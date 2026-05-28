@@ -259,7 +259,7 @@ jobs:
 
             // Idempotency check — avoid duplicate issues on workflow re-runs
             const { data: search } = await tracking.rest.search.issuesAndPullRequests({
-              q: `repo:Comfy-Org/unreviewed-merges in:title "PR #${pr.number}" label:${repoLabel}`,
+              q: `repo:Comfy-Org/unreviewed-merges is:issue in:title "PR #${pr.number}" label:${repoLabel}`,
             });
             if (search.total_count > 0) {
               core.info(`Tracking issue already exists: ${search.items[0].html_url}`);
