@@ -211,8 +211,11 @@ jobs:
               return;
             }
 
-            const { getOctokit } = require('@actions/github');
-            const tracking = getOctokit(process.env.UNREVIEWED_MERGES_TOKEN);
+            // actions/github-script exposes getOctokit on the `github` global —
+            // require('@actions/github') is NOT resolvable from the inline-script
+            // context (the action bundles the module but does not expose it
+            // on the Node module-resolution path).
+            const tracking = github.getOctokit(process.env.UNREVIEWED_MERGES_TOKEN);
 
             const repoLabel = `repo:${repo.toLowerCase()}`;
             const statusLabel = hasJustification ? 'needs-review' : 'needs-justification';
