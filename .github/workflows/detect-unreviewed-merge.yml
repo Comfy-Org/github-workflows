@@ -243,11 +243,16 @@ jobs:
               return;
             }
 
-            // actions/github-script exposes getOctokit on the `github` global —
-            // require('@actions/github') is NOT resolvable from the inline-script
-            // context (the action bundles the module but does not expose it
-            // on the Node module-resolution path).
-            const tracking = github.getOctokit(process.env.UNREVIEWED_MERGES_TOKEN);
+            // In actions/github-script's inline-script context, `github` is an
+            // Octokit *instance* (pre-authenticated with GITHUB_TOKEN), not the
+            // @actions/github module. Neither require('@actions/github') nor
+            // github.getOctokit() works here.
+            //
+            // Workaround: reuse the constructor of the existing Octokit instance
+            // — it carries the same plugins and version, just re-authenticated
+            // with the PAT. No module resolution required.
+            const Octokit = github.constructor;
+            const tracking = new Octokit({ auth: process.env.UNREVIEWED_MERGES_TOKEN });
 
             const repoLabel = `repo:${repo.toLowerCase()}`;
             const statusLabel = hasJustification ? 'needs-review' : 'needs-justification';
