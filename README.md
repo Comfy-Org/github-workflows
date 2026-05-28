@@ -12,17 +12,25 @@ This repo is **public** so any repo — public or private, inside or outside the
 
 ## Usage
 
-Reference a workflow by full path and pin to a tagged release (or a full commit SHA for stricter supply-chain hygiene):
+Reference a workflow by full path and pin to a **full commit SHA** (with the version as a trailing comment). Also set explicit minimum permissions on the calling job so the default permissive token scope isn't granted:
 
 ```yaml
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
   my-job:
-    uses: Comfy-Org/github-workflows/.github/workflows/<workflow-name>.yml@v1
+    uses: Comfy-Org/github-workflows/.github/workflows/<workflow-name>.yml@<sha>  # v1
     with:
       <input>: <value>
     secrets:
       <SECRET>: ${{ secrets.<SECRET> }}
 ```
+
+The SHA-pin format satisfies pin-validation tooling (`pinact`, `zizmor`, etc.) and gives auditors immutable supply-chain evidence. Dependabot/Renovate can auto-bump the SHA when the upstream tag moves.
+
+A bare `@v1` tag is technically allowed but **will fail** in repos that run pin-validation in CI (e.g. `cloud`, `ComfyUI_frontend`).
 
 Per-workflow inputs, required secrets, and triggers are documented in each workflow file's header comment.
 
@@ -31,8 +39,7 @@ Per-workflow inputs, required secrets, and triggers are documented in each workf
 Workflows in this repo use **semver-style major-version tags** (`v1`, `v2`, …).
 
 - Breaking changes bump the major (`v1` → `v2`); callers opt in.
-- Backwards-compatible changes update the existing major tag in place (`git tag -f v1 <sha> && git push -f origin v1`) — all callers pick up the update on their next run.
-- For SOC 2 / audit-friendly pinning, pin callers to a full commit SHA and let Dependabot or Renovate manage updates.
+- Backwards-compatible changes update the existing major tag in place (`git tag -f v1 <sha> && git push -f origin v1`) — callers pinned to the tag pick up the update on the next run; callers pinned to a SHA opt in by bumping the SHA.
 
 ## Adding a new reusable workflow
 
