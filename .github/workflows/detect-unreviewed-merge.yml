@@ -62,14 +62,46 @@ jobs:
               return;
             }
 
-            // Find the PR associated with this merge commit
-            const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
-              owner,
-              repo,
-              commit_sha: sha,
-            });
+            // Find the PR associated with this merge commit. The
+            // listPullRequestsAssociatedWithCommit endpoint is eventually
+            // consistent — for a few seconds after a merge it can return [].
+            // Retry with backoff, then fall back to parsing the PR number
+            // from the squash/merge commit message subject (always present
+            // for PRs merged via the GitHub UI or `gh pr merge`).
+            async function findPr() {
+              for (let attempt = 0; attempt < 5; attempt++) {
+                const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                  owner, repo, commit_sha: sha,
+                });
+                const hit = prs.find(p => p.merged_at && p.base.ref === branch);
+                if (hit) return hit;
+                if (attempt < 4) {
+                  await new Promise(r => setTimeout(r, (attempt + 1) * 5000));
+                }
+              }
 
-            const pr = prs.find(p => p.merged_at && p.base.ref === branch);
+              // Fallback: parse PR number from the commit message subject.
+              // Squash merges:   "<title> (#1234)"
+              // Merge commits:   "Merge pull request #1234 from <branch>"
+              const { data: commit } = await github.rest.repos.getCommit({
+                owner, repo, ref: sha,
+              });
+              const subject = commit.commit.message.split('\n', 1)[0];
+              const m = subject.match(/\(#(\d+)\)\s*$/) ||
+                        subject.match(/^Merge pull request #(\d+)\b/);
+              if (!m) return null;
+
+              const { data: prData } = await github.rest.pulls.get({
+                owner, repo, pull_number: parseInt(m[1], 10),
+              });
+              if (prData.merged_at && prData.base.ref === branch) {
+                core.info(`Resolved PR #${prData.number} via commit-message fallback`);
+                return prData;
+              }
+              return null;
+            }
+
+            const pr = await findPr();
             if (!pr) {
               core.info('No merged PR found for this commit — skipping.');
               return;
