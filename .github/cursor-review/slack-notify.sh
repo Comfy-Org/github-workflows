@@ -36,23 +36,20 @@ fi
 
 # ── DM mode ────────────────────────────────────────────────────────────────────
 if [ -n "${SLACK_BOT_TOKEN:-}" ] && [ -n "${DM_GITHUB_USER:-}" ]; then
-    # GitHub username → comfy.org email prefix overrides for anyone whose
-    # GitHub handle doesn't match their email prefix. Keys are lowercase for
-    # case-insensitive lookup (GitHub usernames are case-insensitive).
-    declare -A GITHUB_EMAIL_MAP
-    GITHUB_EMAIL_MAP[mattmillerai]=mattmiller
-    GITHUB_EMAIL_MAP[huntcsg]=hunter
-    GITHUB_EMAIL_MAP[skishore23]=kishore
-    GITHUB_EMAIL_MAP[robinjhuang]=robin
-    GITHUB_EMAIL_MAP[luke-mino-altherr]=luke
-    GITHUB_EMAIL_MAP[fengsi]=si
-    GITHUB_EMAIL_MAP[deepanjanroy]=dproy
-    GITHUB_EMAIL_MAP[deepme987]=deep
-    GITHUB_EMAIL_MAP[synap5e]=simonpinfold
-    GITHUB_EMAIL_MAP[purzbeats]=purz
-
+    # GitHub handle → comfy.org email-prefix overrides for anyone whose GitHub
+    # handle doesn't match their email prefix. Supplied as a JSON object via
+    # $DM_EMAIL_MAP (e.g. {"somehandle":"firstname"}) so the team roster stays
+    # out of this public repo — set it as an org/repo Actions variable and pass
+    # it into this script. Keys MUST be lowercase; GitHub handles are
+    # case-insensitive and we normalize to lowercase before lookup.
     NORMALIZED_USER="${DM_GITHUB_USER,,}"
-    EMAIL_PREFIX="${GITHUB_EMAIL_MAP[$NORMALIZED_USER]:-$NORMALIZED_USER}"
+    EMAIL_PREFIX="$NORMALIZED_USER"
+    if [ -n "${DM_EMAIL_MAP:-}" ]; then
+        MAPPED=$(echo "$DM_EMAIL_MAP" | jq -r --arg u "$NORMALIZED_USER" '.[$u] // empty' 2>/dev/null || echo "")
+        if [ -n "$MAPPED" ]; then
+            EMAIL_PREFIX="$MAPPED"
+        fi
+    fi
     echo "DM mode: resolving ${EMAIL_PREFIX}@comfy.org (GitHub: ${DM_GITHUB_USER})"
 
     EMAIL="${EMAIL_PREFIX}@comfy.org"

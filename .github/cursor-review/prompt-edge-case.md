@@ -38,8 +38,8 @@ If you find no issues, return an empty array: []
 
 Example response:
 [
-  {"file": "common/retrier.go", "line": 55, "side": "RIGHT", "severity": "high", "body": "When `maxRetries` is 0 the loop body never executes, so the function returns `nil` instead of running the operation once. The guard should be `i <= maxRetries`."},
-  {"file": "services/dispatcher/router.go", "line": 203, "side": "RIGHT", "severity": "medium", "body": "The `default` branch of the select sends on `errCh` without checking if the channel is full. If two goroutines hit this path simultaneously the second send blocks forever, leaking the goroutine."}
+  {"file": "pkg/retry/retrier.go", "line": 55, "side": "RIGHT", "severity": "high", "body": "When `maxRetries` is 0 the loop body never executes, so the function returns `nil` instead of running the operation once. The guard should be `i <= maxRetries`."},
+  {"file": "internal/router/router.go", "line": 203, "side": "RIGHT", "severity": "medium", "body": "The `default` branch of the select sends on `errCh` without checking if the channel is full. If two goroutines hit this path simultaneously the second send blocks forever, leaking the goroutine."}
 ]
 
 === BEGIN DIFF ===

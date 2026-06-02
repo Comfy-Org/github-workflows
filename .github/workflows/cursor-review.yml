@@ -629,6 +629,10 @@ jobs:
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           DM_GITHUB_USER: ${{ steps.triggerer.outputs.triggered_by }}
+          # JSON GitHub-handle → email-prefix overrides, kept out of this public
+          # repo. Set it as an org/repo Actions variable; absent = handle is used
+          # as the email prefix verbatim.
+          DM_EMAIL_MAP: ${{ vars.CURSOR_REVIEW_DM_EMAIL_MAP }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_URL: ${{ github.event.pull_request.html_url }}
         run: |
@@ -679,6 +683,9 @@ jobs:
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           DM_GITHUB_USER: ${{ steps.triggerer.outputs.triggered_by }}
+          # See notify-start: JSON handle → email-prefix overrides, supplied as
+          # an org/repo Actions variable so the roster stays out of this repo.
+          DM_EMAIL_MAP: ${{ vars.CURSOR_REVIEW_DM_EMAIL_MAP }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_URL: ${{ github.event.pull_request.html_url }}
           CONSOLIDATE_RESULT: ${{ needs.consolidate.result }}

@@ -36,8 +36,8 @@ If you find no issues, return an empty array: []
 
 Example response:
 [
-  {"file": "services/ingest/handler/prompt.go", "line": 42, "side": "RIGHT", "severity": "critical", "body": "User-supplied `filename` is passed to `os.Open` without path-traversal validation. An attacker can read arbitrary files with `../../etc/passwd`."},
-  {"file": "services/inference/upload.go", "line": 118, "side": "RIGHT", "severity": "high", "body": "The goroutine captures `ctx` from the outer scope but the parent function returns and cancels the context before the upload completes, causing silent data loss."}
+  {"file": "internal/api/handler.go", "line": 42, "side": "RIGHT", "severity": "critical", "body": "User-supplied `filename` is passed to `os.Open` without path-traversal validation. An attacker can read arbitrary files with `../../etc/passwd`."},
+  {"file": "internal/worker/upload.go", "line": 118, "side": "RIGHT", "severity": "high", "body": "The goroutine captures `ctx` from the outer scope but the parent function returns and cancels the context before the upload completes, causing silent data loss."}
 ]
 
 === BEGIN DIFF ===
