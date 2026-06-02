@@ -1,0 +1,700 @@
+name: Cursor Review (reusable)
+
+# Reusable, label-triggered multi-model code review. A 4-lab × 2-review-type
+# panel (8 cursor-agent cells) runs adversarial + edge-case passes, then a
+# judge model consolidates the findings into ONE review posted on the PR,
+# with per-finding severity badges (critical/high/medium/low/nit).
+#
+# Single source of truth: the prompts and the extract/post/notify scripts
+# live in THIS repo under .github/cursor-review/. Consumer repos add only a
+# thin caller — they don't carry copies of the review logic, so there's no
+# drift to keep in sync.
+#
+# Caller pattern (place in source repo at .github/workflows/ci-cursor-review.yml):
+#
+#   name: CI - Cursor Review
+#   on:
+#     pull_request:
+#       types: [labeled, unlabeled]
+#   permissions:
+#     contents: read
+#     pull-requests: write
+#   concurrency:
+#     group: cursor-review-pr-${{ github.event.pull_request.number }}-${{ github.event.label.name }}
+#     cancel-in-progress: true
+#   jobs:
+#     cursor-review:
+#       uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@main
+#       with:
+#         # Repo-specific pathspecs excluded from the size cap and the diff.
+#         diff_excludes: >-
+#           :!**/package-lock.json
+#           :!data/object_info.json.gz
+#         # Pin the assets ref to the same ref you pin `uses:` to for
+#         # reproducibility (defaults to main).
+#         workflows_ref: main
+#       secrets:
+#         CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+#         SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+on:
+  workflow_call:
+    inputs:
+      judge_model:
+        description: >-
+          Single judge model that adjudicates panel findings into one
+          consolidated review. Picked to match the highest reasoning tier in
+          the panel.
+        type: string
+        required: false
+        default: claude-opus-4-7-thinking-xhigh
+      diff_size_cap:
+        description: >-
+          Max changed lines (added + removed, after diff_excludes). PRs over
+          the cap are skipped — too large for a useful single-pass review.
+        type: number
+        required: false
+        default: 5000
+      review_label:
+        description: Label whose addition triggers the review.
+        type: string
+        required: false
+        default: cursor-review
+      diff_excludes:
+        description: >-
+          Whitespace-separated git pathspecs excluded from BOTH the size-budget
+          count and the diff fed to Cursor. Pass your repo's generated/vendored
+          paths (lockfiles, snapshots, fixtures) so they don't blow the cap or
+          waste review signal. Folded scalar collapses newlines to spaces so the
+          value word-splits into pathspec args. Paths with a leading underscore
+          need the long-form `:(exclude)` syntax — the short-form `:!` parser
+          reads `_` as pathspec magic.
+        type: string
+        required: false
+        default: >-
+          :!**/package-lock.json
+          :!**/yarn.lock
+          :!**/pnpm-lock.yaml
+          :!**/go.sum
+          :!**/node_modules/**
+          :!**/.claude/**
+          :!**/dist/**
+          :!**/vendor/**
+          :!**/*.generated.*
+          :!**/*.min.js
+          :!**/*.min.css
+      workflows_ref:
+        description: >-
+          Ref of Comfy-Org/github-workflows to load the prompts and scripts
+          from. Pin this to the same ref you pin `uses:` to for reproducibility.
+        type: string
+        required: false
+        default: main
+    secrets:
+      CURSOR_API_KEY:
+        description: Cursor API key for cursor-agent (the panel + judge models bill through it).
+        required: true
+      SLACK_BOT_TOKEN:
+        description: Slack bot token for the start/complete DM notifications. Optional — DMs are skipped if absent.
+        required: false
+
+# DIFF_SIZE_CAP / REVIEW_LABEL / JUDGE_MODEL / DIFF_EXCLUDES are mapped from
+# `inputs` here so the run steps below read them verbatim from the original
+# (private-repo) workflow without per-step plumbing. `inputs` is available to
+# workflow-level env in a called workflow; `secrets` is not (those stay in jobs).
+env:
+  DIFF_SIZE_CAP: ${{ inputs.diff_size_cap }}
+  REVIEW_LABEL: ${{ inputs.review_label }}
+  JUDGE_MODEL: ${{ inputs.judge_model }}
+  DIFF_EXCLUDES: ${{ inputs.diff_excludes }}
+  # Where the assets checkout lands (this repo, .github/cursor-review/*).
+  CURSOR_REVIEW_ASSETS: ${{ github.workspace }}/_cursor_review_assets/.github/cursor-review
+
+jobs:
+  gate:
+    name: Gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+      already_reviewed: ${{ steps.dup.outputs.already_reviewed }}
+    steps:
+      - name: Check trigger label
+        id: check
+        env:
+          LABEL_NAME: ${{ github.event.label.name }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          GH_EVENT_ACTION: ${{ github.event.action }}
+        run: |
+          # skip-cursor-review wins even if the trigger label is also present.
+          if echo "$PR_LABELS" | jq -e 'index("skip-cursor-review")' > /dev/null; then
+            echo "skip-cursor-review label present — skipping."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Only adding the trigger label fires the matrix. Removing it cancels
+          # any in-progress run via the concurrency group and then no-ops here.
+          if [ "$LABEL_NAME" = "$REVIEW_LABEL" ] && [ "$GH_EVENT_ACTION" = "labeled" ]; then
+            echo "$REVIEW_LABEL label added — running."
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Removing skip-cursor-review while the trigger label is present
+          # unblocks a previously skipped review — treat it as a fresh trigger.
+          if [ "$LABEL_NAME" = "skip-cursor-review" ] && [ "$GH_EVENT_ACTION" = "unlabeled" ]; then
+            if echo "$PR_LABELS" | jq -e --arg l "$REVIEW_LABEL" 'index($l)' > /dev/null; then
+              echo "skip-cursor-review removed while $REVIEW_LABEL is present — running."
+              echo "should_run=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "Label '$LABEL_NAME' is not the trigger label — skipping."
+          echo "should_run=false" >> "$GITHUB_OUTPUT"
+
+      - name: Check for prior review on this commit
+        id: dup
+        if: steps.check.outputs.should_run == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Idempotency: skip the matrix if a Cursor Review consolidated
+          # review already exists for this exact HEAD SHA. Protects against
+          # label remove+re-add (or any other event-replay path) from
+          # re-running the panel on unchanged content.
+          #
+          # Escape hatches:
+          # - Push commits → new HEAD SHA, check finds nothing, runs.
+          # - Dismiss the existing review → DISMISSED state filtered out
+          #   below, so re-applying the label fires a fresh run.
+          #
+          # API failure falls through to running, not skipping — better to
+          # double-review than silently no-op.
+          EXISTING=$(gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" 2>/dev/null \
+            | jq --arg sha "$HEAD_SHA" '[.[] | select(.commit_id == $sha and .state != "DISMISSED" and (.body | startswith("## 🔍 Cursor Review — Consolidated panel")))] | length' \
+            2>/dev/null || echo 0)
+
+          if [ "$EXISTING" -gt 0 ]; then
+            echo "Already reviewed at $HEAD_SHA ($EXISTING existing review(s)) — skipping matrix."
+            echo "already_reviewed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No prior review for $HEAD_SHA — proceeding."
+            echo "already_reviewed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  diff-size:
+    name: Diff size check
+    needs: gate
+    if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      within_cap: ${{ steps.count.outputs.within_cap }}
+    steps:
+      - name: Checkout PR repo
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Count changed lines
+        id: count
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # numstat reports "-\t-" for binary files; treat those as 0 lines so
+          # binary-only PRs can't bypass the size cap by producing no insertion
+          # tokens for grep to count.
+          # $DIFF_EXCLUDES is intentionally unquoted: bash word-splits it into
+          # separate pathspec args. Pathspecs all start with ":!", so pathname
+          # expansion finds no matches and leaves them literal.
+          # shellcheck disable=SC2086
+          TOTAL=$(git diff --numstat "$BASE_SHA...$HEAD_SHA" -- . $DIFF_EXCLUDES \
+            | awk '{ if ($1 != "-") added += $1; if ($2 != "-") removed += $2 } END { print (added + removed) + 0 }')
+          echo "Changed lines: $TOTAL (cap: $DIFF_SIZE_CAP)"
+
+          if [ "$TOTAL" -gt "$DIFF_SIZE_CAP" ]; then
+            echo "Diff exceeds cap — skipping review."
+            echo "within_cap=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "within_cap=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  review:
+    # Each cell produces a findings artifact. No cell posts a review —
+    # consolidate adjudicates the panel and posts ONE review at the end.
+    name: '${{ matrix.review_type }} (${{ matrix.model }})'
+    needs: [gate, diff-size]
+    if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # Pinned to the highest reasoning tier available for each lab. Gemini
+        # and Kimi only ship a single tier in Cursor's catalog; OpenAI Codex
+        # and Claude expose xhigh variants we use here.
+        model:
+          - gpt-5.3-codex-xhigh
+          - claude-opus-4-7-thinking-xhigh
+          - gemini-3.1-pro
+          - kimi-k2.5
+        review_type: [adversarial, edge-case]
+    steps:
+      - name: Seed default findings artifact
+        # Pre-seed a minimal artifact tagged status=error so this cell
+        # ALWAYS shows up in the panel summary, even if a later step
+        # (checkout, Cursor install, prompt build, extract) fails. The
+        # `Extract findings` step overwrites this on success. Without
+        # this, an early-failing cell silently disappears from the panel
+        # and the consolidated review undercounts the matrix.
+        env:
+          MODEL: ${{ matrix.model }}
+          REVIEW_TYPE: ${{ matrix.review_type }}
+        run: |
+          mkdir -p /tmp/findings-out
+          python3 - <<'PY'
+          import json, os
+          record = {
+              "model": os.environ["MODEL"],
+              "review_type": os.environ["REVIEW_TYPE"],
+              "status": "error",
+              "error": "Cell did not reach the extraction step.",
+              "findings": [],
+          }
+          with open("/tmp/findings-out/findings.json", "w", encoding="utf-8") as f:
+              json.dump(record, f)
+          PY
+
+      - name: Checkout PR repo
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Load cursor-review assets
+        # Trusted prompts/scripts come from THIS workflow's repo (public,
+        # pinned via workflows_ref) — never from the PR checkout, so a
+        # malicious PR can't rewrite the prompt to exfiltrate the diff or
+        # smuggle instructions to the model.
+        uses: actions/checkout@v6
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _cursor_review_assets
+          persist-credentials: false
+
+      - name: Generate diff
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # See diff_excludes input for the rationale and pathspec list.
+          # shellcheck disable=SC2086
+          git diff "$BASE_SHA...$HEAD_SHA" -- . $DIFF_EXCLUDES > /tmp/pr-diff.patch
+
+          echo "Diff size: $(wc -l < /tmp/pr-diff.patch) lines"
+
+      - name: Install Cursor agent CLI
+        run: |
+          curl https://cursor.com/install -fsSL | bash
+          echo "$HOME/.cursor/bin" >> "$GITHUB_PATH"
+
+      - name: Log Cursor agent version
+        # The install script is unpinned (curl | bash from cursor.com), so we
+        # log the installed version into the run for forensics rather than
+        # gating on a hard-coded baseline. A version equality check produced
+        # daily toil without adding integrity protection — a CDN compromise
+        # would just ship malicious bits as a "new version" we'd then bump to.
+        run: cursor-agent --version
+
+      - name: Build prompt
+        env:
+          REVIEW_TYPE: ${{ matrix.review_type }}
+        run: |
+          {
+            cat "$CURSOR_REVIEW_ASSETS/prompt-${REVIEW_TYPE}.md"
+            cat /tmp/pr-diff.patch
+            echo ""
+            echo "=== END DIFF ==="
+          } > /tmp/prompt.txt
+
+          echo "Prompt size: $(wc -c < /tmp/prompt.txt) bytes"
+
+      - name: Run cursor review
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          MODEL: ${{ matrix.model }}
+        run: |
+          # --sandbox is intentionally omitted. The hosted runner is already
+          # an ephemeral VM, so the agent's AppArmor sandbox doesn't add
+          # protection — and as of cursor-agent 2026.05.05 it fails to start
+          # on ubuntu-latest, producing empty output.
+          cursor-agent \
+            --print \
+            --trust \
+            --model "$MODEL" \
+            < /tmp/prompt.txt \
+            > /tmp/review-raw.txt 2>/tmp/review-stderr.txt || true
+
+          echo "=== Raw output (first 500 chars) ==="
+          head -c 500 /tmp/review-raw.txt
+          echo ""
+          echo "=== Stderr ==="
+          cat /tmp/review-stderr.txt
+
+      - name: Extract findings
+        if: always()
+        env:
+          MODEL: ${{ matrix.model }}
+          REVIEW_TYPE: ${{ matrix.review_type }}
+        run: |
+          mkdir -p /tmp/findings-out
+          python3 "$CURSOR_REVIEW_ASSETS/extract-findings.py" \
+            --raw /tmp/review-raw.txt \
+            --out /tmp/findings-out/findings.json \
+            --model "$MODEL" \
+            --review-type "$REVIEW_TYPE"
+
+          echo "=== Extracted findings ==="
+          cat /tmp/findings-out/findings.json
+          echo ""
+
+      - name: Upload findings artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: findings-${{ matrix.review_type }}-${{ matrix.model }}
+          path: /tmp/findings-out/findings.json
+          if-no-files-found: error
+          retention-days: 7
+
+  consolidate:
+    # Adjudicates the 8 cell artifacts into one consolidated review.
+    # Calls cursor-agent one more time as the judge, with prompt-judge.md.
+    name: Consolidate panel
+    needs: [gate, diff-size, review]
+    if: always() && needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true' && needs.review.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout PR repo
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Load cursor-review assets
+        uses: actions/checkout@v6
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _cursor_review_assets
+          persist-credentials: false
+
+      - name: Generate diff
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # See diff_excludes input for the rationale and pathspec list.
+          # shellcheck disable=SC2086
+          git diff "$BASE_SHA...$HEAD_SHA" -- . $DIFF_EXCLUDES > /tmp/pr-diff.patch
+
+      - name: Install Cursor agent CLI
+        run: |
+          curl https://cursor.com/install -fsSL | bash
+          echo "$HOME/.cursor/bin" >> "$GITHUB_PATH"
+
+      - name: Download panel findings
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/panel
+          pattern: findings-*
+
+      - name: Aggregate panel findings
+        id: aggregate
+        run: |
+          # Each artifact directory contains one findings.json. Combine into
+          # a single panel.json array preserving cell metadata.
+          python3 - <<'PY'
+          import json, os, glob
+
+          panel = []
+          for path in sorted(glob.glob("/tmp/panel/findings-*/findings.json")):
+              with open(path, encoding="utf-8") as f:
+                  panel.append(json.load(f))
+
+          with open("/tmp/panel.json", "w", encoding="utf-8") as f:
+              json.dump(panel, f, indent=2)
+
+          ok = sum(1 for c in panel if c.get("status") == "ok")
+          print(f"Panel: {ok}/{len(panel)} cells contributed findings.")
+
+          # Emit metadata for the next step to gate on.
+          with open(os.environ["GITHUB_OUTPUT"], "a") as g:
+              g.write(f"ok_count={ok}\n")
+              g.write(f"total={len(panel)}\n")
+          PY
+
+      - name: Build judge prompt
+        if: steps.aggregate.outputs.ok_count != '0'
+        run: |
+          {
+            cat "$CURSOR_REVIEW_ASSETS/prompt-judge.md"
+            cat /tmp/panel.json
+            echo ""
+            echo "=== END PANEL FINDINGS ==="
+            echo ""
+            echo "=== BEGIN DIFF ==="
+            cat /tmp/pr-diff.patch
+            echo ""
+            echo "=== END DIFF ==="
+          } > /tmp/judge-prompt.txt
+
+          echo "Judge prompt size: $(wc -c < /tmp/judge-prompt.txt) bytes"
+
+      - name: Run judge
+        if: steps.aggregate.outputs.ok_count != '0'
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+        run: |
+          cursor-agent \
+            --print \
+            --trust \
+            --model "$JUDGE_MODEL" \
+            < /tmp/judge-prompt.txt \
+            > /tmp/judge-raw.txt 2>/tmp/judge-stderr.txt || true
+
+          echo "=== Judge raw output (first 1000 chars) ==="
+          head -c 1000 /tmp/judge-raw.txt
+          echo ""
+          echo "=== Judge stderr ==="
+          cat /tmp/judge-stderr.txt
+
+      - name: Build consolidated findings file
+        id: consolidated
+        env:
+          OK_COUNT: ${{ steps.aggregate.outputs.ok_count }}
+        run: |
+          # If at least one cell produced findings, parse the judge output
+          # into a findings file. Otherwise short-circuit — post-review.py
+          # will render a "no contributors" review with the panel summary.
+          if [ "$OK_COUNT" = "0" ]; then
+            echo "No panel cells contributed findings — skipping judge parse."
+            echo '{"status": "ok", "findings": []}' > /tmp/judge-findings.json
+          else
+            python3 "$CURSOR_REVIEW_ASSETS/extract-findings.py" \
+              --raw /tmp/judge-raw.txt \
+              --out /tmp/judge-findings.json \
+              --model "$JUDGE_MODEL" \
+              --review-type judge
+          fi
+
+          # If the judge errored or its output couldn't be parsed, surface
+          # that to the next step so we post an honest error review rather
+          # than silently claiming "no findings" when the panel did produce
+          # content.
+          JUDGE_STATUS=$(python3 -c "import json,sys; print(json.load(open('/tmp/judge-findings.json')).get('status','?'))")
+          echo "Judge status: $JUDGE_STATUS"
+          echo "judge_status=$JUDGE_STATUS" >> "$GITHUB_OUTPUT"
+
+          # Combine judge findings with panel metadata (model, review_type,
+          # status only — drop full per-cell findings to keep the post payload
+          # small) for the post-review script.
+          python3 - <<'PY'
+          import json
+          with open("/tmp/panel.json", encoding="utf-8") as f:
+              panel = json.load(f)
+          panel_meta = [
+              {"model": c.get("model"), "review_type": c.get("review_type"), "status": c.get("status")}
+              for c in panel
+          ]
+          with open("/tmp/judge-findings.json", encoding="utf-8") as f:
+              judge = json.load(f)
+          findings = judge.get("findings") or []
+          consolidated = {"findings": findings, "panel": panel_meta}
+          with open("/tmp/consolidated.json", "w", encoding="utf-8") as f:
+              json.dump(consolidated, f)
+          print(f"Consolidated: {len(findings)} judge finding(s), {len(panel_meta)} panel cells.")
+          PY
+
+      - name: Resolve triggerer
+        id: triggerer
+        env:
+          GH_ACTOR: ${{ github.actor }}
+          PR_ASSIGNEES: ${{ toJSON(github.event.pull_request.assignees.*.login) }}
+        run: |
+          # github.actor on pull_request.labeled is the user who applied the
+          # label — but when the auto-labeler workflow applies it via a bot
+          # App token, github.actor becomes "<app>[bot]" and the human who
+          # actually triggered the chain (by assigning themselves) is lost.
+          # Recover them by falling back to the PR's first assignee whenever
+          # the actor is a bot.
+          if [[ "$GH_ACTOR" == *"[bot]" ]]; then
+            FALLBACK=$(echo "$PR_ASSIGNEES" | jq -r '.[0] // empty')
+            if [ -n "$FALLBACK" ]; then
+              echo "Actor $GH_ACTOR is a bot — using assignee '$FALLBACK' for attribution."
+              echo "triggered_by=$FALLBACK" >> "$GITHUB_OUTPUT"
+            else
+              echo "Actor $GH_ACTOR is a bot and no assignee found — keeping bot attribution."
+              echo "triggered_by=$GH_ACTOR" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "triggered_by=$GH_ACTOR" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post review
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          TRIGGERED_BY: ${{ steps.triggerer.outputs.triggered_by }}
+          JUDGE_STATUS: ${{ steps.consolidated.outputs.judge_status }}
+        run: |
+          # If the judge call itself failed but the panel had content, post
+          # an error review so we don't silently misreport. The "ok with
+          # zero findings" path stays normal — that's the legitimate
+          # "no high-signal findings" case.
+          if [ "$JUDGE_STATUS" != "ok" ]; then
+            JUDGE_ERROR=$(python3 -c "import json; print(json.load(open('/tmp/judge-findings.json')).get('error','(no error message)'))")
+            python3 "$CURSOR_REVIEW_ASSETS/post-review.py" \
+              --findings /tmp/consolidated.json \
+              --pr-number "$PR_NUMBER" \
+              --repo "$REPO" \
+              --commit-sha "$HEAD_SHA" \
+              --triggered-by "$TRIGGERED_BY" \
+              --error-message "Judge call failed (status=${JUDGE_STATUS}): ${JUDGE_ERROR}"
+          else
+            python3 "$CURSOR_REVIEW_ASSETS/post-review.py" \
+              --findings /tmp/consolidated.json \
+              --pr-number "$PR_NUMBER" \
+              --repo "$REPO" \
+              --commit-sha "$HEAD_SHA" \
+              --triggered-by "$TRIGGERED_BY"
+          fi
+
+  notify-start:
+    name: Notify start
+    needs: [gate, diff-size]
+    if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Load cursor-review assets
+        uses: actions/checkout@v6
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _cursor_review_assets
+          persist-credentials: false
+
+      - name: Resolve triggerer
+        id: triggerer
+        env:
+          GH_ACTOR: ${{ github.actor }}
+          PR_ASSIGNEES: ${{ toJSON(github.event.pull_request.assignees.*.login) }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          if [[ "$GH_ACTOR" == *"[bot]" ]]; then
+            ASSIGNEE=$(echo "$PR_ASSIGNEES" | jq -r '.[0] // empty')
+            # Prefer PR author for DM routing — they opened the work and most want
+            # the review status. Falls back to assignee, then empty (skips DM) if
+            # the author is also a bot (e.g. Dependabot PRs).
+            RESOLVED="${PR_AUTHOR:-${ASSIGNEE:-}}"
+            if [[ "$RESOLVED" == *"[bot]" ]]; then RESOLVED=""; fi
+            echo "triggered_by=$RESOLVED" >> "$GITHUB_OUTPUT"
+          else
+            echo "triggered_by=$GH_ACTOR" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: DM triggerer — review starting
+        continue-on-error: true
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          DM_GITHUB_USER: ${{ steps.triggerer.outputs.triggered_by }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          chmod +x "$CURSOR_REVIEW_ASSETS/slack-notify.sh"
+          MSG="*${PR_TITLE}*"$'\n'"${PR_URL}"$'\n'"8-cell panel running, then a judge consolidates."
+          "$CURSOR_REVIEW_ASSETS/slack-notify.sh" \
+            "warning" \
+            "Cursor review starting" \
+            "$MSG"
+
+  notify-complete:
+    name: Notify complete
+    needs: [gate, diff-size, review, consolidate]
+    if: always() && needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true' && needs.review.result != 'skipped'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Load cursor-review assets
+        uses: actions/checkout@v6
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _cursor_review_assets
+          persist-credentials: false
+
+      - name: Resolve triggerer
+        id: triggerer
+        env:
+          GH_ACTOR: ${{ github.actor }}
+          PR_ASSIGNEES: ${{ toJSON(github.event.pull_request.assignees.*.login) }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          if [[ "$GH_ACTOR" == *"[bot]" ]]; then
+            ASSIGNEE=$(echo "$PR_ASSIGNEES" | jq -r '.[0] // empty')
+            # Prefer PR author for DM routing — they opened the work and most want
+            # the review status. Falls back to assignee, then empty (skips DM) if
+            # the author is also a bot (e.g. Dependabot PRs).
+            RESOLVED="${PR_AUTHOR:-${ASSIGNEE:-}}"
+            if [[ "$RESOLVED" == *"[bot]" ]]; then RESOLVED=""; fi
+            echo "triggered_by=$RESOLVED" >> "$GITHUB_OUTPUT"
+          else
+            echo "triggered_by=$GH_ACTOR" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: DM triggerer — review complete
+        continue-on-error: true
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          DM_GITHUB_USER: ${{ steps.triggerer.outputs.triggered_by }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          CONSOLIDATE_RESULT: ${{ needs.consolidate.result }}
+        run: |
+          chmod +x "$CURSOR_REVIEW_ASSETS/slack-notify.sh"
+          if [ "$CONSOLIDATE_RESULT" = "success" ]; then
+            STATUS="success"
+            TITLE="Cursor review complete"
+            DETAIL="One consolidated review is on the PR."
+          else
+            STATUS="warning"
+            TITLE="Cursor review failed to post"
+            DETAIL="Consolidate step did not succeed — see the run for details."
+          fi
+          MSG="*${PR_TITLE}*"$'\n'"${PR_URL}"$'\n'"${DETAIL}"
+          "$CURSOR_REVIEW_ASSETS/slack-notify.sh" \
+            "$STATUS" \
+            "$TITLE" \
+            "$MSG"
