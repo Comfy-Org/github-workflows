@@ -40,7 +40,7 @@ if [ -n "${SLACK_BOT_TOKEN:-}" ] && [ -n "${DM_GITHUB_USER:-}" ]; then
     # GitHub handle doesn't match their email prefix. Keys are lowercase for
     # case-insensitive lookup (GitHub usernames are case-insensitive).
     declare -A GITHUB_EMAIL_MAP
-    GITHUB_EMAIL_MAP[millermedia]=mattmiller
+    GITHUB_EMAIL_MAP[mattmillerai]=mattmiller
     GITHUB_EMAIL_MAP[huntcsg]=hunter
     GITHUB_EMAIL_MAP[skishore23]=kishore
     GITHUB_EMAIL_MAP[robinjhuang]=robin
