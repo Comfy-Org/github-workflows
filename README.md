@@ -10,6 +10,7 @@ This repo is **public** so any repo — public or private, inside or outside the
 |---|---|
 | [`detect-unreviewed-merge.yml`](.github/workflows/detect-unreviewed-merge.yml) | SOC 2 compliance — detects PRs merged without prior approval and opens a tracking issue in [`Comfy-Org/unreviewed-merges`](https://github.com/Comfy-Org/unreviewed-merges). |
 | [`cursor-review.yml`](.github/workflows/cursor-review.yml) | Label-triggered multi-model code review. A 4-lab × 2-review-type cursor-agent panel runs adversarial + edge-case passes, a judge model consolidates them into one PR review with per-finding severity badges, and the triggerer gets Slack start/complete DMs. Prompts and scripts live in [`.github/cursor-review/`](.github/cursor-review) — the single source of truth, so consumer repos carry only a thin caller. Requires `CURSOR_API_KEY` (+ optional `SLACK_BOT_TOKEN`). |
+| [`assign-prs-to-author.yml`](.github/workflows/assign-prs-to-author.yml) | Housekeeping — assigns every open PR with no assignees to its author (bot-authored PRs skipped by default). Run on a schedule from a thin caller; useful when a team tracks PR ownership via assignees. The calling job needs `pull-requests: write` and `issues: write`. |
 
 ## Usage
 
