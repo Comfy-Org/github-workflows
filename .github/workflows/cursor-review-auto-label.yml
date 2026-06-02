@@ -1,0 +1,122 @@
+name: Cursor Review Auto-Label (reusable)
+
+# Reusable companion to cursor-review.yml. Translates PR *assignment* of an
+# opted-in reviewer into the review label, which is what cursor-review.yml
+# actually triggers on. Keeps the "fire on label" contract intact while letting
+# people opt into review-on-assignment without UI clicks.
+#
+# The opt-in roster is NOT baked into this file. It lives in the CALLER repo's
+# `vars.CURSOR_REVIEW_OPTED_IN_LOGINS` (whitespace-separated GitHub logins) —
+# same pattern as `vars.CURSOR_REVIEW_DM_EMAIL_MAP`. The `vars` context in a
+# reusable workflow resolves to the caller's repository/org variables, so each
+# consumer manages its own roster by editing the variable, not this workflow.
+#
+# IMPORTANT: the label MUST be applied with a GitHub App token, not the default
+# GITHUB_TOKEN. Label events triggered by GITHUB_TOKEN do not create new
+# workflow runs, so a GITHUB_TOKEN-applied label would silently fail to fire the
+# review. The caller therefore sets `vars.APP_ID` (the CLOUD_CODE_BOT app id) and
+# passes `secrets.CLOUD_CODE_BOT_PRIVATE_KEY`.
+#
+# Example caller (consumer repo):
+#
+#   name: CI - Cursor Review Auto-Label
+#   on:
+#     pull_request:
+#       types: [assigned]
+#   jobs:
+#     auto-label:
+#       permissions:
+#         contents: read
+#       uses: Comfy-Org/github-workflows/.github/workflows/cursor-review-auto-label.yml@<sha>
+#       secrets:
+#         CLOUD_CODE_BOT_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+
+on:
+  workflow_call:
+    inputs:
+      review_label:
+        description: >-
+          Label to apply on assignment. MUST match the label cursor-review.yml
+          triggers on (its `review_label` input, default `cursor-review`).
+        type: string
+        required: false
+        default: cursor-review
+      skip_label:
+        description: >-
+          If this label is already present on the PR, auto-labeling is
+          suppressed — don't fight an explicit opt-out.
+        type: string
+        required: false
+        default: skip-cursor-review
+    secrets:
+      CLOUD_CODE_BOT_PRIVATE_KEY:
+        description: >-
+          Private key for the CLOUD_CODE_BOT GitHub App (app id = vars.APP_ID).
+          Required: the label must be applied by a GitHub App so it triggers the
+          downstream review run (GITHUB_TOKEN-applied labels do not).
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  auto-label:
+    name: Auto-apply review label
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+
+      - name: Apply label if assignee is opted in
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ASSIGNEE: ${{ github.event.assignee.login }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          # Whitespace-separated GitHub logins, from the caller repo's variable.
+          OPTED_IN_LOGINS: ${{ vars.CURSOR_REVIEW_OPTED_IN_LOGINS }}
+          REVIEW_LABEL: ${{ inputs.review_label }}
+          SKIP_LABEL: ${{ inputs.skip_label }}
+        run: |
+          # Empty/unset roster -> nothing is opted in. Don't fail the run;
+          # consumers that haven't set the variable just get a no-op.
+          if [ -z "$(echo "$OPTED_IN_LOGINS" | tr -d '[:space:]')" ]; then
+            echo "vars.CURSOR_REVIEW_OPTED_IN_LOGINS is empty/unset — no-op."
+            exit 0
+          fi
+
+          matched=false
+          for login in $OPTED_IN_LOGINS; do
+            if [ "$ASSIGNEE" = "$login" ]; then
+              matched=true
+              break
+            fi
+          done
+
+          if [ "$matched" = "false" ]; then
+            echo "Assignee $ASSIGNEE is not opted in — no-op."
+            exit 0
+          fi
+
+          # Already labeled (e.g. applied manually before assigning) — don't
+          # re-add; it would no-op anyway, but stay quiet about it.
+          if echo "$PR_LABELS" | jq -e --arg l "$REVIEW_LABEL" 'index($l)' > /dev/null; then
+            echo "$REVIEW_LABEL already present — no-op."
+            exit 0
+          fi
+
+          # An explicit skip label wins — don't silently fight the user's intent.
+          if echo "$PR_LABELS" | jq -e --arg l "$SKIP_LABEL" 'index($l)' > /dev/null; then
+            echo "$SKIP_LABEL present — not auto-applying."
+            exit 0
+          fi
+
+          echo "Applying $REVIEW_LABEL label for $ASSIGNEE."
+          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label "$REVIEW_LABEL"
