@@ -1,15 +1,23 @@
 name: Cursor Review Auto-Label (reusable)
 
-# Reusable companion to cursor-review.yml. Translates PR *assignment* of an
-# opted-in reviewer into the review label, which is what cursor-review.yml
-# actually triggers on. Keeps the "fire on label" contract intact while letting
-# people opt into review-on-assignment without UI clicks.
+# Reusable companion to cursor-review.yml. Translates the moment an opted-in
+# person becomes responsible for a PR into the review label that
+# cursor-review.yml triggers on — keeping the "fire on label" contract intact
+# while letting people opt in without UI clicks.
+#
+# Which moments fire is decided by the CALLER's `on:` triggers; this workflow
+# just reacts to whatever pull_request event was passed through:
+#   - assigned            -> the newly-assigned reviewer
+#   - opened              -> the PR author (skipped while the PR is a draft)
+#   - ready_for_review    -> the PR author
+# A caller that lists only `[assigned]` keeps the original assignment-only
+# behavior; add `opened` / `ready_for_review` to also label on PR creation.
 #
 # The opt-in roster is NOT baked into this file. It lives in the CALLER repo's
-# `vars.CURSOR_REVIEW_OPTED_IN_LOGINS` (whitespace-separated GitHub logins) —
-# same pattern as `vars.CURSOR_REVIEW_DM_EMAIL_MAP`. The `vars` context in a
-# reusable workflow resolves to the caller's repository/org variables, so each
-# consumer manages its own roster by editing the variable, not this workflow.
+# `vars.CURSOR_REVIEW_OPTED_IN_LOGINS` (whitespace-separated GitHub logins). The
+# `vars` context in a reusable workflow resolves to the caller's repository/org
+# variables, so each consumer manages its own roster by editing the variable,
+# not this workflow.
 #
 # IMPORTANT: the label MUST be applied with a GitHub App token, not the default
 # GITHUB_TOKEN. Label events triggered by GITHUB_TOKEN do not create new
@@ -22,7 +30,7 @@ name: Cursor Review Auto-Label (reusable)
 #   name: CI - Cursor Review Auto-Label
 #   on:
 #     pull_request:
-#       types: [assigned]
+#       types: [assigned, opened, ready_for_review]   # or just [assigned]
 #   jobs:
 #     auto-label:
 #       permissions:
@@ -36,8 +44,8 @@ on:
     inputs:
       review_label:
         description: >-
-          Label to apply on assignment. MUST match the label cursor-review.yml
-          triggers on (its `review_label` input, default `cursor-review`).
+          Label to apply. MUST match the label cursor-review.yml triggers on
+          (its `review_label` input, default `cursor-review`).
         type: string
         required: false
         default: cursor-review
@@ -73,10 +81,13 @@ jobs:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
 
-      - name: Apply label if assignee is opted in
+      - name: Apply label when an opted-in person opens / readies / is assigned
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ACTION: ${{ github.event.action }}
           ASSIGNEE: ${{ github.event.assignee.login }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
           PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
@@ -92,21 +103,40 @@ jobs:
             exit 0
           fi
 
+          # Pick the login this event is "about":
+          #   assigned                  -> the newly-assigned reviewer
+          #   opened / ready_for_review -> the PR author
+          case "$ACTION" in
+            assigned)
+              candidate="$ASSIGNEE" ;;
+            opened|ready_for_review)
+              candidate="$AUTHOR" ;;
+            *)
+              echo "Unhandled action '$ACTION' — no-op."
+              exit 0 ;;
+          esac
+
+          # Don't fire on a PR opened as a draft — the ready_for_review event
+          # re-triggers this workflow once it's marked ready.
+          if [ "$ACTION" = "opened" ] && [ "$IS_DRAFT" = "true" ]; then
+            echo "PR opened as a draft — deferring until marked ready for review."
+            exit 0
+          fi
+
           matched=false
           for login in $OPTED_IN_LOGINS; do
-            if [ "$ASSIGNEE" = "$login" ]; then
+            if [ "$candidate" = "$login" ]; then
               matched=true
               break
             fi
           done
 
           if [ "$matched" = "false" ]; then
-            echo "Assignee $ASSIGNEE is not opted in — no-op."
+            echo "$candidate is not opted in (action=$ACTION) — no-op."
             exit 0
           fi
 
-          # Already labeled (e.g. applied manually before assigning) — don't
-          # re-add; it would no-op anyway, but stay quiet about it.
+          # Already labeled — don't re-add (would just no-op anyway).
           if echo "$PR_LABELS" | jq -e --arg l "$REVIEW_LABEL" 'index($l)' > /dev/null; then
             echo "$REVIEW_LABEL already present — no-op."
             exit 0
@@ -118,5 +148,5 @@ jobs:
             exit 0
           fi
 
-          echo "Applying $REVIEW_LABEL label for $ASSIGNEE."
+          echo "Applying $REVIEW_LABEL label for $candidate (action=$ACTION)."
           gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label "$REVIEW_LABEL"
