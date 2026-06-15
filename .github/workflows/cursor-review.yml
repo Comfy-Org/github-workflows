@@ -47,7 +47,7 @@ on:
           the panel.
         type: string
         required: false
-        default: claude-opus-4-7-thinking-xhigh
+        default: claude-opus-4-8-thinking-xhigh
       diff_size_cap:
         description: >-
           Max changed lines (added + removed, after diff_excludes). PRs over
@@ -247,7 +247,7 @@ jobs:
         # and Claude expose xhigh variants we use here.
         model:
           - gpt-5.3-codex-xhigh
-          - claude-opus-4-7-thinking-xhigh
+          - claude-opus-4-8-thinking-xhigh
           - gemini-3.1-pro
           - kimi-k2.5
         review_type: [adversarial, edge-case]
