@@ -1,0 +1,105 @@
+name: Bump cursor-review callers
+
+# When cursor-review.yml is updated on main, open a SHA-bump PR in every repo
+# that pins a caller against it. PRs are opened by Cloud Code Bot so they are
+# easy to filter and merge.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/cursor-review.yml
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate Cloud Code Bot token
+        uses: actions/create-github-app-token@df432ceedc7162793a195dd1713ff69aeae84f52 # v1.12.0
+        id: token
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+          owner: Comfy-Org
+
+      - name: Bump SHA in caller repos
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          NEW_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          SHORT="${NEW_SHA:0:7}"
+          BRANCH="ci/bump-cursor-review-${SHORT}"
+
+          # repo|file|label — label is optional, leave empty if the repo has none
+          CALLERS=(
+            "Comfy-Org/cloud|.github/workflows/ci-cursor-review.yml|"
+            "Comfy-Org/comfy-cloud-mcp-server|.github/workflows/ci-cursor-review.yml|"
+            "Comfy-Org/comfy-inapp-agent|.github/workflows/ci-cursor-review.yml|"
+            "Comfy-Org/swarmhost|.github/workflows/cursor-review.yml|"
+            "Comfy-Org/comfy-infra|.github/workflows/ci-cursor-review.yml|"
+            "Comfy-Org/ComfyUI_frontend|.github/workflows/pr-cursor-review.yaml|"
+            "Comfy-Org/Comfy-Desktop|.github/workflows/ci-cursor-review.yml|ci"
+            "Comfy-Org/ComfyUI|.github/workflows/ci-cursor-review.yml|Core"
+          )
+
+          for ENTRY in "${CALLERS[@]}"; do
+            REPO=$(echo "$ENTRY" | cut -d'|' -f1)
+            FILE=$(echo "$ENTRY" | cut -d'|' -f2)
+            LABEL=$(echo "$ENTRY" | cut -d'|' -f3)
+            FILE_ENC="${FILE//\//%2F}"
+
+            DEFAULT_BRANCH=$(gh api "repos/${REPO}" --jq '.default_branch')
+
+            # Fetch current file; skip if not found
+            CURRENT=$(gh api "repos/${REPO}/contents/${FILE_ENC}?ref=${DEFAULT_BRANCH}" 2>/dev/null) || {
+              echo "::warning::${REPO}: ${FILE} not found — skipping"
+              continue
+            }
+
+            BLOB_SHA=$(echo "$CURRENT" | jq -r '.sha')
+            OLD_CONTENT=$(echo "$CURRENT" | jq -r '.content' | base64 -d)
+
+            # Skip if already pinned to this SHA
+            if echo "$OLD_CONTENT" | grep -qF "$NEW_SHA"; then
+              echo "${REPO}: already at ${SHORT} — skipping"
+              continue
+            fi
+
+            # Replace every 40-char hex SHA and update the inline comment
+            NEW_CONTENT=$(echo "$OLD_CONTENT" \
+              | sed -E "s/[0-9a-f]{40}/${NEW_SHA}/g" \
+              | sed -E "s|# github-workflows#[0-9]+|# github-workflows main (${SHORT})|g")
+
+            # Create branch from default branch tip (ignore 422 if it already exists)
+            MAIN_SHA=$(gh api "repos/${REPO}/git/refs/heads/${DEFAULT_BRANCH}" --jq '.object.sha')
+            gh api --method POST "repos/${REPO}/git/refs" \
+              --field ref="refs/heads/${BRANCH}" \
+              --field sha="${MAIN_SHA}" 2>/dev/null || true
+
+            # Commit updated file
+            ENCODED=$(printf '%s' "$NEW_CONTENT" | base64 | tr -d '\n')
+            gh api --method PUT "repos/${REPO}/contents/${FILE_ENC}" \
+              --field message="ci: bump cursor-review to github-workflows@${SHORT}" \
+              --field content="${ENCODED}" \
+              --field sha="${BLOB_SHA}" \
+              --field branch="${BRANCH}" \
+              > /dev/null
+
+            # Build label args if the repo has a label configured
+            LABEL_ARGS=()
+            [[ -n "$LABEL" ]] && LABEL_ARGS=(--label "$LABEL")
+
+            # Open PR (ignore error if one already exists for this branch)
+            gh pr create \
+              --repo "${REPO}" \
+              --head "${BRANCH}" \
+              --base "${DEFAULT_BRANCH}" \
+              --title "ci: bump cursor-review to github-workflows@${SHORT}" \
+              --body "Automatic SHA bump — \`cursor-review.yml\` was updated in \`Comfy-Org/github-workflows\` at [\`${SHORT}\`](https://github.com/Comfy-Org/github-workflows/commit/${NEW_SHA}).
+
+_Opened by the \`bump-cursor-review-callers\` workflow._" \
+              "${LABEL_ARGS[@]}" 2>/dev/null \
+              && echo "${REPO}: PR opened" \
+              || echo "::warning::${REPO}: PR may already exist for ${BRANCH}"
+          done
