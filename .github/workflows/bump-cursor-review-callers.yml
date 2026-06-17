@@ -31,22 +31,22 @@ jobs:
           SHORT="${NEW_SHA:0:7}"
           BRANCH="ci/bump-cursor-review-${SHORT}"
 
-          # repo|file pairs — one entry per caller
+          # repo|file|label — label is optional, leave empty if the repo has none
           CALLERS=(
-            "Comfy-Org/cloud|.github/workflows/ci-cursor-review.yml"
-            "Comfy-Org/comfy-cloud-mcp-server|.github/workflows/ci-cursor-review.yml"
-            "Comfy-Org/comfy-inapp-agent|.github/workflows/ci-cursor-review.yml"
-            "Comfy-Org/swarmhost|.github/workflows/cursor-review.yml"
-            "Comfy-Org/comfy-infra|.github/workflows/ci-cursor-review.yml"
-            "Comfy-Org/ComfyUI_frontend|.github/workflows/pr-cursor-review.yaml"
-            "Comfy-Org/Comfy-Desktop|.github/workflows/ci-cursor-review.yml"
-            "Comfy-Org/ComfyUI|.github/workflows/ci-cursor-review.yml"
+            "Comfy-Org/cloud|.github/workflows/ci-cursor-review.yml|"
+            "Comfy-Org/comfy-cloud-mcp-server|.github/workflows/ci-cursor-review.yml|"
+            "Comfy-Org/comfy-inapp-agent|.github/workflows/ci-cursor-review.yml|"
+            "Comfy-Org/swarmhost|.github/workflows/cursor-review.yml|"
+            "Comfy-Org/comfy-infra|.github/workflows/ci-cursor-review.yml|"
+            "Comfy-Org/ComfyUI_frontend|.github/workflows/pr-cursor-review.yaml|"
+            "Comfy-Org/Comfy-Desktop|.github/workflows/ci-cursor-review.yml|ci"
+            "Comfy-Org/ComfyUI|.github/workflows/ci-cursor-review.yml|Core"
           )
 
           for ENTRY in "${CALLERS[@]}"; do
-            REPO="${ENTRY%%|*}"
-            FILE="${ENTRY##*|}"
-            # GitHub contents API requires %2F-encoded path separators
+            REPO=$(echo "$ENTRY" | cut -d'|' -f1)
+            FILE=$(echo "$ENTRY" | cut -d'|' -f2)
+            LABEL=$(echo "$ENTRY" | cut -d'|' -f3)
             FILE_ENC="${FILE//\//%2F}"
 
             DEFAULT_BRANCH=$(gh api "repos/${REPO}" --jq '.default_branch')
@@ -66,8 +66,7 @@ jobs:
               continue
             fi
 
-            # Replace every 40-char hex SHA (uses: pin + workflows_ref value) and
-            # update the inline # github-workflows#N comment to record the new ref.
+            # Replace every 40-char hex SHA and update the inline comment
             NEW_CONTENT=$(echo "$OLD_CONTENT" \
               | sed -E "s/[0-9a-f]{40}/${NEW_SHA}/g" \
               | sed -E "s|# github-workflows#[0-9]+|# github-workflows main (${SHORT})|g")
@@ -87,6 +86,10 @@ jobs:
               --field branch="${BRANCH}" \
               > /dev/null
 
+            # Build label args if the repo has a label configured
+            LABEL_ARGS=()
+            [[ -n "$LABEL" ]] && LABEL_ARGS=(--label "$LABEL")
+
             # Open PR (ignore error if one already exists for this branch)
             gh pr create \
               --repo "${REPO}" \
@@ -95,7 +98,8 @@ jobs:
               --title "ci: bump cursor-review to github-workflows@${SHORT}" \
               --body "Automatic SHA bump — \`cursor-review.yml\` was updated in \`Comfy-Org/github-workflows\` at [\`${SHORT}\`](https://github.com/Comfy-Org/github-workflows/commit/${NEW_SHA}).
 
-_Opened by the \`bump-cursor-review-callers\` workflow._" 2>/dev/null \
+_Opened by the \`bump-cursor-review-callers\` workflow._" \
+              "${LABEL_ARGS[@]}" 2>/dev/null \
               && echo "${REPO}: PR opened" \
               || echo "::warning::${REPO}: PR may already exist for ${BRANCH}"
           done
