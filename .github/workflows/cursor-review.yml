@@ -127,7 +127,22 @@ jobs:
           LABEL_NAME: ${{ github.event.label.name }}
           PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
           GH_EVENT_ACTION: ${{ github.event.action }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          BASE_REPO: ${{ github.repository }}
         run: |
+          # PRs from forks can't run this review. The pull_request event grants
+          # fork PRs no access to secrets — so CURSOR_API_KEY is empty and every
+          # panel cell produces empty output — and a read-only GITHUB_TOKEN, so
+          # posting the consolidated review returns HTTP 403. The review can
+          # neither analyze nor post, so skip cleanly instead of burning the
+          # 8-cell matrix + judge and failing red on every external contribution.
+          # (head.repo.full_name != github.repository is the cross-repo signal.)
+          if [ -n "$HEAD_REPO" ] && [ "$HEAD_REPO" != "$BASE_REPO" ]; then
+            echo "PR is from a fork ($HEAD_REPO != $BASE_REPO) — review needs secrets and write access a fork PR can't have. Skipping."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           # skip-cursor-review wins even if the trigger label is also present.
           if echo "$PR_LABELS" | jq -e 'index("skip-cursor-review")' > /dev/null; then
             echo "skip-cursor-review label present — skipping."
