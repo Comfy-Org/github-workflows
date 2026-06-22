@@ -23,6 +23,7 @@ inline payload — typical cause is line numbers that don't match the diff.
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 
@@ -109,6 +110,78 @@ def gh_post_review(repo: str, pr_number: str, payload: str) -> subprocess.Comple
     )
 
 
+def is_read_only_token_error(result: subprocess.CompletedProcess) -> bool:
+    """True when the POST failed because the token can't write to the PR.
+
+    The gate skips fork PRs (which always hit this), but a read-only token can
+    still occur on same-repo runs — org/repo default workflow permissions set
+    to read-only, or events that downgrade the token. GitHub answers those with
+    HTTP 403 'Resource not accessible by integration'. That's an environment
+    constraint, not a review failure, so callers degrade to the job summary
+    rather than failing the check red.
+    """
+    blob = result.stderr or ""
+    return "Resource not accessible by integration" in blob or "HTTP 403" in blob
+
+
+def write_step_summary(markdown: str) -> None:
+    """Render the review into the Actions run summary as a no-write fallback.
+
+    Used when the PR can't be written to (read-only token): the content is
+    still delivered — in the run's Summary tab — instead of being lost.
+    """
+    note = (
+        "> ℹ️ This review could not be posted on the PR because the run's "
+        "`GITHUB_TOKEN` is read-only (e.g. read-only default workflow "
+        "permissions). Posting it here instead.\n\n"
+    )
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        # No summary file (e.g. a local run) — fall back to stdout so the
+        # content isn't silently dropped.
+        print(note + markdown)
+        return
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(note + markdown + "\n")
+
+
+def post_or_degrade(repo, pr_number, payload, summary_markdown, context) -> bool:
+    """POST a review; degrade to the step summary on a read-only token.
+
+    Returns True when the review was delivered — either posted on the PR, or
+    (when the token is read-only) written to the job step summary. Returns
+    False only on a genuine POST failure the caller should handle itself
+    (e.g. retry without inline anchors).
+    """
+    result = gh_post_review(repo, pr_number, payload)
+    if result.returncode == 0:
+        return True
+    if is_read_only_token_error(result):
+        print(
+            f"{context}: token is read-only — writing the review to the job "
+            "summary instead of the PR.",
+            file=sys.stderr,
+        )
+        write_step_summary(summary_markdown)
+        return True
+    print(f"{context} POST failed: {result.stderr}", file=sys.stderr)
+    return False
+
+
+def render_findings_markdown(review_body: str, comments: list[dict]) -> str:
+    """Flatten the review body + inline comments into one markdown blob.
+
+    Inline review comments don't render in a step summary, so list them
+    underneath the body when degrading to the summary or a body-only review.
+    """
+    md = review_body
+    if comments:
+        md += "\n\n---\n\n"
+        for c in comments:
+            md += f"**`{c['path']}:{c['line']}`** — {c['body']}\n\n"
+    return md
+
+
 def build_panel_summary(panel: list[dict]) -> str:
     if not panel:
         return ""
@@ -170,19 +243,14 @@ def normalize_comments(findings: list[dict]) -> list[dict]:
 
 def post_error_review(repo, pr_number, commit_sha, header, error_message):
     safe = neutralize_mentions(error_message)
-    payload = json.dumps(
-        {
-            "body": (
-                f"{header}\n\n⚠️ **Review failed**\n\n```\n{safe}\n```\n\n"
-                "Re-trigger by removing and re-adding the `cursor-review` label."
-            ),
-            "event": "COMMENT",
-            "commit_id": commit_sha,
-        }
+    body_text = (
+        f"{header}\n\n⚠️ **Review failed**\n\n```\n{safe}\n```\n\n"
+        "Re-trigger by removing and re-adding the `cursor-review` label."
     )
-    result = gh_post_review(repo, pr_number, payload)
-    if result.returncode != 0:
-        print(f"Error-review POST failed: {result.stderr}", file=sys.stderr)
+    payload = json.dumps(
+        {"body": body_text, "event": "COMMENT", "commit_id": commit_sha}
+    )
+    if not post_or_degrade(repo, pr_number, payload, body_text, "Error review"):
         raise SystemExit(1)
 
 
@@ -241,9 +309,9 @@ def main():
         payload = json.dumps(
             {"body": body_text, "event": "COMMENT", "commit_id": args.commit_sha}
         )
-        result = gh_post_review(args.repo, args.pr_number, payload)
-        if result.returncode != 0:
-            print(f"No-findings review POST failed: {result.stderr}", file=sys.stderr)
+        if not post_or_degrade(
+            args.repo, args.pr_number, payload, body_text, "No-findings review"
+        ):
             raise SystemExit(1)
         return
 
@@ -271,13 +339,22 @@ def main():
     result = gh_post_review(args.repo, args.pr_number, payload)
 
     if result.returncode != 0:
+        # A read-only token rejects any write, so the inline-less fallback below
+        # would fail the same way — degrade straight to the job summary instead.
+        if is_read_only_token_error(result):
+            print(
+                "Review: token is read-only — writing the review to the job "
+                "summary instead of the PR.",
+                file=sys.stderr,
+            )
+            write_step_summary(render_findings_markdown(review_body, comments))
+            return
+
         print(f"Review POST failed: {result.stderr}", file=sys.stderr)
         # Fallback: same body without inline anchors. Typical cause is line
         # numbers that fall outside the diff context — often the model picked
         # a line near the change but not on the change.
-        fallback_body = review_body + "\n\n---\n\n"
-        for c in comments:
-            fallback_body += f"**`{c['path']}:{c['line']}`** — {c['body']}\n\n"
+        fallback_body = render_findings_markdown(review_body, comments)
         fallback_body += "\n_(Inline comments could not be anchored to the diff; listed above instead.)_"
 
         fallback_payload = json.dumps(
@@ -287,9 +364,9 @@ def main():
                 "commit_id": args.commit_sha,
             }
         )
-        fallback_result = gh_post_review(args.repo, args.pr_number, fallback_payload)
-        if fallback_result.returncode != 0:
-            print(f"Fallback review POST also failed: {fallback_result.stderr}", file=sys.stderr)
+        if not post_or_degrade(
+            args.repo, args.pr_number, fallback_payload, fallback_body, "Fallback review"
+        ):
             raise SystemExit(1)
 
 
