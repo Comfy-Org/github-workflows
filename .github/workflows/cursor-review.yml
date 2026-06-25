@@ -97,6 +97,17 @@ on:
       SLACK_BOT_TOKEN:
         description: Slack bot token for the start/complete DM notifications. Optional — DMs are skipped if absent.
         required: false
+      BOT_APP_ID:
+        description: >-
+          GitHub App ID. When set (with BOT_APP_PRIVATE_KEY), the consolidated
+          review + per-finding line comments post under that App's identity
+          (e.g. cloud-code-bot[bot]) instead of github-actions[bot], so its
+          threads are distinct and queryable. Optional — omit to post as
+          github-actions[bot] (default; unchanged for OSS consumers).
+        required: false
+      BOT_APP_PRIVATE_KEY:
+        description: PEM private key for BOT_APP_ID. Required only when BOT_APP_ID is set.
+        required: false
 
 # DIFF_SIZE_CAP / REVIEW_LABEL / JUDGE_MODEL / DIFF_EXCLUDES are mapped from
 # `inputs` here so the run steps below read them verbatim from the original
@@ -573,9 +584,31 @@ jobs:
             echo "triggered_by=$GH_ACTOR" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Detect bot identity
+        id: bot_cfg
+        env:
+          BOT_APP_ID: ${{ secrets.BOT_APP_ID }}
+        run: |
+          # `secrets` can't be referenced in a step `if:`, so surface presence
+          # as a step output the mint step can gate on.
+          if [ -n "$BOT_APP_ID" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Mint bot-identity token (optional)
+        id: bot_token
+        if: ${{ steps.bot_cfg.outputs.enabled == 'true' }}
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.BOT_APP_ID }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+
       - name: Post review
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Dedicated bot identity when configured (BOT_APP_ID), else github-actions[bot].
+          GH_TOKEN: ${{ steps.bot_token.outputs.token || secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
