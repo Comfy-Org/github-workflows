@@ -33,9 +33,15 @@ name: Cursor Review (reusable)
 #         # Pin the assets ref to the same ref you pin `uses:` to for
 #         # reproducibility (defaults to main).
 #         workflows_ref: main
+#         # Optional: post the review under your own GitHub App so its threads are
+#         # a distinct, queryable identity instead of github-actions[bot]. Supply
+#         # your App's id + private key (App IDs aren't secret, so id is an input).
+#         bot_app_id: ${{ vars.REVIEW_BOT_APP_ID }}
 #       secrets:
 #         CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
 #         SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+#         # Optional — the private key paired with bot_app_id.
+#         BOT_APP_PRIVATE_KEY: ${{ secrets.REVIEW_BOT_PRIVATE_KEY }}
 
 on:
   workflow_call:
@@ -90,12 +96,26 @@ on:
         type: string
         required: false
         default: main
+      bot_app_id:
+        description: >-
+          GitHub App ID. When set (with the bot_app_private_key secret), the
+          consolidated review + per-finding line comments post under that App's
+          identity (your App's "<app>[bot]" login) instead of
+          github-actions[bot], so its threads are distinct and queryable.
+          Optional — omit to post as github-actions[bot] (default; unchanged for
+          OSS consumers). App IDs aren't secret, so this is an input, not a secret.
+        type: string
+        required: false
+        default: ''
     secrets:
       CURSOR_API_KEY:
         description: Cursor API key for cursor-agent (the panel + judge models bill through it).
         required: true
       SLACK_BOT_TOKEN:
         description: Slack bot token for the start/complete DM notifications. Optional — DMs are skipped if absent.
+        required: false
+      BOT_APP_PRIVATE_KEY:
+        description: PEM private key matching the bot_app_id input. Required only when bot_app_id is set.
         required: false
 
 # DIFF_SIZE_CAP / REVIEW_LABEL / JUDGE_MODEL / DIFF_EXCLUDES are mapped from
@@ -573,9 +593,18 @@ jobs:
             echo "triggered_by=$GH_ACTOR" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Mint bot-identity token (optional)
+        id: bot_token
+        if: ${{ inputs.bot_app_id != '' }}
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ inputs.bot_app_id }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+
       - name: Post review
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Dedicated bot identity when configured (bot_app_id), else github-actions[bot].
+          GH_TOKEN: ${{ steps.bot_token.outputs.token || secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
