@@ -33,14 +33,15 @@ name: Cursor Review (reusable)
 #         # Pin the assets ref to the same ref you pin `uses:` to for
 #         # reproducibility (defaults to main).
 #         workflows_ref: main
-#         # Optional dedicated review identity (else posts as github-actions[bot]).
-#         # Comfy: the shared Cloud Code Bot — its App ID lives in the APP_ID var.
-#         bot_app_id: ${{ vars.APP_ID }}
+#         # Optional: post the review under your own GitHub App so its threads are
+#         # a distinct, queryable identity instead of github-actions[bot]. Supply
+#         # your App's id + private key (App IDs aren't secret, so id is an input).
+#         bot_app_id: ${{ vars.REVIEW_BOT_APP_ID }}
 #       secrets:
 #         CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
 #         SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-#         # Optional — pairs with bot_app_id. Comfy: CLOUD_CODE_BOT_PRIVATE_KEY.
-#         BOT_APP_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+#         # Optional — the private key paired with bot_app_id.
+#         BOT_APP_PRIVATE_KEY: ${{ secrets.REVIEW_BOT_PRIVATE_KEY }}
 
 on:
   workflow_call:
@@ -99,7 +100,7 @@ on:
         description: >-
           GitHub App ID. When set (with the bot_app_private_key secret), the
           consolidated review + per-finding line comments post under that App's
-          identity (e.g. Cloud Code Bot -> cloud-code-bot[bot]) instead of
+          identity (your App's "<app>[bot]" login) instead of
           github-actions[bot], so its threads are distinct and queryable.
           Optional — omit to post as github-actions[bot] (default; unchanged for
           OSS consumers). App IDs aren't secret, so this is an input, not a secret.
