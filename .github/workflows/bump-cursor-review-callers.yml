@@ -5,6 +5,7 @@ name: Bump cursor-review callers
 # easy to filter and merge.
 
 on:
+  workflow_dispatch: {}   # allow on-demand runs (e.g. to re-bump callers)
   push:
     branches: [main]
     paths:
