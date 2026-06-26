@@ -96,9 +96,7 @@ jobs:
               --head "${BRANCH}" \
               --base "${DEFAULT_BRANCH}" \
               --title "ci: bump cursor-review to github-workflows@${SHORT}" \
-              --body "Automatic SHA bump — \`cursor-review.yml\` was updated in \`Comfy-Org/github-workflows\` at [\`${SHORT}\`](https://github.com/Comfy-Org/github-workflows/commit/${NEW_SHA}).
-
-_Opened by the \`bump-cursor-review-callers\` workflow._" \
+              --body "Automatic SHA bump — \`cursor-review.yml\` was updated in \`Comfy-Org/github-workflows\` at [\`${SHORT}\`](https://github.com/Comfy-Org/github-workflows/commit/${NEW_SHA}). _Opened by the \`bump-cursor-review-callers\` workflow._" \
               "${LABEL_ARGS[@]}" 2>/dev/null \
               && echo "${REPO}: PR opened" \
               || echo "::warning::${REPO}: PR may already exist for ${BRANCH}"
