@@ -37,6 +37,11 @@ name: Cursor Review (reusable)
 #         # a distinct, queryable identity instead of github-actions[bot]. Supply
 #         # your App's id + private key (App IDs aren't secret, so id is an input).
 #         bot_app_id: ${{ vars.REVIEW_BOT_APP_ID }}
+#         # Optional: make the review blocking. true → the "Blocking gate" check
+#         # goes red while any cursor-review finding thread is unresolved. To
+#         # actually block merge you must ALSO mark "Blocking gate" as a required
+#         # status check in this repo's branch-protection settings (see README).
+#         blocking: true
 #       secrets:
 #         CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
 #         SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
@@ -107,6 +112,20 @@ on:
         type: string
         required: false
         default: ''
+      blocking:
+        description: >-
+          Opt-in merge gate. false (default) → the review is advisory, exactly as
+          before: it posts findings but never fails the check, so no caller's
+          behavior changes until it opts in. true → a final "Blocking gate" job
+          fails (red check) when the PR has unresolved cursor-review finding
+          threads, and passes once they are all resolved (idempotent on re-run).
+          NOTE: this workflow cannot set branch protection. To actually block the
+          merge you must ALSO mark the "Blocking gate" check as a required status
+          check in the caller repo's branch-protection / ruleset settings — until
+          you do, the red check is visible but non-blocking. See the README.
+        type: boolean
+        required: false
+        default: false
     secrets:
       CURSOR_API_KEY:
         description: Cursor API key for cursor-agent (the panel + judge models bill through it).
@@ -632,6 +651,45 @@ jobs:
               --commit-sha "$HEAD_SHA" \
               --triggered-by "$TRIGGERED_BY"
           fi
+
+  blocking-gate:
+    # Opt-in merge gate (inputs.blocking). Fails the check when the PR has
+    # unresolved cursor-review finding threads, so a required-status-check
+    # config can block the merge until they're addressed. With blocking:false
+    # (default) this job is skipped entirely — the review stays advisory and
+    # the existing path is unchanged.
+    #
+    # Runs whenever the review is genuinely triggered (should_run), regardless
+    # of already_reviewed / within_cap: on a resolve→re-trigger of an unchanged
+    # commit the panel is skipped (already_reviewed) but this gate still
+    # re-queries the live thread state and goes green once the threads are
+    # resolved. `needs: consolidate` (with always()) orders it after the review
+    # is posted on a fresh run, and lets it run even when consolidate is skipped.
+    name: Blocking gate
+    needs: [gate, consolidate]
+    if: ${{ always() && inputs.blocking && needs.gate.outputs.should_run == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Load cursor-review assets
+        uses: actions/checkout@v6
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _cursor_review_assets
+          persist-credentials: false
+
+      - name: Fail on unresolved cursor-review threads
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 "$CURSOR_REVIEW_ASSETS/gate-unresolved.py" \
+            --repo "$REPO" \
+            --pr-number "$PR_NUMBER"
 
   notify-start:
     name: Notify start
