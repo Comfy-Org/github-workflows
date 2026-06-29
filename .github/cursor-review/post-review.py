@@ -262,10 +262,19 @@ def main():
     parser.add_argument("--commit-sha", required=True)
     parser.add_argument("--triggered-by", default=None)
     parser.add_argument("--error-message", default=None, help="If set, post an error review with this message")
+    parser.add_argument(
+        "--notice",
+        default=None,
+        help="Banner prepended to the review body (e.g. a judge-failed degradation note).",
+    )
     args = parser.parse_args()
 
     attribution = f"\n\n_Triggered by @{args.triggered_by}._" if args.triggered_by else ""
     header = f"## 🔍 Cursor Review — Consolidated panel{attribution}"
+    if args.notice:
+        # Surface a degradation banner (judge failed → raw panel findings) right
+        # under the title so every rendered body carries it.
+        header += f"\n\n{neutralize_mentions(args.notice)}"
 
     if args.error_message:
         post_error_review(args.repo, args.pr_number, args.commit_sha, header, args.error_message)

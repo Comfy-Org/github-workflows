@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Parse raw cursor-agent output into a normalized findings record.
 
-Used by per-cell matrix steps. Each cell calls this to convert the model's
-raw stdout into a JSON file the consolidate step can ingest. The output is
-always structured — even on parse failures or empty output — so the
-consolidate step has a uniform input.
+Used by per-cell matrix steps AND by the judge/consolidate step. Each caller
+converts the model's raw stdout into a JSON file the next step can ingest. The
+output is always structured — even on parse failures or empty output — so the
+downstream step has a uniform input.
 
 Output shape:
     {
@@ -21,32 +21,107 @@ import json
 import re
 
 
-def parse_json_findings(raw_text: str):
-    """Extract a JSON array from raw model output, tolerating surrounding prose.
+def _try_load(snippet: str):
+    """json.loads `snippet`, returning the value only if it's a list or dict.
 
-    Returns the parsed value, or None if no JSON array could be located.
+    A bare number/string/bool is never a findings payload, so reject it — this
+    keeps the brace-scan below from "succeeding" on a stray scalar.
+    """
+    try:
+        value = json.loads(snippet)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return value if isinstance(value, (list, dict)) else None
+
+
+def _iter_json_candidates(text: str):
+    """Yield each top-level balanced {...} / [...] region embedded in `text`.
+
+    String- and escape-aware: braces or brackets inside JSON string literals
+    don't throw off the nesting count, so prose like `... the findings […] are`
+    surrounding a real array doesn't corrupt the match the way a naive
+    first-`[`/last-`]` slice does. Regions are yielded in document order; the
+    caller parses each and takes the first that loads.
+    """
+    openers = {"{", "["}
+    closers = {"}", "]"}
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] not in openers:
+            i += 1
+            continue
+        depth = 0
+        in_str = False
+        escape = False
+        j = i
+        while j < n:
+            c = text[j]
+            if in_str:
+                if escape:
+                    escape = False
+                elif c == "\\":
+                    escape = True
+                elif c == '"':
+                    in_str = False
+            elif c == '"':
+                in_str = True
+            elif c in openers:
+                depth += 1
+            elif c in closers:
+                depth -= 1
+                if depth == 0:
+                    yield text[i : j + 1]
+                    break
+            j += 1
+        # Resume scanning after this region (or after an unbalanced opener).
+        i = j + 1
+
+
+def parse_json_findings(raw_text: str):
+    """Extract a JSON value (array or object) from raw model output.
+
+    Tolerates surrounding prose and markdown fences. Returns the parsed value
+    (list or dict), or None if no JSON could be located. Layered most- to
+    least-strict so a clean response takes the fast path:
+
+    1. The whole output is JSON.
+    2. A fenced ```json (or bare ```) block holds the JSON.
+    3. A balanced {...}/[...] region is embedded in prose.
     """
     text = raw_text.strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
 
-    fenced = re.search(r"```(?:json)?\s*\n(.*?)```", text, re.DOTALL)
-    if fenced:
-        try:
-            return json.loads(fenced.group(1).strip())
-        except json.JSONDecodeError:
-            pass
+    parsed = _try_load(text)
+    if parsed is not None:
+        return parsed
 
-    start = text.find("[")
-    end = text.rfind("]")
-    if start != -1 and end != -1 and end > start:
-        try:
-            return json.loads(text[start : end + 1])
-        except json.JSONDecodeError:
-            pass
+    for match in re.finditer(r"```(?:json)?\s*\n(.*?)```", text, re.DOTALL):
+        parsed = _try_load(match.group(1).strip())
+        if parsed is not None:
+            return parsed
 
+    for candidate in _iter_json_candidates(text):
+        parsed = _try_load(candidate)
+        if parsed is not None:
+            return parsed
+
+    return None
+
+
+def coerce_findings_list(parsed):
+    """Reduce a parsed JSON value to the findings list, or None if it isn't one.
+
+    The panel cells and judge are all asked for a bare JSON array, but a model
+    intermittently wraps it as `{"findings": [...]}` (or a near-synonym key).
+    Unwrap those so a well-formed-but-wrapped response parses instead of being
+    discarded as a parse_error.
+    """
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict):
+        for key in ("findings", "results", "items", "reviews"):
+            value = parsed.get(key)
+            if isinstance(value, list):
+                return value
     return None
 
 
@@ -75,19 +150,13 @@ def main():
             json.dump(record, f)
         return
 
-    findings = parse_json_findings(raw)
+    findings = coerce_findings_list(parse_json_findings(raw))
 
     if findings is None:
         # Truncate raw so artifacts stay small even on chatty parse failures.
         record.update(
             status="parse_error",
             error=f"Could not parse JSON findings from output. First 500 chars:\n{raw[:500]}",
-            findings=[],
-        )
-    elif not isinstance(findings, list):
-        record.update(
-            status="parse_error",
-            error=f"Output parsed but is not an array (got {type(findings).__name__}).",
             findings=[],
         )
     else:

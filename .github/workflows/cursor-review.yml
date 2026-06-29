@@ -508,18 +508,51 @@ jobs:
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
         run: |
-          cursor-agent \
-            --print \
-            --trust \
-            --model "$JUDGE_MODEL" \
-            < /tmp/judge-prompt.txt \
-            > /tmp/judge-raw.txt 2>/tmp/judge-stderr.txt || true
+          run_judge() {
+            cursor-agent \
+              --print \
+              --trust \
+              --model "$JUDGE_MODEL" \
+              < "$1" \
+              > /tmp/judge-raw.txt 2>/tmp/judge-stderr.txt || true
+          }
+
+          run_judge /tmp/judge-prompt.txt
 
           echo "=== Judge raw output (first 1000 chars) ==="
           head -c 1000 /tmp/judge-raw.txt
           echo ""
           echo "=== Judge stderr ==="
           cat /tmp/judge-stderr.txt
+
+          # LLMs intermittently wrap the findings array in prose. extract-findings.py
+          # recovers most of that (fenced block / embedded brace-match), but if it
+          # still can't parse, retry the judge ONCE with a terse strict-JSON
+          # reminder appended — a single retry clears the large majority of these
+          # transient parse failures. The retry overwrites /tmp/judge-raw.txt, so
+          # the parse step below reads whichever attempt the judge last produced.
+          python3 "$CURSOR_REVIEW_ASSETS/extract-findings.py" \
+            --raw /tmp/judge-raw.txt \
+            --out /tmp/judge-probe.json \
+            --model "$JUDGE_MODEL" \
+            --review-type judge
+          PROBE_STATUS=$(python3 -c "import json; print(json.load(open('/tmp/judge-probe.json')).get('status','?'))")
+
+          if [ "$PROBE_STATUS" != "ok" ]; then
+            echo "Judge output did not parse (status=$PROBE_STATUS) — retrying once with a strict-JSON reminder."
+            {
+              cat /tmp/judge-prompt.txt
+              echo ""
+              echo "=== REMINDER ==="
+              echo "Your previous response could not be parsed as JSON. Return ONLY the JSON array of findings — no prose, no explanation, no markdown code fences. Your entire response must be a single JSON array (return [] if there are no findings)."
+            } > /tmp/judge-prompt-retry.txt
+            run_judge /tmp/judge-prompt-retry.txt
+            echo "=== Judge retry raw output (first 1000 chars) ==="
+            head -c 1000 /tmp/judge-raw.txt
+            echo ""
+            echo "=== Judge retry stderr ==="
+            cat /tmp/judge-stderr.txt
+          fi
 
       - name: Build consolidated findings file
         id: consolidated
@@ -550,9 +583,13 @@ jobs:
 
           # Combine judge findings with panel metadata (model, review_type,
           # status only — drop full per-cell findings to keep the post payload
-          # small) for the post-review script.
+          # small) for the post-review script. If the judge FAILED (still no
+          # parseable verdict after the retry), fall back to the raw per-cell
+          # findings so the run surfaces what the panel found instead of a bare
+          # "Review failed".
           python3 - <<'PY'
-          import json
+          import json, os
+
           with open("/tmp/panel.json", encoding="utf-8") as f:
               panel = json.load(f)
           panel_meta = [
@@ -561,11 +598,39 @@ jobs:
           ]
           with open("/tmp/judge-findings.json", encoding="utf-8") as f:
               judge = json.load(f)
-          findings = judge.get("findings") or []
+
+          degraded = judge.get("status") != "ok"
+          if not degraded:
+              findings = judge.get("findings") or []
+          else:
+              # Judge unusable — union the per-cell findings, deduping identical
+              # (file, line, body) across cells to cut the obvious cross-cell
+              # repetition the judge would normally collapse.
+              seen, findings = set(), []
+              for cell in panel:
+                  if cell.get("status") != "ok":
+                      continue
+                  for fnd in cell.get("findings") or []:
+                      if not isinstance(fnd, dict):
+                          continue
+                      key = (fnd.get("file"), fnd.get("line"), fnd.get("body"))
+                      if key in seen:
+                          continue
+                      seen.add(key)
+                      findings.append(fnd)
+
           consolidated = {"findings": findings, "panel": panel_meta}
           with open("/tmp/consolidated.json", "w", encoding="utf-8") as f:
               json.dump(consolidated, f)
-          print(f"Consolidated: {len(findings)} judge finding(s), {len(panel_meta)} panel cells.")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as g:
+              g.write(f"consolidated_count={len(findings)}\n")
+              g.write(f"degraded={'true' if degraded else 'false'}\n")
+          print(
+              f"Consolidated: {len(findings)} finding(s) "
+              f"({'degraded panel fallback' if degraded else 'judge-adjudicated'}), "
+              f"{len(panel_meta)} panel cells."
+          )
           PY
 
       - name: Resolve triggerer
@@ -610,12 +675,30 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           TRIGGERED_BY: ${{ steps.triggerer.outputs.triggered_by }}
           JUDGE_STATUS: ${{ steps.consolidated.outputs.judge_status }}
+          CONSOLIDATED_COUNT: ${{ steps.consolidated.outputs.consolidated_count }}
         run: |
-          # If the judge call itself failed but the panel had content, post
-          # an error review so we don't silently misreport. The "ok with
-          # zero findings" path stays normal — that's the legitimate
-          # "no high-signal findings" case.
-          if [ "$JUDGE_STATUS" != "ok" ]; then
+          # Three cases:
+          # 1. Judge ok                       → normal consolidated review.
+          # 2. Judge failed, panel has findings → post the raw per-cell findings
+          #    with a notice banner (degraded, but NOT a bare "Review failed").
+          # 3. Judge failed, no findings       → honest error review.
+          if [ "$JUDGE_STATUS" = "ok" ]; then
+            python3 "$CURSOR_REVIEW_ASSETS/post-review.py" \
+              --findings /tmp/consolidated.json \
+              --pr-number "$PR_NUMBER" \
+              --repo "$REPO" \
+              --commit-sha "$HEAD_SHA" \
+              --triggered-by "$TRIGGERED_BY"
+          elif [ "${CONSOLIDATED_COUNT:-0}" != "0" ]; then
+            JUDGE_ERROR=$(python3 -c "import json; print(json.load(open('/tmp/judge-findings.json')).get('error','(no error message)'))")
+            python3 "$CURSOR_REVIEW_ASSETS/post-review.py" \
+              --findings /tmp/consolidated.json \
+              --pr-number "$PR_NUMBER" \
+              --repo "$REPO" \
+              --commit-sha "$HEAD_SHA" \
+              --triggered-by "$TRIGGERED_BY" \
+              --notice "⚠️ The judge step could not produce a parseable verdict after a retry (status=${JUDGE_STATUS}). The findings below are the raw, un-adjudicated panel output — they may contain duplicates or false positives the judge would normally filter."
+          else
             JUDGE_ERROR=$(python3 -c "import json; print(json.load(open('/tmp/judge-findings.json')).get('error','(no error message)'))")
             python3 "$CURSOR_REVIEW_ASSETS/post-review.py" \
               --findings /tmp/consolidated.json \
@@ -624,13 +707,6 @@ jobs:
               --commit-sha "$HEAD_SHA" \
               --triggered-by "$TRIGGERED_BY" \
               --error-message "Judge call failed (status=${JUDGE_STATUS}): ${JUDGE_ERROR}"
-          else
-            python3 "$CURSOR_REVIEW_ASSETS/post-review.py" \
-              --findings /tmp/consolidated.json \
-              --pr-number "$PR_NUMBER" \
-              --repo "$REPO" \
-              --commit-sha "$HEAD_SHA" \
-              --triggered-by "$TRIGGERED_BY"
           fi
 
   notify-start:
