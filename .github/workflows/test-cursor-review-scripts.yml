@@ -1,0 +1,38 @@
+name: Test cursor-review scripts
+
+# Runs the Python unit tests for the cursor-review helper scripts (the
+# extract-findings.py JSON parser in particular). These scripts drive the
+# review panel + judge consolidation, so a parser regression silently breaks
+# every consumer repo's review — cheap to guard with a unit run on change.
+
+on:
+  pull_request:
+    paths:
+      - '.github/cursor-review/**'
+      - '.github/workflows/test-cursor-review-scripts.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/cursor-review/**'
+      - '.github/workflows/test-cursor-review-scripts.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: unittest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Run cursor-review script tests
+        run: python3 -m unittest discover -s .github/cursor-review/tests -p 'test_*.py' -v
