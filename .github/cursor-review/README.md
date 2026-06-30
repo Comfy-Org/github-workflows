@@ -84,6 +84,7 @@ silently vanishing — the review tells you what didn't run.
 | [`prompt-judge.md`](prompt-judge.md) | Prompt the judge model uses to consolidate panel findings into one review. |
 | [`extract-findings.py`](extract-findings.py) | Parses a cell's raw `cursor-agent` output into a normalized findings record. Always emits structured JSON — even on empty output or parse failure — so the consolidate step has uniform input. |
 | [`post-review.py`](post-review.py) | Reads the judge's consolidated findings and posts **one** PR review with line-anchored inline comments and severity badges. |
+| [`gate-unresolved.py`](gate-unresolved.py) | The opt-in blocking gate (`blocking: true`). Queries the PR's review threads and exits non-zero while any cursor-review finding thread is unresolved. |
 | [`slack-notify.sh`](slack-notify.sh) | Sends the start/complete Slack DMs to the triggerer (no-ops without a token). |
 
 ## Adopt it in your repo
@@ -142,6 +143,46 @@ an app token is required). The opt-in roster lives in the caller's
 `vars.CURSOR_REVIEW_OPTED_IN_LOGINS`. See that workflow's header for the full
 example and the `vars.APP_ID` / `CLOUD_CODE_BOT_PRIVATE_KEY` requirements.
 
+### Optional: make the review blocking (merge gate)
+
+By default the review is **advisory** — it posts findings as PR review threads,
+but an unresolved (red) review never blocks merge. Opt into a blocking gate by
+passing `blocking: true`:
+
+```yaml
+jobs:
+  cursor-review:
+    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@<sha>  # v1
+    with:
+      blocking: true
+    secrets:
+      CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+```
+
+With `blocking: true`, a final **Blocking gate** job queries the PR's review
+threads and **fails the check while any cursor-review finding thread is
+unresolved**. Resolve the thread(s) — or push a fix and re-trigger the review —
+and the gate goes green. It is idempotent: resolving threads and re-running the
+check turns it green without a fresh panel.
+
+> **This workflow cannot set branch protection.** A red check is visible but
+> does not block merge on its own. To actually gate merges you must **also mark
+> the `Blocking gate` check as a required status check** in the calling repo:
+> *Settings → Branches → Branch protection rule* (or *Rulesets*) → **Require
+> status checks to pass** → add **`Blocking gate`** (it appears once the
+> workflow has run at least once with `blocking: true`). The check name is
+> prefixed with your caller job id, e.g. `cursor-review / Blocking gate`.
+
+Notes:
+
+- `blocking: false` (the default, or simply not passing the input) is **exactly
+  today's behavior** — no caller changes until it opts in.
+- A thread is recognized as a cursor-review thread by its originating review's
+  body marker, so the gate works whether the review posts as
+  `github-actions[bot]` or under a dedicated `bot_app_id`.
+- Outdated threads (their code changed since the finding was posted) don't
+  block — a re-review re-posts anything still wrong as a fresh thread.
+
 ## Configuration knobs
 
 All optional, with defaults — pass them under `with:` in the caller. Full
@@ -154,6 +195,8 @@ descriptions live in the [workflow header](../workflows/cursor-review.yml).
 | `review_label` | `cursor-review` | Label whose addition triggers the review. |
 | `diff_excludes` | lockfiles, `node_modules`, `dist`, `vendor`, minified/generated files | Pathspecs excluded from both the size count and the reviewed diff. |
 | `workflows_ref` | `main` | Ref this directory's prompts/scripts are loaded from. Pin to your `uses:` SHA. |
+| `bot_app_id` | `''` | Optional GitHub App ID; when set (with `BOT_APP_PRIVATE_KEY`), the review posts under that App's identity instead of `github-actions[bot]`. |
+| `blocking` | `false` | Opt-in merge gate. `true` fails the **Blocking gate** check while any cursor-review finding thread is unresolved. See [Make the review blocking](#optional-make-the-review-blocking-merge-gate). |
 
 ### Escape hatches
 
