@@ -1,0 +1,358 @@
+name: Assign Reviewers (reusable)
+
+# Auto-requests expertise-aware, load-balanced PR reviewers, with optional
+# "new-folk" randomization so people outside the matched experts get review
+# reps. Models its structure on cursor-review-auto-label.yml: a workflow_call
+# contract, caller-side `vars` for config, a GitHub App token, and defensive
+# draft/skip handling that never fails the PR.
+#
+# WHY AN APP TOKEN: reviewer requests are made with the CLOUD_CODE_BOT app token
+# (vars.APP_ID + secrets.CLOUD_CODE_BOT_PRIVATE_KEY), not the default
+# GITHUB_TOKEN. On fork PRs the GITHUB_TOKEN is read-only, so a
+# GITHUB_TOKEN-driven requestReviewers would 403 (the failure seen in
+# github-workflows#12). The app token sidesteps that, so the calling job only
+# needs `contents: read` — no `pull-requests: write` on GITHUB_TOKEN.
+#
+# REVIEWER CONFIG (in the CALLER repo, default `.github/reviewers.yml`): a
+# top-level `default_pool` plus a `rules` list mapping path globs to reviewers.
+#
+#   default_pool: [octocat, hubot]        # fallback when no rule matches
+#   rules:
+#     - paths: ["frontend/**", "*.css"]   # globs (*, **, ? supported)
+#       reviewers: [alice, bob]
+#     - paths:
+#         - backend/**
+#       reviewers:
+#         - carol
+#
+# Both flow (`[a, b]`) and block (`- a`) sequences are accepted. The config is
+# read from the PR head SHA via the contents API, so a PR's own edits to the
+# config take effect on that PR.
+#
+# SELECTION: changed paths -> union of matching experts (else default_pool) ->
+# drop the author + vars.REVIEWER_EXCLUDE -> rank ascending by each candidate's
+# open review load (steering off anyone at/over vars.REVIEWER_LOAD_CAP) ->
+# deterministically (per PR number) maybe swap the last slot for a
+# vars.REVIEWER_GROWTH_POOL member -> request the top `num_reviewers`.
+#
+# Example caller (consumer repo):
+#
+#   name: CI - Assign Reviewers
+#   on:
+#     pull_request:
+#       types: [opened, ready_for_review]
+#   jobs:
+#     assign:
+#       permissions:
+#         contents: read
+#       uses: Comfy-Org/github-workflows/.github/workflows/assign-reviewers.yml@<sha>  # v1
+#       with:
+#         num_reviewers: 2
+#       secrets:
+#         CLOUD_CODE_BOT_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+#
+# Caller-side configuration:
+#   vars.APP_ID                 - CLOUD_CODE_BOT app id (same as cursor-review-auto-label)
+#   vars.REVIEWER_GROWTH_POOL   - whitespace-separated logins for new-folk randomization
+#   vars.REVIEWER_LOAD_CAP      - max open reviews before a candidate is steered off (optional)
+#   vars.REVIEWER_EXCLUDE       - whitespace-separated logins to hard-exclude (optional)
+
+on:
+  workflow_call:
+    inputs:
+      reviewer_config_path:
+        description: >-
+          Path in the caller repo to the expertise/path-glob reviewer config.
+        type: string
+        required: false
+        default: .github/reviewers.yml
+      num_reviewers:
+        description: How many reviewers to request.
+        type: number
+        required: false
+        default: 2
+      skip_label:
+        description: >-
+          If this label is present on the PR, reviewer assignment is suppressed.
+        type: string
+        required: false
+        default: skip-auto-assign
+    secrets:
+      CLOUD_CODE_BOT_PRIVATE_KEY:
+        description: >-
+          Private key for the CLOUD_CODE_BOT GitHub App (app id = vars.APP_ID).
+          Required: reviewer requests are made by the app so they succeed even on
+          fork PRs where the default GITHUB_TOKEN is read-only.
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  assign-reviewers:
+    name: Request expertise-aware reviewers
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+
+      - name: Select and request reviewers
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          REVIEWER_CONFIG_PATH: ${{ inputs.reviewer_config_path }}
+          NUM_REVIEWERS: ${{ inputs.num_reviewers }}
+          SKIP_LABEL: ${{ inputs.skip_label }}
+          GROWTH_POOL: ${{ vars.REVIEWER_GROWTH_POOL }}
+          LOAD_CAP: ${{ vars.REVIEWER_LOAD_CAP }}
+          EXCLUDE: ${{ vars.REVIEWER_EXCLUDE }}
+        with:
+          # Authenticate the octokit with the APP token so reviewer requests
+          # work on fork PRs (read-only GITHUB_TOKEN would 403).
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const pr = context.payload.pull_request;
+            if (!pr) { core.info('Not a pull_request event — nothing to do.'); return; }
+            const { owner, repo } = context.repo;
+            const pull_number = pr.number;
+
+            // --- 1. Early exits (never fail the PR) ---
+            if (pr.draft) { core.info('PR is a draft — skipping.'); return; }
+            if (pr.user && pr.user.type === 'Bot') { core.info('Author is a bot — skipping.'); return; }
+            const skipLabel = process.env.SKIP_LABEL;
+            const labels = (pr.labels || []).map((l) => l.name);
+            if (skipLabel && labels.includes(skipLabel)) {
+              core.info(`${skipLabel} present — skipping.`);
+              return;
+            }
+            if ((pr.requested_reviewers || []).length > 0) {
+              core.info('PR already has requested reviewers — skipping.');
+              return;
+            }
+
+            // --- helpers ---
+            // Dependency-free glob -> RegExp (`*` within a segment, `**` across
+            // segments, `?` single non-slash char). minimatch/picomatch are not
+            // reliably available inside github-script, so we roll our own.
+            const globToRegExp = (glob) => {
+              let re = '';
+              for (let i = 0; i < glob.length; i++) {
+                const c = glob[i];
+                if (c === '*') {
+                  if (glob[i + 1] === '*') {
+                    if (glob[i + 2] === '/') { re += '(?:.*/)?'; i += 2; }
+                    else { re += '.*'; i += 1; }
+                  } else { re += '[^/]*'; }
+                } else if (c === '?') {
+                  re += '[^/]';
+                } else if ('.+^${}()|[]\\/'.includes(c)) {
+                  re += '\\' + c;
+                } else {
+                  re += c;
+                }
+              }
+              return new RegExp('^' + re + '$');
+            };
+            const matchesAny = (p, globs) => globs.some((g) => globToRegExp(g).test(p));
+
+            // Minimal YAML parser scoped to the documented reviewers.yml schema
+            // (default_pool + rules[{paths, reviewers}], flow or block seqs).
+            // js-yaml is not bundled with github-script; the schema is small and
+            // fixed, so a focused parser is safer than an unavailable dependency.
+            const parseReviewerConfig = (text) => {
+              const out = { default_pool: [], rules: [] };
+              const stripComment = (s) => {
+                let inS = false, inD = false;
+                for (let i = 0; i < s.length; i++) {
+                  const ch = s[i];
+                  if (ch === "'" && !inD) inS = !inS;
+                  else if (ch === '"' && !inS) inD = !inD;
+                  else if (ch === '#' && !inS && !inD && (i === 0 || /\s/.test(s[i - 1]))) return s.slice(0, i);
+                }
+                return s;
+              };
+              const unquote = (s) => {
+                s = s.trim();
+                if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) return s.slice(1, -1);
+                return s;
+              };
+              const parseFlow = (s) => {
+                s = s.trim();
+                if (!s.startsWith('[')) return null;
+                const end = s.indexOf(']');
+                const inner = s.slice(1, end === -1 ? s.length : end);
+                return inner.split(',').map((x) => unquote(x)).filter((x) => x.length > 0);
+              };
+              const indentOf = (l) => l.match(/^ */)[0].length;
+              const lines = text.split(/\r?\n/).map(stripComment);
+              let i = 0;
+              while (i < lines.length) {
+                const raw = lines[i];
+                if (!raw.trim()) { i++; continue; }
+                const line = raw.trim();
+                if (indentOf(raw) === 0 && line.startsWith('default_pool:')) {
+                  const rest = line.slice('default_pool:'.length).trim();
+                  const flow = parseFlow(rest);
+                  if (flow) { out.default_pool = flow; i++; continue; }
+                  i++;
+                  while (i < lines.length) {
+                    const r = lines[i];
+                    if (!r.trim()) { i++; continue; }
+                    if (indentOf(r) === 0) break;
+                    const t = r.trim();
+                    if (t.startsWith('- ')) out.default_pool.push(unquote(t.slice(2)));
+                    i++;
+                  }
+                  continue;
+                }
+                if (indentOf(raw) === 0 && line.startsWith('rules:')) {
+                  i++;
+                  let current = null, listKey = null, ruleIndent = -1;
+                  const setKey = (seg) => {
+                    const m = seg.match(/^(paths|reviewers):(.*)$/);
+                    if (!m) return;
+                    const key = m[1];
+                    const val = m[2].trim();
+                    const flow = parseFlow(val);
+                    if (flow) { if (current) current[key] = flow; listKey = null; }
+                    else if (val === '') { listKey = key; }
+                    else { if (current) current[key] = [unquote(val)]; listKey = null; }
+                  };
+                  while (i < lines.length) {
+                    const r = lines[i];
+                    if (!r.trim()) { i++; continue; }
+                    if (indentOf(r) === 0) break;
+                    const ind = indentOf(r);
+                    const t = r.trim();
+                    const isDash = t === '-' || t.startsWith('- ');
+                    if (isDash && (ruleIndent === -1 || ind === ruleIndent)) {
+                      if (ruleIndent === -1) ruleIndent = ind;
+                      current = { paths: [], reviewers: [] };
+                      out.rules.push(current);
+                      listKey = null;
+                      const afterDash = t.slice(1).trim();
+                      if (afterDash) setKey(afterDash);
+                    } else if (isDash && listKey && current) {
+                      current[listKey].push(unquote(t.slice(1).trim()));
+                    } else {
+                      setKey(t);
+                    }
+                    i++;
+                  }
+                  continue;
+                }
+                i++;
+              }
+              return out;
+            };
+
+            // --- 2. Changed paths ---
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner, repo, pull_number, per_page: 100,
+            });
+            const changed = files.map((f) => f.filename);
+            core.info(`PR #${pull_number}: ${changed.length} changed file(s).`);
+
+            // --- 3. Read + parse the caller's reviewer config from the head SHA ---
+            const configPath = process.env.REVIEWER_CONFIG_PATH;
+            let config;
+            try {
+              const res = await github.rest.repos.getContent({
+                owner, repo, path: configPath, ref: pr.head.sha,
+              });
+              if (Array.isArray(res.data) || !res.data.content) {
+                core.info(`${configPath} is not a file — nothing to do.`);
+                return;
+              }
+              const text = Buffer.from(res.data.content, 'base64').toString('utf8');
+              config = parseReviewerConfig(text);
+            } catch (e) {
+              core.info(`Could not read ${configPath}@${pr.head.sha} (${e.message}) — nothing to do.`);
+              return;
+            }
+
+            // Match changed paths -> union of expert reviewers; else default_pool.
+            const candidates = new Set();
+            for (const rule of config.rules) {
+              const globs = rule.paths || [];
+              if (globs.length && changed.some((p) => matchesAny(p, globs))) {
+                for (const r of (rule.reviewers || [])) candidates.add(r);
+              }
+            }
+            if (candidates.size === 0) {
+              for (const r of (config.default_pool || [])) candidates.add(r);
+            }
+
+            // --- 4. Remove the author and hard-excluded logins ---
+            const exclude = new Set(
+              (process.env.EXCLUDE || '').split(/\s+/).filter(Boolean)
+            );
+            if (pr.user && pr.user.login) exclude.add(pr.user.login);
+            let pool = [...candidates].filter((c) => !exclude.has(c));
+            if (pool.length === 0) {
+              core.info('No eligible candidates after exclusions — nothing to request.');
+              return;
+            }
+
+            // --- 5. Load-balance: rank ascending by open review load ---
+            const cap = parseInt(process.env.LOAD_CAP || '', 10); // NaN when unset
+            const withLoad = [];
+            for (const login of pool) {
+              let load = 0;
+              try {
+                const r = await github.rest.search.issuesAndPullRequests({
+                  q: `is:open is:pr review-requested:${login} org:${owner}`,
+                });
+                load = r.data.total_count;
+              } catch (e) {
+                core.info(`Load query failed for ${login} (${e.message}) — treating load as 0.`);
+              }
+              withLoad.push({ login, load });
+            }
+            let ranked = withLoad.slice().sort((a, b) => a.load - b.load);
+            if (!Number.isNaN(cap)) {
+              const under = ranked.filter((x) => x.load < cap);
+              // Only steer off over-cap candidates if some remain; otherwise a
+              // busy reviewer beats no reviewer.
+              if (under.length > 0) ranked = under;
+            }
+            let selected = ranked.map((x) => x.login);
+
+            // --- 6. New-folk randomization (deterministic per PR number) ---
+            const num = Math.max(1, parseInt(process.env.NUM_REVIEWERS || '2', 10) || 2);
+            const growth = (process.env.GROWTH_POOL || '').split(/\s+/).filter(Boolean);
+            selected = selected.slice(0, num);
+            // Deterministic pseudo-random in [0,1) from the PR number — stable
+            // across re-runs of the same PR, so behavior is not flaky.
+            const rand = ((pull_number * 2654435761) >>> 0) / 4294967296;
+            if (growth.length && selected.length >= 1 && rand < 0.5) {
+              const eligible = growth.filter((g) => !selected.includes(g) && !exclude.has(g));
+              if (eligible.length) {
+                const pick = eligible[pull_number % eligible.length];
+                if (selected.length >= 2) {
+                  selected[selected.length - 1] = pick; // swap last expert slot
+                } else {
+                  selected.push(pick); // single expert: add a newcomer instead of dropping coverage
+                }
+              }
+            }
+            selected = selected.slice(0, num);
+
+            // --- 7. Request reviewers (never fail the PR) ---
+            if (selected.length === 0) {
+              core.info('No reviewers selected — nothing to request.');
+              return;
+            }
+            try {
+              await github.rest.pulls.requestReviewers({
+                owner, repo, pull_number, reviewers: selected,
+              });
+              core.info(`Requested reviewers: ${selected.join(', ')}`);
+            } catch (e) {
+              core.warning(`requestReviewers failed (${e.message}) — leaving PR unassigned.`);
+            }
