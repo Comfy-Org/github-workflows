@@ -1,0 +1,74 @@
+name: Assign PRs to Author (reusable)
+
+# Reusable workflow that assigns every open PR with no assignees to its
+# author. Useful when a team tracks PR ownership via assignees (rather than
+# reviewers) — unassigned PRs get routed back to whoever opened them.
+#
+# By default, PRs opened by bot accounts (Dependabot, Renovate, app tokens)
+# are skipped; set `skip-bots: false` to assign those too.
+#
+# The caller's GITHUB_TOKEN is used (no secrets to pass), so the calling job
+# MUST grant `pull-requests: write` and `issues: write` — assignees are set
+# through the issues API.
+#
+# Caller pattern (place in your repo at .github/workflows/assign-prs-to-author.yml):
+#
+#   name: Housekeeping - Assign PRs to Author
+#   on:
+#     schedule:
+#       - cron: "0 2 * * *"   # daily at 02:00 UTC
+#     workflow_dispatch:
+#   jobs:
+#     assign:
+#       permissions:
+#         pull-requests: write
+#         issues: write
+#       uses: Comfy-Org/github-workflows/.github/workflows/assign-prs-to-author.yml@<sha>  # v1
+
+on:
+  workflow_call:
+    inputs:
+      skip-bots:
+        description: >-
+          Skip PRs opened by bot accounts (Dependabot, Renovate, app tokens).
+          Set to false to assign those to their bot author as well.
+        type: boolean
+        required: false
+        default: true
+
+jobs:
+  assign:
+    name: Assign unassigned PRs
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Assign unassigned PRs to their authors
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const skipBots = ${{ inputs.skip-bots }};
+            const pulls = await github.paginate(github.rest.pulls.list, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100,
+            });
+
+            for (const pr of pulls) {
+              // Already owned, or no resolvable author — leave it alone.
+              if (pr.assignees.length > 0 || !pr.user) continue;
+              if (skipBots && pr.user.type === 'Bot') continue;
+              try {
+                console.log(`Assigning PR #${pr.number} to ${pr.user.login}`);
+                await github.rest.issues.addAssignees({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pr.number,
+                  assignees: [pr.user.login],
+                });
+              } catch (error) {
+                console.warn(`Failed to assign PR #${pr.number}: ${error.message}`);
+              }
+            }
