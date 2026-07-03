@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Generate Cloud Code Bot token
-        uses: actions/create-github-app-token@df432ceedc7162793a195dd1713ff69aeae84f52 # v1.12.0
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
         id: token
         with:
           app-id: ${{ vars.APP_ID }}
@@ -28,7 +28,11 @@ jobs:
           GH_TOKEN: ${{ steps.token.outputs.token }}
           NEW_SHA: ${{ github.sha }}
         run: |
-          set -euo pipefail
+          # NOTE: deliberately no `set -e`. Each caller is bumped independently
+          # in bump_one(); a failure there returns non-zero and is downgraded to
+          # a per-repo warning so one bad repo cannot abort the whole fan-out.
+          # We still fail the job at the end if any repo failed.
+          set -uo pipefail
           SHORT="${NEW_SHA:0:7}"
           BRANCH="ci/bump-cursor-review-${SHORT}"
 
@@ -36,6 +40,7 @@ jobs:
           CALLERS=(
             "Comfy-Org/cloud|.github/workflows/ci-cursor-review.yml|"
             "Comfy-Org/comfy-cloud-mcp-server|.github/workflows/ci-cursor-review.yml|"
+            "Comfy-Org/comfy-local-mcp|.github/workflows/ci-cursor-review.yml|"
             "Comfy-Org/comfy-inapp-agent|.github/workflows/ci-cursor-review.yml|"
             "Comfy-Org/swarmhost|.github/workflows/cursor-review.yml|"
             "Comfy-Org/comfy-infra|.github/workflows/ci-cursor-review.yml|"
@@ -44,61 +49,92 @@ jobs:
             "Comfy-Org/ComfyUI|.github/workflows/ci-cursor-review.yml|Core"
           )
 
-          for ENTRY in "${CALLERS[@]}"; do
-            REPO=$(echo "$ENTRY" | cut -d'|' -f1)
-            FILE=$(echo "$ENTRY" | cut -d'|' -f2)
-            LABEL=$(echo "$ENTRY" | cut -d'|' -f3)
+          # Bump a single caller repo. Every external call is guarded, so a bad
+          # repo returns non-zero here (caught by the loop) instead of killing
+          # the run. An expected skip (file missing / already pinned) is a
+          # successful `return 0`.
+          bump_one() {
+            local ENTRY="$1" REPO FILE LABEL FILE_ENC
+            REPO=$(cut -d'|' -f1 <<<"$ENTRY")
+            FILE=$(cut -d'|' -f2 <<<"$ENTRY")
+            LABEL=$(cut -d'|' -f3 <<<"$ENTRY")
             FILE_ENC="${FILE//\//%2F}"
 
-            DEFAULT_BRANCH=$(gh api "repos/${REPO}" --jq '.default_branch')
-
-            # Fetch current file; skip if not found
-            CURRENT=$(gh api "repos/${REPO}/contents/${FILE_ENC}?ref=${DEFAULT_BRANCH}" 2>/dev/null) || {
-              echo "::warning::${REPO}: ${FILE} not found — skipping"
-              continue
+            local DEFAULT_BRANCH
+            DEFAULT_BRANCH=$(gh api "repos/${REPO}" --jq '.default_branch') || {
+              echo "::warning::${REPO}: cannot read repo metadata — skipping"
+              return 1
             }
 
-            BLOB_SHA=$(echo "$CURRENT" | jq -r '.sha')
-            OLD_CONTENT=$(echo "$CURRENT" | jq -r '.content' | base64 -d)
+            # Fetch current file; a missing file is an expected skip (success).
+            local CURRENT
+            CURRENT=$(gh api "repos/${REPO}/contents/${FILE_ENC}?ref=${DEFAULT_BRANCH}" 2>/dev/null) || {
+              echo "::warning::${REPO}: ${FILE} not found — skipping"
+              return 0
+            }
 
-            # Skip if already pinned to this SHA
-            if echo "$OLD_CONTENT" | grep -qF "$NEW_SHA"; then
+            local BLOB_SHA OLD_CONTENT
+            BLOB_SHA=$(jq -r '.sha' <<<"$CURRENT")
+            OLD_CONTENT=$(jq -r '.content' <<<"$CURRENT" | base64 -d)
+
+            # Already pinned to this SHA → nothing to do (success).
+            if grep -qF "$NEW_SHA" <<<"$OLD_CONTENT"; then
               echo "${REPO}: already at ${SHORT} — skipping"
-              continue
+              return 0
             fi
 
-            # Replace every 40-char hex SHA and update the inline comment
-            NEW_CONTENT=$(echo "$OLD_CONTENT" \
-              | sed -E "s/[0-9a-f]{40}/${NEW_SHA}/g" \
-              | sed -E "s|# github-workflows#[0-9]+|# github-workflows main (${SHORT})|g")
+            # Replace every 40-char hex SHA and update the inline comment.
+            local NEW_CONTENT
+            NEW_CONTENT=$(sed -E "s/[0-9a-f]{40}/${NEW_SHA}/g; s|# github-workflows#[0-9]+|# github-workflows main (${SHORT})|g" <<<"$OLD_CONTENT")
 
-            # Create branch from default branch tip (ignore 422 if it already exists)
-            MAIN_SHA=$(gh api "repos/${REPO}/git/refs/heads/${DEFAULT_BRANCH}" --jq '.object.sha')
+            # Create the branch from the default-branch tip (ignore 422 if it exists).
+            local MAIN_SHA
+            MAIN_SHA=$(gh api "repos/${REPO}/git/refs/heads/${DEFAULT_BRANCH}" --jq '.object.sha') || {
+              echo "::warning::${REPO}: cannot read ${DEFAULT_BRANCH} ref — skipping"
+              return 1
+            }
             gh api --method POST "repos/${REPO}/git/refs" \
               --field ref="refs/heads/${BRANCH}" \
               --field sha="${MAIN_SHA}" 2>/dev/null || true
 
-            # Commit updated file
+            # Commit the updated file onto the branch.
+            local ENCODED
             ENCODED=$(printf '%s' "$NEW_CONTENT" | base64 | tr -d '\n')
             gh api --method PUT "repos/${REPO}/contents/${FILE_ENC}" \
               --field message="ci: bump cursor-review to github-workflows@${SHORT}" \
               --field content="${ENCODED}" \
               --field sha="${BLOB_SHA}" \
               --field branch="${BRANCH}" \
-              > /dev/null
+              > /dev/null || {
+              echo "::warning::${REPO}: commit to ${BRANCH} failed — skipping"
+              return 1
+            }
 
-            # Build label args if the repo has a label configured
-            LABEL_ARGS=()
+            local LABEL_ARGS=()
             [[ -n "$LABEL" ]] && LABEL_ARGS=(--label "$LABEL")
 
-            # Open PR (ignore error if one already exists for this branch)
-            gh pr create \
+            # Open the PR (a pre-existing PR for this branch is not an error).
+            if gh pr create \
               --repo "${REPO}" \
               --head "${BRANCH}" \
               --base "${DEFAULT_BRANCH}" \
               --title "ci: bump cursor-review to github-workflows@${SHORT}" \
               --body "Automatic SHA bump — \`cursor-review.yml\` was updated in \`Comfy-Org/github-workflows\` at [\`${SHORT}\`](https://github.com/Comfy-Org/github-workflows/commit/${NEW_SHA}). _Opened by the \`bump-cursor-review-callers\` workflow._" \
-              "${LABEL_ARGS[@]}" 2>/dev/null \
-              && echo "${REPO}: PR opened" \
-              || echo "::warning::${REPO}: PR may already exist for ${BRANCH}"
+              "${LABEL_ARGS[@]}" 2>/dev/null; then
+              echo "${REPO}: PR opened"
+            else
+              echo "::warning::${REPO}: PR may already exist for ${BRANCH}"
+            fi
+            return 0
+          }
+
+          FAILED=()
+          for ENTRY in "${CALLERS[@]}"; do
+            bump_one "$ENTRY" || FAILED+=("${ENTRY%%|*}")
           done
+
+          if (( ${#FAILED[@]} )); then
+            printf '::error::bump failed for %d repo(s): %s\n' "${#FAILED[@]}" "${FAILED[*]}"
+            exit 1
+          fi
+          echo "cursor-review bump complete for all callers."
