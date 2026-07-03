@@ -41,6 +41,8 @@ jobs:
             "Comfy-Org/cloud|.github/workflows/ci-cursor-review.yml|"
             "Comfy-Org/comfy-cloud-mcp-server|.github/workflows/ci-cursor-review.yml|"
             "Comfy-Org/comfy-local-mcp|.github/workflows/ci-cursor-review.yml|"
+            "Comfy-Org/Comfy-iOS|.github/workflows/ci-cursor-review.yml|"
+            "Comfy-Org/ComfySwiftSDK|.github/workflows/ci-cursor-review.yml|"
             "Comfy-Org/comfy-inapp-agent|.github/workflows/ci-cursor-review.yml|"
             "Comfy-Org/swarmhost|.github/workflows/cursor-review.yml|"
             "Comfy-Org/comfy-infra|.github/workflows/ci-cursor-review.yml|"
