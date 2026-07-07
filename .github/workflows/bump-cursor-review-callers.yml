@@ -99,9 +99,13 @@ jobs:
               --field ref="refs/heads/${BRANCH}" \
               --field sha="${MAIN_SHA}" 2>/dev/null || true
 
-            # Commit the updated file onto the branch.
+            # Commit the updated file onto the branch. `$(...)` capture above
+            # (base64 -d, then sed) strips the file's trailing newline, so
+            # printf '%s\n' restores exactly one — otherwise the committed
+            # caller loses its EOF newline and trips the receiver repo's
+            # formatter (oxfmt/prettier both require a trailing newline).
             local ENCODED
-            ENCODED=$(printf '%s' "$NEW_CONTENT" | base64 | tr -d '\n')
+            ENCODED=$(printf '%s\n' "$NEW_CONTENT" | base64 | tr -d '\n')
             gh api --method PUT "repos/${REPO}/contents/${FILE_ENC}" \
               --field message="ci: bump cursor-review to github-workflows@${SHORT}" \
               --field content="${ENCODED}" \
