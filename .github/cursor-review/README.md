@@ -59,7 +59,7 @@ skipped if no Slack token is configured).
 | OpenAI | `gpt-5.3-codex-xhigh` |
 | Anthropic | `claude-opus-4-8-thinking-xhigh` |
 | Google | `gemini-3.1-pro` |
-| Moonshot | `kimi-k2.5` |
+| Moonshot | `kimi-k2.7-code` |
 
 Each model runs **two review types**:
 
