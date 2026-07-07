@@ -283,11 +283,121 @@ jobs:
             echo "within_cap=true" >> "$GITHUB_OUTPUT"
           fi
 
+  preflight:
+    # Validate the panel's pinned model ids against the LIVE Cursor catalog
+    # once, before the 8-cell fan-out. When Cursor delists a pinned id the
+    # per-cell `cursor-agent --model <id>` call fails with 0 bytes of stdout,
+    # which downstream reads as an `empty` cell — indistinguishable from "the
+    # model ran and found nothing", so the panel silently runs a lab short for
+    # weeks. Failing here turns that drift into a loud, visible job failure on
+    # the very next run. This job is ALSO the single source of truth for the
+    # matrix model list (emitted as an output the `review` matrix consumes), so
+    # the validated list and the reviewed list can never drift apart.
+    name: Preflight — validate model catalog
+    needs: [gate, diff-size]
+    if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      models: ${{ steps.models.outputs.models }}
+    steps:
+      - name: Define panel models
+        id: models
+        # Single source of truth for the per-lab model pins. The `review`
+        # matrix consumes this list via fromJSON, and the catalog check below
+        # validates every entry — so a bump only ever touches this one list.
+        # Keep in sync with the README model table.
+        run: |
+          cat > /tmp/models.json <<'JSON'
+          [
+            "gpt-5.3-codex-xhigh",
+            "claude-opus-4-8-thinking-xhigh",
+            "gemini-3.1-pro",
+            "kimi-k2.7-code"
+          ]
+          JSON
+          echo "models=$(jq -c . /tmp/models.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Install Cursor agent CLI
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+        run: |
+          # Fork PRs (and any run without the secret) get no CURSOR_API_KEY, so
+          # `cursor-agent models` can't authenticate. Skip cleanly — matches the
+          # gate's fork handling, which already sets should_run=false for forks.
+          if [ -z "$CURSOR_API_KEY" ]; then
+            echo "No CURSOR_API_KEY (fork PR or unset secret) — skipping catalog preflight."
+            exit 0
+          fi
+          curl https://cursor.com/install -fsSL | bash
+          echo "$HOME/.cursor/bin" >> "$GITHUB_PATH"
+
+      - name: Validate model pins against live catalog
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+        run: |
+          if [ -z "$CURSOR_API_KEY" ]; then
+            echo "No CURSOR_API_KEY — skipping catalog preflight (matches fork handling)."
+            exit 0
+          fi
+
+          # Capture the live catalog. A failure here (auth/network) is itself a
+          # hard fail — better red than a silently degraded panel.
+          if ! cursor-agent models > /tmp/catalog.txt 2>/tmp/catalog-stderr.txt; then
+            echo "::error::'cursor-agent models' failed — cannot verify the panel model pins."
+            cat /tmp/catalog-stderr.txt
+            exit 1
+          fi
+          echo "=== Cursor catalog ==="
+          cat /tmp/catalog.txt
+
+          python3 - <<'PY'
+          import json
+          import re
+          import sys
+
+          with open("/tmp/models.json", encoding="utf-8") as f:
+              pins = json.load(f)
+          with open("/tmp/catalog.txt", encoding="utf-8") as f:
+              catalog_raw = f.read()
+
+          catalog_lines = [ln.strip() for ln in catalog_raw.splitlines() if ln.strip()]
+
+          def present(model_id):
+              # Match the id as a whole token so `kimi-k2.5` doesn't match inside
+              # `kimi-k2.55`; ids contain `.`/`-`, so bound on those too.
+              pattern = r"(?<![\w.-])" + re.escape(model_id) + r"(?![\w.-])"
+              return re.search(pattern, catalog_raw) is not None
+
+          missing = [m for m in pins if not present(m)]
+          if not missing:
+              print("All pinned models present in the Cursor catalog:")
+              for m in pins:
+                  print(f"  - {m}")
+              sys.exit(0)
+
+          print(f"::error::Cursor catalog is missing pinned model id(s): {', '.join(missing)}")
+          for m in missing:
+              lab = re.split(r"[-.]", m, maxsplit=1)[0]
+              hints = sorted({ln for ln in catalog_lines if lab.lower() in ln.lower()})
+              hint = ", ".join(hints) if hints else "(no same-lab id found)"
+              print(f"  - {m}: closest available for lab '{lab}': {hint}")
+          print(
+              "Update the pin in the preflight 'Define panel models' step (and the "
+              "README model table) to a current catalog id."
+          )
+          sys.exit(1)
+          PY
+
   review:
     # Each cell produces a findings artifact. No cell posts a review —
     # consolidate adjudicates the panel and posts ONE review at the end.
     name: '${{ matrix.review_type }} (${{ matrix.model }})'
-    needs: [gate, diff-size]
+    # `preflight` gates the fan-out: if a pinned model is delisted it fails
+    # there, and this job is skipped instead of quietly running a lab short.
+    needs: [gate, diff-size, preflight]
     if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -296,14 +406,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Pinned to the highest reasoning tier available for each lab. Gemini
-        # and Kimi only ship a single tier in Cursor's catalog; OpenAI Codex
-        # and Claude expose xhigh variants we use here.
-        model:
-          - gpt-5.3-codex-xhigh
-          - claude-opus-4-8-thinking-xhigh
-          - gemini-3.1-pro
-          - kimi-k2.7-code
+        # Model list comes from the preflight job (single source of truth); it
+        # is validated against the live catalog there. Gemini and Kimi only
+        # ship a single tier in Cursor's catalog; OpenAI Codex and Claude
+        # expose the xhigh variants used here.
+        model: ${{ fromJSON(needs.preflight.outputs.models) }}
         review_type: [adversarial, edge-case]
     steps:
       - name: Seed default findings artifact
@@ -395,12 +502,21 @@ jobs:
           # an ephemeral VM, so the agent's AppArmor sandbox doesn't add
           # protection — and as of cursor-agent 2026.05.05 it fails to start
           # on ubuntu-latest, producing empty output.
+          #
+          # Capture the exit code instead of swallowing it with `|| true`: a
+          # delisted/unavailable model exits non-zero with empty stdout, and
+          # the extract step uses the code + stderr to tag the cell `error`
+          # (loud) rather than `empty` (silent). The `&& ... || ...` idiom
+          # records the code without tripping the shell's `set -e`.
           cursor-agent \
             --print \
             --trust \
             --model "$MODEL" \
             < /tmp/prompt.txt \
-            > /tmp/review-raw.txt 2>/tmp/review-stderr.txt || true
+            > /tmp/review-raw.txt 2>/tmp/review-stderr.txt \
+            && CURSOR_EXIT=0 || CURSOR_EXIT=$?
+          echo "$CURSOR_EXIT" > /tmp/review-exit-code
+          echo "cursor-agent exit code: $CURSOR_EXIT"
 
           echo "=== Raw output (first 500 chars) ==="
           head -c 500 /tmp/review-raw.txt
@@ -415,11 +531,18 @@ jobs:
           REVIEW_TYPE: ${{ matrix.review_type }}
         run: |
           mkdir -p /tmp/findings-out
+          # Pass the run's exit code + stderr so a delisted-model failure is
+          # classified `error`, not `empty`. Both are best-effort: a blank
+          # exit code (run step skipped) reads as "unknown", and a missing
+          # stderr file is tolerated by extract-findings.py.
+          CURSOR_EXIT="$(cat /tmp/review-exit-code 2>/dev/null || true)"
           python3 "$CURSOR_REVIEW_ASSETS/extract-findings.py" \
             --raw /tmp/review-raw.txt \
             --out /tmp/findings-out/findings.json \
             --model "$MODEL" \
-            --review-type "$REVIEW_TYPE"
+            --review-type "$REVIEW_TYPE" \
+            --exit-code "$CURSOR_EXIT" \
+            --stderr /tmp/review-stderr.txt
 
           echo "=== Extracted findings ==="
           cat /tmp/findings-out/findings.json

@@ -107,6 +107,58 @@ def parse_json_findings(raw_text: str):
     return None
 
 
+def parse_exit_code(value):
+    """Coerce the --exit-code argument to an int, or None if unknown.
+
+    The workflow passes the captured cursor-agent exit status through as a
+    string that may be blank (the run step didn't record one) or absent, so
+    treat anything non-integer as "unknown" rather than erroring.
+    """
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+# A delisted / unavailable model makes cursor-agent print this to stderr and
+# exit non-zero with zero bytes on stdout. Matching it lets us tag the cell as
+# a loud `error` instead of an `empty` that reads as "ran and found nothing".
+_MODEL_UNAVAILABLE_RE = re.compile(r"Cannot use this model:.*", re.IGNORECASE)
+
+
+def classify_run_error(exit_code, stderr_text, raw):
+    """Return an error message if the cursor-agent call clearly failed, else None.
+
+    Two signals:
+
+    * stderr names an unusable model (`Cannot use this model: <id>`) — this is
+      definitive (the model never ran), so it wins even when stdout has content.
+    * a non-zero exit code AND empty stdout — the call failed and produced
+      nothing, which the caller would otherwise misread as an `empty`
+      (found-nothing) cell. A non-zero exit that still yielded parseable
+      findings is left to the normal parse path so real findings are never
+      discarded.
+    """
+    stderr_text = stderr_text or ""
+    match = _MODEL_UNAVAILABLE_RE.search(stderr_text)
+    if match:
+        return match.group(0).strip()
+
+    if exit_code not in (None, 0) and not (raw or "").strip():
+        msg = f"cursor-agent exited with status {exit_code} and produced no output."
+        tail = [line.strip() for line in stderr_text.splitlines() if line.strip()]
+        if tail:
+            msg += f" Last stderr: {tail[-1]}"
+        return msg
+
+    return None
+
+
 def coerce_findings_list(parsed):
     """Reduce a parsed JSON value to the findings list, or None if it isn't one.
 
@@ -131,15 +183,45 @@ def main():
     parser.add_argument("--out", required=True, help="Path to write the findings JSON file")
     parser.add_argument("--model", required=True)
     parser.add_argument("--review-type", required=True)
+    parser.add_argument(
+        "--exit-code",
+        default=None,
+        help="cursor-agent process exit status (blank/absent = unknown).",
+    )
+    parser.add_argument(
+        "--stderr",
+        default=None,
+        help="Path to the cursor-agent stderr capture, used to classify run errors.",
+    )
     args = parser.parse_args()
 
     record = {"model": args.model, "review_type": args.review_type}
+
+    stderr_text = ""
+    if args.stderr:
+        try:
+            with open(args.stderr, encoding="utf-8", errors="replace") as f:
+                stderr_text = f.read()
+        except OSError:
+            stderr_text = ""
 
     try:
         with open(args.raw, encoding="utf-8") as f:
             raw = f.read()
     except (OSError, UnicodeDecodeError) as e:
         record.update(status="error", error=f"Could not read raw output: {e}", findings=[])
+        with open(args.out, "w", encoding="utf-8") as f:
+            json.dump(record, f)
+        return
+
+    # Defense-in-depth against silent catalog drift: a delisted/unavailable
+    # model exits non-zero with a "Cannot use this model: <id>" stderr and no
+    # stdout. Tag that as a loud `error` (which post-review.py reports as
+    # `(error)` and counts as a failed cell) rather than an `empty` that is
+    # indistinguishable from "the model ran and found nothing".
+    run_error = classify_run_error(parse_exit_code(args.exit_code), stderr_text, raw)
+    if run_error is not None:
+        record.update(status="error", error=run_error, findings=[])
         with open(args.out, "w", encoding="utf-8") as f:
             json.dump(record, f)
         return
