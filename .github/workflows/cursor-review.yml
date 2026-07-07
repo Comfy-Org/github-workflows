@@ -546,9 +546,11 @@ jobs:
 
           # LLMs intermittently wrap the findings array in prose. extract-findings.py
           # recovers most of that (fenced block / embedded brace-match), but if it
-          # still can't parse, retry the judge ONCE with a terse strict-JSON
-          # reminder appended — a single retry clears the large majority of these
-          # transient parse failures. The retry overwrites /tmp/judge-raw.txt, so
+          # still can't parse, retry the judge ONCE — asking it to REFORMAT its own
+          # prior (prose) output into the schema, NOT re-adjudicate. A thinking judge
+          # re-runs its reasoning and can narrate again; transcribing a finished
+          # analysis into JSON is a far higher-compliance task and preserves the
+          # verdicts it already made. The retry overwrites /tmp/judge-raw.txt, so
           # the parse step below reads whichever attempt the judge last produced.
           python3 "$CURSOR_REVIEW_ASSETS/extract-findings.py" \
             --raw /tmp/judge-raw.txt \
@@ -558,12 +560,15 @@ jobs:
           PROBE_STATUS=$(python3 -c "import json; print(json.load(open('/tmp/judge-probe.json')).get('status','?'))")
 
           if [ "$PROBE_STATUS" != "ok" ]; then
-            echo "Judge output did not parse (status=$PROBE_STATUS) — retrying once with a strict-JSON reminder."
+            echo "Judge output did not parse (status=$PROBE_STATUS) — retrying once, reformatting the prior output into JSON."
             {
-              cat /tmp/judge-prompt.txt
+              echo "Below is a code-review adjudication you already produced. Your ONLY task now is to transcribe it into JSON — do NOT re-review the code or change any conclusion."
               echo ""
-              echo "=== REMINDER ==="
-              echo "Your previous response could not be parsed as JSON. Return ONLY the JSON array of findings — no prose, no explanation, no markdown code fences. Your entire response must be a single JSON array (return [] if there are no findings)."
+              echo "=== BEGIN PRIOR ADJUDICATION ==="
+              cat /tmp/judge-raw.txt
+              echo "=== END PRIOR ADJUDICATION ==="
+              echo ""
+              echo "Emit a JSON array. Include one object for each finding you decided to KEEP (omit the ones you called false positives, noise, or duplicates). Each object has exactly these keys: \"file\" (string, repo-relative path), \"line\" (integer, a RIGHT-side diff line), \"side\" (\"RIGHT\"), \"severity\" (one of \"critical\", \"high\", \"medium\", \"low\", \"nit\"), \"body\" (string, 1-3 sentences ending with the reviewer attribution). Order most-severe first. Output ONLY the JSON array (return [] if you kept none) — no prose, no preamble, no explanation, no markdown code fences."
             } > /tmp/judge-prompt-retry.txt
             run_judge /tmp/judge-prompt-retry.txt
             echo "=== Judge retry raw output (first 1000 chars) ==="
