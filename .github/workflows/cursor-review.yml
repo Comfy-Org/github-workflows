@@ -303,7 +303,7 @@ jobs:
           - gpt-5.3-codex-xhigh
           - claude-opus-4-8-thinking-xhigh
           - gemini-3.1-pro
-          - kimi-k2.5
+          - kimi-k2.7-code
         review_type: [adversarial, edge-case]
     steps:
       - name: Seed default findings artifact
