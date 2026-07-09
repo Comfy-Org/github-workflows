@@ -46,6 +46,7 @@ jobs:
             "Comfy-Org/comfy-inapp-agent|.github/workflows/ci-cursor-review.yml|"
             "Comfy-Org/swarmhost|.github/workflows/cursor-review.yml|"
             "Comfy-Org/comfy-infra|.github/workflows/ci-cursor-review.yml|"
+            "Comfy-Org/evals|.github/workflows/ci-cursor-review.yml|"
             "Comfy-Org/ComfyUI_frontend|.github/workflows/pr-cursor-review.yaml|"
             "Comfy-Org/Comfy-Desktop|.github/workflows/ci-cursor-review.yml|ci"
             "Comfy-Org/ComfyUI|.github/workflows/ci-cursor-review.yml|Core"
