@@ -15,6 +15,9 @@ name: Assign Reviewers (reusable)
 #
 # REVIEWER CONFIG (in the CALLER repo, default `.github/reviewers.yml`): a
 # top-level `default_pool` plus a `rules` list mapping path globs to reviewers.
+# Entries are GitHub logins, or team refs of the form `org/team-slug`
+# (optionally @-prefixed) which expand to the team's current members at
+# selection time — so membership is managed in org settings, not in the file.
 #
 #   default_pool: [octocat, hubot]        # fallback when no rule matches
 #   rules:
@@ -24,12 +27,16 @@ name: Assign Reviewers (reusable)
 #         - backend/**
 #       reviewers:
 #         - carol
+#         - Comfy-Org/backend-reviewers   # team ref: expands to members
 #
 # Both flow (`[a, b]`) and block (`- a`) sequences are accepted. The config is
 # read from the PR head SHA via the contents API, so a PR's own edits to the
-# config take effect on that PR.
+# config take effect on that PR. Team expansion requires the GitHub App to
+# hold the org-level Members:read permission; a team that cannot be resolved
+# is skipped (logged), never a workflow failure.
 #
 # SELECTION: changed paths -> union of matching experts (else default_pool) ->
+# expand team refs to member logins ->
 # drop the author + vars.REVIEWER_EXCLUDE -> rank ascending by each candidate's
 # open review load (steering off anyone at/over vars.REVIEWER_LOAD_CAP) ->
 # deterministically (per PR number) maybe swap the last slot for a
@@ -288,12 +295,40 @@ jobs:
               for (const r of (config.default_pool || [])) candidates.add(r);
             }
 
+            // --- 3b. Expand team refs (org/team-slug) into current members ---
+            // An entry containing '/' is a team reference (`Comfy-Org/ingest`,
+            // optionally @-prefixed like a mention); anything else is a login.
+            // Teams keep people out of the config file — membership changes in
+            // org settings, no repo PR. Expansion needs the app to hold org
+            // Members:read; a failed or malformed ref is skipped (a '/' string
+            // is never a valid login, and passing it through would 422 the
+            // whole requestReviewers call).
+            const expanded = new Set();
+            for (const entry of candidates) {
+              const ref = entry.replace(/^@/, '');
+              if (!ref.includes('/')) { expanded.add(ref); continue; }
+              const [org, team_slug, ...rest] = ref.split('/');
+              if (!org || !team_slug || rest.length > 0) {
+                core.info(`Malformed team ref "${entry}" — skipping.`);
+                continue;
+              }
+              try {
+                const members = await github.paginate(github.rest.teams.listMembersInOrg, {
+                  org, team_slug, per_page: 100,
+                });
+                for (const m of members) expanded.add(m.login);
+                core.info(`Expanded team ${ref} -> ${members.length} member(s).`);
+              } catch (e) {
+                core.info(`Could not expand team ${ref} (${e.message}) — skipping.`);
+              }
+            }
+
             // --- 4. Remove the author and hard-excluded logins ---
             const exclude = new Set(
               (process.env.EXCLUDE || '').split(/\s+/).filter(Boolean)
             );
             if (pr.user && pr.user.login) exclude.add(pr.user.login);
-            let pool = [...candidates].filter((c) => !exclude.has(c));
+            let pool = [...expanded].filter((c) => !exclude.has(c));
             if (pool.length === 0) {
               core.info('No eligible candidates after exclusions — nothing to request.');
               return;
