@@ -42,6 +42,15 @@ name: Cursor Review (reusable)
 #         # actually block merge you must ALSO mark "Blocking gate" as a required
 #         # status check in this repo's branch-protection settings (see README).
 #         blocking: true
+#         # Optional: run every job on a self-hosted runner instead of
+#         # ubuntu-latest (e.g. a private repo over its GitHub-hosted-minutes
+#         # quota). JSON-encoded; a self-hosted macOS runner needs cursor-agent
+#         # to run in a normal shell context (e.g. run.sh under tmux), NOT a
+#         # launchd LaunchAgent, or cursor-agent exits empty.
+#         runs_on: '["self-hosted", "macOS"]'
+#         # Optional: override the panel models when this repo's Cursor account
+#         # can't reach a default provider (e.g. no Google access). JSON array.
+#         models: '["gpt-5.3-codex-xhigh", "claude-opus-4-8-thinking-xhigh", "cursor-grok-4.5-high", "kimi-k2.7-code"]'
 #       secrets:
 #         CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
 #         SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
@@ -126,6 +135,30 @@ on:
         type: boolean
         required: false
         default: false
+      runs_on:
+        description: >-
+          JSON-encoded runs-on value for every job in this workflow. Default
+          '"ubuntu-latest"' (a JSON string) preserves existing GitHub-hosted
+          behavior for all callers. Override with a JSON array to target a
+          self-hosted runner, e.g. '["self-hosted", "macOS"]' — useful for
+          repos that would otherwise burn GitHub-hosted minutes (private repos
+          over quota). Parsed with fromJSON, so the value MUST be valid JSON.
+        type: string
+        required: false
+        default: '"ubuntu-latest"'
+      models:
+        description: >-
+          JSON array of cursor-agent model IDs for the review panel (one matrix
+          cell per model per review type). Default is the 4-lab set below. Override
+          when the caller's Cursor account lacks access to a default provider (e.g.
+          no Google access → swap gemini for a grok/glm model) or a model is
+          delisted; verify each ID is reachable on the caller's account first.
+          Parsed with fromJSON, so the value MUST be a valid JSON array.
+        type: string
+        required: false
+        default: >-
+          ["gpt-5.3-codex-xhigh", "claude-opus-4-8-thinking-xhigh",
+           "gemini-3.1-pro", "kimi-k2.7-code"]
     secrets:
       CURSOR_API_KEY:
         description: Cursor API key for cursor-agent (the panel + judge models bill through it).
@@ -152,7 +185,7 @@ env:
 jobs:
   gate:
     name: Gate
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     permissions:
       contents: read
       pull-requests: read
@@ -247,7 +280,7 @@ jobs:
     name: Diff size check
     needs: gate
     if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     permissions:
       contents: read
     outputs:
@@ -289,21 +322,17 @@ jobs:
     name: '${{ matrix.review_type }} (${{ matrix.model }})'
     needs: [gate, diff-size]
     if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     timeout-minutes: 30
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        # Pinned to the highest reasoning tier available for each lab. Gemini
-        # and Kimi only ship a single tier in Cursor's catalog; OpenAI Codex
-        # and Claude expose xhigh variants we use here.
-        model:
-          - gpt-5.3-codex-xhigh
-          - claude-opus-4-8-thinking-xhigh
-          - gemini-3.1-pro
-          - kimi-k2.7-code
+        # Panel models come from the `models` input (default: the 4-lab set,
+        # one reasoning-tier-pinned model per lab). Callers override when their
+        # Cursor account can't reach a default provider or a model is delisted.
+        model: ${{ fromJSON(inputs.models) }}
         review_type: [adversarial, edge-case]
     steps:
       - name: Seed default findings artifact
@@ -363,7 +392,12 @@ jobs:
       - name: Install Cursor agent CLI
         run: |
           curl https://cursor.com/install -fsSL | bash
+          # Linux installer targets ~/.cursor/bin; the macOS installer targets
+          # ~/.local/bin. Add both so this works on ubuntu-latest and on a
+          # self-hosted macOS runner (runs_on override). The absent dir on each
+          # platform is a harmless PATH entry.
           echo "$HOME/.cursor/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Log Cursor agent version
         # The install script is unpinned (curl | bash from cursor.com), so we
@@ -440,7 +474,7 @@ jobs:
     name: Consolidate panel
     needs: [gate, diff-size, review]
     if: always() && needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true' && needs.review.result != 'skipped'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     timeout-minutes: 15
     permissions:
       contents: read
@@ -472,7 +506,12 @@ jobs:
       - name: Install Cursor agent CLI
         run: |
           curl https://cursor.com/install -fsSL | bash
+          # Linux installer targets ~/.cursor/bin; the macOS installer targets
+          # ~/.local/bin. Add both so this works on ubuntu-latest and on a
+          # self-hosted macOS runner (runs_on override). The absent dir on each
+          # platform is a harmless PATH entry.
           echo "$HOME/.cursor/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Download panel findings
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -749,7 +788,7 @@ jobs:
     name: Blocking gate
     needs: [gate, diff-size, consolidate]
     if: ${{ always() && inputs.blocking && needs.gate.outputs.should_run == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     permissions:
       contents: read
       pull-requests: read
@@ -788,7 +827,7 @@ jobs:
     name: Notify start
     needs: [gate, diff-size]
     if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     permissions:
       contents: read
     steps:
@@ -842,7 +881,7 @@ jobs:
     name: Notify complete
     needs: [gate, diff-size, review, consolidate]
     if: always() && needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true' && needs.review.result != 'skipped'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     permissions:
       contents: read
     steps:
