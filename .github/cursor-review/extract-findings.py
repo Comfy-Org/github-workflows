@@ -41,7 +41,7 @@ def _iter_json_candidates(text: str):
     don't throw off the nesting count, so prose like `... the findings […] are`
     surrounding a real array doesn't corrupt the match the way a naive
     first-`[`/last-`]` slice does. Regions are yielded in document order; the
-    caller parses each and takes the first that loads.
+    caller parses each and keeps the last that is findings-shaped.
     """
     openers = {"{", "["}
     closers = {"}", "]"}
@@ -78,49 +78,72 @@ def _iter_json_candidates(text: str):
 
 
 def parse_json_findings(raw_text: str):
-    """Extract a JSON value (array or object) from raw model output.
+    """Extract the findings JSON value from raw model output.
 
     Tolerates surrounding prose and markdown fences. Returns the parsed value
-    (list or dict), or None if no JSON could be located. Layered most- to
-    least-strict so a clean response takes the fast path:
+    (a findings array, or a `{"findings": [...]}` wrapper), or None if no
+    findings-shaped JSON could be located.
 
-    1. The whole output is JSON.
-    2. A fenced ```json (or bare ```) block holds the JSON.
-    3. A balanced {...}/[...] region is embedded in prose.
+    Crucially this scans for a *findings-shaped* region, not merely the first
+    thing that parses as JSON, and prefers the LAST such region. The judge
+    (esp. on verification-heavy diffs, BE-3160) opens with prose that quotes
+    individual finding OBJECTS or scalar lists inline while reasoning, then
+    emits the real array LAST. Taking the first parseable region there yields
+    an un-coercible object (→ spurious parse_error) or a bogus scalar list,
+    while the genuine findings array sits further down. Layered so a clean
+    response still takes the fast path:
+
+    1. The whole output is the findings JSON.
+    2. A fenced ```json (or bare ```) block holds it — last valid block wins.
+    3. A balanced {...}/[...] region embedded in prose — last valid wins.
     """
     text = raw_text.strip()
 
-    parsed = _try_load(text)
-    if parsed is not None:
-        return parsed
+    # Fast path: the whole response is the findings payload.
+    whole = _try_load(text)
+    if coerce_findings_list(whole) is not None:
+        return whole
 
+    # Fenced blocks: prose/verification precedes the answer, so the last
+    # findings-shaped fence is the real one.
+    best = None
     for match in re.finditer(r"```(?:json)?\s*\n(.*?)```", text, re.DOTALL):
         parsed = _try_load(match.group(1).strip())
-        if parsed is not None:
-            return parsed
+        if coerce_findings_list(parsed) is not None:
+            best = parsed
+    if best is not None:
+        return best
 
+    # Bare balanced regions embedded in prose: keep the LAST findings-shaped
+    # one so an inline finding object / scalar list quoted mid-reasoning never
+    # shadows the real array that follows it.
     for candidate in _iter_json_candidates(text):
         parsed = _try_load(candidate)
-        if parsed is not None:
-            return parsed
-
-    return None
+        if coerce_findings_list(parsed) is not None:
+            best = parsed
+    return best
 
 
 def coerce_findings_list(parsed):
     """Reduce a parsed JSON value to the findings list, or None if it isn't one.
 
-    The panel cells and judge are all asked for a bare JSON array, but a model
-    intermittently wraps it as `{"findings": [...]}` (or a near-synonym key).
-    Unwrap those so a well-formed-but-wrapped response parses instead of being
-    discarded as a parse_error.
+    A findings list is a JSON array of finding OBJECTS (an empty array is
+    allowed — "no findings"), or an object wrapping such an array under a
+    findings-like key. The panel cells and judge are asked for a bare JSON
+    array, but a model intermittently wraps it as `{"findings": [...]}` (or a
+    near-synonym key); unwrap those so a well-formed-but-wrapped response
+    parses instead of being discarded as a parse_error.
+
+    Requiring the elements to be objects is what lets the extractor above skip
+    a scalar list the judge quotes in prose (e.g. `["contains", "startswith"]`
+    while narrating jq builtins) and keep scanning for the real findings array.
     """
     if isinstance(parsed, list):
-        return parsed
+        return parsed if all(isinstance(item, dict) for item in parsed) else None
     if isinstance(parsed, dict):
         for key in ("findings", "results", "items", "reviews"):
             value = parsed.get(key)
-            if isinstance(value, list):
+            if isinstance(value, list) and all(isinstance(item, dict) for item in value):
                 return value
     return None
 
