@@ -37,20 +37,6 @@ name: Cursor Review (reusable)
 #         # a distinct, queryable identity instead of github-actions[bot]. Supply
 #         # your App's id + private key (App IDs aren't secret, so id is an input).
 #         bot_app_id: ${{ vars.REVIEW_BOT_APP_ID }}
-#         # Optional: make the review blocking. true → the "Blocking gate" check
-#         # goes red while any cursor-review finding thread is unresolved. To
-#         # actually block merge you must ALSO mark "Blocking gate" as a required
-#         # status check in this repo's branch-protection settings (see README).
-#         blocking: true
-#         # Optional: run every job on a self-hosted runner instead of
-#         # ubuntu-latest (e.g. a private repo over its GitHub-hosted-minutes
-#         # quota). JSON-encoded; a self-hosted macOS runner needs cursor-agent
-#         # to run in a normal shell context (e.g. run.sh under tmux), NOT a
-#         # launchd LaunchAgent, or cursor-agent exits empty.
-#         runs_on: '["self-hosted", "macOS"]'
-#         # Optional: override the panel models when this repo's Cursor account
-#         # can't reach a default provider (e.g. no Google access). JSON array.
-#         models: '["gpt-5.3-codex-xhigh", "claude-opus-4-8-thinking-xhigh", "cursor-grok-4.5-high", "kimi-k2.7-code"]'
 #       secrets:
 #         CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
 #         SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
@@ -121,44 +107,6 @@ on:
         type: string
         required: false
         default: ''
-      blocking:
-        description: >-
-          Opt-in merge gate. false (default) → the review is advisory, exactly as
-          before: it posts findings but never fails the check, so no caller's
-          behavior changes until it opts in. true → a final "Blocking gate" job
-          fails (red check) when the PR has unresolved cursor-review finding
-          threads, and passes once they are all resolved (idempotent on re-run).
-          NOTE: this workflow cannot set branch protection. To actually block the
-          merge you must ALSO mark the "Blocking gate" check as a required status
-          check in the caller repo's branch-protection / ruleset settings — until
-          you do, the red check is visible but non-blocking. See the README.
-        type: boolean
-        required: false
-        default: false
-      runs_on:
-        description: >-
-          JSON-encoded runs-on value for every job in this workflow. Default
-          '"ubuntu-latest"' (a JSON string) preserves existing GitHub-hosted
-          behavior for all callers. Override with a JSON array to target a
-          self-hosted runner, e.g. '["self-hosted", "macOS"]' — useful for
-          repos that would otherwise burn GitHub-hosted minutes (private repos
-          over quota). Parsed with fromJSON, so the value MUST be valid JSON.
-        type: string
-        required: false
-        default: '"ubuntu-latest"'
-      models:
-        description: >-
-          JSON array of cursor-agent model IDs for the review panel (one matrix
-          cell per model per review type). Default is the 4-lab set below. Override
-          when the caller's Cursor account lacks access to a default provider (e.g.
-          no Google access → swap gemini for a grok/glm model) or a model is
-          delisted; verify each ID is reachable on the caller's account first.
-          Parsed with fromJSON, so the value MUST be a valid JSON array.
-        type: string
-        required: false
-        default: >-
-          ["gpt-5.3-codex-xhigh", "claude-opus-4-8-thinking-xhigh",
-           "gemini-3.1-pro", "kimi-k2.7-code"]
     secrets:
       CURSOR_API_KEY:
         description: Cursor API key for cursor-agent (the panel + judge models bill through it).
@@ -185,7 +133,7 @@ env:
 jobs:
   gate:
     name: Gate
-    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: read
@@ -280,14 +228,14 @@ jobs:
     name: Diff size check
     needs: gate
     if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true'
-    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
       within_cap: ${{ steps.count.outputs.within_cap }}
     steps:
       - name: Checkout PR repo
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -322,17 +270,21 @@ jobs:
     name: '${{ matrix.review_type }} (${{ matrix.model }})'
     needs: [gate, diff-size]
     if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true'
-    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        # Panel models come from the `models` input (default: the 4-lab set,
-        # one reasoning-tier-pinned model per lab). Callers override when their
-        # Cursor account can't reach a default provider or a model is delisted.
-        model: ${{ fromJSON(inputs.models) }}
+        # Pinned to the highest reasoning tier available for each lab. Gemini
+        # and Kimi only ship a single tier in Cursor's catalog; OpenAI Codex
+        # and Claude expose xhigh variants we use here.
+        model:
+          - gpt-5.3-codex-xhigh
+          - claude-opus-4-8-thinking-xhigh
+          - gemini-3.1-pro
+          - kimi-k2.5
         review_type: [adversarial, edge-case]
     steps:
       - name: Seed default findings artifact
@@ -361,7 +313,7 @@ jobs:
           PY
 
       - name: Checkout PR repo
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -371,7 +323,7 @@ jobs:
         # pinned via workflows_ref) — never from the PR checkout, so a
         # malicious PR can't rewrite the prompt to exfiltrate the diff or
         # smuggle instructions to the model.
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@v6
         with:
           repository: Comfy-Org/github-workflows
           ref: ${{ inputs.workflows_ref }}
@@ -392,12 +344,7 @@ jobs:
       - name: Install Cursor agent CLI
         run: |
           curl https://cursor.com/install -fsSL | bash
-          # Linux installer targets ~/.cursor/bin; the macOS installer targets
-          # ~/.local/bin. Add both so this works on ubuntu-latest and on a
-          # self-hosted macOS runner (runs_on override). The absent dir on each
-          # platform is a harmless PATH entry.
           echo "$HOME/.cursor/bin" >> "$GITHUB_PATH"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Log Cursor agent version
         # The install script is unpinned (curl | bash from cursor.com), so we
@@ -461,7 +408,7 @@ jobs:
 
       - name: Upload findings artifact
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@v7
         with:
           name: findings-${{ matrix.review_type }}-${{ matrix.model }}
           path: /tmp/findings-out/findings.json
@@ -474,20 +421,20 @@ jobs:
     name: Consolidate panel
     needs: [gate, diff-size, review]
     if: always() && needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true' && needs.review.result != 'skipped'
-    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
       pull-requests: write
     steps:
       - name: Checkout PR repo
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Load cursor-review assets
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@v6
         with:
           repository: Comfy-Org/github-workflows
           ref: ${{ inputs.workflows_ref }}
@@ -506,15 +453,10 @@ jobs:
       - name: Install Cursor agent CLI
         run: |
           curl https://cursor.com/install -fsSL | bash
-          # Linux installer targets ~/.cursor/bin; the macOS installer targets
-          # ~/.local/bin. Add both so this works on ubuntu-latest and on a
-          # self-hosted macOS runner (runs_on override). The absent dir on each
-          # platform is a harmless PATH entry.
           echo "$HOME/.cursor/bin" >> "$GITHUB_PATH"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Download panel findings
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@v8
         with:
           path: /tmp/panel
           pattern: findings-*
@@ -585,11 +527,9 @@ jobs:
 
           # LLMs intermittently wrap the findings array in prose. extract-findings.py
           # recovers most of that (fenced block / embedded brace-match), but if it
-          # still can't parse, retry the judge ONCE — asking it to REFORMAT its own
-          # prior (prose) output into the schema, NOT re-adjudicate. A thinking judge
-          # re-runs its reasoning and can narrate again; transcribing a finished
-          # analysis into JSON is a far higher-compliance task and preserves the
-          # verdicts it already made. The retry overwrites /tmp/judge-raw.txt, so
+          # still can't parse, retry the judge ONCE with a terse strict-JSON
+          # reminder appended — a single retry clears the large majority of these
+          # transient parse failures. The retry overwrites /tmp/judge-raw.txt, so
           # the parse step below reads whichever attempt the judge last produced.
           python3 "$CURSOR_REVIEW_ASSETS/extract-findings.py" \
             --raw /tmp/judge-raw.txt \
@@ -599,15 +539,12 @@ jobs:
           PROBE_STATUS=$(python3 -c "import json; print(json.load(open('/tmp/judge-probe.json')).get('status','?'))")
 
           if [ "$PROBE_STATUS" != "ok" ]; then
-            echo "Judge output did not parse (status=$PROBE_STATUS) — retrying once, reformatting the prior output into JSON."
+            echo "Judge output did not parse (status=$PROBE_STATUS) — retrying once with a strict-JSON reminder."
             {
-              echo "Below is a code-review adjudication you already produced. Your ONLY task now is to transcribe it into JSON — do NOT re-review the code or change any conclusion."
+              cat /tmp/judge-prompt.txt
               echo ""
-              echo "=== BEGIN PRIOR ADJUDICATION ==="
-              cat /tmp/judge-raw.txt
-              echo "=== END PRIOR ADJUDICATION ==="
-              echo ""
-              echo "Emit a JSON array. Include one object for each finding you decided to KEEP (omit the ones you called false positives, noise, or duplicates). Each object has exactly these keys: \"file\" (string, repo-relative path), \"line\" (integer, a RIGHT-side diff line), \"side\" (\"RIGHT\"), \"severity\" (one of \"critical\", \"high\", \"medium\", \"low\", \"nit\"), \"body\" (string, 1-3 sentences ending with the reviewer attribution). Order most-severe first. Output ONLY the JSON array (return [] if you kept none) — no prose, no preamble, no explanation, no markdown code fences."
+              echo "=== REMINDER ==="
+              echo "Your previous response could not be parsed as JSON. Return ONLY the JSON array of findings — no prose, no explanation, no markdown code fences. Your entire response must be a single JSON array (return [] if there are no findings). You have no shell, filesystem, or web tools here, so do not narrate attempts to use them or your verification reasoning; emit only the array."
             } > /tmp/judge-prompt-retry.txt
             run_judge /tmp/judge-prompt-retry.txt
             echo "=== Judge retry raw output (first 1000 chars) ==="
@@ -724,7 +661,7 @@ jobs:
       - name: Mint bot-identity token (optional)
         id: bot_token
         if: ${{ inputs.bot_app_id != '' }}
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ inputs.bot_app_id }}
           private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
@@ -772,67 +709,16 @@ jobs:
               --error-message "Judge call failed (status=${JUDGE_STATUS}): ${JUDGE_ERROR}"
           fi
 
-  blocking-gate:
-    # Opt-in merge gate (inputs.blocking). Fails the check when the PR has
-    # unresolved cursor-review finding threads, so a required-status-check
-    # config can block the merge until they're addressed. With blocking:false
-    # (default) this job is skipped entirely — the review stays advisory and
-    # the existing path is unchanged.
-    #
-    # Runs whenever the review is genuinely triggered (should_run), regardless
-    # of already_reviewed / within_cap: on a resolve→re-trigger of an unchanged
-    # commit the panel is skipped (already_reviewed) but this gate still
-    # re-queries the live thread state and goes green once the threads are
-    # resolved. `needs: consolidate` (with always()) orders it after the review
-    # is posted on a fresh run, and lets it run even when consolidate is skipped.
-    name: Blocking gate
-    needs: [gate, diff-size, consolidate]
-    if: ${{ always() && inputs.blocking && needs.gate.outputs.should_run == 'true' }}
-    runs-on: ${{ fromJSON(inputs.runs_on) }}
-    permissions:
-      contents: read
-      pull-requests: read
-    steps:
-      - name: Fail if the fresh review did not complete
-        # always() lets this gate run after a failed/cancelled consolidate, where
-        # no threads are posted and the unresolved-thread check below would pass
-        # green. Guard the fresh, within-cap path: if the panel was supposed to
-        # run and consolidate did not succeed, refuse to pass. The skip paths
-        # (already_reviewed re-trigger, over-cap) leave consolidate skipped and
-        # are intentionally exempt — they fall through to the live thread query.
-        if: ${{ needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true' && needs.consolidate.result != 'success' }}
-        run: |
-          echo "Consolidate panel did not complete; refusing to pass the blocking gate."
-          exit 1
-
-      - name: Load cursor-review assets
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          repository: Comfy-Org/github-workflows
-          ref: ${{ inputs.workflows_ref }}
-          path: _cursor_review_assets
-          persist-credentials: false
-
-      - name: Fail on unresolved cursor-review threads
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
-        run: |
-          python3 "$CURSOR_REVIEW_ASSETS/gate-unresolved.py" \
-            --repo "$REPO" \
-            --pr-number "$PR_NUMBER"
-
   notify-start:
     name: Notify start
     needs: [gate, diff-size]
     if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true'
-    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
       - name: Load cursor-review assets
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@v6
         with:
           repository: Comfy-Org/github-workflows
           ref: ${{ inputs.workflows_ref }}
@@ -881,12 +767,12 @@ jobs:
     name: Notify complete
     needs: [gate, diff-size, review, consolidate]
     if: always() && needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true' && needs.review.result != 'skipped'
-    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
       - name: Load cursor-review assets
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@v6
         with:
           repository: Comfy-Org/github-workflows
           ref: ${{ inputs.workflows_ref }}
