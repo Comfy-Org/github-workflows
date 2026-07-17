@@ -56,6 +56,19 @@ on:
         type: string
         required: false
         default: skip-cursor-review
+      runs_on:
+        description: >-
+          JSON-encoded runs-on value for this workflow's single job. Default
+          '"ubuntu-latest"' (a JSON string) preserves existing GitHub-hosted
+          behavior for all callers. Override with a JSON array to target a
+          self-hosted runner, e.g. '["self-hosted", "macOS"]' — useful for
+          repos that would otherwise burn GitHub-hosted minutes (private repos
+          over quota). Parsed with fromJSON, so the value MUST be valid JSON.
+          Matches the same input on cursor-review.yml so a caller can pin both
+          workflows to one runner.
+        type: string
+        required: false
+        default: '"ubuntu-latest"'
     secrets:
       CLOUD_CODE_BOT_PRIVATE_KEY:
         description: >-
@@ -70,7 +83,7 @@ permissions:
 jobs:
   auto-label:
     name: Auto-apply review label
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
     permissions:
       contents: read
     steps:
