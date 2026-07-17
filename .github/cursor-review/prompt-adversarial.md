@@ -19,25 +19,22 @@ Do NOT flag:
 - Performance micro-optimizations unless they create a DoS vector
 - Issues in test files unless the test itself is masking a real bug
 
-Review the following diff and report every finding. You MUST respond with ONLY a JSON
-array — no prose, no markdown fences, no explanation outside the array.
-
-Each element must be an object with exactly these keys:
-- "file": string — the file path relative to the repo root
-- "line": integer — the line number in the NEW side of the diff where the issue exists
-- "side": "RIGHT" — always RIGHT since findings are on the new code
-- "severity": string — one of "critical", "high", "medium", "low", "nit"
+Review the following diff and record every finding with the
+`cursor_review_record_finding` tool. Call it once per distinct issue using:
+- `file`: the file path relative to the repo root
+- `line`: the line number in the NEW side of the diff where the issue exists
+- `side`: `RIGHT` since findings are on the new code
+- `severity`: one of `critical`, `high`, `medium`, `low`, `nit`
   ("critical" = exploitable hole / data loss / crash on a normal path;
   "high" = real bug on a plausible input; "medium" = bug on an edge path;
   "low" = minor security/reliability concern; "nit" = very low-impact security/reliability concern)
-- "body": string — a concise description of the issue (1-3 sentences)
+- `body`: a concise description of the issue (1-3 sentences)
 
-If you find no issues, return an empty array: []
+After recording all findings, call `cursor_review_finish` exactly once. Call it
+even if you found no issues. Do not put findings in your final response: only
+tool calls are collected.
 
-Example response:
-[
-  {"file": "internal/api/handler.go", "line": 42, "side": "RIGHT", "severity": "critical", "body": "User-supplied `filename` is passed to `os.Open` without path-traversal validation. An attacker can read arbitrary files with `../../etc/passwd`."},
-  {"file": "internal/worker/upload.go", "line": 118, "side": "RIGHT", "severity": "high", "body": "The goroutine captures `ctx` from the outer scope but the parent function returns and cancels the context before the upload completes, causing silent data loss."}
-]
+Example `cursor_review_record_finding` arguments:
+`{"file":"internal/api/handler.go","line":42,"side":"RIGHT","severity":"critical","body":"User-supplied filename is passed to os.Open without path-traversal validation."}`
 
 === BEGIN DIFF ===

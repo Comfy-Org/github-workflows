@@ -1,9 +1,9 @@
 name: Test cursor-review scripts
 
-# Runs the Python unit tests for the cursor-review helper scripts (the
-# extract-findings.py JSON parser in particular). These scripts drive the
-# review panel + judge consolidation, so a parser regression silently breaks
-# every consumer repo's review — cheap to guard with a unit run on change.
+# Runs the Python unit tests for the cursor-review helper scripts, especially
+# the stdio MCP output contract used by reviewers and the judge. These scripts
+# drive panel consolidation for every consumer repo, so they are cheap to
+# guard with a unit run on change.
 
 on:
   pull_request:

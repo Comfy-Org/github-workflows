@@ -21,25 +21,22 @@ Do NOT flag:
 - Performance optimizations unless they cause correctness issues
 - Issues in test files unless the test itself is masking a real bug
 
-Review the following diff and report every finding. You MUST respond with ONLY a JSON
-array — no prose, no markdown fences, no explanation outside the array.
-
-Each element must be an object with exactly these keys:
-- "file": string — the file path relative to the repo root
-- "line": integer — the line number in the NEW side of the diff where the issue exists
-- "side": "RIGHT" — always RIGHT since findings are on the new code
-- "severity": string — one of "critical", "high", "medium", "low", "nit"
+Review the following diff and record every finding with the
+`cursor_review_record_finding` tool. Call it once per distinct issue using:
+- `file`: the file path relative to the repo root
+- `line`: the line number in the NEW side of the diff where the issue exists
+- `side`: `RIGHT` since findings are on the new code
+- `severity`: one of `critical`, `high`, `medium`, `low`, `nit`
   ("critical" = data loss / crash on a normal path; "high" = real bug on a
   plausible input; "medium" = bug on an edge path; "low" = minor correctness issue;
   "nit" = very low-impact correctness/clarity issue)
-- "body": string — a concise description of the issue (1-3 sentences)
+- `body`: a concise description of the issue (1-3 sentences)
 
-If you find no issues, return an empty array: []
+After recording all findings, call `cursor_review_finish` exactly once. Call it
+even if you found no issues. Do not put findings in your final response: only
+tool calls are collected.
 
-Example response:
-[
-  {"file": "pkg/retry/retrier.go", "line": 55, "side": "RIGHT", "severity": "high", "body": "When `maxRetries` is 0 the loop body never executes, so the function returns `nil` instead of running the operation once. The guard should be `i <= maxRetries`."},
-  {"file": "internal/router/router.go", "line": 203, "side": "RIGHT", "severity": "medium", "body": "The `default` branch of the select sends on `errCh` without checking if the channel is full. If two goroutines hit this path simultaneously the second send blocks forever, leaking the goroutine."}
-]
+Example `cursor_review_record_finding` arguments:
+`{"file":"pkg/retry/retrier.go","line":55,"side":"RIGHT","severity":"high","body":"When maxRetries is 0 the loop never executes, so the operation is not attempted."}`
 
 === BEGIN DIFF ===
