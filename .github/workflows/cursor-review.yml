@@ -163,7 +163,7 @@ jobs:
         run: |
           # PRs from forks can't run this review. The pull_request event grants
           # fork PRs no access to secrets — so CURSOR_API_KEY is empty and every
-          # panel cell produces empty output — and a read-only GITHUB_TOKEN, so
+          # panel cell fails before submitting output — and a read-only GITHUB_TOKEN, so
           # posting the consolidated review returns HTTP 403. The review can
           # neither analyze nor post, so skip cleanly instead of burning the
           # 8-cell matrix + judge and failing red on every external contribution.
@@ -292,11 +292,9 @@ jobs:
   preflight:
     # Validate the panel's pinned model ids against the LIVE Cursor catalog
     # once, before the 8-cell fan-out. When Cursor delists a pinned id the
-    # per-cell `cursor-agent --model <id>` call fails with 0 bytes of stdout,
-    # which downstream reads as an `empty` cell — indistinguishable from "the
-    # model ran and found nothing", so the panel silently runs a lab short for
-    # weeks. Failing here turns that drift into a loud, visible job failure on
-    # the very next run. This job is ALSO the single source of truth for the
+    # per-cell `cursor-agent --model <id>` call cannot submit structured output.
+    # Failing here turns that drift into a loud, visible job failure before the
+    # fan-out starts. This job is ALSO the single source of truth for the
     # matrix model list (emitted as an output the `review` matrix consumes), so
     # the validated list and the reviewed list can never drift apart.
     name: Preflight — validate model catalog
@@ -443,7 +441,7 @@ jobs:
               "model": os.environ["MODEL"],
               "review_type": os.environ["REVIEW_TYPE"],
               "status": "error",
-              "error": "Cell did not reach the extraction step.",
+              "error": "Cell did not complete structured output submission.",
               "findings": [],
           }
           with open("/tmp/findings-out/findings.json", "w", encoding="utf-8") as f:
