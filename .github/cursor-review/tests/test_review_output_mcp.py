@@ -38,7 +38,7 @@ class ValidationTest(unittest.TestCase):
 
 
 class StdioServerTest(unittest.TestCase):
-    def run_server(self, mode, messages):
+    def run_server(self, mode, messages, include_initial=False):
         with tempfile.TemporaryDirectory() as directory:
             output_path = os.path.join(directory, "findings.json")
             subprocess.run(
@@ -46,6 +46,8 @@ class StdioServerTest(unittest.TestCase):
                  "--model", "test-model", "--review-type", mode, "--init"],
                 check=True,
             )
+            with open(output_path, encoding="utf-8") as source:
+                initial_record = json.load(source)
             process = subprocess.run(
                 [sys.executable, MODULE_PATH, "--mode", mode, "--out", output_path,
                  "--model", "test-model", "--review-type", mode],
@@ -57,6 +59,8 @@ class StdioServerTest(unittest.TestCase):
             with open(output_path, encoding="utf-8") as source:
                 record = json.load(source)
             responses = [json.loads(line) for line in process.stdout.splitlines()]
+            if include_initial:
+                return record, responses, initial_record
             return record, responses
 
     def test_reviewer_records_findings_and_finishes(self):
@@ -109,10 +113,19 @@ class StdioServerTest(unittest.TestCase):
         self.assertEqual(record["findings"], [])
 
     def test_invalid_tool_input_does_not_replace_output(self):
-        record, responses = self.run_server("judge", [
+        record, responses, initial_record = self.run_server("judge", [
             {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
                 "name": "cursor_review_submit_final",
-                "arguments": {"findings": [{**FINDING, "line": 0}]},
+                "arguments": {"findings": [FINDING, {**FINDING, "line": 0}]},
+            }},
+        ], include_initial=True)
+        self.assertEqual(record, initial_record)
+        self.assertTrue(responses[0]["result"]["isError"])
+
+    def test_rejects_falsy_non_object_tool_arguments(self):
+        record, responses = self.run_server("reviewer", [
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+                "name": "cursor_review_finish", "arguments": [],
             }},
         ])
         self.assertEqual(record["status"], "error")
