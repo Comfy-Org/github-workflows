@@ -504,7 +504,8 @@ jobs:
             --review-type "$REVIEW_TYPE" \
             --init
 
-          mkdir -p .cursor
+          rm -rf -- .cursor
+          mkdir -m 700 .cursor
           python3 - <<'PY'
           import json, os, sys, tempfile
 
@@ -656,7 +657,8 @@ jobs:
             --review-type judge \
             --init
 
-          mkdir -p .cursor
+          rm -rf -- .cursor
+          mkdir -m 700 .cursor
           python3 - <<'PY'
           import json, os, sys, tempfile
 

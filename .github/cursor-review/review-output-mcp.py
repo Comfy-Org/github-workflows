@@ -225,7 +225,7 @@ def handle(args, message):
         try:
             if not isinstance(params, dict):
                 raise ValueError("params must be an object")
-            text = call_tool(args, params.get("name"), params.get("arguments") or {})
+            text = call_tool(args, params.get("name"), params.get("arguments", {}))
             return result(request_id, {
                 "content": [{"type": "text", "text": text}],
                 "isError": False,
