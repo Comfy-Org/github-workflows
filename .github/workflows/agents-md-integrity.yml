@@ -1,0 +1,142 @@
+name: AGENTS.md Integrity (reusable)
+
+# Reusable workflow that checks a repo's AGENTS.md against the Comfy AGENTS.md
+# standard (Comfy Engineering Guide, "AGENTS.md, done right", §10): one thin
+# top-level AGENTS.md as the single source of truth, a one-line `@AGENTS.md`
+# CLAUDE.md shim, no divergent `.cursorrules`, a hard under-200-line ceiling
+# (Anthropic guidance) with an aspirational 150-line target, per-subtree shims
+# in monorepos, and a CODEOWNERS DRI. It runs in the CALLER's context, so
+# `actions/checkout` checks out the calling repo and the checks operate on that
+# repo's files. Fails with a non-zero exit (and GitHub annotations) so it can
+# be wired as a required status check.
+#
+# The check script is loaded from THIS repo (public, pinned via `workflows_ref`)
+# — never from the caller's checkout — so a PR can't rewrite the checker.
+#
+# Caller pattern (place in the consumer repo at
+# .github/workflows/agents-md-integrity.yml):
+#
+#   name: AGENTS.md Integrity
+#   on:
+#     pull_request:
+#     push:
+#       branches: [main, master]
+#   jobs:
+#     agents-md:
+#       permissions:
+#         contents: read
+#       uses: Comfy-Org/github-workflows/.github/workflows/agents-md-integrity.yml@<sha>  # v1
+#       with:
+#         workflows_ref: <same-sha>   # pin the checker to the same ref as `uses:`
+#
+# INPUTS (all optional):
+#   max_lines            Hard line ceiling for AGENTS.md; over it FAILS.
+#                        Default 200 (official Anthropic guidance).
+#   warn_lines           Aspirational target; over it emits a non-fatal WARNING
+#                        (but at/under max_lines still passes). Default 150.
+#   forbid_cursorrules   When true, a legacy root `.cursorrules` file FAILS the
+#                        check (AGENTS.md is the single source of truth).
+#                        Default true.
+#   check_nested         When true, every nested `AGENTS.md` (monorepo subtree)
+#                        must have a sibling `CLAUDE.md` containing `@AGENTS.md`
+#                        and must itself be <= max_lines. Default true.
+#   require_codeowners   Controls the CODEOWNERS/DRI check severity. When false
+#                        (default) an unowned AGENTS.md only WARNS; when true it
+#                        FAILS. Default false (warn only).
+#   agents_file          Path to the agents file to check. Default `AGENTS.md`.
+#   workflows_ref        Ref of Comfy-Org/github-workflows to load the check
+#                        script from. Pin this to the same ref you pin `uses:`
+#                        to for reproducibility. Default `main`.
+#
+# No secrets required.
+
+on:
+  workflow_call:
+    inputs:
+      max_lines:
+        description: Hard line ceiling for AGENTS.md (over it FAILS). Default 200.
+        type: number
+        required: false
+        default: 200
+      warn_lines:
+        description: >-
+          Aspirational line target (over it WARNS, but at/under max_lines still
+          passes). Default 150.
+        type: number
+        required: false
+        default: 150
+      forbid_cursorrules:
+        description: >-
+          Fail when a legacy root `.cursorrules` file exists. Default true.
+        type: boolean
+        required: false
+        default: true
+      check_nested:
+        description: >-
+          Check nested (monorepo) AGENTS.md files for a sibling `@AGENTS.md`
+          CLAUDE.md shim and the line ceiling. Default true.
+        type: boolean
+        required: false
+        default: true
+      require_codeowners:
+        description: >-
+          Escalate the CODEOWNERS/DRI check from a warning to a failure. Default
+          false (an unowned AGENTS.md only warns).
+        type: boolean
+        required: false
+        default: false
+      agents_file:
+        description: Path to the agents file to check. Default `AGENTS.md`.
+        type: string
+        required: false
+        default: AGENTS.md
+      workflows_ref:
+        description: >-
+          Ref of Comfy-Org/github-workflows to load the check script from. Pin
+          this to the same ref you pin `uses:` to for reproducibility.
+        type: string
+        required: false
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: AGENTS.md integrity
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout caller repo
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Load integrity check script
+        # The checker comes from THIS repo (public, pinned via workflows_ref),
+        # never from the caller's checkout, so a PR can't rewrite the check.
+        uses: actions/checkout@v6
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _agents_md_integrity
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Check AGENTS.md integrity
+        env:
+          AGENTS_CHECK_ROOT: ${{ github.workspace }}
+          MAX_LINES: ${{ inputs.max_lines }}
+          WARN_LINES: ${{ inputs.warn_lines }}
+          FORBID_CURSORRULES: ${{ inputs.forbid_cursorrules }}
+          CHECK_NESTED: ${{ inputs.check_nested }}
+          REQUIRE_CODEOWNERS: ${{ inputs.require_codeowners }}
+          AGENTS_FILE: ${{ inputs.agents_file }}
+        run: |
+          python3 "$GITHUB_WORKSPACE/_agents_md_integrity/.github/agents-md-integrity/check_agents_md.py" \
+            --root "$AGENTS_CHECK_ROOT"
