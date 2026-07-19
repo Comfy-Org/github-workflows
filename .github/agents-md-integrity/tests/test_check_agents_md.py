@@ -25,6 +25,7 @@ DEFAULT_CONFIG = {
     "warn_lines": 150,
     "forbid_cursorrules": True,
     "check_nested": True,
+    "require_shim": True,
     "require_codeowners": False,
 }
 
@@ -122,15 +123,29 @@ class CheckAgentsMdTest(unittest.TestCase):
         failures, _ = self._run()
         self.assertEqual(failures, [])
 
-    def test_no_claude_md_is_fine(self):
-        # CLAUDE.md is optional; its absence is not a failure.
+    def test_missing_claude_md_fails(self):
+        # The shim is REQUIRED: Claude Code reads only CLAUDE.md and does not
+        # fall back to AGENTS.md, so its absence hides the instructions.
         _write(self.root, "AGENTS.md", "thin\n")
         _write(self.root, "CODEOWNERS", "* @o\n")
         failures, _ = self._run()
+        self.assertTrue(any("no root 'CLAUDE.md' shim" in f for f in failures))
+
+    def test_missing_claude_md_passes_when_require_shim_off(self):
+        _write(self.root, "AGENTS.md", "thin\n")
+        _write(self.root, "CODEOWNERS", "* @o\n")
+        failures, _ = self._run(require_shim=False)
         self.assertEqual(failures, [])
+
+    def test_missing_agents_md_does_not_also_report_missing_shim(self):
+        # Empty repo: check 1 (AGENTS.md missing) fires; the shim check stays
+        # quiet rather than piling a second failure on the same root cause.
+        failures, _ = self._run()
+        self.assertEqual(len([f for f in failures if "CLAUDE.md" in f]), 0)
 
     def test_cursorrules_gate_off(self):
         _write(self.root, "AGENTS.md", "thin\n")
+        _write(self.root, "CLAUDE.md", "@AGENTS.md\n")
         _write(self.root, ".cursorrules", "rules\n")
         _write(self.root, "CODEOWNERS", "* @o\n")
         failures, _ = self._run(forbid_cursorrules=False)
@@ -138,6 +153,7 @@ class CheckAgentsMdTest(unittest.TestCase):
 
     def test_nested_gate_off(self):
         _write(self.root, "AGENTS.md", "thin\n")
+        _write(self.root, "CLAUDE.md", "@AGENTS.md\n")
         _write(self.root, "CODEOWNERS", "* @o\n")
         _write(self.root, "packages/x/AGENTS.md", "nested, no shim\n")
         failures, _ = self._run(check_nested=False)
@@ -145,6 +161,7 @@ class CheckAgentsMdTest(unittest.TestCase):
 
     def test_nested_scan_skips_vendored_dirs(self):
         _write(self.root, "AGENTS.md", "thin\n")
+        _write(self.root, "CLAUDE.md", "@AGENTS.md\n")
         _write(self.root, "CODEOWNERS", "* @o\n")
         # A vendored AGENTS.md must not trip the nested check.
         _write(self.root, "node_modules/pkg/AGENTS.md", "vendored\n")
@@ -153,12 +170,14 @@ class CheckAgentsMdTest(unittest.TestCase):
 
     def test_codeowners_missing_warns_by_default(self):
         _write(self.root, "AGENTS.md", "thin\n")
+        _write(self.root, "CLAUDE.md", "@AGENTS.md\n")
         failures, warnings = self._run()
         self.assertEqual(failures, [])
         self.assertTrue(any("no CODEOWNERS file" in w for w in warnings))
 
     def test_codeowners_unmatched_warns(self):
         _write(self.root, "AGENTS.md", "thin\n")
+        _write(self.root, "CLAUDE.md", "@AGENTS.md\n")
         _write(self.root, ".github/CODEOWNERS", "/src/ @team\n")
         failures, warnings = self._run()
         self.assertEqual(failures, [])
@@ -166,6 +185,7 @@ class CheckAgentsMdTest(unittest.TestCase):
 
     def test_codeowners_wildcard_matches(self):
         _write(self.root, "AGENTS.md", "thin\n")
+        _write(self.root, "CLAUDE.md", "@AGENTS.md\n")
         _write(self.root, "CODEOWNERS", "* @default-team\n")
         failures, warnings = self._run(require_codeowners=True)
         self.assertEqual(failures, [])
@@ -174,6 +194,7 @@ class CheckAgentsMdTest(unittest.TestCase):
     def test_codeowners_last_match_wins_unassign(self):
         # A later, more specific rule with NO owner unassigns AGENTS.md.
         _write(self.root, "AGENTS.md", "thin\n")
+        _write(self.root, "CLAUDE.md", "@AGENTS.md\n")
         _write(self.root, "CODEOWNERS", "* @default\n/AGENTS.md\n")
         failures, warnings = self._run()
         self.assertTrue(any("not matched by any CODEOWNERS" in w for w in warnings))
@@ -190,7 +211,7 @@ class CheckAgentsMdTest(unittest.TestCase):
         # also flagged as a shim-less nested file.
         _write(self.root, "docs/AGENTS.md", "thin\n")
         _write(self.root, "CODEOWNERS", "* @o\n")
-        failures, _ = self._run(agents_file="docs/AGENTS.md")
+        failures, _ = self._run(agents_file="docs/AGENTS.md", require_shim=False)
         self.assertEqual(failures, [])
 
 

@@ -40,6 +40,10 @@ name: AGENTS.md Integrity (reusable)
 #   check_nested         When true, every nested `AGENTS.md` (monorepo subtree)
 #                        must have a sibling `CLAUDE.md` containing `@AGENTS.md`
 #                        and must itself be <= max_lines. Default true.
+#   require_shim         When true, a missing root `CLAUDE.md` FAILS whenever the
+#                        agents file exists (Claude Code reads only CLAUDE.md and
+#                        does not fall back, so no shim = invisible instructions).
+#                        Default true.
 #   require_codeowners   Controls the CODEOWNERS/DRI check severity. When false
 #                        (default) an unowned AGENTS.md only WARNS; when true it
 #                        FAILS. Default false (warn only).
@@ -75,6 +79,13 @@ on:
         description: >-
           Check nested (monorepo) AGENTS.md files for a sibling `@AGENTS.md`
           CLAUDE.md shim and the line ceiling. Default true.
+        type: boolean
+        required: false
+        default: true
+      require_shim:
+        description: >-
+          Fail when the root `CLAUDE.md` shim is missing while the agents file
+          exists (Claude Code reads only CLAUDE.md, no fallback). Default true.
         type: boolean
         required: false
         default: true
@@ -135,6 +146,7 @@ jobs:
           WARN_LINES: ${{ inputs.warn_lines }}
           FORBID_CURSORRULES: ${{ inputs.forbid_cursorrules }}
           CHECK_NESTED: ${{ inputs.check_nested }}
+          REQUIRE_SHIM: ${{ inputs.require_shim }}
           REQUIRE_CODEOWNERS: ${{ inputs.require_codeowners }}
           AGENTS_FILE: ${{ inputs.agents_file }}
         run: |

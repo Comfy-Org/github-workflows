@@ -2,8 +2,9 @@
 """Check a repo's AGENTS.md against the Comfy AGENTS.md standard.
 
 The standard (Comfy Engineering Guide, "AGENTS.md, done right", §10): one thin
-top-level `AGENTS.md` is the single source of truth, `CLAUDE.md` is a one-line
-`@AGENTS.md` shim (optionally with a few Claude-only lines below), there are no
+top-level `AGENTS.md` is the single source of truth, `CLAUDE.md` is a REQUIRED
+one-line `@AGENTS.md` shim (optionally with a few Claude-only lines below —
+Claude Code reads only CLAUDE.md and does not fall back), there are no
 divergent `.cursorrules`, and the file stays under a hard line ceiling (200,
 per Anthropic guidance) with an aspirational target (150). In a monorepo every
 nested `AGENTS.md` gets a sibling `CLAUDE.md` shim so Claude Code picks it up in
@@ -180,7 +181,11 @@ def run_checks(root, config):
                 f"of {warn_lines} (hard ceiling {max_lines})."
             )
 
-    # 3. CLAUDE.md shim.
+    # 3. CLAUDE.md shim. Claude Code reads only CLAUDE.md and does NOT fall
+    # back to AGENTS.md, so a missing root shim means the repo's instructions
+    # are invisible to it — the most common gap in the org audit. Only checked
+    # when the agents file itself exists (check 1 already fired otherwise;
+    # don't double-report).
     claude_path = os.path.join(root, "CLAUDE.md")
     if os.path.isfile(claude_path):
         if not _has_import(claude_path, import_token):
@@ -189,6 +194,13 @@ def run_checks(root, config):
                 f"it is a divergent copy. Make it a thin shim whose first line "
                 f"is '{import_token}' (Claude-only notes may follow)."
             )
+    elif config["require_shim"] and os.path.isfile(agents_path):
+        failures.append(
+            f"no root 'CLAUDE.md' shim. Claude Code reads only 'CLAUDE.md' "
+            f"and does not fall back to '{agents_basename}', so this repo's "
+            f"agent instructions are invisible to it. Add a one-line shim "
+            f"containing '{import_token}'."
+        )
 
     # 4. No legacy .cursorrules.
     if config["forbid_cursorrules"]:
@@ -293,6 +305,7 @@ def main(argv=None):
         "warn_lines": _env_int("WARN_LINES", 150),
         "forbid_cursorrules": _env_bool("FORBID_CURSORRULES", True),
         "check_nested": _env_bool("CHECK_NESTED", True),
+        "require_shim": _env_bool("REQUIRE_SHIM", True),
         "require_codeowners": _env_bool("REQUIRE_CODEOWNERS", False),
     }
 
