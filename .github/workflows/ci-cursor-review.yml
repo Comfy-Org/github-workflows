@@ -8,22 +8,28 @@ name: CI - Cursor Review
 # Pinning to a merged main SHA keeps the reviewer tamper-proof; the bump-callers
 # workflow keeps the pin fresh (this repo is enrolled in CURSOR_REVIEW_CALLERS).
 #
-# Unlike sibling callers (label-triggered, applied by tooling), this one runs on
-# every non-draft PR directly: changes here propagate into every consumer
-# repo's CI, the PR volume is small, and a direct trigger avoids the
-# label-application dependency entirely.
+# Label-triggered for now (apply `cursor-review` to a PR to fire the panel;
+# `skip-cursor-review` vetoes) — the reusable's gate at this pin only honors
+# label events. Once the pin advances past the commit adding the reusable's
+# `run_without_label` input, the auto-bump PR for this file should also add
+# `run_without_label: true` under `with:` and widen the trigger types to
+# [opened, reopened, ready_for_review, labeled, unlabeled] — this repo has no
+# labeling automation, and every non-draft PR here is worth a review (its
+# files become other repos' required checks).
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [labeled, unlabeled]
 
+# Cancel any earlier in-flight review run for the same PR when cursor-review is
+# removed or re-applied. Scoping by label name ensures that removing an
+# unrelated label does not kill a running cursor review.
 concurrency:
-  group: cursor-review-pr-${{ github.event.pull_request.number }}
+  group: cursor-review-pr-${{ github.event.pull_request.number }}-${{ github.event.label.name }}
   cancel-in-progress: true
 
 jobs:
   cursor-review:
-    if: ${{ !github.event.pull_request.draft }}
     permissions:
       contents: read
       pull-requests: write
