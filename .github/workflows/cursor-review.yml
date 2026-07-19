@@ -53,7 +53,7 @@ on:
           the panel.
         type: string
         required: false
-        default: claude-opus-4-8-thinking-xhigh
+        default: claude-opus-4-8-thinking-max
       diff_size_cap:
         description: >-
           Max changed lines (added + removed, after diff_excludes). PRs over
@@ -277,12 +277,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Pinned to the highest reasoning tier available for each lab. Gemini
-        # and Kimi only ship a single tier in Cursor's catalog; OpenAI Codex
-        # and Claude expose xhigh variants we use here.
+        # Pinned to each lab's newest highest-reasoning tier in Cursor's
+        # catalog (last checked 2026-07-14). OpenAI: GPT-5.6 Sol is the
+        # 5.6-family coding flagship (no 5.6 codex variant exists). Anthropic:
+        # Fable 5 tops the catalog but all Fable entries are marked NO ZDR in
+        # Cursor, and this panel reviews private-repo diffs, so it is excluded;
+        # Opus 4.8 thinking at its max tier is the top ZDR-eligible pick.
+        # Gemini (Pro line) and Kimi still ship a single reasoning tier each.
         model:
-          - gpt-5.3-codex-xhigh
-          - claude-opus-4-8-thinking-xhigh
+          - gpt-5.6-sol-max
+          - claude-opus-4-8-thinking-max
           - gemini-3.1-pro
           - kimi-k2.5
         review_type: [adversarial, edge-case]
