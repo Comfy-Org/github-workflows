@@ -1,0 +1,46 @@
+name: CI - Cursor Review
+
+# Thin caller enrolling THIS repo in its own reusable cursor-review workflow.
+# The review logic (panel matrix, judge consolidation, prompts, scripts) lives
+# in cursor-review.yml in this same repo, but the caller still pins it by full
+# commit SHA like every external consumer: a local `uses: ./...` path would run
+# the PR's OWN copy of the reviewer, letting a PR weaken the panel judging it.
+# Pinning to a merged main SHA keeps the reviewer tamper-proof; the bump-callers
+# workflow keeps the pin fresh (this repo is enrolled in CURSOR_REVIEW_CALLERS).
+#
+# Label-triggered for now (apply `cursor-review` to a PR to fire the panel;
+# `skip-cursor-review` vetoes) — the reusable's gate at this pin only honors
+# label events. Once the pin advances past the commit adding the reusable's
+# `run_without_label` input, the auto-bump PR for this file should also add
+# `run_without_label: true` under `with:` and widen the trigger types to
+# [opened, reopened, ready_for_review, labeled, unlabeled] — this repo has no
+# labeling automation, and every non-draft PR here is worth a review (its
+# files become other repos' required checks).
+
+on:
+  pull_request:
+    types: [labeled, unlabeled]
+
+# Cancel any earlier in-flight review run for the same PR when cursor-review is
+# removed or re-applied. Scoping by label name ensures that removing an
+# unrelated label does not kill a running cursor review.
+concurrency:
+  group: cursor-review-pr-${{ github.event.pull_request.number }}-${{ github.event.label.name }}
+  cancel-in-progress: true
+
+jobs:
+  cursor-review:
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@fe6b08e278c27ceacf2651cf441d0752ca2e78ee # main (fe6b08e)
+    with:
+      # Keep the assets ref in lock-step with the `uses:` ref above.
+      workflows_ref: fe6b08e278c27ceacf2651cf441d0752ca2e78ee
+      # No vendored/generated content in this repo; defensive excludes only.
+      diff_excludes: >-
+        :!**/*-lock.json
+        :!**/dist/**
+    secrets:
+      CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
