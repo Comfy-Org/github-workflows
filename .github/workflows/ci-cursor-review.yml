@@ -1,0 +1,40 @@
+name: CI - Cursor Review
+
+# Thin caller enrolling THIS repo in its own reusable cursor-review workflow.
+# The review logic (panel matrix, judge consolidation, prompts, scripts) lives
+# in cursor-review.yml in this same repo, but the caller still pins it by full
+# commit SHA like every external consumer: a local `uses: ./...` path would run
+# the PR's OWN copy of the reviewer, letting a PR weaken the panel judging it.
+# Pinning to a merged main SHA keeps the reviewer tamper-proof; the bump-callers
+# workflow keeps the pin fresh (this repo is enrolled in CURSOR_REVIEW_CALLERS).
+#
+# Unlike sibling callers (label-triggered, applied by tooling), this one runs on
+# every non-draft PR directly: changes here propagate into every consumer
+# repo's CI, the PR volume is small, and a direct trigger avoids the
+# label-application dependency entirely.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: cursor-review-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  cursor-review:
+    if: ${{ !github.event.pull_request.draft }}
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@fe6b08e278c27ceacf2651cf441d0752ca2e78ee # main (fe6b08e)
+    with:
+      # Keep the assets ref in lock-step with the `uses:` ref above.
+      workflows_ref: fe6b08e278c27ceacf2651cf441d0752ca2e78ee
+      # No vendored/generated content in this repo; defensive excludes only.
+      diff_excludes: >-
+        :!**/*-lock.json
+        :!**/dist/**
+    secrets:
+      CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+      SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
