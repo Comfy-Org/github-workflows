@@ -1,17 +1,20 @@
 name: Assign Reviewers (reusable)
 
-# Auto-requests expertise-aware, load-balanced PR reviewers, with optional
-# "new-folk" randomization so people outside the matched experts get review
-# reps. Models its structure on cursor-review-auto-label.yml: a workflow_call
+# Auto-assigns expertise-aware, load-balanced PR owners, with optional
+# "new-folk" randomization so people outside the matched experts get reps.
+# NOTE: this org routes/alerts people via the ASSIGNEE field, so this workflow
+# writes assignees (github.rest.issues.addAssignees) — NOT reviewer requests.
+# Models its structure on cursor-review-auto-label.yml: a workflow_call
 # contract, caller-side `vars` for config, a GitHub App token, and defensive
 # draft/skip handling that never fails the PR.
 #
-# WHY AN APP TOKEN: reviewer requests are made with the CLOUD_CODE_BOT app token
+# WHY AN APP TOKEN: assignments are made with the CLOUD_CODE_BOT app token
 # (vars.APP_ID + secrets.CLOUD_CODE_BOT_PRIVATE_KEY), not the default
 # GITHUB_TOKEN. On fork PRs the GITHUB_TOKEN is read-only, so a
-# GITHUB_TOKEN-driven requestReviewers would 403 (the failure seen in
+# GITHUB_TOKEN-driven addAssignees would 403 (same class of failure seen in
 # github-workflows#12). The app token sidesteps that, so the calling job only
-# needs `contents: read` — no `pull-requests: write` on GITHUB_TOKEN.
+# needs `contents: read`. NOTE: assigning users on PRs uses the app's
+# `Pull requests: write` permission, which CLOUD_CODE_BOT already carries.
 #
 # REVIEWER CONFIG (in the CALLER repo, default `.github/reviewers.yml`): a
 # top-level `default_pool` plus a `rules` list mapping path globs to reviewers.
@@ -31,9 +34,9 @@ name: Assign Reviewers (reusable)
 #
 # SELECTION: changed paths -> union of matching experts (else default_pool) ->
 # drop the author + vars.REVIEWER_EXCLUDE -> rank ascending by each candidate's
-# open review load (steering off anyone at/over vars.REVIEWER_LOAD_CAP) ->
+# open assignee load (steering off anyone at/over vars.REVIEWER_LOAD_CAP) ->
 # deterministically (per PR number) maybe swap the last slot for a
-# vars.REVIEWER_GROWTH_POOL member -> request the top `num_reviewers`.
+# vars.REVIEWER_GROWTH_POOL member -> assign the top `num_reviewers`.
 #
 # Example caller (consumer repo):
 #
@@ -81,7 +84,7 @@ on:
       CLOUD_CODE_BOT_PRIVATE_KEY:
         description: >-
           Private key for the CLOUD_CODE_BOT GitHub App (app id = vars.APP_ID).
-          Required: reviewer requests are made by the app so they succeed even on
+          Required: assignments are made by the app so they succeed even on
           fork PRs where the default GITHUB_TOKEN is read-only.
         required: true
 
@@ -90,7 +93,7 @@ permissions:
 
 jobs:
   assign-reviewers:
-    name: Request expertise-aware reviewers
+    name: Assign expertise-aware owners
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -102,7 +105,7 @@ jobs:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
 
-      - name: Select and request reviewers
+      - name: Select and assign owners
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           REVIEWER_CONFIG_PATH: ${{ inputs.reviewer_config_path }}
@@ -112,8 +115,8 @@ jobs:
           LOAD_CAP: ${{ vars.REVIEWER_LOAD_CAP }}
           EXCLUDE: ${{ vars.REVIEWER_EXCLUDE }}
         with:
-          # Authenticate the octokit with the APP token so reviewer requests
-          # work on fork PRs (read-only GITHUB_TOKEN would 403).
+          # Authenticate the octokit with the APP token so assignment works on
+          # fork PRs (read-only GITHUB_TOKEN would 403).
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const pr = context.payload.pull_request;
@@ -130,8 +133,8 @@ jobs:
               core.info(`${skipLabel} present — skipping.`);
               return;
             }
-            if ((pr.requested_reviewers || []).length > 0) {
-              core.info('PR already has requested reviewers — skipping.');
+            if ((pr.assignees || []).length > 0) {
+              core.info('PR already has assignees — skipping.');
               return;
             }
 
@@ -295,18 +298,18 @@ jobs:
             if (pr.user && pr.user.login) exclude.add(pr.user.login);
             let pool = [...candidates].filter((c) => !exclude.has(c));
             if (pool.length === 0) {
-              core.info('No eligible candidates after exclusions — nothing to request.');
+              core.info('No eligible candidates after exclusions — nothing to assign.');
               return;
             }
 
-            // --- 5. Load-balance: rank ascending by open review load ---
+            // --- 5. Load-balance: rank ascending by open assignee load ---
             const cap = parseInt(process.env.LOAD_CAP || '', 10); // NaN when unset
             const withLoad = [];
             for (const login of pool) {
               let load = 0;
               try {
                 const r = await github.rest.search.issuesAndPullRequests({
-                  q: `is:open is:pr review-requested:${login} org:${owner}`,
+                  q: `is:open is:pr assignee:${login} org:${owner}`,
                 });
                 load = r.data.total_count;
               } catch (e) {
@@ -343,16 +346,19 @@ jobs:
             }
             selected = selected.slice(0, num);
 
-            // --- 7. Request reviewers (never fail the PR) ---
+            // --- 7. Assign the selected users (never fail the PR) ---
+            // This org routes/alerts people via the ASSIGNEE field, not the
+            // reviewer-request field, so we assign rather than requestReviewers.
+            // Note: addAssignees caps at 10 and silently drops non-collaborators.
             if (selected.length === 0) {
-              core.info('No reviewers selected — nothing to request.');
+              core.info('No one selected — nothing to assign.');
               return;
             }
             try {
-              await github.rest.pulls.requestReviewers({
-                owner, repo, pull_number, reviewers: selected,
+              await github.rest.issues.addAssignees({
+                owner, repo, issue_number: pull_number, assignees: selected,
               });
-              core.info(`Requested reviewers: ${selected.join(', ')}`);
+              core.info(`Assigned: ${selected.join(', ')}`);
             } catch (e) {
-              core.warning(`requestReviewers failed (${e.message}) — leaving PR unassigned.`);
+              core.warning(`addAssignees failed (${e.message}) — leaving PR unassigned.`);
             }
