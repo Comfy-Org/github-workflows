@@ -14,7 +14,8 @@
 #     fleet still hard-fails, and a malformed variable hard-fails.
 #
 # No network: `gh` is a PATH stub that serves a fixture file and captures the
-# contents PUT so we can inspect exactly what would be committed.
+# Git Data API calls (the blob content + the tree's file list) so we can inspect
+# exactly what would be committed.
 
 set -uo pipefail
 
@@ -42,8 +43,9 @@ mkdir -p "$STUB_BIN"
 cat > "${STUB_BIN}/gh" <<'STUB'
 #!/usr/bin/env bash
 # Minimal `gh` stub. Serves $STUB_CONTENT_FILE for a contents GET and captures
-# the decoded contents PUT to $STUB_PUT_DIR; everything else returns a canned
-# value so bump-callers.sh runs end to end offline.
+# the atomic Git Data API commit (blobs/tree/commit/ref) to $STUB_PUT_DIR;
+# everything else returns a canned value so bump-callers.sh runs end to end
+# offline.
 sub="$1"; shift || true
 if [[ "$sub" == "pr" ]]; then
   action="$1"; shift || true
@@ -87,26 +89,35 @@ while (( i < ${#args[@]} )); do
   esac
 done
 
-# Model the ONE bump branch's committed file set in $STUB_PUT_DIR/branch_files:
-# a ref create/reset (POST/PATCH on git/refs) rebuilds the branch at the tip and
-# so DROPS every prior bump commit (truncate), while a contents PUT commits a
-# file onto it (append its path). This is what lets a test assert the branch's
-# final contents — and catch the BE-3896 regression where resetting the branch
-# per file left only the last file on it. (One branch is modeled; a same-repo
-# test drives a single repo, so branch_files reflects exactly that repo's PR.)
-case "$method" in
-  POST)  # branch create at the tip — starts a fresh (empty) bump branch
-    [[ "$path" == *"/git/refs"* ]] && : > "$STUB_PUT_DIR/branch_files"
-    exit 0;;
-  PATCH) # force-reset of the bump branch ref — discards prior bump commits
-    [[ "$path" == *"/git/refs"* ]] && : > "$STUB_PUT_DIR/branch_files"
-    exit 0;;
-  PUT)
+# Model the ONE atomic bump commit in $STUB_PUT_DIR. The script builds a blob
+# per staged file (POST git/blobs), one tree carrying all of them off the tip
+# (POST git/trees, body on stdin), one commit (POST git/commits), then points
+# the bump branch at that commit (POST/PATCH git/refs). We record each blob's
+# decoded content (put.$n.txt / put.last.txt; count = number of blobs = files
+# committed) and the tree's path list as $STUB_PUT_DIR/branch_files — the
+# atomic branch's final file set. Because the whole commit is built BEFORE the
+# ref moves, an earlier failure (e.g. a Pass-1 fetch error) leaves NO blobs, NO
+# tree, and the ref untouched — the all-or-nothing property this asserts
+# (BE-3902) — while the tree still lists BOTH files of a monorepo caller on the
+# one branch (BE-3896). (One branch/commit is modeled; a same-repo test drives a
+# single repo, so branch_files reflects exactly that repo's PR.)
+case "$method:$path" in
+  POST:*/git/blobs*)    # blob create — capture the new file content, count it
     n=$(( $(cat "$STUB_PUT_DIR/count" 2>/dev/null || echo 0) + 1 ))
     echo "$n" > "$STUB_PUT_DIR/count"
     printf '%s' "$content" | { base64 -d 2>/dev/null || base64 -D; } > "$STUB_PUT_DIR/put.$n.txt"
     cp "$STUB_PUT_DIR/put.$n.txt" "$STUB_PUT_DIR/put.last.txt"
-    echo "${path##*/contents/}" >> "$STUB_PUT_DIR/branch_files"   # file now on the branch
+    echo "blobsha${n}"
+    exit 0;;
+  POST:*/git/trees*)    # tree create — the stdin body lists every bumped path
+    jq -r '.tree[].path' > "$STUB_PUT_DIR/branch_files"
+    echo "treesha1"
+    exit 0;;
+  POST:*/git/commits*)  # commit create — drain the body, return a commit sha
+    cat >/dev/null
+    echo "commitsha1"
+    exit 0;;
+  POST:*/git/refs*|PATCH:*/git/refs*)  # point the bump branch at the commit
     exit 0;;
 esac
 
@@ -236,18 +247,20 @@ check "'# v1' comment left intact" "grep -qF '# v1' \"$PUT\""
 
 echo "== monorepo: TWO files in the SAME repo BOTH land on the one branch (BE-3896) =="
 # A repo listed more than once (a monorepo pinning the reusable workflow from
-# two workflow files) must land BOTH files on its single stable branch. The old
-# per-entry loop reset the branch before each file, so the second file's reset
-# discarded the first file's commit and the PR shipped only the last file — a
-# silent partial bump. The stub now models the branch's file set (a reset
-# truncates it, a PUT appends), so this asserts the branch keeps BOTH files.
+# two workflow files) must land BOTH files on its single stable branch. Both are
+# now built into ONE atomic commit (one tree carrying both blobs), so the branch
+# holds them together or not at all. The stub records the tree's path list as
+# the branch's file set, so this asserts the branch keeps BOTH files — the old
+# per-entry loop reset the branch before each file and shipped only the last one
+# (BE-3896), and the per-file PUT loop that replaced it could still leave a
+# partial commit on failure (BE-3902).
 new_case mono
 STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
   VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
   CALLERS_JSON='[{"repo":"Comfy-Org/secret-mono","file":".github/workflows/ci-a.yml","label":""},{"repo":"Comfy-Org/secret-mono","file":".github/workflows/ci-b.yml","label":""}]'
 BF="${STUB_PUT_DIR}/branch_files"
 check "exit 0" "[[ $RC -eq 0 ]]"
-check "committed both files (2 PUTs)"          "[[ \$(cat \"\$STUB_PUT_DIR/count\") -eq 2 ]]"
+check "committed both files (2 blobs)"         "[[ \$(cat \"\$STUB_PUT_DIR/count\") -eq 2 ]]"
 check "branch holds exactly two files"         "[[ \$(wc -l < \"$BF\") -eq 2 ]]"
 check "first file present on the branch"       "grep -q 'ci-a.yml' \"$BF\""   # the file the old code dropped
 check "second file present on the branch"      "grep -q 'ci-b.yml' \"$BF\""
@@ -307,9 +320,10 @@ check "committed NOTHING"                       "[[ ! -f \"\$STUB_PUT_DIR/count\
 check "opened NO PR"                            "[[ ! -f \"\$STUB_PUT_DIR/pr.log\" ]] || ! grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
 check "job failed for the repo"                 "grep -q 'bump failed for 1 repo' <<<\"\$OUT\""
 
-echo "== same repo+file listed twice is de-duped to ONE commit (no stale-sha 409) =="
-# A repo listed twice for the same path must stage that file once; a second PUT
-# with the now-stale pre-bump blob sha would 409 and fail the repo.
+echo "== same repo+file listed twice is de-duped to ONE blob/tree entry =="
+# A repo listed twice for the same path must stage that file once; a duplicate
+# tree entry for the same path is ambiguous (the atomic commit must carry each
+# path exactly once), so the dedup keeps the commit well-formed.
 new_case dedup
 STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
   VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \

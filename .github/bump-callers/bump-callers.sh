@@ -97,11 +97,14 @@ fi
 # the loop) instead of killing the run. A repo whose files are all missing or
 # already pinned commits nothing and is a successful skip (`return 0`).
 #
-# Grouping by repo is load-bearing: the branch is reset to the default-branch
-# tip ONCE per repo, then each file is committed onto it. The previous per-entry
-# loop reset the branch before EACH file, so a second same-repo file's reset
-# discarded the first file's commit and the PR shipped only the last file — a
-# silent partial bump (BE-3896).
+# Grouping by repo is load-bearing: all of a repo's files are built into ONE
+# atomic commit (Git Data API) off the default-branch tip and the bump branch is
+# moved to it in a single step, so the PR either bumps every file or none — never
+# a partial-yet-mergeable bump. The earlier per-file Contents PUT loop committed
+# files one at a time with no rollback, so a mid-sequence failure left the
+# earlier files already committed on the branch (BE-3902); and before that a
+# per-ENTRY branch reset discarded earlier commits so only the last file shipped
+# (BE-3896). One commit for the whole repo closes both.
 bump_repo() {
   local REPO="$1"; shift   # remaining args: this repo's "repo|file|label" entries
 
@@ -111,12 +114,12 @@ bump_repo() {
     return 1
   }
 
-  # Resolve the default-branch tip ONCE, up front, and pin every Pass-1 blob
-  # fetch to this immutable SHA (not the mutable `?ref=<branch>`). This closes a
-  # TOCTOU race: if the caller's default branch moved between the fetches and the
-  # reset below, a staged blob `sha` would be stale against the new tip and its
-  # Pass-2 PUT would 409 after earlier files already committed. Reading the tip
-  # is a GET (no branch churn), so it is safe before the all-skip early return.
+  # Resolve the default-branch tip ONCE, up front. Every Pass-1 fetch is pinned
+  # to this immutable SHA (not the mutable `?ref=<branch>`), and Pass 2 uses the
+  # same SHA as both the tree's `base_tree` and the commit's parent — so the
+  # whole bump is built against one consistent snapshot of the caller repo,
+  # never a moving tip. Reading the tip is a GET (no branch churn), so it is safe
+  # before the all-skip early return.
   local MAIN_SHA
   MAIN_SHA=$(gh api "repos/${REPO}/git/refs/heads/${DEFAULT_BRANCH}" --jq '.object.sha') || {
     echo "::warning::${REPO}: cannot read ${DEFAULT_BRANCH} ref — skipping"
@@ -127,8 +130,8 @@ bump_repo() {
   # anything yet. This keeps the reset/commit path off entirely for a repo whose
   # files are all missing or already pinned (the old per-entry skips), so it
   # never resets a branch or opens a PR it doesn't need.
-  local -a PEND_FILE_ENC=() PEND_CONTENT=() PEND_BLOB=() LABELS=()
-  local ENTRY FILE LABEL FILE_ENC CURRENT BLOB_SHA OLD_CONTENT NEW_CONTENT
+  local -a PEND_FILE=() PEND_CONTENT=() LABELS=()
+  local ENTRY FILE LABEL FILE_ENC CURRENT OLD_CONTENT NEW_CONTENT
   for ENTRY in "$@"; do
     FILE=$(cut -d'|' -f2 <<<"$ENTRY")
     LABEL=$(cut -d'|' -f3 <<<"$ENTRY")
@@ -141,8 +144,8 @@ bump_repo() {
     # duplicate entry's label into the set (it still applies to the one PR) but
     # do not re-stage the file.
     local SEEN_FILE=0 P
-    for P in ${PEND_FILE_ENC[@]+"${PEND_FILE_ENC[@]}"}; do
-      [[ "$P" == "$FILE_ENC" ]] && { SEEN_FILE=1; break; }
+    for P in ${PEND_FILE[@]+"${PEND_FILE[@]}"}; do
+      [[ "$P" == "$FILE" ]] && { SEEN_FILE=1; break; }
     done
     if (( SEEN_FILE )); then
       [[ -n "$LABEL" ]] && LABELS+=("$LABEL")
@@ -170,7 +173,6 @@ bump_repo() {
     fi
     rm -f "$ERRFILE"
 
-    BLOB_SHA=$(jq -r '.sha' <<<"$CURRENT")
     OLD_CONTENT=$(jq -r '.content' <<<"$CURRENT" | base64 -d)
 
     # Rewrite the github-workflows pin(s) to NEW_SHA and normalize the stale
@@ -203,49 +205,79 @@ bump_repo() {
     # newline, so printf '%s\n' restores exactly one — otherwise the committed
     # caller loses its EOF newline and trips the receiver repo's formatter
     # (oxfmt/prettier both require a trailing newline).
-    PEND_FILE_ENC+=("$FILE_ENC")
+    PEND_FILE+=("$FILE")
     PEND_CONTENT+=("$(printf '%s\n' "$NEW_CONTENT" | base64 | tr -d '\n')")
-    PEND_BLOB+=("$BLOB_SHA")
   done
 
   # Nothing to bump for this repo → clean skip: no branch churn, no PR.
-  if (( ${#PEND_FILE_ENC[@]} == 0 )); then
+  if (( ${#PEND_FILE[@]} == 0 )); then
     return 0
   fi
 
-  # Rebuild the stable bump branch from the resolved default-branch tip (MAIN_SHA,
-  # captured up front) ONCE for the repo, so the PR is always a clean "bump to
-  # @SHORT" diff — it never accumulates stale commits across bumps and never
-  # drifts if the caller's default branch moved since the last bump (BE-3882).
-  # Create the branch at the tip; if it already exists (an open bump PR, or
-  # residue from a prior run) force it back to the tip so the diff is rebuilt
-  # from scratch rather than committed on top of the old bump.
+  # Pass 2 — land EVERY staged file in ONE atomic commit via the Git Data API,
+  # then point the stable bump branch at it. The previous per-file Contents PUT
+  # loop committed files one at a time with no rollback, so a mid-sequence
+  # failure left the earlier files already committed on the branch — and if an
+  # open bump PR pointed at it, a partial-yet-mergeable bump (BE-3902). Building
+  # one commit off the tip and moving the ref in a single step makes the bump
+  # all-or-nothing: either every file lands or the branch is untouched.
+
+  # 1. Create a blob for each staged file's new content.
+  local -a TREE_ENTRIES=()
+  local i BLOB_NEW
+  for (( i = 0; i < ${#PEND_FILE[@]}; i++ )); do
+    BLOB_NEW=$(gh api --method POST "repos/${REPO}/git/blobs" \
+      --field content="${PEND_CONTENT[$i]}" \
+      --field encoding=base64 \
+      --jq '.sha') || {
+      echo "::warning::${REPO}: blob create for ${PEND_FILE[$i]} failed — skipping"
+      return 1
+    }
+    # Callers are regular files (mode 100644 — the `.github/workflows/*.yml`
+    # they pin from is never executable). `base_tree` below carries every OTHER
+    # path in the repo unchanged, so the tree lists only the bumped files.
+    TREE_ENTRIES+=("$(jq -n --arg path "${PEND_FILE[$i]}" --arg sha "$BLOB_NEW" \
+      '{path: $path, mode: "100644", type: "blob", sha: $sha}')")
+  done
+
+  # 2. Build ONE tree off the default-branch tip carrying all staged blobs.
+  local TREE_SHA
+  TREE_SHA=$(printf '%s\n' "${TREE_ENTRIES[@]}" \
+      | jq -s --arg base "$MAIN_SHA" '{base_tree: $base, tree: .}' \
+      | gh api --method POST "repos/${REPO}/git/trees" --input - --jq '.sha') || {
+    echo "::warning::${REPO}: tree create failed — skipping"
+    return 1
+  }
+
+  # 3. Create ONE commit with that tree, parented on the tip so the PR is always
+  #    a clean "bump to @SHORT" diff against the default branch (never stale
+  #    commits accumulated across bumps, never drift if the caller's default
+  #    branch moved since the last bump — BE-3882).
+  local COMMIT_SHA
+  COMMIT_SHA=$(jq -n \
+      --arg msg "ci: bump ${TAG} to github-workflows@${SHORT}" \
+      --arg tree "$TREE_SHA" --arg parent "$MAIN_SHA" \
+      '{message: $msg, tree: $tree, parents: [$parent]}' \
+      | gh api --method POST "repos/${REPO}/git/commits" --input - --jq '.sha') || {
+    echo "::warning::${REPO}: commit create failed — skipping"
+    return 1
+  }
+
+  # 4. Point the stable bump branch at the finished commit. Create it there if it
+  #    is new; otherwise force it there so the diff is rebuilt from scratch (an
+  #    open bump PR's branch, or residue from a prior run) rather than committed
+  #    on top of the old bump (BE-3882). The ref moves in ONE step from its old
+  #    state to the complete new commit — it never transiently sits at an empty
+  #    or partial tree.
   if ! gh api --method POST "repos/${REPO}/git/refs" \
         --field ref="refs/heads/${BRANCH}" \
-        --field sha="${MAIN_SHA}" >/dev/null 2>&1; then
+        --field sha="${COMMIT_SHA}" >/dev/null 2>&1; then
     gh api --method PATCH "repos/${REPO}/git/refs/heads/${BRANCH}" \
-      --field sha="${MAIN_SHA}" --field force=true >/dev/null 2>&1 || {
-      echo "::warning::${REPO}: cannot reset ${BRANCH} to ${DEFAULT_BRANCH} tip — skipping"
+      --field sha="${COMMIT_SHA}" --field force=true >/dev/null 2>&1 || {
+      echo "::warning::${REPO}: cannot point ${BRANCH} at the bump commit — skipping"
       return 1
     }
   fi
-
-  # Pass 2 — commit each staged file onto the (single) branch in turn. Each PUT
-  # carries that file's own blob SHA from the tip; because the files are
-  # distinct, committing one never changes another's blob, so every PUT applies
-  # cleanly on top of the previous one and the branch accumulates ALL of them.
-  local i
-  for (( i = 0; i < ${#PEND_FILE_ENC[@]}; i++ )); do
-    gh api --method PUT "repos/${REPO}/contents/${PEND_FILE_ENC[$i]}" \
-      --field message="ci: bump ${TAG} to github-workflows@${SHORT}" \
-      --field content="${PEND_CONTENT[$i]}" \
-      --field sha="${PEND_BLOB[$i]}" \
-      --field branch="${BRANCH}" \
-      > /dev/null || {
-      echo "::warning::${REPO}: commit to ${BRANCH} failed — skipping"
-      return 1
-    }
-  done
 
   # The title/body embed ${SHORT}. Build them once so the create and the
   # update-in-place paths post the identical, current text. The body is a single
