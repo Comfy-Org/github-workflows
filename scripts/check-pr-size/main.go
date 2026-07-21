@@ -378,8 +378,26 @@ func writeGitHubOutputs(res Result) {
 // here is a single blob read — so a healthy git never trips it.
 const gitTimeout = 60 * time.Second
 
+// gitWaitDelay bounds how long Wait() may block after the timeout fires and the
+// child is killed. exec.CommandContext only SIGKILLs the immediate git process;
+// a descendant that inherited the stdout/stderr pipes (a diff/filter driver,
+// textconv, pager, or credential helper) can hold them open, so the copy
+// goroutines behind cmd.Output()/StdoutPipe never see EOF and Wait() would block
+// past the deadline. WaitDelay (Go 1.20+) forces those pipes closed and Wait to
+// return after the grace period, keeping the BE-3248 timeout robust.
+const gitWaitDelay = 10 * time.Second
+
 func runGit(args ...string) (string, error) {
-	out, _, err := runGitStdin(nil, args...)
+	out, stderr, err := runGitStdin(nil, args...)
+	// runGitStdin sets cmd.Stderr, so a returned *exec.ExitError no longer
+	// carries git's stderr (Cmd.Output only populates ExitError.Stderr when
+	// Stderr is nil). Fold the captured stderr back into the error so callers
+	// like diffFiles keep git's diagnostics.
+	if err != nil {
+		if s := strings.TrimSpace(stderr); s != "" {
+			err = fmt.Errorf("%w: %s", err, s)
+		}
+	}
 	return out, err
 }
 
@@ -402,6 +420,7 @@ func runGitStdin(stdin []byte, args ...string) (stdout, stderr string, err error
 	ctx, cancel := context.WithTimeout(context.Background(), gitTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.WaitDelay = gitWaitDelay
 	cmd.Env = append(os.Environ(), "LC_ALL=C")
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
@@ -447,6 +466,7 @@ func runGitCapped(maxBytes int64, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), gitTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.WaitDelay = gitWaitDelay
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -470,6 +490,11 @@ func runGitCapped(maxBytes int64, args ...string) ([]byte, error) {
 		return data, nil
 	}
 	if err := cmd.Wait(); err != nil {
+		// Wrap a timeout hit as %w of ctx.Err() so errors.Is(err,
+		// context.DeadlineExceeded) works, mirroring runGitStdin (BE-3248).
+		if ctx.Err() == context.DeadlineExceeded {
+			err = fmt.Errorf("git %v timed out after %s: %w", args, gitTimeout, ctx.Err())
+		}
 		return nil, err
 	}
 	return data, nil

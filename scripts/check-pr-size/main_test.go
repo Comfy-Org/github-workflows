@@ -492,3 +492,21 @@ func TestRunGitCappedLimitsBlobRead(t *testing.T) {
 		t.Errorf("len(data) = %d, want 100 (capped read)", len(data))
 	}
 }
+
+// TestRunGitFoldsStderrIntoError guards the refactor regression: runGit
+// delegates to runGitStdin, which sets cmd.Stderr, so a returned *exec.ExitError
+// no longer carries git's stderr. runGit must fold the captured stderr back into
+// its error so callers (e.g. diffFiles) keep git's diagnostics.
+func TestRunGitFoldsStderrIntoError(t *testing.T) {
+	dir := initTestRepo(t)
+	t.Chdir(dir)
+
+	// A bogus revision makes git exit non-zero and write a diagnostic to stderr.
+	_, err := runGit("show", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef:nope")
+	if err == nil {
+		t.Fatal("runGit on a bogus revision should return an error")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "fatal") {
+		t.Errorf("runGit error should carry git's stderr diagnostic, got: %v", err)
+	}
+}
