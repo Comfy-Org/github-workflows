@@ -188,7 +188,10 @@ jobs:
           # "current directory is contained in a module that is not one of the
           # workspace modules". GOWORK=off ignores any ambient workspace and builds
           # the tool as its own standalone module (it has its own go.mod).
-          GOWORK: off
+          # Quote "off": a bare `off` is a YAML boolean, which Actions stringifies
+          # to "false" in the env — and `GOWORK=false` (neither off, empty, nor an
+          # absolute path) makes `go build` abort. The quotes keep it the literal off.
+          GOWORK: "off"
         run: |
           # Drop anything the PR checkout could have pre-seeded under the tool
           # path (such files are untracked in the tool repo, which checkout
