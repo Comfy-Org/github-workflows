@@ -47,7 +47,11 @@ CALLERS_JSON="${CALLERS_JSON-}"
 ALLOW_EMPTY="${ALLOW_EMPTY:-false}"
 
 SHORT="${NEW_SHA:0:7}"
-BRANCH="ci/bump-${TAG}-${SHORT}"
+# Stable branch per (repo, TAG) — deliberately NOT SHA-stamped. A fixed head
+# branch is what lets a subsequent bump reuse (and update in place) the one open
+# bump PR instead of opening a fresh PR on every SHA (BE-3882). The SHA lives in
+# the commit/title/body, not the branch name.
+BRANCH="ci/bump-${TAG}"
 
 STRIPPED="${CALLERS_JSON//[[:space:]]/}"
 
@@ -126,21 +130,34 @@ bump_one() {
   local NEW_CONTENT
   NEW_CONTENT=$(sed -E "s/[0-9a-f]{40}/${NEW_SHA}/g; s|# github-workflows#[0-9]+|# github-workflows main (${SHORT})|g" <<<"$OLD_CONTENT")
 
-  # Create the branch from the default-branch tip (ignore 422 if it exists).
+  # Rebuild the stable bump branch from the caller's CURRENT default-branch tip
+  # every run, so the PR is always a clean single-commit "bump to @SHORT" diff —
+  # it never accumulates stale commits across bumps and never drifts if the
+  # caller's default branch moved since the last bump (BE-3882).
   local MAIN_SHA
   MAIN_SHA=$(gh api "repos/${REPO}/git/refs/heads/${DEFAULT_BRANCH}" --jq '.object.sha') || {
     echo "::warning::${REPO}: cannot read ${DEFAULT_BRANCH} ref — skipping"
     return 1
   }
-  gh api --method POST "repos/${REPO}/git/refs" \
-    --field ref="refs/heads/${BRANCH}" \
-    --field sha="${MAIN_SHA}" 2>/dev/null || true
+  # Create the branch at the tip; if it already exists (an open bump PR, or
+  # residue from a prior run) force it back to the tip so the diff is rebuilt
+  # from scratch rather than committed on top of the old bump.
+  if ! gh api --method POST "repos/${REPO}/git/refs" \
+        --field ref="refs/heads/${BRANCH}" \
+        --field sha="${MAIN_SHA}" >/dev/null 2>&1; then
+    gh api --method PATCH "repos/${REPO}/git/refs/heads/${BRANCH}" \
+      --field sha="${MAIN_SHA}" --field force=true >/dev/null 2>&1 || {
+      echo "::warning::${REPO}: cannot reset ${BRANCH} to ${DEFAULT_BRANCH} tip — skipping"
+      return 1
+    }
+  fi
 
-  # Commit the updated file onto the branch. `$(...)` capture above (base64 -d,
-  # then sed) strips the file's trailing newline, so printf '%s\n' restores
-  # exactly one — otherwise the committed caller loses its EOF newline and trips
-  # the receiver repo's formatter (oxfmt/prettier both require a trailing
-  # newline).
+  # Commit the updated file as the single commit on top of the tip. `$(...)`
+  # capture above (base64 -d, then sed) strips the file's trailing newline, so
+  # printf '%s\n' restores exactly one — otherwise the committed caller loses its
+  # EOF newline and trips the receiver repo's formatter (oxfmt/prettier both
+  # require a trailing newline). BLOB_SHA is the file's blob at the tip we just
+  # reset to, so the update applies cleanly regardless of any prior branch state.
   local ENCODED
   ENCODED=$(printf '%s\n' "$NEW_CONTENT" | base64 | tr -d '\n')
   gh api --method PUT "repos/${REPO}/contents/${FILE_ENC}" \
@@ -153,22 +170,45 @@ bump_one() {
     return 1
   }
 
+  # The title/body embed ${SHORT}. Build them once so the create and the
+  # update-in-place paths post the identical, current text. The body is a single
+  # line so the workflow parses it — a multi-line --body collapsed the step's
+  # YAML in an earlier revision.
+  local PR_TITLE PR_BODY
+  PR_TITLE="ci: bump ${TAG} to github-workflows@${SHORT}"
+  PR_BODY="Automatic SHA bump — \`${WORKFLOW_FILE}\` was updated in \`Comfy-Org/github-workflows\` at [\`${SHORT}\`](https://github.com/Comfy-Org/github-workflows/commit/${NEW_SHA}). _Opened by the \`bump-${TAG}-callers\` workflow._"
+
+  # Reuse the one open bump PR for this branch if there is one: the branch push
+  # above already refreshed its diff to the new SHA, so just refresh its
+  # title/body. The stable head branch guarantees at most ONE open bump PR per
+  # (repo, TAG) at any time — never open a second (BE-3882).
+  local EXISTING_PR
+  EXISTING_PR=$(gh pr list --repo "${REPO}" --head "${BRANCH}" --state open --json number --jq '.[0].number' 2>/dev/null)
+  if [[ -n "$EXISTING_PR" ]]; then
+    if gh pr edit "${EXISTING_PR}" --repo "${REPO}" \
+        --title "${PR_TITLE}" --body "${PR_BODY}" >/dev/null 2>&1; then
+      echo "${REPO}: PR #${EXISTING_PR} updated to ${SHORT}"
+    else
+      echo "::warning::${REPO}: failed to update open PR #${EXISTING_PR}"
+      return 1
+    fi
+    return 0
+  fi
+
+  # No open PR for this branch → open one (first bump, or the prior PR was
+  # merged/closed — and its branch possibly auto-deleted — since the last run).
   local LABEL_ARGS=()
   [[ -n "$LABEL" ]] && LABEL_ARGS=(--label "$LABEL")
-
-  # Open the PR (a pre-existing PR for this branch is not an error). The body is
-  # a single line so the workflow parses it — a multi-line --body collapsed the
-  # step's YAML in an earlier revision.
   if gh pr create \
     --repo "${REPO}" \
     --head "${BRANCH}" \
     --base "${DEFAULT_BRANCH}" \
-    --title "ci: bump ${TAG} to github-workflows@${SHORT}" \
-    --body "Automatic SHA bump — \`${WORKFLOW_FILE}\` was updated in \`Comfy-Org/github-workflows\` at [\`${SHORT}\`](https://github.com/Comfy-Org/github-workflows/commit/${NEW_SHA}). _Opened by the \`bump-${TAG}-callers\` workflow._" \
+    --title "${PR_TITLE}" \
+    --body "${PR_BODY}" \
     "${LABEL_ARGS[@]}" 2>/dev/null; then
     echo "${REPO}: PR opened"
   else
-    echo "::warning::${REPO}: PR may already exist for ${BRANCH}"
+    echo "::warning::${REPO}: PR create failed for ${BRANCH}"
   fi
   return 0
 }

@@ -46,7 +46,14 @@ cat > "${STUB_BIN}/gh" <<'STUB'
 # value so bump-callers.sh runs end to end offline.
 sub="$1"; shift || true
 if [[ "$sub" == "pr" ]]; then
-  echo "pr-create $*" >> "$STUB_PUT_DIR/pr.log"
+  action="$1"; shift || true
+  echo "pr-$action $*" >> "$STUB_PUT_DIR/pr.log"
+  # `pr list --json number --jq '.[0].number'` returns the open PR number, if
+  # any. STUB_OPEN_PR toggles whether an open bump PR already exists for the
+  # branch (set = update-in-place path; unset = create path).
+  if [[ "$action" == "list" ]]; then
+    [[ -n "${STUB_OPEN_PR:-}" ]] && echo "$STUB_OPEN_PR"
+  fi
   exit 0
 fi
 [[ "$sub" == "api" ]] || exit 0
@@ -68,6 +75,7 @@ done
 
 case "$method" in
   POST) exit 0;;
+  PATCH) exit 0;;  # force-reset of the bump branch ref
   PUT)
     n=$(( $(cat "$STUB_PUT_DIR/count" 2>/dev/null || echo 0) + 1 ))
     echo "$n" > "$STUB_PUT_DIR/count"
@@ -132,6 +140,22 @@ check "stale pin comment removed"             "! grep -qF '# github-workflows#27
 # exactly one trailing newline (#23): last byte is \n (tail -c1 strips to empty),
 # and the last two bytes are not both \n (tail -c2 keeps a non-newline byte).
 check "single trailing newline"               "[[ -z \"\$(tail -c1 \"$PUT\")\" && -n \"\$(tail -c2 \"$PUT\")\" ]]"
+# No open PR for the stable branch → the create path runs, not the edit path.
+check "opened a new PR (pr create called)"    "grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
+check "did not edit (no open PR existed)"     "! grep -q '^pr-edit' \"\$STUB_PUT_DIR/pr.log\""
+
+echo "== cursor-review fleet: an open bump PR is UPDATED IN PLACE, not re-opened (BE-3882) =="
+new_case reuse
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  STUB_OPEN_PR=42 \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-alpha","file":".github/workflows/ci-cursor-review.yml","label":""}]'
+check "exit 0" "[[ $RC -eq 0 ]]"
+check "updated the existing PR in place"      "grep -q 'PR #42 updated to $SHORT' <<<\"\$OUT\""
+check "did NOT report a new PR opened"        "! grep -q 'PR opened' <<<\"\$OUT\""
+check "called pr edit on the open PR"         "grep -q '^pr-edit 42 ' \"\$STUB_PUT_DIR/pr.log\""
+check "did NOT open a second PR"              "! grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
+check "branch still refreshed to the new SHA" "grep -qF '$NEW_SHA' \"\${STUB_PUT_DIR}/put.last.txt\""
 
 echo "== agents-md fleet: two callers, two SHA refs, '# v1' preserved =="
 new_case amd
