@@ -45,6 +45,12 @@ on:
     branches: [main]
     paths:
       - .github/workflows/cursor-review.yml
+      # The prompts + scripts consumers actually run live here, loaded from the
+      # `workflows_ref` SHA a caller pins (see cursor-review.yml's header) — a
+      # behavior change here (e.g. extract-findings.py parsing) needs the same
+      # caller bump as a workflow-file change, or pinned callers silently drift
+      # onto stale review behavior.
+      - .github/cursor-review/**
 
 permissions:
   contents: read
