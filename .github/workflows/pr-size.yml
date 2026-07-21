@@ -181,6 +181,14 @@ jobs:
           cache: false
 
       - name: Build check-pr-size
+        env:
+          # The tool is checked out INTO the consumer's working tree (_pr_size_tool/),
+          # so if that consumer is a go.work monorepo (e.g. Comfy-Org/cloud), a plain
+          # `go build` walks up, finds the consumer's go.work, and fails with
+          # "current directory is contained in a module that is not one of the
+          # workspace modules". GOWORK=off ignores any ambient workspace and builds
+          # the tool as its own standalone module (it has its own go.mod).
+          GOWORK: off
         run: |
           # Drop anything the PR checkout could have pre-seeded under the tool
           # path (such files are untracked in the tool repo, which checkout
