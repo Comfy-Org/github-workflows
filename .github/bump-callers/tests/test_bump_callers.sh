@@ -210,6 +210,80 @@ check "ignored the fork PR, opened the real one"  "grep -q 'PR opened' <<<\"\$OU
 check "did NOT edit the attacker's fork PR"       "! grep -q '^pr-edit 1337' \"\$STUB_PUT_DIR/pr.log\""
 check "opened a fresh PR via create"              "grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
 
+echo "== cursor-review fleet: wire_bot=true also wires the cloud-code-bot identity (BE-1814) =="
+# The real wire-bot-identity.py helper, driven end to end (no stub) — a caller
+# flagged wire_bot must get BOTH the SHA bump AND the identity wired in one PR.
+WIRE_SCRIPT="${SCRIPT_DIR}/../../cursor-review/wire-bot-identity.py"
+WIRE_FIXTURE="${WORK}/wire_caller.yml"
+printf '%s\n' \
+  'name: CI cursor-review' \
+  'jobs:' \
+  '  review:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@1111111111111111111111111111111111111111  # github-workflows#27' \
+  '    with:' \
+  '      pr_number: 42' \
+  '    secrets:' \
+  '      CURSOR_API_KEY: dummy' \
+  > "$WIRE_FIXTURE"
+new_case wire
+STUB_CONTENT_FILE="$WIRE_FIXTURE" WIRE_BOT_SCRIPT="$WIRE_SCRIPT" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-wired","file":".github/workflows/ci-cursor-review.yml","label":"","wire_bot":true}]'
+check "exit 0" "[[ $RC -eq 0 ]]"
+PUT="${STUB_PUT_DIR}/put.last.txt"
+check "SHA bumped"                          "grep -qF '$NEW_SHA' \"$PUT\""
+check "bot_app_id wired in"                  "grep -q 'bot_app_id: \${{ vars.APP_ID }}' \"$PUT\""
+check "BOT_APP_PRIVATE_KEY wired in"          "grep -q 'BOT_APP_PRIVATE_KEY: \${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}' \"$PUT\""
+check "PR body notes the wiring"             "grep -q 'BE-1814' \"\$STUB_PUT_DIR/pr.log\""
+check "reported fleet complete"              "grep -q 'cursor-review bump complete' <<<\"\$OUT\""
+
+echo "== cursor-review fleet: wire_bot=false (default) never wires, even with WIRE_BOT_SCRIPT set =="
+new_case nowire
+STUB_CONTENT_FILE="$WIRE_FIXTURE" WIRE_BOT_SCRIPT="$WIRE_SCRIPT" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-unwired","file":".github/workflows/ci-cursor-review.yml","label":""}]'
+check "exit 0" "[[ $RC -eq 0 ]]"
+PUT="${STUB_PUT_DIR}/put.last.txt"
+check "SHA still bumped"                     "grep -qF '$NEW_SHA' \"$PUT\""
+check "bot_app_id NOT wired in"              "! grep -q 'bot_app_id:' \"$PUT\""
+check "BOT_APP_PRIVATE_KEY NOT wired in"     "! grep -q 'BOT_APP_PRIVATE_KEY:' \"$PUT\""
+
+echo "== cursor-review fleet: wire_bot=true but WIRE_BOT_SCRIPT unset degrades to SHA-bump-only =="
+new_case wirenoscript
+STUB_CONTENT_FILE="$WIRE_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-noscript","file":".github/workflows/ci-cursor-review.yml","label":"","wire_bot":true}]'
+check "exit 0 (degrades, does not fail the repo)" "[[ $RC -eq 0 ]]"
+check "warned WIRE_BOT_SCRIPT is unset"            "grep -q 'WIRE_BOT_SCRIPT is unset' <<<\"\$OUT\""
+PUT="${STUB_PUT_DIR}/put.last.txt"
+check "SHA still bumped"                           "grep -qF '$NEW_SHA' \"$PUT\""
+check "bot_app_id NOT wired in"                    "! grep -q 'bot_app_id:' \"$PUT\""
+
+echo "== cursor-review fleet: already-wired + already-current caller is a clean skip (Chesterton's Fence) =="
+# A caller that already has the wiring AND is already at the target SHA must be
+# a true no-op — the content-equality check (not a bare SHA grep) is what makes
+# a wiring-only change on an already-current caller still stage, while a
+# fully-converged caller (this case) stays a clean skip.
+ALREADY_WIRED_FIXTURE="${WORK}/already_wired_caller.yml"
+printf '%s\n' \
+  'name: CI cursor-review' \
+  'jobs:' \
+  '  review:' \
+  "    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@${NEW_SHA}  # github-workflows main (${SHORT})" \
+  '    with:' \
+  '      bot_app_id: dummy' \
+  '    secrets:' \
+  '      CURSOR_API_KEY: dummy' \
+  '      BOT_APP_PRIVATE_KEY: dummy' \
+  > "$ALREADY_WIRED_FIXTURE"
+new_case alreadywired
+STUB_CONTENT_FILE="$ALREADY_WIRED_FIXTURE" WIRE_BOT_SCRIPT="$WIRE_SCRIPT" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-converged","file":".github/workflows/ci-cursor-review.yml","label":"","wire_bot":true}]'
+check "exit 0" "[[ $RC -eq 0 ]]"
+check "reported already at SHORT (+ wired)" "grep -q 'already at $SHORT' <<<\"\$OUT\""
+check "committed nothing"                    "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+
 echo "== agents-md fleet: two callers, two SHA refs, '# v1' preserved =="
 new_case amd
 AMD_FIXTURE="${WORK}/amd_caller.yml"
