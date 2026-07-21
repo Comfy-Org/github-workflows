@@ -1,0 +1,303 @@
+name: PR Size Cap (reusable)
+
+# Reusable PR-size guardrail: counts a pull request's changed lines (added +
+# deleted) across its net diff, excluding generated files and dependency
+# lockfiles, and fails the check when the remainder exceeds `max_lines` — so
+# diffs stay reviewable for humans and AI agents alike.
+#
+# What's excluded from the count:
+#   - dependency lockfiles (go.sum, package-lock.json, ... plus `extra_lockfiles`)
+#   - files marked `linguist-generated` in .gitattributes — read from the BASE
+#     ref only, so a PR cannot mark its own files generated to shrink its count
+#   - Go files carrying the canonical `// Code generated ... DO NOT EDIT.`
+#     marker before the package clause (this rule simply never matches in
+#     non-Go repos, so it is unconditional)
+#   - files matching `extra_generated_globs`
+#
+# Bypass: add the `bypass_label` (default `oversized-ok`) to the PR for a
+# legitimately large change. The check still runs (so it always posts a
+# status) and reports green.
+#
+# Rollout: `mode: warn` reports (and comments) on overage but never fails the
+# check — use it to trial a cap on a repo before flipping to `enforce`.
+#
+# When a PR is over the cap and bot credentials are configured, the bot posts a
+# single sticky comment explaining the overage and the bypass label, then flips
+# it to ✅ once the PR is trimmed or labeled — the failing status alone does not
+# surface the bypass label. Without `bot_app_id` + BOT_APP_PRIVATE_KEY, or with
+# `comment: false`, the workflow degrades gracefully: the check status and the
+# size job's step summary still carry the full report; no comment is posted.
+#
+# Two-job security split: the `pr-size` job runs against PR code with a
+# read-only token; the `comment` job holds the bot write token, checks out NO
+# PR code, and receives the report as an artifact — so a write-scoped token is
+# never present in a job that touched PR-authored content.
+#
+# The counting logic + its unit tests live in scripts/check-pr-size/ in THIS
+# repo; the size job builds it from the `workflows_ref` checkout, so consumer
+# repos carry only a thin caller and there is no logic to drift.
+#
+# Caller pattern (place in consumer repo at .github/workflows/ci-pr-size.yml):
+#
+#   name: CI - PR Size Cap
+#   on:
+#     pull_request:
+#       branches: [main]
+#       # labeled/unlabeled are included (beyond the default opened/synchronize/
+#       # reopened) so toggling the bypass label re-runs the check immediately —
+#       # no dummy push needed to clear a failed run.
+#       types: [opened, synchronize, reopened, labeled, unlabeled]
+#   permissions:
+#     contents: read
+#   jobs:
+#     pr-size:
+#       uses: Comfy-Org/github-workflows/.github/workflows/pr-size.yml@<sha>  # v1
+#       with:
+#         max_lines: 1000
+#         # Pin the tool ref to the same ref you pin `uses:` to for
+#         # reproducibility (defaults to main).
+#         workflows_ref: <sha>
+#         # Optional: post the sticky comment under your GitHub App.
+#         bot_app_id: ${{ vars.APP_ID }}
+#       secrets:
+#         BOT_APP_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+
+on:
+  workflow_call:
+    inputs:
+      max_lines:
+        description: Max non-generated changed lines (added + deleted) allowed.
+        type: number
+        required: false
+        default: 1000
+      mode:
+        description: >-
+          `enforce` fails the check when a PR is over the cap; `warn` still
+          reports (and comments) on overage but never fails the check — for
+          gradual per-repo rollout.
+        type: string
+        required: false
+        default: enforce
+      bypass_label:
+        description: >-
+          PR label that bypasses the cap for a legitimately large change.
+          Create it in the consumer repo before enforcing.
+        type: string
+        required: false
+        default: oversized-ok
+      extra_lockfiles:
+        description: >-
+          Extra dependency-lockfile base names to exclude from the count, on
+          top of the built-ins (go.sum, go.work.sum, package-lock.json,
+          pnpm-lock.yaml, yarn.lock, Cargo.lock, poetry.lock, uv.lock).
+          Whitespace- or comma-separated; matched at any directory depth.
+        type: string
+        required: false
+        default: ''
+      extra_generated_globs:
+        description: >-
+          Extra glob patterns treated as generated (excluded from the count).
+          Whitespace- or comma-separated. `*` matches within a path segment,
+          `**` across segments, `?` one character. A pattern without `/` is
+          matched against the file's base name at any depth; one with `/`
+          against the full repo-relative path.
+        type: string
+        required: false
+        default: ''
+      comment:
+        description: >-
+          Post the sticky over-cap PR comment (needs bot_app_id +
+          BOT_APP_PRIVATE_KEY). Set false for status + step summary only.
+        type: boolean
+        required: false
+        default: true
+      bot_app_id:
+        description: >-
+          GitHub App ID used to post the sticky comment (paired with the
+          BOT_APP_PRIVATE_KEY secret). App IDs aren't secret, so this is an
+          input. Optional — when absent, the comment job degrades to status +
+          step summary only.
+        type: string
+        required: false
+        default: ''
+      workflows_ref:
+        description: >-
+          Ref of Comfy-Org/github-workflows to load the check-pr-size tool
+          from. Pin this to the same ref you pin `uses:` to for
+          reproducibility.
+        type: string
+        required: false
+        default: main
+    secrets:
+      BOT_APP_PRIVATE_KEY:
+        description: >-
+          PEM private key matching bot_app_id. Required only when bot_app_id
+          is set and comment is true.
+        required: false
+
+# Mapped from `inputs` here so the run steps below read them without per-step
+# plumbing; the check-pr-size tool reads the PR_SIZE_* variables directly.
+env:
+  PR_SIZE_MAX_LINES: ${{ inputs.max_lines }}
+  PR_SIZE_MODE: ${{ inputs.mode }}
+  PR_SIZE_BYPASS: ${{ contains(github.event.pull_request.labels.*.name, inputs.bypass_label) }}
+  PR_SIZE_BYPASS_LABEL: ${{ inputs.bypass_label }}
+  PR_SIZE_EXTRA_LOCKFILES: ${{ inputs.extra_lockfiles }}
+  PR_SIZE_EXTRA_GENERATED_GLOBS: ${{ inputs.extra_generated_globs }}
+
+jobs:
+  pr-size:
+    name: Cap PR size (LoC)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          # Full history for all refs, so the base SHA and the merge-base
+          # three-dot diff resolve without a separate authenticated fetch.
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Load check-pr-size tool
+        # The tool comes from THIS workflow's repo (public, pinned via
+        # workflows_ref) — never from the PR checkout, so no PR-authored code
+        # runs in this job.
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _pr_size_tool
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
+        with:
+          go-version-file: _pr_size_tool/scripts/check-pr-size/go.mod
+          # The module is dependency-free (no go.sum) — nothing to cache.
+          cache: false
+
+      - name: Build check-pr-size
+        run: |
+          # Drop anything the PR checkout could have pre-seeded under the tool
+          # path (such files are untracked in the tool repo, which checkout
+          # does not remove), so the build compiles only the pinned sources.
+          git -C _pr_size_tool clean -ffdx
+          (cd _pr_size_tool/scripts/check-pr-size && go build -o "${RUNNER_TEMP}/check-pr-size" .)
+
+      - name: Check PR size
+        id: check
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -o pipefail
+          "${RUNNER_TEMP}/check-pr-size" \
+            --base "${BASE_SHA}" \
+            --head "${HEAD_SHA}" | tee "${RUNNER_TEMP}/pr-size-report.md"
+
+      - name: Record over-cap flag
+        # The comment job keys off this flag rather than the pr-size job's
+        # result, so `warn` mode (job green) still comments on overage. It
+        # rides the artifact, which — unlike job outputs — carries identically
+        # whether this job passed or failed.
+        if: always()
+        env:
+          OVER_CAP: ${{ steps.check.outputs.over_cap }}
+        run: printf '%s' "${OVER_CAP:-}" > "${RUNNER_TEMP}/pr-size-over-cap"
+
+      # Hand the rendered report to the isolated `comment` job below. Uploaded
+      # as an artifact (not a job output) so the job that holds the bot
+      # write-token never runs in the same context as the PR checkout.
+      - name: Upload size report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: pr-size-report
+          path: |
+            ${{ runner.temp }}/pr-size-report.md
+            ${{ runner.temp }}/pr-size-over-cap
+          if-no-files-found: warn
+          retention-days: 7
+
+  # Posts the size report as a single sticky PR comment when a PR is over the
+  # cap (and flips it to ✅ once the PR is trimmed or bypass-labeled), so
+  # contributors see WHY the check is red and how to clear it. Posting is keyed
+  # off the over-cap flag carried in the artifact, not the size job's result,
+  # so `warn` mode (job green) still comments on overage.
+  #
+  # Isolation: this job checks out NO PR code and only downloads the report
+  # artifact, so the bot's write-scoped token is never present in a job that
+  # held a PR checkout.
+  comment:
+    name: Comment when oversize
+    needs: pr-size
+    # always(): the interesting case is exactly when pr-size failed.
+    if: always() && inputs.comment && needs.pr-size.result != 'cancelled' && needs.pr-size.result != 'skipped'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      # The `secrets` context is unavailable in `if` conditions, so the
+      # credentials-present test is evaluated here (job env allows it) and the
+      # steps below gate on the result. With no bot credentials they no-op and
+      # the check status + step summary stay the only outputs.
+      BOT_CONFIGURED: ${{ inputs.bot_app_id != '' && secrets.BOT_APP_PRIVATE_KEY != '' }}
+    steps:
+      - name: Download size report
+        id: dl
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: pr-size-report
+          path: report
+
+      - name: Mint bot token
+        if: steps.dl.outcome == 'success' && env.BOT_CONFIGURED == 'true'
+        id: bot
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          app-id: ${{ inputs.bot_app_id }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+          # Scope the minted token to comment upserts only, not the app's full
+          # installation permissions (PR comments ride the issues API).
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Upsert sticky size comment
+        if: steps.bot.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [ ! -s report/pr-size-report.md ]; then
+            echo "Report artifact empty — the size tool crashed before rendering; leaving any existing comment untouched."
+            exit 0
+          fi
+          OVER="$(cat report/pr-size-over-cap 2>/dev/null || true)"
+          MARKER='<!-- ci-pr-size -->'
+          { printf '%s\n\n' "$MARKER"; cat report/pr-size-report.md; } > body.md
+          # Find our existing sticky comment (if any) by the hidden marker, so
+          # we update one comment across pushes instead of stacking new ones.
+          existing="$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
+            --jq ".[] | select(.body | contains(\"${MARKER}\")) | .id")"
+          existing="$(printf '%s' "$existing" | head -n1)"
+          if [ -n "$existing" ]; then
+            # Update in place — flips to ✅ when a previously-flagged PR is fixed.
+            gh api -X PATCH "repos/${REPO}/issues/comments/${existing}" -F body=@body.md >/dev/null
+            echo "Updated sticky size comment ${existing}."
+          elif [ "$OVER" = "true" ]; then
+            gh api -X POST "repos/${REPO}/issues/${PR_NUMBER}/comments" -F body=@body.md >/dev/null
+            echo "Posted oversize comment."
+          else
+            echo "Under cap and no existing comment — nothing to post."
+          fi
+
+      - name: Note degraded mode
+        if: steps.dl.outcome == 'success' && steps.bot.outcome == 'skipped'
+        run: echo "bot_app_id/BOT_APP_PRIVATE_KEY not configured — no PR comment; the report is in the pr-size job's step summary."

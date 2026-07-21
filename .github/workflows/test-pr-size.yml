@@ -1,0 +1,55 @@
+name: Test pr-size script
+
+# Runs the Go unit tests (+ gofmt/vet) for the PR-size checker behind
+# pr-size.yml. The checker gates every consumer repo's PRs, so a counting
+# regression silently blocks (or waves through) PRs org-wide — cheap to guard
+# with a unit run on change.
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/check-pr-size/**'
+      - '.github/workflows/test-pr-size.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/check-pr-size/**'
+      - '.github/workflows/test-pr-size.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: go test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: scripts/check-pr-size
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
+        with:
+          go-version-file: scripts/check-pr-size/go.mod
+          # The module is dependency-free (no go.sum) — nothing to cache.
+          cache: false
+
+      - name: gofmt
+        run: |
+          UNFORMATTED="$(gofmt -l .)"
+          if [ -n "$UNFORMATTED" ]; then
+            echo "gofmt needed on:"
+            echo "$UNFORMATTED"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...

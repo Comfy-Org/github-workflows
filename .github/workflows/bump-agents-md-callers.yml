@@ -39,6 +39,17 @@ on:
       - .github/workflows/agents-md-integrity.yml
       - .github/agents-md-integrity/**
 
+# Serialize runs of this fleet. The bumper now pushes to a STABLE branch
+# (ci/bump-agents-md-integrity) shared across runs, so two overlapping runs (a
+# rapid second main push, or a push racing a manual re-run) would force-reset
+# that branch and race the PR update — an older run finishing last could leave
+# the committed diff pinned to a stale SHA. cancel-in-progress: false lets the
+# running bump finish; GitHub keeps only the newest pending run, so the latest
+# SHA always wins (BE-3882).
+concurrency:
+  group: bump-agents-md-callers
+  cancel-in-progress: false
+
 jobs:
   bump:
     runs-on: ubuntu-latest
