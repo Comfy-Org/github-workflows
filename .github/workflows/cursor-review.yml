@@ -705,8 +705,13 @@ jobs:
 
           panel = []
           for path in sorted(glob.glob("/tmp/panel/findings-*/findings.json")):
-              with open(path, encoding="utf-8") as f:
-                  panel.append(json.load(f))
+              try:
+                  with open(path, encoding="utf-8") as f:
+                      cell = json.load(f)
+              except (OSError, json.JSONDecodeError):
+                  continue
+              if isinstance(cell, dict):
+                  panel.append(cell)
 
           expected = {
               (model, review_type)
@@ -766,7 +771,9 @@ jobs:
             --approve-mcps \
             --model "$JUDGE_MODEL" \
             < /tmp/judge-prompt.txt \
-            > /tmp/judge-raw.txt 2>/tmp/judge-stderr.txt || true
+            > /tmp/judge-raw.txt 2>/tmp/judge-stderr.txt \
+            && JUDGE_EXIT=0 || JUDGE_EXIT=$?
+          echo "cursor-agent (judge) exit code: $JUDGE_EXIT"
 
           echo "=== Judge raw output (first 1000 chars) ==="
           head -c 1000 /tmp/judge-raw.txt

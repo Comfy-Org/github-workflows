@@ -63,7 +63,8 @@ def initial_record(args):
 def read_record(args):
     try:
         with open(args.out, encoding="utf-8") as source:
-            return json.load(source)
+            record = json.load(source)
+            return record if isinstance(record, dict) else initial_record(args)
     except (OSError, json.JSONDecodeError):
         return initial_record(args)
 
@@ -230,7 +231,7 @@ def handle(args, message):
                 "content": [{"type": "text", "text": text}],
                 "isError": False,
             })
-        except (KeyError, TypeError, ValueError) as exc:
+        except (KeyError, TypeError, ValueError, OSError) as exc:
             return result(request_id, {
                 "content": [{"type": "text", "text": str(exc)}],
                 "isError": True,
@@ -247,7 +248,7 @@ def serve(args):
             if not isinstance(message, dict):
                 raise ValueError("request must be an object")
             response = handle(args, message)
-        except (json.JSONDecodeError, ValueError) as exc:
+        except (json.JSONDecodeError, ValueError, OSError) as exc:
             response = error(None, -32700, str(exc))
         if response is not None:
             print(json.dumps(response, separators=(",", ":")), flush=True)

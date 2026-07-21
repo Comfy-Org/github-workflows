@@ -4,6 +4,8 @@ name: Test cursor-review scripts
 # the stdio MCP output contract used by reviewers and the judge. These scripts
 # drive panel consolidation for every consumer repo, so they are cheap to
 # guard with a unit run on change.
+# Inputs/secrets: none. Triggers: path-filtered pull requests and pushes to main.
+# Caller pattern: none; this is repository-local CI, not a reusable workflow.
 
 on:
   pull_request:
