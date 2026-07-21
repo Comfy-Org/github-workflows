@@ -89,15 +89,21 @@ if (( ${#CALLERS[@]} == 0 )); then
   exit 1
 fi
 
-# Bump a single caller repo. Every external call is guarded, so a bad repo
-# returns non-zero here (caught by the loop) instead of killing the run. An
-# expected skip (file missing / already pinned) is a successful `return 0`.
-bump_one() {
-  local ENTRY="$1" REPO FILE LABEL FILE_ENC
-  REPO=$(cut -d'|' -f1 <<<"$ENTRY")
-  FILE=$(cut -d'|' -f2 <<<"$ENTRY")
-  LABEL=$(cut -d'|' -f3 <<<"$ENTRY")
-  FILE_ENC="${FILE//\//%2F}"
+# Bump ONE caller repo, committing EVERY file that repo pins onto a single
+# stable bump branch. Called once per repo with that repo's entries, so a repo
+# listed more than once in the caller variable (a monorepo pinning the reusable
+# workflow from several workflow files) lands ALL its files on ONE branch/PR.
+# Every external call is guarded, so a bad repo returns non-zero here (caught by
+# the loop) instead of killing the run. A repo whose files are all missing or
+# already pinned commits nothing and is a successful skip (`return 0`).
+#
+# Grouping by repo is load-bearing: the branch is reset to the default-branch
+# tip ONCE per repo, then each file is committed onto it. The previous per-entry
+# loop reset the branch before EACH file, so a second same-repo file's reset
+# discarded the first file's commit and the PR shipped only the last file — a
+# silent partial bump (BE-3896).
+bump_repo() {
+  local REPO="$1"; shift   # remaining args: this repo's "repo|file|label" entries
 
   local DEFAULT_BRANCH
   DEFAULT_BRANCH=$(gh api "repos/${REPO}" --jq '.default_branch') || {
@@ -105,34 +111,57 @@ bump_one() {
     return 1
   }
 
-  # Fetch current file; a missing file is an expected skip (success).
-  local CURRENT
-  CURRENT=$(gh api "repos/${REPO}/contents/${FILE_ENC}?ref=${DEFAULT_BRANCH}" 2>/dev/null) || {
-    echo "::warning::${REPO}: ${FILE} not found — skipping"
-    return 0
-  }
+  # Pass 1 — stage every file that actually needs a bump WITHOUT writing
+  # anything yet. This keeps the reset/commit path off entirely for a repo whose
+  # files are all missing or already pinned (the old per-entry skips), so it
+  # never resets a branch or opens a PR it doesn't need.
+  local -a PEND_FILE_ENC=() PEND_CONTENT=() PEND_BLOB=() LABELS=()
+  local ENTRY FILE LABEL FILE_ENC CURRENT BLOB_SHA OLD_CONTENT NEW_CONTENT
+  for ENTRY in "$@"; do
+    FILE=$(cut -d'|' -f2 <<<"$ENTRY")
+    LABEL=$(cut -d'|' -f3 <<<"$ENTRY")
+    FILE_ENC="${FILE//\//%2F}"
+    [[ -n "$LABEL" ]] && LABELS+=("$LABEL")
 
-  local BLOB_SHA OLD_CONTENT
-  BLOB_SHA=$(jq -r '.sha' <<<"$CURRENT")
-  OLD_CONTENT=$(jq -r '.content' <<<"$CURRENT" | base64 -d)
+    # Fetch current file; a missing file is an expected skip (this file only).
+    CURRENT=$(gh api "repos/${REPO}/contents/${FILE_ENC}?ref=${DEFAULT_BRANCH}" 2>/dev/null) || {
+      echo "::warning::${REPO}: ${FILE} not found — skipping"
+      continue
+    }
 
-  # Already pinned to this SHA → nothing to do (success).
-  if grep -qF "$NEW_SHA" <<<"$OLD_CONTENT"; then
-    echo "${REPO}: already at ${SHORT} — skipping"
+    BLOB_SHA=$(jq -r '.sha' <<<"$CURRENT")
+    OLD_CONTENT=$(jq -r '.content' <<<"$CURRENT" | base64 -d)
+
+    # Already pinned to this SHA → nothing to do for this file.
+    if grep -qF "$NEW_SHA" <<<"$OLD_CONTENT"; then
+      echo "${REPO}: ${FILE} already at ${SHORT} — skipping"
+      continue
+    fi
+
+    # Replace every 40-char hex SHA (the caller's pin — cursor-review has one,
+    # agents-md-integrity has two: the `uses: ...@<sha>` and its `workflows_ref`)
+    # and normalize the stale `# github-workflows#NN` pin comment. The comment
+    # rewrite is a no-op for callers that use a different comment form (e.g.
+    # agents-md-integrity's `# v1`), so it is safe to share across fleets.
+    NEW_CONTENT=$(sed -E "s/[0-9a-f]{40}/${NEW_SHA}/g; s|# github-workflows#[0-9]+|# github-workflows main (${SHORT})|g" <<<"$OLD_CONTENT")
+
+    # `$(...)` capture above (base64 -d, then sed) strips the file's trailing
+    # newline, so printf '%s\n' restores exactly one — otherwise the committed
+    # caller loses its EOF newline and trips the receiver repo's formatter
+    # (oxfmt/prettier both require a trailing newline).
+    PEND_FILE_ENC+=("$FILE_ENC")
+    PEND_CONTENT+=("$(printf '%s\n' "$NEW_CONTENT" | base64 | tr -d '\n')")
+    PEND_BLOB+=("$BLOB_SHA")
+  done
+
+  # Nothing to bump for this repo → clean skip: no branch churn, no PR.
+  if (( ${#PEND_FILE_ENC[@]} == 0 )); then
     return 0
   fi
 
-  # Replace every 40-char hex SHA (the caller's pin — cursor-review has one,
-  # agents-md-integrity has two: the `uses: ...@<sha>` and its `workflows_ref`)
-  # and normalize the stale `# github-workflows#NN` pin comment. The comment
-  # rewrite is a no-op for callers that use a different comment form (e.g.
-  # agents-md-integrity's `# v1`), so it is safe to share across fleets.
-  local NEW_CONTENT
-  NEW_CONTENT=$(sed -E "s/[0-9a-f]{40}/${NEW_SHA}/g; s|# github-workflows#[0-9]+|# github-workflows main (${SHORT})|g" <<<"$OLD_CONTENT")
-
   # Rebuild the stable bump branch from the caller's CURRENT default-branch tip
-  # every run, so the PR is always a clean single-commit "bump to @SHORT" diff —
-  # it never accumulates stale commits across bumps and never drifts if the
+  # ONCE for the repo, so the PR is always a clean "bump to @SHORT" diff — it
+  # never accumulates stale commits across bumps and never drifts if the
   # caller's default branch moved since the last bump (BE-3882).
   local MAIN_SHA
   MAIN_SHA=$(gh api "repos/${REPO}/git/refs/heads/${DEFAULT_BRANCH}" --jq '.object.sha') || {
@@ -152,23 +181,22 @@ bump_one() {
     }
   fi
 
-  # Commit the updated file as the single commit on top of the tip. `$(...)`
-  # capture above (base64 -d, then sed) strips the file's trailing newline, so
-  # printf '%s\n' restores exactly one — otherwise the committed caller loses its
-  # EOF newline and trips the receiver repo's formatter (oxfmt/prettier both
-  # require a trailing newline). BLOB_SHA is the file's blob at the tip we just
-  # reset to, so the update applies cleanly regardless of any prior branch state.
-  local ENCODED
-  ENCODED=$(printf '%s\n' "$NEW_CONTENT" | base64 | tr -d '\n')
-  gh api --method PUT "repos/${REPO}/contents/${FILE_ENC}" \
-    --field message="ci: bump ${TAG} to github-workflows@${SHORT}" \
-    --field content="${ENCODED}" \
-    --field sha="${BLOB_SHA}" \
-    --field branch="${BRANCH}" \
-    > /dev/null || {
-    echo "::warning::${REPO}: commit to ${BRANCH} failed — skipping"
-    return 1
-  }
+  # Pass 2 — commit each staged file onto the (single) branch in turn. Each PUT
+  # carries that file's own blob SHA from the tip; because the files are
+  # distinct, committing one never changes another's blob, so every PUT applies
+  # cleanly on top of the previous one and the branch accumulates ALL of them.
+  local i
+  for (( i = 0; i < ${#PEND_FILE_ENC[@]}; i++ )); do
+    gh api --method PUT "repos/${REPO}/contents/${PEND_FILE_ENC[$i]}" \
+      --field message="ci: bump ${TAG} to github-workflows@${SHORT}" \
+      --field content="${PEND_CONTENT[$i]}" \
+      --field sha="${PEND_BLOB[$i]}" \
+      --field branch="${BRANCH}" \
+      > /dev/null || {
+      echo "::warning::${REPO}: commit to ${BRANCH} failed — skipping"
+      return 1
+    }
+  done
 
   # The title/body embed ${SHORT}. Build them once so the create and the
   # update-in-place paths post the identical, current text. The body is a single
@@ -207,8 +235,16 @@ bump_one() {
 
   # No open PR for this branch → open one (first bump, or the prior PR was
   # merged/closed — and its branch possibly auto-deleted — since the last run).
-  local LABEL_ARGS=()
-  [[ -n "$LABEL" ]] && LABEL_ARGS=(--label "$LABEL")
+  # Apply every distinct non-empty label the repo's entries carried (they need
+  # not agree; dedup so `gh pr create` isn't passed the same label twice).
+  local -a LABEL_ARGS=()
+  local L SEEN_LABELS=""
+  for L in ${LABELS[@]+"${LABELS[@]}"}; do
+    case "$SEEN_LABELS" in
+      *"|${L}|"*) ;;
+      *) LABEL_ARGS+=(--label "$L"); SEEN_LABELS="${SEEN_LABELS}|${L}|" ;;
+    esac
+  done
   if gh pr create \
     --repo "${REPO}" \
     --head "${BRANCH}" \
@@ -229,9 +265,27 @@ bump_one() {
   fi
 }
 
-FAILED=()
+# Group the flat entry list by repo, preserving first-seen order, so each repo
+# is bumped exactly once with ALL of its files (BE-3896). `|` can't appear in a
+# repo name (it is the field delimiter), so it is a safe membership sentinel.
+REPOS=()
+SEEN_REPOS=""
 for ENTRY in "${CALLERS[@]}"; do
-  bump_one "$ENTRY" || FAILED+=("${ENTRY%%|*}")
+  REPO="${ENTRY%%|*}"
+  case "$SEEN_REPOS" in
+    *"|${REPO}|"*) ;;
+    *) REPOS+=("$REPO"); SEEN_REPOS="${SEEN_REPOS}|${REPO}|" ;;
+  esac
+done
+
+FAILED=()
+for REPO in "${REPOS[@]}"; do
+  # Collect this repo's entries (in their original order) and bump them together.
+  ENTRIES=()
+  for ENTRY in "${CALLERS[@]}"; do
+    [[ "${ENTRY%%|*}" == "$REPO" ]] && ENTRIES+=("$ENTRY")
+  done
+  bump_repo "$REPO" "${ENTRIES[@]}" || FAILED+=("$REPO")
 done
 
 if (( ${#FAILED[@]} )); then

@@ -87,14 +87,26 @@ while (( i < ${#args[@]} )); do
   esac
 done
 
+# Model the ONE bump branch's committed file set in $STUB_PUT_DIR/branch_files:
+# a ref create/reset (POST/PATCH on git/refs) rebuilds the branch at the tip and
+# so DROPS every prior bump commit (truncate), while a contents PUT commits a
+# file onto it (append its path). This is what lets a test assert the branch's
+# final contents — and catch the BE-3896 regression where resetting the branch
+# per file left only the last file on it. (One branch is modeled; a same-repo
+# test drives a single repo, so branch_files reflects exactly that repo's PR.)
 case "$method" in
-  POST) exit 0;;
-  PATCH) exit 0;;  # force-reset of the bump branch ref
+  POST)  # branch create at the tip — starts a fresh (empty) bump branch
+    [[ "$path" == *"/git/refs"* ]] && : > "$STUB_PUT_DIR/branch_files"
+    exit 0;;
+  PATCH) # force-reset of the bump branch ref — discards prior bump commits
+    [[ "$path" == *"/git/refs"* ]] && : > "$STUB_PUT_DIR/branch_files"
+    exit 0;;
   PUT)
     n=$(( $(cat "$STUB_PUT_DIR/count" 2>/dev/null || echo 0) + 1 ))
     echo "$n" > "$STUB_PUT_DIR/count"
     printf '%s' "$content" | { base64 -d 2>/dev/null || base64 -D; } > "$STUB_PUT_DIR/put.$n.txt"
     cp "$STUB_PUT_DIR/put.$n.txt" "$STUB_PUT_DIR/put.last.txt"
+    echo "${path##*/contents/}" >> "$STUB_PUT_DIR/branch_files"   # file now on the branch
     exit 0;;
 esac
 
@@ -209,6 +221,27 @@ PUT="${STUB_PUT_DIR}/put.last.txt"
 check "both SHA refs rewritten (2 occurrences)" "[[ \$(grep -cF '$NEW_SHA' \"$PUT\") -eq 2 ]]"
 check "old agents-md pin removed" "! grep -qF '2222222222222222222222222222222222222222' \"$PUT\""
 check "'# v1' comment left intact" "grep -qF '# v1' \"$PUT\""
+
+echo "== monorepo: TWO files in the SAME repo BOTH land on the one branch (BE-3896) =="
+# A repo listed more than once (a monorepo pinning the reusable workflow from
+# two workflow files) must land BOTH files on its single stable branch. The old
+# per-entry loop reset the branch before each file, so the second file's reset
+# discarded the first file's commit and the PR shipped only the last file — a
+# silent partial bump. The stub now models the branch's file set (a reset
+# truncates it, a PUT appends), so this asserts the branch keeps BOTH files.
+new_case mono
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-mono","file":".github/workflows/ci-a.yml","label":""},{"repo":"Comfy-Org/secret-mono","file":".github/workflows/ci-b.yml","label":""}]'
+BF="${STUB_PUT_DIR}/branch_files"
+check "exit 0" "[[ $RC -eq 0 ]]"
+check "committed both files (2 PUTs)"          "[[ \$(cat \"\$STUB_PUT_DIR/count\") -eq 2 ]]"
+check "branch holds exactly two files"         "[[ \$(wc -l < \"$BF\") -eq 2 ]]"
+check "first file present on the branch"       "grep -q 'ci-a.yml' \"$BF\""   # the file the old code dropped
+check "second file present on the branch"      "grep -q 'ci-b.yml' \"$BF\""
+check "opened exactly ONE PR for the repo"     "[[ \$(grep -c '^pr-create' \"\$STUB_PUT_DIR/pr.log\") -eq 1 ]]"
+check "masked the repo name once"              "grep -q '::add-mask::Comfy-Org/secret-mono' <<<\"\$OUT\""
+check "reported fleet complete"                "grep -q 'cursor-review bump complete' <<<\"\$OUT\""
 
 echo "== agents-md fleet: empty list is a clean no-op (ALLOW_EMPTY) =="
 new_case empty
