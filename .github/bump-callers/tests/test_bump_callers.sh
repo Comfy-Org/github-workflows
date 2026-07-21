@@ -112,6 +112,18 @@ esac
 
 # GET dispatch by resource path.
 if [[ "$path" == *"/contents/"* ]]; then
+  # Simulate content-fetch failures so the script's 404-vs-transient handling is
+  # exercised. STUB_404_FILE: a contents GET whose (decoded-ish) path contains
+  # this substring returns a genuine 404 (an expected per-file skip).
+  # STUB_FETCH_FAIL: EVERY contents GET returns a transient non-404 error (the
+  # script must fail the repo, never ship a partial bump).
+  base="${path##*/contents/}"; base="${base%%\?*}"
+  if [[ -n "${STUB_404_FILE:-}" && "$base" == *"${STUB_404_FILE}"* ]]; then
+    echo "gh: Not Found (HTTP 404)" >&2; exit 1
+  fi
+  if [[ -n "${STUB_FETCH_FAIL:-}" ]]; then
+    echo "gh: Internal Server Error (HTTP 500)" >&2; exit 1
+  fi
   b64=$(base64 < "$STUB_CONTENT_FILE" | tr -d '\n')
   printf '{"sha":"blobsha123","content":"%s"}' "$b64"
 elif [[ "$path" == *"/git/refs/heads/"* ]]; then
@@ -267,6 +279,110 @@ STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
   CALLERS_JSON='{"not":"an array"}'
 check "exit 1 on malformed" "[[ $RC -eq 1 ]]"
 check "error explains shape" "grep -q 'not a non-empty JSON array' <<<\"\$OUT\""
+
+echo "== monorepo: a genuinely-missing (404) file is skipped, the present one still bumps =="
+# One file 404s (expected per-file skip), the other bumps. The repo must still
+# succeed and open its PR with the file that WAS present — a 404 is not a repo
+# failure.
+new_case miss404
+STUB_CONTENT_FILE="$CR_FIXTURE" STUB_404_FILE="ci-b.yml" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-mono","file":".github/workflows/ci-a.yml","label":""},{"repo":"Comfy-Org/secret-mono","file":".github/workflows/ci-b.yml","label":""}]'
+check "exit 0 (404 is a skip, not a failure)" "[[ $RC -eq 0 ]]"
+check "reported the 404 file as not found"    "grep -q 'ci-b.yml not found' <<<\"\$OUT\""
+check "committed only the present file"        "[[ \$(cat \"\$STUB_PUT_DIR/count\") -eq 1 ]]"
+check "still opened the PR"                     "grep -q 'PR opened' <<<\"\$OUT\""
+
+echo "== transient fetch error fails the repo — NEVER a silent partial bump =="
+# A non-404 fetch error (auth/rate-limit/5xx/network) must fail the whole repo:
+# skipping it and opening a PR with only the files that DID fetch is the exact
+# partial-bump this refactor exists to prevent (BE-3896).
+new_case transient
+STUB_CONTENT_FILE="$CR_FIXTURE" STUB_FETCH_FAIL=1 run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-alpha","file":".github/workflows/ci-cursor-review.yml","label":""}]'
+check "exit 1 on transient fetch error"        "[[ $RC -eq 1 ]]"
+check "warned about avoiding a partial bump"   "grep -q 'failing repo to avoid a partial bump' <<<\"\$OUT\""
+check "committed NOTHING"                       "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+check "opened NO PR"                            "[[ ! -f \"\$STUB_PUT_DIR/pr.log\" ]] || ! grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
+check "job failed for the repo"                 "grep -q 'bump failed for 1 repo' <<<\"\$OUT\""
+
+echo "== same repo+file listed twice is de-duped to ONE commit (no stale-sha 409) =="
+# A repo listed twice for the same path must stage that file once; a second PUT
+# with the now-stale pre-bump blob sha would 409 and fail the repo.
+new_case dedup
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-dup","file":".github/workflows/ci.yml","label":"ci"},{"repo":"Comfy-Org/secret-dup","file":".github/workflows/ci.yml","label":"ci"}]'
+check "exit 0" "[[ $RC -eq 0 ]]"
+check "committed the file exactly once"        "[[ \$(cat \"\$STUB_PUT_DIR/count\") -eq 1 ]]"
+check "opened exactly one PR"                   "[[ \$(grep -c '^pr-create' \"\$STUB_PUT_DIR/pr.log\") -eq 1 ]]"
+
+echo "== a full-SHA pin of ANOTHER action is NOT clobbered to github-workflows' SHA =="
+# The caller also pins actions/checkout by full SHA (the org's mandated
+# practice). The 40-hex rewrite must touch only the github-workflows pin, not
+# every hex token in the file.
+new_case anchor
+ANCHOR_FIXTURE="${WORK}/anchor_caller.yml"
+printf '%s\n' \
+  'name: CI cursor-review' \
+  'jobs:' \
+  '  review:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@1111111111111111111111111111111111111111  # github-workflows#27' \
+  '  build:' \
+  '    runs-on: ubuntu-latest' \
+  '    steps:' \
+  '      - uses: actions/checkout@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  # v4' \
+  > "$ANCHOR_FIXTURE"
+STUB_CONTENT_FILE="$ANCHOR_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-anchor","file":".github/workflows/ci.yml","label":""}]'
+PUT="${STUB_PUT_DIR}/put.last.txt"
+check "exit 0" "[[ $RC -eq 0 ]]"
+check "github-workflows pin bumped"            "grep -qF '$NEW_SHA' \"$PUT\""
+check "old github-workflows pin removed"        "! grep -qF '1111111111111111111111111111111111111111' \"$PUT\""
+check "actions/checkout SHA left intact"        "grep -qF 'actions/checkout@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' \"$PUT\""
+
+echo "== half-bumped file (one ref at NEW_SHA, one stale) is REPAIRED, not skipped =="
+# The already-pinned check compares rewritten-vs-original content, so a file
+# where only one of two refs reached NEW_SHA still differs and is re-staged —
+# the old 'NEW_SHA appears anywhere' grep would have skipped it, stranding the
+# stale ref.
+new_case halfbump
+HALF_FIXTURE="${WORK}/half_caller.yml"
+printf '%s\n' \
+  'name: AGENTS.md Integrity' \
+  'jobs:' \
+  '  agents-md:' \
+  "    uses: Comfy-Org/github-workflows/.github/workflows/agents-md-integrity.yml@${NEW_SHA}  # v1" \
+  '    with:' \
+  '      workflows_ref: 2222222222222222222222222222222222222222' \
+  > "$HALF_FIXTURE"
+STUB_CONTENT_FILE="$HALF_FIXTURE" run_bump \
+  VAR_NAME=AGENTS_MD_CALLERS TAG=agents-md-integrity WORKFLOW_FILE=agents-md-integrity.yml ALLOW_EMPTY=true \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-half","file":".github/workflows/agents-md-integrity.yml","label":""}]'
+PUT="${STUB_PUT_DIR}/put.last.txt"
+check "exit 0" "[[ $RC -eq 0 ]]"
+check "re-staged the half-bumped file"         "[[ \$(cat \"\$STUB_PUT_DIR/count\") -eq 1 ]]"
+check "both refs now at NEW_SHA"               "[[ \$(grep -cF '$NEW_SHA' \"$PUT\") -eq 2 ]]"
+check "stale second ref repaired"              "! grep -qF '2222222222222222222222222222222222222222' \"$PUT\""
+
+echo "== a fully already-pinned file is a clean skip (no commit, no PR) =="
+new_case pinned
+PINNED_FIXTURE="${WORK}/pinned_caller.yml"
+printf '%s\n' \
+  'name: CI cursor-review' \
+  'jobs:' \
+  '  review:' \
+  "    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@${NEW_SHA}  # github-workflows main (${SHORT})" \
+  > "$PINNED_FIXTURE"
+STUB_CONTENT_FILE="$PINNED_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-pinned","file":".github/workflows/ci.yml","label":""}]'
+check "exit 0" "[[ $RC -eq 0 ]]"
+check "reported already at SHORT"              "grep -q 'already at $SHORT' <<<\"\$OUT\""
+check "committed nothing"                       "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+check "opened no PR"                            "[[ ! -f \"\$STUB_PUT_DIR/pr.log\" ]] || ! grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
 
 echo
 echo "== $PASS passed, $FAIL failed =="

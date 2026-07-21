@@ -111,6 +111,18 @@ bump_repo() {
     return 1
   }
 
+  # Resolve the default-branch tip ONCE, up front, and pin every Pass-1 blob
+  # fetch to this immutable SHA (not the mutable `?ref=<branch>`). This closes a
+  # TOCTOU race: if the caller's default branch moved between the fetches and the
+  # reset below, a staged blob `sha` would be stale against the new tip and its
+  # Pass-2 PUT would 409 after earlier files already committed. Reading the tip
+  # is a GET (no branch churn), so it is safe before the all-skip early return.
+  local MAIN_SHA
+  MAIN_SHA=$(gh api "repos/${REPO}/git/refs/heads/${DEFAULT_BRANCH}" --jq '.object.sha') || {
+    echo "::warning::${REPO}: cannot read ${DEFAULT_BRANCH} ref — skipping"
+    return 1
+  }
+
   # Pass 1 — stage every file that actually needs a bump WITHOUT writing
   # anything yet. This keeps the reset/commit path off entirely for a repo whose
   # files are all missing or already pinned (the old per-entry skips), so it
@@ -121,29 +133,71 @@ bump_repo() {
     FILE=$(cut -d'|' -f2 <<<"$ENTRY")
     LABEL=$(cut -d'|' -f3 <<<"$ENTRY")
     FILE_ENC="${FILE//\//%2F}"
-    [[ -n "$LABEL" ]] && LABELS+=("$LABEL")
 
-    # Fetch current file; a missing file is an expected skip (this file only).
-    CURRENT=$(gh api "repos/${REPO}/contents/${FILE_ENC}?ref=${DEFAULT_BRANCH}" 2>/dev/null) || {
-      echo "::warning::${REPO}: ${FILE} not found — skipping"
+    # De-duplicate by file: a repo listed twice for the SAME path (a structurally
+    # valid config) must stage that file ONCE. A second PUT carrying the same
+    # pre-bump blob `sha` would 409 — the first PUT already moved the blob — and
+    # fail the whole repo even though the file was actually bumped. Fold the
+    # duplicate entry's label into the set (it still applies to the one PR) but
+    # do not re-stage the file.
+    local SEEN_FILE=0 P
+    for P in ${PEND_FILE_ENC[@]+"${PEND_FILE_ENC[@]}"}; do
+      [[ "$P" == "$FILE_ENC" ]] && { SEEN_FILE=1; break; }
+    done
+    if (( SEEN_FILE )); then
+      [[ -n "$LABEL" ]] && LABELS+=("$LABEL")
       continue
-    }
+    fi
+
+    # Fetch current file, pinned to the resolved tip. Distinguish a genuine 404
+    # (this file is actually absent → an expected per-file skip) from ANY other
+    # failure (auth, rate limit, 5xx, network). Treating a transient error as
+    # "not found" and continuing would open a PR that silently OMITS this file
+    # while the job still reports success — the partial-bump class this refactor
+    # exists to kill (BE-3896). So a non-404 failure fails the whole repo.
+    local ERRFILE RC
+    ERRFILE=$(mktemp)
+    CURRENT=$(gh api "repos/${REPO}/contents/${FILE_ENC}?ref=${MAIN_SHA}" 2>"$ERRFILE"); RC=$?
+    if (( RC != 0 )); then
+      if grep -qi 'HTTP 404' "$ERRFILE"; then
+        echo "::warning::${REPO}: ${FILE} not found — skipping"
+        rm -f "$ERRFILE"
+        continue
+      fi
+      echo "::warning::${REPO}: ${FILE} fetch failed (HTTP error, not 404) — failing repo to avoid a partial bump"
+      rm -f "$ERRFILE"
+      return 1
+    fi
+    rm -f "$ERRFILE"
 
     BLOB_SHA=$(jq -r '.sha' <<<"$CURRENT")
     OLD_CONTENT=$(jq -r '.content' <<<"$CURRENT" | base64 -d)
 
-    # Already pinned to this SHA → nothing to do for this file.
-    if grep -qF "$NEW_SHA" <<<"$OLD_CONTENT"; then
+    # Rewrite the github-workflows pin(s) to NEW_SHA and normalize the stale
+    # `# github-workflows#NN` pin comment. Anchor the 40-hex substitution to the
+    # two known pin contexts — the `uses: …Comfy-Org/github-workflows…@<sha>`
+    # line and agents-md-integrity's bare `workflows_ref: <sha>` line — so a
+    # full-SHA pin of ANOTHER action in the same file (`actions/checkout@<sha>`,
+    # the org's mandated practice) is never clobbered to github-workflows' SHA.
+    # The comment rewrite is a no-op for callers that use a different comment
+    # form (e.g. agents-md-integrity's `# v1`), so it is safe to share.
+    NEW_CONTENT=$(sed -E "/github-workflows|workflows_ref/ s/[0-9a-f]{40}/${NEW_SHA}/g; s|# github-workflows#[0-9]+|# github-workflows main (${SHORT})|g" <<<"$OLD_CONTENT")
+
+    # Already fully pinned → the rewrite is a no-op → nothing to do for this file.
+    # Comparing the rewritten content to the original (rather than grepping for
+    # NEW_SHA appearing *anywhere*) also repairs a half-bumped file: if a prior
+    # run left one of two refs at NEW_SHA and the other stale, the content still
+    # differs here, so the file is re-staged and repaired instead of skipped.
+    if [[ "$NEW_CONTENT" == "$OLD_CONTENT" ]]; then
       echo "${REPO}: ${FILE} already at ${SHORT} — skipping"
       continue
     fi
 
-    # Replace every 40-char hex SHA (the caller's pin — cursor-review has one,
-    # agents-md-integrity has two: the `uses: ...@<sha>` and its `workflows_ref`)
-    # and normalize the stale `# github-workflows#NN` pin comment. The comment
-    # rewrite is a no-op for callers that use a different comment form (e.g.
-    # agents-md-integrity's `# v1`), so it is safe to share across fleets.
-    NEW_CONTENT=$(sed -E "s/[0-9a-f]{40}/${NEW_SHA}/g; s|# github-workflows#[0-9]+|# github-workflows main (${SHORT})|g" <<<"$OLD_CONTENT")
+    # Collect the label ONLY now that the file is confirmed staged. Labels from
+    # entries that were skipped (missing / already-pinned) must not land on the
+    # repo's real bump PR — a stray blocking label (e.g. `do-not-merge`) on a
+    # skipped entry would else be applied to the actual bump.
+    [[ -n "$LABEL" ]] && LABELS+=("$LABEL")
 
     # `$(...)` capture above (base64 -d, then sed) strips the file's trailing
     # newline, so printf '%s\n' restores exactly one — otherwise the committed
@@ -159,15 +213,10 @@ bump_repo() {
     return 0
   fi
 
-  # Rebuild the stable bump branch from the caller's CURRENT default-branch tip
-  # ONCE for the repo, so the PR is always a clean "bump to @SHORT" diff — it
-  # never accumulates stale commits across bumps and never drifts if the
-  # caller's default branch moved since the last bump (BE-3882).
-  local MAIN_SHA
-  MAIN_SHA=$(gh api "repos/${REPO}/git/refs/heads/${DEFAULT_BRANCH}" --jq '.object.sha') || {
-    echo "::warning::${REPO}: cannot read ${DEFAULT_BRANCH} ref — skipping"
-    return 1
-  }
+  # Rebuild the stable bump branch from the resolved default-branch tip (MAIN_SHA,
+  # captured up front) ONCE for the repo, so the PR is always a clean "bump to
+  # @SHORT" diff — it never accumulates stale commits across bumps and never
+  # drifts if the caller's default branch moved since the last bump (BE-3882).
   # Create the branch at the tip; if it already exists (an open bump PR, or
   # residue from a prior run) force it back to the tip so the diff is rebuilt
   # from scratch rather than committed on top of the old bump.
@@ -237,13 +286,18 @@ bump_repo() {
   # merged/closed — and its branch possibly auto-deleted — since the last run).
   # Apply every distinct non-empty label the repo's entries carried (they need
   # not agree; dedup so `gh pr create` isn't passed the same label twice).
-  local -a LABEL_ARGS=()
-  local L SEEN_LABELS=""
+  # Exact-match membership (not a `|${L}|` substring sentinel): GitHub label
+  # names may themselves contain `|`, so a substring test could drop a distinct
+  # label whose name is a substring of an already-seen one (e.g. `bug` vs `bug|ui`).
+  local -a LABEL_ARGS=() SEEN_LABELS=()
+  local L S DUP
   for L in ${LABELS[@]+"${LABELS[@]}"}; do
-    case "$SEEN_LABELS" in
-      *"|${L}|"*) ;;
-      *) LABEL_ARGS+=(--label "$L"); SEEN_LABELS="${SEEN_LABELS}|${L}|" ;;
-    esac
+    DUP=0
+    for S in ${SEEN_LABELS[@]+"${SEEN_LABELS[@]}"}; do
+      [[ "$S" == "$L" ]] && { DUP=1; break; }
+    done
+    (( DUP )) && continue
+    SEEN_LABELS+=("$L"); LABEL_ARGS+=(--label "$L")
   done
   if gh pr create \
     --repo "${REPO}" \
