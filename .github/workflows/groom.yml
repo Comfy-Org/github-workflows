@@ -15,11 +15,13 @@ name: Groom (reusable)
 #
 # Security boundary (per cloud/.github/workflows/model-gap-detector.yml): the
 # agent reads UNTRUSTED repo content, so credentials never live in the agent
-# step. The `audit` job that runs the agents has `contents: read` ONLY — it is
-# structurally incapable of writing anything to GitHub. All credentialed issue
-# I/O (dedup read + filing as the bot) happens in the separate `file` job, which
-# holds no agent. Issues are opened/acted as the bot identity you configure
-# (Comfy: cloud-code-bot), NOT github-actions[bot].
+# step. The two `audit_*` jobs that run the agents have `contents: read` ONLY —
+# they are structurally incapable of writing anything to GitHub. The finder and
+# verifier run in SEPARATE jobs on separate fresh checkouts, so a prompt-injected
+# finder cannot tamper with the code the verifier reads or the brief it follows.
+# All credentialed issue I/O (dedup read + filing as the bot) happens in the
+# separate `file` job, which holds no agent. Issues are opened/acted as the bot
+# identity you configure (Comfy: cloud-code-bot), NOT github-actions[bot].
 #
 # Caller pattern (place in the source repo at .github/workflows/groom.yml):
 #
@@ -35,6 +37,11 @@ name: Groom (reusable)
 #           default: false
 #   permissions:
 #     contents: read
+#     # issues: write   # REQUIRED ONLY if you OMIT bot_app_id and file as
+#     #                 # github-actions[bot]: a reusable workflow cannot elevate
+#     #                 # the caller's token, so the github.token fallback needs
+#     #                 # the caller to grant issues:write. With bot_app_id set,
+#     #                 # filing uses the App token and this is not needed.
 #   # REQUIRED — the dedup ledger reads GitHub issue state BEFORE filing, and
 #   # issue creation happens in a later step, so two overlapping runs could both
 #   # classify a signature as new and file duplicates (a TOCTOU race). Serialize.
@@ -231,20 +238,23 @@ jobs:
             echo "should_run=false" >> "$GITHUB_OUTPUT"
           fi
 
-  audit:
-    # Two-phase READ-ONLY audit: finder → independent verifier. This job holds
-    # NO write credentials and has `contents: read` ONLY — the agents that read
-    # untrusted repo content are structurally incapable of writing to GitHub.
-    # Its only output is the verified-findings artifact the `file` job consumes.
-    name: Audit (finder + verifier)
+  audit_find:
+    # Phase 1 — the READ-ONLY finder. Holds NO write credentials (`contents:
+    # read` ONLY) and reads untrusted repo content, so it is structurally
+    # incapable of writing to GitHub. Its only output is the candidate-findings
+    # artifact the INDEPENDENT verifier job (below) re-checks on its own fresh
+    # checkout — the two agents never share a workspace, so a prompt-injected
+    # finder cannot tamper with the code the verifier reads or the brief it
+    # follows.
+    name: Audit — finder
     needs: gate
     if: needs.gate.outputs.should_run == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 40
     permissions:
       contents: read
     outputs:
-      have_findings: ${{ steps.validate.outputs.have_findings }}
+      have_candidates: ${{ steps.assert.outputs.have_candidates }}
     steps:
       - name: Checkout target repo (clean default branch)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -253,7 +263,7 @@ jobs:
           persist-credentials: false
           path: repo
 
-      - name: Load groom assets (briefs + ledger)
+      - name: Load groom assets (briefs)
         # Trusted briefs come from THIS workflow's repo (public, pinned via
         # workflows_ref) — never from the target checkout, so a malicious repo
         # can't rewrite the prompt to change what groom does.
@@ -296,7 +306,9 @@ jobs:
           if themes:
               brief += (
                   "\n\nADDITIONAL SCOPE — restrict this run's findings to these refactor "
-                  f"themes (they map onto the dimensions above; drop anything outside them): {themes}.\n"
+                  f"themes (they map onto the dimensions above; drop anything outside them): {themes}. "
+                  "ALWAYS keep security/auth-adjacent findings regardless of theme — the themes "
+                  "list never suppresses a security finding.\n"
               )
           with open("/tmp/groom-finder-prompt.md", "w", encoding="utf-8") as f:
               f.write(brief)
@@ -320,16 +332,76 @@ jobs:
           claude_args: |
             --model ${{ inputs.model }}
             --max-turns 40
-            --allowedTools "Read,Glob,Grep,Write,Bash(git log:*),Bash(git show:*),Bash(git grep:*),Bash(grep:*),Bash(rg:*),Bash(cat:*),Bash(find:*),Bash(ls:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(sed:*),Bash(awk:*)"
+            --allowedTools "Read,Glob,Grep,Write,Bash(git log:*),Bash(git show:*),Bash(git grep:*),Bash(grep:*),Bash(cat:*),Bash(ls:*),Bash(head:*),Bash(tail:*),Bash(wc:*)"
 
       - name: Assert finder produced JSON
+        id: assert
         run: |
           set -euo pipefail
           if [ ! -s "$FINDER_OUT" ] || ! jq -e . "$FINDER_OUT" >/dev/null 2>&1; then
             echo "::error::Finder did not produce valid JSON at $FINDER_OUT."
             exit 1
           fi
-          echo "Finder candidates: $(jq '.findings | length' "$FINDER_OUT")"
+          COUNT=$(jq '.findings | length' "$FINDER_OUT")
+          echo "Finder candidates: $COUNT"
+          if [ "$COUNT" -gt 0 ]; then
+            echo "have_candidates=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_candidates=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload finder candidates
+        if: steps.assert.outputs.have_candidates == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: groom-finder
+          path: ${{ env.FINDER_OUT }}
+          if-no-files-found: error
+          retention-days: 7
+
+  audit_verify:
+    # Phase 2 — the INDEPENDENT verifier, in its OWN job on its OWN fresh
+    # checkout. It sees only the finder's JSON (downloaded as an artifact) plus a
+    # clean default-branch checkout of the target and trusted briefs re-fetched
+    # from THIS repo — it never shares a workspace with the finder. That
+    # isolation is what upholds the independent-verifier boundary: the finder's
+    # `Write` cannot reach the code the verifier reads or the brief it follows.
+    # Holds NO write credentials (`contents: read` ONLY).
+    name: Audit — verifier
+    needs: [gate, audit_find]
+    if: needs.gate.outputs.should_run == 'true' && needs.audit_find.outputs.have_candidates == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    outputs:
+      have_findings: ${{ steps.validate.outputs.have_findings }}
+    steps:
+      - name: Checkout target repo (fresh clean default branch)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          path: repo
+
+      - name: Load groom assets (briefs)
+        # Re-fetched fresh from THIS repo — never inherited from the finder job,
+        # so a tampered brief cannot cross the job boundary.
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _groom_assets
+          persist-credentials: false
+
+      - name: Download finder candidates
+        # Lands at $FINDER_OUT (/tmp/groom-finder.json) — the only thing that
+        # crosses from the finder to the verifier is this JSON, treated as
+        # untrusted data.
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: groom-finder
+          path: /tmp
 
       - name: Build verifier prompt
         env:
@@ -360,8 +432,9 @@ jobs:
           PY
 
       - name: Run verifier
-        # A FRESH agent session — it sees only the finder's JSON + the code, never
-        # the finder's reasoning. That independence is the whole point.
+        # A FRESH agent session on a FRESH checkout — it sees only the finder's
+        # JSON + the code, never the finder's reasoning. That independence is the
+        # whole point.
         uses: anthropics/claude-code-action@b76a0776ae74036e77cd11018083743453d7ad35 # v1
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -375,7 +448,7 @@ jobs:
           claude_args: |
             --model ${{ inputs.model }}
             --max-turns 40
-            --allowedTools "Read,Glob,Grep,Write,Bash(git log:*),Bash(git show:*),Bash(git grep:*),Bash(grep:*),Bash(rg:*),Bash(cat:*),Bash(find:*),Bash(ls:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(sed:*),Bash(awk:*)"
+            --allowedTools "Read,Glob,Grep,Write,Bash(git log:*),Bash(git show:*),Bash(git grep:*),Bash(grep:*),Bash(cat:*),Bash(ls:*),Bash(head:*),Bash(tail:*),Bash(wc:*)"
 
       - name: Validate verified findings
         id: validate
@@ -410,8 +483,8 @@ jobs:
     # and opens issues as the configured bot. Runs only when the audit produced
     # survivors.
     name: File findings
-    needs: [gate, audit]
-    if: needs.gate.outputs.should_run == 'true' && needs.audit.outputs.have_findings == 'true'
+    needs: [gate, audit_verify]
+    if: needs.gate.outputs.should_run == 'true' && needs.audit_verify.outputs.have_findings == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -443,7 +516,9 @@ jobs:
       - name: Ensure groom labels exist
         if: ${{ inputs.dry_run != true }}
         env:
-          # Bot token when configured, else the default (issues:write) token.
+          # Bot token when configured, else the caller's github.token — which
+          # only carries issues:write if the CALLER granted it (a reusable
+          # workflow can't elevate the caller's token). See the caller pattern.
           GH_TOKEN: ${{ steps.bot_token.outputs.token || github.token }}
           REPO: ${{ github.repository }}
         run: |
@@ -502,7 +577,19 @@ jobs:
           repo = os.environ["REPO"]
           scope = os.environ["SCOPE_LABEL"]
           run_url = os.environ["RUN_URL"]
-          max_findings = int(os.environ["MAX_FINDINGS"])
+          # `type: number` lets a fractional value (e.g. 12.5) through as a string
+          # int() would choke on, and a negative value would make the [:cap] slice
+          # below count from the END (filing the wrong subset). Parse via float,
+          # floor to an int, and reject negatives so the flood backstop holds.
+          raw_max = os.environ["MAX_FINDINGS"].strip()
+          try:
+              max_findings = int(float(raw_max))
+          except ValueError:
+              print(f"::error::max_findings={raw_max!r} is not a number.")
+              sys.exit(1)
+          if max_findings < 0:
+              print(f"::error::max_findings={raw_max!r} must be non-negative.")
+              sys.exit(1)
           dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
 
           with open("/tmp/groom-decision.json", encoding="utf-8") as f:
@@ -520,16 +607,30 @@ jobs:
               print(f"::warning::{len(to_file)} new findings exceed max_findings={max_findings}; filing the first {max_findings}, deferring {len(to_file) - max_findings} to the next run.")
 
           filed = 0
+          failures = 0
           for f in capped:
+              # The ledger routes signatureless findings to `invalid`, so a
+              # to_file entry should always carry one — but read it defensively so
+              # a broken invariant skips the finding instead of crashing the batch
+              # mid-run (after earlier issues already filed).
+              sig = f.get("signature")
+              if not sig:
+                  print(f"::warning::Skipping a finding with no signature: {f.get('title')!r}")
+                  continue
               title = (f.get("title") or "Untitled groom finding").strip()
-              is_security = bool(f.get("security"))
+              # Normalize security truthiness — a verifier that emits the STRING
+              # "false"/"0" would otherwise be truthy under bool() and get the
+              # do-not-auto-implement banner. Handles JSON bool and string forms.
+              is_security = str(f.get("security")).strip().lower() == "true"
               labels = ["groom", "groom-security"] if is_security else ["groom"]
 
               header = f"**Filed by the groom sweep** — {repo} (`{scope}`) · verdict **{f.get('verdict', '?')}** · [run]({run_url})."
               if is_security:
                   header = ("> ⚠️ **Security / auth-adjacent — investigate the SAFE scope; do NOT auto-implement a broad refactor.**\n\n"
                             + header)
-              body = f"{header}\n\n{f.get('body', '').strip()}\n\n{signature_marker(f['signature'])}\n"
+              # `f.get('body', '')` returns None for an explicit "body": null, so
+              # guard with `or ''` before .strip().
+              body = f"{header}\n\n{(f.get('body') or '').strip()}\n\n{signature_marker(sig)}\n"
 
               if dry_run:
                   print(f"[dry-run] WOULD file: '[groom] {title}' labels={labels} security={is_security}")
@@ -543,8 +644,13 @@ jobs:
                   out = subprocess.run(cmd, text=True, capture_output=True, timeout=60, check=True)
                   print(f"Filed: {out.stdout.strip()}")
                   filed += 1
-              except subprocess.CalledProcessError as e:
-                  print(f"::error::Failed to file '{title}': {e.stderr.strip()}")
+              except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                  # TimeoutExpired does NOT inherit from CalledProcessError, so
+                  # catch both — a slow `gh` call is a per-issue filing failure,
+                  # not a reason to abort the remaining findings.
+                  stderr = (getattr(e, "stderr", None) or "").strip()
+                  print(f"::error::Failed to file '{title}': {stderr or e}")
+                  failures += 1
 
           verb = "would file" if dry_run else "filed"
           print(f"Groom {verb} {filed} issue(s) as the configured actor.")
@@ -557,4 +663,13 @@ jobs:
                   s.write(f"- Suppressed **{len(decision.get('suppressed', []))}** already-known/rejected signature(s)\n")
                   if invalid:
                       s.write(f"- **{len(invalid)}** finding(s) skipped (no usable signature)\n")
+                  if failures:
+                      s.write(f"- ⚠️ **{failures}** issue(s) FAILED to file (see the step log)\n")
+
+          # Surface a filing outage instead of a silent green check: if any
+          # `gh issue create` failed (bad token, rate limit, missing label), the
+          # step must fail so the run doesn't report success with issues unfiled.
+          if failures:
+              print(f"::error::{failures} issue(s) failed to file — see errors above.")
+              sys.exit(1)
           PY
