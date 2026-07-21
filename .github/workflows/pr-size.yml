@@ -314,8 +314,15 @@ jobs:
           fi
 
       - name: Note degraded mode
-        # Covers both "creds absent" (bot step skipped) and "mint failed" (bot
-        # step errored under continue-on-error) — either way, no comment, and the
-        # report still lives in the pr-size job's step summary.
-        if: steps.dl.outcome == 'success' && steps.bot.outcome != 'success'
-        run: echo "No bot comment posted (credentials absent, or the app token could not be minted for this repo). The full report is in the pr-size job's step summary."
+        # Covers every path where no comment is posted so the job never goes
+        # green silently: "download failed" (dl errored under continue-on-error,
+        # e.g. the size tool crashed before uploading the report), "creds absent"
+        # (bot step skipped) and "mint failed" (bot step errored). Whenever the
+        # report artifact exists it still lives in the pr-size job's step summary.
+        if: steps.dl.outcome != 'success' || steps.bot.outcome != 'success'
+        run: |
+          if [ "${{ steps.dl.outcome }}" != "success" ]; then
+            echo "No bot comment posted: the size report artifact could not be downloaded (the pr-size job likely failed before uploading it). Check the pr-size job logs."
+          else
+            echo "No bot comment posted (credentials absent, or the app token could not be minted for this repo). The full report is in the pr-size job's step summary."
+          fi
