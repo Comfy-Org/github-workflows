@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -8,6 +10,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -21,6 +24,11 @@ const (
 	// marker (which sits at the top). It caps memory/time so a PR cannot point a
 	// "generated" path at an unbounded or blocking target and hang the job.
 	maxScanBytes = 4 << 20 // 4 MiB
+	// maxStderrBytes caps captured git stderr. cmd.Output() installs a 32 KiB
+	// prefixSuffixSaver on stderr only when it is nil; runGitStdin sets its own
+	// stderr writer, so it re-adds an equivalent cap to keep a git command that
+	// floods stderr from buffering unbounded memory.
+	maxStderrBytes = 32 << 10 // 32 KiB
 )
 
 func main() {
@@ -59,7 +67,7 @@ func main() {
 	// shrink its own counted LoC. Two defense-in-depth conditions disable the
 	// attribute path entirely (unless the bypass label is present): git too old
 	// to honor `check-attr --source`, or the PR diff touching .gitattributes at
-	// all. See attrGenerated / TouchesGitattributes.
+	// all. See attrGeneratedBatch / TouchesGitattributes.
 	attr := attrPolicy{source: *base, useSource: checkAttrSourceSupported(*base)}
 	attrModified := TouchesGitattributes(files)
 	attr.trusted = attrTrusted(attr.useSource, attrModified, *bypassFlag)
@@ -132,52 +140,115 @@ func attrTrusted(useSource, attrModified, bypass bool) bool {
 // lockfile name lists (built-in + extras), the caller-supplied generated globs,
 // the linguist-generated git attribute (read from the base ref per attr), and
 // the canonical Go generated marker in the file's content.
+//
+// The linguist-generated attribute is resolved for every non-binary path in a
+// SINGLE `git check-attr` pass (attrGeneratedBatch) rather than one subprocess
+// per file, so a large PR pays constant process-creation cost instead of O(N).
 func classify(files []FileChange, base, head string, attr attrPolicy, extras Extras) {
+	var attrGen map[string]bool
+	if attr.trusted {
+		paths := make([]string, 0, len(files))
+		for i := range files {
+			if !files[i].Binary {
+				paths = append(paths, files[i].Path)
+			}
+		}
+		attrGen = attrGeneratedBatch(paths, attr.source, attr.useSource)
+	}
 	for i := range files {
 		f := &files[i]
 		if f.Binary {
 			continue
 		}
 		if IsLockfile(f.Path) || extras.Generated(f.Path) ||
-			(attr.trusted && attrGenerated(f.Path, attr.source, attr.useSource)) ||
+			attrGen[f.Path] ||
 			contentGenerated(f.Path, base, head) {
 			f.Generated = true
 		}
 	}
 }
 
-// attrGenerated reports whether .gitattributes marks the path linguist-generated.
-// When useSource is set, the attribute rules are read from source (the base ref)
-// via `git check-attr --source`, so .gitattributes rules introduced by the PR
-// head are never consulted — a PR cannot mark arbitrary hand-written files
-// generated to escape the size count. `--source` needs git >= 2.40 (GitHub
-// runners ship newer); on older git useSource is false and the attribute path is
-// left untrusted (see attrPolicy) rather than reading the PR checkout.
-func attrGenerated(path, source string, useSource bool) bool {
-	args := []string{"check-attr", "linguist-generated"}
+// attrGeneratedBatch reports, per path, whether .gitattributes marks it
+// linguist-generated, resolving every path in ONE `git check-attr` pass (paths
+// fed on stdin) instead of one subprocess per file. The returned map contains an
+// entry only for paths git reported as generated ("true" for an explicit "=true"
+// or "set" for a bare attribute); callers treat an absent path as not-generated,
+// matching the old err→false fallback.
+//
+// When useSource is set the rules are read from source (the base ref) via
+// `--source`, so .gitattributes rules introduced by the PR head are never
+// consulted — a PR cannot mark arbitrary hand-written files generated to escape
+// the size count. `--source` needs git >= 2.40 (GitHub runners ship newer); on
+// older git useSource is false and `--source` is omitted (the caller only
+// invokes this on a runner where the attribute path is trusted; see attrPolicy).
+func attrGeneratedBatch(paths []string, source string, useSource bool) map[string]bool {
+	result := make(map[string]bool, len(paths))
+	if len(paths) == 0 {
+		return result
+	}
+	// `-z` uses NUL as the separator for both stdin paths and output fields, so a
+	// path containing spaces/newlines (already possible from the -z numstat that
+	// produced these) round-trips safely.
+	args := []string{"check-attr", "-z"}
 	if useSource {
 		args = append(args, "--source", source)
 	}
-	args = append(args, "--", path)
-	out, err := runGit(args...)
-	if err != nil {
-		return false
+	args = append(args, "--stdin", "linguist-generated")
+
+	var stdin bytes.Buffer
+	for _, p := range paths {
+		stdin.WriteString(p)
+		stdin.WriteByte(0)
 	}
-	// Format: "<path>: linguist-generated: <value>". git reports "true" for an
-	// explicit "=true" and "set" for a bare attribute; both mean generated.
-	s := strings.TrimSpace(out)
-	return strings.HasSuffix(s, ": true") || strings.HasSuffix(s, ": set")
+	out, _, err := runGitStdin(stdin.Bytes(), args...)
+	if err != nil {
+		return result
+	}
+	// `-z` output is a flat NUL-separated stream of (path, attribute, value)
+	// triples, with a trailing NUL after the final value (so Split yields an
+	// empty tail element the triple loop ignores).
+	fields := strings.Split(out, "\x00")
+	for i := 0; i+2 < len(fields); i += 3 {
+		if v := fields[i+2]; v == "true" || v == "set" {
+			result[fields[i]] = true
+		}
+	}
+	return result
 }
 
 // checkAttrSourceSupported reports whether the installed git honors
 // `check-attr --source` (added in git 2.40). Older git rejects the flag as an
 // unknown option and exits non-zero, so we probe once rather than parse the
-// version string. A false result forces the attribute path onto its untrusted
-// fallback (see attrPolicy). The probe path need not exist; check-attr resolves
-// rules for arbitrary path strings.
+// version string. The probe path need not exist; check-attr resolves rules for
+// arbitrary path strings.
+//
+// Only git's own "unknown flag" signature counts as unsupported. Any OTHER probe
+// failure (a transient git error, an unreadable base ref) leaves --source
+// trusted: reporting a modern-but-flaky git as "too old" would silently drop
+// every base linguist-generated exclusion and emit a misleading "runner's git is
+// too old" note (BE-3247). On such an unrelated failure the reads stay
+// conservative anyway — attrGeneratedBatch's own --source call fails closed, so
+// files are over-counted (never under-counted), and the size cap can only be too
+// strict, never too loose.
 func checkAttrSourceSupported(source string) bool {
-	_, err := runGit("check-attr", "--source", source, "linguist-generated", "--", ".gitattributes")
-	return err == nil
+	_, stderr, err := runGitStdin(nil, "check-attr", "--source", source, "linguist-generated", "--", ".gitattributes")
+	if err == nil {
+		return true
+	}
+	// A genuine unknown-flag rejection => --source truly unsupported. Anything
+	// else is an unrelated failure and must not disable the base-ref attribute path.
+	return !isUnknownFlagError(stderr)
+}
+
+// isUnknownFlagError reports whether git's stderr indicates it rejected an option
+// as unrecognized. git's parse-options prints "unknown option" for long flags and
+// "unknown switch" for short ones; matching is case-insensitive and substring-based
+// so it tolerates the surrounding usage text and minor wording drift across git
+// versions. The stderr comes from runGitStdin, which forces LC_ALL=C, so this
+// only ever sees git's canonical English wording (BE-3247).
+func isUnknownFlagError(stderr string) bool {
+	s := strings.ToLower(stderr)
+	return strings.Contains(s, "unknown option") || strings.Contains(s, "unknown switch")
 }
 
 // contentGenerated reports whether a .go file carries Go's canonical generated
@@ -301,22 +372,81 @@ func writeGitHubOutputs(res Result) {
 	fmt.Fprintf(f, "over_cap=%t\ncounted=%d\n", !res.OK, res.Counted)
 }
 
+// gitTimeout bounds every git invocation so a hung git (a wedged credential
+// prompt, a stuck pack read, an unresponsive filter) cannot stall the job until
+// the global CI runner timeout. It is deliberately generous — the heaviest call
+// here is a single blob read — so a healthy git never trips it.
+const gitTimeout = 60 * time.Second
+
 func runGit(args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
-	out, err := cmd.Output()
-	if err != nil {
-		return "", err
-	}
-	return string(out), nil
+	out, _, err := runGitStdin(nil, args...)
+	return out, err
 }
+
+// runGitStdin runs git with the given args and optional stdin, returning stdout
+// and stderr separately. Three behaviors matter to callers:
+//   - stderr is captured (a plain cmd.Output() discards it) and bounded to
+//     maxStderrBytes, so checkAttrSourceSupported can tell an old git's
+//     unknown-flag rejection from an unrelated failure (BE-3247).
+//   - the call runs under a gitTimeout deadline via exec.CommandContext; when it
+//     fires the child is killed and the timeout surfaces as an error, which
+//     callers already treat as "git failed" rather than returning stale data
+//     (BE-3248).
+//   - stdin, when non-nil, is fed to git — used for `check-attr --stdin`.
+//
+// git is forced into the C locale so its parse-options diagnostics (localized
+// via gettext under LANG/LC_MESSAGES) stay in the canonical English wording
+// isUnknownFlagError matches; the porcelain output we parse (-z numstat, -z
+// check-attr, blob contents) is locale-independent.
+func runGitStdin(stdin []byte, args ...string) (stdout, stderr string, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), gitTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Env = append(os.Environ(), "LC_ALL=C")
+	if stdin != nil {
+		cmd.Stdin = bytes.NewReader(stdin)
+	}
+	errBuf := &capWriter{cap: maxStderrBytes}
+	cmd.Stderr = errBuf
+	out, err := cmd.Output()
+	if err != nil && ctx.Err() == context.DeadlineExceeded {
+		err = fmt.Errorf("git %v timed out after %s: %w", args, gitTimeout, ctx.Err())
+	}
+	return string(out), errBuf.String(), err
+}
+
+// capWriter is an io.Writer that retains at most cap bytes, silently discarding
+// the overflow while still reporting a full write so the child process never
+// sees a short-write error. It re-adds the stderr cap that cmd.Output() would
+// otherwise provide (see maxStderrBytes).
+type capWriter struct {
+	buf bytes.Buffer
+	cap int
+}
+
+func (w *capWriter) Write(p []byte) (int, error) {
+	if room := w.cap - w.buf.Len(); room > 0 {
+		if len(p) > room {
+			w.buf.Write(p[:room])
+		} else {
+			w.buf.Write(p)
+		}
+	}
+	return len(p), nil
+}
+
+func (w *capWriter) String() string { return w.buf.String() }
 
 // runGitCapped runs git and reads at most maxBytes of its stdout, killing the
 // process rather than blocking on Wait() if it had more to write. Used for
 // reads of ref-addressed blobs (e.g. `git show <ref>:<path>`) whose size we
 // don't control, so a single oversized blob can't spike job memory the way an
-// unbounded cmd.Output() would.
+// unbounded cmd.Output() would. Bounded by gitTimeout like every other git call
+// (BE-3248), so a stuck blob read can't hang the job.
 func runGitCapped(maxBytes int64, args ...string) ([]byte, error) {
-	cmd := exec.Command("git", args...)
+	ctx, cancel := context.WithTimeout(context.Background(), gitTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err

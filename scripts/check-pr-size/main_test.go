@@ -79,11 +79,11 @@ func TestTouchesGitattributes(t *testing.T) {
 	}
 }
 
-// TestAttrGeneratedSourceIsolatesBase proves attrGenerated reads .gitattributes
-// from the base tree (useSource=true), not the working tree (the PR head). It
-// checks both directions: a base rule the head removed is still honored via
-// --source, and a rule only the head adds is ignored via --source but WOULD
-// have been honored reading the working tree.
+// TestAttrGeneratedSourceIsolatesBase proves attrGeneratedBatch reads
+// .gitattributes from the base tree (useSource=true), not the working tree (the
+// PR head). It checks both directions: a base rule the head removed is still
+// honored via --source, and a rule only the head adds is ignored via --source
+// but WOULD have been honored reading the working tree.
 func TestAttrGeneratedSourceIsolatesBase(t *testing.T) {
 	// Direction 1: base HAS the rule, head REMOVED it.
 	t.Run("base rule honored despite head removal", func(t *testing.T) {
@@ -98,12 +98,12 @@ func TestAttrGeneratedSourceIsolatesBase(t *testing.T) {
 		if !checkAttrSourceSupported(base) {
 			t.Skip("git too old for check-attr --source")
 		}
-		if !attrGenerated("foo.go", base, true) {
-			t.Error("attrGenerated should read the base rule via --source")
+		if !attrGeneratedBatch([]string{"foo.go"}, base, true)["foo.go"] {
+			t.Error("attrGeneratedBatch should read the base rule via --source")
 		}
 		// Reading the working tree (head) must NOT see the removed rule.
-		if attrGenerated("foo.go", base, false) {
-			t.Error("attrGenerated without --source read the head tree, expected no rule")
+		if attrGeneratedBatch([]string{"foo.go"}, base, false)["foo.go"] {
+			t.Error("attrGeneratedBatch without --source read the head tree, expected no rule")
 		}
 	})
 
@@ -120,13 +120,110 @@ func TestAttrGeneratedSourceIsolatesBase(t *testing.T) {
 		if !checkAttrSourceSupported(base) {
 			t.Skip("git too old for check-attr --source")
 		}
-		if attrGenerated("foo.go", base, true) {
-			t.Error("attrGenerated via --source must not see the head-introduced rule")
+		if attrGeneratedBatch([]string{"foo.go"}, base, true)["foo.go"] {
+			t.Error("attrGeneratedBatch via --source must not see the head-introduced rule")
 		}
-		if !attrGenerated("foo.go", base, false) {
+		if !attrGeneratedBatch([]string{"foo.go"}, base, false)["foo.go"] {
 			t.Error("sanity: reading the working tree should see the head rule (the vulnerability)")
 		}
 	})
+}
+
+// TestAttrGeneratedBatchMultiplePaths proves the single-pass batch resolves each
+// path independently against the base ref: a matched path is reported generated,
+// an unmatched one is absent from the map, and an empty input never shells out.
+func TestAttrGeneratedBatchMultiplePaths(t *testing.T) {
+	dir := initTestRepo(t)
+	writeFile(t, dir, ".gitattributes", "gen/*.go linguist-generated=true\n")
+	writeFile(t, dir, "gen/a.go", "package gen\n")
+	writeFile(t, dir, "gen/b.go", "package gen\n")
+	writeFile(t, dir, "hand.go", "package main\n")
+	base := commitAll(t, dir, "base with rule")
+	t.Chdir(dir)
+
+	if !checkAttrSourceSupported(base) {
+		t.Skip("git too old for check-attr --source")
+	}
+	got := attrGeneratedBatch([]string{"gen/a.go", "gen/b.go", "hand.go"}, base, true)
+	if !got["gen/a.go"] || !got["gen/b.go"] {
+		t.Errorf("matched paths should be generated, got %v", got)
+	}
+	if got["hand.go"] {
+		t.Errorf("unmatched path should not be generated, got %v", got)
+	}
+	if len(attrGeneratedBatch(nil, base, true)) != 0 {
+		t.Error("empty input should return an empty map")
+	}
+}
+
+// TestIsUnknownFlagError checks that only git's unrecognized-option wording is
+// treated as the "unsupported --source flag" signal, and unrelated git errors
+// (e.g. a bad ref) are not — the core BE-3247 distinction.
+func TestIsUnknownFlagError(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		stderr string
+		want   bool
+	}{
+		{"long option wording", "error: unknown option `source'\nusage: git check-attr ...", true},
+		{"short switch wording", "error: unknown switch `s'\n", true},
+		{"mixed case tolerated", "ERROR: Unknown Option `source'", true},
+		{"unrelated fatal is not a flag error", "fatal: no-such-ref: not a valid tree-ish source\n", false},
+		{"empty stderr", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isUnknownFlagError(tt.stderr); got != tt.want {
+				t.Errorf("isUnknownFlagError(%q) = %v, want %v", tt.stderr, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestCheckAttrSourceSupported proves the BE-3247 fix end to end against real
+// git: a valid probe reports supported, and a probe that fails for a reason
+// OTHER than an unknown --source flag (here an unresolvable base ref) is NOT
+// misreported as unsupported — which would otherwise drop legit base exclusions
+// and emit the misleading "git is too old" note.
+func TestCheckAttrSourceSupported(t *testing.T) {
+	dir := initTestRepo(t)
+	writeFile(t, dir, "foo.go", "package foo\n")
+	commitAll(t, dir, "base")
+	t.Chdir(dir)
+
+	if !checkAttrSourceSupported("HEAD") {
+		t.Skip("git too old for check-attr --source")
+	}
+	// An unresolvable source ref makes git fatal with "not a valid tree-ish
+	// source" (not an unknown-flag error), so --source must stay trusted.
+	if !checkAttrSourceSupported("this-ref-does-not-exist") {
+		t.Error("checkAttrSourceSupported must stay true when the probe fails for a reason other than an unknown --source flag")
+	}
+}
+
+// TestCapWriter checks that captured git stderr is bounded: writes past the cap
+// are dropped (never buffered), while each Write still reports its full length so
+// the child process never observes a short write.
+func TestCapWriter(t *testing.T) {
+	t.Parallel()
+	w := &capWriter{cap: 4}
+	if n, err := w.Write([]byte("ab")); n != 2 || err != nil {
+		t.Fatalf("Write(ab) = (%d, %v), want (2, nil)", n, err)
+	}
+	// Straddles the cap: only "cd" fits, but the writer must report all 4 bytes
+	// written so exec does not treat it as an error.
+	if n, err := w.Write([]byte("cdef")); n != 4 || err != nil {
+		t.Fatalf("Write(cdef) = (%d, %v), want (4, nil)", n, err)
+	}
+	// Fully past the cap: dropped entirely, still reported as fully written.
+	if n, err := w.Write([]byte("gh")); n != 2 || err != nil {
+		t.Fatalf("Write(gh) = (%d, %v), want (2, nil)", n, err)
+	}
+	if got := w.String(); got != "abcd" {
+		t.Errorf("capWriter retained %q, want %q", got, "abcd")
+	}
 }
 
 // TestClassifyPRAddedGitattributesDoesNotReduceCount is the anti-gaming
