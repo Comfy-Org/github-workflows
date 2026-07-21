@@ -5,18 +5,20 @@
 # When a reusable workflow (e.g. cursor-review.yml or agents-md-integrity.yml)
 # is updated on main, this opens a SHA-bump PR in every repo that pins a caller
 # against it. It is fleet-agnostic: the thin workflow entrypoints
-# (bump-cursor-review-callers.yml, bump-agents-md-callers.yml) invoke it with a
-# different caller list, human tag, and reusable-workflow filename. There is ONE
-# implementation so the two fleets cannot drift apart (a forked copy is how
-# other shared machinery in the org has rotted); the entrypoints differ only in
-# their path-filter triggers and the parameters below.
+# (bump-cursor-review-callers.yml, bump-agents-md-callers.yml,
+# bump-pr-size-callers.yml) invoke it with a different caller list, human tag,
+# and reusable-workflow filename. There is ONE implementation so the fleets
+# cannot drift apart (a forked copy is how other shared machinery in the org
+# has rotted); the entrypoints differ only in their path-filter triggers and
+# the parameters below.
 #
 # This repo is PUBLIC (both the workflow files and the Actions run logs are
 # publicly viewable) and most callers are private, so caller names must never
 # appear in a committed file or in the logs. Each caller list lives in a
 # repo-level Actions variable (config, not a credential — a variable, not a
-# secret) as a JSON array of {"repo","file","label"} objects, and every repo
-# name is `::add-mask::`ed out of the run logs before it is ever echoed.
+# secret) as a JSON array of {"repo","file","label","wire_bot"} objects, and
+# every repo name is `::add-mask::`ed out of the run logs before it is ever
+# echoed.
 #
 # Required environment:
 #   GH_TOKEN       Token with contents:write + pull-requests:write on the callers
@@ -27,11 +29,19 @@
 #   TAG            Human tag for branch/commit/PR text (e.g. "cursor-review").
 #   WORKFLOW_FILE  Reusable workflow filename referenced in the PR body.
 # Optional:
-#   ALLOW_EMPTY    "true" → an empty caller list is a clean no-op (a fleet that
-#                  is seeded empty and grows). Default "false" → an empty/missing
-#                  list is a hard error (a fleet that always has callers must
-#                  never silently no-op — that would leave every caller un-bumped
-#                  without anyone noticing).
+#   ALLOW_EMPTY      "true" → an empty caller list is a clean no-op (a fleet that
+#                    is seeded empty and grows). Default "false" → an empty/missing
+#                    list is a hard error (a fleet that always has callers must
+#                    never silently no-op — that would leave every caller un-bumped
+#                    without anyone noticing).
+#   WIRE_BOT_SCRIPT  Path to a helper that reads a caller's YAML on stdin and
+#                    writes it back wired for some extra identity/config, idempotently
+#                    (BE-1814's .github/cursor-review/wire-bot-identity.py). Only
+#                    consulted for an entry whose `wire_bot` field is true; unset
+#                    (the agents-md-integrity entrypoint never sets it) means no
+#                    fleet here uses wiring, so a stray `wire_bot: true` in that
+#                    fleet's variable is a harmless no-op with a warning, not a
+#                    failure — this keeps the script itself cursor-review-agnostic.
 
 # NOTE: deliberately no `set -e`. Each caller is bumped independently in
 # bump_one(); a failure there returns non-zero and is downgraded to a per-repo
@@ -45,6 +55,7 @@ set -uo pipefail
 : "${WORKFLOW_FILE:?WORKFLOW_FILE is required}"
 CALLERS_JSON="${CALLERS_JSON-}"
 ALLOW_EMPTY="${ALLOW_EMPTY:-false}"
+WIRE_BOT_SCRIPT="${WIRE_BOT_SCRIPT-}"
 
 SHORT="${NEW_SHA:0:7}"
 # Stable branch per (repo, TAG) — deliberately NOT SHA-stamped. A fixed head
@@ -70,19 +81,21 @@ if [[ -z "$STRIPPED" ]]; then
   echo "::error::${VAR_NAME} variable is missing or empty. Seed it with the caller list — see this workflow's header comment for the update flow."
   exit 1
 fi
-if ! jq -e 'type == "array" and length > 0 and all(.[]; (.repo | type == "string" and . != "") and (.file | type == "string" and . != ""))' <<<"$CALLERS_JSON" >/dev/null 2>&1; then
-  echo "::error::${VAR_NAME} is not a non-empty JSON array of {repo,file,label} objects (each needing a non-empty repo and file). Fix the variable — see the workflow header."
+if ! jq -e 'type == "array" and length > 0 and all(.[]; (.repo | type == "string" and . != "") and (.file | type == "string" and . != "") and (.wire_bot == null or (.wire_bot | type == "boolean")))' <<<"$CALLERS_JSON" >/dev/null 2>&1; then
+  echo "::error::${VAR_NAME} is not a non-empty JSON array of {repo,file,label,wire_bot} objects (each needing a non-empty repo and file, and a boolean wire_bot if present). Fix the variable — see the workflow header."
   exit 1
 fi
 
-# Parse the JSON into repo|file|label tuples, and mask every repo name in the
-# (publicly viewable) run logs BEFORE the loop that echoes it, so all per-repo
-# output shows *** instead of a private repo name.
+# Parse the JSON into repo|file|label|wire_bot tuples, and mask every repo name
+# in the (publicly viewable) run logs BEFORE the loop that echoes it, so all
+# per-repo output shows *** instead of a private repo name. jq's `//` treats
+# both `false` and `null` as falsy, so an absent/false/null wire_bot all print
+# the empty string here — exactly the "not flagged" case.
 CALLERS=()
 while IFS= read -r ENTRY; do
   echo "::add-mask::${ENTRY%%|*}"
   CALLERS+=("$ENTRY")
-done < <(jq -r '.[] | "\(.repo)|\(.file)|\(.label // "")"' <<<"$CALLERS_JSON")
+done < <(jq -r '.[] | "\(.repo)|\(.file)|\(.label // "")|\(.wire_bot // "")"' <<<"$CALLERS_JSON")
 
 if (( ${#CALLERS[@]} == 0 )); then
   echo "::error::${VAR_NAME} parsed to zero callers — refusing to run a no-op dispatcher."
@@ -131,10 +144,12 @@ bump_repo() {
   # files are all missing or already pinned (the old per-entry skips), so it
   # never resets a branch or opens a PR it doesn't need.
   local -a PEND_FILE=() PEND_CONTENT=() LABELS=()
-  local ENTRY FILE LABEL FILE_ENC CURRENT OLD_CONTENT NEW_CONTENT
+  local WIRING_ADDED_ANY=""
+  local ENTRY FILE LABEL WIRE_BOT FILE_ENC CURRENT OLD_CONTENT NEW_CONTENT
   for ENTRY in "$@"; do
     FILE=$(cut -d'|' -f2 <<<"$ENTRY")
     LABEL=$(cut -d'|' -f3 <<<"$ENTRY")
+    WIRE_BOT=$(cut -d'|' -f4 <<<"$ENTRY")
     FILE_ENC="${FILE//\//%2F}"
 
     # De-duplicate by file: a repo listed twice for the SAME path (a structurally
@@ -184,6 +199,27 @@ bump_repo() {
     # The comment rewrite is a no-op for callers that use a different comment
     # form (e.g. agents-md-integrity's `# v1`), so it is safe to share.
     NEW_CONTENT=$(sed -E "/github-workflows|workflows_ref/ s/[0-9a-f]{40}/${NEW_SHA}/g; s|# github-workflows#[0-9]+|# github-workflows main (${SHORT})|g" <<<"$OLD_CONTENT")
+
+    # Wire an extra identity/config into this file when its entry is flagged
+    # (BE-1814's cloud-code-bot review identity is the first user). Idempotent —
+    # an already-wired caller comes back unchanged — so this only adds the
+    # wiring to callers that don't have it yet, alongside the SHA bump. Folded
+    # into the SAME content-equality check below (not a separate "grep for the
+    # wired marker" skip) so a wiring-only change on an already-SHA-current
+    # caller still stages the file instead of being short-circuited.
+    if [[ -n "$WIRE_BOT" ]]; then
+      if [[ -z "$WIRE_BOT_SCRIPT" ]]; then
+        echo "::warning::${REPO}: ${FILE} flagged wire_bot but WIRE_BOT_SCRIPT is unset — bumping SHA only"
+      else
+        local WIRED
+        if WIRED=$(python3 "$WIRE_BOT_SCRIPT" <<<"$NEW_CONTENT") && [[ -n "$WIRED" ]]; then
+          [[ "$WIRED" != "$NEW_CONTENT" ]] && WIRING_ADDED_ANY=1
+          NEW_CONTENT="$WIRED"
+        else
+          echo "::warning::${REPO}: ${FILE} bot-identity wiring failed — bumping SHA only"
+        fi
+      fi
+    fi
 
     # Already fully pinned → the rewrite is a no-op → nothing to do for this file.
     # Comparing the rewritten content to the original (rather than grepping for
@@ -297,7 +333,13 @@ bump_repo() {
   # YAML in an earlier revision.
   local PR_TITLE PR_BODY
   PR_TITLE="ci: bump ${TAG} to github-workflows@${SHORT}"
-  PR_BODY="Automatic SHA bump — \`${WORKFLOW_FILE}\` was updated in \`Comfy-Org/github-workflows\` at [\`${SHORT}\`](https://github.com/Comfy-Org/github-workflows/commit/${NEW_SHA}). _Opened by the \`bump-${TAG}-callers\` workflow._"
+  PR_BODY="Automatic SHA bump — \`${WORKFLOW_FILE}\` was updated in \`Comfy-Org/github-workflows\` at [\`${SHORT}\`](https://github.com/Comfy-Org/github-workflows/commit/${NEW_SHA})."
+  # Note the identity wiring in the PR body when it was actually added this run
+  # (skipped for a caller already wired — that gets a pure SHA bump). NB: keep
+  # GitHub-Actions expression syntax out of this script — the caller entrypoint
+  # interpolates those at parse time, not here.
+  [[ -n "$WIRING_ADDED_ANY" ]] && PR_BODY="${PR_BODY} Also wires the cloud-code-bot review identity (\`bot_app_id\` → \`vars.APP_ID\`, plus the \`BOT_APP_PRIVATE_KEY\` secret) so the review posts under \`cloud-code-bot[bot]\` instead of \`github-actions[bot]\` — BE-1814."
+  PR_BODY="${PR_BODY} _Opened by the \`bump-${TAG}-callers\` workflow._"
 
   # Reuse the one open bump PR for this branch if there is one: the branch push
   # above already refreshed its diff to the new SHA, so just refresh its

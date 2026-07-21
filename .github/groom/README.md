@@ -1,4 +1,4 @@
-# Groom — two-phase code-cleanup briefs
+# Groom — two-phase code-cleanup briefs + durable rejection ledger
 
 Version-controlled, co-ownable **prompts** for the agent-work *groom* workflow: a
 periodic, org-wide sweep that proposes high-value refactors (duplication,
@@ -81,3 +81,75 @@ a template + substitution reproduces the previous inline prompt with no change t
 review panel's safety rails — the `security` flag as an explicit placeholder, and a
 read-only + untrusted-input boundary on both phases — which harden behavior without
 changing the findings themselves.
+
+## `ledger.py` — the durable dedup / rejection ledger (BE-3874)
+
+A **stateless CI run** starts fresh every time — with no durable memory it would
+re-file findings that were already filed OR already human-rejected on every
+scheduled run. That is the fastest way to make the shared groom capability
+annoying and get it disabled. The roundtable was explicit: *dedup must remember
+REJECTIONS — don't re-raise a rejected finding next week.*
+
+`ledger.py` uses **GitHub issue state itself** as the durable store — the
+GitHub-native option that needs **no net-new secret** (the run's `GITHUB_TOKEN`
+already reads issues) and is fully **auditable** (the record is the issues you
+can see). No separate database, cache, or committed state file.
+
+Keyed on `(repo, finding_signature) → {filed | rejected | superseded}`:
+
+| Live GitHub state | Ledger status | Re-file? |
+|---|---|---|
+| Open `groom` issue for the signature | `filed` | no |
+| Closed as **completed** | `filed` | no (already handled) |
+| Closed as **not planned** (GitHub "close as wontfix") | `rejected` | **no — durable** |
+| Carries the `groom-rejected` label (open or closed) | `rejected` | **no — durable** |
+| Carries the `groom-superseded` label | `superseded` | no |
+| No `groom` issue carries the signature | `unknown` | **yes** |
+
+Only an `unknown` signature is filed. Human rejection — close-as-not-planned or
+the `groom-rejected` label — suppresses that signature forever.
+
+### The filing contract (load-bearing)
+
+This module consumes the verifier's stable dedup `signature` (see above) as an
+opaque string on each finding. For the memory to survive, the step that OPENS an
+issue for a `to_file` finding **must**:
+
+1. apply the **`groom`** label (how the next run finds our issues), and
+2. append `signature_marker(finding["signature"])` to the issue body — an
+   invisible HTML comment (`<!-- groom-signature: … -->`) the next run recovers.
+
+Skip either and the next run cannot recognize the issue and will re-file it.
+
+The dedup decision is a point-in-time snapshot of GitHub issue state read
+*before* filing, and issue creation happens in a later step. Two overlapping
+groom runs could therefore both classify the same signature as `unknown` and
+file duplicates (a TOCTOU race). The caller workflow (not yet written — epic
+BE-3870) **must serialize groom runs with a `concurrency:` group** so at most
+one run reads-then-files at a time.
+
+### CLI (called right before the groomer files)
+
+```bash
+python3 .github/groom/ledger.py \
+    --repo owner/name --candidates findings.json --out decision.json
+```
+
+`findings.json` is a JSON array of findings, each with a `signature`.
+`decision.json` receives `{to_file, suppressed, invalid, ledger_size}` — open
+issues only for `to_file`. `invalid` = findings with no usable signature; they
+are **not** filed (filing an un-dedupable finding would risk the exact
+duplicate-spam this ledger prevents) and should be surfaced as a producer error.
+
+Single-signature probe (exit 0 = should file, 1 = suppressed):
+
+```bash
+python3 .github/groom/ledger.py --repo owner/name --check "<signature>"
+```
+
+- **`tests/`** — `unittest` suite, run by
+  [`test-groom-scripts.yml`](../workflows/test-groom-scripts.yml).
+
+```bash
+python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
+```

@@ -20,6 +20,9 @@ python3 -m unittest discover -s .github/cursor-review/tests -p 'test_*.py' -v
 # agents-md-integrity checker tests
 python3 -m unittest discover -s .github/agents-md-integrity/tests -p 'test_*.py' -v
 
+# groom dedup/rejection ledger tests
+python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
+
 # bump-callers shell tests + lint (gh is stubbed; no network)
 shellcheck -x .github/bump-callers/bump-callers.sh .github/bump-callers/tests/test_bump_callers.sh
 bash .github/bump-callers/tests/test_bump_callers.sh
@@ -43,6 +46,11 @@ tests — run the matching command above for whatever you touched.
   time, never copied into consumers. Tests in `tests/`.
 - `.github/agents-md-integrity/` — `check_agents_md.py`, the checker behind
   `agents-md-integrity.yml` (enforces this AGENTS.md standard). Tests in `tests/`.
+- `.github/groom/` — building blocks for the reusable **groom** code-cleanup
+  workflow (epic BE-3870). Currently `ledger.py`, the durable dedup/rejection
+  memory that stops the stateless groom CI run from re-filing already-filed or
+  human-rejected findings (it uses GitHub issue state as the store — no new
+  secret). Tests in `tests/`.
 - `.github/bump-callers/` — `bump-callers.sh`, the ONE fleet-agnostic script
   that opens SHA-bump PRs in consumer repos when a reusable workflow changes.
   Tests in `tests/`.
@@ -61,8 +69,9 @@ tests — run the matching command above for whatever you touched.
 - `assign-reviewers.yml` — expertise-aware, load-balanced reviewer requests.
 - `assign-prs-to-author.yml` — assigns unassigned open PRs to their author.
 - `detect-unreviewed-merge.yml` — SOC 2: flags PRs merged without approval.
-- `bump-cursor-review-callers.yml` / `bump-agents-md-callers.yml` — thin
-  entrypoints over `bump-callers.sh` that fan SHA bumps out to consumers.
+- `bump-cursor-review-callers.yml` / `bump-agents-md-callers.yml` /
+  `bump-pr-size-callers.yml` — thin entrypoints over `bump-callers.sh` that fan
+  SHA bumps out to consumers.
 
 ## Conventions & gotchas
 
@@ -80,10 +89,11 @@ tests — run the matching command above for whatever you touched.
   self-enrollment callers (`ci-cursor-review.yml`, `ci-detect-unreviewed-merge.yml`)
   deliberately pin a merged-main SHA instead of a local `./` path for the same
   reason — do not "simplify" them to a local path.
-- **One bumper, not two.** `bump-callers.sh` backs both fleets; the two
+- **One bumper, not several.** `bump-callers.sh` backs every fleet; the
   `bump-*-callers.yml` files are thin per-fleet wrappers (they stay separate so a
-  `cursor-review.yml` change doesn't spuriously bump agents-md callers). Do not
-  fork the script — a forked copy is how other shared org machinery has drifted.
+  `cursor-review.yml` change doesn't spuriously bump agents-md or pr-size
+  callers). Do not fork the script — a forked copy is how other shared org
+  machinery has drifted.
 - **New reusable workflow?** `on: workflow_call` + a header comment documenting
   inputs/secrets/triggers + a caller-pattern example, then update the README
   table (README "Adding a new reusable workflow"). Move the floating major tag
@@ -105,4 +115,4 @@ tests — run the matching command above for whatever you touched.
 - [`README.md`](README.md) — public catalog, SHA-pin usage, versioning.
 - [`.github/cursor-review/README.md`](.github/cursor-review/README.md) — review panel internals + adoption.
 - [`.github/agents-md-integrity/README.md`](.github/agents-md-integrity/README.md) — the checker + its knobs.
-- [`.github/bump-callers/README.md`](.github/bump-callers/README.md) — the shared bumper + the two fleets.
+- [`.github/bump-callers/README.md`](.github/bump-callers/README.md) — the shared bumper + its fleets.

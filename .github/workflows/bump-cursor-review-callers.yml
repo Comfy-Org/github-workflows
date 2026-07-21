@@ -16,8 +16,20 @@ name: Bump cursor-review callers
 # their names must never appear in this file or its logs. The list lives in the
 # repo-level Actions variable `CURSOR_REVIEW_CALLERS` (config, not a credential —
 # a variable, not a secret, since secrets are write-only via the API) as a JSON
-# array of {"repo","file","label"} objects. Every repo name is `::add-mask::`ed
-# out of the (public) run logs before it is ever echoed.
+# array of {"repo","file","label","wire_bot"} objects. Every repo name is
+# `::add-mask::`ed out of the (public) run logs before it is ever echoed.
+#
+# A caller flagged `"wire_bot": true` also gets the cloud-code-bot review
+# identity wired in the same PR (BE-1814): the optional bot_app_id input +
+# BOT_APP_PRIVATE_KEY secret the reusable workflow gained in Story 1.1 (PR #13),
+# mapped to the creds those repos already hold (vars.APP_ID /
+# secrets.CLOUD_CODE_BOT_PRIVATE_KEY). Injection is idempotent — see
+# .github/cursor-review/wire-bot-identity.py — so an already-wired caller only
+# gets the SHA bump. Flag only callers with the creds provisioned; one without
+# them still degrades safely to github-actions[bot] (non-breaking, incremental
+# rollout) — flagging one anyway would just be misleading, not unsafe. This is
+# cursor-review-specific, so WIRE_BOT_SCRIPT is set only here, never in
+# bump-agents-md-callers.yml.
 #
 # Update flow — adding/removing a caller needs NO public commit:
 #   gh variable set CURSOR_REVIEW_CALLERS --repo Comfy-Org/github-workflows \
@@ -32,6 +44,9 @@ on:
     branches: [main]
     paths:
       - .github/workflows/cursor-review.yml
+
+permissions:
+  contents: read
 
 # Serialize runs of this fleet. The bumper now pushes to a STABLE branch
 # (ci/bump-cursor-review) shared across runs, so two overlapping runs (a rapid
@@ -68,8 +83,12 @@ jobs:
           VAR_NAME: CURSOR_REVIEW_CALLERS
           TAG: cursor-review
           WORKFLOW_FILE: cursor-review.yml
-          # JSON array of {"repo","file","label"} — see the header comment for the
-          # update flow. Kept in a variable (not the file) so private caller names
-          # never land in this public repo or its logs.
+          # JSON array of {"repo","file","label","wire_bot"} — see the header
+          # comment for the update flow. Kept in a variable (not the file) so
+          # private caller names never land in this public repo or its logs.
           CALLERS_JSON: ${{ vars.CURSOR_REVIEW_CALLERS }}
+          # Only this fleet's callers ever carry `wire_bot` (BE-1814) — the
+          # agents-md-integrity entrypoint never sets this, so bump-callers.sh
+          # skips wiring there even if its variable somehow set the flag.
+          WIRE_BOT_SCRIPT: ${{ github.workspace }}/.github/cursor-review/wire-bot-identity.py
         run: bash .github/bump-callers/bump-callers.sh

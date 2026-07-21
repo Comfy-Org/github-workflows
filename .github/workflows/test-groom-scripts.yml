@@ -1,0 +1,39 @@
+name: Test groom scripts
+
+# Runs the unit tests for the groom dedup/rejection ledger (ledger.py). The
+# ledger is the durable memory that stops the stateless groom CI run from
+# re-filing already-filed or human-rejected findings every run, so a regression
+# here would silently re-open the spam it exists to prevent — cheap to guard
+# with a unit run on change.
+
+on:
+  pull_request:
+    paths:
+      - '.github/groom/**'
+      - '.github/workflows/test-groom-scripts.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/groom/**'
+      - '.github/workflows/test-groom-scripts.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: unittest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Run groom ledger unit tests
+        run: python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
