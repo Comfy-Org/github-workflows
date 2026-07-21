@@ -38,6 +38,11 @@ on:
     branches: [main]
     paths:
       - .github/workflows/pr-size.yml
+      # The counting logic consumers actually run lives here, built from the
+      # `workflows_ref` SHA a caller pins (see pr-size.yml's header) — a
+      # behavior change here needs the same caller bump as a workflow-file
+      # change, or pinned callers silently drift onto stale tool behavior.
+      - scripts/check-pr-size/**
 
 permissions:
   contents: read

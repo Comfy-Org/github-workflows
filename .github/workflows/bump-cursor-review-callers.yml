@@ -6,10 +6,11 @@ name: Bump cursor-review callers
 #
 # This is a thin entrypoint over the shared bumper at
 # .github/bump-callers/bump-callers.sh — the same script drives the
-# agents-md-integrity caller fleet (bump-agents-md-callers.yml). Keeping ONE
-# implementation is deliberate: a forked copy is how other shared machinery in
-# the org has drifted. The two entrypoints differ only in their path-filter
-# trigger and the three parameters passed below.
+# agents-md-integrity and pr-size caller fleets (bump-agents-md-callers.yml,
+# bump-pr-size-callers.yml). Keeping ONE implementation is deliberate: a forked
+# copy is how other shared machinery in the org has drifted. The entrypoints
+# differ only in their path-filter trigger and the three parameters passed
+# below.
 #
 # The caller list is NOT hardcoded here. This repo is PUBLIC (workflow file and
 # Actions run logs are both publicly viewable), and most callers are private, so
