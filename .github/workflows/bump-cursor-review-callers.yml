@@ -4,14 +4,39 @@ name: Bump cursor-review callers
 # that pins a caller against it. PRs are opened by Cloud Code Bot so they are
 # easy to filter and merge.
 #
-# Callers flagged `wire_bot` (4th field) also get the cloud-code-bot review
+# This is a thin entrypoint over the shared bumper at
+# .github/bump-callers/bump-callers.sh — the same script drives the
+# agents-md-integrity caller fleet (bump-agents-md-callers.yml). Keeping ONE
+# implementation is deliberate: a forked copy is how other shared machinery in
+# the org has drifted. The two entrypoints differ only in their path-filter
+# trigger and the three parameters passed below.
+#
+# The caller list is NOT hardcoded here. This repo is PUBLIC (workflow file and
+# Actions run logs are both publicly viewable), and most callers are private, so
+# their names must never appear in this file or its logs. The list lives in the
+# repo-level Actions variable `CURSOR_REVIEW_CALLERS` (config, not a credential —
+# a variable, not a secret, since secrets are write-only via the API) as a JSON
+# array of {"repo","file","label","wire_bot"} objects. Every repo name is
+# `::add-mask::`ed out of the (public) run logs before it is ever echoed.
+#
+# A caller flagged `"wire_bot": true` also gets the cloud-code-bot review
 # identity wired in the same PR (BE-1814): the optional bot_app_id input +
 # BOT_APP_PRIVATE_KEY secret the reusable workflow gained in Story 1.1 (PR #13),
 # mapped to the creds those repos already hold (vars.APP_ID /
 # secrets.CLOUD_CODE_BOT_PRIVATE_KEY). Injection is idempotent — see
 # .github/cursor-review/wire-bot-identity.py — so an already-wired caller only
-# gets the SHA bump. Flag ONLY repos that have the creds provisioned; a repo
-# without them stays github-actions[bot] (non-breaking, incremental rollout).
+# gets the SHA bump. Flag only callers with the creds provisioned; one without
+# them still degrades safely to github-actions[bot] (non-breaking, incremental
+# rollout) — flagging one anyway would just be misleading, not unsafe. This is
+# cursor-review-specific, so WIRE_BOT_SCRIPT is set only here, never in
+# bump-agents-md-callers.yml.
+#
+# Update flow — adding/removing a caller needs NO public commit:
+#   gh variable set CURSOR_REVIEW_CALLERS --repo Comfy-Org/github-workflows \
+#     --body "$(jq -c . callers.json)"
+# Keep the canonical callers.json in a PRIVATE infra/ops repo so variable edits
+# have a reviewed source of truth; the org audit log records each edit. (The
+# specific home repo is intentionally not named here — this file is public.)
 
 on:
   workflow_dispatch: {}   # allow on-demand runs (e.g. to re-bump callers)
@@ -20,15 +45,23 @@ on:
     paths:
       - .github/workflows/cursor-review.yml
 
+# Serialize runs of this fleet. The bumper now pushes to a STABLE branch
+# (ci/bump-cursor-review) shared across runs, so two overlapping runs (a rapid
+# second main push, or a push racing a manual re-run) would force-reset that
+# branch and race the PR update — an older run finishing last could leave the
+# committed diff pinned to a stale SHA. cancel-in-progress: false lets the
+# running bump finish; GitHub keeps only the newest pending run, so the latest
+# SHA always wins (BE-3882).
+concurrency:
+  group: bump-cursor-review-callers
+  cancel-in-progress: false
+
 jobs:
   bump:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        # Needed for the wire-bot-identity.py helper the bump step pipes callers
-        # through. persist-credentials:false — the bump uses the App token via
-        # GH_TOKEN, not the checkout's git credentials.
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@v6
         with:
           persist-credentials: false
 
@@ -44,162 +77,15 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
           NEW_SHA: ${{ github.sha }}
-        run: |
-          # NOTE: deliberately no `set -e`. Each caller is bumped independently
-          # in bump_one(); a failure there returns non-zero and is downgraded to
-          # a per-repo warning so one bad repo cannot abort the whole fan-out.
-          # We still fail the job at the end if any repo failed.
-          set -uo pipefail
-          SHORT="${NEW_SHA:0:7}"
-          BRANCH="ci/bump-cursor-review-${SHORT}"
-
-          # repo|file|label|wire_bot
-          #   label    — optional PR label; leave empty if the repo has none.
-          #   wire_bot — "1" to also wire the cloud-code-bot review identity in
-          #              the same PR (BE-1814): the optional bot_app_id input +
-          #              BOT_APP_PRIVATE_KEY secret from Story 1.1 (PR #13),
-          #              mapped to vars.APP_ID / secrets.CLOUD_CODE_BOT_PRIVATE_KEY.
-          #              Empty = SHA-bump only; the caller stays github-actions[bot].
-          #   ⚠ Flag ONLY repos that already hold the creds — a caller that
-          #   references a missing secret still degrades to github-actions[bot]
-          #   (non-breaking), but flagging a repo without the app is misleading.
-          #   Wired: cloud + mcp-server (already wired — injection is a no-op)
-          #   and comfy-inapp-agent + Comfy-iOS (their cursor-review-auto-label
-          #   callers already use the same app, so the creds are provisioned).
-          #   NOT: comfy-local-mcp / ComfySwiftSDK / comfy-infra / the public
-          #   OSS repos (no cloud-code-bot creds), and NOT swarmhost (its own
-          #   caller notes the app is not provisioned there yet).
-          CALLERS=(
-            "Comfy-Org/cloud|.github/workflows/ci-cursor-review.yml||1"
-            "Comfy-Org/comfy-cloud-mcp-server|.github/workflows/ci-cursor-review.yml||1"
-            "Comfy-Org/comfy-local-mcp|.github/workflows/ci-cursor-review.yml||"
-            "Comfy-Org/Comfy-iOS|.github/workflows/ci-cursor-review.yml||1"
-            "Comfy-Org/ComfySwiftSDK|.github/workflows/ci-cursor-review.yml||"
-            "Comfy-Org/comfy-inapp-agent|.github/workflows/ci-cursor-review.yml||1"
-            "Comfy-Org/swarmhost|.github/workflows/cursor-review.yml||"
-            "Comfy-Org/comfy-infra|.github/workflows/ci-cursor-review.yml||"
-            "Comfy-Org/ComfyUI_frontend|.github/workflows/pr-cursor-review.yaml||"
-            "Comfy-Org/Comfy-Desktop|.github/workflows/ci-cursor-review.yml|ci|"
-            "Comfy-Org/ComfyUI|.github/workflows/ci-cursor-review.yml|Core|"
-          )
-
-          # Bump a single caller repo. Every external call is guarded, so a bad
-          # repo returns non-zero here (caught by the loop) instead of killing
-          # the run. An expected skip (file missing / already pinned) is a
-          # successful `return 0`.
-          bump_one() {
-            local ENTRY="$1" REPO FILE LABEL WIRE_BOT FILE_ENC
-            REPO=$(cut -d'|' -f1 <<<"$ENTRY")
-            FILE=$(cut -d'|' -f2 <<<"$ENTRY")
-            LABEL=$(cut -d'|' -f3 <<<"$ENTRY")
-            WIRE_BOT=$(cut -d'|' -f4 <<<"$ENTRY")
-            FILE_ENC="${FILE//\//%2F}"
-
-            local DEFAULT_BRANCH
-            DEFAULT_BRANCH=$(gh api "repos/${REPO}" --jq '.default_branch') || {
-              echo "::warning::${REPO}: cannot read repo metadata — skipping"
-              return 1
-            }
-
-            # Fetch current file; a missing file is an expected skip (success).
-            local CURRENT
-            CURRENT=$(gh api "repos/${REPO}/contents/${FILE_ENC}?ref=${DEFAULT_BRANCH}" 2>/dev/null) || {
-              echo "::warning::${REPO}: ${FILE} not found — skipping"
-              return 0
-            }
-
-            local BLOB_SHA OLD_CONTENT
-            BLOB_SHA=$(jq -r '.sha' <<<"$CURRENT")
-            OLD_CONTENT=$(jq -r '.content' <<<"$CURRENT" | base64 -d)
-
-            # Replace every 40-char hex SHA and update the inline comment.
-            local NEW_CONTENT
-            NEW_CONTENT=$(sed -E "s/[0-9a-f]{40}/${NEW_SHA}/g; s|# github-workflows#[0-9]+|# github-workflows main (${SHORT})|g" <<<"$OLD_CONTENT")
-
-            # Wire the cloud-code-bot review identity for flagged callers
-            # (BE-1814). Idempotent — an already-wired caller is unchanged — so
-            # this only adds the bot_app_id input + BOT_APP_PRIVATE_KEY secret to
-            # callers that don't have them yet, alongside the SHA bump.
-            local WIRING_ADDED=""
-            if [[ -n "$WIRE_BOT" ]]; then
-              local WIRED
-              if WIRED=$(python3 "${GITHUB_WORKSPACE}/.github/cursor-review/wire-bot-identity.py" <<<"$NEW_CONTENT") && [[ -n "$WIRED" ]]; then
-                [[ "$WIRED" != "$NEW_CONTENT" ]] && WIRING_ADDED=1
-                NEW_CONTENT="$WIRED"
-              else
-                echo "::warning::${REPO}: bot-identity wiring failed — bumping SHA only"
-              fi
-            fi
-
-            # Nothing changed (already at this SHA and, if flagged, already
-            # wired) → no-op, skip. This content check replaces the old
-            # "grep for NEW_SHA" skip so a wiring-only change (SHA already
-            # current) still opens a PR instead of being short-circuited.
-            if [[ "$NEW_CONTENT" == "$OLD_CONTENT" ]]; then
-              echo "${REPO}: already at ${SHORT}$([[ -n "$WIRE_BOT" ]] && echo ' + wired') — skipping"
-              return 0
-            fi
-
-            # Create the branch from the default-branch tip (ignore 422 if it exists).
-            local MAIN_SHA
-            MAIN_SHA=$(gh api "repos/${REPO}/git/refs/heads/${DEFAULT_BRANCH}" --jq '.object.sha') || {
-              echo "::warning::${REPO}: cannot read ${DEFAULT_BRANCH} ref — skipping"
-              return 1
-            }
-            gh api --method POST "repos/${REPO}/git/refs" \
-              --field ref="refs/heads/${BRANCH}" \
-              --field sha="${MAIN_SHA}" 2>/dev/null || true
-
-            # Commit the updated file onto the branch. `$(...)` capture above
-            # (base64 -d, then sed) strips the file's trailing newline, so
-            # printf '%s\n' restores exactly one — otherwise the committed
-            # caller loses its EOF newline and trips the receiver repo's
-            # formatter (oxfmt/prettier both require a trailing newline).
-            local ENCODED
-            ENCODED=$(printf '%s\n' "$NEW_CONTENT" | base64 | tr -d '\n')
-            gh api --method PUT "repos/${REPO}/contents/${FILE_ENC}" \
-              --field message="ci: bump cursor-review to github-workflows@${SHORT}" \
-              --field content="${ENCODED}" \
-              --field sha="${BLOB_SHA}" \
-              --field branch="${BRANCH}" \
-              > /dev/null || {
-              echo "::warning::${REPO}: commit to ${BRANCH} failed — skipping"
-              return 1
-            }
-
-            local LABEL_ARGS=()
-            [[ -n "$LABEL" ]] && LABEL_ARGS=(--label "$LABEL")
-
-            # Note the identity wiring in the PR body when it was actually added
-            # (skipped for callers already wired — those get a pure SHA bump).
-            local BODY="Automatic SHA bump — \`cursor-review.yml\` was updated in \`Comfy-Org/github-workflows\` at [\`${SHORT}\`](https://github.com/Comfy-Org/github-workflows/commit/${NEW_SHA})."
-            # NB: keep GitHub-Actions expression syntax out of this run block —
-            # Actions interpolates those at parse time. Describe in prose instead.
-            [[ -n "$WIRING_ADDED" ]] && BODY="${BODY} Also wires the cloud-code-bot review identity (\`bot_app_id\` → \`vars.APP_ID\`, plus the \`BOT_APP_PRIVATE_KEY\` secret) so the review posts under \`cloud-code-bot[bot]\` instead of \`github-actions[bot]\` — BE-1814."
-            BODY="${BODY} _Opened by the \`bump-cursor-review-callers\` workflow._"
-
-            # Open the PR (a pre-existing PR for this branch is not an error).
-            if gh pr create \
-              --repo "${REPO}" \
-              --head "${BRANCH}" \
-              --base "${DEFAULT_BRANCH}" \
-              --title "ci: bump cursor-review to github-workflows@${SHORT}" \
-              --body "$BODY" \
-              "${LABEL_ARGS[@]}" 2>/dev/null; then
-              echo "${REPO}: PR opened"
-            else
-              echo "::warning::${REPO}: PR may already exist for ${BRANCH}"
-            fi
-            return 0
-          }
-
-          FAILED=()
-          for ENTRY in "${CALLERS[@]}"; do
-            bump_one "$ENTRY" || FAILED+=("${ENTRY%%|*}")
-          done
-
-          if (( ${#FAILED[@]} )); then
-            printf '::error::bump failed for %d repo(s): %s\n' "${#FAILED[@]}" "${FAILED[*]}"
-            exit 1
-          fi
-          echo "cursor-review bump complete for all callers."
+          VAR_NAME: CURSOR_REVIEW_CALLERS
+          TAG: cursor-review
+          WORKFLOW_FILE: cursor-review.yml
+          # JSON array of {"repo","file","label","wire_bot"} — see the header
+          # comment for the update flow. Kept in a variable (not the file) so
+          # private caller names never land in this public repo or its logs.
+          CALLERS_JSON: ${{ vars.CURSOR_REVIEW_CALLERS }}
+          # Only this fleet's callers ever carry `wire_bot` (BE-1814) — the
+          # agents-md-integrity entrypoint never sets this, so bump-callers.sh
+          # skips wiring there even if its variable somehow set the flag.
+          WIRE_BOT_SCRIPT: ${{ github.workspace }}/.github/cursor-review/wire-bot-identity.py
+        run: bash .github/bump-callers/bump-callers.sh

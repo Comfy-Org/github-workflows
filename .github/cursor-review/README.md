@@ -56,8 +56,8 @@ skipped if no Slack token is configured).
 
 | Lab | Model (Cursor catalog) |
 |---|---|
-| OpenAI | `gpt-5.3-codex-xhigh` |
-| Anthropic | `claude-opus-4-8-thinking-xhigh` |
+| OpenAI | `gpt-5.6-sol-max` |
+| Anthropic | `claude-opus-4-8-thinking-max` |
 | Google | `gemini-3.1-pro` |
 | Moonshot | `kimi-k2.7-code` |
 
@@ -190,7 +190,7 @@ descriptions live in the [workflow header](../workflows/cursor-review.yml).
 
 | Input | Default | What it does |
 |---|---|---|
-| `judge_model` | `claude-opus-4-8-thinking-xhigh` | Model that consolidates panel findings. |
+| `judge_model` | `claude-opus-4-8-thinking-max` | Model that consolidates panel findings. |
 | `diff_size_cap` | `5000` | Max changed lines (after excludes); larger PRs are skipped. |
 | `review_label` | `cursor-review` | Label whose addition triggers the review. |
 | `diff_excludes` | lockfiles, `node_modules`, `dist`, `vendor`, minified/generated files | Pathspecs excluded from both the size count and the reviewed diff. |
