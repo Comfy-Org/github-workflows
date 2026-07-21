@@ -208,9 +208,11 @@ func contentGenerated(path, base, head string) bool {
 	}
 	// Not in the working tree (e.g. deleted): read the head/base blob so a
 	// shrinking regen of a generated file is still classified as generated.
+	// Capped at maxScanBytes just like the working-tree read above, so a
+	// deleted path pointing at an oversized blob can't balloon job memory.
 	for _, ref := range []string{head, base} {
-		if out, err := runGit("show", ref+":"+path); err == nil {
-			return IsGeneratedContent([]byte(out))
+		if data, err := runGitCapped(maxScanBytes, "show", ref+":"+path); err == nil {
+			return IsGeneratedContent(data)
 		}
 	}
 	return false
@@ -306,6 +308,41 @@ func runGit(args ...string) (string, error) {
 		return "", err
 	}
 	return string(out), nil
+}
+
+// runGitCapped runs git and reads at most maxBytes of its stdout, killing the
+// process rather than blocking on Wait() if it had more to write. Used for
+// reads of ref-addressed blobs (e.g. `git show <ref>:<path>`) whose size we
+// don't control, so a single oversized blob can't spike job memory the way an
+// unbounded cmd.Output() would.
+func runGitCapped(maxBytes int64, args ...string) ([]byte, error) {
+	cmd := exec.Command("git", args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	data, readErr := io.ReadAll(io.LimitReader(stdout, maxBytes))
+	if readErr != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return nil, readErr
+	}
+	// Drain-probe for leftover output beyond the cap; if the process still has
+	// more to write, kill it instead of letting Wait() block on a full pipe.
+	extra := make([]byte, 1)
+	n, _ := stdout.Read(extra)
+	if n > 0 {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return data, nil
+	}
+	if err := cmd.Wait(); err != nil {
+		return nil, err
+	}
+	return data, nil
 }
 
 func envInt(key string, def int) int {
