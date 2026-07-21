@@ -116,10 +116,10 @@ bump_repo() {
 
   # Resolve the default-branch tip ONCE, up front. Every Pass-1 fetch is pinned
   # to this immutable SHA (not the mutable `?ref=<branch>`), and Pass 2 uses the
-  # same SHA as both the tree's `base_tree` and the commit's parent — so the
-  # whole bump is built against one consistent snapshot of the caller repo,
-  # never a moving tip. Reading the tip is a GET (no branch churn), so it is safe
-  # before the all-skip early return.
+  # same commit as the new commit's parent AND (via its resolved tree) as the
+  # tree's `base_tree` — so the whole bump is built against one consistent
+  # snapshot of the caller repo, never a moving tip. Reading the tip is a GET (no
+  # branch churn), so it is safe before the all-skip early return.
   local MAIN_SHA
   MAIN_SHA=$(gh api "repos/${REPO}/git/refs/heads/${DEFAULT_BRANCH}" --jq '.object.sha') || {
     echo "::warning::${REPO}: cannot read ${DEFAULT_BRANCH} ref — skipping"
@@ -226,10 +226,12 @@ bump_repo() {
   local -a TREE_ENTRIES=()
   local i BLOB_NEW
   for (( i = 0; i < ${#PEND_FILE[@]}; i++ )); do
-    BLOB_NEW=$(gh api --method POST "repos/${REPO}/git/blobs" \
-      --field content="${PEND_CONTENT[$i]}" \
-      --field encoding=base64 \
-      --jq '.sha') || {
+    # Pass the base64 body on stdin (like the tree/commit calls below), not via
+    # --field on argv — this keeps the content off /proc/<pid>/cmdline and out of
+    # the ARG_MAX bound, and matches the surrounding Git Data API calls.
+    BLOB_NEW=$(jq -n --arg content "${PEND_CONTENT[$i]}" \
+        '{content: $content, encoding: "base64"}' \
+      | gh api --method POST "repos/${REPO}/git/blobs" --input - --jq '.sha') || {
       echo "::warning::${REPO}: blob create for ${PEND_FILE[$i]} failed — skipping"
       return 1
     }
@@ -241,9 +243,19 @@ bump_repo() {
   done
 
   # 2. Build ONE tree off the default-branch tip carrying all staged blobs.
+  #    `base_tree` must be a TREE SHA, not a commit SHA — the Create-a-tree API
+  #    rejects a commit SHA (422), and a tree built with no valid `base_tree`
+  #    would carry ONLY the bumped files, so merging its PR would delete every
+  #    other path in the caller repo. `MAIN_SHA` is the tip *commit* SHA (still
+  #    correct as the commit's parent below), so resolve its tree first.
+  local MAIN_TREE_SHA
+  MAIN_TREE_SHA=$(gh api "repos/${REPO}/git/commits/${MAIN_SHA}" --jq '.tree.sha') || {
+    echo "::warning::${REPO}: cannot resolve base tree — skipping"
+    return 1
+  }
   local TREE_SHA
   TREE_SHA=$(printf '%s\n' "${TREE_ENTRIES[@]}" \
-      | jq -s --arg base "$MAIN_SHA" '{base_tree: $base, tree: .}' \
+      | jq -s --arg base "$MAIN_TREE_SHA" '{base_tree: $base, tree: .}' \
       | gh api --method POST "repos/${REPO}/git/trees" --input - --jq '.sha') || {
     echo "::warning::${REPO}: tree create failed — skipping"
     return 1

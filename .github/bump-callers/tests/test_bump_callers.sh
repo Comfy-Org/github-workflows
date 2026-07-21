@@ -103,6 +103,9 @@ done
 # single repo, so branch_files reflects exactly that repo's PR.)
 case "$method:$path" in
   POST:*/git/blobs*)    # blob create — capture the new file content, count it
+    # The script now sends the base64 body on stdin (--input -), so read the
+    # content out of the JSON body rather than the old --field content= on argv.
+    content=$(jq -r '.content' <(cat))
     n=$(( $(cat "$STUB_PUT_DIR/count" 2>/dev/null || echo 0) + 1 ))
     echo "$n" > "$STUB_PUT_DIR/count"
     printf '%s' "$content" | { base64 -d 2>/dev/null || base64 -D; } > "$STUB_PUT_DIR/put.$n.txt"
@@ -110,7 +113,13 @@ case "$method:$path" in
     echo "blobsha${n}"
     exit 0;;
   POST:*/git/trees*)    # tree create — the stdin body lists every bumped path
-    jq -r '.tree[].path' > "$STUB_PUT_DIR/branch_files"
+    body=$(cat)
+    jq -r '.tree[].path' <<<"$body" > "$STUB_PUT_DIR/branch_files"
+    # Record base_tree so the suite can assert it is the TIP's TREE sha (resolved
+    # via GET git/commits below), NOT the tip COMMIT sha — the real Create-a-tree
+    # API rejects a commit sha, and a missing/invalid base_tree drops every other
+    # file in the caller repo.
+    jq -r '.base_tree // ""' <<<"$body" > "$STUB_PUT_DIR/branch_base_tree"
     echo "treesha1"
     exit 0;;
   POST:*/git/commits*)  # commit create — drain the body, return a commit sha
@@ -137,6 +146,11 @@ if [[ "$path" == *"/contents/"* ]]; then
   fi
   b64=$(base64 < "$STUB_CONTENT_FILE" | tr -d '\n')
   printf '{"sha":"blobsha123","content":"%s"}' "$b64"
+elif [[ "$path" == *"/git/commits/"* ]]; then
+  # Resolve the tip commit's TREE sha (distinct from the commit sha) — the script
+  # must pass THIS as base_tree, not the commit sha it was parented on. The stub
+  # discards --jq (see arg loop), so emit the post-`.tree.sha` value directly.
+  echo "maintreesha1"
 elif [[ "$path" == *"/git/refs/heads/"* ]]; then
   echo "1234567890abcdef1234567890abcdef12345678"
 else
@@ -189,6 +203,12 @@ check "stale pin comment removed"             "! grep -qF '# github-workflows#27
 # exactly one trailing newline (#23): last byte is \n (tail -c1 strips to empty),
 # and the last two bytes are not both \n (tail -c2 keeps a non-newline byte).
 check "single trailing newline"               "[[ -z \"\$(tail -c1 \"$PUT\")\" && -n \"\$(tail -c2 \"$PUT\")\" ]]"
+# base_tree must be the tip's TREE sha (resolved via GET git/commits), NOT the
+# tip COMMIT sha — a commit sha 422s the real Create-a-tree API, and a bad
+# base_tree drops every other file in the caller repo (BE-3902).
+BBT="${STUB_PUT_DIR}/branch_base_tree"
+check "base_tree is the resolved tree sha"    "[[ \"\$(cat \"$BBT\")\" == 'maintreesha1' ]]"
+check "base_tree is NOT the commit sha"       "! grep -qF '1234567890abcdef1234567890abcdef12345678' \"$BBT\""
 # No open PR for the stable branch → the create path runs, not the edit path.
 check "opened a new PR (pr create called)"    "grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
 check "did not edit (no open PR existed)"     "! grep -q '^pr-edit' \"\$STUB_PUT_DIR/pr.log\""
