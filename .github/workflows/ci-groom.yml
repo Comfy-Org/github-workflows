@@ -38,13 +38,15 @@ on:
         type: boolean
         default: false
 
-# Serialize runs per target repo — the dedup ledger reads live issue state and
-# THEN files, so two overlapping runs could both classify a signature as new and
-# file duplicates (a TOCTOU race). Belt to the reusable's own `concurrency:`
-# suspenders; never cancel a half-filed run.
-concurrency:
-  group: groom-${{ github.repository }}
-  cancel-in-progress: false
+# NOTE: intentionally NO caller-level `concurrency:` here. The reusable groom.yml
+# already declares `concurrency: groom-${{ github.repository }}` (cancel-in-
+# progress: false), which serializes runs per target repo across ALL callers —
+# that is the real TOCTOU guard for the read-then-file dedup ledger. Duplicating
+# the identical group in this caller would DEADLOCK the run: the caller holds the
+# group while its reusable `uses:` job waits to acquire the SAME group with
+# cancel-in-progress:false, so the reusable never gets the slot and the run hangs
+# until timeout (GitHub Actions caller/callee same-group deadlock). Serialization
+# lives in the reusable; the caller deliberately stays out of the group.
 
 jobs:
   groom:
@@ -67,6 +69,14 @@ jobs:
       # Match the volume-gate window to this caller's ~weekly cron, so a week
       # with nothing merged skips the (expensive) audit.
       cadence: 7
+      # A dry-run is the Phase 3 parity spot-check, so it must ALWAYS exercise the
+      # full audit + dedup — bypass the volume gate when dispatched with
+      # dry_run:true. Otherwise a quiet week (nothing merged in `cadence` days)
+      # would gate the dry-run to nothing and print no parity summary, defeating
+      # the dispatch's whole purpose. Live runs (the weekly schedule, where inputs
+      # is null -> '' != 'true' -> true, or a dry_run:false dispatch) keep the gate
+      # on so a quiescent repo still skips the spend.
+      volume_gate: ${{ github.event.inputs.dry_run != 'true' }}
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       BOT_APP_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
