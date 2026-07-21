@@ -45,6 +45,9 @@ on:
     paths:
       - .github/workflows/cursor-review.yml
 
+permissions:
+  contents: read
+
 # Serialize runs of this fleet. The bumper now pushes to a STABLE branch
 # (ci/bump-cursor-review) shared across runs, so two overlapping runs (a rapid
 # second main push, or a push racing a manual re-run) would force-reset that

@@ -69,8 +69,9 @@ tests — run the matching command above for whatever you touched.
 - `assign-reviewers.yml` — expertise-aware, load-balanced reviewer requests.
 - `assign-prs-to-author.yml` — assigns unassigned open PRs to their author.
 - `detect-unreviewed-merge.yml` — SOC 2: flags PRs merged without approval.
-- `bump-cursor-review-callers.yml` / `bump-agents-md-callers.yml` — thin
-  entrypoints over `bump-callers.sh` that fan SHA bumps out to consumers.
+- `bump-cursor-review-callers.yml` / `bump-agents-md-callers.yml` /
+  `bump-pr-size-callers.yml` — thin entrypoints over `bump-callers.sh` that fan
+  SHA bumps out to consumers.
 
 ## Conventions & gotchas
 
@@ -88,10 +89,11 @@ tests — run the matching command above for whatever you touched.
   self-enrollment callers (`ci-cursor-review.yml`, `ci-detect-unreviewed-merge.yml`)
   deliberately pin a merged-main SHA instead of a local `./` path for the same
   reason — do not "simplify" them to a local path.
-- **One bumper, not two.** `bump-callers.sh` backs both fleets; the two
+- **One bumper, not several.** `bump-callers.sh` backs every fleet; the
   `bump-*-callers.yml` files are thin per-fleet wrappers (they stay separate so a
-  `cursor-review.yml` change doesn't spuriously bump agents-md callers). Do not
-  fork the script — a forked copy is how other shared org machinery has drifted.
+  `cursor-review.yml` change doesn't spuriously bump agents-md or pr-size
+  callers). Do not fork the script — a forked copy is how other shared org
+  machinery has drifted.
 - **New reusable workflow?** `on: workflow_call` + a header comment documenting
   inputs/secrets/triggers + a caller-pattern example, then update the README
   table (README "Adding a new reusable workflow"). Move the floating major tag
@@ -113,4 +115,4 @@ tests — run the matching command above for whatever you touched.
 - [`README.md`](README.md) — public catalog, SHA-pin usage, versioning.
 - [`.github/cursor-review/README.md`](.github/cursor-review/README.md) — review panel internals + adoption.
 - [`.github/agents-md-integrity/README.md`](.github/agents-md-integrity/README.md) — the checker + its knobs.
-- [`.github/bump-callers/README.md`](.github/bump-callers/README.md) — the shared bumper + the two fleets.
+- [`.github/bump-callers/README.md`](.github/bump-callers/README.md) — the shared bumper + its fleets.
