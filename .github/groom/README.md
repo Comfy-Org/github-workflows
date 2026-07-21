@@ -36,9 +36,10 @@ rather than buried in a runner script.
   `REJECT` (premature / overstated / not worth it).
 - **`security: true`** marks any auth/permission/security-adjacent finding —
   those are filed as investigations, **never** auto-implemented.
-- **`signature`** is a stable dedup key (`<repo-basename>:<scope>:<slug>`) that
-  must stay identical across re-runs of the same finding, so a consumer never
-  re-files a finding it has already seen.
+- **`signature`** is a stable dedup key (`<repo-basename>:<scope>:<slug>`) whose
+  `<slug>` is derived **deterministically** from the finding's core subject, so it
+  stays identical across re-runs of the same finding and a consumer never re-files
+  a finding it has already seen.
 
 ## How a consumer uses these briefs
 
@@ -68,7 +69,15 @@ single-brace JSON in the briefs). A consumer replaces every occurrence:
 reads it); `{{VERIFIER_OUT}}` and `{{REPO_BASENAME}}` appear only in the
 verifier.
 
+Substituted values are trusted, runner-controlled strings (repo slugs, package
+paths, output file paths). They land verbatim inside quoted JSON in the briefs, so
+a consumer that could ever pass a value containing a quote, backslash, or newline
+must JSON-escape it first (or keep it to a safe charset).
+
 Because the placeholders sit exactly where the runner's inline values used to be,
-a template + substitution reproduces the previous inline prompt **byte-for-byte**
-— which is how the studio daemon can adopt the shared briefs with no change to
-what groom finds (see the parity note in the initiating PR).
+a template + substitution reproduces the previous inline prompt with no change to
+**what groom finds** — which is how the studio daemon can adopt the shared briefs
+(see the parity note in the initiating PR). The briefs additionally fold in the
+review panel's safety rails — the `security` flag as an explicit placeholder, and a
+read-only + untrusted-input boundary on both phases — which harden behavior without
+changing the findings themselves.
