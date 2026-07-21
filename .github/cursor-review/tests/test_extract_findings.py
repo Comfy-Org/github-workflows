@@ -101,6 +101,44 @@ class ParseJsonFindingsTest(unittest.TestCase):
     def test_object_without_findings_key(self):
         self.assertIsNone(_findings('{"summary": "looks good", "count": 0}'))
 
+    def test_scalar_list_is_not_findings(self):
+        # A list of scalars is valid JSON but never a findings payload — it
+        # must not be mistaken for one (the PR-146 jq-builtins prose shape).
+        self.assertIsNone(_findings('["contains", "startswith", "ascii_downcase"]'))
+
+    def test_verification_prose_with_inline_object_then_array_be3160(self):
+        # PR-145 shape: verification prose that quotes a single finding OBJECT
+        # inline, THEN the real array. The old first-parseable-region logic
+        # returned the un-coercible inline object → spurious parse_error.
+        raw = (
+            "Verification changes my adjudication significantly. Three panel "
+            'findings turn out to be misreads. For instance {"file": "b.go", '
+            '"line": 3, "severity": "low"} does not hold on inspection.\n\n'
+            "Final consolidated findings:\n" + json.dumps(FINDINGS)
+        )
+        self.assertEqual(_findings(raw), FINDINGS)
+
+    def test_tool_narration_prose_with_scalar_list_then_array_be3160(self):
+        # PR-146 shape: tool-attempt narration containing an inline scalar list,
+        # THEN the real array. The old logic returned the scalar list as bogus
+        # findings; extraction must recover the genuine array instead.
+        raw = (
+            "Shell execution isn't available here. Let me confirm the jq builtin "
+            'set via documentation. The relevant keys are ["contains", '
+            '"startswith", "ascii_downcase"].\n\n' + json.dumps(FINDINGS)
+        )
+        self.assertEqual(_findings(raw), FINDINGS)
+
+    def test_last_findings_array_wins(self):
+        # When multiple findings-shaped arrays appear, the LAST (the real answer
+        # after prose) wins over an earlier draft the judge second-guessed.
+        earlier = [{"file": "old.go", "line": 1, "side": "RIGHT", "body": "superseded"}]
+        raw = (
+            "My first pass produced:\n" + json.dumps(earlier) + "\n\nOn "
+            "reflection that was wrong. The final answer is:\n" + json.dumps(FINDINGS)
+        )
+        self.assertEqual(_findings(raw), FINDINGS)
+
 
 class ClassifyRunErrorTest(unittest.TestCase):
     """Unit-cover the delisted-model / failed-invocation classifier."""
@@ -187,6 +225,17 @@ class MainEndToEndTest(unittest.TestCase):
 
     def test_prose_wrapped_parses_ok(self):
         raw = "After review, my verdict is:\n\n" + json.dumps(FINDINGS)
+        record = self._run(raw)
+        self.assertEqual(record["status"], "ok")
+        self.assertEqual(record["findings"], FINDINGS)
+
+    def test_verification_prose_then_array_is_ok_be3160(self):
+        # Acceptance #1: a judge output containing valid JSON after prose must
+        # consolidate (status ok), not fail as parse_error.
+        raw = (
+            "Verification changes my adjudication significantly. Three panel "
+            "findings turn out to be misreads.\n\n" + json.dumps(FINDINGS)
+        )
         record = self._run(raw)
         self.assertEqual(record["status"], "ok")
         self.assertEqual(record["findings"], FINDINGS)
