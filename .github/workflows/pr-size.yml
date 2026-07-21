@@ -181,6 +181,17 @@ jobs:
           cache: false
 
       - name: Build check-pr-size
+        env:
+          # The tool is checked out INTO the consumer's working tree (_pr_size_tool/),
+          # so if that consumer is a go.work monorepo (e.g. Comfy-Org/cloud), a plain
+          # `go build` walks up, finds the consumer's go.work, and fails with
+          # "current directory is contained in a module that is not one of the
+          # workspace modules". GOWORK=off ignores any ambient workspace and builds
+          # the tool as its own standalone module (it has its own go.mod).
+          # Quote "off": a bare `off` is a YAML boolean, which Actions stringifies
+          # to "false" in the env — and `GOWORK=false` (neither off, empty, nor an
+          # absolute path) makes `go build` abort. The quotes keep it the literal off.
+          GOWORK: "off"
         run: |
           # Drop anything the PR checkout could have pre-seeded under the tool
           # path (such files are untracked in the tool repo, which checkout
@@ -258,14 +269,21 @@ jobs:
       - name: Mint bot token
         if: steps.dl.outcome == 'success' && env.BOT_CONFIGURED == 'true'
         id: bot
+        # Best-effort: the size verdict lives in the pr-size job, and the report
+        # is always in that job's step summary. A consumer whose bot app lacks
+        # the requested scope (or has creds misconfigured) must degrade to
+        # status + summary, never get a red check from the comment path — so a
+        # failed mint is tolerated here rather than failing the job.
+        continue-on-error: true
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
         with:
           app-id: ${{ inputs.bot_app_id }}
           private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
-          # Scope the minted token to comment upserts only, not the app's full
-          # installation permissions (PR comments ride the issues API).
+          # Scope the token to exactly what the upsert uses: the sticky comment
+          # rides the issues comments API, so issues:write is the only permission
+          # required. Requesting more (e.g. pull-requests:write) makes the mint
+          # 422 on an installation not granted it, for no gain.
           permission-issues: write
-          permission-pull-requests: write
 
       - name: Upsert sticky size comment
         if: steps.bot.outcome == 'success'
@@ -299,5 +317,15 @@ jobs:
           fi
 
       - name: Note degraded mode
-        if: steps.dl.outcome == 'success' && steps.bot.outcome == 'skipped'
-        run: echo "bot_app_id/BOT_APP_PRIVATE_KEY not configured — no PR comment; the report is in the pr-size job's step summary."
+        # Covers every path where no comment is posted so the job never goes
+        # green silently: "download failed" (dl errored under continue-on-error,
+        # e.g. the size tool crashed before uploading the report), "creds absent"
+        # (bot step skipped) and "mint failed" (bot step errored). Whenever the
+        # report artifact exists it still lives in the pr-size job's step summary.
+        if: steps.dl.outcome != 'success' || steps.bot.outcome != 'success'
+        run: |
+          if [ "${{ steps.dl.outcome }}" != "success" ]; then
+            echo "No bot comment posted: the size report artifact could not be downloaded (the pr-size job likely failed before uploading it). Check the pr-size job logs."
+          else
+            echo "No bot comment posted (credentials absent, or the app token could not be minted for this repo). The full report is in the pr-size job's step summary."
+          fi
