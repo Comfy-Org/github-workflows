@@ -53,7 +53,7 @@ on:
           the panel.
         type: string
         required: false
-        default: claude-opus-4-8-thinking-xhigh
+        default: claude-opus-4-8-thinking-max
       diff_size_cap:
         description: >-
           Max changed lines (added + removed, after diff_excludes). PRs over
@@ -107,6 +107,16 @@ on:
         type: string
         required: false
         default: ''
+      run_without_label:
+        description: >-
+          Run on plain pull_request events (opened / reopened / ready_for_review
+          / synchronize) instead of requiring the trigger label — for repos with
+          no labeling automation. The fork skip, the skip-cursor-review label,
+          and the same-commit dedupe all still apply. Default false
+          (label-triggered, unchanged for existing callers).
+        type: boolean
+        required: false
+        default: false
     secrets:
       CURSOR_API_KEY:
         description: Cursor API key for cursor-agent (the panel + judge models bill through it).
@@ -149,6 +159,7 @@ jobs:
           GH_EVENT_ACTION: ${{ github.event.action }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           BASE_REPO: ${{ github.repository }}
+          RUN_WITHOUT_LABEL: ${{ inputs.run_without_label }}
         run: |
           # PRs from forks can't run this review. The pull_request event grants
           # fork PRs no access to secrets — so CURSOR_API_KEY is empty and every
@@ -168,6 +179,20 @@ jobs:
             echo "skip-cursor-review label present — skipping."
             echo "should_run=false" >> "$GITHUB_OUTPUT"
             exit 0
+          fi
+
+          # Label-free mode (run_without_label input): callers in repos with no
+          # labeling automation opt in to running on plain PR events. Sits
+          # BELOW the fork skip and skip-cursor-review checks — those still
+          # veto — and the same-commit dedupe below still prevents re-reviews.
+          if [ "$RUN_WITHOUT_LABEL" = "true" ]; then
+            case "$GH_EVENT_ACTION" in
+              opened|reopened|ready_for_review|synchronize)
+                echo "run_without_label mode — running on '$GH_EVENT_ACTION'."
+                echo "should_run=true" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+            esac
           fi
 
           # Only adding the trigger label fires the matrix. Removing it cancels
@@ -277,12 +302,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Pinned to the highest reasoning tier available for each lab. Gemini
-        # and Kimi only ship a single tier in Cursor's catalog; OpenAI Codex
-        # and Claude expose xhigh variants we use here.
+        # Pinned to each lab's newest highest-reasoning tier in Cursor's
+        # catalog (last checked 2026-07-14). OpenAI: GPT-5.6 Sol is the
+        # 5.6-family coding flagship (no 5.6 codex variant exists). Anthropic:
+        # Fable 5 tops the catalog but all Fable entries are marked NO ZDR in
+        # Cursor, and this panel reviews private-repo diffs, so it is excluded;
+        # Opus 4.8 thinking at its max tier is the top ZDR-eligible pick.
+        # Gemini (Pro line) and Kimi still ship a single reasoning tier each.
         model:
-          - gpt-5.3-codex-xhigh
-          - claude-opus-4-8-thinking-xhigh
+          - gpt-5.6-sol-max
+          - claude-opus-4-8-thinking-max
           - gemini-3.1-pro
           - kimi-k2.5
         review_type: [adversarial, edge-case]

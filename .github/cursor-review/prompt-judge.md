@@ -56,7 +56,7 @@ object with exactly:
 - "body": string — concise (1-3 sentences). Do NOT prefix the body with a
   severity word or emoji; the severity field drives the rendered badge. END
   with attribution like
-  `_Raised by 3 of 8 reviewers (gpt-5.3-codex-xhigh adversarial, claude-opus-4-8-thinking-xhigh edge-case, gemini-3.1-pro adversarial)._`
+  `_Raised by 3 of 8 reviewers (gpt-5.6-sol-max adversarial, claude-opus-4-8-thinking-max edge-case, gemini-3.1-pro adversarial)._`
 
 Order the array most-severe first. If no findings rise to the bar, return [].
 
