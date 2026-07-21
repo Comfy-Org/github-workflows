@@ -181,6 +181,14 @@ jobs:
           cache: false
 
       - name: Build check-pr-size
+        env:
+          # The tool is checked out into `_pr_size_tool/` UNDER the consumer
+          # repo's checkout, so `go build` discovers that repo's root `go.work`
+          # (if any) and refuses to build a module the workspace doesn't list:
+          # "current directory is contained in a module that is not one of the
+          # workspace modules listed in go.work". The tool is dependency-free
+          # (no go.sum), so disable workspace mode and build it standalone.
+          GOWORK: off
         run: |
           # Drop anything the PR checkout could have pre-seeded under the tool
           # path (such files are untracked in the tool repo, which checkout
