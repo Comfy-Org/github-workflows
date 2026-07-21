@@ -1,0 +1,61 @@
+name: Test agents-md-integrity script
+
+# Runs the unit tests for the AGENTS.md integrity checker plus a CLI smoke test
+# that exercises one passing and one failing repo fixture end-to-end. The
+# checker gates every consumer repo's CI, so a regression here silently breaks
+# their required status check — cheap to guard with a unit + smoke run on change.
+
+on:
+  pull_request:
+    paths:
+      - '.github/agents-md-integrity/**'
+      - '.github/workflows/test-agents-md-integrity.yml'
+      - '.github/workflows/agents-md-integrity.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/agents-md-integrity/**'
+      - '.github/workflows/test-agents-md-integrity.yml'
+      - '.github/workflows/agents-md-integrity.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: unittest + smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Run agents-md-integrity unit tests
+        run: python3 -m unittest discover -s .github/agents-md-integrity/tests -p 'test_*.py' -v
+
+      - name: Smoke test — a compliant repo passes
+        run: |
+          root="$(mktemp -d)"
+          printf 'thin agents file\n' > "$root/AGENTS.md"
+          printf '@AGENTS.md\n' > "$root/CLAUDE.md"
+          mkdir -p "$root/.github"
+          printf '* @comfy-org/backend\n' > "$root/.github/CODEOWNERS"
+          python3 .github/agents-md-integrity/check_agents_md.py --root "$root"
+
+      - name: Smoke test — a drifted repo fails
+        run: |
+          root="$(mktemp -d)"
+          python3 -c "open('$root/AGENTS.md','w').write(chr(10).join('l%d'%i for i in range(250)))"
+          printf 'divergent copy, no import\n' > "$root/CLAUDE.md"
+          printf 'legacy rules\n' > "$root/.cursorrules"
+          if python3 .github/agents-md-integrity/check_agents_md.py --root "$root"; then
+            echo "::error::checker passed a drifted repo — expected a non-zero exit"
+            exit 1
+          fi
+          echo "checker correctly failed the drifted repo"
