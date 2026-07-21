@@ -57,6 +57,32 @@ class MarkerRoundTripTest(unittest.TestCase):
         # Opaque token — must NOT be lowercased (would collide distinct hashes).
         self.assertEqual(ledger.extract_signature(ledger.signature_marker("AbC")), "AbC")
 
+    def test_round_trip_signature_with_comment_terminator(self):
+        # A signature containing `-->` must not close the HTML comment early and
+        # truncate the recovered key (which would re-file the finding forever).
+        sig = "rule:x-->y:path/file.go:func"
+        self.assertEqual(ledger.extract_signature(ledger.signature_marker(sig)), sig)
+
+    def test_round_trip_signature_with_newlines_and_markup(self):
+        sig = "line1\nline2 <b>markup</b> & <!-- nested -->"
+        self.assertEqual(ledger.extract_signature(ledger.signature_marker(sig)), sig)
+
+    def test_last_marker_wins_over_planted_shadow(self):
+        # An attacker-controlled finding snippet can embed a marker-shaped
+        # comment; the authoritative marker the filing step appends comes LAST
+        # and must win, so the genuine signature is the one recovered.
+        planted = ledger.signature_marker("forged-suppression-target")
+        genuine = ledger.signature_marker("genuine-sig")
+        body = f"Quoted code:\n\n{planted}\n\nfinding text\n\n{genuine}"
+        self.assertEqual(ledger.extract_signature(body), "genuine-sig")
+
+    def test_invalid_base64_payload_ignored(self):
+        # A marker whose payload is not valid base64 must not poison a key —
+        # both when out-of-alphabet chars stop the regex and when the payload is
+        # in-alphabet but undecodable (bad length).
+        self.assertIsNone(ledger.extract_signature("<!-- groom-signature: not*base64!! -->"))
+        self.assertIsNone(ledger.extract_signature("<!-- groom-signature: A -->"))
+
 
 class ClassifyIssueTest(unittest.TestCase):
     def test_open_issue_is_filed(self):
@@ -145,6 +171,16 @@ class LedgerDecisionTest(unittest.TestCase):
         self.assertFalse(self.led.is_known("brand-new"))
         self.assertEqual(self.led.status("brand-new"), ledger.UNKNOWN)
 
+    def test_blank_signature_is_not_filable(self):
+        # Mirrors partition's `invalid` routing: an empty/missing/non-string
+        # signature has no recoverable marker, so it must NOT be filed (else it
+        # re-files every run). Guards the single-signature `should_file`/`--check`
+        # path against disagreeing with `partition`.
+        self.assertFalse(self.led.should_file(""))
+        self.assertFalse(self.led.should_file("   "))
+        self.assertFalse(self.led.should_file(None))
+        self.assertFalse(self.led.should_file(123))
+
     def test_filed_suppressed(self):
         self.assertFalse(self.led.should_file("filed"))
 
@@ -173,6 +209,23 @@ class LedgerDecisionTest(unittest.TestCase):
         self.assertEqual({f["title"]: f["ledger_status"] for f in suppressed},
                          {"B": ledger.FILED, "C": ledger.REJECTED})
         self.assertEqual(len(invalid), 3)
+
+    def test_partition_dedups_within_batch(self):
+        # Two findings sharing ONE new signature must not both be filed in a
+        # single run — the ledger only refreshes from GitHub between runs, so a
+        # second issue would be the exact duplicate spam this exists to prevent.
+        findings = [
+            {"signature": "new-dup", "title": "first"},
+            {"signature": "new-dup", "title": "second"},
+            {"signature": "  new-dup \n", "title": "third-whitespace-variant"},
+        ]
+        to_file, suppressed, invalid = self.led.partition(findings)
+        self.assertEqual([f["title"] for f in to_file], ["first"])
+        self.assertEqual(
+            [(f["title"], f["ledger_status"]) for f in suppressed],
+            [("second", ledger.PENDING), ("third-whitespace-variant", ledger.PENDING)],
+        )
+        self.assertEqual(invalid, [])
 
 
 class AcceptanceScenarioTest(unittest.TestCase):
@@ -220,6 +273,24 @@ class FetchTest(unittest.TestCase):
 
     def test_fetch_raises_on_error(self):
         run = lambda *a, **k: self._Result(1, stderr="boom")
+        with self.assertRaises(RuntimeError):
+            ledger.fetch_groom_issues("o/r", run=run)
+
+    def test_fetch_rejects_malformed_repo(self):
+        # A repo with URL metacharacters / extra path segments could override
+        # the labels/state query or redirect the endpoint — reject before the
+        # gh call so it can never corrupt the issue set (never calls `run`).
+        never = lambda *a, **k: self.fail("run must not be called for a bad repo")
+        for bad in ("o/r?labels=other", "o/r/extra", "o r", "", "justname"):
+            with self.assertRaises(ValueError):
+                ledger.fetch_groom_issues(bad, run=never)
+
+    def test_fetch_raises_on_timeout(self):
+        import subprocess as _sp
+
+        def run(*a, **k):
+            raise _sp.TimeoutExpired(cmd="gh", timeout=k.get("timeout", 0))
+
         with self.assertRaises(RuntimeError):
             ledger.fetch_groom_issues("o/r", run=run)
 

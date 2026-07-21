@@ -48,6 +48,13 @@ issue for a `to_file` finding **must**:
 
 Skip either and the next run cannot recognize the issue and will re-file it.
 
+The dedup decision is a point-in-time snapshot of GitHub issue state read
+*before* filing, and issue creation happens in a later step. Two overlapping
+groom runs could therefore both classify the same signature as `unknown` and
+file duplicates (a TOCTOU race). The caller workflow (not yet written — epic
+BE-3870) **must serialize groom runs with a `concurrency:` group** so at most
+one run reads-then-files at a time.
+
 ### CLI (called right before the groomer files)
 
 ```bash

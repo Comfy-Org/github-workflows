@@ -48,6 +48,8 @@ re-file it.
 """
 
 import argparse
+import base64
+import binascii
 import json
 import re
 import subprocess
@@ -71,15 +73,34 @@ SUPERSEDED_LABEL = "groom-superseded"
 
 # The signature marker embedded in a filed issue's body. An HTML comment so it
 # renders invisibly, and a stable prefix so it round-trips through the API's raw
-# body. Kept deliberately simple; the signature itself is opaque.
+# body. The opaque signature is URL-safe-base64 encoded before embedding: the
+# raw signature could contain `-->` (which would close the comment early and
+# truncate the recovered key, re-filing the finding forever) or arbitrary
+# markdown/HTML (which would be injected into the public issue body). base64url
+# is a delimiter-safe, injection-proof alphabet — `[A-Za-z0-9_=-]` — that can
+# never contain `-->`, so the payload group is bounded to that alphabet. The
+# surrounding whitespace groups are POSSESSIVE (`\s*+`): with a plain `\s*` on
+# both sides of an empty-matchable payload, a body carrying the prefix followed
+# by a long whitespace run and no terminator backtracks in O(n^2) (the reported
+# ReDoS). Possessive quantifiers make the whitespace non-giving, so a
+# non-matching body fails in linear time. (Requires Python 3.11+; CI runs 3.12.)
 _MARKER_PREFIX = "groom-signature:"
-_MARKER_RE = re.compile(r"<!--\s*groom-signature:\s*(.+?)\s*-->", re.DOTALL)
+_MARKER_RE = re.compile(r"<!--\s*+groom-signature:\s*+([A-Za-z0-9_=-]*)\s*+-->")
 
 # Ledger statuses. UNKNOWN is the only one that permits filing.
 FILED = "filed"
 REJECTED = "rejected"
 SUPERSEDED = "superseded"
 UNKNOWN = "unknown"
+
+# Partition-time-only status: a signature that is UNKNOWN in the live ledger but
+# has ALREADY been routed to `to_file` earlier in THIS candidate batch. The
+# second-and-later findings that share it are suppressed under this status so a
+# single run cannot open two issues for one signature before GitHub state is
+# refreshed — the exact duplicate spam the ledger exists to prevent. Never a
+# live ledger status (it is not a GitHub issue state), so it is not in
+# `_PRECEDENCE`.
+PENDING = "pending"
 
 # Precedence when several issues share one signature (shouldn't happen, but be
 # robust): surface the most decision-bearing status. Rejection is the stickiest
@@ -92,11 +113,15 @@ _PRECEDENCE = {REJECTED: 3, SUPERSEDED: 2, FILED: 1}
 def signature_marker(signature: str) -> str:
     """The HTML-comment marker the filing step must append to an issue body.
 
-    Round-trips with `extract_signature`. The filing step owns applying this
-    (and the `groom` label); if it doesn't, the next run cannot recognize the
-    issue and will re-file the finding.
+    Round-trips with `extract_signature`. The signature is URL-safe-base64
+    encoded so it can carry any opaque bytes (including `-->`, newlines, or
+    markdown) without closing the comment early or injecting into the public
+    issue body. The filing step owns applying this (and the `groom` label); if
+    it doesn't, the next run cannot recognize the issue and will re-file the
+    finding.
     """
-    return f"<!-- {_MARKER_PREFIX} {normalize_signature(signature)} -->"
+    encoded = base64.urlsafe_b64encode(normalize_signature(signature).encode("utf-8")).decode("ascii")
+    return f"<!-- {_MARKER_PREFIX} {encoded} -->"
 
 
 def normalize_signature(signature) -> str:
@@ -117,15 +142,24 @@ def normalize_signature(signature) -> str:
 def extract_signature(body):
     """Recover the embedded signature from an issue body, or None.
 
-    Tolerant of the surrounding markdown/prose an issue body carries; returns
-    the FIRST marker found (a groom issue embeds exactly one).
+    Tolerant of the surrounding markdown/prose an issue body carries. Returns
+    the signature from the LAST marker, not the first: the filing contract
+    appends the authoritative marker after the finding text, so a marker-shaped
+    comment planted earlier in an attacker-controlled quoted snippet cannot
+    shadow the genuine one. The base64 payload is decoded back to the original
+    opaque signature; a marker whose payload is not valid base64/UTF-8 is
+    ignored (returns None) rather than poisoning a ledger key.
     """
     if not body:
         return None
-    match = _MARKER_RE.search(body)
-    if not match:
+    matches = _MARKER_RE.findall(body)
+    if not matches:
         return None
-    signature = normalize_signature(match.group(1))
+    try:
+        decoded = base64.urlsafe_b64decode(matches[-1].encode("ascii")).decode("utf-8")
+    except (binascii.Error, ValueError):
+        return None
+    signature = normalize_signature(decoded)
     return signature or None
 
 
@@ -200,53 +234,89 @@ class Ledger:
         return self.status(signature) != UNKNOWN
 
     def should_file(self, signature) -> bool:
-        """A finding is filed only if its signature is genuinely new."""
-        return self.status(signature) == UNKNOWN
+        """A finding is filed only if its signature is genuinely new.
+
+        A missing/blank/non-string signature is NOT filable: it has no
+        recoverable marker, so filing it would re-file on every subsequent run.
+        This mirrors `partition`, which routes such a candidate to `invalid`
+        rather than `to_file`.
+        """
+        return normalize_signature(signature) != "" and self.status(signature) == UNKNOWN
 
     def partition(self, findings):
         """Split candidate findings into to_file / suppressed / invalid.
 
-        `to_file`  — signature is UNKNOWN: open an issue (remember to embed the
-                     marker + apply the `groom` label).
-        `suppressed` — signature is known (filed/rejected/superseded): each
-                     annotated with `ledger_status` for auditable reporting.
+        `to_file`  — signature is UNKNOWN *and* first-seen in this batch: open
+                     an issue (remember to embed the marker + apply the `groom`
+                     label).
+        `suppressed` — signature is known (filed/rejected/superseded) OR was
+                     already routed to `to_file` earlier in this same batch
+                     (`pending`): each annotated with `ledger_status` for
+                     auditable reporting.
         `invalid`  — no usable signature: cannot be deduped, so it is NOT filed
                      (filing it would risk the exact duplicate-spam this ledger
                      exists to prevent). The workflow should surface these as a
                      producer error rather than silently dropping or spamming.
+
+        Intra-batch dedup: two candidates that share one new signature must not
+        both be filed — the ledger is only refreshed from GitHub between runs,
+        so the first opens the issue and later duplicates are suppressed as
+        `pending` (not falsely labeled `filed`, which they are not yet).
         """
         to_file, suppressed, invalid = [], [], []
+        filed_this_batch = set()
         for finding in findings:
             signature = normalize_signature(finding.get("signature")) if isinstance(finding, dict) else ""
             if not signature:
                 invalid.append(finding)
                 continue
             status = self.status(signature)
-            if status == UNKNOWN:
-                to_file.append(finding)
-            else:
+            if status != UNKNOWN:
                 suppressed.append({**finding, "ledger_status": status})
+            elif signature in filed_this_batch:
+                suppressed.append({**finding, "ledger_status": PENDING})
+            else:
+                filed_this_batch.add(signature)
+                to_file.append(finding)
         return to_file, suppressed, invalid
+
+
+# A repo must be exactly `owner/name` — no extra path segments or URL
+# metacharacters (`?`, `&`, `#`) that could override the `labels=…&state=all`
+# query or redirect the endpoint and silently return the wrong issue set.
+_REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+
+# Bound the `gh api` call so a stalled network/API connection can't block the
+# groom run until the coarse Actions job timeout, wasting runner minutes.
+_FETCH_TIMEOUT_SECONDS = 60
 
 
 def fetch_groom_issues(repo: str, run=subprocess.run):
     """List every `groom`-labeled issue in `repo` (state=all) via `gh api`.
 
     Paginated so a repo with many groom issues is fully covered. `run` is
-    injectable so tests can stub the subprocess. Raises on a non-zero exit —
-    a failure to read the ledger must fail loudly, never silently degrade to an
-    empty ledger (which would re-file everything).
+    injectable so tests can stub the subprocess. Raises on a non-zero exit or a
+    timeout — a failure to read the ledger must fail loudly, never silently
+    degrade to an empty ledger (which would re-file everything).
     """
-    result = run(
-        [
-            "gh",
-            "api",
-            "--paginate",
-            f"/repos/{repo}/issues?labels={GROOM_LABEL}&state=all&per_page=100",
-        ],
-        text=True,
-        capture_output=True,
-    )
+    if not _REPO_RE.match(repo or ""):
+        raise ValueError(f"invalid repo {repo!r}: expected owner/name")
+    try:
+        result = run(
+            [
+                "gh",
+                "api",
+                "--paginate",
+                f"/repos/{repo}/issues?labels={GROOM_LABEL}&state=all&per_page=100",
+            ],
+            text=True,
+            capture_output=True,
+            timeout=_FETCH_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"gh api timed out after {_FETCH_TIMEOUT_SECONDS}s listing groom issues"
+        ) from exc
     if result.returncode != 0:
         raise RuntimeError(f"gh api failed to list groom issues: {result.stderr.strip()}")
     return _parse_paginated_json(result.stdout)
@@ -310,9 +380,15 @@ def main(argv=None):
     ledger = load_ledger(args.repo)
 
     if args.check is not None:
+        # A blank/unusable signature is `invalid`, not filable — mirror
+        # `partition` (which routes it to `invalid`) instead of reporting
+        # `unknown` and exiting 0, which would file an un-dedupable issue.
+        if normalize_signature(args.check) == "":
+            print("invalid")
+            return 1
         status = ledger.status(args.check)
         print(status)
-        return 0 if status == UNKNOWN else 1
+        return 0 if ledger.should_file(args.check) else 1
 
     with open(args.candidates, encoding="utf-8") as f:
         findings = json.load(f)
