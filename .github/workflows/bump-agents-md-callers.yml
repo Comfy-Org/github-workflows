@@ -39,6 +39,9 @@ on:
       - .github/workflows/agents-md-integrity.yml
       - .github/agents-md-integrity/**
 
+permissions:
+  contents: read
+
 jobs:
   bump:
     runs-on: ubuntu-latest

@@ -39,6 +39,9 @@ on:
     paths:
       - .github/workflows/pr-size.yml
 
+permissions:
+  contents: read
+
 jobs:
   bump:
     runs-on: ubuntu-latest
