@@ -5,11 +5,12 @@ name: Bump agents-md-integrity callers
 # it. PRs are opened by Cloud Code Bot so they are easy to filter and merge.
 #
 # This is a thin entrypoint over the shared bumper at
-# .github/bump-callers/bump-callers.sh — the same script drives the cursor-review
-# caller fleet (bump-cursor-review-callers.yml). Keeping ONE implementation is
-# deliberate: a forked copy is how other shared machinery in the org has drifted.
-# The two entrypoints differ only in their path-filter trigger and the three
-# parameters passed below. (They stay separate rather than a single matrix
+# .github/bump-callers/bump-callers.sh — the same script drives the
+# cursor-review and pr-size caller fleets (bump-cursor-review-callers.yml,
+# bump-pr-size-callers.yml). Keeping ONE implementation is deliberate: a forked
+# copy is how other shared machinery in the org has drifted. The entrypoints
+# differ only in their path-filter trigger and the three parameters passed
+# below. (They stay separate rather than a single matrix
 # because their triggers differ — a cursor-review.yml change must not spuriously
 # bump agents-md callers, and vice versa.)
 #
