@@ -7,7 +7,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
+from unittest import mock
 
 MODULE_PATH = os.path.join(os.path.dirname(__file__), "..", "review-output-mcp.py")
 SPEC = importlib.util.spec_from_file_location("review_output_mcp", MODULE_PATH)
@@ -35,6 +37,31 @@ class ValidationTest(unittest.TestCase):
     def test_rejects_unknown_fields(self):
         with self.assertRaisesRegex(ValueError, "keys must be exactly"):
             MCP.validate_finding({**FINDING, "confidence": 0.9})
+
+    def test_non_object_record_falls_back_to_initial_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = os.path.join(directory, "findings.json")
+            with open(output_path, "w", encoding="utf-8") as output:
+                json.dump([], output)
+            args = types.SimpleNamespace(
+                out=output_path,
+                model="test-model",
+                review_type="reviewer",
+            )
+            self.assertEqual(MCP.read_record(args), MCP.initial_record(args))
+
+    def test_tool_io_error_returns_json_rpc_error(self):
+        args = types.SimpleNamespace(mode="reviewer")
+        message = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "cursor_review_finish", "arguments": {}},
+        }
+        with mock.patch.object(MCP, "call_tool", side_effect=OSError("disk full")):
+            response = MCP.handle(args, message)
+        self.assertTrue(response["result"]["isError"])
+        self.assertEqual(response["result"]["content"][0]["text"], "disk full")
 
 
 class StdioServerTest(unittest.TestCase):
