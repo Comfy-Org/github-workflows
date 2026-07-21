@@ -76,18 +76,21 @@ on:
         description: Comment posted when a PR is marked stale.
         type: string
         required: false
+        # Intentionally omits specific day counts / the label name so it stays
+        # correct when a caller overrides days_before_pr_* or stale_pr_label
+        # without also overriding this message (the exact deadline lives in the
+        # Slack digest, which is derived from the actual inputs).
         default: >
-          This PR has been automatically marked **stale** after 14 days of
-          inactivity. It will be closed in 14 days if there's no further
-          activity. Push a commit, comment, or remove the `stale` label to
-          keep it open.
+          This PR has been automatically marked **stale** due to inactivity and
+          will be closed if there's no further activity. Push a commit or leave
+          a comment to keep it open.
       close_pr_message:
         description: Comment posted when a stale PR is closed.
         type: string
         required: false
         default: >
-          Closing this PR as stale after ~4 weeks of inactivity. Feel free to
-          reopen when you pick it back up.
+          Closing this PR as stale after an extended period of inactivity. Feel
+          free to reopen when you pick it back up.
       dry_run:
         description: >-
           Preview only — actions/stale runs in debug-only mode and no Slack
@@ -109,6 +112,7 @@ permissions:
 jobs:
   stale:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - id: stale
         uses: actions/stale@5bef64f19d7facfb25b37b414482c7164d639639 # v9.1.0
@@ -151,12 +155,24 @@ jobs:
         run: |
           set -euo pipefail
 
+          # No token configured → skip entirely rather than firing a curl with an
+          # empty `Authorization: Bearer` header, which would still ship the repo
+          # name + PR titles to Slack's API. The secret is documented as optional
+          # ("only the Slack heads-up is skipped"), so honor that here.
+          if [ -z "${SLACK_BOT_TOKEN:-}" ]; then
+            echo "SLACK_BOT_TOKEN not set — skipping Slack heads-up"
+            exit 0
+          fi
+
           # actions/stale outputs JSON arrays of the PRs it staled/closed this run.
           # Build "• <url|#N> title" lines; derive the URL from repo + number so we
-          # don't depend on html_url being present in the output objects.
+          # don't depend on html_url being present in the output objects. Escape
+          # Slack mrkdwn control chars (& < >) in the title so a crafted title
+          # can't inject <!channel>/<!here> pings or masked <url|label> links.
           fmt() {
-            echo "${1:-[]}" | jq -r --arg base "$SERVER_URL/$REPO/pull" \
-              '.[]? | "• <\($base)/\(.number)|#\(.number)> \(.title // "")"'
+            echo "${1:-[]}" | jq -r --arg base "$SERVER_URL/$REPO/pull" '
+              def slack_escape: gsub("&";"&amp;") | gsub("<";"&lt;") | gsub(">";"&gt;");
+              .[]? | "• <\($base)/\(.number)|#\(.number)> \((.title // "") | slack_escape)"'
           }
           WARN_LINES=$(fmt "$STALED")
           CLOSE_LINES=$(fmt "$CLOSED")
@@ -166,7 +182,14 @@ jobs:
           # resolve correctly via $REPO above.
           TEXT=":hourglass_flowing_sand: *Stale PR bot — ${REPO}*"
           if [ -n "$WARN_LINES" ]; then
-            TEXT="${TEXT}"$'\n\n'"*Marked stale* — auto-closes in ${DAYS_TO_CLOSE} days without activity:"$'\n'"${WARN_LINES}"
+            # actions/stale treats days-before-pr-close <= 0 as "never close", so
+            # only promise a deadline when the close window is a positive count.
+            if [ "${DAYS_TO_CLOSE}" -gt 0 ] 2>/dev/null; then
+              STALE_HEADER="*Marked stale* — auto-closes in ${DAYS_TO_CLOSE} days without activity:"
+            else
+              STALE_HEADER="*Marked stale* (auto-close disabled):"
+            fi
+            TEXT="${TEXT}"$'\n\n'"${STALE_HEADER}"$'\n'"${WARN_LINES}"
           fi
           if [ -n "$CLOSE_LINES" ]; then
             TEXT="${TEXT}"$'\n\n'"*Closed as stale:*"$'\n'"${CLOSE_LINES}"
@@ -174,14 +197,22 @@ jobs:
 
           PAYLOAD=$(jq -nc --arg channel "$SLACK_CHANNEL" --arg text "$TEXT" \
             '{channel: $channel, text: $text}')
-          RESPONSE=$(curl -sS -X POST \
+          # Capture body + HTTP status separately with connect/total timeouts so a
+          # stalled Slack endpoint can't hang the runner for hours, and so a
+          # transport failure yields a real reason instead of an empty warning.
+          HTTP_CODE=$(curl -sS -X POST \
+            --connect-timeout 10 --max-time 30 \
             -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
             -H 'Content-Type: application/json; charset=utf-8' \
             --data "$PAYLOAD" \
-            https://slack.com/api/chat.postMessage || true)
+            -o /tmp/slack_response.json -w '%{http_code}' \
+            https://slack.com/api/chat.postMessage || echo "000")
+          RESPONSE=$(cat /tmp/slack_response.json 2>/dev/null || true)
 
-          if [ "$(echo "$RESPONSE" | jq -r '.ok')" = "true" ]; then
+          if [ "$(echo "$RESPONSE" | jq -r '.ok // false' 2>/dev/null)" = "true" ]; then
             echo "Slack heads-up sent"
           else
-            echo "::warning::Slack notification failed: $(echo "$RESPONSE" | jq -r '.error // "unknown error"')"
+            REASON=$(echo "$RESPONSE" | jq -r '.error // empty' 2>/dev/null || true)
+            [ -z "$REASON" ] && REASON="transport/HTTP failure (http_code=${HTTP_CODE})"
+            echo "::warning::Slack notification failed: ${REASON}"
           fi
