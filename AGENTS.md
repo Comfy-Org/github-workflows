@@ -20,6 +20,9 @@ python3 -m unittest discover -s .github/cursor-review/tests -p 'test_*.py' -v
 # agents-md-integrity checker tests
 python3 -m unittest discover -s .github/agents-md-integrity/tests -p 'test_*.py' -v
 
+# groom dedup/rejection ledger tests
+python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
+
 # bump-callers shell tests + lint (gh is stubbed; no network)
 shellcheck -x .github/bump-callers/bump-callers.sh .github/bump-callers/tests/test_bump_callers.sh
 bash .github/bump-callers/tests/test_bump_callers.sh
@@ -43,6 +46,11 @@ tests — run the matching command above for whatever you touched.
   time, never copied into consumers. Tests in `tests/`.
 - `.github/agents-md-integrity/` — `check_agents_md.py`, the checker behind
   `agents-md-integrity.yml` (enforces this AGENTS.md standard). Tests in `tests/`.
+- `.github/groom/` — building blocks for the reusable **groom** code-cleanup
+  workflow (epic BE-3870). Currently `ledger.py`, the durable dedup/rejection
+  memory that stops the stateless groom CI run from re-filing already-filed or
+  human-rejected findings (it uses GitHub issue state as the store — no new
+  secret). Tests in `tests/`.
 - `.github/bump-callers/` — `bump-callers.sh`, the ONE fleet-agnostic script
   that opens SHA-bump PRs in consumer repos when a reusable workflow changes.
   Tests in `tests/`.
