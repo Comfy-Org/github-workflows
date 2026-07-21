@@ -1,0 +1,72 @@
+name: CI - Groom
+
+# Thin caller enrolling THIS repo as the FIRST groom pilot (BE-3873 / Groom
+# Phase 3). The groom logic (two-phase finder -> independent verifier audit, the
+# durable dedup/rejection ledger, the GitHub-issue sink) lives in groom.yml in
+# this same repo; the caller pins it by full commit SHA like every external
+# consumer — a local `uses: ./...` path would run the PR's OWN copy of the
+# auditor, letting a PR weaken the reviewer judging it. Named ci-groom.yml
+# because the canonical caller path (groom.yml) is occupied here by the reusable
+# itself (same reason as ci-cursor-review.yml / ci-detect-unreviewed-merge.yml).
+#
+# GROOMER-ONLY mode: groom only FINDS and FILES `groom`-labeled GitHub issues —
+# no commits, no PRs, no auto-builder, never merges. It runs weekly on a schedule
+# (never on-PR), plus a manual dispatch carrying a `dry_run` toggle so the audit +
+# dedup can be spot-checked against a studio groom run on the same commit BEFORE
+# trusting live filing (the Phase 3 dry-run parity gate).
+#
+# PREREQUISITE (operator): `secrets.ANTHROPIC_API_KEY` must be available to this
+# repo (org- or repo-level) — the finder + verifier agents bill through it. Until
+# it exists the run fails loudly at the agent step, deliberately, so the pilot is
+# never silently inert. Filing uses the cloud-code-bot App identity (vars.APP_ID
+# + secrets.CLOUD_CODE_BOT_PRIVATE_KEY — already provisioned here for
+# cursor-review), so groom's issues are a distinct, queryable actor rather than
+# github-actions[bot], and the caller needs no issues:write scope of its own.
+
+on:
+  schedule:
+    # Weekly, Monday 09:17 UTC. Off-peak + a non-round minute to dodge the
+    # top-of-hour GitHub scheduler congestion. Never fires on a PR.
+    - cron: '17 9 * * 1'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: >-
+          Run the full audit + dedup but do NOT open issues — print what WOULD be
+          filed to the job summary. Use it to spot-check parity against a studio
+          groom run on the same repo/commit before trusting live filing.
+        type: boolean
+        default: false
+
+# Serialize runs per target repo — the dedup ledger reads live issue state and
+# THEN files, so two overlapping runs could both classify a signature as new and
+# file duplicates (a TOCTOU race). Belt to the reusable's own `concurrency:`
+# suspenders; never cancel a half-filed run.
+concurrency:
+  group: groom-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  groom:
+    permissions:
+      # Least privilege: the App token (bot_app_id) does the issue I/O, so the
+      # caller's own github.token stays read-only. (Grant issues:write here ONLY
+      # if you drop bot_app_id and fall back to filing as github-actions[bot].)
+      contents: read
+    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@07154fb5d0d979017d79b822873cfbe86483bfb3 # main (groom.yml lands here — #49 / BE-3872)
+    with:
+      # File groom's issues as cloud-code-bot (App token), not github-actions[bot].
+      bot_app_id: ${{ vars.APP_ID }}
+      # Keep the assets ref (finder/verifier briefs + dedup ledger) in lock-step
+      # with the `uses:` ref above, so a run always loads the briefs that match
+      # the workflow filing them.
+      workflows_ref: 07154fb5d0d979017d79b822873cfbe86483bfb3
+      # Manual dispatch can dry-run; the weekly schedule always files live
+      # (github.event.inputs is null on a schedule event -> '' != 'true' -> false).
+      dry_run: ${{ github.event.inputs.dry_run == 'true' }}
+      # Match the volume-gate window to this caller's ~weekly cron, so a week
+      # with nothing merged skips the (expensive) audit.
+      cadence: 7
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      BOT_APP_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
