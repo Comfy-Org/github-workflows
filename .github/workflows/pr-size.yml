@@ -188,7 +188,11 @@ jobs:
           # "current directory is contained in a module that is not one of the
           # workspace modules listed in go.work". The tool is dependency-free
           # (no go.sum), so disable workspace mode and build it standalone.
-          GOWORK: off
+          # Quoted: unquoted `off` is coerced to boolean false by the Actions
+          # YAML parser (YAML 1.1) and exported as GOWORK=false, which Go then
+          # treats as a workspace-file path and rejects ("must be an absolute
+          # path"). The literal string "off" is what disables workspace mode.
+          GOWORK: "off"
         run: |
           # Drop anything the PR checkout could have pre-seeded under the tool
           # path (such files are untracked in the tool repo, which checkout
