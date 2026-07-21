@@ -48,11 +48,25 @@ sub="$1"; shift || true
 if [[ "$sub" == "pr" ]]; then
   action="$1"; shift || true
   echo "pr-$action $*" >> "$STUB_PUT_DIR/pr.log"
-  # `pr list --json number --jq '.[0].number'` returns the open PR number, if
-  # any. STUB_OPEN_PR toggles whether an open bump PR already exists for the
-  # branch (set = update-in-place path; unset = create path).
+  # Faithfully model `gh pr list --json <fields> --jq <expr>`: build the JSON
+  # array real gh would return for the query, then run the caller's ACTUAL --jq
+  # over it. Modeling the post-jq output honestly (rather than echoing a bare
+  # number, or nothing) is what makes the no-open-PR case emit exactly what real
+  # gh emits — so an empty list can't silently mask a `gh pr edit null`
+  # regression, and a decoy fork PR is actually exercised.
+  #   STUB_OPEN_PR — number of an open bump PR on the repo's OWN branch.
+  #   STUB_FORK_PR — number of a cross-repository (fork) PR on the same branch
+  #                  name; the script must ignore it.
   if [[ "$action" == "list" ]]; then
-    [[ -n "${STUB_OPEN_PR:-}" ]] && echo "$STUB_OPEN_PR"
+    jqexpr=""; a=("$@")
+    for ((j=0; j<${#a[@]}; j++)); do
+      [[ "${a[$j]}" == "--jq" ]] && jqexpr="${a[$((j+1))]}"
+    done
+    entries=()
+    [[ -n "${STUB_FORK_PR:-}" ]] && entries+=("{\"number\":${STUB_FORK_PR},\"isCrossRepository\":true}")
+    [[ -n "${STUB_OPEN_PR:-}" ]] && entries+=("{\"number\":${STUB_OPEN_PR},\"isCrossRepository\":false}")
+    json="[$(IFS=,; echo "${entries[*]}")]"
+    if [[ -n "$jqexpr" ]]; then jq -r "$jqexpr" <<<"$json"; fi
   fi
   exit 0
 fi
@@ -156,6 +170,21 @@ check "did NOT report a new PR opened"        "! grep -q 'PR opened' <<<\"\$OUT\
 check "called pr edit on the open PR"         "grep -q '^pr-edit 42 ' \"\$STUB_PUT_DIR/pr.log\""
 check "did NOT open a second PR"              "! grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
 check "branch still refreshed to the new SHA" "grep -qF '$NEW_SHA' \"\${STUB_PUT_DIR}/put.last.txt\""
+
+echo "== cursor-review fleet: a decoy fork PR on the stable branch is IGNORED =="
+# An attacker pre-opens a fork PR whose head branch NAME collides with the
+# predictable stable branch (ci/bump-<tag>). `gh pr list --head` matches by name
+# across forks, so without the isCrossRepository filter the bot would edit the
+# attacker's PR and skip the real bump. The real caller has NO open bump PR here.
+new_case fork
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  STUB_FORK_PR=1337 \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-alpha","file":".github/workflows/ci-cursor-review.yml","label":""}]'
+check "exit 0" "[[ $RC -eq 0 ]]"
+check "ignored the fork PR, opened the real one"  "grep -q 'PR opened' <<<\"\$OUT\""
+check "did NOT edit the attacker's fork PR"       "! grep -q '^pr-edit 1337' \"\$STUB_PUT_DIR/pr.log\""
+check "opened a fresh PR via create"              "grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
 
 echo "== agents-md fleet: two callers, two SHA refs, '# v1' preserved =="
 new_case amd

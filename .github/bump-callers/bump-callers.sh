@@ -182,8 +182,18 @@ bump_one() {
   # above already refreshed its diff to the new SHA, so just refresh its
   # title/body. The stable head branch guarantees at most ONE open bump PR per
   # (repo, TAG) at any time — never open a second (BE-3882).
+  #
+  # `.[0].number // empty` (not a bare `.[0].number`, which prints the literal
+  # `null` on an empty list and would send us down `gh pr edit null`). And
+  # because `--head` matches by branch *name* across forks, exclude
+  # cross-repository PRs (`isCrossRepository == false`): the branch name is now
+  # predictable (`ci/bump-<tag>`), so an attacker could pre-open a fork PR on it
+  # and have the bot stamp their PR with the official title/body instead of
+  # bumping the real caller. Only the caller repo's own bump branch counts.
   local EXISTING_PR
-  EXISTING_PR=$(gh pr list --repo "${REPO}" --head "${BRANCH}" --state open --json number --jq '.[0].number' 2>/dev/null)
+  EXISTING_PR=$(gh pr list --repo "${REPO}" --head "${BRANCH}" --state open \
+    --json number,isCrossRepository \
+    --jq 'map(select(.isCrossRepository == false)) | .[0].number // empty' 2>/dev/null)
   if [[ -n "$EXISTING_PR" ]]; then
     if gh pr edit "${EXISTING_PR}" --repo "${REPO}" \
         --title "${PR_TITLE}" --body "${PR_BODY}" >/dev/null 2>&1; then
@@ -207,10 +217,16 @@ bump_one() {
     --body "${PR_BODY}" \
     "${LABEL_ARGS[@]}" 2>/dev/null; then
     echo "${REPO}: PR opened"
+    return 0
   else
+    # Reaching here means no open bump PR existed (the update-in-place path
+    # above already handled that case), so a create failure is a real error
+    # — auth, branch protection, an invalid label, a transient API fault — not
+    # a benign "PR already exists". Fail the caller so it lands in FAILED and
+    # the job reports the miss instead of a silent success.
     echo "::warning::${REPO}: PR create failed for ${BRANCH}"
+    return 1
   fi
-  return 0
 }
 
 FAILED=()
