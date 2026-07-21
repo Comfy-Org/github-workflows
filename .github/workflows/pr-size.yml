@@ -182,15 +182,16 @@ jobs:
 
       - name: Build check-pr-size
         env:
-          # The tool is checked out INTO the consumer's working tree (_pr_size_tool/),
-          # so if that consumer is a go.work monorepo (e.g. Comfy-Org/cloud), a plain
-          # `go build` walks up, finds the consumer's go.work, and fails with
+          # The tool is checked out into `_pr_size_tool/` UNDER the consumer
+          # repo's checkout, so `go build` discovers that repo's root `go.work`
+          # (if any) and refuses to build a module the workspace doesn't list:
           # "current directory is contained in a module that is not one of the
-          # workspace modules". GOWORK=off ignores any ambient workspace and builds
-          # the tool as its own standalone module (it has its own go.mod).
-          # Quote "off": a bare `off` is a YAML boolean, which Actions stringifies
-          # to "false" in the env — and `GOWORK=false` (neither off, empty, nor an
-          # absolute path) makes `go build` abort. The quotes keep it the literal off.
+          # workspace modules listed in go.work". The tool is dependency-free
+          # (no go.sum), so disable workspace mode and build it standalone.
+          # Quoted: unquoted `off` is coerced to boolean false by the Actions
+          # YAML parser (YAML 1.1) and exported as GOWORK=false, which Go then
+          # treats as a workspace-file path and rejects ("must be an absolute
+          # path"). The literal string "off" is what disables workspace mode.
           GOWORK: "off"
         run: |
           # Drop anything the PR checkout could have pre-seeded under the tool
