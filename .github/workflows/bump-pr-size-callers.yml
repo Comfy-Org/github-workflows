@@ -22,8 +22,8 @@ name: Bump pr-size callers
 # array of {"repo","file","label"} objects, same shape as the other fleets'
 # variables. Every repo name is `::add-mask::`ed out of the (public) run logs
 # before it is ever echoed. The variable is seeded EMPTY (`[]`) — an empty list
-# is a clean no-op here (ALLOW_EMPTY below), since pr-size.yml itself hasn't
-# landed yet; the rollout's per-repo caller tickets add entries as callers land.
+# is a clean no-op here (ALLOW_EMPTY below); the rollout's per-repo caller
+# tickets add entries as callers land.
 #
 # Update flow — adding/removing a caller needs NO public commit:
 #   gh variable set PR_SIZE_CALLERS --repo Comfy-Org/github-workflows \
