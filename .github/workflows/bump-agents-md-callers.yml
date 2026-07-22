@@ -56,10 +56,17 @@ concurrency:
 
 jobs:
   bump:
+    # Guard against a workflow_dispatch run from a non-main ref: github.sha is
+    # the tip of whatever ref was selected, and the bumper force-resets a stable
+    # shared branch — a manual run from an older ref would pin every caller to a
+    # stale SHA (and run this job's script, with the App token minted below,
+    # from an unreviewed commit). The push trigger is already main-only, so this
+    # only ever skips stray manual runs.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
         with:
           persist-credentials: false
 
@@ -84,4 +91,12 @@ jobs:
           # update flow. Kept in a variable (not the file) so private caller names
           # never land in this public repo or its logs.
           CALLERS_JSON: ${{ vars.AGENTS_MD_CALLERS }}
-        run: bash .github/bump-callers/bump-callers.sh
+        run: |
+          # The push path filter also matches a commit that DELETES the
+          # reusable workflow; bumping callers to a SHA where the file is gone
+          # would break every caller. Deletion means decommissioning — no-op.
+          if [[ ! -f .github/workflows/agents-md-integrity.yml ]]; then
+            echo "agents-md-integrity.yml absent at this SHA — decommissioned; nothing to bump"
+            exit 0
+          fi
+          bash .github/bump-callers/bump-callers.sh
