@@ -133,8 +133,41 @@ jobs:
               core.info(`${skipLabel} present — skipping.`);
               return;
             }
-            if ((pr.assignees || []).length > 0) {
-              core.info('PR already has assignees — skipping.');
+            // Respect an existing MANUAL assignment: if someone other than the
+            // author is already assigned, a human picked their own owner — skip
+            // and add nothing (this lets a contributor assign a reviewer at PR
+            // creation and have the bot leave it alone). Read the CURRENT
+            // assignees live from the API rather than trusting pr.assignees from
+            // the trigger payload — a creation-time assignee is missed by the
+            // payload (github-workflows BE-4008), which is what let the bot stack
+            // onto an already-assigned PR. Author-only (or no) assignees fall
+            // through to the normal blame-based pick; multiple bot picks are
+            // intentional (load-spread) and are NOT capped here.
+            const authorLogin = pr.user && pr.user.login;
+            // Live read of the non-author assignees. Returns `null` when the API
+            // read fails: callers treat "can't confirm" as "skip", never as
+            // "fall back to the payload" — the payload is exactly the value that
+            // misses creation-time assignees (BE-4008), so trusting it on failure
+            // would re-open the race this change exists to close.
+            const readNonAuthorAssignees = async () => {
+              let live;
+              try {
+                live = await github.rest.pulls.get({ owner, repo, pull_number });
+              } catch (e) {
+                core.info(`Could not read live assignees (${e.message}).`);
+                return null;
+              }
+              return (live.data.assignees || [])
+                .map((a) => a && a.login)
+                .filter((login) => login && login !== authorLogin);
+            };
+            const nonAuthorAssignees = await readNonAuthorAssignees();
+            if (nonAuthorAssignees === null) {
+              core.info('Live assignee state unreadable — skipping to avoid stacking onto a possible manual assignment.');
+              return;
+            }
+            if (nonAuthorAssignees.length > 0) {
+              core.info(`Already assigned to ${nonAuthorAssignees.join(', ')} — skipping.`);
               return;
             }
 
@@ -352,6 +385,22 @@ jobs:
             // Note: addAssignees caps at 10 and silently drops non-collaborators.
             if (selected.length === 0) {
               core.info('No one selected — nothing to assign.');
+              return;
+            }
+            // TOCTOU guard: the early skip check ran before the async config
+            // read + candidate selection above. A human (or a concurrent run —
+            // this workflow defines no `concurrency:` group) may have assigned
+            // someone in that window, and GitHub assignment is additive, so
+            // re-read the live state immediately before mutating and bail if a
+            // non-author assignee now exists. Unreadable state → skip, same as
+            // the early check.
+            const preAssign = await readNonAuthorAssignees();
+            if (preAssign === null) {
+              core.info('Live assignee state unreadable before assigning — skipping.');
+              return;
+            }
+            if (preAssign.length > 0) {
+              core.info(`Assigned to ${preAssign.join(', ')} during processing — skipping.`);
               return;
             }
             try {
