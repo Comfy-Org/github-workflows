@@ -48,10 +48,12 @@ tests — run the matching command above for whatever you touched.
   `agents-md-integrity.yml` (enforces this AGENTS.md standard). Tests in `tests/`.
 - `.github/groom/` — briefs + building blocks behind the reusable **groom**
   code-cleanup workflow (`groom.yml`, epic BE-3870): `finder.md` / `verifier.md`
-  (the two-phase prompts, single source of truth, loaded at run time), and
-  `ledger.py`, the durable dedup/rejection memory that stops the stateless groom
-  CI run from re-filing already-filed or human-rejected findings (it uses GitHub
-  issue state as the store — no new secret). Tests in `tests/`.
+  / `builder.md` (the phase-1/2/3 prompts, single source of truth, loaded at run
+  time), and `ledger.py`, the durable dedup/rejection memory that stops the
+  stateless groom CI run from re-filing already-filed or human-rejected findings
+  — and (BE-4003) recognizes auto-builder PR state (open/merged/closed) so a
+  built finding is never re-proposed. It uses GitHub issue+PR state as the store
+  — no new secret. Tests in `tests/`.
 - `.github/bump-callers/` — `bump-callers.sh`, the ONE fleet-agnostic script
   that opens SHA-bump PRs in consumer repos when a reusable workflow changes.
   Tests in `tests/`.
@@ -66,10 +68,12 @@ tests — run the matching command above for whatever you touched.
   `blocking: true` gates on unresolved findings.
 - `cursor-review-auto-label.yml` — translates PR assignment/open into the review
   label (via an app token, since a `GITHUB_TOKEN`-applied label won't fire runs).
-- `groom.yml` — scheduled/dispatch org-wide code-cleanup sweep (finds only, no
-  PRs): read-only finder → independent verifier on a clean whole-repo checkout →
-  dedup vs the ledger → file survivors as `groom` GitHub issues as a bot. Agent
-  step holds no write creds; briefs live in `.github/groom/`.
+- `groom.yml` — scheduled/dispatch org-wide code-cleanup sweep: read-only finder
+  → independent verifier on a clean whole-repo checkout → dedup vs the ledger →
+  file survivors as `groom` GitHub issues as a bot. Agent step holds no write
+  creds; briefs live in `.github/groom/`. Opt-in auto-builder (`builder: true`,
+  BE-4003) turns the top CONFIRMED findings into review-gated PRs (never
+  auto-merged) via a credential-free patch job + a separate bot PR job.
 - `agents-md-integrity.yml` — enforces the AGENTS.md standard on the caller repo.
 - `assign-reviewers.yml` — expertise-aware, load-balanced reviewer requests.
 - `assign-prs-to-author.yml` — assigns unassigned open PRs to their author.
