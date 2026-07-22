@@ -70,8 +70,9 @@ name: Groom (reusable)
 #         # findings into REVIEW-GATED PRs (never auto-merged) instead of issues.
 #         # Default OFF — the finds-only groomer (issues) stays the default.
 #         # REQUIRES bot_app_id (branded PRs that trigger CI + cursor-review), and
-#         # the bot App must have contents:write + pull-requests:write on the repo
-#         # so the separate PR job can push a branch + open the PR. Pilot with
+#         # the bot App must have contents:write + pull-requests:write + issues:write
+#         # on the repo so the separate PR job can push a branch + open the PR, and
+#         # so the file / build_pr-bail paths can open groom issues. Pilot with
 #         # dry_run:true first to preview patches without opening PRs.
 #         # builder: true
 #         # max_prs: 5            # throttle: at most N builder PRs per run
@@ -574,6 +575,9 @@ jobs:
         with:
           app-id: ${{ inputs.bot_app_id }}
           private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+          # Least privilege: this job only READS live issue + PR state to dedup.
+          permission-issues: read
+          permission-pull-requests: read
 
       - name: Load groom assets (ledger)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -693,6 +697,8 @@ jobs:
         with:
           app-id: ${{ inputs.bot_app_id }}
           private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+          # Least privilege: this job only opens `groom` issues (+ their labels).
+          permission-issues: write
 
       - name: Load groom assets (ledger)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -945,6 +951,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/out
+          # `type: number` can arrive as a fractional string (e.g. 400.0) that the
+          # integer-only `-gt` test below would abort on under `set -euo pipefail`,
+          # skipping the patch upload. Floor it to an int first (mirrors the file
+          # job's MAX_FINDINGS handling).
+          PR_SIZE_LIMIT=$(awk -v v="$PR_SIZE_LIMIT" 'BEGIN{printf "%d", v}')
           STATUS=$(jq -r '.status // "bail"' "$BUILDER_OUT" 2>/dev/null || echo bail)
           SUMMARY=$(jq -r '.summary // ""' "$BUILDER_OUT" 2>/dev/null || echo "")
           # Stage everything the agent touched (incl. new files) and diff it.
@@ -1004,6 +1015,11 @@ jobs:
         with:
           app-id: ${{ inputs.bot_app_id }}
           private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+          # Least privilege: push the branch (contents), open the PR
+          # (pull-requests), and fall back to a `groom` issue (issues).
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
 
       - name: Load groom assets (signature marker)
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
