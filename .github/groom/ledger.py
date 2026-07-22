@@ -71,6 +71,15 @@ REJECTED_LABEL = "groom-rejected"
 # implying a human said "no".
 SUPERSEDED_LABEL = "groom-superseded"
 
+# The label the auto-builder (BE-4003) stamps on every PR it opens. A PR is
+# admitted to the ledger as a builder record ONLY if it carries this label — the
+# `groom` label alone is not enough. Signature markers are public in issue/PR
+# bodies, so without this gate anyone with label/triage access could paste a live
+# finding's marker into their own `groom`-labeled PR and permanently suppress the
+# finding (close it unmerged → `pr-closed`, or add `groom-rejected`). Only the
+# bot applies `groom-pr`, so requiring it keeps that spoof out of the ledger.
+BUILDER_PR_LABEL = "groom-pr"
+
 # The signature marker embedded in a filed issue's body. An HTML comment so it
 # renders invisibly, and a stable prefix so it round-trips through the API's raw
 # body. The opaque signature is URL-safe-base64 encoded before embedding: the
@@ -87,11 +96,23 @@ SUPERSEDED_LABEL = "groom-superseded"
 _MARKER_PREFIX = "groom-signature:"
 _MARKER_RE = re.compile(r"<!--\s*+groom-signature:\s*+([A-Za-z0-9_=-]*)\s*+-->")
 
-# Ledger statuses. UNKNOWN is the only one that permits filing.
+# Ledger statuses. UNKNOWN is the only one that permits filing/proposing.
 FILED = "filed"
 REJECTED = "rejected"
 SUPERSEDED = "superseded"
 UNKNOWN = "unknown"
+
+# PR-state statuses (BE-4003 auto-builder). A groom builder PR carries the
+# finding's signature in its body exactly like a filed issue does, so the same
+# ledger recognizes it. Its lifecycle maps onto durable dedup states so a built
+# finding is never re-proposed: an OPEN builder PR is `pr-open`, a MERGED one is
+# `merged` (shipped — done), and a CLOSED-unmerged one is `pr-closed` (a human
+# declined the fix — durable, exactly like a rejected issue). Every one of these
+# is non-UNKNOWN, so all of them suppress re-proposing, matching the RFC:
+# "a merged/closed/rejected finding is never re-proposed."
+PR_OPEN = "pr-open"
+MERGED = "merged"
+PR_CLOSED = "pr-closed"
 
 # Partition-time-only status: a signature that is UNKNOWN in the live ledger but
 # has ALREADY been routed to `to_file` earlier in THIS candidate batch. The
@@ -102,12 +123,15 @@ UNKNOWN = "unknown"
 # `_PRECEDENCE`.
 PENDING = "pending"
 
-# Precedence when several issues share one signature (shouldn't happen, but be
-# robust): surface the most decision-bearing status. Rejection is the stickiest
-# human signal, so it wins; a superseded marker beats a plain filed one. The
-# dedup DECISION doesn't depend on this ordering — every non-UNKNOWN status
-# suppresses filing equally — only the reported status does.
-_PRECEDENCE = {REJECTED: 3, SUPERSEDED: 2, FILED: 1}
+# Precedence when several records (issues and/or builder PRs) share one
+# signature (e.g. a finding filed as an issue AND later built as a PR): surface
+# the most decision-bearing status. A human "no" is the stickiest signal, so
+# REJECTED (rejected issue) and PR_CLOSED (declined PR) win; a shipped state
+# (MERGED) beats a still-open one; a plain filed/superseded issue and an open PR
+# rank lowest. The dedup DECISION doesn't depend on this ordering — every
+# non-UNKNOWN status suppresses filing/proposing equally — only the reported
+# status does.
+_PRECEDENCE = {REJECTED: 6, PR_CLOSED: 5, MERGED: 4, SUPERSEDED: 3, FILED: 2, PR_OPEN: 1}
 
 
 def signature_marker(signature: str) -> str:
@@ -174,14 +198,20 @@ def _labels(issue) -> set:
 
 
 def classify_issue(issue) -> str:
-    """Map one groom issue to a ledger status (never UNKNOWN — it exists).
+    """Map one groom record (issue OR builder PR) to a ledger status.
 
-    Rejection is recognized two ways, either of which is durable:
-      * the `groom-rejected` label (open or closed), or
-      * closed as `not_planned` — GitHub's "Close as not planned" == wontfix.
-    A `groom-superseded` label marks a replaced finding. Everything else
-    (open, or closed as completed/fixed) is FILED: already handled, don't
-    re-file.
+    Never UNKNOWN — the record exists, so it is at least known. The
+    `/repos/{repo}/issues` listing returns both issues and pull requests; a PR
+    carries a `pull_request` object (with `merged_at`), which is how we tell the
+    two apart here.
+
+    Human rejection wins first and is durable, recognized three ways:
+      * the `groom-rejected` label (open or closed, issue or PR), or
+      * an issue closed as `not_planned` — GitHub's "Close as not planned", or
+      * (for PRs) closed unmerged — a human declined the fix (`pr-closed`).
+    A `groom-superseded` label marks a replaced finding. For a builder PR: open
+    is `pr-open`, merged is `merged` (shipped). Everything else (an open issue,
+    or one closed as completed/fixed) is FILED: already handled, don't re-file.
     """
     labels = _labels(issue)
     closed_not_planned = (
@@ -191,24 +221,43 @@ def classify_issue(issue) -> str:
         return REJECTED
     if SUPERSEDED_LABEL in labels:
         return SUPERSEDED
+    pr = issue.get("pull_request")
+    if pr:
+        if issue.get("state") == "open":
+            return PR_OPEN
+        # Closed: a merge stamps `merged_at`; an unmerged close is a decline.
+        return MERGED if pr.get("merged_at") else PR_CLOSED
     return FILED
 
 
 def build_ledger(issues) -> dict:
-    """Build a {signature -> status} map from a list of groom issues.
+    """Build a {signature -> status} map from a list of groom records.
 
-    Issues without a recoverable signature marker are skipped: a `groom`-labeled
-    issue a human opened by hand (no marker) is not one of ours and must not
-    poison a signature key. Pull requests (the `/issues` endpoint returns them
-    too) are skipped. When two issues share a signature, the higher-precedence
-    status wins (`_PRECEDENCE`).
+    Records without a recoverable signature marker are skipped: a `groom`-labeled
+    issue or PR a human opened by hand (no marker) is not one of ours and must
+    not poison a signature key. That marker check is what makes it safe to
+    include pull requests here: the `/issues` endpoint returns groom-labeled PRs
+    too, and a groom builder PR (BE-4003) DOES carry a signature marker, so it is
+    a first-class ledger record — a merged/open/closed builder PR suppresses
+    re-proposing its finding. (BE-3874 skipped all PRs because groom filed only
+    issues then; the builder makes signed PRs part of the durable record.)
+
+    A PR is admitted ONLY if it ALSO carries the `groom-pr` label the bot stamps
+    on its own builder PRs. Markers are public, so the `groom` label + a pasted
+    marker alone must not let a hand-opened PR masquerade as a builder record and
+    suppress a live finding — requiring `groom-pr` (bot-applied) closes that.
+
+    When several records share a signature, the higher-precedence status wins
+    (`_PRECEDENCE`).
     """
     statuses: dict = {}
     for issue in issues:
-        if issue.get("pull_request"):
-            continue
         signature = extract_signature(issue.get("body"))
         if not signature:
+            continue
+        # Gate PRs on the bot-applied `groom-pr` label (see docstring): a signed
+        # but non-builder PR is not one of ours and must not enter the ledger.
+        if issue.get("pull_request") and BUILDER_PR_LABEL not in _labels(issue):
             continue
         status = classify_issue(issue)
         current = statuses.get(signature)

@@ -19,6 +19,15 @@ The finder's JSON file is the **only** handoff between the phases — the verifi
 never sees the finder's reasoning, only its claims and the actual code. That
 separation is the whole point: the skeptic can't be anchored by the proposer.
 
+**Optional phase 3 — the auto-builder** ([`builder.md`](builder.md), BE-4003).
+When the workflow runs with `builder: true`, the top few CONFIRMED, non-security
+findings are handed one at a time to a **credential-free** builder agent that
+writes the code change into its checkout; a separate no-agent job captures the
+diff, opens a **review-gated PR** as the bot (never auto-merged), and the
+ledger's PR-state stops that finding from being re-proposed. The builder holds no
+credentials — it can only produce a *patch*, never push. Default off: the
+finds-only groomer (issues) stays the default.
+
 These two files are the **single source of truth** for the groom prompts, the
 same way [`.github/cursor-review/`](../cursor-review) is for the review panel.
 The core thesis of the groom initiative is *collaborate on the prompt, not the
@@ -31,6 +40,7 @@ rather than buried in a runner script.
 |---|---|---|---|
 | 1. Find | [`finder.md`](finder.md) | clean `origin/main` checkout + scan scope | `{repo, scope, findings:[{title, dimension, sites, evidence, proposed, value, risk, confidence, steelman}]}` at `{{FINDER_OUT}}` |
 | 2. Verify | [`verifier.md`](verifier.md) | the finder's JSON + the code | `{repo, scope, summary, findings:[{title, verdict, security, signature, body}]}` at `{{VERIFIER_OUT}}` |
+| 3. Build (opt-in) | [`builder.md`](builder.md) | ONE verified finding `{title, body, signature}` at `{{FINDING_IN}}` + the code | edits in the checkout + a control file `{status: patched\|bail, summary}` at `{{BUILDER_OUT}}` |
 
 - **`verdict`** is `CONFIRM` \| `DOWNGRADE` (real but narrow the scope) \|
   `REJECT` (premature / overstated / not worth it).
@@ -64,6 +74,8 @@ single-brace JSON in the briefs). A consumer replaces every occurrence:
 | `{{SCOPE_LABEL}}` | short scope label (the package path, or `whole-repo`) |
 | `{{FINDER_OUT}}` | path the finder writes its candidate JSON to |
 | `{{VERIFIER_OUT}}` | path the verifier writes its verified JSON to |
+| `{{FINDING_IN}}` | (builder) path the single finding to build is read from |
+| `{{BUILDER_OUT}}` | (builder) path the builder writes its `{status, summary}` control file to |
 
 `{{FINDER_OUT}}` appears in **both** briefs (the finder writes it; the verifier
 reads it); `{{VERIFIER_OUT}}` and `{{REPO_BASENAME}}` appear only in the
@@ -97,17 +109,24 @@ can see). No separate database, cache, or committed state file.
 
 Keyed on `(repo, finding_signature) → {filed | rejected | superseded}`:
 
-| Live GitHub state | Ledger status | Re-file? |
+| Live GitHub state | Ledger status | Re-file / re-propose? |
 |---|---|---|
 | Open `groom` issue for the signature | `filed` | no |
 | Closed as **completed** | `filed` | no (already handled) |
 | Closed as **not planned** (GitHub "close as wontfix") | `rejected` | **no — durable** |
 | Carries the `groom-rejected` label (open or closed) | `rejected` | **no — durable** |
 | Carries the `groom-superseded` label | `superseded` | no |
-| No `groom` issue carries the signature | `unknown` | **yes** |
+| Open **builder PR** for the signature (BE-4003) | `pr-open` | no |
+| **Builder PR merged** | `merged` | no (shipped) |
+| **Builder PR closed unmerged** | `pr-closed` | **no — durable** (human declined) |
+| No `groom` issue or PR carries the signature | `unknown` | **yes** |
 
-Only an `unknown` signature is filed. Human rejection — close-as-not-planned or
-the `groom-rejected` label — suppresses that signature forever.
+Only an `unknown` signature is filed/proposed. Human rejection — close-as-not-planned,
+the `groom-rejected` label, or a **closed-unmerged builder PR** — suppresses that
+signature forever. The auto-builder's PRs carry the signature marker in their body
+exactly like a filed issue, so the same ledger recognizes them: the `/issues`
+listing returns groom-labeled PRs too, and the marker check (a human-opened,
+markerless `groom` issue/PR is ignored) is what keeps including PRs safe.
 
 ### The filing contract (load-bearing)
 
