@@ -20,8 +20,13 @@ ledger = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ledger)
 
 
-def issue(signature=None, *, state="open", state_reason=None, labels=("groom",), body=None, pr=False):
-    """Build a minimal GitHub-issue dict, embedding a marker unless body given."""
+def issue(signature=None, *, state="open", state_reason=None, labels=("groom",), body=None, pr=False, merged_at=None):
+    """Build a minimal GitHub-issue dict, embedding a marker unless body given.
+
+    Set `pr=True` to model a builder pull request (the `/issues` listing returns
+    PRs too, tagged with a `pull_request` object); `merged_at` is the merge
+    timestamp GitHub stamps on that object when a PR merges (None = unmerged).
+    """
     if body is None:
         body = "Some finding text.\n\n" + ledger.signature_marker(signature) if signature else "no marker"
     d = {
@@ -31,7 +36,7 @@ def issue(signature=None, *, state="open", state_reason=None, labels=("groom",),
         "body": body,
     }
     if pr:
-        d["pull_request"] = {"url": "http://x"}
+        d["pull_request"] = {"url": "http://x", "merged_at": merged_at}
     return d
 
 
@@ -121,6 +126,32 @@ class ClassifyIssueTest(unittest.TestCase):
             ledger.REJECTED,
         )
 
+    # --- Builder PR states (BE-4003) ---
+
+    def test_open_builder_pr_is_pr_open(self):
+        self.assertEqual(ledger.classify_issue(issue("s", pr=True, state="open")), ledger.PR_OPEN)
+
+    def test_merged_builder_pr_is_merged(self):
+        # A merge stamps `merged_at` — the finding shipped, don't re-propose.
+        self.assertEqual(
+            ledger.classify_issue(issue("s", pr=True, state="closed", merged_at="2026-07-21T00:00:00Z")),
+            ledger.MERGED,
+        )
+
+    def test_closed_unmerged_builder_pr_is_pr_closed(self):
+        # Closed without merging == a human declined the fix — durable, never re-propose.
+        self.assertEqual(
+            ledger.classify_issue(issue("s", pr=True, state="closed", merged_at=None)),
+            ledger.PR_CLOSED,
+        )
+
+    def test_rejected_label_on_open_pr_wins(self):
+        # groom-rejected on an open builder PR is still a durable human "no".
+        self.assertEqual(
+            ledger.classify_issue(issue("s", pr=True, state="open", labels=("groom", "groom-rejected"))),
+            ledger.REJECTED,
+        )
+
 
 class BuildLedgerTest(unittest.TestCase):
     def test_skips_issues_without_marker(self):
@@ -128,9 +159,25 @@ class BuildLedgerTest(unittest.TestCase):
         led = ledger.build_ledger([issue(body="human wrote this, no marker")])
         self.assertEqual(len(led), 0)
 
-    def test_skips_pull_requests(self):
-        led = ledger.build_ledger([issue("s", pr=True)])
+    def test_skips_markerless_pull_requests(self):
+        # A human PR labeled `groom` by hand (no signature marker) is not ours —
+        # the marker check is what makes including PRs safe.
+        led = ledger.build_ledger([issue(body="human PR, no marker", pr=True)])
         self.assertEqual(len(led), 0)
+
+    def test_includes_signed_builder_pr(self):
+        # A groom builder PR carries the marker → it IS a ledger record now.
+        led = ledger.build_ledger([issue("built", pr=True, state="open")])
+        self.assertEqual(led, {"built": ledger.PR_OPEN})
+
+    def test_pr_closed_beats_open_issue_for_same_signature(self):
+        # A finding filed as an issue AND later built into a declined PR: the
+        # human decline (pr-closed) is the most decision-bearing status.
+        led = ledger.build_ledger([
+            issue("dup", state="open"),
+            issue("dup", pr=True, state="closed", merged_at=None),
+        ])
+        self.assertEqual(led["dup"], ledger.PR_CLOSED)
 
     def test_rejection_wins_when_duplicate_signatures(self):
         # Same signature on a filed AND a rejected issue → rejected surfaces.
@@ -250,6 +297,33 @@ class AcceptanceScenarioTest(unittest.TestCase):
         led = ledger.Ledger(ledger.build_ledger([issue("y", state="open")]))
         to_file, _, _ = led.partition([{"signature": "z-new"}])
         self.assertEqual(len(to_file), 1)
+
+    # --- Builder auto-PR dedup (BE-4003, acceptance criterion 3) ---
+
+    def test_open_builder_pr_suppresses_reproposal(self):
+        # Run N built "b" into an OPEN PR. Run N+1 must NOT re-propose it.
+        led = ledger.Ledger(ledger.build_ledger([issue("b", pr=True, state="open")]))
+        to_file, suppressed, _ = led.partition([{"signature": "b"}])
+        self.assertEqual(to_file, [])
+        self.assertEqual(suppressed[0]["ledger_status"], ledger.PR_OPEN)
+
+    def test_merged_builder_pr_never_reproposed(self):
+        # A merged builder PR means the fix shipped — never re-propose.
+        led = ledger.Ledger(
+            ledger.build_ledger([issue("b", pr=True, state="closed", merged_at="2026-07-21T00:00:00Z")])
+        )
+        to_file, suppressed, _ = led.partition([{"signature": "b"}])
+        self.assertEqual(to_file, [])
+        self.assertEqual(suppressed[0]["ledger_status"], ledger.MERGED)
+
+    def test_closed_builder_pr_never_reproposed(self):
+        # A human closed the builder PR unmerged — durable decline, never re-propose.
+        led = ledger.Ledger(
+            ledger.build_ledger([issue("b", pr=True, state="closed", merged_at=None)])
+        )
+        to_file, suppressed, _ = led.partition([{"signature": "b"}])
+        self.assertEqual(to_file, [])
+        self.assertEqual(suppressed[0]["ledger_status"], ledger.PR_CLOSED)
 
 
 class FetchTest(unittest.TestCase):
