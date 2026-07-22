@@ -133,8 +133,29 @@ jobs:
               core.info(`${skipLabel} present — skipping.`);
               return;
             }
-            if ((pr.assignees || []).length > 0) {
-              core.info('PR already has assignees — skipping.');
+            // Respect an existing MANUAL assignment: if someone other than the
+            // author is already assigned, a human picked their own owner — skip
+            // and add nothing (this lets a contributor assign a reviewer at PR
+            // creation and have the bot leave it alone). Read the CURRENT
+            // assignees live from the API rather than trusting pr.assignees from
+            // the trigger payload — a creation-time assignee is missed by the
+            // payload (github-workflows BE-4008), which is what let the bot stack
+            // onto an already-assigned PR. Author-only (or no) assignees fall
+            // through to the normal blame-based pick; multiple bot picks are
+            // intentional (load-spread) and are NOT capped here.
+            const authorLogin = pr.user && pr.user.login;
+            let liveAssignees = pr.assignees || [];
+            try {
+              const live = await github.rest.pulls.get({ owner, repo, pull_number });
+              liveAssignees = live.data.assignees || [];
+            } catch (e) {
+              core.info(`Could not read live assignees (${e.message}) — falling back to payload assignees.`);
+            }
+            const nonAuthorAssignees = liveAssignees
+              .map((a) => a && a.login)
+              .filter((login) => login && login !== authorLogin);
+            if (nonAuthorAssignees.length > 0) {
+              core.info(`Already assigned to ${nonAuthorAssignees.join(', ')} — skipping.`);
               return;
             }
 
