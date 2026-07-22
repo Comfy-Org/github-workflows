@@ -34,8 +34,10 @@ touches[rule][login] += 1
 - **Emails → logins:** `login@users.noreply.github.com` (and the
   `digits+login@` form) decode directly; every other distinct email costs one
   `GET /repos/{owner}/{repo}/commits/{sha}` to read `.author.login`. Commits
-  whose email can't be resolved are dropped and the count is reported in the
-  PR body.
+  whose email has **no linked account** are dropped and the count is reported
+  in the PR body — but an API **failure** (rate limit, 5xx, timeout) is never
+  scored as "no account": any failed lookup downgrades the whole run to the
+  clean no-op, so a transient outage can't emit a biased map.
 - **Eligibility = repo collaborators** (paginated `GET .../collaborators`) —
   *not* org members, because `addAssignees` silently drops non-collaborators,
   so the collaborator set is the exact test the runtime applies.
@@ -70,7 +72,7 @@ with their top contributors — candidates for new rules, never auto-added.
 | `top_k` / `floor` | 4 / 2 | Enough experts to load-balance across without piling every rule onto the same two people. |
 | `min_touches` / `min_score` | 5 / 1.5 | Filters drive-by contributors: one huge recent commit is not sustained expertise. |
 | `floor_min_touches` | 2 | Relaxed bar used only to reach the floor. |
-| `pr_branch` | `bot/refresh-reviewers` | Stable branch, force-reset each run — re-runs update the one open drift PR instead of stacking duplicates. |
+| `pr_branch` | `bot/refresh-reviewers` | Stable branch, force-reset each run — re-runs update the one open drift PR instead of stacking duplicates. Guarded: it may never equal the default branch, a tip a human has pushed to is never force-reset ("edit freely" means it), and a no-drift run closes a stale still-bot-authored PR. |
 
 ## `map_exclude` guidance
 

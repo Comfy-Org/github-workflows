@@ -152,6 +152,13 @@ class TestPathFiltering(unittest.TestCase):
     def test_plain_path_untouched(self):
         self.assertEqual(gen.normalize_numstat_path("a/b/c.go"), "a/b/c.go")
 
+    def test_quoted_path_escapes_are_decoded(self):
+        # git C-style quoting (core.quotePath): \t, \", \\, octal non-ASCII
+        self.assertEqual(gen.normalize_numstat_path('"a\\ttab.go"'), "a\ttab.go")
+        self.assertEqual(gen.normalize_numstat_path('"quo\\"te.go"'), 'quo"te.go')
+        self.assertEqual(gen.normalize_numstat_path('"back\\\\slash.go"'), "back\\slash.go")
+        self.assertEqual(gen.normalize_numstat_path('"sp\\303\\244th.go"'), "späth.go")
+
 
 class TestParseLog(unittest.TestCase):
     LOG = "\n".join([
@@ -258,8 +265,27 @@ class TestComputeScores(unittest.TestCase):
         self.assertEqual(touches[1]["alice"], 1)
         self.assertNotIn("bob", overall)                 # all-excluded commit
         self.assertAlmostEqual(overall["alice"], 1.5)
-        self.assertAlmostEqual(gap["docs/guide.md"]["carol"], 1.0)
+        self.assertAlmostEqual(gap["docs"]["carol"], 1.0)
         self.assertNotIn("services/ingest", gap)         # covered by a rule
+
+    def test_gap_dedupes_per_commit_and_keys_by_directory(self):
+        # a single commit touching many unmatched files in one directory must
+        # add its weight ONCE per gap key (same commit-touch semantics as the
+        # rule scores — else the gap column is incomparable), and the key is
+        # the top-two-level DIRECTORY, never the filename.
+        rules = [[gen.glob_to_regexp("services/ingest/**")]]
+        now = 1_800_000_000
+        commits = [
+            ("carol", now, ["docs/a.md", "docs/b.md", "docs/sub/c.md"]),
+            ("dave", now, ["README.md"]),                    # root-level file
+            ("erin", now, ["web/src/components/App.tsx"]),   # deep path
+        ]
+        _s, _t, _o, gap = gen.compute_scores(commits, rules, [], now, 90)
+        self.assertAlmostEqual(gap["docs"]["carol"], 1.0)    # not 2.0
+        self.assertAlmostEqual(gap["docs/sub"]["carol"], 1.0)
+        self.assertAlmostEqual(gap["(root)"]["dave"], 1.0)
+        self.assertAlmostEqual(gap["web/src"]["erin"], 1.0)
+        self.assertNotIn("docs/a.md", gap)
 
 
 CONFIG = """\
@@ -368,6 +394,60 @@ class TestSurgicalRewrite(unittest.TestCase):
     def test_default_pool_exclude_is_case_insensitive(self):
         pool = gen.select_default_pool({"DrJKL": 9.0, "b": 5.0}, [], {"drjkl"})
         self.assertEqual(pool, ["b"])
+
+
+class TestEnvKnobs(unittest.TestCase):
+    def _with_env(self, value, default=90):
+        os.environ["_RR_TEST_KNOB"] = value
+        self.addCleanup(os.environ.pop, "_RR_TEST_KNOB", None)
+        return gen._env_pos_float("_RR_TEST_KNOB", default)
+
+    def test_zero_half_life_falls_back_to_default(self):
+        # half_life_days: 0 would divide by zero in decay_weight
+        self.assertEqual(self._with_env("0"), 90.0)
+
+    def test_negative_half_life_falls_back_to_default(self):
+        # a negative half-life inverts the decay (older commits gain weight)
+        self.assertEqual(self._with_env("-5"), 90.0)
+
+    def test_positive_value_passes_through(self):
+        self.assertEqual(self._with_env("30"), 30.0)
+
+
+class TestApiErrorSentinel(unittest.TestCase):
+    """A transient API failure must stay distinguishable from 'this email has
+    no linked account' — collapsing the two silently drops contributors."""
+
+    def _patch_gh_get(self, fake):
+        orig = gen.gh_get
+        gen.gh_get = fake
+        self.addCleanup(setattr, gen, "gh_get", orig)
+
+    def test_resolve_email_propagates_api_error(self):
+        self._patch_gh_get(lambda url, token: gen.API_ERROR)
+        self.assertIs(gen.resolve_email_via_api("a", "o/r", "t", "sha"),
+                      gen.API_ERROR)
+
+    def test_resolve_email_none_for_unlinked_account(self):
+        self._patch_gh_get(lambda url, token: {"author": None})
+        self.assertIsNone(gen.resolve_email_via_api("a", "o/r", "t", "sha"))
+
+    def test_resolve_email_returns_login(self):
+        self._patch_gh_get(lambda url, token: {"author": {"login": "octocat"}})
+        self.assertEqual(gen.resolve_email_via_api("a", "o/r", "t", "sha"),
+                         "octocat")
+
+    def test_fetch_collaborators_unavailable_on_api_error(self):
+        self._patch_gh_get(lambda url, token: gen.API_ERROR)
+        self.assertIsNone(gen.fetch_collaborators("a", "o/r", "t"))
+
+
+class TestMarkdownEscaping(unittest.TestCase):
+    def test_md_code_escapes_table_breakers(self):
+        # `|` would split the table cell, a backtick would close the span
+        self.assertEqual(gen.md_code("a|b"), "`a\\|b`")
+        self.assertEqual(gen.md_code("a`b`c"), "`a'b'c`")
+        self.assertEqual(gen.md_code("plain/path.go"), "`plain/path.go`")
 
 
 class TestPrBody(unittest.TestCase):

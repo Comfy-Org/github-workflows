@@ -25,6 +25,14 @@ Exclusions:
     runtime applies: `addAssignees` silently drops non-collaborators),
   - MAP_EXCLUDE logins (e.g. an operator whose commits are agent-authored).
 
+Trust model: scoring reads unauthenticated git author metadata. Anyone with
+push access to the default branch can forge another user's noreply email (the
+commits API attributes by email too, so API resolution inherits the same
+limit) or a future author date (clamped to full weight). That forger is by
+definition already a collaborator, and the only output is a drift PR a human
+reviews — so the exposure is accepted rather than "fixed" with signature
+checks the underlying data can't support.
+
 This script is a drift DETECTOR, never a live mutator: it emits the rewritten
 config + a machine-readable report for the workflow's PR step and exits.
 Environmental problems (missing config, unreachable API) are downgraded to a
@@ -338,12 +346,30 @@ def rewrite_config(text, locs, rule_replacements, default_pool_replacement):
 
 # --- git log parsing ---------------------------------------------------------
 
+def _git_unquote(path):
+    """Decode git's C-style path quoting (core.quotePath: `\\t`, `\\"`,
+    `\\\\`, `\\ooo` octal for non-ASCII bytes). Quoted output is ASCII, so
+    decode escapes then reassemble the raw bytes as UTF-8; malformed input
+    falls back to the bare inner string."""
+    if not (len(path) >= 2 and path[0] == '"' and path[-1] == '"'):
+        return path
+    inner = path[1:-1]
+    try:
+        return (inner.encode("ascii", "backslashreplace")
+                .decode("unicode_escape")
+                .encode("latin-1").decode("utf-8", "replace"))
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        return inner
+
+
 def normalize_numstat_path(path):
-    """Normalize a numstat path: strip git's quoting, resolve both rename
+    """Normalize a numstat path: decode git's quoting, resolve both rename
     syntaxes (`a/{old => new}/c` and whole-path `old => new`) to the NEW
-    path."""
-    if len(path) >= 2 and path[0] == '"' and path[-1] == '"':
-        path = path[1:-1]
+    path. A filename legitimately containing ` => ` is indistinguishable from
+    the whole-path rename form in numstat's line output — accepted ambiguity
+    (vanishingly rare, and the cost is one file scored against the wrong
+    bucket)."""
+    path = _git_unquote(path)
     path = RENAME_BRACE_RX.sub(r"\1", path).replace("//", "/")
     if " => " in path:
         path = path.rsplit(" => ", 1)[1]
@@ -396,8 +422,11 @@ def compute_scores(commits, rule_globs, exclude_rxs, now, half_life_days):
       score[i][login]   decayed per-rule score
       touches[i][login] raw per-rule commit touches
       overall[login]    whole-repo decayed score (any surviving file)
-      gap[topdir][login] decayed score of files matching NO rule, keyed by
-                         the file's top-two-level directory
+      gap[topdir][login] decayed score of commits touching >=1 file matching
+                         NO rule, keyed by the file's top-two-level DIRECTORY
+                         ("(root)" for top-level files). Accumulated once per
+                         commit per key — same commit-touch semantics as the
+                         rule scores, so the two columns stay comparable.
     """
     score = [defaultdict(float) for _ in rule_globs]
     touches = [defaultdict(int) for _ in rule_globs]
@@ -406,6 +435,7 @@ def compute_scores(commits, rule_globs, exclude_rxs, now, half_life_days):
     for login, ts, paths in commits:
         w = decay_weight((now - ts) / 86400.0, half_life_days)
         touched = set()
+        gap_keys = set()
         any_file = False
         for path in paths:
             if any(rx.search(path) for rx in exclude_rxs):
@@ -417,12 +447,13 @@ def compute_scores(commits, rule_globs, exclude_rxs, now, half_life_days):
                     touched.add(i)
                     matched = True
             if not matched:
-                parts = path.split("/")
-                key = "/".join(parts[:2]) if len(parts) > 1 else parts[0]
-                gap[key][login] += w
+                dirs = path.split("/")[:-1]
+                gap_keys.add("/".join(dirs[:2]) if dirs else "(root)")
         if not any_file:
             continue
         overall[login] += w
+        for key in gap_keys:
+            gap[key][login] += w
         for i in touched:
             score[i][login] += w
             touches[i][login] += 1
@@ -467,8 +498,18 @@ def select_default_pool(overall, final_rule_lists, map_exclude, size=5,
 
 # --- GitHub API --------------------------------------------------------------
 
+# Sentinel distinct from None: "the API call FAILED" (timeout / 5xx / 403 /
+# bad JSON) vs "the API answered and the answer is empty". Callers must never
+# collapse the two — a transient failure that masquerades as "author has no
+# linked account" silently drops that contributor's history and biases the
+# proposal (the documented posture for environmental problems is a clean
+# no-op, not a skewed map).
+API_ERROR = object()
+
+
 def gh_get(url, token):
-    """GET a GitHub API URL; None on any error (callers degrade, not crash)."""
+    """GET a GitHub API URL; API_ERROR on any transport/HTTP failure so
+    callers can tell an outage from a genuinely empty answer."""
     req = urllib.request.Request(url, headers={
         "Authorization": "Bearer " + token,
         "Accept": "application/vnd.github+json",
@@ -479,7 +520,7 @@ def gh_get(url, token):
             return json.load(resp)
     except (urllib.error.URLError, TimeoutError, ValueError) as e:
         print(f"::warning::GET {url.split('?')[0]} failed: {e}")
-        return None
+        return API_ERROR
 
 
 def fetch_collaborators(api, repo, token):
@@ -488,9 +529,7 @@ def fetch_collaborators(api, repo, token):
     page = 1
     while True:
         data = gh_get(f"{api}/repos/{repo}/collaborators?per_page=100&page={page}", token)
-        if data is None:
-            return None
-        if not isinstance(data, list):
+        if data is API_ERROR or not isinstance(data, list):
             return None
         for c in data:
             if isinstance(c, dict) and c.get("login"):
@@ -502,9 +541,12 @@ def fetch_collaborators(api, repo, token):
 
 
 def resolve_email_via_api(api, repo, token, sha):
-    """Resolve a commit author email -> login via one commit fetch; None when
-    the email has no linked GitHub account (or the call fails)."""
+    """Resolve a commit author email -> login via one commit fetch. Returns
+    the login, None when the email has no linked GitHub account, or API_ERROR
+    when the call itself failed (callers must not treat that as no-account)."""
     data = gh_get(f"{api}/repos/{repo}/commits/{sha}", token)
+    if data is API_ERROR:
+        return API_ERROR
     if not isinstance(data, dict):
         return None
     author = data.get("author") or {}
@@ -512,6 +554,15 @@ def resolve_email_via_api(api, repo, token, sha):
 
 
 # --- report / PR body --------------------------------------------------------
+
+def md_code(s):
+    """Wrap repo-derived text (paths, directory names) in a Markdown code
+    span that cannot break out of its table cell: GFM honors `\\|` even
+    inside code spans within tables, and a backtick would close the span so
+    it is swapped for a plain apostrophe. Keeps a crafted filename from
+    injecting rows/links/mentions into the bot-authored PR body."""
+    return "`" + s.replace("|", "\\|").replace("`", "'") + "`"
+
 
 def fmt_login_score(login, score_map, touch_map, starred=frozenset()):
     star = "\\*" if login in starred else ""
@@ -541,7 +592,7 @@ def build_pr_body(report):
         "|---|---|---|---|",
     ]
     for r in report["rules"]:
-        paths = "<br>".join("`" + p + "`" for p in r["paths"]) or "—"
+        paths = "<br>".join(md_code(p) for p in r["paths"]) or "—"
         before = ", ".join(r["before"]) or "—"
         if r["under_floor"]:
             after = "*(unchanged — fewer than floor qualify; runtime falls " \
@@ -574,7 +625,7 @@ def build_pr_body(report):
         ]
         for g in report["gaps"]:
             top = ", ".join(f"{t['login']} ({t['score']:.1f})" for t in g["top"])
-            lines.append(f"| `{g['dir']}` | {g['score']:.1f} | {top} |")
+            lines.append(f"| {md_code(g['dir'])} | {g['score']:.1f} | {top} |")
         lines.append("")
     lines += [
         "### Knobs",
@@ -605,6 +656,18 @@ def _env_float(name, default):
         return default
 
 
+def _env_pos_float(name, default):
+    """_env_float, but the knob must be strictly positive — a zero half-life
+    would divide by zero and a negative one would invert the decay (older
+    commits gaining weight), so both fall back to the default with a warning
+    instead of crashing the never-fail run."""
+    v = _env_float(name, default)
+    if v <= 0:
+        print(f"::warning::{name} must be positive (got {v}) — using {default}")
+        return float(default)
+    return v
+
+
 def write_outputs(outputs):
     out_file = os.environ.get("GITHUB_OUTPUT")
     if not out_file:
@@ -632,7 +695,7 @@ def main():
     config_path = os.environ.get("REVIEWER_CONFIG_PATH") or ".github/reviewers.yml"
     knobs = {
         "window_months": _env_int("WINDOW_MONTHS", 12),
-        "half_life_days": _env_float("HALF_LIFE_DAYS", 90),
+        "half_life_days": _env_pos_float("HALF_LIFE_DAYS", 90),
         "top_k": _env_int("TOP_K", 4),
         "floor": _env_int("FLOOR", 2),
         "min_touches": _env_int("MIN_TOUCHES", 5),
@@ -643,7 +706,11 @@ def main():
     results_dir = os.environ.get("RESULTS_DIR") or os.environ.get("RUNNER_TEMP") or "."
     os.makedirs(results_dir, exist_ok=True)
 
-    # exclusion regexes (built-ins + caller extras; bad extras warn, not fail)
+    # exclusion regexes (built-ins + caller extras; bad extras warn, not
+    # fail). The extras are trusted caller workflow config — a caller can
+    # already run arbitrary code in their own workflow, so a pathological
+    # (catastrophic-backtracking) pattern only stalls the caller's own run
+    # until the job timeout; no complexity bound is attempted here.
     exclude_rxs = [re.compile(rx) for rx in BUILTIN_EXCLUDE_PATHS]
     for rx in (os.environ.get("EXTRA_EXCLUDE_PATHS") or "").splitlines():
         rx = rx.strip()
@@ -693,8 +760,21 @@ def main():
             email_login[e] = login
         else:
             email_sha.setdefault(e, sha)
+    failed_lookups = 0
     for e, sha in email_sha.items():
-        email_login[e] = resolve_email_via_api(api, repo, token, sha)
+        login = resolve_email_via_api(api, repo, token, sha)
+        if login is API_ERROR:
+            failed_lookups += 1
+            login = None
+        email_login[e] = login
+    if failed_lookups:
+        # A transient API failure (rate limit, 5xx, timeout) must not be
+        # scored as "these authors have no linked account" — that would
+        # silently drop their entire history and emit a biased proposal.
+        # Environmental problem -> the documented clean no-op; the next
+        # scheduled run retries with a fresh quota.
+        return _noop_exit(
+            f"email->login resolution failed for {failed_lookups} email(s)")
 
     # --- membership filter (collaborators = the runtime's eligibility) ------
     collaborators = fetch_collaborators(api, repo, token)
