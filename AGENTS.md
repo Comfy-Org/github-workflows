@@ -54,9 +54,8 @@ tests — run the matching command above for whatever you touched.
   — and (BE-4003) recognizes auto-builder PR state (open/merged/closed) so a
   built finding is never re-proposed — and `interval.py`, the runtime cadence
   gate (`GROOM_INTERVAL_DAYS`) that early-exits a daily tick unless the interval
-  has elapsed since the last real run (derived from run history — no new
-  secret). It uses GitHub issue+PR state as the store — no new secret. Tests in
-  `tests/`.
+  has elapsed since the last real run (derived from Actions run history — no new
+  secret). Tests in `tests/`.
 - `.github/bump-callers/` — `bump-callers.sh`, the ONE fleet-agnostic script
   that opens SHA-bump PRs in consumer repos when a reusable workflow changes.
   Tests in `tests/`.
