@@ -306,6 +306,59 @@ func TestClassifyHonorsLegitBaseGitattributes(t *testing.T) {
 	}
 }
 
+// TestWriteGeneratedPaths proves --generated-out serialization: exactly the
+// paths marked Generated are emitted, NUL-separated (so a name with spaces or a
+// newline round-trips), hand-written paths are omitted, and an all-hand-written
+// set yields a zero-byte file (which the cursor-review consumer reads as
+// "exclude nothing").
+func TestWriteGeneratedPaths(t *testing.T) {
+	t.Parallel()
+	files := []FileChange{
+		{Path: "api/service.pb.go", Generated: true},
+		{Path: "internal/hand.go", Generated: false},
+		{Path: "weird name\nwith newline.json", Generated: true},
+		{Path: "web/vendor/lib.js", Generated: true},
+	}
+	out := filepath.Join(t.TempDir(), "gen-paths")
+	if err := writeGeneratedPaths(files, out); err != nil {
+		t.Fatalf("writeGeneratedPaths: %v", err)
+	}
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Split on NUL; the trailing NUL after the final path yields an empty tail
+	// element, which the filter drops — mirroring how the consumer reads it.
+	var got []string
+	for _, p := range strings.Split(string(data), "\x00") {
+		if p != "" {
+			got = append(got, p)
+		}
+	}
+	want := []string{"api/service.pb.go", "weird name\nwith newline.json", "web/vendor/lib.js"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d paths %q, want %d %q", len(got), got, len(want), want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("path[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	// No generated files → a zero-byte file, not a missing one.
+	empty := filepath.Join(t.TempDir(), "empty")
+	if err := writeGeneratedPaths([]FileChange{{Path: "only-hand.go"}}, empty); err != nil {
+		t.Fatalf("writeGeneratedPaths (empty set): %v", err)
+	}
+	info, err := os.Stat(empty)
+	if err != nil {
+		t.Fatalf("stat empty output: %v", err)
+	}
+	if info.Size() != 0 {
+		t.Errorf("empty generated set should write a zero-byte file, got size %d", info.Size())
+	}
+}
+
 // TestClassifyAppliesExtras proves the per-repo extras exclude matching files
 // without any git attribute or content marker involved. Non-.go paths are used
 // so contentGenerated never consults git, and attr.trusted is false so the

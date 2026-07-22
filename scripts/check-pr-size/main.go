@@ -40,6 +40,7 @@ func main() {
 	bypassLabel := flag.String("bypass-label", envStr("PR_SIZE_BYPASS_LABEL", defaultBypassLabel), "PR label name the report offers as the bypass")
 	extraLockfiles := flag.String("extra-lockfiles", os.Getenv("PR_SIZE_EXTRA_LOCKFILES"), "extra lockfile base names to exclude (whitespace/comma separated)")
 	extraGlobs := flag.String("extra-generated-globs", os.Getenv("PR_SIZE_EXTRA_GENERATED_GLOBS"), "extra glob patterns treated as generated (whitespace/comma separated)")
+	generatedOut := flag.String("generated-out", "", "if set, also write the NUL-separated list of paths classified as generated to this file (for a downstream consumer to exclude, e.g. the cursor-review diff); does not change the size verdict")
 	flag.Parse()
 
 	if *base == "" {
@@ -92,9 +93,38 @@ func main() {
 	report(res, *modeFlag, *bypassLabel)
 	writeGitHubOutputs(res)
 
+	// Emit the classified generated paths for a downstream consumer (the
+	// cursor-review workflow excludes them from the diff it feeds the review
+	// models, reusing THIS classifier as the single source of truth for "what
+	// is codegen"). Written last and best-effort: a write failure is logged but
+	// never changes the size verdict already reported above, nor fails a check
+	// that would otherwise pass — the consumer degrades to no exclusions.
+	if *generatedOut != "" {
+		if err := writeGeneratedPaths(files, *generatedOut); err != nil {
+			fmt.Fprintf(os.Stderr, "check-pr-size: could not write --generated-out %q: %v\n", *generatedOut, err)
+		}
+	}
+
 	if shouldFail(res, *modeFlag) {
 		os.Exit(1)
 	}
+}
+
+// writeGeneratedPaths writes every path classified as generated to path,
+// NUL-separated with a trailing NUL after each entry. NUL matches the separator
+// git's `-z` numstat/check-attr use and round-trips paths containing spaces or
+// newlines (which the -z numstat parser already admits), so a consumer can read
+// it back with a NUL-delimited read loop and no quoting hazards. An empty
+// generated set writes a zero-byte file — a consumer reads it as "exclude nothing".
+func writeGeneratedPaths(files []FileChange, path string) error {
+	var b bytes.Buffer
+	for _, f := range files {
+		if f.Generated {
+			b.WriteString(f.Path)
+			b.WriteByte(0)
+		}
+	}
+	return os.WriteFile(path, b.Bytes(), 0o644)
 }
 
 // shouldFail reports whether the process should exit non-zero: over the cap

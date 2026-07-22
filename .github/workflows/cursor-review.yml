@@ -26,10 +26,14 @@ name: Cursor Review (reusable)
 #     cursor-review:
 #       uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@main
 #       with:
-#         # Repo-specific pathspecs excluded from the size cap and the diff.
-#         diff_excludes: >-
-#           :!**/package-lock.json
-#           :!data/object_info.json.gz
+#         # Repo-specific generated/vendored paths. Fed to the shared
+#         # check-pr-size classifier, so they're excluded from BOTH the size gate
+#         # and the reviewed diff — the same codegen detection the PR-size cap
+#         # uses (lockfiles, base-ref linguist-generated, Go markers are already
+#         # built in). Use diff_excludes only for diff-only, non-generated paths.
+#         extra_generated_globs: >-
+#           data/object_info.json.gz
+#           **/*.snap
 #         # Pin the assets ref to the same ref you pin `uses:` to for
 #         # reproducibility (defaults to main).
 #         workflows_ref: main
@@ -66,29 +70,56 @@ on:
         type: string
         required: false
         default: cursor-review
-      diff_excludes:
+      extra_generated_globs:
         description: >-
-          Whitespace-separated git pathspecs excluded from BOTH the size-budget
-          count and the diff fed to Cursor. Pass your repo's generated/vendored
-          paths (lockfiles, snapshots, fixtures) so they don't blow the cap or
-          waste review signal. Folded scalar collapses newlines to spaces so the
-          value word-splits into pathspec args. Paths with a leading underscore
-          need the long-form `:(exclude)` syntax — the short-form `:!` parser
-          reads `_` as pathspec magic.
+          Extra glob patterns treated as generated, fed to the shared
+          check-pr-size classifier. Matching files are excluded from BOTH the
+          diff-size gate AND the diff handed to the review panel + judge — the
+          exact same "what is codegen" logic the PR-size cap uses, so the two
+          workflows can't drift. `*` matches within a path segment, `**` across
+          segments, `?` one character; a pattern without `/` matches the base
+          name at any depth. This is the preferred knob for generated/vendored
+          paths: the classifier already covers dependency lockfiles, files
+          marked `linguist-generated` in the BASE ref's `.gitattributes` (so a
+          PR can't exempt itself), and the canonical Go
+          `// Code generated ... DO NOT EDIT.` marker — so you rarely need more.
         type: string
         required: false
         default: >-
-          :!**/package-lock.json
-          :!**/yarn.lock
-          :!**/pnpm-lock.yaml
-          :!**/go.sum
-          :!**/node_modules/**
-          :!**/.claude/**
-          :!**/dist/**
-          :!**/vendor/**
-          :!**/*.generated.*
-          :!**/*.min.js
-          :!**/*.min.css
+          **/node_modules/**
+          **/.claude/**
+          **/dist/**
+          **/vendor/**
+          **/*.generated.*
+          **/*.min.js
+          **/*.min.css
+      extra_lockfiles:
+        description: >-
+          Extra dependency-lockfile base names to exclude (count + diff), on top
+          of the classifier's built-ins (go.sum, go.work.sum, package-lock.json,
+          pnpm-lock.yaml, yarn.lock, Cargo.lock, poetry.lock, uv.lock).
+          Whitespace- or comma-separated; matched at any directory depth.
+        type: string
+        required: false
+        default: ''
+      diff_excludes:
+        description: >-
+          Additional git pathspecs excluded from the reviewed diff ONLY (not the
+          size gate), applied verbatim ON TOP of the shared classifier's
+          generated-file exclusion. Back-compat escape hatch for one-off paths
+          that aren't "generated" per se; for generated/vendored paths prefer
+          `extra_generated_globs`, which also keeps them out of the size gate.
+          Folded scalar collapses newlines to spaces so the value word-splits
+          into pathspec args. Paths with a leading underscore need the long-form
+          `:(exclude)` syntax — the short-form `:!` parser reads `_` as pathspec
+          magic. (Previously this fed both the count and the diff and defaulted
+          to the lockfile/vendored list; that list now lives in the classifier
+          and `extra_generated_globs`, so the default here is empty. Callers that
+          listed generated paths here should move them to `extra_generated_globs`
+          to keep them out of the size gate too.)
+        type: string
+        required: false
+        default: ''
       workflows_ref:
         description: >-
           Ref of Comfy-Org/github-workflows to load the prompts and scripts
@@ -137,6 +168,8 @@ env:
   REVIEW_LABEL: ${{ inputs.review_label }}
   JUDGE_MODEL: ${{ inputs.judge_model }}
   DIFF_EXCLUDES: ${{ inputs.diff_excludes }}
+  EXTRA_GENERATED_GLOBS: ${{ inputs.extra_generated_globs }}
+  EXTRA_LOCKFILES: ${{ inputs.extra_lockfiles }}
   # Where the assets checkout lands (this repo, .github/cursor-review/*).
   CURSOR_REVIEW_ASSETS: ${{ github.workspace }}/_cursor_review_assets/.github/cursor-review
 
@@ -256,38 +289,128 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    # within_cap is derived from the shared check-pr-size tool's `over_cap`
+    # output: counted = non-generated changed lines, compared against the review
+    # cap passed as --max. If the tool fails operationally, over_cap is unset and
+    # this evaluates true — falling open to "review it" rather than silently
+    # skipping a PR because the classifier hiccuped.
     outputs:
-      within_cap: ${{ steps.count.outputs.within_cap }}
+      within_cap: ${{ steps.check.outputs.over_cap != 'true' }}
     steps:
-      - name: Checkout PR repo
-        uses: actions/checkout@v6
+      - name: Checkout PR head
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
         with:
+          # Full history so the BASE...HEAD three-dot diff resolves and the
+          # tool's base-ref reads (linguist-generated via `check-attr --source`,
+          # deleted-file blob fallbacks) work without a separate fetch.
           fetch-depth: 0
           persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Count changed lines
-        id: count
+      - name: Load check-pr-size tool
+        # The SAME classifier the PR-size cap uses — the single source of truth
+        # for "what is codegen". Comes from THIS repo (public, pinned via
+        # workflows_ref), never the PR checkout, so a malicious PR can't rewrite
+        # the logic that decides which of its files skip review.
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _pr_size_tool
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
+        with:
+          go-version-file: _pr_size_tool/scripts/check-pr-size/go.mod
+          # Dependency-free module (no go.sum) — nothing to cache.
+          cache: false
+
+      - name: Build check-pr-size
+        env:
+          # See pr-size.yml: the tool is checked out UNDER the consumer repo's
+          # checkout, so a root go.work would otherwise refuse the build. The
+          # tool is dependency-free; disable workspace mode and build standalone.
+          # Quoted "off" — unquoted off is coerced to GOWORK=false by the Actions
+          # YAML parser, which Go then rejects as a bad workspace-file path.
+          GOWORK: "off"
+        run: |
+          # Drop anything the PR checkout could have pre-seeded under the tool
+          # path so the build compiles only the pinned sources.
+          git -C _pr_size_tool clean -ffdx
+          (cd _pr_size_tool/scripts/check-pr-size && go build -o "${RUNNER_TEMP}/check-pr-size" .)
+
+      - name: Classify generated files and check size
+        id: check
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          # numstat reports "-\t-" for binary files; treat those as 0 lines so
-          # binary-only PRs can't bypass the size cap by producing no insertion
-          # tokens for grep to count.
-          # $DIFF_EXCLUDES is intentionally unquoted: bash word-splits it into
-          # separate pathspec args. Pathspecs all start with ":!", so pathname
-          # expansion finds no matches and leaves them literal.
-          # shellcheck disable=SC2086
-          TOTAL=$(git diff --numstat "$BASE_SHA...$HEAD_SHA" -- . $DIFF_EXCLUDES \
-            | awk '{ if ($1 != "-") added += $1; if ($2 != "-") removed += $2 } END { print (added + removed) + 0 }')
-          echo "Changed lines: $TOTAL (cap: $DIFF_SIZE_CAP)"
-
-          if [ "$TOTAL" -gt "$DIFF_SIZE_CAP" ]; then
-            echo "Diff exceeds cap — skipping review."
-            echo "within_cap=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "within_cap=true" >> "$GITHUB_OUTPUT"
+          # Reuse the PR-size classifier as the single source of truth. --max is
+          # THIS review's cap (DIFF_SIZE_CAP), so the tool's `over_cap` output
+          # means "non-generated changed lines exceed the review cap" — exactly
+          # the gate we want. --mode warn: the tool never exits non-zero on
+          # overage (this workflow gates via within_cap, not the tool's own
+          # pass/fail). The same run writes the classified generated paths to
+          # --generated-out for the diff step below, so classification happens
+          # ONCE and the count and the reviewed diff can never disagree.
+          #
+          # An operational failure (exit 2 — bad ref, git error) leaves over_cap
+          # unset → within_cap evaluates true → the diff step, finding no
+          # generated-paths file, falls back to diff_excludes-only (the pre-tool
+          # behavior). Fail open to "review", never silently skip.
+          rc=0
+          "${RUNNER_TEMP}/check-pr-size" \
+            --base "${BASE_SHA}" \
+            --head "${HEAD_SHA}" \
+            --max "${DIFF_SIZE_CAP}" \
+            --mode warn \
+            --extra-generated-globs "${EXTRA_GENERATED_GLOBS}" \
+            --extra-lockfiles "${EXTRA_LOCKFILES}" \
+            --generated-out "${RUNNER_TEMP}/generated-paths" || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning::check-pr-size exited ${rc} — reviewing with no generated-file exclusions (diff_excludes still apply)."
+            rm -f "${RUNNER_TEMP}/generated-paths"
           fi
+
+      - name: Build reviewed diff (generated files excluded)
+        # Skip when over cap: the review is skipped anyway, so don't spend time
+        # rendering (and uploading) a diff nothing will consume.
+        if: steps.check.outputs.over_cap != 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Exclude every path the classifier flagged generated, plus any caller
+          # diff_excludes pathspecs (applied verbatim, back-compat).
+          # :(exclude,literal) disables pathspec magic so a path with
+          # metacharacters matches literally. An absent/empty generated-paths
+          # file (tool degraded, or nothing generated) leaves EXCLUDE_ARGS empty,
+          # so the diff is just the full diff minus diff_excludes.
+          EXCLUDE_ARGS=()
+          if [ -s "${RUNNER_TEMP}/generated-paths" ]; then
+            while IFS= read -r -d '' p; do
+              if [ -n "$p" ]; then EXCLUDE_ARGS+=(":(exclude,literal)${p}"); fi
+            done < "${RUNNER_TEMP}/generated-paths"
+          fi
+          echo "Excluding ${#EXCLUDE_ARGS[@]} generated file(s) classified by check-pr-size."
+          # $DIFF_EXCLUDES is intentionally unquoted so bash word-splits it into
+          # pathspec args; the tool-derived excludes are a quoted array.
+          # shellcheck disable=SC2086
+          git diff "${BASE_SHA}...${HEAD_SHA}" -- . $DIFF_EXCLUDES "${EXCLUDE_ARGS[@]}" \
+            > "${RUNNER_TEMP}/pr-diff.patch"
+          echo "Reviewed diff size: $(wc -l < "${RUNNER_TEMP}/pr-diff.patch") lines"
+
+      - name: Upload reviewed diff
+        # Shared with the panel cells + judge so the diff is generated ONCE, and
+        # those jobs need no PR checkout of their own.
+        if: steps.check.outputs.over_cap != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: pr-diff
+          path: ${{ runner.temp }}/pr-diff.patch
+          if-no-files-found: error
+          retention-days: 7
 
   preflight:
     # Validate the panel's pinned model ids against the LIVE Cursor catalog
@@ -450,12 +573,6 @@ jobs:
               json.dump(record, f)
           PY
 
-      - name: Checkout PR repo
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
       - name: Load cursor-review assets
         # Trusted prompts/scripts come from THIS workflow's repo (public,
         # pinned via workflows_ref) — never from the PR checkout, so a
@@ -468,16 +585,14 @@ jobs:
           path: _cursor_review_assets
           persist-credentials: false
 
-      - name: Generate diff
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          # See diff_excludes input for the rationale and pathspec list.
-          # shellcheck disable=SC2086
-          git diff "$BASE_SHA...$HEAD_SHA" -- . $DIFF_EXCLUDES > /tmp/pr-diff.patch
-
-          echo "Diff size: $(wc -l < /tmp/pr-diff.patch) lines"
+      - name: Download reviewed diff
+        # The generated-file-excluded diff is built ONCE in the diff-size job and
+        # shared here, so this cell needs no PR checkout of its own — the only
+        # PR-authored content it ever sees is the diff text it reviews.
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: pr-diff
+          path: /tmp
 
       - name: Install Cursor agent CLI
         run: |
@@ -581,12 +696,6 @@ jobs:
       contents: read
       pull-requests: write
     steps:
-      - name: Checkout PR repo
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
       - name: Load cursor-review assets
         uses: actions/checkout@v6
         with:
@@ -595,14 +704,14 @@ jobs:
           path: _cursor_review_assets
           persist-credentials: false
 
-      - name: Generate diff
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          # See diff_excludes input for the rationale and pathspec list.
-          # shellcheck disable=SC2086
-          git diff "$BASE_SHA...$HEAD_SHA" -- . $DIFF_EXCLUDES > /tmp/pr-diff.patch
+      - name: Download reviewed diff
+        # Same generated-file-excluded diff the panel reviewed, built once in
+        # diff-size — so the judge adjudicates against exactly what the panel
+        # saw, and this job needs no PR checkout.
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: pr-diff
+          path: /tmp
 
       - name: Install Cursor agent CLI
         run: |
