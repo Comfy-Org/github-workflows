@@ -12,6 +12,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"io"
@@ -49,10 +50,17 @@ type FileChange struct {
 	Deleted   int
 	Binary    bool
 	Generated bool
+	// Discounted is the number of this file's changed lines (added + deleted)
+	// that are blank or comment-only, so excluded from the counted total when
+	// comment-discounting is on. Zero unless annotateDiscounts populated it (see
+	// main.go), so Counted() == Changed() for every existing path/test by
+	// default — the feature only ever subtracts.
+	Discounted int
 }
 
-// Changed returns the line count this file contributes to PR size (added +
-// deleted). Binary files contribute nothing (they are not lines of code).
+// Changed returns the raw line count this file contributes (added + deleted),
+// used for reporting a file's size and for the generated-exclusion total.
+// Binary files contribute nothing (they are not lines of code).
 func (f FileChange) Changed() int {
 	if f.Binary {
 		return 0
@@ -60,14 +68,26 @@ func (f FileChange) Changed() int {
 	return f.Added + f.Deleted
 }
 
+// Counted returns the lines this file contributes to the cap: its changed lines
+// minus any blank/comment lines discounted from the count. Never negative
+// (Discounted is clamped to Changed() by the caller). Equal to Changed() when
+// nothing was discounted, so the default (comment-discounting off) is unchanged.
+func (f FileChange) Counted() int {
+	if c := f.Changed() - f.Discounted; c > 0 {
+		return c
+	}
+	return 0
+}
+
 // Result is the outcome of evaluating a diff against the cap.
 type Result struct {
-	Counted   int  // changed lines from non-generated, non-binary files
-	Generated int  // changed lines excluded because the file is generated
-	Max       int  // the configured ceiling
-	Bypassed  bool // a bypass label was present
-	OK        bool // Bypassed OR Counted <= Max
-	// Files sorted by descending Changed(), for reporting.
+	Counted    int  // counted lines from non-generated, non-binary files (after any comment/blank discount)
+	Generated  int  // changed lines excluded because the file is generated
+	Discounted int  // changed lines excluded from non-generated files as blank/comment-only (count-only)
+	Max        int  // the configured ceiling
+	Bypassed   bool // a bypass label was present
+	OK         bool // Bypassed OR Counted <= Max
+	// Files sorted by descending Counted(), for reporting.
 	Files []FileChange
 	// Note is an optional human-facing explanation appended to the report (e.g.
 	// why linguist-generated exclusions were skipped). Set by the caller.
@@ -288,11 +308,153 @@ func Evaluate(files []FileChange, max int, bypassed bool) Result {
 			res.Generated += f.Changed()
 			continue
 		}
-		res.Counted += f.Changed()
+		res.Counted += f.Counted()
+		res.Discounted += f.Discounted
 	}
 	res.OK = bypassed || res.Counted <= max
 	sort.SliceStable(res.Files, func(i, j int) bool {
-		return res.Files[i].Changed() > res.Files[j].Changed()
+		return res.Files[i].Counted() > res.Files[j].Counted()
 	})
 	return res
+}
+
+// commentSyntax describes a language's comment markers for the blank/comment
+// discounting heuristic. line holds full-line comment prefixes; blockStart /
+// blockEnd bound a block comment. Only SINGLE-LINE block comments (start and
+// end on the same trimmed line) are recognized — multi-line block bodies and
+// language string literals are deliberately NOT tracked (that would need a real
+// per-language lexer). The heuristic is count-only and documented as approximate.
+type commentSyntax struct {
+	line       []string
+	blockStart string
+	blockEnd   string
+}
+
+var (
+	cFamily = commentSyntax{line: []string{"//"}, blockStart: "/*", blockEnd: "*/"} // C/Go/JS/TS/Rust/…
+	hashCmt = commentSyntax{line: []string{"#"}}                                    // Python/Ruby/shell/YAML/…
+	dashCmt = commentSyntax{line: []string{"--"}}                                   // SQL/Lua/Haskell
+	mlCmt   = commentSyntax{blockStart: "<!--", blockEnd: "-->"}                    // HTML/XML/Markdown/Vue
+)
+
+// extComment maps a lowercased file extension (with dot) to its comment syntax.
+// An extension not listed has no comment markers, so only blank lines are ever
+// discounted for it — safe (never miscounts real code as a comment).
+var extComment = map[string]commentSyntax{
+	".go": cFamily, ".c": cFamily, ".h": cFamily, ".cc": cFamily, ".cpp": cFamily,
+	".cxx": cFamily, ".hpp": cFamily, ".hh": cFamily, ".java": cFamily, ".js": cFamily,
+	".jsx": cFamily, ".ts": cFamily, ".tsx": cFamily, ".mjs": cFamily, ".cjs": cFamily,
+	".rs": cFamily, ".kt": cFamily, ".kts": cFamily, ".swift": cFamily, ".scala": cFamily,
+	".cs": cFamily, ".php": cFamily, ".m": cFamily, ".mm": cFamily, ".dart": cFamily,
+	".proto": cFamily, ".gradle": cFamily, ".groovy": cFamily,
+	".py": hashCmt, ".rb": hashCmt, ".sh": hashCmt, ".bash": hashCmt, ".zsh": hashCmt,
+	".yaml": hashCmt, ".yml": hashCmt, ".toml": hashCmt, ".pl": hashCmt, ".pm": hashCmt,
+	".r": hashCmt, ".tf": hashCmt, ".tfvars": hashCmt, ".mk": hashCmt, ".ps1": hashCmt,
+	".sql": dashCmt, ".lua": dashCmt, ".hs": dashCmt,
+	".html": mlCmt, ".htm": mlCmt, ".xml": mlCmt, ".vue": mlCmt, ".svelte": mlCmt,
+	".md": mlCmt, ".markdown": mlCmt,
+}
+
+// commentSyntaxFor returns the comment syntax for a path by extension (plus a
+// few well-known extensionless names). Unknown → zero value (blank-only).
+func commentSyntaxFor(path string) commentSyntax {
+	switch baseName(path) {
+	case "Makefile", "makefile", "GNUmakefile", "Dockerfile":
+		return hashCmt
+	}
+	base := baseName(path)
+	if dot := strings.LastIndex(base, "."); dot >= 0 {
+		return extComment[strings.ToLower(base[dot:])]
+	}
+	return commentSyntax{}
+}
+
+// isInsignificantLine reports whether a changed line's body (the diff line with
+// its +/- marker already stripped) is blank or a comment under cs, and so should
+// not count toward PR size. A line whose non-whitespace content merely CONTAINS
+// a comment token (e.g. a string literal `x = "# not a comment"`) is significant
+// — only a line that STARTS (after trimming) with a comment marker is dropped.
+func isInsignificantLine(body string, cs commentSyntax) bool {
+	t := strings.TrimSpace(body)
+	if t == "" {
+		return true
+	}
+	for _, prefix := range cs.line {
+		if strings.HasPrefix(t, prefix) {
+			return true
+		}
+	}
+	if cs.blockStart != "" && strings.HasPrefix(t, cs.blockStart) && strings.Contains(t, cs.blockEnd) {
+		return true
+	}
+	return false
+}
+
+// ParseDiscounts parses a unified diff and returns, per new-file path, the count
+// of changed lines (added or removed) that are blank or comment-only under that
+// file's language. It is pure (reads from patch) so it unit-tests against literal
+// diffs. File/section headers (`+++ `, `--- `) are only honored OUTSIDE a hunk;
+// once inside a hunk (after `@@`) a leading `+`/`-` is content — so an added line
+// whose own text begins with `+++`/`---` is never mistaken for a header. A path
+// git had to quote (spaces/specials; non-ASCII is disabled via core.quotePath in
+// the caller) is left as-is and simply won't match the numstat path, so that file
+// falls back to its raw count — the discount only ever applies to paths we
+// resolved cleanly.
+func ParseDiscounts(patch io.Reader) (map[string]int, error) {
+	result := map[string]int{}
+	sc := bufio.NewScanner(patch)
+	// Allow very long lines (e.g. minified/one-line files) rather than erroring;
+	// 16 MiB is far past any real source line.
+	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+
+	var path string
+	var cs commentSyntax
+	var haveFile, inHunk bool
+	for sc.Scan() {
+		line := sc.Text()
+		switch {
+		case strings.HasPrefix(line, "diff --git "):
+			haveFile, inHunk, path = false, false, ""
+		case !inHunk && strings.HasPrefix(line, "--- "):
+			if p := parseDiffHeaderPath(line[4:]); p != "" {
+				path, cs, haveFile = p, commentSyntaxFor(p), true
+			}
+		case !inHunk && strings.HasPrefix(line, "+++ "):
+			if p := parseDiffHeaderPath(line[4:]); p != "" {
+				path, cs, haveFile = p, commentSyntaxFor(p), true
+			}
+		case strings.HasPrefix(line, "@@"):
+			inHunk = true
+		case inHunk && strings.HasPrefix(line, "+"):
+			if haveFile && isInsignificantLine(line[1:], cs) {
+				result[path]++
+			}
+		case inHunk && strings.HasPrefix(line, "-"):
+			if haveFile && isInsignificantLine(line[1:], cs) {
+				result[path]++
+			}
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// parseDiffHeaderPath extracts the file path from a diff `--- ` / `+++ ` header
+// value (the text after the 4-char prefix). Returns "" for /dev/null (added or
+// deleted side) and for a git-quoted path (starts with a double quote — left
+// unresolved so its file falls back to the raw count). Strips the a/ or b/ prefix
+// and a trailing tab-delimited timestamp git may append.
+func parseDiffHeaderPath(v string) string {
+	if i := strings.IndexByte(v, '\t'); i >= 0 {
+		v = v[:i]
+	}
+	if v == "/dev/null" || v == "" || strings.HasPrefix(v, `"`) {
+		return ""
+	}
+	if len(v) >= 2 && (v[:2] == "a/" || v[:2] == "b/") {
+		return v[2:]
+	}
+	return v
 }

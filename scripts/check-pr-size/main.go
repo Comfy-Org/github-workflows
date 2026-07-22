@@ -41,6 +41,7 @@ func main() {
 	extraLockfiles := flag.String("extra-lockfiles", os.Getenv("PR_SIZE_EXTRA_LOCKFILES"), "extra lockfile base names to exclude (whitespace/comma separated)")
 	extraGlobs := flag.String("extra-generated-globs", os.Getenv("PR_SIZE_EXTRA_GENERATED_GLOBS"), "extra glob patterns treated as generated (whitespace/comma separated)")
 	generatedOut := flag.String("generated-out", "", "if set, also write the NUL-separated list of paths classified as generated to this file (for a downstream consumer to exclude, e.g. the cursor-review diff); does not change the size verdict")
+	ignoreComments := flag.Bool("ignore-comments", envBool("PR_SIZE_IGNORE_COMMENTS"), "exclude blank and comment-only changed lines from the counted total (heuristic, count-only; never affects generated classification or --generated-out)")
 	flag.Parse()
 
 	if *base == "" {
@@ -73,6 +74,12 @@ func main() {
 	attrModified := TouchesGitattributes(files)
 	attr.trusted = attrTrusted(attr.useSource, attrModified, *bypassFlag)
 	classify(files, *base, *head, attr, extras)
+
+	// Discount blank/comment-only changed lines from the count (opt-in). Runs
+	// after classify so it only ever inspects non-generated, non-binary files.
+	if *ignoreComments {
+		annotateDiscounts(files, *base, *head)
+	}
 
 	res := Evaluate(files, *maxFlag, *bypassFlag)
 	if !res.OK && !attr.trusted {
@@ -142,6 +149,63 @@ func diffFiles(base, head string) ([]FileChange, error) {
 		return nil, fmt.Errorf("git diff failed: %w", err)
 	}
 	return ParseNumstat(strings.NewReader(out))
+}
+
+// annotateDiscounts sets FileChange.Discounted for each non-generated, non-binary
+// file to the number of its changed lines that are blank or comment-only, so the
+// counted total reflects significant lines. Count-only: it never changes which
+// files are generated, nor any diff a consumer builds from --generated-out.
+//
+// Best-effort by design: on any git/parse failure it leaves Discounted at 0, so
+// that file counts raw — a failure can only make the cap STRICTER, never sneak a
+// large change under it. Restricts the patch to the counted paths, so a large
+// generated diff is never fetched or parsed.
+func annotateDiscounts(files []FileChange, base, head string) {
+	idx := make(map[string]*FileChange, len(files))
+	paths := make([]string, 0, len(files))
+	for i := range files {
+		f := &files[i]
+		if f.Generated || f.Binary {
+			continue
+		}
+		paths = append(paths, f.Path)
+		idx[f.Path] = f
+	}
+	if len(paths) == 0 {
+		return
+	}
+	patch, err := runGitDiffPatch(base, head, paths)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "check-pr-size: comment discounting skipped (git diff failed): %v\n", err)
+		return
+	}
+	discounts, err := ParseDiscounts(strings.NewReader(patch))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "check-pr-size: comment discounting skipped (parse failed): %v\n", err)
+		return
+	}
+	for p, d := range discounts {
+		f, ok := idx[p]
+		if !ok {
+			continue // header path git quoted, or otherwise unmatched — count raw
+		}
+		if d > f.Changed() {
+			d = f.Changed() // clamp: never discount more than the file changed
+		}
+		f.Discounted = d
+	}
+}
+
+// runGitDiffPatch returns the unified-diff patch for the PR's net changes (three
+// dot) restricted to the given paths. core.quotePath=false keeps non-ASCII paths
+// unquoted so ParseDiscounts can read them back; the :(literal) pathspec magic
+// disables wildcards so a filename with glob metacharacters is matched literally.
+func runGitDiffPatch(base, head string, paths []string) (string, error) {
+	args := []string{"-c", "core.quotePath=false", "diff", base + "..." + head, "--"}
+	for _, p := range paths {
+		args = append(args, ":(literal)"+p)
+	}
+	return runGit(args...)
 }
 
 // attrPolicy controls how the linguist-generated git attribute is consulted.
@@ -335,6 +399,9 @@ func renderReport(res Result, mode, bypassLabel string) string {
 	fmt.Fprintf(&b, "- Changed lines counted (non-generated): **%d**\n", res.Counted)
 	fmt.Fprintf(&b, "- Cap: **%d**\n", res.Max)
 	fmt.Fprintf(&b, "- Excluded (generated/lockfiles): %d\n", res.Generated)
+	if res.Discounted > 0 {
+		fmt.Fprintf(&b, "- Excluded (blank/comment lines): %d\n", res.Discounted)
+	}
 	if res.Bypassed {
 		fmt.Fprintf(&b, "- Bypassed via `%s` label ✅\n", bypassLabel)
 	}
@@ -355,7 +422,7 @@ func renderReport(res Result, mode, bypassLabel string) string {
 	shown := 0
 	var top strings.Builder
 	for _, f := range res.Files {
-		if f.Generated || f.Changed() == 0 {
+		if f.Generated || f.Counted() == 0 {
 			continue
 		}
 		if shown == 0 {

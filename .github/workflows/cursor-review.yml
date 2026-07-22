@@ -60,11 +60,25 @@ on:
         default: claude-opus-4-8-thinking-max
       diff_size_cap:
         description: >-
-          Max changed lines (added + removed, after diff_excludes). PRs over
-          the cap are skipped — too large for a useful single-pass review.
+          Max counted changed lines. PRs over the cap are skipped — too large
+          for a useful single-pass review. "Counted" is added + removed lines
+          after the shared classifier's generated-file exclusion and (when
+          ignore_comments is true) blank/comment-line discounting.
         type: number
         required: false
         default: 5000
+      ignore_comments:
+        description: >-
+          Discount blank lines and comment-only lines from the counted total, so
+          AI-generated comment volume doesn't push a PR over the cap and skip the
+          review. Count-only: comments are still sent to the review panel (a
+          reviewer should catch wrong or misleading comments). Heuristic
+          (per-language, single-line comment markers; multi-line block-comment
+          bodies and string literals aren't lexed), so it's approximate. Default
+          true; set false to count every changed line.
+        type: boolean
+        required: false
+        default: true
       review_label:
         description: Label whose addition triggers the review.
         type: string
@@ -345,6 +359,9 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # Read by the tool's --ignore-comments default: discount blank/comment
+          # lines from the counted total (count-only; the reviewed diff keeps them).
+          PR_SIZE_IGNORE_COMMENTS: ${{ inputs.ignore_comments }}
         run: |
           # Reuse the PR-size classifier as the single source of truth. --max is
           # THIS review's cap (DIFF_SIZE_CAP), so the tool's `over_cap` output

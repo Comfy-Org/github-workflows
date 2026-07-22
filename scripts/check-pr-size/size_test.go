@@ -410,3 +410,143 @@ func TestContentGeneratedRejectsSymlink(t *testing.T) {
 		t.Errorf("contentGenerated must not follow symlinks")
 	}
 }
+
+// TestCommentSyntaxFor pins the ext/basename → comment-syntax mapping, including
+// the "unknown extension gets no comment markers" (blank-only) safe default.
+func TestCommentSyntaxFor(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		path      string
+		wantLine  []string
+		wantBlock string // blockStart, "" if none
+	}{
+		{"pkg/foo.go", []string{"//"}, "/*"},
+		{"web/app.tsx", []string{"//"}, "/*"},
+		{"scripts/deploy.sh", []string{"#"}, ""},
+		{"infra/main.tf", []string{"#"}, ""},
+		{"db/schema.sql", []string{"--"}, ""},
+		{"docs/index.html", nil, "<!--"},
+		{"Makefile", []string{"#"}, ""},
+		{"build/Dockerfile", []string{"#"}, ""},
+		{"data/blob.bin", nil, ""},              // unknown ext → blank-only
+		{"README", nil, ""},                     // no extension → blank-only
+		{"path/UPPER.GO", []string{"//"}, "/*"}, // extension match is case-insensitive
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			t.Parallel()
+			cs := commentSyntaxFor(tt.path)
+			if strings.Join(cs.line, ",") != strings.Join(tt.wantLine, ",") {
+				t.Errorf("%s: line = %v, want %v", tt.path, cs.line, tt.wantLine)
+			}
+			if cs.blockStart != tt.wantBlock {
+				t.Errorf("%s: blockStart = %q, want %q", tt.path, cs.blockStart, tt.wantBlock)
+			}
+		})
+	}
+}
+
+// TestIsInsignificantLine pins the per-line heuristic: blanks and comment-prefixed
+// lines are insignificant; a comment token merely CONTAINED in code (a string
+// literal) is significant; a multi-line block-comment body (no single-line
+// close) is significant (documented limitation).
+func TestIsInsignificantLine(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		body string
+		cs   commentSyntax
+		want bool
+	}{
+		{"blank", "", cFamily, true},
+		{"whitespace only", "   \t", cFamily, true},
+		{"go line comment", "  // explain", cFamily, true},
+		{"go code", "\tx := f()", cFamily, false},
+		{"single-line block", "/* note */", cFamily, true},
+		{"block open only is significant", "/* start of a long block", cFamily, false},
+		{"go pointer deref is code, not comment", "*out = result", cFamily, false},
+		{"hash comment python", "# a note", hashCmt, true},
+		{"hash token inside string is code", `url = "http://x#frag"`, hashCmt, false},
+		{"sql dash comment", "-- drop", dashCmt, true},
+		{"html single-line comment", "<!-- hi -->", mlCmt, true},
+		{"unknown lang: blank still insignificant", "   ", commentSyntax{}, true},
+		{"unknown lang: comment-looking code counts", "// still code here", commentSyntax{}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isInsignificantLine(tt.body, tt.cs); got != tt.want {
+				t.Errorf("isInsignificantLine(%q) = %v, want %v", tt.body, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestParseDiscounts feeds a literal unified diff spanning a .go and a .py file
+// and checks the per-path blank/comment counts. It also covers the header-vs-
+// content ambiguity: an ADDED line whose own text begins with "+++" (inside a
+// hunk) must be treated as content, never as a file header.
+func TestParseDiscounts(t *testing.T) {
+	t.Parallel()
+	patch := strings.Join([]string{
+		"diff --git a/pkg/foo.go b/pkg/foo.go",
+		"index 111..222 100644",
+		"--- a/pkg/foo.go",
+		"+++ b/pkg/foo.go",
+		"@@ -1,3 +1,7 @@",
+		" package foo",
+		"+// added comment", // insignificant (go comment)
+		"+",                 // insignificant (blank)
+		"+func F() int {",   // significant
+		"+++ still content", // significant: leading + stripped -> "++ still content", not a header
+		"-x := 1",           // significant (removed code)
+		"-// old comment",   // insignificant (removed comment)
+		" return 0",
+		"diff --git a/app.py b/app.py",
+		"index 333..444 100644",
+		"--- a/app.py",
+		"+++ b/app.py",
+		"@@ -0,0 +1,2 @@",
+		"+# python comment", // insignificant
+		"+value = 42",       // significant
+		"",
+	}, "\n")
+
+	got, err := ParseDiscounts(strings.NewReader(patch))
+	if err != nil {
+		t.Fatalf("ParseDiscounts: %v", err)
+	}
+	if got["pkg/foo.go"] != 3 {
+		t.Errorf("pkg/foo.go discounted = %d, want 3 (comment, blank, removed comment)", got["pkg/foo.go"])
+	}
+	if got["app.py"] != 1 {
+		t.Errorf("app.py discounted = %d, want 1 (python comment)", got["app.py"])
+	}
+}
+
+// TestEvaluateDiscount proves Discounted lowers the counted total (not the
+// generated total) and that a fully blank/comment file drops to zero counted.
+func TestEvaluateDiscount(t *testing.T) {
+	t.Parallel()
+	files := []FileChange{
+		{Path: "a.go", Added: 100, Deleted: 0, Discounted: 40}, // 60 counted
+		{Path: "b.go", Added: 20, Deleted: 0, Discounted: 20},  // all comment → 0 counted
+		{Path: "gen.pb.go", Added: 900, Generated: true},       // excluded wholesale
+	}
+	res := Evaluate(files, 1000, false)
+	if res.Counted != 60 {
+		t.Errorf("Counted = %d, want 60", res.Counted)
+	}
+	if res.Discounted != 60 {
+		t.Errorf("Discounted = %d, want 60 (40+20)", res.Discounted)
+	}
+	if res.Generated != 900 {
+		t.Errorf("Generated = %d, want 900 (raw, discount does not touch generated)", res.Generated)
+	}
+	// b.go contributes 0 counted lines.
+	for _, f := range res.Files {
+		if f.Path == "b.go" && f.Counted() != 0 {
+			t.Errorf("b.go Counted() = %d, want 0", f.Counted())
+		}
+	}
+}
