@@ -166,16 +166,38 @@ class BuildLedgerTest(unittest.TestCase):
         self.assertEqual(len(led), 0)
 
     def test_includes_signed_builder_pr(self):
-        # A groom builder PR carries the marker → it IS a ledger record now.
-        led = ledger.build_ledger([issue("built", pr=True, state="open")])
+        # A groom builder PR carries the marker AND the bot's `groom-pr` label →
+        # it IS a ledger record now.
+        led = ledger.build_ledger(
+            [issue("built", pr=True, state="open", labels=("groom", "groom-pr"))]
+        )
         self.assertEqual(led, {"built": ledger.PR_OPEN})
 
-    def test_pr_closed_beats_open_issue_for_same_signature(self):
-        # A finding filed as an issue AND later built into a declined PR: the
-        # human decline (pr-closed) is the most decision-bearing status.
+    def test_skips_pr_without_builder_label(self):
+        # A `groom`-labeled PR carrying a pasted signature marker but NOT the
+        # bot-applied `groom-pr` label is a spoof — it must not enter the ledger
+        # (else anyone with label access could suppress a live finding).
+        led = ledger.build_ledger([issue("spoof", pr=True, state="open")])
+        self.assertEqual(len(led), 0)
+
+    def test_spoof_pr_cannot_suppress_live_issue(self):
+        # A genuine open issue for a signature stays FILED even if a hand-opened
+        # `groom` PR (no `groom-pr` label) pastes the same marker and is closed
+        # unmerged to try to force a `pr-closed` suppression.
         led = ledger.build_ledger([
             issue("dup", state="open"),
-            issue("dup", pr=True, state="closed", merged_at=None),
+            issue("dup", pr=True, state="closed", merged_at=None),  # no groom-pr
+        ])
+        self.assertEqual(led["dup"], ledger.FILED)
+
+    def test_pr_closed_beats_open_issue_for_same_signature(self):
+        # A finding filed as an issue AND later built into a declined builder PR
+        # (carrying `groom-pr`): the human decline (pr-closed) is the most
+        # decision-bearing status.
+        led = ledger.build_ledger([
+            issue("dup", state="open"),
+            issue("dup", pr=True, state="closed", merged_at=None,
+                  labels=("groom", "groom-pr")),
         ])
         self.assertEqual(led["dup"], ledger.PR_CLOSED)
 
@@ -300,27 +322,34 @@ class AcceptanceScenarioTest(unittest.TestCase):
 
     # --- Builder auto-PR dedup (BE-4003, acceptance criterion 3) ---
 
+    # Builder PRs carry the bot-applied `groom-pr` label — that's what admits
+    # them to the ledger (a marker alone on a hand-opened PR does not).
+    _PR_LABELS = ("groom", "groom-pr")
+
     def test_open_builder_pr_suppresses_reproposal(self):
         # Run N built "b" into an OPEN PR. Run N+1 must NOT re-propose it.
-        led = ledger.Ledger(ledger.build_ledger([issue("b", pr=True, state="open")]))
+        led = ledger.Ledger(ledger.build_ledger(
+            [issue("b", pr=True, state="open", labels=self._PR_LABELS)]
+        ))
         to_file, suppressed, _ = led.partition([{"signature": "b"}])
         self.assertEqual(to_file, [])
         self.assertEqual(suppressed[0]["ledger_status"], ledger.PR_OPEN)
 
     def test_merged_builder_pr_never_reproposed(self):
         # A merged builder PR means the fix shipped — never re-propose.
-        led = ledger.Ledger(
-            ledger.build_ledger([issue("b", pr=True, state="closed", merged_at="2026-07-21T00:00:00Z")])
-        )
+        led = ledger.Ledger(ledger.build_ledger(
+            [issue("b", pr=True, state="closed", merged_at="2026-07-21T00:00:00Z",
+                   labels=self._PR_LABELS)]
+        ))
         to_file, suppressed, _ = led.partition([{"signature": "b"}])
         self.assertEqual(to_file, [])
         self.assertEqual(suppressed[0]["ledger_status"], ledger.MERGED)
 
     def test_closed_builder_pr_never_reproposed(self):
         # A human closed the builder PR unmerged — durable decline, never re-propose.
-        led = ledger.Ledger(
-            ledger.build_ledger([issue("b", pr=True, state="closed", merged_at=None)])
-        )
+        led = ledger.Ledger(ledger.build_ledger(
+            [issue("b", pr=True, state="closed", merged_at=None, labels=self._PR_LABELS)]
+        ))
         to_file, suppressed, _ = led.partition([{"signature": "b"}])
         self.assertEqual(to_file, [])
         self.assertEqual(suppressed[0]["ledger_status"], ledger.PR_CLOSED)

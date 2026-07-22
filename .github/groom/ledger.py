@@ -71,6 +71,15 @@ REJECTED_LABEL = "groom-rejected"
 # implying a human said "no".
 SUPERSEDED_LABEL = "groom-superseded"
 
+# The label the auto-builder (BE-4003) stamps on every PR it opens. A PR is
+# admitted to the ledger as a builder record ONLY if it carries this label — the
+# `groom` label alone is not enough. Signature markers are public in issue/PR
+# bodies, so without this gate anyone with label/triage access could paste a live
+# finding's marker into their own `groom`-labeled PR and permanently suppress the
+# finding (close it unmerged → `pr-closed`, or add `groom-rejected`). Only the
+# bot applies `groom-pr`, so requiring it keeps that spoof out of the ledger.
+BUILDER_PR_LABEL = "groom-pr"
+
 # The signature marker embedded in a filed issue's body. An HTML comment so it
 # renders invisibly, and a stable prefix so it round-trips through the API's raw
 # body. The opaque signature is URL-safe-base64 encoded before embedding: the
@@ -231,14 +240,24 @@ def build_ledger(issues) -> dict:
     too, and a groom builder PR (BE-4003) DOES carry a signature marker, so it is
     a first-class ledger record — a merged/open/closed builder PR suppresses
     re-proposing its finding. (BE-3874 skipped all PRs because groom filed only
-    issues then; the builder makes signed PRs part of the durable record.) When
-    several records share a signature, the higher-precedence status wins
+    issues then; the builder makes signed PRs part of the durable record.)
+
+    A PR is admitted ONLY if it ALSO carries the `groom-pr` label the bot stamps
+    on its own builder PRs. Markers are public, so the `groom` label + a pasted
+    marker alone must not let a hand-opened PR masquerade as a builder record and
+    suppress a live finding — requiring `groom-pr` (bot-applied) closes that.
+
+    When several records share a signature, the higher-precedence status wins
     (`_PRECEDENCE`).
     """
     statuses: dict = {}
     for issue in issues:
         signature = extract_signature(issue.get("body"))
         if not signature:
+            continue
+        # Gate PRs on the bot-applied `groom-pr` label (see docstring): a signed
+        # but non-builder PR is not one of ours and must not enter the ledger.
+        if issue.get("pull_request") and BUILDER_PR_LABEL not in _labels(issue):
             continue
         status = classify_issue(issue)
         current = statuses.get(signature)
