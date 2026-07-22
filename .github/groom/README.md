@@ -147,6 +147,42 @@ Single-signature probe (exit 0 = should file, 1 = suppressed):
 python3 .github/groom/ledger.py --repo owner/name --check "<signature>"
 ```
 
+## `interval.py` — the runtime cadence gate (BE-4004)
+
+GitHub Actions `schedule:` cron is **static in the workflow file** — there is no
+native "every N days" input. So a caller fires on a **frequent (daily) base
+cron**, and this gate turns that into an **effective every-`GROOM_INTERVAL_DAYS`
+run**: at run start it early-exits unless the interval has elapsed since the last
+real groom, so a skipped tick costs ~nothing (it never reaches the finder).
+
+- **The knob is a repo Actions variable, `GROOM_INTERVAL_DAYS`** (default `7` =
+  weekly, matching the original cron). The caller wires it to the reusable's
+  `interval_days` input (`interval_days: ${{ vars.GROOM_INTERVAL_DAYS || '7' }}`)
+  and re-evaluates it each run, so changing the variable retunes cadence — weekly
+  → every-3-days → daily — with **no workflow-file edit**, the same "live knob"
+  ergonomics as the per-repo caps.
+- **Last-run state is derived from GitHub Actions run history**, not a writable
+  store: the GitHub-native option that needs **no net-new secret** and only
+  `actions: read`. A prior run "counts" only if it actually reached the finder
+  (its `Audit — finder` job ran, not `skipped` by this gate), so the
+  interval-skip ticks in between never reset the clock. (A repo variable would
+  need a `Variables: write` credential the run doesn't carry, and a missing grant
+  would fail *silently* into a daily over-spend — run history has no such trap.)
+- **`workflow_dispatch` always runs** — a manual dispatch bypasses the gate.
+- **Fail-open**, like the volume gate: any error reading history (API hiccup, no
+  history, unparseable timestamp) RUNS the audit rather than skip a due groom.
+
+The caller grants `actions: read` (a reusable workflow's token is capped by the
+caller's grant, so without it the run-history read 403s and the gate fails open).
+As with `ledger.py`, the pure decision logic is split from the thin `gh` I/O so it
+is fully unit-testable with no network.
+
+```bash
+python3 .github/groom/interval.py \
+    --repo owner/name --workflow-file ci-groom.yml \
+    --current-run-id 123 --interval-days 7 --event-name schedule
+```
+
 - **`tests/`** — `unittest` suite, run by
   [`test-groom-scripts.yml`](../workflows/test-groom-scripts.yml).
 

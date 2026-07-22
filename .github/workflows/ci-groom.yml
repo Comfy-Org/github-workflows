@@ -10,10 +10,18 @@ name: CI - Groom
 # itself (same reason as ci-cursor-review.yml / ci-detect-unreviewed-merge.yml).
 #
 # GROOMER-ONLY mode: groom only FINDS and FILES `groom`-labeled GitHub issues —
-# no commits, no PRs, no auto-builder, never merges. It runs weekly on a schedule
-# (never on-PR), plus a manual dispatch carrying a `dry_run` toggle so the audit +
-# dedup can be spot-checked against a studio groom run on the same commit BEFORE
-# trusting live filing (the Phase 3 dry-run parity gate).
+# no commits, no PRs, no auto-builder, never merges. It fires on a DAILY base
+# cron (never on-PR), but the EFFECTIVE cadence is the runtime interval gate in
+# the reusable (BE-4004): a tick within `GROOM_INTERVAL_DAYS` of the last real
+# run no-ops cheaply before the finder ever spins up. Plus a manual dispatch
+# carrying a `dry_run` toggle (which ALWAYS runs, bypassing the interval gate) so
+# the audit + dedup can be spot-checked against a studio groom run on the same
+# commit BEFORE trusting live filing (the Phase 3 dry-run parity gate).
+#
+# CADENCE KNOB (BE-4004): set repo Actions variable `GROOM_INTERVAL_DAYS`
+# (default 7 = weekly, matching the original cron). Changing it retunes cadence
+# (weekly -> every-3-days -> daily) with NO workflow-file edit:
+#   gh variable set GROOM_INTERVAL_DAYS --repo Comfy-Org/github-workflows --body 3
 #
 # PREREQUISITE (operator): `secrets.ANTHROPIC_API_KEY` must be available to this
 # repo (org- or repo-level) — the finder + verifier agents bill through it. Until
@@ -25,9 +33,12 @@ name: CI - Groom
 
 on:
   schedule:
-    # Weekly, Monday 09:17 UTC. Off-peak + a non-round minute to dodge the
-    # top-of-hour GitHub scheduler congestion. Never fires on a PR.
-    - cron: '17 9 * * 1'
+    # DAILY base tick at 09:17 UTC. Off-peak + a non-round minute to dodge the
+    # top-of-hour GitHub scheduler congestion. Never fires on a PR. This is the
+    # frequent base cron for the interval-gate pattern (GH Actions cron is static
+    # in the file — there is no runtime "every N days"); the reusable's interval
+    # gate turns this daily tick into an effective every-GROOM_INTERVAL_DAYS run.
+    - cron: '17 9 * * *'
   workflow_dispatch:
     inputs:
       dry_run:
@@ -55,27 +66,42 @@ jobs:
       # caller's own github.token stays read-only. (Grant issues:write here ONLY
       # if you drop bot_app_id and fall back to filing as github-actions[bot].)
       contents: read
-    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@07154fb5d0d979017d79b822873cfbe86483bfb3 # main (groom.yml lands here — #49 / BE-3872)
+      # REQUIRED for the interval gate (BE-4004): the reusable reads this repo's
+      # Actions run history to find the last real groom run. A reusable workflow's
+      # token is capped by the caller's grant, so without this the gate fails open
+      # (runs every daily tick, over-spending).
+      actions: read
+    # ⚠️ BUMP-AT-MERGE (BE-4004): this pin (and workflows_ref below) must point at
+    # THIS PR's squash-merge SHA — the interval gate lives in the NEW groom.yml,
+    # so the placeholder below fails LOUD (unresolvable ref) until bumped, exactly
+    # the reusable-lands-then-bump-caller two-step the pilot used (#49 -> #53).
+    # After merge:  gh api ... / edit both refs to the merge commit SHA.
+    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@REPLACE_AT_MERGE_WITH_THIS_PRS_SQUASH_SHA # BE-4004 interval gate — bump to merge SHA
     with:
       # File groom's issues as cloud-code-bot (App token), not github-actions[bot].
       bot_app_id: ${{ vars.APP_ID }}
-      # Keep the assets ref (finder/verifier briefs + dedup ledger) in lock-step
-      # with the `uses:` ref above, so a run always loads the briefs that match
-      # the workflow filing them.
-      workflows_ref: 07154fb5d0d979017d79b822873cfbe86483bfb3
-      # Manual dispatch can dry-run; the weekly schedule always files live
+      # Keep the assets ref (finder/verifier briefs + interval gate + dedup
+      # ledger) in lock-step with the `uses:` ref above, so a run always loads the
+      # scripts that match the workflow filing them. BUMP-AT-MERGE with `uses:`.
+      workflows_ref: REPLACE_AT_MERGE_WITH_THIS_PRS_SQUASH_SHA
+      # Manual dispatch can dry-run; the daily schedule always files live
       # (github.event.inputs is null on a schedule event -> '' != 'true' -> false).
       dry_run: ${{ github.event.inputs.dry_run == 'true' }}
-      # Match the volume-gate window to this caller's ~weekly cron, so a week
-      # with nothing merged skips the (expensive) audit.
-      cadence: 7
+      # Effective cadence knob (BE-4004): the daily base cron only produces a real
+      # run every GROOM_INTERVAL_DAYS days. Re-evaluated each run, so changing the
+      # variable retunes cadence with no file edit. Unset -> 7 (weekly), today.
+      interval_days: ${{ vars.GROOM_INTERVAL_DAYS || '7' }}
+      # Match the volume-gate window to that same effective cadence, not the daily
+      # base cron — so the merge-activity check spans how often a real run happens.
+      cadence: ${{ vars.GROOM_INTERVAL_DAYS || '7' }}
       # A dry-run is the Phase 3 parity spot-check, so it must ALWAYS exercise the
       # full audit + dedup — bypass the volume gate when dispatched with
-      # dry_run:true. Otherwise a quiet week (nothing merged in `cadence` days)
+      # dry_run:true. Otherwise a quiet window (nothing merged in `cadence` days)
       # would gate the dry-run to nothing and print no parity summary, defeating
-      # the dispatch's whole purpose. Live runs (the weekly schedule, where inputs
+      # the dispatch's whole purpose. Live runs (the daily schedule, where inputs
       # is null -> '' != 'true' -> true, or a dry_run:false dispatch) keep the gate
-      # on so a quiescent repo still skips the spend.
+      # on so a quiescent repo still skips the spend. (Note: a schedule tick still
+      # passes the interval gate first — the volume gate is the second throttle.)
       volume_gate: ${{ github.event.inputs.dry_run != 'true' }}
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

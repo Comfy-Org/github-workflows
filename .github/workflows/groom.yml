@@ -28,8 +28,12 @@ name: Groom (reusable)
 #   name: Groom
 #   on:
 #     schedule:
-#       - cron: '17 9 * * 1'      # weekly, Monday 09:17 UTC — never on-PR
-#     workflow_dispatch:
+#       # Frequent BASE cron (daily). Effective cadence is the runtime interval
+#       # gate, not the cron: a tick within GROOM_INTERVAL_DAYS of the last real
+#       # run no-ops cheaply (before the finder). GH Actions cron is static in the
+#       # file, so a daily tick + a runtime gate is how you get a tunable cadence.
+#       - cron: '17 9 * * *'      # daily 09:17 UTC — never on-PR
+#     workflow_dispatch:          # always runs — a manual override bypasses the gate
 #       inputs:
 #         dry_run:
 #           description: 'Run the audit but do NOT file issues'
@@ -37,6 +41,10 @@ name: Groom (reusable)
 #           default: false
 #   permissions:
 #     contents: read
+#     actions: read     # REQUIRED — the interval gate reads this workflow's run
+#     #                 # history to find the last real groom run. A reusable
+#     #                 # workflow's token is capped by the caller's grant, so
+#     #                 # WITHOUT this the gate fails open (runs every daily tick).
 #     # issues: write   # REQUIRED ONLY if you OMIT bot_app_id and file as
 #     #                 # github-actions[bot]: a reusable workflow cannot elevate
 #     #                 # the caller's token, so the github.token fallback needs
@@ -56,9 +64,19 @@ name: Groom (reusable)
 #         bot_app_id: ${{ vars.APP_ID }}
 #         workflows_ref: <sha>          # pin assets to the same ref as `uses:`
 #         dry_run: ${{ github.event.inputs.dry_run == 'true' }}
+#         # Cadence knob + the matching volume-gate window (BE-4004).
+#         interval_days: ${{ vars.GROOM_INTERVAL_DAYS || '7' }}
+#         cadence: ${{ vars.GROOM_INTERVAL_DAYS || '7' }}
 #       secrets:
 #         ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 #         BOT_APP_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+#
+# CADENCE (the runtime knob, BE-4004): wire `interval_days` to the repo Actions
+# variable `GROOM_INTERVAL_DAYS` (default 7 = weekly). The caller re-evaluates it
+# each run, and on the daily base cron the reusable early-exits unless that many
+# days have elapsed since the last real groom run — so weekly -> every-3-days ->
+# daily is a variable edit, no workflow-file change. `workflow_dispatch` always
+# runs regardless.
 
 on:
   workflow_call:
@@ -76,12 +94,27 @@ on:
         default: >-
           duplication, inconsistent patterns, missing abstractions,
           complexity hotspots, dead code
+      interval_days:
+        description: >-
+          Effective run cadence in days (BE-4004). On a frequent (daily) base
+          cron, the reusable early-exits unless at least this many days have
+          elapsed since the last REAL groom run — so the caller fires daily but a
+          run actually happens ~every `interval_days`. Wire it in the caller to a
+          repo Actions variable (GROOM_INTERVAL_DAYS, falling back to 7) to retune
+          cadence with no workflow-file edit — see the caller pattern in the
+          header. `workflow_dispatch` always runs regardless. Default 7 keeps the
+          original weekly behavior; 0 disables the throttle (run every base tick).
+        type: number
+        required: false
+        default: 7
       cadence:
         description: >-
           Volume-gate window in days (see volume_gate). When the gate is on, the
           run is skipped if NO pull request merged into the default branch in the
           last `cadence` days — a quiescent repo has nothing new to groom. Set
-          this to roughly your caller's cron interval.
+          this to roughly your EFFECTIVE cadence — the same value you pass to
+          `interval_days` — so the merge window matches how often a real run can
+          happen (see the interval gate below).
         type: number
         required: false
         default: 7
@@ -185,20 +218,30 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      # The interval gate lists THIS caller's Actions run history to find the
+      # last real groom run (see the "Interval gate" step). A reusable workflow's
+      # token is CAPPED by the caller's grant, so the CALLER must also grant
+      # actions:read — without it the run-history read 403s and the gate fails
+      # OPEN (runs every daily tick, over-spending). See the caller pattern.
+      actions: read
     outputs:
       should_run: ${{ steps.check.outputs.should_run }}
     steps:
-      - name: Validate sink + apply volume gate
-        id: check
+      - name: Load groom assets (interval gate)
+        # interval.py is loaded from THIS repo at the pinned ref — a single
+        # source of truth like the briefs + ledger, never the target checkout.
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _groom_assets
+          persist-credentials: false
+
+      - name: Validate sink
         env:
-          GH_TOKEN: ${{ github.token }}
           SINK: ${{ inputs.sink }}
-          VOLUME_GATE: ${{ inputs.volume_gate }}
-          CADENCE: ${{ inputs.cadence }}
-          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-
           # The GitHub sink is the only one implemented. `linear` is a documented
           # later phase — fail loudly instead of running the whole audit and then
           # silently filing nothing.
@@ -207,19 +250,74 @@ jobs:
             exit 1
           fi
 
+      - name: Interval gate (GROOM_INTERVAL_DAYS)
+        # Cadence gate: on a frequent (daily) base cron, skip cheaply unless
+        # GROOM_INTERVAL_DAYS have elapsed since the last REAL groom run (derived
+        # from run history). workflow_dispatch always bypasses. Runs BEFORE the
+        # finder ever spins up, so a skipped tick costs ~nothing. Fail-open.
+        id: interval
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          EVENT_NAME: ${{ github.event_name }}
+          WF_REF: ${{ github.workflow_ref }}
+          # The caller wires this to `vars.GROOM_INTERVAL_DAYS` and re-evaluates it
+          # each run, so changing that variable retunes cadence with no file edit.
+          # Blank/garbage -> interval.py defaults to 7 (weekly), matching today.
+          INTERVAL_DAYS: ${{ inputs.interval_days }}
+        run: |
+          set -euo pipefail
+          # Derive the CALLER workflow file (e.g. ci-groom.yml) from workflow_ref
+          # `owner/repo/.github/workflows/<file>@<ref>` so the run-history read is
+          # scoped to this caller, not every workflow in the repo.
+          WF_PATH="${WF_REF%@*}"
+          WF_FILE="${WF_PATH##*/}"
+          # interval.py always exits 0 with a fail-open decision in the JSON; the
+          # `else` is a belt-and-suspenders fallback for an unexpected crash.
+          if DECISION=$(python3 "$GROOM_ASSETS/interval.py" \
+              --repo "$REPO" --workflow-file "$WF_FILE" \
+              --current-run-id "$RUN_ID" --interval-days "$INTERVAL_DAYS" \
+              --event-name "$EVENT_NAME"); then
+            echo "$DECISION"
+            RUN=$(echo "$DECISION" | jq -r '.should_run')
+            REASON=$(echo "$DECISION" | jq -r '.reason')
+          else
+            RUN=true
+            REASON="interval gate crashed — running (fail-open)."
+          fi
+          echo "Interval gate: $REASON"
+          if [ "$RUN" = "true" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Volume gate (merge activity)
+        # Only reached when the interval gate passed. Skip a quiescent repo:
+        # nothing merged in the cadence window ⇒ nothing new to groom.
+        id: volume
+        if: steps.interval.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VOLUME_GATE: ${{ inputs.volume_gate }}
+          CADENCE: ${{ inputs.cadence }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
           if [ "$VOLUME_GATE" != "true" ]; then
             echo "Volume gate off — running."
-            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "run=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Skip a quiescent repo: nothing merged in the window ⇒ nothing new to
-          # groom. Fail-OPEN — any API hiccup runs the audit rather than silently
+          # Fail-OPEN — any API hiccup runs the audit rather than silently
           # skipping a due groom (mirrors the studio volume gate).
           SINCE=$(date -u -d "${CADENCE} days ago" +%Y-%m-%d 2>/dev/null || echo "")
           if [ -z "$SINCE" ]; then
             echo "Could not compute the cadence window — running (fail-open)."
-            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "run=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -229,12 +327,28 @@ jobs:
 
           if [ "$MERGED" = "-1" ]; then
             echo "Merge-count check failed — running (fail-open)."
-            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "run=true" >> "$GITHUB_OUTPUT"
           elif [ "$MERGED" -gt 0 ]; then
             echo "$MERGED PR(s) merged since $SINCE — running."
-            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "No PRs merged since $SINCE (cadence ${CADENCE}d) — nothing new to groom, skipping."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Decide should_run
+        # Run only if BOTH gates passed: enough time elapsed (interval) AND new
+        # merge activity (volume). If the interval gate skipped, the volume step
+        # was skipped and its output is empty -> should_run=false.
+        id: check
+        env:
+          INTERVAL_RUN: ${{ steps.interval.outputs.run }}
+          VOLUME_RUN: ${{ steps.volume.outputs.run }}
+        run: |
+          set -euo pipefail
+          if [ "$INTERVAL_RUN" = "true" ] && [ "$VOLUME_RUN" = "true" ]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          else
             echo "should_run=false" >> "$GITHUB_OUTPUT"
           fi
 
