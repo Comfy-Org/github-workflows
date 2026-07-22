@@ -245,7 +245,7 @@ def post_error_review(repo, pr_number, commit_sha, header, error_message):
     safe = neutralize_mentions(error_message)
     body_text = (
         f"{header}\n\n⚠️ **Review failed**\n\n```\n{safe}\n```\n\n"
-        "Re-trigger by removing and re-adding the `cursor-review` label."
+        "Re-trigger by removing and re-adding the active Cursor Review label."
     )
     payload = json.dumps(
         {"body": body_text, "event": "COMMENT", "commit_id": commit_sha}
