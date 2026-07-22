@@ -97,9 +97,21 @@ jobs:
           # never land in this public repo or its logs.
           CALLERS_JSON: ${{ vars.ASSIGN_REVIEWERS_CALLERS }}
         run: |
+          # The main-only ref guard above cannot catch a manual RE-RUN of an
+          # older main run: github.ref is refs/heads/main but github.sha is
+          # that run's original (now stale) commit, and the bumper would
+          # force-repin every caller to it. Only act from the current tip —
+          # any newer push has its own queued run that does the bump.
+          main_tip=$(git ls-remote origin refs/heads/main | cut -f1)
+          if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
+            echo "github.sha $GITHUB_SHA is not the current main tip ($main_tip) — stale run/re-run; nothing to bump"
+            exit 0
+          fi
           # The push path filter also matches a commit that DELETES the
           # reusable workflow; bumping callers to a SHA where the file is gone
           # would break every caller. Deletion means decommissioning — no-op.
+          # (This fleet has no run-time asset dir — the yml is self-contained —
+          # so unlike the sibling entrypoints only the workflow file is checked.)
           if [[ ! -f .github/workflows/assign-reviewers.yml ]]; then
             echo "assign-reviewers.yml absent at this SHA — decommissioned; nothing to bump"
             exit 0
