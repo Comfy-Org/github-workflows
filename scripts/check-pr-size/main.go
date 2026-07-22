@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"flag"
@@ -40,8 +41,10 @@ func main() {
 	bypassLabel := flag.String("bypass-label", envStr("PR_SIZE_BYPASS_LABEL", defaultBypassLabel), "PR label name the report offers as the bypass")
 	extraLockfiles := flag.String("extra-lockfiles", os.Getenv("PR_SIZE_EXTRA_LOCKFILES"), "extra lockfile base names to exclude (whitespace/comma separated)")
 	extraGlobs := flag.String("extra-generated-globs", os.Getenv("PR_SIZE_EXTRA_GENERATED_GLOBS"), "extra glob patterns treated as generated (whitespace/comma separated)")
-	generatedOut := flag.String("generated-out", "", "if set, also write the NUL-separated list of paths classified as generated to this file (for a downstream consumer to exclude, e.g. the cursor-review diff); does not change the size verdict")
-	ignoreComments := flag.Bool("ignore-comments", envBool("PR_SIZE_IGNORE_COMMENTS"), "exclude blank and comment-only changed lines from the counted total (heuristic, count-only; never affects generated classification or --generated-out)")
+	reviewedDiffOut := flag.String("reviewed-diff-out", "", "if set and the size check passes, also write the PR's unified diff with all generated-file sections excluded to this file (for a downstream review consumer, e.g. cursor-review); a failure writing it exits 2 so the consumer never pairs this run's counts with a missing/partial diff")
+	diffExcludes := flag.String("diff-excludes", "", "extra git pathspecs (whitespace-separated, passed to git verbatim) applied ONLY when building --reviewed-diff-out; never affects the size verdict")
+	markerFromBase := flag.Bool("marker-from-base", false, "read the Go generated-code marker from the BASE blob instead of the PR head, so a PR cannot self-exempt a file by adding the marker; files new in the PR then never match the marker (path- and attribute-based rules still apply), which is strictly conservative — set this when --reviewed-diff-out feeds a review that must not be evadable")
+	ignoreComments := flag.Bool("ignore-comments", envBool("PR_SIZE_IGNORE_COMMENTS"), "exclude blank and comment-only changed lines from the counted total (heuristic, count-only; never affects generated classification or --reviewed-diff-out)")
 	flag.Parse()
 
 	if *base == "" {
@@ -73,7 +76,7 @@ func main() {
 	attr := attrPolicy{source: *base, useSource: checkAttrSourceSupported(*base)}
 	attrModified := TouchesGitattributes(files)
 	attr.trusted = attrTrusted(attr.useSource, attrModified, *bypassFlag)
-	classify(files, *base, *head, attr, extras)
+	classify(files, *base, *head, attr, extras, *markerFromBase)
 
 	// Discount blank/comment-only changed lines from the count (opt-in). Runs
 	// after classify so it only ever inspects non-generated, non-binary files.
@@ -100,15 +103,24 @@ func main() {
 	report(res, *modeFlag, *bypassLabel)
 	writeGitHubOutputs(res)
 
-	// Emit the classified generated paths for a downstream consumer (the
-	// cursor-review workflow excludes them from the diff it feeds the review
-	// models, reusing THIS classifier as the single source of truth for "what
-	// is codegen"). Written last and best-effort: a write failure is logged but
-	// never changes the size verdict already reported above, nor fails a check
-	// that would otherwise pass — the consumer degrades to no exclusions.
-	if *generatedOut != "" {
-		if err := writeGeneratedPaths(files, *generatedOut); err != nil {
-			fmt.Fprintf(os.Stderr, "check-pr-size: could not write --generated-out %q: %v\n", *generatedOut, err)
+	// Emit the reviewed diff for a downstream consumer (the cursor-review
+	// workflow feeds it to the review panel + judge): the PR's full patch with
+	// every generated file's section filtered out, reusing THIS classification
+	// as the single source of truth for "what is codegen" — the count and the
+	// reviewed diff come from one process and can never disagree. Written last;
+	// a write failure exits 2 (after removing any partial file) so the consumer
+	// sees a degraded run rather than pairing this run's counts with a
+	// missing/truncated diff. Skipped when over the cap — nothing downstream
+	// consumes a diff the gate is about to skip.
+	if *reviewedDiffOut != "" {
+		if res.OK {
+			if err := writeReviewedDiff(*base, *head, strings.Fields(*diffExcludes), files, *reviewedDiffOut); err != nil {
+				os.Remove(*reviewedDiffOut)
+				fmt.Fprintf(os.Stderr, "check-pr-size: could not write --reviewed-diff-out %q: %v\n", *reviewedDiffOut, err)
+				os.Exit(2)
+			}
+		} else {
+			fmt.Fprintln(os.Stderr, "check-pr-size: over the cap — skipping --reviewed-diff-out")
 		}
 	}
 
@@ -117,21 +129,65 @@ func main() {
 	}
 }
 
-// writeGeneratedPaths writes every path classified as generated to path,
-// NUL-separated with a trailing NUL after each entry. NUL matches the separator
-// git's `-z` numstat/check-attr use and round-trips paths containing spaces or
-// newlines (which the -z numstat parser already admits), so a consumer can read
-// it back with a NUL-delimited read loop and no quoting hazards. An empty
-// generated set writes a zero-byte file — a consumer reads it as "exclude nothing".
-func writeGeneratedPaths(files []FileChange, path string) error {
-	var b bytes.Buffer
+// writeReviewedDiff streams `git diff base...head` (plus any caller-supplied
+// verbatim exclude pathspecs) through FilterPatch, writing the patch minus
+// every generated file's section to outPath. The generated set is passed to
+// git by FILTERING ITS OUTPUT, never as per-file argv pathspecs, so an
+// unbounded number of generated files (they cost nothing against the cap)
+// cannot overflow ARG_MAX and fail the diff. core.quotePath=false keeps
+// non-ASCII paths verbatim in the headers so they match the numstat-derived
+// classification; a path git still quotes (control chars, quotes) simply won't
+// match and its section is kept — reviewed, never hidden.
+func writeReviewedDiff(base, head string, diffExcludes []string, files []FileChange, outPath string) error {
+	gen := make(map[string]bool)
 	for _, f := range files {
 		if f.Generated {
-			b.WriteString(f.Path)
-			b.WriteByte(0)
+			gen[f.Path] = true
 		}
 	}
-	return os.WriteFile(path, b.Bytes(), 0o644)
+	ctx, cancel := context.WithTimeout(context.Background(), gitTimeout)
+	defer cancel()
+	args := append([]string{"-c", "core.quotePath=false", "diff", base + "..." + head, "--", "."}, diffExcludes...)
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.WaitDelay = gitWaitDelay
+	errBuf := &capWriter{cap: maxStderrBytes}
+	cmd.Stderr = errBuf
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	out, err := os.Create(outPath)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	bw := bufio.NewWriter(out)
+	kept, dropped, ferr := FilterPatch(stdout, bw, func(p string) bool { return gen[p] })
+	if ferr != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return ferr
+	}
+	if err := cmd.Wait(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			err = fmt.Errorf("git %v timed out after %s: %w", args, gitTimeout, ctx.Err())
+		}
+		if s := strings.TrimSpace(errBuf.String()); s != "" {
+			err = fmt.Errorf("%w: %s", err, s)
+		}
+		return err
+	}
+	if err := bw.Flush(); err != nil {
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "check-pr-size: reviewed diff written to %s (%d file section(s) kept, %d generated section(s) excluded)\n", outPath, kept, dropped)
+	return nil
 }
 
 // shouldFail reports whether the process should exit non-zero: over the cap
@@ -235,28 +291,29 @@ func attrTrusted(useSource, attrModified, bypass bool) bool {
 // the linguist-generated git attribute (read from the base ref per attr), and
 // the canonical Go generated marker in the file's content.
 //
-// The linguist-generated attribute is resolved for every non-binary path in a
-// SINGLE `git check-attr` pass (attrGeneratedBatch) rather than one subprocess
-// per file, so a large PR pays constant process-creation cost instead of O(N).
-func classify(files []FileChange, base, head string, attr attrPolicy, extras Extras) {
+// Binary files are classified by the path- and attribute-based rules too (none
+// of those read content), so a binary lockfile or a binary matching an extra
+// glob still leaves a --reviewed-diff-out consumer's diff; only the content
+// marker read is skipped for them. Their Changed() is 0 either way, so the
+// size verdict is untouched.
+//
+// The linguist-generated attribute is resolved for every path in a SINGLE
+// `git check-attr` pass (attrGeneratedBatch) rather than one subprocess per
+// file, so a large PR pays constant process-creation cost instead of O(N).
+func classify(files []FileChange, base, head string, attr attrPolicy, extras Extras, markerFromBase bool) {
 	var attrGen map[string]bool
 	if attr.trusted {
 		paths := make([]string, 0, len(files))
 		for i := range files {
-			if !files[i].Binary {
-				paths = append(paths, files[i].Path)
-			}
+			paths = append(paths, files[i].Path)
 		}
 		attrGen = attrGeneratedBatch(paths, attr.source, attr.useSource)
 	}
 	for i := range files {
 		f := &files[i]
-		if f.Binary {
-			continue
-		}
 		if IsLockfile(f.Path) || extras.Generated(f.Path) ||
 			attrGen[f.Path] ||
-			contentGenerated(f.Path, base, head) {
+			(!f.Binary && contentGenerated(f.Path, base, head, markerFromBase)) {
 			f.Generated = true
 		}
 	}
@@ -352,8 +409,23 @@ func isUnknownFlagError(stderr string) bool {
 // non-Go file by pasting the marker at its top. Working-tree reads never follow a
 // symlink and are capped at maxScanBytes, so a PR cannot point a "generated" path
 // at an unbounded/blocking target (e.g. /dev/zero) to hang or OOM the job.
-func contentGenerated(path, base, head string) bool {
+//
+// With markerFromBase set, ONLY the base blob is consulted — mirroring the
+// base-ref invariant the linguist-generated attribute path already enforces.
+// The head-content read is fine for a size cap (self-marking merely shrinks a
+// count a maintainer can eyeball), but when the classification decides what a
+// blocking review SEES, a head-honored marker would let a PR hide arbitrary
+// code by prepending one comment line. Base-only means a file new in the PR
+// never matches the marker (it is counted and reviewed — conservative); files
+// generated at base stay excluded.
+func contentGenerated(path, base, head string, markerFromBase bool) bool {
 	if !strings.HasSuffix(path, ".go") {
+		return false
+	}
+	if markerFromBase {
+		if data, err := runGitCapped(maxScanBytes, "show", base+":"+path); err == nil {
+			return IsGeneratedContent(data)
+		}
 		return false
 	}
 	if info, err := os.Lstat(path); err == nil {

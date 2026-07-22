@@ -97,6 +97,11 @@ on:
           marked `linguist-generated` in the BASE ref's `.gitattributes` (so a
           PR can't exempt itself), and the canonical Go
           `// Code generated ... DO NOT EDIT.` marker — so you rarely need more.
+          Because this classification decides what the review panel SEES, the
+          Go marker is honored only from the BASE blob (same base-ref invariant
+          as `.gitattributes`): a PR cannot hide a file from review by adding
+          the marker, and a file NEW in the PR never matches it — cover newly
+          generated files with a glob here or a base `.gitattributes` rule.
         type: string
         required: false
         default: >-
@@ -304,10 +309,13 @@ jobs:
     permissions:
       contents: read
     # within_cap is derived from the shared check-pr-size tool's `over_cap`
-    # output: counted = non-generated changed lines, compared against the review
-    # cap passed as --max. If the tool fails operationally, over_cap is unset and
-    # this evaluates true — falling open to "review it" rather than silently
-    # skipping a PR because the classifier hiccuped.
+    # output: counted = non-generated changed lines (minus any comment/blank
+    # discount), compared against the review cap passed as --max. Failure
+    # handling is explicit and two-tier (see the classify step): a git-level
+    # failure fails THIS JOB — fail closed, no review — while a tool-level
+    # failure falls back to the RAW changed-line count with no exclusions
+    # (strictly >= the classified count), so a degraded run can still review a
+    # small PR but can never feed an unbounded diff to the panel.
     outputs:
       within_cap: ${{ steps.check.outputs.over_cap != 'true' }}
     steps:
@@ -354,7 +362,7 @@ jobs:
           git -C _pr_size_tool clean -ffdx
           (cd _pr_size_tool/scripts/check-pr-size && go build -o "${RUNNER_TEMP}/check-pr-size" .)
 
-      - name: Classify generated files and check size
+      - name: Classify generated files, check size, and build reviewed diff
         id: check
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -368,53 +376,77 @@ jobs:
           # means "non-generated changed lines exceed the review cap" — exactly
           # the gate we want. --mode warn: the tool never exits non-zero on
           # overage (this workflow gates via within_cap, not the tool's own
-          # pass/fail). The same run writes the classified generated paths to
-          # --generated-out for the diff step below, so classification happens
-          # ONCE and the count and the reviewed diff can never disagree.
+          # pass/fail). The same run writes the reviewed diff (the PR's patch
+          # with every generated file's section filtered out, minus any caller
+          # diff_excludes pathspecs) to --reviewed-diff-out, so classification
+          # happens ONCE and the count and the reviewed diff can never disagree.
+          # Filtering the patch — instead of expanding one exclude pathspec per
+          # generated file onto argv — means an unbounded number of generated
+          # files (they cost nothing against the cap) can't overflow ARG_MAX.
           #
-          # An operational failure (exit 2 — bad ref, git error) leaves over_cap
-          # unset → within_cap evaluates true → the diff step, finding no
-          # generated-paths file, falls back to diff_excludes-only (the pre-tool
-          # behavior). Fail open to "review", never silently skip.
+          # --marker-from-base: this classification decides what a (potentially
+          # blocking) review SEES, so the Go generated marker is honored only
+          # from the BASE blob — a PR can't hide hand-written code from the
+          # panel by prepending the one-line marker. Matches the base-ref
+          # invariant the linguist-generated attribute path already enforces.
+          #
+          # Failure handling is two-tier, both explicit:
+          #   - git-level breakage (bad ref, missing history): the fallback
+          #     `git diff --numstat` below dies under `set -e` and FAILS this
+          #     job — fail closed, a loud red X, never a silent skip.
+          #   - tool-level failure (classifier bug, patch-write error): fall
+          #     back to the RAW changed-line count with no exclusions —
+          #     strictly >= the classified count, so a degraded run still
+          #     reviews a small PR but can never feed an unbounded diff to the
+          #     eight panel jobs. The next step rebuilds the diff with
+          #     diff_excludes only (the pre-classifier behavior).
           rc=0
           "${RUNNER_TEMP}/check-pr-size" \
             --base "${BASE_SHA}" \
             --head "${HEAD_SHA}" \
             --max "${DIFF_SIZE_CAP}" \
             --mode warn \
+            --marker-from-base \
             --extra-generated-globs "${EXTRA_GENERATED_GLOBS}" \
             --extra-lockfiles "${EXTRA_LOCKFILES}" \
-            --generated-out "${RUNNER_TEMP}/generated-paths" || rc=$?
-          if [ "$rc" -ne 0 ]; then
-            echo "::warning::check-pr-size exited ${rc} — reviewing with no generated-file exclusions (diff_excludes still apply)."
-            rm -f "${RUNNER_TEMP}/generated-paths"
+            --diff-excludes "${DIFF_EXCLUDES}" \
+            --reviewed-diff-out "${RUNNER_TEMP}/pr-diff.patch" || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            if [ -f "${RUNNER_TEMP}/pr-diff.patch" ]; then
+              echo "Reviewed diff size: $(wc -l < "${RUNNER_TEMP}/pr-diff.patch") lines"
+            fi
+          else
+            echo "::warning::check-pr-size exited ${rc} — gating on the raw line count and reviewing with no generated-file exclusions (diff_excludes still apply)."
+            rm -f "${RUNNER_TEMP}/pr-diff.patch"
+            echo "degraded=true" >> "$GITHUB_OUTPUT"
+            # Raw-count gate: no exclusions, so always >= the classified count.
+            # Appended after any over_cap the tool already wrote — the last
+            # value wins, so a raw overage can only tighten the gate. The
+            # numstat runs as its own statement (not inside a pipeline, whose
+            # exit status `set -e` would ignore) so git-level breakage fails
+            # the job here (fail closed, above).
+            git diff --numstat "${BASE_SHA}...${HEAD_SHA}" > "${RUNNER_TEMP}/raw-numstat"
+            RAW=$(awk '{ if ($1 != "-") total += $1; if ($2 != "-") total += $2 } END { print total + 0 }' "${RUNNER_TEMP}/raw-numstat")
+            echo "Raw changed lines (no exclusions): ${RAW} (cap: ${DIFF_SIZE_CAP})"
+            if [ "${RAW}" -gt "${DIFF_SIZE_CAP}" ]; then
+              echo "over_cap=true" >> "$GITHUB_OUTPUT"
+            fi
           fi
 
-      - name: Build reviewed diff (generated files excluded)
-        # Skip when over cap: the review is skipped anyway, so don't spend time
-        # rendering (and uploading) a diff nothing will consume.
-        if: steps.check.outputs.over_cap != 'true'
+      - name: Build reviewed diff (degraded fallback)
+        # Only when the classifier tool failed but the raw count is within the
+        # cap: no generated-file exclusions are available, so build the diff
+        # with just the caller's diff_excludes (the pre-classifier behavior).
+        # The raw-count gate above already bounded this diff's size.
+        if: steps.check.outputs.over_cap != 'true' && steps.check.outputs.degraded == 'true'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          # Exclude every path the classifier flagged generated, plus any caller
-          # diff_excludes pathspecs (applied verbatim, back-compat).
-          # :(exclude,literal) disables pathspec magic so a path with
-          # metacharacters matches literally. An absent/empty generated-paths
-          # file (tool degraded, or nothing generated) leaves EXCLUDE_ARGS empty,
-          # so the diff is just the full diff minus diff_excludes.
-          EXCLUDE_ARGS=()
-          if [ -s "${RUNNER_TEMP}/generated-paths" ]; then
-            while IFS= read -r -d '' p; do
-              if [ -n "$p" ]; then EXCLUDE_ARGS+=(":(exclude,literal)${p}"); fi
-            done < "${RUNNER_TEMP}/generated-paths"
-          fi
-          echo "Excluding ${#EXCLUDE_ARGS[@]} generated file(s) classified by check-pr-size."
           # $DIFF_EXCLUDES is intentionally unquoted so bash word-splits it into
-          # pathspec args; the tool-derived excludes are a quoted array.
+          # pathspec args.
           # shellcheck disable=SC2086
-          git diff "${BASE_SHA}...${HEAD_SHA}" -- . $DIFF_EXCLUDES "${EXCLUDE_ARGS[@]}" \
+          git diff "${BASE_SHA}...${HEAD_SHA}" -- . $DIFF_EXCLUDES \
             > "${RUNNER_TEMP}/pr-diff.patch"
           echo "Reviewed diff size: $(wc -l < "${RUNNER_TEMP}/pr-diff.patch") lines"
 
@@ -595,7 +627,7 @@ jobs:
         # pinned via workflows_ref) — never from the PR checkout, so a
         # malicious PR can't rewrite the prompt to exfiltrate the diff or
         # smuggle instructions to the model.
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
         with:
           repository: Comfy-Org/github-workflows
           ref: ${{ inputs.workflows_ref }}
@@ -694,7 +726,7 @@ jobs:
 
       - name: Upload findings artifact
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: findings-${{ matrix.review_type }}-${{ matrix.model }}
           path: /tmp/findings-out/findings.json
@@ -714,7 +746,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Load cursor-review assets
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
         with:
           repository: Comfy-Org/github-workflows
           ref: ${{ inputs.workflows_ref }}
@@ -736,7 +768,7 @@ jobs:
           echo "$HOME/.cursor/bin" >> "$GITHUB_PATH"
 
       - name: Download panel findings
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           path: /tmp/panel
           pattern: findings-*
@@ -941,7 +973,7 @@ jobs:
       - name: Mint bot-identity token (optional)
         id: bot_token
         if: ${{ inputs.bot_app_id != '' }}
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
         with:
           app-id: ${{ inputs.bot_app_id }}
           private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
@@ -998,7 +1030,7 @@ jobs:
       contents: read
     steps:
       - name: Load cursor-review assets
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
         with:
           repository: Comfy-Org/github-workflows
           ref: ${{ inputs.workflows_ref }}
@@ -1052,7 +1084,7 @@ jobs:
       contents: read
     steps:
       - name: Load cursor-review assets
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
         with:
           repository: Comfy-Org/github-workflows
           ref: ${{ inputs.workflows_ref }}

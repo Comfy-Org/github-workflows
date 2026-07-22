@@ -256,9 +256,12 @@ func (e Extras) Generated(path string) bool {
 
 // globRegexp compiles a glob pattern to a regexp: `**` matches any characters
 // including `/`, `*` matches within a path segment, `?` matches one non-`/`
-// character; everything else is literal. Every non-wildcard byte is
-// QuoteMeta-escaped, so the built expression is always valid and compilation
-// cannot fail.
+// character; everything else is literal. `**/` matches ZERO or more leading
+// segments (gitignore semantics), so `**/dist/**` also matches a root-level
+// `dist/` — compiled as `(?:.*/)?`, not `.*/`, which would demand at least one
+// parent directory and silently exempt root-level paths from exclusion. Every
+// non-wildcard byte is QuoteMeta-escaped, so the built expression is always
+// valid and compilation cannot fail.
 func globRegexp(pattern string) *regexp.Regexp {
 	var b strings.Builder
 	b.WriteString(`^`)
@@ -266,8 +269,13 @@ func globRegexp(pattern string) *regexp.Regexp {
 		switch pattern[i] {
 		case '*':
 			if i+1 < len(pattern) && pattern[i+1] == '*' {
-				b.WriteString(`.*`)
-				i++
+				if i+2 < len(pattern) && pattern[i+2] == '/' {
+					b.WriteString(`(?:.*/)?`)
+					i += 2
+				} else {
+					b.WriteString(`.*`)
+					i++
+				}
 			} else {
 				b.WriteString(`[^/]*`)
 			}
@@ -439,6 +447,161 @@ func ParseDiscounts(patch io.Reader) (map[string]int, error) {
 		return nil, err
 	}
 	return result, nil
+}
+
+// FilterPatch streams a unified git diff from r to w, dropping every per-file
+// section for which drop reports true on ANY of the section's paths (old side,
+// new side, or rename/copy source/destination). Dropping the WHOLE section —
+// rather than excluding paths via git pathspecs — is what lets the caller
+// exclude an unbounded number of generated files without argv (ARG_MAX)
+// limits, and it removes a generated rename in one piece: the old-path
+// deletion never survives as an orphaned full-file removal the way it does
+// when only the destination is pathspec-excluded.
+//
+// Section paths are harvested from the `--- `/`+++ ` headers (via
+// parseDiffHeaderPath) and the `rename/copy from/to` lines; when a section has
+// neither (binary or mode-only changes), the `diff --git a/X b/Y` line is
+// parsed as a fallback (parseDiffGitPaths). A section whose paths cannot be
+// parsed at all (e.g. git had to quote them) is KEPT: an unparseable file gets
+// reviewed, never silently hidden. Buffering is bounded to a section's header
+// (a handful of lines); decided content streams through, so a huge kept file
+// never sits in memory.
+//
+// It returns the number of sections kept and dropped. Text before the first
+// `diff --git ` line (git emits none, but be tolerant) passes through.
+func FilterPatch(r io.Reader, w io.Writer, drop func(path string) bool) (kept, dropped int, err error) {
+	br := bufio.NewReaderSize(r, 64*1024)
+
+	var header []string // buffered, undecided section-header lines
+	var paths []string  // candidate paths harvested from those lines
+	var diffGitLine string
+	deciding := false // buffering a section header, keep/drop not yet decided
+	emitting := true  // disposition of the current decided section (or preamble)
+
+	decide := func() error {
+		deciding = false
+		candidates := paths
+		if len(candidates) == 0 {
+			candidates = parseDiffGitPaths(diffGitLine)
+		}
+		emitting = true
+		for _, p := range candidates {
+			if drop(p) {
+				emitting = false
+				break
+			}
+		}
+		if emitting {
+			kept++
+			for _, l := range header {
+				if _, werr := io.WriteString(w, l); werr != nil {
+					return werr
+				}
+			}
+		} else {
+			dropped++
+		}
+		header = nil
+		return nil
+	}
+
+	harvest := func(line string) {
+		l := strings.TrimRight(line, "\n")
+		add := func(v string) {
+			// A git-quoted value (leading `"`) is left unresolved — the section
+			// falls back to other headers or is kept.
+			if v != "" && !strings.HasPrefix(v, `"`) {
+				paths = append(paths, v)
+			}
+		}
+		switch {
+		case strings.HasPrefix(l, "--- "), strings.HasPrefix(l, "+++ "):
+			if p := parseDiffHeaderPath(l[4:]); p != "" {
+				paths = append(paths, p)
+			}
+		case strings.HasPrefix(l, "rename from "):
+			add(l[len("rename from "):])
+		case strings.HasPrefix(l, "rename to "):
+			add(l[len("rename to "):])
+		case strings.HasPrefix(l, "copy from "):
+			add(l[len("copy from "):])
+		case strings.HasPrefix(l, "copy to "):
+			add(l[len("copy to "):])
+		}
+	}
+
+	for {
+		line, rerr := br.ReadString('\n')
+		if line != "" {
+			isDiffGit := strings.HasPrefix(line, "diff --git ")
+			if deciding {
+				// Header ends at the first hunk, a binary stanza, or the next
+				// file section; anything else is more header to buffer.
+				if isDiffGit || strings.HasPrefix(line, "@@") ||
+					strings.HasPrefix(line, "Binary files ") || strings.HasPrefix(line, "GIT binary patch") {
+					if derr := decide(); derr != nil {
+						return kept, dropped, derr
+					}
+				} else {
+					header = append(header, line)
+					harvest(line)
+					continue
+				}
+			}
+			switch {
+			case isDiffGit:
+				deciding = true
+				header = []string{line}
+				paths = nil
+				diffGitLine = strings.TrimRight(line, "\n")
+			case emitting:
+				if _, werr := io.WriteString(w, line); werr != nil {
+					return kept, dropped, werr
+				}
+			}
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return kept, dropped, rerr
+		}
+	}
+	if deciding {
+		if derr := decide(); derr != nil {
+			return kept, dropped, derr
+		}
+	}
+	return kept, dropped, nil
+}
+
+// parseDiffGitPaths extracts path candidates from a `diff --git a/X b/Y` line —
+// the fallback for sections with no `---`/`+++` or rename/copy headers (binary
+// and mode-only changes). The line is ambiguous when paths contain spaces, so
+// resolution is conservative: first try the split point where the a/-side
+// equals the b/-side (X == Y — every non-rename, however spacey the name);
+// otherwise split at ` b/` only when it appears exactly once. A quoted or
+// unresolvable line yields nil, which the caller treats as "keep the section".
+func parseDiffGitPaths(line string) []string {
+	v := strings.TrimPrefix(line, "diff --git ")
+	if v == line || strings.HasPrefix(v, `"`) || !strings.HasPrefix(v, "a/") {
+		return nil
+	}
+	for j := 0; ; {
+		i := strings.Index(v[j:], " b/")
+		if i < 0 {
+			break
+		}
+		j += i
+		if left, right := v[:j], v[j+3:]; left[2:] == right {
+			return []string{right}
+		}
+		j += 3
+	}
+	if i := strings.Index(v, " b/"); i >= 0 && strings.LastIndex(v, " b/") == i {
+		return []string{v[2:i], v[i+3:]}
+	}
+	return nil
 }
 
 // parseDiffHeaderPath extracts the file path from a diff `--- ` / `+++ ` header
