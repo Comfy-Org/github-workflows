@@ -19,11 +19,11 @@ never a copy of the review logic. Nothing here to keep in sync downstream.
 ## How it works
 
 ```
-PR gets the `cursor-review` label
+PR gets `cursor-review` or `cursor-review-xl`
         │
         ▼
    ┌─────────┐   skip if: `skip-cursor-review` present,
-   │  Gate   │   PR over the diff-size cap, or this exact
+   │  Gate   │   PR over the diff-size cap (unless XL), or this exact
    └────┬────┘   commit was already reviewed (idempotent)
         │ should_run
         ▼
@@ -103,10 +103,6 @@ on:
 permissions:
   contents: read
   pull-requests: write
-concurrency:
-  # Re-labeling cancels an in-flight run for the same PR + label.
-  group: cursor-review-pr-${{ github.event.pull_request.number }}-${{ github.event.label.name }}
-  cancel-in-progress: true
 jobs:
   cursor-review:
     uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@<sha>  # v1
@@ -130,7 +126,19 @@ jobs:
 | Secret | `SLACK_BOT_TOKEN` | no | Enables start/complete DMs to the triggerer. |
 | Variable | `CURSOR_REVIEW_DM_EMAIL_MAP` | no | Maps GitHub logins → emails for Slack DM lookup. |
 
-**3. Trigger a review** by adding the `cursor-review` label to a PR. That's it.
+**3. Trigger a review** by adding `cursor-review` to a PR. For an intentionally
+large PR, add `cursor-review-xl` instead; it runs the same panel without the
+diff-size cap. Create both labels once in each consumer repository.
+
+### Large diffs: `cursor-review-xl`
+
+`cursor-review-xl` is a standalone alternate trigger. It keeps the normal
+diff exclusions and line-count reporting, but bypasses `diff_size_cap`. If both
+review labels are present, XL mode wins.
+
+Concurrency is owned by the reusable workflow: adding XL cancels an in-flight
+standard panel for the same PR, while unrelated label changes cannot cancel a
+review. Callers do not need their own `concurrency` block.
 
 ### Optional: review-on-assignment
 
@@ -193,6 +201,7 @@ descriptions live in the [workflow header](../workflows/cursor-review.yml).
 | `judge_model` | `claude-opus-4-8-thinking-max` | Model that consolidates panel findings. |
 | `diff_size_cap` | `5000` | Max changed lines (after excludes); larger PRs are skipped. |
 | `review_label` | `cursor-review` | Label whose addition triggers the review. |
+| `xl_review_label` | `cursor-review-xl` | Alternate trigger that bypasses `diff_size_cap`; wins when both labels are present. |
 | `diff_excludes` | lockfiles, `node_modules`, `dist`, `vendor`, minified/generated files | Pathspecs excluded from both the size count and the reviewed diff. |
 | `workflows_ref` | `main` | Ref this directory's prompts/scripts are loaded from. Pin to your `uses:` SHA. |
 | `bot_app_id` | `''` | Optional GitHub App ID; when set (with `BOT_APP_PRIVATE_KEY`), the review posts under that App's identity instead of `github-actions[bot]`. |
@@ -202,8 +211,10 @@ descriptions live in the [workflow header](../workflows/cursor-review.yml).
 
 - **Skip a PR**: add the `skip-cursor-review` label. It wins even if the trigger
   label is present. Removing it (while the trigger label is on) starts a run.
+- **Review a large PR**: add `cursor-review-xl`; it bypasses only the line cap,
+  while normal exclusions, idempotency, and failure handling still apply.
 - **Re-review after changes**: push commits. The new HEAD SHA bypasses the
-  idempotency check and a re-applied label runs a fresh panel.
+  idempotency check and re-applying the active review label runs a fresh panel.
 - **Re-review unchanged content**: dismiss the existing review, then re-apply
   the label.
 
