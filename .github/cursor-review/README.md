@@ -35,7 +35,7 @@ PR gets the `cursor-review` label
    │   Google          ▢                              ▢                    │
    │   Moonshot        ▢                              ▢                    │
    │                                                                       │
-   │   each cell: build prompt → run cursor-agent → extract-findings.py    │
+   │   each cell: cursor-agent records findings through a stdio MCP tool   │
    └───────────────────────────────┬───────────────────────────────────────┘
                                     │ 8 findings artifacts
                                     ▼
@@ -71,9 +71,12 @@ Each model runs **two review types**:
   [`prompt-edge-case.md`](prompt-edge-case.md).
 
 A single **judge** model ([`prompt-judge.md`](prompt-judge.md)) then adjudicates
-all 8 cells' findings into the final review. If a cell fails (checkout, agent,
-extraction), it still shows up in the panel summary tagged `error` rather than
-silently vanishing — the review tells you what didn't run.
+all 8 cells' findings and submits the final review through the same slim stdio
+MCP server. Model prose is never parsed for results: tool schemas validate the
+records before writing them, which removes formatting drift, markdown fences,
+truncated JSON, and reformat retries from the result path. If a cell fails
+(checkout, agent, or tool submission), it still shows up in the panel summary
+tagged `error` rather than silently vanishing.
 
 ## What's in this directory
 
@@ -82,7 +85,7 @@ silently vanishing — the review tells you what didn't run.
 | [`prompt-adversarial.md`](prompt-adversarial.md) | Prompt for the security/reliability review pass. |
 | [`prompt-edge-case.md`](prompt-edge-case.md) | Prompt for the correctness/logic review pass. |
 | [`prompt-judge.md`](prompt-judge.md) | Prompt the judge model uses to consolidate panel findings into one review. |
-| [`extract-findings.py`](extract-findings.py) | Parses a cell's raw `cursor-agent` output into a normalized findings record. Always emits structured JSON — even on empty output or parse failure — so the consolidate step has uniform input. |
+| [`review-output-mcp.py`](review-output-mcp.py) | Dependency-free stdio MCP server. Reviewers record individual findings and finish; the judge submits the final findings array. It validates and atomically writes the normalized records consumed by later jobs. |
 | [`post-review.py`](post-review.py) | Reads the judge's consolidated findings and posts **one** PR review with line-anchored inline comments and severity badges. |
 | [`gate-unresolved.py`](gate-unresolved.py) | The opt-in blocking gate (`blocking: true`). Queries the PR's review threads and exits non-zero while any cursor-review finding thread is unresolved. |
 | [`slack-notify.sh`](slack-notify.sh) | Sends the start/complete Slack DMs to the triggerer (no-ops without a token). |

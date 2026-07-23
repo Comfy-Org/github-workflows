@@ -5,7 +5,7 @@ name: Cursor Review (reusable)
 # judge model consolidates the findings into ONE review posted on the PR,
 # with per-finding severity badges (critical/high/medium/low/nit).
 #
-# Single source of truth: the prompts and the extract/post/notify scripts
+# Single source of truth: the prompts and the output/post/notify scripts
 # live in THIS repo under .github/cursor-review/. Consumer repos add only a
 # thin caller — they don't carry copies of the review logic, so there's no
 # drift to keep in sync.
@@ -163,7 +163,7 @@ jobs:
         run: |
           # PRs from forks can't run this review. The pull_request event grants
           # fork PRs no access to secrets — so CURSOR_API_KEY is empty and every
-          # panel cell produces empty output — and a read-only GITHUB_TOKEN, so
+          # panel cell fails before submitting output — and a read-only GITHUB_TOKEN, so
           # posting the consolidated review returns HTTP 403. The review can
           # neither analyze nor post, so skip cleanly instead of burning the
           # 8-cell matrix + judge and failing red on every external contribution.
@@ -292,11 +292,9 @@ jobs:
   preflight:
     # Validate the panel's pinned model ids against the LIVE Cursor catalog
     # once, before the 8-cell fan-out. When Cursor delists a pinned id the
-    # per-cell `cursor-agent --model <id>` call fails with 0 bytes of stdout,
-    # which downstream reads as an `empty` cell — indistinguishable from "the
-    # model ran and found nothing", so the panel silently runs a lab short for
-    # weeks. Failing here turns that drift into a loud, visible job failure on
-    # the very next run. This job is ALSO the single source of truth for the
+    # per-cell `cursor-agent --model <id>` call cannot submit structured output.
+    # Failing here turns that drift into a loud, visible job failure before the
+    # fan-out starts. This job is ALSO the single source of truth for the
     # matrix model list (emitted as an output the `review` matrix consumes), so
     # the validated list and the reviewed list can never drift apart.
     name: Preflight — validate model catalog
@@ -428,8 +426,8 @@ jobs:
       - name: Seed default findings artifact
         # Pre-seed a minimal artifact tagged status=error so this cell
         # ALWAYS shows up in the panel summary, even if a later step
-        # (checkout, Cursor install, prompt build, extract) fails. The
-        # `Extract findings` step overwrites this on success. Without
+        # (checkout, Cursor install, prompt build, tool submission) fails. The
+        # MCP output tool overwrites this on success. Without
         # this, an early-failing cell silently disappears from the panel
         # and the consolidated review undercounts the matrix.
         env:
@@ -443,7 +441,7 @@ jobs:
               "model": os.environ["MODEL"],
               "review_type": os.environ["REVIEW_TYPE"],
               "status": "error",
-              "error": "Cell did not reach the extraction step.",
+              "error": "Cell did not complete structured output submission.",
               "findings": [],
           }
           with open("/tmp/findings-out/findings.json", "w", encoding="utf-8") as f:
@@ -492,6 +490,57 @@ jobs:
         # would just ship malicious bits as a "new version" we'd then bump to.
         run: cursor-agent --version
 
+      - name: Configure structured review output
+        env:
+          MODEL: ${{ matrix.model }}
+          REVIEW_TYPE: ${{ matrix.review_type }}
+        run: |
+          python3 "$CURSOR_REVIEW_ASSETS/review-output-mcp.py" \
+            --mode reviewer \
+            --out /tmp/findings-out/findings.json \
+            --model "$MODEL" \
+            --review-type "$REVIEW_TYPE" \
+            --init
+
+          rm -rf -- .cursor
+          mkdir -m 700 .cursor
+          python3 - <<'PY'
+          import json, os, sys, tempfile
+
+          if os.path.islink(".cursor"):
+              raise SystemExit("Refusing to write Cursor config through a symlinked .cursor directory")
+
+          config = {
+              "mcpServers": {
+                  "cursor-review-output": {
+                      "type": "stdio",
+                      "command": sys.executable,
+                      "args": [
+                          os.path.join(os.environ["CURSOR_REVIEW_ASSETS"], "review-output-mcp.py"),
+                          "--mode", "reviewer",
+                          "--out", "/tmp/findings-out/findings.json",
+                          "--model", os.environ["MODEL"],
+                          "--review-type", os.environ["REVIEW_TYPE"],
+                      ],
+                  }
+              }
+          }
+          cli_config = {
+              "permissions": {
+                  "allow": [
+                      "Mcp(cursor-review-output:cursor_review_record_finding)",
+                      "Mcp(cursor-review-output:cursor_review_finish)",
+                  ],
+                  "deny": [],
+              }
+          }
+          for filename, value in (("mcp.json", config), ("cli.json", cli_config)):
+              fd, temporary = tempfile.mkstemp(dir=".cursor", prefix=f".{filename}-")
+              with os.fdopen(fd, "w", encoding="utf-8") as output:
+                  json.dump(value, output)
+              os.replace(temporary, os.path.join(".cursor", filename))
+          PY
+
       - name: Build prompt
         env:
           REVIEW_TYPE: ${{ matrix.review_type }}
@@ -515,14 +564,13 @@ jobs:
           # protection — and as of cursor-agent 2026.05.05 it fails to start
           # on ubuntu-latest, producing empty output.
           #
-          # Capture the exit code instead of swallowing it with `|| true`: a
-          # delisted/unavailable model exits non-zero with empty stdout, and
-          # the extract step uses the code + stderr to tag the cell `error`
-          # (loud) rather than `empty` (silent). The `&& ... || ...` idiom
-          # records the code without tripping the shell's `set -e`.
+          # Capture the exit code without tripping the shell's `set -e`. If the
+          # agent fails before finishing its MCP submission, the pre-seeded
+          # structured artifact remains status=error.
           cursor-agent \
             --print \
             --trust \
+            --approve-mcps \
             --model "$MODEL" \
             < /tmp/prompt.txt \
             > /tmp/review-raw.txt 2>/tmp/review-stderr.txt \
@@ -536,27 +584,10 @@ jobs:
           echo "=== Stderr ==="
           cat /tmp/review-stderr.txt
 
-      - name: Extract findings
+      - name: Show structured findings
         if: always()
-        env:
-          MODEL: ${{ matrix.model }}
-          REVIEW_TYPE: ${{ matrix.review_type }}
         run: |
-          mkdir -p /tmp/findings-out
-          # Pass the run's exit code + stderr so a delisted-model failure is
-          # classified `error`, not `empty`. Both are best-effort: a blank
-          # exit code (run step skipped) reads as "unknown", and a missing
-          # stderr file is tolerated by extract-findings.py.
-          CURSOR_EXIT="$(cat /tmp/review-exit-code 2>/dev/null || true)"
-          python3 "$CURSOR_REVIEW_ASSETS/extract-findings.py" \
-            --raw /tmp/review-raw.txt \
-            --out /tmp/findings-out/findings.json \
-            --model "$MODEL" \
-            --review-type "$REVIEW_TYPE" \
-            --exit-code "$CURSOR_EXIT" \
-            --stderr /tmp/review-stderr.txt
-
-          echo "=== Extracted findings ==="
+          echo "=== Structured findings ==="
           cat /tmp/findings-out/findings.json
           echo ""
 
@@ -573,7 +604,7 @@ jobs:
     # Adjudicates the 8 cell artifacts into one consolidated review.
     # Calls cursor-agent one more time as the judge, with prompt-judge.md.
     name: Consolidate panel
-    needs: [gate, diff-size, review]
+    needs: [gate, diff-size, preflight, review]
     if: always() && needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true' && needs.review.result != 'skipped'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -615,8 +646,57 @@ jobs:
           path: /tmp/panel
           pattern: findings-*
 
+      - name: Configure structured final review
+        run: |
+          python3 "$CURSOR_REVIEW_ASSETS/review-output-mcp.py" \
+            --mode judge \
+            --out /tmp/judge-findings.json \
+            --model "$JUDGE_MODEL" \
+            --review-type judge \
+            --init
+
+          rm -rf -- .cursor
+          mkdir -m 700 .cursor
+          python3 - <<'PY'
+          import json, os, sys, tempfile
+
+          if os.path.islink(".cursor"):
+              raise SystemExit("Refusing to write Cursor config through a symlinked .cursor directory")
+
+          config = {
+              "mcpServers": {
+                  "cursor-review-output": {
+                      "type": "stdio",
+                      "command": sys.executable,
+                      "args": [
+                          os.path.join(os.environ["CURSOR_REVIEW_ASSETS"], "review-output-mcp.py"),
+                          "--mode", "judge",
+                          "--out", "/tmp/judge-findings.json",
+                          "--model", os.environ["JUDGE_MODEL"],
+                          "--review-type", "judge",
+                      ],
+                  }
+              }
+          }
+          cli_config = {
+              "permissions": {
+                  "allow": [
+                      "Mcp(cursor-review-output:cursor_review_submit_final)",
+                  ],
+                  "deny": [],
+              }
+          }
+          for filename, value in (("mcp.json", config), ("cli.json", cli_config)):
+              fd, temporary = tempfile.mkstemp(dir=".cursor", prefix=f".{filename}-")
+              with os.fdopen(fd, "w", encoding="utf-8") as output:
+                  json.dump(value, output)
+              os.replace(temporary, os.path.join(".cursor", filename))
+          PY
+
       - name: Aggregate panel findings
         id: aggregate
+        env:
+          PANEL_MODELS: ${{ needs.preflight.outputs.models }}
         run: |
           # Each artifact directory contains one findings.json. Combine into
           # a single panel.json array preserving cell metadata.
@@ -625,8 +705,31 @@ jobs:
 
           panel = []
           for path in sorted(glob.glob("/tmp/panel/findings-*/findings.json")):
-              with open(path, encoding="utf-8") as f:
-                  panel.append(json.load(f))
+              try:
+                  with open(path, encoding="utf-8") as f:
+                      cell = json.load(f)
+              except (OSError, json.JSONDecodeError):
+                  continue
+              if isinstance(cell, dict):
+                  panel.append(cell)
+
+          expected = {
+              (model, review_type)
+              for model in json.loads(os.environ["PANEL_MODELS"])
+              for review_type in ("adversarial", "edge-case")
+          }
+          present = {
+              (cell.get("model"), cell.get("review_type"))
+              for cell in panel
+          }
+          for model, review_type in sorted(expected - present):
+              panel.append({
+                  "model": model,
+                  "review_type": review_type,
+                  "status": "error",
+                  "error": "Cell findings artifact was not uploaded.",
+                  "findings": [],
+              })
 
           with open("/tmp/panel.json", "w", encoding="utf-8") as f:
               json.dump(panel, f, indent=2)
@@ -662,16 +765,15 @@ jobs:
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
         run: |
-          run_judge() {
-            cursor-agent \
-              --print \
-              --trust \
-              --model "$JUDGE_MODEL" \
-              < "$1" \
-              > /tmp/judge-raw.txt 2>/tmp/judge-stderr.txt || true
-          }
-
-          run_judge /tmp/judge-prompt.txt
+          cursor-agent \
+            --print \
+            --trust \
+            --approve-mcps \
+            --model "$JUDGE_MODEL" \
+            < /tmp/judge-prompt.txt \
+            > /tmp/judge-raw.txt 2>/tmp/judge-stderr.txt \
+            && JUDGE_EXIT=0 || JUDGE_EXIT=$?
+          echo "cursor-agent (judge) exit code: $JUDGE_EXIT"
 
           echo "=== Judge raw output (first 1000 chars) ==="
           head -c 1000 /tmp/judge-raw.txt
@@ -679,68 +781,34 @@ jobs:
           echo "=== Judge stderr ==="
           cat /tmp/judge-stderr.txt
 
-          # LLMs intermittently wrap the findings array in prose. extract-findings.py
-          # recovers most of that (fenced block / embedded brace-match), but if it
-          # still can't parse, retry the judge ONCE with a terse strict-JSON
-          # reminder appended — a single retry clears the large majority of these
-          # transient parse failures. The retry overwrites /tmp/judge-raw.txt, so
-          # the parse step below reads whichever attempt the judge last produced.
-          python3 "$CURSOR_REVIEW_ASSETS/extract-findings.py" \
-            --raw /tmp/judge-raw.txt \
-            --out /tmp/judge-probe.json \
-            --model "$JUDGE_MODEL" \
-            --review-type judge
-          PROBE_STATUS=$(python3 -c "import json; print(json.load(open('/tmp/judge-probe.json')).get('status','?'))")
-
-          if [ "$PROBE_STATUS" != "ok" ]; then
-            echo "Judge output did not parse (status=$PROBE_STATUS) — retrying once with a strict-JSON reminder."
-            {
-              cat /tmp/judge-prompt.txt
-              echo ""
-              echo "=== REMINDER ==="
-              echo "Your previous response could not be parsed as JSON. Return ONLY the JSON array of findings — no prose, no explanation, no markdown code fences. Your entire response must be a single JSON array (return [] if there are no findings). You have no shell, filesystem, or web tools here, so do not narrate attempts to use them or your verification reasoning; emit only the array."
-            } > /tmp/judge-prompt-retry.txt
-            run_judge /tmp/judge-prompt-retry.txt
-            echo "=== Judge retry raw output (first 1000 chars) ==="
-            head -c 1000 /tmp/judge-raw.txt
-            echo ""
-            echo "=== Judge retry stderr ==="
-            cat /tmp/judge-stderr.txt
-          fi
+          echo "=== Structured final review ==="
+          cat /tmp/judge-findings.json
+          echo ""
 
       - name: Build consolidated findings file
         id: consolidated
         env:
           OK_COUNT: ${{ steps.aggregate.outputs.ok_count }}
         run: |
-          # If at least one cell produced findings, parse the judge output
-          # into a findings file. Otherwise short-circuit — post-review.py
-          # will render a "no contributors" review with the panel summary.
+          # If no cells completed, short-circuit — post-review.py will render
+          # a "no contributors" review with the panel summary. Otherwise the
+          # judge's MCP tool has already written /tmp/judge-findings.json.
           if [ "$OK_COUNT" = "0" ]; then
-            echo "No panel cells contributed findings — skipping judge parse."
+            echo "No panel cells contributed findings — skipping judge."
             echo '{"status": "ok", "findings": []}' > /tmp/judge-findings.json
-          else
-            python3 "$CURSOR_REVIEW_ASSETS/extract-findings.py" \
-              --raw /tmp/judge-raw.txt \
-              --out /tmp/judge-findings.json \
-              --model "$JUDGE_MODEL" \
-              --review-type judge
           fi
 
-          # If the judge errored or its output couldn't be parsed, surface
-          # that to the next step so we post an honest error review rather
-          # than silently claiming "no findings" when the panel did produce
-          # content.
+          # If the judge did not call its final-review tool, surface that to
+          # the next step rather than silently claiming "no findings".
           JUDGE_STATUS=$(python3 -c "import json,sys; print(json.load(open('/tmp/judge-findings.json')).get('status','?'))")
           echo "Judge status: $JUDGE_STATUS"
           echo "judge_status=$JUDGE_STATUS" >> "$GITHUB_OUTPUT"
 
           # Combine judge findings with panel metadata (model, review_type,
           # status only — drop full per-cell findings to keep the post payload
-          # small) for the post-review script. If the judge FAILED (still no
-          # parseable verdict after the retry), fall back to the raw per-cell
-          # findings so the run surfaces what the panel found instead of a bare
-          # "Review failed".
+          # small) for the post-review script. If the judge did not submit,
+          # fall back to the raw per-cell findings so the run still surfaces
+          # what the panel found.
           python3 - <<'PY'
           import json, os
 
@@ -851,7 +919,7 @@ jobs:
               --repo "$REPO" \
               --commit-sha "$HEAD_SHA" \
               --triggered-by "$TRIGGERED_BY" \
-              --notice "⚠️ The judge step could not produce a parseable verdict after a retry (status=${JUDGE_STATUS}). The findings below are the raw, un-adjudicated panel output — they may contain duplicates or false positives the judge would normally filter."
+              --notice "⚠️ The judge step did not submit a final review through its structured-output tool (status=${JUDGE_STATUS}). The findings below are the raw, un-adjudicated panel output — they may contain duplicates or false positives the judge would normally filter."
           else
             JUDGE_ERROR=$(python3 -c "import json; print(json.load(open('/tmp/judge-findings.json')).get('error','(no error message)'))")
             python3 "$CURSOR_REVIEW_ASSETS/post-review.py" \
