@@ -61,10 +61,17 @@ concurrency:
 
 jobs:
   bump:
+    # Guard against a workflow_dispatch run from a non-main ref: github.sha is
+    # the tip of whatever ref was selected, and the bumper force-resets a stable
+    # shared branch — a manual run from an older ref would pin every caller to a
+    # stale SHA (and run this job's script, with the App token minted below,
+    # from an unreviewed commit). The push trigger is already main-only, so this
+    # only ever skips stray manual runs.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
         with:
           persist-credentials: false
 
@@ -89,4 +96,24 @@ jobs:
           # update flow. Kept in a variable (not the file) so private caller names
           # never land in this public repo or its logs.
           CALLERS_JSON: ${{ vars.ASSIGN_REVIEWERS_CALLERS }}
-        run: bash .github/bump-callers/bump-callers.sh
+        run: |
+          # The main-only ref guard above cannot catch a manual RE-RUN of an
+          # older main run: github.ref is refs/heads/main but github.sha is
+          # that run's original (now stale) commit, and the bumper would
+          # force-repin every caller to it. Only act from the current tip —
+          # any newer push has its own queued run that does the bump.
+          main_tip=$(git ls-remote origin refs/heads/main | cut -f1)
+          if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
+            echo "github.sha $GITHUB_SHA is not the current main tip ($main_tip) — stale run/re-run; nothing to bump"
+            exit 0
+          fi
+          # The push path filter also matches a commit that DELETES the
+          # reusable workflow; bumping callers to a SHA where the file is gone
+          # would break every caller. Deletion means decommissioning — no-op.
+          # (This fleet has no run-time asset dir — the yml is self-contained —
+          # so unlike the sibling entrypoints only the workflow file is checked.)
+          if [[ ! -f .github/workflows/assign-reviewers.yml ]]; then
+            echo "assign-reviewers.yml absent at this SHA — decommissioned; nothing to bump"
+            exit 0
+          fi
+          bash .github/bump-callers/bump-callers.sh
