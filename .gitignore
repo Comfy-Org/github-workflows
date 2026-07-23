@@ -2,3 +2,7 @@
 __pycache__/
 *.py[cod]
 *.pyc
+
+# Go — a `go build ./...` in the package dir drops the compiled binary next to
+# the sources; workflows build it into ${RUNNER_TEMP} instead (never tracked).
+scripts/check-pr-size/check-pr-size
