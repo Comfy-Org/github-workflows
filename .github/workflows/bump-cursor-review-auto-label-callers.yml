@@ -1,0 +1,114 @@
+name: Bump cursor-review-auto-label callers
+
+# When the cursor-review-auto-label reusable workflow is updated on main, open
+# a SHA-bump PR in every repo that pins a caller against it. PRs are opened by
+# Cloud Code Bot so they are easy to filter and merge.
+#
+# This is a thin entrypoint over the shared bumper at
+# .github/bump-callers/bump-callers.sh — the same script drives the
+# cursor-review, agents-md-integrity, pr-size, AND assign-reviewers caller
+# fleets (bump-cursor-review-callers.yml, bump-agents-md-callers.yml,
+# bump-pr-size-callers.yml, bump-assign-reviewers-callers.yml). Keeping ONE
+# implementation is deliberate: a forked copy is how other shared machinery in
+# the org has drifted. The entrypoints differ only in their path-filter trigger
+# and the parameters passed below. (They stay separate rather than a single
+# matrix because their triggers differ — a cursor-review-auto-label.yml change
+# must not spuriously bump the other fleets' callers, and vice versa. In
+# particular, repos pinning BOTH cursor-review.yml and
+# cursor-review-auto-label.yml get each caller bumped by its own fleet, so the
+# two siblings stay in lock-step instead of the auto-label caller silently
+# drifting behind.)
+#
+# The caller list is NOT hardcoded here. This repo is PUBLIC (workflow file and
+# Actions run logs are both publicly viewable), and most callers are private, so
+# their names must never appear in this file or its logs. The list lives in the
+# repo-level Actions variable `CURSOR_REVIEW_AUTO_LABEL_CALLERS` (config, not a
+# credential — a variable, not a secret, since secrets are write-only via the
+# API) as a JSON array of {"repo","file","label"} objects, same shape as
+# CURSOR_REVIEW_CALLERS. Every repo name is `::add-mask::`ed out of the (public)
+# run logs before it is ever echoed. The variable is seeded EMPTY (`[]`) — an
+# empty list is a clean no-op here (ALLOW_EMPTY below); existing consumers'
+# auto-label callers are registered by editing the variable (see the update
+# flow), and new entries are added as callers land.
+#
+# Update flow — adding/removing a caller needs NO public commit:
+#   gh variable set CURSOR_REVIEW_AUTO_LABEL_CALLERS --repo Comfy-Org/github-workflows \
+#     --body "$(jq -c . callers.json)"
+# Keep the canonical callers.json in a PRIVATE infra/ops repo so variable edits
+# have a reviewed source of truth; the org audit log records each edit. (The
+# specific home repo is intentionally not named here — this file is public.)
+
+on:
+  workflow_dispatch: {}   # allow on-demand runs (e.g. to re-bump callers)
+  push:
+    branches: [main]
+    paths:
+      # cursor-review-auto-label.yml is entirely self-contained — its labeling
+      # logic runs inline via actions/github-script, with no external
+      # prompt/script asset dir (unlike cursor-review/** or
+      # scripts/check-pr-size/**). So the workflow file itself is the only path
+      # that can change its behavior.
+      - .github/workflows/cursor-review-auto-label.yml
+
+permissions:
+  contents: read
+
+# Serialize runs of this fleet. The bumper pushes to a STABLE branch
+# (ci/bump-cursor-review-auto-label) shared across runs, so two overlapping
+# runs (a rapid second main push, or a push racing a manual re-run) would
+# force-reset that branch and race the PR update — an older run finishing last
+# could leave the committed diff pinned to a stale SHA. cancel-in-progress:
+# false lets the running bump finish; GitHub keeps only the newest pending run,
+# so the latest SHA always wins (BE-3882).
+concurrency:
+  group: bump-cursor-review-auto-label-callers
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    # Guard against a workflow_dispatch run from a non-main ref: github.sha is
+    # the tip of whatever ref was selected, and the bumper force-resets a stable
+    # shared branch — a manual run from an older ref would pin every caller to a
+    # stale SHA (and run this job's script, with the App token minted below,
+    # from an unreviewed commit). The push trigger is already main-only, so this
+    # only ever skips stray manual runs.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Generate Cloud Code Bot token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        id: token
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+          owner: Comfy-Org
+
+      - name: Bump SHA in caller repos
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          NEW_SHA: ${{ github.sha }}
+          VAR_NAME: CURSOR_REVIEW_AUTO_LABEL_CALLERS
+          TAG: cursor-review-auto-label
+          WORKFLOW_FILE: cursor-review-auto-label.yml
+          # Seeded empty; an empty list is a clean no-op, not an error (the
+          # variable is repo config the merge itself cannot create — see the
+          # header comment for the registration flow).
+          ALLOW_EMPTY: "true"
+          # JSON array of {"repo","file","label"} — see the header comment for
+          # the update flow. Kept in a variable (not the file) so private caller
+          # names never land in this public repo or its logs.
+          CALLERS_JSON: ${{ vars.CURSOR_REVIEW_AUTO_LABEL_CALLERS }}
+        run: |
+          # The push path filter also matches a commit that DELETES the
+          # reusable workflow; bumping callers to a SHA where the file is gone
+          # would break every caller. Deletion means decommissioning — no-op.
+          if [[ ! -f .github/workflows/cursor-review-auto-label.yml ]]; then
+            echo "cursor-review-auto-label.yml absent at this SHA — decommissioned; nothing to bump"
+            exit 0
+          fi
+          bash .github/bump-callers/bump-callers.sh

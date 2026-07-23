@@ -4,10 +4,10 @@
 #
 # When a reusable workflow (e.g. cursor-review.yml or agents-md-integrity.yml)
 # is updated on main, this opens a SHA-bump PR in every repo that pins a caller
-# against it. It is fleet-agnostic: the thin workflow entrypoints
-# (bump-cursor-review-callers.yml, bump-agents-md-callers.yml,
-# bump-pr-size-callers.yml) invoke it with a different caller list, human tag,
-# and reusable-workflow filename. There is ONE implementation so the fleets
+# against it. It is fleet-agnostic: the thin workflow entrypoints (the
+# bump-*-callers.yml workflows — see the fleet table in this directory's
+# README) invoke it with a different caller list, human tag, and
+# reusable-workflow filename. There is ONE implementation so the fleets
 # cannot drift apart (a forked copy is how other shared machinery in the org
 # has rotted); the entrypoints differ only in their path-filter triggers and
 # the parameters below.

@@ -78,9 +78,10 @@ tests — run the matching command above for whatever you touched.
 - `assign-reviewers.yml` — expertise-aware, load-balanced reviewer requests.
 - `assign-prs-to-author.yml` — assigns unassigned open PRs to their author.
 - `detect-unreviewed-merge.yml` — SOC 2: flags PRs merged without approval.
-- `bump-cursor-review-callers.yml` / `bump-agents-md-callers.yml` /
-  `bump-pr-size-callers.yml` / `bump-assign-reviewers-callers.yml` — thin
-  entrypoints over `bump-callers.sh` that fan SHA bumps out to consumers.
+- `bump-cursor-review-callers.yml` / `bump-cursor-review-auto-label-callers.yml` /
+  `bump-agents-md-callers.yml` / `bump-pr-size-callers.yml` /
+  `bump-assign-reviewers-callers.yml` — thin entrypoints over `bump-callers.sh`
+  that fan SHA bumps out to consumers.
 
 ## Conventions & gotchas
 

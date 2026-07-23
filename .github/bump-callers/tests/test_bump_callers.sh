@@ -6,7 +6,8 @@
 # scripts.yml / test-agents-md-integrity.yml lineage of guarding shared CI
 # machinery with a unit run on change — this drives the real script against a
 # stubbed `gh` and asserts the behavior that a consumer repo depends on:
-#   * BOTH caller variables (CURSOR_REVIEW_CALLERS + AGENTS_MD_CALLERS) parse,
+#   * each fleet's caller variable (CURSOR_REVIEW_CALLERS,
+#     CURSOR_REVIEW_AUTO_LABEL_CALLERS, AGENTS_MD_CALLERS, ...) parses,
 #   * every private repo name is masked out of the public run logs,
 #   * the caller's pinned SHA (and only it) is rewritten, the pin comment is
 #     normalized, and the committed file keeps its single trailing newline,
@@ -314,6 +315,45 @@ STUB_CONTENT_FILE="$ALREADY_WIRED_FIXTURE" WIRE_BOT_SCRIPT="$WIRE_SCRIPT" run_bu
 check "exit 0" "[[ $RC -eq 0 ]]"
 check "reported already at SHORT (+ wired)" "grep -q 'already at $SHORT' <<<\"\$OUT\""
 check "committed nothing"                    "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+
+echo "== cursor-review-auto-label fleet: two callers each get a SHA-bump PR (BE-4005) =="
+# The new fleet's exact entrypoint parameters (VAR_NAME/TAG/WORKFLOW_FILE,
+# ALLOW_EMPTY=true), driven with two callers — mirroring the two consumers the
+# variable is seeded with — so the bumper provably opens one SHA-bump PR per
+# consumer instead of letting their auto-label callers drift behind the
+# sibling ci-cursor-review.yml.
+new_case autolabel
+AL_FIXTURE="${WORK}/autolabel_caller.yml"
+printf '%s\n' \
+  'name: CI - Cursor Review Auto-Label' \
+  'jobs:' \
+  '  auto-label:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review-auto-label.yml@3333333333333333333333333333333333333333  # github-workflows#44' \
+  > "$AL_FIXTURE"
+STUB_CONTENT_FILE="$AL_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_AUTO_LABEL_CALLERS TAG=cursor-review-auto-label WORKFLOW_FILE=cursor-review-auto-label.yml ALLOW_EMPTY=true \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-delta","file":".github/workflows/cursor-review-auto-label.yml","label":""},{"repo":"Comfy-Org/secret-epsilon","file":".github/workflows/cursor-review-auto-label.yml","label":""}]'
+check "exit 0" "[[ $RC -eq 0 ]]"
+check "masked caller delta"   "grep -q '::add-mask::Comfy-Org/secret-delta' <<<\"\$OUT\""
+check "masked caller epsilon" "grep -q '::add-mask::Comfy-Org/secret-epsilon' <<<\"\$OUT\""
+check "committed both callers"  "[[ \$(cat \"\$STUB_PUT_DIR/count\") -eq 2 ]]"
+check "opened one PR per caller" "[[ \$(grep -c '^pr-create' \"\$STUB_PUT_DIR/pr.log\") -eq 2 ]]"
+PUT="${STUB_PUT_DIR}/put.last.txt"
+check "new SHA written"         "grep -qF '$NEW_SHA' \"$PUT\""
+check "old pin removed"          "! grep -qF '3333333333333333333333333333333333333333' \"$PUT\""
+check "pin comment normalized"  "grep -qF '# github-workflows main ($SHORT)' \"$PUT\""
+check "reported fleet complete" "grep -q 'cursor-review-auto-label bump complete' <<<\"\$OUT\""
+
+echo "== cursor-review-auto-label fleet: empty list is a clean no-op (ALLOW_EMPTY) =="
+# The variable is repo config the merge itself cannot create, so the fleet must
+# no-op cleanly (not hard-fail) until it is seeded.
+new_case autolabelempty
+STUB_CONTENT_FILE="$AL_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_AUTO_LABEL_CALLERS TAG=cursor-review-auto-label WORKFLOW_FILE=cursor-review-auto-label.yml ALLOW_EMPTY=true \
+  CALLERS_JSON=''
+check "exit 0 on unseeded variable" "[[ $RC -eq 0 ]]"
+check "logged no-op"                "grep -q 'no callers yet' <<<\"\$OUT\""
+check "no commit made"              "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
 
 echo "== agents-md fleet: two callers, two SHA refs, '# v1' preserved =="
 new_case amd

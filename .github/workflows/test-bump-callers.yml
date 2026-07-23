@@ -2,8 +2,8 @@ name: Test bump-callers script
 
 # Runs the functional tests + shellcheck for the shared caller-bump script
 # (.github/bump-callers/bump-callers.sh). That one script drives the SHA-bump
-# fan-out for the cursor-review, agents-md-integrity, pr-size, AND
-# assign-reviewers caller fleets,
+# fan-out for the cursor-review, cursor-review-auto-label, agents-md-integrity,
+# pr-size, AND assign-reviewers caller fleets,
 # so a regression here silently breaks every consumer repo's pin auto-bump (or,
 # worse, leaks a private caller name into this public repo's run logs) — cheap
 # to guard with a unit run on change. Mirrors test-cursor-review-scripts.yml /
@@ -14,6 +14,7 @@ on:
     paths:
       - '.github/bump-callers/**'
       - '.github/workflows/bump-cursor-review-callers.yml'
+      - '.github/workflows/bump-cursor-review-auto-label-callers.yml'
       - '.github/workflows/bump-agents-md-callers.yml'
       - '.github/workflows/bump-pr-size-callers.yml'
       - '.github/workflows/bump-assign-reviewers-callers.yml'
@@ -23,6 +24,7 @@ on:
     paths:
       - '.github/bump-callers/**'
       - '.github/workflows/bump-cursor-review-callers.yml'
+      - '.github/workflows/bump-cursor-review-auto-label-callers.yml'
       - '.github/workflows/bump-agents-md-callers.yml'
       - '.github/workflows/bump-pr-size-callers.yml'
       - '.github/workflows/bump-assign-reviewers-callers.yml'
