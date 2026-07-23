@@ -190,6 +190,15 @@ real groom, so a skipped tick costs ~nothing (it never reaches the finder).
 - **`workflow_dispatch` always runs** — a manual dispatch bypasses the gate.
 - **Fail-open**, like the volume gate: any error reading history (API hiccup, no
   history, unparseable timestamp) RUNS the audit rather than skip a due groom.
+- **One normalization for both gates.** The caller wires the same variable to
+  `cadence` (the volume gate's merge-activity window), so the volume gate routes
+  it through this module too — `interval.py --normalize-cadence "$CADENCE"` —
+  rather than feeding the raw value to `date -d`. Same degradation
+  (blank/garbage/negative → `7`), then floored at **1 whole day**. Without it the
+  gates drift on reachable values: `-3` becomes a *future* `date -d` cutoff that
+  matches no merged PR (skipping every run — groom silently off) while the
+  interval gate had safely degraded to weekly, and `0` (a legitimate "no
+  throttle") shrinks the merge window to today-only.
 
 The caller grants `actions: read` (a reusable workflow's token is capped by the
 caller's grant, so without it the run-history read 403s and the gate fails open).
@@ -200,6 +209,9 @@ is fully unit-testable with no network.
 python3 .github/groom/interval.py \
     --repo owner/name --workflow-file ci-groom.yml \
     --current-run-id 123 --interval-days 7 --event-name schedule
+
+# Second mode — normalize the shared knob into the volume gate's window:
+python3 .github/groom/interval.py --normalize-cadence "$GROOM_INTERVAL_DAYS"
 ```
 
 - **`tests/`** — `unittest` suite, run by

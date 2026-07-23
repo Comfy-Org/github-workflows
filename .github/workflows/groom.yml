@@ -141,7 +141,9 @@ on:
           last `cadence` days — a quiescent repo has nothing new to groom. Set
           this to roughly your EFFECTIVE cadence — the same value you pass to
           `interval_days` — so the merge window matches how often a real run can
-          happen (see the interval gate below).
+          happen (see the interval gate below). Normalized through the same
+          parser as `interval_days` (blank/garbage/negative -> 7) and floored at
+          1 day, so wiring both to one Actions variable can't drift the gates.
         type: number
         required: false
         default: 7
@@ -377,9 +379,17 @@ jobs:
             exit 0
           fi
 
+          # Normalize through interval.py so BOTH gates read the shared
+          # GROOM_INTERVAL_DAYS knob the same way — blank/garbage/negative -> 7,
+          # and a sub-1-day window floored to 1. Passing the raw value to
+          # `date -d` drifts: `-3` yields a FUTURE cutoff that matches no merged
+          # PR (skipping every run, silently disabling groom) while the interval
+          # gate had safely degraded to weekly.
+          CADENCE_DAYS=$(python3 "$GROOM_ASSETS/interval.py" --normalize-cadence "$CADENCE" || echo "")
+
           # Fail-OPEN — any API hiccup runs the audit rather than silently
           # skipping a due groom (mirrors the studio volume gate).
-          SINCE=$(date -u -d "${CADENCE} days ago" +%Y-%m-%d 2>/dev/null || echo "")
+          SINCE=$(date -u -d "${CADENCE_DAYS:-} days ago" +%Y-%m-%d 2>/dev/null || echo "")
           if [ -z "$SINCE" ]; then
             echo "Could not compute the cadence window — running (fail-open)."
             echo "run=true" >> "$GITHUB_OUTPUT"
@@ -397,7 +407,7 @@ jobs:
             echo "$MERGED PR(s) merged since $SINCE — running."
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
-            echo "No PRs merged since $SINCE (cadence ${CADENCE}d) — nothing new to groom, skipping."
+            echo "No PRs merged since $SINCE (cadence ${CADENCE_DAYS}d) — nothing new to groom, skipping."
             echo "run=false" >> "$GITHUB_OUTPUT"
           fi
 

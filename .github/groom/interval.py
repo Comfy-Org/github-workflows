@@ -67,6 +67,13 @@ _AUDITED_CONCLUSIONS = {"success", "failure"}
 # the documented weekly behavior (AC: unset variable stays weekly, matching today).
 _DEFAULT_INTERVAL_DAYS = 7.0
 
+# Floor for the volume gate's merge-activity window. The volume gate shares this
+# same cadence knob, but a sub-1-day lookback is meaningless for "did anything
+# merge?": 0 collapses the window to today-only, so a repo that merged nothing
+# in the last few hours is judged quiescent. (Negative values never reach here —
+# parse_interval_days already folds them into the default.)
+_MIN_CADENCE_DAYS = 1
+
 # owner/name only — no path segments or URL metacharacters that could redirect
 # the `gh api` endpoint (mirrors ledger.py's guard).
 _REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
@@ -102,6 +109,27 @@ def parse_interval_days(raw, default: float = _DEFAULT_INTERVAL_DAYS):
     if value < 0:
         return default
     return value
+
+
+def normalize_cadence_days(raw, default: float = _DEFAULT_INTERVAL_DAYS) -> int:
+    """Whole-day volume-gate window derived from the SAME raw value as the interval.
+
+    Both gates are wired to `GROOM_INTERVAL_DAYS` in the caller, so they must
+    agree on what a given value means. Feeding the raw variable straight to
+    `date -d` drifts from `parse_interval_days` in two reachable ways:
+
+    - `-3` -> `date -d '-3 days ago'` is a FUTURE cutoff that matches no merged
+      PR, so the volume gate skips EVERY run — silently disabling groom, where
+      the interval gate had degraded safely to the weekly default.
+    - `0` (a legitimate "no throttle" for the interval gate) collapses the
+      merge window to today-only, so most ticks are judged quiescent.
+
+    Routing through `parse_interval_days` first, then flooring at one whole day,
+    keeps the two gates on one normalization. The floor takes nothing away: to
+    run with no merge-activity throttle at all, set `volume_gate: false` — that
+    is the input that expresses it, not a zero-width window.
+    """
+    return max(_MIN_CADENCE_DAYS, int(parse_interval_days(raw, default)))
 
 
 def parse_iso8601_utc(ts: str) -> datetime:
@@ -228,6 +256,17 @@ def evaluate(repo, workflow_file, current_run_id, interval_days, event_name, now
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    # Second, tiny mode — no API calls, no other flags required:
+    #     python3 interval.py --normalize-cadence "$CADENCE"   # -> e.g. `7`
+    # The volume gate shells out to this so BOTH gates derive their window from
+    # this one parser instead of the volume gate feeding the raw Actions
+    # variable straight to `date -d` (see normalize_cadence_days).
+    if argv and argv[0] == "--normalize-cadence":
+        print(normalize_cadence_days(argv[1] if len(argv) > 1 else ""))
+        return 0
+
     parser = argparse.ArgumentParser(description="Groom runtime cadence gate (GROOM_INTERVAL_DAYS).")
     parser.add_argument("--repo", required=True, help="owner/name of the target repo")
     parser.add_argument("--workflow-file", required=True, help="caller workflow basename, e.g. ci-groom.yml")

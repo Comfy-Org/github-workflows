@@ -8,6 +8,8 @@ Core properties:
   finder actually ran counts).
 - `workflow_dispatch` always runs, regardless of the interval.
 - The gate is fail-open: no history / an API error runs rather than skips.
+- The volume gate's window normalizes through the SAME parser (blank/garbage/
+  negative -> 7, floored at 1 whole day), so the two gates can't drift apart.
 
 The pure logic runs with no network; the history I/O is exercised via a stubbed
 `gh` subprocess.
@@ -15,7 +17,9 @@ The pure logic runs with no network; the history I/O is exercised via a stubbed
 Run: python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import unittest
@@ -71,6 +75,42 @@ class ParseIntervalDaysTest(unittest.TestCase):
         self.assertEqual(interval.parse_interval_days("3"), 3.0)
         self.assertEqual(interval.parse_interval_days("1.5"), 1.5)
         self.assertEqual(interval.parse_interval_days("0"), 0.0)
+
+
+class NormalizeCadenceDaysTest(unittest.TestCase):
+    def test_unset_blank_garbage_negative_default_to_weekly(self):
+        # Same degradation as the interval gate — the two share one knob.
+        for raw in (None, "", "   ", "not-a-number", "-3"):
+            self.assertEqual(interval.normalize_cadence_days(raw), 7, raw)
+
+    def test_zero_and_fractions_floor_to_one_whole_day(self):
+        # 0 legitimately disables the interval throttle, but a 0-day merge
+        # window would judge almost every repo quiescent — floor at 1.
+        self.assertEqual(interval.normalize_cadence_days("0"), 1)
+        self.assertEqual(interval.normalize_cadence_days("0.5"), 1)
+        self.assertEqual(interval.normalize_cadence_days("1.9"), 1)
+
+    def test_numeric_values_truncate_to_whole_days(self):
+        self.assertEqual(interval.normalize_cadence_days("3"), 3)
+        self.assertEqual(interval.normalize_cadence_days("7"), 7)
+        self.assertEqual(interval.normalize_cadence_days("14.7"), 14)
+
+    def test_cli_mode_prints_normalized_value_without_other_flags(self):
+        # The volume gate shells out as `interval.py --normalize-cadence "$X"`,
+        # with none of the gate's required flags — it must not error out.
+        for raw, want in (("-3", "7"), ("0", "1"), ("3", "3"), ("", "7")):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = interval.main(["--normalize-cadence", raw])
+            self.assertEqual(rc, 0, raw)
+            self.assertEqual(buf.getvalue().strip(), want, raw)
+
+    def test_cli_mode_with_missing_value_falls_back_to_default(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = interval.main(["--normalize-cadence"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(buf.getvalue().strip(), "7")
 
 
 class RunAuditedTest(unittest.TestCase):
