@@ -389,6 +389,25 @@ jobs:
         # validated end-to-end on. Bump deliberately, re-validating a groom run.
         run: npm install -g @anthropic-ai/claude-code@2.1.217
 
+      - name: Lock the clone read-only
+        # The finder NEVER writes into the clone — its sole output is $FINDER_OUT
+        # under /tmp. Making the whole checkout unwritable closes the `Write` tool
+        # as an escalation path at the OS level, which is strictly stronger than a
+        # permission-rule allowlist: a prompt-injected agent that talks the
+        # permission engine into a write still cannot land one.
+        #
+        # What this specifically kills: writing `.git/config` to register a
+        # `diff.external` driver or `core.fsmonitor`, which the *allowlisted*
+        # `git show --ext-diff` / `git log` would then execute as an arbitrary
+        # command — with the model key in this step's env. GIT_PAGER=cat only
+        # closed the pager sub-path; this closes the config route it left open.
+        #
+        # Verified locally: with the tree chmod'd a-w, `git log`/`git show`/
+        # `git status`/`grep`/`cat`/`ls` (the entire allowlist) all still succeed,
+        # while writing `.git/config`, creating a file in the tree, and mkdir under
+        # `.git` all fail EACCES. /tmp is untouched, so $FINDER_OUT still works.
+        run: chmod -R a-w "$GROOM_CLONE"
+
       - name: Run finder
         # Invoked as the CLI directly, NOT via the anthropics composite action
         # (BE-4202/BE-4214): the action cannot set a working directory, so the
@@ -438,7 +457,14 @@ jobs:
           # environment (validated); the old 40 could not finish the brief at all.
           # `git grep` is deliberately NOT allowlisted: `--open-files-in-pager=<cmd>`
           # executes an arbitrary command. The Grep tool covers content search.
+          # `env -u GITHUB_*`: the runner's file-command channels are how a step
+          # talks to LATER steps. $GITHUB_ENV in particular is a write-to-execute
+          # primitive — a line like `BASH_ENV=/tmp/x` there makes every subsequent
+          # `run:` step source that file, i.e. arbitrary shell OUTSIDE this
+          # allowlist. The agent inherits this step's env, so the paths are simply
+          # removed from the child process rather than left for it to find.
           STATUS=0
+          env -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_OUTPUT -u GITHUB_STATE -u GITHUB_STEP_SUMMARY \
           claude -p "$PROMPT" \
             --model "$MODEL" \
             --max-turns 150 \
@@ -456,6 +482,13 @@ jobs:
           fi
           exit "$STATUS"
 
+      - name: Unlock the clone
+        # ALWAYS: the agent is done, and a read-only `.git` would break any later
+        # step that touches it — notably `actions/checkout`'s post-job cleanup,
+        # which runs `git config --local --unset-all` on the auth header.
+        if: always()
+        run: chmod -R u+w "$GROOM_CLONE"
+
       - name: Redact agent execution log
         # ALWAYS, and BEFORE the assert step, so the diagnostics survive a starved
         # or failed run: the CLI result JSON carries `subtype` (e.g.
@@ -470,9 +503,18 @@ jobs:
         # `cat /proc/self/environ`) and exfiltrate it through the artifact with no
         # network egress at all. Denials are reduced to per-tool counts.
         if: always()
+        continue-on-error: true
         run: |
           set -uo pipefail
           RAW=/tmp/groom-finder-exec.json
+          # Delete any pre-existing DIAG before writing: the agent's `Write` tool
+          # reaches /tmp (only the clone is locked read-only), so a prompt-injected
+          # agent could pre-create this exact path with the model key embedded. If
+          # the CLI then produced empty/invalid stdout the projection below is
+          # skipped and the `if: always()` upload would publish the ATTACKER's file
+          # as a public artifact. Removing it first makes "no valid raw output" mean
+          # "no artifact", never "whatever was already sitting there".
+          rm -f /tmp/groom-finder-diag.json
           # Written only when there is something to report, so upload-artifact's
           # `if-no-files-found: warn` can actually fire on a starved run.
           if [ -s "$RAW" ] && jq -e . "$RAW" >/dev/null 2>&1; then
@@ -490,7 +532,11 @@ jobs:
           fi
 
       - name: Upload agent execution log
+        # continue-on-error: this upload is pure telemetry. A transient
+        # artifact-service or quota failure must not sink an otherwise-successful
+        # agent job (and with it the downstream job consuming its result).
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: groom-finder-exec
@@ -599,6 +645,14 @@ jobs:
         # Pinned for the same supply-chain reason as the finder job — see there.
         run: npm install -g @anthropic-ai/claude-code@2.1.217
 
+      - name: Lock the clone read-only
+        # Same OS-level write lockdown as the finder job — see the full note there.
+        # The verifier's only output is $VERIFIER_OUT under /tmp, so it never needs
+        # to write into the clone; locking it denies the `.git/config` →
+        # `diff.external` → arbitrary-execution route that the allowlisted
+        # `git show`/`git log` would otherwise hand a prompt-injected agent.
+        run: chmod -R a-w "$GROOM_CLONE"
+
       - name: Run verifier
         # A FRESH agent session on a FRESH checkout — it sees only the finder's
         # JSON + the code, never the finder's reasoning. That independence is the
@@ -625,7 +679,11 @@ jobs:
           # TARGET repo's CLAUDE.md/AGENTS.md loading as trusted memory (which
           # --setting-sources does NOT cover). `git grep` is not allowlisted —
           # `--open-files-in-pager=<cmd>` is arbitrary execution. See the finder job.
+          # env -u GITHUB_*: strips the runner's file-command paths from the agent's
+          # env so it cannot write $GITHUB_ENV (BASH_ENV = arbitrary shell in a
+          # later step, outside this allowlist). See the finder job for the note.
           STATUS=0
+          env -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_OUTPUT -u GITHUB_STATE -u GITHUB_STEP_SUMMARY \
           claude -p "$PROMPT" \
             --model "$MODEL" \
             --max-turns 150 \
@@ -642,14 +700,24 @@ jobs:
           fi
           exit "$STATUS"
 
+      - name: Unlock the clone
+        # ALWAYS — a read-only `.git` would break `actions/checkout`'s post-job
+        # cleanup. See the finder job.
+        if: always()
+        run: chmod -R u+w "$GROOM_CLONE"
+
       - name: Redact agent execution log
         # ALWAYS + before validate so diagnostics survive a starved run, and a
         # fixed-shape projection only — the raw JSON carries model-controlled text
         # that could smuggle the model key into a public artifact. See the finder job.
         if: always()
+        continue-on-error: true
         run: |
           set -uo pipefail
           RAW=/tmp/groom-verifier-exec.json
+          # Drop any pre-existing DIAG first — the agent's Write reaches /tmp and
+          # could have planted a key-bearing file at this path. See the finder job.
+          rm -f /tmp/groom-verifier-diag.json
           if [ -s "$RAW" ] && jq -e . "$RAW" >/dev/null 2>&1; then
             jq '{
               type, subtype, is_error, api_error_status, terminal_reason,
@@ -665,7 +733,11 @@ jobs:
           fi
 
       - name: Upload agent execution log
+        # continue-on-error: this upload is pure telemetry. A transient
+        # artifact-service or quota failure must not sink an otherwise-successful
+        # agent job (and with it the downstream job consuming its result).
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: groom-verifier-exec
@@ -677,10 +749,19 @@ jobs:
         id: validate
         run: |
           set -euo pipefail
+          # HARD failure, mirroring the finder's "Assert" step. The CLI exiting 0
+          # does not prove the agent wrote its output: `claude -p` can finish
+          # cleanly having never created $VERIFIER_OUT. Treating that as
+          # `have_findings=false` kept the run GREEN while silently discarding
+          # every candidate the finder confirmed — indistinguishable, on the run
+          # page, from an honest "nothing survived verification".
+          #
+          # Note this is only about the file being MISSING or unparseable. A valid
+          # document with zero CONFIRM/DOWNGRADE survivors is a legitimate verdict
+          # and still exits 0 with have_findings=false below.
           if [ ! -s "$VERIFIER_OUT" ] || ! jq -e . "$VERIFIER_OUT" >/dev/null 2>&1; then
-            echo "::warning::Verifier produced no valid JSON — nothing to file."
-            echo "have_findings=false" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "::error::Verifier did not produce valid JSON at $VERIFIER_OUT — failing rather than silently filing nothing. See the groom-verifier-exec artifact for subtype/num_turns."
+            exit 1
           fi
           # Only CONFIRM/DOWNGRADE survive to filing (REJECT is dropped).
           KEEP=$(jq '[.findings[]? | select(.verdict == "CONFIRM" or .verdict == "DOWNGRADE")] | length' "$VERIFIER_OUT")
@@ -1099,6 +1180,20 @@ jobs:
         # Pinned for the same supply-chain reason as the finder job — see there.
         run: npm install -g @anthropic-ai/claude-code@2.1.217
 
+      - name: Lock the clone's .git read-only
+        # Narrower than the finder/verifier lockdown: the builder's whole JOB is to
+        # edit files in the worktree, so only `.git` is frozen. That is the part it
+        # never needs to write and the part that is a code-execution primitive —
+        # `.git/config` can register a `diff.external` driver or `core.fsmonitor`
+        # that the allowlisted `git diff`/`git status`/`git show` then execute as
+        # an arbitrary command, with the model key in this step's env.
+        #
+        # Verified locally that this preserves everything the builder needs: with
+        # `.git` chmod'd a-w, editing tracked files, `git status`, `git diff`,
+        # `git log` and `git show` all still succeed (git degrades gracefully when
+        # it cannot refresh the index), while `.git/config` writes fail EACCES.
+        run: chmod -R a-w "$GROOM_CLONE/.git"
+
       - name: Run builder
         # Invoked as the CLI directly with cwd = the clone (BE-4214) so the
         # allowlisted `git diff`/`git status`/`git log` commands the brief relies
@@ -1138,7 +1233,12 @@ jobs:
           # --max-turns 100 (was 60): this single-finding task is narrower than the
           # finder's whole-repo sweep, but gets headroom now that git works — 100 turns
           # at the validated pace (~82 turns ≈ 12.3 min) fits the job's 30-min timeout.
+          # env -u GITHUB_*: strips the runner's file-command paths from the agent's
+          # env. Without it the builder's (necessarily broad) Write/Edit could
+          # target $GITHUB_ENV to set BASH_ENV and run arbitrary shell in a later
+          # step, escaping this allowlist entirely. See the finder job.
           STATUS=0
+          env -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_OUTPUT -u GITHUB_STATE -u GITHUB_STEP_SUMMARY \
           claude -p "$PROMPT" \
             --model "$MODEL" \
             --max-turns 100 \
@@ -1155,15 +1255,25 @@ jobs:
           fi
           exit "$STATUS"
 
+      - name: Unlock the clone's .git
+        # ALWAYS, and BEFORE the capture step: capture runs `git diff` to build the
+        # patch, and `actions/checkout`'s post-job cleanup writes to `.git` too.
+        if: always()
+        run: chmod -R u+w "$GROOM_CLONE/.git"
+
       - name: Redact agent execution log
         # ALWAYS + before capture so diagnostics survive a starved run, and a
         # fixed-shape projection only — the raw JSON carries model-controlled text
         # that could smuggle the model key into a public artifact. See the finder job.
         # The artifact name carries matrix.idx — names must be unique per run.
         if: always()
+        continue-on-error: true
         run: |
           set -uo pipefail
           RAW=/tmp/groom-builder-exec.json
+          # Drop any pre-existing DIAG first — the agent's Write reaches /tmp and
+          # could have planted a key-bearing file at this path. See the finder job.
+          rm -f /tmp/groom-builder-diag.json
           if [ -s "$RAW" ] && jq -e . "$RAW" >/dev/null 2>&1; then
             jq '{
               type, subtype, is_error, api_error_status, terminal_reason,
@@ -1179,7 +1289,11 @@ jobs:
           fi
 
       - name: Upload agent execution log
+        # continue-on-error: this upload is pure telemetry. A transient
+        # artifact-service or quota failure must not sink an otherwise-successful
+        # agent job (and with it the downstream job consuming its result).
         if: always()
+        continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: groom-builder-exec-${{ matrix.idx }}
@@ -1211,6 +1325,19 @@ jobs:
           # "review-gated, patch-only" boundary (review gates merge, not CI exec).
           # A prompt-injected builder must never self-author CI. Refuse such a
           # patch and file an issue so a human authors the workflow change.
+          #
+          # KNOWN GAP — read this BEFORE setting `builder: true` on any caller.
+          # This policy enumerates ONE CI-privileged path. Other checked-in files
+          # also execute in that pre-review CI — `package.json` scripts,
+          # `Makefile`, `conftest.py`/tox/pytest config, and composite actions
+          # under `.github/actions/` — so the same "runs with secrets before a
+          # human reads the diff" window exists for them. Not fixed here because
+          # the right path list is target-repo-specific (a repo whose CI never
+          # runs npm scripts should not have `package.json` blocked, and
+          # over-blocking silently downgrades legitimate refactors to issues) —
+          # that needs a human call on policy, not a blind widening of this grep.
+          # The exposure is currently latent: `builder` defaults to false and no
+          # caller enables it. Widen this policy as a precondition of enabling it.
           TOUCHED_WF=$(git -C repo diff --cached --name-only | grep -E '^\.github/workflows/' || true)
 
           bail() {
