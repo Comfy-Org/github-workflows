@@ -234,6 +234,11 @@ func TestExtrasGenerated(t *testing.T) {
 		{"path glob anchors to full path", "", "gen/**", "gen/a/b.ts", true},
 		{"path glob does not float", "", "gen/**", "src/gen/a.ts", false},
 		{"double star crosses segments", "", "web/**/snapshots/**", "web/a/b/snapshots/x.snap", true},
+		{"leading double star matches root level", "", "**/node_modules/**", "node_modules/pkg/index.js", true},
+		{"leading double star matches nested", "", "**/node_modules/**", "web/node_modules/pkg/index.js", true},
+		{"leading double star star matches root file", "", "**/*.min.js", "app.min.js", true},
+		{"leading double star star matches nested file", "", "**/*.min.js", "web/js/app.min.js", true},
+		{"interior double star matches zero segments", "", "web/**/snapshots/**", "web/snapshots/x.snap", true},
 		{"single star does not cross segments", "", "web/*/x.ts", "web/a/b/x.ts", false},
 		{"question mark matches one char", "", "v?.json", "schema/v1.json", true},
 		{"question mark needs a char", "", "v?.json", "v.json", false},
@@ -378,7 +383,7 @@ func TestContentGeneratedOnlyTrustsGoFiles(t *testing.T) {
 	if err := os.WriteFile(goFile, marker, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if !contentGenerated(goFile, "", "") {
+	if !contentGenerated(goFile, "", "", false) {
 		t.Errorf("a .go file with the generated marker should be generated")
 	}
 
@@ -388,7 +393,7 @@ func TestContentGeneratedOnlyTrustsGoFiles(t *testing.T) {
 	if err := os.WriteFile(mdFile, marker, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if contentGenerated(mdFile, "", "") {
+	if contentGenerated(mdFile, "", "", false) {
 		t.Errorf("a non-.go file with a pasted marker must not be treated as generated")
 	}
 }
@@ -406,7 +411,361 @@ func TestContentGeneratedRejectsSymlink(t *testing.T) {
 	}
 	// The DoS guard must refuse to follow a symlink, even one pointing at a
 	// legitimately generated file.
-	if contentGenerated(link, "", "") {
+	if contentGenerated(link, "", "", false) {
 		t.Errorf("contentGenerated must not follow symlinks")
+	}
+}
+
+// TestCommentSyntaxFor pins the ext/basename → comment-syntax mapping, including
+// the "unknown extension gets no comment markers" (blank-only) safe default.
+func TestCommentSyntaxFor(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		path      string
+		wantLine  []string
+		wantBlock string // blockStart, "" if none
+	}{
+		{"pkg/foo.go", []string{"//"}, "/*"},
+		{"web/app.tsx", []string{"//"}, "/*"},
+		{"scripts/deploy.sh", []string{"#"}, ""},
+		{"infra/main.tf", []string{"#"}, ""},
+		{"db/schema.sql", []string{"--"}, ""},
+		{"docs/index.html", nil, "<!--"},
+		{"Makefile", []string{"#"}, ""},
+		{"build/Dockerfile", []string{"#"}, ""},
+		{"data/blob.bin", nil, ""},              // unknown ext → blank-only
+		{"README", nil, ""},                     // no extension → blank-only
+		{"path/UPPER.GO", []string{"//"}, "/*"}, // extension match is case-insensitive
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			t.Parallel()
+			cs := commentSyntaxFor(tt.path)
+			if strings.Join(cs.line, ",") != strings.Join(tt.wantLine, ",") {
+				t.Errorf("%s: line = %v, want %v", tt.path, cs.line, tt.wantLine)
+			}
+			if cs.blockStart != tt.wantBlock {
+				t.Errorf("%s: blockStart = %q, want %q", tt.path, cs.blockStart, tt.wantBlock)
+			}
+		})
+	}
+}
+
+// TestIsInsignificantLine pins the per-line heuristic: blanks and comment-prefixed
+// lines are insignificant; a comment token merely CONTAINED in code (a string
+// literal) is significant; a multi-line block-comment body (no single-line
+// close) is significant (documented limitation).
+func TestIsInsignificantLine(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		body string
+		cs   commentSyntax
+		want bool
+	}{
+		{"blank", "", cFamily, true},
+		{"whitespace only", "   \t", cFamily, true},
+		{"go line comment", "  // explain", cFamily, true},
+		{"go code", "\tx := f()", cFamily, false},
+		{"single-line block", "/* note */", cFamily, true},
+		{"block open only is significant", "/* start of a long block", cFamily, false},
+		{"go pointer deref is code, not comment", "*out = result", cFamily, false},
+		{"hash comment python", "# a note", hashCmt, true},
+		{"hash token inside string is code", `url = "http://x#frag"`, hashCmt, false},
+		{"sql dash comment", "-- drop", dashCmt, true},
+		{"html single-line comment", "<!-- hi -->", mlCmt, true},
+		{"unknown lang: blank still insignificant", "   ", commentSyntax{}, true},
+		{"unknown lang: comment-looking code counts", "// still code here", commentSyntax{}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isInsignificantLine(tt.body, tt.cs); got != tt.want {
+				t.Errorf("isInsignificantLine(%q) = %v, want %v", tt.body, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestParseDiscounts feeds a literal unified diff spanning a .go and a .py file
+// and checks the per-path blank/comment counts. It also covers the header-vs-
+// content ambiguity: an ADDED line whose own text begins with "+++" (inside a
+// hunk) must be treated as content, never as a file header.
+func TestParseDiscounts(t *testing.T) {
+	t.Parallel()
+	patch := strings.Join([]string{
+		"diff --git a/pkg/foo.go b/pkg/foo.go",
+		"index 111..222 100644",
+		"--- a/pkg/foo.go",
+		"+++ b/pkg/foo.go",
+		"@@ -1,3 +1,7 @@",
+		" package foo",
+		"+// added comment", // insignificant (go comment)
+		"+",                 // insignificant (blank)
+		"+func F() int {",   // significant
+		"+++ still content", // significant: leading + stripped -> "++ still content", not a header
+		"-x := 1",           // significant (removed code)
+		"-// old comment",   // insignificant (removed comment)
+		" return 0",
+		"diff --git a/app.py b/app.py",
+		"index 333..444 100644",
+		"--- a/app.py",
+		"+++ b/app.py",
+		"@@ -0,0 +1,2 @@",
+		"+# python comment", // insignificant
+		"+value = 42",       // significant
+		"",
+	}, "\n")
+
+	got, err := ParseDiscounts(strings.NewReader(patch))
+	if err != nil {
+		t.Fatalf("ParseDiscounts: %v", err)
+	}
+	if got["pkg/foo.go"] != 3 {
+		t.Errorf("pkg/foo.go discounted = %d, want 3 (comment, blank, removed comment)", got["pkg/foo.go"])
+	}
+	if got["app.py"] != 1 {
+		t.Errorf("app.py discounted = %d, want 1 (python comment)", got["app.py"])
+	}
+}
+
+// TestEvaluateDiscount proves Discounted lowers the counted total (not the
+// generated total) and that a fully blank/comment file drops to zero counted.
+func TestEvaluateDiscount(t *testing.T) {
+	t.Parallel()
+	files := []FileChange{
+		{Path: "a.go", Added: 100, Deleted: 0, Discounted: 40}, // 60 counted
+		{Path: "b.go", Added: 20, Deleted: 0, Discounted: 20},  // all comment → 0 counted
+		{Path: "gen.pb.go", Added: 900, Generated: true},       // excluded wholesale
+	}
+	res := Evaluate(files, 1000, false)
+	if res.Counted != 60 {
+		t.Errorf("Counted = %d, want 60", res.Counted)
+	}
+	if res.Discounted != 60 {
+		t.Errorf("Discounted = %d, want 60 (40+20)", res.Discounted)
+	}
+	if res.Generated != 900 {
+		t.Errorf("Generated = %d, want 900 (raw, discount does not touch generated)", res.Generated)
+	}
+	// b.go contributes 0 counted lines.
+	for _, f := range res.Files {
+		if f.Path == "b.go" && f.Counted() != 0 {
+			t.Errorf("b.go Counted() = %d, want 0", f.Counted())
+		}
+	}
+}
+
+// TestFilterPatch exercises the reviewed-diff section filter against literal
+// patches: sections drop by old path, new path, or rename source/destination
+// (the whole rename goes at once — no orphaned old-path deletion), binary and
+// mode-only sections resolve via the `diff --git` fallback, and anything
+// unparseable is kept, never hidden.
+func TestFilterPatch(t *testing.T) {
+	t.Parallel()
+	drop := func(set ...string) func(string) bool {
+		m := map[string]bool{}
+		for _, p := range set {
+			m[p] = true
+		}
+		return func(p string) bool { return m[p] }
+	}
+
+	textSection := func(path, add string) string {
+		return "diff --git a/" + path + " b/" + path + "\n" +
+			"index 1111111..2222222 100644\n" +
+			"--- a/" + path + "\n" +
+			"+++ b/" + path + "\n" +
+			"@@ -1,1 +1,2 @@\n line\n+" + add + "\n"
+	}
+
+	t.Run("drops generated section, keeps hand-written", func(t *testing.T) {
+		t.Parallel()
+		patch := textSection("hand.go", "var A = 1") + textSection("gen.pb.go", "var B = 2")
+		var out strings.Builder
+		kept, dropped, err := FilterPatch(strings.NewReader(patch), &out, drop("gen.pb.go"))
+		if err != nil {
+			t.Fatalf("FilterPatch: %v", err)
+		}
+		if kept != 1 || dropped != 1 {
+			t.Errorf("kept=%d dropped=%d, want 1 and 1", kept, dropped)
+		}
+		if got := out.String(); got != textSection("hand.go", "var A = 1") {
+			t.Errorf("unexpected output:\n%s", got)
+		}
+	})
+
+	t.Run("empty drop set is the identity", func(t *testing.T) {
+		t.Parallel()
+		patch := textSection("a.go", "x") + textSection("b.go", "y")
+		var out strings.Builder
+		kept, dropped, err := FilterPatch(strings.NewReader(patch), &out, drop())
+		if err != nil {
+			t.Fatalf("FilterPatch: %v", err)
+		}
+		if kept != 2 || dropped != 0 || out.String() != patch {
+			t.Errorf("identity violated: kept=%d dropped=%d\n%s", kept, dropped, out.String())
+		}
+	})
+
+	t.Run("rename drops as one piece via destination path", func(t *testing.T) {
+		t.Parallel()
+		patch := "diff --git a/old/gen.pb.go b/new/gen.pb.go\n" +
+			"similarity index 90%\n" +
+			"rename from old/gen.pb.go\n" +
+			"rename to new/gen.pb.go\n" +
+			"index 1111111..2222222 100644\n" +
+			"--- a/old/gen.pb.go\n" +
+			"+++ b/new/gen.pb.go\n" +
+			"@@ -1,1 +1,2 @@\n line\n+more\n" +
+			textSection("hand.go", "var A = 1")
+		var out strings.Builder
+		kept, dropped, err := FilterPatch(strings.NewReader(patch), &out, drop("new/gen.pb.go"))
+		if err != nil {
+			t.Fatalf("FilterPatch: %v", err)
+		}
+		if kept != 1 || dropped != 1 {
+			t.Errorf("kept=%d dropped=%d, want 1 and 1", kept, dropped)
+		}
+		if got := out.String(); strings.Contains(got, "old/gen.pb.go") || strings.Contains(got, "new/gen.pb.go") {
+			t.Errorf("rename section should drop entirely (both sides):\n%s", got)
+		}
+	})
+
+	t.Run("pure rename with no hunks drops at section boundary", func(t *testing.T) {
+		t.Parallel()
+		patch := "diff --git a/gen.pb.go b/moved/gen.pb.go\n" +
+			"similarity index 100%\n" +
+			"rename from gen.pb.go\n" +
+			"rename to moved/gen.pb.go\n" +
+			textSection("hand.go", "var A = 1")
+		var out strings.Builder
+		kept, dropped, err := FilterPatch(strings.NewReader(patch), &out, drop("moved/gen.pb.go"))
+		if err != nil {
+			t.Fatalf("FilterPatch: %v", err)
+		}
+		if kept != 1 || dropped != 1 || strings.Contains(out.String(), "rename") {
+			t.Errorf("kept=%d dropped=%d output:\n%s", kept, dropped, out.String())
+		}
+	})
+
+	t.Run("binary section drops via diff --git fallback", func(t *testing.T) {
+		t.Parallel()
+		patch := "diff --git a/data/object_info.json.gz b/data/object_info.json.gz\n" +
+			"index 1111111..2222222 100644\n" +
+			"Binary files a/data/object_info.json.gz and b/data/object_info.json.gz differ\n" +
+			textSection("hand.go", "var A = 1")
+		var out strings.Builder
+		kept, dropped, err := FilterPatch(strings.NewReader(patch), &out, drop("data/object_info.json.gz"))
+		if err != nil {
+			t.Fatalf("FilterPatch: %v", err)
+		}
+		if kept != 1 || dropped != 1 || strings.Contains(out.String(), "object_info") {
+			t.Errorf("kept=%d dropped=%d output:\n%s", kept, dropped, out.String())
+		}
+	})
+
+	t.Run("mode-only section decides at boundary", func(t *testing.T) {
+		t.Parallel()
+		patch := "diff --git a/tool.sh b/tool.sh\n" +
+			"old mode 100644\n" +
+			"new mode 100755\n" +
+			textSection("hand.go", "var A = 1")
+		var out strings.Builder
+		kept, dropped, err := FilterPatch(strings.NewReader(patch), &out, drop("tool.sh"))
+		if err != nil {
+			t.Fatalf("FilterPatch: %v", err)
+		}
+		if kept != 1 || dropped != 1 || strings.Contains(out.String(), "tool.sh") {
+			t.Errorf("kept=%d dropped=%d output:\n%s", kept, dropped, out.String())
+		}
+	})
+
+	t.Run("paths with spaces resolve via header equality", func(t *testing.T) {
+		t.Parallel()
+		// With core.quotePath=false git leaves a spacey path unquoted and
+		// appends a tab to the ---/+++ headers; parseDiffHeaderPath strips it.
+		patch := "diff --git a/my dir/gen file.go b/my dir/gen file.go\n" +
+			"index 1111111..2222222 100644\n" +
+			"--- a/my dir/gen file.go\t\n" +
+			"+++ b/my dir/gen file.go\t\n" +
+			"@@ -1,1 +1,2 @@\n line\n+more\n"
+		var out strings.Builder
+		_, dropped, err := FilterPatch(strings.NewReader(patch), &out, drop("my dir/gen file.go"))
+		if err != nil {
+			t.Fatalf("FilterPatch: %v", err)
+		}
+		if dropped != 1 || out.String() != "" {
+			t.Errorf("spacey generated path should drop, output:\n%s", out.String())
+		}
+	})
+
+	t.Run("unparseable quoted section is kept, not hidden", func(t *testing.T) {
+		t.Parallel()
+		patch := "diff --git \"a/we\\tird.go\" \"b/we\\tird.go\"\n" +
+			"index 1111111..2222222 100644\n" +
+			"--- \"a/we\\tird.go\"\n" +
+			"+++ \"b/we\\tird.go\"\n" +
+			"@@ -1,1 +1,2 @@\n line\n+more\n"
+		var out strings.Builder
+		kept, dropped, err := FilterPatch(strings.NewReader(patch), &out, func(string) bool { return true })
+		if err != nil {
+			t.Fatalf("FilterPatch: %v", err)
+		}
+		if kept != 1 || dropped != 0 || out.String() != patch {
+			t.Errorf("unparseable section must be kept verbatim, got kept=%d dropped=%d:\n%s", kept, dropped, out.String())
+		}
+	})
+
+	t.Run("added content resembling headers stays content", func(t *testing.T) {
+		t.Parallel()
+		// Inside a hunk, +/- lines are content: an added line reading
+		// "+++ b/gen.pb.go" must not rebind the section's path.
+		patch := "diff --git a/hand.md b/hand.md\n" +
+			"index 1111111..2222222 100644\n" +
+			"--- a/hand.md\n" +
+			"+++ b/hand.md\n" +
+			"@@ -1,1 +1,3 @@\n line\n++++ b/gen.pb.go\n+diff --git a/x b/x\n"
+		var out strings.Builder
+		kept, dropped, err := FilterPatch(strings.NewReader(patch), &out, drop("gen.pb.go"))
+		if err != nil {
+			t.Fatalf("FilterPatch: %v", err)
+		}
+		if kept != 1 || dropped != 0 || out.String() != patch {
+			t.Errorf("content lines must not affect sectioning, got kept=%d dropped=%d:\n%s", kept, dropped, out.String())
+		}
+	})
+}
+
+// TestParseDiffGitPaths pins the fallback parser's conservatism: unambiguous
+// lines resolve, the equal-halves rule handles spacey non-renames, and quoted
+// or ambiguous lines yield nil (the caller keeps those sections).
+func TestParseDiffGitPaths(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		line string
+		want []string
+	}{
+		{"simple", "diff --git a/x.go b/x.go", []string{"x.go"}},
+		{"spacey same path", "diff --git a/my dir/f.gz b/my dir/f.gz", []string{"my dir/f.gz"}},
+		{"rename single separator", "diff --git a/old.go b/new.go", []string{"old.go", "new.go"}},
+		{"pathological b-slash name", "diff --git a/g.gz b/g.gz b/g.gz b/g.gz", []string{"g.gz b/g.gz"}},
+		{"quoted gives up", `diff --git "a/we\tird" "b/we\tird"`, nil},
+		{"not a diff line", "not a header", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := parseDiffGitPaths(tt.line)
+			if len(got) != len(tt.want) {
+				t.Fatalf("parseDiffGitPaths(%q) = %q, want %q", tt.line, got, tt.want)
+			}
+			for i := range tt.want {
+				if got[i] != tt.want[i] {
+					t.Errorf("parseDiffGitPaths(%q)[%d] = %q, want %q", tt.line, i, got[i], tt.want[i])
+				}
+			}
+		})
 	}
 }
