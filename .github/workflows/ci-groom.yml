@@ -60,6 +60,11 @@ jobs:
       # need NOTHING beyond contents: read — they invoke the Claude CLI directly
       # and mint no GitHub token, so `id-token: write` is no longer required
       # (BE-4214). Grant the union below or the call is rejected.
+      # ORDERING: the pinned SHA below predates the agent jobs entirely, so
+      # dropping the grant is safe against it. When bumping that pin, move it to
+      # a SHA at or after the BE-4214 CLI migration — the intermediate main SHAs
+      # (#55 / #64) still declare `id-token: write` on the agent jobs and would
+      # be rejected by this shorter grant.
       contents: read
       issues: write
       pull-requests: read
