@@ -53,9 +53,12 @@ name: Groom (reusable)
 #     # issue/PR writes, but the reusable's `file` (issues: write) and `build_select`
 #     # (issues: read, pull-requests: read) jobs still declare this GITHUB_TOKEN
 #     # scope, and the declaration is what GitHub checks against the caller's grant.
+#     # id-token: write is for the finder/verifier/builder agent jobs —
+#     # anthropics/claude-code-action mints its GitHub token via OIDC.
 #     contents: read
 #     issues: write
 #     pull-requests: read
+#     id-token: write
 #   # REQUIRED — the dedup ledger reads GitHub issue state BEFORE filing, and
 #   # issue creation happens in a later step, so two overlapping runs could both
 #   # classify a signature as new and file duplicates (a TOCTOU race). Serialize.
@@ -315,6 +318,9 @@ jobs:
     timeout-minutes: 40
     permissions:
       contents: read
+      # anthropics/claude-code-action mints its GitHub token via OIDC; without
+      # id-token: write the agent step fails ("Could not fetch an OIDC token").
+      id-token: write
     outputs:
       have_candidates: ${{ steps.assert.outputs.have_candidates }}
     steps:
@@ -436,6 +442,9 @@ jobs:
     timeout-minutes: 40
     permissions:
       contents: read
+      # anthropics/claude-code-action mints its GitHub token via OIDC; without
+      # id-token: write the agent step fails ("Could not fetch an OIDC token").
+      id-token: write
     outputs:
       have_findings: ${{ steps.validate.outputs.have_findings }}
     steps:
@@ -880,6 +889,9 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+      # anthropics/claude-code-action mints its GitHub token via OIDC; without
+      # id-token: write the agent step fails ("Could not fetch an OIDC token").
+      id-token: write
     strategy:
       fail-fast: false
       matrix:

@@ -56,10 +56,13 @@ jobs:
       # regardless of `if:` guards or the bot App token doing the real writes). A
       # short grant fails the whole run with an opaque "workflow file issue" / 0
       # jobs. groom.yml's jobs need: file -> issues: write; build_select ->
-      # issues: read + pull-requests: read. Grant the union or the call is rejected.
+      # issues: read + pull-requests: read; the finder/verifier agent jobs ->
+      # id-token: write (claude-code-action mints its GitHub token via OIDC).
+      # Grant the union or the call is rejected.
       contents: read
       issues: write
       pull-requests: read
+      id-token: write
     uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@07154fb5d0d979017d79b822873cfbe86483bfb3 # main (groom.yml lands here — #49 / BE-3872)
     with:
       # File groom's issues as cloud-code-bot (App token), not github-actions[bot].
