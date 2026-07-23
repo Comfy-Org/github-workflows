@@ -1,0 +1,326 @@
+name: Refresh Reviewers (reusable)
+
+# Recomputes the caller repo's reviewer expertise map (`.github/reviewers.yml`,
+# the config assign-reviewers.yml consumes) from git history and opens a drift
+# PR when the committed map has fallen behind reality. This engine is a drift
+# DETECTOR, never a live mutator: nothing is assigned, nothing merges — the
+# whole deliverable is one reviewable single-file PR a human accepts or edits.
+#
+# HOW IT SCORES (validated in the BE-4114 spike against cloud history):
+# recency-decayed commit touches per rule bucket — per commit, per rule glob
+# matched by >=1 surviving changed file, score += 0.5^(age_days/half_life_days)
+# and touches += 1. Line counts are intentionally unused. Bot authors,
+# generated/churn paths, and non-collaborators are excluded (collaborators —
+# not org members — because `addAssignees` silently drops non-collaborators,
+# so that is the exact eligibility test the runtime applies). The generator
+# rewrites ONLY the `reviewers: [...]` / `default_pool: [...]` lists,
+# preserving every comment: the config's comments are its documentation.
+#
+# WHY AN APP TOKEN: the drift PR is created with the CLOUD_CODE_BOT app token
+# (vars.APP_ID + secrets.CLOUD_CODE_BOT_PRIVATE_KEY) — the branch push needs
+# `contents: write` and the PR open/edit needs `pull-requests: write`, both of
+# which the app carries; the workflow's own `permissions:` block stays
+# `contents: read` because every mutation goes through the app token (same
+# pattern as assign-reviewers.yml).
+#
+# IDEMPOTENT: re-runs force-reset the same `pr_branch` from the default branch
+# and edit the one open drift PR in place — duplicate PRs never stack. Guard
+# rails: `pr_branch` may never equal the default branch (hard error), a
+# concurrency group serializes runs per repo, a drift branch whose tip a
+# human has pushed to is never force-reset (the PR body says "edit freely"
+# and means it), and a no-drift run closes a stale still-bot-authored drift
+# PR so an obsolete proposal can't linger mergeable.
+#
+# The generator script is loaded from THIS repo (public, pinned via
+# `workflows_ref`) — never from the caller's checkout — so a caller-side
+# change can't rewrite the logic scoring it.
+#
+# Example caller (consumer repo), e.g. on a weekly schedule:
+#
+#   name: CI - Refresh Reviewers
+#   on:
+#     schedule:
+#       - cron: '0 6 * * 1'
+#     workflow_dispatch:
+#   jobs:
+#     refresh:
+#       permissions:
+#         contents: read
+#       uses: Comfy-Org/github-workflows/.github/workflows/refresh-reviewers.yml@<sha>  # v1
+#       with:
+#         workflows_ref: <same-sha>   # required — pin the generator to the same SHA as `uses:`
+#         map_exclude: some-operator-login
+#       secrets:
+#         CLOUD_CODE_BOT_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+#
+# Caller-side configuration:
+#   vars.APP_ID  - CLOUD_CODE_BOT app id (same as assign-reviewers.yml)
+#
+# NOTE: `map_exclude` (who may appear in the COMMITTED map) is distinct from
+# the runtime `vars.REVIEWER_EXCLUDE` (who assign-reviewers skips at PR time).
+# Seed map_exclude with operator logins whose commits are largely
+# agent-authored — their commit volume is not personal expertise.
+
+on:
+  workflow_call:
+    inputs:
+      reviewer_config_path:
+        description: >-
+          Path in the caller repo to the expertise/path-glob reviewer config
+          (same meaning as in assign-reviewers.yml).
+        type: string
+        required: false
+        default: .github/reviewers.yml
+      window_months:
+        description: How many months of git history to score.
+        type: number
+        required: false
+        default: 12
+      half_life_days:
+        description: Decay half-life in days for commit recency weighting.
+        type: number
+        required: false
+        default: 90
+      top_k:
+        description: Max experts per rule.
+        type: number
+        required: false
+        default: 4
+      floor:
+        description: >-
+          Min experts per rule; below-threshold candidates backfill up to this,
+          and a rule that still can't reach it is left unchanged.
+        type: number
+        required: false
+        default: 2
+      min_touches:
+        description: Raw commit-touches needed to qualify for a rule.
+        type: number
+        required: false
+        default: 5
+      min_score:
+        description: Decayed score needed to qualify for a rule.
+        type: number
+        required: false
+        default: 1.5
+      floor_min_touches:
+        description: Relaxed touch threshold used only for floor backfill.
+        type: number
+        required: false
+        default: 2
+      map_exclude:
+        description: >-
+          Whitespace-separated logins never to place in the map (distinct from
+          the runtime vars.REVIEWER_EXCLUDE — e.g. an operator login whose
+          commits are largely agent-authored).
+        type: string
+        required: false
+        default: ''
+      extra_exclude_paths:
+        description: >-
+          Newline-separated regexes appended to the built-in generated/churn
+          path exclusion list.
+        type: string
+        required: false
+        default: ''
+      pr_branch:
+        description: Head branch for the drift PR (reset + reused across runs).
+        type: string
+        required: false
+        default: bot/refresh-reviewers
+      workflows_ref:
+        description: >-
+          Ref of Comfy-Org/github-workflows to load the generator script from.
+          Pin this to the same SHA you pin `uses:` to. REQUIRED with no
+          default on purpose: defaulting to the mutable `main` would load the
+          generator from a moving ref even when the caller pinned `uses:` by
+          SHA, defeating the pin-everything-by-SHA rule.
+        type: string
+        required: true
+    secrets:
+      CLOUD_CODE_BOT_PRIVATE_KEY:
+        description: >-
+          Private key for the CLOUD_CODE_BOT GitHub App (app id = vars.APP_ID).
+          Required: the drift-PR branch push and PR open/edit are made by the
+          app (contents: write + pull-requests: write), so the workflow's own
+          token stays read-only.
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    name: Recompute reviewer map
+    runs-on: ubuntu-latest
+    # One refresh per caller repo at a time — overlapping runs would race the
+    # force-reset of the shared drift branch. Queued, never cancelled: the
+    # newest queued run recomputes from the newest history anyway.
+    concurrency:
+      group: refresh-reviewers-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+
+      - name: Checkout caller repo (full history)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          # Full history IS the input signal for the expertise scoring.
+          fetch-depth: 0
+          # The app token is persisted so the drift-PR push below can use
+          # plain `git push origin` (the default GITHUB_TOKEN stays unused).
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: true
+
+      - name: Load generator script
+        # The generator comes from THIS repo (public, pinned via
+        # workflows_ref), never from the caller's checkout, so a caller-side
+        # change can't rewrite the scoring logic.
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _refresh_reviewers
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Resolve default branch
+        id: default-branch
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          EVENT_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          BRANCH="$EVENT_DEFAULT_BRANCH"
+          if [ -z "$BRANCH" ]; then
+            BRANCH="$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)"
+          fi
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Recompute reviewer map
+        id: generate
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          DEFAULT_BRANCH: ${{ steps.default-branch.outputs.branch }}
+          REVIEWER_CONFIG_PATH: ${{ inputs.reviewer_config_path }}
+          WINDOW_MONTHS: ${{ inputs.window_months }}
+          HALF_LIFE_DAYS: ${{ inputs.half_life_days }}
+          TOP_K: ${{ inputs.top_k }}
+          FLOOR: ${{ inputs.floor }}
+          MIN_TOUCHES: ${{ inputs.min_touches }}
+          MIN_SCORE: ${{ inputs.min_score }}
+          FLOOR_MIN_TOUCHES: ${{ inputs.floor_min_touches }}
+          MAP_EXCLUDE: ${{ inputs.map_exclude }}
+          EXTRA_EXCLUDE_PATHS: ${{ inputs.extra_exclude_paths }}
+          RESULTS_DIR: ${{ runner.temp }}/refresh-reviewers
+        run: |
+          python3 "$GITHUB_WORKSPACE/_refresh_reviewers/.github/refresh-reviewers/generate.py"
+          if [ -f "$RESULTS_DIR/pr-body.md" ]; then
+            cat "$RESULTS_DIR/pr-body.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Open or update the drift PR
+        if: steps.generate.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          DEFAULT_BRANCH: ${{ steps.default-branch.outputs.branch }}
+          PR_BRANCH: ${{ inputs.pr_branch }}
+          CONFIG_PATH: ${{ inputs.reviewer_config_path }}
+          NEW_CONFIG: ${{ steps.generate.outputs.new_config_path }}
+          PR_BODY: ${{ steps.generate.outputs.pr_body_path }}
+        run: |
+          set -euo pipefail
+          # A misconfigured `pr_branch: main` would force-push the generated
+          # commit straight onto the default branch — refuse loudly.
+          if [ "$PR_BRANCH" = "$DEFAULT_BRANCH" ]; then
+            echo "::error::pr_branch ('$PR_BRANCH') must not be the default branch"
+            exit 1
+          fi
+
+          # Commit as the app's bot identity — the `[bot]@` email also keeps
+          # these refresh commits out of future expertise scoring.
+          BOT_EMAIL="${APP_SLUG}[bot]@users.noreply.github.com"
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "$BOT_EMAIL"
+
+          # The PR body advertises "edit freely" — never clobber a human's
+          # commits on the drift branch. If an OPEN drift PR's tip is not
+          # bot-authored, a human is driving it: leave it alone. (A closed or
+          # merged PR's leftover branch is nobody's — reset it freely.)
+          EXISTING="$(gh pr list --head "$PR_BRANCH" --base "$DEFAULT_BRANCH" \
+            --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$EXISTING" ] && git fetch origin "refs/heads/$PR_BRANCH" 2>/dev/null; then
+            TIP_AUTHOR="$(git log -1 --format=%ae FETCH_HEAD)"
+            if [ "$TIP_AUTHOR" != "$BOT_EMAIL" ]; then
+              echo "::warning::open drift PR #$EXISTING has a tip authored by $TIP_AUTHOR (not the bot) — leaving human edits in place, not force-pushing."
+              exit 0
+            fi
+          fi
+
+          # Reset the (stable) drift branch from the default branch, land the
+          # single-file change, and force-push — re-runs update in place, so
+          # duplicate PRs never stack.
+          git checkout -B "$PR_BRANCH" "refs/remotes/origin/$DEFAULT_BRANCH"
+          cp "$NEW_CONFIG" "$CONFIG_PATH"
+          git add -- "$CONFIG_PATH"
+          if git diff --cached --quiet; then
+            echo "Recomputed map matches origin/$DEFAULT_BRANCH — nothing to open."
+            exit 0
+          fi
+          git commit -m "chore: refresh reviewer expertise map from git history"
+          git push --force origin "HEAD:refs/heads/$PR_BRANCH"
+
+          if [ -n "$EXISTING" ]; then
+            gh pr edit "$EXISTING" --body-file "$PR_BODY"
+            echo "Updated existing drift PR #$EXISTING."
+          else
+            gh pr create --head "$PR_BRANCH" --base "$DEFAULT_BRANCH" \
+              --title "chore: refresh reviewer expertise map" \
+              --body-file "$PR_BODY"
+          fi
+
+      - name: Close stale drift PR (no drift)
+        # A later run that finds NO drift must still reconcile an
+        # already-open bot PR: new history or decay may have made a
+        # previously proposed map obsolete, and leaving that PR open and
+        # mergeable would silently reintroduce an outdated reviewer map.
+        # Only a still-bot-authored PR is closed — one a human has pushed to
+        # is theirs to drive. Gated on report_path so the generator's
+        # environmental no-op (API outage, missing config — which also emits
+        # changed=false but no report) can never close a PR the run failed
+        # to recompute.
+        if: >-
+          steps.generate.outputs.changed == 'false' &&
+          steps.generate.outputs.report_path != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          DEFAULT_BRANCH: ${{ steps.default-branch.outputs.branch }}
+          PR_BRANCH: ${{ inputs.pr_branch }}
+        run: |
+          set -euo pipefail
+          EXISTING="$(gh pr list --head "$PR_BRANCH" --base "$DEFAULT_BRANCH" \
+            --state open --json number --jq '.[0].number // empty')"
+          if [ -z "$EXISTING" ]; then
+            echo "No open drift PR — nothing to reconcile."
+            exit 0
+          fi
+          BOT_EMAIL="${APP_SLUG}[bot]@users.noreply.github.com"
+          if git fetch origin "refs/heads/$PR_BRANCH" 2>/dev/null && \
+             [ "$(git log -1 --format=%ae FETCH_HEAD)" = "$BOT_EMAIL" ]; then
+            gh pr close "$EXISTING" --comment "The latest refresh run found no drift — the committed map matches the recomputed one, so this proposal is obsolete. A future run will open a fresh PR if drift reappears."
+            echo "Closed stale drift PR #$EXISTING."
+          else
+            echo "Drift PR #$EXISTING has non-bot commits — leaving it to its human author."
+          fi

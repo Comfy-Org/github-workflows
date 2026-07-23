@@ -23,6 +23,9 @@ python3 -m unittest discover -s .github/agents-md-integrity/tests -p 'test_*.py'
 # groom dedup/rejection ledger tests
 python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
 
+# refresh-reviewers generator tests
+python3 -m unittest discover -s .github/refresh-reviewers/tests -p 'test_*.py' -v
+
 # bump-callers shell tests + lint (gh is stubbed; no network)
 shellcheck -x .github/bump-callers/bump-callers.sh .github/bump-callers/tests/test_bump_callers.sh
 bash .github/bump-callers/tests/test_bump_callers.sh
@@ -54,6 +57,10 @@ tests — run the matching command above for whatever you touched.
   — and (BE-4003) recognizes auto-builder PR state (open/merged/closed) so a
   built finding is never re-proposed. It uses GitHub issue+PR state as the store
   — no new secret. Tests in `tests/`.
+- `.github/refresh-reviewers/` — `generate.py`, the engine behind
+  `refresh-reviewers.yml`: recomputes a caller's reviewers.yml from git history
+  (decayed commit touches, assigner-parity globs, collaborator-only) and
+  surgically rewrites just the reviewer lists for a drift PR. Tests in `tests/`.
 - `.github/bump-callers/` — `bump-callers.sh`, the ONE fleet-agnostic script
   that opens SHA-bump PRs in consumer repos when a reusable workflow changes.
   Tests in `tests/`.
@@ -76,6 +83,9 @@ tests — run the matching command above for whatever you touched.
   auto-merged) via a credential-free patch job + a separate bot PR job.
 - `agents-md-integrity.yml` — enforces the AGENTS.md standard on the caller repo.
 - `assign-reviewers.yml` — expertise-aware, load-balanced reviewer requests.
+- `refresh-reviewers.yml` — scheduled drift-detector: recomputes the caller's
+  reviewers.yml from git history and opens one idempotent drift PR (never a
+  live mutator).
 - `assign-prs-to-author.yml` — assigns unassigned open PRs to their author.
 - `detect-unreviewed-merge.yml` — SOC 2: flags PRs merged without approval.
 - `bump-cursor-review-callers.yml` / `bump-agents-md-callers.yml` /
