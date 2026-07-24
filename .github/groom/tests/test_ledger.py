@@ -305,10 +305,28 @@ class PathTokenTest(unittest.TestCase):
         self.assertEqual(ledger.path_token("repo:services-ingest:services-ingest-main-go"),
                          "services-ingest-main-go")
 
-    def test_extra_colons_stay_in_the_path_segment(self):
-        # Only the first two colons are structural; anything after belongs to
-        # the path segment (maxsplit=2), so a colon in the slug can't shear it.
-        self.assertEqual(ledger.path_token("cloud:whole-repo:a:b"), "a:b")
+    def test_a_colon_in_the_scope_label_does_not_shear_the_token(self):
+        # `<scope-label>` is a free-form workflow input and may contain a colon;
+        # `<repo-basename>` and `<path-slug>` cannot (the slug collapses every
+        # non-alphanumeric run to a hyphen). So the token is what follows the
+        # LAST colon — counting from the left would yield `api:src-tools-ts`
+        # here and break cross-scope matching for the same path.
+        self.assertEqual(ledger.path_token("cloud:pkg:api:src-tools-ts"), "src-tools-ts")
+        self.assertEqual(
+            ledger.path_token("cloud:pkg:api:src-tools-ts"),
+            ledger.path_token("cloud:whole-repo:src-tools-ts"),
+        )
+
+    def test_leading_and_trailing_hyphens_are_trimmed(self):
+        # The verifier's slug rule read literally turns `services/ingest/` into
+        # `services-ingest-`, while its worked example shows `services-ingest`.
+        # Trimming reconciles the two so one directory has one token.
+        self.assertEqual(ledger.path_token("repo:scope:services-ingest-"), "services-ingest")
+        self.assertEqual(
+            ledger.path_token("repo:scope:services-ingest-"),
+            ledger.path_token("repo:scope:services-ingest"),
+        )
+        self.assertEqual(ledger.path_token("repo:scope:---"), "")
 
     def test_no_third_segment_has_no_token(self):
         # A malformed / pre-format signature has no path anchor and must never
@@ -410,6 +428,108 @@ class PathCollisionTest(unittest.TestCase):
         self.assertTrue(self.led.should_file("repo:whole-repo:src-server-ts"))
         self.assertFalse(self.led.path_collides("repo:whole-repo:src-server-ts"))
         self.assertFalse(self.led.path_collides("no-path-segment"))
+
+    def test_superseded_record_does_not_seed_the_path_index(self):
+        # `groom-superseded` is the documented "retire this issue so the finding
+        # can be re-filed under the current signature format" signal. If the
+        # retired issue stayed in the path index it would keep suppressing the
+        # replacement by path and defeat the label the human applied.
+        led = ledger.Ledger({"repo:whole-repo:src-tools-ts": ledger.SUPERSEDED})
+        to_file, suppressed, _ = led.partition([{"signature": "repo:src:src-tools-ts"}])
+        self.assertEqual(len(to_file), 1)
+        self.assertEqual(suppressed, [])
+
+    def test_superseded_exact_signature_is_still_suppressed(self):
+        # Only the PATH index drops superseded records; exact-signature dedup is
+        # untouched, so the retired issue is not re-filed under its own key.
+        led = ledger.Ledger({"repo:whole-repo:src-tools-ts": ledger.SUPERSEDED})
+        to_file, suppressed, _ = led.partition([{"signature": "repo:whole-repo:src-tools-ts"}])
+        self.assertEqual(to_file, [])
+        self.assertEqual(suppressed[0]["ledger_status"], ledger.SUPERSEDED)
+
+
+class SecurityExemptionTest(unittest.TestCase):
+    """A path anchors a LOCATION, not a finding, so the backstop must never bury
+    a security finding behind an already-filed routine finding on the same file.
+
+    The rest of the pipeline guarantees security findings always surface as
+    investigations (groom.yml applies `groom-security` and refuses to
+    auto-implement them); a heuristic that suppresses a candidate whose own
+    signature is NEW must not be able to break that.
+    """
+
+    def setUp(self):
+        # A routine finding already filed for `src/tools.ts`.
+        self.led = ledger.Ledger({"repo:whole-repo:src-tools-ts": ledger.FILED})
+
+    def test_security_candidate_is_not_suppressed_by_path_collision(self):
+        to_file, suppressed, _ = self.led.partition(
+            [{"signature": "repo:src:src-tools-ts", "security": True, "title": "authz bypass"}]
+        )
+        self.assertEqual([f["title"] for f in to_file], ["authz bypass"])
+        self.assertEqual(suppressed, [])
+
+    def test_string_true_counts_as_security(self):
+        # The verifier is an LLM writing JSON; it sometimes emits the STRING
+        # "true". groom.yml's labeling rule accepts it, so this must too — the
+        # exempt set and the `groom-security`-labeled set are the same set.
+        to_file, _, _ = self.led.partition(
+            [{"signature": "repo:src:src-tools-ts", "security": "TRUE"}]
+        )
+        self.assertEqual(len(to_file), 1)
+
+    def test_only_an_explicit_true_exempts(self):
+        # Anything that is not provably `true` — false, absent, null, a stray
+        # string — stays subject to the backstop. Were this the conservative
+        # `!= "false"` reading used by the BUILD gate, every candidate that
+        # simply omits the field would be exempt and the backstop would be dead.
+        absent = object()
+        for security in (False, None, "false", "no", 0, "", "yes", absent):
+            with self.subTest(security=security):
+                finding = {"signature": "repo:src:src-tools-ts"}
+                if security is not absent:
+                    finding["security"] = security
+                to_file, suppressed, _ = self.led.partition([finding])
+                self.assertEqual(to_file, [])
+                self.assertEqual(suppressed[0]["ledger_status"], ledger.PATH_COLLISION)
+
+    def test_exemption_does_not_bypass_exact_signature_dedup(self):
+        # The exemption is bounded: it only skips the path HEURISTIC. Once the
+        # security issue exists, its own signature is `filed` and the next run
+        # suppresses it — so the exemption costs at most one issue, never a
+        # per-run duplicate.
+        led = ledger.Ledger({"repo:whole-repo:sec-src-tools-ts": ledger.FILED})
+        to_file, suppressed, _ = led.partition(
+            [{"signature": "repo:whole-repo:sec-src-tools-ts", "security": True}]
+        )
+        self.assertEqual(to_file, [])
+        self.assertEqual(suppressed[0]["ledger_status"], ledger.FILED)
+
+    def test_security_candidate_is_exempt_from_the_intra_batch_path_check(self):
+        # Same guarantee within ONE run: a routine finding routed to `to_file`
+        # first must not swallow a security finding on the same file.
+        led = ledger.Ledger({})
+        to_file, suppressed, _ = led.partition([
+            {"signature": "repo:whole-repo:src-tools-ts", "title": "routine"},
+            {"signature": "repo:src:src-tools-ts", "security": True, "title": "authz bypass"},
+        ])
+        self.assertEqual([f["title"] for f in to_file], ["routine", "authz bypass"])
+        self.assertEqual(suppressed, [])
+
+    def test_should_file_mirrors_the_exemption(self):
+        sig = "repo:src:src-tools-ts"
+        self.assertFalse(self.led.should_file(sig))
+        self.assertTrue(self.led.should_file(sig, security=True))
+        # A path-anchored key that is already `filed` is not filable either way.
+        self.assertFalse(self.led.should_file("repo:whole-repo:src-tools-ts", security=True))
+
+    def test_is_security_finding_helper(self):
+        self.assertTrue(ledger.is_security_finding({"security": True}))
+        self.assertTrue(ledger.is_security_finding({"security": " True "}))
+        self.assertFalse(ledger.is_security_finding({"security": False}))
+        self.assertFalse(ledger.is_security_finding({}))
+        self.assertFalse(ledger.is_security_finding("not a dict"))
+        self.assertFalse(ledger.is_security_finding(None))
 
 
 class AcceptanceScenarioTest(unittest.TestCase):
@@ -663,6 +783,52 @@ class BuilderPrBodyTest(unittest.TestCase):
         self.assertIn("truncated", out)
         self.assertTrue(out.rstrip().endswith("-->"))  # marker preserved LAST
         self.assertEqual(ledger.extract_signature(out), "sig-big")
+
+
+class CheckCliTest(unittest.TestCase):
+    """The `--check` single-signature probe, including its security variant.
+
+    Exit 0 = "file it", 1 = suppressed; stdout is the reported status. The probe
+    must agree with `partition`, so a routine probe reports `path-collision`
+    where partition would suppress and `--check-security` reports `unknown`
+    where partition's exemption would file.
+    """
+
+    STATUSES = {"repo:whole-repo:src-tools-ts": "filed"}
+
+    def setUp(self):
+        self._real_load = ledger.load_ledger
+        ledger.load_ledger = lambda repo: ledger.Ledger(dict(self.STATUSES))
+        self.addCleanup(setattr, ledger, "load_ledger", self._real_load)
+
+    def _check(self, signature, *extra):
+        import contextlib
+        import io
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = ledger.main(["--repo", "owner/name", "--check", signature, *extra])
+        return code, out.getvalue().strip()
+
+    def test_known_signature_is_suppressed(self):
+        self.assertEqual(self._check("repo:whole-repo:src-tools-ts"), (1, "filed"))
+
+    def test_new_path_is_filable(self):
+        self.assertEqual(self._check("repo:whole-repo:src-server-ts"), (0, "unknown"))
+
+    def test_blank_signature_is_invalid(self):
+        self.assertEqual(self._check("   "), (1, "invalid"))
+
+    def test_path_collision_is_reported_distinctly(self):
+        self.assertEqual(self._check("repo:src:src-tools-ts"), (1, ledger.PATH_COLLISION))
+
+    def test_check_security_skips_the_path_backstop(self):
+        self.assertEqual(self._check("repo:src:src-tools-ts", "--check-security"), (0, "unknown"))
+
+    def test_check_security_still_honors_exact_signature_dedup(self):
+        self.assertEqual(
+            self._check("repo:whole-repo:src-tools-ts", "--check-security"), (1, "filed")
+        )
 
 
 if __name__ == "__main__":

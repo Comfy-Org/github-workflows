@@ -47,6 +47,13 @@ runs, because a reworded title produced a new title-derived slug).
 Classification is unchanged — the signature stays an opaque, exactly-matched
 string everywhere else.
 
+Because that backstop suppresses a candidate whose own signature is new, it is
+scoped tightly: it never applies to a `security: true` candidate (a path anchors
+a location, not a finding, so an already-filed routine finding on a file must
+not bury a later security finding on it), and a `superseded` record — the
+documented "retire this issue so the finding can be re-filed" signal — is kept
+out of the path index entirely.
+
 CLI (what the groom workflow calls right before it files):
 
     python3 .github/groom/ledger.py \
@@ -304,9 +311,9 @@ def normalize_signature(signature) -> str:
 
 
 # The verifier's signature format is `<repo-basename>:<scope-label>:<path-slug>`
-# (verifier.md). Only the trailing `<path-slug>` segment — everything after the
-# SECOND colon — is the finding's anchor; the first two segments are run
-# metadata. `maxsplit=2` keeps a colon inside the path segment intact.
+# (verifier.md). Only the trailing `<path-slug>` segment is the finding's
+# anchor; the leading segments are run metadata. A signature needs at least
+# this many segments to carry a path at all.
 _SIGNATURE_SEGMENTS = 3
 
 
@@ -318,14 +325,44 @@ def path_token(signature) -> str:
     re-wording the title on every run (BE-4460 — the same `src/tools.ts` finding
     was filed twice because its title-derived slug changed between runs).
 
-    Lowercased for comparison only. The verifier emits lowercase slugs already,
-    so this only guards against a stray capital; the full signature stays
-    case-sensitive and opaque everywhere else (`normalize_signature`).
+    Split from the LAST colon, not the second: `<repo-basename>` and
+    `<path-slug>` are both colon-free by construction (the slug collapses every
+    non-alphanumeric run to a hyphen), but `<scope-label>` is a free-form
+    workflow input that may itself contain a colon (`pkg:api`). Counting from
+    the left would then shear the scope's tail onto the token (`api:src-tools-ts`)
+    and break cross-scope matching; counting from the right cannot.
+
+    Lowercased and hyphen-trimmed for comparison only. The verifier emits
+    lowercase slugs already, so the case fold only guards against a stray
+    capital; the hyphen trim reconciles the two spellings its own slug rule can
+    produce for one directory (`services/ingest/` -> `services-ingest-` under a
+    literal reading, `services-ingest` in the worked example). The full
+    signature stays case-sensitive and opaque everywhere else
+    (`normalize_signature`).
     """
-    parts = normalize_signature(signature).split(":", _SIGNATURE_SEGMENTS - 1)
-    if len(parts) < _SIGNATURE_SEGMENTS:
+    normalized = normalize_signature(signature)
+    if normalized.count(":") < _SIGNATURE_SEGMENTS - 1:
         return ""
-    return parts[-1].strip().lower()
+    return normalized.rsplit(":", 1)[-1].strip().lower().strip("-")
+
+
+def is_security_finding(finding) -> bool:
+    """True only if the candidate is EXPLICITLY marked `security: true`.
+
+    Same truthiness rule the filing step uses to apply the `groom-security`
+    label (`str(...).strip().lower() == "true"` in groom.yml), so "the finding
+    exempt from the path backstop" and "the finding labeled security" are the
+    same set — never one without the other.
+
+    Deliberately NOT the conservative `!= "false"` reading used by the *build*
+    gate. There, treating an unmarked finding as security is the safe direction
+    (it stays an issue instead of being auto-implemented). Here the exemption
+    only ever *adds* filings, so `!= "false"` would exempt every candidate that
+    simply omits the field and disable the backstop entirely.
+    """
+    if not isinstance(finding, dict):
+        return False
+    return str(finding.get("security")).strip().lower() == "true"
 
 
 def extract_signature(body):
@@ -436,9 +473,25 @@ class Ledger:
 
     def __init__(self, statuses: dict):
         self._statuses = dict(statuses)
-        # Path-slug index over the SAME records, for the backstop below. Built
+        # Path-slug index over the same records, for the backstop below. Built
         # once here rather than scanned per candidate.
-        self._known_paths = {t for t in map(path_token, self._statuses) if t}
+        #
+        # SUPERSEDED records are excluded on purpose. `groom-superseded` is the
+        # documented escape hatch for retiring a stale issue so its finding can
+        # be re-filed under the current signature format; leaving it in the path
+        # index would let the retired issue keep suppressing the replacement by
+        # path and defeat the very label the human applied. Every other status
+        # (including the durable human "no" of REJECTED / PR_CLOSED) still seeds
+        # the index.
+        self._known_paths = {
+            token
+            for token in (
+                path_token(signature)
+                for signature, status in self._statuses.items()
+                if status != SUPERSEDED
+            )
+            if token
+        }
 
     def __len__(self) -> int:
         return len(self._statuses)
@@ -463,25 +516,36 @@ class Ledger:
         Deterministic and exact — string equality on the path segment, no fuzzy
         or substring matching, so it can only suppress a candidate that names
         the identical path. A signature with no third segment (a malformed or
-        pre-format signature) has no path token and never collides.
+        pre-format signature) has no path token and never collides, and a
+        SUPERSEDED record is not in the index at all (see `__init__`).
+
+        This is a heuristic — it deliberately suppresses a candidate whose exact
+        signature is new — so `partition` never applies it to a `security: true`
+        candidate. Callers working from a whole finding should go through
+        `partition` or pass `security=` to `should_file`.
         """
         token = path_token(signature)
         return bool(token) and token in self._known_paths
 
-    def should_file(self, signature) -> bool:
+    def should_file(self, signature, *, security: bool = False) -> bool:
         """A finding is filed only if its signature is genuinely new.
 
         A missing/blank/non-string signature is NOT filable: it has no
         recoverable marker, so filing it would re-file on every subsequent run.
         A signature whose path-slug is already covered by a known signature is
-        not filable either (`path_collides`). Both mirror `partition`, which
-        routes such candidates to `invalid` / `path-collision` rather than
-        `to_file`.
+        not filable either (`path_collides`) — unless the candidate is a
+        security finding, which the path backstop never suppresses. All three
+        mirror `partition`, which routes such candidates to `invalid` /
+        `path-collision` rather than `to_file`.
+
+        `security` defaults to False because a bare signature carries no
+        security flag; pass the finding's own flag (`is_security_finding`) to
+        match `partition` exactly.
         """
         return (
             normalize_signature(signature) != ""
             and self.status(signature) == UNKNOWN
-            and not self.path_collides(signature)
+            and (security or not self.path_collides(signature))
         )
 
     def partition(self, findings):
@@ -511,6 +575,16 @@ class Ledger:
         `path-collision`. That is what keeps a re-keyed signature from opening a
         SECOND issue for a file that already has one, both across the format
         change and across scope labels.
+
+        The backstop NEVER suppresses a `security: true` candidate. It is a
+        heuristic on a *different* signature, and a path anchors a location, not
+        a finding: one routine already-filed finding on `src/tools.ts` must not
+        be able to bury a later security finding on the same file, which would
+        break the "security findings are always surfaced as investigations"
+        guarantee the rest of the pipeline enforces. Exact-signature dedup still
+        applies to security candidates, so the exemption costs at most one issue
+        per security finding — the next run sees that issue and suppresses it as
+        `filed`.
         """
         to_file, suppressed, invalid = [], [], []
         filed_this_batch = set()
@@ -525,11 +599,12 @@ class Ledger:
                 continue
             status = self.status(signature)
             token = path_token(signature)
+            security = is_security_finding(finding)
             if status != UNKNOWN:
                 suppressed.append({**finding, "ledger_status": status})
             elif signature in filed_this_batch:
                 suppressed.append({**finding, "ledger_status": PENDING})
-            elif token and (self.path_collides(signature) or token in paths_this_batch):
+            elif token and not security and (self.path_collides(signature) or token in paths_this_batch):
                 suppressed.append({**finding, "ledger_status": PATH_COLLISION})
             else:
                 filed_this_batch.add(signature)
@@ -630,6 +705,15 @@ def main(argv=None):
         metavar="SIGNATURE",
         help="Print the ledger status of one signature and exit 0 if it should be filed, 1 if suppressed.",
     )
+    parser.add_argument(
+        "--check-security",
+        action="store_true",
+        help=(
+            "Probe --check as a `security: true` finding, which the path-collision "
+            "backstop never suppresses. Without it the probe answers for a routine "
+            "finding and may report `path-collision` where `partition` would file."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if args.check is None and not args.candidates:
@@ -647,12 +731,12 @@ def main(argv=None):
         status = ledger.status(args.check)
         # Report the path backstop distinctly, exactly as `partition` does, so
         # the probe never says `unknown`/exit 0 for a signature partition would
-        # suppress.
-        if status == UNKNOWN and ledger.path_collides(args.check):
+        # suppress. `--check-security` mirrors partition's exemption.
+        if status == UNKNOWN and not args.check_security and ledger.path_collides(args.check):
             print(PATH_COLLISION)
             return 1
         print(status)
-        return 0 if ledger.should_file(args.check) else 1
+        return 0 if ledger.should_file(args.check, security=args.check_security) else 1
 
     with open(args.candidates, encoding="utf-8") as f:
         findings = json.load(f)

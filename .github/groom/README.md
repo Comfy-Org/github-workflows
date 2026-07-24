@@ -49,9 +49,14 @@ rather than buried in a runner script.
 - **`signature`** is a stable dedup key, `<repo-basename>:<scope>:<path-slug>`,
   where `<path-slug>` is the finding's **primary file or directory path** —
   lowercased, every run of non-alphanumeric characters collapsed to a single
-  hyphen (`src/tools.ts` → `src-tools-ts`). Multi-file finding: the most
-  representative path (the one the body's first evidence cites). Only a repo-wide
-  pattern with no single anchor falls back to a normalized subject noun-phrase.
+  hyphen, leading/trailing hyphens trimmed (`src/tools.ts` → `src-tools-ts`,
+  `services/ingest/` → `services-ingest`). Multi-file finding: the
+  **alphabetically first** of the cited paths — a mechanical rule, because "the
+  most representative one" is a judgment the verifier would re-make differently
+  next run. Only a repo-wide pattern with no single anchor falls back to a
+  normalized subject noun-phrase. A `security: true` finding's slug is prefixed
+  `sec-`, so a routine finding already filed for a file can never dedup away a
+  security finding about that same file.
   It is anchored to the **path, not the title**, because titles are re-generated
   on every run: a re-worded title yields a new title-slug, the ledger's
   exact-string match sees a "new" finding, and the same finding is filed twice
@@ -127,7 +132,7 @@ Keyed on `(repo, finding_signature) → {filed | rejected | superseded}`:
 | Open **builder PR** for the signature (BE-4003) | `pr-open` | no |
 | **Builder PR merged** | `merged` | no (shipped) |
 | **Builder PR closed unmerged** | `pr-closed` | **no — durable** (human declined) |
-| A known signature shares the candidate's `<path-slug>` (BE-4460) | `path-collision` | no |
+| A known, non-`superseded` signature shares the candidate's `<path-slug>`, and the candidate is not `security: true` (BE-4460) | `path-collision` | no |
 | No `groom` issue or PR carries the signature | `unknown` | **yes** |
 
 Only an `unknown` signature is filed/proposed. Human rejection — close-as-not-planned,
@@ -153,19 +158,47 @@ Skip either and the next run cannot recognize the issue and will re-file it.
 
 Classification treats the signature as an opaque string, with one exception: a
 candidate whose exact signature is `unknown` but whose `<path-slug>` segment
-(everything after the second `:`) is already covered — by a known signature, or
-by a candidate already routed to `to_file` in the same batch — is suppressed as
-**`path-collision`** rather than filed. That keeps one issue per anchoring path
-when the leading segments differ (a re-scoped run, a legacy signature whose slug
-coincides). Matching is **exact string equality** on the path segment — no
-substring or fuzzy matching, which would silently drop real findings about
-different files that share a basename (`src/index.ts` vs `lib/index.ts`).
+(everything after the **last** `:` — `<repo-basename>` and `<path-slug>` are
+colon-free by construction, so counting from the right is what keeps a scope
+label that itself contains a colon, `pkg:api`, from shearing the token) is
+already covered — by a known signature, or by a candidate already routed to
+`to_file` in the same batch — is suppressed as **`path-collision`** rather than
+filed. That keeps one issue per anchoring path when the leading segments differ
+(a re-scoped run, a legacy signature whose slug coincides). Matching is **exact
+string equality** on the path segment — no substring or fuzzy matching, which
+would silently drop real findings about different files that share a basename
+(`src/index.ts` vs `lib/index.ts`).
+
+Because the backstop suppresses a candidate whose *own* signature is new, it is
+deliberately narrow — two carve-outs:
+
+- **`security: true` candidates are never suppressed by it.** A path anchors a
+  location, not a finding, so without this an already-filed routine finding on
+  `src/tools.ts` would bury a later security finding on the same file and break
+  the "security findings always surface as investigations" guarantee. (The
+  verifier's `sec-` slug prefix separates the two lanes up front; this is the
+  code-side guarantee for legacy and cross-scope signatures that predate it.)
+  Exact-signature dedup still applies, so the exemption costs at most one issue
+  per security finding — the next run sees it as `filed`.
+- **`superseded` records are left out of the path index.** `groom-superseded` is
+  the documented "retire this issue so its finding can be re-filed under the
+  current format" signal; keeping it in the index would let the retired issue go
+  on suppressing the replacement by path and defeat the label a human applied.
+
+Known, accepted limit: slugification is lossy, so two genuinely distinct paths
+can map to one slug (`src/foo/bar.ts` and `src/foo-bar.ts` both →
+`src-foo-bar-ts`) and the second finding is suppressed. The blast radius is one
+finding on a path shape that is rare in practice, and it is the same collapse the
+format already accepts for two distinct findings about one file — the deliberate
+trade for a key that is stable across re-wordings.
 
 Consequence for the format transition: a legacy *title*-derived slug that merely
 *embeds* the path (`split-tools-ts-into-focused-modules`) is **not** matched, so
 such a finding can be filed once more under its new path-anchored signature —
 then it is stable forever. Label the superseded legacy issue `groom-superseded`
-(or close it as not planned) to retire it.
+(or close it as not planned) to retire it. A security finding already filed under
+an unprefixed slug re-files once for the same reason when it picks up its `sec-`
+prefix — same one-per-finding, one-time transition cost, same fix.
 
 The dedup decision is a point-in-time snapshot of GitHub issue state read
 *before* filing, and issue creation happens in a later step. Two overlapping
@@ -191,7 +224,13 @@ Single-signature probe (exit 0 = should file, 1 = suppressed):
 
 ```bash
 python3 .github/groom/ledger.py --repo owner/name --check "<signature>"
+# ...as a security finding, which the path backstop never suppresses:
+python3 .github/groom/ledger.py --repo owner/name --check "<signature>" --check-security
 ```
+
+A bare signature carries no `security` flag, so the probe answers for a routine
+finding by default; pass `--check-security` to mirror `partition`'s decision for
+a `security: true` candidate.
 
 - **`tests/`** — `unittest` suite, run by
   [`test-groom-scripts.yml`](../workflows/test-groom-scripts.yml).
