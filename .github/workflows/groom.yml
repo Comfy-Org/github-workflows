@@ -72,7 +72,9 @@ name: Groom (reusable)
 #       with:
 #         # Post/act issues as cloud-code-bot instead of github-actions[bot].
 #         bot_app_id: ${{ vars.APP_ID }}
-#         workflows_ref: <sha>          # pin assets to the same ref as `uses:`
+#         # No workflows_ref: the briefs + ledger auto-load from the same commit
+#         # this `uses:` pin resolves to (github.job_workflow_sha). Set it only to
+#         # test briefs from a branch.
 #         dry_run: ${{ github.event.inputs.dry_run == 'true' }}
 #         # OPT-IN auto-builder ("split C", BE-4003): turn the top few CONFIRMED
 #         # findings into REVIEW-GATED PRs (never auto-merged) instead of issues.
@@ -169,10 +171,15 @@ on:
       workflows_ref:
         description: >-
           Ref of Comfy-Org/github-workflows to load the groom briefs + ledger
-          from. Pin this to the same ref you pin `uses:` to for reproducibility.
+          from. LEAVE UNSET (the default): the assets are then checked out from
+          `github.job_workflow_sha` — the exact commit this reusable workflow was
+          resolved from via the caller's `uses:` pin — so the briefs + ledger
+          always match the logic running them, with nothing for the caller to
+          keep in sync. Set this ONLY to override that (e.g. test briefs from a
+          branch while pinning `uses:` elsewhere).
         type: string
         required: false
-        default: main
+        default: ''
       bot_app_id:
         description: >-
           GitHub App ID. When set (with the BOT_APP_PRIVATE_KEY secret), issues
@@ -330,13 +337,16 @@ jobs:
           path: repo
 
       - name: Load groom assets (briefs)
-        # Trusted briefs come from THIS workflow's repo (public, pinned via
-        # workflows_ref) — never from the target checkout, so a malicious repo
-        # can't rewrite the prompt to change what groom does.
+        # Trusted briefs come from THIS workflow's repo (public, pinned to the
+        # workflow's own resolved commit) — never from the target checkout, so a
+        # malicious repo can't rewrite the prompt to change what groom does.
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: Comfy-Org/github-workflows
-          ref: ${{ inputs.workflows_ref }}
+          # Default to the exact commit THIS reusable workflow was resolved from
+          # (github.job_workflow_sha), so the briefs + ledger can't desync from
+          # the logic loading them; workflows_ref is an explicit override only.
+          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}
           path: _groom_assets
           persist-credentials: false
 
@@ -659,7 +669,10 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: Comfy-Org/github-workflows
-          ref: ${{ inputs.workflows_ref }}
+          # Default to the exact commit THIS reusable workflow was resolved from
+          # (github.job_workflow_sha), so the briefs + ledger can't desync from
+          # the logic loading them; workflows_ref is an explicit override only.
+          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}
           path: _groom_assets
           persist-credentials: false
 
@@ -954,7 +967,10 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: Comfy-Org/github-workflows
-          ref: ${{ inputs.workflows_ref }}
+          # Default to the exact commit THIS reusable workflow was resolved from
+          # (github.job_workflow_sha), so the briefs + ledger can't desync from
+          # the logic loading them; workflows_ref is an explicit override only.
+          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}
           path: _groom_assets
           persist-credentials: false
 
@@ -1081,7 +1097,10 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: Comfy-Org/github-workflows
-          ref: ${{ inputs.workflows_ref }}
+          # Default to the exact commit THIS reusable workflow was resolved from
+          # (github.job_workflow_sha), so the briefs + ledger can't desync from
+          # the logic loading them; workflows_ref is an explicit override only.
+          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}
           path: _groom_assets
           persist-credentials: false
 
@@ -1263,7 +1282,10 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: Comfy-Org/github-workflows
-          ref: ${{ inputs.workflows_ref }}
+          # Default to the exact commit THIS reusable workflow was resolved from
+          # (github.job_workflow_sha), so the briefs + ledger can't desync from
+          # the logic loading them; workflows_ref is an explicit override only.
+          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}
           path: _groom_assets
           persist-credentials: false
 
@@ -1627,7 +1649,10 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: Comfy-Org/github-workflows
-          ref: ${{ inputs.workflows_ref }}
+          # Default to the exact commit THIS reusable workflow was resolved from
+          # (github.job_workflow_sha), so the briefs + ledger can't desync from
+          # the logic loading them; workflows_ref is an explicit override only.
+          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}
           path: _groom_assets
           persist-credentials: false
 
