@@ -203,11 +203,14 @@ Env knobs (config only — **never** the key):
 | Env var | Default | Meaning |
 |---|---|---|
 | `GROOM_BROKER_PORT` | `8199` | port to listen on (`127.0.0.1:<port>`) |
-| `GROOM_BROKER_UPSTREAM` | `https://api.anthropic.com` | where `/v1/*` is forwarded (overridable so tests can point it at a local fake) |
+| `GROOM_BROKER_UPSTREAM` | `https://api.anthropic.com` | where `/v1/*` is forwarded (overridable so tests can point it at a local fake; `http://` is accepted **only** for loopback hosts, so a plaintext non-loopback upstream can't leak the injected key) |
 
 On listen it prints one readiness line (`groom-key-broker listening on
-127.0.0.1:<port>`); a consumer's wait-loop should key off the port being
-connectable, not the line.
+127.0.0.1:<port>`); a consumer's wait-loop should key off **that line** (proof
+the broker itself bound the port), not merely the port being connectable — a
+foreign process already holding the port would pass a bare connect check while
+the broker exits with `EADDRINUSE`, and the consumer would then stream prompts
+and repo data (plus the dummy key) to an unrelated listener.
 
 > **groom.yml wiring lands in the sibling ticket (BE-4311)** — this file adds the
 > broker script + its unit tests only; nothing in `groom.yml` calls it yet.

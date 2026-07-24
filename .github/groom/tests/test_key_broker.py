@@ -261,6 +261,51 @@ class KeyBrokerTest(unittest.TestCase):
 
         self.assertIsNone(proc.poll(), "broker should stay alive after an upstream error")
 
+    # --- a client abort mid-request must not crash the broker -------------
+
+    def test_client_abort_does_not_kill_broker(self):
+        # Send a Content-Length that promises more body than we deliver, then
+        # slam the socket shut — the classic "unhandled 'error' on req.pipe"
+        # crash. The broker must survive and still serve the next request.
+        raw = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        raw.sendall(
+            b"POST /v1/messages HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: 4096\r\n\r\n"
+            b"{}"  # far short of the promised 4096 bytes
+        )
+        raw.close()  # abort mid-body
+        time.sleep(0.2)
+
+        self.assertIsNone(self.broker.poll(), "broker must survive a client abort")
+        conn = self._conn()  # a fresh request proves it's still serving
+        conn.request("HEAD", "/")
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        self.assertEqual(resp.status, 200)
+
+    # --- a non-root upstream keeps its path prefix ------------------------
+
+    def test_upstream_path_prefix_is_preserved(self):
+        prefixed = "http://127.0.0.1:%d/prefix" % self.upstream.server_address[1]
+        port = _free_port()
+        proc = _start_broker(prefixed, port)
+        self.addCleanup(_stop_broker, proc)
+        if not _wait_port(port):
+            raise self.failureException("broker did not become connectable")
+
+        conn = self._conn(port)
+        conn.request("POST", "/v1/messages", body=b"{}",
+                     headers={"content-type": "application/json"})
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(self.records[-1]["path"], "/prefix/v1/messages")
+
 
 class BrokerStartupTest(unittest.TestCase):
     """Startup guards that don't need a running upstream."""
@@ -276,6 +321,29 @@ class BrokerStartupTest(unittest.TestCase):
             env={**os.environ, "GROOM_BROKER_PORT": str(_free_port())},
         )
         self.assertNotEqual(proc.wait(timeout=10), 0)
+
+    def _startup_exit_code(self, env_overrides):
+        env = {**os.environ, "GROOM_BROKER_PORT": str(_free_port())}
+        env.update(env_overrides)
+        proc = subprocess.Popen(
+            [NODE, SCRIPT],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+        )
+        return proc.wait(timeout=10)
+
+    @unittest.skipUnless(NODE, "node is required to run the key-broker")
+    def test_rejects_port_with_trailing_garbage(self):
+        # "8199x" must be rejected, not silently coerced to 8199.
+        self.assertNotEqual(self._startup_exit_code({"GROOM_BROKER_PORT": "8199x"}), 0)
+
+    @unittest.skipUnless(NODE, "node is required to run the key-broker")
+    def test_rejects_plaintext_non_loopback_upstream(self):
+        # http:// to a non-loopback host would leak the key in cleartext.
+        code = self._startup_exit_code({"GROOM_BROKER_UPSTREAM": "http://example.com"})
+        self.assertNotEqual(code, 0)
 
 
 if __name__ == "__main__":
