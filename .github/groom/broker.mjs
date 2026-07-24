@@ -63,6 +63,13 @@ const server = http.createServer((req, res) => {
       console.log(`${req.method} ${req.url} ${upRes.statusCode}`);
       res.writeHead(upRes.statusCode, upRes.headers);
       upRes.pipe(res); // stream through — no buffering, so SSE passes intact
+      // A mid-stream upstream failure (after headers) can't become a 502 anymore;
+      // handle its 'error' so it tears down the client response instead of
+      // bubbling to an uncaughtException that takes the whole broker down.
+      upRes.on('error', () => {
+        console.log(`${req.method} ${req.url} upstream-stream-error`);
+        res.destroy();
+      });
     },
   );
 
@@ -71,6 +78,16 @@ const server = http.createServer((req, res) => {
     if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
     res.end('upstream error\n');
   });
+
+  // Don't let a hung upstream pin a request open forever; tear it down on idle.
+  upstream.setTimeout(120_000, () => upstream.destroy(new Error('upstream timeout')));
+
+  // If the client goes away (aborted/dropped), stop talking to upstream so we
+  // don't leave a half-open request spending against the key.
+  res.on('close', () => {
+    if (!res.writableFinished) upstream.destroy();
+  });
+  req.on('error', () => upstream.destroy());
 
   req.pipe(upstream); // forward the request body streaming too
 });

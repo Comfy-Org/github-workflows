@@ -104,6 +104,10 @@ main() {
 	[[ -n "$clone" ]] || die "--clone is required"
 	[[ -n "$out_dir" ]] || die "--out-dir is required"
 	[[ ${#cmd[@]} -gt 0 ]] || die "a -- <command...> is required"
+	# bwrap binds each of these at its REAL path; a relative value would resolve
+	# against an unexpected CWD instead of failing loud, so require absolute paths.
+	[[ "$clone" = /* ]] || die "--clone must be an absolute path (got '$clone')"
+	[[ "$out_dir" = /* ]] || die "--out-dir must be an absolute path (got '$out_dir')"
 	case "$clone_mode" in
 		ro | rw-git-ro) ;;
 		*) die "--clone-mode must be 'ro' or 'rw-git-ro' (got '${clone_mode:-}')" ;;
@@ -152,6 +156,13 @@ main() {
 			# tracked files (the patch we capture) yet can never rewrite history
 			# or git config. Ordering matters — the rw clone bind first, then the
 			# ro .git overlay on top.
+			#
+			# This assumes .git is a real directory. In a git-worktree checkout it
+			# is instead a file holding a `gitdir:` pointer to metadata elsewhere on
+			# the host — which would NOT be mounted into the jail, silently breaking
+			# git rather than protecting it. Fail loud instead (callers pass plain
+			# clones; worktree checkouts are unsupported here).
+			[[ -d "$clone/.git" ]] || die "--clone-mode rw-git-ro needs a plain .git directory (got a gitdir pointer file — git worktree checkouts are unsupported): $clone/.git"
 			bwrap_args+=(--bind "$clone" "$clone" --ro-bind "$clone/.git" "$clone/.git")
 			;;
 	esac
@@ -159,6 +170,7 @@ main() {
 	local f
 	if [[ ${#ro_files[@]} -gt 0 ]]; then
 		for f in "${ro_files[@]}"; do
+			[[ "$f" = /* ]] || die "--ro-file must be an absolute path (got '$f')"
 			bwrap_args+=(--ro-bind "$f" "$f")
 		done
 	fi
