@@ -334,15 +334,16 @@ jobs:
         # green silently: "download failed" (dl errored under continue-on-error,
         # e.g. the size tool crashed before uploading the report), "creds absent"
         # (bot step skipped), "mint failed" (bot step errored) and "post failed"
-        # (upsert ran but 403'd at runtime — e.g. the app lacks Pull requests on
-        # this installation). Whenever the report artifact exists it still lives
+        # (upsert ran but failed at runtime — any of network/5xx, rate limit, a
+        # malformed body, or a residual permission 403; the upsert step log has
+        # the real error). Whenever the report artifact exists it still lives
         # in the pr-size job's step summary.
         if: steps.dl.outcome != 'success' || steps.bot.outcome != 'success' || steps.upsert.outcome == 'failure'
         run: |
           if [ "${{ steps.dl.outcome }}" != "success" ]; then
             echo "No bot comment posted: the size report artifact could not be downloaded (the pr-size job likely failed before uploading it). Check the pr-size job logs."
           elif [ "${{ steps.upsert.outcome }}" = "failure" ]; then
-            echo "No bot comment posted: the sticky comment could not be posted — the bot app likely lacks the Pull requests permission on this installation (the issue-comments API on a PR checks it). The full report is in the pr-size job's step summary."
+            echo "No bot comment posted: the sticky comment upsert failed at runtime — see the 'Upsert sticky size comment' step log above for the actual error (e.g. a network/5xx failure, GitHub rate limit, or — now that the mint requests pull-requests:write — a residual permission 403 on an installation that has not granted it). The full report is in the pr-size job's step summary."
           else
             echo "No bot comment posted (credentials absent, or the app token could not be minted for this repo). The full report is in the pr-size job's step summary."
           fi
