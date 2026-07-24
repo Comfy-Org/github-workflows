@@ -67,13 +67,18 @@ jobs:
       # regardless of `if:` guards or the bot App token doing the real writes). A
       # short grant fails the whole run with an opaque "workflow file issue" / 0
       # jobs. groom.yml's jobs need: file -> issues: write; build_select ->
-      # issues: read + pull-requests: read; the finder/verifier agent jobs ->
-      # id-token: write (claude-code-action mints its GitHub token via OIDC).
-      # Grant the union or the call is rejected.
+      # issues: read + pull-requests: read. The finder/verifier/builder agent jobs
+      # need NOTHING beyond contents: read — they invoke the Claude CLI directly
+      # and mint no GitHub token, so `id-token: write` is no longer required
+      # (BE-4214). Grant the union below or the call is rejected.
+      # ORDERING: the pinned SHA below predates the agent jobs entirely, so
+      # dropping the grant is safe against it. When bumping that pin, move it to
+      # a SHA at or after the BE-4214 CLI migration — the intermediate main SHAs
+      # (#55 / #64) still declare `id-token: write` on the agent jobs and would
+      # be rejected by this shorter grant.
       contents: read
       issues: write
       pull-requests: read
-      id-token: write
       # REQUIRED for the interval gate (BE-4004): the reusable reads this repo's
       # Actions run history to find the last real groom run. A reusable workflow's
       # token is capped by the caller's grant, so without this the gate fails open
