@@ -37,11 +37,13 @@ ws_canary="${GITHUB_WORKSPACE%/}/agent-sandbox-canary-ws.$$"
 fake_pid=""
 broker_pid=""
 host_sleep_pid=""
+host_http_pid=""
 
 cleanup() {
 	if [[ -n "$fake_pid" ]]; then kill "$fake_pid" 2>/dev/null || true; fi
 	if [[ -n "$broker_pid" ]]; then kill "$broker_pid" 2>/dev/null || true; fi
 	if [[ -n "$host_sleep_pid" ]]; then kill "$host_sleep_pid" 2>/dev/null || true; fi
+	if [[ -n "$host_http_pid" ]]; then kill "$host_http_pid" 2>/dev/null || true; fi
 	rm -f "$home_canary" "$temp_canary" "$ws_canary" /tmp/canary
 	rm -rf "$work"
 }
@@ -157,10 +159,15 @@ kill "$host_sleep_pid" 2>/dev/null || true
 host_sleep_pid=""
 pass "pid isolation (host pids invisible in jail /proc)"
 
-# --- 5. broker credential proxy ----------------------------------------------
+# --- 5. broker credential proxy (over the bind-mounted unix socket) ----------
 # Fake local HTTPS upstream stands in for api.anthropic.com; the broker runs with
-# the real (fake) key and a test-only TLS bypass for the self-signed upstream.
+# the real (fake) key and a test-only TLS bypass for the self-signed upstream, and
+# now listens on a UNIX SOCKET (no TCP port) bind-mounted into the isolated-netns
+# jail via --uds. Inside the jail the in-jail forwarder (jail-shim.mjs) on
+# 127.0.0.1:8790 bridges curl to that socket — exactly the composition the
+# production groom caller will use — and ALL the existing assertions run against it.
 
+SHIM="$ROOT/.github/groom/jail-shim.mjs"
 certdir="$work/certs"
 mkdir -p "$certdir"
 openssl req -x509 -newkey rsa:2048 -nodes \
@@ -169,7 +176,7 @@ openssl req -x509 -newkey rsa:2048 -nodes \
 
 real_key="sk-ant-TESTFAKE-broker-forwarding-proof"
 up_port=8791
-broker_port=8790
+shim_port=8790
 
 node "$FAKE_UPSTREAM" "$up_port" "$certdir/key.pem" "$certdir/cert.pem" &
 fake_pid=$!
@@ -177,19 +184,28 @@ ANTHROPIC_API_KEY="$real_key" \
 	BROKER_UPSTREAM_HOST=127.0.0.1 \
 	BROKER_UPSTREAM_PORT="$up_port" \
 	NODE_TLS_REJECT_UNAUTHORIZED=0 \
-	node "$BROKER" "$broker_port" &
+	node "$BROKER" "$work/broker.sock" &
 broker_pid=$!
 
 ready=""
 for _ in $(seq 1 50); do
-	if curl -fsS "http://127.0.0.1:$broker_port/healthz" >/dev/null 2>&1; then ready=1; break; fi
+	if curl -fsS --unix-socket "$work/broker.sock" http://broker/healthz >/dev/null 2>&1; then ready=1; break; fi
 	sleep 0.2
 done
-[[ -n "$ready" ]] || fail "broker did not come up on 127.0.0.1:$broker_port"
+[[ -n "$ready" ]] || fail "broker did not come up on $work/broker.sock"
 
 if ! "$SANDBOX" --clone "$clone" --clone-mode ro --out-dir "$outdir" \
-	--env BROKERPORT="$broker_port" --env REALKEY="$real_key" -- bash -c '
-	base="http://127.0.0.1:$BROKERPORT"
+	--uds "$work/broker.sock" --ro-file "$SHIM" \
+	--env SHIM="$SHIM" --env SHIMPORT="$shim_port" --env REALKEY="$real_key" -- bash -c '
+	# Bring up the in-jail TCP->UDS forwarder and wait for it before asserting.
+	node "$SHIM" "$SHIMPORT" /run/broker.sock &
+	base="http://127.0.0.1:$SHIMPORT"
+	shim_ready=""
+	for _ in $(seq 1 50); do
+		if curl -fsS "$base/healthz" >/dev/null 2>&1; then shim_ready=1; break; fi
+		sleep 0.2
+	done
+	[ -n "$shim_ready" ] || { echo "jail-shim did not come up on $base"; exit 1; }
 	# real key injected, caller-supplied dummy stripped
 	body=$(curl -s "$base/v1/messages" -H "x-api-key: dummy")
 	echo "$body" | grep -q "$REALKEY" || { echo "real key not forwarded upstream: $body"; exit 1; }
@@ -211,17 +227,68 @@ if ! "$SANDBOX" --clone "$clone" --clone-mode ro --out-dir "$outdir" \
 	echo "$stream" | grep -q "\[DONE\]"  || { echo "sse [DONE] missing"; exit 1; }
 	exit 0
 '; then fail "broker credential proxy"; fi
-pass "broker credential proxy (key injected+stripped, healthz local, non-/v1 404, SSE streams)"
+pass "broker credential proxy over UDS (key injected+stripped, healthz local, non-/v1 404, SSE streams)"
 
 # --- 6. broker crash-resilience: client disconnect mid-stream ----------------
 # .pipe() puts no error listener on the client response, so a client that drops
 # mid-SSE would emit an unhandled 'error' on res and kill the whole broker. Force
 # that: /v1/stream sends one frame, waits 50ms, then the rest — abort inside the
-# gap, then prove the broker is still serving.
-curl -sN --max-time 0.02 "http://127.0.0.1:$broker_port/v1/stream" >/dev/null 2>&1 || true
+# gap, then prove the broker is still serving. Host-side over the same UDS (the
+# crash-proofing is transport-independent).
+curl -sN --max-time 0.02 --unix-socket "$work/broker.sock" http://broker/v1/stream >/dev/null 2>&1 || true
 sleep 0.2
-curl -fsS "http://127.0.0.1:$broker_port/healthz" >/dev/null 2>&1 \
+curl -fsS --unix-socket "$work/broker.sock" http://broker/healthz >/dev/null 2>&1 \
 	|| fail "broker crashed after a client disconnected mid-stream"
 pass "broker crash-resilience (survives a client mid-stream disconnect)"
+
+# --- 7. egress isolation proofs (the BE-4369 acceptance tests) ---------------
+# --unshare-all with no shared-network flag gives an empty netns with only lo up, so
+# the broker's bind-mounted socket (proven in section 5) is the ONLY reachable service.
+# Everything else off-host is unreachable BY CONSTRUCTION — prove it deterministically
+# (connects fail immediately: ECONNREFUSED on the jail's own lo, ENETUNREACH off-netns;
+# --max-time 3 is only a backstop, no real network or long timeouts are needed).
+
+# 7a. Host loopback NOT reachable: a listener on the HOST's 127.0.0.1 sits on a
+# different loopback than the jail's, so a jail connect must fail. Run this jail
+# WITHOUT a shim on that port so nothing in-jail shadows it.
+node -e 'require("http").createServer((q,s)=>s.end("host")).listen(8799, "127.0.0.1")' &
+host_http_pid=$!
+ready=""
+for _ in $(seq 1 50); do
+	if curl -fsS "http://127.0.0.1:8799/" >/dev/null 2>&1; then ready=1; break; fi
+	sleep 0.2
+done
+[[ -n "$ready" ]] || fail "host-loopback listener did not come up on 127.0.0.1:8799"
+if ! "$SANDBOX" --clone "$clone" --clone-mode ro --out-dir "$outdir" -- bash -c '
+	if curl -s --max-time 3 http://127.0.0.1:8799/ >/dev/null 2>&1; then
+		echo "host loopback 127.0.0.1:8799 reachable from jail — netns not isolated"; exit 1; fi
+	exit 0
+'; then fail "host loopback reachable from jail"; fi
+kill "$host_http_pid" 2>/dev/null || true
+host_http_pid=""
+pass "host loopback unreachable from jail (jail lo != host lo)"
+
+# 7b. Cloud metadata endpoint NOT reachable (immediate ENETUNREACH in empty netns).
+if ! "$SANDBOX" --clone "$clone" --clone-mode ro --out-dir "$outdir" -- bash -c '
+	if curl -s --max-time 3 http://169.254.169.254/metadata/instance >/dev/null 2>&1; then
+		echo "cloud metadata 169.254.169.254 reachable from jail"; exit 1; fi
+	exit 0
+'; then fail "cloud metadata endpoint reachable from jail"; fi
+pass "cloud metadata endpoint unreachable from jail"
+
+# 7c. Arbitrary external IP NOT reachable (IP literal, so no DNS dependence).
+if ! "$SANDBOX" --clone "$clone" --clone-mode ro --out-dir "$outdir" -- bash -c '
+	if curl -s --max-time 3 http://1.1.1.1/ >/dev/null 2>&1; then
+		echo "external IP 1.1.1.1 reachable from jail"; exit 1; fi
+	exit 0
+'; then fail "arbitrary external IP reachable from jail"; fi
+pass "arbitrary external IP unreachable from jail"
+
+# 7d. --uds fail-loud: a nonexistent socket path must exit non-zero BEFORE the cmd.
+if "$SANDBOX" --clone "$clone" --clone-mode ro --out-dir "$outdir" \
+	--uds /nonexistent.sock -- true 2>/dev/null; then
+	fail "--uds /nonexistent.sock was accepted (must fail loud before running the command)"
+fi
+pass "--uds fail-loud on a nonexistent socket path"
 
 echo "ALL SANDBOX TESTS PASSED"

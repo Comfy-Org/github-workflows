@@ -1,28 +1,54 @@
 // broker.mjs — a zero-dependency reverse proxy that holds the real Anthropic key
-// so a sandboxed agent never sees it (BE-4302, phase 1).
+// so a sandboxed agent never sees it (BE-4302 phase 1; UDS transport BE-4421 phase 2).
 //
-//   node broker.mjs <port>
+//   node broker.mjs <port|socket-path>
 //
-// The agent inside the bwrap jail (agent-sandbox.sh) talks to this broker on host
-// loopback with NO key of its own; the broker strips any inbound credential,
-// injects the real ANTHROPIC_API_KEY (read from its own env, never the jail's),
-// and forwards to api.anthropic.com. The key lives only in the host process; the
-// jail can spend against it but can never read it.
+// The agent inside the bwrap jail (agent-sandbox.sh) talks to this broker with NO
+// key of its own; the broker strips any inbound credential, injects the real
+// ANTHROPIC_API_KEY (read from its own env, never the jail's), and forwards to
+// api.anthropic.com. The key lives only in the host process; the jail can spend
+// against it but can never read it.
 //
-// Contract: listens on 127.0.0.1 only; forwards only /v1/* paths; deletes inbound
-// x-api-key / authorization before adding the real one; streams responses through
-// unbuffered so SSE works; logs method + path + status ONLY (never headers/body).
+// Transport: a numeric argv[2] keeps the legacy TCP mode (127.0.0.1:<port>,
+// retained for the fake-upstream test plumbing and back-compat); any other value
+// is treated as an absolute unix-domain-socket path (the phase-2 default — the
+// socket is bind-mounted into the isolated-netns jail at /run/broker.sock, since
+// the jail has no network egress). A relative path is refused.
+//
+// Contract: listens on 127.0.0.1 (TCP mode) or a unix socket only; forwards only
+// /v1/* paths; deletes inbound x-api-key / authorization before adding the real
+// one; streams responses through unbuffered so SSE works; logs method + path +
+// status ONLY (never headers/body). The request-handling contract is
+// transport-independent — TCP and UDS behave identically.
 //
 // BROKER_UPSTREAM_HOST / BROKER_UPSTREAM_PORT override the upstream target for
 // tests only; production leaves them unset and pins api.anthropic.com:443.
 
 import http from 'node:http';
 import https from 'node:https';
+import fs from 'node:fs';
 
-const port = Number(process.argv[2]);
-if (!Number.isInteger(port) || port <= 0 || port > 65535) {
-  console.error('broker: usage: node broker.mjs <port>');
-  process.exit(1);
+const arg = process.argv[2];
+let listenArgs; // spread into server.listen(): [port, host] for TCP or [path] for UDS
+let addr; // human label for the listen log line
+if (arg !== undefined && /^\d+$/.test(arg)) {
+  const port = Number(arg);
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+    console.error('broker: usage: node broker.mjs <port|socket-path>');
+    process.exit(1);
+  }
+  listenArgs = [port, '127.0.0.1'];
+  addr = `127.0.0.1:${port}`;
+} else {
+  const sockPath = arg;
+  if (!sockPath || sockPath[0] !== '/') {
+    console.error('broker: usage: node broker.mjs <port|socket-path> (socket path must be absolute)');
+    process.exit(1);
+  }
+  // Clear a stale socket left by a crashed prior run so listen() doesn't EADDRINUSE.
+  fs.rmSync(sockPath, { force: true });
+  listenArgs = [sockPath];
+  addr = sockPath;
 }
 
 const KEY = process.env.ANTHROPIC_API_KEY;
@@ -108,6 +134,6 @@ const server = http.createServer((req, res) => {
   req.pipe(upstream); // forward the request body streaming too
 });
 
-server.listen(port, '127.0.0.1', () => {
-  console.log(`broker listening on 127.0.0.1:${port} -> ${UPSTREAM_HOST}:${UPSTREAM_PORT}`);
+server.listen(...listenArgs, () => {
+  console.log(`broker listening on ${addr} -> ${UPSTREAM_HOST}:${UPSTREAM_PORT}`);
 });
