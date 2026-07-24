@@ -46,10 +46,18 @@ rather than buried in a runner script.
   `REJECT` (premature / overstated / not worth it).
 - **`security: true`** marks any auth/permission/security-adjacent finding —
   those are filed as investigations, **never** auto-implemented.
-- **`signature`** is a stable dedup key (`<repo-basename>:<scope>:<slug>`) whose
-  `<slug>` is derived **deterministically** from the finding's core subject, so it
-  stays identical across re-runs of the same finding and a consumer never re-files
-  a finding it has already seen.
+- **`signature`** is a stable dedup key, `<repo-basename>:<scope>:<path-slug>`,
+  where `<path-slug>` is the finding's **primary file or directory path** —
+  lowercased, every run of non-alphanumeric characters collapsed to a single
+  hyphen (`src/tools.ts` → `src-tools-ts`). Multi-file finding: the most
+  representative path (the one the body's first evidence cites). Only a repo-wide
+  pattern with no single anchor falls back to a normalized subject noun-phrase.
+  It is anchored to the **path, not the title**, because titles are re-generated
+  on every run: a re-worded title yields a new title-slug, the ledger's
+  exact-string match sees a "new" finding, and the same finding is filed twice
+  (observed in a consumer repo: one `src/tools.ts` finding, two issues opened by
+  consecutive runs). Paths survive rewordings, so the signature stays identical
+  across re-runs and a consumer never re-files a finding it has already seen.
 
 ## How a consumer uses these briefs
 
@@ -119,6 +127,7 @@ Keyed on `(repo, finding_signature) → {filed | rejected | superseded}`:
 | Open **builder PR** for the signature (BE-4003) | `pr-open` | no |
 | **Builder PR merged** | `merged` | no (shipped) |
 | **Builder PR closed unmerged** | `pr-closed` | **no — durable** (human declined) |
+| A known signature shares the candidate's `<path-slug>` (BE-4460) | `path-collision` | no |
 | No `groom` issue or PR carries the signature | `unknown` | **yes** |
 
 Only an `unknown` signature is filed/proposed. Human rejection — close-as-not-planned,
@@ -139,6 +148,24 @@ issue for a `to_file` finding **must**:
    invisible HTML comment (`<!-- groom-signature: … -->`) the next run recovers.
 
 Skip either and the next run cannot recognize the issue and will re-file it.
+
+### The path-token backstop (BE-4460)
+
+Classification treats the signature as an opaque string, with one exception: a
+candidate whose exact signature is `unknown` but whose `<path-slug>` segment
+(everything after the second `:`) is already covered — by a known signature, or
+by a candidate already routed to `to_file` in the same batch — is suppressed as
+**`path-collision`** rather than filed. That keeps one issue per anchoring path
+when the leading segments differ (a re-scoped run, a legacy signature whose slug
+coincides). Matching is **exact string equality** on the path segment — no
+substring or fuzzy matching, which would silently drop real findings about
+different files that share a basename (`src/index.ts` vs `lib/index.ts`).
+
+Consequence for the format transition: a legacy *title*-derived slug that merely
+*embeds* the path (`split-tools-ts-into-focused-modules`) is **not** matched, so
+such a finding can be filed once more under its new path-anchored signature —
+then it is stable forever. Label the superseded legacy issue `groom-superseded`
+(or close it as not planned) to retire it.
 
 The dedup decision is a point-in-time snapshot of GitHub issue state read
 *before* filing, and issue creation happens in a later step. Two overlapping

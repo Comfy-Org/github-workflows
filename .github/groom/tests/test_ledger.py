@@ -297,6 +297,121 @@ class LedgerDecisionTest(unittest.TestCase):
         self.assertEqual(invalid, [])
 
 
+class PathTokenTest(unittest.TestCase):
+    """The `<path-slug>` segment extraction the backstop keys on (BE-4460)."""
+
+    def test_extracts_segment_after_second_colon(self):
+        self.assertEqual(ledger.path_token("cloud:whole-repo:src-tools-ts"), "src-tools-ts")
+        self.assertEqual(ledger.path_token("repo:services-ingest:services-ingest-main-go"),
+                         "services-ingest-main-go")
+
+    def test_extra_colons_stay_in_the_path_segment(self):
+        # Only the first two colons are structural; anything after belongs to
+        # the path segment (maxsplit=2), so a colon in the slug can't shear it.
+        self.assertEqual(ledger.path_token("cloud:whole-repo:a:b"), "a:b")
+
+    def test_no_third_segment_has_no_token(self):
+        # A malformed / pre-format signature has no path anchor and must never
+        # collide with anything (else it would suppress unrelated findings).
+        self.assertEqual(ledger.path_token("cloud:whole-repo"), "")
+        self.assertEqual(ledger.path_token("just-a-slug"), "")
+        self.assertEqual(ledger.path_token(""), "")
+        self.assertEqual(ledger.path_token(None), "")
+        self.assertEqual(ledger.path_token(123), "")
+
+    def test_token_is_trimmed_and_lowercased_for_comparison(self):
+        self.assertEqual(ledger.path_token("  cloud:whole-repo: SRC-Tools-TS \n"), "src-tools-ts")
+
+    def test_empty_third_segment_has_no_token(self):
+        self.assertEqual(ledger.path_token("cloud:whole-repo:"), "")
+        self.assertEqual(ledger.path_token("cloud:whole-repo:   "), "")
+
+
+class PathCollisionTest(unittest.TestCase):
+    """The path-token backstop: one issue per anchoring path, not per wording.
+
+    The incident this guards: the SAME `src/tools.ts` finding was filed twice
+    because its signature was a slug of the LLM-generated title, which was
+    re-worded between runs. Signatures are now path-anchored, and this backstop
+    suppresses a re-keyed candidate whose path is already covered.
+    """
+
+    def setUp(self):
+        # A known issue for `src/tools.ts`, filed under one scope label.
+        self.led = ledger.Ledger({"repo:whole-repo:src-tools-ts": ledger.FILED})
+
+    def test_same_path_under_a_different_signature_is_suppressed(self):
+        # Same path, different leading segments (a legacy signature, a re-scoped
+        # run) => exact-string dedup misses it; the path backstop catches it.
+        to_file, suppressed, invalid = self.led.partition(
+            [{"signature": "repo:src:src-tools-ts", "title": "tools.ts is a monolith"}]
+        )
+        self.assertEqual(to_file, [])
+        self.assertEqual(suppressed[0]["ledger_status"], ledger.PATH_COLLISION)
+        self.assertEqual(invalid, [])
+
+    def test_exact_signature_match_still_reports_its_ledger_status(self):
+        # The backstop must not shadow the real status: an identical signature
+        # is `filed`, not `path-collision`.
+        _, suppressed, _ = self.led.partition([{"signature": "repo:whole-repo:src-tools-ts"}])
+        self.assertEqual(suppressed[0]["ledger_status"], ledger.FILED)
+
+    def test_different_path_is_not_suppressed(self):
+        # No false suppression: a finding about another file still files, even
+        # when the paths share tokens (`tools-ts`) — matching is exact, never
+        # substring/fuzzy.
+        to_file, suppressed, _ = self.led.partition([
+            {"signature": "repo:whole-repo:src-server-ts", "title": "other file"},
+            {"signature": "repo:whole-repo:test-tools-ts", "title": "same basename, other dir"},
+        ])
+        self.assertEqual([f["title"] for f in to_file], ["other file", "same basename, other dir"])
+        self.assertEqual(suppressed, [])
+
+    def test_legacy_title_slug_embedding_the_path_is_not_matched(self):
+        # Documented limit (BE-4460): matching is EXACT on the path segment, so
+        # a legacy TITLE-derived slug that merely *embeds* the path
+        # (`split-tools-ts-into-modules`) does not block the new path-anchored
+        # candidate — substring matching would silently drop real findings whose
+        # files share a basename. Cost is bounded: at most one duplicate per
+        # finding during the format transition, then it is stable forever.
+        led = ledger.Ledger({"repo:whole-repo:split-tools-ts-into-focused-modules": ledger.FILED})
+        to_file, _, _ = led.partition([{"signature": "repo:whole-repo:src-tools-ts"}])
+        self.assertEqual(len(to_file), 1)
+
+    def test_signature_without_a_path_segment_never_collides(self):
+        led = ledger.Ledger({"legacy-flat-signature": ledger.FILED})
+        to_file, _, _ = led.partition([{"signature": "another-flat-signature"}])
+        self.assertEqual(len(to_file), 1)
+
+    def test_intra_batch_path_collision_suppresses_the_second(self):
+        # Within ONE run GitHub state is not refreshed, so two candidates
+        # anchored to the same path must not open two issues either.
+        led = ledger.Ledger({})
+        to_file, suppressed, _ = led.partition([
+            {"signature": "repo:whole-repo:src-tools-ts", "title": "first"},
+            {"signature": "repo:src:src-tools-ts", "title": "second, re-keyed"},
+        ])
+        self.assertEqual([f["title"] for f in to_file], ["first"])
+        self.assertEqual([(f["title"], f["ledger_status"]) for f in suppressed],
+                         [("second, re-keyed", ledger.PATH_COLLISION)])
+
+    def test_rejected_path_stays_suppressed_across_a_rewording(self):
+        # A human rejection must survive the verifier re-keying the finding.
+        led = ledger.Ledger({"repo:whole-repo:src-tools-ts": ledger.REJECTED})
+        to_file, suppressed, _ = led.partition([{"signature": "repo:whole-repo-v2:src-tools-ts"}])
+        self.assertEqual(to_file, [])
+        self.assertEqual(suppressed[0]["ledger_status"], ledger.PATH_COLLISION)
+
+    def test_should_file_agrees_with_partition(self):
+        # The single-signature probe (`--check`) must not say "file it" for a
+        # candidate `partition` suppresses.
+        self.assertFalse(self.led.should_file("repo:src:src-tools-ts"))
+        self.assertTrue(self.led.path_collides("repo:src:src-tools-ts"))
+        self.assertTrue(self.led.should_file("repo:whole-repo:src-server-ts"))
+        self.assertFalse(self.led.path_collides("repo:whole-repo:src-server-ts"))
+        self.assertFalse(self.led.path_collides("no-path-segment"))
+
+
 class AcceptanceScenarioTest(unittest.TestCase):
     """End-to-end run N -> run N+1 using the ledger built from prior issues."""
 
@@ -319,6 +434,30 @@ class AcceptanceScenarioTest(unittest.TestCase):
         led = ledger.Ledger(ledger.build_ledger([issue("y", state="open")]))
         to_file, _, _ = led.partition([{"signature": "z-new"}])
         self.assertEqual(len(to_file), 1)
+
+    # --- Path-anchored signatures (BE-4460) ---
+
+    def test_same_file_reworded_next_run_is_not_refiled(self):
+        # THE acceptance case. Run N filed the `src/tools.ts` monolith finding;
+        # run N+1 describes the same file with different wording. Because the
+        # signature is anchored to the PATH, not the title, run N+1 produces the
+        # identical signature and is suppressed as already `filed` — one issue,
+        # not two.
+        sig = "repo:whole-repo:src-tools-ts"
+        led = ledger.Ledger(ledger.build_ledger([issue(sig, state="open")]))
+        to_file, suppressed, _ = led.partition(
+            [{"signature": sig, "title": "src/tools.ts has grown into a monolith"}]
+        )
+        self.assertEqual(to_file, [])
+        self.assertEqual(suppressed[0]["ledger_status"], ledger.FILED)
+
+    def test_path_format_signature_marker_round_trip(self):
+        # Marker round-trip is unchanged by the format: the signature is still
+        # embedded and recovered verbatim (it stays an opaque string).
+        sig = "repo:whole-repo:src-tools-ts"
+        recovered = ledger.extract_signature(issue(sig)["body"])
+        self.assertEqual(recovered, sig)
+        self.assertEqual(ledger.path_token(recovered), "src-tools-ts")
 
     # --- Builder auto-PR dedup (BE-4003, acceptance criterion 3) ---
 

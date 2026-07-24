@@ -34,6 +34,19 @@ each finding's `signature` field; it never invents one. It only trims
 surrounding whitespace so a stray newline in a marker can't split one signature
 into two ledger keys.
 
+One structural assumption is made on top of that opacity (BE-4460): the
+signature's trailing `<path-slug>` segment — everything after the second `:` in
+the verifier's `<repo-basename>:<scope-label>:<path-slug>` format — names the
+finding's primary file/directory, and is therefore stable even when the LLM
+re-words the title. `partition` uses it as a **backstop**: a candidate whose
+exact signature is new but whose path segment is already covered by a known
+signature is suppressed as `path-collision` instead of filed. That is what
+carries dedup across the title-slug -> path-slug format change (the incident
+that motivated it: one `src/tools.ts` finding filed as two issues by consecutive
+runs, because a reworded title produced a new title-derived slug).
+Classification is unchanged — the signature stays an opaque, exactly-matched
+string everywhere else.
+
 CLI (what the groom workflow calls right before it files):
 
     python3 .github/groom/ledger.py \
@@ -122,6 +135,14 @@ PR_CLOSED = "pr-closed"
 # live ledger status (it is not a GitHub issue state), so it is not in
 # `_PRECEDENCE`.
 PENDING = "pending"
+
+# Partition-time-only status: the signature itself is UNKNOWN, but its
+# `<path-slug>` segment is already covered by a known signature (or by a
+# candidate routed to `to_file` earlier in this batch). See `path_token` — this
+# is the backstop that carries dedup across the title-slug -> path-slug
+# signature format change (BE-4460). Like PENDING it is not a GitHub issue
+# state, so it is not in `_PRECEDENCE`.
+PATH_COLLISION = "path-collision"
 
 # Precedence when several records (issues and/or builder PRs) share one
 # signature (e.g. a finding filed as an issue AND later built as a PR): surface
@@ -282,6 +303,31 @@ def normalize_signature(signature) -> str:
     return signature.strip()
 
 
+# The verifier's signature format is `<repo-basename>:<scope-label>:<path-slug>`
+# (verifier.md). Only the trailing `<path-slug>` segment — everything after the
+# SECOND colon — is the finding's anchor; the first two segments are run
+# metadata. `maxsplit=2` keeps a colon inside the path segment intact.
+_SIGNATURE_SEGMENTS = 3
+
+
+def path_token(signature) -> str:
+    """The `<path-slug>` segment of a signature, or "" if it has no third segment.
+
+    The path segment is what makes a signature stable: the verifier now derives
+    it from the finding's PRIMARY file/directory path, which survives the LLM
+    re-wording the title on every run (BE-4460 — the same `src/tools.ts` finding
+    was filed twice because its title-derived slug changed between runs).
+
+    Lowercased for comparison only. The verifier emits lowercase slugs already,
+    so this only guards against a stray capital; the full signature stays
+    case-sensitive and opaque everywhere else (`normalize_signature`).
+    """
+    parts = normalize_signature(signature).split(":", _SIGNATURE_SEGMENTS - 1)
+    if len(parts) < _SIGNATURE_SEGMENTS:
+        return ""
+    return parts[-1].strip().lower()
+
+
 def extract_signature(body):
     """Recover the embedded signature from an issue body, or None.
 
@@ -390,6 +436,9 @@ class Ledger:
 
     def __init__(self, statuses: dict):
         self._statuses = dict(statuses)
+        # Path-slug index over the SAME records, for the backstop below. Built
+        # once here rather than scanned per candidate.
+        self._known_paths = {t for t in map(path_token, self._statuses) if t}
 
     def __len__(self) -> int:
         return len(self._statuses)
@@ -401,15 +450,39 @@ class Ledger:
     def is_known(self, signature) -> bool:
         return self.status(signature) != UNKNOWN
 
+    def path_collides(self, signature) -> bool:
+        """True if some KNOWN signature already covers this signature's path-slug.
+
+        The backstop for the title-slug -> path-slug signature format change
+        (BE-4460). Exact-string dedup on the WHOLE signature misses two cases
+        that are the same finding: an issue filed for the same path under a
+        different `<scope-label>` (a re-scoped or narrowed run), and a legacy
+        issue whose title-derived slug happens to equal the new path-slug.
+        Comparing only the trailing path segment catches both.
+
+        Deterministic and exact — string equality on the path segment, no fuzzy
+        or substring matching, so it can only suppress a candidate that names
+        the identical path. A signature with no third segment (a malformed or
+        pre-format signature) has no path token and never collides.
+        """
+        token = path_token(signature)
+        return bool(token) and token in self._known_paths
+
     def should_file(self, signature) -> bool:
         """A finding is filed only if its signature is genuinely new.
 
         A missing/blank/non-string signature is NOT filable: it has no
         recoverable marker, so filing it would re-file on every subsequent run.
-        This mirrors `partition`, which routes such a candidate to `invalid`
-        rather than `to_file`.
+        A signature whose path-slug is already covered by a known signature is
+        not filable either (`path_collides`). Both mirror `partition`, which
+        routes such candidates to `invalid` / `path-collision` rather than
+        `to_file`.
         """
-        return normalize_signature(signature) != "" and self.status(signature) == UNKNOWN
+        return (
+            normalize_signature(signature) != ""
+            and self.status(signature) == UNKNOWN
+            and not self.path_collides(signature)
+        )
 
     def partition(self, findings):
         """Split candidate findings into to_file / suppressed / invalid.
@@ -417,9 +490,10 @@ class Ledger:
         `to_file`  — signature is UNKNOWN *and* first-seen in this batch: open
                      an issue (remember to embed the marker + apply the `groom`
                      label).
-        `suppressed` — signature is known (filed/rejected/superseded) OR was
+        `suppressed` — signature is known (filed/rejected/superseded), was
                      already routed to `to_file` earlier in this same batch
-                     (`pending`): each annotated with `ledger_status` for
+                     (`pending`), or its `<path-slug>` is already covered
+                     (`path-collision`): each annotated with `ledger_status` for
                      auditable reporting.
         `invalid`  — no usable signature: cannot be deduped, so it is NOT filed
                      (filing it would risk the exact duplicate-spam this ledger
@@ -430,21 +504,37 @@ class Ledger:
         both be filed — the ledger is only refreshed from GitHub between runs,
         so the first opens the issue and later duplicates are suppressed as
         `pending` (not falsely labeled `filed`, which they are not yet).
+
+        Path backstop (BE-4460): a candidate whose signature is UNKNOWN but
+        whose `<path-slug>` is already covered — by a known signature, or by a
+        candidate routed to `to_file` earlier in this batch — is suppressed as
+        `path-collision`. That is what keeps a re-keyed signature from opening a
+        SECOND issue for a file that already has one, both across the format
+        change and across scope labels.
         """
         to_file, suppressed, invalid = [], [], []
         filed_this_batch = set()
+        # Path tokens routed to `to_file` in THIS batch, checked alongside the
+        # ledger's own: within one run GitHub state is not yet refreshed, so
+        # two candidates anchored to the same path would otherwise both file.
+        paths_this_batch = set()
         for finding in findings:
             signature = normalize_signature(finding.get("signature")) if isinstance(finding, dict) else ""
             if not signature:
                 invalid.append(finding)
                 continue
             status = self.status(signature)
+            token = path_token(signature)
             if status != UNKNOWN:
                 suppressed.append({**finding, "ledger_status": status})
             elif signature in filed_this_batch:
                 suppressed.append({**finding, "ledger_status": PENDING})
+            elif token and (self.path_collides(signature) or token in paths_this_batch):
+                suppressed.append({**finding, "ledger_status": PATH_COLLISION})
             else:
                 filed_this_batch.add(signature)
+                if token:
+                    paths_this_batch.add(token)
                 to_file.append(finding)
         return to_file, suppressed, invalid
 
@@ -555,6 +645,12 @@ def main(argv=None):
             print("invalid")
             return 1
         status = ledger.status(args.check)
+        # Report the path backstop distinctly, exactly as `partition` does, so
+        # the probe never says `unknown`/exit 0 for a signature partition would
+        # suppress.
+        if status == UNKNOWN and ledger.path_collides(args.check):
+            print(PATH_COLLISION)
+            return 1
         print(status)
         return 0 if ledger.should_file(args.check) else 1
 
