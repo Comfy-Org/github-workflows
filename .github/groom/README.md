@@ -28,6 +28,20 @@ ledger's PR-state stops that finding from being re-proposed. The builder holds n
 credentials — it can only produce a *patch*, never push. Default off: the
 finds-only groomer (issues) stays the default.
 
+A builder patch that touches a **CI-privileged path** — workflow/action
+definitions, dependency **lockfiles** (`package-lock.json`, `pnpm-lock.yaml`,
+`Cargo.lock`, …), package manifests, or build/test config — is downgraded from a
+PR to a filed issue: on a same-repo branch push that code executes in
+credentialed CI *before* a human reads the diff (review gates merge, not CI
+exec). The deny-list is the tested [`patch_policy.py`](patch_policy.py) (BE-4404)
+— a conservative default, not a proof of completeness, so read it before setting
+`builder: true` on a repo whose CI runs something else privileged. **Structural
+limit:** the policy guards privileged-*config* surfaces, but any patch's source
+code still executes when the caller's CI runs its *tests* — a review-gated PR is
+untrusted code running pre-merge. Callers enabling the builder should avoid
+exposing secrets to test steps and consider `npm ci --ignore-scripts` (or
+equivalents) where viable.
+
 These two files are the **single source of truth** for the groom prompts, the
 same way [`.github/cursor-review/`](../cursor-review) is for the review panel.
 The core thesis of the groom initiative is *collaborate on the prompt, not the
@@ -171,4 +185,29 @@ python3 .github/groom/ledger.py --repo owner/name --check "<signature>"
 
 ```bash
 python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
+```
+
+## `patch_policy.py` — the CI-privileged patch deny-list (BE-4404)
+
+The auto-builder's `Capture patch` step must never open an auto-PR whose patch
+touches a path the caller's CI *executes* before a human reviews the merge —
+that would run builder-authored (untrusted) code with repository secrets. The
+patterns that decide this were an untestable inline `grep -E`; `patch_policy.py`
+extracts them so they carry a unit-test suite, and closes the biggest live gap
+(dependency **lockfiles** — `npm ci` re-resolves and runs their tarballs' install
+scripts) plus `.husky/`, composite-action manifests, `.gitmodules`, and the
+common build files across the JS/Python/Rust/Ruby/Swift/Gradle/Bazel/CMake
+ecosystems.
+
+- `denied_paths(paths)` returns the CI-privileged subset of the changed paths.
+- `main()` reads NUL-delimited paths from stdin (matching `git diff --cached
+  --name-only -z`) and prints the matches, **exit 0 always** — the caller tests
+  non-emptiness. NUL delimiting is mandatory: git C-quotes exotic paths in its
+  default output, slipping them past the anchors; `-z` emits raw bytes.
+- The list is a conservative **default, not a proof of completeness** — over-block
+  is safe (a false positive only downgrades a PR to an issue), under-block is the
+  hole. A repo whose CI runs something else privileged must add it here first.
+
+```bash
+python3 -m unittest discover -s .github/groom/tests -p test_patch_policy.py -v
 ```

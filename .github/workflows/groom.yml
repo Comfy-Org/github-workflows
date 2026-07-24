@@ -19,6 +19,16 @@ name: Groom (reusable)
 # human review — they are NEVER auto-merged. The remaining findings (DOWNGRADE,
 # security, beyond-cap) are still filed as `groom` issues (hybrid). Default off.
 #
+# Patch-path policy (BE-4404): a builder patch that touches a CI-privileged path
+# (workflow/action defs, dependency lockfiles, package manifests, build/test
+# config) is downgraded from a PR to a filed issue — that code would execute in
+# credentialed pre-review CI. The deny-list is the tested `.github/groom/
+# patch_policy.py`. STRUCTURAL LIMIT: the deny-list guards privileged-CONFIG
+# surfaces, but ANY patch's source still executes when the caller's CI runs its
+# tests — a review-gated PR is still untrusted code running before merge. Callers
+# enabling `builder: true` should avoid exposing secrets to test steps and
+# consider `npm ci --ignore-scripts` (or equivalents) where viable.
+#
 # Topology mirrors cursor-review.yml (this repo is the single source of truth —
 # the finder/verifier BRIEFS + the dedup ledger live under .github/groom/, so a
 # consumer carries only a thin caller and there's no logic to keep in sync).
@@ -1535,50 +1545,34 @@ jobs:
             exit 0
           fi
           CHANGED=$(git -C repo diff --cached --numstat | awk '{a+=($1=="-"?0:$1); d+=($2=="-"?0:$2)} END{print a+d+0}')
-          # Path policy: a patch touching `.github/workflows/` would, on the
+          # Path policy: a patch touching a CI-privileged path would, on the
           # same-repo branch push, run in CI with repository secrets + a writable
           # token BEFORE any human reviews the merge — defeating the RFC's
           # "review-gated, patch-only" boundary (review gates merge, not CI exec).
-          # A prompt-injected builder must never self-author CI. Refuse such a
-          # patch and file an issue so a human authors the workflow change.
-          #
-          # The deny-list covers the paths that actually execute in that pre-review CI:
-          # the workflow + composite-action definitions (`.github/workflows/`,
-          # `.github/actions/`) AND the build/test config the CI of a typical repo
-          # invokes — npm lifecycle scripts (`package.json`), `Makefile`, and the
-          # Python test/build config (`conftest.py`, `noxfile.py`, `tox.ini`,
-          # `pytest.ini`, `setup.py`, `setup.cfg`, `pyproject.toml`), plus
-          # `Dockerfile` and `.pre-commit-config.yaml`. Each is a "runs with
-          # repository secrets before a human reads the diff" window, exactly like a
-          # workflow file. Earlier revisions blocked only the first two and left the
-          # rest as a comment-guarded KNOWN GAP; a comment is not a control.
-          #
-          # STILL read this BEFORE setting `builder: true` on any caller: the precise
-          # list is target-repo-specific and this is a conservative DEFAULT, not a
-          # proof of completeness. A repo whose CI runs something else privileged
-          # (a checked-in `scripts/` entrypoint, a Gradle/Bazel build file) must add
-          # it here first. Erring wide is the safe direction — a false positive only
-          # downgrades a legitimate refactor from a PR to an issue, and nothing is
-          # dropped either way.
-          #
-          # Paths are compared NUL-delimited (`--name-only -z`), not via the default
-          # output: git C-quotes and double-quote-wraps any path containing a quote,
-          # backslash or control byte, so `.github/workflows/ev"il.yml` is emitted as
-          # `".github/workflows/ev\"il.yml"` — whose leading quote slips straight past
-          # the `^\.github/` anchor. `-c core.quotePath=false` did NOT fix this; it
-          # only suppresses quoting of high (non-ASCII) bytes. `-z` emits raw bytes
-          # with no quoting at all. Translating NUL to newline can only SPLIT a path
-          # that itself contains a newline, and both halves are then tested — that
-          # over-blocks, never under-blocks, which is the safe direction here.
-          TOUCHED_CI=$(git -C repo diff --cached --name-only -z | tr '\0' '\n' \
-            | grep -E '^\.github/(workflows|actions)/|(^|/)(package\.json|Makefile|GNUmakefile|conftest\.py|noxfile\.py|tox\.ini|pytest\.ini|setup\.py|setup\.cfg|pyproject\.toml|Dockerfile|\.pre-commit-config\.yaml)$' || true)
+          # A prompt-injected builder must never self-author code that pre-review CI
+          # executes. The deny-list lives in the tested `patch_policy.py` (BE-4404)
+          # so the pattern set is unit-tested, not an untestable inline grep. Two
+          # load-bearing notes survive here:
+          #   (a) it is a conservative DEFAULT, not a proof of completeness — the
+          #       precise list is target-repo-specific, so STILL read patch_policy.py
+          #       BEFORE setting `builder: true` on any caller (a repo whose CI runs
+          #       something else privileged must add it there). Erring wide is safe:
+          #       a false positive only downgrades a legit refactor from a PR to an
+          #       issue, and nothing is dropped either way.
+          #   (b) NUL-delimited comparison is mandatory (`--name-only -z`): git
+          #       C-quotes and double-quote-wraps any path with a quote/backslash/
+          #       control byte in default output, slipping the path past a `^\.github/`
+          #       anchor; `-z` emits raw bytes so patch_policy.py sees the true path.
+          # $GROOM_ASSETS already points into the _groom_assets checkout (workflow
+          # env, same var the prompt-build steps use).
+          TOUCHED_CI=$(git -C repo diff --cached --name-only -z | python3 "$GROOM_ASSETS/patch_policy.py" || true)
 
           if [ "$STATUS" != "patched" ] || [ ! -s /tmp/out/patch.diff ]; then
             echo "Build $IDX produced no patch (status=$STATUS) — will file as an issue."
             bail "${SUMMARY:-builder produced no patch}"
           elif [ -n "$TOUCHED_CI" ]; then
             echo "::warning::Build $IDX patch edits CI-privileged file(s) [$(echo "$TOUCHED_CI" | tr '\n' ' ')] — refusing to auto-open a PR that would run in credentialed CI before human review; filing an issue instead."
-            bail "patch modifies a CI-privileged path (.github/workflows|actions, or build/test config that executes in pre-review CI) — a human must author these changes"
+            bail "patch modifies a CI-privileged path (per .github/groom/patch_policy.py — workflow/action defs, lockfiles, or build/test config that executes in pre-review CI) — a human must author these changes"
           elif [ "$CHANGED" -gt "$PR_SIZE_LIMIT" ]; then
             echo "::warning::Build $IDX patch changed $CHANGED lines (> $PR_SIZE_LIMIT) — filing an issue instead of a giant PR."
             bail "patch too large: ${CHANGED} lines changed (> ${PR_SIZE_LIMIT})"
