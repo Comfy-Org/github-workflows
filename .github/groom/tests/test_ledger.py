@@ -362,7 +362,7 @@ class PathCollisionTest(unittest.TestCase):
         # Same path, different leading segments (a legacy signature, a re-scoped
         # run) => exact-string dedup misses it; the path backstop catches it.
         to_file, suppressed, invalid = self.led.partition(
-            [{"signature": "repo:src:src-tools-ts", "title": "tools.ts is a monolith"}]
+            [{"signature": "repo:src:src-tools-ts", "security": False, "title": "tools.ts is a monolith"}]
         )
         self.assertEqual(to_file, [])
         self.assertEqual(suppressed[0]["ledger_status"], ledger.PATH_COLLISION)
@@ -406,8 +406,8 @@ class PathCollisionTest(unittest.TestCase):
         # anchored to the same path must not open two issues either.
         led = ledger.Ledger({})
         to_file, suppressed, _ = led.partition([
-            {"signature": "repo:whole-repo:src-tools-ts", "title": "first"},
-            {"signature": "repo:src:src-tools-ts", "title": "second, re-keyed"},
+            {"signature": "repo:whole-repo:src-tools-ts", "security": False, "title": "first"},
+            {"signature": "repo:src:src-tools-ts", "security": False, "title": "second, re-keyed"},
         ])
         self.assertEqual([f["title"] for f in to_file], ["first"])
         self.assertEqual([(f["title"], f["ledger_status"]) for f in suppressed],
@@ -416,7 +416,9 @@ class PathCollisionTest(unittest.TestCase):
     def test_rejected_path_stays_suppressed_across_a_rewording(self):
         # A human rejection must survive the verifier re-keying the finding.
         led = ledger.Ledger({"repo:whole-repo:src-tools-ts": ledger.REJECTED})
-        to_file, suppressed, _ = led.partition([{"signature": "repo:whole-repo-v2:src-tools-ts"}])
+        to_file, suppressed, _ = led.partition(
+            [{"signature": "repo:whole-repo-v2:src-tools-ts", "security": False}]
+        )
         self.assertEqual(to_file, [])
         self.assertEqual(suppressed[0]["ledger_status"], ledger.PATH_COLLISION)
 
@@ -471,25 +473,37 @@ class SecurityExemptionTest(unittest.TestCase):
 
     def test_string_true_counts_as_security(self):
         # The verifier is an LLM writing JSON; it sometimes emits the STRING
-        # "true". groom.yml's labeling rule accepts it, so this must too — the
-        # exempt set and the `groom-security`-labeled set are the same set.
+        # "true" rather than the literal.
         to_file, _, _ = self.led.partition(
             [{"signature": "repo:src:src-tools-ts", "security": "TRUE"}]
         )
         self.assertEqual(len(to_file), 1)
 
-    def test_only_an_explicit_true_exempts(self):
-        # Anything that is not provably `true` — false, absent, null, a stray
-        # string — stays subject to the backstop. Were this the conservative
-        # `!= "false"` reading used by the BUILD gate, every candidate that
-        # simply omits the field would be exempt and the backstop would be dead.
+    def test_an_unusable_flag_fails_closed(self):
+        # The backstop decides a SECURITY guarantee from an LLM-authored field,
+        # so ambiguity resolves toward surfacing the finding — same conservative
+        # reading the build gate uses. A flag that is absent, null or mangled
+        # exempts the candidate rather than risking a silently buried finding.
+        # Cost is one extra issue; the next run suppresses it as `filed`.
         absent = object()
-        for security in (False, None, "false", "no", 0, "", "yes", absent):
+        for security in (None, "no", 0, "", "yes", absent):
             with self.subTest(security=security):
                 finding = {"signature": "repo:src:src-tools-ts"}
                 if security is not absent:
                     finding["security"] = security
                 to_file, suppressed, _ = self.led.partition([finding])
+                self.assertEqual(len(to_file), 1)
+                self.assertEqual(suppressed, [])
+
+    def test_only_a_provably_false_flag_is_subject_to_the_backstop(self):
+        # The well-formed case: the verifier's schema requires `security` on
+        # every finding, so real batches always land here and the backstop is
+        # fully active for them.
+        for security in (False, "false", "FALSE", " false "):
+            with self.subTest(security=security):
+                to_file, suppressed, _ = self.led.partition(
+                    [{"signature": "repo:src:src-tools-ts", "security": security}]
+                )
                 self.assertEqual(to_file, [])
                 self.assertEqual(suppressed[0]["ledger_status"], ledger.PATH_COLLISION)
 
@@ -516,6 +530,27 @@ class SecurityExemptionTest(unittest.TestCase):
         self.assertEqual([f["title"] for f in to_file], ["routine", "authz bypass"])
         self.assertEqual(suppressed, [])
 
+    def test_the_security_lane_prefix_is_domain_separated(self):
+        # `verifier.md` prefixes a security finding's slug `sec_` — UNDERSCORE,
+        # because slugifying a path can never produce one (every `_` in a path
+        # collapses to a hyphen). A hyphen prefix would NOT be domain-separated:
+        # a routine finding about `sec/auth.ts` slugifies to `sec-auth-ts` and
+        # would share a signature with a security finding about `auth.ts`,
+        # silently suppressing one of them. These two must stay distinct.
+        routine_in_sec_dir = "repo:whole-repo:sec-auth-ts"     # sec/auth.ts, routine
+        security_on_auth = "repo:whole-repo:sec_auth-ts"       # auth.ts, security
+        self.assertNotEqual(
+            ledger.path_token(routine_in_sec_dir), ledger.path_token(security_on_auth)
+        )
+        led = ledger.Ledger({routine_in_sec_dir: ledger.FILED})
+        to_file, suppressed, _ = led.partition(
+            [{"signature": security_on_auth, "security": False}]
+        )
+        # Suppression here would be the collision, not the exemption — so assert
+        # it with the flag OFF, where the backstop is fully armed.
+        self.assertEqual(len(to_file), 1)
+        self.assertEqual(suppressed, [])
+
     def test_should_file_mirrors_the_exemption(self):
         sig = "repo:src:src-tools-ts"
         self.assertFalse(self.led.should_file(sig))
@@ -526,8 +561,12 @@ class SecurityExemptionTest(unittest.TestCase):
     def test_is_security_finding_helper(self):
         self.assertTrue(ledger.is_security_finding({"security": True}))
         self.assertTrue(ledger.is_security_finding({"security": " True "}))
+        self.assertTrue(ledger.is_security_finding({}))          # fails closed
+        self.assertTrue(ledger.is_security_finding({"security": None}))
         self.assertFalse(ledger.is_security_finding({"security": False}))
-        self.assertFalse(ledger.is_security_finding({}))
+        self.assertFalse(ledger.is_security_finding({"security": " FALSE "}))
+        # A non-dict is not a finding at all; `partition` routes it to `invalid`
+        # before ever asking, so it must not be reported as security.
         self.assertFalse(ledger.is_security_finding("not a dict"))
         self.assertFalse(ledger.is_security_finding(None))
 

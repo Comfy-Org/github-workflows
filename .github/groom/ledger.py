@@ -347,22 +347,23 @@ def path_token(signature) -> str:
 
 
 def is_security_finding(finding) -> bool:
-    """True only if the candidate is EXPLICITLY marked `security: true`.
+    """True unless the candidate is PROVABLY non-security (`security: false`).
 
-    Same truthiness rule the filing step uses to apply the `groom-security`
-    label (`str(...).strip().lower() == "true"` in groom.yml), so "the finding
-    exempt from the path backstop" and "the finding labeled security" are the
-    same set — never one without the other.
+    Fails CLOSED, the same conservative reading the build gate uses (groom.yml:
+    `str(...).strip().lower() != "false"`): a finding whose flag the verifier
+    omitted or mangled is treated as security, so the path backstop can never be
+    what silently buries it. The verifier's schema requires `security` on every
+    finding, so well-formed batches are unaffected — only malformed producer
+    output takes the safe branch, and there it costs at most one extra issue
+    (exact-signature dedup still suppresses it on the next run).
 
-    Deliberately NOT the conservative `!= "false"` reading used by the *build*
-    gate. There, treating an unmarked finding as security is the safe direction
-    (it stays an issue instead of being auto-implemented). Here the exemption
-    only ever *adds* filings, so `!= "false"` would exempt every candidate that
-    simply omits the field and disable the backstop entirely.
+    The `== "true"` reading would be wrong here for the same reason it is wrong
+    at the build gate: it decides a SECURITY guarantee from an LLM-authored
+    field, so ambiguity has to resolve toward surfacing the finding.
     """
     if not isinstance(finding, dict):
         return False
-    return str(finding.get("security")).strip().lower() == "true"
+    return str(finding.get("security")).strip().lower() != "false"
 
 
 def extract_signature(body):
@@ -483,6 +484,14 @@ class Ledger:
         # path and defeat the very label the human applied. Every other status
         # (including the durable human "no" of REJECTED / PR_CLOSED) still seeds
         # the index.
+        #
+        # `statuses` is already collapsed by `_PRECEDENCE`, where SUPERSEDED
+        # outranks FILED/PR_OPEN, so one signature carrying BOTH a superseded
+        # issue and a live one reads as SUPERSEDED and leaves the index. That
+        # only relaxes the heuristic: the signature itself is still non-UNKNOWN,
+        # so an exact re-run is suppressed as before, and the most a re-scoped
+        # variant can cost is one duplicate — the same bound as the rest of the
+        # format transition.
         self._known_paths = {
             token
             for token in (

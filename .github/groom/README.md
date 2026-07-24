@@ -55,8 +55,11 @@ rather than buried in a runner script.
   most representative one" is a judgment the verifier would re-make differently
   next run. Only a repo-wide pattern with no single anchor falls back to a
   normalized subject noun-phrase. A `security: true` finding's slug is prefixed
-  `sec-`, so a routine finding already filed for a file can never dedup away a
-  security finding about that same file.
+  `sec_` — underscore, because slugification can never produce one, so the
+  security lane for `auth.ts` (`sec_auth-ts`) cannot collide with a routine
+  finding about `sec/auth.ts` (`sec-auth-ts`). That lane is what stops a routine
+  finding already filed for a file from deduping away a security finding about
+  that same file.
   It is anchored to the **path, not the title**, because titles are re-generated
   on every run: a re-worded title yields a new title-slug, the ledger's
   exact-string match sees a "new" finding, and the same finding is filed twice
@@ -176,28 +179,38 @@ deliberately narrow — two carve-outs:
   location, not a finding, so without this an already-filed routine finding on
   `src/tools.ts` would bury a later security finding on the same file and break
   the "security findings always surface as investigations" guarantee. (The
-  verifier's `sec-` slug prefix separates the two lanes up front; this is the
-  code-side guarantee for legacy and cross-scope signatures that predate it.)
-  Exact-signature dedup still applies, so the exemption costs at most one issue
-  per security finding — the next run sees it as `filed`.
+  verifier's `sec_` slug prefix separates the two lanes up front; this is the
+  code-side guarantee for legacy and cross-scope signatures that predate it, and
+  it fails **closed** — `is_security_finding` treats a finding whose flag the
+  verifier omitted or mangled as security, so a malformed flag can never be what
+  buries one.) Exact-signature dedup still applies, so the exemption costs at
+  most one extra issue — the next run sees it as `filed`. It does **not** make
+  security findings individually addressable: two distinct vulnerabilities in one
+  file share the `sec_<path>` key and collapse, exactly as two routine findings
+  on one file do (see the limit below).
 - **`superseded` records are left out of the path index.** `groom-superseded` is
   the documented "retire this issue so its finding can be re-filed under the
   current format" signal; keeping it in the index would let the retired issue go
   on suppressing the replacement by path and defeat the label a human applied.
 
-Known, accepted limit: slugification is lossy, so two genuinely distinct paths
-can map to one slug (`src/foo/bar.ts` and `src/foo-bar.ts` both →
-`src-foo-bar-ts`) and the second finding is suppressed. The blast radius is one
-finding on a path shape that is rare in practice, and it is the same collapse the
-format already accepts for two distinct findings about one file — the deliberate
-trade for a key that is stable across re-wordings.
+Known, accepted limit — and a **permanent** suppression, not a one-time
+transition cost. A path-anchored key identifies a *location*, so every later
+finding that maps to an already-covered token is dropped for good: two different
+findings about one file, and two genuinely distinct paths that slugify alike
+(`src/foo/bar.ts` and `src/foo-bar.ts` both → `src-foo-bar-ts`, or a file and a
+same-stem directory). That is the deliberate trade for a key that survives
+re-wording — one issue per anchoring path, chosen over the duplicate-per-run
+spam the title-derived key produced. Widening it needs a per-finding
+discriminator that is *stable across runs*, which is exactly what the LLM cannot
+supply today; the `security` flag is one bit that is, which is why the security
+lane is carved out of this and nothing else is.
 
 Consequence for the format transition: a legacy *title*-derived slug that merely
 *embeds* the path (`split-tools-ts-into-focused-modules`) is **not** matched, so
 such a finding can be filed once more under its new path-anchored signature —
 then it is stable forever. Label the superseded legacy issue `groom-superseded`
 (or close it as not planned) to retire it. A security finding already filed under
-an unprefixed slug re-files once for the same reason when it picks up its `sec-`
+an unprefixed slug re-files once for the same reason when it picks up its `sec_`
 prefix — same one-per-finding, one-time transition cost, same fix.
 
 The dedup decision is a point-in-time snapshot of GitHub issue state read
