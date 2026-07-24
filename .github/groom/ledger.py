@@ -148,6 +148,52 @@ def signature_marker(signature: str) -> str:
     return f"<!-- {_MARKER_PREFIX} {encoded} -->"
 
 
+# The builder-authored PR body must LEAD with an `## ELI-5` section (the comfy-pr
+# convention embedded in builder.md). `_first_heading` pulls the first markdown
+# ATX heading's text; `_ELI5_HEADING_RE` matches an ELI-5 heading title. If the
+# builder's body doesn't lead with one, it is treated as unusable and the
+# assembler falls back to the original template — so a PR that uses the
+# builder body is GUARANTEED to open with an ELI-5 section (BE-4346).
+_HEADING_RE = re.compile(r"(?m)^[ \t]*#{1,6}[ \t]+(.+?)[ \t]*$")
+_ELI5_HEADING_RE = re.compile(r"(?i)^ELI[ -]?5\b")
+
+
+def _leads_with_eli5(body: str) -> bool:
+    m = _HEADING_RE.search(body or "")
+    return bool(m and _ELI5_HEADING_RE.match(m.group(1)))
+
+
+def builder_pr_body(*, banner: str, eli5_body: str, verifier_rationale: str, signature: str) -> str:
+    """Assemble the groom auto-builder PR body from its load-bearing parts (BE-4346).
+
+    The builder agent — which made the change and knows what it did — authors
+    `eli5_body`: an `## ELI-5`-first, structured what/why description written one
+    line per paragraph (no hard-wrap), following the team's comfy-pr convention.
+    That body LEADS the PR. The `banner` (auto-built / review-only / never
+    auto-merged) is prepended and the ledger `signature_marker` is appended LAST;
+    both are load-bearing — the banner sets review expectations, and
+    `extract_signature` reads the LAST marker, so appending the authoritative
+    marker AFTER the model-authored body keeps the ledger key un-spoofable even
+    if the body embeds a marker-shaped comment. The verifier's rationale is
+    retained as a secondary, collapsed `<details>` section under the ELI-5.
+
+    Falls back to the original template (banner + `## Verifier rationale` +
+    marker) when `eli5_body` is empty or does not lead with an ELI-5 heading (a
+    builder bail, an empty/oversized file zeroed upstream, or a malformed body) —
+    it never returns an empty-body PR.
+    """
+    marker = signature_marker(signature)
+    body = (eli5_body or "").strip()
+    rationale = (verifier_rationale or "").strip()
+    if body and _leads_with_eli5(body):
+        rationale_section = (
+            "<details>\n<summary><strong>Verifier rationale</strong></summary>\n\n"
+            f"{rationale}\n\n</details>"
+        )
+        return f"{banner}\n\n{body}\n\n{rationale_section}\n\n{marker}\n"
+    return f"{banner}\n\n## Verifier rationale\n\n{rationale}\n\n{marker}\n"
+
+
 def normalize_signature(signature) -> str:
     """Canonicalize a signature for use as a ledger key.
 
