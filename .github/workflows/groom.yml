@@ -463,8 +463,21 @@ jobs:
           # `run:` step source that file, i.e. arbitrary shell OUTSIDE this
           # allowlist. The agent inherits this step's env, so the paths are simply
           # removed from the child process rather than left for it to find.
+          # -u RUNNER_TEMP additionally hides the file-command FILES themselves (under
+          # $RUNNER_TEMP/_runner_file_commands/) from the allowlisted ls/Glob — the
+          # -u GITHUB_* above only removed the pointer vars, not the files they named.
+          # GIT_CONFIG_GLOBAL=/dev/null + GIT_CONFIG_SYSTEM=/dev/null: cwd is the
+          # untrusted clone whose .git is locked read-only, but Write can still create
+          # ~/.gitconfig or $XDG_CONFIG_HOME/git/config OUTSIDE it, where an injected
+          # `[diff] external=<cmd>` / `core.fsmonitor=<cmd>` would execute from the
+          # allowlisted git show/log/diff. Pointing git at /dev/null for BOTH global
+          # and system config makes any such file inert (the clone's LOCAL config is
+          # still read, so repo git ops are unaffected). A structural close of this
+          # whole read-the-runner-FS class — a sandboxed agent step with a scrubbed
+          # env — is the tracked gate before groom runs on any untrusted repo.
           STATUS=0
-          env -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_OUTPUT -u GITHUB_STATE -u GITHUB_STEP_SUMMARY \
+          env -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_OUTPUT -u GITHUB_STATE -u GITHUB_STEP_SUMMARY -u RUNNER_TEMP \
+            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
           claude -p "$PROMPT" \
             --model "$MODEL" \
             --max-turns 150 \
@@ -473,6 +486,18 @@ jobs:
             --setting-sources "" \
             --strict-mcp-config \
             --output-format json > /tmp/groom-finder-exec.json || STATUS=$?
+          # Pre-publish secret scan: the agent can read $ANTHROPIC_API_KEY (e.g.
+          # `cat /proc/self/environ`) and its PRIMARY output ($FINDER_OUT, filed
+          # verbatim as public GitHub issues) is model-authored. Fail closed if the
+          # literal key lands there. Deterministic against the literal value only —
+          # base64/split obfuscation defeats it; the structural close (key out of the
+          # agent env via a sandboxed step/broker) is the tracked pre-untrusted-repo
+          # gate. Runs regardless of $STATUS — a partial/aborted output can carry it.
+          if [ -n "${ANTHROPIC_API_KEY:-}" ] && [ -f "$FINDER_OUT" ] \
+             && LC_ALL=C grep -qF -- "$ANTHROPIC_API_KEY" "$FINDER_OUT"; then
+            echo "::error::finder output contains ANTHROPIC_API_KEY — refusing to publish (possible prompt-injection exfil)."
+            rm -f "$FINDER_OUT"; STATUS=1
+          fi
           # Do NOT swallow a non-zero exit: a rate-limit/network/turn-exhaustion
           # failure must fail the job loudly. Swallowing it made the run green and
           # silently discarded the finder's real candidates. The diagnostics upload
@@ -514,14 +539,26 @@ jobs:
           # skipped and the `if: always()` upload would publish the ATTACKER's file
           # as a public artifact. Removing it first makes "no valid raw output" mean
           # "no artifact", never "whatever was already sitting there".
-          rm -f /tmp/groom-finder-diag.json
+          rm -rf /tmp/groom-finder-diag.json
           # Written only when there is something to report, so upload-artifact's
           # `if-no-files-found: warn` can actually fire on a starved run.
           if [ -s "$RAW" ] && jq -e . "$RAW" >/dev/null 2>&1; then
             jq '{
-              type, subtype, is_error, api_error_status, terminal_reason,
-              stop_reason, num_turns, session_id,
-              duration_ms, duration_api_ms, total_cost_usd,
+              # Type/format-guard every copied field: $RAW is in /tmp, which the
+              # agent Write reaches, so a prompt-injected agent can forge it with the
+              # model key smuggled into a free-form field. Each shape below (lowercase
+              # enum, hex session id, number, boolean) CANNOT hold the key value.
+              type:            (.type             | if type=="string" and test("^[a-z][a-z0-9_.]{0,39}$") then . else null end),
+              subtype:         (.subtype          | if type=="string" and test("^[a-z][a-z0-9_.]{0,39}$") then . else null end),
+              is_error:        (.is_error         | if type=="boolean" then . else null end),
+              api_error_status:(.api_error_status | if type=="string" and test("^[a-z][a-z0-9_.]{0,39}$") then . else null end),
+              terminal_reason: (.terminal_reason  | if type=="string" and test("^[a-z][a-z0-9_.]{0,39}$") then . else null end),
+              stop_reason:     (.stop_reason      | if type=="string" and test("^[a-z][a-z0-9_.]{0,39}$") then . else null end),
+              num_turns:       (.num_turns        | if type=="number" then . else null end),
+              session_id:      (.session_id       | if type=="string" and test("^[0-9a-fA-F-]{8,64}$") then . else null end),
+              duration_ms:     (.duration_ms      | if type=="number" then . else null end),
+              duration_api_ms: (.duration_api_ms  | if type=="number" then . else null end),
+              total_cost_usd:  (.total_cost_usd   | if type=="number" then . else null end),
               denials_by_tool: ((.permission_denials // []) | group_by(.tool_name)
                 | map({
                     tool: ((.[0].tool_name // "" | tostring)
@@ -683,7 +720,8 @@ jobs:
           # env so it cannot write $GITHUB_ENV (BASH_ENV = arbitrary shell in a
           # later step, outside this allowlist). See the finder job for the note.
           STATUS=0
-          env -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_OUTPUT -u GITHUB_STATE -u GITHUB_STEP_SUMMARY \
+          env -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_OUTPUT -u GITHUB_STATE -u GITHUB_STEP_SUMMARY -u RUNNER_TEMP \
+            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
           claude -p "$PROMPT" \
             --model "$MODEL" \
             --max-turns 150 \
@@ -692,6 +730,14 @@ jobs:
             --setting-sources "" \
             --strict-mcp-config \
             --output-format json > /tmp/groom-verifier-exec.json || STATUS=$?
+          # Pre-publish secret scan (see the finder job): $VERIFIER_OUT is filed
+          # verbatim as public issues and the agent can read $ANTHROPIC_API_KEY. Fail
+          # closed on the literal key. Structural close (sandbox/broker) tracked.
+          if [ -n "${ANTHROPIC_API_KEY:-}" ] && [ -f "$VERIFIER_OUT" ] \
+             && LC_ALL=C grep -qF -- "$ANTHROPIC_API_KEY" "$VERIFIER_OUT"; then
+            echo "::error::verifier output contains ANTHROPIC_API_KEY — refusing to publish (possible prompt-injection exfil)."
+            rm -f "$VERIFIER_OUT"; STATUS=1
+          fi
           # Fail loudly rather than letting the validate step below read the
           # missing output as "no findings" and keep the run green — that silently
           # discards the finder's real candidates. See the finder job.
@@ -717,12 +763,24 @@ jobs:
           RAW=/tmp/groom-verifier-exec.json
           # Drop any pre-existing DIAG first — the agent's Write reaches /tmp and
           # could have planted a key-bearing file at this path. See the finder job.
-          rm -f /tmp/groom-verifier-diag.json
+          rm -rf /tmp/groom-verifier-diag.json
           if [ -s "$RAW" ] && jq -e . "$RAW" >/dev/null 2>&1; then
             jq '{
-              type, subtype, is_error, api_error_status, terminal_reason,
-              stop_reason, num_turns, session_id,
-              duration_ms, duration_api_ms, total_cost_usd,
+              # Type/format-guard every copied field: $RAW is in /tmp, which the
+              # agent Write reaches, so a prompt-injected agent can forge it with the
+              # model key smuggled into a free-form field. Each shape below (lowercase
+              # enum, hex session id, number, boolean) CANNOT hold the key value.
+              type:            (.type             | if type=="string" and test("^[a-z][a-z0-9_.]{0,39}$") then . else null end),
+              subtype:         (.subtype          | if type=="string" and test("^[a-z][a-z0-9_.]{0,39}$") then . else null end),
+              is_error:        (.is_error         | if type=="boolean" then . else null end),
+              api_error_status:(.api_error_status | if type=="string" and test("^[a-z][a-z0-9_.]{0,39}$") then . else null end),
+              terminal_reason: (.terminal_reason  | if type=="string" and test("^[a-z][a-z0-9_.]{0,39}$") then . else null end),
+              stop_reason:     (.stop_reason      | if type=="string" and test("^[a-z][a-z0-9_.]{0,39}$") then . else null end),
+              num_turns:       (.num_turns        | if type=="number" then . else null end),
+              session_id:      (.session_id       | if type=="string" and test("^[0-9a-fA-F-]{8,64}$") then . else null end),
+              duration_ms:     (.duration_ms      | if type=="number" then . else null end),
+              duration_api_ms: (.duration_api_ms  | if type=="number" then . else null end),
+              total_cost_usd:  (.total_cost_usd   | if type=="number" then . else null end),
               denials_by_tool: ((.permission_denials // []) | group_by(.tool_name)
                 | map({
                     tool: ((.[0].tool_name // "" | tostring)
@@ -761,6 +819,16 @@ jobs:
           # and still exits 0 with have_findings=false below.
           if [ ! -s "$VERIFIER_OUT" ] || ! jq -e . "$VERIFIER_OUT" >/dev/null 2>&1; then
             echo "::error::Verifier did not produce valid JSON at $VERIFIER_OUT — failing rather than silently filing nothing. See the groom-verifier-exec artifact for subtype/num_turns."
+            exit 1
+          fi
+          # Parseable-but-schema-invalid output ({} or {"findings": "x"}) must ALSO
+          # hard-fail: otherwise the `.findings[]?` iteration below yields zero
+          # survivors and silently discards every finder candidate while the run stays
+          # green — the exact silent-discard this step exists to prevent. Require
+          # `findings` to be an array. ({"findings": []} is a legitimate "nothing
+          # survived" verdict and still passes — an empty array is an array.)
+          if ! jq -e '(.findings | type) == "array"' "$VERIFIER_OUT" >/dev/null 2>&1; then
+            echo "::error::Verifier output at $VERIFIER_OUT lacks a 'findings' array (schema-invalid) — failing rather than silently filing nothing."
             exit 1
           fi
           # Only CONFIRM/DOWNGRADE survive to filing (REJECT is dropped).
@@ -1238,7 +1306,8 @@ jobs:
           # target $GITHUB_ENV to set BASH_ENV and run arbitrary shell in a later
           # step, escaping this allowlist entirely. See the finder job.
           STATUS=0
-          env -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_OUTPUT -u GITHUB_STATE -u GITHUB_STEP_SUMMARY \
+          env -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_OUTPUT -u GITHUB_STATE -u GITHUB_STEP_SUMMARY -u RUNNER_TEMP \
+            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
           claude -p "$PROMPT" \
             --model "$MODEL" \
             --max-turns 100 \
@@ -1273,12 +1342,24 @@ jobs:
           RAW=/tmp/groom-builder-exec.json
           # Drop any pre-existing DIAG first — the agent's Write reaches /tmp and
           # could have planted a key-bearing file at this path. See the finder job.
-          rm -f /tmp/groom-builder-diag.json
+          rm -rf /tmp/groom-builder-diag.json
           if [ -s "$RAW" ] && jq -e . "$RAW" >/dev/null 2>&1; then
             jq '{
-              type, subtype, is_error, api_error_status, terminal_reason,
-              stop_reason, num_turns, session_id,
-              duration_ms, duration_api_ms, total_cost_usd,
+              # Type/format-guard every copied field: $RAW is in /tmp, which the
+              # agent Write reaches, so a prompt-injected agent can forge it with the
+              # model key smuggled into a free-form field. Each shape below (lowercase
+              # enum, hex session id, number, boolean) CANNOT hold the key value.
+              type:            (.type             | if type=="string" and test("^[a-z][a-z0-9_.]{0,39}$") then . else null end),
+              subtype:         (.subtype          | if type=="string" and test("^[a-z][a-z0-9_.]{0,39}$") then . else null end),
+              is_error:        (.is_error         | if type=="boolean" then . else null end),
+              api_error_status:(.api_error_status | if type=="string" and test("^[a-z][a-z0-9_.]{0,39}$") then . else null end),
+              terminal_reason: (.terminal_reason  | if type=="string" and test("^[a-z][a-z0-9_.]{0,39}$") then . else null end),
+              stop_reason:     (.stop_reason      | if type=="string" and test("^[a-z][a-z0-9_.]{0,39}$") then . else null end),
+              num_turns:       (.num_turns        | if type=="number" then . else null end),
+              session_id:      (.session_id       | if type=="string" and test("^[0-9a-fA-F-]{8,64}$") then . else null end),
+              duration_ms:     (.duration_ms      | if type=="number" then . else null end),
+              duration_api_ms: (.duration_api_ms  | if type=="number" then . else null end),
+              total_cost_usd:  (.total_cost_usd   | if type=="number" then . else null end),
               denials_by_tool: ((.permission_denials // []) | group_by(.tool_name)
                 | map({
                     tool: ((.[0].tool_name // "" | tostring)
@@ -1305,6 +1386,10 @@ jobs:
         env:
           IDX: ${{ matrix.idx }}
           PR_SIZE_LIMIT: ${{ inputs.pr_size_limit }}
+          # Present ONLY to scan the patch for the literal key before it becomes a
+          # public PR (471). This step runs NO agent, so holding the key here adds no
+          # exfil surface — the risk is an AGENT reading it, and there is none here.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           set -euo pipefail
           mkdir -p /tmp/out
@@ -1318,6 +1403,14 @@ jobs:
           # Stage everything the agent touched (incl. new files) and diff it.
           git -C repo add -A
           git -C repo diff --cached > /tmp/out/patch.diff || true
+          # Pre-publish secret scan (471): the patch becomes a public PR and is
+          # model-authored, and the builder could read $ANTHROPIC_API_KEY. Fail closed
+          # if the literal key is in the diff (deterministic vs the literal value;
+          # base64/split defeats it — the sandbox/broker is the structural gate).
+          if [ -n "${ANTHROPIC_API_KEY:-}" ] && LC_ALL=C grep -qF -- "$ANTHROPIC_API_KEY" /tmp/out/patch.diff; then
+            echo "::error::builder patch contains ANTHROPIC_API_KEY — refusing to open a PR (possible prompt-injection exfil)."
+            exit 1
+          fi
           CHANGED=$(git -C repo diff --cached --numstat | awk '{a+=($1=="-"?0:$1); d+=($2=="-"?0:$2)} END{print a+d+0}')
           # Path policy: a patch touching `.github/workflows/` would, on the
           # same-repo branch push, run in CI with repository secrets + a writable
@@ -1327,10 +1420,10 @@ jobs:
           # patch and file an issue so a human authors the workflow change.
           #
           # KNOWN GAP — read this BEFORE setting `builder: true` on any caller.
-          # This policy enumerates ONE CI-privileged path. Other checked-in files
-          # also execute in that pre-review CI — `package.json` scripts,
-          # `Makefile`, `conftest.py`/tox/pytest config, and composite actions
-          # under `.github/actions/` — so the same "runs with secrets before a
+          # This policy blocks the workflow + composite-action paths
+          # (`.github/workflows/`, `.github/actions/`). Other checked-in files also
+          # execute in that pre-review CI — `package.json` scripts, `Makefile`, and
+          # `conftest.py`/tox/pytest config — so the same "runs with secrets before a
           # human reads the diff" window exists for them. Not fixed here because
           # the right path list is target-repo-specific (a repo whose CI never
           # runs npm scripts should not have `package.json` blocked, and
@@ -1338,7 +1431,11 @@ jobs:
           # that needs a human call on policy, not a blind widening of this grep.
           # The exposure is currently latent: `builder` defaults to false and no
           # caller enables it. Widen this policy as a precondition of enabling it.
-          TOUCHED_WF=$(git -C repo diff --cached --name-only | grep -E '^\.github/workflows/' || true)
+          # -c core.quotePath=false: with the default (true) git QUOTES paths with
+          # special bytes (e.g. `.github/workflows/ev"il.yml`), so the anchored grep
+          # would miss them and let the workflow file through. `.github/actions/` is
+          # covered too — composite actions run in the same pre-review credentialed CI.
+          TOUCHED_WF=$(git -C repo -c core.quotePath=false diff --cached --name-only | grep -E '^\.github/(workflows|actions)/' || true)
 
           bail() {
             printf '{"status":"bail","reason":%s}\n' "$(jq -Rn --arg r "$1" '$r')" > /tmp/out/result.json
@@ -1349,7 +1446,7 @@ jobs:
             bail "${SUMMARY:-builder produced no patch}"
           elif [ -n "$TOUCHED_WF" ]; then
             echo "::warning::Build $IDX patch edits workflow file(s) [$(echo "$TOUCHED_WF" | tr '\n' ' ')] — refusing to auto-open a PR that would run in credentialed CI before human review; filing an issue instead."
-            bail "patch modifies .github/workflows/ (CI-privileged path) — a human must author workflow changes"
+            bail "patch modifies .github/workflows/ or .github/actions/ (CI-privileged path) — a human must author these changes"
           elif [ "$CHANGED" -gt "$PR_SIZE_LIMIT" ]; then
             echo "::warning::Build $IDX patch changed $CHANGED lines (> $PR_SIZE_LIMIT) — filing an issue instead of a giant PR."
             bail "patch too large: ${CHANGED} lines changed (> ${PR_SIZE_LIMIT})"
