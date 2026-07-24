@@ -1565,13 +1565,26 @@ jobs:
           #       anchor; `-z` emits raw bytes so patch_policy.py sees the true path.
           # $GROOM_ASSETS already points into the _groom_assets checkout (workflow
           # env, same var the prompt-build steps use).
-          TOUCHED_CI=$(git -C repo diff --cached --name-only -z | python3 "$GROOM_ASSETS/patch_policy.py" || true)
+          # NO `|| true`: patch_policy.py always exits 0 on success (a no-match is
+          # empty output, not a nonzero exit, unlike the old `grep`), so `|| true`
+          # would only mask a REAL failure (missing $GROOM_ASSETS, wrong path, bad
+          # interpreter, uncaught exception). Under this step's `set -euo pipefail`,
+          # letting such a failure abort the step fails CLOSED — no PR is opened when
+          # the gate can't run — instead of fail-open (empty TOUCHED_CI => PR opened).
+          TOUCHED_CI=$(git -C repo diff --cached --name-only -z | python3 "$GROOM_ASSETS/patch_policy.py")
 
           if [ "$STATUS" != "patched" ] || [ ! -s /tmp/out/patch.diff ]; then
             echo "Build $IDX produced no patch (status=$STATUS) — will file as an issue."
             bail "${SUMMARY:-builder produced no patch}"
           elif [ -n "$TOUCHED_CI" ]; then
-            echo "::warning::Build $IDX patch edits CI-privileged file(s) [$(echo "$TOUCHED_CI" | tr '\n' ' ')] — refusing to auto-open a PR that would run in credentialed CI before human review; filing an issue instead."
+            # Strip control bytes before interpolating attacker-influenced paths into
+            # a workflow-command line: `tr '\n' ' '` alone leaves CR (and other C0
+            # controls) intact, and the Actions runner treats a bare `\r` as a line
+            # terminator — a denied path named `…\r::stop-commands::…` would inject
+            # arbitrary workflow commands. `tr -d '\000-\037'` drops all C0 controls
+            # (newlines are already spaces by then); this line is human-readable only,
+            # the authoritative deny already happened above.
+            echo "::warning::Build $IDX patch edits CI-privileged file(s) [$(echo "$TOUCHED_CI" | tr '\n' ' ' | tr -d '\000-\037')] — refusing to auto-open a PR that would run in credentialed CI before human review; filing an issue instead."
             bail "patch modifies a CI-privileged path (per .github/groom/patch_policy.py — workflow/action defs, lockfiles, or build/test config that executes in pre-review CI) — a human must author these changes"
           elif [ "$CHANGED" -gt "$PR_SIZE_LIMIT" ]; then
             echo "::warning::Build $IDX patch changed $CHANGED lines (> $PR_SIZE_LIMIT) — filing an issue instead of a giant PR."

@@ -115,11 +115,15 @@ class AddedPatternsTest(unittest.TestCase):
             "settings.gradle",
             "gradle/wrapper/gradle-wrapper.properties",
             "android/gradle/wrapper/gradle-wrapper.jar",
+            # Wrapper scripts CI runs via `./gradlew` — root, no extension.
+            "gradlew",
+            "gradlew.bat",
+            "android/gradlew",
         ):
             self.assertTrue(denied(p), p)
 
     def test_ruby(self):
-        for p in ("Gemfile", "Rakefile", "myproj.gemspec", "gems/foo.gemspec"):
+        for p in ("Gemfile", "Rakefile", "rakefile", "myproj.gemspec", "gems/foo.gemspec"):
             self.assertTrue(denied(p), p)
 
     def test_cmake_and_bazel(self):
@@ -137,8 +141,99 @@ class AddedPatternsTest(unittest.TestCase):
             self.assertTrue(denied(p), p)
 
     def test_task_runners(self):
-        for p in ("Jenkinsfile", "Taskfile.yml", "justfile", "Justfile", "ci/Jenkinsfile"):
+        for p in (
+            "Jenkinsfile",
+            "Taskfile.yml",
+            "Taskfile.yaml",
+            "taskfile.yml",
+            "taskfile.yaml",
+            "justfile",
+            "Justfile",
+            "ci/Jenkinsfile",
+        ):
             self.assertTrue(denied(p), p)
+
+
+class PanelHardeningTest(unittest.TestCase):
+    """Under-blocks closed after the BE-4404 cursor-review panel — each an
+    executed-in-pre-review-CI surface the conservative default first missed."""
+
+    def test_lowercase_makefile(self):
+        # GNU Make prefers lowercase `makefile` over `Makefile`.
+        for p in ("makefile", "sub/makefile"):
+            self.assertTrue(denied(p), p)
+
+    def test_go_modules(self):
+        for p in ("go.mod", "go.sum", "go.work", "go.work.sum", "svc/api/go.mod"):
+            self.assertTrue(denied(p), p)
+
+    def test_dockerfile_variants(self):
+        for p in (
+            "Dockerfile",           # plain (regression guard)
+            "Dockerfile.prod",      # suffix form
+            "Dockerfile.dev",
+            "prod.Dockerfile",      # extension form
+            "docker/api.Dockerfile",
+        ):
+            self.assertTrue(denied(p), p)
+
+    def test_cargo_config(self):
+        for p in (".cargo/config.toml", ".cargo/config", "sub/.cargo/config.toml"):
+            self.assertTrue(denied(p), p)
+
+    def test_swift_and_pnpm_extras(self):
+        for p in ("Package.resolved", "ios/Package.resolved", ".pnpmfile.cjs", "app/.pnpmfile.cjs"):
+            self.assertTrue(denied(p), p)
+
+    def test_case_insensitive_on_case_insensitive_runners(self):
+        # macOS/Windows CI checks out `PACKAGE.JSON` as the real `package.json`.
+        for p in ("PACKAGE.JSON", "MAKEFILE", "DOCKERFILE", "sub/Package-Lock.JSON"):
+            self.assertTrue(denied(p), p)
+
+
+class ApiGuardTest(unittest.TestCase):
+    """`denied_paths` must reject a bare str/bytes (a silent character-iteration footgun)."""
+
+    def test_bare_str_raises(self):
+        with self.assertRaises(TypeError):
+            policy.denied_paths("package.json")
+
+    def test_bare_bytes_raises(self):
+        with self.assertRaises(TypeError):
+            policy.denied_paths(b"package.json")
+
+    def test_list_is_accepted(self):
+        self.assertEqual(policy.denied_paths(["package.json"]), ["package.json"])
+
+
+class MainStdoutTest(unittest.TestCase):
+    """`main()` must emit a non-UTF-8 denied path without crashing (surrogateescape)."""
+
+    def test_non_utf8_denied_path_is_emitted_not_crashed(self):
+        import io
+
+        # A denied path (package.json) whose DIRECTORY segment carries a raw non-UTF-8
+        # byte (0xff) — the basename still anchors, so it is denied. git -z emits it
+        # verbatim; parse_nul_delimited holds the byte as a lone surrogate.
+        raw = b"p\xffkg/package.json\x00package.json\x00"
+        stdin = io.BytesIO(raw)
+        stdout_buf = io.BytesIO()
+
+        class _Stdin:
+            buffer = stdin
+
+        class _Stdout:
+            buffer = stdout_buf
+
+        orig_in, orig_out = policy.sys.stdin, policy.sys.stdout
+        try:
+            policy.sys.stdin, policy.sys.stdout = _Stdin(), _Stdout()
+            rc = policy.main()
+        finally:
+            policy.sys.stdin, policy.sys.stdout = orig_in, orig_out
+        self.assertEqual(rc, 0)
+        # Both paths denied; the non-UTF-8 one survives round-trip as raw bytes.
+        self.assertEqual(stdout_buf.getvalue(), b"p\xffkg/package.json\npackage.json\n")
 
 
 class NegativeCasesTest(unittest.TestCase):
@@ -158,12 +253,12 @@ class NegativeCasesTest(unittest.TestCase):
         # The ticket's named anchoring regressions, plus a few more.
         for p in (
             "packages.json",      # not package.json
-            "Dockerfile.md",      # not Dockerfile
             "mypackage.json",     # not package.json
-            "app/gradlew",        # not *.gradle
             "BUILD.md",           # not BUILD / BUILD.bazel
             "myrequirements.txt",  # requirements* glob is basename-anchored
             "notpyproject.toml",  # not pyproject.toml
+            "gocode/foo.go",       # a .go source file is not go.mod/go.sum
+            "cargofile.toml",      # not the `.cargo/config.toml` path suffix
         ):
             self.assertFalse(denied(p), p)
 

@@ -65,6 +65,8 @@ _BASENAMES = (
     "package.json",
     "Makefile",
     "GNUmakefile",
+    "makefile",  # GNU Make searches GNUmakefile, makefile, Makefile — and PREFERS
+    #              lowercase `makefile` over `Makefile`, so it must be denied too.
     "conftest.py",
     "noxfile.py",
     "tox.ini",
@@ -101,6 +103,7 @@ _BASENAMES = (
     "settings.gradle",  # also covered by the *.gradle glob; explicit for clarity
     "Gemfile",
     "Rakefile",
+    "rakefile",  # `rake` accepts the lowercase form too.
     "CMakeLists.txt",
     "WORKSPACE",
     "WORKSPACE.bazel",
@@ -108,8 +111,33 @@ _BASENAMES = (
     "BUILD.bazel",
     "Jenkinsfile",
     "Taskfile.yml",
+    "Taskfile.yaml",
+    "taskfile.yml",  # go-task also loads the lowercase spellings.
+    "taskfile.yaml",
     "justfile",
     "Justfile",
+    # Gradle wrapper scripts: Gradle CI invokes `./gradlew` (or `gradlew.bat` on
+    # Windows) directly, so an edited wrapper runs arbitrary code. These are at the
+    # repo root with no extension, so the `*.gradle` glob and `gradle/wrapper/`
+    # segment (which cover the jar/properties) do NOT reach them — deny by name.
+    "gradlew",
+    "gradlew.bat",
+    # Go: `go build`/`go test` in CI re-fetch modules from these; a `replace`
+    # directive in go.mod can redirect a dependency to attacker-controlled code.
+    "go.mod",
+    "go.sum",
+    "go.work",
+    "go.work.sum",
+    "Package.resolved",  # SwiftPM pins resolved from this on `swift build`.
+    ".pnpmfile.cjs",     # pnpm executes this hook during install.
+)
+
+# Path suffixes anchored on a full segment boundary (basenames won't do — these
+# carry a directory component). `.cargo/config[.toml]` can set a build `runner` or
+# linker that executes during `cargo build`/`cargo test` in pre-review CI.
+_PATH_SUFFIXES = (
+    r"\.cargo/config\.toml",
+    r"\.cargo/config",
 )
 
 # Basename globs (`*` = any run of non-`/` chars), privileged at ANY depth.
@@ -121,6 +149,12 @@ _BASENAME_GLOBS = (
     "*.gemspec",
     "*.cmake",
     "*.bzl",
+    # Multi-Dockerfile conventions CI builds via `docker build -f`: the
+    # `Dockerfile.<tag>` suffix form (Dockerfile.prod) and the `<tag>.Dockerfile`
+    # extension form (prod.Dockerfile). `Dockerfile*` also over-catches
+    # `Dockerfile.md`-style docs — a safe over-block (downgrades to an issue).
+    "Dockerfile*",
+    "*.Dockerfile",
 )
 
 
@@ -129,13 +163,22 @@ def _glob_to_regex(glob: str) -> str:
     return re.escape(glob).replace(r"\*", r"[^/]*")
 
 
+# IGNORECASE: macOS and Windows CI runners use case-INSENSITIVE filesystems, so a
+# builder can commit `PACKAGE.JSON` / `MAKEFILE` / `DOCKERFILE` which a
+# case-sensitive Linux checker would miss but which resolves to the real,
+# CI-executed file once checked out on the runner. The policy explicitly targets
+# Swift/Xcode (macOS) callers, so match case-insensitively. This also over-blocks
+# some lowercase near-collisions (e.g. a file literally named `build`) — the safe
+# direction per the module contract (over-block only downgrades a PR to an issue).
 _PATTERN = re.compile(
     "|".join(
         [rf"^{p}" for p in _ROOT_PREFIXES]
         + [rf"(?:^|/){p}" for p in _SEGMENT_PREFIXES]
         + [rf"(?:^|/){re.escape(b)}$" for b in _BASENAMES]
         + [rf"(?:^|/){_glob_to_regex(g)}$" for g in _BASENAME_GLOBS]
-    )
+        + [rf"(?:^|/){s}$" for s in _PATH_SUFFIXES]
+    ),
+    re.IGNORECASE,
 )
 
 
@@ -149,6 +192,10 @@ def _is_denied(path: str) -> bool:
 
 def denied_paths(paths: Iterable[str]) -> list[str]:
     """Return the subset of `paths` that touch a CI-privileged surface."""
+    # A bare `str` is iterable; without this guard a caller that passes one path as
+    # a string would iterate its characters and silently under-block. Fail loud.
+    if isinstance(paths, (str, bytes)):
+        raise TypeError("denied_paths expects an iterable of paths, not a single str/bytes")
     return [p for p in paths if _is_denied(p)]
 
 
@@ -163,8 +210,15 @@ def parse_nul_delimited(data: bytes) -> list[str]:
 
 
 def main() -> int:
+    # Write raw bytes, not text: `parse_nul_delimited` decodes with `surrogateescape`,
+    # so a denied path carrying non-UTF-8 bytes holds lone surrogates that the default
+    # strict `sys.stdout` (text) would reject with UnicodeEncodeError — crashing on the
+    # very path we must report. Round-trip through the same codec so a non-UTF-8
+    # CI-privileged path is still emitted (and thus still blocked), never dropped.
+    out = sys.stdout.buffer
     for path in denied_paths(parse_nul_delimited(sys.stdin.buffer.read())):
-        sys.stdout.write(path + "\n")
+        out.write(path.encode("utf-8", "surrogateescape") + b"\n")
+    out.flush()
     return 0
 
 

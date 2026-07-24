@@ -196,8 +196,9 @@ patterns that decide this were an untestable inline `grep -E`; `patch_policy.py`
 extracts them so they carry a unit-test suite, and closes the biggest live gap
 (dependency **lockfiles** — `npm ci` re-resolves and runs their tarballs' install
 scripts) plus `.husky/`, composite-action manifests, `.gitmodules`, and the
-common build files across the JS/Python/Rust/Ruby/Swift/Gradle/Bazel/CMake
-ecosystems.
+common build files across the JS/Python/Rust/Ruby/Swift/Go/Gradle/Bazel/CMake
+ecosystems. Matching is **case-insensitive** — macOS/Windows CI runners resolve
+`PACKAGE.JSON` to the real file, so the Linux checker must too.
 
 - `denied_paths(paths)` returns the CI-privileged subset of the changed paths.
 - `main()` reads NUL-delimited paths from stdin (matching `git diff --cached
