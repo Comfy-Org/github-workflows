@@ -44,7 +44,10 @@ const server = http.createServer((req, res) => {
   }
 
   // Only the Messages/Anthropic API surface is proxied; everything else is denied.
-  if (!req.url.startsWith('/v1/')) {
+  // Reject dot-segments too: a raw target like `/v1/../v2/foo` passes a bare
+  // prefix check yet normalizes to a non-/v1 route upstream, so fail it closed.
+  const reqPath = req.url.split('?')[0];
+  if (!req.url.startsWith('/v1/') || reqPath.includes('..')) {
     console.log(`${req.method} ${req.url} 404`);
     res.writeHead(404, { 'content-type': 'text/plain' });
     res.end('not found\n');
@@ -75,8 +78,16 @@ const server = http.createServer((req, res) => {
 
   upstream.on('error', () => {
     console.log(`${req.method} ${req.url} 502`);
-    if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain' });
-    res.end('upstream error\n');
+    if (!res.headersSent) {
+      res.writeHead(502, { 'content-type': 'text/plain' });
+      res.end('upstream error\n');
+    } else {
+      // Response already began streaming (routine for SSE): a 502 body can't be
+      // sent anymore, and appending 'upstream error' here would splice stray
+      // bytes into the middle of the real body. Tear it down instead so the
+      // client sees a truncated stream rather than a corrupted one.
+      res.destroy();
+    }
   });
 
   // Don't let a hung upstream pin a request open forever; tear it down on idle.
@@ -87,6 +98,11 @@ const server = http.createServer((req, res) => {
   res.on('close', () => {
     if (!res.writableFinished) upstream.destroy();
   });
+  // .pipe() forwards neither errors nor a listener onto the client response, so a
+  // client socket error mid-stream (ECONNRESET, write-after-close) would emit an
+  // unhandled 'error' on res and take the whole broker down. Absorb it and tear
+  // down the upstream leg — same crash-proofing as the upRes/upstream handlers.
+  res.on('error', () => upstream.destroy());
   req.on('error', () => upstream.destroy());
 
   req.pipe(upstream); // forward the request body streaming too

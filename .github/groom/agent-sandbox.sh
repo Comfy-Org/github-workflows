@@ -114,10 +114,24 @@ main() {
 	esac
 	[[ -d "$clone" ]] || die "clone path is not a directory: $clone"
 
-	preflight
-
-	# out-dir must exist on the host before it can be bound rw into the jail.
+	# out-dir must exist on the host before it can be bound rw into the jail; create
+	# it here so we can canonicalize it for the overlap check below.
 	mkdir -p "$out_dir"
+
+	# The writable out-dir is bound LAST, and bwrap's last-bind-wins ordering means
+	# an out-dir that overlaps the clone would shadow the read-only clone/.git
+	# mounts and silently make protected content (including .git under rw-git-ro)
+	# writable — defeating the read-only contract. Canonicalize both and require
+	# them to be disjoint (neither equal nor an ancestor of the other). Fail here,
+	# before the (slow) preflight, so a bad invocation is rejected fast.
+	local clone_real out_real
+	clone_real="$(realpath "$clone")" || die "cannot resolve --clone path: $clone"
+	out_real="$(realpath "$out_dir")" || die "cannot resolve --out-dir path: $out_dir"
+	if [[ "$out_real" == "$clone_real" || "$out_real" == "$clone_real"/* || "$clone_real" == "$out_real"/* ]]; then
+		die "--out-dir must not overlap --clone (out-dir '$out_real' vs clone '$clone_real'): a writable bind over the clone would defeat its read-only mounts"
+	fi
+
+	preflight
 
 	local bwrap_args=(
 		--unshare-all --share-net --die-with-parent --new-session --clearenv

@@ -126,6 +126,24 @@ grep -q "builder patch" "$clone/patch-from-agent.txt" 2>/dev/null \
 	|| fail "rw-git-ro worktree write not visible on host"
 pass "clone rw-git-ro (worktree write captured on host, .git read-only)"
 
+# --- 3b. out-dir/clone overlap rejection -------------------------------------
+# The out-dir is bound rw LAST, so bwrap's last-wins ordering would let it shadow
+# the read-only clone/.git mounts if it overlapped them. The wrapper must reject
+# an out-dir equal to, inside, or an ancestor of the clone — failing loud before
+# it ever builds the jail. (This validation runs before preflight, so it holds
+# even on a host without bwrap.)
+
+if "$SANDBOX" --clone "$clone" --clone-mode ro --out-dir "$clone" -- true 2>/dev/null; then
+	fail "out-dir == clone was accepted (rw bind would un-protect the read-only clone)"
+fi
+if "$SANDBOX" --clone "$clone" --clone-mode ro --out-dir "$clone/nested/out" -- true 2>/dev/null; then
+	fail "out-dir inside clone was accepted (rw bind would shadow the read-only clone)"
+fi
+if "$SANDBOX" --clone "$clone/.git" --clone-mode ro --out-dir "$clone" -- true 2>/dev/null; then
+	fail "out-dir as an ancestor of clone was accepted (rw bind would shadow the read-only clone)"
+fi
+pass "out-dir/clone overlap rejected (equal, nested, and ancestor cases)"
+
 # --- 4. pid isolation --------------------------------------------------------
 
 sleep 300 &
@@ -182,6 +200,10 @@ if ! "$SANDBOX" --clone "$clone" --clone-mode ro --out-dir "$outdir" \
 	# non-/v1 path denied
 	code=$(curl -s -o /dev/null -w "%{http_code}" "$base/not-v1")
 	[ "$code" = "404" ] || { echo "non-/v1 not 404: $code"; exit 1; }
+	# dot-segment path denied (raw target, sent un-normalized via --path-as-is):
+	# a bare prefix check would pass "/v1/.." yet it normalizes off /v1 upstream.
+	code=$(curl -s --path-as-is -o /dev/null -w "%{http_code}" "$base/v1/../not-v1")
+	[ "$code" = "404" ] || { echo "dot-segment /v1/../ not 404: $code"; exit 1; }
 	# chunked/SSE response streams through intact
 	stream=$(curl -sN "$base/v1/stream")
 	echo "$stream" | grep -q "data: one" || { echo "sse frame one missing"; exit 1; }
@@ -190,5 +212,16 @@ if ! "$SANDBOX" --clone "$clone" --clone-mode ro --out-dir "$outdir" \
 	exit 0
 '; then fail "broker credential proxy"; fi
 pass "broker credential proxy (key injected+stripped, healthz local, non-/v1 404, SSE streams)"
+
+# --- 6. broker crash-resilience: client disconnect mid-stream ----------------
+# .pipe() puts no error listener on the client response, so a client that drops
+# mid-SSE would emit an unhandled 'error' on res and kill the whole broker. Force
+# that: /v1/stream sends one frame, waits 50ms, then the rest — abort inside the
+# gap, then prove the broker is still serving.
+curl -sN --max-time 0.02 "http://127.0.0.1:$broker_port/v1/stream" >/dev/null 2>&1 || true
+sleep 0.2
+curl -fsS "http://127.0.0.1:$broker_port/healthz" >/dev/null 2>&1 \
+	|| fail "broker crashed after a client disconnected mid-stream"
+pass "broker crash-resilience (survives a client mid-stream disconnect)"
 
 echo "ALL SANDBOX TESTS PASSED"
