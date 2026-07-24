@@ -49,11 +49,13 @@ tests — run the matching command above for whatever you touched.
 - `.github/groom/` — briefs + building blocks behind the reusable **groom**
   code-cleanup workflow (`groom.yml`, epic BE-3870): `finder.md` / `verifier.md`
   / `builder.md` (the phase-1/2/3 prompts, single source of truth, loaded at run
-  time), and `ledger.py`, the durable dedup/rejection memory that stops the
+  time), `ledger.py`, the durable dedup/rejection memory that stops the
   stateless groom CI run from re-filing already-filed or human-rejected findings
   — and (BE-4003) recognizes auto-builder PR state (open/merged/closed) so a
-  built finding is never re-proposed. It uses GitHub issue+PR state as the store
-  — no new secret. Tests in `tests/`.
+  built finding is never re-proposed — and `interval.py`, the runtime cadence
+  gate (`GROOM_INTERVAL_DAYS`) that early-exits a daily tick unless the interval
+  has elapsed since the last real run (derived from Actions run history — no new
+  secret). Tests in `tests/`.
 - `.github/bump-callers/` — `bump-callers.sh`, the ONE fleet-agnostic script
   that opens SHA-bump PRs in consumer repos when a reusable workflow changes.
   Tests in `tests/`.
