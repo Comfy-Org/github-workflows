@@ -426,10 +426,9 @@ jobs:
           # `Bash(git show:*)` are PREFIX matches, so a prompt-injected agent could
           # otherwise reach a pager and execute an arbitrary command from a single
           # allowlisted invocation — with the model key in this step's env.
-          # (Deliberately NOT clearing global/system git config: `git config` is
-          # not allowlisted and untrusted repo CONTENT cannot set core.pager, so
-          # there is no attacker path there — while GIT_CONFIG_GLOBAL=/dev/null
-          # would mask the `safe.directory` actions/checkout writes globally.)
+          # (Global/system git config IS cleared, but on the `claude` child only —
+          # see the GIT_CONFIG_* note in the run script below, which also re-supplies
+          # the `safe.directory` allowance that clearing global config would mask.)
           GIT_PAGER: cat
           PAGER: cat
           # Passed via env, not interpolated into the script, so the prompt text
@@ -457,31 +456,47 @@ jobs:
           # environment (validated); the old 40 could not finish the brief at all.
           # `git grep` is deliberately NOT allowlisted: `--open-files-in-pager=<cmd>`
           # executes an arbitrary command. The Grep tool covers content search.
-          # `env -u GITHUB_*`: the runner's file-command channels are how a step
-          # talks to LATER steps. $GITHUB_ENV in particular is a write-to-execute
-          # primitive — a line like `BASH_ENV=/tmp/x` there makes every subsequent
-          # `run:` step source that file, i.e. arbitrary shell OUTSIDE this
-          # allowlist. The agent inherits this step's env, so the paths are simply
-          # removed from the child process rather than left for it to find.
-          # -u RUNNER_TEMP additionally hides the file-command FILES themselves (under
-          # $RUNNER_TEMP/_runner_file_commands/) from the allowlisted ls/Glob — the
-          # -u GITHUB_* above only removed the pointer vars, not the files they named.
-          # GIT_CONFIG_GLOBAL=/dev/null + GIT_CONFIG_SYSTEM=/dev/null: cwd is the
-          # untrusted clone whose .git is locked read-only, but Write can still create
-          # ~/.gitconfig or $XDG_CONFIG_HOME/git/config OUTSIDE it, where an injected
-          # `[diff] external=<cmd>` / `core.fsmonitor=<cmd>` would execute from the
-          # allowlisted git show/log/diff. Pointing git at /dev/null for BOTH global
-          # and system config makes any such file inert (the clone's LOCAL config is
-          # still read, so repo git ops are unaffected). A structural close of this
-          # whole read-the-runner-FS class — a sandboxed agent step with a scrubbed
-          # env — is the tracked gate before groom runs on any untrusted repo.
+          # `Edit(//<abs path>)` instead of a bare `Write` is the STRUCTURAL close of
+          # the whole write-somewhere-that-executes class. The finder's only write is
+          # $FINDER_OUT, so the write tools are scoped to exactly that one path. An
+          # unscoped `Write` reached the ENTIRE runner filesystem, and the read-only
+          # clone lock did not narrow it: $RUNNER_TEMP/_runner_file_commands/set_env_*
+          # (append `BASH_ENV=/tmp/x` → arbitrary shell in every later `run:` step),
+          # /home/runner/work/_actions/**/dist/index.js (overwrite an action's code),
+          # and ~/.gitconfig were all in reach. `env -u` cannot fix that: it removes
+          # the pointer VARS, never the files, whose paths are fixed and derivable.
+          # Verified empirically against the pinned 2.1.217, since the rule surface is
+          # version-specific: `Edit(//<abs>)` and `Edit(//<abs>/**)` govern BOTH the
+          # Write and the Edit tool (in-scope calls succeed — including creating a new
+          # file, and from a cwd elsewhere — while out-of-scope ones are refused and
+          # land in permission_denials), whereas `Write(<path>)` does NOT bind at all — a
+          # `Write(...)`-shaped rule denies every write, which would starve the agent.
+          # The Bash allowlist cannot route around it either: the Bash tool refuses
+          # output redirection outright (`cat x > y` is denied under `Bash(cat:*)`).
+          # `env -u GITHUB_*`: defense in depth on the same channel — the runner's
+          # file-command paths are how a step talks to LATER steps, and $GITHUB_ENV in
+          # particular is a write-to-execute primitive. Removing the vars means the
+          # agent cannot even name the target; the Edit scoping above is what actually
+          # denies the write. -u RUNNER_TEMP likewise only drops the pointer.
+          # GIT_CONFIG_GLOBAL=/dev/null + GIT_CONFIG_SYSTEM=/dev/null: belt-and-braces
+          # on the config route — an injected `[diff] external=<cmd>` /
+          # `core.fsmonitor=<cmd>` in ~/.gitconfig would execute from the allowlisted
+          # git show/log/diff. The clone's LOCAL config is still read, so repo git ops
+          # are unaffected. GIT_CONFIG_COUNT/KEY_0/VALUE_0 re-supplies the
+          # `safe.directory` allowance that actions/checkout writes to GLOBAL config —
+          # without it, clearing global config would make every allowlisted `git`
+          # command fail "dubious ownership" on any runner whose checkout owner differs
+          # from the step user (container/self-hosted), re-creating the BE-4214
+          # starvation this PR fixes. A sandboxed agent step with a scrubbed env is
+          # still the tracked gate before groom runs on any untrusted repo.
           STATUS=0
           env -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_OUTPUT -u GITHUB_STATE -u GITHUB_STEP_SUMMARY -u RUNNER_TEMP \
             GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*' \
           claude -p "$PROMPT" \
             --model "$MODEL" \
             --max-turns 150 \
-            --allowedTools "Read,Glob,Grep,Write,Bash(git log:*),Bash(git show:*),Bash(grep:*),Bash(cat:*),Bash(ls:*),Bash(head:*),Bash(tail:*),Bash(wc:*)" \
+            --allowedTools "Read,Glob,Grep,Edit(//${FINDER_OUT#/}),Bash(git log:*),Bash(git show:*),Bash(grep:*),Bash(cat:*),Bash(ls:*),Bash(head:*),Bash(tail:*),Bash(wc:*)" \
             --bare \
             --setting-sources "" \
             --strict-mcp-config \
@@ -561,8 +576,15 @@ jobs:
               total_cost_usd:  (.total_cost_usd   | if type=="number" then . else null end),
               denials_by_tool: ((.permission_denials // []) | group_by(.tool_name)
                 | map({
+                    # The tool NAME is model-influenced too — it is copied from $RAW,
+                    # which the agent Write reaches. A shape guard is not enough: any
+                    # 32-char base64url-ish string passes one, so the key could be
+                    # split across a handful of forged tool_name entries and
+                    # reassembled from the public artifact. Echo only names this
+                    # workflow actually grants; everything else collapses to a
+                    # constant, which cannot carry attacker bytes.
                     tool: ((.[0].tool_name // "" | tostring)
-                            | if test("^[A-Za-z][A-Za-z0-9_-]{0,31}$") then . else "(other)" end),
+                            | if IN("Read","Glob","Grep","Write","Edit","Bash") then . else "(other)" end),
                     count: length
                   }))
             }' "$RAW" > /tmp/groom-finder-diag.json
@@ -716,16 +738,20 @@ jobs:
           # TARGET repo's CLAUDE.md/AGENTS.md loading as trusted memory (which
           # --setting-sources does NOT cover). `git grep` is not allowlisted —
           # `--open-files-in-pager=<cmd>` is arbitrary execution. See the finder job.
-          # env -u GITHUB_*: strips the runner's file-command paths from the agent's
-          # env so it cannot write $GITHUB_ENV (BASH_ENV = arbitrary shell in a
-          # later step, outside this allowlist). See the finder job for the note.
+          # Edit(//$VERIFIER_OUT) instead of a bare `Write`: the verifier's only write
+          # is that one file, so the write tools are scoped to it. This is what
+          # actually denies a write to $RUNNER_TEMP/_runner_file_commands/set_env_*
+          # (BASH_ENV → arbitrary shell in a later step) or to a checked-out action's
+          # JS — `env -u` only removes the pointer VARS, not the files. See the
+          # finder job for the full note and the empirical verification.
           STATUS=0
           env -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_OUTPUT -u GITHUB_STATE -u GITHUB_STEP_SUMMARY -u RUNNER_TEMP \
             GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*' \
           claude -p "$PROMPT" \
             --model "$MODEL" \
             --max-turns 150 \
-            --allowedTools "Read,Glob,Grep,Write,Bash(git log:*),Bash(git show:*),Bash(grep:*),Bash(cat:*),Bash(ls:*),Bash(head:*),Bash(tail:*),Bash(wc:*)" \
+            --allowedTools "Read,Glob,Grep,Edit(//${VERIFIER_OUT#/}),Bash(git log:*),Bash(git show:*),Bash(grep:*),Bash(cat:*),Bash(ls:*),Bash(head:*),Bash(tail:*),Bash(wc:*)" \
             --bare \
             --setting-sources "" \
             --strict-mcp-config \
@@ -783,8 +809,15 @@ jobs:
               total_cost_usd:  (.total_cost_usd   | if type=="number" then . else null end),
               denials_by_tool: ((.permission_denials // []) | group_by(.tool_name)
                 | map({
+                    # The tool NAME is model-influenced too — it is copied from $RAW,
+                    # which the agent Write reaches. A shape guard is not enough: any
+                    # 32-char base64url-ish string passes one, so the key could be
+                    # split across a handful of forged tool_name entries and
+                    # reassembled from the public artifact. Echo only names this
+                    # workflow actually grants; everything else collapses to a
+                    # constant, which cannot carry attacker bytes.
                     tool: ((.[0].tool_name // "" | tostring)
-                            | if test("^[A-Za-z][A-Za-z0-9_-]{0,31}$") then . else "(other)" end),
+                            | if IN("Read","Glob","Grep","Write","Edit","Bash") then . else "(other)" end),
                     count: length
                   }))
             }' "$RAW" > /tmp/groom-verifier-diag.json
@@ -829,6 +862,30 @@ jobs:
           # survived" verdict and still passes — an empty array is an array.)
           if ! jq -e '(.findings | type) == "array"' "$VERIFIER_OUT" >/dev/null 2>&1; then
             echo "::error::Verifier output at $VERIFIER_OUT lacks a 'findings' array (schema-invalid) — failing rather than silently filing nothing."
+            exit 1
+          fi
+          # …and the ENTRIES must be well-formed too. `findings` being an array is not
+          # enough: a populated-but-malformed array like `[{}]` passes the type check
+          # above, contributes nothing to KEEP, and silently discards every finder
+          # candidate while the run stays green — the exact silent-discard this step
+          # exists to prevent. The other half is the opposite failure: a non-string
+          # `title`/`body` sails through here and crashes the downstream file job on
+          # `.strip()`, mid-batch, after earlier issues have already been filed.
+          # `title`/`body` are only required on the verdicts that actually get filed —
+          # a REJECT entry is dropped, so holding it to the filing schema would fail
+          # runs over a field nothing reads. `signature` is deliberately NOT required:
+          # the ledger already routes signatureless findings to `invalid` with a
+          # warning, and escalating that handled case to a hard failure would throw
+          # away every OTHER finding in the batch.
+          BAD=$(jq '[ .findings[]
+                      | select((type != "object")
+                               or ((.verdict? | type) != "string")
+                               or (((.verdict == "CONFIRM") or (.verdict == "DOWNGRADE"))
+                                   and (((.title? | type) != "string")
+                                        or ((.body? | type) != "string"))))
+                    ] | length' "$VERIFIER_OUT")
+          if [ "$BAD" -gt 0 ]; then
+            echo "::error::Verifier output at $VERIFIER_OUT has $BAD malformed finding(s) — each needs a string 'verdict', and CONFIRM/DOWNGRADE additionally a string 'title' and 'body'. Failing rather than silently discarding candidates or crashing the file job mid-batch."
             exit 1
           fi
           # Only CONFIRM/DOWNGRADE survive to filing (REJECT is dropped).
@@ -1301,17 +1358,27 @@ jobs:
           # --max-turns 100 (was 60): this single-finding task is narrower than the
           # finder's whole-repo sweep, but gets headroom now that git works — 100 turns
           # at the validated pace (~82 turns ≈ 12.3 min) fits the job's 30-min timeout.
-          # env -u GITHUB_*: strips the runner's file-command paths from the agent's
-          # env. Without it the builder's (necessarily broad) Write/Edit could
-          # target $GITHUB_ENV to set BASH_ENV and run arbitrary shell in a later
-          # step, escaping this allowlist entirely. See the finder job.
+          # The builder's writes are BROAD but not UNBOUNDED: it edits the worktree
+          # and writes $BUILDER_OUT, and nothing else. Scoping the write tools to
+          # exactly those two paths — rather than granting bare `Write,Edit` over the
+          # whole runner filesystem — is what keeps a prompt-injected builder off
+          # $RUNNER_TEMP/_runner_file_commands/set_env_* (append `BASH_ENV=/tmp/x` and
+          # every later `run:` step sources attacker shell, escaping this allowlist
+          # entirely), off /home/runner/work/_actions/**/dist/index.js, and off
+          # ~/.gitconfig. `env -u GITHUB_*` is defense in depth on the same channel: it
+          # removes the pointer VARS, but the files sit at fixed, derivable paths, so
+          # it was never the control that denied the write. `.git` stays chmod'd
+          # read-only under the glob below — two independent locks on the one part of
+          # the tree that is a code-execution primitive. See the finder job for the
+          # empirical verification of the rule syntax against the pinned CLI.
           STATUS=0
           env -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_OUTPUT -u GITHUB_STATE -u GITHUB_STEP_SUMMARY -u RUNNER_TEMP \
             GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*' \
           claude -p "$PROMPT" \
             --model "$MODEL" \
             --max-turns 100 \
-            --allowedTools "Read,Glob,Grep,Write,Edit,Bash(git diff:*),Bash(git status:*),Bash(git log:*),Bash(git show:*),Bash(grep:*),Bash(cat:*),Bash(ls:*),Bash(head:*),Bash(tail:*),Bash(wc:*)" \
+            --allowedTools "Read,Glob,Grep,Edit(//${GROOM_CLONE#/}/**),Edit(//${BUILDER_OUT#/}),Bash(git diff:*),Bash(git status:*),Bash(git log:*),Bash(git show:*),Bash(grep:*),Bash(cat:*),Bash(ls:*),Bash(head:*),Bash(tail:*),Bash(wc:*)" \
             --bare \
             --setting-sources "" \
             --strict-mcp-config \
@@ -1362,8 +1429,15 @@ jobs:
               total_cost_usd:  (.total_cost_usd   | if type=="number" then . else null end),
               denials_by_tool: ((.permission_denials // []) | group_by(.tool_name)
                 | map({
+                    # The tool NAME is model-influenced too — it is copied from $RAW,
+                    # which the agent Write reaches. A shape guard is not enough: any
+                    # 32-char base64url-ish string passes one, so the key could be
+                    # split across a handful of forged tool_name entries and
+                    # reassembled from the public artifact. Echo only names this
+                    # workflow actually grants; everything else collapses to a
+                    # constant, which cannot carry attacker bytes.
                     tool: ((.[0].tool_name // "" | tostring)
-                            | if test("^[A-Za-z][A-Za-z0-9_-]{0,31}$") then . else "(other)" end),
+                            | if IN("Read","Glob","Grep","Write","Edit","Bash") then . else "(other)" end),
                     count: length
                   }))
             }' "$RAW" > /tmp/groom-builder-diag.json
@@ -1390,6 +1464,22 @@ jobs:
           # public PR (471). This step runs NO agent, so holding the key here adds no
           # exfil surface — the risk is an AGENT reading it, and there is none here.
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # The agent ran just before this step and its writes reach the worktree, so
+          # the `git` invocations below must not read attacker-plantable config. The
+          # clone's `.git` was locked read-only for the agent, but ~/.gitconfig was
+          # not — and a `[filter "x"] clean = <cmd>` / `[diff] external = <cmd>` there,
+          # referenced from a worktree `.gitattributes` the agent CAN write, would
+          # execute during the `git add -A` / `git diff --cached` below, with the model
+          # key in this step's env. The agent's own claude process already runs with
+          # these cleared; this step needs them too, since it is the one that actually
+          # runs git over the agent's output. safe.directory is re-supplied for the
+          # same reason as in the agent steps — clearing global config otherwise masks
+          # the entry actions/checkout writes there.
+          GIT_CONFIG_GLOBAL: /dev/null
+          GIT_CONFIG_SYSTEM: /dev/null
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: safe.directory
+          GIT_CONFIG_VALUE_0: '*'
         run: |
           set -euo pipefail
           mkdir -p /tmp/out
@@ -1400,16 +1490,37 @@ jobs:
           PR_SIZE_LIMIT=$(awk -v v="$PR_SIZE_LIMIT" 'BEGIN{printf "%d", v}')
           STATUS=$(jq -r '.status // "bail"' "$BUILDER_OUT" 2>/dev/null || echo bail)
           SUMMARY=$(jq -r '.summary // ""' "$BUILDER_OUT" 2>/dev/null || echo "")
+
+          # Declared up here because the secret scan below bails through it.
+          bail() {
+            printf '{"status":"bail","reason":%s}\n' "$(jq -Rn --arg r "$1" '$r')" > /tmp/out/result.json
+            : > /tmp/out/patch.diff
+          }
+
           # Stage everything the agent touched (incl. new files) and diff it.
           git -C repo add -A
           git -C repo diff --cached > /tmp/out/patch.diff || true
-          # Pre-publish secret scan (471): the patch becomes a public PR and is
-          # model-authored, and the builder could read $ANTHROPIC_API_KEY. Fail closed
-          # if the literal key is in the diff (deterministic vs the literal value;
-          # base64/split defeats it — the sandbox/broker is the structural gate).
-          if [ -n "${ANTHROPIC_API_KEY:-}" ] && LC_ALL=C grep -qF -- "$ANTHROPIC_API_KEY" /tmp/out/patch.diff; then
-            echo "::error::builder patch contains ANTHROPIC_API_KEY — refusing to open a PR (possible prompt-injection exfil)."
-            exit 1
+          # Pre-publish secret scan (471): the builder could read $ANTHROPIC_API_KEY,
+          # and BOTH of its outputs are model-authored and published. The patch becomes
+          # a public PR — and $SUMMARY is copied verbatim into result.json (a public
+          # artifact) and into the bail issue's body, so a builder that writes the key
+          # into its summary while emitting NO patch would leak it entirely unscanned.
+          # Scan both. Deterministic against the literal value only; base64/split
+          # defeats it — the sandbox/broker is the structural gate.
+          #
+          # Bail rather than `exit 1`: failing the matrix leg skips the upload below,
+          # so build_pr has nothing to download and the finding is neither opened as a
+          # PR nor filed as an issue nor recorded in the ledger — leaving it to be
+          # re-proposed (and re-leaked) on every subsequent run. Bailing fails just as
+          # closed — the patch is emptied and the reason is a FIXED string, never the
+          # tainted $SUMMARY — while landing the finding in the ledger. The `::error::`
+          # keeps it loud on the run page.
+          if [ -n "${ANTHROPIC_API_KEY:-}" ] \
+             && { LC_ALL=C grep -qF -- "$ANTHROPIC_API_KEY" /tmp/out/patch.diff \
+                  || printf '%s' "$SUMMARY" | LC_ALL=C grep -qF -- "$ANTHROPIC_API_KEY"; }; then
+            echo "::error::Build $IDX output contains ANTHROPIC_API_KEY — refusing to publish the patch OR the summary (possible prompt-injection exfil); filing a redacted issue instead."
+            bail "builder output withheld: it contained the model API key (possible prompt-injection exfil). Patch and summary discarded — a human must review this finding manually."
+            exit 0
           fi
           CHANGED=$(git -C repo diff --cached --numstat | awk '{a+=($1=="-"?0:$1); d+=($2=="-"?0:$2)} END{print a+d+0}')
           # Path policy: a patch touching `.github/workflows/` would, on the
@@ -1419,34 +1530,43 @@ jobs:
           # A prompt-injected builder must never self-author CI. Refuse such a
           # patch and file an issue so a human authors the workflow change.
           #
-          # KNOWN GAP — read this BEFORE setting `builder: true` on any caller.
-          # This policy blocks the workflow + composite-action paths
-          # (`.github/workflows/`, `.github/actions/`). Other checked-in files also
-          # execute in that pre-review CI — `package.json` scripts, `Makefile`, and
-          # `conftest.py`/tox/pytest config — so the same "runs with secrets before a
-          # human reads the diff" window exists for them. Not fixed here because
-          # the right path list is target-repo-specific (a repo whose CI never
-          # runs npm scripts should not have `package.json` blocked, and
-          # over-blocking silently downgrades legitimate refactors to issues) —
-          # that needs a human call on policy, not a blind widening of this grep.
-          # The exposure is currently latent: `builder` defaults to false and no
-          # caller enables it. Widen this policy as a precondition of enabling it.
-          # -c core.quotePath=false: with the default (true) git QUOTES paths with
-          # special bytes (e.g. `.github/workflows/ev"il.yml`), so the anchored grep
-          # would miss them and let the workflow file through. `.github/actions/` is
-          # covered too — composite actions run in the same pre-review credentialed CI.
-          TOUCHED_WF=$(git -C repo -c core.quotePath=false diff --cached --name-only | grep -E '^\.github/(workflows|actions)/' || true)
+          # The deny-list covers the paths that actually execute in that pre-review CI:
+          # the workflow + composite-action definitions (`.github/workflows/`,
+          # `.github/actions/`) AND the build/test config the CI of a typical repo
+          # invokes — npm lifecycle scripts (`package.json`), `Makefile`, and the
+          # Python test/build config (`conftest.py`, `noxfile.py`, `tox.ini`,
+          # `pytest.ini`, `setup.py`, `setup.cfg`, `pyproject.toml`), plus
+          # `Dockerfile` and `.pre-commit-config.yaml`. Each is a "runs with
+          # repository secrets before a human reads the diff" window, exactly like a
+          # workflow file. Earlier revisions blocked only the first two and left the
+          # rest as a comment-guarded KNOWN GAP; a comment is not a control.
+          #
+          # STILL read this BEFORE setting `builder: true` on any caller: the precise
+          # list is target-repo-specific and this is a conservative DEFAULT, not a
+          # proof of completeness. A repo whose CI runs something else privileged
+          # (a checked-in `scripts/` entrypoint, a Gradle/Bazel build file) must add
+          # it here first. Erring wide is the safe direction — a false positive only
+          # downgrades a legitimate refactor from a PR to an issue, and nothing is
+          # dropped either way.
+          #
+          # Paths are compared NUL-delimited (`--name-only -z`), not via the default
+          # output: git C-quotes and double-quote-wraps any path containing a quote,
+          # backslash or control byte, so `.github/workflows/ev"il.yml` is emitted as
+          # `".github/workflows/ev\"il.yml"` — whose leading quote slips straight past
+          # the `^\.github/` anchor. `-c core.quotePath=false` did NOT fix this; it
+          # only suppresses quoting of high (non-ASCII) bytes. `-z` emits raw bytes
+          # with no quoting at all. Translating NUL to newline can only SPLIT a path
+          # that itself contains a newline, and both halves are then tested — that
+          # over-blocks, never under-blocks, which is the safe direction here.
+          TOUCHED_CI=$(git -C repo diff --cached --name-only -z | tr '\0' '\n' \
+            | grep -E '^\.github/(workflows|actions)/|(^|/)(package\.json|Makefile|GNUmakefile|conftest\.py|noxfile\.py|tox\.ini|pytest\.ini|setup\.py|setup\.cfg|pyproject\.toml|Dockerfile|\.pre-commit-config\.yaml)$' || true)
 
-          bail() {
-            printf '{"status":"bail","reason":%s}\n' "$(jq -Rn --arg r "$1" '$r')" > /tmp/out/result.json
-            : > /tmp/out/patch.diff
-          }
           if [ "$STATUS" != "patched" ] || [ ! -s /tmp/out/patch.diff ]; then
             echo "Build $IDX produced no patch (status=$STATUS) — will file as an issue."
             bail "${SUMMARY:-builder produced no patch}"
-          elif [ -n "$TOUCHED_WF" ]; then
-            echo "::warning::Build $IDX patch edits workflow file(s) [$(echo "$TOUCHED_WF" | tr '\n' ' ')] — refusing to auto-open a PR that would run in credentialed CI before human review; filing an issue instead."
-            bail "patch modifies .github/workflows/ or .github/actions/ (CI-privileged path) — a human must author these changes"
+          elif [ -n "$TOUCHED_CI" ]; then
+            echo "::warning::Build $IDX patch edits CI-privileged file(s) [$(echo "$TOUCHED_CI" | tr '\n' ' ')] — refusing to auto-open a PR that would run in credentialed CI before human review; filing an issue instead."
+            bail "patch modifies a CI-privileged path (.github/workflows|actions, or build/test config that executes in pre-review CI) — a human must author these changes"
           elif [ "$CHANGED" -gt "$PR_SIZE_LIMIT" ]; then
             echo "::warning::Build $IDX patch changed $CHANGED lines (> $PR_SIZE_LIMIT) — filing an issue instead of a giant PR."
             bail "patch too large: ${CHANGED} lines changed (> ${PR_SIZE_LIMIT})"
