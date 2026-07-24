@@ -110,7 +110,7 @@ def _start_upstream():
     return server
 
 
-def _start_broker(upstream_url, port):
+def _start_broker(upstream_url, port, stdin_payload=None):
     env = {**os.environ, "GROOM_BROKER_UPSTREAM": upstream_url, "GROOM_BROKER_PORT": str(port)}
     proc = subprocess.Popen(
         [NODE, SCRIPT],
@@ -120,7 +120,10 @@ def _start_broker(upstream_url, port):
         env=env,
     )
     # The real key arrives ONLY on stdin's first line — never env, never argv.
-    proc.stdin.write((REAL_KEY + "\n").encode())
+    # stdin_payload lets a test feed a raw (e.g. padded/CRLF) line; default is
+    # the clean key followed by the newline the broker's readline consumes.
+    payload = (REAL_KEY + "\n") if stdin_payload is None else stdin_payload
+    proc.stdin.write(payload.encode())
     proc.stdin.flush()
     return proc
 
@@ -189,6 +192,27 @@ class KeyBrokerTest(unittest.TestCase):
         self.assertNotEqual(rec["headers"].get("x-api-key"), "dummy")
         # ...and the inbound authorization header was stripped entirely.
         self.assertNotIn("authorization", rec["headers"])
+
+    def test_stdin_key_is_trimmed(self):
+        # A padded/copy-pasted secret (leading+trailing spaces + CRLF) must reach
+        # the upstream TRIMMED: the raw value carries illegal header chars that
+        # would otherwise throw on client.request. Guards key-broker.mjs `.trim()`.
+        padded = "  " + REAL_KEY + " \r\n"
+        port = _free_port()
+        upstream_url = "http://127.0.0.1:%d" % self.upstream.server_address[1]
+        proc = _start_broker(upstream_url, port, stdin_payload=padded)
+        self.addCleanup(_stop_broker, proc)
+        if not _wait_port(port):
+            raise self.failureException("padded-key broker did not become connectable")
+
+        conn = self._conn(port)
+        conn.request("POST", "/v1/messages", body=b"{}", headers={"content-type": "application/json"})
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+
+        # The trimmed key — not the padded input — reaches x-api-key upstream.
+        self.assertEqual(self.records[-1]["headers"].get("x-api-key"), REAL_KEY)
 
     def test_request_body_reaches_upstream_intact(self):
         body = b'{"prompt":"unicode \xe2\x9c\x93 check","pad":"' + b"x" * 2048 + b'"}'
