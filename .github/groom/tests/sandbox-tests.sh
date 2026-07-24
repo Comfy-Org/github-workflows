@@ -39,9 +39,9 @@ broker_pid=""
 host_sleep_pid=""
 
 cleanup() {
-	[[ -n "$fake_pid" ]] && kill "$fake_pid" 2>/dev/null || true
-	[[ -n "$broker_pid" ]] && kill "$broker_pid" 2>/dev/null || true
-	[[ -n "$host_sleep_pid" ]] && kill "$host_sleep_pid" 2>/dev/null || true
+	if [[ -n "$fake_pid" ]]; then kill "$fake_pid" 2>/dev/null || true; fi
+	if [[ -n "$broker_pid" ]]; then kill "$broker_pid" 2>/dev/null || true; fi
+	if [[ -n "$host_sleep_pid" ]]; then kill "$host_sleep_pid" 2>/dev/null || true; fi
 	rm -f "$home_canary" "$temp_canary" "$ws_canary" /tmp/canary
 	rm -rf "$work"
 }
