@@ -1818,7 +1818,13 @@ jobs:
           try:
               with open("/tmp/build/pr_body.md", encoding="utf-8") as f:
                   builder_body = f.read()
-          except FileNotFoundError:
+          except (OSError, UnicodeDecodeError):
+              # Missing file (bail/empty/dropped upstream) OR an unreadable/non-UTF-8
+              # body (non-UTF-8 bytes pass the byte-wise secret scan + wc -c cap
+              # upstream and would raise UnicodeDecodeError here). Either way, fall
+              # back to the template — never crash: this runs AFTER `git push`, so a
+              # crash would orphan the pushed branch, open no PR, record no ledger
+              # marker, and the finding would be re-proposed every run.
               pass
           pr_body = builder_pr_body(banner=banner, eli5_body=builder_body,
                                     verifier_rationale=body_md, signature=sig)

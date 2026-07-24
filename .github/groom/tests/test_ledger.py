@@ -481,6 +481,50 @@ class BuilderPrBodyTest(unittest.TestCase):
         self.assertIn("## Verifier rationale", out)
         self.assertNotIn("<details>", out)
 
+    def test_decoy_eli5_heading_in_code_fence_is_rejected(self):
+        # A `## ELI-5` that only appears inside a leading fenced code block never
+        # renders as the opening heading — it must NOT be accepted as ELI-5-first.
+        body = "```md\n## ELI-5\n```\n\n## What changed\n\nreal content."
+        out = ledger.builder_pr_body(banner=self.BANNER, eli5_body=body,
+                                     verifier_rationale="R.", signature="s")
+        self.assertIn("## Verifier rationale", out)  # template fallback
+        self.assertNotIn("<details>", out)
+
+    def test_real_eli5_heading_after_code_fence_is_accepted(self):
+        # A genuine ELI-5 heading is still detected even when an earlier fenced
+        # block contains heading-shaped lines.
+        body = "```\n# not a heading\n```\n\n## ELI-5\n\nplain words."
+        out = ledger.builder_pr_body(banner=self.BANNER, eli5_body=body,
+                                     verifier_rationale="R.", signature="s")
+        self.assertIn("<details>", out)
+
+    def test_comment_injection_in_body_is_neutralized(self):
+        # An unclosed HTML comment in the builder body must not hide the rationale
+        # or marker: the delimiters are escaped to visible text, and the ledger
+        # marker still round-trips.
+        body = "## ELI-5\n\nlooks fine <!-- everything after here is hidden"
+        out = ledger.builder_pr_body(banner=self.BANNER, eli5_body=body,
+                                     verifier_rationale="rationale stays visible", signature="sig-x")
+        self.assertNotIn("<!--", out.replace(ledger.signature_marker("sig-x"), ""))
+        self.assertIn("rationale stays visible", out)
+        self.assertEqual(ledger.extract_signature(out), "sig-x")
+
+    def test_details_injection_in_rationale_is_neutralized(self):
+        # A `</details>` in the rationale must not close the wrapping section early.
+        out = ledger.builder_pr_body(banner=self.BANNER, eli5_body=self.ELI5,
+                                     verifier_rationale="oops </details> broke out", signature="s")
+        self.assertNotIn("</details> broke out", out)
+        self.assertIn("&lt;/details&gt;", out)
+
+    def test_oversized_rationale_is_truncated_under_limit(self):
+        huge = "X" * 200_000
+        out = ledger.builder_pr_body(banner=self.BANNER, eli5_body=self.ELI5,
+                                     verifier_rationale=huge, signature="sig-big")
+        self.assertLessEqual(len(out), 65536)          # under GitHub's hard limit
+        self.assertIn("truncated", out)
+        self.assertTrue(out.rstrip().endswith("-->"))  # marker preserved LAST
+        self.assertEqual(ledger.extract_signature(out), "sig-big")
+
 
 if __name__ == "__main__":
     unittest.main()
