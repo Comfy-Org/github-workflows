@@ -80,7 +80,9 @@ echo secret > /tmp/canary
 export HOSTSECRET=leaked-host-value
 if ! "$SANDBOX" --clone "$clone" --clone-mode ro --out-dir "$outdir" \
 	--env FOO=bar -- bash -c '
-	dump=$(tr "\0" "\n" < /proc/self/environ)
+	# NB: read via `cat` not `< /proc/self/environ` — the `<` redirect resolves
+	# /proc/self in the pre-exec forked shell and reads empty inside the jail.
+	dump=$(cat /proc/self/environ | tr "\0" "\n")
 	echo "$dump" | grep -qx "FOO=bar"                              || { echo "FOO missing"; exit 1; }
 	echo "$dump" | grep -qx "HOME=/home/agent"                     || { echo "HOME wrong"; exit 1; }
 	echo "$dump" | grep -qx "PATH=/usr/local/bin:/usr/bin:/bin"    || { echo "PATH wrong"; exit 1; }
