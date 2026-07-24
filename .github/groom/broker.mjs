@@ -31,6 +31,7 @@ import fs from 'node:fs';
 const arg = process.argv[2];
 let listenArgs; // spread into server.listen(): [port, host] for TCP or [path] for UDS
 let addr; // human label for the listen log line
+let uds; // the socket path in UDS mode (undefined in TCP mode); chmod'd after bind
 if (arg !== undefined && /^\d+$/.test(arg)) {
   const port = Number(arg);
   if (!Number.isInteger(port) || port <= 0 || port > 65535) {
@@ -46,7 +47,21 @@ if (arg !== undefined && /^\d+$/.test(arg)) {
     process.exit(1);
   }
   // Clear a stale socket left by a crashed prior run so listen() doesn't EADDRINUSE.
-  fs.rmSync(sockPath, { force: true });
+  // Only ever unlink an actual SOCKET: an unconditional rmSync(force) would crash on
+  // a directory (EISDIR is not suppressed by force), silently delete a regular file
+  // at a mistyped path, and unlink a live socket. Stat first and fail loud on
+  // anything that isn't a socket. lstat so a symlink is treated as a non-socket.
+  try {
+    const st = fs.lstatSync(sockPath);
+    if (!st.isSocket()) {
+      console.error(`broker: refusing to start — ${sockPath} exists and is not a socket`);
+      process.exit(1);
+    }
+    fs.unlinkSync(sockPath);
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw e; // absent path is the normal case
+  }
+  uds = sockPath;
   listenArgs = [sockPath];
   addr = sockPath;
 }
@@ -134,6 +149,17 @@ const server = http.createServer((req, res) => {
   req.pipe(upstream); // forward the request body streaming too
 });
 
+// A listen failure (EADDRINUSE, EACCES, a bad UDS dir) would otherwise surface as
+// an uncaught 'error' event and a raw stack trace; log it and exit non-zero.
+server.on('error', (e) => {
+  console.error(`broker: listen failed on ${addr}: ${e.message}`);
+  process.exit(1);
+});
+
 server.listen(...listenArgs, () => {
+  // Lock the UDS to owner-only. server.listen() creates it under the process umask,
+  // so a permissive umask could let another local user connect(2) to this
+  // credential-injecting proxy and spend the real key (they still can't read it).
+  if (uds !== undefined) fs.chmodSync(uds, 0o600);
   console.log(`broker listening on ${addr} -> ${UPSTREAM_HOST}:${UPSTREAM_PORT}`);
 });

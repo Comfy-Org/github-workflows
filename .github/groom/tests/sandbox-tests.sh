@@ -248,6 +248,13 @@ pass "broker crash-resilience (survives a client mid-stream disconnect)"
 # (connects fail immediately: ECONNREFUSED on the jail's own lo, ENETUNREACH off-netns;
 # --max-time 3 is only a backstop, no real network or long timeouts are needed).
 
+# The 7a/7b/7c checks read a `curl` FAILURE as "unreachable" — so a curl missing
+# from the jail PATH would make every branch false and green-light the tests
+# without exercising the network control at all. Assert the tool is actually
+# present in the jail first, so a missing dependency can't silently pass them.
+"$SANDBOX" --clone "$clone" --clone-mode ro --out-dir "$outdir" -- bash -c 'command -v curl >/dev/null' \
+	|| fail "curl not available in jail — egress-isolation checks (7a/7b/7c) would false-pass"
+
 # 7a. Host loopback NOT reachable: a listener on the HOST's 127.0.0.1 sits on a
 # different loopback than the jail's, so a jail connect must fail. Run this jail
 # WITHOUT a shim on that port so nothing in-jail shadows it.

@@ -29,6 +29,16 @@ const server = net.createServer((c) => {
   u.on('error', () => c.destroy());
 });
 
+// The shim is backgrounded inside the jail while the caller captures the command's
+// stdout as the agent's JSON output; a listen failure surfacing as an uncaught
+// 'error' would kill the shim with a raw stack trace, so handle it and exit clean.
+server.on('error', (e) => {
+  console.error(`jail-shim: listen failed on 127.0.0.1:${port}: ${e.message}`);
+  process.exit(1);
+});
+
 server.listen(port, '127.0.0.1', () => {
-  console.log(`shim listening on 127.0.0.1:${port} -> ${sockPath}`);
+  // stderr, NOT stdout: the shim runs backgrounded alongside the agent whose stdout
+  // the caller captures as JSON — a banner on stdout would corrupt that capture.
+  console.error(`shim listening on 127.0.0.1:${port} -> ${sockPath}`);
 });
