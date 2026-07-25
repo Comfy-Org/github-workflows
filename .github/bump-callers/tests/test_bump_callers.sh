@@ -492,6 +492,67 @@ check "reported already at SHORT"              "grep -q 'already at $SHORT' <<<\
 check "committed nothing"                       "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
 check "opened no PR"                            "[[ ! -f \"\$STUB_PUT_DIR/pr.log\" ]] || ! grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
 
+echo "== an ALREADY-CONVERTED 'main (<short>)' marker is refreshed, not frozen (BE-4523) =="
+# The legacy `# github-workflows#NN` rule only fires once. After a caller has
+# been migrated to the `main (<short>)` marker, every later bump used to advance
+# the real 40-hex pin and leave the human-readable annotation at the SHA the file
+# no longer uses (Comfy-iOS shipped exactly that and hand-fixed it). Both marker
+# spellings must track the pin: the prose comment ABOVE the `uses:` line and the
+# trailing comment ON it.
+new_case converted
+CONVERTED_FIXTURE="${WORK}/converted_caller.yml"
+printf '%s\n' \
+  'name: CI cursor-review' \
+  'jobs:' \
+  '  review:' \
+  '    # Pinned to github-workflows main (1111111). The bump-cursor-review-callers' \
+  '    # workflow auto-opens a SHA-bump PR here when cursor-review.yml changes' \
+  '    # upstream; keep workflows_ref matching.' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@1111111111111111111111111111111111111111 # github-workflows main (1111111)' \
+  '    with:' \
+  '      workflows_ref: 1111111111111111111111111111111111111111' \
+  > "$CONVERTED_FIXTURE"
+STUB_CONTENT_FILE="$CONVERTED_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-converted","file":".github/workflows/ci-cursor-review.yml","label":""}]'
+PUT="${STUB_PUT_DIR}/put.last.txt"
+check "exit 0" "[[ $RC -eq 0 ]]"
+check "staged the file (not a skip)"            "[[ \$(cat \"\$STUB_PUT_DIR/count\") -eq 1 ]]"
+check "both SHA refs bumped"                    "[[ \$(grep -cF '$NEW_SHA' \"$PUT\") -eq 2 ]]"
+check "old 40-hex pin removed"                  "! grep -qF '1111111111111111111111111111111111111111' \"$PUT\""
+check "no stale short SHA left in any marker"   "! grep -qF 'main (1111111)' \"$PUT\""
+check "BOTH markers refreshed to the new short" "[[ \$(grep -cF 'github-workflows main ($SHORT)' \"$PUT\") -eq 2 ]]"
+check "prose marker above uses: refreshed"      "grep -qF '# Pinned to github-workflows main ($SHORT).' \"$PUT\""
+check "no attribution warning for a single-reusable caller" \
+  "! grep -q 'marker comments untouched' <<<\"\$OUT\""
+
+echo "== a SECOND reusable's marker in the same file is left untouched (BE-4523) =="
+# A `main (<short>)` marker names a SHA but not WHICH reusable it annotates, so a
+# file pinning several github-workflows reusables gives no honest way to tell
+# whose marker is whose. The bumper must refuse to guess: leave every marker as
+# found and warn, rather than stamping this fleet's SHA onto a sibling fleet's
+# annotation (Comfy-iOS pins cursor-review-auto-label.yml independently, at its
+# own older SHA — in a separate file today, but the guard is what keeps a
+# single-file variant from regressing).
+new_case multireusable
+MULTI_FIXTURE="${WORK}/multi_caller.yml"
+printf '%s\n' \
+  'name: CI cursor-review' \
+  'jobs:' \
+  '  review:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@1111111111111111111111111111111111111111 # github-workflows main (1111111)' \
+  '  auto-label:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review-auto-label.yml@2222222222222222222222222222222222222222 # github-workflows main (2222222)' \
+  > "$MULTI_FIXTURE"
+STUB_CONTENT_FILE="$MULTI_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-multi","file":".github/workflows/ci-cursor-review.yml","label":""}]'
+PUT="${STUB_PUT_DIR}/put.last.txt"
+check "exit 0" "[[ $RC -eq 0 ]]"
+check "warned that markers were left alone"     "grep -q \"marker comments untouched\" <<<\"\$OUT\""
+check "the other reusable's marker is untouched" "grep -qF 'github-workflows main (2222222)' \"$PUT\""
+check "this fleet's short SHA was NOT stamped in" "! grep -qF 'github-workflows main ($SHORT)' \"$PUT\""
+
 echo
 echo "== $PASS passed, $FAIL failed =="
 [[ $FAIL -eq 0 ]]

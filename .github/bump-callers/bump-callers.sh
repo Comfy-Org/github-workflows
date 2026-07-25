@@ -200,6 +200,39 @@ bump_repo() {
     # form (e.g. agents-md-integrity's `# v1`), so it is safe to share.
     NEW_CONTENT=$(sed -E "/github-workflows|workflows_ref/ s/[0-9a-f]{40}/${NEW_SHA}/g; s|# github-workflows#[0-9]+|# github-workflows main (${SHORT})|g" <<<"$OLD_CONTENT")
 
+    # Refresh an ALREADY-converted `github-workflows main (<short>)` marker
+    # (BE-4523). The rule above only handles the LEGACY `# github-workflows#NN`
+    # form, so once a caller had been migrated to the `main (<short>)` marker
+    # every later bump advanced the real 40-hex pin and left the human-readable
+    # annotation frozen at whatever it was on conversion day — Comfy-iOS shipped
+    # a bump whose `uses:`/`workflows_ref` were current while both marker
+    # comments still named a SHA the file no longer used, and it had to be
+    # hand-fixed. The pattern is deliberately NOT anchored to `# ` so it also
+    # catches the prose form callers put above the `uses:` line ("# Pinned to
+    # github-workflows main (dc65b8b). …"), which is the same annotation and
+    # goes stale the same way. `{7,40}` covers both the short and full-SHA
+    # spellings; re-running against an already-current marker rewrites it to
+    # itself, so this stays a no-op for a converged caller (the already-pinned
+    # clean-skip path still skips).
+    #
+    # Attribution guard: a marker names a SHA but not WHICH reusable it pins, so
+    # in a file that pins several github-workflows reusables there is no honest
+    # way to tell whose marker is whose — rewriting them all would stamp this
+    # fleet's SHA onto a sibling fleet's annotation. Only rewrite when every
+    # github-workflows reusable this file `uses:` is the one we are bumping;
+    # otherwise leave every marker alone and say so. (No caller does this today;
+    # the guard is why the new rule cannot regress one that starts to.)
+    local GW_REUSABLES
+    if grep -qE 'github-workflows main \([0-9a-f]{7,40}\)' <<<"$OLD_CONTENT"; then
+      GW_REUSABLES=$(grep -oE 'github-workflows/\.github/workflows/[A-Za-z0-9._-]+\.ya?ml' <<<"$OLD_CONTENT" \
+        | sed -E 's|.*/||' | sort -u)
+      if [[ "$GW_REUSABLES" == "$WORKFLOW_FILE" ]]; then
+        NEW_CONTENT=$(sed -E "s|github-workflows main \([0-9a-f]{7,40}\)|github-workflows main (${SHORT})|g" <<<"$NEW_CONTENT")
+      else
+        echo "::warning::${REPO}: ${FILE} does not pin ${WORKFLOW_FILE} alone — leaving its 'github-workflows main (<short>)' marker comments untouched"
+      fi
+    fi
+
     # Wire an extra identity/config into this file when its entry is flagged
     # (BE-1814's cloud-code-bot review identity is the first user). Idempotent —
     # an already-wired caller comes back unchanged — so this only adds the
