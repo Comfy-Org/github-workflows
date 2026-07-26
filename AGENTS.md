@@ -80,8 +80,10 @@ tests — run the matching command above for whatever you touched.
 - `detect-unreviewed-merge.yml` — SOC 2: flags PRs merged without approval.
 - `bump-cursor-review-callers.yml` / `bump-cursor-review-auto-label-callers.yml` /
   `bump-agents-md-callers.yml` / `bump-pr-size-callers.yml` /
-  `bump-assign-reviewers-callers.yml` — thin entrypoints over `bump-callers.sh`
-  that fan SHA bumps out to consumers.
+  `bump-assign-reviewers-callers.yml` / `bump-groom-callers.yml` — thin
+  entrypoints over `bump-callers.sh` that fan SHA bumps out to consumers. A
+  groom caller pins TWICE (`uses:` + `workflows_ref:`); the shared rewrite
+  moves both, so never hand-bump one alone.
 
 ## Conventions & gotchas
 
@@ -96,9 +98,9 @@ tests — run the matching command above for whatever you touched.
 - **Scripts are the single source of truth**, loaded at run time from a pinned
   ref of THIS repo — never from the caller's checkout. That's what makes the
   reviewer/checker tamper-proof: a PR can't rewrite the logic judging it. The
-  self-enrollment callers (`ci-cursor-review.yml`, `ci-detect-unreviewed-merge.yml`)
-  deliberately pin a merged-main SHA instead of a local `./` path for the same
-  reason — do not "simplify" them to a local path.
+  self-enrollment callers (`ci-cursor-review.yml`, `ci-assign-reviewers.yml`,
+  `ci-detect-unreviewed-merge.yml`) deliberately pin a merged-main SHA instead
+  of a local `./` path for the same reason — do not "simplify" them to a path.
 - **One bumper, not several.** `bump-callers.sh` backs every fleet; the
   `bump-*-callers.yml` files are thin per-fleet wrappers (they stay separate so a
   `cursor-review.yml` change doesn't spuriously bump agents-md or pr-size

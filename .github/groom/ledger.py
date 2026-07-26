@@ -148,6 +148,125 @@ def signature_marker(signature: str) -> str:
     return f"<!-- {_MARKER_PREFIX} {encoded} -->"
 
 
+# The builder-authored PR body must LEAD with an `## ELI-5` section (the comfy-pr
+# convention embedded in builder.md). `_HEADING_RE` pulls the first markdown
+# ATX heading's text; `_ELI5_HEADING_RE` matches an ELI-5 heading title. If the
+# builder's body doesn't lead with one, it is treated as unusable and the
+# assembler falls back to the original template — so a PR that uses the
+# builder body is GUARANTEED to open with an ELI-5 section (BE-4346).
+_HEADING_RE = re.compile(r"(?m)^[ \t]*#{1,6}[ \t]+(.+?)[ \t]*$")
+_ELI5_HEADING_RE = re.compile(r"(?i)^ELI[ -]?5\b")
+_FENCE_OPEN_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})")
+
+
+def _strip_fenced_code(text: str) -> str:
+    """Drop fenced code blocks (``` / ~~~) so heading detection ignores headings
+    that only *look* like headings inside a code block.
+
+    Without this, a decoy `## ELI-5` fenced at the top of the body is a false
+    accept (the rendered PR never shows an ELI-5 heading first). Indented code
+    blocks are left as-is — rare in an author-written ELI-5 prose body, and the
+    marginal false-accept doesn't justify a full Markdown parser here.
+    """
+    out, fence = [], None
+    for line in text.splitlines():
+        if fence is None:
+            m = _FENCE_OPEN_RE.match(line)
+            if m:
+                fence = m.group(1)[0]  # ` or ~
+                continue
+            out.append(line)
+        elif re.match(rf"[ \t]*{re.escape(fence)}{{3,}}[ \t]*$", line):
+            fence = None  # closing fence; drop it and resume outside
+    return "\n".join(out)
+
+
+def _leads_with_eli5(body: str) -> bool:
+    m = _HEADING_RE.search(_strip_fenced_code(body or ""))
+    return bool(m and _ELI5_HEADING_RE.match(m.group(1)))
+
+
+# GitHub rejects a PR body over 65536 chars. The assembled body is
+# banner + builder ELI-5 body + verifier rationale + marker. The ELI-5 body is
+# bounded upstream (BODY_MAX=20000 in groom.yml), but `verifier_rationale`
+# (the verifier's `body_md`) is NOT — a large rationale can push the total past
+# the limit and fail `gh pr create` AFTER the branch is already pushed,
+# orphaning it and leaving the finding unrecorded, to be re-proposed every run
+# (the very loop the ledger prevents). Cap the total by truncating the rationale
+# — the least load-bearing dynamic part — to fit, staying under the hard limit.
+# The banner and the trailing marker are always preserved.
+_PR_BODY_MAX = 65000
+
+
+def _fit_rationale(rationale: str, overhead: int) -> str:
+    """Truncate `rationale` so `overhead + len(result) <= _PR_BODY_MAX`.
+
+    `overhead` is the length of everything else in the assembled body (banner,
+    ELI-5 body, section wrappers, marker). Appends a visible notice when it cuts,
+    and drops the rationale entirely when there is no room even for the notice.
+    """
+    budget = _PR_BODY_MAX - overhead
+    if len(rationale) <= budget:
+        return rationale
+    notice = "\n\n_[rationale truncated to fit GitHub's PR-body limit]_"
+    keep = budget - len(notice)
+    if keep <= 0:
+        return ""
+    return rationale[:keep].rstrip() + notice
+
+
+def _sanitize_untrusted(text: str) -> str:
+    """Neutralize markup in model/verifier-authored body text that would corrupt
+    the rendered PR body.
+
+    An unclosed `<!--` in the (prompt-injectable) builder body would comment out
+    the trailing rationale and marker in GitHub's rendered view; a `</details>`
+    in the rationale would close the wrapping collapsible section early. Escaping
+    the comment delimiters and the closing tag renders them as visible literal
+    text instead. The authoritative ledger marker is appended AFTER this and is
+    never sanitized, so `extract_signature`/dedup is unaffected (and a
+    marker-shaped comment planted in the body is defanged here too).
+    """
+    if not text:
+        return ""
+    return (text.replace("<!--", "&lt;!--").replace("-->", "--&gt;")
+                .replace("</details>", "&lt;/details&gt;"))
+
+
+def builder_pr_body(*, banner: str, eli5_body: str, verifier_rationale: str, signature: str) -> str:
+    """Assemble the groom auto-builder PR body from its load-bearing parts (BE-4346).
+
+    The builder agent — which made the change and knows what it did — authors
+    `eli5_body`: an `## ELI-5`-first, structured what/why description written one
+    line per paragraph (no hard-wrap), following the team's comfy-pr convention.
+    That body LEADS the PR. The `banner` (auto-built / review-only / never
+    auto-merged) is prepended and the ledger `signature_marker` is appended LAST;
+    both are load-bearing — the banner sets review expectations, and
+    `extract_signature` reads the LAST marker, so appending the authoritative
+    marker AFTER the model-authored body keeps the ledger key un-spoofable even
+    if the body embeds a marker-shaped comment. The verifier's rationale is
+    retained as a secondary, collapsed `<details>` section under the ELI-5.
+
+    Falls back to the original template (banner + `## Verifier rationale` +
+    marker) when `eli5_body` is empty or does not lead with an ELI-5 heading (a
+    builder bail, an empty/oversized file zeroed upstream, or a malformed body) —
+    it never returns an empty-body PR.
+    """
+    marker = signature_marker(signature)
+    body = _sanitize_untrusted(eli5_body).strip()
+    rationale = _sanitize_untrusted(verifier_rationale).strip()
+    if body and _leads_with_eli5(body):
+        prefix = (f"{banner}\n\n{body}\n\n"
+                  "<details>\n<summary><strong>Verifier rationale</strong></summary>\n\n")
+        suffix = f"\n\n</details>\n\n{marker}\n"
+        rationale = _fit_rationale(rationale, len(prefix) + len(suffix))
+        return f"{prefix}{rationale}{suffix}"
+    prefix = f"{banner}\n\n## Verifier rationale\n\n"
+    suffix = f"\n\n{marker}\n"
+    rationale = _fit_rationale(rationale, len(prefix) + len(suffix))
+    return f"{prefix}{rationale}{suffix}"
+
+
 def normalize_signature(signature) -> str:
     """Canonicalize a signature for use as a ledger key.
 
