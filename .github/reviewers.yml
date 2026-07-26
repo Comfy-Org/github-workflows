@@ -43,6 +43,9 @@ rules:
   - paths:
       - .github/bump-callers/**
       - .github/workflows/bump-*.yml
+      # `test-bump-callers.yml` does not match `bump-*.yml` — name it, the same
+      # way every other bucket names its own `test-*.yml`.
+      - .github/workflows/test-bump-callers.yml
     reviewers:
       - wei-hai
       - deepme987
@@ -109,6 +112,9 @@ rules:
       - .github/workflows/test-agents-md-integrity.yml
       - .github/workflows/stale.yml
       - .github/workflows/detect-unreviewed-merge.yml
+      # Its `ci-` prefixed self-enrollment caller, named outright for the same
+      # reason ci-assign-reviewers.yml is below: no glob here reaches it.
+      - .github/workflows/ci-detect-unreviewed-merge.yml
     reviewers:
       - wei-hai
       - deepme987

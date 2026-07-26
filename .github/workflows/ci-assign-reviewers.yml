@@ -20,16 +20,32 @@ name: CI - Assign Reviewers
 #
 # PREREQUISITES, both already provisioned here for cursor-review / the bumpers:
 # vars.APP_ID + secrets.CLOUD_CODE_BOT_PRIVATE_KEY. The App token (not
-# GITHUB_TOKEN) does the assigning so fork PRs don't 403 on a read-only token —
-# which is why this job needs only `contents: read`.
+# GITHUB_TOKEN) does the assigning — the reusable needs `Pull requests: write`
+# to set assignees and this job therefore needs only `contents: read` itself.
+#
+# FORK PRs ARE NOT ROUTED, and that is deliberate. `pull_request` withholds
+# repository secrets from fork-originated runs, so CLOUD_CODE_BOT_PRIVATE_KEY
+# arrives empty and the App-token mint hard-fails — a red X and no routing
+# either way. The job is guarded to skip cleanly on forks instead (see `if:`
+# below). Routing them would mean `pull_request_target`, which runs privileged
+# against untrusted HEAD and would turn the head-sha map read described above
+# into a real escalation; not a trade worth making for assignee routing.
+#
+# PIN FRESHNESS (operator): the pin below only tracks assign-reviewers.yml once
+# this repo is listed in vars.ASSIGN_REVIEWERS_CALLERS, which
+# bump-assign-reviewers-callers.yml fans bumps out to. Until then the pin is
+# updated by hand, same as any other consumer that isn't enrolled.
 
 on:
   pull_request:
     # `opened` covers ready PRs; `ready_for_review` catches a draft being
     # promoted (the reusable skips drafts, so a PR opened as a draft would
-    # otherwise never get routed). Deliberately NOT `synchronize` — re-running on
-    # every push would fight a human who reassigned the PR on purpose.
-    types: [opened, ready_for_review]
+    # otherwise never get routed); `reopened` gives a second chance to a PR that
+    # was closed still unrouted (e.g. its `opened` run failed). Deliberately NOT
+    # `synchronize` — re-running on every push would fight a human who
+    # reassigned the PR on purpose. Re-firing is safe regardless: the reusable
+    # skips any PR that already has a non-author assignee.
+    types: [opened, ready_for_review, reopened]
 
 # Never let routing fight itself: two events for the same PR (opened, then
 # ready_for_review moments later) would both read open-assignee load and could
@@ -40,6 +56,11 @@ concurrency:
 
 jobs:
   assign:
+    # Same-repo branches only. On a fork PR the secret below is empty (see
+    # "FORK PRs" in the header), so without this the App-token step fails and
+    # every external contribution carries a red check for a routing decision
+    # that could never have been made anyway. A skipped job reports as neutral.
+    if: github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       # Only `contents: read` — the reusable reads .github/reviewers.yml from the
       # head sha and does every write with the CLOUD_CODE_BOT App token, so no
