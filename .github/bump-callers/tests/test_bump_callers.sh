@@ -213,6 +213,64 @@ check "base_tree is NOT the commit sha"       "! grep -qF '1234567890abcdef12345
 check "opened a new PR (pr create called)"    "grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
 check "did not edit (no open PR existed)"     "! grep -q '^pr-edit' \"\$STUB_PUT_DIR/pr.log\""
 
+echo "== groom fleet: BOTH pins (uses: + workflows_ref) and the '# main @' comment move together =="
+# A groom caller pins the reusable TWICE — the `uses:` SHA and the `workflows_ref:`
+# input that loads the finder/verifier briefs + dedup ledger. They must move in
+# lock-step or a run executes one version's workflow against another version's
+# briefs. The fixture also carries an `actions/checkout@<40hex>` pin, which must
+# NOT be clobbered to github-workflows' SHA.
+new_case groom
+GROOM_FIXTURE="${WORK}/groom_caller.yml"
+printf '%s\n' \
+  'name: Groom' \
+  'jobs:' \
+  '  groom:' \
+  '    steps:' \
+  '      - uses: actions/checkout@abcdefabcdefabcdefabcdefabcdefabcdefabcd  # v6' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@1111111111111111111111111111111111111111 # main @ 1111111 — groom.yml not on the v1 tag yet' \
+  '    with:' \
+  '      workflows_ref: 1111111111111111111111111111111111111111  # main @ 1111111' \
+  "      max_prs: \${{ github.event.inputs.max_prs || '1' }}" \
+  '      # github-workflows pin note, short form, hex run ends at EOL: # main @ 1111111' \
+  '      # github-workflows pin note, deliberate FULL sha: # main @ 1111111111111111111111111111111111111111' \
+  '      # unrelated third-party note, neither anchor on the line: # main @ 2222222' \
+  > "$GROOM_FIXTURE"
+STUB_CONTENT_FILE="$GROOM_FIXTURE" run_bump \
+  VAR_NAME=GROOM_CALLERS TAG=groom WORKFLOW_FILE=groom.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-groomed","file":".github/workflows/groom.yml","label":""}]'
+check "exit 0" "[[ $RC -eq 0 ]]"
+check "masked the private repo name"  "grep -q '::add-mask::Comfy-Org/secret-groomed' <<<\"\$OUT\""
+check "reported groom fleet complete" "grep -q 'groom bump complete' <<<\"\$OUT\""
+PUT="${STUB_PUT_DIR}/put.last.txt"
+check "uses: pin moved"                       "grep -qE \"groom.yml@${NEW_SHA}\" \"$PUT\""
+check "workflows_ref pin moved"               "grep -qE \"workflows_ref: ${NEW_SHA}\" \"$PUT\""
+check "no stale 40-hex pin anywhere"          "! grep -qF '1111111111111111111111111111111111111111' \"$PUT\""
+check "'# main @' comment moved to new short" "grep -qF '# main @ $SHORT' \"$PUT\""
+# The `# main @` rewrite is bounded to a 7-12 hex SHORT sha, and that bound has to
+# hold at BOTH ends of the run or it mangles what it claims to protect.
+check "'# main @ <short>' at EOL rewritten"   "grep -qE '# main @ ${SHORT}\$' \"$PUT\""
+# A deliberate FULL-sha comment is corrected by the 40-hex rule and must then be
+# left alone — an unbounded {7,12} match would eat its first 12 characters, swap in
+# the 7-char SHORT and strand the other 28 as a nonsense suffix.
+check "full-sha '# main @' keeps full form"   "grep -qF '# main @ ${NEW_SHA}' \"$PUT\""
+# The `workflows_ref:` pin is bumped by the 40-hex rule, so its OWN `# main @
+# <short>` note has to move with it — the comment rules are anchored to the same
+# two pin contexts as that rule for exactly this line. A narrower anchor bumps the
+# pin and leaves the comment naming the old commit: a confident lie on the second
+# of groom's two pins.
+check "workflows_ref's own pin comment moved" \
+  "grep -qE \"workflows_ref: ${NEW_SHA} +# main @ ${SHORT}\$\" \"$PUT\""
+# ...and the anchor still BOUNDS the rewrite: a `# main @ <short>` note on a line
+# naming neither pin context belongs to some other pin and must be left alone.
+check "unanchored '# main @' note untouched"  "grep -qF '# main @ 2222222' \"$PUT\""
+# The third-party action pin is a full 40-hex SHA on a line that does NOT mention
+# github-workflows — the address anchor is what keeps it intact (the org mandates
+# SHA-pinning every action, so clobbering it would break the caller's CI).
+check "actions/checkout pin untouched"        "grep -qF 'actions/checkout@abcdefabcdefabcdefabcdefabcdefabcdefabcd' \"$PUT\""
+# max_prs forwards a workflow_dispatch string (see groom.yml's input docs); the
+# bumper must not mangle the expression while rewriting the pins around it.
+check "max_prs forward expression intact"     "grep -qF \"github.event.inputs.max_prs || '1'\" \"$PUT\""
+
 echo "== cursor-review fleet: an open bump PR is UPDATED IN PLACE, not re-opened (BE-3882) =="
 new_case reuse
 STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
@@ -548,7 +606,9 @@ printf '%s\n' \
   '  review:' \
   '    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@1111111111111111111111111111111111111111 # github-workflows main (1111111)' \
   '  auto-label:' \
-  '    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review-auto-label.yml@2222222222222222222222222222222222222222 # github-workflows#27' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review-auto-label.yml@2222222222222222222222222222222222222222 # github-workflows#27 # main @ 2222222' \
+  '    with:' \
+  '      workflows_ref: 1111111111111111111111111111111111111111  # main @ 1111111' \
   > "$MULTI_FIXTURE"
 STUB_CONTENT_FILE="$MULTI_FIXTURE" run_bump \
   VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
@@ -561,6 +621,22 @@ check "the SIBLING's 40-hex pin is UNCHANGED"    "grep -qF 'cursor-review-auto-l
 check "the sibling's legacy marker is untouched" "grep -qF '# github-workflows#27' \"$PUT\""
 check "our own marker left alone (ambiguous)"    "grep -qF 'github-workflows main (1111111)' \"$PUT\""
 check "this fleet's short SHA was NOT stamped in" "! grep -qF 'github-workflows main ($SHORT)' \"$PUT\""
+# The `# main @ <short>` form is attributed differently from the two markers above:
+# it rides ON the pin line, so it moves with whatever the 40-hex rule moves — same
+# address, both regimes. That makes the multi-reusable case a two-sided assertion:
+#   * the SIBLING's `# main @` note shares its line with a pin the tightened address
+#     deliberately does NOT bump, so stamping the note would be the same cross-fleet
+#     lie as stamping the pin, and
+#   * a `workflows_ref:` pin IS bumped even here (that context stays broad — an
+#     un-bumped workflows_ref disagreeing with its own `uses:` is the worse
+#     failure), so its own note MUST move with it or the guard manufactures exactly
+#     the stale comment BE-4346 removed.
+# Unreachable today (no caller calls two reusables); asserted so the guard and the
+# groom fleet's lock-step cannot silently trade one for the other.
+check "sibling's '# main @' note NOT stamped"    "grep -qF '# main @ 2222222' \"$PUT\""
+check "workflows_ref pin bumped even here"       "grep -qE \"workflows_ref: ${NEW_SHA}\" \"$PUT\""
+check "workflows_ref's '# main @' moved with it" \
+  "grep -qE \"workflows_ref: ${NEW_SHA} +# main @ ${SHORT}\\\$\" \"$PUT\""
 
 echo "== merely NAMING a sibling workflow in a comment is not a second caller (BE-4523) =="
 # The multi-reusable check reads `uses:` lines only. A single-reusable caller that

@@ -234,7 +234,39 @@ bump_repo() {
     if (( GW_HAS_SIBLING )); then
       SHA_ADDR="/github-workflows[^[:space:]]*${WORKFLOW_FILE//./\\.}|workflows_ref/"
     fi
-    NEW_CONTENT=$(sed -E "${SHA_ADDR} s/[0-9a-f]{40}/${NEW_SHA}/g" <<<"$OLD_CONTENT")
+    #
+    # The groom callers' `# main @ <short>` annotation rides on the pin line
+    # itself, so it moves HERE, under the SAME `${SHA_ADDR}` — the address is the
+    # exact set of lines whose pin this rule rewrites, which makes it honest
+    # attribution for that form (the `main (<short>)` form below cannot use it: it
+    # also appears in prose ABOVE the `uses:` line, naming no pin context of its
+    # own, so it needs the caller-level guard instead). The two MUST stay
+    # identical: a groom caller pins TWICE and its `workflows_ref: <sha>  # main @
+    # <short>` line is rewritten by the 40-hex rule, so a narrower anchor here
+    # would bump that pin while leaving its comment naming the old commit —
+    # reintroducing, on the second of the two groom pins, exactly the confident lie
+    # these rewrites exist to kill. Sharing the address also means the sibling
+    # tightening covers this form for free: a sibling fleet's `uses: …/other.yml@…
+    # # main @ <short>` line is outside the tightened address, so neither its pin
+    # nor its annotation is stamped with our SHA.
+    #
+    # The short form is bounded to {7,12} hex so a deliberate FULL-sha annotation
+    # keeps its full form (the 40-hex rule has already corrected it in the same
+    # pass) instead of being shortened — and that bound only holds if the hex run
+    # ENDS there, hence two rules rather than one: `[0-9a-f]{7,12}` alone is happy
+    # to match the first 12 characters of a longer run, so on a `# main @ <40hex>`
+    # comment it would swap 12 hex for the 7-char SHORT and strand the remaining 28
+    # — mangling the very full-form comment the bound exists to protect. Requiring
+    # a non-hex character (or end of line) after the run makes the match a whole
+    # token: rule 2 catches the short form mid-line, rule 3 the same at EOL, and a
+    # 13+ hex run matches neither and is left intact. A hex-boundary assertion
+    # (`\b`, `[[:>:]]`) would be simpler but spells differently in GNU and BSD sed;
+    # this is portable ERE.
+    NEW_CONTENT=$(sed -E "
+      ${SHA_ADDR} s/[0-9a-f]{40}/${NEW_SHA}/g
+      ${SHA_ADDR} s|# main @ [0-9a-f]{7,12}([^0-9a-f])|# main @ ${SHORT}\1|g
+      ${SHA_ADDR} s|# main @ [0-9a-f]{7,12}\$|# main @ ${SHORT}|g
+    " <<<"$OLD_CONTENT")
 
     # Normalize the human-readable pin annotation so it never disagrees with the
     # pin above. Two spellings, both handled here:
@@ -254,13 +286,16 @@ bump_repo() {
     # clean-skip path still skips). A caller using some other comment form
     # (agents-md-integrity's `# v1`) matches neither rule and is untouched.
     #
-    # Attribution guard: an annotation names a SHA but not WHICH reusable it
-    # annotates, so in a file that calls several github-workflows reusables there
-    # is no honest way to tell whose is whose — rewriting them all would stamp
-    # this fleet's SHA onto a sibling fleet's annotation. So rewrite only when the
-    # file is provably ours alone; otherwise leave every annotation as found and
-    # say so. (No caller does this today; the guard is why the new rule cannot
-    # regress one that starts to.)
+    # Attribution guard: an annotation of these two forms names a SHA but not
+    # WHICH reusable it annotates — and, appearing in prose above the pin as often
+    # as beside it, it carries no line context to attribute it by either. So in a
+    # file that calls several github-workflows reusables there is no honest way to
+    # tell whose is whose, and rewriting them all would stamp this fleet's SHA
+    # onto a sibling fleet's annotation. Rewrite only when the file is provably
+    # ours alone; otherwise leave every annotation as found and say so. (No caller
+    # does this today; the guard is why the new rule cannot regress one that starts
+    # to.) The `# main @` form needs no guard here — it is bound to the pin line it
+    # annotates and moved above, under the same address as the pin itself.
     if (( GW_ONLY_OURS )); then
       NEW_CONTENT=$(sed -E "s|# github-workflows#[0-9]+|# github-workflows main (${SHORT})|g; s|github-workflows main \([0-9a-f]{7,40}\)|github-workflows main (${SHORT})|g" <<<"$NEW_CONTENT")
     elif grep -qE '# github-workflows#[0-9]+|github-workflows main \([0-9a-f]{7,40}\)' <<<"$OLD_CONTENT"; then
