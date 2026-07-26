@@ -208,10 +208,22 @@ bump_repo() {
     # <sha>` note elsewhere in the caller is untouched, and bounded to {7,12} hex
     # so a deliberate FULL-sha comment keeps its full form (the 40-hex rewrite
     # above has already corrected it) instead of being shortened.
+    #
+    # That bound only holds if the hex run ENDS there, hence the two rules rather
+    # than one: `[0-9a-f]{7,12}` alone is happy to match the first 12 characters of
+    # a longer run, so on a `# main @ <40hex>` comment (already rewritten to
+    # NEW_SHA by rule 1) it would swap 12 hex for the 7-char SHORT and leave the
+    # remaining 28 dangling — mangling the very full-form comment the bound exists
+    # to protect. Requiring a non-hex character (or end of line) after the run
+    # makes the match a whole token: rule 3 catches the short form mid-line, rule 4
+    # the same at EOL, and a 13+ hex run matches neither and is left intact. A
+    # hex-boundary assertion (`\b`, `[[:>:]]`) would be simpler but spells
+    # differently in GNU and BSD sed; this is portable ERE.
     NEW_CONTENT=$(sed -E "
       /github-workflows|workflows_ref/ s/[0-9a-f]{40}/${NEW_SHA}/g
       s|# github-workflows#[0-9]+|# github-workflows main (${SHORT})|g
-      /github-workflows/ s|# main @ [0-9a-f]{7,12}|# main @ ${SHORT}|g
+      /github-workflows/ s|# main @ [0-9a-f]{7,12}([^0-9a-f])|# main @ ${SHORT}\1|g
+      /github-workflows/ s|# main @ [0-9a-f]{7,12}\$|# main @ ${SHORT}|g
     " <<<"$OLD_CONTENT")
 
     # Wire an extra identity/config into this file when its entry is flagged

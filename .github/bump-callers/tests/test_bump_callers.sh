@@ -231,6 +231,8 @@ printf '%s\n' \
   '    with:' \
   '      workflows_ref: 1111111111111111111111111111111111111111' \
   "      max_prs: \${{ github.event.inputs.max_prs || '1' }}" \
+  '      # github-workflows pin note, short form, hex run ends at EOL: # main @ 1111111' \
+  '      # github-workflows pin note, deliberate FULL sha: # main @ 1111111111111111111111111111111111111111' \
   > "$GROOM_FIXTURE"
 STUB_CONTENT_FILE="$GROOM_FIXTURE" run_bump \
   VAR_NAME=GROOM_CALLERS TAG=groom WORKFLOW_FILE=groom.yml \
@@ -243,6 +245,13 @@ check "uses: pin moved"                       "grep -qE \"groom.yml@${NEW_SHA}\"
 check "workflows_ref pin moved"               "grep -qE \"workflows_ref: ${NEW_SHA}\" \"$PUT\""
 check "no stale 40-hex pin anywhere"          "! grep -qF '1111111111111111111111111111111111111111' \"$PUT\""
 check "'# main @' comment moved to new short" "grep -qF '# main @ $SHORT' \"$PUT\""
+# The `# main @` rewrite is bounded to a 7-12 hex SHORT sha, and that bound has to
+# hold at BOTH ends of the run or it mangles what it claims to protect.
+check "'# main @ <short>' at EOL rewritten"   "grep -qE '# main @ ${SHORT}\$' \"$PUT\""
+# A deliberate FULL-sha comment is corrected by the 40-hex rule and must then be
+# left alone — an unbounded {7,12} match would eat its first 12 characters, swap in
+# the 7-char SHORT and strand the other 28 as a nonsense suffix.
+check "full-sha '# main @' keeps full form"   "grep -qF '# main @ ${NEW_SHA}' \"$PUT\""
 # The third-party action pin is a full 40-hex SHA on a line that does NOT mention
 # github-workflows — the address anchor is what keeps it intact (the org mandates
 # SHA-pinning every action, so clobbering it would break the caller's CI).

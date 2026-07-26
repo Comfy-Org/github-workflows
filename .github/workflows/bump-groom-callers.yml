@@ -70,7 +70,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
 
@@ -80,7 +80,22 @@ jobs:
         with:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+          # `owner:` with no `repositories:` is deliberate and cannot be narrowed:
+          # the caller list is a runtime variable (see the header), so the repos
+          # this token must reach are not knowable at authoring time — and naming
+          # them here would leak private caller names into a public file.
+          #
+          # The PERMISSIONS can be narrowed without naming anything, so they are:
+          # unset, the minted token carries every permission the app holds on every
+          # repo it is installed on, far past what this bumper needs. It commits
+          # the rewritten caller file via the Git Data API (contents) and opens or
+          # updates the bump PR (pull-requests); `gh pr create --label` stamps the
+          # caller's label through the issues API (issues) — same trio, and the
+          # same reasoning, as groom.yml's own PR job.
           owner: Comfy-Org
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
 
       - name: Bump SHA in caller repos
         env:
