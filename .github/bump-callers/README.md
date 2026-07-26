@@ -47,6 +47,17 @@ into that split state through a hand-bump of only one. It also re-points the
 `# main @ <short>` pin comment those callers carry — a comment still naming the
 old commit after the pin moved is worse than no comment.
 
+A caller pinning **two** github-workflows reusables in the same file is a
+special case: the `uses:` pin rewrite and the `# main @ <short>` comment rewrite
+are both address-restricted to the line calling THIS fleet's `WORKFLOW_FILE`, so
+a sibling fleet's pin and annotation are left untouched rather than stamped with
+this fleet's SHA (BE-4523). The legacy `# github-workflows#NN` / already-converted
+`github-workflows main (<short>)` markers name a SHA but not which reusable they
+annotate, so they are refreshed only when the file is provably ours alone;
+otherwise they are left as found and the run logs a warning. Inert for every
+caller today (all call exactly one reusable); it exists so a caller that starts
+calling two cannot be corrupted.
+
 ## How the pin rewrite is scoped (and why it asserts afterwards)
 
 The rewrite targets the **pin token**, not "any 40-hex on a line that mentions
