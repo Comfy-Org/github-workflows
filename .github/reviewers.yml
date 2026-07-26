@@ -1,0 +1,131 @@
+# Expertise map consumed by assign-reviewers.yml at PR time (see
+# .github/workflows/ci-assign-reviewers.yml, this repo's caller).
+#
+# Despite the workflow's name it writes the ASSIGNEE field, not reviewer
+# requests — "this org routes/alerts people via the ASSIGNEE field"
+# (assign-reviewers.yml's header). So a `reviewers:` entry below means "gets
+# assigned", which is what actually gets a PR looked at here.
+#
+# HOW THIS MAP WAS SEEDED, and why it is not derived from git history: nearly
+# every commit on main in this repo has one author, so authorship carries no
+# routing signal at all. The people below are instead the ones who have actually
+# APPROVED merged PRs in the matching area. Approval counts at seed time:
+# wei-hai 9, huntcsg 3, deepme987 3, sundar-svg 2, synap5e 1,
+# luke-mino-altherr 1, bigcat88 1.
+#
+# ORDER OF OPERATIONS with refresh-reviewers (#63, BE-4116): that generator
+# treats the committed `rules:` globs as its BUCKET DEFINITIONS and only
+# re-scores who belongs in each — it cannot invent buckets, so this file has to
+# exist first. Two things to know when its first drift PR arrives:
+#   1. It scores recency-decayed COMMIT authorship, so on this repo it will want
+#      to collapse most buckets to the single dominant committer. That is a
+#      history artifact, not a routing improvement — read that PR, don't
+#      rubber-stamp it.
+#   2. The bucket globs below are therefore the durable part of this file. Edit
+#      them deliberately; they outlive the names.
+#
+# Selection at PR time: changed paths -> union of matching rules -> drop the PR
+# author -> rank ascending by open assignee load -> assign `num_reviewers`.
+# NOTE the author drop: a bucket whose only member is the author empties, so
+# `default_pool` is the real safety net and must never be just one person (and
+# must not be the person who opens most PRs here).
+
+default_pool:
+  - wei-hai
+  - deepme987
+  - huntcsg
+
+rules:
+  # The shared caller-bump machinery + every per-fleet entrypoint. wei-hai owns
+  # this area by approval history (the CURSOR_REVIEW_CALLERS variable migration,
+  # the trailing-newline fix, the caller-list additions); deepme987 approved the
+  # wire-bot identity injection.
+  - paths:
+      - .github/bump-callers/**
+      - .github/workflows/bump-*.yml
+      # `test-bump-callers.yml` does not match `bump-*.yml` — name it, the same
+      # way every other bucket names its own `test-*.yml`.
+      - .github/workflows/test-bump-callers.yml
+    reviewers:
+      - wei-hai
+      - deepme987
+
+  # groom: briefs, ledger, sandbox/broker, and the reusable + its own caller.
+  # synap5e approved the builder PR-body convention and holds the open sandbox
+  # PRs; luke-mino-altherr approved the direct-CLI agent phases; bigcat88
+  # approved the caller-permissions correction.
+  - paths:
+      - .github/groom/**
+      - .github/workflows/groom.yml
+      - .github/workflows/ci-groom.yml
+      - .github/workflows/test-groom-scripts.yml
+    reviewers:
+      - synap5e
+      - luke-mino-altherr
+      - bigcat88
+
+  # cursor-review: the review panel, judge, prompts and auto-label. huntcsg
+  # approved the blocking gate and the judge-parsing recovery; sundar-svg
+  # approved the runs_on/self-hosted parameterization.
+  - paths:
+      - .github/cursor-review/**
+      - .github/workflows/cursor-review.yml
+      - .github/workflows/cursor-review-auto-label.yml
+      - .github/workflows/ci-cursor-review.yml
+      - .github/workflows/test-cursor-review-scripts.yml
+    reviewers:
+      - huntcsg
+      - sundar-svg
+      - deepme987
+
+  # PR-size gate + its Go classifier. guill carries the open pr-size token work;
+  # wei-hai approved it.
+  - paths:
+      - scripts/check-pr-size/**
+      - .github/workflows/pr-size.yml
+      - .github/workflows/test-pr-size.yml
+    reviewers:
+      - guill
+      - wei-hai
+
+  # The assignee-routing machinery itself, including the generator that will
+  # later rewrite this very file. wei-hai approved both the expertise-aware
+  # assign-reviewers workflow and assign-prs-to-author; deepme987 approved the
+  # non-author-assignee skip.
+  - paths:
+      - .github/refresh-reviewers/**
+      - .github/workflows/assign-*.yml
+      # The `ci-` prefixed self-enrollment caller does NOT match `assign-*.yml`,
+      # so it needs naming outright — otherwise a change to this repo's own
+      # routing caller falls through to default_pool.
+      - .github/workflows/ci-assign-reviewers.yml
+      - .github/workflows/refresh-reviewers.yml
+      - .github/reviewers.yml
+    reviewers:
+      - wei-hai
+      - deepme987
+
+  # AGENTS.md standard checker + housekeeping workflows.
+  - paths:
+      - .github/agents-md-integrity/**
+      - .github/workflows/agents-md-integrity.yml
+      - .github/workflows/test-agents-md-integrity.yml
+      - .github/workflows/stale.yml
+      - .github/workflows/detect-unreviewed-merge.yml
+      # Its `ci-` prefixed self-enrollment caller, named outright for the same
+      # reason ci-assign-reviewers.yml is below: no glob here reaches it.
+      - .github/workflows/ci-detect-unreviewed-merge.yml
+    reviewers:
+      - wei-hai
+      - deepme987
+
+  # Repo-level docs and standards. Deliberately the broad pool, since an
+  # AGENTS.md or README change can come from any of the areas above.
+  - paths:
+      - AGENTS.md
+      - CLAUDE.md
+      - README.md
+    reviewers:
+      - wei-hai
+      - huntcsg
+      - deepme987

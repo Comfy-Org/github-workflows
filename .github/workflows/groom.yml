@@ -179,10 +179,14 @@ on:
         required: false
         default: the whole repository
       model:
-        description: Anthropic model id for both the finder and the verifier agents.
+        description: >-
+          Anthropic model id for the finder, verifier, and builder agents. Defaults
+          to the current flagship — finding real refactors and adjudicating them is
+          quality-sensitive, so the strongest model earns its cost here. A caller
+          can pin an older id (e.g. `claude-opus-4-8`) to hold a run steady.
         type: string
         required: false
-        default: claude-opus-4-8
+        default: claude-opus-5
       workflows_ref:
         description: >-
           Ref of Comfy-Org/github-workflows to load the groom briefs + ledger

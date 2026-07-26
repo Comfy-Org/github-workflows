@@ -243,6 +243,24 @@ bump_repo() {
 
     OLD_CONTENT=$(jq -r '.content' <<<"$CURRENT" | base64 -d)
 
+    # Which github-workflows reusables does this file actually CALL? Taken from
+    # `uses:` lines only (`^[^#]*uses:` keeps a commented-out `# uses:` out), so a
+    # prose comment or a docs URL that merely NAMES a sibling workflow cannot make
+    # a single-reusable caller look multi-reusable — that would wrongly trip the
+    # attribution guard below and leave the caller's marker stale, i.e. re-create
+    # the very BE-4523 bug. Empty means we could not identify one (an unusual
+    # spelling): treated as "not provably ours", which only ever costs the
+    # marker refresh, never a pin bump.
+    local GW_USES
+    GW_USES=$(grep -oE '^[^#]*uses:[[:space:]]*[^[:space:]]*github-workflows/\.github/workflows/[A-Za-z0-9._-]+\.ya?ml' <<<"$OLD_CONTENT" \
+      | sed -E 's|.*/||' | sort -u) || true
+    # Provably ours alone → safe to rewrite unattributed marker comments.
+    # Provably NOT ours alone → this file also calls a SIBLING fleet's reusable.
+    local GW_ONLY_OURS=0 GW_HAS_SIBLING=0
+    if [[ -n "$GW_USES" ]]; then
+      if [[ "$GW_USES" == "$WORKFLOW_FILE" ]]; then GW_ONLY_OURS=1; else GW_HAS_SIBLING=1; fi
+    fi
+
     # Rewrite the github-workflows pin(s) to NEW_SHA and normalize the stale pin
     # comments.
     #
@@ -267,40 +285,93 @@ bump_repo() {
     # Rule 2 is additionally `^`-anchored so it only fires where `workflows_ref:`
     # is a block-mapping key, never inside a prose comment that mentions it.
     #
-    # Rules 3-5 normalize the pin COMMENTS, because a comment that still names
-    # the OLD commit after the pin moved is worse than no comment — it is a
-    # confident lie in the one file where the pin is the whole point:
-    #   `# github-workflows#27`  -> `# github-workflows main (<short>)`
-    #   `# main @ 29a81ca …`     -> `# main @ <short> …`   (the groom callers' form)
-    # The `# main @` rules are anchored to that comment token AND to the same two
-    # pin contexts by line address (`github-workflows` or `workflows_ref`), so an
-    # unrelated `# main @ <sha>` note elsewhere in the caller is untouched. The
-    # two line addresses MUST stay identical: a groom caller's
-    # `workflows_ref: <sha>  # main @ <short>` line is rewritten by rule 2, so a
-    # narrower address here would bump that pin while leaving its comment naming
-    # the old commit — reintroducing, on the second of the two groom pins, exactly
-    # the confident lie these rules exist to kill.
+    # In a file that also calls a SIBLING github-workflows reusable, rule 1 (the
+    # `uses:` pin — token-anchored on repo name alone, not on WHICH reusable) is
+    # additionally address-restricted to OUR reusable's path via SHA_ADDR: without
+    # it, a caller pinning TWO github-workflows reusables would have BOTH `uses:`
+    # lines bumped to this fleet's SHA — a cross-fleet stamp that silently points
+    # the sibling caller at a commit its own fleet never shipped. Rules 4-6 (the
+    # `# main @` comment, below) ride on the SAME address, since the annotation
+    # belongs to whichever pin line it sits on. The tightening is inert for every
+    # caller today (all 23 call exactly one github-workflows reusable, so the
+    # address matches everywhere rule 1 would anyway); it exists so a caller that
+    # starts calling two cannot be corrupted.
     #
-    # Rule 3 (the FULL-sha comment form) is load-bearing now that rule 1 no longer
-    # sprays every 40-hex on the line: a deliberate `# main @ <40hex>` note used to
-    # be corrected as collateral of the old line-scoped substitution, and would
-    # otherwise be left naming the old commit. Rules 4-5 handle the SHORT form and
-    # are bounded to {7,12} hex, which only holds if the hex run ENDS there —
+    # Rule 2 (`workflows_ref:`) stays unaddressed in both cases: it is a `with:`
+    # input carrying no workflow name, so telling OUR job's from a sibling job's
+    # needs YAML block structure a line-wise sed does not have — and leaving ours
+    # un-bumped (a `workflows_ref` disagreeing with its own `uses:` pin) is the
+    # worse failure. Unreachable while no caller calls two reusables; if one ever
+    # does, parse the YAML instead of extending this rule.
+    local SHA_ADDR='github-workflows|workflows_ref'
+    if (( GW_HAS_SIBLING )); then
+      SHA_ADDR="github-workflows[^[:space:]]*${WORKFLOW_FILE//./\\.}|workflows_ref"
+    fi
+    #
+    # The `# github-workflows#NN` legacy marker (and its already-converted
+    # `main (<short>)` form) is deliberately NOT rewritten here — it names a SHA
+    # but not WHICH reusable's pin it annotates (it can sit in prose ABOVE the
+    # `uses:` line, outside any single pin's address), so it cannot be
+    # address-scoped like the rules below. It is normalized after this rewrite,
+    # gated on GW_ONLY_OURS (see below), instead of unconditionally here.
+    #
+    # Rules 4-6 normalize the `# main @ <sha>` comment (the groom callers' form),
+    # because a comment that still names the OLD commit after the pin moved is
+    # worse than no comment — it is a confident lie in the one file where the pin
+    # is the whole point: `# main @ 29a81ca …` -> `# main @ <short> …`. Rule 4 (the
+    # FULL-sha form) is load-bearing now that rules 1-2 no longer sweep every
+    # 40-hex on the line: a deliberate `# main @ <40hex>` note used to be
+    # corrected as collateral of the old broad substitution, and would otherwise
+    # be left naming the old commit. Rules 5-6 handle the SHORT form and are
+    # bounded to {7,12} hex, which only holds if the hex run ENDS there —
     # `[0-9a-f]{7,12}` alone is happy to match the first 12 characters of a longer
     # run, so on a 40-hex comment it would swap 12 hex for the 7-char SHORT and
-    # leave the remaining 28 dangling, mangling the very full-form comment rule 3
-    # just corrected. Requiring a non-hex character (rule 4) or end of line
-    # (rule 5) after the run makes the match a whole token, so a 13+ hex run
+    # leave the remaining 28 dangling, mangling the very full-form comment rule 4
+    # just corrected. Requiring a non-hex character (rule 5) or end of line
+    # (rule 6) after the run makes the match a whole token, so a 13+ hex run
     # matches neither. A hex-boundary assertion (`\b`, `[[:>:]]`) would be simpler
     # but spells differently in GNU and BSD sed; this is portable ERE.
     NEW_CONTENT=$(sed -E "
-      s|(${USES_PIN_RE})${REF_RE}|\1${NEW_SHA}|g
+      /${SHA_ADDR}/ s|(${USES_PIN_RE})${REF_RE}|\1${NEW_SHA}|g
       s|^(${INPUT_PIN_RE})${REF_RE}|\1${NEW_SHA}|
-      s|# github-workflows#[0-9]+|# github-workflows main (${SHORT})|g
-      /github-workflows|workflows_ref/ s|# main @ [0-9a-f]{40}|# main @ ${NEW_SHA}|g
-      /github-workflows|workflows_ref/ s|# main @ [0-9a-f]{7,12}([^0-9a-f])|# main @ ${SHORT}\1|g
-      /github-workflows|workflows_ref/ s|# main @ [0-9a-f]{7,12}\$|# main @ ${SHORT}|g
+      /${SHA_ADDR}/ s|# main @ [0-9a-f]{40}|# main @ ${NEW_SHA}|g
+      /${SHA_ADDR}/ s|# main @ [0-9a-f]{7,12}([^0-9a-f])|# main @ ${SHORT}\1|g
+      /${SHA_ADDR}/ s|# main @ [0-9a-f]{7,12}\$|# main @ ${SHORT}|g
     " <<<"$OLD_CONTENT")
+
+    # Normalize the human-readable pin annotation so it never disagrees with the
+    # pin above. Two spellings, both handled here:
+    #   * the LEGACY `# github-workflows#NN` form (converted on first sight), and
+    #   * the ALREADY-CONVERTED `github-workflows main (<short>)` form (BE-4523).
+    # Only the legacy rule existed before, and it fires once — so after a caller
+    # was migrated, every later bump advanced the real 40-hex pin and left the
+    # annotation frozen at whatever it was on conversion day. Comfy-iOS shipped a
+    # bump whose `uses:`/`workflows_ref` were current while both of its marker
+    # comments still named a SHA the file no longer used, and it had to be
+    # hand-fixed. The marker pattern is deliberately NOT anchored to `# ` so it
+    # also catches the prose form callers put ABOVE the `uses:` line ("# Pinned
+    # to github-workflows main (dc65b8b). …"), which is the same annotation and
+    # goes stale the same way; `{7,40}` covers both the short and full-SHA
+    # spellings. Re-running against an already-current marker rewrites it to
+    # itself, so this stays a no-op for a converged caller (the already-pinned
+    # clean-skip path still skips). A caller using some other comment form
+    # (agents-md-integrity's `# v1`) matches neither rule and is untouched.
+    #
+    # Attribution guard: an annotation of these two forms names a SHA but not
+    # WHICH reusable it annotates — and, appearing in prose above the pin as often
+    # as beside it, it carries no line context to attribute it by either. So in a
+    # file that calls several github-workflows reusables there is no honest way to
+    # tell whose is whose, and rewriting them all would stamp this fleet's SHA
+    # onto a sibling fleet's annotation. Rewrite only when the file is provably
+    # ours alone; otherwise leave every annotation as found and say so. (No caller
+    # does this today; the guard is why the new rule cannot regress one that starts
+    # to.) The `# main @` form needs no guard here — it is bound to the pin line it
+    # annotates and moved above, under the same address as the pin itself.
+    if (( GW_ONLY_OURS )); then
+      NEW_CONTENT=$(sed -E "s|# github-workflows#[0-9]+|# github-workflows main (${SHORT})|g; s|github-workflows main \([0-9a-f]{7,40}\)|github-workflows main (${SHORT})|g" <<<"$NEW_CONTENT")
+    elif grep -qE '# github-workflows#[0-9]+|github-workflows main \([0-9a-f]{7,40}\)' <<<"$OLD_CONTENT"; then
+      echo "::warning::${REPO}: ${FILE} does not call ${WORKFLOW_FILE} alone — leaving its github-workflows pin comments untouched"
+    fi
 
     # Wire an extra identity/config into this file when its entry is flagged
     # (BE-1814's cloud-code-bot review identity is the first user). Idempotent —
@@ -347,15 +418,22 @@ bump_repo() {
     # first-`#` strip would read back a bare NEW_SHA and accept that corrupted
     # value. Under YAML's rule the value survives intact, compares unequal, and
     # fails the repo — the loud outcome, as designed.
-    local LIVE_CONTENT STALE_PINS SAFE_PINS
+    local LIVE_CONTENT USES_SCAN STALE_PINS SAFE_PINS
     LIVE_CONTENT=$(sed -E 's|^| |; s|[[:space:]]#.*$||' <<<"$NEW_CONTENT")
+    # The `uses:` pin scan is restricted to the same SHA_ADDR-eligible lines as
+    # rule 1's rewrite above (a no-op restriction outside the sibling case): a
+    # sibling reusable's `uses:` pin is deliberately left untouched by rule 1, so
+    # scanning it here too would read its (unrelated, un-moved) ref as a stale
+    # github-workflows pin and fail an otherwise-clean repo. The `workflows_ref:`
+    # scan below stays unrestricted — rule 2 is unaddressed for the same reason.
+    USES_SCAN=$(grep -E "$SHA_ADDR" <<<"$LIVE_CONTENT") || true
     STALE_PINS=$(
       {
         # A `uses:` ref cannot contain whitespace, so the token after `@` is the
         # whole ref. `workflows_ref` is a YAML scalar, so take the rest of the
         # line — that keeps an expression value readable in the warning instead
         # of truncating it to `${{`.
-        grep -oE "${USES_PIN_RE}[^[:space:]]+" <<<"$LIVE_CONTENT" | sed -E 's|^.*@||'
+        grep -oE "${USES_PIN_RE}[^[:space:]]+" <<<"$USES_SCAN" | sed -E 's|^.*@||'
         grep -oE "${INPUT_KEY_RE}[[:space:]]*[^[:space:]].*$" <<<"$LIVE_CONTENT" \
           | sed -E 's|^.*workflows_ref:[[:space:]]*||; s|[[:space:]]+$||'
       # An extracted value that is EMPTY after unquoting is named rather than
