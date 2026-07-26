@@ -179,7 +179,19 @@ real groom, so a skipped tick costs ~nothing (it never reaches the finder).
   `interval_days` input (`interval_days: ${{ vars.GROOM_INTERVAL_DAYS || '7' }}`)
   and re-evaluates it each run, so changing the variable retunes cadence — weekly
   → every-3-days → daily — with **no workflow-file edit**, the same "live knob"
-  ergonomics as the per-repo caps.
+  ergonomics as the per-repo caps. Both cadence inputs (`interval_days`,
+  `cadence`) are declared **`type: string`** deliberately: they carry a free-text
+  Actions variable, and a `number` input would make GitHub reject a typo'd value
+  (`weekly`, `7d`) at workflow-call time — failing the run *closed* before the
+  degradation below could ever run. As strings, `interval.py` is the single
+  normalization authority.
+- **A tick clears the bar a half-tick early.** GitHub's cron fires late by an
+  unpredictable amount, so demanding a full `interval_days` on a daily tick would
+  skip at 6.99 days elapsed, push the run to tomorrow, and — because the clock
+  re-anchors on that later run — ratchet the cadence a day later every cycle. The
+  gate compares against `interval_days` less `0.5` (capped at half the interval),
+  which absorbs the jitter without letting two real runs land on consecutive
+  daily ticks (those are a full ~1.0 day apart).
 - **Last-run state is derived from GitHub Actions run history**, not a writable
   store: the GitHub-native option that needs **no net-new secret** and only
   `actions: read`. A prior run "counts" only if it actually reached the finder

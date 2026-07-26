@@ -104,7 +104,9 @@ name: Groom (reusable)
 # each run, and on the daily base cron the reusable early-exits unless that many
 # days have elapsed since the last real groom run — so weekly -> every-3-days ->
 # daily is a variable edit, no workflow-file change. `workflow_dispatch` always
-# runs regardless.
+# runs regardless. Both cadence inputs are `type: string` on purpose so a typo'd
+# variable ("weekly", "7d") degrades to the weekly default inside the gate rather
+# than failing the whole run at workflow-call time — pass them as strings.
 
 on:
   workflow_call:
@@ -132,9 +134,15 @@ on:
           cadence with no workflow-file edit — see the caller pattern in the
           header. `workflow_dispatch` always runs regardless. Default 7 keeps the
           original weekly behavior; 0 disables the throttle (run every base tick).
-        type: number
+          Deliberately `type: string`, not `number`: this is wired to a free-text
+          Actions variable a human edits, and a `number` input makes GitHub reject
+          a typo'd value ("weekly", "7d") at workflow-call time — failing the run
+          CLOSED, the opposite of this gate's fail-open design and unreachable by
+          interval.py's own blank/garbage/negative -> 7 degradation. As a string
+          the Python parser is the single normalization authority.
+        type: string
         required: false
-        default: 7
+        default: '7'
       cadence:
         description: >-
           Volume-gate window in days (see volume_gate). When the gate is on, the
@@ -145,9 +153,12 @@ on:
           happen (see the interval gate below). Normalized through the same
           parser as `interval_days` (blank/garbage/negative -> 7) and floored at
           1 day, so wiring both to one Actions variable can't drift the gates.
-        type: number
+          `type: string` for the same reason as `interval_days` — both are wired
+          to the one free-text Actions variable, so a `number` input would fail
+          the run closed on a typo before either gate's degradation could run.
+        type: string
         required: false
-        default: 7
+        default: '7'
       volume_gate:
         description: >-
           Skip the (expensive) audit when nothing merged in the last `cadence`

@@ -130,6 +130,19 @@ class RunAuditedTest(unittest.TestCase):
         self.assertFalse(interval.run_audited([]))
 
 
+class IntervalThresholdTest(unittest.TestCase):
+    def test_full_day_intervals_lose_a_half_tick(self):
+        self.assertEqual(interval.interval_threshold(7.0), 6.5)
+        self.assertEqual(interval.interval_threshold(3.0), 2.5)
+        self.assertEqual(interval.interval_threshold(1.0), 0.5)
+
+    def test_sub_daily_intervals_cap_the_slack_at_half(self):
+        # A 0.5-day slack would zero the bar (= run every tick) for a sub-daily
+        # cadence on a sub-daily base cron; keep a proportional throttle instead.
+        self.assertEqual(interval.interval_threshold(0.5), 0.25)
+        self.assertEqual(interval.interval_threshold(0.25), 0.125)
+
+
 class IntervalDecisionTest(unittest.TestCase):
     def test_within_interval_skips(self):
         d = interval.interval_decision(7.0, iso(3), NOW)
@@ -139,6 +152,22 @@ class IntervalDecisionTest(unittest.TestCase):
     def test_at_or_after_interval_runs(self):
         self.assertTrue(interval.interval_decision(7.0, iso(7), NOW)["should_run"])
         self.assertTrue(interval.interval_decision(7.0, iso(9.5), NOW)["should_run"])
+
+    def test_cron_jitter_just_under_the_interval_still_runs(self):
+        # The regression this tolerance exists for: GitHub fired the last real
+        # run a few minutes late, so the due tick measures 6.99 days. Without the
+        # half-tick slack this skips, the run slips a day, the clock re-anchors
+        # on the later run, and the cadence drifts later every cycle.
+        for days in (6.99, 6.75, 6.5):
+            d = interval.interval_decision(7.0, iso(days), NOW)
+            self.assertTrue(d["should_run"], days)
+
+    def test_the_previous_daily_tick_still_skips(self):
+        # The slack must not pull the run a whole tick early: the tick one day
+        # before the due one sits at ~6.0 days, well under the 6.5 bar.
+        for days in (6.0, 6.25, 6.49):
+            d = interval.interval_decision(7.0, iso(days), NOW)
+            self.assertFalse(d["should_run"], days)
 
     def test_no_prior_run_runs(self):
         self.assertTrue(interval.interval_decision(7.0, None, NOW)["should_run"])

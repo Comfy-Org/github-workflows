@@ -27,9 +27,15 @@ run (API hiccup, unparseable timestamp, no history) RUNS the audit rather than
 silently skipping a due groom. `workflow_dispatch` **always** bypasses the gate —
 a manual run is an explicit override.
 
-The pure decision logic (`run_audited`, `days_since`, `interval_decision`) is
-separated from the thin `gh` I/O shell (`fetch_workflow_runs`, `fetch_run_jobs`)
-so it is fully unit-testable with no network.
+A tick clears the gate a half-tick EARLY (`interval_threshold`): GitHub's cron
+fires late by an unpredictable amount, so demanding a full `interval_days` on a
+daily tick would skip at 6.99 days elapsed and ratchet the cadence a day later
+every cycle. See `_TICK_TOLERANCE_DAYS`.
+
+The pure decision logic (`run_audited`, `days_since`, `interval_threshold`,
+`interval_decision`) is separated from the thin `gh` I/O shell
+(`fetch_workflow_runs`, `fetch_run_jobs`) so it is fully unit-testable with no
+network.
 
 CLI (what the groom gate job calls):
 
@@ -66,6 +72,23 @@ _AUDITED_CONCLUSIONS = {"success", "failure"}
 # Default cadence when GROOM_INTERVAL_DAYS is unset/blank/garbage — 7 days keeps
 # the documented weekly behavior (AC: unset variable stays weekly, matching today).
 _DEFAULT_INTERVAL_DAYS = 7.0
+
+# Slack allowed on the elapsed-days bar, in days, to absorb scheduler jitter.
+#
+# GitHub fires `schedule:` cron LATE by an unpredictable amount (routinely
+# minutes, sometimes tens of minutes), and the base cron is a DAILY tick, so the
+# gap between two consecutive real runs is measured with that much noise while
+# the only available answers are ~1 day apart. Requiring a FULL `interval_days`
+# therefore drops a whole tick whenever the due tick happens to fire earlier
+# relative to the anchor than the last real run did — last real run started Mon
+# 09:31 (scheduler delay), next Monday's tick starts 09:19, elapsed 6.99 < 7, so
+# it skips and the run slips to Tuesday. Worse, the clock re-anchors on THAT
+# later run, so the cadence ratchets later every cycle (7 -> 8 -> 8 days...).
+#
+# Clearing the bar half a tick early absorbs the jitter. It cannot make two real
+# runs land on consecutive daily ticks: those are a full ~1.0 day apart, which is
+# still short of a 0.5-day tolerance on any interval >= 1.
+_TICK_TOLERANCE_DAYS = 0.5
 
 # Floor for the volume gate's merge-activity window. The volume gate shares this
 # same cadence knob, but a sub-1-day lookback is meaningless for "did anything
@@ -158,12 +181,25 @@ def run_audited(jobs) -> bool:
     return False
 
 
+def interval_threshold(interval_days: float) -> float:
+    """The elapsed-days bar a tick must clear: the interval, less jitter slack.
+
+    The tolerance is capped at HALF the interval so a sub-daily cadence driven by
+    a sub-daily base cron (e.g. an hourly caller with `interval_days: 0.25`) keeps
+    a real throttle instead of collapsing to a bar of 0 = "run every tick".
+    """
+    return interval_days - min(_TICK_TOLERANCE_DAYS, interval_days / 2.0)
+
+
 def interval_decision(interval_days: float, last_run_iso, now: datetime) -> dict:
     """Pure gate decision, given the last real run (or None) and now.
 
     - No prior real run -> run (first groom, fail-open).
     - `interval_days <= 0` -> run (throttle disabled).
-    - `days_since(last) >= interval_days` -> run; else skip cheaply.
+    - `days_since(last) >= interval_threshold(interval_days)` -> run; else skip
+      cheaply. The bar is the interval less a half-tick of scheduler-jitter slack
+      so late-firing cron can't drift the cadence a day later every cycle
+      (see _TICK_TOLERANCE_DAYS).
     """
     if interval_days <= 0:
         return {"should_run": True, "reason": f"interval_days={interval_days:g} (<=0) — throttle disabled, running.",
@@ -172,12 +208,15 @@ def interval_decision(interval_days: float, last_run_iso, now: datetime) -> dict
         return {"should_run": True, "reason": "no prior groom run found in history — running (fail-open).",
                 "days_since": None, "last_run_at": None}
     elapsed = days_since(last_run_iso, now)
-    if elapsed >= interval_days:
+    threshold = interval_threshold(interval_days)
+    if elapsed >= threshold:
         return {"should_run": True,
-                "reason": f"{elapsed:.2f} days since last run >= interval {interval_days:g} — running.",
+                "reason": (f"{elapsed:.2f} days since last run >= {threshold:g} "
+                           f"(interval {interval_days:g} less jitter slack) — running."),
                 "days_since": round(elapsed, 2), "last_run_at": last_run_iso}
     return {"should_run": False,
-            "reason": f"skipped: {elapsed:.2f} days since last run < interval {interval_days:g}.",
+            "reason": (f"skipped: {elapsed:.2f} days since last run < {threshold:g} "
+                       f"(interval {interval_days:g} less jitter slack)."),
             "days_since": round(elapsed, 2), "last_run_at": last_run_iso}
 
 
