@@ -229,10 +229,11 @@ printf '%s\n' \
   '      - uses: actions/checkout@abcdefabcdefabcdefabcdefabcdefabcdefabcd  # v6' \
   '    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@1111111111111111111111111111111111111111 # main @ 1111111 — groom.yml not on the v1 tag yet' \
   '    with:' \
-  '      workflows_ref: 1111111111111111111111111111111111111111' \
+  '      workflows_ref: 1111111111111111111111111111111111111111  # main @ 1111111' \
   "      max_prs: \${{ github.event.inputs.max_prs || '1' }}" \
   '      # github-workflows pin note, short form, hex run ends at EOL: # main @ 1111111' \
   '      # github-workflows pin note, deliberate FULL sha: # main @ 1111111111111111111111111111111111111111' \
+  '      # unrelated third-party note, neither anchor on the line: # main @ 2222222' \
   > "$GROOM_FIXTURE"
 STUB_CONTENT_FILE="$GROOM_FIXTURE" run_bump \
   VAR_NAME=GROOM_CALLERS TAG=groom WORKFLOW_FILE=groom.yml \
@@ -252,6 +253,16 @@ check "'# main @ <short>' at EOL rewritten"   "grep -qE '# main @ ${SHORT}\$' \"
 # left alone — an unbounded {7,12} match would eat its first 12 characters, swap in
 # the 7-char SHORT and strand the other 28 as a nonsense suffix.
 check "full-sha '# main @' keeps full form"   "grep -qF '# main @ ${NEW_SHA}' \"$PUT\""
+# The `workflows_ref:` pin is bumped by the 40-hex rule, so its OWN `# main @
+# <short>` note has to move with it — the comment rules are anchored to the same
+# two pin contexts as that rule for exactly this line. A narrower anchor bumps the
+# pin and leaves the comment naming the old commit: a confident lie on the second
+# of groom's two pins.
+check "workflows_ref's own pin comment moved" \
+  "grep -qE \"workflows_ref: ${NEW_SHA} +# main @ ${SHORT}\$\" \"$PUT\""
+# ...and the anchor still BOUNDS the rewrite: a `# main @ <short>` note on a line
+# naming neither pin context belongs to some other pin and must be left alone.
+check "unanchored '# main @' note untouched"  "grep -qF '# main @ 2222222' \"$PUT\""
 # The third-party action pin is a full 40-hex SHA on a line that does NOT mention
 # github-workflows — the address anchor is what keeps it intact (the org mandates
 # SHA-pinning every action, so clobbering it would break the caller's CI).

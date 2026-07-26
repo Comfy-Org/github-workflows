@@ -204,10 +204,15 @@ bump_repo() {
     # lie in the one file where the pin is the whole point:
     #   `# github-workflows#27`  -> `# github-workflows main (<short>)`
     #   `# main @ 29a81ca …`     -> `# main @ <short> …`   (the groom callers' form)
-    # The second is anchored to the github-workflows line so an unrelated `# main @
-    # <sha>` note elsewhere in the caller is untouched, and bounded to {7,12} hex
-    # so a deliberate FULL-sha comment keeps its full form (the 40-hex rewrite
-    # above has already corrected it) instead of being shortened.
+    # The second is anchored to the SAME two pin contexts as the 40-hex rule above
+    # (`github-workflows` or `workflows_ref`) so an unrelated `# main @ <sha>` note
+    # elsewhere in the caller is untouched, and bounded to {7,12} hex so a
+    # deliberate FULL-sha comment keeps its full form (the 40-hex rewrite above has
+    # already corrected it) instead of being shortened. The two anchors MUST stay
+    # identical: a groom caller's `workflows_ref: <sha>  # main @ <short>` line is
+    # rewritten by rule 1, so a narrower anchor here would bump that pin while
+    # leaving its comment naming the old commit — reintroducing, on the second of
+    # the two groom pins, exactly the confident lie these rules exist to kill.
     #
     # That bound only holds if the hex run ENDS there, hence the two rules rather
     # than one: `[0-9a-f]{7,12}` alone is happy to match the first 12 characters of
@@ -222,8 +227,8 @@ bump_repo() {
     NEW_CONTENT=$(sed -E "
       /github-workflows|workflows_ref/ s/[0-9a-f]{40}/${NEW_SHA}/g
       s|# github-workflows#[0-9]+|# github-workflows main (${SHORT})|g
-      /github-workflows/ s|# main @ [0-9a-f]{7,12}([^0-9a-f])|# main @ ${SHORT}\1|g
-      /github-workflows/ s|# main @ [0-9a-f]{7,12}\$|# main @ ${SHORT}|g
+      /github-workflows|workflows_ref/ s|# main @ [0-9a-f]{7,12}([^0-9a-f])|# main @ ${SHORT}\1|g
+      /github-workflows|workflows_ref/ s|# main @ [0-9a-f]{7,12}\$|# main @ ${SHORT}|g
     " <<<"$OLD_CONTENT")
 
     # Wire an extra identity/config into this file when its entry is flagged
