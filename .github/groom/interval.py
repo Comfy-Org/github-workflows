@@ -50,6 +50,7 @@ is carried in the JSON, and any failure is folded into a fail-open `should_run`)
 
 import argparse
 import json
+import math
 import re
 import subprocess
 import sys
@@ -86,8 +87,8 @@ _DEFAULT_INTERVAL_DAYS = 7.0
 # later run, so the cadence ratchets later every cycle (7 -> 8 -> 8 days...).
 #
 # Clearing the bar half a tick early absorbs the jitter. It cannot make two real
-# runs land on consecutive daily ticks: those are a full ~1.0 day apart, which is
-# still short of a 0.5-day tolerance on any interval >= 1.
+# runs land on consecutive daily ticks: those are a full ~1.0 day apart, which
+# still exceeds the 0.5-day tolerance on any interval >= 1.
 _TICK_TOLERANCE_DAYS = 0.5
 
 # Floor for the volume gate's merge-activity window. The volume gate shares this
@@ -119,6 +120,9 @@ def parse_interval_days(raw, default: float = _DEFAULT_INTERVAL_DAYS):
     Unset/blank/negative/non-numeric all fall back to `default` (7 = weekly) so a
     misconfigured variable degrades to today's behavior rather than disabling the
     gate. A value of exactly 0 is honored (0 = no throttle, run every tick).
+    `inf`/`nan` parse as valid floats but would silently wedge the gate (a NaN
+    threshold makes every `>=` comparison false, so it never runs again) — reject
+    them the same as any other garbage input.
     """
     if raw is None:
         return default
@@ -129,7 +133,7 @@ def parse_interval_days(raw, default: float = _DEFAULT_INTERVAL_DAYS):
         value = float(text)
     except ValueError:
         return default
-    if value < 0:
+    if not math.isfinite(value) or value < 0:
         return default
     return value
 

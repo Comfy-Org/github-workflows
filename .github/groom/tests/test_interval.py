@@ -71,6 +71,13 @@ class ParseIntervalDaysTest(unittest.TestCase):
         for raw in (None, "", "   ", "not-a-number", "-3"):
             self.assertEqual(interval.parse_interval_days(raw), 7.0, raw)
 
+    def test_non_finite_defaults_to_weekly(self):
+        # inf/nan parse as valid floats but would wedge the gate: a NaN
+        # threshold makes every `>=` comparison False, so it silently never
+        # runs again. Reject them like any other garbage input.
+        for raw in ("inf", "-inf", "nan", "Infinity"):
+            self.assertEqual(interval.parse_interval_days(raw), 7.0, raw)
+
     def test_numeric_values(self):
         self.assertEqual(interval.parse_interval_days("3"), 3.0)
         self.assertEqual(interval.parse_interval_days("1.5"), 1.5)
@@ -81,6 +88,12 @@ class NormalizeCadenceDaysTest(unittest.TestCase):
     def test_unset_blank_garbage_negative_default_to_weekly(self):
         # Same degradation as the interval gate — the two share one knob.
         for raw in (None, "", "   ", "not-a-number", "-3"):
+            self.assertEqual(interval.normalize_cadence_days(raw), 7, raw)
+
+    def test_non_finite_default_to_weekly(self):
+        # Would otherwise raise in the int() cast (ValueError for nan,
+        # OverflowError for inf) instead of degrading like other bad inputs.
+        for raw in ("inf", "-inf", "nan"):
             self.assertEqual(interval.normalize_cadence_days(raw), 7, raw)
 
     def test_zero_and_fractions_floor_to_one_whole_day(self):

@@ -303,6 +303,13 @@ jobs:
       # actions:read — without it the run-history read 403s and the gate fails
       # OPEN (runs every daily tick, over-spending). See the caller pattern.
       actions: read
+      # The volume gate's `gh api search/issues` (merge-activity check) needs
+      # read on both issues and pull requests. A job `permissions:` block is not
+      # additive with the caller's grant — the token gets ONLY what's listed
+      # here, so without these the search 403s on every run (fails OPEN, so it
+      # over-runs rather than silently skips, but it neuters the gate).
+      issues: read
+      pull-requests: read
     outputs:
       should_run: ${{ steps.check.outputs.should_run }}
     steps:
