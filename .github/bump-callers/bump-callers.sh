@@ -196,9 +196,23 @@ bump_repo() {
     # line and agents-md-integrity's bare `workflows_ref: <sha>` line — so a
     # full-SHA pin of ANOTHER action in the same file (`actions/checkout@<sha>`,
     # the org's mandated practice) is never clobbered to github-workflows' SHA.
-    # The comment rewrite is a no-op for callers that use a different comment
-    # form (e.g. agents-md-integrity's `# v1`), so it is safe to share.
-    NEW_CONTENT=$(sed -E "/github-workflows|workflows_ref/ s/[0-9a-f]{40}/${NEW_SHA}/g; s|# github-workflows#[0-9]+|# github-workflows main (${SHORT})|g" <<<"$OLD_CONTENT")
+    # The comment rewrites are a no-op for callers that use a different comment
+    # form (e.g. agents-md-integrity's `# v1`), so they are safe to share.
+    #
+    # Two comment forms are normalized, because a pin comment that still names the
+    # OLD commit after the pin moved is worse than no comment — it is a confident
+    # lie in the one file where the pin is the whole point:
+    #   `# github-workflows#27`  -> `# github-workflows main (<short>)`
+    #   `# main @ 29a81ca …`     -> `# main @ <short> …`   (the groom callers' form)
+    # The second is anchored to the github-workflows line so an unrelated `# main @
+    # <sha>` note elsewhere in the caller is untouched, and bounded to {7,12} hex
+    # so a deliberate FULL-sha comment keeps its full form (the 40-hex rewrite
+    # above has already corrected it) instead of being shortened.
+    NEW_CONTENT=$(sed -E "
+      /github-workflows|workflows_ref/ s/[0-9a-f]{40}/${NEW_SHA}/g
+      s|# github-workflows#[0-9]+|# github-workflows main (${SHORT})|g
+      /github-workflows/ s|# main @ [0-9a-f]{7,12}|# main @ ${SHORT}|g
+    " <<<"$OLD_CONTENT")
 
     # Wire an extra identity/config into this file when its entry is flagged
     # (BE-1814's cloud-code-bot review identity is the first user). Idempotent —

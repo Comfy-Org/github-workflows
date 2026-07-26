@@ -45,6 +45,16 @@ name: Groom (reusable)
 #           description: 'Run the audit but do NOT file issues'
 #           type: boolean
 #           default: false
+#         # OPTIONAL, builder callers only: let an operator raise the builder PR
+#         # ceiling for ONE manual run without editing the workflow. `choice` (not
+#         # `string`) so the UI offers a sanctioned list; the reusable clamps and
+#         # warns on anything else, so a value posted past this list by an API
+#         # dispatch fails closed at 0 PRs rather than aborting the run.
+#         max_prs:
+#           description: 'Builder PR ceiling for THIS dispatch (schedule uses the `with:` value)'
+#           type: choice
+#           default: '1'
+#           options: ['1', '2', '3', '5']
 #   permissions:
 #     # REQUIRED union — a reusable's nested jobs cannot request more GITHUB_TOKEN
 #     # scope than the caller grants, and GitHub validates this at STARTUP (a short
@@ -83,7 +93,14 @@ name: Groom (reusable)
 #         # so the file / build_pr-bail paths can open groom issues. Pilot with
 #         # dry_run:true first to preview patches without opening PRs.
 #         # builder: true
-#         # max_prs: 5            # throttle: at most N builder PRs per run
+#         # Throttle: at most N builder PRs per run. A bare number pins every run
+#         # (`max_prs: 1`). To let the optional dispatch input above override it for
+#         # one manual run, forward the input with a fallback for the SCHEDULE (which
+#         # carries no inputs, so the expression yields ''):
+#         #   max_prs: ${{ github.event.inputs.max_prs || '1' }}
+#         # No fromJSON() and no allowlist re-check are needed — max_prs is a
+#         # `string` input and the reusable does the parse/clamp (see its
+#         # description). That is the whole reason it is not `type: number`.
 #       secrets:
 #         ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 #         BOT_APP_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
@@ -202,9 +219,42 @@ on:
           the top `max_prs` CONFIRM, non-security findings (ranked by the
           verifier) become PRs; the rest are filed as issues. Ignored unless
           `builder` is true.
-        type: number
+
+
+          Typed `string`, not `number`, ON PURPOSE — so a caller can forward its
+          own `workflow_dispatch` input straight through and let an operator raise
+          the ceiling for one manual run (see the caller pattern in the header).
+          A `workflow_dispatch` input is ALWAYS a string, and GitHub rejects a
+          string expression assigned to a `type: number` reusable input at
+          startup; the workaround is a `fromJSON()` cast in the caller, and
+          `fromJSON()` on a non-numeric string throws during expression
+          evaluation — failing the run before any job starts, with an error far
+          less obvious than "you typo'd a number". Taking a string here keeps
+          that cast, and its failure mode, in ONE place (the `build_select` step
+          below) instead of copy-pasted into every caller. A plain YAML number
+          (`max_prs: 1`) still assigns cleanly to a string input, so existing
+          callers need no change.
+
+
+          Parsing, all of which is non-fatal: empty/whitespace — what a SCHEDULED
+          run yields when a caller forwards `github.event.inputs.max_prs`, since a
+          schedule event carries no inputs — means "no override asked for" and
+          takes this default; a number is floor-clamped to >= 0; anything else
+          opens ZERO PRs with a loud warning, so a typo'd dispatch fails CLOSED
+          and every finding still files as an issue rather than throwing away a
+          completed audit.
+
+
+          No upper bound is enforced here, deliberately. A caller's `options:`
+          list is a UI convention and a typo guard, NOT a security boundary — the
+          only principals who can post a value past it (an API/CLI
+          `workflow_dispatch`) already have repo write access and could just edit
+          `options:`. The real backstops are structural: builder PRs are review-
+          gated and NEVER auto-merged, the finder emits only ~6-12 findings a run,
+          and `pr_size_limit` bails any oversized patch to an issue.
+        type: string
         required: false
-        default: 5
+        default: '5'
       pr_size_limit:
         description: >-
           Patch-size bail-out. If a finding's generated patch changes more than
@@ -1003,13 +1053,31 @@ jobs:
               print(f"::warning::{len(invalid)} verified finding(s) had no usable signature and were NOT filed (producer error).")
 
           builder = os.environ.get("BUILDER", "false").lower() == "true"
-          # `type: number` can arrive as "5" or "5.0"; parse leniently, clamp >=0.
-          raw = os.environ.get("MAX_PRS", "5").strip()
+          # max_prs is a `string` input so a caller can forward a raw
+          # workflow_dispatch value without a fromJSON() cast (see the input's
+          # description). This is the ONE place it is parsed. Three cases, none of
+          # which may abort the run:
+          #   empty   -> a SCHEDULED run of a caller that forwards
+          #              `github.event.inputs.max_prs`; a schedule event carries no
+          #              inputs, so no override was asked for -> take the default.
+          #   numeric -> accept "5" and "5.0" alike, floor-clamped to >= 0.
+          #   garbage -> `type: choice` constrains only the WEB UI; an API/CLI
+          #              workflow_dispatch can post any string. Fail CLOSED at 0
+          #              PRs with a loud warning instead of exiting non-zero: the
+          #              finder and verifier have already run and been paid for,
+          #              and every finding still files as an issue on the 0-PR
+          #              path. Falling back to MAX_PRS_DEFAULT here would be
+          #              actively wrong — a caller piloting at `max_prs: 1` would
+          #              silently get 5.
+          # OverflowError is caught alongside ValueError because float() accepts
+          # "inf"/"-inf" happily and it is int() that then blows up.
+          MAX_PRS_DEFAULT = "5"  # keep in sync with the input's `default:` above
+          raw = os.environ.get("MAX_PRS", MAX_PRS_DEFAULT).strip() or MAX_PRS_DEFAULT
           try:
               max_prs = max(0, int(float(raw)))
-          except ValueError:
-              print(f"::error::max_prs={raw!r} is not a number.")
-              raise SystemExit(1)
+          except (ValueError, OverflowError):
+              print(f"::warning::max_prs={raw!r} is not a number — opening NO builder PRs this run; every finding files as an issue instead. Re-dispatch with a numeric max_prs.")
+              max_prs = 0
 
           to_build, built_positions = [], set()
           if builder:

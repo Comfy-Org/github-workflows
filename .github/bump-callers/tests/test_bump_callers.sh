@@ -213,6 +213,44 @@ check "base_tree is NOT the commit sha"       "! grep -qF '1234567890abcdef12345
 check "opened a new PR (pr create called)"    "grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
 check "did not edit (no open PR existed)"     "! grep -q '^pr-edit' \"\$STUB_PUT_DIR/pr.log\""
 
+echo "== groom fleet: BOTH pins (uses: + workflows_ref) and the '# main @' comment move together =="
+# A groom caller pins the reusable TWICE — the `uses:` SHA and the `workflows_ref:`
+# input that loads the finder/verifier briefs + dedup ledger. They must move in
+# lock-step or a run executes one version's workflow against another version's
+# briefs. The fixture also carries an `actions/checkout@<40hex>` pin, which must
+# NOT be clobbered to github-workflows' SHA.
+new_case groom
+GROOM_FIXTURE="${WORK}/groom_caller.yml"
+printf '%s\n' \
+  'name: Groom' \
+  'jobs:' \
+  '  groom:' \
+  '    steps:' \
+  '      - uses: actions/checkout@abcdefabcdefabcdefabcdefabcdefabcdefabcd  # v6' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@1111111111111111111111111111111111111111 # main @ 1111111 — groom.yml not on the v1 tag yet' \
+  '    with:' \
+  '      workflows_ref: 1111111111111111111111111111111111111111' \
+  "      max_prs: \${{ github.event.inputs.max_prs || '1' }}" \
+  > "$GROOM_FIXTURE"
+STUB_CONTENT_FILE="$GROOM_FIXTURE" run_bump \
+  VAR_NAME=GROOM_CALLERS TAG=groom WORKFLOW_FILE=groom.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-groomed","file":".github/workflows/groom.yml","label":""}]'
+check "exit 0" "[[ $RC -eq 0 ]]"
+check "masked the private repo name"  "grep -q '::add-mask::Comfy-Org/secret-groomed' <<<\"\$OUT\""
+check "reported groom fleet complete" "grep -q 'groom bump complete' <<<\"\$OUT\""
+PUT="${STUB_PUT_DIR}/put.last.txt"
+check "uses: pin moved"                       "grep -qE \"groom.yml@${NEW_SHA}\" \"$PUT\""
+check "workflows_ref pin moved"               "grep -qE \"workflows_ref: ${NEW_SHA}\" \"$PUT\""
+check "no stale 40-hex pin anywhere"          "! grep -qF '1111111111111111111111111111111111111111' \"$PUT\""
+check "'# main @' comment moved to new short" "grep -qF '# main @ $SHORT' \"$PUT\""
+# The third-party action pin is a full 40-hex SHA on a line that does NOT mention
+# github-workflows — the address anchor is what keeps it intact (the org mandates
+# SHA-pinning every action, so clobbering it would break the caller's CI).
+check "actions/checkout pin untouched"        "grep -qF 'actions/checkout@abcdefabcdefabcdefabcdefabcdefabcdefabcd' \"$PUT\""
+# max_prs forwards a workflow_dispatch string (see groom.yml's input docs); the
+# bumper must not mangle the expression while rewriting the pins around it.
+check "max_prs forward expression intact"     "grep -qF \"github.event.inputs.max_prs || '1'\" \"$PUT\""
+
 echo "== cursor-review fleet: an open bump PR is UPDATED IN PLACE, not re-opened (BE-3882) =="
 new_case reuse
 STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
