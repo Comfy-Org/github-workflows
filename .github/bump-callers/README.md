@@ -42,11 +42,38 @@ The **groom** fleet is the one that most needs this: a groom caller pins the
 reusable **twice** — the `uses:` SHA *and* the `workflows_ref:` input that loads
 the finder/verifier/builder briefs plus the dedup ledger. Those must stay in
 lock-step or a run executes one version's workflow against another version's
-briefs. `bump-callers.sh`'s pin rewrite moves both (it matches the `uses:` line
-and any bare `workflows_ref:` line), so the fleet cannot drift into that split
-state through a hand-bump of only one. It also re-points the `# main @ <short>`
-pin comment those callers carry — a comment still naming the old commit after the
-pin moved is worse than no comment.
+briefs. `bump-callers.sh`'s pin rewrite moves both, so the fleet cannot drift
+into that split state through a hand-bump of only one. It also re-points the
+`# main @ <short>` pin comment those callers carry — a comment still naming the
+old commit after the pin moved is worse than no comment.
+
+## How the pin rewrite is scoped (and why it asserts afterwards)
+
+The rewrite targets the **pin token**, not "any 40-hex on a line that mentions
+`github-workflows`" (BE-4662). Two patterns, matched by position rather than by
+what the ref *looks like*:
+
+- `Comfy-Org/github-workflows…@<ref>` — the `uses:` pin;
+- `workflows_ref: <ref>` as a block-mapping key, optionally quoted — the input pin.
+
+Whatever sits right after the token is the ref, so **any literal ref shape moves**
+— full sha, short sha, or a tag like `v1`. That matters because a caller whose
+`workflows_ref` is a tag used to be skipped by the old 40-hex rule while its
+`uses:` pin moved: a green-looking bump PR on a caller that is now running one
+version's workflow against another version's briefs. In the other direction, an
+unrelated full SHA that merely *shares* a line with the words `github-workflows`
+or `workflows_ref` is now unreachable, and a prose comment mentioning
+`workflows_ref:` is left as prose.
+
+Precision cuts both ways, though — a pin form the patterns don't know how to move
+would be silently left behind. So before a rewritten file can be staged, the
+script re-reads it with a deliberately **broader** reader (any non-whitespace
+value sitting where a ref belongs, comments excluded) and **asserts every
+github-workflows pin now equals the new SHA**. If one does not — today the one
+known case is a `workflows_ref` fed by a `${{ … }}` expression, which is
+intentionally never rewritten — it emits a `::warning::` naming the file and the
+stale value and **fails that repo**, exactly as it does for a transient fetch
+error. A partial bump is worse than no bump (BE-3896).
 
 ## The caller variables
 

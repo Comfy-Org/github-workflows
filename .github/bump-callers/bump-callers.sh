@@ -64,6 +64,31 @@ SHORT="${NEW_SHA:0:7}"
 # the commit/title/body, not the branch name.
 BRANCH="ci/bump-${TAG}"
 
+# The two forms a caller uses to pin THIS repo, written as regex prefixes that
+# end exactly where the ref begins. They live here, together, because the
+# rewrite below and the post-rewrite assertion that guards it must never drift
+# apart: whatever the rewrite is expected to move, the assertion re-reads.
+#   1. the `uses:` pin — `Comfy-Org/github-workflows/<path>@<ref>`
+#   2. the input pin  — `workflows_ref: <ref>` (optionally quoted), which loads
+#      this repo's prompts/briefs/scripts at run time
+# INPUT_PIN_RE is applied `^`-anchored (see the rewrite), i.e. only where
+# `workflows_ref:` is a block-mapping KEY. That is what keeps the rewrite off a
+# prose comment that merely mentions the input — `# workflows_ref: keep in sync
+# with uses:` must not come back with a SHA spliced into the middle of the
+# sentence. The assertion below is deliberately NOT anchored that way, so the
+# one shape this misses (flow style, `with: {workflows_ref: v1}`) fails the repo
+# loudly instead of silently half-bumping it.
+USES_PIN_RE='Comfy-Org/github-workflows[^@[:space:]]*@'
+INPUT_PIN_RE='[[:space:]]*workflows_ref:[[:space:]]*['\''"]?'
+# A LITERAL ref: a full sha, a short sha, or a tag (`v1`). Deliberately excludes
+# quotes, `#` and `$ { } ( )` so a closing quote or a trailing comment is never
+# swallowed, and a GitHub expression (`workflows_ref: ${{ inputs.workflows_ref }}`)
+# is never half-rewritten into a broken value — an expression matches nothing
+# here, is left untouched, and is then caught by the assertion, which fails the
+# repo rather than shipping a caller whose two pins disagree.
+# shellcheck disable=SC2016  # `$ { }` here are regex literals, not an expansion
+REF_RE='[^[:space:]'\''"#$(){}]+'
+
 STRIPPED="${CALLERS_JSON//[[:space:]]/}"
 
 # Empty handling is fleet-specific. A fleet seeded empty (ALLOW_EMPTY=true)
@@ -190,43 +215,61 @@ bump_repo() {
 
     OLD_CONTENT=$(jq -r '.content' <<<"$CURRENT" | base64 -d)
 
-    # Rewrite the github-workflows pin(s) to NEW_SHA and normalize the stale
-    # `# github-workflows#NN` pin comment. Anchor the 40-hex substitution to the
-    # two known pin contexts — the `uses: …Comfy-Org/github-workflows…@<sha>`
-    # line and agents-md-integrity's bare `workflows_ref: <sha>` line — so a
-    # full-SHA pin of ANOTHER action in the same file (`actions/checkout@<sha>`,
-    # the org's mandated practice) is never clobbered to github-workflows' SHA.
-    # The comment rewrites are a no-op for callers that use a different comment
-    # form (e.g. agents-md-integrity's `# v1`), so they are safe to share.
+    # Rewrite the github-workflows pin(s) to NEW_SHA and normalize the stale pin
+    # comments.
     #
-    # Two comment forms are normalized, because a pin comment that still names the
-    # OLD commit after the pin moved is worse than no comment — it is a confident
-    # lie in the one file where the pin is the whole point:
+    # Rules 1-2 are anchored to the PIN TOKEN itself (BE-4662) —
+    # `Comfy-Org/github-workflows…@<ref>` and `workflows_ref: <ref>` — NOT to
+    # "any 40-hex on a line that mentions github-workflows or workflows_ref",
+    # which is what this used to key on. Keying on the line was wrong in both
+    # directions, and silently so:
+    #   * UNDER-rewrite. A caller pins this repo TWICE — the `uses:` sha and the
+    #     `workflows_ref:` input that loads the briefs/prompts/scripts at run
+    #     time — and the halves must move in lock-step or a run executes one
+    #     version's workflow against another version's assets. A `workflows_ref`
+    #     pinned to a TAG (`v1`) or a short sha is not 40 hex, so it was left
+    #     behind while `uses:` moved, and the content-equality check below still
+    #     saw a difference — a green-looking bump PR on a split caller.
+    #   * OVER-rewrite. An unrelated 40-hex value that merely shared such a line
+    #     was clobbered to NEW_SHA.
+    # Matching the ref by POSITION (right after the pin token) instead of by
+    # 40-hex-ness fixes both at once: any literal ref shape is moved, and a
+    # full-SHA pin of ANOTHER action (`actions/checkout@<sha>`, the org's
+    # mandated practice) or a co-located digest is unreachable by both patterns.
+    # Rule 2 is additionally `^`-anchored so it only fires where `workflows_ref:`
+    # is a block-mapping key, never inside a prose comment that mentions it.
+    #
+    # Rules 3-5 normalize the pin COMMENTS, because a comment that still names
+    # the OLD commit after the pin moved is worse than no comment — it is a
+    # confident lie in the one file where the pin is the whole point:
     #   `# github-workflows#27`  -> `# github-workflows main (<short>)`
     #   `# main @ 29a81ca …`     -> `# main @ <short> …`   (the groom callers' form)
-    # The second is anchored to the SAME two pin contexts as the 40-hex rule above
-    # (`github-workflows` or `workflows_ref`) so an unrelated `# main @ <sha>` note
-    # elsewhere in the caller is untouched, and bounded to {7,12} hex so a
-    # deliberate FULL-sha comment keeps its full form (the 40-hex rewrite above has
-    # already corrected it) instead of being shortened. The two anchors MUST stay
-    # identical: a groom caller's `workflows_ref: <sha>  # main @ <short>` line is
-    # rewritten by rule 1, so a narrower anchor here would bump that pin while
-    # leaving its comment naming the old commit — reintroducing, on the second of
-    # the two groom pins, exactly the confident lie these rules exist to kill.
+    # The `# main @` rules are anchored to that comment token AND to the same two
+    # pin contexts by line address (`github-workflows` or `workflows_ref`), so an
+    # unrelated `# main @ <sha>` note elsewhere in the caller is untouched. The
+    # two line addresses MUST stay identical: a groom caller's
+    # `workflows_ref: <sha>  # main @ <short>` line is rewritten by rule 2, so a
+    # narrower address here would bump that pin while leaving its comment naming
+    # the old commit — reintroducing, on the second of the two groom pins, exactly
+    # the confident lie these rules exist to kill.
     #
-    # That bound only holds if the hex run ENDS there, hence the two rules rather
-    # than one: `[0-9a-f]{7,12}` alone is happy to match the first 12 characters of
-    # a longer run, so on a `# main @ <40hex>` comment (already rewritten to
-    # NEW_SHA by rule 1) it would swap 12 hex for the 7-char SHORT and leave the
-    # remaining 28 dangling — mangling the very full-form comment the bound exists
-    # to protect. Requiring a non-hex character (or end of line) after the run
-    # makes the match a whole token: rule 3 catches the short form mid-line, rule 4
-    # the same at EOL, and a 13+ hex run matches neither and is left intact. A
-    # hex-boundary assertion (`\b`, `[[:>:]]`) would be simpler but spells
-    # differently in GNU and BSD sed; this is portable ERE.
+    # Rule 3 (the FULL-sha comment form) is load-bearing now that rule 1 no longer
+    # sprays every 40-hex on the line: a deliberate `# main @ <40hex>` note used to
+    # be corrected as collateral of the old line-scoped substitution, and would
+    # otherwise be left naming the old commit. Rules 4-5 handle the SHORT form and
+    # are bounded to {7,12} hex, which only holds if the hex run ENDS there —
+    # `[0-9a-f]{7,12}` alone is happy to match the first 12 characters of a longer
+    # run, so on a 40-hex comment it would swap 12 hex for the 7-char SHORT and
+    # leave the remaining 28 dangling, mangling the very full-form comment rule 3
+    # just corrected. Requiring a non-hex character (rule 4) or end of line
+    # (rule 5) after the run makes the match a whole token, so a 13+ hex run
+    # matches neither. A hex-boundary assertion (`\b`, `[[:>:]]`) would be simpler
+    # but spells differently in GNU and BSD sed; this is portable ERE.
     NEW_CONTENT=$(sed -E "
-      /github-workflows|workflows_ref/ s/[0-9a-f]{40}/${NEW_SHA}/g
+      s|(${USES_PIN_RE})${REF_RE}|\1${NEW_SHA}|g
+      s|^(${INPUT_PIN_RE})${REF_RE}|\1${NEW_SHA}|
       s|# github-workflows#[0-9]+|# github-workflows main (${SHORT})|g
+      /github-workflows|workflows_ref/ s|# main @ [0-9a-f]{40}|# main @ ${NEW_SHA}|g
       /github-workflows|workflows_ref/ s|# main @ [0-9a-f]{7,12}([^0-9a-f])|# main @ ${SHORT}\1|g
       /github-workflows|workflows_ref/ s|# main @ [0-9a-f]{7,12}\$|# main @ ${SHORT}|g
     " <<<"$OLD_CONTENT")
@@ -250,6 +293,42 @@ bump_repo() {
           echo "::warning::${REPO}: ${FILE} bot-identity wiring failed — bumping SHA only"
         fi
       fi
+    fi
+
+    # ASSERT that the rewrite actually moved EVERY github-workflows pin in this
+    # file, before it can be staged (BE-4662). The patterns above are precise by
+    # design, and precision cuts both ways: a pin form they do not know how to
+    # move is silently left behind. So re-read the result with a DELIBERATELY
+    # BROADER reader — any non-whitespace value sitting where a ref belongs — and
+    # fail the repo if anything but NEW_SHA is still there. The gap between the
+    # two (today: a `workflows_ref` fed by a `${{ … }}` expression, which is
+    # deliberately never rewritten) then surfaces as a loud, named failure
+    # instead of a green-looking PR that bumps `uses:` and leaves the assets ref
+    # behind. A caller running one version's workflow against another version's
+    # briefs is exactly the split this fleet exists to prevent, and — as with the
+    # transient fetch error above — a partial bump is worse than no bump (BE-3896).
+    #
+    # Comments are not pins, so drop everything from the first `#` on each line
+    # before scanning: a prose note that happens to say `workflows_ref:` must not
+    # fail an otherwise-clean repo. This cannot hide a real pin — a pin and its
+    # trailing comment are never the same token, and the rewrite's REF_RE stops
+    # at `#` for the same reason.
+    local LIVE_CONTENT STALE_PINS
+    LIVE_CONTENT=$(sed -E 's|#.*$||' <<<"$NEW_CONTENT")
+    STALE_PINS=$(
+      {
+        # A `uses:` ref cannot contain whitespace, so the token after `@` is the
+        # whole ref. `workflows_ref` is a YAML scalar, so take the rest of the
+        # line — that keeps an expression value readable in the warning instead
+        # of truncating it to `${{`.
+        grep -oE "${USES_PIN_RE}[^[:space:]]+" <<<"$LIVE_CONTENT" | sed -E 's|^.*@||'
+        grep -E "workflows_ref:[[:space:]]*[^[:space:]]" <<<"$LIVE_CONTENT" \
+          | sed -E 's|^.*workflows_ref:[[:space:]]*||; s|[[:space:]]+$||'
+      } | sed -E "s|^['\"]||; s|['\"]\$||" | grep -v '^$' | grep -vFx "$NEW_SHA" | sort -u
+    )
+    if [[ -n "$STALE_PINS" ]]; then
+      echo "::warning::${REPO}: ${FILE} still pins github-workflows at $(tr '\n' ' ' <<<"$STALE_PINS")after the rewrite (expected ${NEW_SHA}) — failing repo to avoid a half-bumped caller"
+      return 1
     fi
 
     # Already fully pinned → the rewrite is a no-op → nothing to do for this file.
