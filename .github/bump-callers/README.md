@@ -53,7 +53,11 @@ The rewrite targets the **pin token**, not "any 40-hex on a line that mentions
 `github-workflows`" (BE-4662). Two patterns, matched by position rather than by
 what the ref *looks like*:
 
-- `Comfy-Org/github-workflows…@<ref>` — the `uses:` pin;
+- `Comfy-Org/github-workflows…@<ref>` — the `uses:` pin. The owner/repo is matched
+  **case-insensitively**, because GitHub resolves `uses:` that way and a caller
+  written `comfy-org/…` is calling this repo; what follows the repo name must be
+  the `/` of a path or the `@` of a ref, so a **sibling** repo whose name merely
+  starts the same (`github-workflows-tools/action@v1`) is out of reach.
 - `workflows_ref: <ref>` as a block-mapping key, optionally quoted — the input pin.
 
 Whatever sits right after the token is the ref, so **any literal ref shape moves**
@@ -73,7 +77,16 @@ github-workflows pin now equals the new SHA**. If one does not — today the one
 known case is a `workflows_ref` fed by a `${{ … }}` expression, which is
 intentionally never rewritten — it emits a `::warning::` naming the file and the
 stale value and **fails that repo**, exactly as it does for a transient fetch
-error. A partial bump is worse than no bump (BE-3896).
+error. A partial bump is worse than no bump (BE-3896). An empty pin
+(`workflows_ref: ""`) and a value the rewrite could only half-move (a `#` inside
+the ref) fail the same way rather than reading back as clean.
+
+Because that reader is the one place a false positive would block an otherwise
+clean caller's bump on every run, it is bounded on both sides: comments are
+dropped by YAML's own rule (a `#` preceded by whitespace, so a `#` *inside* a
+value survives to be compared), and the `workflows_ref` key needs a real left
+boundary, so a longer key that merely ends in it (`upstream_workflows_ref: v1`)
+is not read as this repo's pin.
 
 ## The caller variables
 

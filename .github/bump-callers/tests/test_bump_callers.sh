@@ -15,6 +15,10 @@
 #     sha, tag) — while an unrelated 40-hex merely sharing such a line is left
 #     alone, and a pin the rewrite cannot move fails the repo rather than
 #     shipping a half-bumped caller,
+#   * the pin token's edges hold in both directions: a differently-cased
+#     owner/repo is still this repo, while a sibling repo whose name starts the
+#     same and a longer key ending in `workflows_ref` are neither rewritten nor
+#     misread as a stale pin,
 #   * an empty seeded-empty fleet is a clean no-op while a must-have-callers
 #     fleet still hard-fails, and a malformed variable hard-fails.
 #
@@ -663,6 +667,7 @@ STUB_CONTENT_FILE="$EXPR_FIXTURE" run_bump \
 check "exit 1 — the repo failed"               "[[ $RC -eq 1 ]]"
 check "warning names the file"                 "grep -q 'agents-md-integrity.yml still pins github-workflows' <<<\"\$OUT\""
 check "warning names the un-bumped pin"        "grep -qF 'inputs.workflows_ref' <<<\"\$OUT\""
+check "warning reads as a sentence"            "grep -qF 'inputs.workflows_ref }} after the rewrite' <<<\"\$OUT\""
 check "committed NOTHING"                      "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
 check "opened NO PR"                           "[[ ! -f \"\$STUB_PUT_DIR/pr.log\" ]] || ! grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
 check "job failed for the repo"                "grep -q 'bump failed for 1 repo' <<<\"\$OUT\""
@@ -693,6 +698,130 @@ check "staged the caller"                       "[[ \$(cat \"\$STUB_PUT_DIR/coun
 check "both real pins bumped"                   "[[ \$(grep -cF '$NEW_SHA' \"$PUT\") -eq 2 ]]"
 check "old pin gone"                            "! grep -qF '2222222222222222222222222222222222222222' \"$PUT\""
 check "prose comment still readable"            "grep -qF 'keep this in lock-step with the uses: pin above' \"$PUT\""
+
+echo "== a SIBLING repo that merely starts with our name is NOT repinned (BE-4662) =="
+# The pin token ends at a DELIMITER. Without one, the path glob after the repo
+# name also swallows a sibling repo's name — `github-workflows-tools/action@v1`
+# would be repinned to THIS repo's SHA, and because the assertion reads pins with
+# the same pattern it would read the corrupted value back as NEW_SHA and stage it.
+new_case sibling
+SIB_FIXTURE="${WORK}/sibling_caller.yml"
+printf '%s\n' \
+  'name: CI cursor-review' \
+  'jobs:' \
+  '  review:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@1111111111111111111111111111111111111111  # github-workflows#27' \
+  '  tools:' \
+  '    uses: Comfy-Org/github-workflows-tools/.github/workflows/lint.yml@cccccccccccccccccccccccccccccccccccccccc  # v3' \
+  '    steps:' \
+  '      - uses: Comfy-Org/github-workflows-actions/setup@v2' \
+  > "$SIB_FIXTURE"
+STUB_CONTENT_FILE="$SIB_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-sibling","file":".github/workflows/ci.yml","label":""}]'
+PUT="${STUB_PUT_DIR}/put.last.txt"
+check "exit 0" "[[ $RC -eq 0 ]]"
+check "our pin bumped"                          "grep -qF 'cursor-review.yml@$NEW_SHA' \"$PUT\""
+check "sibling repo's SHA pin left intact"      "grep -qF 'github-workflows-tools/.github/workflows/lint.yml@cccccccccccccccccccccccccccccccccccccccc' \"$PUT\""
+check "sibling repo's tag pin left intact"      "grep -qF 'github-workflows-actions/setup@v2' \"$PUT\""
+check "exactly ONE pin was rewritten"           "[[ \$(grep -cF '$NEW_SHA' \"$PUT\") -eq 1 ]]"
+
+echo "== a lowercase owner/repo is still THIS repo — both halves move (BE-4662) =="
+# GitHub resolves `uses:` owner/repo case-insensitively, so a caller written
+# `comfy-org/…` is calling this repo. A case-SENSITIVE match would skip its
+# `uses:` half while rule 2 (repo-agnostic) bumped `workflows_ref` anyway, and the
+# assertion — reading `uses:` with the same pattern — would not see the stale half
+# either: a silently half-bumped caller, the split this change exists to prevent.
+new_case lowercase
+LC_FIXTURE="${WORK}/lowercase_caller.yml"
+printf '%s\n' \
+  'name: AGENTS.md Integrity' \
+  'jobs:' \
+  '  agents-md:' \
+  '    uses: comfy-org/github-workflows/.github/workflows/agents-md-integrity.yml@2222222222222222222222222222222222222222  # v1' \
+  '    with:' \
+  '      workflows_ref: v1' \
+  > "$LC_FIXTURE"
+STUB_CONTENT_FILE="$LC_FIXTURE" run_bump \
+  VAR_NAME=AGENTS_MD_CALLERS TAG=agents-md-integrity WORKFLOW_FILE=agents-md-integrity.yml ALLOW_EMPTY=true \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-lowercase","file":".github/workflows/agents-md-integrity.yml","label":""}]'
+PUT="${STUB_PUT_DIR}/put.last.txt"
+check "exit 0" "[[ $RC -eq 0 ]]"
+check "staged the caller"                       "[[ \$(cat \"\$STUB_PUT_DIR/count\") -eq 1 ]]"
+check "lowercase uses: pin bumped"              "grep -qF 'comfy-org/github-workflows/.github/workflows/agents-md-integrity.yml@$NEW_SHA' \"$PUT\""
+check "workflows_ref bumped in lock-step"       "grep -qF 'workflows_ref: $NEW_SHA' \"$PUT\""
+check "owner case preserved as written"         "! grep -qF 'Comfy-Org/github-workflows/.github' \"$PUT\""
+check "both pins at the new SHA"                "[[ \$(grep -cF '$NEW_SHA' \"$PUT\") -eq 2 ]]"
+
+echo "== a longer key ENDING in workflows_ref is not a stale pin =="
+# The assertion is looser than the rewrite by design, which makes it the one place
+# a false positive hard-fails a clean repo. `upstream_workflows_ref: v1` is not
+# this repo's input — rule 2 correctly leaves it alone — so reading it as an
+# un-bumped github-workflows pin would block this caller's bump on every run.
+new_case longkey
+LONGKEY_FIXTURE="${WORK}/longkey_caller.yml"
+printf '%s\n' \
+  'name: AGENTS.md Integrity' \
+  'jobs:' \
+  '  agents-md:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/agents-md-integrity.yml@2222222222222222222222222222222222222222  # v1' \
+  '    with:' \
+  '      workflows_ref: 2222222222222222222222222222222222222222' \
+  '      upstream_workflows_ref: v1' \
+  > "$LONGKEY_FIXTURE"
+STUB_CONTENT_FILE="$LONGKEY_FIXTURE" run_bump \
+  VAR_NAME=AGENTS_MD_CALLERS TAG=agents-md-integrity WORKFLOW_FILE=agents-md-integrity.yml ALLOW_EMPTY=true \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-longkey","file":".github/workflows/agents-md-integrity.yml","label":""}]'
+PUT="${STUB_PUT_DIR}/put.last.txt"
+check "exit 0 — the foreign key did not trip it" "[[ $RC -eq 0 ]]"
+check "staged the caller"                        "[[ \$(cat \"\$STUB_PUT_DIR/count\") -eq 1 ]]"
+check "both real pins bumped"                    "[[ \$(grep -cF '$NEW_SHA' \"$PUT\") -eq 2 ]]"
+check "foreign key's value left alone"           "grep -qE '^[[:space:]]*upstream_workflows_ref:[[:space:]]*v1\$' \"$PUT\""
+
+echo "== a '#' inside the ref cannot fake its way past the assertion =="
+# `#` is legal in a git ref name, and REF_RE stops at it, so rule 2 rewrites only
+# the part before: `'feature#1'` -> `'<NEW_SHA>#1'`. Stripping comments at the
+# FIRST `#` would read that back as a bare NEW_SHA and accept the corrupted value;
+# stripping by YAML's rule (whitespace-preceded `#`) keeps the value whole, so it
+# compares unequal and fails the repo instead of shipping broken YAML.
+new_case hashref
+HASH_FIXTURE="${WORK}/hash_ref_caller.yml"
+printf '%s\n' \
+  'name: AGENTS.md Integrity' \
+  'jobs:' \
+  '  agents-md:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/agents-md-integrity.yml@2222222222222222222222222222222222222222  # v1' \
+  '    with:' \
+  "      workflows_ref: 'feature#1'" \
+  > "$HASH_FIXTURE"
+STUB_CONTENT_FILE="$HASH_FIXTURE" run_bump \
+  VAR_NAME=AGENTS_MD_CALLERS TAG=agents-md-integrity WORKFLOW_FILE=agents-md-integrity.yml ALLOW_EMPTY=true \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-hashref","file":".github/workflows/agents-md-integrity.yml","label":""}]'
+check "exit 1 — the repo failed"                 "[[ $RC -eq 1 ]]"
+check "warning names the half-rewritten value"   "grep -qF '#1' <<<\"\$OUT\""
+check "committed NOTHING"                        "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+check "opened NO PR"                             "[[ ! -f \"\$STUB_PUT_DIR/pr.log\" ]] || ! grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
+
+echo "== an EMPTY workflows_ref is a stale pin, not a blank to skip =="
+# `workflows_ref: \"\"` is a pin rule 2 cannot move either (REF_RE needs >=1
+# character), so dropping empty extracted values would let it slip past while
+# `uses:` moved — the silent half-bump the assertion exists to catch.
+new_case emptyref
+EMPTY_FIXTURE="${WORK}/empty_ref_caller.yml"
+printf '%s\n' \
+  'name: AGENTS.md Integrity' \
+  'jobs:' \
+  '  agents-md:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/agents-md-integrity.yml@2222222222222222222222222222222222222222  # v1' \
+  '    with:' \
+  '      workflows_ref: ""' \
+  > "$EMPTY_FIXTURE"
+STUB_CONTENT_FILE="$EMPTY_FIXTURE" run_bump \
+  VAR_NAME=AGENTS_MD_CALLERS TAG=agents-md-integrity WORKFLOW_FILE=agents-md-integrity.yml ALLOW_EMPTY=true \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-emptyref","file":".github/workflows/agents-md-integrity.yml","label":""}]'
+check "exit 1 — the repo failed"                 "[[ $RC -eq 1 ]]"
+check "warning names the empty pin"              "grep -qF '(empty)' <<<\"\$OUT\""
+check "committed NOTHING"                        "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
 
 echo
 echo "== $PASS passed, $FAIL failed =="

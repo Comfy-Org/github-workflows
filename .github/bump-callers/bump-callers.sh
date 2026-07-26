@@ -78,8 +78,36 @@ BRANCH="ci/bump-${TAG}"
 # sentence. The assertion below is deliberately NOT anchored that way, so the
 # one shape this misses (flow style, `with: {workflows_ref: v1}`) fails the repo
 # loudly instead of silently half-bumping it.
-USES_PIN_RE='Comfy-Org/github-workflows[^@[:space:]]*@'
+#
+# The repo name is spelled case-INSENSITIVELY because GitHub resolves a `uses:`
+# owner/repo that way — a caller written `comfy-org/github-workflows/…@<old>` is
+# calling THIS repo and must be bumped like any other. Missing it would be the
+# worst kind of miss: rule 2 below is repo-agnostic, so the caller's
+# `workflows_ref:` half would move while `uses:` stayed stale, and the assertion
+# (which reuses this same regex to read `uses:` back) would not see the stale
+# half either — shipping exactly the split bump this change exists to prevent.
+# Character classes rather than a case-insensitive flag: sed's `I` and grep's
+# `-i` are not portable/scopable the same way, and this regex is shared by both.
+REPO_RE='[Cc][Oo][Mm][Ff][Yy]-[Oo][Rr][Gg]/[Gg][Ii][Tt][Hh][Uu][Bb]-[Ww][Oo][Rr][Kk][Ff][Ll][Oo][Ww][Ss]'
+# The path segment is OPTIONAL but the delimiter after the repo name is NOT:
+# what follows `github-workflows` must be the `/` that starts the path or the `@`
+# that starts the ref. Without that, `[^@[:space:]]*` also swallows a SIBLING
+# repo's name — `Comfy-Org/github-workflows-tools/action@v1` would be repinned to
+# THIS repo's SHA, and because the assertion reuses this regex it would read the
+# corrupted value back as NEW_SHA and stage it silently.
+USES_PIN_RE="${REPO_RE}(/[^@[:space:]]*)?@"
 INPUT_PIN_RE='[[:space:]]*workflows_ref:[[:space:]]*['\''"]?'
+# The assertion's reader for the input pin. Deliberately looser than
+# INPUT_PIN_RE's `^`-anchored use — it also catches flow style
+# (`with: {workflows_ref: v1}`), which the rewrite cannot move — but it still
+# needs a LEFT boundary. Unanchored, `workflows_ref:` matches inside a longer key
+# like `upstream_workflows_ref: v1`, whose value rule 2 correctly leaves alone;
+# the assertion would then read that value as a stale github-workflows pin and
+# hard-fail an otherwise-clean repo on every run. The boundary is a plain
+# character class, not `(^|…)`: `^` inside a group is a GNU extension, and the
+# assertion pads every line with a leading space first (see below) so a key at
+# column 0 is covered by the same class.
+INPUT_KEY_RE='[[:space:],{]workflows_ref:'
 # A LITERAL ref: a full sha, a short sha, or a tag (`v1`). Deliberately excludes
 # quotes, `#` and `$ { } ( )` so a closing quote or a trailing comment is never
 # swallowed, and a GitHub expression (`workflows_ref: ${{ inputs.workflows_ref }}`)
@@ -308,13 +336,19 @@ bump_repo() {
     # briefs is exactly the split this fleet exists to prevent, and — as with the
     # transient fetch error above — a partial bump is worse than no bump (BE-3896).
     #
-    # Comments are not pins, so drop everything from the first `#` on each line
-    # before scanning: a prose note that happens to say `workflows_ref:` must not
-    # fail an otherwise-clean repo. This cannot hide a real pin — a pin and its
-    # trailing comment are never the same token, and the rewrite's REF_RE stops
-    # at `#` for the same reason.
-    local LIVE_CONTENT STALE_PINS
-    LIVE_CONTENT=$(sed -E 's|#.*$||' <<<"$NEW_CONTENT")
+    # Comments are not pins, so drop them before scanning: a prose note that
+    # happens to say `workflows_ref:` must not fail an otherwise-clean repo. A
+    # comment is stripped by YAML's OWN rule — a `#` preceded by whitespace (every
+    # line is padded with a leading space first, so that also covers a `#` at
+    # column 0, and gives INPUT_KEY_RE's boundary class a character to match at
+    # line start) — NOT at the first `#` anywhere on the line. That distinction is
+    # what keeps the assertion honest about a `#` INSIDE a value: REF_RE stops at
+    # `#`, so `workflows_ref: 'feature#1'` is rewritten to `'<NEW_SHA>#1'`, and a
+    # first-`#` strip would read back a bare NEW_SHA and accept that corrupted
+    # value. Under YAML's rule the value survives intact, compares unequal, and
+    # fails the repo — the loud outcome, as designed.
+    local LIVE_CONTENT STALE_PINS SAFE_PINS
+    LIVE_CONTENT=$(sed -E 's|^| |; s|[[:space:]]#.*$||' <<<"$NEW_CONTENT")
     STALE_PINS=$(
       {
         # A `uses:` ref cannot contain whitespace, so the token after `@` is the
@@ -322,12 +356,25 @@ bump_repo() {
         # line — that keeps an expression value readable in the warning instead
         # of truncating it to `${{`.
         grep -oE "${USES_PIN_RE}[^[:space:]]+" <<<"$LIVE_CONTENT" | sed -E 's|^.*@||'
-        grep -E "workflows_ref:[[:space:]]*[^[:space:]]" <<<"$LIVE_CONTENT" \
+        grep -oE "${INPUT_KEY_RE}[[:space:]]*[^[:space:]].*$" <<<"$LIVE_CONTENT" \
           | sed -E 's|^.*workflows_ref:[[:space:]]*||; s|[[:space:]]+$||'
-      } | sed -E "s|^['\"]||; s|['\"]\$||" | grep -v '^$' | grep -vFx "$NEW_SHA" | sort -u
+      # An extracted value that is EMPTY after unquoting is named rather than
+      # dropped: `workflows_ref: ""` is a pin the rewrite cannot move either
+      # (REF_RE needs ≥1 character), so filtering blanks out here would let it
+      # slip past the assertion while `uses:` moved — the exact silent half-bump
+      # this guard exists to catch. It is not a legal ref, so it fails loudly.
+      } | sed -E "s|^['\"]||; s|['\"]\$||" \
+        | sed -E 's|^$|(empty)|' | grep -vFx "$NEW_SHA" | sort -u
     )
     if [[ -n "$STALE_PINS" ]]; then
-      echo "::warning::${REPO}: ${FILE} still pins github-workflows at $(tr '\n' ' ' <<<"$STALE_PINS")after the rewrite (expected ${NEW_SHA}) — failing repo to avoid a half-bumped caller"
+      # Sanitize before echoing: these values come from a caller file, and the
+      # run logs of this public repo are a workflow-command sink. `tr` collapses
+      # the newline join but not a carriage return, so a value carrying `\r::`
+      # could inject a command of its own; `::` is neutralized for the same
+      # reason. (The value itself is a ref of THIS public repo, so there is
+      # nothing private to redact — only a control character to defang.)
+      SAFE_PINS=$(tr -d '\r' <<<"$STALE_PINS" | sed -E 's|::|:|g' | tr '\n' ' ' | sed -E 's|[[:space:]]+$||')
+      echo "::warning::${REPO}: ${FILE} still pins github-workflows at ${SAFE_PINS} after the rewrite (expected ${NEW_SHA}) — failing repo to avoid a half-bumped caller"
       return 1
     fi
 
