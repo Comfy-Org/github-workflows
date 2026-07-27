@@ -28,6 +28,24 @@ forward automatically instead of silently drifting commits behind.
 | [`bump-pr-size-callers.yml`](../workflows/bump-pr-size-callers.yml) | `pr-size.yml` or `scripts/check-pr-size/**` | `PR_SIZE_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-assign-reviewers-callers.yml`](../workflows/bump-assign-reviewers-callers.yml) | `assign-reviewers.yml` | `ASSIGN_REVIEWERS_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-groom-callers.yml`](../workflows/bump-groom-callers.yml) | `groom.yml` or `groom/**` | `GROOM_CALLERS` | empty `[]` (grows as callers land) |
+| [`bump-auto-label-callers.yml`](../workflows/bump-auto-label-callers.yml) | `cursor-review-auto-label.yml` | `AUTO_LABEL_CALLERS` | non-empty (hard-fails if empty) |
+
+### Reusables with no fleet — deliberate, not an oversight
+
+| Reusable | Callers | Why no fleet |
+|---|---|---|
+| `stale.yml` | 0 | Nothing to bump. Add a fleet when the first caller lands. |
+| `assign-prs-to-author.yml` | 0 | Same. |
+| `detect-unreviewed-merge.yml` | ~12 | **A real gap.** Its pins are bumped by hand. Deferred deliberately, not missed. |
+
+A reusable that has callers but no fleet is the trap this whole directory exists
+to prevent: the pins simply never move, so consumers drift behind indefinitely
+and only find out when the caller and the reusable stop being compatible. That is
+not hypothetical — the groom fleet omitted *its own* caller (`ci-groom.yml`) from
+`GROOM_CALLERS`, the pin sat unchanged from the day it was written, and the caller
+ended up failing at startup against a reusable it had drifted away from. Before
+adding a caller anywhere, check that its fleet exists **and** that the repo is in
+the variable; the second half is the one people skip.
 
 They stay as thin entrypoints rather than one matrix because their triggers
 differ: a `cursor-review.yml` change must not spuriously bump agents-md or
