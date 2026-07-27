@@ -90,9 +90,11 @@ tests — run the matching command above for whatever you touched.
 ## Conventions & gotchas
 
 - **Public repo — never leak private caller names.** Consumer repo lists live in
-  repo **variables** (`CURSOR_REVIEW_CALLERS`, `AGENTS_MD_CALLERS`), never
-  hardcoded in a workflow file or printed to run logs (logs are public). The
-  bumper masks names it processes. Keep private repo paths/detail out of
+  repo **variables** — one per fleet (`CURSOR_REVIEW_CALLERS`,
+  `AUTO_LABEL_CALLERS`, `AGENTS_MD_CALLERS`, `PR_SIZE_CALLERS`,
+  `ASSIGN_REVIEWERS_CALLERS`, `GROOM_CALLERS`; the bump-callers README table is
+  canonical) — never hardcoded in a workflow file or printed to run logs (logs
+  are public). The bumper masks names it processes. Keep private repo paths/detail out of
   workflow files, commit messages, and PR text.
 - **Pin everything by full commit SHA**, with a trailing `# v1` comment — both
   the `uses:` in callers and every third-party action here. Bare `@v1` fails the
