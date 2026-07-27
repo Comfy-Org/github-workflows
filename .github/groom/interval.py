@@ -21,9 +21,11 @@ over-spend). A prior run "counts" as a real groom only if it actually reached th
 finder (its `Audit — finder` job ran, i.e. was not `skipped` by this very gate),
 so the interval-skip ticks in between never reset the clock. Run history is
 durable across the stateless CI runs and readable with only `actions: read`.
-A **path-scoped** run (groom.yml's `path` input, BE-4757) also does not count: it
-audited one directory, so it must not stamp "done" over the whole-repo audit it
-never performed — see `_SCOPED_JOB_MARKER`.
+The clock is **per scope** (groom.yml's `path` input, BE-4757): a run counts only
+against a tick auditing the SAME scope. A path-scoped run must not stamp "done"
+over the whole-repo audit it never performed, and — symmetrically — a permanently
+path-scoped caller must still get a working cadence for ITS directory rather than
+re-billing an audit every tick. See `_SCOPED_MARKER_PREFIX`.
 
 The gate is **fail-open**, matching the volume gate: any error deriving the last
 run (API hiccup, unparseable timestamp, no history) RUNS the audit rather than
@@ -44,7 +46,8 @@ CLI (what the groom gate job calls):
 
     python3 .github/groom/interval.py \
         --repo owner/name --workflow-file ci-groom.yml \
-        --current-run-id 123 --interval-days 7 --event-name schedule
+        --current-run-id 123 --interval-days 7 --event-name schedule \
+        --path ''            # the scope this tick would audit ('' = whole repo)
 
 Prints a `{should_run, reason, interval_days, days_since, last_run_at}` decision
 JSON to stdout; the gate step reads `.should_run`. Always exits 0 (the decision
@@ -67,23 +70,43 @@ from datetime import datetime, timezone
 # `skipped`, so it never matches the audited conclusions below.
 _FINDER_JOB_HINTS = ("finder", "audit_find")
 
-# A PATH-SCOPED audit (groom.yml's `path` input, BE-4757) must NOT reset the
-# whole-repo cadence clock. `workflow_dispatch` deliberately bypasses this gate,
-# so without this exclusion a manual `path: services/api` run would reach the
-# finder, become "the last real groom", and suppress the next scheduled
-# whole-repo tick for a full GROOM_INTERVAL_DAYS — a PARTIAL audit stamping
-# "done" over the full one.
+# The subset of the above that proves we are reading a RENDERED DISPLAY name, and
+# can therefore read the scope marker off it. The bare job-id form (`audit_find`)
+# carries no marker — not because it is whole-repo, but because the name never
+# went through groom.yml's `name:` expression at all — so it is treated as
+# UNKNOWN scope and counts for nothing. See `run_audited`.
+_DISPLAY_NAME_HINTS = ("finder",)
+
+# The cadence clock is PER SCOPE (groom.yml's `path` input, BE-4757). The signal
+# has to survive the runs API, which does NOT return a run's dispatch INPUTS — so
+# groom.yml renames the finder job itself when `path` is set (`Audit — finder
+# (scoped: services/api)`). Job names are the one per-run discriminator both
+# sides can see.
 #
-# The signal has to survive the runs API, which does NOT return a run's dispatch
-# INPUTS — so groom.yml renames the finder job itself when `path` is set (`Audit
-# — finder (scoped)`) and this marker is what excludes it. Job names are the one
-# per-run discriminator both sides can see.
+# Both directions matter:
 #
-# Collision direction is deliberate: a caller whose OWN job name happened to
-# contain "(scoped)" would make a real whole-repo run stop counting, i.e. groom
-# would run MORE often. That is the same fail-open bias as every other branch in
-# this module — never the silent under-run.
-_SCOPED_JOB_MARKER = "(scoped)"
+# * A scoped run must not reset the WHOLE-REPO clock. `workflow_dispatch`
+#   deliberately bypasses this gate, so without the marker a manual
+#   `path: services/api` run would reach the finder, become "the last real
+#   groom", and suppress the next scheduled whole-repo tick for a full
+#   GROOM_INTERVAL_DAYS — a PARTIAL audit stamping "done" over the full one.
+# * A permanently scoped caller (an explicitly documented pattern: pin `path` in
+#   `with:` to groom one directory as its own unit) must still HAVE a clock. With
+#   a scope-blind exclusion every one of its finder jobs is invisible, the gate
+#   fails open on every tick, and the billed audit re-runs daily no matter what
+#   GROOM_INTERVAL_DAYS says — the cadence knob silently defeated for exactly the
+#   configuration the `path` input advertises.
+#
+# So the marker carries the path, and a tick counts only a prior run of its OWN
+# scope. The path charset (`scope.py:_COMPONENT_RE` plus `/`) is deliberately
+# narrow, so it embeds in a job name without escaping concerns.
+_SCOPED_MARKER_PREFIX = "(scoped:"
+
+# Collision direction is deliberate everywhere here: an unrecognised, truncated
+# or ambiguous job name (a caller job id long enough to push the marker past
+# GitHub's name rendering, say) makes a real run stop counting, i.e. groom runs
+# MORE often. That is the same fail-open bias as every other branch in this
+# module — never the silent under-run.
 
 # A finder job that reached success OR failure spent the (billed) audit, so both
 # count as a real run: counting a failure keeps a run that spent money but died
@@ -197,18 +220,40 @@ def days_since(then_iso: str, now: datetime) -> float:
     return (now - then).total_seconds() / 86400.0
 
 
-def run_audited(jobs) -> bool:
-    """True if a run's jobs show a WHOLE-REPO finder actually ran.
+def scoped_job_marker(path: str) -> str:
+    """The job-name marker groom.yml appends for a run scoped to `path`.
 
-    Not an interval-skip (its finder job is `skipped`), and not a path-scoped
-    audit (its finder job carries `_SCOPED_JOB_MARKER`) — a scoped run audits one
-    directory, so it must leave the next scheduled whole-repo tick DUE.
+    Kept next to the matcher that reads it, so the producing expression in
+    groom.yml and the consuming comparison cannot drift apart silently
+    (`test_interval.py` pins both halves against this).
     """
+    return f"(scoped: {path})"
+
+
+def run_audited(jobs, scope_path: str = "") -> bool:
+    """True if a run's jobs show a finder for `scope_path` actually ran.
+
+    `scope_path` is the scope of the tick being decided: "" for a whole-repo
+    audit, else the audited directory. A run counts only against its OWN scope —
+    a scoped run must leave the next scheduled whole-repo tick DUE, and a
+    whole-repo sweep is not a substitute for a scoped caller's own cadence.
+
+    Never counted: an interval-skip (its finder job is `skipped`), and a job
+    matched only by the bare job-id hint, whose name never carried the scope
+    marker and so cannot be ATTRIBUTED to a scope at all. Both fall through to
+    "no prior run", which fails open.
+    """
+    want = scoped_job_marker(scope_path).lower() if scope_path else ""
     for job in jobs or []:
         name = (job.get("name") or "").lower()
-        if _SCOPED_JOB_MARKER in name:
+        if not any(hint in name for hint in _FINDER_JOB_HINTS):
             continue
-        if any(hint in name for hint in _FINDER_JOB_HINTS) and job.get("conclusion") in _AUDITED_CONCLUSIONS:
+        if job.get("conclusion") not in _AUDITED_CONCLUSIONS:
+            continue
+        if want:
+            if want in name:
+                return True
+        elif _SCOPED_MARKER_PREFIX not in name and any(h in name for h in _DISPLAY_NAME_HINTS):
             return True
     return False
 
@@ -292,12 +337,13 @@ def fetch_run_jobs(repo: str, run_id, run=subprocess.run):
     return payload.get("jobs", []) if isinstance(payload, dict) else []
 
 
-def find_last_audited_run_at(repo, workflow_file, current_run_id, run=subprocess.run):
+def find_last_audited_run_at(repo, workflow_file, current_run_id, scope_path="", run=subprocess.run):
     """`run_started_at` of the most recent completed run that ran the finder.
 
     Walks the caller workflow's runs newest-first, skips the current run and any
-    still-in-progress run, and returns the first whose finder job actually ran.
-    Returns None if none is found within the scanned window (-> fail-open run).
+    still-in-progress run, and returns the first whose finder job actually ran
+    FOR `scope_path`. Returns None if none is found within the scanned window
+    (-> fail-open run).
     """
     current = str(current_run_id) if current_run_id is not None else None
     for wf_run in fetch_workflow_runs(repo, workflow_file, run=run):
@@ -306,18 +352,19 @@ def find_last_audited_run_at(repo, workflow_file, current_run_id, run=subprocess
         if wf_run.get("status") != "completed":
             continue
         jobs = fetch_run_jobs(repo, wf_run.get("id"), run=run)
-        if run_audited(jobs):
+        if run_audited(jobs, scope_path):
             return wf_run.get("run_started_at")
     return None
 
 
-def evaluate(repo, workflow_file, current_run_id, interval_days, event_name, now, run=subprocess.run) -> dict:
+def evaluate(repo, workflow_file, current_run_id, interval_days, event_name, now,
+             scope_path="", run=subprocess.run) -> dict:
     """Full gate decision, folding dispatch bypass + fail-open around the pure logic."""
     if event_name == "workflow_dispatch":
         return {"should_run": True, "reason": "workflow_dispatch — interval gate bypassed (manual override).",
                 "interval_days": interval_days, "days_since": None, "last_run_at": None}
     try:
-        last_run_iso = find_last_audited_run_at(repo, workflow_file, current_run_id, run=run)
+        last_run_iso = find_last_audited_run_at(repo, workflow_file, current_run_id, scope_path, run=run)
     except Exception as exc:  # noqa: BLE001 — any failure to read history must fail OPEN, never skip a due groom.
         return {"should_run": True, "reason": f"could not read run history ({exc}) — running (fail-open).",
                 "interval_days": interval_days, "days_since": None, "last_run_at": None}
@@ -344,6 +391,8 @@ def main(argv=None):
     parser.add_argument("--current-run-id", required=True, help="this run's id, to exclude it from history")
     parser.add_argument("--interval-days", default="", help="raw GROOM_INTERVAL_DAYS value (blank -> default 7)")
     parser.add_argument("--event-name", default="schedule", help="github.event_name (workflow_dispatch bypasses)")
+    parser.add_argument("--path", default="",
+                        help="scope this tick would audit ('' = whole repo); the clock is per-scope")
     parser.add_argument("--now", default=None, help="override 'now' as an ISO-8601 UTC timestamp (for testing)")
     parser.add_argument("--out", help="write the decision JSON here (also printed to stdout)")
     args = parser.parse_args(argv)
@@ -354,7 +403,7 @@ def main(argv=None):
     try:
         decision = evaluate(
             args.repo, args.workflow_file, args.current_run_id,
-            interval_days, args.event_name, now,
+            interval_days, args.event_name, now, (args.path or "").strip(),
         )
     except Exception as exc:  # noqa: BLE001 — belt-and-suspenders: an unexpected bug fails OPEN.
         decision = {"should_run": True, "reason": f"gate error ({exc}) — running (fail-open).",

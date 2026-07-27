@@ -57,8 +57,9 @@ tests — run the matching command above for whatever you touched.
   has elapsed since the last real run (derived from Actions run history — no new
   secret) — and `scope.py` (BE-4757), the `path` input's enforcement: validate +
   contain the path, hand the finder the in-scope file list, post-filter
-  out-of-scope findings. A scoped run is excluded from the cadence clock and does
-  not affect dedup signatures. Tests in `tests/`.
+  out-of-scope findings. The cadence clock is PER SCOPE (a scoped run never
+  stamps "done" over the whole-repo audit, and a permanently scoped caller still
+  gets its own cadence); dedup signatures ignore `path`. Tests in `tests/`.
 - `.github/bump-callers/` — `bump-callers.sh`, the ONE fleet-agnostic script
   that opens SHA-bump PRs in consumer repos when a reusable workflow changes.
   Tests in `tests/`.

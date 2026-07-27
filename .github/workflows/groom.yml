@@ -250,21 +250,22 @@ on:
           would blind the finder to the context that makes a finding correct.
 
 
-          Not dispatch-only: a caller may pin a permanently scoped run (the
-          studio fleet already grooms `Comfy-Org/cloud`'s `common/assets` and
-          `services` as two independent scoped units), and a monorepo caller may
-          want the same in CI. To expose it as a manual knob, add a `path`
-          `workflow_dispatch` input in the caller and forward it — see the caller
-          pattern in the header.
+          Not dispatch-only: a caller may pin a permanently scoped run, grooming
+          two subtrees of one monorepo as independent units by calling this
+          workflow twice with a different `path`. To expose it as a manual knob
+          instead, add a `path` `workflow_dispatch` input in the caller and
+          forward it — see the caller pattern in the header.
 
 
-          CADENCE: a scoped run does NOT reset the cadence clock. It renames its
-          finder job `Audit — finder (scoped)`, which `interval.py` excludes when
-          deriving the last real groom — so a manual `path:` audit leaves the
-          next scheduled whole-repo tick DUE instead of stamping a partial audit
-          over the full one. The DEDUP signature is likewise unaffected by
-          `path`, so a defect filed by a scoped run is recognised and skipped by a
-          later whole-repo run and vice versa.
+          CADENCE: the clock is PER SCOPE. A scoped run renames its finder job
+          `Audit — finder (scoped: <path>)`, and `interval.py` counts only a
+          prior run of the SAME scope when deriving the last real groom. So a
+          manual `path:` audit leaves the next scheduled whole-repo tick DUE
+          instead of stamping a partial audit over the full one — and a caller
+          that pins `path` permanently still gets a real `interval_days` cadence
+          for its directory rather than re-billing the audit every tick. The
+          DEDUP signature is unaffected by `path`, so a defect filed by a scoped
+          run is recognised and skipped by a later whole-repo run and vice versa.
         type: string
         required: false
         default: ''
@@ -277,8 +278,9 @@ on:
           When `path` is set and this input is left at its default, it is DERIVED
           from `path` (`services/api`) so a filed issue names the directory the
           finding came from. An explicit value always wins. The dedup signature
-          keeps using the RAW input (never the derivation), which is what lets a
-          scoped and a whole-repo run dedup against each other.
+          keeps using THIS input (normalized, but never path-derived), which is
+          what lets a scoped and a whole-repo run dedup against each other —
+          setting an explicit value therefore also picks that dedup namespace.
         type: string
         required: false
         default: whole-repo
@@ -443,6 +445,7 @@ jobs:
       path: ${{ steps.scope.outputs.path }}
       scope_label: ${{ steps.scope.outputs.scope_label }}
       scope_desc: ${{ steps.scope.outputs.scope_desc }}
+      sig_scope: ${{ steps.scope.outputs.sig_scope }}
     steps:
       - name: Load groom assets (interval gate)
         # interval.py is loaded from THIS repo at the pinned ref — a single
@@ -496,6 +499,10 @@ jobs:
             echo "path=$(echo "$RESOLVED" | jq -r '.path')"
             echo "scope_label=$(echo "$RESOLVED" | jq -r '.scope_label')"
             echo "scope_desc=$(echo "$RESOLVED" | jq -r '.scope_desc')"
+            # The dedup-signature scope: the caller's own scope_label, normalized
+            # (whitespace collapsed, blank -> the documented default) but NEVER
+            # path-derived — see scope.py's derive_scope.
+            echo "sig_scope=$(echo "$RESOLVED" | jq -r '.sig_scope')"
           } >> "$GITHUB_OUTPUT"
 
       - name: Interval gate (GROOM_INTERVAL_DAYS)
@@ -515,6 +522,9 @@ jobs:
           # each run, so changing that variable retunes cadence with no file edit.
           # Blank/garbage -> interval.py defaults to 7 (weekly), matching today.
           INTERVAL_DAYS: ${{ inputs.interval_days }}
+          # The clock is per-scope: this tick is compared against prior runs that
+          # audited the SAME scope, read off the finder job's `(scoped: …)` marker.
+          GROOM_PATH: ${{ steps.scope.outputs.path }}
         run: |
           set -euo pipefail
           # Derive the CALLER workflow file (e.g. ci-groom.yml) from workflow_ref
@@ -527,7 +537,7 @@ jobs:
           if DECISION=$(python3 "$GROOM_ASSETS/interval.py" \
               --repo "$REPO" --workflow-file "$WF_FILE" \
               --current-run-id "$RUN_ID" --interval-days "$INTERVAL_DAYS" \
-              --event-name "$EVENT_NAME"); then
+              --event-name "$EVENT_NAME" --path "$GROOM_PATH"); then
             echo "$DECISION"
             RUN=$(echo "$DECISION" | jq -r '.should_run')
             REASON=$(echo "$DECISION" | jq -r '.reason')
@@ -618,16 +628,22 @@ jobs:
     # finder cannot tamper with the code the verifier reads or the brief it
     # follows.
     #
-    # The `(scoped)` suffix on a path-scoped run is LOAD-BEARING, not cosmetic
-    # (BE-4757): interval.py derives "the last real groom" from run history by
-    # looking for a finder job that ran, and the runs API does NOT expose a run's
-    # dispatch inputs — the job name is the only per-run signal both sides can
-    # see. Without the suffix, a manual `path: services/api` run (dispatch always
-    # bypasses the interval gate) would become the repo's last real groom and
-    # suppress the next scheduled WHOLE-REPO tick for a full GROOM_INTERVAL_DAYS
-    # — a partial audit stamping "done" over the full one. Keep this expression
-    # and interval.py's `_SCOPED_JOB_MARKER` in sync.
-    name: Audit — finder${{ needs.gate.outputs.path != '' && ' (scoped)' || '' }}
+    # The `(scoped: <path>)` suffix on a path-scoped run is LOAD-BEARING, not
+    # cosmetic (BE-4757): interval.py derives "the last real groom" from run
+    # history by looking for a finder job that ran, and the runs API does NOT
+    # expose a run's dispatch inputs — the job name is the only per-run signal
+    # both sides can see. Without it, a manual `path: services/api` run (dispatch
+    # always bypasses the interval gate) would become the repo's last real groom
+    # and suppress the next scheduled WHOLE-REPO tick for a full
+    # GROOM_INTERVAL_DAYS — a partial audit stamping "done" over the full one.
+    # The PATH is in the marker, not just the word "scoped", so the clock is
+    # per-scope in both directions: a caller that pins `path` permanently finds
+    # its OWN prior runs and keeps a real cadence, instead of failing open and
+    # re-billing the audit every tick. Keep this expression and interval.py's
+    # `scoped_job_marker` in sync.
+    # (Double-quoted because the marker contains `: `, which YAML would otherwise
+    # read as a mapping separator in a plain scalar.)
+    name: "Audit — finder${{ needs.gate.outputs.path != '' && format(' (scoped: {0})', needs.gate.outputs.path) || '' }}"
     needs: gate
     if: needs.gate.outputs.should_run == 'true'
     runs-on: ubuntu-latest
@@ -710,6 +726,21 @@ jobs:
           groom_path = os.environ.get("GROOM_PATH", "")
           if groom_path:
               files = groom_scope.list_files(os.environ["GROOM_CLONE"], groom_path)
+              if not files:
+                  # FAIL LOUDLY. `contain` proved the directory EXISTS, but existing
+                  # and being auditable are different things: a fully-gitignored
+                  # directory (build output, vendored deps) or a tracked symlink
+                  # passes containment and still yields zero tracked files. Handing
+                  # the finder an empty list buys a billed agent run that reviews
+                  # nothing and reports the directory clean — the silent-clean
+                  # failure the whole path guard exists to prevent.
+                  print(
+                      f"::error::Scoped groom found NO tracked files under `{groom_path}` — "
+                      "the directory exists but is empty or entirely untracked/gitignored. "
+                      "Refusing to run an audit that could only report 'clean'.",
+                      file=sys.stderr,
+                  )
+                  raise SystemExit(1)
               brief += groom_scope.file_list_block(files, groom_path)
               print(f"Scoped to `{groom_path}`: {len(files)} tracked file(s) in scope")
           themes = os.environ["THEMES"].strip()
@@ -1036,13 +1067,16 @@ jobs:
           GROOM_PATH: ${{ needs.gate.outputs.path }}
           SCOPE_LABEL: ${{ needs.gate.outputs.scope_label }}
           SCOPE_DESC: ${{ needs.gate.outputs.scope_desc }}
-          # The dedup signature's scope component is the caller's RAW scope_label,
+          # The dedup signature's scope component is the caller's OWN scope_label,
           # NEVER the path-derived one (BE-4757). If the signature absorbed the
           # audited directory, the SAME defect would file twice — once under
           # `services/api` from a scoped run and once under `whole-repo` from the
           # scheduled sweep. Content-derived signatures are what make a scoped run
           # and a whole-repo run dedup against each other in both directions.
-          SIG_SCOPE: ${{ inputs.scope_label }}
+          # It goes through the gate (not `inputs.` raw) only for normalization: a
+          # blank or whitespace-only scope_label would otherwise reach the brief
+          # empty and yield a malformed `repo::slug` signature.
+          SIG_SCOPE: ${{ needs.gate.outputs.sig_scope }}
         run: |
           set -euo pipefail
           python3 - <<'PY'

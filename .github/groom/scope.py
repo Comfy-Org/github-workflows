@@ -2,9 +2,9 @@
 """Path scoping for a groom run (BE-4757) — validate, derive, contain, filter.
 
 `groom.yml` gained a `path` input so a run (typically a manual dispatch, but any
-caller may pin one) can audit ONE subdirectory instead of the whole repo. The
-studio fleet has run path-scoped groom units for a while (`Comfy-Org/cloud|common/assets|31`);
-this module is the CI reusable's half of that, and it deliberately mirrors the
+caller may pin one) can audit ONE subdirectory instead of the whole repo — a
+monorepo consumer can groom each subtree as its own unit on its own cadence. This
+module is the CI reusable's half of that, and it deliberately mirrors the
 invariants `scan-path-scoping-test.sh` paid for on the vulnscan side (BE-4655).
 
 The design rule is **constrain, don't instruct**. `scope_label`/`scope_desc` are
@@ -23,6 +23,10 @@ So scoping is layered:
    escape. It also proves the directory actually exists, so a typo'd dispatch
    fails loudly instead of auditing an empty file list and reporting "clean".
 3. **A concrete file list** handed to the finder (`list_files`) instead of prose.
+   An EMPTY list fails the run in `groom.yml` rather than being handed over:
+   existing (which step 2 proves) and being auditable are different things — a
+   fully-gitignored or empty directory would otherwise buy a billed agent run
+   that reviews nothing and reports "clean".
 4. **Post-filtering** (`filter_findings`) of any finding whose evidence sites
    all fall outside the scope, with the dropped count LOGGED — a silent drop
    reads as "clean directory", which is the failure this exists to prevent.
@@ -34,12 +38,14 @@ be read.
 Two things this module deliberately does NOT touch:
 
 * **The dedup signature.** It stays content-derived (see `verifier.md`'s
-  `{{SIG_SCOPE}}`, which is wired to the caller's RAW `scope_label` and never to
-  `path`), so a defect filed by a scoped run is recognised and suppressed by a
-  later whole-repo run and vice versa. A scope-derived signature would file the
-  same defect twice under two scopes.
-* **The cadence clock.** That lives in `interval.py` — a scoped run must not
-  stamp "done" over the whole-repo audit it did not perform.
+  `{{SIG_SCOPE}}`, which is wired to `derive_scope`'s `sig_scope` — the caller's
+  own `scope_label`, normalized but NEVER path-derived), so a defect filed by a
+  scoped run is recognised and suppressed by a later whole-repo run and vice
+  versa. A path-derived signature would file the same defect twice under two
+  scopes.
+* **The cadence clock.** That lives in `interval.py`, and it is per-scope — a
+  scoped run must not stamp "done" over the whole-repo audit it did not perform,
+  and a permanently scoped caller must still get a working cadence of its own.
 
 CLI (what the workflow steps call):
 
@@ -152,12 +158,21 @@ def derive_scope(path: str, scope_label, scope_desc) -> dict:
     # it just removes the injection shape rather than trusting the folding.
     label = " ".join((scope_label or "").split()) or DEFAULT_SCOPE_LABEL
     desc = " ".join((scope_desc or "").split()) or DEFAULT_SCOPE_DESC
+    # The DEDUP-signature scope forks from the presentation label here, BEFORE the
+    # path derivation. It gets the same normalization (whitespace collapse, blank
+    # -> the documented default) — a blank `scope_label:` would otherwise reach
+    # verifier.md's `{{SIG_SCOPE}}` empty and yield a malformed `repo::slug` — but
+    # it deliberately never absorbs `path`, which is what lets a scoped run and a
+    # whole-repo run recognise each other's findings. A caller that sets an
+    # explicit `scope_label` is choosing its own dedup namespace, and that choice
+    # is honoured verbatim (changing it would re-file every finding once).
+    sig_scope = label
     if path:
         if label == DEFAULT_SCOPE_LABEL:
             label = path
         if desc == DEFAULT_SCOPE_DESC:
             desc = f"the `{path}` directory"
-    return {"path": path, "scope_label": label, "scope_desc": desc}
+    return {"path": path, "scope_label": label, "scope_desc": desc, "sig_scope": sig_scope}
 
 
 def resolve_within(root: str, path: str) -> str:
@@ -192,6 +207,12 @@ def normalize_site(site, clone: str = "") -> str:
     runner's clone. Anything unparseable returns "" and is treated as out of
     scope by the caller — a finding we cannot LOCATE is a finding we cannot
     attribute to the audited directory.
+
+    Traversal is COLLAPSED before the caller's lexical prefix test, and a site
+    that climbs out of the repo root returns "". Without this,
+    `services/api/../../common/x` passes a naive `startswith('services/api/')`
+    while actually resolving outside the scope — the same `..` hole `validate_path`
+    already closes on the input side, on the side the AGENT controls.
     """
     if not isinstance(site, str):
         return ""
@@ -206,7 +227,16 @@ def normalize_site(site, clone: str = "") -> str:
     while text.startswith("./"):
         text = text[2:]
     text = text.lstrip("/")
-    return text.rstrip("/")
+    text = text.rstrip("/")
+    if not text:
+        return ""
+    # `normpath` also folds `a//b` and `a/./b`; it is purely lexical (no
+    # filesystem access), which is what we want — the site may name a file the
+    # finder hallucinated, and touching the disk here would be a different check.
+    text = os.path.normpath(text)
+    if text == "." or text == ".." or text.startswith("../"):
+        return ""
+    return text
 
 
 def site_in_scope(site, path: str, clone: str = "") -> bool:
@@ -250,11 +280,24 @@ def filter_findings(findings, path: str, clone: str = ""):
     return kept, dropped
 
 
+def printable_path(name: str) -> bool:
+    """Is this tracked filename safe to inline in an agent prompt verbatim?"""
+    return not any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in name)
+
+
 def list_files(root: str, path: str, run=subprocess.run):
     """Tracked files under `path`, via `git ls-files` in the checkout.
 
     Tracked-only on purpose: it is what the finder can actually read and review,
     and it excludes build output a full checkout may carry.
+
+    Names carrying a newline or other control character are DROPPED. Git permits
+    them, and every one of these names is interpolated verbatim into the finder
+    prompt as a `- {f}` bullet the agent treats as authoritative — so a planted
+    filename containing a newline could forge extra list entries or inject
+    instructions. Dropping is safe (the file is simply not enumerated; the brief
+    already says the scope is the whole directory, not just the listed files) and
+    the count is announced by the caller.
     """
     result = run(
         ["git", "-C", root, "ls-files", "-z", "--", path or "."],
@@ -264,7 +307,7 @@ def list_files(root: str, path: str, run=subprocess.run):
     )
     if result.returncode != 0:
         raise RuntimeError(f"git ls-files failed: {(result.stderr or '').strip()}")
-    return [f for f in (result.stdout or "").split("\0") if f]
+    return [f for f in (result.stdout or "").split("\0") if f and printable_path(f)]
 
 
 def scope_note(path: str) -> str:
@@ -274,11 +317,20 @@ def scope_note(path: str) -> str:
     finding rather than a surprise drop — and states just as explicitly that
     READING outside the directory is fine, because the checkout is full and the
     context outside is often what makes a finding correct.
+
+    The rule it states is `finding_in_scope`'s ANY-in-scope rule, verbatim. Asking
+    for EVERY site to be in scope would read as a stricter contract than the
+    filter enforces and would suppress exactly the cross-boundary findings
+    (a duplication spanning `services/api` and `common/`) that keeping the
+    checkout FULL exists to enable.
     """
     return (
         f"HARD SCOPE — this run audits ONLY the `{path}` directory of the repository. "
-        f"Every entry in a finding's `sites` list MUST be a file under `{path}/`; a finding whose "
-        "evidence lies entirely outside it is DROPPED after you finish, so reporting one is wasted work. "
+        f"AT LEAST ONE entry in a finding's `sites` list MUST be a file under `{path}/`, and it must be "
+        "the site the finding is actually ABOUT. A finding whose evidence lies ENTIRELY outside the "
+        "directory is DROPPED after you finish, so reporting one is wasted work. A finding that spans "
+        f"the boundary — e.g. logic duplicated between `{path}/` and code elsewhere — is IN scope and "
+        f"wanted: list every relevant site, inside `{path}/` and out. "
         "You MAY read any file in the repository for CONTEXT (a refactor inside this directory "
         "legitimately references code outside it) — the restriction is on what you REPORT, not on "
         "what you read."
@@ -333,10 +385,19 @@ def _cmd_filter(args) -> int:
         document = json.load(f)
     findings = document.get("findings") if isinstance(document, dict) else None
     if not isinstance(findings, list):
-        # Nothing to filter and nothing to claim — leave the document untouched so
-        # the downstream schema assertions produce their own (better) error.
-        print("::warning::scope filter: no findings array to filter — leaving the document unchanged.")
-        return 0
+        # FAIL, don't shrug. There is no downstream check that catches this: the
+        # workflow's only assertion is `jq '.findings | length'`, and jq scores a
+        # MISSING field as 0 — identical to a genuinely clean directory. A finder
+        # that emitted `{}` structurally failed, and letting that render as "the
+        # scoped directory is clean, run green" is precisely the silent-clean
+        # failure the rest of this module exists to prevent. (An empty but
+        # PRESENT `"findings": []` is the real clean case and passes below.)
+        print(
+            "::error::scope filter: finder output has no `findings` array — "
+            "the finder produced structurally invalid output, not a clean directory.",
+            file=sys.stderr,
+        )
+        return 1
     kept, dropped = filter_findings(findings, path, args.clone or "")
     if dropped:
         # LOUD, and itemized. A silent drop is indistinguishable from a clean
