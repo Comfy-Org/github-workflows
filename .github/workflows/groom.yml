@@ -741,14 +741,17 @@ jobs:
               if not files:
                   # FAIL LOUDLY. `contain` proved the directory EXISTS, but existing
                   # and being auditable are different things: a fully-gitignored
-                  # directory (build output, vendored deps) or a tracked symlink
-                  # passes containment and still yields zero tracked files. Handing
-                  # the finder an empty list buys a billed agent run that reviews
-                  # nothing and reports the directory clean — the silent-clean
-                  # failure the whole path guard exists to prevent.
+                  # directory (build output, vendored deps), a tracked symlink, or a
+                  # git SUBMODULE (a gitlink whose files a default checkout never
+                  # populates — `list_files` skips those) passes containment and still
+                  # yields zero tracked files. Handing the finder an empty list buys a
+                  # billed agent run that reviews nothing and reports the directory
+                  # clean — the silent-clean failure the whole path guard exists to
+                  # prevent.
                   print(
                       f"::error::Scoped groom found NO tracked files under `{groom_path}` — "
-                      "the directory exists but is empty or entirely untracked/gitignored. "
+                      "the directory is empty, entirely untracked/gitignored, or a git submodule "
+                      "(groom a submodule from its own repository). "
                       "Refusing to run an audit that could only report 'clean'.",
                       file=sys.stderr,
                   )
@@ -1314,15 +1317,24 @@ jobs:
           # the ledger already routes signatureless findings to `invalid` with a
           # warning, and escalating that handled case to a hard failure would throw
           # away every OTHER finding in the batch.
+          # `verdict` is checked against the ALLOWED SET, not merely for being a
+          # string: the KEEP filter below selects on the exact literals, so a near
+          # miss like "CONFIRMED" or a lowercase "confirm" would pass a type-only
+          # check and then be silently discarded — a genuinely confirmed finding
+          # dropped with the run still green, which is the precise silent-discard
+          # this fail-loud step exists to prevent.
           BAD=$(jq '[ .findings[]
                       | select((type != "object")
                                or ((.verdict? | type) != "string")
+                               or ((.verdict != "CONFIRM")
+                                   and (.verdict != "DOWNGRADE")
+                                   and (.verdict != "REJECT"))
                                or (((.verdict == "CONFIRM") or (.verdict == "DOWNGRADE"))
                                    and (((.title? | type) != "string")
                                         or ((.body? | type) != "string"))))
                     ] | length' "$VERIFIER_OUT")
           if [ "$BAD" -gt 0 ]; then
-            echo "::error::Verifier output at $VERIFIER_OUT has $BAD malformed finding(s) — each needs a string 'verdict', and CONFIRM/DOWNGRADE additionally a string 'title' and 'body'. Failing rather than silently discarding candidates or crashing the file job mid-batch."
+            echo "::error::Verifier output at $VERIFIER_OUT has $BAD malformed finding(s) — each needs a 'verdict' that is exactly CONFIRM, DOWNGRADE or REJECT, and CONFIRM/DOWNGRADE additionally a string 'title' and 'body'. Failing rather than silently discarding candidates or crashing the file job mid-batch."
             exit 1
           fi
           # ENFORCE the path scope a SECOND time (BE-4757) — and canonicalize the

@@ -93,6 +93,21 @@ class ValidatePath(unittest.TestCase):
                 with self.assertRaises(scope.UnsafePathError):
                     scope.validate_path(bad)
 
+    def test_an_over_long_path_is_rejected_so_the_cadence_marker_survives(self):
+        # The path is embedded in the finder job's name as the `(scoped: <path>)`
+        # marker interval.py matches on. GitHub truncates a long job name, and a
+        # truncated marker means no prior run is EVER recognised for that scope:
+        # the gate fails open and re-bills the audit every tick, silently killing
+        # GROOM_INTERVAL_DAYS for a permanently scoped caller. Cheaper to reject.
+        longest_ok = "d" * scope._MAX_PATH_LEN
+        self.assertEqual(scope.validate_path(longest_ok), longest_ok)
+        with self.assertRaises(scope.UnsafePathError) as caught:
+            scope.validate_path("d" * (scope._MAX_PATH_LEN + 1))
+        self.assertIn(str(scope._MAX_PATH_LEN), str(caught.exception))
+        # The cap is measured AFTER the ergonomic normalization, not before —
+        # `./x/` must not spend three characters of a caller's budget.
+        self.assertEqual(scope.validate_path(f"./{longest_ok}/"), longest_ok)
+
     def test_rejected_paths_never_look_like_a_component(self):
         # The derived label lands in prompts and in an issue body inside
         # backticks; the vulnscan suite's "key is a safe single component" arm.
@@ -584,6 +599,25 @@ class ScopeNote(unittest.TestCase):
         # A silently short list reads to the agent as "that is the whole dir".
         self.assertIn("not just the files listed", block)
 
+    def test_file_list_is_capped_by_BYTES_not_only_by_count(self):
+        # The count cap bounds the wrong quantity on its own: names near PATH_MAX
+        # satisfy it and still serialize to megabytes, overflowing the finder's
+        # context and aborting an otherwise valid scoped audit.
+        long_names = [f"services/api/{'d' * 200}/{i}.go" for i in range(scope._MAX_LISTED_FILES - 1)]
+        self.assertLess(len(long_names), scope._MAX_LISTED_FILES)  # count cap NOT reached
+        block = scope.file_list_block(long_names, "services/api")
+        self.assertLessEqual(len(block.encode("utf-8")), scope._MAX_LISTED_BYTES + 4096)
+        self.assertIn(f"In-scope tracked files ({len(long_names)})", block)
+        self.assertIn("more (list truncated", block)
+        self.assertIn("not just the files listed", block)
+
+    def test_one_pathological_name_never_empties_the_list(self):
+        # At least one entry is always listed — an empty enumeration would read to
+        # the agent as "this directory has no files", the silent-clean shape.
+        block = scope.file_list_block(["services/api/" + "d" * (scope._MAX_LISTED_BYTES * 2)], "services/api")
+        self.assertIn("- services/api/dddd", block)
+        self.assertNotIn("more (list truncated", block)
+
 
 class ListFiles(unittest.TestCase):
     """The finder gets an enumeration, not prose — against a real git tree."""
@@ -674,6 +708,35 @@ class ListFiles(unittest.TestCase):
             scope.list_files(self.root, "services/api")
         self.assertEqual(buf.getvalue(), "")
 
+    def test_a_submodule_gitlink_is_not_mistaken_for_auditable_source(self):
+        # A submodule is ONE mode-160000 index entry naming the directory, and a
+        # default checkout never populates its files. Counted as a tracked file it
+        # would satisfy groom.yml's non-empty guard and hand the finder a
+        # directory with nothing readable in it — reported back as "clean".
+        env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=self.root, env=env, text=True, capture_output=True, check=True,
+        ).stdout.strip()
+        subprocess.run(
+            ["git", "update-index", "--add", "--cacheinfo", f"160000,{head},vendor/sub"],
+            cwd=self.root, env=env, check=True, capture_output=True,
+        )
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            files = scope.list_files(self.root, "vendor/sub")
+        # Empty, so groom.yml's non-empty guard fails the run loudly…
+        self.assertEqual(files, [])
+        # …and the reason is stated rather than left to look like an empty dir.
+        self.assertIn("::warning::", buf.getvalue())
+        self.assertIn("submodule gitlink", buf.getvalue())
+        # A normal scope alongside it is unaffected.
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(
+                sorted(scope.list_files(self.root, "services/api")),
+                ["services/api/a.go", "services/api/sub/b.go"],
+            )
+
     def test_printable_path_predicate(self):
         self.assertTrue(scope.printable_path("services/api/a.go"))
         self.assertTrue(scope.printable_path("services/api/a b`c$.go"))
@@ -681,6 +744,12 @@ class ListFiles(unittest.TestCase):
         self.assertFalse(scope.printable_path("a\nb.go"))
         self.assertFalse(scope.printable_path("a\tb.go"))
         self.assertFalse(scope.printable_path("a\x7fb.go"))
+        # Git permits the Unicode line separators too, and plenty of consumers
+        # render them as a line break — so they forge a `- {f}` bullet exactly
+        # like `\n` and belong in the same rejected set.
+        self.assertFalse(scope.printable_path("a\u0085b.go"))  # NEL
+        self.assertFalse(scope.printable_path("a\u2028b.go"))  # LINE SEPARATOR
+        self.assertFalse(scope.printable_path("a\u2029b.go"))  # PARAGRAPH SEPARATOR
         # A lone surrogate is how list_files carries a non-UTF-8 filename byte;
         # inlining one would crash the prompt WRITE rather than merely leaving
         # the file unlisted.

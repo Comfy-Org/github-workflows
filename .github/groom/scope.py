@@ -91,11 +91,33 @@ _COMPONENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 # for `file:line`, so the location suffix is stripped before the containment test.
 _SITE_LOCATION_RE = re.compile(r":\d+(?:[:-]\d+)?$")
 
-# How many in-scope files to inline in the finder prompt. A hard cap keeps a
-# monorepo subtree from blowing the prompt budget; truncation is ANNOUNCED in the
-# prompt rather than silently swallowed (a silently short list reads to the agent
-# as "that is the whole directory").
+# How many in-scope files to inline in the finder prompt, and how many BYTES that
+# listing may occupy. A hard cap keeps a monorepo subtree from blowing the prompt
+# budget; truncation is ANNOUNCED in the prompt rather than silently swallowed (a
+# silently short list reads to the agent as "that is the whole directory").
+#
+# BOTH caps are needed: a count cap alone bounds the wrong quantity, since 1500
+# deeply-nested near-PATH_MAX names still serialize to megabytes and can push the
+# finder past its context window — aborting an otherwise valid scoped audit.
 _MAX_LISTED_FILES = 1500
+_MAX_LISTED_BYTES = 96 * 1024
+
+# `git ls-files -s` mode for a submodule gitlink. See `list_files`.
+_GITLINK_MODE = "160000"
+
+# Longest accepted `path`. The value is embedded verbatim in the finder job's
+# name as the `(scoped: <path>)` marker `interval.py` matches on, and GitHub
+# truncates a long job name — which would silently break the per-scope cadence
+# clock (the gate then fails open and re-bills the audit every tick). Capping the
+# input is the cheap end of that; 160 characters is far longer than any real
+# source directory path and leaves ample headroom under GitHub's limit.
+_MAX_PATH_LEN = 160
+
+# Code points a tracked filename may not contain if it is to be inlined in an
+# agent prompt: ASCII controls and DEL (below), plus the Unicode line separators
+# Git permits and many consumers render as a line break — NEL, LINE SEPARATOR and
+# PARAGRAPH SEPARATOR. Any of them can forge an extra `- {f}` bullet.
+_FORBIDDEN_NAME_CODEPOINTS = frozenset({0x7F, 0x85, 0x2028, 0x2029})
 
 # The verdicts that actually reach the filing job (`groom.yml`'s validate step
 # keeps exactly these). A REJECT is discarded downstream regardless, so the
@@ -140,6 +162,20 @@ def validate_path(raw) -> str:
     if text == "":
         # `.` or `./` or `/`-only after stripping — the whole repo, spelled oddly.
         raise UnsafePathError(f"path {raw!r} resolves to the repo root — leave `path` empty for a whole-repo run")
+    if len(text) > _MAX_PATH_LEN:
+        # Not a safety bound — a cadence one, and measured on the NORMALIZED path
+        # so the ergonomic `./x/` form does not spend a caller's budget. The path
+        # is embedded in the finder job's name as the `(scoped: <path>)` marker
+        # `interval.py` matches; a job name GitHub truncates means no prior run is
+        # ever recognised for this scope, so the gate fails open (the safe
+        # direction) but re-bills the audit on every tick for a permanently
+        # scoped caller. Rejecting up front, in the cheap gate job, is VISIBLE;
+        # a silently dead cadence knob is not.
+        raise UnsafePathError(
+            f"path {raw!r} is {len(text)} characters — longer than the {_MAX_PATH_LEN}-character maximum. "
+            "The path is embedded in the finder job's name as the marker the cadence gate matches on, "
+            "and a truncated name would silently defeat the per-scope interval."
+        )
     parts = text.split("/")
     for part in parts:
         if part == "":
@@ -413,8 +449,16 @@ def printable_path(name: str) -> bool:
     the non-UTF-8 filename bytes Git permits. A surrogate cannot be encoded back
     out, so inlining one would crash the prompt write instead of the file merely
     going unlisted.
+
+    "Control character" here is not just the ASCII range: Git also permits the
+    Unicode line separators U+0085, U+2028 and U+2029, which plenty of consumers
+    render as a line break — so they forge a bullet exactly like `\\n` does and
+    belong in the same rejected set (`_FORBIDDEN_NAME_CODEPOINTS`).
     """
-    return not any(ord(ch) < 0x20 or ord(ch) == 0x7F or 0xD800 <= ord(ch) <= 0xDFFF for ch in name)
+    return not any(
+        ord(ch) < 0x20 or ord(ch) in _FORBIDDEN_NAME_CODEPOINTS or 0xD800 <= ord(ch) <= 0xDFFF
+        for ch in name
+    )
 
 
 def _as_text(raw) -> str:
@@ -450,15 +494,42 @@ def list_files(root: str, path: str, run=subprocess.run):
     the runner locale would raise `UnicodeDecodeError` on the first such tracked
     file — aborting the whole scoped audit before the finder runs, and before
     `printable_path` ever gets the chance to drop just that one name.
+
+    Listed with `-s` (stage) so SUBMODULE gitlinks can be recognised and skipped.
+    A submodule is one mode-160000 index entry naming the directory, and a
+    default checkout never populates its files — so a scope that IS a submodule
+    (or holds only submodules) would otherwise return a non-empty list, satisfy
+    groom.yml's non-empty guard, and hand the finder a directory with no readable
+    source: the silent-clean outcome this module exists to prevent. Skipping the
+    gitlinks lets that case fall through to the empty-list failure instead.
     """
     result = run(
-        ["git", "-C", root, "ls-files", "-z", "--", path or "."],
+        ["git", "-C", root, "ls-files", "-s", "-z", "--", path or "."],
         capture_output=True,
         timeout=120,
     )
     if result.returncode != 0:
         raise RuntimeError(f"git ls-files failed: {_as_text(result.stderr).strip()}")
-    names = [f for f in _as_text(result.stdout).split("\0") if f]
+    names, gitlinks = [], 0
+    for entry in _as_text(result.stdout).split("\0"):
+        if not entry:
+            continue
+        # `-s -z` emits `<mode> <sha> <stage>\t<path>` with no quoting, and the
+        # metadata prefix cannot contain a tab — so partitioning on the FIRST tab
+        # is exact even for a filename that contains tabs itself.
+        meta, tab, name = entry.partition("\t")
+        if not tab:
+            raise RuntimeError(f"git ls-files -s emitted an unparseable entry: {entry!r}")
+        if meta.split(" ", 1)[0] == _GITLINK_MODE:
+            gitlinks += 1
+            continue
+        names.append(name)
+    if gitlinks:
+        print(
+            f"::warning::scope: skipped {gitlinks} submodule gitlink(s) under `{path or '.'}` — "
+            "a default checkout does not populate a submodule's files, so there is nothing to audit "
+            "there. Groom a submodule from its OWN repository."
+        )
     listed = [f for f in names if printable_path(f)]
     if len(listed) != len(names):
         print(
@@ -501,9 +572,23 @@ def file_list_block(files, path: str) -> str:
 
     This is the "constrain, don't instruct" half that a prompt CAN carry: a
     concrete enumeration beats prose.
+
+    Truncated by BYTES as well as by count: 1500 deeply-nested near-PATH_MAX
+    names satisfy the count cap and still serialize to megabytes, overflowing the
+    finder's context and aborting an audit that was otherwise fine. At least one
+    name is always listed, so a single pathological path cannot empty the block.
     """
     total = len(files)
-    shown = files[:_MAX_LISTED_FILES]
+    shown, budget = [], _MAX_LISTED_BYTES
+    for f in files[:_MAX_LISTED_FILES]:
+        # `replace` rather than a strict encode: the name reaching here is already
+        # `printable_path`-clean, but this is a measurement, not a write, and it
+        # must never be the thing that raises.
+        cost = len(f.encode("utf-8", "replace")) + 3  # "- " + "\n"
+        if shown and cost > budget:
+            break
+        budget -= cost
+        shown.append(f)
     lines = [
         "",
         "",
@@ -514,7 +599,8 @@ def file_list_block(files, path: str) -> str:
     lines += [f"- {f}" for f in shown]
     if total > len(shown):
         lines.append(
-            f"- …and {total - len(shown)} more (list truncated at {_MAX_LISTED_FILES}; "
+            f"- …and {total - len(shown)} more (list truncated at {len(shown)} of {total}, "
+            f"capped at {_MAX_LISTED_FILES} names / {_MAX_LISTED_BYTES // 1024} KiB; "
             f"the scope is the WHOLE `{path}` directory, not just the files listed)."
         )
     lines.append("")
