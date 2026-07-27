@@ -92,7 +92,7 @@ All are optional. The ones that matter:
 | `dry_run` | `false` | Full audit + dedup, files nothing, prints what it would file. Use before the first live run. |
 | `max_findings` | `12` | Cap issues per run. Lower it on a first pilot. |
 | `model` | `claude-opus-5` | The finder/verifier model. |
-| `themes` | *(none)* | Steer the finder at particular kinds of cleanup. |
+| `themes` | `duplication, inconsistent patterns, missing abstractions, complexity hotspots, dead code` | Steer the finder at particular kinds of cleanup. The default mirrors the finder brief's own five dimensions, so it is a no-op; **narrow** it (e.g. `duplication, dead code`) to focus a repo. Security/auth-adjacent findings are filed regardless of theme. |
 | `scope_label` / `scope_desc` | `whole-repo` | Cosmetic labels for the scope in issue bodies. |
 | `workflows_ref` | `main` | **Set to your `uses:` SHA.** Briefs load from this ref at run time. |
 | `bot_app_id` | `''` | File as your App rather than `github-actions[bot]`. |

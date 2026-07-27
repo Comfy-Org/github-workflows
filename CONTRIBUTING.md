@@ -81,11 +81,17 @@ Two steps. Missing the second is the common mistake:
 
 ## Security-sensitive areas
 
-The AI workflows (`cursor-review.yml`, `groom.yml`) split model execution from
-credential use on purpose: the agent jobs run with `contents: read` and mint no
-GitHub token, emitting a patch or findings that a **separate** job applies as a
-GitHub App. Preserving that boundary matters more than convenience — do not give
-an agent job a write token to save a step. See [SECURITY.md](SECURITY.md).
+The AI workflows (`cursor-review.yml`, `groom.yml`) aim to split model execution
+from credential use: the agent jobs run with `contents: read` and mint no GitHub
+token, emitting a patch or findings that a **separate** job applies as a GitHub
+App. Preserving that boundary matters more than convenience — do not give an agent
+job a write token to save a step.
+
+The split is clean for `groom.yml` and for `cursor-review.yml`'s 8 panel cells.
+It is **not** clean for cursor-review's judge: `Consolidate panel` runs the judge
+model and posts the review in one `pull-requests: write` job. Treat that as a known
+rough edge to work *toward* the boundary, not as licence to widen it elsewhere. See
+[SECURITY.md](SECURITY.md).
 
 ## Review
 

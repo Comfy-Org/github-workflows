@@ -57,6 +57,8 @@ on:
 concurrency:
   # cursor-review declares no group of its own, so a caller-level group is safe
   # and worth having — it stops label-toggling from stacking panels.
+  # NOTE: label.name is part of the key only because this caller is label-only.
+  # Drop it if you widen `types:` — see the run_without_label gotcha.
   group: cursor-review-pr-${{ github.event.pull_request.number }}-${{ github.event.label.name }}
   cancel-in-progress: true
 
@@ -148,10 +150,23 @@ in any log to explain it. Set both together:
 on:
   pull_request:
     types: [opened, reopened, ready_for_review, synchronize, labeled, unlabeled]
+
+concurrency:
+  # Drop `label.name` from the key — see below.
+  group: cursor-review-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 # ...
     with:
       run_without_label: true
 ```
+
+**Drop `github.event.label.name` from the concurrency group when you widen
+`types:`.** That expression is empty on `opened`/`synchronize`/`reopened`, so
+label events and plain PR events resolve to *different* groups and cannot cancel
+each other. A push racing a label toggle then runs two 8-cell panels
+concurrently — and because the head-SHA dedupe is evaluated before either posts,
+both pass it and you get two panels and two reviews. Keying on the PR number
+alone keeps every trigger in one group.
 
 Keep `labeled`/`unlabeled` in the list even in label-free mode: the label path
 stays live alongside it, which is how you force a re-review on an unchanged commit

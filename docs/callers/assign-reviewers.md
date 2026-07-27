@@ -119,10 +119,17 @@ turns the expertise map into a real escalation path, so it is not offered.
 [`ci-assign-reviewers.yml`](../../.github/workflows/ci-assign-reviewers.yml) in
 this repo is the worked example.
 
+**A matched bucket does not fall back to `default_pool`.** `default_pool` is
+consulted only when *no* rule matched the changed paths. The author is dropped
+**after** that choice, so a rule whose reviewer list is just the PR author matches,
+yields a one-person candidate set, loses that person to the author-drop, and ends
+at `No eligible candidates after exclusions — nothing to assign`. It never reaches
+`default_pool`. Write each bucket with at least one member who is not the usual
+author of changes in those paths.
+
 **`default_pool` must never be one person** — and must not be whoever opens most
-PRs in the repo. Selection drops the author, so a bucket whose only member is the
-author empties and falls through to `default_pool`. If that is also the author,
-nothing gets assigned.
+PRs in the repo. When it *is* used (no rule matched), the same author-drop applies,
+so a single-member pool that happens to be the author assigns nobody.
 
 **Globs are the durable part; names are not.** People change teams. Write bucket
 globs deliberately and expect the roster inside them to churn.

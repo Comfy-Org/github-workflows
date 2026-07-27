@@ -225,5 +225,8 @@ gh secret list --repo <your-org>/<your-repo>     # repo-level
 gh variable list --repo <your-org>/<your-repo>
 ```
 
-A missing required secret fails loudly at the step that needs it — deliberately,
-so an enrolled workflow is never silently inert.
+**Omitting** a required `secrets:` mapping fails at startup — loudly, with zero
+jobs. But **mapping a secret that is not set** passes an empty string through, and
+that failure is quieter: `cursor-review` degrades to a panel where every cell
+produces nothing rather than failing red. So confirm the secret exists, not just
+that the mapping is present.

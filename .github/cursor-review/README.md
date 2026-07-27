@@ -90,7 +90,7 @@ silently vanishing — the review tells you what didn't run.
 ## Adopt it in your repo
 
 The review logic lives here; your repo adds only a **thin caller**. Pin `uses:`
-to a full commit SHA (see the [top-level README](../../README.md#usage) for the
+to a full commit SHA (see the [top-level README](../../README.md#pinning) for the
 why and the versioning policy).
 
 **1. Add the caller workflow** at `.github/workflows/ci-cursor-review.yml`:

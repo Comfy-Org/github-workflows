@@ -73,7 +73,7 @@ issues: write
 | `days_before_pr_stale` | `14` | Inactivity before labeling. |
 | `days_before_pr_close` | `14` | Further inactivity before closing. |
 | `stale_pr_label` | `stale` | The label applied. |
-| `exempt_pr_labels` | `pinned,security,work-in-progress,wip,dependencies` | Never swept. |
+| `exempt_pr_labels` | `pinned,security,work-in-progress,wip,dependencies,do-not-merge` | Never swept. Passing your own value **replaces** this list — re-state the entries you still want. |
 | `stale_pr_message` | *(see workflow)* | Comment posted when labeling. |
 | `close_pr_message` | *(see workflow)* | Comment posted when closing. |
 | `dry_run` | `false` | Report without labeling or closing. |
