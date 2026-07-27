@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+"""Path scoping for a groom run (BE-4757) — validate, derive, contain, filter.
+
+`groom.yml` gained a `path` input so a run (typically a manual dispatch, but any
+caller may pin one) can audit ONE subdirectory instead of the whole repo. The
+studio fleet has run path-scoped groom units for a while (`Comfy-Org/cloud|common/assets|31`);
+this module is the CI reusable's half of that, and it deliberately mirrors the
+invariants `scan-path-scoping-test.sh` paid for on the vulnscan side (BE-4655).
+
+The design rule is **constrain, don't instruct**. `scope_label`/`scope_desc` are
+prompt substitutions — asking an agent to "stay in services/api" enforces nothing.
+So scoping is layered:
+
+1. **Syntactic validation** (`validate_path`) — runs in the cheap `gate` job,
+   before any billed agent. Rejects absolute paths, `..` COMPONENTS, empty
+   components and anything outside a conservative charset. A dotted directory
+   name (`services/my..svc`) is legitimate and must be ACCEPTED — only a `..`
+   path component is dangerous, so this does not over-reject.
+2. **Filesystem containment** (`resolve_within`) — runs in the finder job once
+   the target is checked out. Normalizes both sides through `os.path.realpath`
+   (the Python `cd && pwd -P`) before prefix-comparing, so a symlinked or
+   `$TMPDIR`-style trailing-slash path can neither escape nor report a FALSE
+   escape. It also proves the directory actually exists, so a typo'd dispatch
+   fails loudly instead of auditing an empty file list and reporting "clean".
+3. **A concrete file list** handed to the finder (`list_files`) instead of prose.
+4. **Post-filtering** (`filter_findings`) of any finding whose evidence sites
+   all fall outside the scope, with the dropped count LOGGED — a silent drop
+   reads as "clean directory", which is the failure this exists to prevent.
+
+The checkout stays FULL on purpose (a refactor in `services/api` legitimately
+references `common/`); the constraint is on what may be REPORTED, not on what may
+be read.
+
+Two things this module deliberately does NOT touch:
+
+* **The dedup signature.** It stays content-derived (see `verifier.md`'s
+  `{{SIG_SCOPE}}`, which is wired to the caller's RAW `scope_label` and never to
+  `path`), so a defect filed by a scoped run is recognised and suppressed by a
+  later whole-repo run and vice versa. A scope-derived signature would file the
+  same defect twice under two scopes.
+* **The cadence clock.** That lives in `interval.py` — a scoped run must not
+  stamp "done" over the whole-repo audit it did not perform.
+
+CLI (what the workflow steps call):
+
+    python3 scope.py validate --path 'services/api'          # -> normalized path on stdout
+    python3 scope.py derive   --path 'services/api' \
+        --scope-label whole-repo --scope-desc 'the whole repository'   # -> JSON
+    python3 scope.py contain  --root /path/to/clone --path services/api
+    python3 scope.py filter   --path services/api --clone /path/to/clone \
+        --in /tmp/groom-finder.json --out /tmp/groom-finder.json
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+# The `scope_label` / `scope_desc` input defaults, duplicated from groom.yml. A
+# derived value only replaces an input that still holds its DEFAULT — that is the
+# only way an Actions reusable can distinguish "not provided" from "provided",
+# and it is what makes an explicit caller override win over the path derivation.
+DEFAULT_SCOPE_LABEL = "whole-repo"
+DEFAULT_SCOPE_DESC = "the whole repository"
+
+# Conservative per-component charset. Deliberately excludes shell/markdown
+# metacharacters, whitespace, `:` and `\` — the derived label is interpolated
+# into an issue body inside backticks and into agent prompts, and the path itself
+# reaches `git ls-files`, so keeping the charset boring removes that whole family
+# of concerns in ONE place instead of at each use site. It still admits every
+# real-world source directory name, including a DOTTED one (`my..svc`).
+_COMPONENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+# Trailing `:12`, `:12-40` or `:12:5` on an evidence site — the finder brief asks
+# for `file:line`, so the location suffix is stripped before the containment test.
+_SITE_LOCATION_RE = re.compile(r":\d+(?:[:-]\d+)?$")
+
+# How many in-scope files to inline in the finder prompt. A hard cap keeps a
+# monorepo subtree from blowing the prompt budget; truncation is ANNOUNCED in the
+# prompt rather than silently swallowed (a silently short list reads to the agent
+# as "that is the whole directory").
+_MAX_LISTED_FILES = 1500
+
+
+class UnsafePathError(ValueError):
+    """A `path` input that must never reach `git ls-files` or a prompt."""
+
+
+def validate_path(raw) -> str:
+    """Normalize the `path` input, or raise `UnsafePathError`.
+
+    Returns "" for an unset/blank path — the whole-repo default, which must
+    reproduce today's behavior byte-for-byte. Otherwise returns the path with
+    any `./` prefix and trailing slashes removed.
+
+    Rejected: absolute paths, `~`-relative paths, backslashes, control
+    characters, an empty component (`a//b`), a `.` component, a `..` COMPONENT,
+    and any component outside `_COMPONENT_RE`. NOT rejected: a component that
+    merely CONTAINS dots (`services/my..svc`) — over-rejecting that is the
+    documented trap from the vulnscan suite.
+    """
+    if raw is None:
+        return ""
+    text = str(raw).strip()
+    if text == "":
+        return ""
+    if any(ch in text for ch in ("\\", "\x00")) or any(ord(ch) < 0x20 for ch in text):
+        raise UnsafePathError(f"path {raw!r} contains a backslash or control character")
+    if text.startswith("/"):
+        raise UnsafePathError(f"path {raw!r} is absolute — pass a path relative to the repo root")
+    if text.startswith("~"):
+        raise UnsafePathError(f"path {raw!r} is home-relative — pass a path relative to the repo root")
+    # Strip a leading `./` and any trailing slashes BEFORE splitting, so the
+    # ergonomic `./services/api/` normalizes instead of failing on empty/dot
+    # components a caller could not reasonably be expected to avoid.
+    while text.startswith("./"):
+        text = text[2:]
+    text = text.rstrip("/")
+    if text == "":
+        # `.` or `./` or `/`-only after stripping — the whole repo, spelled oddly.
+        raise UnsafePathError(f"path {raw!r} resolves to the repo root — leave `path` empty for a whole-repo run")
+    parts = text.split("/")
+    for part in parts:
+        if part == "":
+            raise UnsafePathError(f"path {raw!r} has an empty component (doubled separator)")
+        if part == ".":
+            raise UnsafePathError(f"path {raw!r} has a '.' component")
+        if part == "..":
+            raise UnsafePathError(f"path {raw!r} has a '..' component — it could escape the repo root")
+        if not _COMPONENT_RE.match(part):
+            raise UnsafePathError(
+                f"path {raw!r} has an unsupported component {part!r} — allowed: letters, digits, '.', '_', '-'"
+            )
+    return "/".join(parts)
+
+
+def derive_scope(path: str, scope_label, scope_desc) -> dict:
+    """Drive the cosmetic scope inputs from `path`, without clobbering overrides.
+
+    A filed issue must say WHERE the finding came from, so a scoped run should
+    read `services/api`, not `whole-repo`. But an explicit caller override has to
+    win — the studio fleet already labels its cloud subtrees itself. An Actions
+    reusable cannot see whether an input was supplied, so "still equal to the
+    documented default" is the (only, and stated) proxy for "not overridden".
+    """
+    # Collapse whitespace runs (including newlines) to single spaces: these values
+    # are written to $GITHUB_OUTPUT as `key=value`, where an embedded newline
+    # would truncate the value and inject a bogus output key. The YAML `>-` inputs
+    # already fold to one line, so this is byte-identical for every real caller —
+    # it just removes the injection shape rather than trusting the folding.
+    label = " ".join((scope_label or "").split()) or DEFAULT_SCOPE_LABEL
+    desc = " ".join((scope_desc or "").split()) or DEFAULT_SCOPE_DESC
+    if path:
+        if label == DEFAULT_SCOPE_LABEL:
+            label = path
+        if desc == DEFAULT_SCOPE_DESC:
+            desc = f"the `{path}` directory"
+    return {"path": path, "scope_label": label, "scope_desc": desc}
+
+
+def resolve_within(root: str, path: str) -> str:
+    """Absolute path of `path` inside `root`, proving it cannot escape.
+
+    Both sides go through `os.path.realpath` — the Python equivalent of
+    `cd && pwd -P` — BEFORE the prefix compare, which is what makes the check
+    correct in the two ways a naive `startswith` is not: a symlinked component
+    that points outside the tree is resolved (so it cannot escape), and a root
+    that carries a trailing slash (macOS `$TMPDIR` is the classic) is normalized
+    (so it does not report a FALSE escape). `realpath` strips trailing
+    separators, hence the explicit `+ os.sep` on the prefix.
+    """
+    root_real = os.path.realpath(root)
+    if not path:
+        return root_real
+    target = os.path.realpath(os.path.join(root_real, path))
+    if target != root_real and not target.startswith(root_real + os.sep):
+        raise UnsafePathError(f"path {path!r} resolves outside the checkout ({target} not under {root_real})")
+    if target == root_real:
+        raise UnsafePathError(f"path {path!r} resolves to the checkout root — leave `path` empty for a whole-repo run")
+    if not os.path.isdir(target):
+        raise UnsafePathError(f"path {path!r} is not a directory in this checkout ({target})")
+    return target
+
+
+def normalize_site(site, clone: str = "") -> str:
+    """Repo-relative file part of an evidence site (`file:line` -> `file`).
+
+    Defensive about the shapes an LLM actually emits: a bare path, a `file:line`,
+    a `file:line-line` range, a `./`-prefixed path, or an absolute path inside the
+    runner's clone. Anything unparseable returns "" and is treated as out of
+    scope by the caller — a finding we cannot LOCATE is a finding we cannot
+    attribute to the audited directory.
+    """
+    if not isinstance(site, str):
+        return ""
+    text = site.strip()
+    if not text:
+        return ""
+    text = _SITE_LOCATION_RE.sub("", text).strip()
+    if clone:
+        clone_prefix = clone.rstrip("/") + "/"
+        if text.startswith(clone_prefix):
+            text = text[len(clone_prefix):]
+    while text.startswith("./"):
+        text = text[2:]
+    text = text.lstrip("/")
+    return text.rstrip("/")
+
+
+def site_in_scope(site, path: str, clone: str = "") -> bool:
+    """Is one evidence site inside the audited directory?"""
+    if not path:
+        return True
+    norm = normalize_site(site, clone)
+    if not norm:
+        return False
+    return norm == path or norm.startswith(path + "/")
+
+
+def finding_in_scope(finding, path: str, clone: str = "") -> bool:
+    """Keep a finding if ANY of its evidence sites is inside the audited directory.
+
+    ANY, not ALL, and this is a deliberate call. The checkout is kept FULL
+    precisely because a refactor in `services/api` legitimately references
+    `common/` — a duplication finding that spans the two IS a finding about the
+    audited directory, and requiring every site to be in scope would suppress
+    exactly the cross-cutting findings the full checkout exists to enable. What
+    gets dropped is a finding whose evidence lies ENTIRELY outside the scope
+    (including one with no locatable sites at all, which cannot be attributed).
+    """
+    if not path:
+        return True
+    if not isinstance(finding, dict):
+        return False
+    sites = finding.get("sites")
+    if not isinstance(sites, list):
+        return False
+    return any(site_in_scope(s, path, clone) for s in sites)
+
+
+def filter_findings(findings, path: str, clone: str = ""):
+    """Partition findings into (kept, dropped) against the audited directory."""
+    if not path:
+        return list(findings or []), []
+    kept, dropped = [], []
+    for finding in findings or []:
+        (kept if finding_in_scope(finding, path, clone) else dropped).append(finding)
+    return kept, dropped
+
+
+def list_files(root: str, path: str, run=subprocess.run):
+    """Tracked files under `path`, via `git ls-files` in the checkout.
+
+    Tracked-only on purpose: it is what the finder can actually read and review,
+    and it excludes build output a full checkout may carry.
+    """
+    result = run(
+        ["git", "-C", root, "ls-files", "-z", "--", path or "."],
+        text=True,
+        capture_output=True,
+        timeout=120,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"git ls-files failed: {(result.stderr or '').strip()}")
+    return [f for f in (result.stdout or "").split("\0") if f]
+
+
+def scope_note(path: str) -> str:
+    """The HARD SCOPE paragraph appended to the finder AND verifier briefs.
+
+    States the post-filter explicitly, so an out-of-scope finding is a wasted
+    finding rather than a surprise drop — and states just as explicitly that
+    READING outside the directory is fine, because the checkout is full and the
+    context outside is often what makes a finding correct.
+    """
+    return (
+        f"HARD SCOPE — this run audits ONLY the `{path}` directory of the repository. "
+        f"Every entry in a finding's `sites` list MUST be a file under `{path}/`; a finding whose "
+        "evidence lies entirely outside it is DROPPED after you finish, so reporting one is wasted work. "
+        "You MAY read any file in the repository for CONTEXT (a refactor inside this directory "
+        "legitimately references code outside it) — the restriction is on what you REPORT, not on "
+        "what you read."
+    )
+
+
+def file_list_block(files, path: str) -> str:
+    """`scope_note` plus the concrete in-scope file list, for the finder brief.
+
+    This is the "constrain, don't instruct" half that a prompt CAN carry: a
+    concrete enumeration beats prose.
+    """
+    total = len(files)
+    shown = files[:_MAX_LISTED_FILES]
+    lines = [
+        "",
+        "",
+        scope_note(path),
+        "",
+        f"In-scope tracked files ({total}):",
+    ]
+    lines += [f"- {f}" for f in shown]
+    if total > len(shown):
+        lines.append(
+            f"- …and {total - len(shown)} more (list truncated at {_MAX_LISTED_FILES}; "
+            f"the scope is the WHOLE `{path}` directory, not just the files listed)."
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _cmd_validate(args) -> int:
+    print(validate_path(args.path))
+    return 0
+
+
+def _cmd_derive(args) -> int:
+    path = validate_path(args.path)
+    print(json.dumps(derive_scope(path, args.scope_label, args.scope_desc)))
+    return 0
+
+
+def _cmd_contain(args) -> int:
+    path = validate_path(args.path)
+    print(resolve_within(args.root, path))
+    return 0
+
+
+def _cmd_filter(args) -> int:
+    path = validate_path(args.path)
+    with open(args.infile, encoding="utf-8") as f:
+        document = json.load(f)
+    findings = document.get("findings") if isinstance(document, dict) else None
+    if not isinstance(findings, list):
+        # Nothing to filter and nothing to claim — leave the document untouched so
+        # the downstream schema assertions produce their own (better) error.
+        print("::warning::scope filter: no findings array to filter — leaving the document unchanged.")
+        return 0
+    kept, dropped = filter_findings(findings, path, args.clone or "")
+    if dropped:
+        # LOUD, and itemized. A silent drop is indistinguishable from a clean
+        # directory, which is the whole reason this is counted.
+        print(
+            f"::warning::scope filter: dropped {len(dropped)} finding(s) whose evidence lies "
+            f"entirely outside `{path}` (kept {len(kept)})."
+        )
+        for finding in dropped:
+            title = finding.get("title") if isinstance(finding, dict) else None
+            sites = finding.get("sites") if isinstance(finding, dict) else None
+            print(f"::warning::  dropped (out of scope `{path}`): {title!r} sites={sites!r}")
+    print(f"scope filter: kept {len(kept)}, dropped {len(dropped)} (scope `{path or 'whole-repo'}`)")
+    document["findings"] = kept
+    document["scope_dropped"] = len(dropped)
+    with open(args.outfile, "w", encoding="utf-8") as f:
+        json.dump(document, f, indent=2)
+    return 0
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Groom path scoping (BE-4757).")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_validate = sub.add_parser("validate", help="normalize + syntactically validate the path input")
+    p_validate.add_argument("--path", default="")
+    p_validate.set_defaults(func=_cmd_validate)
+
+    p_derive = sub.add_parser("derive", help="derive scope_label/scope_desc from the path")
+    p_derive.add_argument("--path", default="")
+    p_derive.add_argument("--scope-label", default=DEFAULT_SCOPE_LABEL)
+    p_derive.add_argument("--scope-desc", default=DEFAULT_SCOPE_DESC)
+    p_derive.set_defaults(func=_cmd_derive)
+
+    p_contain = sub.add_parser("contain", help="prove the path resolves inside the checkout")
+    p_contain.add_argument("--root", required=True)
+    p_contain.add_argument("--path", default="")
+    p_contain.set_defaults(func=_cmd_contain)
+
+    p_filter = sub.add_parser("filter", help="drop findings whose evidence is outside the scope")
+    p_filter.add_argument("--path", default="")
+    p_filter.add_argument("--clone", default="")
+    p_filter.add_argument("--in", dest="infile", required=True)
+    p_filter.add_argument("--out", dest="outfile", required=True)
+    p_filter.set_defaults(func=_cmd_filter)
+
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except UnsafePathError as exc:
+        # A rejected path FAILS the run — unlike the cadence/volume gates, there is
+        # no safe "fail open" reading of "audit a directory I could not validate".
+        print(f"::error::Invalid groom `path` input: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

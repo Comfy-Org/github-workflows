@@ -59,6 +59,14 @@ name: Groom (reusable)
 #           type: choice
 #           default: '1'
 #           options: ['1', '2', '3', '5']
+#         # OPTIONAL: scope ONE manual run to a subdirectory (BE-4757). Empty (the
+#         # default, and what a SCHEDULE always yields) is the whole repo. A scoped
+#         # run does NOT reset the cadence clock, so the next scheduled whole-repo
+#         # tick stays due — see the `path` input's description.
+#         path:
+#           description: 'Audit only this directory (repo-relative, e.g. services/api). Empty = whole repo.'
+#           type: string
+#           default: ''
 #   permissions:
 #     # REQUIRED union — a reusable's nested jobs cannot request more GITHUB_TOKEN
 #     # scope than the caller grants, and GitHub validates this at STARTUP (a short
@@ -95,6 +103,9 @@ name: Groom (reusable)
 #         bot_app_id: ${{ vars.APP_ID }}
 #         workflows_ref: <sha>          # pin assets to the same ref as `uses:`
 #         dry_run: ${{ github.event.inputs.dry_run == 'true' }}
+#         # Forward the optional scoping input above. A schedule event carries no
+#         # inputs, so this yields '' there = whole repo, unchanged.
+#         path: ${{ github.event.inputs.path }}
 #         # Cadence knob + the matching volume-gate window (BE-4004).
 #         interval_days: ${{ vars.GROOM_INTERVAL_DAYS || '7' }}
 #         cadence: ${{ vars.GROOM_INTERVAL_DAYS || '7' }}
@@ -219,10 +230,55 @@ on:
         type: number
         required: false
         default: 12
+      path:
+        description: >-
+          Audit ONE directory of the repo instead of the whole thing (BE-4757).
+          Empty (the default) is the whole-repo behavior, byte-for-byte — every
+          existing caller is unaffected. Give a path RELATIVE to the repo root
+          (`services/api`); absolute paths, `..` components and anything
+          resolving outside the checkout are REJECTED before any billed agent
+          runs. A dotted directory name (`services/my..svc`) is fine — only a
+          `..` path COMPONENT is unsafe.
+
+
+          This CONSTRAINS the run, it does not merely ask the agent nicely (which
+          is all `scope_desc` ever did): the finder is handed the concrete
+          in-scope file list, and any finding whose evidence sites all fall
+          outside the directory is DROPPED after verification, with the dropped
+          count logged. The checkout stays FULL on purpose — a refactor in
+          `services/api` legitimately references `common/`, and a sparse checkout
+          would blind the finder to the context that makes a finding correct.
+
+
+          Not dispatch-only: a caller may pin a permanently scoped run (the
+          studio fleet already grooms `Comfy-Org/cloud`'s `common/assets` and
+          `services` as two independent scoped units), and a monorepo caller may
+          want the same in CI. To expose it as a manual knob, add a `path`
+          `workflow_dispatch` input in the caller and forward it — see the caller
+          pattern in the header.
+
+
+          CADENCE: a scoped run does NOT reset the cadence clock. It renames its
+          finder job `Audit — finder (scoped)`, which `interval.py` excludes when
+          deriving the last real groom — so a manual `path:` audit leaves the
+          next scheduled whole-repo tick DUE instead of stamping a partial audit
+          over the full one. The DEDUP signature is likewise unaffected by
+          `path`, so a defect filed by a scoped run is recognised and skipped by a
+          later whole-repo run and vice versa.
+        type: string
+        required: false
+        default: ''
       scope_label:
         description: >-
           Short scope label used in the dedup signature and issue metadata. Use
           the package path for a monorepo package scan, or `whole-repo`.
+
+
+          When `path` is set and this input is left at its default, it is DERIVED
+          from `path` (`services/api`) so a filed issue names the directory the
+          finding came from. An explicit value always wins. The dedup signature
+          keeps using the RAW input (never the derivation), which is what lets a
+          scoped and a whole-repo run dedup against each other.
         type: string
         required: false
         default: whole-repo
@@ -230,6 +286,10 @@ on:
         description: >-
           Human scan-scope sentence handed to both agents (e.g. "the whole
           repository", or "the package `services/foo` — do NOT scan the rest").
+          Prose only — it INSTRUCTS the agents, it does not constrain them; use
+          `path` for a scope that is actually enforced. When `path` is set and
+          this input is left at its default it is derived from `path`; an
+          explicit value always wins.
         type: string
         required: false
         default: the whole repository
@@ -377,6 +437,12 @@ jobs:
       pull-requests: read
     outputs:
       should_run: ${{ steps.check.outputs.should_run }}
+      # Resolved ONCE here and consumed by every downstream job, so the
+      # derivation rules live in exactly one place (scope.py) instead of being
+      # re-implemented per job.
+      path: ${{ steps.scope.outputs.path }}
+      scope_label: ${{ steps.scope.outputs.scope_label }}
+      scope_desc: ${{ steps.scope.outputs.scope_desc }}
     steps:
       - name: Load groom assets (interval gate)
         # interval.py is loaded from THIS repo at the pinned ref — a single
@@ -400,6 +466,37 @@ jobs:
             echo "::error::sink='$SINK' is not supported yet — only 'github' is implemented (linear sink is a later phase, needs an org LINEAR_API_KEY)."
             exit 1
           fi
+
+      - name: Validate + resolve scope path
+        # SYNTACTIC half of the path guard (BE-4757), deliberately in the cheap
+        # gate job: an unsafe or malformed `path` must fail BEFORE a billed agent
+        # spins up. The FILESYSTEM containment half (symlink escape, "is it
+        # actually a directory") runs in the finder job, which is the first job
+        # that has the target checked out.
+        #
+        # This step also resolves scope_label/scope_desc for the whole run. It is
+        # NOT gated on should_run: the derivation is pure, and a job that lists
+        # `gate` in `needs` reads these outputs regardless of which gate skipped.
+        id: scope
+        env:
+          GROOM_PATH: ${{ inputs.path }}
+          SCOPE_LABEL: ${{ inputs.scope_label }}
+          SCOPE_DESC: ${{ inputs.scope_desc }}
+        run: |
+          set -euo pipefail
+          # scope.py exits 2 with an ::error:: on an unsafe path — there is no
+          # safe fail-open reading of "audit a directory I could not validate",
+          # so unlike the two gates below this one fails the run CLOSED.
+          RESOLVED=$(python3 "$GROOM_ASSETS/scope.py" derive \
+            --path "$GROOM_PATH" \
+            --scope-label "$SCOPE_LABEL" \
+            --scope-desc "$SCOPE_DESC")
+          echo "$RESOLVED"
+          {
+            echo "path=$(echo "$RESOLVED" | jq -r '.path')"
+            echo "scope_label=$(echo "$RESOLVED" | jq -r '.scope_label')"
+            echo "scope_desc=$(echo "$RESOLVED" | jq -r '.scope_desc')"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Interval gate (GROOM_INTERVAL_DAYS)
         # Cadence gate: on a frequent (daily) base cron, skip cheaply unless
@@ -520,7 +617,17 @@ jobs:
     # checkout — the two agents never share a workspace, so a prompt-injected
     # finder cannot tamper with the code the verifier reads or the brief it
     # follows.
-    name: Audit — finder
+    #
+    # The `(scoped)` suffix on a path-scoped run is LOAD-BEARING, not cosmetic
+    # (BE-4757): interval.py derives "the last real groom" from run history by
+    # looking for a finder job that ran, and the runs API does NOT expose a run's
+    # dispatch inputs — the job name is the only per-run signal both sides can
+    # see. Without the suffix, a manual `path: services/api` run (dispatch always
+    # bypasses the interval gate) would become the repo's last real groom and
+    # suppress the next scheduled WHOLE-REPO tick for a full GROOM_INTERVAL_DAYS
+    # — a partial audit stamping "done" over the full one. Keep this expression
+    # and interval.py's `_SCOPED_JOB_MARKER` in sync.
+    name: Audit — finder${{ needs.gate.outputs.path != '' && ' (scoped)' || '' }}
     needs: gate
     if: needs.gate.outputs.should_run == 'true'
     runs-on: ubuntu-latest
@@ -548,11 +655,28 @@ jobs:
           path: _groom_assets
           persist-credentials: false
 
+      - name: Contain the scope path
+        # FILESYSTEM half of the path guard — the gate already rejected anything
+        # syntactically unsafe, but only here does the target exist, so only here
+        # can a symlinked component that points outside the tree be resolved, and
+        # only here can "that directory does not exist" be caught. Both sides are
+        # normalized with realpath (the Python `cd && pwd -P`) before the prefix
+        # compare, so a trailing separator can't report a FALSE escape either.
+        # A typo'd path fails the run LOUDLY rather than auditing an empty file
+        # list and reporting a suspiciously clean directory.
+        if: needs.gate.outputs.path != ''
+        env:
+          GROOM_PATH: ${{ needs.gate.outputs.path }}
+        run: |
+          set -euo pipefail
+          python3 "$GROOM_ASSETS/scope.py" contain --root "$GROOM_CLONE" --path "$GROOM_PATH"
+
       - name: Build finder prompt
         env:
           REPO: ${{ github.repository }}
-          SCOPE_LABEL: ${{ inputs.scope_label }}
-          SCOPE_DESC: ${{ inputs.scope_desc }}
+          GROOM_PATH: ${{ needs.gate.outputs.path }}
+          SCOPE_LABEL: ${{ needs.gate.outputs.scope_label }}
+          SCOPE_DESC: ${{ needs.gate.outputs.scope_desc }}
           THEMES: ${{ inputs.themes }}
         run: |
           set -euo pipefail
@@ -561,7 +685,10 @@ jobs:
           # a workspace path — lands verbatim. Values are runner-controlled and
           # confined to safe charsets (repo slugs, paths, a short theme list).
           python3 - <<'PY'
-          import os
+          import os, sys
+          sys.path.insert(0, os.environ["GROOM_ASSETS"])
+          import scope as groom_scope
+
           repo = os.environ["REPO"]
           subs = {
               "{{REPO}}": repo,
@@ -576,6 +703,15 @@ jobs:
               brief = f.read()
           for k, v in subs.items():
               brief = brief.replace(k, v)
+          # Path scoping (BE-4757): hand the finder the CONCRETE in-scope file
+          # list rather than trusting the {{SCOPE_DESC}} prose above to hold it.
+          # Enumeration is what an agent can actually act on; the real enforcement
+          # is the post-filter after this job.
+          groom_path = os.environ.get("GROOM_PATH", "")
+          if groom_path:
+              files = groom_scope.list_files(os.environ["GROOM_CLONE"], groom_path)
+              brief += groom_scope.file_list_block(files, groom_path)
+              print(f"Scoped to `{groom_path}`: {len(files)} tracked file(s) in scope")
           themes = os.environ["THEMES"].strip()
           if themes:
               brief += (
@@ -813,11 +949,25 @@ jobs:
 
       - name: Assert finder produced JSON
         id: assert
+        env:
+          GROOM_PATH: ${{ needs.gate.outputs.path }}
         run: |
           set -euo pipefail
           if [ ! -s "$FINDER_OUT" ] || ! jq -e . "$FINDER_OUT" >/dev/null 2>&1; then
             echo "::error::Finder did not produce valid JSON at $FINDER_OUT."
             exit 1
+          fi
+          # ENFORCE the path scope (BE-4757). The brief ASKS the finder to stay in
+          # the directory; this is what makes it true. Runs on the finder output
+          # because that is where the evidence `sites` live — the verifier only
+          # adjudicates candidates, so filtering here also saves paying the
+          # verifier to re-check findings that would be dropped anyway.
+          # The dropped count is LOGGED as a warning: a silent drop is
+          # indistinguishable from a clean directory, which is the whole point.
+          if [ -n "$GROOM_PATH" ]; then
+            python3 "$GROOM_ASSETS/scope.py" filter \
+              --path "$GROOM_PATH" --clone "$GROOM_CLONE" \
+              --in "$FINDER_OUT" --out "$FINDER_OUT"
           fi
           COUNT=$(jq '.findings | length' "$FINDER_OUT")
           echo "Finder candidates: $COUNT"
@@ -883,12 +1033,23 @@ jobs:
       - name: Build verifier prompt
         env:
           REPO: ${{ github.repository }}
-          SCOPE_LABEL: ${{ inputs.scope_label }}
-          SCOPE_DESC: ${{ inputs.scope_desc }}
+          GROOM_PATH: ${{ needs.gate.outputs.path }}
+          SCOPE_LABEL: ${{ needs.gate.outputs.scope_label }}
+          SCOPE_DESC: ${{ needs.gate.outputs.scope_desc }}
+          # The dedup signature's scope component is the caller's RAW scope_label,
+          # NEVER the path-derived one (BE-4757). If the signature absorbed the
+          # audited directory, the SAME defect would file twice — once under
+          # `services/api` from a scoped run and once under `whole-repo` from the
+          # scheduled sweep. Content-derived signatures are what make a scoped run
+          # and a whole-repo run dedup against each other in both directions.
+          SIG_SCOPE: ${{ inputs.scope_label }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import os
+          import os, sys
+          sys.path.insert(0, os.environ["GROOM_ASSETS"])
+          import scope as groom_scope
+
           repo = os.environ["REPO"]
           subs = {
               "{{REPO}}": repo,
@@ -896,6 +1057,7 @@ jobs:
               "{{CLONE}}": os.environ["GROOM_CLONE"],
               "{{SCOPE_DESC}}": os.environ["SCOPE_DESC"],
               "{{SCOPE_LABEL}}": os.environ["SCOPE_LABEL"],
+              "{{SIG_SCOPE}}": os.environ["SIG_SCOPE"],
               "{{FINDER_OUT}}": os.environ["FINDER_OUT"],
               "{{VERIFIER_OUT}}": os.environ["VERIFIER_OUT"],
           }
@@ -903,6 +1065,12 @@ jobs:
               brief = f.read()
           for k, v in subs.items():
               brief = brief.replace(k, v)
+          groom_path = os.environ.get("GROOM_PATH", "")
+          if groom_path:
+              # No file list here — the verifier adjudicates the finder's
+              # (already post-filtered) candidates rather than sweeping the tree,
+              # so it needs the RULE, not the enumeration.
+              brief += "\n\n" + groom_scope.scope_note(groom_path) + "\n"
           with open("/tmp/groom-verifier-prompt.md", "w", encoding="utf-8") as f:
               f.write(brief)
           print(f"Verifier prompt: {len(brief)} chars")
@@ -1345,7 +1513,11 @@ jobs:
           GH_TOKEN: ${{ steps.bot_token.outputs.token || github.token }}
           REPO: ${{ github.repository }}
           MAX_FINDINGS: ${{ inputs.max_findings }}
-          SCOPE_LABEL: ${{ inputs.scope_label }}
+          # DERIVED (BE-4757): on a path-scoped run with no explicit override this
+          # is the audited directory, so a filed issue says WHERE the finding came
+          # from. It is presentation only — the dedup signature deliberately does
+          # NOT follow the path (see the verifier prompt's SIG_SCOPE).
+          SCOPE_LABEL: ${{ needs.gate.outputs.scope_label }}
           DRY_RUN: ${{ inputs.dry_run }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -1503,6 +1675,7 @@ jobs:
         env:
           IDX: ${{ matrix.idx }}
           REPO: ${{ github.repository }}
+          GROOM_PATH: ${{ needs.gate.outputs.path }}
         run: |
           set -euo pipefail
           jq ".to_build[$IDX]" "$DECISION_OUT" > "$FINDING_IN"
@@ -1523,6 +1696,19 @@ jobs:
               brief = f.read()
           for k, v in subs.items():
               brief = brief.replace(k, v)
+          # Path scoping (BE-4757). Advisory here, unlike the finder's post-filter:
+          # a scoped finding's fix legitimately needs a call-site update outside
+          # the directory to compile, so hard-rejecting an out-of-scope hunk would
+          # ship a broken patch. `pr_size_limit` and human review remain the real
+          # backstops on patch breadth.
+          groom_path = os.environ.get("GROOM_PATH", "")
+          if groom_path:
+              brief += (
+                  f"\n\nSCOPE — this groom run audits the `{groom_path}` directory. Keep the change "
+                  f"centred there: edit files outside `{groom_path}/` only where the fix genuinely "
+                  "requires it (e.g. updating a call site so the tree still builds), and say so in "
+                  "the PR body.\n"
+              )
           with open("/tmp/groom-builder-prompt.md", "w", encoding="utf-8") as f:
               f.write(brief)
           print(f"Builder prompt: {len(brief)} chars")

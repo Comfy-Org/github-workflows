@@ -55,7 +55,10 @@ tests — run the matching command above for whatever you touched.
   built finding is never re-proposed — and `interval.py`, the runtime cadence
   gate (`GROOM_INTERVAL_DAYS`) that early-exits a daily tick unless the interval
   has elapsed since the last real run (derived from Actions run history — no new
-  secret). Tests in `tests/`.
+  secret) — and `scope.py` (BE-4757), the `path` input's enforcement: validate +
+  contain the path, hand the finder the in-scope file list, post-filter
+  out-of-scope findings. A scoped run is excluded from the cadence clock and does
+  not affect dedup signatures. Tests in `tests/`.
 - `.github/bump-callers/` — `bump-callers.sh`, the ONE fleet-agnostic script
   that opens SHA-bump PRs in consumer repos when a reusable workflow changes.
   Tests in `tests/`.

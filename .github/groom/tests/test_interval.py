@@ -143,6 +143,60 @@ class RunAuditedTest(unittest.TestCase):
         self.assertFalse(interval.run_audited([]))
 
 
+class ScopedRunDoesNotResetCadence(unittest.TestCase):
+    """THE headline assertion for BE-4757.
+
+    `workflow_dispatch` bypasses the interval gate by design, so a manual
+    path-scoped groom REACHES the finder. If that run then counted as "the last
+    real groom", the next scheduled WHOLE-REPO tick would be suppressed for a
+    full GROOM_INTERVAL_DAYS — a partial audit stamping "done" over the full one.
+
+    groom.yml renames the finder job `Audit — finder (scoped)` when `path` is
+    set (the runs API does not return a run's dispatch inputs, so the job name is
+    the only per-run signal both sides can see); `run_audited` excludes it.
+    """
+
+    def scoped_finder_job(self, conclusion="success"):
+        return {"name": "groom / Audit — finder (scoped)", "conclusion": conclusion}
+
+    def test_scoped_finder_job_is_not_a_real_groom(self):
+        self.assertFalse(interval.run_audited([self.scoped_finder_job()]))
+        self.assertFalse(interval.run_audited([self.scoped_finder_job("failure")]))
+
+    def test_scoped_run_does_not_mask_a_whole_repo_run_in_the_same_list(self):
+        # Belt-and-suspenders on the loop's ordering: an unscoped finder job
+        # anywhere in the list still counts.
+        self.assertTrue(interval.run_audited([self.scoped_finder_job(), finder_job("success")]))
+
+    def test_scheduled_tick_after_a_scoped_run_is_still_DUE(self):
+        # End-to-end through `evaluate`: a scoped run YESTERDAY, a real whole-repo
+        # groom 8 days ago, interval 7. The scheduled tick must RUN — the scoped
+        # run must not have re-anchored the clock to yesterday.
+        runs = [
+            {"id": "3", "status": "completed", "run_started_at": iso(0.5)},   # scoped dispatch
+            {"id": "2", "status": "completed", "run_started_at": iso(8.0)},   # last real groom
+        ]
+        jobs = {"3": [self.scoped_finder_job()], "2": [finder_job("success")]}
+        decision = interval.evaluate(
+            "o/r", "ci-groom.yml", "9", 7.0, "schedule", NOW, run=make_gh_stub(runs, jobs)
+        )
+        self.assertTrue(decision["should_run"], decision["reason"])
+        self.assertEqual(decision["last_run_at"], iso(8.0))
+
+    def test_control_an_unscoped_run_yesterday_DOES_suppress_the_tick(self):
+        # The same fixture with the recent run UNSCOPED must skip — otherwise the
+        # assertion above would pass for the wrong reason (a broken gate).
+        runs = [
+            {"id": "3", "status": "completed", "run_started_at": iso(0.5)},
+            {"id": "2", "status": "completed", "run_started_at": iso(8.0)},
+        ]
+        jobs = {"3": [finder_job("success")], "2": [finder_job("success")]}
+        decision = interval.evaluate(
+            "o/r", "ci-groom.yml", "9", 7.0, "schedule", NOW, run=make_gh_stub(runs, jobs)
+        )
+        self.assertFalse(decision["should_run"], decision["reason"])
+
+
 class IntervalThresholdTest(unittest.TestCase):
     def test_full_day_intervals_lose_a_half_tick(self):
         self.assertEqual(interval.interval_threshold(7.0), 6.5)

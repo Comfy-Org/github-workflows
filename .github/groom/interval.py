@@ -21,6 +21,9 @@ over-spend). A prior run "counts" as a real groom only if it actually reached th
 finder (its `Audit — finder` job ran, i.e. was not `skipped` by this very gate),
 so the interval-skip ticks in between never reset the clock. Run history is
 durable across the stateless CI runs and readable with only `actions: read`.
+A **path-scoped** run (groom.yml's `path` input, BE-4757) also does not count: it
+audited one directory, so it must not stamp "done" over the whole-repo audit it
+never performed — see `_SCOPED_JOB_MARKER`.
 
 The gate is **fail-open**, matching the volume gate: any error deriving the last
 run (API hiccup, unparseable timestamp, no history) RUNS the audit rather than
@@ -63,6 +66,24 @@ from datetime import datetime, timezone
 # GitHub renders nested-reusable job names. An interval-skip tick has this job
 # `skipped`, so it never matches the audited conclusions below.
 _FINDER_JOB_HINTS = ("finder", "audit_find")
+
+# A PATH-SCOPED audit (groom.yml's `path` input, BE-4757) must NOT reset the
+# whole-repo cadence clock. `workflow_dispatch` deliberately bypasses this gate,
+# so without this exclusion a manual `path: services/api` run would reach the
+# finder, become "the last real groom", and suppress the next scheduled
+# whole-repo tick for a full GROOM_INTERVAL_DAYS — a PARTIAL audit stamping
+# "done" over the full one.
+#
+# The signal has to survive the runs API, which does NOT return a run's dispatch
+# INPUTS — so groom.yml renames the finder job itself when `path` is set (`Audit
+# — finder (scoped)`) and this marker is what excludes it. Job names are the one
+# per-run discriminator both sides can see.
+#
+# Collision direction is deliberate: a caller whose OWN job name happened to
+# contain "(scoped)" would make a real whole-repo run stop counting, i.e. groom
+# would run MORE often. That is the same fail-open bias as every other branch in
+# this module — never the silent under-run.
+_SCOPED_JOB_MARKER = "(scoped)"
 
 # A finder job that reached success OR failure spent the (billed) audit, so both
 # count as a real run: counting a failure keeps a run that spent money but died
@@ -177,9 +198,16 @@ def days_since(then_iso: str, now: datetime) -> float:
 
 
 def run_audited(jobs) -> bool:
-    """True if a run's jobs show the finder actually ran (not an interval-skip)."""
+    """True if a run's jobs show a WHOLE-REPO finder actually ran.
+
+    Not an interval-skip (its finder job is `skipped`), and not a path-scoped
+    audit (its finder job carries `_SCOPED_JOB_MARKER`) — a scoped run audits one
+    directory, so it must leave the next scheduled whole-repo tick DUE.
+    """
     for job in jobs or []:
         name = (job.get("name") or "").lower()
+        if _SCOPED_JOB_MARKER in name:
+            continue
         if any(hint in name for hint in _FINDER_JOB_HINTS) and job.get("conclusion") in _AUDITED_CONCLUSIONS:
             return True
     return False
