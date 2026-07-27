@@ -54,7 +54,11 @@ flow, the trailing-newline fix, the single-line PR body) lives once in
 `bump-callers.sh`. Registering a new fleet is: add a thin entrypoint (copy an
 existing one, swap the path filter + `VAR_NAME`/`TAG`/`WORKFLOW_FILE`/
 `ALLOW_EMPTY`), seed its variable, and add a row to this table + the paths in
-`test-bump-callers.yml`.
+`test-bump-callers.yml`. **Then `workflow_dispatch` the new entrypoint once.**
+Landing a fleet does not touch the reusable it watches, so its own merge matches
+no path filter and fires no run — callers that were already stale when the fleet
+was created stay stale until the reusable next changes. Every entrypoint carries
+`workflow_dispatch` for exactly this.
 
 The **groom** fleet is the one that most needs this: a groom caller pins the
 reusable **twice** — the `uses:` SHA *and* the `workflows_ref:` input that loads
@@ -74,6 +78,14 @@ appear in a committed file or in the logs. Each fleet's caller list lives in a
 repo-level Actions **variable** (config, not a credential) as a JSON array of
 `{"repo","file","label"}` objects (`label` optional). `bump-callers.sh`
 `::add-mask::`es every repo name out of the run logs before echoing it.
+
+> **Known gap.** Each entrypoint hands the roster to the script through the
+> step's `env:`, and Actions prints a step's env block *before* the step runs —
+> so the raw roster appears in the (public) log ahead of any masking. Closing it
+> means fetching the variable at run time (`gh variable get`) and masking it
+> before first use, which needs a token permission the fleets do not mint today.
+> It is fleet-wide; no single entrypoint can fix it. Until then, assume the
+> roster is public.
 
 Adding/removing a caller needs **no public commit** — edit the variable:
 
