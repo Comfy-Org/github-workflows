@@ -8,8 +8,11 @@ Checks that your repo follows the org's agent-instructions standard:
 
 - a top-level `AGENTS.md` **exists** and stays under a hard line ceiling
   (`max_lines`, default 200; warns over `warn_lines`, default 150)
-- a `CLAUDE.md`, **if present**, is a thin `@AGENTS.md` shim rather than a
-  divergent copy
+- a root `CLAUDE.md` **exists** and is a thin `@AGENTS.md` shim rather than a
+  divergent copy. With the default `require_shim: true`, a repo that has
+  `AGENTS.md` and *no* `CLAUDE.md` **fails** — Claude Code reads only `CLAUDE.md`
+  and does not fall back, so a missing shim means invisible instructions. Set
+  `require_shim: false` to only validate a `CLAUDE.md` that is already there.
 - no legacy `.cursorrules` (gated by `forbid_cursorrules`)
 - every nested monorepo `AGENTS.md` has a sibling `@AGENTS.md` shim and is under
   the ceiling (gated by `check_nested`)
@@ -33,7 +36,7 @@ name: AGENTS.md Integrity
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main]        # or [master] — your default branch
 
 jobs:
   check:
@@ -60,7 +63,7 @@ contents: read
 | `warn_lines` | `150` | Warns without failing. |
 | `forbid_cursorrules` | `true` | Fail on a legacy `.cursorrules`. |
 | `check_nested` | `true` | Also check nested monorepo `AGENTS.md` files. |
-| `require_shim` | `true` | `CLAUDE.md` must be an `@AGENTS.md` shim. |
+| `require_shim` | `true` | A root `CLAUDE.md` shim must **exist** (and import `@AGENTS.md`). `false` still rejects a divergent `CLAUDE.md`, but tolerates its absence. |
 | `require_codeowners` | `false` | Require a CODEOWNERS DRI for `AGENTS.md`. |
 | `agents_file` | `AGENTS.md` | Override the filename. |
 | `workflows_ref` | `main` | **Set to your `uses:` SHA** — the checker script loads from this ref. |

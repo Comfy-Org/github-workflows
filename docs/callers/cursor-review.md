@@ -9,8 +9,12 @@ passes over the PR diff. A judge model consolidates them into **one** PR review
 with per-finding severity badges. The person who applied the label gets Slack
 start/complete DMs.
 
-Advisory by default. Opt into blocking to fail a required-status-check gate while
-findings stay unresolved.
+**Advisory only.** No input fails the run on findings — the panel posts the review
+and succeeds regardless of what it found. If you want a merge gate, mark the
+consolidate check required: it is named `<your caller's job id> / Consolidate panel`
+(so `review / Consolidate panel` for the caller below). That gates on a review
+having *run*, not on its findings being addressed — resolving them stays a human
+judgement call.
 
 Prompts and scripts live in [`.github/cursor-review/`](../../.github/cursor-review)
 — the single source of truth, so your repo carries only a thin caller.
@@ -33,6 +37,9 @@ name: Cursor Review
 
 on:
   pull_request:
+    # Label-gated mode. If you set `run_without_label: true` below, this list
+    # must also carry [opened, reopened, ready_for_review, synchronize] — see
+    # the gotcha at the bottom.
     types: [labeled, unlabeled]
 
 concurrency:
@@ -72,10 +79,10 @@ pull-requests: write   # posting the consolidated review
 | `judge_model` | `claude-opus-4-8-thinking-max` | Consolidates the panel into one review. |
 | `diff_size_cap` | `5000` | Skip review above this diff size. |
 | `review_label` | `cursor-review` | The label that triggers a run. |
-| `diff_excludes` | *(none)* | Paths to keep out of the reviewed diff — generated code, fixtures, vendored trees. |
+| `diff_excludes` | lockfiles, `node_modules`, `.claude`, `dist`, `vendor`, `*.generated.*`, `*.min.js` | Paths kept out of **both** the size-budget count and the reviewed diff. Passing your own value **replaces** the default list, so re-state the entries you still want. |
 | `workflows_ref` | `main` | **Set to your `uses:` SHA** — prompts load from this ref at run time. |
 | `bot_app_id` | `''` | Post as your App. |
-| `run_without_label` | `false` | Run on every PR rather than waiting for the label. |
+| `run_without_label` | `false` | Run on every PR rather than waiting for the label. **Also requires widening your caller's `types:`** — see the gotcha. |
 
 ## Gotchas
 
@@ -87,6 +94,39 @@ exists to handle.
 
 **Applying the label does not guarantee a run.** If the event was swallowed,
 remove the label, confirm it is gone, then re-add it.
+
+**One review per commit — re-labeling alone will not re-review.** The gate skips
+the panel if a non-dismissed consolidated review already exists for the PR's HEAD
+SHA, so a remove-and-re-add on unchanged content no-ops by design. To get a fresh
+review of the same commit, **dismiss the existing review first**, then apply the
+label. Pushing a commit changes the SHA and always re-runs.
+
+**Fork PRs are skipped, deliberately.** `pull_request` withholds secrets from
+fork-originated runs, so `CURSOR_API_KEY` would be empty (every panel cell
+produces nothing) and `GITHUB_TOKEN` read-only (posting the review 403s). The gate
+detects the cross-repo head and skips cleanly rather than burning the matrix and
+failing red on every external contribution. Do not "fix" this with
+`pull_request_target` — that runs privileged against untrusted head code.
+
+**`run_without_label: true` needs a wider trigger, or it never fires.** The input
+only tells the reusable's gate to accept `opened` / `reopened` /
+`ready_for_review` / `synchronize`; it cannot add those events to *your* `on:`
+block. A caller left on `types: [labeled, unlabeled]` therefore still runs only
+when a label is toggled — ordinary PRs are silently never reviewed, with nothing
+in any log to explain it. Set both together:
+
+```yaml
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize, labeled, unlabeled]
+# ...
+    with:
+      run_without_label: true
+```
+
+Keep `labeled`/`unlabeled` in the list even in label-free mode: the label path
+stays live alongside it, which is how you force a re-review on an unchanged commit
+(dismiss the existing review, then apply the label — see the dedupe gotcha below).
 
 **`run_without_label: true` reviews every PR.** On a busy repo that is a large
 step up in spend. Start label-gated.

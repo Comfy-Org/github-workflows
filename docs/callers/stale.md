@@ -10,7 +10,7 @@ Slack digest of what it touched. PRs inactive for `days_before_pr_stale` get the
 `days_before_pr_close` more days.
 
 The digest names the source repo in the header **and on every PR line**
-(`Comfy-Org/cloud#3523`), so batches from different repos posted to the same
+(`your-org/your-repo#123`), so batches from different repos posted to the same
 channel stay unambiguous line by line.
 
 Issues are untouched — this is PR-only.

@@ -43,6 +43,7 @@ jobs:
     uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@<full-commit-sha>
     with:
       cadence: 7
+      workflows_ref: <same-full-commit-sha>   # see "Pinning" — do not leave this at main
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 ```
@@ -167,22 +168,52 @@ compatible. That is not hypothetical: this repo's own `ci-groom.yml` is not in
 
 ## Verifying it works
 
-Before trusting a schedule, prove the wiring:
+Before trusting a schedule, prove the wiring. How you trigger it depends on the
+caller's `on:` block — there is no universal recipe.
 
 ```bash
-# 1. Does the caller parse and resolve at all?
+# 1. Does the caller parse and resolve at all? (all callers)
 gh workflow list --repo <your-org>/<your-repo>
 
-# 2. Run it once by hand (needs workflow_dispatch in your `on:`)
-gh workflow run <caller>.yml --repo <your-org>/<your-repo>
-
-# 3. Read the result — a startup_failure means the permission grant is short
+# 2. Read the result of its most recent run
 gh run list --repo <your-org>/<your-repo> --workflow <caller>.yml --limit 1
 ```
 
+**Scheduled / dispatchable callers** — `groom`, `stale`, `assign-prs-to-author`.
+These declare `workflow_dispatch`, so you can fire them by hand:
+
+```bash
+gh workflow run <caller>.yml --repo <your-org>/<your-repo>
+```
+
+`groom` and `stale` are the two that take a **`dry_run`** input: a full audit that
+files/labels nothing and prints what it *would* do. Use it before the first live
+run. It only reaches the reusable if your caller plumbs a `workflow_dispatch` input
+through to `with: dry_run:` — [groom.md](groom.md) and [stale.md](stale.md) both
+show that wiring.
+
+```bash
+gh workflow run groom.yml --repo <your-org>/<your-repo> -f dry_run=true
+```
+
+**PR-triggered callers** — `cursor-review`, `cursor-review-auto-label`, `pr-size`,
+`agents-md-integrity`, `assign-reviewers`. As shown in their setup guides these
+declare **no `workflow_dispatch` and no `dry_run`**, so `gh workflow run` errors out
+instead of starting a run. Verify by opening a throwaway PR — and for
+`cursor-review`, applying the review label.
+
+Adding `workflow_dispatch` to the caller is only worth it for
+`agents-md-integrity`, which has no event dependency at all: it checks out the repo
+and validates the files, so a manual dispatch is a genuine smoke test. For the
+others it buys nothing — `cursor-review`, `cursor-review-auto-label` and `pr-size`
+read `github.event.pull_request`, which a dispatch does not populate, and
+`assign-reviewers` logs `Not a pull_request event — nothing to do` and exits.
+
+**Push-triggered caller** — `detect-unreviewed-merge` runs on push to the default
+branch. Verify it by landing any commit there, then reading the run.
+
 `conclusion: startup_failure` with no job logs is **always** worth checking the
-permission grant first. For the AI workflows, dispatch once with `dry_run: true`
-so you see what it *would* do before it does it.
+permission grant first.
 
 ## Secrets
 

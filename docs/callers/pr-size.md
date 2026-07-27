@@ -30,7 +30,7 @@ name: PR Size Cap
 
 on:
   pull_request:
-    branches: [main]
+    branches: [main]        # or [master] — YOUR default branch; see the gotcha
     # labeled/unlabeled are beyond the default set, so toggling the bypass label
     # re-runs the check immediately instead of needing a push.
     types: [opened, synchronize, reopened, labeled, unlabeled]
@@ -70,6 +70,12 @@ contents: read
 | `workflows_ref` | `main` | **Set to your `uses:` SHA** — the tool is built from this ref. |
 
 ## Gotchas
+
+**`branches:` must name your actual default branch.** The filter matches the PR's
+**base**, so a repo whose default is `master` (or `develop`, or a release train)
+gets *no* runs from the snippet above — the check silently never fires, no status
+appears, and nothing signals the misconfiguration. Adapt the value, or drop the
+`branches:` filter to size every PR regardless of base.
 
 **Start in `mode: warn`.** Turning on enforcement over an existing PR queue fails
 open PRs that were fine when opened. Warn for a cycle, read the numbers, then

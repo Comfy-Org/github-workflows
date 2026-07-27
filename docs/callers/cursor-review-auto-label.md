@@ -36,6 +36,9 @@ on:
 
 jobs:
   auto-label:
+    # Same-repo branches only — the App-token step fails on fork PRs, and
+    # cursor-review.yml skips forks regardless. See the gotcha.
+    if: github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       contents: read
     uses: Comfy-Org/github-workflows/.github/workflows/cursor-review-auto-label.yml@<full-commit-sha>
@@ -68,6 +71,14 @@ to explain it. Hence `vars.APP_ID` and the App private key are required rather
 than optional here.
 
 ## Gotchas
+
+**Guard the job against fork PRs yourself.** `pull_request` withholds secrets from
+fork-originated runs, so `CLOUD_CODE_BOT_PRIVATE_KEY` arrives empty and the
+App-token mint hard-fails — e.g. the moment a maintainer assigns a reviewer to an
+external contribution, that PR picks up a red check. The reusable does **not**
+carry a fork guard of its own, so add the `if:` shown in the caller above. Nothing
+is lost: [`cursor-review.yml`](cursor-review.md) skips fork PRs anyway, so the
+label would have had nothing to trigger.
 
 **Which moments fire is the caller's choice.** This workflow reacts to whatever
 `pull_request` event you pass through; it does not pick triggers for you.

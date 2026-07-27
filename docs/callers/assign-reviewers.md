@@ -15,7 +15,9 @@ Matches a PR's changed paths against a **caller-repo** `.github/reviewers.yml`
 > Comfy-Org routes and alerts people via assignees, so an entry under
 > `reviewers:` means "gets assigned".
 
-Requests go through the CLOUD_CODE_BOT App token, so they work on fork PRs.
+The assignee write goes through the CLOUD_CODE_BOT App token rather than
+`GITHUB_TOKEN`, so the calling job needs only `contents: read`. **This does not
+buy fork support** — see the fork gotcha below.
 
 ## Prerequisites
 
@@ -41,6 +43,10 @@ on:
 
 jobs:
   assign:
+    # Same-repo branches only. On a fork PR the secret below arrives empty, so
+    # the App-token step hard-fails and every external contribution carries a red
+    # X for a routing decision that could never have been made. See the gotcha.
+    if: github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       contents: read
     uses: Comfy-Org/github-workflows/.github/workflows/assign-reviewers.yml@<full-commit-sha>
@@ -90,6 +96,17 @@ rules:
 with commentary on how the buckets were seeded.
 
 ## Gotchas
+
+**Fork PRs are not routed, and the caller must skip them explicitly.** The
+`pull_request` event withholds repository secrets from fork-originated runs, so
+`CLOUD_CODE_BOT_PRIVATE_KEY` arrives empty and the App-token mint hard-fails — a
+red check and no routing either way. Hence the `if:` guard in the caller above; a
+skipped job reports as neutral instead. Routing forks would mean
+`pull_request_target`, which runs privileged against untrusted head code while
+this workflow reads `.github/reviewers.yml` from the head SHA — that combination
+turns the expertise map into a real escalation path, so it is not offered.
+[`ci-assign-reviewers.yml`](../../.github/workflows/ci-assign-reviewers.yml) in
+this repo is the worked example.
 
 **`default_pool` must never be one person** — and must not be whoever opens most
 PRs in the repo. Selection drops the author, so a bucket whose only member is the
