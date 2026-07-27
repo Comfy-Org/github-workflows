@@ -413,5 +413,118 @@ class FetchTest(unittest.TestCase):
         self.assertFalse(led.should_file("rejected-one"))
 
 
+class BuilderPrBodyTest(unittest.TestCase):
+    """The auto-builder PR body assembler (BE-4346).
+
+    Properties: the builder-authored ELI-5 body leads; the verifier rationale is
+    kept as a secondary `<details>` section; the banner is FIRST and the ledger
+    marker is LAST (so the next run still dedups the finding and the marker can't
+    be spoofed from the model body); and an empty / non-ELI-5 body falls back to
+    the original template rather than opening an empty-body PR.
+    """
+
+    BANNER = "> 🤖 **Auto-built by the groom sweep** — review required. · [run](http://x)"
+    ELI5 = ("## ELI-5\n\nWe renamed a helper so the two call sites read the same.\n\n"
+            "## What changed\n\nExtracted `fmt()` in `a.go` and `b.go`.\n\n"
+            "## Why\n\nLess duplication; behavior is identical.")
+
+    def test_builder_body_leads_and_wraps_rationale(self):
+        out = ledger.builder_pr_body(banner=self.BANNER, eli5_body=self.ELI5,
+                                     verifier_rationale="The verifier said X.", signature="sig-1")
+        self.assertTrue(out.startswith(self.BANNER))            # banner first
+        self.assertIn("## ELI-5", out)
+        self.assertLess(out.index("## ELI-5"), out.index("The verifier said X."))  # ELI-5 before rationale
+        self.assertIn("<details>", out)
+        self.assertIn("The verifier said X.", out)
+        self.assertEqual(ledger.extract_signature(out), "sig-1")  # marker recoverable
+        # Marker is LAST: nothing but whitespace after it.
+        self.assertRegex(out, r"-->\s*\Z")
+
+    def test_fallback_when_body_empty(self):
+        out = ledger.builder_pr_body(banner=self.BANNER, eli5_body="",
+                                     verifier_rationale="Rationale here.", signature="sig-2")
+        self.assertTrue(out.startswith(self.BANNER))
+        self.assertIn("## Verifier rationale", out)             # original template
+        self.assertNotIn("<details>", out)
+        self.assertIn("Rationale here.", out)
+        self.assertEqual(ledger.extract_signature(out), "sig-2")
+
+    def test_fallback_when_body_lacks_eli5_heading(self):
+        # A body whose FIRST heading isn't ELI-5 is unusable → template fallback,
+        # guaranteeing every builder-body PR opens with ELI-5.
+        body = "## Summary\n\nDid a thing.\n\n## ELI-5\n\ntoo late, not first."
+        out = ledger.builder_pr_body(banner=self.BANNER, eli5_body=body,
+                                     verifier_rationale="R.", signature="sig-3")
+        self.assertIn("## Verifier rationale", out)
+        self.assertNotIn("<details>", out)
+
+    def test_eli5_heading_variants_are_accepted(self):
+        for heading in ("## ELI-5", "## ELI5", "### ELI-5: overview", "#  eli 5"):
+            body = f"{heading}\n\nplain words."
+            out = ledger.builder_pr_body(banner=self.BANNER, eli5_body=body,
+                                         verifier_rationale="R.", signature="s")
+            self.assertIn("<details>", out, f"{heading!r} should be accepted as ELI-5")
+
+    def test_spoofed_marker_in_body_cannot_shadow_real_signature(self):
+        # A prompt-injected body embedding a marker for a DIFFERENT signature must
+        # NOT poison the ledger: extract_signature reads the LAST marker, and the
+        # real one is appended after the body.
+        evil = ledger.signature_marker("attacker-sig")
+        body = f"## ELI-5\n\nlooks fine {evil}\n\nmore."
+        out = ledger.builder_pr_body(banner=self.BANNER, eli5_body=body,
+                                     verifier_rationale="R.", signature="real-sig")
+        self.assertEqual(ledger.extract_signature(out), "real-sig")
+
+    def test_whitespace_only_body_falls_back(self):
+        out = ledger.builder_pr_body(banner=self.BANNER, eli5_body="   \n  ",
+                                     verifier_rationale="R.", signature="s")
+        self.assertIn("## Verifier rationale", out)
+        self.assertNotIn("<details>", out)
+
+    def test_decoy_eli5_heading_in_code_fence_is_rejected(self):
+        # A `## ELI-5` that only appears inside a leading fenced code block never
+        # renders as the opening heading — it must NOT be accepted as ELI-5-first.
+        body = "```md\n## ELI-5\n```\n\n## What changed\n\nreal content."
+        out = ledger.builder_pr_body(banner=self.BANNER, eli5_body=body,
+                                     verifier_rationale="R.", signature="s")
+        self.assertIn("## Verifier rationale", out)  # template fallback
+        self.assertNotIn("<details>", out)
+
+    def test_real_eli5_heading_after_code_fence_is_accepted(self):
+        # A genuine ELI-5 heading is still detected even when an earlier fenced
+        # block contains heading-shaped lines.
+        body = "```\n# not a heading\n```\n\n## ELI-5\n\nplain words."
+        out = ledger.builder_pr_body(banner=self.BANNER, eli5_body=body,
+                                     verifier_rationale="R.", signature="s")
+        self.assertIn("<details>", out)
+
+    def test_comment_injection_in_body_is_neutralized(self):
+        # An unclosed HTML comment in the builder body must not hide the rationale
+        # or marker: the delimiters are escaped to visible text, and the ledger
+        # marker still round-trips.
+        body = "## ELI-5\n\nlooks fine <!-- everything after here is hidden"
+        out = ledger.builder_pr_body(banner=self.BANNER, eli5_body=body,
+                                     verifier_rationale="rationale stays visible", signature="sig-x")
+        self.assertNotIn("<!--", out.replace(ledger.signature_marker("sig-x"), ""))
+        self.assertIn("rationale stays visible", out)
+        self.assertEqual(ledger.extract_signature(out), "sig-x")
+
+    def test_details_injection_in_rationale_is_neutralized(self):
+        # A `</details>` in the rationale must not close the wrapping section early.
+        out = ledger.builder_pr_body(banner=self.BANNER, eli5_body=self.ELI5,
+                                     verifier_rationale="oops </details> broke out", signature="s")
+        self.assertNotIn("</details> broke out", out)
+        self.assertIn("&lt;/details&gt;", out)
+
+    def test_oversized_rationale_is_truncated_under_limit(self):
+        huge = "X" * 200_000
+        out = ledger.builder_pr_body(banner=self.BANNER, eli5_body=self.ELI5,
+                                     verifier_rationale=huge, signature="sig-big")
+        self.assertLessEqual(len(out), 65536)          # under GitHub's hard limit
+        self.assertIn("truncated", out)
+        self.assertTrue(out.rstrip().endswith("-->"))  # marker preserved LAST
+        self.assertEqual(ledger.extract_signature(out), "sig-big")
+
+
 if __name__ == "__main__":
     unittest.main()

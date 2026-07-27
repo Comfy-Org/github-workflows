@@ -49,6 +49,16 @@ name: Groom (reusable)
 #           description: 'Run the audit but do NOT file issues'
 #           type: boolean
 #           default: false
+#         # OPTIONAL, builder callers only: let an operator raise the builder PR
+#         # ceiling for ONE manual run without editing the workflow. `choice` (not
+#         # `string`) so the UI offers a sanctioned list; the reusable clamps and
+#         # warns on anything else, so a value posted past this list by an API
+#         # dispatch fails closed at 0 PRs rather than aborting the run.
+#         max_prs:
+#           description: 'Builder PR ceiling for THIS dispatch (schedule uses the `with:` value)'
+#           type: choice
+#           default: '1'
+#           options: ['1', '2', '3', '5']
 #   permissions:
 #     # REQUIRED union — a reusable's nested jobs cannot request more GITHUB_TOKEN
 #     # scope than the caller grants, and GitHub validates this at STARTUP (a short
@@ -94,7 +104,14 @@ name: Groom (reusable)
 #         # so the file / build_pr-bail paths can open groom issues. Pilot with
 #         # dry_run:true first to preview patches without opening PRs.
 #         # builder: true
-#         # max_prs: 5            # throttle: at most N builder PRs per run
+#         # Throttle: at most N builder PRs per run. A bare number pins every run
+#         # (`max_prs: 1`). To let the optional dispatch input above override it for
+#         # one manual run, forward the input with a fallback for the SCHEDULE (which
+#         # carries no inputs, so the expression yields ''):
+#         #   max_prs: ${{ github.event.inputs.max_prs || '1' }}
+#         # No fromJSON() and no allowlist re-check are needed — max_prs is a
+#         # `string` input and the reusable does the parse/clamp (see its
+#         # description). That is the whole reason it is not `type: number`.
 #       secrets:
 #         ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 #         BOT_APP_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
@@ -208,10 +225,14 @@ on:
         required: false
         default: the whole repository
       model:
-        description: Anthropic model id for both the finder and the verifier agents.
+        description: >-
+          Anthropic model id for the finder, verifier, and builder agents. Defaults
+          to the current flagship — finding real refactors and adjudicating them is
+          quality-sensitive, so the strongest model earns its cost here. A caller
+          can pin an older id (e.g. `claude-opus-4-8`) to hold a run steady.
         type: string
         required: false
-        default: claude-opus-4-8
+        default: claude-opus-5
       workflows_ref:
         description: >-
           Ref of Comfy-Org/github-workflows to load the groom briefs + ledger
@@ -248,9 +269,42 @@ on:
           the top `max_prs` CONFIRM, non-security findings (ranked by the
           verifier) become PRs; the rest are filed as issues. Ignored unless
           `builder` is true.
-        type: number
+
+
+          Typed `string`, not `number`, ON PURPOSE — so a caller can forward its
+          own `workflow_dispatch` input straight through and let an operator raise
+          the ceiling for one manual run (see the caller pattern in the header).
+          A `workflow_dispatch` input is ALWAYS a string, and GitHub rejects a
+          string expression assigned to a `type: number` reusable input at
+          startup; the workaround is a `fromJSON()` cast in the caller, and
+          `fromJSON()` on a non-numeric string throws during expression
+          evaluation — failing the run before any job starts, with an error far
+          less obvious than "you typo'd a number". Taking a string here keeps
+          that cast, and its failure mode, in ONE place (the `build_select` step
+          below) instead of copy-pasted into every caller. A plain YAML number
+          (`max_prs: 1`) still assigns cleanly to a string input, so existing
+          callers need no change.
+
+
+          Parsing, all of which is non-fatal: empty/whitespace — what a SCHEDULED
+          run yields when a caller forwards `github.event.inputs.max_prs`, since a
+          schedule event carries no inputs — means "no override asked for" and
+          takes this default; a number is floor-clamped to >= 0; anything else
+          opens ZERO PRs with a loud warning, so a typo'd dispatch fails CLOSED
+          and every finding still files as an issue rather than throwing away a
+          completed audit.
+
+
+          No upper bound is enforced here, deliberately. A caller's `options:`
+          list is a UI convention and a typo guard, NOT a security boundary — the
+          only principals who can post a value past it (an API/CLI
+          `workflow_dispatch`) already have repo write access and could just edit
+          `options:`. The real backstops are structural: builder PRs are review-
+          gated and NEVER auto-merged, the finder emits only ~6-12 findings a run,
+          and `pr_size_limit` bails any oversized patch to an issue.
+        type: string
         required: false
-        default: 5
+        default: '5'
       pr_size_limit:
         description: >-
           Patch-size bail-out. If a finding's generated patch changes more than
@@ -290,6 +344,8 @@ env:
   DECISION_OUT: /tmp/groom-decision.json
   FINDING_IN: /tmp/groom-finding.json
   BUILDER_OUT: /tmp/groom-builder-result.json
+  # Builder-authored PR body (BE-4346): ELI-5-first, structured, no hard-wrap.
+  PR_BODY_OUT: /tmp/groom-pr-body.md
 
 jobs:
   gate:
@@ -1143,13 +1199,31 @@ jobs:
               print(f"::warning::{len(invalid)} verified finding(s) had no usable signature and were NOT filed (producer error).")
 
           builder = os.environ.get("BUILDER", "false").lower() == "true"
-          # `type: number` can arrive as "5" or "5.0"; parse leniently, clamp >=0.
-          raw = os.environ.get("MAX_PRS", "5").strip()
+          # max_prs is a `string` input so a caller can forward a raw
+          # workflow_dispatch value without a fromJSON() cast (see the input's
+          # description). This is the ONE place it is parsed. Three cases, none of
+          # which may abort the run:
+          #   empty   -> a SCHEDULED run of a caller that forwards
+          #              `github.event.inputs.max_prs`; a schedule event carries no
+          #              inputs, so no override was asked for -> take the default.
+          #   numeric -> accept "5" and "5.0" alike, floor-clamped to >= 0.
+          #   garbage -> `type: choice` constrains only the WEB UI; an API/CLI
+          #              workflow_dispatch can post any string. Fail CLOSED at 0
+          #              PRs with a loud warning instead of exiting non-zero: the
+          #              finder and verifier have already run and been paid for,
+          #              and every finding still files as an issue on the 0-PR
+          #              path. Falling back to MAX_PRS_DEFAULT here would be
+          #              actively wrong — a caller piloting at `max_prs: 1` would
+          #              silently get 5.
+          # OverflowError is caught alongside ValueError because float() accepts
+          # "inf"/"-inf" happily and it is int() that then blows up.
+          MAX_PRS_DEFAULT = "5"  # keep in sync with the input's `default:` above
+          raw = os.environ.get("MAX_PRS", MAX_PRS_DEFAULT).strip() or MAX_PRS_DEFAULT
           try:
               max_prs = max(0, int(float(raw)))
-          except ValueError:
-              print(f"::error::max_prs={raw!r} is not a number.")
-              raise SystemExit(1)
+          except (ValueError, OverflowError):
+              print(f"::warning::max_prs={raw!r} is not a number — opening NO builder PRs this run; every finding files as an issue instead. Re-dispatch with a numeric max_prs.")
+              max_prs = 0
 
           to_build, built_positions = [], set()
           if builder:
@@ -1433,6 +1507,7 @@ jobs:
               "{{CLONE}}": os.environ["GROOM_CLONE"],
               "{{FINDING_IN}}": os.environ["FINDING_IN"],
               "{{BUILDER_OUT}}": os.environ["BUILDER_OUT"],
+              "{{PR_BODY_OUT}}": os.environ["PR_BODY_OUT"],
           }
           with open(os.path.join(os.environ["GROOM_ASSETS"], "builder.md"), encoding="utf-8") as f:
               brief = f.read()
@@ -1501,8 +1576,9 @@ jobs:
           # finder's whole-repo sweep, but gets headroom now that git works — 100 turns
           # at the validated pace (~82 turns ≈ 12.3 min) fits the job's 30-min timeout.
           # The builder's writes are BROAD but not UNBOUNDED: it edits the worktree
-          # and writes $BUILDER_OUT, and nothing else. Scoping the write tools to
-          # exactly those two paths — rather than granting bare `Write,Edit` over the
+          # and writes $BUILDER_OUT + $PR_BODY_OUT (the model-authored PR body,
+          # BE-4346), and nothing else. Scoping the write tools to exactly those
+          # paths — rather than granting bare `Write,Edit` over the
           # whole runner filesystem — is what keeps a prompt-injected builder off
           # $RUNNER_TEMP/_runner_file_commands/set_env_* (append `BASH_ENV=/tmp/x` and
           # every later `run:` step sources attacker shell, escaping this allowlist
@@ -1520,7 +1596,7 @@ jobs:
           claude -p "$PROMPT" \
             --model "$MODEL" \
             --max-turns 100 \
-            --allowedTools "Read,Glob,Grep,Edit(//${GROOM_CLONE#/}/**),Edit(//${BUILDER_OUT#/}),Bash(git diff:*),Bash(git status:*),Bash(git log:*),Bash(git show:*),Bash(grep:*),Bash(cat:*),Bash(ls:*),Bash(head:*),Bash(tail:*),Bash(wc:*)" \
+            --allowedTools "Read,Glob,Grep,Edit(//${GROOM_CLONE#/}/**),Edit(//${BUILDER_OUT#/}),Edit(//${PR_BODY_OUT#/}),Bash(git diff:*),Bash(git status:*),Bash(git log:*),Bash(git show:*),Bash(grep:*),Bash(cat:*),Bash(ls:*),Bash(head:*),Bash(tail:*),Bash(wc:*)" \
             --bare \
             --setting-sources "" \
             --strict-mcp-config \
@@ -1637,18 +1713,25 @@ jobs:
           bail() {
             printf '{"status":"bail","reason":%s}\n' "$(jq -Rn --arg r "$1" '$r')" > /tmp/out/result.json
             : > /tmp/out/patch.diff
+            rm -f /tmp/out/pr_body.md
           }
+          # Cap on the model-authored PR body (BE-4346). Well under GitHub's 65536-char
+          # PR-body limit, leaving headroom for the banner + verifier rationale + marker
+          # that build_pr wraps around it; an oversized body is dropped (→ build_pr
+          # falls back to the plain template), never truncated mid-markdown.
+          BODY_MAX=20000
 
           # Stage everything the agent touched (incl. new files) and diff it.
           git -C repo add -A
           git -C repo diff --cached > /tmp/out/patch.diff || true
           # Pre-publish secret scan (471): the builder could read $ANTHROPIC_API_KEY,
-          # and BOTH of its outputs are model-authored and published. The patch becomes
-          # a public PR — and $SUMMARY is copied verbatim into result.json (a public
-          # artifact) and into the bail issue's body, so a builder that writes the key
-          # into its summary while emitting NO patch would leak it entirely unscanned.
-          # Scan both. Deterministic against the literal value only; base64/split
-          # defeats it — the sandbox/broker is the structural gate.
+          # and ALL of its outputs are model-authored and published. The patch becomes
+          # a public PR — $SUMMARY is copied verbatim into result.json (a public
+          # artifact) and into the bail issue's body — and the PR body ($PR_BODY_OUT,
+          # BE-4346) is published verbatim as the PR description, so a builder that
+          # writes the key into any of them would leak it entirely unscanned. Scan all
+          # three. Deterministic against the literal value only; base64/split defeats
+          # it — the sandbox/broker is the structural gate.
           #
           # Bail rather than `exit 1`: failing the matrix leg skips the upload below,
           # so build_pr has nothing to download and the finding is neither opened as a
@@ -1659,9 +1742,10 @@ jobs:
           # keeps it loud on the run page.
           if [ -n "${ANTHROPIC_API_KEY:-}" ] \
              && { LC_ALL=C grep -qF -- "$ANTHROPIC_API_KEY" /tmp/out/patch.diff \
-                  || printf '%s' "$SUMMARY" | LC_ALL=C grep -qF -- "$ANTHROPIC_API_KEY"; }; then
-            echo "::error::Build $IDX output contains ANTHROPIC_API_KEY — refusing to publish the patch OR the summary (possible prompt-injection exfil); filing a redacted issue instead."
-            bail "builder output withheld: it contained the model API key (possible prompt-injection exfil). Patch and summary discarded — a human must review this finding manually."
+                  || printf '%s' "$SUMMARY" | LC_ALL=C grep -qF -- "$ANTHROPIC_API_KEY" \
+                  || { [ -s "$PR_BODY_OUT" ] && LC_ALL=C grep -qF -- "$ANTHROPIC_API_KEY" "$PR_BODY_OUT"; }; }; then
+            echo "::error::Build $IDX output contains ANTHROPIC_API_KEY — refusing to publish the patch, summary OR PR body (possible prompt-injection exfil); filing a redacted issue instead."
+            bail "builder output withheld: it contained the model API key (possible prompt-injection exfil). Patch, summary and PR body discarded — a human must review this finding manually."
             exit 0
           fi
           CHANGED=$(git -C repo diff --cached --numstat | awk '{a+=($1=="-"?0:$1); d+=($2=="-"?0:$2)} END{print a+d+0}')
@@ -1715,6 +1799,17 @@ jobs:
           else
             printf '{"status":"patched","changed":%s,"summary":%s}\n' "$CHANGED" "$(jq -Rn --arg s "$SUMMARY" '$s')" > /tmp/out/result.json
             echo "Build $IDX patch: $CHANGED line(s) changed."
+            # Hand the builder-authored PR body (BE-4346) to build_pr via the artifact.
+            # It was secret-scanned above alongside the patch. Drop it — build_pr then
+            # falls back to the plain banner+rationale template — when it is absent
+            # (builder emitted none) or implausibly large; never truncate it. build_pr
+            # additionally validates it leads with `## ELI-5` and falls back if not.
+            if [ -s "$PR_BODY_OUT" ] && [ "$(wc -c < "$PR_BODY_OUT")" -le "$BODY_MAX" ]; then
+              cp "$PR_BODY_OUT" /tmp/out/pr_body.md
+              echo "Build $IDX PR body: $(wc -c < "$PR_BODY_OUT") byte(s)."
+            else
+              echo "Build $IDX: no usable builder PR body — build_pr will use the rationale template."
+            fi
           fi
 
       - name: Upload build result
@@ -1827,7 +1922,7 @@ jobs:
           # Reuse the ledger's exact marker encoding so the NEXT run recognizes
           # this PR (or bail issue) and never re-proposes the finding.
           sys.path.insert(0, os.path.join(os.environ["GITHUB_WORKSPACE"], "_groom_assets", ".github", "groom"))
-          from ledger import signature_marker
+          from ledger import signature_marker, builder_pr_body
 
           repo = os.environ["REPO"]
           idx = int(os.environ["IDX"])
@@ -1920,14 +2015,33 @@ jobs:
           sh(["git", "-C", "repo", "commit", "-m", f"groom: {title}\n\nAuto-built groom refactor ({sig}).\nReview required — do not auto-merge."])
           sh(["git", "-C", "repo", "push", "origin", branch])
 
-          # Branded, review-gated PR body: the verifier's rationale + a loud
-          # "review required, never auto-merged" banner + the ledger marker.
+          # Branded, review-gated PR body (BE-4346). The builder — which made the
+          # change — authors an `## ELI-5`-first, structured what/why body; the
+          # verifier's rationale is retained as a secondary `<details>` section under
+          # it. `builder_pr_body` prepends the loud "review required, never
+          # auto-merged" banner and appends the ledger marker LAST (both load-bearing),
+          # and falls back to the original banner+rationale template when the builder
+          # emitted no usable body (bail / empty / dropped upstream / not ELI-5-first) —
+          # never an empty-body PR.
           banner = ("> 🤖 **Auto-built by the groom sweep** — this is a machine-proposed refactor. "
                     "It runs full CI + cursor-review and **requires human review; it is NOT auto-merged.** "
                     f"Ranked from a CONFIRMED groom finding. · [run]({run_url})")
           if is_security:
               banner = "> ⚠️ **Security / auth-adjacent — scrutinize carefully.**\n" + banner
-          pr_body = f"{banner}\n\n## Verifier rationale\n\n{body_md}\n\n{signature_marker(sig)}\n"
+          builder_body = ""
+          try:
+              with open("/tmp/build/pr_body.md", encoding="utf-8") as f:
+                  builder_body = f.read()
+          except (OSError, UnicodeDecodeError):
+              # Missing file (bail/empty/dropped upstream) OR an unreadable/non-UTF-8
+              # body (non-UTF-8 bytes pass the byte-wise secret scan + wc -c cap
+              # upstream and would raise UnicodeDecodeError here). Either way, fall
+              # back to the template — never crash: this runs AFTER `git push`, so a
+              # crash would orphan the pushed branch, open no PR, record no ledger
+              # marker, and the finding would be re-proposed every run.
+              pass
+          pr_body = builder_pr_body(banner=banner, eli5_body=builder_body,
+                                    verifier_rationale=body_md, signature=sig)
 
           cmd = ["gh", "pr", "create", "-R", repo, "--base", base, "--head", branch,
                  "--title", f"[groom] {title}", "--body", pr_body,
