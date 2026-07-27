@@ -36,9 +36,12 @@ on:
 
 jobs:
   auto-label:
-    # Same-repo branches only — the App-token step fails on fork PRs, and
-    # cursor-review.yml skips forks regardless. See the gotcha.
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    # Same-repo, human-authored PRs only. Both fork PRs and Dependabot PRs run
+    # without Actions secrets, so the App-token mint fails on either. See the
+    # gotcha.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository
+      && github.actor != 'dependabot[bot]'
     permissions:
       contents: read
     uses: Comfy-Org/github-workflows/.github/workflows/cursor-review-auto-label.yml@<full-commit-sha>
@@ -71,6 +74,13 @@ to explain it. Hence `vars.APP_ID` and the App private key are required rather
 than optional here.
 
 ## Gotchas
+
+**Dependabot PRs fail the same way, and the fork guard alone misses them.**
+Dependabot branches live in the base repo, so they pass the cross-repo test, but
+Dependabot-triggered runs read the *Dependabot* secret store rather than Actions
+secrets — the private key is empty and the mint fails. This workflow has no
+bot-author skip of its own, so the caller-level `&& github.actor !=
+'dependabot[bot]'` above is what keeps dependency PRs green.
 
 **Guard the job against fork PRs yourself.** `pull_request` withholds secrets from
 fork-originated runs, so `CLOUD_CODE_BOT_PRIVATE_KEY` arrives empty and the

@@ -114,10 +114,14 @@ tests — run the matching command above for whatever you touched.
   `docs/callers/<name>.md` setup guide and a row in the README table (see
   CONTRIBUTING.md "Adding a new reusable workflow"). Move the floating major tag
   after merge.
-- **Document only inputs that exist.** The README and this file each described a
-  `cursor-review` `blocking:` input that was never declared; GitHub rejects an
-  unknown input at startup, so a phantom input in the docs is a broken caller for
-  whoever copies it. Check `on.workflow_call.inputs` before documenting a knob.
+- **Document only inputs that exist.** GitHub rejects an unknown input at startup,
+  so a phantom input in the docs is a broken caller for whoever copies it. Check
+  `on.workflow_call.inputs` before documenting a knob. The `cursor-review`
+  `blocking:` input is the worked example: it shipped in #16, was deleted from the
+  workflow by #31 (a judge-extraction fix) while its docs and
+  `gate-unresolved.py` were left behind, and the stale docs outlived it here, in
+  the README, and in `.github/cursor-review/README.md`. **Deleting an input is a
+  docs change too** — grep the repo for its name in the same commit.
 - **Versioning:** semver-style major tags (`v1`, `v2`). Breaking changes bump the
   major; backwards-compatible changes move the existing tag in place
   (`git tag -f v1 <sha> && git push -f origin v1`). This tag force-move is the

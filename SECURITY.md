@@ -29,11 +29,14 @@ and grant credentials to. In scope:
   quoting, or into a job that holds write scope.
 - **`pull_request_target` / fork-PR issues** — anything that lets a fork PR run
   with the base repo's secrets.
-- **Agent-boundary breaks** — the AI review and groom workflows deliberately run
-  their model steps with **no write credentials**, emitting patches or findings
-  that a *separate* job applies. A way to make an agent step hold a write token,
-  or to influence the privileged job from inside the unprivileged one, is a
-  vulnerability.
+- **Agent-boundary breaks** — where a model step is meant to run with **no write
+  credentials**, emitting patches or findings that a *separate* job applies, a way
+  to make that step hold a write token — or to influence the privileged job from
+  inside the unprivileged one — is a vulnerability. The separation is real for
+  groom and for cursor-review's 8 panel cells (`contents: read` only). It is
+  **not** absolute for cursor-review's judge: the `Consolidate panel` job runs the
+  judge model and posts the review in the same `pull-requests: write` job, so
+  treat findings about that boundary as in scope rather than known-and-accepted.
 - **Supply chain** — an unpinned or mutable third-party action reference, or a
   way to make a caller resolve assets from a ref other than the one it pinned.
 

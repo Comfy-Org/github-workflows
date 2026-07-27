@@ -9,12 +9,24 @@ passes over the PR diff. A judge model consolidates them into **one** PR review
 with per-finding severity badges. The person who applied the label gets Slack
 start/complete DMs.
 
-**Advisory only.** No input fails the run on findings — the panel posts the review
-and succeeds regardless of what it found. If you want a merge gate, mark the
-consolidate check required: it is named `<your caller's job id> / Consolidate panel`
-(so `review / Consolidate panel` for the caller below). That gates on a review
-having *run*, not on its findings being addressed — resolving them stays a human
-judgement call.
+**Advisory only, and there is currently no supported way to make it blocking.**
+The panel posts the review and succeeds regardless of what it found; no input
+fails the run on findings.
+
+Do **not** try to build a gate by marking `… / Consolidate panel` a required
+check. GitHub counts a *skipped* required check as passing, and that job is
+`if:`-gated on five conditions — it skips when the trigger label is absent, when a
+review already exists for the head SHA (the dedupe below), when the diff is over
+`diff_size_cap`, on fork PRs, and when the panel itself is skipped. So the check
+goes green in exactly the cases where no review ran, which is the opposite of a
+gate.
+
+A real opt-in gate did exist — a `blocking:` input and a fail-closed **Blocking
+gate** job — but both were dropped from `cursor-review.yml` in
+[#31](https://github.com/Comfy-Org/github-workflows/pull/31), which was otherwise
+a judge-extraction fix. Its script (`.github/cursor-review/gate-unresolved.py`)
+is still in the tree, orphaned. Restoring it is tracked separately; until then,
+treat this review as advisory and gate on human approval.
 
 Prompts and scripts live in [`.github/cursor-review/`](../../.github/cursor-review)
 — the single source of truth, so your repo carries only a thin caller.
@@ -99,7 +111,24 @@ remove the label, confirm it is gone, then re-add it.
 the panel if a non-dismissed consolidated review already exists for the PR's HEAD
 SHA, so a remove-and-re-add on unchanged content no-ops by design. To get a fresh
 review of the same commit, **dismiss the existing review first**, then apply the
-label. Pushing a commit changes the SHA and always re-runs.
+label.
+
+Pushing a commit clears the dedupe (new head SHA), but with the label-gated caller
+above it does **not** by itself start a run — `types: [labeled, unlabeled]` omits
+`synchronize`, so a push delivers no event at all. After pushing you still toggle
+the label. Add `synchronize` to `types:` if you want every push re-reviewed (and
+see the spend warning below).
+
+**Dependabot PRs are not covered by the fork skip.** Dependabot's branches live in
+the base repo, so the gate's cross-repo check treats them as ordinary PRs — but
+Dependabot-triggered runs read the *Dependabot* secret store, not Actions secrets.
+`CURSOR_API_KEY` therefore arrives empty and the token is read-only, so under
+`run_without_label: true` (or a `synchronize` trigger) every dependency PR burns
+the matrix and fails red. Keep those PRs out with a caller-level guard:
+
+```yaml
+    if: github.actor != 'dependabot[bot]'
+```
 
 **Fork PRs are skipped, deliberately.** `pull_request` withholds secrets from
 fork-originated runs, so `CURSOR_API_KEY` would be empty (every panel cell

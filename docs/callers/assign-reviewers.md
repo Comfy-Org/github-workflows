@@ -43,10 +43,13 @@ on:
 
 jobs:
   assign:
-    # Same-repo branches only. On a fork PR the secret below arrives empty, so
-    # the App-token step hard-fails and every external contribution carries a red
-    # X for a routing decision that could never have been made. See the gotcha.
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    # Same-repo, human-authored PRs only. On a fork PR — and on a Dependabot PR,
+    # which is same-repo but reads the Dependabot secret store — the secret below
+    # arrives empty, so the App-token step hard-fails and the PR carries a red X
+    # for a routing decision that could never have been made. See the gotcha.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository
+      && github.actor != 'dependabot[bot]'
     permissions:
       contents: read
     uses: Comfy-Org/github-workflows/.github/workflows/assign-reviewers.yml@<full-commit-sha>
@@ -96,6 +99,14 @@ rules:
 with commentary on how the buckets were seeded.
 
 ## Gotchas
+
+**Dependabot PRs need the same skip as forks, for a different reason.** They are
+same-repo, so the fork guard alone lets them through — but Dependabot-triggered
+runs read the *Dependabot* secret store rather than Actions secrets, so
+`CLOUD_CODE_BOT_PRIVATE_KEY` is still empty. The reusable *does* skip bot authors
+(`pr.user.type === 'Bot'`), but that check runs inside the job, **after** the
+App-token mint has already failed — so the red X lands before the skip is reached.
+Hence `&& github.actor != 'dependabot[bot]'` in the guard above.
 
 **Fork PRs are not routed, and the caller must skip them explicitly.** The
 `pull_request` event withholds repository secrets from fork-originated runs, so

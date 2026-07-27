@@ -47,7 +47,11 @@ at startup, getting it wrong gives you a zero-job `startup_failure` with no logs
 
 ## Inputs
 
-None.
+| Input | Default | Notes |
+|---|---|---|
+| `skip-bots` | `true` | Skip PRs opened by bot accounts (Dependabot, Renovate, app tokens). Set `false` to assign those to their bot author too. |
+
+Note the hyphen — it is `skip-bots`, not `skip_bots`.
 
 ## Gotchas
 
