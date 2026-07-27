@@ -74,10 +74,13 @@ name: Groom (reusable)
 #     contents: read
 #     issues: write
 #     pull-requests: read
-#     actions: read     # REQUIRED — the interval gate reads this workflow's run
-#     #                 # history to find the last real groom run. A reusable
-#     #                 # workflow's token is capped by the caller's grant, so
-#     #                 # WITHOUT this the gate fails open (runs every daily tick).
+#     actions: read     # REQUIRED — the `gate` job reads this workflow's run
+#     #                 # history to find the last real groom run, and DECLARES
+#     #                 # this scope. A nested job can't hold more than the caller
+#     #                 # grants and GitHub checks at STARTUP, so omitting this
+#     #                 # REJECTS the run outright ("requesting 'actions: read',
+#     #                 # but is only allowed 'actions: none'") — it does not
+#     #                 # degrade to a fail-open daily run.
 #   # REQUIRED — the dedup ledger reads GitHub issue state BEFORE filing, and
 #   # issue creation happens in a later step, so two overlapping runs could both
 #   # classify a signature as new and file duplicates (a TOCTOU race). Serialize.

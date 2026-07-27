@@ -212,10 +212,15 @@ real groom, so a skipped tick costs ~nothing (it never reaches the finder).
   interval gate had safely degraded to weekly, and `0` (a legitimate "no
   throttle") shrinks the merge window to today-only.
 
-The caller grants `actions: read` (a reusable workflow's token is capped by the
-caller's grant, so without it the run-history read 403s and the gate fails open).
-As with `ledger.py`, the pure decision logic is split from the thin `gh` I/O so it
-is fully unit-testable with no network.
+The caller **must** grant `actions: read`. The `gate` job declares that scope, and
+a nested reusable job can never hold more than the calling job grants — GitHub
+checks the subset at **startup**, so a caller that omits it has the whole run
+rejected (`requesting 'actions: read', but is only allowed 'actions: none'`,
+surfaced as an opaque "workflow file issue" with zero jobs) rather than degrading
+to a fail-open daily run. Fail-open covers the *other* failure: the grant is
+present but the history read errors (fresh repo with no runs, API hiccup) — then
+the gate runs rather than skips. As with `ledger.py`, the pure decision logic is
+split from the thin `gh` I/O so it is fully unit-testable with no network.
 
 ```bash
 python3 .github/groom/interval.py \

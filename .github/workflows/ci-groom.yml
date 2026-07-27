@@ -79,10 +79,13 @@ jobs:
       contents: read
       issues: write
       pull-requests: read
-      # REQUIRED for the interval gate (BE-4004): the reusable reads this repo's
-      # Actions run history to find the last real groom run. A reusable workflow's
-      # token is capped by the caller's grant, so without this the gate fails open
-      # (runs every daily tick, over-spending).
+      # REQUIRED for the interval gate (BE-4004): the reusable's `gate` job reads
+      # this repo's Actions run history to find the last real groom run. That job
+      # DECLARES `actions: read`, so the STARTUP subset check above applies —
+      # omitting it here does NOT degrade to a fail-open run, it REJECTS the whole
+      # run ("requesting 'actions: read', but is only allowed 'actions: none'").
+      # The gate's fail-open path is the other case: the grant is present but the
+      # history read errors (fresh repo, API hiccup) -> run rather than skip.
       actions: read
     # ⚠️ BUMP-AT-MERGE (BE-4004): this pin (and workflows_ref below) must point at
     # THIS PR's squash-merge SHA — the interval gate lives in the NEW groom.yml,
