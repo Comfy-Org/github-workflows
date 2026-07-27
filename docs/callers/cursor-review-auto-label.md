@@ -1,0 +1,79 @@
+# `cursor-review-auto-label.yml` — apply the review label for opted-in reviewers
+
+Read [the shared caller contract](README.md) first.
+
+## What it does
+
+Companion to [`cursor-review.yml`](cursor-review.md). When a person becomes
+responsible for a PR, this applies the review label that `cursor-review.yml`
+triggers on — keeping the "fire on label" contract intact instead of bolting a
+second trigger onto the review itself.
+
+The opt-in roster lives in **your** repo as
+`vars.CURSOR_REVIEW_OPTED_IN_LOGINS` (whitespace-separated GitHub logins). No
+roster is baked into the workflow.
+
+## Prerequisites
+
+| | |
+|---|---|
+| `vars.APP_ID` | **Required.** The CLOUD_CODE_BOT app id. |
+| `secrets.CLOUD_CODE_BOT_PRIVATE_KEY` | **Required.** |
+| `vars.CURSOR_REVIEW_OPTED_IN_LOGINS` | The opt-in roster. Empty means nobody gets auto-labeled. |
+
+## Caller
+
+`.github/workflows/cursor-review-auto-label.yml`:
+
+```yaml
+name: Cursor Review Auto-Label
+
+on:
+  pull_request:
+    # `assigned` is the core behavior. Add `opened` / `ready_for_review` to also
+    # label at PR creation time.
+    types: [assigned, opened, ready_for_review]
+
+jobs:
+  auto-label:
+    permissions:
+      contents: read
+    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review-auto-label.yml@<full-commit-sha>
+    secrets:
+      CLOUD_CODE_BOT_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+```
+
+## Required permissions
+
+```yaml
+contents: read
+```
+
+Only that. The label write goes through the App token, not `GITHUB_TOKEN`.
+
+## Inputs
+
+| Input | Default | Notes |
+|---|---|---|
+| `review_label` | `cursor-review` | Must match `cursor-review.yml`'s `review_label`. |
+| `skip_label` | `skip-cursor-review` | Present on a PR ⇒ never auto-label it. |
+| `runs_on` | `'"ubuntu-latest"'` | JSON. Set for self-hosted runners. |
+
+## Why the App token is mandatory
+
+A label applied with the default `GITHUB_TOKEN` **does not trigger workflow
+runs** — GitHub suppresses events raised by that token to prevent recursion. The
+label would appear on the PR and no review would start, with nothing in any log
+to explain it. Hence `vars.APP_ID` and the App private key are required rather
+than optional here.
+
+## Gotchas
+
+**Which moments fire is the caller's choice.** This workflow reacts to whatever
+`pull_request` event you pass through; it does not pick triggers for you.
+
+**Keep `review_label` in sync** between this workflow and `cursor-review.yml`. A
+mismatch labels PRs that nothing is listening for.
+
+**An auto-applied label is not proof a review ran.** Check the run, not the
+label.

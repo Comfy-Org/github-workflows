@@ -2,3 +2,12 @@
 __pycache__/
 *.py[cod]
 *.pyc
+
+# Go build output. pr-size.yml compiles this from source into RUNNER_TEMP on
+# every run, so a committed binary is dead weight — and a local `go build` here
+# produces a host-arch executable that cannot run on the ubuntu-latest runners.
+/scripts/check-pr-size/check-pr-size
+
+# Stray local logs
+err.log
+*.err.log

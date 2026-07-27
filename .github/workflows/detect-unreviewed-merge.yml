@@ -13,13 +13,21 @@ name: Detect Unreviewed Merge (reusable)
 #   concurrency:
 #     group: detect-unreviewed-merge-${{ github.sha }}
 #     cancel-in-progress: false
+#   permissions:
+#     contents: read
+#     pull-requests: read
 #   jobs:
 #     detect:
-#       uses: Comfy-Org/unreviewed-merges/.github/workflows/detector.yml@v1
+#       # This repo, pinned by full commit SHA. The path below is the live one;
+#       # an older example pointed at Comfy-Org/unreviewed-merges/.../detector.yml,
+#       # which does not exist and does not resolve.
+#       uses: Comfy-Org/github-workflows/.github/workflows/detect-unreviewed-merge.yml@<sha>  # v1
 #       with:
 #         approval-mode: latest-per-reviewer  # or 'any-approval' for private repos
 #       secrets:
 #         UNREVIEWED_MERGES_TOKEN: ${{ secrets.UNREVIEWED_MERGES_TOKEN }}
+#
+# Setup guide: docs/callers/detect-unreviewed-merge.md
 
 on:
   workflow_call:

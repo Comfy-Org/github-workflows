@@ -1,56 +1,126 @@
 # Comfy-Org reusable GitHub Actions workflows
 
-Shared, versioned [reusable workflows](https://docs.github.com/en/actions/using-workflows/reusing-workflows) for use across Comfy-Org repositories.
+Shared, versioned [reusable
+workflows](https://docs.github.com/en/actions/using-workflows/reusing-workflows)
+for use across Comfy-Org repositories.
 
-This repo is **public** so any repo — public or private, inside or outside the org — can call these workflows with no extra GitHub Actions settings.
+This repo is **public**, so any repo — public or private, inside or outside the
+org — can call these workflows with no extra GitHub Actions settings.
+
+**→ [Setup guides for every workflow](docs/callers/)** — each gives you a
+complete, copy-pasteable caller.
 
 ## Workflows
 
-| Workflow | Purpose |
-|---|---|
-| [`detect-unreviewed-merge.yml`](.github/workflows/detect-unreviewed-merge.yml) | SOC 2 compliance — detects PRs merged without prior approval and opens a tracking issue in [`Comfy-Org/unreviewed-merges`](https://github.com/Comfy-Org/unreviewed-merges). |
-| [`cursor-review.yml`](.github/workflows/cursor-review.yml) | Label-triggered multi-model code review. A 4-lab × 2-review-type cursor-agent panel runs adversarial + edge-case passes, a judge model consolidates them into one PR review with per-finding severity badges, and the triggerer gets Slack start/complete DMs. Advisory by default; opt in with `blocking: true` to fail a (required-status-check) gate while findings stay unresolved. Prompts and scripts live in [`.github/cursor-review/`](.github/cursor-review) — the single source of truth, so consumer repos carry only a thin caller. Self-hostable via `runs_on` (JSON, default `ubuntu-latest`) and panel models overridable via `models` (JSON array) for accounts lacking a default provider. Requires `CURSOR_API_KEY` (+ optional `SLACK_BOT_TOKEN`). |
-| [`cursor-review-auto-label.yml`](.github/workflows/cursor-review-auto-label.yml) | Companion to `cursor-review.yml`. On PR assignment, applies the review label for an opted-in reviewer (via the CLOUD_CODE_BOT app token, so the label actually triggers the review). The opt-in roster lives in the caller's `vars.CURSOR_REVIEW_OPTED_IN_LOGINS` — no roster is baked into the workflow. Requires `vars.APP_ID` + `CLOUD_CODE_BOT_PRIVATE_KEY`. |
-| [`assign-reviewers.yml`](.github/workflows/assign-reviewers.yml) | Auto-requests expertise-aware, load-balanced PR reviewers with new-folk randomization. Matches changed paths against a caller-repo `.github/reviewers.yml` (path-glob → reviewers, plus a `default_pool`), drops the author + `vars.REVIEWER_EXCLUDE`, ranks candidates by open review load (steering off anyone at/over `vars.REVIEWER_LOAD_CAP`), and may swap a slot for a `vars.REVIEWER_GROWTH_POOL` member. Requests go through the CLOUD_CODE_BOT app token so they work on fork PRs. Requires `vars.APP_ID` + `CLOUD_CODE_BOT_PRIVATE_KEY`. |
-| [`assign-prs-to-author.yml`](.github/workflows/assign-prs-to-author.yml) | Housekeeping — assigns every open PR with no assignees to its author (bot-authored PRs skipped by default). Run on a schedule from a thin caller; useful when a team tracks PR ownership via assignees. The calling job needs `pull-requests: write` and `issues: write`. |
-| [`pr-size.yml`](.github/workflows/pr-size.yml) | PR-size cap — fails (or, in `mode: warn`, only reports) when a PR's net diff exceeds `max_lines` non-generated changed lines, keeping diffs reviewable. Excludes dependency lockfiles, `linguist-generated` files (read from the base ref, so a PR can't exempt itself), Go generated-code markers, and per-repo `extra_lockfiles` / `extra_generated_globs`. A `bypass_label` (default `oversized-ok`) waves through a legitimately large change; a sticky bot comment explains overages when `bot_app_id` + `BOT_APP_PRIVATE_KEY` are supplied (degrades to status + step summary without them). Counting logic + tests live in [`scripts/check-pr-size/`](scripts/check-pr-size). |
-| [`stale.yml`](.github/workflows/stale.yml) | Stale-PR sweeper (`actions/stale`) plus a Slack digest of what it touched. PRs inactive for N days are labeled `stale`; still-inactive PRs are closed. The digest names the source repo in the header **and on every PR line** (`Comfy-Org/cloud#3523`) so batches from different repos posted to the same channel are unambiguous, line by line. Thresholds, messages, exempt labels, and the Slack channel are inputs; the caller owns the schedule + dry-run toggle. The calling job needs `pull-requests: write` and `issues: write`. Optional `SLACK_BOT_TOKEN`. |
-| [`groom.yml`](.github/workflows/groom.yml) | Scheduled/dispatch org-wide **code-cleanup sweep** (finds only — no commits, no PRs, never merges). A read-only FINDER agent scans a clean default-branch checkout (whole-repo, not a diff) for high-value refactors; an INDEPENDENT VERIFIER agent (fresh session) re-checks each as CONFIRM/DOWNGRADE/REJECT with a stable dedup signature; survivors are deduped against a durable GitHub-issue-state ledger and filed as `groom`-labeled GitHub issues (security-adjacent ones get `groom-security` — investigate, don't auto-implement). Mirrors the cursor-review topology: briefs + ledger live in [`.github/groom/`](.github/groom) as the single source of truth. The agent step holds no write credentials (the `audit` job is `contents: read` only, per `model-gap-detector.yml`); filing runs in a separate job as the bot you configure via `bot_app_id` (Comfy: cloud-code-bot). `dry_run` reports what it would file without opening issues. The calling job must grant `contents: read` + `issues: write` + `pull-requests: read` — declared by the `file` / `build_select` jobs (needed even with `bot_app_id` set); GitHub rejects a shorter grant at startup. The finder/verifier/builder agent jobs invoke the Claude CLI directly and mint no GitHub token, so they need nothing beyond `contents: read` (`id-token: write` is no longer required; a caller that still grants it is harmless). Requires `ANTHROPIC_API_KEY` (+ `BOT_APP_PRIVATE_KEY` when `bot_app_id` is set). **Opt-in auto-builder** (`builder: true`, BE-4003): the top `max_prs` (default 5) CONFIRMED, non-security findings become **review-gated PRs** (full CI + cursor-review, **never auto-merged**) instead of issues; a credential-free `build` job emits only a patch artifact and a separate `build_pr` job opens the PR as the bot, preserving the security boundary. The ledger's PR-state (open/merged/closed) stops a built finding being re-proposed. Requires `bot_app_id`. `max_prs` is typed **`string`**, not `number`, so a caller can forward its own `workflow_dispatch` input straight through (`max_prs: ${{ github.event.inputs.max_prs \|\| '1' }}`) and let an operator raise the ceiling for one manual run — no `fromJSON()` cast in the caller, and the parse/clamp (empty → default, non-numeric → 0 PRs + warning, never a failed run) happens once inside the reusable. |
-| [`agents-md-integrity.yml`](.github/workflows/agents-md-integrity.yml) | Enforces the Comfy `AGENTS.md` standard on the caller repo: a top-level `AGENTS.md` must exist and stay under a hard line ceiling (`max_lines`, default 200; warns over `warn_lines`, default 150), a `CLAUDE.md` (if present) must be a thin `@AGENTS.md` shim rather than a divergent copy, no legacy `.cursorrules` (gated `forbid_cursorrules`), every nested monorepo `AGENTS.md` needs a sibling `@AGENTS.md` shim and to be under the ceiling (gated `check_nested`), and `AGENTS.md` should have a CODEOWNERS DRI (`require_codeowners`, warn-only by default). Fails with a non-zero exit + GitHub annotations so it wires in as a required status check. The checker lives in [`.github/agents-md-integrity/`](.github/agents-md-integrity) (pin `workflows_ref` to the same ref as `uses:`); no secrets required. |
+| Workflow | Purpose | Setup |
+|---|---|---|
+| [`groom.yml`](.github/workflows/groom.yml) | Scheduled whole-repo code-cleanup sweep. A read-only finder agent proposes refactors, an independent verifier re-checks each, and survivors are deduped against a durable ledger and filed as `groom` issues. Opt-in builder turns top findings into review-gated PRs. | [groom.md](docs/callers/groom.md) |
+| [`cursor-review.yml`](.github/workflows/cursor-review.yml) | Label-triggered multi-model code review. A 4-lab × 2-review-type panel runs adversarial + edge-case passes; a judge model consolidates them into one PR review with per-finding severity badges, and the triggerer gets Slack DMs. | [cursor-review.md](docs/callers/cursor-review.md) |
+| [`cursor-review-auto-label.yml`](.github/workflows/cursor-review-auto-label.yml) | Companion to the above. Applies the review label for an opted-in reviewer using an App token, so the label actually fires the review. | [cursor-review-auto-label.md](docs/callers/cursor-review-auto-label.md) |
+| [`pr-size.yml`](.github/workflows/pr-size.yml) | PR-size cap. Fails (or, in `mode: warn`, only reports) when a PR's net **non-generated** diff exceeds `max_lines`, excluding lockfiles and generated code. Bypass label for legitimately large changes. | [pr-size.md](docs/callers/pr-size.md) |
+| [`agents-md-integrity.yml`](.github/workflows/agents-md-integrity.yml) | Enforces the org `AGENTS.md` standard: it exists, stays under a line ceiling, `CLAUDE.md` is a thin shim, no legacy `.cursorrules`. Wires in as a required status check. | [agents-md-integrity.md](docs/callers/agents-md-integrity.md) |
+| [`assign-reviewers.yml`](.github/workflows/assign-reviewers.yml) | Expertise-aware, load-balanced PR routing from a per-repo `.github/reviewers.yml`, with new-folk randomization. Writes the **assignee** field. | [assign-reviewers.md](docs/callers/assign-reviewers.md) |
+| [`assign-prs-to-author.yml`](.github/workflows/assign-prs-to-author.yml) | Housekeeping. Assigns every open PR with no assignees to its author. Run on a schedule. | [assign-prs-to-author.md](docs/callers/assign-prs-to-author.md) |
+| [`stale.yml`](.github/workflows/stale.yml) | Stale-PR sweeper (`actions/stale`) plus a Slack digest that names the repo on every PR line, so multi-repo batches in one channel stay readable. | [stale.md](docs/callers/stale.md) |
+| [`detect-unreviewed-merge.yml`](.github/workflows/detect-unreviewed-merge.yml) | SOC 2 compliance. Detects PRs merged without prior approval and opens a tracking issue in [`Comfy-Org/unreviewed-merges`](https://github.com/Comfy-Org/unreviewed-merges). | [detect-unreviewed-merge.md](docs/callers/detect-unreviewed-merge.md) |
 
-## Usage
+Per-workflow inputs and secrets are also documented in each workflow file's
+header comment; the setup guides above are the maintained, copy-pasteable version.
 
-Reference a workflow by full path and pin to a **full commit SHA** (with the version as a trailing comment). Also set explicit minimum permissions on the calling job so the default permissive token scope isn't granted:
+## Quick start
+
+A caller is a **complete workflow file** in your repo at
+`.github/workflows/<name>.yml`. It needs its own `on:` trigger — the reusable
+workflow does not supply one — and its calling job must grant the permissions the
+reusable's nested jobs declare:
 
 ```yaml
-permissions:
-  contents: read
-  pull-requests: read
+name: PR Size Cap
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 jobs:
-  my-job:
-    uses: Comfy-Org/github-workflows/.github/workflows/<workflow-name>.yml@<sha>  # v1
+  size:
+    permissions:
+      contents: read
+    uses: Comfy-Org/github-workflows/.github/workflows/pr-size.yml@<full-commit-sha>
     with:
-      <input>: <value>
-    secrets:
-      <SECRET>: ${{ secrets.<SECRET> }}
+      workflows_ref: <same-full-commit-sha>
+      max_lines: 1000
 ```
 
-The SHA-pin format satisfies pin-validation tooling (`pinact`, `zizmor`, etc.) and gives auditors immutable supply-chain evidence. Dependabot/Renovate can auto-bump the SHA when the upstream tag moves.
+Get the current SHA:
 
-A bare `@v1` tag is technically allowed but **will fail** in repos that run pin-validation in CI (e.g. `cloud`, `ComfyUI_frontend`).
+```bash
+gh api repos/Comfy-Org/github-workflows/commits/main --jq .sha
+```
 
-Per-workflow inputs, required secrets, and triggers are documented in each workflow file's header comment.
+Then follow the [setup guide](docs/callers/) for whichever workflow you are
+adopting — the exact permission grant, required secrets, and per-workflow
+footguns are there.
+
+> **Permissions fail at startup.** A nested job cannot request more
+> `GITHUB_TOKEN` scope than the calling job grants, and GitHub validates that
+> *before any job runs* — regardless of `if:` guards, and regardless of a GitHub
+> App token doing the real writes. Get it wrong and you get an opaque "workflow
+> file issue" with **zero jobs and no logs**, not a failing step. Grant exactly
+> what the setup guide lists.
+
+## Pinning
+
+Pin `uses:` to a **full commit SHA**, with the version as a trailing comment:
+
+```yaml
+uses: Comfy-Org/github-workflows/.github/workflows/pr-size.yml@8c4ff3e… # v1
+```
+
+The SHA-pin format satisfies pin-validation tooling (`pinact`, `zizmor`) and gives
+auditors immutable supply-chain evidence. Dependabot/Renovate can auto-bump it.
+
+A bare `@v1` tag is technically allowed but **will fail** in repos that run pin
+validation in CI — and because `v1` is force-pushed for compatible changes, it
+silently changes what you execute.
+
+**Keep `workflows_ref` equal to your `uses:` SHA.** `groom`, `cursor-review`,
+`pr-size`, and `agents-md-integrity` load assets — agent briefs, review prompts,
+checker scripts — from `workflows_ref` at run time. It defaults to `main`, so a
+SHA-pinned caller that leaves it unset runs an old workflow against today's
+assets.
+
+## Staying current
+
+Enrolling a repo is **two steps**:
+
+1. Merge the caller workflow into your repo.
+2. Add the repo to the matching roster variable here — `GROOM_CALLERS`,
+   `CURSOR_REVIEW_CALLERS`, `PR_SIZE_CALLERS`, `AGENTS_MD_CALLERS`, or
+   `ASSIGN_REVIEWERS_CALLERS`.
+
+The `bump-*-callers.yml` workflows read those rosters to open pin-bump PRs when a
+reusable moves. **A repo absent from the roster keeps its original SHA forever**,
+drifts behind, and eventually breaks when the two stop being compatible. Details
+in [docs/callers/README.md](docs/callers/README.md#staying-current).
 
 ## Versioning
 
-Workflows in this repo use **semver-style major-version tags** (`v1`, `v2`, …).
+Major-version tags (`v1`, `v2`, …).
 
-- Breaking changes bump the major (`v1` → `v2`); callers opt in.
-- Backwards-compatible changes update the existing major tag in place (`git tag -f v1 <sha> && git push -f origin v1`) — callers pinned to the tag pick up the update on the next run; callers pinned to a SHA opt in by bumping the SHA.
+- **Breaking changes** bump the major; callers opt in. Adding a required input,
+  adding a required secret, or making a nested job request a new permission are
+  all breaking — even though nothing in the caller's YAML changed.
+- **Backwards-compatible changes** move the existing major tag in place
+  (`git tag -f v1 <sha> && git push -f origin v1`). Callers pinned to the tag pick
+  it up on their next run; SHA-pinned callers opt in by bumping.
 
-## Adding a new reusable workflow
+## Contributing
 
-1. Add the workflow file under `.github/workflows/<descriptive-name>.yml` with `on: workflow_call:` and a header comment documenting inputs/secrets.
-2. Update the table in this README.
-3. Move the floating `v1` tag (or cut a new major) once the change is reviewed and merged.
+See [CONTRIBUTING.md](CONTRIBUTING.md) — how to add a new reusable workflow, which
+tests to run, and why every change here is live-fire.
+
+Security issues: **do not open a public issue.** See [SECURITY.md](SECURITY.md).
+
+## License
+
+[MIT](LICENSE).
