@@ -199,7 +199,11 @@ real groom, so a skipped tick costs ~nothing (it never reaches the finder).
   interval-skip ticks in between never reset the clock. (A repo variable would
   need a `Variables: write` credential the run doesn't carry, and a missing grant
   would fail *silently* into a daily over-spend — run history has no such trap.)
-- **`workflow_dispatch` always runs** — a manual dispatch bypasses the gate.
+- **`workflow_dispatch` bypasses THIS gate** — a manual dispatch is never
+  interval-throttled. It is not a blanket "always runs": the volume gate is a
+  second, independent throttle, so a live dispatch into a quiescent repo can
+  still skip. Turn `volume_gate` off (the reference caller does exactly this for
+  `dry_run:true` dispatches) if a manual run must always reach the finder.
 - **Fail-open**, like the volume gate: any error reading history (API hiccup, no
   history, unparseable timestamp) RUNS the audit rather than skip a due groom.
 - **One normalization for both gates.** The caller wires the same variable to

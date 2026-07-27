@@ -43,7 +43,7 @@ name: Groom (reusable)
 #       # run no-ops cheaply (before the finder). GH Actions cron is static in the
 #       # file, so a daily tick + a runtime gate is how you get a tunable cadence.
 #       - cron: '17 9 * * *'      # daily 09:17 UTC — never on-PR
-#     workflow_dispatch:          # always runs — a manual override bypasses the gate
+#     workflow_dispatch:          # bypasses the INTERVAL gate (not the volume gate)
 #       inputs:
 #         dry_run:
 #           description: 'Run the audit but do NOT file issues'
@@ -152,7 +152,10 @@ on:
           run actually happens ~every `interval_days`. Wire it in the caller to a
           repo Actions variable (GROOM_INTERVAL_DAYS, falling back to 7) to retune
           cadence with no workflow-file edit — see the caller pattern in the
-          header. `workflow_dispatch` always runs regardless. Default 7 keeps the
+          header. `workflow_dispatch` bypasses THIS gate regardless of the
+          interval — but not the separate `volume_gate`, which still applies to a
+          live dispatch, so a manual run is not unconditionally guaranteed to
+          reach the finder. Default 7 keeps the
           original weekly behavior; 0 disables the throttle (run every base tick).
           Deliberately `type: string`, not `number`: this is wired to a free-text
           Actions variable a human edits, and a `number` input makes GitHub reject
@@ -183,7 +186,10 @@ on:
         description: >-
           Skip the (expensive) audit when nothing merged in the last `cadence`
           days. Fail-open — a gate-check API error runs the audit anyway. Turn
-          off to always run on the caller's schedule.
+          off to always run on the caller's schedule. INDEPENDENT of the interval
+          gate: `workflow_dispatch` bypasses the interval gate but NOT this one,
+          so a caller that needs a manual run to always reach the finder must
+          also pass `volume_gate: false` for that dispatch.
         type: boolean
         required: false
         default: true
@@ -398,7 +404,8 @@ jobs:
       - name: Interval gate (GROOM_INTERVAL_DAYS)
         # Cadence gate: on a frequent (daily) base cron, skip cheaply unless
         # GROOM_INTERVAL_DAYS have elapsed since the last REAL groom run (derived
-        # from run history). workflow_dispatch always bypasses. Runs BEFORE the
+        # from run history). workflow_dispatch always bypasses THIS gate (the
+        # volume gate below is a separate throttle). Runs BEFORE the
         # finder ever spins up, so a skipped tick costs ~nothing. Fail-open.
         id: interval
         env:
