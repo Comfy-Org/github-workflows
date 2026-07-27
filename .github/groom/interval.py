@@ -243,15 +243,25 @@ def run_audited(jobs, scope_path: str = "") -> bool:
     marker and so cannot be ATTRIBUTED to a scope at all. Both fall through to
     "no prior run", which fails open.
     """
-    want = scoped_job_marker(scope_path).lower() if scope_path else ""
+    want = scoped_job_marker(scope_path) if scope_path else ""
     for job in jobs or []:
-        name = (job.get("name") or "").lower()
+        raw_name = job.get("name") or ""
+        name = raw_name.lower()
         if not any(hint in name for hint in _FINDER_JOB_HINTS):
             continue
         if job.get("conclusion") not in _AUDITED_CONCLUSIONS:
             continue
         if want:
-            if want in name:
+            # The MARKER is compared case-SENSITIVELY (against the raw job name)
+            # while the surrounding prose hints stay case-insensitive. Paths on
+            # the Linux runner are case-sensitive and `_COMPONENT_RE` admits both
+            # cases, so `services/api` and `services/API` are two distinct scopes
+            # with two distinct clocks; folding case would collapse them onto one
+            # and let a run of either silently suppress the other's due tick —
+            # the silent under-run this module refuses. A case MISMATCH now reads
+            # as "no prior run of this scope", i.e. fail-open, the same collision
+            # direction as every other branch here.
+            if want in raw_name:
                 return True
         elif _SCOPED_MARKER_PREFIX not in name and any(h in name for h in _DISPLAY_NAME_HINTS):
             return True

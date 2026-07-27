@@ -212,6 +212,21 @@ class ResolveWithin(unittest.TestCase):
         finally:
             os.rmdir(outside)
 
+    def test_symlinked_scope_rejected_even_when_it_points_INSIDE(self):
+        # Containment passes (the target is in the tree), but `git ls-files --
+        # <link>` lists the LINK, not the files behind it — so groom.yml's
+        # non-empty guard would be satisfied by one entry while the finder
+        # audited nothing and reported the directory clean. Fail loudly instead;
+        # naming the real directory is a one-word fix for the caller.
+        os.symlink(os.path.join(self.root, "services", "api"), os.path.join(self.root, "api-link"))
+        with self.assertRaises(scope.UnsafePathError) as ctx:
+            scope.resolve_within(self.root, "api-link")
+        self.assertIn("symlink", str(ctx.exception))
+        # A symlinked INTERMEDIATE component is the same hazard.
+        os.symlink(os.path.join(self.root, "services"), os.path.join(self.root, "svc-link"))
+        with self.assertRaises(scope.UnsafePathError):
+            scope.resolve_within(self.root, "svc-link/api")
+
     def test_missing_directory_rejected(self):
         # A typo'd dispatch must fail LOUDLY, not audit an empty file list and
         # report a suspiciously clean directory.
@@ -248,6 +263,23 @@ class SiteScoping(unittest.TestCase):
             scope.normalize_site("/home/runner/work/x/x/repo/services/api/a.go:3", clone="/home/runner/work/x/x/repo"),
             "services/api/a.go",
         )
+
+    def test_absolute_site_outside_the_clone_is_unlocatable_not_relativized(self):
+        # Stripping the leading slash would silently REINTERPRET an out-of-tree
+        # absolute path as repo-relative, so `/services/api/x.go` would satisfy a
+        # `services/api` scope and `/etc/passwd` an `etc` one. We know where the
+        # clone is, so anything absolute outside it is unlocatable.
+        clone = "/home/runner/work/x/x/repo"
+        for outside in ("/services/api/x.go:3", "/etc/passwd", "/opt/other/repo/services/api/x.go"):
+            with self.subTest(site=outside):
+                self.assertEqual(scope.normalize_site(outside, clone=clone), "")
+                self.assertFalse(scope.site_in_scope(outside, "services/api", clone))
+        # The clone's own root is not a file inside it either.
+        self.assertEqual(scope.normalize_site(clone, clone=clone), "")
+        # …and with NO clone to compare against the lenient strip still applies:
+        # there is nothing to distinguish "repo-relative, written with a slash"
+        # from "genuinely elsewhere".
+        self.assertEqual(scope.normalize_site("/services/api/x.go:3"), "services/api/x.go")
 
     def test_scope_membership(self):
         self.assertTrue(scope.site_in_scope("services/api/a.go:3", "services/api"))
@@ -350,12 +382,178 @@ class FilterFindings(unittest.TestCase):
             with open(dst, encoding="utf-8") as f:
                 self.assertEqual(json.load(f)["scope_dropped"], 0)
 
+    def test_a_leading_hyphen_directory_survives_the_cli(self):
+        # `_COMPONENT_RE` admits `-`, so `-foo` is a legitimate directory name.
+        # With the bare `--path <value>` form argparse reads it as an unknown
+        # OPTION and the step dies; groom.yml therefore uses `--path=<value>`
+        # everywhere, and this is the behavior that makes that necessary.
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(scope.main(["validate", "--path=-foo/bar"]), 0)
+        self.assertEqual(buf.getvalue().strip(), "-foo/bar")
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(io.StringIO()):
+                scope.main(["validate", "--path", "-foo/bar"])
+
+    def test_workflow_passes_every_caller_controlled_value_as_flag_equals_value(self):
+        wf = os.path.join(os.path.dirname(__file__), "..", "..", "workflows", "groom.yml")
+        with open(wf, encoding="utf-8") as f:
+            text = f.read()
+        for bare in ('--path "$GROOM_PATH"', '--scope-label "$SCOPE_LABEL"', '--scope-desc "$SCOPE_DESC"'):
+            with self.subTest(flag=bare):
+                self.assertNotIn(bare, text)
+
     def test_cli_rejects_an_unsafe_path_nonzero(self):
         # Fails CLOSED — unlike the cadence/volume gates there is no safe
         # fail-open reading of "audit a directory I could not validate".
         self.assertEqual(scope.main(["validate", "--path", "../../etc"]), 2)
         self.assertEqual(scope.main(["validate", "--path", "/etc"]), 2)
         self.assertEqual(scope.main(["validate", "--path", "services/../../etc"]), 2)
+
+
+class FilterVerified(unittest.TestCase):
+    """The finder-side filter is not the last word — the verifier RESHAPES findings.
+
+    A `DOWNGRADE` verdict explicitly means "real but narrower", so a
+    cross-boundary candidate that legitimately survived the finder-side filter
+    (one site in `services/api`, one in `common/`) can be narrowed onto its
+    OUT-of-scope half — by honest adjudication, or steered there by injected repo
+    content — and be filed under a directory it no longer belongs to.
+    """
+
+    IN_SCOPE = {"title": "dupe in api", "verdict": "CONFIRM", "sites": ["services/api/a.go:10"]}
+    NARROWED_OUT = {"title": "actually a common/ problem", "verdict": "DOWNGRADE", "sites": ["common/x.go:5"]}
+    CROSS = {"title": "api duplicates common", "verdict": "CONFIRM",
+             "sites": ["services/api/a.go:10", "common/x.go:5"]}
+    NO_SITES = {"title": "verifier omitted sites", "verdict": "CONFIRM"}
+    EMPTY_SITES = {"title": "verifier emitted junk sites", "verdict": "CONFIRM", "sites": ["", None]}
+    REJECTED = {"title": "not real", "verdict": "REJECT", "sites": ["common/x.go:5"]}
+
+    def test_whole_repo_is_untouched(self):
+        findings = [self.IN_SCOPE, self.NARROWED_OUT, self.CROSS, self.NO_SITES]
+        kept, dropped, unlocatable = scope.filter_verified(findings, "")
+        self.assertEqual(kept, findings)
+        self.assertEqual((dropped, unlocatable), ([], 0))
+
+    def test_a_verdict_narrowed_out_of_the_directory_is_dropped(self):
+        kept, dropped, _ = scope.filter_verified(
+            [self.IN_SCOPE, self.NARROWED_OUT, self.CROSS], "services/api"
+        )
+        self.assertEqual([f["title"] for f in kept], ["dupe in api", "api duplicates common"])
+        self.assertEqual([f["title"] for f in dropped], ["actually a common/ problem"])
+
+    def test_a_finding_with_no_locatable_sites_is_KEPT_and_counted(self):
+        # The opposite of the finder-side rule, deliberately. `sites` is advisory
+        # on the verifier schema, so "no locatable sites" usually means the field
+        # was omitted or garbled — and dropping on that would discard every
+        # survivor and render as an honest "nothing survived verification", the
+        # silent-clean failure the module exists to prevent.
+        kept, dropped, unlocatable = scope.filter_verified(
+            [self.NO_SITES, self.EMPTY_SITES], "services/api"
+        )
+        self.assertEqual([f["title"] for f in kept], [self.NO_SITES["title"], self.EMPTY_SITES["title"]])
+        self.assertEqual(dropped, [])
+        self.assertEqual(unlocatable, 2)
+
+    def test_a_REJECT_is_passed_through_untouched(self):
+        # It is discarded downstream anyway; scope-filtering it would only
+        # inflate the dropped count into a scary-looking warning.
+        kept, dropped, _ = scope.filter_verified([self.REJECTED], "services/api")
+        self.assertEqual(kept, [self.REJECTED])
+        self.assertEqual(dropped, [])
+
+    def test_cli_verify_filters_and_records_the_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "verifier.json")
+            with open(src, "w", encoding="utf-8") as f:
+                json.dump({"findings": [self.IN_SCOPE, self.NARROWED_OUT]}, f)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = scope.main(["verify", "--path=services/api", "--in", src, "--out", src])
+            self.assertEqual(rc, 0)
+            with open(src, encoding="utf-8") as f:
+                out = json.load(f)
+            self.assertEqual([f["title"] for f in out["findings"]], ["dupe in api"])
+            self.assertEqual(out["scope_dropped_verified"], 1)
+            self.assertIn("::warning::", buf.getvalue())
+
+    def test_cli_verify_fails_when_the_verifier_emitted_no_findings_array(self):
+        # Same reasoning as the finder-side filter: a missing array is a
+        # structural producer failure, not an empty verdict.
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "verifier.json")
+            with open(src, "w", encoding="utf-8") as f:
+                json.dump({}, f)
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(scope.main(["verify", "--path=services/api", "--in", src, "--out", src]), 1)
+
+
+class CanonicalizeSignature(unittest.TestCase):
+    """Invariant 4, ENFORCED — the dedup key's scope is ours, not the model's.
+
+    Signature scope-independence is what makes one defect file ONCE whether a
+    scoped run or the whole-repo sweep found it. Leaving it to the verifier brief
+    means leaving it to a model reading untrusted repository content; this module's
+    rule is constrain, don't instruct.
+    """
+
+    def test_a_path_substituted_scope_is_rewritten_back(self):
+        self.assertEqual(
+            scope.canonicalize_signature("myrepo:services/api:dup-error-handling", "whole-repo"),
+            "myrepo:whole-repo:dup-error-handling",
+        )
+
+    def test_a_correct_signature_is_returned_unchanged(self):
+        sig = "myrepo:whole-repo:dup-error-handling"
+        self.assertEqual(scope.canonicalize_signature(sig, "whole-repo"), sig)
+
+    def test_a_slug_is_rejoined_not_re_split(self):
+        self.assertEqual(
+            scope.canonicalize_signature("myrepo:svc:a:b:c", "whole-repo"),
+            "myrepo:whole-repo:a:b:c",
+        )
+
+    def test_a_malformed_or_missing_signature_is_left_alone(self):
+        # The ledger already routes these to `invalid` with a warning; inventing a
+        # shape here would turn a visible producer error into a mis-keyed issue.
+        for sig in ("no-colons-at-all", "only:two", "", None, 17):
+            with self.subTest(signature=sig):
+                self.assertEqual(scope.canonicalize_signature(sig, "whole-repo"), sig)
+
+    def test_no_sig_scope_means_no_rewrite(self):
+        self.assertEqual(scope.canonicalize_signature("a:b:c", ""), "a:b:c")
+
+    def test_a_scope_label_containing_a_colon_is_never_corrupted(self):
+        # `scope_label` is free-form caller text, so the component boundaries can
+        # be genuinely ambiguous. A correct signature must survive verbatim…
+        self.assertEqual(
+            scope.canonicalize_signature("myrepo:monorepo:api:slug", "monorepo:api"),
+            "myrepo:monorepo:api:slug",
+        )
+        # …and a deviating one is left ALONE rather than guessed at: mangling a
+        # working dedup key is worse than the double-filing this guards against.
+        self.assertEqual(
+            scope.canonicalize_signature("myrepo:services/api:slug", "monorepo:api"),
+            "myrepo:services/api:slug",
+        )
+
+    def test_cli_verify_canonicalizes_the_scope_component(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "verifier.json")
+            with open(src, "w", encoding="utf-8") as f:
+                json.dump({"findings": [
+                    {"title": "t", "verdict": "CONFIRM", "signature": "myrepo:services/api:slug",
+                     "sites": ["services/api/a.go:1"]},
+                ]}, f)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = scope.main([
+                    "verify", "--path=services/api", "--sig-scope=whole-repo", "--in", src, "--out", src,
+                ])
+            self.assertEqual(rc, 0)
+            with open(src, encoding="utf-8") as f:
+                self.assertEqual(json.load(f)["findings"][0]["signature"], "myrepo:whole-repo:slug")
+            self.assertIn("rewrote the scope component", buf.getvalue())
 
 
 class ScopeNote(unittest.TestCase):
@@ -436,18 +634,57 @@ class ListFiles(unittest.TestCase):
             ["git", "update-index", "--add", "--cacheinfo", f"100644,{blob},{evil}"],
             cwd=self.root, env=env, check=True, capture_output=True,
         )
-        files = scope.list_files(self.root, "services/api")
+        with contextlib.redirect_stdout(io.StringIO()):
+            files = scope.list_files(self.root, "services/api")
         self.assertNotIn(evil, files)
         self.assertEqual(sorted(files), ["services/api/a.go", "services/api/sub/b.go"])
         # …and no fragment of it survives into the prompt block either.
         self.assertNotIn("IGNORE PREVIOUS INSTRUCTIONS", scope.file_list_block(files, "services/api"))
 
+    def test_a_non_utf8_filename_does_not_abort_the_whole_audit(self):
+        # Git permits arbitrary bytes in a path. Decoding `git ls-files` output
+        # strictly against the runner locale raises UnicodeDecodeError on the
+        # first such tracked file, killing the scoped audit before the finder
+        # runs — and before printable_path ever gets to drop just that one name.
+        env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
+        blob = subprocess.run(
+            ["git", "hash-object", "-w", "--stdin"],
+            cwd=self.root, env=env, input="x\n", text=True, capture_output=True, check=True,
+        ).stdout.strip()
+        evil = b"services/api/caf\xe9.go"  # latin-1 'é' — not valid UTF-8
+        subprocess.run(
+            [b"git", b"update-index", b"--add", b"--cacheinfo",
+             b"100644," + blob.encode() + b"," + evil],
+            cwd=self.root, env=env, check=True, capture_output=True,
+        )
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            files = scope.list_files(self.root, "services/api")
+        # The other files still list, the undecodable one is dropped (a lone
+        # surrogate cannot be encoded back into the UTF-8 prompt file)…
+        self.assertEqual(sorted(files), ["services/api/a.go", "services/api/sub/b.go"])
+        # …and the drop is ANNOUNCED: a shortened list presented as complete
+        # reads to the agent as "that is the whole directory".
+        self.assertIn("::warning::", buf.getvalue())
+        self.assertIn("omitted 1 of 3", buf.getvalue())
+
+    def test_a_clean_tree_announces_nothing(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            scope.list_files(self.root, "services/api")
+        self.assertEqual(buf.getvalue(), "")
+
     def test_printable_path_predicate(self):
         self.assertTrue(scope.printable_path("services/api/a.go"))
         self.assertTrue(scope.printable_path("services/api/a b`c$.go"))
+        self.assertTrue(scope.printable_path("services/api/café.go"))
         self.assertFalse(scope.printable_path("a\nb.go"))
         self.assertFalse(scope.printable_path("a\tb.go"))
         self.assertFalse(scope.printable_path("a\x7fb.go"))
+        # A lone surrogate is how list_files carries a non-UTF-8 filename byte;
+        # inlining one would crash the prompt WRITE rather than merely leaving
+        # the file unlisted.
+        self.assertFalse(scope.printable_path(b"caf\xe9.go".decode("utf-8", "surrogateescape")))
 
 
 class SignatureIsContentDerived(unittest.TestCase):
@@ -478,6 +715,18 @@ class SignatureIsContentDerived(unittest.TestCase):
         self.assertIn("SIG_SCOPE: ${{ needs.gate.outputs.sig_scope }}", text)
         # …and the path-DERIVED label must NOT be what feeds it.
         self.assertNotIn("SIG_SCOPE: ${{ needs.gate.outputs.scope_label }}", text)
+
+    def test_the_signature_scope_is_ENFORCED_not_merely_requested(self):
+        # The brief asks; this pins that the workflow also CONSTRAINS. Without the
+        # rewrite pass, model variation (or a prompt-injected verifier) could fold
+        # the audited directory into the key and file one defect once per scope.
+        wf = os.path.join(os.path.dirname(__file__), "..", "..", "workflows", "groom.yml")
+        with open(wf, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn('scope.py" verify', text)
+        self.assertIn('--sig-scope="$SIG_SCOPE"', text)
+        # The verifier now emits the field the re-check reads.
+        self.assertIn('"sites":[', self.brief)
 
     def test_same_defect_yields_one_signature_across_scopes(self):
         # The end-to-end shape, expressed as the template the verifier fills in:

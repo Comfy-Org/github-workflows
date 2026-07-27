@@ -39,17 +39,24 @@ rather than buried in a runner script.
 | Phase | Brief | Input | Output (JSON) |
 |---|---|---|---|
 | 1. Find | [`finder.md`](finder.md) | clean `origin/main` checkout + scan scope | `{repo, scope, findings:[{title, dimension, sites, evidence, proposed, value, risk, confidence, steelman}]}` at `{{FINDER_OUT}}` |
-| 2. Verify | [`verifier.md`](verifier.md) | the finder's JSON + the code | `{repo, scope, summary, findings:[{title, verdict, security, signature, body}]}` at `{{VERIFIER_OUT}}` |
+| 2. Verify | [`verifier.md`](verifier.md) | the finder's JSON + the code | `{repo, scope, summary, findings:[{title, verdict, security, sites, signature, body}]}` at `{{VERIFIER_OUT}}` |
 | 3. Build (opt-in) | [`builder.md`](builder.md) | ONE verified finding `{title, body, signature}` at `{{FINDING_IN}}` + the code | edits in the checkout + a control file `{status: patched\|bail, summary}` at `{{BUILDER_OUT}}` |
 
 - **`verdict`** is `CONFIRM` \| `DOWNGRADE` (real but narrow the scope) \|
   `REJECT` (premature / overstated / not worth it).
 - **`security: true`** marks any auth/permission/security-adjacent finding —
   those are filed as investigations, **never** auto-implemented.
+- **`sites`** is the `file:line` evidence the verdict actually rests on — the
+  NARROWED set on a `DOWNGRADE`. On a path-scoped run `scope.py verify` re-applies
+  the directory filter to it, because a downgrade may narrow a cross-boundary
+  finding onto its out-of-scope half.
 - **`signature`** is a stable dedup key (`<repo-basename>:<scope>:<slug>`) whose
   `<slug>` is derived **deterministically** from the finding's core subject, so it
   stays identical across re-runs of the same finding and a consumer never re-files
-  a finding it has already seen.
+  a finding it has already seen. The `<scope>` component is the caller's own
+  `scope_label`, never the audited directory — and `scope.py verify` rewrites it
+  back to that value, so scope-independence does not depend on the model obeying
+  the brief.
 
 ## How a consumer uses these briefs
 

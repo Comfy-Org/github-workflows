@@ -238,14 +238,19 @@ on:
           (`services/api`); absolute paths, `..` components and anything
           resolving outside the checkout are REJECTED before any billed agent
           runs. A dotted directory name (`services/my..svc`) is fine — only a
-          `..` path COMPONENT is unsafe.
+          `..` path COMPONENT is unsafe. A SYMLINKED directory is rejected too
+          (even one pointing inside the repo): `git ls-files` would enumerate the
+          link rather than the files behind it, so the audit would review nothing
+          and report clean — name the real directory.
 
 
           This CONSTRAINS the run, it does not merely ask the agent nicely (which
           is all `scope_desc` ever did): the finder is handed the concrete
           in-scope file list, and any finding whose evidence sites all fall
-          outside the directory is DROPPED after verification, with the dropped
-          count logged. The checkout stays FULL on purpose — a refactor in
+          outside the directory is DROPPED — once on the finder's output and
+          again on the verifier's, since a DOWNGRADE verdict may narrow a
+          cross-boundary finding onto its out-of-scope half. Every drop is
+          logged. The checkout stays FULL on purpose — a refactor in
           `services/api` legitimately references `common/`, and a sparse checkout
           would blind the finder to the context that makes a finding correct.
 
@@ -490,10 +495,15 @@ jobs:
           # scope.py exits 2 with an ::error:: on an unsafe path — there is no
           # safe fail-open reading of "audit a directory I could not validate",
           # so unlike the two gates below this one fails the run CLOSED.
+          # `--flag=value`, not `--flag value`, everywhere scope.py/interval.py
+          # take a caller-controlled value: a directory named `-foo` is valid per
+          # scope.py's charset (and a `scope_label` is free text), and argparse
+          # reads a leading-hyphen operand as an unknown OPTION rather than as
+          # this flag's value.
           RESOLVED=$(python3 "$GROOM_ASSETS/scope.py" derive \
-            --path "$GROOM_PATH" \
-            --scope-label "$SCOPE_LABEL" \
-            --scope-desc "$SCOPE_DESC")
+            --path="$GROOM_PATH" \
+            --scope-label="$SCOPE_LABEL" \
+            --scope-desc="$SCOPE_DESC")
           echo "$RESOLVED"
           {
             echo "path=$(echo "$RESOLVED" | jq -r '.path')"
@@ -537,7 +547,7 @@ jobs:
           if DECISION=$(python3 "$GROOM_ASSETS/interval.py" \
               --repo "$REPO" --workflow-file "$WF_FILE" \
               --current-run-id "$RUN_ID" --interval-days "$INTERVAL_DAYS" \
-              --event-name "$EVENT_NAME" --path "$GROOM_PATH"); then
+              --event-name "$EVENT_NAME" --path="$GROOM_PATH"); then
             echo "$DECISION"
             RUN=$(echo "$DECISION" | jq -r '.should_run')
             REASON=$(echo "$DECISION" | jq -r '.reason')
@@ -679,13 +689,15 @@ jobs:
         # normalized with realpath (the Python `cd && pwd -P`) before the prefix
         # compare, so a trailing separator can't report a FALSE escape either.
         # A typo'd path fails the run LOUDLY rather than auditing an empty file
-        # list and reporting a suspiciously clean directory.
+        # list and reporting a suspiciously clean directory — and so does a
+        # SYMLINKED scope, which would pass containment while `git ls-files`
+        # enumerated the link instead of the directory behind it.
         if: needs.gate.outputs.path != ''
         env:
           GROOM_PATH: ${{ needs.gate.outputs.path }}
         run: |
           set -euo pipefail
-          python3 "$GROOM_ASSETS/scope.py" contain --root "$GROOM_CLONE" --path "$GROOM_PATH"
+          python3 "$GROOM_ASSETS/scope.py" contain --root="$GROOM_CLONE" --path="$GROOM_PATH"
 
       - name: Build finder prompt
         env:
@@ -990,14 +1002,17 @@ jobs:
           fi
           # ENFORCE the path scope (BE-4757). The brief ASKS the finder to stay in
           # the directory; this is what makes it true. Runs on the finder output
-          # because that is where the evidence `sites` live — the verifier only
-          # adjudicates candidates, so filtering here also saves paying the
-          # verifier to re-check findings that would be dropped anyway.
+          # because that is where the evidence `sites` live, and filtering here
+          # also saves paying the verifier to re-check findings that would be
+          # dropped anyway. It is not the LAST word though: the verifier may
+          # narrow a cross-boundary finding onto its out-of-scope half, so the
+          # same rule is re-applied to its output (see `scope.py verify` in the
+          # audit_verify job).
           # The dropped count is LOGGED as a warning: a silent drop is
           # indistinguishable from a clean directory, which is the whole point.
           if [ -n "$GROOM_PATH" ]; then
             python3 "$GROOM_ASSETS/scope.py" filter \
-              --path "$GROOM_PATH" --clone "$GROOM_CLONE" \
+              --path="$GROOM_PATH" --clone="$GROOM_CLONE" \
               --in "$FINDER_OUT" --out "$FINDER_OUT"
           fi
           COUNT=$(jq '.findings | length' "$FINDER_OUT")
@@ -1248,6 +1263,18 @@ jobs:
 
       - name: Validate verified findings
         id: validate
+        env:
+          # Re-applied to the VERIFIED findings, not just the finder's: a
+          # DOWNGRADE verdict explicitly reshapes a finding, so a cross-boundary
+          # candidate that legitimately passed the finder-side filter can be
+          # narrowed onto its OUT-of-scope half (honestly, or steered there by
+          # injected repo content) and be filed under a directory it no longer
+          # belongs to. See scope.py's `filter_verified`.
+          GROOM_PATH: ${{ needs.gate.outputs.path }}
+          # …and the dedup signature's scope component is forced back to the
+          # literal the brief handed out. Asking an untrusted model to copy
+          # {{SIG_SCOPE}} verbatim is an instruction; this is the constraint.
+          SIG_SCOPE: ${{ needs.gate.outputs.sig_scope }}
         run: |
           set -euo pipefail
           # HARD failure, mirroring the finder's "Assert" step. The CLI exiting 0
@@ -1298,6 +1325,14 @@ jobs:
             echo "::error::Verifier output at $VERIFIER_OUT has $BAD malformed finding(s) — each needs a string 'verdict', and CONFIRM/DOWNGRADE additionally a string 'title' and 'body'. Failing rather than silently discarding candidates or crashing the file job mid-batch."
             exit 1
           fi
+          # ENFORCE the path scope a SECOND time (BE-4757) — and canonicalize the
+          # signature scope — now that the schema checks above guarantee a
+          # well-formed `findings` array. Runs unconditionally: the signature
+          # canonicalization applies to a whole-repo run too, and the scope filter
+          # is a no-op when GROOM_PATH is empty. Drops and rewrites are LOGGED.
+          python3 "$GROOM_ASSETS/scope.py" verify \
+            --path="$GROOM_PATH" --clone="$GROOM_CLONE" --sig-scope="$SIG_SCOPE" \
+            --in "$VERIFIER_OUT" --out "$VERIFIER_OUT"
           # Only CONFIRM/DOWNGRADE survive to filing (REJECT is dropped).
           KEEP=$(jq '[.findings[]? | select(.verdict == "CONFIRM" or .verdict == "DOWNGRADE")] | length' "$VERIFIER_OUT")
           echo "Verified survivors (CONFIRM/DOWNGRADE): $KEEP"

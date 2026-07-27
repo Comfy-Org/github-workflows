@@ -191,6 +191,19 @@ class ScopedRunDoesNotResetCadence(unittest.TestCase):
         self.assertFalse(interval.run_audited([self.scoped_finder_job(path="packages/ui")], "services/api"))
         self.assertFalse(interval.run_audited([finder_job("success")], "services/api"))
 
+    def test_scopes_differing_only_in_CASE_are_separate_clocks(self):
+        # Paths are case-sensitive on the Linux runner and the path charset admits
+        # both cases, so `services/api` and `services/API` are two directories and
+        # two scopes. Matching the marker case-INSENSITIVELY would collapse them
+        # onto one clock and let a run of either suppress the other's due tick —
+        # the silent under-run this module refuses. The mismatch must instead read
+        # as "no prior run of this scope", i.e. fail open.
+        upper = [self.scoped_finder_job(path="services/API")]
+        self.assertFalse(interval.run_audited(upper, "services/api"))
+        self.assertFalse(interval.run_audited([self.scoped_finder_job(path="services/api")], "services/API"))
+        # …and the exact-case match still counts, so the fix costs nothing.
+        self.assertTrue(interval.run_audited(upper, "services/API"))
+
     def test_permanently_scoped_caller_gets_a_real_cadence(self):
         # End-to-end: a `path: services/api` caller ran its scoped audit 2 days
         # ago on a 7-day interval. The scheduled tick must SKIP — the cadence knob
@@ -213,7 +226,9 @@ class ScopedRunDoesNotResetCadence(unittest.TestCase):
         self.assertIn("format(' (scoped: {0})', needs.gate.outputs.path)", text)
         self.assertEqual(interval.scoped_job_marker("services/api"), " (scoped: services/api)".strip())
         # …and the gate must actually hand the tick's scope to the gate script.
-        self.assertIn('--event-name "$EVENT_NAME" --path "$GROOM_PATH"', text)
+        # `--path=…`, not `--path …`: a directory named `-foo` is valid per
+        # scope.py's charset and argparse would read the bare form as an option.
+        self.assertIn('--event-name "$EVENT_NAME" --path="$GROOM_PATH"', text)
 
     def test_a_whole_repo_sweep_does_not_satisfy_a_scoped_callers_cadence(self):
         # …and the converse: the scoped unit's clock is its own, so a whole-repo
