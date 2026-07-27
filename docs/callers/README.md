@@ -40,9 +40,11 @@ jobs:
       contents: read
       issues: write
       pull-requests: read
+      actions: read           # groom's runtime cadence gate reads run history
     uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@<full-commit-sha>
     with:
       cadence: 7
+      interval_days: 7
       workflows_ref: <same-full-commit-sha>   # see "Pinning" — do not leave this at main
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

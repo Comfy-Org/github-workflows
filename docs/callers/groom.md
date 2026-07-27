@@ -34,10 +34,13 @@ name: Groom
 
 on:
   schedule:
-    # Weekly. Pick a NON-round minute and stagger it against other repos —
-    # top-of-hour is the most congested slot on GitHub's scheduler.
-    - cron: '17 9 * * 1'
-  workflow_dispatch:
+    # Frequent BASE cron (daily). Effective cadence is the runtime `interval_days`
+    # gate below, not this cron — GitHub Actions cron is static in the file, so a
+    # daily tick + a runtime gate is how you get a tunable cadence with no
+    # workflow-file edit. Pick a NON-round minute and stagger it against other
+    # repos — top-of-hour is the most congested slot on GitHub's scheduler.
+    - cron: '17 9 * * *'
+  workflow_dispatch:          # bypasses the interval gate (not the volume gate)
     inputs:
       dry_run:
         description: Run the full audit but do NOT open issues — print what it would file.
@@ -52,11 +55,16 @@ jobs:
       contents: read
       issues: write
       pull-requests: read
+      actions: read   # the interval gate reads run history for the last real run
     uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@<full-commit-sha>
     with:
       workflows_ref: <same-full-commit-sha>
       bot_app_id: ${{ vars.APP_ID }}
-      cadence: 7
+      # Cadence knob + the matching volume-gate window (BE-4004). Wire both to
+      # one repo Actions variable so they can't drift: retune weekly ->
+      # every-3-days -> daily by editing `GROOM_INTERVAL_DAYS`, no workflow edit.
+      interval_days: ${{ vars.GROOM_INTERVAL_DAYS || '7' }}
+      cadence: ${{ vars.GROOM_INTERVAL_DAYS || '7' }}
       # `github.event.inputs` is null on a schedule event, so '' != 'true' -> false.
       # Scheduled runs always file live; only a manual dispatch can dry-run.
       dry_run: ${{ github.event.inputs.dry_run == 'true' }}
@@ -74,12 +82,16 @@ Then add your repo to `vars.GROOM_CALLERS` — see
 contents: read
 issues: write        # the `file` job
 pull-requests: read  # the `build_select` job
+actions: read        # the interval gate (BE-4004) — reads this workflow's run
+                      # history to find the last real groom run
 ```
 
-Grant all three **even when `bot_app_id` is set** and the App token does the
+Grant all four **even when `bot_app_id` is set** and the App token does the
 actual writing. GitHub validates the grant at startup against what the nested
 jobs *declare*, not against what they end up using. A short grant produces a
-zero-job `startup_failure` with no logs.
+zero-job `startup_failure` with no logs — omitting `actions: read` specifically
+rejects the run with "requesting 'actions: read', but is only allowed
+'actions: none'" rather than degrading to a fail-open daily run.
 
 ## Inputs
 
@@ -87,7 +99,8 @@ All are optional. The ones that matter:
 
 | Input | Default | Why you'd change it |
 |---|---|---|
-| `cadence` | `7` | Match your cron. Feeds the volume gate below. |
+| `interval_days` | `7` | Effective run cadence (BE-4004): on the daily base cron, a tick within this many days of the last REAL run early-exits before the finder. Wire it to a `GROOM_INTERVAL_DAYS` repo Actions variable so cadence is a variable edit, not a workflow-file change. `workflow_dispatch` bypasses this gate (not `volume_gate`). `0` disables the throttle. |
+| `cadence` | `7` | Volume-gate window in days — set to match `interval_days` (wire both to the same variable) so the merge-activity check lines up with how often a real run can happen. Feeds the volume gate below. |
 | `volume_gate` | `true` | Skips the (expensive) audit when nothing merged in `cadence` days. **This is the cost control — leave it on** for scheduled runs. |
 | `dry_run` | `false` | Full audit + dedup, files nothing, prints what it would file. Use before the first live run. |
 | `max_findings` | `12` | Cap issues per run. Lower it on a first pilot. |
