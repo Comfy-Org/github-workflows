@@ -8,9 +8,11 @@ name: Stale PRs (reusable)
 #   • Any new commit/comment removes `stale` and resets the clock
 #   • Issues are left untouched (days-before-issue-* = -1)
 #
-# The Slack digest header names the source repo (`github.repository`) so two
-# repos' batches posted to the same channel are unambiguous — a bare "#158"
-# looks identical whether it's from cloud or comfy-infra.
+# The Slack digest names the source repo (`github.repository`) in the header AND
+# on every individual PR line (`Comfy-Org/cloud#158`), so two repos' batches
+# posted to the same channel are unambiguous — a bare "#158" looks identical
+# whether it's from cloud or comfy-infra, and a line quoted or read on its own
+# still says which repo it came from.
 #
 # Caller pattern (place in source repo at .github/workflows/stale.yml). The
 # caller owns the schedule + the workflow_dispatch dry-run toggle; this reusable
@@ -133,9 +135,9 @@ jobs:
           close-pr-message: ${{ inputs.close_pr_message }}
           debug-only: ${{ inputs.dry_run || false }}
 
-      # Surface what the bot did in Slack, not just in-PR. The header names the
-      # source repo so batches from different repos posted to the same channel
-      # are visually distinguishable.
+      # Surface what the bot did in Slack, not just in-PR. The header and every
+      # PR line name the source repo so batches from different repos posted to
+      # the same channel are unambiguous line-by-line.
       - name: Slack heads-up (marked stale / closed)
         # Skip during dry-run previews and when no PR was touched this run. If
         # no SLACK_BOT_TOKEN is configured the curl below degrades to a warning
@@ -165,21 +167,25 @@ jobs:
           fi
 
           # actions/stale outputs JSON arrays of the PRs it staled/closed this run.
-          # Build "• <url|#N> title" lines; derive the URL from repo + number so we
-          # don't depend on html_url being present in the output objects. Escape
-          # Slack mrkdwn control chars (& < >) in the title so a crafted title
-          # can't inject <!channel>/<!here> pings or masked <url|label> links.
+          # Build "• <url|owner/repo#N> title" lines; the repo name is carried on
+          # EVERY line (not just the header) so a line read, quoted, or forwarded
+          # on its own still says which repo it belongs to. Derive the URL from
+          # repo + number so we don't depend on html_url being present in the
+          # output objects. Escape Slack mrkdwn control chars (& < >) in the title
+          # so a crafted title can't inject <!channel>/<!here> pings or masked
+          # <url|label> links. ($REPO is `github.repository`, which GitHub
+          # constrains to [A-Za-z0-9._-]+/[A-Za-z0-9._-]+, so it needs no escaping.)
           fmt() {
-            echo "${1:-[]}" | jq -r --arg base "$SERVER_URL/$REPO/pull" '
+            echo "${1:-[]}" | jq -r --arg base "$SERVER_URL/$REPO/pull" --arg repo "$REPO" '
               def slack_escape: gsub("&";"&amp;") | gsub("<";"&lt;") | gsub(">";"&gt;");
-              .[]? | "• <\($base)/\(.number)|#\(.number)> \((.title // "") | slack_escape)"'
+              .[]? | "• <\($base)/\(.number)|\($repo)#\(.number)> \((.title // "") | slack_escape)"'
           }
           WARN_LINES=$(fmt "$STALED")
           CLOSE_LINES=$(fmt "$CLOSED")
 
           # Name the repo in the header so two repos' batches in the same channel
-          # aren't confused (a bare "#158" is ambiguous). Per-PR links already
-          # resolve correctly via $REPO above.
+          # aren't confused (a bare "#158" is ambiguous). Every PR line repeats it
+          # (see fmt() above) so no single line is ambiguous on its own either.
           TEXT=":hourglass_flowing_sand: *Stale PR bot — ${REPO}*"
           if [ -n "$WARN_LINES" ]; then
             # actions/stale treats days-before-pr-close <= 0 as "never close", so
