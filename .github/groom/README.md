@@ -245,6 +245,75 @@ A bare signature carries no `security` flag, so the probe answers for a routine
 finding by default; pass `--check-security` to mirror `partition`'s decision for
 a `security: true` candidate.
 
+## `interval.py` — the runtime cadence gate (BE-4004)
+
+GitHub Actions `schedule:` cron is **static in the workflow file** — there is no
+native "every N days" input. So a caller fires on a **frequent (daily) base
+cron**, and this gate turns that into an **effective every-`GROOM_INTERVAL_DAYS`
+run**: at run start it early-exits unless the interval has elapsed since the last
+real groom, so a skipped tick costs ~nothing (it never reaches the finder).
+
+- **The knob is a repo Actions variable, `GROOM_INTERVAL_DAYS`** (default `7` =
+  weekly, matching the original cron). The caller wires it to the reusable's
+  `interval_days` input (`interval_days: ${{ vars.GROOM_INTERVAL_DAYS || '7' }}`)
+  and re-evaluates it each run, so changing the variable retunes cadence — weekly
+  → every-3-days → daily — with **no workflow-file edit**, the same "live knob"
+  ergonomics as the per-repo caps. Both cadence inputs (`interval_days`,
+  `cadence`) are declared **`type: string`** deliberately: they carry a free-text
+  Actions variable, and a `number` input would make GitHub reject a typo'd value
+  (`weekly`, `7d`) at workflow-call time — failing the run *closed* before the
+  degradation below could ever run. As strings, `interval.py` is the single
+  normalization authority.
+- **A tick clears the bar a half-tick early.** GitHub's cron fires late by an
+  unpredictable amount, so demanding a full `interval_days` on a daily tick would
+  skip at 6.99 days elapsed, push the run to tomorrow, and — because the clock
+  re-anchors on that later run — ratchet the cadence a day later every cycle. The
+  gate compares against `interval_days` less `0.5` (capped at half the interval),
+  which absorbs the jitter without letting two real runs land on consecutive
+  daily ticks (those are a full ~1.0 day apart).
+- **Last-run state is derived from GitHub Actions run history**, not a writable
+  store: the GitHub-native option that needs **no net-new secret** and only
+  `actions: read`. A prior run "counts" only if it actually reached the finder
+  (its `Audit — finder` job ran, not `skipped` by this gate), so the
+  interval-skip ticks in between never reset the clock. (A repo variable would
+  need a `Variables: write` credential the run doesn't carry, and a missing grant
+  would fail *silently* into a daily over-spend — run history has no such trap.)
+- **`workflow_dispatch` bypasses THIS gate** — a manual dispatch is never
+  interval-throttled. It is not a blanket "always runs": the volume gate is a
+  second, independent throttle, so a live dispatch into a quiescent repo can
+  still skip. Turn `volume_gate` off (the reference caller does exactly this for
+  `dry_run:true` dispatches) if a manual run must always reach the finder.
+- **Fail-open**, like the volume gate: any error reading history (API hiccup, no
+  history, unparseable timestamp) RUNS the audit rather than skip a due groom.
+- **One normalization for both gates.** The caller wires the same variable to
+  `cadence` (the volume gate's merge-activity window), so the volume gate routes
+  it through this module too — `interval.py --normalize-cadence "$CADENCE"` —
+  rather than feeding the raw value to `date -d`. Same degradation
+  (blank/garbage/negative → `7`), then floored at **1 whole day**. Without it the
+  gates drift on reachable values: `-3` becomes a *future* `date -d` cutoff that
+  matches no merged PR (skipping every run — groom silently off) while the
+  interval gate had safely degraded to weekly, and `0` (a legitimate "no
+  throttle") shrinks the merge window to today-only.
+
+The caller **must** grant `actions: read`. The `gate` job declares that scope, and
+a nested reusable job can never hold more than the calling job grants — GitHub
+checks the subset at **startup**, so a caller that omits it has the whole run
+rejected (`requesting 'actions: read', but is only allowed 'actions: none'`,
+surfaced as an opaque "workflow file issue" with zero jobs) rather than degrading
+to a fail-open daily run. Fail-open covers the *other* failure: the grant is
+present but the history read errors (fresh repo with no runs, API hiccup) — then
+the gate runs rather than skips. As with `ledger.py`, the pure decision logic is
+split from the thin `gh` I/O so it is fully unit-testable with no network.
+
+```bash
+python3 .github/groom/interval.py \
+    --repo owner/name --workflow-file ci-groom.yml \
+    --current-run-id 123 --interval-days 7 --event-name schedule
+
+# Second mode — normalize the shared knob into the volume gate's window:
+python3 .github/groom/interval.py --normalize-cadence "$GROOM_INTERVAL_DAYS"
+```
+
 - **`tests/`** — `unittest` suite, run by
   [`test-groom-scripts.yml`](../workflows/test-groom-scripts.yml).
 

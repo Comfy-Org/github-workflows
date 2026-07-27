@@ -49,11 +49,13 @@ tests — run the matching command above for whatever you touched.
 - `.github/groom/` — briefs + building blocks behind the reusable **groom**
   code-cleanup workflow (`groom.yml`, epic BE-3870): `finder.md` / `verifier.md`
   / `builder.md` (the phase-1/2/3 prompts, single source of truth, loaded at run
-  time), and `ledger.py`, the durable dedup/rejection memory that stops the
+  time), `ledger.py`, the durable dedup/rejection memory that stops the
   stateless groom CI run from re-filing already-filed or human-rejected findings
   — and (BE-4003) recognizes auto-builder PR state (open/merged/closed) so a
-  built finding is never re-proposed. It uses GitHub issue+PR state as the store
-  — no new secret. Tests in `tests/`.
+  built finding is never re-proposed — and `interval.py`, the runtime cadence
+  gate (`GROOM_INTERVAL_DAYS`) that early-exits a daily tick unless the interval
+  has elapsed since the last real run (derived from Actions run history — no new
+  secret). Tests in `tests/`.
 - `.github/bump-callers/` — `bump-callers.sh`, the ONE fleet-agnostic script
   that opens SHA-bump PRs in consumer repos when a reusable workflow changes.
   Tests in `tests/`.
@@ -79,8 +81,10 @@ tests — run the matching command above for whatever you touched.
 - `assign-prs-to-author.yml` — assigns unassigned open PRs to their author.
 - `detect-unreviewed-merge.yml` — SOC 2: flags PRs merged without approval.
 - `bump-cursor-review-callers.yml` / `bump-agents-md-callers.yml` /
-  `bump-pr-size-callers.yml` / `bump-assign-reviewers-callers.yml` — thin
-  entrypoints over `bump-callers.sh` that fan SHA bumps out to consumers.
+  `bump-pr-size-callers.yml` / `bump-assign-reviewers-callers.yml` /
+  `bump-groom-callers.yml` — thin entrypoints over `bump-callers.sh` that fan SHA
+  bumps out to consumers. A groom caller pins TWICE (`uses:` + `workflows_ref:`);
+  the shared rewrite moves both, so never hand-bump one alone.
 
 ## Conventions & gotchas
 
@@ -95,9 +99,9 @@ tests — run the matching command above for whatever you touched.
 - **Scripts are the single source of truth**, loaded at run time from a pinned
   ref of THIS repo — never from the caller's checkout. That's what makes the
   reviewer/checker tamper-proof: a PR can't rewrite the logic judging it. The
-  self-enrollment callers (`ci-cursor-review.yml`, `ci-detect-unreviewed-merge.yml`)
-  deliberately pin a merged-main SHA instead of a local `./` path for the same
-  reason — do not "simplify" them to a local path.
+  self-enrollment callers (`ci-cursor-review.yml`, `ci-assign-reviewers.yml`,
+  `ci-detect-unreviewed-merge.yml`) deliberately pin a merged-main SHA instead
+  of a local `./` path for the same reason — do not "simplify" them to a path.
 - **One bumper, not several.** `bump-callers.sh` backs every fleet; the
   `bump-*-callers.yml` files are thin per-fleet wrappers (they stay separate so a
   `cursor-review.yml` change doesn't spuriously bump agents-md or pr-size
