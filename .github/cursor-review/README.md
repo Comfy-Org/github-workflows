@@ -81,14 +81,18 @@ fifth pin) — and the preflight validates them against Cursor's live catalog on
 every run, so a delisted pin fails loudly instead of silently running the panel
 a lab short.
 
-Drift the preflight *can't* see — a **newer** model shipping — is now
-machine-checked weekly by
+Drift the preflight *can't* see — a **newer** model shipping, or a pin quietly
+reclassified non-ZDR — is machine-checked weekly by
 [`cursor-review-catalog-drift.yml`](../workflows/cursor-review-catalog-drift.yml),
 which diffs the pins against `cursor-agent models` and files one sticky
-`[cursor-review catalog drift]` issue listing delisted pins, unpinned same-lab
-catalog ids, and an audit date older than 30 days. It reports; it never bumps a
-pin — picking the newest highest-reasoning **ZDR-eligible** model stays a human
-call (Cursor marks only NO-ZDR models inline, e.g. Fable's `(NO ZDR)` suffix).
+`[cursor-review catalog drift]` issue listing delisted pins, **pins whose catalog
+line now says NO-ZDR**, unpinned same-lab catalog ids, and an audit date older
+than 30 days. It reports; it never bumps a pin — picking the newest
+highest-reasoning **ZDR-eligible** model stays a human call (Cursor marks only
+NO-ZDR models inline, e.g. Fable's `(NO ZDR)` suffix). That marker is the one
+thing the checker interprets rather than merely reproducing, and only on a pin
+already in service: cursor-review sends private diffs to every pinned model, so
+a pin losing ZDR eligibility reddens the run exactly like a delisted one.
 The `last checked <date>` comment above the pins remains the **human**-audit
 record: refresh it when you re-audit, and the weekly check will tell you when
 it has gone stale.
@@ -103,7 +107,7 @@ it has gone stale.
 | [`extract-findings.py`](extract-findings.py) | Parses a cell's raw `cursor-agent` output into a normalized findings record. Always emits structured JSON — even on empty output or parse failure — so the consolidate step has uniform input. |
 | [`post-review.py`](post-review.py) | Reads the judge's consolidated findings and posts **one** PR review with line-anchored inline comments and severity badges. |
 | [`gate-unresolved.py`](gate-unresolved.py) | The opt-in blocking gate (`blocking: true`). Queries the PR's review threads and exits non-zero while any cursor-review finding thread is unresolved. |
-| [`catalog-drift.py`](catalog-drift.py) | Backs the weekly catalog-drift check. Extracts the pins from `cursor-review.yml`, diffs them against raw `cursor-agent models` output, and renders the sticky issue title + body (delisted pins, unpinned same-lab ids, stale audit date). Reports only — it never edits a pin. |
+| [`catalog-drift.py`](catalog-drift.py) | Backs the weekly catalog-drift check. Extracts the pins from `cursor-review.yml`, diffs them against raw `cursor-agent models` output, and renders the sticky issue title + body (delisted pins, pins marked NO-ZDR, unpinned same-lab ids, stale audit date). Reports only — it never edits a pin. |
 | [`slack-notify.sh`](slack-notify.sh) | Sends the start/complete Slack DMs to the triggerer (no-ops without a token). |
 
 ## Adopt it in your repo

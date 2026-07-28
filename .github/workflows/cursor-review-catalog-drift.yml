@@ -16,9 +16,12 @@ name: Cursor Review — catalog drift check
 # automatically when a run finds nothing):
 #
 #   * a delisted pin — urgent, consumer PRs are about to go red at preflight;
+#   * a pin whose catalog line now says NO-ZDR — also urgent, and the quieter
+#     failure: nothing breaks, private review diffs just keep going to a model
+#     that may retain them;
 #   * unpinned same-lab catalog ids — a REVIEW-ME list, not a recommendation
 #     (newest highest-reasoning ZDR-eligible is a human call);
-#   * a `last checked` audit date older than 30 days.
+#   * a `last checked` audit date older than 30 days (or future-dated).
 #
 # The `last checked` comment stays the human-audit record — this check does not
 # write it, it just tells you when it has gone stale.
@@ -69,20 +72,30 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install Cursor agent CLI
+      - name: Check the Cursor credential is present
+        # Separate from the install step so the org secret is NOT in scope while
+        # a remote installer script runs (see the next step). Unlike the per-PR
+        # preflight there is no fork case here — a scheduled run in this repo
+        # either has the org secret or the check is broken. Fail rather than
+        # "skip cleanly", which would be a green run that checked nothing (the
+        # exact silent staleness this workflow exists to end).
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
         run: |
           set -euo pipefail
-          # Unlike the per-PR preflight there is no fork case here — a scheduled
-          # run in this repo either has the org secret or the check is broken.
-          # Fail rather than "skip cleanly", which would be a green run that
-          # checked nothing (the exact silent-staleness this workflow exists to
-          # end).
           if [ -z "${CURSOR_API_KEY:-}" ]; then
             echo "::error::CURSOR_API_KEY is not available to this workflow — the drift check cannot read the live catalog. Grant the org secret to this repo (it already backs ci-cursor-review.yml)."
             exit 1
           fi
+          echo "CURSOR_API_KEY is present."
+
+      - name: Install Cursor agent CLI
+        # NO `env:` on purpose — the installer needs no credential, so it does
+        # not get one. It is still an unpinned remote script piped into bash
+        # (Cursor publishes no checksummed release artifact); the containing job
+        # holds no write scope for that reason.
+        run: |
+          set -euo pipefail
           curl https://cursor.com/install -fsSL | bash
           echo "$HOME/.cursor/bin" >> "$GITHUB_PATH"
 
@@ -91,15 +104,25 @@ jobs:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
         run: |
           set -euo pipefail
+          # `cursor-agent` output is semi-trusted third-party text and this repo
+          # is public, so it is never echoed raw: a line beginning `::` would be
+          # executed by the runner as a workflow command (`::add-mask::`,
+          # `::stop-commands::`). Fence the echo with an unguessable token so the
+          # runner treats the whole block as plain text.
+          stop_token="catalog-$(openssl rand -hex 16)"
           # Same "better red than silent" stance as the preflight: an auth or
           # network failure here is a hard fail, not an assumed-clean run.
           if ! cursor-agent models > /tmp/catalog.txt 2>/tmp/catalog-stderr.txt; then
             echo "::error::'cursor-agent models' failed — cannot check the panel pins against the live catalog."
+            echo "::stop-commands::${stop_token}"
             cat /tmp/catalog-stderr.txt
+            echo "::${stop_token}::"
             exit 1
           fi
           echo "=== Cursor catalog ==="
+          echo "::stop-commands::${stop_token}"
           cat /tmp/catalog.txt
+          echo "::${stop_token}::"
 
       - name: Compare pins against the catalog
         id: drift
@@ -152,16 +175,27 @@ jobs:
         run: |
           set -euo pipefail
           PREFIX='[cursor-review catalog drift]'
+          LABEL='cursor-review-catalog-drift'
 
-          # Find-by-title (the sticky key), filtered on an EXACT prefix rather
-          # than `--search`, which is fuzzy AND eventually consistent — a search
-          # that hasn't indexed the issue we filed would file a duplicate. Walk
-          # EVERY open issue (`--paginate`, not a `--limit` page) so the sticky
-          # can't fall off the end of the result set and get filed twice as this
-          # repo accumulates open issues (groom files here too). `/issues`
-          # returns PRs as well, hence the `.pull_request == null` filter that
-          # `gh issue list` applied for us.
-          numbers=$(gh api "repos/${REPO}/issues?state=open&per_page=100" --paginate \
+          # The sticky key is LABEL + exact title prefix, and neither half is
+          # optional:
+          #   * the label, because a public title prefix alone is squattable —
+          #     anyone can open "[cursor-review catalog drift] …" and the bot
+          #     would adopt and rewrite their issue. Applying a label needs write
+          #     access, so label+prefix means only a trusted actor can be adopted.
+          #   * `--paginate` over EVERY matching open issue, not a `--limit`
+          #     page: a sticky that fell off the end of a bounded newest-first
+          #     page would be filed a second time, and a clean run could no
+          #     longer close the original (groom files issues in this repo too).
+          # Not `--search`, which is fuzzy AND eventually consistent — a search
+          # that hasn't indexed the issue we just filed would file a duplicate.
+          # `/issues` returns PRs as well, hence the `.pull_request == null`
+          # filter that `gh issue list` applied for us.
+          if ! gh label create "$LABEL" -R "$REPO" --color BFD4F2 \
+                 --description 'Sticky report from the weekly cursor-review catalog-drift check'; then
+            echo "Label ${LABEL} already exists (or could not be created); continuing."
+          fi
+          numbers=$(gh api "repos/${REPO}/issues?state=open&labels=${LABEL}&per_page=100" --paginate \
             --jq '.[] | select(.pull_request == null) | {number, title}' \
             | jq -rs --arg p "$PREFIX" 'map(select(.title | startswith($p))) | .[].number')
           existing=$(printf '%s\n' "$numbers" | head -n 1)
@@ -176,7 +210,8 @@ jobs:
               gh issue edit "$existing" -R "$REPO" --title "$title" --body-file /tmp/drift-body.md
               echo "Updated sticky drift issue #${existing}."
             else
-              gh issue create -R "$REPO" --title "$title" --body-file /tmp/drift-body.md
+              gh issue create -R "$REPO" --title "$title" --label "$LABEL" \
+                --body-file /tmp/drift-body.md
             fi
           elif [ -n "$existing" ]; then
             # Clean run: close the sticky issue so it never lingers past the
@@ -187,11 +222,13 @@ jobs:
             echo "No drift and no open sticky issue — nothing to do."
           fi
 
-      - name: Fail the run on a delisted pin
-        # The sticky issue carries every finding; only the urgent one reddens
-        # the run, so the weekly check stays green while a review-me list waits
-        # for a human but shouts when consumer PRs are about to fail preflight.
+      - name: Fail the run on an urgent finding
+        # The sticky issue carries every finding; only the urgent ones redden the
+        # run, so the weekly check stays green while a review-me list waits for a
+        # human but shouts when a pin is actively broken — either delisted
+        # (consumer PRs are about to fail preflight) or marked NO-ZDR (private
+        # diffs are flowing to a model that may retain them).
         if: needs.drift.outputs.urgent == 'true'
         run: |
-          echo "::error::A pinned cursor-review model id is missing from Cursor's live catalog — consumer PRs will fail the review preflight until the pin is updated. See the '[cursor-review catalog drift]' issue."
+          echo "::error::A pinned cursor-review model is either missing from Cursor's live catalog (consumer PRs will fail the review preflight) or now marked NO-ZDR (private diffs are going to a non-ZDR model). See the '[cursor-review catalog drift]' issue."
           exit 1
