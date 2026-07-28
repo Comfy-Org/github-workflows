@@ -22,8 +22,9 @@ finder (its `Audit — finder` job ran, i.e. was not `skipped` by this very gate
 so the interval-skip ticks in between never reset the clock. A *failed* finder
 job counts only when its billed agent step (`Run finder`) actually ran, so a
 flaky checkout or `npm install` before the agent cannot burn a whole cycle
-(BE-4809). Run history is durable across the stateless CI runs and readable with
-only `actions: read`.
+(BE-4809) — judged across ALL of a run's attempts, so a re-run that flakes early
+cannot erase the spend of an earlier attempt. Run history is durable across the
+stateless CI runs and readable with only `actions: read`.
 
 The gate is **fail-open**, matching the volume gate: any error deriving the last
 run (API hiccup, unparseable timestamp, no history) RUNS the audit rather than
@@ -79,10 +80,15 @@ _AUDITED_CONCLUSIONS = {"success", "failure"}
 # any of them concludes the JOB `failure` while spending nothing — and counting
 # that as a spent audit silently skips every tick for a full interval. So for a
 # `failure` job we additionally require the agent step itself to have run; the
-# gate names it `Run finder` in `.github/workflows/groom.yml`. Matched
-# case-insensitively as a substring, mirroring `_FINDER_JOB_HINTS`, and pinned
-# against the producing workflow by a test so a rename can't silently drift.
-_AGENT_STEP_HINTS = ("run finder",)
+# gate names it `Run finder` in `.github/workflows/groom.yml`.
+#
+# Matched by EXACT (case-insensitive) name, unlike `_FINDER_JOB_HINTS` above:
+# that one is a substring match because GitHub genuinely mangles JOB names in a
+# nested reusable ("<caller-job> / Audit — finder"), but STEP names come back
+# verbatim from the YAML, so there is nothing to be tolerant of — and a substring
+# would also match a neighbour like `Rerun finder`. A test pins these names
+# against the producing workflow so a rename can't silently drift the two apart.
+_AGENT_STEP_NAMES = {"run finder"}
 
 # Step conclusions that mean the agent step did NOT execute. GitHub reports the
 # steps AFTER a failing one as `skipped` rather than omitting them, so merely
@@ -132,6 +138,13 @@ _FETCH_TIMEOUT_SECONDS = 30
 # How many recent runs to scan back for the last real groom before giving up
 # (fail-open). Far more than any sane interval's worth of daily skip-ticks.
 _MAX_RUNS_SCANNED = 100
+
+# Page size and page cap for the per-run jobs walk. `filter=all` returns one set
+# of jobs PER ATTEMPT (see fetch_run_jobs), so a much-re-run workflow can spill
+# past a single page — groom is ~8 jobs a run, so 5 pages covers ~60 attempts.
+# The cap only bounds a pathological payload; the gate must stay cheap.
+_JOBS_PAGE_SIZE = 100
+_MAX_JOB_PAGES = 5
 
 
 def parse_interval_days(raw, default: float = _DEFAULT_INTERVAL_DAYS):
@@ -217,8 +230,8 @@ def _agent_step_ran(job) -> bool:
     for step in steps:
         if not isinstance(step, dict):
             continue
-        name = (step.get("name") or "").lower()
-        if any(hint in name for hint in _AGENT_STEP_HINTS):
+        name = (step.get("name") or "").strip().lower()
+        if name in _AGENT_STEP_NAMES:
             return step.get("conclusion") not in _UNRUN_STEP_CONCLUSIONS
     return False
 
@@ -316,17 +329,37 @@ def fetch_workflow_runs(repo: str, workflow_file: str, run=subprocess.run):
 
 
 def fetch_run_jobs(repo: str, run_id, run=subprocess.run):
-    """The jobs of one workflow run (single page).
+    """Every job of one workflow run, across ALL of its attempts.
+
+    `filter=all` is load-bearing, not tidiness (BE-4809). The endpoint defaults
+    to `filter=latest` — only the most recent attempt of a re-run workflow. That
+    default was harmless while every `failure` counted, but the answer now
+    depends on WHICH STEPS ran: if the first attempt spent the billed agent and
+    someone then hit "re-run" and that attempt flaked in `npm install`, the
+    latest attempt alone reads as unspent and the next daily tick re-bills a
+    groom that already happened — the exact double-spend this gate prevents.
+    `run_audited` needs only ONE attempt to show the agent ran, so handing it the
+    union of attempts is both correct and order-independent.
 
     Returns each job UNPROJECTED — `run_audited` reads the per-job `steps` array
-    (BE-4809) as well as `name`/`conclusion`, so do not add a `--jq`/field filter
-    here without keeping `steps`: dropping it degrades the gate to counting every
+    as well as `name`/`conclusion`, so do not add a `--jq`/field filter here
+    without keeping `steps`: dropping it degrades the gate to counting every
     `failure` as a spent audit, silently and without a test failing.
     """
     if not _REPO_RE.match(repo or ""):
         raise ValueError(f"invalid repo {repo!r}: expected owner/name")
-    payload = _api_json([f"/repos/{repo}/actions/runs/{run_id}/jobs?per_page=100"], run)
-    return payload.get("jobs", []) if isinstance(payload, dict) else []
+    jobs = []
+    for page in range(1, _MAX_JOB_PAGES + 1):
+        payload = _api_json(
+            [f"/repos/{repo}/actions/runs/{run_id}/jobs"
+             f"?filter=all&per_page={_JOBS_PAGE_SIZE}&page={page}"],
+            run,
+        )
+        page_jobs = payload.get("jobs", []) if isinstance(payload, dict) else []
+        jobs.extend(page_jobs)
+        if len(page_jobs) < _JOBS_PAGE_SIZE:
+            break
+    return jobs
 
 
 def find_last_audited_run_at(repo, workflow_file, current_run_id, run=subprocess.run):

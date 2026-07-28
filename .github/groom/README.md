@@ -208,8 +208,12 @@ real groom, so a skipped tick costs ~nothing (it never reaches the finder).
   `success` still counts unconditionally. The missing-data direction here is
   deliberately the OPPOSITE of the rest of the gate: no usable `steps` array
   counts the failure, because re-billing a genuinely-spent audit on the next
-  daily tick is the expensive mistake. A unit test pins the step name against
-  `groom.yml` so a rename can't silently drift the two apart.
+  daily tick is the expensive mistake. For the same reason the jobs are fetched
+  with `filter=all` (the endpoint defaults to `latest`): the question is now
+  step-level, so a manual re-run that flakes in `npm install` must not erase the
+  agent an *earlier* attempt already paid for — one attempt showing the step ran
+  is enough. A unit test pins the step name against `groom.yml` so a rename can't
+  silently drift the two apart.
 - **`workflow_dispatch` bypasses THIS gate** — a manual dispatch is never
   interval-throttled. It is not a blanket "always runs": the volume gate is a
   second, independent throttle, so a live dispatch into a quiescent repo can
