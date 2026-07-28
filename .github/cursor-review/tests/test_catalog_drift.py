@@ -139,25 +139,48 @@ class ExtractionTest(unittest.TestCase):
     def test_pin_and_catalog_id_shape_rules_agree(self):
         # The pin validator and the catalog parser MUST accept the same shapes:
         # a pin the catalog parser would never emit reads as delisted every run.
-        # Both go through `_is_model_id`, which requires a `-`/`.` AND a digit —
-        # so a separator-less id (`o3`) or a digit-less one (`code-supernova`) is
-        # rejected at extraction: a loud checker-defect signal, not a false claim
-        # about the catalog. If that rule is ever relaxed, relaxing the one
-        # function relaxes both sides; this test is the tripwire.
-        for token in ["o3", "sonnet", "gpt5", "code-supernova", "gpt-based"]:
+        # All three paths go through `_is_model_id`, which requires a `-`/`.` and
+        # a letter — so a separator-less id (`o3`) is rejected at extraction: a
+        # loud checker-defect signal, not a false claim about the catalog. If
+        # that rule is ever relaxed, relaxing the one function relaxes every
+        # side; this test is the tripwire.
+        for token in ["o3", "sonnet", "gpt5"]:
             self.assertFalse(cd._is_model_id(token), token)
             self.assertEqual(cd.catalog_entries(token + "\n"), [])
         for token in ["gpt-5.6-sol-max", "kimi-k2.7-code", "gemini-3.1-pro", "o5-pro"]:
             self.assertTrue(cd._is_model_id(token), token)
             self.assertEqual([m for m, _ in cd.catalog_entries(token + "\n")], [token])
 
-    def test_a_digit_less_pin_is_rejected_loudly_rather_than_read_as_delisted(self):
-        # The other half of the tripwire: because `_is_model_id` gates pins too,
-        # tightening it to require a digit must surface as an ExtractionError
-        # (red run, actionable message), never as a silent "delisted pin".
+    def test_a_digit_less_id_is_accepted_on_both_sides(self):
+        # Cursor ships digit-less ids for real (`code-supernova`). Requiring a
+        # digit dropped them in `catalog_entries` BEFORE parsing, so a newly
+        # shipped digit-less family never reached the BE-4852 catch-all and the
+        # run reported clean — the silence this check exists to end — and a
+        # digit-less PIN hard-failed extraction every run.
+        self.assertTrue(cd._is_model_id("code-supernova"))
+        self.assertEqual(
+            [m for m, _ in cd.catalog_entries("code-supernova\n")], ["code-supernova"]
+        )
         text = WORKFLOW.replace('"kimi-k2.7-code"', '"code-supernova"')
+        self.assertIn("code-supernova", cd.extract_panel_models(text))
+
+    def test_a_digit_less_family_reaches_the_unpinned_families_catch_all(self):
+        # The end-to-end of the above: a digit-less family the panel pins nothing
+        # from must surface as a finding, not vanish.
+        report = analyze(catalog=CATALOG + "code-supernova\n")
+        families = {g["lab"]: [c["id"] for c in g["candidates"]] for g in report["unpinned_labs"]}
+        self.assertEqual(families["code"], ["code-supernova"])
+        self.assertTrue(report["has_findings"])
+
+    def test_a_judge_default_the_catalog_parser_would_reject_raises(self):
+        # The judge pin was the one hole in the "both sides agree" contract:
+        # `extract_judge_model` checked only for whitespace/scalar markers, so a
+        # separator-less default (`o3`) extracted cleanly and then failed
+        # `present()` — a phantom URGENT "delisted pin" every Monday against a
+        # model sitting right there in the catalog.
+        text = WORKFLOW.replace("default: claude-opus-4-8-thinking-max", "default: o3")
         with self.assertRaises(cd.ExtractionError):
-            cd.extract_panel_models(text)
+            cd.extract_judge_model(text)
 
     def test_valid_json_with_a_placeholder_entry_raises(self):
         # Strict JSON is not enough — a placeholder would be "checked" as a pin.
@@ -221,14 +244,32 @@ class CatalogParsingTest(unittest.TestCase):
         self.assertIn("gpt-5.6-sol", entries)
         self.assertEqual(entries["fable-5-max"], "(NO ZDR)")
 
-    def test_a_hyphenated_prose_word_is_not_admitted_as_an_id(self):
-        # `gpt-based` is lowercase, hyphenated and has letters, so before the
-        # digit requirement it parsed as a catalog id — noise in the review-me
-        # list, and a phantom family in the unpinned-families section.
+    def test_a_hyphenated_prose_word_is_admitted_and_that_is_the_accepted_trade(self):
+        # `gpt-based` is lowercase, hyphenated and has letters, so it parses as
+        # an id: one bogus row in a never-urgent list. Screening it out by
+        # requiring a digit was tried and reverted — it also dropped real
+        # digit-less ids (`code-supernova`) before parsing, which is the
+        # under-report direction this checker refuses (see `_is_model_id` and
+        # `present`). Over-reporting a prose word is the cheaper failure, and
+        # this test pins that choice so it is not silently re-tightened.
         entries = cd.catalog_entries(
             "gpt-based models are listed below\ngpt-5.6-sol-max\nself-hosted options: none\n"
         )
-        self.assertEqual([m for m, _ in entries], ["gpt-5.6-sol-max"])
+        self.assertEqual(
+            [m for m, _ in entries], ["gpt-based", "gpt-5.6-sol-max", "self-hosted"]
+        )
+        # What actually matters is that the noise is inert. `gpt-based` reads as
+        # lab `gpt`, so it shows up as one extra row in the same-lab review-me
+        # list — a list that is explicitly "review me, not a recommendation" and
+        # never `urgent`. It cannot redden a run, and it cannot mask a real pin,
+        # because `delisted` is computed from the pins, not from this list.
+        report = analyze(catalog="\n".join(PANEL) + f"\n{JUDGE}\ngpt-based models are listed\n")
+        self.assertFalse(report["urgent"])
+        self.assertEqual(report["delisted"], [])
+        self.assertEqual(
+            [(g["lab"], [c["id"] for c in g["candidates"]]) for g in report["unpinned"]],
+            [("gpt", ["gpt-based"])],
+        )
 
     def test_a_numbered_list_marker_is_not_mistaken_for_an_id(self):
         # `1.` satisfies "lowercase token with a separator", so without the
@@ -463,6 +504,30 @@ class RenderTest(unittest.TestCase):
         self.assertGreater(len(report["unpinned_labs"]), 100)
         body = cd.render_body(report, catalog)
         self.assertLess(len(body), 65536)
+        # Length alone is not the property that matters — the section must be
+        # budgeted rather than sliced by the blunt `MAX_BODY_CHARS` clamp, which
+        # would leave the markup unterminated (swallowing the rest of the issue
+        # in GitHub's renderer) and drop the sections below it.
+        self.assertEqual(body.count("<details>"), body.count("</details>"))
+        self.assertIn("more", body)
+        # The sections that follow the fold survive.
+        self.assertIn("Raw <code>cursor-agent models</code> output", body)
+        self.assertIn("This issue is sticky", body)
+
+    def test_the_unpinned_families_fold_names_what_it_truncated(self):
+        # Silent truncation would read as "these are all the families" — the one
+        # reading that could hide the rebranded family this section exists for.
+        catalog = "\n".join(PANEL) + "".join(f"\nlab{n}-9-max" for n in range(cd.MAX_FAMILY_LABS + 5))
+        body = cd.render_body(analyze(catalog=catalog), catalog)
+        self.assertIn("+5 more", body)
+        self.assertEqual(body.count("<details>"), body.count("</details>"))
+
+    def test_a_single_family_with_many_ids_is_capped_and_says_so(self):
+        ids = "".join(f"\nsolo-{n}-max" for n in range(cd.MAX_FAMILY_IDS + 3))
+        catalog = "\n".join(PANEL) + ids
+        body = cd.render_body(analyze(catalog=catalog), catalog)
+        self.assertIn("… and 3 more", body)
+        self.assertEqual(body.count("<details>"), body.count("</details>"))
 
     def test_a_backtick_in_a_catalog_note_cannot_break_out_of_its_code_span(self):
         # Notes are unconstrained third-party text reproduced in a bot-authored

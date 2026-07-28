@@ -65,6 +65,13 @@ DEFAULT_STALE_DAYS = 30
 # raw-catalog fold rather than losing the whole body to a 422.
 MAX_CATALOG_CHARS = 40000
 MAX_BODY_CHARS = 60000
+# Per-section budget for the unpinned-families fold, so `MAX_BODY_CHARS` (a blunt
+# `body[:N]`) can never cut into its markup. Generous next to a real catalog —
+# a few dozen models across a handful of families — while still bounding a
+# pathological one. The section is a "scan for a familiar lab wearing an
+# unfamiliar prefix" list, so the first rows of each family carry its signal.
+MAX_FAMILY_LABS = 40
+MAX_FAMILY_IDS = 25
 
 _HEREDOC_START = re.compile(r"cat\s*>\s*/tmp/models\.json\s*<<\s*'?JSON'?")
 _HEREDOC_END = re.compile(r"^\s*JSON\s*$")
@@ -76,12 +83,6 @@ _LAST_CHECKED = re.compile(r"last checked\s+(\d{4}-\d{2}-\d{2})", re.IGNORECASE)
 # carries at least one `-` or `.` — that separator requirement is what keeps
 # prose lines ("Available models:") out of the parsed id list.
 _ID_TOKEN = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
-# Every model id a lab has shipped to Cursor's catalog carries a version number
-# somewhere (`gpt-5.6-sol-max`, `claude-opus-4-8-thinking-max`, `kimi-k2.7-code`,
-# `o5-pro`), and a hyphenated PROSE word at the head of a catalog line does not
-# ("`gpt-based` models are …"). Requiring a digit is what separates the two — see
-# `_is_model_id`.
-_HAS_DIGIT = re.compile(r"[0-9]")
 _BULLET = re.compile(r"^[-*>•\s]+")
 # The ONE catalog marker worth interpreting rather than merely reproducing: a
 # PINNED model reclassified non-ZDR means private review diffs are flowing to a
@@ -104,7 +105,7 @@ class ExtractionError(Exception):
 def _is_model_id(token):
     """True for a bare catalog/model id — see `_ID_TOKEN`.
 
-    Three requirements beyond the character class, each closing a different
+    Two requirements beyond the character class, each closing a different
     misparse:
 
       * a `-`/`.` **separator**, which keeps prose lines ("Available models:")
@@ -113,27 +114,34 @@ def _is_model_id(token):
         `1. gpt-5.6-sol-max` catalog line) from parsing as an id. That matters
         more than it looks: `present()` trusts this parse, so a catalog of
         ['1.', '2.'] would look perfectly valid while reporting every real pin as
-        delisted;
-      * a **digit**, which keeps a hyphenated prose word at the head of a catalog
-        line ("`gpt-based` models are …") from being admitted as a bogus id — it
-        would otherwise add noise to the review-me list and, since BE-4852, mint
-        a phantom `gpt-based`-style entry in the unpinned-families section.
+        delisted.
 
     Parsing nothing at all instead routes a garbled catalog to `main`'s
     diagnostic "no ids could be parsed — the format may have changed" hard exit.
 
-    All three bind the PIN validator too (`extract_panel_models` /
-    `extract_judge_model` call this): a shape the catalog parser would never emit
+    Deliberately NOT also requiring a digit, though every id the panel pins today
+    happens to carry one. Cursor ships digit-less ids for real (`code-supernova`),
+    and the rule is not free in that direction: a digit-less id is dropped by
+    `catalog_entries` BEFORE parsing, so a newly shipped digit-less family never
+    reaches the BE-4852 unpinned-families catch-all and the run reports clean —
+    the exact "a new model shipped and nobody noticed" silence this whole check
+    exists to end. What the digit bought was keeping a hyphenated PROSE word at
+    the head of a catalog line ("`gpt-based` models are …") out of the id list;
+    what it cost was dropping real ids. That trade is the wrong way round, and in
+    the same direction `present` already argues for explicitly: over-report
+    (one bogus row in a collapsed, never-urgent section) rather than
+    under-report (a real family silently missing).
+
+    Both rules bind the PIN validator too — `extract_panel_models` and
+    `extract_judge_model` call this: a shape the catalog parser would never emit
     must not be accepted as a pin, or that pin reads as delisted every run. If a
-    lab ever ships a separator-less or digit-less id, relax the rule HERE — one
-    function, both sides — and `test_pin_and_catalog_id_shape_rules_agree` keeps
-    them honest.
+    lab ever ships a separator-less id, relax the rule HERE — one function, both
+    sides — and `test_pin_and_catalog_id_shape_rules_agree` keeps them honest.
     """
     return (
         bool(_ID_TOKEN.match(token))
         and re.search(r"[-.]", token) is not None
         and re.search(r"[a-z]", token) is not None
-        and _HAS_DIGIT.search(token) is not None
     )
 
 
@@ -193,10 +201,10 @@ def extract_panel_models(workflow_text):
     if bad:
         raise ExtractionError(
             f"the /tmp/models.json heredoc yielded entries that are not bare model ids: {bad!r} "
-            "(expected a single lowercase token containing a `-` or `.` AND a digit, e.g. "
-            "`gpt-5.6-sol-max`). If a lab has shipped a separator-less or digit-less id, relax "
-            "`_is_model_id` — it is the ONE rule the pin validator and the catalog parser share, "
-            "and they must agree, or the pin will read as delisted every run."
+            "(expected a single lowercase token containing a `-` or `.`, e.g. "
+            "`gpt-5.6-sol-max`). If a lab has shipped a separator-less id, relax `_is_model_id` "
+            "— it is the ONE rule the pin validator and the catalog parser share, and they must "
+            "agree, or the pin will read as delisted every run."
         )
     return models
 
@@ -222,10 +230,21 @@ def extract_judge_model(workflow_text):
                 # `>-`, which would report as delisted on every single run.
                 value = re.split(r"\s+#", default.group(1).strip(), maxsplit=1)[0].strip()
                 value = value.strip("\"'")
-                if value and value[0] not in ">|" and not re.search(r"\s", value):
+                # …and then the SAME shape rule the catalog parser applies. The
+                # scalar/whitespace checks above are strictly weaker than
+                # `_is_model_id`, so without this the judge pin was the one hole
+                # in the "both sides agree" contract: a default the catalog
+                # parser would never emit (`o3` — no separator) extracted
+                # cleanly here and then failed `present()`, reporting a phantom
+                # URGENT "delisted pin" every Monday against a model that is
+                # sitting right there in the catalog.
+                if value and value[0] not in ">|" and _is_model_id(value):
                     return value
                 raise ExtractionError(
-                    f"the `judge_model` input's default is not a bare model id: {value!r}"
+                    f"the `judge_model` input's default is not a bare model id: {value!r} "
+                    "(expected a single lowercase token containing a `-` or `.`, e.g. "
+                    "`claude-opus-4-8-thinking-max`). Relax `_is_model_id` if a lab ships a "
+                    "separator-less id — it gates the catalog parser too, and the two must agree."
                 )
         break
     raise ExtractionError("could not find the `judge_model` input's `default:` value")
@@ -396,14 +415,17 @@ def analyze(panel_models, judge_model, catalog_text, last_checked, today, stale_
     # exists to avoid). Most of what lands here is genuinely uninteresting —
     # labs Comfy will never pin — hence: a finding, but never `urgent`, and
     # rendered collapsed.
+    # Grouped through a dict keyed by lab (not a linear scan per entry) so this
+    # stays O(N) on a catalog whose ids all have distinct prefixes.
     unpinned_labs = []
+    by_lab = {}
     for model_id, note in entries:
         lab = lab_of(model_id)
         if lab in pinned_labs:
             continue
-        group = next((g for g in unpinned_labs if g["lab"] == lab), None)
+        group = by_lab.get(lab)
         if group is None:
-            group = {"lab": lab, "candidates": []}
+            group = by_lab[lab] = {"lab": lab, "candidates": []}
             unpinned_labs.append(group)
         group["candidates"].append({"id": model_id, "note": note})
 
@@ -502,12 +524,20 @@ def _inline_code(text):
     return f"{delim}{pad}{flat}{pad}{delim}"
 
 
-def _candidate_list(candidates):
-    """Bullet list of `{id, note}` rows — shared by both unpinned sections."""
-    return "\n".join(
-        f"- `{c['id']}`" + (f" — {_inline_code(c['note'])}" if c["note"] else "")
-        for c in candidates
-    )
+def _candidate_list(candidates, limit=None):
+    """Bullet list of `{id, note}` rows — shared by both unpinned sections.
+
+    `limit` caps the rows and names the remainder instead of dropping it
+    silently; the same-lab list above is bounded by the pins so it passes None.
+    """
+    shown = candidates if limit is None else candidates[:limit]
+    rows = [
+        f"- `{c['id']}`" + (f" — {_inline_code(c['note'])}" if c["note"] else "") for c in shown
+    ]
+    hidden = len(candidates) - len(shown)
+    if hidden:
+        rows.append(f"- _… and {hidden} more — see the raw catalog fold below._")
+    return "\n".join(rows)
 
 
 def render_body(report, catalog_text, run_url=None, checked_at=None):
@@ -586,10 +616,22 @@ def render_body(report, catalog_text, run_url=None, checked_at=None):
         # it must not crowd out the same-lab review-me list above. It exists for
         # the one row that matters — a lab already on the panel shipping under a
         # new family prefix, which `lab_of` cannot tell from a new vendor.
+        # Budgeted HERE rather than left to `MAX_BODY_CHARS` below. That clamp is
+        # a blunt `body[:N]`: on a catalog with thousands of distinct prefixes it
+        # would cut INTO this block, leaving the `<details>`/inline-code markup
+        # unterminated (which swallows the rest of the issue in GitHub's
+        # renderer) and dropping the stale-audit and raw-catalog sections that
+        # follow. Truncating with an explicit count keeps the body well-formed
+        # and says out loud what was dropped.
+        shown = families[:MAX_FAMILY_LABS]
+        hidden = len(families) - len(shown)
+        labs_listed = ", ".join("`" + g["lab"] + "`" for g in shown)
+        if hidden:
+            labs_listed += f", +{hidden} more"
         detail = [
             "<details>",
             f"<summary>Catalog ids from <b>unpinned model families</b> "
-            f"({', '.join('`' + g['lab'] + '`' for g in families)})</summary>",
+            f"({labs_listed})</summary>",
             "",
             "Families the panel pins **nothing** from. Usually just labs Comfy does not use — but "
             "the lab of an id is its first `-`/`.`-separated token, so a lab the panel DOES pin "
@@ -598,11 +640,11 @@ def render_body(report, catalog_text, run_url=None, checked_at=None):
             "wearing an unfamiliar prefix; ignore the rest. Same caveats as above — notes are "
             "verbatim, an unmarked id is **not** thereby confirmed ZDR-eligible.",
         ]
-        for group in families:
+        for group in shown:
             detail.append("")
             detail.append(f"**`{group['lab']}`**")
             detail.append("")
-            detail.append(_candidate_list(group["candidates"]))
+            detail.append(_candidate_list(group["candidates"], limit=MAX_FAMILY_IDS))
         detail.append("")
         detail.append("</details>")
         out.append("\n".join(detail))
