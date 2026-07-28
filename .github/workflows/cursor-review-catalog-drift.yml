@@ -33,9 +33,9 @@ on:
     - cron: '17 6 * * 1'
   workflow_dispatch:
 
-permissions:
-  contents: read
-  issues: write
+# Permissions are declared PER JOB, not here: a workflow-level `issues: write`
+# would hand the write scope to the job that runs Cursor's installer too (see
+# the `drift` job comment).
 
 # One drift run at a time: two overlapping runs would race on the sticky issue
 # (both reading "no open issue" and filing a duplicate). Queue instead of
@@ -49,6 +49,20 @@ jobs:
     name: Compare pins against the live catalog
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # NO write scope, deliberately — the same boundary groom.yml draws around
+    # its agent jobs. This job pipes a MUTABLE third-party installer
+    # (`curl https://cursor.com/install | bash`) into the shell and puts
+    # `~/.cursor/bin` on PATH, so every later `gh`/`python3` call in it is
+    # already downstream of code Cursor can change at will. Cursor publishes no
+    # versioned, checksummed artifact to pin, so the mitigation is to give this
+    # job nothing worth stealing a write with: it emits the rendered report as
+    # an artifact, and the credentialed `sticky` job below (which runs no
+    # third-party code) is the only place `issues: write` exists.
+    permissions:
+      contents: read
+    outputs:
+      has_findings: ${{ steps.drift.outputs.has_findings }}
+      urgent: ${{ steps.drift.outputs.urgent }}
     steps:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -102,23 +116,54 @@ jobs:
             --json-out /tmp/drift-report.json
           cat /tmp/drift-body.md >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Upload the rendered drift report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: cursor-review-catalog-drift
+          path: |
+            /tmp/drift-title.txt
+            /tmp/drift-body.md
+            /tmp/drift-report.json
+          if-no-files-found: error
+          retention-days: 7
+
+  sticky:
+    name: Open, update, or close the sticky drift issue
+    needs: drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The credentialed sink: it only reads the artifact `drift` rendered and
+    # talks to the issues API. No checkout, no installer, no `cursor-agent`.
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Download the rendered drift report
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: cursor-review-catalog-drift
+          path: /tmp
+
       - name: Open, update, or close the sticky drift issue
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          HAS_FINDINGS: ${{ steps.drift.outputs.has_findings }}
+          HAS_FINDINGS: ${{ needs.drift.outputs.has_findings }}
         run: |
           set -euo pipefail
           PREFIX='[cursor-review catalog drift]'
 
           # Find-by-title (the sticky key), filtered on an EXACT prefix rather
           # than `--search`, which is fuzzy AND eventually consistent — a search
-          # that hasn't indexed the issue we filed would file a duplicate. The
-          # generous limit is what keeps that promise as this repo accumulates
-          # open issues (groom files here too): the sticky ages out of a
-          # newest-first page long before it stops mattering.
-          numbers=$(gh issue list -R "$REPO" --state open --limit 500 --json number,title \
-            | jq -r --arg p "$PREFIX" 'map(select(.title | startswith($p))) | .[].number')
+          # that hasn't indexed the issue we filed would file a duplicate. Walk
+          # EVERY open issue (`--paginate`, not a `--limit` page) so the sticky
+          # can't fall off the end of the result set and get filed twice as this
+          # repo accumulates open issues (groom files here too). `/issues`
+          # returns PRs as well, hence the `.pull_request == null` filter that
+          # `gh issue list` applied for us.
+          numbers=$(gh api "repos/${REPO}/issues?state=open&per_page=100" --paginate \
+            --jq '.[] | select(.pull_request == null) | {number, title}' \
+            | jq -rs --arg p "$PREFIX" 'map(select(.title | startswith($p))) | .[].number')
           existing=$(printf '%s\n' "$numbers" | head -n 1)
           extra=$(printf '%s\n' "$numbers" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')
           if [ -n "$extra" ]; then
@@ -146,7 +191,7 @@ jobs:
         # The sticky issue carries every finding; only the urgent one reddens
         # the run, so the weekly check stays green while a review-me list waits
         # for a human but shouts when consumer PRs are about to fail preflight.
-        if: steps.drift.outputs.urgent == 'true'
+        if: needs.drift.outputs.urgent == 'true'
         run: |
           echo "::error::A pinned cursor-review model id is missing from Cursor's live catalog — consumer PRs will fail the review preflight until the pin is updated. See the '[cursor-review catalog drift]' issue."
           exit 1

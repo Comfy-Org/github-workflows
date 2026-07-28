@@ -139,7 +139,7 @@ def extract_judge_model(workflow_text):
                 # `>-`, which would report as delisted on every single run.
                 value = re.split(r"\s+#", default.group(1).strip(), maxsplit=1)[0].strip()
                 value = value.strip("\"'")
-                if value and not value[0] in ">|" and not re.search(r"\s", value):
+                if value and value[0] not in ">|" and not re.search(r"\s", value):
                     return value
                 raise ExtractionError(
                     f"the `judge_model` input's default is not a bare model id: {value!r}"
