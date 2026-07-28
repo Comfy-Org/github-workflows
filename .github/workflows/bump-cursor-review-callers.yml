@@ -111,7 +111,20 @@ jobs:
           # that run's original (now stale) commit, and the bumper would
           # force-repin every caller to it. Only act from the current tip —
           # any newer push has its own queued run that does the bump.
-          main_tip=$(git ls-remote origin refs/heads/main | cut -f1)
+          # Don't pipe into `cut`: the pipeline would report cut's status, so a
+          # failed ls-remote (network blip, remote hiccup) yields an EMPTY
+          # main_tip that then compares unequal to github.sha and silently
+          # no-ops the whole fleet bump as if the run were stale. A lookup we
+          # couldn't perform is not evidence of staleness — fail loudly.
+          if ! ls_remote=$(git ls-remote origin refs/heads/main); then
+            echo "::error::Could not look up the current main tip (git ls-remote failed)"
+            exit 1
+          fi
+          main_tip=${ls_remote%%$'\t'*}
+          if [[ -z "$main_tip" ]]; then
+            echo "::error::git ls-remote returned no SHA for refs/heads/main"
+            exit 1
+          fi
           if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
             echo "github.sha $GITHUB_SHA is not the current main tip ($main_tip) — stale run/re-run; nothing to bump"
             exit 0
