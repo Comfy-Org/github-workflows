@@ -33,7 +33,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@ece4c3eaa71812a5a665f48d5d1f4bb0ff5f655e # main (fe6b08e)
+    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@ece4c3eaa71812a5a665f48d5d1f4bb0ff5f655e # github-workflows main (ece4c3e)
     with:
       # Keep the assets ref in lock-step with the `uses:` ref above.
       workflows_ref: ece4c3eaa71812a5a665f48d5d1f4bb0ff5f655e
