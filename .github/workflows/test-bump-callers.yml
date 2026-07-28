@@ -2,8 +2,9 @@ name: Test bump-callers script
 
 # Runs the functional tests + shellcheck for the shared caller-bump script
 # (.github/bump-callers/bump-callers.sh). That one script drives the SHA-bump
-# fan-out for the cursor-review, agents-md-integrity, pr-size, assign-reviewers
-# AND groom caller fleets, so a regression here silently breaks every consumer
+# fan-out for the cursor-review, cursor-review-auto-label, agents-md-integrity,
+# pr-size, assign-reviewers AND groom caller fleets, so a regression here
+# silently breaks every consumer
 # repo's pin auto-bump (or, worse, leaks a private caller name into this public
 # repo's run logs) — cheap to guard with a unit run on change. Mirrors
 # test-cursor-review-scripts.yml / test-agents-md-integrity.yml.
@@ -17,6 +18,7 @@ on:
       - '.github/workflows/bump-pr-size-callers.yml'
       - '.github/workflows/bump-assign-reviewers-callers.yml'
       - '.github/workflows/bump-groom-callers.yml'
+      - '.github/workflows/bump-auto-label-callers.yml'
       - '.github/workflows/test-bump-callers.yml'
   push:
     branches: [main]
@@ -27,6 +29,7 @@ on:
       - '.github/workflows/bump-pr-size-callers.yml'
       - '.github/workflows/bump-assign-reviewers-callers.yml'
       - '.github/workflows/bump-groom-callers.yml'
+      - '.github/workflows/bump-auto-label-callers.yml'
       - '.github/workflows/test-bump-callers.yml'
 
 permissions:
