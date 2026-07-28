@@ -23,8 +23,8 @@ AND actually spent the audit — a job that ended BEFORE its agent step (checkou
 asset load, prompt build) billed nothing, so it must not advance the clock
 (BE-4814, see `run_audited`). Conversely a job that hung and tripped its
 40-minute timeout billed the most of any outcome, so it must. The interval-skip
-ticks in between never reset it either. Run history is durable across the stateless CI runs and readable with
-only `actions: read`.
+ticks in between never reset it either. Run history is durable across the
+stateless CI runs and readable with only `actions: read`.
 
 The gate is **fail-open**, matching the volume gate: any error deriving the last
 run (API hiccup, unparseable timestamp, no history) RUNS the audit rather than
@@ -172,7 +172,7 @@ _MAX_RUNS_SCANNED = 100
 # How many attempts of a single run to read back before giving up (fail-open).
 # Only reached for a run somebody re-ran by hand, which is already rare; the cap
 # keeps a pathological re-run count from turning this cheap gate into a storm of
-# API calls. See `run_audited_across_attempts`.
+# API calls. See `audited_run_anchor`.
 _MAX_ATTEMPTS_SCANNED = 5
 
 
@@ -415,7 +415,7 @@ def fetch_run_jobs(repo: str, run_id, run=subprocess.run, attempt=None):
 
     `attempt=None` asks the plain endpoint, which reports only the run's LATEST
     attempt; pass an attempt number to read an earlier one (see
-    `run_audited_across_attempts`).
+    `audited_run_anchor`).
     """
     if not _REPO_RE.match(repo or ""):
         raise ValueError(f"invalid repo {repo!r}: expected owner/name")
