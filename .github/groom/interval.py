@@ -69,9 +69,10 @@ from datetime import datetime, timezone
 _FINDER_JOB_HINTS = ("finder", "audit_find")
 
 # A finder job that reached `success` spent the (billed) audit — nothing else to
-# check, the agent step is upstream of every step that could still fail.
-# `skipped` (the interval-skip case), `cancelled`, and a null conclusion never
-# count. `failure` is the interesting one, and it needs EVIDENCE — see below.
+# check, the agent step is upstream of every step that could still fail. `skipped`
+# (the interval-skip case) and a null conclusion never count at all. Every other
+# ending — `failure`, `timed_out`, `cancelled` — may or may not have spent the
+# audit, so it needs EVIDENCE; see _AGENT_EVIDENCE_CONCLUSIONS below.
 _AUDITED_CONCLUSIONS = {"success"}
 
 # A non-success ending counts as a spent audit only if the billed agent step
