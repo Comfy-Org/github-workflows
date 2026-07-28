@@ -139,15 +139,15 @@ class ExtractionTest(unittest.TestCase):
     def test_pin_and_catalog_id_shape_rules_agree(self):
         # The pin validator and the catalog parser MUST accept the same shapes:
         # a pin the catalog parser would never emit reads as delisted every run.
-        # All three paths go through `_is_model_id`, which requires a `-`/`.` and
-        # a letter — so a separator-less id (`o3`) is rejected at extraction: a
-        # loud checker-defect signal, not a false claim about the catalog. If
-        # that rule is ever relaxed, relaxing the one function relaxes every
-        # side; this test is the tripwire.
-        for token in ["o3", "sonnet", "gpt5"]:
+        # All three paths go through `_is_model_id`, which requires a letter
+        # plus a `-`/`.` or a digit — so a bare prose word (`sonnet`) is
+        # rejected at extraction: a loud checker-defect signal, not a false
+        # claim about the catalog. If that rule is ever relaxed, relaxing the
+        # one function relaxes every side; this test is the tripwire.
+        for token in ["sonnet", "models", "available"]:
             self.assertFalse(cd._is_model_id(token), token)
             self.assertEqual(cd.catalog_entries(token + "\n"), [])
-        for token in ["gpt-5.6-sol-max", "kimi-k2.7-code", "gemini-3.1-pro", "o5-pro"]:
+        for token in ["gpt-5.6-sol-max", "kimi-k2.7-code", "gemini-3.1-pro", "o5-pro", "o3", "gpt5"]:
             self.assertTrue(cd._is_model_id(token), token)
             self.assertEqual([m for m, _ in cd.catalog_entries(token + "\n")], [token])
 
@@ -172,13 +172,28 @@ class ExtractionTest(unittest.TestCase):
         self.assertEqual(families["code"], ["code-supernova"])
         self.assertTrue(report["has_findings"])
 
+    def test_a_bare_separator_less_id_is_accepted_on_both_sides(self):
+        # OpenAI ships bare o-series ids for real (`o3`). Requiring a `-`/`.`
+        # dropped them in `catalog_entries` BEFORE parsing — the same pre-parse
+        # silence that got the digit rule reverted, and it hit exactly the bare
+        # o-series rebrand the BE-4852 catch-all was built for: the id never
+        # reached it and the run reported clean.
+        report = analyze(catalog=CATALOG + "o3\n")
+        families = {g["lab"]: [c["id"] for c in g["candidates"]] for g in report["unpinned_labs"]}
+        self.assertEqual(families["o3"], ["o3"])
+        self.assertTrue(report["has_findings"])
+        # …and the pin side of the shared rule accepts it too.
+        text = WORKFLOW.replace("default: claude-opus-4-8-thinking-max", "default: o3")
+        self.assertEqual(cd.extract_judge_model(text), "o3")
+
     def test_a_judge_default_the_catalog_parser_would_reject_raises(self):
         # The judge pin was the one hole in the "both sides agree" contract:
         # `extract_judge_model` checked only for whitespace/scalar markers, so a
-        # separator-less default (`o3`) extracted cleanly and then failed
-        # `present()` — a phantom URGENT "delisted pin" every Monday against a
-        # model sitting right there in the catalog.
-        text = WORKFLOW.replace("default: claude-opus-4-8-thinking-max", "default: o3")
+        # default the catalog parser drops (`sonnet` — a bare digit-less word)
+        # extracted cleanly and then failed `present()` — a phantom URGENT
+        # "delisted pin" every Monday against a model sitting right there in
+        # the catalog.
+        text = WORKFLOW.replace("default: claude-opus-4-8-thinking-max", "default: sonnet")
         with self.assertRaises(cd.ExtractionError):
             cd.extract_judge_model(text)
 
@@ -258,11 +273,12 @@ class CatalogParsingTest(unittest.TestCase):
         self.assertEqual(
             [m for m, _ in entries], ["gpt-based", "gpt-5.6-sol-max", "self-hosted"]
         )
-        # What actually matters is that the noise is inert. `gpt-based` reads as
+        # What usually matters is that the noise is inert. `gpt-based` reads as
         # lab `gpt`, so it shows up as one extra row in the same-lab review-me
         # list — a list that is explicitly "review me, not a recommendation" and
-        # never `urgent`. It cannot redden a run, and it cannot mask a real pin,
-        # because `delisted` is computed from the pins, not from this list.
+        # never `urgent` — and a token that matches no pin cannot redden a run
+        # or mask one. The exception — a prose token that exactly EQUALS a pin —
+        # is pinned separately below.
         report = analyze(catalog="\n".join(PANEL) + f"\n{JUDGE}\ngpt-based models are listed\n")
         self.assertFalse(report["urgent"])
         self.assertEqual(report["delisted"], [])
@@ -270,6 +286,25 @@ class CatalogParsingTest(unittest.TestCase):
             [(g["lab"], [c["id"] for c in g["candidates"]]) for g in report["unpinned"]],
             [("gpt", ["gpt-based"])],
         )
+
+    def test_a_prose_line_leading_with_a_pinned_id_reads_as_that_pin(self):
+        # The known residual of admitting prose tokens: a catalog line whose
+        # FIRST token exactly equals a pinned id ("kimi-k2.7-code was removed…")
+        # is shape-indistinguishable from a listing of that id with a note, so
+        # `present()` counts the pin as listed and the urgent delisted finding
+        # is suppressed. Telling the two apart means interpreting the note text,
+        # which this checker refuses by design for everything except NO-ZDR (see
+        # `catalog_entries`) — a "removed"/"deprecated" word denylist would be
+        # guessing at phrasing Cursor has never committed to, with a false match
+        # crying delisted-wolf about a live pin. Pinned here so the trade stays
+        # explicit rather than accidental: if Cursor ever ships prose like this,
+        # the fix is note interpretation, not tighter token screening.
+        catalog = CATALOG.replace(
+            "kimi-k2.7-code\n", "kimi-k2.7-code was removed from the catalog\n"
+        )
+        report = analyze(catalog=catalog)
+        self.assertEqual(report["delisted"], [])
+        self.assertFalse(report["urgent"])
 
     def test_a_numbered_list_marker_is_not_mistaken_for_an_id(self):
         # `1.` satisfies "lowercase token with a separator", so without the
@@ -528,6 +563,57 @@ class RenderTest(unittest.TestCase):
         body = cd.render_body(analyze(catalog=catalog), catalog)
         self.assertIn("… and 3 more", body)
         self.assertEqual(body.count("<details>"), body.count("</details>"))
+
+    def test_worst_case_lists_and_notes_never_reach_the_blunt_clamp(self):
+        # The row caps alone bound COUNTS, not chars: max-rows-everywhere with
+        # long notes used to blow through MAX_BODY_CHARS and land in the blunt
+        # `body[:N]` clamp, which slices mid-markup — exactly the corruption the
+        # per-section budgets exist to prevent. The one-id-per-family test above
+        # never reaches that worst case, so this one does: long notes, hundreds
+        # of same-lab ids, and dozens of families × dozens of ids at once. The
+        # body must come in UNDER the cap via budgeting (notes capped, lists
+        # capped, families fold char-budgeted, raw fold given only the leftover
+        # budget) — not via the clamp.
+        note = "context " * 60  # ~480 chars, > MAX_NOTE_CHARS
+        catalog = (
+            CATALOG
+            + "".join(f"gpt-tier-{n} {note}\n" for n in range(300))
+            + "".join(f"newlab{n}-tier-{m} {note}\n" for n in range(60) for m in range(30))
+        )
+        report = analyze(catalog=catalog)
+        body = cd.render_body(report, catalog)
+        self.assertLessEqual(len(body), cd.MAX_BODY_CHARS)
+        self.assertNotIn("report truncated", body)
+        self.assertEqual(body.count("<details>"), body.count("</details>"))
+        # The sections after the big lists survive, well-formed.
+        self.assertIn("This issue is sticky", body)
+        self.assertIn("cursor-agent models", body)
+
+    def test_the_raw_fold_shrinks_to_the_budget_the_report_left_over(self):
+        # A 40K report + a 40K raw fold is 80K — over GitHub's 65536 limit even
+        # though each half respects its own constant. The fold must take only
+        # what MAX_BODY_CHARS has left, and the whole body must stay well-formed.
+        catalog = CATALOG + "".join(f"lab{n}-9-max\n" for n in range(4000))
+        body = cd.render_body(analyze(catalog=catalog), catalog)
+        self.assertLessEqual(len(body), cd.MAX_BODY_CHARS)
+        self.assertNotIn("report truncated", body)
+        self.assertIn("truncated — see the workflow run log", body)
+
+    def test_a_delisted_pins_alternatives_list_is_capped(self):
+        extra = cd.MAX_FAMILY_IDS + 8
+        catalog = CATALOG.replace("kimi-k2.7-code\n", "") + "".join(
+            f"kimi-k{n}-code\n" for n in range(extra)
+        )
+        body = cd.render_body(analyze(catalog=catalog), catalog)
+        self.assertIn("Delisted pin", body)
+        self.assertIn("+8 more", body)
+
+    def test_an_oversized_note_is_capped_in_its_row(self):
+        catalog = CATALOG + "gpt-5.7-preview " + ("x" * 1000) + "\n"
+        body = cd.render_body(analyze(catalog=catalog), catalog)
+        row = [ln for ln in body.splitlines() if ln.startswith("- `gpt-5.7-preview`")][0]
+        self.assertLess(len(row), cd.MAX_NOTE_CHARS + 100)
+        self.assertIn("…", row)
 
     def test_a_backtick_in_a_catalog_note_cannot_break_out_of_its_code_span(self):
         # Notes are unconstrained third-party text reproduced in a bot-authored
