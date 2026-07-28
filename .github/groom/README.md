@@ -199,6 +199,21 @@ real groom, so a skipped tick costs ~nothing (it never reaches the finder).
   interval-skip ticks in between never reset the clock. (A repo variable would
   need a `Variables: write` credential the run doesn't carry, and a missing grant
   would fail *silently* into a daily over-spend — run history has no such trap.)
+- **A FAILED finder job counts only if it actually spent the audit** (BE-4814).
+  A failure that reached the agent and died later (the JSON assert, an upload)
+  still counts — otherwise a run that cost money re-spends on tomorrow's tick.
+  But the job can also die *before* the agent (checkout, asset load, prompt
+  build), and those bill nothing, so counting them would advance the clock and
+  suppress every tick for a whole `GROOM_INTERVAL_DAYS` — hiding a typo'd input
+  or a broken caller for a week rather than letting it recur daily until someone
+  notices. The gate therefore requires **positive evidence**: the jobs API's
+  per-job `steps[]` must show the agent step (`Run finder`, pinned as
+  `interval.agent_step_name()`) actually started. Every ambiguity — no `steps[]`,
+  an empty one, the step absent, still `queued`, or `skipped` — reads as **not
+  audited**, i.e. re-run. A duplicated audit costs one run; a suppressed one
+  hides a broken caller for a full interval. A `success` needs no such check (the
+  agent step is upstream of everything that could still fail, and no `if:`
+  guards it).
 - **`workflow_dispatch` bypasses THIS gate** — a manual dispatch is never
   interval-throttled. It is not a blanket "always runs": the volume gate is a
   second, independent throttle, so a live dispatch into a quiescent repo can

@@ -18,9 +18,12 @@ option that needs no net-new secret and no writable durable store (a repo
 variable would need an extra `Variables: write` credential the run does not
 otherwise carry, and a missing grant would fail *silently* into a daily
 over-spend). A prior run "counts" as a real groom only if it actually reached the
-finder (its `Audit — finder` job ran, i.e. was not `skipped` by this very gate),
-so the interval-skip ticks in between never reset the clock. Run history is
-durable across the stateless CI runs and readable with only `actions: read`.
+finder (its `Audit — finder` job ran, i.e. was not `skipped` by this very gate)
+AND actually spent the audit — a job that failed BEFORE its agent step (checkout,
+asset load, prompt build) billed nothing, so it must not advance the clock
+(BE-4814, see `run_audited`). The interval-skip ticks in between never reset it
+either. Run history is durable across the stateless CI runs and readable with
+only `actions: read`.
 
 The gate is **fail-open**, matching the volume gate: any error deriving the last
 run (API hiccup, unparseable timestamp, no history) RUNS the audit rather than
@@ -64,11 +67,40 @@ from datetime import datetime, timezone
 # `skipped`, so it never matches the audited conclusions below.
 _FINDER_JOB_HINTS = ("finder", "audit_find")
 
-# A finder job that reached success OR failure spent the (billed) audit, so both
-# count as a real run: counting a failure keeps a run that spent money but died
-# at a later step (e.g. filing) from re-spending on the very next daily tick.
-# `skipped` (the interval-skip case), `cancelled`, and a null conclusion do not.
-_AUDITED_CONCLUSIONS = {"success", "failure"}
+# A finder job that reached `success` spent the (billed) audit — nothing else to
+# check, the agent step is upstream of every step that could still fail.
+# `skipped` (the interval-skip case), `cancelled`, and a null conclusion never
+# count. `failure` is the interesting one, and it needs EVIDENCE — see below.
+_AUDITED_CONCLUSIONS = {"success"}
+
+# A `failure` counts as a spent audit only if the billed agent step actually
+# started (BE-4814). Counting every failure keeps a run that spent money but died
+# at a LATER step (e.g. the JSON assert) from re-spending on the very next daily
+# tick — that half is still wanted. But the finder job can also die far BEFORE
+# the agent: checkout, the asset load, the prompt build, the runner itself. Those
+# spend nothing, and counting them advances the cadence clock, so a typo'd input
+# or a broken caller goes quiet for a whole GROOM_INTERVAL_DAYS window instead of
+# recurring (and being noticed) daily. This gate is fail-OPEN everywhere else;
+# that was the one branch that failed closed.
+_AGENT_EVIDENCE_CONCLUSIONS = {"failure"}
+
+# The billed agent step inside the finder job, matched EXACTLY (after strip)
+# against the `steps[]` the runs-jobs API returns per job. The literal lives here,
+# next to the matcher that consumes it, so the producing `- name:` in groom.yml
+# and this comparison cannot drift apart silently (`test_interval.py` pins both
+# halves). Exact, not substring: the same job also has `Build finder prompt`,
+# `Assert finder produced JSON` and `Upload finder candidates`, none of which is
+# evidence that a single token was billed.
+_AGENT_STEP_NAME = "Run finder"
+
+# Step states that mean the agent step never STARTED. GitHub reports an unreached
+# step either as still `queued` (job died before it) or as `completed` with a
+# `skipped` conclusion, and which one you get depends on where the job died — so
+# both forms are checked rather than trusting either shape. `cancelled` likewise
+# bills nothing. Anything else (in_progress, or completed with success/failure)
+# means the agent ran and the audit is spent.
+_UNSTARTED_STEP_STATUSES = {"queued", "waiting", "pending", "requested"}
+_UNSTARTED_STEP_CONCLUSIONS = {"skipped", "cancelled", "canceled"}
 
 # Default cadence when GROOM_INTERVAL_DAYS is unset/blank/garbage — 7 days keeps
 # the documented weekly behavior (AC: unset variable stays weekly, matching today).
@@ -176,11 +208,57 @@ def days_since(then_iso: str, now: datetime) -> float:
     return (now - then).total_seconds() / 86400.0
 
 
+def agent_step_name() -> str:
+    """The groom.yml finder step whose start proves the (billed) audit happened.
+
+    Kept next to the matcher that reads it, so the producing `- name:` in
+    groom.yml and the consuming comparison cannot drift apart silently
+    (`test_interval.py` pins both halves against this).
+    """
+    return _AGENT_STEP_NAME
+
+
+def agent_step_started(job) -> bool:
+    """True if this job's `steps[]` show the billed agent step actually started.
+
+    Positive evidence only, and fail-OPEN on every ambiguity: a missing, empty or
+    unmatched `steps[]` reads as "the agent never ran", which makes the run NOT
+    count and leaves the next tick due. A duplicated audit costs one run; a
+    suppressed one hides a broken caller for a full interval.
+    """
+    for step in job.get("steps") or []:
+        if (step.get("name") or "").strip() != _AGENT_STEP_NAME:
+            continue
+        status = (step.get("status") or "").strip().lower()
+        conclusion = (step.get("conclusion") or "").strip().lower()
+        if status in _UNSTARTED_STEP_STATUSES or conclusion in _UNSTARTED_STEP_CONCLUSIONS:
+            continue
+        if not status and not conclusion:
+            # A name and nothing else says nothing about whether it ran. The API
+            # always sends `status`, so this is the malformed/unknown-shape case:
+            # no evidence -> not audited, same direction as every other branch.
+            continue
+        return True
+    return False
+
+
 def run_audited(jobs) -> bool:
-    """True if a run's jobs show the finder actually ran (not an interval-skip)."""
+    """True if a run's jobs show the finder actually ran (not an interval-skip).
+
+    A `success` counts on the job conclusion alone. A `failure` counts only with
+    positive evidence that the agent step started (BE-4814) — the job can fail
+    long before it (checkout, asset load, prompt build), and those runs bill
+    nothing, so treating them as a spent audit would advance the cadence clock
+    and hide the breakage for a whole interval.
+    """
     for job in jobs or []:
         name = (job.get("name") or "").lower()
-        if any(hint in name for hint in _FINDER_JOB_HINTS) and job.get("conclusion") in _AUDITED_CONCLUSIONS:
+        if not any(hint in name for hint in _FINDER_JOB_HINTS):
+            continue
+        conclusion = job.get("conclusion")
+        if conclusion in _AUDITED_CONCLUSIONS:
+            return True
+        if conclusion in _AGENT_EVIDENCE_CONCLUSIONS and agent_step_started(job):
             return True
     return False
 
