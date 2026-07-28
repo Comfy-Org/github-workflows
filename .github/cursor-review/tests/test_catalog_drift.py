@@ -139,16 +139,25 @@ class ExtractionTest(unittest.TestCase):
     def test_pin_and_catalog_id_shape_rules_agree(self):
         # The pin validator and the catalog parser MUST accept the same shapes:
         # a pin the catalog parser would never emit reads as delisted every run.
-        # Both currently require a `-`/`.`, so a separator-less id (`o3`) is
-        # rejected at extraction — a loud checker-defect signal, not a false
-        # claim about the catalog. If that rule is ever relaxed, relax it in
-        # both places; this test is the tripwire.
-        for token in ["o3", "sonnet", "gpt5"]:
+        # Both go through `_is_model_id`, which requires a `-`/`.` AND a digit —
+        # so a separator-less id (`o3`) or a digit-less one (`code-supernova`) is
+        # rejected at extraction: a loud checker-defect signal, not a false claim
+        # about the catalog. If that rule is ever relaxed, relaxing the one
+        # function relaxes both sides; this test is the tripwire.
+        for token in ["o3", "sonnet", "gpt5", "code-supernova", "gpt-based"]:
             self.assertFalse(cd._is_model_id(token), token)
             self.assertEqual(cd.catalog_entries(token + "\n"), [])
-        for token in ["gpt-5.6-sol-max", "kimi-k2.7-code", "gemini-3.1-pro"]:
+        for token in ["gpt-5.6-sol-max", "kimi-k2.7-code", "gemini-3.1-pro", "o5-pro"]:
             self.assertTrue(cd._is_model_id(token), token)
             self.assertEqual([m for m, _ in cd.catalog_entries(token + "\n")], [token])
+
+    def test_a_digit_less_pin_is_rejected_loudly_rather_than_read_as_delisted(self):
+        # The other half of the tripwire: because `_is_model_id` gates pins too,
+        # tightening it to require a digit must surface as an ExtractionError
+        # (red run, actionable message), never as a silent "delisted pin".
+        text = WORKFLOW.replace('"kimi-k2.7-code"', '"code-supernova"')
+        with self.assertRaises(cd.ExtractionError):
+            cd.extract_panel_models(text)
 
     def test_valid_json_with_a_placeholder_entry_raises(self):
         # Strict JSON is not enough — a placeholder would be "checked" as a pin.
@@ -211,6 +220,15 @@ class CatalogParsingTest(unittest.TestCase):
         entries = dict(cd.catalog_entries(CATALOG))
         self.assertIn("gpt-5.6-sol", entries)
         self.assertEqual(entries["fable-5-max"], "(NO ZDR)")
+
+    def test_a_hyphenated_prose_word_is_not_admitted_as_an_id(self):
+        # `gpt-based` is lowercase, hyphenated and has letters, so before the
+        # digit requirement it parsed as a catalog id — noise in the review-me
+        # list, and a phantom family in the unpinned-families section.
+        entries = cd.catalog_entries(
+            "gpt-based models are listed below\ngpt-5.6-sol-max\nself-hosted options: none\n"
+        )
+        self.assertEqual([m for m, _ in entries], ["gpt-5.6-sol-max"])
 
     def test_a_numbered_list_marker_is_not_mistaken_for_an_id(self):
         # `1.` satisfies "lowercase token with a separator", so without the
@@ -315,11 +333,56 @@ class AnalyzeTest(unittest.TestCase):
         self.assertTrue(report["has_findings"])
         self.assertFalse(report["urgent"])
 
-    def test_ids_from_unpinned_labs_are_not_listed_as_candidates(self):
-        # `fable-*` is a lab the panel does not pin — it belongs in the raw
-        # catalog fold, not in the review-me list.
+    def test_ids_from_unpinned_labs_are_not_listed_as_same_lab_candidates(self):
+        # `fable-*` is a lab the panel does not pin — it belongs in the quieter
+        # unpinned-families catch-all, never in the same-lab review-me list.
         report = analyze()
         self.assertNotIn("fable", [g["lab"] for g in report["unpinned"]])
+        self.assertEqual(
+            [g["lab"] for g in report["unpinned_labs"]], ["fable"]
+        )
+        self.assertEqual(
+            report["unpinned_labs"][0]["candidates"], [{"id": "fable-5-max", "note": "(NO ZDR)"}]
+        )
+
+    def test_a_rebranded_family_from_a_pinned_lab_is_caught_by_the_catch_all(self):
+        # The BE-4852 case: OpenAI ships `o5-pro` alongside `gpt-*`. `lab_of`
+        # reads its family as `o5` (the first `-`/`.`-separated token), which no
+        # pin uses, so the same-lab review-me list cannot see it — the catch-all
+        # is the only thing standing between "a newer model shipped" and silence.
+        report = analyze(catalog=CATALOG + "o5-pro\no5-pro-thinking\n")
+        self.assertEqual(cd.lab_of("o5-pro"), "o5")
+        self.assertNotIn("o5", [g["lab"] for g in report["unpinned"]])
+        families = {g["lab"]: [c["id"] for c in g["candidates"]] for g in report["unpinned_labs"]}
+        self.assertEqual(families["o5"], ["o5-pro", "o5-pro-thinking"])
+        self.assertTrue(report["has_findings"])
+
+    def test_an_unpinned_family_is_a_finding_but_never_urgent(self):
+        # It is a standing watchlist, not breakage: it must gate the sticky issue
+        # (or a rebranded family renders into a body nobody sees) but must not
+        # redden the weekly run.
+        catalog = "\n".join(PANEL) + "\nfable-5-max\n"
+        report = analyze(catalog=catalog)
+        self.assertTrue(report["has_findings"])
+        self.assertFalse(report["urgent"])
+        self.assertIn("unpinned famil", cd.summary_line(report))
+
+    def test_a_catalog_of_exactly_the_pins_still_has_no_unpinned_families(self):
+        # The auto-close path: the catch-all must not make `has_findings` true
+        # unconditionally.
+        report = analyze(catalog="\n".join(PANEL) + "\n")
+        self.assertEqual(report["unpinned_labs"], [])
+        self.assertFalse(report["has_findings"])
+
+    def test_a_delisted_pins_lab_still_counts_as_pinned_for_the_catch_all(self):
+        # A lab whose only pin was just delisted is emphatically still "a lab the
+        # panel pins" — its successors belong in the same-lab review-me list with
+        # the delisted-pin context, not demoted into the quiet fold.
+        catalog = CATALOG.replace("kimi-k2.7-code\n", "kimi-k3-code\n")
+        report = analyze(catalog=catalog)
+        self.assertNotIn("kimi", [g["lab"] for g in report["unpinned_labs"]])
+        kimi = [g for g in report["unpinned"] if g["lab"] == "kimi"][0]
+        self.assertEqual([c["id"] for c in kimi["candidates"]], ["kimi-k3-code"])
 
     def test_a_newly_shipped_same_lab_model_shows_up(self):
         report = analyze(catalog=CATALOG + "claude-opus-5-thinking-max\n")
@@ -384,9 +447,21 @@ class RenderTest(unittest.TestCase):
         self.assertIn("````text", body)
 
     def test_oversized_catalog_is_truncated(self):
-        catalog = CATALOG + ("gpt-filler-x\n" * 6000)
+        # `gpt-filler-1x` is a parseable same-lab id on purpose (a digit-less
+        # `gpt-filler-x` is no longer admitted, which would make this exercise
+        # only the raw-fold clamp and not the report above it).
+        catalog = CATALOG + ("gpt-filler-1x\n" * 6000)
         body = cd.render_body(analyze(catalog=catalog), catalog)
         self.assertIn("truncated", body)
+        self.assertLess(len(body), 65536)
+
+    def test_a_catalog_of_many_distinct_unpinned_families_still_fits_the_body_cap(self):
+        # GitHub rejects an oversized body outright (422), so the section added
+        # for BE-4852 must not be able to push the report past the clamp.
+        catalog = CATALOG + "".join(f"lab{n}-9-max\n" for n in range(4000))
+        report = analyze(catalog=catalog)
+        self.assertGreater(len(report["unpinned_labs"]), 100)
+        body = cd.render_body(report, catalog)
         self.assertLess(len(body), 65536)
 
     def test_a_backtick_in_a_catalog_note_cannot_break_out_of_its_code_span(self):
@@ -405,6 +480,23 @@ class RenderTest(unittest.TestCase):
         self.assertIn("NO-ZDR", body)
         self.assertIn("`gemini-3.1-pro`", body)
         self.assertIn("confidentiality regression", body)
+
+    def test_body_lists_unpinned_families_in_a_collapsed_section(self):
+        catalog = CATALOG + "o5-pro\n"
+        body = cd.render_body(analyze(catalog=catalog), catalog)
+        self.assertIn("unpinned model families", body)
+        self.assertIn("`o5-pro`", body)
+        self.assertIn("`o5`", body)
+        # Collapsed, and below the same-lab review-me list it must not crowd out.
+        self.assertLess(body.index("review-me list"), body.index("unpinned model families"))
+        self.assertIn("<summary>Catalog ids from <b>unpinned model families</b>", body)
+
+    def test_a_backtick_in_an_unpinned_family_note_cannot_break_out(self):
+        # Same public-repo injection surface as the same-lab list — these notes
+        # go through `_inline_code` too, not a bare single-backtick span.
+        catalog = CATALOG + "fable-6-max `@everyone` see docs\n"
+        body = cd.render_body(analyze(catalog=catalog), catalog)
+        self.assertIn("`` `@everyone` see docs ``", body)
 
     def test_clean_body_says_no_drift(self):
         catalog = "\n".join(PANEL) + "\n"

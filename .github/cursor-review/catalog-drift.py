@@ -10,7 +10,7 @@ swaps found by the BE-4817 audit (Opus 5 on 2026-07-24, Kimi K3 on ~2026-07-26)
 landed in that window and were caught by hand, not by CI.
 
 This script is the machine half of that audit. Given the workflow file and the
-raw output of `cursor-agent models`, it reports four kinds of drift:
+raw output of `cursor-agent models`, it reports five kinds of drift:
 
   * **delisted pin** — a pinned id (panel or judge) is absent from the live
     catalog. Urgent: consumer PRs will start failing preflight.
@@ -24,6 +24,11 @@ raw output of `cursor-agent models`, it reports four kinds of drift:
     picking "newest highest-reasoning ZDR-eligible" needs human judgment, and ZDR
     especially — Cursor only marks NO-ZDR inline (e.g. a `(NO ZDR)` suffix), so any
     such marker on the line is surfaced verbatim rather than interpreted.
+  * **unpinned model families** — catalog ids whose family prefix matches no pin
+    at all. Quieter than the above (mostly labs the panel will never pin, so it
+    renders collapsed and is never `urgent`), but it is the ONLY place a lab the
+    panel already pins can surface after rebranding under a new prefix — see
+    `lab_of` and the catch-all in `analyze`.
   * **stale audit date** — the `last checked YYYY-MM-DD` comment is older than
     `--stale-days` (or missing entirely).
 
@@ -71,6 +76,12 @@ _LAST_CHECKED = re.compile(r"last checked\s+(\d{4}-\d{2}-\d{2})", re.IGNORECASE)
 # carries at least one `-` or `.` — that separator requirement is what keeps
 # prose lines ("Available models:") out of the parsed id list.
 _ID_TOKEN = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+# Every model id a lab has shipped to Cursor's catalog carries a version number
+# somewhere (`gpt-5.6-sol-max`, `claude-opus-4-8-thinking-max`, `kimi-k2.7-code`,
+# `o5-pro`), and a hyphenated PROSE word at the head of a catalog line does not
+# ("`gpt-based` models are …"). Requiring a digit is what separates the two — see
+# `_is_model_id`.
+_HAS_DIGIT = re.compile(r"[0-9]")
 _BULLET = re.compile(r"^[-*>•\s]+")
 # The ONE catalog marker worth interpreting rather than merely reproducing: a
 # PINNED model reclassified non-ZDR means private review diffs are flowing to a
@@ -93,17 +104,36 @@ class ExtractionError(Exception):
 def _is_model_id(token):
     """True for a bare catalog/model id — see `_ID_TOKEN`.
 
-    The letter requirement keeps a numbered-list marker (`1.` in a hypothetical
-    `1. gpt-5.6-sol-max` catalog line) from parsing as an id. That matters more
-    than it looks: `present()` trusts this parse, so a catalog of ['1.', '2.']
-    would look perfectly valid while reporting every real pin as delisted.
-    Parsing nothing instead routes it to `main`'s diagnostic "no ids could be
-    parsed — the format may have changed" hard exit.
+    Three requirements beyond the character class, each closing a different
+    misparse:
+
+      * a `-`/`.` **separator**, which keeps prose lines ("Available models:")
+        out of the parsed id list;
+      * a **letter**, which keeps a numbered-list marker (`1.` in a hypothetical
+        `1. gpt-5.6-sol-max` catalog line) from parsing as an id. That matters
+        more than it looks: `present()` trusts this parse, so a catalog of
+        ['1.', '2.'] would look perfectly valid while reporting every real pin as
+        delisted;
+      * a **digit**, which keeps a hyphenated prose word at the head of a catalog
+        line ("`gpt-based` models are …") from being admitted as a bogus id — it
+        would otherwise add noise to the review-me list and, since BE-4852, mint
+        a phantom `gpt-based`-style entry in the unpinned-families section.
+
+    Parsing nothing at all instead routes a garbled catalog to `main`'s
+    diagnostic "no ids could be parsed — the format may have changed" hard exit.
+
+    All three bind the PIN validator too (`extract_panel_models` /
+    `extract_judge_model` call this): a shape the catalog parser would never emit
+    must not be accepted as a pin, or that pin reads as delisted every run. If a
+    lab ever ships a separator-less or digit-less id, relax the rule HERE — one
+    function, both sides — and `test_pin_and_catalog_id_shape_rules_agree` keeps
+    them honest.
     """
     return (
         bool(_ID_TOKEN.match(token))
         and re.search(r"[-.]", token) is not None
         and re.search(r"[a-z]", token) is not None
+        and _HAS_DIGIT.search(token) is not None
     )
 
 
@@ -163,10 +193,10 @@ def extract_panel_models(workflow_text):
     if bad:
         raise ExtractionError(
             f"the /tmp/models.json heredoc yielded entries that are not bare model ids: {bad!r} "
-            "(expected a single lowercase token containing a `-` or `.`, e.g. "
-            "`gpt-5.6-sol-max`). If a lab has shipped a separator-less id, relax `_is_model_id` "
-            "here AND in the catalog parser together — they must agree, or the pin will read as "
-            "delisted every run."
+            "(expected a single lowercase token containing a `-` or `.` AND a digit, e.g. "
+            "`gpt-5.6-sol-max`). If a lab has shipped a separator-less or digit-less id, relax "
+            "`_is_model_id` — it is the ONE rule the pin validator and the catalog parser share, "
+            "and they must agree, or the pin will read as delisted every run."
         )
     return models
 
@@ -281,7 +311,15 @@ def present(model_id, catalog_ids):
 
 
 def lab_of(model_id):
-    """Lab prefix of an id — `gpt-5.6-sol-max` -> `gpt` (preflight's split)."""
+    """Lab prefix of an id — `gpt-5.6-sol-max` -> `gpt` (preflight's split).
+
+    A *family* prefix, strictly — not a vendor. One lab can ship under several
+    (OpenAI's `o<n>` series alongside `gpt-*` is the precedent), and nothing in a
+    bare id says the two belong together. Mapping them would need a hand-kept
+    alias table, which is exactly the maintenance burden deriving labs from the
+    pins avoids; `analyze` handles the rebrand case with the unpinned-families
+    catch-all instead (BE-4852).
+    """
     return re.split(r"[-.]", model_id, maxsplit=1)[0].lower()
 
 
@@ -332,6 +370,7 @@ def analyze(panel_models, judge_model, catalog_text, last_checked, today, stale_
         if lab not in labs:
             labs.append(lab)
     pinned_set = set(pinned)
+    pinned_labs = set(labs)
     unpinned = []
     for lab in labs:
         candidates = [
@@ -345,6 +384,28 @@ def analyze(panel_models, judge_model, catalog_text, last_checked, today, stale_
                     "candidates": candidates,
                 }
             )
+
+    # The catch-all (BE-4852): catalog ids whose family prefix matches NO pin.
+    # `lab_of` equates a lab with an id's first token, so an existing lab
+    # shipping under a NEW family prefix — OpenAI's `o<n>` series alongside
+    # `gpt-*` is the precedent — resolves to a "lab" nobody pins and would drop
+    # out of the review-me list above entirely. That is precisely the "a newer
+    # model shipped and nobody noticed" case this whole check exists to catch, so
+    # it gets its own quieter section rather than a hand-maintained prefix→lab
+    # alias table (which is the maintenance burden deriving labs from the pins
+    # exists to avoid). Most of what lands here is genuinely uninteresting —
+    # labs Comfy will never pin — hence: a finding, but never `urgent`, and
+    # rendered collapsed.
+    unpinned_labs = []
+    for model_id, note in entries:
+        lab = lab_of(model_id)
+        if lab in pinned_labs:
+            continue
+        group = next((g for g in unpinned_labs if g["lab"] == lab), None)
+        if group is None:
+            group = {"lab": lab, "candidates": []}
+            unpinned_labs.append(group)
+        group["candidates"].append({"id": model_id, "note": note})
 
     audit = {
         "last_checked": last_checked.isoformat() if last_checked else None,
@@ -365,11 +426,19 @@ def analyze(panel_models, judge_model, catalog_text, last_checked, today, stale_
         "delisted": delisted,
         "zdr_risk": zdr_risk,
         "unpinned": unpinned,
+        "unpinned_labs": unpinned_labs,
         "audit": audit,
         # `urgent` is what reddens the weekly run: a pin the preflight is about
-        # to reject, or a pin that is no longer ZDR-eligible.
+        # to reject, or a pin that is no longer ZDR-eligible. `unpinned_labs` is
+        # deliberately NOT here — it is a standing watchlist, not a breakage.
         "urgent": bool(delisted or zdr_risk),
-        "has_findings": bool(delisted or zdr_risk or unpinned or audit["stale"]),
+        # `unpinned_labs` DOES count, or a rebranded family would render into a
+        # body nobody ever sees (a clean `has_findings` closes the sticky issue).
+        # It does not newly pin the issue open: `unpinned` alone already makes
+        # this true on any real catalog, which lists more tiers per pinned lab
+        # than the panel pins — the auto-close path was already reserved for a
+        # catalog trimmed to exactly the pins.
+        "has_findings": bool(delisted or zdr_risk or unpinned or unpinned_labs or audit["stale"]),
     }
 
 
@@ -390,6 +459,13 @@ def summary_line(report):
     count = sum(len(g["candidates"]) for g in report["unpinned"])
     if count:
         bits.append(f"{count} unpinned same-lab id{'s' if count != 1 else ''}")
+    families = report.get("unpinned_labs") or []
+    if families:
+        ids = sum(len(g["candidates"]) for g in families)
+        bits.append(
+            f"{len(families)} unpinned famil{'y' if len(families) == 1 else 'ies'} "
+            f"({ids} id{'s' if ids != 1 else ''})"
+        )
     audit = report["audit"]
     if audit["stale"]:
         if audit["last_checked"] is None:
@@ -426,6 +502,14 @@ def _inline_code(text):
     return f"{delim}{pad}{flat}{pad}{delim}"
 
 
+def _candidate_list(candidates):
+    """Bullet list of `{id, note}` rows — shared by both unpinned sections."""
+    return "\n".join(
+        f"- `{c['id']}`" + (f" — {_inline_code(c['note'])}" if c["note"] else "")
+        for c in candidates
+    )
+
+
 def render_body(report, catalog_text, run_url=None, checked_at=None):
     """Render the sticky issue body (also used as the run's step summary)."""
     pins = report["pins"]
@@ -441,8 +525,9 @@ def render_body(report, catalog_text, run_url=None, checked_at=None):
         )
     else:
         out.append(
-            "No drift: every pinned model id is present in Cursor's live catalog, no unpinned "
-            "same-lab ids are available, and the audit date is current."
+            "No drift: every pinned model id is present in Cursor's live catalog, the catalog "
+            "offers no unpinned ids — from a pinned lab or an unpinned family — and the audit "
+            "date is current."
         )
 
     meta = []
@@ -493,12 +578,34 @@ def render_body(report, catalog_text, run_url=None, checked_at=None):
         for group in report["unpinned"]:
             pinned_now = ", ".join(f"`{m}`" for m in group["pinned"]) or "_none_"
             out.append(f"**`{group['lab']}`** (pinned: {pinned_now})")
-            out.append(
-                "\n".join(
-                    f"- `{c['id']}`" + (f" — {_inline_code(c['note'])}" if c["note"] else "")
-                    for c in group["candidates"]
-                )
-            )
+            out.append(_candidate_list(group["candidates"]))
+
+    families = report.get("unpinned_labs") or []
+    if families:
+        # Collapsed on purpose: most of this is labs the panel will never pin, so
+        # it must not crowd out the same-lab review-me list above. It exists for
+        # the one row that matters — a lab already on the panel shipping under a
+        # new family prefix, which `lab_of` cannot tell from a new vendor.
+        detail = [
+            "<details>",
+            f"<summary>Catalog ids from <b>unpinned model families</b> "
+            f"({', '.join('`' + g['lab'] + '`' for g in families)})</summary>",
+            "",
+            "Families the panel pins **nothing** from. Usually just labs Comfy does not use — but "
+            "the lab of an id is its first `-`/`.`-separated token, so a lab the panel DOES pin "
+            "shipping under a new family prefix (OpenAI's `o<n>` series alongside `gpt-*` is the "
+            "precedent) lands here rather than in the review-me list above. Scan for a familiar lab "
+            "wearing an unfamiliar prefix; ignore the rest. Same caveats as above — notes are "
+            "verbatim, an unmarked id is **not** thereby confirmed ZDR-eligible.",
+        ]
+        for group in families:
+            detail.append("")
+            detail.append(f"**`{group['lab']}`**")
+            detail.append("")
+            detail.append(_candidate_list(group["candidates"]))
+        detail.append("")
+        detail.append("</details>")
+        out.append("\n".join(detail))
 
     if audit["stale"]:
         if audit["last_checked"] is None:

@@ -86,7 +86,11 @@ reclassified non-ZDR — is machine-checked weekly by
 [`cursor-review-catalog-drift.yml`](../workflows/cursor-review-catalog-drift.yml),
 which diffs the pins against `cursor-agent models` and files one sticky
 `[cursor-review catalog drift]` issue listing delisted pins, **pins whose catalog
-line now says NO-ZDR**, unpinned same-lab catalog ids, and an audit date older
+line now says NO-ZDR**, unpinned same-lab catalog ids, catalog ids from families
+the panel pins nothing from (a quieter, collapsed catch-all — a lab equates to an
+id's first `-`/`.`-separated token, so a lab the panel *does* pin can only
+surface there after rebranding under a new prefix, e.g. OpenAI's `o<n>` series
+alongside `gpt-*`), and an audit date older
 than 30 days. It reports; it never bumps a pin — picking the newest
 highest-reasoning **ZDR-eligible** model stays a human call (Cursor marks only
 NO-ZDR models inline, e.g. Fable's `(NO ZDR)` suffix). That marker is the one
@@ -107,7 +111,7 @@ it has gone stale.
 | [`extract-findings.py`](extract-findings.py) | Parses a cell's raw `cursor-agent` output into a normalized findings record. Always emits structured JSON — even on empty output or parse failure — so the consolidate step has uniform input. |
 | [`post-review.py`](post-review.py) | Reads the judge's consolidated findings and posts **one** PR review with line-anchored inline comments and severity badges. |
 | [`gate-unresolved.py`](gate-unresolved.py) | The opt-in blocking gate (`blocking: true`). Queries the PR's review threads and exits non-zero while any cursor-review finding thread is unresolved. |
-| [`catalog-drift.py`](catalog-drift.py) | Backs the weekly catalog-drift check. Extracts the pins from `cursor-review.yml`, diffs them against raw `cursor-agent models` output, and renders the sticky issue title + body (delisted pins, pins marked NO-ZDR, unpinned same-lab ids, stale audit date). Reports only — it never edits a pin. |
+| [`catalog-drift.py`](catalog-drift.py) | Backs the weekly catalog-drift check. Extracts the pins from `cursor-review.yml`, diffs them against raw `cursor-agent models` output, and renders the sticky issue title + body (delisted pins, pins marked NO-ZDR, unpinned same-lab ids, catalog ids from unpinned families, stale audit date). Reports only — it never edits a pin. |
 | [`slack-notify.sh`](slack-notify.sh) | Sends the start/complete Slack DMs to the triggerer (no-ops without a token). |
 
 ## Adopt it in your repo
