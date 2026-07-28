@@ -69,31 +69,32 @@ from datetime import datetime, timezone
 _FINDER_JOB_HINTS = ("finder", "audit_find")
 
 # A finder job that reached `success` spent the (billed) audit — nothing else to
-# check, the agent step is upstream of every step that could still fail. `skipped`
-# (the interval-skip case) and a null conclusion never count at all. Every other
-# ending — `failure`, `timed_out`, `cancelled` — may or may not have spent the
-# audit, so it needs EVIDENCE; see _AGENT_EVIDENCE_CONCLUSIONS below.
+# check, the agent step is upstream of every step that could still fail.
 _AUDITED_CONCLUSIONS = {"success"}
 
-# A non-success ending counts as a spent audit only if the billed agent step
-# actually started (BE-4814). Counting every failure keeps a run that spent money
-# but died at a LATER step (e.g. the JSON assert) from re-spending on the very
-# next daily tick — that half is still wanted. But the finder job can also die
-# far BEFORE the agent: checkout, the asset load, the prompt build, the runner
-# itself. Those spend nothing, and counting them advances the cadence clock, so a
-# typo'd input or a broken caller goes quiet for a whole GROOM_INTERVAL_DAYS
-# window instead of recurring (and being noticed) daily. This gate is fail-OPEN
-# everywhere else; that was the one branch that failed closed.
+# The two endings that definitively spent NOTHING, so they never even reach the
+# evidence path: `skipped` is this very gate's own interval-skip, and a null
+# conclusion means the run is not finished. Deliberately a DENYLIST — every other
+# ending may or may not have billed, and is resolved by the per-step evidence in
+# `agent_step_started`: if the agent step ran, the audit was spent no matter how
+# the job was finally stamped. An allowlist here would have to enumerate the whole
+# API vocabulary (`failure`, `timed_out`, `cancelled`, and the rarer `neutral` /
+# `stale` / `action_required`), and any conclusion it forgot would silently mean
+# "billed, but never counted" — i.e. re-spent on every subsequent daily tick.
 #
-# `timed_out` and `cancelled` belong here alongside `failure` and are the
-# EXPENSIVE members of the set: the finder job carries `timeout-minutes: 40`, so
-# an agent that hangs bills the full window and *then* trips the job timeout —
-# the single costliest outcome this module sees. Leaving those conclusions out of
-# the evidence path meant they could never count, so that 40 minutes of billing
-# was forgotten and re-spent on every subsequent daily tick. They still need the
-# same per-step evidence as a `failure` (a run cancelled during checkout bills
-# nothing), which is exactly what `agent_step_started` supplies.
-_AGENT_EVIDENCE_CONCLUSIONS = {"failure", "timed_out", "cancelled", "canceled"}
+# `timed_out` and `cancelled` are the EXPENSIVE members: the finder job carries
+# `timeout-minutes: 40`, so an agent that hangs bills the full window and *then*
+# trips the job timeout — the single costliest outcome this module sees.
+#
+# The evidence requirement itself is BE-4814. Counting a failure that spent money
+# but died at a LATER step (e.g. the JSON assert) keeps it from re-spending on the
+# very next daily tick — that half is wanted. But the finder job can also die far
+# BEFORE the agent: checkout, the asset load, the prompt build, the runner itself.
+# Those spend nothing, and counting them advances the cadence clock, so a typo'd
+# input or a broken caller goes quiet for a whole GROOM_INTERVAL_DAYS window
+# instead of recurring (and being noticed) daily. This gate is fail-OPEN
+# everywhere else; that was the one branch that failed closed.
+_NEVER_AUDITED_CONCLUSIONS = {"skipped", ""}
 
 # The billed agent step inside the finder job, matched EXACTLY (after strip)
 # against the `steps[]` the runs-jobs API returns per job. The literal lives here,
@@ -314,11 +315,12 @@ def agent_step_started(job) -> bool:
 def run_audited(jobs) -> bool:
     """True if a run's jobs show the finder actually ran (not an interval-skip).
 
-    A `success` counts on the job conclusion alone. A `failure`/`timed_out`/
-    `cancelled` counts only with positive evidence that the agent step started
-    (BE-4814) — the job can end long before it (checkout, asset load, prompt
-    build), and those runs bill nothing, so treating them as a spent audit would
-    advance the cadence clock and hide the breakage for a whole interval.
+    A `success` counts on the job conclusion alone. Every other ending except the
+    two that spent nothing by definition (`skipped`, unfinished) counts only with
+    positive evidence that the agent step started (BE-4814) — the job can end long
+    before it (checkout, asset load, prompt build), and those runs bill nothing,
+    so treating them as a spent audit would advance the cadence clock and hide the
+    breakage for a whole interval.
     """
     for job in jobs if isinstance(jobs, list) else []:
         if not isinstance(job, dict):
@@ -332,7 +334,7 @@ def run_audited(jobs) -> bool:
         conclusion = _text(job.get("conclusion")).lower()
         if conclusion in _AUDITED_CONCLUSIONS:
             return True
-        if conclusion in _AGENT_EVIDENCE_CONCLUSIONS and agent_step_started(job):
+        if conclusion not in _NEVER_AUDITED_CONCLUSIONS and agent_step_started(job):
             return True
     return False
 
@@ -424,30 +426,55 @@ def fetch_run_jobs(repo: str, run_id, run=subprocess.run, attempt=None):
     return payload.get("jobs", []) if isinstance(payload, dict) else []
 
 
-def run_audited_across_attempts(repo, wf_run, run=subprocess.run) -> bool:
-    """`run_audited` for a run, counting a spent audit on ANY of its attempts.
+def finder_job_started_at(jobs):
+    """`started_at` of the finder job in one attempt's jobs payload, or None."""
+    for job in jobs if isinstance(jobs, list) else []:
+        if not isinstance(job, dict):
+            continue
+        if any(hint in _text(job.get("name")).lower() for hint in _FINDER_JOB_HINTS):
+            return _text(job.get("started_at")) or None
+    return None
 
-    The plain jobs endpoint returns only the latest attempt. A re-run that dies
-    before the agent would therefore erase the evidence of an earlier attempt that
-    DID reach it, and the already-paid audit would repeat on the next tick — the
-    same forgotten-spend bug as a pre-agent failure, one level up. So when the
-    latest attempt shows nothing and the run has earlier ones, walk them back.
+
+def audited_run_anchor(repo, wf_run, run=subprocess.run):
+    """The timestamp to anchor the cadence clock on for a run, or None if unaudited.
+
+    `run_audited` for the run, counting a spent audit on ANY of its attempts. The
+    plain jobs endpoint returns only the latest attempt, so a re-run that dies
+    before the agent would erase the evidence of an earlier attempt that DID reach
+    it, and the already-paid audit would repeat on the next tick — the same
+    forgotten-spend bug as a pre-agent failure, one level up. When the latest
+    attempt shows nothing and the run has earlier ones, walk them back.
 
     Costs nothing in the normal case: `run_attempt` is 1 for every run nobody
     re-ran by hand, and the loop is skipped entirely.
     """
-    if run_audited(fetch_run_jobs(repo, wf_run.get("id"), run=run)):
-        return True
+    run_id = wf_run.get("id")
+    if run_audited(fetch_run_jobs(repo, run_id, run=run)):
+        return _text(wf_run.get("run_started_at")) or None
     try:
         attempts = int(wf_run.get("run_attempt") or 1)
     except (TypeError, ValueError):
         attempts = 1
     # Newest-first, excluding the latest (already read above), and bounded so a
     # pathologically re-run entry can't turn the cheap gate into a request storm.
-    for attempt in range(min(attempts, _MAX_ATTEMPTS_SCANNED) - 1, 0, -1):
-        if run_audited(fetch_run_jobs(repo, wf_run.get("id"), run=run, attempt=attempt)):
-            return True
-    return False
+    # The window must slide with `attempts` — capping the START at
+    # _MAX_ATTEMPTS_SCANNED would scan the OLDEST attempts of a heavily re-run
+    # entry and miss a billed audit sitting on a recent one.
+    for attempt in range(attempts - 1, max(0, attempts - _MAX_ATTEMPTS_SCANNED), -1):
+        jobs = fetch_run_jobs(repo, run_id, run=run, attempt=attempt)
+        if run_audited(jobs):
+            # `run_started_at` tracks the LATEST attempt, so anchoring on it here
+            # would date a week-old paid audit to today's pre-agent re-run and
+            # suppress the next full interval — the fail-CLOSED direction this
+            # gate exists to avoid. Prefer the audited attempt's own finder-job
+            # start; fall back to the run's creation (older anchor = more elapsed
+            # days = fail-open) rather than the re-run time.
+            return (finder_job_started_at(jobs)
+                    or _text(wf_run.get("created_at"))
+                    or _text(wf_run.get("run_started_at"))
+                    or None)
+    return None
 
 
 def find_last_audited_run_at(repo, workflow_file, current_run_id, run=subprocess.run):
@@ -456,6 +483,9 @@ def find_last_audited_run_at(repo, workflow_file, current_run_id, run=subprocess
     Walks the caller workflow's runs newest-first, skips the current run and any
     still-in-progress run, and returns the first whose finder job actually ran.
     Returns None if none is found within the scanned window (-> fail-open run).
+
+    The anchor is the run's `run_started_at`, except where only an EARLIER attempt
+    supplied the evidence — see `audited_run_anchor`.
     """
     current = str(current_run_id) if current_run_id is not None else None
     for wf_run in fetch_workflow_runs(repo, workflow_file, run=run):
@@ -465,8 +495,9 @@ def find_last_audited_run_at(repo, workflow_file, current_run_id, run=subprocess
             continue
         if wf_run.get("status") != "completed":
             continue
-        if run_audited_across_attempts(repo, wf_run, run=run):
-            return wf_run.get("run_started_at")
+        anchor = audited_run_anchor(repo, wf_run, run=run)
+        if anchor:
+            return anchor
     return None
 
 

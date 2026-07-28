@@ -379,6 +379,22 @@ class CancelledAndTimedOutTest(unittest.TestCase):
             step = agent_step(conclusion="cancelled", started_at=started, completed_at=completed)
             self.assertFalse(interval.run_audited([finder_job("timed_out", [step])]), (started, completed))
 
+    def test_any_ending_that_is_not_skipped_or_unfinished_takes_the_evidence_path(self):
+        # The rule is a DENYLIST, not an enumeration of endings: if the agent step
+        # ran, the audit was spent no matter how the job was finally stamped. An
+        # allowlist would have to name the whole API vocabulary, and anything it
+        # forgot would read as "billed but never counted", i.e. re-spent daily.
+        for conclusion in ("failure", "timed_out", "cancelled", "canceled",
+                           "neutral", "stale", "action_required", "something_new"):
+            self.assertTrue(interval.run_audited([finder_job(conclusion, [agent_step()])]), conclusion)
+            self.assertFalse(interval.run_audited([finder_job(conclusion, [pre_agent_step()])]), conclusion)
+
+    def test_the_two_endings_that_spent_nothing_never_reach_the_evidence_path(self):
+        # `skipped` is this gate's own interval-skip and a null conclusion means
+        # unfinished — neither can have billed, whatever the steps payload claims.
+        for conclusion in (None, "", "skipped"):
+            self.assertFalse(interval.run_audited([finder_job(conclusion, [agent_step()])]), conclusion)
+
     def test_a_timed_out_agent_does_not_re_spend_on_the_next_tick(self):
         # End-to-end, the harm this closes: yesterday's run hung and burned the
         # full 40-minute timeout. Today's tick must SKIP — the audit was paid.
@@ -443,20 +459,69 @@ class EarlierAttemptTest(unittest.TestCase):
         interval.evaluate("o/r", "ci-groom.yml", 100, 7.0, "schedule", NOW, run=spy)
         self.assertFalse([u for u in seen if "/attempts/" in u], seen)
 
-    def test_the_attempt_walk_is_bounded(self):
-        # A pathological re-run count can't turn the cheap gate into a request
-        # storm — the walk is capped, newest-first.
+    def attempts_fetched(self, runs, latest, by_attempt=None):
+        """Which attempt numbers the walk actually asked for, in request order."""
         seen = []
-        latest = {"99": [finder_job("failure", [pre_agent_step()])], "90": [finder_job("success")]}
-        base = make_gh_stub(self.runs(50), latest, {})
+        base = make_gh_stub(runs, latest, by_attempt or {})
 
         def spy(cmd, **kwargs):
             seen.append(cmd[-1])
             return base(cmd, **kwargs)
 
-        interval.evaluate("o/r", "ci-groom.yml", 100, 7.0, "schedule", NOW, run=spy)
-        attempts_hit = [u for u in seen if "/attempts/" in u]
-        self.assertEqual(len(attempts_hit), interval._MAX_ATTEMPTS_SCANNED - 1, attempts_hit)
+        decision = interval.evaluate("o/r", "ci-groom.yml", 100, 7.0, "schedule", NOW, run=spy)
+        return [int(u.split("/attempts/")[1].split("/")[0]) for u in seen if "/attempts/" in u], decision
+
+    def test_the_attempt_walk_is_bounded_AND_reads_the_NEWEST_earlier_attempts(self):
+        # A pathological re-run count can't turn the cheap gate into a request
+        # storm — but the cap must slide the window with `run_attempt`, not pin it
+        # to the bottom. Asserting only the COUNT passes either way and would mask
+        # a walk that scans attempts 1..4 of a 50-attempt run: a billed audit on a
+        # recent attempt (49) would go unread and be re-spent on the next tick.
+        latest = {"99": [finder_job("failure", [pre_agent_step()])], "90": [finder_job("success")]}
+        fetched, _ = self.attempts_fetched(self.runs(50), latest)
+        self.assertEqual(fetched, [49, 48, 47, 46], fetched)
+        self.assertEqual(len(fetched), interval._MAX_ATTEMPTS_SCANNED - 1, fetched)
+        # Under the cap, the walk simply reaches attempt 1 — nothing is skipped.
+        fetched, _ = self.attempts_fetched(self.runs(3), latest)
+        self.assertEqual(fetched, [2, 1], fetched)
+
+    def test_a_billed_audit_on_a_recent_attempt_of_a_heavily_re_run_entry_counts(self):
+        # The harm the direction bug caused, end to end: attempt 49 of 50 paid for
+        # the agent, so today's tick must SKIP rather than re-spend it.
+        latest = {"99": [finder_job("failure", [pre_agent_step()])], "90": [finder_job("success")]}
+        by_attempt = {"99/49": [billed_finder_job()]}
+        d = interval.evaluate("o/r", "ci-groom.yml", 100, 7.0, "schedule", NOW,
+                              run=make_gh_stub(self.runs(50), latest, by_attempt))
+        self.assertFalse(d["should_run"], d["reason"])
+
+    def test_the_anchor_is_the_audited_attempt_not_the_re_run(self):
+        # `run_started_at` tracks the LATEST attempt. If the paid attempt ran 8
+        # days ago and someone re-ran the entry today (dying pre-agent), anchoring
+        # on the run means "audited today" and suppresses the next full interval —
+        # fail-CLOSED, the direction this gate exists to avoid. Anchor on the
+        # audited attempt's own finder-job start instead, so the tick RUNS.
+        runs = self.runs(2)
+        runs[1]["run_started_at"] = iso(0.1)   # today's pre-agent re-run
+        runs[1]["created_at"] = iso(8)
+        latest = {"99": [finder_job("failure", [pre_agent_step()])], "90": [finder_job("success")]}
+        billed = billed_finder_job()
+        billed["started_at"] = iso(8)
+        d = interval.evaluate("o/r", "ci-groom.yml", 100, 7.0, "schedule", NOW,
+                              run=make_gh_stub(runs, latest, {"99/1": [billed]}))
+        self.assertTrue(d["should_run"], d["reason"])
+        self.assertEqual(d["last_run_at"], iso(8))
+
+    def test_a_missing_attempt_timestamp_falls_back_to_the_older_anchor(self):
+        # No finder-job `started_at`: fall back to the run's CREATION, not its
+        # re-run time. An older anchor means more elapsed days, i.e. fail-open.
+        runs = self.runs(2)
+        runs[1]["run_started_at"] = iso(0.1)
+        runs[1]["created_at"] = iso(8)
+        latest = {"99": [finder_job("failure", [pre_agent_step()])], "90": [finder_job("success")]}
+        d = interval.evaluate("o/r", "ci-groom.yml", 100, 7.0, "schedule", NOW,
+                              run=make_gh_stub(runs, latest, {"99/1": [billed_finder_job()]}))
+        self.assertTrue(d["should_run"], d["reason"])
+        self.assertEqual(d["last_run_at"], iso(8))
 
     def test_a_garbage_run_attempt_degrades_to_the_latest_attempt_only(self):
         latest = {"99": [billed_finder_job()], "90": [finder_job("success")]}

@@ -214,8 +214,13 @@ real groom, so a skipped tick costs ~nothing (it never reaches the finder).
   hides a broken caller for a full interval. A `success` needs no such check (the
   agent step is upstream of everything that could still fail, and no `if:`
   guards it).
-  - `timed_out` and `cancelled` take the same evidence path as `failure`, and
-    are the expensive members of it: the finder job runs under
+  - Which endings take the evidence path is a **denylist**, not an enumeration:
+    only `skipped` (this gate's own interval-skip) and an unfinished run are
+    excluded outright. Everything else — `failure`, `timed_out`, `cancelled`,
+    and the rarer `neutral`/`stale`/`action_required` — is decided by the step
+    evidence, because if the agent ran, the audit was spent however the job was
+    finally stamped. An allowlist would silently forget any ending it missed.
+  - `timed_out`/`cancelled` are the expensive members: the finder job runs under
     `timeout-minutes: 40`, so a **hung agent bills the whole window** and only
     then trips the timeout. GitHub stamps that in-flight step `cancelled` —
     indistinguishable *by conclusion* from a step that was never reached, so the
@@ -224,7 +229,11 @@ real groom, so a skipped tick costs ~nothing (it never reaches the finder).
   - Evidence is looked for across a run's **earlier attempts**, not just the
     latest. The jobs endpoint reports only the newest attempt, so a manual
     re-run that dies in checkout would otherwise erase the record of an earlier
-    attempt that did reach the agent — and re-spend that audit.
+    attempt that did reach the agent — and re-spend that audit. The walk is
+    newest-first and bounded, and when an earlier attempt supplies the evidence
+    the clock anchors on **that attempt's** finder-job start, not the run's
+    `run_started_at` (which tracks the re-run and would date a week-old audit to
+    today).
 - **`workflow_dispatch` bypasses THIS gate** — a manual dispatch is never
   interval-throttled. It is not a blanket "always runs": the volume gate is a
   second, independent throttle, so a live dispatch into a quiescent repo can
