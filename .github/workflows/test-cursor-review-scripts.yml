@@ -4,16 +4,25 @@ name: Test cursor-review scripts
 # extract-findings.py JSON parser in particular). These scripts drive the
 # review panel + judge consolidation, so a parser regression silently breaks
 # every consumer repo's review — cheap to guard with a unit run on change.
+#
+# cursor-review.yml itself is in the path filter because catalog-drift.py reads
+# the model pins OUT of it (BE-4819) — the test suite asserts those anchors
+# still parse, and that assertion is only worth anything if it runs when the
+# file it parses changes.
 
 on:
   pull_request:
     paths:
       - '.github/cursor-review/**'
+      - '.github/workflows/cursor-review.yml'
+      - '.github/workflows/cursor-review-catalog-drift.yml'
       - '.github/workflows/test-cursor-review-scripts.yml'
   push:
     branches: [main]
     paths:
       - '.github/cursor-review/**'
+      - '.github/workflows/cursor-review.yml'
+      - '.github/workflows/cursor-review-catalog-drift.yml'
       - '.github/workflows/test-cursor-review-scripts.yml'
 
 permissions:

@@ -1,0 +1,152 @@
+name: Cursor Review — catalog drift check
+
+# Weekly guard against the cursor-review panel pins going stale silently
+# (BE-4819). The per-PR preflight in cursor-review.yml already fails loud when a
+# PINNED id is delisted — but only at review time, on somebody's PR, after the
+# pin has already gone bad; and by design it never notices a NEWER model
+# shipping. The only guard against that second case was a `last checked <date>`
+# comment above the pins, which went stale inside 13 days (the BE-4817 audit
+# found two swaps — Opus 5 on 2026-07-24, Kimi K3 on ~2026-07-26 — that landed
+# in that window and were caught by hand, not by CI).
+#
+# This run reads the pins OUT OF cursor-review.yml (never a duplicated list, so
+# it stays zero-maintenance across pin bumps), diffs them against
+# `cursor-agent models`, and reports three things through ONE sticky issue
+# (title prefix `[cursor-review catalog drift]`, updated in place, closed
+# automatically when a run finds nothing):
+#
+#   * a delisted pin — urgent, consumer PRs are about to go red at preflight;
+#   * unpinned same-lab catalog ids — a REVIEW-ME list, not a recommendation
+#     (newest highest-reasoning ZDR-eligible is a human call);
+#   * a `last checked` audit date older than 30 days.
+#
+# The `last checked` comment stays the human-audit record — this check does not
+# write it, it just tells you when it has gone stale.
+#
+# Not reusable on purpose: it reads THIS repo's cursor-review.yml, which is the
+# single source of truth for every consumer's pins.
+
+on:
+  schedule:
+    # Mondays 06:17 UTC — off the hour, so it doesn't queue behind the
+    # top-of-hour scheduling spike.
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+# One drift run at a time: two overlapping runs would race on the sticky issue
+# (both reading "no open issue" and filing a duplicate). Queue instead of
+# cancelling so a manual dispatch during a scheduled run still reports.
+concurrency:
+  group: cursor-review-catalog-drift
+  cancel-in-progress: false
+
+jobs:
+  drift:
+    name: Compare pins against the live catalog
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Cursor agent CLI
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+        run: |
+          set -euo pipefail
+          # Unlike the per-PR preflight there is no fork case here — a scheduled
+          # run in this repo either has the org secret or the check is broken.
+          # Fail rather than "skip cleanly", which would be a green run that
+          # checked nothing (the exact silent-staleness this workflow exists to
+          # end).
+          if [ -z "${CURSOR_API_KEY:-}" ]; then
+            echo "::error::CURSOR_API_KEY is not available to this workflow — the drift check cannot read the live catalog. Grant the org secret to this repo (it already backs ci-cursor-review.yml)."
+            exit 1
+          fi
+          curl https://cursor.com/install -fsSL | bash
+          echo "$HOME/.cursor/bin" >> "$GITHUB_PATH"
+
+      - name: Fetch the live Cursor catalog
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+        run: |
+          set -euo pipefail
+          # Same "better red than silent" stance as the preflight: an auth or
+          # network failure here is a hard fail, not an assumed-clean run.
+          if ! cursor-agent models > /tmp/catalog.txt 2>/tmp/catalog-stderr.txt; then
+            echo "::error::'cursor-agent models' failed — cannot check the panel pins against the live catalog."
+            cat /tmp/catalog-stderr.txt
+            exit 1
+          fi
+          echo "=== Cursor catalog ==="
+          cat /tmp/catalog.txt
+
+      - name: Compare pins against the catalog
+        id: drift
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 .github/cursor-review/catalog-drift.py \
+            --workflow .github/workflows/cursor-review.yml \
+            --catalog /tmp/catalog.txt \
+            --run-url "$RUN_URL" \
+            --title-out /tmp/drift-title.txt \
+            --body-out /tmp/drift-body.md \
+            --json-out /tmp/drift-report.json
+          cat /tmp/drift-body.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open, update, or close the sticky drift issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          HAS_FINDINGS: ${{ steps.drift.outputs.has_findings }}
+        run: |
+          set -euo pipefail
+          PREFIX='[cursor-review catalog drift]'
+
+          # Find-by-title (the sticky key), filtered on an EXACT prefix rather
+          # than `--search`, which is fuzzy AND eventually consistent — a search
+          # that hasn't indexed the issue we filed would file a duplicate. The
+          # generous limit is what keeps that promise as this repo accumulates
+          # open issues (groom files here too): the sticky ages out of a
+          # newest-first page long before it stops mattering.
+          numbers=$(gh issue list -R "$REPO" --state open --limit 500 --json number,title \
+            | jq -r --arg p "$PREFIX" 'map(select(.title | startswith($p))) | .[].number')
+          existing=$(printf '%s\n' "$numbers" | head -n 1)
+          extra=$(printf '%s\n' "$numbers" | tail -n +2 | tr '\n' ' ' | sed 's/ *$//')
+          if [ -n "$extra" ]; then
+            echo "::warning::More than one open sticky drift issue found; updating #${existing} and leaving these for a human to close: ${extra}"
+          fi
+
+          if [ "$HAS_FINDINGS" = "true" ]; then
+            title=$(cat /tmp/drift-title.txt)
+            if [ -n "$existing" ]; then
+              gh issue edit "$existing" -R "$REPO" --title "$title" --body-file /tmp/drift-body.md
+              echo "Updated sticky drift issue #${existing}."
+            else
+              gh issue create -R "$REPO" --title "$title" --body-file /tmp/drift-body.md
+            fi
+          elif [ -n "$existing" ]; then
+            # Clean run: close the sticky issue so it never lingers past the
+            # drift it reported. A later run opens a fresh one if drift returns.
+            gh issue close "$existing" -R "$REPO" --comment "$(cat /tmp/drift-body.md)"
+            echo "Closed sticky drift issue #${existing} — no drift."
+          else
+            echo "No drift and no open sticky issue — nothing to do."
+          fi
+
+      - name: Fail the run on a delisted pin
+        # The sticky issue carries every finding; only the urgent one reddens
+        # the run, so the weekly check stays green while a review-me list waits
+        # for a human but shouts when consumer PRs are about to fail preflight.
+        if: steps.drift.outputs.urgent == 'true'
+        run: |
+          echo "::error::A pinned cursor-review model id is missing from Cursor's live catalog — consumer PRs will fail the review preflight until the pin is updated. See the '[cursor-review catalog drift]' issue."
+          exit 1

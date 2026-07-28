@@ -43,7 +43,10 @@ tests — run the matching command above for whatever you touched.
   repo's own CI callers (`ci-*.yml`) and the `test-*.yml` script tests.
 - `.github/cursor-review/` — prompts + scripts behind `cursor-review.yml`
   (the multi-model review panel + judge). Single source of truth; loaded at run
-  time, never copied into consumers. Tests in `tests/`.
+  time, never copied into consumers. Also holds `catalog-drift.py`, the
+  comparison logic behind the weekly `cursor-review-catalog-drift.yml` check
+  (BE-4819) — it reads the pins *out of* `cursor-review.yml`, so never
+  duplicate the model list. Tests in `tests/`.
 - `.github/agents-md-integrity/` — `check_agents_md.py`, the checker behind
   `agents-md-integrity.yml` (enforces this AGENTS.md standard). Tests in `tests/`.
 - `.github/groom/` — briefs + building blocks behind the reusable **groom**
