@@ -6,6 +6,9 @@ Core properties:
   a tick at/after the interval runs.
 - The interval-skip ticks in between do NOT reset the clock (only a run whose
   finder actually ran counts).
+- A FAILED finder job counts only when its billed agent step (`Run finder`) ran,
+  so a flaky pre-agent step (checkout, `npm install`) can't burn a whole cycle
+  (BE-4809) — with a fail-SAFE fallback when the payload carries no step data.
 - `workflow_dispatch` always runs, regardless of the interval.
 - The gate is fail-open: no history / an API error runs rather than skips.
 - The volume gate's window normalizes through the SAME parser (blank/garbage/
@@ -22,6 +25,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import unittest
 from datetime import datetime, timezone
 
@@ -62,8 +66,32 @@ def make_gh_stub(runs, jobs_by_run):
     return _run
 
 
-def finder_job(conclusion="success"):
-    return {"name": "groom / Audit — finder", "conclusion": conclusion}
+def finder_job(conclusion="success", steps=None):
+    """A finder job as the jobs API renders it.
+
+    `steps=None` omits the array entirely — the fail-safe shape every pre-BE-4809
+    fixture (and any truncated/changed payload) has, which still counts.
+    """
+    job = {"name": "groom / Audit — finder", "conclusion": conclusion}
+    if steps is not None:
+        job["steps"] = steps
+    return job
+
+
+def step(name, conclusion="success"):
+    return {"name": name, "status": "completed", "conclusion": conclusion, "number": 1}
+
+
+# The steps the finder job runs BEFORE the billed agent (see groom.yml's
+# `audit_find`) — any of these can flake and fail the job having spent nothing.
+PRE_AGENT_STEPS = [
+    step("Set up job"),
+    step("Checkout target repo (clean default branch)"),
+    step("Load groom assets (briefs)"),
+    step("Build finder prompt"),
+    step("Install Claude Code"),
+    step("Lock the clone read-only"),
+]
 
 
 class ParseIntervalDaysTest(unittest.TestCase):
@@ -141,6 +169,105 @@ class RunAuditedTest(unittest.TestCase):
         self.assertFalse(interval.run_audited([finder_job(None)]))
         self.assertFalse(interval.run_audited([{"name": "groom / Gate", "conclusion": "success"}]))
         self.assertFalse(interval.run_audited([]))
+
+
+class FailedFinderSpentTheAgentTest(unittest.TestCase):
+    """A `failure` job counts only if the billed agent step actually ran (BE-4809)."""
+
+    def test_failure_after_the_agent_ran_still_counts(self):
+        # The money was spent; the job died at a later step (filing, artifact
+        # upload). Re-running on the very next daily tick would double-bill.
+        for agent_conclusion in ("success", "failure", "cancelled"):
+            job = finder_job("failure", PRE_AGENT_STEPS + [
+                step("Run finder", agent_conclusion),
+                step("Assert candidates", "failure"),
+            ])
+            self.assertTrue(interval.run_audited([job]), agent_conclusion)
+
+    def test_failure_before_the_agent_does_not_count(self):
+        # A flaky `npm install` (or either checkout) fails the job having spent
+        # nothing — the tick must stay due rather than eat a whole interval.
+        truncated = PRE_AGENT_STEPS[:-2] + [step("Install Claude Code", "failure")]
+        self.assertFalse(interval.run_audited([finder_job("failure", truncated)]))
+
+    def test_failure_with_the_agent_step_skipped_does_not_count(self):
+        # GitHub renders every step after a failing one as `skipped` rather than
+        # omitting it, so the step being present is not evidence that it ran.
+        steps = PRE_AGENT_STEPS[:-1] + [
+            step("Lock the clone read-only", "failure"),
+            step("Run finder", "skipped"),
+        ]
+        self.assertFalse(interval.run_audited([finder_job("failure", steps)]))
+        self.assertFalse(interval.run_audited([finder_job("failure", PRE_AGENT_STEPS + [step("Run finder", None)])]))
+
+    def test_failure_without_step_data_counts(self):
+        # Fail-SAFE, deliberately the opposite bias to the elapsed-time logic: no
+        # usable `steps` (API shape change, truncated payload) keeps today's
+        # behavior, because re-billing a genuinely-spent audit is the expensive
+        # direction.
+        self.assertTrue(interval.run_audited([finder_job("failure")]))          # key absent
+        self.assertTrue(interval.run_audited([finder_job("failure", [])]))      # empty array
+        self.assertTrue(interval.run_audited([{"name": "groom / Audit — finder",
+                                               "conclusion": "failure", "steps": None}]))
+
+    def test_success_is_unaffected_by_step_data(self):
+        # A successful job cannot have succeeded without the agent, so the step
+        # array is never consulted — including a (nonsensical) truncated one.
+        self.assertTrue(interval.run_audited([finder_job("success")]))
+        self.assertTrue(interval.run_audited([finder_job("success", PRE_AGENT_STEPS)]))
+        self.assertTrue(interval.run_audited([finder_job("success", PRE_AGENT_STEPS + [step("Run finder")])]))
+
+    def test_a_spent_failure_still_counts_when_an_unspent_one_precedes_it(self):
+        # Job order must not decide the answer: one matching job that spent the
+        # agent is enough, even behind a matching job that didn't.
+        jobs = [
+            finder_job("failure", [step("Install Claude Code", "failure")]),
+            finder_job("failure", PRE_AGENT_STEPS + [step("Run finder")]),
+        ]
+        self.assertTrue(interval.run_audited(jobs))
+
+    def test_unspent_failure_leaves_the_tick_due_end_to_end(self):
+        # The behavior that matters: yesterday's run died in `npm install`, so
+        # today's tick must still groom rather than wait out the interval.
+        runs = [
+            {"id": 100, "status": "in_progress", "run_started_at": iso(0)},
+            {"id": 99, "status": "completed", "run_started_at": iso(1)},
+        ]
+        jobs = {"99": [finder_job("failure", [step("Install Claude Code", "failure")])]}
+        d = interval.evaluate("o/r", "ci-groom.yml", 100, 7.0, "schedule", NOW, run=make_gh_stub(runs, jobs))
+        self.assertTrue(d["should_run"])
+        self.assertIsNone(d["last_run_at"])
+
+
+class AgentStepNamePinTest(unittest.TestCase):
+    """Pin the step name this module matches to the one groom.yml produces.
+
+    Producer (`.github/workflows/groom.yml`) and consumer (this module) live in
+    different files, so a rename of the step would otherwise silently degrade the
+    gate back to counting every failed job as a spent audit — no test failing.
+    """
+
+    def _audit_find_step_names(self):
+        path = os.path.join(os.path.dirname(__file__), "..", "..", "workflows", "groom.yml")
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        names, inside = [], False
+        for line in lines:
+            if re.match(r"^  [A-Za-z_][A-Za-z0-9_-]*:\s*$", line):
+                inside = line.strip() == "audit_find:"
+                continue
+            if inside:
+                m = re.match(r"^\s*- name:\s*(\S.*?)\s*$", line)
+                if m:
+                    names.append(m.group(1))
+        return names
+
+    def test_groom_yml_names_exactly_the_agent_step_this_module_matches(self):
+        names = self._audit_find_step_names()
+        self.assertIn("Run finder", names, "groom.yml's audit_find job no longer has a `Run finder` step")
+        matched = [n for n in names if any(h in n.lower() for h in interval._AGENT_STEP_HINTS)]
+        self.assertEqual(matched, ["Run finder"],
+                         f"_AGENT_STEP_HINTS must match exactly the agent step, got {matched} from {names}")
 
 
 class IntervalThresholdTest(unittest.TestCase):

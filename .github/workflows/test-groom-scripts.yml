@@ -10,11 +10,17 @@ on:
   pull_request:
     paths:
       - '.github/groom/**'
+      # interval.py pins the finder's agent step NAME against this workflow
+      # (BE-4809), so a rename there must run these tests too.
+      - '.github/workflows/groom.yml'
       - '.github/workflows/test-groom-scripts.yml'
   push:
     branches: [main]
     paths:
       - '.github/groom/**'
+      # interval.py pins the finder's agent step NAME against this workflow
+      # (BE-4809), so a rename there must run these tests too.
+      - '.github/workflows/groom.yml'
       - '.github/workflows/test-groom-scripts.yml'
 
 permissions:

@@ -199,6 +199,17 @@ real groom, so a skipped tick costs ~nothing (it never reaches the finder).
   interval-skip ticks in between never reset the clock. (A repo variable would
   need a `Variables: write` credential the run doesn't carry, and a missing grant
   would fail *silently* into a daily over-spend — run history has no such trap.)
+- **A *failed* finder job counts only if the billed agent step ran** (BE-4809).
+  The job runs two checkouts, `npm install`, the prompt build and the read-only
+  chmod BEFORE the agent; a transient failure in any of them concludes the job
+  `failure` having spent nothing, and counting that would silently skip every
+  tick for a full interval. So a `failure` additionally requires the run-history
+  payload's per-job `steps` to show `Run finder` reaching a real conclusion —
+  `success` still counts unconditionally. The missing-data direction here is
+  deliberately the OPPOSITE of the rest of the gate: no usable `steps` array
+  counts the failure, because re-billing a genuinely-spent audit on the next
+  daily tick is the expensive mistake. A unit test pins the step name against
+  `groom.yml` so a rename can't silently drift the two apart.
 - **`workflow_dispatch` bypasses THIS gate** — a manual dispatch is never
   interval-throttled. It is not a blanket "always runs": the volume gate is a
   second, independent throttle, so a live dispatch into a quiescent repo can
