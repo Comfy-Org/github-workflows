@@ -50,22 +50,36 @@ class Result:
         self.stderr = stderr
 
 
-def make_gh_stub(runs, jobs_by_run):
-    """A `gh api` stub: routes /runs vs /runs/<id>/jobs by URL."""
+def make_gh_stub(runs, jobs_by_run, jobs_by_attempt=None):
+    """A `gh api` stub: routes /runs vs /runs/<id>[/attempts/<n>]/jobs by URL.
+
+    `jobs_by_attempt` is keyed `"<run id>/<attempt>"` and answers the per-attempt
+    endpoint; `jobs_by_run` answers the plain one (the LATEST attempt), exactly as
+    the real API splits them.
+    """
+    jobs_by_attempt = jobs_by_attempt or {}
 
     def _run(cmd, **kwargs):
         url = cmd[-1]
         if "/jobs" in url:
-            run_id = url.split("/actions/runs/")[1].split("/jobs")[0]
-            return Result(stdout=json.dumps({"jobs": jobs_by_run.get(run_id, [])}))
+            tail = url.split("/actions/runs/")[1].split("/jobs")[0]
+            if "/attempts/" in tail:
+                run_id, attempt = tail.split("/attempts/")
+                return Result(stdout=json.dumps({"jobs": jobs_by_attempt.get(f"{run_id}/{attempt}", [])}))
+            return Result(stdout=json.dumps({"jobs": jobs_by_run.get(tail, [])}))
         return Result(stdout=json.dumps({"workflow_runs": runs}))
 
     return _run
 
 
-def agent_step(status="completed", conclusion="success"):
+def agent_step(status="completed", conclusion="success", started_at=None, completed_at=None):
     """The finder's billed agent step, shaped as the runs-jobs API returns it."""
-    return {"name": interval.agent_step_name(), "number": 6, "status": status, "conclusion": conclusion}
+    step = {"name": interval.agent_step_name(), "number": 6, "status": status, "conclusion": conclusion}
+    if started_at is not None:
+        step["started_at"] = started_at
+    if completed_at is not None:
+        step["completed_at"] = completed_at
+    return step
 
 
 def pre_agent_step(name="Checkout target repo (clean default branch)", conclusion="failure"):
@@ -193,6 +207,8 @@ class PreAgentFailureTest(unittest.TestCase):
         # The other shape GitHub uses for an unreached step: `completed`/`skipped`.
         job = finder_job("failure", [pre_agent_step(), agent_step(conclusion="skipped")])
         self.assertFalse(interval.run_audited([job]))
+        # A `cancelled` step with no timestamp span is likewise unreached — the
+        # spanned case is the opposite verdict, see CancelledAndTimedOutTest.
         cancelled = finder_job("failure", [pre_agent_step(), agent_step(conclusion="cancelled")])
         self.assertFalse(interval.run_audited([cancelled]))
 
@@ -243,6 +259,28 @@ class PreAgentFailureTest(unittest.TestCase):
         job = finder_job("failure", [{}, {"name": None}, {"name": interval.agent_step_name()}])
         self.assertFalse(interval.run_audited([job]))
 
+    def test_non_dict_entries_are_skipped_rather_than_raising(self):
+        # The docstring promises the walk survives junk, so feed it genuinely
+        # non-dict entries — a bare None, a string, a list — not just odd dicts.
+        # A real payload never looks like this; the point is that the scan cannot
+        # AttributeError its way into the upstream fail-open backstop.
+        junk = [None, "Run finder", ["Run finder"], 7, {"name": ["Run finder"]}]
+        self.assertFalse(interval.run_audited([finder_job("failure", junk)]))
+        # ...and a valid entry AFTER the junk is still reached and honored.
+        self.assertTrue(interval.run_audited([finder_job("failure", [*junk, agent_step()])]))
+        # Junk at the job level, and a `steps[]` that isn't even a list.
+        self.assertFalse(interval.run_audited([None, "job", 7]))
+        self.assertFalse(interval.run_audited([finder_job("failure", "not-a-list")]))
+        self.assertFalse(interval.run_audited("not-a-list"))
+
+    def test_job_conclusion_is_normalized_like_the_step_fields(self):
+        # The job conclusion and the step fields are compared against the same
+        # kind of membership set, so they must be normalized the same way — a
+        # casing/whitespace variance must not slip past one check but not the other.
+        self.assertTrue(interval.run_audited([finder_job(" SUCCESS ")]))
+        self.assertTrue(interval.run_audited([finder_job("Failure", [agent_step(conclusion=" Success ")])]))
+        self.assertFalse(interval.run_audited([finder_job("Failure", [agent_step(conclusion=" SKIPPED ")])]))
+
     def test_a_pre_agent_failure_does_not_advance_the_cadence_clock(self):
         # End-to-end: yesterday's tick died in checkout (billing nothing) and the
         # last REAL groom was 8 days ago on a 7-day interval. The tick must RUN,
@@ -290,6 +328,144 @@ class PreAgentFailureTest(unittest.TestCase):
         # Exactly one step in that job carries the name — otherwise "did the agent
         # start?" stops having a single answer.
         self.assertEqual(finder_block[0].count(f"- name: {interval.agent_step_name()}\n"), 1)
+
+
+class CancelledAndTimedOutTest(unittest.TestCase):
+    """The most EXPENSIVE ending must count, and it is not `failure`.
+
+    The finder job carries `timeout-minutes: 40`. An agent that hangs bills that
+    whole window and then trips the job timeout, so the job ends `timed_out` (or
+    `cancelled`, if someone kills the run) and GitHub stamps the in-flight agent
+    step `cancelled`. Reading either level as "never started" forgets the single
+    costliest audit there is and re-spends it on tomorrow's tick, every tick.
+
+    The conclusion alone cannot tell a cancellation that caught a RUNNING agent
+    from one that finalized a step never reached; the timestamps can, so an
+    elapsed span is the evidence, and no span stays fail-open (not audited).
+    """
+
+    def cancelled_mid_flight(self):
+        """The agent step as GitHub stamps it when a 40-minute run is killed."""
+        return agent_step(conclusion="cancelled",
+                          started_at="2026-07-21T09:00:00Z", completed_at="2026-07-21T09:40:00Z")
+
+    def test_timed_out_job_with_an_in_flight_agent_is_a_spent_audit(self):
+        job = finder_job("timed_out", [pre_agent_step(conclusion="success"), self.cancelled_mid_flight()])
+        self.assertTrue(interval.run_audited([job]))
+
+    def test_cancelled_job_with_an_in_flight_agent_is_a_spent_audit(self):
+        for conclusion in ("cancelled", "canceled"):
+            job = finder_job(conclusion, [pre_agent_step(conclusion="success"), self.cancelled_mid_flight()])
+            self.assertTrue(interval.run_audited([job]), conclusion)
+
+    def test_cancelled_job_that_died_before_the_agent_is_not_spent(self):
+        # The half that must not regress with the widened conclusion set: a run
+        # cancelled during checkout bills nothing, so it still may not advance the
+        # clock. Both unreached shapes, under both endings.
+        for conclusion in ("timed_out", "cancelled"):
+            queued = finder_job(conclusion, [pre_agent_step(), agent_step(status="queued", conclusion=None)])
+            self.assertFalse(interval.run_audited([queued]), conclusion)
+            skipped = finder_job(conclusion, [pre_agent_step(), agent_step(conclusion="skipped")])
+            self.assertFalse(interval.run_audited([skipped]), conclusion)
+            self.assertFalse(interval.run_audited([finder_job(conclusion)]), conclusion)
+
+    def test_a_cancelled_agent_step_without_a_span_stays_fail_open(self):
+        # No timestamps, one timestamp, or a zero-width span (both stamped at the
+        # same cancellation instant) are all "no evidence" — the unreached step
+        # GitHub finalized on the way down looks exactly like that.
+        instant = "2026-07-21T09:00:00Z"
+        for started, completed in ((None, None), (instant, None), (None, instant),
+                                   (instant, instant), ("garbage", instant)):
+            step = agent_step(conclusion="cancelled", started_at=started, completed_at=completed)
+            self.assertFalse(interval.run_audited([finder_job("timed_out", [step])]), (started, completed))
+
+    def test_a_timed_out_agent_does_not_re_spend_on_the_next_tick(self):
+        # End-to-end, the harm this closes: yesterday's run hung and burned the
+        # full 40-minute timeout. Today's tick must SKIP — the audit was paid.
+        runs = [
+            {"id": 100, "status": "in_progress", "run_started_at": iso(0)},
+            {"id": 99, "status": "completed", "run_started_at": iso(1)},
+            {"id": 90, "status": "completed", "run_started_at": iso(8)},
+        ]
+        jobs = {"99": [finder_job("timed_out", [pre_agent_step(conclusion="success"),
+                                                self.cancelled_mid_flight()])],
+                "90": [finder_job("success")]}
+        d = interval.evaluate("o/r", "ci-groom.yml", 100, 7.0, "schedule", NOW, run=make_gh_stub(runs, jobs))
+        self.assertFalse(d["should_run"], d["reason"])
+        self.assertEqual(d["last_run_at"], iso(1))
+
+
+class EarlierAttemptTest(unittest.TestCase):
+    """A re-run must not erase the evidence that an earlier attempt billed.
+
+    The plain jobs endpoint reports only a run's LATEST attempt. If attempt 1
+    reached the agent and attempt 2 (a manual re-run) died in checkout, reading
+    only the latest attempt forgets the paid audit and re-spends it next tick —
+    the same bug BE-4814 fixes at the step level, one level up.
+    """
+
+    def runs(self, attempt_count):
+        return [
+            {"id": 100, "status": "in_progress", "run_started_at": iso(0)},
+            {"id": 99, "status": "completed", "run_started_at": iso(1), "run_attempt": attempt_count},
+            {"id": 90, "status": "completed", "run_started_at": iso(8)},
+        ]
+
+    def test_an_earlier_attempt_that_billed_still_counts(self):
+        latest = {"99": [finder_job("failure", [pre_agent_step()])], "90": [finder_job("success")]}
+        by_attempt = {"99/1": [billed_finder_job()], "99/2": latest["99"]}
+        d = interval.evaluate("o/r", "ci-groom.yml", 100, 7.0, "schedule", NOW,
+                              run=make_gh_stub(self.runs(2), latest, by_attempt))
+        self.assertFalse(d["should_run"], d["reason"])
+        self.assertEqual(d["last_run_at"], iso(1))
+
+    def test_no_attempt_that_billed_still_falls_open(self):
+        # Every attempt died pre-agent: nothing was spent, so the clock stays
+        # anchored on the 8-day-old real run and today's tick RUNS.
+        latest = {"99": [finder_job("failure", [pre_agent_step()])], "90": [finder_job("success")]}
+        by_attempt = {"99/1": latest["99"], "99/2": latest["99"]}
+        d = interval.evaluate("o/r", "ci-groom.yml", 100, 7.0, "schedule", NOW,
+                              run=make_gh_stub(self.runs(2), latest, by_attempt))
+        self.assertTrue(d["should_run"], d["reason"])
+        self.assertEqual(d["last_run_at"], iso(8))
+
+    def test_single_attempt_runs_make_no_extra_api_calls(self):
+        # The common case must stay exactly as cheap as before: `run_attempt` 1
+        # (or absent) must never hit the per-attempt endpoint.
+        seen = []
+        base = make_gh_stub(self.runs(1), {"99": [finder_job("failure", [pre_agent_step()])],
+                                           "90": [finder_job("success")]})
+
+        def spy(cmd, **kwargs):
+            seen.append(cmd[-1])
+            return base(cmd, **kwargs)
+
+        interval.evaluate("o/r", "ci-groom.yml", 100, 7.0, "schedule", NOW, run=spy)
+        self.assertFalse([u for u in seen if "/attempts/" in u], seen)
+
+    def test_the_attempt_walk_is_bounded(self):
+        # A pathological re-run count can't turn the cheap gate into a request
+        # storm — the walk is capped, newest-first.
+        seen = []
+        latest = {"99": [finder_job("failure", [pre_agent_step()])], "90": [finder_job("success")]}
+        base = make_gh_stub(self.runs(50), latest, {})
+
+        def spy(cmd, **kwargs):
+            seen.append(cmd[-1])
+            return base(cmd, **kwargs)
+
+        interval.evaluate("o/r", "ci-groom.yml", 100, 7.0, "schedule", NOW, run=spy)
+        attempts_hit = [u for u in seen if "/attempts/" in u]
+        self.assertEqual(len(attempts_hit), interval._MAX_ATTEMPTS_SCANNED - 1, attempts_hit)
+
+    def test_a_garbage_run_attempt_degrades_to_the_latest_attempt_only(self):
+        latest = {"99": [billed_finder_job()], "90": [finder_job("success")]}
+        for raw in (None, "", "lots", {}):
+            runs = self.runs(1)
+            runs[1]["run_attempt"] = raw
+            d = interval.evaluate("o/r", "ci-groom.yml", 100, 7.0, "schedule", NOW,
+                                  run=make_gh_stub(runs, latest, {}))
+            self.assertFalse(d["should_run"], (raw, d["reason"]))
 
 
 class IntervalThresholdTest(unittest.TestCase):
