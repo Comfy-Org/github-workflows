@@ -10,10 +10,15 @@ swaps found by the BE-4817 audit (Opus 5 on 2026-07-24, Kimi K3 on ~2026-07-26)
 landed in that window and were caught by hand, not by CI.
 
 This script is the machine half of that audit. Given the workflow file and the
-raw output of `cursor-agent models`, it reports three kinds of drift:
+raw output of `cursor-agent models`, it reports four kinds of drift:
 
   * **delisted pin** — a pinned id (panel or judge) is absent from the live
     catalog. Urgent: consumer PRs will start failing preflight.
+  * **pin marked NO-ZDR** — a pinned id is still listed, but its catalog line now
+    carries a NO-ZDR marker. Also urgent, for the opposite reason: nothing
+    breaks, and private review diffs quietly keep flowing to a model that may
+    retain them. This is the one marker the script interprets rather than merely
+    reproducing (see `_NO_ZDR`).
   * **unpinned same-lab ids** — catalog ids from a lab the panel already pins,
     which the panel does *not* pin. A REVIEW-ME list, never an auto-recommendation:
     picking "newest highest-reasoning ZDR-eligible" needs human judgment, and ZDR
@@ -38,8 +43,8 @@ Usage (see cursor-review-catalog-drift.yml):
 Exit code is 0 for both "drift" and "no drift" — findings are reported through
 the sticky issue, not the run status. A non-zero exit means the checker itself
 could not run (pins unreadable), which is a real defect in the checker or in the
-workflow it parses. The caller decides separately whether a delisted pin should
-also redden the run (it does; see the workflow's final step).
+workflow it parses. The caller decides separately whether an urgent finding
+should also redden the run (it does; see the workflow's final step).
 """
 
 import argparse
@@ -67,10 +72,39 @@ _LAST_CHECKED = re.compile(r"last checked\s+(\d{4}-\d{2}-\d{2})", re.IGNORECASE)
 # prose lines ("Available models:") out of the parsed id list.
 _ID_TOKEN = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 _BULLET = re.compile(r"^[-*>•\s]+")
+# The ONE catalog marker worth interpreting rather than merely reproducing: a
+# PINNED model reclassified non-ZDR means private review diffs are flowing to a
+# model that may retain them. Notes are otherwise passed through verbatim (see
+# `catalog_entries`) precisely because promotion is a human call — but a
+# confidentiality regression on a pin already in service is not a "review me".
+_NO_ZDR = re.compile(r"no[\s_-]*zdr", re.IGNORECASE)
+# How far above the `Define panel models` heredoc the `last checked` audit
+# comment is allowed to sit. Anchoring the search here (rather than scanning the
+# whole file) stops an unrelated `last checked` elsewhere in cursor-review.yml
+# from shadowing the real pin-adjacent date; the real-workflow test guards the
+# window from being too tight.
+LAST_CHECKED_WINDOW = 40
 
 
 class ExtractionError(Exception):
     """The pins could not be read out of the workflow file."""
+
+
+def _is_model_id(token):
+    """True for a bare catalog/model id — see `_ID_TOKEN`.
+
+    The letter requirement keeps a numbered-list marker (`1.` in a hypothetical
+    `1. gpt-5.6-sol-max` catalog line) from parsing as an id. That matters more
+    than it looks: `present()` trusts this parse, so a catalog of ['1.', '2.']
+    would look perfectly valid while reporting every real pin as delisted.
+    Parsing nothing instead routes it to `main`'s diagnostic "no ids could be
+    parsed — the format may have changed" hard exit.
+    """
+    return (
+        bool(_ID_TOKEN.match(token))
+        and re.search(r"[-.]", token) is not None
+        and re.search(r"[a-z]", token) is not None
+    )
 
 
 # --------------------------------------------------------------------------
@@ -78,14 +112,18 @@ class ExtractionError(Exception):
 # --------------------------------------------------------------------------
 
 
+def _heredoc_start(lines):
+    """Index of the `cat > /tmp/models.json <<'JSON'` line, or None."""
+    for i, line in enumerate(lines):
+        if _HEREDOC_START.search(line):
+            return i
+    return None
+
+
 def extract_panel_models(workflow_text):
     """Return the panel model ids from the 'Define panel models' heredoc."""
     lines = workflow_text.splitlines()
-    start = None
-    for i, line in enumerate(lines):
-        if _HEREDOC_START.search(line):
-            start = i
-            break
+    start = _heredoc_start(lines)
     if start is None:
         raise ExtractionError(
             "could not find the `cat > /tmp/models.json <<'JSON'` heredoc in the "
@@ -115,6 +153,21 @@ def extract_panel_models(workflow_text):
     models = [m.strip() for m in parsed if m.strip()]
     if not models:
         raise ExtractionError("the /tmp/models.json heredoc contains no model ids")
+    # EVERY entry must look like a bare model id. A *guessed* pin set is worse
+    # than a red run: the quoted-token fallback would otherwise adopt a quoted
+    # comment, and even a strictly-valid JSON array can carry a placeholder
+    # ("TODO pick a fifth"). Either way the checker would report a bogus pin as
+    # delisted every Monday, or silently monitor the wrong set — the exact
+    # silent staleness this checker exists to end.
+    bad = [m for m in models if not _is_model_id(m)]
+    if bad:
+        raise ExtractionError(
+            f"the /tmp/models.json heredoc yielded entries that are not bare model ids: {bad!r} "
+            "(expected a single lowercase token containing a `-` or `.`, e.g. "
+            "`gpt-5.6-sol-max`). If a lab has shipped a separator-less id, relax `_is_model_id` "
+            "here AND in the catalog parser together — they must agree, or the pin will read as "
+            "delisted every run."
+        )
     return models
 
 
@@ -149,8 +202,19 @@ def extract_judge_model(workflow_text):
 
 
 def extract_last_checked(workflow_text):
-    """Return the `last checked YYYY-MM-DD` audit date, or None if absent."""
-    match = _LAST_CHECKED.search(workflow_text)
+    """Return the pins' `last checked YYYY-MM-DD` audit date, or None if absent.
+
+    Searched only in the `LAST_CHECKED_WINDOW` lines immediately above the panel
+    heredoc, so an unrelated `last checked` elsewhere in cursor-review.yml can't
+    shadow the real pin-adjacent date. None means "report it stale", which is the
+    safe direction: a missing audit record is itself a finding.
+    """
+    lines = workflow_text.splitlines()
+    start = _heredoc_start(lines)
+    window = (
+        lines[max(0, start - LAST_CHECKED_WINDOW) : start + 1] if start is not None else lines
+    )
+    match = _LAST_CHECKED.search("\n".join(window))
     if not match:
         return None
     try:
@@ -180,22 +244,40 @@ def catalog_entries(catalog_text):
             continue
         parts = line.split(None, 1)
         model_id = parts[0]
-        if not _ID_TOKEN.match(model_id) or not re.search(r"[-.]", model_id):
+        if not _is_model_id(model_id):
             continue
         note = parts[1].strip() if len(parts) > 1 else ""
         if model_id in seen:
-            if note and not seen[model_id]:
-                seen[model_id] = note
+            # MERGE rather than keep-first: if the catalog lists an id twice and
+            # only the second line carries `(NO ZDR)`, keeping the first note
+            # would discard the one marker a human must see.
+            if note and note not in _split_notes(seen[model_id]):
+                seen[model_id] = f"{seen[model_id]} / {note}" if seen[model_id] else note
             continue
         seen[model_id] = note
         order.append(model_id)
     return [(m, seen[m]) for m in order]
 
 
-def present(model_id, catalog_text):
-    """Whole-token containment check — the same regex the preflight uses."""
-    pattern = r"(?<![\w.-])" + re.escape(model_id) + r"(?![\w.-])"
-    return re.search(pattern, catalog_text) is not None
+def _split_notes(note):
+    """Notes merged by `catalog_entries`, back as a list."""
+    return [part.strip() for part in note.split(" / ") if part.strip()]
+
+
+def present(model_id, catalog_ids):
+    """Exact membership in the PARSED catalog ids.
+
+    Deliberately NOT a substring/whole-token scan of the raw catalog text, even
+    though the per-PR preflight does that: a delisted id very often still
+    *appears* in the text — in its successor's replacement/deprecation note,
+    which is precisely when a delist happens — and a text scan would then call
+    it present, silently swallowing the one urgent finding this check exists to
+    raise while consumer PRs go red at preflight. `unpinned` already compares
+    against the parsed ids, so this makes them one source of truth. The
+    trade-off is deliberate: a garbled catalog now over-reports (loud, and
+    guarded by the "no ids parsed" hard fail) instead of under-reporting.
+    """
+    return model_id in catalog_ids
 
 
 def lab_of(model_id):
@@ -206,28 +288,40 @@ def lab_of(model_id):
 def analyze(panel_models, judge_model, catalog_text, last_checked, today, stale_days):
     """Compare the pins against the catalog and return the drift report."""
     entries = catalog_entries(catalog_text)
+    catalog_ids = {m for m, _ in entries}
+    notes = dict(entries)
     pinned = list(panel_models)
     if judge_model not in pinned:
         pinned.append(judge_model)
 
-    delisted = []
-    for model_id in pinned:
-        if present(model_id, catalog_text):
-            continue
-        lab = lab_of(model_id)
+    def roles_of(model_id):
         roles = []
         if model_id in panel_models:
             roles.append("panel")
         if model_id == judge_model:
             roles.append("judge")
-        delisted.append(
-            {
-                "id": model_id,
-                "roles": roles,
-                "lab": lab,
-                "same_lab_available": [m for m, _ in entries if lab_of(m) == lab],
-            }
-        )
+        return roles
+
+    delisted = []
+    zdr_risk = []
+    for model_id in pinned:
+        if not present(model_id, catalog_ids):
+            lab = lab_of(model_id)
+            delisted.append(
+                {
+                    "id": model_id,
+                    "roles": roles_of(model_id),
+                    "lab": lab,
+                    "same_lab_available": [m for m, _ in entries if lab_of(m) == lab],
+                }
+            )
+            continue
+        # Still listed — but is it still ZDR-eligible? A pin reclassified
+        # NO-ZDR keeps quietly receiving private review diffs, so it is checked
+        # here rather than only being surfaced for promotion candidates.
+        note = notes.get(model_id, "")
+        if _NO_ZDR.search(note):
+            zdr_risk.append({"id": model_id, "roles": roles_of(model_id), "note": note})
 
     # Labs are derived from the pins themselves (not a hardcoded list) so a pin
     # bump to a newly-branded lab keeps this checker zero-maintenance. With
@@ -257,16 +351,25 @@ def analyze(panel_models, judge_model, catalog_text, last_checked, today, stale_
         "age_days": (today - last_checked).days if last_checked else None,
         "stale_days": stale_days,
     }
-    audit["stale"] = last_checked is None or audit["age_days"] > stale_days
+    # A NEGATIVE age is a future-dated typo, not a fresh audit — without this it
+    # reads as current and suppresses the stale alert until `stale_days` past
+    # that future date.
+    audit["stale"] = (
+        last_checked is None or audit["age_days"] > stale_days or audit["age_days"] < 0
+    )
+    audit["future_dated"] = audit["age_days"] is not None and audit["age_days"] < 0
 
     return {
         "pins": {"panel": list(panel_models), "judge": judge_model},
         "catalog_ids": [m for m, _ in entries],
         "delisted": delisted,
+        "zdr_risk": zdr_risk,
         "unpinned": unpinned,
         "audit": audit,
-        "urgent": bool(delisted),
-        "has_findings": bool(delisted or unpinned or audit["stale"]),
+        # `urgent` is what reddens the weekly run: a pin the preflight is about
+        # to reject, or a pin that is no longer ZDR-eligible.
+        "urgent": bool(delisted or zdr_risk),
+        "has_findings": bool(delisted or zdr_risk or unpinned or audit["stale"]),
     }
 
 
@@ -281,6 +384,9 @@ def summary_line(report):
     delisted = report["delisted"]
     if delisted:
         bits.append(f"{len(delisted)} delisted pin{'s' if len(delisted) != 1 else ''}")
+    zdr = report.get("zdr_risk") or []
+    if zdr:
+        bits.append(f"{len(zdr)} pin{'s' if len(zdr) != 1 else ''} marked NO-ZDR")
     count = sum(len(g["candidates"]) for g in report["unpinned"])
     if count:
         bits.append(f"{count} unpinned same-lab id{'s' if count != 1 else ''}")
@@ -302,6 +408,22 @@ def _fenced(text):
     longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
     fence = "`" * max(3, longest + 1)
     return f"{fence}text\n{text}\n{fence}"
+
+
+def _inline_code(text):
+    """Render `text` as an inline code span that its own backticks can't escape.
+
+    Catalog notes are unconstrained third-party free text reproduced verbatim in
+    a bot-authored issue in a PUBLIC repo. A bare single-backtick span would let
+    a note carrying a backtick break out and inject markdown — or an `@mention`
+    that notifies real people — so the delimiter is sized to the note (per
+    CommonMark) and padded when the note starts or ends with a backtick.
+    """
+    flat = re.sub(r"\s+", " ", text).strip()
+    longest = max((len(m) for m in re.findall(r"`+", flat)), default=0)
+    delim = "`" * (longest + 1)
+    pad = " " if flat.startswith("`") or flat.endswith("`") else ""
+    return f"{delim}{pad}{flat}{pad}{delim}"
 
 
 def render_body(report, catalog_text, run_url=None, checked_at=None):
@@ -347,6 +469,18 @@ def render_body(report, catalog_text, run_url=None, checked_at=None):
             )
             out.append(f"- `{item['id']}` ({roles}) — available for lab `{item['lab']}`: {same_lab}")
 
+    if report.get("zdr_risk"):
+        out.append(
+            "## 🚨 Pinned model marked NO-ZDR — fix first\n\n"
+            "These ids are still in the catalog but its line now carries a NO-ZDR marker. "
+            "cursor-review sends **private diffs** to every pinned model, so a pin that is no "
+            "longer zero-data-retention eligible is a confidentiality regression: confirm against "
+            "the catalog and repin to a ZDR-eligible tier."
+        )
+        for item in report["zdr_risk"]:
+            roles = "/".join(item["roles"]) or "pin"
+            out.append(f"- `{item['id']}` ({roles}) — catalog note: {_inline_code(item['note'])}")
+
     if report["unpinned"]:
         out.append(
             "## Unpinned same-lab catalog ids — review me\n\n"
@@ -361,7 +495,7 @@ def render_body(report, catalog_text, run_url=None, checked_at=None):
             out.append(f"**`{group['lab']}`** (pinned: {pinned_now})")
             out.append(
                 "\n".join(
-                    f"- `{c['id']}`" + (f" — `{c['note']}`" if c["note"] else "")
+                    f"- `{c['id']}`" + (f" — {_inline_code(c['note'])}" if c["note"] else "")
                     for c in group["candidates"]
                 )
             )
@@ -373,6 +507,15 @@ def render_body(report, catalog_text, run_url=None, checked_at=None):
                 "No `last checked YYYY-MM-DD` comment was found above the panel pins in "
                 "`cursor-review.yml`. That comment is the human-audit record — restore it when "
                 "you next review the pins."
+            )
+        elif audit.get("future_dated"):
+            out.append(
+                f"## Stale audit date — future-dated\n\n"
+                f"The `last checked` comment in `cursor-review.yml` reads "
+                f"**{audit['last_checked']}**, which is in the future ({-audit['age_days']} days "
+                f"from now) — almost certainly a typo. It is treated as stale rather than fresh, "
+                f"since a future date would otherwise suppress this alert. Fix the date and "
+                f"re-audit the pins."
             )
         else:
             out.append(
@@ -406,6 +549,17 @@ def render_body(report, catalog_text, run_url=None, checked_at=None):
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
+
+
+def _quoted_for_log(text):
+    """Prefix every line so none can be read as a GitHub workflow command.
+
+    `cursor-agent` output is semi-trusted third-party text, and this runs in a
+    PUBLIC repo's Actions log. A line beginning `::` would be executed by the
+    runner (`::add-mask::`, `::stop-commands::`, `::error::`), so the catalog is
+    never echoed raw.
+    """
+    return "\n".join("| " + line for line in text.splitlines())
 
 
 def _write(path, text):
@@ -455,9 +609,9 @@ def main(argv=None):
         # Fail loudly instead of crying wolf about four delisted pins.
         print(
             "::error::No model ids could be parsed out of the Cursor catalog output — "
-            "the format may have changed. Raw output:"
+            "the format may have changed. Raw output (each line prefixed `| `):"
         )
-        print(catalog_text)
+        print(_quoted_for_log(catalog_text))
         return 1
 
     report = analyze(

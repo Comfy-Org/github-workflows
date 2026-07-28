@@ -108,9 +108,56 @@ class ExtractionTest(unittest.TestCase):
     def test_missing_last_checked_is_none_not_an_error(self):
         self.assertIsNone(cd.extract_last_checked("no audit comment here"))
 
+    def test_last_checked_is_read_near_the_pins_not_the_first_match_anywhere(self):
+        # An unrelated `last checked` elsewhere in the file must not shadow the
+        # real pin-adjacent audit date.
+        preamble = "# changelog: last checked 2020-01-01\n" + "#\n" * (cd.LAST_CHECKED_WINDOW + 5)
+        self.assertEqual(cd.extract_last_checked(preamble + WORKFLOW), datetime.date(2026, 7, 14))
+
+    def test_last_checked_far_from_the_pins_is_not_adopted(self):
+        text = WORKFLOW.replace(
+            "        # catalog (last checked 2026-07-14).",
+            "\n".join(["# stray: last checked 2020-01-01"] + [""] * cd.LAST_CHECKED_WINDOW),
+        )
+        self.assertIsNone(cd.extract_last_checked(text))
+
     def test_heredoc_with_a_trailing_comma_falls_back_to_quoted_tokens(self):
         text = WORKFLOW.replace('"kimi-k2.7-code"', '"kimi-k2.7-code",')
         self.assertEqual(cd.extract_panel_models(text), PANEL)
+
+    def test_quoted_token_fallback_rejects_a_quoted_non_id(self):
+        # The fallback must not adopt a quoted comment as a "pin": a guessed pin
+        # set means false delisted alarms every Monday, or a real pin silently
+        # dropped and then never monitored.
+        text = WORKFLOW.replace(
+            '            "kimi-k2.7-code"\n',
+            '            "kimi-k2.7-code",  # see "the Kimi tier" in the catalog\n',
+        )
+        with self.assertRaises(cd.ExtractionError):
+            cd.extract_panel_models(text)
+
+    def test_pin_and_catalog_id_shape_rules_agree(self):
+        # The pin validator and the catalog parser MUST accept the same shapes:
+        # a pin the catalog parser would never emit reads as delisted every run.
+        # Both currently require a `-`/`.`, so a separator-less id (`o3`) is
+        # rejected at extraction — a loud checker-defect signal, not a false
+        # claim about the catalog. If that rule is ever relaxed, relax it in
+        # both places; this test is the tripwire.
+        for token in ["o3", "sonnet", "gpt5"]:
+            self.assertFalse(cd._is_model_id(token), token)
+            self.assertEqual(cd.catalog_entries(token + "\n"), [])
+        for token in ["gpt-5.6-sol-max", "kimi-k2.7-code", "gemini-3.1-pro"]:
+            self.assertTrue(cd._is_model_id(token), token)
+            self.assertEqual([m for m, _ in cd.catalog_entries(token + "\n")], [token])
+
+    def test_valid_json_with_a_placeholder_entry_raises(self):
+        # Strict JSON is not enough — a placeholder would be "checked" as a pin.
+        text = WORKFLOW.replace(
+            '            "kimi-k2.7-code"\n',
+            '            "kimi-k2.7-code",\n            "TODO pick a fifth"\n',
+        )
+        with self.assertRaises(cd.ExtractionError):
+            cd.extract_panel_models(text)
 
     def test_missing_heredoc_raises(self):
         with self.assertRaises(cd.ExtractionError):
@@ -165,6 +212,14 @@ class CatalogParsingTest(unittest.TestCase):
         self.assertIn("gpt-5.6-sol", entries)
         self.assertEqual(entries["fable-5-max"], "(NO ZDR)")
 
+    def test_a_numbered_list_marker_is_not_mistaken_for_an_id(self):
+        # `1.` satisfies "lowercase token with a separator", so without the
+        # letter requirement a numbered catalog format would parse as the ids
+        # ['1.', '2.'] — a catalog that looks valid while every real pin reads
+        # as delisted. Parsing nothing is the better failure: `main` turns it
+        # into the diagnostic "the format may have changed" hard exit.
+        self.assertEqual(cd.catalog_entries("1. gpt-5.6-sol-max\n2. kimi-k2.7-code\n"), [])
+
     def test_skips_prose_and_bullets(self):
         entries = cd.catalog_entries("Available models:\n\n  - gpt-5.6-sol-max\n  * kimi-k2.7-code\n")
         self.assertEqual([m for m, _ in entries], ["gpt-5.6-sol-max", "kimi-k2.7-code"])
@@ -173,10 +228,21 @@ class CatalogParsingTest(unittest.TestCase):
         entries = cd.catalog_entries("gpt-5.6-sol\ngpt-5.6-sol (NO ZDR)\n")
         self.assertEqual(entries, [("gpt-5.6-sol", "(NO ZDR)")])
 
-    def test_present_matches_whole_tokens_only(self):
-        self.assertTrue(cd.present("kimi-k2.7", "kimi-k2.7\n"))
-        self.assertFalse(cd.present("kimi-k2.7", "kimi-k2.75-code\n"))
-        self.assertFalse(cd.present("gpt-5.6-sol", "gpt-5.6-sol-max\n"))
+    def test_a_later_no_zdr_note_on_a_repeated_id_is_not_discarded(self):
+        # Keep-first would drop the one marker a human must see.
+        entries = dict(cd.catalog_entries("gpt-5.6-sol 200k ctx\ngpt-5.6-sol (NO ZDR)\n"))
+        self.assertIn("(NO ZDR)", entries["gpt-5.6-sol"])
+        self.assertIn("200k ctx", entries["gpt-5.6-sol"])
+
+    def test_repeated_identical_notes_are_not_duplicated(self):
+        entries = dict(cd.catalog_entries("gpt-5.6-sol (NO ZDR)\ngpt-5.6-sol (NO ZDR)\n"))
+        self.assertEqual(entries["gpt-5.6-sol"], "(NO ZDR)")
+
+    def test_present_matches_parsed_ids_exactly(self):
+        ids = {m for m, _ in cd.catalog_entries(CATALOG)}
+        self.assertTrue(cd.present("kimi-k2.7-code", ids))
+        self.assertFalse(cd.present("kimi-k2.7", ids))
+        self.assertFalse(cd.present("gpt-5.6-sol-max-plus", ids))
 
     def test_lab_of_splits_on_the_first_separator(self):
         self.assertEqual(cd.lab_of("gpt-5.6-sol-max"), "gpt")
@@ -206,6 +272,36 @@ class AnalyzeTest(unittest.TestCase):
         self.assertEqual([d["id"] for d in report["delisted"]], [JUDGE])
         # The judge default is also a panel pin here, so both roles show.
         self.assertEqual(report["delisted"][0]["roles"], ["panel", "judge"])
+
+    def test_delisted_pin_mentioned_only_in_a_successor_note_is_still_reported(self):
+        # The regression the raw-text scan had: a delist normally ships WITH a
+        # note naming the id it replaces, so scanning the text found the dead pin
+        # and reported "no drift" while consumer PRs went red at preflight.
+        catalog = CATALOG.replace(
+            "kimi-k2.7-code\n", "kimi-k3-code (replaces kimi-k2.7-code)\n"
+        )
+        report = analyze(catalog=catalog)
+        self.assertTrue(report["urgent"])
+        self.assertEqual([d["id"] for d in report["delisted"]], ["kimi-k2.7-code"])
+
+    def test_a_pinned_model_marked_no_zdr_is_urgent(self):
+        catalog = CATALOG.replace("gemini-3.1-pro\n", "gemini-3.1-pro (NO ZDR)\n")
+        report = analyze(catalog=catalog)
+        self.assertEqual([z["id"] for z in report["zdr_risk"]], ["gemini-3.1-pro"])
+        self.assertEqual(report["zdr_risk"][0]["roles"], ["panel"])
+        self.assertFalse(report["delisted"])
+        self.assertTrue(report["urgent"])
+        self.assertIn("NO-ZDR", cd.summary_line(report))
+
+    def test_an_unmarked_pin_is_not_a_zdr_risk(self):
+        catalog = "\n".join(PANEL) + "\n"
+        self.assertEqual(analyze(catalog=catalog)["zdr_risk"], [])
+
+    def test_a_no_zdr_marker_on_an_unpinned_id_is_not_urgent(self):
+        # `fable-5-max (NO ZDR)` is in CATALOG but not pinned — it belongs in the
+        # raw fold, and must not redden the weekly run.
+        self.assertEqual(analyze()["zdr_risk"], [])
+        self.assertFalse(analyze()["urgent"])
 
     def test_judge_pin_outside_the_panel_is_still_checked(self):
         report = analyze(judge="claude-judge-only")
@@ -239,6 +335,18 @@ class AnalyzeTest(unittest.TestCase):
         self.assertTrue(stale["audit"]["stale"])
         self.assertTrue(stale["has_findings"])
         self.assertFalse(stale["urgent"])
+
+    def test_a_future_dated_audit_comment_counts_as_stale_not_fresh(self):
+        # A typo'd future date yields a negative age, which read as "fresh" and
+        # suppressed the alert until ~stale_days past that future date.
+        report = analyze(
+            catalog="\n".join(PANEL) + "\n", last_checked=TODAY + datetime.timedelta(days=400)
+        )
+        self.assertTrue(report["audit"]["stale"])
+        self.assertTrue(report["audit"]["future_dated"])
+        self.assertTrue(report["has_findings"])
+        body = cd.render_body(report, "\n".join(PANEL) + "\n")
+        self.assertIn("future", body.lower())
 
     def test_missing_audit_date_counts_as_stale(self):
         report = analyze(catalog="\n".join(PANEL) + "\n", last_checked=None)
@@ -280,6 +388,23 @@ class RenderTest(unittest.TestCase):
         body = cd.render_body(analyze(catalog=catalog), catalog)
         self.assertIn("truncated", body)
         self.assertLess(len(body), 65536)
+
+    def test_a_backtick_in_a_catalog_note_cannot_break_out_of_its_code_span(self):
+        # Notes are unconstrained third-party text reproduced in a bot-authored
+        # issue in a PUBLIC repo; a bare single-backtick span would let one inject
+        # markdown or an @mention that notifies real people.
+        catalog = CATALOG + "gpt-5.7-preview `@everyone` see docs\n"
+        body = cd.render_body(analyze(catalog=catalog), catalog)
+        # Two-backtick delimiter, padded because the note itself starts with one.
+        self.assertIn("`` `@everyone` see docs ``", body)
+        self.assertNotIn("- `gpt-5.7-preview` — `` `@everyone`` see", body)
+
+    def test_a_pinned_no_zdr_marker_is_called_out_in_the_body(self):
+        catalog = CATALOG.replace("gemini-3.1-pro\n", "gemini-3.1-pro (NO ZDR)\n")
+        body = cd.render_body(analyze(catalog=catalog), catalog)
+        self.assertIn("NO-ZDR", body)
+        self.assertIn("`gemini-3.1-pro`", body)
+        self.assertIn("confidentiality regression", body)
 
     def test_clean_body_says_no_drift(self):
         catalog = "\n".join(PANEL) + "\n"
@@ -339,6 +464,14 @@ class MainTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("::error::", out)
         self.assertNotIn("delisted", out.lower())
+
+    def test_an_unparseable_catalog_cannot_smuggle_a_workflow_command_into_the_log(self):
+        # `cursor-agent` output is semi-trusted and this repo is public: a line
+        # beginning `::` echoed raw would be EXECUTED by the runner.
+        code, _, out = self._run(WORKFLOW, "Error page\n::add-mask::hunter2\n")
+        self.assertEqual(code, 1)
+        self.assertNotIn("\n::add-mask::", out)
+        self.assertIn("| ::add-mask::hunter2", out)
 
     def test_github_output_receives_the_flags(self):
         tmp = tempfile.mkdtemp()

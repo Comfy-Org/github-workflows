@@ -88,7 +88,7 @@ silently vanishing — the review tells you what didn't run.
 | [`slack-notify.sh`](slack-notify.sh) | Sends the start/complete Slack DMs to the triggerer (no-ops without a token). |
 | [`install-cursor-cli.sh`](install-cursor-cli.sh) | Installs the Cursor agent CLI from the versioned, sha256-pinned release artifact — not `curl cursor.com/install \| bash`. Used by all three CLI-using jobs; the pin (`CURSOR_CLI_VERSION` / `CURSOR_CLI_SHA256`) lives in `cursor-review.yml`'s top-level `env:`. |
 | [`build-ledger.py`](build-ledger.py) | Builds the **prior-review ledger** — what earlier rounds raised on this PR and how the author answered — and splices it into the panel/judge prompts. Also the prompt splicer, so the no-ledger path is byte-identical to the pre-ledger prompt. |
-| [`catalog-drift.py`](catalog-drift.py) | Backs the weekly catalog-drift check. Extracts the pins from `cursor-review.yml`, diffs them against raw `cursor-agent models` output, and renders the sticky issue title + body (delisted pins, unpinned same-lab ids, stale audit date). Reports only — it never edits a pin. |
+| [`catalog-drift.py`](catalog-drift.py) | Backs the weekly catalog-drift check. Extracts the pins from `cursor-review.yml`, diffs them against raw `cursor-agent models` output, and renders the sticky issue title + body (delisted pins, pins marked NO-ZDR, unpinned same-lab ids, stale audit date). Reports only — it never edits a pin. |
 
 ## Adopt it in your repo
 
