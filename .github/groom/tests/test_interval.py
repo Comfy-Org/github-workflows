@@ -328,6 +328,27 @@ class PreAgentFailureTest(unittest.TestCase):
         # Exactly one step in that job carries the name — otherwise "did the agent
         # start?" stops having a single answer.
         self.assertEqual(finder_block[0].count(f"- name: {interval.agent_step_name()}\n"), 1)
+        # And that step must carry no `if:`. A `success` is trusted on the job
+        # conclusion ALONE, so a conditionally-skipped agent inside a succeeding
+        # job would count as a spent audit and suppress the cadence for a full
+        # interval while billing nothing. groom.yml warns about this in a comment;
+        # this is the assertion that actually holds the line.
+        step = finder_block[0].split(f"- name: {interval.agent_step_name()}\n", 1)[1]
+        step = step.split("\n      - name:", 1)[0]
+        self.assertNotRegex(step, r"(?m)^\s+if:\s", "the pinned agent step must not be conditional")
+
+    def test_the_gate_job_is_time_bounded(self):
+        # The gate walks run history (and, for re-run entries, per-attempt job
+        # payloads) at a 30s per-call timeout, so its cost is data-dependent. It
+        # is the cheap job, but it still needs a hard stop like every other job
+        # in the file.
+        wf = os.path.join(os.path.dirname(__file__), "..", "..", "workflows", "groom.yml")
+        with open(wf, encoding="utf-8") as f:
+            text = f.read()
+        gate = re.split(r"(?m)^  (?=[A-Za-z_][A-Za-z0-9_-]*:\s*$)", text)
+        gate = [b for b in gate if b.startswith("gate:")]
+        self.assertEqual(len(gate), 1, "could not isolate the gate job in groom.yml")
+        self.assertRegex(gate[0], r"(?m)^    timeout-minutes: \d+$")
 
 
 class CancelledAndTimedOutTest(unittest.TestCase):
@@ -427,11 +448,44 @@ class EarlierAttemptTest(unittest.TestCase):
             {"id": 90, "status": "completed", "run_started_at": iso(8)},
         ]
 
+    def billed_attempt(self, days_ago):
+        """A billed finder job stamped with when that attempt actually ran."""
+        job = billed_finder_job()
+        job["started_at"] = iso(days_ago)
+        return [job]
+
     def test_an_earlier_attempt_that_billed_still_counts(self):
         latest = {"99": [finder_job("failure", [pre_agent_step()])], "90": [finder_job("success")]}
-        by_attempt = {"99/1": [billed_finder_job()], "99/2": latest["99"]}
+        by_attempt = {"99/1": self.billed_attempt(1), "99/2": latest["99"]}
         d = interval.evaluate("o/r", "ci-groom.yml", 100, 7.0, "schedule", NOW,
                               run=make_gh_stub(self.runs(2), latest, by_attempt))
+        self.assertFalse(d["should_run"], d["reason"])
+        self.assertEqual(d["last_run_at"], iso(1))
+
+    def test_the_anchor_never_falls_back_to_the_re_run_timestamp(self):
+        # The fallback chain for an earlier attempt is finder-job start ->
+        # `created_at` -> give up. `run_started_at` is deliberately NOT the last
+        # resort: it is the re-run time, so using it would date a week-old audit
+        # to today and suppress the next full interval (fail-CLOSED). With neither
+        # timestamp available the run is skipped and the scan moves to an older
+        # one — here the 8-day-old real run, so the tick RUNS.
+        runs = self.runs(2)
+        runs[1]["run_started_at"] = iso(0.1)   # today's pre-agent re-run
+        latest = {"99": [finder_job("failure", [pre_agent_step()])], "90": [finder_job("success")]}
+        d = interval.evaluate("o/r", "ci-groom.yml", 100, 7.0, "schedule", NOW,
+                              run=make_gh_stub(runs, latest, {"99/1": [billed_finder_job()]}))
+        self.assertTrue(d["should_run"], d["reason"])
+        self.assertEqual(d["last_run_at"], iso(8))
+
+    def test_an_audited_latest_attempt_missing_run_started_at_still_anchors(self):
+        # The latest-attempt branch shares the same fallbacks instead of dropping
+        # the run: `run_started_at` -> finder-job start -> `created_at`.
+        runs = self.runs(1)
+        del runs[1]["run_started_at"]
+        runs[1]["created_at"] = iso(1)
+        d = interval.evaluate("o/r", "ci-groom.yml", 100, 7.0, "schedule", NOW,
+                              run=make_gh_stub(runs, {"99": self.billed_attempt(1),
+                                                      "90": [finder_job("success")]}))
         self.assertFalse(d["should_run"], d["reason"])
         self.assertEqual(d["last_run_at"], iso(1))
 
@@ -489,10 +543,10 @@ class EarlierAttemptTest(unittest.TestCase):
         # The harm the direction bug caused, end to end: attempt 49 of 50 paid for
         # the agent, so today's tick must SKIP rather than re-spend it.
         latest = {"99": [finder_job("failure", [pre_agent_step()])], "90": [finder_job("success")]}
-        by_attempt = {"99/49": [billed_finder_job()]}
         d = interval.evaluate("o/r", "ci-groom.yml", 100, 7.0, "schedule", NOW,
-                              run=make_gh_stub(self.runs(50), latest, by_attempt))
+                              run=make_gh_stub(self.runs(50), latest, {"99/49": self.billed_attempt(1)}))
         self.assertFalse(d["should_run"], d["reason"])
+        self.assertEqual(d["last_run_at"], iso(1))
 
     def test_the_anchor_is_the_audited_attempt_not_the_re_run(self):
         # `run_started_at` tracks the LATEST attempt. If the paid attempt ran 8
@@ -531,6 +585,38 @@ class EarlierAttemptTest(unittest.TestCase):
             d = interval.evaluate("o/r", "ci-groom.yml", 100, 7.0, "schedule", NOW,
                                   run=make_gh_stub(runs, latest, {}))
             self.assertFalse(d["should_run"], (raw, d["reason"]))
+
+    def test_a_run_entry_with_a_junk_id_is_skipped_not_fetched(self):
+        # A missing/garbage `id` would interpolate into the URL and spend a doomed
+        # round-trip. It must skip that ENTRY, not abort the scan — aborting would
+        # fail open on the whole decision and forget the real history behind it.
+        seen = []
+        runs = [
+            {"id": 100, "status": "in_progress", "run_started_at": iso(0)},
+            {"status": "completed", "run_started_at": iso(1)},                  # no id
+            {"id": "99; rm -rf /", "status": "completed", "run_started_at": iso(1)},
+            {"id": 90, "status": "completed", "run_started_at": iso(8)},
+        ]
+        base = make_gh_stub(runs, {"90": [finder_job("success")]})
+
+        def spy(cmd, **kwargs):
+            seen.append(cmd[-1])
+            return base(cmd, **kwargs)
+
+        d = interval.evaluate("o/r", "ci-groom.yml", 100, 7.0, "schedule", NOW, run=spy)
+        self.assertTrue(d["should_run"], d["reason"])
+        self.assertEqual(d["last_run_at"], iso(8))       # the scan reached the real run
+        self.assertFalse([u for u in seen if "None" in u or "rm -rf" in u], seen)
+
+    def test_finder_job_started_at_scans_past_a_match_with_no_timestamp(self):
+        stamped = finder_job("success")
+        stamped["started_at"] = iso(3)
+        jobs = [{"name": "groom / Gate", "started_at": iso(9)},
+                finder_job("skipped"),                    # matches the hint, no timestamp
+                stamped]
+        self.assertEqual(interval.finder_job_started_at(jobs), iso(3))
+        self.assertIsNone(interval.finder_job_started_at([finder_job("skipped")]))
+        self.assertIsNone(interval.finder_job_started_at(None))
 
 
 class IntervalThresholdTest(unittest.TestCase):

@@ -161,6 +161,9 @@ _REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 # A workflow file basename the API accepts as a workflow id, e.g. `ci-groom.yml`.
 _WORKFLOW_FILE_RE = re.compile(r"^[A-Za-z0-9._-]+\.ya?ml$")
 
+# A run id is a bare positive integer — anything else came from a junk payload.
+_RUN_ID_RE = re.compile(r"^[0-9]+$")
+
 # Bound each `gh api` call so a stalled connection can't hang the gate until the
 # coarse job timeout (mirrors ledger.py).
 _FETCH_TIMEOUT_SECONDS = 30
@@ -419,6 +422,10 @@ def fetch_run_jobs(repo: str, run_id, run=subprocess.run, attempt=None):
     """
     if not _REPO_RE.match(repo or ""):
         raise ValueError(f"invalid repo {repo!r}: expected owner/name")
+    # Guarded like `repo`: a junk run payload missing `id` would otherwise
+    # interpolate `None` into the path and spend a doomed round-trip to find out.
+    if not _RUN_ID_RE.match(str(run_id or "")):
+        raise ValueError(f"invalid run id {run_id!r}: expected a positive integer")
     base = f"/repos/{repo}/actions/runs/{run_id}"
     if attempt is not None:
         base = f"{base}/attempts/{int(attempt)}"
@@ -427,12 +434,20 @@ def fetch_run_jobs(repo: str, run_id, run=subprocess.run, attempt=None):
 
 
 def finder_job_started_at(jobs):
-    """`started_at` of the finder job in one attempt's jobs payload, or None."""
+    """`started_at` of the finder job in one attempt's jobs payload, or None.
+
+    Keeps scanning past a matching job that carries no usable timestamp rather
+    than giving up on the first hint match — there is one finder job today, but a
+    payload that listed a second must not lose the answer to ordering.
+    """
     for job in jobs if isinstance(jobs, list) else []:
         if not isinstance(job, dict):
             continue
-        if any(hint in _text(job.get("name")).lower() for hint in _FINDER_JOB_HINTS):
-            return _text(job.get("started_at")) or None
+        if not any(hint in _text(job.get("name")).lower() for hint in _FINDER_JOB_HINTS):
+            continue
+        started = _text(job.get("started_at"))
+        if started:
+            return started
     return None
 
 
@@ -450,8 +465,15 @@ def audited_run_anchor(repo, wf_run, run=subprocess.run):
     re-ran by hand, and the loop is skipped entirely.
     """
     run_id = wf_run.get("id")
-    if run_audited(fetch_run_jobs(repo, run_id, run=run)):
-        return _text(wf_run.get("run_started_at")) or None
+    latest_jobs = fetch_run_jobs(repo, run_id, run=run)
+    if run_audited(latest_jobs):
+        # `run_started_at` tracks the LATEST attempt, which is the audited one
+        # here, so it is the right anchor — but share the earlier-attempt branch's
+        # fallbacks rather than dropping the whole run when it is missing.
+        return (_text(wf_run.get("run_started_at"))
+                or finder_job_started_at(latest_jobs)
+                or _text(wf_run.get("created_at"))
+                or None)
     try:
         attempts = int(wf_run.get("run_attempt") or 1)
     except (TypeError, ValueError):
@@ -467,13 +489,12 @@ def audited_run_anchor(repo, wf_run, run=subprocess.run):
             # `run_started_at` tracks the LATEST attempt, so anchoring on it here
             # would date a week-old paid audit to today's pre-agent re-run and
             # suppress the next full interval — the fail-CLOSED direction this
-            # gate exists to avoid. Prefer the audited attempt's own finder-job
-            # start; fall back to the run's creation (older anchor = more elapsed
-            # days = fail-open) rather than the re-run time.
-            return (finder_job_started_at(jobs)
-                    or _text(wf_run.get("created_at"))
-                    or _text(wf_run.get("run_started_at"))
-                    or None)
+            # gate exists to avoid. So it is NOT in this chain at all, not even as
+            # a last resort: prefer the audited attempt's own finder-job start,
+            # then the run's creation (an older anchor means more elapsed days,
+            # i.e. fail-open), and otherwise give up on this run entirely — the
+            # scan moves to an older one, which is again the fail-open direction.
+            return finder_job_started_at(jobs) or _text(wf_run.get("created_at")) or None
     return None
 
 
@@ -490,6 +511,10 @@ def find_last_audited_run_at(repo, workflow_file, current_run_id, run=subprocess
     current = str(current_run_id) if current_run_id is not None else None
     for wf_run in fetch_workflow_runs(repo, workflow_file, run=run):
         if not isinstance(wf_run, dict):
+            continue
+        # One junk entry skips that run rather than aborting the scan (which
+        # would fail open on the whole decision and forget real history).
+        if not _RUN_ID_RE.match(str(wf_run.get("id") or "")):
             continue
         if current is not None and str(wf_run.get("id")) == current:
             continue

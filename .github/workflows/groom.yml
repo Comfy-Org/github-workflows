@@ -360,6 +360,13 @@ jobs:
   gate:
     name: Gate
     runs-on: ubuntu-latest
+    # The one job here that had no bound. It is meant to be cheap — a handful of
+    # `gh api` reads — but its cost is data-dependent: the interval gate walks up
+    # to `_MAX_RUNS_SCANNED` runs and, for any that were re-run by hand, up to
+    # `_MAX_ATTEMPTS_SCANNED` attempts each, at a 30s per-call timeout. A degraded
+    # API on a pathological history could burn runner minutes before the gate
+    # fails open. Ten minutes is ~20x the normal case and still a hard stop.
+    timeout-minutes: 10
     permissions:
       contents: read
       # The interval gate lists THIS caller's Actions run history to find the
