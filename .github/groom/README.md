@@ -19,6 +19,15 @@ The finder's JSON file is the **only** handoff between the phases — the verifi
 never sees the finder's reasoning, only its claims and the actual code. That
 separation is the whole point: the skeptic can't be anchored by the proposer.
 
+**Optional phase 3 — the auto-builder** ([`builder.md`](builder.md), BE-4003).
+When the workflow runs with `builder: true`, the top few CONFIRMED, non-security
+findings are handed one at a time to a **credential-free** builder agent that
+writes the code change into its checkout; a separate no-agent job captures the
+diff, opens a **review-gated PR** as the bot (never auto-merged), and the
+ledger's PR-state stops that finding from being re-proposed. The builder holds no
+credentials — it can only produce a *patch*, never push. Default off: the
+finds-only groomer (issues) stays the default.
+
 These two files are the **single source of truth** for the groom prompts, the
 same way [`.github/cursor-review/`](../cursor-review) is for the review panel.
 The core thesis of the groom initiative is *collaborate on the prompt, not the
@@ -31,6 +40,7 @@ rather than buried in a runner script.
 |---|---|---|---|
 | 1. Find | [`finder.md`](finder.md) | clean `origin/main` checkout + scan scope | `{repo, scope, findings:[{title, dimension, sites, evidence, proposed, value, risk, confidence, steelman}]}` at `{{FINDER_OUT}}` |
 | 2. Verify | [`verifier.md`](verifier.md) | the finder's JSON + the code | `{repo, scope, summary, findings:[{title, verdict, security, signature, body}]}` at `{{VERIFIER_OUT}}` |
+| 3. Build (opt-in) | [`builder.md`](builder.md) | ONE verified finding `{title, body, signature}` at `{{FINDING_IN}}` + the code | edits in the checkout + a control file `{status: patched\|bail, summary}` at `{{BUILDER_OUT}}` |
 
 - **`verdict`** is `CONFIRM` \| `DOWNGRADE` (real but narrow the scope) \|
   `REJECT` (premature / overstated / not worth it).
@@ -64,6 +74,8 @@ single-brace JSON in the briefs). A consumer replaces every occurrence:
 | `{{SCOPE_LABEL}}` | short scope label (the package path, or `whole-repo`) |
 | `{{FINDER_OUT}}` | path the finder writes its candidate JSON to |
 | `{{VERIFIER_OUT}}` | path the verifier writes its verified JSON to |
+| `{{FINDING_IN}}` | (builder) path the single finding to build is read from |
+| `{{BUILDER_OUT}}` | (builder) path the builder writes its `{status, summary}` control file to |
 
 `{{FINDER_OUT}}` appears in **both** briefs (the finder writes it; the verifier
 reads it); `{{VERIFIER_OUT}}` and `{{REPO_BASENAME}}` appear only in the
@@ -97,17 +109,24 @@ can see). No separate database, cache, or committed state file.
 
 Keyed on `(repo, finding_signature) → {filed | rejected | superseded}`:
 
-| Live GitHub state | Ledger status | Re-file? |
+| Live GitHub state | Ledger status | Re-file / re-propose? |
 |---|---|---|
 | Open `groom` issue for the signature | `filed` | no |
 | Closed as **completed** | `filed` | no (already handled) |
 | Closed as **not planned** (GitHub "close as wontfix") | `rejected` | **no — durable** |
 | Carries the `groom-rejected` label (open or closed) | `rejected` | **no — durable** |
 | Carries the `groom-superseded` label | `superseded` | no |
-| No `groom` issue carries the signature | `unknown` | **yes** |
+| Open **builder PR** for the signature (BE-4003) | `pr-open` | no |
+| **Builder PR merged** | `merged` | no (shipped) |
+| **Builder PR closed unmerged** | `pr-closed` | **no — durable** (human declined) |
+| No `groom` issue or PR carries the signature | `unknown` | **yes** |
 
-Only an `unknown` signature is filed. Human rejection — close-as-not-planned or
-the `groom-rejected` label — suppresses that signature forever.
+Only an `unknown` signature is filed/proposed. Human rejection — close-as-not-planned,
+the `groom-rejected` label, or a **closed-unmerged builder PR** — suppresses that
+signature forever. The auto-builder's PRs carry the signature marker in their body
+exactly like a filed issue, so the same ledger recognizes them: the `/issues`
+listing returns groom-labeled PRs too, and the marker check (a human-opened,
+markerless `groom` issue/PR is ignored) is what keeps including PRs safe.
 
 ### The filing contract (load-bearing)
 
@@ -145,6 +164,75 @@ Single-signature probe (exit 0 = should file, 1 = suppressed):
 
 ```bash
 python3 .github/groom/ledger.py --repo owner/name --check "<signature>"
+```
+
+## `interval.py` — the runtime cadence gate (BE-4004)
+
+GitHub Actions `schedule:` cron is **static in the workflow file** — there is no
+native "every N days" input. So a caller fires on a **frequent (daily) base
+cron**, and this gate turns that into an **effective every-`GROOM_INTERVAL_DAYS`
+run**: at run start it early-exits unless the interval has elapsed since the last
+real groom, so a skipped tick costs ~nothing (it never reaches the finder).
+
+- **The knob is a repo Actions variable, `GROOM_INTERVAL_DAYS`** (default `7` =
+  weekly, matching the original cron). The caller wires it to the reusable's
+  `interval_days` input (`interval_days: ${{ vars.GROOM_INTERVAL_DAYS || '7' }}`)
+  and re-evaluates it each run, so changing the variable retunes cadence — weekly
+  → every-3-days → daily — with **no workflow-file edit**, the same "live knob"
+  ergonomics as the per-repo caps. Both cadence inputs (`interval_days`,
+  `cadence`) are declared **`type: string`** deliberately: they carry a free-text
+  Actions variable, and a `number` input would make GitHub reject a typo'd value
+  (`weekly`, `7d`) at workflow-call time — failing the run *closed* before the
+  degradation below could ever run. As strings, `interval.py` is the single
+  normalization authority.
+- **A tick clears the bar a half-tick early.** GitHub's cron fires late by an
+  unpredictable amount, so demanding a full `interval_days` on a daily tick would
+  skip at 6.99 days elapsed, push the run to tomorrow, and — because the clock
+  re-anchors on that later run — ratchet the cadence a day later every cycle. The
+  gate compares against `interval_days` less `0.5` (capped at half the interval),
+  which absorbs the jitter without letting two real runs land on consecutive
+  daily ticks (those are a full ~1.0 day apart).
+- **Last-run state is derived from GitHub Actions run history**, not a writable
+  store: the GitHub-native option that needs **no net-new secret** and only
+  `actions: read`. A prior run "counts" only if it actually reached the finder
+  (its `Audit — finder` job ran, not `skipped` by this gate), so the
+  interval-skip ticks in between never reset the clock. (A repo variable would
+  need a `Variables: write` credential the run doesn't carry, and a missing grant
+  would fail *silently* into a daily over-spend — run history has no such trap.)
+- **`workflow_dispatch` bypasses THIS gate** — a manual dispatch is never
+  interval-throttled. It is not a blanket "always runs": the volume gate is a
+  second, independent throttle, so a live dispatch into a quiescent repo can
+  still skip. Turn `volume_gate` off (the reference caller does exactly this for
+  `dry_run:true` dispatches) if a manual run must always reach the finder.
+- **Fail-open**, like the volume gate: any error reading history (API hiccup, no
+  history, unparseable timestamp) RUNS the audit rather than skip a due groom.
+- **One normalization for both gates.** The caller wires the same variable to
+  `cadence` (the volume gate's merge-activity window), so the volume gate routes
+  it through this module too — `interval.py --normalize-cadence "$CADENCE"` —
+  rather than feeding the raw value to `date -d`. Same degradation
+  (blank/garbage/negative → `7`), then floored at **1 whole day**. Without it the
+  gates drift on reachable values: `-3` becomes a *future* `date -d` cutoff that
+  matches no merged PR (skipping every run — groom silently off) while the
+  interval gate had safely degraded to weekly, and `0` (a legitimate "no
+  throttle") shrinks the merge window to today-only.
+
+The caller **must** grant `actions: read`. The `gate` job declares that scope, and
+a nested reusable job can never hold more than the calling job grants — GitHub
+checks the subset at **startup**, so a caller that omits it has the whole run
+rejected (`requesting 'actions: read', but is only allowed 'actions: none'`,
+surfaced as an opaque "workflow file issue" with zero jobs) rather than degrading
+to a fail-open daily run. Fail-open covers the *other* failure: the grant is
+present but the history read errors (fresh repo with no runs, API hiccup) — then
+the gate runs rather than skips. As with `ledger.py`, the pure decision logic is
+split from the thin `gh` I/O so it is fully unit-testable with no network.
+
+```bash
+python3 .github/groom/interval.py \
+    --repo owner/name --workflow-file ci-groom.yml \
+    --current-run-id 123 --interval-days 7 --event-name schedule
+
+# Second mode — normalize the shared knob into the volume gate's window:
+python3 .github/groom/interval.py --normalize-cadence "$GROOM_INTERVAL_DAYS"
 ```
 
 - **`tests/`** — `unittest` suite, run by

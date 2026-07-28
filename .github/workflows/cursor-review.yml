@@ -57,7 +57,7 @@ on:
           the panel.
         type: string
         required: false
-        default: claude-opus-4-8-thinking-max
+        default: claude-opus-5-thinking-max
       diff_size_cap:
         description: >-
           Max counted changed lines. PRs over the cap are skipped — too large
@@ -489,17 +489,22 @@ jobs:
         # Keep in sync with the README model table.
         #
         # Pinned to each lab's newest highest-reasoning tier in Cursor's
-        # catalog (last checked 2026-07-14). OpenAI: GPT-5.6 Sol is the
+        # catalog (last checked 2026-07-28). OpenAI: GPT-5.6 Sol is the
         # 5.6-family coding flagship (no 5.6 codex variant exists). Anthropic:
         # Fable 5 tops the catalog but all Fable entries are marked NO ZDR in
         # Cursor, and this panel reviews private-repo diffs, so it is excluded;
-        # Opus 4.8 thinking at its max tier is the top ZDR-eligible pick.
+        # bumped Anthropic's pin from Opus 4.8 to Opus 5 thinking at its max
+        # tier. ZDR eligibility for Opus 5 specifically in Cursor's catalog
+        # is UNCONFIRMED as of this bump (no CURSOR_API_KEY/live-catalog
+        # access and no verifiable primary source were available when this
+        # was written) — confirm against Cursor's live catalog/dashboard
+        # before relying on this pin for private-repo review traffic.
         # Gemini (Pro line) and Kimi still ship a single reasoning tier each.
         run: |
           cat > /tmp/models.json <<'JSON'
           [
             "gpt-5.6-sol-max",
-            "claude-opus-4-8-thinking-max",
+            "claude-opus-5-thinking-max",
             "gemini-3.1-pro",
             "kimi-k2.7-code"
           ]

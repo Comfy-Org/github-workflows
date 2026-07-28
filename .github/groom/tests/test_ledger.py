@@ -20,8 +20,13 @@ ledger = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ledger)
 
 
-def issue(signature=None, *, state="open", state_reason=None, labels=("groom",), body=None, pr=False):
-    """Build a minimal GitHub-issue dict, embedding a marker unless body given."""
+def issue(signature=None, *, state="open", state_reason=None, labels=("groom",), body=None, pr=False, merged_at=None):
+    """Build a minimal GitHub-issue dict, embedding a marker unless body given.
+
+    Set `pr=True` to model a builder pull request (the `/issues` listing returns
+    PRs too, tagged with a `pull_request` object); `merged_at` is the merge
+    timestamp GitHub stamps on that object when a PR merges (None = unmerged).
+    """
     if body is None:
         body = "Some finding text.\n\n" + ledger.signature_marker(signature) if signature else "no marker"
     d = {
@@ -31,7 +36,7 @@ def issue(signature=None, *, state="open", state_reason=None, labels=("groom",),
         "body": body,
     }
     if pr:
-        d["pull_request"] = {"url": "http://x"}
+        d["pull_request"] = {"url": "http://x", "merged_at": merged_at}
     return d
 
 
@@ -121,6 +126,32 @@ class ClassifyIssueTest(unittest.TestCase):
             ledger.REJECTED,
         )
 
+    # --- Builder PR states (BE-4003) ---
+
+    def test_open_builder_pr_is_pr_open(self):
+        self.assertEqual(ledger.classify_issue(issue("s", pr=True, state="open")), ledger.PR_OPEN)
+
+    def test_merged_builder_pr_is_merged(self):
+        # A merge stamps `merged_at` — the finding shipped, don't re-propose.
+        self.assertEqual(
+            ledger.classify_issue(issue("s", pr=True, state="closed", merged_at="2026-07-21T00:00:00Z")),
+            ledger.MERGED,
+        )
+
+    def test_closed_unmerged_builder_pr_is_pr_closed(self):
+        # Closed without merging == a human declined the fix — durable, never re-propose.
+        self.assertEqual(
+            ledger.classify_issue(issue("s", pr=True, state="closed", merged_at=None)),
+            ledger.PR_CLOSED,
+        )
+
+    def test_rejected_label_on_open_pr_wins(self):
+        # groom-rejected on an open builder PR is still a durable human "no".
+        self.assertEqual(
+            ledger.classify_issue(issue("s", pr=True, state="open", labels=("groom", "groom-rejected"))),
+            ledger.REJECTED,
+        )
+
 
 class BuildLedgerTest(unittest.TestCase):
     def test_skips_issues_without_marker(self):
@@ -128,9 +159,47 @@ class BuildLedgerTest(unittest.TestCase):
         led = ledger.build_ledger([issue(body="human wrote this, no marker")])
         self.assertEqual(len(led), 0)
 
-    def test_skips_pull_requests(self):
-        led = ledger.build_ledger([issue("s", pr=True)])
+    def test_skips_markerless_pull_requests(self):
+        # A human PR labeled `groom` by hand (no signature marker) is not ours —
+        # the marker check is what makes including PRs safe.
+        led = ledger.build_ledger([issue(body="human PR, no marker", pr=True)])
         self.assertEqual(len(led), 0)
+
+    def test_includes_signed_builder_pr(self):
+        # A groom builder PR carries the marker AND the bot's `groom-pr` label →
+        # it IS a ledger record now.
+        led = ledger.build_ledger(
+            [issue("built", pr=True, state="open", labels=("groom", "groom-pr"))]
+        )
+        self.assertEqual(led, {"built": ledger.PR_OPEN})
+
+    def test_skips_pr_without_builder_label(self):
+        # A `groom`-labeled PR carrying a pasted signature marker but NOT the
+        # bot-applied `groom-pr` label is a spoof — it must not enter the ledger
+        # (else anyone with label access could suppress a live finding).
+        led = ledger.build_ledger([issue("spoof", pr=True, state="open")])
+        self.assertEqual(len(led), 0)
+
+    def test_spoof_pr_cannot_suppress_live_issue(self):
+        # A genuine open issue for a signature stays FILED even if a hand-opened
+        # `groom` PR (no `groom-pr` label) pastes the same marker and is closed
+        # unmerged to try to force a `pr-closed` suppression.
+        led = ledger.build_ledger([
+            issue("dup", state="open"),
+            issue("dup", pr=True, state="closed", merged_at=None),  # no groom-pr
+        ])
+        self.assertEqual(led["dup"], ledger.FILED)
+
+    def test_pr_closed_beats_open_issue_for_same_signature(self):
+        # A finding filed as an issue AND later built into a declined builder PR
+        # (carrying `groom-pr`): the human decline (pr-closed) is the most
+        # decision-bearing status.
+        led = ledger.build_ledger([
+            issue("dup", state="open"),
+            issue("dup", pr=True, state="closed", merged_at=None,
+                  labels=("groom", "groom-pr")),
+        ])
+        self.assertEqual(led["dup"], ledger.PR_CLOSED)
 
     def test_rejection_wins_when_duplicate_signatures(self):
         # Same signature on a filed AND a rejected issue → rejected surfaces.
@@ -251,6 +320,40 @@ class AcceptanceScenarioTest(unittest.TestCase):
         to_file, _, _ = led.partition([{"signature": "z-new"}])
         self.assertEqual(len(to_file), 1)
 
+    # --- Builder auto-PR dedup (BE-4003, acceptance criterion 3) ---
+
+    # Builder PRs carry the bot-applied `groom-pr` label — that's what admits
+    # them to the ledger (a marker alone on a hand-opened PR does not).
+    _PR_LABELS = ("groom", "groom-pr")
+
+    def test_open_builder_pr_suppresses_reproposal(self):
+        # Run N built "b" into an OPEN PR. Run N+1 must NOT re-propose it.
+        led = ledger.Ledger(ledger.build_ledger(
+            [issue("b", pr=True, state="open", labels=self._PR_LABELS)]
+        ))
+        to_file, suppressed, _ = led.partition([{"signature": "b"}])
+        self.assertEqual(to_file, [])
+        self.assertEqual(suppressed[0]["ledger_status"], ledger.PR_OPEN)
+
+    def test_merged_builder_pr_never_reproposed(self):
+        # A merged builder PR means the fix shipped — never re-propose.
+        led = ledger.Ledger(ledger.build_ledger(
+            [issue("b", pr=True, state="closed", merged_at="2026-07-21T00:00:00Z",
+                   labels=self._PR_LABELS)]
+        ))
+        to_file, suppressed, _ = led.partition([{"signature": "b"}])
+        self.assertEqual(to_file, [])
+        self.assertEqual(suppressed[0]["ledger_status"], ledger.MERGED)
+
+    def test_closed_builder_pr_never_reproposed(self):
+        # A human closed the builder PR unmerged — durable decline, never re-propose.
+        led = ledger.Ledger(ledger.build_ledger(
+            [issue("b", pr=True, state="closed", merged_at=None, labels=self._PR_LABELS)]
+        ))
+        to_file, suppressed, _ = led.partition([{"signature": "b"}])
+        self.assertEqual(to_file, [])
+        self.assertEqual(suppressed[0]["ledger_status"], ledger.PR_CLOSED)
+
 
 class FetchTest(unittest.TestCase):
     """Stub `gh api` to exercise the I/O shell without network."""
@@ -308,6 +411,119 @@ class FetchTest(unittest.TestCase):
         self.assertTrue(led.should_file("something-new"))
         self.assertFalse(led.should_file("open-one"))
         self.assertFalse(led.should_file("rejected-one"))
+
+
+class BuilderPrBodyTest(unittest.TestCase):
+    """The auto-builder PR body assembler (BE-4346).
+
+    Properties: the builder-authored ELI-5 body leads; the verifier rationale is
+    kept as a secondary `<details>` section; the banner is FIRST and the ledger
+    marker is LAST (so the next run still dedups the finding and the marker can't
+    be spoofed from the model body); and an empty / non-ELI-5 body falls back to
+    the original template rather than opening an empty-body PR.
+    """
+
+    BANNER = "> 🤖 **Auto-built by the groom sweep** — review required. · [run](http://x)"
+    ELI5 = ("## ELI-5\n\nWe renamed a helper so the two call sites read the same.\n\n"
+            "## What changed\n\nExtracted `fmt()` in `a.go` and `b.go`.\n\n"
+            "## Why\n\nLess duplication; behavior is identical.")
+
+    def test_builder_body_leads_and_wraps_rationale(self):
+        out = ledger.builder_pr_body(banner=self.BANNER, eli5_body=self.ELI5,
+                                     verifier_rationale="The verifier said X.", signature="sig-1")
+        self.assertTrue(out.startswith(self.BANNER))            # banner first
+        self.assertIn("## ELI-5", out)
+        self.assertLess(out.index("## ELI-5"), out.index("The verifier said X."))  # ELI-5 before rationale
+        self.assertIn("<details>", out)
+        self.assertIn("The verifier said X.", out)
+        self.assertEqual(ledger.extract_signature(out), "sig-1")  # marker recoverable
+        # Marker is LAST: nothing but whitespace after it.
+        self.assertRegex(out, r"-->\s*\Z")
+
+    def test_fallback_when_body_empty(self):
+        out = ledger.builder_pr_body(banner=self.BANNER, eli5_body="",
+                                     verifier_rationale="Rationale here.", signature="sig-2")
+        self.assertTrue(out.startswith(self.BANNER))
+        self.assertIn("## Verifier rationale", out)             # original template
+        self.assertNotIn("<details>", out)
+        self.assertIn("Rationale here.", out)
+        self.assertEqual(ledger.extract_signature(out), "sig-2")
+
+    def test_fallback_when_body_lacks_eli5_heading(self):
+        # A body whose FIRST heading isn't ELI-5 is unusable → template fallback,
+        # guaranteeing every builder-body PR opens with ELI-5.
+        body = "## Summary\n\nDid a thing.\n\n## ELI-5\n\ntoo late, not first."
+        out = ledger.builder_pr_body(banner=self.BANNER, eli5_body=body,
+                                     verifier_rationale="R.", signature="sig-3")
+        self.assertIn("## Verifier rationale", out)
+        self.assertNotIn("<details>", out)
+
+    def test_eli5_heading_variants_are_accepted(self):
+        for heading in ("## ELI-5", "## ELI5", "### ELI-5: overview", "#  eli 5"):
+            body = f"{heading}\n\nplain words."
+            out = ledger.builder_pr_body(banner=self.BANNER, eli5_body=body,
+                                         verifier_rationale="R.", signature="s")
+            self.assertIn("<details>", out, f"{heading!r} should be accepted as ELI-5")
+
+    def test_spoofed_marker_in_body_cannot_shadow_real_signature(self):
+        # A prompt-injected body embedding a marker for a DIFFERENT signature must
+        # NOT poison the ledger: extract_signature reads the LAST marker, and the
+        # real one is appended after the body.
+        evil = ledger.signature_marker("attacker-sig")
+        body = f"## ELI-5\n\nlooks fine {evil}\n\nmore."
+        out = ledger.builder_pr_body(banner=self.BANNER, eli5_body=body,
+                                     verifier_rationale="R.", signature="real-sig")
+        self.assertEqual(ledger.extract_signature(out), "real-sig")
+
+    def test_whitespace_only_body_falls_back(self):
+        out = ledger.builder_pr_body(banner=self.BANNER, eli5_body="   \n  ",
+                                     verifier_rationale="R.", signature="s")
+        self.assertIn("## Verifier rationale", out)
+        self.assertNotIn("<details>", out)
+
+    def test_decoy_eli5_heading_in_code_fence_is_rejected(self):
+        # A `## ELI-5` that only appears inside a leading fenced code block never
+        # renders as the opening heading — it must NOT be accepted as ELI-5-first.
+        body = "```md\n## ELI-5\n```\n\n## What changed\n\nreal content."
+        out = ledger.builder_pr_body(banner=self.BANNER, eli5_body=body,
+                                     verifier_rationale="R.", signature="s")
+        self.assertIn("## Verifier rationale", out)  # template fallback
+        self.assertNotIn("<details>", out)
+
+    def test_real_eli5_heading_after_code_fence_is_accepted(self):
+        # A genuine ELI-5 heading is still detected even when an earlier fenced
+        # block contains heading-shaped lines.
+        body = "```\n# not a heading\n```\n\n## ELI-5\n\nplain words."
+        out = ledger.builder_pr_body(banner=self.BANNER, eli5_body=body,
+                                     verifier_rationale="R.", signature="s")
+        self.assertIn("<details>", out)
+
+    def test_comment_injection_in_body_is_neutralized(self):
+        # An unclosed HTML comment in the builder body must not hide the rationale
+        # or marker: the delimiters are escaped to visible text, and the ledger
+        # marker still round-trips.
+        body = "## ELI-5\n\nlooks fine <!-- everything after here is hidden"
+        out = ledger.builder_pr_body(banner=self.BANNER, eli5_body=body,
+                                     verifier_rationale="rationale stays visible", signature="sig-x")
+        self.assertNotIn("<!--", out.replace(ledger.signature_marker("sig-x"), ""))
+        self.assertIn("rationale stays visible", out)
+        self.assertEqual(ledger.extract_signature(out), "sig-x")
+
+    def test_details_injection_in_rationale_is_neutralized(self):
+        # A `</details>` in the rationale must not close the wrapping section early.
+        out = ledger.builder_pr_body(banner=self.BANNER, eli5_body=self.ELI5,
+                                     verifier_rationale="oops </details> broke out", signature="s")
+        self.assertNotIn("</details> broke out", out)
+        self.assertIn("&lt;/details&gt;", out)
+
+    def test_oversized_rationale_is_truncated_under_limit(self):
+        huge = "X" * 200_000
+        out = ledger.builder_pr_body(banner=self.BANNER, eli5_body=self.ELI5,
+                                     verifier_rationale=huge, signature="sig-big")
+        self.assertLessEqual(len(out), 65536)          # under GitHub's hard limit
+        self.assertIn("truncated", out)
+        self.assertTrue(out.rstrip().endswith("-->"))  # marker preserved LAST
+        self.assertEqual(ledger.extract_signature(out), "sig-big")
 
 
 if __name__ == "__main__":
