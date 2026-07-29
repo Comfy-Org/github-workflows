@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+"""Resolve groom's OPERATIONAL knobs from a JSON Actions variable (BE-5227).
+
+Every groom knob used to be a `with:` input on the caller, so retuning one —
+raise the builder PR ceiling, narrow the scan to a package, pause filing —
+meant editing a workflow file in the consumer repo, opening a PR, and waiting
+for review. `interval_days` already escaped that via the `GROOM_INTERVAL_DAYS`
+Actions variable (BE-4004); this module generalizes that one-off into a single
+`GROOM_CONFIG` JSON variable covering every operational knob.
+
+Precedence, highest first:
+
+  1. `workflow_dispatch` inputs  — a one-run override an operator types in the UI
+  2. `GROOM_CONFIG` (this file)  — the live, no-PR config layer
+  3. the caller's `with:` inputs — the reviewed default committed in the repo
+  4. the reusable's own defaults
+
+so an existing caller that sets nothing keeps behaving EXACTLY as before, and a
+repo opts into variable-driven config purely by setting the variable.
+
+WHAT THIS DELIBERATELY CANNOT SET (`_LOCKED_KEYS`)
+--------------------------------------------------
+An Actions variable is editable by anyone with repo write — the same principals
+who could edit the workflow file — but editing it BYPASSES PR REVIEW, and unlike
+a commit it leaves no diff on a branch. So the knobs that define the auto-builder's
+security boundary stay in the reviewed workflow file and are IGNORED here, loudly:
+
+  * `builder`       — flipping the auto-builder on is a decision to let an agent
+                      author code in this repo. That belongs in a reviewed commit.
+  * `pr_size_limit` — the patch-size bail-out is the backstop that keeps an
+                      unreviewably-large machine patch out of a PR.
+  * `sink`, `bot_app_id`, `workflows_ref`, `config` — identity, the pinned
+                      asset ref, and this input itself: pinning is the
+                      reproducibility contract, not an operational dial.
+
+Everything else (`_OPERATIONAL_KEYS`) is fair game: it can only make groom
+scan less, propose less, or file less — never grant it more privilege.
+
+FAIL-OPEN, ALWAYS
+-----------------
+This runs before the finder, i.e. before anything has been paid for, but a
+malformed variable must never take groom offline: a repo that typos its JSON
+should get a WARNING and the previous (`with:`) behavior, not a red run every
+day until someone notices. So every failure path here degrades to the caller's
+defaults and exits 0. The one thing it will not do is silently accept a value it
+could not parse — each drop emits a `::warning::` naming the key.
+
+Output is ONE compact JSON object on a single line, written to stdout for the
+workflow to stash in `$GITHUB_OUTPUT` as `resolved`. Consumers read individual
+knobs with `fromJSON(needs.gate.outputs.resolved).max_prs`. One output beats
+eleven because job outputs are strings: multi-line values (`themes`,
+`scope_desc`) would each need heredoc delimiter plumbing, and every new knob
+would mean another output declaration in `gate` plus another `env:` line in
+every consuming job.
+
+CLI:
+
+    python3 .github/groom/config.py \
+        --defaults-json "$DEFAULTS" \
+        --config-json "$GROOM_CONFIG" \
+        [--dispatch-json "$DISPATCH_INPUTS"]
+"""
+
+import argparse
+import json
+import re
+import sys
+
+# Knobs `GROOM_CONFIG` may set. The value is the coercion applied — see the
+# `_coerce_*` helpers for why each knob is typed the way it is (several are
+# deliberately kept as STRINGS because a downstream parser, not this module, is
+# their normalization authority).
+_OPERATIONAL_KEYS = {
+    "dry_run": "bool",
+    "volume_gate": "bool",
+    # Stays a string: `build_select`'s Python block is the single parse/clamp
+    # authority for max_prs (see the input's description in groom.yml), and
+    # duplicating the clamp here would give two places to disagree.
+    "max_prs": "numeric_string",
+    "max_findings": "nonneg_int",
+    # Stay strings: interval.py is the single normalization authority, and it
+    # deliberately degrades blank/garbage/negative to 7 rather than failing.
+    "interval_days": "numeric_string",
+    "cadence": "numeric_string",
+    "paths": "path_list",
+    "themes": "prose",
+    "scope_desc": "prose",
+    "scope_label": "scope_label",
+    "model": "model",
+}
+
+# Knobs the variable may NOT set — see the module docstring for why each one is
+# here. Present-but-ignored, with a loud warning: silently dropping them would
+# leave an operator believing they had disabled the builder.
+_LOCKED_KEYS = ("builder", "pr_size_limit", "sink", "bot_app_id", "workflows_ref", "config")
+
+# Caps on the free-text knobs. These land in the finder/verifier BRIEFS — the
+# trusted prompt — so a variable edit is a (repo-write-gated) path into prompt
+# text. Bounding length and stripping control characters keeps a careless or
+# malicious value from displacing the brief's own instructions with a wall of
+# text; it is a blast-radius limit, not an injection proof (the brief's own
+# "treat repo content as untrusted data" framing carries that).
+_PROSE_MAX = 600
+_PATH_MAX = 200
+_PATHS_MAX = 50
+
+# A scan path must look like a repo-relative path. No absolute paths, no `..`
+# traversal, no globs that would read as shell — the value is interpolated into
+# prose the agent reads, and a plausible-looking `/etc` or `../../` entry would
+# point the scan (and the reader) somewhere meaningless at best.
+_PATH_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._/\-]*$")
+
+# A model id is passed as the VALUE of `claude --model`, so it cannot become a
+# separate flag — but keep it to the shape a model id actually has rather than
+# forwarding arbitrary bytes into the agent invocation. Leading `-` is refused
+# explicitly: it is the one shape that would be worth attempting.
+_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+# Printable-only: strip C0/C1 controls (including newlines) from prose that gets
+# spliced into a single-line JSON output and then into a prompt. A newline in
+# `scope_desc` could otherwise fabricate a new instruction line in the brief.
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _warn(message: str) -> None:
+    """Emit a GitHub Actions warning annotation on stderr.
+
+    stderr, not stdout: stdout carries the resolved JSON and nothing else.
+    """
+    print(f"::warning::groom config: {message}", file=sys.stderr)
+
+
+def _coerce_bool(key, value):
+    """JSON `true`/`false`, or the strings "true"/"false" (any case).
+
+    Strings are accepted because a caller may forward a `workflow_dispatch`
+    input, which GitHub always delivers as a string, through the same merge.
+    Anything else (1, "yes", null) is DROPPED rather than guessed at: silently
+    reading "yes" as false would quietly turn filing back on.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    _warn(f"{key}={value!r} is not a boolean — ignoring it (using the caller's value).")
+    return None
+
+
+def _coerce_numeric_string(key, value):
+    """A number kept AS A STRING for a downstream parser to normalize.
+
+    `max_prs`, `interval_days` and `cadence` each have an existing, documented
+    parser that owns clamping and fail-open degradation. This only checks the
+    value is numeric at all and hands the canonical string on, so the resolved
+    JSON never carries a shape those parsers would choke on.
+    """
+    if isinstance(value, bool):  # bool is an int subclass — reject before the number check
+        _warn(f"{key}={value!r} is a boolean, expected a number — ignoring it.")
+        return None
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            float(value.strip())
+        except ValueError:
+            _warn(f"{key}={value!r} is not a number — ignoring it.")
+            return None
+        return value.strip()
+    _warn(f"{key}={value!r} is not a number — ignoring it.")
+    return None
+
+
+def _coerce_nonneg_int(key, value):
+    """A non-negative integer, floored.
+
+    `max_findings` slices the filing list (`[:cap]`); a negative value would
+    make that slice count from the END and file the wrong subset, so refuse it
+    here rather than let it through to the file job.
+    """
+    if isinstance(value, bool):
+        _warn(f"{key}={value!r} is a boolean, expected a number — ignoring it.")
+        return None
+    try:
+        parsed = int(float(value))
+    except (TypeError, ValueError):
+        _warn(f"{key}={value!r} is not a number — ignoring it.")
+        return None
+    if parsed < 0:
+        _warn(f"{key}={value!r} must be non-negative — ignoring it.")
+        return None
+    return parsed
+
+
+def _coerce_prose(key, value):
+    """Free text for the briefs: controls stripped, whitespace collapsed, capped."""
+    if not isinstance(value, str):
+        _warn(f"{key}={value!r} is not a string — ignoring it.")
+        return None
+    cleaned = " ".join(_CONTROL_RE.sub(" ", value).split())
+    if len(cleaned) > _PROSE_MAX:
+        _warn(f"{key} is {len(cleaned)} chars (limit {_PROSE_MAX}) — truncating.")
+        cleaned = cleaned[:_PROSE_MAX].rstrip()
+    return cleaned
+
+
+def _coerce_scope_label(key, value):
+    """The scope label, which is ALSO the dedup signature's second field.
+
+    Changing it re-keys every signature, so the entire ledger stops matching and
+    groom re-files its whole backlog once. That is occasionally what you want
+    (a genuinely re-scoped scan) and never what you want by accident, so it is
+    settable but always announced.
+    """
+    cleaned = _coerce_prose(key, value)
+    if cleaned is None:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9._/\-]{1,80}", cleaned):
+        _warn(f"{key}={value!r} must be 1-80 chars of [A-Za-z0-9._/-] — ignoring it.")
+        return None
+    return cleaned
+
+
+def _coerce_model(key, value):
+    if not isinstance(value, str) or not _MODEL_RE.match(value.strip()):
+        _warn(f"{key}={value!r} is not a valid model id — ignoring it.")
+        return None
+    return value.strip()
+
+
+def _coerce_path_list(key, value):
+    """Scan paths, as a JSON array or a comma-separated string.
+
+    Invalid ENTRIES are dropped individually (with a warning) rather than
+    rejecting the whole list: one typo'd path should not silently widen the scan
+    back to the whole repo, which is what dropping the key would do.
+    """
+    if isinstance(value, str):
+        items = [p for p in (part.strip() for part in value.split(",")) if p]
+    elif isinstance(value, list):
+        items = value
+    else:
+        _warn(f"{key}={value!r} must be an array or a comma-separated string — ignoring it.")
+        return None
+
+    kept = []
+    for item in items:
+        if not isinstance(item, str):
+            _warn(f"{key} entry {item!r} is not a string — dropping it.")
+            continue
+        path = _CONTROL_RE.sub("", item).strip().strip("/")
+        if not path:
+            continue
+        if len(path) > _PATH_MAX or ".." in path or not _PATH_RE.match(path):
+            _warn(f"{key} entry {item!r} is not a plausible repo-relative path — dropping it.")
+            continue
+        if path not in kept:
+            kept.append(path)
+        if len(kept) >= _PATHS_MAX:
+            _warn(f"{key} exceeded {_PATHS_MAX} entries — ignoring the rest.")
+            break
+    return kept
+
+
+_COERCERS = {
+    "bool": _coerce_bool,
+    "numeric_string": _coerce_numeric_string,
+    "nonneg_int": _coerce_nonneg_int,
+    "prose": _coerce_prose,
+    "scope_label": _coerce_scope_label,
+    "model": _coerce_model,
+    "path_list": _coerce_path_list,
+}
+
+
+def parse_layer(raw, *, label):
+    """Parse one JSON config layer into a dict, or {} — never raising.
+
+    A blank value is the overwhelmingly common case (no variable set / a
+    schedule event carrying no dispatch inputs) and is NOT worth a warning.
+    Anything non-blank that is not a JSON object IS warned about, because
+    someone meant it to take effect.
+    """
+    if raw is None or not str(raw).strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        _warn(f"{label} is not valid JSON — ignoring it entirely and using the caller's values.")
+        return {}
+    if not isinstance(parsed, dict):
+        _warn(f"{label} must be a JSON object, got {type(parsed).__name__} — ignoring it.")
+        return {}
+    return parsed
+
+
+def coerce_layer(layer, *, label):
+    """Validate/normalize one parsed layer down to accepted operational knobs."""
+    out = {}
+    for key, value in layer.items():
+        if key in _LOCKED_KEYS:
+            _warn(
+                f"{label} sets {key!r}, which cannot be configured by variable — it is part of "
+                "the reviewed security boundary and must be changed in the workflow file. Ignoring it."
+            )
+            continue
+        kind = _OPERATIONAL_KEYS.get(key)
+        if kind is None:
+            _warn(f"{label} has unknown key {key!r} — ignoring it (typo?).")
+            continue
+        if value is None:  # explicit null = "don't override this knob"
+            continue
+        coerced = _COERCERS[kind](key, value)
+        if coerced is not None:
+            out[key] = coerced
+    return out
+
+
+def resolve(*, defaults, config_raw, dispatch_raw=None):
+    """Merge the layers into the final knob set. Highest precedence last."""
+    resolved = dict(defaults)
+    layers = (
+        (config_raw, "GROOM_CONFIG"),
+        (dispatch_raw, "workflow_dispatch inputs"),
+    )
+    for raw, label in layers:
+        overrides = coerce_layer(parse_layer(raw, label=label), label=label)
+        for key, value in overrides.items():
+            if key == "scope_label" and value != resolved.get("scope_label"):
+                _warn(
+                    f"{label} changes scope_label from {resolved.get('scope_label')!r} to {value!r}. "
+                    "The scope label is part of every dedup signature, so EVERY existing ledger "
+                    "entry stops matching and this run will re-propose findings already filed "
+                    "under the old label. Intended only for a genuine re-scope."
+                )
+            resolved[key] = value
+    return resolved
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Resolve groom's operational knobs from GROOM_CONFIG over the caller's defaults."
+    )
+    parser.add_argument(
+        "--defaults-json",
+        required=True,
+        help="JSON object of the caller's `with:` values (the reviewed baseline).",
+    )
+    parser.add_argument(
+        "--config-json",
+        default="",
+        help="Contents of the GROOM_CONFIG Actions variable (may be empty).",
+    )
+    parser.add_argument(
+        "--dispatch-json",
+        default="",
+        help="JSON object of workflow_dispatch inputs, if any (highest precedence).",
+    )
+    args = parser.parse_args(argv)
+
+    # The defaults layer comes from the workflow itself, so a parse failure here
+    # is OUR bug, not a user typo — but still degrade rather than abort: an empty
+    # baseline plus the reusable's input defaults is a working groom run.
+    defaults = coerce_layer(parse_layer(args.defaults_json, label="caller defaults"),
+                            label="caller defaults")
+    resolved = resolve(
+        defaults=defaults,
+        config_raw=args.config_json,
+        dispatch_raw=args.dispatch_json,
+    )
+    # Compact + no newlines: this is written verbatim as one `$GITHUB_OUTPUT` line.
+    print(json.dumps(resolved, separators=(",", ":"), sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
