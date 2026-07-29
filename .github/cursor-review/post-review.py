@@ -265,9 +265,32 @@ def render_repeat_of(finding: dict) -> str:
     url = finding.get("repeat_of")
     if not isinstance(url, str) or not url.strip():
         return ""
+    return f"\n\n↩︎ re-raise of {neutralize_mentions(url.strip())}{render_repeat_round(finding)}"
+
+
+def render_repeat_round(finding: dict) -> str:
+    """Render the ``(round N)`` suffix, or nothing.
+
+    This is judge output and the judge reads the ledger — untrusted PR text — so
+    the field is model-relayed content like any other body. The control that
+    actually holds is the type: a *positive integer* can't carry an `@handle` or
+    markup at all, unlike the previous "int or str" check, which passed arbitrary
+    text through to the rendered comment. (That check also admitted `bool`, a
+    subclass of `int`, so `repeat_round: true` rendered as "(round True)".)
+    neutralize_mentions stays on the render as defense in depth for whoever
+    loosens the type next.
+    """
     round_no = finding.get("repeat_round")
-    suffix = f" (round {round_no})" if isinstance(round_no, (int, str)) and str(round_no).strip() else ""
-    return f"\n\n↩︎ re-raise of {neutralize_mentions(url.strip())}{suffix}"
+    if isinstance(round_no, bool):
+        return ""
+    if isinstance(round_no, str):
+        round_no = round_no.strip()
+        if not round_no.isdigit():
+            return ""
+        round_no = int(round_no)
+    if not isinstance(round_no, int) or round_no <= 0:
+        return ""
+    return f" (round {neutralize_mentions(str(round_no))})"
 
 
 def enforce_repeat_cap(enriched: list[dict], cap: int = REPEAT_CAP) -> tuple[list[dict], int]:

@@ -355,6 +355,15 @@ jobs:
 
       - name: Upload ledger artifact
         if: always()
+        # continue-on-error like every other step in this job, for the reason in
+        # the job comment: `review` needs this job and has no always() guard, and
+        # `consolidate` then drops out on `needs.review.result != 'skipped'`. An
+        # artifact-upload hiccup failing THIS job would therefore post no review
+        # at all — strictly worse than the degraded path, where the panel simply
+        # runs without prior context and the review body says so (the consumers
+        # of the artifact all download it continue-on-error, and consolidate
+        # emits the unavailable banner when the file does not arrive).
+        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
           name: cursor-review-ledger
@@ -794,6 +803,7 @@ jobs:
         run: bash "$CURSOR_REVIEW_ASSETS/install-cursor-cli.sh"
 
       - name: Download prior-review ledger
+        id: ledger_download
         continue-on-error: true
         uses: actions/download-artifact@v8
         with:
@@ -1040,23 +1050,36 @@ jobs:
           JUDGE_STATUS: ${{ steps.consolidated.outputs.judge_status }}
           CONSOLIDATED_COUNT: ${{ steps.consolidated.outputs.consolidated_count }}
           LEDGER_STATUS: ${{ needs.ledger.outputs.status }}
+          LEDGER_DOWNLOAD: ${{ steps.ledger_download.outcome }}
         run: |
           # Prior-review ledger line for the review header: either the
           # round/ledger summary, or the "context unavailable" banner naming the
           # failed call. A guard that could not read its input SAYS SO — a
           # context-free re-review must never render identically to a genuine
           # first-round review.
+          #
+          # The DELIVERY of the ledger is checked separately from its CONTENT.
+          # Both downloads are continue-on-error, so an upload or download that
+          # failed leaves no ledger-note.txt while the ledger job still reports
+          # status=ok — and the panel prompts were spliced with an EMPTY block.
+          # Reading only LEDGER_STATUS there would emit no banner and the
+          # context-free re-review would render as a genuine first round, the
+          # exact partial failure the banner exists to catch. So: file ABSENT
+          # (delivery failed) is a banner; file PRESENT but empty is a real
+          # "nothing to say" (first round / kill switch / no prior findings).
           LEDGER_NOTE=""
-          if [ -f /tmp/ledger/ledger-note.txt ]; then
+          if [ "${LEDGER_DOWNLOAD:-failure}" != "success" ] || [ ! -f /tmp/ledger/ledger-note.txt ]; then
+            LEDGER_NOTE="⚠️ prior-review context unavailable (ledger artifact did not reach the consolidate job: download=${LEDGER_DOWNLOAD:-missing}) — the panel ran without prior-round context, so findings may repeat earlier rounds."
+          else
             LEDGER_NOTE="$(cat /tmp/ledger/ledger-note.txt)"
-          fi
-          if [ -z "$LEDGER_NOTE" ]; then
-            case "${LEDGER_STATUS:-missing}" in
-              ok|empty|disabled) ;;
-              *)
-                LEDGER_NOTE="⚠️ prior-review context unavailable (ledger job: status=${LEDGER_STATUS:-missing}) — findings may repeat earlier rounds."
-                ;;
-            esac
+            if [ -z "$LEDGER_NOTE" ]; then
+              case "${LEDGER_STATUS:-missing}" in
+                ok|empty|disabled) ;;
+                *)
+                  LEDGER_NOTE="⚠️ prior-review context unavailable (ledger job: status=${LEDGER_STATUS:-missing}) — findings may repeat earlier rounds."
+                  ;;
+              esac
+            fi
           fi
 
           # Three cases:

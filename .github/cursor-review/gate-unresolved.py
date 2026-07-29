@@ -57,7 +57,14 @@ query($owner: String!, $name: String!, $pr: Int!, $cursor: String) {
           isOutdated
           comments(first: 1) {
             nodes {
+              # fullDatabaseId (BigInt, serialized as a String) alongside
+              # databaseId, which the schema declares as a 32-bit `Int` while
+              # live review-comment ids are already past 2^31−1. GitHub happens
+              # to serialize the oversized value today, but the ledger joins on
+              # this id, so it reads the field that is actually typed for it and
+              # keeps databaseId only as a fallback.
               databaseId
+              fullDatabaseId
               author { login }
               pullRequestReview { body }
             }
