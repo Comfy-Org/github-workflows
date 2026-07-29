@@ -87,6 +87,7 @@ silently vanishing — the review tells you what didn't run.
 | [`gate-unresolved.py`](gate-unresolved.py) | **Orphaned — nothing calls this today.** Implemented the opt-in blocking gate: queries the PR's review threads and exits non-zero while any cursor-review finding thread is unresolved. The job that ran it was dropped from `cursor-review.yml` in #31; see [the regression note](#the-blocking-gate-is-currently-not-available-regressed). |
 | [`slack-notify.sh`](slack-notify.sh) | Sends the start/complete Slack DMs to the triggerer (no-ops without a token). |
 | [`install-cursor-cli.sh`](install-cursor-cli.sh) | Installs the Cursor agent CLI from the versioned, sha256-pinned release artifact — not `curl cursor.com/install \| bash`. Used by all three CLI-using jobs; the pin (`CURSOR_CLI_VERSION` / `CURSOR_CLI_SHA256`) lives in `cursor-review.yml`'s top-level `env:`. |
+| [`build-ledger.py`](build-ledger.py) | Builds the **prior-review ledger** — what earlier rounds raised on this PR and how the author answered — and splices it into the panel/judge prompts. Also the prompt splicer, so the no-ledger path is byte-identical to the pre-ledger prompt. |
 
 ## Adopt it in your repo
 

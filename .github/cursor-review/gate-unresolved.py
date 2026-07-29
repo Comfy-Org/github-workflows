@@ -57,6 +57,7 @@ query($owner: String!, $name: String!, $pr: Int!, $cursor: String) {
           isOutdated
           comments(first: 1) {
             nodes {
+              databaseId
               author { login }
               pullRequestReview { body }
             }
@@ -101,23 +102,37 @@ def is_cursor_thread(thread: dict) -> bool:
     return body.startswith(CONSOLIDATED_MARKER)
 
 
-def collect_unresolved(owner: str, name: str, pr: int) -> int:
-    """Count live (non-outdated, unresolved) cursor-review finding threads."""
-    count = 0
+def iter_threads(owner: str, name: str, pr: int):
+    """Yield every review thread node on the PR, paging transparently.
+
+    The single reader of ``reviewThreads`` state for the whole cursor-review
+    workflow: this gate consumes it below, and ``build-ledger.py`` imports it to
+    carry ``isResolved`` / ``isOutdated`` into the prior-review ledger. Keeping
+    one query (and one ``CONSOLIDATED_MARKER``) means the gate and the ledger can
+    never disagree about which threads are ours.
+    """
     cursor = None
     while True:
         data = run_graphql(owner, name, pr, cursor)
         threads = data["data"]["repository"]["pullRequest"]["reviewThreads"]
         for thread in threads["nodes"]:
-            if not is_cursor_thread(thread):
-                continue
-            if thread.get("isResolved") or thread.get("isOutdated"):
-                continue
-            count += 1
+            yield thread
         page = threads["pageInfo"]
         if not page["hasNextPage"]:
-            return count
+            return
         cursor = page["endCursor"]
+
+
+def collect_unresolved(owner: str, name: str, pr: int) -> int:
+    """Count live (non-outdated, unresolved) cursor-review finding threads."""
+    count = 0
+    for thread in iter_threads(owner, name, pr):
+        if not is_cursor_thread(thread):
+            continue
+        if thread.get("isResolved") or thread.get("isOutdated"):
+            continue
+        count += 1
+    return count
 
 
 def emit(text: str) -> None:
