@@ -36,6 +36,13 @@ security boundary stay in the reviewed workflow file and are IGNORED here, loudl
 Everything else (`_OPERATIONAL_KEYS`) is fair game: it can only make groom
 scan less, propose less, or file less — never grant it more privilege.
 
+The lock applies to the VARIABLE and `config` layers, not to the caller-defaults
+layer, which is the reviewed workflow file itself — the thing the lock protects.
+So a locked key arriving in `--defaults-json` passes through untouched
+(`coerce_layer(..., trusted=True)`); rejecting it there would strip a reviewed
+`with:` value out of the resolved set and fire the bypass warning on every normal
+run, teaching operators to ignore the one annotation that flags a real attempt.
+
 FAIL-OPEN, ALWAYS
 -----------------
 This runs before the finder, i.e. before anything has been paid for, but a
@@ -63,6 +70,7 @@ CLI:
 
 import argparse
 import json
+import math
 import re
 import sys
 
@@ -83,8 +91,13 @@ _OPERATIONAL_KEYS = {
     "interval_days": "numeric_string",
     "cadence": "numeric_string",
     "paths": "path_list",
+    # `themes` may be set to "" — that is the documented way to CLEAR a themes
+    # list the caller pinned in its `with:`, and the finder's `if themes:` guard
+    # reads an empty value as "no theme restriction". `scope_desc` is different:
+    # it is substituted into "Scan {{SCOPE_DESC}}." verbatim, so blanking it
+    # leaves the agent a truncated sentence rather than a wider scan.
     "themes": "prose",
-    "scope_desc": "prose",
+    "scope_desc": "prose_nonblank",
     "scope_label": "scope_label",
     "model": "model",
 }
@@ -122,6 +135,23 @@ _MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
+_WARN_ECHO_MAX = 120
+
+
+def _shown(value) -> str:
+    """`repr(value)` for a warning, bounded.
+
+    Warnings echo the offending value so the operator can spot their typo, but
+    the value is variable-controlled and can be enormous (a 4300-digit integer
+    literal, a 600+-char prose blob), and this repo's run logs are PUBLIC. Cap it
+    at a length that still identifies the value.
+    """
+    text = repr(value)
+    if len(text) > _WARN_ECHO_MAX:
+        return f"{text[:_WARN_ECHO_MAX]}… ({len(text)} chars)"
+    return text
+
+
 def _warn(message: str) -> None:
     """Emit a GitHub Actions warning annotation on stderr.
 
@@ -142,7 +172,7 @@ def _coerce_bool(key, value):
         return value
     if isinstance(value, str) and value.strip().lower() in ("true", "false"):
         return value.strip().lower() == "true"
-    _warn(f"{key}={value!r} is not a boolean — ignoring it (using the caller's value).")
+    _warn(f"{key}={_shown(value)} is not a boolean — ignoring it (using the caller's value).")
     return None
 
 
@@ -153,21 +183,40 @@ def _coerce_numeric_string(key, value):
     parser that owns clamping and fail-open degradation. This only checks the
     value is numeric at all and hands the canonical string on, so the resolved
     JSON never carries a shape those parsers would choke on.
+
+    "Numeric at all" means FINITE and NON-NEGATIVE, not merely `float()`-able.
+    `inf`/`nan` (and the bare `Infinity`/`NaN` literals Python's `json` accepts)
+    parse as floats but degrade downstream in opposite, silent directions —
+    `max_prs: "inf"` builds zero PRs while `interval_days: "nan"` reverts to the
+    weekly default — so the operator would get the inverse of what they set with
+    no annotation naming the key. `interval.py`'s `parse_interval_days` already
+    applies the same `math.isfinite`/`< 0` guard; rejecting here means the
+    warning names the key instead of the value vanishing into a clamp.
     """
     if isinstance(value, bool):  # bool is an int subclass — reject before the number check
-        _warn(f"{key}={value!r} is a boolean, expected a number — ignoring it.")
+        _warn(f"{key}={_shown(value)} is a boolean, expected a number — ignoring it.")
         return None
     if isinstance(value, (int, float)):
-        return str(value)
-    if isinstance(value, str) and value.strip():
-        try:
-            float(value.strip())
-        except ValueError:
-            _warn(f"{key}={value!r} is not a number — ignoring it.")
-            return None
-        return value.strip()
-    _warn(f"{key}={value!r} is not a number — ignoring it.")
-    return None
+        text = str(value)
+    elif isinstance(value, str) and value.strip():
+        text = value.strip()
+    else:
+        _warn(f"{key}={_shown(value)} is not a number — ignoring it.")
+        return None
+    try:
+        parsed = float(text)
+    except (ValueError, OverflowError):
+        # OverflowError: an int literal past ~1e308 is a valid JSON number but
+        # has no float, so `float()` raises rather than returning inf.
+        _warn(f"{key}={_shown(value)} is not a number — ignoring it.")
+        return None
+    if not math.isfinite(parsed):
+        _warn(f"{key}={_shown(value)} is not a finite number in range — ignoring it.")
+        return None
+    if parsed < 0:
+        _warn(f"{key}={_shown(value)} must be non-negative — ignoring it.")
+        return None
+    return text
 
 
 def _coerce_nonneg_int(key, value):
@@ -176,30 +225,68 @@ def _coerce_nonneg_int(key, value):
     `max_findings` slices the filing list (`[:cap]`); a negative value would
     make that slice count from the END and file the wrong subset, so refuse it
     here rather than let it through to the file job.
+
+    The float is validated BEFORE it is floored, in that order deliberately:
+
+    * `int(float(x))` raises `OverflowError` — an `ArithmeticError`, NOT caught
+      by `(TypeError, ValueError)` — for `inf`, `"inf"`, the bare `Infinity`
+      literal `json` accepts, `1e999`, and any 310+-digit integer. An uncaught
+      traceback here would exit non-zero and break this module's central
+      FAIL-OPEN contract, turning the gate red on every daily tick.
+    * `int()` truncates TOWARD ZERO, so flooring first would turn `-0.5` into a
+      `0` that sails past the `< 0` guard — reading a clearly invalid value as
+      "file nothing" instead of keeping the caller's cap.
     """
     if isinstance(value, bool):
-        _warn(f"{key}={value!r} is a boolean, expected a number — ignoring it.")
+        _warn(f"{key}={_shown(value)} is a boolean, expected a number — ignoring it.")
         return None
     try:
-        parsed = int(float(value))
-    except (TypeError, ValueError):
-        _warn(f"{key}={value!r} is not a number — ignoring it.")
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        _warn(f"{key}={_shown(value)} is not a number — ignoring it.")
+        return None
+    if not math.isfinite(parsed):
+        _warn(f"{key}={_shown(value)} is not a finite number in range — ignoring it.")
         return None
     if parsed < 0:
-        _warn(f"{key}={value!r} must be non-negative — ignoring it.")
+        _warn(f"{key}={_shown(value)} must be non-negative — ignoring it.")
         return None
-    return parsed
+    return int(parsed)
 
 
 def _coerce_prose(key, value):
-    """Free text for the briefs: controls stripped, whitespace collapsed, capped."""
+    """Free text for the briefs: controls stripped, whitespace collapsed, capped.
+
+    An empty result is returned as `""`, not `None`: for `themes` that is the
+    documented way to clear a list the caller pinned. Knobs where a blank value
+    is unusable rather than meaningful use `_coerce_prose_nonblank`.
+    """
     if not isinstance(value, str):
-        _warn(f"{key}={value!r} is not a string — ignoring it.")
+        _warn(f"{key}={_shown(value)} is not a string — ignoring it.")
         return None
     cleaned = " ".join(_CONTROL_RE.sub(" ", value).split())
     if len(cleaned) > _PROSE_MAX:
         _warn(f"{key} is {len(cleaned)} chars (limit {_PROSE_MAX}) — truncating.")
         cleaned = cleaned[:_PROSE_MAX].rstrip()
+    return cleaned
+
+
+def _coerce_prose_nonblank(key, value):
+    """Prose whose blank form is unusable, so blank means "keep the caller's".
+
+    `scope_desc` is substituted verbatim into the finder brief's "Scan
+    {{SCOPE_DESC}}." sentence, so an empty or whitespace-only value does not
+    widen the scan — it hands the agent a truncated sentence with no scope at
+    all. Every other coercer signals "unusable, keep the caller's value" by
+    returning `None`; do the same here rather than letting `coerce_layer`'s
+    `is not None` check write the empty string over a working default.
+    """
+    cleaned = _coerce_prose(key, value)
+    if cleaned is None:
+        return None
+    if not cleaned:
+        _warn(f"{key}={_shown(value)} is empty — ignoring it (using the caller's value).")
+        return None
     return cleaned
 
 
@@ -215,14 +302,14 @@ def _coerce_scope_label(key, value):
     if cleaned is None:
         return None
     if not re.fullmatch(r"[A-Za-z0-9._/\-]{1,80}", cleaned):
-        _warn(f"{key}={value!r} must be 1-80 chars of [A-Za-z0-9._/-] — ignoring it.")
+        _warn(f"{key}={_shown(value)} must be 1-80 chars of [A-Za-z0-9._/-] — ignoring it.")
         return None
     return cleaned
 
 
 def _coerce_model(key, value):
     if not isinstance(value, str) or not _MODEL_RE.match(value.strip()):
-        _warn(f"{key}={value!r} is not a valid model id — ignoring it.")
+        _warn(f"{key}={_shown(value)} is not a valid model id — ignoring it.")
         return None
     return value.strip()
 
@@ -233,31 +320,51 @@ def _coerce_path_list(key, value):
     Invalid ENTRIES are dropped individually (with a warning) rather than
     rejecting the whole list: one typo'd path should not silently widen the scan
     back to the whole repo, which is what dropping the key would do.
+
+    But an EMPTY result is not a narrowing — the consumer reads `paths: []` the
+    same as an unset knob and scans everything. So when nothing survives (every
+    entry rejected, an explicit `[]`, a comma-only string) return `None` and keep
+    the lower layer's value: returning `[]` would let `coerce_layer` write it
+    over a narrower `paths` and produce exactly the whole-repo widening the
+    per-entry dropping above exists to prevent.
     """
     if isinstance(value, str):
         items = [p for p in (part.strip() for part in value.split(",")) if p]
     elif isinstance(value, list):
         items = value
     else:
-        _warn(f"{key}={value!r} must be an array or a comma-separated string — ignoring it.")
+        _warn(f"{key}={_shown(value)} must be an array or a comma-separated string — ignoring it.")
         return None
 
     kept = []
-    for item in items:
+    for index, item in enumerate(items):
+        if len(kept) >= _PATHS_MAX:
+            # Checked BEFORE the append, and only with entries actually left, so
+            # a list of exactly _PATHS_MAX valid entries does not warn that
+            # something was dropped when nothing was.
+            _warn(f"{key} exceeded {_PATHS_MAX} entries — ignoring the remaining {len(items) - index}.")
+            break
         if not isinstance(item, str):
-            _warn(f"{key} entry {item!r} is not a string — dropping it.")
+            _warn(f"{key} entry {_shown(item)} is not a string — dropping it.")
             continue
         path = _CONTROL_RE.sub("", item).strip().strip("/")
         if not path:
             continue
-        if len(path) > _PATH_MAX or ".." in path or not _PATH_RE.match(path):
-            _warn(f"{key} entry {item!r} is not a plausible repo-relative path — dropping it.")
+        # Traversal is checked per COMPONENT, not as a substring: `..` is only
+        # traversal when it is a whole path segment, and a substring test would
+        # also reject legitimate names with adjacent periods (`src/v1..v2/x.py`).
+        if (
+            len(path) > _PATH_MAX
+            or ".." in path.split("/")
+            or not _PATH_RE.match(path)
+        ):
+            _warn(f"{key} entry {_shown(item)} is not a plausible repo-relative path — dropping it.")
             continue
         if path not in kept:
             kept.append(path)
-        if len(kept) >= _PATHS_MAX:
-            _warn(f"{key} exceeded {_PATHS_MAX} entries — ignoring the rest.")
-            break
+    if not kept:
+        _warn(f"{key}={_shown(value)} yielded no usable path — ignoring it (using the caller's value).")
+        return None
     return kept
 
 
@@ -266,6 +373,7 @@ _COERCERS = {
     "numeric_string": _coerce_numeric_string,
     "nonneg_int": _coerce_nonneg_int,
     "prose": _coerce_prose,
+    "prose_nonblank": _coerce_prose_nonblank,
     "scope_label": _coerce_scope_label,
     "model": _coerce_model,
     "path_list": _coerce_path_list,
@@ -279,12 +387,19 @@ def parse_layer(raw, *, label):
     schedule event carrying no dispatch inputs) and is NOT worth a warning.
     Anything non-blank that is not a JSON object IS warned about, because
     someone meant it to take effect.
+
+    The `except` is deliberately broad (as in `interval.py`'s `evaluate`) rather
+    than the obvious `json.JSONDecodeError`: `json.loads` also raises a plain
+    `ValueError` for an integer literal past CPython's 4300-digit int/str
+    conversion limit and `RecursionError` for a deeply nested array — both fit
+    easily inside a 48 KB Actions variable, and either one crashing the gate
+    would break the fail-open contract this whole module exists to keep.
     """
     if raw is None or not str(raw).strip():
         return {}
     try:
         parsed = json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
+    except Exception:
         _warn(f"{label} is not valid JSON — ignoring it entirely and using the caller's values.")
         return {}
     if not isinstance(parsed, dict):
@@ -293,11 +408,24 @@ def parse_layer(raw, *, label):
     return parsed
 
 
-def coerce_layer(layer, *, label):
-    """Validate/normalize one parsed layer down to accepted operational knobs."""
+def coerce_layer(layer, *, label, trusted=False):
+    """Validate/normalize one parsed layer down to accepted operational knobs.
+
+    `trusted=True` marks the caller-defaults layer, which IS the workflow file —
+    the thing `_LOCKED_KEYS` protects, not a bypass of it. Rejecting a locked key
+    there would strip a reviewed `with:` value out of `resolved` and fire the
+    "part of the reviewed security boundary" warning on every normal run,
+    desensitizing operators to the one annotation meant to flag a real bypass
+    attempt. Locked keys pass through untouched (there is no coercer for them);
+    only the variable/`config` layers are gated.
+    """
     out = {}
     for key, value in layer.items():
         if key in _LOCKED_KEYS:
+            if trusted:
+                if value is not None:  # explicit null = "don't set this knob"
+                    out[key] = value
+                continue
             _warn(
                 f"{label} sets {key!r}, which cannot be configured by variable — it is part of "
                 "the reviewed security boundary and must be changed in the workflow file. Ignoring it."
@@ -327,7 +455,7 @@ def resolve(*, defaults, config_raw, dispatch_raw=None):
         for key, value in overrides.items():
             if key == "scope_label" and value != resolved.get("scope_label"):
                 _warn(
-                    f"{label} changes scope_label from {resolved.get('scope_label')!r} to {value!r}. "
+                    f"{label} changes scope_label from {_shown(resolved.get('scope_label'))} to {_shown(value)}. "
                     "The scope label is part of every dedup signature, so EVERY existing ledger "
                     "entry stops matching and this run will re-propose findings already filed "
                     "under the old label. Intended only for a genuine re-scope."
@@ -361,7 +489,7 @@ def main(argv=None):
     # is OUR bug, not a user typo — but still degrade rather than abort: an empty
     # baseline plus the reusable's input defaults is a working groom run.
     defaults = coerce_layer(parse_layer(args.defaults_json, label="caller defaults"),
-                            label="caller defaults")
+                            label="caller defaults", trusted=True)
     resolved = resolve(
         defaults=defaults,
         config_raw=args.config_json,
