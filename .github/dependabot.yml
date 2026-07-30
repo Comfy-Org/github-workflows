@@ -1,0 +1,99 @@
+# Dependabot configuration for Comfy-Org/github-workflows.
+# Docs: https://docs.github.com/en/code-security/dependabot/working-with-dependabot/dependabot-options-reference
+#
+# This repo had NO Dependabot config until now, which is a sharper gap here than
+# in a normal repo: everything this repo ships is a *reusable workflow*, so a
+# stale action here is stale in every consumer repo simultaneously — and several
+# of these workflows run with a bot App token that holds contents /
+# pull-requests / issues write. That is the blast radius.
+#
+# The house rule is to pin third-party actions by full commit SHA (a tag is
+# mutable, and a compromised action runs inside consumers' CI with their
+# secrets). SHAs do not float, so without Dependabot they simply rot: a security
+# fix in actions/checkout never arrives, and nothing fails to tell you so. Most
+# `uses:` here are SHA-pinned already; a handful still sit on floating major
+# tags. Dependabot will NOT convert a tag ref to a SHA, so those files get the
+# least benefit from this config until they are pinned by hand — see the
+# "Pin everything by full commit SHA" rule in AGENTS.md.
+version: 2
+
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      # Monthly, matching the cloud repo's github-actions cadence. These are CI
+      # actions, not runtime dependencies; weekly churn here buys noise. Security
+      # updates are advisory-driven and are NOT bound by this interval — they
+      # arrive as their own ungrouped PRs (the groups below declare no
+      # `applies-to:`, so they cover version updates only).
+      interval: "monthly"
+    groups:
+      # Grouped PRs rather than a dozen singles. Every caller pins THIS repo by
+      # SHA, so each merge here obliges a fleet-wide caller bump
+      # (bump-*-callers.yml opens those PRs automatically) — batching keeps that
+      # to one bump per cycle instead of one per action.
+      #
+      # Majors are split out so one breaking major (say actions/checkout v7)
+      # cannot hold every other action's patch hostage in an unmergeable PR
+      # until someone unpicks it by hand.
+      github-actions:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+      github-actions-major:
+        patterns: ["*"]
+        update-types: ["major"]
+    # `dependencies` must already exist as a repo label — Dependabot applies
+    # existing labels, it does not create the ones named here. It is also in
+    # stale.yml's default `exempt_pr_labels`, which is what keeps these PRs from
+    # being auto-staled while they wait on a fleet bump.
+    labels: ["dependencies"]
+    # Room for the two grouped PRs above plus headroom: each merge obliges a
+    # fleet-wide caller bump, so PRs here sit open longer than usual, and once
+    # the limit is hit Dependabot silently stops opening new ones.
+    open-pull-requests-limit: 5
+    cooldown:
+      # Let a freshly-published version age before we adopt it, so a botched
+      # release is usually yanked before it reaches consumer CI. The window has
+      # to be wide enough to actually catch a yank — a 1-day window paired with
+      # a monthly run would almost never bind, since the monthly run mostly sees
+      # releases that are already weeks old.
+      #
+      # `default-days` is the only cooldown key the github-actions ecosystem
+      # accepts — the `semver-*-days` variants are rejected at config-parse time
+      # here (they need an ecosystem with semver-classified releases), which is
+      # why majors get no longer window on this entry.
+      default-days: 7
+    ignore:
+      # NEVER let Dependabot touch this repo's self-references.
+      #
+      # A caller of a reusable in this repo pins it TWICE — the `uses:` SHA and a
+      # `workflows_ref:` input that loads the matching briefs/scripts at run time
+      # — and the two MUST stay in lock-step or a run executes one version's
+      # workflow against another version's scripts. Dependabot only understands
+      # `uses:`; it rewrites the SHA and leaves `workflows_ref:` behind, producing
+      # exactly that split state. This is not hypothetical — it has happened to
+      # live callers.
+      #
+      # `bump-callers.sh` is the tool that rewrites BOTH, and it is the only thing
+      # that should ever move these pins. The same ignore belongs in every
+      # consumer repo's dependabot.yml.
+      #
+      # Scoped to this repo, not `Comfy-Org/*`: `ignore` suppresses security
+      # updates as well as version updates, so an org-wide wildcard would
+      # silently blacklist every future first-party action consumed here. The
+      # trailing `*` covers both the `owner/repo` and `owner/repo/path.yml`
+      # forms of the dependency name.
+      - dependency-name: "Comfy-Org/github-workflows*"
+
+  # Dependency-free today, but declared so the day a module is added it is
+  # watched rather than silently rotting — the same failure mode this file
+  # exists to fix.
+  - package-ecosystem: "gomod"
+    directory: "/scripts/check-pr-size"
+    schedule:
+      interval: "monthly"
+    labels: ["dependencies"]
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
