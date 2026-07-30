@@ -90,7 +90,6 @@ _OPERATIONAL_KEYS = {
     # deliberately degrades blank/garbage/negative to 7 rather than failing.
     "interval_days": "numeric_string",
     "cadence": "numeric_string",
-    "paths": "path_list",
     # `themes` may be set to "" — that is the documented way to CLEAR a themes
     # list the caller pinned in its `with:`, and the finder's `if themes:` guard
     # reads an empty value as "no theme restriction". `scope_desc` is different:
@@ -114,14 +113,6 @@ _LOCKED_KEYS = ("builder", "pr_size_limit", "sink", "bot_app_id", "workflows_ref
 # text; it is a blast-radius limit, not an injection proof (the brief's own
 # "treat repo content as untrusted data" framing carries that).
 _PROSE_MAX = 600
-_PATH_MAX = 200
-_PATHS_MAX = 50
-
-# A scan path must look like a repo-relative path. No absolute paths, no `..`
-# traversal, no globs that would read as shell — the value is interpolated into
-# prose the agent reads, and a plausible-looking `/etc` or `../../` entry would
-# point the scan (and the reader) somewhere meaningless at best.
-_PATH_RE = re.compile(r"^[A-Za-z0-9._][A-Za-z0-9._/\-]*$")
 
 # A model id is passed as the VALUE of `claude --model`, so it cannot become a
 # separate flag — but keep it to the shape a model id actually has rather than
@@ -314,60 +305,6 @@ def _coerce_model(key, value):
     return value.strip()
 
 
-def _coerce_path_list(key, value):
-    """Scan paths, as a JSON array or a comma-separated string.
-
-    Invalid ENTRIES are dropped individually (with a warning) rather than
-    rejecting the whole list: one typo'd path should not silently widen the scan
-    back to the whole repo, which is what dropping the key would do.
-
-    But an EMPTY result is not a narrowing — the consumer reads `paths: []` the
-    same as an unset knob and scans everything. So when nothing survives (every
-    entry rejected, an explicit `[]`, a comma-only string) return `None` and keep
-    the lower layer's value: returning `[]` would let `coerce_layer` write it
-    over a narrower `paths` and produce exactly the whole-repo widening the
-    per-entry dropping above exists to prevent.
-    """
-    if isinstance(value, str):
-        items = [p for p in (part.strip() for part in value.split(",")) if p]
-    elif isinstance(value, list):
-        items = value
-    else:
-        _warn(f"{key}={_shown(value)} must be an array or a comma-separated string — ignoring it.")
-        return None
-
-    kept = []
-    for index, item in enumerate(items):
-        if len(kept) >= _PATHS_MAX:
-            # Checked BEFORE the append, and only with entries actually left, so
-            # a list of exactly _PATHS_MAX valid entries does not warn that
-            # something was dropped when nothing was.
-            _warn(f"{key} exceeded {_PATHS_MAX} entries — ignoring the remaining {len(items) - index}.")
-            break
-        if not isinstance(item, str):
-            _warn(f"{key} entry {_shown(item)} is not a string — dropping it.")
-            continue
-        path = _CONTROL_RE.sub("", item).strip().strip("/")
-        if not path:
-            continue
-        # Traversal is checked per COMPONENT, not as a substring: `..` is only
-        # traversal when it is a whole path segment, and a substring test would
-        # also reject legitimate names with adjacent periods (`src/v1..v2/x.py`).
-        if (
-            len(path) > _PATH_MAX
-            or ".." in path.split("/")
-            or not _PATH_RE.match(path)
-        ):
-            _warn(f"{key} entry {_shown(item)} is not a plausible repo-relative path — dropping it.")
-            continue
-        if path not in kept:
-            kept.append(path)
-    if not kept:
-        _warn(f"{key}={_shown(value)} yielded no usable path — ignoring it (using the caller's value).")
-        return None
-    return kept
-
-
 _COERCERS = {
     "bool": _coerce_bool,
     "numeric_string": _coerce_numeric_string,
@@ -376,7 +313,6 @@ _COERCERS = {
     "prose_nonblank": _coerce_prose_nonblank,
     "scope_label": _coerce_scope_label,
     "model": _coerce_model,
-    "path_list": _coerce_path_list,
 }
 
 

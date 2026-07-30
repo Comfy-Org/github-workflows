@@ -647,10 +647,13 @@ jobs:
           SCOPE_LABEL: ${{ fromJSON(needs.gate.outputs.resolved).scope_label }}
           SCOPE_DESC: ${{ fromJSON(needs.gate.outputs.resolved).scope_desc }}
           THEMES: ${{ fromJSON(needs.gate.outputs.resolved).themes }}
-          # Optional path narrowing (BE-5227). A JSON array when set, absent
-          # otherwise — `paths` has no reusable-input equivalent, so an unset knob
-          # is a missing key and `|| ''` yields the empty string.
-          PATHS: ${{ toJSON(fromJSON(needs.gate.outputs.resolved).paths) }}
+          # Path scoping is deliberately NOT here — #83 owns it, via a `path` input
+          # backed by .github/groom/scope.py, and it also teaches interval.py not to
+          # reset the cadence when the scope narrows. An earlier revision of this PR
+          # carried a competing `paths` knob; it was dropped rather than merged into
+          # a second implementation of the same feature. Once #83 lands, add `path`
+          # to config.py's _OPERATIONAL_KEYS and to the DEFAULTS block in `gate` and
+          # the knob becomes variable-tunable with no further wiring.
         run: |
           set -euo pipefail
           # Substitute the {{DOUBLE_BRACE}} placeholders. python str.replace is
@@ -680,24 +683,6 @@ jobs:
                   f"themes (they map onto the dimensions above; drop anything outside them): {themes}. "
                   "ALWAYS keep security/auth-adjacent findings regardless of theme — the themes "
                   "list never suppresses a security finding.\n"
-              )
-          # Optional path narrowing (BE-5227). config.py has already validated every
-          # entry as a plausible repo-relative path (no traversal, no absolute, no
-          # control characters) and capped the count, so this only has to render it.
-          # json.loads is guarded because an absent knob arrives as the literal
-          # "null" from toJSON() — that is the common case, not an error.
-          try:
-              paths = json.loads(os.environ.get("PATHS") or "null")
-          except ValueError:
-              paths = None
-          if isinstance(paths, list) and paths:
-              rendered = ", ".join(f"`{p}`" for p in paths)
-              brief += (
-                  "\n\nPATH SCOPE — this run scans ONLY these paths, relative to the repo "
-                  f"root: {rendered}. Findings whose sites all fall outside them are OUT OF "
-                  "SCOPE; drop them rather than reporting them, even if they look valuable. "
-                  "You may still READ outside these paths when you need context to judge a "
-                  "finding INSIDE them (e.g. to confirm a helper is unused repo-wide).\n"
               )
           with open("/tmp/groom-finder-prompt.md", "w", encoding="utf-8") as f:
               f.write(brief)
