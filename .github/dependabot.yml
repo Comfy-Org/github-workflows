@@ -57,8 +57,12 @@ updates:
       # to be wide enough to actually catch a yank — a 1-day window paired with
       # a monthly run would almost never bind, since the monthly run mostly sees
       # releases that are already weeks old.
+      #
+      # `default-days` is the only cooldown key the github-actions ecosystem
+      # accepts — the `semver-*-days` variants are rejected at config-parse time
+      # here (they need an ecosystem with semver-classified releases), which is
+      # why majors get no longer window on this entry.
       default-days: 7
-      semver-major-days: 14
     ignore:
       # NEVER let Dependabot touch this repo's self-references.
       #
