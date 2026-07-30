@@ -120,14 +120,14 @@ jobs:
       contents: read
     steps:
       - name: Checkout caller repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 
       - name: Load integrity check script
         # The checker comes from THIS repo (public, pinned via workflows_ref),
         # never from the caller's checkout, so a PR can't rewrite the check.
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: Comfy-Org/github-workflows
           ref: ${{ inputs.workflows_ref }}
@@ -135,7 +135,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 

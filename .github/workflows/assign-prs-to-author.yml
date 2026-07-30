@@ -45,7 +45,7 @@ jobs:
       issues: write
     steps:
       - name: Assign unassigned PRs to their authors
-        uses: actions/github-script@v9
+        uses: actions/github-script@v9.0.0
         with:
           script: |
             const skipBots = ${{ inputs.skip-bots }};
