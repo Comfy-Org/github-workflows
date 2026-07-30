@@ -28,6 +28,24 @@ forward automatically instead of silently drifting commits behind.
 | [`bump-pr-size-callers.yml`](../workflows/bump-pr-size-callers.yml) | `pr-size.yml` or `scripts/check-pr-size/**` | `PR_SIZE_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-assign-reviewers-callers.yml`](../workflows/bump-assign-reviewers-callers.yml) | `assign-reviewers.yml` | `ASSIGN_REVIEWERS_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-groom-callers.yml`](../workflows/bump-groom-callers.yml) | `groom.yml` or `groom/**` | `GROOM_CALLERS` | empty `[]` (grows as callers land) |
+| [`bump-auto-label-callers.yml`](../workflows/bump-auto-label-callers.yml) | `cursor-review-auto-label.yml` | `AUTO_LABEL_CALLERS` | non-empty (hard-fails if empty) |
+
+### Reusables with no fleet — deliberate, not an oversight
+
+| Reusable | Callers | Why no fleet |
+|---|---|---|
+| `stale.yml` | 0 | Nothing to bump. Add a fleet when the first caller lands. |
+| `assign-prs-to-author.yml` | 0 | Same. |
+| `detect-unreviewed-merge.yml` | ~12 | **A real gap.** Its pins are bumped by hand. Deferred deliberately, not missed. |
+
+A reusable that has callers but no fleet is the trap this whole directory exists
+to prevent: the pins simply never move, so consumers drift behind indefinitely
+and only find out when the caller and the reusable stop being compatible. That is
+not hypothetical — the groom fleet omitted *its own* caller (`ci-groom.yml`) from
+`GROOM_CALLERS`, the pin sat unchanged from the day it was written, and the caller
+ended up failing at startup against a reusable it had drifted away from. Before
+adding a caller anywhere, check that its fleet exists **and** that the repo is in
+the variable; the second half is the one people skip.
 
 They stay as thin entrypoints rather than one matrix because their triggers
 differ: a `cursor-review.yml` change must not spuriously bump agents-md or
@@ -36,7 +54,11 @@ flow, the trailing-newline fix, the single-line PR body) lives once in
 `bump-callers.sh`. Registering a new fleet is: add a thin entrypoint (copy an
 existing one, swap the path filter + `VAR_NAME`/`TAG`/`WORKFLOW_FILE`/
 `ALLOW_EMPTY`), seed its variable, and add a row to this table + the paths in
-`test-bump-callers.yml`.
+`test-bump-callers.yml`. **Then `workflow_dispatch` the new entrypoint once.**
+Landing a fleet does not touch the reusable it watches, so its own merge matches
+no path filter and fires no run — callers that were already stale when the fleet
+was created stay stale until the reusable next changes. Every entrypoint carries
+`workflow_dispatch` for exactly this.
 
 The **groom** fleet is the one that most needs this: a groom caller pins the
 reusable **twice** — the `uses:` SHA *and* the `workflows_ref:` input that loads
@@ -56,6 +78,14 @@ appear in a committed file or in the logs. Each fleet's caller list lives in a
 repo-level Actions **variable** (config, not a credential) as a JSON array of
 `{"repo","file","label"}` objects (`label` optional). `bump-callers.sh`
 `::add-mask::`es every repo name out of the run logs before echoing it.
+
+> **Known gap.** Each entrypoint hands the roster to the script through the
+> step's `env:`, and Actions prints a step's env block *before* the step runs —
+> so the raw roster appears in the (public) log ahead of any masking. Closing it
+> means fetching the variable at run time (`gh variable get`) and masking it
+> before first use, which needs a token permission the fleets do not mint today.
+> It is fleet-wide; no single entrypoint can fix it. Until then, assume the
+> roster is public.
 
 Adding/removing a caller needs **no public commit** — edit the variable:
 
