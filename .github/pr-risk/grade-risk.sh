@@ -105,13 +105,40 @@ PY
     # Last-resort fallback: even the Python renderer is unavailable. Write a
     # minimal but well-formed report so the publish job still has something to
     # publish as unknown, instead of the run vanishing silently.
-    printf '{"schema":1,"status":"unknown","tier":null,"label":null,"reason":%s,"total_lines":0,"tier_lines":{},"files":[],"top_tier_files":[],"attr_source_degraded":false}\n' \
-      "\"grader unavailable\"" > "${OUT_DIR}/risk-report.json"
-    # The one place the marker is repeated: by definition Python is unusable
-    # here, so grade_risk.DEFAULT_MARKER cannot be read. Keep the two in sync.
-    printf '%s\n\nRisk: unknown — the grader could not run.\n' \
-      "${MARKER:-<!-- ci-pr-risk -->}" > "${OUT_DIR}/risk-comment.md"
-    printf 'Risk: unknown\n\nThe risk grader could not run.\n' > "${OUT_DIR}/risk-check.md"
+    #
+    # `reason` carries git's stderr, which quotes PR-authored path names, so it
+    # is sanitised twice over.
+    #
+    # For JSON: reduced to printable ASCII, then the two structural characters
+    # are backslash-escaped (backslashes FIRST, or the escape of a quote would
+    # itself be escaped). Dropping non-ASCII before `cut` is what makes the
+    # length bound safe — `cut -c` is byte-oriented in the C locale, so
+    # truncating a UTF-8 path at byte 500 could sever a multi-byte character
+    # and leave a report the publisher cannot even decode.
+    #
+    # For markdown: a stricter whitelist still, because nothing PR-influenced
+    # may introduce a `[`, a backtick, a `<` or a newline into this
+    # bot-authored comment — a forged `- [x] **This grade is wrong**` line
+    # would read back as a genuine reviewer dispute.
+    local json_reason md_reason
+    json_reason=$(printf '%s' "$reason" | tr -c '\040-\176' ' ' | cut -c1-500 \
+      | sed 's/\\/\\\\/g; s/"/\\"/g')
+    md_reason=$(printf '%s' "$reason" | tr -c 'A-Za-z0-9 ._/:-' ' ' | cut -c1-500)
+    printf '{"schema":1,"status":"unknown","tier":null,"label":null,"reason":"%s","total_lines":0,"tier_lines":{},"files":[],"top_tier_files":[],"attr_source_degraded":%s}\n' \
+      "$json_reason" "$([ -n "${ATTR_DEGRADED:-}" ] && echo true || echo false)" \
+      > "${OUT_DIR}/risk-report.json"
+    # The one place the marker and the dispute checkbox are repeated: by
+    # definition Python is unusable here, so grade_risk.DEFAULT_MARKER and its
+    # rendered footer cannot be read. The checkbox line MUST stay in the form
+    # publish_risk.UNCHECKED_RE matches — this body overwrites the sticky
+    # comment, and without a box for `upsert_sticky` to re-tick, a registered
+    # dispute is silently discarded and `risk-grade-disputed` becomes
+    # unclearable. A unit test asserts the two forms stay in step.
+    # shellcheck disable=SC2016  # the backticks are markdown, not substitution
+    printf '%s\n\n## ⚪ Risk: **unknown**\n\nThe risk grader could not run: %s\n\nNo `risk:*` label was applied. Push again to re-grade.\n\n- [ ] **This grade is wrong** — tick this box if the tier above is off. Nothing is gated on it either way.\n\n<sub>Advisory only — this check never fails and never blocks merge.</sub>\n' \
+      "${MARKER:-<!-- ci-pr-risk -->}" "$md_reason" > "${OUT_DIR}/risk-comment.md"
+    printf 'Risk: unknown\n\nThe risk grader could not run: %s\n' \
+      "$md_reason" > "${OUT_DIR}/risk-check.md"
   fi
   exit 0
 }
@@ -148,19 +175,38 @@ fi
 # reached only when git genuinely does not know the option, and a real diff
 # failure stays a real failure. The degradation is recorded in the report so it
 # is visible rather than living in one stderr line.
+#
+# The probe's EXIT CODE alone is not that signal. `rev-parse --verify HEAD`
+# also fails on an unborn or invalid HEAD, on a --repo-dir that is not a git
+# repository, and on an unreadable one — none of which say anything about
+# --attr-source support. Treating those as "unsupported" dropped the anti-bypass
+# guard on a runner that does support it and reported attr_source_degraded to
+# reviewers who were not degraded. So the unknown-option signal is identified
+# specifically (git exits 129 and says so on stderr); every OTHER probe failure
+# KEEPS the option, and the real diff below reports the real error.
 NUMSTAT_FILE="${OUT_DIR}/.numstat"
 NUMSTAT_ERR="${OUT_DIR}/.numstat.err"
-ATTR_ARG=()
+ATTR_PROBE_ERR="${OUT_DIR}/.attr-probe.err"
+ATTR_ARG=("--attr-source=${BASE}")
 ATTR_DEGRADED_ARG=()
 ATTR_DEGRADED=""
-if git -C "$REPO_DIR" "--attr-source=${BASE}" rev-parse --quiet --verify HEAD >/dev/null 2>&1; then
-  ATTR_ARG=("--attr-source=${BASE}")
-else
+git -C "$REPO_DIR" "--attr-source=${BASE}" rev-parse --quiet --verify HEAD \
+  >/dev/null 2>"$ATTR_PROBE_ERR"
+ATTR_PROBE_RC=$?
+if [ "$ATTR_PROBE_RC" -ne 0 ] && { [ "$ATTR_PROBE_RC" -eq 129 ] \
+   || grep -qiE 'unknown option|unknown switch|unrecognized option' "$ATTR_PROBE_ERR"; }; then
+  ATTR_ARG=()
   ATTR_DEGRADED_ARG=(--attr-degraded)
   ATTR_DEGRADED=1
   echo "grade-risk.sh: this git does not support --attr-source (needs >= 2.42); .gitattributes was read from the PR head, so a PR that marks its own files '-diff' can zero its line counts." >&2
 fi
-if ! git -C "$REPO_DIR" "${ATTR_ARG[@]+"${ATTR_ARG[@]}"}" diff --numstat -z "${BASE}...${HEAD}" \
+rm -f "$ATTR_PROBE_ERR"
+# The trailing `--` is load-bearing: without it git falls back to treating an
+# unresolvable `A...B` as a PATHSPEC, which exits 0 with an empty diff — an
+# ungradable ref would then be graded R0 (empty diff) instead of reported
+# unknown, the one default this workflow forbids. CI always passes a real base
+# SHA, but the offline backfill caller (BE-5507) passes operator-supplied refs.
+if ! git -C "$REPO_DIR" "${ATTR_ARG[@]+"${ATTR_ARG[@]}"}" diff --numstat -z "${BASE}...${HEAD}" -- \
      >"$NUMSTAT_FILE" 2>"$NUMSTAT_ERR"; then
   emit_unknown "git diff ${BASE}...${HEAD} failed: $(tr '\n' ' ' <"$NUMSTAT_ERR")"
 fi

@@ -34,8 +34,12 @@ name: PR Risk Grade (reusable)
 # RE-GRADES ON EVERY PUSH. This is the load-bearing requirement, not a
 # nice-to-have: a grade that goes stale is worse than no grade, because it
 # spends trust that does not come back. The caller MUST include `synchronize`
-# in its trigger types (see the caller pattern below); the label is recomputed
-# and replaced on each run.
+# AND `edited` in its trigger types (see the caller pattern below); the label is
+# recomputed and replaced on each run. `edited` is not decoration: retargeting a
+# PR changes its base and therefore its net diff without moving the head SHA and
+# without firing `synchronize`, and the publisher declines to publish a grade
+# computed against a base the PR no longer targets — so a caller missing
+# `edited` leaves that PR carrying its pre-retarget tier until the next push.
 #
 # UNKNOWN IS PUBLISHED AS UNKNOWN. A PR the grader could not read gets NO tier
 # and says so — in the Check Run, in the comment, and by carrying no `risk:*`
@@ -68,9 +72,13 @@ name: PR Risk Grade (reusable)
 #   on:
 #     pull_request:
 #       # `synchronize` is what makes the grade re-compute on every push — it
-#       # is REQUIRED, not optional. labeled/unlabeled keep the grade current
-#       # when a label changes; reopened re-grades a revived PR.
-#       types: [opened, synchronize, reopened, labeled, unlabeled]
+#       # is REQUIRED, not optional. `edited` is required for the same reason:
+#       # RETARGETING a PR changes its base, and so its three-dot diff and its
+#       # grade, without moving the head SHA and WITHOUT firing `synchronize` —
+#       # so without it an author can hold a low tier by rebasing the base away.
+#       # labeled/unlabeled keep the grade current when a label changes;
+#       # reopened re-grades a revived PR.
+#       types: [opened, synchronize, reopened, edited, labeled, unlabeled]
 #     issue_comment:
 #       # Records a reviewer ticking the "this grade is wrong" checkbox on the
 #       # sticky comment. Omit this trigger to skip the disagreement stream;
@@ -324,6 +332,19 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # The BRANCH, not the base SHA: retargeting a PR changes its diff
+          # without moving the head SHA and without firing `synchronize`, so the
+          # publisher compares this against the PR's live base and declines to
+          # publish a grade computed against the old one. The base SHA would be
+          # wrong here — it advances whenever the base branch does, which is not
+          # a retarget.
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          # Identity of the account this job publishes as, so `find_sticky`
+          # adopts OUR sticky comment and never another installed bot's.
+          # `app-slug` is empty when no bot token was minted, and the publisher
+          # always accepts `github-actions[bot]` — which is what the fallback
+          # `github.token` posts as.
+          BOT_SLUG: ${{ steps.bot.outputs.app-slug }}
           MODE: ${{ inputs.mode }}
           WANT_COMMENT: ${{ inputs.comment }}
         run: |
@@ -350,13 +371,19 @@ jobs:
               echo "risk-comment.md is missing from the artifact — publishing the Check Run and the label only. The full grade is in the grade job's step summary." | tee -a "${GITHUB_STEP_SUMMARY}"
             fi
           fi
+          AUTHOR_ARG=()
+          if [ -n "${BOT_SLUG}" ]; then
+            AUTHOR_ARG=(--author-login "${BOT_SLUG}[bot]")
+          fi
           python3 _pr_risk_tool/.github/pr-risk/publish_risk.py publish \
             --repo "${REPO}" \
             --pr "${PR_NUMBER}" \
             --sha "${HEAD_SHA}" \
+            --base-ref "${BASE_REF}" \
             --report risk/risk-report.json \
             --check risk/risk-check.md \
             --mode "${MODE}" \
+            "${AUTHOR_ARG[@]+"${AUTHOR_ARG[@]}"}" \
             "${COMMENT_ARG[@]}"
 
       - name: Note degraded mode
@@ -437,9 +464,14 @@ jobs:
           # attacker-controlled text and must not reach the shell as code.
           COMMENT_BODY: ${{ github.event.comment.body }}
           COMMENT_ID: ${{ github.event.comment.id }}
+          BOT_SLUG: ${{ steps.bot.outputs.app-slug }}
         run: |
           set -euo pipefail
           printf '%s' "${COMMENT_BODY}" > edited-comment.md
+          AUTHOR_ARG=()
+          if [ -n "${BOT_SLUG}" ]; then
+            AUTHOR_ARG=(--author-login "${BOT_SLUG}[bot]")
+          fi
           # No-ops (and says so) unless the edited comment IS our sticky one:
           # the id is matched against it, so another bot quoting the marker
           # cannot drive — or clear — the dispute label.
@@ -447,4 +479,5 @@ jobs:
             --repo "${REPO}" \
             --pr "${PR_NUMBER}" \
             --comment-id "${COMMENT_ID}" \
+            "${AUTHOR_ARG[@]+"${AUTHOR_ARG[@]}"}" \
             --body edited-comment.md

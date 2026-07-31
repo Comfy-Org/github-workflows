@@ -60,10 +60,13 @@ DEFAULT_REASON = "application source"
 #
 #   1. tests first  — a test-only change is low risk regardless of what it
 #                     tests, so `services/auth/auth_test.go` is R1, not R3.
-#   2. docs next    — `docs/auth.md` is prose about a sensitive surface, not
+#   2. shadowed     — policy and build/dependency inputs that the broad docs
+#                     rules would otherwise claim for R0 (`docs/CODEOWNERS`,
+#                     `requirements.txt`).
+#   3. docs next    — `docs/auth.md` is prose about a sensitive surface, not
 #                     the surface itself.
-#   3. sensitive    — everything that can break production, leak, or migrate.
-#   4. default R2   — ordinary source.
+#   4. sensitive    — everything that can break production, leak, or migrate.
+#   5. default R2   — ordinary source.
 #
 # A pattern containing `/` is matched against the full repo-relative path; one
 # without is matched against the base name at any depth (same convention as
@@ -83,14 +86,34 @@ RISK_RULES: list[tuple[str, int, str]] = [
     ("**/__tests__/**", R1, "test code"),
     ("**/testdata/**", R1, "test fixture"),
     ("**/fixtures/**", R1, "test fixture"),
-    # 2. docs, lockfiles, non-executable metadata
+    # 2. policy and build/dependency inputs that the docs rules below would
+    #    otherwise shadow. These sit BEFORE section 3 only because ordering is
+    #    first-match-wins and `docs/**` / `*.txt` would claim them for R0.
+    #
+    #    CODEOWNERS is not metadata: it IS the repo's review and access-control
+    #    policy, so a PR that drops the security team or a required owner from
+    #    it is precisely what must not land in the low-attention bucket. GitHub
+    #    honours it at the root, in `.github/`, AND in `docs/` — hence above
+    #    the `docs/**` rule, not merely inside section 3.
+    ("CODEOWNERS", R3, "code review / access-control policy"),
+    #    Dependency MANIFESTS are a supply-chain surface — a swap to an
+    #    attacker-controlled package is a deliberate edit — unlike the derived
+    #    lockfiles below. `*.txt` matches a basename at any depth, so without
+    #    these they would grade R0 "documentation", BELOW the R2 default the
+    #    source they govern gets, and be filtered out of a deep-review queue.
+    #    These are the reachable cases, named explicitly; `*.txt` still shadows
+    #    section 4 for other names (`secrets.txt`), which is part of the general
+    #    rule-ordering question BE-5507 owns when it replaces this table.
+    ("requirements*.txt", R2, "dependency manifest"),
+    ("constraints*.txt", R2, "dependency manifest"),
+    ("CMakeLists.txt", R2, "build configuration"),
+    # 3. docs, lockfiles, non-executable metadata
     ("*.md", R0, "documentation"),
     ("*.mdx", R0, "documentation"),
     ("*.txt", R0, "documentation"),
     ("*.rst", R0, "documentation"),
     ("docs/**", R0, "documentation"),
     ("LICENSE*", R0, "repository metadata"),
-    ("CODEOWNERS", R0, "repository metadata"),
     (".gitignore", R0, "repository metadata"),
     (".github/ISSUE_TEMPLATE/**", R0, "repository metadata"),
     ("go.sum", R0, "dependency lockfile"),
@@ -101,7 +124,7 @@ RISK_RULES: list[tuple[str, int, str]] = [
     ("Cargo.lock", R0, "dependency lockfile"),
     ("poetry.lock", R0, "dependency lockfile"),
     ("uv.lock", R0, "dependency lockfile"),
-    # 3. sensitive surfaces
+    # 4. sensitive surfaces
     ("**/migrations/**", R3, "database migration"),
     ("**/migrate/**", R3, "database migration"),
     ("*.sql", R3, "database schema / DDL"),

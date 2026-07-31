@@ -67,10 +67,18 @@ classifier that runs once, marks a PR extra-small, and never re-analyses it
 while the PR grows into several thousand lines. A stale grade is worse than no
 grade, because it spends trust that does not come back.
 
-So the caller **must** include `synchronize` in its trigger types, and the
-label is recomputed and *replaced* on every run: exactly one `risk:*` label at
-any time, stale tiers removed. A PR that grows from `R0` into `R3` carries
-`risk:R3` and only `risk:R3`.
+So the caller **must** include `synchronize` **and `edited`** in its trigger
+types, and the label is recomputed and *replaced* on every run: exactly one
+`risk:*` label at any time, stale tiers removed. A PR that grows from `R0` into
+`R3` carries `risk:R3` and only `risk:R3`.
+
+`edited` is the less obvious half. **Retargeting** a PR changes its base — and
+therefore its three-dot diff and its grade — without moving the head SHA and
+without firing `synchronize`, so an author could otherwise hold a low tier by
+rebasing the base away. The publisher refuses to write a label or a comment
+computed against a base the PR no longer targets (`--base-ref`, compared with
+the PR's live base), so a caller missing `edited` leaves that PR carrying its
+pre-retarget tier until the next push rather than silently re-asserting it.
 
 ## Unknown is published as unknown
 
@@ -85,10 +93,24 @@ failure as a stale grade.
 The grader reads PR-authored content (paths, `.gitattributes`) and writes into a
 bot-authored comment, so a few things are deliberately not taken on trust:
 
-- **The sticky marker is public**, so `find_sticky` matches on the marker *and*
-  a `user.type == 'Bot'` author. Otherwise a PR author could pre-post a comment
-  carrying the marker and have the publisher overwrite it — inheriting control
-  of the preserved dispute checkbox.
+- **The sticky marker is public**, so `find_sticky` needs three things to agree
+  before it adopts a comment: a `user.type == 'Bot'` author, an author *login*
+  that is `github-actions[bot]` or the publishing app's `<slug>[bot]`, and the
+  marker on the **first line** of the body. Bot *type* alone is not identity —
+  every other GitHub App installed on the repo is a Bot too, and whichever one
+  sorted first would be adopted permanently, with every re-grade PATCHing over
+  its body (or 403ing forever) and the dispute checkbox read back out of a
+  foreign comment. Login alone is not enough either: every other
+  `GITHUB_TOKEN` workflow in the repo also posts as `github-actions[bot]`, and
+  one that *quotes* our comment carries the marker — nested in its own prose,
+  which is what the first-line test rules out. Without all three, a PR author
+  could pre-post a comment carrying the marker and have the publisher overwrite
+  it, inheriting control of the preserved dispute checkbox.
+  The app login comes from the minted token's `app-slug`, so on the degraded
+  path where the mint itself failed the publisher falls back to
+  `github-actions[bot]` and would post a second comment rather than adopt the
+  app's. That is the deliberate trade: a duplicate comment in an already-
+  degraded run, instead of a foreign bot's comment being adopted permanently.
 - **Paths and reasons are escaped before rendering.** Git permits `|`,
   backticks and newlines in a filename; unescaped, such a path breaks out of
   its table cell and can forge a ticked "this grade is wrong" line in the bot's

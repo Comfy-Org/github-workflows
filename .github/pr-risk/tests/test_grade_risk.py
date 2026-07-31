@@ -96,6 +96,39 @@ class ClassifyPathTest(unittest.TestCase):
         """`**/tests/**` must match a repo-root `tests/` too, not only nested."""
         self.assertEqual(grade_risk.classify_path("tests/test_x.py")[0], grade_risk.R1)
 
+    def test_codeowners_is_access_control_not_metadata(self):
+        """CODEOWNERS is the repo's review and access-control policy — a PR
+        that drops the security team from it is exactly what must not land in
+        the low-attention bucket. GitHub honours it at the root, in `.github/`
+        and in `docs/`, so the rule has to outrank `docs/**` as well."""
+        for path in ("CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS"):
+            self.assertEqual(grade_risk.classify_path(path)[0], grade_risk.R3, path)
+
+    def test_dependency_manifests_are_not_documentation(self):
+        """`*.txt` has no `/`, so it matches a basename at ANY depth and used
+        to claim these for R0 — below the R2 default the source they govern
+        gets, filtering a swap to an attacker-controlled package out of the
+        deep-review queue."""
+        for path in (
+            "requirements.txt",
+            "requirements-dev.txt",
+            "svc/api/constraints.txt",
+            "src/CMakeLists.txt",
+        ):
+            tier, reason = grade_risk.classify_path(path)
+            self.assertGreaterEqual(tier, grade_risk.R2, path)
+            self.assertNotEqual(reason, "documentation", path)
+
+    def test_ordinary_text_files_are_still_documentation(self):
+        for path in ("NOTICE.txt", "docs/glossary.txt"):
+            self.assertEqual(grade_risk.classify_path(path)[0], grade_risk.R0, path)
+
+    def test_a_codeowners_fixture_under_tests_is_still_a_test(self):
+        """Section 1 still wins: a fixture is not the repo's live policy."""
+        self.assertEqual(
+            grade_risk.classify_path("pkg/testdata/CODEOWNERS")[0], grade_risk.R1
+        )
+
 
 class ParseNumstatTest(unittest.TestCase):
     def test_basic(self):

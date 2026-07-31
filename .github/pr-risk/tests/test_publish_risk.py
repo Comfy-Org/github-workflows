@@ -34,14 +34,17 @@ class FakeApi:
     sequence of publishes reads as a real reconciliation would).
     """
 
-    def __init__(self, labels=None, comments=None, head_sha="sha1"):
+    def __init__(self, labels=None, comments=None, head_sha="sha1", base_ref="main"):
         self.labels = list(labels or [])
-        # Comments default to a Bot author: ours are posted by the app token or
-        # by github-actions[bot], and find_sticky requires that.
+        # Comments default to the GITHUB_TOKEN bot identity: ours are posted by
+        # the app token or by github-actions[bot], and find_sticky requires the
+        # type AND the login to match.
         self.comments = [
-            {"user": {"type": "Bot"}, **c} for c in list(comments or [])
+            {"user": {"type": "Bot", "login": publish_risk.DEFAULT_AUTHOR_LOGIN}, **c}
+            for c in list(comments or [])
         ]
         self.head_sha = head_sha
+        self.base_ref = base_ref
         self.calls = []
         self.next_comment_id = 1000
 
@@ -51,7 +54,7 @@ class FakeApi:
             # Paginated like the real endpoint, so a pager bug shows up here.
             return self._page([{"name": n} for n in self.labels], path)
         if method == "GET" and "/pulls/" in path:
-            return {"head": {"sha": self.head_sha}}
+            return {"head": {"sha": self.head_sha}, "base": {"ref": self.base_ref}}
         if method == "GET" and "/comments" in path:
             return self._page(list(self.comments), path)
         if method == "POST" and path.endswith("/labels"):
@@ -71,7 +74,10 @@ class FakeApi:
                 {
                     "id": self.next_comment_id,
                     "body": body["body"],
-                    "user": {"type": "Bot"},
+                    "user": {
+                        "type": "Bot",
+                        "login": publish_risk.DEFAULT_AUTHOR_LOGIN,
+                    },
                 }
             )
             return {"id": self.next_comment_id}
@@ -101,6 +107,31 @@ class MarkerAgreementTest(unittest.TestCase):
         the sticky one — the exact duplication the ticket forbids. pr-risk.yml
         deliberately passes no --marker so these defaults are the only source."""
         self.assertEqual(grade_risk.DEFAULT_MARKER, publish_risk.MARKER)
+
+    def test_the_publishers_own_checkbox_line_is_the_one_it_reads_back(self):
+        """publish_risk renders its own fallback bodies (a malformed report),
+        so its copy of the checkbox must match the regexes it later greps with
+        AND the form grade_risk renders — or a dispute registered on a normal
+        comment is silently dropped the first time a fallback body overwrites
+        it, leaving `risk-grade-disputed` stuck on and unclearable."""
+        self.assertTrue(publish_risk.UNCHECKED_RE.search(publish_risk.DISPUTE_LINE))
+        self.assertIsNone(publish_risk.CHECKED_RE.search(publish_risk.DISPUTE_LINE))
+        rendered = grade_risk.render_comment(
+            grade_risk.unknown_report("nope"), publish_risk.MARKER
+        )
+        self.assertIn(publish_risk.DISPUTE_LINE, rendered)
+
+    def test_the_shell_last_resort_body_carries_a_readable_checkbox(self):
+        """grade-risk.sh writes that body with printf when Python itself is
+        unavailable, so it is the one copy no Python test can reach by import."""
+        script = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "grade-risk.sh",
+        )
+        with open(script, encoding="utf-8") as fh:
+            source = fh.read()
+        self.assertIn(publish_risk.DISPUTE_LINE, source)
+        self.assertIn(publish_risk.MARKER, source)
 
 
 class ReconcileLabelsTest(unittest.TestCase):
@@ -132,12 +163,39 @@ class ReconcileLabelsTest(unittest.TestCase):
     def test_a_non_risk_label_is_refused_not_applied(self):
         """`desired` arrives verbatim from the report artifact and this is the
         privileged job. Reconciliation only DELETES names matching the regex,
-        so a bogus label would never be cleaned up by any later run."""
+        so a bogus label would never be cleaned up by any later run.
+
+        The unsupported tiers and the trailing newline are the sharp cases:
+        `^risk:R[0-9]+$` accepted `risk:R99`, and `$` also matches before a
+        trailing newline, so `"risk:R2\\n"` passed and spliced a raw newline
+        into the label DELETE path. The non-strings are sharper still — they
+        raised `TypeError` out of the regex, which is NOT what cmd_publish
+        catches, so the whole publish died instead of degrading to unknown."""
         api = FakeApi()
-        for bogus in ("lgtm", "risk-assessment-done", "risk:Rx", ""):
-            with self.assertRaises(ValueError):
+        bogus_values = (
+            "lgtm", "risk-assessment-done", "risk:Rx", "",
+            "risk:R4", "risk:R99", "risk:R00", "risk:R2\n", " risk:R2",
+            2, None.__class__, ["risk:R2"], {"name": "risk:R2"}, True,
+        )
+        for bogus in bogus_values:
+            with self.assertRaises(ValueError, msg=repr(bogus)):
                 publish_risk.reconcile_labels(api, "o/r", 1, bogus)
         self.assertEqual(api.of("POST", "/labels"), [])
+
+    def test_every_supported_tier_is_applicable(self):
+        for tier in range(grade_risk.MAX_TIER + 1):
+            api = FakeApi()
+            publish_risk.reconcile_labels(api, "o/r", 1, f"risk:R{tier}")
+            self.assertIn(f"risk:R{tier}", api.labels)
+
+    def test_a_legacy_out_of_range_tier_is_still_cleaned_up(self):
+        """The removal side stays broader than the applicable set on purpose:
+        a `risk:R7` written by an older revision must not sit on the PR forever
+        beside the current tier."""
+        api = FakeApi(labels=["risk:R7"])
+        res = publish_risk.reconcile_labels(api, "o/r", 1, "risk:R2")
+        self.assertEqual(res["removed"], ["risk:R7"])
+        self.assertEqual([n for n in api.labels if n.startswith("risk:R")], ["risk:R2"])
 
     def test_the_desired_label_lands_even_if_a_stale_delete_fails(self):
         """A DELETE can 404 (a concurrent run got there first) or 403. Deleting
@@ -278,6 +336,64 @@ class StickyCommentTest(unittest.TestCase):
         self.assertIn("- [x] **This grade is wrong**", api.comments[0]["body"])
         self.assertNotIn("- [ ] **This grade is wrong**", api.comments[0]["body"])
 
+    def test_another_installed_bots_comment_is_not_adopted(self):
+        """Bot TYPE is not identity. Any other GitHub App on the repo is also a
+        Bot, and comments are scanned in ascending id order — so a bot that
+        quotes our sticky comment would be adopted PERMANENTLY: every re-grade
+        PATCHes over its body (or 403s forever), and `upsert_sticky` reads the
+        dispute checkbox back out of a foreign comment."""
+        ours = grade_risk.render_comment(
+            grade_risk.grade(grade_risk.parse_numstat("1\t0\ta.go\0")),
+            publish_risk.MARKER,
+        )
+        api = FakeApi(
+            comments=[
+                {
+                    "id": 1,
+                    "user": {"type": "Bot", "login": "some-other-app[bot]"},
+                    "body": "For reference:\n\n" + ours,
+                }
+            ]
+        )
+        res = publish_risk.upsert_sticky(api, "o/r", 1, ours)
+        self.assertEqual(res["action"], "created")
+        self.assertEqual(api.of("PATCH", "/comments/"), [])
+        self.assertIn("For reference:", api.comments[0]["body"])
+
+    def test_the_configured_app_login_is_adopted(self):
+        api = FakeApi(
+            comments=[
+                {
+                    "id": 1,
+                    "user": {"type": "Bot", "login": "cloud-code-bot[bot]"},
+                    "body": publish_risk.MARKER + "\nold",
+                }
+            ]
+        )
+        res = publish_risk.upsert_sticky(
+            api, "o/r", 1, publish_risk.MARKER + "\nnew", ["cloud-code-bot[bot]"]
+        )
+        self.assertEqual(res["action"], "updated")
+
+    def test_a_sibling_workflow_quoting_us_under_our_own_login_is_skipped(self):
+        """Login matching cannot see this one: every other GITHUB_TOKEN
+        workflow in the repo posts as github-actions[bot] too. The marker has
+        to be the FIRST thing in the body, which a quote never is."""
+        ours = publish_risk.MARKER + "\nour body"
+        api = FakeApi(comments=[{"id": 1, "body": "Bot digest:\n\n> " + ours}])
+        res = publish_risk.upsert_sticky(api, "o/r", 1, ours)
+        self.assertEqual(res["action"], "created")
+        self.assertEqual(api.of("PATCH", "/comments/"), [])
+
+    def test_a_comment_posted_before_an_app_was_configured_is_still_ours(self):
+        """github-actions[bot] is ALWAYS accepted, so turning on bot_app_id
+        adopts the existing comment rather than starting a duplicate."""
+        api = FakeApi(comments=[{"id": 1, "body": publish_risk.MARKER + "\nold"}])
+        res = publish_risk.upsert_sticky(
+            api, "o/r", 1, publish_risk.MARKER + "\nnew", ["cloud-code-bot[bot]"]
+        )
+        self.assertEqual(res["action"], "updated")
+
     def test_an_unticked_box_stays_unticked(self):
         report = grade_risk.grade(grade_risk.parse_numstat("3\t1\ta.md\0"))
         fresh = grade_risk.render_comment(report, publish_risk.MARKER)
@@ -358,10 +474,10 @@ class CmdPublishTest(unittest.TestCase):
             report,
         )
 
-    def _args(self, report, check, comment, mode):
+    def _args(self, report, check, comment, mode, base_ref="main"):
         return argparse.Namespace(
             repo="o/r", pr=1, sha="sha1", report=report, check=check,
-            comment=comment, mode=mode,
+            comment=comment, mode=mode, base_ref=base_ref, author_login=[],
         )
 
     def test_publish_mode_writes_all_three_surfaces(self):
@@ -434,6 +550,119 @@ class CmdPublishTest(unittest.TestCase):
         publish_risk.cmd_publish(self._args(rep, chk, com, "publish"), flaky)
         self.assertIn("risk:R3", api.labels)
 
+    def test_a_retargeted_pr_does_not_get_its_old_base_grade_published(self):
+        """Retargeting changes the three-dot diff — and so the grade — without
+        moving the head SHA and without firing `synchronize`, so a head-only
+        staleness check let a grade computed against the old base sail through
+        and an author could hold a low tier by rebasing the base away."""
+        _, rep, chk, com, _ = self._artifacts("30\t10\tdb/migrations/001.sql\0")
+        api = FakeApi(labels=["risk:R0"], base_ref="release/2.0")
+        publish_risk.cmd_publish(
+            self._args(rep, chk, com, "publish", base_ref="main"), api
+        )
+        self.assertEqual(len(api.of("POST", "/check-runs")), 1)
+        self.assertEqual(api.labels, ["risk:R0"])
+        self.assertEqual(api.of("POST", "/comments"), [])
+
+    def test_an_unchanged_base_publishes_normally(self):
+        _, rep, chk, com, _ = self._artifacts("30\t10\tdb/migrations/001.sql\0")
+        api = FakeApi(base_ref="main")
+        publish_risk.cmd_publish(
+            self._args(rep, chk, com, "publish", base_ref="main"), api
+        )
+        self.assertIn("risk:R3", api.labels)
+
+    def test_an_unreadable_base_ref_still_publishes(self):
+        """Same degrade-to-publishing rule as the head SHA: a staleness lookup
+        that returns nothing must not drop an otherwise good grade."""
+        _, rep, chk, com, _ = self._artifacts("30\t10\tdb/migrations/001.sql\0")
+        api = FakeApi(base_ref=None)
+        publish_risk.cmd_publish(
+            self._args(rep, chk, com, "publish", base_ref="main"), api
+        )
+        self.assertIn("risk:R3", api.labels)
+
+    def test_a_failed_check_run_does_not_suppress_the_label_and_comment(self):
+        """Three independent surfaces, three independent failure modes. Letting
+        the first abort the rest is how a PR ends up with a Check Run
+        announcing one tier and a label and comment describing another."""
+        _, rep, chk, com, _ = self._artifacts("30\t10\tdb/migrations/001.sql\0")
+        api = FakeApi()
+
+        def flaky(method, path, body):
+            if method == "POST" and path.endswith("/check-runs"):
+                raise publish_risk.ApiError("POST /check-runs -> HTTP 403")
+            return api(method, path, body)
+
+        rc = publish_risk.cmd_publish(self._args(rep, chk, com, "publish"), flaky)
+        self.assertEqual(rc, 1)  # degraded, so pr-risk.yml says so
+        self.assertIn("risk:R3", api.labels)
+        self.assertEqual(len(api.of("POST", "/comments")), 1)
+
+    def test_a_failed_label_reconcile_does_not_suppress_the_comment(self):
+        """reconcile_labels raises ApiError from the paged GET and from the
+        POST (403 scope gap, secondary rate limit, 5xx), not just ValueError.
+        Only ValueError was caught, so those aborted cmd_publish before the
+        sticky comment — leaving the comment describing an older grade while
+        the Check Run had already announced the new tier."""
+        _, rep, chk, com, _ = self._artifacts("30\t10\tdb/migrations/001.sql\0")
+        api = FakeApi()
+
+        def flaky(method, path, body):
+            if "/labels" in path:
+                raise publish_risk.ApiError("GET /labels -> HTTP 502")
+            return api(method, path, body)
+
+        rc = publish_risk.cmd_publish(self._args(rep, chk, com, "publish"), flaky)
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(api.of("POST", "/check-runs")), 1)
+        self.assertEqual(len(api.of("POST", "/comments")), 1)
+
+    def test_a_malformed_label_makes_all_three_surfaces_say_unknown(self):
+        """Rejecting the tier at labelling time left the Check Run and the
+        comment still asserting it — no label, but two surfaces announcing a
+        tier the publisher had just refused to trust."""
+        d = tempfile.mkdtemp()
+        report = grade_risk.grade(grade_risk.parse_numstat("3\t1\tsvc/auth/a.go\0"))
+        report["label"] = "risk:R9"  # a tier this publisher may not create
+        title, summary = grade_risk.render_check(report)
+        rep = _write(d, "risk-report.json", json.dumps(report))
+        chk = _write(d, "risk-check.md", f"{title}\n\n{summary}\n")
+        com = _write(
+            d, "risk-comment.md", grade_risk.render_comment(report, publish_risk.MARKER)
+        )
+        api = FakeApi(labels=["risk:R0"])
+        publish_risk.cmd_publish(self._args(rep, chk, com, "publish"), api)
+
+        self.assertEqual(api.of("POST", "/labels"), [])
+        self.assertNotIn("risk:R0", api.labels)
+        # No surface may ASSERT the refused tier. Naming it as the rejected
+        # value is the diagnostic, and is not the same thing as claiming it.
+        check_out = api.of("POST", "/check-runs")[0][2]["output"]
+        self.assertEqual(check_out["title"], "Risk: unknown")
+        self.assertIn("no tier was published", check_out["summary"])
+        self.assertNotIn("**Tier:", check_out["summary"])
+        posted = api.of("POST", "/comments")[0][2]["body"]
+        self.assertTrue(posted.startswith(publish_risk.MARKER))
+        self.assertIn("Risk: **unknown**", posted)
+        self.assertNotIn("`risk:R9`", posted)
+        self.assertNotIn("Per-file breakdown", posted)
+        # Still round-trippable: a dispute registered on this body is readable.
+        self.assertTrue(publish_risk.UNCHECKED_RE.search(posted))
+
+    def test_a_malformed_label_body_still_preserves_a_registered_dispute(self):
+        d = tempfile.mkdtemp()
+        report = grade_risk.grade(grade_risk.parse_numstat("3\t1\tsvc/auth/a.go\0"))
+        ticked = grade_risk.render_comment(report, publish_risk.MARKER, disputed=True)
+        report["label"] = ["not", "even", "a", "string"]
+        title, summary = grade_risk.render_check(report)
+        rep = _write(d, "risk-report.json", json.dumps(report))
+        chk = _write(d, "risk-check.md", f"{title}\n\n{summary}\n")
+        com = _write(d, "risk-comment.md", "ignored — the report was rejected")
+        api = FakeApi(comments=[{"id": 7, "body": ticked}])
+        publish_risk.cmd_publish(self._args(rep, chk, com, "publish"), api)
+        self.assertTrue(publish_risk.CHECKED_RE.search(api.comments[0]["body"]))
+
     def test_a_grown_pr_relabels_from_r0_to_r3_across_two_publishes(self):
         """The load-bearing re-grade property, end to end."""
         api = FakeApi()
@@ -455,7 +684,8 @@ class CmdDisputeTest(unittest.TestCase):
     def _args(self, body_text, comment_id=""):
         d = tempfile.mkdtemp()
         return argparse.Namespace(
-            repo="o/r", pr=1, body=_write(d, "b.md", body_text), comment_id=comment_id
+            repo="o/r", pr=1, body=_write(d, "b.md", body_text),
+            comment_id=comment_id, author_login=[],
         )
 
     def test_a_ticked_box_labels_the_pr(self):
