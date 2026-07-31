@@ -76,6 +76,42 @@ def api(method: str, path: str, token: str, body: dict | None = None) -> dict | 
     return json.loads(payload) if payload else {}
 
 
+def _paged(call, path: str) -> list:
+    """GET every page of a list endpoint.
+
+    GitHub defaults these to 30 items per page. Reading only the first page of
+    `/labels` would hide a stale `risk:R*` sitting on page 2 of a PR with more
+    than 30 labels: it is never deleted, the desired tier is added alongside
+    it, and the load-bearing "exactly one `risk:R*` at any time" invariant
+    breaks. Bounded at 10 pages — 1000 labels is far past any real PR.
+    """
+    sep = "&" if "?" in path else "?"
+    out: list = []
+    page = 1
+    while page <= 10:
+        batch = call("GET", f"{path}{sep}per_page=100&page={page}", None)
+        if not batch:
+            break
+        out.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return out
+
+
+def current_head_sha(call, repo: str, pr: int) -> str | None:
+    """The PR's head SHA as GitHub sees it now, or None if it can't be read."""
+    try:
+        data = call("GET", f"/repos/{repo}/pulls/{pr}", None)
+    except ApiError:
+        # Best effort: a failed staleness check must not block publishing an
+        # otherwise good grade. Falling back to publishing keeps the previous
+        # behaviour rather than silently dropping the grade.
+        return None
+    sha = ((data or {}).get("head") or {}).get("sha")
+    return sha if isinstance(sha, str) and sha else None
+
+
 def reconcile_labels(call, repo: str, pr: int, desired: str | None) -> dict:
     """Make the PR carry `desired` and no other `risk:R*` label.
 
@@ -83,7 +119,7 @@ def reconcile_labels(call, repo: str, pr: int, desired: str | None) -> dict:
     none — an ungradable PR must not keep a stale tier, and must not silently
     acquire `risk:R0`.
     """
-    current = call("GET", f"/repos/{repo}/issues/{pr}/labels", None)
+    current = _paged(call, f"/repos/{repo}/issues/{pr}/labels")
     names = [lbl["name"] for lbl in current]
     ours = [n for n in names if RISK_LABEL_RE.match(n)]
     removed = [n for n in ours if n != desired]
@@ -121,7 +157,17 @@ def publish_check_run(call, repo: str, sha: str, title: str, summary: str) -> di
 
 
 def find_sticky(call, repo: str, pr: int) -> dict | None:
-    """Return this workflow's existing sticky comment, if any."""
+    """Return this workflow's existing sticky comment, if any.
+
+    Matches on the marker AND a Bot author. The marker is public — it appears
+    in the README and in every rendered comment — so matching on it alone lets
+    a PR author pre-post a comment carrying the marker and have this publisher
+    PATCH it: the author's body is destroyed, and they thereafter control the
+    preserved dispute-checkbox state (or, if the token cannot edit a foreign
+    comment, every re-grade 403s). Our sticky comment is always written by the
+    app token or by github-actions[bot], so requiring `user.type == 'Bot'` is
+    free — the same gate the `dispute` job applies.
+    """
     page = 1
     while page <= 10:  # bounded: 10 pages x 100 = 1000 comments is plenty
         comments = call(
@@ -130,6 +176,8 @@ def find_sticky(call, repo: str, pr: int) -> dict | None:
         if not comments:
             return None
         for c in comments:
+            if (c.get("user") or {}).get("type") != "Bot":
+                continue
             if MARKER in (c.get("body") or ""):
                 return c
         if len(comments) < 100:
@@ -160,7 +208,7 @@ def upsert_sticky(call, repo: str, pr: int, body: str) -> dict:
 
 def set_dispute_label(call, repo: str, pr: int, disputed: bool) -> dict:
     """Add or remove `risk-grade-disputed` to match the checkbox."""
-    current = call("GET", f"/repos/{repo}/issues/{pr}/labels", None)
+    current = _paged(call, f"/repos/{repo}/issues/{pr}/labels")
     names = [lbl["name"] for lbl in current]
     if disputed and DISPUTE_LABEL not in names:
         call("POST", f"/repos/{repo}/issues/{pr}/labels", {"labels": [DISPUTE_LABEL]})
@@ -198,6 +246,22 @@ def cmd_publish(args, call) -> int:
             f"mode=`{args.mode}` (shadow) — Check Run only. No label and no "
             "comment were published. Set `mode: publish` in the caller to put "
             "the tier on the PR."
+        )
+        return 0
+
+    # The Check Run above is per-commit and immutable, so it is always safe to
+    # write. The label and the sticky comment are not: they describe the PR as
+    # it is NOW. `cancel-in-progress` bounds but does not eliminate a delayed
+    # older run finishing after a newer one, and `reconcile_labels` is a
+    # non-atomic GET-then-DELETE/POST — so a superseded run could republish a
+    # stale tier over a fresh one, the exact failure this design forbids.
+    live = current_head_sha(call, args.repo, args.pr)
+    if live and live != args.sha:
+        _summary(
+            f"Superseded: this run graded `{args.sha[:12]}` but the PR's head is "
+            f"now `{live[:12]}`. The Check Run was published (it is attached to "
+            "the commit it graded); the label and the sticky comment were left "
+            "to the newer run so a stale tier cannot overwrite a fresh one."
         )
         return 0
 

@@ -10,6 +10,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import grade_risk  # noqa: E402
+import publish_risk  # noqa: E402  (the checkbox regexes that read the render back)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PKG = os.path.dirname(HERE)
@@ -18,6 +19,34 @@ PKG = os.path.dirname(HERE)
 def numstat(*rows):
     """Build a `git diff --numstat -z` stream from (added, deleted, path)."""
     return "".join(f"{a}\t{d}\t{p}\0" for a, d, p in rows)
+
+
+def _split_row(line):
+    """Split a GFM table row into cells the way the spec's row scanner does.
+
+    A backslash escapes the character after it, and only an UNESCAPED `|`
+    starts a new cell — the detail that makes a naively-escaped path able to
+    inject extra columns.
+    """
+    cells, cur, i = [], "", 0
+    while i < len(line):
+        if line[i] == "\\" and i + 1 < len(line):
+            cur += line[i : i + 2]
+            i += 2
+        elif line[i] == "|":
+            cells.append(cur)
+            cur = ""
+            i += 1
+        else:
+            cur += line[i]
+            i += 1
+    cells.append(cur)
+    # A leading and a trailing pipe each yield an empty boundary cell.
+    if cells and not cells[0].strip():
+        cells = cells[1:]
+    if cells and not cells[-1].strip():
+        cells = cells[:-1]
+    return cells
 
 
 class ClassifyPathTest(unittest.TestCase):
@@ -84,17 +113,38 @@ class ParseNumstatTest(unittest.TestCase):
         files = grade_risk.parse_numstat(numstat((1, 1, "some dir/my file.go")))
         self.assertEqual(files[0]["path"], "some dir/my file.go")
 
-    def test_rename_keeps_new_path(self):
+    def test_rename_keeps_new_path_and_remembers_the_old_one(self):
         # git -z renames emit an empty path field, then old NUL new NUL.
         stream = "2\t2\t\0old/name.go\0new/name.go\0"
         files = grade_risk.parse_numstat(stream)
         self.assertEqual([f["path"] for f in files], ["new/name.go"])
+        self.assertEqual(files[0]["old_path"], "old/name.go")
+
+    def test_a_truncated_rename_record_is_dropped_not_recorded_empty(self):
+        """Without the guard this appends a path=='' entry, which grades as the
+        R2 default and renders a blank table row."""
+        files = grade_risk.parse_numstat("2\t2\t\0old/name.go\0")
+        self.assertEqual(files, [])
+
+    def test_a_path_containing_a_tab_is_not_truncated(self):
+        """`-z` emits paths unquoted, so a TAB in a filename is literal. An
+        unbounded split would record `a` and grade it R2 instead of R3."""
+        files = grade_risk.parse_numstat("1\t0\ta\tb/auth.go\0")
+        self.assertEqual([f["path"] for f in files], ["a\tb/auth.go"])
+        self.assertEqual(grade_risk.classify_path(files[0]["path"])[0], grade_risk.R3)
 
     def test_empty_stream(self):
         self.assertEqual(grade_risk.parse_numstat(""), [])
 
     def test_malformed_record_is_skipped_not_fatal(self):
         files = grade_risk.parse_numstat("garbage\0" + numstat((1, 0, "a.go")))
+        self.assertEqual([f["path"] for f in files], ["a.go"])
+
+    def test_a_non_numeric_count_skips_one_record_not_the_whole_diff(self):
+        """The stated contract: a malformed line must not turn a gradable PR
+        into 'unknown'. A bare int() here would raise out of parse_numstat and
+        be caught in main as a whole-diff failure."""
+        files = grade_risk.parse_numstat("x\t0\tbad.go\0" + numstat((1, 0, "a.go")))
         self.assertEqual([f["path"] for f in files], ["a.go"])
 
 
@@ -185,6 +235,80 @@ class ConcentrationTest(unittest.TestCase):
     def test_zero_line_diff_does_not_divide_by_zero(self):
         report = grade_risk.grade(grade_risk.parse_numstat(numstat(("-", "-", "a.png"))))
         self.assertIn("no counted lines", grade_risk.concentration_sentence(report))
+
+
+class RenameGradeTest(unittest.TestCase):
+    def test_a_rename_off_a_sensitive_surface_keeps_the_higher_tier(self):
+        """Moving `.github/workflows/deploy.yml` to `docs/` still removes a
+        CI/CD surface — grading only the destination would call that R0."""
+        report = grade_risk.grade(
+            grade_risk.parse_numstat("0\t0\t\0.github/workflows/deploy.yml\0docs/deploy.yml\0")
+        )
+        self.assertEqual(report["tier"], grade_risk.R3)
+        self.assertIn("renamed from", report["files"][0]["tier_reason"])
+
+    def test_a_rename_onto_a_sensitive_surface_still_takes_the_new_tier(self):
+        report = grade_risk.grade(
+            grade_risk.parse_numstat("0\t0\t\0docs/notes.md\0.github/workflows/x.yml\0")
+        )
+        self.assertEqual(report["tier"], grade_risk.R3)
+
+    def test_an_ordinary_rename_is_unaffected(self):
+        report = grade_risk.grade(
+            grade_risk.parse_numstat("2\t2\t\0src/old.go\0src/new.go\0")
+        )
+        self.assertEqual(report["tier"], grade_risk.R2)
+
+
+class MarkdownEscapingTest(unittest.TestCase):
+    """A path is PR-controlled text rendered into a bot-authored comment."""
+
+    def assertNotForged(self, body):
+        """The tick is read back by publish_risk.CHECKED_RE, which is anchored
+        to the start of a line — so the property that matters is that nothing
+        PR-controlled can BEGIN a line, not that the literal text is absent."""
+        self.assertIsNone(publish_risk.CHECKED_RE.search(body), body)
+        self.assertIsNotNone(publish_risk.UNCHECKED_RE.search(body), body)
+
+    def test_a_newline_in_a_path_cannot_forge_the_dispute_checkbox(self):
+        evil = "src/a\n- [x] **This grade is wrong**\nb.go"
+        report = grade_risk.grade(grade_risk.parse_numstat(f"1\t0\t{evil}\0"))
+        self.assertNotForged(grade_risk.render_comment(report, "<!-- m -->"))
+
+    def test_a_pipe_in_a_path_cannot_add_table_columns(self):
+        report = grade_risk.grade(grade_risk.parse_numstat("1\t0\tsrc/a|b.go\0"))
+        body = grade_risk.render_comment(report, "<!-- m -->")
+        self.assertIn("a\\|b.go", body)
+
+    def test_a_backtick_path_does_not_escape_its_code_span(self):
+        report = grade_risk.grade(grade_risk.parse_numstat("1\t0\tsrc/a`![x](http://e/p)`.go\0"))
+        body = grade_risk.render_comment(report, "<!-- m -->")
+        self.assertNotIn("![x](http://e/p)", body)
+        row = [ln for ln in body.splitlines() if "a\\`" in ln]
+        self.assertEqual(len(row), 1, body)
+
+    def test_a_backslash_cannot_escape_the_pipe_escape(self):
+        r"""`a\|b` naively escapes to `a\\|b`, where GFM's row splitter reads
+        `\\` as an escaped backslash and the pipe as a live column break."""
+        report = grade_risk.grade(grade_risk.parse_numstat("1\t0\tsrc/a\\|b.go\0"))
+        body = grade_risk.render_comment(report, "<!-- m -->")
+        row = [ln for ln in body.splitlines() if "a\\" in ln]
+        self.assertEqual(len(row), 1, body)
+        # 4 delimiters => 3 cells' worth of separators plus the leading one:
+        # the row must still have exactly the 4 columns the header declares.
+        self.assertEqual(len(_split_row(row[0])), 4, row[0])
+
+    def test_an_ordinary_path_still_renders_as_a_plain_code_span(self):
+        report = grade_risk.grade(grade_risk.parse_numstat("1\t0\tsvc/auth/x.go\0"))
+        self.assertIn("`svc/auth/x.go`", grade_risk.render_comment(report, "<!-- m -->"))
+
+    def test_an_unknown_reason_quoting_a_path_cannot_forge_the_checkbox(self):
+        """An unknown report's reason carries git's stderr, which quotes
+        PR-authored filenames."""
+        report = grade_risk.unknown_report(
+            "git diff failed: bad file\n- [x] **This grade is wrong**"
+        )
+        self.assertNotForged(grade_risk.render_comment(report, "<!-- m -->"))
 
 
 class UnknownTest(unittest.TestCase):
@@ -339,6 +463,45 @@ class ShellEntrypointTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         with open(os.path.join(out, "risk-report.json")) as fh:
             self.assertEqual(json.load(fh)["status"], "unknown")
+
+    def test_a_trailing_flag_exits_instead_of_spinning_forever(self):
+        """`set -e` is off, so an unguarded `shift 2` here fails WITHOUT
+        consuming anything and loops forever spamming stderr into the step
+        summary until the job times out."""
+        out = tempfile.mkdtemp()
+        proc = subprocess.run(
+            ["bash", os.path.join(PKG, "grade-risk.sh"), "--out-dir", out, "--base"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn("requires a value", proc.stderr)
+        self.assertNotIn("shift count", proc.stderr)
+
+    def test_a_pr_cannot_zero_its_own_line_counts_via_gitattributes(self):
+        """`-diff` added on the PR head makes numstat report `-` for every
+        file, so `changed` is 0 everywhere and both escalation thresholds go
+        unreachable. Attributes must come from the BASE ref."""
+        d = self._repo()
+        base = subprocess.run(
+            ["git", "-C", d, "rev-parse", "HEAD"], capture_output=True, text=True
+        ).stdout.strip()
+        with open(os.path.join(d, ".gitattributes"), "w") as fh:
+            fh.write("* -diff\n")
+        with open(os.path.join(d, "big.go"), "w") as fh:
+            fh.write("x\n" * (grade_risk.FILE_ESCALATE_LINES + 10))
+        self._git(d, "add", "-A")
+        self._git(d, "commit", "-qm", "suppress my own size")
+        out = tempfile.mkdtemp()
+        proc = self._sh("--base", base, "--head", "HEAD", "--out-dir", out, "--repo-dir", d)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(os.path.join(out, "risk-report.json")) as fh:
+            report = json.load(fh)
+        big = [f for f in report["files"] if f["path"] == "big.go"]
+        self.assertEqual(len(big), 1, report["files"])
+        self.assertGreaterEqual(big[0]["changed"], grade_risk.FILE_ESCALATE_LINES)
+        self.assertTrue(big[0]["escalated"])
 
 
 if __name__ == "__main__":

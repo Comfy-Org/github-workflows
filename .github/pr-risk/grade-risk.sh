@@ -31,13 +31,24 @@ REPO_DIR="."
 # the sticky one, so it is defined ONCE in Python and never duplicated here.
 MARKER=""
 
+# `set -e` is deliberately off (this script must reach its own exit paths), so a
+# bare `shift 2` on a trailing flag would FAIL without consuming anything and
+# spin the loop below forever, spamming "shift count out of range" into the step
+# summary until the job times out. Every value-taking arm checks first.
+need_value() {
+  if [ "$#" -lt 2 ]; then
+    echo "grade-risk.sh: $1 requires a value" >&2
+    exit 2
+  fi
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
-    --base) BASE="${2:-}"; shift 2 ;;
-    --head) HEAD="${2:-}"; shift 2 ;;
-    --out-dir) OUT_DIR="${2:-}"; shift 2 ;;
-    --repo-dir) REPO_DIR="${2:-}"; shift 2 ;;
-    --marker) MARKER="${2:-}"; shift 2 ;;
+    --base) need_value "$@"; BASE="$2"; shift 2 ;;
+    --head) need_value "$@"; HEAD="$2"; shift 2 ;;
+    --out-dir) need_value "$@"; OUT_DIR="$2"; shift 2 ;;
+    --repo-dir) need_value "$@"; REPO_DIR="$2"; shift 2 ;;
+    --marker) need_value "$@"; MARKER="$2"; shift 2 ;;
     -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
     *) echo "grade-risk.sh: unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -110,10 +121,25 @@ fi
 # against it. `-z` keeps paths with spaces/newlines intact. stdout and stderr
 # go to separate files: git's diagnostics must never be spliced into the
 # numstat stream the grader parses.
+#
+# `--attr-source` reads .gitattributes from the BASE ref rather than from the
+# working tree, which here is the PR's own head. Without it a PR that adds
+# `* -diff` (or marks paths `binary`) makes git emit `-` counts for every file:
+# every `changed` becomes 0, and both FILE_ESCALATE_LINES and
+# SIZE_ESCALATE_LINES become unreachable — a PR could suppress its own size
+# signal. pr-size.yml guards the analogous `linguist-generated` case the same
+# way. It is a TOP-LEVEL git option (before the subcommand) and needs git
+# >= 2.42, so a failure falls back to a plain diff and says so, rather than
+# reddening an advisory check on an older runner.
 NUMSTAT_FILE="${OUT_DIR}/.numstat"
 NUMSTAT_ERR="${OUT_DIR}/.numstat.err"
-if ! git -C "$REPO_DIR" diff --numstat -z "${BASE}...${HEAD}" >"$NUMSTAT_FILE" 2>"$NUMSTAT_ERR"; then
-  emit_unknown "git diff ${BASE}...${HEAD} failed: $(tr '\n' ' ' <"$NUMSTAT_ERR")"
+if ! git -C "$REPO_DIR" "--attr-source=${BASE}" diff --numstat -z "${BASE}...${HEAD}" \
+     >"$NUMSTAT_FILE" 2>"$NUMSTAT_ERR"; then
+  if ! git -C "$REPO_DIR" diff --numstat -z "${BASE}...${HEAD}" \
+       >"$NUMSTAT_FILE" 2>"$NUMSTAT_ERR"; then
+    emit_unknown "git diff ${BASE}...${HEAD} failed: $(tr '\n' ' ' <"$NUMSTAT_ERR")"
+  fi
+  echo "grade-risk.sh: --attr-source is unsupported by this git; .gitattributes was read from the PR head, so a PR that marks its own files '-diff' can zero its line counts. Upgrade to git >= 2.42 to close that." >&2
 fi
 
 # --marker is forwarded only when the caller explicitly set one; otherwise the

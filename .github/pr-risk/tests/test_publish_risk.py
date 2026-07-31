@@ -34,19 +34,26 @@ class FakeApi:
     sequence of publishes reads as a real reconciliation would).
     """
 
-    def __init__(self, labels=None, comments=None):
+    def __init__(self, labels=None, comments=None, head_sha="sha1"):
         self.labels = list(labels or [])
-        self.comments = list(comments or [])
+        # Comments default to a Bot author: ours are posted by the app token or
+        # by github-actions[bot], and find_sticky requires that.
+        self.comments = [
+            {"user": {"type": "Bot"}, **c} for c in list(comments or [])
+        ]
+        self.head_sha = head_sha
         self.calls = []
         self.next_comment_id = 1000
 
     def __call__(self, method, path, body):
         self.calls.append((method, path, body))
-        if method == "GET" and path.endswith("/labels"):
-            return [{"name": n} for n in self.labels]
+        if method == "GET" and "/labels" in path:
+            # Paginated like the real endpoint, so a pager bug shows up here.
+            return self._page([{"name": n} for n in self.labels], path)
+        if method == "GET" and "/pulls/" in path:
+            return {"head": {"sha": self.head_sha}}
         if method == "GET" and "/comments" in path:
-            # One page; the pager stops when a page is short.
-            return list(self.comments) if "page=1" in path else []
+            return self._page(list(self.comments), path)
         if method == "POST" and path.endswith("/labels"):
             for n in body["labels"]:
                 if n not in self.labels:
@@ -60,7 +67,13 @@ class FakeApi:
             return {"id": 42}
         if method == "POST" and "/comments" in path:
             self.next_comment_id += 1
-            self.comments.append({"id": self.next_comment_id, "body": body["body"]})
+            self.comments.append(
+                {
+                    "id": self.next_comment_id,
+                    "body": body["body"],
+                    "user": {"type": "Bot"},
+                }
+            )
             return {"id": self.next_comment_id}
         if method == "PATCH" and "/comments/" in path:
             cid = int(path.rsplit("/", 1)[1])
@@ -69,6 +82,14 @@ class FakeApi:
                     c["body"] = body["body"]
             return {"id": cid}
         return {}
+
+    @staticmethod
+    def _page(items, path):
+        """Serve `items` the way GitHub pages a list endpoint."""
+        per_page = 100 if "per_page=100" in path else 30
+        page = int(path.rsplit("page=", 1)[1]) if "page=" in path else 1
+        start = (page - 1) * per_page
+        return items[start : start + per_page]
 
     def of(self, method, needle):
         return [c for c in self.calls if c[0] == method and needle in c[1]]
@@ -127,6 +148,19 @@ class ReconcileLabelsTest(unittest.TestCase):
         publish_risk.reconcile_labels(api, "o/r", 1, "risk:R3")
         self.assertIn("risk%3AR0", api.of("DELETE", "/labels/")[0][1])
 
+    def test_a_stale_tier_past_the_first_page_is_still_removed(self):
+        """`/labels` defaults to 30 per page. A stale risk:R* hiding on page 2
+        must not survive, or the PR carries two tiers at once."""
+        api = FakeApi(labels=[f"topic-{n}" for n in range(40)] + ["risk:R0"])
+        res = publish_risk.reconcile_labels(api, "o/r", 1, "risk:R3")
+        self.assertEqual(res["removed"], ["risk:R0"])
+        self.assertEqual([n for n in api.labels if n.startswith("risk:R")], ["risk:R3"])
+
+    def test_pager_asks_for_full_pages(self):
+        api = FakeApi(labels=["risk:R0"])
+        publish_risk.reconcile_labels(api, "o/r", 1, "risk:R1")
+        self.assertIn("per_page=100", api.of("GET", "/labels")[0][1])
+
 
 class CheckRunTest(unittest.TestCase):
     def test_conclusion_is_always_neutral(self):
@@ -173,6 +207,31 @@ class StickyCommentTest(unittest.TestCase):
         self.assertEqual(res["action"], "created")
         self.assertEqual(api.comments[0]["body"], "looks good to me")
 
+    def test_a_human_comment_carrying_the_marker_is_not_hijacked(self):
+        """The marker is public (README + every rendered comment), so a PR
+        author can pre-post one. Matching it alone would PATCH their comment
+        away and hand them control of the preserved dispute checkbox."""
+        api = FakeApi(
+            comments=[
+                {
+                    "id": 7,
+                    "user": {"type": "User"},
+                    "body": publish_risk.MARKER
+                    + "\n- [x] **This grade is wrong**\nmine, not yours",
+                }
+            ]
+        )
+        fresh = grade_risk.render_comment(
+            grade_risk.grade(grade_risk.parse_numstat("1\t0\ta.go\0")),
+            publish_risk.MARKER,
+        )
+        res = publish_risk.upsert_sticky(api, "o/r", 1, fresh)
+        self.assertEqual(res["action"], "created")
+        self.assertEqual(api.of("PATCH", "/comments/"), [])
+        self.assertIn("mine, not yours", api.comments[0]["body"])
+        # ...and their forged tick did not leak into our fresh comment either.
+        self.assertIn("- [ ] **This grade is wrong**", api.comments[-1]["body"])
+
     def test_a_registered_disagreement_survives_a_re_grade(self):
         """A push must not silently un-tick a reviewer's disagreement."""
         report = grade_risk.grade(
@@ -217,6 +276,17 @@ class DisputeLabelTest(unittest.TestCase):
         )
         self.assertEqual(api.of("POST", "/labels"), [])
         self.assertEqual(api.of("DELETE", "/labels/"), [])
+
+    def test_the_label_is_found_past_the_first_page(self):
+        """Same 30-per-page default as reconcile_labels: un-ticking the box on
+        a heavily-labelled PR must still remove risk-grade-disputed."""
+        api = FakeApi(
+            labels=[f"topic-{n}" for n in range(40)] + [publish_risk.DISPUTE_LABEL]
+        )
+        self.assertEqual(
+            publish_risk.set_dispute_label(api, "o/r", 1, False)["action"], "removed"
+        )
+        self.assertNotIn(publish_risk.DISPUTE_LABEL, api.labels)
 
     def test_checkbox_regex_accepts_the_rendered_forms(self):
         for line in (
@@ -302,6 +372,35 @@ class CmdPublishTest(unittest.TestCase):
         publish_risk.cmd_publish(self._args(rep, chk, "", "publish"), api)
         self.assertIn("risk:R0", api.labels)
         self.assertEqual(api.of("POST", "/comments"), [])
+
+    def test_a_superseded_run_does_not_overwrite_a_newer_grade(self):
+        """cancel-in-progress bounds but does not eliminate a delayed older run
+        landing last. Its Check Run is per-commit and still publishes; its
+        label and comment must not stomp the newer head's."""
+        _, rep, chk, com, _ = self._artifacts("30\t10\tdb/migrations/001.sql\0")
+        api = FakeApi(labels=["risk:R0"], head_sha="newer-sha")
+        rc = publish_risk.cmd_publish(self._args(rep, chk, com, "publish"), api)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(api.of("POST", "/check-runs")), 1)
+        self.assertEqual(api.labels, ["risk:R0"])
+        self.assertEqual(api.of("POST", "/labels"), [])
+        self.assertEqual(api.of("DELETE", "/labels/"), [])
+        self.assertEqual(api.of("POST", "/comments"), [])
+
+    def test_an_unreadable_head_sha_still_publishes(self):
+        """A failed staleness lookup must degrade to publishing, not to
+        silently dropping an otherwise good grade."""
+        _, rep, chk, com, _ = self._artifacts("30\t10\tdb/migrations/001.sql\0")
+
+        api = FakeApi()
+
+        def flaky(method, path, body):
+            if method == "GET" and "/pulls/" in path:
+                raise publish_risk.ApiError("GET /pulls/1 -> HTTP 502")
+            return api(method, path, body)
+
+        publish_risk.cmd_publish(self._args(rep, chk, com, "publish"), flaky)
+        self.assertIn("risk:R3", api.labels)
 
     def test_a_grown_pr_relabels_from_r0_to_r3_across_two_publishes(self):
         """The load-bearing re-grade property, end to end."""

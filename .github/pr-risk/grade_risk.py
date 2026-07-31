@@ -180,7 +180,8 @@ def parse_numstat(data: str) -> list[dict]:
     `-z` is used so paths containing spaces or newlines round-trip safely. In
     `-z` mode git emits `added\\tdeleted\\t` followed by a NUL-terminated path;
     for renames it emits the path fields as two further NUL-terminated
-    entries (old, new) and we keep the NEW path.
+    entries (old, new). We keep the NEW path and remember the old one as
+    `old_path`, so `grade` can score the rename at the higher of the two ends.
 
     A binary file's counts are `-`; it is recorded with zero counted lines
     (there is no line count to reason about) but still classified, so a binary
@@ -194,31 +195,49 @@ def parse_numstat(data: str) -> list[dict]:
         i += 1
         if not chunk.strip():
             continue
-        fields = chunk.split("\t")
+        # Split at most twice: a path may legally contain a TAB, and `-z` emits
+        # it unquoted, so an unbounded split would truncate `a\tb/auth.go` to
+        # `a` and grade it R2 instead of R3.
+        fields = chunk.split("\t", 2)
         if len(fields) < 3:
             # Not a numstat record (trailing junk); skip rather than crash —
             # a malformed line must not turn a gradable PR into "unknown".
             continue
         added_s, deleted_s, path = fields[0], fields[1], fields[2]
         binary = added_s == "-" or deleted_s == "-"
+        old_path = ""
         if path == "":
             # Rename/copy: the old and new paths follow as separate records.
-            if i + 1 < len(parts):
-                path = parts[i + 1]
-                i += 2
-            else:
+            if i + 1 >= len(parts):
                 continue
-        added = 0 if binary else int(added_s or 0)
-        deleted = 0 if binary else int(deleted_s or 0)
-        files.append(
-            {
-                "path": path,
-                "added": added,
-                "deleted": deleted,
-                "changed": added + deleted,
-                "binary": binary,
-            }
-        )
+            old_path, path = parts[i], parts[i + 1]
+            i += 2
+            if not path:
+                # Truncated rename record — the new path never arrived. Skip it
+                # rather than append an entry with an empty path, which would
+                # grade as the R2 default and render a blank table row.
+                continue
+        if binary:
+            added = deleted = 0
+        else:
+            try:
+                added = int(added_s or 0)
+                deleted = int(deleted_s or 0)
+            except ValueError:
+                # A non-numeric count is one malformed record, not a whole-diff
+                # failure: skip just this file, per the contract above. Letting
+                # ValueError escape would downgrade the entire PR to "unknown".
+                continue
+        record = {
+            "path": path,
+            "added": added,
+            "deleted": deleted,
+            "changed": added + deleted,
+            "binary": binary,
+        }
+        if old_path:
+            record["old_path"] = old_path
+        files.append(record)
     return files
 
 
@@ -227,6 +246,17 @@ def grade(files: list[dict]) -> dict:
     graded = []
     for f in files:
         tier, reason = classify_path(f["path"])
+        old_path = f.get("old_path")
+        if old_path:
+            old_tier, old_reason = classify_path(old_path)
+            if old_tier > tier:
+                # A rename that moves a file OFF a sensitive surface still
+                # removes that surface, so grade it at the higher of the two
+                # ends: `.github/workflows/deploy.yml` -> `docs/deploy.yml` is
+                # not an R0 change. The old path itself stays out of the reason
+                # string — it is PR-controlled text and belongs only in the
+                # JSON report, not in rendered markdown.
+                tier, reason = old_tier, f"renamed from {old_reason}"
         escalated = False
         if f["changed"] >= FILE_ESCALATE_LINES and tier < MAX_TIER:
             tier += 1
@@ -325,6 +355,48 @@ def concentration_sentence(report: dict) -> str:
 
 DISPUTE_CHECKBOX = "**This grade is wrong**"
 
+# Every ASCII punctuation character CommonMark lets you backslash-escape. Used
+# only on the fallback path in `_md_path`, where an inline-code span cannot
+# hold the text safely.
+_MD_ESCAPE = str.maketrans({c: "\\" + c for c in "\\`*_{}[]()#+-.!<>|~"})
+
+
+def _md_path(path: str) -> str:
+    """Render a PR-controlled path safely inside a markdown table cell.
+
+    Paths come straight from the diff and git permits `|`, backticks and
+    newlines in a filename. Unescaped, such a path breaks out of its inline
+    code span and out of the table row, letting a PR author inject arbitrary
+    markdown into this bot-authored comment — including a checked
+    `- [x] **This grade is wrong**` line that a later re-grade reads back as a
+    genuine reviewer dispute, or a remote image that logs reviewer IPs.
+
+    Newlines are flattened (nothing PR-controlled may ever start a line) and
+    pipes are backslash-escaped — GFM honours `\\|` inside inline spans too. A
+    path containing a backtick or a backslash falls back to fully escaped plain
+    text: no inline-code span can quote a backtick reliably, and a literal
+    backslash in front of a pipe (`a\\|b`) would otherwise escape the ESCAPE
+    and hand the pipe back to the table splitter.
+    """
+    flat = path.replace("\r", " ").replace("\n", " ")
+    if "`" in flat or "\\" in flat:
+        return flat.translate(_MD_ESCAPE)
+    return "`" + flat.replace("|", "\\|") + "`"
+
+
+def _md_text(text: str) -> str:
+    """Flatten and pipe-escape a reason string before rendering it.
+
+    Tier reasons are our own constants, but an UNKNOWN report's reason carries
+    git's stderr — which quotes PR-authored path names — so it is no less
+    attacker-influenced than a path. Flattening newlines is the load-bearing
+    part: nothing PR-controlled may ever start a line of this comment, or it
+    could forge the dispute checkbox. Backslashes are doubled BEFORE pipes are
+    escaped, so a literal `\\` in front of a `|` cannot escape the escape.
+    """
+    flat = text.replace("\r", " ").replace("\n", " ")
+    return flat.replace("\\", "\\\\").replace("|", "\\|")
+
 
 def render_comment(report: dict, marker: str, disputed: bool = False) -> str:
     """Render the sticky PR comment.
@@ -339,7 +411,7 @@ def render_comment(report: dict, marker: str, disputed: bool = False) -> str:
         lines += [
             "## ⚪ Risk: **unknown**",
             "",
-            f"The risk grader could not read this diff: {report['reason']}",
+            f"The risk grader could not read this diff: {_md_text(report['reason'])}",
             "",
             "No `risk:*` label was applied — an ungradable PR is published as "
             "unknown rather than defaulted to `risk:R0`. Re-run the check (or "
@@ -350,7 +422,7 @@ def render_comment(report: dict, marker: str, disputed: bool = False) -> str:
         lines += [
             f"## Risk: **`risk:R{tier}`** — {TIER_NAMES[tier].split(' — ', 1)[1]}",
             "",
-            f"{report['reason']}",
+            _md_text(report["reason"]),
             "",
             concentration_sentence(report),
             "",
@@ -362,8 +434,8 @@ def render_comment(report: dict, marker: str, disputed: bool = False) -> str:
         shown = sorted(report["files"], key=lambda f: (-f["tier"], -f["changed"]))
         for f in shown[:50]:
             lines.append(
-                f"| `{f['path']}` | +{f['added']}/-{f['deleted']} | "
-                f"R{f['tier']} | {f['tier_reason']} |"
+                f"| {_md_path(f['path'])} | +{f['added']}/-{f['deleted']} | "
+                f"R{f['tier']} | {_md_text(f['tier_reason'])} |"
             )
         if len(shown) > 50:
             lines.append(f"| _…and {len(shown) - 50} more files_ | | | |")
@@ -388,15 +460,15 @@ def render_check(report: dict) -> tuple[str, str]:
         return (
             "Risk: unknown",
             "The risk grader could not read this diff: "
-            f"{report['reason']}\n\nNo tier was assigned and no `risk:*` label "
-            "was applied. This check is advisory and never fails.",
+            f"{_md_text(report['reason'])}\n\nNo tier was assigned and no "
+            "`risk:*` label was applied. This check is advisory and never fails.",
         )
     tier = report["tier"]
     summary = "\n".join(
         [
             f"**Tier: `risk:R{tier}`** ({TIER_NAMES[tier]})",
             "",
-            f"Reason: {report['reason']}",
+            f"Reason: {_md_text(report['reason'])}",
             "",
             concentration_sentence(report),
             "",

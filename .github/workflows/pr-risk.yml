@@ -313,11 +313,25 @@ jobs:
           set -euo pipefail
           if [ ! -s risk/risk-report.json ] || [ ! -s risk/risk-check.md ]; then
             echo "Report artifact empty — the grader crashed before rendering; leaving any existing label and comment untouched."
-            exit 0
+            # Exit NON-zero so `steps.publish.outcome` is `failure` and the
+            # "Note degraded mode" step below actually runs. Exiting 0 here
+            # would report success while a stale `risk:R*` stayed advertised on
+            # a newer, ungraded head with no notice anywhere. `continue-on-error`
+            # keeps the job green, so this still gates nothing.
+            echo "degraded=empty-report" >> "${GITHUB_OUTPUT}"
+            exit 1
           fi
           COMMENT_ARG=()
           if [ "${WANT_COMMENT}" = "true" ]; then
-            COMMENT_ARG=(--comment risk/risk-comment.md)
+            # The upload uses `if-no-files-found: warn`, so a partial artifact
+            # can carry the report and the check text without the comment body.
+            # Publish what we have rather than raising FileNotFoundError AFTER
+            # the Check Run and the label are already written.
+            if [ -s risk/risk-comment.md ]; then
+              COMMENT_ARG=(--comment risk/risk-comment.md)
+            else
+              echo "risk-comment.md is missing from the artifact — publishing the Check Run and the label only. The full grade is in the grade job's step summary." | tee -a "${GITHUB_STEP_SUMMARY}"
+            fi
           fi
           python3 _pr_risk_tool/.github/pr-risk/publish_risk.py publish \
             --repo "${REPO}" \
@@ -337,9 +351,13 @@ jobs:
         env:
           DL: ${{ steps.dl.outcome }}
           BOT: ${{ steps.bot.outcome }}
+          DEGRADED: ${{ steps.publish.outputs.degraded }}
         run: |
           if [ "${DL}" != "success" ]; then
             echo "Nothing published: the risk report artifact could not be downloaded (the grade job likely failed before uploading it). Check the grade job logs."
+          elif [ "${DEGRADED}" = "empty-report" ]; then
+            echo "Nothing published: the artifact downloaded but risk-report.json or risk-check.md was empty — the grader crashed before rendering. Any existing risk:R* label and sticky comment were left untouched and may now be STALE, describing an older head. Check the grade job logs."
+            echo "Nothing is gated on this workflow, so no PR is blocked by this."
           else
             echo "Nothing published: the publish step failed at runtime — see the 'Publish label, Check Run and sticky comment' step log for the actual error. Common causes: the caller granted less than checks:write + pull-requests:write; a fork PR whose GITHUB_TOKEN is read-only and no bot_app_id was supplied (mint outcome: ${BOT:-skipped}); a rate limit or 5xx."
             echo "The full grade is in the grade job's step summary either way. Nothing is gated on this workflow, so no PR is blocked by this."

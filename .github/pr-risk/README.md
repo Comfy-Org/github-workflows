@@ -80,6 +80,26 @@ carries no `risk:*` label — never defaulted to `risk:R0`, never silently
 skipped. Silently defaulting to the safest tier is the same trust-spending
 failure as a stale grade.
 
+## What a PR cannot do to its own grade
+
+The grader reads PR-authored content (paths, `.gitattributes`) and writes into a
+bot-authored comment, so a few things are deliberately not taken on trust:
+
+- **The sticky marker is public**, so `find_sticky` matches on the marker *and*
+  a `user.type == 'Bot'` author. Otherwise a PR author could pre-post a comment
+  carrying the marker and have the publisher overwrite it — inheriting control
+  of the preserved dispute checkbox.
+- **Paths are escaped before rendering.** Git permits `|`, backticks and
+  newlines in a filename; unescaped, such a path breaks out of its table cell
+  and can forge a ticked "this grade is wrong" line in the bot's own comment.
+- **`.gitattributes` is read from the BASE ref** (`git --attr-source`), so a PR
+  that adds `* -diff` cannot make numstat report `-` for every file and zero out
+  its own size escalation. Same guard `pr-size.yml` applies to
+  `linguist-generated`. Needs git >= 2.42; older runners fall back and say so.
+- **The publisher re-checks the PR head SHA** before touching the label or the
+  comment, so a delayed, superseded run cannot republish a stale tier over a
+  newer one. Its Check Run still publishes — that one is per-commit.
+
 ## Adoption
 
 See the caller pattern in the header comment of
