@@ -420,49 +420,6 @@ jobs:
           path: _groom_assets
           persist-credentials: false
 
-      - name: Resolve the pinned Claude Code CLI version
-        # The agent CLI pin lives in `.github/groom/package.json` in THIS repo, at
-        # the same `workflows_ref` the briefs come from — one source of truth for
-        # the three jobs that install it.
-        #
-        # Why a package.json and not an `env:` constant up top: Dependabot's
-        # github-actions ecosystem only parses `uses:` refs, and an inline
-        # `npm install -g <pkg>@<ver>` inside a `run:` step is invisible to EVERY
-        # ecosystem when there is no npm manifest in the repo. So nothing watched
-        # the pin and it silently rotted — the exact failure mode dependabot.yml
-        # was added to fix. A real manifest makes the npm ecosystem see it and open
-        # a bump PR (see the `/.github/groom` entry in .github/dependabot.yml).
-        # Nothing is ever installed FROM that directory; it exists to be read here.
-        #
-        # Resolved in `gate` rather than per-job because every install job already
-        # `needs: gate`, so one resolution + one validation covers all three and
-        # they cannot drift apart the way three hardcoded literals could.
-        id: claude_version
-        run: |
-          set -euo pipefail
-          manifest="$GROOM_ASSETS/package.json"
-          if [ ! -f "$manifest" ]; then
-            echo "::error::$manifest is missing — it is the single source of truth for the groom agent CLI pin (BE-5373)."
-            exit 1
-          fi
-          version=$(jq -r '.dependencies["@anthropic-ai/claude-code"] // ""' "$manifest")
-          if [ -z "$version" ]; then
-            echo "::error::$manifest has no dependencies[\"@anthropic-ai/claude-code\"] entry — the groom agent CLI pin must live there."
-            exit 1
-          fi
-          # Exact versions only. The agent CLI is executable supply chain for steps
-          # that read untrusted repo content, so a floating range (^, ~, *, latest,
-          # a dist-tag) would silently re-introduce the unpinned install this pin
-          # exists to prevent. Dependabot's npm updater preserves an exact
-          # requirement as exact (`versioning-strategy: increase`), so a normal bump
-          # passes; anything else fails loudly instead of floating.
-          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)*$ ]]; then
-            echo "::error::@anthropic-ai/claude-code is pinned to '$version', which is not an exact X.Y.Z version. Floating ranges and dist-tags are not allowed for the agent CLI."
-            exit 1
-          fi
-          echo "Claude Code CLI pinned at $version"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
       - name: Resolve operational knobs (GROOM_CONFIG)
         # Merges, highest precedence LAST: the per-knob `with:` inputs (the
         # reviewed baseline) < `vars.GROOM_CONFIG` (the live, no-PR layer) < the
@@ -649,6 +606,79 @@ jobs:
           else
             echo "should_run=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Resolve the pinned Claude Code CLI version
+        # The agent CLI pin lives in `.github/groom/package.json` in THIS repo, at
+        # the same `workflows_ref` the briefs come from — one source of truth for
+        # the three jobs that install it.
+        #
+        # Why a package.json and not an `env:` constant up top: Dependabot's
+        # github-actions ecosystem only parses `uses:` refs, and an inline
+        # `npm install -g <pkg>@<ver>` inside a `run:` step is invisible to EVERY
+        # ecosystem when there is no npm manifest in the repo. So nothing watched
+        # the pin and it silently rotted — the exact failure mode dependabot.yml
+        # was added to fix. A real manifest makes the npm ecosystem see it and open
+        # a bump PR (see the `/.github/groom` entry in .github/dependabot.yml).
+        # Nothing is ever installed FROM that directory; it exists to be read here.
+        #
+        # Resolved in `gate` rather than per-job because every install job already
+        # `needs: gate`, so one resolution + one validation covers all three and
+        # they cannot drift apart the way three hardcoded literals could.
+        #
+        # LAST step in the job, and gated on `should_run`, deliberately: this is
+        # the one fail-CLOSED step in a job whose every other step fails OPEN, and
+        # a scheduled caller skips ~6 of 7 daily ticks. Running it eagerly would
+        # let a bad manifest (e.g. at a stale `workflows_ref`) red out ticks that
+        # were never going to install anything. Nothing downstream can observe the
+        # difference — all six consumer jobs are themselves
+        # `if: needs.gate.outputs.should_run == 'true'` — and a bad pin cannot
+        # reach main in the first place, because test_claude_code_pin.py runs on
+        # any PR touching `.github/groom/**`. So the check still fires on every
+        # tick that would actually install the CLI, and only on those.
+        id: claude_version
+        if: steps.check.outputs.should_run == 'true'
+        run: |
+          set -euo pipefail
+          manifest="$GROOM_ASSETS/package.json"
+          if [ ! -f "$manifest" ]; then
+            echo "::error::$manifest is missing — it is the single source of truth for the groom agent CLI pin (BE-5373)."
+            exit 1
+          fi
+          # `?` on the index so a manifest whose `dependencies` is present but not
+          # an object (a string, a list) falls into the empty-version branch below
+          # with a legible message, instead of dying on a raw jq "cannot index"
+          # error under `set -e`. `// ""` covers absent/null.
+          version=$(jq -r '(.dependencies["@anthropic-ai/claude-code"]? // "")' "$manifest")
+          if [ -z "$version" ]; then
+            echo "::error::$manifest has no dependencies[\"@anthropic-ai/claude-code\"] entry — the groom agent CLI pin must live there."
+            exit 1
+          fi
+          # Newlines stripped BEFORE the value is ever echoed. It is untrusted
+          # input at this point (an arbitrary JSON string from a manifest at the
+          # caller-supplied `workflows_ref`), and a `::error::` line carrying an
+          # embedded newline can emit further workflow commands — `::add-mask::`,
+          # `::stop-commands::` — into this job's log stream. Only used for
+          # reporting; the value that leaves this step is the validated one.
+          printable=${version//[$'\n\r']/ }
+          # Exact versions only. The agent CLI is executable supply chain for steps
+          # that read untrusted repo content, so a floating range (^, ~, *, latest,
+          # a dist-tag) would silently re-introduce the unpinned install this pin
+          # exists to prevent. Dependabot's npm updater preserves an exact
+          # requirement as exact (`versioning-strategy: increase`), so a normal bump
+          # passes; anything else fails loudly instead of floating.
+          #
+          # Strict SemVer, not a loose suffix match: the prerelease and build parts
+          # are dot-separated non-empty identifiers, and at most one of each in
+          # that order. A looser `([-+][0-9A-Za-z.-]+)*` accepts junk like
+          # `1.2.3-a..b`, which npm treats as a (mutable) dist-tag rather than an
+          # exact version — precisely the un-pinning this guard exists to reject.
+          semver='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          if ! [[ "$version" =~ $semver ]]; then
+            echo "::error::@anthropic-ai/claude-code is pinned to '$printable', which is not an exact X.Y.Z version. Floating ranges and dist-tags are not allowed for the agent CLI."
+            exit 1
+          fi
+          echo "Claude Code CLI pinned at $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
   audit_find:
     # Phase 1 — the READ-ONLY finder. Holds NO write credentials (`contents:

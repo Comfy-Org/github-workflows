@@ -343,6 +343,16 @@ the `claude_code_version` job output; all three install steps consume that outpu
 via `needs.gate.outputs`. So there is no version literal left in the workflow, and
 a merged bump PR moves every call site at once.
 
+That resolve step is the **last** step in `gate` and runs only when
+`should_run == 'true'`. It is the one fail-**closed** step in a job whose every
+other step fails open, and a scheduled caller skips ~6 of 7 daily ticks — running
+it eagerly would let a broken manifest (say, at a stale `workflows_ref`) red out
+ticks that were never going to install anything. So on a skipped tick the
+`claude_code_version` output is empty; that is expected, and unobservable, since
+every consumer job is itself gated on `should_run`. A bad pin still cannot reach
+`main`, because `tests/test_claude_code_pin.py` runs on any PR touching
+`.github/groom/**`.
+
 Two rules the tooling enforces, both because the agent CLI is executable supply
 chain for steps that read untrusted repo content:
 
