@@ -85,6 +85,27 @@ updates:
       # forms of the dependency name.
       - dependency-name: "Comfy-Org/github-workflows*"
 
+      # Hold `create-github-app-token` at v1.x in the cross-repo bumpers.
+      #
+      # The v1.12.0 -> v3.2.0 jump in the 2026-07-30 major group (#95) broke the
+      # `owner:`-without-`repositories:` token: every bump-*-callers.yml run since
+      # has 403'd with "Resource not accessible by integration" on `tree create`
+      # for every caller repo, silently stranding every consumer on a stale pin.
+      # Verified against one repo across the boundary: cloud-code-bot[bot] wrote
+      # Comfy-Org/cloud at 23:03 on v1.12.0 and 403'd on the same repo, same token
+      # config, on v3.2.0. Neither the v2.0.0 nor the v3.0.0 release notes document
+      # a scoping change, so this is pinned by evidence, not by changelog.
+      #
+      # Scoped to majors only: v1.x patches still arrive. Lifting this needs a
+      # cross-repo write proven on a real caller, not a green unit-test run —
+      # nothing in CI exercises the cross-repo path.
+      #
+      # NOTE: only the six bump-*-callers.yml workflows are held back. The
+      # current-repo minters (groom.yml, cursor-review.yml, pr-size.yml, ...) do
+      # not set `owner:`, are scoped to the running repo, and stay on v3.x.
+      - dependency-name: "actions/create-github-app-token"
+        update-types: ["version-update:semver-major"]
+
   # Dependency-free today, but declared so the day a module is added it is
   # watched rather than silently rotting — the same failure mode this file
   # exists to fix.
