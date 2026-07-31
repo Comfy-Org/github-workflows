@@ -70,7 +70,16 @@ mkdir -p "$OUT_DIR"
 # or defaulted to the safest tier.
 emit_unknown() {
   local reason="$1"
-  echo "grade-risk.sh: ${reason}" >&2
+  # `reason` carries git's stderr, which quotes PR-authored path names, and
+  # pr-risk.yml pipes this step through `tee -a "$GITHUB_STEP_SUMMARY"` — so an
+  # unescaped echo renders PR-controlled markdown (a remote image that logs
+  # reviewer IPs, a link) verbatim in the run summary, and an unbounded one can
+  # blow the 1 MiB step-summary cap. Every OTHER consumer of this string is
+  # already escaped (`_md_text` in Python, the `tr` whitelists below); this
+  # echo was the gap. Same whitelist and bound as the markdown fallback.
+  local safe_reason
+  safe_reason=$(printf '%s' "$reason" | tr -c 'A-Za-z0-9 ._/:-' ' ' | cut -c1-500)
+  echo "grade-risk.sh: ${safe_reason}" >&2
   # `-I` (isolated) is load-bearing, not tidiness: reading the program from
   # stdin puts '' — the process CWD, which in the `grade` job is the PR's own
   # checkout — at the front of sys.path, ahead of the `sys.path.insert` below
@@ -107,7 +116,8 @@ PY
     # publish as unknown, instead of the run vanishing silently.
     #
     # `reason` carries git's stderr, which quotes PR-authored path names, so it
-    # is sanitised twice over.
+    # is sanitised twice over. (`safe_reason` above is the step-summary form;
+    # these two are the JSON and markdown forms, each with its own rules.)
     #
     # For JSON: reduced to printable ASCII, then the two structural characters
     # are backslash-escaped (backslashes FIRST, or the escape of a quote would
@@ -123,7 +133,7 @@ PY
     local json_reason md_reason
     json_reason=$(printf '%s' "$reason" | tr -c '\040-\176' ' ' | cut -c1-500 \
       | sed 's/\\/\\\\/g; s/"/\\"/g')
-    md_reason=$(printf '%s' "$reason" | tr -c 'A-Za-z0-9 ._/:-' ' ' | cut -c1-500)
+    md_reason="$safe_reason"
     printf '{"schema":1,"status":"unknown","tier":null,"label":null,"reason":"%s","total_lines":0,"tier_lines":{},"files":[],"top_tier_files":[],"attr_source_degraded":%s}\n' \
       "$json_reason" "$([ -n "${ATTR_DEGRADED:-}" ] && echo true || echo false)" \
       > "${OUT_DIR}/risk-report.json"

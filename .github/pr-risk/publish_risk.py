@@ -79,7 +79,17 @@ class ApiError(RuntimeError):
 
 def api(method: str, path: str, token: str, body: dict | None = None) -> dict | list:
     """Minimal GitHub REST call. Kept tiny and injectable so the tests can
-    replace it wholesale rather than mocking a transport."""
+    replace it wholesale rather than mocking a transport.
+
+    EVERY failure leaves here as `ApiError`. That is the contract `cmd_publish`
+    relies on to attempt its three publications independently: an exception
+    that is not an `ApiError` escapes every `except ApiError` there and aborts
+    the whole publish — after the Check Run has already announced a tier. Two
+    such escapes are reachable without any HTTP error at all: a socket read
+    timeout in `resp.read()` raises `TimeoutError`, and a non-JSON body (a
+    proxy's HTML error page, a truncated response) raises `JSONDecodeError`.
+    Both are caught here rather than at each call site.
+    """
     url = path if path.startswith("http") else f"{API_ROOT}{path}"
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
@@ -96,7 +106,18 @@ def api(method: str, path: str, token: str, body: dict | None = None) -> dict | 
         raise ApiError(f"{method} {url} -> HTTP {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:  # pragma: no cover - network path
         raise ApiError(f"{method} {url} -> {exc}") from exc
-    return json.loads(payload) if payload else {}
+    except OSError as exc:  # pragma: no cover - network path
+        # Covers the read timeout (TimeoutError) and any other socket-level
+        # failure raised by `resp.read()` rather than by the request itself.
+        raise ApiError(f"{method} {url} -> {exc}") from exc
+    if not payload:
+        return {}
+    try:
+        return json.loads(payload)
+    except ValueError as exc:  # pragma: no cover - network path
+        raise ApiError(
+            f"{method} {url} -> response was not JSON: {exc}"
+        ) from exc
 
 
 def _paged(call, path: str) -> list:
@@ -206,7 +227,14 @@ def reconcile_labels(call, repo: str, pr: int, desired: str | None) -> dict:
             # A stale tier we could not remove is worth reporting, but it must
             # not abort the run and take the sticky comment down with it.
             failed.append(f"{name} ({exc})")
-    return {"added": added, "removed": removed, "failed_removals": failed}
+    # `names` is the label set as it was READ, so the caller can see whether
+    # `risk-grade-disputed` is on the PR without paying for a second page walk.
+    return {
+        "added": added,
+        "removed": removed,
+        "failed_removals": failed,
+        "names": names,
+    }
 
 
 def publish_check_run(call, repo: str, sha: str, title: str, summary: str) -> dict:
@@ -260,12 +288,23 @@ def find_sticky(call, repo: str, pr: int, logins=()) -> dict | None:
                     matching alone still cannot see, because every other
                     `GITHUB_TOKEN` workflow in the repo posts as
                     `github-actions[bot]` as well.
+
+    Scanned NEWEST-FIRST, and the scan is bounded at 10 pages. Ascending order
+    made that bound unrecoverable: on a PR with more than 1000 comments the
+    sticky is past the cap, so every re-grade POSTs a fresh comment — which
+    itself lands past the cap, so the next run does it again, forever, and each
+    new body resets the dispute tick. Descending, a comment we create is found
+    on page 1 from then on, so the breakage costs at most one duplicate rather
+    than one per push.
     """
     allowed = _author_allowed(logins)
     page = 1
     while page <= 10:  # bounded: 10 pages x 100 = 1000 comments is plenty
         comments = call(
-            "GET", f"/repos/{repo}/issues/{pr}/comments?per_page=100&page={page}", None
+            "GET",
+            f"/repos/{repo}/issues/{pr}/comments"
+            f"?per_page=100&page={page}&sort=created&direction=desc",
+            None,
         )
         if not comments:
             return None
@@ -281,16 +320,49 @@ def find_sticky(call, repo: str, pr: int, logins=()) -> dict | None:
     return None
 
 
-def upsert_sticky(call, repo: str, pr: int, body: str, logins=()) -> dict:
+def upsert_sticky(
+    call, repo: str, pr: int, body: str, logins=(), disputed: bool = False
+) -> dict:
     """Create or update the single sticky comment.
 
     Preserves the reviewer's "this grade is wrong" checkbox across re-grades:
     a push must not silently un-tick a disagreement someone registered. The
-    body arrives rendered with an UNCHECKED box, so when the existing comment
-    is checked we flip the fresh body to checked before writing it.
+    body arrives rendered with an UNCHECKED box, so when the tick is set we
+    flip the fresh body to checked before writing it.
+
+    The tick is read from TWO sources, because the comment body alone is racy.
+    `find_sticky` reads the body and the PATCH writes it back, so a reviewer
+    ticking the box inside that window is overwritten — and the `edited` event
+    our own PATCH then fires drives `cmd_dispute` to CLEAR `risk-grade-disputed`,
+    turning a lost tick into a lost label:
+
+      `disputed`  the caller's view of the `risk-grade-disputed` label, which
+                  `cmd_dispute` already wrote from an earlier tick. Unlike the
+                  body, it survives this overwrite, so a dispute registered on
+                  any previous run is re-asserted here instead of dropped —
+                  and because the body we write is then ticked, the `edited`
+                  event it fires reads as still-disputed and the label stands.
+      body        re-read by id IMMEDIATELY before the PATCH rather than reused
+                  from the `find_sticky` scan, which may be several paginated
+                  requests old. That does not make the write atomic — GitHub
+                  offers no conditional comment update — but it shrinks the
+                  window from the whole scan to a single round trip.
     """
     existing = find_sticky(call, repo, pr, logins)
-    if existing and CHECKED_RE.search(existing.get("body") or ""):
+    if existing:
+        seen_body = existing.get("body") or ""
+        try:
+            fresh = call(
+                "GET", f"/repos/{repo}/issues/comments/{existing['id']}", None
+            )
+            if isinstance(fresh, dict) and fresh.get("body") is not None:
+                seen_body = fresh["body"]
+        except ApiError:
+            # A failed re-read is not a reason to drop the write: fall back to
+            # the body the scan already returned.
+            pass
+        disputed = disputed or bool(CHECKED_RE.search(seen_body))
+    if disputed:
         body = UNCHECKED_RE.sub(
             lambda m: m.group(0).replace("[ ]", "[x]", 1), body, count=1
         )
@@ -387,8 +459,28 @@ def _summary(line: str) -> None:
 
 
 def cmd_publish(args, call) -> int:
-    with open(args.report, encoding="utf-8") as fh:
-        report = json.load(fh)
+    # A corrupt-but-non-empty report is a real artifact state: the grade job's
+    # upload is `if-no-files-found: warn` and its shell fallbacks write the
+    # report with printf, so a truncated or half-written file reaches here.
+    # pr-risk.yml's guard only tests `-s` (non-empty), never well-formedness,
+    # so letting JSONDecodeError escape published NOTHING — not even the
+    # unknown Check Run the design promises — and left the previous head's
+    # `risk:R*` on the PR. Degrade to the same malformed path an out-of-range
+    # label already takes.
+    report_error = None
+    try:
+        with open(args.report, encoding="utf-8") as fh:
+            report = json.load(fh)
+        if not isinstance(report, dict):
+            raise ValueError(f"top level is {type(report).__name__}, not an object")
+    except (ValueError, OSError) as exc:
+        # `_safe` because `detail` is interpolated straight into the Check Run
+        # summary and the sticky comment: a decoder message quotes position,
+        # not content, but that is a property of today's stdlib, not a
+        # guarantee — and everything else rendered here is whitelisted.
+        report = {}
+        report_error = f"the report artifact could not be read ({_safe(exc, 200)})"
+
     with open(args.check, encoding="utf-8") as fh:
         check_text = fh.read()
     title, _, summary = check_text.partition("\n\n")
@@ -407,11 +499,29 @@ def cmd_publish(args, call) -> int:
     # surfaces contradicting each other: no label, but a Check Run and a sticky
     # comment still announcing it. Rejecting the report up here re-renders all
     # three as UNKNOWN together.
-    desired = report.get("label") if report.get("status") == "graded" else None
-    if desired is not None and not (
-        isinstance(desired, str) and APPLICABLE_LABEL_RE.fullmatch(desired)
-    ):
-        detail = f"the report asked for {_safe(repr(desired))}, which is not a risk:R0..R3 label"
+    #
+    # A report marked `graded` MUST carry a usable label. Testing only
+    # `desired is not None` let a graded report with a missing or null `label`
+    # slip through the guard entirely: `reconcile_labels(None)` stripped every
+    # tier and the summary said the PR could not be graded, while the check
+    # text and the comment body — rendered from that same report and never
+    # re-rendered as unknown — still announced one. `status` not being
+    # `graded` is the ordinary unknown case and stays untouched.
+    graded = report.get("status") == "graded"
+    desired = report.get("label") if graded else None
+    usable = isinstance(desired, str) and bool(APPLICABLE_LABEL_RE.fullmatch(desired))
+    if report_error:
+        detail = report_error
+    elif graded and desired is None:
+        detail = "the report is marked graded but carries no label"
+    elif graded and not usable:
+        detail = (
+            f"the report asked for {_safe(repr(desired))}, which is not a "
+            "risk:R0..R3 label"
+        )
+    else:
+        detail = None
+    if detail:
         _summary(
             f"Report artifact is malformed — {detail}. Publishing the Check Run "
             "and the comment as UNKNOWN, and applying no label."
@@ -480,8 +590,13 @@ def cmd_publish(args, call) -> int:
         )
         return 1 if failures else 0
 
+    # Whether a dispute is already on record, read from the label rather than
+    # from the comment body — see `upsert_sticky`. Defaults to False when the
+    # label read failed, which is the pre-existing behaviour.
+    disputed = False
     try:
         lab = reconcile_labels(call, args.repo, args.pr, desired)
+        disputed = DISPUTE_LABEL in lab["names"]
         if desired:
             _summary(f"Label: `{desired}` (removed: {lab['removed'] or 'none'})")
         else:
@@ -491,6 +606,14 @@ def cmd_publish(args, call) -> int:
                 f"{lab['removed'] or 'none'})"
             )
         if lab["failed_removals"]:
+            # A stale tier we could not remove leaves the PR carrying TWO
+            # `risk:R*` labels — the invariant this module calls load-bearing.
+            # Reporting it only in the step summary meant `cmd_publish` still
+            # returned 0, so pr-risk.yml's "Note degraded mode" step never
+            # fired and the breakage was visible nowhere a reviewer looks.
+            failures.append(
+                "stale label removal: " + "; ".join(lab["failed_removals"])
+            )
             _summary(
                 "Warning: these stale risk labels could not be removed, so the "
                 f"PR may show more than one tier: {'; '.join(lab['failed_removals'])}"
@@ -505,7 +628,7 @@ def cmd_publish(args, call) -> int:
 
     if body is not None:
         try:
-            res = upsert_sticky(call, args.repo, args.pr, body, logins)
+            res = upsert_sticky(call, args.repo, args.pr, body, logins, disputed)
             _summary(f"Sticky comment {res['action']}.")
         except ApiError as exc:
             failures.append(f"sticky comment: {exc}")
@@ -531,17 +654,30 @@ def cmd_dispute(args, call) -> int:
     # comment (a review summarizer, say) would drive `risk-grade-disputed` —
     # including CLEARING a genuine dispute if the quoted copy shows an unticked
     # box. `find_sticky` was hardened against exactly this; match the id here.
-    if args.comment_id:
-        sticky = find_sticky(
-            call, args.repo, args.pr, getattr(args, "author_login", None) or []
+    #
+    # An ABSENT id refuses the request rather than falling through to the
+    # weaker marker-only check. pr-risk.yml always passes one, so the only way
+    # to reach this is a miswired caller — and a security control that
+    # degrades to fail-open when its input goes missing is the control failing
+    # silently, which is worse than not recording one checkbox toggle.
+    if not args.comment_id:
+        _summary(
+            "No --comment-id was passed, so the edited comment cannot be "
+            "matched against this workflow's sticky comment — refusing to "
+            "touch `" + DISPUTE_LABEL + "` on marker text alone. This is a "
+            "caller bug: pr-risk.yml always passes --comment-id."
         )
-        if not sticky or str(sticky.get("id")) != str(args.comment_id):
-            _summary(
-                f"Edited comment {args.comment_id} carries the marker but is not "
-                "this workflow's sticky comment (probably another bot quoting "
-                "it) — nothing to record."
-            )
-            return 0
+        return 0
+    sticky = find_sticky(
+        call, args.repo, args.pr, getattr(args, "author_login", None) or []
+    )
+    if not sticky or str(sticky.get("id")) != str(args.comment_id):
+        _summary(
+            f"Edited comment {_safe(args.comment_id, 40)} carries the marker but "
+            "is not this workflow's sticky comment (probably another bot "
+            "quoting it) — nothing to record."
+        )
+        return 0
     disputed = bool(CHECKED_RE.search(body))
     res = set_dispute_label(call, args.repo, args.pr, disputed)
     _summary(

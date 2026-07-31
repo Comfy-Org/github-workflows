@@ -31,11 +31,18 @@ caller's checkout, so a pull request cannot rewrite the logic grading it.
 ## How a tier is decided
 
 1. **Every changed file is classified** against `RISK_RULES` in `grade_risk.py`,
-   first match wins. The ordering is deliberate: tests first (a test for a
-   sensitive surface is still a test), then docs (`docs/auth.md` is prose *about*
-   a sensitive surface, not the surface), then sensitive surfaces
-   (migrations, CI/CD, IaC, auth, secrets, billing), then `R2` for ordinary
-   source.
+   first match wins, case-insensitively (`migration.SQL` and `main.TF` are the
+   same surfaces as their lowercase spellings). The ordering is deliberate:
+   tests first (a test for a sensitive surface is still a test), then the
+   policy, dependency and secret-material rules that the broad docs globs would
+   otherwise shadow, then docs (`docs/auth.md` is prose *about* a sensitive
+   surface, not the surface), then the remaining sensitive surfaces
+   (migrations, CI/CD, IaC, auth, billing), then `R2` for ordinary source.
+
+   The shadowing is why section 2 exists: `*.txt` has no `/`, so it matches a
+   basename at **any depth** — `secrets.txt` and `requirements.txt` would grade
+   `R0` "documentation", below even the `R2` default their contents deserve,
+   and be filtered straight out of a deep-review queue.
 2. **A very large single file escalates one tier** (`FILE_ESCALATE_LINES`) —
    size is itself an attention signal, independent of what the file is.
 3. **The PR's tier is the MAX of its file tiers.** One `R3` file makes the PR
@@ -116,15 +123,32 @@ bot-authored comment, so a few things are deliberately not taken on trust:
   its table cell and can forge a ticked "this grade is wrong" line in the bot's
   own comment, or inject a remote image that logs reviewer IPs. An UNKNOWN
   report's reason gets the same treatment — it carries git's stderr, which
-  quotes PR-authored path names. The body is length-bounded too, so a diff of
+  quotes PR-authored path names, and it is escaped on **every** surface it
+  reaches, including `grade-risk.sh`'s stderr note, which `pr-risk.yml` pipes
+  into `$GITHUB_STEP_SUMMARY`. The body is length-bounded too, so a diff of
   very long paths cannot 422 the upsert and freeze the comment.
+- **A malformed report publishes as unknown, not as a tier.** A corrupt or
+  truncated `risk-report.json`, or one marked `graded` with no usable label,
+  re-renders all three surfaces as unknown together. Publishing the label
+  first and discovering the problem later left the Check Run and the comment
+  announcing a tier the publisher had just refused to trust.
 - **The fallback renderer runs `python3 -I`.** Reading the program from stdin
   would otherwise put the process CWD — the PR's checkout — at the front of
   `sys.path`, so a PR shipping a top-level `json.py` would execute its own code
   in the job that authors the report.
 - **The dispute checkbox is matched by comment id**, not by the marker alone,
   so another bot quoting our comment cannot set — or clear — the
-  `risk-grade-disputed` label.
+  `risk-grade-disputed` label. An **absent** id is refused rather than falling
+  back to marker-only matching: a control that degrades to fail-open when its
+  input goes missing has failed.
+- **A registered dispute survives a re-grade**, and is read from the
+  `risk-grade-disputed` label as well as from the comment body. The body alone
+  is racy — the scan reads it and the upsert writes it back, so a tick landing
+  in that window was overwritten, and the `edited` event our own write then
+  fired cleared the label. The label is durable, so the re-rendered body comes
+  back ticked and the event reads as still-disputed. The body is also re-read
+  by id immediately before the write, which shrinks the window to one round
+  trip (GitHub offers no conditional comment update, so it cannot close it).
 - **The label the publisher applies is re-validated** against the same
   `risk:R<n>` pattern reconciliation uses, so a malformed report cannot make
   the privileged job create an arbitrary label that nothing later cleans up.
@@ -151,5 +175,11 @@ See the caller pattern in the header comment of
 - **The calling job must grant `checks: write` + `pull-requests: write`** (plus
   `contents: read`). GitHub rejects a caller that grants less than a called job
   requests, at startup, even in shadow mode. Supply `bot_app_id` +
-  `BOT_APP_PRIVATE_KEY` to publish as your app — **required for fork PRs**,
-  whose `GITHUB_TOKEN` is read-only.
+  `BOT_APP_PRIVATE_KEY` to publish as your app.
+- **Fork PRs do not publish, and no caller configuration changes that.** This
+  runs on `pull_request` (deliberately not `pull_request_target`) and GitHub
+  withholds repository secrets from fork-triggered runs, so
+  `secrets.BOT_APP_PRIVATE_KEY` is empty exactly on the fork path: the mint
+  fails and publishing falls back to the read-only `GITHUB_TOKEN`. The full
+  grade is still in the grade job's step summary. That is the accepted cost of
+  never handing a privileged context a PR checkout.

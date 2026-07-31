@@ -20,6 +20,7 @@ import os
 import sys
 import tempfile
 import unittest
+from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -55,6 +56,11 @@ class FakeApi:
             return self._page([{"name": n} for n in self.labels], path)
         if method == "GET" and "/pulls/" in path:
             return {"head": {"sha": self.head_sha}, "base": {"ref": self.base_ref}}
+        if method == "GET" and "/issues/comments/" in path:
+            # Single-comment read by id — `upsert_sticky` re-reads the body
+            # here immediately before it PATCHes.
+            cid = int(path.rsplit("/", 1)[1])
+            return next((c for c in self.comments if c.get("id") == cid), {})
         if method == "GET" and "/comments" in path:
             return self._page(list(self.comments), path)
         if method == "POST" and path.endswith("/labels"):
@@ -91,9 +97,18 @@ class FakeApi:
 
     @staticmethod
     def _page(items, path):
-        """Serve `items` the way GitHub pages a list endpoint."""
-        per_page = 100 if "per_page=100" in path else 30
-        page = int(path.rsplit("page=", 1)[1]) if "page=" in path else 1
+        """Serve `items` the way GitHub pages a list endpoint.
+
+        Honours `direction=desc` so `find_sticky`'s newest-first scan is
+        exercised for real: served ascending regardless, the 1000-comment
+        pagination test below would pass whichever direction the code asked
+        for, which is the bug it exists to catch.
+        """
+        query = parse_qs(urlparse(path).query)
+        if query.get("direction", [""])[0] == "desc":
+            items = list(reversed(items))
+        per_page = min(int(query.get("per_page", ["30"])[0]), 100)
+        page = int(query.get("page", ["1"])[0])
         start = (page - 1) * per_page
         return items[start : start + per_page]
 
@@ -134,6 +149,56 @@ class MarkerAgreementTest(unittest.TestCase):
         self.assertIn(publish_risk.MARKER, source)
 
 
+class ApiErrorWrappingTest(unittest.TestCase):
+    """Every failure must leave `api()` as ApiError.
+
+    `cmd_publish` attempts its three publications independently, and every one
+    of those guards is `except ApiError`. Anything else escapes all three and
+    aborts the publish after the Check Run has already announced a tier —
+    which is reachable with no HTTP error at all.
+    """
+
+    class _Resp:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def read(self):
+            if isinstance(self._payload, Exception):
+                raise self._payload
+            return self._payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _api_with(self, payload):
+        real = publish_risk.urllib.request.urlopen
+        publish_risk.urllib.request.urlopen = lambda *a, **k: self._Resp(payload)
+        try:
+            return publish_risk.api("GET", "/repos/o/r/pulls/1", "tok")
+        finally:
+            publish_risk.urllib.request.urlopen = real
+
+    def test_a_non_json_body_raises_api_error(self):
+        """A proxy's HTML error page, or a truncated response."""
+        with self.assertRaises(publish_risk.ApiError) as ctx:
+            self._api_with(b"<html>502 Bad Gateway</html>")
+        self.assertIn("not JSON", str(ctx.exception))
+
+    def test_a_read_timeout_raises_api_error(self):
+        """`resp.read()` raises TimeoutError, which URLError does not cover."""
+        with self.assertRaises(publish_risk.ApiError):
+            self._api_with(TimeoutError("timed out"))
+
+    def test_a_well_formed_body_still_round_trips(self):
+        self.assertEqual(self._api_with(b'{"ok": true}'), {"ok": True})
+
+    def test_an_empty_body_is_an_empty_dict(self):
+        self.assertEqual(self._api_with(b""), {})
+
+
 class ReconcileLabelsTest(unittest.TestCase):
     def test_adds_the_desired_tier(self):
         api = FakeApi(labels=["bug"])
@@ -156,7 +221,17 @@ class ReconcileLabelsTest(unittest.TestCase):
     def test_already_correct_is_a_no_op(self):
         api = FakeApi(labels=["risk:R2"])
         res = publish_risk.reconcile_labels(api, "o/r", 1, "risk:R2")
-        self.assertEqual(res, {"added": [], "removed": [], "failed_removals": []})
+        self.assertEqual(
+            res,
+            {
+                "added": [],
+                "removed": [],
+                "failed_removals": [],
+                # The label set as READ, so cmd_publish can see whether a
+                # dispute is on record without a second page walk.
+                "names": ["risk:R2"],
+            },
+        )
         self.assertEqual(api.of("POST", "/labels"), [])
         self.assertEqual(api.of("DELETE", "/labels/"), [])
 
@@ -400,6 +475,80 @@ class StickyCommentTest(unittest.TestCase):
         api = FakeApi(comments=[{"id": 7, "body": fresh}])
         publish_risk.upsert_sticky(api, "o/r", 1, fresh)
         self.assertIn("- [ ] **This grade is wrong**", api.comments[0]["body"])
+
+    def test_a_tick_landing_after_the_scan_is_not_overwritten(self):
+        """find_sticky reads the body, then the PATCH writes it back. A tick
+        registered inside that window was silently lost — and the `edited`
+        event our own PATCH fires then drove cmd_dispute to CLEAR the label.
+        The body is re-read by id immediately before the write."""
+        report = grade_risk.grade(grade_risk.parse_numstat("3\t1\ta.md\0"))
+        fresh = grade_risk.render_comment(report, publish_risk.MARKER)
+        api = FakeApi(comments=[{"id": 7, "body": fresh}])
+
+        def racing(method, path, body):
+            # The reviewer ticks the box after the list scan and before the
+            # single-comment re-read, which is the whole window.
+            if method == "GET" and "/issues/1/comments" in path:
+                out = api(method, path, body)
+                api.comments[0]["body"] = grade_risk.render_comment(
+                    report, publish_risk.MARKER, disputed=True
+                )
+                return out
+            return api(method, path, body)
+
+        publish_risk.upsert_sticky(racing, "o/r", 1, fresh)
+        self.assertIn("- [x] **This grade is wrong**", api.comments[0]["body"])
+
+    def test_the_dispute_label_re_asserts_a_tick_the_body_lost(self):
+        """The label is the durable record: cmd_dispute wrote it from an
+        earlier tick, so even a body that comes back unticked (a lost race, or
+        a fallback body that overwrote it) must not silently drop the dispute
+        — and the re-ticked body keeps our own `edited` event from clearing
+        the label."""
+        report = grade_risk.grade(grade_risk.parse_numstat("3\t1\ta.md\0"))
+        fresh = grade_risk.render_comment(report, publish_risk.MARKER)
+        api = FakeApi(comments=[{"id": 7, "body": fresh}])
+        publish_risk.upsert_sticky(api, "o/r", 1, fresh, (), True)
+        self.assertIn("- [x] **This grade is wrong**", api.comments[0]["body"])
+
+    def test_a_failed_body_re_read_still_writes_the_comment(self):
+        """A 5xx on the re-read must not cost the whole publication; fall back
+        to the body the scan already returned."""
+        report = grade_risk.grade(grade_risk.parse_numstat("3\t1\ta.md\0"))
+        ticked = grade_risk.render_comment(report, publish_risk.MARKER, disputed=True)
+        fresh = grade_risk.render_comment(report, publish_risk.MARKER)
+        api = FakeApi(comments=[{"id": 7, "body": ticked}])
+
+        def flaky(method, path, body):
+            if method == "GET" and "/issues/comments/" in path:
+                raise publish_risk.ApiError("GET -> HTTP 502")
+            return api(method, path, body)
+
+        res = publish_risk.upsert_sticky(flaky, "o/r", 1, fresh)
+        self.assertEqual(res["action"], "updated")
+        self.assertIn("- [x] **This grade is wrong**", api.comments[0]["body"])
+
+    def test_the_sticky_is_found_on_a_pr_with_more_than_a_thousand_comments(self):
+        """The scan is bounded at 10 pages x 100. Ascending, a sticky past that
+        cap made every re-grade POST a NEW comment — which itself landed past
+        the cap, so the next run repeated it forever, each time resetting the
+        dispute tick. Newest-first, a comment we created stays reachable."""
+        ours = grade_risk.render_comment(
+            grade_risk.grade(grade_risk.parse_numstat("1\t0\ta.go\0")),
+            publish_risk.MARKER,
+        )
+        chatter = [{"id": n, "body": f"comment {n}"} for n in range(1200)]
+        api = FakeApi(comments=chatter + [{"id": 9999, "body": ours}])
+        res = publish_risk.upsert_sticky(api, "o/r", 1, ours)
+        self.assertEqual(res["action"], "updated")
+        self.assertEqual(api.of("POST", "/comments"), [])
+
+    def test_the_scan_asks_for_newest_first(self):
+        api = FakeApi()
+        publish_risk.find_sticky(api, "o/r", 1)
+        path = api.of("GET", "/issues/1/comments")[0][1]
+        self.assertIn("direction=desc", path)
+        self.assertIn("sort=created", path)
 
 
 class DisputeLabelTest(unittest.TestCase):
@@ -663,6 +812,97 @@ class CmdPublishTest(unittest.TestCase):
         publish_risk.cmd_publish(self._args(rep, chk, com, "publish"), api)
         self.assertTrue(publish_risk.CHECKED_RE.search(api.comments[0]["body"]))
 
+    def test_a_graded_report_with_no_label_is_malformed_too(self):
+        """The guard was short-circuited by `desired is not None`, so a report
+        marked `graded` with a missing/null label slipped through untouched:
+        every tier was stripped and the summary said ungradable, while the
+        Check Run and the comment — rendered from that same report and never
+        re-rendered — still announced a tier."""
+        for missing in ({"label": None}, {}):
+            with self.subTest(missing=missing):
+                d = tempfile.mkdtemp()
+                report = grade_risk.grade(
+                    grade_risk.parse_numstat("3\t1\tsvc/auth/a.go\0")
+                )
+                report.pop("label", None)
+                report.update(missing)
+                self.assertEqual(report["status"], "graded")
+                title, summary = grade_risk.render_check(
+                    grade_risk.grade(grade_risk.parse_numstat("3\t1\tsvc/auth/a.go\0"))
+                )
+                rep = _write(d, "risk-report.json", json.dumps(report))
+                chk = _write(d, "risk-check.md", f"{title}\n\n{summary}\n")
+                com = _write(d, "risk-comment.md", "a body still asserting R3")
+                api = FakeApi(labels=["risk:R0"])
+                publish_risk.cmd_publish(self._args(rep, chk, com, "publish"), api)
+
+                self.assertEqual(api.of("POST", "/labels"), [])
+                self.assertNotIn("risk:R0", api.labels)
+                out = api.of("POST", "/check-runs")[0][2]["output"]
+                self.assertEqual(out["title"], "Risk: unknown")
+                posted = api.of("POST", "/comments")[0][2]["body"]
+                self.assertIn("Risk: **unknown**", posted)
+                self.assertNotIn("asserting R3", posted)
+
+    def test_a_corrupt_report_still_publishes_an_unknown_check_run(self):
+        """pr-risk.yml's guard tests `-s`, not well-formedness, so a truncated
+        or half-written report reaches here. JSONDecodeError escaping meant
+        NOTHING was published — not even the unknown Check Run the design
+        promises — and the previous head's `risk:R*` stayed on the PR."""
+        d = tempfile.mkdtemp()
+        report = grade_risk.grade(grade_risk.parse_numstat("3\t1\tsvc/auth/a.go\0"))
+        title, summary = grade_risk.render_check(report)
+        rep = _write(d, "risk-report.json", '{"schema": 1, "status": "grad')
+        chk = _write(d, "risk-check.md", f"{title}\n\n{summary}\n")
+        com = _write(
+            d, "risk-comment.md", grade_risk.render_comment(report, publish_risk.MARKER)
+        )
+        api = FakeApi(labels=["risk:R0"])
+        rc = publish_risk.cmd_publish(self._args(rep, chk, com, "publish"), api)
+
+        self.assertEqual(rc, 0)
+        out = api.of("POST", "/check-runs")[0][2]["output"]
+        self.assertEqual(out["title"], "Risk: unknown")
+        self.assertNotIn("risk:R0", api.labels)
+        self.assertEqual(api.of("POST", "/labels"), [])
+        posted = api.of("POST", "/comments")[0][2]["body"]
+        self.assertIn("Risk: **unknown**", posted)
+        self.assertTrue(publish_risk.UNCHECKED_RE.search(posted))
+
+    def test_a_stale_label_that_could_not_be_removed_reports_degraded(self):
+        """Two `risk:R*` at once breaks the invariant this module calls
+        load-bearing. Reporting it only in the step summary left rc==0, so
+        pr-risk.yml's 'Note degraded mode' step never fired."""
+        _, rep, chk, com, _ = self._artifacts("30\t10\tdb/migrations/001.sql\0")
+        api = FakeApi(labels=["risk:R0"])
+
+        def flaky(method, path, body):
+            if method == "DELETE":
+                raise publish_risk.ApiError("DELETE -> HTTP 403: forbidden")
+            return api(method, path, body)
+
+        rc = publish_risk.cmd_publish(self._args(rep, chk, com, "publish"), flaky)
+        self.assertEqual(rc, 1)
+        # Both tiers really are on the PR, which is what makes it degraded...
+        self.assertEqual(sorted(n for n in api.labels if n.startswith("risk:R")),
+                         ["risk:R0", "risk:R3"])
+        # ...and the comment still published, because rc is a report, not a halt.
+        self.assertEqual(len(api.of("POST", "/comments")), 1)
+
+    def test_a_disputed_pr_keeps_its_tick_through_a_re_grade(self):
+        """End to end: the label says disputed, so the re-rendered body comes
+        back ticked even though the comment we are overwriting is not."""
+        _, rep, chk, com, _ = self._artifacts("3\t1\tsvc/auth/a.go\0")
+        unticked = grade_risk.render_comment(
+            grade_risk.grade(grade_risk.parse_numstat("3\t1\tsvc/auth/a.go\0")),
+            publish_risk.MARKER,
+        )
+        api = FakeApi(
+            labels=[publish_risk.DISPUTE_LABEL], comments=[{"id": 7, "body": unticked}]
+        )
+        publish_risk.cmd_publish(self._args(rep, chk, com, "publish"), api)
+        self.assertTrue(publish_risk.CHECKED_RE.search(api.comments[0]["body"]))
+
     def test_a_grown_pr_relabels_from_r0_to_r3_across_two_publishes(self):
         """The load-bearing re-grade property, end to end."""
         api = FakeApi()
@@ -694,8 +934,8 @@ class CmdDisputeTest(unittest.TestCase):
             publish_risk.MARKER,
             disputed=True,
         )
-        api = FakeApi()
-        publish_risk.cmd_dispute(self._args(body), api)
+        api = FakeApi(comments=[{"id": 7, "body": body}])
+        publish_risk.cmd_dispute(self._args(body, comment_id=7), api)
         self.assertIn(publish_risk.DISPUTE_LABEL, api.labels)
 
     def test_unticking_clears_the_label(self):
@@ -703,14 +943,33 @@ class CmdDisputeTest(unittest.TestCase):
             grade_risk.grade(grade_risk.parse_numstat("1\t0\ta.go\0")),
             publish_risk.MARKER,
         )
-        api = FakeApi(labels=[publish_risk.DISPUTE_LABEL])
-        publish_risk.cmd_dispute(self._args(body), api)
+        api = FakeApi(
+            labels=[publish_risk.DISPUTE_LABEL], comments=[{"id": 7, "body": body}]
+        )
+        publish_risk.cmd_dispute(self._args(body, comment_id=7), api)
         self.assertNotIn(publish_risk.DISPUTE_LABEL, api.labels)
 
     def test_an_unrelated_edited_comment_is_ignored(self):
         api = FakeApi()
         publish_risk.cmd_dispute(self._args("I edited my review comment"), api)
         self.assertEqual(api.calls, [])
+
+    def test_a_missing_comment_id_refuses_rather_than_falling_back(self):
+        """The id check was opt-in: `--comment-id` defaults to `""`, and an
+        absent one fell straight through to marker-only matching — so a
+        miswired caller silently downgraded the control to the very check
+        `find_sticky` was hardened against. A security control that fails open
+        when its input goes missing has failed."""
+        ours = self._sticky_body(disputed=False)
+        api = FakeApi(
+            labels=[publish_risk.DISPUTE_LABEL], comments=[{"id": 7, "body": ours}]
+        )
+        rc = publish_risk.cmd_dispute(self._args(ours), api)
+        self.assertEqual(rc, 0)
+        # Nothing was written — in particular a genuine dispute was not CLEARED.
+        self.assertIn(publish_risk.DISPUTE_LABEL, api.labels)
+        self.assertEqual(api.of("DELETE", "/labels/"), [])
+        self.assertEqual(api.of("POST", "/labels"), [])
 
     def _sticky_body(self, disputed):
         return grade_risk.render_comment(

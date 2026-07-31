@@ -60,9 +60,9 @@ DEFAULT_REASON = "application source"
 #
 #   1. tests first  — a test-only change is low risk regardless of what it
 #                     tests, so `services/auth/auth_test.go` is R1, not R3.
-#   2. shadowed     — policy and build/dependency inputs that the broad docs
-#                     rules would otherwise claim for R0 (`docs/CODEOWNERS`,
-#                     `requirements.txt`).
+#   2. shadowed     — policy, build/dependency inputs and secret material that
+#                     the broad docs rules would otherwise claim for R0
+#                     (`docs/CODEOWNERS`, `requirements.txt`, `secrets.txt`).
 #   3. docs next    — `docs/auth.md` is prose about a sensitive surface, not
 #                     the surface itself.
 #   4. sensitive    — everything that can break production, leak, or migrate.
@@ -86,9 +86,12 @@ RISK_RULES: list[tuple[str, int, str]] = [
     ("**/__tests__/**", R1, "test code"),
     ("**/testdata/**", R1, "test fixture"),
     ("**/fixtures/**", R1, "test fixture"),
-    # 2. policy and build/dependency inputs that the docs rules below would
-    #    otherwise shadow. These sit BEFORE section 3 only because ordering is
-    #    first-match-wins and `docs/**` / `*.txt` would claim them for R0.
+    # 2. policy, build/dependency inputs and secret material that the docs
+    #    rules below would otherwise shadow. These sit BEFORE section 3 only
+    #    because ordering is first-match-wins and `docs/**` / `*.txt` would
+    #    claim them for R0 — below even the R2 default, which is the direction
+    #    that actually costs something: it filters them OUT of a deep-review
+    #    queue rather than merely into one.
     #
     #    CODEOWNERS is not metadata: it IS the repo's review and access-control
     #    policy, so a PR that drops the security team or a required owner from
@@ -101,19 +104,41 @@ RISK_RULES: list[tuple[str, int, str]] = [
     #    lockfiles below. `*.txt` matches a basename at any depth, so without
     #    these they would grade R0 "documentation", BELOW the R2 default the
     #    source they govern gets, and be filtered out of a deep-review queue.
-    #    These are the reachable cases, named explicitly; `*.txt` still shadows
-    #    section 4 for other names (`secrets.txt`), which is part of the general
-    #    rule-ordering question BE-5507 owns when it replaces this table.
+    #    These are the reachable cases, named explicitly.
     ("requirements*.txt", R2, "dependency manifest"),
     ("constraints*.txt", R2, "dependency manifest"),
     ("CMakeLists.txt", R2, "build configuration"),
+    #    Secret and key material, hoisted out of section 4 for the same reason:
+    #    `*.txt` matches a basename at any depth, so `secrets.txt`,
+    #    `credentials.txt` and `server.key.txt` graded R0 "documentation" —
+    #    BELOW even the R2 default — and were filtered out of the deep-review
+    #    queue entirely. The asymmetry decides it: a doc that merely mentions
+    #    secrets graded R3 costs one careful read, while a real secrets change
+    #    graded R0 costs the review it needed. The GENERAL ordering question
+    #    (which broad rules should shadow which) stays BE-5507's when it
+    #    replaces this table; this is the one case where the shadowing put a
+    #    sensitive surface below the default.
+    ("*secret*", R3, "secret material handling"),
+    ("*credential*", R3, "credential handling"),
+    ("*.pem", R3, "key material"),
+    ("*.key", R3, "key material"),
     # 3. docs, lockfiles, non-executable metadata
     ("*.md", R0, "documentation"),
     ("*.mdx", R0, "documentation"),
     ("*.txt", R0, "documentation"),
     ("*.rst", R0, "documentation"),
     ("docs/**", R0, "documentation"),
-    ("LICENSE*", R0, "repository metadata"),
+    # Named exactly rather than `LICENSE*`, which is a trailing wildcard on a
+    # common English word: case-insensitive matching turns it into a match for
+    # `license_manager.py` and `licenses.ts`, quietly grading ordinary source
+    # R0 — below the R2 default. The extension-bearing forms need no rule of
+    # their own; `LICENSE.md` / `LICENSE.txt` already reach R0 via `*.md` /
+    # `*.txt` above.
+    ("LICENSE", R0, "repository metadata"),
+    ("LICENCE", R0, "repository metadata"),
+    ("LICENSE-*", R0, "repository metadata"),
+    ("LICENCE-*", R0, "repository metadata"),
+    ("COPYING", R0, "repository metadata"),
     (".gitignore", R0, "repository metadata"),
     (".github/ISSUE_TEMPLATE/**", R0, "repository metadata"),
     ("go.sum", R0, "dependency lockfile"),
@@ -143,10 +168,8 @@ RISK_RULES: list[tuple[str, int, str]] = [
     ("**/iam/**", R3, "access control"),
     ("**/rbac/**", R3, "access control"),
     ("**/permissions/**", R3, "access control"),
-    ("*secret*", R3, "secret material handling"),
-    ("*credential*", R3, "credential handling"),
-    ("*.pem", R3, "key material"),
-    ("*.key", R3, "key material"),
+    # `*secret*` / `*credential*` / `*.pem` / `*.key` belong here logically but
+    # live in section 2 above, where the docs rules cannot shadow them.
     ("**/billing/**", R3, "billing / payments"),
     ("**/payments/**", R3, "billing / payments"),
     ("**/security/**", R3, "security-sensitive code"),
@@ -173,13 +196,26 @@ TIER_NAMES = {
 
 
 def _matches(pattern: str, path: str) -> bool:
-    """Glob-match `path` against `pattern`.
+    """Glob-match `path` against `pattern`, case-INSENSITIVELY.
 
     A pattern with `/` matches the full repo-relative path; one without
     matches the base name at any depth. `**/` is normalised so `**/tests/**`
     also matches a top-level `tests/...` (fnmatch's `*` crosses `/`, so the
     leading `**/` would otherwise require at least one parent directory).
+
+    `fnmatchcase` on both sides of a `casefold()` rather than `fnmatch`: the
+    latter's case-folding is PLATFORM-dependent (it normalises via
+    `os.path.normcase`, which is a no-op on Linux and lowercases on Windows),
+    so the same diff would grade differently depending on the runner. Folding
+    explicitly makes the rules mean the same thing everywhere.
+
+    Case matters here because git paths are case-sensitive but authors are
+    not: `migration.SQL`, `main.TF` and `Secrets.yaml` all missed their R3
+    rules and fell through to the R2 default. That is an ordinary misgrade,
+    and also a one-keystroke way to pick a lower tier on purpose.
     """
+    path = path.casefold()
+    pattern = pattern.casefold()
     if "/" in pattern:
         if fnmatch.fnmatchcase(path, pattern):
             return True
