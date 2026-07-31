@@ -314,6 +314,49 @@ python3 .github/groom/interval.py \
 python3 .github/groom/interval.py --normalize-cadence "$GROOM_INTERVAL_DAYS"
 ```
 
+## `package.json` — the agent CLI pin (BE-5373)
+
+`.github/groom/package.json` is **not a project**. Nothing is ever installed from
+this directory, there is no lockfile, and no CI job runs `npm install` here. Its
+only job is to be the single, machine-visible source of truth for the
+`@anthropic-ai/claude-code` version that `groom.yml` installs in its three agent
+jobs (finder, verifier, builder):
+
+```json
+{ "dependencies": { "@anthropic-ai/claude-code": "X.Y.Z" } }
+```
+
+(The live value is deliberately not repeated here — [`package.json`](package.json)
+is the only place it appears, which is the whole point.)
+
+Why a manifest instead of an `env:` constant at the top of the workflow:
+Dependabot's `github-actions` ecosystem only parses `uses:` refs, so an inline
+`npm install -g <pkg>@<ver>` inside a `run:` step is invisible to **every**
+ecosystem when the repo has no npm manifest. The version therefore had nothing
+watching it and simply rotted — while being duplicated across three call sites,
+so a hand bump could update two and leave a split state. A real manifest makes
+the npm ecosystem see it; the `/.github/groom` entry in
+[`.github/dependabot.yml`](../dependabot.yml) opens the bump PR.
+
+`groom.yml`'s `gate` job reads the pin **once**, validates it, and exports it as
+the `claude_code_version` job output; all three install steps consume that output
+via `needs.gate.outputs`. So there is no version literal left in the workflow, and
+a merged bump PR moves every call site at once.
+
+Two rules the tooling enforces, both because the agent CLI is executable supply
+chain for steps that read untrusted repo content:
+
+- **Keep the version exact** — no `^`, `~`, wildcard or dist-tag. The gate step
+  fails the run on anything that is not `X.Y.Z`, and the Dependabot entry sets
+  `versioning-strategy: "increase"` so a bump stays exact.
+- **Bump deliberately** — a CLI release can rename a flag or shift the default
+  permission mode, and groom's sandbox is built out of those flags. Re-validate a
+  real groom run (`workflow_dispatch` on `ci-groom.yml`) before merging a bump.
+
+`tests/test_claude_code_pin.py` guards the arrangement: exact pin, no hardcoded
+literal anywhere in `groom.yml`, every install step wired to the gate output, and
+the Dependabot entry still present.
+
 - **`tests/`** — `unittest` suite, run by
   [`test-groom-scripts.yml`](../workflows/test-groom-scripts.yml).
 

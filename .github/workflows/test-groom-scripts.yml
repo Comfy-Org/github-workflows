@@ -4,17 +4,33 @@ name: Test groom scripts
 # ledger is the durable memory that stops the stateless groom CI run from
 # re-filing already-filed or human-rejected findings every run, so a regression
 # here would silently re-open the spam it exists to prevent — cheap to guard
-# with a unit run on change.
+# with a unit run on change. It also runs the config/interval tests and the
+# BE-5373 pin guard, which is why the path filter reaches outside
+# `.github/groom/` — see the comment on those entries.
 
 on:
   pull_request:
     paths:
       - '.github/groom/**'
+      # test_claude_code_pin.py asserts ACROSS these two files (BE-5373): the CLI
+      # version must exist only in .github/groom/package.json, and dependabot.yml
+      # must keep watching it. Without them in the filter, the regression the
+      # guard exists to catch — a hardcoded version literal re-added to groom.yml,
+      # or the npm entry dropped — lands in a PR that never runs the guard.
+      - '.github/workflows/groom.yml'
+      - '.github/dependabot.yml'
       - '.github/workflows/test-groom-scripts.yml'
   push:
     branches: [main]
     paths:
       - '.github/groom/**'
+      # test_claude_code_pin.py asserts ACROSS these two files (BE-5373): the CLI
+      # version must exist only in .github/groom/package.json, and dependabot.yml
+      # must keep watching it. Without them in the filter, the regression the
+      # guard exists to catch — a hardcoded version literal re-added to groom.yml,
+      # or the npm entry dropped — lands in a PR that never runs the guard.
+      - '.github/workflows/groom.yml'
+      - '.github/dependabot.yml'
       - '.github/workflows/test-groom-scripts.yml'
 
 permissions:
