@@ -849,6 +849,12 @@ jobs:
         # `gate` job (BE-5373), so this step and its two siblings in `audit_verify`
         # and `build` can never drift apart, and Dependabot can bump all three by
         # editing one line. Bump deliberately, re-validating a groom run.
+        #
+        # Scope, so the guarantee is not read as wider than it is: this pins the
+        # TOP-LEVEL version only. `npm install -g` has no lockfile, so transitive
+        # deps still resolve at install time and the package's lifecycle scripts
+        # still run. Closing that needs a different install mechanism, not a flag
+        # — tracked separately.
         env:
           CLAUDE_CODE_VERSION: ${{ needs.gate.outputs.claude_code_version }}
         run: npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION:?not resolved by the gate job from .github/groom/package.json}"
