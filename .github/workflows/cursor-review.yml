@@ -260,7 +260,7 @@ jobs:
       within_cap: ${{ steps.count.outputs.within_cap }}
     steps:
       - name: Checkout PR repo
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -456,7 +456,7 @@ jobs:
           PY
 
       - name: Checkout PR repo
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -466,7 +466,7 @@ jobs:
         # pinned via workflows_ref) — never from the PR checkout, so a
         # malicious PR can't rewrite the prompt to exfiltrate the diff or
         # smuggle instructions to the model.
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Comfy-Org/github-workflows
           ref: ${{ inputs.workflows_ref }}
@@ -567,7 +567,7 @@ jobs:
 
       - name: Upload findings artifact
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: findings-${{ matrix.review_type }}-${{ matrix.model }}
           path: /tmp/findings-out/findings.json
@@ -587,13 +587,13 @@ jobs:
       pull-requests: write
     steps:
       - name: Checkout PR repo
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Load cursor-review assets
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Comfy-Org/github-workflows
           ref: ${{ inputs.workflows_ref }}
@@ -615,7 +615,7 @@ jobs:
           echo "$HOME/.cursor/bin" >> "$GITHUB_PATH"
 
       - name: Download panel findings
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: /tmp/panel
           pattern: findings-*
@@ -820,7 +820,7 @@ jobs:
       - name: Mint bot-identity token (optional)
         id: bot_token
         if: ${{ inputs.bot_app_id != '' }}
-        uses: actions/create-github-app-token@v3.2.0
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ inputs.bot_app_id }}
           private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
@@ -877,7 +877,7 @@ jobs:
       contents: read
     steps:
       - name: Load cursor-review assets
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Comfy-Org/github-workflows
           ref: ${{ inputs.workflows_ref }}
@@ -931,7 +931,7 @@ jobs:
       contents: read
     steps:
       - name: Load cursor-review assets
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Comfy-Org/github-workflows
           ref: ${{ inputs.workflows_ref }}
