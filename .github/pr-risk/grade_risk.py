@@ -451,6 +451,19 @@ def render_comment(report: dict, marker: str, disputed: bool = False) -> str:
     disagreement someone already registered.
     """
     box = "x" if disputed else " "
+    # ONE definition of the footer. publish_risk.CHECKED_RE / UNCHECKED_RE match
+    # this checkbox line exactly, so a second copy that drifted would silently
+    # break dispute round-tripping on whichever branch kept the stale wording.
+    tail = [
+        "",
+        f"- [{box}] {DISPUTE_CHECKBOX} — tick this box if the tier above is off. "
+        "Nothing is gated on it either way; ticking labels the PR "
+        "`risk-grade-disputed` so the grader can be tuned against real "
+        "reviewer disagreement.",
+        "",
+        "<sub>Advisory only — this check never fails, never blocks merge, and "
+        "no automation reads the label. It re-grades on every push.</sub>",
+    ]
     lines = [marker, ""]
     if report["status"] != "graded":
         lines += [
@@ -486,17 +499,6 @@ def render_comment(report: dict, marker: str, disputed: bool = False) -> str:
             f"R{f['tier']} | {_md_text(f['tier_reason'])} |"
             for f in shown[:50]
         ]
-        tail = [
-            "",
-            f"- [{box}] {DISPUTE_CHECKBOX} — tick this box if the tier above is off. "
-            "Nothing is gated on it either way; ticking labels the PR "
-            "`risk-grade-disputed` so the grader can be tuned against real "
-            "reviewer disagreement.",
-            "",
-            "<sub>Advisory only — this check never fails, never blocks merge, and "
-            "no automation reads the label. It re-grades on every push.</sub>",
-        ]
-
         def assemble(n: int) -> str:
             kept = rows[:n]
             omitted = len(shown) - n
@@ -514,19 +516,24 @@ def render_comment(report: dict, marker: str, disputed: bool = False) -> str:
         while n > 0 and len(body) > COMMENT_MAX_CHARS:
             n //= 2
             body = assemble(n)
-        return body
+        return _bounded(body, tail)
 
-    lines += [
-        "",
-        f"- [{box}] {DISPUTE_CHECKBOX} — tick this box if the tier above is off. "
-        "Nothing is gated on it either way; ticking labels the PR "
-        "`risk-grade-disputed` so the grader can be tuned against real "
-        "reviewer disagreement.",
-        "",
-        "<sub>Advisory only — this check never fails, never blocks merge, and "
-        "no automation reads the label. It re-grades on every push.</sub>",
-    ]
-    return "\n".join(lines) + "\n"
+    return _bounded("\n".join(lines + tail) + "\n", tail)
+
+
+def _bounded(body: str, tail: list[str]) -> str:
+    """Last-resort guarantee that the body fits, whatever the branch built.
+
+    Row-dropping already bounds the graded branch, and everything else is
+    length-capped, so this should never fire — but "the comment always fits"
+    has to hold unconditionally or the 422 it exists to prevent comes back
+    through whichever path the estimate missed. The footer is re-appended so a
+    truncated body still carries the dispute checkbox the publisher reads.
+    """
+    if len(body) <= COMMENT_MAX_CHARS:
+        return body
+    footer = "\n".join(["", "_(truncated — see the Check Run for the full grade.)_"] + tail)
+    return body[: COMMENT_MAX_CHARS - len(footer) - 1] + footer + "\n"
 
 
 def render_check(report: dict) -> tuple[str, str]:

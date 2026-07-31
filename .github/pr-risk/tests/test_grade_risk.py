@@ -322,6 +322,25 @@ class MarkdownEscapingTest(unittest.TestCase):
         self.assertIn("Per-file breakdown", body)
         self.assertIn("more files", body)
 
+    def test_every_branch_carries_the_footer_the_publisher_reads(self):
+        """The graded, unknown and truncated branches must all end in the same
+        checkbox line — publish_risk's regexes match it exactly, so a drifted
+        second copy would silently break dispute round-tripping on one path."""
+        long_paths = "".join(
+            f"1\t0\tp{i}/" + "x" * 300 + ".go\0" for i in range(400)
+        )
+        bodies = {
+            "graded": grade_risk.grade(grade_risk.parse_numstat(numstat((1, 0, "a.go")))),
+            "unknown": grade_risk.unknown_report("boom"),
+            "truncated": grade_risk.grade(grade_risk.parse_numstat(long_paths)),
+        }
+        for name, report in bodies.items():
+            unticked = grade_risk.render_comment(report, "<!-- m -->")
+            ticked = grade_risk.render_comment(report, "<!-- m -->", disputed=True)
+            self.assertIsNotNone(publish_risk.UNCHECKED_RE.search(unticked), name)
+            self.assertIsNotNone(publish_risk.CHECKED_RE.search(ticked), name)
+            self.assertLessEqual(len(unticked), grade_risk.COMMENT_MAX_CHARS, name)
+
     def test_an_ordinary_path_still_renders_as_a_plain_code_span(self):
         report = grade_risk.grade(grade_risk.parse_numstat("1\t0\tsvc/auth/x.go\0"))
         self.assertIn("`svc/auth/x.go`", grade_risk.render_comment(report, "<!-- m -->"))
