@@ -308,6 +308,9 @@ def grade(files: list[dict]) -> dict:
         "top_tier_lines": top_lines,
         "files": graded,
         "top_tier_files": [f["path"] for f in top_tier_files],
+        # Always present so consumers never have to probe for the key; set by
+        # `main` from --attr-degraded (see the flag's help).
+        "attr_source_degraded": False,
     }
 
 
@@ -327,6 +330,7 @@ def unknown_report(reason: str) -> dict:
         "tier_lines": {},
         "files": [],
         "top_tier_files": [],
+        "attr_source_degraded": False,
     }
 
 
@@ -335,7 +339,14 @@ def _pct(part: int, whole: int) -> int:
 
 
 def concentration_sentence(report: dict) -> str:
-    """One sentence naming how much of the diff sits below the top tier."""
+    """One sentence naming how much of the diff sits below the top tier.
+
+    This describes `base_tier` — the tier the FILES earned. When the whole-diff
+    size escalation moved the headline tier on top of that, say so explicitly:
+    otherwise a 900-line docs-only PR headlines `risk:R1` directly above "All
+    900 changed lines are R0", and the sentence contradicts the tier it exists
+    to explain.
+    """
     total = report["total_lines"]
     if total <= 0:
         return "This diff changes no counted lines."
@@ -343,22 +354,50 @@ def concentration_sentence(report: dict) -> str:
     top_lines = report["top_tier_lines"]
     below = total - top_lines
     if base_tier == R0 or below <= 0:
-        return f"All {total} changed lines are R{base_tier}."
-    names = "/".join(f"R{t}" for t in range(base_tier))
-    n_files = len(report["top_tier_files"])
-    return (
-        f"**{_pct(below, total)}% of this diff is {names}**; the "
-        f"{_pct(top_lines, total)}% that makes it R{base_tier} is "
-        f"{n_files} file{'s' if n_files != 1 else ''}, {top_lines} lines."
-    )
+        sentence = f"All {total} changed lines are R{base_tier}."
+    else:
+        names = "/".join(f"R{t}" for t in range(base_tier))
+        n_files = len(report["top_tier_files"])
+        sentence = (
+            f"**{_pct(below, total)}% of this diff is {names}**; the "
+            f"{_pct(top_lines, total)}% that makes it R{base_tier} is "
+            f"{n_files} file{'s' if n_files != 1 else ''}, {top_lines} lines."
+        )
+    if report.get("size_escalated"):
+        sentence += (
+            f" The headline tier is R{report['tier']} rather than R{base_tier} "
+            f"because the whole diff is {total} lines "
+            f"(>= {SIZE_ESCALATE_LINES}), which escalates it one step on size "
+            "alone."
+        )
+    return sentence
 
 
 DISPUTE_CHECKBOX = "**This grade is wrong**"
 
-# Every ASCII punctuation character CommonMark lets you backslash-escape. Used
-# only on the fallback path in `_md_path`, where an inline-code span cannot
-# hold the text safely.
+# Every ASCII punctuation character CommonMark lets you backslash-escape.
 _MD_ESCAPE = str.maketrans({c: "\\" + c for c in "\\`*_{}[]()#+-.!<>|~"})
+
+# GitHub rejects an issue-comment body over 65536 characters with a 422. The
+# Check Run output is already truncated at the API call; the comment needs its
+# own bound or a diff of long, deeply-nested paths 422s on EVERY re-grade —
+# after `reconcile_labels` has already written the fresh label, leaving the
+# label current and the comment permanently stale.
+COMMENT_MAX_CHARS = 65000
+_PATH_DISPLAY_MAX = 160
+_REASON_DISPLAY_MAX = 500
+
+# Surfaced when grade-risk.sh could not use `git --attr-source` (git < 2.42).
+# The line counts below then honour the PR head's own `.gitattributes`, so a PR
+# marking its files `-diff` can zero them — worth saying out loud rather than
+# leaving in one stderr line nobody reads.
+_ATTR_DEGRADED_NOTE = (
+    "> [!NOTE]\n"
+    "> This runner's git predates `--attr-source` (2.42), so `.gitattributes` "
+    "was read from this PR's head rather than from the base branch. A PR that "
+    "marks its own files `-diff` can zero the line counts below, and with them "
+    "the size escalation. The tier from the file paths is unaffected."
+)
 
 
 def _md_path(path: str) -> str:
@@ -379,6 +418,9 @@ def _md_path(path: str) -> str:
     and hand the pipe back to the table splitter.
     """
     flat = path.replace("\r", " ").replace("\n", " ")
+    if len(flat) > _PATH_DISPLAY_MAX:
+        # Bounded so 50 rows cannot push the body past GitHub's comment limit.
+        flat = flat[:_PATH_DISPLAY_MAX] + "…"
     if "`" in flat or "\\" in flat:
         return flat.translate(_MD_ESCAPE)
     return "`" + flat.replace("|", "\\|") + "`"
@@ -391,11 +433,14 @@ def _md_text(text: str) -> str:
     git's stderr — which quotes PR-authored path names — so it is no less
     attacker-influenced than a path. Flattening newlines is the load-bearing
     part: nothing PR-controlled may ever start a line of this comment, or it
-    could forge the dispute checkbox. Backslashes are doubled BEFORE pipes are
-    escaped, so a literal `\\` in front of a `|` cannot escape the escape.
+    could forge the dispute checkbox. The full `_MD_ESCAPE` table is applied
+    for the same reason `_md_path` applies it — escaping only pipes would leave
+    `[`, `]`, `(`, `)`, `!` and `<` live, which is enough for an inline link, a
+    remote image that logs reviewer IPs, or raw HTML. Escaped punctuation
+    renders as the bare character, so a normal reason is unchanged on screen.
     """
     flat = text.replace("\r", " ").replace("\n", " ")
-    return flat.replace("\\", "\\\\").replace("|", "\\|")
+    return flat[:_REASON_DISPLAY_MAX].translate(_MD_ESCAPE)
 
 
 def render_comment(report: dict, marker: str, disputed: bool = False) -> str:
@@ -425,6 +470,10 @@ def render_comment(report: dict, marker: str, disputed: bool = False) -> str:
             _md_text(report["reason"]),
             "",
             concentration_sentence(report),
+        ]
+        if report.get("attr_source_degraded"):
+            lines += ["", _ATTR_DEGRADED_NOTE]
+        lines += [
             "",
             "<details><summary>Per-file breakdown</summary>",
             "",
@@ -432,14 +481,40 @@ def render_comment(report: dict, marker: str, disputed: bool = False) -> str:
             "|---|---|---|---|",
         ]
         shown = sorted(report["files"], key=lambda f: (-f["tier"], -f["changed"]))
-        for f in shown[:50]:
-            lines.append(
-                f"| {_md_path(f['path'])} | +{f['added']}/-{f['deleted']} | "
-                f"R{f['tier']} | {_md_text(f['tier_reason'])} |"
-            )
-        if len(shown) > 50:
-            lines.append(f"| _…and {len(shown) - 50} more files_ | | | |")
-        lines += ["", "</details>"]
+        rows = [
+            f"| {_md_path(f['path'])} | +{f['added']}/-{f['deleted']} | "
+            f"R{f['tier']} | {_md_text(f['tier_reason'])} |"
+            for f in shown[:50]
+        ]
+        tail = [
+            "",
+            f"- [{box}] {DISPUTE_CHECKBOX} — tick this box if the tier above is off. "
+            "Nothing is gated on it either way; ticking labels the PR "
+            "`risk-grade-disputed` so the grader can be tuned against real "
+            "reviewer disagreement.",
+            "",
+            "<sub>Advisory only — this check never fails, never blocks merge, and "
+            "no automation reads the label. It re-grades on every push.</sub>",
+        ]
+
+        def assemble(n: int) -> str:
+            kept = rows[:n]
+            omitted = len(shown) - n
+            if omitted > 0:
+                kept = kept + [f"| _…and {omitted} more files_ | | | |"]
+            return "\n".join(lines + kept + ["", "</details>"] + tail) + "\n"
+
+        # Drop rows until the body fits. The per-path and per-reason caps above
+        # already keep 50 rows well inside the limit; this is the backstop that
+        # makes "the comment always fits" a property rather than an estimate,
+        # because a 422 here would leave the label fresh and the comment stale
+        # forever.
+        n = len(rows)
+        body = assemble(n)
+        while n > 0 and len(body) > COMMENT_MAX_CHARS:
+            n //= 2
+            body = assemble(n)
+        return body
 
     lines += [
         "",
@@ -484,6 +559,7 @@ def render_check(report: dict) -> tuple[str, str]:
             "This check is advisory: it never fails, never blocks merge, and "
             "no automation consumes the tier.",
         ]
+        + (["", _ATTR_DEGRADED_NOTE] if report.get("attr_source_degraded") else [])
     )
     return f"Risk: R{tier}", summary
 
@@ -503,6 +579,13 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_MARKER,
         help="Hidden marker that makes the PR comment sticky.",
     )
+    ap.add_argument(
+        "--attr-degraded",
+        action="store_true",
+        help="The diff was taken WITHOUT `git --attr-source` (git < 2.42), so "
+        "`.gitattributes` came from the PR head and its line counts are not "
+        "trustworthy. Recorded in the report and surfaced in both renders.",
+    )
     args = ap.parse_args(argv)
 
     if args.numstat == "-":
@@ -515,6 +598,7 @@ def main(argv: list[str] | None = None) -> int:
         report = grade(parse_numstat(data))
     except Exception as exc:  # noqa: BLE001 - any parse failure is "unknown", not a crash
         report = unknown_report(f"could not parse the diff ({type(exc).__name__}: {exc})")
+    report["attr_source_degraded"] = args.attr_degraded
 
     os.makedirs(args.out_dir, exist_ok=True)
     with open(os.path.join(args.out_dir, "risk-report.json"), "w", encoding="utf-8") as fh:

@@ -125,9 +125,41 @@ class ReconcileLabelsTest(unittest.TestCase):
     def test_already_correct_is_a_no_op(self):
         api = FakeApi(labels=["risk:R2"])
         res = publish_risk.reconcile_labels(api, "o/r", 1, "risk:R2")
-        self.assertEqual(res, {"added": [], "removed": []})
+        self.assertEqual(res, {"added": [], "removed": [], "failed_removals": []})
         self.assertEqual(api.of("POST", "/labels"), [])
         self.assertEqual(api.of("DELETE", "/labels/"), [])
+
+    def test_a_non_risk_label_is_refused_not_applied(self):
+        """`desired` arrives verbatim from the report artifact and this is the
+        privileged job. Reconciliation only DELETES names matching the regex,
+        so a bogus label would never be cleaned up by any later run."""
+        api = FakeApi()
+        for bogus in ("lgtm", "risk-assessment-done", "risk:Rx", ""):
+            with self.assertRaises(ValueError):
+                publish_risk.reconcile_labels(api, "o/r", 1, bogus)
+        self.assertEqual(api.of("POST", "/labels"), [])
+
+    def test_the_desired_label_lands_even_if_a_stale_delete_fails(self):
+        """A DELETE can 404 (a concurrent run got there first) or 403. Deleting
+        first meant that error propagated and the PR was left with NO tier."""
+        api = FakeApi(labels=["risk:R0"])
+
+        def flaky(method, path, body):
+            if method == "DELETE":
+                raise publish_risk.ApiError("DELETE -> HTTP 404: not found")
+            return api(method, path, body)
+
+        res = publish_risk.reconcile_labels(flaky, "o/r", 1, "risk:R3")
+        self.assertEqual(res["added"], ["risk:R3"])
+        self.assertEqual(res["removed"], [])
+        self.assertEqual(len(res["failed_removals"]), 1)
+        self.assertIn("risk:R3", api.labels)
+
+    def test_the_desired_label_is_added_before_stale_ones_are_removed(self):
+        api = FakeApi(labels=["risk:R0"])
+        publish_risk.reconcile_labels(api, "o/r", 1, "risk:R3")
+        methods = [m for m, p, _ in api.calls if "/labels" in p and m != "GET"]
+        self.assertEqual(methods, ["POST", "DELETE"])
 
     def test_unknown_removes_every_tier_and_adds_none(self):
         """Unknown is published as unknown — never silently defaulted to R0."""
@@ -420,9 +452,11 @@ class CmdPublishTest(unittest.TestCase):
 
 
 class CmdDisputeTest(unittest.TestCase):
-    def _args(self, body_text):
+    def _args(self, body_text, comment_id=""):
         d = tempfile.mkdtemp()
-        return argparse.Namespace(repo="o/r", pr=1, body=_write(d, "b.md", body_text))
+        return argparse.Namespace(
+            repo="o/r", pr=1, body=_write(d, "b.md", body_text), comment_id=comment_id
+        )
 
     def test_a_ticked_box_labels_the_pr(self):
         body = grade_risk.render_comment(
@@ -447,6 +481,32 @@ class CmdDisputeTest(unittest.TestCase):
         api = FakeApi()
         publish_risk.cmd_dispute(self._args("I edited my review comment"), api)
         self.assertEqual(api.calls, [])
+
+    def _sticky_body(self, disputed):
+        return grade_risk.render_comment(
+            grade_risk.grade(grade_risk.parse_numstat("1\t0\ta.go\0")),
+            publish_risk.MARKER,
+            disputed=disputed,
+        )
+
+    def test_another_bot_quoting_the_marker_cannot_drive_the_label(self):
+        """The marker is published in the README and in every rendered comment,
+        so a review summarizer quoting our body would otherwise toggle the
+        dispute label — including CLEARING a genuine one."""
+        ours = self._sticky_body(disputed=True)
+        api = FakeApi(
+            labels=[publish_risk.DISPUTE_LABEL], comments=[{"id": 7, "body": ours}]
+        )
+        quoted = "Summary of this PR's bots:\n\n> " + ours.replace("\n", "\n> ")
+        publish_risk.cmd_dispute(self._args(quoted, comment_id=99), api)
+        self.assertIn(publish_risk.DISPUTE_LABEL, api.labels)
+        self.assertEqual(api.of("DELETE", "/labels/"), [])
+
+    def test_an_edit_to_our_own_sticky_comment_is_recorded(self):
+        body = self._sticky_body(disputed=True)
+        api = FakeApi(comments=[{"id": 7, "body": body}])
+        publish_risk.cmd_dispute(self._args(body, comment_id=7), api)
+        self.assertIn(publish_risk.DISPUTE_LABEL, api.labels)
 
 
 if __name__ == "__main__":

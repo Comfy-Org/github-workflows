@@ -89,13 +89,30 @@ bot-authored comment, so a few things are deliberately not taken on trust:
   a `user.type == 'Bot'` author. Otherwise a PR author could pre-post a comment
   carrying the marker and have the publisher overwrite it — inheriting control
   of the preserved dispute checkbox.
-- **Paths are escaped before rendering.** Git permits `|`, backticks and
-  newlines in a filename; unescaped, such a path breaks out of its table cell
-  and can forge a ticked "this grade is wrong" line in the bot's own comment.
+- **Paths and reasons are escaped before rendering.** Git permits `|`,
+  backticks and newlines in a filename; unescaped, such a path breaks out of
+  its table cell and can forge a ticked "this grade is wrong" line in the bot's
+  own comment, or inject a remote image that logs reviewer IPs. An UNKNOWN
+  report's reason gets the same treatment — it carries git's stderr, which
+  quotes PR-authored path names. The body is length-bounded too, so a diff of
+  very long paths cannot 422 the upsert and freeze the comment.
+- **The fallback renderer runs `python3 -I`.** Reading the program from stdin
+  would otherwise put the process CWD — the PR's checkout — at the front of
+  `sys.path`, so a PR shipping a top-level `json.py` would execute its own code
+  in the job that authors the report.
+- **The dispute checkbox is matched by comment id**, not by the marker alone,
+  so another bot quoting our comment cannot set — or clear — the
+  `risk-grade-disputed` label.
+- **The label the publisher applies is re-validated** against the same
+  `risk:R<n>` pattern reconciliation uses, so a malformed report cannot make
+  the privileged job create an arbitrary label that nothing later cleans up.
 - **`.gitattributes` is read from the BASE ref** (`git --attr-source`), so a PR
   that adds `* -diff` cannot make numstat report `-` for every file and zero out
   its own size escalation. Same guard `pr-size.yml` applies to
-  `linguist-generated`. Needs git >= 2.42; older runners fall back and say so.
+  `linguist-generated`. Needs git >= 2.42; support is probed explicitly (rather
+  than inferred from a failed diff, which would silently restore the bypass on
+  any unrelated error), and an older runner sets `attr_source_degraded` in the
+  report, which both renders surface.
 - **The publisher re-checks the PR head SHA** before touching the label or the
   comment, so a delayed, superseded run cannot republish a stale tier over a
   newer one. Its Check Run still publishes — that one is per-commit.

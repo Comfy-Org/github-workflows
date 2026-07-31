@@ -71,12 +71,23 @@ mkdir -p "$OUT_DIR"
 emit_unknown() {
   local reason="$1"
   echo "grade-risk.sh: ${reason}" >&2
-  if ! REASON="$reason" MARKER="$MARKER" OUT_DIR="$OUT_DIR" "$PYTHON" - <<'PY'
+  # `-I` (isolated) is load-bearing, not tidiness: reading the program from
+  # stdin puts '' — the process CWD, which in the `grade` job is the PR's own
+  # checkout — at the front of sys.path, ahead of the `sys.path.insert` below
+  # and ahead of `import json, os, sys`. Without it a PR shipping a top-level
+  # `json.py` executes its own code the first time any unknown path is hit,
+  # breaking the "no PR-authored code runs in this job" boundary and letting the
+  # PR author the report the privileged publish job consumes. Running the grader
+  # from a FILE (below) is unaffected: there sys.path[0] is the script's own
+  # pinned directory.
+  if ! REASON="$reason" MARKER="$MARKER" OUT_DIR="$OUT_DIR" \
+       ATTR_DEGRADED="${ATTR_DEGRADED:-}" "$PYTHON" -I - <<'PY'
 import json, os, sys
 sys.path.insert(0, os.environ["GRADER_DIR"])
 import grade_risk
 
 report = grade_risk.unknown_report(os.environ["REASON"])
+report["attr_source_degraded"] = bool(os.environ.get("ATTR_DEGRADED"))
 marker = os.environ.get("MARKER") or grade_risk.DEFAULT_MARKER
 out = os.environ["OUT_DIR"]
 os.makedirs(out, exist_ok=True)
@@ -94,7 +105,7 @@ PY
     # Last-resort fallback: even the Python renderer is unavailable. Write a
     # minimal but well-formed report so the publish job still has something to
     # publish as unknown, instead of the run vanishing silently.
-    printf '{"schema":1,"status":"unknown","tier":null,"label":null,"reason":%s,"total_lines":0,"tier_lines":{},"files":[],"top_tier_files":[]}\n' \
+    printf '{"schema":1,"status":"unknown","tier":null,"label":null,"reason":%s,"total_lines":0,"tier_lines":{},"files":[],"top_tier_files":[],"attr_source_degraded":false}\n' \
       "\"grader unavailable\"" > "${OUT_DIR}/risk-report.json"
     # The one place the marker is repeated: by definition Python is unusable
     # here, so grade_risk.DEFAULT_MARKER cannot be read. Keep the two in sync.
@@ -129,17 +140,29 @@ fi
 # SIZE_ESCALATE_LINES become unreachable — a PR could suppress its own size
 # signal. pr-size.yml guards the analogous `linguist-generated` case the same
 # way. It is a TOP-LEVEL git option (before the subcommand) and needs git
-# >= 2.42, so a failure falls back to a plain diff and says so, rather than
-# reddening an advisory check on an older runner.
+# >= 2.42.
+#
+# Support is probed EXPLICITLY rather than inferred from the diff failing.
+# Falling back whenever the first diff errored would silently restore the very
+# `* -diff` bypass this closes, for any unrelated failure — so the fallback is
+# reached only when git genuinely does not know the option, and a real diff
+# failure stays a real failure. The degradation is recorded in the report so it
+# is visible rather than living in one stderr line.
 NUMSTAT_FILE="${OUT_DIR}/.numstat"
 NUMSTAT_ERR="${OUT_DIR}/.numstat.err"
-if ! git -C "$REPO_DIR" "--attr-source=${BASE}" diff --numstat -z "${BASE}...${HEAD}" \
+ATTR_ARG=()
+ATTR_DEGRADED_ARG=()
+ATTR_DEGRADED=""
+if git -C "$REPO_DIR" "--attr-source=${BASE}" rev-parse --quiet --verify HEAD >/dev/null 2>&1; then
+  ATTR_ARG=("--attr-source=${BASE}")
+else
+  ATTR_DEGRADED_ARG=(--attr-degraded)
+  ATTR_DEGRADED=1
+  echo "grade-risk.sh: this git does not support --attr-source (needs >= 2.42); .gitattributes was read from the PR head, so a PR that marks its own files '-diff' can zero its line counts." >&2
+fi
+if ! git -C "$REPO_DIR" "${ATTR_ARG[@]+"${ATTR_ARG[@]}"}" diff --numstat -z "${BASE}...${HEAD}" \
      >"$NUMSTAT_FILE" 2>"$NUMSTAT_ERR"; then
-  if ! git -C "$REPO_DIR" diff --numstat -z "${BASE}...${HEAD}" \
-       >"$NUMSTAT_FILE" 2>"$NUMSTAT_ERR"; then
-    emit_unknown "git diff ${BASE}...${HEAD} failed: $(tr '\n' ' ' <"$NUMSTAT_ERR")"
-  fi
-  echo "grade-risk.sh: --attr-source is unsupported by this git; .gitattributes was read from the PR head, so a PR that marks its own files '-diff' can zero its line counts. Upgrade to git >= 2.42 to close that." >&2
+  emit_unknown "git diff ${BASE}...${HEAD} failed: $(tr '\n' ' ' <"$NUMSTAT_ERR")"
 fi
 
 # --marker is forwarded only when the caller explicitly set one; otherwise the
@@ -148,7 +171,8 @@ MARKER_ARG=()
 if [ -n "$MARKER" ]; then
   MARKER_ARG=(--marker "$MARKER")
 fi
-if ! "$PYTHON" "$GRADER" --numstat "$NUMSTAT_FILE" --out-dir "$OUT_DIR" "${MARKER_ARG[@]+"${MARKER_ARG[@]}"}"; then
+if ! "$PYTHON" "$GRADER" --numstat "$NUMSTAT_FILE" --out-dir "$OUT_DIR" \
+     "${MARKER_ARG[@]+"${MARKER_ARG[@]}"}" "${ATTR_DEGRADED_ARG[@]+"${ATTR_DEGRADED_ARG[@]}"}"; then
   emit_unknown "the grader exited non-zero"
 fi
 

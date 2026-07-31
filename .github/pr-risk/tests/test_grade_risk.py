@@ -298,6 +298,30 @@ class MarkdownEscapingTest(unittest.TestCase):
         # the row must still have exactly the 4 columns the header declares.
         self.assertEqual(len(_split_row(row[0])), 4, row[0])
 
+    def test_a_reason_cannot_inject_a_link_image_or_raw_html(self):
+        """An unknown report's reason carries git stderr, which quotes
+        PR-authored paths — so it needs `_md_path`'s full escaping, not just
+        pipes."""
+        body = grade_risk.render_comment(
+            grade_risk.unknown_report(
+                "git failed on ![pix](http://evil/p.png) <img src=x> [a](b)"
+            ),
+            "<!-- m -->",
+        )
+        for live in ("![pix](http://evil/p.png)", "<img src=x>", "[a](b)"):
+            self.assertNotIn(live, body)
+
+    def test_the_comment_body_stays_under_githubs_limit(self):
+        """A 422 on upsert would leave the label fresh and the comment stale
+        forever, because publish_check_run truncates but upsert_sticky did not."""
+        rows = [(1, 0, "src/" + "d" * 300 + f"/{i}/" + "f" * 300 + ".go") for i in range(80)]
+        report = grade_risk.grade(grade_risk.parse_numstat(numstat(*rows)))
+        body = grade_risk.render_comment(report, "<!-- m -->")
+        self.assertLessEqual(len(body), grade_risk.COMMENT_MAX_CHARS)
+        # Still a usable comment, not a stub.
+        self.assertIn("Per-file breakdown", body)
+        self.assertIn("more files", body)
+
     def test_an_ordinary_path_still_renders_as_a_plain_code_span(self):
         report = grade_risk.grade(grade_risk.parse_numstat("1\t0\tsvc/auth/x.go\0"))
         self.assertIn("`svc/auth/x.go`", grade_risk.render_comment(report, "<!-- m -->"))
@@ -309,6 +333,39 @@ class MarkdownEscapingTest(unittest.TestCase):
             "git diff failed: bad file\n- [x] **This grade is wrong**"
         )
         self.assertNotForged(grade_risk.render_comment(report, "<!-- m -->"))
+
+
+class SizeEscalationNarrativeTest(unittest.TestCase):
+    def test_the_sentence_explains_a_headline_tier_the_files_did_not_earn(self):
+        """A 900-line docs-only PR headlines risk:R1 above "All 900 changed
+        lines are R0" — the sentence must not contradict the tier."""
+        # Several medium docs files, each under FILE_ESCALATE_LINES so no file
+        # escalates on its own — only the whole-diff size rule fires.
+        per_file = grade_risk.FILE_ESCALATE_LINES - 50
+        n = grade_risk.SIZE_ESCALATE_LINES // per_file + 1
+        rows = [(per_file, 0, f"docs/part{i}.md") for i in range(n)]
+        report = grade_risk.grade(grade_risk.parse_numstat(numstat(*rows)))
+        self.assertTrue(report["size_escalated"])
+        self.assertEqual(report["base_tier"], grade_risk.R0)
+        sentence = grade_risk.concentration_sentence(report)
+        self.assertIn(f"R{report['tier']}", sentence)
+        self.assertIn("on size", sentence)
+
+    def test_an_unescalated_report_says_nothing_extra(self):
+        report = grade_risk.grade(grade_risk.parse_numstat(numstat((5, 0, "a.md"))))
+        self.assertNotIn("on size", grade_risk.concentration_sentence(report))
+
+
+class AttrDegradedTest(unittest.TestCase):
+    def test_the_degradation_is_surfaced_in_both_renders(self):
+        report = grade_risk.grade(grade_risk.parse_numstat(numstat((5, 0, "a.go"))))
+        report["attr_source_degraded"] = True
+        self.assertIn("--attr-source", grade_risk.render_comment(report, "<!-- m -->"))
+        self.assertIn("--attr-source", grade_risk.render_check(report)[1])
+
+    def test_nothing_is_said_when_attributes_came_from_the_base(self):
+        report = grade_risk.grade(grade_risk.parse_numstat(numstat((5, 0, "a.go"))))
+        self.assertNotIn("--attr-source", grade_risk.render_comment(report, "<!-- m -->"))
 
 
 class UnknownTest(unittest.TestCase):
@@ -478,6 +535,43 @@ class ShellEntrypointTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 2, proc.stderr)
         self.assertIn("requires a value", proc.stderr)
         self.assertNotIn("shift count", proc.stderr)
+
+    def test_the_fallback_emit_path_ignores_pr_authored_modules(self):
+        r"""emit_unknown feeds its program to `python3 -`, which puts the CWD
+        (the PR's own checkout in the grade job) at the front of sys.path ahead
+        of `import json`. Without `-I` a PR shipping a top-level json.py runs
+        its own code in the credential-free-but-report-authoring job."""
+        d = self._repo()
+        with open(os.path.join(d, "json.py"), "w") as fh:
+            fh.write("raise SystemExit('PR-authored json.py executed')\n")
+        out = tempfile.mkdtemp()
+        proc = subprocess.run(
+            ["bash", os.path.join(PKG, "grade-risk.sh"),
+             "--base", "0" * 40, "--head", "HEAD", "--out-dir", out, "--repo-dir", d],
+            capture_output=True, text=True, cwd=d,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("PR-authored json.py executed", proc.stderr + proc.stdout)
+        with open(os.path.join(out, "risk-report.json")) as fh:
+            report = json.load(fh)
+        # The real renderer ran, not the last-resort printf fallback.
+        self.assertEqual(report["status"], "unknown")
+        self.assertIn("git diff", report["reason"])
+
+    def test_a_real_diff_failure_is_not_masked_as_an_attr_source_fallback(self):
+        """The fallback must fire only when git lacks --attr-source. Falling
+        back on ANY first-diff failure would silently restore the `-diff`
+        bypass, and would turn a genuine failure into a successful grade."""
+        d = self._repo()
+        out = tempfile.mkdtemp()
+        proc = self._sh(
+            "--base", "0" * 40, "--head", "HEAD", "--out-dir", out, "--repo-dir", d
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(os.path.join(out, "risk-report.json")) as fh:
+            report = json.load(fh)
+        self.assertEqual(report["status"], "unknown")
+        self.assertFalse(report["attr_source_degraded"])
 
     def test_a_pr_cannot_zero_its_own_line_counts_via_gitattributes(self):
         """`-diff` added on the PR head makes numstat report `-` for every

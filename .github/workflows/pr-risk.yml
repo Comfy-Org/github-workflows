@@ -5,11 +5,18 @@ name: PR Risk Grade (reusable)
 # three ways so reviewers can sort a deep queue by how much attention a change
 # actually needs (`is:pr is:open label:risk:R0`).
 #
-# NOTHING IS GATED. The Check Run's conclusion is hardcoded `neutral`, the
-# grader always exits 0, and every publish step is best-effort: this workflow
-# cannot fail a PR, cannot block a merge, and is not safe to make a required
-# check even if someone tries. No automation consumes the label — it exists for
-# humans to filter by.
+# NOTHING IS GATED ON THE GRADE. The Check Run's conclusion is hardcoded
+# `neutral`, the grader always exits 0, and every publish step is best-effort,
+# so no tier — however bad — can fail a PR or block a merge. No automation
+# consumes the label either; it exists for humans to filter by.
+#
+# That is a promise about the GRADE, not about the jobs. A `neutral` Check Run
+# does not neutralize this workflow's own job status: an infrastructure failure
+# (a checkout, `setup-python`, the artifact upload, or the 5-minute timeout)
+# fails the job like any other workflow's, and a red called-workflow check on a
+# caller that someone made REQUIRED would block that PR. So do not make the
+# caller a required check — the grade is advisory and there is nothing to gate
+# on.
 #
 # What it publishes:
 #   label       exactly one `risk:R0`..`risk:R3` at any time. Stale tiers are
@@ -83,10 +90,19 @@ name: PR Risk Grade (reusable)
 #         # Pin the tool ref to the same ref you pin `uses:` to.
 #         workflows_ref: <sha>
 #         # Optional: publish under your GitHub App instead of GITHUB_TOKEN.
-#         # REQUIRED for fork PRs, whose GITHUB_TOKEN is read-only.
+#         # Does NOT rescue fork PRs — see the note below.
 #         bot_app_id: ${{ vars.APP_ID }}
 #       secrets:
 #         BOT_APP_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+#
+# FORK PRs DO NOT PUBLISH, and no caller configuration changes that. This runs
+# on `pull_request` (deliberately not `pull_request_target`), and GitHub
+# withholds repository secrets from fork-triggered runs — so
+# `secrets.BOT_APP_PRIVATE_KEY` is empty exactly on the fork path, the app-token
+# mint fails, and publishing falls back to the read-only `GITHUB_TOKEN`. A fork
+# PR therefore always lands in degraded mode: the full grade is in the grade
+# job's step summary, but no label, Check Run or comment is written. That is the
+# accepted cost of never handing a privileged context a PR checkout.
 #
 # GitHub rejects a caller that grants LESS than a called job requests, so the
 # `checks: write` + `pull-requests: write` grant above is required at startup
@@ -116,9 +132,10 @@ on:
         description: >-
           GitHub App ID used to publish (paired with the BOT_APP_PRIVATE_KEY
           secret). App IDs aren't secret, so this is an input. Optional — when
-          absent the workflow falls back to GITHUB_TOKEN, which works for
-          same-repo PRs but is READ-ONLY on fork PRs, where publishing then
-          degrades to the step summary.
+          absent the workflow falls back to GITHUB_TOKEN. Note this does NOT
+          rescue fork PRs: secrets are withheld from fork-triggered
+          `pull_request` runs, so the mint fails there whatever you set, and
+          publishing degrades to the step summary.
         type: string
         required: false
         default: ''
@@ -419,11 +436,15 @@ jobs:
           # Via env, never interpolated into the script body: a comment body is
           # attacker-controlled text and must not reach the shell as code.
           COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_ID: ${{ github.event.comment.id }}
         run: |
           set -euo pipefail
           printf '%s' "${COMMENT_BODY}" > edited-comment.md
-          # No-ops (and says so) unless the edited comment is our sticky one.
+          # No-ops (and says so) unless the edited comment IS our sticky one:
+          # the id is matched against it, so another bot quoting the marker
+          # cannot drive — or clear — the dispute label.
           python3 _pr_risk_tool/.github/pr-risk/publish_risk.py dispute \
             --repo "${REPO}" \
             --pr "${PR_NUMBER}" \
+            --comment-id "${COMMENT_ID}" \
             --body edited-comment.md

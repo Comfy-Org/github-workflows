@@ -118,22 +118,51 @@ def reconcile_labels(call, repo: str, pr: int, desired: str | None) -> dict:
     `desired=None` (the unknown case) removes every `risk:R*` label and adds
     none — an ungradable PR must not keep a stale tier, and must not silently
     acquire `risk:R0`.
+
+    `desired` is validated against `RISK_LABEL_RE` — the same pattern the
+    removal side uses. It arrives verbatim from the report artifact, and this
+    job is the privileged one: an unvalidated name would let a malformed report
+    create an ARBITRARY label (`lgtm`, `risk-assessment-done`) that no later
+    reconciliation would ever clean up, because reconciliation only deletes
+    names matching that regex. A non-match is treated as unknown.
     """
+    if desired is not None and not RISK_LABEL_RE.match(desired):
+        raise ValueError(
+            f"refusing to apply {desired!r}: not a risk:R<n> label. The report "
+            "artifact is malformed; publishing as unknown instead."
+        )
     current = _paged(call, f"/repos/{repo}/issues/{pr}/labels")
     names = [lbl["name"] for lbl in current]
     ours = [n for n in names if RISK_LABEL_RE.match(n)]
-    removed = [n for n in ours if n != desired]
-    for name in removed:
-        # URL-safe enough: risk labels are `risk:R<n>` by construction, but the
-        # colon is encoded so a future tier name can't break the path.
-        call("DELETE", f"/repos/{repo}/issues/{pr}/labels/{name.replace(':', '%3A')}", None)
+
+    # Add BEFORE removing. `api()` raises on any non-2xx, and a DELETE can
+    # legitimately 404 (a concurrent run already removed it) or hit a 403 /
+    # 5xx / rate limit. Deleting first meant one such error propagated out of
+    # cmd_publish with the desired label never added — leaving the PR carrying
+    # NO risk:* label while the Check Run had already announced a tier.
     added = []
     if desired and desired not in names:
         # POST .../labels creates the label in the repo if it does not exist
         # yet, so a consumer repo needs no manual label setup to opt in.
         call("POST", f"/repos/{repo}/issues/{pr}/labels", {"labels": [desired]})
         added.append(desired)
-    return {"added": added, "removed": removed}
+
+    removed, failed = [], []
+    for name in [n for n in ours if n != desired]:
+        try:
+            # URL-safe enough: risk labels are `risk:R<n>` by construction, but
+            # the colon is encoded so a future tier name can't break the path.
+            call(
+                "DELETE",
+                f"/repos/{repo}/issues/{pr}/labels/{name.replace(':', '%3A')}",
+                None,
+            )
+            removed.append(name)
+        except ApiError as exc:
+            # A stale tier we could not remove is worth reporting, but it must
+            # not abort the run and take the sticky comment down with it.
+            failed.append(f"{name} ({exc})")
+    return {"added": added, "removed": removed, "failed_removals": failed}
 
 
 def publish_check_run(call, repo: str, sha: str, title: str, summary: str) -> dict:
@@ -266,13 +295,26 @@ def cmd_publish(args, call) -> int:
         return 0
 
     desired = report.get("label") if report.get("status") == "graded" else None
-    lab = reconcile_labels(call, args.repo, args.pr, desired)
+    try:
+        lab = reconcile_labels(call, args.repo, args.pr, desired)
+    except ValueError as exc:
+        # A report claiming a label this workflow does not own. Fall back to
+        # the unknown path (strip every risk:R*, add none) rather than trusting
+        # it — publishing a bogus label is worse than publishing no tier.
+        _summary(f"Label: none — {exc}")
+        desired = None
+        lab = reconcile_labels(call, args.repo, args.pr, None)
     if desired:
         _summary(f"Label: `{desired}` (removed: {lab['removed'] or 'none'})")
     else:
         _summary(
             "Label: none — this PR could not be graded, so it is published as "
             f"UNKNOWN rather than defaulted to `risk:R0` (removed: {lab['removed'] or 'none'})"
+        )
+    if lab["failed_removals"]:
+        _summary(
+            "Warning: these stale risk labels could not be removed, so the PR "
+            f"may show more than one tier: {'; '.join(lab['failed_removals'])}"
         )
 
     if args.comment:
@@ -289,6 +331,20 @@ def cmd_dispute(args, call) -> int:
     if MARKER not in body:
         _summary("Edited comment is not the risk sticky comment — nothing to record.")
         return 0
+    # The marker alone is not proof of authorship: it is published in the
+    # README and in every rendered comment, so any OTHER bot that quotes our
+    # comment (a review summarizer, say) would drive `risk-grade-disputed` —
+    # including CLEARING a genuine dispute if the quoted copy shows an unticked
+    # box. `find_sticky` was hardened against exactly this; match the id here.
+    if args.comment_id:
+        sticky = find_sticky(call, args.repo, args.pr)
+        if not sticky or str(sticky.get("id")) != str(args.comment_id):
+            _summary(
+                f"Edited comment {args.comment_id} carries the marker but is not "
+                "this workflow's sticky comment (probably another bot quoting "
+                "it) — nothing to record."
+            )
+            return 0
     disputed = bool(CHECKED_RE.search(body))
     res = set_dispute_label(call, args.repo, args.pr, disputed)
     _summary(
@@ -321,6 +377,12 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--repo", required=True)
     d.add_argument("--pr", type=int, required=True)
     d.add_argument("--body", required=True, help="File holding the edited comment body")
+    d.add_argument(
+        "--comment-id",
+        default="",
+        help="Id of the edited comment. Checked against the sticky comment so "
+        "another bot quoting the marker cannot drive the dispute label.",
+    )
     d.set_defaults(func=cmd_dispute)
 
     args = ap.parse_args(argv)
