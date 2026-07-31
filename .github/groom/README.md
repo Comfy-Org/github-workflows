@@ -46,10 +46,26 @@ rather than buried in a runner script.
   `REJECT` (premature / overstated / not worth it).
 - **`security: true`** marks any auth/permission/security-adjacent finding —
   those are filed as investigations, **never** auto-implemented.
-- **`signature`** is a stable dedup key (`<repo-basename>:<scope>:<slug>`) whose
-  `<slug>` is derived **deterministically** from the finding's core subject, so it
-  stays identical across re-runs of the same finding and a consumer never re-files
-  a finding it has already seen.
+- **`signature`** is a stable dedup key, `<repo-basename>:<scope>:<path-slug>`,
+  where `<path-slug>` is the finding's **primary file or directory path** —
+  lowercased, every run of non-alphanumeric characters collapsed to a single
+  hyphen, leading/trailing hyphens trimmed (`src/tools.ts` → `src-tools-ts`,
+  `services/ingest/` → `services-ingest`). Multi-file finding: the
+  **alphabetically first** of the cited paths — a mechanical rule, because "the
+  most representative one" is a judgment the verifier would re-make differently
+  next run. Only a repo-wide pattern with no single anchor falls back to a
+  normalized subject noun-phrase. A `security: true` finding's slug is prefixed
+  `sec_` — underscore, because slugification can never produce one, so the
+  security lane for `auth.ts` (`sec_auth-ts`) cannot collide with a routine
+  finding about `sec/auth.ts` (`sec-auth-ts`). That lane is what stops a routine
+  finding already filed for a file from deduping away a security finding about
+  that same file.
+  It is anchored to the **path, not the title**, because titles are re-generated
+  on every run: a re-worded title yields a new title-slug, the ledger's
+  exact-string match sees a "new" finding, and the same finding is filed twice
+  (observed in a consumer repo: one `src/tools.ts` finding, two issues opened by
+  consecutive runs). Paths survive rewordings, so the signature stays identical
+  across re-runs and a consumer never re-files a finding it has already seen.
 
 ## How a consumer uses these briefs
 
@@ -119,6 +135,7 @@ Keyed on `(repo, finding_signature) → {filed | rejected | superseded}`:
 | Open **builder PR** for the signature (BE-4003) | `pr-open` | no |
 | **Builder PR merged** | `merged` | no (shipped) |
 | **Builder PR closed unmerged** | `pr-closed` | **no — durable** (human declined) |
+| A known, non-`superseded` signature shares the candidate's `<path-slug>`, and the candidate is not `security: true` (BE-4460) | `path-collision` | no |
 | No `groom` issue or PR carries the signature | `unknown` | **yes** |
 
 Only an `unknown` signature is filed/proposed. Human rejection — close-as-not-planned,
@@ -139,6 +156,62 @@ issue for a `to_file` finding **must**:
    invisible HTML comment (`<!-- groom-signature: … -->`) the next run recovers.
 
 Skip either and the next run cannot recognize the issue and will re-file it.
+
+### The path-token backstop (BE-4460)
+
+Classification treats the signature as an opaque string, with one exception: a
+candidate whose exact signature is `unknown` but whose `<path-slug>` segment
+(everything after the **last** `:` — `<repo-basename>` and `<path-slug>` are
+colon-free by construction, so counting from the right is what keeps a scope
+label that itself contains a colon, `pkg:api`, from shearing the token) is
+already covered — by a known signature, or by a candidate already routed to
+`to_file` in the same batch — is suppressed as **`path-collision`** rather than
+filed. That keeps one issue per anchoring path when the leading segments differ
+(a re-scoped run, a legacy signature whose slug coincides). Matching is **exact
+string equality** on the path segment — no substring or fuzzy matching, which
+would silently drop real findings about different files that share a basename
+(`src/index.ts` vs `lib/index.ts`).
+
+Because the backstop suppresses a candidate whose *own* signature is new, it is
+deliberately narrow — two carve-outs:
+
+- **`security: true` candidates are never suppressed by it.** A path anchors a
+  location, not a finding, so without this an already-filed routine finding on
+  `src/tools.ts` would bury a later security finding on the same file and break
+  the "security findings always surface as investigations" guarantee. (The
+  verifier's `sec_` slug prefix separates the two lanes up front; this is the
+  code-side guarantee for legacy and cross-scope signatures that predate it, and
+  it fails **closed** — `is_security_finding` treats a finding whose flag the
+  verifier omitted or mangled as security, so a malformed flag can never be what
+  buries one.) Exact-signature dedup still applies, so the exemption costs at
+  most one extra issue — the next run sees it as `filed`. It does **not** make
+  security findings individually addressable: two distinct vulnerabilities in one
+  file share the `sec_<path>` key and collapse, exactly as two routine findings
+  on one file do (see the limit below).
+- **`superseded` records are left out of the path index.** `groom-superseded` is
+  the documented "retire this issue so its finding can be re-filed under the
+  current format" signal; keeping it in the index would let the retired issue go
+  on suppressing the replacement by path and defeat the label a human applied.
+
+Known, accepted limit — and a **permanent** suppression, not a one-time
+transition cost. A path-anchored key identifies a *location*, so every later
+finding that maps to an already-covered token is dropped for good: two different
+findings about one file, and two genuinely distinct paths that slugify alike
+(`src/foo/bar.ts` and `src/foo-bar.ts` both → `src-foo-bar-ts`, or a file and a
+same-stem directory). That is the deliberate trade for a key that survives
+re-wording — one issue per anchoring path, chosen over the duplicate-per-run
+spam the title-derived key produced. Widening it needs a per-finding
+discriminator that is *stable across runs*, which is exactly what the LLM cannot
+supply today; the `security` flag is one bit that is, which is why the security
+lane is carved out of this and nothing else is.
+
+Consequence for the format transition: a legacy *title*-derived slug that merely
+*embeds* the path (`split-tools-ts-into-focused-modules`) is **not** matched, so
+such a finding can be filed once more under its new path-anchored signature —
+then it is stable forever. Label the superseded legacy issue `groom-superseded`
+(or close it as not planned) to retire it. A security finding already filed under
+an unprefixed slug re-files once for the same reason when it picks up its `sec_`
+prefix — same one-per-finding, one-time transition cost, same fix.
 
 The dedup decision is a point-in-time snapshot of GitHub issue state read
 *before* filing, and issue creation happens in a later step. Two overlapping
@@ -164,6 +237,81 @@ Single-signature probe (exit 0 = should file, 1 = suppressed):
 
 ```bash
 python3 .github/groom/ledger.py --repo owner/name --check "<signature>"
+# ...as a security finding, which the path backstop never suppresses:
+python3 .github/groom/ledger.py --repo owner/name --check "<signature>" --check-security
+```
+
+A bare signature carries no `security` flag, so the probe answers for a routine
+finding by default; pass `--check-security` to mirror `partition`'s decision for
+a `security: true` candidate.
+
+## `interval.py` — the runtime cadence gate (BE-4004)
+
+GitHub Actions `schedule:` cron is **static in the workflow file** — there is no
+native "every N days" input. So a caller fires on a **frequent (daily) base
+cron**, and this gate turns that into an **effective every-`GROOM_INTERVAL_DAYS`
+run**: at run start it early-exits unless the interval has elapsed since the last
+real groom, so a skipped tick costs ~nothing (it never reaches the finder).
+
+- **The knob is a repo Actions variable, `GROOM_INTERVAL_DAYS`** (default `7` =
+  weekly, matching the original cron). The caller wires it to the reusable's
+  `interval_days` input (`interval_days: ${{ vars.GROOM_INTERVAL_DAYS || '7' }}`)
+  and re-evaluates it each run, so changing the variable retunes cadence — weekly
+  → every-3-days → daily — with **no workflow-file edit**, the same "live knob"
+  ergonomics as the per-repo caps. Both cadence inputs (`interval_days`,
+  `cadence`) are declared **`type: string`** deliberately: they carry a free-text
+  Actions variable, and a `number` input would make GitHub reject a typo'd value
+  (`weekly`, `7d`) at workflow-call time — failing the run *closed* before the
+  degradation below could ever run. As strings, `interval.py` is the single
+  normalization authority.
+- **A tick clears the bar a half-tick early.** GitHub's cron fires late by an
+  unpredictable amount, so demanding a full `interval_days` on a daily tick would
+  skip at 6.99 days elapsed, push the run to tomorrow, and — because the clock
+  re-anchors on that later run — ratchet the cadence a day later every cycle. The
+  gate compares against `interval_days` less `0.5` (capped at half the interval),
+  which absorbs the jitter without letting two real runs land on consecutive
+  daily ticks (those are a full ~1.0 day apart).
+- **Last-run state is derived from GitHub Actions run history**, not a writable
+  store: the GitHub-native option that needs **no net-new secret** and only
+  `actions: read`. A prior run "counts" only if it actually reached the finder
+  (its `Audit — finder` job ran, not `skipped` by this gate), so the
+  interval-skip ticks in between never reset the clock. (A repo variable would
+  need a `Variables: write` credential the run doesn't carry, and a missing grant
+  would fail *silently* into a daily over-spend — run history has no such trap.)
+- **`workflow_dispatch` bypasses THIS gate** — a manual dispatch is never
+  interval-throttled. It is not a blanket "always runs": the volume gate is a
+  second, independent throttle, so a live dispatch into a quiescent repo can
+  still skip. Turn `volume_gate` off (the reference caller does exactly this for
+  `dry_run:true` dispatches) if a manual run must always reach the finder.
+- **Fail-open**, like the volume gate: any error reading history (API hiccup, no
+  history, unparseable timestamp) RUNS the audit rather than skip a due groom.
+- **One normalization for both gates.** The caller wires the same variable to
+  `cadence` (the volume gate's merge-activity window), so the volume gate routes
+  it through this module too — `interval.py --normalize-cadence "$CADENCE"` —
+  rather than feeding the raw value to `date -d`. Same degradation
+  (blank/garbage/negative → `7`), then floored at **1 whole day**. Without it the
+  gates drift on reachable values: `-3` becomes a *future* `date -d` cutoff that
+  matches no merged PR (skipping every run — groom silently off) while the
+  interval gate had safely degraded to weekly, and `0` (a legitimate "no
+  throttle") shrinks the merge window to today-only.
+
+The caller **must** grant `actions: read`. The `gate` job declares that scope, and
+a nested reusable job can never hold more than the calling job grants — GitHub
+checks the subset at **startup**, so a caller that omits it has the whole run
+rejected (`requesting 'actions: read', but is only allowed 'actions: none'`,
+surfaced as an opaque "workflow file issue" with zero jobs) rather than degrading
+to a fail-open daily run. Fail-open covers the *other* failure: the grant is
+present but the history read errors (fresh repo with no runs, API hiccup) — then
+the gate runs rather than skips. As with `ledger.py`, the pure decision logic is
+split from the thin `gh` I/O so it is fully unit-testable with no network.
+
+```bash
+python3 .github/groom/interval.py \
+    --repo owner/name --workflow-file ci-groom.yml \
+    --current-run-id 123 --interval-days 7 --event-name schedule
+
+# Second mode — normalize the shared knob into the volume gate's window:
+python3 .github/groom/interval.py --normalize-cadence "$GROOM_INTERVAL_DAYS"
 ```
 
 - **`tests/`** — `unittest` suite, run by

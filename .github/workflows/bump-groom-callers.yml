@@ -1,0 +1,158 @@
+name: Bump groom callers
+
+# When groom.yml (or the briefs/ledger it loads) is updated on main, open a
+# SHA-bump PR in every repo that pins a groom caller against it. PRs are opened
+# by Cloud Code Bot so they are easy to filter and merge.
+#
+# This is a thin entrypoint over the shared bumper at
+# .github/bump-callers/bump-callers.sh — the same script drives the
+# cursor-review, agents-md-integrity, pr-size and assign-reviewers fleets.
+# Keeping ONE implementation is deliberate: a forked copy is how other shared
+# machinery in the org has drifted. The entrypoints differ only in their
+# path-filter trigger and the parameters passed below.
+#
+# WHY groom needs a bumper at all, more than most fleets: a groom caller pins the
+# reusable TWICE — the `uses:` SHA and the `workflows_ref:` input that loads the
+# finder/verifier/builder briefs + the dedup ledger. Those two must stay in
+# lock-step or a run executes one version's workflow against another version's
+# briefs. bump-callers.sh rewrites both (its rewrite matches the `uses:` line and
+# any bare `workflows_ref:` line), so the fleet cannot drift into that split
+# state by hand-bumping only one of them.
+#
+# The caller list is NOT hardcoded here. This repo is PUBLIC (workflow file and
+# Actions run logs are both publicly viewable) and callers may be private, so
+# their names must never appear in this file or its logs. The list lives in the
+# repo-level Actions variable `GROOM_CALLERS` (config, not a credential — a
+# variable, not a secret, since secrets are write-only via the API) as a JSON
+# array of {"repo","file","label"} objects. Every repo name is `::add-mask::`ed
+# out of the (public) run logs before it is ever echoed.
+#
+# No WIRE_BOT_SCRIPT here: bot-identity injection is a cursor-review-only concern
+# (BE-1814). A groom caller must set `bot_app_id` itself — the reusable requires
+# it for `builder: true` — so there is nothing for the bumper to wire.
+#
+# Update flow — adding/removing a caller needs NO public commit:
+#   gh variable set GROOM_CALLERS --repo Comfy-Org/github-workflows \
+#     --body "$(jq -c . callers.json)"
+# Keep the canonical callers.json in a PRIVATE infra/ops repo so variable edits
+# have a reviewed source of truth; the org audit log records each edit. (The
+# specific home repo is intentionally not named here — this file is public.)
+
+on:
+  workflow_dispatch: {}   # allow on-demand runs (e.g. to re-bump callers)
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/groom.yml
+      # The briefs + ledger consumers actually run live here, loaded at run time
+      # from the `workflows_ref` SHA a caller pins (see groom.yml's header) — a
+      # behavior change here (a finder/verifier/builder brief edit, or ledger.py
+      # dedup logic) needs the same caller bump as a workflow-file change, or
+      # pinned callers silently drift onto stale audit behavior.
+      - .github/groom/**
+
+permissions:
+  contents: read
+
+# Serialize runs of this fleet. The bumper pushes to a STABLE branch
+# (ci/bump-groom) shared across runs, so two overlapping runs (a rapid second
+# main push, or a push racing a manual re-run) would force-reset that branch and
+# race the PR update — an older run finishing last could leave the committed diff
+# pinned to a stale SHA. cancel-in-progress: false lets the running bump finish;
+# GitHub keeps only the newest pending run, so the latest SHA always wins
+# (BE-3882).
+concurrency:
+  group: bump-groom-callers
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    # Guard against a workflow_dispatch run from a non-main ref: github.sha is
+    # the tip of whatever ref was selected, and the bumper force-resets a stable
+    # shared branch — a manual run from an older ref would pin every caller to a
+    # stale SHA (and run this job's script, with the App token minted below,
+    # from an unreviewed commit). The push trigger is already main-only, so this
+    # only ever skips stray manual runs.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Generate Cloud Code Bot token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: token
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+          # `owner:` with no `repositories:` is deliberate and cannot be narrowed:
+          # the caller list is a runtime variable (see the header), so the repos
+          # this token must reach are not knowable at authoring time — and naming
+          # them here would leak private caller names into a public file.
+          #
+          # The PERMISSIONS can be narrowed without naming anything, so they are:
+          # unset, the minted token carries every permission the app holds on every
+          # repo it is installed on, far past what this bumper needs. It commits
+          # the rewritten caller file via the Git Data API (contents) and opens or
+          # updates the bump PR (pull-requests); `gh pr create --label` stamps the
+          # caller's label through the issues API (issues) — same trio, and the
+          # same reasoning, as groom.yml's own PR job.
+          owner: Comfy-Org
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+
+      - name: Bump SHA in caller repos
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          NEW_SHA: ${{ github.sha }}
+          VAR_NAME: GROOM_CALLERS
+          TAG: groom
+          WORKFLOW_FILE: groom.yml
+          # JSON array of {"repo","file","label"} — see the header comment for the
+          # update flow. Kept in a variable (not the file) so caller names never
+          # land in this public repo or its logs.
+          CALLERS_JSON: ${{ vars.GROOM_CALLERS }}
+          # groom is still rolling out repo by repo, so an empty list is a clean
+          # no-op rather than a hard failure — same posture as the agents-md /
+          # pr-size / assign-reviewers fleets. Flip to the default (unset) once
+          # the fleet is expected to always have callers, so a silently empty
+          # variable can never leave every caller un-bumped unnoticed.
+          ALLOW_EMPTY: 'true'
+        run: |
+          # The main-only ref guard above cannot catch a manual RE-RUN of an
+          # older main run: github.ref is refs/heads/main but github.sha is
+          # that run's original (now stale) commit, and the bumper would
+          # force-repin every caller to it. Only act from the current tip —
+          # any newer push has its own queued run that does the bump.
+          # Don't pipe into `cut`: the pipeline would report cut's status, so a
+          # failed ls-remote (network blip, remote hiccup) yields an EMPTY
+          # main_tip that then compares unequal to github.sha and silently
+          # no-ops the whole fleet bump as if the run were stale. A lookup we
+          # couldn't perform is not evidence of staleness — fail loudly.
+          if ! ls_remote=$(git ls-remote origin refs/heads/main); then
+            echo "::error::Could not look up the current main tip (git ls-remote failed)"
+            exit 1
+          fi
+          main_tip=${ls_remote%%$'\t'*}
+          if [[ -z "$main_tip" ]]; then
+            echo "::error::git ls-remote returned no SHA for refs/heads/main"
+            exit 1
+          fi
+          if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
+            echo "github.sha $GITHUB_SHA is not the current main tip ($main_tip) — stale run/re-run; nothing to bump"
+            exit 0
+          fi
+          # The push path filter also matches a commit that DELETES the reusable
+          # workflow — or the briefs/ledger callers load at run time from the
+          # pinned SHA (.github/groom/**); bumping callers to a SHA where either
+          # is gone would break every caller. Deletion means decommissioning —
+          # no-op. Both are checked because a groom caller pins BOTH (`uses:` and
+          # `workflows_ref:`), so either one missing is a broken pin.
+          if [[ ! -f .github/workflows/groom.yml || ! -d .github/groom ]]; then
+            echo "groom.yml or .github/groom/ absent at this SHA — decommissioned; nothing to bump"
+            exit 0
+          fi
+          bash .github/bump-callers/bump-callers.sh
