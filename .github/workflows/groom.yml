@@ -249,6 +249,28 @@ on:
         type: string
         required: false
         default: main
+      config:
+        description: >-
+          OPTIONAL JSON object of operational knobs (BE-5227), as an ESCAPE HATCH
+          for a caller that wants its config pinned in the reviewed workflow file.
+          You almost certainly do NOT need to pass this: the `gate` job already
+          reads the calling repo's `vars.GROOM_CONFIG` on its own — the `vars`
+          context inside a reusable resolves against the CALLER's repository, so a
+          consumer opts in by setting that variable and needs no `with:` change at
+          all (verified in-org: assign-reviewers.yml reads `vars.REVIEWER_LOAD_CAP`,
+          which is set on `cloud` and NOT on this repo).
+
+
+          Ranks ABOVE `vars.GROOM_CONFIG`, which makes it the slot for a one-run
+          override: a reusable workflow cannot see the caller's
+          `workflow_dispatch` inputs, so a caller that wants a dispatch value to
+          beat the repo variable must forward it as a JSON blob here rather than
+          per-knob. Same allowlist, same coercion, same fail-open degradation —
+          see `.github/groom/config.py` for the key list, and for the knobs that
+          are deliberately NOT settable by config at all.
+        type: string
+        required: false
+        default: ''
       bot_app_id:
         description: >-
           GitHub App ID. When set (with the BOT_APP_PRIVATE_KEY secret), issues
@@ -377,6 +399,12 @@ jobs:
       pull-requests: read
     outputs:
       should_run: ${{ steps.check.outputs.should_run }}
+      # The single resolved knob set (BE-5227), as one compact JSON string. EVERY
+      # downstream job reads its operational knobs from here via
+      # `fromJSON(needs.gate.outputs.resolved).<knob>` rather than `inputs.<knob>`,
+      # so the GROOM_CONFIG merge happens in exactly ONE place. Emitted before
+      # either gate runs, so it is populated even on a skipped tick.
+      resolved: ${{ steps.resolve.outputs.resolved }}
     steps:
       - name: Load groom assets (interval gate)
         # interval.py is loaded from THIS repo at the pinned ref — a single
@@ -387,6 +415,67 @@ jobs:
           ref: ${{ inputs.workflows_ref }}
           path: _groom_assets
           persist-credentials: false
+
+      - name: Resolve operational knobs (GROOM_CONFIG)
+        # Merges, highest precedence LAST: the per-knob `with:` inputs (the
+        # reviewed baseline) < `vars.GROOM_CONFIG` (the live, no-PR layer) < the
+        # `config` input (a caller's explicit override slot). config.py is the
+        # single normalization authority; it exits 0 on ANY malformed layer and
+        # degrades to the lower one, because a typo'd repo variable must not red
+        # out a daily scheduled sweep.
+        #
+        # `vars.GROOM_CONFIG` is read HERE, inside the reusable, not passed in by
+        # the caller: the `vars` context in a called workflow resolves against the
+        # CALLER's repository, so every consumer inherits variable-driven config
+        # with no `with:` change — only a pin bump, which the bump-groom-callers
+        # fleet automates. (An input `default:` cannot reference `vars`, which is
+        # why this is a step env rather than the `config` input's default.)
+        #
+        # There is deliberately NO workflow_dispatch layer here, because a
+        # reusable workflow CANNOT see one: inside a called workflow `inputs` is
+        # this workflow's own inputs, and `github.event.inputs` is the caller's raw
+        # payload only for the caller's own jobs. A caller that forwards a dispatch
+        # input does so per-knob (`max_prs: ${{ github.event.inputs.max_prs || '1' }}`),
+        # which lands in the per-knob baseline BELOW the variable — so once
+        # GROOM_CONFIG sets a knob, that variable is the source of truth for it and
+        # a per-knob dispatch override of that same knob stops taking effect. A
+        # caller that wants one-run overrides to keep winning should forward a JSON
+        # blob into `config` instead, which ranks above the variable.
+        id: resolve
+        env:
+          GROOM_CONFIG: ${{ vars.GROOM_CONFIG }}
+          CONFIG_INPUT: ${{ inputs.config }}
+          # The per-knob inputs are the REVIEWED baseline the layers above
+          # override. toJSON() on each is what keeps a value containing quotes,
+          # newlines or YAML metacharacters from breaking the JSON we build.
+          DEFAULTS: >-
+            {
+              "dry_run": ${{ toJSON(inputs.dry_run) }},
+              "volume_gate": ${{ toJSON(inputs.volume_gate) }},
+              "max_prs": ${{ toJSON(inputs.max_prs) }},
+              "max_findings": ${{ toJSON(inputs.max_findings) }},
+              "interval_days": ${{ toJSON(inputs.interval_days) }},
+              "cadence": ${{ toJSON(inputs.cadence) }},
+              "themes": ${{ toJSON(inputs.themes) }},
+              "scope_label": ${{ toJSON(inputs.scope_label) }},
+              "scope_desc": ${{ toJSON(inputs.scope_desc) }},
+              "model": ${{ toJSON(inputs.model) }}
+            }
+        run: |
+          set -euo pipefail
+          # Two passes rather than one, so the layer ORDER is explicit in the
+          # shell instead of implicit in an argument name: variable over baseline,
+          # then the caller's explicit `config` over that.
+          BASE=$(python3 "$GROOM_ASSETS/config.py" \
+            --defaults-json "$DEFAULTS" \
+            --config-json "$GROOM_CONFIG")
+          RESOLVED=$(python3 "$GROOM_ASSETS/config.py" \
+            --defaults-json "$BASE" \
+            --config-json "$CONFIG_INPUT")
+          echo "Resolved knobs: $RESOLVED"
+          # Single-line compact JSON by construction (config.py guarantees it), so
+          # a plain key=value line is safe — no heredoc delimiter needed.
+          echo "resolved=$RESOLVED" >> "$GITHUB_OUTPUT"
 
       - name: Validate sink
         env:
@@ -414,10 +503,12 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           EVENT_NAME: ${{ github.event_name }}
           WF_REF: ${{ github.workflow_ref }}
-          # The caller wires this to `vars.GROOM_INTERVAL_DAYS` and re-evaluates it
-          # each run, so changing that variable retunes cadence with no file edit.
+          # Resolved (BE-5227): `GROOM_CONFIG.interval_days` overrides the caller's
+          # `interval_days` input, which is itself usually wired to the older
+          # single-purpose `vars.GROOM_INTERVAL_DAYS`. Either variable retunes
+          # cadence with no file edit; GROOM_CONFIG wins when both are set.
           # Blank/garbage -> interval.py defaults to 7 (weekly), matching today.
-          INTERVAL_DAYS: ${{ inputs.interval_days }}
+          INTERVAL_DAYS: ${{ fromJSON(steps.resolve.outputs.resolved).interval_days }}
         run: |
           set -euo pipefail
           # Derive the CALLER workflow file (e.g. ci-groom.yml) from workflow_ref
@@ -452,8 +543,8 @@ jobs:
         if: steps.interval.outputs.run == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          VOLUME_GATE: ${{ inputs.volume_gate }}
-          CADENCE: ${{ inputs.cadence }}
+          VOLUME_GATE: ${{ fromJSON(steps.resolve.outputs.resolved).volume_gate }}
+          CADENCE: ${{ fromJSON(steps.resolve.outputs.resolved).cadence }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -551,9 +642,18 @@ jobs:
       - name: Build finder prompt
         env:
           REPO: ${{ github.repository }}
-          SCOPE_LABEL: ${{ inputs.scope_label }}
-          SCOPE_DESC: ${{ inputs.scope_desc }}
-          THEMES: ${{ inputs.themes }}
+          # Resolved knobs (BE-5227) rather than raw inputs — see the `gate` job's
+          # resolve step for the precedence.
+          SCOPE_LABEL: ${{ fromJSON(needs.gate.outputs.resolved).scope_label }}
+          SCOPE_DESC: ${{ fromJSON(needs.gate.outputs.resolved).scope_desc }}
+          THEMES: ${{ fromJSON(needs.gate.outputs.resolved).themes }}
+          # Path scoping is deliberately NOT here — #83 owns it, via a `path` input
+          # backed by .github/groom/scope.py, and it also teaches interval.py not to
+          # reset the cadence when the scope narrows. An earlier revision of this PR
+          # carried a competing `paths` knob; it was dropped rather than merged into
+          # a second implementation of the same feature. Once #83 lands, add `path`
+          # to config.py's _OPERATIONAL_KEYS and to the DEFAULTS block in `gate` and
+          # the knob becomes variable-tunable with no further wiring.
         run: |
           set -euo pipefail
           # Substitute the {{DOUBLE_BRACE}} placeholders. python str.replace is
@@ -561,7 +661,7 @@ jobs:
           # a workspace path — lands verbatim. Values are runner-controlled and
           # confined to safe charsets (repo slugs, paths, a short theme list).
           python3 - <<'PY'
-          import os
+          import json, os
           repo = os.environ["REPO"]
           subs = {
               "{{REPO}}": repo,
@@ -629,7 +729,7 @@ jobs:
           # permissions are contents:read, so even the implicit github.token
           # cannot write. The agent's sole output is the local FINDER_OUT file.
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          MODEL: ${{ inputs.model }}
+          MODEL: ${{ fromJSON(needs.gate.outputs.resolved).model }}
           # Neutralize git's pager escape hatch: `Bash(git log:*)` /
           # `Bash(git show:*)` are PREFIX matches, so a prompt-injected agent could
           # otherwise reach a pager and execute an arbitrary command from a single
@@ -883,8 +983,8 @@ jobs:
       - name: Build verifier prompt
         env:
           REPO: ${{ github.repository }}
-          SCOPE_LABEL: ${{ inputs.scope_label }}
-          SCOPE_DESC: ${{ inputs.scope_desc }}
+          SCOPE_LABEL: ${{ fromJSON(needs.gate.outputs.resolved).scope_label }}
+          SCOPE_DESC: ${{ fromJSON(needs.gate.outputs.resolved).scope_desc }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -928,7 +1028,7 @@ jobs:
         working-directory: ${{ env.GROOM_CLONE }}
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          MODEL: ${{ inputs.model }}
+          MODEL: ${{ fromJSON(needs.gate.outputs.resolved).model }}
           # Neutralize git's pager escape hatch — see the finder job for the note.
           GIT_PAGER: cat
           PAGER: cat
@@ -1180,7 +1280,7 @@ jobs:
           GH_TOKEN: ${{ steps.bot_token.outputs.token || github.token }}
           REPO: ${{ github.repository }}
           BUILDER: ${{ inputs.builder }}
-          MAX_PRS: ${{ inputs.max_prs }}
+          MAX_PRS: ${{ fromJSON(needs.gate.outputs.resolved).max_prs }}
         run: |
           set -euo pipefail
           # Keep only CONFIRM/DOWNGRADE survivors (REJECT is dropped), same rule
@@ -1320,7 +1420,7 @@ jobs:
           path: /tmp
 
       - name: Ensure groom labels exist
-        if: ${{ inputs.dry_run != true }}
+        if: ${{ fromJSON(needs.gate.outputs.resolved).dry_run != true }}
         env:
           # Bot token when configured, else the caller's github.token — which
           # only carries issues:write if the CALLER granted it (a reusable
@@ -1344,9 +1444,9 @@ jobs:
           # else github-actions[bot]. This is the ONLY credentialed write.
           GH_TOKEN: ${{ steps.bot_token.outputs.token || github.token }}
           REPO: ${{ github.repository }}
-          MAX_FINDINGS: ${{ inputs.max_findings }}
-          SCOPE_LABEL: ${{ inputs.scope_label }}
-          DRY_RUN: ${{ inputs.dry_run }}
+          MAX_FINDINGS: ${{ fromJSON(needs.gate.outputs.resolved).max_findings }}
+          SCOPE_LABEL: ${{ fromJSON(needs.gate.outputs.resolved).scope_label }}
+          DRY_RUN: ${{ fromJSON(needs.gate.outputs.resolved).dry_run }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -1557,7 +1657,7 @@ jobs:
           # cannot write. The agent's sole outputs are files under repo/ (the
           # edits) + the BUILDER_OUT control file.
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          MODEL: ${{ inputs.model }}
+          MODEL: ${{ fromJSON(needs.gate.outputs.resolved).model }}
           # Neutralize git's pager escape hatch — see the finder job for the note.
           GIT_PAGER: cat
           PAGER: cat
@@ -1903,7 +2003,7 @@ jobs:
         # Honor the dry-run contract (preview without mutating the target repo) —
         # matches the file job's label step guard. A dry run opens no PR/issue, so
         # it needs no labels.
-        if: ${{ inputs.dry_run != true }}
+        if: ${{ fromJSON(needs.gate.outputs.resolved).dry_run != true }}
         env:
           GH_TOKEN: ${{ steps.bot_token.outputs.token }}
           REPO: ${{ github.repository }}
@@ -1922,7 +2022,7 @@ jobs:
           IDX: ${{ matrix.idx }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           RUN_ID: ${{ github.run_id }}
-          DRY_RUN: ${{ inputs.dry_run }}
+          DRY_RUN: ${{ fromJSON(needs.gate.outputs.resolved).dry_run }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
