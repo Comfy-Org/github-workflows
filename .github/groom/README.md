@@ -343,11 +343,39 @@ the `claude_code_version` job output; all three install steps consume that outpu
 via `needs.gate.outputs`. So there is no version literal left in the workflow, and
 a merged bump PR moves every call site at once.
 
+**Which ref the pin is read from — `job.workflow_sha`, not `workflows_ref`.**
+Unlike the briefs and `ledger.py`/`interval.py`, the manifest is *not* loaded
+from `$GROOM_ASSETS`. It gets its own sparse checkout at the commit this
+`groom.yml` itself was read from, i.e. the ref the caller pinned `uses:` to.
+That matters twice over, because this is executable supply chain rather than a
+prompt:
+
+- `workflows_ref` is `required: false` and defaults to the mutable `main`, so a
+  caller that SHA-pins `uses:` but omits it would have *what executes* inside the
+  three agent jobs tracking a branch tip, while the sandbox flags those jobs pass
+  stay frozen at the pinned SHA. Reading from `job_workflow_sha` keeps the CLI
+  version and the flags that depend on it on the same commit, so SHA-pinning
+  `uses:` alone fully pins the CLI.
+- The resolve step fails **closed** on a missing manifest. Read from
+  `workflows_ref`, this repo's documented split-pin state (Dependabot moves
+  `uses:` and leaves `workflows_ref:` behind — see
+  [`.github/dependabot.yml`](../dependabot.yml)) would become a total groom
+  outage. Read from `job.workflow_sha` the case cannot arise: any commit whose
+  `groom.yml` reads the manifest also ships it.
+
+`job.workflow_sha`, **not** `github.job_workflow_sha` — the latter is the
+spelling everyone reaches for and it expands to an empty string inside a
+reusable-workflow job, which Actions does not treat as an error. The populated
+accessor is the `job`-context one added in runner v2.334.0 (April 2026). All
+groom jobs are `ubuntu-latest`, so it is always available; the resolve step
+still re-checks it and emits a `::warning::` if it is ever empty, because the
+failure mode is otherwise invisible.
+
 That resolve step is the **last** step in `gate` and runs only when
-`should_run == 'true'`. It is the one fail-**closed** step in a job whose every
-other step fails open, and a scheduled caller skips ~6 of 7 daily ticks — running
-it eagerly would let a broken manifest (say, at a stale `workflows_ref`) red out
-ticks that were never going to install anything. So on a skipped tick the
+`should_run == 'true'` (as does the checkout that feeds it). It is the one
+fail-**closed** step in a job whose every other step fails open, and a scheduled
+caller skips ~6 of 7 daily ticks — running it eagerly would let a broken manifest
+red out ticks that were never going to install anything. So on a skipped tick the
 `claude_code_version` output is empty; that is expected, and unobservable, since
 every consumer job is itself gated on `should_run`. A bad pin still cannot reach
 `main`, because `tests/test_claude_code_pin.py` runs on any PR touching
@@ -357,8 +385,10 @@ Two rules the tooling enforces, both because the agent CLI is executable supply
 chain for steps that read untrusted repo content:
 
 - **Keep the version exact** — no `^`, `~`, wildcard or dist-tag. The gate step
-  fails the run on anything that is not `X.Y.Z`, and the Dependabot entry sets
-  `versioning-strategy: "increase"` so a bump stays exact.
+  fails the run on anything that is not strict SemVer (no leading zeros, no
+  component past 2^53-1, non-empty prerelease/build identifiers — anything
+  node-semver rejects, npm resolves as a *mutable dist-tag*), and the Dependabot
+  entry sets `versioning-strategy: "increase"` so a bump stays exact.
 - **Bump deliberately** — a CLI release can rename a flag or shift the default
   permission mode, and groom's sandbox is built out of those flags. Re-validate a
   real groom run (`workflow_dispatch` on `ci-groom.yml`) before merging a bump.

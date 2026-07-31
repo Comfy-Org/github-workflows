@@ -35,11 +35,21 @@ _DEPENDABOT = os.path.join(_REPO_ROOT, ".github", "dependabot.yml")
 
 _PACKAGE = "@anthropic-ai/claude-code"
 # Mirrors the gate step's shell guard in groom.yml, and must stay strict for the
-# same reason it is strict there: SemVer's prerelease/build parts are
-# dot-separated NON-EMPTY identifiers, at most one of each, in that order. A
-# looser `([-+][0-9A-Za-z.-]+)*` accepts junk like `1.2.3-a..b`, which npm reads
-# as a mutable dist-tag rather than an exact version — the exact un-pinning the
-# guard exists to reject.
+# same reason it is strict there. Three ways a sloppy pattern admits a spec npm
+# then resolves as a mutable DIST-TAG instead of an exact version — the precise
+# un-pinning the guard exists to reject:
+#   - SemVer prerelease/build parts are dot-separated NON-EMPTY identifiers, at
+#     most one of each, in that order; a looser `([-+][0-9A-Za-z.-]+)*` accepts
+#     junk like `1.2.3-a..b`;
+#   - a bare `[0-9]+` accepts leading zeros (`01.02.03`), which node-semver
+#     rejects;
+#   - a bare `[0-9]+` is unbounded (`9007199254740992.0.0`), and node-semver
+#     rejects any component past 2^53-1.
+# Hence `_NUM` (no leading zeros, at most 15 digits — the widest that cannot
+# exceed 2^53-1) and `_PRE_ID` (the SemVer prerelease-identifier grammar, which
+# also forbids leading zeros on a NUMERIC identifier). Build identifiers stay
+# `[0-9A-Za-z-]+`: SemVer allows leading zeros there, since a build part is
+# never compared numerically.
 #
 # Always matched with `re.fullmatch`, never `assertRegex`/`re.search`, which
 # use `re.search` semantics where `$` also matches just before a trailing
@@ -52,14 +62,17 @@ _PACKAGE = "@anthropic-ai/claude-code"
 # the manifest, so a malformed pin gets rejected at review time instead of
 # being quietly normalized on every groom run forever. An EMBEDDED newline is
 # rejected in both places.
+_NUM = r"(0|[1-9][0-9]{0,14})"
+_PRE_ID = r"(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
 _EXACT_VERSION = re.compile(
-    r"[0-9]+\.[0-9]+\.[0-9]+"
-    r"(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?"
+    rf"{_NUM}\.{_NUM}\.{_NUM}"
+    rf"(-{_PRE_ID}(\.{_PRE_ID})*)?"
     r"(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?"
 )
-# Any `<pkg>@<something>` literal in the workflow. The point is that NO version
-# literal survives, so this is deliberately loose about what follows the `@`.
-_HARDCODED = re.compile(re.escape(_PACKAGE) + r"@(?!\$\{|\")[^\s\"']+")
+# Any `<pkg>@<spec>` occurrence in the workflow. The point is that NO version
+# literal survives, so this is deliberately loose about what follows the `@` —
+# see `_hardcoded_specs` for how a literal is told apart from an expansion.
+_PKG_AT = re.compile(re.escape(_PACKAGE) + r"@(\S+)")
 
 # A job key inside the top-level `jobs:` mapping. GitHub Actions job IDs allow
 # `-` and uppercase, so this deliberately does NOT narrow to `[a-z_]`: a future
@@ -74,17 +87,35 @@ def _read(path):
         return fh.read()
 
 
+def _hardcoded_specs(text):
+    """`<pkg>@<spec>` occurrences whose spec is a LITERAL, not an expansion.
+
+    Keyed on the absence of a `$` expansion rather than on a prefix allowlist:
+    an allowlist of `${` and `"` gets it wrong in both directions — it flags a
+    perfectly valid unbraced `@$CLAUDE_CODE_VERSION`, and it lets a quoted
+    hardcoded `@"2.1.217"` through, which is the regression itself.
+    """
+    return [m.group(1) for m in _PKG_AT.finditer(text) if "$" not in m.group(1)]
+
+
 def _strip_comments(block):
-    """Drop full-line YAML comments.
+    """Drop YAML comments, whole-line and inline.
 
     The `gate` job's prose explains the very things these tests grep for — it
     contains both `npm install -g ...` and the words `needs: gate` — so a raw
     substring scan sees a phantom install step in a job that has none and then
     "proves" it depends on itself. Only executable lines count.
+
+    Inline too, per the YAML rule that a `#` opens a comment only when preceded
+    by whitespace: a correct `needs: gate  # after the interval gate` would
+    otherwise parse the comment text INTO the needs set and red the suite.
     """
-    return "\n".join(
-        line for line in block.splitlines() if not line.lstrip().startswith("#")
-    )
+    out = []
+    for line in block.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        out.append(re.sub(r"\s+#.*$", "", line))
+    return "\n".join(out)
 
 
 def _jobs(text):
@@ -107,18 +138,29 @@ def _dependabot_entries(text):
     `- package-ecosystem:` item, which is all this guard asserts on. Enough to
     tie ecosystem/directory/strategy to the SAME entry without a YAML parser
     (this repo's Python is stdlib-only).
+
+    Surrounding quotes are dropped: `npm` and `"npm"` are the same YAML scalar,
+    so asserting on the quoted spelling would red this guard on a purely
+    cosmetic, semantically identical edit to dependabot.yml.
     """
+
+    def _scalar(raw):
+        raw = raw.strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+            return raw[1:-1]
+        return raw
+
     entries = []
     current = None
     for line in _strip_comments(text).splitlines():
         head = re.match(r"^  - ([a-z-]+):[ \t]*(.*)$", line)
         if head:
-            current = {head.group(1): head.group(2).strip()}
+            current = {head.group(1): _scalar(head.group(2))}
             entries.append(current)
             continue
         key = re.match(r"^    ([a-z-]+):[ \t]*(.*)$", line)
         if key and current is not None:
-            current[key.group(1)] = key.group(2).strip()
+            current[key.group(1)] = _scalar(key.group(2))
     return entries
 
 
@@ -136,11 +178,14 @@ def _needs(block):
     inline = m.group(1).strip()
     if inline:
         return {n.strip().strip("\"'") for n in inline.strip("[]").split(",") if n.strip()}
-    # Block sequence: `needs:` on its own line, then `- name` items.
+    # Block sequence: `needs:` on its own line, then `- name` items. YAML lets
+    # the sequence sit at the KEY's own indentation (`    - gate`) as readily as
+    # indented under it (`      - gate`), and both are what a formatter might
+    # emit — pinning one spelling would red this guard on a correct file.
     tail = _strip_comments(block)[m.end() :]
     out = set()
     for line in tail.splitlines()[1:]:
-        item = re.match(r"^      - (.+)$", line)
+        item = re.match(r"^ {4,8}- (.+)$", line)
         if not item:
             break
         out.add(item.group(1).strip().strip("\"'"))
@@ -168,7 +213,18 @@ class ManifestTest(unittest.TestCase):
         # The pattern above is a MIRROR of groom.yml's gate regex; nothing
         # mechanically keeps the two in step, so pin the shared contract here.
         # These cases are the ones where a sloppy mirror and the shell disagree.
-        for good in ("2.1.217", "1.0.0", "2.1.218-beta.1", "1.0.0+b5", "1.0.0-rc.1+b5"):
+        for good in (
+            "2.1.217",
+            "1.0.0",
+            "0.0.0",
+            "2.1.218-beta.1",
+            "1.0.0+b5",
+            "1.0.0-rc.1+b5",
+            "1.2.3-0a",  # alphanumeric identifier, so a leading 0 is legal
+            "1.2.3-alpha.0",
+            "1.2.3+001",  # leading zeros ARE legal in a build identifier
+            "999999999999999.0.0",  # 15 digits — the widest component allowed
+        ):
             self.assertIsNotNone(_EXACT_VERSION.fullmatch(good), good)
         for bad in (
             "^2.1.217",
@@ -182,6 +238,10 @@ class ManifestTest(unittest.TestCase):
             "1.2.3-a..b",  # empty prerelease identifier -> npm dist-tag, not exact
             "1.2.3-",
             "1.2.3+",
+            "01.02.03",  # leading zeros -> node-semver rejects -> npm dist-tag
+            "1.02.3",
+            "1.2.3-01",  # numeric prerelease identifier, same rule
+            "9007199254740992.0.0",  # 16 digits, past 2^53-1 -> node-semver rejects
         ):
             self.assertIsNone(_EXACT_VERSION.fullmatch(bad), bad)
 
@@ -200,7 +260,11 @@ class WorkflowTest(unittest.TestCase):
         self.groom = _read(_GROOM_YML)
 
     def test_no_hardcoded_version_literal_remains(self):
-        found = _HARDCODED.findall(self.groom)
+        # Scanned WITHOUT `_strip_comments`, unlike the count below: a version
+        # literal sitting in prose is stale documentation the moment Dependabot
+        # bumps the manifest, which is the same rot this PR removed from the
+        # `run:` steps. Reference the pin, never restate it.
+        found = _hardcoded_specs(self.groom)
         self.assertEqual(
             [],
             found,
@@ -208,10 +272,23 @@ class WorkflowTest(unittest.TestCase):
             f".github/groom/package.json via the gate job. Found: {found}",
         )
 
+    def test_hardcoded_scan_keys_on_expansion_not_on_a_prefix(self):
+        # The scan must key on whether the spec EXPANDS, not on how it is
+        # spelled: both directions of a prefix allowlist are regressions.
+        self.assertEqual([], _hardcoded_specs(f'npm i -g {_PACKAGE}@$CLAUDE_CODE_VERSION'))
+        self.assertEqual(
+            [], _hardcoded_specs(f'npm i -g "{_PACKAGE}@${{CLAUDE_CODE_VERSION}}"')
+        )
+        self.assertEqual(['"2.1.217"'], _hardcoded_specs(f'npm i -g {_PACKAGE}@"2.1.217"'))
+        self.assertEqual(["2.1.217"], _hardcoded_specs(f"npm i -g {_PACKAGE}@2.1.217"))
+
     def test_every_install_step_uses_the_gate_output(self):
+        # Comment-stripped: a YAML comment that happens to spell out
+        # `npm install -g <the package>` is not an install site, and counting it
+        # would red this guard even though no executable step changed.
         installs = [
             line
-            for line in self.groom.splitlines()
+            for line in _strip_comments(self.groom).splitlines()
             if "npm install -g" in line and _PACKAGE in line
         ]
         self.assertEqual(
@@ -273,14 +350,14 @@ class DependabotTest(unittest.TestCase):
         # while some other ecosystem entry happened to point at
         # `/.github/groom`, masking exactly the regression this guards.
         entries = _dependabot_entries(_read(_DEPENDABOT))
-        npm = [e for e in entries if e.get("package-ecosystem") == '"npm"']
+        npm = [e for e in entries if e.get("package-ecosystem") == "npm"]
         self.assertEqual(
             1, len(npm), f"expected exactly one npm entry, found {len(npm)}"
         )
-        self.assertEqual('"/.github/groom"', npm[0].get("directory"))
+        self.assertEqual("/.github/groom", npm[0].get("directory"))
         # The workflow guard rejects a range at run time, so the updater must be
         # told to keep an exact requirement exact rather than widening it.
-        self.assertEqual('"increase"', npm[0].get("versioning-strategy"))
+        self.assertEqual("increase", npm[0].get("versioning-strategy"))
 
 
 if __name__ == "__main__":
