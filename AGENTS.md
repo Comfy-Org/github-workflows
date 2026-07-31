@@ -23,6 +23,9 @@ python3 -m unittest discover -s .github/agents-md-integrity/tests -p 'test_*.py'
 # groom dedup/rejection ledger tests
 python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
 
+# pr-risk grader/publisher tests (+ `shellcheck -x .github/pr-risk/grade-risk.sh`)
+python3 -m unittest discover -s .github/pr-risk/tests -p 'test_*.py' -v
+
 # bump-callers shell tests + lint (gh is stubbed; no network)
 shellcheck -x .github/bump-callers/bump-callers.sh .github/bump-callers/tests/test_bump_callers.sh
 bash .github/bump-callers/tests/test_bump_callers.sh
@@ -56,6 +59,10 @@ tests — run the matching command above for whatever you touched.
   gate (`GROOM_INTERVAL_DAYS`) that early-exits a daily tick unless the interval
   has elapsed since the last real run (derived from Actions run history — no new
   secret). Tests in `tests/`.
+- `.github/pr-risk/` — behind `pr-risk.yml`: `grade-risk.sh` (entrypoint, always
+  exits 0), `grade_risk.py` (pure grader + renderers), `publish_risk.py` (label /
+  Check Run / sticky comment / dispute checkbox). `RISK_RULES` + the escalation
+  thresholds are a FIRST CUT that BE-5507 replaces in place. Tests in `tests/`.
 - `.github/bump-callers/` — `bump-callers.sh`, the ONE fleet-agnostic script
   that opens SHA-bump PRs in consumer repos when a reusable workflow changes.
   Tests in `tests/`.
@@ -76,6 +83,10 @@ tests — run the matching command above for whatever you touched.
   creds; briefs live in `.github/groom/`. Opt-in auto-builder (`builder: true`,
   BE-4003) turns the top CONFIRMED findings into review-gated PRs (never
   auto-merged) via a credential-free patch job + a separate bot PR job.
+- `pr-risk.yml` — **non-blocking** PR risk grade (R0..R3): one `risk:R*` label, a
+  `neutral` Check Run, a sticky comment (breakdown + concentration + dispute box).
+  Re-grades every push (caller MUST send `synchronize`); unknown stays unknown,
+  never `risk:R0`. `mode: shadow` = Check Run only. Never gates.
 - `agents-md-integrity.yml` — enforces the AGENTS.md standard on the caller repo.
 - `assign-reviewers.yml` — expertise-aware, load-balanced reviewer requests.
 - `assign-prs-to-author.yml` — assigns unassigned open PRs to their author.
@@ -139,4 +150,5 @@ tests — run the matching command above for whatever you touched.
 - [`README.md`](README.md) — public catalog, SHA-pin usage, versioning.
 - [`.github/cursor-review/README.md`](.github/cursor-review/README.md) — review panel internals + adoption.
 - [`.github/agents-md-integrity/README.md`](.github/agents-md-integrity/README.md) — the checker + its knobs.
+- [`.github/pr-risk/README.md`](.github/pr-risk/README.md) — the risk grader, its map, and adoption.
 - [`.github/bump-callers/README.md`](.github/bump-callers/README.md) — the shared bumper + its fleets.

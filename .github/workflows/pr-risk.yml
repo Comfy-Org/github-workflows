@@ -1,0 +1,411 @@
+name: PR Risk Grade (reusable)
+
+# Non-blocking risk grading for pull requests. Grades a PR's net diff into a
+# tier — R0 (trivial) .. R3 (needs a careful read) — and PUBLISHES that grade
+# three ways so reviewers can sort a deep queue by how much attention a change
+# actually needs (`is:pr is:open label:risk:R0`).
+#
+# NOTHING IS GATED. The Check Run's conclusion is hardcoded `neutral`, the
+# grader always exits 0, and every publish step is best-effort: this workflow
+# cannot fail a PR, cannot block a merge, and is not safe to make a required
+# check even if someone tries. No automation consumes the label — it exists for
+# humans to filter by.
+#
+# What it publishes:
+#   label       exactly one `risk:R0`..`risk:R3` at any time. Stale tiers are
+#               removed on every re-grade, so a PR that grows from R0 into R3
+#               carries `risk:R3` and only `risk:R3`.
+#   check run   "PR risk (advisory)" — immutable, timestamped, attached to the
+#               head commit, carrying the tier AND the reason it was assigned.
+#               This is the per-change audit artifact.
+#   comment     ONE sticky comment (hidden marker `<!-- ci-pr-risk -->`),
+#               updated in place on every re-grade rather than duplicated per
+#               push, carrying the per-file breakdown, the risk concentration
+#               ("94% of this diff is R0/R1; the 6% that makes it R3 is these
+#               two files, 40 lines"), and a "this grade is wrong" checkbox.
+#
+# RE-GRADES ON EVERY PUSH. This is the load-bearing requirement, not a
+# nice-to-have: a grade that goes stale is worse than no grade, because it
+# spends trust that does not come back. The caller MUST include `synchronize`
+# in its trigger types (see the caller pattern below); the label is recomputed
+# and replaced on each run.
+#
+# UNKNOWN IS PUBLISHED AS UNKNOWN. A PR the grader could not read gets NO tier
+# and says so — in the Check Run, in the comment, and by carrying no `risk:*`
+# label. It is never defaulted to `risk:R0` and never silently skipped.
+#
+# Shadow mode (`mode: shadow`, the DEFAULT) publishes ONLY the Check Run — the
+# audit artifact — and no label, no comment. That is the feature-flag
+# equivalent for a CI surface: adopting repos see the grades accumulating on
+# commits before any reviewer-facing surface changes. Flip to `mode: publish`
+# to put the tier on the PR.
+#
+# Two-job security split, as pr-size.yml does it: the `grade` job runs against
+# PR code with a read-only token and NO write credentials; the `publish` job
+# holds the bot write token, checks out NO PR code, and receives the report as
+# an artifact — so a write-scoped token is never present in a job that touched
+# PR-authored content.
+#
+# Grading logic + its unit tests live in .github/pr-risk/ in THIS repo and are
+# loaded at run time from a pinned ref of THIS repo, never from the caller's
+# checkout — a pull request cannot rewrite the logic grading it.
+#
+# The risk map itself (`RISK_RULES` and the escalation thresholds in
+# grade_risk.py) is a documented FIRST CUT. BE-5507 owns deriving and tuning
+# it from a backfill over merged history; when that lands, the table is
+# replaced in place and nothing else moves.
+#
+# Caller pattern (place in consumer repo at .github/workflows/ci-pr-risk.yml):
+#
+#   name: CI - PR Risk Grade
+#   on:
+#     pull_request:
+#       # `synchronize` is what makes the grade re-compute on every push — it
+#       # is REQUIRED, not optional. labeled/unlabeled keep the grade current
+#       # when a label changes; reopened re-grades a revived PR.
+#       types: [opened, synchronize, reopened, labeled, unlabeled]
+#     issue_comment:
+#       # Records a reviewer ticking the "this grade is wrong" checkbox on the
+#       # sticky comment. Omit this trigger to skip the disagreement stream;
+#       # everything else still works.
+#       types: [edited]
+#   permissions:
+#     contents: read
+#     checks: write          # the Check Run
+#     pull-requests: write   # the label + the sticky comment
+#   jobs:
+#     pr-risk:
+#       uses: Comfy-Org/github-workflows/.github/workflows/pr-risk.yml@<sha>  # v1
+#       with:
+#         # Default is `shadow` (Check Run only). Opt in to the reviewer-facing
+#         # label + comment with `publish`.
+#         mode: shadow
+#         # Pin the tool ref to the same ref you pin `uses:` to.
+#         workflows_ref: <sha>
+#         # Optional: publish under your GitHub App instead of GITHUB_TOKEN.
+#         # REQUIRED for fork PRs, whose GITHUB_TOKEN is read-only.
+#         bot_app_id: ${{ vars.APP_ID }}
+#       secrets:
+#         BOT_APP_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+#
+# GitHub rejects a caller that grants LESS than a called job requests, so the
+# `checks: write` + `pull-requests: write` grant above is required at startup
+# even in shadow mode.
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: >-
+          `shadow` (default) publishes ONLY the Check Run — no label, no
+          comment — so a repo can accumulate grades before any reviewer-facing
+          surface changes. `publish` additionally applies the `risk:R*` label
+          and the sticky comment. NEITHER mode ever gates: no value of this
+          input can fail a check or block a merge.
+        type: string
+        required: false
+        default: shadow
+      comment:
+        description: >-
+          Post the sticky risk comment (only consulted when `mode: publish`).
+          Set false for label + Check Run only.
+        type: boolean
+        required: false
+        default: true
+      bot_app_id:
+        description: >-
+          GitHub App ID used to publish (paired with the BOT_APP_PRIVATE_KEY
+          secret). App IDs aren't secret, so this is an input. Optional — when
+          absent the workflow falls back to GITHUB_TOKEN, which works for
+          same-repo PRs but is READ-ONLY on fork PRs, where publishing then
+          degrades to the step summary.
+        type: string
+        required: false
+        default: ''
+      workflows_ref:
+        description: >-
+          Ref of Comfy-Org/github-workflows to load the pr-risk scripts from.
+          Pin this to the same ref you pin `uses:` to for reproducibility.
+        type: string
+        required: false
+        default: main
+    secrets:
+      BOT_APP_PRIVATE_KEY:
+        description: >-
+          PEM private key matching bot_app_id. Required only when bot_app_id is
+          set.
+        required: false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Grade: runs against PR code, holds NO write credentials.
+  # ---------------------------------------------------------------------------
+  grade:
+    name: Grade PR risk
+    # `pull_request` only — deliberately NOT `pull_request_target`. This job
+    # checks out PR head code, and the fork case is solved properly by the
+    # two-job split below (the publish job holds the token and no PR code)
+    # rather than by handing a privileged context a PR checkout.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    concurrency:
+      # A superseded push must never win the race and republish a stale grade
+      # over a newer one — that is precisely the stale-classifier failure this
+      # workflow exists to avoid. Each job has its own group prefix so a
+      # checkbox edit and a push never cancel each other, and the PR number
+      # falls back to `issue.number` so an issue_comment run (where this job is
+      # skipped) cannot land in a shared, PR-agnostic group.
+      group: pr-risk-grade-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Full history for all refs, so the base SHA and the merge-base
+          # three-dot diff resolve without a separate authenticated fetch.
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Load pr-risk grader
+        # The grader comes from THIS workflow's repo (public, pinned via
+        # workflows_ref) — never from the PR checkout, so a PR cannot rewrite
+        # the logic grading it, and no PR-authored code runs in this job.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _pr_risk_tool
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Grade the diff
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -uo pipefail
+          # Drop anything the PR checkout could have pre-seeded under the tool
+          # path (such files are untracked in the tool repo, which checkout
+          # does not remove), so we run only the pinned sources.
+          git -C _pr_risk_tool clean -ffdx || true
+          # grade-risk.sh always exits 0 — an ungradable diff is reported as
+          # status "unknown", never as a failed check. The `if !` and the
+          # trailing `exit 0` are belt-and-braces on that contract: this step
+          # must not be able to redden a PR's checks even if the grader is
+          # outright broken, because nothing here is allowed to gate. A broken
+          # grader surfaces as the publish job's "degraded mode" note instead.
+          # --marker is deliberately NOT passed: the grader and the publisher
+          # must agree on which hidden marker identifies "our" sticky comment,
+          # or a re-grade would post a second comment instead of updating the
+          # first. Both default to the same constant, and a unit test asserts
+          # they stay equal — one place to change, not three.
+          if ! bash _pr_risk_tool/.github/pr-risk/grade-risk.sh \
+            --base "${BASE_SHA}" \
+            --head "${HEAD_SHA}" \
+            --out-dir "${RUNNER_TEMP}/risk" \
+            --repo-dir . 2>&1 | tee -a "${GITHUB_STEP_SUMMARY}"; then
+            echo "grade-risk.sh exited non-zero, which by design it should not. Publishing will report degraded mode. Nothing is gated on this check, so no PR is blocked."
+          fi
+          exit 0
+
+      # Hand the rendered report to the isolated `publish` job below. Uploaded
+      # as an artifact (not a job output) so the job holding the bot write
+      # token never runs in the same context as the PR checkout.
+      - name: Upload risk report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: pr-risk-report
+          path: |
+            ${{ runner.temp }}/risk/risk-report.json
+            ${{ runner.temp }}/risk/risk-comment.md
+            ${{ runner.temp }}/risk/risk-check.md
+          if-no-files-found: warn
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Publish: holds the write token, checks out NO PR code.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: Publish risk grade
+    needs: grade
+    # always(): a grade job that somehow failed still leaves the artifact, and
+    # the interesting case is exactly the degraded one.
+    if: always() && needs.grade.result != 'cancelled' && needs.grade.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+    concurrency:
+      group: pr-risk-publish-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: true
+    steps:
+      - name: Load pr-risk publisher
+        # The ONLY checkout in this job: this repo's own pinned scripts. No PR
+        # code is ever present alongside the write token.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _pr_risk_tool
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Download risk report
+        id: dl
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: pr-risk-report
+          path: risk
+
+      - name: Mint bot token
+        # Best-effort. A consumer whose app lacks the requested scope must
+        # degrade to a step summary, never get a red check from an advisory
+        # workflow — so a failed mint is tolerated rather than failing the job.
+        if: inputs.bot_app_id != '' && steps.dl.outcome == 'success'
+        id: bot
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          app-id: ${{ inputs.bot_app_id }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+          # Exactly what the publisher uses: `checks` for the Check Run,
+          # `pull-requests` for the label and the sticky comment (the
+          # issues-comments API on a PULL REQUEST is governed by the app's
+          # Pull requests permission, not Issues).
+          permission-checks: write
+          permission-pull-requests: write
+
+      - name: Publish label, Check Run and sticky comment
+        id: publish
+        # Advisory contract: this workflow may never redden a PR's checks. A
+        # runtime failure here (missing scope, 403 on a fork PR's read-only
+        # GITHUB_TOKEN, rate limit, 5xx) is reported by "Note degraded mode"
+        # below instead of failing the job.
+        if: steps.dl.outcome == 'success'
+        continue-on-error: true
+        env:
+          # Prefer the bot token; fall back to GITHUB_TOKEN, which is
+          # sufficient for same-repo PRs and read-only on forks.
+          GH_TOKEN_BOT: ${{ steps.bot.outputs.token }}
+          GITHUB_TOKEN: ${{ steps.bot.outputs.token || github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MODE: ${{ inputs.mode }}
+          WANT_COMMENT: ${{ inputs.comment }}
+        run: |
+          set -euo pipefail
+          if [ ! -s risk/risk-report.json ] || [ ! -s risk/risk-check.md ]; then
+            echo "Report artifact empty — the grader crashed before rendering; leaving any existing label and comment untouched."
+            exit 0
+          fi
+          COMMENT_ARG=()
+          if [ "${WANT_COMMENT}" = "true" ]; then
+            COMMENT_ARG=(--comment risk/risk-comment.md)
+          fi
+          python3 _pr_risk_tool/.github/pr-risk/publish_risk.py publish \
+            --repo "${REPO}" \
+            --pr "${PR_NUMBER}" \
+            --sha "${HEAD_SHA}" \
+            --report risk/risk-report.json \
+            --check risk/risk-check.md \
+            --mode "${MODE}" \
+            "${COMMENT_ARG[@]}"
+
+      - name: Note degraded mode
+        # Covers every path where nothing was published, so the job never goes
+        # green silently: artifact missing (the grade job died before
+        # uploading) or the publish call failed at runtime. The rendered report
+        # is always in the grade job's step summary regardless.
+        if: steps.dl.outcome != 'success' || steps.publish.outcome == 'failure'
+        env:
+          DL: ${{ steps.dl.outcome }}
+          BOT: ${{ steps.bot.outcome }}
+        run: |
+          if [ "${DL}" != "success" ]; then
+            echo "Nothing published: the risk report artifact could not be downloaded (the grade job likely failed before uploading it). Check the grade job logs."
+          else
+            echo "Nothing published: the publish step failed at runtime — see the 'Publish label, Check Run and sticky comment' step log for the actual error. Common causes: the caller granted less than checks:write + pull-requests:write; a fork PR whose GITHUB_TOKEN is read-only and no bot_app_id was supplied (mint outcome: ${BOT:-skipped}); a rate limit or 5xx."
+            echo "The full grade is in the grade job's step summary either way. Nothing is gated on this workflow, so no PR is blocked by this."
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Dispute: records a reviewer ticking "this grade is wrong" on the sticky
+  # comment, as a `risk-grade-disputed` label — a queryable stream of real
+  # reviewer disagreement to tune the risk map against. Checks out no PR code.
+  # ---------------------------------------------------------------------------
+  dispute:
+    name: Record grade dispute
+    # Only comment EDITS, only on pull requests, and only on a comment authored
+    # by a bot — our sticky comment is always posted by the app (or by
+    # github-actions[bot]), so this cannot be driven by an arbitrary user
+    # pasting the marker into their own comment.
+    if: >-
+      github.event_name == 'issue_comment'
+      && github.event.issue.pull_request != null
+      && github.event.comment.user.type == 'Bot'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    concurrency:
+      group: pr-risk-dispute-${{ github.event.issue.number }}
+      cancel-in-progress: true
+    steps:
+      - name: Load pr-risk publisher
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _pr_risk_tool
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Mint bot token
+        if: inputs.bot_app_id != ''
+        id: bot
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
+        with:
+          app-id: ${{ inputs.bot_app_id }}
+          private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
+          permission-pull-requests: write
+
+      - name: Record the checkbox state
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ steps.bot.outputs.token || github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          # Via env, never interpolated into the script body: a comment body is
+          # attacker-controlled text and must not reach the shell as code.
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          set -euo pipefail
+          printf '%s' "${COMMENT_BODY}" > edited-comment.md
+          # No-ops (and says so) unless the edited comment is our sticky one.
+          python3 _pr_risk_tool/.github/pr-risk/publish_risk.py dispute \
+            --repo "${REPO}" \
+            --pr "${PR_NUMBER}" \
+            --body edited-comment.md

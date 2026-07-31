@@ -1,0 +1,52 @@
+name: Test pr-risk scripts
+
+# Runs the unit tests (+ shellcheck) for the risk grader and publisher behind
+# pr-risk.yml. The grader decides which tier every PR in an adopting repo is
+# labelled with, and the publisher owns the "exactly one risk:* label" and
+# "unknown is never R0" invariants — a regression in either silently mislabels
+# the queue reviewers are sorting by, which spends trust that does not come
+# back. Cheap to guard with a unit run on change.
+
+on:
+  pull_request:
+    paths:
+      - '.github/pr-risk/**'
+      - '.github/workflows/pr-risk.yml'
+      - '.github/workflows/test-pr-risk.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/pr-risk/**'
+      - '.github/workflows/pr-risk.yml'
+      - '.github/workflows/test-pr-risk.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: unittest + shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Shellcheck the grader entrypoint
+        run: shellcheck -x .github/pr-risk/grade-risk.sh
+
+      - name: Run pr-risk unit tests
+        # The grade-risk.sh end-to-end cases build throwaway git repos, so give
+        # git an identity the runner does not have by default.
+        env:
+          GIT_AUTHOR_NAME: pr-risk-tests
+          GIT_AUTHOR_EMAIL: pr-risk-tests@example.invalid
+          GIT_COMMITTER_NAME: pr-risk-tests
+          GIT_COMMITTER_EMAIL: pr-risk-tests@example.invalid
+        run: python3 -m unittest discover -s .github/pr-risk/tests -p 'test_*.py' -v
