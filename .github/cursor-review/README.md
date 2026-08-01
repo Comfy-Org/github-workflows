@@ -115,7 +115,7 @@ jobs:
       diff_excludes: >-
         :!**/package-lock.json
         :!**/*.generated.*
-      # Pin the prompts/scripts to the same ref you pin `uses:` to.
+      # REQUIRED — the same SHA as the `uses:` pin above.
       workflows_ref: <sha>
     secrets:
       CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
@@ -194,7 +194,7 @@ descriptions live in the [workflow header](../workflows/cursor-review.yml).
 | `diff_size_cap` | `5000` | Max changed lines (after excludes); larger PRs are skipped. |
 | `review_label` | `cursor-review` | Label whose addition triggers the review. |
 | `diff_excludes` | lockfiles, `node_modules`, `dist`, `vendor`, minified/generated files | Pathspecs excluded from both the size count and the reviewed diff. |
-| `workflows_ref` | `main` | Ref this directory's prompts/scripts are loaded from. Pin to your `uses:` SHA. |
+| `workflows_ref` | **required** (no default) | Ref this directory's prompts/scripts are loaded from. Must be the same commit SHA as your `uses:` pin — omit it and the run fails fast, because pinning `uses:` while loading scripts from a mutable branch defeats the pin. |
 | `bot_app_id` | `''` | Optional GitHub App ID; when set (with `BOT_APP_PRIVATE_KEY`), the review posts under that App's identity instead of `github-actions[bot]`. |
 | `blocking` | `false` | Opt-in merge gate. `true` fails the **Blocking gate** check while any cursor-review finding thread is unresolved. See [Make the review blocking](#optional-make-the-review-blocking-merge-gate). |
 

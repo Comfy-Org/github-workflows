@@ -1,0 +1,66 @@
+name: Test workflow pins
+
+# Regression lint (BE-5546): no reusable workflow here may give its
+# `workflows_ref` input a `default:`. A default lets a caller SHA-pin `uses:`
+# and still load this repo's scripts from a MUTABLE branch, into jobs holding
+# write permissions — the pin then proves nothing. Removing that default is a
+# one-line edit to undo, so it is guarded by CI rather than by convention.
+#
+# Runs on every workflow-file change (not just the three fixed ones) so a
+# workflow added later is covered the day it lands.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - '.github/workflow-pins/**'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/**'
+      - '.github/workflow-pins/**'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: unittest + lint this repo
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Run workflow-pins unit tests
+        run: python3 -m unittest discover -s .github/workflow-pins/tests -p 'test_*.py' -v
+
+      - name: Lint this repo's workflows
+        run: python3 .github/workflow-pins/check_workflow_pins.py
+
+      - name: Smoke test — a reintroduced default fails the lint
+        run: |
+          # Proves the lint is wired to FAIL, not just to run: the unit tests
+          # exercise the parser, this exercises the CLI's exit status.
+          dir="$(mktemp -d)"
+          cat > "$dir/regressed.yml" <<'YAML'
+          name: Regressed
+          on:
+            workflow_call:
+              inputs:
+                workflows_ref:
+                  type: string
+                  required: false
+                  default: main
+          YAML
+          if python3 .github/workflow-pins/check_workflow_pins.py --workflows-dir "$dir"; then
+            echo "::error::lint passed a workflow with a workflows_ref default — expected a non-zero exit"
+            exit 1
+          fi
+          echo "lint correctly rejected the reintroduced default"

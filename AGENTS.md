@@ -27,7 +27,10 @@ python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
 shellcheck -x .github/bump-callers/bump-callers.sh .github/bump-callers/tests/test_bump_callers.sh
 bash .github/bump-callers/tests/test_bump_callers.sh
 
-# run the AGENTS.md integrity checker against any repo tree
+# workflow-pins lint (no reusable workflow may default `workflows_ref`) + its tests
+python3 -m unittest discover -s .github/workflow-pins/tests -p 'test_*.py' && python3 .github/workflow-pins/check_workflow_pins.py
+
+# AGENTS.md integrity checker against any repo tree
 python3 .github/agents-md-integrity/check_agents_md.py --root .
 ```
 
@@ -56,6 +59,7 @@ tests — run the matching command above for whatever you touched.
   gate (`GROOM_INTERVAL_DAYS`) that early-exits a daily tick unless the interval
   has elapsed since the last real run (derived from Actions run history — no new
   secret). Tests in `tests/`.
+- `.github/workflow-pins/` — `check_workflow_pins.py` + `tests/`: the lint forbidding a `default:` on a `workflow_call` workflow's `workflows_ref`.
 - `.github/bump-callers/` — `bump-callers.sh`, the ONE fleet-agnostic script
   that opens SHA-bump PRs in consumer repos when a reusable workflow changes.
   Tests in `tests/`.
@@ -101,6 +105,10 @@ tests — run the matching command above for whatever you touched.
 - **Pin everything by full commit SHA**, with a trailing `# v1` comment — both
   the `uses:` in callers and every third-party action here. Bare `@v1` fails the
   pin-validation (`pinact`, `zizmor`) that consumer CI runs. See README "Usage".
+- **`workflows_ref` is REQUIRED, never given a `default:`** (BE-5546) — a default
+  lets a caller SHA-pin `uses:` yet load mutable scripts, and `required:` is
+  unenforced for `workflow_call` (omitted → `''` → `actions/checkout` takes the
+  default branch) — hence the empty-ref guard before every assets checkout.
 - **Scripts are the single source of truth**, loaded at run time from a pinned
   ref of THIS repo — never from the caller's checkout. That's what makes the
   reviewer/checker tamper-proof: a PR can't rewrite the logic judging it. The

@@ -40,6 +40,8 @@ The SHA-pin format satisfies pin-validation tooling (`pinact`, `zizmor`, etc.) a
 
 A bare `@v1` tag is technically allowed but **will fail** in repos that run pin-validation in CI (e.g. `cloud`, `ComfyUI_frontend`).
 
+Workflows that load their backing scripts at run time take a `workflows_ref` input — always set it to the *same* commit SHA you pin `uses:` to. Pinning only `uses:` runs a pinned workflow that loads **mutable** scripts from a floating branch, which defeats the pin. On `cursor-review.yml`, `groom.yml`, and `agents-md-integrity.yml` the input is **required with no default** and the run fails fast when it is empty or omitted (GitHub does not enforce `required: true` for `workflow_call` inputs, so those workflows check at run time).
+
 Per-workflow inputs, required secrets, and triggers are documented in each workflow file's header comment.
 
 ## Versioning
