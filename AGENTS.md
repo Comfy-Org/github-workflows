@@ -59,7 +59,7 @@ tests — run the matching command above for whatever you touched.
   gate (`GROOM_INTERVAL_DAYS`) that early-exits a daily tick unless the interval
   has elapsed since the last real run (derived from Actions run history — no new
   secret). Tests in `tests/`.
-- `.github/workflow-pins/` — `check_workflow_pins.py` + `tests/`: the lint forbidding a `default:` on a `workflow_call` workflow's `workflows_ref`.
+- `.github/workflow-pins/` — `check_workflow_pins.py` + `tests/`: the lint forbidding a `default:` on a `workflow_call` workflow's `workflows_ref`, and requiring the empty-ref guard in every job that checks out at it.
 - `.github/bump-callers/` — `bump-callers.sh`, the ONE fleet-agnostic script
   that opens SHA-bump PRs in consumer repos when a reusable workflow changes.
   Tests in `tests/`.
@@ -108,7 +108,7 @@ tests — run the matching command above for whatever you touched.
 - **`workflows_ref` is REQUIRED, never given a `default:`** (BE-5546) — a default
   lets a caller SHA-pin `uses:` yet load mutable scripts, and `required:` is
   unenforced for `workflow_call` (omitted → `''` → `actions/checkout` takes the
-  default branch) — hence the empty-ref guard before every assets checkout.
+  default branch) — hence the empty-ref guard, in the checkout's OWN job.
 - **Scripts are the single source of truth**, loaded at run time from a pinned
   ref of THIS repo — never from the caller's checkout. That's what makes the
   reviewer/checker tamper-proof: a PR can't rewrite the logic judging it. The

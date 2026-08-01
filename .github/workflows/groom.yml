@@ -417,12 +417,19 @@ jobs:
         env:
           WORKFLOWS_REF: ${{ inputs.workflows_ref }}
         run: |
-          if [ -z "$WORKFLOWS_REF" ]; then
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form, and echo only that: dropping
+          # newlines also stops a multi-line value from smuggling a ::workflow
+          # command:: into the log, and from satisfying the line-oriented grep
+          # below on one 40-hex line among many.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
             echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
             exit 1
           fi
-          if ! printf '%s' "$WORKFLOWS_REF" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "::warning::workflows_ref '$WORKFLOWS_REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
           fi
 
       - name: Load groom assets (interval gate)
@@ -656,12 +663,19 @@ jobs:
         env:
           WORKFLOWS_REF: ${{ inputs.workflows_ref }}
         run: |
-          if [ -z "$WORKFLOWS_REF" ]; then
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form, and echo only that: dropping
+          # newlines also stops a multi-line value from smuggling a ::workflow
+          # command:: into the log, and from satisfying the line-oriented grep
+          # below on one 40-hex line among many.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
             echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
             exit 1
           fi
-          if ! printf '%s' "$WORKFLOWS_REF" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "::warning::workflows_ref '$WORKFLOWS_REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
           fi
 
       - name: Load groom assets (briefs)
@@ -1006,12 +1020,19 @@ jobs:
         env:
           WORKFLOWS_REF: ${{ inputs.workflows_ref }}
         run: |
-          if [ -z "$WORKFLOWS_REF" ]; then
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form, and echo only that: dropping
+          # newlines also stops a multi-line value from smuggling a ::workflow
+          # command:: into the log, and from satisfying the line-oriented grep
+          # below on one 40-hex line among many.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
             echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
             exit 1
           fi
-          if ! printf '%s' "$WORKFLOWS_REF" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "::warning::workflows_ref '$WORKFLOWS_REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
           fi
 
       - name: Load groom assets (briefs)
@@ -1320,12 +1341,19 @@ jobs:
         env:
           WORKFLOWS_REF: ${{ inputs.workflows_ref }}
         run: |
-          if [ -z "$WORKFLOWS_REF" ]; then
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form, and echo only that: dropping
+          # newlines also stops a multi-line value from smuggling a ::workflow
+          # command:: into the log, and from satisfying the line-oriented grep
+          # below on one 40-hex line among many.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
             echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
             exit 1
           fi
-          if ! printf '%s' "$WORKFLOWS_REF" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "::warning::workflows_ref '$WORKFLOWS_REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
           fi
 
       - name: Load groom assets (ledger)
@@ -1482,12 +1510,19 @@ jobs:
         env:
           WORKFLOWS_REF: ${{ inputs.workflows_ref }}
         run: |
-          if [ -z "$WORKFLOWS_REF" ]; then
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form, and echo only that: dropping
+          # newlines also stops a multi-line value from smuggling a ::workflow
+          # command:: into the log, and from satisfying the line-oriented grep
+          # below on one 40-hex line among many.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
             echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
             exit 1
           fi
-          if ! printf '%s' "$WORKFLOWS_REF" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "::warning::workflows_ref '$WORKFLOWS_REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
           fi
 
       - name: Load groom assets (ledger)
@@ -1681,12 +1716,19 @@ jobs:
         env:
           WORKFLOWS_REF: ${{ inputs.workflows_ref }}
         run: |
-          if [ -z "$WORKFLOWS_REF" ]; then
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form, and echo only that: dropping
+          # newlines also stops a multi-line value from smuggling a ::workflow
+          # command:: into the log, and from satisfying the line-oriented grep
+          # below on one 40-hex line among many.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
             echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
             exit 1
           fi
-          if ! printf '%s' "$WORKFLOWS_REF" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "::warning::workflows_ref '$WORKFLOWS_REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
           fi
 
       - name: Load groom assets (builder brief)
@@ -2083,12 +2125,19 @@ jobs:
         env:
           WORKFLOWS_REF: ${{ inputs.workflows_ref }}
         run: |
-          if [ -z "$WORKFLOWS_REF" ]; then
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form, and echo only that: dropping
+          # newlines also stops a multi-line value from smuggling a ::workflow
+          # command:: into the log, and from satisfying the line-oriented grep
+          # below on one 40-hex line among many.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
             echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
             exit 1
           fi
-          if ! printf '%s' "$WORKFLOWS_REF" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "::warning::workflows_ref '$WORKFLOWS_REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
           fi
 
       - name: Load groom assets (signature marker)

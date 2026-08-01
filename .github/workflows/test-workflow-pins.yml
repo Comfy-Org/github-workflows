@@ -64,3 +64,39 @@ jobs:
             exit 1
           fi
           echo "lint correctly rejected the reintroduced default"
+
+      - name: Smoke test — an unguarded ref checkout fails the lint
+        run: |
+          # The other half of the hole: no default to find, but a job that
+          # checks out at the ref without the fail-fast guard still lets an
+          # omitted input reach `ref: ''` and take the default branch.
+          dir="$(mktemp -d)"
+          # The ref expression goes in via a placeholder, for two reasons: a
+          # literal Actions expression written here would be evaluated when this
+          # run block is rendered (and `inputs` is empty in this workflow), so
+          # the fixture would silently lose the very line under test; and the
+          # lint's own "this file uses the input, so it must declare it" check
+          # would then read this workflow as a consumer it failed to parse.
+          D='$'
+          sed "s|__REF__|${D}{{ inputs.workflows_ref }}|" > "$dir/unguarded.yml" <<'YAML'
+          name: Unguarded
+          on:
+            workflow_call:
+              inputs:
+                workflows_ref:
+                  type: string
+                  required: true
+          jobs:
+            run:
+              runs-on: ubuntu-latest
+              steps:
+                - uses: actions/checkout@abc
+                  with:
+                    ref: __REF__
+          YAML
+          grep -q 'inputs.workflows_ref' "$dir/unguarded.yml"  # fixture intact
+          if python3 .github/workflow-pins/check_workflow_pins.py --workflows-dir "$dir"; then
+            echo "::error::lint passed an unguarded workflows_ref checkout — expected a non-zero exit"
+            exit 1
+          fi
+          echo "lint correctly rejected the unguarded checkout"

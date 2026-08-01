@@ -114,6 +114,117 @@ class FindDefaultsTests(unittest.TestCase):
         # YAML 1.1 turns a bare `on` into True, so some repos quote the key.
         self.assertEqual(len(self._find(_reusable(DEFAULTED).replace("\non:", '\n"on":'))), 1)
 
+    def test_a_trailing_comment_on_the_on_key_is_not_an_inline_trigger_list(self):
+        # `on:  # triggers` is the block form. Reading the comment as an inline
+        # value would drop the whole file from the lint while CI still says OK.
+        text = _reusable(DEFAULTED).replace("\non:\n", "\non:  # when this runs\n")
+        self.assertEqual(len(self._find(text)), 1)
+
+    def test_an_inline_trigger_list_with_a_comment_is_still_skipped(self):
+        self.assertIsNone(self._find("name: F\non: [push]  # only pushes\njobs: {}\n"))
+
+    def test_flow_mapping_default_on_the_input_line_is_caught(self):
+        # The one-line reintroduction: no child lines for a block scan to walk.
+        text = _reusable("").replace(
+            "      workflows_ref:\n",
+            "      workflows_ref: {type: string, required: false, default: main}\n",
+        )
+        hits = self._find(text)
+        self.assertEqual(len(hits), 1, hits)
+        self.assertIn("default: main", text.split("\n")[hits[0] - 1])
+
+    def test_flow_mapping_without_a_default_is_clean(self):
+        text = _reusable("").replace(
+            "      workflows_ref:\n",
+            "      workflows_ref: {type: string, required: true}\n",
+        )
+        self.assertEqual(self._find(text), [])
+
+    def test_a_default_inside_a_folded_description_is_not_a_declaration(self):
+        # `description: >-` continuation lines are indented DEEPER than the
+        # input's own properties. This diff's own prose ("There is deliberately
+        # no default: …") is one reflow away from starting such a line.
+        folded = (
+            "        description: >-\n"
+            "          Ref to load scripts from. There is deliberately no\n"
+            "          default: a floating default would defeat the pin.\n"
+            "        type: string\n"
+            "        required: true\n"
+        )
+        self.assertEqual(self._find(_reusable(folded)), [])
+
+    def test_quoted_keys_do_not_hide_a_declaration_or_a_default(self):
+        # Quoting any of these is valid Actions YAML and must not be an escape
+        # hatch — the same one `on` already had.
+        text = (
+            _reusable(DEFAULTED)
+            .replace("  workflow_call:", '  "workflow_call":')
+            .replace("    inputs:", '    "inputs":')
+            .replace("      workflows_ref:", '      "workflows_ref":')
+            .replace("        default: main", '        "default": main')
+        )
+        self.assertEqual(len(self._find(text)), 1)
+
+
+class GuardCoverageTests(unittest.TestCase):
+    """Every `ref: ${{ inputs.workflows_ref }}` needs the guard in its own job.
+
+    Dropping the default is only half the fix: a NEW job (or a new reusable
+    workflow) that checks out at the ref without the guard reopens the `ref: ''`
+    default-branch fallback, and the default-only lint stays green because it
+    never declared a default to begin with.
+    """
+
+    GUARD = (
+        "      - name: Require a pinned workflows_ref\n"
+        "        env:\n"
+        "          WORKFLOWS_REF: ${{ inputs.workflows_ref }}\n"
+        "        run: |\n"
+        "          exit 1\n"
+    )
+    CHECKOUT = (
+        "      - name: Load assets\n"
+        "        uses: actions/checkout@abc\n"
+        "        with:\n"
+        "          ref: ${{ inputs.workflows_ref }}\n"
+    )
+
+    def _jobs(self, *jobs):
+        text = "name: F\non:\n  workflow_call:\njobs:\n"
+        for i, steps in enumerate(jobs):
+            text += "  job%d:\n    runs-on: ubuntu-latest\n    steps:\n%s" % (i, steps)
+        return cwp.find_unguarded_ref_checkouts(text.split("\n"))
+
+    def test_guarded_checkout_passes(self):
+        self.assertEqual(self._jobs(self.GUARD + self.CHECKOUT), [])
+
+    def test_unguarded_checkout_is_reported(self):
+        self.assertEqual(len(self._jobs(self.CHECKOUT)), 1)
+
+    def test_a_guard_after_the_checkout_does_not_count(self):
+        self.assertEqual(len(self._jobs(self.CHECKOUT + self.GUARD)), 1)
+
+    def test_a_guard_in_another_job_does_not_count(self):
+        # Jobs run independently — job A's guard protects nothing in job B.
+        self.assertEqual(len(self._jobs(self.GUARD, self.CHECKOUT)), 1)
+
+    def test_each_job_is_judged_on_its_own_guard(self):
+        self.assertEqual(self._jobs(self.GUARD + self.CHECKOUT, self.GUARD + self.CHECKOUT), [])
+
+    def test_this_repos_own_workflows_guard_every_ref_checkout(self):
+        root = os.path.normpath(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "workflows")
+        )
+        seen = 0
+        for name in ("cursor-review.yml", "groom.yml", "agents-md-integrity.yml"):
+            with open(os.path.join(root, name), encoding="utf-8") as f:
+                lines = f.read().split("\n")
+            uses = [line for line in lines if cwp._REF_USE_RE.match(line)]
+            self.assertTrue(uses, "%s: no ref checkout found — fixture drifted" % name)
+            seen += len(uses)
+            self.assertEqual(cwp.find_unguarded_ref_checkouts(lines), [], name)
+        self.assertEqual(seen, 12, "expected the 12 guarded sites BE-5546 fixed")
+
 
 class CheckDirTests(unittest.TestCase):
     def setUp(self):
@@ -153,6 +264,89 @@ class CheckDirTests(unittest.TestCase):
         self.assertEqual(len(errors), 1, errors)
         self.assertIn("KNOWN_EXEMPT", errors[0])
         self.assertEqual(exempt_ok, [])
+
+    def test_a_lost_declaration_is_an_error_not_a_silent_skip(self):
+        # The file plainly USES the input, so a declaration must exist. If the
+        # text parser cannot find it, the file is uncovered — which must look
+        # different from "not applicable", not identical to it.
+        self._write(
+            "unparseable.yml",
+            "name: F\n"
+            "on:\n"
+            "  workflow_call:\n"
+            "jobs:\n"
+            "  j:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ inputs.workflows_ref }}\n",
+        )
+        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("NOT covering this file", errors[0])
+        self.assertEqual(checked, [])
+
+    def test_an_unrelated_workflow_is_still_a_silent_skip(self):
+        self._write("unrelated.yml", "name: F\non: [push]\njobs: {}\n")
+        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        self.assertEqual((errors, checked), ([], []))
+
+    def test_an_unguarded_ref_checkout_fails_the_lint(self):
+        self._write(
+            "leaky.yml",
+            _reusable(PINNED).replace(
+                "      - run: echo hi\n",
+                "      - uses: actions/checkout@abc\n"
+                "        with:\n"
+                "          ref: ${{ inputs.workflows_ref }}\n",
+            ),
+        )
+        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("no empty-ref guard", errors[0])
+        self.assertEqual(checked, ["leaky.yml"])
+
+    def test_an_exempt_workflow_is_not_held_to_the_guard(self):
+        # It still has its default, so an omitted input never reaches checkout
+        # as '' — the guard only becomes required when the default goes.
+        self._write(
+            "legacy.yml",
+            _reusable(DEFAULTED).replace(
+                "      - run: echo hi\n",
+                "      - uses: actions/checkout@abc\n"
+                "        with:\n"
+                "          ref: ${{ inputs.workflows_ref }}\n",
+            ),
+        )
+        errors, _, exempt_ok = cwp.check_dir(self.dir, exempt=frozenset({"legacy.yml"}))
+        self.assertEqual(errors, [])
+        self.assertEqual(exempt_ok, ["legacy.yml"])
+
+    def test_an_exemption_for_a_missing_file_fails(self):
+        # Rename or delete the workflow and the entry would otherwise survive
+        # forever, pre-exempting whatever later reuses the filename.
+        self._write("good.yml", _reusable(PINNED))
+        errors, _, _ = cwp.check_dir(self.dir, exempt=frozenset({"renamed-away.yml"}))
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("renamed-away.yml", errors[0])
+        self.assertIn("KNOWN_EXEMPT", errors[0])
+
+    def test_an_exemption_for_a_workflow_that_dropped_the_input_fails(self):
+        self._write("legacy.yml", "name: F\non: [push]\njobs: {}\n")
+        errors, _, _ = cwp.check_dir(self.dir, exempt=frozenset({"legacy.yml"}))
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("KNOWN_EXEMPT", errors[0])
+
+    def test_the_real_known_exempt_list_is_not_stale(self):
+        # KNOWN_EXEMPT is checked against the real tree by the default run too;
+        # this pins it so a rename cannot quietly widen the exemption.
+        root = os.path.normpath(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "workflows")
+        )
+        errors, checked, exempt_ok = cwp.check_dir(root)
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(sorted(exempt_ok), sorted(cwp.KNOWN_EXEMPT))
 
     def test_this_repos_own_workflows_pass(self):
         # The real forcing function: the checked-in tree must stay clean.

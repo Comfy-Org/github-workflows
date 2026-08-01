@@ -4,10 +4,12 @@ An **internal repo lint** — unlike the other directories here, nothing in this
 one is loaded by a reusable workflow at run time. It guards a property of this
 repo's own workflow files.
 
-- **`check_workflow_pins.py`** — fails if any `on: workflow_call` workflow in
-  `.github/workflows/` declares a `default:` for its `workflows_ref` input.
-  Text-level parsing (this repo is stdlib-only — no PyYAML), the same
-  constraint `bump-callers.sh` works under.
+- **`check_workflow_pins.py`** — for every `on: workflow_call` workflow in
+  `.github/workflows/`, fails if it (1) declares a `default:` for its
+  `workflows_ref` input, or (2) checks out at `ref: ${{ inputs.workflows_ref }}`
+  in a job that does not run the empty-ref guard first. Text-level parsing (this
+  repo is stdlib-only — no PyYAML), the same constraint `bump-callers.sh` works
+  under.
 - **`tests/`** — `unittest` suite, run by
   [`test-workflow-pins.yml`](../workflows/test-workflow-pins.yml) along with a
   CLI smoke test that a reintroduced default really exits non-zero.
@@ -43,7 +45,28 @@ Deleting a `default:` is a one-line edit to undo, hence the lint. It covers
 **every** `workflow_call` workflow, not an allow-list of today's three, so a
 workflow added later is guarded the day it lands.
 
+The lint checks the guard as well as the default, because the default is only
+half the hole. A **new job** — or a whole new reusable workflow — that checks
+out at `ref: ${{ inputs.workflows_ref }}` without the guard reopens the `ref: ''`
+default-branch fallback, and a default-only lint stays green throughout: there
+was never a `default:` to find. So every such checkout must be preceded, *in its
+own job*, by the guard step (a guard in job A does nothing for job B). An
+exempt workflow is not held to this — it still has its default, so an omitted
+input can never arrive as `''` — which puts it back under the check the moment
+its own ticket drops the default.
+
+Two shapes the text parser is deliberately strict about: a `default` inside a
+flow mapping (`workflows_ref: {type: string, default: main}`) is caught even
+though it has no child lines to walk, and a file that *uses* `inputs.workflows_ref`
+but whose declaration the parser cannot locate is a hard **error**, not a quiet
+skip — "not applicable" and "I could not read this" must never look the same,
+or a shape the parser trips on drops out of coverage with CI still green.
+
 `KNOWN_EXEMPT` in the script carries workflows with the same debt that are
 tracked under their own ticket (today: `pr-size.yml`, whose caller fleet has
-not been enumerated yet). The lint fails on a **stale** entry — one whose
-workflow no longer has the default — so the list drains itself.
+not been enumerated yet). The lint fails on a **stale** entry so the list drains
+itself rather than rotting — whether the workflow dropped its default (fixed) or
+no longer exists under that name at all (renamed or deleted), the latter being
+the case that would otherwise silently pre-exempt whatever later reuses the
+filename. The list is only applied to this repo's own `.github/workflows`: run
+against an ad-hoc `--workflows-dir` every entry would look stale.
