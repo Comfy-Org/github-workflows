@@ -130,6 +130,9 @@ _INLINE_BRANCH_END_RE = re.compile(r"""\b(?:fi|else|elif)\b""")
 # Nesting, so a conditional `exit` one level in is not read as the branch's own.
 _IF_OPEN_RE = re.compile(r"""\bif\b""")
 _FI_RE = re.compile(r"""\bfi\b""")
+# Step-level keys that can stop a correct guard from actually guarding.
+_STEP_IF_RE = re.compile(r"""^\s*(['"]?)if\1\s*:""")
+_STEP_CONTINUE_RE = re.compile(r"""^\s*(['"]?)continue-on-error\1\s*:\s*(.*)$""")
 
 
 def _empty_test_re(names):
@@ -414,7 +417,7 @@ def find_workflows_ref_defaults(lines):
 
 
 def _step_bounds(lines, idx):
-    """(start, end) of the STEP whose `env:` block holds the binding at `idx`.
+    """(start, end, key_indent) of the STEP whose `env:` holds the binding at `idx`.
 
     None when the binding is not inside a step at all — a job-level `env:`
     hoists the value out of every step, which is a binding but not a guard.
@@ -447,7 +450,7 @@ def _step_bounds(lines, idx):
         if _indent(lines[j]) < key_indent:
             end = j
             break
-    return start, end
+    return start, end, key_indent
 
 
 def is_guard_step(lines, idx):
@@ -460,7 +463,24 @@ def is_guard_step(lines, idx):
     bounds = _step_bounds(lines, idx)
     if bounds is None:
         return False
-    body = lines[bounds[0]:bounds[1]]
+    start, end, key_indent = bounds
+    body = lines[start:end]
+
+    # Two Actions-level ways a perfectly-written guard still guards nothing —
+    # and they never touch the shell, so every check below would pass them:
+    # `continue-on-error: true` means the `exit 1` does not fail the job and
+    # the checkout runs anyway, and a step-level `if:` can skip the guard
+    # outright for some events while the checkout still runs. Neither is
+    # evaluable here, so both disqualify the step rather than being assumed
+    # benign.
+    for line in body:
+        if _indent(line) != key_indent:
+            continue
+        if _STEP_IF_RE.match(line):
+            return False
+        cont = _STEP_CONTINUE_RE.match(line)
+        if cont and _strip_comment(cont.group(2)).lower() not in ("false", ""):
+            return False
     names = _ref_derived_names(body)
     empty_re = _empty_test_re(names)
     whole_re = _whole_empty_test_re(names)

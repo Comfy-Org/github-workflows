@@ -325,6 +325,30 @@ class GuardCoverageTests(unittest.TestCase):
             "        run: %s\n" % script
         )
 
+    def _guard_with(self, extra_keys):
+        return self.GUARD.replace(
+            "      - name: Require a pinned workflows_ref\n",
+            "      - name: Require a pinned workflows_ref\n" + extra_keys,
+        )
+
+    def test_a_skippable_guard_step_is_not_a_guard(self):
+        # A step-level `if:` can skip the guard outright while the checkout
+        # still runs. The shell inside is impeccable and guards nothing.
+        step = self._guard_with("        if: github.event_name == 'push'\n")
+        self.assertEqual(len(self._jobs(step + self.CHECKOUT)), 1)
+
+    def test_a_continue_on_error_guard_is_not_a_guard(self):
+        # `exit 1` that does not fail the job: the checkout runs regardless.
+        step = self._guard_with("        continue-on-error: true\n")
+        self.assertEqual(len(self._jobs(step + self.CHECKOUT)), 1)
+        # …and an expression is not evaluable here, so it disqualifies too.
+        expr = self._guard_with("        continue-on-error: ${{ inputs.soft }}\n")
+        self.assertEqual(len(self._jobs(expr + self.CHECKOUT)), 1)
+
+    def test_continue_on_error_false_is_still_a_guard(self):
+        step = self._guard_with("        continue-on-error: false\n")
+        self.assertEqual(self._jobs(step + self.CHECKOUT), [])
+
     def test_a_conditional_exit_inside_the_branch_is_not_a_guard(self):
         # The branch is entered on an empty ref but only exits if `$X` matches,
         # so the empty ref still reaches the checkout. The multiline path
