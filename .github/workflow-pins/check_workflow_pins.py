@@ -72,6 +72,16 @@ _JOBS_RE = re.compile(r"""^(['"]?)jobs\1\s*:""")
 # (`[^,}]`) so a sibling entry mentioning the input can't be misread as the ref.
 _REF_USE_BLOCK_RE = re.compile(r"""^\s*(['"]?)ref\1\s*:.*inputs\.%s\b""" % INPUT_NAME)
 _REF_USE_FLOW_RE = re.compile(r"""[{,]\s*(['"]?)ref\1\s*:[^,}]*inputs\.%s\b""" % INPUT_NAME)
+# …and a third, because the value does not have to share the key's line at all:
+#   ref: >-              ref: |              ref:
+#     ${{ … }}             ${{ … }}            ${{ … }}
+# A block scalar (`|`/`>`, with any chomping or explicit-indent modifier), or a
+# plain multi-line scalar, or a quote opened at end of line — all leave the key
+# line with no `inputs.` on it, so BOTH same-line patterns read the checkout as
+# absent. Same bypass as the flow form, spelled vertically. The key line only
+# OPENS a window; a hit needs the input to actually appear in the continuation.
+_REF_KEY_OPEN_RE = re.compile(r"""^\s*(['"]?)ref\1\s*:\s*(?:[|>][+-]?\d*|["'])?\s*$""")
+_INPUT_MENTION_RE = re.compile(r"""inputs\.%s\b""" % INPUT_NAME)
 # The guard step's signature: it takes the ref through `env:` (never
 # interpolated into the script body) under this one name, used nowhere else.
 # Block form only, deliberately: a guard written in flow style reads as ABSENT,
@@ -91,6 +101,12 @@ _CONSUMES_BLOCK_RE = re.compile(
 _CONSUMES_FLOW_RE = re.compile(
     r"""[{,]\s*(['"]?)[\w.-]+\1\s*:\s*(['"]?)\$\{\{\s*inputs\.%s\s*\}\}\2\s*[,}]""" % INPUT_NAME
 )
+# The block-scalar form, for the same reason again. (The plain multi-line form
+# already lands in _CONSUMES_BLOCK_RE, whose `\s*` spans the newline; only the
+# `|`/`>` indicator sits between the colon and the value and defeats it.)
+_CONSUMES_SCALAR_RE = re.compile(
+    r"""(?m)^\s*(['"]?)[\w.-]+\1\s*:\s*[|>][+-]?\d*\s*\n\s*\$\{\{\s*inputs\.%s\s*\}\}""" % INPUT_NAME
+)
 
 # A `default` key inside a flow mapping: `{type: string, default: main}`.
 _FLOW_DEFAULT_RE = re.compile(r"""[{,]\s*(['"]?)default\1\s*:""")
@@ -105,8 +121,12 @@ def is_ref_use(line):
 
 
 def _consumes_input(text):
-    """True when `text` uses the input as a mapping value in either YAML style."""
-    return bool(_CONSUMES_BLOCK_RE.search(text) or _CONSUMES_FLOW_RE.search(text))
+    """True when `text` uses the input as a mapping value in any YAML style."""
+    return bool(
+        _CONSUMES_BLOCK_RE.search(text)
+        or _CONSUMES_FLOW_RE.search(text)
+        or _CONSUMES_SCALAR_RE.search(text)
+    )
 
 
 def _strip_comment(value):
@@ -268,11 +288,27 @@ def find_unguarded_ref_checkouts(lines):
     unguarded = []
     for start in job_starts:
         guarded = False
+        # An open `ref:` whose value continues below, as (line index, indent).
+        # Continuation lines are the more-indented ones that follow; the first
+        # line back at or above the key's indent closes the scalar.
+        pending = None
         for i, line in _block_body(lines, start, job_indent):
+            if pending is not None:
+                if _indent(line) > pending[1]:
+                    if _INPUT_MENTION_RE.search(line):
+                        if not guarded:
+                            unguarded.append(pending[0] + 1)
+                        pending = None
+                    continue
+                # Scalar closed — fall through and judge this line normally.
+                pending = None
             if _GUARD_RE.match(line):
                 guarded = True
-            elif is_ref_use(line) and not guarded:
-                unguarded.append(i + 1)
+            elif is_ref_use(line):
+                if not guarded:
+                    unguarded.append(i + 1)
+            elif _REF_KEY_OPEN_RE.match(line):
+                pending = (i, _indent(line))
     return unguarded
 
 

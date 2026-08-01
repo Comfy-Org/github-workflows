@@ -62,6 +62,15 @@ but whose declaration the parser cannot locate is a hard **error**, not a quiet
 skip — "not applicable" and "I could not read this" must never look the same,
 or a shape the parser trips on drops out of coverage with CI still green.
 
+The ref-checkout detector recognises all three YAML spellings of the same
+checkout — block (`ref: ${{ … }}`), flow (`with: {…, ref: "${{ … }}"}`), and a
+value carried on the following line (`ref: >-`, `ref: |`, or a bare `ref:`).
+They are one checkout to Actions, so a detector that knows only one of them
+reports an unguarded job as clean. Do not "simplify" the extra patterns away.
+The guard's own signature is matched in block form **only**, deliberately: a
+guard written in flow style reads as ABSENT and fails loudly, which is the right
+bias for a check whose whole job is noticing an absence.
+
 `KNOWN_EXEMPT` in the script carries workflows with the same debt that are
 tracked under their own ticket (today: `pr-size.yml`, whose caller fleet has
 not been enumerated yet). The lint fails on a **stale** entry so the list drains

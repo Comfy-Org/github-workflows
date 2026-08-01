@@ -237,6 +237,54 @@ class GuardCoverageTests(unittest.TestCase):
         )
         self.assertEqual(self._jobs(step), [])
 
+    # The same checkout again, with the value on the FOLLOWING line. Neither
+    # same-line pattern sees an `inputs.` on the `ref:` line, so before the
+    # continuation scan these reported nothing for a job with no guard at all.
+    FOLDED_CHECKOUT = (
+        "      - name: Load assets\n"
+        "        uses: actions/checkout@abc\n"
+        "        with:\n"
+        "          ref: >-\n"
+        "            ${{ inputs.workflows_ref }}\n"
+    )
+    LITERAL_CHECKOUT = FOLDED_CHECKOUT.replace("ref: >-", "ref: |")
+    PLAIN_CHECKOUT = FOLDED_CHECKOUT.replace("ref: >-", "ref:")
+
+    def test_a_folded_scalar_checkout_is_not_an_escape_hatch(self):
+        self.assertEqual(len(self._jobs(self.FOLDED_CHECKOUT)), 1)
+
+    def test_a_literal_scalar_checkout_is_not_an_escape_hatch(self):
+        self.assertEqual(len(self._jobs(self.LITERAL_CHECKOUT)), 1)
+
+    def test_a_plain_multiline_checkout_is_not_an_escape_hatch(self):
+        self.assertEqual(len(self._jobs(self.PLAIN_CHECKOUT)), 1)
+
+    def test_a_guarded_multiline_checkout_passes(self):
+        self.assertEqual(self._jobs(self.GUARD + self.FOLDED_CHECKOUT), [])
+
+    def test_a_multiline_ref_pinned_to_a_literal_is_not_a_use(self):
+        # The window a `ref:` key opens is not itself a finding: this checkout
+        # never names the input, and failing it would fail a compliant workflow.
+        step = (
+            "      - name: Literal ref\n"
+            "        with:\n"
+            "          ref: >-\n"
+            "            main\n"
+        )
+        self.assertEqual(self._jobs(step), [])
+
+    def test_the_input_after_a_ref_scalar_closes_is_not_attributed_to_it(self):
+        # `ref:` is pinned; the input feeds a LATER, shallower key. Running the
+        # continuation scan past the scalar's end would blame it on the `ref:`.
+        step = (
+            "      - name: Literal ref\n"
+            "        with:\n"
+            "          ref: >-\n"
+            "            main\n"
+            "          path: ${{ inputs.workflows_ref }}\n"
+        )
+        self.assertEqual(self._jobs(step), [])
+
     def test_this_repos_own_workflows_guard_every_ref_checkout(self):
         root = os.path.normpath(
             os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "workflows")
@@ -334,6 +382,46 @@ class CheckDirTests(unittest.TestCase):
         self.assertEqual(len(errors), 1, errors)
         self.assertIn("NOT covering this file", errors[0])
         self.assertEqual(checked, [])
+
+    def test_a_lost_declaration_is_caught_through_a_block_scalar_use(self):
+        # And once more with the value on the next line — the third spelling of
+        # the same use, which has to stay just as loud as the other two.
+        self._write(
+            "unparseable.yml",
+            "name: F\n"
+            "on:\n"
+            "  workflow_call:\n"
+            "jobs:\n"
+            "  j:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: >-\n"
+            "            ${{ inputs.workflows_ref }}\n",
+        )
+        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("NOT covering this file", errors[0])
+        self.assertEqual(checked, [])
+
+    def test_an_unguarded_block_scalar_checkout_fails_the_lint(self):
+        # End to end: a declared, default-free workflow whose only checkout is
+        # written vertically and unguarded still exits non-zero.
+        self._write(
+            "leaky.yml",
+            _reusable(PINNED).replace(
+                "      - run: echo hi\n",
+                "      - uses: actions/checkout@abc\n"
+                "        with:\n"
+                "          ref: >-\n"
+                "            ${{ inputs.workflows_ref }}\n",
+            ),
+        )
+        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("no empty-ref guard", errors[0])
+        self.assertEqual(checked, ["leaky.yml"])
 
     def test_an_unrelated_workflow_is_still_a_silent_skip(self):
         self._write("unrelated.yml", "name: F\non: [push]\njobs: {}\n")
