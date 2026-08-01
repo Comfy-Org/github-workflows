@@ -45,8 +45,10 @@ DEFAULT_WORKFLOWS_DIR = ".github/workflows"
 
 # Reusable workflows that still carry a `workflows_ref` default and are tracked
 # for the same fix under their own ticket. An entry here is a KNOWN debt, not a
-# blessing — the checker fails on a STALE entry (one whose workflow no longer
-# has the default) so the list drains itself instead of rotting.
+# blessing — the checker fails on a STALE entry so the list drains itself
+# instead of rotting, whether the workflow dropped its default (fixed) or no
+# longer exists under that name (renamed or deleted). The latter matters most:
+# left alone it would pre-exempt whatever future workflow reuses the filename.
 #
 #   pr-size.yml — same shape as the three fixed in BE-5546, but its caller
 #   fleet (`vars.PR_SIZE_CALLERS`) was not enumerated by the BE-5543 spike, so
