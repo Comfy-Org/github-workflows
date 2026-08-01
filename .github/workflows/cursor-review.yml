@@ -350,7 +350,22 @@ jobs:
             echo "No CURSOR_API_KEY (fork PR or unset secret) — skipping catalog preflight."
             exit 0
           fi
-          curl https://cursor.com/install -fsSL | bash
+          # Download-then-execute instead of curl|bash: a pipeline's exit status is its
+          # last command's, so a failed curl piped into bash exits 0 and the missing
+          # binary resurfaces later as a misleading 'command not found' (BE-5631).
+          curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 \
+            https://cursor.com/install -o /tmp/cursor-install.sh
+          bash /tmp/cursor-install.sh
+          # $GITHUB_PATH only applies to LATER steps, so assert against the install
+          # location directly. The installer symlinks cursor-agent into ~/.local/bin,
+          # which is already on the runner PATH — hence command -v is the real check
+          # and the explicit path is the fallback. (The $HOME/.cursor/bin line below
+          # is vestigial: that directory is not what the current installer writes.)
+          if ! command -v cursor-agent >/dev/null 2>&1 \
+            && [ ! -x "$HOME/.local/bin/cursor-agent" ]; then
+            echo "::error::cursor-agent missing after install — the installer ran but produced no cursor-agent binary (expected a symlink in \$HOME/.local/bin)."
+            exit 1
+          fi
           echo "$HOME/.cursor/bin" >> "$GITHUB_PATH"
 
       - name: Validate model pins against live catalog
@@ -486,7 +501,22 @@ jobs:
 
       - name: Install Cursor agent CLI
         run: |
-          curl https://cursor.com/install -fsSL | bash
+          # Download-then-execute instead of curl|bash: a pipeline's exit status is its
+          # last command's, so a failed curl piped into bash exits 0 and the missing
+          # binary resurfaces later as a misleading 'command not found' (BE-5631).
+          curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 \
+            https://cursor.com/install -o /tmp/cursor-install.sh
+          bash /tmp/cursor-install.sh
+          # $GITHUB_PATH only applies to LATER steps, so assert against the install
+          # location directly. The installer symlinks cursor-agent into ~/.local/bin,
+          # which is already on the runner PATH — hence command -v is the real check
+          # and the explicit path is the fallback. (The $HOME/.cursor/bin line below
+          # is vestigial: that directory is not what the current installer writes.)
+          if ! command -v cursor-agent >/dev/null 2>&1 \
+            && [ ! -x "$HOME/.local/bin/cursor-agent" ]; then
+            echo "::error::cursor-agent missing after install — the installer ran but produced no cursor-agent binary (expected a symlink in \$HOME/.local/bin)."
+            exit 1
+          fi
           echo "$HOME/.cursor/bin" >> "$GITHUB_PATH"
 
       - name: Log Cursor agent version
@@ -611,7 +641,22 @@ jobs:
 
       - name: Install Cursor agent CLI
         run: |
-          curl https://cursor.com/install -fsSL | bash
+          # Download-then-execute instead of curl|bash: a pipeline's exit status is its
+          # last command's, so a failed curl piped into bash exits 0 and the missing
+          # binary resurfaces later as a misleading 'command not found' (BE-5631).
+          curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 \
+            https://cursor.com/install -o /tmp/cursor-install.sh
+          bash /tmp/cursor-install.sh
+          # $GITHUB_PATH only applies to LATER steps, so assert against the install
+          # location directly. The installer symlinks cursor-agent into ~/.local/bin,
+          # which is already on the runner PATH — hence command -v is the real check
+          # and the explicit path is the fallback. (The $HOME/.cursor/bin line below
+          # is vestigial: that directory is not what the current installer writes.)
+          if ! command -v cursor-agent >/dev/null 2>&1 \
+            && [ ! -x "$HOME/.local/bin/cursor-agent" ]; then
+            echo "::error::cursor-agent missing after install — the installer ran but produced no cursor-agent binary (expected a symlink in \$HOME/.local/bin)."
+            exit 1
+          fi
           echo "$HOME/.cursor/bin" >> "$GITHUB_PATH"
 
       - name: Download panel findings
