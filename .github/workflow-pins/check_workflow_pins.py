@@ -107,8 +107,45 @@ _GUARD_BINDING_RE = re.compile(
 # checkout in that job passed unexamined. That is the lint's own subject failing
 # silently, so the step must also be seen to REJECT the empty value: an
 # emptiness test and a non-zero exit, both inside that same step.
-_GUARD_EMPTY_TEST_RE = re.compile(r"""(?:\[\[?|\btest)\s+-z\b""")
+# And the two halves must be about the SAME thing. "an emptiness test somewhere,
+# a non-zero exit somewhere" passes a step that tests an unrelated variable and
+# exits on an unrelated condition — a near-match, and a likelier accident than
+# the bare decoy. So the `-z` must name the ref (or a variable derived from it)
+# and the exit must sit in THAT test's branch.
 _GUARD_FAIL_RE = re.compile(r"""^\s*exit\s+[1-9]""")
+# Same, unanchored — for the one-liner `[ -z "$REF" ] && exit 1`, where the
+# exit shares the test's line rather than opening a branch under it.
+_GUARD_FAIL_INLINE_RE = re.compile(r"""\bexit\s+[1-9]""")
+_SHELL_ASSIGN_RE = re.compile(r"""^\s*(?:export\s+)?([A-Za-z_]\w*)=(.*)$""")
+_BRANCH_END_RE = re.compile(r"""^\s*(?:fi|else|elif)\b""")
+
+
+def _empty_test_re(names):
+    """`[ -z "$NAME" ]` / `[[ -z $NAME ]]` / `test -z …` for any of `names`."""
+    alt = "|".join(sorted(re.escape(n) for n in names))
+    return re.compile(r"""(?:\[\[?|\btest)\s+-z\s+"?\$\{?(?:%s)\b""" % alt)
+
+
+def _ref_derived_names(body):
+    """Shell variables carrying the ref: `WORKFLOWS_REF` and anything set from it.
+
+    The real guard tests `$REF`, assigned from `$WORKFLOWS_REF` through a
+    `printf | tr` strip, so following one assignment hop is what makes the test
+    recognizable at all — but only a hop that actually carries the value.
+    """
+    names = {"WORKFLOWS_REF"}
+    for _ in range(3):  # a short chain of derivations; converges immediately
+        grew = False
+        for line in body:
+            match = _SHELL_ASSIGN_RE.match(line)
+            if not match or match.group(1) in names:
+                continue
+            if re.search(r"""\$\{?(?:%s)\b""" % "|".join(sorted(names)), match.group(2)):
+                names.add(match.group(1))
+                grew = True
+        if not grew:
+            break
+    return names
 # A mapping value that IS the input (`ref:`/`WORKFLOWS_REF:` etc.) — used to
 # tell "not applicable" apart from "the parser lost this file". Deliberately
 # narrower than "the string appears somewhere": the test workflow's own shell
@@ -387,9 +424,21 @@ def is_guard_step(lines, idx):
     if bounds is None:
         return False
     body = lines[bounds[0]:bounds[1]]
-    return any(_GUARD_EMPTY_TEST_RE.search(l) for l in body) and any(
-        _GUARD_FAIL_RE.match(l) for l in body
-    )
+    empty_re = _empty_test_re(_ref_derived_names(body))
+    for i, line in enumerate(body):
+        if not empty_re.search(line):
+            continue
+        if _GUARD_FAIL_INLINE_RE.search(line):
+            return True  # one-liner: `[ -z "$REF" ] && exit 1`
+        # Otherwise the exit must be inside this test's own branch, which ends
+        # at the matching `fi`/`else` — an exit after it answers to something
+        # else entirely.
+        for rest in body[i + 1:]:
+            if _BRANCH_END_RE.match(rest):
+                break
+            if _GUARD_FAIL_RE.match(rest):
+                return True
+    return False
 
 
 def find_unguarded_ref_checkouts(lines):

@@ -235,8 +235,64 @@ class GuardCoverageTests(unittest.TestCase):
         '        run: echo "$WORKFLOWS_REF"\n'
     )
 
+    # The NEAR match: an emptiness test and a non-zero exit are both present,
+    # but they are about an unrelated variable and an unrelated condition.
+    # "a `-z` somewhere, an `exit` somewhere" passed this, and it is a likelier
+    # accident than the bare decoy above — arg validation next to a clone.
+    NEAR_MISS = (
+        "      - name: Clone at the ref\n"
+        "        env:\n"
+        "          WORKFLOWS_REF: ${{ inputs.workflows_ref }}\n"
+        "        run: |\n"
+        '          if [ -z "$UNRELATED" ]; then\n'
+        '            echo "unrelated value is empty"\n'
+        "          fi\n"
+        '          if [ "$UNRELATED" = "blocked" ]; then\n'
+        "            exit 1\n"
+        "          fi\n"
+    )
+    # Tests the RIGHT variable, but only warns — the exit belongs to a later,
+    # separate branch, so an empty ref still reaches the checkout.
+    NO_EXIT_IN_BRANCH = (
+        "      - name: Warn only\n"
+        "        env:\n"
+        "          WORKFLOWS_REF: ${{ inputs.workflows_ref }}\n"
+        "        run: |\n"
+        '          if [ -z "$WORKFLOWS_REF" ]; then\n'
+        '            echo "::warning::no ref"\n'
+        "          fi\n"
+        '          if [ "$OTHER" = "x" ]; then\n'
+        "            exit 1\n"
+        "          fi\n"
+    )
+
     def test_a_step_that_only_handles_the_ref_is_not_a_guard(self):
         self.assertEqual(len(self._jobs(self.DECOY + self.CHECKOUT)), 1)
+
+    def test_an_unrelated_test_and_an_unrelated_exit_are_not_a_guard(self):
+        self.assertEqual(len(self._jobs(self.NEAR_MISS + self.CHECKOUT)), 1)
+
+    def test_the_exit_must_be_in_the_empty_branch(self):
+        self.assertEqual(len(self._jobs(self.NO_EXIT_IN_BRANCH + self.CHECKOUT)), 1)
+
+    def test_a_one_line_empty_test_counts(self):
+        one_liner = (
+            "      - name: Require a pinned workflows_ref\n"
+            "        env:\n"
+            "          WORKFLOWS_REF: ${{ inputs.workflows_ref }}\n"
+            '        run: [ -z "$WORKFLOWS_REF" ] && exit 1\n'
+        )
+        self.assertEqual(self._jobs(one_liner + self.CHECKOUT), [])
+
+    def test_the_guard_may_test_a_variable_derived_from_the_ref(self):
+        # The real guard tests `$REF`, assigned from `$WORKFLOWS_REF` — but the
+        # hop has to actually carry the value.
+        self.assertEqual(self._jobs(self.GUARD + self.CHECKOUT), [])
+        unrelated_hop = self.GUARD.replace(
+            "REF=\"$(printf '%s' \"$WORKFLOWS_REF\" | tr -d '[:space:]')\"",
+            'REF="$(cat /etc/hostname)"',
+        )
+        self.assertEqual(len(self._jobs(unrelated_hop + self.CHECKOUT)), 1)
 
     def test_a_decoy_before_the_real_guard_still_passes(self):
         # The decoy must not POISON a job that does guard — only fail to excuse
