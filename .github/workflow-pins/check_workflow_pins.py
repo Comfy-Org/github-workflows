@@ -126,6 +126,31 @@ def _empty_test_re(names):
     return re.compile(r"""(?:\[\[?|\btest)\s+-z\s+"?\$\{?(?:%s)\b""" % alt)
 
 
+def _whole_empty_test_re(names):
+    """The same test as the ENTIRE condition — nothing ANDed onto it.
+
+    `if [ -z "$REF" ] && [ "$OTHER" = blocked ]; then exit 1; fi` contains the
+    emptiness test but does not fail for every empty ref: empty + `OTHER`
+    unset falls through to the checkout. A text lint cannot evaluate shell, so
+    it accepts only a condition that is exactly the emptiness test and rejects
+    every compound as ambiguous — including a widening `||`, which is safe in
+    fact but not worth a special case in a detector that fails closed.
+    """
+    alt = "|".join(sorted(re.escape(n) for n in names))
+    var = r""""?\$\{?(?:%s)\}?"?""" % alt
+    return re.compile(
+        r"""^(?:\[\[?\s+-z\s+%s\s+\]\]?|test\s+-z\s+%s)$""" % (var, var)
+    )
+
+
+# An `if`/`elif` split into its condition and whatever follows `then` (which is
+# the branch body itself when the whole statement is written on one line).
+_IF_COND_RE = re.compile(r"""^\s*(?:el)?if\s+(.*?)\s*;?\s*then\b(.*)$""")
+# A single-line `run:` puts the shell on the key's own line — the `run:` is
+# YAML, not part of the condition being judged.
+_RUN_PREFIX_RE = re.compile(r"""^(['"]?)run\1\s*:\s*""")
+
+
 def _ref_derived_names(body):
     """Shell variables carrying the ref: `WORKFLOWS_REF` and anything set from it.
 
@@ -424,19 +449,34 @@ def is_guard_step(lines, idx):
     if bounds is None:
         return False
     body = lines[bounds[0]:bounds[1]]
-    empty_re = _empty_test_re(_ref_derived_names(body))
+    names = _ref_derived_names(body)
+    empty_re = _empty_test_re(names)
+    whole_re = _whole_empty_test_re(names)
     for i, line in enumerate(body):
         if not empty_re.search(line):
             continue
-        if _GUARD_FAIL_INLINE_RE.search(line):
-            return True  # one-liner: `[ -z "$REF" ] && exit 1`
-        # Otherwise the exit must be inside this test's own branch, which ends
-        # at the matching `fi`/`else` — an exit after it answers to something
-        # else entirely.
-        for rest in body[i + 1:]:
-            if _BRANCH_END_RE.match(rest):
-                break
-            if _GUARD_FAIL_RE.match(rest):
+        code = _RUN_PREFIX_RE.sub("", line.strip())
+        cond_match = _IF_COND_RE.match(code)
+        if cond_match:
+            # An `if`: the emptiness test must BE the condition, not part of it.
+            if not whole_re.match(cond_match.group(1).strip()):
+                continue
+            # `if [ -z "$REF" ]; then exit 1; fi` all on one line.
+            if _GUARD_FAIL_INLINE_RE.search(cond_match.group(2)):
+                return True
+            # Otherwise the exit must be inside this test's own branch, which
+            # ends at the matching `fi`/`else` — an exit after it answers to
+            # something else entirely.
+            for rest in body[i + 1:]:
+                if _BRANCH_END_RE.match(rest):
+                    break
+                if _GUARD_FAIL_RE.match(rest):
+                    return True
+        else:
+            # The one-liner `[ -z "$REF" ] && exit 1` — everything left of the
+            # first `&&` is the condition, and it is held to the same rule.
+            head, sep, tail = code.partition("&&")
+            if sep and whole_re.match(head.strip()) and _GUARD_FAIL_INLINE_RE.search(tail):
                 return True
     return False
 

@@ -284,6 +284,26 @@ class GuardCoverageTests(unittest.TestCase):
         )
         self.assertEqual(self._jobs(one_liner + self.CHECKOUT), [])
 
+    def test_a_compound_condition_is_not_a_guard(self):
+        # `-z "$REF" && OTHER = blocked` contains the emptiness test but does
+        # not fail for EVERY empty ref: empty + `OTHER` unset falls straight
+        # through to the checkout. A text lint cannot evaluate shell, so an
+        # ANDed condition is rejected as ambiguous rather than trusted.
+        compound = self.GUARD.replace(
+            'if [ -z "$REF" ]; then',
+            'if [ -z "$REF" ] && [ "$OTHER" = "blocked" ]; then',
+        )
+        self.assertEqual(len(self._jobs(compound + self.CHECKOUT)), 1)
+
+    def test_a_single_line_if_then_exit_counts(self):
+        one_line_if = (
+            "      - name: Require a pinned workflows_ref\n"
+            "        env:\n"
+            "          WORKFLOWS_REF: ${{ inputs.workflows_ref }}\n"
+            '        run: if [ -z "$WORKFLOWS_REF" ]; then exit 1; fi\n'
+        )
+        self.assertEqual(self._jobs(one_line_if + self.CHECKOUT), [])
+
     def test_the_guard_may_test_a_variable_derived_from_the_ref(self):
         # The real guard tests `$REF`, assigned from `$WORKFLOWS_REF` — but the
         # hop has to actually carry the value.
