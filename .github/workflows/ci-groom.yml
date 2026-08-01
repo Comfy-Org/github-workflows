@@ -87,19 +87,19 @@ jobs:
       # The gate's fail-open path is the other case: the grant is present but the
       # history read errors (fresh repo, API hiccup) -> run rather than skip.
       actions: read
-    # ⚠️ BUMP-AT-MERGE (BE-4004): this pin (and workflows_ref below) must point at
-    # THIS PR's squash-merge SHA — the interval gate lives in the NEW groom.yml,
-    # so the placeholder below fails LOUD (unresolvable ref) until bumped, exactly
-    # the reusable-lands-then-bump-caller two-step the pilot used (#49 -> #53).
-    # After merge:  gh api ... / edit both refs to the merge commit SHA.
-    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@REPLACE_AT_MERGE_WITH_THIS_PRS_SQUASH_SHA # BE-4004 interval gate — bump to merge SHA
+    # Pinned by full SHA like every other caller — self-enrollment still loads
+    # the reusable from a MERGED main commit, never a local `./` path (AGENTS.md
+    # "Scripts are the single source of truth"). This pin and `workflows_ref`
+    # below MUST stay byte-identical: bump-callers.sh rewrites the pair together,
+    # so never hand-bump one alone.
+    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@bcde90f4c5b0267d32583dc1d339ac8731c0da9a # main @ bcde90f
     with:
       # File groom's issues as cloud-code-bot (App token), not github-actions[bot].
       bot_app_id: ${{ vars.APP_ID }}
       # Keep the assets ref (finder/verifier briefs + interval gate + dedup
       # ledger) in lock-step with the `uses:` ref above, so a run always loads the
-      # scripts that match the workflow filing them. BUMP-AT-MERGE with `uses:`.
-      workflows_ref: REPLACE_AT_MERGE_WITH_THIS_PRS_SQUASH_SHA
+      # scripts that match the workflow filing them. Bump the two together.
+      workflows_ref: bcde90f4c5b0267d32583dc1d339ac8731c0da9a  # main @ bcde90f
       # Manual dispatch can dry-run; the daily schedule always files live
       # (github.event.inputs is null on a schedule event -> '' != 'true' -> false).
       dry_run: ${{ github.event.inputs.dry_run == 'true' }}
