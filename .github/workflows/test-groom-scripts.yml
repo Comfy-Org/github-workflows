@@ -51,5 +51,19 @@ jobs:
         with:
           python-version: '3.12'
 
+      # test_claude_code_pin.py's TestPinnedDependencyShape shells out to
+      # `npm view` to check that the pinned CLI's dependency tree is still closed
+      # (BE-5582). npm happens to exist on the `ubuntu-latest` image, but relying
+      # on that makes it an UNDECLARED property of the runner: if the image ever
+      # drops it, or this job moves into a python-only container, the guard
+      # degrades to a skip and a dependency-changing bump merges green. Declaring
+      # Node here makes the dependency explicit — and the guard hard-fails rather
+      # than skipping when npm is missing in CI, so a broken step is reported
+      # instead of silently disarming it.
+      - name: Set up Node (for the BE-5373 pin's dependency-shape guard)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
       - name: Run groom ledger unit tests
         run: python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
