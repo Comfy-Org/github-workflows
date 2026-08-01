@@ -63,9 +63,19 @@ _JOBS_RE = re.compile(r"""^(['"]?)jobs\1\s*:""")
 # Any `ref:` mentioning the input counts, not just the bare expression: a
 # `${{ inputs.workflows_ref || 'main' }}` fallback is the same hole wearing a
 # different hat, and it should trip the lint rather than slip past it.
-_REF_USE_RE = re.compile(r"""^\s*(['"]?)ref\1\s*:.*inputs\.%s\b""" % INPUT_NAME)
+#
+# Two spellings, because a key at line start is not the only way to write one.
+# The flow-mapping form puts the whole `with:` on one line —
+#   with: {repository: Comfy-Org/github-workflows, ref: "${{ inputs.workflows_ref }}"}
+# — which is the same unguarded checkout, and the same one-line bypass already
+# barred for `default:`. The flow pattern stops the value at the entry boundary
+# (`[^,}]`) so a sibling entry mentioning the input can't be misread as the ref.
+_REF_USE_BLOCK_RE = re.compile(r"""^\s*(['"]?)ref\1\s*:.*inputs\.%s\b""" % INPUT_NAME)
+_REF_USE_FLOW_RE = re.compile(r"""[{,]\s*(['"]?)ref\1\s*:[^,}]*inputs\.%s\b""" % INPUT_NAME)
 # The guard step's signature: it takes the ref through `env:` (never
 # interpolated into the script body) under this one name, used nowhere else.
+# Block form only, deliberately: a guard written in flow style reads as ABSENT,
+# which fails the lint loudly instead of passing a checkout it never verified.
 _GUARD_RE = re.compile(
     r"""^\s*(['"]?)WORKFLOWS_REF\1\s*:\s*(['"]?)\$\{\{\s*inputs\.workflows_ref\s*\}\}\2\s*$"""
 )
@@ -73,8 +83,13 @@ _GUARD_RE = re.compile(
 # tell "not applicable" apart from "the parser lost this file". Deliberately
 # narrower than "the string appears somewhere": the test workflow's own shell
 # fixtures name the input in prose and in a `sed` script, and neither is a use.
-_CONSUMES_RE = re.compile(
+# Flow form included for the same reason as above — otherwise a file whose only
+# use is one-line escapes the "NOT covering this file" error too.
+_CONSUMES_BLOCK_RE = re.compile(
     r"""(?m)^\s*(['"]?)[\w.-]+\1\s*:\s*(['"]?)\$\{\{\s*inputs\.%s\s*\}\}\2\s*$""" % INPUT_NAME
+)
+_CONSUMES_FLOW_RE = re.compile(
+    r"""[{,]\s*(['"]?)[\w.-]+\1\s*:\s*(['"]?)\$\{\{\s*inputs\.%s\s*\}\}\2\s*[,}]""" % INPUT_NAME
 )
 
 # A `default` key inside a flow mapping: `{type: string, default: main}`.
@@ -82,6 +97,16 @@ _FLOW_DEFAULT_RE = re.compile(r"""[{,]\s*(['"]?)default\1\s*:""")
 
 # A `#` opens a comment at the start of a value or after whitespace.
 _COMMENT_RE = re.compile(r"(?:^|\s)#.*$")
+
+
+def is_ref_use(line):
+    """True when `line` checks out at the input — block or flow-mapping form."""
+    return bool(_REF_USE_BLOCK_RE.match(line) or _REF_USE_FLOW_RE.search(line))
+
+
+def _consumes_input(text):
+    """True when `text` uses the input as a mapping value in either YAML style."""
+    return bool(_CONSUMES_BLOCK_RE.search(text) or _CONSUMES_FLOW_RE.search(text))
 
 
 def _strip_comment(value):
@@ -246,7 +271,7 @@ def find_unguarded_ref_checkouts(lines):
         for i, line in _block_body(lines, start, job_indent):
             if _GUARD_RE.match(line):
                 guarded = True
-            elif _REF_USE_RE.match(line) and not guarded:
+            elif is_ref_use(line) and not guarded:
                 unguarded.append(i + 1)
     return unguarded
 
@@ -274,7 +299,7 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
             # "Nothing to check" — unless the file plainly USES the input, in
             # which case the text parser lost a declaration that must exist and
             # this file is silently uncovered. Fail loudly instead.
-            if _CONSUMES_RE.search(text):
+            if _consumes_input(text):
                 errors.append(
                     "::error file=%s::%s references `inputs.%s` but the checker "
                     "could not find its input declaration — the lint is NOT "

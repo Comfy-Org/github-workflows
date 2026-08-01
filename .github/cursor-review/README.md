@@ -185,8 +185,9 @@ Notes:
 
 ## Configuration knobs
 
-All optional, with defaults — pass them under `with:` in the caller. Full
-descriptions live in the [workflow header](../workflows/cursor-review.yml).
+All optional except `workflows_ref` (required, no default) — pass them under
+`with:` in the caller. Full descriptions live in the
+[workflow header](../workflows/cursor-review.yml).
 
 | Input | Default | What it does |
 |---|---|---|

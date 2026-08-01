@@ -11,6 +11,7 @@ in the header comment, a caller's `with:` value of the same name, and a
 """
 
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -188,6 +189,13 @@ class GuardCoverageTests(unittest.TestCase):
         "        with:\n"
         "          ref: ${{ inputs.workflows_ref }}\n"
     )
+    # Same checkout, written as a one-line flow mapping — the shape that walked
+    # past a `ref:`-at-line-start anchor while the hole stayed wide open.
+    FLOW_CHECKOUT = (
+        "      - name: Load assets\n"
+        "        uses: actions/checkout@abc\n"
+        '        with: {repository: Comfy-Org/github-workflows, ref: "${{ inputs.workflows_ref }}"}\n'
+    )
 
     def _jobs(self, *jobs):
         text = "name: F\non:\n  workflow_call:\njobs:\n"
@@ -211,6 +219,24 @@ class GuardCoverageTests(unittest.TestCase):
     def test_each_job_is_judged_on_its_own_guard(self):
         self.assertEqual(self._jobs(self.GUARD + self.CHECKOUT, self.GUARD + self.CHECKOUT), [])
 
+    def test_a_flow_mapping_checkout_is_not_an_escape_hatch(self):
+        # `with: {…, ref: …}` on one line is the same unguarded checkout, and
+        # anchoring on `ref:` at line start reported nothing at all for it.
+        self.assertEqual(len(self._jobs(self.FLOW_CHECKOUT)), 1)
+
+    def test_a_guarded_flow_mapping_checkout_passes(self):
+        self.assertEqual(self._jobs(self.GUARD + self.FLOW_CHECKOUT), [])
+
+    def test_a_sibling_flow_entry_is_not_read_as_the_ref(self):
+        # `ref:` is pinned to a literal here; the input feeds a DIFFERENT key.
+        # Matching greedily across the whole line would call this a ref use and
+        # fail a workflow that never checks out at the input.
+        step = (
+            "      - name: Not a ref checkout\n"
+            '        with: {ref: v1, path: "${{ inputs.workflows_ref }}"}\n'
+        )
+        self.assertEqual(self._jobs(step), [])
+
     def test_this_repos_own_workflows_guard_every_ref_checkout(self):
         root = os.path.normpath(
             os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "workflows")
@@ -219,7 +245,7 @@ class GuardCoverageTests(unittest.TestCase):
         for name in ("cursor-review.yml", "groom.yml", "agents-md-integrity.yml"):
             with open(os.path.join(root, name), encoding="utf-8") as f:
                 lines = f.read().split("\n")
-            uses = [line for line in lines if cwp._REF_USE_RE.match(line)]
+            uses = [line for line in lines if cwp.is_ref_use(line)]
             self.assertTrue(uses, "%s: no ref checkout found — fixture drifted" % name)
             seen += len(uses)
             self.assertEqual(cwp.find_unguarded_ref_checkouts(lines), [], name)
@@ -229,6 +255,7 @@ class GuardCoverageTests(unittest.TestCase):
 class CheckDirTests(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
 
     def _write(self, name, text):
         with open(os.path.join(self.dir, name), "w", encoding="utf-8") as f:
@@ -281,6 +308,27 @@ class CheckDirTests(unittest.TestCase):
             "      - uses: actions/checkout@abc\n"
             "        with:\n"
             "          ref: ${{ inputs.workflows_ref }}\n",
+        )
+        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("NOT covering this file", errors[0])
+        self.assertEqual(checked, [])
+
+    def test_a_lost_declaration_is_caught_through_a_flow_mapping_use(self):
+        # Same uncovered file, with its only use written in flow style. Before
+        # the flow patterns this returned zero errors — the loudest failure the
+        # checker has, silenced by a pair of braces.
+        self._write(
+            "unparseable.yml",
+            "name: F\n"
+            "on:\n"
+            "  workflow_call:\n"
+            "jobs:\n"
+            "  j:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - uses: actions/checkout@abc\n"
+            '        with: {repository: Comfy-Org/github-workflows, ref: "${{ inputs.workflows_ref }}"}\n',
         )
         errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
         self.assertEqual(len(errors), 1, errors)

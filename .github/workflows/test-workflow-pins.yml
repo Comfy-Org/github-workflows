@@ -23,6 +23,12 @@ on:
 permissions:
   contents: read
 
+# One lint run per ref: a push that supersedes an in-flight run should cancel
+# it, not race it for a runner.
+concurrency:
+  group: test-workflow-pins-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: unittest + lint this repo
