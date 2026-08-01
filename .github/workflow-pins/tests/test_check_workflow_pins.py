@@ -249,6 +249,10 @@ class GuardCoverageTests(unittest.TestCase):
     )
     LITERAL_CHECKOUT = FOLDED_CHECKOUT.replace("ref: >-", "ref: |")
     PLAIN_CHECKOUT = FOLDED_CHECKOUT.replace("ref: >-", "ref:")
+    # …and the same two with a comment where the value would sit. A comment does
+    # not end the mapping value: both still take the ref from the line below.
+    COMMENTED_CHECKOUT = FOLDED_CHECKOUT.replace("ref: >-", "ref:  # the pinned ref")
+    COMMENTED_FOLDED_CHECKOUT = FOLDED_CHECKOUT.replace("ref: >-", "ref: >-  # pinned")
 
     def test_a_folded_scalar_checkout_is_not_an_escape_hatch(self):
         self.assertEqual(len(self._jobs(self.FOLDED_CHECKOUT)), 1)
@@ -259,8 +263,31 @@ class GuardCoverageTests(unittest.TestCase):
     def test_a_plain_multiline_checkout_is_not_an_escape_hatch(self):
         self.assertEqual(len(self._jobs(self.PLAIN_CHECKOUT)), 1)
 
+    def test_a_commented_ref_key_checkout_is_not_an_escape_hatch(self):
+        # `ref:  # pinned` with the value below is a working checkout, but the
+        # comment left the key line looking like an ordinary finished scalar, so
+        # the continuation scan never opened and the job read as having no
+        # checkout at all — silently, since `_consumes_input` missed it too.
+        self.assertEqual(len(self._jobs(self.COMMENTED_CHECKOUT)), 1)
+
+    def test_a_comment_after_a_block_header_is_not_an_escape_hatch(self):
+        # YAML allows a comment after `|`/`>`; the value still follows below.
+        self.assertEqual(len(self._jobs(self.COMMENTED_FOLDED_CHECKOUT)), 1)
+
     def test_a_guarded_multiline_checkout_passes(self):
         self.assertEqual(self._jobs(self.GUARD + self.FOLDED_CHECKOUT), [])
+
+    def test_a_guarded_commented_checkout_passes(self):
+        self.assertEqual(self._jobs(self.GUARD + self.COMMENTED_CHECKOUT), [])
+
+    def test_a_trailing_comment_on_the_guard_still_counts_as_the_guard(self):
+        # The guard is doing its job; refusing to see it would fail a compliant
+        # workflow, which is the opposite of the flow-form guard's trade-off.
+        guard = self.GUARD.replace(
+            "WORKFLOWS_REF: ${{ inputs.workflows_ref }}",
+            "WORKFLOWS_REF: ${{ inputs.workflows_ref }}  # the pinned ref",
+        )
+        self.assertEqual(self._jobs(guard + self.CHECKOUT), [])
 
     def test_a_multiline_ref_pinned_to_a_literal_is_not_a_use(self):
         # The window a `ref:` key opens is not itself a finding: this checkout
@@ -415,6 +442,45 @@ class CheckDirTests(unittest.TestCase):
                 "      - uses: actions/checkout@abc\n"
                 "        with:\n"
                 "          ref: >-\n"
+                "            ${{ inputs.workflows_ref }}\n",
+            ),
+        )
+        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("no empty-ref guard", errors[0])
+        self.assertEqual(checked, ["leaky.yml"])
+
+    def test_a_lost_declaration_is_caught_through_a_commented_ref_key(self):
+        # The fourth spelling: a comment where the value would go. This one was
+        # doubly silent — invisible to the guard scan AND to this backstop, so a
+        # whole uncovered file passed clean rather than failing loudly.
+        self._write(
+            "unparseable.yml",
+            "name: F\n"
+            "on:\n"
+            "  workflow_call:\n"
+            "jobs:\n"
+            "  j:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref:  # the pinned ref\n"
+            "            ${{ inputs.workflows_ref }}\n",
+        )
+        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("NOT covering this file", errors[0])
+        self.assertEqual(checked, [])
+
+    def test_an_unguarded_commented_ref_checkout_fails_the_lint(self):
+        self._write(
+            "leaky.yml",
+            _reusable(PINNED).replace(
+                "      - run: echo hi\n",
+                "      - uses: actions/checkout@abc\n"
+                "        with:\n"
+                "          ref:  # the pinned ref\n"
                 "            ${{ inputs.workflows_ref }}\n",
             ),
         )

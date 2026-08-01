@@ -73,21 +73,32 @@ _JOBS_RE = re.compile(r"""^(['"]?)jobs\1\s*:""")
 _REF_USE_BLOCK_RE = re.compile(r"""^\s*(['"]?)ref\1\s*:.*inputs\.%s\b""" % INPUT_NAME)
 _REF_USE_FLOW_RE = re.compile(r"""[{,]\s*(['"]?)ref\1\s*:[^,}]*inputs\.%s\b""" % INPUT_NAME)
 # …and a third, because the value does not have to share the key's line at all:
-#   ref: >-              ref: |              ref:
-#     ${{ … }}             ${{ … }}            ${{ … }}
+#   ref: >-              ref: |              ref:              ref:  # pinned
+#     ${{ … }}             ${{ … }}            ${{ … }}          ${{ … }}
 # A block scalar (`|`/`>`, with any chomping or explicit-indent modifier), or a
 # plain multi-line scalar, or a quote opened at end of line — all leave the key
 # line with no `inputs.` on it, so BOTH same-line patterns read the checkout as
 # absent. Same bypass as the flow form, spelled vertically. The key line only
 # OPENS a window; a hit needs the input to actually appear in the continuation.
-_REF_KEY_OPEN_RE = re.compile(r"""^\s*(['"]?)ref\1\s*:\s*(?:[|>][+-]?\d*|["'])?\s*$""")
+#
+# A trailing `#` comment does not close that window: `ref:  # pinned` still
+# takes its value from the line below, and YAML also allows a comment after a
+# block header (`ref: |  # pinned`). Requiring end-of-line right after the key
+# read both as ordinary scalars and lost the continuation. Not after an opening
+# QUOTE, though — there a `#` is string content, not a comment.
+_REF_KEY_OPEN_RE = re.compile(
+    r"""^\s*(['"]?)ref\1\s*:[^\S\n]*(?:["'][^\S\n]*$|(?:[|>][+-]?\d*)?[^\S\n]*(?:#.*)?$)"""
+)
 _INPUT_MENTION_RE = re.compile(r"""inputs\.%s\b""" % INPUT_NAME)
 # The guard step's signature: it takes the ref through `env:` (never
 # interpolated into the script body) under this one name, used nowhere else.
 # Block form only, deliberately: a guard written in flow style reads as ABSENT,
 # which fails the lint loudly instead of passing a checkout it never verified.
+# A trailing comment IS tolerated — unlike the flow form that is a real guard
+# doing its job, so rejecting it would fail a compliant workflow, not catch one.
 _GUARD_RE = re.compile(
-    r"""^\s*(['"]?)WORKFLOWS_REF\1\s*:\s*(['"]?)\$\{\{\s*inputs\.workflows_ref\s*\}\}\2\s*$"""
+    r"""^\s*(['"]?)WORKFLOWS_REF\1\s*:\s*(['"]?)\$\{\{\s*inputs\.workflows_ref\s*\}\}\2"""
+    r"""[^\S\n]*(?:#.*)?$"""
 )
 # A mapping value that IS the input (`ref:`/`WORKFLOWS_REF:` etc.) — used to
 # tell "not applicable" apart from "the parser lost this file". Deliberately
@@ -95,8 +106,12 @@ _GUARD_RE = re.compile(
 # fixtures name the input in prose and in a `sed` script, and neither is a use.
 # Flow form included for the same reason as above — otherwise a file whose only
 # use is one-line escapes the "NOT covering this file" error too.
+# (`:[^\S\n]*(?:#…)?\s*` rather than a plain `\s*`, so a comment sitting between
+# the key and a value on the next line does not hide the use — the same gap, in
+# the backstop that is supposed to catch exactly this kind of miss.)
 _CONSUMES_BLOCK_RE = re.compile(
-    r"""(?m)^\s*(['"]?)[\w.-]+\1\s*:\s*(['"]?)\$\{\{\s*inputs\.%s\s*\}\}\2\s*$""" % INPUT_NAME
+    r"""(?m)^\s*(['"]?)[\w.-]+\1\s*:[^\S\n]*(?:#[^\n]*)?\s*"""
+    r"""(['"]?)\$\{\{\s*inputs\.%s\s*\}\}\2\s*$""" % INPUT_NAME
 )
 _CONSUMES_FLOW_RE = re.compile(
     r"""[{,]\s*(['"]?)[\w.-]+\1\s*:\s*(['"]?)\$\{\{\s*inputs\.%s\s*\}\}\2\s*[,}]""" % INPUT_NAME
@@ -105,7 +120,8 @@ _CONSUMES_FLOW_RE = re.compile(
 # already lands in _CONSUMES_BLOCK_RE, whose `\s*` spans the newline; only the
 # `|`/`>` indicator sits between the colon and the value and defeats it.)
 _CONSUMES_SCALAR_RE = re.compile(
-    r"""(?m)^\s*(['"]?)[\w.-]+\1\s*:\s*[|>][+-]?\d*\s*\n\s*\$\{\{\s*inputs\.%s\s*\}\}""" % INPUT_NAME
+    r"""(?m)^\s*(['"]?)[\w.-]+\1\s*:\s*[|>][+-]?\d*[^\S\n]*(?:#[^\n]*)?\n"""
+    r"""\s*\$\{\{\s*inputs\.%s\s*\}\}""" % INPUT_NAME
 )
 
 # A `default` key inside a flow mapping: `{type: string, default: main}`.
