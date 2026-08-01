@@ -127,6 +127,9 @@ _SHELL_ASSIGN_RE = re.compile(r"""^\s*(?:export\s+)?([A-Za-z_]\w*)=(.*)$""")
 _BRANCH_END_RE = re.compile(r"""^\s*(?:fi|else|elif)\b""")
 # The same boundary mid-line, for a branch written inline after `then`.
 _INLINE_BRANCH_END_RE = re.compile(r"""\b(?:fi|else|elif)\b""")
+# Nesting, so a conditional `exit` one level in is not read as the branch's own.
+_IF_OPEN_RE = re.compile(r"""\bif\b""")
+_FI_RE = re.compile(r"""\bfi\b""")
 
 
 def _empty_test_re(names):
@@ -481,11 +484,19 @@ def is_guard_step(lines, idx):
             # Otherwise the exit must be inside this test's own branch, which
             # ends at the matching `fi`/`else` — an exit after it answers to
             # something else entirely.
+            # …at the branch's OWN depth. An `exit` nested inside an inner
+            # `if` is conditional on that inner test, so the empty ref can
+            # still fall through — the multiline twin of the inline rule above.
+            depth = 0
             for rest in body[i + 1:]:
-                if _BRANCH_END_RE.match(rest):
-                    break
-                if _GUARD_FAIL_RE.match(rest):
-                    return True
+                if depth == 0:
+                    if _BRANCH_END_RE.match(rest):
+                        break
+                    if _GUARD_FAIL_RE.match(rest):
+                        return True
+                # `\bif\b` does not match inside `elif`, and a nested one-liner
+                # `if …; then …; fi` opens and closes on the same line.
+                depth = max(0, depth + len(_IF_OPEN_RE.findall(rest)) - len(_FI_RE.findall(rest)))
         else:
             # The one-liner `[ -z "$REF" ] && exit 1` — everything left of the
             # first `&&` is the condition, and it is held to the same rule.

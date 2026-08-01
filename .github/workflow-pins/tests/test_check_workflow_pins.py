@@ -334,6 +334,39 @@ class GuardCoverageTests(unittest.TestCase):
         )
         self.assertEqual(len(self._jobs(step + self.CHECKOUT)), 1)
 
+    def test_a_nested_conditional_exit_is_not_a_guard_in_a_script_block(self):
+        # The multiline twin of the test above: the empty-ref branch is
+        # entered, but its only `exit` sits inside an inner `if`, so an empty
+        # ref still reaches the checkout. One rule, two paths.
+        step = (
+            "      - name: S\n"
+            "        env:\n"
+            "          WORKFLOWS_REF: ${{ inputs.workflows_ref }}\n"
+            "        run: |\n"
+            '          if [ -z "$WORKFLOWS_REF" ]; then\n'
+            '            if [ "$X" = y ]; then\n'
+            "              exit 1\n"
+            "            fi\n"
+            "          fi\n"
+        )
+        self.assertEqual(len(self._jobs(step + self.CHECKOUT)), 1)
+
+    def test_an_exit_after_a_nested_block_still_counts(self):
+        # …but nesting must not blind the scan to the branch's own exit.
+        step = (
+            "      - name: S\n"
+            "        env:\n"
+            "          WORKFLOWS_REF: ${{ inputs.workflows_ref }}\n"
+            "        run: |\n"
+            '          if [ -z "$WORKFLOWS_REF" ]; then\n'
+            '            if [ "$X" = y ]; then\n'
+            '              echo "note"\n'
+            "            fi\n"
+            "            exit 1\n"
+            "          fi\n"
+        )
+        self.assertEqual(self._jobs(step + self.CHECKOUT), [])
+
     def test_the_one_liner_exit_must_be_what_the_and_reaches(self):
         # `… && echo warn; … && exit 1` — the `&&` reaches only the echo.
         step = self._run_step(
