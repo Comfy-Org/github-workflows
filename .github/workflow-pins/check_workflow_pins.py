@@ -90,16 +90,25 @@ _REF_KEY_OPEN_RE = re.compile(
     r"""^\s*(['"]?)ref\1\s*:[^\S\n]*(?:["'][^\S\n]*$|(?:[|>][+-]?\d*)?[^\S\n]*(?:#.*)?$)"""
 )
 _INPUT_MENTION_RE = re.compile(r"""inputs\.%s\b""" % INPUT_NAME)
-# The guard step's signature: it takes the ref through `env:` (never
-# interpolated into the script body) under this one name, used nowhere else.
+# How the guard RECEIVES the ref: through `env:` (never interpolated into the
+# script body) under this one name. Half the signature — `is_guard_step` below
+# checks the other half, that the step actually rejects an empty value.
 # Block form only, deliberately: a guard written in flow style reads as ABSENT,
 # which fails the lint loudly instead of passing a checkout it never verified.
 # A trailing comment IS tolerated — unlike the flow form that is a real guard
 # doing its job, so rejecting it would fail a compliant workflow, not catch one.
-_GUARD_RE = re.compile(
+_GUARD_BINDING_RE = re.compile(
     r"""^\s*(['"]?)WORKFLOWS_REF\1\s*:\s*(['"]?)\$\{\{\s*inputs\.workflows_ref\s*\}\}\2"""
     r"""[^\S\n]*(?:#.*)?$"""
 )
+# …but the binding alone is NOT the guard, it is only how the guard receives the
+# value. Keying on it by itself made ANY step that merely handles the ref — one
+# that echoes it, or clones with it — mark its whole job guarded, so every later
+# checkout in that job passed unexamined. That is the lint's own subject failing
+# silently, so the step must also be seen to REJECT the empty value: an
+# emptiness test and a non-zero exit, both inside that same step.
+_GUARD_EMPTY_TEST_RE = re.compile(r"""(?:\[\[?|\btest)\s+-z\b""")
+_GUARD_FAIL_RE = re.compile(r"""^\s*exit\s+[1-9]""")
 # A mapping value that IS the input (`ref:`/`WORKFLOWS_REF:` etc.) — used to
 # tell "not applicable" apart from "the parser lost this file". Deliberately
 # narrower than "the string appears somewhere": the test workflow's own shell
@@ -124,6 +133,23 @@ _CONSUMES_SCALAR_RE = re.compile(
     r"""\s*\$\{\{\s*inputs\.%s\s*\}\}""" % INPUT_NAME
 )
 
+# An `env:` binding of the input to a NAME (`WORKFLOWS_REF: ${{ inputs… }}`).
+# A checkout does not have to name the input directly: hoist it to a job-level
+# `env:` — the natural refactor once several steps want it — and every
+# `ref: ${{ env.WORKFLOWS_REF }}` below reads as no ref use at all, dropping
+# the very checkouts this lint exists to cover. So the names bound to the input
+# are collected first, and a `ref:` reaching one of them counts as a use.
+_ENV_ALIAS_RE = re.compile(
+    r"""^\s*(['"]?)([A-Za-z_]\w*)\1\s*:[^\S\n]*"""
+    r"""(['"]?)\$\{\{\s*inputs\.%s\s*\}\}\3[^\S\n]*(?:#.*)?$""" % INPUT_NAME
+)
+# Scoped to `env:` blocks, not every mapping key bound to the input: the
+# checkout's own `ref: ${{ inputs.workflows_ref }}` is such a binding too, and
+# treating `ref` as an alias would make `env.ref`/`$ref` anywhere read as the
+# input. (Block form only — a flow-style `env: {…}` binds no alias here, which
+# loses nothing the `_CONSUMES_*` backstop does not already catch.)
+_ENV_KEY_RE = re.compile(r"""^\s*(['"]?)env\1\s*:[^\S\n]*(?:#.*)?$""")
+
 # A `default` key inside a flow mapping: `{type: string, default: main}`.
 _FLOW_DEFAULT_RE = re.compile(r"""[{,]\s*(['"]?)default\1\s*:""")
 
@@ -131,9 +157,46 @@ _FLOW_DEFAULT_RE = re.compile(r"""[{,]\s*(['"]?)default\1\s*:""")
 _COMMENT_RE = re.compile(r"(?:^|\s)#.*$")
 
 
-def is_ref_use(line):
+def env_aliases(lines):
+    """Names bound to the input by an `env:` mapping, e.g. `WORKFLOWS_REF`."""
+    names = set()
+    for i, line in enumerate(lines):
+        if not _ENV_KEY_RE.match(line):
+            continue
+        for _, child in _block_body(lines, i, _indent(line)):
+            match = _ENV_ALIAS_RE.match(child)
+            if match:
+                names.add(match.group(2))
+    return frozenset(names)
+
+
+def _mention_alt(aliases):
+    """Regex alternation for "reaches the input" — directly or via an alias.
+
+    File-wide rather than scope-aware on purpose: `env:` is scoped per job and
+    per step, but over-approximating can only ever DEMAND a guard, never excuse
+    a missing one — the safe direction for a detector whose job is absence.
+    """
+    alt = r"""inputs\.%s\b""" % INPUT_NAME
+    if aliases:
+        names = "|".join(sorted(re.escape(a) for a in aliases))
+        alt += r"""|env\.(?:%s)\b|\$\{?(?:%s)\b""" % (names, names)
+    return alt
+
+
+def _ref_use_res(aliases):
+    """The (block, flow) `ref:` patterns, widened to the input's env aliases."""
+    alt = _mention_alt(aliases)
+    return (
+        re.compile(r"""^\s*(['"]?)ref\1\s*:.*(?:%s)""" % alt),
+        re.compile(r"""[{,]\s*(['"]?)ref\1\s*:[^,}]*(?:%s)""" % alt),
+    )
+
+
+def is_ref_use(line, res=None):
     """True when `line` checks out at the input — block or flow-mapping form."""
-    return bool(_REF_USE_BLOCK_RE.match(line) or _REF_USE_FLOW_RE.search(line))
+    block_re, flow_re = res or (_REF_USE_BLOCK_RE, _REF_USE_FLOW_RE)
+    return bool(block_re.match(line) or flow_re.search(line))
 
 
 def _consumes_input(text):
@@ -276,12 +339,68 @@ def find_workflows_ref_defaults(lines):
     return hits
 
 
+def _step_bounds(lines, idx):
+    """(start, end) of the STEP whose `env:` block holds the binding at `idx`.
+
+    None when the binding is not inside a step at all — a job-level `env:`
+    hoists the value out of every step, which is a binding but not a guard.
+    """
+    ind = _indent(lines[idx])
+    key_indent = None  # the step's own key column, i.e. where `env:`/`run:` sit
+    for j in range(idx - 1, -1, -1):
+        if _is_skippable(lines[j]):
+            continue
+        if _indent(lines[j]) < ind:
+            key_indent = _indent(lines[j])
+            break
+    if key_indent is None:
+        return None
+
+    start = None  # the step's `- …` list-item line
+    for j in range(idx, -1, -1):
+        if _is_skippable(lines[j]) or _indent(lines[j]) >= key_indent:
+            continue
+        if lines[j].lstrip().startswith("- "):
+            start = j
+        break  # first shallower line decides it: a step, or not one at all
+    if start is None:
+        return None
+
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if _is_skippable(lines[j]):
+            continue
+        if _indent(lines[j]) < key_indent:
+            end = j
+            break
+    return start, end
+
+
+def is_guard_step(lines, idx):
+    """True when the binding at `idx` sits in a step that REJECTS an empty ref.
+
+    Fail-closed: a step the parser cannot resolve, or one that takes the value
+    without testing it, is not a guard — which reports the checkout it precedes
+    rather than passing a checkout nothing verified.
+    """
+    bounds = _step_bounds(lines, idx)
+    if bounds is None:
+        return False
+    body = lines[bounds[0]:bounds[1]]
+    return any(_GUARD_EMPTY_TEST_RE.search(l) for l in body) and any(
+        _GUARD_FAIL_RE.match(l) for l in body
+    )
+
+
 def find_unguarded_ref_checkouts(lines):
     """1-based line numbers of `ref: ${{ inputs.workflows_ref }}` uses with no guard.
 
     A use is guarded when the empty-ref guard step appears earlier in the SAME
     job — jobs run independently, so a guard in job A does nothing for job B.
     """
+    aliases = env_aliases(lines)
+    ref_res = _ref_use_res(aliases)
+    mention_re = re.compile(_mention_alt(aliases))
     jobs_line = None
     for i, line in enumerate(lines):
         if _is_skippable(line):
@@ -311,16 +430,16 @@ def find_unguarded_ref_checkouts(lines):
         for i, line in _block_body(lines, start, job_indent):
             if pending is not None:
                 if _indent(line) > pending[1]:
-                    if _INPUT_MENTION_RE.search(line):
+                    if mention_re.search(line):
                         if not guarded:
                             unguarded.append(pending[0] + 1)
                         pending = None
                     continue
                 # Scalar closed — fall through and judge this line normally.
                 pending = None
-            if _GUARD_RE.match(line):
-                guarded = True
-            elif is_ref_use(line):
+            if _GUARD_BINDING_RE.match(line):
+                guarded = guarded or is_guard_step(lines, i)
+            elif is_ref_use(line, ref_res):
                 if not guarded:
                     unguarded.append(i + 1)
             elif _REF_KEY_OPEN_RE.match(line):

@@ -176,12 +176,18 @@ class GuardCoverageTests(unittest.TestCase):
     never declared a default to begin with.
     """
 
+    # The real guard's shape: it RECEIVES the ref through `env:` and REJECTS an
+    # empty one. Both halves matter to the detector — see
+    # `test_a_step_that_only_handles_the_ref_is_not_a_guard`.
     GUARD = (
         "      - name: Require a pinned workflows_ref\n"
         "        env:\n"
         "          WORKFLOWS_REF: ${{ inputs.workflows_ref }}\n"
         "        run: |\n"
-        "          exit 1\n"
+        '          REF="$(printf \'%s\' "$WORKFLOWS_REF" | tr -d \'[:space:]\')"\n'
+        '          if [ -z "$REF" ]; then\n'
+        "            exit 1\n"
+        "          fi\n"
     )
     CHECKOUT = (
         "      - name: Load assets\n"
@@ -218,6 +224,68 @@ class GuardCoverageTests(unittest.TestCase):
 
     def test_each_job_is_judged_on_its_own_guard(self):
         self.assertEqual(self._jobs(self.GUARD + self.CHECKOUT, self.GUARD + self.CHECKOUT), [])
+
+    # A step that RECEIVES the ref but never tests it. Keying the guard on its
+    # `env:` binding alone let this mark the whole job guarded, so every later
+    # checkout passed unexamined — the lint's own subject, failing silently.
+    DECOY = (
+        "      - name: Print the ref\n"
+        "        env:\n"
+        "          WORKFLOWS_REF: ${{ inputs.workflows_ref }}\n"
+        '        run: echo "$WORKFLOWS_REF"\n'
+    )
+
+    def test_a_step_that_only_handles_the_ref_is_not_a_guard(self):
+        self.assertEqual(len(self._jobs(self.DECOY + self.CHECKOUT)), 1)
+
+    def test_a_decoy_before_the_real_guard_still_passes(self):
+        # The decoy must not POISON a job that does guard — only fail to excuse
+        # one that does not.
+        self.assertEqual(self._jobs(self.DECOY + self.GUARD + self.CHECKOUT), [])
+
+    def test_a_job_level_env_hoist_is_not_a_guard(self):
+        # Hoisting the ref to a job-level `env:` is the natural refactor once
+        # several steps want it. It binds the value but rejects nothing, and it
+        # is not a step at all — so the checkout below it is unguarded, and the
+        # `ref: ${{ env.WORKFLOWS_REF }}` spelling must still read as a ref use.
+        text = (
+            "name: F\non:\n  workflow_call:\njobs:\n"
+            "  job0:\n    runs-on: ubuntu-latest\n"
+            "    env:\n      WORKFLOWS_REF: ${{ inputs.workflows_ref }}\n"
+            "    steps:\n"
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ env.WORKFLOWS_REF }}\n"
+        )
+        self.assertEqual(len(cwp.find_unguarded_ref_checkouts(text.split("\n"))), 1)
+
+    ALIASED_CHECKOUT = (
+        "      - name: Load assets\n"
+        "        uses: actions/checkout@abc\n"
+        "        with:\n"
+        "          ref: ${{ env.WORKFLOWS_REF }}\n"
+    )
+
+    def test_an_aliased_checkout_still_needs_a_guard_in_its_own_job(self):
+        # The guard in job A binds the name; job B checks out at it with no
+        # guard of its own. Reading only `inputs.` made job B's checkout vanish.
+        self.assertEqual(len(self._jobs(self.GUARD, self.ALIASED_CHECKOUT)), 1)
+
+    def test_an_aliased_checkout_behind_the_guard_passes(self):
+        self.assertEqual(self._jobs(self.GUARD + self.ALIASED_CHECKOUT), [])
+
+    def test_only_env_blocks_bind_an_alias(self):
+        # The checkout's own `ref:` is a mapping key bound to the input too.
+        # Collecting it as an alias would make `env.ref`/`$ref` anywhere read
+        # as the input.
+        lines = (self.GUARD + self.CHECKOUT).split("\n")
+        self.assertEqual(cwp.env_aliases(lines), frozenset({"WORKFLOWS_REF"}))
+
+    def test_an_unbound_env_name_is_not_a_ref_use(self):
+        # Nothing binds this name to the input, so it is an unrelated variable
+        # — demanding a guard for it would fail a compliant workflow.
+        self.assertEqual(self._jobs(self.ALIASED_CHECKOUT), [])
 
     def test_a_flow_mapping_checkout_is_not_an_escape_hatch(self):
         # `with: {…, ref: …}` on one line is the same unguarded checkout, and
