@@ -19,12 +19,19 @@ these are the guards that keep the arrangement from quietly regressing:
 - .github/dependabot.yml still carries the npm entry for `/.github/groom` —
   without it the manifest is just an unwatched second place to rot.
 
+The last class is a different kind of guard: it queries the registry to check
+that the PINNED VERSION'S OWN dependency tree still has the shape that makes a
+top-level-only pin a complete pin. See `TestPinnedDependencyShape` and the
+"Scope: why the top-level pin is the whole pin" section of ../README.md.
+
 Run: python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
 """
 
 import json
 import os
 import re
+import shutil
+import subprocess
 import unittest
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -80,6 +87,98 @@ _PKG_AT = re.compile(re.escape(_PACKAGE) + r"@(\S+)")
 # fold into the PRECEDING job's block and the `needs: gate` assertion below
 # passes vacuously — the precise regression these guards exist to catch.
 _JOB_KEY = re.compile(r"^  ([A-Za-z_][A-Za-z0-9_-]*):$", re.MULTILINE)
+
+# The registry round-trip for the dependency-shape guard below. Generous, because
+# a cold CI runner's first `npm view` pays a metadata fetch, and the failure mode
+# of a too-tight timeout here is a red suite on a PR that changed nothing.
+_NPM_TIMEOUT_SEC = 60
+# One process per (spec, field) for the whole run, so splitting the shape guard
+# into readable per-assertion test methods costs one registry hit, not four.
+_NPM_CACHE = {}
+
+# Spellings of "not actually CI". GitHub Actions sets `CI=true` on every runner,
+# so a registry that errors or times out hard-fails there rather than skipping; a
+# developer who exports `CI=false` gets the offline-friendly skip they clearly
+# meant.
+_NOT_CI = {"", "0", "false", "no", "off"}
+
+
+def _in_ci():
+    return os.environ.get("CI", "").strip().lower() not in _NOT_CI
+
+
+def _npm_field(spec, field):
+    """`npm view <spec> <field> --json`, as `(value, error, unavailable)`.
+
+    ONE field per invocation, deliberately. Asking for two in a single call is
+    the obvious optimization and it is unsafe: npm keys the output object by
+    field name only when BOTH fields are present. When just one exists it prints
+    that field's map BARE and unlabelled, so `{"is-number": "^6.0.0"}` is
+    indistinguishable from a two-field reply in which `dependencies` happens to
+    be absent. Read the keyed way, a future release that declares real
+    `dependencies` and no `optionalDependencies` would parse as "both empty" and
+    PASS — the precise regression this guard exists to fail on. One field per
+    call has no such shape ambiguity: the reply is that field's map, `{}` if the
+    field is present but empty, or empty output if the field is absent at all.
+
+    Returns `(value, error, unavailable)`. `error` is set for anything that
+    stopped us from learning the shape — non-zero exit, timeout, unreadable JSON —
+    and is fatal in CI, where an unverified guard is an absent guard. `unavailable`
+    marks the narrower "there is no npm here at all" case, which is ALWAYS a skip:
+    it is a precise, non-flaky property of the machine rather than a transient
+    registry failure, and an `unittest discover` on a node-less dev box must not go
+    red over a change it has nothing to do with. (CI runners ship npm, so this
+    branch does not quietly disarm the guard there.)
+    """
+    key = (spec, field)
+    if key in _NPM_CACHE:
+        return _NPM_CACHE[key]
+
+    npm = shutil.which("npm")
+    if npm is None:
+        result = (None, "no `npm` on PATH", True)
+    else:
+        try:
+            proc = subprocess.run(
+                [npm, "view", spec, field, "--json"],
+                capture_output=True,
+                text=True,
+                timeout=_NPM_TIMEOUT_SEC,
+                # Inherited stdin would let a credential prompt hang the run out
+                # to the timeout instead of failing immediately.
+                stdin=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired:
+            result = (None, f"`npm view` timed out after {_NPM_TIMEOUT_SEC}s", False)
+        except OSError as exc:  # npm on PATH but unexecutable
+            result = (None, f"could not run `npm view`: {exc}", False)
+        else:
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+                result = (
+                    None,
+                    f"`npm view {spec} {field}` exited {proc.returncode}"
+                    + (f": {detail[0]}" if detail else ""),
+                    False,
+                )
+            else:
+                raw = proc.stdout.strip()
+                # Absent field -> npm prints nothing. That is a real answer ("no
+                # such field"), not a failure, and `{}` is its faithful reading.
+                if not raw:
+                    result = ({}, None, False)
+                else:
+                    try:
+                        result = (json.loads(raw), None, False)
+                    except ValueError as exc:
+                        result = (
+                            None,
+                            f"`npm view` returned unreadable JSON: {exc}",
+                            False,
+                        )
+
+    _NPM_CACHE[key] = result
+    return result
 
 
 def _read(path):
@@ -358,6 +457,124 @@ class DependabotTest(unittest.TestCase):
         # The workflow guard rejects a range at run time, so the updater must be
         # told to keep an exact requirement exact rather than widening it.
         self.assertEqual("increase", npm[0].get("versioning-strategy"))
+
+
+class TestPinnedDependencyShape(unittest.TestCase):
+    """The pinned version's own dependency tree must stay CLOSED (BE-5580).
+
+    Everything above guards the pin's *mechanism*. This guards its *scope*.
+
+    `npm install -g` has no lockfile, so a top-level pin does not mechanically
+    pin transitive deps. The reason that is nonetheless the whole pin today is a
+    property of the package, not of the install command: as of 2.1.x
+    `@anthropic-ai/claude-code` declares NO regular dependencies, and its only
+    optionalDependencies are same-scope `@anthropic-ai/claude-code-<platform>`
+    binaries exact-pinned to the identical version. So the resolved install is
+    fully determined by the pinned version. The accepted boundary and the risks
+    accepted with it are written up in ../README.md, "Scope: why the top-level
+    pin is the whole pin".
+
+    That property is not guaranteed to hold forever — versions 1.x through 2.0.0
+    DID declare floating third-party `@img/sharp-*: ^0.33.5` ranges, under which
+    two installs of the same pinned CLI version can resolve different bytes. So
+    the residual risk gets a guard rather than a promise: this class fails the
+    PR that changes the pin — Dependabot's bump PR edits
+    `.github/groom/package.json`, which is exactly what triggers this suite — if
+    the new version's tree has stopped being closed. A red here is not "fix the
+    test"; it is the signal to re-open the transitive-pinning decision.
+
+    Network-dependent — the only class here that is — so it degrades by AUDIENCE
+    rather than failing everyone: a registry that errors or times out is a hard
+    failure in CI, where an unverifiable guard is a silently missing guard, and a
+    skip on a dev machine, where an offline `unittest discover` must not go red
+    over a change it has nothing to do with. A machine with no `npm` at all skips
+    in both places; CI runners ship npm, so that branch cannot disarm the guard
+    where it matters.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        deps = json.loads(_read(_MANIFEST)).get("dependencies", {})
+        cls.version = deps.get(_PACKAGE)
+        cls.spec = f"{_PACKAGE}@{cls.version}"
+
+    def setUp(self):
+        # ManifestTest owns asserting these; here they are preconditions, and
+        # querying the registry for `@anthropic-ai/claude-code@None` or for a
+        # dist-tag would just add a confusing second failure to that one.
+        if self.version is None or _EXACT_VERSION.fullmatch(self.version) is None:
+            self.skipTest(
+                f"{_MANIFEST} does not pin {_PACKAGE} to an exact version "
+                f"(got {self.version!r}) — see ManifestTest for that failure"
+            )
+
+    def _field(self, field):
+        """The pinned version's `field` map, or skip/fail if we cannot learn it."""
+        value, error, unavailable = _npm_field(self.spec, field)
+        if error is not None:
+            message = (
+                f"could not verify the dependency shape of {self.spec}: {error}. "
+                "The npm registry could not be consulted, so this guard could not "
+                "check that the pinned CLI's dependency tree is still closed under "
+                "the exact top-level pin (see .github/groom/README.md, 'Scope: why "
+                "the top-level pin is the whole pin')."
+            )
+            # No npm at all is a property of the MACHINE, not a failed check, so it
+            # skips everywhere — CI runners ship npm, so this cannot quietly disarm
+            # the guard there. A registry that IS reachable-in-principle but errored
+            # or timed out is different: in CI an unverified guard is an ABSENT
+            # guard, and this suite runs on the bump PR precisely to be the check
+            # nobody has to remember.
+            if _in_ci() and not unavailable:
+                self.fail(message)
+            self.skipTest(message)
+        self.assertIsInstance(value, dict, f"unexpected `npm view` shape: {value!r}")
+        for name, spec in value.items():
+            # Guards the single-field reading above: every value in a dependency
+            # map is a version SPEC string. A nested object would mean npm
+            # answered in some other shape (keyed by field, or by version) and
+            # this whole comparison is meaningless rather than passing.
+            self.assertIsInstance(
+                spec, str, f"unexpected `npm view` {field} entry: {name}={spec!r}"
+            )
+        return value
+
+    def _regression(self, name, spec):
+        return (
+            f"{self.spec} declares {name}@{spec}: the dependency tree is no "
+            "longer closed under the exact top-level pin, so the accepted "
+            "boundary documented in .github/groom/README.md no longer holds. "
+            "Re-open the transitive-pinning decision (spike BE-5580) before "
+            "bumping."
+        )
+
+    def test_pinned_version_declares_no_regular_dependencies(self):
+        # ANY regular dependency is a shape regression: unlike the platform
+        # binaries below, a `dependencies` entry is installed unconditionally and
+        # is not covered by the same-publisher argument.
+        deps = self._field("dependencies")
+        for name, spec in sorted(deps.items()):
+            self.fail(self._regression(name, spec))
+
+    def test_optional_dependencies_are_all_same_scope(self):
+        # The boundary rests on the platform binaries sharing a publisher with
+        # the top-level package: hijacking one is not a cheaper attack than
+        # hijacking the thing we pinned. A dep from any other scope breaks that
+        # argument even if it happens to be exact-pinned — 1.x-2.0.0's
+        # `@img/sharp-*` is the historical instance.
+        optional = self._field("optionalDependencies")
+        for name, spec in sorted(optional.items()):
+            if not name.startswith("@anthropic-ai/"):
+                self.fail(self._regression(name, spec))
+
+    def test_optional_dependencies_are_pinned_to_the_same_exact_version(self):
+        # String equality, NOT semver satisfaction: `^2.1.217` SATISFIES 2.1.217
+        # while still floating to 2.9.x tomorrow, and a floating range is
+        # precisely the regression being guarded.
+        optional = self._field("optionalDependencies")
+        for name, spec in sorted(optional.items()):
+            if spec != self.version:
+                self.fail(self._regression(name, spec))
 
 
 if __name__ == "__main__":

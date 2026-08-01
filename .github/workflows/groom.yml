@@ -853,8 +853,10 @@ jobs:
         # Scope, so the guarantee is not read as wider than it is: this pins the
         # TOP-LEVEL version only. `npm install -g` has no lockfile, so transitive
         # deps still resolve at install time and the package's lifecycle scripts
-        # still run. Closing that needs a different install mechanism, not a flag
-        # — tracked separately.
+        # still run. That top-level pin is nonetheless the accepted boundary: the
+        # tree is closed at this version (no regular deps; only same-scope
+        # platform binaries exact-pinned to it) — the boundary and its shape guard
+        # are documented in `.github/groom/README.md` (BE-5580).
         env:
           CLAUDE_CODE_VERSION: ${{ needs.gate.outputs.claude_code_version }}
         run: npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION:?not resolved by the gate job from .github/groom/package.json}"

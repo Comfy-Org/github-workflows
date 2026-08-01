@@ -397,6 +397,65 @@ chain for steps that read untrusted repo content:
 literal anywhere in `groom.yml`, every install step wired to the gate output, and
 the Dependabot entry still present.
 
+### Scope: why the top-level pin is the whole pin
+
+Mechanically the pin covers only the **top-level** version — `npm install -g`
+writes no lockfile, so nothing in the install command constrains what the package
+itself depends on. The reason that is nonetheless the complete boundary is a
+property of *this package*, not of the command: as of 2.1.x
+`@anthropic-ai/claude-code` declares **no regular dependencies at all**, and its
+only `optionalDependencies` are the eight same-scope
+`@anthropic-ai/claude-code-<platform>` binaries, each **exact-pinned to the
+identical version** and each with no dependencies and no lifecycle scripts of its
+own. Verify with:
+
+```bash
+npm view "@anthropic-ai/claude-code@<pinned>" dependencies optionalDependencies
+```
+
+(Read that output by eye, not with a script. `npm view` labels the two fields only
+when **both** are present; when just one is, it prints that field's map bare and
+unlabelled, so a reply of `{"is-number": "^6.0.0"}` is ambiguous between the two.
+The guard below therefore queries one field per call — see `_npm_field`.)
+
+So the resolved install is fully determined by the pinned version: there is no
+third-party code in the tree and no range left to float. Hijacking a "transitive
+dep" here would mean compromising the *same publisher* as the top-level package —
+not a cheaper attack than compromising the thing we already pinned, which is what
+makes the extra machinery a lockfile would buy not worth its cost.
+
+(The top-level package does run a `postinstall`, so this is "the resolved bytes
+are pinned", not "nothing executes". Those bytes are covered by the pin like the
+rest of the package; that install step is why the CLI is treated as executable
+supply chain throughout this section.)
+
+Two residual risks are **accepted**:
+
+- **An npm-registry-level compromise** serving different bytes for an
+  already-published, immutable version. A lockfile `integrity` hash would close
+  this, and it was still rejected: adding one would turn this deliberately inert
+  pin carrier into a real project (see the section above — nothing is ever
+  installed from this directory, and a lockfile invites exactly the `npm install`
+  that must not happen here), in exchange for a defense against an event that
+  compromises effectively all CI everywhere, not just groom.
+- **A future version reintroducing floating third-party dependencies.** This one
+  is *not* accepted silently — it is guarded.
+  `tests/test_claude_code_pin.py`'s `TestPinnedDependencyShape` queries the
+  registry for the pinned version and fails if `dependencies` is non-empty, if any
+  `optionalDependencies` key leaves the `@anthropic-ai/` scope, or if any of their
+  values is not the exact pinned version string (string equality, not
+  range-satisfaction — `^2.1.217` satisfies 2.1.217 today and floats tomorrow).
+  Because a Dependabot bump PR edits `.github/groom/package.json`, it triggers
+  this suite — so the guard fires on the one event that can change the pin. A red
+  there is not a test to fix: it means the tree stopped being closed, and the
+  transitive-pinning decision (spike BE-5580) has to be re-opened before bumping.
+
+The guard is not hypothetical. Versions **1.x through 2.0.0** of this same package
+declared floating `@img/sharp-*: ^0.33.5` ranges — third-party, cross-scope, and
+range-pinned — under which two installs of the same pinned CLI version could
+resolve different bytes. The closed tree is a recent property, so it is checked
+rather than assumed.
+
 - **`tests/`** — `unittest` suite, run by
   [`test-groom-scripts.yml`](../workflows/test-groom-scripts.yml).
 
