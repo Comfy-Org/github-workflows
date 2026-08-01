@@ -304,6 +304,43 @@ class GuardCoverageTests(unittest.TestCase):
         )
         self.assertEqual(self._jobs(one_line_if + self.CHECKOUT), [])
 
+    def test_an_inline_exit_after_the_branch_closes_is_not_a_guard(self):
+        # `then echo "missing"; fi; exit 1` — the branch does not exit, so an
+        # empty ref walks on to the checkout; the trailing exit answers to
+        # nothing. The multiline path already stopped at `fi`; the inline one
+        # had quietly stopped agreeing with it.
+        after_fi = (
+            "      - name: Decoy\n"
+            "        env:\n"
+            "          WORKFLOWS_REF: ${{ inputs.workflows_ref }}\n"
+            '        run: if [ -z "$WORKFLOWS_REF" ]; then echo "missing"; fi; exit 1\n'
+        )
+        self.assertEqual(len(self._jobs(after_fi + self.CHECKOUT)), 1)
+
+    def _run_step(self, script):
+        return (
+            "      - name: S\n"
+            "        env:\n"
+            "          WORKFLOWS_REF: ${{ inputs.workflows_ref }}\n"
+            "        run: %s\n" % script
+        )
+
+    def test_a_conditional_exit_inside_the_branch_is_not_a_guard(self):
+        # The branch is entered on an empty ref but only exits if `$X` matches,
+        # so the empty ref still reaches the checkout. The multiline path
+        # already required a bare `exit`; the inline path had not.
+        step = self._run_step(
+            'if [ -z "$WORKFLOWS_REF" ]; then [ "$X" = y ] && exit 1; fi'
+        )
+        self.assertEqual(len(self._jobs(step + self.CHECKOUT)), 1)
+
+    def test_the_one_liner_exit_must_be_what_the_and_reaches(self):
+        # `… && echo warn; … && exit 1` — the `&&` reaches only the echo.
+        step = self._run_step(
+            '[ -z "$WORKFLOWS_REF" ] && echo warn; [ "$X" = y ] && exit 1'
+        )
+        self.assertEqual(len(self._jobs(step + self.CHECKOUT)), 1)
+
     def test_the_guard_may_test_a_variable_derived_from_the_ref(self):
         # The real guard tests `$REF`, assigned from `$WORKFLOWS_REF` — but the
         # hop has to actually carry the value.

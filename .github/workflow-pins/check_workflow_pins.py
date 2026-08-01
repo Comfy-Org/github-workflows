@@ -113,11 +113,20 @@ _GUARD_BINDING_RE = re.compile(
 # the bare decoy. So the `-z` must name the ref (or a variable derived from it)
 # and the exit must sit in THAT test's branch.
 _GUARD_FAIL_RE = re.compile(r"""^\s*exit\s+[1-9]""")
-# Same, unanchored — for the one-liner `[ -z "$REF" ] && exit 1`, where the
-# exit shares the test's line rather than opening a branch under it.
-_GUARD_FAIL_INLINE_RE = re.compile(r"""\bexit\s+[1-9]""")
+# A command that IS `exit N`, for a branch written inline. The multiline path
+# anchors `exit` at the start of its line, so a conditional `[ … ] && exit 1`
+# does not count there; the inline paths hold to the same rule by requiring a
+# `;`-separated command that is nothing but the exit.
+_GUARD_FAIL_INLINE_RE = re.compile(r"""^\s*exit\s+[1-9]\d*\s*$""")
+
+
+def _exits_unconditionally(text):
+    """True when `text` contains a bare `exit N` as one of its `;` commands."""
+    return any(_GUARD_FAIL_INLINE_RE.match(part) for part in text.split(";"))
 _SHELL_ASSIGN_RE = re.compile(r"""^\s*(?:export\s+)?([A-Za-z_]\w*)=(.*)$""")
 _BRANCH_END_RE = re.compile(r"""^\s*(?:fi|else|elif)\b""")
+# The same boundary mid-line, for a branch written inline after `then`.
+_INLINE_BRANCH_END_RE = re.compile(r"""\b(?:fi|else|elif)\b""")
 
 
 def _empty_test_re(names):
@@ -461,8 +470,13 @@ def is_guard_step(lines, idx):
             # An `if`: the emptiness test must BE the condition, not part of it.
             if not whole_re.match(cond_match.group(1).strip()):
                 continue
-            # `if [ -z "$REF" ]; then exit 1; fi` all on one line.
-            if _GUARD_FAIL_INLINE_RE.search(cond_match.group(2)):
+            # `if [ -z "$REF" ]; then exit 1; fi` all on one line. The branch
+            # still ends at its `fi` — `then echo "missing"; fi; exit 1` exits
+            # AFTER the branch, so the empty ref never triggers it. Same
+            # boundary the multiline path below applies, which is where this
+            # inline path had quietly stopped agreeing with it.
+            inline = _INLINE_BRANCH_END_RE.split(cond_match.group(2), 1)[0]
+            if _exits_unconditionally(inline):
                 return True
             # Otherwise the exit must be inside this test's own branch, which
             # ends at the matching `fi`/`else` — an exit after it answers to
@@ -475,9 +489,13 @@ def is_guard_step(lines, idx):
         else:
             # The one-liner `[ -z "$REF" ] && exit 1` — everything left of the
             # first `&&` is the condition, and it is held to the same rule.
+            # The exit must be the command the `&&` actually reaches, so only
+            # the first `;`-segment counts: `… && echo warn; … && exit 1`
+            # leaves the empty ref walking on.
             head, sep, tail = code.partition("&&")
-            if sep and whole_re.match(head.strip()) and _GUARD_FAIL_INLINE_RE.search(tail):
-                return True
+            if sep and whole_re.match(head.strip()):
+                if _GUARD_FAIL_INLINE_RE.match(tail.split(";")[0]):
+                    return True
     return False
 
 
