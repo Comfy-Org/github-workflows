@@ -349,8 +349,14 @@ on:
           this more than it looks. Two reasons. (1) Different counting basis:
           `pr-size.yml` counts *non-generated* changed lines — it strips
           lockfiles and generated output first, and offers an `oversized-ok`
-          bypass label — whereas this counts raw changed lines with no
-          exclusions. (2) Different risk: the human cap is advisory on a diff
+          bypass label — whereas this counts changed lines straight off
+          `git diff --cached --numstat`, with no content-based exclusions. Note
+          that this basis is not a byte budget: `numstat` reports `-` for binary
+          files (counted as 0 here), and a line is a line however long, so one
+          minified line clears any ceiling. It bounds review effort in the
+          reviewable case, not patch size in the worst case — another reason not
+          to spend the headroom the human cap allows. (2) Different risk: the
+          human cap is advisory on a diff
           whose author chose the scope and can defend it in review; this is a
           hard refusal on a diff with no author to interrogate, where the
           failure mode is a reviewer approving 900 plausible-looking
@@ -363,9 +369,13 @@ on:
           patch-too-large (403 lines, three over) — 400 was not systematically
           tight, it caught one boundary case, so 600 buys headroom for that
           shape without a large jump. This default is the reviewed knob: it is a
-          `_LOCKED_KEY` in `.github/groom/config.py`, so a repo cannot raise its
-          own ceiling via `GROOM_CONFIG` — changing it here, under review, is
-          the only way it moves.
+          `_LOCKED_KEY` in `.github/groom/config.py`, so the un-reviewed layer —
+          a repo's `GROOM_CONFIG` Actions variable, editable with repo write and
+          leaving no diff — cannot raise it. It can still be raised per-repo the
+          reviewed way, by a `with: pr_size_limit:` in that repo's caller (the
+          builder job reads `inputs.pr_size_limit` directly), which is a commit
+          on a branch someone has to approve. So auditing a repo's effective
+          ceiling means reading its caller, not assuming this default.
         type: number
         required: false
         default: 600
