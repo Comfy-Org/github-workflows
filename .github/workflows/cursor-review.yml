@@ -360,9 +360,11 @@ jobs:
           # gets the ~6 KB bootstrap, then the bootstrap itself pulls the actual
           # cursor-agent payload. Unbounded, a stalled cursor.com burns the whole job
           # budget and surfaces as an opaque cancelled job rather than the readable
-          # install failure this step exists to produce. --max-time is per attempt, so
-          # --retry-max-time is what caps curl overall (~2 min); +300s for the
-          # installer keeps the worst case inside the tightest job cap here (10 min).
+          # install failure this step exists to produce. --max-time is per attempt and
+          # --retry-max-time only bounds when a NEW attempt may start, so an attempt
+          # beginning just under 120s still gets its full 60s: curl's worst case is
+          # ~3 min. +240s for the installer (plus a 30s SIGKILL grace) keeps the total
+          # inside the tightest job cap here — preflight's timeout-minutes: 10.
           curl -fsSL --connect-timeout 10 --max-time 60 \
             --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 120 \
             https://cursor.com/install -o "$installer"
@@ -371,20 +373,23 @@ jobs:
             echo "::error::cursor.com/install returned an empty body — nothing to execute."
             exit 1
           fi
-          # </dev/null keeps stdin closed, as it effectively was under curl|bash, so an
-          # installer that ever branches on interactive stdin behaves as it did before.
+          # -k escalates to SIGKILL, so an installer that traps SIGTERM cannot outlive
+          # the cap. </dev/null keeps stdin closed, as it effectively was under
+          # curl|bash, so an installer that branches on interactive stdin is unaffected.
           rc=0
-          timeout 300 bash "$installer" </dev/null || rc=$?
+          timeout -k 30 240 bash "$installer" </dev/null || rc=$?
           if [ "$rc" -ne 0 ]; then
-            echo "::error::cursor.com installer exited $rc (124 = exceeded the 300s cap)."
+            echo "::error::cursor.com installer exited $rc (124 usually means it exceeded the 240s cap)."
             exit "$rc"
           fi
           # $GITHUB_PATH only applies to LATER steps, so assert against the install
           # location directly. The installer symlinks cursor-agent into ~/.local/bin,
           # which is already on the runner PATH — hence command -v is the real check
-          # and the explicit path is the fallback.
+          # and the explicit path is the fallback. -f as well as -x, because -x alone
+          # is also true for a searchable directory sitting at that path.
+          agent="$HOME/.local/bin/cursor-agent"
           if ! command -v cursor-agent >/dev/null 2>&1 \
-            && [ ! -x "$HOME/.local/bin/cursor-agent" ]; then
+            && ! { [ -f "$agent" ] && [ -x "$agent" ]; }; then
             echo "::error::cursor-agent missing after install — the installer ran but produced no cursor-agent binary (expected a symlink in \$HOME/.local/bin)."
             exit 1
           fi
@@ -540,9 +545,11 @@ jobs:
           # gets the ~6 KB bootstrap, then the bootstrap itself pulls the actual
           # cursor-agent payload. Unbounded, a stalled cursor.com burns the whole job
           # budget and surfaces as an opaque cancelled job rather than the readable
-          # install failure this step exists to produce. --max-time is per attempt, so
-          # --retry-max-time is what caps curl overall (~2 min); +300s for the
-          # installer keeps the worst case inside the tightest job cap here (10 min).
+          # install failure this step exists to produce. --max-time is per attempt and
+          # --retry-max-time only bounds when a NEW attempt may start, so an attempt
+          # beginning just under 120s still gets its full 60s: curl's worst case is
+          # ~3 min. +240s for the installer (plus a 30s SIGKILL grace) keeps the total
+          # inside the tightest job cap here — preflight's timeout-minutes: 10.
           curl -fsSL --connect-timeout 10 --max-time 60 \
             --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 120 \
             https://cursor.com/install -o "$installer"
@@ -551,20 +558,23 @@ jobs:
             echo "::error::cursor.com/install returned an empty body — nothing to execute."
             exit 1
           fi
-          # </dev/null keeps stdin closed, as it effectively was under curl|bash, so an
-          # installer that ever branches on interactive stdin behaves as it did before.
+          # -k escalates to SIGKILL, so an installer that traps SIGTERM cannot outlive
+          # the cap. </dev/null keeps stdin closed, as it effectively was under
+          # curl|bash, so an installer that branches on interactive stdin is unaffected.
           rc=0
-          timeout 300 bash "$installer" </dev/null || rc=$?
+          timeout -k 30 240 bash "$installer" </dev/null || rc=$?
           if [ "$rc" -ne 0 ]; then
-            echo "::error::cursor.com installer exited $rc (124 = exceeded the 300s cap)."
+            echo "::error::cursor.com installer exited $rc (124 usually means it exceeded the 240s cap)."
             exit "$rc"
           fi
           # $GITHUB_PATH only applies to LATER steps, so assert against the install
           # location directly. The installer symlinks cursor-agent into ~/.local/bin,
           # which is already on the runner PATH — hence command -v is the real check
-          # and the explicit path is the fallback.
+          # and the explicit path is the fallback. -f as well as -x, because -x alone
+          # is also true for a searchable directory sitting at that path.
+          agent="$HOME/.local/bin/cursor-agent"
           if ! command -v cursor-agent >/dev/null 2>&1 \
-            && [ ! -x "$HOME/.local/bin/cursor-agent" ]; then
+            && ! { [ -f "$agent" ] && [ -x "$agent" ]; }; then
             echo "::error::cursor-agent missing after install — the installer ran but produced no cursor-agent binary (expected a symlink in \$HOME/.local/bin)."
             exit 1
           fi
@@ -709,9 +719,11 @@ jobs:
           # gets the ~6 KB bootstrap, then the bootstrap itself pulls the actual
           # cursor-agent payload. Unbounded, a stalled cursor.com burns the whole job
           # budget and surfaces as an opaque cancelled job rather than the readable
-          # install failure this step exists to produce. --max-time is per attempt, so
-          # --retry-max-time is what caps curl overall (~2 min); +300s for the
-          # installer keeps the worst case inside the tightest job cap here (10 min).
+          # install failure this step exists to produce. --max-time is per attempt and
+          # --retry-max-time only bounds when a NEW attempt may start, so an attempt
+          # beginning just under 120s still gets its full 60s: curl's worst case is
+          # ~3 min. +240s for the installer (plus a 30s SIGKILL grace) keeps the total
+          # inside the tightest job cap here — preflight's timeout-minutes: 10.
           curl -fsSL --connect-timeout 10 --max-time 60 \
             --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 120 \
             https://cursor.com/install -o "$installer"
@@ -720,20 +732,23 @@ jobs:
             echo "::error::cursor.com/install returned an empty body — nothing to execute."
             exit 1
           fi
-          # </dev/null keeps stdin closed, as it effectively was under curl|bash, so an
-          # installer that ever branches on interactive stdin behaves as it did before.
+          # -k escalates to SIGKILL, so an installer that traps SIGTERM cannot outlive
+          # the cap. </dev/null keeps stdin closed, as it effectively was under
+          # curl|bash, so an installer that branches on interactive stdin is unaffected.
           rc=0
-          timeout 300 bash "$installer" </dev/null || rc=$?
+          timeout -k 30 240 bash "$installer" </dev/null || rc=$?
           if [ "$rc" -ne 0 ]; then
-            echo "::error::cursor.com installer exited $rc (124 = exceeded the 300s cap)."
+            echo "::error::cursor.com installer exited $rc (124 usually means it exceeded the 240s cap)."
             exit "$rc"
           fi
           # $GITHUB_PATH only applies to LATER steps, so assert against the install
           # location directly. The installer symlinks cursor-agent into ~/.local/bin,
           # which is already on the runner PATH — hence command -v is the real check
-          # and the explicit path is the fallback.
+          # and the explicit path is the fallback. -f as well as -x, because -x alone
+          # is also true for a searchable directory sitting at that path.
+          agent="$HOME/.local/bin/cursor-agent"
           if ! command -v cursor-agent >/dev/null 2>&1 \
-            && [ ! -x "$HOME/.local/bin/cursor-agent" ]; then
+            && ! { [ -f "$agent" ] && [ -x "$agent" ]; }; then
             echo "::error::cursor-agent missing after install — the installer ran but produced no cursor-agent binary (expected a symlink in \$HOME/.local/bin)."
             exit 1
           fi
