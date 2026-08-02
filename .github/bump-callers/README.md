@@ -52,9 +52,20 @@ pin it can *find*, so a caller whose `uses:` carries a placeholder, a tag or a
 branch instead of a 40-hex SHA is un-bumpable no matter how it is registered.
 That is the second way `ci-groom.yml` broke (BE-6015) — registered, but pinned to
 a `REPLACE_AT_MERGE_…` placeholder a landed PR never replaced, so every scheduled
-run died at startup. `bump-callers.sh` now emits a `::warning::` naming such a
-file rather than logging the reassuring `already at <short> — skipping` that hid
-it; a bump run's warnings are worth reading.
+run died at startup. `bump-callers.sh` now checks each caller's pin against the
+ORIGINAL file — independently of whether the rewrite changed anything — and
+warns per file, then **fails the run** with an aggregate error, instead of
+logging the reassuring `already at <short> — skipping` that hid it. Three shapes
+trip it, all of them a caller this fleet cannot keep current:
+
+- the `uses:` names our reusable but is not pinned to a 40-hex commit;
+- the `uses:` is pinned but a `workflows_ref:` beside it is not (the split state
+  a twice-pinning caller exists to avoid);
+- the file names some *other* github-workflows reusable and none of ours — a
+  stale roster entry, where the variable is the thing to fix, not the file.
+
+The failure lands after the whole fleet is processed, so every other caller still
+gets its bump; what it refuses to do is report success.
 
 They stay as thin entrypoints rather than one matrix because their triggers
 differ: a `cursor-review.yml` change must not spuriously bump agents-md or

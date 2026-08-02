@@ -550,15 +550,18 @@ check "reported already at SHORT"              "grep -q 'already at $SHORT' <<<\
 check "committed nothing"                       "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
 check "opened no PR"                            "[[ ! -f \"\$STUB_PUT_DIR/pr.log\" ]] || ! grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
 
-echo "== a caller with NO 40-hex pin WARNS instead of reporting 'already at' (BE-6015) =="
+echo "== a caller with NO movable pin FAILS the run instead of reporting 'already at' (BE-6015) =="
 # The twin of the case above, and the reason it needs its own test: a caller
 # pinned with something that is not a 40-hex SHA — a placeholder, a tag, a branch
 # — produces a byte-identical no-op rewrite, so the naive skip reported it as
 # converged. This repo's own ci-groom.yml sat on a `REPLACE_AT_MERGE_…`
 # placeholder for weeks, failing every scheduled run at startup on an
 # unresolvable ref, while the bumper's log said it was already current. The
-# bumper has no SHA to rewrite here, so the only honest output is a warning that
-# names the file for a human to pin.
+# bumper has no SHA to rewrite here, so it cannot self-heal the file; the honest
+# outcome is a warning naming it AND a red run — a warning inside a green run is
+# what let BE-6015 sit unnoticed. Two callers, both unpinnable, so the assertions
+# also prove the failure is aggregated at the END: the second caller is still
+# processed rather than the first one aborting the fan-out.
 new_case unpinned
 UNPINNED_FIXTURE="${WORK}/unpinned_caller.yml"
 printf '%s\n' \
@@ -571,14 +574,157 @@ printf '%s\n' \
   > "$UNPINNED_FIXTURE"
 STUB_CONTENT_FILE="$UNPINNED_FIXTURE" run_bump \
   VAR_NAME=GROOM_CALLERS TAG=groom WORKFLOW_FILE=groom.yml \
-  CALLERS_JSON='[{"repo":"Comfy-Org/secret-unpinned","file":".github/workflows/ci-groom.yml","label":""}]'
-# A warning, not a failure: one unpinnable caller must not abort the fan-out.
-check "exit 0" "[[ $RC -eq 0 ]]"
-check "warned about the missing commit pin" \
-  "grep -q '::warning::.*has no 40-hex groom.yml commit pin' <<<\"\$OUT\""
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-unpinned","file":".github/workflows/ci-groom.yml","label":""},{"repo":"Comfy-Org/secret-unpinned-two","file":".github/workflows/groom.yml","label":""}]'
+check "exit 1 — an unpinnable caller must not report success" "[[ $RC -eq 1 ]]"
+check "warned about the unmovable pin" \
+  "grep -q '::warning::.*pins groom.yml with something other than a 40-hex commit SHA' <<<\"\$OUT\""
+check "fan-out continued — BOTH callers were reached" \
+  "[[ \$(grep -c 'something other than a 40-hex commit SHA' <<<\"\$OUT\") -eq 2 ]]"
+check "aggregate error tallies both files" \
+  "grep -q '::error::2 caller file(s) this bumper cannot keep current for groom.yml' <<<\"\$OUT\""
 check "did NOT claim the file was already current"  "! grep -q 'already at $SHORT' <<<\"\$OUT\""
+check "did NOT report the fleet complete"           "! grep -q 'groom bump complete' <<<\"\$OUT\""
 check "committed nothing"                           "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
 check "opened no PR"                                "[[ ! -f \"\$STUB_PUT_DIR/pr.log\" ]] || ! grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
+
+echo "== an unmovable 'uses:' is caught even when the rewrite DOES change bytes (BE-6015) =="
+# The pin check cannot live inside the no-op branch. A groom caller pins TWICE, so
+# a placeholder `uses:` can sit beside a stale-but-movable `workflows_ref:`: the
+# rewrite then produces DIFFERENT content, the file is staged, and a "bump to
+# <short>" PR ships with the unresolvable `uses:` still in place — the same lie,
+# just quieter. Bump the half it can (never silently drop it) and still warn+fail.
+new_case partialpin
+PARTIAL_FIXTURE="${WORK}/partial_caller.yml"
+printf '%s\n' \
+  'name: CI groom' \
+  'jobs:' \
+  '  groom:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@REPLACE_AT_MERGE_WITH_THIS_PRS_SQUASH_SHA' \
+  '    with:' \
+  '      workflows_ref: 1111111111111111111111111111111111111111' \
+  > "$PARTIAL_FIXTURE"
+STUB_CONTENT_FILE="$PARTIAL_FIXTURE" run_bump \
+  VAR_NAME=GROOM_CALLERS TAG=groom WORKFLOW_FILE=groom.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-partial","file":".github/workflows/ci-groom.yml","label":""}]'
+PUT="${STUB_PUT_DIR}/put.last.txt"
+check "exit 1" "[[ $RC -eq 1 ]]"
+check "warned despite the rewrite changing bytes" \
+  "grep -q '::warning::.*pins groom.yml with something other than a 40-hex commit SHA' <<<\"\$OUT\""
+check "the movable half was still repaired"        "grep -qF '$NEW_SHA' \"$PUT\""
+check "the placeholder is still there to fix"      "grep -qF 'REPLACE_AT_MERGE' \"$PUT\""
+
+echo "== a commented-out old pin cannot vouch for a placeholder live pin (BE-6015) =="
+# The probe is anchored to `^[^#]*uses:` for the same reason GW_USES is: an
+# unanchored scan of the file body lets a commented-out previous pin, a docs URL,
+# or a sibling job's line satisfy the 40-hex test while the LIVE `uses:` is still
+# a placeholder — restoring the exact silence this check removes.
+new_case commentedpin
+COMMENTED_FIXTURE="${WORK}/commented_caller.yml"
+printf '%s\n' \
+  'name: CI groom' \
+  '# previously: uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@1111111111111111111111111111111111111111' \
+  'jobs:' \
+  '  groom:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@REPLACE_AT_MERGE_WITH_THIS_PRS_SQUASH_SHA' \
+  > "$COMMENTED_FIXTURE"
+STUB_CONTENT_FILE="$COMMENTED_FIXTURE" run_bump \
+  VAR_NAME=GROOM_CALLERS TAG=groom WORKFLOW_FILE=groom.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-commented","file":".github/workflows/ci-groom.yml","label":""}]'
+check "exit 1" "[[ $RC -eq 1 ]]"
+check "the commented 40-hex did not suppress the warning" \
+  "grep -q '::warning::.*pins groom.yml with something other than a 40-hex commit SHA' <<<\"\$OUT\""
+check "did NOT claim the file was already current"  "! grep -q 'already at $SHORT' <<<\"\$OUT\""
+
+echo "== a ref that merely STARTS with 40 hex is not an immutable commit pin (BE-6015) =="
+# `@[0-9a-f]{40}` with no trailing boundary accepts a mutable ref that happens to
+# begin with 40 hex — a `<sha>-wip` branch, an over-long hex string — and reports
+# it as pinned. The `([[:space:]]|$)` boundary makes the run a whole token.
+new_case suffixpin
+SUFFIX_FIXTURE="${WORK}/suffix_caller.yml"
+printf '%s\n' \
+  'name: CI groom' \
+  'jobs:' \
+  '  groom:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@1111111111111111111111111111111111111111-wip' \
+  > "$SUFFIX_FIXTURE"
+STUB_CONTENT_FILE="$SUFFIX_FIXTURE" run_bump \
+  VAR_NAME=GROOM_CALLERS TAG=groom WORKFLOW_FILE=groom.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-suffix","file":".github/workflows/ci-groom.yml","label":""}]'
+check "exit 1" "[[ $RC -eq 1 ]]"
+check "warned about the branch-shaped ref" \
+  "grep -q '::warning::.*pins groom.yml with something other than a 40-hex commit SHA' <<<\"\$OUT\""
+
+echo "== a pinned 'uses:' beside an UNPINNED workflows_ref is still un-bumpable (BE-6015) =="
+# A groom/agents-md caller pins TWICE. Validating only the `uses:` half reports a
+# caller as converged while its `workflows_ref:` sits on a tag or a branch —
+# leaving the split state (workflow from one version, briefs/ledger from another)
+# that pinning both exists to prevent, and which the bumper cannot repair either
+# because there is no 40-hex run on that line for the rewrite to move.
+new_case refunpinned
+REFUNPINNED_FIXTURE="${WORK}/refunpinned_caller.yml"
+printf '%s\n' \
+  'name: CI groom' \
+  'jobs:' \
+  '  groom:' \
+  "    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@${NEW_SHA}" \
+  '    with:' \
+  '      workflows_ref: main' \
+  > "$REFUNPINNED_FIXTURE"
+STUB_CONTENT_FILE="$REFUNPINNED_FIXTURE" run_bump \
+  VAR_NAME=GROOM_CALLERS TAG=groom WORKFLOW_FILE=groom.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-refunpinned","file":".github/workflows/ci-groom.yml","label":""}]'
+check "exit 1" "[[ $RC -eq 1 ]]"
+check "warned about the unpinned workflows_ref" \
+  "grep -q '::warning::.*workflows_ref.* is not a 40-hex commit SHA' <<<\"\$OUT\""
+check "did NOT claim the file was already current"  "! grep -q 'already at $SHORT' <<<\"\$OUT\""
+check "committed nothing"                           "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+
+echo "== a roster entry pointing at a file that calls ONLY a sibling reusable is the roster's bug =="
+# `GW_USES` non-empty proves the file calls SOME github-workflows reusable, not
+# ours. Telling a human to hand-pin a workflow this file does not use hides the
+# real problem — the stale entry in the fleet variable — so the warning names
+# that instead. (Silently skipping is not an option either: this file also
+# produces a no-op rewrite, i.e. the "already at" lie.)
+new_case wrongfleet
+WRONGFLEET_FIXTURE="${WORK}/wrongfleet_caller.yml"
+printf '%s\n' \
+  'name: CI cursor-review' \
+  'jobs:' \
+  '  review:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@1111111111111111111111111111111111111111' \
+  > "$WRONGFLEET_FIXTURE"
+STUB_CONTENT_FILE="$WRONGFLEET_FIXTURE" run_bump \
+  VAR_NAME=GROOM_CALLERS TAG=groom WORKFLOW_FILE=groom.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-wrongfleet","file":".github/workflows/ci-groom.yml","label":""}]'
+check "exit 1" "[[ $RC -eq 1 ]]"
+check "blamed the roster entry, not the file" \
+  "grep -q '::warning::.*has no \`uses:\` calling groom.yml.*GROOM_CALLERS.*fix the roster entry' <<<\"\$OUT\""
+check "did NOT tell a human to hand-pin groom.yml"  "! grep -q 'pin it by full SHA by hand' <<<\"\$OUT\""
+check "did NOT claim the file was already current"  "! grep -q 'already at $SHORT' <<<\"\$OUT\""
+check "did NOT bump the sibling fleet's pin"        "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+
+echo "== a file naming NO github-workflows reusable stays silent (no false positives) =="
+# The unusual-spelling escape hatch, now that an unpinnable caller fails the run:
+# `GW_USES` empty means no `uses:` line names a github-workflows reusable in a
+# spelling this script parses. "Not provably ours" must stay a quiet skip exactly
+# as the rewrite address treats it — a check that turns every unparsed caller red
+# is a check people disable.
+new_case nogw
+NOGW_FIXTURE="${WORK}/nogw_caller.yml"
+printf '%s\n' \
+  'name: CI something else' \
+  'jobs:' \
+  '  build:' \
+  '    steps:' \
+  '      - uses: actions/checkout@1111111111111111111111111111111111111111' \
+  > "$NOGW_FIXTURE"
+STUB_CONTENT_FILE="$NOGW_FIXTURE" run_bump \
+  VAR_NAME=GROOM_CALLERS TAG=groom WORKFLOW_FILE=groom.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-nogw","file":".github/workflows/ci-groom.yml","label":""}]'
+check "exit 0" "[[ $RC -eq 0 ]]"
+check "emitted no pin warning"        "! grep -q 'pin it by full SHA by hand' <<<\"\$OUT\""
+check "emitted no roster warning"     "! grep -q 'fix the roster entry' <<<\"\$OUT\""
+check "left the unrelated action pin alone" "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
 
 echo "== an ALREADY-CONVERTED 'main (<short>)' marker is refreshed, not frozen (BE-4523) =="
 # The legacy `# github-workflows#NN` rule only fires once. After a caller has

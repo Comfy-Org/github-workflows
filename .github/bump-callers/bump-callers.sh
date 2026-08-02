@@ -323,32 +323,70 @@ bump_repo() {
       fi
     fi
 
+    # PIN INTEGRITY (BE-6015) — asked of the ORIGINAL content, and asked BEFORE
+    # the no-op test below, because "the rewrite changed nothing" and "this file
+    # carries a pin this fleet can move" are different questions and only the
+    # second one is what the fleet promises. A caller that names our reusable but
+    # pins it with anything other than a 40-hex commit — a `REPLACE_AT_MERGE_…`
+    # placeholder, a tag, a branch — has no SHA for the sed above to rewrite, so
+    # the bumper cannot self-heal it; the honest report is a warning naming the
+    # file for a human to pin. Not hypothetical: this repo's own `ci-groom.yml`
+    # sat on such a placeholder from the day it was written, failing every
+    # scheduled run at startup on an unresolvable ref, while an audit of the
+    # bumper's log read `already at <short> — skipping` and moved on.
+    #
+    # Checking here rather than inside the no-op branch is load-bearing: a file
+    # can carry an unmovable `uses:` AND a stale-but-movable `workflows_ref:`, in
+    # which case the rewrite DOES change bytes, the file is staged, and a "bump to
+    # <short>" PR would ship with the unresolvable `uses:` still in place — a
+    # quieter version of the same lie. Both halves are checked for the same
+    # reason: a groom/agents-md caller pins TWICE, and a `uses:` at NEW_SHA beside
+    # a `workflows_ref:` on `main` is exactly the split state (workflow from one
+    # version, briefs/ledger from another) this fleet exists to prevent.
+    #
+    # Both probes are anchored to `^[^#]*<key>:` — the same anchoring `GW_USES`
+    # uses — so a commented-out old pin, a docs URL, or a sibling job's line
+    # cannot vouch for a live pin that is still a placeholder. The trailing
+    # `([[:space:]]|$)` makes the 40-hex run a whole token, so a mutable ref that
+    # merely STARTS with 40 hex (a `<sha>-suffix` branch, an over-long hex string)
+    # is not mistaken for an immutable commit pin.
+    local PIN_OK=1
+    if ! grep -qxF "$WORKFLOW_FILE" <<<"$GW_USES"; then
+      # `GW_USES` empty means no `uses:` line here names a github-workflows
+      # reusable in a spelling this script can parse — "not provably ours", which
+      # stays silent exactly as the rewrite address above does. Non-empty but
+      # WITHOUT our file is a different animal: the roster sent us to a file that
+      # calls only a SIBLING fleet's reusable, so there is nothing here for this
+      # fleet to bump and the stale entry — not the file — is the bug.
+      if [[ -n "$GW_USES" ]]; then
+        PIN_OK=0
+        echo "::warning::${REPO}: ${FILE} has no \`uses:\` calling ${WORKFLOW_FILE} — it is listed in ${VAR_NAME} but this fleet has nothing to bump in it; fix the roster entry"
+      fi
+    elif ! grep -qE "^[^#]*uses:[[:space:]]*[^[:space:]]*github-workflows/\.github/workflows/${WORKFLOW_FILE//./\\.}@[0-9a-f]{40}([[:space:]]|$)" <<<"$OLD_CONTENT"; then
+      PIN_OK=0
+      echo "::warning::${REPO}: ${FILE} pins ${WORKFLOW_FILE} with something other than a 40-hex commit SHA — the bumper cannot move it; pin it by full SHA by hand"
+    elif grep -qE '^[^#]*workflows_ref:' <<<"$OLD_CONTENT" \
+      && ! grep -qE "^[^#]*workflows_ref:[[:space:]]*[0-9a-f]{40}([[:space:]]|$)" <<<"$OLD_CONTENT"; then
+      PIN_OK=0
+      echo "::warning::${REPO}: ${FILE} pins ${WORKFLOW_FILE} by SHA but its \`workflows_ref:\` is not a 40-hex commit SHA — the bumper cannot move it; pin it by full SHA by hand"
+    fi
+    # Accumulate rather than `return 1`: an unpinnable caller is broken at startup
+    # by definition, so the run must not report success — but it must also not
+    # abort the fan-out, since every OTHER caller in the fleet still deserves its
+    # bump. The aggregate `::error::` after the loop is what makes this
+    # unskimmable; BE-6015 persisted for weeks precisely because a warning in a
+    # green run reads as noise.
+    (( PIN_OK )) || UNPINNABLE+=("${REPO}:${FILE}")
+
     # Already fully pinned → the rewrite is a no-op → nothing to do for this file.
     # Comparing the rewritten content to the original (rather than grepping for
     # NEW_SHA appearing *anywhere*) also repairs a half-bumped file: if a prior
     # run left one of two refs at NEW_SHA and the other stale, the content still
     # differs here, so the file is re-staged and repaired instead of skipped.
-    #
-    # ...but a no-op rewrite only MEANS "already at NEW_SHA" when the file
-    # actually carries a 40-hex pin this pass could have moved. A caller that
-    # names our reusable and pins it with anything else — a placeholder, a tag, a
-    # branch — produces a byte-identical no-op, and reporting that as converged is
-    # a confident lie about the one thing this fleet exists to guarantee. It is
-    # also not hypothetical: this repo's own `ci-groom.yml` sat on a
-    # `REPLACE_AT_MERGE_…` placeholder from the day it was written, failing every
-    # scheduled run at startup on an unresolvable ref, while an audit of the
-    # bumper's log read `already at <short> — skipping` and moved on (BE-6015).
-    # There is no SHA here for the bumper to rewrite, so it cannot self-heal this
-    # — the honest report is a warning naming the file for a human to pin.
-    # `GW_USES` is the same reusable-name probe the rewrite address uses above, so
-    # an unusual `uses:` spelling that probe cannot identify stays silent rather
-    # than warning on every converged caller.
+    # The "already at" line is claimed only when the pin check above vouched for
+    # the file; otherwise the warning it just emitted is the whole story.
     if [[ "$NEW_CONTENT" == "$OLD_CONTENT" ]]; then
-      if [[ -n "$GW_USES" ]] && ! grep -qE "github-workflows/\.github/workflows/${WORKFLOW_FILE//./\\.}@[0-9a-f]{40}" <<<"$OLD_CONTENT"; then
-        echo "::warning::${REPO}: ${FILE} has no 40-hex ${WORKFLOW_FILE} commit pin — the bumper cannot move it; pin it by full SHA by hand"
-      else
-        echo "${REPO}: ${FILE} already at ${SHORT} — skipping"
-      fi
+      (( PIN_OK )) && echo "${REPO}: ${FILE} already at ${SHORT} — skipping"
       continue
     fi
 
@@ -540,6 +578,10 @@ for ENTRY in "${CALLERS[@]}"; do
 done
 
 FAILED=()
+# Caller files that carry no pin this fleet can move (BE-6015). Appended to from
+# inside bump_repo — deliberately a plain global, since the bump loop below runs
+# the function in this shell (no subshell/pipe), so the accumulation survives.
+UNPINNABLE=()
 for REPO in "${REPOS[@]}"; do
   # Collect this repo's entries (in their original order) and bump them together.
   ENTRIES=()
@@ -551,6 +593,17 @@ done
 
 if (( ${#FAILED[@]} )); then
   printf '::error::bump failed for %d repo(s): %s\n' "${#FAILED[@]}" "${FAILED[*]}"
+fi
+# Every other caller has been bumped by now; failing here (rather than at the
+# first offender) keeps the fan-out complete while still refusing to report
+# success for a fleet that contains a caller the bumper cannot keep current.
+# Repo names are `::add-mask::`ed at parse time, so this prints *** in the public
+# log while the file path stays readable enough to act on.
+if (( ${#UNPINNABLE[@]} )); then
+  printf '::error::%d caller file(s) this bumper cannot keep current for %s — see the per-file warnings above: %s\n' \
+    "${#UNPINNABLE[@]}" "${WORKFLOW_FILE}" "${UNPINNABLE[*]}"
+fi
+if (( ${#FAILED[@]} || ${#UNPINNABLE[@]} )); then
   exit 1
 fi
 echo "${TAG} bump complete for all callers."
