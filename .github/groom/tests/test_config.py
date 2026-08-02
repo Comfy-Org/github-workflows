@@ -369,9 +369,39 @@ class TestBailSinkWiring(unittest.TestCase):
     def test_build_pr_suppresses_and_warns(self):
         self.assertIn("from config import normalize_bail_sink", self.wf)
         self.assertIn('bail_sink = normalize_bail_sink(os.environ.get("BAIL_SINK"))', self.wf)
-        self.assertIn('if bail_sink == "none":', self.wf)
+        self.assertIn('if bail_sink == "none" and not withheld:', self.wf)
         # Suppressed must still be VISIBLE — the annotation is the recovery path.
         self.assertIn("::warning::bail_sink=none", self.wf)
+
+    def test_secret_scan_withhold_is_exempt_from_suppression(self):
+        """`bail_sink` is an OPERATIONAL key only while it can't erase a security record.
+
+        The exemption rides on a machine field (`"withheld": true` in
+        result.json), NOT a substring match on the prose reason, so rewording the
+        bail message can never silently disarm it. Pin all three links: the
+        producer's flag, the bail call that sets it, and the consumer's read.
+        """
+        self.assertIn('printf \'{"status":"bail","reason":%s,"withheld":%s}\\n\'', self.wf)
+        withhold = re.search(r"\n\s*bail \"builder output withheld:.*\n", self.wf).group(0)
+        self.assertTrue(withhold.rstrip().endswith(" true"), withhold)
+        self.assertIn(
+            'file_issue(result.get("reason", "not built"), withheld=bool(result.get("withheld")))',
+            self.wf,
+        )
+
+    def test_missing_signature_guard_precedes_the_sink_branch(self):
+        """A schema failure must not be reported as an operator's suppression."""
+        body = self.wf[self.wf.index("def file_issue(reason, withheld=False):"):]
+        self.assertLess(body.index("has no signature"), body.index('bail_sink == "none"'))
+
+    def test_suppression_annotation_sanitizes_every_model_authored_field(self):
+        """`signature` is model-authored too: a raw newline in it forges a workflow command."""
+        branch = re.search(
+            r'(?s)if bail_sink == "none" and not withheld:.*?\n\s+return\n', self.wf
+        ).group(0)
+        for field in ("oneline(title, 120)", "oneline(sig, 200)", "oneline(reason, 300)"):
+            self.assertIn(field, branch)
+        self.assertNotIn("{sig or ", branch)
 
     def test_max_findings_description_disclaims_bail_issues(self):
         """The documentation half of the ticket, kept from silently rotting."""

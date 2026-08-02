@@ -38,7 +38,11 @@ scan less, propose less, or file less — never grant it more privilege. That is
 why `bail_sink` (BE-6157) is operational even though its sibling `sink` is
 locked: `sink` picks the credentialed backend every finding is filed through,
 while `bail_sink` only chooses whether a builder BAIL becomes an issue or just a
-warning. Note the corollary for `pr_size_limit`, which is the knob an operator
+warning — and `build_pr` exempts the pre-publish secret-scan withhold from `none`
+so the one bail with security meaning keeps its durable record either way, which
+is what keeps "quieter, never less privileged" true here.
+
+Note the corollary for `pr_size_limit`, which is the knob an operator
 usually reaches for after a near-miss bail: it stays LOCKED (a reviewed commit in
 the caller) because it is the unreviewably-large-patch backstop — suppressing the
 bail is not a reason to unlock raising the ceiling.

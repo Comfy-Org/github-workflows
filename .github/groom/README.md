@@ -48,14 +48,19 @@ Two things follow that are easy to get wrong:
 - **`bail_sink` is the knob for the bail path.** `issue` (default) keeps the
   behavior above; `none` files nothing and instead emits a `::warning::` naming
   the finding, its bail reason and its signature, plus a run-summary line — so the
-  bail is visible in the run rather than invisible. `none` suppresses *every*
-  bail, including the secret-scan withhold (which still prints its own
-  `::error::`), and because no issue is filed, no signature marker is recorded,
-  so a later run may re-propose and re-bail on that finding.
+  bail is visible in the run rather than invisible. Because no issue is filed, no
+  signature marker is recorded, so a later run re-proposes the finding; a
+  *deterministic* bail (a patch that always exceeds `pr_size_limit`, or always
+  touches a CI-privileged path) therefore re-bails on every run and permanently
+  holds one of the `max_prs` slots — at `max_prs: 1`, nothing else ever gets
+  built. The one bail `none` does **not** suppress is the pre-publish secret-scan
+  withhold: that issue is filed regardless, because an expiring `::error::` in the
+  run log is not a durable record of a possible key-exfil attempt.
 
 `bail_sink` is an **operational** knob (`vars.GROOM_CONFIG` can set it with no
 PR), unlike `sink` / `pr_size_limit` / `builder`, which stay in the reviewed
-workflow file. If bails are frequent because well-scoped patches keep landing
+workflow file — the withhold carve-out above is what keeps that classification
+honest: the knob can make groom quieter, never less safe. If bails are frequent because well-scoped patches keep landing
 just over the line, the real fix is usually raising `pr_size_limit` **in the
 caller** — a reviewed commit, by design — not suppressing the signal.
 
