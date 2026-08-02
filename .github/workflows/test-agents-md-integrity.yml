@@ -72,14 +72,27 @@ jobs:
           printf 'plugin payload\n' > "$root/plugins/demo/AGENTS.md"
           printf 'Claude-only instructions shipped to plugin consumers.\n' > "$root/plugins/demo/CLAUDE.md"
 
-          if python3 .github/agents-md-integrity/check_agents_md.py --root "$root"; then
-            echo "::error::payload repo passed WITHOUT --exclude — check_nested is not firing"
+          # Assert the exact failure, not merely "non-zero": an exit-2 config
+          # error or an unhandled traceback would also be non-zero and would
+          # mask a checker that is broken for every repo.
+          set +e
+          out="$(python3 .github/agents-md-integrity/check_agents_md.py --root "$root" 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+          if [ "$code" -ne 1 ]; then
+            echo "::error::payload repo without --exclude: expected exit 1, got $code"
             exit 1
           fi
+          grep -qF "FAIL: nested 'plugins/demo/AGENTS.md' has no sibling" <<<"$out" || {
+            echo "::error::payload repo passed WITHOUT --exclude — check_nested is not firing"
+            exit 1
+          }
 
           out="$(python3 .github/agents-md-integrity/check_agents_md.py --root "$root" --exclude 'plugins/**')"
           echo "$out"
-          grep -qF 'EXCLUDED: plugins/demo (matched plugins/**)' <<<"$out" || {
+          # Pruned once at `plugins`, not once per plugin directory.
+          grep -qF 'EXCLUDED: plugins (matched plugins/**)' <<<"$out" || {
             echo "::error::exclusion applied but left no trace in the log"
             exit 1
           }

@@ -263,7 +263,7 @@ class ExcludePathsTest(unittest.TestCase):
         failures, warnings, exclusions = self._run(exclude=["plugins/**"])
         self.assertEqual(failures, [])
         self.assertEqual(warnings, [])
-        self.assertIn(("plugins/comfy-conventions", "plugins/**"), exclusions)
+        self.assertIn(("plugins", "plugins/**"), exclusions)
 
     def test_non_excluded_nested_pair_still_fails(self):
         # Same repo, a SECOND nested file outside the excluded subtree: the
@@ -277,7 +277,7 @@ class ExcludePathsTest(unittest.TestCase):
         self.assertIn("packages/api/AGENTS.md", failures[0])
         self.assertIn("no sibling 'CLAUDE.md'", failures[0])
         self.assertNotIn("plugins", "\n".join(failures))
-        self.assertEqual(exclusions, [("plugins/comfy-conventions", "plugins/**")])
+        self.assertEqual(exclusions, [("plugins", "plugins/**")])
 
     def test_exclusion_targeting_root_errors_out(self):
         for glob in ("**", "AGENTS.md", "CLAUDE.md", "*", "/AGENTS.md", "./CLAUDE.md"):
@@ -327,7 +327,7 @@ class ExcludePathsTest(unittest.TestCase):
         failures, _, exclusions = self._run(exclude=["plugins/**"])
         self.assertEqual(failures, [])
         # Reported once, at the pruned directory — not once per buried file.
-        self.assertEqual(exclusions, [("plugins/a", "plugins/**")])
+        self.assertEqual(exclusions, [("plugins", "plugins/**")])
 
     def test_directly_matched_nested_file_is_reported(self):
         glob = "packages/api/AGENTS.md"
@@ -362,7 +362,7 @@ class ExcludePathsTest(unittest.TestCase):
         self.assertEqual(failures, [])
         # The vendored tree is skipped silently (baseline), not reported as an
         # exclusion — only the caller's own globs get an EXCLUDED line.
-        self.assertEqual(exclusions, [("plugins/x", "plugins/**")])
+        self.assertEqual(exclusions, [("plugins", "plugins/**")])
 
     # --- glob semantics ---------------------------------------------------
 
@@ -390,6 +390,61 @@ class ExcludePathsTest(unittest.TestCase):
         self.assertEqual(
             exclusions, [("a/payload", "**/payload"), ("payload", "**/payload")]
         )
+
+    def test_interior_double_star_spans_zero_segments(self):
+        # The documented contract is "`**` crosses segments", and the leading
+        # `**/` case already matches zero of them; an interior one that needed
+        # at least one segment would silently not apply the exclusion a caller
+        # wrote in the standard globstar form.
+        _write(self.root, "plugins/AGENTS.md", "payload\n")
+        _write(self.root, "plugins/deep/nest/AGENTS.md", "payload\n")
+        failures, _, exclusions = self._run(exclude=["plugins/**/AGENTS.md"])
+        self.assertEqual(failures, [])
+        self.assertIn(("plugins/AGENTS.md", "plugins/**/AGENTS.md"), exclusions)
+        self.assertIn(
+            ("plugins/deep/nest/AGENTS.md", "plugins/**/AGENTS.md"), exclusions
+        )
+
+    def test_trailing_double_star_prunes_at_the_directory_itself(self):
+        # `plugins` and `plugins/**` are documented as identical. If `/**`
+        # matched only the CHILDREN, a marketplace with hundreds of plugins
+        # would emit hundreds of EXCLUDED lines instead of one.
+        for name in ("a", "b", "c"):
+            _write(self.root, f"plugins/{name}/AGENTS.md", "payload\n")
+        bare = self._run(exclude=["plugins"])
+        globbed = self._run(exclude=["plugins/**"])
+        self.assertEqual(bare[0], [])
+        self.assertEqual([p for p, _ in bare[2]], ["plugins"])
+        self.assertEqual([p for p, _ in globbed[2]], ["plugins"])
+
+    def test_glob_is_a_strict_full_match_not_match_plus_dollar(self):
+        # Python's `$` also matches before a trailing newline, and a path
+        # component may contain one, so `re.match(...\n)` would let a crafted
+        # directory name be pruned by an exclusion that does not name it.
+        regex = cam._exclude_pattern_to_regex("plugins/demo")
+        self.assertTrue(regex.fullmatch("plugins/demo"))
+        self.assertTrue(regex.fullmatch("plugins/demo/nested"))
+        self.assertIsNone(regex.fullmatch("plugins/demo\n"))
+        self.assertIsNone(cam._match_exclude("plugins/demo\n", [("g", regex)]))
+
+    def test_wildcard_only_glob_is_rejected(self):
+        # `*/**` matches every path containing a slash but neither protected
+        # root file, so the root guard alone would let it disable the whole
+        # nested scan while `check_nested` still read `true`.
+        for glob in ("*/**", "*/*", "**/*", "**/**"):
+            with self.subTest(glob=glob):
+                with self.assertRaises(cam.ExcludeConfigError) as ctx:
+                    self._run(exclude=[glob])
+                self.assertIn("not excludable", str(ctx.exception))
+
+    def test_glob_normalizing_to_the_root_is_rejected(self):
+        # `/` most plausibly reads as "exclude the repo root"; it must be the
+        # loud exit-2 rejection, not a regex that silently matches nothing.
+        for glob in ("/", "./", "//", "."):
+            with self.subTest(glob=glob):
+                with self.assertRaises(cam.ExcludeConfigError) as ctx:
+                    self._run(exclude=[glob])
+                self.assertIn("not excludable", str(ctx.exception))
 
     def test_unmatched_glob_is_a_silent_no_op_not_an_error(self):
         _write(self.root, "packages/api/AGENTS.md", "nested\n")
@@ -425,9 +480,7 @@ class ExcludePathsTest(unittest.TestCase):
         code, out = self._main("--exclude", "plugins/**")
         self.assertEqual(code, 0)
         self.assertIn("Exclusion globs: plugins/**", out)
-        self.assertIn(
-            "EXCLUDED: plugins/comfy-conventions (matched plugins/**)", out
-        )
+        self.assertIn("EXCLUDED: plugins (matched plugins/**)", out)
         self.assertIn("::notice::AGENTS.md integrity: EXCLUDED", out)
         self.assertIn("Result: AGENTS.md integrity OK.", out)
 
@@ -444,13 +497,33 @@ class ExcludePathsTest(unittest.TestCase):
         self.assertIn("not excludable", out)
         self.assertIn("::error::", out)
 
+    def test_annotations_escape_newlines_out_of_repo_controlled_paths(self):
+        # A path component may contain a newline, and the scanned tree is
+        # PR-controlled: unescaped, the name below would close the `::notice::`
+        # and emit a second workflow command that suppresses the annotations
+        # printed after it.
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cam._emit(
+                ["nested 'a\n::error::forged' is bad"],
+                [],
+                [("x\n::stop-commands::tok", "x*")],
+            )
+        lines = buf.getvalue().splitlines()
+        # The injected commands survive only as inert %0A-escaped text, so no
+        # LINE begins with a workflow command other than the ones we emitted.
+        self.assertIn("EXCLUDED: x%0A::stop-commands::tok (matched x*)", lines)
+        for line in lines:
+            if line.startswith("::"):
+                self.assertRegex(line, r"^::(notice|warning|error)::AGENTS\.md ")
+
     def test_cli_accepts_repeated_and_csv_flags(self):
         _write(self.root, "plugins/x/AGENTS.md", "payload\n")
         _write(self.root, "vendored-skills/y/AGENTS.md", "payload\n")
         code, out = self._main("--exclude", "plugins/**,vendored-skills/**")
         self.assertEqual(code, 0)
-        self.assertIn("EXCLUDED: plugins/x", out)
-        self.assertIn("EXCLUDED: vendored-skills/y", out)
+        self.assertIn("EXCLUDED: plugins (matched plugins/**)", out)
+        self.assertIn("EXCLUDED: vendored-skills (matched vendored-skills/**)", out)
 
 
 if __name__ == "__main__":

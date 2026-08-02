@@ -48,10 +48,14 @@ with:
     plugins/**
 ```
 
-- Repeatable, and one value may be comma- or newline-separated. Globs are
-  repo-root relative; `*`/`?` stay within a path segment, `**` crosses
-  segments, a leading `**/` means "at any depth", and a glob matching a
-  directory excludes everything beneath it.
+- Repeatable, and one value may be comma- or newline-separated. Because `,` is
+  always a separator, a path containing a literal comma cannot be expressed.
+- Globs are repo-root relative; `*`/`?` stay within a path segment, `**`
+  crosses **zero or more** segments (so `plugins/**/AGENTS.md` also matches
+  `plugins/AGENTS.md`), a leading `**/` means "at any depth", and a glob
+  matching a directory excludes everything beneath it — `plugins` and
+  `plugins/**` are identical, and both prune once at `plugins` rather than once
+  per child.
 - **Additive**, never a replacement: the hardcoded `SKIP_DIRS` baseline
   (`node_modules`, `vendor`, `.git`, …) still applies.
 - Applied during the **walk**, so an excluded subtree is never opened or
@@ -62,4 +66,8 @@ with:
   leaves no trace is how coverage rots invisibly.
 - A glob matching the **root** agents file or `CLAUDE.md` is rejected with exit
   code **2** (`1` = a check failed, `0` = pass). Root compliance is the
-  non-negotiable part of the standard and is not excludable.
+  non-negotiable part of the standard and is not excludable. So are the two
+  ways of asking for the whole repo without saying so: a glob that normalizes
+  to nothing (`/`, `.`, `//`) and a glob made only of wildcard segments (`*`,
+  `**`, `*/**`, `*/*`) — the latter would otherwise prune every top-level
+  directory while `check_nested` still read `true`. Name the subtree.

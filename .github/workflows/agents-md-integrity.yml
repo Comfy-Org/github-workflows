@@ -50,8 +50,10 @@ name: AGENTS.md Integrity (reusable)
 #                        the whole repo. Excluded subtrees are never scanned,
 #                        and each one is reported in the run log as
 #                        `EXCLUDED: <path> (matched <glob>)`. A glob that would
-#                        exclude the ROOT agents file or `CLAUDE.md` is rejected
-#                        (the run fails) — root compliance is not excludable.
+#                        exclude the ROOT agents file or `CLAUDE.md`, or that
+#                        asks for the whole repo without saying so (`/`, `*`,
+#                        `*/**`), is rejected and the run fails — neither root
+#                        compliance nor the nested scan as a whole is excludable.
 #                        Default empty (nothing excluded). Example:
 #                          exclude_paths: |
 #                            plugins/**
@@ -103,7 +105,8 @@ on:
           AGENTS.md scan (e.g. `plugins/**` for a repo that ships agent
           instructions as distributable payload). Excluded subtrees are never
           scanned and are reported in the run log. A glob matching the root
-          agents file or `CLAUDE.md` is rejected. Default empty.
+          agents file or `CLAUDE.md`, or made only of wildcards, is rejected.
+          Default empty.
         type: string
         required: false
         default: ''
@@ -181,7 +184,10 @@ jobs:
           # it ran before.
           args=(--root "$AGENTS_CHECK_ROOT")
           if [ -n "$(printf '%s' "$EXCLUDE_PATHS" | tr -d '[:space:]')" ]; then
-            args+=(--exclude "$EXCLUDE_PATHS")
+            # Attached form: as a separate token, a legitimate glob starting
+            # with a hyphen (`-generated/**`) is parsed by argparse as an
+            # unknown option and the job dies with a usage error.
+            args+=("--exclude=$EXCLUDE_PATHS")
           fi
           python3 "$GITHUB_WORKSPACE/_agents_md_integrity/.github/agents-md-integrity/check_agents_md.py" \
             "${args[@]}"
