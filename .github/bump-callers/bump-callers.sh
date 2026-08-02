@@ -328,8 +328,27 @@ bump_repo() {
     # NEW_SHA appearing *anywhere*) also repairs a half-bumped file: if a prior
     # run left one of two refs at NEW_SHA and the other stale, the content still
     # differs here, so the file is re-staged and repaired instead of skipped.
+    #
+    # ...but a no-op rewrite only MEANS "already at NEW_SHA" when the file
+    # actually carries a 40-hex pin this pass could have moved. A caller that
+    # names our reusable and pins it with anything else — a placeholder, a tag, a
+    # branch — produces a byte-identical no-op, and reporting that as converged is
+    # a confident lie about the one thing this fleet exists to guarantee. It is
+    # also not hypothetical: this repo's own `ci-groom.yml` sat on a
+    # `REPLACE_AT_MERGE_…` placeholder from the day it was written, failing every
+    # scheduled run at startup on an unresolvable ref, while an audit of the
+    # bumper's log read `already at <short> — skipping` and moved on (BE-6015).
+    # There is no SHA here for the bumper to rewrite, so it cannot self-heal this
+    # — the honest report is a warning naming the file for a human to pin.
+    # `GW_USES` is the same reusable-name probe the rewrite address uses above, so
+    # an unusual `uses:` spelling that probe cannot identify stays silent rather
+    # than warning on every converged caller.
     if [[ "$NEW_CONTENT" == "$OLD_CONTENT" ]]; then
-      echo "${REPO}: ${FILE} already at ${SHORT} — skipping"
+      if [[ -n "$GW_USES" ]] && ! grep -qE "github-workflows/\.github/workflows/${WORKFLOW_FILE//./\\.}@[0-9a-f]{40}" <<<"$OLD_CONTENT"; then
+        echo "::warning::${REPO}: ${FILE} has no 40-hex ${WORKFLOW_FILE} commit pin — the bumper cannot move it; pin it by full SHA by hand"
+      else
+        echo "${REPO}: ${FILE} already at ${SHORT} — skipping"
+      fi
       continue
     fi
 

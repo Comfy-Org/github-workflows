@@ -550,6 +550,36 @@ check "reported already at SHORT"              "grep -q 'already at $SHORT' <<<\
 check "committed nothing"                       "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
 check "opened no PR"                            "[[ ! -f \"\$STUB_PUT_DIR/pr.log\" ]] || ! grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
 
+echo "== a caller with NO 40-hex pin WARNS instead of reporting 'already at' (BE-6015) =="
+# The twin of the case above, and the reason it needs its own test: a caller
+# pinned with something that is not a 40-hex SHA — a placeholder, a tag, a branch
+# — produces a byte-identical no-op rewrite, so the naive skip reported it as
+# converged. This repo's own ci-groom.yml sat on a `REPLACE_AT_MERGE_…`
+# placeholder for weeks, failing every scheduled run at startup on an
+# unresolvable ref, while the bumper's log said it was already current. The
+# bumper has no SHA to rewrite here, so the only honest output is a warning that
+# names the file for a human to pin.
+new_case unpinned
+UNPINNED_FIXTURE="${WORK}/unpinned_caller.yml"
+printf '%s\n' \
+  'name: CI groom' \
+  'jobs:' \
+  '  groom:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@REPLACE_AT_MERGE_WITH_THIS_PRS_SQUASH_SHA' \
+  '    with:' \
+  '      workflows_ref: REPLACE_AT_MERGE_WITH_THIS_PRS_SQUASH_SHA' \
+  > "$UNPINNED_FIXTURE"
+STUB_CONTENT_FILE="$UNPINNED_FIXTURE" run_bump \
+  VAR_NAME=GROOM_CALLERS TAG=groom WORKFLOW_FILE=groom.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-unpinned","file":".github/workflows/ci-groom.yml","label":""}]'
+# A warning, not a failure: one unpinnable caller must not abort the fan-out.
+check "exit 0" "[[ $RC -eq 0 ]]"
+check "warned about the missing commit pin" \
+  "grep -q '::warning::.*has no 40-hex groom.yml commit pin' <<<\"\$OUT\""
+check "did NOT claim the file was already current"  "! grep -q 'already at $SHORT' <<<\"\$OUT\""
+check "committed nothing"                           "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+check "opened no PR"                                "[[ ! -f \"\$STUB_PUT_DIR/pr.log\" ]] || ! grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
+
 echo "== an ALREADY-CONVERTED 'main (<short>)' marker is refreshed, not frozen (BE-4523) =="
 # The legacy `# github-workflows#NN` rule only fires once. After a caller has
 # been migrated to the `main (<short>)` marker, every later bump used to advance

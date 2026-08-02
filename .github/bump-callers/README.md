@@ -47,6 +47,15 @@ ended up failing at startup against a reusable it had drifted away from. Before
 adding a caller anywhere, check that its fleet exists **and** that the repo is in
 the variable; the second half is the one people skip.
 
+Being in the variable is necessary, not sufficient: the bumper can only move a
+pin it can *find*, so a caller whose `uses:` carries a placeholder, a tag or a
+branch instead of a 40-hex SHA is un-bumpable no matter how it is registered.
+That is the second way `ci-groom.yml` broke (BE-6015) — registered, but pinned to
+a `REPLACE_AT_MERGE_…` placeholder a landed PR never replaced, so every scheduled
+run died at startup. `bump-callers.sh` now emits a `::warning::` naming such a
+file rather than logging the reassuring `already at <short> — skipping` that hid
+it; a bump run's warnings are worth reading.
+
 They stay as thin entrypoints rather than one matrix because their triggers
 differ: a `cursor-review.yml` change must not spuriously bump agents-md or
 pr-size callers, and vice versa. Everything else (masking, the PR-per-caller
