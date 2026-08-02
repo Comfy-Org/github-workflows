@@ -59,3 +59,43 @@ jobs:
             exit 1
           fi
           echo "checker correctly failed the drifted repo"
+
+      - name: Smoke test — --exclude carves out a payload subtree, and is logged
+        run: |
+          # A repo that SHIPS agent instructions as plugin payload: the nested
+          # pair is real content, not a shim, so it can only pass via exclusion.
+          root="$(mktemp -d)"
+          printf 'thin agents file\n' > "$root/AGENTS.md"
+          printf '@AGENTS.md\n' > "$root/CLAUDE.md"
+          mkdir -p "$root/.github" "$root/plugins/demo"
+          printf '* @comfy-org/backend\n' > "$root/.github/CODEOWNERS"
+          printf 'plugin payload\n' > "$root/plugins/demo/AGENTS.md"
+          printf 'Claude-only instructions shipped to plugin consumers.\n' > "$root/plugins/demo/CLAUDE.md"
+
+          if python3 .github/agents-md-integrity/check_agents_md.py --root "$root"; then
+            echo "::error::payload repo passed WITHOUT --exclude — check_nested is not firing"
+            exit 1
+          fi
+
+          out="$(python3 .github/agents-md-integrity/check_agents_md.py --root "$root" --exclude 'plugins/**')"
+          echo "$out"
+          grep -qF 'EXCLUDED: plugins/demo (matched plugins/**)' <<<"$out" || {
+            echo "::error::exclusion applied but left no trace in the log"
+            exit 1
+          }
+          echo "checker correctly excluded the payload subtree and logged it"
+
+      - name: Smoke test — a root-excluding glob is rejected
+        run: |
+          root="$(mktemp -d)"
+          printf 'thin agents file\n' > "$root/AGENTS.md"
+          printf '@AGENTS.md\n' > "$root/CLAUDE.md"
+          set +e
+          python3 .github/agents-md-integrity/check_agents_md.py --root "$root" --exclude '**'
+          code=$?
+          set -e
+          if [ "$code" -ne 2 ]; then
+            echo "::error::expected exit 2 for a root-excluding glob, got $code"
+            exit 1
+          fi
+          echo "checker correctly rejected a root-excluding glob"

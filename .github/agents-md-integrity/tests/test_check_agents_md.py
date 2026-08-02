@@ -8,7 +8,9 @@ repo and one repo that trips every hard check.
 Run: python3 .github/agents-md-integrity/tests/test_check_agents_md.py
 """
 
+import contextlib
 import importlib.util
+import io
 import os
 import tempfile
 import unittest
@@ -27,6 +29,7 @@ DEFAULT_CONFIG = {
     "check_nested": True,
     "require_shim": True,
     "require_codeowners": False,
+    "exclude": [],
 }
 
 
@@ -52,6 +55,12 @@ class CheckAgentsMdTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def _run(self, **overrides):
+        """(failures, warnings) — the pair almost every case cares about."""
+        failures, warnings, _ = self._run_full(**overrides)
+        return failures, warnings
+
+    def _run_full(self, **overrides):
+        """(failures, warnings, exclusions) — for the exclusion cases."""
         return cam.run_checks(self.root, _config(**overrides))
 
     # --- passing case -----------------------------------------------------
@@ -213,6 +222,235 @@ class CheckAgentsMdTest(unittest.TestCase):
         _write(self.root, "CODEOWNERS", "* @o\n")
         failures, _ = self._run(agents_file="docs/AGENTS.md", require_shim=False)
         self.assertEqual(failures, [])
+
+
+class ExcludePathsTest(unittest.TestCase):
+    """`--exclude` / `exclude_paths`: carve payload subtrees out of the walk.
+
+    The motivating shape is a repo whose PRODUCT is agent instructions — a
+    plugin marketplace ships `plugins/<name>/AGENTS.md` next to a real
+    multi-line Claude payload, not an `@AGENTS.md` shim — where `check_nested`
+    is correct everywhere except that subtree.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+        # A compliant root, so only the nested/exclusion behavior is under test.
+        _write(self.root, "AGENTS.md", "thin\n")
+        _write(self.root, "CLAUDE.md", "@AGENTS.md\n")
+        _write(self.root, "CODEOWNERS", "* @o\n")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _run(self, **overrides):
+        return cam.run_checks(self.root, _config(**overrides))
+
+    def _write_plugin_payload(self):
+        """The comfy-conventions shape: payload AGENTS.md + a real CLAUDE.md."""
+        _write(self.root, "plugins/comfy-conventions/AGENTS.md", "payload\n")
+        _write(
+            self.root,
+            "plugins/comfy-conventions/CLAUDE.md",
+            "\n".join(f"claude payload line {i}" for i in range(44)),
+        )
+
+    # --- the four acceptance cases ---------------------------------------
+
+    def test_excluded_nested_pair_passes(self):
+        self._write_plugin_payload()
+        failures, warnings, exclusions = self._run(exclude=["plugins/**"])
+        self.assertEqual(failures, [])
+        self.assertEqual(warnings, [])
+        self.assertIn(("plugins/comfy-conventions", "plugins/**"), exclusions)
+
+    def test_non_excluded_nested_pair_still_fails(self):
+        # Same repo, a SECOND nested file outside the excluded subtree: the
+        # exclusion must not disable the rule everywhere else.
+        self._write_plugin_payload()
+        _write(self.root, "packages/api/AGENTS.md", "nested\n")
+        _write(self.root, "packages/api/CLAUDE.md", "divergent, no import\n")
+
+        failures, _, exclusions = self._run(exclude=["plugins/**"])
+        self.assertEqual(len(failures), 1)
+        self.assertIn("packages/api/AGENTS.md", failures[0])
+        self.assertIn("no sibling 'CLAUDE.md'", failures[0])
+        self.assertNotIn("plugins", "\n".join(failures))
+        self.assertEqual(exclusions, [("plugins/comfy-conventions", "plugins/**")])
+
+    def test_exclusion_targeting_root_errors_out(self):
+        for glob in ("**", "AGENTS.md", "CLAUDE.md", "*", "/AGENTS.md", "./CLAUDE.md"):
+            with self.subTest(glob=glob):
+                with self.assertRaises(cam.ExcludeConfigError) as ctx:
+                    self._run(exclude=[glob])
+                self.assertIn("not excludable", str(ctx.exception))
+
+    def test_root_exclusion_rejected_even_when_nested_check_is_off(self):
+        # The glob is never consulted with check_nested off, but asking for
+        # something the checker will not do is still a loud config error.
+        with self.assertRaises(cam.ExcludeConfigError):
+            self._run(exclude=["**"], check_nested=False)
+
+    def test_pathful_agents_file_is_protected_too(self):
+        _write(self.root, "docs/AGENTS.md", "thin\n")
+        with self.assertRaises(cam.ExcludeConfigError):
+            self._run(agents_file="docs/AGENTS.md", exclude=["docs/**"])
+        # ...but excluding an unrelated subtree is still fine.
+        self._run(agents_file="docs/AGENTS.md", exclude=["plugins/**"])
+
+    def test_no_exclude_reproduces_todays_behavior(self):
+        self._write_plugin_payload()
+        failures, warnings, exclusions = self._run()
+        self.assertEqual(exclusions, [])
+        self.assertEqual(warnings, [])
+        self.assertEqual(len(failures), 1)
+        self.assertIn("plugins/comfy-conventions/AGENTS.md", failures[0])
+        self.assertIn("no sibling 'CLAUDE.md'", failures[0])
+
+    # --- walk-time (not post-filter) semantics ----------------------------
+
+    def test_excluded_subtree_is_never_line_counted(self):
+        # A nested payload file way over the ceiling: a post-filter on findings
+        # would have opened and counted it first. Excluded means never read.
+        _write(
+            self.root,
+            "plugins/big/AGENTS.md",
+            "\n".join(f"l{i}" for i in range(500)),
+        )
+        _write(self.root, "plugins/big/CLAUDE.md", "44 lines of payload\n")
+        failures, _, _ = self._run(exclude=["plugins/**"])
+        self.assertEqual(failures, [])
+
+    def test_exclusion_prunes_the_directory_before_descending(self):
+        _write(self.root, "plugins/a/b/c/AGENTS.md", "deep payload\n")
+        failures, _, exclusions = self._run(exclude=["plugins/**"])
+        self.assertEqual(failures, [])
+        # Reported once, at the pruned directory — not once per buried file.
+        self.assertEqual(exclusions, [("plugins/a", "plugins/**")])
+
+    def test_directly_matched_nested_file_is_reported(self):
+        glob = "packages/api/AGENTS.md"
+        _write(self.root, glob, "nested, no shim\n")
+        failures, _, exclusions = self._run(exclude=[glob])
+        self.assertEqual(failures, [])
+        self.assertEqual(exclusions, [(glob, glob)])
+
+    def test_exclusions_with_check_nested_off_warn_that_they_do_nothing(self):
+        # Both knobs set is the invisible-coverage-loss shape exclusions exist
+        # to replace, so say so rather than letting it read as scoped.
+        _write(self.root, "plugins/x/AGENTS.md", "payload\n")
+        failures, warnings, exclusions = self._run(
+            exclude=["plugins/**"], check_nested=False
+        )
+        self.assertEqual(failures, [])
+        self.assertEqual(exclusions, [])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("`check_nested` is false", warnings[0])
+
+    def test_blank_glob_in_a_handmade_config_is_dropped(self):
+        _write(self.root, "packages/api/AGENTS.md", "nested, no shim\n")
+        failures, _, exclusions = self._run(exclude=["", "   "])
+        self.assertEqual(exclusions, [])
+        self.assertEqual(len(failures), 1)  # a blank glob excludes NOTHING
+
+    def test_skip_dirs_remain_the_always_on_baseline(self):
+        # SKIP_DIRS is not replaced by --exclude; it still applies alongside it.
+        _write(self.root, "node_modules/pkg/AGENTS.md", "vendored\n")
+        _write(self.root, "plugins/x/AGENTS.md", "payload\n")
+        failures, _, exclusions = self._run(exclude=["plugins/**"])
+        self.assertEqual(failures, [])
+        # The vendored tree is skipped silently (baseline), not reported as an
+        # exclusion — only the caller's own globs get an EXCLUDED line.
+        self.assertEqual(exclusions, [("plugins/x", "plugins/**")])
+
+    # --- glob semantics ---------------------------------------------------
+
+    def test_bare_directory_glob_excludes_the_whole_subtree(self):
+        _write(self.root, "plugins/x/AGENTS.md", "payload\n")
+        failures, _, exclusions = self._run(exclude=["plugins"])
+        self.assertEqual(failures, [])
+        self.assertEqual(exclusions, [("plugins", "plugins")])
+
+    def test_single_star_does_not_cross_a_path_separator(self):
+        _write(self.root, "packages/api/AGENTS.md", "nested, no shim\n")
+        # `packages/*` matches `packages/api` (one segment) — excluded.
+        failures, _, _ = self._run(exclude=["packages/*"])
+        self.assertEqual(failures, [])
+        # `pack*/AGENTS.md` must NOT match `packages/api/AGENTS.md`.
+        failures, _, exclusions = self._run(exclude=["pack*/AGENTS.md"])
+        self.assertEqual(exclusions, [])
+        self.assertEqual(len(failures), 1)
+
+    def test_leading_double_star_matches_at_any_depth(self):
+        _write(self.root, "a/payload/AGENTS.md", "payload\n")
+        _write(self.root, "payload/AGENTS.md", "payload\n")
+        failures, _, exclusions = self._run(exclude=["**/payload"])
+        self.assertEqual(failures, [])
+        self.assertEqual(
+            exclusions, [("a/payload", "**/payload"), ("payload", "**/payload")]
+        )
+
+    def test_unmatched_glob_is_a_silent_no_op_not_an_error(self):
+        _write(self.root, "packages/api/AGENTS.md", "nested\n")
+        _write(self.root, "packages/api/CLAUDE.md", "@AGENTS.md\n")
+        failures, warnings, exclusions = self._run(exclude=["does/not/exist/**"])
+        self.assertEqual(failures, [])
+        self.assertEqual(warnings, [])
+        self.assertEqual(exclusions, [])
+
+    # --- CLI / value parsing ----------------------------------------------
+
+    def test_split_patterns_handles_repeatable_csv_and_newlines(self):
+        self.assertEqual(
+            cam._split_patterns(["a/**,b/**", "  c/** \n\n d/** \n", ""]),
+            ["a/**", "b/**", "c/**", "d/**"],
+        )
+
+    def test_split_patterns_of_blank_input_is_empty(self):
+        # The workflow passes the raw input through; a blank one must be a
+        # true no-op rather than an empty glob that matches everything.
+        for value in ([], [""], ["   "], ["\n"], [",,"]):
+            with self.subTest(value=value):
+                self.assertEqual(cam._split_patterns(value), [])
+
+    def _main(self, *argv):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = cam.main(["--root", self.root, *argv])
+        return code, buf.getvalue()
+
+    def test_cli_excluded_payload_passes_and_logs_the_exclusion(self):
+        self._write_plugin_payload()
+        code, out = self._main("--exclude", "plugins/**")
+        self.assertEqual(code, 0)
+        self.assertIn("Exclusion globs: plugins/**", out)
+        self.assertIn(
+            "EXCLUDED: plugins/comfy-conventions (matched plugins/**)", out
+        )
+        self.assertIn("::notice::AGENTS.md integrity: EXCLUDED", out)
+        self.assertIn("Result: AGENTS.md integrity OK.", out)
+
+    def test_cli_without_exclude_fails_the_same_payload(self):
+        self._write_plugin_payload()
+        code, out = self._main()
+        self.assertEqual(code, 1)
+        self.assertNotIn("EXCLUDED", out)
+        self.assertNotIn("Exclusion globs", out)
+
+    def test_cli_root_exclusion_exits_two(self):
+        code, out = self._main("--exclude", "**")
+        self.assertEqual(code, 2)
+        self.assertIn("not excludable", out)
+        self.assertIn("::error::", out)
+
+    def test_cli_accepts_repeated_and_csv_flags(self):
+        _write(self.root, "plugins/x/AGENTS.md", "payload\n")
+        _write(self.root, "vendored-skills/y/AGENTS.md", "payload\n")
+        code, out = self._main("--exclude", "plugins/**,vendored-skills/**")
+        self.assertEqual(code, 0)
+        self.assertIn("EXCLUDED: plugins/x", out)
+        self.assertIn("EXCLUDED: vendored-skills/y", out)
 
 
 if __name__ == "__main__":
