@@ -353,13 +353,32 @@ jobs:
           # Download-then-execute instead of curl|bash: a pipeline's exit status is its
           # last command's, so a failed curl piped into bash exits 0 and the missing
           # binary resurfaces later as a misleading 'command not found' (BE-5631).
-          # Timeouts keep a stalled cursor.com from hanging the job to its 30-minute
-          # cap (×8 matrix cells) instead of failing here with a readable error.
-          installer="${RUNNER_TEMP:-/tmp}/cursor-install.sh"
+          # mktemp rather than a fixed name: nothing can pre-place a symlink at a
+          # predictable path for `curl -o` to write through.
+          installer="$(mktemp "${RUNNER_TEMP:-/tmp}/cursor-install.XXXXXX")"
+          # Both halves are time-bounded, because the fetch is two downloads: curl
+          # gets the ~6 KB bootstrap, then the bootstrap itself pulls the actual
+          # cursor-agent payload. Unbounded, a stalled cursor.com burns the whole job
+          # budget and surfaces as an opaque cancelled job rather than the readable
+          # install failure this step exists to produce. --max-time is per attempt, so
+          # --retry-max-time is what caps curl overall (~2 min); +300s for the
+          # installer keeps the worst case inside the tightest job cap here (10 min).
           curl -fsSL --connect-timeout 10 --max-time 60 \
-            --retry 3 --retry-all-errors --retry-delay 2 \
+            --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 120 \
             https://cursor.com/install -o "$installer"
-          bash "$installer"
+          # A 200 with an empty body would make the installer a silent no-op.
+          if [ ! -s "$installer" ]; then
+            echo "::error::cursor.com/install returned an empty body — nothing to execute."
+            exit 1
+          fi
+          # </dev/null keeps stdin closed, as it effectively was under curl|bash, so an
+          # installer that ever branches on interactive stdin behaves as it did before.
+          rc=0
+          timeout 300 bash "$installer" </dev/null || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::cursor.com installer exited $rc (124 = exceeded the 300s cap)."
+            exit "$rc"
+          fi
           # $GITHUB_PATH only applies to LATER steps, so assert against the install
           # location directly. The installer symlinks cursor-agent into ~/.local/bin,
           # which is already on the runner PATH — hence command -v is the real check
@@ -514,13 +533,32 @@ jobs:
           # Download-then-execute instead of curl|bash: a pipeline's exit status is its
           # last command's, so a failed curl piped into bash exits 0 and the missing
           # binary resurfaces later as a misleading 'command not found' (BE-5631).
-          # Timeouts keep a stalled cursor.com from hanging the job to its 30-minute
-          # cap (×8 matrix cells) instead of failing here with a readable error.
-          installer="${RUNNER_TEMP:-/tmp}/cursor-install.sh"
+          # mktemp rather than a fixed name: nothing can pre-place a symlink at a
+          # predictable path for `curl -o` to write through.
+          installer="$(mktemp "${RUNNER_TEMP:-/tmp}/cursor-install.XXXXXX")"
+          # Both halves are time-bounded, because the fetch is two downloads: curl
+          # gets the ~6 KB bootstrap, then the bootstrap itself pulls the actual
+          # cursor-agent payload. Unbounded, a stalled cursor.com burns the whole job
+          # budget and surfaces as an opaque cancelled job rather than the readable
+          # install failure this step exists to produce. --max-time is per attempt, so
+          # --retry-max-time is what caps curl overall (~2 min); +300s for the
+          # installer keeps the worst case inside the tightest job cap here (10 min).
           curl -fsSL --connect-timeout 10 --max-time 60 \
-            --retry 3 --retry-all-errors --retry-delay 2 \
+            --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 120 \
             https://cursor.com/install -o "$installer"
-          bash "$installer"
+          # A 200 with an empty body would make the installer a silent no-op.
+          if [ ! -s "$installer" ]; then
+            echo "::error::cursor.com/install returned an empty body — nothing to execute."
+            exit 1
+          fi
+          # </dev/null keeps stdin closed, as it effectively was under curl|bash, so an
+          # installer that ever branches on interactive stdin behaves as it did before.
+          rc=0
+          timeout 300 bash "$installer" </dev/null || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::cursor.com installer exited $rc (124 = exceeded the 300s cap)."
+            exit "$rc"
+          fi
           # $GITHUB_PATH only applies to LATER steps, so assert against the install
           # location directly. The installer symlinks cursor-agent into ~/.local/bin,
           # which is already on the runner PATH — hence command -v is the real check
@@ -664,13 +702,32 @@ jobs:
           # Download-then-execute instead of curl|bash: a pipeline's exit status is its
           # last command's, so a failed curl piped into bash exits 0 and the missing
           # binary resurfaces later as a misleading 'command not found' (BE-5631).
-          # Timeouts keep a stalled cursor.com from hanging the job to its 30-minute
-          # cap (×8 matrix cells) instead of failing here with a readable error.
-          installer="${RUNNER_TEMP:-/tmp}/cursor-install.sh"
+          # mktemp rather than a fixed name: nothing can pre-place a symlink at a
+          # predictable path for `curl -o` to write through.
+          installer="$(mktemp "${RUNNER_TEMP:-/tmp}/cursor-install.XXXXXX")"
+          # Both halves are time-bounded, because the fetch is two downloads: curl
+          # gets the ~6 KB bootstrap, then the bootstrap itself pulls the actual
+          # cursor-agent payload. Unbounded, a stalled cursor.com burns the whole job
+          # budget and surfaces as an opaque cancelled job rather than the readable
+          # install failure this step exists to produce. --max-time is per attempt, so
+          # --retry-max-time is what caps curl overall (~2 min); +300s for the
+          # installer keeps the worst case inside the tightest job cap here (10 min).
           curl -fsSL --connect-timeout 10 --max-time 60 \
-            --retry 3 --retry-all-errors --retry-delay 2 \
+            --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 120 \
             https://cursor.com/install -o "$installer"
-          bash "$installer"
+          # A 200 with an empty body would make the installer a silent no-op.
+          if [ ! -s "$installer" ]; then
+            echo "::error::cursor.com/install returned an empty body — nothing to execute."
+            exit 1
+          fi
+          # </dev/null keeps stdin closed, as it effectively was under curl|bash, so an
+          # installer that ever branches on interactive stdin behaves as it did before.
+          rc=0
+          timeout 300 bash "$installer" </dev/null || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::cursor.com installer exited $rc (124 = exceeded the 300s cap)."
+            exit "$rc"
+          fi
           # $GITHUB_PATH only applies to LATER steps, so assert against the install
           # location directly. The installer symlinks cursor-agent into ~/.local/bin,
           # which is already on the runner PATH — hence command -v is the real check
