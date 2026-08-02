@@ -10,11 +10,17 @@ on:
   pull_request:
     paths:
       - '.github/groom/**'
+      # The suite also pins the groom.yml WIRING of the knobs these scripts
+      # resolve (BE-6157), so a workflow-only edit that unhooks one must run it.
+      - '.github/workflows/groom.yml'
       - '.github/workflows/test-groom-scripts.yml'
   push:
     branches: [main]
     paths:
       - '.github/groom/**'
+      # The suite also pins the groom.yml WIRING of the knobs these scripts
+      # resolve (BE-6157), so a workflow-only edit that unhooks one must run it.
+      - '.github/workflows/groom.yml'
       - '.github/workflows/test-groom-scripts.yml'
 
 permissions:

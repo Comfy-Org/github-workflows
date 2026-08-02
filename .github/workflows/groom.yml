@@ -115,6 +115,12 @@ name: Groom (reusable)
 #         # No fromJSON() and no allowlist re-check are needed — max_prs is a
 #         # `string` input and the reusable does the parse/clamp (see its
 #         # description). That is the whole reason it is not `type: number`.
+#         # A build that can't become a PR (patch over `pr_size_limit`, patch
+#         # touching CI-privileged paths, …) files a `groom` issue instead so the
+#         # work isn't lost — that path is NOT capped by `max_findings`. To make
+#         # a builder run open PRs and nothing else, add `bail_sink: none` (it is
+#         # also settable live via vars.GROOM_CONFIG — see the input).
+#         # bail_sink: none
 #       secrets:
 #         ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 #         BOT_APP_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
@@ -213,9 +219,17 @@ on:
         default: github
       max_findings:
         description: >-
-          Cap on the number of NEW issues opened in one run (after dedup). A
-          backstop against a surprise flood; the finder brief already targets
-          ~6-12 high-precision findings.
+          Cap on the number of NEW **findings** issues opened in one run (after
+          dedup) — i.e. the `file` job's output. A backstop against a surprise
+          flood; the finder brief already targets ~6-12 high-precision findings.
+
+
+          It does NOT govern the auto-builder's BAIL issues (BE-6157). Those come
+          from a different job (`build_pr`): a CONFIRMED finding whose patch
+          exceeds `pr_size_limit` or touches a CI-privileged path still files an
+          issue, so work the builder already paid for is not silently discarded.
+          So `max_findings: 0` means "file no FINDINGS", not "open no issues" —
+          set `bail_sink: none` to suppress the bail issues too.
         type: number
         required: false
         default: 12
@@ -345,6 +359,39 @@ on:
         type: number
         required: false
         default: 400
+      bail_sink:
+        description: >-
+          Where the auto-builder's BAIL issues go (BE-6157). A CONFIRMED finding
+          the builder could not turn into a PR — no patch produced, patch over
+          `pr_size_limit`, patch touching a CI-privileged path, patch that would
+          not apply, or the pre-publish secret scan withholding it — is filed as a
+          `groom` issue so a completed, already-paid-for audit is not thrown away.
+          That path lives in `build_pr`, NOT the `file` job, so `max_findings`
+          does not cap it and `max_findings: 0` alone does not silence it.
+
+
+          `issue` (the default) is that behavior, unchanged. `none` files
+          nothing: the bail is announced as a `::warning::` naming the finding,
+          its bail reason and its dedup signature, and written to the run summary,
+          so it is recoverable from the run rather than lost silently. Two
+          consequences of `none` worth knowing before setting it: nothing records
+          the signature in the ledger, so the finding can be re-proposed — and
+          re-bail, re-spending builder tokens — on a later run; and it suppresses
+          EVERY bail, including the prompt-injection secret-scan withhold, which
+          still prints its `::error::` on the run page but files no issue.
+          `linear` is reserved for the Linear-sink phase and is NOT implemented
+          here.
+
+
+          Unlike `sink`, this is an OPERATIONAL knob, so `vars.GROOM_CONFIG` may
+          set it with no PR: it can only make groom quieter, never grant it
+          privilege. An unrecognized value (including `linear`) is dropped with a
+          warning and the run falls back to `issue` — the fail-open direction, so
+          a typo can never silently discard a finding. Ignored unless `builder`
+          is true.
+        type: string
+        required: false
+        default: issue
     secrets:
       ANTHROPIC_API_KEY:
         description: Anthropic API key the finder + verifier agents bill through.
@@ -454,6 +501,7 @@ jobs:
               "volume_gate": ${{ toJSON(inputs.volume_gate) }},
               "max_prs": ${{ toJSON(inputs.max_prs) }},
               "max_findings": ${{ toJSON(inputs.max_findings) }},
+              "bail_sink": ${{ toJSON(inputs.bail_sink) }},
               "interval_days": ${{ toJSON(inputs.interval_days) }},
               "cadence": ${{ toJSON(inputs.cadence) }},
               "themes": ${{ toJSON(inputs.themes) }},
@@ -2024,6 +2072,11 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           DRY_RUN: ${{ fromJSON(needs.gate.outputs.resolved).dry_run }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          # Resolved (BE-6157): where a BAIL goes. Reads empty when config.py
+          # dropped an unrecognized value — `normalize_bail_sink` maps that (and
+          # any other unknown) back to `issue`, so the fallback is today's
+          # behavior rather than silent suppression.
+          BAIL_SINK: ${{ fromJSON(needs.gate.outputs.resolved).bail_sink }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -2033,6 +2086,9 @@ jobs:
           # this PR (or bail issue) and never re-proposes the finding.
           sys.path.insert(0, os.path.join(os.environ["GITHUB_WORKSPACE"], "_groom_assets", ".github", "groom"))
           from ledger import signature_marker, builder_pr_body
+          # config.py owns the bail_sink allowlist (BE-6157) so the workflow and
+          # the GROOM_CONFIG coercion can never disagree about what `none` means.
+          from config import normalize_bail_sink
 
           repo = os.environ["REPO"]
           idx = int(os.environ["IDX"])
@@ -2052,6 +2108,7 @@ jobs:
           # still gets the `groom-security` label / scrutiny banner.
           is_security = str(finding.get("security")).strip().lower() != "false"
           dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
+          bail_sink = normalize_bail_sink(os.environ.get("BAIL_SINK"))
 
           def sh(cmd, check=True, **kw):
               r = subprocess.run(cmd, text=True, capture_output=True, **kw)
@@ -2059,10 +2116,39 @@ jobs:
                   raise RuntimeError(f"{' '.join(cmd)} failed: {(r.stderr or r.stdout).strip()}")
               return r
 
+          def oneline(value, limit):
+              """Model-authored text, flattened to one bounded line.
+
+              An embedded newline in a `::warning::` ends the annotation early and
+              lets the remainder pose as its own workflow command, so anything
+              that reaches an annotation goes through here first.
+              """
+              return " ".join(str(value).split())[:limit]
+
+          def summarize(line):
+              path = os.environ.get("GITHUB_STEP_SUMMARY")
+              if path:
+                  with open(path, "a", encoding="utf-8") as s:
+                      s.write(line)
+
           def file_issue(reason):
               # Bail fallback (agent bailed / patch too large / apply failed):
               # file a `groom` issue so the finding is not silently dropped AND
               # the ledger records it (no re-loop next run).
+              if bail_sink == "none":
+                  # BE-6157: the operator asked for silence — file nothing, but
+                  # never SILENTLY nothing. This annotation plus the summary line
+                  # ARE the recovery path, because no issue means no signature
+                  # marker, which means the ledger does not remember this finding
+                  # and a later run may re-propose (and re-bail on) it. The title
+                  # and (on the agent-bail path) the reason are model-authored, so
+                  # both go through `oneline` before reaching the annotation.
+                  print(f"::warning::bail_sink=none — NOT filing a bail issue for "
+                        f"'{oneline(title, 120)}' (idx={idx}, signature={sig or 'missing'}): "
+                        f"{oneline(reason, 300)}")
+                  summarize(f"- 🔇 bail suppressed (`bail_sink: none`) for **{oneline(title, 120)}** "
+                            f"(`{sig or 'no signature'}`) — {oneline(reason, 300)}\n")
+                  return
               if not sig:
                   print(f"::warning::bailed finding idx={idx} has no signature — cannot file, skipping.")
                   return
@@ -2116,10 +2202,7 @@ jobs:
               changed = result.get("changed", "?")
               print(f"[dry-run] WOULD open PR '[groom] {title}' on branch {branch} "
                     f"(base {base}, {changed} line(s) changed).")
-              summary = os.environ.get("GITHUB_STEP_SUMMARY")
-              if summary:
-                  with open(summary, "a", encoding="utf-8") as s:
-                      s.write(f"- [dry-run] would build PR for **{title}** ({changed} lines)\n")
+              summarize(f"- [dry-run] would build PR for **{title}** ({changed} lines)\n")
               sys.exit(0)
 
           sh(["git", "-C", "repo", "commit", "-m", f"groom: {title}\n\nAuto-built groom refactor ({sig}).\nReview required — do not auto-merge."])
@@ -2160,8 +2243,5 @@ jobs:
           pr_url = out.stdout.strip()
           print(f"Opened builder PR: {pr_url}")
 
-          summary = os.environ.get("GITHUB_STEP_SUMMARY")
-          if summary:
-              with open(summary, "a", encoding="utf-8") as s:
-                  s.write(f"- 🤖 Built PR for **{title}**: {pr_url}\n")
+          summarize(f"- 🤖 Built PR for **{title}**: {pr_url}\n")
           PY

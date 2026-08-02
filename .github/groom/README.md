@@ -28,6 +28,37 @@ ledger's PR-state stops that finding from being re-proposed. The builder holds n
 credentials — it can only produce a *patch*, never push. Default off: the
 finds-only groomer (issues) stays the default.
 
+### Builder bail-outs, and what `max_findings` does *not* cover (BE-6157)
+
+A build that cannot become a PR **bails**: the builder produced no patch, the
+patch exceeds `pr_size_limit`, the patch touches a CI-privileged path
+(`.github/workflows|actions/`, build/test config), the patch does not apply, or
+the pre-publish secret scan withheld it. By default the bail is filed as a `groom`
+issue, so a CONFIRMED finding the builder already spent tokens on is handed to a
+human rather than discarded.
+
+Two things follow that are easy to get wrong:
+
+- **`max_findings` does not govern bail issues.** It caps the NEW **findings**
+  issues the `file` job opens after dedup — a flood backstop, nothing more. Bail
+  issues are opened by the separate `build_pr` job, so `max_findings: 0` silences
+  the findings path and a bail issue can still appear. That is deliberate (losing
+  paid-for work is worse than one extra issue), and it was surprising enough in
+  practice to be worth stating twice.
+- **`bail_sink` is the knob for the bail path.** `issue` (default) keeps the
+  behavior above; `none` files nothing and instead emits a `::warning::` naming
+  the finding, its bail reason and its signature, plus a run-summary line — so the
+  bail is visible in the run rather than invisible. `none` suppresses *every*
+  bail, including the secret-scan withhold (which still prints its own
+  `::error::`), and because no issue is filed, no signature marker is recorded,
+  so a later run may re-propose and re-bail on that finding.
+
+`bail_sink` is an **operational** knob (`vars.GROOM_CONFIG` can set it with no
+PR), unlike `sink` / `pr_size_limit` / `builder`, which stay in the reviewed
+workflow file. If bails are frequent because well-scoped patches keep landing
+just over the line, the real fix is usually raising `pr_size_limit` **in the
+caller** — a reviewed commit, by design — not suppressing the signal.
+
 These two files are the **single source of truth** for the groom prompts, the
 same way [`.github/cursor-review/`](../cursor-review) is for the review panel.
 The core thesis of the groom initiative is *collaborate on the prompt, not the
