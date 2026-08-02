@@ -353,20 +353,30 @@ jobs:
           # Download-then-execute instead of curl|bash: a pipeline's exit status is its
           # last command's, so a failed curl piped into bash exits 0 and the missing
           # binary resurfaces later as a misleading 'command not found' (BE-5631).
-          curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 \
-            https://cursor.com/install -o /tmp/cursor-install.sh
-          bash /tmp/cursor-install.sh
+          # Timeouts keep a stalled cursor.com from hanging the job to its 30-minute
+          # cap (×8 matrix cells) instead of failing here with a readable error.
+          installer="${RUNNER_TEMP:-/tmp}/cursor-install.sh"
+          curl -fsSL --connect-timeout 10 --max-time 60 \
+            --retry 3 --retry-all-errors --retry-delay 2 \
+            https://cursor.com/install -o "$installer"
+          bash "$installer"
           # $GITHUB_PATH only applies to LATER steps, so assert against the install
           # location directly. The installer symlinks cursor-agent into ~/.local/bin,
           # which is already on the runner PATH — hence command -v is the real check
-          # and the explicit path is the fallback. (The $HOME/.cursor/bin line below
-          # is vestigial: that directory is not what the current installer writes.)
+          # and the explicit path is the fallback.
           if ! command -v cursor-agent >/dev/null 2>&1 \
             && [ ! -x "$HOME/.local/bin/cursor-agent" ]; then
             echo "::error::cursor-agent missing after install — the installer ran but produced no cursor-agent binary (expected a symlink in \$HOME/.local/bin)."
             exit 1
           fi
-          echo "$HOME/.cursor/bin" >> "$GITHUB_PATH"
+          # Export the directory the installer actually writes to. It is already on the
+          # GitHub-hosted runner's default PATH, so this is a no-op there; it matters
+          # when only the explicit-path fallback above satisfied the assertion, which
+          # would otherwise still leave later steps with 'cursor-agent: command not
+          # found'. Replaces a vestigial $HOME/.cursor/bin entry: the current installer
+          # never creates that directory, and any run reaching this line has already
+          # proven cursor-agent is on PATH or in ~/.local/bin, so it never contributed.
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Validate model pins against live catalog
         env:
@@ -504,20 +514,30 @@ jobs:
           # Download-then-execute instead of curl|bash: a pipeline's exit status is its
           # last command's, so a failed curl piped into bash exits 0 and the missing
           # binary resurfaces later as a misleading 'command not found' (BE-5631).
-          curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 \
-            https://cursor.com/install -o /tmp/cursor-install.sh
-          bash /tmp/cursor-install.sh
+          # Timeouts keep a stalled cursor.com from hanging the job to its 30-minute
+          # cap (×8 matrix cells) instead of failing here with a readable error.
+          installer="${RUNNER_TEMP:-/tmp}/cursor-install.sh"
+          curl -fsSL --connect-timeout 10 --max-time 60 \
+            --retry 3 --retry-all-errors --retry-delay 2 \
+            https://cursor.com/install -o "$installer"
+          bash "$installer"
           # $GITHUB_PATH only applies to LATER steps, so assert against the install
           # location directly. The installer symlinks cursor-agent into ~/.local/bin,
           # which is already on the runner PATH — hence command -v is the real check
-          # and the explicit path is the fallback. (The $HOME/.cursor/bin line below
-          # is vestigial: that directory is not what the current installer writes.)
+          # and the explicit path is the fallback.
           if ! command -v cursor-agent >/dev/null 2>&1 \
             && [ ! -x "$HOME/.local/bin/cursor-agent" ]; then
             echo "::error::cursor-agent missing after install — the installer ran but produced no cursor-agent binary (expected a symlink in \$HOME/.local/bin)."
             exit 1
           fi
-          echo "$HOME/.cursor/bin" >> "$GITHUB_PATH"
+          # Export the directory the installer actually writes to. It is already on the
+          # GitHub-hosted runner's default PATH, so this is a no-op there; it matters
+          # when only the explicit-path fallback above satisfied the assertion, which
+          # would otherwise still leave later steps with 'cursor-agent: command not
+          # found'. Replaces a vestigial $HOME/.cursor/bin entry: the current installer
+          # never creates that directory, and any run reaching this line has already
+          # proven cursor-agent is on PATH or in ~/.local/bin, so it never contributed.
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Log Cursor agent version
         # The install script is unpinned (curl | bash from cursor.com), so we
@@ -644,20 +664,30 @@ jobs:
           # Download-then-execute instead of curl|bash: a pipeline's exit status is its
           # last command's, so a failed curl piped into bash exits 0 and the missing
           # binary resurfaces later as a misleading 'command not found' (BE-5631).
-          curl -fsSL --retry 3 --retry-all-errors --retry-delay 2 \
-            https://cursor.com/install -o /tmp/cursor-install.sh
-          bash /tmp/cursor-install.sh
+          # Timeouts keep a stalled cursor.com from hanging the job to its 30-minute
+          # cap (×8 matrix cells) instead of failing here with a readable error.
+          installer="${RUNNER_TEMP:-/tmp}/cursor-install.sh"
+          curl -fsSL --connect-timeout 10 --max-time 60 \
+            --retry 3 --retry-all-errors --retry-delay 2 \
+            https://cursor.com/install -o "$installer"
+          bash "$installer"
           # $GITHUB_PATH only applies to LATER steps, so assert against the install
           # location directly. The installer symlinks cursor-agent into ~/.local/bin,
           # which is already on the runner PATH — hence command -v is the real check
-          # and the explicit path is the fallback. (The $HOME/.cursor/bin line below
-          # is vestigial: that directory is not what the current installer writes.)
+          # and the explicit path is the fallback.
           if ! command -v cursor-agent >/dev/null 2>&1 \
             && [ ! -x "$HOME/.local/bin/cursor-agent" ]; then
             echo "::error::cursor-agent missing after install — the installer ran but produced no cursor-agent binary (expected a symlink in \$HOME/.local/bin)."
             exit 1
           fi
-          echo "$HOME/.cursor/bin" >> "$GITHUB_PATH"
+          # Export the directory the installer actually writes to. It is already on the
+          # GitHub-hosted runner's default PATH, so this is a no-op there; it matters
+          # when only the explicit-path fallback above satisfied the assertion, which
+          # would otherwise still leave later steps with 'cursor-agent: command not
+          # found'. Replaces a vestigial $HOME/.cursor/bin entry: the current installer
+          # never creates that directory, and any run reaching this line has already
+          # proven cursor-agent is on PATH or in ~/.local/bin, so it never contributed.
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Download panel findings
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
