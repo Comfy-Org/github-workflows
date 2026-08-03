@@ -21,7 +21,7 @@ name: Detect Unreviewed Merge (reusable)
 #       # This repo, pinned by full commit SHA. The path below is the live one;
 #       # an older example pointed at Comfy-Org/unreviewed-merges/.../detector.yml,
 #       # which does not exist and does not resolve.
-#       uses: Comfy-Org/github-workflows/.github/workflows/detect-unreviewed-merge.yml@<sha>  # v1
+#       uses: Comfy-Org/github-workflows/.github/workflows/detect-unreviewed-merge.yml@<full-commit-sha>  # v1 — substitute a real 40-char SHA
 #       with:
 #         approval-mode: latest-per-reviewer  # or 'any-approval' for private repos
 #       secrets:

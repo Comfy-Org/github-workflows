@@ -64,6 +64,9 @@ concurrency:
 
 jobs:
   review:
+    # A no-op while label-gated, but load-bearing the moment you widen `types:`
+    # or set `run_without_label` — see the Dependabot gotcha.
+    if: github.actor != 'dependabot[bot]'
     permissions:
       contents: read
       pull-requests: write
@@ -126,7 +129,8 @@ the base repo, so the gate's cross-repo check treats them as ordinary PRs — bu
 Dependabot-triggered runs read the *Dependabot* secret store, not Actions secrets.
 `CURSOR_API_KEY` therefore arrives empty and the token is read-only, so under
 `run_without_label: true` (or a `synchronize` trigger) every dependency PR burns
-the matrix and fails red. Keep those PRs out with a caller-level guard:
+the matrix and fails red. The caller above already carries the guard that keeps
+those PRs out — keep it when you widen `types:`:
 
 ```yaml
     if: github.actor != 'dependabot[bot]'

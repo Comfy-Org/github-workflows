@@ -33,6 +33,9 @@ None. No secrets — the only credential used is the automatic `GITHUB_TOKEN`.
 name: CI - PR Risk Grade
 
 on:
+  # Public repo taking fork PRs? Use `pull_request_target:` here instead —
+  # a fork run under plain `pull_request` cannot write the label. See the
+  # fork gotcha below before you swap it.
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
@@ -87,7 +90,11 @@ statuses: read
 **Fork PRs need `pull_request_target`, not `pull_request`.** A fork PR under a
 plain `pull_request` trigger gets a read-only token and the label write fails.
 This is safe to do here by construction — the workflow never checks out or
-executes PR code.
+executes PR code. That property is the entire safety argument, so keep the
+caller a bare `uses:` job: `pull_request_target` runs privileged, and adding
+your own steps (or jobs) that check out or run PR head code under it reopens
+the classic pwn-request hole. Same-repo-only callers (private org repos that
+take no fork PRs) should stay on plain `pull_request`.
 
 **Enroll it as its own workflow, not a job inside an existing CI workflow.**
 The grading job excludes its own *run* from the check rollup it reads; a job

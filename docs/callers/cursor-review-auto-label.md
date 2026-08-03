@@ -49,6 +49,10 @@ jobs:
       CLOUD_CODE_BOT_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
 ```
 
+Then add your repo to `vars.AUTO_LABEL_CALLERS` on `Comfy-Org/github-workflows`
+— that roster is what keeps your pin current
+(see [Staying current](README.md#staying-current)).
+
 ## Required permissions
 
 ```yaml

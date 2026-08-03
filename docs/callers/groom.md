@@ -95,7 +95,8 @@ rejects the run with "requesting 'actions: read', but is only allowed
 
 ## Inputs
 
-All are optional. The ones that matter:
+All are optional to GitHub's startup validator, but treat `workflows_ref` as
+required — see its row. The ones that matter:
 
 | Input | Default | Why you'd change it |
 |---|---|---|
@@ -107,7 +108,7 @@ All are optional. The ones that matter:
 | `model` | `claude-opus-5` | The finder/verifier model. |
 | `themes` | `duplication, inconsistent patterns, missing abstractions, complexity hotspots, dead code` | Steer the finder at particular kinds of cleanup. The default mirrors the finder brief's own five dimensions, so it is a no-op; **narrow** it (e.g. `duplication, dead code`) to focus a repo. Security/auth-adjacent findings are filed regardless of theme. |
 | `scope_label` / `scope_desc` | `whole-repo` | Cosmetic labels for the scope in issue bodies. |
-| `workflows_ref` | `main` | **Set to your `uses:` SHA.** Briefs load from this ref at run time. |
+| `workflows_ref` | `main` | **Treat as required: set to your `uses:` SHA.** Briefs load from this ref at run time — a caller that SHA-pins `uses:` but leaves this at `main` still runs unreviewed HEAD briefs. |
 | `bot_app_id` | `''` | File as your App rather than `github-actions[bot]`. |
 | `builder` | `false` | Opt into PR-writing — see below. |
 | `max_prs` | `'5'` | Only with `builder: true`. Typed **string**, deliberately. |
