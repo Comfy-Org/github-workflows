@@ -414,10 +414,20 @@ grade_stream() {
 # rather than a false green — enroll pr-risk as its OWN workflow to grade off a full rollup.
 fetch_pr_record() { # <repo> <num> -> record JSON on stdout, rc 1 on an unreadable PR
   # Token note: the checkSuite -> workflowRun traversal below is an ACTIONS resource, so the
-  # job token needs `actions: read` on top of `pull-requests`/`checks` — GraphQL fails the
-  # WHOLE query on one unreadable field, which surfaces here as an unreadable PR (every grade
-  # lands ungraded), not as a partial record.
-  local repo="$1" num="$2" q resp files fstatus
+  # job token needs `actions: read` on top of `pull-requests`/`checks`.
+  #
+  # Without it this is an UNREADABLE PR, not a partial record — and the mechanism is `gh`, not
+  # GraphQL. GitHub does answer a forbidden field with `data` present and that field nulled,
+  # plus an `errors` entry; but `gh api graphql` exits NON-ZERO whenever the response carries a
+  # top-level `errors` array, however complete `data` is (verified: a two-alias query with one
+  # bad alias returns data for the good one and still exits 1). So the `|| return 1` below fires
+  # and the half-record never reaches jq. That matters: if a nulled `workflowRun` DID reach jq,
+  # `is_self`'s `(.checkSuite.workflowRun.databaseId // -1)` fallback would match nothing,
+  # self-exclusion would silently stop working, our own in-progress run would read PENDING
+  # forever, and the PR would land a confident-looking R2 floor after burning the whole wait
+  # budget. Rejecting the read outright is what keeps that from being reachable — so do NOT
+  # "recover" partial data here by dropping the rc check.
+  local repo="$1" num="$2" q resp files fstatus errf
   # shellcheck disable=SC2016  # GraphQL: $vars are query variables
   q='query($owner:String!,$name:String!,$num:Int!){
   repository(owner:$owner,name:$name){ pullRequest(number:$num){
@@ -430,8 +440,20 @@ fetch_pr_record() { # <repo> <num> -> record JSON on stdout, rc 1 on an unreadab
         ... on CheckRun{ name status conclusion checkSuite{ workflowRun{ databaseId workflow{ name } } } }
         ... on StatusContext{ context state } } } } } } }
   } } }'
-  resp="$(gh api graphql -f query="$q" -F owner="${repo%%/*}" -F name="${repo##*/}" -F num="$num" 2>/dev/null)" || return 1
-  jq -e '.data.repository.pullRequest.number != null' >/dev/null 2>&1 <<<"$resp" || return 1
+  # SURFACE WHY THE READ FAILED. Discarding gh's stderr made a PERMANENTLY misconfigured token
+  # look exactly like a transient blip: the caller's rc=3 handler retries four times with
+  # backoff and then labels `ungraded`, and the one string that names the cause ("Resource not
+  # accessible by integration" / FORBIDDEN, or a missing-scope message) never reached the log —
+  # so the fix above (`actions: read`) was undiagnosable from a run. gh's own error text is safe
+  # to print: it names fields and scopes, not PR content.
+  errf="$(mktemp "${TMPDIR:-/tmp}/grade-pr-risk-fetch.XXXXXX")" || return 1
+  resp="$(gh api graphql -f query="$q" -F owner="${repo%%/*}" -F name="${repo##*/}" -F num="$num" 2>"$errf")" || {
+    warn "PR read failed for $repo#$num: $(tr '\n' ' ' < "$errf")"
+    rm -f "$errf"; return 1
+  }
+  jq -e '.data.repository.pullRequest.number != null' >/dev/null 2>&1 <<<"$resp" \
+    || { warn "PR read for $repo#$num returned no pullRequest — treating as unreadable"
+         rm -f "$errf"; return 1; }
 
   # ---- the changed-file list comes from REST, not GraphQL ------------------------------------
   # GraphQL's `files` connection cannot answer this axis. Two reasons, both structural:
@@ -451,9 +473,16 @@ fetch_pr_record() { # <repo> <num> -> record JSON on stdout, rc 1 on an unreadab
                           previous_path: (.previous_filename // null),
                           additions: .additions, deletions: .deletions,
                           change_type: ((.status // "") | ascii_upcase
-                                        | if . == "REMOVED" then "DELETED" else . end)}' 2>/dev/null \
+                                        | if . == "REMOVED" then "DELETED" else . end)}' 2>"$errf" \
            | jq -sc '.')" || { files=null; fstatus=unreadable; }
   [ -n "$files" ] || { files=null; fstatus=unreadable; }
+  # Same reason as the GraphQL read above: an unreadable file list drops the whole PR to
+  # `changed_paths_status: unreadable` (the path floor goes unknown), and without gh's error text
+  # the log says only "could not be read" — a 403 from a short `pull-requests` grant and a 502
+  # are then the same message. This one is a WARN, not a return: the record is still emitted with
+  # its status twin set, and the grader's unknown contract handles it from there.
+  [ "$fstatus" = ok ] || warn "changed-file read failed for $repo#$num: $(tr '\n' ' ' < "$errf" | grep . || echo '(no error text — the read produced nothing)')"
+  rm -f "$errf"
 
   jq -c --arg repo "$repo" --arg self "$SELF_CONTEXT" --arg selfrun "$SELF_RUN_ID" \
         --argjson files "$files" --arg fstatus "$fstatus" '

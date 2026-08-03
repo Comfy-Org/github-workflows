@@ -68,6 +68,14 @@ name: PR Risk Grade (reusable)
 #       uses: Comfy-Org/github-workflows/.github/workflows/pr-risk.yml@<sha>  # v1
 #       with:
 #         workflows_ref: <same sha>
+#
+# GRANT ALL SIX OR THE RUN NEVER STARTS. A reusable workflow can only NARROW the caller's
+# token, never elevate it, so a caller whose block is short of what the `grade` job declares is
+# rejected by GitHub before any step executes ("is requesting 'pull-requests: write', but is
+# only allowed 'pull-requests: read'") — the check goes red with no grade, and the PR keeps
+# whatever label the previous push left rather than degrading to `risk:ungraded`. Copy the
+# block above verbatim when you enroll, and re-check it against this header whenever you move
+# the SHA pin.
 
 on:
   workflow_call:
@@ -142,13 +150,22 @@ jobs:
       contents: read        # read the consumer's .github/risk.json override from the BASE ref
       issues: write         # create the risk:* labels repo-side on first use (repo label CRUD
                             # maps to Issues; enrolling a repo needs no manual label setup)
-      pull-requests: write  # THE ONLY PR WRITE: sync the one risk label. The labels endpoint is
-                            # dual-mapped — labeling an ISSUE rides issues:write, labeling a PR
-                            # rides pull-requests:write — so `issues: write` alone 403s here
-                            # ("Resource not accessible by integration"). The CODE still writes
-                            # nothing but the label — no comment, no review, no merge — and a
-                            # GITHUB_TOKEN-applied label cannot fire `labeled` triggers, so this
-                            # write cannot start a workflow cascade.
+      pull-requests: write  # Sync the one risk label — the labels endpoint is dual-mapped:
+                            # labeling an ISSUE rides issues:write, labeling a PR rides
+                            # pull-requests:write, so `issues: write` alone 403s here
+                            # ("Resource not accessible by integration"). There is no narrower
+                            # grant that can label a PR; this is minimum-necessary, not tidy.
+                            # SCOPE HONESTLY: `pull-requests: write` is a TOKEN-level grant, so
+                            # it also permits commenting, reviewing, editing and closing — the
+                            # label-only guarantee is CODE-level (apply-risk-label.sh is the
+                            # only writer, and it touches nothing but the mapped label names),
+                            # backed by the fact that the job checks out no PR code: the only
+                            # code holding this token is this repo's, loaded from the pinned
+                            # workflows_ref. Public repos enroll via `pull_request_target`, so
+                            # that token IS present on fork-authored events — which is exactly
+                            # why workflows_ref must be a full SHA of THIS repo and never a
+                            # mutable ref. A GITHUB_TOKEN-applied label also cannot fire
+                            # `labeled` triggers, so the write cannot start a cascade.
       checks: read          # the check rollup the reversibility axis reads (CheckRun contexts)
       actions: read         # the same rollup's CheckRun -> checkSuite -> workflowRun traversal
                             # (self-exclusion keys on workflowRun.databaseId, and workflow runs
