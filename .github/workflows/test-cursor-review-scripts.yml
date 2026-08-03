@@ -21,13 +21,19 @@ permissions:
 
 jobs:
   test:
-    name: unittest
+    name: unittest + shellcheck
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: ShellCheck the cursor-review shell scripts
+        # These run inside the review jobs with no unit tests behind them, so
+        # shellcheck is the only automated guard on install-cursor-cli.sh (the
+        # sha256-pinned CLI installer) and slack-notify.sh.
+        run: shellcheck -x .github/cursor-review/install-cursor-cli.sh .github/cursor-review/slack-notify.sh
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0

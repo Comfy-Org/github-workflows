@@ -140,8 +140,10 @@ env:
   # Where the assets checkout lands (this repo, .github/cursor-review/*).
   CURSOR_REVIEW_ASSETS: ${{ github.workspace }}/_cursor_review_assets/.github/cursor-review
   # Cursor CLI pin — a versioned, checksummed artifact instead of the mutable
-  # cursor.com/install script (BE-5864). Old versions stay downloadable, so a
+  # cursor.com/install script (BE-5869). Old versions stay downloadable, so a
   # Cursor release never breaks this; the pin moves only via a reviewed PR.
+  # Consumed by .github/cursor-review/install-cursor-cli.sh, the ONE installer
+  # all three CLI-using jobs run (preflight, review matrix, consolidate).
   CURSOR_CLI_VERSION: 2026.07.23-e383d2b
   # sha256 of the linux/x64 agent-cli-package.tar.gz (all jobs run ubuntu-latest).
   # Cross-checked against nixpkgs pkgs/by-name/cu/cursor-cli at pin time.
@@ -346,6 +348,16 @@ jobs:
           JSON
           echo "models=$(jq -c . /tmp/models.json)" >> "$GITHUB_OUTPUT"
 
+      - name: Load cursor-review assets
+        # Same trusted-assets checkout the review/consolidate jobs do — this
+        # job needs it for install-cursor-cli.sh.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _cursor_review_assets
+          persist-credentials: false
+
       - name: Install Cursor agent CLI
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
@@ -357,28 +369,7 @@ jobs:
             echo "No CURSOR_API_KEY (fork PR or unset secret) — skipping catalog preflight."
             exit 0
           fi
-          # Download Cursor's versioned release artifact directly and verify it against
-          # the pinned digest — the mutable cursor.com/install script never executes
-          # (BE-5864). mktemp so nothing can pre-place a symlink for curl to write through.
-          pkg="$(mktemp "${RUNNER_TEMP:-/tmp}/cursor-cli.XXXXXX")"
-          # ~83 MB payload: --max-time sized for the artifact, not the old 6 KB bootstrap.
-          # Worst case ~3 attempts x 120s stays inside the tightest job cap (preflight's
-          # timeout-minutes: 10).
-          curl -fsSL --connect-timeout 10 --max-time 120 \
-            --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 300 \
-            "https://downloads.cursor.com/lab/${CURSOR_CLI_VERSION}/linux/x64/agent-cli-package.tar.gz" \
-            -o "$pkg"
-          echo "${CURSOR_CLI_SHA256}  ${pkg}" | sha256sum -c -
-          # Mirror the vendor installer's layout: versions dir + ~/.local/bin symlink
-          # (~/.local/bin is already on the hosted runner's default PATH).
-          dest="$HOME/.local/share/cursor-agent/versions/${CURSOR_CLI_VERSION}"
-          mkdir -p "$dest" "$HOME/.local/bin"
-          tar --strip-components=1 -xzf "$pkg" -C "$dest"
-          rm -f "$pkg"
-          ln -sf "$dest/cursor-agent" "$HOME/.local/bin/cursor-agent"
-          # Prove the pinned binary actually runs before any later step depends on it.
-          "$HOME/.local/bin/cursor-agent" --version
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          bash "$CURSOR_REVIEW_ASSETS/install-cursor-cli.sh"
 
       - name: Validate model pins against live catalog
         env:
@@ -512,36 +503,21 @@ jobs:
           echo "Diff size: $(wc -l < /tmp/pr-diff.patch) lines"
 
       - name: Install Cursor agent CLI
-        run: |
-          # Download Cursor's versioned release artifact directly and verify it against
-          # the pinned digest — the mutable cursor.com/install script never executes
-          # (BE-5864). mktemp so nothing can pre-place a symlink for curl to write through.
-          pkg="$(mktemp "${RUNNER_TEMP:-/tmp}/cursor-cli.XXXXXX")"
-          # ~83 MB payload: --max-time sized for the artifact, not the old 6 KB bootstrap.
-          # Worst case ~3 attempts x 120s stays inside the tightest job cap (preflight's
-          # timeout-minutes: 10).
-          curl -fsSL --connect-timeout 10 --max-time 120 \
-            --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 300 \
-            "https://downloads.cursor.com/lab/${CURSOR_CLI_VERSION}/linux/x64/agent-cli-package.tar.gz" \
-            -o "$pkg"
-          echo "${CURSOR_CLI_SHA256}  ${pkg}" | sha256sum -c -
-          # Mirror the vendor installer's layout: versions dir + ~/.local/bin symlink
-          # (~/.local/bin is already on the hosted runner's default PATH).
-          dest="$HOME/.local/share/cursor-agent/versions/${CURSOR_CLI_VERSION}"
-          mkdir -p "$dest" "$HOME/.local/bin"
-          tar --strip-components=1 -xzf "$pkg" -C "$dest"
-          rm -f "$pkg"
-          ln -sf "$dest/cursor-agent" "$HOME/.local/bin/cursor-agent"
-          # Prove the pinned binary actually runs before any later step depends on it.
-          "$HOME/.local/bin/cursor-agent" --version
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        run: bash "$CURSOR_REVIEW_ASSETS/install-cursor-cli.sh"
 
-      - name: Log Cursor agent version
-        # The install is pinned to a versioned artifact and verified against a
-        # pinned sha256 (BE-5864), so the bits that ran are known-good by
-        # construction. This step logs the resulting version into the run for
-        # forensics — which build produced a given review — not as a gate.
-        run: cursor-agent --version
+      - name: Verify Cursor agent version
+        # The installer already asserts this once. Re-asserted here, on the
+        # PATH-resolved binary immediately before the review runs, so a swap
+        # between install and use (a CLI self-update, a stale symlink) can't
+        # quietly hand the review to unpinned bits — and the version still
+        # lands in the log for forensics.
+        run: |
+          installed="$(cursor-agent --version)"
+          if [ "$installed" != "$CURSOR_CLI_VERSION" ]; then
+            echo "::error::cursor-agent reports '${installed}', expected the pinned '${CURSOR_CLI_VERSION}'."
+            exit 1
+          fi
+          echo "cursor-agent ${installed} (matches CURSOR_CLI_VERSION)."
 
       - name: Build prompt
         env:
@@ -656,29 +632,7 @@ jobs:
           git diff "$BASE_SHA...$HEAD_SHA" -- . $DIFF_EXCLUDES > /tmp/pr-diff.patch
 
       - name: Install Cursor agent CLI
-        run: |
-          # Download Cursor's versioned release artifact directly and verify it against
-          # the pinned digest — the mutable cursor.com/install script never executes
-          # (BE-5864). mktemp so nothing can pre-place a symlink for curl to write through.
-          pkg="$(mktemp "${RUNNER_TEMP:-/tmp}/cursor-cli.XXXXXX")"
-          # ~83 MB payload: --max-time sized for the artifact, not the old 6 KB bootstrap.
-          # Worst case ~3 attempts x 120s stays inside the tightest job cap (preflight's
-          # timeout-minutes: 10).
-          curl -fsSL --connect-timeout 10 --max-time 120 \
-            --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 300 \
-            "https://downloads.cursor.com/lab/${CURSOR_CLI_VERSION}/linux/x64/agent-cli-package.tar.gz" \
-            -o "$pkg"
-          echo "${CURSOR_CLI_SHA256}  ${pkg}" | sha256sum -c -
-          # Mirror the vendor installer's layout: versions dir + ~/.local/bin symlink
-          # (~/.local/bin is already on the hosted runner's default PATH).
-          dest="$HOME/.local/share/cursor-agent/versions/${CURSOR_CLI_VERSION}"
-          mkdir -p "$dest" "$HOME/.local/bin"
-          tar --strip-components=1 -xzf "$pkg" -C "$dest"
-          rm -f "$pkg"
-          ln -sf "$dest/cursor-agent" "$HOME/.local/bin/cursor-agent"
-          # Prove the pinned binary actually runs before any later step depends on it.
-          "$HOME/.local/bin/cursor-agent" --version
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        run: bash "$CURSOR_REVIEW_ASSETS/install-cursor-cli.sh"
 
       - name: Download panel findings
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
