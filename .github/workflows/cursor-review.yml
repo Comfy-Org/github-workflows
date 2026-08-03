@@ -19,9 +19,6 @@ name: Cursor Review (reusable)
 #   permissions:
 #     contents: read
 #     pull-requests: write
-#   concurrency:
-#     group: cursor-review-pr-${{ github.event.pull_request.number }}-${{ github.event.label.name }}
-#     cancel-in-progress: true
 #   jobs:
 #     cursor-review:
 #       uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@main
@@ -66,6 +63,13 @@ on:
         type: string
         required: false
         default: cursor-review
+      xl_review_label:
+        description: >-
+          Alternate trigger label that runs the same review while bypassing the
+          diff-size cap. If both trigger labels are present, XL mode wins.
+        type: string
+        required: false
+        default: cursor-review-xl
       diff_excludes:
         description: >-
           Whitespace-separated git pathspecs excluded from BOTH the size-budget
@@ -128,13 +132,39 @@ on:
         description: PEM private key matching the bot_app_id input. Required only when bot_app_id is set.
         required: false
 
-# DIFF_SIZE_CAP / REVIEW_LABEL / JUDGE_MODEL / DIFF_EXCLUDES are mapped from
-# `inputs` here so the run steps below read them verbatim from the original
+# Serialize actual review triggers per caller repo + PR. Standard and XL events
+# share one group so adding XL cancels an in-flight standard panel. A standard
+# label event while XL is already present is deliberately kept out of that group
+# (XL already owns the PR), and unrelated labels keep distinct suffixes so they
+# cannot cancel reviews. The reusable prefix must differ from callers' legacy
+# concurrency groups or a called workflow could cancel its own caller.
+concurrency:
+  group: >-
+    cursor-review-reusable-${{ github.repository }}-${{ github.event.pull_request.number }}-${{
+      (
+        github.event.label.name == inputs.xl_review_label
+        || (
+          github.event.label.name == inputs.review_label
+          && !contains(
+            github.event.pull_request.labels.*.name,
+            inputs.xl_review_label
+          )
+        )
+        || (inputs.run_without_label && !github.event.label.name)
+      ) && 'review'
+      || github.event.label.name
+      || github.event.action
+    }}
+  cancel-in-progress: true
+
+# DIFF_SIZE_CAP / REVIEW_LABEL / XL_REVIEW_LABEL / JUDGE_MODEL / DIFF_EXCLUDES
+# are mapped from `inputs` here so the run steps read them verbatim from the
 # (private-repo) workflow without per-step plumbing. `inputs` is available to
 # workflow-level env in a called workflow; `secrets` is not (those stay in jobs).
 env:
   DIFF_SIZE_CAP: ${{ inputs.diff_size_cap }}
   REVIEW_LABEL: ${{ inputs.review_label }}
+  XL_REVIEW_LABEL: ${{ inputs.xl_review_label }}
   JUDGE_MODEL: ${{ inputs.judge_model }}
   DIFF_EXCLUDES: ${{ inputs.diff_excludes }}
   # Where the assets checkout lands (this repo, .github/cursor-review/*).
@@ -150,6 +180,7 @@ jobs:
     outputs:
       should_run: ${{ steps.check.outputs.should_run }}
       already_reviewed: ${{ steps.dup.outputs.already_reviewed }}
+      xl_mode: ${{ steps.check.outputs.xl_mode }}
     steps:
       - name: Check trigger label
         id: check
@@ -161,6 +192,16 @@ jobs:
           BASE_REPO: ${{ github.repository }}
           RUN_WITHOUT_LABEL: ${{ inputs.run_without_label }}
         run: |
+          # XL is a property of the PR's current labels, not just this event.
+          # That makes it win when both labels are present and preserves XL when
+          # removing skip-cursor-review re-triggers a previously gated review.
+          XL_MODE=false
+          if [ -n "$XL_REVIEW_LABEL" ] \
+            && echo "$PR_LABELS" | jq -e --arg l "$XL_REVIEW_LABEL" 'index($l)' > /dev/null; then
+            XL_MODE=true
+          fi
+          echo "xl_mode=$XL_MODE" >> "$GITHUB_OUTPUT"
+
           # PRs from forks can't run this review. The pull_request event grants
           # fork PRs no access to secrets — so CURSOR_API_KEY is empty and every
           # panel cell produces empty output — and a read-only GITHUB_TOKEN, so
@@ -195,25 +236,42 @@ jobs:
             esac
           fi
 
-          # Only adding the trigger label fires the matrix. Removing it cancels
-          # any in-progress run via the concurrency group and then no-ops here.
-          if [ "$LABEL_NAME" = "$REVIEW_LABEL" ] && [ "$GH_EVENT_ACTION" = "labeled" ]; then
-            echo "$REVIEW_LABEL label added — running."
-            echo "should_run=true" >> "$GITHUB_OUTPUT"
-            exit 0
+          # Either trigger label can start the matrix. XL is checked first so it
+          # owns the mode when callers customize both inputs to the same value.
+          if [ "$GH_EVENT_ACTION" = "labeled" ]; then
+            if [ -n "$XL_REVIEW_LABEL" ] && [ "$LABEL_NAME" = "$XL_REVIEW_LABEL" ]; then
+              echo "$XL_REVIEW_LABEL label added — running in XL mode."
+              echo "should_run=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            if [ "$LABEL_NAME" = "$REVIEW_LABEL" ]; then
+              if [ "$XL_MODE" = "true" ]; then
+                echo "$REVIEW_LABEL added while $XL_REVIEW_LABEL is present — XL already owns the review; skipping duplicate trigger."
+                echo "should_run=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "$REVIEW_LABEL label added — running."
+              echo "should_run=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
           fi
 
-          # Removing skip-cursor-review while the trigger label is present
-          # unblocks a previously skipped review — treat it as a fresh trigger.
+          # Removing skip-cursor-review while either trigger is present unblocks
+          # a previously skipped review. XL wins when both are present.
           if [ "$LABEL_NAME" = "skip-cursor-review" ] && [ "$GH_EVENT_ACTION" = "unlabeled" ]; then
-            if echo "$PR_LABELS" | jq -e --arg l "$REVIEW_LABEL" 'index($l)' > /dev/null; then
+            if [ "$XL_MODE" = "true" ]; then
+              echo "skip-cursor-review removed while $XL_REVIEW_LABEL is present — running in XL mode."
+              echo "should_run=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            elif echo "$PR_LABELS" | jq -e --arg l "$REVIEW_LABEL" 'index($l)' > /dev/null; then
               echo "skip-cursor-review removed while $REVIEW_LABEL is present — running."
               echo "should_run=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
           fi
 
-          echo "Label '$LABEL_NAME' is not the trigger label — skipping."
+          echo "Label '$LABEL_NAME' is not a review trigger — skipping."
           echo "should_run=false" >> "$GITHUB_OUTPUT"
 
       - name: Check for prior review on this commit
@@ -270,6 +328,7 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          XL_MODE: ${{ needs.gate.outputs.xl_mode }}
         run: |
           # numstat reports "-\t-" for binary files; treat those as 0 lines so
           # binary-only PRs can't bypass the size cap by producing no insertion
@@ -280,9 +339,12 @@ jobs:
           # shellcheck disable=SC2086
           TOTAL=$(git diff --numstat "$BASE_SHA...$HEAD_SHA" -- . $DIFF_EXCLUDES \
             | awk '{ if ($1 != "-") added += $1; if ($2 != "-") removed += $2 } END { print (added + removed) + 0 }')
-          echo "Changed lines: $TOTAL (cap: $DIFF_SIZE_CAP)"
+          echo "Changed lines: $TOTAL"
 
-          if [ "$TOTAL" -gt "$DIFF_SIZE_CAP" ]; then
+          if [ "$XL_MODE" = "true" ]; then
+            echo "XL mode ($XL_REVIEW_LABEL) — bypassing the $DIFF_SIZE_CAP-line cap."
+            echo "within_cap=true" >> "$GITHUB_OUTPUT"
+          elif [ "$TOTAL" -gt "$DIFF_SIZE_CAP" ]; then
             echo "Diff exceeds cap — skipping review."
             echo "within_cap=false" >> "$GITHUB_OUTPUT"
           else
