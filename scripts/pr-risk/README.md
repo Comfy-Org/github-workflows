@@ -121,7 +121,29 @@ off. The base ref is re-read **per target** and an unresolvable one fails that
 target: the ref selects which branch's `.github/risk.json` judges the PR, live
 PRs are commonly stacked on feature branches rather than the default branch, and
 an empty `?ref=` is not an error to the contents API — it silently resolves to
-the default branch.
+the default branch. That is also why the ref is percent-encoded into the request
+rather than interpolated raw: `#`, `&` and `+` are all legal in a branch name,
+and a raw `#` truncates the URL into exactly that empty-ref read. A 404 for the
+**ref** ("no commit found for the ref" — a deleted or renamed base branch) is
+distinguished from a 404 for the **file** and fails the target instead of
+falling back to the generic map.
+
+Two operational caveats for a backfill:
+
+- **A batch cannot serialize per-PR.** One run covers N pull requests and a run
+  belongs to exactly one concurrency group, so a batch overlapping a
+  `pull_request` run for one of its own numbers can interleave with it — the
+  label sync is a read-current / delete-stale / add-target sequence, so that PR
+  may briefly carry two `risk:*` labels (the next grade re-syncs it, and the
+  label gates nothing meanwhile). Dispatch when the queue is quiet, and use
+  `pr_number` when you want the per-PR group to serialize against event runs. A
+  DELETE of a label a concurrent run already removed is treated as removed, not
+  as a failure.
+- **The pre-grader reads retry.** Rate limits are global, not per-PR, so the
+  base-ref and override reads — the first hop for every target — retry a
+  transient failure with backoff, as the grader already does. Without it one
+  secondary-rate-limit burst mid-backfill failed every remaining target at once.
+  A definitive answer (404, 401, 422) is never retried.
 
 ## Per-repo overrides (read from the base ref)
 

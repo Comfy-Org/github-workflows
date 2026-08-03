@@ -61,6 +61,15 @@ name: PR Risk Grade (reusable)
 # that reaches this workflow with no target at all FAILS LOUDLY instead of exiting 0: a button
 # that silently grades nothing is worse than no button.
 #
+# A BATCH CANNOT SERIALIZE PER-PR, and no concurrency key can make it: one run covers N pull
+# requests and a run belongs to exactly one group. The label sync is a read-current /
+# delete-stale / add-target sequence, so a batch that overlaps a `pull_request` run for one of ITS
+# numbers can interleave with it and leave that PR briefly carrying two `risk:*` labels — the next
+# grade of that PR re-syncs it to one, and the label gates nothing in the meantime. Two mitigations
+# and one limit: dispatch a backfill when the queue is quiet; prefer `pr_number` when you want the
+# per-PR concurrency group to serialize a re-grade against event runs; and a DELETE of a label
+# another run already removed is tolerated rather than painted red (see apply-risk-label.sh).
+#
 # SECRETS: none. This workflow declares no `secrets:` inputs and callers pass none — the only
 # credential in the job is the automatic `GITHUB_TOKEN` (`github.token`), used for the PR read
 # and the one label write. There is no `secrets: inherit` to add and nothing to rotate.
@@ -97,6 +106,9 @@ name: PR Risk Grade (reusable)
 #     # constant group for every dispatch — and with cancel-in-progress that means each
 #     # dispatched PR cancels the one before it, which is precisely the shape a backfill has.
 #     # `inputs` is empty on a `pull_request` run, so this one expression is correct on both.
+#     # A `pr_numbers` LIST keys its own group, which serializes identical batches but cannot
+#     # serialize a batch against a `pull_request` run for one of its members — see "A BATCH
+#     # CANNOT SERIALIZE PER-PR" above for what that costs and how to avoid it.
 #     group: ${{ github.workflow }}-${{ inputs.pr_numbers || inputs.pr_number || github.event.pull_request.number }}
 #     cancel-in-progress: true
 #   permissions:
@@ -331,41 +343,76 @@ jobs:
           TIER: ${{ steps.grade.outputs.tier }}
           WAITED: ${{ steps.grade.outputs.waited }}
           TARGETS: ${{ steps.grade.outputs.targets }}
-          GRADED: ${{ steps.grade.outputs.graded }}
-          UNGRADED: ${{ steps.grade.outputs.ungraded }}
-          FAILED: ${{ steps.grade.outputs.failed }}
-          SKIPPED: ${{ steps.grade.outputs.skipped }}
         run: |
           set -uo pipefail
           RESULTS=pr-risk-results.jsonl
+          # WHETHER THE FILE EXISTS AT ALL IS ITSELF EVIDENCE. The grade step truncates it once the
+          # target list parses, so ABSENT means no target was ever resolved (a usage error, or a
+          # step killed that early), while PRESENT-BUT-EMPTY means targets were resolved and the
+          # step then stopped before recording the first outcome. Those are different failures and
+          # get different wording.
+          HAD_RESULTS=1
+          [ -f "$RESULTS" ] || HAD_RESULTS=0
           [ -f "$RESULTS" ] || : > "$RESULTS"
+          # COUNT THE RECORDED ROWS RATHER THAN TRUSTING THE STEP OUTPUTS. Every output above is
+          # written by the grade step's LAST lines, so a step killed by the job timeout or dying
+          # mid-batch emits none of them — and branching on an empty `targets` chose the
+          # single-target rendering, which prints row ONE and silently discards every other target
+          # already recorded. The cancelled-mid-batch run is exactly the case those records exist
+          # for. The per-status counts are derived here too, so the heading can never disagree with
+          # the table under it.
+          ROWS="$(jq -s 'length' "$RESULTS" 2>/dev/null || echo 0)"
+          COUNTS="$(jq -sr '[(map(select(.status == "graded")) | length),
+                            (map(select(.status == "ungraded")) | length),
+                            (map(select(.status == "failed")) | length),
+                            (map(select(.status == "skipped")) | length)] | @tsv' \
+                      "$RESULTS" 2>/dev/null || printf '0\t0\t0\t0')"
+          IFS=$'\t' read -r N_GRADED N_UNGRADED N_FAILED N_SKIPPED <<<"$COUNTS"
           {
-            if [ "${TARGETS:-1}" = 1 ] || [ ! -s "$RESULTS" ]; then
+            if [ "$ROWS" -eq 0 ]; then
+              # No target was even attempted — a usage error (an empty or malformed target list),
+              # which is a different failure from an unreadable PR and must not borrow its
+              # wording: no PR was named, so none "could not be read".
+              echo "## PR risk grade: none (advisory)"
+              echo
+              if [ "$HAD_RESULTS" = 0 ]; then
+                echo "No pull request was graded: the run resolved no target — either none was supplied, or the grade step was cancelled before it got one. On a \`workflow_dispatch\`, supply \`pr_number\` or \`pr_numbers\` — see the step log for the exact reason."
+              else
+                echo "No pull request was graded: targets WERE resolved, but the grade step recorded no outcome for any of them — it was cancelled or died before the first target finished. The dispatched numbers are in the step log; none of them was labeled."
+              fi
+            elif [ "$ROWS" -eq 1 ] && [ "${TARGETS:-1}" = 1 ]; then
               # ONE target: the per-axis table, unchanged — this is what the event path renders.
               one="$(jq -sc '.[0] // {}' "$RESULTS" 2>/dev/null || echo '{}')"
               rec="$(jq -r '.record // ""'  <<<"$one")"
               st="$(jq  -r '.status // ""'  <<<"$one")"
               note="$(jq -r '.note // ""'   <<<"$one")"
-              echo "## PR risk grade: ${TIER:-unknown} (advisory)"
-              echo
-              if [ -n "$rec" ] && [ -s "$rec" ] && jq -e '.risk' "$rec" >/dev/null 2>&1; then
+              # The HEADING tier falls back to the recorded row. `tier` is a step OUTPUT, so it is
+              # empty on a cancelled step — and heading a row that recorded R1 as "grade: unknown"
+              # contradicts the table printed directly under it.
+              head_tier="${TIER:-}"
+              [ -n "$head_tier" ] || head_tier="$(jq -r '.tier // "unknown"' <<<"$one")"
+              if [ "$st" = failed ]; then
+                # A FAILED TARGET NEVER RENDERS A GRADE TABLE, even when it HAS a record. A label
+                # write that 403s leaves the PR carrying the previous push's grade, and heading
+                # that outcome "PR risk grade: R1" with the full axis table under it reads as "R1
+                # was applied" — the one outcome where the label on the PR is not what the summary
+                # shows. The note says which input or write failed instead; reporting it as "could
+                # not be read via the API" would name the wrong cause.
+                echo "## PR risk grade: NOT APPLIED (advisory)"
+                echo
+                echo "Nothing was labeled: ${note:-see the step log for the reason}"
+              elif [ -n "$rec" ] && [ -s "$rec" ] && jq -e '.risk' "$rec" >/dev/null 2>&1; then
+                echo "## PR risk grade: ${head_tier:-unknown} (advisory)"
+                echo
                 jq -r '
                   "Grade = worst(path_floor, provenance, reversibility) — \(.risk.reason)\n",
                   "| axis | tier | reason |", "|---|---|---|",
                   (.risk.axes | to_entries[] | "| \(.key) | \(.value.tier // "unknown") | \(.value.reason) |"),
                   "\nMap `\(.risk.map_version)` · registry `\(.risk.registry_version)` · waited \($waited)s for the rollup · checks `\(.checks_state // "none")`"
                 ' --arg waited "${WAITED:-0}" "$rec"
-              elif [ "$st" = failed ] && [ -n "$note" ]; then
-                # A target that never reached the grader (an unresolvable base ref, an override
-                # file that would not read) says WHICH input failed. Reporting it as "could not
-                # be read via the API" would name the wrong cause and imply a label was applied.
-                echo "Nothing was graded: ${note}"
-              elif [ ! -s "$RESULTS" ]; then
-                # No target was even attempted — a usage error (an empty or malformed target
-                # list), which is a different failure from an unreadable PR and must not borrow
-                # its wording: no PR was named, so none "could not be read".
-                echo "No pull request was graded: the run resolved no target. On a \`workflow_dispatch\`, supply \`pr_number\` or \`pr_numbers\` — see the step log for the exact reason."
               else
+                echo "## PR risk grade: ${head_tier:-unknown} (advisory)"
+                echo
                 echo "The PR could not be read via the API; nothing was graded (labeled ungraded — this is NOT a low-risk verdict)."
               fi
             else
@@ -373,8 +420,20 @@ jobs:
               # per target. `not attempted` is listed as its own outcome rather than folded into
               # the failures: those PRs are un-graded, not mis-graded, and re-dispatching exactly
               # those numbers is the fix.
-              echo "## PR risk grades: ${GRADED:-0} graded, ${UNGRADED:-0} ungraded, ${FAILED:-0} failed, ${SKIPPED:-0} not attempted (advisory)"
+              echo "## PR risk grades: ${N_GRADED} graded, ${N_UNGRADED} ungraded, ${N_FAILED} failed, ${N_SKIPPED} not attempted (advisory)"
               echo
+              # A ROW COUNT SHORT OF THE TARGET COUNT MEANS THE STEP DID NOT FINISH. Say so: the
+              # un-recorded numbers were never graded, and silence there reads as "all covered".
+              case "${TARGETS:-}" in
+                ''|*[!0-9]*)
+                  echo "> The grade step never reported its own summary — it was cancelled or timed out. The rows below are what it had recorded when it stopped; anything else in the dispatched list was NOT graded."
+                  echo ;;
+                *)
+                  if [ "$TARGETS" -gt "$ROWS" ]; then
+                    echo "> Only ${ROWS} of ${TARGETS} targets were recorded — the grade step did not run to completion. The rest were NOT graded; re-dispatch those numbers."
+                    echo
+                  fi ;;
+              esac
               echo "| pr | tier | label | base ref | waited | note |"
               echo "|---|---|---|---|---|---|"
               jq -r '"| #\(.pr) | \(.tier // "—") | \(.label // "—") | `\(.base_ref // "—")` | \(.waited)s | \(.note // "") |"' "$RESULTS"

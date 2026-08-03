@@ -31,7 +31,10 @@
 #   FLEET_LOGINS BOT_LOGINS SELF_CONTEXT SELF_RUN_ID   passed through to the grader
 #   WAIT_MINUTES          per-target settle wait (default 10)
 #   JOB_TIMEOUT_MINUTES   the calling job's timeout-minutes (default 30) — the whole run is
-#                         budgeted against it, not just each target
+#                         budgeted against it, not just each target. Two deadlines come out of
+#                         it: the WAIT budget (how long targets may sleep for CI) and the JOB
+#                         deadline (after which a new target is not STARTED at all). They are
+#                         not the same thing — see main().
 #   LABEL_MAP             passed through to apply-risk-label.sh
 #   MAX_TARGETS           refuse a list longer than this (default 50)
 #   RESULTS               per-target JSONL outcome file (default pr-risk-results.jsonl)
@@ -69,26 +72,104 @@ LABEL_MAP="${LABEL_MAP:-}"
 MAX_TARGETS="${MAX_TARGETS:-50}"
 RESULTS="${RESULTS:-pr-risk-results.jsonl}"
 DRY_RUN="${DRY_RUN:-0}"
-# The two retry/backoff constants are env-overridable ONLY so the suite can exercise the
-# unreadable-PR and settle-repeat branches without sleeping through the production backoff. CI
-# passes neither, so the values below are what runs in production.
+# The retry/backoff constants are env-overridable ONLY so the suite can exercise the
+# unreadable-PR, read-retry and settle-repeat branches without sleeping through the production
+# backoff. CI passes none of them, so the values below are what runs in production.
 MAX_UNREADABLE_TRIES="${MAX_UNREADABLE_TRIES:-4}"
 READ_RETRY_BUDGET_SECONDS="${READ_RETRY_BUDGET_SECONDS:-150}"
 POLL_DELAY_SECONDS="${POLL_DELAY_SECONDS:-15}"
+READ_RETRY_TRIES="${READ_RETRY_TRIES:-3}"
+READ_RETRY_DELAY_SECONDS="${READ_RETRY_DELAY_SECONDS:-10}"
 
 # Set by the per-target helpers, read by their callers.
 G_TIER=""
 G_WAITED=0
 TARGET_COUNT=1
 OVERALL_DEADLINE=0
+JOB_DEADLINE=0
 
 log()  { printf '[grade-targets] %s\n' "$*" >&2; }
 die()  { printf '[grade-targets] ERROR %s\n' "$*" >&2; exit 2; }
 
-ERRF="$(mktemp "${TMPDIR:-/tmp}/grade-targets-err.XXXXXX")" || die "mktemp failed"
-LABELF="$(mktemp "${TMPDIR:-/tmp}/grade-targets-label.XXXXXX")" || die "mktemp failed"
-trap 'rm -f "$ERRF" "$LABELF"' EXIT
-gherr() { tr '\n' ' ' < "$ERRF" | sed 's/[[:space:]]*$//'; }
+# SCRATCH FILES AND THE EXIT TRAP ARE CREATED LAZILY, on first use, and the trap is installed only
+# by a DIRECT invocation. At file scope they were side effects of merely SOURCING this file, and
+# the `trap ... EXIT` replaced the sourcing shell's own EXIT trap — so a suite that sources these
+# helpers to drive them directly silently lost its `rm -rf "$SANDBOX"` cleanup and leaked both the
+# sandbox and these temp files. The footer's "sourceable without side effects" claim is only true
+# with this deferred.
+GT_DIRECT=0
+[ "${BASH_SOURCE[0]}" = "${0}" ] && GT_DIRECT=1
+ERRF=""
+LABELF=""
+OUTF=""
+init_scratch() {
+  [ -z "$ERRF" ] || return 0
+  ERRF="$(mktemp "${TMPDIR:-/tmp}/grade-targets-err.XXXXXX")"     || die "mktemp failed"
+  LABELF="$(mktemp "${TMPDIR:-/tmp}/grade-targets-label.XXXXXX")" || die "mktemp failed"
+  OUTF="$(mktemp "${TMPDIR:-/tmp}/grade-targets-out.XXXXXX")"     || die "mktemp failed"
+  [ "$GT_DIRECT" = 1 ] && trap 'rm -f "$ERRF" "$LABELF" "$OUTF"' EXIT
+  return 0
+}
+gherr() {
+  [ -n "$ERRF" ] && [ -f "$ERRF" ] || return 0
+  tr '\n' ' ' < "$ERRF" | sed 's/[[:space:]]*$//'
+}
+
+# ---- URL building ------------------------------------------------------------------------------
+# EVERY INTERPOLATED VALUE BELOW IS A URL COMPONENT, so it is percent-encoded like one. Git branch
+# names legally contain `#`, `&`, `+` and `%`, and consumer-supplied override paths can too: raw,
+# a PR based on `fix/#123-thing` had its request truncated at the `#`, which arrives at the
+# contents endpoint as an EMPTY `?ref=` — and an empty ref is not an error there, it silently
+# resolves to the repository DEFAULT branch. That is precisely the "graded against rules nobody
+# read" failure resolve_base_ref exists to prevent, reached by a different door (`&` splits off a
+# bogus query param; `+` decodes to a space and 404s into the generic-default fallback). This is
+# the same reason apply-risk-label.sh encodes label names before putting them in a path.
+enc()      { jq -rn --arg s "$1" '$s | @uri'; }
+# A path keeps its separators — `/` is structural here, not data — but each SEGMENT is encoded.
+enc_path() { jq -rn --arg s "$1" '$s | split("/") | map(@uri) | join("/")'; }
+
+# ---- transient failures on the pre-grader reads ------------------------------------------------
+# WHY THESE READS RETRY. Each target's base-ref read and its two override reads happen BEFORE the
+# grader, which already retries this same failure class (rate limit, secondary rate limit,
+# transient 5xx) four times with backoff, precisely so a blip does not become a durable verdict.
+# Rate limits are GLOBAL rather than per-PR, so on a 50-PR backfill one secondary-rate-limit burst
+# hit every remaining target at its very first hop and failed them wholesale — the inverse of the
+# "one unreadable PR never abandons the rest" guarantee this file's header promises. Retrying here
+# is what stops the batch's most-repeated read from being its least resilient one.
+#
+# A DEFINITIVE ANSWER IS NOT RETRIED. 404 (the path is absent, or no such PR), 401, 410 and 422 do
+# not change on a second ask, and fetch_override needs the 404 verdict PROMPTLY to fall back to the
+# shipped defaults. 403 is ambiguous — GitHub returns it both for a missing scope and for a
+# secondary rate limit — so it is retried only when the message reads like a rate limit.
+retryable_err() { # gh's stderr in $ERRF -> rc 0 when another attempt could plausibly differ
+  local msg; msg="$(gherr)"
+  case "$msg" in
+    *"rate limit"*|*"Rate limit"*|*"secondary rate"*|*"abuse detection"*) return 0 ;;
+    *"(HTTP 5"*|*"(HTTP 429)"*) return 0 ;;   # server side / explicit throttle
+    *"(HTTP "*)                 return 1 ;;   # any other status is an answer, not a blip
+    *)                          return 0 ;;   # no status at all: DNS, TLS, timeout, gh itself
+  esac
+}
+
+retry_read() { # <outfile> <gh api args...> -> rc 0, else gh's rc with its stderr left in $ERRF
+  init_scratch
+  local out="$1"; shift
+  local tries="$READ_RETRY_TRIES" attempt=1 delay="$READ_RETRY_DELAY_SECONDS" rc
+  while :; do
+    rc=0
+    gh api "$@" > "$out" 2>"$ERRF" || rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    retryable_err || return "$rc"
+    [ "$attempt" -lt "$tries" ] || return "$rc"
+    # A retry may never spend the time a LATER target needs: past the job's own deadline the
+    # remaining targets are better reported un-attempted by number than started and cut off.
+    [ "$JOB_DEADLINE" -eq 0 ] || [ "$(( $(date +%s) + delay ))" -lt "$JOB_DEADLINE" ] || return "$rc"
+    log "read failed (attempt ${attempt}/${tries}) — retrying in ${delay}s: $(gherr)"
+    sleep "$delay"
+    attempt=$(( attempt + 1 ))
+    delay=$(( delay * 2 )); [ "$delay" -le 60 ] || delay=60
+  done
+}
 
 # ---- targets ---------------------------------------------------------------------------------
 # A PR number is a positive integer with NO leading zeros. `007` is rejected rather than
@@ -123,13 +204,13 @@ parse_targets() { # <raw> -> one validated, de-duplicated number per line
 # prevent, arriving by a different door. Stacked PRs make it concrete: base refs on live PRs in
 # the pilot repo include feature branches, not just `main`.
 resolve_base_ref() { # <num> -> ref on stdout, rc 1 (reason already annotated on stderr)
-  local num="$1" ref rc
-  ref="$(gh api "repos/${REPO}/pulls/${num}" --jq '.base.ref' 2>"$ERRF")"; rc=$?
-  if [ "$rc" -ne 0 ]; then
+  init_scratch
+  local num="$1" ref
+  if ! retry_read "$OUTF" "repos/${REPO}/pulls/${num}" --jq '.base.ref'; then
     echo "::error::could not read the base ref of ${REPO}#${num}: $(gherr). NOT grading it against the default branch's rules." >&2
     return 1
   fi
-  ref="${ref%$'\n'}"
+  ref="$(tr -d '\n' < "$OUTF")"
   case "$ref" in
     ""|null)
       echo "::error::the base ref of ${REPO}#${num} read back empty — refusing to fall through to the repository default branch, which would grade this PR against another branch's rules." >&2
@@ -149,12 +230,23 @@ resolve_base_ref() { # <num> -> ref on stdout, rc 1 (reason already annotated on
 # repo's sharpened one — a LOWER tier computed from an input nobody read, which is the
 # confident-answer-from-an-unread-source failure the unknown contract forbids everywhere else. So
 # the status code is captured and anything that is not 200-or-404 fails the target.
+#
+# A 404 FROM THIS ENDPOINT IS TWO DIFFERENT ANSWERS. "the path is not in that tree" is the benign
+# one this fallback is for; "no commit found for the ref" is NOT — it means the base branch was
+# deleted or renamed (reachable on a by-number re-grade of an old PR), and treating it as "no
+# override" grades the PR confidently against rules nobody read, the same failure the non-404 guard
+# was written to stop. GitHub distinguishes them in the message body, so this does too.
 fetch_override() { # <path> <outfile> <base-ref> -> prints the outfile, or nothing when absent
+  init_scratch
   local p="$1" out="$2" base="$3"
-  if gh api "repos/${REPO}/contents/${p}?ref=${base}" \
-       -H "Accept: application/vnd.github.raw" > "$out" 2>"$ERRF"; then
+  if retry_read "$out" "repos/${REPO}/contents/$(enc_path "$p")?ref=$(enc "$base")" \
+       -H "Accept: application/vnd.github.raw"; then
     echo "using ${p} from ${base}" >&2
     printf '%s' "$out"
+  elif grep -qi 'no commit found for the ref' "$ERRF"; then
+    rm -f "$out"
+    echo "::error::the ref '${base}' does not resolve in ${REPO} (${p} was requested from it): $(gherr). NOT falling back to the generic default: a 404 for the REF is not a 404 for the FILE, and grading against the default branch's rules is exactly what re-reading the base ref exists to prevent." >&2
+    return 1
   elif grep -q '(HTTP 404)' "$ERRF"; then
     rm -f "$out"   # the redirect already created it empty; nothing must read it
     echo "no ${p} on ${base} — using the generic default" >&2
@@ -186,7 +278,7 @@ settle_grade() { # <num> <record-file> <map-override|""> <rb-override|""> <settl
   [ -z "$map_override" ] || args+=( --map "$map_override" )
   [ -z "$rb_override" ]  || args+=( --runbooks "$rb_override" )
 
-  local empty_deadline pending state now delay settled_once rc
+  local empty_deadline pending state now delay nap settled_once rc
   # Grace for checks to REGISTER at all.
   empty_deadline=$(( $(date +%s) + 120 ))
   G_WAITED=0
@@ -200,11 +292,11 @@ settle_grade() { # <num> <record-file> <map-override|""> <rb-override|""> <settl
   # hiccup into a durable verdict, so it is retried with backoff. This gets its OWN budget, not
   # the settle deadline: a transient API failure has nothing to do with how long the caller wants
   # to wait for CI, and sharing the deadline would leave `wait_for_checks_minutes: 0` with no
-  # retry at all. It IS capped by the whole run's budget, so one dead PR in a batch cannot eat
-  # the time the remaining targets need.
+  # retry at all. It IS capped by the JOB's deadline — not by the wait budget, which a batch may
+  # legitimately outlive while still grading — so one dead PR cannot get the run cancelled.
   local unreadable_tries=0 max_unreadable_tries="$MAX_UNREADABLE_TRIES" read_deadline read_delay=10
   read_deadline=$(( $(date +%s) + READ_RETRY_BUDGET_SECONDS ))
-  [ "$read_deadline" -le "$OVERALL_DEADLINE" ] || [ "$TARGET_COUNT" -eq 1 ] || read_deadline="$OVERALL_DEADLINE"
+  [ "$JOB_DEADLINE" -eq 0 ] || [ "$read_deadline" -le "$JOB_DEADLINE" ] || read_deadline="$JOB_DEADLINE"
   while :; do
     rc=0
     bash "$GRADER" "${args[@]}" > "$record" || rc=$?
@@ -241,10 +333,24 @@ settle_grade() { # <num> <record-file> <map-override|""> <rb-override|""> <settl
     else
       break
     fi
-    sleep "$delay"; G_WAITED=$(( G_WAITED + delay ))
+    # CLAMP THE SLEEP TO WHAT REMAINS OF THE DEADLINE. The loop tests `now < deadline` and then
+    # slept a full 15/30/60/120s, so a continuously-pending rollup overran the caller's wait by up
+    # to 105s per target — and in a batch that overrun is charged to the LATER targets' budget,
+    # pushing them into the un-attempted lane for time this target had no right to spend. The
+    # backoff itself keeps doubling; only the nap is shortened.
+    now="$(date +%s)"
+    nap="$delay"
+    [ "$(( now + nap ))" -le "$deadline" ] || nap=$(( deadline - now ))
+    [ "$nap" -gt 0 ] || break
+    sleep "$nap"; G_WAITED=$(( G_WAITED + nap ))
     delay=$(( delay * 2 )); [ "$delay" -le 120 ] || delay=120
   done
-  G_TIER="$(jq -r '.risk.tier // "unknown"' "$record")"
+  G_TIER="$(jq -r '.risk.tier // "unknown"' "$record" 2>/dev/null)"
+  # AN EMPTY TIER IS THE UNKNOWN LANE, NEVER A GRADED ONE. A record that is empty or not JSON at
+  # all makes jq print nothing and exit 0, and apply-risk-label.sh maps an empty TIER to
+  # `risk:ungraded` — so leaving G_TIER empty labeled the PR ungraded while this file recorded
+  # `status: graded` with a null tier and the batch counters credited it as graded.
+  [ -n "$G_TIER" ] || G_TIER=unknown
   return 0
 }
 
@@ -262,6 +368,7 @@ record_result() { # <pr> <status> <tier> <label> <record|""> <waited> <base-ref>
 }
 
 process_target() { # <num> -> rc 0 = label in sync, rc 1 = failed
+  init_scratch
   local num="$1" base map rb record label deadline now label_rc
   record="record-${num}.json"
   G_TIER=""; G_WAITED=0
@@ -314,7 +421,7 @@ process_target() { # <num> -> rc 0 = label in sync, rc 1 = failed
   # `unknown` is a REPORTED verdict, not a failure: the event path labels it `risk:ungraded` and
   # keeps the check green, and a dispatch must not start disagreeing about that.
   case "$G_TIER" in
-    unknown|null)
+    ""|unknown|null)
       record_result "$num" ungraded unknown "$label" "$record" "$G_WAITED" "$base" "the PR could not be read via the API — labeled ungraded, which is NOT a low-risk verdict" ;;
     *)
       record_result "$num" graded "$G_TIER" "$label" "$record" "$G_WAITED" "$base" "" ;;
@@ -324,27 +431,40 @@ process_target() { # <num> -> rc 0 = label in sync, rc 1 = failed
 
 # ---- main --------------------------------------------------------------------------------------
 main() {
+  init_scratch
   [ -n "$REPO" ] || die "REPO is required"
   [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "bad REPO '$REPO' (want owner/name)"
   [ -f "$GRADER" ]  || die "grader not found at $GRADER (set TOOL_DIR)"
   [ -f "$LABELER" ] || die "label script not found at $LABELER (set TOOL_DIR)"
   command -v jq >/dev/null 2>&1 || die "jq not found on PATH"
   command -v gh >/dev/null 2>&1 || die "gh not found on PATH"
-  [[ "$JOB_TIMEOUT_MINUTES" =~ ^[0-9]+$ ]] || die "bad JOB_TIMEOUT_MINUTES '$JOB_TIMEOUT_MINUTES'"
+  [[ "$JOB_TIMEOUT_MINUTES" =~ ^[1-9][0-9]*$ ]] || die "bad JOB_TIMEOUT_MINUTES '$JOB_TIMEOUT_MINUTES' (want a positive integer — it is the calling job's timeout-minutes, and 0 leaves no time to grade anything)"
   [[ "$MAX_TARGETS" =~ ^[1-9][0-9]*$ ]]    || die "bad MAX_TARGETS '$MAX_TARGETS'"
 
   # CLAMP THE WAIT TO THE JOB'S OWN BUDGET rather than trusting the input description. A caller
   # who passes 40 against a 30-minute timeout gets a job cancelled mid-sleep: the label step
   # never runs, the PR keeps whatever label the previous push left, and the check goes red for a
   # reason nobody would guess. 5 minutes of headroom is left for the label + summary steps.
-  local max_wait
+  local max_wait started
+  started="$(date +%s)"
   max_wait=$(( JOB_TIMEOUT_MINUTES > 5 ? JOB_TIMEOUT_MINUTES - 5 : 0 ))
   [ "$WAIT_MINUTES" -ge 0 ] 2>/dev/null || WAIT_MINUTES=10
   if [ "$WAIT_MINUTES" -gt "$max_wait" ]; then
     echo "::warning::wait_for_checks_minutes=${WAIT_MINUTES} exceeds what a ${JOB_TIMEOUT_MINUTES}-minute job can spend waiting — clamped to ${max_wait}"
     WAIT_MINUTES="$max_wait"
   fi
-  OVERALL_DEADLINE=$(( $(date +%s) + 60 * max_wait ))
+  # TWO DEADLINES, BECAUSE THEY ANSWER TWO DIFFERENT QUESTIONS.
+  #   OVERALL_DEADLINE is the WAIT budget: how long targets may collectively SLEEP for CI. It
+  #   clamps each target's settle wait so a batch does not spend the early targets' full waits.
+  #   JOB_DEADLINE is when a new target may no longer be STARTED, and it is the JOB's own timeout
+  #   minus headroom for the in-flight label write and the summary step.
+  # Gating the start on the WAIT budget conflated them: a spent wait budget only means no remaining
+  # target may sleep, and grading with zero wait is still a real grade (an honest R2 floor at
+  # worst), so targets there was ample time to grade were reported un-attempted instead. At
+  # JOB_TIMEOUT_MINUTES <= 5 the wait budget is 0 from the first instant, which made a batch record
+  # every target `skipped` and grade NOTHING.
+  OVERALL_DEADLINE=$(( started + 60 * max_wait ))
+  JOB_DEADLINE=$(( started + 60 * JOB_TIMEOUT_MINUTES - 90 ))
 
   # parse_targets runs in a command substitution, so its `die` exits that SUBSHELL — the rc has
   # to be propagated here or a bad number would leave an empty target list and exit 0, which is
@@ -356,19 +476,22 @@ main() {
   : > "$RESULTS"
   log "grading ${TARGET_COUNT} target(s) in ${REPO}: ${targets[*]}"
 
-  local num graded=0 ungraded=0 failed=0 skipped=0 total_waited=0
+  local num graded=0 ungraded=0 failed=0 skipped=0 total_waited=0 attempted=0
   for num in "${targets[@]}"; do
     # BUDGET STOP. A target that cannot START inside the job's budget is reported as un-attempted
     # rather than begun and cut off: a run cancelled mid-label is the one outcome with no signal
-    # at all, because the summary step never renders either.
-    if [ "$TARGET_COUNT" -gt 1 ] && [ "$(date +%s)" -ge "$OVERALL_DEADLINE" ]; then
-      log "::warning::${REPO}#${num} was NOT graded — the job's wait budget is spent. Re-dispatch the remaining numbers."
-      record_result "$num" skipped "" "" "" 0 "" "not attempted — the job's wait budget was spent before this target's turn"
+    # at all, because the summary step never renders either. THE FIRST TARGET IS EXEMPT — a run
+    # that grades nothing while reporting every target as un-attempted is a silent no-op with
+    # extra steps, and however short the budget there is always time for one grade to be tried.
+    if [ "$attempted" -gt 0 ] && [ "$(date +%s)" -ge "$JOB_DEADLINE" ]; then
+      log "::warning::${REPO}#${num} was NOT graded — the job's time budget is spent. Re-dispatch the remaining numbers."
+      record_result "$num" skipped "" "" "" 0 "" "not attempted — the job's time budget was spent before this target's turn"
       skipped=$(( skipped + 1 ))
       continue
     fi
+    attempted=$(( attempted + 1 ))
     if process_target "$num"; then
-      case "$G_TIER" in unknown|null) ungraded=$(( ungraded + 1 )) ;; *) graded=$(( graded + 1 )) ;; esac
+      case "$G_TIER" in ""|unknown|null) ungraded=$(( ungraded + 1 )) ;; *) graded=$(( graded + 1 )) ;; esac
     else
       failed=$(( failed + 1 ))
     fi
@@ -393,8 +516,9 @@ main() {
   [ "$(( failed + skipped ))" -eq 0 ]
 }
 
-# Sourceable without side effects (the test suite sources this file to exercise the helpers
-# directly); only a direct invocation runs it.
+# Sourceable without side effects — no temp file is created and no EXIT trap installed until a
+# helper actually needs one (see init_scratch), so a suite that sources this file to exercise the
+# helpers keeps its own EXIT cleanup. Only a direct invocation runs main.
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   main "$@"
 fi

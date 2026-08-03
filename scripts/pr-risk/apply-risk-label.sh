@@ -120,9 +120,20 @@ for l in "${OWNED[@]}"; do
     # push's grade for changed code. That is why the message has to name the resulting state and
     # the cause: the red check is the only signal, and a reader must not read the stale label as
     # a current verdict.
-    ghq api -X DELETE "repos/$REPO/issues/$PR_NUMBER/labels/$(enc "$l")" >/dev/null \
-      || fail "could not remove stale label '$l' from $REPO#$PR_NUMBER: $(gherr) — '$TARGET' was NOT applied, so the PR still carries the STALE grade '$l'"
-    log "removed stale '$l'"
+    #
+    # A 404 IS NOT A FAILURE HERE. It means the label is already off the PR — the state this loop
+    # is trying to reach. The read above is a snapshot, so anything that removes the label between
+    # that read and this DELETE (a human, or a concurrent grading run of the same PR, which a
+    # batch dispatch can overlap with an event run) made it 404. Failing on that painted a red
+    # check and skipped the target label for a PR that was in the desired state.
+    if ! ghq api -X DELETE "repos/$REPO/issues/$PR_NUMBER/labels/$(enc "$l")" >/dev/null; then
+      case "$(gherr)" in
+        *"(HTTP 404)"*) log "stale '$l' was already gone (404) — treating it as removed" ;;
+        *) fail "could not remove stale label '$l' from $REPO#$PR_NUMBER: $(gherr) — '$TARGET' was NOT applied, so the PR still carries the STALE grade '$l'" ;;
+      esac
+    else
+      log "removed stale '$l'"
+    fi
   fi
 done
 
