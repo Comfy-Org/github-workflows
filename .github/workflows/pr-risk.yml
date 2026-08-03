@@ -1,0 +1,243 @@
+name: PR Risk Grade (reusable)
+
+# Reusable ADVISORY PR risk grader — the shadow-check rung of the PR risk-grading ladder.
+# Grades every PR event into a tier R0 (safest) .. R3 (riskiest) and syncs ONE label
+# (`risk:R0` .. `risk:R3`, or `risk:ungraded` when an input was unreadable). That label is
+# the entire product: nothing is gated, nothing is blocked, nothing merges, no comment is
+# posted. Humans look at the label and agree or disagree; disagreement is recorded by adding
+# the `risk-dispute` label (which this workflow never touches) plus a comment saying why.
+#
+# grade = worst(path_floor, provenance, reversibility) — three deterministic axes; the worst
+# tier wins, so no axis can move a PR into a safer lane than another axis put it. No LLM, no
+# model call anywhere: `gh` + `jq` over the PR's own API record. See
+# scripts/pr-risk/grade-pr-risk.sh for the axes and the unknown contract.
+#
+# The grader and its default risk map load from THIS repo at the pinned `workflows_ref`,
+# never from the graded PR's checkout (no PR code is checked out at all) — a PR cannot edit
+# the rules that judge it. A consumer repo sharpens the generic defaults by committing
+# `.github/risk.json` (map) / `.github/risk-runbooks.json` (runbook registry), which are read
+# from the PR's BASE ref: present-but-invalid fails the run loudly; absent falls back to the
+# defaults in scripts/pr-risk/.
+#
+# CHECKS SETTLE BEFORE THE LABEL DOES: the reversibility axis asks "did tests covering these
+# lines actually run", and at event time the rest of the rollup is usually still running (the
+# grading job itself is excluded from the rollup it reads — see --self-context in the
+# grader). The job re-polls until the other checks settle or `wait_for_checks_minutes` runs
+# out, then labels what it has. Pair the caller with a per-PR cancel-in-progress concurrency
+# group so a new push supersedes a waiting run instead of stacking behind it.
+#
+# The label is applied with the plain GITHUB_TOKEN on purpose: GITHUB_TOKEN-applied labels
+# cannot fire `labeled` triggers, so the shadow check is structurally unable to start a
+# workflow cascade. Fork PRs under a plain `pull_request` trigger get a read-only token and
+# the label write will fail — enroll public repos with `pull_request_target` instead (safe
+# here by construction: this workflow never checks out or executes PR code).
+#
+# Caller pattern (consumer repo, .github/workflows/ci-pr-risk.yml):
+#
+#   name: CI - PR Risk Grade
+#   on:
+#     pull_request:
+#       types: [opened, synchronize, reopened, ready_for_review]
+#   concurrency:
+#     group: pr-risk-${{ github.event.pull_request.number }}
+#     cancel-in-progress: true
+#   permissions:
+#     contents: read
+#   jobs:
+#     pr-risk:
+#       permissions:
+#         contents: read
+#         issues: write         # the risk label rides the issues API
+#         pull-requests: read
+#         checks: read          # the check rollup the reversibility axis reads
+#         statuses: read
+#       uses: Comfy-Org/github-workflows/.github/workflows/pr-risk.yml@<sha>  # v1
+#       with:
+#         workflows_ref: <same sha>
+
+on:
+  workflow_call:
+    inputs:
+      fleet_logins:
+        description: >-
+          GitHub logins whose PRs are supervised-agent output (comma-separated).
+          Grades provenance `agent-supervised` alongside the `agent-coded` label.
+        type: string
+        required: false
+        default: mattmillerai
+      bot_logins:
+        description: >-
+          Extra logins treated as bots, on top of any `[bot]`-suffixed login
+          (comma-separated). A bot with no runbook registry entry grades as
+          human — identity alone never buys trust.
+        type: string
+        required: false
+        default: github-actions,dependabot,renovate,coderabbitai,cursor,comfy-pr-bot,web-flow
+      label_map:
+        description: >-
+          Rename the five grader-owned labels, as `tier=label` pairs
+          (comma-separated). Default:
+          `R0=risk:R0,R1=risk:R1,R2=risk:R2,R3=risk:R3,unknown=risk:ungraded`.
+          Tier KEYS are fixed; only the label text is yours. Missing labels are
+          created on first use, color-coded green through red.
+        type: string
+        required: false
+        default: ''
+      wait_for_checks_minutes:
+        description: >-
+          How long to wait for the REST of the check rollup to settle before
+          labeling (the grading run itself is excluded from the rollup it
+          reads). 0 labels immediately — expect R2 floors from still-pending
+          checks. Keep at or below 25 (the job times out at 30).
+        type: number
+        required: false
+        default: 10
+      repo_map_path:
+        description: Path of the consumer repo's risk-map override, read from the PR base ref.
+        type: string
+        required: false
+        default: .github/risk.json
+      repo_runbooks_path:
+        description: Path of the consumer repo's runbook-registry override, read from the PR base ref.
+        type: string
+        required: false
+        default: .github/risk-runbooks.json
+      workflows_ref:
+        description: >-
+          Ref of Comfy-Org/github-workflows to load the grader + default map
+          from. Pin to the same ref you pin `uses:` to.
+        type: string
+        required: false
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  grade:
+    name: Grade PR risk
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
+      checks: read
+      statuses: read
+    env:
+      REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      BASE_REF: ${{ github.event.pull_request.base.ref }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Load pr-risk tool
+        # The grader + default map come from THIS workflow's repo (public, pinned
+        # via workflows_ref) — never from the graded PR. No PR code is checked
+        # out anywhere in this job.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _pr_risk_tool
+          persist-credentials: false
+
+      - name: Fetch per-repo overrides from the base ref
+        id: overrides
+        env:
+          MAP_PATH: ${{ inputs.repo_map_path }}
+          RB_PATH: ${{ inputs.repo_runbooks_path }}
+        run: |
+          set -uo pipefail
+          # Read from the BASE ref, so the PR being graded cannot edit the rules
+          # that judge it. Absent (404) falls back to the shipped defaults;
+          # present-but-invalid is left for the grader's structural validation
+          # to reject loudly — a repo that commits a corrupt map must see red,
+          # not silent generic grading.
+          if gh api "repos/${REPO}/contents/${MAP_PATH}?ref=${BASE_REF}" \
+               -H "Accept: application/vnd.github.raw" > repo-risk-map.json 2>/dev/null; then
+            echo "map=repo-risk-map.json" >> "$GITHUB_OUTPUT"
+            echo "using ${MAP_PATH} from ${BASE_REF}"
+          else
+            echo "map=" >> "$GITHUB_OUTPUT"
+            echo "no ${MAP_PATH} on ${BASE_REF} — using the generic default map"
+          fi
+          if gh api "repos/${REPO}/contents/${RB_PATH}?ref=${BASE_REF}" \
+               -H "Accept: application/vnd.github.raw" > repo-risk-runbooks.json 2>/dev/null; then
+            echo "runbooks=repo-risk-runbooks.json" >> "$GITHUB_OUTPUT"
+            echo "using ${RB_PATH} from ${BASE_REF}"
+          else
+            echo "runbooks=" >> "$GITHUB_OUTPUT"
+            echo "no ${RB_PATH} on ${BASE_REF} — using the generic default registry"
+          fi
+
+      - name: Grade (waits for the rest of the rollup to settle)
+        id: grade
+        env:
+          FLEET_LOGINS: ${{ inputs.fleet_logins }}
+          BOT_LOGINS: ${{ inputs.bot_logins }}
+          SELF_CONTEXT: ${{ github.workflow }}
+          WAIT_MINUTES: ${{ inputs.wait_for_checks_minutes }}
+          MAP_OVERRIDE: ${{ steps.overrides.outputs.map }}
+          RB_OVERRIDE: ${{ steps.overrides.outputs.runbooks }}
+        run: |
+          set -uo pipefail
+          TOOL="_pr_risk_tool/scripts/pr-risk/grade-pr-risk.sh"
+          ARGS=( --repo "$REPO" --pr "$PR_NUMBER" --self-context "$SELF_CONTEXT" )
+          [ -n "$FLEET_LOGINS" ] && ARGS+=( --fleet-logins "$FLEET_LOGINS" )
+          [ -n "$BOT_LOGINS" ]   && ARGS+=( --bot-logins "$BOT_LOGINS" )
+          [ -n "$MAP_OVERRIDE" ] && ARGS+=( --map "$MAP_OVERRIDE" )
+          [ -n "$RB_OVERRIDE" ]  && ARGS+=( --runbooks "$RB_OVERRIDE" )
+          deadline=$(( $(date +%s) + 60 * WAIT_MINUTES ))
+          waited=0
+          while :; do
+            rc=0
+            bash "$TOOL" "${ARGS[@]}" > record.json || rc=$?
+            case "$rc" in
+              0|1) ;;                     # graded (1 = graded but unknown — still labeled)
+              3)  echo "PR unreadable via the API — labeling ungraded"
+                  printf '{}' > record.json
+                  break ;;
+              *)  echo "grader failed (rc=$rc)"; exit 1 ;;   # setup/usage bug: fail loud
+            esac
+            pending="$(jq -r '.checks_pending_excl_self // false' record.json)"
+            if [ "$pending" = "true" ] && [ "$(date +%s)" -lt "$deadline" ]; then
+              sleep 30; waited=$(( waited + 30 )); continue
+            fi
+            break
+          done
+          tier="$(jq -r '.risk.tier // "unknown"' record.json)"
+          echo "tier=$tier"   >> "$GITHUB_OUTPUT"
+          echo "waited=$waited" >> "$GITHUB_OUTPUT"
+          echo "graded tier: $tier (waited ${waited}s for the rollup)"
+
+      - name: Apply risk label
+        env:
+          TIER: ${{ steps.grade.outputs.tier }}
+          LABEL_MAP: ${{ inputs.label_map }}
+        run: |
+          set -uo pipefail
+          bash _pr_risk_tool/scripts/pr-risk/apply-risk-label.sh
+
+      - name: Step summary
+        if: always()
+        env:
+          TIER: ${{ steps.grade.outputs.tier }}
+          WAITED: ${{ steps.grade.outputs.waited }}
+        run: |
+          set -uo pipefail
+          {
+            echo "## PR risk grade: ${TIER:-unknown} (advisory)"
+            echo
+            if [ -s record.json ] && jq -e '.risk' record.json >/dev/null 2>&1; then
+              jq -r '
+                "Grade = worst(path_floor, provenance, reversibility) — \(.risk.reason)\n",
+                "| axis | tier | reason |", "|---|---|---|",
+                (.risk.axes | to_entries[] | "| \(.key) | \(.value.tier // "unknown") | \(.value.reason) |"),
+                "\nMap `\(.risk.map_version)` · registry `\(.risk.registry_version)` · waited \($waited)s for the rollup · checks `\(.checks_state // "none")`"
+              ' --arg waited "${WAITED:-0}" record.json
+            else
+              echo "The PR could not be read via the API; nothing was graded (labeled ungraded — this is NOT a low-risk verdict)."
+            fi
+            echo
+            echo "This label routes nothing and gates nothing. Disagree with the grade? Add the \`risk-dispute\` label and say why in a comment — the grader never touches that label."
+          } >> "$GITHUB_STEP_SUMMARY"

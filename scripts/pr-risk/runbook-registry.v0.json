@@ -1,0 +1,41 @@
+{
+  "registry_version": "v0-generic",
+  "_comment": [
+    "The DEFAULT runbook registry for the reusable pr-risk.yml workflow — the KNOWN automated",
+    "producers whose output has a fixed diff shape. Read by the grader's provenance axis.",
+    "",
+    "PROVENANCE ALONE IS NEVER SUFFICIENT. Every entry carries a `shape` assertion, and the",
+    "assertion is what separates \"claims to be runbook X\" (an identity anyone with a token",
+    "can present) from \"actually looks like runbook X's output\". A PR whose identity matches",
+    "an entry but whose SHAPE does not is NOT a runbook: it falls back to its underlying",
+    "provenance class and the failure is recorded in `shape_failures`, never silently ignored.",
+    "",
+    "IDENTITY is the server-attributed PR author login (and, where the producer is a workflow,",
+    "the head-ref shape that workflow pushes) — never the forgeable commit author string.",
+    "",
+    "This default registers only ecosystem-universal producers. A consumer repo registers its",
+    "own producers (release bots, spec-sync pushes, caller bumpers) by committing",
+    ".github/risk-runbooks.json; the workflow reads it from the PR's BASE ref, so a PR cannot",
+    "register a runbook for itself.",
+    "",
+    "`daily_cap` bounds how many PRs a producer may contribute per UTC day before the surplus",
+    "stops counting as routine runbook output; `lane` is the candidate routing lane a later",
+    "phase would open for it. Both are RECORDED and gate nothing."
+  ],
+  "runbooks": [
+    {
+      "id": "dependabot",
+      "why": "Dependabot — the highest-volume automated producer, and the one with the best-known diff shape",
+      "identity": { "logins": ["dependabot[bot]", "dependabot", "dependabot-preview[bot]"],
+                    "head_ref_patterns": ["dependabot/**"] },
+      "permitted_paths": ["go.mod", "go.sum", "**/go.mod", "**/go.sum", "**/package.json", "**/package-lock.json",
+                          "**/pnpm-lock.yaml", "**/yarn.lock", "**/requirements*.txt", "**/pyproject.toml",
+                          "**/uv.lock", "**/Cargo.toml", "**/Cargo.lock", ".github/workflows/**"],
+      "shape": { "max_changed_files": 4, "max_additions": 2000, "max_deletions": 2000,
+                 "title_regex": "(?i)^((chore|build|fix)\\(deps[^)]*\\):?|bump)[[:space:]]" },
+      "daily_cap": 20,
+      "lane": "dependency-bump",
+      "_note": "permitted_paths deliberately include the dependency manifests the path map pins R3 — worst-wins keeps the R3 floor. A runbook can never buy its way past the path map; provenance can only PROPOSE a tier."
+    }
+  ]
+}

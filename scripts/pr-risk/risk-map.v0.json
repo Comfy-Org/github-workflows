@@ -1,0 +1,80 @@
+{
+  "map_version": "v0-generic",
+  "_comment": [
+    "The DEFAULT PR risk map for the reusable pr-risk.yml workflow. VERSIONED so a later",
+    "revision can be REPLAYED against accumulated graded records rather than reconstructed —",
+    "every graded record carries the map_version that produced it.",
+    "",
+    "This default is deliberately GENERIC: it names ecosystem-level risk classes (CI, deps,",
+    "migrations, IaC, secrets, API contracts), never any one repo's internal layout. A consumer",
+    "repo sharpens it by committing .github/risk.json; the workflow reads that file from the",
+    "PR's BASE ref, so a PR cannot edit the rules that judge it — the same defence pr-size.yml",
+    "uses for linguist-generated.",
+    "",
+    "TIERS: R0 safest .. R3 riskiest. grade = worst(path_floor, provenance, reversibility):",
+    "each axis independently PROPOSES a tier and the worst wins, so no axis can ever move a PR",
+    "into a SAFER lane than another axis put it.",
+    "",
+    "GLOBS: `**` crosses directory separators, `*` does not. Matching is whole-path anchored."
+  ],
+  "tiers": ["R0", "R1", "R2", "R3"],
+  "default_tier": "R0",
+
+  "path_rules": [
+    { "class": "risk-map",      "tier": "R3", "why": "touching the map itself is automatically R3 — a PR must not be able to lower its own grade",
+      "paths": ["risk-map.*.json", ".github/risk.json", ".github/risk-runbooks.json", "**/.github/risk.json"] },
+    { "class": "codeowners",    "tier": "R3", "why": "CODEOWNERS decides who must review — editing it edits the review gate",
+      "paths": ["CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS", "**/CODEOWNERS"] },
+    { "class": "ci",            "tier": "R3", "why": "any workflow file is automatically R3 — a workflow runs with repo credentials",
+      "paths": [".github/workflows/**", ".github/actions/**", "**/.github/workflows/**"] },
+    { "class": "auth",          "tier": "R3", "why": "authentication / trust boundary",
+      "paths": ["**/auth/**", "**/middleware/auth*", "**/auth_validator*", "**/authvalidator/**", "**/*token_validator*"] },
+    { "class": "billing",       "tier": "R3", "why": "billing / credits — money moves",
+      "paths": ["**/billing/**", "**/pricing/**", "**/credits/**"] },
+    { "class": "migrations",    "tier": "R3", "why": "schema migrations mutate persistent state and do not cleanly revert",
+      "paths": ["**/migrations/**", "**/migrate/**", "databases/**"] },
+    { "class": "iac",           "tier": "R3", "why": "infrastructure as code — blast radius is the estate, not the request",
+      "paths": ["infrastructure/**", "terraform/**", "**/*.tf", "charts/**", "helm/**"] },
+    { "class": "deps",          "tier": "R3", "why": "dependency manifests pull in code nobody in the PR wrote — every ecosystem, not just one (a package.json `scripts` block is supply-chain-relevant in exactly the same way go.mod is)",
+      "paths": ["**/go.mod", "**/go.sum", "**/go.work*",
+                "**/package.json", "**/package-lock.json", "**/pnpm-lock.yaml", "**/yarn.lock", "**/npm-shrinkwrap.json",
+                "**/requirements*.txt", "**/pyproject.toml", "**/Pipfile", "**/Pipfile.lock", "**/poetry.lock", "**/uv.lock", "**/setup.py",
+                "**/Cargo.toml", "**/Cargo.lock",
+                "**/Gemfile", "**/Gemfile.lock", "**/composer.json", "**/composer.lock", "**/*.gemspec"] },
+    { "class": "api-contract",  "tier": "R3", "why": "cross-repo API contract — consumers break out of band",
+      "paths": ["openapi.yaml", "openapi.yml", "**/openapi.yaml", "**/openapi.yml", "**/*.proto"] },
+    { "class": "secrets",       "tier": "R3", "why": "secrets handling",
+      "paths": ["**/secrets/**", "**/*secret*.go", "**/*secret*.ts", "secrets.env*", "**/kms/**", "**/*credential*"] },
+    { "class": "data-deletion", "tier": "R3", "why": "data deletion / compliance — irreversible by construction",
+      "paths": ["**/deletion/**", "**/gdpr/**"] },
+
+    { "class": "docs",          "tier": "R0", "why": "prose only",
+      "paths": ["**/*.md", "docs/**", "**/*.txt", "LICENSE", "**/*.mdx"] },
+    { "class": "tests",         "tier": "R0", "why": "test-only changes cannot break production behaviour",
+      "paths": ["**/*_test.go", "**/*.test.ts", "**/*.test.tsx", "**/*.spec.ts", "**/test/**", "**/tests/**", "*-test.sh"] }
+  ],
+  "_path_rule_order": "R3 classes are listed FIRST but ORDER DOES NOT MATTER: the path floor is the WORST tier over every rule any changed path matches, so an R0 doc rule can never cancel an R3 migration rule in the same PR.",
+
+  "provenance_tiers": {
+    "runbook": "R0",
+    "agent-supervised": "R1",
+    "human": "R1",
+    "external": "R3",
+    "_why": "external (a fork / first-time contributor) is R3 on provenance alone — an unreviewed outside diff is the one provenance class never routed unattended. runbook is R0 ONLY when the shape assertion also holds (see the runbook registry); a claimed-but-shape-failed runbook falls back to its underlying class."
+  },
+
+  "reversibility": {
+    "irreversible_classes": ["migrations", "data-deletion", "secrets"],
+    "_why_irreversible": "a PR touching these mutates persistent state or deletes data — reverting the code does not restore the state, so reversibility is pinned R3 regardless of how clean the diff is.",
+    "delete_sensitive_classes": ["migrations", "data-deletion", "iac", "auth", "billing", "api-contract"],
+    "_why_delete": "a DELETED file under a persistent-state or trust-boundary class is not a clean single revert — R3.",
+    "no_green_checks_tier": "R2",
+    "_why_no_green": "did tests covering the touched lines actually run? A PR with no GREEN check rollup cannot answer yes, so it cannot be graded safer than R2.",
+    "no_test_touched_tier": "R1",
+    "_why_no_test": "green checks but the diff touches no test file: the suite ran, but nothing proves it covers THESE lines.",
+    "clean_tier": "R0"
+  },
+
+  "flippable_flag_paths": ["**/feature_flag*/**", "**/featureflags/**", "**/flags/**", "**/*feature_flag*", "**/*featureFlag*"],
+  "_flippable": "a change gated behind a flippable flag is recoverable without a deploy. Recorded on the reversibility axis as `flag_gated`; in v0 it is REPORTED, never used to LOWER a tier (an axis may only move a PR riskier)."
+}
