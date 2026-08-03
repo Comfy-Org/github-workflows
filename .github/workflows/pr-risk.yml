@@ -26,11 +26,21 @@ name: PR Risk Grade (reusable)
 # out, then labels what it has. Pair the caller with a per-PR cancel-in-progress concurrency
 # group so a new push supersedes a waiting run instead of stacking behind it.
 #
+# SECRETS: none. This workflow declares no `secrets:` inputs and callers pass none — the only
+# credential in the job is the automatic `GITHUB_TOKEN` (`github.token`), used for the PR read
+# and the one label write. There is no `secrets: inherit` to add and nothing to rotate.
+#
 # The label is applied with the plain GITHUB_TOKEN on purpose: GITHUB_TOKEN-applied labels
 # cannot fire `labeled` triggers, so the shadow check is structurally unable to start a
 # workflow cascade. Fork PRs under a plain `pull_request` trigger get a read-only token and
 # the label write will fail — enroll public repos with `pull_request_target` instead (safe
 # here by construction: this workflow never checks out or executes PR code).
+#
+# ENROLL THIS AS ITS OWN WORKFLOW, not as one job inside an existing CI workflow. The grading
+# job is part of the check rollup it reads, so it excludes its own RUN from that rollup; a job
+# sharing a run with the rest of CI therefore excludes its siblings too and lands on the honest
+# R2 floor instead of grading off a full rollup. (It can never grade a red PR green either way
+# — a FAILING check is never excluded.)
 #
 # Caller pattern (consumer repo, .github/workflows/ci-pr-risk.yml):
 #
@@ -88,7 +98,9 @@ on:
           How long to wait for the REST of the check rollup to settle before
           labeling (the grading run itself is excluded from the rollup it
           reads). 0 labels immediately — expect R2 floors from still-pending
-          checks. Keep at or below 25 (the job times out at 30).
+          checks. CLAMPED to what a 30-minute job can actually spend waiting (25),
+          so an over-large value degrades to a shorter wait instead of a job
+          cancelled mid-sleep with the label never applied.
         type: number
         required: false
         default: 10
@@ -105,10 +117,14 @@ on:
       workflows_ref:
         description: >-
           Ref of Comfy-Org/github-workflows to load the grader + default map
-          from. Pin to the same ref you pin `uses:` to.
+          from. REQUIRED, and pin it to the SAME full commit SHA you pin `uses:`
+          to. There is deliberately no default: a floating default (`main`) let a
+          caller SHA-pin `uses:` and then download the grader from HEAD of main,
+          so the two halves of one tool drifted apart and the grading logic
+          stayed mutable after review. A supply chain with a floating link in it
+          is not a chain.
         type: string
-        required: false
-        default: main
+        required: true
 
 permissions:
   contents: read
@@ -119,11 +135,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      contents: read
-      issues: write
-      pull-requests: read
-      checks: read
-      statuses: read
+      contents: read        # read the consumer's .github/risk.json override from the BASE ref
+      issues: write         # THE ONLY WRITE: sync the one risk label (a PR is an issue to the
+                            # labels API). Nothing else is written — no comment, no review, no
+                            # merge — and a GITHUB_TOKEN-applied label cannot fire `labeled`
+                            # triggers, so this write cannot start a workflow cascade.
+      pull-requests: read   # the PR record itself: author, association, fork flag, file list
+      checks: read          # the check rollup the reversibility axis reads (CheckRun contexts)
+      statuses: read        # the same rollup's legacy commit-status contexts
     env:
       REPO: ${{ github.repository }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -149,26 +168,38 @@ jobs:
         run: |
           set -uo pipefail
           # Read from the BASE ref, so the PR being graded cannot edit the rules
-          # that judge it. Absent (404) falls back to the shipped defaults;
-          # present-but-invalid is left for the grader's structural validation
-          # to reject loudly — a repo that commits a corrupt map must see red,
-          # not silent generic grading.
-          if gh api "repos/${REPO}/contents/${MAP_PATH}?ref=${BASE_REF}" \
-               -H "Accept: application/vnd.github.raw" > repo-risk-map.json 2>/dev/null; then
-            echo "map=repo-risk-map.json" >> "$GITHUB_OUTPUT"
-            echo "using ${MAP_PATH} from ${BASE_REF}"
-          else
-            echo "map=" >> "$GITHUB_OUTPUT"
-            echo "no ${MAP_PATH} on ${BASE_REF} — using the generic default map"
-          fi
-          if gh api "repos/${REPO}/contents/${RB_PATH}?ref=${BASE_REF}" \
-               -H "Accept: application/vnd.github.raw" > repo-risk-runbooks.json 2>/dev/null; then
-            echo "runbooks=repo-risk-runbooks.json" >> "$GITHUB_OUTPUT"
-            echo "using ${RB_PATH} from ${BASE_REF}"
-          else
-            echo "runbooks=" >> "$GITHUB_OUTPUT"
-            echo "no ${RB_PATH} on ${BASE_REF} — using the generic default registry"
-          fi
+          # that judge it. Absent (a genuine 404) falls back to the shipped
+          # defaults; present-but-invalid is left for the grader's structural
+          # validation to reject loudly — a repo that commits a corrupt map must
+          # see red, not silent generic grading.
+          #
+          # ONLY A 404 MEANS ABSENT. Treating any non-zero exit as "no override"
+          # meant a 403 rate-limit, a 5xx or a network blip silently graded the
+          # PR against the generic default map instead of the repo's sharpened
+          # one — a LOWER tier computed from an input nobody read, which is the
+          # confident-answer-from-an-unread-source failure the unknown contract
+          # forbids everywhere else. So the status code is captured and anything
+          # that is not 200-or-404 fails the run.
+          errf="$(mktemp)"
+          fetch_override() { # <path> <outfile> -> prints the outfile, or nothing when absent
+            local p="$1" out="$2"
+            if gh api "repos/${REPO}/contents/${p}?ref=${BASE_REF}" \
+                 -H "Accept: application/vnd.github.raw" > "$out" 2>"$errf"; then
+              echo "using ${p} from ${BASE_REF}" >&2
+              printf '%s' "$out"
+            elif grep -q '(HTTP 404)' "$errf"; then
+              rm -f "$out"   # the redirect already created it empty; nothing must read it
+              echo "no ${p} on ${BASE_REF} — using the generic default" >&2
+            else
+              echo "::error::could not read ${p} from ${BASE_REF}: $(tr '\n' ' ' < "$errf"). NOT falling back to the generic default: that would grade this PR against rules nobody read." >&2
+              return 1
+            fi
+          }
+          map="$(fetch_override "$MAP_PATH" repo-risk-map.json)" || exit 1
+          rb="$(fetch_override "$RB_PATH" repo-risk-runbooks.json)" || exit 1
+          rm -f "$errf"
+          echo "map=$map"       >> "$GITHUB_OUTPUT"
+          echo "runbooks=$rb"   >> "$GITHUB_OUTPUT"
 
       - name: Grade (waits for the rest of the rollup to settle)
         id: grade
@@ -176,34 +207,94 @@ jobs:
           FLEET_LOGINS: ${{ inputs.fleet_logins }}
           BOT_LOGINS: ${{ inputs.bot_logins }}
           SELF_CONTEXT: ${{ github.workflow }}
+          SELF_RUN_ID: ${{ github.run_id }}
           WAIT_MINUTES: ${{ inputs.wait_for_checks_minutes }}
           MAP_OVERRIDE: ${{ steps.overrides.outputs.map }}
           RB_OVERRIDE: ${{ steps.overrides.outputs.runbooks }}
+          JOB_TIMEOUT_MINUTES: 30      # keep in sync with timeout-minutes on the job
         run: |
           set -uo pipefail
           TOOL="_pr_risk_tool/scripts/pr-risk/grade-pr-risk.sh"
-          ARGS=( --repo "$REPO" --pr "$PR_NUMBER" --self-context "$SELF_CONTEXT" )
+          ARGS=( --repo "$REPO" --pr "$PR_NUMBER"
+                 --self-context "$SELF_CONTEXT" --self-run-id "$SELF_RUN_ID" )
           [ -n "$FLEET_LOGINS" ] && ARGS+=( --fleet-logins "$FLEET_LOGINS" )
           [ -n "$BOT_LOGINS" ]   && ARGS+=( --bot-logins "$BOT_LOGINS" )
           [ -n "$MAP_OVERRIDE" ] && ARGS+=( --map "$MAP_OVERRIDE" )
           [ -n "$RB_OVERRIDE" ]  && ARGS+=( --runbooks "$RB_OVERRIDE" )
-          deadline=$(( $(date +%s) + 60 * WAIT_MINUTES ))
+
+          # CLAMP THE WAIT TO THE JOB'S OWN BUDGET rather than trusting the input
+          # description. A caller who passes 40 against a 30-minute timeout gets a
+          # job cancelled mid-sleep: the label step never runs, the PR keeps
+          # whatever label the previous push left, and the check goes red for a
+          # reason nobody would guess. 5 minutes of headroom is left for the
+          # label + summary steps.
+          max_wait=$(( JOB_TIMEOUT_MINUTES - 5 ))
+          wait_minutes="${WAIT_MINUTES:-10}"
+          [ "$wait_minutes" -ge 0 ] 2>/dev/null || wait_minutes=10
+          if [ "$wait_minutes" -gt "$max_wait" ]; then
+            echo "::warning::wait_for_checks_minutes=${wait_minutes} exceeds what a ${JOB_TIMEOUT_MINUTES}-minute job can spend waiting — clamped to ${max_wait}"
+            wait_minutes="$max_wait"
+          fi
+          deadline=$(( $(date +%s) + 60 * wait_minutes ))
+          empty_deadline=$(( $(date +%s) + 120 ))   # grace for checks to REGISTER at all
           waited=0
+          # Poll backoff: 15s doubling to 120s. The fixed 30s poll idled a runner
+          # up to the full wait on every `synchronize` event, per PR, across the
+          # fleet, for a grade that is one API call — increasing backoff cuts both
+          # runner minutes and API calls without changing the settle behaviour.
+          delay=15
+          settled_once=0
+          # rc=3 (the PR could not be read) covers rate limits, secondary rate
+          # limits and transient 5xx as well as a genuinely missing PR. Labeling
+          # `ungraded` on the first blip turns a momentary hiccup into a durable
+          # verdict, so it is retried with backoff. This gets its OWN budget, not
+          # the settle deadline: a transient API failure has nothing to do with
+          # how long the caller wants to wait for CI, and sharing the deadline
+          # would leave `wait_for_checks_minutes: 0` with no retry at all.
+          unreadable_tries=0
+          max_unreadable_tries=4
+          read_deadline=$(( $(date +%s) + 150 ))
+          read_delay=10
           while :; do
             rc=0
             bash "$TOOL" "${ARGS[@]}" > record.json || rc=$?
             case "$rc" in
               0|1) ;;                     # graded (1 = graded but unknown — still labeled)
-              3)  echo "PR unreadable via the API — labeling ungraded"
+              3)  unreadable_tries=$(( unreadable_tries + 1 ))
+                  if [ "$unreadable_tries" -lt "$max_unreadable_tries" ] && [ "$(date +%s)" -lt "$read_deadline" ]; then
+                    echo "PR read failed (attempt ${unreadable_tries}/${max_unreadable_tries}) — retrying in ${read_delay}s"
+                    sleep "$read_delay"; waited=$(( waited + read_delay ))
+                    read_delay=$(( read_delay * 2 )); [ "$read_delay" -le 60 ] || read_delay=60
+                    continue
+                  fi
+                  echo "PR unreadable via the API after ${unreadable_tries} attempt(s) — labeling ungraded"
                   printf '{}' > record.json
                   break ;;
               *)  echo "grader failed (rc=$rc)"; exit 1 ;;   # setup/usage bug: fail loud
             esac
             pending="$(jq -r '.checks_pending_excl_self // false' record.json)"
-            if [ "$pending" = "true" ] && [ "$(date +%s)" -lt "$deadline" ]; then
-              sleep 30; waited=$(( waited + 30 )); continue
+            state="$(jq -r '.checks_state // "none"' record.json)"
+            now="$(date +%s)"
+            [ "$now" -lt "$deadline" ] || break
+            if [ "$pending" = "true" ]; then
+              settled_once=0
+            elif [ "$state" = "none" ] && [ "$now" -lt "$empty_deadline" ]; then
+              # An EMPTY rollup is checks that have not registered yet, not CI
+              # that finished — exiting the poll here would apply a label that a
+              # check appearing a second later never revises. Bounded by a SHORT
+              # grace window rather than the whole budget, so a repo with
+              # genuinely no CI is not made to wait 25 minutes on every PR to
+              # arrive at the same honest R2.
+              settled_once=0
+            elif [ "$settled_once" -eq 0 ]; then
+              # First settled reading. Require it to REPEAT before labeling: one
+              # transiently-quiet poll is not a settled rollup.
+              settled_once=1
+            else
+              break
             fi
-            break
+            sleep "$delay"; waited=$(( waited + delay ))
+            delay=$(( delay * 2 )); [ "$delay" -le 120 ] || delay=120
           done
           tier="$(jq -r '.risk.tier // "unknown"' record.json)"
           echo "tier=$tier"   >> "$GITHUB_OUTPUT"

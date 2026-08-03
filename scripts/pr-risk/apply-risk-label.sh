@@ -82,8 +82,18 @@ if [ "$DRY_RUN" = 1 ]; then
   exit 0
 fi
 
-# Current labels on the PR (a PR is an issue to the labels API).
-current="$(gh api "repos/$REPO/issues/$PR_NUMBER/labels" --jq '[.[].name]' 2>/dev/null)" \
+# A label name is a PATH SEGMENT in every request below, and GitHub label names legally contain
+# spaces, `/`, `#`, `?` and `%`. A caller who remaps `R3=risk high` would otherwise build a
+# malformed or misrouted URL: the DELETE fails, `fail` fires, and a rename paints the check red.
+# Encoded for the path only — the raw name is what we log, compare and send as a form field.
+enc() { jq -rn --arg s "$1" '$s | @uri'; }
+
+# Current labels on the PR (a PR is an issue to the labels API). --paginate because the endpoint
+# returns 30 per page: on a PR with more than 30 labels a stale grader-owned label falls off page
+# one, `has()` reports false, the removal loop skips it, and the PR carries two contradictory risk
+# labels at once — the exact state the ownership contract above promises cannot happen.
+current="$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/labels?per_page=100" --jq '.[].name' 2>/dev/null \
+           | jq -Rsc 'split("\n") | map(select(length > 0))')" \
   || fail "could not read labels on $REPO#$PR_NUMBER"
 
 has() { jq -e --arg l "$1" 'index($l) != null' >/dev/null 2>&1 <<<"$current"; }
@@ -92,7 +102,7 @@ has() { jq -e --arg l "$1" 'index($l) != null' >/dev/null 2>&1 <<<"$current"; }
 for l in "${OWNED[@]}"; do
   [ "$l" = "$TARGET" ] && continue
   if has "$l"; then
-    gh api -X DELETE "repos/$REPO/issues/$PR_NUMBER/labels/$l" >/dev/null 2>&1 \
+    gh api -X DELETE "repos/$REPO/issues/$PR_NUMBER/labels/$(enc "$l")" >/dev/null 2>&1 \
       || fail "could not remove stale label '$l' from $REPO#$PR_NUMBER"
     log "removed stale '$l'"
   fi
@@ -102,7 +112,7 @@ if has "$TARGET"; then
   log "already labeled '$TARGET' — nothing to do"
 else
   # Ensure the label exists in the repo first, so enrollment needs no manual label setup.
-  if ! gh api "repos/$REPO/labels/$TARGET" >/dev/null 2>&1; then
+  if ! gh api "repos/$REPO/labels/$(enc "$TARGET")" >/dev/null 2>&1; then
     gh api -X POST "repos/$REPO/labels" \
       -f name="$TARGET" -f color="$(color_for "$TIER")" \
       -f description="PR risk grade (advisory shadow check; grader-owned)" >/dev/null 2>&1 \

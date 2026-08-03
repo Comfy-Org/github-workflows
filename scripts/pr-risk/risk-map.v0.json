@@ -15,14 +15,22 @@
     "each axis independently PROPOSES a tier and the worst wins, so no axis can ever move a PR",
     "into a SAFER lane than another axis put it.",
     "",
-    "GLOBS: `**` crosses directory separators, `*` does not. Matching is whole-path anchored."
+    "GLOBS: `**` crosses directory separators, `*` does not. Matching is whole-path anchored,",
+    "so a glob WITHOUT a leading `**/` matches ROOT-LEVEL files only — prefix every rule that",
+    "should match at any depth, or it silently matches nothing in a real tree.",
+    "",
+    "Matching covers every path the diff touches, DESTINATION and ORIGIN: a RENAMED file is",
+    "graded under its previous path too, so moving a file out of a guarded directory cannot",
+    "escape that directory's rule."
   ],
   "tiers": ["R0", "R1", "R2", "R3"],
   "default_tier": "R0",
 
   "path_rules": [
-    { "class": "risk-map",      "tier": "R3", "why": "touching the map itself is automatically R3 — a PR must not be able to lower its own grade",
-      "paths": ["risk-map.*.json", ".github/risk.json", ".github/risk-runbooks.json", "**/.github/risk.json"] },
+    { "class": "risk-map",      "tier": "R3", "why": "touching the map, the registry or the grader itself is automatically R3 — a PR must not be able to lower its own grade, and a PR that edits the judge must not be graded safest by that judge",
+      "paths": ["**/risk-map.*.json", "**/runbook-registry.*.json", "**/pr-risk/**",
+                ".github/risk.json", ".github/risk-runbooks.json",
+                "**/.github/risk.json", "**/.github/risk-runbooks.json"] },
     { "class": "codeowners",    "tier": "R3", "why": "CODEOWNERS decides who must review — editing it edits the review gate",
       "paths": ["CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS", "**/CODEOWNERS"] },
     { "class": "ci",            "tier": "R3", "why": "any workflow file is automatically R3 — a workflow runs with repo credentials",
@@ -51,7 +59,7 @@
     { "class": "docs",          "tier": "R0", "why": "prose only",
       "paths": ["**/*.md", "docs/**", "**/*.txt", "LICENSE", "**/*.mdx"] },
     { "class": "tests",         "tier": "R0", "why": "test-only changes cannot break production behaviour",
-      "paths": ["**/*_test.go", "**/*.test.ts", "**/*.test.tsx", "**/*.spec.ts", "**/test/**", "**/tests/**", "*-test.sh"] }
+      "paths": ["**/*_test.go", "**/*.test.ts", "**/*.test.tsx", "**/*.spec.ts", "**/test/**", "**/tests/**", "**/*-test.sh"] }
   ],
   "_path_rule_order": "R3 classes are listed FIRST but ORDER DOES NOT MATTER: the path floor is the WORST tier over every rule any changed path matches, so an R0 doc rule can never cancel an R3 migration rule in the same PR.",
 
@@ -72,7 +80,17 @@
     "_why_no_green": "did tests covering the touched lines actually run? A PR with no GREEN check rollup cannot answer yes, so it cannot be graded safer than R2.",
     "no_test_touched_tier": "R1",
     "_why_no_test": "green checks but the diff touches no test file: the suite ran, but nothing proves it covers THESE lines.",
-    "clean_tier": "R0"
+    "clean_tier": "R0",
+    "test_path_patterns": ["**/*_test.go",
+                           "**/*.test.ts", "**/*.test.tsx", "**/*.test.js", "**/*.test.jsx",
+                           "**/*.spec.ts", "**/*.spec.tsx", "**/*.spec.js",
+                           "**/test_*.py", "**/*_test.py",
+                           "**/*_test.rb", "**/*_spec.rb",
+                           "**/*Test.java", "**/*Tests.java", "**/*Test.kt", "**/*Test.cs",
+                           "**/*_test.rs", "**/*_test.exs", "**/*_test.php", "**/*Test.php",
+                           "**/test/**", "**/tests/**", "**/testdata/**", "**/__tests__/**",
+                           "**/*-test.sh", "**/test_*.sh"],
+    "_why_test_patterns": "'did a test file change?' is an INPUT ON THE MAP, not a constant in the grader — a consumer sharpens it with .github/risk.json like every other rule. Omit the key entirely and the grader falls back to its built-in regex, which only knows the Go/TS shapes and so can never let a Python, Java or Ruby consumer reach clean_tier."
   },
 
   "flippable_flag_paths": ["**/feature_flag*/**", "**/featureflags/**", "**/flags/**", "**/*feature_flag*", "**/*featureFlag*"],

@@ -1,3 +1,13 @@
+# CONTRACT: this is one of THIS repo's own path-filtered script tests, NOT a reusable
+# workflow. It is not callable and has no caller pattern:
+#   TRIGGERS — `pull_request` and `push` to main, both filtered to scripts/pr-risk/**
+#              and this file. A change elsewhere in the repo does not run it.
+#   INPUTS   — none (no `workflow_call`, no `workflow_dispatch`).
+#   SECRETS  — none. Read-only `contents: read`; the suites are hermetic and make no
+#              network call (the live-PR path stubs `gh` on PATH with a fixture).
+# The reusable workflow these scripts back is .github/workflows/pr-risk.yml — that is
+# the file with the inputs/secrets/caller-pattern header.
+
 name: Test pr-risk scripts
 
 # Runs the hermetic test suites (+ shellcheck) for the grader and label-sync

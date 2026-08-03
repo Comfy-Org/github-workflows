@@ -61,6 +61,7 @@ RUNBOOKS="${PR_RISK_RUNBOOKS:-$SKILL_DIR/runbook-registry.v0.json}"
 FLEET_LOGINS="${PR_RISK_FLEET_LOGINS:-mattmillerai}"
 BOT_LOGINS="${PR_RISK_BOT_LOGINS:-github-actions,dependabot,renovate,coderabbitai,cursor,comfy-pr-bot,web-flow}"
 SELF_CONTEXT="${PR_RISK_SELF_CONTEXT:-}"
+SELF_RUN_ID="${PR_RISK_SELF_RUN_ID:-}"
 PR_NUM=""
 MODE=""
 
@@ -83,6 +84,10 @@ usage: grade-pr-risk.sh (--repo owner/name --pr N | --stdin) [options]
                        workflow's runs — the grading job is itself part of the rollup it
                        reads, so the raw rollup can never be SUCCESS while it runs. Also
                        emits checks_pending_excl_self so a caller can wait for CI to settle.
+  --self-run-id ID     PREFERRED over --self-context: exclude by workflow-RUN id
+                       (github.run_id) instead of display name, so a same-named workflow
+                       elsewhere is not excluded. A FAILING check is never excluded either
+                       way — self-exclusion may only ever hide our own pending run.
 exit: 0 ok | 1 graded but unknown | 2 usage/setup | 3 PR unreadable (nothing graded)
 USAGE
 }
@@ -113,6 +118,16 @@ read_map() { # <file> <kind: map|runbooks> -> JSON on stdout, rc 0; rc 1 + reaso
       elif (.provenance_tiers | type) != "object" then "provenance_tiers is missing or not an object"
       elif ([.provenance_tiers | to_entries[] | select(.key | startswith("_") | not) | .value | select(IN(known[]) | not)] | length) > 0
         then "provenance_tiers carries a tier outside \(known)"
+      # EVERY provenance class must be MAPPED, not just well-typed. Checking only the values let
+      # a map that OMITS `external` pass, and the lookup then fell back to a tier of its own
+      # choosing — silently retiring the "external (fork / first-time contributor) is R3, no
+      # exceptions" invariant that both the default map comment and the README promise. A class
+      # nobody mapped is a routing decision nobody made, so it is refused at load time.
+      # (No apostrophes in here: the whole shape program is a single-quoted shell string.)
+      elif ((["runbook","agent-supervised","human","external"] - [.provenance_tiers | keys[]]) | length) > 0
+        then "provenance_tiers is missing a class: \(["runbook","agent-supervised","human","external"] - [.provenance_tiers | keys[]]) — an unmapped class would be graded off a tier nobody chose"
+      elif ((.reversibility // {}) | has("test_path_patterns")) and (((.reversibility // {}).test_path_patterns | type) != "array")
+        then "reversibility.test_path_patterns is present but not an array"
       elif (.default_tier // "R0") as $d | ($d | IN(known[])) | not then "default_tier is outside \(known)"
       elif [(.reversibility // {}) | .no_green_checks_tier, .no_test_touched_tier, .clean_tier | select(. != null and (IN(known[]) | not))] | length > 0
         then "a reversibility tier is outside \(known)"
@@ -182,6 +197,12 @@ cat <<'JQ'
     | .  as $r
     | (.changed_paths) as $paths
     | ([$paths[]? | .path]) as $plist
+    # EVERY path the diff touches, DESTINATION *and* ORIGIN. A RENAMED file is recorded under its
+    # destination only, so matching `.path` alone let a rename out of a sensitive directory escape
+    # the floor entirely: move `.github/workflows/deploy.yml` or an `auth/` file to an innocuous
+    # name and the R3 rule that guards it never matches. The origin path is part of what the PR
+    # did, so it is graded too.
+    | ([$paths[]? | .path, (.previous_path // empty)] | unique) as $pall
 
     # ---- AXIS 1: PATH FLOOR ---------------------------------------------------------------
     # WORST over every rule any changed path matches. An R0 rule (docs, tests) can never cancel
@@ -191,7 +212,7 @@ cat <<'JQ'
              reason:("changed-path list is " + ($r.changed_paths_status // "absent") + " — a PR whose files we cannot read is exactly the PR that might touch auth"),
              classes:null}
        else
-         ([$M.path_rules[]? | . as $rule | select($plist | any(. as $p | $p | matches_any($rule.paths)))]) as $hit
+         ([$M.path_rules[]? | . as $rule | select($pall | any(. as $p | $p | matches_any($rule.paths)))]) as $hit
          | {tier: (reduce $hit[] as $h ($DEF; worst(.; $h.tier))),
             status:"ok",
             reason: (if ($hit|length) == 0 then "no mapped path touched — floor \($DEF)"
@@ -206,13 +227,18 @@ cat <<'JQ'
     | ($r.author // null) as $author
     | ($author | classify_login($fleetl; $botl)) as $cls
     | (($r.labels // []) | index("agent-coded") != null) as $agent_coded
+    # The label list has a STATUS TWIN for the same reason the file list does: `agent-coded` is
+    # read from it, and a TRUNCATED label list answers "is this agent-coded?" with a confident no
+    # it has not earned. A consumer map that splits agent-supervised from human would then grade
+    # off a list nobody confirmed was complete.
+    | ($r.labels_status // "ok") as $lbst
     # `external` is decided from is_fork + author_association, and those arrive with a STATUS
     # twin — whether they were actually read has to be asked before they are believed. Reading
     # an un-collected `is_fork` as "not a fork" would make `external => R3` — the one provenance
     # class never routed unattended — silently unreachable. Unread is `unknown`, and `unknown`
     # refuses to grade the axis.
     | ($r.provenance_status // (if ($r | has("is_fork")) then "ok" else "absent" end)) as $pvst
-    | (if $pvst != "ok" then "unknown"
+    | (if $pvst != "ok" or $lbst != "ok" then "unknown"
        elif ($r.is_fork // false) or (($r.author_association // "") | IN("FIRST_TIME_CONTRIBUTOR","FIRST_TIMER","NONE"))
        then "external"
        elif $agent_coded or $cls == "fleet" then "agent-supervised"
@@ -235,7 +261,7 @@ cat <<'JQ'
                       or (($r.head_ref // "") | matches_any($bk.identity.head_ref_patterns // []))))
         | {id: $bk.id, lane: $bk.lane, daily_cap: $bk.daily_cap,
            paths_ok: (if $r.changed_paths_status != "ok" then null
-                      else ($plist | length) > 0 and all($plist[]; matches_any($bk.permitted_paths // [])) end),
+                      else ($pall | length) > 0 and all($pall[]; matches_any($bk.permitted_paths // [])) end),
            shape_ok: (($r.changed_files // 0) <= ($bk.shape.max_changed_files // 1e9)
                       and ($r.additions // 0) <= ($bk.shape.max_additions // 1e9)
                       and ($r.deletions // 0) <= ($bk.shape.max_deletions // 1e9)),
@@ -255,9 +281,15 @@ cat <<'JQ'
        then {tier:null, status:"unknown",
              reason:(if $pvst != "ok"
                      then "fork / author-association were not collected (\($pvst)) — the `external` provenance class is un-decidable, and defaulting it to 'not a fork' would silently retire the external => R3 rule"
+                     elif $lbst != "ok"
+                     then "the PR label list is \($lbst) — `agent-coded` cannot be read off a truncated list, and reading it as absent would be a confident answer from a source nobody finished reading"
                      else "PR author did not resolve to a GitHub account — provenance is unattributable" end),
              provenance:null}
-       else {tier: (($M.provenance_tiers // {})[$prov] // "R1"), status:"ok",
+       # An UNMAPPED class falls back to the RISKIEST tier, never R1 — same direction as
+       # tier_rank. read_map now REQUIRES all four classes, so this is defence in depth; the
+       # direction is what matters, because defaulting to R1 is how a map that omitted `external`
+       # used to grade a fork the same as a teammate.
+       else {tier: (($M.provenance_tiers // {})[$prov] // "R3"), status:"ok",
              provenance: $prov,
              runbook: (if $rbk == null then null else $rbk.id end),
              runbook_lane: (if $rbk == null then null else $rbk.lane end),
@@ -286,15 +318,36 @@ cat <<'JQ'
        then {tier:null, status:"unknown", reason:"check rollup was not collected (\($ckst)) — 'did tests covering these lines run?' is un-answerable"}
        else
          ([$A1.classes[]? | select(. as $c | ($RV.irreversible_classes // []) | index($c))]) as $irrev
-         | ([$paths[] | select(.change_type == "DELETED") | .path]) as $deleted
-         | (($A1.classes // []) | any(. as $c | ($RV.delete_sensitive_classes // []) | index($c))) as $del_sensitive
-         | ($plist | any(matches_any($M.flippable_flag_paths // []))) as $flag
-         | ($plist | any(test("(_test\\.|\\.test\\.|\\.spec\\.|(^|/)tests?/|-test\\.sh$)"))) as $touched_test
+         # A RENAME removes the ORIGIN path as surely as a delete does, so renaming a file OUT of
+         # a sensitive directory counts here too — otherwise `git mv auth/x.go misc/x.go` reads as
+         # a clean revert.
+         | (([$paths[] | select(.change_type == "DELETED") | .path]
+             + [$paths[] | select(.change_type == "RENAMED") | (.previous_path // empty)]) | unique) as $deleted
+         # Sensitive-class match over the DELETED paths ONLY. This was computed from $A1.classes —
+         # the classes matched by ANY changed file — so a PR that merely MODIFIED an auth file
+         # while deleting an unrelated README reported "deletes N file(s) under a sensitive class"
+         # and pinned reversibility R3. The two sets have to be the same set for the sentence the
+         # reason string prints to be true.
+         | ([$M.path_rules[]? | . as $rule | select($deleted | any(. as $p | $p | matches_any($rule.paths))) | .class] | unique) as $del_classes
+         | ($del_classes | any(. as $c | ($RV.delete_sensitive_classes // []) | index($c))) as $del_sensitive
+         | ($pall | any(matches_any($M.flippable_flag_paths // []))) as $flag
+         # "Did a test file change?" comes from the VERSIONED map when it says, and falls back to
+         # the built-in regex when it does not. Hardcoding it meant a consumer could not fix it
+         # with .github/risk.json — the one lever the workflow gives them — and the regex misses
+         # `test_*.py`, `*_test.py`, `*Test.java` and `*_spec.rb`, so whole ecosystems could never
+         # reach clean_tier and sat at R1 forever.
+         # DESTINATION paths only ($plist, not $pall): renaming `x_test.go` to `x.go` REMOVES a
+         # test, and matching the origin path would read that as "a test file changed" and let it
+         # reach clean_tier. The path floor uses $pall because widening it there can only ever
+         # grade RISKIER; widening it here would grade safer, which is the wrong direction.
+         | (($RV.test_path_patterns // []) as $tp
+            | if ($tp | length) > 0 then ($plist | any(matches_any($tp)))
+              else ($plist | any(test("(_test\\.|\\.test\\.|\\.spec\\.|(^|/)tests?/|-test\\.sh$)"))) end) as $touched_test
          | ($r.checks_state // null) as $checks
          | (if ($irrev | length) > 0
               then {t:"R3", why:("touches " + ($irrev|join(", ")) + " — mutates persistent state or deletes data; reverting the code does not restore it")}
             elif (($deleted | length) > 0 and $del_sensitive)
-              then {t:"R3", why:("deletes " + ($deleted|length|tostring) + " file(s) under a sensitive class — not a single clean revert")}
+              then {t:"R3", why:("removes " + ($deleted|length|tostring) + " file(s) under a sensitive class (" + ($del_classes|join(", ")) + ") — not a single clean revert")}
             elif $checks == null or $checks != "SUCCESS"
               then {t: ($RV.no_green_checks_tier // "R2"),
                     why:("no GREEN check rollup (" + ($checks // "absent") + ") — cannot answer whether tests covering these lines actually ran")}
@@ -338,55 +391,111 @@ grade_stream() {
 # THE GRADING JOB IS PART OF THE ROLLUP IT READS. When this script runs inside a workflow on
 # the PR it is grading, its own check run is in progress, so the raw statusCheckRollup.state
 # can never be SUCCESS at grade time — every CI-time grade would floor at R2 and the tiers
-# would be an artifact of the measurement. With --self-context <caller workflow name> the
-# rollup is therefore recomputed from the individual contexts, EXCLUDING check runs belonging
-# to that workflow: any remaining failure => FAILURE, any remaining pending => PENDING, any
-# remaining success => SUCCESS, nothing else on the commit => null (the honest "no CI" case).
-# `checks_pending_excl_self` is emitted alongside so a CI caller can wait for the rest of the
-# rollup to settle instead of labeling a snapshot of half-finished checks. More than 100
-# contexts is `unknown`, never a truncated aggregate.
+# would be an artifact of the measurement. With --self-run-id (preferred) or --self-context
+# the rollup is therefore recomputed from the individual contexts, EXCLUDING our own check
+# runs: any remaining pending => PENDING, any remaining SUCCESS => SUCCESS, remaining contexts
+# that are all SKIPPED/NEUTRAL => NEUTRAL, nothing else on the commit => null (the honest
+# "no CI" case). `checks_pending_excl_self` is emitted alongside so a CI caller can wait for
+# the rest of the rollup to settle instead of labeling a snapshot of half-finished checks.
+# More than 100 contexts is `unknown`, never a truncated aggregate.
+#
+# TWO RULES KEEP SELF-EXCLUSION FROM BECOMING A BLINDFOLD:
+#   * A FAILURE is scanned over ALL contexts, self INCLUDED. Exclusion may only ever hide our
+#     own PENDING; it must never be able to hide a red check. Matching on the workflow NAME
+#     dropped every sibling job of a consumer that put the grading job inside its existing CI
+#     workflow, so a FAILED test job vanished and the remaining green contexts aggregated to
+#     SUCCESS — reversibility then graded R0/R1 on a red PR.
+#   * SUCCESS requires at least one context that actually CONCLUDED SUCCESS. A rollup of
+#     nothing but SKIPPED / NEUTRAL / null establishes nothing about whether tests ran, which
+#     is the axis's whole question, so it aggregates to NEUTRAL and floors at R2.
+# --self-run-id also makes the match EXACT (github.run_id), so a same-named workflow in the
+# consumer repo is no longer excluded. A caller that still embeds the grading job inside a
+# multi-job workflow has all of that run's siblings excluded and lands on the honest R2 floor
+# rather than a false green — enroll pr-risk as its OWN workflow to grade off a full rollup.
 fetch_pr_record() { # <repo> <num> -> record JSON on stdout, rc 1 on an unreadable PR
-  local repo="$1" num="$2" q resp
+  local repo="$1" num="$2" q resp files fstatus
   # shellcheck disable=SC2016  # GraphQL: $vars are query variables
   q='query($owner:String!,$name:String!,$num:Int!){
   repository(owner:$owner,name:$name){ pullRequest(number:$num){
     number title state isDraft createdAt updatedAt closedAt mergedAt
     author{ login } authorAssociation baseRefName headRefName isCrossRepository
     additions deletions changedFiles
-    labels(first:20){ nodes{ name } }
+    labels(first:100){ pageInfo{ hasNextPage } nodes{ name } }
     commits(last:1){ nodes{ commit{ statusCheckRollup{ state
       contexts(first:100){ pageInfo{ hasNextPage } nodes{ __typename
-        ... on CheckRun{ name status conclusion checkSuite{ workflowRun{ workflow{ name } } } }
+        ... on CheckRun{ name status conclusion checkSuite{ workflowRun{ databaseId workflow{ name } } } }
         ... on StatusContext{ context state } } } } } } }
-    files(first:100){ pageInfo{ hasNextPage } nodes{ path additions deletions changeType } }
   } } }'
   resp="$(gh api graphql -f query="$q" -F owner="${repo%%/*}" -F name="${repo##*/}" -F num="$num" 2>/dev/null)" || return 1
   jq -e '.data.repository.pullRequest.number != null' >/dev/null 2>&1 <<<"$resp" || return 1
-  jq -c --arg repo "$repo" --arg self "$SELF_CONTEXT" '.data.repository.pullRequest
+
+  # ---- the changed-file list comes from REST, not GraphQL ------------------------------------
+  # GraphQL's `files` connection cannot answer this axis. Two reasons, both structural:
+  #   * PullRequestChangedFile has NO previous-path field (its whole field set is additions,
+  #     changeType, deletions, path, viewerViewedState), so a RENAME is only ever visible under
+  #     its DESTINATION — the origin path, which is what the sensitive-path floor needs, is
+  #     simply not on offer.
+  #   * `files(first:100)` capped the list at 100 and graded everything above it `unknown`,
+  #     which put exactly the PRs a risk grade helps most (the 150-file ones) in the ungraded
+  #     lane.
+  # REST /pulls/{n}/files answers both: `previous_filename` carries the origin, and --paginate
+  # walks every page. GitHub caps that endpoint at 3000 files; a short read is detected below
+  # against GraphQL's own changedFiles count and reported `unknown` rather than graded.
+  fstatus=ok
+  files="$(gh api --paginate "repos/$repo/pulls/$num/files?per_page=100" \
+             --jq '.[] | {path: .filename,
+                          previous_path: (.previous_filename // null),
+                          additions: .additions, deletions: .deletions,
+                          change_type: ((.status // "") | ascii_upcase
+                                        | if . == "REMOVED" then "DELETED" else . end)}' 2>/dev/null \
+           | jq -sc '.')" || { files=null; fstatus=unreadable; }
+  [ -n "$files" ] || { files=null; fstatus=unreadable; }
+
+  jq -c --arg repo "$repo" --arg self "$SELF_CONTEXT" --arg selfrun "$SELF_RUN_ID" \
+        --argjson files "$files" --arg fstatus "$fstatus" '
+      def is_failing: (.__typename == "CheckRun" and ((.conclusion // "") | IN("FAILURE","TIMED_OUT","CANCELLED","ACTION_REQUIRED","STARTUP_FAILURE")))
+                      or (.__typename == "StatusContext" and ((.state // "") | IN("ERROR","FAILURE")));
+      def is_pending: (.__typename == "CheckRun" and ((.status != "COMPLETED") or ((.conclusion // "") == "STALE")))
+                      or (.__typename == "StatusContext" and ((.state // "") | IN("PENDING","EXPECTED")));
+      def is_success: (.__typename == "CheckRun" and ((.conclusion // "") == "SUCCESS"))
+                      or (.__typename == "StatusContext" and ((.state // "") == "SUCCESS"));
+      # Ours by RUN ID when the caller supplied one (exact), else by workflow display name.
+      def is_self($self; $selfrun): .__typename == "CheckRun"
+        and (if $selfrun != "" then ((.checkSuite.workflowRun.databaseId // -1) | tostring) == $selfrun
+             else (($self != "") and ((.checkSuite.workflowRun.workflow.name // "") == $self)) end);
+      .data.repository.pullRequest
     | ([.labels.nodes[]? | .name] | sort) as $labels
+    | (.labels.pageInfo.hasNextPage // false) as $labels_trunc
     | (.commits.nodes[0].commit.statusCheckRollup) as $ro
-    # Effective check state. Without --self-context ($self == ""): the raw rollup, the same
-    # signal the offline corpus grader reads. With it: the self-excluding aggregate above.
-    | (if ($self == "") or ($ro == null)
+    # Effective check state. Without a self selector: the raw rollup, the same signal the
+    # offline corpus grader reads. With one: the self-excluding aggregate described above.
+    | (if ($self == "" and $selfrun == "") or ($ro == null)
        then {state: ($ro.state // null), pending: false, status: "ok"}
        elif ($ro.contexts.pageInfo.hasNextPage // false)
        then {state: null, pending: false, status: "unknown"}
        else
-         ([$ro.contexts.nodes[]
-           | select(((.__typename == "CheckRun") and ((.checkSuite.workflowRun.workflow.name // "") == $self)) | not)]) as $ctx
-         | (if any($ctx[]; (.__typename == "CheckRun" and ((.conclusion // "") | IN("FAILURE","TIMED_OUT","CANCELLED","ACTION_REQUIRED","STARTUP_FAILURE")))
-                        or (.__typename == "StatusContext" and (.state | IN("ERROR","FAILURE"))))
-            then "FAILURE"
-            elif any($ctx[]; (.__typename == "CheckRun" and ((.status != "COMPLETED") or ((.conclusion // "") == "STALE")))
-                          or (.__typename == "StatusContext" and (.state | IN("PENDING","EXPECTED"))))
-            then "PENDING"
-            elif ($ctx | length) > 0 then "SUCCESS"
+         ([$ro.contexts.nodes[]]) as $all
+         | ([$all[] | select(is_self($self; $selfrun) | not)]) as $ctx
+         | (if   any($all[]; is_failing) then "FAILURE"
+            elif any($ctx[]; is_pending) then "PENDING"
+            elif any($ctx[]; is_success) then "SUCCESS"
+            elif ($ctx | length) > 0     then "NEUTRAL"
             else null end) as $st
          | {state: $st, pending: ($st == "PENDING"), status: "ok"}
        end) as $checks
+    # The changed-file read, with its status twin. A list SHORTER than changedFiles is a
+    # truncated read, and a truncated read is `unknown` — never a floor computed from the
+    # subset of files that happened to fit.
+    | (if $fstatus != "ok" or $files == null
+       then {list: null, status: "unreadable", reason: "the changed-file list could not be read from the pulls/{n}/files API"}
+       elif ($files | length) < (.changedFiles // 0)
+       then {list: null, status: "unknown",
+             reason: "changed-file list is short (\($files | length) of \(.changedFiles)) — GitHub caps the files API at 3000 files"}
+       else {list: $files, status: "ok", reason: null} end) as $fread
     | {schema_version:3, repo:$repo, pr:.number, title:.title, author:(.author.login // null),
        author_association:.authorAssociation, is_fork:(.isCrossRepository // false),
        labels:$labels, agent_coded:($labels | index("agent-coded") != null),
+       labels_status:(if $labels_trunc then "unknown" else "ok" end),
        created_at:.createdAt, updated_at:.updatedAt, closed_at:.closedAt, merged_at:.mergedAt,
        base_ref:.baseRefName, head_ref:.headRefName, is_draft:.isDraft,
        additions:.additions, deletions:.deletions, changed_files:.changedFiles,
@@ -397,10 +506,9 @@ fetch_pr_record() { # <repo> <num> -> record JSON on stdout, rc 1 on an unreadab
        checks_status:$checks.status, provenance_status:"ok",
        checks_pending_excl_self:$checks.pending,
        outcome:(if .mergedAt != null then "merged" elif .state == "CLOSED" then "closed_unmerged" else "open" end),
-       changed_paths:(if (.files.pageInfo.hasNextPage // false) then null
-                      else [.files.nodes[] | {path:.path, additions:.additions, deletions:.deletions, change_type:.changeType}] end),
-       changed_paths_status:(if (.files.pageInfo.hasNextPage // false) then "unknown" else "ok" end),
-       changed_paths_reason:(if (.files.pageInfo.hasNextPage // false) then "file list truncated at 100 files" else null end)}' <<<"$resp"
+       changed_paths:$fread.list,
+       changed_paths_status:$fread.status,
+       changed_paths_reason:$fread.reason}' <<<"$resp"
 }
 
 # ---- main --------------------------------------------------------------------------------------
@@ -415,6 +523,7 @@ main() {
       --fleet-logins)  FLEET_LOGINS="${2:-}"; shift 2 || die "--fleet-logins needs a value" ;;
       --bot-logins)    BOT_LOGINS="${2:-}"; shift 2 || die "--bot-logins needs a value" ;;
       --self-context)  SELF_CONTEXT="${2:-}"; shift 2 || die "--self-context needs a value" ;;
+      --self-run-id)   SELF_RUN_ID="${2:-}"; shift 2 || die "--self-run-id needs a value" ;;
       -h|--help)       usage; exit 0 ;;
       *)               usage; die "unknown argument '$1'" ;;
     esac
@@ -425,6 +534,7 @@ main() {
   if [ "$MODE" = pr ]; then
     [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "bad --repo '$REPO' (want owner/name)"
     [[ "$PR_NUM" =~ ^[0-9]+$ ]] || die "bad --pr '$PR_NUM'"
+    [ -z "$SELF_RUN_ID" ] || [[ "$SELF_RUN_ID" =~ ^[0-9]+$ ]] || die "bad --self-run-id '$SELF_RUN_ID' (want a numeric github.run_id)"
     command -v gh >/dev/null 2>&1 || die "gh not found on PATH"
   fi
 
