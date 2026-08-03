@@ -1,0 +1,60 @@
+# CONTRACT: this is one of THIS repo's own path-filtered script tests, NOT a reusable
+# workflow. It is not callable and has no caller pattern:
+#   TRIGGERS — `pull_request` and `push` to main, both filtered to scripts/pr-risk/**
+#              and this file. A change elsewhere in the repo does not run it.
+#   INPUTS   — none (no `workflow_call`, no `workflow_dispatch`).
+#   SECRETS  — none. Read-only `contents: read`; the suites are hermetic and make no
+#              network call (the live-PR path stubs `gh` on PATH with a fixture).
+# The reusable workflow these scripts back is .github/workflows/pr-risk.yml — that is
+# the file with the inputs/secrets/caller-pattern header.
+
+name: Test pr-risk scripts
+
+# Runs the hermetic test suites (+ shellcheck) for the grader and label-sync
+# scripts behind pr-risk.yml. The grader stamps an advisory risk tier on every
+# consumer repo's PRs, so a grading regression silently mislabels PRs org-wide
+# — cheap to guard with a unit run on change. No network: the suites feed the
+# grader synthetic records and stub `gh` for the live-PR path.
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/pr-risk/**'
+      - '.github/workflows/test-pr-risk.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/pr-risk/**'
+      - '.github/workflows/test-pr-risk.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: shellcheck + suites
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: scripts/pr-risk
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: shellcheck
+        run: shellcheck -x grade-pr-risk.sh apply-risk-label.sh tests/test_grade_pr_risk.sh tests/test_apply_risk_label.sh
+
+      - name: default map + registry parse and validate
+        # The shipped defaults must pass the grader's own structural validation:
+        # a malformed default would fail every consumer at once.
+        run: |
+          bash -c 'source ./grade-pr-risk.sh; read_map risk-map.v0.json map >/dev/null && read_map runbook-registry.v0.json runbooks >/dev/null'
+          echo "defaults validate"
+
+      - name: grader suite
+        run: bash tests/test_grade_pr_risk.sh
+
+      - name: label suite
+        run: bash tests/test_apply_risk_label.sh
