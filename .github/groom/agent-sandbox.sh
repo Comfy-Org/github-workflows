@@ -3,17 +3,28 @@
 # agent-sandbox.sh — run an arbitrary command inside a bubblewrap (bwrap) jail.
 #
 # This is the confinement harness for the groom auto-builder's agent step
-# (BE-4302, phase 1). It gives an untrusted agent a network-connected shell that
-# can ONLY see: a read-only /usr + /etc, ephemeral /tmp + $HOME, the target clone
-# (read-only, or read-write worktree with a read-only .git), an explicit set of
-# read-only files, and one writable out-dir. Everything else on the host — other
-# repos, the runner's secrets, $HOME, $RUNNER_TEMP, $GITHUB_WORKSPACE, the host
-# process table — is invisible. The real API key never enters the jail; the agent
-# reaches Anthropic only through the broker (broker.mjs) on host loopback.
+# (BE-4302 phase 1; isolated-netns hardening BE-4421 phase 2). It gives an
+# untrusted agent a shell in an ISOLATED network namespace — an empty netns with
+# only loopback up (no host network, no host loopback services, no cloud metadata
+# at 169.254.169.254 / 168.63.129.16) — that can ONLY see: a read-only /usr + /etc,
+# ephemeral /tmp + $HOME, the target clone (read-only, or read-write worktree with
+# a read-only .git), an explicit set of read-only files, and one writable out-dir.
+# Everything else on the host — other repos, the runner's secrets, $HOME,
+# $RUNNER_TEMP, $GITHUB_WORKSPACE, the host process table — is invisible. The real
+# API key never enters the jail; the agent reaches Anthropic only through the
+# broker (broker.mjs), bind-mounted into the jail as a unix-domain socket at
+# /run/broker.sock (--uds). There is NO network egress — nothing else off-host is
+# reachable, so in-jail `git fetch` / `npm install` cannot work.
 #
 # Usage:
 #   agent-sandbox.sh --clone <path> --clone-mode ro|rw-git-ro --out-dir <path> \
-#       [--ro-file <path> ...] [--env KEY=VALUE ...] -- <command...>
+#       [--ro-file <path> ...] [--env KEY=VALUE ...] [--uds <host-socket-path>] \
+#       -- <command...>
+#
+#   --uds bind-mounts a host-side listening unix socket (the broker) to the fixed
+#   in-jail path /run/broker.sock (read-only: connect(2) to a socket works under a
+#   read-only bind, but the jail can't chmod/replace the shared inode).
+#   Omit it for a fully offline jail.
 #
 # The preflight FAILS LOUD: if a working bwrap sandbox cannot be established on
 # this runner image, the script exits non-zero and the command is NEVER run. It
@@ -30,7 +41,7 @@ die() {
 # minus the caller-supplied clone/ro-file/out-dir/env. `true` runs as the probe.
 selftest() {
 	bwrap \
-		--unshare-all --share-net \
+		--unshare-all \
 		--ro-bind /usr /usr \
 		--symlink usr/bin /bin \
 		--symlink usr/lib /lib \
@@ -86,7 +97,7 @@ PROFILE
 }
 
 main() {
-	local clone="" clone_mode="" out_dir=""
+	local clone="" clone_mode="" out_dir="" uds=""
 	local ro_files=() envs=() cmd=()
 
 	while [[ $# -gt 0 ]]; do
@@ -96,6 +107,7 @@ main() {
 			--out-dir) [[ $# -ge 2 ]] || die "--out-dir needs a value"; out_dir="$2"; shift 2 ;;
 			--ro-file) [[ $# -ge 2 ]] || die "--ro-file needs a value"; ro_files+=("$2"); shift 2 ;;
 			--env) [[ $# -ge 2 ]] || die "--env needs a value"; envs+=("$2"); shift 2 ;;
+			--uds) [[ $# -ge 2 ]] || die "--uds needs a value"; [[ -n "$2" ]] || die "--uds needs a non-empty value"; [[ -z "$uds" ]] || die "--uds may be given at most once"; uds="$2"; shift 2 ;;
 			--) shift; cmd=("$@"); break ;;
 			*) die "unknown argument: $1" ;;
 		esac
@@ -113,6 +125,22 @@ main() {
 		*) die "--clone-mode must be 'ro' or 'rw-git-ro' (got '${clone_mode:-}')" ;;
 	esac
 	[[ -d "$clone" ]] || die "clone path is not a directory: $clone"
+	# The broker socket is bind-mounted at its real path, so require absolute; and
+	# require it to already be a listening unix socket — a rw --bind of a missing or
+	# non-socket path would just give the jail a useless mountpoint. Fail loud.
+	if [[ -n "$uds" ]]; then
+		[[ "$uds" = /* ]] || die "--uds must be an absolute path (got '$uds')"
+		[[ -S "$uds" ]] || die "--uds path is not a listening unix socket (start the broker first): $uds"
+		# -S only proves the inode is a socket, not that a broker is actually
+		# listening — a stale socket from a crashed broker would pass -S yet the
+		# in-jail connect() then fails at runtime, breaking the fail-loud-before-
+		# running guarantee. Probe /healthz over the socket to confirm a live
+		# listener (best-effort: only when curl is present, matching the tests).
+		if command -v curl >/dev/null 2>&1; then
+			curl -fsS --max-time 5 --unix-socket "$uds" http://broker/healthz >/dev/null 2>&1 \
+				|| die "--uds socket has no live broker listening (healthz probe failed): $uds"
+		fi
+	fi
 
 	# out-dir must exist on the host before it can be bound rw into the jail; create
 	# it here so we can canonicalize it for the overlap check below.
@@ -134,7 +162,7 @@ main() {
 	preflight
 
 	local bwrap_args=(
-		--unshare-all --share-net --die-with-parent --new-session --clearenv
+		--unshare-all --die-with-parent --new-session --clearenv
 		--ro-bind /usr /usr
 		--symlink usr/bin /bin
 		--symlink usr/lib /lib
@@ -187,6 +215,19 @@ main() {
 			[[ "$f" = /* ]] || die "--ro-file must be an absolute path (got '$f')"
 			bwrap_args+=(--ro-bind "$f" "$f")
 		done
+	fi
+
+	# Bind the broker's unix socket into the isolated netns at a fixed path, READ-
+	# ONLY. connect(2) to a socket still works under a read-only bind — the kernel's
+	# read-only-fs EROFS check (sb_permission) fires only for regular files, dirs and
+	# symlinks, never for a socket inode — so the jail can still reach the broker,
+	# while --ro-bind additionally strips the agent's ability to chmod the shared
+	# socket inode (e.g. 000 to DoS itself, 0777 to widen host-side access). As a
+	# mountpoint the socket also can't be unlinked or replaced from inside the jail.
+	# bwrap auto-creates the dest. (Section 5 of sandbox-tests.sh exercises this exact
+	# in-jail connect over --ro-bind, so a regression here fails CI loudly.)
+	if [[ -n "$uds" ]]; then
+		bwrap_args+=(--ro-bind "$uds" /run/broker.sock)
 	fi
 
 	bwrap_args+=(--bind "$out_dir" "$out_dir" --chdir "$clone")

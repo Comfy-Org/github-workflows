@@ -185,12 +185,19 @@ API key — while still letting it edit its worktree and reach Anthropic.
 
   ```bash
   agent-sandbox.sh --clone <path> --clone-mode ro|rw-git-ro --out-dir <path> \
-      [--ro-file <path> ...] [--env KEY=VALUE ...] -- <command...>
+      [--ro-file <path> ...] [--env KEY=VALUE ...] [--uds <host-socket-path>] \
+      -- <command...>
   ```
 
 - **[`broker.mjs`](broker.mjs)** — a ~50-line node-stdlib reverse proxy
-  (`node broker.mjs <port>`) that holds the real key on the host and forwards the
-  jail's requests to it.
+  (`node broker.mjs <port|socket-path>`) that holds the real key on the host and
+  forwards the jail's requests to it. In socket mode it listens on a unix-domain
+  socket (bind-mounted into the jail via `--uds`); the legacy TCP port mode is
+  retained for the test plumbing and back-compat.
+- **[`jail-shim.mjs`](jail-shim.mjs)** — a ~20-line node-stdlib TCP→UDS forwarder
+  (`node jail-shim.mjs <port> /run/broker.sock`) that runs **inside** the jail so
+  agent tooling speaking HTTP to a `127.0.0.1:<port>` base URL reaches the broker's
+  bind-mounted socket (the isolated netns has no way to dial a host TCP port).
 
 ### The sandbox contract (what the agent can and cannot see)
 
@@ -204,7 +211,7 @@ API key — while still letting it edit its worktree and reach Anthropic.
 | host `$HOME` / `$RUNNER_TEMP` / `$GITHUB_WORKSPACE` / other repos | **invisible** |
 | host process table | **invisible** (own pid namespace) |
 | environment | **cleared** — only `HOME`, `PATH`, `TERM`, and each `--env KEY=VALUE`; nothing inherited from the host |
-| network | shared (so the agent can reach the broker on loopback) |
+| network | **isolated network namespace** (loopback only) — host network, host loopback, and cloud metadata are all **unreachable**; the broker is reached via a unix socket bind-mounted at `/run/broker.sock` plus the in-jail `jail-shim.mjs` TCP forwarder |
 
 The `rw-git-ro` worktree write is exactly how the builder's patch is captured: the
 agent edits tracked files, the wrapper's caller reads them back on the host
@@ -215,8 +222,21 @@ afterward, but the agent can never rewrite git history or `.git/config`.
 `x-api-key` / `authorization` header, injects the real key, and forwards only
 `/v1/*` paths to `api.anthropic.com` — streaming the response through unbuffered
 so SSE works. `GET /healthz` answers locally; anything not under `/v1/` is `404`.
-It listens on `127.0.0.1` only, refuses to start with an empty key, and logs one
-line per request — method + path + status, never headers or body.
+It listens on a unix-domain socket (`--uds`, the phase-2 default) or `127.0.0.1`
+(legacy TCP mode), refuses to start with an empty key or a relative socket path,
+and logs one line per request — method + path + status, never headers or body. The
+request-handling contract is identical on both transports.
+
+**No network egress (BE-4421).** The jail runs in an isolated network namespace
+with only loopback up, so the broker — reached over the unix socket bind-mounted
+at `/run/broker.sock` via the in-jail `jail-shim.mjs` TCP→UDS forwarder — is the
+*only* thing the agent can talk to. Host network, host loopback services, and
+cloud metadata (`169.254.169.254` / `168.63.129.16`) are all unreachable. Two
+consequences for callers: set `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` in the
+agent env so the agent doesn't stall on telemetry endpoints that can never be
+reached; and because there is no egress, in-jail `git fetch` / `npm install`
+cannot work — anything the agent needs must already be in the clone before it is
+sandboxed.
 
 ### The loud-preflight guarantee
 
@@ -237,8 +257,11 @@ in [`test-groom-scripts.yml`](../workflows/test-groom-scripts.yml)) asserts ever
 row of the contract above with `bash -c` as the sandboxed command — env scrub, FS
 confinement + tmpfs shadowing, both clone modes, pid isolation — and points the
 broker at a local fake upstream ([`tests/fake-upstream.mjs`](tests/fake-upstream.mjs))
-to prove key injection/stripping, the `/healthz` + non-`/v1` behavior, and SSE
-pass-through. No `claude`, no API key, no spend.
+*over the bind-mounted unix socket + in-jail `jail-shim.mjs`* to prove key
+injection/stripping, the `/healthz` + non-`/v1` behavior, and SSE pass-through. It
+also proves the BE-4369 egress isolation: host loopback, cloud metadata, and an
+arbitrary external IP are all unreachable from the jail. No `claude`, no API key,
+no spend.
 
 ```bash
 shellcheck -x .github/groom/agent-sandbox.sh .github/groom/tests/sandbox-tests.sh
