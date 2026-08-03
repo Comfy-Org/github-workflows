@@ -84,18 +84,23 @@ tests — run the matching command above for whatever you touched.
 - `assign-reviewers.yml` — expertise-aware, load-balanced reviewer requests.
 - `assign-prs-to-author.yml` — assigns unassigned open PRs to their author.
 - `detect-unreviewed-merge.yml` — SOC 2: flags PRs merged without approval.
-- `bump-cursor-review-callers.yml` / `bump-agents-md-callers.yml` /
-  `bump-pr-size-callers.yml` / `bump-assign-reviewers-callers.yml` /
-  `bump-groom-callers.yml` — thin entrypoints over `bump-callers.sh` that fan SHA
-  bumps out to consumers. A groom caller pins TWICE (`uses:` + `workflows_ref:`);
-  the shared rewrite moves both, so never hand-bump one alone.
+- `bump-cursor-review-callers.yml` / `bump-auto-label-callers.yml` /
+  `bump-agents-md-callers.yml` / `bump-pr-size-callers.yml` /
+  `bump-assign-reviewers-callers.yml` / `bump-groom-callers.yml` — thin
+  entrypoints over `bump-callers.sh` that fan SHA bumps out to consumers. A groom
+  caller pins TWICE (`uses:` + `workflows_ref:`); the shared rewrite moves both,
+  so never hand-bump one alone. `stale.yml` and `assign-prs-to-author.yml` have
+  no fleet because they have no callers; `detect-unreviewed-merge.yml` has ~12
+  callers and no fleet — a known, deferred gap, so its pins move by hand.
 
 ## Conventions & gotchas
 
 - **Public repo — never leak private caller names.** Consumer repo lists live in
-  repo **variables** (`CURSOR_REVIEW_CALLERS`, `AGENTS_MD_CALLERS`), never
-  hardcoded in a workflow file or printed to run logs (logs are public). The
-  bumper masks names it processes. Keep private repo paths/detail out of
+  repo **variables** — one per fleet (`CURSOR_REVIEW_CALLERS`,
+  `AUTO_LABEL_CALLERS`, `AGENTS_MD_CALLERS`, `PR_SIZE_CALLERS`,
+  `ASSIGN_REVIEWERS_CALLERS`, `GROOM_CALLERS`; the bump-callers README table is
+  canonical) — never hardcoded in a workflow file or printed to run logs (logs
+  are public). The bumper masks names it processes. Keep private repo paths/detail out of
   workflow files, commit messages, and PR text.
 - **Pin everything by full commit SHA**, with a trailing `# v1` comment — both
   the `uses:` in callers and every third-party action here. Bare `@v1` fails the
@@ -111,6 +116,12 @@ tests — run the matching command above for whatever you touched.
   `cursor-review.yml` change doesn't spuriously bump agents-md or pr-size
   callers). Do not fork the script — a forked copy is how other shared org
   machinery has drifted.
+- **Enrolling a caller is TWO steps.** Merge the caller, *and* add the repo to
+  its `vars.*_CALLERS` roster. Skipping the second is the most repeated mistake
+  here: the pin then never moves, the caller drifts behind the reusable, and it
+  fails at startup much later with no obvious cause. This repo did it to its own
+  `ci-groom.yml`. When auditing, compare the roster against reality in both
+  directions — a roster entry whose caller file does not exist is equally broken.
 - **New reusable workflow?** `on: workflow_call` + a header comment documenting
   inputs/secrets/triggers + a caller-pattern example, then a
   `docs/callers/<name>.md` setup guide and a row in the README table (see
