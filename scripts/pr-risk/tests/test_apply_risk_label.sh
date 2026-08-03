@@ -121,6 +121,46 @@ case "$err" in
   *) bad "the 403 text reaches the log" "$err" ;;
 esac
 
+echo "— a stale label that is ALREADY GONE is not a failure —"
+# The label read is a snapshot. Anything that removes the stale label between that read and this
+# DELETE — a human, or a concurrent grading run of the same PR, which a batch dispatch can overlap
+# with an event run — makes the DELETE 404. That 404 IS the state the removal loop wants, so
+# failing on it painted the check red and skipped the target label for a PR that was already fine.
+# Any OTHER status still fails: a 403 there leaves the PR carrying a stale grade.
+mkdir -p "$SANDBOX/bin404"
+cat > "$SANDBOX/bin404/gh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$GH_LOG"
+for a in "$@"; do
+  case "$a" in
+    *issues/*/labels/*)
+      if [[ " $* " == *" -X DELETE "* ]]; then
+        echo 'gh: Label does not exist (HTTP 404)' >&2; exit 1
+      fi ;;
+  esac
+done
+for a in "$@"; do
+  case "$a" in
+    *issues/*/labels*) [ "${1:-}" = api ] && [[ " $* " != *" -X POST "* && " $* " != *" -X DELETE "* ]] \
+                         && printf 'risk:R0\n'
+                       exit 0 ;;
+  esac
+done
+exit 0
+STUB
+chmod +x "$SANDBOX/bin404/gh"
+: > "$GH_LOG"
+out404="$(PATH="$SANDBOX/bin404:$PATH" REPO=test/repo PR_NUMBER=7 TIER=R2 bash "$SCRIPT" 2>&1)"
+rc404=$?
+eq "a 404 on the stale DELETE keeps the run green" 0 "$rc404"
+case "$out404" in
+  *"already gone"*) ok "and it says the label was already gone" ;;
+  *) bad "and it says the label was already gone" "$out404" ;;
+esac
+if grep -q -- '-X POST repos/test/repo/issues/7/labels -f labels\[\]=risk:R2' "$GH_LOG"; then
+  ok "the target label is still applied after the benign 404"
+else bad "the target label is still applied after the benign 404" "$(tr '\n' '|' < "$GH_LOG")"; fi
+
 echo
 echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]
