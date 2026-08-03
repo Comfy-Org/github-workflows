@@ -21,11 +21,15 @@ on:
     paths:
       - 'scripts/pr-risk/**'
       - '.github/workflows/test-pr-risk.yml'
+      # pr-risk.yml passes the scripts their whole input contract through env, so a change
+      # to it can break the suites without touching a file under scripts/pr-risk/.
+      - '.github/workflows/pr-risk.yml'
   push:
     branches: [main]
     paths:
       - 'scripts/pr-risk/**'
       - '.github/workflows/test-pr-risk.yml'
+      - '.github/workflows/pr-risk.yml'
 
 permissions:
   contents: read
@@ -44,7 +48,7 @@ jobs:
           persist-credentials: false
 
       - name: shellcheck
-        run: shellcheck -x grade-pr-risk.sh apply-risk-label.sh tests/test_grade_pr_risk.sh tests/test_apply_risk_label.sh
+        run: shellcheck -x grade-pr-risk.sh apply-risk-label.sh grade-targets.sh tests/test_grade_pr_risk.sh tests/test_apply_risk_label.sh tests/test_grade_targets.sh
 
       - name: default map + registry parse and validate
         # The shipped defaults must pass the grader's own structural validation:
@@ -58,3 +62,9 @@ jobs:
 
       - name: label suite
         run: bash tests/test_apply_risk_label.sh
+
+      - name: targets suite
+        # The orchestration layer behind pr-risk.yml: base-ref resolution, the per-repo override
+        # contract, the settle poll, per-target failure isolation. Hermetic — `gh` is stubbed and
+        # every call it receives is logged, so the suite asserts on which requests were made.
+        run: bash tests/test_grade_targets.sh
