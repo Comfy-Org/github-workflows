@@ -92,6 +92,35 @@ else ok "an unowned label is never written to"; fi
 PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 TIER=R2 bash "$SCRIPT" >/dev/null 2>&1
 eq "an in-sync label writes nothing" 1 "$(wc -l < "$GH_LOG" | tr -d ' ')"
 
+echo "— a failed write reports GITHUB's reason, not just 'could not' —"
+# The likeliest misconfiguration is a caller granting `issues: write` but not
+# `pull-requests: write`: the labels endpoint is dual-mapped, so labeling a PR 403s with
+# "Resource not accessible by integration". Swallowing gh's stderr made that identical to a
+# network blip or a deleted PR, so the diagnosis never reached a public run log. This stub
+# 403s the label ADD and the test asserts the reason is carried into the failure message.
+mkdir -p "$SANDBOX/bin403"
+cat > "$SANDBOX/bin403/gh" <<'STUB'
+#!/usr/bin/env bash
+for a in "$@"; do
+  case "$a" in
+    *issues/*/labels*)
+      if [[ " $* " == *" -X POST "* ]]; then
+        echo 'gh: Resource not accessible by integration (HTTP 403)' >&2; exit 1
+      fi
+      printf 'keep-me\n'; exit 0 ;;
+  esac
+done
+exit 0
+STUB
+chmod +x "$SANDBOX/bin403/gh"
+err="$(PATH="$SANDBOX/bin403:$PATH" REPO=test/repo PR_NUMBER=7 TIER=R1 bash "$SCRIPT" 2>&1 >/dev/null)"
+rc=$?
+eq "a 403 on the label add exits 4" 4 "$rc"
+case "$err" in
+  *"Resource not accessible by integration"*) ok "the 403 text reaches the log" ;;
+  *) bad "the 403 text reaches the log" "$err" ;;
+esac
+
 echo
 echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]

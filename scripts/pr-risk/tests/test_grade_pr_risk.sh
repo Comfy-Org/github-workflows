@@ -256,6 +256,36 @@ out="$(rec 21 dev 'feat: x' '[{"path":"src/x.go","additions":9,"deletions":0,"ch
 eq "truncated labels make provenance unknown" unknown "$(jq -r '.risk.axes.provenance.status' <<<"$out")"
 eq "and the overall grade refuses" null "$(jq -r '.risk.tier' <<<"$out")"
 
+echo "— phase 19: an UNREADABLE PR exits 3 and says why, in GitHub's own words —"
+# A short token grant (no `actions: read`) fails the rollup's checkSuite -> workflowRun hop, and
+# `gh api graphql` exits non-zero on any top-level `errors` entry even when `data` is present —
+# so a misconfigured caller is an unreadable PR, not a partial record. That is the RIGHT
+# behaviour (a nulled workflowRun would silently break self-exclusion), but it used to be
+# undiagnosable: the caller retries rc=3 four times and labels `ungraded`, and with gh's stderr
+# discarded a permanent misconfiguration looked exactly like a rate-limit blip.
+mkdir -p "$SANDBOX/bin403"
+cat > "$SANDBOX/bin403/gh" <<'STUB'
+#!/usr/bin/env bash
+for a in "$@"; do
+  [ "$a" = graphql ] || continue
+  echo 'gh: Although you appear to have the correct authorization credentials, the `actions` scope is required (FORBIDDEN)' >&2
+  exit 1
+done
+exit 0
+STUB
+chmod +x "$SANDBOX/bin403/gh"
+err="$(PATH="$SANDBOX/bin403:$PATH" bash "$GRADER" --repo test/repo --pr 42 \
+         --self-run-id 999 2>&1 >/dev/null)"
+eq "an unreadable PR exits 3 (retryable, never graded)" 3 "$?"
+case "$err" in
+  *FORBIDDEN*) ok "gh's reason for the failed PR read reaches the log" ;;
+  *) bad "gh's reason for the failed PR read reaches the log" "$err" ;;
+esac
+case "$err" in
+  *"NOT 'no risk'"*) ok "and the warning still refuses to read as low risk" ;;
+  *) bad "and the warning still refuses to read as low risk" "$err" ;;
+esac
+
 echo
 echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]
