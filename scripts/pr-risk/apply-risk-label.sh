@@ -22,7 +22,10 @@
 #               Relabeling (e.g. a 1-indexed R1..R4 scheme) is a caller-side remap of the
 #               VALUES only; tier keys are fixed R0..R3 + unknown everywhere else.
 #   DRY_RUN     1 = print the plan, write nothing
-#   GH_TOKEN    token for gh (in CI: the job's GITHUB_TOKEN; needs issues: write)
+#   GH_TOKEN    token for gh (in CI: the job's GITHUB_TOKEN; needs pull-requests: write for
+#               the label add/remove on the PR — the labels endpoint is dual-mapped and
+#               issues:write alone 403s on a PR — plus issues: write to create the risk:*
+#               labels repo-side on first use)
 #
 # Missing labels are created on first use (color-coded, described), so enrolling a repo needs
 # no manual label setup.

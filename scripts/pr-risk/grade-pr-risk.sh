@@ -413,6 +413,10 @@ grade_stream() {
 # multi-job workflow has all of that run's siblings excluded and lands on the honest R2 floor
 # rather than a false green — enroll pr-risk as its OWN workflow to grade off a full rollup.
 fetch_pr_record() { # <repo> <num> -> record JSON on stdout, rc 1 on an unreadable PR
+  # Token note: the checkSuite -> workflowRun traversal below is an ACTIONS resource, so the
+  # job token needs `actions: read` on top of `pull-requests`/`checks` — GraphQL fails the
+  # WHOLE query on one unreadable field, which surfaces here as an unreadable PR (every grade
+  # lands ungraded), not as a partial record.
   local repo="$1" num="$2" q resp files fstatus
   # shellcheck disable=SC2016  # GraphQL: $vars are query variables
   q='query($owner:String!,$name:String!,$num:Int!){

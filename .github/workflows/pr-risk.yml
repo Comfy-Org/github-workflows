@@ -57,9 +57,13 @@ name: PR Risk Grade (reusable)
 #     pr-risk:
 #       permissions:
 #         contents: read
-#         issues: write         # the risk label rides the issues API
-#         pull-requests: read
+#         issues: write         # create the risk:* labels repo-side on first use
+#         pull-requests: write  # the label write itself — labeling a PR rides the
+#                               # pull-requests permission, not issues (the labels
+#                               # endpoint is dual-mapped by what the "issue" is)
 #         checks: read          # the check rollup the reversibility axis reads
+#         actions: read         # the rollup query walks CheckRun -> checkSuite ->
+#                               # workflowRun (an Actions resource) for self-exclusion
 #         statuses: read
 #       uses: Comfy-Org/github-workflows/.github/workflows/pr-risk.yml@<sha>  # v1
 #       with:
@@ -136,12 +140,20 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read        # read the consumer's .github/risk.json override from the BASE ref
-      issues: write         # THE ONLY WRITE: sync the one risk label (a PR is an issue to the
-                            # labels API). Nothing else is written — no comment, no review, no
-                            # merge — and a GITHUB_TOKEN-applied label cannot fire `labeled`
-                            # triggers, so this write cannot start a workflow cascade.
-      pull-requests: read   # the PR record itself: author, association, fork flag, file list
+      issues: write         # create the risk:* labels repo-side on first use (repo label CRUD
+                            # maps to Issues; enrolling a repo needs no manual label setup)
+      pull-requests: write  # THE ONLY PR WRITE: sync the one risk label. The labels endpoint is
+                            # dual-mapped — labeling an ISSUE rides issues:write, labeling a PR
+                            # rides pull-requests:write — so `issues: write` alone 403s here
+                            # ("Resource not accessible by integration"). The CODE still writes
+                            # nothing but the label — no comment, no review, no merge — and a
+                            # GITHUB_TOKEN-applied label cannot fire `labeled` triggers, so this
+                            # write cannot start a workflow cascade.
       checks: read          # the check rollup the reversibility axis reads (CheckRun contexts)
+      actions: read         # the same rollup's CheckRun -> checkSuite -> workflowRun traversal
+                            # (self-exclusion keys on workflowRun.databaseId, and workflow runs
+                            # are an Actions resource — without this the WHOLE GraphQL read
+                            # errors and every PR grades unknown/ungraded)
       statuses: read        # the same rollup's legacy commit-status contexts
     env:
       REPO: ${{ github.repository }}
