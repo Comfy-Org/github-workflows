@@ -12,7 +12,7 @@ Findings file shape:
             ...
         ],
         "panel": [
-            {"model": str, "review_type": str, "status": "ok"|"empty"|"error"|"parse_error"},
+            {"model": str, "review_type": str, "status": "ok"|"error"},
             ...
         ]
     }
@@ -28,7 +28,7 @@ import subprocess
 import sys
 
 # Severity scale, ordered most → least urgent. Drives sort order, the inline
-# comment prefix, and the summary table. The judge is instructed to emit one
+# comment prefix, and the summary table. The judge tool accepts one
 # of these strings per finding (see prompt-judge.md); anything missing or
 # unrecognized falls back to DEFAULT_SEVERITY so a malformed value can never
 # drop a finding — it just lands in the middle bucket.
