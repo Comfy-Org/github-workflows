@@ -470,6 +470,10 @@ jobs:
       # so the GROOM_CONFIG merge happens in exactly ONE place. Emitted before
       # either gate runs, so it is populated even on a skipped tick.
       resolved: ${{ steps.resolve.outputs.resolved }}
+      # The pinned agent-CLI version (BE-5373), resolved ONCE from
+      # .github/groom/package.json and consumed by all three "Install Claude Code"
+      # steps. See the resolve step below for why the pin lives in a manifest.
+      claude_code_version: ${{ steps.claude_version.outputs.version }}
     steps:
       - name: Load groom assets (interval gate)
         # interval.py is loaded from THIS repo at the pinned ref — a single
@@ -672,6 +676,153 @@ jobs:
             echo "should_run=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Load the agent CLI pin
+        # Deliberately NOT from `$GROOM_ASSETS` (which tracks `inputs.workflows_ref`,
+        # a `required: false` input defaulting to the mutable `main`). Two reasons,
+        # both about this being executable supply chain rather than a brief:
+        #
+        # 1. A caller that SHA-pins `uses:` but omits `workflows_ref` would have the
+        #    CLI version — and therefore what actually executes inside the three
+        #    agent jobs — governed by a branch tip, while the sandbox flags those
+        #    jobs pass are frozen at the pinned `uses:` SHA. The two could diverge.
+        #    `job.workflow_sha` IS the commit this very workflow file was read
+        #    from, so the pin and the flags that depend on it are always the same
+        #    commit, and SHA-pinning `uses:` alone fully pins the CLI.
+        # 2. The resolve step below fails CLOSED on a missing manifest. Read from
+        #    `workflows_ref`, that turns this repo's documented split-pin state
+        #    (Dependabot moves `uses:` and leaves `workflows_ref:` behind — see
+        #    .github/dependabot.yml) into a total groom outage for that caller.
+        #    Read from `job.workflow_sha` the case cannot arise: any commit whose
+        #    groom.yml has this step also has the manifest next to it.
+        #
+        # `job.workflow_sha`, NOT `github.job_workflow_sha`. The latter is the one
+        # everybody reaches for and it is a trap: it yields an EMPTY string inside
+        # a reusable-workflow job, and Actions expands an unknown context property
+        # to "" rather than erroring — so the mistake would silently resolve the
+        # pin from the default branch, i.e. exactly the bug this step exists to
+        # fix. The populated accessor is the `job` context one added in runner
+        # v2.334.0 (Apr 2026): "the commit SHA of the workflow file that defines
+        # the current job". Every job here is `ubuntu-latest`, which is always on
+        # a current runner; only a stale self-hosted runner would see it empty, so
+        # the resolve step below re-checks and WARNS rather than assuming.
+        #
+        # Sparse and gated on `should_run` for the same reason the resolve step is —
+        # a skipped tick installs nothing and should pay for nothing.
+        if: steps.check.outputs.should_run == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ job.workflow_sha }}
+          sparse-checkout: .github/groom/package.json
+          sparse-checkout-cone-mode: false
+          path: _groom_pin
+          persist-credentials: false
+
+      - name: Resolve the pinned Claude Code CLI version
+        # The agent CLI pin lives in `.github/groom/package.json` in THIS repo, at
+        # the ref the caller pinned `uses:` to (see the checkout above) — one source
+        # of truth for the three jobs that install it.
+        #
+        # Why a package.json and not an `env:` constant up top: Dependabot's
+        # github-actions ecosystem only parses `uses:` refs, and an inline
+        # `npm install -g <pkg>@<ver>` inside a `run:` step is invisible to EVERY
+        # ecosystem when there is no npm manifest in the repo. So nothing watched
+        # the pin and it silently rotted — the exact failure mode dependabot.yml
+        # was added to fix. A real manifest makes the npm ecosystem see it and open
+        # a bump PR (see the `/.github/groom` entry in .github/dependabot.yml).
+        # Nothing is ever installed FROM that directory; it exists to be read here.
+        #
+        # Resolved in `gate` rather than per-job because every install job already
+        # `needs: gate`, so one resolution + one validation covers all three and
+        # they cannot drift apart the way three hardcoded literals could.
+        #
+        # LAST step in the job, and gated on `should_run`, deliberately: this is
+        # the one fail-CLOSED step in a job whose every other step fails OPEN, and
+        # a scheduled caller skips ~6 of 7 daily ticks. Running it eagerly would
+        # let a bad manifest red out ticks that were never going to install
+        # anything. Nothing downstream can observe the difference — all six
+        # consumer jobs are themselves
+        # `if: needs.gate.outputs.should_run == 'true'` — and a bad pin cannot
+        # reach main in the first place, because test_claude_code_pin.py runs on
+        # any PR touching `.github/groom/**`. So the check still fires on every
+        # tick that would actually install the CLI, and only on those.
+        id: claude_version
+        if: steps.check.outputs.should_run == 'true'
+        env:
+          # Only to confirm the checkout above got a real ref — see below.
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          # WARN rather than fail: an empty `job.workflow_sha` means the checkout
+          # above silently fell back to the default branch, which is no worse than
+          # the pre-BE-5373 behaviour (`workflows_ref` also defaults to `main`) and
+          # is not worth turning into a groom outage. But it does mean the caller's
+          # `uses:` SHA no longer pins the CLI, so it must not pass unremarked —
+          # this is precisely the silent-empty trap `github.job_workflow_sha` sets.
+          if [ -z "${WORKFLOW_SHA:-}" ]; then
+            echo "::warning::job.workflow_sha is empty, so the agent CLI pin was read from the default branch rather than the ref this workflow was called at. The pin is still validated, but the caller's uses: SHA no longer pins it."
+          fi
+          manifest="$GITHUB_WORKSPACE/_groom_pin/.github/groom/package.json"
+          if [ ! -f "$manifest" ]; then
+            echo "::error::$manifest is missing — it is the single source of truth for the groom agent CLI pin (BE-5373)."
+            exit 1
+          fi
+          # Type-checked at BOTH levels, not just on the index. A bare
+          # `.dependencies[...]?` only makes the INNER lookup forgiving; if the
+          # manifest's top-level JSON is not an object (a list, a string, a
+          # number) jq still raises "Cannot index ... with string" and `set -e`
+          # aborts with a raw jq error instead of the `::error::` annotation
+          # below — fail-closed, but unattributable. The `if !` also catches jq
+          # failing outright on a file that is not JSON at all.
+          if ! version=$(jq -r '
+            if type != "object" then ""
+            elif (.dependencies | type) != "object" then ""
+            else (.dependencies["@anthropic-ai/claude-code"] // "")
+            end' "$manifest"); then
+            echo "::error::$manifest is not valid JSON — it is the single source of truth for the groom agent CLI pin (BE-5373)."
+            exit 1
+          fi
+          if [ -z "$version" ]; then
+            echo "::error::$manifest has no dependencies[\"@anthropic-ai/claude-code\"] entry — the groom agent CLI pin must live there."
+            exit 1
+          fi
+          # Newlines stripped BEFORE the value is ever echoed. It is an arbitrary
+          # JSON string until validated, and a `::error::` line carrying an
+          # embedded newline can emit further workflow commands — `::add-mask::`,
+          # `::stop-commands::` — into this job's log stream. Only used for
+          # reporting; the value that leaves this step is the validated one.
+          printable=${version//[$'\n\r']/ }
+          # Exact versions only. The agent CLI is executable supply chain for steps
+          # that read untrusted repo content, so a floating range (^, ~, *, latest,
+          # a dist-tag) would silently re-introduce the unpinned install this pin
+          # exists to prevent. Dependabot's npm updater preserves an exact
+          # requirement as exact (`versioning-strategy: increase`), so a normal bump
+          # passes; anything else fails loudly instead of floating.
+          #
+          # Strict SemVer, not a loose suffix match. Three ways a sloppy pattern
+          # lets a NON-exact spec through, all of which npm then resolves as a
+          # mutable dist-tag rather than a version — the exact un-pinning this
+          # guard exists to reject:
+          #   - `([-+][0-9A-Za-z.-]+)*` accepts empty identifiers (`1.2.3-a..b`);
+          #   - a bare `[0-9]+` accepts leading zeros (`01.02.03`), which
+          #     node-semver rejects;
+          #   - a bare `[0-9]+` is unbounded (`9007199254740992.0.0`), and
+          #     node-semver rejects a component past 2^53-1.
+          # Hence: no leading zeros, at most 15 digits per component (the widest
+          # that cannot exceed 2^53-1), non-empty dot-separated identifiers, at
+          # most one prerelease and one build part, in that order. Build
+          # identifiers may keep leading zeros — SemVer only forbids them on
+          # NUMERIC identifiers, and a build part is never compared numerically.
+          num='(0|[1-9][0-9]{0,14})'
+          pre_id='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
+          semver="^${num}\.${num}\.${num}(-${pre_id}(\.${pre_id})*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$"
+          if ! [[ "$version" =~ $semver ]]; then
+            echo "::error::@anthropic-ai/claude-code is pinned to '$printable', which is not an exact X.Y.Z version. Floating ranges and dist-tags are not allowed for the agent CLI."
+            exit 1
+          fi
+          echo "Claude Code CLI pinned at $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
   audit_find:
     # Phase 1 — the READ-ONLY finder. Holds NO write credentials (`contents:
     # read` ONLY) and reads untrusted repo content, so it is structurally
@@ -765,9 +916,22 @@ jobs:
         # Pinned, not floating: the agent CLI is executable supply chain for a
         # step that reads untrusted repo content, and an unannounced CLI change
         # (flag rename, default permission-mode shift) would silently break or
-        # loosen the sandbox below. 2.1.217 is the version the BE-4214 fix was
-        # validated end-to-end on. Bump deliberately, re-validating a groom run.
-        run: npm install -g @anthropic-ai/claude-code@2.1.217
+        # loosen the sandbox below. The pin itself lives in
+        # `.github/groom/package.json` and is resolved + validated once by the
+        # `gate` job (BE-5373), so this step and its two siblings in `audit_verify`
+        # and `build` can never drift apart, and Dependabot can bump all three by
+        # editing one line. Bump deliberately, re-validating a groom run.
+        #
+        # Scope, so the guarantee is not read as wider than it is: this pins the
+        # TOP-LEVEL version only. `npm install -g` has no lockfile, so transitive
+        # deps still resolve at install time and the package's lifecycle scripts
+        # still run. That top-level pin is nonetheless the accepted boundary: the
+        # tree is closed at this version (no regular deps; only same-scope
+        # platform binaries exact-pinned to it) — the boundary and its shape guard
+        # are documented in `.github/groom/README.md` (BE-5580).
+        env:
+          CLAUDE_CODE_VERSION: ${{ needs.gate.outputs.claude_code_version }}
+        run: npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION:?not resolved by the gate job from .github/groom/package.json}"
 
       - name: Lock the clone read-only
         # The finder NEVER writes into the clone — its sole output is $FINDER_OUT
@@ -1094,7 +1258,11 @@ jobs:
 
       - name: Install Claude Code
         # Pinned for the same supply-chain reason as the finder job — see there.
-        run: npm install -g @anthropic-ai/claude-code@2.1.217
+        # Version comes from the gate job's single read of
+        # `.github/groom/package.json` (BE-5373), never a local literal.
+        env:
+          CLAUDE_CODE_VERSION: ${{ needs.gate.outputs.claude_code_version }}
+        run: npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION:?not resolved by the gate job from .github/groom/package.json}"
 
       - name: Lock the clone read-only
         # Same OS-level write lockdown as the finder job — see the full note there.
@@ -1723,7 +1891,11 @@ jobs:
 
       - name: Install Claude Code
         # Pinned for the same supply-chain reason as the finder job — see there.
-        run: npm install -g @anthropic-ai/claude-code@2.1.217
+        # Version comes from the gate job's single read of
+        # `.github/groom/package.json` (BE-5373), never a local literal.
+        env:
+          CLAUDE_CODE_VERSION: ${{ needs.gate.outputs.claude_code_version }}
+        run: npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION:?not resolved by the gate job from .github/groom/package.json}"
 
       - name: Lock the clone's .git read-only
         # Narrower than the finder/verifier lockdown: the builder's whole JOB is to

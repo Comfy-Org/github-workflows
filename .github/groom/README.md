@@ -412,6 +412,186 @@ python3 .github/groom/interval.py \
 python3 .github/groom/interval.py --normalize-cadence "$GROOM_INTERVAL_DAYS"
 ```
 
+## `package.json` — the agent CLI pin (BE-5373)
+
+`.github/groom/package.json` is **not a project**. Nothing is ever installed from
+this directory, there is no lockfile, and no CI job runs `npm install` here. Its
+only job is to be the single, machine-visible source of truth for the
+`@anthropic-ai/claude-code` version that `groom.yml` installs in its three agent
+jobs (finder, verifier, builder):
+
+```json
+{ "dependencies": { "@anthropic-ai/claude-code": "X.Y.Z" } }
+```
+
+(The live value is deliberately not repeated here — [`package.json`](package.json)
+is the only place it appears, which is the whole point.)
+
+Why a manifest instead of an `env:` constant at the top of the workflow:
+Dependabot's `github-actions` ecosystem only parses `uses:` refs, so an inline
+`npm install -g <pkg>@<ver>` inside a `run:` step is invisible to **every**
+ecosystem when the repo has no npm manifest. The version therefore had nothing
+watching it and simply rotted — while being duplicated across three call sites,
+so a hand bump could update two and leave a split state. A real manifest makes
+the npm ecosystem see it; the `/.github/groom` entry in
+[`.github/dependabot.yml`](../dependabot.yml) opens the bump PR.
+
+`groom.yml`'s `gate` job reads the pin **once**, validates it, and exports it as
+the `claude_code_version` job output; all three install steps consume that output
+via `needs.gate.outputs`. So there is no version literal left in the workflow, and
+a merged bump PR moves every call site at once.
+
+**Which ref the pin is read from — `job.workflow_sha`, not `workflows_ref`.**
+Unlike the briefs and `ledger.py`/`interval.py`, the manifest is *not* loaded
+from `$GROOM_ASSETS`. It gets its own sparse checkout at the commit this
+`groom.yml` itself was read from, i.e. the ref the caller pinned `uses:` to.
+That matters twice over, because this is executable supply chain rather than a
+prompt:
+
+- `workflows_ref` is `required: false` and defaults to the mutable `main`, so a
+  caller that SHA-pins `uses:` but omits it would have *what executes* inside the
+  three agent jobs tracking a branch tip, while the sandbox flags those jobs pass
+  stay frozen at the pinned SHA. Reading from `job_workflow_sha` keeps the CLI
+  version and the flags that depend on it on the same commit, so SHA-pinning
+  `uses:` alone fully pins the CLI.
+- The resolve step fails **closed** on a missing manifest. Read from
+  `workflows_ref`, this repo's documented split-pin state (Dependabot moves
+  `uses:` and leaves `workflows_ref:` behind — see
+  [`.github/dependabot.yml`](../dependabot.yml)) would become a total groom
+  outage. Read from `job.workflow_sha` the case cannot arise: any commit whose
+  `groom.yml` reads the manifest also ships it.
+
+`job.workflow_sha`, **not** `github.job_workflow_sha` — the latter is the
+spelling everyone reaches for and it expands to an empty string inside a
+reusable-workflow job, which Actions does not treat as an error. The populated
+accessor is the `job`-context one added in runner v2.334.0 (April 2026). All
+groom jobs are `ubuntu-latest`, so it is always available; the resolve step
+still re-checks it and emits a `::warning::` if it is ever empty, because the
+failure mode is otherwise invisible.
+
+That resolve step is the **last** step in `gate` and runs only when
+`should_run == 'true'` (as does the checkout that feeds it). It is the one
+fail-**closed** step in a job whose every other step fails open, and a scheduled
+caller skips ~6 of 7 daily ticks — running it eagerly would let a broken manifest
+red out ticks that were never going to install anything. So on a skipped tick the
+`claude_code_version` output is empty; that is expected, and unobservable, since
+every consumer job is itself gated on `should_run`. A bad pin still cannot reach
+`main`, because `tests/test_claude_code_pin.py` runs on any PR touching
+`.github/groom/**`.
+
+Two rules the tooling enforces, both because the agent CLI is executable supply
+chain for steps that read untrusted repo content:
+
+- **Keep the version exact** — no `^`, `~`, wildcard or dist-tag. The gate step
+  fails the run on anything that is not strict SemVer (no leading zeros, no
+  component past 2^53-1, non-empty prerelease/build identifiers — anything
+  node-semver rejects, npm resolves as a *mutable dist-tag*), and the Dependabot
+  entry sets `versioning-strategy: "increase"` so a bump stays exact.
+- **Bump deliberately** — a CLI release can rename a flag or shift the default
+  permission mode, and groom's sandbox is built out of those flags. Re-validate a
+  real groom run (`workflow_dispatch` on `ci-groom.yml`) before merging a bump.
+
+`tests/test_claude_code_pin.py` guards the arrangement: exact pin, no hardcoded
+literal anywhere in `groom.yml`, every install step wired to the gate output, and
+the Dependabot entry still present.
+
+### Scope: why the top-level pin is the whole pin
+
+Mechanically the pin covers only the **top-level** version — `npm install -g`
+writes no lockfile, so nothing in the install command constrains what the package
+itself depends on. The reason that is nonetheless the complete boundary is a
+property of *this package*, not of the command: as of 2.1.x
+`@anthropic-ai/claude-code` declares **no regular, peer or bundled dependencies at
+all**, and its only `optionalDependencies` are the eight same-scope
+`@anthropic-ai/claude-code-<platform>` binaries, each **exact-pinned to the
+identical version** and each a leaf — no dependency fields and no install
+lifecycle scripts of its own. Verify with:
+
+```bash
+for f in dependencies optionalDependencies peerDependencies bundleDependencies; do
+  npm view "@anthropic-ai/claude-code@<pinned>" "$f"
+done
+```
+
+(One field per call, and read the output by eye rather than with a script.
+`npm view` labels fields only when **more than one** is present; when just one is,
+it prints that field's map bare and unlabelled, so a reply of
+`{"is-number": "^6.0.0"}` is ambiguous about which field answered. The guard below
+queries one field per call for the same reason — see `_npm_field`.)
+
+`peerDependencies` and `bundleDependencies` are in that list on purpose, not for
+completeness: npm 7+ **auto-installs** peer dependencies, so a floating peer range
+floats exactly like a regular one, and `bundleDependencies` ships third-party code
+*inside the tarball*, where no registry version spec constrains it at all. A check
+that looked only at `dependencies` would leave both doors open.
+
+So the resolved install is fully determined by the pinned version: across the
+pinned package and its eight declared platform binaries there is no third-party
+code in the tree and no range left to float. Hijacking a "transitive dep" here
+would mean compromising the *same publisher* as the top-level package — not a
+cheaper attack than compromising the thing we already pinned, which is what makes
+the extra machinery a lockfile would buy not worth its cost.
+
+(The top-level package does run a `postinstall`, so this is "the resolved bytes
+are pinned", not "nothing executes". Those bytes are covered by the pin like the
+rest of the package; that install step is why the CLI is treated as executable
+supply chain throughout this section.)
+
+Two residual risks are **accepted**:
+
+- **An npm-registry-level compromise** serving different bytes for an
+  already-published, immutable version. A lockfile `integrity` hash would close
+  this, and it was still rejected: adding one would turn this deliberately inert
+  pin carrier into a real project (see the section above — nothing is ever
+  installed from this directory, and a lockfile invites exactly the `npm install`
+  that must not happen here), in exchange for a defense against an event that
+  compromises effectively all CI everywhere, not just groom.
+- **A future version reintroducing floating third-party dependencies.** This one
+  is *not* accepted silently — it is guarded.
+  `tests/test_claude_code_pin.py`'s `TestPinnedDependencyShape` queries the
+  registry for the pinned version and fails if:
+  - the top-level `dependencies`, `peerDependencies` or `bundleDependencies` is
+    non-empty;
+  - any `optionalDependencies` key leaves the `@anthropic-ai/` scope, or any of
+    their values is not the exact pinned version string (string equality, not
+    range-satisfaction — `^2.1.217` satisfies 2.1.217 today and floats tomorrow);
+  - any declared platform binary is no longer a leaf — it declares its own
+    `dependencies`, `optionalDependencies` or `peerDependencies`, or runs a
+    `preinstall`/`install`/`postinstall` script. (`prepare` is excluded: npm runs
+    it for git and local installs, not when unpacking a published tarball, and the
+    top-level package already carries one as a publish guard.)
+
+  That second level matters: a depth-1-only guard would rest the whole closure
+  claim on an unchecked assumption about the binaries, and a release whose
+  platform binary picked up a floating third-party dep would reopen the resolved
+  tree with every top-level assertion still green. What the guard does **not**
+  reach is anything below those binaries — which is sound only because they are
+  verified to be leaves; if that ever stops holding, the guard says so rather than
+  quietly narrowing.
+
+  Because a Dependabot bump PR edits `.github/groom/package.json`, it triggers
+  this suite — so the guard fires on the one event that can change the pin. A red
+  there is not a test to fix: it means the tree stopped being closed, and the
+  transitive-pinning decision (spike BE-5580) has to be re-opened before bumping.
+
+  The lookups pin the registry explicitly (`--registry` *and*
+  `--@anthropic-ai:registry`, since npm's scoped setting outranks the global one),
+  so an `.npmrc` added to the checkout cannot redirect the guard at a registry
+  that answers "closed tree"; they retry once so a single blip does not red a PR
+  that only touched `ledger.py`; and they open with a positive-control lookup of
+  `version`, because empty `npm view` output legitimately means "field absent" and
+  would otherwise let an npm that answers *nothing* pass every assertion
+  vacuously. `test-groom-scripts.yml` installs Node explicitly so npm is a
+  declared dependency of the job rather than an incidental property of the runner
+  image; missing npm is therefore a hard failure in CI, and a skip only on a dev
+  machine that is simply offline.
+
+The guard is not hypothetical. Versions **1.x through 2.0.0** of this same package
+declared floating `@img/sharp-*: ^0.33.5` ranges — third-party, cross-scope, and
+range-pinned — under which two installs of the same pinned CLI version could
+resolve different bytes. The closed tree is a recent property, so it is checked
+rather than assumed.
+
 - **`tests/`** — `unittest` suite, run by
   [`test-groom-scripts.yml`](../workflows/test-groom-scripts.yml). The key-broker
   tests boot the real script under `node` (skipped when `node` is absent).
