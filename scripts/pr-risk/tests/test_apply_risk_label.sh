@@ -55,11 +55,26 @@ export GH_LOG="$SANDBOX/gh.log" CURRENT_LABELS="$SANDBOX/current.txt"
 printf 'risk:R0\nkeep-me\n' > "$CURRENT_LABELS"
 cat > "$SANDBOX/bin/gh" <<'STUB'
 #!/usr/bin/env bash
+# The real `gh api --paginate ... --jq '[.[].name]'` answers with a JSON ARRAY per page, and the
+# script keeps the names inside JSON from there to the PUT so a name can never be split on a
+# character it happens to contain. The stub has to answer in that shape, built without jq so the
+# jq-failure test below cannot perturb the stub itself.
+emit_labels_json() {
+  local n first=1
+  printf '['
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    [ "$first" = 1 ] || printf ','
+    first=0
+    printf '"%s"' "$n"
+  done < "$CURRENT_LABELS"
+  printf ']\n'
+}
 printf '%s\n' "$*" >> "$GH_LOG"
 for a in "$@"; do
   case "$a" in
     *issues/*/labels*) [ "${1:-}" = api ] && [[ " $* " != *" -X POST "* && " $* " != *" -X PUT "* ]] \
-                         && cat "$CURRENT_LABELS"
+                         && emit_labels_json
                        exit 0 ;;
   esac
 done
@@ -134,6 +149,21 @@ echo "— first use: the label is pre-created before the sync —"
 mkdir -p "$SANDBOX/bin404label"
 cat > "$SANDBOX/bin404label/gh" <<'STUB'
 #!/usr/bin/env bash
+# The real `gh api --paginate ... --jq '[.[].name]'` answers with a JSON ARRAY per page, and the
+# script keeps the names inside JSON from there to the PUT so a name can never be split on a
+# character it happens to contain. The stub has to answer in that shape, built without jq so the
+# jq-failure test below cannot perturb the stub itself.
+emit_labels_json() {
+  local n first=1
+  printf '['
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    [ "$first" = 1 ] || printf ','
+    first=0
+    printf '"%s"' "$n"
+  done < "$CURRENT_LABELS"
+  printf ']\n'
+}
 printf '%s\n' "$*" >> "$GH_LOG"
 for a in "$@"; do
   case "$a" in
@@ -143,7 +173,7 @@ done
 for a in "$@"; do
   case "$a" in
     *issues/*/labels*) [ "${1:-}" = api ] && [[ " $* " != *" -X POST "* && " $* " != *" -X PUT "* ]] \
-                         && cat "$CURRENT_LABELS"
+                         && emit_labels_json
                        exit 0 ;;
   esac
 done
@@ -222,6 +252,104 @@ if grep -q -- '-X PUT' "$GH_LOG"; then
   bad "and no PUT is issued at all" "$(grep -- '-X PUT' "$GH_LOG" | tr '\n' '|')"
 else ok "and no PUT is issued at all (the unowned labels survive)"; fi
 
+echo "— a name is never SPLIT on its way back into the PUT —"
+# The snapshot-to-PUT path used to be newline-delimited end to end (`--jq .[].name` -> split("\n")
+# -> `read -r`), so a name containing a newline arrived as two fabricated names. That is far worse
+# here than under the old delete/add shape: the PUT writes the set BACK, so the fabrication would
+# replace the real label with its fragments. Names now stay inside JSON the whole way.
+mkdir -p "$SANDBOX/binnl"
+cat > "$SANDBOX/binnl/gh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$GH_LOG"
+for a in "$@"; do
+  case "$a" in
+    *issues/*/labels*) [ "${1:-}" = api ] && [[ " $* " != *" -X POST "* && " $* " != *" -X PUT "* ]] \
+                         && printf '["keep\\nme","risk:R0"]\n'
+                       exit 0 ;;
+  esac
+done
+exit 0
+STUB
+chmod +x "$SANDBOX/binnl/gh"
+: > "$GH_LOG"
+PATH="$SANDBOX/binnl:$PATH" REPO=test/repo PR_NUMBER=7 TIER=R2 bash "$SCRIPT" >/dev/null 2>&1
+eq "the two-line name stays ONE label (a split would make three)" 2 \
+   "$(grep -o -- '-f labels\[\]=' "$GH_LOG" | wc -l | tr -d ' ')"
+if grep -q -- '-f labels\[\]=me' "$GH_LOG"; then
+  bad "and no fragment is sent as a label of its own" "$(tr '\n' '|' < "$GH_LOG")"
+else ok "and no fragment is sent as a label of its own"; fi
+
+echo "— a jq error in the membership check is NOT an answer of 'absent' —"
+# has() sends jq's stderr to /dev/null, so a malfunction (OOM, corrupt snapshot, jq off PATH) used
+# to be indistinguishable from "label not present". The dangerous direction is inside the owned
+# loop: an error there leaves in_sync=1, logs "already labeled", exits 0 — and a double-labeled PR
+# stays broken forever with a green check. rc 1 means absent; anything else means no answer.
+mkdir -p "$SANDBOX/binjqerr"
+cp "$SANDBOX/bin/gh" "$SANDBOX/binjqerr/gh"
+cat > "$SANDBOX/binjqerr/jq" <<'STUB'
+#!/usr/bin/env bash
+# Fail only the membership check (the one call given -e); everything else is real jq.
+for a in "$@"; do [ "$a" = -e ] && { echo 'jq: error: synthetic failure' >&2; exit 5; }; done
+exec "$REAL_JQ" "$@"
+STUB
+chmod +x "$SANDBOX/binjqerr/jq"
+: > "$GH_LOG"; printf 'risk:R2\nrisk:R0\nkeep-me\n' > "$CURRENT_LABELS"
+REAL_JQ="$(command -v jq)" PATH="$SANDBOX/binjqerr:$PATH" \
+  REPO=test/repo PR_NUMBER=7 TIER=R2 bash "$SCRIPT" >/dev/null 2>&1
+eq "a failing membership check exits 4, never a silent in-sync 0" 4 "$?"
+if grep -q -- '-X PUT' "$GH_LOG"; then
+  bad "and issues no PUT off an unanswered check" "$(grep -- '-X PUT' "$GH_LOG" | tr '\n' '|')"
+else ok "and issues no PUT off an unanswered check"; fi
+
+echo "— a NON-404 on the label probe is named, not read as 'label missing' —"
+# The probe swallowed all stderr, so a 403 (the caller granted pull-requests but not `issues:
+# write`) read as "label does not exist": the run went down the pre-create path, failed there too,
+# and surfaced as a confusing error from a later request — the operator chased the wrong symptom.
+mkdir -p "$SANDBOX/bin403probe"
+cat > "$SANDBOX/bin403probe/gh" <<'STUB'
+#!/usr/bin/env bash
+emit_labels_json() {
+  local n first=1
+  printf '['
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    [ "$first" = 1 ] || printf ','
+    first=0
+    printf '"%s"' "$n"
+  done < "$CURRENT_LABELS"
+  printf ']\n'
+}
+printf '%s\n' "$*" >> "$GH_LOG"
+for a in "$@"; do
+  case "$a" in
+    */labels/*) [[ " $* " != *" -X "* ]] && { echo 'gh: Resource not accessible by integration (HTTP 403)' >&2; exit 1; } ;;
+  esac
+done
+for a in "$@"; do
+  case "$a" in
+    *issues/*/labels*) [ "${1:-}" = api ] && [[ " $* " != *" -X POST "* && " $* " != *" -X PUT "* ]] \
+                         && emit_labels_json
+                       exit 0 ;;
+  esac
+done
+exit 0
+STUB
+chmod +x "$SANDBOX/bin403probe/gh"
+: > "$GH_LOG"; printf 'risk:R0\nkeep-me\n' > "$CURRENT_LABELS"
+probeerr="$(PATH="$SANDBOX/bin403probe:$PATH" REPO=test/repo PR_NUMBER=7 TIER=R2 \
+              bash "$SCRIPT" 2>&1 >/dev/null)"
+case "$probeerr" in
+  *"NON-404"*"Resource not accessible by integration"*)
+    ok "the probe's real error is logged as the one to chase" ;;
+  *) bad "the probe's real error is logged as the one to chase" "$probeerr" ;;
+esac
+if grep -q -- '-X POST repos/test/repo/labels' "$GH_LOG"; then
+  bad "and no pre-create is attempted off a non-404" "$(tr '\n' '|' < "$GH_LOG")"
+else ok "and no pre-create is attempted off a non-404 (that create would just fail too)"; fi
+if grep -q -- '-X PUT repos/test/repo/issues/7/labels ' "$GH_LOG"; then
+  ok "and the sync is still attempted (the probe is advisory, not a gate)"
+else bad "and the sync is still attempted" "$(tr '\n' '|' < "$GH_LOG")"; fi
+
 echo "— a failed write reports GITHUB's reason, not just 'could not' —"
 # The likeliest misconfiguration is a caller granting `issues: write` but not
 # `pull-requests: write`: the labels endpoint is dual-mapped, so labeling a PR 403s with
@@ -231,13 +359,28 @@ echo "— a failed write reports GITHUB's reason, not just 'could not' —"
 mkdir -p "$SANDBOX/bin403"
 cat > "$SANDBOX/bin403/gh" <<'STUB'
 #!/usr/bin/env bash
+# The real `gh api --paginate ... --jq '[.[].name]'` answers with a JSON ARRAY per page, and the
+# script keeps the names inside JSON from there to the PUT so a name can never be split on a
+# character it happens to contain. The stub has to answer in that shape, built without jq so the
+# jq-failure test below cannot perturb the stub itself.
+emit_labels_json() {
+  local n first=1
+  printf '['
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    [ "$first" = 1 ] || printf ','
+    first=0
+    printf '"%s"' "$n"
+  done < "$CURRENT_LABELS"
+  printf ']\n'
+}
 for a in "$@"; do
   case "$a" in
     *issues/*/labels*)
       if [[ " $* " == *" -X PUT "* ]]; then
         echo 'gh: Resource not accessible by integration (HTTP 403)' >&2; exit 1
       fi
-      printf 'keep-me\n'; exit 0 ;;
+      emit_labels_json; exit 0 ;;
   esac
 done
 exit 0
