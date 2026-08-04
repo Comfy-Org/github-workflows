@@ -86,22 +86,24 @@ tests — run the matching command above for whatever you touched.
 - `detect-unreviewed-merge.yml` — SOC 2: flags PRs merged without approval.
 - `bump-cursor-review-callers.yml` / `bump-auto-label-callers.yml` /
   `bump-agents-md-callers.yml` / `bump-pr-size-callers.yml` /
-  `bump-assign-reviewers-callers.yml` / `bump-groom-callers.yml` — thin
-  entrypoints over `bump-callers.sh` that fan SHA bumps out to consumers. A groom
-  caller pins TWICE (`uses:` + `workflows_ref:`); the shared rewrite moves both,
-  so never hand-bump one alone. `stale.yml` and `assign-prs-to-author.yml` have
-  no fleet because they have no callers; `detect-unreviewed-merge.yml` has ~12
-  callers and no fleet — a known, deferred gap, so its pins move by hand.
+  `bump-pr-risk-callers.yml` / `bump-assign-reviewers-callers.yml` /
+  `bump-groom-callers.yml` — thin entrypoints over `bump-callers.sh` that fan SHA
+  bumps out to consumers. A groom or pr-risk caller pins TWICE (`uses:` +
+  `workflows_ref:`); the shared rewrite moves both, so never hand-bump one alone.
+  `stale.yml` and `assign-prs-to-author.yml` have no fleet because they have no
+  callers; `detect-unreviewed-merge.yml` has ~12 callers and no fleet — a known,
+  deferred gap, so its pins move by hand.
 
 ## Conventions & gotchas
 
 - **Public repo — never leak private caller names.** Consumer repo lists live in
   repo **variables** — one per fleet (`CURSOR_REVIEW_CALLERS`,
   `AUTO_LABEL_CALLERS`, `AGENTS_MD_CALLERS`, `PR_SIZE_CALLERS`,
-  `ASSIGN_REVIEWERS_CALLERS`, `GROOM_CALLERS`; the bump-callers README table is
-  canonical) — never hardcoded in a workflow file or printed to run logs (logs
-  are public). The bumper masks names it processes. Keep private repo paths/detail out of
-  workflow files, commit messages, and PR text.
+  `PR_RISK_CALLERS`, `ASSIGN_REVIEWERS_CALLERS`, `GROOM_CALLERS`; the
+  bump-callers README table is canonical) — never hardcoded in a workflow file or
+  printed to run logs (logs are public). The bumper masks names it processes.
+  Keep private repo paths/detail out of workflow files, commit messages, and PR
+  text.
 - **Pin everything by full commit SHA**, with a trailing `# v1` comment — both
   the `uses:` in callers and every third-party action here. Bare `@v1` fails the
   pin-validation (`pinact`, `zizmor`) that consumer CI runs. See README "Pinning".

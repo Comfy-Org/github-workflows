@@ -26,6 +26,7 @@ forward automatically instead of silently drifting commits behind.
 | [`bump-cursor-review-callers.yml`](../workflows/bump-cursor-review-callers.yml) | `cursor-review.yml` or `cursor-review/**` | `CURSOR_REVIEW_CALLERS` | non-empty (hard-fails if empty) |
 | [`bump-agents-md-callers.yml`](../workflows/bump-agents-md-callers.yml) | `agents-md-integrity.yml` or `agents-md-integrity/**` | `AGENTS_MD_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-pr-size-callers.yml`](../workflows/bump-pr-size-callers.yml) | `pr-size.yml` or `scripts/check-pr-size/**` | `PR_SIZE_CALLERS` | empty `[]` (grows as callers land) |
+| [`bump-pr-risk-callers.yml`](../workflows/bump-pr-risk-callers.yml) | `pr-risk.yml` or `scripts/pr-risk/**` (minus its `tests/` and `README.md`, which no caller executes) | `PR_RISK_CALLERS` | empty `[]` allowed (grows as callers land) |
 | [`bump-assign-reviewers-callers.yml`](../workflows/bump-assign-reviewers-callers.yml) | `assign-reviewers.yml` | `ASSIGN_REVIEWERS_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-groom-callers.yml`](../workflows/bump-groom-callers.yml) | `groom.yml` or `groom/**` | `GROOM_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-auto-label-callers.yml`](../workflows/bump-auto-label-callers.yml) | `cursor-review-auto-label.yml` | `AUTO_LABEL_CALLERS` | non-empty (hard-fails if empty) |
@@ -67,7 +68,10 @@ lock-step or a run executes one version's workflow against another version's
 briefs. `bump-callers.sh`'s pin rewrite moves both, so the fleet cannot drift
 into that split state through a hand-bump of only one. It also re-points the
 `# main @ <short>` pin comment those callers carry — a comment still naming the
-old commit after the pin moved is worse than no comment.
+old commit after the pin moved is worse than no comment. **`pr-risk` callers have
+the same double-pin shape** — `uses:` plus a `workflows_ref:` the reusable checks
+the grader, risk map and label script out at — so the same rewrite covers them
+and the same never-hand-bump-one-alone rule applies.
 
 A caller pinning **two** github-workflows reusables in the same file is a
 special case: the `uses:` pin rewrite and the `# main @ <short>` comment rewrite
