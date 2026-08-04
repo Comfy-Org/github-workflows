@@ -30,6 +30,27 @@ forward automatically instead of silently drifting commits behind.
 | [`bump-assign-reviewers-callers.yml`](../workflows/bump-assign-reviewers-callers.yml) | `assign-reviewers.yml` | `ASSIGN_REVIEWERS_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-groom-callers.yml`](../workflows/bump-groom-callers.yml) | `groom.yml` or `groom/**` | `GROOM_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-auto-label-callers.yml`](../workflows/bump-auto-label-callers.yml) | `cursor-review-auto-label.yml` | `AUTO_LABEL_CALLERS` | non-empty (hard-fails if empty) |
+| [`bump-detect-unreviewed-merge-callers.yml`](../workflows/bump-detect-unreviewed-merge-callers.yml) | `detect-unreviewed-merge.yml` | `DETECT_UNREVIEWED_MERGE_CALLERS` | **not yet seeded** — hard-fails until it is (see below) |
+
+### Why the detect-unreviewed-merge roster is not seeded yet
+
+Its 12 live callers are known and correctly wired (each pins a full 40-hex SHA
+against this repo's path, i.e. exactly what the rewrite moves). It is unseeded
+anyway, on purpose.
+
+Every roster reaches `bump-callers.sh` through the step's `env:` block, and
+Actions prints that block — values and all — before the script's `::add-mask::`
+can run. This repo is public, so each seeded fleet already publishes its roster
+in a world-readable log. That is the known gap documented in every `bump-*`
+header. The difference here is that two of this fleet's callers are non-public
+repos that appear in **no** already-seeded roster, so seeding would publish two
+names that are not out yet — and a public log entry cannot be unpublished.
+
+So the trade is: seed now and take an irreversible disclosure, or leave it
+unseeded and take a red run. The red run is reversible and is already the
+designed behaviour for an empty roster, so it wins. Seed the variable as the
+immediate follow-on to the masking fix — never as a way to turn that red run
+green.
 
 ### Reusables with no fleet — deliberate, not an oversight
 
@@ -37,7 +58,6 @@ forward automatically instead of silently drifting commits behind.
 |---|---|---|
 | `stale.yml` | 0 | Nothing to bump. Add a fleet when the first caller lands. |
 | `assign-prs-to-author.yml` | 0 | Same. |
-| `detect-unreviewed-merge.yml` | ~12 | **A real gap.** Its pins are bumped by hand. Deferred deliberately, not missed. |
 
 A reusable that has callers but no fleet is the trap this whole directory exists
 to prevent: the pins simply never move, so consumers drift behind indefinitely
