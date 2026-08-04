@@ -137,12 +137,14 @@ Two operational caveats for a backfill:
   interleaving cannot leave the PR carrying two `risk:*` labels: the two writers
   end last-writer-wins with exactly one — possibly the staler tier, which the
   next grade re-syncs and which gates nothing meanwhile. The residual it costs
-  instead is narrower: the PUT is built from a snapshot read, so a **non-owned**
-  label added in the read→PUT window (about one API round-trip, and only on a run
-  that actually changes the grade) is dropped — `risk-dispute` included, so
-  re-add a dispute that happens to land in that instant. Dispatch when the queue
-  is quiet, and use `pr_number` when you want the per-PR group to serialize a
-  re-grade against event runs.
+  instead is narrower, but it cuts both ways: the PUT is built from a snapshot
+  read, so a **non-owned** label added in the read→PUT window is dropped
+  (`risk-dispute` included — re-add a dispute that lands in that instant) and one
+  **removed** in that window is resurrected. The window opens only on a run that
+  actually changes the grade, and is about one API round-trip — three on the
+  first grade in a repo, where the label pre-create sits inside it. Dispatch when
+  the queue is quiet, and use `pr_number` when you want the per-PR group to
+  serialize a re-grade against event runs.
 - **The pre-grader reads retry.** Rate limits are global, not per-PR, so the
   base-ref and override reads — the first hop for every target — retry a
   transient failure with backoff, as the grader already does. Without it one
@@ -207,9 +209,10 @@ Labels are created on first use, color-coded green → red (gray for ungraded).
   about risk.
 - `apply-risk-label.sh` — the one write, and it is literally one request: a
   single atomic `PUT` of the PR's full label set — every label the script does
-  not own, carried through verbatim, plus the computed one. Owns exactly the five
-  mapped labels, so a PR it has written to carries exactly one of them even when
-  two grading runs race. An already-in-sync PR writes nothing at all.
+  not own, carried through verbatim from the snapshot read, plus the computed
+  one. Owns exactly the five mapped labels (matched case-insensitively, as GitHub
+  label identity is), so a PR it has written to carries exactly one of them even
+  when two grading runs race. An already-in-sync PR writes nothing at all.
 - `risk-map.v0.json` / `runbook-registry.v0.json` — the generic defaults.
 - `tests/` — hermetic suites (synthetic records + a stubbed `gh`); run via
   [`test-pr-risk.yml`](../../.github/workflows/test-pr-risk.yml).

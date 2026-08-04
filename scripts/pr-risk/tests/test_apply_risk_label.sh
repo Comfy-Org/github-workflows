@@ -181,6 +181,47 @@ eq "an in-sync label writes nothing" 1 "$(wc -l < "$GH_LOG" | tr -d ' ')"
 eq "an in-sync run exits 0" 0 "$rcsync"
 eq "an in-sync run still prints the target" "risk:R2" "$outsync"
 
+echo "— label identity is CASE-INSENSITIVE on GitHub, so the ownership match must be too —"
+# GitHub will not let a repo hold both `risk:R2` and `Risk:R2` — they are the same label. A
+# case-sensitive match therefore misreads a variant spelling (an older LABEL_MAP, or a
+# hand-created label) as "not the target AND not owned", which breaks the contract twice: the
+# in-sync short-circuit never fires so EVERY run issues the destructive PUT, and the variant is
+# carried through that PUT next to the new target — two `risk:*` labels, the exact state this
+# shape exists to make impossible.
+: > "$GH_LOG"; printf 'Risk:R2\nkeep-me\n' > "$CURRENT_LABELS"
+outci="$(PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 TIER=R2 bash "$SCRIPT" 2>/dev/null)"
+eq "a case-variant of the TARGET reads as in-sync (no write)" 1 "$(wc -l < "$GH_LOG" | tr -d ' ')"
+eq "and the run still prints the canonical target" "risk:R2" "$outci"
+: > "$GH_LOG"; printf 'Risk:R0\nkeep-me\n' > "$CURRENT_LABELS"
+PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 TIER=R2 bash "$SCRIPT" >/dev/null 2>&1
+putci="$(grep -- '-X PUT repos/test/repo/issues/7/labels ' "$GH_LOG")"
+eq "a case-variant of a STALE owned label is dropped, not carried through beside the target" \
+   "api -X PUT repos/test/repo/issues/7/labels -f labels[]=keep-me -f labels[]=risk:R2" \
+   "$putci"
+
+echo "— a broken jq must fail the run, never degrade the PUT to target-only —"
+# The carry-through filter used to run inside a process substitution, where its exit status is
+# structurally unobservable: `pipefail` does not reach `< <(...)` and `set -e` is off. A jq that
+# failed there appended nothing, so this destructive full-set replace silently became
+# `labels[]=$TARGET` alone — DELETING every unowned label on the PR (`risk-dispute` included)
+# while logging "synced" and exiting 0. A total replace must refuse to run on an unverified set.
+mkdir -p "$SANDBOX/binjqfail"
+cp "$SANDBOX/bin/gh" "$SANDBOX/binjqfail/gh"
+cat > "$SANDBOX/binjqfail/jq" <<'STUB'
+#!/usr/bin/env bash
+# Fail only the carry-through filter (the one call given --argjson); everything else is real jq.
+for a in "$@"; do [ "$a" = --argjson ] && { echo 'jq: error: synthetic failure' >&2; exit 5; }; done
+exec "$REAL_JQ" "$@"
+STUB
+chmod +x "$SANDBOX/binjqfail/jq"
+: > "$GH_LOG"; printf 'risk:R0\nrisk-dispute\nkeep-me\n' > "$CURRENT_LABELS"
+REAL_JQ="$(command -v jq)" PATH="$SANDBOX/binjqfail:$PATH" \
+  REPO=test/repo PR_NUMBER=7 TIER=R2 bash "$SCRIPT" >/dev/null 2>&1
+eq "a failing carry-through filter exits 4" 4 "$?"
+if grep -q -- '-X PUT' "$GH_LOG"; then
+  bad "and no PUT is issued at all" "$(grep -- '-X PUT' "$GH_LOG" | tr '\n' '|')"
+else ok "and no PUT is issued at all (the unowned labels survive)"; fi
+
 echo "— a failed write reports GITHUB's reason, not just 'could not' —"
 # The likeliest misconfiguration is a caller granting `issues: write` but not
 # `pull-requests: write`: the labels endpoint is dual-mapped, so labeling a PR 403s with
@@ -213,11 +254,18 @@ case "$err" in
   *"test/repo#7"*) ok "and the failure names the PR" ;;
   *) bad "and the failure names the PR" "$err" ;;
 esac
-# A failed PUT is atomic — nothing landed. Saying so is the diagnosability the delete-then-add
-# shape could not offer: there, a mid-sequence failure left the PR carrying the previous grade.
+# A failed PUT is atomic — applied or not, never half. Saying so is the diagnosability the
+# delete-then-add shape could not offer: there, a mid-sequence failure left the PR mid-transition.
+# But it must NOT be overstated into "nothing was applied": a client timeout or a proxy 5xx can
+# surface as a nonzero `gh` after GitHub already committed the replacement, and a message asserting
+# the old labels survived would send a responder hunting for labels that are in fact gone.
 case "$err" in
-  *UNCHANGED*) ok "and states the label state is UNCHANGED (a failed PUT applies nothing)" ;;
-  *) bad "and states the label state is UNCHANGED" "$err" ;;
+  *"never half"*) ok "and states the failed PUT was all-or-nothing" ;;
+  *) bad "and states the failed PUT was all-or-nothing" "$err" ;;
+esac
+case "$err" in
+  *"does not prove WHICH"*) ok "without overclaiming that nothing landed (a timeout can follow a commit)" ;;
+  *) bad "without overclaiming that nothing landed" "$err" ;;
 esac
 
 echo

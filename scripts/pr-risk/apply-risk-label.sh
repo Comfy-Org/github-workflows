@@ -9,18 +9,25 @@
 # racing (a `pr_numbers` batch and a `pull_request` event run sit in different concurrency groups,
 # so they CAN overlap) end last-writer-wins with still exactly one owned label — possibly the staler
 # tier, which is acceptable because the label is advisory and the next grade re-syncs it. Zero owned
-# labels is impossible: every PUT this script builds contains the target. Labels it does NOT own are
-# carried through the PUT untouched, so a human who disagrees with a grade records that with their
+# labels is impossible: every PUT this script builds contains the target, and LABEL_MAP is rejected
+# up front if any tier maps to an empty name, so the array can never degrade to the empty-labels
+# request that strips a PR. Labels it does NOT own are carried through the PUT as the snapshot read
+# saw them (see RESIDUAL), so a human who disagrees with a grade records that with their
 # OWN label (the pilot convention is `risk-dispute`) and the grader will never fight it. Editing the
 # grader-owned label by hand is futile by design: the next push re-syncs it.
 #
 # RESIDUAL — the price of atomicity, worth knowing for the pilot: the PUT is built from a SNAPSHOT
-# read, so a NON-owned label added by a human between that read and the PUT is silently dropped,
-# `risk-dispute` INCLUDED. The window is ~one API round-trip and only opens on a run that actually
-# changes the grade (an in-sync PR writes nothing at all), and it is far narrower than the
-# double-label window it replaces, which lasted until the next grade. But a dispute lost there
-# vanishes with no trace, and disputes are this pilot's calibration data — re-add the label if one
-# lands in that instant.
+# read, so it is an unguarded read-modify-write (the labels endpoint offers no version precondition
+# that could make it otherwise), and it clobbers BOTH directions inside that window. A NON-owned
+# label ADDED there is silently dropped — `risk-dispute` INCLUDED — and a non-owned label REMOVED
+# there is RESURRECTED, so a `do-not-merge` or review label a human or a sibling labeler cleared in
+# that instant comes back. The window opens ONLY on a run that actually changes the grade (an
+# in-sync PR writes nothing at all) and is normally ~one API round-trip; on the FIRST grade in a
+# repo the label probe and the pre-create sit inside it too, so enrollment widens it to about
+# three. It is far narrower than the double-label window it replaces — that one lasted until the
+# next grade — and unlike that one it cannot leave the PR self-contradictory. But a dispute lost
+# here vanishes with no trace, and disputes are this pilot's calibration data — re-add the label if
+# one lands in that instant.
 #
 # The label is applied with the plain GITHUB_TOKEN on purpose: GITHUB_TOKEN-applied labels do
 # not fire `labeled` workflow triggers, which makes the shadow check incapable of starting a
@@ -45,9 +52,11 @@
 # no manual label setup.
 #
 # Exit: 0 = label in sync (or dry run). 2 = usage error. 4 = a GitHub write failed — the run
-#       must go red rather than pretend the label landed. Because the write is a single PUT, a
-#       failure leaves the PR's labels exactly as they were: there is no partial-write state to
-#       reason about, so the red check means "the grade was not applied", never "half applied".
+#       must go red rather than pretend the label landed. Because the write is a single PUT there
+#       is no partial-write state to reason about: the red check means "applied or not applied",
+#       never "half applied". It does NOT mean "definitely not applied" — a client timeout, a
+#       reset connection or a proxy 5xx can surface as a nonzero `gh` after GitHub committed the
+#       replacement, so read the PR's labels before concluding the old set survived.
 
 set -uo pipefail
 
@@ -128,7 +137,14 @@ current="$(ghq api --paginate "repos/$REPO/issues/$PR_NUMBER/labels?per_page=100
            | jq -Rsc 'split("\n") | map(select(length > 0))')" \
   || fail "could not read labels on $REPO#$PR_NUMBER: $(gherr)"
 
-has() { jq -e --arg l "$1" 'index($l) != null' >/dev/null 2>&1 <<<"$current"; }
+# GitHub label identity is CASE-INSENSITIVE (you cannot hold both `risk:R2` and `Risk:R2`), so every
+# comparison against the snapshot has to be too. A case variant — an older LABEL_MAP spelling, or a
+# hand-created label — otherwise reads as "not the target AND not owned": the in-sync short-circuit
+# never fires, so every run issues the PUT (widening the residual window the header confines to
+# grade-changing runs), and the variant is carried through the PUT beside the new target, which is
+# the two-`risk:*`-labels state this shape exists to make impossible.
+has() { jq -e --arg l "$1" 'map(ascii_downcase) | index($l | ascii_downcase) != null' \
+          >/dev/null 2>&1 <<<"$current"; }
 
 # In sync = the target is present AND no other owned label is. Short-circuit so the common case
 # (re-grading a PR whose tier did not move) performs no write at all — which is also what keeps the
@@ -169,16 +185,30 @@ fi
 # and the exactly-one invariant already holds after ANY single writer's PUT.
 #
 # The empty-labels footgun of this endpoint (a PUT with an empty array strips every label) is
-# structurally absent: the array below always ends with "$TARGET".
-owned_json="$(printf '%s\n' "${OWNED[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
+# closed at both ends: the array below always ends with "$TARGET", and "$TARGET" cannot be empty
+# because LABEL_MAP validation above rejects a tier mapped to an empty name before any write.
+#
+# BOTH jq calls are status-checked, and neither may run inside a process substitution. `set -e` is
+# off and `pipefail` does not reach `< <(...)`, so a failing filter there — `--argjson` rejecting a
+# malformed owned_json, an OOM, a jq that is not on PATH — would append NOTHING, silently degrade
+# this destructive full-set replace to `labels[]=$TARGET` alone, DELETE every unowned label on the
+# PR, and still log "synced" and exit 0. A replace this total must refuse to run unless the set it
+# is replacing with is known-good.
+owned_json="$(printf '%s\n' "${OWNED[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+  || fail "could not build the owned-label set (jq failed) — refusing to PUT a partial label set"
+carry="$(jq -r --argjson owned "$owned_json" \
+           '($owned | map(ascii_downcase)) as $o
+            | .[] | . as $x | select(($o | index($x | ascii_downcase)) == null)' <<<"$current")" \
+  || fail "could not compute the carry-through labels for $REPO#$PR_NUMBER (jq failed) — refusing to PUT a partial label set"
+
 put_args=()
 while IFS= read -r l; do
   [ -n "$l" ] && put_args+=(-f "labels[]=$l")
-done < <(jq -r --argjson owned "$owned_json" '.[] | select(. as $x | $owned | index($x) == null)' <<<"$current")
+done <<<"$carry"
 put_args+=(-f "labels[]=$TARGET")
 
 ghq api -X PUT "repos/$REPO/issues/$PR_NUMBER/labels" "${put_args[@]}" >/dev/null \
-  || fail "could not sync labels on $REPO#$PR_NUMBER to '$TARGET': $(gherr) — the write is a single atomic PUT, so NOTHING was applied and the PR's label state is UNCHANGED"
+  || fail "could not sync labels on $REPO#$PR_NUMBER to '$TARGET': $(gherr) — the write is a single atomic PUT, so it applied fully or not at all, never half; a failed request does not prove WHICH (a timeout or proxy 5xx can land after GitHub committed it), so re-read the PR's labels before assuming the previous set survived"
 
 log "synced to '$TARGET' ($(( ${#put_args[@]} / 2 )) labels on the PR)"
 

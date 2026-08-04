@@ -68,9 +68,11 @@ name: PR Risk Grade (reusable)
 # last-writer-wins with still EXACTLY ONE `risk:*` label — possibly the staler tier, which the next
 # grade re-syncs, and which gates nothing meanwhile. It can no longer leave two contradictory labels
 # on a PR. What the shape does cost is a narrower residual: the PUT is built from a snapshot read,
-# so a NON-owned label added by a human in the read→PUT window — roughly one API round-trip, and
-# only on a run that actually changes the grade — is silently dropped, `risk-dispute` included.
-# Re-add it if a dispute happens to land in that instant. Still prefer `pr_number` when you want the
+# so a NON-owned label added by someone else in the read→PUT window is silently dropped
+# (`risk-dispute` included) and one removed in it is resurrected. That window opens only on a run
+# that actually changes the grade and is roughly one API round-trip — about three on the first
+# grade in a repo, where the label pre-create sits inside it. Re-add a dispute that happens to land
+# in that instant. Still prefer `pr_number` when you want the
 # per-PR concurrency group to serialize a re-grade against event runs (with `cancel-in-progress`
 # that is also how a superseded wait gets cut short), and dispatch a backfill when the queue is
 # quiet.
@@ -341,9 +343,13 @@ jobs:
                             # SCOPE HONESTLY: `pull-requests: write` is a TOKEN-level grant, so
                             # it also permits commenting, reviewing, editing and closing — the
                             # label-only guarantee is CODE-level (apply-risk-label.sh is the
-                            # only writer, and the only state it changes is the mapped label
-                            # names — its atomic PUT re-sends every unowned label unchanged),
-                            # backed by the fact that the job checks out no PR code: the only
+                            # only writer, and the only state it INTENDS to change is the
+                            # mapped label names — its atomic PUT re-sends every unowned label
+                            # as the snapshot read saw it, with one residual an auditor should
+                            # know: a label added or removed by someone else inside that
+                            # read->PUT window is dropped or resurrected respectively; see the
+                            # script's RESIDUAL note), backed by the fact that the job checks
+                            # out no PR code: the only
                             # code holding this token is this repo's, loaded from the pinned
                             # workflows_ref. Public repos enroll via `pull_request_target`, so
                             # that token IS present on fork-authored events — which is exactly
