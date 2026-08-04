@@ -19,12 +19,11 @@
 #     visible symptom.
 #   * THE GUARD STOPS BEING FIRST. It only bounds what it precedes — a guard after the checkout
 #     it protects is decoration.
-#   * AN AXIS IS DROPPED, OR STOPS BEING FATAL. Shape alone proves the ref is immutable, not
-#     which commit it is; the `github.job_workflow_sha` comparison is what proves it is the
-#     revision already running. Either axis degraded to a warning is a silent no-op.
-#   * AN AXIS BECOMES A TAUTOLOGY. Rebind `WORKFLOWS_REF` to `${{ github.job_workflow_sha }}`
-#     and the lock-step test compares the resolved SHA with itself — always green, while the
-#     checkout below still uses the unvalidated input. Nothing about the guard's SHAPE changes.
+#   * THE CHECK IS WEAKENED, IN ANY OF THE WAYS A PATTERN SCAN CANNOT ENUMERATE. Loosen the
+#     character class, drop the length test, wrap the strict test in a permissive branch
+#     (`if <7-hex> then accept; else <the 40-hex check>; fi`), rebind `WORKFLOWS_REF` to
+#     something other than the input, emit the raw value in a new spelling (`printenv`, `env`,
+#     `declare -p`, `set -x`), or add a second emitting statement after a sanctioned prefix.
 #   * THE STEP IS NEUTERED WHOLESALE. `continue-on-error: true` makes every `exit 1` advisory
 #     and an `if:` switches the step off — added to both copies they stay byte-identical, every
 #     assertion above still holds, and the checkout proceeds on an unvalidated ref. Or the
@@ -33,20 +32,26 @@
 #   * THE INPUT IS ALIASED PAST THE SCAN. The unguarded-checkout scan matches `ref:` keys naming
 #     `inputs.workflows_ref`. Bind it to an `env:` key first, forward it to a composite action,
 #     or hand it to a `git fetch` in a `run:` step, and the scan has nothing left to see.
-#   * THE RAW VALUE IS EMITTED AGAIN. The runner re-parses any line of step output, so a
-#     multi-line ref can forge workflow commands in a public log — including one hop through
-#     another variable, which is why the emit scan whitelists what may touch the value rather
-#     than blacklisting the emit shapes someone thought of.
 #
-# ASSERT PROPERTIES, NOT COUNTS, AND POSITIONS, NOT SUMS. An earlier draft pinned a literal
-# number of `exit 1` lines, which would have gone red on the very next hardening of the guard —
-# a test that blocks its own subject's improvement teaches people to delete the test. A later
-# one compared total `::error::` and `exit 1` counts, which one path could satisfy on another's
-# behalf. What is asserted here is that no rejection path can be non-fatal (no `exit 0` at all)
-# and that each `::error::` is FOLLOWED by an exit. The awk passes also self-check that they
-# matched anything, so a brittle anchor fails loudly rather than passing vacuously with zero
-# coverage — and the patterns are deliberately over-inclusive, since a false positive here costs
-# a puzzled minute and a false negative ships an unguarded checkout.
+# THE GUARD'S EXECUTABLE BODY IS PINNED VERBATIM, and that is deliberate. Earlier drafts of this
+# file tried to characterize the body instead — assert both axes are present, assert every
+# `::error::` is followed by an `exit 1`, whitelist which statements may touch the value — and
+# each round of review found another way through, because every one of them was a pattern over an
+# open-ended language: the whitelist cleared a whole `;`-delimited statement on its PREFIX (so
+# `if [[ -n "$REF" ]] && echo "$REF" >> "$GITHUB_STEP_SUMMARY"` passed), its TRIGGER was itself a
+# blacklist (so `printenv WORKFLOWS_REF` and `set -euxo pipefail` were invisible), and a `has`
+# needle proves a test is PRESENT, never that it is the only path to the checkout. A trust
+# boundary this small — nine executable lines — is better served by an equality: the body is what
+# it is below, or the build is red. Widening it is then a deliberate two-place edit whose diff a
+# reviewer sees, which is the property all those scans were reaching for.
+#
+# STRUCTURE IS PINNED; PROSE IS NOT. The `::error::` message is free to be reworded (it is
+# canonicalized away before the comparison) but is separately checked to expand nothing but the
+# sanitized copy — otherwise a wording tweak would fail this test for no security reason, while
+# `echo "::error::$WORKFLOWS_REF"` would slip past a prose-blind pin. Everything AROUND the body —
+# which jobs have the guard, whether it precedes its checkout, whether the copies agree, whether
+# either has been neutered — stays a property assertion, and each of those scans self-checks that
+# it matched anything, so a stale anchor fails loudly rather than passing vacuously.
 #
 #   bash tests/test_pin_contract.sh          # exit 0 = all green
 set -uo pipefail
@@ -59,8 +64,8 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf 'ok   %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf 'FAIL %s\n     got: %s\n' "$1" "${2:-}"; }
 eq()  { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected '$2')" "$3"; fi }
-# `grep -F`, not `case` globbing: half these needles are regex text (`^[0-9a-fA-F]{40}$`), whose
-# brackets and braces a glob would happily reinterpret into something laxer than it reads.
+# `grep -F`, not `case` globbing: these needles are workflow and shell syntax (`${{`, `[[ `),
+# whose brackets and braces a glob would happily reinterpret into something laxer than it reads.
 has() { if printf '%s\n' "$2" | grep -qF -- "$3"; then ok "$1"; else bad "$1" "not found: $3"; fi }
 no()  { if printf '%s\n' "$2" | grep -qF -- "$3"; then bad "$1" "present: $3"; else ok "$1"; fi }
 
@@ -142,50 +147,59 @@ else
 fi
 eq "all copies of the guard step are byte-identical" "" "$drift"
 
-# --- both axes are still enforced, and no rejection path can be non-fatal ---------------------
+# --- the guard's executable body is exactly this -----------------------------------------------
 body="$(cat "$first" 2>/dev/null)"
 # WHOLE-LINE comments are dropped before any assertion about control flow, so an `exit 1` or an
 # `exit 0` quoted in prose neither satisfies nor breaks a check. Deliberately NOT a trailing-`#`
 # strip: `#` has no special meaning inside a shell string, and this repo routinely writes
 # `github-workflows#NN` and the like in exactly the annotation lines below — a naive
 # `s/[[:space:]]*#.*$//` would truncate such a line and could silently drop the `$WORKFLOWS_REF`
-# mention that the emit scan exists to inspect. The residual cost runs the other, harmless way:
-# a trailing comment that happens to say `exit 0` trips a check. False positive, one puzzled
-# minute — the trade this file makes everywhere.
+# mention the pin below exists to inspect. The residual cost runs the other, harmless way: a
+# trailing comment that happens to say `exit 1` becomes part of the pinned text. False positive,
+# one puzzled minute — the trade this file makes everywhere.
 code="$(printf '%s\n' "$body" | grep -v '^[[:space:]]*#')"
 
-# The value under test must be the caller's INPUT, not a restatement of the runner's own. Rebind
-# it to `${{ github.job_workflow_sha }}` and the lock-step comparison compares the resolved SHA
-# with itself — a tautology that always passes while the checkout below still uses the
-# unvalidated input, with every other assertion in this file staying green.
-has "the guarded value is the caller's input, not the resolved SHA restated" \
-    "$code" 'WORKFLOWS_REF: ${{ inputs.workflows_ref }}'
-has "axis 1: the ref must be shaped like a full 40-hex commit SHA" \
-    "$code" '^[0-9a-fA-F]{40}$'
-has "axis 2: the runner-supplied resolved SHA is read into the guard" \
-    "$code" 'JOB_WORKFLOW_SHA: ${{ github.job_workflow_sha }}'
-has "axis 2: the pin is compared against it, case-insensitively" \
-    "$code" '"${WORKFLOWS_REF,,}" != "${JOB_WORKFLOW_SHA,,}"'
-has "axis 2: an unreadable job_workflow_sha is itself a rejection (fail closed)" \
-    "$code" '[[ -z "$JOB_WORKFLOW_SHA" ]]'
+# THE EQUALITY. Every property the scans in earlier drafts reached for — the input is the value
+# under test and not a restatement of something else, the shape test is the ONLY path to the
+# checkout rather than merely a present one, no branch accepts early, no statement emits the raw
+# value under any spelling, `set -euo pipefail` has not grown an `x` — is a consequence of the
+# body being exactly this and nothing else. See the header for why an equality rather than yet
+# another pattern. To CHANGE the guard, change it here too: that second edit is the point.
+expect="$(cat <<'PINNED'
+      - name: Enforce workflows_ref pin contract
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+        run: |
+          set -euo pipefail
+          safe_ref=$(printf '%s' "$WORKFLOWS_REF" | tr -c 'A-Za-z0-9._/-' '?')
+          safe_ref=${safe_ref:0:64}
+          if [[ ${#WORKFLOWS_REF} -ne 40 || "$WORKFLOWS_REF" == *[!0-9a-f]* ]]; then
+            echo "::error::<message>"
+            exit 1
+          fi
+PINNED
+)"
+# Blank lines are noise here (the slicer keeps them so the byte-identity check above sees them),
+# and the annotation's PROSE is canonicalized to `<message>` so a rewording is not a test failure.
+actual="$(printf '%s\n' "$code" | grep -v '^[[:space:]]*$' | sed 's/\(::error::\).*/\1<message>"/')"
+if [ "$actual" = "$expect" ]; then
+  ok "the guard's executable body is exactly the pinned one"
+else
+  bad "the guard's executable body is exactly the pinned one" \
+      "$(diff <(printf '%s\n' "$expect") <(printf '%s\n' "$actual") | tr '\n' '~')"
+fi
 
-# Every rejection is fatal, expressed without pinning a literal count: nothing in the guard may
-# exit successfully mid-way, and each error annotation must be followed by a failing exit. A new
-# axis therefore extends this cleanly instead of turning it red.
-no  "no rejection path exits non-fatally" "$code" "exit 0"
-# Positionally, not by totals. Equal SUMS would let one path degrade to log-and-continue so long
-# as another gained a spare `exit 1` — which is exactly the regression this is here to catch, so
-# each `::error::` must be followed by `exit 1` as the next non-blank line.
-unpaired="$(printf '%s\n' "$code" | awk '
-  /^[[:space:]]*$/ { next }
-  pending && $0 !~ /^[[:space:]]*exit 1[[:space:]]*$/ { print "UNPAIRED:" NR; pending = 0 }
-  { pending = /::error::/ }
-  END { if (pending) print "UNPAIRED:eof" }
-' | tr '\n' ' ' | sed 's/ $//')"
-eq "every ::error:: is followed by a failing exit" "" "$unpaired"
-errors=$(printf '%s\n' "$code" | grep -c '::error::')
-if [ "$errors" -ge 3 ]; then ok "all three rejection paths are present (shape, unreadable, mismatch)"
-else bad "all three rejection paths are present (shape, unreadable, mismatch)" "$errors ::error:: lines"; fi
+# The one thing the canonicalization above deliberately stops seeing. `<message>` hides the
+# annotation's text, so it must be checked here that the text expands NOTHING but the sanitized
+# copy — otherwise `echo "::error::$WORKFLOWS_REF"` would read as a mere rewording, and a
+# multi-line ref would forge workflow commands in a PUBLIC log exactly as before.
+errline="$(printf '%s\n' "$code" | grep -F '::error::')"
+stripped="${errline//\$\{safe_ref\}/}"
+if [ -n "$errline" ] && [ "${stripped#*\$}" = "$stripped" ]; then
+  ok "the annotation expands nothing but the sanitized copy"
+else
+  bad "the annotation expands nothing but the sanitized copy" "$errline"
+fi
 
 # --- the guard cannot be neutered while staying byte-identical --------------------------------
 # The cheapest way to disarm this without tripping any check above is a step-level key:
@@ -220,72 +234,14 @@ no "the protected checkout is not softened by continue-on-error" "$protected" "c
 jobsoft="$(grep -nE '^    continue-on-error:' "$WF" | tr '\n' ' ' | sed 's/ $//')"
 eq "no job demotes its own failures wholesale (no job-level continue-on-error)" "" "$jobsoft"
 
-# --- neither raw value is interpolated into the shell nor emitted raw -------------------------
-# `${{ inputs.workflows_ref }}` inline in `run:` would be a shell-injection vector, and emitting
-# the raw value lets a multi-line value forge workflow commands in a public log — the runner
-# re-parses ANY line of step output, so this is not only about `echo` and not only about lines
-# that themselves contain `::`. Every line naming the value must therefore be one that consumes
-# it (a `[[ ]]` test, or the assignment that sanitizes it), never one that emits it: no bare
-# `echo`/`printf`, no workflow command, no redirect into an Actions file, and no continuation of
-# a line that was doing one of those.
-#
-# BOTH values, not just the caller's. `JOB_WORKFLOW_SHA` is runner-supplied and so cannot be
-# forged by a caller — but the guard's own comment argues the platform could reshape or rename
-# that property out from under it, which is exactly why the guard never tests it for shape and
-# does sanitize it before echoing. A scan that covered only `WORKFLOWS_REF` would stay green
-# while a future edit echoed raw `$JOB_WORKFLOW_SHA` into an annotation, contradicting the
-# comment it sits under. Same whitelist, one more sanctioned assignment.
+# --- the input reaches the shell only through env: ---------------------------------------------
+# `${{ inputs.workflows_ref }}` interpolated inline into a `run:` body would be a shell-injection
+# vector — the runner substitutes the text BEFORE bash ever sees it, so quoting inside the script
+# cannot help. The pinned body above already spells the binding out, but this states the rule by
+# name so a failure says WHICH rule broke rather than just showing a diff.
 script="$(printf '%s\n' "$code" | sed -n '/run: |/,$p')"
-# Unlike every other anchor here, this one had no coverage self-check: reshape the block scalar
-# (`run: >-`, or a `run:` with a trailing comment) and `$script` comes back EMPTY, at which point
-# both assertions below pass over nothing at all — the vacuous-pass mode this file's header
-# claims to have eliminated. Anchor on a line the guard's script must contain.
 has "the run: block scan found the guard's script body" "$script" 'set -euo pipefail'
-# WHITELIST, not blacklist. The named categories below are diagnostics — they say WHICH way a
-# line leaks — but the verdict is the `else`: the raw value may be read by the sanitizing
-# assignment and by the `[[ ]]` tests, and by NOTHING else. A blacklist of emit-shapes has a
-# one-hop hole (`raw=$WORKFLOWS_REF` on one line, `echo "$raw"` on the next, and every shape rule
-# sees nothing) and an open-ended tail of spellings to keep chasing — `export`, `local`, `read`,
-# a herestring, a here-doc. Inverting it is what lets the assertion's name be true: any new way
-# of touching the value is reported until someone widens this list on purpose.
-#
-# PER STATEMENT, not per line. Sanctioning a whole LINE on its prefix hands back everything the
-# whitelist just bought: `if [[ -n "$WORKFLOWS_REF" ]]; then echo "$WORKFLOWS_REF" >> \
-# "$GITHUB_STEP_SUMMARY"; fi` opens with a sanctioned `if [[ ` and would clear in full, raw emit
-# and all. So the line is split on `;` first and each statement judged on its own — the shell's
-# own separator, so a leak has to hide inside a command substitution (where it is captured, not
-# logged) rather than merely after a semicolon. A `;` inside a quoted string over-splits, which
-# costs a false positive, never a false negative: the trade this file makes everywhere.
-emitted="$(printf '%s\n' "$script" | awk '
-  {
-    raw = $0
-    n = split(raw, stmt, ";")
-    for (i = 1; i <= n; i++) {
-      line = stmt[i]; sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line)
-      if (line !~ /\$\{?(WORKFLOWS_REF|JOB_WORKFLOW_SHA)/) continue
-      sanctioned = (!cont && (line ~ /^safe_(ref|job_sha)=\$\(printf/ || line ~ /^(el)?if \[\[ /))
-      if (!sanctioned) {
-        if (cont)                             { print "CONTINUATION:" NR }
-        else if (line ~ /::/)                 { print "WORKFLOW-COMMAND:" NR }
-        else if (line ~ /GITHUB_(STEP_SUMMARY|OUTPUT|ENV|PATH)/) { print "ACTIONS-FILE:" NR }
-        else if (line ~ /^(echo|printf)[[:space:]]/)             { print "BARE-EMIT:" NR }
-        else if (line ~ /[^0-9a-zA-Z_]>>?[[:space:]]*[\$\/"]/)   { print "REDIRECT:" NR }
-        else                                  { print "UNSANCTIONED:" NR }
-      }
-    }
-    cont = (raw ~ /\\$/)
-  }
-' | tr '\n' ' ' | sed 's/ $//')"
-eq "neither raw value is emitted or copied elsewhere, only sanitized or tested" "" "$emitted"
-# Coverage self-check for the scan above, in the same spirit as the ones on the other anchors: if
-# the trigger pattern matched nothing at all — a renamed env key, a reshaped script — the `eq`
-# passes vacuously over an empty scan and reports a green boundary that was never inspected.
-ntouch=$(printf '%s\n' "$script" | grep -cE '\$\{?(WORKFLOWS_REF|JOB_WORKFLOW_SHA)')
-if [ "$ntouch" -ge 5 ]; then ok "the emit scan saw both guarded values ($ntouch lines)"
-else bad "the emit scan saw both guarded values" "$ntouch lines — anchors are stale, coverage is vacuous"; fi
-no "the input reaches the script only via env:" "$script" '${{'
-has "the sanitized input is what the annotations use" "$code" '${safe_ref}'
-has "the sanitized runner SHA is what the annotations use" "$code" '${safe_job_sha}'
+no  "the input reaches the script only via env:" "$script" '${{'
 
 # --- ...and the input is never aliased out from under the checkout scan ------------------------
 # The "every workflows_ref checkout sits behind the guard" scan at the top matches literal `ref:`
@@ -319,17 +275,22 @@ aliased="$(awk -v guard="$GUARD_NAME" '
   { print "ALIASED:" NR }
 ' "$WF" | tr '\n' ' ' | sed 's/ $//')"
 eq "the input is referenced only as the guard step's own env binding or a ref: key" "" "$aliased"
-# EXACTLY two mentions per guarded job, not "at least". `-ge` let a spare mention ride along
-# unexamined; the assertion's own name claims one binding and one `ref:` apiece, so it is an
-# equality. Still a property rather than a literal: a third guarded job moves both sides at once.
-nmentions=$(awk '
-  { line = $0; sub(/^[[:space:]]*/, "", line) }
+# Coverage self-check, PER CATEGORY rather than against a `nrefs * 2` total. The total encoded
+# today's exact shape twice over — one binding AND one `ref:` per checkout — so a job that
+# legitimately checked the tool out twice, or a consolidation that bound the input once for two
+# steps, failed with the misleading "anchors are stale" message even though coverage was intact.
+# What actually needs proving is that each scan matched at all: one binding per guard copy, and
+# the `ref:` keys the top-of-file scan already counted. The alias scan above is what forbids
+# anything else, so these two need not add up to the mentions.
+nbind=$(grep -cE '^ *WORKFLOWS_REF: \$\{\{ inputs\.workflows_ref \}\}$' "$WF")
+eq "each copy of the guard binds the input exactly once" "$guards" "$nbind"
+nrefkeys=$(awk '
+  { line = $0; gsub(/[[:space:]]/, "", line) }
   line ~ /^#/ { next }
-  line ~ /inputs\.workflows_ref/ { n += 1 }
+  line ~ /^ref:.*inputs\.workflows_ref/ { n += 1 }
   END { print n+0 }
 ' "$WF")
-want=$((nrefs * 2))
-eq "the alias scan saw one env binding and one ref: per guarded job ($nmentions)" "$want" "$nmentions"
+eq "every counted checkout names the input on its own ref: key" "$nrefs" "$nrefkeys"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -14,28 +14,25 @@ name: PR Risk Grade (reusable)
 #
 # The grader and its default risk map load from THIS repo at the pinned `workflows_ref`,
 # never from the graded PR's checkout (no PR code is checked out at all) — a PR cannot edit
-# the rules that judge it. `workflows_ref` has deliberately no default and is now ENFORCED: every
-# job that checks it out fails BEFORE the checkout unless the value is a full 40-hex commit SHA
-# *and* equals `github.job_workflow_sha` — the commit `uses:` resolved to for that job. The first
-# test rejects anything mutable (a branch, a tag, `refs/pull/N/head`); the second rejects a
-# well-shaped SHA that is not the revision already running — a stale pin left behind when `uses:`
-# moved, or a fork-authored commit of this PUBLIC repo handed to `workflows_ref` while `uses:`
-# stayed upstream. So the two halves of the tool cannot disagree, and "pin it to the same SHA as
-# `uses:`" is machine-checked rather than trusted prose in this header.
+# the rules that judge it. `workflows_ref` has deliberately no default and its SHAPE is now
+# ENFORCED: every job that checks it out fails BEFORE the checkout unless the value is a full
+# 40-hex lowercase commit SHA. That rejects everything MUTABLE — a branch, a tag,
+# `refs/pull/N/head` — so the grading logic cannot change after the caller was reviewed, and
+# "pin it, don't float it" is machine-checked rather than trusted prose in this header.
 #
-# What that does NOT prove — and cannot, from in here — is that the running revision is upstream
-# code: `job_workflow_sha` is whatever the CALLER's own `uses:` resolved to, so a caller pointing
-# `uses:` itself at a fork commit is already running the fork's copy of this very file. Nor does
-# it prove the caller SHA-pinned `uses:` at all: the value arrives already resolved, so a
-# `uses: ...@v1` caller passing the SHA that tag points at satisfies both axes (it just goes red
-# the next time `v1` is force-moved) — and a caller that passes the `github.job_workflow_sha`
-# CONTEXT here rather than a written-out SHA satisfies them permanently, since the passthrough
-# re-resolves on every run and so never needs repinning. That is the shape to look for when
-# reviewing a caller: `workflows_ref` must be a literal 40-hex SHA in the caller's `with:`, equal
-# to the one in `uses:`, never an expression. Both cases are bounded by review of the caller on
-# its base branch, not by any check this workflow can make. Call this workflow DIRECTLY — a nested
-# `workflow_call` chain through an org wrapper is unsupported, because `job_workflow_sha` names
-# one commit and the wrapper's is not this file's; see the `workflows_ref` input for the detail.
+# WHAT SHAPE DOES NOT PROVE is WHICH commit it is. A fork of this PUBLIC repo shares its object
+# store, so a fork-authored commit is a perfectly well-shaped 40-hex SHA and would be checked out
+# into a job holding the caller's `pull-requests: write` token. Nothing inside this file can close
+# that: the check it wants is "`workflows_ref` equals the commit the caller's `uses:` resolved to",
+# and the runner does NOT expose that commit to the workflow — `github.workflow_sha` is the
+# CALLER's top-level workflow file, and `job_workflow_sha` (the value that would answer this)
+# exists only as an OIDC token claim, which would mean an `id-token: write` grant from every
+# caller and a token exchange in a job that today holds `permissions: {}`. Until that is designed,
+# this is bounded by REVIEW OF THE CALLER on its base branch — which is also the only thing that
+# can see the ref the caller actually wrote: `uses:` must name this repo at a full commit SHA and
+# `with: workflows_ref:` must be that same SHA written out LITERALLY, never an expression and
+# never a tag. Call this workflow DIRECTLY; a nested `workflow_call` chain through an org wrapper
+# is unsupported. See the `workflows_ref` input for the detail.
 # A consumer repo sharpens the generic defaults by committing
 # `.github/risk.json` (map) / `.github/risk-runbooks.json` (runbook registry), which are read
 # from the PR's BASE ref: present-but-invalid fails the run loudly; absent falls back to the
@@ -173,10 +170,11 @@ name: PR Risk Grade (reusable)
 #         statuses: read
 #       uses: Comfy-Org/github-workflows/.github/workflows/pr-risk.yml@<sha>  # v1
 #       with:
-#         # ENFORCED, not merely asked for: it must be a full 40-hex commit SHA *and* the same
-#         # commit the `uses:` above resolves to, or the run fails before the tool checkout. A
-#         # branch, a tag, `refs/pull/N/head`, or a SHA left behind when `uses:` moved is
-#         # rejected — see the paragraph about the pinned ref at the top of this header for why.
+#         # ENFORCED, not merely asked for: it must be a full 40-hex LOWERCASE commit SHA or the
+#         # run fails before the tool checkout — a branch, a tag or `refs/pull/N/head` is rejected.
+#         # Write out the SAME SHA as the `uses:` above, LITERALLY: that the two agree is what
+#         # review of this caller checks, and it is not something the workflow can see. See the
+#         # paragraph about the pinned ref at the top of this header for why.
 #         workflows_ref: <same sha>
 #         # OFF BY DEFAULT. Enrolling and switching on are two decisions: land the caller, get
 #         # it reviewed, then start grading. Either pin it on here, or leave this out and set
@@ -294,58 +292,45 @@ on:
           is not a chain.
 
 
-          ENFORCED, on two axes, before the tool checkout: it must match
-          `^[0-9a-fA-F]{40}$` (branches, tags and `refs/pull/N/head` are mutable,
-          so they are rejected rather than documented against) AND equal
-          `github.job_workflow_sha`, the commit `uses:` resolved to. The second
-          test is what stops the two halves of the tool disagreeing — a stale pin
-          left behind when `uses:` moved, or a fork-authored commit of this
-          PUBLIC repo passed here while `uses:` stayed upstream, both being just
-          as well-shaped as any other SHA. It does not, and cannot, prove the
-          running revision is upstream: that is what reviewing the caller's
-          `uses:` line on its base branch is for.
+          ITS SHAPE IS ENFORCED before the tool checkout: exactly 40 characters,
+          every one of them in `[0-9a-f]`. Branches, tags and `refs/pull/N/head`
+          are mutable, so they are rejected rather than documented against; a
+          multi-line value, trailing whitespace and uppercase hex are rejected
+          with them, since this value is handed to `actions/checkout` verbatim.
 
 
-          WHAT IT CANNOT SEE is the caller's ORIGINAL `uses:` ref.
-          `job_workflow_sha` is already the RESOLVED commit, so a `uses: ...@v1`
-          caller that passes whatever `v1` currently points at satisfies both
-          axes: this guard does NOT reject a tag- or branch-pinned `uses:`, and
-          no check inside the called workflow can — proving that needs the ref
-          the caller wrote, which is never sent. Reviewing the caller's `uses:`
-          line on its base branch is what bounds it, and org policy already
-          requires a full commit SHA there (a floating one fails the
-          pin-validation consumer CI runs).
+          THAT IS ONE AXIS, AND IT IS THE ONLY ONE AVAILABLE FROM IN HERE. Shape
+          proves the ref is IMMUTABLE; it says nothing about WHICH commit it
+          names. A fork of this PUBLIC repo shares its object store, so a
+          fork-authored commit is as well-shaped as any other and would be
+          checked out into a job holding the caller's write token; equally, a pin
+          left behind when `uses:` moved still passes. The test that would close
+          both is "equal to the commit `uses:` resolved to for this job" — and
+          the runner does not expose that commit to the workflow.
+          `github.workflow_sha` is the CALLER's top-level workflow file, not this
+          one; the value that would answer it, `job_workflow_sha`, exists only as
+          an OIDC token claim, which means an `id-token: write` grant from every
+          caller plus a token exchange in a job that today holds
+          `permissions: {}`. Adding that is a caller-contract change and is
+          tracked separately — do not assume this input's provenance is checked.
 
 
-          NOR CAN IT SEE THAT THIS VALUE WAS WRITTEN OUT. `job_workflow_sha`
-          also resolves in the CALLER's own `with:` block, so a caller can hand
-          this input that context expression instead of a SHA. It then equals
-          itself by construction and passes both axes on every run, forever,
-          while `uses:` sits on `@v1` or `@main` — the value that arrives here
-          is identical either way, so the guard has nothing to distinguish. This
-          is strictly worse than the tag-pinned case below, because the
-          passthrough never needs repinning and so never produces the loud
-          failure that would otherwise surface the drift. WHEN REVIEWING A
-          CALLER, require a LITERAL 40-hex SHA in `with: workflows_ref:`,
-          character-for-character the one in `uses:` — an expression of any
-          kind, and this whole contract is decoration.
-
-
-          What a floating `uses:` does buy is a LOUD failure on the next
-          sanctioned `git tag -f v1 <sha>` move: the tag resolves somewhere new,
-          this hand-written pin does not follow, and every tag-pinned caller goes
-          red until it is repinned. That is the intended direction of the
-          failure — better a red check than a tool silently swapped under a
-          reviewed caller — but it is a cost the tag-pinned caller pays, not a
-          rejection at the door. Pin `uses:` to a SHA and pass the same SHA here.
+          SO REVIEW OF THE CALLER IS WHAT BOUNDS IT, and it is the only place
+          that CAN: the ref the caller actually wrote in `uses:` is never sent
+          here, so no check inside this workflow can tell a SHA-pinned caller
+          from a `@v1` one passing whatever that tag currently points at, nor a
+          written-out SHA from a context expression that re-resolves every run.
+          WHEN REVIEWING A CALLER, require `uses:` at a full commit SHA of this
+          repo (org policy already does — a floating one fails the pin-validation
+          consumer CI runs) and `with: workflows_ref:` set to that same SHA
+          LITERALLY, character-for-character. An expression of any kind here, and
+          the contract is decoration.
 
 
           CALL IT DIRECTLY — a nested `workflow_call` chain (caller → an org
-          wrapper workflow → this one) is NOT supported. `job_workflow_sha` names
-          ONE commit for the job, and a wrapper living in another repo (or at
-          another commit of this one) is a different commit than this file, so no
-          single `workflows_ref` value can satisfy both this guard and the
-          wrapper's own pin. Name `pr-risk.yml` in the caller's `uses:`.
+          wrapper workflow → this one) is NOT supported: the wrapper's own pin
+          and this input name different files, and nothing reconciles them.
+          Name `pr-risk.yml` in the caller's `uses:`.
         type: string
         required: true
       enabled:
@@ -387,8 +372,8 @@ on:
           enrollment. The `workflows_ref` pin contract is enforced BEFORE this
           resolves and is not subject to it — the resolver script is itself
           loaded from `workflows_ref`, so there is no point in the run at which a
-          mismatched pin could be read as "switched off" without first checking
-          out the very ref under suspicion. A caller whose two pins have drifted
+          mutable pin could be read as "switched off" without first checking out
+          the very ref under suspicion. A caller pinned to a branch or a tag
           therefore fails red on every PR even with `{"enabled": false}` set. The
           fix is the one-line repin (or dropping the caller) — both PRs, but a
           caller that cannot say which revision of the tool it runs is not in a
@@ -415,18 +400,21 @@ jobs:
       enabled: ${{ steps.resolve.outputs.enabled }}
     steps:
       # THE PIN CONTRACT IS ENFORCED, NOT DOCUMENTED. The ref below supplies the code that runs
-      # in this job, so it is checked on TWO axes before any checkout happens:
-      #   1. SHAPE — a mutable ref (branch, tag, `refs/pull/N/head`) means that code can change
-      #      after the caller was reviewed. Only a full commit SHA is immutable.
-      #   2. LOCK-STEP — shape alone does not say WHICH commit it is. GitHub serves a fork PR's
-      #      head objects from this upstream repo, so a fork-authored 40-hex SHA is a perfectly
-      #      well-shaped ref. So the value must EQUAL `github.job_workflow_sha`, the commit
-      #      `uses:` resolved to for this job — runner-supplied and unforgeable by any input.
-      #      That is what turns "pin it to the same SHA as `uses:`" from prose into a check, and
-      #      it is scoped to exactly that: the grader cannot come from a different revision than
-      #      the one running. It does NOT prove the running revision is upstream — a caller whose
-      #      own `uses:` points at a fork commit is already running that fork's copy of this file,
-      #      which no check inside this file can reach. Reviewing the caller bounds that one.
+      # in this job, so its SHAPE is checked before any checkout happens: a mutable ref (branch,
+      # tag, `refs/pull/N/head`) means that code can change after the caller was reviewed, and
+      # only a full commit SHA is immutable.
+      #
+      # SHAPE IS THE ONLY AXIS THIS FILE CAN CHECK, so do not read it as more. It does not say
+      # WHICH commit the ref names: a fork of this PUBLIC repo shares its object store, so a
+      # fork-authored 40-hex SHA is a perfectly well-shaped ref, and a pin left behind when
+      # `uses:` moved is too. Both would be closed by "equal to the commit `uses:` resolved to
+      # for this job" — but the runner does not hand that commit to the workflow.
+      # `github.workflow_sha` is the CALLER's top-level workflow file; `job_workflow_sha`, which
+      # is the value that would answer it, is an OIDC token CLAIM, not a `github` context
+      # property (`actionlint` rejects `github.job_workflow_sha`, and reading the claim needs
+      # `id-token: write` from every caller plus an exchange in a job that holds `permissions: {}`
+      # today). Reviewing the caller is what bounds that, and it is the only thing that can.
+      #
       # Enforced in the WORKFLOW, not in a script: the scripts are what the ref loads, so a
       # script-side check would sit inside the blast radius it is meant to bound. EVERY job that
       # checks out `workflows_ref` re-asserts this itself — `grade` does not inherit its safety
@@ -435,57 +423,38 @@ jobs:
       # any of this repo's code has executed anywhere.
       #
       # The value arrives via `env:` and is never interpolated into the script body — inline
-      # `${{ }}` of the very input being validated is a shell-injection vector. `[[ =~ ]]` rather
-      # than `grep -Eq '^[0-9a-fA-F]{40}$'` because grep anchors per LINE: a multi-line value
-      # carrying one SHA-shaped line would pass it and then be handed to checkout in full.
-      # The two copies of this step are byte-identical on purpose, and
-      # scripts/pr-risk/tests/test_pin_contract.sh fails the build if they drift apart or if a
-      # job grows a `workflows_ref` checkout without one.
+      # `${{ }}` of the very input being validated is a shell-injection vector. The two copies of
+      # this step are byte-identical on purpose, and scripts/pr-risk/tests/test_pin_contract.sh
+      # pins this step's executable body verbatim, fails the build if the copies drift apart, and
+      # fails it if a job grows a `workflows_ref` checkout without one.
       - name: Enforce workflows_ref pin contract
         env:
           WORKFLOWS_REF: ${{ inputs.workflows_ref }}
-          # The commit `uses:` actually resolved to for THIS job. The runner sets it from the
-          # call graph; no input, caller expression, or fork PR can forge it — which is what
-          # makes the lock-step comparison below a real check rather than a restatement of the
-          # same untrusted value.
-          JOB_WORKFLOW_SHA: ${{ github.job_workflow_sha }}
         run: |
           set -euo pipefail
-          # Never interpolate a raw value into a `::error::`. A multi-line value — exactly what
-          # the `[[ =~ ]]` choice exists to catch — would end the annotation at the first newline
-          # and leave the remainder to be re-parsed by the runner as workflow commands
+          # Never interpolate a raw value into a `::error::`. A multi-line value — exactly what the
+          # length/character test below exists to catch — would end the annotation at the first
+          # newline and leave the remainder to be re-parsed by the runner as workflow commands
           # (`::add-mask::`, `::stop-commands::`, a forged `::notice::`) in a PUBLIC log. Anything
           # outside the ref alphabet becomes `?` and the result is truncated, so what is echoed is
-          # always one bounded line. The RUNNER-supplied SHA gets the identical treatment, not
-          # because a caller can forge it, but because it is only ever tested for emptiness and
-          # never for shape — and the block below argues the platform could rename or reshape that
-          # property out from under this guard. Neither value is trusted to be one tidy line.
+          # always one bounded line.
           safe_ref=$(printf '%s' "$WORKFLOWS_REF" | tr -c 'A-Za-z0-9._/-' '?')
           safe_ref=${safe_ref:0:64}
-          safe_job_sha=$(printf '%s' "$JOB_WORKFLOW_SHA" | tr -c 'A-Za-z0-9._/-' '?')
-          safe_job_sha=${safe_job_sha:0:64}
-          if [[ ! "$WORKFLOWS_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
-            echo "::error::workflows_ref must be the FULL 40-hex commit SHA of Comfy-Org/github-workflows (got '${safe_ref}'). Pin it to the SAME SHA you pin uses: to — see the pr-risk.yml header. Branches, tags and refs/pull/N/head are mutable (and PR-head refs resolve fork-authored code), so they are rejected before the tool checkout."
-            exit 1
-          fi
-          # Shape proves the ref is IMMUTABLE; it proves nothing about WHICH commit it names.
-          # GitHub serves a fork PR's head objects from this upstream repo, so a fork-authored
-          # 40-hex SHA passes the regex and would be checked out into a job holding the caller's
-          # token. The tool is only the revision that was reviewed if it is the very commit this
-          # job is already running from, so that is what is asserted.
+          # LENGTH + CHARACTER CLASS, not `grep -Eq '^[0-9a-f]{40}$'` and not `[[ =~ ]]`: both raise
+          # an anchoring question this form does not have. `grep` anchors `^…$` per LINE, so a
+          # multi-line value carrying one SHA-shaped line passes it and is then handed to checkout
+          # in full; `[[ =~ ]]` anchors the whole string, but whether `$` may ALSO match just before
+          # a trailing newline is a libc-dependent detail no trust boundary should rest on. A length
+          # test plus "contains a character outside [0-9a-f]" has no anchors at all — a newline, a
+          # space or an uppercase letter is simply a character outside the class.
           #
-          # FAILS CLOSED. An unrecognized `github` context property evaluates to the empty string,
-          # so a rename or removal upstream would otherwise turn this whole boundary into a silent
-          # permanent no-op with no red check anywhere — the one failure mode a security guard
-          # must not have. The context is always populated for a `workflow_call` job and this
-          # workflow has no other trigger, so empty means the platform changed under us: stop,
-          # loudly, rather than check out a ref whose provenance cannot be established.
-          if [[ -z "$JOB_WORKFLOW_SHA" ]]; then
-            echo "::error::github.job_workflow_sha is empty, so workflows_ref cannot be checked for lock-step with the commit uses: resolved to. That context is always populated for a workflow_call job and this workflow has no other trigger, so this is a platform regression (or a renamed context property), not a supported mode — failing closed rather than checking out a ref whose provenance cannot be established."
-            exit 1
-          fi
-          if [[ "${WORKFLOWS_REF,,}" != "${JOB_WORKFLOW_SHA,,}" ]]; then
-            echo "::error::workflows_ref (${safe_ref}) is not the commit uses: resolved to (${safe_job_sha}), so the grader would load from a different revision of Comfy-Org/github-workflows than the one running. Set BOTH to that same full commit SHA. If the uses: line calling this workflow is pinned to a TAG or a BRANCH, fix that first: it must be a full commit SHA (org policy — a floating uses: fails the pin-validation consumer CI runs anyway), and this input takes the same SHA."
+          # LOWERCASE ONLY, deliberately. The value is handed to `actions/checkout` VERBATIM, so
+          # accepting a spelling the fetch may not resolve would trade this step's clear message for
+          # an obscure failure one step later — the opposite of the point. Everything that emits a
+          # SHA (`git rev-parse`, `gh`, the REST API, the UI) emits lowercase, so a false reject
+          # here is loud and fixed by lowercasing.
+          if [[ ${#WORKFLOWS_REF} -ne 40 || "$WORKFLOWS_REF" == *[!0-9a-f]* ]]; then
+            echo "::error::workflows_ref must be the FULL 40-hex lowercase commit SHA of Comfy-Org/github-workflows (got '${safe_ref}'). Pin it to the SAME SHA you pin uses: to — see the pr-risk.yml header. Branches, tags and refs/pull/N/head are mutable (and PR-head refs resolve fork-authored code), so they are rejected before the tool checkout."
             exit 1
           fi
       # The tool checkout is the same pinned-ref load the grade job does: the resolver is this
@@ -580,48 +549,31 @@ jobs:
       - name: Enforce workflows_ref pin contract
         env:
           WORKFLOWS_REF: ${{ inputs.workflows_ref }}
-          # The commit `uses:` actually resolved to for THIS job. The runner sets it from the
-          # call graph; no input, caller expression, or fork PR can forge it — which is what
-          # makes the lock-step comparison below a real check rather than a restatement of the
-          # same untrusted value.
-          JOB_WORKFLOW_SHA: ${{ github.job_workflow_sha }}
         run: |
           set -euo pipefail
-          # Never interpolate a raw value into a `::error::`. A multi-line value — exactly what
-          # the `[[ =~ ]]` choice exists to catch — would end the annotation at the first newline
-          # and leave the remainder to be re-parsed by the runner as workflow commands
+          # Never interpolate a raw value into a `::error::`. A multi-line value — exactly what the
+          # length/character test below exists to catch — would end the annotation at the first
+          # newline and leave the remainder to be re-parsed by the runner as workflow commands
           # (`::add-mask::`, `::stop-commands::`, a forged `::notice::`) in a PUBLIC log. Anything
           # outside the ref alphabet becomes `?` and the result is truncated, so what is echoed is
-          # always one bounded line. The RUNNER-supplied SHA gets the identical treatment, not
-          # because a caller can forge it, but because it is only ever tested for emptiness and
-          # never for shape — and the block below argues the platform could rename or reshape that
-          # property out from under this guard. Neither value is trusted to be one tidy line.
+          # always one bounded line.
           safe_ref=$(printf '%s' "$WORKFLOWS_REF" | tr -c 'A-Za-z0-9._/-' '?')
           safe_ref=${safe_ref:0:64}
-          safe_job_sha=$(printf '%s' "$JOB_WORKFLOW_SHA" | tr -c 'A-Za-z0-9._/-' '?')
-          safe_job_sha=${safe_job_sha:0:64}
-          if [[ ! "$WORKFLOWS_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
-            echo "::error::workflows_ref must be the FULL 40-hex commit SHA of Comfy-Org/github-workflows (got '${safe_ref}'). Pin it to the SAME SHA you pin uses: to — see the pr-risk.yml header. Branches, tags and refs/pull/N/head are mutable (and PR-head refs resolve fork-authored code), so they are rejected before the tool checkout."
-            exit 1
-          fi
-          # Shape proves the ref is IMMUTABLE; it proves nothing about WHICH commit it names.
-          # GitHub serves a fork PR's head objects from this upstream repo, so a fork-authored
-          # 40-hex SHA passes the regex and would be checked out into a job holding the caller's
-          # token. The tool is only the revision that was reviewed if it is the very commit this
-          # job is already running from, so that is what is asserted.
+          # LENGTH + CHARACTER CLASS, not `grep -Eq '^[0-9a-f]{40}$'` and not `[[ =~ ]]`: both raise
+          # an anchoring question this form does not have. `grep` anchors `^…$` per LINE, so a
+          # multi-line value carrying one SHA-shaped line passes it and is then handed to checkout
+          # in full; `[[ =~ ]]` anchors the whole string, but whether `$` may ALSO match just before
+          # a trailing newline is a libc-dependent detail no trust boundary should rest on. A length
+          # test plus "contains a character outside [0-9a-f]" has no anchors at all — a newline, a
+          # space or an uppercase letter is simply a character outside the class.
           #
-          # FAILS CLOSED. An unrecognized `github` context property evaluates to the empty string,
-          # so a rename or removal upstream would otherwise turn this whole boundary into a silent
-          # permanent no-op with no red check anywhere — the one failure mode a security guard
-          # must not have. The context is always populated for a `workflow_call` job and this
-          # workflow has no other trigger, so empty means the platform changed under us: stop,
-          # loudly, rather than check out a ref whose provenance cannot be established.
-          if [[ -z "$JOB_WORKFLOW_SHA" ]]; then
-            echo "::error::github.job_workflow_sha is empty, so workflows_ref cannot be checked for lock-step with the commit uses: resolved to. That context is always populated for a workflow_call job and this workflow has no other trigger, so this is a platform regression (or a renamed context property), not a supported mode — failing closed rather than checking out a ref whose provenance cannot be established."
-            exit 1
-          fi
-          if [[ "${WORKFLOWS_REF,,}" != "${JOB_WORKFLOW_SHA,,}" ]]; then
-            echo "::error::workflows_ref (${safe_ref}) is not the commit uses: resolved to (${safe_job_sha}), so the grader would load from a different revision of Comfy-Org/github-workflows than the one running. Set BOTH to that same full commit SHA. If the uses: line calling this workflow is pinned to a TAG or a BRANCH, fix that first: it must be a full commit SHA (org policy — a floating uses: fails the pin-validation consumer CI runs anyway), and this input takes the same SHA."
+          # LOWERCASE ONLY, deliberately. The value is handed to `actions/checkout` VERBATIM, so
+          # accepting a spelling the fetch may not resolve would trade this step's clear message for
+          # an obscure failure one step later — the opposite of the point. Everything that emits a
+          # SHA (`git rev-parse`, `gh`, the REST API, the UI) emits lowercase, so a false reject
+          # here is loud and fixed by lowercasing.
+          if [[ ${#WORKFLOWS_REF} -ne 40 || "$WORKFLOWS_REF" == *[!0-9a-f]* ]]; then
+            echo "::error::workflows_ref must be the FULL 40-hex lowercase commit SHA of Comfy-Org/github-workflows (got '${safe_ref}'). Pin it to the SAME SHA you pin uses: to — see the pr-risk.yml header. Branches, tags and refs/pull/N/head are mutable (and PR-head refs resolve fork-authored code), so they are rejected before the tool checkout."
             exit 1
           fi
       - name: Load pr-risk tool
