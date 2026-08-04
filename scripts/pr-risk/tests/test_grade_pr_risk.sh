@@ -286,6 +286,98 @@ case "$err" in
   *) bad "and the warning still refuses to read as low risk" "$err" ;;
 esac
 
+echo "— phase 20: a check rollup deeper than one page is DRAINED, not abandoned —"
+# GraphQL caps ANY connection page at 100, so a rollup with more checks than that came back
+# `hasNextPage: true` and the whole PR graded UNKNOWN. Measured on Comfy-Org/cloud: an ordinary
+# code PR carries 103 checks and graded `risk:ungraded`, while the enrollment PR (66 checks)
+# graded fine — so the bug was invisible until real traffic hit it, and the busier a repo's CI
+# the more of it went ungraded.
+#
+# The paging stub answers page 1 when no cursor is passed and page 2 when `cursor=C1` is. OUR
+# OWN check deliberately lives on PAGE 2: a drain that dropped page-2 nodes, or fetched them
+# with a narrower field selection than page 1, would silently stop excluding self and read
+# PENDING forever.
+mkdir -p "$SANDBOX/binpage"
+cat > "$SANDBOX/page1.json" <<'FIX'
+{"data":{"repository":{"pullRequest":{
+  "number":42,"title":"docs: tweak readme","state":"OPEN","isDraft":false,
+  "createdAt":"2026-08-01T00:00:00Z","updatedAt":"2026-08-01T00:10:00Z","closedAt":null,"mergedAt":null,
+  "author":{"login":"dev"},"authorAssociation":"MEMBER","baseRefName":"main","headRefName":"docs-tweak",
+  "isCrossRepository":false,"additions":3,"deletions":1,"changedFiles":1,
+  "labels":{"pageInfo":{"hasNextPage":false},"nodes":[]},
+  "commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"PENDING","contexts":{
+    "pageInfo":{"hasNextPage":true,"endCursor":"C1"},
+    "nodes":[
+      {"__typename":"CheckRun","name":"unit tests","status":"COMPLETED","conclusion":"SUCCESS",
+       "checkSuite":{"workflowRun":{"databaseId":1000,"workflow":{"name":"CI"}}}}
+    ]}}}}]}
+}}}}
+FIX
+cat > "$SANDBOX/page2.json" <<'FIX'
+{"data":{"repository":{"pullRequest":{
+  "commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{
+    "pageInfo":{"hasNextPage":false,"endCursor":null},
+    "nodes":[
+      {"__typename":"CheckRun","name":"Grade PR risk","status":"IN_PROGRESS","conclusion":null,
+       "checkSuite":{"workflowRun":{"databaseId":999,"workflow":{"name":"CI - PR Risk Grade"}}}}
+    ]}}}}]}
+}}}}
+FIX
+cat > "$SANDBOX/binpage/gh" <<'STUB'
+#!/usr/bin/env bash
+fixture=""; filter=""; paged=0
+for ((i=1; i<=$#; i++)); do
+  a="${!i}"
+  case "$a" in
+    cursor=*)         paged=1 ;;
+    graphql)          fixture="$FIXTURE_DIR/page1.json" ;;
+    *pulls/*/files*)  fixture="$FIXTURE_DIR/files.json" ;;
+    --jq)             n=$((i+1)); filter="${!n}" ;;
+  esac
+done
+if [ "$paged" -eq 1 ]; then
+  [ -z "${FAILPAGE:-}" ] || { echo "HTTP 502" >&2; exit 1; }
+  fixture="$FIXTURE_DIR/${PAGE2:-page2.json}"
+fi
+[ -n "$fixture" ] || { echo "gh stub: unhandled args: $*" >&2; exit 1; }
+if [ -n "$filter" ]; then jq -c "$filter" "$fixture"; else cat "$fixture"; fi
+STUB
+chmod +x "$SANDBOX/binpage/gh"
+paged_pr() { PATH="$SANDBOX/binpage:$PATH" bash "$GRADER" --repo test/repo --pr 42 "$@" 2>/dev/null; }
+
+out="$(paged_pr --self-run-id 999)"
+eq "a two-page rollup grades instead of going unknown" ok "$(jq -r '.risk.status' <<<"$out")"
+# Self lives on page 2, so this only reads SUCCESS if the drained page was both fetched AND
+# carried the checkSuite.workflowRun.databaseId that is_self keys on.
+eq "self-exclusion still works past the page boundary" SUCCESS "$(jq -r '.checks_state' <<<"$out")"
+eq "drained rollup reports nothing else pending" false "$(jq -r '.checks_pending_excl_self' <<<"$out")"
+
+# A page-2 read that FAILS must leave the record's hasNextPage set — the honest ungraded
+# outcome — never a grade computed from page 1 alone.
+out="$(FAILPAGE=1 paged_pr --self-run-id 999)"
+eq "a failed rollup page stays UNKNOWN, never a partial grade" unknown "$(jq -r '.risk.status' <<<"$out")"
+
+# A cursor that repeats would spin until the page guard; it must stop and stay unknown.
+jq '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo
+      = {"hasNextPage":true,"endCursor":"C1"}' "$SANDBOX/page2.json" > "$SANDBOX/page2stuck.json"
+out="$(PAGE2=page2stuck.json paged_pr --self-run-id 999)"
+eq "a non-advancing cursor stops and stays UNKNOWN" unknown "$(jq -r '.risk.status' <<<"$out")"
+
+# The page guard is a runaway bound, not a policy: past it the PR stays ungraded rather than
+# being graded off the pages that fit.
+out="$(PR_RISK_MAX_ROLLUP_PAGES=0 paged_pr --self-run-id 999)"
+eq "a rollup past the page guard stays UNKNOWN" unknown "$(jq -r '.risk.status' <<<"$out")"
+
+# A PR with NO checks at all has a null statusCheckRollup. Assigning into a null CREATES the
+# object in jq, so an unguarded splice would turn "no rollup" into "an empty rollup" and route
+# it away from the branch that treats a checkless PR as readable. Pagination must not run here.
+jq '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup = null' \
+  "$SANDBOX/page1.json" > "$SANDBOX/page1norollup.json"
+cp "$SANDBOX/page1norollup.json" "$SANDBOX/page1.json"
+out="$(paged_pr --self-run-id 999)"
+eq "a PR with no checks is untouched by the drain" ok "$(jq -r '.checks_status // "ok"' <<<"$out")"
+eq "and still grades" ok "$(jq -r '.risk.status' <<<"$out")"
+
 echo
 echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]
