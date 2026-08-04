@@ -15,12 +15,16 @@ on:
   pull_request:
     paths:
       - '.github/groom/**'
+      # interval.py pins the finder's agent step NAME against this workflow
+      # (BE-4809), so a rename there must run these tests too.
       - '.github/workflows/groom.yml'
       - '.github/workflows/test-groom-scripts.yml'
   push:
     branches: [main]
     paths:
       - '.github/groom/**'
+      # interval.py pins the finder's agent step NAME against this workflow
+      # (BE-4809), so a rename there must run these tests too.
       - '.github/workflows/groom.yml'
       - '.github/workflows/test-groom-scripts.yml'
 
@@ -33,14 +37,37 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
 
       - name: Run groom ledger unit tests
         run: python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
+
+  # Deterministic proofs of the agent-sandbox.sh confinement contract and the
+  # broker.mjs credential proxy (BE-4302, phase 1). No claude, no API key, no
+  # spend — every property is asserted with `bash -c` as the sandboxed command.
+  # Runs here (a PR-gating test workflow), NOT in ci-groom.yml: ci-groom.yml is the
+  # scheduled groom CALLER that deliberately never fires on a PR, so a job there
+  # could never be seen green on this change. shellcheck (repo convention) + node +
+  # openssl + curl are preinstalled on ubuntu-latest; the wrapper's preflight
+  # installs bubblewrap + the AppArmor profile the runner image needs.
+  sandbox-tests:
+    name: sandbox-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Shellcheck the sandbox scripts
+        run: shellcheck -x .github/groom/agent-sandbox.sh .github/groom/tests/sandbox-tests.sh
+
+      - name: Prove sandbox confinement + broker proxy (no API spend)
+        run: bash .github/groom/tests/sandbox-tests.sh

@@ -1,0 +1,76 @@
+# CONTRACT: this is one of THIS repo's own path-filtered script tests, NOT a reusable
+# workflow. It is not callable and has no caller pattern:
+#   TRIGGERS — `pull_request` and `push` to main, both filtered to scripts/pr-risk/**
+#              and this file. A change elsewhere in the repo does not run it.
+#   INPUTS   — none (no `workflow_call`, no `workflow_dispatch`).
+#   SECRETS  — none. Read-only `contents: read`; the suites are hermetic and make no
+#              network call (the live-PR path stubs `gh` on PATH with a fixture).
+# The reusable workflow these scripts back is .github/workflows/pr-risk.yml — that is
+# the file with the inputs/secrets/caller-pattern header.
+
+name: Test pr-risk scripts
+
+# Runs the hermetic test suites (+ shellcheck) for the grader and label-sync
+# scripts behind pr-risk.yml. The grader stamps an advisory risk tier on every
+# consumer repo's PRs, so a grading regression silently mislabels PRs org-wide
+# — cheap to guard with a unit run on change. No network: the suites feed the
+# grader synthetic records and stub `gh` for the live-PR path.
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/pr-risk/**'
+      - '.github/workflows/test-pr-risk.yml'
+      # pr-risk.yml passes the scripts their whole input contract through env, so a change
+      # to it can break the suites without touching a file under scripts/pr-risk/.
+      - '.github/workflows/pr-risk.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/pr-risk/**'
+      - '.github/workflows/test-pr-risk.yml'
+      - '.github/workflows/pr-risk.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: shellcheck + suites
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: scripts/pr-risk
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: shellcheck
+        run: shellcheck -x grade-pr-risk.sh apply-risk-label.sh grade-targets.sh resolve-enabled.sh tests/test_grade_pr_risk.sh tests/test_apply_risk_label.sh tests/test_grade_targets.sh tests/test_resolve_enabled.sh
+
+      - name: default map + registry parse and validate
+        # The shipped defaults must pass the grader's own structural validation:
+        # a malformed default would fail every consumer at once.
+        run: |
+          bash -c 'source ./grade-pr-risk.sh; read_map risk-map.v0.json map >/dev/null && read_map runbook-registry.v0.json runbooks >/dev/null'
+          echo "defaults validate"
+
+      - name: grader suite
+        run: bash tests/test_grade_pr_risk.sh
+
+      - name: label suite
+        run: bash tests/test_apply_risk_label.sh
+
+      - name: targets suite
+        # The orchestration layer behind pr-risk.yml: base-ref resolution, the per-repo override
+        # contract, the settle poll, per-target failure isolation. Hermetic — `gh` is stubbed and
+        # every call it receives is logged, so the suite asserts on which requests were made.
+        run: bash tests/test_grade_targets.sh
+
+      - name: enablement suite
+        # The `enabled` switch: that `vars.RISK_CONFIG` outranks the reviewed input in BOTH
+        # directions, and that a malformed variable degrades to the reviewed value rather than
+        # to off — a typo must never be indistinguishable from a deliberate shutdown.
+        run: bash tests/test_resolve_enabled.sh

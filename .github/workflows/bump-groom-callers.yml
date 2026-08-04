@@ -15,9 +15,12 @@ name: Bump groom callers
 # reusable TWICE — the `uses:` SHA and the `workflows_ref:` input that loads the
 # finder/verifier/builder briefs + the dedup ledger. Those two must stay in
 # lock-step or a run executes one version's workflow against another version's
-# briefs. bump-callers.sh rewrites both (its rewrite matches the `uses:` line and
-# any bare `workflows_ref:` line), so the fleet cannot drift into that split
-# state by hand-bumping only one of them.
+# briefs. bump-callers.sh rewrites both — it targets the pin TOKEN
+# (`Comfy-Org/github-workflows…@<ref>` and the `workflows_ref:` key), so the ref's
+# shape does not matter and both halves move whatever they are pinned to — and it
+# then asserts every pin in the file reached the new SHA before staging it. So the
+# fleet cannot drift into that split state by hand-bumping only one of them, nor
+# ship a half-bumped caller (BE-4662).
 #
 # The caller list is NOT hardcoded here. This repo is PUBLIC (workflow file and
 # Actions run logs are both publicly viewable) and callers may be private, so
@@ -77,12 +80,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
       - name: Generate Cloud Code Bot token
-        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0 — pinned: see dependabot.yml ignore (v2+ breaks cross-repo `owner:` token scoping)
         id: token
         with:
           app-id: ${{ vars.APP_ID }}
@@ -127,7 +130,20 @@ jobs:
           # that run's original (now stale) commit, and the bumper would
           # force-repin every caller to it. Only act from the current tip —
           # any newer push has its own queued run that does the bump.
-          main_tip=$(git ls-remote origin refs/heads/main | cut -f1)
+          # Don't pipe into `cut`: the pipeline would report cut's status, so a
+          # failed ls-remote (network blip, remote hiccup) yields an EMPTY
+          # main_tip that then compares unequal to github.sha and silently
+          # no-ops the whole fleet bump as if the run were stale. A lookup we
+          # couldn't perform is not evidence of staleness — fail loudly.
+          if ! ls_remote=$(git ls-remote origin refs/heads/main); then
+            echo "::error::Could not look up the current main tip (git ls-remote failed)"
+            exit 1
+          fi
+          main_tip=${ls_remote%%$'\t'*}
+          if [[ -z "$main_tip" ]]; then
+            echo "::error::git ls-remote returned no SHA for refs/heads/main"
+            exit 1
+          fi
           if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
             echo "github.sha $GITHUB_SHA is not the current main tip ($main_tip) — stale run/re-run; nothing to bump"
             exit 0
