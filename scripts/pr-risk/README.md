@@ -62,6 +62,15 @@ Two CI-specific mechanics worth knowing:
   one. Enroll pr-risk as its **own workflow** rather than a job inside an
   existing CI workflow — a job sharing a run with the rest of CI excludes its
   siblings too, and lands on the honest R2 floor instead of a full rollup.
+- **A caller grants the UNION of every job's `permissions:`, including jobs it
+  will never run.** GitHub validates each nested job's *declaration* against the
+  caller's block at startup, before any job `if:` is evaluated, so `checks:
+  write` — declared by the `publish-check` job — is required of every caller
+  whatever `check_run` is set to. Leaving `check_run` false skips the job and
+  publishes nothing; it does not excuse the grant. **Moving an existing pin onto
+  a version that added a job? Add its permission in the same PR** — a bump alone
+  fails the caller's next run at startup with an opaque "workflow file issue".
+  The copy-paste block lives in [`pr-risk.yml`](../../.github/workflows/pr-risk.yml)'s header.
 - **The label is applied with the plain `GITHUB_TOKEN`**, which cannot fire
   `labeled` triggers — the shadow check is structurally unable to start a
   workflow cascade. Later phases that WANT label-triggered routing switch to an

@@ -470,7 +470,7 @@ fetch_pr_record() { # <repo> <num> -> record JSON on stdout, rc 1 on an unreadab
     author{ login } authorAssociation baseRefName headRefName isCrossRepository
     additions deletions changedFiles
     labels(first:100){ pageInfo{ hasNextPage } nodes{ name } }
-    commits(last:1){ nodes{ commit{ statusCheckRollup{ state
+    commits(last:1){ nodes{ commit{ oid statusCheckRollup{ state
       contexts(first:100){ '"$ctxsel"' } } } } }
   } } }'
   # shellcheck disable=SC2016  # GraphQL: $vars are query variables
@@ -619,6 +619,11 @@ fetch_pr_record() { # <repo> <num> -> record JSON on stdout, rc 1 on an unreadab
        labels_status:(if $labels_trunc then "unknown" else "ok" end),
        created_at:.createdAt, updated_at:.updatedAt, closed_at:.closedAt, merged_at:.mergedAt,
        base_ref:.baseRefName, head_ref:.headRefName, is_draft:.isDraft,
+       # THE COMMIT THIS GRADE IS ABOUT. Recorded so a publish surface attaches the grade to the
+       # commit whose rollup and file list produced it, rather than re-reading "head" one job
+       # later: grading waits out the rollup settle, so a push inside that window would otherwise
+       # stamp the tier of the PREVIOUS commit onto a new head as an immutable Check Run.
+       head_sha:(.commits.nodes[0].commit.oid // null),
        additions:.additions, deletions:.deletions, changed_files:.changedFiles,
        # The status twins the fleet collector emits, so a live grade and a corpus grade of the
        # same PR read the same fields. checks_status is `unknown` only when the context list

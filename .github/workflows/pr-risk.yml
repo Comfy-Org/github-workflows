@@ -164,7 +164,13 @@ name: PR Risk Grade (reusable)
 #         pull-requests: write  # the label write itself — labeling a PR rides the
 #                               # pull-requests permission, not issues (the labels
 #                               # endpoint is dual-mapped by what the "issue" is)
-#         checks: read          # the check rollup the reversibility axis reads
+#         checks: write         # REQUIRED OF EVERY CALLER, opted into `check_run` or not — see
+#                               # GRANT ALL SEVEN below. The `publish-check` job DECLARES
+#                               # `checks: write`, and GitHub validates every nested job's
+#                               # declaration against this block at STARTUP; a job `if:` cannot
+#                               # save a short grant, because nothing has run yet when the check
+#                               # is made. Only the grade job's own `checks: read` (the rollup
+#                               # the reversibility axis reads) is used unless `check_run: true`.
 #         actions: read         # the rollup query walks CheckRun -> checkSuite ->
 #                               # workflowRun (an Actions resource) for self-exclusion
 #         statuses: read
@@ -196,13 +202,22 @@ name: PR Risk Grade (reusable)
 # enroller. What this workflow CAN do, and does, is refuse to be a silent no-op once it is
 # actually reached: a run with no resolvable target fails with a message naming both inputs.
 #
-# GRANT ALL SIX OR THE RUN NEVER STARTS. A reusable workflow can only NARROW the caller's
-# token, never elevate it, so a caller whose block is short of what the `grade` job declares is
-# rejected by GitHub before any step executes ("is requesting 'pull-requests: write', but is
-# only allowed 'pull-requests: read'") — the check goes red with no grade, and the PR keeps
+# GRANT ALL SEVEN OR THE RUN NEVER STARTS. A reusable workflow can only NARROW the caller's
+# token, never elevate it, so a caller whose block is short of what ANY of this workflow's jobs
+# declares is rejected by GitHub before any step executes ("is requesting 'pull-requests: write',
+# but is only allowed 'pull-requests: read'") — the check goes red with no grade, and the PR keeps
 # whatever label the previous push left rather than degrading to `risk:ungraded`. Copy the
 # block above verbatim when you enroll, and re-check it against this header whenever you move
 # the SHA pin.
+#
+# THE UNION INCLUDES JOBS THAT NEVER RUN. GitHub checks the DECLARATION on every nested job at
+# startup, not the set of jobs that actually get scheduled, so `checks: write` is required even
+# from a caller leaving `check_run` false and skipping the `publish-check` job entirely. An `if:`
+# is a runtime condition and nothing has run yet when the grant is validated. This is the same
+# union rule groom.yml documents, learned the same way: a short grant fails the whole run with an
+# opaque "workflow file issue" and no job-level detail. IF YOU ARE MOVING AN EXISTING PIN ONTO
+# THIS COMMIT, ADD `checks: write` TO THE CALLER IN THE SAME PR — a pin bump alone will fail the
+# caller's next run at startup.
 
 on:
   workflow_call:
@@ -313,12 +328,14 @@ on:
           even if a repo later marks it required.
 
 
-          DEFAULTS TO FALSE, and switching it on REQUIRES ONE EXTRA LINE IN THE CALLER: a
-          `publish-check` job runs with `checks: write`, so the caller's `permissions:` block
-          needs that grant. It is a SEPARATE job precisely so this stays opt-in — raising the
-          grade job's own `checks: read` to `checks: write` would have been rejected for every
-          already-enrolled caller before any step ran. With the input false the job is skipped
-          and nothing about an existing caller changes.
+          DEFAULTS TO FALSE — but the `checks: write` it needs is REQUIRED OF EVERY CALLER
+          REGARDLESS, because the `publish-check` job declares it and GitHub validates every
+          nested job's declaration against the caller's block at STARTUP, before any `if:` is
+          evaluated. Leaving this false skips the job and publishes nothing; it does NOT excuse
+          the grant. A caller moving its pin onto this version must add `checks: write` in the
+          same PR or its next run fails before a step executes. The separate job still earns its
+          keep: it is the only place `checks: write` is ever HELD, and it reads nothing from a
+          pull request, so no PR-controlled text is ever rendered under the elevated token.
         type: boolean
         required: false
         default: false
@@ -775,10 +792,14 @@ jobs:
   # text is interpreted here — the two-job split BE-5508 asked for, adopted for exactly the reason
   # rendering PR-authored paths into a bot-authored artifact makes it worth having.
   #
-  # It is also what keeps `check_run` genuinely opt-in. A reusable workflow can only NARROW the
-  # caller's token, so raising the GRADE job's `checks: read` to `checks: write` would have been
-  # rejected — before any step ran — for every caller already enrolled with the reviewed block in
-  # this file's header. Skipped when the input is false, so those callers are untouched.
+  # THE GRANT IS NOT OPTIONAL EVEN THOUGH THE BEHAVIOUR IS. GitHub validates a nested job's
+  # declared `permissions:` against the caller's block at startup, so this `checks: write` is
+  # required of every caller whatever `check_run` is set to — the `if:` below decides whether a
+  # check is PUBLISHED, not whether the grant is CHECKED. The header's caller block carries it,
+  # and enrolling or re-pinning without it fails the run before any step executes.
+  #
+  # Keeping it in its OWN job is still what limits the blast radius: `checks: write` is held here
+  # and nowhere else, and the grade job — the one that reads pull requests — keeps `checks: read`.
   publish-check:
     needs: [gate, grade]
     if: needs.gate.outputs.enabled == 'true' && inputs.check_run && !cancelled()
@@ -809,9 +830,20 @@ jobs:
           for i in $(seq 0 $(( n - 1 ))); do
             one="$(jq -c ".[$i]" <<<"$SURFACES")"
             pr="$(jq -r '.pr' <<<"$one")"
-            sha="$(gh api "repos/${REPO}/pulls/${pr}" --jq '.head.sha' 2>/dev/null)" || sha=""
+            # THE GRADED COMMIT, carried in the payload — not "head as of now". The grade job
+            # waits out the check rollup (up to `wait_for_checks_minutes`) and this is a whole
+            # further job, so re-reading head here would stamp the tier of the PREVIOUS commit
+            # onto a new head as an immutable, timestamped Check Run — misattributing the grade
+            # in the one artifact whose value is being a trustworthy commit-attached record. A
+            # push inside that window gets its own grade and its own check.
+            sha="$(jq -r '.sha // empty' <<<"$one")"
             if [ -z "$sha" ] || [ "$sha" = null ]; then
-              echo "::warning::could not read the head sha of ${REPO}#${pr} — no Check Run was created for it"
+              # Only a record with no graded oid (an ungradable PR) lands here: that verdict is
+              # about the PR rather than about any one commit, so head is the honest anchor.
+              sha="$(gh api "repos/${REPO}/pulls/${pr}" --jq '.head.sha' 2>/dev/null)" || sha=""
+            fi
+            if [ -z "$sha" ] || [ "$sha" = null ]; then
+              echo "::warning::could not resolve a commit for ${REPO}#${pr} — no Check Run was created for it"
               rc=1; continue
             fi
             # `conclusion: neutral` is hardcoded. Nothing in this workflow may emit

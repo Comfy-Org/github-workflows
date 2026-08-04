@@ -33,13 +33,19 @@ source "$SCRIPT"
 
 record() { # <tier> <floor> <files-json> [prov-tier] [rev-tier] -> a graded record file
   local tier="$1" floor="$2" files="$3" prov="${4:-R1}" rev="${5:-R1}"
-  local f="$SANDBOX/rec-$RANDOM.json"
-  jq -n --arg t "$tier" --arg fl "$floor" --argjson files "$files" --arg p "$prov" --arg rv "$rev" '
+  local f="$SANDBOX/rec-$RANDOM.json" ff="$SANDBOX/files-$RANDOM.json"
+  # The files array goes in via a FILE, not --argjson. Linux caps a single argv entry at 128KiB
+  # (MAX_ARG_STRLEN) regardless of the much larger total ARG_MAX, so the bounded-body fixture below
+  # (~170KiB of paths) makes `jq --argjson` die with "Argument list too long" on CI while passing
+  # on macOS, which has no per-argument cap. Reading it from disk is limit-free on both.
+  printf '%s' "$files" > "$ff"
+  jq -n --arg t "$tier" --arg fl "$floor" --slurpfile files "$ff" --arg p "$prov" --arg rv "$rev" '
     {pr:7, risk:{map_version:"v0-generic", registry_version:"v0", tier:$t, status:"ok",
       reason:"worst of path_floor=\($fl), provenance=\($p), reversibility=\($rv)",
-      axes:{path_floor:{tier:$fl, status:"ok", reason:"matched things", classes:["x"], files:$files},
+      axes:{path_floor:{tier:$fl, status:"ok", reason:"matched things", classes:["x"], files:$files[0]},
             provenance:{tier:$p, status:"ok", reason:"human"},
-            reversibility:{tier:$rv, status:"ok", reason:"checks green but the diff touches no test file"}}}}' > "$f"
+            reversibility:{tier:$rv, status:"ok", reason:"checks green but the diff touches no test file"}}}}' > "$f" \
+    || printf 'FATAL: record() could not build %s\n' "$f" >&2
   printf '%s' "$f"
 }
 file_entry() { jq -n --arg p "$1" --arg t "$2" --argjson a "$3" --argjson d "$4" \
@@ -134,7 +140,12 @@ echo "— the body is BOUNDED under GitHub's 65536-char comment limit (measured,
 deep="$(printf 'src/%.0s' $(seq 1 60))deeply/nested/path/component/that/keeps/going/and/going/file"
 manyfiles="$(jq -nc --arg d "$deep" '[range(0;400) | {path:($d + "-\(.).go"), previous_path:null,
              additions:(. + 3), deletions:1, change_type:"MODIFIED", tier:"R3", classes:["cls"]}]')"
-bigbody="$(render_surfaces "$(record R3 R3 "$manyfiles")" 0 | jq -r '.comment_body')"
+bigrec="$(record R3 R3 "$manyfiles")"
+# Pin the FIXTURE before asserting on the body: a record that failed to build renders the short
+# "unknown" body, which would sail under the limit and pass the size check for the wrong reason.
+eq "the oversized fixture really carries 400 files" "400" \
+   "$(jq '.risk.axes.path_floor.files | length' "$bigrec" 2>/dev/null)"
+bigbody="$(render_surfaces "$bigrec" 0 | jq -r '.comment_body')"
 n="${#bigbody}"
 if [ "$n" -lt 65536 ]; then ok "400 long deeply-nested paths render in ${n} chars (< 65536)"
 else bad "400 long deeply-nested paths render under 65536 chars" "$n"; fi
@@ -222,6 +233,131 @@ echo "— RENDER_ONLY writes nothing and emits the surfaces object —"
 outj="$(RECORD="$r" RENDER_ONLY=1 PATH="$SANDBOX/bin:$PATH" bash "$SCRIPT" 2>/dev/null)"
 eq "RENDER_ONLY emits a check title" "Risk: R1" "$(jq -r '.check_title' <<<"$outj")"
 eq "…and a comment body" "true" "$(jq -r '(.comment_body | length) > 100' <<<"$outj")"
+
+echo "— A FAILED READ WRITES NOTHING. Both reads are load-bearing —"
+# `rc=1` alone is not enough: control used to fall through to the create/clear branches. A failed
+# LIST then POSTed a SECOND sticky (and every later failure another, breaking "N pushes, one
+# comment" on exactly the transient class a 50-target backfill makes likely), and a failed RE-READ
+# rewrote the body with the box cleared AND removed the dispute label — permanently erasing a
+# registered reviewer disagreement on nothing worse than a 500.
+: > "$GH_LOG"; printf '[]\n' > "$LABELS"
+cat > "$SANDBOX/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$GH_LOG"
+case "$*" in
+  *issues/7/comments*) echo "gh: upstream is unavailable (HTTP 500)" >&2; exit 1 ;;
+  *labels*)            cat "$LABELS"; exit 0 ;;
+esac
+exit 0
+STUB
+chmod +x "$SANDBOX/bin/gh"
+out="$(PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 RECORD="$r" \
+        PUBLISH_COMMENT=1 bash "$SCRIPT" 2>&1)"; rc=$?
+eq "a failed comment LIST still exits 0 (advisory)" 0 "$rc"
+hasnt "$(cat "$GH_LOG")" "-X " "…and issues NO write at all — a blind create is a DUPLICATE"
+has "$out" "DUPLICATE" "…and names that as the reason nothing was written"
+# ERRF is initialised once at startup, not lazily inside `ghq`: most ghq calls sit in a command
+# substitution, so a lazy init set it in the SUBSHELL and every gherr in a warning printed
+# nothing — hiding whether the failure was auth, throttling or transport.
+has "$out" "HTTP 500" "…and the warning carries gh's own stderr (ERRF survives the subshell)"
+
+# Now the sticky EXISTS and its box is TICKED, but the re-read by id fails.
+: > "$GH_LOG"
+jq -n --arg m "$STICKY_MARKER" '[{id:99, user:{type:"Bot", login:"github-actions[bot]"}, body:($m + "\nx")}]' > "$COMMENTS"
+printf '%s\n' "$DISPUTE_LABEL" > "$LABELS"
+cat > "$SANDBOX/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$GH_LOG"
+case "$*" in
+  *issues/comments/*)  echo "gh: bad gateway (HTTP 502)" >&2; exit 1 ;;   # the re-read by id
+  *labels*)            cat "$LABELS"; exit 0 ;;
+  *comments*)          cat "$COMMENTS"; exit 0 ;;
+esac
+exit 0
+STUB
+chmod +x "$SANDBOX/bin/gh"
+out="$(PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 RECORD="$r" \
+        PUBLISH_COMMENT=1 bash "$SCRIPT" 2>&1)"; rc=$?
+eq "a failed dispute RE-READ still exits 0" 0 "$rc"
+hasnt "$(cat "$GH_LOG")" "-X PATCH" "…and does NOT rewrite the body with the box cleared"
+hasnt "$(cat "$GH_LOG")" "-X DELETE" "…and does NOT strip the dispute label it cannot verify"
+has "$out" "UNKNOWN" "…and reports the dispute state as unknown rather than unticked"
+
+echo "— the comment scan runs BACKWARDS from the last page —"
+# `sort=created&direction=desc` was never a parameter of GET /issues/{n}/comments (those belong to
+# the repo-wide /issues/comments route) and GitHub ignores unknown query params, so the listing is
+# always OLDEST-first. Our sticky is at the END: the scan has to start there or the page bound is
+# unrecoverable on a chatty PR.
+: > "$GH_LOG"
+printf '%s\n\n- [ ] %s — x\n' "$STICKY_MARKER" "$DISPUTE_TEXT" > "$CBODY"
+printf '[]\n' > "$LABELS"
+cat > "$SANDBOX/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$GH_LOG"
+case "$*" in
+  *--silent*)         printf 'HTTP/2.0 200 OK\r\nlink: <https://api.github.com/x?per_page=100&page=2>; rel="next", <https://api.github.com/x?per_page=100&page=3>; rel="last"\r\n\r\n'; exit 0 ;;
+  *page=3*)           cat "$COMMENTS"; exit 0 ;;
+  *issues/comments/*) cat "$CBODY"; exit 0 ;;
+  *labels*)           cat "$LABELS"; exit 0 ;;
+  *comments*)         echo '[]'; exit 0 ;;
+esac
+exit 0
+STUB
+chmod +x "$SANDBOX/bin/gh"
+out="$(PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 RECORD="$r" \
+        PUBLISH_COMMENT=1 bash "$SCRIPT" 2>&1)"
+has "$out" "updated the sticky comment (99)" "a sticky on the LAST page is found and UPDATED"
+has "$(cat "$GH_LOG")" "page=3" "…because page 3 was the first page fetched"
+# `&page=1` anchored at end-of-line: `per_page=100` contains the substring "page=1", and the
+# header-only probe legitimately asks for page 1.
+if grep -v -- '--silent' "$GH_LOG" | grep -Eq '&page=1$'
+then bad "…and page 1 was never walked forwards" "$(tr '\n' '|' < "$GH_LOG")"
+else ok "…and page 1 was never walked forwards"; fi
+
+echo "— the Check Run attaches to the GRADED commit, not to head-as-of-now —"
+# The grade job waits out the rollup settle and the publish is a whole further job, so re-reading
+# head here stamps the PREVIOUS commit's tier onto a new head — in the one artifact whose value is
+# being an immutable, correctly-attributed commit record.
+export CHECKBODY="$SANDBOX/checkbody.json"
+rsha="$SANDBOX/rec-graded-sha.json"
+jq '. + {head_sha:"9999999999999999999999999999999999999999"}' "$r" > "$rsha"
+: > "$GH_LOG"
+cat > "$SANDBOX/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$GH_LOG"
+case "$*" in
+  *check-runs*) cat > "$CHECKBODY"; exit 0 ;;
+  *pulls/*)     echo "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; exit 0 ;;
+esac
+exit 0
+STUB
+chmod +x "$SANDBOX/bin/gh"
+PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 RECORD="$rsha" \
+  PUBLISH_CHECK=1 bash "$SCRIPT" >/dev/null 2>&1
+eq "the check is posted on the graded sha" \
+   "9999999999999999999999999999999999999999" "$(jq -r '.head_sha' "$CHECKBODY" 2>/dev/null)"
+hasnt "$(cat "$GH_LOG")" "pulls/" "…and head is never re-read when the record names its commit"
+eq "…and the conclusion is still hardcoded neutral" neutral "$(jq -r '.conclusion' "$CHECKBODY" 2>/dev/null)"
+# A record with NO graded oid (an ungradable PR) still gets a check — that verdict is about the
+# PR, not about a commit, so head is the honest anchor there.
+: > "$GH_LOG"
+PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 RECORD="$r" \
+  PUBLISH_CHECK=1 bash "$SCRIPT" >/dev/null 2>&1
+eq "a record with no graded sha falls back to the API head" \
+   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$(jq -r '.head_sha' "$CHECKBODY" 2>/dev/null)"
+
+echo "— a TRUNCATED body is still well-formed markdown —"
+# The backstop re-appends the footer so a cut body still carries the checkbox. It has to close the
+# `<details>` the graded branch opened too, or that checkbox renders INSIDE the collapsed section.
+# shellcheck disable=SC2034  # read by render_surfaces in the SOURCED publisher, not here
+COMMENT_MAX_CHARS=900
+tbody="$(render_surfaces "$bigrec" 0 | jq -r '.comment_body')"
+# shellcheck disable=SC2034  # restored so any later assertion renders against the real bound
+COMMENT_MAX_CHARS=65000
+has "$tbody" "(truncated" "the backstop fires when everything else fails to fit"
+has "$tbody" "- [ ] $DISPUTE_TEXT" "…and the truncated body STILL carries the checkbox"
+eq "…and every <details> it opened is closed" \
+   "$(grep -c '<details>' <<<"$tbody")" "$(grep -c '</details>' <<<"$tbody")"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -118,10 +118,13 @@ COMMENT_MAX_CHARS=65000
 # GitHub's own caps on the Check Run output fields.
 CHECK_TITLE_MAX=255
 CHECK_SUMMARY_MAX=65535
-# Bounded scan for our own comment. 10 pages x 100 is plenty, and the scan is NEWEST-FIRST so a
-# comment we created is found on page 1 from then on: ascending order made the bound
-# unrecoverable, because on a very chatty PR the sticky sits past the cap, every re-grade POSTs a
-# fresh one that ALSO lands past the cap, and each new body resets the reviewer's tick.
+# Bounded scan for our own comment: at most this many pages of 100, walked from the LAST page
+# BACKWARDS. The order matters and cannot be asked for: `GET /issues/{n}/comments` takes only
+# `since`/`per_page`/`page` — `sort`/`direction` belong to the repo-wide `/issues/comments` route
+# and are silently ignored here — so the listing is always OLDEST-FIRST. Scanning it forwards made
+# the bound unrecoverable: on a very chatty PR the sticky sits past the cap, every re-grade POSTs a
+# fresh one that ALSO lands past the cap, and each new body resets the reviewer's tick. Our sticky
+# is the comment we posted, so walking back from the end finds it on the first page tried.
 STICKY_MAX_PAGES="${STICKY_MAX_PAGES:-10}"
 
 log()  { printf '[publish-risk-surfaces] %s\n' "$*" >&2; }
@@ -268,8 +271,12 @@ cat <<'JQ'
     # length-capped, so this should never fire — but "the comment always fits" has to hold on
     # every branch or the 422 it exists to prevent returns through whichever one the estimate
     # missed, and a 422 leaves the label fresh and the comment stale on every future re-grade.
+    # The cut lands mid-table, INSIDE the `<details>` the graded branch opened, so the footer has
+    # to close it — otherwise the dispute checkbox this script parses back renders swallowed by
+    # the collapsed section instead of below it. The ungraded branch never opens one.
     | (if ($body0 | length) <= $max then $body0
-       else (("\n" + (["", "_(truncated — the full grade is in the Check Run and the step summary.)_"] + $tail | join("\n")))) as $footer
+       else (("\n" + (["", "_(truncated — the full grade is in the Check Run and the step summary.)_"]
+                      + (if $graded then ["", "</details>"] else [] end) + $tail | join("\n")))) as $footer
             | ($body0[0:($max - ($footer | length) - 1)] + $footer + "\n")
        end) as $comment_body
 
@@ -313,12 +320,31 @@ allowed_logins() {
   printf '%s' "$STICKY_LOGINS" | tr ',' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep . || true
 }
 
-# find_sticky -> the comment id on stdout (empty when there is none), rc 1 on a read failure
+# sticky_last_page -> the highest page number of the comment listing (1 when there is only one).
+# Read from the Link header rather than assumed, because the listing has no way to ask for
+# newest-first and the sticky is always at the END of it.
+sticky_last_page() {
+  local hdr n
+  # `-i --silent` = headers only: this call exists purely for `Link: …rel="last"`.
+  hdr="$(ghq api -i --silent "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100&page=1")" || return 1
+  n="$(printf '%s' "$hdr" | tr -d '\r' | grep -i '^link:' \
+       | tr ',' '\n' | sed -n 's/.*[?&]page=\([0-9][0-9]*\)>[[:space:]]*;[[:space:]]*rel="last".*/\1/p' | head -n 1)"
+  case "$n" in ''|*[!0-9]*) n=1 ;; esac
+  printf '%s' "$n"
+}
+
+# find_sticky -> the comment id on stdout (empty when there is none), rc 1 on a read failure.
+# rc 1 means WE DO NOT KNOW whether a sticky exists — the caller must not fall through to the
+# create branch on it, or every transient list failure POSTs another comment with the tick reset.
 find_sticky() {
-  local page=1 body allow id
+  local page last floor body allow id
   allow="$(allowed_logins | jq -Rsc 'split("\n") | map(select(length > 0))')"
-  while [ "$page" -le "$STICKY_MAX_PAGES" ]; do
-    body="$(ghq api "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100&page=${page}&sort=created&direction=desc")" \
+  last="$(sticky_last_page)" \
+    || { warn "could not list comments on $REPO#$PR_NUMBER: $(gherr)"; return 1; }
+  page="$last"
+  floor=$(( last - STICKY_MAX_PAGES + 1 )); [ "$floor" -ge 1 ] || floor=1
+  while [ "$page" -ge "$floor" ]; do
+    body="$(ghq api "repos/$REPO/issues/$PR_NUMBER/comments?per_page=100&page=${page}")" \
       || { warn "could not list comments on $REPO#$PR_NUMBER: $(gherr)"; return 1; }
     # Our body is rendered with the marker as its FIRST line. A bot that QUOTES the sticky
     # comment carries the marker too, nested inside its own prose — which login matching alone
@@ -331,23 +357,27 @@ find_sticky() {
                   # captured comment — `.user.login` here would index the allow-list array.
                   | select(($allow | index($c.user.login // "")) != null)
                   | select(((.body // "") | startswith($m)))
-                  | .id ] | first // empty' <<<"$body")" || return 1
+                  | .id ] | last // empty' <<<"$body")" || return 1
     [ -z "$id" ] || { printf '%s' "$id"; return 0; }
-    [ "$(jq 'length' <<<"$body")" -eq 100 ] || return 0
-    page=$(( page + 1 ))
+    page=$(( page - 1 ))
   done
   return 0
 }
 
-# comment_is_disputed <comment-id> -> rc 0 when the checkbox is ticked.
+# comment_is_disputed <comment-id> -> rc 0 = ticked, rc 1 = definitely unticked, rc 2 = UNKNOWN.
 # Re-read by id IMMEDIATELY before the write rather than reused from the paginated scan: that
 # does not make the update atomic (GitHub offers no conditional comment update) but it shrinks
 # the window in which a reviewer's tick can be overwritten from the whole scan to one round trip.
+#
+# THE THIRD OUTCOME IS THE POINT. Folding a failed re-read into "unticked" is not a conservative
+# default here, it is destructive: the body would be PATCHed back to `- [ ]` and the dispute label
+# actively REMOVED, permanently erasing a registered disagreement on nothing worse than a 500 —
+# the exact outcome this file's header promises cannot happen. On rc 2 the caller writes nothing.
 comment_is_disputed() {
   local id="$1" body
   body="$(ghq api "repos/$REPO/issues/comments/${id}" --jq '.body // ""')" || {
-    warn "could not re-read comment ${id} on $REPO#$PR_NUMBER: $(gherr) — treating the checkbox as unticked"
-    return 1
+    warn "could not re-read comment ${id} on $REPO#$PR_NUMBER: $(gherr) — the dispute state is UNKNOWN, so the comment and the label are left exactly as they are"
+    return 2
   }
   grep -Eq "$CHECKED_RE" <<<"$body"
 }
@@ -416,37 +446,76 @@ main() {
   [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || die "bad PR_NUMBER '$PR_NUMBER'"
   [ "$DRY_RUN" = 1 ] || command -v gh >/dev/null 2>&1 || die "gh not found on PATH"
 
+  # ONCE, HERE — not lazily inside `ghq`. Most `ghq` calls sit inside a command substitution
+  # (`id="$(find_sticky)"`, `current="$(ghq api …)"`), so a lazy init sets ERRF in the SUBSHELL and
+  # the enclosing scope keeps the empty default. Every `gherr` in the failure warnings then
+  # interpolated nothing, hiding whether a failure was auth, throttling or transport — on exactly
+  # the warnings an operator has to act on.
+  init_scratch
+
   local rc=0
 
   if [ "$PUBLISH_COMMENT" = 1 ]; then
-    local id="" disputed=0 surfaces body
-    id="$(find_sticky)" || rc=1
-    if [ -n "$id" ] && comment_is_disputed "$id"; then disputed=1; fi
-    surfaces="$(render_surfaces "$RECORD" "$disputed")" || { warn "the surfaces could not be rendered"; surfaces=""; }
-    if [ -z "$surfaces" ]; then
+    local id="" disputed=0 surfaces body find_rc=0 dis_rc=0
+    # A READ FAILURE IS NOT "THERE IS NO COMMENT". Both reads below are load-bearing: falling
+    # through on a failed LIST posts a second sticky (and every later failure another), and
+    # falling through on a failed RE-READ rewrites the body with the box cleared and strips the
+    # dispute label. Either turns a transient 5xx into permanent damage to the one signal this
+    # surface exists to collect, so an unknown state means WRITE NOTHING and say so.
+    id="$(find_sticky)" || find_rc=1
+    if [ "$find_rc" -ne 0 ]; then
+      warn "the sticky comment could not be looked up on $REPO#$PR_NUMBER — nothing was written (a blind create would post a DUPLICATE and reset the dispute checkbox)"
       rc=1
     else
-      body="$(jq -r '.comment_body' <<<"$surfaces")"
-      if [ "$DRY_RUN" = 1 ]; then
-        log "DRY RUN — would $( [ -n "$id" ] && echo "update comment $id" || echo "create a comment" ) (disputed=${disputed})"
-        printf '%s' "$body"
-      elif [ -n "$id" ]; then
-        jq -n --arg b "$body" '{body:$b}' \
-          | ghq api -X PATCH "repos/$REPO/issues/comments/${id}" --input - >/dev/null \
-          || { warn "could not update the sticky comment ${id} on $REPO#$PR_NUMBER: $(gherr)"; rc=1; }
-        log "updated the sticky comment (${id})"
+      if [ -n "$id" ]; then
+        comment_is_disputed "$id"; dis_rc=$?
+        [ "$dis_rc" -eq 0 ] && disputed=1
+      fi
+      if [ "$dis_rc" -eq 2 ]; then
+        rc=1   # already announced inside comment_is_disputed; the comment and label stay untouched
       else
-        jq -n --arg b "$body" '{body:$b}' \
-          | ghq api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" --input - >/dev/null \
-          || { warn "could not create the sticky comment on $REPO#$PR_NUMBER: $(gherr)"; rc=1; }
-        log "created the sticky comment"
+        surfaces="$(render_surfaces "$RECORD" "$disputed")" || { warn "the surfaces could not be rendered"; surfaces=""; }
+        if [ -z "$surfaces" ]; then
+          rc=1
+        else
+          body="$(jq -r '.comment_body' <<<"$surfaces")"
+          if [ "$DRY_RUN" = 1 ]; then
+            log "DRY RUN — would $( [ -n "$id" ] && echo "update comment $id" || echo "create a comment" ) (disputed=${disputed})"
+            printf '%s' "$body"
+          elif [ -n "$id" ]; then
+            # The success line lives in the `else`: logging it unconditionally made a 403 print a
+            # warning AND "updated the sticky comment", so the run log contradicted itself for
+            # whoever was diagnosing a permanently stale comment.
+            if jq -n --arg b "$body" '{body:$b}' \
+                 | ghq api -X PATCH "repos/$REPO/issues/comments/${id}" --input - >/dev/null
+            then log "updated the sticky comment (${id})"
+            else warn "could not update the sticky comment ${id} on $REPO#$PR_NUMBER: $(gherr)"; rc=1; fi
+          else
+            if jq -n --arg b "$body" '{body:$b}' \
+                 | ghq api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" --input - >/dev/null
+            then log "created the sticky comment"
+            else warn "could not create the sticky comment on $REPO#$PR_NUMBER: $(gherr)"; rc=1; fi
+          fi
+        fi
+        sync_dispute_label "$disputed" || rc=1
       fi
     fi
-    sync_dispute_label "$disputed" || rc=1
   fi
 
   if [ "$PUBLISH_CHECK" = 1 ]; then
     local sha="$HEAD_SHA" surfaces2
+    # THE GRADED COMMIT, NOT "HEAD NOW". The record carries the oid whose rollup and file list
+    # produced this tier, and grading deliberately waits out the rollup settle (up to
+    # `wait_for_checks_minutes`) — so re-reading head at publish time would stamp the PREVIOUS
+    # commit's grade onto a new head as an immutable, timestamped Check Run, in the artifact whose
+    # whole value is being a trustworthy commit-attached record. A push during that window gets
+    # its own grade and its own check; this one stays attached to what it actually graded.
+    if [ -z "$sha" ]; then
+      sha="$(jq -r '.head_sha // empty' "$RECORD" 2>/dev/null)"
+      [ -n "$sha" ] && log "attaching the Check Run to the GRADED commit ${sha}"
+    fi
+    # Only a record with no head_sha (an ungradable PR, or a pre-schema record) falls back to the
+    # API — an ungraded `unknown` verdict is about the PR, not about a particular commit.
     if [ -z "$sha" ] && [ "$DRY_RUN" != 1 ]; then
       sha="$(ghq api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.sha')" \
         || { warn "could not read the head sha of $REPO#$PR_NUMBER: $(gherr) — no Check Run was created"; sha=""; rc=1; }

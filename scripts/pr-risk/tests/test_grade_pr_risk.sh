@@ -128,7 +128,7 @@ cat > "$SANDBOX/fixture.json" <<'FIX'
   "author":{"login":"dev"},"authorAssociation":"MEMBER","baseRefName":"main","headRefName":"docs-tweak",
   "isCrossRepository":false,"additions":3,"deletions":1,"changedFiles":1,
   "labels":{"pageInfo":{"hasNextPage":false},"nodes":[]},
-  "commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"PENDING","contexts":{
+  "commits":{"nodes":[{"commit":{"oid":"c0ffee1234567890abcdef1234567890abcdef12","statusCheckRollup":{"state":"PENDING","contexts":{
     "pageInfo":{"hasNextPage":false},
     "nodes":[
       {"__typename":"CheckRun","name":"Grade PR risk","status":"IN_PROGRESS","conclusion":null,
@@ -162,6 +162,11 @@ graded_pr() { PATH="$SANDBOX/bin:$PATH" bash "$GRADER" --repo test/repo --pr 42 
 
 out="$(graded_pr --self-context 'CI - PR Risk Grade')"
 eq "self-excluded rollup reads SUCCESS (by name)" SUCCESS "$(jq -r '.checks_state' <<<"$out")"
+# THE RECORD NAMES THE COMMIT IT GRADED. Without it a publish surface can only re-read "head",
+# and grading deliberately waits out the rollup settle — so a push in that window would attach
+# this commit's tier to a different commit as an immutable Check Run.
+eq "the record carries the graded head sha" \
+   "c0ffee1234567890abcdef1234567890abcdef12" "$(jq -r '.head_sha' <<<"$out")"
 eq "nothing else pending" false "$(jq -r '.checks_pending_excl_self' <<<"$out")"
 eq "live docs PR grades R1" R1 "$(jq -r '.risk.tier' <<<"$out")"
 # --self-run-id is the EXACT selector: same result, but keyed on github.run_id, so a
