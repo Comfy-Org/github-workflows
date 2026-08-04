@@ -295,6 +295,14 @@ on:
           as well-shaped as any other SHA. It does not, and cannot, prove the
           running revision is upstream: that is what reviewing the caller's
           `uses:` line on its base branch is for.
+
+
+          COROLLARY: a tag- or branch-pinned `uses:` cannot satisfy this, since
+          `job_workflow_sha` is then whatever the tag currently points at and a
+          force-moved `v1` would silently change the tool under a reviewed
+          caller. That is intentional and matches org policy — `uses:` must be a
+          full commit SHA (a floating one fails the pin-validation consumer CI
+          already runs). Pin `uses:` to a SHA and pass the same SHA here.
         type: string
         required: true
       enabled:
@@ -417,7 +425,7 @@ jobs:
             exit 1
           fi
           if [[ "${WORKFLOWS_REF,,}" != "${JOB_WORKFLOW_SHA,,}" ]]; then
-            echo "::error::workflows_ref (${safe_ref}) is not the commit uses: resolved to (${JOB_WORKFLOW_SHA}), so the grader would load from a different revision of Comfy-Org/github-workflows than the one reviewed alongside this caller. Set workflows_ref to the SAME SHA as the uses: line calling this workflow (a local './' call must pass that run's own commit SHA)."
+            echo "::error::workflows_ref (${safe_ref}) is not the commit uses: resolved to (${JOB_WORKFLOW_SHA}), so the grader would load from a different revision of Comfy-Org/github-workflows than the one running. Set BOTH to that same full commit SHA. If the uses: line calling this workflow is pinned to a TAG or a BRANCH, fix that first: it must be a full commit SHA (org policy — a floating uses: fails the pin-validation consumer CI runs anyway), and this input takes the same SHA."
             exit 1
           fi
       # The tool checkout is the same pinned-ref load the grade job does: the resolver is this
@@ -548,7 +556,7 @@ jobs:
             exit 1
           fi
           if [[ "${WORKFLOWS_REF,,}" != "${JOB_WORKFLOW_SHA,,}" ]]; then
-            echo "::error::workflows_ref (${safe_ref}) is not the commit uses: resolved to (${JOB_WORKFLOW_SHA}), so the grader would load from a different revision of Comfy-Org/github-workflows than the one reviewed alongside this caller. Set workflows_ref to the SAME SHA as the uses: line calling this workflow (a local './' call must pass that run's own commit SHA)."
+            echo "::error::workflows_ref (${safe_ref}) is not the commit uses: resolved to (${JOB_WORKFLOW_SHA}), so the grader would load from a different revision of Comfy-Org/github-workflows than the one running. Set BOTH to that same full commit SHA. If the uses: line calling this workflow is pinned to a TAG or a BRANCH, fix that first: it must be a full commit SHA (org policy — a floating uses: fails the pin-validation consumer CI runs anyway), and this input takes the same SHA."
             exit 1
           fi
       - name: Load pr-risk tool

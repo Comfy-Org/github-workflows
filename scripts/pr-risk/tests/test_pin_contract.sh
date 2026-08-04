@@ -22,13 +22,21 @@
 #   * AN AXIS IS DROPPED, OR STOPS BEING FATAL. Shape alone proves the ref is immutable, not
 #     which commit it is; the `github.job_workflow_sha` comparison is what proves it is the
 #     revision already running. Either axis degraded to a warning is a silent no-op.
+#   * THE STEP IS NEUTERED WHOLESALE. `continue-on-error: true` makes every `exit 1` advisory
+#     and an `if:` switches the step off — added to both copies they stay byte-identical, every
+#     assertion above still holds, and the checkout proceeds on an unvalidated ref.
+#   * THE RAW VALUE IS EMITTED AGAIN. The runner re-parses any line of step output, so a
+#     multi-line ref can forge workflow commands in a public log.
 #
-# ASSERT PROPERTIES, NOT COUNTS. An earlier draft pinned a literal number of `exit 1` lines,
-# which would have gone red on the very next hardening of the guard — a test that blocks its own
-# subject's improvement teaches people to delete the test. What is asserted here instead is that
-# no rejection path can be non-fatal (no `exit 0` at all) and that every `::error::` is paired
-# with an exit. The awk passes also self-check that they matched anything, so a brittle anchor
-# fails loudly rather than passing vacuously with zero coverage.
+# ASSERT PROPERTIES, NOT COUNTS, AND POSITIONS, NOT SUMS. An earlier draft pinned a literal
+# number of `exit 1` lines, which would have gone red on the very next hardening of the guard —
+# a test that blocks its own subject's improvement teaches people to delete the test. A later
+# one compared total `::error::` and `exit 1` counts, which one path could satisfy on another's
+# behalf. What is asserted here is that no rejection path can be non-fatal (no `exit 0` at all)
+# and that each `::error::` is FOLLOWED by an exit. The awk passes also self-check that they
+# matched anything, so a brittle anchor fails loudly rather than passing vacuously with zero
+# coverage — and the patterns are deliberately over-inclusive, since a false positive here costs
+# a puzzled minute and a false negative ships an unguarded checkout.
 #
 #   bash tests/test_pin_contract.sh          # exit 0 = all green
 set -uo pipefail
@@ -41,8 +49,10 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf 'ok   %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf 'FAIL %s\n     got: %s\n' "$1" "${2:-}"; }
 eq()  { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected '$2')" "$3"; fi }
-has() { case "$2" in *"$3"*) ok "$1" ;; *) bad "$1" "not found: $3" ;; esac }
-no()  { case "$2" in *"$3"*) bad "$1" "present: $3" ;; *) ok "$1" ;; esac }
+# `grep -F`, not `case` globbing: half these needles are regex text (`^[0-9a-fA-F]{40}$`), whose
+# brackets and braces a glob would happily reinterpret into something laxer than it reads.
+has() { if printf '%s\n' "$2" | grep -qF -- "$3"; then ok "$1"; else bad "$1" "not found: $3"; fi }
+no()  { if printf '%s\n' "$2" | grep -qF -- "$3"; then bad "$1" "present: $3"; else ok "$1"; fi }
 
 GUARD_NAME='      - name: Enforce workflows_ref pin contract'
 
@@ -51,8 +61,10 @@ GUARD_NAME='      - name: Enforce workflows_ref pin contract'
 # each one, so a guard in `gate` cannot vouch for a checkout in `grade`. Checkout detection is
 # deliberately NOT a byte-exact line match: a future job that quotes the expression, drops the
 # inner spaces, indents differently, or adds a trailing comment must still be seen, or an
-# unguarded checkout ships green and defeats the point of this file. Match on the whitespace-
-# stripped form instead. The awk also reports how many jobs and how many refs it saw, so a
+# unguarded checkout ships green and defeats the point of this file. So: strip whitespace, then
+# match any `ref:` key mentioning `inputs.workflows_ref` ANYWHERE in the value. Deliberately
+# over-inclusive — a false positive here costs one puzzled minute, a false negative ships an
+# unguarded checkout. The awk also reports how many jobs and how many refs it saw, so a
 # pattern that silently matches nothing fails below rather than printing a vacuous `ok`.
 scan="$(awk -v guard="$GUARD_NAME" '
   function squash(s) { gsub(/[[:space:]]/, "", s); return s }
@@ -60,7 +72,7 @@ scan="$(awk -v guard="$GUARD_NAME" '
   !injobs { next }
   /^  [A-Za-z0-9_-]+:[[:space:]]*(#.*)?$/ { job = $1; jobs += 1; guarded = 0; next }
   $0 == guard { guarded = 1; next }
-  squash($0) ~ /^ref:\$\{\{inputs\.workflows_ref\}\}$/ {
+  squash($0) ~ /^ref:.*inputs\.workflows_ref/ {
     refs += 1
     if (!guarded) print "UNGUARDED:" job
   }
@@ -102,15 +114,26 @@ awk -v guard="$GUARD_NAME" -v out="$copies" '
   /^       / { print > f; next }
   { inguard = 0 }
 ' "$WF"
+# Without `set -e` and without `nullglob`, a slicer that produced nothing would leave the loop
+# below iterating the literal glob and `cmp`-ing a nonexistent file — the byte-identity check
+# would dissolve into a confusing message instead of a clean failure. Count first.
+nslices=$(find "$copies" -maxdepth 1 -name 'guard.*' -type f | wc -l | tr -d ' ')
+if [ "$nslices" -ge 2 ]; then ok "the guard slicer produced one slice per copy ($nslices)"
+else bad "the guard slicer produced one slice per copy" "$nslices — nothing to compare"; fi
+
 drift=""
 first="$copies/guard.1"
-for f in "$copies"/guard.*; do
-  cmp -s "$first" "$f" || drift="$drift $(basename "$f")"
-done
+if [ -f "$first" ]; then
+  for f in "$copies"/guard.*; do
+    cmp -s "$first" "$f" || drift="$drift $(basename "$f")"
+  done
+else
+  drift="no slices"
+fi
 eq "all copies of the guard step are byte-identical" "" "$drift"
 
 # --- both axes are still enforced, and no rejection path can be non-fatal ---------------------
-body="$(cat "$first")"
+body="$(cat "$first" 2>/dev/null)"
 # Comments are stripped before any assertion about control flow, so an `exit 1` or an `exit 0`
 # quoted in prose neither satisfies nor breaks a check.
 code="$(printf '%s\n' "$body" | sed 's/[[:space:]]*#.*$//')"
@@ -118,31 +141,61 @@ code="$(printf '%s\n' "$body" | sed 's/[[:space:]]*#.*$//')"
 has "axis 1: the ref must be shaped like a full 40-hex commit SHA" \
     "$code" '^[0-9a-fA-F]{40}$'
 has "axis 2: the runner-supplied resolved SHA is read into the guard" \
-    "$body" 'JOB_WORKFLOW_SHA: ${{ github.job_workflow_sha }}'
+    "$code" 'JOB_WORKFLOW_SHA: ${{ github.job_workflow_sha }}'
 has "axis 2: the pin is compared against it, case-insensitively" \
     "$code" '"${WORKFLOWS_REF,,}" != "${JOB_WORKFLOW_SHA,,}"'
 has "axis 2: an unreadable job_workflow_sha is itself a rejection (fail closed)" \
     "$code" '[[ -z "$JOB_WORKFLOW_SHA" ]]'
 
 # Every rejection is fatal, expressed without pinning a literal count: nothing in the guard may
-# exit successfully mid-way, and each error annotation must be paired with a failing exit. A new
+# exit successfully mid-way, and each error annotation must be followed by a failing exit. A new
 # axis therefore extends this cleanly instead of turning it red.
 no  "no rejection path exits non-fatally" "$code" "exit 0"
+# Positionally, not by totals. Equal SUMS would let one path degrade to log-and-continue so long
+# as another gained a spare `exit 1` — which is exactly the regression this is here to catch, so
+# each `::error::` must be followed by `exit 1` as the next non-blank line.
+unpaired="$(printf '%s\n' "$code" | awk '
+  /^[[:space:]]*$/ { next }
+  pending && $0 !~ /^[[:space:]]*exit 1[[:space:]]*$/ { print "UNPAIRED:" NR; pending = 0 }
+  { pending = /::error::/ }
+  END { if (pending) print "UNPAIRED:eof" }
+' | tr '\n' ' ' | sed 's/ $//')"
+eq "every ::error:: is followed by a failing exit" "" "$unpaired"
 errors=$(printf '%s\n' "$code" | grep -c '::error::')
-fatals=$(printf '%s\n' "$code" | grep -c 'exit 1')
-eq  "every ::error:: is paired with a failing exit" "$errors" "$fatals"
 if [ "$errors" -ge 3 ]; then ok "all three rejection paths are present (shape, unreadable, mismatch)"
 else bad "all three rejection paths are present (shape, unreadable, mismatch)" "$errors ::error:: lines"; fi
 
-# --- the input itself is never interpolated into the shell or echoed raw ----------------------
-# `${{ inputs.workflows_ref }}` inline in `run:` would be a shell-injection vector, and echoing
-# the raw value into a `::error::` lets a multi-line value forge workflow commands in a public
-# log. The echo check matches the value in ANY spelling — `$WORKFLOWS_REF` unbraced is the more
-# likely regression than `${WORKFLOWS_REF}`, so it must not be the one the test misses.
+# --- the guard cannot be neutered while staying byte-identical --------------------------------
+# The cheapest way to disarm this without tripping any check above is a step-level key:
+# `continue-on-error: true` makes the `exit 1` advisory, and an `if:` can switch the whole step
+# off. Added to BOTH copies they stay identical, every error stays paired, and the checkout
+# proceeds with an unvalidated ref. So the step must carry neither.
+no "the guard is not softened by continue-on-error" "$code" "continue-on-error"
+gatedon="$(printf '%s\n' "$code" | grep -E '^        if:' || true)"
+eq "the guard is not conditional (no step-level if:)" "" "$gatedon"
+
+# --- the input itself is never interpolated into the shell nor emitted raw --------------------
+# `${{ inputs.workflows_ref }}` inline in `run:` would be a shell-injection vector, and emitting
+# the raw value lets a multi-line value forge workflow commands in a public log — the runner
+# re-parses ANY line of step output, so this is not only about `echo` and not only about lines
+# that themselves contain `::`. Every line naming the value must therefore be one that consumes
+# it (a `[[ ]]` test, or the assignment that sanitizes it), never one that emits it: no bare
+# `echo`/`printf`, no workflow command, no redirect into an Actions file, and no continuation of
+# a line that was doing one of those.
 script="$(printf '%s\n' "$code" | sed -n '/run: |/,$p')"
 no "the input reaches the script only via env:" "$script" '${{'
-echoed="$(printf '%s\n' "$code" | grep -E '^[[:space:]]*echo ' | grep -E '\$\{?WORKFLOWS_REF' || true)"
-eq "only the sanitized value is echoed into annotations" "" "$echoed"
+emitted="$(printf '%s\n' "$script" | awk '
+  { line = $0; sub(/^[[:space:]]+/, "", line) }
+  line ~ /\$\{?WORKFLOWS_REF/ {
+    if (cont)                             { print "CONTINUATION:" NR }
+    else if (line ~ /::/)                 { print "WORKFLOW-COMMAND:" NR }
+    else if (line ~ /GITHUB_(STEP_SUMMARY|OUTPUT|ENV|PATH)/) { print "ACTIONS-FILE:" NR }
+    else if (line ~ /^(echo|printf)[[:space:]]/)             { print "BARE-EMIT:" NR }
+    else if (line ~ /[^0-9a-zA-Z_]>>?[[:space:]]*[\$\/"]/)   { print "REDIRECT:" NR }
+  }
+  { cont = (line ~ /\\$/) }
+' | tr '\n' ' ' | sed 's/ $//')"
+eq "the raw value is consumed, never emitted, in any spelling" "" "$emitted"
 has "the sanitized value is what the annotations use" "$code" '${safe_ref}'
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
