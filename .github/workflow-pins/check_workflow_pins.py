@@ -49,12 +49,9 @@ DEFAULT_WORKFLOWS_DIR = ".github/workflows"
 # instead of rotting, whether the workflow dropped its default (fixed) or no
 # longer exists under that name (renamed or deleted). The latter matters most:
 # left alone it would pre-exempt whatever future workflow reuses the filename.
-#
-#   pr-size.yml — same shape as the three fixed in BE-5546, but its caller
-#   fleet (`vars.PR_SIZE_CALLERS`) was not enumerated by the BE-5543 spike, so
-#   dropping its default is an unverified break of consumer CI. Needs its own
-#   caller audit first.
-KNOWN_EXEMPT = frozenset({"pr-size.yml"})
+# Empty as of BE-5858: the list drained itself exactly as designed, and every
+# reusable workflow here is now held to both checks with no carve-out.
+KNOWN_EXEMPT = frozenset()
 
 _ON_RE = re.compile(r"""^(['"]?)on\1\s*:(.*)$""")
 _JOBS_RE = re.compile(r"""^(['"]?)jobs\1\s*:""")

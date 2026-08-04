@@ -555,14 +555,16 @@ class GuardCoverageTests(unittest.TestCase):
             os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "workflows")
         )
         seen = 0
-        for name in ("cursor-review.yml", "groom.yml", "agents-md-integrity.yml"):
+        for name in ("cursor-review.yml", "groom.yml", "agents-md-integrity.yml", "pr-size.yml"):
             with open(os.path.join(root, name), encoding="utf-8") as f:
                 lines = f.read().split("\n")
             uses = [line for line in lines if cwp.is_ref_use(line)]
             self.assertTrue(uses, "%s: no ref checkout found — fixture drifted" % name)
             seen += len(uses)
             self.assertEqual(cwp.find_unguarded_ref_checkouts(lines), [], name)
-        self.assertEqual(seen, 12, "expected the 12 guarded sites BE-5546 fixed")
+        self.assertEqual(
+            seen, 13, "expected the 12 guarded sites BE-5546 fixed + pr-size.yml's (BE-5858)"
+        )
 
 
 class CheckDirTests(unittest.TestCase):
@@ -793,7 +795,7 @@ class CheckDirTests(unittest.TestCase):
         root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "workflows")
         errors, checked, _ = cwp.check_dir(os.path.normpath(root))
         self.assertEqual(errors, [], errors)
-        for name in ("cursor-review.yml", "groom.yml", "agents-md-integrity.yml"):
+        for name in ("cursor-review.yml", "groom.yml", "agents-md-integrity.yml", "pr-size.yml"):
             self.assertIn(name, checked)
 
 

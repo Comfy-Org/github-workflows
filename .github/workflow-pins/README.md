@@ -72,10 +72,12 @@ guard written in flow style reads as ABSENT and fails loudly, which is the right
 bias for a check whose whole job is noticing an absence.
 
 `KNOWN_EXEMPT` in the script carries workflows with the same debt that are
-tracked under their own ticket (today: `pr-size.yml`, whose caller fleet has
-not been enumerated yet). The lint fails on a **stale** entry so the list drains
-itself rather than rotting — whether the workflow dropped its default (fixed) or
-no longer exists under that name at all (renamed or deleted), the latter being
+tracked under their own ticket. It is **empty today** — `pr-size.yml`, its last
+entry, was fixed in BE-5858 once its caller fleet had been audited, so no
+reusable workflow here is carved out of either check. The lint fails on a
+**stale** entry so the list drains itself rather than rotting — whether the
+workflow dropped its default (fixed) or no longer exists under that name at
+all (renamed or deleted), the latter being
 the case that would otherwise silently pre-exempt whatever later reuses the
 filename. The list is only applied to this repo's own `.github/workflows`: run
 against an ad-hoc `--workflows-dir` every entry would look stale.
