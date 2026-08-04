@@ -66,7 +66,7 @@ write_fixture() { # [author] [assoc] [is_fork]
       baseRefName:"release/v2", headRefName:"docs-tweak",
       isCrossRepository:$fork, additions:3, deletions:1, changedFiles:1,
       labels:{pageInfo:{hasNextPage:false}, nodes:[]},
-      commits:{nodes:[{commit:{statusCheckRollup:{state:"SUCCESS", contexts:{
+      commits:{nodes:[{commit:{oid:"c0ffee1234567890abcdef1234567890abcdef12", statusCheckRollup:{state:"SUCCESS", contexts:{
         pageInfo:{hasNextPage:false},
         nodes:[{__typename:"CheckRun", name:"unit tests", status:"COMPLETED",
                 conclusion:"SUCCESS",
@@ -411,6 +411,49 @@ src_probe="$(TMPDIR="$PROBE_TMP" bash -c 'trap "echo MY-TRAP-SURVIVED" EXIT; sou
               _ "$TARGETS" 2>&1)"
 has_text "the sourcing shell keeps its own EXIT trap" "MY-TRAP-SURVIVED" "$src_probe"
 eq "and sourcing creates no scratch files" 0 "$(find "$PROBE_TMP" -type f | wc -l | tr -d ' ')"
+
+echo "— phase 22: the rendered Check Run payloads carry the GRADED commit —"
+# The publish job is a separate job that runs after the grade job has already waited out the check
+# rollup. Re-reading "head" there would attach this grade to whatever commit arrived meanwhile, so
+# the oid travels in the payload and the publish job uses it.
+run_targets PR_NUMBERS=42 BASE_REF=main PUBLISH_CHECK=1
+eq "the run stays green"        0 "$RC"
+eq "one payload was rendered"   1 "$(jq -s length "$WORK/pr-risk-surfaces.jsonl" 2>/dev/null)"
+eq "and it names the graded sha" "c0ffee1234567890abcdef1234567890abcdef12" \
+   "$(jq -r -s '.[0].sha' "$WORK/pr-risk-surfaces.jsonl" 2>/dev/null)"
+eq "…alongside the pr it belongs to" 42 "$(jq -r -s '.[0].pr' "$WORK/pr-risk-surfaces.jsonl" 2>/dev/null)"
+
+echo "— phase 23: the AGGREGATE payload budget degrades loudly instead of E2BIG-ing the step —"
+# The per-target summary cap says nothing about the SUM, and all of them cross into the publish
+# job as ONE environment string — which Linux refuses to exec past 128KiB (MAX_ARG_STRLEN),
+# whatever the much larger total ARG_MAX says. A 50-target backfill at the per-target cap is
+# ~600KB, so the excess has to degrade (no check for those targets) rather than take the run down.
+# A budget of 1 byte drops everything, which is the same code path as dropping target 12 of 50.
+run_targets PR_NUMBERS=42 BASE_REF=main PUBLISH_CHECK=1 SURFACES_BUDGET_BYTES=1
+eq "the run is STILL green — the grade is unaffected" 0 "$RC"
+eq "the graded/labeled outcome is untouched" graded "$(res '.status')"
+eq "no payload is emitted past the budget"   0 "$(jq -s length "$WORK/pr-risk-surfaces.jsonl" 2>/dev/null)"
+has_text "the dropped target is named"       "budget (1 bytes) is spent" "$OUT"
+# NEVER A SILENT CAP: a short publish set has to say so, or the run reads as "every opted-in
+# target got a check" when some deliberately did not.
+has_text "…and the run-level tally says how many were dropped" "1 target(s) got no Check Run payload" "$OUT"
+
+echo "— phase 24: a render failure is ANNOUNCED, not swallowed —"
+# The render's stderr used to go to /dev/null with no error branch, so a bad CHECK_SUMMARY_CAP or
+# a non-JSON render made the target vanish from the publish set and a `check_run: true` opt-in
+# silently produced no check at all.
+STUBPUB="$SANDBOX/stubpub"
+mkdir -p "$STUBPUB"
+cp "$TOOLDIR/grade-pr-risk.sh" "$TOOLDIR/apply-risk-label.sh" \
+   "$TOOLDIR/risk-map.v0.json" "$TOOLDIR/runbook-registry.v0.json" "$STUBPUB/"
+printf '#!/usr/bin/env bash\necho "render blew up: no such file" >&2\nexit 3\n' > "$STUBPUB/publish-risk-surfaces.sh"
+chmod +x "$STUBPUB/publish-risk-surfaces.sh"
+run_targets PR_NUMBERS=42 BASE_REF=main PUBLISH_CHECK=1 TOOL_DIR="$STUBPUB"
+eq "the run stays green"                 0 "$RC"
+eq "the grade and label still happened"  graded "$(res '.status')"
+eq "nothing is published for it"         0 "$(jq -s length "$WORK/pr-risk-surfaces.jsonl" 2>/dev/null)"
+has_text "and the failure is annotated"  "the Check Run could not be rendered (rc=3)" "$OUT"
+has_text "…carrying the renderer's own stderr" "render blew up" "$OUT"
 
 echo
 echo "passed $PASS, failed $FAIL"

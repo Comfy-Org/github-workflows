@@ -85,6 +85,23 @@ eq "map version stamped" v0-generic "$(jq -r '.risk.map_version' <<<"$out")"
 eq "registry version stamped" v0-generic "$(jq -r '.risk.registry_version' <<<"$out")"
 
 echo "— phase 7: a structurally empty map is refused outright —"
+echo "— per-file path floors are REPORTING ONLY: worst(files) == the floor itself —"
+# publish-risk-surfaces.sh renders one row per file from risk.axes.path_floor.files. Those
+# per-file floors are matched with the SAME rules as the floor, so `worst` over them must equal
+# the floor — otherwise the breakdown has quietly become a second grading model that can disagree
+# with the tier printed above it.
+# ONE line: --stdin is JSONL, and a pretty-printed record is dropped by the per-line reader.
+inv="$(grade <<<'{"changed_paths_status":"ok","author":"someone","is_fork":false,"labels":[],"checks_status":"ok","checks_state":"SUCCESS","provenance_status":"ok","changed_paths":[{"path":".github/workflows/a.yml","change_type":"MODIFIED"},{"path":"docs/a.md","change_type":"MODIFIED"},{"path":"src/plain.go","change_type":"MODIFIED"}]}')"
+eq "the floor is R3 (the ci rule)" "R3" "$(jq -r '.risk.axes.path_floor.tier' <<<"$inv")"
+eq "worst over the per-file floors equals it" "R3" \
+   "$(jq -r '[.risk.axes.path_floor.files[].tier] | map({"R0":0,"R1":1,"R2":2,"R3":3}[.]) | max
+             | ["R0","R1","R2","R3"][.]' <<<"$inv")"
+eq "every changed file gets exactly one row" 3 "$(jq '.risk.axes.path_floor.files | length' <<<"$inv")"
+eq "an unmapped path falls to the map default, not to the floor" "R0" \
+   "$(jq -r '.risk.axes.path_floor.files[] | select(.path == "src/plain.go") | .tier' <<<"$inv")"
+eq "the docs rule keeps its own R0 row under an R3 floor" "R0" \
+   "$(jq -r '.risk.axes.path_floor.files[] | select(.path == "docs/a.md") | .tier' <<<"$inv")"
+
 printf '{}' > "$SANDBOX/empty-map.json"
 rec 7 dev 'docs: x' '[{"path":"README.md","additions":1,"deletions":0,"change_type":"MODIFIED"}]' ok SUCCESS \
   | bash "$GRADER" --stdin --map "$SANDBOX/empty-map.json" >/dev/null 2>&1
@@ -111,7 +128,7 @@ cat > "$SANDBOX/fixture.json" <<'FIX'
   "author":{"login":"dev"},"authorAssociation":"MEMBER","baseRefName":"main","headRefName":"docs-tweak",
   "isCrossRepository":false,"additions":3,"deletions":1,"changedFiles":1,
   "labels":{"pageInfo":{"hasNextPage":false},"nodes":[]},
-  "commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"PENDING","contexts":{
+  "commits":{"nodes":[{"commit":{"oid":"c0ffee1234567890abcdef1234567890abcdef12","statusCheckRollup":{"state":"PENDING","contexts":{
     "pageInfo":{"hasNextPage":false},
     "nodes":[
       {"__typename":"CheckRun","name":"Grade PR risk","status":"IN_PROGRESS","conclusion":null,
@@ -145,6 +162,11 @@ graded_pr() { PATH="$SANDBOX/bin:$PATH" bash "$GRADER" --repo test/repo --pr 42 
 
 out="$(graded_pr --self-context 'CI - PR Risk Grade')"
 eq "self-excluded rollup reads SUCCESS (by name)" SUCCESS "$(jq -r '.checks_state' <<<"$out")"
+# THE RECORD NAMES THE COMMIT IT GRADED. Without it a publish surface can only re-read "head",
+# and grading deliberately waits out the rollup settle — so a push in that window would attach
+# this commit's tier to a different commit as an immutable Check Run.
+eq "the record carries the graded head sha" \
+   "c0ffee1234567890abcdef1234567890abcdef12" "$(jq -r '.head_sha' <<<"$out")"
 eq "nothing else pending" false "$(jq -r '.checks_pending_excl_self' <<<"$out")"
 eq "live docs PR grades R1" R1 "$(jq -r '.risk.tier' <<<"$out")"
 # --self-run-id is the EXACT selector: same result, but keyed on github.run_id, so a

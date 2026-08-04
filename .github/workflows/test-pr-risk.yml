@@ -48,7 +48,7 @@ jobs:
           persist-credentials: false
 
       - name: shellcheck
-        run: shellcheck -x grade-pr-risk.sh apply-risk-label.sh grade-targets.sh resolve-enabled.sh tests/test_grade_pr_risk.sh tests/test_apply_risk_label.sh tests/test_grade_targets.sh tests/test_resolve_enabled.sh tests/test_pin_contract.sh
+        run: shellcheck -x grade-pr-risk.sh apply-risk-label.sh grade-targets.sh resolve-enabled.sh tests/test_grade_pr_risk.sh tests/test_apply_risk_label.sh tests/test_grade_targets.sh tests/test_resolve_enabled.sh tests/test_pin_contract.sh publish-risk-surfaces.sh tests/test_publish_risk_surfaces.sh
 
       - name: default map + registry parse and validate
         # The shipped defaults must pass the grader's own structural validation:
@@ -76,6 +76,14 @@ jobs:
         # over the workflow text: every job that checks out the ref is guarded, the hand-copied
         # copies have not drifted, and neither enforcement axis has been dropped.
         run: bash tests/test_pin_contract.sh
+
+      - name: publish-surfaces suite
+        # The two OPT-IN surfaces (Check Run + sticky comment). The properties worth the most
+        # here are the ones an estimate cannot establish: that a crafted FILENAME cannot forge a
+        # reviewer dispute or break the table it sits in, and that a diff of many long,
+        # deeply-nested paths renders UNDER GitHub's 65536-char comment limit — measured, because
+        # a 422 there leaves the label fresh and the comment permanently stale.
+        run: bash tests/test_publish_risk_surfaces.sh
 
       - name: enablement suite
         # The `enabled` switch: that `vars.RISK_CONFIG` outranks the reviewed input in BOTH
