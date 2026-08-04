@@ -363,10 +363,36 @@ on:
           override is refused with a `::warning::` and falls back to this value;
           an explicit `0` is honoured and means "always file issues, never open
           PRs". The effective value appears in the gate job's `Resolved knobs:`
-          line on every run.
+          line on every run — which is where to read a repo's real ceiling,
+          rather than assuming this default.
+
+          The default stays deliberately BELOW the org's 1000-line human PR cap
+          (`pr-size.yml` `max_lines`), and copying that number here would loosen
+          this more than it looks. Two reasons. (1) Different counting basis:
+          `pr-size.yml` counts *non-generated* changed lines — it strips
+          lockfiles and generated output first, and offers an `oversized-ok`
+          bypass label — whereas this counts changed lines straight off
+          `git diff --cached --numstat`, with no content-based exclusions. Note
+          that this basis is not a byte budget: `numstat` reports `-` for binary
+          files (counted as 0 here), and a line is a line however long, so one
+          minified line clears any ceiling. It bounds review effort in the
+          reviewable case, not patch size in the worst case — another reason not
+          to spend the headroom the human cap allows. (2) Different risk: the
+          human cap is advisory on a diff whose author chose the scope and can
+          defend it in review; this is a hard refusal on a diff with no author to
+          interrogate, where the failure mode is a reviewer approving 900
+          plausible-looking machine-written lines because nothing in it looks
+          wrong. The machine does not get the same benefit of the doubt, on
+          purpose.
+
+          Raised 400 → 600 on 2026-08-02 (BE-6161) on measured evidence: across
+          both builder repos, 49 `groom` issues produced 7 bails and exactly ONE
+          patch-too-large (403 lines, three over) — 400 was not systematically
+          tight, it caught one boundary case, so 600 buys headroom for that
+          shape without a large jump.
         type: number
         required: false
-        default: 400
+        default: 600
     secrets:
       ANTHROPIC_API_KEY:
         description: Anthropic API key the finder + verifier agents bill through.
@@ -1874,7 +1900,7 @@ jobs:
             echo "::warning::pr_size_limit resolved to an empty value — falling back to the caller's input ($PR_SIZE_LIMIT_INPUT)."
             PR_SIZE_LIMIT="$PR_SIZE_LIMIT_INPUT"
           fi
-          # `type: number` can arrive as a fractional string (e.g. 400.0) that the
+          # `type: number` can arrive as a fractional string (e.g. 600.0) that the
           # integer-only `-gt` test below would abort on under `set -euo pipefail`,
           # skipping the patch upload. Floor it to an int first (mirrors the file
           # job's MAX_FINDINGS handling).
