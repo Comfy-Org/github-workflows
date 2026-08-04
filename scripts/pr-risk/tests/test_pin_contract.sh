@@ -220,7 +220,7 @@ no "the protected checkout is not softened by continue-on-error" "$protected" "c
 jobsoft="$(grep -nE '^    continue-on-error:' "$WF" | tr '\n' ' ' | sed 's/ $//')"
 eq "no job demotes its own failures wholesale (no job-level continue-on-error)" "" "$jobsoft"
 
-# --- the input itself is never interpolated into the shell nor emitted raw --------------------
+# --- neither raw value is interpolated into the shell nor emitted raw -------------------------
 # `${{ inputs.workflows_ref }}` inline in `run:` would be a shell-injection vector, and emitting
 # the raw value lets a multi-line value forge workflow commands in a public log — the runner
 # re-parses ANY line of step output, so this is not only about `echo` and not only about lines
@@ -228,6 +228,13 @@ eq "no job demotes its own failures wholesale (no job-level continue-on-error)" 
 # it (a `[[ ]]` test, or the assignment that sanitizes it), never one that emits it: no bare
 # `echo`/`printf`, no workflow command, no redirect into an Actions file, and no continuation of
 # a line that was doing one of those.
+#
+# BOTH values, not just the caller's. `JOB_WORKFLOW_SHA` is runner-supplied and so cannot be
+# forged by a caller — but the guard's own comment argues the platform could reshape or rename
+# that property out from under it, which is exactly why the guard never tests it for shape and
+# does sanitize it before echoing. A scan that covered only `WORKFLOWS_REF` would stay green
+# while a future edit echoed raw `$JOB_WORKFLOW_SHA` into an annotation, contradicting the
+# comment it sits under. Same whitelist, one more sanctioned assignment.
 script="$(printf '%s\n' "$code" | sed -n '/run: |/,$p')"
 # Unlike every other anchor here, this one had no coverage self-check: reshape the block scalar
 # (`run: >-`, or a `run:` with a trailing comment) and `$script` comes back EMPTY, at which point
@@ -241,24 +248,44 @@ has "the run: block scan found the guard's script body" "$script" 'set -euo pipe
 # sees nothing) and an open-ended tail of spellings to keep chasing — `export`, `local`, `read`,
 # a herestring, a here-doc. Inverting it is what lets the assertion's name be true: any new way
 # of touching the value is reported until someone widens this list on purpose.
+#
+# PER STATEMENT, not per line. Sanctioning a whole LINE on its prefix hands back everything the
+# whitelist just bought: `if [[ -n "$WORKFLOWS_REF" ]]; then echo "$WORKFLOWS_REF" >> \
+# "$GITHUB_STEP_SUMMARY"; fi` opens with a sanctioned `if [[ ` and would clear in full, raw emit
+# and all. So the line is split on `;` first and each statement judged on its own — the shell's
+# own separator, so a leak has to hide inside a command substitution (where it is captured, not
+# logged) rather than merely after a semicolon. A `;` inside a quoted string over-splits, which
+# costs a false positive, never a false negative: the trade this file makes everywhere.
 emitted="$(printf '%s\n' "$script" | awk '
-  { line = $0; sub(/^[[:space:]]+/, "", line) }
-  line ~ /\$\{?WORKFLOWS_REF/ {
-    sanctioned = (!cont && (line ~ /^safe_ref=\$\(printf/ || line ~ /^(el)?if \[\[ /))
-    if (!sanctioned) {
-      if (cont)                             { print "CONTINUATION:" NR }
-      else if (line ~ /::/)                 { print "WORKFLOW-COMMAND:" NR }
-      else if (line ~ /GITHUB_(STEP_SUMMARY|OUTPUT|ENV|PATH)/) { print "ACTIONS-FILE:" NR }
-      else if (line ~ /^(echo|printf)[[:space:]]/)             { print "BARE-EMIT:" NR }
-      else if (line ~ /[^0-9a-zA-Z_]>>?[[:space:]]*[\$\/"]/)   { print "REDIRECT:" NR }
-      else                                  { print "UNSANCTIONED:" NR }
+  {
+    raw = $0
+    n = split(raw, stmt, ";")
+    for (i = 1; i <= n; i++) {
+      line = stmt[i]; sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line)
+      if (line !~ /\$\{?(WORKFLOWS_REF|JOB_WORKFLOW_SHA)/) continue
+      sanctioned = (!cont && (line ~ /^safe_(ref|job_sha)=\$\(printf/ || line ~ /^(el)?if \[\[ /))
+      if (!sanctioned) {
+        if (cont)                             { print "CONTINUATION:" NR }
+        else if (line ~ /::/)                 { print "WORKFLOW-COMMAND:" NR }
+        else if (line ~ /GITHUB_(STEP_SUMMARY|OUTPUT|ENV|PATH)/) { print "ACTIONS-FILE:" NR }
+        else if (line ~ /^(echo|printf)[[:space:]]/)             { print "BARE-EMIT:" NR }
+        else if (line ~ /[^0-9a-zA-Z_]>>?[[:space:]]*[\$\/"]/)   { print "REDIRECT:" NR }
+        else                                  { print "UNSANCTIONED:" NR }
+      }
     }
+    cont = (raw ~ /\\$/)
   }
-  { cont = (line ~ /\\$/) }
 ' | tr '\n' ' ' | sed 's/ $//')"
-eq "the raw value is only sanitized or tested, never emitted or copied elsewhere" "" "$emitted"
+eq "neither raw value is emitted or copied elsewhere, only sanitized or tested" "" "$emitted"
+# Coverage self-check for the scan above, in the same spirit as the ones on the other anchors: if
+# the trigger pattern matched nothing at all — a renamed env key, a reshaped script — the `eq`
+# passes vacuously over an empty scan and reports a green boundary that was never inspected.
+ntouch=$(printf '%s\n' "$script" | grep -c '\${\?\(WORKFLOWS_REF\|JOB_WORKFLOW_SHA\)')
+if [ "$ntouch" -ge 5 ]; then ok "the emit scan saw both guarded values ($ntouch lines)"
+else bad "the emit scan saw both guarded values" "$ntouch lines — anchors are stale, coverage is vacuous"; fi
 no "the input reaches the script only via env:" "$script" '${{'
-has "the sanitized value is what the annotations use" "$code" '${safe_ref}'
+has "the sanitized input is what the annotations use" "$code" '${safe_ref}'
+has "the sanitized runner SHA is what the annotations use" "$code" '${safe_job_sha}'
 
 # --- ...and the input is never aliased out from under the checkout scan ------------------------
 # The "every workflows_ref checkout sits behind the guard" scan at the top matches literal `ref:`
@@ -270,16 +297,31 @@ has "the sanitized value is what the annotations use" "$code" '${safe_ref}'
 # is a grep. So: OUTSIDE comments, `inputs.workflows_ref` may appear only as the guard's own env
 # binding or as a `ref:` key — the two shapes the scans above actually understand. A future job
 # that legitimately needs it elsewhere adds the shape here, deliberately, rather than by accident.
-aliased="$(awk '
+#
+# WHICH STEP OWNS THE BINDING MATTERS. Sanctioning the env-binding SHAPE anywhere in the file
+# leaves the hole open one step to the right: a later step that binds `WORKFLOWS_REF: ${{
+# inputs.workflows_ref }}` of its own and then runs `git fetch origin "$WORKFLOWS_REF"` adds no
+# `ref:` key, so `REFS` and the guard count both stay put, the binding clears on shape, and an
+# unguarded fetch of an unvalidated ref ships green — the exact bypass this scan exists to close.
+# So the binding is sanctioned only INSIDE a guard step: step ownership is tracked by resetting
+# at every step key (`- ` at step indent) and every job key, and set only by the guard's own
+# `- name:` line, which the byte-identity check above already pins.
+aliased="$(awk -v guard="$GUARD_NAME" '
+  $0 == guard { inguard = 1; next }
+  /^      - / { inguard = 0 }
+  /^  [A-Za-z0-9_-]+:/ { inguard = 0 }
   { line = $0; sub(/^[[:space:]]*/, "", line) }
   line ~ /^#/ { next }
   line !~ /inputs\.workflows_ref/ { next }
   { squashed = line; gsub(/[[:space:]]/, "", squashed) }
-  squashed ~ /^WORKFLOWS_REF:\$\{\{inputs\.workflows_ref\}\}$/ { next }
+  inguard && squashed ~ /^WORKFLOWS_REF:\$\{\{inputs\.workflows_ref\}\}$/ { next }
   squashed ~ /^ref:/ { next }
   { print "ALIASED:" NR }
 ' "$WF" | tr '\n' ' ' | sed 's/ $//')"
-eq "the input is referenced only as the guard's env binding or a ref: key" "" "$aliased"
+eq "the input is referenced only as the guard step's own env binding or a ref: key" "" "$aliased"
+# EXACTLY two mentions per guarded job, not "at least". `-ge` let a spare mention ride along
+# unexamined; the assertion's own name claims one binding and one `ref:` apiece, so it is an
+# equality. Still a property rather than a literal: a third guarded job moves both sides at once.
 nmentions=$(awk '
   { line = $0; sub(/^[[:space:]]*/, "", line) }
   line ~ /^#/ { next }
@@ -287,8 +329,7 @@ nmentions=$(awk '
   END { print n+0 }
 ' "$WF")
 want=$((nrefs * 2))
-if [ "$nmentions" -ge "$want" ]; then ok "the alias scan saw one env binding and one ref: per guarded job ($nmentions)"
-else bad "the alias scan saw one env binding and one ref: per guarded job" "$nmentions, expected >= $want — anchors are stale, coverage is vacuous"; fi
+eq "the alias scan saw one env binding and one ref: per guarded job ($nmentions)" "$want" "$nmentions"
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

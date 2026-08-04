@@ -28,8 +28,12 @@ name: PR Risk Grade (reusable)
 # `uses:` itself at a fork commit is already running the fork's copy of this very file. Nor does
 # it prove the caller SHA-pinned `uses:` at all: the value arrives already resolved, so a
 # `uses: ...@v1` caller passing the SHA that tag points at satisfies both axes (it just goes red
-# the next time `v1` is force-moved). Both cases are bounded by review of the caller on its base
-# branch, not by any check this workflow can make. Call this workflow DIRECTLY — a nested
+# the next time `v1` is force-moved) — and a caller that passes the `github.job_workflow_sha`
+# CONTEXT here rather than a written-out SHA satisfies them permanently, since the passthrough
+# re-resolves on every run and so never needs repinning. That is the shape to look for when
+# reviewing a caller: `workflows_ref` must be a literal 40-hex SHA in the caller's `with:`, equal
+# to the one in `uses:`, never an expression. Both cases are bounded by review of the caller on
+# its base branch, not by any check this workflow can make. Call this workflow DIRECTLY — a nested
 # `workflow_call` chain through an org wrapper is unsupported, because `job_workflow_sha` names
 # one commit and the wrapper's is not this file's; see the `workflows_ref` input for the detail.
 # A consumer repo sharpens the generic defaults by committing
@@ -311,6 +315,20 @@ on:
           line on its base branch is what bounds it, and org policy already
           requires a full commit SHA there (a floating one fails the
           pin-validation consumer CI runs).
+
+
+          NOR CAN IT SEE THAT THIS VALUE WAS WRITTEN OUT. `job_workflow_sha`
+          also resolves in the CALLER's own `with:` block, so a caller can hand
+          this input that context expression instead of a SHA. It then equals
+          itself by construction and passes both axes on every run, forever,
+          while `uses:` sits on `@v1` or `@main` — the value that arrives here
+          is identical either way, so the guard has nothing to distinguish. This
+          is strictly worse than the tag-pinned case below, because the
+          passthrough never needs repinning and so never produces the loud
+          failure that would otherwise surface the drift. WHEN REVIEWING A
+          CALLER, require a LITERAL 40-hex SHA in `with: workflows_ref:`,
+          character-for-character the one in `uses:` — an expression of any
+          kind, and this whole contract is decoration.
 
 
           What a floating `uses:` does buy is a LOUD failure on the next
