@@ -24,10 +24,18 @@ name: Bump pr-risk callers
 # repo-level Actions variable `PR_RISK_CALLERS` (config, not a credential — a
 # variable, not a secret, since secrets are write-only via the API) as a JSON
 # array of {"repo","file","label"} objects, same shape as the other fleets'
-# variables. Every repo name is `::add-mask::`ed out of the (public) run logs
-# before it is ever echoed. The variable is seeded EMPTY (`[]`) — an empty list
-# is a clean no-op here (ALLOW_EMPTY below); the rollout's per-repo caller
-# tickets add entries as callers land.
+# variables. `bump-callers.sh` `::add-mask::`es every repo name before IT echoes
+# anything.
+# KNOWN GAP (shared by every entrypoint in this family, tracked separately):
+# passing the roster through this step's `env:` means Actions prints the raw
+# value in the step's env dump before the script — and its masking — ever runs.
+# Closing it means reading the variable at run time (`gh variable get`) and
+# masking it first, which needs a token permission this fleet does not mint
+# today; it is a fleet-wide change, not one this entrypoint can make alone.
+# Until then, treat the roster as visible in the public run log.
+# The variable is seeded EMPTY (`[]`) — an empty list is a clean no-op here
+# (ALLOW_EMPTY below); the rollout's per-repo caller tickets add entries as
+# callers land.
 #
 # Update flow — adding/removing a caller needs NO public commit:
 #   gh variable set PR_RISK_CALLERS --repo Comfy-Org/github-workflows \
@@ -47,6 +55,15 @@ on:
       # behavior change here needs the same caller bump as a workflow-file
       # change, or pinned callers silently drift onto stale tool behavior.
       - scripts/pr-risk/**
+      # …but the tests and the tool README under that dir are NOT part of what a
+      # pinned caller executes, so a test-only or docs-only commit would fan a
+      # pure-churn SHA-bump PR (identical consumer behavior, a review round in
+      # every caller repo) across the whole fleet. Exclude them so a bump PR
+      # keeps meaning "consumer-visible behavior changed". Negations only strip
+      # the paths they match: a commit touching a tool script AND its test still
+      # matches the positive pattern and still bumps.
+      - '!scripts/pr-risk/tests/**'
+      - '!scripts/pr-risk/README.md'
 
 permissions:
   contents: read
@@ -72,6 +89,11 @@ jobs:
     # only ever skips stray manual runs.
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # The job is a bounded loop of `git`/`gh` network calls; nothing here should
+    # take minutes. Without this a hung call would hold a runner for the default
+    # 6 hours (and, via the serializing concurrency group above, block every
+    # later bump behind it).
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -84,7 +106,22 @@ jobs:
         with:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+          # `owner:` with no `repositories:` is deliberate and cannot be narrowed:
+          # the caller list is a runtime variable (see the header), so the repos
+          # this token must reach are not knowable at authoring time — and naming
+          # them here would leak private caller names into a public file.
+          #
+          # The PERMISSIONS can be narrowed without naming anything, so they are:
+          # unset, the minted token carries every permission the app holds on every
+          # repo it is installed on, far past what this bumper needs. It commits
+          # the rewritten caller file via the Git Data API (contents) and opens or
+          # updates the bump PR (pull-requests); `gh pr create --label` stamps the
+          # caller's label through the issues API (issues) — same trio, and the
+          # same reasoning, as the groom and auto-label fleets' entrypoints.
           owner: Comfy-Org
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
 
       - name: Bump SHA in caller repos
         env:
@@ -97,14 +134,16 @@ jobs:
           ALLOW_EMPTY: "true"
           # JSON array of {"repo","file","label"} — see the header comment for the
           # update flow. Kept in a variable (not the file) so private caller names
-          # never land in this public repo or its logs.
+          # never land in this public repo. NOTE: this env binding is itself the
+          # known log-exposure gap documented in the header — Actions dumps the
+          # step env before the script's `::add-mask::` runs.
           CALLERS_JSON: ${{ vars.PR_RISK_CALLERS }}
         run: |
           # The main-only ref guard above cannot catch a manual RE-RUN of an
           # older main run: github.ref is refs/heads/main but github.sha is
           # that run's original (now stale) commit, and the bumper would
-          # force-repin every caller to it. Only act from the current tip —
-          # any newer push has its own queued run that does the bump.
+          # force-repin every caller to it. So establish the current main tip
+          # first; the guard below decides whether this run is genuinely stale.
           # Don't pipe into `cut`: the pipeline would report cut's status, so a
           # failed ls-remote (network blip, remote hiccup) yields an EMPTY
           # main_tip that then compares unequal to github.sha and silently
@@ -119,9 +158,55 @@ jobs:
             echo "::error::git ls-remote returned no SHA for refs/heads/main"
             exit 1
           fi
+          # The paths this fleet's push trigger watches — the reusable workflow
+          # plus the run-time tool sources a pinned caller executes. This MUST
+          # mirror the `paths:` filter above, exclusions included: the check
+          # below reads "did a later commit start a run of its own?", and a path
+          # the filter ignores starts none. Compare a path the filter excludes
+          # (tests/, the tool README) and a test-only commit landing behind us
+          # looks like a newer run that will do the bump — when in fact nobody
+          # will, and every caller silently freezes.
+          WATCHED=(
+            .github/workflows/pr-risk.yml
+            scripts/pr-risk
+            ':(exclude)scripts/pr-risk/tests'
+            ':(exclude)scripts/pr-risk/README.md'
+          )
           if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
-            echo "github.sha $GITHUB_SHA is not the current main tip ($main_tip) — stale run/re-run; nothing to bump"
-            exit 0
+            # main has moved on. That alone does NOT make this run stale: the
+            # push trigger is path-filtered to WATCHED, so an unrelated commit
+            # landing in the seconds between this run's trigger and this check
+            # starts NO run of its own. Skipping on a bare SHA mismatch would
+            # discard the only run for this change and leave every caller
+            # frozen — the exact pin-drift this fleet exists to prevent.
+            # What actually distinguishes a stale re-run is that a WATCHED path
+            # has CHANGED since: then a later commit did touch the filter and
+            # does have its own run, which will pin the newer content.
+            if ! git fetch --depth=1 origin main; then
+              echo "::error::Could not fetch the current main tip to compare the watched paths"
+              exit 1
+            fi
+            main_tip=$(git rev-parse FETCH_HEAD)
+            for gone in .github/workflows/pr-risk.yml scripts/pr-risk; do
+              if ! git rev-parse --verify --quiet "FETCH_HEAD:$gone" >/dev/null; then
+                echo "$gone no longer exists on main ($main_tip) — decommissioned; nothing to bump"
+                exit 0
+              fi
+            done
+            # --quiet implies --exit-code: 0 = identical, 1 = changed, anything
+            # else = the comparison itself failed. Treating that failure as
+            # "changed" would silently no-op the fleet on a git hiccup — the same
+            # trap the ls-remote guard above avoids — so fail loudly instead.
+            diff_rc=0
+            git diff --quiet HEAD FETCH_HEAD -- "${WATCHED[@]}" || diff_rc=$?
+            if (( diff_rc == 1 )); then
+              echo "github.sha $GITHUB_SHA is behind main ($main_tip) and a watched path changed since — stale run/re-run; the newer commit has its own run. Nothing to bump"
+              exit 0
+            elif (( diff_rc != 0 )); then
+              echo "::error::Could not compare the watched paths between $GITHUB_SHA and main ($main_tip) (git diff exit $diff_rc)"
+              exit 1
+            fi
+            echo "main moved to $main_tip since $GITHUB_SHA, but the watched paths are unchanged — this run is still the only one for that change; proceeding"
           fi
           # The push path filter also matches a commit that DELETES the
           # reusable workflow — or the run-time tool sources callers build from
