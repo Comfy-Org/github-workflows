@@ -139,6 +139,15 @@ env:
   DIFF_EXCLUDES: ${{ inputs.diff_excludes }}
   # Where the assets checkout lands (this repo, .github/cursor-review/*).
   CURSOR_REVIEW_ASSETS: ${{ github.workspace }}/_cursor_review_assets/.github/cursor-review
+  # Cursor CLI pin — a versioned, checksummed artifact instead of the mutable
+  # cursor.com/install script (BE-5869). Old versions stay downloadable, so a
+  # Cursor release never breaks this; the pin moves only via a reviewed PR.
+  # Consumed by .github/cursor-review/install-cursor-cli.sh, the ONE installer
+  # all three CLI-using jobs run (preflight, review matrix, consolidate).
+  CURSOR_CLI_VERSION: 2026.07.23-e383d2b
+  # sha256 of the linux/x64 agent-cli-package.tar.gz (all jobs run ubuntu-latest).
+  # Cross-checked against nixpkgs pkgs/by-name/cu/cursor-cli at pin time.
+  CURSOR_CLI_SHA256: 702ad595213bee5df0268be9f80a19f29fcceaa2a42fc55e39f2b5199051f0c4
 
 jobs:
   gate:
@@ -341,6 +350,16 @@ jobs:
           JSON
           echo "models=$(jq -c . /tmp/models.json)" >> "$GITHUB_OUTPUT"
 
+      - name: Load cursor-review assets
+        # Same trusted-assets checkout the review/consolidate jobs do — this
+        # job needs it for install-cursor-cli.sh.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _cursor_review_assets
+          persist-credentials: false
+
       - name: Install Cursor agent CLI
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
@@ -352,57 +371,7 @@ jobs:
             echo "No CURSOR_API_KEY (fork PR or unset secret) — skipping catalog preflight."
             exit 0
           fi
-          # Download-then-execute instead of curl|bash: a pipeline's exit status is its
-          # last command's, so a failed curl piped into bash exits 0 and the missing
-          # binary resurfaces later as a misleading 'command not found' (BE-5631).
-          # mktemp rather than a fixed name: nothing can pre-place a symlink at a
-          # predictable path for `curl -o` to write through.
-          installer="$(mktemp "${RUNNER_TEMP:-/tmp}/cursor-install.XXXXXX")"
-          # Both halves are time-bounded, because the fetch is two downloads: curl
-          # gets the ~6 KB bootstrap, then the bootstrap itself pulls the actual
-          # cursor-agent payload. Unbounded, a stalled cursor.com burns the whole job
-          # budget and surfaces as an opaque cancelled job rather than the readable
-          # install failure this step exists to produce. --max-time is per attempt and
-          # --retry-max-time only bounds when a NEW attempt may start, so an attempt
-          # beginning just under 120s still gets its full 60s: curl's worst case is
-          # ~3 min. +240s for the installer (plus a 30s SIGKILL grace) keeps the total
-          # inside the tightest job cap here — preflight's timeout-minutes: 10.
-          curl -fsSL --connect-timeout 10 --max-time 60 \
-            --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 120 \
-            https://cursor.com/install -o "$installer"
-          # A 200 with an empty body would make the installer a silent no-op.
-          if [ ! -s "$installer" ]; then
-            echo "::error::cursor.com/install returned an empty body — nothing to execute."
-            exit 1
-          fi
-          # -k escalates to SIGKILL, so an installer that traps SIGTERM cannot outlive
-          # the cap. </dev/null keeps stdin closed, as it effectively was under
-          # curl|bash, so an installer that branches on interactive stdin is unaffected.
-          rc=0
-          timeout -k 30 240 bash "$installer" </dev/null || rc=$?
-          if [ "$rc" -ne 0 ]; then
-            echo "::error::cursor.com installer exited $rc (124 usually means it exceeded the 240s cap)."
-            exit "$rc"
-          fi
-          # $GITHUB_PATH only applies to LATER steps, so assert against the install
-          # location directly. The installer symlinks cursor-agent into ~/.local/bin,
-          # which is already on the runner PATH — hence command -v is the real check
-          # and the explicit path is the fallback. -f as well as -x, because -x alone
-          # is also true for a searchable directory sitting at that path.
-          agent="$HOME/.local/bin/cursor-agent"
-          if ! command -v cursor-agent >/dev/null 2>&1 \
-            && ! { [ -f "$agent" ] && [ -x "$agent" ]; }; then
-            echo "::error::cursor-agent missing after install — the installer ran but produced no cursor-agent binary (expected a symlink in \$HOME/.local/bin)."
-            exit 1
-          fi
-          # Export the directory the installer actually writes to. It is already on the
-          # GitHub-hosted runner's default PATH, so this is a no-op there; it matters
-          # when only the explicit-path fallback above satisfied the assertion, which
-          # would otherwise still leave later steps with 'cursor-agent: command not
-          # found'. Replaces a vestigial $HOME/.cursor/bin entry: the current installer
-          # never creates that directory, and any run reaching this line has already
-          # proven cursor-agent is on PATH or in ~/.local/bin, so it never contributed.
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          bash "$CURSOR_REVIEW_ASSETS/install-cursor-cli.sh"
 
       - name: Validate model pins against live catalog
         env:
@@ -536,66 +505,21 @@ jobs:
           echo "Diff size: $(wc -l < /tmp/pr-diff.patch) lines"
 
       - name: Install Cursor agent CLI
-        run: |
-          # Download-then-execute instead of curl|bash: a pipeline's exit status is its
-          # last command's, so a failed curl piped into bash exits 0 and the missing
-          # binary resurfaces later as a misleading 'command not found' (BE-5631).
-          # mktemp rather than a fixed name: nothing can pre-place a symlink at a
-          # predictable path for `curl -o` to write through.
-          installer="$(mktemp "${RUNNER_TEMP:-/tmp}/cursor-install.XXXXXX")"
-          # Both halves are time-bounded, because the fetch is two downloads: curl
-          # gets the ~6 KB bootstrap, then the bootstrap itself pulls the actual
-          # cursor-agent payload. Unbounded, a stalled cursor.com burns the whole job
-          # budget and surfaces as an opaque cancelled job rather than the readable
-          # install failure this step exists to produce. --max-time is per attempt and
-          # --retry-max-time only bounds when a NEW attempt may start, so an attempt
-          # beginning just under 120s still gets its full 60s: curl's worst case is
-          # ~3 min. +240s for the installer (plus a 30s SIGKILL grace) keeps the total
-          # inside the tightest job cap here — preflight's timeout-minutes: 10.
-          curl -fsSL --connect-timeout 10 --max-time 60 \
-            --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 120 \
-            https://cursor.com/install -o "$installer"
-          # A 200 with an empty body would make the installer a silent no-op.
-          if [ ! -s "$installer" ]; then
-            echo "::error::cursor.com/install returned an empty body — nothing to execute."
-            exit 1
-          fi
-          # -k escalates to SIGKILL, so an installer that traps SIGTERM cannot outlive
-          # the cap. </dev/null keeps stdin closed, as it effectively was under
-          # curl|bash, so an installer that branches on interactive stdin is unaffected.
-          rc=0
-          timeout -k 30 240 bash "$installer" </dev/null || rc=$?
-          if [ "$rc" -ne 0 ]; then
-            echo "::error::cursor.com installer exited $rc (124 usually means it exceeded the 240s cap)."
-            exit "$rc"
-          fi
-          # $GITHUB_PATH only applies to LATER steps, so assert against the install
-          # location directly. The installer symlinks cursor-agent into ~/.local/bin,
-          # which is already on the runner PATH — hence command -v is the real check
-          # and the explicit path is the fallback. -f as well as -x, because -x alone
-          # is also true for a searchable directory sitting at that path.
-          agent="$HOME/.local/bin/cursor-agent"
-          if ! command -v cursor-agent >/dev/null 2>&1 \
-            && ! { [ -f "$agent" ] && [ -x "$agent" ]; }; then
-            echo "::error::cursor-agent missing after install — the installer ran but produced no cursor-agent binary (expected a symlink in \$HOME/.local/bin)."
-            exit 1
-          fi
-          # Export the directory the installer actually writes to. It is already on the
-          # GitHub-hosted runner's default PATH, so this is a no-op there; it matters
-          # when only the explicit-path fallback above satisfied the assertion, which
-          # would otherwise still leave later steps with 'cursor-agent: command not
-          # found'. Replaces a vestigial $HOME/.cursor/bin entry: the current installer
-          # never creates that directory, and any run reaching this line has already
-          # proven cursor-agent is on PATH or in ~/.local/bin, so it never contributed.
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        run: bash "$CURSOR_REVIEW_ASSETS/install-cursor-cli.sh"
 
-      - name: Log Cursor agent version
-        # The install script is unpinned (curl | bash from cursor.com), so we
-        # log the installed version into the run for forensics rather than
-        # gating on a hard-coded baseline. A version equality check produced
-        # daily toil without adding integrity protection — a CDN compromise
-        # would just ship malicious bits as a "new version" we'd then bump to.
-        run: cursor-agent --version
+      - name: Verify Cursor agent version
+        # The installer already asserts this once. Re-asserted here, on the
+        # PATH-resolved binary immediately before the review runs, so a swap
+        # between install and use (a CLI self-update, a stale symlink) can't
+        # quietly hand the review to unpinned bits — and the version still
+        # lands in the log for forensics.
+        run: |
+          installed="$(cursor-agent --version)"
+          if [ "$installed" != "$CURSOR_CLI_VERSION" ]; then
+            echo "::error::cursor-agent reports '${installed}', expected the pinned '${CURSOR_CLI_VERSION}'."
+            exit 1
+          fi
+          echo "cursor-agent ${installed} (matches CURSOR_CLI_VERSION)."
 
       - name: Build prompt
         env:
@@ -710,58 +634,7 @@ jobs:
           git diff "$BASE_SHA...$HEAD_SHA" -- . $DIFF_EXCLUDES > /tmp/pr-diff.patch
 
       - name: Install Cursor agent CLI
-        run: |
-          # Download-then-execute instead of curl|bash: a pipeline's exit status is its
-          # last command's, so a failed curl piped into bash exits 0 and the missing
-          # binary resurfaces later as a misleading 'command not found' (BE-5631).
-          # mktemp rather than a fixed name: nothing can pre-place a symlink at a
-          # predictable path for `curl -o` to write through.
-          installer="$(mktemp "${RUNNER_TEMP:-/tmp}/cursor-install.XXXXXX")"
-          # Both halves are time-bounded, because the fetch is two downloads: curl
-          # gets the ~6 KB bootstrap, then the bootstrap itself pulls the actual
-          # cursor-agent payload. Unbounded, a stalled cursor.com burns the whole job
-          # budget and surfaces as an opaque cancelled job rather than the readable
-          # install failure this step exists to produce. --max-time is per attempt and
-          # --retry-max-time only bounds when a NEW attempt may start, so an attempt
-          # beginning just under 120s still gets its full 60s: curl's worst case is
-          # ~3 min. +240s for the installer (plus a 30s SIGKILL grace) keeps the total
-          # inside the tightest job cap here — preflight's timeout-minutes: 10.
-          curl -fsSL --connect-timeout 10 --max-time 60 \
-            --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 120 \
-            https://cursor.com/install -o "$installer"
-          # A 200 with an empty body would make the installer a silent no-op.
-          if [ ! -s "$installer" ]; then
-            echo "::error::cursor.com/install returned an empty body — nothing to execute."
-            exit 1
-          fi
-          # -k escalates to SIGKILL, so an installer that traps SIGTERM cannot outlive
-          # the cap. </dev/null keeps stdin closed, as it effectively was under
-          # curl|bash, so an installer that branches on interactive stdin is unaffected.
-          rc=0
-          timeout -k 30 240 bash "$installer" </dev/null || rc=$?
-          if [ "$rc" -ne 0 ]; then
-            echo "::error::cursor.com installer exited $rc (124 usually means it exceeded the 240s cap)."
-            exit "$rc"
-          fi
-          # $GITHUB_PATH only applies to LATER steps, so assert against the install
-          # location directly. The installer symlinks cursor-agent into ~/.local/bin,
-          # which is already on the runner PATH — hence command -v is the real check
-          # and the explicit path is the fallback. -f as well as -x, because -x alone
-          # is also true for a searchable directory sitting at that path.
-          agent="$HOME/.local/bin/cursor-agent"
-          if ! command -v cursor-agent >/dev/null 2>&1 \
-            && ! { [ -f "$agent" ] && [ -x "$agent" ]; }; then
-            echo "::error::cursor-agent missing after install — the installer ran but produced no cursor-agent binary (expected a symlink in \$HOME/.local/bin)."
-            exit 1
-          fi
-          # Export the directory the installer actually writes to. It is already on the
-          # GitHub-hosted runner's default PATH, so this is a no-op there; it matters
-          # when only the explicit-path fallback above satisfied the assertion, which
-          # would otherwise still leave later steps with 'cursor-agent: command not
-          # found'. Replaces a vestigial $HOME/.cursor/bin entry: the current installer
-          # never creates that directory, and any run reaching this line has already
-          # proven cursor-agent is on PATH or in ~/.local/bin, so it never contributed.
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        run: bash "$CURSOR_REVIEW_ASSETS/install-cursor-cli.sh"
 
       - name: Download panel findings
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
