@@ -64,11 +64,62 @@ The **groom** fleet is the one that most needs this: a groom caller pins the
 reusable **twice** — the `uses:` SHA *and* the `workflows_ref:` input that loads
 the finder/verifier/builder briefs plus the dedup ledger. Those must stay in
 lock-step or a run executes one version's workflow against another version's
-briefs. `bump-callers.sh`'s pin rewrite moves both (it matches the `uses:` line
-and any bare `workflows_ref:` line), so the fleet cannot drift into that split
-state through a hand-bump of only one. It also re-points the `# main @ <short>`
-pin comment those callers carry — a comment still naming the old commit after the
-pin moved is worse than no comment.
+briefs. `bump-callers.sh`'s pin rewrite moves both, so the fleet cannot drift
+into that split state through a hand-bump of only one. It also re-points the
+`# main @ <short>` pin comment those callers carry — a comment still naming the
+old commit after the pin moved is worse than no comment.
+
+A caller pinning **two** github-workflows reusables in the same file is a
+special case: the `uses:` pin rewrite and the `# main @ <short>` comment rewrite
+are both address-restricted to the line calling THIS fleet's `WORKFLOW_FILE`, so
+a sibling fleet's pin and annotation are left untouched rather than stamped with
+this fleet's SHA (BE-4523). The legacy `# github-workflows#NN` / already-converted
+`github-workflows main (<short>)` markers name a SHA but not which reusable they
+annotate, so they are refreshed only when the file is provably ours alone;
+otherwise they are left as found and the run logs a warning. Inert for every
+caller today (all call exactly one reusable); it exists so a caller that starts
+calling two cannot be corrupted.
+
+## How the pin rewrite is scoped (and why it asserts afterwards)
+
+The rewrite targets the **pin token**, not "any 40-hex on a line that mentions
+`github-workflows`" (BE-4662). Two patterns, matched by position rather than by
+what the ref *looks like*:
+
+- `Comfy-Org/github-workflows…@<ref>` — the `uses:` pin. The owner/repo is matched
+  **case-insensitively**, because GitHub resolves `uses:` that way and a caller
+  written `comfy-org/…` is calling this repo; what follows the repo name must be
+  the `/` of a path or the `@` of a ref, so a **sibling** repo whose name merely
+  starts the same (`github-workflows-tools/action@v1`) is out of reach.
+- `workflows_ref: <ref>` as a block-mapping key, optionally quoted — the input pin.
+
+Whatever sits right after the token is the ref, so **any literal ref shape moves**
+— full sha, short sha, or a tag like `v1`. That matters because a caller whose
+`workflows_ref` is a tag used to be skipped by the old 40-hex rule while its
+`uses:` pin moved: a green-looking bump PR on a caller that is now running one
+version's workflow against another version's briefs. In the other direction, an
+unrelated full SHA that merely *shares* a line with the words `github-workflows`
+or `workflows_ref` is now unreachable, and a prose comment mentioning
+`workflows_ref:` is left as prose.
+
+Precision cuts both ways, though — a pin form the patterns don't know how to move
+would be silently left behind. So before a rewritten file can be staged, the
+script re-reads it with a deliberately **broader** reader (any non-whitespace
+value sitting where a ref belongs, comments excluded) and **asserts every
+github-workflows pin now equals the new SHA**. If one does not — today the one
+known case is a `workflows_ref` fed by a `${{ … }}` expression, which is
+intentionally never rewritten — it emits a `::warning::` naming the file and the
+stale value and **fails that repo**, exactly as it does for a transient fetch
+error. A partial bump is worse than no bump (BE-3896). An empty pin
+(`workflows_ref: ""`) and a value the rewrite could only half-move (a `#` inside
+the ref) fail the same way rather than reading back as clean.
+
+Because that reader is the one place a false positive would block an otherwise
+clean caller's bump on every run, it is bounded on both sides: comments are
+dropped by YAML's own rule (a `#` preceded by whitespace, so a `#` *inside* a
+value survives to be compared), and the `workflows_ref` key needs a real left
+boundary, so a longer key that merely ends in it (`upstream_workflows_ref: v1`)
+is not read as this repo's pin.
 
 ## The caller variables
 
