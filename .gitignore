@@ -3,6 +3,12 @@ __pycache__/
 *.py[cod]
 *.pyc
 
-# Go — a `go build ./...` in the package dir drops the compiled binary next to
-# the sources; workflows build it into ${RUNNER_TEMP} instead (never tracked).
-scripts/check-pr-size/check-pr-size
+# Go build output. pr-size.yml compiles this from source into RUNNER_TEMP on
+# every run, so a committed binary is dead weight — and a local `go build` here
+# produces a host-arch executable that cannot run on the ubuntu-latest runners.
+/scripts/check-pr-size/check-pr-size
+/scripts/check-pr-size/check-pr-size.exe
+
+# Stray local logs
+err.log
+*.err.log

@@ -1,20 +1,48 @@
 name: Test groom scripts
 
-# Runs the unit tests for the groom dedup/rejection ledger (ledger.py). The
-# ledger is the durable memory that stops the stateless groom CI run from
-# re-filing already-filed or human-rejected findings every run, so a regression
-# here would silently re-open the spam it exists to prevent — cheap to guard
-# with a unit run on change.
+# Runs the unit tests for the groom dedup/rejection ledger (ledger.py) and the
+# runtime cadence gate (interval.py). The ledger is the durable memory that stops
+# the stateless groom CI run from re-filing already-filed or human-rejected
+# findings every run, so a regression here would silently re-open the spam it
+# exists to prevent — cheap to guard with a unit run on change. It also runs the
+# config tests and the BE-5373 pin guard, which is why the path filter reaches
+# outside `.github/groom/` — see the comment on those entries.
 
 on:
   pull_request:
     paths:
       - '.github/groom/**'
+      # `groom.yml` and `dependabot.yml` are trigger paths because this suite
+      # asserts ACROSS files, in two independent places:
+      #   * BE-4814 — interval.py pins literals the workflow PRODUCES and the
+      #     module CONSUMES (today the finder's agent step name), so a rename in
+      #     groom.yml has to run these tests to be caught, not merge unwatched
+      #     because the change touched no file under .github/groom/.
+      #   * BE-5373 — test_claude_code_pin.py requires the CLI version to exist
+      #     only in .github/groom/package.json AND dependabot.yml to keep
+      #     watching it. Without both here, the regression the guard exists to
+      #     catch (a hardcoded version literal re-added to groom.yml, or the npm
+      #     entry dropped) lands in a PR that never runs the guard.
+      - '.github/workflows/groom.yml'
+      - '.github/dependabot.yml'
       - '.github/workflows/test-groom-scripts.yml'
   push:
     branches: [main]
     paths:
       - '.github/groom/**'
+      # `groom.yml` and `dependabot.yml` are trigger paths because this suite
+      # asserts ACROSS files, in two independent places:
+      #   * BE-4814 — interval.py pins literals the workflow PRODUCES and the
+      #     module CONSUMES (today the finder's agent step name), so a rename in
+      #     groom.yml has to run these tests to be caught, not merge unwatched
+      #     because the change touched no file under .github/groom/.
+      #   * BE-5373 — test_claude_code_pin.py requires the CLI version to exist
+      #     only in .github/groom/package.json AND dependabot.yml to keep
+      #     watching it. Without both here, the regression the guard exists to
+      #     catch (a hardcoded version literal re-added to groom.yml, or the npm
+      #     entry dropped) lands in a PR that never runs the guard.
+      - '.github/workflows/groom.yml'
+      - '.github/dependabot.yml'
       - '.github/workflows/test-groom-scripts.yml'
 
 permissions:
@@ -26,14 +54,51 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
 
+      # test_claude_code_pin.py's TestPinnedDependencyShape shells out to
+      # `npm view` to check that the pinned CLI's dependency tree is still closed
+      # (BE-5582). npm happens to exist on the `ubuntu-latest` image, but relying
+      # on that makes it an UNDECLARED property of the runner: if the image ever
+      # drops it, or this job moves into a python-only container, the guard
+      # degrades to a skip and a dependency-changing bump merges green. Declaring
+      # Node here makes the dependency explicit — and the guard hard-fails rather
+      # than skipping when npm is missing in CI, so a broken step is reported
+      # instead of silently disarming it.
+      - name: Set up Node (for the BE-5373 pin's dependency-shape guard)
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
       - name: Run groom ledger unit tests
         run: python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
+
+  # Deterministic proofs of the agent-sandbox.sh confinement contract and the
+  # broker.mjs credential proxy (BE-4302, phase 1). No claude, no API key, no
+  # spend — every property is asserted with `bash -c` as the sandboxed command.
+  # Runs here (a PR-gating test workflow), NOT in ci-groom.yml: ci-groom.yml is the
+  # scheduled groom CALLER that deliberately never fires on a PR, so a job there
+  # could never be seen green on this change. shellcheck (repo convention) + node +
+  # openssl + curl are preinstalled on ubuntu-latest; the wrapper's preflight
+  # installs bubblewrap + the AppArmor profile the runner image needs.
+  sandbox-tests:
+    name: sandbox-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Shellcheck the sandbox scripts
+        run: shellcheck -x .github/groom/agent-sandbox.sh .github/groom/tests/sandbox-tests.sh
+
+      - name: Prove sandbox confinement + broker proxy (no API spend)
+        run: bash .github/groom/tests/sandbox-tests.sh
