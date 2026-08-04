@@ -31,7 +31,7 @@ forward automatically instead of silently drifting commits behind.
 | [`bump-auto-label-callers.yml`](../workflows/bump-auto-label-callers.yml) | `cursor-review-auto-label.yml` | `AUTO_LABEL_CALLERS` | non-empty (hard-fails if empty) |
 | [`bump-detect-unreviewed-merge-callers.yml`](../workflows/bump-detect-unreviewed-merge-callers.yml) | `detect-unreviewed-merge.yml` | `DETECT_UNREVIEWED_MERGE_CALLERS` | **not yet seeded** — hard-fails until it is (see below) |
 
-#### Why the detect-unreviewed-merge roster is not seeded yet
+### Why the detect-unreviewed-merge roster is not seeded yet
 
 Its 12 live callers are known and correctly wired (each pins a full 40-hex SHA
 against this repo's path, i.e. exactly what the rewrite moves). It is unseeded

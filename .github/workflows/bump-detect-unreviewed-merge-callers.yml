@@ -85,6 +85,14 @@ permissions:
 # the committed diff pinned to a stale SHA. cancel-in-progress: false lets the
 # running bump finish; GitHub keeps only the newest pending run, so the latest
 # SHA always wins (BE-3882).
+# Edge, shared by all seven bump-* entrypoints: "newest pending" is by ENQUEUE
+# time, not by commit date, so manually re-running a superseded run while a
+# newer push run is still pending evicts that newer run — the re-run then finds
+# WATCHED changed and correctly no-ops, and nobody pins the newer SHA. It is
+# self-healing (the next change to WATCHED bumps everything forward) and
+# recoverable now (`workflow_dispatch` from main pins the current tip), so it is
+# documented rather than guarded against here: the guard belongs in the shared
+# staleness script, not forked into one of seven copies.
 concurrency:
   group: bump-detect-unreviewed-merge-callers
   cancel-in-progress: false
@@ -141,8 +149,13 @@ jobs:
           TAG: detect-unreviewed-merge
           WORKFLOW_FILE: detect-unreviewed-merge.yml
           # Redundant with bump-callers.sh's own default, deliberately — see the
-          # header: an empty roster here is a clobbered variable, not an empty
-          # fleet, and must fail loudly regardless of what that default becomes.
+          # header: this fleet has a known non-empty set of live callers, so an
+          # empty roster is never "this fleet has no members" and must fail
+          # loudly regardless of what that default becomes. RIGHT NOW that
+          # failure is EXPECTED — the roster ships unseeded until the masking
+          # fix lands (header, "READ THIS BEFORE ACTING ON A RED RUN"). Do NOT
+          # respond to it by seeding the variable; only after masking is in
+          # place does an empty roster mean it was clobbered.
           ALLOW_EMPTY: "false"
           # JSON array of {"repo","file","label"} — see the header comment for the
           # update flow. Kept in a variable (not the file) so private caller names
