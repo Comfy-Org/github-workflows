@@ -1,0 +1,76 @@
+name: CI - Assign Reviewers
+
+# Thin caller enrolling THIS repo in its own expertise-aware assignee routing.
+# The logic lives in assign-reviewers.yml in this same repo; the caller pins it
+# by full commit SHA like every external consumer — a local `uses: ./...` path
+# would run the PR's OWN copy of the router, letting a PR rewrite who gets
+# assigned to review it. Named ci-assign-reviewers.yml because the canonical
+# caller path (assign-reviewers.yml) is occupied here by the reusable itself,
+# same as ci-cursor-review.yml / ci-detect-unreviewed-merge.yml / ci-groom.yml.
+#
+# WHAT IT WRITES: the ASSIGNEE field, not reviewer requests — despite the
+# workflow's name. "This org routes/alerts people via the ASSIGNEE field"
+# (assign-reviewers.yml's header). That is the point of enrolling: PRs here were
+# sitting with no assignee, so nothing routed them to anyone who could approve.
+#
+# The expertise map is .github/reviewers.yml in this repo (seeded from who has
+# actually APPROVED merged PRs per area — see that file's header for why git
+# history was NOT the source). It is read from the PR HEAD sha, so a PR's own
+# edit to the map takes effect on that same PR.
+#
+# PREREQUISITES, both already provisioned here for cursor-review / the bumpers:
+# vars.APP_ID + secrets.CLOUD_CODE_BOT_PRIVATE_KEY. The App token (not
+# GITHUB_TOKEN) does the assigning — the reusable needs `Pull requests: write`
+# to set assignees and this job therefore needs only `contents: read` itself.
+#
+# FORK PRs ARE NOT ROUTED, and that is deliberate. `pull_request` withholds
+# repository secrets from fork-originated runs, so CLOUD_CODE_BOT_PRIVATE_KEY
+# arrives empty and the App-token mint hard-fails — a red X and no routing
+# either way. The job is guarded to skip cleanly on forks instead (see `if:`
+# below). Routing them would mean `pull_request_target`, which runs privileged
+# against untrusted HEAD and would turn the head-sha map read described above
+# into a real escalation; not a trade worth making for assignee routing.
+#
+# PIN FRESHNESS (operator): the pin below only tracks assign-reviewers.yml once
+# this repo is listed in vars.ASSIGN_REVIEWERS_CALLERS, which
+# bump-assign-reviewers-callers.yml fans bumps out to. Until then the pin is
+# updated by hand, same as any other consumer that isn't enrolled.
+
+on:
+  pull_request:
+    # `opened` covers ready PRs; `ready_for_review` catches a draft being
+    # promoted (the reusable skips drafts, so a PR opened as a draft would
+    # otherwise never get routed); `reopened` gives a second chance to a PR that
+    # was closed still unrouted (e.g. its `opened` run failed). Deliberately NOT
+    # `synchronize` — re-running on every push would fight a human who
+    # reassigned the PR on purpose. Re-firing is safe regardless: the reusable
+    # skips any PR that already has a non-author assignee.
+    types: [opened, ready_for_review, reopened]
+
+# Never let routing fight itself: two events for the same PR (opened, then
+# ready_for_review moments later) would both read open-assignee load and could
+# both assign, overshooting num_reviewers.
+concurrency:
+  group: assign-reviewers-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  assign:
+    # Same-repo branches only. On a fork PR the secret below is empty (see
+    # "FORK PRs" in the header), so without this the App-token step fails and
+    # every external contribution carries a red check for a routing decision
+    # that could never have been made anyway. A skipped job reports as neutral.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      # Only `contents: read` — the reusable reads .github/reviewers.yml from the
+      # head sha and does every write with the CLOUD_CODE_BOT App token, so no
+      # pull-requests/issues GITHUB_TOKEN scope is needed here.
+      contents: read
+    uses: Comfy-Org/github-workflows/.github/workflows/assign-reviewers.yml@29a81cab43766adc52a6f2adadcab63f0db7f6c5 # main @ 29a81ca — assign-reviewers.yml not on the v1 tag
+    with:
+      # ONE assignee per PR, matching how this repo's PRs are actually tracked
+      # (a single named owner, not a pair). Raise to 2 if single-owner PRs start
+      # stalling — the reusable's own default is 2.
+      num_reviewers: 1
+    secrets:
+      CLOUD_CODE_BOT_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}

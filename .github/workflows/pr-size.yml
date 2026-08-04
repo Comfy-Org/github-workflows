@@ -154,7 +154,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout PR head
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           # Full history for all refs, so the base SHA and the merge-base
           # three-dot diff resolve without a separate authenticated fetch.
@@ -166,7 +166,7 @@ jobs:
         # The tool comes from THIS workflow's repo (public, pinned via
         # workflows_ref) — never from the PR checkout, so no PR-authored code
         # runs in this job.
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: Comfy-Org/github-workflows
           ref: ${{ inputs.workflows_ref }}
@@ -174,7 +174,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16  # v6.5.0
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           go-version-file: _pr_size_tool/scripts/check-pr-size/go.mod
           # The module is dependency-free (no go.sum) — nothing to cache.
@@ -281,13 +281,25 @@ jobs:
           app-id: ${{ inputs.bot_app_id }}
           private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
           # Scope the token to exactly what the upsert uses: the sticky comment
-          # rides the issues comments API, so issues:write is the only permission
-          # required. Requesting more (e.g. pull-requests:write) makes the mint
-          # 422 on an installation not granted it, for no gain.
-          permission-issues: write
+          # rides the issues-comments API on a PULL REQUEST, and for GitHub Apps
+          # that endpoint checks the app's Pull requests permission (not Issues) —
+          # so pull-requests:write is the one scope required (read is implied for
+          # the list-comments GET). Requesting an ungranted extra permission (e.g.
+          # issues:write) makes the mint 422 on an installation not granted it,
+          # for no gain — this workflow only ever comments on pull requests.
+          permission-pull-requests: write
 
       - name: Upsert sticky size comment
         if: steps.bot.outcome == 'success'
+        id: upsert
+        # Best-effort, same contract as the mint step: the size verdict lives in
+        # the pr-size job and the report is always in that job's step summary, so
+        # the comment path must degrade to status + summary, never redden the
+        # check. A runtime permission failure here (e.g. a 403 because the bot
+        # app lacks Pull requests on this installation — proven live on Jul-24)
+        # would otherwise escape the mint-only guard and fail the job, so tolerate
+        # it and let "Note degraded mode" report it.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.bot.outputs.token }}
           REPO: ${{ github.repository }}
@@ -321,12 +333,17 @@ jobs:
         # Covers every path where no comment is posted so the job never goes
         # green silently: "download failed" (dl errored under continue-on-error,
         # e.g. the size tool crashed before uploading the report), "creds absent"
-        # (bot step skipped) and "mint failed" (bot step errored). Whenever the
-        # report artifact exists it still lives in the pr-size job's step summary.
-        if: steps.dl.outcome != 'success' || steps.bot.outcome != 'success'
+        # (bot step skipped), "mint failed" (bot step errored) and "post failed"
+        # (upsert ran but failed at runtime — any of network/5xx, rate limit, a
+        # malformed body, or a residual permission 403; the upsert step log has
+        # the real error). Whenever the report artifact exists it still lives
+        # in the pr-size job's step summary.
+        if: steps.dl.outcome != 'success' || steps.bot.outcome != 'success' || steps.upsert.outcome == 'failure'
         run: |
           if [ "${{ steps.dl.outcome }}" != "success" ]; then
             echo "No bot comment posted: the size report artifact could not be downloaded (the pr-size job likely failed before uploading it). Check the pr-size job logs."
+          elif [ "${{ steps.upsert.outcome }}" = "failure" ]; then
+            echo "No bot comment posted: the sticky comment upsert failed at runtime — see the 'Upsert sticky size comment' step log above for the actual error (e.g. a network/5xx failure, GitHub rate limit, or — now that the mint requests pull-requests:write — a residual permission 403 on an installation that has not granted it). The full report is in the pr-size job's step summary."
           else
             echo "No bot comment posted (credentials absent, or the app token could not be minted for this repo). The full report is in the pr-size job's step summary."
           fi

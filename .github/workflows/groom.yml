@@ -48,13 +48,27 @@ name: Groom (reusable)
 #   name: Groom
 #   on:
 #     schedule:
-#       - cron: '17 9 * * 1'      # weekly, Monday 09:17 UTC — never on-PR
-#     workflow_dispatch:
+#       # Frequent BASE cron (daily). Effective cadence is the runtime interval
+#       # gate, not the cron: a tick within GROOM_INTERVAL_DAYS of the last real
+#       # run no-ops cheaply (before the finder). GH Actions cron is static in the
+#       # file, so a daily tick + a runtime gate is how you get a tunable cadence.
+#       - cron: '17 9 * * *'      # daily 09:17 UTC — never on-PR
+#     workflow_dispatch:          # bypasses the INTERVAL gate (not the volume gate)
 #       inputs:
 #         dry_run:
 #           description: 'Run the audit but do NOT file issues'
 #           type: boolean
 #           default: false
+#         # OPTIONAL, builder callers only: let an operator raise the builder PR
+#         # ceiling for ONE manual run without editing the workflow. `choice` (not
+#         # `string`) so the UI offers a sanctioned list; the reusable clamps and
+#         # warns on anything else, so a value posted past this list by an API
+#         # dispatch fails closed at 0 PRs rather than aborting the run.
+#         max_prs:
+#           description: 'Builder PR ceiling for THIS dispatch (schedule uses the `with:` value)'
+#           type: choice
+#           default: '1'
+#           options: ['1', '2', '3', '5']
 #   permissions:
 #     # REQUIRED union — a reusable's nested jobs cannot request more GITHUB_TOKEN
 #     # scope than the caller grants, and GitHub validates this at STARTUP (a short
@@ -70,6 +84,13 @@ name: Groom (reusable)
 #     contents: read
 #     issues: write
 #     pull-requests: read
+#     actions: read     # REQUIRED — the `gate` job reads this workflow's run
+#     #                 # history to find the last real groom run, and DECLARES
+#     #                 # this scope. A nested job can't hold more than the caller
+#     #                 # grants and GitHub checks at STARTUP, so omitting this
+#     #                 # REJECTS the run outright ("requesting 'actions: read',
+#     #                 # but is only allowed 'actions: none'") — it does not
+#     #                 # degrade to a fail-open daily run.
 #   # REQUIRED — the dedup ledger reads GitHub issue state BEFORE filing, and
 #   # issue creation happens in a later step, so two overlapping runs could both
 #   # classify a signature as new and file duplicates (a TOCTOU race). Serialize.
@@ -82,8 +103,13 @@ name: Groom (reusable)
 #       with:
 #         # Post/act issues as cloud-code-bot instead of github-actions[bot].
 #         bot_app_id: ${{ vars.APP_ID }}
-#         workflows_ref: <sha>          # pin assets to the same ref as `uses:`
+#         # No workflows_ref: the briefs + ledger auto-load from the same commit
+#         # this `uses:` pin resolves to (github.job_workflow_sha). Set it only to
+#         # test briefs from a branch.
 #         dry_run: ${{ github.event.inputs.dry_run == 'true' }}
+#         # Cadence knob + the matching volume-gate window (BE-4004).
+#         interval_days: ${{ vars.GROOM_INTERVAL_DAYS || '7' }}
+#         cadence: ${{ vars.GROOM_INTERVAL_DAYS || '7' }}
 #         # OPT-IN auto-builder ("split C", BE-4003): turn the top few CONFIRMED
 #         # findings into REVIEW-GATED PRs (never auto-merged) instead of issues.
 #         # Default OFF — the finds-only groomer (issues) stays the default.
@@ -93,10 +119,26 @@ name: Groom (reusable)
 #         # so the file / build_pr-bail paths can open groom issues. Pilot with
 #         # dry_run:true first to preview patches without opening PRs.
 #         # builder: true
-#         # max_prs: 5            # throttle: at most N builder PRs per run
+#         # Throttle: at most N builder PRs per run. A bare number pins every run
+#         # (`max_prs: 1`). To let the optional dispatch input above override it for
+#         # one manual run, forward the input with a fallback for the SCHEDULE (which
+#         # carries no inputs, so the expression yields ''):
+#         #   max_prs: ${{ github.event.inputs.max_prs || '1' }}
+#         # No fromJSON() and no allowlist re-check are needed — max_prs is a
+#         # `string` input and the reusable does the parse/clamp (see its
+#         # description). That is the whole reason it is not `type: number`.
 #       secrets:
 #         ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 #         BOT_APP_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+#
+# CADENCE (the runtime knob, BE-4004): wire `interval_days` to the repo Actions
+# variable `GROOM_INTERVAL_DAYS` (default 7 = weekly). The caller re-evaluates it
+# each run, and on the daily base cron the reusable early-exits unless that many
+# days have elapsed since the last real groom run — so weekly -> every-3-days ->
+# daily is a variable edit, no workflow-file change. `workflow_dispatch` always
+# runs regardless. Both cadence inputs are `type: string` on purpose so a typo'd
+# variable ("weekly", "7d") degrades to the weekly default inside the gate rather
+# than failing the whole run at workflow-call time — pass them as strings.
 
 on:
   workflow_call:
@@ -114,20 +156,52 @@ on:
         default: >-
           duplication, inconsistent patterns, missing abstractions,
           complexity hotspots, dead code
+      interval_days:
+        description: >-
+          Effective run cadence in days (BE-4004). On a frequent (daily) base
+          cron, the reusable early-exits unless at least this many days have
+          elapsed since the last REAL groom run — so the caller fires daily but a
+          run actually happens ~every `interval_days`. Wire it in the caller to a
+          repo Actions variable (GROOM_INTERVAL_DAYS, falling back to 7) to retune
+          cadence with no workflow-file edit — see the caller pattern in the
+          header. `workflow_dispatch` bypasses THIS gate regardless of the
+          interval — but not the separate `volume_gate`, which still applies to a
+          live dispatch, so a manual run is not unconditionally guaranteed to
+          reach the finder. Default 7 keeps the
+          original weekly behavior; 0 disables the throttle (run every base tick).
+          Deliberately `type: string`, not `number`: this is wired to a free-text
+          Actions variable a human edits, and a `number` input makes GitHub reject
+          a typo'd value ("weekly", "7d") at workflow-call time — failing the run
+          CLOSED, the opposite of this gate's fail-open design and unreachable by
+          interval.py's own blank/garbage/negative -> 7 degradation. As a string
+          the Python parser is the single normalization authority.
+        type: string
+        required: false
+        default: '7'
       cadence:
         description: >-
           Volume-gate window in days (see volume_gate). When the gate is on, the
           run is skipped if NO pull request merged into the default branch in the
           last `cadence` days — a quiescent repo has nothing new to groom. Set
-          this to roughly your caller's cron interval.
-        type: number
+          this to roughly your EFFECTIVE cadence — the same value you pass to
+          `interval_days` — so the merge window matches how often a real run can
+          happen (see the interval gate below). Normalized through the same
+          parser as `interval_days` (blank/garbage/negative -> 7) and floored at
+          1 day, so wiring both to one Actions variable can't drift the gates.
+          `type: string` for the same reason as `interval_days` — both are wired
+          to the one free-text Actions variable, so a `number` input would fail
+          the run closed on a typo before either gate's degradation could run.
+        type: string
         required: false
-        default: 7
+        default: '7'
       volume_gate:
         description: >-
           Skip the (expensive) audit when nothing merged in the last `cadence`
           days. Fail-open — a gate-check API error runs the audit anyway. Turn
-          off to always run on the caller's schedule.
+          off to always run on the caller's schedule. INDEPENDENT of the interval
+          gate: `workflow_dispatch` bypasses the interval gate but NOT this one,
+          so a caller that needs a manual run to always reach the finder must
+          also pass `volume_gate: false` for that dispatch.
         type: boolean
         required: false
         default: true
@@ -172,17 +246,48 @@ on:
         required: false
         default: the whole repository
       model:
-        description: Anthropic model id for both the finder and the verifier agents.
+        description: >-
+          Anthropic model id for the finder, verifier, and builder agents. Defaults
+          to the current flagship — finding real refactors and adjudicating them is
+          quality-sensitive, so the strongest model earns its cost here. A caller
+          can pin an older id (e.g. `claude-opus-4-8`) to hold a run steady.
         type: string
         required: false
-        default: claude-opus-4-8
+        default: claude-opus-5
       workflows_ref:
         description: >-
           Ref of Comfy-Org/github-workflows to load the groom briefs + ledger
-          from. Pin this to the same ref you pin `uses:` to for reproducibility.
+          from. LEAVE UNSET (the default): the assets are then checked out from
+          `github.job_workflow_sha` — the exact commit this reusable workflow was
+          resolved from via the caller's `uses:` pin — so the briefs + ledger
+          always match the logic running them, with nothing for the caller to
+          keep in sync. Set this ONLY to override that (e.g. test briefs from a
+          branch while pinning `uses:` elsewhere).
         type: string
         required: false
-        default: main
+        default: ''
+      config:
+        description: >-
+          OPTIONAL JSON object of operational knobs (BE-5227), as an ESCAPE HATCH
+          for a caller that wants its config pinned in the reviewed workflow file.
+          You almost certainly do NOT need to pass this: the `gate` job already
+          reads the calling repo's `vars.GROOM_CONFIG` on its own — the `vars`
+          context inside a reusable resolves against the CALLER's repository, so a
+          consumer opts in by setting that variable and needs no `with:` change at
+          all (verified in-org: assign-reviewers.yml reads `vars.REVIEWER_LOAD_CAP`,
+          which is set on `cloud` and NOT on this repo).
+
+
+          Ranks ABOVE `vars.GROOM_CONFIG`, which makes it the slot for a one-run
+          override: a reusable workflow cannot see the caller's
+          `workflow_dispatch` inputs, so a caller that wants a dispatch value to
+          beat the repo variable must forward it as a JSON blob here rather than
+          per-knob. Same allowlist, same coercion, same fail-open degradation —
+          see `.github/groom/config.py` for the key list, and for the knobs that
+          are deliberately NOT settable by config at all.
+        type: string
+        required: false
+        default: ''
       bot_app_id:
         description: >-
           GitHub App ID. When set (with the BOT_APP_PRIVATE_KEY secret), issues
@@ -212,18 +317,92 @@ on:
           the top `max_prs` CONFIRM, non-security findings (ranked by the
           verifier) become PRs; the rest are filed as issues. Ignored unless
           `builder` is true.
-        type: number
+
+
+          Typed `string`, not `number`, ON PURPOSE — so a caller can forward its
+          own `workflow_dispatch` input straight through and let an operator raise
+          the ceiling for one manual run (see the caller pattern in the header).
+          A `workflow_dispatch` input is ALWAYS a string, and GitHub rejects a
+          string expression assigned to a `type: number` reusable input at
+          startup; the workaround is a `fromJSON()` cast in the caller, and
+          `fromJSON()` on a non-numeric string throws during expression
+          evaluation — failing the run before any job starts, with an error far
+          less obvious than "you typo'd a number". Taking a string here keeps
+          that cast, and its failure mode, in ONE place (the `build_select` step
+          below) instead of copy-pasted into every caller. A plain YAML number
+          (`max_prs: 1`) still assigns cleanly to a string input, so existing
+          callers need no change.
+
+
+          Parsing, all of which is non-fatal: empty/whitespace — what a SCHEDULED
+          run yields when a caller forwards `github.event.inputs.max_prs`, since a
+          schedule event carries no inputs — means "no override asked for" and
+          takes this default; a number is floor-clamped to >= 0; anything else
+          opens ZERO PRs with a loud warning, so a typo'd dispatch fails CLOSED
+          and every finding still files as an issue rather than throwing away a
+          completed audit.
+
+
+          No upper bound is enforced here, deliberately. A caller's `options:`
+          list is a UI convention and a typo guard, NOT a security boundary — the
+          only principals who can post a value past it (an API/CLI
+          `workflow_dispatch`) already have repo write access and could just edit
+          `options:`. The one structural backstop is that builder PRs are
+          review-gated and NEVER auto-merged; the softer ones are that the finder
+          emits only ~6-12 findings a run, and that `pr_size_limit` bails any
+          oversized patch to an issue (itself retunable by `GROOM_CONFIG`, so
+          treat it as a queue-hygiene dial rather than a boundary).
+        type: string
         required: false
-        default: 5
+        default: '5'
       pr_size_limit:
         description: >-
           Patch-size bail-out. If a finding's generated patch changes more than
           this many lines, it is NOT opened as a giant PR — it is filed as a
           `groom` issue for a human instead, so nothing balloons unreviewed.
           Ignored unless `builder` is true.
+
+
+          This is the REVIEWED DEFAULT, not a fixed ceiling: `GROOM_CONFIG`
+          (or the `config` input) may override it per repo with no PR, exactly
+          like the other operational knobs — see `.github/groom/config.py` for
+          why this one knob is allowed to widen behaviour. It is not a merge
+          gate; builder PRs run full CI + cursor-review and are never
+          auto-merged, so a higher limit means a bigger diff reaches a reviewer,
+          not that a bigger diff lands unreviewed. A non-numeric or negative
+          override is refused with a `::warning::` and falls back to this value;
+          an explicit `0` is honoured and means "always file issues, never open
+          PRs". The effective value appears in the gate job's `Resolved knobs:`
+          line on every run — which is where to read a repo's real ceiling,
+          rather than assuming this default.
+
+          The default stays deliberately BELOW the org's 1000-line human PR cap
+          (`pr-size.yml` `max_lines`), and copying that number here would loosen
+          this more than it looks. Two reasons. (1) Different counting basis:
+          `pr-size.yml` counts *non-generated* changed lines — it strips
+          lockfiles and generated output first, and offers an `oversized-ok`
+          bypass label — whereas this counts changed lines straight off
+          `git diff --cached --numstat`, with no content-based exclusions. Note
+          that this basis is not a byte budget: `numstat` reports `-` for binary
+          files (counted as 0 here), and a line is a line however long, so one
+          minified line clears any ceiling. It bounds review effort in the
+          reviewable case, not patch size in the worst case — another reason not
+          to spend the headroom the human cap allows. (2) Different risk: the
+          human cap is advisory on a diff whose author chose the scope and can
+          defend it in review; this is a hard refusal on a diff with no author to
+          interrogate, where the failure mode is a reviewer approving 900
+          plausible-looking machine-written lines because nothing in it looks
+          wrong. The machine does not get the same benefit of the doubt, on
+          purpose.
+
+          Raised 400 → 600 on 2026-08-02 (BE-6161) on measured evidence: across
+          both builder repos, 49 `groom` issues produced 7 bails and exactly ONE
+          patch-too-large (403 lines, three over) — 400 was not systematically
+          tight, it caught one boundary case, so 600 buys headroom for that
+          shape without a large jump.
         type: number
         required: false
-        default: 400
+        default: 600
     secrets:
       ANTHROPIC_API_KEY:
         description: Anthropic API key the finder + verifier agents bill through.
@@ -263,20 +442,108 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      # The interval gate lists THIS caller's Actions run history to find the
+      # last real groom run (see the "Interval gate" step). A reusable workflow's
+      # token is CAPPED by the caller's grant, so the CALLER must also grant
+      # actions:read — without it the run-history read 403s and the gate fails
+      # OPEN (runs every daily tick, over-spending). See the caller pattern.
+      actions: read
+      # The volume gate's `gh api search/issues` (merge-activity check) needs
+      # read on both issues and pull requests. A job `permissions:` block is not
+      # additive with the caller's grant — the token gets ONLY what's listed
+      # here, so without these the search 403s on every run (fails OPEN, so it
+      # over-runs rather than silently skips, but it neuters the gate).
+      issues: read
+      pull-requests: read
     outputs:
       should_run: ${{ steps.check.outputs.should_run }}
+      # The single resolved knob set (BE-5227), as one compact JSON string. EVERY
+      # downstream job reads its operational knobs from here via
+      # `fromJSON(needs.gate.outputs.resolved).<knob>` rather than `inputs.<knob>`,
+      # so the GROOM_CONFIG merge happens in exactly ONE place. Emitted before
+      # either gate runs, so it is populated even on a skipped tick.
+      resolved: ${{ steps.resolve.outputs.resolved }}
     steps:
-      - name: Validate sink + apply volume gate
-        id: check
+      - name: Load groom assets (interval gate)
+        # interval.py is loaded from THIS repo at the pinned ref — a single
+        # source of truth like the briefs + ledger, never the target checkout.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          # Default to the exact commit THIS reusable workflow was resolved from
+          # (github.job_workflow_sha), so interval.py can't desync from the logic
+          # loading it; workflows_ref is an explicit override only.
+          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}
+          path: _groom_assets
+          persist-credentials: false
+
+      - name: Resolve operational knobs (GROOM_CONFIG)
+        # Merges, highest precedence LAST: the per-knob `with:` inputs (the
+        # reviewed baseline) < `vars.GROOM_CONFIG` (the live, no-PR layer) < the
+        # `config` input (a caller's explicit override slot). config.py is the
+        # single normalization authority; it exits 0 on ANY malformed layer and
+        # degrades to the lower one, because a typo'd repo variable must not red
+        # out a daily scheduled sweep.
+        #
+        # `vars.GROOM_CONFIG` is read HERE, inside the reusable, not passed in by
+        # the caller: the `vars` context in a called workflow resolves against the
+        # CALLER's repository, so every consumer inherits variable-driven config
+        # with no `with:` change — only a pin bump, which the bump-groom-callers
+        # fleet automates. (An input `default:` cannot reference `vars`, which is
+        # why this is a step env rather than the `config` input's default.)
+        #
+        # There is deliberately NO workflow_dispatch layer here, because a
+        # reusable workflow CANNOT see one: inside a called workflow `inputs` is
+        # this workflow's own inputs, and `github.event.inputs` is the caller's raw
+        # payload only for the caller's own jobs. A caller that forwards a dispatch
+        # input does so per-knob (`max_prs: ${{ github.event.inputs.max_prs || '1' }}`),
+        # which lands in the per-knob baseline BELOW the variable — so once
+        # GROOM_CONFIG sets a knob, that variable is the source of truth for it and
+        # a per-knob dispatch override of that same knob stops taking effect. A
+        # caller that wants one-run overrides to keep winning should forward a JSON
+        # blob into `config` instead, which ranks above the variable.
+        id: resolve
         env:
-          GH_TOKEN: ${{ github.token }}
-          SINK: ${{ inputs.sink }}
-          VOLUME_GATE: ${{ inputs.volume_gate }}
-          CADENCE: ${{ inputs.cadence }}
-          REPO: ${{ github.repository }}
+          GROOM_CONFIG: ${{ vars.GROOM_CONFIG }}
+          CONFIG_INPUT: ${{ inputs.config }}
+          # The per-knob inputs are the REVIEWED baseline the layers above
+          # override. toJSON() on each is what keeps a value containing quotes,
+          # newlines or YAML metacharacters from breaking the JSON we build.
+          DEFAULTS: >-
+            {
+              "dry_run": ${{ toJSON(inputs.dry_run) }},
+              "volume_gate": ${{ toJSON(inputs.volume_gate) }},
+              "max_prs": ${{ toJSON(inputs.max_prs) }},
+              "max_findings": ${{ toJSON(inputs.max_findings) }},
+              "pr_size_limit": ${{ toJSON(inputs.pr_size_limit) }},
+              "interval_days": ${{ toJSON(inputs.interval_days) }},
+              "cadence": ${{ toJSON(inputs.cadence) }},
+              "themes": ${{ toJSON(inputs.themes) }},
+              "scope_label": ${{ toJSON(inputs.scope_label) }},
+              "scope_desc": ${{ toJSON(inputs.scope_desc) }},
+              "model": ${{ toJSON(inputs.model) }}
+            }
         run: |
           set -euo pipefail
+          # Two passes rather than one, so the layer ORDER is explicit in the
+          # shell instead of implicit in an argument name: variable over baseline,
+          # then the caller's explicit `config` over that.
+          BASE=$(python3 "$GROOM_ASSETS/config.py" \
+            --defaults-json "$DEFAULTS" \
+            --config-json "$GROOM_CONFIG")
+          RESOLVED=$(python3 "$GROOM_ASSETS/config.py" \
+            --defaults-json "$BASE" \
+            --config-json "$CONFIG_INPUT")
+          echo "Resolved knobs: $RESOLVED"
+          # Single-line compact JSON by construction (config.py guarantees it), so
+          # a plain key=value line is safe — no heredoc delimiter needed.
+          echo "resolved=$RESOLVED" >> "$GITHUB_OUTPUT"
 
+      - name: Validate sink
+        env:
+          SINK: ${{ inputs.sink }}
+        run: |
+          set -euo pipefail
           # The GitHub sink is the only one implemented. `linear` is a documented
           # later phase — fail loudly instead of running the whole audit and then
           # silently filing nothing.
@@ -285,19 +552,85 @@ jobs:
             exit 1
           fi
 
+      - name: Interval gate (GROOM_INTERVAL_DAYS)
+        # Cadence gate: on a frequent (daily) base cron, skip cheaply unless
+        # GROOM_INTERVAL_DAYS have elapsed since the last REAL groom run (derived
+        # from run history). workflow_dispatch always bypasses THIS gate (the
+        # volume gate below is a separate throttle). Runs BEFORE the
+        # finder ever spins up, so a skipped tick costs ~nothing. Fail-open.
+        id: interval
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          EVENT_NAME: ${{ github.event_name }}
+          WF_REF: ${{ github.workflow_ref }}
+          # Resolved (BE-5227): `GROOM_CONFIG.interval_days` overrides the caller's
+          # `interval_days` input, which is itself usually wired to the older
+          # single-purpose `vars.GROOM_INTERVAL_DAYS`. Either variable retunes
+          # cadence with no file edit; GROOM_CONFIG wins when both are set.
+          # Blank/garbage -> interval.py defaults to 7 (weekly), matching today.
+          INTERVAL_DAYS: ${{ fromJSON(steps.resolve.outputs.resolved).interval_days }}
+        run: |
+          set -euo pipefail
+          # Derive the CALLER workflow file (e.g. ci-groom.yml) from workflow_ref
+          # `owner/repo/.github/workflows/<file>@<ref>` so the run-history read is
+          # scoped to this caller, not every workflow in the repo.
+          WF_PATH="${WF_REF%@*}"
+          WF_FILE="${WF_PATH##*/}"
+          # interval.py always exits 0 with a fail-open decision in the JSON; the
+          # `else` is a belt-and-suspenders fallback for an unexpected crash.
+          if DECISION=$(python3 "$GROOM_ASSETS/interval.py" \
+              --repo "$REPO" --workflow-file "$WF_FILE" \
+              --current-run-id "$RUN_ID" --interval-days "$INTERVAL_DAYS" \
+              --event-name "$EVENT_NAME"); then
+            echo "$DECISION"
+            RUN=$(echo "$DECISION" | jq -r '.should_run')
+            REASON=$(echo "$DECISION" | jq -r '.reason')
+          else
+            RUN=true
+            REASON="interval gate crashed — running (fail-open)."
+          fi
+          echo "Interval gate: $REASON"
+          if [ "$RUN" = "true" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Volume gate (merge activity)
+        # Only reached when the interval gate passed. Skip a quiescent repo:
+        # nothing merged in the cadence window ⇒ nothing new to groom.
+        id: volume
+        if: steps.interval.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VOLUME_GATE: ${{ fromJSON(steps.resolve.outputs.resolved).volume_gate }}
+          CADENCE: ${{ fromJSON(steps.resolve.outputs.resolved).cadence }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
           if [ "$VOLUME_GATE" != "true" ]; then
             echo "Volume gate off — running."
-            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "run=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Skip a quiescent repo: nothing merged in the window ⇒ nothing new to
-          # groom. Fail-OPEN — any API hiccup runs the audit rather than silently
+          # Normalize through interval.py so BOTH gates read the shared
+          # GROOM_INTERVAL_DAYS knob the same way — blank/garbage/negative -> 7,
+          # and a sub-1-day window floored to 1. Passing the raw value to
+          # `date -d` drifts: `-3` yields a FUTURE cutoff that matches no merged
+          # PR (skipping every run, silently disabling groom) while the interval
+          # gate had safely degraded to weekly.
+          CADENCE_DAYS=$(python3 "$GROOM_ASSETS/interval.py" --normalize-cadence "$CADENCE" || echo "")
+
+          # Fail-OPEN — any API hiccup runs the audit rather than silently
           # skipping a due groom (mirrors the studio volume gate).
-          SINCE=$(date -u -d "${CADENCE} days ago" +%Y-%m-%d 2>/dev/null || echo "")
+          SINCE=$(date -u -d "${CADENCE_DAYS:-} days ago" +%Y-%m-%d 2>/dev/null || echo "")
           if [ -z "$SINCE" ]; then
             echo "Could not compute the cadence window — running (fail-open)."
-            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "run=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -307,12 +640,28 @@ jobs:
 
           if [ "$MERGED" = "-1" ]; then
             echo "Merge-count check failed — running (fail-open)."
-            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "run=true" >> "$GITHUB_OUTPUT"
           elif [ "$MERGED" -gt 0 ]; then
             echo "$MERGED PR(s) merged since $SINCE — running."
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No PRs merged since $SINCE (cadence ${CADENCE_DAYS}d) — nothing new to groom, skipping."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Decide should_run
+        # Run only if BOTH gates passed: enough time elapsed (interval) AND new
+        # merge activity (volume). If the interval gate skipped, the volume step
+        # was skipped and its output is empty -> should_run=false.
+        id: check
+        env:
+          INTERVAL_RUN: ${{ steps.interval.outputs.run }}
+          VOLUME_RUN: ${{ steps.volume.outputs.run }}
+        run: |
+          set -euo pipefail
+          if [ "$INTERVAL_RUN" = "true" ] && [ "$VOLUME_RUN" = "true" ]; then
             echo "should_run=true" >> "$GITHUB_OUTPUT"
           else
-            echo "No PRs merged since $SINCE (cadence ${CADENCE}d) — nothing new to groom, skipping."
             echo "should_run=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -335,29 +684,41 @@ jobs:
       have_candidates: ${{ steps.assert.outputs.have_candidates }}
     steps:
       - name: Checkout target repo (clean default branch)
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
           path: repo
 
       - name: Load groom assets (briefs)
-        # Trusted briefs come from THIS workflow's repo (public, pinned via
-        # workflows_ref) — never from the target checkout, so a malicious repo
-        # can't rewrite the prompt to change what groom does.
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        # Trusted briefs come from THIS workflow's repo (public, pinned to the
+        # workflow's own resolved commit) — never from the target checkout, so a
+        # malicious repo can't rewrite the prompt to change what groom does.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Comfy-Org/github-workflows
-          ref: ${{ inputs.workflows_ref }}
+          # Default to the exact commit THIS reusable workflow was resolved from
+          # (github.job_workflow_sha), so the briefs + ledger can't desync from
+          # the logic loading them; workflows_ref is an explicit override only.
+          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}
           path: _groom_assets
           persist-credentials: false
 
       - name: Build finder prompt
         env:
           REPO: ${{ github.repository }}
-          SCOPE_LABEL: ${{ inputs.scope_label }}
-          SCOPE_DESC: ${{ inputs.scope_desc }}
-          THEMES: ${{ inputs.themes }}
+          # Resolved knobs (BE-5227) rather than raw inputs — see the `gate` job's
+          # resolve step for the precedence.
+          SCOPE_LABEL: ${{ fromJSON(needs.gate.outputs.resolved).scope_label }}
+          SCOPE_DESC: ${{ fromJSON(needs.gate.outputs.resolved).scope_desc }}
+          THEMES: ${{ fromJSON(needs.gate.outputs.resolved).themes }}
+          # Path scoping is deliberately NOT here — #83 owns it, via a `path` input
+          # backed by .github/groom/scope.py, and it also teaches interval.py not to
+          # reset the cadence when the scope narrows. An earlier revision of this PR
+          # carried a competing `paths` knob; it was dropped rather than merged into
+          # a second implementation of the same feature. Once #83 lands, add `path`
+          # to config.py's _OPERATIONAL_KEYS and to the DEFAULTS block in `gate` and
+          # the knob becomes variable-tunable with no further wiring.
         run: |
           set -euo pipefail
           # Substitute the {{DOUBLE_BRACE}} placeholders. python str.replace is
@@ -365,7 +726,7 @@ jobs:
           # a workspace path — lands verbatim. Values are runner-controlled and
           # confined to safe charsets (repo slugs, paths, a short theme list).
           python3 - <<'PY'
-          import os
+          import json, os
           repo = os.environ["REPO"]
           subs = {
               "{{REPO}}": repo,
@@ -433,7 +794,7 @@ jobs:
           # permissions are contents:read, so even the implicit github.token
           # cannot write. The agent's sole output is the local FINDER_OUT file.
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          MODEL: ${{ inputs.model }}
+          MODEL: ${{ fromJSON(needs.gate.outputs.resolved).model }}
           # Neutralize git's pager escape hatch: `Bash(git log:*)` /
           # `Bash(git show:*)` are PREFIX matches, so a prompt-injected agent could
           # otherwise reach a pager and execute an arbitrary command from a single
@@ -659,7 +1020,7 @@ jobs:
       have_findings: ${{ steps.validate.outputs.have_findings }}
     steps:
       - name: Checkout target repo (fresh clean default branch)
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -668,10 +1029,13 @@ jobs:
       - name: Load groom assets (briefs)
         # Re-fetched fresh from THIS repo — never inherited from the finder job,
         # so a tampered brief cannot cross the job boundary.
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Comfy-Org/github-workflows
-          ref: ${{ inputs.workflows_ref }}
+          # Default to the exact commit THIS reusable workflow was resolved from
+          # (github.job_workflow_sha), so the briefs + ledger can't desync from
+          # the logic loading them; workflows_ref is an explicit override only.
+          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}
           path: _groom_assets
           persist-credentials: false
 
@@ -687,8 +1051,8 @@ jobs:
       - name: Build verifier prompt
         env:
           REPO: ${{ github.repository }}
-          SCOPE_LABEL: ${{ inputs.scope_label }}
-          SCOPE_DESC: ${{ inputs.scope_desc }}
+          SCOPE_LABEL: ${{ fromJSON(needs.gate.outputs.resolved).scope_label }}
+          SCOPE_DESC: ${{ fromJSON(needs.gate.outputs.resolved).scope_desc }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -732,7 +1096,7 @@ jobs:
         working-directory: ${{ env.GROOM_CLONE }}
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          MODEL: ${{ inputs.model }}
+          MODEL: ${{ fromJSON(needs.gate.outputs.resolved).model }}
           # Neutralize git's pager escape hatch — see the finder job for the note.
           GIT_PAGER: cat
           PAGER: cat
@@ -963,10 +1327,13 @@ jobs:
           permission-pull-requests: read
 
       - name: Load groom assets (ledger)
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Comfy-Org/github-workflows
-          ref: ${{ inputs.workflows_ref }}
+          # Default to the exact commit THIS reusable workflow was resolved from
+          # (github.job_workflow_sha), so the briefs + ledger can't desync from
+          # the logic loading them; workflows_ref is an explicit override only.
+          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}
           path: _groom_assets
           persist-credentials: false
 
@@ -984,7 +1351,7 @@ jobs:
           GH_TOKEN: ${{ steps.bot_token.outputs.token || github.token }}
           REPO: ${{ github.repository }}
           BUILDER: ${{ inputs.builder }}
-          MAX_PRS: ${{ inputs.max_prs }}
+          MAX_PRS: ${{ fromJSON(needs.gate.outputs.resolved).max_prs }}
         run: |
           set -euo pipefail
           # Keep only CONFIRM/DOWNGRADE survivors (REJECT is dropped), same rule
@@ -1013,13 +1380,31 @@ jobs:
               print(f"::warning::{len(invalid)} verified finding(s) had no usable signature and were NOT filed (producer error).")
 
           builder = os.environ.get("BUILDER", "false").lower() == "true"
-          # `type: number` can arrive as "5" or "5.0"; parse leniently, clamp >=0.
-          raw = os.environ.get("MAX_PRS", "5").strip()
+          # max_prs is a `string` input so a caller can forward a raw
+          # workflow_dispatch value without a fromJSON() cast (see the input's
+          # description). This is the ONE place it is parsed. Three cases, none of
+          # which may abort the run:
+          #   empty   -> a SCHEDULED run of a caller that forwards
+          #              `github.event.inputs.max_prs`; a schedule event carries no
+          #              inputs, so no override was asked for -> take the default.
+          #   numeric -> accept "5" and "5.0" alike, floor-clamped to >= 0.
+          #   garbage -> `type: choice` constrains only the WEB UI; an API/CLI
+          #              workflow_dispatch can post any string. Fail CLOSED at 0
+          #              PRs with a loud warning instead of exiting non-zero: the
+          #              finder and verifier have already run and been paid for,
+          #              and every finding still files as an issue on the 0-PR
+          #              path. Falling back to MAX_PRS_DEFAULT here would be
+          #              actively wrong — a caller piloting at `max_prs: 1` would
+          #              silently get 5.
+          # OverflowError is caught alongside ValueError because float() accepts
+          # "inf"/"-inf" happily and it is int() that then blows up.
+          MAX_PRS_DEFAULT = "5"  # keep in sync with the input's `default:` above
+          raw = os.environ.get("MAX_PRS", MAX_PRS_DEFAULT).strip() or MAX_PRS_DEFAULT
           try:
               max_prs = max(0, int(float(raw)))
-          except ValueError:
-              print(f"::error::max_prs={raw!r} is not a number.")
-              raise SystemExit(1)
+          except (ValueError, OverflowError):
+              print(f"::warning::max_prs={raw!r} is not a number — opening NO builder PRs this run; every finding files as an issue instead. Re-dispatch with a numeric max_prs.")
+              max_prs = 0
 
           to_build, built_positions = [], set()
           if builder:
@@ -1090,10 +1475,13 @@ jobs:
           permission-issues: write
 
       - name: Load groom assets (ledger)
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Comfy-Org/github-workflows
-          ref: ${{ inputs.workflows_ref }}
+          # Default to the exact commit THIS reusable workflow was resolved from
+          # (github.job_workflow_sha), so the briefs + ledger can't desync from
+          # the logic loading them; workflows_ref is an explicit override only.
+          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}
           path: _groom_assets
           persist-credentials: false
 
@@ -1106,7 +1494,7 @@ jobs:
           path: /tmp
 
       - name: Ensure groom labels exist
-        if: ${{ inputs.dry_run != true }}
+        if: ${{ fromJSON(needs.gate.outputs.resolved).dry_run != true }}
         env:
           # Bot token when configured, else the caller's github.token — which
           # only carries issues:write if the CALLER granted it (a reusable
@@ -1130,9 +1518,9 @@ jobs:
           # else github-actions[bot]. This is the ONLY credentialed write.
           GH_TOKEN: ${{ steps.bot_token.outputs.token || github.token }}
           REPO: ${{ github.repository }}
-          MAX_FINDINGS: ${{ inputs.max_findings }}
-          SCOPE_LABEL: ${{ inputs.scope_label }}
-          DRY_RUN: ${{ inputs.dry_run }}
+          MAX_FINDINGS: ${{ fromJSON(needs.gate.outputs.resolved).max_findings }}
+          SCOPE_LABEL: ${{ fromJSON(needs.gate.outputs.resolved).scope_label }}
+          DRY_RUN: ${{ fromJSON(needs.gate.outputs.resolved).dry_run }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -1265,17 +1653,20 @@ jobs:
         idx: ${{ fromJSON(needs.build_select.outputs.build_idxs || '[]') }}
     steps:
       - name: Checkout target repo (clean default branch)
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
           path: repo
 
       - name: Load groom assets (builder brief)
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Comfy-Org/github-workflows
-          ref: ${{ inputs.workflows_ref }}
+          # Default to the exact commit THIS reusable workflow was resolved from
+          # (github.job_workflow_sha), so the briefs + ledger can't desync from
+          # the logic loading them; workflows_ref is an explicit override only.
+          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}
           path: _groom_assets
           persist-credentials: false
 
@@ -1343,7 +1734,7 @@ jobs:
           # cannot write. The agent's sole outputs are files under repo/ (the
           # edits) + the BUILDER_OUT control file.
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          MODEL: ${{ inputs.model }}
+          MODEL: ${{ fromJSON(needs.gate.outputs.resolved).model }}
           # Neutralize git's pager escape hatch — see the finder job for the note.
           GIT_PAGER: cat
           PAGER: cat
@@ -1473,7 +1864,18 @@ jobs:
       - name: Capture patch (enforce the size bail-out)
         env:
           IDX: ${{ matrix.idx }}
-          PR_SIZE_LIMIT: ${{ inputs.pr_size_limit }}
+          # Resolved (BE-6345), not `inputs.pr_size_limit`: the ceiling is now an
+          # operational knob `GROOM_CONFIG` may retune per repo, so it has to be
+          # read through the same single merge point as every other knob. A
+          # variable/`config` value that is non-numeric or negative never reaches
+          # here: config.py warns and keeps the caller's reviewed default, so the
+          # awk floor below cannot be handed a typo it would silently render as 0.
+          # The one value that CAN arrive unusable is an unusable caller default —
+          # handled by the guard in the script below, not here.
+          PR_SIZE_LIMIT: ${{ fromJSON(needs.gate.outputs.resolved).pr_size_limit }}
+          # Belt to the above's suspenders, and the pre-BE-6345 behaviour verbatim:
+          # used only if the resolved set carried no usable value at all.
+          PR_SIZE_LIMIT_INPUT: ${{ inputs.pr_size_limit }}
           # Present ONLY to scan the patch for the literal key before it becomes a
           # public PR (471). This step runs NO agent, so holding the key here adds no
           # exfil surface — the risk is an AGENT reading it, and there is none here.
@@ -1497,11 +1899,27 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/out
-          # `type: number` can arrive as a fractional string (e.g. 400.0) that the
+          # Empty means the resolved knob set somehow carried no pr_size_limit —
+          # only reachable if the CALLER's own reviewed `with:` value was itself
+          # rejected by config.py (e.g. a negative literal), since the variable
+          # layer falls back to that default rather than dropping the key. awk
+          # would render "" as 0, and a limit of 0 bails EVERY build to an issue,
+          # silently turning the builder off. Fall back to the caller's input and
+          # say so, rather than disabling PR-opening without a word.
+          if [ -z "${PR_SIZE_LIMIT//[[:space:]]/}" ]; then
+            echo "::warning::pr_size_limit resolved to an empty value — falling back to the caller's input ($PR_SIZE_LIMIT_INPUT)."
+            PR_SIZE_LIMIT="$PR_SIZE_LIMIT_INPUT"
+          fi
+          # `type: number` can arrive as a fractional string (e.g. 600.0) that the
           # integer-only `-gt` test below would abort on under `set -euo pipefail`,
           # skipping the patch upload. Floor it to an int first (mirrors the file
           # job's MAX_FINDINGS handling).
           PR_SIZE_LIMIT=$(awk -v v="$PR_SIZE_LIMIT" 'BEGIN{printf "%d", v}')
+          # No echo of the value here on purpose: the gate job already logs the
+          # whole resolved set ("Resolved knobs: {…}"), pr_size_limit included, so
+          # a variable-set ceiling — which leaves no diff and no branch — is
+          # already on the run record once per run (BE-6345). A per-build repeat
+          # would be the same fact N times.
           STATUS=$(jq -r '.status // "bail"' "$BUILDER_OUT" 2>/dev/null || echo bail)
           SUMMARY=$(jq -r '.summary // ""' "$BUILDER_OUT" 2>/dev/null || echo "")
 
@@ -1654,10 +2072,13 @@ jobs:
           permission-issues: write
 
       - name: Load groom assets (signature marker)
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Comfy-Org/github-workflows
-          ref: ${{ inputs.workflows_ref }}
+          # Default to the exact commit THIS reusable workflow was resolved from
+          # (github.job_workflow_sha), so the briefs + ledger can't desync from
+          # the logic loading them; workflows_ref is an explicit override only.
+          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}
           path: _groom_assets
           persist-credentials: false
 
@@ -1676,7 +2097,7 @@ jobs:
       - name: Checkout target repo (as the bot, for the push)
         # persist-credentials stays ON (default) with the bot token so the branch
         # push authenticates as the bot — this is the credentialed job by design.
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           path: repo
@@ -1686,7 +2107,7 @@ jobs:
         # Honor the dry-run contract (preview without mutating the target repo) —
         # matches the file job's label step guard. A dry run opens no PR/issue, so
         # it needs no labels.
-        if: ${{ inputs.dry_run != true }}
+        if: ${{ fromJSON(needs.gate.outputs.resolved).dry_run != true }}
         env:
           GH_TOKEN: ${{ steps.bot_token.outputs.token }}
           REPO: ${{ github.repository }}
@@ -1705,7 +2126,7 @@ jobs:
           IDX: ${{ matrix.idx }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           RUN_ID: ${{ github.run_id }}
-          DRY_RUN: ${{ inputs.dry_run }}
+          DRY_RUN: ${{ fromJSON(needs.gate.outputs.resolved).dry_run }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail

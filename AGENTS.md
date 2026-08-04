@@ -49,23 +49,29 @@ tests — run the matching command above for whatever you touched.
 - `.github/groom/` — briefs + building blocks behind the reusable **groom**
   code-cleanup workflow (`groom.yml`, epic BE-3870): `finder.md` / `verifier.md`
   / `builder.md` (the phase-1/2/3 prompts, single source of truth, loaded at run
-  time), and `ledger.py`, the durable dedup/rejection memory that stops the
+  time), `ledger.py`, the durable dedup/rejection memory that stops the
   stateless groom CI run from re-filing already-filed or human-rejected findings
   — and (BE-4003) recognizes auto-builder PR state (open/merged/closed) so a
-  built finding is never re-proposed. It uses GitHub issue+PR state as the store
-  — no new secret. Tests in `tests/`.
+  built finding is never re-proposed — and `interval.py`, the runtime cadence
+  gate (`GROOM_INTERVAL_DAYS`) that early-exits a daily tick unless the interval
+  has elapsed since the last real run (derived from Actions run history — no new
+  secret). Tests in `tests/`.
 - `.github/bump-callers/` — `bump-callers.sh`, the ONE fleet-agnostic script
   that opens SHA-bump PRs in consumer repos when a reusable workflow changes.
   Tests in `tests/`.
 - `README.md` — the public workflow catalog: per-workflow purpose, the SHA-pin
   usage pattern, and the versioning policy. Keep its table in sync when you add
   a workflow.
+- `docs/callers/` — one setup guide per reusable workflow: a complete,
+  copy-pasteable caller (including `on:` and the exact permission grant),
+  required secrets/vars, and per-workflow footguns. Add a page when you add a
+  workflow; the README table links to it.
 
 ## Reusable workflow catalog (what each does)
 
 - `cursor-review.yml` — label-triggered multi-model PR review (4-lab × 2-type
-  panel → judge → one PR review with severity badges). Advisory by default;
-  `blocking: true` gates on unresolved findings.
+  panel → judge → one PR review with severity badges). Advisory: it posts a
+  review, it does not gate.
 - `cursor-review-auto-label.yml` — translates PR assignment/open into the review
   label (via an app token, since a `GITHUB_TOKEN`-applied label won't fire runs).
 - `groom.yml` — scheduled/dispatch org-wide code-cleanup sweep: read-only finder
@@ -78,35 +84,59 @@ tests — run the matching command above for whatever you touched.
 - `assign-reviewers.yml` — expertise-aware, load-balanced reviewer requests.
 - `assign-prs-to-author.yml` — assigns unassigned open PRs to their author.
 - `detect-unreviewed-merge.yml` — SOC 2: flags PRs merged without approval.
-- `bump-cursor-review-callers.yml` / `bump-agents-md-callers.yml` /
-  `bump-pr-size-callers.yml` / `bump-assign-reviewers-callers.yml` — thin
-  entrypoints over `bump-callers.sh` that fan SHA bumps out to consumers.
+- `bump-cursor-review-callers.yml` / `bump-auto-label-callers.yml` /
+  `bump-agents-md-callers.yml` / `bump-pr-size-callers.yml` /
+  `bump-pr-risk-callers.yml` / `bump-assign-reviewers-callers.yml` /
+  `bump-groom-callers.yml` — thin entrypoints over `bump-callers.sh` that fan SHA
+  bumps out to consumers. A groom or pr-risk caller pins TWICE (`uses:` +
+  `workflows_ref:`); the shared rewrite moves both, so never hand-bump one alone.
+  `stale.yml` and `assign-prs-to-author.yml` have no fleet because they have no
+  callers; `detect-unreviewed-merge.yml` has ~12 callers and no fleet — a known,
+  deferred gap, so its pins move by hand.
 
 ## Conventions & gotchas
 
 - **Public repo — never leak private caller names.** Consumer repo lists live in
-  repo **variables** (`CURSOR_REVIEW_CALLERS`, `AGENTS_MD_CALLERS`), never
-  hardcoded in a workflow file or printed to run logs (logs are public). The
-  bumper masks names it processes. Keep private repo paths/detail out of
-  workflow files, commit messages, and PR text.
+  repo **variables** — one per fleet (`CURSOR_REVIEW_CALLERS`,
+  `AUTO_LABEL_CALLERS`, `AGENTS_MD_CALLERS`, `PR_SIZE_CALLERS`,
+  `PR_RISK_CALLERS`, `ASSIGN_REVIEWERS_CALLERS`, `GROOM_CALLERS`; the
+  bump-callers README table is canonical) — never hardcoded in a workflow file or
+  printed to run logs (logs are public). The bumper masks names it processes.
+  Keep private repo paths/detail out of workflow files, commit messages, and PR
+  text.
 - **Pin everything by full commit SHA**, with a trailing `# v1` comment — both
   the `uses:` in callers and every third-party action here. Bare `@v1` fails the
-  pin-validation (`pinact`, `zizmor`) that consumer CI runs. See README "Usage".
+  pin-validation (`pinact`, `zizmor`) that consumer CI runs. See README "Pinning".
 - **Scripts are the single source of truth**, loaded at run time from a pinned
   ref of THIS repo — never from the caller's checkout. That's what makes the
   reviewer/checker tamper-proof: a PR can't rewrite the logic judging it. The
-  self-enrollment callers (`ci-cursor-review.yml`, `ci-detect-unreviewed-merge.yml`)
-  deliberately pin a merged-main SHA instead of a local `./` path for the same
-  reason — do not "simplify" them to a local path.
+  self-enrollment callers (`ci-cursor-review.yml`, `ci-assign-reviewers.yml`,
+  `ci-detect-unreviewed-merge.yml`) deliberately pin a merged-main SHA instead
+  of a local `./` path for the same reason — do not "simplify" them to a path.
 - **One bumper, not several.** `bump-callers.sh` backs every fleet; the
   `bump-*-callers.yml` files are thin per-fleet wrappers (they stay separate so a
   `cursor-review.yml` change doesn't spuriously bump agents-md or pr-size
   callers). Do not fork the script — a forked copy is how other shared org
   machinery has drifted.
+- **Enrolling a caller is TWO steps.** Merge the caller, *and* add the repo to
+  its `vars.*_CALLERS` roster. Skipping the second is the most repeated mistake
+  here: the pin then never moves, the caller drifts behind the reusable, and it
+  fails at startup much later with no obvious cause. This repo did it to its own
+  `ci-groom.yml`. When auditing, compare the roster against reality in both
+  directions — a roster entry whose caller file does not exist is equally broken.
 - **New reusable workflow?** `on: workflow_call` + a header comment documenting
-  inputs/secrets/triggers + a caller-pattern example, then update the README
-  table (README "Adding a new reusable workflow"). Move the floating major tag
+  inputs/secrets/triggers + a caller-pattern example, then a
+  `docs/callers/<name>.md` setup guide and a row in the README table (see
+  CONTRIBUTING.md "Adding a new reusable workflow"). Move the floating major tag
   after merge.
+- **Document only inputs that exist.** GitHub rejects an unknown input at startup,
+  so a phantom input in the docs is a broken caller for whoever copies it. Check
+  `on.workflow_call.inputs` before documenting a knob. The `cursor-review`
+  `blocking:` input is the worked example: it shipped in #16, was deleted from the
+  workflow by #31 (a judge-extraction fix) while its docs and
+  `gate-unresolved.py` were left behind, and the stale docs outlived it here, in
+  the README, and in `.github/cursor-review/README.md`. **Deleting an input is a
+  docs change too** — grep the repo for its name in the same commit.
 - **Versioning:** semver-style major tags (`v1`, `v2`). Breaking changes bump the
   major; backwards-compatible changes move the existing tag in place
   (`git tag -f v1 <sha> && git push -f origin v1`). This tag force-move is the
@@ -122,6 +152,9 @@ tests — run the matching command above for whatever you touched.
 ## Deeper docs
 
 - [`README.md`](README.md) — public catalog, SHA-pin usage, versioning.
+- [`docs/callers/`](docs/callers/) — per-workflow setup guides (copy-pasteable callers).
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — tests to run, breaking-change rules, enrollment.
+- [`SECURITY.md`](SECURITY.md) — disclosure process + the agent credential boundary.
 - [`.github/cursor-review/README.md`](.github/cursor-review/README.md) — review panel internals + adoption.
 - [`.github/agents-md-integrity/README.md`](.github/agents-md-integrity/README.md) — the checker + its knobs.
 - [`.github/bump-callers/README.md`](.github/bump-callers/README.md) — the shared bumper + its fleets.
