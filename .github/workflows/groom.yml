@@ -440,6 +440,13 @@ jobs:
   gate:
     name: Gate
     runs-on: ubuntu-latest
+    # The one job here that had no bound. It is meant to be cheap — a handful of
+    # `gh api` reads — but its cost is data-dependent: the interval gate walks up
+    # to `_MAX_RUNS_SCANNED` runs and, for any that were re-run by hand, up to
+    # `_MAX_ATTEMPTS_SCANNED` attempts each, at a 30s per-call timeout. A degraded
+    # API on a pathological history could burn runner minutes before the gate
+    # fails open. Ten minutes is ~20x the normal case and still a hard stop.
+    timeout-minutes: 10
     permissions:
       contents: read
       # The interval gate lists THIS caller's Actions run history to find the
@@ -781,6 +788,15 @@ jobs:
         # `.git` all fail EACCES. /tmp is untouched, so $FINDER_OUT still works.
         run: chmod -R a-w "$GROOM_CLONE"
 
+      # NAME IS LOAD-BEARING — `interval.py` matches this step name EXACTLY
+      # (`_AGENT_STEP_NAME`) against the runs-jobs API's `steps[]` to decide
+      # whether a FAILED finder job actually spent its (billed) audit and may
+      # therefore advance the GROOM_INTERVAL_DAYS cadence clock (BE-4814). A
+      # rename here without the matching one there makes every failed run read as
+      # "agent never started", i.e. the cadence stops throttling failures — so
+      # `test_interval.py` pins both halves. Same for adding an `if:` to this
+      # step: a conditionally-skipped agent inside a SUCCEEDING job would still
+      # count, because a success is trusted on the job conclusion alone.
       - name: Run finder
         # Invoked as the CLI directly, NOT via the anthropics composite action
         # (BE-4202/BE-4214): the action cannot set a working directory, so the

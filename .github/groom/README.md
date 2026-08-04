@@ -341,21 +341,41 @@ real groom, so a skipped tick costs ~nothing (it never reaches the finder).
   interval-skip ticks in between never reset the clock. (A repo variable would
   need a `Variables: write` credential the run doesn't carry, and a missing grant
   would fail *silently* into a daily over-spend — run history has no such trap.)
-- **A *failed* finder job counts only if the billed agent step ran** (BE-4809).
-  The job runs two checkouts, `npm install`, the prompt build and the read-only
-  chmod BEFORE the agent; a transient failure in any of them concludes the job
-  `failure` having spent nothing, and counting that would silently skip every
-  tick for a full interval. So a `failure` additionally requires the run-history
-  payload's per-job `steps` to show `Run finder` reaching a real conclusion —
-  `success` still counts unconditionally. The missing-data direction here is
-  deliberately the OPPOSITE of the rest of the gate: no usable `steps` array
-  counts the failure, because re-billing a genuinely-spent audit on the next
-  daily tick is the expensive mistake. For the same reason the jobs are fetched
-  with `filter=all` (the endpoint defaults to `latest`): the question is now
-  step-level, so a manual re-run that flakes in `npm install` must not erase the
-  agent an *earlier* attempt already paid for — one attempt showing the step ran
-  is enough. A unit test pins the step name against `groom.yml` so a rename can't
-  silently drift the two apart.
+- **A NON-SUCCESS finder job counts only if it actually spent the audit**
+  (BE-4814). A failure that reached the agent and died later (the JSON assert, an
+  upload) still counts — otherwise a run that cost money re-spends on tomorrow's
+  tick. But the job can also die *before* the agent (checkout, asset load, prompt
+  build), and those bill nothing, so counting them would advance the clock and
+  suppress every tick for a whole `GROOM_INTERVAL_DAYS` — hiding a typo'd input
+  or a broken caller for a week rather than letting it recur daily until someone
+  notices. The gate therefore requires **positive evidence**: the jobs API's
+  per-job `steps[]` must show the agent step (`Run finder`, pinned as
+  `interval.agent_step_name()`) actually started. Every ambiguity — no `steps[]`,
+  an empty one, the step absent, still `queued`, or `skipped` — reads as **not
+  audited**, i.e. re-run. A duplicated audit costs one run; a suppressed one
+  hides a broken caller for a full interval. A `success` needs no such check (the
+  agent step is upstream of everything that could still fail, and no `if:`
+  guards it).
+  - Which endings take the evidence path is a **denylist**, not an enumeration:
+    only `skipped` (this gate's own interval-skip) and an unfinished run are
+    excluded outright. Everything else — `failure`, `timed_out`, `cancelled`,
+    and the rarer `neutral`/`stale`/`action_required` — is decided by the step
+    evidence, because if the agent ran, the audit was spent however the job was
+    finally stamped. An allowlist would silently forget any ending it missed.
+  - `timed_out`/`cancelled` are the expensive members: the finder job runs under
+    `timeout-minutes: 40`, so a **hung agent bills the whole window** and only
+    then trips the timeout. GitHub stamps that in-flight step `cancelled` —
+    indistinguishable *by conclusion* from a step that was never reached, so the
+    gate reads the step's **timestamps**: a `started_at` strictly before its
+    `completed_at` proves it ran; no span is no evidence (fail-open).
+  - Evidence is looked for across a run's **earlier attempts**, not just the
+    latest. The jobs endpoint reports only the newest attempt, so a manual
+    re-run that dies in checkout would otherwise erase the record of an earlier
+    attempt that did reach the agent — and re-spend that audit. The walk is
+    newest-first and bounded, and when an earlier attempt supplies the evidence
+    the clock anchors on **that attempt's** finder-job start, not the run's
+    `run_started_at` (which tracks the re-run and would date a week-old audit to
+    today).
 - **`workflow_dispatch` bypasses THIS gate** — a manual dispatch is never
   interval-throttled. It is not a blanket "always runs": the volume gate is a
   second, independent throttle, so a live dispatch into a quiescent repo can

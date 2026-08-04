@@ -1,10 +1,15 @@
 name: Test groom scripts
 
-# Runs the unit tests for the groom dedup/rejection ledger (ledger.py). The
-# ledger is the durable memory that stops the stateless groom CI run from
-# re-filing already-filed or human-rejected findings every run, so a regression
-# here would silently re-open the spam it exists to prevent — cheap to guard
-# with a unit run on change.
+# Runs the unit tests for the groom dedup/rejection ledger (ledger.py) and the
+# runtime cadence gate (interval.py). The ledger is the durable memory that stops
+# the stateless groom CI run from re-filing already-filed or human-rejected
+# findings every run, so a regression here would silently re-open the spam it
+# exists to prevent — cheap to guard with a unit run on change.
+#
+# `groom.yml` is a trigger path too (BE-4814): the suite pins literals the
+# workflow PRODUCES and interval.py CONSUMES — today the finder's agent step name
+# — so a rename there has to run these tests to be caught, not merge unwatched
+# because the change touched no file under .github/groom/.
 
 on:
   pull_request:
