@@ -318,23 +318,25 @@ jobs:
         #
         # Pinned to each lab's newest highest-reasoning tier in Cursor's
         # catalog (last checked 2026-07-28). OpenAI: GPT-5.6 Sol is the
-        # 5.6-family coding flagship (no 5.6 codex variant exists). Anthropic:
-        # Fable 5 tops the catalog but all Fable entries are marked NO ZDR in
-        # Cursor, and this panel reviews private-repo diffs, so it is excluded;
-        # bumped Anthropic's pin from Opus 4.8 to Opus 5 thinking at its max
-        # tier. ZDR eligibility for Opus 5 specifically in Cursor's catalog
-        # is UNCONFIRMED as of this bump (no CURSOR_API_KEY/live-catalog
-        # access and no verifiable primary source were available when this
-        # was written) — confirm against Cursor's live catalog/dashboard
-        # before relying on this pin for private-repo review traffic.
-        # Gemini (Pro line) and Kimi still ship a single reasoning tier each.
+        # 5.6-family coding flagship (Luna is the cost tier, Terra mid; the
+        # Codex line stops at 5.3). Anthropic: Fable 5 tops the catalog but
+        # all Fable entries are marked NO ZDR in Cursor, and this panel
+        # reviews private-repo diffs, so it is excluded; Opus 5 thinking at
+        # its max tier is ZDR-eligible (confirmed against the live catalog —
+        # no NO-ZDR marker, see PR BE-4818 for the run link) and replaces
+        # Opus 4.8 at identical per-token pricing. Gemini: 3.1 Pro is still
+        # the only Pro-line entry (3.5/3.6 are Flash tier). Moonshot: Kimi K3
+        # (max tier) supersedes K2.7 Code; no NO-ZDR marker in the catalog
+        # (same evidentiary bar as every other pin), ~3.2x/3.75x the
+        # per-token cost of K2.7 on this lab's two panel cells (~+10-15%
+        # total panel cost per PR).
         run: |
           cat > /tmp/models.json <<'JSON'
           [
             "gpt-5.6-sol-max",
             "claude-opus-5-thinking-max",
             "gemini-3.1-pro",
-            "kimi-k2.7-code"
+            "kimi-k3-max"
           ]
           JSON
           echo "models=$(jq -c . /tmp/models.json)" >> "$GITHUB_OUTPUT"
