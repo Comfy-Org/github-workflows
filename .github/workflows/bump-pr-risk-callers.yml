@@ -43,6 +43,12 @@ name: Bump pr-risk callers
 # Keep the canonical callers.json in a PRIVATE infra/ops repo so variable edits
 # have a reviewed source of truth; the org audit log records each edit. (The
 # specific home repo is intentionally not named here — this file is public.)
+#
+# Recovery note: GitHub evaluates a `paths:` filter against only the first 300
+# changed files of a push, so a `scripts/pr-risk/**` change buried in a larger
+# main push can create NO run at all — callers then stay pinned to stale
+# grading logic with no red signal anywhere. `workflow_dispatch` above is the
+# recovery: run it once from main and the fleet catches up.
 
 on:
   workflow_dispatch: {}   # allow on-demand runs (e.g. to re-bump callers)
@@ -182,39 +188,77 @@ jobs:
             # What actually distinguishes a stale re-run is that a WATCHED path
             # has CHANGED since: then a later commit did touch the filter and
             # does have its own run, which will pin the newer content.
-            if ! git fetch --depth=1 origin main; then
+            # Needs real history, not just the two tips: the question below is
+            # "did a COMMIT touch a watched path", which a shallow --depth=1
+            # fetch cannot answer (its grafted tip has no parents, so every
+            # path reads as newly added). actions/checkout clones shallow, so
+            # deepen — cheap on a repo this size, and --unshallow errors out on
+            # an already-complete clone, hence the probe.
+            unshallow=()
+            [[ -f "$(git rev-parse --git-dir)/shallow" ]] && unshallow=(--unshallow)
+            if ! git fetch "${unshallow[@]}" origin main; then
               echo "::error::Could not fetch the current main tip to compare the watched paths"
               exit 1
             fi
-            main_tip=$(git rev-parse FETCH_HEAD)
-            for gone in .github/workflows/pr-risk.yml scripts/pr-risk; do
+            if ! main_tip=$(git rev-parse --verify "FETCH_HEAD^{commit}"); then
+              echo "::error::Fetched main but could not resolve FETCH_HEAD to a commit"
+              exit 1
+            fi
+            # Decommissioning check, on the files the reusable actually EXECUTES
+            # (see pr-risk.yml) rather than on `scripts/pr-risk/` existing: this
+            # change establishes that tests/ and the tool README are not part of
+            # what a caller runs, so a commit deleting the graders while leaving
+            # those two behind would satisfy a bare directory probe and bump
+            # every caller onto a SHA where the tools are gone.
+            # FETCH_HEAD resolved above, so a path that fails to resolve here is
+            # genuinely absent rather than an unreadable object.
+            for gone in .github/workflows/pr-risk.yml \
+                        scripts/pr-risk/grade-pr-risk.sh \
+                        scripts/pr-risk/grade-targets.sh \
+                        scripts/pr-risk/resolve-enabled.sh; do
               if ! git rev-parse --verify --quiet "FETCH_HEAD:$gone" >/dev/null; then
                 echo "$gone no longer exists on main ($main_tip) — decommissioned; nothing to bump"
                 exit 0
               fi
             done
-            # --quiet implies --exit-code: 0 = identical, 1 = changed, anything
-            # else = the comparison itself failed. Treating that failure as
-            # "changed" would silently no-op the fleet on a git hiccup — the same
-            # trap the ls-remote guard above avoids — so fail loudly instead.
-            diff_rc=0
-            git diff --quiet HEAD FETCH_HEAD -- "${WATCHED[@]}" || diff_rc=$?
-            if (( diff_rc == 1 )); then
-              echo "github.sha $GITHUB_SHA is behind main ($main_tip) and a watched path changed since — stale run/re-run; the newer commit has its own run. Nothing to bump"
-              exit 0
-            elif (( diff_rc != 0 )); then
-              echo "::error::Could not compare the watched paths between $GITHUB_SHA and main ($main_tip) (git diff exit $diff_rc)"
+            # Refuse to pin callers to a commit main can no longer reach (a
+            # re-run from a commit a force-push or reset orphaned): it may be
+            # garbage-collected, and every caller's `uses:` and `workflows_ref:`
+            # would stop resolving.
+            if ! git merge-base --is-ancestor HEAD FETCH_HEAD; then
+              echo "::error::github.sha $GITHUB_SHA is not reachable from main ($main_tip) — refusing to pin callers to an orphaned commit"
               exit 1
             fi
-            echo "main moved to $main_tip since $GITHUB_SHA, but the watched paths are unchanged — this run is still the only one for that change; proceeding"
+            # Ask "did a later COMMIT touch a watched path", not "does the net
+            # content differ". A merge-then-revert of a bad grader change nets
+            # to zero, so a content diff would call this run the only one for
+            # the change and repin every caller BACKWARDS to $GITHUB_SHA —
+            # while both the bad commit and its revert did have runs of their
+            # own. rev-list answers the question the guard actually means.
+            if ! touched=$(git rev-list --count HEAD..FETCH_HEAD -- "${WATCHED[@]}"); then
+              echo "::error::Could not list commits touching the watched paths between $GITHUB_SHA and main ($main_tip)"
+              exit 1
+            fi
+            if (( touched > 0 )); then
+              echo "github.sha $GITHUB_SHA is behind main ($main_tip) and $touched later commit(s) touched a watched path — stale run/re-run; those commits have runs of their own. Nothing to bump"
+              exit 0
+            fi
+            echo "main moved to $main_tip since $GITHUB_SHA, but no later commit touched a watched path — this run is still the only one for that change; proceeding"
           fi
           # The push path filter also matches a commit that DELETES the
           # reusable workflow — or the run-time tool sources callers build from
-          # the pinned SHA (scripts/pr-risk/**); bumping callers to a SHA
-          # where either is gone would break every caller. Deletion means
-          # decommissioning — no-op.
-          if [[ ! -f .github/workflows/pr-risk.yml || ! -d scripts/pr-risk ]]; then
-            echo "pr-risk.yml or scripts/pr-risk/ absent at this SHA — decommissioned; nothing to bump"
-            exit 0
-          fi
+          # the pinned SHA; bumping callers to a SHA where any of them is gone
+          # would break every caller. Deletion means decommissioning — no-op.
+          # Tested per-file (not `-d scripts/pr-risk`) for the same reason as
+          # the FETCH_HEAD probe above: tests/ and the tool README are not part
+          # of what a caller executes, so the directory can outlive the graders.
+          for required in .github/workflows/pr-risk.yml \
+                          scripts/pr-risk/grade-pr-risk.sh \
+                          scripts/pr-risk/grade-targets.sh \
+                          scripts/pr-risk/resolve-enabled.sh; do
+            if [[ ! -f "$required" ]]; then
+              echo "$required absent at this SHA — decommissioned; nothing to bump"
+              exit 0
+            fi
+          done
           bash .github/bump-callers/bump-callers.sh
