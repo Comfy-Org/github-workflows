@@ -88,8 +88,8 @@ tests — run the matching command above for whatever you touched.
   caller pins TWICE (`uses:` + `workflows_ref:`); the shared rewrite moves both,
   so never hand-bump one alone. `stale.yml` and `assign-prs-to-author.yml` have
   no fleet because they have no callers; `detect-unreviewed-merge.yml`'s fleet is
-  `bump-detect-unreviewed-merge-callers.yml` (its roster variable is seeded
-  separately — see the bump-callers README).
+  `bump-detect-unreviewed-merge-callers.yml`, whose `DETECT_UNREVIEWED_MERGE_CALLERS`
+  roster is seeded with its 12 live callers.
 
 ## Conventions & gotchas
 

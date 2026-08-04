@@ -15,11 +15,20 @@ name: Detect Unreviewed Merge (reusable)
 #     cancel-in-progress: false
 #   jobs:
 #     detect:
-#       uses: Comfy-Org/unreviewed-merges/.github/workflows/detector.yml@v1
+#       uses: Comfy-Org/github-workflows/.github/workflows/detect-unreviewed-merge.yml@<sha>  # v1
 #       with:
 #         approval-mode: latest-per-reviewer  # or 'any-approval' for private repos
 #       secrets:
 #         UNREVIEWED_MERGES_TOKEN: ${{ secrets.UNREVIEWED_MERGES_TOKEN }}
+#
+# Pin the FULL 40-hex commit SHA with a trailing `# v1`, exactly as above — a
+# bare `@v1` fails consumer pin-validation (pinact/zizmor), and it is also what
+# `bump-detect-unreviewed-merge-callers.yml` rewrites: the bumper only advances
+# a `Comfy-Org/github-workflows/...` line carrying a 40-hex SHA, so a caller
+# wired against any other repo/path or a floating tag would be skipped as
+# "already pinned" and drift behind forever. (The earlier text here named
+# `Comfy-Org/unreviewed-merges/.github/workflows/detector.yml@v1`, which no
+# caller has used since this reusable moved into github-workflows.)
 
 on:
   workflow_call:
