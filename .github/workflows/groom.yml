@@ -330,9 +330,11 @@ on:
           list is a UI convention and a typo guard, NOT a security boundary — the
           only principals who can post a value past it (an API/CLI
           `workflow_dispatch`) already have repo write access and could just edit
-          `options:`. The real backstops are structural: builder PRs are review-
-          gated and NEVER auto-merged, the finder emits only ~6-12 findings a run,
-          and `pr_size_limit` bails any oversized patch to an issue.
+          `options:`. The one structural backstop is that builder PRs are
+          review-gated and NEVER auto-merged; the softer ones are that the finder
+          emits only ~6-12 findings a run, and that `pr_size_limit` bails any
+          oversized patch to an issue (itself retunable by `GROOM_CONFIG`, so
+          treat it as a queue-hygiene dial rather than a boundary).
         type: string
         required: false
         default: '5'
@@ -342,6 +344,19 @@ on:
           this many lines, it is NOT opened as a giant PR — it is filed as a
           `groom` issue for a human instead, so nothing balloons unreviewed.
           Ignored unless `builder` is true.
+
+
+          This is the REVIEWED DEFAULT, not a fixed ceiling: `GROOM_CONFIG`
+          (or the `config` input) may override it per repo with no PR, exactly
+          like the other operational knobs — see `.github/groom/config.py` for
+          why this one knob is allowed to widen behaviour. It is not a merge
+          gate; builder PRs run full CI + cursor-review and are never
+          auto-merged, so a higher limit means a bigger diff reaches a reviewer,
+          not that a bigger diff lands unreviewed. A non-numeric or negative
+          override is refused with a `::warning::` and falls back to this value;
+          an explicit `0` is honoured and means "always file issues, never open
+          PRs". The effective value appears in the gate job's `Resolved knobs:`
+          line on every run.
         type: number
         required: false
         default: 400
@@ -454,6 +469,7 @@ jobs:
               "volume_gate": ${{ toJSON(inputs.volume_gate) }},
               "max_prs": ${{ toJSON(inputs.max_prs) }},
               "max_findings": ${{ toJSON(inputs.max_findings) }},
+              "pr_size_limit": ${{ toJSON(inputs.pr_size_limit) }},
               "interval_days": ${{ toJSON(inputs.interval_days) }},
               "cadence": ${{ toJSON(inputs.cadence) }},
               "themes": ${{ toJSON(inputs.themes) }},
@@ -1787,7 +1803,18 @@ jobs:
       - name: Capture patch (enforce the size bail-out)
         env:
           IDX: ${{ matrix.idx }}
-          PR_SIZE_LIMIT: ${{ inputs.pr_size_limit }}
+          # Resolved (BE-6345), not `inputs.pr_size_limit`: the ceiling is now an
+          # operational knob `GROOM_CONFIG` may retune per repo, so it has to be
+          # read through the same single merge point as every other knob. A
+          # variable/`config` value that is non-numeric or negative never reaches
+          # here: config.py warns and keeps the caller's reviewed default, so the
+          # awk floor below cannot be handed a typo it would silently render as 0.
+          # The one value that CAN arrive unusable is an unusable caller default —
+          # handled by the guard in the script below, not here.
+          PR_SIZE_LIMIT: ${{ fromJSON(needs.gate.outputs.resolved).pr_size_limit }}
+          # Belt to the above's suspenders, and the pre-BE-6345 behaviour verbatim:
+          # used only if the resolved set carried no usable value at all.
+          PR_SIZE_LIMIT_INPUT: ${{ inputs.pr_size_limit }}
           # Present ONLY to scan the patch for the literal key before it becomes a
           # public PR (471). This step runs NO agent, so holding the key here adds no
           # exfil surface — the risk is an AGENT reading it, and there is none here.
@@ -1811,11 +1838,27 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/out
+          # Empty means the resolved knob set somehow carried no pr_size_limit —
+          # only reachable if the CALLER's own reviewed `with:` value was itself
+          # rejected by config.py (e.g. a negative literal), since the variable
+          # layer falls back to that default rather than dropping the key. awk
+          # would render "" as 0, and a limit of 0 bails EVERY build to an issue,
+          # silently turning the builder off. Fall back to the caller's input and
+          # say so, rather than disabling PR-opening without a word.
+          if [ -z "${PR_SIZE_LIMIT//[[:space:]]/}" ]; then
+            echo "::warning::pr_size_limit resolved to an empty value — falling back to the caller's input ($PR_SIZE_LIMIT_INPUT)."
+            PR_SIZE_LIMIT="$PR_SIZE_LIMIT_INPUT"
+          fi
           # `type: number` can arrive as a fractional string (e.g. 400.0) that the
           # integer-only `-gt` test below would abort on under `set -euo pipefail`,
           # skipping the patch upload. Floor it to an int first (mirrors the file
           # job's MAX_FINDINGS handling).
           PR_SIZE_LIMIT=$(awk -v v="$PR_SIZE_LIMIT" 'BEGIN{printf "%d", v}')
+          # No echo of the value here on purpose: the gate job already logs the
+          # whole resolved set ("Resolved knobs: {…}"), pr_size_limit included, so
+          # a variable-set ceiling — which leaves no diff and no branch — is
+          # already on the run record once per run (BE-6345). A per-build repeat
+          # would be the same fact N times.
           STATUS=$(jq -r '.status // "bail"' "$BUILDER_OUT" 2>/dev/null || echo bail)
           SUMMARY=$(jq -r '.summary // ""' "$BUILDER_OUT" 2>/dev/null || echo "")
 
