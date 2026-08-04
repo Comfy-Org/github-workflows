@@ -270,13 +270,25 @@ on:
         required: true
       enabled:
         description: >-
-          Whether to grade at all. DEFAULTS TO FALSE: enrolling this workflow and
-          switching it on are two separate decisions, so a repo can land the
-          caller, get it reviewed, and start grading later — or stop grading
-          without reverting anything. When it resolves false the `grade` job does
-          not run: nothing is read, nothing is labelled, and no existing `risk:*`
-          label is touched (a disabled run leaves whatever the last enabled one
-          left, it does not clean up).
+          Whether to grade AUTOMATICALLY. DEFAULTS TO FALSE: enrolling this
+          workflow and switching it on are two separate decisions, so a repo can
+          land the caller, get it reviewed, and start grading later — or stop
+          grading without reverting anything. When it resolves false a
+          `pull_request` run does not grade: nothing is read, nothing is
+          labelled, and no existing `risk:*` label is touched (a disabled run
+          leaves whatever the last enabled one left, it does not clean up).
+
+
+          A MANUAL `workflow_dispatch` GRADES REGARDLESS. Dispatching requires
+          write access and is an explicit, attributed act, so there is no
+          unattended behaviour left for this switch to govern — and without that
+          exemption the staged rollout this input exists for cannot happen: a
+          repo enrolled OFF could not grade even one PR to see what the grader
+          would say, so "try it here before turning it on" would require turning
+          it on. The cost, stated plainly: false is a MUTE on the PR stream, not
+          a lockout. A repo needing the harder guarantee should remove the
+          caller — nothing here can bind a maintainer who can edit the workflow
+          file anyway.
 
 
           `vars.RISK_CONFIG` on the CALLING repo OVERRIDES this, in both
@@ -330,7 +342,21 @@ jobs:
 
   grade:
     needs: gate
-    if: needs.gate.outputs.enabled == 'true'
+    # `enabled` governs AUTOMATIC grading — the `pull_request` stream. A manual dispatch is
+    # never blocked by it: running a workflow_dispatch requires write access on the repo and is
+    # an explicit, attributed act, so there is no unattended behaviour left for the switch to
+    # govern. Without this clause the staged rollout the switch exists for does not work — a
+    # repo that enrols OFF cannot grade even a single PR to see what the grader would say, so
+    # "try it here before turning it on" requires switching the whole repo on first, which is
+    # the thing being evaluated.
+    #
+    # What this costs, stated rather than buried: `{"enabled": false}` stops the PR-stream
+    # noise, but it does NOT stop a human running the grader by hand. It is a mute, not a
+    # lockout. If a repo ever needs the harder guarantee, remove the caller — nothing here can
+    # bind a maintainer who can edit the workflow file anyway.
+    if: >-
+      needs.gate.outputs.enabled == 'true' ||
+      github.event_name == 'workflow_dispatch'
     name: Grade PR risk
     runs-on: ubuntu-latest
     timeout-minutes: 30
