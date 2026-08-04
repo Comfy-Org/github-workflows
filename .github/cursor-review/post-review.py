@@ -49,6 +49,15 @@ SEVERITY_LABEL = {
 }
 DEFAULT_SEVERITY = "medium"
 
+# Max re-raises of an already-answered finding allowed in one review (BE-5109).
+# Nothing already-answered is ever silently suppressed — a wrong or premature
+# deferral must not be able to permanently bury a real Critical — but a round is
+# never allowed to be all re-litigation, so the panel gets at most this many
+# re-raises, on the record, with the link. Extras are dropped loudly (the review
+# body says how many). Kept in sync with REPEAT_CAP in build-ledger.py, which is
+# what the judge prompt block quotes.
+REPEAT_CAP = 2
+
 
 def normalize_severity(value) -> str:
     """Coerce a model-supplied severity into one of SEVERITY_ORDER.
@@ -226,19 +235,82 @@ def normalize_comments(findings: list[dict]) -> list[dict]:
             continue
         severity = normalize_severity(finding.get("severity"))
         badge = f"{SEVERITY_EMOJI[severity]} **{SEVERITY_LABEL[severity]}** — "
+        repeat_line = render_repeat_of(finding)
         enriched.append(
             {
                 "severity": severity,
+                # Truthy only for a re-raise of an already-answered finding —
+                # what enforce_repeat_cap counts against REPEAT_CAP.
+                "repeat_of": repeat_line,
                 "comment": {
                     "path": path,
                     "line": line_int,
                     "side": "RIGHT",
-                    "body": badge + neutralize_mentions(body),
+                    "body": badge + neutralize_mentions(body) + repeat_line,
                 },
             }
         )
     enriched.sort(key=lambda item: severity_rank(item["severity"]))
     return enriched
+
+
+def render_repeat_of(finding: dict) -> str:
+    """Render the re-raise line for a finding the judge marked as a repeat.
+
+    `repeat_of` is the prior round's `discussion_url` from the ledger. Showing
+    it inline is the whole point of the repeat policy: a re-raise happens on the
+    record, linked to the thread that already answered it, so the author can see
+    at a glance that this is round N of the same conversation.
+    """
+    url = finding.get("repeat_of")
+    if not isinstance(url, str) or not url.strip():
+        return ""
+    return f"\n\n↩︎ re-raise of {neutralize_mentions(url.strip())}{render_repeat_round(finding)}"
+
+
+def render_repeat_round(finding: dict) -> str:
+    """Render the ``(round N)`` suffix, or nothing.
+
+    This is judge output and the judge reads the ledger — untrusted PR text — so
+    the field is model-relayed content like any other body. The control that
+    actually holds is the type: a *positive integer* can't carry an `@handle` or
+    markup at all, unlike the previous "int or str" check, which passed arbitrary
+    text through to the rendered comment. (That check also admitted `bool`, a
+    subclass of `int`, so `repeat_round: true` rendered as "(round True)".)
+    neutralize_mentions stays on the render as defense in depth for whoever
+    loosens the type next.
+    """
+    round_no = finding.get("repeat_round")
+    if isinstance(round_no, bool):
+        return ""
+    if isinstance(round_no, str):
+        round_no = round_no.strip()
+        if not round_no.isdigit():
+            return ""
+        round_no = int(round_no)
+    if not isinstance(round_no, int) or round_no <= 0:
+        return ""
+    return f" (round {neutralize_mentions(str(round_no))})"
+
+
+def enforce_repeat_cap(enriched: list[dict], cap: int = REPEAT_CAP) -> tuple[list[dict], int]:
+    """Keep at most `cap` re-raises, most severe first; report how many were cut.
+
+    Enforced here rather than trusted to the judge: the cap is a hard property of
+    the review, and a model that emits five re-raises should not be able to turn
+    a round into pure re-litigation. `enriched` is already severity-sorted, so
+    the survivors are the most severe repeats.
+    """
+    kept, dropped = [], 0
+    repeats = 0
+    for item in enriched:
+        if item.get("repeat_of"):
+            if repeats >= cap:
+                dropped += 1
+                continue
+            repeats += 1
+        kept.append(item)
+    return kept, dropped
 
 
 def post_error_review(repo, pr_number, commit_sha, header, error_message):
@@ -267,6 +339,14 @@ def main():
         default=None,
         help="Banner prepended to the review body (e.g. a judge-failed degradation note).",
     )
+    parser.add_argument(
+        "--ledger-note",
+        default=None,
+        help=(
+            "Prior-review ledger line for the header — either the round/ledger summary "
+            "or the 'context unavailable' banner. Empty/absent renders nothing."
+        ),
+    )
     args = parser.parse_args()
 
     attribution = f"\n\n_Triggered by @{args.triggered_by}._" if args.triggered_by else ""
@@ -275,6 +355,11 @@ def main():
         # Surface a degradation banner (judge failed → raw panel findings) right
         # under the title so every rendered body carries it.
         header += f"\n\n{neutralize_mentions(args.notice)}"
+    if args.ledger_note and args.ledger_note.strip():
+        # Either "Round N — ledger: …" or the ledger-unavailable banner. The
+        # banner case matters most: a re-review that ran WITHOUT prior context
+        # must never look identical to a genuine first-round review.
+        header += f"\n\n_{neutralize_mentions(args.ledger_note.strip())}_"
 
     if args.error_message:
         post_error_review(args.repo, args.pr_number, args.commit_sha, header, args.error_message)
@@ -325,9 +410,15 @@ def main():
         return
 
     enriched = normalize_comments(findings)
+    enriched, repeats_dropped = enforce_repeat_cap(enriched)
     comments = [item["comment"] for item in enriched]
 
     review_body = f"{header}\n\nFound **{len(comments)}** finding(s)."
+    if repeats_dropped:
+        review_body += (
+            f"\n\n_{repeats_dropped} re-raise(s) of already-answered findings were dropped "
+            f"(cap: {REPEAT_CAP} per review). They are still open on their original threads._"
+        )
     severity_summary = build_severity_summary(enriched)
     if severity_summary:
         review_body += f"\n\n{severity_summary}"
