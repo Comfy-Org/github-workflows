@@ -142,6 +142,11 @@ name: PR Risk Grade (reusable)
 #       uses: Comfy-Org/github-workflows/.github/workflows/pr-risk.yml@<sha>  # v1
 #       with:
 #         workflows_ref: <same sha>
+#         # OFF BY DEFAULT. Enrolling and switching on are two decisions: land the caller, get
+#         # it reviewed, then start grading. Either pin it on here, or leave this out and set
+#         # the repo variable RISK_CONFIG to {"enabled": true} — the variable outranks this
+#         # input in BOTH directions, so {"enabled": false} is also a kill switch needing no PR.
+#         enabled: true
 #         # Both are empty on a `pull_request` run (`inputs` is empty there), which is exactly
 #         # the no-input event path — so ONE caller shape serves both event and dispatch and
 #         # there is nothing to keep in sync between two jobs.
@@ -253,12 +258,69 @@ on:
           is not a chain.
         type: string
         required: true
+      enabled:
+        description: >-
+          Whether to grade at all. DEFAULTS TO FALSE: enrolling this workflow and
+          switching it on are two separate decisions, so a repo can land the
+          caller, get it reviewed, and start grading later — or stop grading
+          without reverting anything. When it resolves false the `grade` job does
+          not run: nothing is read, nothing is labelled, and no existing `risk:*`
+          label is touched (a disabled run leaves whatever the last enabled one
+          left, it does not clean up).
+
+
+          `vars.RISK_CONFIG` on the CALLING repo OVERRIDES this, in both
+          directions — `{"enabled": true}` switches a caller on with no `with:`
+          change, and `{"enabled": false}` is a kill switch that needs no PR at
+          all. That works because the `vars` context inside a reusable resolves
+          against the caller's repository (the same mechanism groom.yml uses for
+          `vars.GROOM_CONFIG`). The variable is the OPERATIONAL lever; this input
+          is the REVIEWED default the variable falls back to when it is absent,
+          empty, not an object, or carries no boolean `enabled` — a malformed
+          variable must never be the reason a repo silently stops grading, so it
+          degrades to this value and says so in an annotation.
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
 
 jobs:
+  # Resolve enablement before anything is read. Its own job rather than a first step of `grade`
+  # so a disabled repo pays one bare runner instead of booting the grading job to immediately
+  # no-op, and so the decision — and the reason for it — is visible in the run graph rather than
+  # buried in a step log. It holds NO token scopes: it reads only its inputs and the caller's
+  # variable, and must never be the thing that touches a PR.
+  gate:
+    name: Resolve enablement
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      enabled: ${{ steps.resolve.outputs.enabled }}
+    steps:
+      # The tool checkout is the same pinned-ref load the grade job does: the resolver is this
+      # repo's code at `workflows_ref`, never the graded PR's.
+      - name: Load pr-risk tool
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _pr_risk_tool
+          persist-credentials: false
+      - name: Resolve enabled
+        id: resolve
+        env:
+          INPUT_ENABLED: ${{ inputs.enabled }}
+          # Empty when the caller repo has no such variable — which is the common case and is
+          # NOT an error; it just means the reviewed input decides.
+          RISK_CONFIG: ${{ vars.RISK_CONFIG }}
+        run: bash _pr_risk_tool/scripts/pr-risk/resolve-enabled.sh
+
   grade:
+    needs: gate
+    if: needs.gate.outputs.enabled == 'true'
     name: Grade PR risk
     runs-on: ubuntu-latest
     timeout-minutes: 30
