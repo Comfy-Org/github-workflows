@@ -62,6 +62,12 @@ FLEET_LOGINS="${PR_RISK_FLEET_LOGINS:-mattmillerai}"
 BOT_LOGINS="${PR_RISK_BOT_LOGINS:-github-actions,dependabot,renovate,coderabbitai,cursor,comfy-pr-bot,web-flow}"
 SELF_CONTEXT="${PR_RISK_SELF_CONTEXT:-}"
 SELF_RUN_ID="${PR_RISK_SELF_RUN_ID:-}"
+# How many 100-context pages of the check rollup to drain before giving up and leaving the PR
+# UNKNOWN. 30 pages = 3000 checks, the same ceiling GitHub puts on the REST changed-files
+# endpoint this script already accepts, and ~29x the largest rollup measured on Comfy-Org/cloud
+# (103). It is a runaway bound, not a policy: a rollup past it stays ungraded rather than being
+# graded off the pages that fit.
+MAX_ROLLUP_PAGES="${PR_RISK_MAX_ROLLUP_PAGES:-30}"
 PR_NUM=""
 MODE=""
 
@@ -427,7 +433,16 @@ fetch_pr_record() { # <repo> <num> -> record JSON on stdout, rc 1 on an unreadab
   # forever, and the PR would land a confident-looking R2 floor after burning the whole wait
   # budget. Rejecting the read outright is what keeps that from being reachable — so do NOT
   # "recover" partial data here by dropping the rc check.
-  local repo="$1" num="$2" q resp files fstatus errf
+  local repo="$1" num="$2" q qctx ctxsel resp files fstatus errf
+  # The rollup's context selection, shared by the first read and the drain query below so the
+  # two cannot drift. It is ONE string on purpose: `is_self` keys on
+  # `checkSuite.workflowRun.databaseId` and `is_failing`/`is_pending` on `__typename` +
+  # status/conclusion, so a drained page missing any of those fields would read as neither
+  # ours nor failing — self-exclusion would quietly stop working past context 100.
+  # shellcheck disable=SC2016  # GraphQL: $vars are query variables
+  ctxsel='pageInfo{ hasNextPage endCursor } nodes{ __typename
+        ... on CheckRun{ name status conclusion checkSuite{ workflowRun{ databaseId workflow{ name } } } }
+        ... on StatusContext{ context state } }'
   # shellcheck disable=SC2016  # GraphQL: $vars are query variables
   q='query($owner:String!,$name:String!,$num:Int!){
   repository(owner:$owner,name:$name){ pullRequest(number:$num){
@@ -436,9 +451,13 @@ fetch_pr_record() { # <repo> <num> -> record JSON on stdout, rc 1 on an unreadab
     additions deletions changedFiles
     labels(first:100){ pageInfo{ hasNextPage } nodes{ name } }
     commits(last:1){ nodes{ commit{ statusCheckRollup{ state
-      contexts(first:100){ pageInfo{ hasNextPage } nodes{ __typename
-        ... on CheckRun{ name status conclusion checkSuite{ workflowRun{ databaseId workflow{ name } } } }
-        ... on StatusContext{ context state } } } } } } }
+      contexts(first:100){ '"$ctxsel"' } } } } }
+  } } }'
+  # shellcheck disable=SC2016  # GraphQL: $vars are query variables
+  qctx='query($owner:String!,$name:String!,$num:Int!,$cursor:String!){
+  repository(owner:$owner,name:$name){ pullRequest(number:$num){
+    commits(last:1){ nodes{ commit{ statusCheckRollup{
+      contexts(first:100, after:$cursor){ '"$ctxsel"' } } } } }
   } } }'
   # SURFACE WHY THE READ FAILED. Discarding gh's stderr made a PERMANENTLY misconfigured token
   # look exactly like a transient blip: the caller's rc=3 handler retries four times with
@@ -454,6 +473,55 @@ fetch_pr_record() { # <repo> <num> -> record JSON on stdout, rc 1 on an unreadab
   jq -e '.data.repository.pullRequest.number != null' >/dev/null 2>&1 <<<"$resp" \
     || { warn "PR read for $repo#$num returned no pullRequest — treating as unreadable"
          rm -f "$errf"; return 1; }
+
+  # ---- drain the rollup's `contexts` connection ----------------------------------------------
+  # GraphQL caps ANY connection page at 100, so the read above returns at most the first 100
+  # checks plus `hasNextPage`. The grader refuses to grade a TRUNCATED rollup — a subset cannot
+  # answer "did green checks covering these lines actually run?" — so without this loop every PR
+  # with more than 100 checks landed `risk:ungraded`, and the busier a repo's CI the more of its
+  # PRs went ungraded. That is the same shape as the `files(first:100)` bug fixed by moving the
+  # changed-file list to REST `--paginate` (see the note below it); the rollup is the connection
+  # that was left behind.
+  #
+  # ON FAILURE, LEAVE THE FLAG SET. A page read that errors, a cursor that does not advance, or a
+  # rollup deeper than the page guard all `break` WITHOUT splicing, so the record keeps the
+  # first page and its `hasNextPage: true` — which the unknown contract below turns into exactly
+  # the ungraded outcome this path already produced. Never a partial rollup graded as whole, and
+  # never the harsher "PR unreadable" bucket for a PR we did successfully read.
+  local rollup='.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup'
+  local ctxnodes ctxmore ctxcur page pages=0
+  ctxnodes="$(jq -c "[$rollup.contexts.nodes[]?]" <<<"$resp")"
+  ctxmore="$(jq -r "$rollup.contexts.pageInfo.hasNextPage // false" <<<"$resp")"
+  ctxcur="$(jq -r "$rollup.contexts.pageInfo.endCursor // \"\"" <<<"$resp")"
+  while [ "$ctxmore" = true ] && [ -n "$ctxcur" ]; do
+    pages=$((pages + 1))
+    if [ "$pages" -gt "$MAX_ROLLUP_PAGES" ]; then
+      warn "rollup for $repo#$num exceeds $((MAX_ROLLUP_PAGES * 100)) checks — grading it would mean grading a partial rollup, so it stays UNKNOWN"
+      break
+    fi
+    page="$(gh api graphql -f query="$qctx" -F owner="${repo%%/*}" -F name="${repo##*/}" \
+              -F num="$num" -F cursor="$ctxcur" 2>"$errf")" || {
+      warn "rollup page $pages failed for $repo#$num: $(tr '\n' ' ' < "$errf")"
+      break
+    }
+    ctxnodes="$(jq -c --argjson acc "$ctxnodes" "\$acc + [$rollup.contexts.nodes[]?]" <<<"$page")" || break
+    ctxmore="$(jq -r "$rollup.contexts.pageInfo.hasNextPage // false" <<<"$page")"
+    # A cursor that repeats would spin until the page guard; treat it as a drained-but-unsure
+    # read and let the flag above decide.
+    local prev="$ctxcur"
+    ctxcur="$(jq -r "$rollup.contexts.pageInfo.endCursor // \"\"" <<<"$page")"
+    [ "$ctxcur" != "$prev" ] || { warn "rollup cursor for $repo#$num did not advance — stopping"; break; }
+  done
+  # Splice ONLY when pagination actually ran AND drained. `pages -gt 0` is load-bearing beyond
+  # saving work: on a PR with no checks at all `statusCheckRollup` is null, and assigning into a
+  # null in jq CREATES the object — which would turn "no rollup" into "an empty rollup" and route
+  # it away from the `$ro == null` branch that treats a checkless PR as readable.
+  if [ "$pages" -gt 0 ] && [ "$ctxmore" = false ]; then
+    resp="$(jq -c --argjson ctx "$ctxnodes" \
+              "$rollup.contexts = {pageInfo: {hasNextPage: false, endCursor: null}, nodes: \$ctx}" \
+              <<<"$resp")" || { warn "could not reassemble the drained rollup for $repo#$num"
+                                rm -f "$errf"; return 1; }
+  fi
 
   # ---- the changed-file list comes from REST, not GraphQL ------------------------------------
   # GraphQL's `files` connection cannot answer this axis. Two reasons, both structural:
