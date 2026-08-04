@@ -35,6 +35,16 @@ name: Bump detect-unreviewed-merge callers
 # fleet-wide change, not one this entrypoint can make alone. Until then, treat
 # the roster as visible in the public run log.
 #
+# CONSEQUENCE — this fleet ships DELIBERATELY UNSEEDED. Every other seeded fleet
+# already publishes its roster this way, so their names are out; this fleet's
+# callers include two non-public repos that no existing roster contains, and
+# seeding before the masking fix lands would publish them on the very first run.
+# A public log entry cannot be unpublished; a red run can. So the variable stays
+# unset until the masking fix lands, and the resulting hard-fail is the
+# intentional nag (see ALLOW_EMPTY below) rather than an oversight. Seed it —
+# `gh variable set` per the update flow below — as the immediate follow-on to
+# that fix, NOT as a way to turn the red run green.
+#
 # ALLOW_EMPTY is set to "false" below. That is already `bump-callers.sh`'s
 # default, but this fleet is seeded NON-EMPTY (its callers all existed before
 # the bumper did), so the property is load-bearing rather than incidental:
@@ -44,8 +54,10 @@ name: Bump detect-unreviewed-merge callers
 # this directory exists to prevent. Stating it explicitly (as
 # `bump-auto-label-callers.yml` does) keeps it true if the shared default ever
 # flips. If a run does hit an empty roster it fails RED on purpose: that is
-# intentional nagging until the roster is restored, not a bug to paper over by
-# flipping ALLOW_EMPTY on.
+# intentional nagging until the roster is seeded (or restored, if it was
+# clobbered), not a bug to paper over by flipping ALLOW_EMPTY on. Expect exactly
+# that red run until the masking fix above lands — it is the designed state, not
+# a broken deploy.
 #
 # Update flow — adding/removing a caller needs NO public commit:
 #   gh variable set DETECT_UNREVIEWED_MERGE_CALLERS --repo Comfy-Org/github-workflows \
@@ -179,14 +191,26 @@ jobs:
             tip_blob=$(git rev-parse --verify --quiet "FETCH_HEAD:$WATCHED" || true)
             here_blob=$(git rev-parse --verify --quiet "HEAD:$WATCHED" || true)
             if [[ -z "$tip_blob" ]]; then
-              echo "$WATCHED no longer exists on main ($main_tip) — decommissioned; nothing to bump"
+              # ::warning:: not a bare echo: if the reusable was deleted while
+              # live callers still pin it, they all hard-fail at startup and a
+              # silently-green run here is the fleet's only chance to say so.
+              echo "::warning::$WATCHED no longer exists on main ($main_tip) — treating as decommissioned and bumping nothing. If any caller still pins it, retire those callers."
               exit 0
             fi
             if [[ "$tip_blob" != "$here_blob" ]]; then
               echo "github.sha $GITHUB_SHA is behind main ($main_tip) and $WATCHED changed since — stale run/re-run; the newer commit has its own run. Nothing to bump"
               exit 0
             fi
-            echo "main moved to $main_tip since $GITHUB_SHA, but $WATCHED is unchanged — this run is still the only one for that change; proceeding"
+            # Pin callers to the VERIFIED TIP, not to this run's stale
+            # github.sha. We have just proved $WATCHED is byte-identical at
+            # both, so the tip is the same reusable content at a commit that is
+            # actually current — pinning the older SHA would hand every caller a
+            # non-tip commit (and, on a land-then-revert, re-pin them backwards).
+            echo "main moved to $main_tip since $GITHUB_SHA, but $WATCHED is unchanged — this run is still the only one for that change; pinning callers to $main_tip and proceeding"
+            # `export` explicitly: the env: binding already marks it exported,
+            # but the script is a separate process and this must not depend on
+            # that inherited attribute surviving a reassignment.
+            export NEW_SHA="$main_tip"
           fi
           # The push path filter also matches a commit that DELETES the
           # reusable workflow; bumping callers to a SHA where it is gone would
@@ -196,7 +220,7 @@ jobs:
           # never exists, making this test always true and the whole fleet a
           # permanent silent no-op.
           if [[ ! -f "$WATCHED" ]]; then
-            echo "$WATCHED absent at this SHA — decommissioned; nothing to bump"
+            echo "::warning::$WATCHED absent at this SHA — treating as decommissioned and bumping nothing. If any caller still pins it, retire those callers."
             exit 0
           fi
           bash .github/bump-callers/bump-callers.sh
