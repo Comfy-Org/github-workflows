@@ -219,9 +219,14 @@ Labels are created on first use, color-coded green → red (gray for ungraded).
   helps most in the ungraded lane. A read that comes back short of `changedFiles`
   is still `unknown`.
 - `publish-risk-surfaces.sh` — the two **opt-in** publish surfaces (`sticky_comment:` /
-  `check_run:`, both `false` by default): the sticky PR comment (per-file path-axis breakdown +
-  the concentration sentence + the dispute checkbox, created once and updated in place) and the
-  Check Run render. Every PR-controlled string it renders is escaped here — a filename may
+  `check_run:`, both `false` by default): the sticky PR comment and the Check Run render. The
+  comment is deliberately **one line above the fold** — tier, the axis that decided it, its
+  reason, plus a concentration fragment when the path axis is what decided — with the formula,
+  the per-axis table, the per-file breakdown and the caveats inside a collapsed `<details>` and
+  the dispute checkbox below it. It is created once and updated in place. The long form lives in
+  the Check Run instead, because this comment lands on PRs that already carry CodeRabbit and an
+  8-cell review panel, and an advisory grade nothing routes on has the weakest claim on the
+  reader's scroll. Every PR-controlled string it renders is escaped here — a filename may
   legally contain `|`, a backtick or a newline, and raw it could break out of its table row and
   forge a pre-ticked dispute checkbox that the next re-grade reads back as a real reviewer
   disagreement. The body is bounded under GitHub's 65536-char comment limit by construction, and

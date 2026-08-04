@@ -298,10 +298,14 @@ on:
         default: .github/risk-runbooks.json
       sticky_comment:
         description: >-
-          Publish ONE sticky PR comment carrying the per-file path-axis breakdown, the risk
-          CONCENTRATION sentence ("94% of this diff is R0/R1; the 6% that puts the path floor at
-          R3 is these two files, 40 lines") and a "this grade is wrong" checkbox. Created once
-          and UPDATED IN PLACE on every re-grade, so N pushes leave exactly one comment.
+          Publish ONE sticky PR comment, and keep it SMALL: the visible body is a single line —
+          the tier, the axis that decided it, that axis's reason, and (only when the path axis
+          decided) how much of the diff carries it. Everything else — the worst() formula, the
+          per-axis reasons, the per-file path-axis breakdown, the map versions and the caveats —
+          is folded into a collapsed `<details>`, with the "this grade is wrong" checkbox below
+          it. An advisory grade nothing routes on does not get to out-shout the review panel and
+          CodeRabbit on the same PR; the Check Run keeps the long form for anyone who wants it.
+          Created once and UPDATED IN PLACE on every re-grade, so N pushes leave one comment.
 
 
           DEFAULTS TO FALSE. A bot comment on every PR across every enrolled repo is a visible

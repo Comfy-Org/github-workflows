@@ -146,6 +146,11 @@ cat <<'JQ'
     # ordinary text is unchanged on screen.
     def md_escape: gsub("(?<c>[\\\\`*_{}\\[\\]()#+.!<>|~-])"; "\\" + .c);
     def md_text($lim): flat | .[0:$lim] | md_escape;
+    # Axis reasons are written as fragments, some with a trailing stop and some without, and the
+    # headline concatenates one with a following sentence. Normalize so the seam never renders as
+    # "…CI classes 14% of 350 lines…". Tested against an escaped stop too: md_escape turns "." into
+    # "\.", whose LAST character is still ".", so this does not double up.
+    def endstop: sub("[[:space:]]+$"; "") | if . == "" or test("[.!?;:]$") then . else . + "." end;
     # A path renders inside an inline code span when it safely can, and as fully-escaped plain
     # text when it cannot. A backtick cannot be quoted reliably inside a code span, and a literal
     # backslash in front of a pipe (`a\|b`) escapes the ESCAPE and hands the pipe back to the
@@ -226,27 +231,58 @@ cat <<'JQ'
        end) as $check_summary
 
     # ---- the sticky comment ------------------------------------------------------------------
+    # DELIBERATELY ONE LINE ABOVE THE FOLD. This lands on PRs that already carry CodeRabbit and an
+    # 8-cell review panel, so an advisory grade nothing routes on has no claim on vertical space:
+    # the visible body is the tier, why, and at most one concentration clause. Everything else —
+    # the formula, the per-axis reasons, the per-file table, the caveats — moves inside the
+    # <details>. The Check Run keeps the long form; it is a surface nobody has to scroll past.
     | (if $disputed == "1" then "x" else " " end) as $box
     # ONE definition of the footer, and it is what the publisher's CHECKED_RE reads back. It is
     # re-appended by the truncation backstop too, so even a body that had to be cut still carries
-    # the checkbox — a truncated body that lost it would read as "never disputed" forever.
+    # the checkbox — a truncated body that lost it would read as "never disputed" forever. CHECKED_RE
+    # anchors only through the bolded label, so the trailing half-sentence is free to be short.
     | ([ "",
-         "- [\($box)] \($dispute_text) — tick this box if the tier above is off. Nothing is gated on it either way; ticking applies the `\($dispute_label)` label so the grader can be tuned against real reviewer disagreement.",
+         "- [\($box)] \($dispute_text) — tick if this tier is wrong; applies the `\($dispute_label)` label. Nothing is gated on it either way.",
          "",
-         "<sub>Advisory only — this grade never fails a check, never blocks a merge, and nothing routes on it. It re-grades on every push, and this comment is updated in place.</sub>" ]) as $tail
+         "<sub>Advisory · never fails a check or blocks a merge · re-grades on every push, updated in place.</sub>" ]) as $tail
+
+    # WHICH AXIS TO NAME IN THE HEADLINE, and its human reason. `$R.reason` is deliberately NOT
+    # used here: it is the machine trace ("worst of path_floor=R1, provenance=R2, ..."), which
+    # restates the tier instead of explaining it. The formula and that trace both still appear
+    # inside the <details>, so nothing is lost by leading with the axis that actually decided.
+    | (if ($drivers | length) > 0
+       then {n: ([$drivers[] | .a] | join(" and ")), r: ($drivers[0].r // "")}
+       elif $graded and (($tier | tier_rank) == ($floor | tier_rank))
+       then {n: "path", r: ($A1.reason // "")}
+       else {n: null, r: ""} end) as $driver
+    # The concentration clause, cut to a headline-sized fragment — and shown ONLY when the path
+    # axis is what drove the tier. Quoting "14% of lines set the path floor at R1" under an R2
+    # headline that provenance produced points the reader at the wrong number.
+    | (if ($driver.n == "path") and ($files | length) > 0 and $total > 0
+          and ($floor | tier_rank) > 0 and ($total - $toplines) > 0
+       then " \(pct($toplines; $total))% of \($total) changed lines carry it (\($topf | length) file(s))."
+       else "" end) as $conc_short
     | (if $graded then
-         [ $marker, "",
-           "## Risk: **`\($tier)`** (advisory)", "",
-           "Grade = worst(path\\_floor, provenance, reversibility) — \($R.reason | md_text(500))", "",
-           $concentration, "",
-           "<details><summary>Per-file path-axis breakdown</summary>", "",
-           "Each row is that file's PATH-AXIS floor — the tier its path alone earns. The headline above is the worst of the path floor, provenance and reversibility, so a file's row is a contribution, not its own overall grade.", "",
-           "| file | +/- | path tier | matched classes |", "|---|---|---|---|" ]
+         ([ $marker, "",
+            # The whole visible comment: tier, the axis that decided it, and that axis's reason.
+            "**Risk `\($tier)`** · advisory"
+              + (if $driver.n != null and ($driver.r | length) > 0
+                 then " — **\($driver.n)**: \($driver.r | md_text(220) | endstop)"
+                 else " — \($R.reason | md_text(220) | endstop)" end)
+              + $conc_short, "",
+            "<details><summary>How this grade was reached</summary>", "",
+            "Grade = worst(path\\_floor, provenance, reversibility).", "",
+            $concentration, "",
+            "| axis | tier | reason |", "|---|---|---|" ]
+          + [ ($R.axes // {}) | to_entries[]
+              | "| \(.key) | \(.value.tier // "unknown") | \(.value.reason | md_text(400)) |" ]
+          + [ "",
+              "Map `\($R.map_version // "unknown")` · registry `\($R.registry_version // "unknown")` · \($files | length) file(s), \($total) counted lines.", "",
+              "Each row below is that file's PATH-AXIS floor — the tier its path alone earns. The headline is the worst of the path floor, provenance and reversibility, so a file's row is a contribution, not its own overall grade.", "",
+              "| file | +/- | path tier | matched classes |", "|---|---|---|---|" ])
        else
          [ $marker, "",
-           "## Risk: **unknown** (advisory)", "",
-           "This pull request could not be graded: \($R.reason // "the graded record was empty or unreadable" | md_text(500))", "",
-           "No tier was computed. An ungradable PR is reported as `unknown`, never defaulted to `R0`." ]
+           "**Risk `unknown`** · advisory — this pull request could not be graded: \($R.reason // "the graded record was empty or unreadable" | md_text(240)). An ungradable PR is never defaulted to `R0`; push again or re-run to retry." ]
        end) as $head
     | ([ $files[] ] | sort_by([ -(.tier | tier_rank), -(.lines) ])) as $shown
     | ([ $shown[0:50][]

@@ -87,16 +87,19 @@ ebody="$(render_surfaces "$r2" 0 | jq -r '.comment_body')"
 if grep -Eq "$CHECKED_RE" <<<"$ebody"; then
   bad "a crafted filename CANNOT forge a ticked dispute checkbox" "$(grep -n 'grade is wrong' <<<"$ebody")"
 else ok "a crafted filename CANNOT forge a ticked dispute checkbox"; fi
+# Both counts are scoped to the PER-FILE table. The <details> block also carries the per-axis
+# table now, so an unscoped `^| ` count would fold its header and three rows into every total.
+file_rows() { sed -n '/^| file | /,$p' <<<"$1" | grep -c '^| '; }
 eq "the crafted path is flattened onto ONE line (no injected rows)" \
-   "$(grep -c '^| ' <<<"$body" | tr -d ' ')x" "$(( $(grep -c '^| ' <<<"$ebody") - 1 ))x"
+   "$(file_rows "$body" | tr -d ' ')x" "$(( $(file_rows "$ebody") - 1 ))x"
 has "$ebody" '\<img src=' "raw HTML from the path is BACKSLASH-ESCAPED, so it renders as text"
 hasnt "$ebody" 'docs/a|b' "the pipe in the path never reaches the table splitter unescaped"
 has   "$ebody" 'docs/a\|b' "…it is backslash-escaped instead"
 # A backtick in the path forces the fully-escaped plain-text branch: no code span can quote it.
 hasnt "$ebody" '`docs/a' "a path containing a backtick is NOT wrapped in a code span"
 # The structure still parses as one table: every rendered row has exactly 4 cells + the delimiters.
-rows="$(grep -c '^| ' <<<"$ebody")"
-eq "the table still has one row per file plus its header" 3 "$rows"
+rows="$(file_rows "$ebody")"
+eq "the per-file table still has one row per file plus its header" 3 "$rows"
 
 echo "— the reason string is escaped too (it quotes PR-authored path names) —"
 u="$SANDBOX/unknown.json"
@@ -107,7 +110,8 @@ else ok "an unknown report's reason cannot forge the checkbox"; fi
 hasnt "$ubody" "](https://evil.example)" "…nor smuggle an inline link"
 
 echo "— UNGRADABLE reports as unknown, NEVER R0 —"
-has "$ubody" "Risk: **unknown**" "the comment headline is unknown"
+# shellcheck disable=SC2016  # the backticks are literal markdown in the rendered headline
+has "$ubody" 'Risk `unknown`' "the comment headline is unknown"
 usurf="$(render_surfaces "$u" 0)"
 eq "the Check Run title is 'Risk: unknown'" "Risk: unknown" "$(jq -r '.check_title' <<<"$usurf")"
 eq "…and the surfaces report tier unknown" "unknown" "$(jq -r '.tier' <<<"$usurf")"
