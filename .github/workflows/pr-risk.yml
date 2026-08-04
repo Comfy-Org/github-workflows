@@ -14,7 +14,11 @@ name: PR Risk Grade (reusable)
 #
 # The grader and its default risk map load from THIS repo at the pinned `workflows_ref`,
 # never from the graded PR's checkout (no PR code is checked out at all) — a PR cannot edit
-# the rules that judge it. A consumer repo sharpens the generic defaults by committing
+# the rules that judge it. `workflows_ref` has deliberately no default and is now ENFORCED as a
+# full 40-hex commit SHA: every job that checks it out fails before the checkout on anything
+# mutable (a branch, a tag, `refs/pull/N/head`), so the "pin it to the same SHA as `uses:`"
+# contract is machine-checked rather than trusted prose in this header. A consumer repo sharpens
+# the generic defaults by committing
 # `.github/risk.json` (map) / `.github/risk-runbooks.json` (runbook registry), which are read
 # from the PR's BASE ref: present-but-invalid fails the run loudly; absent falls back to the
 # defaults in scripts/pr-risk/.
@@ -151,6 +155,9 @@ name: PR Risk Grade (reusable)
 #         statuses: read
 #       uses: Comfy-Org/github-workflows/.github/workflows/pr-risk.yml@<sha>  # v1
 #       with:
+#         # ENFORCED, not merely asked for: a full 40-hex commit SHA, or the run fails before the
+#         # tool checkout. A branch, a tag, or `refs/pull/N/head` is rejected — see the paragraph
+#         # about the pinned ref at the top of this header for why.
 #         workflows_ref: <same sha>
 #         # OFF BY DEFAULT. Enrolling and switching on are two decisions: land the caller, get
 #         # it reviewed, then start grading. Either pin it on here, or leave this out and set
@@ -266,6 +273,12 @@ on:
           so the two halves of one tool drifted apart and the grading logic
           stayed mutable after review. A supply chain with a floating link in it
           is not a chain.
+
+
+          ENFORCED: the run fails before the tool checkout unless this matches
+          `^[0-9a-f]{40}$`. Branches, tags and `refs/pull/N/head` are mutable —
+          and a PR-head ref of this PUBLIC repo resolves fork-authored code — so
+          they are rejected rather than documented against.
         type: string
         required: true
       enabled:
@@ -322,6 +335,31 @@ jobs:
     outputs:
       enabled: ${{ steps.resolve.outputs.enabled }}
     steps:
+      # THE PIN CONTRACT IS ENFORCED, NOT DOCUMENTED. The ref below supplies the code that runs
+      # in this job — a mutable ref (branch, tag, `refs/pull/N/head`) means that code can change
+      # after the caller was reviewed, and PR-head refs of this PUBLIC repo resolve fork-authored
+      # code. Only a full commit SHA is immutable, so anything else fails here, before the
+      # checkout. Enforced in the WORKFLOW, not in a script: the scripts are what the ref loads,
+      # so a script-side check would sit inside the blast radius it is meant to bound. EVERY job
+      # that checks out `workflows_ref` re-asserts this itself — `grade` does not inherit its
+      # safety from this job's step, so neither one can be made unsafe by a later `if:` or a
+      # re-ordering of the graph. This is also the FIRST checkout in the run, so a bad pin is
+      # reported before any of this repo's code has executed anywhere.
+      #
+      # The value arrives via `env:` and is never interpolated into the script body — inline
+      # `${{ }}` of the very input being validated is a shell-injection vector. `[[ =~ ]]` rather
+      # than `grep -Eq '^[0-9a-f]{40}$'` because grep anchors per LINE: a multi-line value
+      # carrying one SHA-shaped line would pass it and then be handed to checkout in full.
+      # The two copies of this step are byte-identical on purpose; keep them that way.
+      - name: Enforce workflows_ref pin contract
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$WORKFLOWS_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::workflows_ref must be the FULL 40-hex commit SHA of Comfy-Org/github-workflows (got '${WORKFLOWS_REF}'). Pin it to the SAME SHA you pin uses: to — see the pr-risk.yml header. Branches, tags and refs/pull/N/head are mutable (and PR-head refs resolve fork-authored code), so they are rejected before the tool checkout."
+            exit 1
+          fi
       # The tool checkout is the same pinned-ref load the grade job does: the resolver is this
       # repo's code at `workflows_ref`, never the graded PR's.
       - name: Load pr-risk tool
@@ -406,6 +444,20 @@ jobs:
       BASE_REF: ${{ (inputs.pr_number || inputs.pr_numbers) == '' && github.event.pull_request.base.ref || '' }}
       GH_TOKEN: ${{ github.token }}
     steps:
+      # The same guard the `gate` job applies, restated here rather than inherited from it. This
+      # job is where the stakes are: the checked-out code runs holding the job's `GH_TOKEN`, which
+      # carries `pull-requests: write`, and public repos enroll via `pull_request_target` so that
+      # token is present on fork-authored events. A job must not depend on ANOTHER job's step for
+      # its own trust boundary — see the `gate` job above for the full rationale.
+      - name: Enforce workflows_ref pin contract
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$WORKFLOWS_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::workflows_ref must be the FULL 40-hex commit SHA of Comfy-Org/github-workflows (got '${WORKFLOWS_REF}'). Pin it to the SAME SHA you pin uses: to — see the pr-risk.yml header. Branches, tags and refs/pull/N/head are mutable (and PR-head refs resolve fork-authored code), so they are rejected before the tool checkout."
+            exit 1
+          fi
       - name: Load pr-risk tool
         # The grader + default map come from THIS workflow's repo (public, pinned
         # via workflows_ref) — never from the graded PR. No PR code is checked
