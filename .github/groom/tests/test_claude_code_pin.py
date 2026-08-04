@@ -19,12 +19,20 @@ these are the guards that keep the arrangement from quietly regressing:
 - .github/dependabot.yml still carries the npm entry for `/.github/groom` —
   without it the manifest is just an unwatched second place to rot.
 
+The last class is a different kind of guard: it queries the registry to check
+that the PINNED VERSION'S OWN dependency tree still has the shape that makes a
+top-level-only pin a complete pin. See `TestPinnedDependencyShape` and the
+"Scope: why the top-level pin is the whole pin" section of ../README.md.
+
 Run: python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
 """
 
 import json
 import os
 import re
+import shutil
+import subprocess
+import time
 import unittest
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -80,6 +88,152 @@ _PKG_AT = re.compile(re.escape(_PACKAGE) + r"@(\S+)")
 # fold into the PRECEDING job's block and the `needs: gate` assertion below
 # passes vacuously — the precise regression these guards exist to catch.
 _JOB_KEY = re.compile(r"^  ([A-Za-z_][A-Za-z0-9_-]*):$", re.MULTILINE)
+
+# The registry round-trip for the dependency-shape guard below. Generous, because
+# a cold CI runner's first `npm view` pays a metadata fetch, and the failure mode
+# of a too-tight timeout here is a red suite on a PR that changed nothing.
+_NPM_TIMEOUT_SEC = 60
+# One extra attempt per lookup. The guard hard-fails in CI, and its path filter
+# is all of `.github/groom/**` — so without a retry a single DNS hiccup or
+# anonymous-rate-limit blip reds a PR that only touched `ledger.py`. Two attempts
+# is the whole budget: the point is to absorb a one-off, not to sit through an
+# outage.
+_NPM_ATTEMPTS = 2
+_NPM_RETRY_SLEEP_SEC = 2
+# One process per (spec, field) for the whole run, so splitting the shape guard
+# into readable per-assertion test methods costs one registry hit, not four.
+_NPM_CACHE = {}
+# Circuit breaker. The guard makes a lookup per (package, field) across two tree
+# levels, so a total registry blackhole would otherwise cost
+# len(specs) * len(fields) * _NPM_ATTEMPTS * _NPM_TIMEOUT_SEC — tens of minutes of
+# runner time to reach a conclusion the first two attempts already reached. Once
+# a lookup exhausts its retries, every later lookup reuses that error instead of
+# dialling out again.
+_NPM_DEAD = []
+
+# The registry to consult, stated explicitly rather than inherited. `npm view`
+# otherwise resolves its registry from ambient config, INCLUDING a project
+# `.npmrc` in the checkout — and this repo has no root `package.json`, so npm's
+# local prefix when the suite runs from the repo root is the checkout itself. A
+# PR that adds a root `.npmrc` pointing at an attacker-run registry could
+# otherwise have the guard ask that registry whether the tree is closed, get
+# "yes", and go green. The SCOPED flag is not redundant: npm's `@scope:registry`
+# setting takes precedence over `registry` for scoped packages, so pinning only
+# the latter still leaves `@anthropic-ai:registry=…` in an `.npmrc` able to
+# redirect the very lookups this guard depends on.
+_REGISTRY = "https://registry.npmjs.org/"
+_REGISTRY_FLAGS = (f"--registry={_REGISTRY}", f"--@anthropic-ai:registry={_REGISTRY}")
+
+# Spellings of "not actually CI". GitHub Actions sets both `CI=true` and
+# `GITHUB_ACTIONS=true` on every runner, so a registry that errors or times out
+# hard-fails there rather than skipping; a developer who exports `CI=false` gets
+# the offline-friendly skip they clearly meant.
+_NOT_CI = {"", "0", "false", "no", "off"}
+
+# Checked in order, and ANY of them being truthy means strict. `CI` alone fails
+# open: it is unauthenticated and trivially settable, so an env-scrubbing wrapper
+# (or a job that unsets it) would silently downgrade every registry error to a
+# skip and report green. `GITHUB_ACTIONS` is set by the runner itself, so the two
+# together mean disarming the guard takes clearing both rather than one.
+_CI_VARS = ("CI", "GITHUB_ACTIONS")
+
+
+def _in_ci():
+    return any(
+        os.environ.get(name, "").strip().lower() not in _NOT_CI for name in _CI_VARS
+    )
+
+
+def _npm_field(spec, field):
+    """`npm view <spec> <field> --json`, as `(value, error, unavailable)`.
+
+    ONE field per invocation, deliberately. Asking for two in a single call is
+    the obvious optimization and it is unsafe: npm keys the output object by
+    field name only when BOTH fields are present. When just one exists it prints
+    that field's map BARE and unlabelled, so `{"is-number": "^6.0.0"}` is
+    indistinguishable from a two-field reply in which `dependencies` happens to
+    be absent. Read the keyed way, a future release that declares real
+    `dependencies` and no `optionalDependencies` would parse as "both empty" and
+    PASS — the precise regression this guard exists to fail on. One field per
+    call has no such shape ambiguity: the reply is that field's map, `{}` if the
+    field is present but empty, or empty output if the field is absent at all.
+
+    Returns `(value, error, unavailable)`. `error` is set for anything that
+    stopped us from learning the shape — non-zero exit, timeout, unreadable JSON —
+    and is fatal in CI, where an unverified guard is an absent guard. `unavailable`
+    marks the narrower "there is no npm here at all" case. That is a property of
+    the MACHINE rather than a failed check, so it skips on a dev box where an
+    offline `unittest discover` must not go red over a change it has nothing to do
+    with — but it is fatal in CI too, because `test-groom-scripts.yml` installs
+    Node explicitly (`actions/setup-node`). npm missing on a runner means that
+    step was dropped or broke, and the honest report of that is a red guard, not a
+    silent skip that lets a dependency-changing bump merge green.
+
+    Only successful and `unavailable` lookups are cached; both are stable answers.
+    An error is retried within the call (`_NPM_ATTEMPTS`) and, once it has
+    exhausted those, trips `_NPM_DEAD` so the remaining lookups report the same
+    reason without dialling out again.
+    """
+    key = (spec, field)
+    if key in _NPM_CACHE:
+        return _NPM_CACHE[key]
+
+    npm = shutil.which("npm")
+    if npm is None:
+        result = (None, "no `npm` on PATH", True)
+        _NPM_CACHE[key] = result
+        return result
+
+    if _NPM_DEAD:
+        return (None, _NPM_DEAD[0], False)
+
+    error = "`npm view` was never attempted"
+    for attempt in range(1, _NPM_ATTEMPTS + 1):
+        try:
+            proc = subprocess.run(
+                [npm, "view", spec, field, "--json", *_REGISTRY_FLAGS],
+                capture_output=True,
+                text=True,
+                timeout=_NPM_TIMEOUT_SEC,
+                # Inherited stdin would let a credential prompt hang the run out
+                # to the timeout instead of failing immediately.
+                stdin=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired:
+            error = f"`npm view` timed out after {_NPM_TIMEOUT_SEC}s"
+        except OSError as exc:  # npm on PATH but unexecutable
+            error = f"could not run `npm view`: {exc}"
+        else:
+            if proc.returncode != 0:
+                detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+                error = f"`npm view {spec} {field}` exited {proc.returncode}" + (
+                    f": {detail[0]}" if detail else ""
+                )
+            else:
+                raw = proc.stdout.strip()
+                # Absent field -> npm prints nothing. That is a real answer ("no
+                # such field"), not a failure, and `{}` is its faithful reading.
+                # It is only safe to read it that way because `_positive_control`
+                # separately proves this npm/registry pair answers at all — see
+                # there for why silence would otherwise pass every assertion.
+                if not raw:
+                    result = ({}, None, False)
+                    _NPM_CACHE[key] = result
+                    return result
+                try:
+                    result = (json.loads(raw), None, False)
+                except ValueError as exc:
+                    error = f"`npm view` returned unreadable JSON: {exc}"
+                else:
+                    _NPM_CACHE[key] = result
+                    return result
+
+        if attempt < _NPM_ATTEMPTS:
+            time.sleep(_NPM_RETRY_SLEEP_SEC)
+
+    error = f"{error} (after {_NPM_ATTEMPTS} attempts)"
+    _NPM_DEAD.append(error)
+    return (None, error, False)
 
 
 def _read(path):
@@ -358,6 +512,323 @@ class DependabotTest(unittest.TestCase):
         # The workflow guard rejects a range at run time, so the updater must be
         # told to keep an exact requirement exact rather than widening it.
         self.assertEqual("increase", npm[0].get("versioning-strategy"))
+
+
+# Dependency fields that must be EMPTY at the top level for the tree to stay
+# closed. Checking only `dependencies` would leave two doors open that the
+# README's closed-tree claim says are shut: npm 7+ AUTO-INSTALLS
+# `peerDependencies`, so a floating peer range floats exactly like a regular one;
+# and `bundleDependencies` ships third-party code INSIDE the tarball, where no
+# registry version spec constrains it at all. `optionalDependencies` is absent
+# here on purpose — at the top level it is the one field legitimately non-empty
+# (the eight platform binaries), so it gets its own two assertions below.
+#
+# BOTH spellings of the bundled field are queried. npm normalizes
+# `bundledDependencies` to `bundleDependencies`, but that normalization happens in
+# the publishing client, so whether a given packument carries the canonical
+# spelling is a property of how it was published rather than something to assume.
+# The alias costs one lookup and answers `{}` whenever the normalization did run.
+_MUST_BE_EMPTY = (
+    "dependencies",
+    "peerDependencies",
+    "bundleDependencies",
+    "bundledDependencies",
+)
+
+# The same question one level down, at the platform binaries. Depth-1 alone would
+# leave the closure claim resting on an unchecked premise: a binary that later
+# declares a floating third-party dep reopens the resolved tree with every
+# top-level assertion still green. `optionalDependencies` joins the list here —
+# nothing about a leaf binary makes a non-empty one legitimate. `bundleDependencies`
+# needs no separate entry at this depth: npm only bundles names that also appear
+# in one of these maps, and all of them must be empty.
+_LEAF_MUST_BE_EMPTY = ("dependencies", "optionalDependencies", "peerDependencies")
+
+# The scripts npm runs when installing a package as a REGISTRY DEPENDENCY, which
+# is how the platform binaries arrive. The README claims each is an inert leaf;
+# this is what makes that checkable rather than a promise. The TOP-LEVEL package
+# does declare a `postinstall` — that one is documented and accepted, not guarded.
+#
+# `prepare` is deliberately NOT here. npm runs it for git and local installs, not
+# when unpacking a published tarball, and the top-level package already carries
+# one as a publish guard — so including it would red this guard the day that
+# harmless convention is rolled out to the binaries, over a script that never
+# executes on install.
+_INSTALL_LIFECYCLE = ("preinstall", "install", "postinstall")
+
+class TestPinnedDependencyShape(unittest.TestCase):
+    """The pinned version's own dependency tree must stay CLOSED (BE-5580).
+
+    Everything above guards the pin's *mechanism*. This guards its *scope*.
+
+    `npm install -g` has no lockfile, so a top-level pin does not mechanically
+    pin transitive deps. The reason that is nonetheless the whole pin today is a
+    property of the package, not of the install command: as of 2.1.x
+    `@anthropic-ai/claude-code` declares NO regular, peer or bundled
+    dependencies, and its only optionalDependencies are same-scope
+    `@anthropic-ai/claude-code-<platform>` binaries exact-pinned to the identical
+    version — each of which is itself a leaf, with no dependency fields and no
+    install lifecycle scripts. So the resolved install is fully determined by the
+    pinned version. The accepted boundary and the risks accepted with it are
+    written up in ../README.md, "Scope: why the top-level pin is the whole pin".
+
+    Both LEVELS are checked, deliberately. A depth-1-only guard would rest the
+    closure claim on an unchecked premise about the binaries, and a release whose
+    platform binary picked up a floating third-party dep would reopen the tree
+    with every assertion still green — the same silent regression this class
+    exists to catch one level up.
+
+    That property is not guaranteed to hold forever — versions 1.x through 2.0.0
+    DID declare floating third-party `@img/sharp-*: ^0.33.5` ranges, under which
+    two installs of the same pinned CLI version can resolve different bytes. So
+    the residual risk gets a guard rather than a promise: this class fails the
+    PR that changes the pin — Dependabot's bump PR edits
+    `.github/groom/package.json`, which is exactly what triggers this suite — if
+    the new version's tree has stopped being closed. A red here is not "fix the
+    test"; it is the signal to re-open the transitive-pinning decision.
+
+    Network-dependent — the only class here that is — so it degrades by AUDIENCE
+    rather than failing everyone: anything that stops it learning the shape is a
+    hard failure in CI, where an unverifiable guard is a silently missing guard,
+    and a skip on a dev machine, where an offline `unittest discover` must not go
+    red over a change it has nothing to do with. That includes a machine with no
+    `npm`: `test-groom-scripts.yml` installs Node explicitly, so npm missing on a
+    runner means that step broke, and reporting it as a skip would let a
+    dependency-changing bump merge green.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        # Parsed defensively rather than bare. A missing or malformed manifest
+        # raised out of here as a class-level ERROR — which is precisely the
+        # confusing second failure the precondition below exists to avoid, just
+        # relocated. ManifestTest owns reporting that; this class only needs to
+        # know whether it has a usable spec to ask the registry about.
+        cls.version = None
+        cls.spec = None
+        cls.precondition = None
+        try:
+            manifest = json.loads(_read(_MANIFEST))
+        except OSError as exc:
+            cls.precondition = f"{_MANIFEST} could not be read: {exc}"
+            return
+        except ValueError as exc:
+            cls.precondition = f"{_MANIFEST} is not valid JSON: {exc}"
+            return
+        deps = manifest.get("dependencies")
+        if not isinstance(deps, dict):
+            cls.precondition = f"{_MANIFEST} has no `dependencies` mapping"
+            return
+        version = deps.get(_PACKAGE)
+        # `isinstance` BEFORE `fullmatch`: a non-string pin (`"…": 2`, or a
+        # nested object) makes `re.fullmatch` raise TypeError, turning a
+        # precondition that should read as a skip into an unrelated-looking
+        # error.
+        if not isinstance(version, str) or _EXACT_VERSION.fullmatch(version) is None:
+            cls.precondition = (
+                f"{_MANIFEST} does not pin {_PACKAGE} to an exact version "
+                f"(got {version!r})"
+            )
+            return
+        cls.version = version
+        cls.spec = f"{_PACKAGE}@{version}"
+
+    def setUp(self):
+        # ManifestTest owns asserting these; here they are preconditions, and
+        # querying the registry for `@anthropic-ai/claude-code@None` or for a
+        # dist-tag would just add a confusing second failure to that one.
+        if self.precondition is not None:
+            self.skipTest(f"{self.precondition} — see ManifestTest for that failure")
+
+    def _fail_or_skip(self, spec, error, unavailable):
+        """Hard-fail in CI, skip on a dev box. Never returns."""
+        message = (
+            f"could not verify the dependency shape of {spec}: {error}. The npm "
+            "registry could not be consulted, so this guard could not check that "
+            "the pinned CLI's dependency tree is still closed under the exact "
+            "top-level pin (see .github/groom/README.md, 'Scope: why the "
+            "top-level pin is the whole pin')."
+        )
+        if unavailable:
+            message += (
+                " test-groom-scripts.yml installs Node explicitly, so on a runner "
+                "this means that step is missing or broken."
+            )
+        # In CI an unverified guard is an ABSENT guard, and this suite runs on the
+        # bump PR precisely to be the check nobody has to remember. On a dev
+        # machine the same condition is just "offline", and an `unittest discover`
+        # there must not go red over a change it has nothing to do with.
+        if _in_ci():
+            self.fail(message)
+        self.skipTest(message)
+
+    def _positive_control(self):
+        """Prove this npm/registry pair answers about the pinned spec at all.
+
+        `_npm_field` reads empty stdout with exit 0 as the positive answer "field
+        absent" -> `{}`. That is what npm genuinely does, and it is also what makes
+        every assertion in this class pass VACUOUSLY if something suppresses npm's
+        output while still exiting 0 — `npm_config_loglevel=silent`, a wrapper
+        `npm` shim earlier on PATH, a registry answering 200 with nothing. Asking
+        first for a field that MUST exist and MUST equal a value we already know
+        separates "no such field" from "no answer": silence here fails instead of
+        quietly converting the whole guard into a pass. It doubles as a check that
+        the registry answered about the package we asked for.
+        """
+        value, error, unavailable = _npm_field(self.spec, "version")
+        if error is not None:
+            self._fail_or_skip(self.spec, error, unavailable)
+        self.assertEqual(
+            self.version,
+            value,
+            f"positive control failed: `npm view {self.spec} version` answered "
+            f"{value!r}, not {self.version!r}. Every assertion in this class reads "
+            "empty `npm view` output as the positive answer 'field absent', so an "
+            "npm that answers nothing — or answers about some other package — "
+            "would make them all pass vacuously. Treat this as the guard being "
+            "unable to run, not as a dependency-shape regression.",
+        )
+
+    def _entries(self, spec, field):
+        """`(name, declared-spec)` pairs for `field` on `spec`, or skip/fail.
+
+        Normalizes npm's two shapes for a dependency-ish field: the `*Dependencies`
+        maps and `scripts` answer `{name: value}`, while `bundleDependencies`
+        answers a bare LIST of names (its entries carry no spec of their own — they
+        name packages that must also appear in one of the maps). A list entry gets
+        `None` for its spec, rendered as the bare name in a failure.
+        """
+        self._positive_control()
+        value, error, unavailable = _npm_field(spec, field)
+        if error is not None:
+            self._fail_or_skip(spec, error, unavailable)
+        if isinstance(value, list):
+            for name in value:
+                self.assertIsInstance(
+                    name, str, f"unexpected `npm view` {field} entry: {name!r}"
+                )
+            # Sort the NAMES, not the pairs: `sorted` on `(name, None)` tuples
+            # falls through to comparing `None < None` on a duplicate name.
+            return [(name, None) for name in sorted(value)]
+        self.assertIsInstance(
+            value, dict, f"unexpected `npm view` {field} shape: {value!r}"
+        )
+        for name, declared in value.items():
+            # Guards the single-field reading in `_npm_field`: every value in a
+            # dependency map is a version SPEC string. A nested object would mean
+            # npm answered in some other shape (keyed by field, or by version) and
+            # this whole comparison is meaningless rather than passing.
+            self.assertIsInstance(
+                declared,
+                str,
+                f"unexpected `npm view` {field} entry: {name}={declared!r}",
+            )
+        return sorted(value.items())
+
+    @staticmethod
+    def _declaration(spec, field, name, declared):
+        rendered = name if declared is None else f"{name}@{declared}"
+        return f"{spec} {field}: {rendered}"
+
+    def _regression(self, declarations):
+        # Every offender in ONE failure. Failing on the first one hides the rest,
+        # and a version that reintroduces several dependencies at once is exactly
+        # the case where seeing the whole shape change matters.
+        return (
+            f"the resolved tree of {self.spec} declares "
+            + "; ".join(declarations)
+            + ". The dependency tree is no longer closed under the exact "
+            "top-level pin, so the accepted boundary documented in "
+            ".github/groom/README.md no longer holds. Re-open the "
+            "transitive-pinning decision (spike BE-5580) before bumping."
+        )
+
+    def _platform_binary_specs(self):
+        """`<name>@<declared>` for each declared platform binary.
+
+        The DECLARED spec, not `<name>@{self.version}`: the point is to inspect
+        what would actually install. If the declaration has drifted off the exact
+        pin, `test_optional_dependencies_are_pinned_to_the_same_exact_version`
+        reports that; this method should not quietly ask about a different
+        version than the one npm would resolve.
+        """
+        return [
+            f"{name}@{declared}"
+            for name, declared in self._entries(self.spec, "optionalDependencies")
+        ]
+
+    def test_pinned_version_declares_no_third_party_dependency_fields(self):
+        # ANY entry in these three is a shape regression: unlike the platform
+        # binaries below, none of them is covered by the same-publisher argument,
+        # and all three end up installed (npm 7+ auto-installs peers; bundled
+        # code ships inside the tarball).
+        offenders = [
+            self._declaration(self.spec, field, name, declared)
+            for field in _MUST_BE_EMPTY
+            for name, declared in self._entries(self.spec, field)
+        ]
+        if offenders:
+            self.fail(self._regression(offenders))
+
+    def test_optional_dependencies_are_all_same_scope(self):
+        # The boundary rests on the platform binaries sharing a publisher with
+        # the top-level package: hijacking one is not a cheaper attack than
+        # hijacking the thing we pinned. A dep from any other scope breaks that
+        # argument even if it happens to be exact-pinned — 1.x-2.0.0's
+        # `@img/sharp-*` is the historical instance.
+        offenders = [
+            self._declaration(self.spec, "optionalDependencies", name, declared)
+            for name, declared in self._entries(self.spec, "optionalDependencies")
+            if not name.startswith("@anthropic-ai/")
+        ]
+        if offenders:
+            self.fail(self._regression(offenders))
+
+    def test_optional_dependencies_are_pinned_to_the_same_exact_version(self):
+        # String equality, NOT semver satisfaction: `^2.1.217` SATISFIES 2.1.217
+        # while still floating to 2.9.x tomorrow, and a floating range is
+        # precisely the regression being guarded.
+        offenders = [
+            self._declaration(self.spec, "optionalDependencies", name, declared)
+            for name, declared in self._entries(self.spec, "optionalDependencies")
+            if declared != self.version
+        ]
+        if offenders:
+            self.fail(self._regression(offenders))
+
+    def test_platform_binaries_declare_no_dependencies_of_their_own(self):
+        # Depth 2. Without this the closure claim stops at the root and rests on
+        # an unchecked assumption about the leaves — a binary that picks up a
+        # floating third-party dep reopens the resolved tree while every
+        # assertion above stays green.
+        offenders = [
+            self._declaration(binary, field, name, declared)
+            for binary in self._platform_binary_specs()
+            for field in _LEAF_MUST_BE_EMPTY
+            for name, declared in self._entries(binary, field)
+        ]
+        if offenders:
+            self.fail(self._regression(offenders))
+
+    def test_platform_binaries_declare_no_install_lifecycle_scripts(self):
+        # The other half of "each with no dependencies and no lifecycle scripts of
+        # its own": pinned bytes still execute if an install hook runs them. The
+        # top-level package's own documented `postinstall` is out of scope here —
+        # it is accepted in ../README.md, not guarded.
+        offenders = [
+            self._declaration(binary, "scripts", name, command)
+            for binary in self._platform_binary_specs()
+            for name, command in self._entries(binary, "scripts")
+            if name in _INSTALL_LIFECYCLE
+        ]
+        if offenders:
+            self.fail(
+                f"a platform binary of {self.spec} runs an install lifecycle "
+                "script: " + "; ".join(offenders) + ". The accepted boundary "
+                "documented in .github/groom/README.md says these are inert "
+                "leaves, and it no longer holds. Re-open the transitive-pinning "
+                "decision (spike BE-5580) before bumping."
+            )
 
 
 if __name__ == "__main__":

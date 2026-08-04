@@ -397,6 +397,103 @@ chain for steps that read untrusted repo content:
 literal anywhere in `groom.yml`, every install step wired to the gate output, and
 the Dependabot entry still present.
 
+### Scope: why the top-level pin is the whole pin
+
+Mechanically the pin covers only the **top-level** version — `npm install -g`
+writes no lockfile, so nothing in the install command constrains what the package
+itself depends on. The reason that is nonetheless the complete boundary is a
+property of *this package*, not of the command: as of 2.1.x
+`@anthropic-ai/claude-code` declares **no regular, peer or bundled dependencies at
+all**, and its only `optionalDependencies` are the eight same-scope
+`@anthropic-ai/claude-code-<platform>` binaries, each **exact-pinned to the
+identical version** and each a leaf — no dependency fields and no install
+lifecycle scripts of its own. Verify with:
+
+```bash
+for f in dependencies optionalDependencies peerDependencies bundleDependencies; do
+  npm view "@anthropic-ai/claude-code@<pinned>" "$f"
+done
+```
+
+(One field per call, and read the output by eye rather than with a script.
+`npm view` labels fields only when **more than one** is present; when just one is,
+it prints that field's map bare and unlabelled, so a reply of
+`{"is-number": "^6.0.0"}` is ambiguous about which field answered. The guard below
+queries one field per call for the same reason — see `_npm_field`.)
+
+`peerDependencies` and `bundleDependencies` are in that list on purpose, not for
+completeness: npm 7+ **auto-installs** peer dependencies, so a floating peer range
+floats exactly like a regular one, and `bundleDependencies` ships third-party code
+*inside the tarball*, where no registry version spec constrains it at all. A check
+that looked only at `dependencies` would leave both doors open.
+
+So the resolved install is fully determined by the pinned version: across the
+pinned package and its eight declared platform binaries there is no third-party
+code in the tree and no range left to float. Hijacking a "transitive dep" here
+would mean compromising the *same publisher* as the top-level package — not a
+cheaper attack than compromising the thing we already pinned, which is what makes
+the extra machinery a lockfile would buy not worth its cost.
+
+(The top-level package does run a `postinstall`, so this is "the resolved bytes
+are pinned", not "nothing executes". Those bytes are covered by the pin like the
+rest of the package; that install step is why the CLI is treated as executable
+supply chain throughout this section.)
+
+Two residual risks are **accepted**:
+
+- **An npm-registry-level compromise** serving different bytes for an
+  already-published, immutable version. A lockfile `integrity` hash would close
+  this, and it was still rejected: adding one would turn this deliberately inert
+  pin carrier into a real project (see the section above — nothing is ever
+  installed from this directory, and a lockfile invites exactly the `npm install`
+  that must not happen here), in exchange for a defense against an event that
+  compromises effectively all CI everywhere, not just groom.
+- **A future version reintroducing floating third-party dependencies.** This one
+  is *not* accepted silently — it is guarded.
+  `tests/test_claude_code_pin.py`'s `TestPinnedDependencyShape` queries the
+  registry for the pinned version and fails if:
+  - the top-level `dependencies`, `peerDependencies` or `bundleDependencies` is
+    non-empty;
+  - any `optionalDependencies` key leaves the `@anthropic-ai/` scope, or any of
+    their values is not the exact pinned version string (string equality, not
+    range-satisfaction — `^2.1.217` satisfies 2.1.217 today and floats tomorrow);
+  - any declared platform binary is no longer a leaf — it declares its own
+    `dependencies`, `optionalDependencies` or `peerDependencies`, or runs a
+    `preinstall`/`install`/`postinstall` script. (`prepare` is excluded: npm runs
+    it for git and local installs, not when unpacking a published tarball, and the
+    top-level package already carries one as a publish guard.)
+
+  That second level matters: a depth-1-only guard would rest the whole closure
+  claim on an unchecked assumption about the binaries, and a release whose
+  platform binary picked up a floating third-party dep would reopen the resolved
+  tree with every top-level assertion still green. What the guard does **not**
+  reach is anything below those binaries — which is sound only because they are
+  verified to be leaves; if that ever stops holding, the guard says so rather than
+  quietly narrowing.
+
+  Because a Dependabot bump PR edits `.github/groom/package.json`, it triggers
+  this suite — so the guard fires on the one event that can change the pin. A red
+  there is not a test to fix: it means the tree stopped being closed, and the
+  transitive-pinning decision (spike BE-5580) has to be re-opened before bumping.
+
+  The lookups pin the registry explicitly (`--registry` *and*
+  `--@anthropic-ai:registry`, since npm's scoped setting outranks the global one),
+  so an `.npmrc` added to the checkout cannot redirect the guard at a registry
+  that answers "closed tree"; they retry once so a single blip does not red a PR
+  that only touched `ledger.py`; and they open with a positive-control lookup of
+  `version`, because empty `npm view` output legitimately means "field absent" and
+  would otherwise let an npm that answers *nothing* pass every assertion
+  vacuously. `test-groom-scripts.yml` installs Node explicitly so npm is a
+  declared dependency of the job rather than an incidental property of the runner
+  image; missing npm is therefore a hard failure in CI, and a skip only on a dev
+  machine that is simply offline.
+
+The guard is not hypothetical. Versions **1.x through 2.0.0** of this same package
+declared floating `@img/sharp-*: ^0.33.5` ranges — third-party, cross-scope, and
+range-pinned — under which two installs of the same pinned CLI version could
+resolve different bytes. The closed tree is a recent property, so it is checked
+rather than assumed.
+
 - **`tests/`** — `unittest` suite, run by
   [`test-groom-scripts.yml`](../workflows/test-groom-scripts.yml).
 
