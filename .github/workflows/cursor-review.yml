@@ -139,6 +139,15 @@ env:
   DIFF_EXCLUDES: ${{ inputs.diff_excludes }}
   # Where the assets checkout lands (this repo, .github/cursor-review/*).
   CURSOR_REVIEW_ASSETS: ${{ github.workspace }}/_cursor_review_assets/.github/cursor-review
+  # Cursor CLI pin — a versioned, checksummed artifact instead of the mutable
+  # cursor.com/install script (BE-5869). Old versions stay downloadable, so a
+  # Cursor release never breaks this; the pin moves only via a reviewed PR.
+  # Consumed by .github/cursor-review/install-cursor-cli.sh, the ONE installer
+  # all three CLI-using jobs run (preflight, review matrix, consolidate).
+  CURSOR_CLI_VERSION: 2026.07.23-e383d2b
+  # sha256 of the linux/x64 agent-cli-package.tar.gz (all jobs run ubuntu-latest).
+  # Cross-checked against nixpkgs pkgs/by-name/cu/cursor-cli at pin time.
+  CURSOR_CLI_SHA256: 702ad595213bee5df0268be9f80a19f29fcceaa2a42fc55e39f2b5199051f0c4
 
 jobs:
   gate:
@@ -318,26 +327,38 @@ jobs:
         #
         # Pinned to each lab's newest highest-reasoning tier in Cursor's
         # catalog (last checked 2026-07-28). OpenAI: GPT-5.6 Sol is the
-        # 5.6-family coding flagship (no 5.6 codex variant exists). Anthropic:
-        # Fable 5 tops the catalog but all Fable entries are marked NO ZDR in
-        # Cursor, and this panel reviews private-repo diffs, so it is excluded;
-        # bumped Anthropic's pin from Opus 4.8 to Opus 5 thinking at its max
-        # tier. ZDR eligibility for Opus 5 specifically in Cursor's catalog
-        # is UNCONFIRMED as of this bump (no CURSOR_API_KEY/live-catalog
-        # access and no verifiable primary source were available when this
-        # was written) — confirm against Cursor's live catalog/dashboard
-        # before relying on this pin for private-repo review traffic.
-        # Gemini (Pro line) and Kimi still ship a single reasoning tier each.
+        # 5.6-family coding flagship (Luna is the cost tier, Terra mid; the
+        # Codex line stops at 5.3). Anthropic: Fable 5 tops the catalog but
+        # all Fable entries are marked NO ZDR in Cursor, and this panel
+        # reviews private-repo diffs, so it is excluded; Opus 5 thinking at
+        # its max tier is ZDR-eligible (confirmed against the live catalog —
+        # no NO-ZDR marker, see PR BE-4818 for the run link) and replaces
+        # Opus 4.8 at identical per-token pricing. Gemini: 3.1 Pro is still
+        # the only Pro-line entry (3.5/3.6 are Flash tier). Moonshot: Kimi K3
+        # (max tier) supersedes K2.7 Code; no NO-ZDR marker in the catalog
+        # (same evidentiary bar as every other pin), ~3.2x/3.75x the
+        # per-token cost of K2.7 on this lab's two panel cells (~+10-15%
+        # total panel cost per PR).
         run: |
           cat > /tmp/models.json <<'JSON'
           [
             "gpt-5.6-sol-max",
             "claude-opus-5-thinking-max",
             "gemini-3.1-pro",
-            "kimi-k2.7-code"
+            "kimi-k3-max"
           ]
           JSON
           echo "models=$(jq -c . /tmp/models.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Load cursor-review assets
+        # Same trusted-assets checkout the review/consolidate jobs do — this
+        # job needs it for install-cursor-cli.sh.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _cursor_review_assets
+          persist-credentials: false
 
       - name: Install Cursor agent CLI
         env:
@@ -350,8 +371,7 @@ jobs:
             echo "No CURSOR_API_KEY (fork PR or unset secret) — skipping catalog preflight."
             exit 0
           fi
-          curl https://cursor.com/install -fsSL | bash
-          echo "$HOME/.cursor/bin" >> "$GITHUB_PATH"
+          bash "$CURSOR_REVIEW_ASSETS/install-cursor-cli.sh"
 
       - name: Validate model pins against live catalog
         env:
@@ -485,17 +505,21 @@ jobs:
           echo "Diff size: $(wc -l < /tmp/pr-diff.patch) lines"
 
       - name: Install Cursor agent CLI
-        run: |
-          curl https://cursor.com/install -fsSL | bash
-          echo "$HOME/.cursor/bin" >> "$GITHUB_PATH"
+        run: bash "$CURSOR_REVIEW_ASSETS/install-cursor-cli.sh"
 
-      - name: Log Cursor agent version
-        # The install script is unpinned (curl | bash from cursor.com), so we
-        # log the installed version into the run for forensics rather than
-        # gating on a hard-coded baseline. A version equality check produced
-        # daily toil without adding integrity protection — a CDN compromise
-        # would just ship malicious bits as a "new version" we'd then bump to.
-        run: cursor-agent --version
+      - name: Verify Cursor agent version
+        # The installer already asserts this once. Re-asserted here, on the
+        # PATH-resolved binary immediately before the review runs, so a swap
+        # between install and use (a CLI self-update, a stale symlink) can't
+        # quietly hand the review to unpinned bits — and the version still
+        # lands in the log for forensics.
+        run: |
+          installed="$(cursor-agent --version)"
+          if [ "$installed" != "$CURSOR_CLI_VERSION" ]; then
+            echo "::error::cursor-agent reports '${installed}', expected the pinned '${CURSOR_CLI_VERSION}'."
+            exit 1
+          fi
+          echo "cursor-agent ${installed} (matches CURSOR_CLI_VERSION)."
 
       - name: Build prompt
         env:
@@ -610,9 +634,7 @@ jobs:
           git diff "$BASE_SHA...$HEAD_SHA" -- . $DIFF_EXCLUDES > /tmp/pr-diff.patch
 
       - name: Install Cursor agent CLI
-        run: |
-          curl https://cursor.com/install -fsSL | bash
-          echo "$HOME/.cursor/bin" >> "$GITHUB_PATH"
+        run: bash "$CURSOR_REVIEW_ASSETS/install-cursor-cli.sh"
 
       - name: Download panel findings
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
