@@ -1,0 +1,134 @@
+name: Bump detect-unreviewed-merge callers
+
+# When detect-unreviewed-merge.yml is updated on main, open a SHA-bump PR in
+# every repo that pins a caller against it. PRs are opened by Cloud Code Bot so
+# they are easy to filter and merge.
+#
+# This is a thin entrypoint over the shared bumper at
+# .github/bump-callers/bump-callers.sh — the same script drives the
+# cursor-review, agents-md-integrity, pr-size, assign-reviewers, auto-label and
+# groom caller fleets. Keeping ONE implementation is deliberate: a forked copy
+# is how other shared machinery in the org has drifted. The entrypoints differ
+# only in their path-filter trigger and the parameters passed below. (They stay
+# separate rather than a single matrix because their triggers differ — a
+# detect-unreviewed-merge.yml change must not spuriously bump the other fleets'
+# callers, and vice versa.)
+#
+# Unlike cursor-review/groom/pr-size, this reusable loads NOTHING at run time —
+# no `workflows_ref:` input, no prompt/script directory — so the workflow file
+# itself is the whole surface a caller pins, and the path filter has a single
+# entry.
+#
+# The caller list is NOT hardcoded here. This repo is PUBLIC (workflow file and
+# Actions run logs are both publicly viewable), and most callers are private, so
+# their names must never appear in this file or its logs. The list lives in the
+# repo-level Actions variable `DETECT_UNREVIEWED_MERGE_CALLERS` (config, not a
+# credential — a variable, not a secret, since secrets are write-only via the
+# API) as a JSON array of {"repo","file","label"} objects, same shape as the
+# other fleets' variables. Every repo name is `::add-mask::`ed out of the
+# (public) run logs before it is ever echoed.
+#
+# ALLOW_EMPTY is deliberately NOT set (so it defaults to false): this fleet has
+# a known, non-empty set of live callers, and per bump-callers.sh a fleet that
+# always has callers must never silently no-op — that would leave every caller
+# un-bumped with nobody noticing, which is exactly the drift this directory
+# exists to prevent. Seeding the variable is a separate step from landing this
+# workflow, so a run in the window before it is seeded fails RED on purpose:
+# that is intentional nagging until the roster exists, not a bug to paper over
+# by flipping ALLOW_EMPTY on.
+#
+# Update flow — adding/removing a caller needs NO public commit:
+#   gh variable set DETECT_UNREVIEWED_MERGE_CALLERS --repo Comfy-Org/github-workflows \
+#     --body "$(jq -c . callers.json)"
+# Keep the canonical callers.json in a PRIVATE infra/ops repo so variable edits
+# have a reviewed source of truth; the org audit log records each edit. (The
+# specific home repo is intentionally not named here — this file is public.)
+
+on:
+  workflow_dispatch: {}   # allow on-demand runs (e.g. to re-bump callers)
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/detect-unreviewed-merge.yml
+
+permissions:
+  contents: read
+
+# Serialize runs of this fleet. The bumper pushes to a STABLE branch
+# (ci/bump-detect-unreviewed-merge) shared across runs, so two overlapping runs
+# (a rapid second main push, or a push racing a manual re-run) would force-reset
+# that branch and race the PR update — an older run finishing last could leave
+# the committed diff pinned to a stale SHA. cancel-in-progress: false lets the
+# running bump finish; GitHub keeps only the newest pending run, so the latest
+# SHA always wins (BE-3882).
+concurrency:
+  group: bump-detect-unreviewed-merge-callers
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    # Guard against a workflow_dispatch run from a non-main ref: github.sha is
+    # the tip of whatever ref was selected, and the bumper force-resets a stable
+    # shared branch — a manual run from an older ref would pin every caller to a
+    # stale SHA (and run this job's script, with the App token minted below,
+    # from an unreviewed commit). The push trigger is already main-only, so this
+    # only ever skips stray manual runs.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Generate Cloud Code Bot token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0 — pinned: see dependabot.yml ignore (v2+ breaks cross-repo `owner:` token scoping)
+        id: token
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+          owner: Comfy-Org
+
+      - name: Bump SHA in caller repos
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          NEW_SHA: ${{ github.sha }}
+          VAR_NAME: DETECT_UNREVIEWED_MERGE_CALLERS
+          TAG: detect-unreviewed-merge
+          WORKFLOW_FILE: detect-unreviewed-merge.yml
+          # JSON array of {"repo","file","label"} — see the header comment for the
+          # update flow. Kept in a variable (not the file) so private caller names
+          # never land in this public repo or its logs.
+          CALLERS_JSON: ${{ vars.DETECT_UNREVIEWED_MERGE_CALLERS }}
+        run: |
+          # The main-only ref guard above cannot catch a manual RE-RUN of an
+          # older main run: github.ref is refs/heads/main but github.sha is
+          # that run's original (now stale) commit, and the bumper would
+          # force-repin every caller to it. Only act from the current tip —
+          # any newer push has its own queued run that does the bump.
+          # Don't pipe into `cut`: the pipeline would report cut's status, so a
+          # failed ls-remote (network blip, remote hiccup) yields an EMPTY
+          # main_tip that then compares unequal to github.sha and silently
+          # no-ops the whole fleet bump as if the run were stale. A lookup we
+          # couldn't perform is not evidence of staleness — fail loudly.
+          if ! ls_remote=$(git ls-remote origin refs/heads/main); then
+            echo "::error::Could not look up the current main tip (git ls-remote failed)"
+            exit 1
+          fi
+          main_tip=${ls_remote%%$'\t'*}
+          if [[ -z "$main_tip" ]]; then
+            echo "::error::git ls-remote returned no SHA for refs/heads/main"
+            exit 1
+          fi
+          if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
+            echo "github.sha $GITHUB_SHA is not the current main tip ($main_tip) — stale run/re-run; nothing to bump"
+            exit 0
+          fi
+          # The push path filter also matches a commit that DELETES the
+          # reusable workflow; bumping callers to a SHA where it is gone would
+          # break every caller. Deletion means decommissioning — no-op.
+          if [[ ! -f .github/workflows/detect-unreviewed-merge.yml ]]; then
+            echo "detect-unreviewed-merge.yml absent at this SHA — decommissioned; nothing to bump"
+            exit 0
+          fi
+          bash .github/bump-callers/bump-callers.sh
