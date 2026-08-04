@@ -245,6 +245,55 @@ A bare signature carries no `security` flag, so the probe answers for a routine
 finding by default; pass `--check-security` to mirror `partition`'s decision for
 a `security: true` candidate.
 
+## `key-broker.mjs` — the localhost API-key proxy (BE-4419)
+
+A tiny, dependency-free localhost HTTP proxy that **holds the real Anthropic API
+key and injects it into forwarded requests**, so the groom agent steps (BE-4311)
+can run the Claude CLI with only a **dummy** key and `ANTHROPIC_BASE_URL` pointed
+at the broker — the real key never enters the agent step's environment.
+
+**Why not just put the key in the agent step's env?** The groom agent has an
+unscoped `Read` tool and `Bash(cat:*)`, and everything on the runner is the same
+user, so `/proc/<agent-pid>/environ` — and, crucially, `/proc/<broker-pid>/environ`
+and `/proc/<broker-pid>/cmdline` — are all agent-readable. The broker's design
+follows from that:
+
+1. **The real key arrives on stdin (first line), never via env or argv.** A key in
+   the process environment or command line would be recoverable straight out of
+   `/proc`. Stdin is not. The broker reads exactly the first line at startup and
+   exits non-zero if stdin closes without one.
+2. **It never logs request/response headers or bodies** — the log file is
+   agent-readable too. At most it logs `method path -> status`.
+3. **It listens on `127.0.0.1` only.**
+
+What it does per request:
+
+- `HEAD` / `GET` on `/` → answered locally with `200` (the CLI's connectivity
+  probe; never forwarded).
+- Path starting with `/v1/` → forwarded to the upstream preserving method and
+  body (streamed both ways, so SSE works), **stripping** any inbound `x-api-key`,
+  `authorization`, and `host`, then **injecting** the real `x-api-key` and the
+  upstream `host`. Upstream status + response headers are copied back verbatim.
+- Anything else → `404` locally. Upstream connection error → `502` with a static
+  body (no detail echoed).
+
+Env knobs (config only — **never** the key):
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `GROOM_BROKER_PORT` | `8199` | port to listen on (`127.0.0.1:<port>`) |
+| `GROOM_BROKER_UPSTREAM` | `https://api.anthropic.com` | where `/v1/*` is forwarded (overridable so tests can point it at a local fake; `http://` is accepted **only** for loopback hosts, so a plaintext non-loopback upstream can't leak the injected key) |
+
+On listen it prints one readiness line (`groom-key-broker listening on
+127.0.0.1:<port>`); a consumer's wait-loop should key off **that line** (proof
+the broker itself bound the port), not merely the port being connectable — a
+foreign process already holding the port would pass a bare connect check while
+the broker exits with `EADDRINUSE`, and the consumer would then stream prompts
+and repo data (plus the dummy key) to an unrelated listener.
+
+> **groom.yml wiring lands in the sibling ticket (BE-4311)** — this file adds the
+> broker script + its unit tests only; nothing in `groom.yml` calls it yet.
+
 ## `interval.py` — the runtime cadence gate (BE-4004)
 
 GitHub Actions `schedule:` cron is **static in the workflow file** — there is no
@@ -315,7 +364,8 @@ python3 .github/groom/interval.py --normalize-cadence "$GROOM_INTERVAL_DAYS"
 ```
 
 - **`tests/`** — `unittest` suite, run by
-  [`test-groom-scripts.yml`](../workflows/test-groom-scripts.yml).
+  [`test-groom-scripts.yml`](../workflows/test-groom-scripts.yml). The key-broker
+  tests boot the real script under `node` (skipped when `node` is absent).
 
 ```bash
 python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
