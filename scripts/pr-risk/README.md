@@ -209,6 +209,16 @@ Labels are created on first use, color-coded green → red (gray for ungraded).
   its connection capped the list at 100, which put exactly the PRs a risk grade
   helps most in the ungraded lane. A read that comes back short of `changedFiles`
   is still `unknown`.
+- `publish-risk-surfaces.sh` — the two **opt-in** publish surfaces (`sticky_comment:` /
+  `check_run:`, both `false` by default): the sticky PR comment (per-file path-axis breakdown +
+  the concentration sentence + the dispute checkbox, created once and updated in place) and the
+  Check Run render. Every PR-controlled string it renders is escaped here — a filename may
+  legally contain `|`, a backtick or a newline, and raw it could break out of its table row and
+  forge a pre-ticked dispute checkbox that the next re-grade reads back as a real reviewer
+  disagreement. The body is bounded under GitHub's 65536-char comment limit by construction, and
+  no failure in it can redden a PR. `RENDER_ONLY=1` emits the surfaces and writes nothing, which
+  is how the Check Run is rendered in the grading job and POSTed from the job that holds
+  `checks: write`.
 - `grade-targets.sh` — the orchestration layer, extracted from `pr-risk.yml`'s
   inline job body so the event path and the by-number path cannot drift into two
   copies of it. Per target: resolve the base ref, fetch that ref's override

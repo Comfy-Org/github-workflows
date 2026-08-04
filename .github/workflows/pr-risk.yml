@@ -281,6 +281,52 @@ on:
         type: string
         required: false
         default: .github/risk-runbooks.json
+      sticky_comment:
+        description: >-
+          Publish ONE sticky PR comment carrying the per-file path-axis breakdown, the risk
+          CONCENTRATION sentence ("94% of this diff is R0/R1; the 6% that puts the path floor at
+          R3 is these two files, 40 lines") and a "this grade is wrong" checkbox. Created once
+          and UPDATED IN PLACE on every re-grade, so N pushes leave exactly one comment.
+
+
+          DEFAULTS TO FALSE. A bot comment on every PR across every enrolled repo is a visible
+          behaviour change, so it is a per-consumer decision — the same precedent `pr-size.yml`
+          set with `mode: warn`. A caller that does not opt in behaves byte-identically to
+          before this input existed: nothing is rendered, nothing is posted, and no dispute
+          label is touched.
+
+
+          Ticking the checkbox applies `risk-grade-disputed` on the next grade, and a re-grade
+          preserves the tick rather than resetting it. That label is DISTINCT from the
+          human-owned `risk-dispute` convention, which the grader still never touches: one is a
+          machine-maintained mirror of a checkbox, rewritten on every grade; the other is a
+          human's own label. Needs no permission beyond the `pull-requests: write` the grade job
+          already holds for the label.
+        type: boolean
+        required: false
+        default: false
+      check_run:
+        description: >-
+          Publish a Check Run on the PR's head commit carrying the tier and the reason — the
+          immutable, timestamped, commit-attached record a label cannot be (a label is mutable
+          and carries no history). Its conclusion is hardcoded `neutral`, so it cannot fail a PR
+          even if a repo later marks it required.
+
+
+          DEFAULTS TO FALSE, and switching it on REQUIRES ONE EXTRA LINE IN THE CALLER: a
+          `publish-check` job runs with `checks: write`, so the caller's `permissions:` block
+          needs that grant. It is a SEPARATE job precisely so this stays opt-in — raising the
+          grade job's own `checks: read` to `checks: write` would have been rejected for every
+          already-enrolled caller before any step ran. With the input false the job is skipped
+          and nothing about an existing caller changes.
+        type: boolean
+        required: false
+        default: false
+      check_name:
+        description: Name of the published Check Run (only used when `check_run` is true).
+        type: string
+        required: false
+        default: PR risk (advisory)
       workflows_ref:
         description: >-
           Ref of Comfy-Org/github-workflows to load the grader + default map
@@ -495,6 +541,11 @@ jobs:
     name: Grade PR risk
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      # The RENDERED Check Run payloads, one per target. Rendering happens HERE — in the job with
+      # the narrow token — and the separate publish job only ever POSTs strings this job already
+      # escaped, so the job holding `checks: write` never renders anything it read from a PR.
+      surfaces: ${{ steps.grade.outputs.surfaces }}
     permissions:
       contents: read        # read the consumer's .github/risk.json override from the BASE ref
       issues: write         # create the risk:* labels repo-side on first use (repo label CRUD
@@ -604,6 +655,10 @@ jobs:
           SELF_CONTEXT: ${{ github.workflow }}
           SELF_RUN_ID: ${{ github.run_id }}
           WAIT_MINUTES: ${{ inputs.wait_for_checks_minutes }}
+          # The sticky comment rides the `pull-requests: write` this job already holds for the
+          # label; the Check Run does not, so it is only RENDERED here (see the `surfaces` output).
+          PUBLISH_COMMENT: ${{ inputs.sticky_comment && '1' || '0' }}
+          PUBLISH_CHECK: ${{ inputs.check_run && '1' || '0' }}
           JOB_TIMEOUT_MINUTES: 30      # keep in sync with timeout-minutes on the job
           TOOL_DIR: _pr_risk_tool/scripts/pr-risk
         run: |
@@ -714,3 +769,62 @@ jobs:
             echo
             echo "This label routes nothing and gates nothing. Disagree with the grade? Add the \`risk-dispute\` label and say why in a comment — the grader never touches that label."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # THE ONE JOB THAT HOLDS `checks: write`, and it reads NOTHING from a pull request. Its whole
+  # input is the `surfaces` output the grade job already rendered and escaped, so no PR-controlled
+  # text is interpreted here — the two-job split BE-5508 asked for, adopted for exactly the reason
+  # rendering PR-authored paths into a bot-authored artifact makes it worth having.
+  #
+  # It is also what keeps `check_run` genuinely opt-in. A reusable workflow can only NARROW the
+  # caller's token, so raising the GRADE job's `checks: read` to `checks: write` would have been
+  # rejected — before any step ran — for every caller already enrolled with the reviewed block in
+  # this file's header. Skipped when the input is false, so those callers are untouched.
+  publish-check:
+    needs: [gate, grade]
+    if: needs.gate.outputs.enabled == 'true' && inputs.check_run && !cancelled()
+    name: Publish the risk Check Run
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      checks: write         # the ONLY new grant this workflow can ask for, and only when opted in
+      contents: read
+      pull-requests: read   # read each target's head sha (the commit the check attaches to)
+    steps:
+      - name: Create the Check Run(s)
+        env:
+          REPO: ${{ github.repository }}
+          SURFACES: ${{ needs.grade.outputs.surfaces }}
+          CHECK_NAME: ${{ inputs.check_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          # An empty/absent output is not an error: the grade job may have been cancelled, or every
+          # target may have failed before rendering. Nothing to publish is not something to fail on
+          # — this surface is advisory and may never redden a PR.
+          n="$(jq 'length' <<<"${SURFACES:-[]}" 2>/dev/null || echo 0)"
+          if [ "${n:-0}" -eq 0 ]; then
+            echo "no rendered Check Run payloads — nothing to publish"; exit 0
+          fi
+          rc=0
+          for i in $(seq 0 $(( n - 1 ))); do
+            one="$(jq -c ".[$i]" <<<"$SURFACES")"
+            pr="$(jq -r '.pr' <<<"$one")"
+            sha="$(gh api "repos/${REPO}/pulls/${pr}" --jq '.head.sha' 2>/dev/null)" || sha=""
+            if [ -z "$sha" ] || [ "$sha" = null ]; then
+              echo "::warning::could not read the head sha of ${REPO}#${pr} — no Check Run was created for it"
+              rc=1; continue
+            fi
+            # `conclusion: neutral` is hardcoded. Nothing in this workflow may emit
+            # success/failure: a neutral check cannot fail a PR even if a repo later marks it
+            # required, which is the entire "nothing is gated" guarantee.
+            jq -n --arg name "${CHECK_NAME:-PR risk (advisory)}" --arg sha "$sha" \
+                  --argjson one "$one" \
+               '{name:$name, head_sha:$sha, status:"completed", conclusion:"neutral",
+                 output:{title:($one.title[0:255]), summary:($one.summary[0:65535])}}' \
+              | gh api -X POST "repos/${REPO}/check-runs" --input - >/dev/null \
+              || { echo "::warning::could not create the Check Run for ${REPO}#${pr} — the grade, its label and the step summary are unaffected"; rc=1; }
+          done
+          # ALWAYS 0. Every failure above is announced; a publish surface that could redden a PR
+          # would quietly turn an advisory grade into a gate.
+          [ "$rc" -eq 0 ] || echo "one or more Check Runs could not be created — announced above"
+          exit 0

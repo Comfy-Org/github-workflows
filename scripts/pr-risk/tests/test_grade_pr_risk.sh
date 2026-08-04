@@ -85,6 +85,23 @@ eq "map version stamped" v0-generic "$(jq -r '.risk.map_version' <<<"$out")"
 eq "registry version stamped" v0-generic "$(jq -r '.risk.registry_version' <<<"$out")"
 
 echo "— phase 7: a structurally empty map is refused outright —"
+echo "— per-file path floors are REPORTING ONLY: worst(files) == the floor itself —"
+# publish-risk-surfaces.sh renders one row per file from risk.axes.path_floor.files. Those
+# per-file floors are matched with the SAME rules as the floor, so `worst` over them must equal
+# the floor — otherwise the breakdown has quietly become a second grading model that can disagree
+# with the tier printed above it.
+# ONE line: --stdin is JSONL, and a pretty-printed record is dropped by the per-line reader.
+inv="$(grade <<<'{"changed_paths_status":"ok","author":"someone","is_fork":false,"labels":[],"checks_status":"ok","checks_state":"SUCCESS","provenance_status":"ok","changed_paths":[{"path":".github/workflows/a.yml","change_type":"MODIFIED"},{"path":"docs/a.md","change_type":"MODIFIED"},{"path":"src/plain.go","change_type":"MODIFIED"}]}')"
+eq "the floor is R3 (the ci rule)" "R3" "$(jq -r '.risk.axes.path_floor.tier' <<<"$inv")"
+eq "worst over the per-file floors equals it" "R3" \
+   "$(jq -r '[.risk.axes.path_floor.files[].tier] | map({"R0":0,"R1":1,"R2":2,"R3":3}[.]) | max
+             | ["R0","R1","R2","R3"][.]' <<<"$inv")"
+eq "every changed file gets exactly one row" 3 "$(jq '.risk.axes.path_floor.files | length' <<<"$inv")"
+eq "an unmapped path falls to the map default, not to the floor" "R0" \
+   "$(jq -r '.risk.axes.path_floor.files[] | select(.path == "src/plain.go") | .tier' <<<"$inv")"
+eq "the docs rule keeps its own R0 row under an R3 floor" "R0" \
+   "$(jq -r '.risk.axes.path_floor.files[] | select(.path == "docs/a.md") | .tier' <<<"$inv")"
+
 printf '{}' > "$SANDBOX/empty-map.json"
 rec 7 dev 'docs: x' '[{"path":"README.md","additions":1,"deletions":0,"change_type":"MODIFIED"}]' ok SUCCESS \
   | bash "$GRADER" --stdin --map "$SANDBOX/empty-map.json" >/dev/null 2>&1

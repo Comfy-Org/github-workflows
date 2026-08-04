@@ -219,11 +219,31 @@ cat <<'JQ'
              classes:null}
        else
          ([$M.path_rules[]? | . as $rule | select($pall | any(. as $p | $p | matches_any($rule.paths)))]) as $hit
+         # PER-FILE FLOORS, for REPORTING ONLY. The same rules, matched one file at a time, so the
+         # publish surfaces can say WHICH files put the floor where it is ("94% of this diff is
+         # R0/R1; the 6% that makes it R3 is these two files") instead of printing an opaque tier.
+         # This CANNOT move the grade: `worst` over these per-file floors is by construction the
+         # same value as `worst` over every matched rule, because each file's floor already starts
+         # at $DEF and every matched rule is some file's rule. tests/test_grade_pr_risk.sh pins
+         # that equality so a future edit here cannot quietly become a second grading model.
+         # Each file is matched on its DESTINATION *and* ORIGIN path, exactly as $pall is above —
+         # a rename out of a guarded directory keeps that directory's tier on its row.
+         | ([$paths[]? | . as $f
+             | ([$f.path, ($f.previous_path // empty)]) as $fp
+             | ([$M.path_rules[]? | . as $rule | select($fp | any(. as $p | $p | matches_any($rule.paths)))]) as $fh
+             | {path: $f.path,
+                previous_path: ($f.previous_path // null),
+                additions: ($f.additions // 0),
+                deletions: ($f.deletions // 0),
+                change_type: ($f.change_type // null),
+                tier: (reduce $fh[] as $h ($DEF; worst(.; $h.tier))),
+                classes: [$fh[] | .class]}]) as $fl
          | {tier: (reduce $hit[] as $h ($DEF; worst(.; $h.tier))),
             status:"ok",
             reason: (if ($hit|length) == 0 then "no mapped path touched — floor \($DEF)"
                      else "matched " + ([$hit[] | "\(.class)=\(.tier)"] | join(", ")) end),
-            classes: [$hit[] | .class]}
+            classes: [$hit[] | .class],
+            files: $fl}
        end) as $A1
 
     # ---- AXIS 2: PROVENANCE ---------------------------------------------------------------
