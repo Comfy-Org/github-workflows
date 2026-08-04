@@ -132,13 +132,17 @@ Two operational caveats for a backfill:
 
 - **A batch cannot serialize per-PR.** One run covers N pull requests and a run
   belongs to exactly one concurrency group, so a batch overlapping a
-  `pull_request` run for one of its own numbers can interleave with it — the
-  label sync is a read-current / delete-stale / add-target sequence, so that PR
-  may briefly carry two `risk:*` labels (the next grade re-syncs it, and the
-  label gates nothing meanwhile). Dispatch when the queue is quiet, and use
-  `pr_number` when you want the per-PR group to serialize against event runs. A
-  DELETE of a label a concurrent run already removed is treated as removed, not
-  as a failure.
+  `pull_request` run for one of its own numbers will interleave with it. The
+  label sync is a single atomic `PUT` of the PR's whole label set, so that
+  interleaving cannot leave the PR carrying two `risk:*` labels: the two writers
+  end last-writer-wins with exactly one — possibly the staler tier, which the
+  next grade re-syncs and which gates nothing meanwhile. The residual it costs
+  instead is narrower: the PUT is built from a snapshot read, so a **non-owned**
+  label added in the read→PUT window (about one API round-trip, and only on a run
+  that actually changes the grade) is dropped — `risk-dispute` included, so
+  re-add a dispute that happens to land in that instant. Dispatch when the queue
+  is quiet, and use `pr_number` when you want the per-PR group to serialize a
+  re-grade against event runs.
 - **The pre-grader reads retry.** Rate limits are global, not per-PR, so the
   base-ref and override reads — the first hop for every target — retry a
   transient failure with backoff, as the grader already does. Without it one
@@ -201,8 +205,11 @@ Labels are created on first use, color-coded green → red (gray for ungraded).
   label. Grades one target or a list through the same code, records each
   outcome, and never lets one bad target abandon the rest. It computes nothing
   about risk.
-- `apply-risk-label.sh` — the one write. Owns exactly the five mapped labels:
-  removes stale ones, applies the computed one, touches nothing else.
+- `apply-risk-label.sh` — the one write, and it is literally one request: a
+  single atomic `PUT` of the PR's full label set — every label the script does
+  not own, carried through verbatim, plus the computed one. Owns exactly the five
+  mapped labels, so a PR it has written to carries exactly one of them even when
+  two grading runs race. An already-in-sync PR writes nothing at all.
 - `risk-map.v0.json` / `runbook-registry.v0.json` — the generic defaults.
 - `tests/` — hermetic suites (synthetic records + a stubbed `gh`); run via
   [`test-pr-risk.yml`](../../.github/workflows/test-pr-risk.yml).

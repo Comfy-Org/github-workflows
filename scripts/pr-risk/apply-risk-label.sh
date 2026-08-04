@@ -2,11 +2,25 @@
 # apply-risk-label.sh — sync a PR's risk label to the computed tier. The one write the
 # reusable pr-risk.yml workflow performs.
 #
-# OWNERSHIP CONTRACT: this script owns EXACTLY the label names in LABEL_MAP's values. It
-# removes stale ones and applies the computed one, and never touches any other label — so a
-# human who disagrees with a grade records that with their OWN label (the pilot convention is
-# `risk-dispute`), which this script will never fight. Editing the grader-owned label by hand
-# is futile by design: the next push re-syncs it.
+# OWNERSHIP CONTRACT: this script owns EXACTLY the label names in LABEL_MAP's values, and a PR it
+# has written to carries EXACTLY ONE of them. That holds under concurrency BY CONSTRUCTION, not by
+# luck: the sync is a single atomic `PUT .../labels`, which replaces the PR's whole label set in one
+# request, so there is no delete-then-add window for a second run to interleave into. Two runs
+# racing (a `pr_numbers` batch and a `pull_request` event run sit in different concurrency groups,
+# so they CAN overlap) end last-writer-wins with still exactly one owned label — possibly the staler
+# tier, which is acceptable because the label is advisory and the next grade re-syncs it. Zero owned
+# labels is impossible: every PUT this script builds contains the target. Labels it does NOT own are
+# carried through the PUT untouched, so a human who disagrees with a grade records that with their
+# OWN label (the pilot convention is `risk-dispute`) and the grader will never fight it. Editing the
+# grader-owned label by hand is futile by design: the next push re-syncs it.
+#
+# RESIDUAL — the price of atomicity, worth knowing for the pilot: the PUT is built from a SNAPSHOT
+# read, so a NON-owned label added by a human between that read and the PUT is silently dropped,
+# `risk-dispute` INCLUDED. The window is ~one API round-trip and only opens on a run that actually
+# changes the grade (an in-sync PR writes nothing at all), and it is far narrower than the
+# double-label window it replaces, which lasted until the next grade. But a dispute lost there
+# vanishes with no trace, and disputes are this pilot's calibration data — re-add the label if one
+# lands in that instant.
 #
 # The label is applied with the plain GITHUB_TOKEN on purpose: GITHUB_TOKEN-applied labels do
 # not fire `labeled` workflow triggers, which makes the shadow check incapable of starting a
@@ -31,7 +45,9 @@
 # no manual label setup.
 #
 # Exit: 0 = label in sync (or dry run). 2 = usage error. 4 = a GitHub write failed — the run
-#       must go red rather than pretend the label landed.
+#       must go red rather than pretend the label landed. Because the write is a single PUT, a
+#       failure leaves the PR's labels exactly as they were: there is no partial-write state to
+#       reason about, so the red check means "the grade was not applied", never "half applied".
 
 set -uo pipefail
 
@@ -85,10 +101,12 @@ if [ "$DRY_RUN" = 1 ]; then
   exit 0
 fi
 
-# A label name is a PATH SEGMENT in every request below, and GitHub label names legally contain
-# spaces, `/`, `#`, `?` and `%`. A caller who remaps `R3=risk high` would otherwise build a
-# malformed or misrouted URL: the DELETE fails, `fail` fires, and a rename paints the check red.
-# Encoded for the path only — the raw name is what we log, compare and send as a form field.
+# A label name is a PATH SEGMENT in the repo-label probe below, and GitHub label names legally
+# contain spaces, `/`, `#`, `?` and `%`. A caller who remaps `R3=risk high` would otherwise build a
+# malformed or misrouted URL: the probe misses, and a rename paints the check red or spams
+# pre-creates. Encoded for the path only — the raw name is what we log, compare and send as a form
+# field. (The label sync itself needs no encoding: its path carries only the PR number, and the
+# label names ride in form fields.)
 enc() { jq -rn --arg s "$1" '$s | @uri'; }
 
 # EVERY WRITE BELOW REPORTS WHY IT FAILED. The two permissions this script needs both fail as a
@@ -103,56 +121,66 @@ ghq() { gh "$@" 2>"$ERRF"; }
 gherr() { tr '\n' ' ' < "$ERRF" | sed 's/[[:space:]]*$//'; }
 
 # Current labels on the PR (a PR is an issue to the labels API). --paginate because the endpoint
-# returns 30 per page: on a PR with more than 30 labels a stale grader-owned label falls off page
-# one, `has()` reports false, the removal loop skips it, and the PR carries two contradictory risk
-# labels at once — the exact state the ownership contract above promises cannot happen.
+# returns 30 per page: on a PR with more than 30 labels a label past page one is invisible here,
+# and this snapshot is what the PUT below is built from — a truncated read would both miss a stale
+# grader-owned label and DELETE every unowned label that fell off page one.
 current="$(ghq api --paginate "repos/$REPO/issues/$PR_NUMBER/labels?per_page=100" --jq '.[].name' \
            | jq -Rsc 'split("\n") | map(select(length > 0))')" \
   || fail "could not read labels on $REPO#$PR_NUMBER: $(gherr)"
 
 has() { jq -e --arg l "$1" 'index($l) != null' >/dev/null 2>&1 <<<"$current"; }
 
-# Remove stale grader-owned labels (everything in the owned set except the target).
-for l in "${OWNED[@]}"; do
-  [ "$l" = "$TARGET" ] && continue
-  if has "$l"; then
-    # `fail` exits BEFORE the target is added, so a 403 here leaves the PR carrying the PREVIOUS
-    # push's grade for changed code. That is why the message has to name the resulting state and
-    # the cause: the red check is the only signal, and a reader must not read the stale label as
-    # a current verdict.
-    #
-    # A 404 IS NOT A FAILURE HERE. It means the label is already off the PR — the state this loop
-    # is trying to reach. The read above is a snapshot, so anything that removes the label between
-    # that read and this DELETE (a human, or a concurrent grading run of the same PR, which a
-    # batch dispatch can overlap with an event run) made it 404. Failing on that painted a red
-    # check and skipped the target label for a PR that was in the desired state.
-    if ! ghq api -X DELETE "repos/$REPO/issues/$PR_NUMBER/labels/$(enc "$l")" >/dev/null; then
-      case "$(gherr)" in
-        *"(HTTP 404)"*) log "stale '$l' was already gone (404) — treating it as removed" ;;
-        *) fail "could not remove stale label '$l' from $REPO#$PR_NUMBER: $(gherr) — '$TARGET' was NOT applied, so the PR still carries the STALE grade '$l'" ;;
-      esac
-    else
-      log "removed stale '$l'"
-    fi
-  fi
-done
-
+# In sync = the target is present AND no other owned label is. Short-circuit so the common case
+# (re-grading a PR whose tier did not move) performs no write at all — which is also what keeps the
+# read→PUT residual documented in the header confined to grade-CHANGING runs.
+in_sync=0
 if has "$TARGET"; then
-  log "already labeled '$TARGET' — nothing to do"
-else
-  # Ensure the label exists in the repo first, so enrollment needs no manual label setup. This
-  # probe keeps its own 2>/dev/null: a 404 here is the EXPECTED first-use answer, and routing it
-  # through ghq would leave that 404 text in $ERRF to be misreported by a later failure.
-  if ! gh api "repos/$REPO/labels/$(enc "$TARGET")" >/dev/null 2>&1; then
-    ghq api -X POST "repos/$REPO/labels" \
-      -f name="$TARGET" -f color="$(color_for "$TIER")" \
-      -f description="PR risk grade (advisory shadow check; grader-owned)" >/dev/null \
-      || log "label '$TARGET' could not be pre-created (may already exist): $(gherr) — trying the add anyway"
-  fi
-  ghq api -X POST "repos/$REPO/issues/$PR_NUMBER/labels" -f "labels[]=$TARGET" >/dev/null \
-    || fail "could not add label '$TARGET' to $REPO#$PR_NUMBER: $(gherr)"
-  log "added '$TARGET'"
+  in_sync=1
+  for l in "${OWNED[@]}"; do
+    if [ "$l" != "$TARGET" ] && has "$l"; then in_sync=0; break; fi
+  done
 fi
+
+if [ "$in_sync" = 1 ]; then
+  log "already labeled '$TARGET' — nothing to do"
+  printf '%s\n' "$TARGET"
+  exit 0
+fi
+
+# Ensure the label exists in the repo first, so enrollment needs no manual label setup: a PUT
+# creates the association but never the label's color or description. This probe keeps its own
+# 2>/dev/null: a 404 here is the EXPECTED first-use answer, and routing it through ghq would leave
+# that 404 text in $ERRF to be misreported by a later failure.
+if ! gh api "repos/$REPO/labels/$(enc "$TARGET")" >/dev/null 2>&1; then
+  ghq api -X POST "repos/$REPO/labels" \
+    -f name="$TARGET" -f color="$(color_for "$TIER")" \
+    -f description="PR risk grade (advisory shadow check; grader-owned)" >/dev/null \
+    || log "label '$TARGET' could not be pre-created (may already exist): $(gherr) — trying the sync anyway"
+fi
+
+# THE ONE WRITE — and it is literally one request. `PUT .../labels` REPLACES the PR's whole label
+# set, so the desired set is "every label we do not own, plus the target". There is no window
+# between removing the stale grade and adding the new one for a concurrent run to interleave into;
+# see the ownership contract at the top for why that is the property this shape exists to buy.
+#
+# Do NOT "optimize" this into a POST when no stale label is present: two runs that both read an
+# empty owned set would both POST, and the PR ends up with both their labels — the exact race this
+# closes. And do NOT wrap it in a verify-and-retry loop: concurrent writers would just ping-pong,
+# and the exactly-one invariant already holds after ANY single writer's PUT.
+#
+# The empty-labels footgun of this endpoint (a PUT with an empty array strips every label) is
+# structurally absent: the array below always ends with "$TARGET".
+owned_json="$(printf '%s\n' "${OWNED[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
+put_args=()
+while IFS= read -r l; do
+  [ -n "$l" ] && put_args+=(-f "labels[]=$l")
+done < <(jq -r --argjson owned "$owned_json" '.[] | select(. as $x | $owned | index($x) == null)' <<<"$current")
+put_args+=(-f "labels[]=$TARGET")
+
+ghq api -X PUT "repos/$REPO/issues/$PR_NUMBER/labels" "${put_args[@]}" >/dev/null \
+  || fail "could not sync labels on $REPO#$PR_NUMBER to '$TARGET': $(gherr) — the write is a single atomic PUT, so NOTHING was applied and the PR's label state is UNCHANGED"
+
+log "synced to '$TARGET' ($(( ${#put_args[@]} / 2 )) labels on the PR)"
 
 printf '%s\n' "$TARGET"
 exit 0

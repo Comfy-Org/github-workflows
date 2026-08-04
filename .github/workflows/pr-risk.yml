@@ -62,13 +62,18 @@ name: PR Risk Grade (reusable)
 # that silently grades nothing is worse than no button.
 #
 # A BATCH CANNOT SERIALIZE PER-PR, and no concurrency key can make it: one run covers N pull
-# requests and a run belongs to exactly one group. The label sync is a read-current /
-# delete-stale / add-target sequence, so a batch that overlaps a `pull_request` run for one of ITS
-# numbers can interleave with it and leave that PR briefly carrying two `risk:*` labels — the next
-# grade of that PR re-syncs it to one, and the label gates nothing in the meantime. Two mitigations
-# and one limit: dispatch a backfill when the queue is quiet; prefer `pr_number` when you want the
-# per-PR concurrency group to serialize a re-grade against event runs; and a DELETE of a label
-# another run already removed is tolerated rather than painted red (see apply-risk-label.sh).
+# requests and a run belongs to exactly one group, so a batch that overlaps a `pull_request` run for
+# one of ITS numbers WILL interleave with it. That is now safe to let happen: the label sync is a
+# single atomic `PUT` of the PR's whole label set (see apply-risk-label.sh), so two writers end
+# last-writer-wins with still EXACTLY ONE `risk:*` label — possibly the staler tier, which the next
+# grade re-syncs, and which gates nothing meanwhile. It can no longer leave two contradictory labels
+# on a PR. What the shape does cost is a narrower residual: the PUT is built from a snapshot read,
+# so a NON-owned label added by a human in the read→PUT window — roughly one API round-trip, and
+# only on a run that actually changes the grade — is silently dropped, `risk-dispute` included.
+# Re-add it if a dispute happens to land in that instant. Still prefer `pr_number` when you want the
+# per-PR concurrency group to serialize a re-grade against event runs (with `cancel-in-progress`
+# that is also how a superseded wait gets cut short), and dispatch a backfill when the queue is
+# quiet.
 #
 # SECRETS: none. This workflow declares no `secrets:` inputs and callers pass none — the only
 # credential in the job is the automatic `GITHUB_TOKEN` (`github.token`), used for the PR read
@@ -336,7 +341,8 @@ jobs:
                             # SCOPE HONESTLY: `pull-requests: write` is a TOKEN-level grant, so
                             # it also permits commenting, reviewing, editing and closing — the
                             # label-only guarantee is CODE-level (apply-risk-label.sh is the
-                            # only writer, and it touches nothing but the mapped label names),
+                            # only writer, and the only state it changes is the mapped label
+                            # names — its atomic PUT re-sends every unowned label unchanged),
                             # backed by the fact that the job checks out no PR code: the only
                             # code holding this token is this repo's, loaded from the pinned
                             # workflows_ref. Public repos enroll via `pull_request_target`, so
