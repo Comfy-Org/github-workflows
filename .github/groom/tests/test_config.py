@@ -145,8 +145,19 @@ class TestLockedKeys(unittest.TestCase):
         self.assertIn("builder", out)
         self.assertIn("security boundary", out)
 
-    def test_pr_size_limit_is_locked(self):
-        self.assertNotIn("pr_size_limit", resolve({}, '{"pr_size_limit": 99999}'))
+    def test_pr_size_limit_is_no_longer_locked(self):
+        """Inverted from `test_pr_size_limit_is_locked` (BE-6345).
+
+        The knob was moved OUT of the reviewed security boundary on purpose: it
+        is not what stops a machine-written patch from landing (builder PRs run
+        CI + cursor-review and are never auto-merged), only what keeps an
+        unreviewably-large one out of the review queue. Kept as an inverted test
+        rather than deleted so the change of stance stays visible here, and so a
+        re-lock has to be a deliberate edit to this assertion.
+        """
+        self.assertNotIn("pr_size_limit", config._LOCKED_KEYS)
+        self.assertEqual(resolve({}, '{"pr_size_limit": 99999}')["pr_size_limit"], 99999)
+        self.assertNotIn("security boundary", warnings_from({}, '{"pr_size_limit": 99999}'))
 
     def test_locked_key_does_not_block_sibling_operational_keys(self):
         got = resolve({}, '{"builder": true, "max_prs": 2}')
@@ -154,7 +165,13 @@ class TestLockedKeys(unittest.TestCase):
         self.assertNotIn("builder", got)
 
     def test_reviewed_caller_defaults_keep_their_locked_values(self):
-        """The defaults layer IS the workflow file — the thing the lock protects."""
+        """The defaults layer IS the workflow file — the thing the lock protects.
+
+        `pr_size_limit` is no longer locked (BE-6345), but it is kept in this
+        assertion because the property under test is unchanged and is the one
+        that would break loudest: a caller's reviewed `with:` value reaches
+        `resolved` untouched whether the knob is locked or operational.
+        """
         got = resolve({"builder": True, "pr_size_limit": 800})
         self.assertIs(got["builder"], True)
         self.assertEqual(got["pr_size_limit"], 800)
@@ -229,6 +246,82 @@ class TestNumericCoercion(unittest.TestCase):
     def test_zero_interval_days_still_honored(self):
         """0 = "no throttle" is a documented, valid value — not a negative."""
         self.assertEqual(resolve({}, '{"interval_days": 0}')["interval_days"], "0")
+
+
+class TestPrSizeLimit(unittest.TestCase):
+    """The one operational knob that can WIDEN behaviour (BE-6345).
+
+    Its coercion is `nonneg_int`, not the `numeric_string` its neighbour
+    `max_prs` uses, because its downstream is
+    `awk -v v="$PR_SIZE_LIMIT" 'BEGIN{printf "%d", v}'` — which renders anything
+    non-numeric as 0 with no diagnostic, and a limit of 0 makes every build bail
+    to an issue, silently switching PR-opening off. So the typo cases below must
+    land on the caller's reviewed default, never on 0.
+    """
+
+    def test_variable_overrides_the_callers_default(self):
+        got = resolve({"pr_size_limit": 400}, '{"pr_size_limit": 900}')
+        self.assertEqual(got["pr_size_limit"], 900)
+
+    def test_variable_value_is_applied_without_a_warning(self):
+        out = warnings_from({"pr_size_limit": 400}, '{"pr_size_limit": 900}')
+        self.assertNotIn("pr_size_limit", out)
+
+    def test_callers_default_survives_when_the_variable_is_silent(self):
+        """The back-compat half: a repo that sets other knobs keeps its ceiling."""
+        got = resolve({"pr_size_limit": 400}, '{"max_prs": 3}')
+        self.assertEqual(got["pr_size_limit"], 400)
+
+    def test_non_numeric_falls_back_to_the_default_not_to_zero(self):
+        """The failure this coercer exists for: awk would render these as 0."""
+        for bad in ('"lots"', '"400 lines"', '""', "true", "[400]", '{"a": 1}'):
+            raw = '{"pr_size_limit": ' + bad + "}"
+            got = resolve({"pr_size_limit": 400}, raw)
+            self.assertEqual(got["pr_size_limit"], 400, raw)
+
+    def test_non_numeric_warns_and_names_the_key(self):
+        out = warnings_from({"pr_size_limit": 400}, '{"pr_size_limit": "lots"}')
+        self.assertIn("pr_size_limit", out)
+        self.assertIn("::warning::", out)
+
+    def test_negative_is_rejected_with_a_warning(self):
+        got = resolve({"pr_size_limit": 400}, '{"pr_size_limit": -1}')
+        self.assertEqual(got["pr_size_limit"], 400)
+        self.assertIn("pr_size_limit", warnings_from({}, '{"pr_size_limit": -1}'))
+
+    def test_negative_fraction_is_not_truncated_into_acceptance(self):
+        """int() truncates toward zero — -0.5 must not sneak through as 0."""
+        self.assertEqual(resolve({"pr_size_limit": 400}, '{"pr_size_limit": -0.5}')["pr_size_limit"], 400)
+
+    def test_explicit_zero_is_honoured(self):
+        """0 = "always file issues, never open PRs" — a legal setting, not a typo."""
+        self.assertEqual(resolve({"pr_size_limit": 400}, '{"pr_size_limit": 0}')["pr_size_limit"], 0)
+
+    def test_non_finite_is_refused(self):
+        """inf would open every patch as a PR; the operator would never see why."""
+        for raw in ('{"pr_size_limit": 1e999}', '{"pr_size_limit": "inf"}',
+                    '{"pr_size_limit": Infinity}', '{"pr_size_limit": "nan"}'):
+            self.assertEqual(resolve({"pr_size_limit": 400}, raw)["pr_size_limit"], 400, raw)
+
+    def test_fractional_is_floored_to_an_int(self):
+        """The `-gt` test downstream is integer-only."""
+        got = resolve({}, '{"pr_size_limit": 650.9}')
+        self.assertIsInstance(got["pr_size_limit"], int)
+        self.assertEqual(got["pr_size_limit"], 650)
+
+    def test_numeric_string_is_accepted(self):
+        """A caller forwarding a dispatch input delivers every value as a string."""
+        self.assertEqual(resolve({}, '{"pr_size_limit": "900"}')["pr_size_limit"], 900)
+
+    def test_the_higher_precedence_layer_wins(self):
+        """Same layering as every other operational knob — no special-casing.
+
+        (groom.yml applies the caller's `config` input by re-running config.py
+        with the previous result as `--defaults-json`, so this second layer is
+        the same mechanism it exercises.)
+        """
+        got = resolve({"pr_size_limit": 400}, '{"pr_size_limit": 900}', '{"pr_size_limit": 1200}')
+        self.assertEqual(got["pr_size_limit"], 1200)
 
 
 class TestProseSanitization(unittest.TestCase):

@@ -27,11 +27,40 @@ security boundary stay in the reviewed workflow file and are IGNORED here, loudl
 
   * `builder`       — flipping the auto-builder on is a decision to let an agent
                       author code in this repo. That belongs in a reviewed commit.
-  * `pr_size_limit` — the patch-size bail-out is the backstop that keeps an
-                      unreviewably-large machine patch out of a PR.
   * `sink`, `bot_app_id`, `workflows_ref`, `config` — identity, the pinned
                       asset ref, and this input itself: pinning is the
                       reproducibility contract, not an operational dial.
+
+WHAT `_OPERATIONAL_KEYS` CAN DO — INCLUDING THE ONE KNOB THAT WIDENS (BE-6345)
+------------------------------------------------------------------------------
+Nearly every operational knob can only make groom scan less, propose less, or
+file less. `pr_size_limit` is the ONE exception, and it is deliberate: raising it
+by variable admits a LARGER machine-written patch into a PR that a lower ceiling
+would have bailed to an issue. So this layer is not a narrow-only layer, and the
+bypass-PR-review property described above genuinely applies to that knob.
+
+Why that is accepted rather than compensated for with a clamp:
+
+  * `pr_size_limit` is NOT the control that stops a machine-written patch from
+    landing. Builder PRs are opened by the bot with the `cursor-review` label,
+    run full CI + cursor-review, and are NEVER auto-merged — groom.yml opens
+    them with a plain `gh pr create` and contains no `gh pr merge` and no
+    auto-merge enablement anywhere. A human approves and merges every one.
+  * The size limit is therefore a convenience backstop: it keeps an
+    unreviewably-large diff out of the review queue in the first place. Raising
+    it means a bigger diff REACHES A HUMAN, not that a bigger diff lands
+    unreviewed.
+  * The alternative was worse in practice — one shared default for every caller,
+    or a reviewed commit per repo for a value operators retune the same way they
+    retune every other dial. That friction is what this module exists to remove.
+
+Because a variable-set value leaves no diff and no branch, the run record is the
+only place the effective ceiling is visible: the gate job echoes the whole
+resolved knob set (`Resolved knobs: …`), `pr_size_limit` included, on every run.
+
+A typo must not silently disable PR-opening, which is why the coercion is
+`nonneg_int` rather than the `numeric_string` its neighbour `max_prs` uses —
+see `_OPERATIONAL_KEYS` for that reasoning.
 
 Everything else (`_OPERATIONAL_KEYS`) is fair game: it can only make groom
 scan less, propose less, or file less — never grant it more privilege. That is
@@ -41,11 +70,6 @@ while `bail_sink` only chooses whether a builder BAIL becomes an issue or just a
 warning — and `build_pr` exempts the pre-publish secret-scan withhold from `none`
 so the one bail with security meaning keeps its durable record either way, which
 is what keeps "quieter, never less privileged" true here.
-
-Note the corollary for `pr_size_limit`, which is the knob an operator
-usually reaches for after a near-miss bail: it stays LOCKED (a reviewed commit in
-the caller) because it is the unreviewably-large-patch backstop — suppressing the
-bail is not a reason to unlock raising the ceiling.
 
 The lock applies to the VARIABLE and `config` layers, not to the caller-defaults
 layer, which is the reviewed workflow file itself — the thing the lock protects.
@@ -105,6 +129,19 @@ _OPERATIONAL_KEYS = {
     # grant it privilege, so the operator who set `max_findings: 0` can get real
     # silence through the same variable instead of a PR (BE-6157).
     "bail_sink": "bail_sink",
+    # `nonneg_int`, NOT `numeric_string` like its neighbour `max_prs`, even
+    # though both are "a number a downstream step parses". The downstream here is
+    # `PR_SIZE_LIMIT=$(awk -v v="$PR_SIZE_LIMIT" 'BEGIN{printf "%d", v}')` in
+    # groom.yml's "Capture patch" step, and `awk`'s `printf "%d"` renders ANY
+    # non-numeric value as 0 with no diagnostic. A limit of 0 makes the
+    # `[ "$CHANGED" -gt "$PR_SIZE_LIMIT" ]` test true for every patch, so every
+    # build bails to an issue and the builder silently stops opening PRs at all.
+    # awk is therefore not a normalization authority worth deferring to: it
+    # cannot tell a typo from an intent. Rejecting here means a typo gets a
+    # `::warning::` naming the key and the caller's reviewed default, which is
+    # this module's documented fail-open behaviour. An explicit `0` still
+    # resolves as 0 — "always file issues, never open PRs" is a legal setting.
+    "pr_size_limit": "nonneg_int",
     # Stay strings: interval.py is the single normalization authority, and it
     # deliberately degrades blank/garbage/negative to 7 rather than failing.
     "interval_days": "numeric_string",
@@ -123,7 +160,7 @@ _OPERATIONAL_KEYS = {
 # Knobs the variable may NOT set — see the module docstring for why each one is
 # here. Present-but-ignored, with a loud warning: silently dropping them would
 # leave an operator believing they had disabled the builder.
-_LOCKED_KEYS = ("builder", "pr_size_limit", "sink", "bot_app_id", "workflows_ref", "config")
+_LOCKED_KEYS = ("builder", "sink", "bot_app_id", "workflows_ref", "config")
 
 # Caps on the free-text knobs. These land in the finder/verifier BRIEFS — the
 # trusted prompt — so a variable edit is a (repo-write-gated) path into prompt
@@ -234,7 +271,10 @@ def _coerce_nonneg_int(key, value):
 
     `max_findings` slices the filing list (`[:cap]`); a negative value would
     make that slice count from the END and file the wrong subset, so refuse it
-    here rather than let it through to the file job.
+    here rather than let it through to the file job. `pr_size_limit` is compared
+    with `-gt` after an `awk printf "%d"` that turns anything unparseable into a
+    silent 0, which would bail every build to an issue — so its typos have to be
+    caught here too, and both go to the caller's reviewed default instead.
 
     The float is validated BEFORE it is floored, in that order deliberately:
 
