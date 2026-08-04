@@ -2237,7 +2237,13 @@ jobs:
     # never uploaded its result simply fails its own build_pr cell (fail-fast off).
     if: ${{ !cancelled() && needs.gate.outputs.should_run == 'true' && needs.build_select.outputs.have_build == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 15 -> 20. Headroom only, and deliberately the LAST line of defence rather
+    # than the fix: the 2026-08-04 cancellation was a hung fetch that produced
+    # zero bytes, so a bigger budget alone would just have bought a longer hang.
+    # The bounded two-attempt checkout below is what actually converts that stall
+    # into a recovery. This also stops build_pr from being tighter than `build`
+    # (30 min), which does strictly more work over the same checkout.
+    timeout-minutes: 20
     permissions:
       contents: read
     strategy:
@@ -2282,12 +2288,68 @@ jobs:
           name: groom-build-${{ matrix.idx }}
           path: /tmp/build
 
+      - name: Decide whether a working tree is needed
+        # The bail path (agent bailed / oversized patch / CI-privileged path /
+        # withheld output) only calls `gh issue create` — it never touches a git
+        # worktree. Reading the status HERE lets the checkout below be skipped
+        # entirely on that path, instead of full-cloning a large monorepo to file
+        # an issue. That is not a hypothetical saving: on 2026-08-04 both build
+        # cells bailed, and the idx-1 cell still spent its whole 15-minute budget
+        # in `git fetch` and was cancelled before it could file, dropping a
+        # CONFIRMED finding that the ledger then never suppressed.
+        id: plan
+        run: |
+          set -euo pipefail
+          # Default CLOSED: an unreadable/absent result.json means the apply step
+          # will take the bail branch (`result.get("status") != "patched"`), so the
+          # worktree is genuinely not needed. Skipping it cannot strand a patch —
+          # if the status is unreadable there is no patch to apply.
+          status=$(jq -r '.status // "bail"' /tmp/build/result.json 2>/dev/null || echo bail)
+          if [ "$status" = "patched" ]; then
+            echo "needs_worktree=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_worktree=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::build ${{ matrix.idx }} status=$status — no patch to apply, skipping the target-repo checkout."
+          fi
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      # Two bounded attempts, NOT one unbounded one. A server-side pack
+      # negotiation can stall with zero bytes on the wire: on 2026-08-04 this
+      # fetch sat silent for 15 minutes and was killed by the job timeout, while
+      # the sibling cell ran the identical fetch 70 seconds earlier in 50s.
+      #
+      # A step `timeout-minutes` alone does NOT buy a retry — exceeding it fails
+      # the step (and the job); checkout's own retry only covers git commands that
+      # exit non-zero inside a step that is still alive, never a step the runner
+      # killed. So attempt 1 is `continue-on-error` and attempt 2 re-runs it on a
+      # fresh connection. Two 6-minute attempts fit inside the 20-minute job
+      # budget with room for the push and the PR open.
       - name: Checkout target repo (as the bot, for the push)
         # persist-credentials stays ON (default) with the bot token so the branch
         # push authenticates as the bot — this is the credentialed job by design.
+        id: checkout_target
+        if: steps.plan.outputs.needs_worktree == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        continue-on-error: true
+        timeout-minutes: 6
         with:
-          fetch-depth: 0
+          # Shallow: everything downstream needs only the default-branch tip —
+          # `checkout -b`, `git apply --index`, then `git push origin <branch>`
+          # (pushing a new branch from a shallow clone is fine, the base commit is
+          # already on the remote). Full history was never read, and on a repo of
+          # this size `fetch-depth: 0` turns a bounded cost into a variable one.
+          fetch-depth: 1
+          path: repo
+          token: ${{ steps.bot_token.outputs.token }}
+
+      - name: Checkout target repo (second attempt after a stalled fetch)
+        # No continue-on-error: if a fresh connection stalls too, fail the cell
+        # loudly rather than falling through to an apply step with no worktree.
+        if: ${{ steps.plan.outputs.needs_worktree == 'true' && steps.checkout_target.outcome == 'failure' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 6
+        with:
+          fetch-depth: 1
           path: repo
           token: ${{ steps.bot_token.outputs.token }}
 
