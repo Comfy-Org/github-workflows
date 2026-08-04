@@ -10,7 +10,7 @@ swaps found by the BE-4817 audit (Opus 5 on 2026-07-24, Kimi K3 on ~2026-07-26)
 landed in that window and were caught by hand, not by CI.
 
 This script is the machine half of that audit. Given the workflow file and the
-raw output of `cursor-agent models`, it reports four kinds of drift:
+raw output of `cursor-agent models`, it reports five kinds of drift:
 
   * **delisted pin** — a pinned id (panel or judge) is absent from the live
     catalog. Urgent: consumer PRs will start failing preflight.
@@ -24,6 +24,11 @@ raw output of `cursor-agent models`, it reports four kinds of drift:
     picking "newest highest-reasoning ZDR-eligible" needs human judgment, and ZDR
     especially — Cursor only marks NO-ZDR inline (e.g. a `(NO ZDR)` suffix), so any
     such marker on the line is surfaced verbatim rather than interpreted.
+  * **unpinned model families** — catalog ids whose family prefix matches no pin
+    at all. Quieter than the above (mostly labs the panel will never pin, so it
+    renders collapsed and is never `urgent`), but it is the ONLY place a lab the
+    panel already pins can surface after rebranding under a new prefix — see
+    `lab_of` and the catch-all in `analyze`.
   * **stale audit date** — the `last checked YYYY-MM-DD` comment is older than
     `--stale-days` (or missing entirely).
 
@@ -56,10 +61,29 @@ import sys
 
 STICKY_TITLE_PREFIX = "[cursor-review catalog drift]"
 DEFAULT_STALE_DAYS = 30
-# GitHub caps an issue body at 65536 chars; leave room for the report above the
-# raw-catalog fold rather than losing the whole body to a 422.
+# GitHub caps an issue body at 65536 chars. MAX_CATALOG_CHARS is only the raw
+# fold's CEILING — `render_body` grants the fold whatever MAX_BODY_CHARS the
+# report sections have not used, so the two budgets cannot overlap into a 422.
 MAX_CATALOG_CHARS = 40000
 MAX_BODY_CHARS = 60000
+# Budgets for the report's candidate lists, so `MAX_BODY_CHARS` (a blunt
+# `body[:N]`) can never cut into their markup. MAX_FAMILY_IDS caps EVERY
+# per-lab id list (the same-lab review-me list, a delisted pin's alternatives,
+# the families fold); MAX_FAMILY_LABS plus the CHARS budget bound the families
+# fold, the one list whose group count the catalog controls — row caps alone
+# bound its rows, not its chars (40 labs × 25 capped-note rows is still ~4× the
+# body cap). All generous next to a real catalog — a few dozen models across a
+# handful of families — and every list leads with its highest-signal rows, so
+# the first rows carry it.
+MAX_FAMILY_LABS = 40
+MAX_FAMILY_IDS = 25
+MAX_FAMILY_FOLD_CHARS = 15000
+# Cap on a rendered note. Notes are third-party free text repeated across
+# dozens of rows; unbounded, a single note could eat the whole body budget.
+MAX_NOTE_CHARS = 200
+# Scaffolding reserve when computing the raw fold's remaining budget: the
+# <details> wrapper, the code-fence lines, and a truncation notice.
+_FOLD_OVERHEAD = 400
 
 _HEREDOC_START = re.compile(r"cat\s*>\s*/tmp/models\.json\s*<<\s*'?JSON'?")
 _HEREDOC_END = re.compile(r"^\s*JSON\s*$")
@@ -68,8 +92,9 @@ _JUDGE_KEY = re.compile(r"^(\s*)judge_model\s*:\s*$")
 _DEFAULT_KEY = re.compile(r"^\s*default\s*:\s*(.+?)\s*$")
 _LAST_CHECKED = re.compile(r"last checked\s+(\d{4}-\d{2}-\d{2})", re.IGNORECASE)
 # A catalog id is lowercase alphanumeric with `.`/`-`/`_` separators, and always
-# carries at least one `-` or `.` — that separator requirement is what keeps
-# prose lines ("Available models:") out of the parsed id list.
+# carries a `-`/`.` or a digit — that requirement is what keeps prose lines
+# ("models available:") out of the parsed id list while still admitting a bare
+# id like `o3`.
 _ID_TOKEN = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 _BULLET = re.compile(r"^[-*>•\s]+")
 # The ONE catalog marker worth interpreting rather than merely reproducing: a
@@ -93,16 +118,46 @@ class ExtractionError(Exception):
 def _is_model_id(token):
     """True for a bare catalog/model id — see `_ID_TOKEN`.
 
-    The letter requirement keeps a numbered-list marker (`1.` in a hypothetical
-    `1. gpt-5.6-sol-max` catalog line) from parsing as an id. That matters more
-    than it looks: `present()` trusts this parse, so a catalog of ['1.', '2.']
-    would look perfectly valid while reporting every real pin as delisted.
-    Parsing nothing instead routes it to `main`'s diagnostic "no ids could be
-    parsed — the format may have changed" hard exit.
+    Two requirements beyond the character class, each closing a different
+    misparse:
+
+      * a `-`/`.` separator **or a digit**, which keeps bare prose words
+        ("models", "available") out of the parsed id list;
+      * a **letter**, which keeps a numbered-list marker (`1.` in a hypothetical
+        `1. gpt-5.6-sol-max` catalog line — or a bare year in prose) from
+        parsing as an id. That matters more than it looks: `present()` trusts
+        this parse, so a catalog of ['1.', '2.'] would look perfectly valid
+        while reporting every real pin as delisted.
+
+    Parsing nothing at all instead routes a garbled catalog to `main`'s
+    diagnostic "no ids could be parsed — the format may have changed" hard exit.
+
+    Deliberately NOT requiring a digit (Cursor ships digit-less ids for real —
+    `code-supernova`) and NOT requiring a separator either (OpenAI ships bare
+    o-series ids — `o3`). Each rule was tried and dropped for the same reason:
+    an id it rejects is dropped by `catalog_entries` BEFORE parsing, so a newly
+    shipped family of that shape never reaches the BE-4852 unpinned-families
+    catch-all and the run reports clean — the exact "a new model shipped and
+    nobody noticed" silence this whole check exists to end, and for the
+    separator rule that silence hit exactly the bare o-series rebrand the
+    catch-all was built for. What each rule bought was keeping some prose at
+    the head of a catalog line out of the id list ("`gpt-based` models …", or
+    "`v2` models …" for the separator); what it cost was dropping real ids.
+    That trade is the wrong way round, and in the same direction `present`
+    already argues for explicitly: over-report (one bogus row in a collapsed,
+    never-urgent section) rather than under-report (a real family silently
+    missing).
+
+    Both rules bind the PIN validator too — `extract_panel_models` and
+    `extract_judge_model` call this: a shape the catalog parser would never emit
+    must not be accepted as a pin, or that pin reads as delisted every run. If a
+    lab ever ships an id this rule rejects (a bare digit-less word), relax it
+    HERE — one function, both sides — and
+    `test_pin_and_catalog_id_shape_rules_agree` keeps them honest.
     """
     return (
         bool(_ID_TOKEN.match(token))
-        and re.search(r"[-.]", token) is not None
+        and re.search(r"[-.0-9]", token) is not None
         and re.search(r"[a-z]", token) is not None
     )
 
@@ -163,10 +218,10 @@ def extract_panel_models(workflow_text):
     if bad:
         raise ExtractionError(
             f"the /tmp/models.json heredoc yielded entries that are not bare model ids: {bad!r} "
-            "(expected a single lowercase token containing a `-` or `.`, e.g. "
-            "`gpt-5.6-sol-max`). If a lab has shipped a separator-less id, relax `_is_model_id` "
-            "here AND in the catalog parser together — they must agree, or the pin will read as "
-            "delisted every run."
+            "(expected a single lowercase token carrying a `-`, `.`, or digit, e.g. "
+            "`gpt-5.6-sol-max` or `o3`). If a lab has shipped an id of a new shape, relax "
+            "`_is_model_id` — it is the ONE rule the pin validator and the catalog parser share, "
+            "and they must agree, or the pin will read as delisted every run."
         )
     return models
 
@@ -192,10 +247,21 @@ def extract_judge_model(workflow_text):
                 # `>-`, which would report as delisted on every single run.
                 value = re.split(r"\s+#", default.group(1).strip(), maxsplit=1)[0].strip()
                 value = value.strip("\"'")
-                if value and value[0] not in ">|" and not re.search(r"\s", value):
+                # …and then the SAME shape rule the catalog parser applies. The
+                # scalar/whitespace checks above are strictly weaker than
+                # `_is_model_id`, so without this the judge pin was the one hole
+                # in the "both sides agree" contract: a default the catalog
+                # parser would never emit (`sonnet` — a bare digit-less word)
+                # extracted cleanly here and then failed `present()`, reporting
+                # a phantom URGENT "delisted pin" every Monday against a model
+                # that is sitting right there in the catalog.
+                if value and value[0] not in ">|" and _is_model_id(value):
                     return value
                 raise ExtractionError(
-                    f"the `judge_model` input's default is not a bare model id: {value!r}"
+                    f"the `judge_model` input's default is not a bare model id: {value!r} "
+                    "(expected a single lowercase token carrying a `-`, `.`, or digit, e.g. "
+                    "`claude-opus-4-8-thinking-max`). Relax `_is_model_id` if a lab ships an id "
+                    "of a new shape — it gates the catalog parser too, and the two must agree."
                 )
         break
     raise ExtractionError("could not find the `judge_model` input's `default:` value")
@@ -281,7 +347,15 @@ def present(model_id, catalog_ids):
 
 
 def lab_of(model_id):
-    """Lab prefix of an id — `gpt-5.6-sol-max` -> `gpt` (preflight's split)."""
+    """Lab prefix of an id — `gpt-5.6-sol-max` -> `gpt` (preflight's split).
+
+    A *family* prefix, strictly — not a vendor. One lab can ship under several
+    (OpenAI's `o<n>` series alongside `gpt-*` is the precedent), and nothing in a
+    bare id says the two belong together. Mapping them would need a hand-kept
+    alias table, which is exactly the maintenance burden deriving labs from the
+    pins avoids; `analyze` handles the rebrand case with the unpinned-families
+    catch-all instead (BE-4852).
+    """
     return re.split(r"[-.]", model_id, maxsplit=1)[0].lower()
 
 
@@ -332,6 +406,7 @@ def analyze(panel_models, judge_model, catalog_text, last_checked, today, stale_
         if lab not in labs:
             labs.append(lab)
     pinned_set = set(pinned)
+    pinned_labs = set(labs)
     unpinned = []
     for lab in labs:
         candidates = [
@@ -345,6 +420,31 @@ def analyze(panel_models, judge_model, catalog_text, last_checked, today, stale_
                     "candidates": candidates,
                 }
             )
+
+    # The catch-all (BE-4852): catalog ids whose family prefix matches NO pin.
+    # `lab_of` equates a lab with an id's first token, so an existing lab
+    # shipping under a NEW family prefix — OpenAI's `o<n>` series alongside
+    # `gpt-*` is the precedent — resolves to a "lab" nobody pins and would drop
+    # out of the review-me list above entirely. That is precisely the "a newer
+    # model shipped and nobody noticed" case this whole check exists to catch, so
+    # it gets its own quieter section rather than a hand-maintained prefix→lab
+    # alias table (which is the maintenance burden deriving labs from the pins
+    # exists to avoid). Most of what lands here is genuinely uninteresting —
+    # labs Comfy will never pin — hence: a finding, but never `urgent`, and
+    # rendered collapsed.
+    # Grouped through a dict keyed by lab (not a linear scan per entry) so this
+    # stays O(N) on a catalog whose ids all have distinct prefixes.
+    unpinned_labs = []
+    by_lab = {}
+    for model_id, note in entries:
+        lab = lab_of(model_id)
+        if lab in pinned_labs:
+            continue
+        group = by_lab.get(lab)
+        if group is None:
+            group = by_lab[lab] = {"lab": lab, "candidates": []}
+            unpinned_labs.append(group)
+        group["candidates"].append({"id": model_id, "note": note})
 
     audit = {
         "last_checked": last_checked.isoformat() if last_checked else None,
@@ -365,11 +465,19 @@ def analyze(panel_models, judge_model, catalog_text, last_checked, today, stale_
         "delisted": delisted,
         "zdr_risk": zdr_risk,
         "unpinned": unpinned,
+        "unpinned_labs": unpinned_labs,
         "audit": audit,
         # `urgent` is what reddens the weekly run: a pin the preflight is about
-        # to reject, or a pin that is no longer ZDR-eligible.
+        # to reject, or a pin that is no longer ZDR-eligible. `unpinned_labs` is
+        # deliberately NOT here — it is a standing watchlist, not a breakage.
         "urgent": bool(delisted or zdr_risk),
-        "has_findings": bool(delisted or zdr_risk or unpinned or audit["stale"]),
+        # `unpinned_labs` DOES count, or a rebranded family would render into a
+        # body nobody ever sees (a clean `has_findings` closes the sticky issue).
+        # It does not newly pin the issue open: `unpinned` alone already makes
+        # this true on any real catalog, which lists more tiers per pinned lab
+        # than the panel pins — the auto-close path was already reserved for a
+        # catalog trimmed to exactly the pins.
+        "has_findings": bool(delisted or zdr_risk or unpinned or unpinned_labs or audit["stale"]),
     }
 
 
@@ -390,6 +498,13 @@ def summary_line(report):
     count = sum(len(g["candidates"]) for g in report["unpinned"])
     if count:
         bits.append(f"{count} unpinned same-lab id{'s' if count != 1 else ''}")
+    families = report.get("unpinned_labs") or []
+    if families:
+        ids = sum(len(g["candidates"]) for g in families)
+        bits.append(
+            f"{len(families)} unpinned famil{'y' if len(families) == 1 else 'ies'} "
+            f"({ids} id{'s' if ids != 1 else ''})"
+        )
     audit = report["audit"]
     if audit["stale"]:
         if audit["last_checked"] is None:
@@ -417,13 +532,35 @@ def _inline_code(text):
     a bot-authored issue in a PUBLIC repo. A bare single-backtick span would let
     a note carrying a backtick break out and inject markdown — or an `@mention`
     that notifies real people — so the delimiter is sized to the note (per
-    CommonMark) and padded when the note starts or ends with a backtick.
+    CommonMark) and padded when the note starts or ends with a backtick. The
+    note is also capped at MAX_NOTE_CHARS — it is repeated across dozens of
+    rows, and unbounded it could eat the whole body budget by itself — with the
+    cap applied BEFORE the delimiter is sized, so it sizes what is emitted.
     """
     flat = re.sub(r"\s+", " ", text).strip()
+    if len(flat) > MAX_NOTE_CHARS:
+        flat = flat[:MAX_NOTE_CHARS].rstrip("`") + " …"
     longest = max((len(m) for m in re.findall(r"`+", flat)), default=0)
     delim = "`" * (longest + 1)
     pad = " " if flat.startswith("`") or flat.endswith("`") else ""
     return f"{delim}{pad}{flat}{pad}{delim}"
+
+
+def _candidate_list(candidates, limit=None):
+    """Bullet list of `{id, note}` rows — shared by both unpinned sections.
+
+    `limit` caps the rows and names the remainder instead of dropping it
+    silently. Every caller passes one: the number of GROUPS in the same-lab
+    list is bounded by the pins, but the ids per group come from the catalog.
+    """
+    shown = candidates if limit is None else candidates[:limit]
+    rows = [
+        f"- `{c['id']}`" + (f" — {_inline_code(c['note'])}" if c["note"] else "") for c in shown
+    ]
+    hidden = len(candidates) - len(shown)
+    if hidden:
+        rows.append(f"- _… and {hidden} more — see the raw catalog fold below._")
+    return "\n".join(rows)
 
 
 def render_body(report, catalog_text, run_url=None, checked_at=None):
@@ -441,8 +578,9 @@ def render_body(report, catalog_text, run_url=None, checked_at=None):
         )
     else:
         out.append(
-            "No drift: every pinned model id is present in Cursor's live catalog, no unpinned "
-            "same-lab ids are available, and the audit date is current."
+            "No drift: every pinned model id is present in Cursor's live catalog, the catalog "
+            "offers no unpinned ids — from a pinned lab or an unpinned family — and the audit "
+            "date is current."
         )
 
     meta = []
@@ -462,11 +600,13 @@ def render_body(report, catalog_text, run_url=None, checked_at=None):
         )
         for item in report["delisted"]:
             roles = "/".join(item["roles"]) or "pin"
-            same_lab = (
-                ", ".join(f"`{m}`" for m in item["same_lab_available"])
-                if item["same_lab_available"]
-                else "_(no same-lab id in the catalog)_"
-            )
+            alts = item["same_lab_available"]
+            if alts:
+                same_lab = ", ".join(f"`{m}`" for m in alts[:MAX_FAMILY_IDS])
+                if len(alts) > MAX_FAMILY_IDS:
+                    same_lab += f", +{len(alts) - MAX_FAMILY_IDS} more"
+            else:
+                same_lab = "_(no same-lab id in the catalog)_"
             out.append(f"- `{item['id']}` ({roles}) — available for lab `{item['lab']}`: {same_lab}")
 
     if report.get("zdr_risk"):
@@ -493,12 +633,59 @@ def render_body(report, catalog_text, run_url=None, checked_at=None):
         for group in report["unpinned"]:
             pinned_now = ", ".join(f"`{m}`" for m in group["pinned"]) or "_none_"
             out.append(f"**`{group['lab']}`** (pinned: {pinned_now})")
-            out.append(
-                "\n".join(
-                    f"- `{c['id']}`" + (f" — {_inline_code(c['note'])}" if c["note"] else "")
-                    for c in group["candidates"]
-                )
+            out.append(_candidate_list(group["candidates"], limit=MAX_FAMILY_IDS))
+
+    families = report.get("unpinned_labs") or []
+    if families:
+        # Collapsed on purpose: most of this is labs the panel will never pin, so
+        # it must not crowd out the same-lab review-me list above. It exists for
+        # the one row that matters — a lab already on the panel shipping under a
+        # new family prefix, which `lab_of` cannot tell from a new vendor.
+        # Budgeted HERE rather than left to `MAX_BODY_CHARS` below. That clamp is
+        # a blunt `body[:N]`: on a catalog with thousands of distinct prefixes it
+        # would cut INTO this block, leaving the `<details>`/inline-code markup
+        # unterminated (which swallows the rest of the issue in GitHub's
+        # renderer) and dropping the stale-audit and raw-catalog sections that
+        # follow. Truncating with an explicit count keeps the body well-formed
+        # and says out loud what was dropped. Budgeted in CHARS as well as rows:
+        # the row caps bound how many rows render, but 40 labs × 25 capped-note
+        # rows still overruns the whole body budget, so groups stop when the
+        # fold's char budget is spent (the first group always renders).
+        shown = []
+        used = 0
+        for group in families:
+            if len(shown) >= MAX_FAMILY_LABS:
+                break
+            block = "\n**`{lab}`**\n\n{rows}".format(
+                lab=group["lab"],
+                rows=_candidate_list(group["candidates"], limit=MAX_FAMILY_IDS),
             )
+            if shown and used + len(block) > MAX_FAMILY_FOLD_CHARS:
+                break
+            shown.append(block)
+            used += len(block)
+            if used > MAX_FAMILY_FOLD_CHARS:
+                break
+        hidden = len(families) - len(shown)
+        labs_listed = ", ".join("`" + g["lab"] + "`" for g in families[: len(shown)])
+        if hidden:
+            labs_listed += f", +{hidden} more"
+        detail = [
+            "<details>",
+            f"<summary>Catalog ids from <b>unpinned model families</b> "
+            f"({labs_listed})</summary>",
+            "",
+            "Families the panel pins **nothing** from. Usually just labs Comfy does not use — but "
+            "the lab of an id is its first `-`/`.`-separated token, so a lab the panel DOES pin "
+            "shipping under a new family prefix (OpenAI's `o<n>` series alongside `gpt-*` is the "
+            "precedent) lands here rather than in the review-me list above. Scan for a familiar lab "
+            "wearing an unfamiliar prefix; ignore the rest. Same caveats as above — notes are "
+            "verbatim, an unmarked id is **not** thereby confirmed ZDR-eligible.",
+        ]
+        detail.extend(shown)
+        detail.append("")
+        detail.append("</details>")
+        out.append("\n".join(detail))
 
     if audit["stale"]:
         if audit["last_checked"] is None:
@@ -525,23 +712,40 @@ def render_body(report, catalog_text, run_url=None, checked_at=None):
                 f"pins and refresh the `last checked` comment in `cursor-review.yml`."
             )
 
-    catalog = catalog_text.rstrip("\n")
-    if len(catalog) > MAX_CATALOG_CHARS:
-        catalog = catalog[:MAX_CATALOG_CHARS] + "\n… truncated — see the workflow run log for the full catalog."
-    out.append(
-        "<details>\n<summary>Raw <code>cursor-agent models</code> output</summary>\n\n"
-        + _fenced(catalog)
-        + "\n</details>"
-    )
-    out.append(
+    footer = (
         "_Filed by the weekly `cursor-review-catalog-drift` check. This issue is sticky — it is "
         "updated in place each run and closed automatically once a run finds no drift._"
     )
+    # The raw fold gets whatever body budget the report has NOT used, up to the
+    # MAX_CATALOG_CHARS ceiling. A fixed 40K assumed the report stayed inside
+    # ~20K; a large catalog can exceed that even with every list capped, and the
+    # blunt `body[:N]` clamp below would then slice mid-fold — unterminated
+    # markup that swallows the footer in GitHub's renderer.
+    catalog = catalog_text.rstrip("\n")
+    remaining = MAX_BODY_CHARS - sum(len(section) + 2 for section in out) - len(footer)
+    budget = min(MAX_CATALOG_CHARS, remaining - _FOLD_OVERHEAD)
+    if budget < 500:
+        # Not enough room left for a useful excerpt — say so instead of folding
+        # a fragment (or overshooting into the clamp).
+        out.append(
+            "_Raw `cursor-agent models` output omitted — the report above used the body "
+            "budget; see the workflow run log for the full catalog._"
+        )
+    else:
+        if len(catalog) > budget:
+            catalog = catalog[:budget] + "\n… truncated — see the workflow run log for the full catalog."
+        out.append(
+            "<details>\n<summary>Raw <code>cursor-agent models</code> output</summary>\n\n"
+            + _fenced(catalog)
+            + "\n</details>"
+        )
+    out.append(footer)
     body = "\n\n".join(out) + "\n"
     if len(body) > MAX_BODY_CHARS:
-        # Last-resort clamp: GitHub rejects an oversized body outright (422), and
-        # a failed issue write would lose the whole report. A truncated report
-        # still names the delisted pins, which lead the body.
+        # Last-resort clamp — every section above is bounded, so reaching this
+        # takes pathological ids, but GitHub rejects an oversized body outright
+        # (422) and a failed issue write would lose the whole report. A
+        # truncated report still names the delisted pins, which lead the body.
         body = body[:MAX_BODY_CHARS] + "\n\n_… report truncated — see the workflow run log._\n"
     return body
 

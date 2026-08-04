@@ -21,6 +21,10 @@ name: Cursor Review — catalog drift check
 #     that may retain them;
 #   * unpinned same-lab catalog ids — a REVIEW-ME list, not a recommendation
 #     (newest highest-reasoning ZDR-eligible is a human call);
+#   * catalog ids from families the panel pins nothing from — quieter still
+#     (collapsed, never urgent), but it is the only place a lab already on the
+#     panel can surface after rebranding under a new prefix, e.g. OpenAI's
+#     `o<n>` series alongside `gpt-*` (BE-4852);
 #   * a `last checked` audit date older than 30 days (or future-dated).
 #
 # The `last checked` comment stays the human-audit record — this check does not
