@@ -15,9 +15,12 @@ name: Bump groom callers
 # reusable TWICE — the `uses:` SHA and the `workflows_ref:` input that loads the
 # finder/verifier/builder briefs + the dedup ledger. Those two must stay in
 # lock-step or a run executes one version's workflow against another version's
-# briefs. bump-callers.sh rewrites both (its rewrite matches the `uses:` line and
-# any bare `workflows_ref:` line), so the fleet cannot drift into that split
-# state by hand-bumping only one of them.
+# briefs. bump-callers.sh rewrites both — it targets the pin TOKEN
+# (`Comfy-Org/github-workflows…@<ref>` and the `workflows_ref:` key), so the ref's
+# shape does not matter and both halves move whatever they are pinned to — and it
+# then asserts every pin in the file reached the new SHA before staging it. So the
+# fleet cannot drift into that split state by hand-bumping only one of them, nor
+# ship a half-bumped caller (BE-4662).
 #
 # The caller list is NOT hardcoded here. This repo is PUBLIC (workflow file and
 # Actions run logs are both publicly viewable) and callers may be private, so

@@ -245,6 +245,55 @@ A bare signature carries no `security` flag, so the probe answers for a routine
 finding by default; pass `--check-security` to mirror `partition`'s decision for
 a `security: true` candidate.
 
+## `key-broker.mjs` — the localhost API-key proxy (BE-4419)
+
+A tiny, dependency-free localhost HTTP proxy that **holds the real Anthropic API
+key and injects it into forwarded requests**, so the groom agent steps (BE-4311)
+can run the Claude CLI with only a **dummy** key and `ANTHROPIC_BASE_URL` pointed
+at the broker — the real key never enters the agent step's environment.
+
+**Why not just put the key in the agent step's env?** The groom agent has an
+unscoped `Read` tool and `Bash(cat:*)`, and everything on the runner is the same
+user, so `/proc/<agent-pid>/environ` — and, crucially, `/proc/<broker-pid>/environ`
+and `/proc/<broker-pid>/cmdline` — are all agent-readable. The broker's design
+follows from that:
+
+1. **The real key arrives on stdin (first line), never via env or argv.** A key in
+   the process environment or command line would be recoverable straight out of
+   `/proc`. Stdin is not. The broker reads exactly the first line at startup and
+   exits non-zero if stdin closes without one.
+2. **It never logs request/response headers or bodies** — the log file is
+   agent-readable too. At most it logs `method path -> status`.
+3. **It listens on `127.0.0.1` only.**
+
+What it does per request:
+
+- `HEAD` / `GET` on `/` → answered locally with `200` (the CLI's connectivity
+  probe; never forwarded).
+- Path starting with `/v1/` → forwarded to the upstream preserving method and
+  body (streamed both ways, so SSE works), **stripping** any inbound `x-api-key`,
+  `authorization`, and `host`, then **injecting** the real `x-api-key` and the
+  upstream `host`. Upstream status + response headers are copied back verbatim.
+- Anything else → `404` locally. Upstream connection error → `502` with a static
+  body (no detail echoed).
+
+Env knobs (config only — **never** the key):
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `GROOM_BROKER_PORT` | `8199` | port to listen on (`127.0.0.1:<port>`) |
+| `GROOM_BROKER_UPSTREAM` | `https://api.anthropic.com` | where `/v1/*` is forwarded (overridable so tests can point it at a local fake; `http://` is accepted **only** for loopback hosts, so a plaintext non-loopback upstream can't leak the injected key) |
+
+On listen it prints one readiness line (`groom-key-broker listening on
+127.0.0.1:<port>`); a consumer's wait-loop should key off **that line** (proof
+the broker itself bound the port), not merely the port being connectable — a
+foreign process already holding the port would pass a bare connect check while
+the broker exits with `EADDRINUSE`, and the consumer would then stream prompts
+and repo data (plus the dummy key) to an unrelated listener.
+
+> **groom.yml wiring lands in the sibling ticket (BE-4311)** — this file adds the
+> broker script + its unit tests only; nothing in `groom.yml` calls it yet.
+
 ## `interval.py` — the runtime cadence gate (BE-4004)
 
 GitHub Actions `schedule:` cron is **static in the workflow file** — there is no
@@ -278,6 +327,21 @@ real groom, so a skipped tick costs ~nothing (it never reaches the finder).
   interval-skip ticks in between never reset the clock. (A repo variable would
   need a `Variables: write` credential the run doesn't carry, and a missing grant
   would fail *silently* into a daily over-spend — run history has no such trap.)
+- **A *failed* finder job counts only if the billed agent step ran** (BE-4809).
+  The job runs two checkouts, `npm install`, the prompt build and the read-only
+  chmod BEFORE the agent; a transient failure in any of them concludes the job
+  `failure` having spent nothing, and counting that would silently skip every
+  tick for a full interval. So a `failure` additionally requires the run-history
+  payload's per-job `steps` to show `Run finder` reaching a real conclusion —
+  `success` still counts unconditionally. The missing-data direction here is
+  deliberately the OPPOSITE of the rest of the gate: no usable `steps` array
+  counts the failure, because re-billing a genuinely-spent audit on the next
+  daily tick is the expensive mistake. For the same reason the jobs are fetched
+  with `filter=all` (the endpoint defaults to `latest`): the question is now
+  step-level, so a manual re-run that flakes in `npm install` must not erase the
+  agent an *earlier* attempt already paid for — one attempt showing the step ran
+  is enough. A unit test pins the step name against `groom.yml` so a rename can't
+  silently drift the two apart.
 - **`workflow_dispatch` bypasses THIS gate** — a manual dispatch is never
   interval-throttled. It is not a blanket "always runs": the volume gate is a
   second, independent throttle, so a live dispatch into a quiescent repo can
@@ -315,8 +379,104 @@ python3 .github/groom/interval.py --normalize-cadence "$GROOM_INTERVAL_DAYS"
 ```
 
 - **`tests/`** — `unittest` suite, run by
-  [`test-groom-scripts.yml`](../workflows/test-groom-scripts.yml).
+  [`test-groom-scripts.yml`](../workflows/test-groom-scripts.yml). The key-broker
+  tests boot the real script under `node` (skipped when `node` is absent).
 
 ```bash
 python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
+```
+
+## The agent sandbox — `agent-sandbox.sh` + `broker.mjs` (BE-4302)
+
+The auto-builder (phase 3) runs an untrusted agent that writes code. These two
+trusted assets confine that agent so a prompt-injected or misbehaving run cannot
+read the runner's secrets, touch anything outside its clone, or exfiltrate the
+API key — while still letting it edit its worktree and reach Anthropic.
+
+- **[`agent-sandbox.sh`](agent-sandbox.sh)** — a [bubblewrap](https://github.com/containers/bubblewrap)
+  (`bwrap`) wrapper that runs an arbitrary command inside an unprivileged jail:
+
+  ```bash
+  agent-sandbox.sh --clone <path> --clone-mode ro|rw-git-ro --out-dir <path> \
+      [--ro-file <path> ...] [--env KEY=VALUE ...] [--uds <host-socket-path>] \
+      -- <command...>
+  ```
+
+- **[`broker.mjs`](broker.mjs)** — a ~50-line node-stdlib reverse proxy
+  (`node broker.mjs <port|socket-path>`) that holds the real key on the host and
+  forwards the jail's requests to it. In socket mode it listens on a unix-domain
+  socket (bind-mounted into the jail via `--uds`); the legacy TCP port mode is
+  retained for the test plumbing and back-compat.
+- **[`jail-shim.mjs`](jail-shim.mjs)** — a ~20-line node-stdlib TCP→UDS forwarder
+  (`node jail-shim.mjs <port> /run/broker.sock`) that runs **inside** the jail so
+  agent tooling speaking HTTP to a `127.0.0.1:<port>` base URL reaches the broker's
+  bind-mounted socket (the isolated netns has no way to dial a host TCP port).
+
+### The sandbox contract (what the agent can and cannot see)
+
+| Surface | Inside the jail |
+|---|---|
+| `/usr`, `/etc` | read-only |
+| `/tmp`, `/home/agent` (`HOME`) | fresh tmpfs — host `/tmp` is **shadowed**, not shared |
+| the clone (`--clone`) | bound **at its real path**; `ro` = read-only, `rw-git-ro` = worktree writable but `.git` read-only |
+| explicit `--ro-file`s | read-only, at their real paths |
+| the out-dir (`--out-dir`) | the **only** writable host location (created on the host first) |
+| host `$HOME` / `$RUNNER_TEMP` / `$GITHUB_WORKSPACE` / other repos | **invisible** |
+| host process table | **invisible** (own pid namespace) |
+| environment | **cleared** — only `HOME`, `PATH`, `TERM`, and each `--env KEY=VALUE`; nothing inherited from the host |
+| network | **isolated network namespace** (loopback only) — host network, host loopback, and cloud metadata are all **unreachable**; the broker is reached via a unix socket bind-mounted at `/run/broker.sock` plus the in-jail `jail-shim.mjs` TCP forwarder |
+
+The `rw-git-ro` worktree write is exactly how the builder's patch is captured: the
+agent edits tracked files, the wrapper's caller reads them back on the host
+afterward, but the agent can never rewrite git history or `.git/config`.
+
+**The real API key never enters the jail.** The broker reads
+`ANTHROPIC_API_KEY` from *its own* (host) environment, **deletes** any inbound
+`x-api-key` / `authorization` header, injects the real key, and forwards only
+`/v1/*` paths to `api.anthropic.com` — streaming the response through unbuffered
+so SSE works. `GET /healthz` answers locally; anything not under `/v1/` is `404`.
+It listens on a unix-domain socket (`--uds`, the phase-2 default) or `127.0.0.1`
+(legacy TCP mode), refuses to start with an empty key or a relative socket path,
+and logs one line per request — method + path + status, never headers or body. The
+request-handling contract is identical on both transports.
+
+**No network egress (BE-4421).** The jail runs in an isolated network namespace
+with only loopback up, so the broker — reached over the unix socket bind-mounted
+at `/run/broker.sock` via the in-jail `jail-shim.mjs` TCP→UDS forwarder — is the
+*only* thing the agent can talk to. Host network, host loopback services, and
+cloud metadata (`169.254.169.254` / `168.63.129.16`) are all unreachable. Two
+consequences for callers: set `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` in the
+agent env so the agent doesn't stall on telemetry endpoints that can never be
+reached; and because there is no egress, in-jail `git fetch` / `npm install`
+cannot work — anything the agent needs must already be in the clone before it is
+sandboxed.
+
+### The loud-preflight guarantee
+
+Before it runs anything, `agent-sandbox.sh` **proves the sandbox works or exits
+non-zero** — it will **never** fall back to running the command unsandboxed. The
+preflight installs `bubblewrap` if missing, installs an unconfined AppArmor
+profile for `bwrap` when the runner sets
+`kernel.apparmor_restrict_unprivileged_userns=1` (mirroring the runner image's own
+podman workaround), and self-tests a real `bwrap` invocation. If that still fails
+it drops the userns restriction and retests; if it *still* fails it emits
+`::error::bwrap sandbox unavailable …` and exits non-zero. A broken sandbox stops
+the run — it never silently degrades to no sandbox.
+
+### Tests — deterministic, no API spend
+
+[`tests/sandbox-tests.sh`](tests/sandbox-tests.sh) (run by the `sandbox-tests` job
+in [`test-groom-scripts.yml`](../workflows/test-groom-scripts.yml)) asserts every
+row of the contract above with `bash -c` as the sandboxed command — env scrub, FS
+confinement + tmpfs shadowing, both clone modes, pid isolation — and points the
+broker at a local fake upstream ([`tests/fake-upstream.mjs`](tests/fake-upstream.mjs))
+*over the bind-mounted unix socket + in-jail `jail-shim.mjs`* to prove key
+injection/stripping, the `/healthz` + non-`/v1` behavior, and SSE pass-through. It
+also proves the BE-4369 egress isolation: host loopback, cloud metadata, and an
+arbitrary external IP are all unreachable from the jail. No `claude`, no API key,
+no spend.
+
+```bash
+shellcheck -x .github/groom/agent-sandbox.sh .github/groom/tests/sandbox-tests.sh
+bash .github/groom/tests/sandbox-tests.sh   # Linux + unprivileged userns only
 ```
