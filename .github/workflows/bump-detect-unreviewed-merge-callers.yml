@@ -45,19 +45,21 @@ name: Bump detect-unreviewed-merge callers
 # `gh variable set` per the update flow below — as the immediate follow-on to
 # that fix, NOT as a way to turn the red run green.
 #
-# ALLOW_EMPTY is set to "false" below. That is already `bump-callers.sh`'s
-# default, but this fleet is seeded NON-EMPTY (its callers all existed before
-# the bumper did), so the property is load-bearing rather than incidental:
-# an empty list here means the variable was clobbered, not that the fleet has no
-# members, and a fleet that always has callers must never silently no-op — that
-# would leave every caller un-bumped with nobody noticing, exactly the drift
-# this directory exists to prevent. Stating it explicitly (as
-# `bump-auto-label-callers.yml` does) keeps it true if the shared default ever
-# flips. If a run does hit an empty roster it fails RED on purpose: that is
-# intentional nagging until the roster is seeded (or restored, if it was
-# clobbered), not a bug to paper over by flipping ALLOW_EMPTY on. Expect exactly
-# that red run until the masking fix above lands — it is the designed state, not
-# a broken deploy.
+# ALLOW_EMPTY is set to "false" below — already `bump-callers.sh`'s default, but
+# stated explicitly (as `bump-auto-label-callers.yml` does) so the property
+# survives a future flip of that default. This fleet has a known, non-empty set
+# of LIVE CALLERS, so an empty run is never "this fleet has no members" and must
+# never be a silent no-op: that would leave every caller un-bumped with nobody
+# noticing, exactly the drift this directory exists to prevent.
+#
+# READ THIS BEFORE ACTING ON A RED RUN. An empty roster right now is the EXPECTED
+# PRE-SEED STATE described above, not a clobbered variable. Until the masking fix
+# lands, the correct response to that red run is to leave it red — do NOT "fix"
+# it by seeding the variable, which is precisely the irreversible disclosure this
+# header exists to prevent. Once masking is in place, seeding is the follow-on
+# and the run goes green on its own. (After that point, and only after it, an
+# empty roster does mean the variable was clobbered and should be restored.)
+# Either way the answer is never to flip ALLOW_EMPTY on.
 #
 # Update flow — adding/removing a caller needs NO public commit:
 #   gh variable set DETECT_UNREVIEWED_MERGE_CALLERS --repo Comfy-Org/github-workflows \
@@ -187,9 +189,29 @@ jobs:
               echo "::error::Could not fetch the current main tip to compare $WATCHED"
               exit 1
             fi
-            main_tip=$(git rev-parse FETCH_HEAD)
+            # Prove FETCH_HEAD resolves to a real commit BEFORE reading blobs
+            # out of it. `git rev-parse --verify --quiet` returns empty both for
+            # "that path is absent from this tree" and for "this revision could
+            # not be resolved at all" (a partial fetch, an unexpected FETCH_HEAD
+            # state). Without this guard the second case is indistinguishable
+            # from deletion and would exit 0 as "decommissioned" — the same
+            # "a lookup we couldn't perform is not evidence" anti-pattern the
+            # ls-remote guard above rejects, but silently no-opping the whole
+            # fleet. With it, an empty tip_blob genuinely means absent-from-tree.
+            if ! main_tip=$(git rev-parse --verify --quiet "FETCH_HEAD^{commit}"); then
+              echo "::error::Fetched main but FETCH_HEAD does not resolve to a commit — cannot compare $WATCHED"
+              exit 1
+            fi
             tip_blob=$(git rev-parse --verify --quiet "FETCH_HEAD:$WATCHED" || true)
-            here_blob=$(git rev-parse --verify --quiet "HEAD:$WATCHED" || true)
+            # HEAD is this run's own checkout, so it must resolve. An empty
+            # here_blob means $WATCHED is absent at github.sha, which is the
+            # deletion-commit case the final guard handles — don't let it fall
+            # into the "changed since" branch below and be reported as a stale
+            # re-run, which would be a misleading log for a real decommission.
+            if ! here_blob=$(git rev-parse --verify --quiet "HEAD:$WATCHED"); then
+              echo "::warning::$WATCHED is absent at this run's own commit $GITHUB_SHA — treating as decommissioned and bumping nothing. If any caller still pins it, retire those callers."
+              exit 0
+            fi
             if [[ -z "$tip_blob" ]]; then
               # ::warning:: not a bare echo: if the reusable was deleted while
               # live callers still pin it, they all hard-fail at startup and a
@@ -206,6 +228,15 @@ jobs:
             # both, so the tip is the same reusable content at a commit that is
             # actually current — pinning the older SHA would hand every caller a
             # non-tip commit (and, on a land-then-revert, re-pin them backwards).
+            #
+            # COUPLED TO THE PATH FILTER — this is only sound because the `paths:`
+            # trigger has exactly ONE entry, so a single-blob comparison covers
+            # everything a caller pins at this SHA. If you ever widen that filter
+            # (an asset directory, a `workflows_ref` surface, as cursor-review /
+            # groom / pr-size already have), this comparison silently
+            # under-verifies: callers would be pinned to a tip whose other
+            # relevant content was never compared. Widen the comparison to every
+            # filtered path in the same change, or drop this re-point.
             echo "main moved to $main_tip since $GITHUB_SHA, but $WATCHED is unchanged — this run is still the only one for that change; pinning callers to $main_tip and proceeding"
             # `export` explicitly: the env: binding already marks it exported,
             # but the script is a separate process and this must not depend on
