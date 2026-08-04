@@ -67,6 +67,84 @@ Two CI-specific mechanics worth knowing:
   workflow cascade. Later phases that WANT label-triggered routing switch to an
   app token deliberately.
 
+## Grading on demand (`pr_number` / `pr_numbers`)
+
+Every grade above is triggered by a `pull_request` event. Two things need a grade
+with no event: a repo that **enrolls mid-stream** and wants the open queue it
+already has labeled, and a **manual re-grade** after a `.github/risk.json` change
+or on a PR carrying `risk-dispute`. Both are a `workflow_dispatch` on the
+consumer's caller, forwarding a number:
+
+```yaml
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number: { required: false }    # one PR
+      pr_numbers: { required: false }   # 12,15,20 — wins over pr_number
+```
+
+With neither supplied the workflow reads the event exactly as before. The grading
+logic is unchanged either way — it was always an API read keyed on a PR number,
+never a read of the event payload. What the number-supplied path changes is only
+which PR is read, plus three consequences worth knowing:
+
+- **Bot-authored and fork PRs are graded here.** The `github.actor != 'dependabot[bot]'`
+  and `head.repo.full_name == github.repository` clauses in the caller's `if:`
+  are **token** guards — a bot's or a fork's `pull_request` run gets a read-only
+  `GITHUB_TOKEN`, so the label write would 403 and the check would go red on
+  every dependency bump. On a dispatch the token is writable and the actor is a
+  human, so neither applies. Fork **risk** is untouched: `external` comes from
+  the API's own fork flag, never from the actor, and still grades R3.
+- **Both clauses must be scoped to the event, or the dispatch is a silent
+  no-op.** There is no `github.event.pull_request` on a `workflow_dispatch`, so
+  an unscoped fork clause is false and the job skips with no run, no error and no
+  annotation. The same applies to the concurrency group: an event-only key
+  collapses to one constant group, and with `cancel-in-progress` a batch has each
+  dispatch cancel the one before it. The workflow header carries a copy-paste
+  block that is correct on both event shapes — use it rather than reconstructing
+  one, and note that a caller-side skip is undetectable from inside the reusable.
+- **A low `wait_for_checks_minutes` is right for a backfill, but `0` is not.**
+  The wait exists to outlast the rest of the rollup while the grading run's own
+  check sits in it. A dispatched run's check attaches to the dispatched ref, not
+  to the PR's head commit, so it is not in that rollup at all and a settled PR
+  reads its true state on the first poll. `0` still breaks out after a single
+  read, ahead of the "require a settled reading to repeat" confirmation, so a
+  target someone pushed to minutes ago lands the honest R2 floor. `1` costs one
+  15s backoff per PR and keeps the confirmation.
+
+A batch grades one target at a time and **one unreadable PR is reported without
+abandoning the rest** — the whole list is attempted, then the run reports whether
+any target failed. The list is explicit and capped (50) rather than an
+`all_open: true` that would be unbounded, and a target the job's time budget
+cannot reach is reported by number as *not attempted* rather than started and cut
+off. The base ref is re-read **per target** and an unresolvable one fails that
+target: the ref selects which branch's `.github/risk.json` judges the PR, live
+PRs are commonly stacked on feature branches rather than the default branch, and
+an empty `?ref=` is not an error to the contents API — it silently resolves to
+the default branch. That is also why the ref is percent-encoded into the request
+rather than interpolated raw: `#`, `&` and `+` are all legal in a branch name,
+and a raw `#` truncates the URL into exactly that empty-ref read. A 404 for the
+**ref** ("no commit found for the ref" — a deleted or renamed base branch) is
+distinguished from a 404 for the **file** and fails the target instead of
+falling back to the generic map.
+
+Two operational caveats for a backfill:
+
+- **A batch cannot serialize per-PR.** One run covers N pull requests and a run
+  belongs to exactly one concurrency group, so a batch overlapping a
+  `pull_request` run for one of its own numbers can interleave with it — the
+  label sync is a read-current / delete-stale / add-target sequence, so that PR
+  may briefly carry two `risk:*` labels (the next grade re-syncs it, and the
+  label gates nothing meanwhile). Dispatch when the queue is quiet, and use
+  `pr_number` when you want the per-PR group to serialize against event runs. A
+  DELETE of a label a concurrent run already removed is treated as removed, not
+  as a failure.
+- **The pre-grader reads retry.** Rate limits are global, not per-PR, so the
+  base-ref and override reads — the first hop for every target — retry a
+  transient failure with backoff, as the grader already does. Without it one
+  secondary-rate-limit burst mid-backfill failed every remaining target at once.
+  A definitive answer (404, 401, 422) is never retried.
+
 ## Per-repo overrides (read from the base ref)
 
 The shipped map and registry are deliberately generic. A consumer repo sharpens
@@ -116,6 +194,13 @@ Labels are created on first use, color-coded green → red (gray for ungraded).
   its connection capped the list at 100, which put exactly the PRs a risk grade
   helps most in the ungraded lane. A read that comes back short of `changedFiles`
   is still `unknown`.
+- `grade-targets.sh` — the orchestration layer, extracted from `pr-risk.yml`'s
+  inline job body so the event path and the by-number path cannot drift into two
+  copies of it. Per target: resolve the base ref, fetch that ref's override
+  files, poll the grader until the rest of the rollup settles, sync the one
+  label. Grades one target or a list through the same code, records each
+  outcome, and never lets one bad target abandon the rest. It computes nothing
+  about risk.
 - `apply-risk-label.sh` — the one write. Owns exactly the five mapped labels:
   removes stale ones, applies the computed one, touches nothing else.
 - `risk-map.v0.json` / `runbook-registry.v0.json` — the generic defaults.

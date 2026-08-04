@@ -26,6 +26,50 @@ name: PR Risk Grade (reusable)
 # out, then labels what it has. Pair the caller with a per-PR cancel-in-progress concurrency
 # group so a new push supersedes a waiting run instead of stacking behind it.
 #
+# ON-DEMAND GRADING (`pr_number` / `pr_numbers`): supply a PR number and that PR is graded with
+# no `pull_request` event involved — which is how a repo enrolling mid-stream grades the open
+# queue it already has, and how a PR is re-graded after a `.github/risk.json` change or a
+# `risk-dispute`. Absent, the workflow reads the event exactly as before. Three things differ on
+# the by-number path, all of them deliberate:
+#   * BOT-AUTHORED PRs ARE GRADED. The `github.actor != 'dependabot[bot]'` clause callers put in
+#     their `if:` is a TOKEN guard, not a policy one: a bot-triggered `pull_request` run gets a
+#     read-only GITHUB_TOKEN, so the label write — this workflow's entire product — would 403.
+#     On a dispatch the actor is the human who pressed the button and the token is writable, so
+#     the reason evaporates. Excluding them would also bias any backfill corpus badly; bots
+#     author a substantial minority of merged PRs. The same is true of the fork clause, and for
+#     the same reason — fork RISK is unaffected either way, because `external` is derived from
+#     the API's `isCrossRepository`, never from the actor, and forks grade R3 with no exceptions.
+#   * THE BASE REF IS RE-READ FROM THE API, per target, because there is no event payload to take
+#     it from. It is load-bearing rather than cosmetic: it selects which branch's
+#     `.github/risk.json` judges the PR, live PRs are commonly stacked on feature branches rather
+#     than the default branch, and an empty ref is NOT an error to the contents API — it silently
+#     resolves to the default branch. So an unresolvable base ref FAILS that target instead of
+#     grading it against rules nobody read.
+#   * A LOW `wait_for_checks_minutes` IS RIGHT HERE, and is not the same trade-off as on the event
+#     path. The wait exists to outlast the rest of the rollup while our own check sits in it; a
+#     dispatched run's check is attached to the dispatched ref, not to the PR's head commit, so
+#     it is not in that rollup at all and a settled PR reads its true state (`SUCCESS`, nothing
+#     pending) on the first poll. It is still not FREE: `0` breaks out after a single read, ahead
+#     of both the not-yet-registered grace window and the "require a settled reading to repeat"
+#     confirmation, so a target someone pushed to minutes ago lands the honest R2 floor. `1` costs
+#     one 15s backoff and a second read per PR and keeps the confirmation. Prefer `1`, not `0`.
+#
+# Batch (`pr_numbers`) grades one target at a time and ONE UNREADABLE PR NEVER ABANDONS THE REST:
+# each target's outcome is recorded, the whole list is attempted, and the run then reports whether
+# any target failed. There is deliberately no `all_open: true` — an explicit list is bounded,
+# reviewable and re-runnable, and the list is capped rather than silently truncated. A dispatch
+# that reaches this workflow with no target at all FAILS LOUDLY instead of exiting 0: a button
+# that silently grades nothing is worse than no button.
+#
+# A BATCH CANNOT SERIALIZE PER-PR, and no concurrency key can make it: one run covers N pull
+# requests and a run belongs to exactly one group. The label sync is a read-current /
+# delete-stale / add-target sequence, so a batch that overlaps a `pull_request` run for one of ITS
+# numbers can interleave with it and leave that PR briefly carrying two `risk:*` labels — the next
+# grade of that PR re-syncs it to one, and the label gates nothing in the meantime. Two mitigations
+# and one limit: dispatch a backfill when the queue is quiet; prefer `pr_number` when you want the
+# per-PR concurrency group to serialize a re-grade against event runs; and a DELETE of a label
+# another run already removed is tolerated rather than painted red (see apply-risk-label.sh).
+#
 # SECRETS: none. This workflow declares no `secrets:` inputs and callers pass none — the only
 # credential in the job is the automatic `GITHUB_TOKEN` (`github.token`), used for the PR read
 # and the one label write. There is no `secrets: inherit` to add and nothing to rotate.
@@ -48,26 +92,113 @@ name: PR Risk Grade (reusable)
 #   on:
 #     pull_request:
 #       types: [opened, synchronize, reopened, ready_for_review]
+#     workflow_dispatch:
+#       inputs:
+#         pr_number:
+#           description: Grade ONE pr by number (enrollment backfill, or a manual re-grade).
+#           required: false
+#         pr_numbers:
+#           description: Grade several, comma-separated (12,15,20). Wins over pr_number.
+#           required: false
 #   concurrency:
-#     group: pr-risk-${{ github.event.pull_request.number }}
+#     # THE KEY MUST CARRY THE RESOLVED TARGET, not just the event PR. On a workflow_dispatch
+#     # `github.event.pull_request.number` is empty, so an event-only key collapses to ONE
+#     # constant group for every dispatch — and with cancel-in-progress that means each
+#     # dispatched PR cancels the one before it, which is precisely the shape a backfill has.
+#     # `inputs` is empty on a `pull_request` run, so this one expression is correct on both.
+#     # A `pr_numbers` LIST keys its own group, which serializes identical batches but cannot
+#     # serialize a batch against a `pull_request` run for one of its members — see "A BATCH
+#     # CANNOT SERIALIZE PER-PR" above for what that costs and how to avoid it.
+#     group: ${{ github.workflow }}-${{ inputs.pr_numbers || inputs.pr_number || github.event.pull_request.number }}
 #     cancel-in-progress: true
 #   permissions:
 #     contents: read
 #   jobs:
 #     pr-risk:
+#       # SCOPE EVERY GUARD CLAUSE TO THE EVENT IT DESCRIBES. Both clauses below are TOKEN
+#       # guards: a fork's and a bot's `pull_request` run gets a read-only GITHUB_TOKEN, so the
+#       # label write would 403 and the check would go red on every dependency bump. Neither is
+#       # a risk judgement — forks are graded R3 from the API's own fork flag, never from the
+#       # actor. On a workflow_dispatch there is no `github.event.pull_request`, so an
+#       # unscoped `head.repo.full_name == github.repository` is FALSE and the job SKIPS
+#       # SILENTLY: the dispatch button appears to do nothing, no run, no error, no annotation.
+#       # Keeping the clauses behind the event test is what makes the button work at all — and
+#       # on a dispatch the token is writable and the actor is a human, so there is nothing left
+#       # for either clause to protect.
+#       if: >-
+#         github.event_name != 'pull_request' ||
+#         (github.actor != 'dependabot[bot]' &&
+#          github.event.pull_request.head.repo.full_name == github.repository)
 #       permissions:
 #         contents: read
-#         issues: write         # the risk label rides the issues API
-#         pull-requests: read
+#         issues: write         # create the risk:* labels repo-side on first use
+#         pull-requests: write  # the label write itself — labeling a PR rides the
+#                               # pull-requests permission, not issues (the labels
+#                               # endpoint is dual-mapped by what the "issue" is)
 #         checks: read          # the check rollup the reversibility axis reads
+#         actions: read         # the rollup query walks CheckRun -> checkSuite ->
+#                               # workflowRun (an Actions resource) for self-exclusion
 #         statuses: read
 #       uses: Comfy-Org/github-workflows/.github/workflows/pr-risk.yml@<sha>  # v1
 #       with:
 #         workflows_ref: <same sha>
+#         # OFF BY DEFAULT. Enrolling and switching on are two decisions: land the caller, get
+#         # it reviewed, then start grading. Either pin it on here, or leave this out and set
+#         # the repo variable RISK_CONFIG to {"enabled": true} — the variable outranks this
+#         # input in BOTH directions, so {"enabled": false} is also a kill switch needing no PR.
+#         enabled: true
+#         # Both are empty on a `pull_request` run (`inputs` is empty there), which is exactly
+#         # the no-input event path — so ONE caller shape serves both event and dispatch and
+#         # there is nothing to keep in sync between two jobs.
+#         pr_number: ${{ inputs.pr_number }}
+#         pr_numbers: ${{ inputs.pr_numbers }}
+#         # For a backfill, dispatch with this lowered — see ON-DEMAND GRADING above for why a
+#         # low wait is sound on the by-number path and why `0` still is not the right value.
+#         # wait_for_checks_minutes: 1
+#
+# A SKIPPED CALLER JOB IS INVISIBLE FROM HERE. This workflow cannot detect, warn about or recover
+# from a caller whose `if:` excluded it — no run is created, so nothing of ours executes. The
+# block above is the only lever, which is why the `if:` is spelled out rather than left to the
+# enroller. What this workflow CAN do, and does, is refuse to be a silent no-op once it is
+# actually reached: a run with no resolvable target fails with a message naming both inputs.
+#
+# GRANT ALL SIX OR THE RUN NEVER STARTS. A reusable workflow can only NARROW the caller's
+# token, never elevate it, so a caller whose block is short of what the `grade` job declares is
+# rejected by GitHub before any step executes ("is requesting 'pull-requests: write', but is
+# only allowed 'pull-requests: read'") — the check goes red with no grade, and the PR keeps
+# whatever label the previous push left rather than degrading to `risk:ungraded`. Copy the
+# block above verbatim when you enroll, and re-check it against this header whenever you move
+# the SHA pin.
 
 on:
   workflow_call:
     inputs:
+      pr_number:
+        description: >-
+          Grade ONE pull request by number instead of the event's. Leave it EMPTY on a
+          `pull_request` run: with no number supplied the target, the base ref and every emitted
+          label are exactly what they were before this input existed. Supplying it is what makes
+          grading possible without a `pull_request` event — the enrollment backfill of an
+          already-open queue, and the manual re-grade after a risk-map change or a
+          `risk-dispute`. Bot-authored and fork PRs ARE graded on this path (see the header).
+          Typed `string` rather than `number` because `workflow_dispatch` inputs arrive as
+          strings, and because an empty string is what lets the fall-through to the event's own
+          number stay a single expression.
+        type: string
+        required: false
+        default: ''
+      pr_numbers:
+        description: >-
+          Grade SEVERAL pull requests by number (comma-separated, e.g. `12,15,20`). Takes
+          precedence over `pr_number` when both are set. Targets are graded one at a time, and
+          one unreadable PR is REPORTED without abandoning the rest — the whole list is
+          attempted before the run decides its own outcome. Pair a long list with a low
+          `wait_for_checks_minutes`: the per-target waits are additive and the run stops starting
+          new targets once the job's budget is spent, reporting the un-attempted ones by number
+          rather than being cancelled mid-label. There is deliberately no `all_open: true`.
+        type: string
+        required: false
+        default: ''
       fleet_logins:
         description: >-
           GitHub logins whose PRs are supervised-agent output (comma-separated).
@@ -95,12 +226,14 @@ on:
         default: ''
       wait_for_checks_minutes:
         description: >-
-          How long to wait for the REST of the check rollup to settle before
+          How long to wait, PER TARGET, for the REST of the check rollup to settle before
           labeling (the grading run itself is excluded from the rollup it
           reads). 0 labels immediately — expect R2 floors from still-pending
           checks. CLAMPED to what a 30-minute job can actually spend waiting (25),
           so an over-large value degrades to a shorter wait instead of a job
-          cancelled mid-sleep with the label never applied.
+          cancelled mid-sleep with the label never applied. On the by-number path a dispatched
+          run's own check is not in the graded PR's rollup at all, so `1` is usually enough
+          there; see ON-DEMAND GRADING in the header for why `0` still is not.
         type: number
         required: false
         default: 10
@@ -125,28 +258,111 @@ on:
           is not a chain.
         type: string
         required: true
+      enabled:
+        description: >-
+          Whether to grade at all. DEFAULTS TO FALSE: enrolling this workflow and
+          switching it on are two separate decisions, so a repo can land the
+          caller, get it reviewed, and start grading later — or stop grading
+          without reverting anything. When it resolves false the `grade` job does
+          not run: nothing is read, nothing is labelled, and no existing `risk:*`
+          label is touched (a disabled run leaves whatever the last enabled one
+          left, it does not clean up).
+
+
+          `vars.RISK_CONFIG` on the CALLING repo OVERRIDES this, in both
+          directions — `{"enabled": true}` switches a caller on with no `with:`
+          change, and `{"enabled": false}` is a kill switch that needs no PR at
+          all. That works because the `vars` context inside a reusable resolves
+          against the caller's repository (the same mechanism groom.yml uses for
+          `vars.GROOM_CONFIG`). The variable is the OPERATIONAL lever; this input
+          is the REVIEWED default the variable falls back to when it is absent,
+          empty, not an object, or carries no boolean `enabled` — a malformed
+          variable must never be the reason a repo silently stops grading, so it
+          degrades to this value and says so in an annotation.
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
 
 jobs:
+  # Resolve enablement before anything is read. Its own job rather than a first step of `grade`
+  # so a disabled repo pays one bare runner instead of booting the grading job to immediately
+  # no-op, and so the decision — and the reason for it — is visible in the run graph rather than
+  # buried in a step log. It holds NO token scopes: it reads only its inputs and the caller's
+  # variable, and must never be the thing that touches a PR.
+  gate:
+    name: Resolve enablement
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      enabled: ${{ steps.resolve.outputs.enabled }}
+    steps:
+      # The tool checkout is the same pinned-ref load the grade job does: the resolver is this
+      # repo's code at `workflows_ref`, never the graded PR's.
+      - name: Load pr-risk tool
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _pr_risk_tool
+          persist-credentials: false
+      - name: Resolve enabled
+        id: resolve
+        env:
+          INPUT_ENABLED: ${{ inputs.enabled }}
+          # Empty when the caller repo has no such variable — which is the common case and is
+          # NOT an error; it just means the reviewed input decides.
+          RISK_CONFIG: ${{ vars.RISK_CONFIG }}
+        run: bash _pr_risk_tool/scripts/pr-risk/resolve-enabled.sh
+
   grade:
+    needs: gate
+    if: needs.gate.outputs.enabled == 'true'
     name: Grade PR risk
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read        # read the consumer's .github/risk.json override from the BASE ref
-      issues: write         # THE ONLY WRITE: sync the one risk label (a PR is an issue to the
-                            # labels API). Nothing else is written — no comment, no review, no
-                            # merge — and a GITHUB_TOKEN-applied label cannot fire `labeled`
-                            # triggers, so this write cannot start a workflow cascade.
-      pull-requests: read   # the PR record itself: author, association, fork flag, file list
+      issues: write         # create the risk:* labels repo-side on first use (repo label CRUD
+                            # maps to Issues; enrolling a repo needs no manual label setup)
+      pull-requests: write  # Sync the one risk label — the labels endpoint is dual-mapped:
+                            # labeling an ISSUE rides issues:write, labeling a PR rides
+                            # pull-requests:write, so `issues: write` alone 403s here
+                            # ("Resource not accessible by integration"). There is no narrower
+                            # grant that can label a PR; this is minimum-necessary, not tidy.
+                            # SCOPE HONESTLY: `pull-requests: write` is a TOKEN-level grant, so
+                            # it also permits commenting, reviewing, editing and closing — the
+                            # label-only guarantee is CODE-level (apply-risk-label.sh is the
+                            # only writer, and it touches nothing but the mapped label names),
+                            # backed by the fact that the job checks out no PR code: the only
+                            # code holding this token is this repo's, loaded from the pinned
+                            # workflows_ref. Public repos enroll via `pull_request_target`, so
+                            # that token IS present on fork-authored events — which is exactly
+                            # why workflows_ref must be a full SHA of THIS repo and never a
+                            # mutable ref. A GITHUB_TOKEN-applied label also cannot fire
+                            # `labeled` triggers, so the write cannot start a cascade.
       checks: read          # the check rollup the reversibility axis reads (CheckRun contexts)
+      actions: read         # the same rollup's CheckRun -> checkSuite -> workflowRun traversal
+                            # (self-exclusion keys on workflowRun.databaseId, and workflow runs
+                            # are an Actions resource — without this the WHOLE GraphQL read
+                            # errors and every PR grades unknown/ungraded)
       statuses: read        # the same rollup's legacy commit-status contexts
     env:
       REPO: ${{ github.repository }}
-      PR_NUMBER: ${{ github.event.pull_request.number }}
-      BASE_REF: ${{ github.event.pull_request.base.ref }}
+      # The target list. `pr_numbers` wins over `pr_number`, and with neither supplied this is
+      # the event's own PR — so the event path resolves to the same single number it always did.
+      PR_NUMBERS: ${{ inputs.pr_numbers || inputs.pr_number || github.event.pull_request.number }}
+      # The event PR's base ref, passed through ONLY when no number was supplied. When one WAS,
+      # the target may be a different PR than the event's (or there may be no event at all), and
+      # the event's base ref would then point the override read at the wrong branch — so the
+      # by-number path re-reads it from the API per target instead. The expression reads oddly
+      # because GitHub's `||` yields the first TRUTHY operand: the `&& ... || ''` tail is how a
+      # conditional passthrough is spelled, and it yields '' both when a number was supplied and
+      # when there is no pull_request payload to read.
+      BASE_REF: ${{ (inputs.pr_number || inputs.pr_numbers) == '' && github.event.pull_request.base.ref || '' }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Load pr-risk tool
@@ -159,175 +375,130 @@ jobs:
           ref: ${{ inputs.workflows_ref }}
           path: _pr_risk_tool
           persist-credentials: false
-
-      - name: Fetch per-repo overrides from the base ref
-        id: overrides
+      - name: Grade the target PR(s) and sync the label
+        id: grade
+        # The per-target sequence — resolve the base ref, fetch that ref's override files, poll
+        # the grader until the rest of the rollup settles, sync the one label — lives in
+        # scripts/pr-risk/grade-targets.sh rather than inline here, so the event path and the
+        # by-number path cannot drift into two copies of it, and so it is unit-testable at all
+        # (tests/test_grade_targets.sh drives every branch with a stubbed `gh`). It grades ONE
+        # target or fifty through the same code; a batch's per-target failures are recorded and
+        # the remaining targets still graded.
         env:
           MAP_PATH: ${{ inputs.repo_map_path }}
           RB_PATH: ${{ inputs.repo_runbooks_path }}
-        run: |
-          set -uo pipefail
-          # Read from the BASE ref, so the PR being graded cannot edit the rules
-          # that judge it. Absent (a genuine 404) falls back to the shipped
-          # defaults; present-but-invalid is left for the grader's structural
-          # validation to reject loudly — a repo that commits a corrupt map must
-          # see red, not silent generic grading.
-          #
-          # ONLY A 404 MEANS ABSENT. Treating any non-zero exit as "no override"
-          # meant a 403 rate-limit, a 5xx or a network blip silently graded the
-          # PR against the generic default map instead of the repo's sharpened
-          # one — a LOWER tier computed from an input nobody read, which is the
-          # confident-answer-from-an-unread-source failure the unknown contract
-          # forbids everywhere else. So the status code is captured and anything
-          # that is not 200-or-404 fails the run.
-          errf="$(mktemp)"
-          fetch_override() { # <path> <outfile> -> prints the outfile, or nothing when absent
-            local p="$1" out="$2"
-            if gh api "repos/${REPO}/contents/${p}?ref=${BASE_REF}" \
-                 -H "Accept: application/vnd.github.raw" > "$out" 2>"$errf"; then
-              echo "using ${p} from ${BASE_REF}" >&2
-              printf '%s' "$out"
-            elif grep -q '(HTTP 404)' "$errf"; then
-              rm -f "$out"   # the redirect already created it empty; nothing must read it
-              echo "no ${p} on ${BASE_REF} — using the generic default" >&2
-            else
-              echo "::error::could not read ${p} from ${BASE_REF}: $(tr '\n' ' ' < "$errf"). NOT falling back to the generic default: that would grade this PR against rules nobody read." >&2
-              return 1
-            fi
-          }
-          map="$(fetch_override "$MAP_PATH" repo-risk-map.json)" || exit 1
-          rb="$(fetch_override "$RB_PATH" repo-risk-runbooks.json)" || exit 1
-          rm -f "$errf"
-          echo "map=$map"       >> "$GITHUB_OUTPUT"
-          echo "runbooks=$rb"   >> "$GITHUB_OUTPUT"
-
-      - name: Grade (waits for the rest of the rollup to settle)
-        id: grade
-        env:
           FLEET_LOGINS: ${{ inputs.fleet_logins }}
           BOT_LOGINS: ${{ inputs.bot_logins }}
+          LABEL_MAP: ${{ inputs.label_map }}
           SELF_CONTEXT: ${{ github.workflow }}
           SELF_RUN_ID: ${{ github.run_id }}
           WAIT_MINUTES: ${{ inputs.wait_for_checks_minutes }}
-          MAP_OVERRIDE: ${{ steps.overrides.outputs.map }}
-          RB_OVERRIDE: ${{ steps.overrides.outputs.runbooks }}
           JOB_TIMEOUT_MINUTES: 30      # keep in sync with timeout-minutes on the job
+          TOOL_DIR: _pr_risk_tool/scripts/pr-risk
         run: |
           set -uo pipefail
-          TOOL="_pr_risk_tool/scripts/pr-risk/grade-pr-risk.sh"
-          ARGS=( --repo "$REPO" --pr "$PR_NUMBER"
-                 --self-context "$SELF_CONTEXT" --self-run-id "$SELF_RUN_ID" )
-          [ -n "$FLEET_LOGINS" ] && ARGS+=( --fleet-logins "$FLEET_LOGINS" )
-          [ -n "$BOT_LOGINS" ]   && ARGS+=( --bot-logins "$BOT_LOGINS" )
-          [ -n "$MAP_OVERRIDE" ] && ARGS+=( --map "$MAP_OVERRIDE" )
-          [ -n "$RB_OVERRIDE" ]  && ARGS+=( --runbooks "$RB_OVERRIDE" )
-
-          # CLAMP THE WAIT TO THE JOB'S OWN BUDGET rather than trusting the input
-          # description. A caller who passes 40 against a 30-minute timeout gets a
-          # job cancelled mid-sleep: the label step never runs, the PR keeps
-          # whatever label the previous push left, and the check goes red for a
-          # reason nobody would guess. 5 minutes of headroom is left for the
-          # label + summary steps.
-          max_wait=$(( JOB_TIMEOUT_MINUTES - 5 ))
-          wait_minutes="${WAIT_MINUTES:-10}"
-          [ "$wait_minutes" -ge 0 ] 2>/dev/null || wait_minutes=10
-          if [ "$wait_minutes" -gt "$max_wait" ]; then
-            echo "::warning::wait_for_checks_minutes=${wait_minutes} exceeds what a ${JOB_TIMEOUT_MINUTES}-minute job can spend waiting — clamped to ${max_wait}"
-            wait_minutes="$max_wait"
-          fi
-          deadline=$(( $(date +%s) + 60 * wait_minutes ))
-          empty_deadline=$(( $(date +%s) + 120 ))   # grace for checks to REGISTER at all
-          waited=0
-          # Poll backoff: 15s doubling to 120s. The fixed 30s poll idled a runner
-          # up to the full wait on every `synchronize` event, per PR, across the
-          # fleet, for a grade that is one API call — increasing backoff cuts both
-          # runner minutes and API calls without changing the settle behaviour.
-          delay=15
-          settled_once=0
-          # rc=3 (the PR could not be read) covers rate limits, secondary rate
-          # limits and transient 5xx as well as a genuinely missing PR. Labeling
-          # `ungraded` on the first blip turns a momentary hiccup into a durable
-          # verdict, so it is retried with backoff. This gets its OWN budget, not
-          # the settle deadline: a transient API failure has nothing to do with
-          # how long the caller wants to wait for CI, and sharing the deadline
-          # would leave `wait_for_checks_minutes: 0` with no retry at all.
-          unreadable_tries=0
-          max_unreadable_tries=4
-          read_deadline=$(( $(date +%s) + 150 ))
-          read_delay=10
-          while :; do
-            rc=0
-            bash "$TOOL" "${ARGS[@]}" > record.json || rc=$?
-            case "$rc" in
-              0|1) ;;                     # graded (1 = graded but unknown — still labeled)
-              3)  unreadable_tries=$(( unreadable_tries + 1 ))
-                  if [ "$unreadable_tries" -lt "$max_unreadable_tries" ] && [ "$(date +%s)" -lt "$read_deadline" ]; then
-                    echo "PR read failed (attempt ${unreadable_tries}/${max_unreadable_tries}) — retrying in ${read_delay}s"
-                    sleep "$read_delay"; waited=$(( waited + read_delay ))
-                    read_delay=$(( read_delay * 2 )); [ "$read_delay" -le 60 ] || read_delay=60
-                    continue
-                  fi
-                  echo "PR unreadable via the API after ${unreadable_tries} attempt(s) — labeling ungraded"
-                  printf '{}' > record.json
-                  break ;;
-              *)  echo "grader failed (rc=$rc)"; exit 1 ;;   # setup/usage bug: fail loud
-            esac
-            pending="$(jq -r '.checks_pending_excl_self // false' record.json)"
-            state="$(jq -r '.checks_state // "none"' record.json)"
-            now="$(date +%s)"
-            [ "$now" -lt "$deadline" ] || break
-            if [ "$pending" = "true" ]; then
-              settled_once=0
-            elif [ "$state" = "none" ] && [ "$now" -lt "$empty_deadline" ]; then
-              # An EMPTY rollup is checks that have not registered yet, not CI
-              # that finished — exiting the poll here would apply a label that a
-              # check appearing a second later never revises. Bounded by a SHORT
-              # grace window rather than the whole budget, so a repo with
-              # genuinely no CI is not made to wait 25 minutes on every PR to
-              # arrive at the same honest R2.
-              settled_once=0
-            elif [ "$settled_once" -eq 0 ]; then
-              # First settled reading. Require it to REPEAT before labeling: one
-              # transiently-quiet poll is not a settled rollup.
-              settled_once=1
-            else
-              break
-            fi
-            sleep "$delay"; waited=$(( waited + delay ))
-            delay=$(( delay * 2 )); [ "$delay" -le 120 ] || delay=120
-          done
-          tier="$(jq -r '.risk.tier // "unknown"' record.json)"
-          echo "tier=$tier"   >> "$GITHUB_OUTPUT"
-          echo "waited=$waited" >> "$GITHUB_OUTPUT"
-          echo "graded tier: $tier (waited ${waited}s for the rollup)"
-
-      - name: Apply risk label
-        env:
-          TIER: ${{ steps.grade.outputs.tier }}
-          LABEL_MAP: ${{ inputs.label_map }}
-        run: |
-          set -uo pipefail
-          bash _pr_risk_tool/scripts/pr-risk/apply-risk-label.sh
+          bash _pr_risk_tool/scripts/pr-risk/grade-targets.sh
 
       - name: Step summary
         if: always()
         env:
           TIER: ${{ steps.grade.outputs.tier }}
           WAITED: ${{ steps.grade.outputs.waited }}
+          TARGETS: ${{ steps.grade.outputs.targets }}
         run: |
           set -uo pipefail
+          RESULTS=pr-risk-results.jsonl
+          # WHETHER THE FILE EXISTS AT ALL IS ITSELF EVIDENCE. The grade step truncates it once the
+          # target list parses, so ABSENT means no target was ever resolved (a usage error, or a
+          # step killed that early), while PRESENT-BUT-EMPTY means targets were resolved and the
+          # step then stopped before recording the first outcome. Those are different failures and
+          # get different wording.
+          HAD_RESULTS=1
+          [ -f "$RESULTS" ] || HAD_RESULTS=0
+          [ -f "$RESULTS" ] || : > "$RESULTS"
+          # COUNT THE RECORDED ROWS RATHER THAN TRUSTING THE STEP OUTPUTS. Every output above is
+          # written by the grade step's LAST lines, so a step killed by the job timeout or dying
+          # mid-batch emits none of them — and branching on an empty `targets` chose the
+          # single-target rendering, which prints row ONE and silently discards every other target
+          # already recorded. The cancelled-mid-batch run is exactly the case those records exist
+          # for. The per-status counts are derived here too, so the heading can never disagree with
+          # the table under it.
+          ROWS="$(jq -s 'length' "$RESULTS" 2>/dev/null || echo 0)"
+          COUNTS="$(jq -sr '[(map(select(.status == "graded")) | length),
+                            (map(select(.status == "ungraded")) | length),
+                            (map(select(.status == "failed")) | length),
+                            (map(select(.status == "skipped")) | length)] | @tsv' \
+                      "$RESULTS" 2>/dev/null || printf '0\t0\t0\t0')"
+          IFS=$'\t' read -r N_GRADED N_UNGRADED N_FAILED N_SKIPPED <<<"$COUNTS"
           {
-            echo "## PR risk grade: ${TIER:-unknown} (advisory)"
-            echo
-            if [ -s record.json ] && jq -e '.risk' record.json >/dev/null 2>&1; then
-              jq -r '
-                "Grade = worst(path_floor, provenance, reversibility) — \(.risk.reason)\n",
-                "| axis | tier | reason |", "|---|---|---|",
-                (.risk.axes | to_entries[] | "| \(.key) | \(.value.tier // "unknown") | \(.value.reason) |"),
-                "\nMap `\(.risk.map_version)` · registry `\(.risk.registry_version)` · waited \($waited)s for the rollup · checks `\(.checks_state // "none")`"
-              ' --arg waited "${WAITED:-0}" record.json
+            if [ "$ROWS" -eq 0 ]; then
+              # No target was even attempted — a usage error (an empty or malformed target list),
+              # which is a different failure from an unreadable PR and must not borrow its
+              # wording: no PR was named, so none "could not be read".
+              echo "## PR risk grade: none (advisory)"
+              echo
+              if [ "$HAD_RESULTS" = 0 ]; then
+                echo "No pull request was graded: the run resolved no target — either none was supplied, or the grade step was cancelled before it got one. On a \`workflow_dispatch\`, supply \`pr_number\` or \`pr_numbers\` — see the step log for the exact reason."
+              else
+                echo "No pull request was graded: targets WERE resolved, but the grade step recorded no outcome for any of them — it was cancelled or died before the first target finished. The dispatched numbers are in the step log; none of them was labeled."
+              fi
+            elif [ "$ROWS" -eq 1 ] && [ "${TARGETS:-1}" = 1 ]; then
+              # ONE target: the per-axis table, unchanged — this is what the event path renders.
+              one="$(jq -sc '.[0] // {}' "$RESULTS" 2>/dev/null || echo '{}')"
+              rec="$(jq -r '.record // ""'  <<<"$one")"
+              st="$(jq  -r '.status // ""'  <<<"$one")"
+              note="$(jq -r '.note // ""'   <<<"$one")"
+              # The HEADING tier falls back to the recorded row. `tier` is a step OUTPUT, so it is
+              # empty on a cancelled step — and heading a row that recorded R1 as "grade: unknown"
+              # contradicts the table printed directly under it.
+              head_tier="${TIER:-}"
+              [ -n "$head_tier" ] || head_tier="$(jq -r '.tier // "unknown"' <<<"$one")"
+              if [ "$st" = failed ]; then
+                # A FAILED TARGET NEVER RENDERS A GRADE TABLE, even when it HAS a record. A label
+                # write that 403s leaves the PR carrying the previous push's grade, and heading
+                # that outcome "PR risk grade: R1" with the full axis table under it reads as "R1
+                # was applied" — the one outcome where the label on the PR is not what the summary
+                # shows. The note says which input or write failed instead; reporting it as "could
+                # not be read via the API" would name the wrong cause.
+                echo "## PR risk grade: NOT APPLIED (advisory)"
+                echo
+                echo "Nothing was labeled: ${note:-see the step log for the reason}"
+              elif [ -n "$rec" ] && [ -s "$rec" ] && jq -e '.risk' "$rec" >/dev/null 2>&1; then
+                echo "## PR risk grade: ${head_tier:-unknown} (advisory)"
+                echo
+                jq -r '
+                  "Grade = worst(path_floor, provenance, reversibility) — \(.risk.reason)\n",
+                  "| axis | tier | reason |", "|---|---|---|",
+                  (.risk.axes | to_entries[] | "| \(.key) | \(.value.tier // "unknown") | \(.value.reason) |"),
+                  "\nMap `\(.risk.map_version)` · registry `\(.risk.registry_version)` · waited \($waited)s for the rollup · checks `\(.checks_state // "none")`"
+                ' --arg waited "${WAITED:-0}" "$rec"
+              else
+                echo "## PR risk grade: ${head_tier:-unknown} (advisory)"
+                echo
+                echo "The PR could not be read via the API; nothing was graded (labeled ungraded — this is NOT a low-risk verdict)."
+              fi
             else
-              echo "The PR could not be read via the API; nothing was graded (labeled ungraded — this is NOT a low-risk verdict)."
+              # A BATCH has no single tier and no room for N axis tables, so it reports one row
+              # per target. `not attempted` is listed as its own outcome rather than folded into
+              # the failures: those PRs are un-graded, not mis-graded, and re-dispatching exactly
+              # those numbers is the fix.
+              echo "## PR risk grades: ${N_GRADED} graded, ${N_UNGRADED} ungraded, ${N_FAILED} failed, ${N_SKIPPED} not attempted (advisory)"
+              echo
+              # A ROW COUNT SHORT OF THE TARGET COUNT MEANS THE STEP DID NOT FINISH. Say so: the
+              # un-recorded numbers were never graded, and silence there reads as "all covered".
+              case "${TARGETS:-}" in
+                ''|*[!0-9]*)
+                  echo "> The grade step never reported its own summary — it was cancelled or timed out. The rows below are what it had recorded when it stopped; anything else in the dispatched list was NOT graded."
+                  echo ;;
+                *)
+                  if [ "$TARGETS" -gt "$ROWS" ]; then
+                    echo "> Only ${ROWS} of ${TARGETS} targets were recorded — the grade step did not run to completion. The rest were NOT graded; re-dispatch those numbers."
+                    echo
+                  fi ;;
+              esac
+              echo "| pr | tier | label | base ref | waited | note |"
+              echo "|---|---|---|---|---|---|"
+              jq -r '"| #\(.pr) | \(.tier // "—") | \(.label // "—") | `\(.base_ref // "—")` | \(.waited)s | \(.note // "") |"' "$RESULTS"
             fi
             echo
             echo "This label routes nothing and gates nothing. Disagree with the grade? Add the \`risk-dispute\` label and say why in a comment — the grader never touches that label."

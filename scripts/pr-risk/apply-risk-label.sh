@@ -22,7 +22,10 @@
 #               Relabeling (e.g. a 1-indexed R1..R4 scheme) is a caller-side remap of the
 #               VALUES only; tier keys are fixed R0..R3 + unknown everywhere else.
 #   DRY_RUN     1 = print the plan, write nothing
-#   GH_TOKEN    token for gh (in CI: the job's GITHUB_TOKEN; needs issues: write)
+#   GH_TOKEN    token for gh (in CI: the job's GITHUB_TOKEN; needs pull-requests: write for
+#               the label add/remove on the PR — the labels endpoint is dual-mapped and
+#               issues:write alone 403s on a PR — plus issues: write to create the risk:*
+#               labels repo-side on first use)
 #
 # Missing labels are created on first use (color-coded, described), so enrolling a repo needs
 # no manual label setup.
@@ -88,13 +91,24 @@ fi
 # Encoded for the path only — the raw name is what we log, compare and send as a form field.
 enc() { jq -rn --arg s "$1" '$s | @uri'; }
 
+# EVERY WRITE BELOW REPORTS WHY IT FAILED. The two permissions this script needs both fail as a
+# bare 403, and with gh's stderr discarded the log said only `could not add label ...` — so the
+# single most likely misconfiguration (granting `issues: write` but not `pull-requests: write`,
+# which 403s on a PR because the labels endpoint is dual-mapped) was indistinguishable from a
+# network blip or a deleted PR. `ghq` keeps gh's own message and hands it to the caller's
+# fail/log text. It names endpoints and scopes, never PR content, so it is safe in a public log.
+ERRF="$(mktemp "${TMPDIR:-/tmp}/apply-risk-label-err.XXXXXX")" || die "mktemp failed"
+trap 'rm -f "$ERRF"' EXIT
+ghq() { gh "$@" 2>"$ERRF"; }
+gherr() { tr '\n' ' ' < "$ERRF" | sed 's/[[:space:]]*$//'; }
+
 # Current labels on the PR (a PR is an issue to the labels API). --paginate because the endpoint
 # returns 30 per page: on a PR with more than 30 labels a stale grader-owned label falls off page
 # one, `has()` reports false, the removal loop skips it, and the PR carries two contradictory risk
 # labels at once — the exact state the ownership contract above promises cannot happen.
-current="$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/labels?per_page=100" --jq '.[].name' 2>/dev/null \
+current="$(ghq api --paginate "repos/$REPO/issues/$PR_NUMBER/labels?per_page=100" --jq '.[].name' \
            | jq -Rsc 'split("\n") | map(select(length > 0))')" \
-  || fail "could not read labels on $REPO#$PR_NUMBER"
+  || fail "could not read labels on $REPO#$PR_NUMBER: $(gherr)"
 
 has() { jq -e --arg l "$1" 'index($l) != null' >/dev/null 2>&1 <<<"$current"; }
 
@@ -102,24 +116,41 @@ has() { jq -e --arg l "$1" 'index($l) != null' >/dev/null 2>&1 <<<"$current"; }
 for l in "${OWNED[@]}"; do
   [ "$l" = "$TARGET" ] && continue
   if has "$l"; then
-    gh api -X DELETE "repos/$REPO/issues/$PR_NUMBER/labels/$(enc "$l")" >/dev/null 2>&1 \
-      || fail "could not remove stale label '$l' from $REPO#$PR_NUMBER"
-    log "removed stale '$l'"
+    # `fail` exits BEFORE the target is added, so a 403 here leaves the PR carrying the PREVIOUS
+    # push's grade for changed code. That is why the message has to name the resulting state and
+    # the cause: the red check is the only signal, and a reader must not read the stale label as
+    # a current verdict.
+    #
+    # A 404 IS NOT A FAILURE HERE. It means the label is already off the PR — the state this loop
+    # is trying to reach. The read above is a snapshot, so anything that removes the label between
+    # that read and this DELETE (a human, or a concurrent grading run of the same PR, which a
+    # batch dispatch can overlap with an event run) made it 404. Failing on that painted a red
+    # check and skipped the target label for a PR that was in the desired state.
+    if ! ghq api -X DELETE "repos/$REPO/issues/$PR_NUMBER/labels/$(enc "$l")" >/dev/null; then
+      case "$(gherr)" in
+        *"(HTTP 404)"*) log "stale '$l' was already gone (404) — treating it as removed" ;;
+        *) fail "could not remove stale label '$l' from $REPO#$PR_NUMBER: $(gherr) — '$TARGET' was NOT applied, so the PR still carries the STALE grade '$l'" ;;
+      esac
+    else
+      log "removed stale '$l'"
+    fi
   fi
 done
 
 if has "$TARGET"; then
   log "already labeled '$TARGET' — nothing to do"
 else
-  # Ensure the label exists in the repo first, so enrollment needs no manual label setup.
+  # Ensure the label exists in the repo first, so enrollment needs no manual label setup. This
+  # probe keeps its own 2>/dev/null: a 404 here is the EXPECTED first-use answer, and routing it
+  # through ghq would leave that 404 text in $ERRF to be misreported by a later failure.
   if ! gh api "repos/$REPO/labels/$(enc "$TARGET")" >/dev/null 2>&1; then
-    gh api -X POST "repos/$REPO/labels" \
+    ghq api -X POST "repos/$REPO/labels" \
       -f name="$TARGET" -f color="$(color_for "$TIER")" \
-      -f description="PR risk grade (advisory shadow check; grader-owned)" >/dev/null 2>&1 \
-      || log "label '$TARGET' could not be pre-created (may already exist) — trying the add anyway"
+      -f description="PR risk grade (advisory shadow check; grader-owned)" >/dev/null \
+      || log "label '$TARGET' could not be pre-created (may already exist): $(gherr) — trying the add anyway"
   fi
-  gh api -X POST "repos/$REPO/issues/$PR_NUMBER/labels" -f "labels[]=$TARGET" >/dev/null \
-    || fail "could not add label '$TARGET' to $REPO#$PR_NUMBER"
+  ghq api -X POST "repos/$REPO/issues/$PR_NUMBER/labels" -f "labels[]=$TARGET" >/dev/null \
+    || fail "could not add label '$TARGET' to $REPO#$PR_NUMBER: $(gherr)"
   log "added '$TARGET'"
 fi
 
