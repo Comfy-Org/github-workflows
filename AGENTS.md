@@ -62,12 +62,16 @@ tests — run the matching command above for whatever you touched.
 - `README.md` — the public workflow catalog: per-workflow purpose, the SHA-pin
   usage pattern, and the versioning policy. Keep its table in sync when you add
   a workflow.
+- `docs/callers/` — one setup guide per reusable workflow: a complete,
+  copy-pasteable caller (including `on:` and the exact permission grant),
+  required secrets/vars, and per-workflow footguns. Add a page when you add a
+  workflow; the README table links to it.
 
 ## Reusable workflow catalog (what each does)
 
 - `cursor-review.yml` — label-triggered multi-model PR review (4-lab × 2-type
-  panel → judge → one PR review with severity badges). Advisory by default;
-  `blocking: true` gates on unresolved findings.
+  panel → judge → one PR review with severity badges). Advisory: it posts a
+  review, it does not gate.
 - `cursor-review-auto-label.yml` — translates PR assignment/open into the review
   label (via an app token, since a `GITHUB_TOKEN`-applied label won't fire runs).
 - `groom.yml` — scheduled/dispatch org-wide code-cleanup sweep: read-only finder
@@ -100,7 +104,7 @@ tests — run the matching command above for whatever you touched.
   workflow files, commit messages, and PR text.
 - **Pin everything by full commit SHA**, with a trailing `# v1` comment — both
   the `uses:` in callers and every third-party action here. Bare `@v1` fails the
-  pin-validation (`pinact`, `zizmor`) that consumer CI runs. See README "Usage".
+  pin-validation (`pinact`, `zizmor`) that consumer CI runs. See README "Pinning".
 - **Scripts are the single source of truth**, loaded at run time from a pinned
   ref of THIS repo — never from the caller's checkout. That's what makes the
   reviewer/checker tamper-proof: a PR can't rewrite the logic judging it. The
@@ -119,9 +123,18 @@ tests — run the matching command above for whatever you touched.
   `ci-groom.yml`. When auditing, compare the roster against reality in both
   directions — a roster entry whose caller file does not exist is equally broken.
 - **New reusable workflow?** `on: workflow_call` + a header comment documenting
-  inputs/secrets/triggers + a caller-pattern example, then update the README
-  table (README "Adding a new reusable workflow"). Move the floating major tag
+  inputs/secrets/triggers + a caller-pattern example, then a
+  `docs/callers/<name>.md` setup guide and a row in the README table (see
+  CONTRIBUTING.md "Adding a new reusable workflow"). Move the floating major tag
   after merge.
+- **Document only inputs that exist.** GitHub rejects an unknown input at startup,
+  so a phantom input in the docs is a broken caller for whoever copies it. Check
+  `on.workflow_call.inputs` before documenting a knob. The `cursor-review`
+  `blocking:` input is the worked example: it shipped in #16, was deleted from the
+  workflow by #31 (a judge-extraction fix) while its docs and
+  `gate-unresolved.py` were left behind, and the stale docs outlived it here, in
+  the README, and in `.github/cursor-review/README.md`. **Deleting an input is a
+  docs change too** — grep the repo for its name in the same commit.
 - **Versioning:** semver-style major tags (`v1`, `v2`). Breaking changes bump the
   major; backwards-compatible changes move the existing tag in place
   (`git tag -f v1 <sha> && git push -f origin v1`). This tag force-move is the
@@ -137,6 +150,9 @@ tests — run the matching command above for whatever you touched.
 ## Deeper docs
 
 - [`README.md`](README.md) — public catalog, SHA-pin usage, versioning.
+- [`docs/callers/`](docs/callers/) — per-workflow setup guides (copy-pasteable callers).
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — tests to run, breaking-change rules, enrollment.
+- [`SECURITY.md`](SECURITY.md) — disclosure process + the agent credential boundary.
 - [`.github/cursor-review/README.md`](.github/cursor-review/README.md) — review panel internals + adoption.
 - [`.github/agents-md-integrity/README.md`](.github/agents-md-integrity/README.md) — the checker + its knobs.
 - [`.github/bump-callers/README.md`](.github/bump-callers/README.md) — the shared bumper + its fleets.
