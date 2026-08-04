@@ -37,3 +37,26 @@ jobs:
 
       - name: Run groom ledger unit tests
         run: python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
+
+  # Deterministic proofs of the agent-sandbox.sh confinement contract and the
+  # broker.mjs credential proxy (BE-4302, phase 1). No claude, no API key, no
+  # spend — every property is asserted with `bash -c` as the sandboxed command.
+  # Runs here (a PR-gating test workflow), NOT in ci-groom.yml: ci-groom.yml is the
+  # scheduled groom CALLER that deliberately never fires on a PR, so a job there
+  # could never be seen green on this change. shellcheck (repo convention) + node +
+  # openssl + curl are preinstalled on ubuntu-latest; the wrapper's preflight
+  # installs bubblewrap + the AppArmor profile the runner image needs.
+  sandbox-tests:
+    name: sandbox-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Shellcheck the sandbox scripts
+        run: shellcheck -x .github/groom/agent-sandbox.sh .github/groom/tests/sandbox-tests.sh
+
+      - name: Prove sandbox confinement + broker proxy (no API spend)
+        run: bash .github/groom/tests/sandbox-tests.sh
