@@ -280,7 +280,7 @@ eq "neither raw value is emitted or copied elsewhere, only sanitized or tested" 
 # Coverage self-check for the scan above, in the same spirit as the ones on the other anchors: if
 # the trigger pattern matched nothing at all — a renamed env key, a reshaped script — the `eq`
 # passes vacuously over an empty scan and reports a green boundary that was never inspected.
-ntouch=$(printf '%s\n' "$script" | grep -c '\${\?\(WORKFLOWS_REF\|JOB_WORKFLOW_SHA\)')
+ntouch=$(printf '%s\n' "$script" | grep -cE '\$\{?(WORKFLOWS_REF|JOB_WORKFLOW_SHA)')
 if [ "$ntouch" -ge 5 ]; then ok "the emit scan saw both guarded values ($ntouch lines)"
 else bad "the emit scan saw both guarded values" "$ntouch lines — anchors are stale, coverage is vacuous"; fi
 no "the input reaches the script only via env:" "$script" '${{'
