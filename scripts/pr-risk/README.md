@@ -62,6 +62,15 @@ Two CI-specific mechanics worth knowing:
   one. Enroll pr-risk as its **own workflow** rather than a job inside an
   existing CI workflow — a job sharing a run with the rest of CI excludes its
   siblings too, and lands on the honest R2 floor instead of a full rollup.
+- **A caller grants the UNION of every job's `permissions:`, including jobs it
+  will never run.** GitHub validates each nested job's *declaration* against the
+  caller's block at startup, before any job `if:` is evaluated, so `checks:
+  write` — declared by the `publish-check` job — is required of every caller
+  whatever `check_run` is set to. Leaving `check_run` false skips the job and
+  publishes nothing; it does not excuse the grant. **Moving an existing pin onto
+  a version that added a job? Add its permission in the same PR** — a bump alone
+  fails the caller's next run at startup with an opaque "workflow file issue".
+  The copy-paste block lives in [`pr-risk.yml`](../../.github/workflows/pr-risk.yml)'s header.
 - **The label is applied with the plain `GITHUB_TOKEN`**, which cannot fire
   `labeled` triggers — the shadow check is structurally unable to start a
   workflow cascade. Later phases that WANT label-triggered routing switch to an
@@ -128,17 +137,32 @@ and a raw `#` truncates the URL into exactly that empty-ref read. A 404 for the
 distinguished from a 404 for the **file** and fails the target instead of
 falling back to the generic map.
 
-Two operational caveats for a backfill:
+Operational caveats for a backfill:
 
 - **A batch cannot serialize per-PR.** One run covers N pull requests and a run
   belongs to exactly one concurrency group, so a batch overlapping a
-  `pull_request` run for one of its own numbers can interleave with it — the
-  label sync is a read-current / delete-stale / add-target sequence, so that PR
-  may briefly carry two `risk:*` labels (the next grade re-syncs it, and the
-  label gates nothing meanwhile). Dispatch when the queue is quiet, and use
-  `pr_number` when you want the per-PR group to serialize against event runs. A
-  DELETE of a label a concurrent run already removed is treated as removed, not
-  as a failure.
+  `pull_request` run for one of its own numbers will interleave with it. The
+  label sync is a single atomic `PUT` of the PR's whole label set, so that
+  interleaving cannot leave the PR carrying two `risk:*` labels: the two writers
+  end last-writer-wins with exactly one — possibly the staler tier, which gates
+  nothing meanwhile and which the next grade re-syncs, with the caveat that on
+  the *last* push to a PR there is no next grade (a superseded run's PUT can
+  still land after the winner's, since cancellation is not instantaneous), so
+  re-dispatch on `pr_number` if a final grade looks wrong. The residual it costs
+  instead is narrower, but it cuts both ways: the PUT is built from a snapshot
+  read, so a **non-owned** label added in the read→PUT window is dropped
+  (`risk-dispute` included — re-add a dispute that lands in that instant) and one
+  **removed** in that window is resurrected. The window opens only on a run that
+  actually changes the grade, and is about one API round-trip — three on the
+  first grade in a repo, where the label pre-create sits inside it. A drop is not
+  invisible: GitHub records it on the PR timeline as an `unlabeled` event by the
+  grader token. Dispatch when the queue is quiet, and use `pr_number` when you
+  want the per-PR group to serialize a re-grade against event runs.
+- **Remapping `label_map` orphans the old names.** Ownership is defined by the
+  *current* map, so labels applied under a previous one are no longer owned:
+  they ride through every future PUT beside the new target and no re-grade will
+  clear them. Delete the retired label names repo-side once, as part of the
+  remap.
 - **The pre-grader reads retry.** Rate limits are global, not per-PR, so the
   base-ref and override reads — the first hop for every target — retry a
   transient failure with backoff, as the grader already does. Without it one
@@ -194,6 +218,21 @@ Labels are created on first use, color-coded green → red (gray for ungraded).
   its connection capped the list at 100, which put exactly the PRs a risk grade
   helps most in the ungraded lane. A read that comes back short of `changedFiles`
   is still `unknown`.
+- `publish-risk-surfaces.sh` — the two **opt-in** publish surfaces (`sticky_comment:` /
+  `check_run:`, both `false` by default): the sticky PR comment and the Check Run render. The
+  comment is deliberately **one line above the fold** — tier, the axis that decided it, its
+  reason, plus a concentration fragment when the path axis is what decided — with the formula,
+  the per-axis table, the per-file breakdown and the caveats inside a collapsed `<details>` and
+  the dispute checkbox below it. It is created once and updated in place. The long form lives in
+  the Check Run instead, because this comment lands on PRs that already carry CodeRabbit and an
+  8-cell review panel, and an advisory grade nothing routes on has the weakest claim on the
+  reader's scroll. Every PR-controlled string it renders is escaped here — a filename may
+  legally contain `|`, a backtick or a newline, and raw it could break out of its table row and
+  forge a pre-ticked dispute checkbox that the next re-grade reads back as a real reviewer
+  disagreement. The body is bounded under GitHub's 65536-char comment limit by construction, and
+  no failure in it can redden a PR. `RENDER_ONLY=1` emits the surfaces and writes nothing, which
+  is how the Check Run is rendered in the grading job and POSTed from the job that holds
+  `checks: write`.
 - `grade-targets.sh` — the orchestration layer, extracted from `pr-risk.yml`'s
   inline job body so the event path and the by-number path cannot drift into two
   copies of it. Per target: resolve the base ref, fetch that ref's override
@@ -201,8 +240,12 @@ Labels are created on first use, color-coded green → red (gray for ungraded).
   label. Grades one target or a list through the same code, records each
   outcome, and never lets one bad target abandon the rest. It computes nothing
   about risk.
-- `apply-risk-label.sh` — the one write. Owns exactly the five mapped labels:
-  removes stale ones, applies the computed one, touches nothing else.
+- `apply-risk-label.sh` — the one write, and it is literally one request: a
+  single atomic `PUT` of the PR's full label set — every label the script does
+  not own, carried through verbatim from the snapshot read, plus the computed
+  one. Owns exactly the five mapped labels (matched case-insensitively, as GitHub
+  label identity is), so a PR it has written to carries exactly one of them even
+  when two grading runs race. An already-in-sync PR writes nothing at all.
 - `risk-map.v0.json` / `runbook-registry.v0.json` — the generic defaults.
 - `tests/` — hermetic suites (synthetic records + a stubbed `gh`); run via
   [`test-pr-risk.yml`](../../.github/workflows/test-pr-risk.yml).

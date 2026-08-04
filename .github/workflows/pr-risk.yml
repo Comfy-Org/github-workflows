@@ -14,7 +14,26 @@ name: PR Risk Grade (reusable)
 #
 # The grader and its default risk map load from THIS repo at the pinned `workflows_ref`,
 # never from the graded PR's checkout (no PR code is checked out at all) — a PR cannot edit
-# the rules that judge it. A consumer repo sharpens the generic defaults by committing
+# the rules that judge it. `workflows_ref` has deliberately no default and its SHAPE is now
+# ENFORCED: every job that checks it out fails BEFORE the checkout unless the value is a full
+# 40-hex lowercase commit SHA. That rejects everything MUTABLE — a branch, a tag,
+# `refs/pull/N/head` — so the grading logic cannot change after the caller was reviewed, and
+# "pin it, don't float it" is machine-checked rather than trusted prose in this header.
+#
+# WHAT SHAPE DOES NOT PROVE is WHICH commit it is. A fork of this PUBLIC repo shares its object
+# store, so a fork-authored commit is a perfectly well-shaped 40-hex SHA and would be checked out
+# into a job holding the caller's `pull-requests: write` token. Nothing inside this file can close
+# that: the check it wants is "`workflows_ref` equals the commit the caller's `uses:` resolved to",
+# and the runner does NOT expose that commit to the workflow — `github.workflow_sha` is the
+# CALLER's top-level workflow file, and `job_workflow_sha` (the value that would answer this)
+# exists only as an OIDC token claim, which would mean an `id-token: write` grant from every
+# caller and a token exchange in a job that today holds `permissions: {}`. Until that is designed,
+# this is bounded by REVIEW OF THE CALLER on its base branch — which is also the only thing that
+# can see the ref the caller actually wrote: `uses:` must name this repo at a full commit SHA and
+# `with: workflows_ref:` must be that same SHA written out LITERALLY, never an expression and
+# never a tag. Call this workflow DIRECTLY; a nested `workflow_call` chain through an org wrapper
+# is unsupported. See the `workflows_ref` input for the detail.
+# A consumer repo sharpens the generic defaults by committing
 # `.github/risk.json` (map) / `.github/risk-runbooks.json` (runbook registry), which are read
 # from the PR's BASE ref: present-but-invalid fails the run loudly; absent falls back to the
 # defaults in scripts/pr-risk/.
@@ -62,13 +81,23 @@ name: PR Risk Grade (reusable)
 # that silently grades nothing is worse than no button.
 #
 # A BATCH CANNOT SERIALIZE PER-PR, and no concurrency key can make it: one run covers N pull
-# requests and a run belongs to exactly one group. The label sync is a read-current /
-# delete-stale / add-target sequence, so a batch that overlaps a `pull_request` run for one of ITS
-# numbers can interleave with it and leave that PR briefly carrying two `risk:*` labels — the next
-# grade of that PR re-syncs it to one, and the label gates nothing in the meantime. Two mitigations
-# and one limit: dispatch a backfill when the queue is quiet; prefer `pr_number` when you want the
-# per-PR concurrency group to serialize a re-grade against event runs; and a DELETE of a label
-# another run already removed is tolerated rather than painted red (see apply-risk-label.sh).
+# requests and a run belongs to exactly one group, so a batch that overlaps a `pull_request` run for
+# one of ITS numbers WILL interleave with it. That is now safe to let happen: the label sync is a
+# single atomic `PUT` of the PR's whole label set (see apply-risk-label.sh), so two writers end
+# last-writer-wins with still EXACTLY ONE `risk:*` label — possibly the staler tier, which gates
+# nothing meanwhile and which the next grade re-syncs (on the LAST push there is no next grade, so
+# re-dispatch on `pr_number` if a final grade looks wrong). It can no longer leave two contradictory
+# labels on a PR under one `label_map`; remapping `label_map` orphans the old names, which is a
+# one-time repo-side cleanup. What the shape does cost is a narrower residual: the PUT is built from
+# a snapshot read, so a NON-owned label added by someone else in the read→PUT window is dropped
+# (`risk-dispute` included) and one removed in it is resurrected. That window opens only on a run
+# that actually changes the grade and is roughly one API round-trip — about three on the first
+# grade in a repo, where the label pre-create sits inside it. The drop is recorded on the PR
+# timeline as an `unlabeled` event, so re-add a dispute that happens to land in that instant.
+# Still prefer `pr_number` when you want the
+# per-PR concurrency group to serialize a re-grade against event runs (with `cancel-in-progress`
+# that is also how a superseded wait gets cut short), and dispatch a backfill when the queue is
+# quiet.
 #
 # SECRETS: none. This workflow declares no `secrets:` inputs and callers pass none — the only
 # credential in the job is the automatic `GITHUB_TOKEN` (`github.token`), used for the PR read
@@ -135,12 +164,23 @@ name: PR Risk Grade (reusable)
 #         pull-requests: write  # the label write itself — labeling a PR rides the
 #                               # pull-requests permission, not issues (the labels
 #                               # endpoint is dual-mapped by what the "issue" is)
-#         checks: read          # the check rollup the reversibility axis reads
+#         checks: write         # REQUIRED OF EVERY CALLER, opted into `check_run` or not — see
+#                               # GRANT ALL SEVEN below. The `publish-check` job DECLARES
+#                               # `checks: write`, and GitHub validates every nested job's
+#                               # declaration against this block at STARTUP; a job `if:` cannot
+#                               # save a short grant, because nothing has run yet when the check
+#                               # is made. Only the grade job's own `checks: read` (the rollup
+#                               # the reversibility axis reads) is used unless `check_run: true`.
 #         actions: read         # the rollup query walks CheckRun -> checkSuite ->
 #                               # workflowRun (an Actions resource) for self-exclusion
 #         statuses: read
 #       uses: Comfy-Org/github-workflows/.github/workflows/pr-risk.yml@<sha>  # v1
 #       with:
+#         # ENFORCED, not merely asked for: it must be a full 40-hex LOWERCASE commit SHA or the
+#         # run fails before the tool checkout — a branch, a tag or `refs/pull/N/head` is rejected.
+#         # Write out the SAME SHA as the `uses:` above, LITERALLY: that the two agree is what
+#         # review of this caller checks, and it is not something the workflow can see. See the
+#         # paragraph about the pinned ref at the top of this header for why.
 #         workflows_ref: <same sha>
 #         # OFF BY DEFAULT. Enrolling and switching on are two decisions: land the caller, get
 #         # it reviewed, then start grading. Either pin it on here, or leave this out and set
@@ -162,13 +202,22 @@ name: PR Risk Grade (reusable)
 # enroller. What this workflow CAN do, and does, is refuse to be a silent no-op once it is
 # actually reached: a run with no resolvable target fails with a message naming both inputs.
 #
-# GRANT ALL SIX OR THE RUN NEVER STARTS. A reusable workflow can only NARROW the caller's
-# token, never elevate it, so a caller whose block is short of what the `grade` job declares is
-# rejected by GitHub before any step executes ("is requesting 'pull-requests: write', but is
-# only allowed 'pull-requests: read'") — the check goes red with no grade, and the PR keeps
+# GRANT ALL SEVEN OR THE RUN NEVER STARTS. A reusable workflow can only NARROW the caller's
+# token, never elevate it, so a caller whose block is short of what ANY of this workflow's jobs
+# declares is rejected by GitHub before any step executes ("is requesting 'pull-requests: write',
+# but is only allowed 'pull-requests: read'") — the check goes red with no grade, and the PR keeps
 # whatever label the previous push left rather than degrading to `risk:ungraded`. Copy the
 # block above verbatim when you enroll, and re-check it against this header whenever you move
 # the SHA pin.
+#
+# THE UNION INCLUDES JOBS THAT NEVER RUN. GitHub checks the DECLARATION on every nested job at
+# startup, not the set of jobs that actually get scheduled, so `checks: write` is required even
+# from a caller leaving `check_run` false and skipping the `publish-check` job entirely. An `if:`
+# is a runtime condition and nothing has run yet when the grant is validated. This is the same
+# union rule groom.yml documents, learned the same way: a short grant fails the whole run with an
+# opaque "workflow file issue" and no job-level detail. IF YOU ARE MOVING AN EXISTING PIN ONTO
+# THIS COMMIT, ADD `checks: write` TO THE CALLER IN THE SAME PR — a pin bump alone will fail the
+# caller's next run at startup.
 
 on:
   workflow_call:
@@ -247,6 +296,58 @@ on:
         type: string
         required: false
         default: .github/risk-runbooks.json
+      sticky_comment:
+        description: >-
+          Publish ONE sticky PR comment, and keep it SMALL: the visible body is a single line —
+          the tier, the axis that decided it, that axis's reason, and (only when the path axis
+          decided) how much of the diff carries it. Everything else — the worst() formula, the
+          per-axis reasons, the per-file path-axis breakdown, the map versions and the caveats —
+          is folded into a collapsed `<details>`, with the "this grade is wrong" checkbox below
+          it. An advisory grade nothing routes on does not get to out-shout the review panel and
+          CodeRabbit on the same PR; the Check Run keeps the long form for anyone who wants it.
+          Created once and UPDATED IN PLACE on every re-grade, so N pushes leave one comment.
+
+
+          DEFAULTS TO FALSE. A bot comment on every PR across every enrolled repo is a visible
+          behaviour change, so it is a per-consumer decision — the same precedent `pr-size.yml`
+          set with `mode: warn`. A caller that does not opt in behaves byte-identically to
+          before this input existed: nothing is rendered, nothing is posted, and no dispute
+          label is touched.
+
+
+          Ticking the checkbox applies `risk-grade-disputed` on the next grade, and a re-grade
+          preserves the tick rather than resetting it. That label is DISTINCT from the
+          human-owned `risk-dispute` convention, which the grader still never touches: one is a
+          machine-maintained mirror of a checkbox, rewritten on every grade; the other is a
+          human's own label. Needs no permission beyond the `pull-requests: write` the grade job
+          already holds for the label.
+        type: boolean
+        required: false
+        default: false
+      check_run:
+        description: >-
+          Publish a Check Run on the PR's head commit carrying the tier and the reason — the
+          immutable, timestamped, commit-attached record a label cannot be (a label is mutable
+          and carries no history). Its conclusion is hardcoded `neutral`, so it cannot fail a PR
+          even if a repo later marks it required.
+
+
+          DEFAULTS TO FALSE — but the `checks: write` it needs is REQUIRED OF EVERY CALLER
+          REGARDLESS, because the `publish-check` job declares it and GitHub validates every
+          nested job's declaration against the caller's block at STARTUP, before any `if:` is
+          evaluated. Leaving this false skips the job and publishes nothing; it does NOT excuse
+          the grant. A caller moving its pin onto this version must add `checks: write` in the
+          same PR or its next run fails before a step executes. The separate job still earns its
+          keep: it is the only place `checks: write` is ever HELD, and it reads nothing from a
+          pull request, so no PR-controlled text is ever rendered under the elevated token.
+        type: boolean
+        required: false
+        default: false
+      check_name:
+        description: Name of the published Check Run (only used when `check_run` is true).
+        type: string
+        required: false
+        default: PR risk (advisory)
       workflows_ref:
         description: >-
           Ref of Comfy-Org/github-workflows to load the grader + default map
@@ -256,17 +357,70 @@ on:
           so the two halves of one tool drifted apart and the grading logic
           stayed mutable after review. A supply chain with a floating link in it
           is not a chain.
+
+
+          ITS SHAPE IS ENFORCED before the tool checkout: exactly 40 characters,
+          every one of them in `[0-9a-f]`. Branches, tags and `refs/pull/N/head`
+          are mutable, so they are rejected rather than documented against; a
+          multi-line value, trailing whitespace and uppercase hex are rejected
+          with them, since this value is handed to `actions/checkout` verbatim.
+
+
+          THAT IS ONE AXIS, AND IT IS THE ONLY ONE AVAILABLE FROM IN HERE. Shape
+          proves the ref is IMMUTABLE; it says nothing about WHICH commit it
+          names. A fork of this PUBLIC repo shares its object store, so a
+          fork-authored commit is as well-shaped as any other and would be
+          checked out into a job holding the caller's write token; equally, a pin
+          left behind when `uses:` moved still passes. The test that would close
+          both is "equal to the commit `uses:` resolved to for this job" — and
+          the runner does not expose that commit to the workflow.
+          `github.workflow_sha` is the CALLER's top-level workflow file, not this
+          one; the value that would answer it, `job_workflow_sha`, exists only as
+          an OIDC token claim, which means an `id-token: write` grant from every
+          caller plus a token exchange in a job that today holds
+          `permissions: {}`. Adding that is a caller-contract change and is
+          tracked separately — do not assume this input's provenance is checked.
+
+
+          SO REVIEW OF THE CALLER IS WHAT BOUNDS IT, and it is the only place
+          that CAN: the ref the caller actually wrote in `uses:` is never sent
+          here, so no check inside this workflow can tell a SHA-pinned caller
+          from a `@v1` one passing whatever that tag currently points at, nor a
+          written-out SHA from a context expression that re-resolves every run.
+          WHEN REVIEWING A CALLER, require `uses:` at a full commit SHA of this
+          repo (org policy already does — a floating one fails the pin-validation
+          consumer CI runs) and `with: workflows_ref:` set to that same SHA
+          LITERALLY, character-for-character. An expression of any kind here, and
+          the contract is decoration.
+
+
+          CALL IT DIRECTLY — a nested `workflow_call` chain (caller → an org
+          wrapper workflow → this one) is NOT supported: the wrapper's own pin
+          and this input name different files, and nothing reconciles them.
+          Name `pr-risk.yml` in the caller's `uses:`.
         type: string
         required: true
       enabled:
         description: >-
-          Whether to grade at all. DEFAULTS TO FALSE: enrolling this workflow and
-          switching it on are two separate decisions, so a repo can land the
-          caller, get it reviewed, and start grading later — or stop grading
-          without reverting anything. When it resolves false the `grade` job does
-          not run: nothing is read, nothing is labelled, and no existing `risk:*`
-          label is touched (a disabled run leaves whatever the last enabled one
-          left, it does not clean up).
+          Whether to grade AUTOMATICALLY. DEFAULTS TO FALSE: enrolling this
+          workflow and switching it on are two separate decisions, so a repo can
+          land the caller, get it reviewed, and start grading later — or stop
+          grading without reverting anything. When it resolves false a
+          `pull_request` run does not grade: nothing is read, nothing is
+          labelled, and no existing `risk:*` label is touched (a disabled run
+          leaves whatever the last enabled one left, it does not clean up).
+
+
+          A MANUAL `workflow_dispatch` GRADES REGARDLESS. Dispatching requires
+          write access and is an explicit, attributed act, so there is no
+          unattended behaviour left for this switch to govern — and without that
+          exemption the staged rollout this input exists for cannot happen: a
+          repo enrolled OFF could not grade even one PR to see what the grader
+          would say, so "try it here before turning it on" would require turning
+          it on. The cost, stated plainly: false is a MUTE on the PR stream, not
+          a lockout. A repo needing the harder guarantee should remove the
+          caller — nothing here can bind a maintainer who can edit the workflow
+          file anyway.
 
 
           `vars.RISK_CONFIG` on the CALLING repo OVERRIDES this, in both
@@ -279,6 +433,18 @@ on:
           empty, not an object, or carries no boolean `enabled` — a malformed
           variable must never be the reason a repo silently stops grading, so it
           degrades to this value and says so in an annotation.
+
+
+          SCOPE OF THE KILL SWITCH: it stops the GRADING, not a broken
+          enrollment. The `workflows_ref` pin contract is enforced BEFORE this
+          resolves and is not subject to it — the resolver script is itself
+          loaded from `workflows_ref`, so there is no point in the run at which a
+          mutable pin could be read as "switched off" without first checking out
+          the very ref under suspicion. A caller pinned to a branch or a tag
+          therefore fails red on every PR even with `{"enabled": false}` set. The
+          fix is the one-line repin (or dropping the caller) — both PRs, but a
+          caller that cannot say which revision of the tool it runs is not in a
+          state the variable is meant to cover.
         type: boolean
         required: false
         default: false
@@ -300,6 +466,64 @@ jobs:
     outputs:
       enabled: ${{ steps.resolve.outputs.enabled }}
     steps:
+      # THE PIN CONTRACT IS ENFORCED, NOT DOCUMENTED. The ref below supplies the code that runs
+      # in this job, so its SHAPE is checked before any checkout happens: a mutable ref (branch,
+      # tag, `refs/pull/N/head`) means that code can change after the caller was reviewed, and
+      # only a full commit SHA is immutable.
+      #
+      # SHAPE IS THE ONLY AXIS THIS FILE CAN CHECK, so do not read it as more. It does not say
+      # WHICH commit the ref names: a fork of this PUBLIC repo shares its object store, so a
+      # fork-authored 40-hex SHA is a perfectly well-shaped ref, and a pin left behind when
+      # `uses:` moved is too. Both would be closed by "equal to the commit `uses:` resolved to
+      # for this job" — but the runner does not hand that commit to the workflow.
+      # `github.workflow_sha` is the CALLER's top-level workflow file; `job_workflow_sha`, which
+      # is the value that would answer it, is an OIDC token CLAIM, not a `github` context
+      # property (`actionlint` rejects `github.job_workflow_sha`, and reading the claim needs
+      # `id-token: write` from every caller plus an exchange in a job that holds `permissions: {}`
+      # today). Reviewing the caller is what bounds that, and it is the only thing that can.
+      #
+      # Enforced in the WORKFLOW, not in a script: the scripts are what the ref loads, so a
+      # script-side check would sit inside the blast radius it is meant to bound. EVERY job that
+      # checks out `workflows_ref` re-asserts this itself — `grade` does not inherit its safety
+      # from this job's step, so neither one can be made unsafe by a later `if:` or a re-ordering
+      # of the graph. This is also the FIRST checkout in the run, so a bad pin is reported before
+      # any of this repo's code has executed anywhere.
+      #
+      # The value arrives via `env:` and is never interpolated into the script body — inline
+      # `${{ }}` of the very input being validated is a shell-injection vector. The two copies of
+      # this step are byte-identical on purpose, and scripts/pr-risk/tests/test_pin_contract.sh
+      # pins this step's executable body verbatim, fails the build if the copies drift apart, and
+      # fails it if a job grows a `workflows_ref` checkout without one.
+      - name: Enforce workflows_ref pin contract
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+        run: |
+          set -euo pipefail
+          # Never interpolate a raw value into a `::error::`. A multi-line value — exactly what the
+          # length/character test below exists to catch — would end the annotation at the first
+          # newline and leave the remainder to be re-parsed by the runner as workflow commands
+          # (`::add-mask::`, `::stop-commands::`, a forged `::notice::`) in a PUBLIC log. Anything
+          # outside the ref alphabet becomes `?` and the result is truncated, so what is echoed is
+          # always one bounded line.
+          safe_ref=$(printf '%s' "$WORKFLOWS_REF" | tr -c 'A-Za-z0-9._/-' '?')
+          safe_ref=${safe_ref:0:64}
+          # LENGTH + CHARACTER CLASS, not `grep -Eq '^[0-9a-f]{40}$'` and not `[[ =~ ]]`: both raise
+          # an anchoring question this form does not have. `grep` anchors `^…$` per LINE, so a
+          # multi-line value carrying one SHA-shaped line passes it and is then handed to checkout
+          # in full; `[[ =~ ]]` anchors the whole string, but whether `$` may ALSO match just before
+          # a trailing newline is a libc-dependent detail no trust boundary should rest on. A length
+          # test plus "contains a character outside [0-9a-f]" has no anchors at all — a newline, a
+          # space or an uppercase letter is simply a character outside the class.
+          #
+          # LOWERCASE ONLY, deliberately. The value is handed to `actions/checkout` VERBATIM, so
+          # accepting a spelling the fetch may not resolve would trade this step's clear message for
+          # an obscure failure one step later — the opposite of the point. Everything that emits a
+          # SHA (`git rev-parse`, `gh`, the REST API, the UI) emits lowercase, so a false reject
+          # here is loud and fixed by lowercasing.
+          if [[ ${#WORKFLOWS_REF} -ne 40 || "$WORKFLOWS_REF" == *[!0-9a-f]* ]]; then
+            echo "::error::workflows_ref must be the FULL 40-hex lowercase commit SHA of Comfy-Org/github-workflows (got '${safe_ref}'). Pin it to the SAME SHA you pin uses: to — see the pr-risk.yml header. Branches, tags and refs/pull/N/head are mutable (and PR-head refs resolve fork-authored code), so they are rejected before the tool checkout."
+            exit 1
+          fi
       # The tool checkout is the same pinned-ref load the grade job does: the resolver is this
       # repo's code at `workflows_ref`, never the graded PR's.
       - name: Load pr-risk tool
@@ -320,10 +544,29 @@ jobs:
 
   grade:
     needs: gate
-    if: needs.gate.outputs.enabled == 'true'
+    # `enabled` governs AUTOMATIC grading — the `pull_request` stream. A manual dispatch is
+    # never blocked by it: running a workflow_dispatch requires write access on the repo and is
+    # an explicit, attributed act, so there is no unattended behaviour left for the switch to
+    # govern. Without this clause the staged rollout the switch exists for does not work — a
+    # repo that enrols OFF cannot grade even a single PR to see what the grader would say, so
+    # "try it here before turning it on" requires switching the whole repo on first, which is
+    # the thing being evaluated.
+    #
+    # What this costs, stated rather than buried: `{"enabled": false}` stops the PR-stream
+    # noise, but it does NOT stop a human running the grader by hand. It is a mute, not a
+    # lockout. If a repo ever needs the harder guarantee, remove the caller — nothing here can
+    # bind a maintainer who can edit the workflow file anyway.
+    if: >-
+      needs.gate.outputs.enabled == 'true' ||
+      github.event_name == 'workflow_dispatch'
     name: Grade PR risk
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      # The RENDERED Check Run payloads, one per target. Rendering happens HERE — in the job with
+      # the narrow token — and the separate publish job only ever POSTs strings this job already
+      # escaped, so the job holding `checks: write` never renders anything it read from a PR.
+      surfaces: ${{ steps.grade.outputs.surfaces }}
     permissions:
       contents: read        # read the consumer's .github/risk.json override from the BASE ref
       issues: write         # create the risk:* labels repo-side on first use (repo label CRUD
@@ -336,8 +579,13 @@ jobs:
                             # SCOPE HONESTLY: `pull-requests: write` is a TOKEN-level grant, so
                             # it also permits commenting, reviewing, editing and closing — the
                             # label-only guarantee is CODE-level (apply-risk-label.sh is the
-                            # only writer, and it touches nothing but the mapped label names),
-                            # backed by the fact that the job checks out no PR code: the only
+                            # only writer, and the only state it INTENDS to change is the
+                            # mapped label names — its atomic PUT re-sends every unowned label
+                            # as the snapshot read saw it, with one residual an auditor should
+                            # know: a label added or removed by someone else inside that
+                            # read->PUT window is dropped or resurrected respectively; see the
+                            # script's RESIDUAL note), backed by the fact that the job checks
+                            # out no PR code: the only
                             # code holding this token is this repo's, loaded from the pinned
                             # workflows_ref. Public repos enroll via `pull_request_target`, so
                             # that token IS present on fork-authored events — which is exactly
@@ -365,6 +613,41 @@ jobs:
       BASE_REF: ${{ (inputs.pr_number || inputs.pr_numbers) == '' && github.event.pull_request.base.ref || '' }}
       GH_TOKEN: ${{ github.token }}
     steps:
+      # The same guard the `gate` job applies, restated here rather than inherited from it. This
+      # job is where the stakes are: the checked-out code runs holding the job's `GH_TOKEN`, which
+      # carries `pull-requests: write`, and public repos enroll via `pull_request_target` so that
+      # token is present on fork-authored events. A job must not depend on ANOTHER job's step for
+      # its own trust boundary — see the `gate` job above for the full rationale.
+      - name: Enforce workflows_ref pin contract
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+        run: |
+          set -euo pipefail
+          # Never interpolate a raw value into a `::error::`. A multi-line value — exactly what the
+          # length/character test below exists to catch — would end the annotation at the first
+          # newline and leave the remainder to be re-parsed by the runner as workflow commands
+          # (`::add-mask::`, `::stop-commands::`, a forged `::notice::`) in a PUBLIC log. Anything
+          # outside the ref alphabet becomes `?` and the result is truncated, so what is echoed is
+          # always one bounded line.
+          safe_ref=$(printf '%s' "$WORKFLOWS_REF" | tr -c 'A-Za-z0-9._/-' '?')
+          safe_ref=${safe_ref:0:64}
+          # LENGTH + CHARACTER CLASS, not `grep -Eq '^[0-9a-f]{40}$'` and not `[[ =~ ]]`: both raise
+          # an anchoring question this form does not have. `grep` anchors `^…$` per LINE, so a
+          # multi-line value carrying one SHA-shaped line passes it and is then handed to checkout
+          # in full; `[[ =~ ]]` anchors the whole string, but whether `$` may ALSO match just before
+          # a trailing newline is a libc-dependent detail no trust boundary should rest on. A length
+          # test plus "contains a character outside [0-9a-f]" has no anchors at all — a newline, a
+          # space or an uppercase letter is simply a character outside the class.
+          #
+          # LOWERCASE ONLY, deliberately. The value is handed to `actions/checkout` VERBATIM, so
+          # accepting a spelling the fetch may not resolve would trade this step's clear message for
+          # an obscure failure one step later — the opposite of the point. Everything that emits a
+          # SHA (`git rev-parse`, `gh`, the REST API, the UI) emits lowercase, so a false reject
+          # here is loud and fixed by lowercasing.
+          if [[ ${#WORKFLOWS_REF} -ne 40 || "$WORKFLOWS_REF" == *[!0-9a-f]* ]]; then
+            echo "::error::workflows_ref must be the FULL 40-hex lowercase commit SHA of Comfy-Org/github-workflows (got '${safe_ref}'). Pin it to the SAME SHA you pin uses: to — see the pr-risk.yml header. Branches, tags and refs/pull/N/head are mutable (and PR-head refs resolve fork-authored code), so they are rejected before the tool checkout."
+            exit 1
+          fi
       - name: Load pr-risk tool
         # The grader + default map come from THIS workflow's repo (public, pinned
         # via workflows_ref) — never from the graded PR. No PR code is checked
@@ -393,6 +676,10 @@ jobs:
           SELF_CONTEXT: ${{ github.workflow }}
           SELF_RUN_ID: ${{ github.run_id }}
           WAIT_MINUTES: ${{ inputs.wait_for_checks_minutes }}
+          # The sticky comment rides the `pull-requests: write` this job already holds for the
+          # label; the Check Run does not, so it is only RENDERED here (see the `surfaces` output).
+          PUBLISH_COMMENT: ${{ inputs.sticky_comment && '1' || '0' }}
+          PUBLISH_CHECK: ${{ inputs.check_run && '1' || '0' }}
           JOB_TIMEOUT_MINUTES: 30      # keep in sync with timeout-minutes on the job
           TOOL_DIR: _pr_risk_tool/scripts/pr-risk
         run: |
@@ -503,3 +790,77 @@ jobs:
             echo
             echo "This label routes nothing and gates nothing. Disagree with the grade? Add the \`risk-dispute\` label and say why in a comment — the grader never touches that label."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # THE ONE JOB THAT HOLDS `checks: write`, and it reads NOTHING from a pull request. Its whole
+  # input is the `surfaces` output the grade job already rendered and escaped, so no PR-controlled
+  # text is interpreted here — the two-job split BE-5508 asked for, adopted for exactly the reason
+  # rendering PR-authored paths into a bot-authored artifact makes it worth having.
+  #
+  # THE GRANT IS NOT OPTIONAL EVEN THOUGH THE BEHAVIOUR IS. GitHub validates a nested job's
+  # declared `permissions:` against the caller's block at startup, so this `checks: write` is
+  # required of every caller whatever `check_run` is set to — the `if:` below decides whether a
+  # check is PUBLISHED, not whether the grant is CHECKED. The header's caller block carries it,
+  # and enrolling or re-pinning without it fails the run before any step executes.
+  #
+  # Keeping it in its OWN job is still what limits the blast radius: `checks: write` is held here
+  # and nowhere else, and the grade job — the one that reads pull requests — keeps `checks: read`.
+  publish-check:
+    needs: [gate, grade]
+    if: needs.gate.outputs.enabled == 'true' && inputs.check_run && !cancelled()
+    name: Publish the risk Check Run
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      checks: write         # the ONLY new grant this workflow can ask for, and only when opted in
+      contents: read
+      pull-requests: read   # read each target's head sha (the commit the check attaches to)
+    steps:
+      - name: Create the Check Run(s)
+        env:
+          REPO: ${{ github.repository }}
+          SURFACES: ${{ needs.grade.outputs.surfaces }}
+          CHECK_NAME: ${{ inputs.check_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          # An empty/absent output is not an error: the grade job may have been cancelled, or every
+          # target may have failed before rendering. Nothing to publish is not something to fail on
+          # — this surface is advisory and may never redden a PR.
+          n="$(jq 'length' <<<"${SURFACES:-[]}" 2>/dev/null || echo 0)"
+          if [ "${n:-0}" -eq 0 ]; then
+            echo "no rendered Check Run payloads — nothing to publish"; exit 0
+          fi
+          rc=0
+          for i in $(seq 0 $(( n - 1 ))); do
+            one="$(jq -c ".[$i]" <<<"$SURFACES")"
+            pr="$(jq -r '.pr' <<<"$one")"
+            # THE GRADED COMMIT, carried in the payload — not "head as of now". The grade job
+            # waits out the check rollup (up to `wait_for_checks_minutes`) and this is a whole
+            # further job, so re-reading head here would stamp the tier of the PREVIOUS commit
+            # onto a new head as an immutable, timestamped Check Run — misattributing the grade
+            # in the one artifact whose value is being a trustworthy commit-attached record. A
+            # push inside that window gets its own grade and its own check.
+            sha="$(jq -r '.sha // empty' <<<"$one")"
+            if [ -z "$sha" ] || [ "$sha" = null ]; then
+              # Only a record with no graded oid (an ungradable PR) lands here: that verdict is
+              # about the PR rather than about any one commit, so head is the honest anchor.
+              sha="$(gh api "repos/${REPO}/pulls/${pr}" --jq '.head.sha' 2>/dev/null)" || sha=""
+            fi
+            if [ -z "$sha" ] || [ "$sha" = null ]; then
+              echo "::warning::could not resolve a commit for ${REPO}#${pr} — no Check Run was created for it"
+              rc=1; continue
+            fi
+            # `conclusion: neutral` is hardcoded. Nothing in this workflow may emit
+            # success/failure: a neutral check cannot fail a PR even if a repo later marks it
+            # required, which is the entire "nothing is gated" guarantee.
+            jq -n --arg name "${CHECK_NAME:-PR risk (advisory)}" --arg sha "$sha" \
+                  --argjson one "$one" \
+               '{name:$name, head_sha:$sha, status:"completed", conclusion:"neutral",
+                 output:{title:($one.title[0:255]), summary:($one.summary[0:65535])}}' \
+              | gh api -X POST "repos/${REPO}/check-runs" --input - >/dev/null \
+              || { echo "::warning::could not create the Check Run for ${REPO}#${pr} — the grade, its label and the step summary are unaffected"; rc=1; }
+          done
+          # ALWAYS 0. Every failure above is announced; a publish surface that could redden a PR
+          # would quietly turn an advisory grade into a gate.
+          [ "$rc" -eq 0 ] || echo "one or more Check Runs could not be created — announced above"
+          exit 0

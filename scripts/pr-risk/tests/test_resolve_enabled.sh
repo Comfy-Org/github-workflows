@@ -29,10 +29,10 @@ ok()  { PASS=$((PASS+1)); printf 'ok   %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf 'FAIL %s\n     got: %s\n' "$1" "${2:-}"; }
 eq()  { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected '$2')" "$3"; fi }
 
-# run <input_enabled> <risk_config> -> sets OUT (resolved value), ERR (stderr), SUMMARY (body)
+# run <input_enabled> <risk_config> [event] -> sets OUT (resolved), ERR (stderr), SUMMARY (body)
 run() {
   : > "$SANDBOX/out"; : > "$SANDBOX/summary"
-  ERR="$(INPUT_ENABLED="$1" RISK_CONFIG="$2" \
+  ERR="$(INPUT_ENABLED="$1" RISK_CONFIG="$2" GITHUB_EVENT_NAME="${3:-pull_request}" \
          GITHUB_OUTPUT="$SANDBOX/out" GITHUB_STEP_SUMMARY="$SANDBOX/summary" \
          bash "$SCRIPT" 2>&1 >/dev/null)"
   OUT="$(sed -n 's/^enabled=//p' "$SANDBOX/out")"
@@ -90,7 +90,40 @@ case "$SUMMARY" in *RISK_CONFIG*) ok "and names the switch" ;; *) bad "and names
 run true ""
 eq "an enabled run writes no summary" "" "$SUMMARY"
 
-echo "— phase 7: it is runnable outside Actions (neither env file set) —"
+echo "— phase 7: a DISABLED dispatch must not claim nothing was graded —"
+# A manual dispatch grades even while disabled (the `grade` job's `if:` lets it through), so the
+# two summaries have to say different things. "No grade was computed" on a run that is about to
+# compute one is the single most misleading line this file could emit: it is exactly the
+# sentence a reader would trust to decide whether the label on their PR is current.
+run false "" workflow_dispatch
+case "$SUMMARY" in
+  *"No grade was computed"*) bad "a disabled dispatch does NOT claim nothing was graded" "$SUMMARY" ;;
+  *) ok "a disabled dispatch does NOT claim nothing was graded" ;;
+esac
+case "$SUMMARY" in
+  *"This MANUAL run grades anyway"*) ok "it says the manual run will grade" ;;
+  *) bad "it says the manual run will grade" "$SUMMARY" ;;
+esac
+# And it must warn that the label it leaves goes stale, since pushes will not re-grade it.
+case "$SUMMARY" in
+  *"every later commit will go ungraded"*) ok "and that the label will not stay current" ;;
+  *) bad "and that the label will not stay current" "$SUMMARY" ;;
+esac
+# The non-dispatch summary keeps its own claim, and points at the dispatch escape hatch.
+run false "" pull_request
+case "$SUMMARY" in
+  *"No grade was computed"*) ok "a disabled pull_request still reports nothing graded" ;;
+  *) bad "a disabled pull_request still reports nothing graded" "$SUMMARY" ;;
+esac
+case "$SUMMARY" in
+  *"not gated by this switch"*) ok "and offers the manual route" ;;
+  *) bad "and offers the manual route" "$SUMMARY" ;;
+esac
+# An ENABLED dispatch writes no summary at all — the grade job owns the output from there.
+run true "" workflow_dispatch
+eq "an enabled dispatch writes no summary" "" "$SUMMARY"
+
+echo "— phase 8: it is runnable outside Actions (neither env file set) —"
 out="$(INPUT_ENABLED=true RISK_CONFIG='' bash "$SCRIPT" 2>/dev/null)"
 case "$out" in *"enabled=true"*) ok "reports to stdout with no GITHUB_OUTPUT" ;; *) bad "reports to stdout with no GITHUB_OUTPUT" "$out" ;; esac
 
