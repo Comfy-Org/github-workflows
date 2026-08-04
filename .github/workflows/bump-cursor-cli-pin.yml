@@ -1,0 +1,372 @@
+name: Bump Cursor CLI pin
+
+# Keep the Cursor CLI pin in cursor-review.yml from going stale silently.
+#
+# BE-5869 replaced `curl https://cursor.com/install | bash` with a versioned,
+# sha256-pinned artifact (see .github/cursor-review/install-cursor-cli.sh). That
+# removed the mutable-bootstrap supply-chain risk but introduced a maintenance
+# one: nothing moves the pin, so the panel would run an ever-older CLI until
+# someone noticed. This job notices instead — weekly it reads the version Cursor
+# currently ships, and when it differs from the pin it downloads that version's
+# linux/x64 artifact, computes its digest, and opens a two-line PR moving
+# CURSOR_CLI_VERSION + CURSOR_CLI_SHA256. Nothing auto-merges: a human reviews
+# the digest, which is the whole point (see the trust-anchor note below).
+#
+# Merging that PR touches .github/workflows/cursor-review.yml, which is exactly
+# the path filter bump-cursor-review-callers.yml watches — so the SHA-pinned
+# caller fleet rolls forward on its own. No new fleet plumbing here.
+#
+# Modelled on bump-cursor-review-callers.yml: same main-only job guard, same
+# non-cancelling concurrency around a stable shared branch, same App-token
+# credential pattern (vars.APP_ID + secrets.CLOUD_CODE_BOT_PRIVATE_KEY, already
+# provisioned in this repo for the bump fleet).
+#
+# Trust anchor: Cursor publishes no checksums for these artifacts, so the digest
+# below is trust-on-first-use — whatever the CDN served this run. The reviewer of
+# the PR is the trust anchor for it. The nixpkgs cross-check is a genuine second
+# opinion when it is available (an independent party fetched the same URL and
+# recorded a hash), but nixpkgs lags releases, so it can only ever be a
+# best-effort corroboration — never a gate. A MISMATCH on the same version is the
+# one fatal case: two parties disagreeing about the bytes at one URL is the
+# tamper signal this whole pin exists to catch.
+
+on:
+  schedule:
+    # Mondays 14:00 UTC — early enough in the week that a bump PR gets reviewed
+    # before the weekend, late enough in the day to be off the top-of-hour rush.
+    - cron: '0 14 * * 1'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+# Serialize runs: the bump lands on a STABLE branch (ci/bump-cursor-cli-pin) that
+# is force-reset each run, so two overlapping runs (a manual dispatch racing the
+# cron) would race that reset and the PR update, and the older run finishing last
+# could leave the PR pinned to a stale digest. cancel-in-progress: false lets the
+# running bump finish; the newest pending run then wins. Same reasoning as
+# bump-cursor-review-callers.yml (BE-3882).
+concurrency:
+  group: bump-cursor-cli-pin
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    # Guard against a workflow_dispatch run from a non-main ref: this job
+    # force-resets a shared branch and mints an App token, so it must only ever
+    # run from reviewed main. The schedule trigger is already main-only, so this
+    # only skips stray manual runs.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # `ref: main` resolves at run time, so the bump is always built on the
+          # LIVE main tip. Without it a re-run of an older run would check out
+          # that run's (now stale) github.sha, and the force-push below would
+          # publish a branch that reverts everything merged since. The `if:`
+          # guard above already restricts this job to main.
+          ref: main
+          persist-credentials: false
+
+      - name: Discover the version Cursor currently ships
+        id: discover
+        env:
+          WORKFLOW_FILE: .github/workflows/cursor-review.yml
+        run: |
+          set -euo pipefail
+
+          # The installer is DATA here, never executed — it is fetched only to
+          # read the version out of its download URL. There is deliberately no
+          # `bash "$installer"` anywhere in this workflow.
+          installer="$(mktemp "${RUNNER_TEMP}/cursor-install.XXXXXX")"
+          curl -fsSL \
+            --proto '=https' --proto-redir '=https' \
+            --connect-timeout 10 --max-time 60 \
+            --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 120 \
+            --max-filesize 1048576 \
+            https://cursor.com/install -o "$installer"
+
+          # Anchored on the download host + path so a stray version-looking
+          # string elsewhere in the script cannot match. `[^/"]+` stops at the
+          # path separator and at the closing quote of the shell string.
+          new_version=$(grep -oE 'downloads\.cursor\.com/lab/[^/"]+' "$installer" | head -1 | awk -F/ '{print $3}' || true)
+
+          # Fail LOUD on an empty extraction. The installer's format changing is
+          # exactly the vendor drift BE-5869 wants early warning about, and a
+          # silent no-op here would hide it for as long as the format stayed
+          # changed — i.e. forever, which is the failure mode this job exists to
+          # prevent in the first place.
+          if [ -z "$new_version" ]; then
+            echo "::error::Could not extract a version from https://cursor.com/install — its format has changed. Update this workflow's extraction (and re-verify the pin by hand)."
+            exit 1
+          fi
+          # Everything downstream interpolates this into a URL, a sed
+          # replacement, a commit message and a PR title, so constrain it to the
+          # shape a version can actually have rather than trusting a remote file.
+          if ! printf '%s' "$new_version" | grep -qE '^[0-9A-Za-z][0-9A-Za-z._-]{0,63}$'; then
+            echo "::error::Extracted version '${new_version}' is not a plausible version string — refusing to use it."
+            exit 1
+          fi
+
+          # Anchored read of the pin: `^  CURSOR_CLI_VERSION: ` matches the
+          # top-level env key and nothing else (the in-job references to
+          # $CURSOR_CLI_VERSION are indented far deeper).
+          old_version=$(sed -nE 's/^  CURSOR_CLI_VERSION: (.*)$/\1/p' "$WORKFLOW_FILE" | head -1 || true)
+          if [ -z "$old_version" ]; then
+            echo "::error::No '  CURSOR_CLI_VERSION: ' line in ${WORKFLOW_FILE} — the pin moved or was removed; this workflow needs updating."
+            exit 1
+          fi
+
+          echo "pinned: ${old_version}"
+          echo "latest: ${new_version}"
+          {
+            echo "old_version=${old_version}"
+            echo "new_version=${new_version}"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$old_version" = "$new_version" ]; then
+            echo "Pin is already current — nothing to do."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Cursor CLI pin already current (\`${old_version}\`)." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Download the artifact and compute its digest
+        id: digest
+        if: steps.discover.outputs.changed == 'true'
+        env:
+          NEW_VERSION: ${{ steps.discover.outputs.new_version }}
+        run: |
+          set -euo pipefail
+
+          pkg="${RUNNER_TEMP}/agent-cli-package.tar.gz"
+          # Deliberately plain `--retry`, NOT --retry-all-errors: a 404 here
+          # means the discovered version has no linux/x64 artifact, which is
+          # permanent and worth surfacing immediately. Same call this job's
+          # consumer makes — see .github/cursor-review/install-cursor-cli.sh,
+          # whose flag notes explain --proto/--max-filesize.
+          curl -fsSL \
+            --proto '=https' --proto-redir '=https' \
+            --connect-timeout 10 --max-time 120 \
+            --max-filesize 268435456 \
+            --retry 3 --retry-delay 2 --retry-max-time 120 \
+            "https://downloads.cursor.com/lab/${NEW_VERSION}/linux/x64/agent-cli-package.tar.gz" -o "$pkg"
+
+          new_sha256=$(sha256sum "$pkg" | awk '{print $1}')
+          if ! printf '%s' "$new_sha256" | grep -qE '^[0-9a-f]{64}$'; then
+            echo "::error::sha256sum produced '${new_sha256}', which is not a 64-hex-character digest."
+            exit 1
+          fi
+
+          # The SRI form nixpkgs records, computed from the same bytes.
+          # Equivalent to `sha256-$(xxd -r -p <<<"$new_sha256" | base64)`, but
+          # openssl is guaranteed present on the hosted runner.
+          new_sri="sha256-$(openssl dgst -sha256 -binary "$pkg" | openssl base64 -A)"
+
+          echo "sha256: ${new_sha256}"
+          {
+            echo "new_sha256=${new_sha256}"
+            echo "new_sri=${new_sri}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Cross-check the digest against nixpkgs
+        id: nixpkgs
+        if: steps.discover.outputs.changed == 'true'
+        env:
+          NEW_VERSION: ${{ steps.discover.outputs.new_version }}
+          NEW_SRI: ${{ steps.digest.outputs.new_sri }}
+        run: |
+          set -euo pipefail
+
+          # Best-effort second opinion, NEVER a gate on nixpkgs being current —
+          # it routinely lags a Cursor release by days, and gating on it would
+          # stall every bump behind a third party's update cadence. Only a
+          # same-version DISAGREEMENT is fatal.
+          nixfile="$(mktemp "${RUNNER_TEMP}/cursor-cli.nix.XXXXXX")"
+          status=""
+          if ! curl -fsSL \
+                --proto '=https' --proto-redir '=https' \
+                --connect-timeout 10 --max-time 60 \
+                --retry 2 --retry-delay 2 --retry-max-time 30 \
+                --max-filesize 1048576 \
+                https://raw.githubusercontent.com/NixOS/nixpkgs/master/pkgs/by-name/cu/cursor-cli/package.nix \
+                -o "$nixfile"; then
+            # A GitHub raw blip must never block the bump.
+            echo "::warning::Could not fetch the nixpkgs cursor-cli expression — proceeding without the cross-check."
+            status="fetch-failed — no second opinion this run"
+          else
+            # nixpkgs' own `version` attr is a `0-unstable-<date>` string, not the
+            # artifact version, so key off the x86_64-linux fetchurl URL instead —
+            # that is the one field that names the exact bytes we downloaded.
+            nix_url=$(grep -oE 'https://downloads\.cursor\.com/lab/[^"]+/linux/x64/agent-cli-package\.tar\.gz' "$nixfile" | head -1 || true)
+            nix_version=$(printf '%s' "$nix_url" | awk -F/ '{print $5}')
+            if [ -z "$nix_version" ]; then
+              echo "::warning::No x86_64-linux cursor-cli URL in the nixpkgs expression — its layout changed; proceeding without the cross-check."
+              status="not-available — nixpkgs expression layout changed"
+            elif [ "$nix_version" != "$NEW_VERSION" ]; then
+              echo "nixpkgs is still on ${nix_version}, not yet updated to ${NEW_VERSION} — proceeding TOFU."
+              status="not-yet-available — nixpkgs is still on \`${nix_version}\`, so this digest is trust-on-first-use"
+            else
+              # The hash sits on the line immediately after the url inside the
+              # same fetchurl block; -A2 keeps it anchored to THIS URL rather
+              # than picking up the arm64/darwin hashes below it.
+              nix_hash=$(grep -A2 -F "$nix_url" "$nixfile" | grep -oE 'sha256-[A-Za-z0-9+/]+=*' | head -1 || true)
+              if [ -z "$nix_hash" ]; then
+                echo "::warning::Found the nixpkgs URL for ${NEW_VERSION} but no hash beside it — proceeding without the cross-check."
+                status="not-available — no hash beside the nixpkgs x86_64-linux URL"
+              elif [ "$nix_hash" != "$NEW_SRI" ]; then
+                # Two independent fetches of one URL disagreeing about the bytes
+                # is the CDN-tamper signal the pin exists to catch. Never bump
+                # through it.
+                echo "::error::nixpkgs pins ${NEW_VERSION} as ${nix_hash} but this run computed ${NEW_SRI}. Two parties disagree about the bytes at one URL — refusing to bump. Investigate before touching the pin."
+                exit 1
+              else
+                echo "nixpkgs agrees: ${nix_hash}"
+                status="matched — nixpkgs records the same digest for \`${NEW_VERSION}\`"
+              fi
+            fi
+          fi
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke-test the proposed pin
+        if: steps.discover.outputs.changed == 'true'
+        env:
+          CURSOR_CLI_VERSION: ${{ steps.discover.outputs.new_version }}
+          CURSOR_CLI_SHA256: ${{ steps.digest.outputs.new_sha256 }}
+        # Run the real installer — the same .github/cursor-review/install-cursor-cli.sh
+        # every consumer executes — against the proposed pin, so a bump that would
+        # break the whole caller fleet fails HERE instead of after merge. It is the
+        # one check a reviewer cannot make by eyeballing a digest: the installer
+        # asserts the archive layout and that the binary self-reports this exact
+        # version, neither of which the digest tells you.
+        #
+        # Deliberately AFTER the nixpkgs cross-check: this step executes the
+        # downloaded binary, so the one available tamper signal runs first.
+        run: bash .github/cursor-review/install-cursor-cli.sh
+
+      - name: Move the pin
+        if: steps.discover.outputs.changed == 'true'
+        env:
+          WORKFLOW_FILE: .github/workflows/cursor-review.yml
+          NEW_VERSION: ${{ steps.discover.outputs.new_version }}
+          NEW_SHA256: ${{ steps.digest.outputs.new_sha256 }}
+        run: |
+          set -euo pipefail
+
+          # Both substitutions are anchored to the top-level env keys, and each
+          # must match EXACTLY one line — anything else means cursor-review.yml
+          # was restructured and a blind sed could corrupt it.
+          for key in CURSOR_CLI_VERSION CURSOR_CLI_SHA256; do
+            n=$(grep -cE "^  ${key}: " "$WORKFLOW_FILE" || true)
+            if [ "$n" != "1" ]; then
+              echo "::error::Expected exactly one '  ${key}: ' line in ${WORKFLOW_FILE}, found ${n}."
+              exit 1
+            fi
+          done
+
+          before="${RUNNER_TEMP}/cursor-review.before.yml"
+
+          cp "$WORKFLOW_FILE" "$before"
+          sed -i -E "s|^  CURSOR_CLI_VERSION: .*\$|  CURSOR_CLI_VERSION: ${NEW_VERSION}|" "$WORKFLOW_FILE"
+          if cmp -s "$before" "$WORKFLOW_FILE"; then
+            echo "::error::The CURSOR_CLI_VERSION substitution changed nothing."
+            exit 1
+          fi
+
+          cp "$WORKFLOW_FILE" "$before"
+          sed -i -E "s|^  CURSOR_CLI_SHA256: .*\$|  CURSOR_CLI_SHA256: ${NEW_SHA256}|" "$WORKFLOW_FILE"
+          if cmp -s "$before" "$WORKFLOW_FILE"; then
+            echo "::error::The CURSOR_CLI_SHA256 substitution changed nothing."
+            exit 1
+          fi
+
+          git --no-pager diff -- "$WORKFLOW_FILE"
+
+      - name: Generate Cloud Code Bot token
+        id: token
+        if: steps.discover.outputs.changed == 'true'
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0 — pinned: see dependabot.yml ignore (v2+ breaks cross-repo `owner:` token scoping)
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+          # No `owner:` — unlike the caller-bumping fleet this only ever writes
+          # to THIS repo, so the default repo-scoped installation token is both
+          # sufficient and narrower. (groom.yml's build_pr job already pushes a
+          # branch and opens a PR here with the same app, so the installation is
+          # known to cover this repo.) Narrowed further to the two permissions
+          # actually used.
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Open or update the bump PR
+        if: steps.discover.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          BRANCH: ci/bump-cursor-cli-pin
+          OLD_VERSION: ${{ steps.discover.outputs.old_version }}
+          NEW_VERSION: ${{ steps.discover.outputs.new_version }}
+          NEW_SHA256: ${{ steps.digest.outputs.new_sha256 }}
+          NIXPKGS_STATUS: ${{ steps.nixpkgs.outputs.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          # Committer identity is cosmetic — the PR AUTHOR (what reviewers and
+          # filters key off) comes from the App token used below. Same convention
+          # as groom.yml's auto-builder.
+          git config user.name 'cursor-cli-pin bumper'
+          git config user.email 'cursor-cli-pin-bumper@users.noreply.github.com'
+          git checkout -B "$BRANCH"
+          git add .github/workflows/cursor-review.yml
+          git commit -m "ci(cursor-review): bump Cursor CLI pin to ${NEW_VERSION}"
+
+          # Force-reset the stable branch so its diff is rebuilt from the current
+          # main tip rather than stacked on a previous week's bump (BE-3882's
+          # stable-branch pattern). The token is masked in the run log by the
+          # create-github-app-token action.
+          git push --force \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "HEAD:refs/heads/${BRANCH}"
+
+          # Built with printf rather than a heredoc: a heredoc terminator has to
+          # sit at column 0, which would end this YAML block scalar early.
+          body="$(mktemp "${RUNNER_TEMP}/pr-body.XXXXXX")"
+          # SC2016: the single-quoted literals hold Markdown backticks, not
+          # command substitutions — that is exactly why they are single-quoted.
+          # shellcheck disable=SC2016
+          {
+            printf '%s\n\n' 'Moves the Cursor CLI pin `cursor-review.yml` installs from (BE-5869).'
+            printf '| | |\n|---|---|\n'
+            printf '| Version | `%s` → `%s` |\n' "$OLD_VERSION" "$NEW_VERSION"
+            printf '| sha256 (linux/x64 `agent-cli-package.tar.gz`) | `%s` |\n' "$NEW_SHA256"
+            printf '| nixpkgs cross-check | %s |\n' "$NIXPKGS_STATUS"
+            printf '| smoke test | passed — `install-cursor-cli.sh` installed this artifact and the binary self-reported `%s` |\n\n' "$NEW_VERSION"
+            printf '**You are the trust anchor for this digest.** Cursor publishes no checksums for these artifacts, so the sha256 above is simply what the CDN served during [this run](%s) — trust-on-first-use. Corroborate it before merging (the nixpkgs row above, or a second independent download); nothing downstream can.\n\n' "$RUN_URL"
+            printf '%s\n\n' 'Merging this bumps `cursor-review.yml`, which triggers `bump-cursor-review-callers.yml` and rolls the SHA-pinned caller fleet forward.'
+            printf '%s\n' '_Opened by the `bump-cursor-cli-pin` workflow._'
+          } > "$body"
+
+          # Reuse the one open PR for this branch if there is one — the force-push
+          # already refreshed its diff, so only the title/body need updating. The
+          # stable head branch guarantees at most one. Exclude cross-repository
+          # PRs: `--head` matches by branch NAME across forks, and this branch
+          # name is predictable, so a fork PR opened on it must not be mistaken
+          # for ours and stamped with the official text.
+          existing=$(gh pr list --repo "${GITHUB_REPOSITORY}" --head "$BRANCH" --state open \
+            --json number,isCrossRepository \
+            --jq 'map(select(.isCrossRepository == false)) | .[0].number // empty')
+
+          title="ci(cursor-review): bump Cursor CLI pin to ${NEW_VERSION}"
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" --repo "${GITHUB_REPOSITORY}" --title "$title" --body-file "$body"
+            echo "Updated PR #${existing}"
+          else
+            gh pr create --repo "${GITHUB_REPOSITORY}" \
+              --head "$BRANCH" --base main \
+              --title "$title" --body-file "$body"
+          fi
+
+          echo "Cursor CLI pin bump proposed: \`${OLD_VERSION}\` → \`${NEW_VERSION}\` (nixpkgs cross-check: ${NIXPKGS_STATUS})." >> "$GITHUB_STEP_SUMMARY"

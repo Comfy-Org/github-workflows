@@ -97,6 +97,12 @@ tests — run the matching command above for whatever you touched.
   `stale.yml` and `assign-prs-to-author.yml` have no fleet because they have no
   callers; `detect-unreviewed-merge.yml` has ~12 callers and no fleet — a known,
   deferred gap, so its pins move by hand.
+- `bump-cursor-cli-pin.yml` — weekly PR moving `CURSOR_CLI_VERSION` /
+  `CURSOR_CLI_SHA256` in `cursor-review.yml` (BE-5870). Not a caller bumper:
+  merging it trips `bump-cursor-review-callers.yml`'s path filter, which rolls
+  the fleet. Cursor ships no checksums, so the PR reviewer is the trust anchor
+  for the digest; the nixpkgs cross-check corroborates when it can and is fatal
+  only on a same-version hash MISMATCH (never a gate — nixpkgs lags releases).
 
 ## Conventions & gotchas
 
