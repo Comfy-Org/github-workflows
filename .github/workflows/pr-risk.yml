@@ -25,8 +25,13 @@ name: PR Risk Grade (reusable)
 #
 # What that does NOT prove — and cannot, from in here — is that the running revision is upstream
 # code: `job_workflow_sha` is whatever the CALLER's own `uses:` resolved to, so a caller pointing
-# `uses:` itself at a fork commit is already running the fork's copy of this very file. That case
-# is bounded by review of the caller on its base branch, not by any check this workflow can make.
+# `uses:` itself at a fork commit is already running the fork's copy of this very file. Nor does
+# it prove the caller SHA-pinned `uses:` at all: the value arrives already resolved, so a
+# `uses: ...@v1` caller passing the SHA that tag points at satisfies both axes (it just goes red
+# the next time `v1` is force-moved). Both cases are bounded by review of the caller on its base
+# branch, not by any check this workflow can make. Call this workflow DIRECTLY — a nested
+# `workflow_call` chain through an org wrapper is unsupported, because `job_workflow_sha` names
+# one commit and the wrapper's is not this file's; see the `workflows_ref` input for the detail.
 # A consumer repo sharpens the generic defaults by committing
 # `.github/risk.json` (map) / `.github/risk-runbooks.json` (runbook registry), which are read
 # from the PR's BASE ref: present-but-invalid fails the run loudly; absent falls back to the
@@ -297,12 +302,32 @@ on:
           `uses:` line on its base branch is for.
 
 
-          COROLLARY: a tag- or branch-pinned `uses:` cannot satisfy this, since
-          `job_workflow_sha` is then whatever the tag currently points at and a
-          force-moved `v1` would silently change the tool under a reviewed
-          caller. That is intentional and matches org policy — `uses:` must be a
-          full commit SHA (a floating one fails the pin-validation consumer CI
-          already runs). Pin `uses:` to a SHA and pass the same SHA here.
+          WHAT IT CANNOT SEE is the caller's ORIGINAL `uses:` ref.
+          `job_workflow_sha` is already the RESOLVED commit, so a `uses: ...@v1`
+          caller that passes whatever `v1` currently points at satisfies both
+          axes: this guard does NOT reject a tag- or branch-pinned `uses:`, and
+          no check inside the called workflow can — proving that needs the ref
+          the caller wrote, which is never sent. Reviewing the caller's `uses:`
+          line on its base branch is what bounds it, and org policy already
+          requires a full commit SHA there (a floating one fails the
+          pin-validation consumer CI runs).
+
+
+          What a floating `uses:` does buy is a LOUD failure on the next
+          sanctioned `git tag -f v1 <sha>` move: the tag resolves somewhere new,
+          this hand-written pin does not follow, and every tag-pinned caller goes
+          red until it is repinned. That is the intended direction of the
+          failure — better a red check than a tool silently swapped under a
+          reviewed caller — but it is a cost the tag-pinned caller pays, not a
+          rejection at the door. Pin `uses:` to a SHA and pass the same SHA here.
+
+
+          CALL IT DIRECTLY — a nested `workflow_call` chain (caller → an org
+          wrapper workflow → this one) is NOT supported. `job_workflow_sha` names
+          ONE commit for the job, and a wrapper living in another repo (or at
+          another commit of this one) is a different commit than this file, so no
+          single `workflows_ref` value can satisfy both this guard and the
+          wrapper's own pin. Name `pr-risk.yml` in the caller's `uses:`.
         type: string
         required: true
       enabled:
@@ -338,6 +363,18 @@ on:
           empty, not an object, or carries no boolean `enabled` — a malformed
           variable must never be the reason a repo silently stops grading, so it
           degrades to this value and says so in an annotation.
+
+
+          SCOPE OF THE KILL SWITCH: it stops the GRADING, not a broken
+          enrollment. The `workflows_ref` pin contract is enforced BEFORE this
+          resolves and is not subject to it — the resolver script is itself
+          loaded from `workflows_ref`, so there is no point in the run at which a
+          mismatched pin could be read as "switched off" without first checking
+          out the very ref under suspicion. A caller whose two pins have drifted
+          therefore fails red on every PR even with `{"enabled": false}` set. The
+          fix is the one-line repin (or dropping the caller) — both PRs, but a
+          caller that cannot say which revision of the tool it runs is not in a
+          state the variable is meant to cover.
         type: boolean
         required: false
         default: false
@@ -396,14 +433,19 @@ jobs:
           JOB_WORKFLOW_SHA: ${{ github.job_workflow_sha }}
         run: |
           set -euo pipefail
-          # Never interpolate the raw value into a `::error::`. A multi-line value — exactly what
+          # Never interpolate a raw value into a `::error::`. A multi-line value — exactly what
           # the `[[ =~ ]]` choice exists to catch — would end the annotation at the first newline
           # and leave the remainder to be re-parsed by the runner as workflow commands
           # (`::add-mask::`, `::stop-commands::`, a forged `::notice::`) in a PUBLIC log. Anything
           # outside the ref alphabet becomes `?` and the result is truncated, so what is echoed is
-          # always one bounded line.
+          # always one bounded line. The RUNNER-supplied SHA gets the identical treatment, not
+          # because a caller can forge it, but because it is only ever tested for emptiness and
+          # never for shape — and the block below argues the platform could rename or reshape that
+          # property out from under this guard. Neither value is trusted to be one tidy line.
           safe_ref=$(printf '%s' "$WORKFLOWS_REF" | tr -c 'A-Za-z0-9._/-' '?')
           safe_ref=${safe_ref:0:64}
+          safe_job_sha=$(printf '%s' "$JOB_WORKFLOW_SHA" | tr -c 'A-Za-z0-9._/-' '?')
+          safe_job_sha=${safe_job_sha:0:64}
           if [[ ! "$WORKFLOWS_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
             echo "::error::workflows_ref must be the FULL 40-hex commit SHA of Comfy-Org/github-workflows (got '${safe_ref}'). Pin it to the SAME SHA you pin uses: to — see the pr-risk.yml header. Branches, tags and refs/pull/N/head are mutable (and PR-head refs resolve fork-authored code), so they are rejected before the tool checkout."
             exit 1
@@ -425,7 +467,7 @@ jobs:
             exit 1
           fi
           if [[ "${WORKFLOWS_REF,,}" != "${JOB_WORKFLOW_SHA,,}" ]]; then
-            echo "::error::workflows_ref (${safe_ref}) is not the commit uses: resolved to (${JOB_WORKFLOW_SHA}), so the grader would load from a different revision of Comfy-Org/github-workflows than the one running. Set BOTH to that same full commit SHA. If the uses: line calling this workflow is pinned to a TAG or a BRANCH, fix that first: it must be a full commit SHA (org policy — a floating uses: fails the pin-validation consumer CI runs anyway), and this input takes the same SHA."
+            echo "::error::workflows_ref (${safe_ref}) is not the commit uses: resolved to (${safe_job_sha}), so the grader would load from a different revision of Comfy-Org/github-workflows than the one running. Set BOTH to that same full commit SHA. If the uses: line calling this workflow is pinned to a TAG or a BRANCH, fix that first: it must be a full commit SHA (org policy — a floating uses: fails the pin-validation consumer CI runs anyway), and this input takes the same SHA."
             exit 1
           fi
       # The tool checkout is the same pinned-ref load the grade job does: the resolver is this
@@ -527,14 +569,19 @@ jobs:
           JOB_WORKFLOW_SHA: ${{ github.job_workflow_sha }}
         run: |
           set -euo pipefail
-          # Never interpolate the raw value into a `::error::`. A multi-line value — exactly what
+          # Never interpolate a raw value into a `::error::`. A multi-line value — exactly what
           # the `[[ =~ ]]` choice exists to catch — would end the annotation at the first newline
           # and leave the remainder to be re-parsed by the runner as workflow commands
           # (`::add-mask::`, `::stop-commands::`, a forged `::notice::`) in a PUBLIC log. Anything
           # outside the ref alphabet becomes `?` and the result is truncated, so what is echoed is
-          # always one bounded line.
+          # always one bounded line. The RUNNER-supplied SHA gets the identical treatment, not
+          # because a caller can forge it, but because it is only ever tested for emptiness and
+          # never for shape — and the block below argues the platform could rename or reshape that
+          # property out from under this guard. Neither value is trusted to be one tidy line.
           safe_ref=$(printf '%s' "$WORKFLOWS_REF" | tr -c 'A-Za-z0-9._/-' '?')
           safe_ref=${safe_ref:0:64}
+          safe_job_sha=$(printf '%s' "$JOB_WORKFLOW_SHA" | tr -c 'A-Za-z0-9._/-' '?')
+          safe_job_sha=${safe_job_sha:0:64}
           if [[ ! "$WORKFLOWS_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
             echo "::error::workflows_ref must be the FULL 40-hex commit SHA of Comfy-Org/github-workflows (got '${safe_ref}'). Pin it to the SAME SHA you pin uses: to — see the pr-risk.yml header. Branches, tags and refs/pull/N/head are mutable (and PR-head refs resolve fork-authored code), so they are rejected before the tool checkout."
             exit 1
@@ -556,7 +603,7 @@ jobs:
             exit 1
           fi
           if [[ "${WORKFLOWS_REF,,}" != "${JOB_WORKFLOW_SHA,,}" ]]; then
-            echo "::error::workflows_ref (${safe_ref}) is not the commit uses: resolved to (${JOB_WORKFLOW_SHA}), so the grader would load from a different revision of Comfy-Org/github-workflows than the one running. Set BOTH to that same full commit SHA. If the uses: line calling this workflow is pinned to a TAG or a BRANCH, fix that first: it must be a full commit SHA (org policy — a floating uses: fails the pin-validation consumer CI runs anyway), and this input takes the same SHA."
+            echo "::error::workflows_ref (${safe_ref}) is not the commit uses: resolved to (${safe_job_sha}), so the grader would load from a different revision of Comfy-Org/github-workflows than the one running. Set BOTH to that same full commit SHA. If the uses: line calling this workflow is pinned to a TAG or a BRANCH, fix that first: it must be a full commit SHA (org policy — a floating uses: fails the pin-validation consumer CI runs anyway), and this input takes the same SHA."
             exit 1
           fi
       - name: Load pr-risk tool

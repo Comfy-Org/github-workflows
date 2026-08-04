@@ -22,11 +22,21 @@
 #   * AN AXIS IS DROPPED, OR STOPS BEING FATAL. Shape alone proves the ref is immutable, not
 #     which commit it is; the `github.job_workflow_sha` comparison is what proves it is the
 #     revision already running. Either axis degraded to a warning is a silent no-op.
+#   * AN AXIS BECOMES A TAUTOLOGY. Rebind `WORKFLOWS_REF` to `${{ github.job_workflow_sha }}`
+#     and the lock-step test compares the resolved SHA with itself — always green, while the
+#     checkout below still uses the unvalidated input. Nothing about the guard's SHAPE changes.
 #   * THE STEP IS NEUTERED WHOLESALE. `continue-on-error: true` makes every `exit 1` advisory
 #     and an `if:` switches the step off — added to both copies they stay byte-identical, every
-#     assertion above still holds, and the checkout proceeds on an unvalidated ref.
+#     assertion above still holds, and the checkout proceeds on an unvalidated ref. Or the
+#     cheaper version, which leaves the guard untouched and edits its VICTIM: `if: always()` on
+#     the checkout, or `continue-on-error` at job level.
+#   * THE INPUT IS ALIASED PAST THE SCAN. The unguarded-checkout scan matches `ref:` keys naming
+#     `inputs.workflows_ref`. Bind it to an `env:` key first, forward it to a composite action,
+#     or hand it to a `git fetch` in a `run:` step, and the scan has nothing left to see.
 #   * THE RAW VALUE IS EMITTED AGAIN. The runner re-parses any line of step output, so a
-#     multi-line ref can forge workflow commands in a public log.
+#     multi-line ref can forge workflow commands in a public log — including one hop through
+#     another variable, which is why the emit scan whitelists what may touch the value rather
+#     than blacklisting the emit shapes someone thought of.
 #
 # ASSERT PROPERTIES, NOT COUNTS, AND POSITIONS, NOT SUMS. An earlier draft pinned a literal
 # number of `exit 1` lines, which would have gone red on the very next hardening of the guard —
@@ -134,10 +144,22 @@ eq "all copies of the guard step are byte-identical" "" "$drift"
 
 # --- both axes are still enforced, and no rejection path can be non-fatal ---------------------
 body="$(cat "$first" 2>/dev/null)"
-# Comments are stripped before any assertion about control flow, so an `exit 1` or an `exit 0`
-# quoted in prose neither satisfies nor breaks a check.
-code="$(printf '%s\n' "$body" | sed 's/[[:space:]]*#.*$//')"
+# WHOLE-LINE comments are dropped before any assertion about control flow, so an `exit 1` or an
+# `exit 0` quoted in prose neither satisfies nor breaks a check. Deliberately NOT a trailing-`#`
+# strip: `#` has no special meaning inside a shell string, and this repo routinely writes
+# `github-workflows#NN` and the like in exactly the annotation lines below — a naive
+# `s/[[:space:]]*#.*$//` would truncate such a line and could silently drop the `$WORKFLOWS_REF`
+# mention that the emit scan exists to inspect. The residual cost runs the other, harmless way:
+# a trailing comment that happens to say `exit 0` trips a check. False positive, one puzzled
+# minute — the trade this file makes everywhere.
+code="$(printf '%s\n' "$body" | grep -v '^[[:space:]]*#')"
 
+# The value under test must be the caller's INPUT, not a restatement of the runner's own. Rebind
+# it to `${{ github.job_workflow_sha }}` and the lock-step comparison compares the resolved SHA
+# with itself — a tautology that always passes while the checkout below still uses the
+# unvalidated input, with every other assertion in this file staying green.
+has "the guarded value is the caller's input, not the resolved SHA restated" \
+    "$code" 'WORKFLOWS_REF: ${{ inputs.workflows_ref }}'
 has "axis 1: the ref must be shaped like a full 40-hex commit SHA" \
     "$code" '^[0-9a-fA-F]{40}$'
 has "axis 2: the runner-supplied resolved SHA is read into the guard" \
@@ -174,6 +196,30 @@ no "the guard is not softened by continue-on-error" "$code" "continue-on-error"
 gatedon="$(printf '%s\n' "$code" | grep -E '^        if:' || true)"
 eq "the guard is not conditional (no step-level if:)" "" "$gatedon"
 
+# --- nor can the step it PROTECTS be made to run anyway ---------------------------------------
+# Everything above inspects the guard. The cheaper bypass leaves the guard byte-identical and
+# edits its victim instead: `if: always()` (or `success() || failure()`) on the checkout makes it
+# run after the guard has exited 1, and a job-level `continue-on-error: true` demotes the guard's
+# failure for the whole job. Either one and the checkout proceeds on an unvalidated ref with
+# every assertion in this file still green — so the protected step is checked too.
+CHECKOUT_NAME='      - name: Load pr-risk tool'
+protected="$(awk -v step="$CHECKOUT_NAME" '
+  $0 == step { instep = 1; print; next }
+  !instep { next }
+  /^[[:space:]]*$/ { next }
+  /^       / { print; next }
+  { instep = 0 }
+' "$WF" | grep -v '^[[:space:]]*#')"
+nprotected=$(printf '%s\n' "$protected" | grep -cxF "$CHECKOUT_NAME")
+if [ "$nprotected" = "$nrefs" ]; then ok "the protected-checkout scan matched every guarded checkout ($nprotected)"
+else bad "the protected-checkout scan matched every guarded checkout" "$nprotected of $nrefs — anchors are stale, coverage is vacuous"; fi
+no "the protected checkout is not run-anyway (no step-level if:)" "$protected" "if:"
+no "the protected checkout is not softened by continue-on-error" "$protected" "continue-on-error"
+# Job level, where one key covers the guard and its checkout at once. `if:` at this indent is
+# legitimate (`grade` is gated on enablement); `continue-on-error` never is.
+jobsoft="$(grep -nE '^    continue-on-error:' "$WF" | tr '\n' ' ' | sed 's/ $//')"
+eq "no job demotes its own failures wholesale (no job-level continue-on-error)" "" "$jobsoft"
+
 # --- the input itself is never interpolated into the shell nor emitted raw --------------------
 # `${{ inputs.workflows_ref }}` inline in `run:` would be a shell-injection vector, and emitting
 # the raw value lets a multi-line value forge workflow commands in a public log — the runner
@@ -183,20 +229,66 @@ eq "the guard is not conditional (no step-level if:)" "" "$gatedon"
 # `echo`/`printf`, no workflow command, no redirect into an Actions file, and no continuation of
 # a line that was doing one of those.
 script="$(printf '%s\n' "$code" | sed -n '/run: |/,$p')"
-no "the input reaches the script only via env:" "$script" '${{'
+# Unlike every other anchor here, this one had no coverage self-check: reshape the block scalar
+# (`run: >-`, or a `run:` with a trailing comment) and `$script` comes back EMPTY, at which point
+# both assertions below pass over nothing at all — the vacuous-pass mode this file's header
+# claims to have eliminated. Anchor on a line the guard's script must contain.
+has "the run: block scan found the guard's script body" "$script" 'set -euo pipefail'
+# WHITELIST, not blacklist. The named categories below are diagnostics — they say WHICH way a
+# line leaks — but the verdict is the `else`: the raw value may be read by the sanitizing
+# assignment and by the `[[ ]]` tests, and by NOTHING else. A blacklist of emit-shapes has a
+# one-hop hole (`raw=$WORKFLOWS_REF` on one line, `echo "$raw"` on the next, and every shape rule
+# sees nothing) and an open-ended tail of spellings to keep chasing — `export`, `local`, `read`,
+# a herestring, a here-doc. Inverting it is what lets the assertion's name be true: any new way
+# of touching the value is reported until someone widens this list on purpose.
 emitted="$(printf '%s\n' "$script" | awk '
   { line = $0; sub(/^[[:space:]]+/, "", line) }
   line ~ /\$\{?WORKFLOWS_REF/ {
-    if (cont)                             { print "CONTINUATION:" NR }
-    else if (line ~ /::/)                 { print "WORKFLOW-COMMAND:" NR }
-    else if (line ~ /GITHUB_(STEP_SUMMARY|OUTPUT|ENV|PATH)/) { print "ACTIONS-FILE:" NR }
-    else if (line ~ /^(echo|printf)[[:space:]]/)             { print "BARE-EMIT:" NR }
-    else if (line ~ /[^0-9a-zA-Z_]>>?[[:space:]]*[\$\/"]/)   { print "REDIRECT:" NR }
+    sanctioned = (!cont && (line ~ /^safe_ref=\$\(printf/ || line ~ /^(el)?if \[\[ /))
+    if (!sanctioned) {
+      if (cont)                             { print "CONTINUATION:" NR }
+      else if (line ~ /::/)                 { print "WORKFLOW-COMMAND:" NR }
+      else if (line ~ /GITHUB_(STEP_SUMMARY|OUTPUT|ENV|PATH)/) { print "ACTIONS-FILE:" NR }
+      else if (line ~ /^(echo|printf)[[:space:]]/)             { print "BARE-EMIT:" NR }
+      else if (line ~ /[^0-9a-zA-Z_]>>?[[:space:]]*[\$\/"]/)   { print "REDIRECT:" NR }
+      else                                  { print "UNSANCTIONED:" NR }
+    }
   }
   { cont = (line ~ /\\$/) }
 ' | tr '\n' ' ' | sed 's/ $//')"
-eq "the raw value is consumed, never emitted, in any spelling" "" "$emitted"
+eq "the raw value is only sanitized or tested, never emitted or copied elsewhere" "" "$emitted"
+no "the input reaches the script only via env:" "$script" '${{'
 has "the sanitized value is what the annotations use" "$code" '${safe_ref}'
+
+# --- ...and the input is never aliased out from under the checkout scan ------------------------
+# The "every workflows_ref checkout sits behind the guard" scan at the top matches literal `ref:`
+# keys naming `inputs.workflows_ref`. Bind the input to something else first — `env: REF: ${{
+# inputs.workflows_ref }}` then `ref: ${{ env.REF }}`, or forward it to a composite action's
+# `with:`, or hand it to a `git fetch`/`gh api` in a `run:` step — and that scan sees no `ref:`
+# to check, `REFS` stays where it was, and an unguarded fetch of an unvalidated ref ships green.
+# Closing that by teaching the scan to follow aliases is a dataflow problem; forbidding the alias
+# is a grep. So: OUTSIDE comments, `inputs.workflows_ref` may appear only as the guard's own env
+# binding or as a `ref:` key — the two shapes the scans above actually understand. A future job
+# that legitimately needs it elsewhere adds the shape here, deliberately, rather than by accident.
+aliased="$(awk '
+  { line = $0; sub(/^[[:space:]]*/, "", line) }
+  line ~ /^#/ { next }
+  line !~ /inputs\.workflows_ref/ { next }
+  { squashed = line; gsub(/[[:space:]]/, "", squashed) }
+  squashed ~ /^WORKFLOWS_REF:\$\{\{inputs\.workflows_ref\}\}$/ { next }
+  squashed ~ /^ref:/ { next }
+  { print "ALIASED:" NR }
+' "$WF" | tr '\n' ' ' | sed 's/ $//')"
+eq "the input is referenced only as the guard's env binding or a ref: key" "" "$aliased"
+nmentions=$(awk '
+  { line = $0; sub(/^[[:space:]]*/, "", line) }
+  line ~ /^#/ { next }
+  line ~ /inputs\.workflows_ref/ { n += 1 }
+  END { print n+0 }
+' "$WF")
+want=$((nrefs * 2))
+if [ "$nmentions" -ge "$want" ]; then ok "the alias scan saw one env binding and one ref: per guarded job ($nmentions)"
+else bad "the alias scan saw one env binding and one ref: per guarded job" "$nmentions, expected >= $want — anchors are stale, coverage is vacuous"; fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
