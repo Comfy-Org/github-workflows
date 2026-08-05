@@ -62,6 +62,15 @@ A typo must not silently disable PR-opening, which is why the coercion is
 `nonneg_int` rather than the `numeric_string` its neighbour `max_prs` uses —
 see `_OPERATIONAL_KEYS` for that reasoning.
 
+Everything else (`_OPERATIONAL_KEYS`) is fair game: it can only make groom
+scan less, propose less, or file less — never grant it more privilege. That is
+why `bail_sink` (BE-6157) is operational even though its sibling `sink` is
+locked: `sink` picks the credentialed backend every finding is filed through,
+while `bail_sink` only chooses whether a builder BAIL becomes an issue or just a
+warning — and `build_pr` exempts the pre-publish secret-scan withhold from `none`
+so the one bail with security meaning keeps its durable record either way, which
+is what keeps "quieter, never less privileged" true here.
+
 The lock applies to the VARIABLE and `config` layers, not to the caller-defaults
 layer, which is the reviewed workflow file itself — the thing the lock protects.
 So a locked key arriving in `--defaults-json` passes through untouched
@@ -111,7 +120,15 @@ _OPERATIONAL_KEYS = {
     # authority for max_prs (see the input's description in groom.yml), and
     # duplicating the clamp here would give two places to disagree.
     "max_prs": "numeric_string",
+    # Caps the `file` job's FINDINGS issues only. It does NOT govern the
+    # auto-builder's bail issues, which `build_pr` files for a CONFIRMED finding
+    # whose patch was too large or CI-privileged (BE-6157) — so `max_findings: 0`
+    # is not "open no issues". `bail_sink` is the knob for those.
     "max_findings": "nonneg_int",
+    # Operational, NOT locked, on purpose: it can only make groom quieter, never
+    # grant it privilege, so the operator who set `max_findings: 0` can get real
+    # silence through the same variable instead of a PR (BE-6157).
+    "bail_sink": "bail_sink",
     # `nonneg_int`, NOT `numeric_string` like its neighbour `max_prs`, even
     # though both are "a number a downstream step parses". The downstream here is
     # `PR_SIZE_LIMIT=$(awk -v v="$PR_SIZE_LIMIT" 'BEGIN{printf "%d", v}')` in
@@ -340,6 +357,50 @@ def _coerce_scope_label(key, value):
     return cleaned
 
 
+# The bail sinks that are actually IMPLEMENTED (BE-6157). `linear` is deliberately
+# absent: it is the sibling `sink: linear` phase's job, and accepting it here would
+# resolve to a sink nothing implements — i.e. silent suppression under a name that
+# promises filing. Keep this list and `build_pr`'s behavior in lockstep; the
+# workflow imports `normalize_bail_sink` rather than re-deriving the allowlist.
+BAIL_SINKS = ("issue", "none")
+DEFAULT_BAIL_SINK = "issue"
+
+
+def normalize_bail_sink(raw):
+    """Map a resolved (or absent) `bail_sink` to an implemented sink.
+
+    Called from `build_pr`'s inline Python with the env value, which is EMPTY
+    whenever the coercer below dropped a bad value — an unrecognized value must
+    resolve to `issue`, never to `none`: filing a redundant issue is recoverable,
+    silently discarding a CONFIRMED finding is not.
+    """
+    value = str(raw or "").strip().lower()
+    return value if value in BAIL_SINKS else DEFAULT_BAIL_SINK
+
+
+def _coerce_bail_sink(key, value):
+    """One of `BAIL_SINKS`, case- and whitespace-insensitive.
+
+    `linear` gets its own warning rather than the generic one: it is a documented
+    later phase, so an operator who sets it is making a reasonable mistake and
+    deserves to be told which, not just that the value was refused.
+    """
+    text = value.strip().lower() if isinstance(value, str) else ""
+    if text in BAIL_SINKS:
+        return text
+    if text == "linear":
+        _warn(
+            f"{key}='linear' is reserved for the Linear sink phase and is not implemented — "
+            "ignoring it (using the caller's value)."
+        )
+        return None
+    _warn(
+        f"{key}={_shown(value)} is not one of {'/'.join(BAIL_SINKS)} — ignoring it "
+        "(using the caller's value)."
+    )
+    return None
+
+
 def _coerce_model(key, value):
     if not isinstance(value, str) or not _MODEL_RE.match(value.strip()):
         _warn(f"{key}={_shown(value)} is not a valid model id — ignoring it.")
@@ -355,6 +416,7 @@ _COERCERS = {
     "prose_nonblank": _coerce_prose_nonblank,
     "scope_label": _coerce_scope_label,
     "model": _coerce_model,
+    "bail_sink": _coerce_bail_sink,
 }
 
 

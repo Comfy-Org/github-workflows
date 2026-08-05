@@ -157,6 +157,18 @@ on:
         type: string
         required: false
         default: ''
+      ledger_prior_review:
+        description: >-
+          Give each review round the PRIOR rounds' findings and the author's
+          replies (the "prior-review ledger"), so a finding that was refuted,
+          declined, or deferred earlier is not silently re-litigated. Set false
+          to disable the ledger — the kill switch for the case where it degrades
+          reviews after rollout; flipping this input beats reverting SHA pins
+          across every consumer. With it false the panel/judge prompts are
+          exactly the pre-ledger ones. Default true.
+        type: boolean
+        required: false
+        default: true
       run_without_label:
         description: >-
           Run on plain pull_request events (opened / reopened / ready_for_review
@@ -191,6 +203,15 @@ env:
   EXTRA_LOCKFILES: ${{ inputs.extra_lockfiles }}
   # Where the assets checkout lands (this repo, .github/cursor-review/*).
   CURSOR_REVIEW_ASSETS: ${{ github.workspace }}/_cursor_review_assets/.github/cursor-review
+  # Cursor CLI pin — a versioned, checksummed artifact instead of the mutable
+  # cursor.com/install script (BE-5869). Old versions stay downloadable, so a
+  # Cursor release never breaks this; the pin moves only via a reviewed PR.
+  # Consumed by .github/cursor-review/install-cursor-cli.sh, the ONE installer
+  # all three CLI-using jobs run (preflight, review matrix, consolidate).
+  CURSOR_CLI_VERSION: 2026.07.23-e383d2b
+  # sha256 of the linux/x64 agent-cli-package.tar.gz (all jobs run ubuntu-latest).
+  # Cross-checked against nixpkgs pkgs/by-name/cu/cursor-cli at pin time.
+  CURSOR_CLI_SHA256: 702ad595213bee5df0268be9f80a19f29fcceaa2a42fc55e39f2b5199051f0c4
 
 jobs:
   gate:
@@ -301,9 +322,114 @@ jobs:
             echo "already_reviewed=false" >> "$GITHUB_OUTPUT"
           fi
 
+  ledger:
+    # Prior-review ledger: what earlier rounds already raised on THIS PR, and how
+    # the author answered. Without it every round re-derives the PR from zero, so
+    # a finding refuted/declined/deferred in round 1 comes back in rounds 2 and 3
+    # and the author hand-writes the same rebuttal again. A dedupe filter can't
+    # fix that — the judge rewrites each finding's prose every round, so a true
+    # repeat pair scores LOWER on text similarity than two unrelated findings on
+    # the same file. The prior context has to enter the prompt.
+    #
+    # One fetch, nine consumers: the 8 review cells and consolidate all download
+    # the `cursor-review-ledger` artifact this job publishes.
+    #
+    # This job must never fail the run — the review matrix `needs:` it, so a hard
+    # failure here would skip the whole panel. Every step is continue-on-error
+    # and a fallback guarantees the artifact exists, degrading to status=unknown
+    # (which is reported, never silently reported as `empty`).
+    name: Prior-review ledger
+    needs: gate
+    if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true'
+    runs-on: ubuntu-latest
+    # Deliberately longer than the per-step timeouts below: a hung step must
+    # trip its OWN timeout (which continue-on-error absorbs) rather than the
+    # job's, because a FAILED job here would skip the entire review matrix.
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      status: ${{ steps.build.outputs.status || steps.fallback.outputs.status }}
+      rounds: ${{ steps.build.outputs.rounds || steps.fallback.outputs.rounds }}
+      last_reviewed_sha: ${{ steps.build.outputs.last_reviewed_sha }}
+    steps:
+      - name: Load cursor-review assets
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: actions/checkout@v6
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _cursor_review_assets
+          persist-credentials: false
+
+      - name: Build prior-review ledger
+        id: build
+        continue-on-error: true
+        timeout-minutes: 8
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          LEDGER_ENABLED: ${{ inputs.ledger_prior_review }}
+        run: |
+          mkdir -p /tmp/ledger
+          python3 "$CURSOR_REVIEW_ASSETS/build-ledger.py" build \
+            --repo "$REPO" \
+            --pr-number "$PR_NUMBER" \
+            --pr-author "$PR_AUTHOR" \
+            --out-dir /tmp/ledger \
+            --enabled "$LEDGER_ENABLED"
+
+      - name: Ensure ledger artifact exists
+        id: fallback
+        if: always()
+        run: |
+          # The build step handles its own fetch failures (status=unknown). This
+          # covers the harder failure — the checkout or the interpreter itself
+          # died — so the downstream download always finds a well-formed ledger
+          # and the review body still tells the reader context was missing.
+          mkdir -p /tmp/ledger
+          if [ -f /tmp/ledger/ledger.json ]; then
+            exit 0
+          fi
+          echo '{"status": "unknown", "rounds": 0, "total_rounds": 0, "entries": [], "entry_count": 0, "unanswered_count": 0, "failed_call": "ledger job", "reason": "the ledger step did not produce an output file (see the job log)"}' > /tmp/ledger/ledger.json
+          : > /tmp/ledger/ledger.md
+          : > /tmp/ledger/ledger-judge.md
+          printf '%s' "⚠️ prior-review context unavailable (ledger job: the ledger step did not produce an output file) — findings may repeat earlier rounds." > /tmp/ledger/ledger-note.txt
+          {
+            echo "status=unknown"
+            echo "rounds=0"
+          } >> "$GITHUB_OUTPUT"
+          echo "::warning::Prior-review ledger step produced no output — running without prior-round context."
+
+      - name: Upload ledger artifact
+        if: always()
+        # continue-on-error like every other step in this job, for the reason in
+        # the job comment: `review` needs this job and has no always() guard, and
+        # `consolidate` then drops out on `needs.review.result != 'skipped'`. An
+        # artifact-upload hiccup failing THIS job would therefore post no review
+        # at all — strictly worse than the degraded path, where the panel simply
+        # runs without prior context and the review body says so (the consumers
+        # of the artifact all download it continue-on-error, and consolidate
+        # emits the unavailable banner when the file does not arrive).
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: cursor-review-ledger
+          path: /tmp/ledger
+          if-no-files-found: error
+          retention-days: 7
+
   diff-size:
     name: Diff size check
-    needs: gate
+    # Needs `ledger` (not just `gate`) so it can build the incremental
+    # "hunks new since the last reviewed round" diff here too, alongside the
+    # main reviewed diff — one checkout, one artifact, instead of every panel
+    # cell (plus consolidate) re-deriving it from its own PR checkout.
+    needs: [gate, ledger]
     if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -450,6 +576,31 @@ jobs:
             > "${RUNNER_TEMP}/pr-diff.patch"
           echo "Reviewed diff size: $(wc -l < "${RUNNER_TEMP}/pr-diff.patch") lines"
 
+      - name: Build incremental diff since last review
+        # The subset of the reviewed diff that changed since the last reviewed
+        # round — PRIORITIZATION, not narrowing, the full diff above stays the
+        # primary input; this just tells the panel where to spend budget. Built
+        # here (this job already holds the fetch-depth:0 checkout) so it can
+        # ride the same shared artifact instead of every consumer re-deriving it.
+        # Best-effort: an unresolvable SHA (force-push, base-branch rewrite)
+        # simply produces no incremental block.
+        if: steps.check.outputs.over_cap != 'true'
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          LAST_REVIEWED_SHA: ${{ needs.ledger.outputs.last_reviewed_sha }}
+          LEDGER_ROUNDS: ${{ needs.ledger.outputs.rounds }}
+        run: |
+          : > "${RUNNER_TEMP}/pr-diff-new.patch"
+          if [ -n "$LAST_REVIEWED_SHA" ] && [ "$LAST_REVIEWED_SHA" != "$HEAD_SHA" ] \
+             && git cat-file -e "${LAST_REVIEWED_SHA}^{commit}" 2>/dev/null; then
+            # shellcheck disable=SC2086
+            git diff "${LAST_REVIEWED_SHA}...${HEAD_SHA}" -- . $DIFF_EXCLUDES \
+              > "${RUNNER_TEMP}/pr-diff-new.patch" || : > "${RUNNER_TEMP}/pr-diff-new.patch"
+            echo "Incremental diff since round ${LEDGER_ROUNDS:-?} (${LAST_REVIEWED_SHA}): $(wc -l < "${RUNNER_TEMP}/pr-diff-new.patch") lines"
+          else
+            echo "No usable last-reviewed SHA — skipping the incremental diff block."
+          fi
+
       - name: Upload reviewed diff
         # Shared with the panel cells + judge so the diff is generated ONCE, and
         # those jobs need no PR checkout of their own.
@@ -457,7 +608,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: pr-diff
-          path: ${{ runner.temp }}/pr-diff.patch
+          path: |
+            ${{ runner.temp }}/pr-diff.patch
+            ${{ runner.temp }}/pr-diff-new.patch
           if-no-files-found: error
           retention-days: 7
 
@@ -513,6 +666,16 @@ jobs:
           JSON
           echo "models=$(jq -c . /tmp/models.json)" >> "$GITHUB_OUTPUT"
 
+      - name: Load cursor-review assets
+        # Same trusted-assets checkout the review/consolidate jobs do — this
+        # job needs it for install-cursor-cli.sh.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _cursor_review_assets
+          persist-credentials: false
+
       - name: Install Cursor agent CLI
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
@@ -524,57 +687,7 @@ jobs:
             echo "No CURSOR_API_KEY (fork PR or unset secret) — skipping catalog preflight."
             exit 0
           fi
-          # Download-then-execute instead of curl|bash: a pipeline's exit status is its
-          # last command's, so a failed curl piped into bash exits 0 and the missing
-          # binary resurfaces later as a misleading 'command not found' (BE-5631).
-          # mktemp rather than a fixed name: nothing can pre-place a symlink at a
-          # predictable path for `curl -o` to write through.
-          installer="$(mktemp "${RUNNER_TEMP:-/tmp}/cursor-install.XXXXXX")"
-          # Both halves are time-bounded, because the fetch is two downloads: curl
-          # gets the ~6 KB bootstrap, then the bootstrap itself pulls the actual
-          # cursor-agent payload. Unbounded, a stalled cursor.com burns the whole job
-          # budget and surfaces as an opaque cancelled job rather than the readable
-          # install failure this step exists to produce. --max-time is per attempt and
-          # --retry-max-time only bounds when a NEW attempt may start, so an attempt
-          # beginning just under 120s still gets its full 60s: curl's worst case is
-          # ~3 min. +240s for the installer (plus a 30s SIGKILL grace) keeps the total
-          # inside the tightest job cap here — preflight's timeout-minutes: 10.
-          curl -fsSL --connect-timeout 10 --max-time 60 \
-            --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 120 \
-            https://cursor.com/install -o "$installer"
-          # A 200 with an empty body would make the installer a silent no-op.
-          if [ ! -s "$installer" ]; then
-            echo "::error::cursor.com/install returned an empty body — nothing to execute."
-            exit 1
-          fi
-          # -k escalates to SIGKILL, so an installer that traps SIGTERM cannot outlive
-          # the cap. </dev/null keeps stdin closed, as it effectively was under
-          # curl|bash, so an installer that branches on interactive stdin is unaffected.
-          rc=0
-          timeout -k 30 240 bash "$installer" </dev/null || rc=$?
-          if [ "$rc" -ne 0 ]; then
-            echo "::error::cursor.com installer exited $rc (124 usually means it exceeded the 240s cap)."
-            exit "$rc"
-          fi
-          # $GITHUB_PATH only applies to LATER steps, so assert against the install
-          # location directly. The installer symlinks cursor-agent into ~/.local/bin,
-          # which is already on the runner PATH — hence command -v is the real check
-          # and the explicit path is the fallback. -f as well as -x, because -x alone
-          # is also true for a searchable directory sitting at that path.
-          agent="$HOME/.local/bin/cursor-agent"
-          if ! command -v cursor-agent >/dev/null 2>&1 \
-            && ! { [ -f "$agent" ] && [ -x "$agent" ]; }; then
-            echo "::error::cursor-agent missing after install — the installer ran but produced no cursor-agent binary (expected a symlink in \$HOME/.local/bin)."
-            exit 1
-          fi
-          # Export the directory the installer actually writes to. It is already on the
-          # GitHub-hosted runner's default PATH, so this is a no-op there; it matters
-          # when only the explicit-path fallback above satisfied the assertion, which
-          # would otherwise still leave later steps with 'cursor-agent: command not
-          # found'. Replaces a vestigial $HOME/.cursor/bin entry: the current installer
-          # never creates that directory, and any run reaching this line has already
-          # proven cursor-agent is on PATH or in ~/.local/bin, so it never contributed.
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          bash "$CURSOR_REVIEW_ASSETS/install-cursor-cli.sh"
 
       - name: Validate model pins against live catalog
         env:
@@ -639,7 +752,7 @@ jobs:
     name: '${{ matrix.review_type }} (${{ matrix.model }})'
     # `preflight` gates the fan-out: if a pinned model is delisted it fails
     # there, and this job is skipped instead of quietly running a lab short.
-    needs: [gate, diff-size, preflight]
+    needs: [gate, diff-size, preflight, ledger]
     if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -691,85 +804,68 @@ jobs:
           persist-credentials: false
 
       - name: Download reviewed diff
-        # The generated-file-excluded diff is built ONCE in the diff-size job and
-        # shared here, so this cell needs no PR checkout of its own — the only
-        # PR-authored content it ever sees is the diff text it reviews.
+        # The generated-file-excluded diff (plus the incremental "hunks new
+        # since the last reviewed round" diff) is built ONCE in the diff-size
+        # job and shared here, so this cell needs no PR checkout of its own —
+        # the only PR-authored content it ever sees is the diff text it reviews.
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           name: pr-diff
           path: /tmp
 
-      - name: Install Cursor agent CLI
-        run: |
-          # Download-then-execute instead of curl|bash: a pipeline's exit status is its
-          # last command's, so a failed curl piped into bash exits 0 and the missing
-          # binary resurfaces later as a misleading 'command not found' (BE-5631).
-          # mktemp rather than a fixed name: nothing can pre-place a symlink at a
-          # predictable path for `curl -o` to write through.
-          installer="$(mktemp "${RUNNER_TEMP:-/tmp}/cursor-install.XXXXXX")"
-          # Both halves are time-bounded, because the fetch is two downloads: curl
-          # gets the ~6 KB bootstrap, then the bootstrap itself pulls the actual
-          # cursor-agent payload. Unbounded, a stalled cursor.com burns the whole job
-          # budget and surfaces as an opaque cancelled job rather than the readable
-          # install failure this step exists to produce. --max-time is per attempt and
-          # --retry-max-time only bounds when a NEW attempt may start, so an attempt
-          # beginning just under 120s still gets its full 60s: curl's worst case is
-          # ~3 min. +240s for the installer (plus a 30s SIGKILL grace) keeps the total
-          # inside the tightest job cap here — preflight's timeout-minutes: 10.
-          curl -fsSL --connect-timeout 10 --max-time 60 \
-            --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 120 \
-            https://cursor.com/install -o "$installer"
-          # A 200 with an empty body would make the installer a silent no-op.
-          if [ ! -s "$installer" ]; then
-            echo "::error::cursor.com/install returned an empty body — nothing to execute."
-            exit 1
-          fi
-          # -k escalates to SIGKILL, so an installer that traps SIGTERM cannot outlive
-          # the cap. </dev/null keeps stdin closed, as it effectively was under
-          # curl|bash, so an installer that branches on interactive stdin is unaffected.
-          rc=0
-          timeout -k 30 240 bash "$installer" </dev/null || rc=$?
-          if [ "$rc" -ne 0 ]; then
-            echo "::error::cursor.com installer exited $rc (124 usually means it exceeded the 240s cap)."
-            exit "$rc"
-          fi
-          # $GITHUB_PATH only applies to LATER steps, so assert against the install
-          # location directly. The installer symlinks cursor-agent into ~/.local/bin,
-          # which is already on the runner PATH — hence command -v is the real check
-          # and the explicit path is the fallback. -f as well as -x, because -x alone
-          # is also true for a searchable directory sitting at that path.
-          agent="$HOME/.local/bin/cursor-agent"
-          if ! command -v cursor-agent >/dev/null 2>&1 \
-            && ! { [ -f "$agent" ] && [ -x "$agent" ]; }; then
-            echo "::error::cursor-agent missing after install — the installer ran but produced no cursor-agent binary (expected a symlink in \$HOME/.local/bin)."
-            exit 1
-          fi
-          # Export the directory the installer actually writes to. It is already on the
-          # GitHub-hosted runner's default PATH, so this is a no-op there; it matters
-          # when only the explicit-path fallback above satisfied the assertion, which
-          # would otherwise still leave later steps with 'cursor-agent: command not
-          # found'. Replaces a vestigial $HOME/.cursor/bin entry: the current installer
-          # never creates that directory, and any run reaching this line has already
-          # proven cursor-agent is on PATH or in ~/.local/bin, so it never contributed.
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Download prior-review ledger
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: cursor-review-ledger
+          path: /tmp/ledger
 
-      - name: Log Cursor agent version
-        # The install script is unpinned (curl | bash from cursor.com), so we
-        # log the installed version into the run for forensics rather than
-        # gating on a hard-coded baseline. A version equality check produced
-        # daily toil without adding integrity protection — a CDN compromise
-        # would just ship malicious bits as a "new version" we'd then bump to.
-        run: cursor-agent --version
+      - name: Install Cursor agent CLI
+        run: bash "$CURSOR_REVIEW_ASSETS/install-cursor-cli.sh"
+
+      - name: Verify Cursor agent version
+        # The installer already asserts this once. Re-asserted here, on the
+        # PATH-resolved binary immediately before the review runs, so a swap
+        # between install and use (a CLI self-update, a stale symlink) can't
+        # quietly hand the review to unpinned bits — and the version still
+        # lands in the log for forensics.
+        run: |
+          installed="$(cursor-agent --version)"
+          if [ "$installed" != "$CURSOR_CLI_VERSION" ]; then
+            echo "::error::cursor-agent reports '${installed}', expected the pinned '${CURSOR_CLI_VERSION}'."
+            exit 1
+          fi
+          echo "cursor-agent ${installed} (matches CURSOR_CLI_VERSION)."
 
       - name: Build prompt
         env:
           REVIEW_TYPE: ${{ matrix.review_type }}
+          LEDGER_ROUNDS: ${{ needs.ledger.outputs.rounds }}
         run: |
+          # Splice the prior-review ledger in AFTER the static instructions and
+          # BEFORE the diff. With no ledger (first round, kill switch off, or a
+          # failed fetch) the spliced prompt is BYTE-IDENTICAL to the prompt file
+          # — that is the no-regression property this whole feature rests on.
+          python3 "$CURSOR_REVIEW_ASSETS/build-ledger.py" splice \
+            --prompt "$CURSOR_REVIEW_ASSETS/prompt-${REVIEW_TYPE}.md" \
+            --marker '=== BEGIN DIFF ===' \
+            --insert /tmp/ledger/ledger.md \
+            --out /tmp/prompt-head.txt
+
           {
-            cat "$CURSOR_REVIEW_ASSETS/prompt-${REVIEW_TYPE}.md"
+            cat /tmp/prompt-head.txt
             cat /tmp/pr-diff.patch
             echo ""
             echo "=== END DIFF ==="
+            if [ -s /tmp/pr-diff-new.patch ]; then
+              echo ""
+              echo "=== HUNKS NEW SINCE ROUND ${LEDGER_ROUNDS:-?} ==="
+              echo "The subset of the diff above that changed since the last reviewed"
+              echo "commit. Prioritize it — but the full diff above is still in scope."
+              cat /tmp/pr-diff-new.patch
+              echo ""
+              echo "=== END HUNKS NEW SINCE ROUND ${LEDGER_ROUNDS:-?} ==="
+            fi
           } > /tmp/prompt.txt
 
           echo "Prompt size: $(wc -c < /tmp/prompt.txt) bytes"
@@ -842,7 +938,7 @@ jobs:
     # Adjudicates the 8 cell artifacts into one consolidated review.
     # Calls cursor-agent one more time as the judge, with prompt-judge.md.
     name: Consolidate panel
-    needs: [gate, diff-size, review]
+    needs: [gate, diff-size, review, ledger]
     if: always() && needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true' && needs.review.result != 'skipped'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -859,67 +955,25 @@ jobs:
           persist-credentials: false
 
       - name: Download reviewed diff
-        # Same generated-file-excluded diff the panel reviewed, built once in
-        # diff-size — so the judge adjudicates against exactly what the panel
-        # saw, and this job needs no PR checkout.
+        # Same generated-file-excluded diff (plus the incremental "hunks new
+        # since the last reviewed round" diff) the panel reviewed, built once
+        # in diff-size — so the judge adjudicates against exactly what the
+        # panel saw, and this job needs no PR checkout.
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: pr-diff
           path: /tmp
 
       - name: Install Cursor agent CLI
-        run: |
-          # Download-then-execute instead of curl|bash: a pipeline's exit status is its
-          # last command's, so a failed curl piped into bash exits 0 and the missing
-          # binary resurfaces later as a misleading 'command not found' (BE-5631).
-          # mktemp rather than a fixed name: nothing can pre-place a symlink at a
-          # predictable path for `curl -o` to write through.
-          installer="$(mktemp "${RUNNER_TEMP:-/tmp}/cursor-install.XXXXXX")"
-          # Both halves are time-bounded, because the fetch is two downloads: curl
-          # gets the ~6 KB bootstrap, then the bootstrap itself pulls the actual
-          # cursor-agent payload. Unbounded, a stalled cursor.com burns the whole job
-          # budget and surfaces as an opaque cancelled job rather than the readable
-          # install failure this step exists to produce. --max-time is per attempt and
-          # --retry-max-time only bounds when a NEW attempt may start, so an attempt
-          # beginning just under 120s still gets its full 60s: curl's worst case is
-          # ~3 min. +240s for the installer (plus a 30s SIGKILL grace) keeps the total
-          # inside the tightest job cap here — preflight's timeout-minutes: 10.
-          curl -fsSL --connect-timeout 10 --max-time 60 \
-            --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 120 \
-            https://cursor.com/install -o "$installer"
-          # A 200 with an empty body would make the installer a silent no-op.
-          if [ ! -s "$installer" ]; then
-            echo "::error::cursor.com/install returned an empty body — nothing to execute."
-            exit 1
-          fi
-          # -k escalates to SIGKILL, so an installer that traps SIGTERM cannot outlive
-          # the cap. </dev/null keeps stdin closed, as it effectively was under
-          # curl|bash, so an installer that branches on interactive stdin is unaffected.
-          rc=0
-          timeout -k 30 240 bash "$installer" </dev/null || rc=$?
-          if [ "$rc" -ne 0 ]; then
-            echo "::error::cursor.com installer exited $rc (124 usually means it exceeded the 240s cap)."
-            exit "$rc"
-          fi
-          # $GITHUB_PATH only applies to LATER steps, so assert against the install
-          # location directly. The installer symlinks cursor-agent into ~/.local/bin,
-          # which is already on the runner PATH — hence command -v is the real check
-          # and the explicit path is the fallback. -f as well as -x, because -x alone
-          # is also true for a searchable directory sitting at that path.
-          agent="$HOME/.local/bin/cursor-agent"
-          if ! command -v cursor-agent >/dev/null 2>&1 \
-            && ! { [ -f "$agent" ] && [ -x "$agent" ]; }; then
-            echo "::error::cursor-agent missing after install — the installer ran but produced no cursor-agent binary (expected a symlink in \$HOME/.local/bin)."
-            exit 1
-          fi
-          # Export the directory the installer actually writes to. It is already on the
-          # GitHub-hosted runner's default PATH, so this is a no-op there; it matters
-          # when only the explicit-path fallback above satisfied the assertion, which
-          # would otherwise still leave later steps with 'cursor-agent: command not
-          # found'. Replaces a vestigial $HOME/.cursor/bin entry: the current installer
-          # never creates that directory, and any run reaching this line has already
-          # proven cursor-agent is on PATH or in ~/.local/bin, so it never contributed.
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        run: bash "$CURSOR_REVIEW_ASSETS/install-cursor-cli.sh"
+
+      - name: Download prior-review ledger
+        id: ledger_download
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: cursor-review-ledger
+          path: /tmp/ledger
 
       - name: Download panel findings
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -954,9 +1008,20 @@ jobs:
 
       - name: Build judge prompt
         if: steps.aggregate.outputs.ok_count != '0'
+        env:
+          LEDGER_ROUNDS: ${{ needs.ledger.outputs.rounds }}
         run: |
+          # The judge is the repeat-policy enforcement point, so it gets the
+          # judge-flavored ledger block (repeat_of requirement + the per-review
+          # repeat cap). Byte-identical to the old prompt when there's no ledger.
+          python3 "$CURSOR_REVIEW_ASSETS/build-ledger.py" splice \
+            --prompt "$CURSOR_REVIEW_ASSETS/prompt-judge.md" \
+            --marker '=== BEGIN PANEL FINDINGS ===' \
+            --insert /tmp/ledger/ledger-judge.md \
+            --out /tmp/judge-prompt-head.txt
+
           {
-            cat "$CURSOR_REVIEW_ASSETS/prompt-judge.md"
+            cat /tmp/judge-prompt-head.txt
             cat /tmp/panel.json
             echo ""
             echo "=== END PANEL FINDINGS ==="
@@ -965,6 +1030,13 @@ jobs:
             cat /tmp/pr-diff.patch
             echo ""
             echo "=== END DIFF ==="
+            if [ -s /tmp/pr-diff-new.patch ]; then
+              echo ""
+              echo "=== HUNKS NEW SINCE ROUND ${LEDGER_ROUNDS:-?} ==="
+              cat /tmp/pr-diff-new.patch
+              echo ""
+              echo "=== END HUNKS NEW SINCE ROUND ${LEDGER_ROUNDS:-?} ==="
+            fi
           } > /tmp/judge-prompt.txt
 
           echo "Judge prompt size: $(wc -c < /tmp/judge-prompt.txt) bytes"
@@ -1142,7 +1214,39 @@ jobs:
           TRIGGERED_BY: ${{ steps.triggerer.outputs.triggered_by }}
           JUDGE_STATUS: ${{ steps.consolidated.outputs.judge_status }}
           CONSOLIDATED_COUNT: ${{ steps.consolidated.outputs.consolidated_count }}
+          LEDGER_STATUS: ${{ needs.ledger.outputs.status }}
+          LEDGER_DOWNLOAD: ${{ steps.ledger_download.outcome }}
         run: |
+          # Prior-review ledger line for the review header: either the
+          # round/ledger summary, or the "context unavailable" banner naming the
+          # failed call. A guard that could not read its input SAYS SO — a
+          # context-free re-review must never render identically to a genuine
+          # first-round review.
+          #
+          # The DELIVERY of the ledger is checked separately from its CONTENT.
+          # Both downloads are continue-on-error, so an upload or download that
+          # failed leaves no ledger-note.txt while the ledger job still reports
+          # status=ok — and the panel prompts were spliced with an EMPTY block.
+          # Reading only LEDGER_STATUS there would emit no banner and the
+          # context-free re-review would render as a genuine first round, the
+          # exact partial failure the banner exists to catch. So: file ABSENT
+          # (delivery failed) is a banner; file PRESENT but empty is a real
+          # "nothing to say" (first round / kill switch / no prior findings).
+          LEDGER_NOTE=""
+          if [ "${LEDGER_DOWNLOAD:-failure}" != "success" ] || [ ! -f /tmp/ledger/ledger-note.txt ]; then
+            LEDGER_NOTE="⚠️ prior-review context unavailable (ledger artifact did not reach the consolidate job: download=${LEDGER_DOWNLOAD:-missing}) — the panel ran without prior-round context, so findings may repeat earlier rounds."
+          else
+            LEDGER_NOTE="$(cat /tmp/ledger/ledger-note.txt)"
+            if [ -z "$LEDGER_NOTE" ]; then
+              case "${LEDGER_STATUS:-missing}" in
+                ok|empty|disabled) ;;
+                *)
+                  LEDGER_NOTE="⚠️ prior-review context unavailable (ledger job: status=${LEDGER_STATUS:-missing}) — findings may repeat earlier rounds."
+                  ;;
+              esac
+            fi
+          fi
+
           # Three cases:
           # 1. Judge ok                       → normal consolidated review.
           # 2. Judge failed, panel has findings → post the raw per-cell findings
@@ -1154,7 +1258,8 @@ jobs:
               --pr-number "$PR_NUMBER" \
               --repo "$REPO" \
               --commit-sha "$HEAD_SHA" \
-              --triggered-by "$TRIGGERED_BY"
+              --triggered-by "$TRIGGERED_BY" \
+              --ledger-note "$LEDGER_NOTE"
           elif [ "${CONSOLIDATED_COUNT:-0}" != "0" ]; then
             JUDGE_ERROR=$(python3 -c "import json; print(json.load(open('/tmp/judge-findings.json')).get('error','(no error message)'))")
             python3 "$CURSOR_REVIEW_ASSETS/post-review.py" \
@@ -1163,6 +1268,7 @@ jobs:
               --repo "$REPO" \
               --commit-sha "$HEAD_SHA" \
               --triggered-by "$TRIGGERED_BY" \
+              --ledger-note "$LEDGER_NOTE" \
               --notice "⚠️ The judge step could not produce a parseable verdict after a retry (status=${JUDGE_STATUS}). The findings below are the raw, un-adjudicated panel output — they may contain duplicates or false positives the judge would normally filter."
           else
             JUDGE_ERROR=$(python3 -c "import json; print(json.load(open('/tmp/judge-findings.json')).get('error','(no error message)'))")
@@ -1172,6 +1278,7 @@ jobs:
               --repo "$REPO" \
               --commit-sha "$HEAD_SHA" \
               --triggered-by "$TRIGGERED_BY" \
+              --ledger-note "$LEDGER_NOTE" \
               --error-message "Judge call failed (status=${JUDGE_STATUS}): ${JUDGE_ERROR}"
           fi
 

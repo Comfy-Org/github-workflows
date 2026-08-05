@@ -23,6 +23,9 @@ python3 -m unittest discover -s .github/agents-md-integrity/tests -p 'test_*.py'
 # groom dedup/rejection ledger tests
 python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
 
+# refresh-reviewers generator tests
+python3 -m unittest discover -s .github/refresh-reviewers/tests -p 'test_*.py' -v
+
 # bump-callers shell tests + lint (gh is stubbed; no network)
 shellcheck -x .github/bump-callers/bump-callers.sh .github/bump-callers/tests/test_bump_callers.sh
 bash .github/bump-callers/tests/test_bump_callers.sh
@@ -43,7 +46,10 @@ tests — run the matching command above for whatever you touched.
   repo's own CI callers (`ci-*.yml`) and the `test-*.yml` script tests.
 - `.github/cursor-review/` — prompts + scripts behind `cursor-review.yml`
   (the multi-model review panel + judge). Single source of truth; loaded at run
-  time, never copied into consumers. Tests in `tests/`.
+  time, never copied into consumers. Also holds `catalog-drift.py`, the
+  comparison logic behind the weekly `cursor-review-catalog-drift.yml` check
+  (BE-4819) — it reads the pins *out of* `cursor-review.yml`, so never
+  duplicate the model list. Tests in `tests/`.
 - `.github/agents-md-integrity/` — `check_agents_md.py`, the checker behind
   `agents-md-integrity.yml` (enforces this AGENTS.md standard). Tests in `tests/`.
 - `.github/groom/` — briefs + building blocks behind the reusable **groom**
@@ -55,7 +61,15 @@ tests — run the matching command above for whatever you touched.
   built finding is never re-proposed — and `interval.py`, the runtime cadence
   gate (`GROOM_INTERVAL_DAYS`) that early-exits a daily tick unless the interval
   has elapsed since the last real run (derived from Actions run history — no new
-  secret). Tests in `tests/`.
+  secret). Also `package.json` (BE-5373) — not a project, no lockfile, nothing is
+  installed from it: it is the one Dependabot-visible home of the
+  `@anthropic-ai/claude-code` pin, which `groom.yml`'s gate reads once and feeds
+  to all three agent jobs. Keep it exact; never re-hardcode a version in a `run:`
+  step. Tests in `tests/`.
+- `.github/refresh-reviewers/` — `generate.py`, the engine behind
+  `refresh-reviewers.yml`: recomputes a caller's reviewers.yml from git history
+  (decayed commit touches, assigner-parity globs, collaborator-only) and
+  surgically rewrites just the reviewer lists for a drift PR. Tests in `tests/`.
 - `.github/bump-callers/` — `bump-callers.sh`, the ONE fleet-agnostic script
   that opens SHA-bump PRs in consumer repos when a reusable workflow changes.
   Tests in `tests/`.
@@ -82,25 +96,39 @@ tests — run the matching command above for whatever you touched.
   auto-merged) via a credential-free patch job + a separate bot PR job.
 - `agents-md-integrity.yml` — enforces the AGENTS.md standard on the caller repo.
 - `assign-reviewers.yml` — expertise-aware, load-balanced reviewer requests.
+- `refresh-reviewers.yml` — scheduled drift-detector: recomputes the caller's
+  reviewers.yml from git history and opens one idempotent drift PR (never a
+  live mutator).
 - `assign-prs-to-author.yml` — assigns unassigned open PRs to their author.
 - `detect-unreviewed-merge.yml` — SOC 2: flags PRs merged without approval.
 - `bump-cursor-review-callers.yml` / `bump-auto-label-callers.yml` /
   `bump-agents-md-callers.yml` / `bump-pr-size-callers.yml` /
-  `bump-assign-reviewers-callers.yml` / `bump-groom-callers.yml` — thin
+  `bump-pr-risk-callers.yml` / `bump-assign-reviewers-callers.yml` /
+  `bump-groom-callers.yml` / `bump-detect-unreviewed-merge-callers.yml` — thin
   entrypoints over `bump-callers.sh` that fan SHA bumps out to consumers. A groom
-  caller pins TWICE (`uses:` + `workflows_ref:`); the shared rewrite moves both,
-  so never hand-bump one alone. `stale.yml` and `assign-prs-to-author.yml` have
-  no fleet because they have no callers; `detect-unreviewed-merge.yml` has ~12
-  callers and no fleet — a known, deferred gap, so its pins move by hand.
+  or pr-risk caller pins TWICE (`uses:` + `workflows_ref:`); the shared rewrite
+  moves both, so never hand-bump one alone. `stale.yml` and
+  `assign-prs-to-author.yml` have no fleet because they have no callers;
+  `detect-unreviewed-merge.yml`'s fleet is
+  `bump-detect-unreviewed-merge-callers.yml`; its `DETECT_UNREVIEWED_MERGE_CALLERS`
+  roster is deliberately UNSEEDED (so it hard-fails) until the run-log masking
+  gap is closed — see the bump-callers README.
+- `bump-cursor-cli-pin.yml` — weekly PR moving `CURSOR_CLI_VERSION` /
+  `CURSOR_CLI_SHA256` in `cursor-review.yml` (BE-5870). Not a caller bumper:
+  merging it trips `bump-cursor-review-callers.yml`'s path filter, which rolls
+  the fleet. Cursor ships no checksums, so the PR reviewer is the trust anchor
+  for the digest; the nixpkgs cross-check corroborates when it can and is fatal
+  only on a same-version hash MISMATCH (never a gate — nixpkgs lags releases).
 
 ## Conventions & gotchas
 
 - **Public repo — never leak private caller names.** Consumer repo lists live in
   repo **variables** — one per fleet (`CURSOR_REVIEW_CALLERS`,
   `AUTO_LABEL_CALLERS`, `AGENTS_MD_CALLERS`, `PR_SIZE_CALLERS`,
-  `ASSIGN_REVIEWERS_CALLERS`, `GROOM_CALLERS`; the bump-callers README table is
-  canonical) — never hardcoded in a workflow file or printed to run logs (logs
-  are public). The bumper masks names it processes. Keep private repo paths/detail out of
+  `PR_RISK_CALLERS`, `ASSIGN_REVIEWERS_CALLERS`, `GROOM_CALLERS`,
+  `DETECT_UNREVIEWED_MERGE_CALLERS`; the bump-callers README table is canonical)
+  — never hardcoded in a workflow file or printed to run logs (logs are public).
+  The bumper masks names it processes. Keep private repo paths/detail out of
   workflow files, commit messages, and PR text.
 - **Pin everything by full commit SHA**, with a trailing `# v1` comment — both
   the `uses:` in callers and every third-party action here. Bare `@v1` fails the

@@ -1,0 +1,8 @@
+{
+  "name": "comfy-groom-agent-cli",
+  "private": true,
+  "description": "Manifest whose ONLY job is to be the single, Dependabot-visible source of truth for the @anthropic-ai/claude-code CLI version that groom.yml installs. Nothing is ever `npm install`ed from this directory: the groom jobs read the pin out of this file and run `npm install -g @anthropic-ai/claude-code@<pin>`. It is a real npm manifest rather than a workflow `env:` constant purely so Dependabot's npm ecosystem can see the pin and open a bump PR — an inline `npm install -g pkg@1.2.3` inside a `run:` step is invisible to every ecosystem, which is how this pin silently rotted. Keep the version EXACT (no ^ or ~): the agent CLI is executable supply chain for steps that read untrusted repo content, and groom.yml rejects a non-exact pin at run time.",
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.217"
+  }
+}

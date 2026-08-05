@@ -56,6 +56,7 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TOOL_DIR="${TOOL_DIR:-$SELF_DIR}"
 GRADER="$TOOL_DIR/grade-pr-risk.sh"
 LABELER="$TOOL_DIR/apply-risk-label.sh"
+PUBLISHER="$TOOL_DIR/publish-risk-surfaces.sh"
 
 REPO="${REPO:-}"
 PR_NUMBERS="${PR_NUMBERS:-}"
@@ -69,8 +70,27 @@ SELF_RUN_ID="${SELF_RUN_ID:-}"
 WAIT_MINUTES="${WAIT_MINUTES:-10}"
 JOB_TIMEOUT_MINUTES="${JOB_TIMEOUT_MINUTES:-30}"
 LABEL_MAP="${LABEL_MAP:-}"
+# The two OPT-IN publish surfaces (pr-risk.yml `check_run:` / `sticky_comment:`). BOTH DEFAULT
+# OFF here as well as in the workflow: an enrolled consumer that does not opt in must see
+# byte-identical behaviour, and a default that lived only in the YAML would silently switch on
+# for anyone driving this script directly.
+PUBLISH_CHECK="${PUBLISH_CHECK:-0}"
+PUBLISH_COMMENT="${PUBLISH_COMMENT:-0}"
+CHECK_NAME="${CHECK_NAME:-}"
+DISPUTE_LABEL="${DISPUTE_LABEL:-}"
+STICKY_LOGINS="${STICKY_LOGINS:-}"
 MAX_TARGETS="${MAX_TARGETS:-50}"
 RESULTS="${RESULTS:-pr-risk-results.jsonl}"
+# Rendered Check Run payloads, one JSON object per target, consumed by pr-risk.yml's separate
+# `publish-check` job (see process_target).
+SURFACES="${SURFACES:-pr-risk-surfaces.jsonl}"
+# ...and the ceiling on their SUM. The whole array crosses into the publish job as one job output
+# and then as one environment string, and Linux refuses to exec a step with any single env string
+# over 128KiB (MAX_ARG_STRLEN) — a 50-target backfill at the per-target cap would be ~600KB and
+# take the step down with E2BIG. 100000 leaves room for the rest of the environment.
+SURFACES_BUDGET_BYTES="${SURFACES_BUDGET_BYTES:-100000}"
+SURFACES_BYTES=0
+SURFACES_DROPPED=0
 DRY_RUN="${DRY_RUN:-0}"
 # The retry/backoff constants are env-overridable ONLY so the suite can exercise the
 # unreadable-PR, read-retry and settle-repeat branches without sleeping through the production
@@ -418,6 +438,65 @@ process_target() { # <num> -> rc 0 = label in sync, rc 1 = failed
     record_result "$num" failed "$G_TIER" "" "$record" "$G_WAITED" "$base" "graded ${G_TIER} but the label write FAILED (rc=${label_rc}) — the PR still carries whatever label it had"
     return 1
   fi
+  # THE PUBLISH SURFACES RUN AFTER THE LABEL AND CANNOT CHANGE THIS TARGET'S OUTCOME. They are
+  # off unless the caller opted in, and even when on, a failed Check Run or comment write is an
+  # annotation inside the publisher and an exit 0 out of it — the grade stays advisory, so a
+  # publish surface must never be able to fail a target that WAS graded and labeled. The rc is
+  # still read so a setup error (a missing script, a bad record path) is visible in the log.
+  if [ "$PUBLISH_COMMENT" = 1 ]; then
+    REPO="$REPO" PR_NUMBER="$num" RECORD="$record" \
+      PUBLISH_CHECK=0 PUBLISH_COMMENT=1 \
+      DISPUTE_LABEL="${DISPUTE_LABEL:-risk-grade-disputed}" \
+      STICKY_LOGINS="$STICKY_LOGINS" DRY_RUN="$DRY_RUN" \
+      bash "$PUBLISHER" >&2 \
+      || log "::warning::${REPO}#${num}: the sticky comment reported a setup error — the grade and its label are unaffected"
+  fi
+  # The Check Run is RENDERED here and POSTED by a separate job. This job holds no
+  # `checks: write` (adding it would have broken every already-enrolled caller, whose reviewed
+  # permissions block grants `checks: read`), and the split is also the security posture worth
+  # having: the escaping of PR-controlled text happens in the job with the narrow token, and the
+  # job holding the elevated one only ever writes strings this one already sanitised.
+  if [ "$PUBLISH_CHECK" = 1 ]; then
+    local rendered render_rc=0 payload=""
+    # The render's stderr goes to $ERRF, not /dev/null: a bad CHECK_SUMMARY_CAP or a non-JSON
+    # render otherwise made the target vanish from the publish set with no annotation at all,
+    # so a `check_run: true` opt-in silently produced no Check Run and nothing said why.
+    init_scratch
+    rendered="$(RECORD="$record" RENDER_ONLY=1 bash "$PUBLISHER" 2>"$ERRF")" || render_rc=$?
+    if [ "$render_rc" -ne 0 ] || [ -z "$rendered" ]; then
+      log "::warning::${REPO}#${num}: the Check Run could not be rendered (rc=${render_rc}) — no check will be published for it: $(gherr)"
+    else
+      # The summary is CAPPED here, well below GitHub's 65535-char Check Run limit, because it
+      # travels to the publish job as a JOB OUTPUT and job outputs share a ~1MB budget across the
+      # whole job: 50 targets x a full-length summary would blow it and the publish job would
+      # receive a TRUNCATED or empty value for every target, not just the offenders. The per-axis
+      # table and the concentration sentence both fit comfortably inside this.
+      #
+      # `sha` is the GRADED commit, carried forward so the publish job attaches the check to what
+      # was actually graded instead of re-reading head a job later (see the record's `head_sha`).
+      payload="$(jq -c --argjson pr "$num" --argjson cap "${CHECK_SUMMARY_CAP:-12000}" \
+                    --arg sha "$(jq -r '.head_sha // ""' "$record" 2>/dev/null)" \
+         '{pr:$pr, sha:(if $sha == "" then null else $sha end),
+           title:.check_title, summary:(.check_summary[0:$cap])}' <<<"$rendered")" || payload=""
+      if [ -z "$payload" ]; then
+        log "::warning::${REPO}#${num}: the rendered Check Run payload could not be assembled — no check will be published for it"
+      # THE AGGREGATE IS BOUNDED, NOT JUST EACH ROW. The per-target cap says nothing about the
+      # sum, and all of them travel to the publish job as ONE environment string — which Linux
+      # caps at 128KiB per string (MAX_ARG_STRLEN) regardless of the much larger total ARG_MAX.
+      # Past that the publish STEP fails to exec at all, turning an advisory grade into a red
+      # job: the one outcome the `exit 0` at the end of that step exists to prevent. So the
+      # excess degrades (no check for those targets) and SAYS SO, rather than taking the run
+      # down with it.
+      elif [ "$(( SURFACES_BYTES + ${#payload} + 1 ))" -gt "$SURFACES_BUDGET_BYTES" ]; then
+        SURFACES_DROPPED=$(( SURFACES_DROPPED + 1 ))
+        log "::warning::${REPO}#${num}: the Check Run payload budget (${SURFACES_BUDGET_BYTES} bytes) is spent — NO check will be published for this target. Its grade, label and step-summary row are unaffected."
+      else
+        printf '%s\n' "$payload" >> "$SURFACES"
+        SURFACES_BYTES=$(( SURFACES_BYTES + ${#payload} + 1 ))
+      fi
+    fi
+  fi
+
   # `unknown` is a REPORTED verdict, not a failure: the event path labels it `risk:ungraded` and
   # keeps the check green, and a dispatch must not start disagreeing about that.
   case "$G_TIER" in
@@ -436,6 +515,10 @@ main() {
   [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "bad REPO '$REPO' (want owner/name)"
   [ -f "$GRADER" ]  || die "grader not found at $GRADER (set TOOL_DIR)"
   [ -f "$LABELER" ] || die "label script not found at $LABELER (set TOOL_DIR)"
+  # Checked ONLY when a surface is on, so a caller that never opted in cannot be failed by a
+  # file it does not use.
+  { [ "$PUBLISH_CHECK" != 1 ] && [ "$PUBLISH_COMMENT" != 1 ]; } || [ -f "$PUBLISHER" ] \
+    || die "publish script not found at $PUBLISHER (set TOOL_DIR) — check_run/sticky_comment were requested"
   command -v jq >/dev/null 2>&1 || die "jq not found on PATH"
   command -v gh >/dev/null 2>&1 || die "gh not found on PATH"
   [[ "$JOB_TIMEOUT_MINUTES" =~ ^[1-9][0-9]*$ ]] || die "bad JOB_TIMEOUT_MINUTES '$JOB_TIMEOUT_MINUTES' (want a positive integer — it is the calling job's timeout-minutes, and 0 leaves no time to grade anything)"
@@ -474,6 +557,9 @@ main() {
   mapfile -t targets <<<"$raw_targets"
   TARGET_COUNT="${#targets[@]}"
   : > "$RESULTS"
+  : > "$SURFACES"
+  SURFACES_BYTES=0
+  SURFACES_DROPPED=0
   log "grading ${TARGET_COUNT} target(s) in ${REPO}: ${targets[*]}"
 
   local num graded=0 ungraded=0 failed=0 skipped=0 total_waited=0 attempted=0
@@ -509,8 +595,17 @@ main() {
       echo "ungraded=$ungraded"
       echo "failed=$failed"
       echo "skipped=$skipped"
+      # The rendered Check Run payloads, as ONE compact JSON array, for the publish job. Heredoc
+      # syntax because the summaries are multi-line; the delimiter is random-free but the value
+      # is jq-compact (single line) so it cannot contain the delimiter.
+      echo "surfaces=$(jq -sc '.' "$SURFACES" 2>/dev/null || echo '[]')"
     } >> "$GITHUB_OUTPUT"
   fi
+
+  # NEVER A SILENT CAP: a publish set short of the graded count has to say so, or the run reads as
+  # "every opted-in target got a check" when some deliberately did not.
+  [ "$SURFACES_DROPPED" -eq 0 ] || \
+    log "::warning::${SURFACES_DROPPED} target(s) got no Check Run payload — the ${SURFACES_BUDGET_BYTES}-byte publish budget was spent. Every one of them was still graded and labeled; re-dispatch them in a smaller batch to publish their checks."
 
   log "done: ${graded} graded, ${ungraded} ungraded, ${failed} failed, ${skipped} not attempted (waited ${total_waited}s total)"
   [ "$(( failed + skipped ))" -eq 0 ]

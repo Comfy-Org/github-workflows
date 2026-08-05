@@ -61,15 +61,39 @@ fi
 echo "pr-risk enabled=$enabled (decided by ${decided_by})"
 
 if [ "$enabled" != true ] && [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-  # shellcheck disable=SC2016  # the body is literal markdown; backticks are code spans
-  {
-    echo "## PR risk grading is DISABLED for this repository"
-    echo
-    echo "No grade was computed, and no \`risk:*\` label was added, changed, or removed —"
-    echo "any label already on this PR is left exactly as the last enabled run left it."
-    echo
-    echo "Decided by ${decided_by}. To switch grading on, either set the repository variable"
-    echo '`RISK_CONFIG` to `{"enabled": true}` (takes effect on the next run, no PR needed), or'
-    echo 'pass `enabled: true` in the caller'"'"'s `with:` block.'
-  } >> "$GITHUB_STEP_SUMMARY"
+  # A manual dispatch grades even while disabled (see the `grade` job's `if:`), so the summary
+  # MUST distinguish the two. Claiming "no grade was computed" on a run that is about to compute
+  # one is worse than saying nothing: it is the one line a reader would trust to tell them
+  # whether their label is current.
+  if [ "${GITHUB_EVENT_NAME:-}" = workflow_dispatch ]; then
+    # shellcheck disable=SC2016  # the body is literal markdown; backticks are code spans
+    {
+      echo "## Automatic PR risk grading is OFF for this repository"
+      echo
+      echo "This MANUAL run grades anyway and will sync a \`risk:*\` label — \`enabled\` governs"
+      echo "the \`pull_request\` stream, not a dispatch anyone with write access chose to run."
+      echo
+      echo "So the label this run leaves will NOT be kept up to date by pushes: until grading is"
+      echo "switched on, it reflects this moment only and every later commit will go ungraded."
+      echo
+      echo "Decided by ${decided_by}. To grade automatically from here on, set the repository"
+      echo 'variable `RISK_CONFIG` to `{"enabled": true}` (no PR needed), or pass'
+      echo '`enabled: true` in the caller'"'"'s `with:` block.'
+    } >> "$GITHUB_STEP_SUMMARY"
+  else
+    # shellcheck disable=SC2016  # the body is literal markdown; backticks are code spans
+    {
+      echo "## PR risk grading is DISABLED for this repository"
+      echo
+      echo "No grade was computed, and no \`risk:*\` label was added, changed, or removed —"
+      echo "any label already on this PR is left exactly as the last enabled run left it."
+      echo
+      echo "Decided by ${decided_by}. To switch grading on, either set the repository variable"
+      echo '`RISK_CONFIG` to `{"enabled": true}` (takes effect on the next run, no PR needed), or'
+      echo 'pass `enabled: true` in the caller'"'"'s `with:` block.'
+      echo
+      echo 'To grade a single PR right now WITHOUT switching the repo on, run this workflow from'
+      echo 'the Actions tab with `pr_number` set — a manual dispatch is not gated by this switch.'
+    } >> "$GITHUB_STEP_SUMMARY"
+  fi
 fi

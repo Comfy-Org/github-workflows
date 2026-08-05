@@ -9,6 +9,7 @@ the locked security knobs. Most of these are therefore negative tests.
 import io
 import json
 import os
+import re
 import sys
 import unittest
 import unittest.mock
@@ -376,6 +377,130 @@ class TestScopeLabel(unittest.TestCase):
 
     def test_invalid_shape_refused(self):
         self.assertNotIn("scope_label", resolve({}, '{"scope_label": "has spaces!"}'))
+
+
+class TestBailSink(unittest.TestCase):
+    """bail_sink (BE-6157) — the knob `max_findings: 0` never was.
+
+    Two halves: the ALLOWLIST coercion here, and `normalize_bail_sink`, which is
+    what `build_pr`'s inline Python actually calls to decide whether to suppress.
+    """
+
+    def test_operational_not_locked(self):
+        """The whole point: a repo can get silence via the variable, no PR."""
+        self.assertIn("bail_sink", config._OPERATIONAL_KEYS)
+        self.assertNotIn("bail_sink", config._LOCKED_KEYS)
+
+    def test_variable_can_suppress_bail_issues(self):
+        got = resolve({"bail_sink": "issue"}, '{"bail_sink": "none"}')
+        self.assertEqual(got["bail_sink"], "none")
+
+    def test_case_and_whitespace_insensitive(self):
+        for raw in ('{"bail_sink": "NONE"}', '{"bail_sink": "  none  "}'):
+            self.assertEqual(resolve({}, raw)["bail_sink"], "none", raw)
+
+    def test_linear_is_refused_by_name(self):
+        """Reserved for the sibling sink phase — must not resolve to silence."""
+        self.assertEqual(resolve({"bail_sink": "issue"}, '{"bail_sink": "linear"}')["bail_sink"],
+                         "issue")
+        self.assertIn("not implemented", warnings_from({}, '{"bail_sink": "linear"}'))
+
+    def test_unknown_value_keeps_the_callers_value(self):
+        for bad in ('{"bail_sink": "silent"}', '{"bail_sink": 0}', '{"bail_sink": true}'):
+            self.assertEqual(resolve({"bail_sink": "issue"}, bad)["bail_sink"], "issue", bad)
+
+    def test_normalize_defaults_to_issue(self):
+        """Every not-provably-`none` input must file — losing a CONFIRMED
+        finding silently is the one failure mode worth engineering against."""
+        for raw in (None, "", "   ", "linear", "silent", "issues", 0, False):
+            self.assertEqual(config.normalize_bail_sink(raw), "issue", repr(raw))
+
+    def test_normalize_suppresses_only_on_none(self):
+        for raw in ("none", "NONE", " None "):
+            self.assertEqual(config.normalize_bail_sink(raw), "none", repr(raw))
+
+    def test_dropped_value_reaches_build_pr_as_issue(self):
+        """End-to-end of the fail-safe: a typo'd variable drops the key from
+        `resolved`, so `fromJSON(...).bail_sink` renders EMPTY in the workflow —
+        and empty must mean `issue`, not `none`."""
+        resolved = resolve({}, '{"bail_sink": "nonw"}')
+        self.assertNotIn("bail_sink", resolved)
+        self.assertEqual(config.normalize_bail_sink(resolved.get("bail_sink")), "issue")
+
+
+class TestBailSinkWiring(unittest.TestCase):
+    """The half of the suppress path that lives in groom.yml (BE-6157).
+
+    `build_pr`'s bail branch is inline Python inside a YAML `run:` block, so it
+    cannot be imported and unit-tested directly. What CAN be pinned is the wiring
+    it depends on — an input, a defaults-layer entry, the env read, and the early
+    return — because every one of them is a silent failure if it goes missing: a
+    dropped `BAIL_SINK:` line leaves `bail_sink: none` accepted by config.py and
+    ignored by the job, which reads as "the knob does nothing".
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        path = os.path.join(os.path.dirname(__file__), "..", "..", "workflows", "groom.yml")
+        with open(path, encoding="utf-8") as f:
+            cls.wf = f.read()
+
+    def test_input_exists_and_defaults_to_issue(self):
+        """Default `issue` is the back-compat promise for every current caller."""
+        self.assertRegex(self.wf, r"(?s)\n      bail_sink:\n.*?\n        default: issue\n")
+
+    def test_input_is_in_the_defaults_layer(self):
+        """Without this the reviewed `with:` value never reaches config.py."""
+        self.assertRegex(self.wf, r'"bail_sink":\s*\$\{\{\s*toJSON\(inputs\.bail_sink\)\s*\}\}')
+
+    def test_build_pr_reads_the_resolved_value(self):
+        self.assertRegex(
+            self.wf,
+            r"BAIL_SINK:\s*\$\{\{\s*fromJSON\(needs\.gate\.outputs\.resolved\)\.bail_sink\s*\}\}",
+        )
+
+    def test_build_pr_suppresses_and_warns(self):
+        self.assertIn("from config import normalize_bail_sink", self.wf)
+        self.assertIn('bail_sink = normalize_bail_sink(os.environ.get("BAIL_SINK"))', self.wf)
+        self.assertIn('if bail_sink == "none" and not withheld:', self.wf)
+        # Suppressed must still be VISIBLE — the annotation is the recovery path.
+        self.assertIn("::warning::bail_sink=none", self.wf)
+
+    def test_secret_scan_withhold_is_exempt_from_suppression(self):
+        """`bail_sink` is an OPERATIONAL key only while it can't erase a security record.
+
+        The exemption rides on a machine field (`"withheld": true` in
+        result.json), NOT a substring match on the prose reason, so rewording the
+        bail message can never silently disarm it. Pin all three links: the
+        producer's flag, the bail call that sets it, and the consumer's read.
+        """
+        self.assertIn('printf \'{"status":"bail","reason":%s,"withheld":%s}\\n\'', self.wf)
+        withhold = re.search(r"\n\s*bail \"builder output withheld:.*\n", self.wf).group(0)
+        self.assertTrue(withhold.rstrip().endswith(" true"), withhold)
+        self.assertIn(
+            'file_issue(result.get("reason", "not built"), withheld=bool(result.get("withheld")))',
+            self.wf,
+        )
+
+    def test_missing_signature_guard_precedes_the_sink_branch(self):
+        """A schema failure must not be reported as an operator's suppression."""
+        body = self.wf[self.wf.index("def file_issue(reason, withheld=False):"):]
+        self.assertLess(body.index("has no signature"), body.index('bail_sink == "none"'))
+
+    def test_suppression_annotation_sanitizes_every_model_authored_field(self):
+        """`signature` is model-authored too: a raw newline in it forges a workflow command."""
+        branch = re.search(
+            r'(?s)if bail_sink == "none" and not withheld:.*?\n\s+return\n', self.wf
+        ).group(0)
+        for field in ("oneline(title, 120)", "oneline(sig, 200)", "oneline(reason, 300)"):
+            self.assertIn(field, branch)
+        self.assertNotIn("{sig or ", branch)
+
+    def test_max_findings_description_disclaims_bail_issues(self):
+        """The documentation half of the ticket, kept from silently rotting."""
+        block = re.search(r"(?s)\n      max_findings:\n(.*?)\n        type:", self.wf).group(1)
+        self.assertIn("bail_sink: none", block)
+        self.assertIn("does not govern", block.lower())
 
 
 class TestCliOutputShape(unittest.TestCase):

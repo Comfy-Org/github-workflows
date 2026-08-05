@@ -35,7 +35,11 @@ Selection guidance:
   aren't more.
 
 Output: a JSON array, no prose, no markdown fences. Each element is an
-object with exactly:
+object with exactly these five keys — plus, ONLY when a PRIOR REVIEW LEDGER
+block appears below and you are re-raising one of its already-answered
+entries, the two extra keys `"repeat_of"` and `"repeat_round"` that the
+ledger's REPEAT POLICY specifies. Emit those two on no other finding; with no
+ledger block present, the five keys below are the whole schema.
 - "file": string — repo-relative path
 - "line": integer — a line number that appears on the RIGHT (new) side of
   one of the diff hunks below. Lines that aren't in any hunk cannot be
