@@ -538,7 +538,7 @@ STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
   VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
   CALLERS_JSON='[{"repo":"Comfy-Org/secret-alpha","file":".github/workflows/ci.yml","label":"bug|ui"}]'
 check "exit 1"                             "[[ $RC -eq 1 ]]"
-check "error names the label rule"         "grep -q 'label must be a string containing no |, CR or newline' <<<\"\$OUT\""
+check "error names the label rule"         "grep -q 'label must be a string containing no |, comma or control character' <<<\"\$OUT\""
 check "the label itself was NEVER echoed"  "! grep -q 'bug|ui' <<<\"\$OUT\""
 check "wrote nothing anywhere"             "[[ -z \"\$(ls -A \"\$STUB_PUT_DIR\")\" ]]"
 check "bailed BEFORE the parse/mask loop"  "! grep -q '::add-mask::' <<<\"\$OUT\""
@@ -599,7 +599,7 @@ STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
   VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
   CALLERS_JSON='[{"repo":"Comfy-Org/secret-a","file":".github/workflows/ci.yml","label":"ci\r"}]'
 check "exit 1"                             "[[ $RC -eq 1 ]]"
-check "error names the label rule"         "grep -q 'label must be a string containing no |, CR or newline' <<<\"\$OUT\""
+check "error names the label rule"         "grep -q 'label must be a string containing no |, comma or control character' <<<\"\$OUT\""
 check "wrote nothing anywhere"             "[[ -z \"\$(ls -A \"\$STUB_PUT_DIR\")\" ]]"
 
 echo "== a lower-cased owner is a WORKING roster entry, not a fleet-wide hard fail (BE-6471) =="
@@ -637,11 +637,11 @@ STUB_CONTENT_FILE="$CR_FIXTURE" STUB_404_FILE="ci-b.yml" run_bump \
   CALLERS_JSON='[{"repo":"Comfy-Org/secret-mono","file":".github/workflows/ci-a.yml","label":""},{"repo":"Comfy-Org/secret-mono","file":".github/workflows/ci-b.yml","label":""}]'
 check "exit 1 — a missing caller file is un-bumpable, not a benign skip" "[[ $RC -eq 1 ]]"
 check "named the missing file and its variable" \
-  "grep -q 'ci-b.yml not found on main — fix or remove its CURSOR_REVIEW_CALLERS entry' <<<\"\$OUT\""
+  "grep -q 'ci-b.yml not found on the default branch — fix or remove its CURSOR_REVIEW_CALLERS entry' <<<\"\$OUT\""
 check "the 404 was NOT a repo failure"          "! grep -q 'bump failed for' <<<\"\$OUT\""
 check "committed only the present file"         "[[ \$(cat \"\$STUB_PUT_DIR/count\") -eq 1 ]]"
 check "still opened the PR for the sibling"     "grep -q 'PR opened' <<<\"\$OUT\""
-check "tallied exactly one un-bumpable entry"   "grep -q '::error::1 roster entr(y/ies) name a caller this bumper can never move' <<<\"\$OUT\""
+check "tallied exactly one un-bumpable entry"   "grep -q '::error::1 caller file(s) cannot be bumped by this fleet' <<<\"\$OUT\""
 check "did NOT report the fleet complete"       "! grep -q 'cursor-review bump complete' <<<\"\$OUT\""
 
 echo "== transient fetch error fails the repo — NEVER a silent partial bump =="
@@ -792,7 +792,7 @@ check "warned, naming the file and the variable" \
 check "fan-out continued — BOTH entries reached" \
   "[[ \$(grep -c 'carries no cursor-review.yml pin' <<<\"\$OUT\") -eq 2 ]]"
 check "aggregate error tallies both files" \
-  "grep -q '::error::2 roster entr(y/ies) name a caller this bumper can never move' <<<\"\$OUT\""
+  "grep -q '::error::2 caller file(s) cannot be bumped by this fleet' <<<\"\$OUT\""
 check "did NOT claim the file was already current" "! grep -q 'already at $SHORT' <<<\"\$OUT\""
 check "did NOT report the fleet complete"          "! grep -q 'cursor-review bump complete' <<<\"\$OUT\""
 check "committed nothing"                          "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
@@ -886,7 +886,7 @@ STUB_CONTENT_FILE="$NOPIN_FIXTURE" run_bump \
   CALLERS_JSON='[{"repo":"Comfy-Org/secret-dupnopin","file":".github/workflows/ci.yml","label":""},{"repo":"Comfy-Org/secret-dupnopin","file":".github/workflows/ci.yml","label":"ci"}]'
 check "exit 1"                                 "[[ $RC -eq 1 ]]"
 check "warned exactly once"                    "[[ \$(grep -c 'carries no cursor-review.yml pin' <<<\"\$OUT\") -eq 1 ]]"
-check "tallied exactly one entry, not two"     "grep -q '::error::1 roster entr(y/ies) name a caller this bumper can never move' <<<\"\$OUT\""
+check "tallied exactly one entry, not two"     "grep -q '::error::1 caller file(s) cannot be bumped by this fleet' <<<\"\$OUT\""
 
 echo "== one un-bumpable entry does not block another repo's bump (BE-6471) =="
 # The fan-out property, and the reason the tally fires at the END rather than at
@@ -906,7 +906,7 @@ check "exactly ONE caller was reported so"     "[[ \$(grep -c 'carries no cursor
 check "the HEALTHY caller was still committed" "[[ \$(cat \"\$STUB_PUT_DIR/count\") -eq 1 ]]"
 check "the healthy caller's pin moved"         "grep -qF 'cursor-review.yml@$NEW_SHA' \"$PUT\""
 check "the healthy caller still got its PR"    "grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
-check "the tally counts exactly one file"      "grep -q '::error::1 roster entr(y/ies) name a caller this bumper can never move' <<<\"\$OUT\""
+check "the tally counts exactly one file"      "grep -q '::error::1 caller file(s) cannot be bumped by this fleet' <<<\"\$OUT\""
 
 echo "== a TAG-pinned workflows_ref moves in lock-step with uses: (BE-4662) =="
 # The under-rewrite half of BE-4662. A caller pins this repo TWICE — the `uses:`
@@ -1284,6 +1284,151 @@ check "exit 0" "[[ $RC -eq 0 ]]"
 check "no spurious attribution warning"          "! grep -q 'pin comments untouched' <<<\"\$OUT\""
 check "the marker WAS refreshed"                 "grep -qF 'github-workflows main ($SHORT)' \"$PUT\""
 check "no stale short SHA left behind"           "! grep -qF 'main (1111111)' \"$PUT\""
+
+echo "== two CASE-VARIANT spellings of one repo are ONE bump, not two (BE-6471) =="
+# The roster rule accepts the owner case-insensitively, because GitHub resolves it
+# that way and `comfy-org/x` is a working entry. Accepting two spellings without
+# folding them is a partial bump: the repo grouping was byte-exact, so each
+# spelling became its own REPOS entry and bump_repo ran TWICE against the same
+# repo — each run building a commit off MAIN_SHA carrying only ITS files and
+# force-PATCHing the SHARED `ci/bump-<tag>` ref, so the second discarded the
+# first's file and then merely edited the open PR. Green run, half a bump
+# (BE-3896). The owner is canonicalized on the way in and the grouping folds case,
+# so both entries land in ONE commit carrying BOTH files.
+new_case ownercasedup
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-case","file":".github/workflows/ci-a.yml","label":""},{"repo":"comfy-org/secret-case","file":".github/workflows/ci-b.yml","label":""}]'
+check "exit 0"                                   "[[ $RC -eq 0 ]]"
+check "ONE commit carrying BOTH files"           "[[ \$(cat \"\$STUB_PUT_DIR/count\") -eq 2 ]]"
+check "both paths are on the one branch"         "[[ \$(sort -u \"\$STUB_PUT_DIR/branch_files\" | wc -l) -eq 2 ]]"
+check "opened exactly one PR"                    "[[ \$(grep -c '^pr-create' \"\$STUB_PUT_DIR/pr.log\") -eq 1 ]]"
+check "never edited a PR it had just created"    "! grep -q '^pr-edit' \"\$STUB_PUT_DIR/pr.log\""
+# Both spellings are masked under the ONE canonical form, so neither can reach the
+# public log — the canonicalization must not create an unmasked spelling.
+check "the canonical spelling was masked"        "grep -q '::add-mask::Comfy-Org/secret-case' <<<\"\$OUT\""
+check "the raw lower-cased spelling never printed" "! grep -q 'comfy-org/secret-case' <<<\"\$OUT\""
+
+echo "== a comma-bearing label is rejected — cobra CSV-splits --label (BE-6471) =="
+# `--label` is a StringSlice: `ci,do-not-merge` applies TWO labels, the second
+# potentially blocking, from an entry that appears to name one. The denylist
+# covers it alongside `|` and the control characters, while the characters GitHub
+# labels legitimately use (space, `:`, `/`) still validate.
+new_case labelcomma
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-a","file":".github/workflows/ci.yml","label":"ci,do-not-merge"}]'
+check "exit 1"                                   "[[ $RC -eq 1 ]]"
+check "error names the label rule"               "grep -q 'label must be a string containing no |, comma or control character' <<<\"\$OUT\""
+check "never echoed the offending label"         "! grep -q 'do-not-merge' <<<\"\$OUT\""
+check "wrote nothing anywhere"                   "[[ -z \"\$(ls -A \"\$STUB_PUT_DIR\")\" ]]"
+
+new_case labelok
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-a","file":".github/workflows/ci.yml","label":"needs review: ui/ux"}]'
+check "a label with a space, colon and slash still validates" "[[ $RC -eq 0 ]]"
+check "no validation error raised"                            "! grep -q 'is invalid' <<<\"\$OUT\""
+
+echo "== a bare workflows_ref never vouches for a file, sibling flag or not (BE-6471) =="
+# The gate used to require an addressable `uses:` pin only when GW_HAS_SIBLING was
+# set — but that flag comes from a CASE-SENSITIVE grep, so a caller spelling this
+# repo `GitHub-Workflows` (or one whose `uses:` of it was deleted, leaving the
+# input behind) left the flag at 0 and the relaxed address applied. Rule 2 is
+# unaddressed and `^`-anchored, so it would stamp THIS fleet's SHA onto that
+# caller's assets ref while the address-filtered assertion stayed silent: a green,
+# mutating, cross-fleet PR. The `uses:` requirement is unconditional now.
+new_case wrefonly
+WREF_FIXTURE="${WORK}/wref_only_caller.yml"
+printf '%s\n' \
+  'name: CI groom' \
+  'jobs:' \
+  '  groom:' \
+  '    uses: comfy-org/GitHub-Workflows/.github/workflows/groom.yml@1111111111111111111111111111111111111111' \
+  '    with:' \
+  '      workflows_ref: 1111111111111111111111111111111111111111' \
+  > "$WREF_FIXTURE"
+STUB_CONTENT_FILE="$WREF_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-wref","file":".github/workflows/ci-groom.yml","label":""}]'
+check "exit 1"                                   "[[ $RC -eq 1 ]]"
+check "flagged as carrying no pin we can move"   "grep -q 'carries no cursor-review.yml pin this bumper can move' <<<\"\$OUT\""
+check "did NOT stamp our SHA on its workflows_ref" \
+  "[[ ! -f \"\$STUB_PUT_DIR/put.last.txt\" ]] || ! grep -qF 'workflows_ref: $NEW_SHA' \"\$STUB_PUT_DIR/put.last.txt\""
+check "committed NOTHING"                        "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+check "opened no PR"                             "[[ ! -f \"\$STUB_PUT_DIR/pr.log\" ]] || ! grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
+
+echo "== a sibling whose filename merely ENDS with ours is not ours (BE-6471) =="
+# SHA_ADDR's sibling form had no left delimiter before the target filename, so for
+# target `groom.yml` a caller pinning `legacy-groom.yml` satisfied the address:
+# rules 1/4-6 repinned that SIBLING reusable to this fleet's SHA and the
+# address-filtered assertion saw nothing un-moved. Requiring the `/` that starts
+# the filename scopes the address to the intended reusable, and the file then
+# correctly reads as un-bumpable BY THIS FLEET.
+new_case siblingsuffix
+LEGACY_FIXTURE="${WORK}/legacy_sibling_caller.yml"
+printf '%s\n' \
+  'name: CI legacy groom' \
+  'jobs:' \
+  '  groom:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/legacy-groom.yml@1111111111111111111111111111111111111111' \
+  > "$LEGACY_FIXTURE"
+STUB_CONTENT_FILE="$LEGACY_FIXTURE" run_bump \
+  VAR_NAME=GROOM_CALLERS TAG=groom WORKFLOW_FILE=groom.yml ALLOW_EMPTY=true \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-legacy","file":".github/workflows/ci-groom.yml","label":""}]'
+check "exit 1"                                   "[[ $RC -eq 1 ]]"
+check "reported as carrying no groom.yml pin"    "grep -q 'carries no groom.yml pin this bumper can move' <<<\"\$OUT\""
+check "did NOT repin the sibling reusable"       "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+check "the sibling's SHA was never moved" \
+  "[[ ! -f \"\$STUB_PUT_DIR/put.last.txt\" ]] || ! grep -qF 'legacy-groom.yml@$NEW_SHA' \"\$STUB_PUT_DIR/put.last.txt\""
+
+echo "== a skipped entry's label never reaches the healthy file's PR (BE-6471) =="
+# The SKIP_FILE dedup must not fold a REJECTED path's label. The label-collection
+# site's invariant is that a skipped entry's label must stay off the repo's real
+# bump PR — a monorepo listing a 404'd path twice, the second entry carrying
+# `do-not-merge`, would otherwise apply that blocking label to the PR built from
+# its OTHER, healthy file. (ci-b.yml 404s twice; ci-a.yml is healthy and PR'd.)
+new_case dupskiplabel
+STUB_CONTENT_FILE="$CR_FIXTURE" STUB_404_FILE="ci-b.yml" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-lbl","file":".github/workflows/ci-a.yml","label":"ci"},{"repo":"Comfy-Org/secret-lbl","file":".github/workflows/ci-b.yml","label":""},{"repo":"Comfy-Org/secret-lbl","file":".github/workflows/ci-b.yml","label":"do-not-merge"}]'
+check "exit 1 — the 404'd entry still fails the run" "[[ $RC -eq 1 ]]"
+check "the healthy file was still committed"         "[[ \$(cat \"\$STUB_PUT_DIR/count\") -eq 1 ]]"
+check "the healthy file's PR was opened"             "grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
+check "the skipped entry's label did NOT land"       "! grep -qe '--label do-not-merge' \"\$STUB_PUT_DIR/pr.log\""
+check "the healthy entry's own label DID land"       "grep -qe '--label ci' \"\$STUB_PUT_DIR/pr.log\""
+check "the doubly-listed 404 was tallied once"       "grep -q '::error::1 caller file(s) cannot be bumped by this fleet' <<<\"\$OUT\""
+
+echo "== a repo abandoned wholesale is not ALSO billed as un-bumpable (BE-6471) =="
+# NOPIN elements recorded for earlier files survive a later `return 1` from the
+# same bump_repo call (transient fetch error, blob/tree/commit failure, the
+# post-rewrite assertion), so the repo appeared in BOTH tallies and the aggregate
+# told the operator to fix roster entries for a bump that was dropped for an
+# unrelated, possibly transient reason. The per-file warning still stands; only
+# the actionable count excludes repos that failed outright.
+# (ci-b.yml 404s → NOPIN; ci-a.yml hits the transient 500 → the repo FAILS.)
+new_case nopinandfailed
+STUB_CONTENT_FILE="$CR_FIXTURE" STUB_404_FILE="ci-b.yml" STUB_FETCH_FAIL=1 run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-both","file":".github/workflows/ci-b.yml","label":""},{"repo":"Comfy-Org/secret-both","file":".github/workflows/ci-a.yml","label":""}]'
+check "exit 1"                                   "[[ $RC -eq 1 ]]"
+check "the repo is reported as FAILED"           "grep -q 'bump failed for 1 repo' <<<\"\$OUT\""
+check "NOT also billed in the un-bumpable tally" "! grep -q 'caller file(s) cannot be bumped by this fleet' <<<\"\$OUT\""
+check "the per-file warning still stands"        "grep -q 'ci-b.yml not found on the default branch' <<<\"\$OUT\""
+
+echo "== a private default-branch name never reaches the public run log (BE-6471) =="
+# DEFAULT_BRANCH is read from the caller's repo metadata and is never masked (only
+# repo names are), so interpolating it into a per-file warning would print a branch
+# named after an internal project verbatim into this public repo's logs. The
+# messages name "the default branch" instead. (The stub serves `main`, so this
+# asserts the SHAPE of the message rather than a secret value.)
+new_case branchname
+STUB_CONTENT_FILE="$CR_FIXTURE" STUB_404_FILE="ci.yml" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-branch","file":".github/workflows/ci.yml","label":""}]'
+check "exit 1"                                        "[[ $RC -eq 1 ]]"
+check "the warning does not interpolate the branch"   "! grep -q 'not found on main' <<<\"\$OUT\""
+check "it names the default branch generically"       "grep -q 'not found on the default branch' <<<\"\$OUT\""
 
 echo
 echo "== $PASS passed, $FAIL failed =="
