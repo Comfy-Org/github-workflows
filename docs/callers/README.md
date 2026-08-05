@@ -156,6 +156,7 @@ Enrolling a repo is **two steps**, and the second is the one people miss.
    | `pr-risk.yml` | `PR_RISK_CALLERS` |
    | `agents-md-integrity.yml` | `AGENTS_MD_CALLERS` |
    | `assign-reviewers.yml` | `ASSIGN_REVIEWERS_CALLERS` |
+   | `detect-unreviewed-merge.yml` | `DETECT_UNREVIEWED_MERGE_CALLERS` |
 
    ```bash
    gh api repos/Comfy-Org/github-workflows/actions/variables/GROOM_CALLERS --jq .value

@@ -67,6 +67,20 @@ fleet does not know the caller exists, so both of its pins sit frozen and the
 caller silently drifts behind the grader it runs. Skipping this half is the most
 repeated mistake in this repo.
 
+Two things to know about that second step:
+
+- **Enrolment does not backfill your pin.** The fleet only runs on a push to
+  `main` touching `pr-risk.yml` or `scripts/pr-risk/**`, so a repo added to the
+  roster after the fact stays on whatever SHA it merged with until the grader
+  next changes. Ask the maintainer to `workflow_dispatch`
+  `bump-pr-risk-callers.yml` once after adding you — every bump entrypoint
+  carries `workflow_dispatch` for exactly this.
+- **The roster is currently readable in this public repo's run log.** The
+  entrypoint binds `vars.PR_RISK_CALLERS` through `env:`, and Actions dumps the
+  step env before `bump-callers.sh` can mask it (a known gap, documented in that
+  workflow's header). Enrolling a **private** repo therefore publishes its name,
+  and a public log entry cannot be unpublished — weigh that before asking.
+
 ## Required permissions
 
 ```yaml
