@@ -499,6 +499,19 @@ out="$(rec 33 'a-teammate' 'feat: something' "$SNAP" ok SUCCESS feature MEMBER f
        | jq -c '.labels = ["agent-coded"]' | app_grade)"
 eq "an agent-coded human is still agent-supervised" agent-supervised "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
 
+# (7) `author_is_bot` is tested `== true`, NOT for jq truthiness. It is the one field that can
+# switch the `external` guard off, and in jq the STRING "false" — what a foreign collector
+# writing JSON by hand emits — is truthy. Read loosely, that grades a first-time outsider
+# `human` R1 on a field nobody set to true.
+for junk in '"false"' '0' '""' 'null'; do
+  out="$(rec 34 'drive-by-human' 'feat: my first patch' "$SNAP" ok SUCCESS feature NONE false \
+         | jq -c ".author_is_bot = $junk" | app_grade)"
+  eq "author_is_bot=$junk is not a bot — still external" external "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
+done
+out="$(rec 35 'drive-by-human' 'feat: my first patch' "$SNAP" ok SUCCESS feature NONE false \
+       | jq -c '.author_is_bot = true' | app_grade)"
+eq "and only the literal boolean flips it" human "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
+
 echo "— phase 22: on the LIVE path the login alone cannot tell you it is a bot —"
 # The case above is the corpus/REST record shape. The live path does not see it: GraphQL reports
 # a Bot actor login WITHOUT the `[bot]` suffix, so `cloud-code-bot[bot]` arrives as
@@ -513,6 +526,10 @@ jq '.data.repository.pullRequest.author = {"login":"cloud-code-bot","__typename"
     | .data.repository.pullRequest.changedFiles = 1
     | .data.repository.pullRequest.title = "data: refresh bundled skills snapshot (auto)"
     | .data.repository.pullRequest.headRefName = "bot/refresh-skills"
+    # ...and the ROLLUP STATE with it. Without --self-run-id the grader reads `.state` directly,
+    # and phase 9 left it PENDING — which floored reversibility R2 and meant the SUCCESS CheckRun
+    # below was never actually consulted, so the fixture implied coverage it did not have.
+    | .data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.state = "SUCCESS"
     | .data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes =
         [{"__typename":"CheckRun","name":"unit tests","status":"COMPLETED","conclusion":"SUCCESS",
           "checkSuite":{"workflowRun":{"databaseId":1000,"workflow":{"name":"CI"}}}}]' \
@@ -541,15 +558,38 @@ out="$(bot_pr)"
 eq "the live record carries GitHub's own actor type" true "$(jq -r '.author_is_bot' <<<"$out")"
 eq "and the login really does arrive unsuffixed" cloud-code-bot "$(jq -r '.author' <<<"$out")"
 eq "an App PR is no longer external on the live path" human "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
-# ...and with the consumer's registry entry it reaches `runbook` — the ticket's end state.
+# ...and with the consumer's registry entry it reaches `runbook` — the ticket's end state. The
+# entry names the App the way a human can SEE it (`cloud-code-bot[bot]`, what REST and the web
+# UI show); the grader restores the suffix GraphQL dropped, so no consumer has to know this.
 out="$(bot_pr --runbooks "$SANDBOX/app-runbooks.json" --bot-logins '')"
-eq "an unsuffixed Bot login still fails an entry that lists only the suffixed form" \
-   human "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
+eq "an entry listing only the SUFFIXED form asserts against an unsuffixed Bot login" \
+   runbook "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
+eq "and the tier now responds to the diff" R0 "$(jq -r '.risk.axes.provenance.tier' <<<"$out")"
+# The rollup really is read on this path: green, but no test file in the diff, so reversibility
+# proposes R1 and that — not the author's account type — is what decides the grade.
+eq "the green rollup is actually consulted" R1 "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
+eq "and the overall grade is R1, decided by the diff" R1 "$(jq -r '.risk.tier' <<<"$out")"
+# THE SYNTHESIS IS ONE-WAY AND GATED ON GITHUB'S ACTOR TYPE, which is the whole safety argument:
+# the suffix is only ever ADDED, and only for an author GitHub types `Bot`. A USER account that
+# happens to be named `cloud-code-bot` presents `cloud-code-bot` and nothing turns the entry's
+# `cloud-code-bot[bot]` back into it — so it cannot inherit the App's runbook.
+jq '.data.repository.pullRequest.author = {"login":"cloud-code-bot","__typename":"User"}
+    | .data.repository.pullRequest.authorAssociation = "MEMBER"' \
+  "$SANDBOX/botfixture.json" > "$SANDBOX/bfuser.json" && cp "$SANDBOX/bfuser.json" "$SANDBOX/botfixture.json"
+out="$(bot_pr --runbooks "$SANDBOX/app-runbooks.json" --bot-logins '')"
+eq "a same-named USER cannot inherit the App's runbook" human "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
+# A BARE-SLUG entry still matches literally — that is what a machine USER account needs — and
+# that is exactly why a bare slug must never be used to name an App.
+jq '.runbooks[0].identity.logins = ["cloud-code-bot"]' \
+  "$SANDBOX/app-runbooks.json" > "$SANDBOX/app-runbooks-bare.json"
+out="$(bot_pr --runbooks "$SANDBOX/app-runbooks-bare.json" --bot-logins '')"
+eq "a bare-slug entry matches a same-named USER too" runbook "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
+# Restore the Bot author for the rest of the phase.
+jq '.data.repository.pullRequest.author = {"login":"cloud-code-bot","__typename":"Bot"}
+    | .data.repository.pullRequest.authorAssociation = "NONE"' \
+  "$SANDBOX/botfixture.json" > "$SANDBOX/bfbot.json" && cp "$SANDBOX/bfbot.json" "$SANDBOX/botfixture.json"
 jq '.runbooks[0].identity.logins = ["cloud-code-bot[bot]","cloud-code-bot"]' \
   "$SANDBOX/app-runbooks.json" > "$SANDBOX/app-runbooks-both.json"
-out="$(bot_pr --runbooks "$SANDBOX/app-runbooks-both.json")"
-eq "an entry listing BOTH login forms asserts" runbook "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
-eq "and the tier now responds to the diff" R0 "$(jq -r '.risk.axes.provenance.tier' <<<"$out")"
 # The fork half is unconditional on the live path too — the API fork flag, not the actor.
 jq '.data.repository.pullRequest.isCrossRepository = true' \
   "$SANDBOX/botfixture.json" > "$SANDBOX/bf2.json" && cp "$SANDBOX/bf2.json" "$SANDBOX/botfixture.json"

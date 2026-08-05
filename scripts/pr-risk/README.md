@@ -184,12 +184,14 @@ them by committing:
 - `.github/risk.json` — the repo's own path→tier map (same schema as
   [`risk-map.v0.json`](risk-map.v0.json))
 - `.github/risk-runbooks.json` — the repo's own producer registry (same schema
-  as [`runbook-registry.v0.json`](runbook-registry.v0.json)). **List BOTH login
-  forms for a GitHub App** — `"my-bot[bot]"` *and* `"my-bot"` — exactly as the
-  shipped `dependabot` entry does. REST and the web UI show the suffixed form,
-  but the grader reads the PR over GraphQL, which reports a Bot login
-  **unsuffixed**; an entry that lists only `my-bot[bot]` never asserts on a live
-  grade, and the producer falls back to `human`.
+  as [`runbook-registry.v0.json`](runbook-registry.v0.json)). **Name a GitHub App
+  by its suffixed login** — `"my-bot[bot]"`, the form REST and the web UI show
+  you. The grader reads the PR over GraphQL, which reports a Bot login
+  **unsuffixed**, and restores the suffix before matching — one way only, and
+  only for an author GitHub's own actor type calls a `Bot`. A bare slug
+  (`"my-bot"`) still matches literally, because a machine **user** account has no
+  suffix and needs it; but a bare slug is equally matchable by a same-named
+  *human*, who would then inherit that runbook — so never name an App with one.
 
 Both are read from the PR's **base ref**, so a PR cannot edit the rules that
 judge it (editing them — or the grader — at all is R3 by the map's own first

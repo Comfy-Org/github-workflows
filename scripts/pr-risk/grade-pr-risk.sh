@@ -265,7 +265,21 @@ cat <<'JQ'
     # works for machine USER accounts, which are typed `User` and carry no suffix at all.
     # Deliberately kept OUT of classify_login: that jq is shared verbatim with agent-work's
     # grade-collect.sh, and a field only this collector emits would fork the shared definition.
-    | (($r.author_is_bot // false) or $cls == "bot") as $is_bot
+    #
+    # `== true`, NOT jq truthiness. This is the one field that can switch the `external` guard
+    # off, and in jq the string "false", 0 and "" are all truthy — so a foreign collector, or a
+    # corpus row someone hand-edited, could turn a stringly-typed "false" into a confident
+    # not-an-outsider. Only the literal boolean counts; anything else falls back to the login.
+    #
+    # NO STATUS TWIN HERE, deliberately, and it is the only provenance input without one. The
+    # twins exist where the un-collected default would ANSWER — reading an absent `is_fork` as
+    # "not a fork" retires `external => R3`. This default runs the other way: absent means "not
+    # known to be a bot", which sends the author BACK through the association test and grades it
+    # the stricter way, exactly as a pre-schema-4 record graded before. Nothing is retired, so
+    # there is nothing to refuse to answer. A schema-3 corpus row therefore still grades an App
+    # PR `external` where a live schema-4 grade now says `human`: that is a versioned behaviour
+    # change, which is what `schema_version` and `map_version` are on the record to express.
+    | ((($r.author_is_bot // false) == true) or $cls == "bot") as $is_bot
     | (($r.labels // []) | index("agent-coded") != null) as $agent_coded
     # The label list has a STATUS TWIN for the same reason the file list does: `agent-coded` is
     # read from it, and a TRUNCATED label list answers "is this agent-coded?" with a confident no
@@ -331,8 +345,23 @@ cat <<'JQ'
     # login test is therefore REQUIRED, and head_ref_patterns are an ADDITIONAL condition where
     # the producer declares them. The parentheses are load-bearing — do not let this collapse
     # back into a bare or/and chain.
+    #
+    # AND THE APP'S SUFFIXED LOGIN IS RESTORED BEFORE MATCHING, in ONE direction only. GraphQL
+    # hands us `cloud-code-bot` where REST and the web UI say `cloud-code-bot[bot]`, so without
+    # this an entry listing the form a human can actually SEE never asserts on a live grade, and
+    # the miss is silent — `shape_failures` only records entries whose identity DID match. The
+    # direction matters and is the whole safety argument: the suffixed form is SYNTHESIZED, never
+    # stripped, and only when `author_is_bot` — GitHub's own actor type, not the caller's
+    # `bot_logins` — says the author is a Bot. So an App reaches an `"x[bot]"` entry, and a USER
+    # account named `x` still cannot: it can only ever present `x`, and nothing here turns
+    # `"x[bot]"` into `"x"`. That asymmetry is why this is safe where normalizing both sides is
+    # not. Consequence for registries: an App should be listed by its SUFFIXED login alone. A
+    # bare slug still matches literally — machine USER accounts have no suffix and need it — but
+    # a bare slug is also matchable by a same-named human, so never use one to name an App.
+    | (if $author != null and (($r.author_is_bot // false) == true) and ($author | endswith("[bot]") | not)
+       then [$author, ($author + "[bot]")] else [$author] end) as $author_forms
     | ([$RB.runbooks[]? | . as $bk
-        | select((($bk.identity.logins // []) | any(. as $l | ($author // "") | ascii_downcase == ($l | ascii_downcase)))
+        | select((($bk.identity.logins // []) | any(. as $l | $author_forms | any(. // "" | ascii_downcase == ($l | ascii_downcase))))
                  and ((($bk.identity.head_ref_patterns // []) | length) == 0
                       or (($r.head_ref // "") | matches_any($bk.identity.head_ref_patterns // []))))
         | {id: $bk.id, lane: $bk.lane, daily_cap: $bk.daily_cap,

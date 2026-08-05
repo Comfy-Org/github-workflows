@@ -261,7 +261,10 @@ on:
           and any author GitHub itself types as a `Bot` (comma-separated). A
           real GitHub App needs no entry here; a machine USER account does. A
           bot with no runbook registry entry grades as human — identity alone
-          never buys trust.
+          never buys trust. LOAD-BEARING, not a hint: a listed login skips the
+          first-time-contributor test, moving a non-fork NONE PR from `external`
+          (R3) to `human` (R1), and nothing validates that the login really is a
+          machine account. List only accounts you control; prune retired ones.
         type: string
         required: false
         default: github-actions,dependabot,renovate,coderabbitai,cursor,comfy-pr-bot,web-flow
