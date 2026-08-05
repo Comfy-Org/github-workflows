@@ -1,0 +1,39 @@
+name: Test refresh-reviewers generator
+
+# Runs the Python unit tests for the refresh-reviewers generator (glob parity
+# with assign-reviewers.yml, decay/selection math, the surgical rewrite). The
+# generator proposes every consumer repo's reviewer map, so a scoring or
+# rewrite regression silently corrupts routing everywhere — cheap to guard
+# with a unit run on change.
+
+on:
+  pull_request:
+    paths:
+      - '.github/refresh-reviewers/**'
+      - '.github/workflows/test-refresh-reviewers.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/refresh-reviewers/**'
+      - '.github/workflows/test-refresh-reviewers.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: unittest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Run refresh-reviewers generator tests
+        run: python3 -m unittest discover -s .github/refresh-reviewers/tests -p 'test_*.py' -v

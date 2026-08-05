@@ -107,6 +107,18 @@ on:
         type: string
         required: false
         default: ''
+      ledger_prior_review:
+        description: >-
+          Give each review round the PRIOR rounds' findings and the author's
+          replies (the "prior-review ledger"), so a finding that was refuted,
+          declined, or deferred earlier is not silently re-litigated. Set false
+          to disable the ledger — the kill switch for the case where it degrades
+          reviews after rollout; flipping this input beats reverting SHA pins
+          across every consumer. With it false the panel/judge prompts are
+          exactly the pre-ledger ones. Default true.
+        type: boolean
+        required: false
+        default: true
       run_without_label:
         description: >-
           Run on plain pull_request events (opened / reopened / ready_for_review
@@ -139,6 +151,15 @@ env:
   DIFF_EXCLUDES: ${{ inputs.diff_excludes }}
   # Where the assets checkout lands (this repo, .github/cursor-review/*).
   CURSOR_REVIEW_ASSETS: ${{ github.workspace }}/_cursor_review_assets/.github/cursor-review
+  # Cursor CLI pin — a versioned, checksummed artifact instead of the mutable
+  # cursor.com/install script (BE-5869). Old versions stay downloadable, so a
+  # Cursor release never breaks this; the pin moves only via a reviewed PR.
+  # Consumed by .github/cursor-review/install-cursor-cli.sh, the ONE installer
+  # all three CLI-using jobs run (preflight, review matrix, consolidate).
+  CURSOR_CLI_VERSION: 2026.07.23-e383d2b
+  # sha256 of the linux/x64 agent-cli-package.tar.gz (all jobs run ubuntu-latest).
+  # Cross-checked against nixpkgs pkgs/by-name/cu/cursor-cli at pin time.
+  CURSOR_CLI_SHA256: 702ad595213bee5df0268be9f80a19f29fcceaa2a42fc55e39f2b5199051f0c4
 
 jobs:
   gate:
@@ -249,6 +270,107 @@ jobs:
             echo "already_reviewed=false" >> "$GITHUB_OUTPUT"
           fi
 
+  ledger:
+    # Prior-review ledger: what earlier rounds already raised on THIS PR, and how
+    # the author answered. Without it every round re-derives the PR from zero, so
+    # a finding refuted/declined/deferred in round 1 comes back in rounds 2 and 3
+    # and the author hand-writes the same rebuttal again. A dedupe filter can't
+    # fix that — the judge rewrites each finding's prose every round, so a true
+    # repeat pair scores LOWER on text similarity than two unrelated findings on
+    # the same file. The prior context has to enter the prompt.
+    #
+    # One fetch, nine consumers: the 8 review cells and consolidate all download
+    # the `cursor-review-ledger` artifact this job publishes.
+    #
+    # This job must never fail the run — the review matrix `needs:` it, so a hard
+    # failure here would skip the whole panel. Every step is continue-on-error
+    # and a fallback guarantees the artifact exists, degrading to status=unknown
+    # (which is reported, never silently reported as `empty`).
+    name: Prior-review ledger
+    needs: gate
+    if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true'
+    runs-on: ubuntu-latest
+    # Deliberately longer than the per-step timeouts below: a hung step must
+    # trip its OWN timeout (which continue-on-error absorbs) rather than the
+    # job's, because a FAILED job here would skip the entire review matrix.
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      status: ${{ steps.build.outputs.status || steps.fallback.outputs.status }}
+      rounds: ${{ steps.build.outputs.rounds || steps.fallback.outputs.rounds }}
+      last_reviewed_sha: ${{ steps.build.outputs.last_reviewed_sha }}
+    steps:
+      - name: Load cursor-review assets
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: actions/checkout@v6
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _cursor_review_assets
+          persist-credentials: false
+
+      - name: Build prior-review ledger
+        id: build
+        continue-on-error: true
+        timeout-minutes: 8
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          LEDGER_ENABLED: ${{ inputs.ledger_prior_review }}
+        run: |
+          mkdir -p /tmp/ledger
+          python3 "$CURSOR_REVIEW_ASSETS/build-ledger.py" build \
+            --repo "$REPO" \
+            --pr-number "$PR_NUMBER" \
+            --pr-author "$PR_AUTHOR" \
+            --out-dir /tmp/ledger \
+            --enabled "$LEDGER_ENABLED"
+
+      - name: Ensure ledger artifact exists
+        id: fallback
+        if: always()
+        run: |
+          # The build step handles its own fetch failures (status=unknown). This
+          # covers the harder failure — the checkout or the interpreter itself
+          # died — so the downstream download always finds a well-formed ledger
+          # and the review body still tells the reader context was missing.
+          mkdir -p /tmp/ledger
+          if [ -f /tmp/ledger/ledger.json ]; then
+            exit 0
+          fi
+          echo '{"status": "unknown", "rounds": 0, "total_rounds": 0, "entries": [], "entry_count": 0, "unanswered_count": 0, "failed_call": "ledger job", "reason": "the ledger step did not produce an output file (see the job log)"}' > /tmp/ledger/ledger.json
+          : > /tmp/ledger/ledger.md
+          : > /tmp/ledger/ledger-judge.md
+          printf '%s' "⚠️ prior-review context unavailable (ledger job: the ledger step did not produce an output file) — findings may repeat earlier rounds." > /tmp/ledger/ledger-note.txt
+          {
+            echo "status=unknown"
+            echo "rounds=0"
+          } >> "$GITHUB_OUTPUT"
+          echo "::warning::Prior-review ledger step produced no output — running without prior-round context."
+
+      - name: Upload ledger artifact
+        if: always()
+        # continue-on-error like every other step in this job, for the reason in
+        # the job comment: `review` needs this job and has no always() guard, and
+        # `consolidate` then drops out on `needs.review.result != 'skipped'`. An
+        # artifact-upload hiccup failing THIS job would therefore post no review
+        # at all — strictly worse than the degraded path, where the panel simply
+        # runs without prior context and the review body says so (the consumers
+        # of the artifact all download it continue-on-error, and consolidate
+        # emits the unavailable banner when the file does not arrive).
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: cursor-review-ledger
+          path: /tmp/ledger
+          if-no-files-found: error
+          retention-days: 7
+
   diff-size:
     name: Diff size check
     needs: gate
@@ -318,26 +440,38 @@ jobs:
         #
         # Pinned to each lab's newest highest-reasoning tier in Cursor's
         # catalog (last checked 2026-07-28). OpenAI: GPT-5.6 Sol is the
-        # 5.6-family coding flagship (no 5.6 codex variant exists). Anthropic:
-        # Fable 5 tops the catalog but all Fable entries are marked NO ZDR in
-        # Cursor, and this panel reviews private-repo diffs, so it is excluded;
-        # bumped Anthropic's pin from Opus 4.8 to Opus 5 thinking at its max
-        # tier. ZDR eligibility for Opus 5 specifically in Cursor's catalog
-        # is UNCONFIRMED as of this bump (no CURSOR_API_KEY/live-catalog
-        # access and no verifiable primary source were available when this
-        # was written) — confirm against Cursor's live catalog/dashboard
-        # before relying on this pin for private-repo review traffic.
-        # Gemini (Pro line) and Kimi still ship a single reasoning tier each.
+        # 5.6-family coding flagship (Luna is the cost tier, Terra mid; the
+        # Codex line stops at 5.3). Anthropic: Fable 5 tops the catalog but
+        # all Fable entries are marked NO ZDR in Cursor, and this panel
+        # reviews private-repo diffs, so it is excluded; Opus 5 thinking at
+        # its max tier is ZDR-eligible (confirmed against the live catalog —
+        # no NO-ZDR marker, see PR BE-4818 for the run link) and replaces
+        # Opus 4.8 at identical per-token pricing. Gemini: 3.1 Pro is still
+        # the only Pro-line entry (3.5/3.6 are Flash tier). Moonshot: Kimi K3
+        # (max tier) supersedes K2.7 Code; no NO-ZDR marker in the catalog
+        # (same evidentiary bar as every other pin), ~3.2x/3.75x the
+        # per-token cost of K2.7 on this lab's two panel cells (~+10-15%
+        # total panel cost per PR).
         run: |
           cat > /tmp/models.json <<'JSON'
           [
             "gpt-5.6-sol-max",
             "claude-opus-5-thinking-max",
             "gemini-3.1-pro",
-            "kimi-k2.7-code"
+            "kimi-k3-max"
           ]
           JSON
           echo "models=$(jq -c . /tmp/models.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Load cursor-review assets
+        # Same trusted-assets checkout the review/consolidate jobs do — this
+        # job needs it for install-cursor-cli.sh.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _cursor_review_assets
+          persist-credentials: false
 
       - name: Install Cursor agent CLI
         env:
@@ -350,8 +484,7 @@ jobs:
             echo "No CURSOR_API_KEY (fork PR or unset secret) — skipping catalog preflight."
             exit 0
           fi
-          curl https://cursor.com/install -fsSL | bash
-          echo "$HOME/.cursor/bin" >> "$GITHUB_PATH"
+          bash "$CURSOR_REVIEW_ASSETS/install-cursor-cli.sh"
 
       - name: Validate model pins against live catalog
         env:
@@ -416,7 +549,7 @@ jobs:
     name: '${{ matrix.review_type }} (${{ matrix.model }})'
     # `preflight` gates the fan-out: if a pinned model is delisted it fails
     # there, and this job is skipped instead of quietly running a lab short.
-    needs: [gate, diff-size, preflight]
+    needs: [gate, diff-size, preflight, ledger]
     if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -473,10 +606,19 @@ jobs:
           path: _cursor_review_assets
           persist-credentials: false
 
+      - name: Download prior-review ledger
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: cursor-review-ledger
+          path: /tmp/ledger
+
       - name: Generate diff
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          LAST_REVIEWED_SHA: ${{ needs.ledger.outputs.last_reviewed_sha }}
+          LEDGER_ROUNDS: ${{ needs.ledger.outputs.rounds }}
         run: |
           # See diff_excludes input for the rationale and pathspec list.
           # shellcheck disable=SC2086
@@ -484,28 +626,67 @@ jobs:
 
           echo "Diff size: $(wc -l < /tmp/pr-diff.patch) lines"
 
-      - name: Install Cursor agent CLI
-        run: |
-          curl https://cursor.com/install -fsSL | bash
-          echo "$HOME/.cursor/bin" >> "$GITHUB_PATH"
+          # Incremental diff: the hunks added since the last reviewed commit.
+          # This is PRIORITIZATION, not narrowing — the full-PR diff above stays
+          # the primary input; this just tells the panel where to spend budget.
+          # Best-effort: an unresolvable SHA (force-push, base-branch rewrite)
+          # simply produces no incremental block.
+          : > /tmp/pr-diff-new.patch
+          if [ -n "$LAST_REVIEWED_SHA" ] && [ "$LAST_REVIEWED_SHA" != "$HEAD_SHA" ] \
+             && git cat-file -e "${LAST_REVIEWED_SHA}^{commit}" 2>/dev/null; then
+            # shellcheck disable=SC2086
+            git diff "$LAST_REVIEWED_SHA...$HEAD_SHA" -- . $DIFF_EXCLUDES > /tmp/pr-diff-new.patch || : > /tmp/pr-diff-new.patch
+            echo "Incremental diff since round $LEDGER_ROUNDS ($LAST_REVIEWED_SHA): $(wc -l < /tmp/pr-diff-new.patch) lines"
+          else
+            echo "No usable last-reviewed SHA — skipping the incremental diff block."
+          fi
 
-      - name: Log Cursor agent version
-        # The install script is unpinned (curl | bash from cursor.com), so we
-        # log the installed version into the run for forensics rather than
-        # gating on a hard-coded baseline. A version equality check produced
-        # daily toil without adding integrity protection — a CDN compromise
-        # would just ship malicious bits as a "new version" we'd then bump to.
-        run: cursor-agent --version
+      - name: Install Cursor agent CLI
+        run: bash "$CURSOR_REVIEW_ASSETS/install-cursor-cli.sh"
+
+      - name: Verify Cursor agent version
+        # The installer already asserts this once. Re-asserted here, on the
+        # PATH-resolved binary immediately before the review runs, so a swap
+        # between install and use (a CLI self-update, a stale symlink) can't
+        # quietly hand the review to unpinned bits — and the version still
+        # lands in the log for forensics.
+        run: |
+          installed="$(cursor-agent --version)"
+          if [ "$installed" != "$CURSOR_CLI_VERSION" ]; then
+            echo "::error::cursor-agent reports '${installed}', expected the pinned '${CURSOR_CLI_VERSION}'."
+            exit 1
+          fi
+          echo "cursor-agent ${installed} (matches CURSOR_CLI_VERSION)."
 
       - name: Build prompt
         env:
           REVIEW_TYPE: ${{ matrix.review_type }}
+          LEDGER_ROUNDS: ${{ needs.ledger.outputs.rounds }}
         run: |
+          # Splice the prior-review ledger in AFTER the static instructions and
+          # BEFORE the diff. With no ledger (first round, kill switch off, or a
+          # failed fetch) the spliced prompt is BYTE-IDENTICAL to the prompt file
+          # — that is the no-regression property this whole feature rests on.
+          python3 "$CURSOR_REVIEW_ASSETS/build-ledger.py" splice \
+            --prompt "$CURSOR_REVIEW_ASSETS/prompt-${REVIEW_TYPE}.md" \
+            --marker '=== BEGIN DIFF ===' \
+            --insert /tmp/ledger/ledger.md \
+            --out /tmp/prompt-head.txt
+
           {
-            cat "$CURSOR_REVIEW_ASSETS/prompt-${REVIEW_TYPE}.md"
+            cat /tmp/prompt-head.txt
             cat /tmp/pr-diff.patch
             echo ""
             echo "=== END DIFF ==="
+            if [ -s /tmp/pr-diff-new.patch ]; then
+              echo ""
+              echo "=== HUNKS NEW SINCE ROUND ${LEDGER_ROUNDS:-?} ==="
+              echo "The subset of the diff above that changed since the last reviewed"
+              echo "commit. Prioritize it — but the full diff above is still in scope."
+              cat /tmp/pr-diff-new.patch
+              echo ""
+              echo "=== END HUNKS NEW SINCE ROUND ${LEDGER_ROUNDS:-?} ==="
+            fi
           } > /tmp/prompt.txt
 
           echo "Prompt size: $(wc -c < /tmp/prompt.txt) bytes"
@@ -578,7 +759,7 @@ jobs:
     # Adjudicates the 8 cell artifacts into one consolidated review.
     # Calls cursor-agent one more time as the judge, with prompt-judge.md.
     name: Consolidate panel
-    needs: [gate, diff-size, review]
+    needs: [gate, diff-size, review, ledger]
     if: always() && needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true' && needs.review.result != 'skipped'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -604,15 +785,30 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          LAST_REVIEWED_SHA: ${{ needs.ledger.outputs.last_reviewed_sha }}
         run: |
           # See diff_excludes input for the rationale and pathspec list.
           # shellcheck disable=SC2086
           git diff "$BASE_SHA...$HEAD_SHA" -- . $DIFF_EXCLUDES > /tmp/pr-diff.patch
 
+          # Same incremental block the panel cells get (see the review job).
+          : > /tmp/pr-diff-new.patch
+          if [ -n "$LAST_REVIEWED_SHA" ] && [ "$LAST_REVIEWED_SHA" != "$HEAD_SHA" ] \
+             && git cat-file -e "${LAST_REVIEWED_SHA}^{commit}" 2>/dev/null; then
+            # shellcheck disable=SC2086
+            git diff "$LAST_REVIEWED_SHA...$HEAD_SHA" -- . $DIFF_EXCLUDES > /tmp/pr-diff-new.patch || : > /tmp/pr-diff-new.patch
+          fi
+
       - name: Install Cursor agent CLI
-        run: |
-          curl https://cursor.com/install -fsSL | bash
-          echo "$HOME/.cursor/bin" >> "$GITHUB_PATH"
+        run: bash "$CURSOR_REVIEW_ASSETS/install-cursor-cli.sh"
+
+      - name: Download prior-review ledger
+        id: ledger_download
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: cursor-review-ledger
+          path: /tmp/ledger
 
       - name: Download panel findings
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -647,9 +843,20 @@ jobs:
 
       - name: Build judge prompt
         if: steps.aggregate.outputs.ok_count != '0'
+        env:
+          LEDGER_ROUNDS: ${{ needs.ledger.outputs.rounds }}
         run: |
+          # The judge is the repeat-policy enforcement point, so it gets the
+          # judge-flavored ledger block (repeat_of requirement + the per-review
+          # repeat cap). Byte-identical to the old prompt when there's no ledger.
+          python3 "$CURSOR_REVIEW_ASSETS/build-ledger.py" splice \
+            --prompt "$CURSOR_REVIEW_ASSETS/prompt-judge.md" \
+            --marker '=== BEGIN PANEL FINDINGS ===' \
+            --insert /tmp/ledger/ledger-judge.md \
+            --out /tmp/judge-prompt-head.txt
+
           {
-            cat "$CURSOR_REVIEW_ASSETS/prompt-judge.md"
+            cat /tmp/judge-prompt-head.txt
             cat /tmp/panel.json
             echo ""
             echo "=== END PANEL FINDINGS ==="
@@ -658,6 +865,13 @@ jobs:
             cat /tmp/pr-diff.patch
             echo ""
             echo "=== END DIFF ==="
+            if [ -s /tmp/pr-diff-new.patch ]; then
+              echo ""
+              echo "=== HUNKS NEW SINCE ROUND ${LEDGER_ROUNDS:-?} ==="
+              cat /tmp/pr-diff-new.patch
+              echo ""
+              echo "=== END HUNKS NEW SINCE ROUND ${LEDGER_ROUNDS:-?} ==="
+            fi
           } > /tmp/judge-prompt.txt
 
           echo "Judge prompt size: $(wc -c < /tmp/judge-prompt.txt) bytes"
@@ -835,7 +1049,39 @@ jobs:
           TRIGGERED_BY: ${{ steps.triggerer.outputs.triggered_by }}
           JUDGE_STATUS: ${{ steps.consolidated.outputs.judge_status }}
           CONSOLIDATED_COUNT: ${{ steps.consolidated.outputs.consolidated_count }}
+          LEDGER_STATUS: ${{ needs.ledger.outputs.status }}
+          LEDGER_DOWNLOAD: ${{ steps.ledger_download.outcome }}
         run: |
+          # Prior-review ledger line for the review header: either the
+          # round/ledger summary, or the "context unavailable" banner naming the
+          # failed call. A guard that could not read its input SAYS SO — a
+          # context-free re-review must never render identically to a genuine
+          # first-round review.
+          #
+          # The DELIVERY of the ledger is checked separately from its CONTENT.
+          # Both downloads are continue-on-error, so an upload or download that
+          # failed leaves no ledger-note.txt while the ledger job still reports
+          # status=ok — and the panel prompts were spliced with an EMPTY block.
+          # Reading only LEDGER_STATUS there would emit no banner and the
+          # context-free re-review would render as a genuine first round, the
+          # exact partial failure the banner exists to catch. So: file ABSENT
+          # (delivery failed) is a banner; file PRESENT but empty is a real
+          # "nothing to say" (first round / kill switch / no prior findings).
+          LEDGER_NOTE=""
+          if [ "${LEDGER_DOWNLOAD:-failure}" != "success" ] || [ ! -f /tmp/ledger/ledger-note.txt ]; then
+            LEDGER_NOTE="⚠️ prior-review context unavailable (ledger artifact did not reach the consolidate job: download=${LEDGER_DOWNLOAD:-missing}) — the panel ran without prior-round context, so findings may repeat earlier rounds."
+          else
+            LEDGER_NOTE="$(cat /tmp/ledger/ledger-note.txt)"
+            if [ -z "$LEDGER_NOTE" ]; then
+              case "${LEDGER_STATUS:-missing}" in
+                ok|empty|disabled) ;;
+                *)
+                  LEDGER_NOTE="⚠️ prior-review context unavailable (ledger job: status=${LEDGER_STATUS:-missing}) — findings may repeat earlier rounds."
+                  ;;
+              esac
+            fi
+          fi
+
           # Three cases:
           # 1. Judge ok                       → normal consolidated review.
           # 2. Judge failed, panel has findings → post the raw per-cell findings
@@ -847,7 +1093,8 @@ jobs:
               --pr-number "$PR_NUMBER" \
               --repo "$REPO" \
               --commit-sha "$HEAD_SHA" \
-              --triggered-by "$TRIGGERED_BY"
+              --triggered-by "$TRIGGERED_BY" \
+              --ledger-note "$LEDGER_NOTE"
           elif [ "${CONSOLIDATED_COUNT:-0}" != "0" ]; then
             JUDGE_ERROR=$(python3 -c "import json; print(json.load(open('/tmp/judge-findings.json')).get('error','(no error message)'))")
             python3 "$CURSOR_REVIEW_ASSETS/post-review.py" \
@@ -856,6 +1103,7 @@ jobs:
               --repo "$REPO" \
               --commit-sha "$HEAD_SHA" \
               --triggered-by "$TRIGGERED_BY" \
+              --ledger-note "$LEDGER_NOTE" \
               --notice "⚠️ The judge step could not produce a parseable verdict after a retry (status=${JUDGE_STATUS}). The findings below are the raw, un-adjudicated panel output — they may contain duplicates or false positives the judge would normally filter."
           else
             JUDGE_ERROR=$(python3 -c "import json; print(json.load(open('/tmp/judge-findings.json')).get('error','(no error message)'))")
@@ -865,6 +1113,7 @@ jobs:
               --repo "$REPO" \
               --commit-sha "$HEAD_SHA" \
               --triggered-by "$TRIGGERED_BY" \
+              --ledger-note "$LEDGER_NOTE" \
               --error-message "Judge call failed (status=${JUDGE_STATUS}): ${JUDGE_ERROR}"
           fi
 
