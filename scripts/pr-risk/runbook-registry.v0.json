@@ -31,7 +31,7 @@
     {
       "id": "dependabot",
       "why": "Dependabot — the highest-volume automated producer, and the one with the best-known diff shape",
-      "identity": { "logins": ["dependabot[bot]", "dependabot", "dependabot-preview[bot]"],
+      "identity": { "logins": ["dependabot[bot]", "dependabot"],
                     "head_ref_patterns": ["dependabot/**"] },
       "_permitted_paths_note": "MUST stay a superset of the `deps` class in risk-map.v0.json. Two manifest lists that must agree are one list too many: when this one is SHORT, a Ruby or PHP dependabot PR fails paths_ok, falls back to `human`, and records a shape_failure that says dependabot failed to look like dependabot. The overall tier does not move — the path floor pins those manifests R3 anyway — but the noise trains readers to skip the one field designed to catch real impersonation.",
       "permitted_paths": ["go.mod", "go.sum", "**/go.mod", "**/go.sum", "**/go.work*",

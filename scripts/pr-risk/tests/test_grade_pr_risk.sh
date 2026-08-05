@@ -462,6 +462,43 @@ eq "a --bot-logins machine user is not external" human "$(jq -r '.risk.axes.prov
 out="$(rec 28 'snapshot-machine' 'chore: refresh skills snapshot' "$SNAP" ok SUCCESS bot/refresh NONE false | app_grade)"
 eq "and without --bot-logins it reads as a first-time human" external "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
 
+# (6) A LABEL CANNOT STAND IN FOR THE SHAPE ASSERTION. `agent-coded` and `fleet_logins` both
+# sat ABOVE the bot test, and both are reachable for a bot only now that the association half
+# has stopped pinning every App `external` first — so they are pinned here, alongside that fix.
+# A REGISTERED producer was never at risk (the shape assertion resolves to `runbook` ahead of
+# the base class either way) — this pins that, then pins the case that WAS wrong: the
+# UNREGISTERED bot, which either half classified `agent-supervised`, contradicting the promise
+# that a bot with no asserting entry falls back to `human`. The default map tiers both R1, so
+# no grade moves here; the classes exist so a CONSUMER map can tier them apart, and a consumer
+# that trusts its supervised agents at R0 would otherwise hand R0 to any `agent-coded` bot PR.
+out="$(rec 29 'cloud-code-bot[bot]' 'chore: refresh skills snapshot' "$SNAP" ok SUCCESS bot/refresh NONE false \
+       | jq -c '.labels = ["agent-coded"]' | app_grade)"
+eq "a registered App is runbook with or without the label" runbook "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
+eq "and still earns R0 from the shape assertion" R0 "$(jq -r '.risk.axes.provenance.tier' <<<"$out")"
+out="$(rec 30 'unregistered-bot[bot]' 'chore: something' "$SNAP" ok SUCCESS bot/x NONE false \
+       | jq -c '.labels = ["agent-coded"]' | app_grade)"
+eq "an agent-coded unregistered bot is human, not agent-supervised" human "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
+eq "and human is R1, exactly what agent-supervised was" R1 "$(jq -r '.risk.axes.provenance.tier' <<<"$out")"
+# The same for `fleet_logins`. That collision exists only because `author_is_bot` no longer
+# comes from the login string: a Bot actor's GraphQL login arrives UNSUFFIXED, so an operator
+# who lists it in --fleet-logins makes `classify_login` say "fleet" while GitHub says Bot. The
+# resolver's own rule is bot-beats-fleet; this use site must not contradict it.
+out="$(rec 31 'cloud-code-bot' 'chore: refresh skills snapshot' "$SNAP" ok SUCCESS bot/refresh NONE false \
+       | jq -c '.author_is_bot = true' \
+       | bash "$GRADER" --stdin --fleet-logins cloud-code-bot 2>/dev/null)"
+eq "a Bot actor in fleet_logins is still read as a bot" human "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
+# ...and with a registry entry that lists the unsuffixed form, the same record reaches `runbook`.
+jq '.runbooks[0].identity.logins = ["cloud-code-bot[bot]","cloud-code-bot"]' \
+  "$SANDBOX/app-runbooks.json" > "$SANDBOX/app-runbooks-bothforms.json"
+out="$(rec 32 'cloud-code-bot' 'chore: refresh skills snapshot' "$SNAP" ok SUCCESS bot/refresh NONE false \
+       | jq -c '.author_is_bot = true' \
+       | bash "$GRADER" --stdin --runbooks "$SANDBOX/app-runbooks-bothforms.json" --fleet-logins cloud-code-bot 2>/dev/null)"
+eq "and the registry, not the fleet list, is what promotes it" runbook "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
+# A HUMAN is untouched by the reorder — the label still classifies a human author.
+out="$(rec 33 'a-teammate' 'feat: something' "$SNAP" ok SUCCESS feature MEMBER false \
+       | jq -c '.labels = ["agent-coded"]' | app_grade)"
+eq "an agent-coded human is still agent-supervised" agent-supervised "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
+
 echo "— phase 22: on the LIVE path the login alone cannot tell you it is a bot —"
 # The case above is the corpus/REST record shape. The live path does not see it: GraphQL reports
 # a Bot actor login WITHOUT the `[bot]` suffix, so `cloud-code-bot[bot]` arrives as

@@ -78,7 +78,7 @@ statuses: read
 | Input | Default | Notes |
 |---|---|---|
 | `workflows_ref` | — (**required**) | Pin to the SAME full commit SHA as `uses:`. No default on purpose: a floating default let a caller SHA-pin `uses:` and still load the grader from HEAD of main. |
-| `fleet_logins` | `mattmillerai` | Logins whose PRs grade provenance `agent-supervised` alongside `agent-coded`. |
+| `fleet_logins` | `mattmillerai` | Logins whose PRs grade provenance `agent-supervised` alongside `agent-coded`. Both are read for **human** authors only: an author GitHub types as a `Bot` is a runbook candidate regardless, so listing a bot here (or labelling its PR) buys it nothing — only a registry entry that asserts can promote it. |
 | `bot_logins` | `github-actions,dependabot,renovate,coderabbitai,cursor,comfy-pr-bot,web-flow` | Extra logins treated as bots. Needed only for **machine USER accounts** — a real GitHub App is recognized from GitHub's own actor type, no list entry required. A bot with no runbook entry still grades as human — identity alone buys no trust. |
 | `label_map` | `''` | Rename the five grader-owned labels as `tier=label` pairs. Tier keys are fixed; only the label text is yours. |
 | `wait_for_checks_minutes` | `10` | How long to wait for the rest of the check rollup to settle before labeling (clamped to 25 — what a 30-minute job can spend waiting). `0` labels immediately, expect R2 floors from still-pending checks. |

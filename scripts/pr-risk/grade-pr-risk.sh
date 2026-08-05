@@ -294,12 +294,31 @@ cat <<'JQ'
     # still lands on `human` below, so identity alone continues to buy no trust.
     # The first-time-contributor guard is UNCHANGED for humans: `$cls` is "human" (or "unknown")
     # for anyone the resolver does not classify as a bot, so a human's NONE still reads external.
+    #
+    # AND THE BOT TEST RUNS BEFORE THE LABEL/FLEET TEST, for the same reason `classify_login`
+    # answers "bot" before it answers "fleet": a bot is a bot no matter what else is true of it.
+    # Both halves of that branch are reachable for a bot and neither is evidence about a bot:
+    #   * `agent-coded` is a LABEL — anyone with write access applies it, and what it claims is
+    #     that a human supervised an agent. That is a claim about a human author, not about an App.
+    #   * `$cls == "fleet"` is reachable for a bot at all only because `$is_bot` no longer comes
+    #     from the login string alone: a Bot actor whose GraphQL login arrives unsuffixed
+    #     (`cloud-code-bot`) and also appears in `fleet_logins` classifies "fleet" while
+    #     `author_is_bot` says Bot. Leaving `fleet` first lets this use site contradict the
+    #     resolver's own documented bot-beats-fleet ordering.
+    # What this does NOT change: a REGISTERED producer was never at risk here, because the shape
+    # assertion below resolves `$rbk != null` to `runbook` ahead of `$base_class` either way.
+    # What it fixes is the UNREGISTERED bot, which either half would classify `agent-supervised`
+    # — contradicting this axis's stated promise (and the map's `_why`) that a non-fork bot with
+    # no asserting entry falls back to `human`. The default map tiers both R1, so nothing moves
+    # there; the two classes exist so a CONSUMER map can tier them apart, and a consumer that
+    # trusts its own supervised agents at R0 would otherwise hand R0 to any bot PR someone
+    # labelled `agent-coded`. Trust in this axis is earned by the shape assertion, never by a label.
     | (if $pvst != "ok" or $lbst != "ok" then "unknown"
        elif ($r.is_fork // false) then "external"
        elif ($is_bot | not) and (($r.author_association // "") | IN("FIRST_TIME_CONTRIBUTOR","FIRST_TIMER","NONE"))
        then "external"
-       elif $agent_coded or $cls == "fleet" then "agent-supervised"
        elif $is_bot then "runbook-candidate"
+       elif $agent_coded or $cls == "fleet" then "agent-supervised"
        elif $cls == "human" then "human"
        else "unknown" end) as $base_class
     # The shape assertion: identity match AND every changed path inside permitted_paths AND the
