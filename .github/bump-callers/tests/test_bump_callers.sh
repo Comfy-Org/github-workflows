@@ -1430,6 +1430,133 @@ check "exit 1"                                        "[[ $RC -eq 1 ]]"
 check "the warning does not interpolate the branch"   "! grep -q 'not found on main' <<<\"\$OUT\""
 check "it names the default branch generically"       "grep -q 'not found on the default branch' <<<\"\$OUT\""
 
+echo "== a repo name that is ONLY dots is rejected in the general case, not just '.'/'..' (BE-6471) =="
+# The rule reads `\A[.]+\z`, so `...` is caught by the NAMED pre-flight rule like
+# `..` is. Enumerating the two literals instead let a longer dot run through to a
+# 404 at the metadata fetch, surfacing as a generic whole-repo FAILED with nothing
+# pointing at the roster — and it made the comment and README ("a name that is
+# *only* dots") false as written.
+new_case dotsmany
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/...","file":".github/workflows/ci.yml","label":""}]'
+check "exit 1 on a longer dot run"           "[[ $RC -eq 1 ]]"
+check "reported the named repo rule"         "grep -q 'index 0 is invalid (repo must match' <<<\"\$OUT\""
+check "wrote nothing anywhere"               "[[ -z \"\$(ls -A \"\$STUB_PUT_DIR\")\" ]]"
+check "bailed BEFORE the parse/mask loop"    "! grep -q '::add-mask::' <<<\"\$OUT\""
+
+new_case dotname
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/a.b.c","file":".github/workflows/ci.yml","label":""}]'
+check "a name merely CONTAINING dots is still valid" "[[ $RC -eq 0 ]]"
+check "and it was actually bumped"                   "[[ \$(cat \"\$STUB_PUT_DIR/count\") -eq 1 ]]"
+
+echo "== a FLOW-STYLE uses: keeps its mapping delimiter — loud failure, never corrupted YAML =="
+# REF_RE stops at whitespace, so in `{uses: …@v1, secrets: inherit}` the token
+# after `@` used to be `v1,` — comma included — and the rewrite replaced the
+# delimiter along with the ref, committing `@<sha> secrets: inherit}`. The
+# post-rewrite assertion only asks whether NEW_SHA is present, so the malformed
+# YAML shipped. Excluding `,` from REF_RE leaves the comma in place, so the
+# assertion reads back `<sha>,`, finds it unequal to NEW_SHA and fails the repo —
+# the same loud outcome flow style already gets on the `workflows_ref:` side.
+new_case flowstyle
+FLOW_FIXTURE="${WORK}/flow_caller.yml"
+printf '%s\n' \
+  'name: CI cursor-review' \
+  'jobs:' \
+  '  review: {uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@v1, secrets: inherit}' \
+  > "$FLOW_FIXTURE"
+STUB_CONTENT_FILE="$FLOW_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-flow","file":".github/workflows/ci.yml","label":""}]'
+check "exit 1"                                   "[[ $RC -eq 1 ]]"
+check "the assertion named the un-moved value"   "grep -q 'still pins github-workflows at' <<<\"\$OUT\""
+check "committed NOTHING"                        "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+check "opened no PR"                             "[[ ! -f \"\$STUB_PUT_DIR/pr.log\" ]] || ! grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
+
+echo "== a github-workflows@ref token that is not a uses: pin does not make a file a caller (BE-6471) =="
+# The gate's reader is anchored to the `uses:` KEY, not just to the pin token.
+# Unanchored, ANY `Comfy-Org/github-workflows@<ref>` on a SHA_ADDR-eligible line
+# satisfied it — a `run:` curl of this repo, an `env:` scalar, a repo@ref handed
+# to some other action — none of which call us. Rule 1 keys on the same unscoped
+# token, so such a file cleared the gate and was then rewritten and PR'd as a bump
+# of something that never was a caller. It is an un-bumpable roster entry instead.
+new_case notauses
+NOTUSES_FIXTURE="${WORK}/notauses_caller.yml"
+printf '%s\n' \
+  'name: CI' \
+  'jobs:' \
+  '  build:' \
+  '    runs-on: ubuntu-latest' \
+  '    steps:' \
+  '      - run: curl -sSL https://example.invalid/Comfy-Org/github-workflows@v1/thing.sh' \
+  > "$NOTUSES_FIXTURE"
+STUB_CONTENT_FILE="$NOTUSES_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-notuses","file":".github/workflows/ci.yml","label":""}]'
+check "exit 1"                                   "[[ $RC -eq 1 ]]"
+check "reported as carrying no movable pin"      "grep -q 'carries no cursor-review.yml pin this bumper can move' <<<\"\$OUT\""
+check "did NOT rewrite the run: token"           "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+check "opened no PR"                             "[[ ! -f \"\$STUB_PUT_DIR/pr.log\" ]] || ! grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
+
+new_case quoteduses
+QUOTED_FIXTURE="${WORK}/quoted_caller.yml"
+printf '%s\n' \
+  'name: CI cursor-review' \
+  'jobs:' \
+  '  review:' \
+  '    uses: "Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@v1"' \
+  > "$QUOTED_FIXTURE"
+STUB_CONTENT_FILE="$QUOTED_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-quoted","file":".github/workflows/ci.yml","label":""}]'
+check "a QUOTED uses: still clears the anchored gate" "[[ $RC -eq 0 ]]"
+check "and its pin was bumped"                        "grep -qF \"cursor-review.yml@$NEW_SHA\" \"\$STUB_PUT_DIR/put.last.txt\""
+
+echo "== wire_bot is unioned per FILE, so the roster's ORDER cannot decide the wiring (BE-6471) =="
+# Only the FIRST entry naming a path is ever staged, so reading `wire_bot` off that
+# entry made the outcome order-dependent: `[{ci.yml, wire_bot: true}, {ci.yml}]`
+# wired the identity while the reverse order silently did not — a duplicate entry
+# quietly dropping the wiring is the wrong half of a bump. Labels are already
+# unioned across duplicates; this is the same rule for the other per-entry field.
+new_case wiredupflip
+STUB_CONTENT_FILE="$WIRE_FIXTURE" WIRE_BOT_SCRIPT="$WIRE_SCRIPT" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-wdup","file":".github/workflows/ci.yml","label":""},{"repo":"Comfy-Org/secret-wdup","file":".github/workflows/ci.yml","label":"","wire_bot":true}]'
+check "exit 0"                                  "[[ $RC -eq 0 ]]"
+check "staged the file exactly once"            "[[ \$(cat \"\$STUB_PUT_DIR/count\") -eq 1 ]]"
+check "the LATER entry's wire_bot still applied" \
+  "grep -q 'bot_app_id: \${{ vars.APP_ID }}' \"\$STUB_PUT_DIR/put.last.txt\""
+
+new_case wiredupfirst
+STUB_CONTENT_FILE="$WIRE_FIXTURE" WIRE_BOT_SCRIPT="$WIRE_SCRIPT" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-wdup","file":".github/workflows/ci.yml","label":"","wire_bot":true},{"repo":"Comfy-Org/secret-wdup","file":".github/workflows/ci.yml","label":""}]'
+check "the reverse order gives the SAME result" "[[ $RC -eq 0 ]]"
+check "still wired"                             "grep -q 'bot_app_id: \${{ vars.APP_ID }}' \"\$STUB_PUT_DIR/put.last.txt\""
+
+echo "== a doubly-listed ALREADY-CURRENT path is fetched and skip-logged ONCE (BE-6471) =="
+# The third early-`continue` (the content-equality no-op) did not record its file,
+# so a repo listing the same converged path twice re-fetched it and printed the
+# skip line twice. SKIP_FILE now covers all three skip paths, giving the same
+# fetched-once/reported-once property the other two already had.
+new_case dupconverged
+CONVERGED_FIXTURE="${WORK}/converged_caller.yml"
+printf '%s\n' \
+  'name: CI cursor-review' \
+  'jobs:' \
+  '  review:' \
+  "    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@${NEW_SHA}  # github-workflows main (${SHORT})" \
+  > "$CONVERGED_FIXTURE"
+STUB_CONTENT_FILE="$CONVERGED_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-conv","file":".github/workflows/ci.yml","label":""},{"repo":"Comfy-Org/secret-conv","file":".github/workflows/ci.yml","label":""}]'
+check "exit 0 — a converged caller is still a clean skip" "[[ $RC -eq 0 ]]"
+check "the skip line was printed exactly once" \
+  "[[ \$(grep -c 'already at $SHORT' <<<\"\$OUT\") -eq 1 ]]"
+check "committed nothing"                                 "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+
 echo
 echo "== $PASS passed, $FAIL failed =="
 [[ $FAIL -eq 0 ]]

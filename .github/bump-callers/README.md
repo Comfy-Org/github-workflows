@@ -126,6 +126,11 @@ unrelated full SHA that merely *shares* a line with the words `github-workflows`
 or `workflows_ref` is now unreachable, and a prose comment mentioning
 `workflows_ref:` is left as prose.
 
+The ref pattern stops at whitespace *and* at YAML's flow-style delimiters (`,`,
+`}`), so the ref in `{uses: …@v1, secrets: inherit}` does not swallow the mapping's
+comma. Flow style is not rewritten — it is failed, by the assertion below — but it
+is never silently *corrupted*.
+
 Precision cuts both ways, though — a pin form the patterns don't know how to move
 would be silently left behind. So before a rewritten file can be staged, the
 script re-reads it with a deliberately **broader** reader (any non-whitespace
@@ -184,7 +189,7 @@ constrains the values before it makes a single API call:
 
 | Field | Rule |
 |---|---|
-| `repo` | must match `^Comfy-Org/[A-Za-z0-9._-]+$` (the owner case-insensitively, as GitHub itself resolves it), and the name may not be `.` or `..` (a dot-leading name like `.github` is fine; a name that is *only* dots is a path segment, not a repo) |
+| `repo` | must match `^Comfy-Org/[A-Za-z0-9._-]+$` (the owner case-insensitively, as GitHub itself resolves it), and the name may not consist *only* of dots — `\A[.]+\z`, so `..` and `...` alike (a dot-leading or dot-bearing name such as `.github` or `a.b.c` is fine; an all-dots name is a path segment, not a repo) |
 | `file` | must match `^\.github/workflows/[A-Za-z0-9._-]+\.ya?ml$` (the class excludes `/`, so `../` traversal cannot appear) |
 | `label` | optional; when present must be a string containing no `\|`, no comma, and no control character |
 
@@ -232,6 +237,13 @@ rescues a file. That input carries no workflow name, so it cannot vouch for
 *this* fleet, and admitting it would let the run stamp this fleet's SHA onto a
 sibling caller's assets ref. Every caller of every seeded fleet carries a `uses:`
 pin today, so nothing legitimate is caught by this.
+
+"`uses:` pin" is meant literally: the check is anchored to the `uses:` key
+(optionally quoted value), not merely to a `Comfy-Org/github-workflows@<ref>`
+token somewhere on the line. A `run:` step that curls this repo, or a repo@ref
+passed as an input to some *other* action, is not a caller — and since the pin
+rewrite keys on the same token, admitting one would mean opening a bump PR
+against a file that never called us.
 
 What does **not** trip it is a pin that is merely not a full SHA. The rewrite
 matches a ref by position rather than shape, so a caller on `@v1` is *self-healed*
