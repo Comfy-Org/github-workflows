@@ -50,9 +50,13 @@ jobs:
   pr-risk:
     permissions:
       contents: read
-      issues: write          # the risk label rides the issues API
-      pull-requests: read
-      checks: read           # the check rollup the reversibility axis reads
+      issues: write          # create the risk:* labels repo-side on first use
+      pull-requests: write   # the label write itself — labeling a PR rides the
+                             # pull-requests permission, not issues (the labels
+                             # endpoint is dual-mapped by what the "issue" is)
+      checks: write          # REQUIRED WHETHER OR NOT you set `check_run: true` —
+                             # see "Grant the whole union" below
+      actions: read          # the rollup's CheckRun -> checkSuite -> workflowRun hop
       statuses: read
     uses: Comfy-Org/github-workflows/.github/workflows/pr-risk.yml@<full-commit-sha>
     with:
@@ -68,10 +72,23 @@ This workflow has no roster yet — it has no fleet of pinned callers to track
 ```yaml
 contents: read
 issues: write
-pull-requests: read
-checks: read
+pull-requests: write
+checks: write
+actions: read
 statuses: read
 ```
+
+**Grant the whole union, including `checks: write`.** A reusable workflow can
+only narrow the caller's token, never elevate it, so GitHub validates *every*
+nested job's declared `permissions:` against this block at **startup** — before
+any job is scheduled. The `publish-check` job declares `checks: write`, and a
+job-level `if:` is a runtime condition, so leaving `check_run` at its default
+`false` does not exempt you: a short grant fails the whole run with an opaque
+"workflow file issue" and no job-level detail. Grading itself only needs
+`checks: read` (the rollup the reversibility axis reads); the write is the
+grant, not the behaviour. **Moving an existing pin onto a commit that has this
+job? Add `checks: write` to the caller in the same PR** — a pin bump alone will
+fail the caller's next run at startup.
 
 ## Inputs
 
