@@ -170,6 +170,32 @@ check "::warning:: annotation"        "grep -q \"::warning::\" <<<\"\$OUT\""
 check "decommission message"          "grep -q \"no longer exists on main\" <<<\"\$OUT\""
 
 # ---------------------------------------------------------------------------
+new_case decommissioned_staged 'the workflow was deleted but its assets survive'
+# The real retirement sequence: delete the reusable now, clean up its asset
+# directory in a later commit. EITHER surface being gone at the tip has to read
+# as a decommission — an AND would let this (the common case) fall through to the
+# stale branch and exit green, suppressing the ::warning:: that is the fleet's
+# only chance to say that live callers now hard-fail at startup.
+BEHIND=$(work_head)
+git -C "$SRC" rm -rq "${WATCHED_PATH}"
+push_src 'retire the groom reusable, briefs cleaned up later'
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" WATCHED_ASSETS="$ASSETS_PATH"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=false"                 "[[ \"$P\" == \"false\" ]]"
+check "::warning:: annotation"        "grep -q \"::warning::\" <<<\"\$OUT\""
+check "names the deleted workflow"    "grep -q \"::warning::${WATCHED_PATH} no longer exists on main\" <<<\"\$OUT\""
+check "not reported as stale"         "! grep -q \"stale run/re-run\" <<<\"\$OUT\""
+# ...and the mirror image: the asset dir goes first, the workflow file survives.
+new_case decommissioned_assets 'the asset dir was deleted but the workflow survives'
+BEHIND=$(work_head)
+git -C "$SRC" rm -rq "${ASSETS_PATH}"
+push_src 'retire the groom briefs, workflow cleaned up later'
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" WATCHED_ASSETS="$ASSETS_PATH"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=false"                 "[[ \"$P\" == \"false\" ]]"
+check "names the deleted asset dir"   "grep -q \"::warning::${ASSETS_PATH} no longer exists on main\" <<<\"\$OUT\""
+
+# ---------------------------------------------------------------------------
 new_case assets 'multi-path fleet: only the asset dir changed — still stale'
 # The case a naive single-blob port gets WRONG. groom/cursor-review/pr-size
 # callers pin an asset directory too (the briefs/prompts/scripts loaded at run
@@ -229,6 +255,99 @@ run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED_ASSETS="$ASSETS_PATH"
 check "exit 0"                        "[[ $RC -eq 0 ]]"
 check "proceed=false"                 "[[ \"$P\" == \"false\" ]]"
 check "::warning:: names the assets"  "grep -q \"::warning::${ASSETS_PATH} absent\" <<<\"\$OUT\""
+
+# ---------------------------------------------------------------------------
+new_case missing_file 'current tip, but the watched workflow is gone locally'
+# The fleet's PRIMARY decommission path — the `[[ ! -f "$WATCHED" ]]` guard — is
+# reached when the DELETING commit is itself the tip, so none of the "main moved"
+# comparisons run at all. Its WATCHED_ASSETS variant is covered above; this is
+# the one every single-path fleet depends on.
+git -C "$SRC" rm -rq "${WATCHED_PATH}"
+push_src 'retire the groom reusable at the tip'
+clone_work
+TIP=$(origin_tip)
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED_ASSETS="$ASSETS_PATH"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=false"                 "[[ \"$P\" == \"false\" ]]"
+check "::warning:: names the file"    "grep -q \"::warning::${WATCHED_PATH} absent\" <<<\"\$OUT\""
+check "no fetch/compare happened"     "! grep -q \"main moved\" <<<\"\$OUT\""
+
+# ---------------------------------------------------------------------------
+new_case tag_shadow 'a TAG named main does not shadow refs/heads/main'
+# `git fetch origin main` resolves the bare name through refs/tags/<name> BEFORE
+# refs/heads/<name>, and this repo routinely creates and force-moves major tags.
+# A tag named `main` would silently become the FETCH_HEAD that the comparison and
+# the re-point run against — i.e. what every caller gets pinned to. Point the tag
+# at a commit whose watched file DIFFERS, so consuming it reads as "stale" while
+# the correct branch fetch re-points.
+BEHIND=$(work_head)
+printf 'name: Groom\non:\n  workflow_call:\n    inputs: {}\n' > "${SRC}/${WATCHED_PATH}"
+push_src 'a decoy commit that edits the watched workflow'
+DECOY_SHA=$(origin_tip)
+git -C "$SRC" checkout -q -- . 2>/dev/null || true
+printf 'name: Groom\non:\n  workflow_call:\n' > "${SRC}/${WATCHED_PATH}"
+printf 'unrelated file, edited\n'             > "${SRC}/README.md"
+push_src 'restore the watched workflow, edit something unrelated'
+TIP=$(origin_tip)
+git -C "$ORIGIN" tag main "$DECOY_SHA"
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" WATCHED_ASSETS="$ASSETS_PATH"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=true"                  "[[ \"$P\" == \"true\" ]]"
+check "re-pointed to the BRANCH tip"  "[[ \"$N\" == \"$TIP\" ]]"
+check "did not consume the tag"       "[[ \"$N\" != \"$DECOY_SHA\" ]]"
+check "not reported as stale"         "! grep -q \"stale run/re-run\" <<<\"\$OUT\""
+
+# ---------------------------------------------------------------------------
+new_case glob_input 'a glob-shaped watched path is rejected, not read as absent'
+# The README tells maintainers to widen these inputs to match the fleet's
+# `paths:` filter, which points straight at `.github/groom/**`. A glob resolves
+# to NOTHING — `[[ -d '.github/groom/**' ]]` is false and
+# `git rev-parse 'HEAD:.github/groom/**'` is empty — so left unvalidated it makes
+# every comparison verify nothing and the whole fleet a permanent silent no-op
+# behind a green run.
+TIP=$(origin_tip)
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED_ASSETS="${ASSETS_PATH}/**"
+check "exit 1"                        "[[ $RC -eq 1 ]]"
+check "::error:: annotation"          "grep -q \"::error::WATCHED_ASSETS must be a literal path\" <<<\"\$OUT\""
+check "proceed is not true"           "[[ \"$P\" != \"true\" ]]"
+# A trailing slash is the same footgun with no glob character in sight.
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED_ASSETS="${ASSETS_PATH}/"
+check "trailing slash: exit 1"        "[[ $RC -eq 1 ]]"
+check "trailing slash: ::error::"     "grep -q \"must not end in a slash\" <<<\"\$OUT\""
+check "trailing slash: not proceed"   "[[ \"$P\" != \"true\" ]]"
+
+# ---------------------------------------------------------------------------
+new_case bad_new_sha 'a malformed NEW_SHA is rejected before it reaches an output'
+# NEW_SHA is the one value never derived from a lookup: it is emitted verbatim
+# into $GITHUB_OUTPUT and handed to bump-callers.sh's pin rewrite. A newline in
+# it injects extra output lines — and an injected `proceed=true` would win over
+# the `proceed=false` this script wrote, since a consuming step reads the LAST
+# value of a repeated key.
+TIP=$(origin_tip)
+run_preflight GITHUB_SHA="$TIP" NEW_SHA=$'0000000000000000000000000000000000000000\nproceed=true'
+check "exit 1"                        "[[ $RC -eq 1 ]]"
+check "::error:: annotation"          "grep -q \"::error::NEW_SHA must be a full 40\" <<<\"\$OUT\""
+check "no injected proceed=true"      "! grep -q \"^proceed=true\$\" \"$OUTFILE\""
+check "nothing written to output"     "[[ ! -s \"$OUTFILE\" ]]"
+# A short/abbreviated SHA is the other way a bad pin reaches every caller.
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="${TIP:0:12}"
+check "short sha: exit 1"             "[[ $RC -eq 1 ]]"
+check "short sha: not proceed"        "[[ \"$P\" != \"true\" ]]"
+
+# ---------------------------------------------------------------------------
+new_case head_mismatch 'HEAD that is not GITHUB_SHA is a hard error'
+# Every "here" side is read from HEAD while every decision is keyed off
+# GITHUB_SHA. A consuming checkout with a `ref:` override (or any earlier step
+# that moves HEAD) would have the script compare main against itself: every
+# comparison reads "unchanged", so every stale re-run proceeds and re-points.
+BEHIND=$(work_head)
+printf 'name: Groom\non:\n  workflow_call:\n    inputs: {}\n' > "${SRC}/${WATCHED_PATH}"
+push_src 'edit the watched workflow'
+TIP=$(origin_tip)
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP"   # HEAD is still $BEHIND
+check "exit 1"                        "[[ $RC -eq 1 ]]"
+check "::error:: annotation"          "grep -q \"::error::HEAD ($BEHIND) is not this run\" <<<\"\$OUT\""
+check "proceed is not true"           "[[ \"$P\" != \"true\" ]]"
 
 echo
 echo "== $PASS passed, $FAIL failed =="

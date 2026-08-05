@@ -133,23 +133,40 @@ re-point that pins callers to the verified tip instead of a stale `github.sha`.
 | `NEW_SHA` | the candidate SHA, normally `github.sha` |
 | `GITHUB_SHA`, `GITHUB_OUTPUT` | provided by Actions |
 
+Both watched paths are **literal paths, not the globs from the `paths:` filter** —
+`.github/groom`, never `.github/groom/**` and never a trailing slash. A glob
+resolves to nothing (`[[ -d '.github/groom/**' ]]` is false,
+`git rev-parse 'HEAD:.github/groom/**'` is empty), so it would make every
+comparison verify nothing and the fleet a permanent silent no-op. The script
+rejects that shape up front rather than reporting it as a decommission, and it
+likewise rejects a `NEW_SHA` that is not a full 40-character lowercase SHA (it is
+emitted verbatim into `$GITHUB_OUTPUT`, so a newline in it injects output lines)
+and a `HEAD` that is not `GITHUB_SHA` (a `ref:` override in the consuming
+checkout would have it compare main against itself).
+
 | Output (step output) | |
 |---|---|
 | `proceed` | `true` → run `bump-callers.sh`; `false` → stale or decommissioned, do nothing |
 | `new_sha` | the SHA to pin — `NEW_SHA`, or the verified main tip when the run was re-pointed forward |
 
 Both outputs are written on **every** exit-0 path. The script exits non-zero only
-for a lookup it could not perform (failed `ls-remote`, failed fetch, unresolvable
-`FETCH_HEAD`): a lookup we couldn't perform is not evidence of staleness, so it
-fails loudly rather than silently no-opping the fleet.
+for an input it cannot trust (the shape checks above) or a lookup it could not
+perform (failed `ls-remote`, failed fetch, unresolvable `FETCH_HEAD`, a
+`rev-parse` that *failed* rather than reporting absence): neither is evidence of
+staleness, so it fails loudly rather than silently no-opping the fleet.
 
 **A multi-path fleet must pass `WATCHED_ASSETS`.** The re-point is only sound
 because every entry in the fleet's `paths:` trigger is covered by the comparison
-— for `cursor-review` / `groom` / `pr-size` that includes the asset directory the
-reusable loads its prompts/scripts/briefs from at run time. Compare `WATCHED`
-alone on one of those and a commit touching only the assets reads as "unchanged",
-so callers get pinned to a tip whose other relevant content was never verified.
-If you widen a fleet's path filter, widen these inputs in the same change.
+— for `agents-md-integrity` (`.github/agents-md-integrity/**`), `cursor-review`
+(`.github/cursor-review/**`), `groom` (`.github/groom/**`) and `pr-size`
+(`scripts/check-pr-size/**`) that includes the asset directory the reusable loads
+its prompts/scripts/briefs from at run time. (`pr-risk` is multi-path too, but its
+filter also carries `:(exclude)` entries that one `WATCHED_ASSETS` string cannot
+express — see the note below.) Compare `WATCHED` alone on one of those and a
+commit touching only the assets reads as "unchanged", so callers get pinned to a
+tip whose other relevant content was never verified. Read the entrypoint's
+`paths:` rather than trusting this list, and if you widen a fleet's path filter,
+widen these inputs in the same change.
 
 Consumption is two steps — the guard, then the bump gated on its output:
 
