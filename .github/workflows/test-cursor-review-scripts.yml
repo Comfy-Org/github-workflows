@@ -4,16 +4,25 @@ name: Test cursor-review scripts
 # extract-findings.py JSON parser in particular). These scripts drive the
 # review panel + judge consolidation, so a parser regression silently breaks
 # every consumer repo's review — cheap to guard with a unit run on change.
+#
+# cursor-review.yml itself is in the path filter because catalog-drift.py reads
+# the model pins OUT of it (BE-4819) — the test suite asserts those anchors
+# still parse, and that assertion is only worth anything if it runs when the
+# file it parses changes.
 
 on:
   pull_request:
     paths:
       - '.github/cursor-review/**'
+      - '.github/workflows/cursor-review.yml'
+      - '.github/workflows/cursor-review-catalog-drift.yml'
       - '.github/workflows/test-cursor-review-scripts.yml'
   push:
     branches: [main]
     paths:
       - '.github/cursor-review/**'
+      - '.github/workflows/cursor-review.yml'
+      - '.github/workflows/cursor-review-catalog-drift.yml'
       - '.github/workflows/test-cursor-review-scripts.yml'
 
 permissions:
@@ -21,13 +30,19 @@ permissions:
 
 jobs:
   test:
-    name: unittest
+    name: unittest + shellcheck
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: ShellCheck the cursor-review shell scripts
+        # These run inside the review jobs with no unit tests behind them, so
+        # shellcheck is the only automated guard on install-cursor-cli.sh (the
+        # sha256-pinned CLI installer) and slack-notify.sh.
+        run: shellcheck -x .github/cursor-review/install-cursor-cli.sh .github/cursor-review/slack-notify.sh
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0

@@ -550,6 +550,61 @@ class GuardCoverageTests(unittest.TestCase):
         )
         self.assertEqual(self._jobs(step), [])
 
+    def test_a_job_workflow_sha_fallback_needs_no_guard(self):
+        # BE-4169: `inputs.workflows_ref || github.job_workflow_sha` can never
+        # resolve empty or mutable on its own, so it needs no runtime guard —
+        # see groom.yml.
+        checkout = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}\n"
+        )
+        self.assertEqual(self._jobs(checkout), [])
+
+    def test_a_plain_fallback_to_a_branch_is_still_unguarded(self):
+        # Only the LITERAL `github.job_workflow_sha` fallback is exempt — a
+        # fallback to anything else (here, a floating branch) is the same
+        # `default: main` hole wearing a different hat and must still trip.
+        checkout = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ inputs.workflows_ref || 'main' }}\n"
+        )
+        self.assertEqual(len(self._jobs(checkout)), 1)
+
+    def test_a_length_and_charset_guard_counts(self):
+        # pr-risk.yml's shape: no `-z` anywhere, but `${#VAR} -ne 40` alone
+        # already rejects an empty ref (length 0 != 40) regardless of what it
+        # is OR'd with — an OR only ever widens the set of rejected values.
+        guard = (
+            "      - name: Enforce workflows_ref pin contract\n"
+            "        env:\n"
+            "          WORKFLOWS_REF: ${{ inputs.workflows_ref }}\n"
+            "        run: |\n"
+            "          if [[ ${#WORKFLOWS_REF} -ne 40 || \"$WORKFLOWS_REF\" == *[!0-9a-f]* ]]; then\n"
+            "            exit 1\n"
+            "          fi\n"
+        )
+        self.assertEqual(self._jobs(guard + self.CHECKOUT), [])
+
+    def test_a_charset_only_condition_is_not_a_length_guard(self):
+        # The OR-widening exception is for a branch that ALONE guarantees
+        # rejection of empty. A charset-only test (no length check at all)
+        # never does — an empty string trivially has no disallowed characters
+        # — so this must still trip.
+        guard = (
+            "      - name: Bad guard\n"
+            "        env:\n"
+            "          WORKFLOWS_REF: ${{ inputs.workflows_ref }}\n"
+            "        run: |\n"
+            "          if [[ \"$WORKFLOWS_REF\" == *[!0-9a-f]* ]]; then\n"
+            "            exit 1\n"
+            "          fi\n"
+        )
+        self.assertEqual(len(self._jobs(guard + self.CHECKOUT)), 1)
+
     def test_this_repos_own_workflows_guard_every_ref_checkout(self):
         root = os.path.normpath(
             os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "workflows")
@@ -563,7 +618,11 @@ class GuardCoverageTests(unittest.TestCase):
             seen += len(uses)
             self.assertEqual(cwp.find_unguarded_ref_checkouts(lines), [], name)
         self.assertEqual(
-            seen, 13, "expected the 12 guarded sites BE-5546 fixed + pr-size.yml's (BE-5858)"
+            seen,
+            15,
+            "expected the 12 guarded sites BE-5546 fixed + pr-size.yml's (BE-5858) "
+            "+ cursor-review.yml's preflight (hard guard) and ledger (BE-4169 "
+            "job_workflow_sha self-pin) sites picked up merging main",
         )
 
 
@@ -592,6 +651,60 @@ class CheckDirTests(unittest.TestCase):
         self.assertIn("bad.yml", errors[0])
         self.assertIn("BE-5546", errors[0])
         self.assertEqual(checked, ["bad.yml"])
+
+    def test_a_job_workflow_sha_default_is_tolerated(self):
+        # BE-4169: `default: ''` paired with `inputs.workflows_ref ||
+        # github.job_workflow_sha` at the checkout is not the `default: main`
+        # hole — the fallback can never be empty or mutable. See groom.yml.
+        text = (
+            "name: Fixture\n"
+            "on:\n"
+            "  workflow_call:\n"
+            "    inputs:\n"
+            "      workflows_ref:\n"
+            "        type: string\n"
+            "        required: false\n"
+            "        default: ''\n"
+            "jobs:\n"
+            "  check:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}\n"
+        )
+        self._write("groom-like.yml", text)
+        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(checked, ["groom-like.yml"])
+
+    def test_a_default_without_the_fallback_is_still_reported(self):
+        # The exemption is conditional on the fallback actually being present:
+        # `default: ''` alone, with an unfallback'd checkout, is the ordinary
+        # `default: main` hole (just spelled with an empty string) and must
+        # still fail both checks.
+        text = (
+            "name: Fixture\n"
+            "on:\n"
+            "  workflow_call:\n"
+            "    inputs:\n"
+            "      workflows_ref:\n"
+            "        type: string\n"
+            "        required: false\n"
+            "        default: ''\n"
+            "jobs:\n"
+            "  check:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ inputs.workflows_ref }}\n"
+        )
+        self._write("bad.yml", text)
+        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        self.assertEqual(len(errors), 2, errors)
 
     def test_exempt_workflow_is_tolerated(self):
         self._write("legacy.yml", _reusable(DEFAULTED))

@@ -138,6 +138,55 @@ def _empty_test_re(names):
     return re.compile(r"""(?:\[\[?|\btest)\s+-z\s+"?\$\{?(?:%s)\b""" % alt)
 
 
+def _length_ne_test_re(names):
+    """`${#NAME} -ne <N>` for `N > 0` — an empty NAME has length 0, so this
+    rejects it exactly like `-z`, just spelled as a shape check (e.g. "must be
+    a full 40-hex SHA") rather than an emptiness check. pr-risk.yml's guard
+    uses this form to reject both an empty ref AND a malformed one in one test.
+    """
+    alt = "|".join(sorted(re.escape(n) for n in names))
+    return re.compile(r"""^\$\{#(?:%s)\}\s*-ne\s*[1-9]\d*$""" % alt)
+
+
+def _bare_empty_test_re(names):
+    """`-z "$NAME"` with no enclosing `[ … ]`/`[[ … ]]`/`test` — the shape an
+    OR-branch is left in once the enclosing brackets are stripped for `_or_terms`.
+    """
+    alt = "|".join(sorted(re.escape(n) for n in names))
+    var = r""""?\$\{?(?:%s)\}?"?""" % alt
+    return re.compile(r"""^-z\s+%s$""" % var)
+
+
+def _or_terms(cond):
+    """Split a `[[ … ]]` / `[ … ]` condition into its top-level `||` branches.
+
+    `||` only WIDENS a condition (adds failure cases) — never narrows it like
+    `&&` does — so if ONE branch alone guarantees rejection of an empty ref,
+    the whole OR'd condition does too, whatever the other branches test.
+    """
+    inner = cond.strip()
+    if inner.startswith("[[") and inner.endswith("]]"):
+        inner = inner[2:-2]
+    elif inner.startswith("[") and inner.endswith("]"):
+        inner = inner[1:-1]
+    return [term.strip() for term in inner.split("||")]
+
+
+def _rejects_empty_ref(cond, names):
+    """True when `cond` (the whole bracketed test) or some top-level OR-branch
+    of it guarantees rejection of an empty value in `names` — the canonical
+    `-z` whole-test, or the length-check shape above. Both are string-equality
+    on the WHOLE branch, matching `_whole_empty_test_re`'s own fail-closed
+    stance on compounds: a branch that merely CONTAINS one of these (e.g.
+    `-z "$REF" && "$OTHER" = x`) does not count, only one that IS it.
+    """
+    if _whole_empty_test_re(names).match(cond.strip()):
+        return True
+    bare_re = _bare_empty_test_re(names)
+    length_re = _length_ne_test_re(names)
+    return any(bare_re.match(term) or length_re.match(term) for term in _or_terms(cond))
+
+
 def _whole_empty_test_re(names):
     """The same test as the ENTIRE condition — nothing ANDed onto it.
 
@@ -229,6 +278,22 @@ _FLOW_DEFAULT_RE = re.compile(r"""[{,]\s*(['"]?)default\1\s*:""")
 
 # A `#` opens a comment at the start of a value or after whitespace.
 _COMMENT_RE = re.compile(r"(?:^|\s)#.*$")
+
+# The BE-4169 self-pinning fallback (see its use in check_dir): the LITERAL
+# expression `inputs.workflows_ref || github.job_workflow_sha`, no other
+# spelling. `github.job_workflow_sha` is the exact commit THIS reusable
+# workflow was resolved from — never empty, never mutable — so an input
+# defaulted to `''` and OR'd with it this way can't reach checkout empty or
+# on a moving ref, the same guarantee `required: true` + the runtime guard
+# buys, bought a different way.
+_JOB_WORKFLOW_SHA_FALLBACK_RE = re.compile(
+    r"""inputs\.%s\s*\|\|\s*github\.job_workflow_sha\b""" % INPUT_NAME
+)
+
+
+def _default_value(line):
+    """The comment-stripped RHS of a `default:` key line."""
+    return _strip_comment(line.split(":", 1)[1])
 
 
 def env_aliases(lines):
@@ -481,14 +546,17 @@ def is_guard_step(lines, idx):
     names = _ref_derived_names(body)
     empty_re = _empty_test_re(names)
     whole_re = _whole_empty_test_re(names)
+    length_mention_re = re.compile(
+        r"""\$\{#(?:%s)\}""" % "|".join(sorted(re.escape(n) for n in names))
+    )
     for i, line in enumerate(body):
-        if not empty_re.search(line):
+        if not (empty_re.search(line) or length_mention_re.search(line)):
             continue
         code = _RUN_PREFIX_RE.sub("", line.strip())
         cond_match = _IF_COND_RE.match(code)
         if cond_match:
-            # An `if`: the emptiness test must BE the condition, not part of it.
-            if not whole_re.match(cond_match.group(1).strip()):
+            # An `if`: the emptiness test must BE (or OR-widen) the condition.
+            if not _rejects_empty_ref(cond_match.group(1).strip(), names):
                 continue
             # `if [ -z "$REF" ]; then exit 1; fi` all on one line. The branch
             # still ends at its `fi` — `then echo "missing"; fi; exit 1` exits
@@ -521,7 +589,7 @@ def is_guard_step(lines, idx):
             # the first `;`-segment counts: `… && echo warn; … && exit 1`
             # leaves the empty ref walking on.
             head, sep, tail = code.partition("&&")
-            if sep and whole_re.match(head.strip()):
+            if sep and _rejects_empty_ref(head.strip(), names):
                 if _GUARD_FAIL_INLINE_RE.match(tail.split(";")[0]):
                     return True
     return False
@@ -566,7 +634,7 @@ def find_unguarded_ref_checkouts(lines):
             if pending is not None:
                 if _indent(line) > pending[1]:
                     if mention_re.search(line):
-                        if not guarded:
+                        if not guarded and not _JOB_WORKFLOW_SHA_FALLBACK_RE.search(line):
                             unguarded.append(pending[0] + 1)
                         pending = None
                     continue
@@ -575,7 +643,10 @@ def find_unguarded_ref_checkouts(lines):
             if _GUARD_BINDING_RE.match(line):
                 guarded = guarded or is_guard_step(lines, i)
             elif is_ref_use(line, ref_res):
-                if not guarded:
+                # BE-4169 exception: `inputs.workflows_ref || github.job_workflow_sha`
+                # can never resolve empty or mutable on its own — see check_dir's
+                # `self_pins_to_job_workflow_sha` docstring-equivalent comment.
+                if not guarded and not _JOB_WORKFLOW_SHA_FALLBACK_RE.search(line):
                     unguarded.append(i + 1)
             elif _REF_KEY_OPEN_RE.match(line):
                 pending = (i, _indent(line))
@@ -632,7 +703,25 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
             # drops the default — which puts it back under the check below.
             continue
 
+        # A safe alternative to `required: true` + a runtime guard (BE-4169):
+        # default the input to '' and OR every checkout's `ref:` with
+        # `github.job_workflow_sha` — the exact commit THIS reusable workflow
+        # was itself resolved from via the caller's `uses:` pin. That value can
+        # never be empty and is never mutable, so an omitted `workflows_ref`
+        # self-pins instead of silently taking the default branch — the same
+        # guarantee `required: true` + the guard buys, bought a different way.
+        # `find_unguarded_ref_checkouts` already recognizes the checkout side
+        # of this (the LITERAL fallback `inputs.workflows_ref ||
+        # github.job_workflow_sha`); this covers the matching `default: ''`,
+        # which is otherwise indistinguishable from the `default: main` hole.
+        # See groom.yml.
+        self_pins_to_job_workflow_sha = any(
+            _JOB_WORKFLOW_SHA_FALLBACK_RE.search(line) for line in lines
+        )
+
         for lineno in defaults:
+            if self_pins_to_job_workflow_sha and _default_value(lines[lineno - 1]) in ("''", '""'):
+                continue
             errors.append(
                 "::error file=%s,line=%d::%s declares a `default:` for the `%s` "
                 "input. Delete it (and keep `required: true` + the runtime "

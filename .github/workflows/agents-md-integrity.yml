@@ -40,6 +40,23 @@ name: AGENTS.md Integrity (reusable)
 #   check_nested         When true, every nested `AGENTS.md` (monorepo subtree)
 #                        must have a sibling `CLAUDE.md` containing `@AGENTS.md`
 #                        and must itself be <= max_lines. Default true.
+#   exclude_paths        Newline- or comma-separated path globs (repo-root
+#                        relative) carved out of the NESTED scan — for a repo
+#                        that ships agent-instruction files as distributable
+#                        PAYLOAD (a plugin/skill marketplace), where the
+#                        nested-shim rule does not apply to the payload but
+#                        should still bind everywhere else. Prefer this over
+#                        `check_nested: false`, which drops nested coverage for
+#                        the whole repo. Excluded subtrees are never scanned,
+#                        and each one is reported in the run log as
+#                        `EXCLUDED: <path> (matched <glob>)`. A glob that would
+#                        exclude the ROOT agents file or `CLAUDE.md`, or that
+#                        asks for the whole repo without saying so (`/`, `*`,
+#                        `*/**`), is rejected and the run fails — neither root
+#                        compliance nor the nested scan as a whole is excludable.
+#                        Default empty (nothing excluded). Example:
+#                          exclude_paths: |
+#                            plugins/**
 #   require_shim         When true, a missing root `CLAUDE.md` FAILS whenever the
 #                        agents file exists (Claude Code reads only CLAUDE.md and
 #                        does not fall back, so no shim = invisible instructions).
@@ -83,6 +100,17 @@ on:
         type: boolean
         required: false
         default: true
+      exclude_paths:
+        description: >-
+          Newline- or comma-separated path globs carved out of the nested
+          AGENTS.md scan (e.g. `plugins/**` for a repo that ships agent
+          instructions as distributable payload). Excluded subtrees are never
+          scanned and are reported in the run log. A glob matching the root
+          agents file or `CLAUDE.md`, or made only of wildcards, is rejected.
+          Default empty.
+        type: string
+        required: false
+        default: ''
       require_shim:
         description: >-
           Fail when the root `CLAUDE.md` shim is missing while the agents file
@@ -176,6 +204,17 @@ jobs:
           REQUIRE_SHIM: ${{ inputs.require_shim }}
           REQUIRE_CODEOWNERS: ${{ inputs.require_codeowners }}
           AGENTS_FILE: ${{ inputs.agents_file }}
+          EXCLUDE_PATHS: ${{ inputs.exclude_paths }}
         run: |
+          # `--exclude` is added ONLY when the caller set a non-blank value, so
+          # a caller that never heard of exclude_paths runs the exact command
+          # it ran before.
+          args=(--root "$AGENTS_CHECK_ROOT")
+          if [ -n "$(printf '%s' "$EXCLUDE_PATHS" | tr -d '[:space:]')" ]; then
+            # Attached form: as a separate token, a legitimate glob starting
+            # with a hyphen (`-generated/**`) is parsed by argparse as an
+            # unknown option and the job dies with a usage error.
+            args+=("--exclude=$EXCLUDE_PATHS")
+          fi
           python3 "$GITHUB_WORKSPACE/_agents_md_integrity/.github/agents-md-integrity/check_agents_md.py" \
-            --root "$AGENTS_CHECK_ROOT"
+            "${args[@]}"

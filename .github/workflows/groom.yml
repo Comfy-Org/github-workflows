@@ -19,6 +19,16 @@ name: Groom (reusable)
 # human review — they are NEVER auto-merged. The remaining findings (DOWNGRADE,
 # security, beyond-cap) are still filed as `groom` issues (hybrid). Default off.
 #
+# Patch-path policy (BE-4404): a builder patch that touches a CI-privileged path
+# (workflow/action defs, dependency lockfiles, package manifests, build/test
+# config) is downgraded from a PR to a filed issue — that code would execute in
+# credentialed pre-review CI. The deny-list is the tested `.github/groom/
+# patch_policy.py`. STRUCTURAL LIMIT: the deny-list guards privileged-CONFIG
+# surfaces, but ANY patch's source still executes when the caller's CI runs its
+# tests — a review-gated PR is still untrusted code running before merge. Callers
+# enabling `builder: true` should avoid exposing secrets to test steps and
+# consider `npm ci --ignore-scripts` (or equivalents) where viable.
+#
 # Topology mirrors cursor-review.yml (this repo is the single source of truth —
 # the finder/verifier BRIEFS + the dedup ledger live under .github/groom/, so a
 # consumer carries only a thin caller and there's no logic to keep in sync).
@@ -93,7 +103,9 @@ name: Groom (reusable)
 #       with:
 #         # Post/act issues as cloud-code-bot instead of github-actions[bot].
 #         bot_app_id: ${{ vars.APP_ID }}
-#         workflows_ref: <sha>          # REQUIRED — same SHA as `uses:` above
+#         # No workflows_ref: the briefs + ledger auto-load from the same commit
+#         # this `uses:` pin resolves to (github.job_workflow_sha). Set it only to
+#         # test briefs from a branch.
 #         dry_run: ${{ github.event.inputs.dry_run == 'true' }}
 #         # Cadence knob + the matching volume-gate window (BE-4004).
 #         interval_days: ${{ vars.GROOM_INTERVAL_DAYS || '7' }}
@@ -115,6 +127,14 @@ name: Groom (reusable)
 #         # No fromJSON() and no allowlist re-check are needed — max_prs is a
 #         # `string` input and the reusable does the parse/clamp (see its
 #         # description). That is the whole reason it is not `type: number`.
+#         # A build that can't become a PR (patch over `pr_size_limit`, patch
+#         # touching CI-privileged paths, …) files a `groom` issue instead so the
+#         # work isn't lost — that path is NOT capped by `max_findings`. To make
+#         # a builder run open PRs and (bar a secret-scan withhold) nothing else,
+#         # add `bail_sink: none` — but read the input first: it also stops the
+#         # ledger recording the bail, so a deterministic bail re-spends a
+#         # `max_prs` slot every run. Settable live via vars.GROOM_CONFIG.
+#         # bail_sink: none
 #       secrets:
 #         ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 #         BOT_APP_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
@@ -213,9 +233,18 @@ on:
         default: github
       max_findings:
         description: >-
-          Cap on the number of NEW issues opened in one run (after dedup). A
-          backstop against a surprise flood; the finder brief already targets
-          ~6-12 high-precision findings.
+          Cap on the number of NEW **findings** issues opened in one run (after
+          dedup) — i.e. the `file` job's output. A backstop against a surprise
+          flood; the finder brief already targets ~6-12 high-precision findings.
+
+
+          It does NOT govern the auto-builder's BAIL issues (BE-6157). Those come
+          from a different job (`build_pr`): a CONFIRMED finding whose patch
+          exceeds `pr_size_limit` or touches a CI-privileged path still files an
+          issue, so work the builder already paid for is not silently discarded.
+          So `max_findings: 0` means "file no FINDINGS", not "open no issues" —
+          set `bail_sink: none` to suppress the bail issues too (bar the
+          secret-scan withhold, which is filed either way).
         type: number
         required: false
         default: 12
@@ -244,13 +273,16 @@ on:
         default: claude-opus-5
       workflows_ref:
         description: >-
-          REQUIRED. Ref of Comfy-Org/github-workflows to load the groom briefs +
-          ledger from. Must be the SAME commit SHA you pin `uses:` to —
-          otherwise the workflow is pinned but the code it runs is not. There is
-          deliberately no default: a floating `main` default would silently load
-          mutable scripts into jobs that hold write permissions.
+          Ref of Comfy-Org/github-workflows to load the groom briefs + ledger
+          from. LEAVE UNSET (the default): the assets are then checked out from
+          `github.job_workflow_sha` — the exact commit this reusable workflow was
+          resolved from via the caller's `uses:` pin — so the briefs + ledger
+          always match the logic running them, with nothing for the caller to
+          keep in sync. Set this ONLY to override that (e.g. test briefs from a
+          branch while pinning `uses:` elsewhere).
         type: string
-        required: true
+        required: false
+        default: ''
       config:
         description: >-
           OPTIONAL JSON object of operational knobs (BE-5227), as an ESCAPE HATCH
@@ -332,9 +364,11 @@ on:
           list is a UI convention and a typo guard, NOT a security boundary — the
           only principals who can post a value past it (an API/CLI
           `workflow_dispatch`) already have repo write access and could just edit
-          `options:`. The real backstops are structural: builder PRs are review-
-          gated and NEVER auto-merged, the finder emits only ~6-12 findings a run,
-          and `pr_size_limit` bails any oversized patch to an issue.
+          `options:`. The one structural backstop is that builder PRs are
+          review-gated and NEVER auto-merged; the softer ones are that the finder
+          emits only ~6-12 findings a run, and that `pr_size_limit` bails any
+          oversized patch to an issue (itself retunable by `GROOM_CONFIG`, so
+          treat it as a queue-hygiene dial rather than a boundary).
         type: string
         required: false
         default: '5'
@@ -344,9 +378,87 @@ on:
           this many lines, it is NOT opened as a giant PR — it is filed as a
           `groom` issue for a human instead, so nothing balloons unreviewed.
           Ignored unless `builder` is true.
+
+
+          This is the REVIEWED DEFAULT, not a fixed ceiling: `GROOM_CONFIG`
+          (or the `config` input) may override it per repo with no PR, exactly
+          like the other operational knobs — see `.github/groom/config.py` for
+          why this one knob is allowed to widen behaviour. It is not a merge
+          gate; builder PRs run full CI + cursor-review and are never
+          auto-merged, so a higher limit means a bigger diff reaches a reviewer,
+          not that a bigger diff lands unreviewed. A non-numeric or negative
+          override is refused with a `::warning::` and falls back to this value;
+          an explicit `0` is honoured and means "always file issues, never open
+          PRs". The effective value appears in the gate job's `Resolved knobs:`
+          line on every run — which is where to read a repo's real ceiling,
+          rather than assuming this default.
+
+          The default stays deliberately BELOW the org's 1000-line human PR cap
+          (`pr-size.yml` `max_lines`), and copying that number here would loosen
+          this more than it looks. Two reasons. (1) Different counting basis:
+          `pr-size.yml` counts *non-generated* changed lines — it strips
+          lockfiles and generated output first, and offers an `oversized-ok`
+          bypass label — whereas this counts changed lines straight off
+          `git diff --cached --numstat`, with no content-based exclusions. Note
+          that this basis is not a byte budget: `numstat` reports `-` for binary
+          files (counted as 0 here), and a line is a line however long, so one
+          minified line clears any ceiling. It bounds review effort in the
+          reviewable case, not patch size in the worst case — another reason not
+          to spend the headroom the human cap allows. (2) Different risk: the
+          human cap is advisory on a diff whose author chose the scope and can
+          defend it in review; this is a hard refusal on a diff with no author to
+          interrogate, where the failure mode is a reviewer approving 900
+          plausible-looking machine-written lines because nothing in it looks
+          wrong. The machine does not get the same benefit of the doubt, on
+          purpose.
+
+          Raised 400 → 600 on 2026-08-02 (BE-6161) on measured evidence: across
+          both builder repos, 49 `groom` issues produced 7 bails and exactly ONE
+          patch-too-large (403 lines, three over) — 400 was not systematically
+          tight, it caught one boundary case, so 600 buys headroom for that
+          shape without a large jump.
         type: number
         required: false
-        default: 400
+        default: 600
+      bail_sink:
+        description: >-
+          Where the auto-builder's BAIL issues go (BE-6157). A CONFIRMED finding
+          the builder could not turn into a PR — no patch produced, patch over
+          `pr_size_limit`, patch touching a CI-privileged path, patch that would
+          not apply, or the pre-publish secret scan withholding it — is filed as a
+          `groom` issue so a completed, already-paid-for audit is not thrown away.
+          That path lives in `build_pr`, NOT the `file` job, so `max_findings`
+          does not cap it and `max_findings: 0` alone does not silence it.
+
+
+          `issue` (the default) is that behavior, unchanged. `none` files
+          nothing: the bail is announced as a `::warning::` naming the finding,
+          its bail reason and its dedup signature, and written to the run summary,
+          so it is recoverable from the run rather than lost silently. Know this
+          before setting it: nothing records the signature in the ledger, so the
+          finding is re-proposed on a later run — and a DETERMINISTIC bail (a
+          patch that always exceeds `pr_size_limit`, or always touches a
+          CI-privileged path) therefore re-bails every run, permanently holding
+          one of the `max_prs` slots, so at the common pilot setting `max_prs: 1`
+          no other CONFIRMED finding is ever built again. The ONE bail `none`
+          does NOT suppress is the pre-publish secret-scan withhold: that issue is
+          filed regardless, because destroying the durable record of a possible
+          key-exfil attempt is where "quieter" would stop being merely quieter.
+          `linear` is reserved for the Linear-sink phase and is NOT implemented
+          here.
+
+
+          Unlike `sink`, this is an OPERATIONAL knob, so `vars.GROOM_CONFIG` may
+          set it with no PR: it can only make groom quieter, never grant it
+          privilege (that is exactly what the withhold carve-out above preserves).
+          An unrecognized value (including `linear`) is dropped with a warning and
+          the run keeps the CALLER's value — `issue` unless the caller itself
+          pinned `none`, in which case the typo leaves the suppression the caller
+          already chose rather than introducing a new one. Ignored unless
+          `builder` is true.
+        type: string
+        required: false
+        default: issue
     secrets:
       ANTHROPIC_API_KEY:
         description: Anthropic API key the finder + verifier agents bill through.
@@ -384,6 +496,13 @@ jobs:
   gate:
     name: Gate
     runs-on: ubuntu-latest
+    # The one job here that had no bound. It is meant to be cheap — a handful of
+    # `gh api` reads — but its cost is data-dependent: the interval gate walks up
+    # to `_MAX_RUNS_SCANNED` runs and, for any that were re-run by hand, up to
+    # `_MAX_ATTEMPTS_SCANNED` attempts each, at a 30s per-call timeout. A degraded
+    # API on a pathological history could burn runner minutes before the gate
+    # fails open. Ten minutes is ~20x the normal case and still a hard stop.
+    timeout-minutes: 10
     permissions:
       contents: read
       # The interval gate lists THIS caller's Actions run history to find the
@@ -407,38 +526,21 @@ jobs:
       # so the GROOM_CONFIG merge happens in exactly ONE place. Emitted before
       # either gate runs, so it is populated even on a skipped tick.
       resolved: ${{ steps.resolve.outputs.resolved }}
+      # The pinned agent-CLI version (BE-5373), resolved ONCE from
+      # .github/groom/package.json and consumed by all three "Install Claude Code"
+      # steps. See the resolve step below for why the pin lives in a manifest.
+      claude_code_version: ${{ steps.claude_version.outputs.version }}
     steps:
-      - name: Require a pinned workflows_ref
-        # workflows_ref has no default on purpose. GitHub does NOT enforce
-        # `required: true` for workflow_call inputs, so an omitted input arrives
-        # as '' and actions/checkout would silently fall back to this repo's
-        # default branch — running MUTABLE scripts under a pin that claims
-        # otherwise. Fail fast instead. (BE-5546)
-        env:
-          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
-        run: |
-          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
-          # whitespace-only value is an empty ref to IT while sailing past a bare
-          # -z test here. Compare the stripped form, and echo only that: dropping
-          # newlines also stops a multi-line value from smuggling a ::workflow
-          # command:: into the log, and from satisfying the line-oriented grep
-          # below on one 40-hex line among many.
-          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
-          if [ -z "$REF" ]; then
-            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
-            exit 1
-          fi
-          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
-          fi
-
       - name: Load groom assets (interval gate)
         # interval.py is loaded from THIS repo at the pinned ref — a single
         # source of truth like the briefs + ledger, never the target checkout.
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Comfy-Org/github-workflows
-          ref: ${{ inputs.workflows_ref }}
+          # Default to the exact commit THIS reusable workflow was resolved from
+          # (github.job_workflow_sha), so interval.py can't desync from the logic
+          # loading it; workflows_ref is an explicit override only.
+          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}
           path: _groom_assets
           persist-credentials: false
 
@@ -480,6 +582,8 @@ jobs:
               "volume_gate": ${{ toJSON(inputs.volume_gate) }},
               "max_prs": ${{ toJSON(inputs.max_prs) }},
               "max_findings": ${{ toJSON(inputs.max_findings) }},
+              "bail_sink": ${{ toJSON(inputs.bail_sink) }},
+              "pr_size_limit": ${{ toJSON(inputs.pr_size_limit) }},
               "interval_days": ${{ toJSON(inputs.interval_days) }},
               "cadence": ${{ toJSON(inputs.cadence) }},
               "themes": ${{ toJSON(inputs.themes) }},
@@ -629,6 +733,153 @@ jobs:
             echo "should_run=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Load the agent CLI pin
+        # Deliberately NOT from `$GROOM_ASSETS` (which tracks `inputs.workflows_ref`,
+        # a `required: false` input defaulting to the mutable `main`). Two reasons,
+        # both about this being executable supply chain rather than a brief:
+        #
+        # 1. A caller that SHA-pins `uses:` but omits `workflows_ref` would have the
+        #    CLI version — and therefore what actually executes inside the three
+        #    agent jobs — governed by a branch tip, while the sandbox flags those
+        #    jobs pass are frozen at the pinned `uses:` SHA. The two could diverge.
+        #    `job.workflow_sha` IS the commit this very workflow file was read
+        #    from, so the pin and the flags that depend on it are always the same
+        #    commit, and SHA-pinning `uses:` alone fully pins the CLI.
+        # 2. The resolve step below fails CLOSED on a missing manifest. Read from
+        #    `workflows_ref`, that turns this repo's documented split-pin state
+        #    (Dependabot moves `uses:` and leaves `workflows_ref:` behind — see
+        #    .github/dependabot.yml) into a total groom outage for that caller.
+        #    Read from `job.workflow_sha` the case cannot arise: any commit whose
+        #    groom.yml has this step also has the manifest next to it.
+        #
+        # `job.workflow_sha`, NOT `github.job_workflow_sha`. The latter is the one
+        # everybody reaches for and it is a trap: it yields an EMPTY string inside
+        # a reusable-workflow job, and Actions expands an unknown context property
+        # to "" rather than erroring — so the mistake would silently resolve the
+        # pin from the default branch, i.e. exactly the bug this step exists to
+        # fix. The populated accessor is the `job` context one added in runner
+        # v2.334.0 (Apr 2026): "the commit SHA of the workflow file that defines
+        # the current job". Every job here is `ubuntu-latest`, which is always on
+        # a current runner; only a stale self-hosted runner would see it empty, so
+        # the resolve step below re-checks and WARNS rather than assuming.
+        #
+        # Sparse and gated on `should_run` for the same reason the resolve step is —
+        # a skipped tick installs nothing and should pay for nothing.
+        if: steps.check.outputs.should_run == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ job.workflow_sha }}
+          sparse-checkout: .github/groom/package.json
+          sparse-checkout-cone-mode: false
+          path: _groom_pin
+          persist-credentials: false
+
+      - name: Resolve the pinned Claude Code CLI version
+        # The agent CLI pin lives in `.github/groom/package.json` in THIS repo, at
+        # the ref the caller pinned `uses:` to (see the checkout above) — one source
+        # of truth for the three jobs that install it.
+        #
+        # Why a package.json and not an `env:` constant up top: Dependabot's
+        # github-actions ecosystem only parses `uses:` refs, and an inline
+        # `npm install -g <pkg>@<ver>` inside a `run:` step is invisible to EVERY
+        # ecosystem when there is no npm manifest in the repo. So nothing watched
+        # the pin and it silently rotted — the exact failure mode dependabot.yml
+        # was added to fix. A real manifest makes the npm ecosystem see it and open
+        # a bump PR (see the `/.github/groom` entry in .github/dependabot.yml).
+        # Nothing is ever installed FROM that directory; it exists to be read here.
+        #
+        # Resolved in `gate` rather than per-job because every install job already
+        # `needs: gate`, so one resolution + one validation covers all three and
+        # they cannot drift apart the way three hardcoded literals could.
+        #
+        # LAST step in the job, and gated on `should_run`, deliberately: this is
+        # the one fail-CLOSED step in a job whose every other step fails OPEN, and
+        # a scheduled caller skips ~6 of 7 daily ticks. Running it eagerly would
+        # let a bad manifest red out ticks that were never going to install
+        # anything. Nothing downstream can observe the difference — all six
+        # consumer jobs are themselves
+        # `if: needs.gate.outputs.should_run == 'true'` — and a bad pin cannot
+        # reach main in the first place, because test_claude_code_pin.py runs on
+        # any PR touching `.github/groom/**`. So the check still fires on every
+        # tick that would actually install the CLI, and only on those.
+        id: claude_version
+        if: steps.check.outputs.should_run == 'true'
+        env:
+          # Only to confirm the checkout above got a real ref — see below.
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          # WARN rather than fail: an empty `job.workflow_sha` means the checkout
+          # above silently fell back to the default branch, which is no worse than
+          # the pre-BE-5373 behaviour (`workflows_ref` also defaults to `main`) and
+          # is not worth turning into a groom outage. But it does mean the caller's
+          # `uses:` SHA no longer pins the CLI, so it must not pass unremarked —
+          # this is precisely the silent-empty trap `github.job_workflow_sha` sets.
+          if [ -z "${WORKFLOW_SHA:-}" ]; then
+            echo "::warning::job.workflow_sha is empty, so the agent CLI pin was read from the default branch rather than the ref this workflow was called at. The pin is still validated, but the caller's uses: SHA no longer pins it."
+          fi
+          manifest="$GITHUB_WORKSPACE/_groom_pin/.github/groom/package.json"
+          if [ ! -f "$manifest" ]; then
+            echo "::error::$manifest is missing — it is the single source of truth for the groom agent CLI pin (BE-5373)."
+            exit 1
+          fi
+          # Type-checked at BOTH levels, not just on the index. A bare
+          # `.dependencies[...]?` only makes the INNER lookup forgiving; if the
+          # manifest's top-level JSON is not an object (a list, a string, a
+          # number) jq still raises "Cannot index ... with string" and `set -e`
+          # aborts with a raw jq error instead of the `::error::` annotation
+          # below — fail-closed, but unattributable. The `if !` also catches jq
+          # failing outright on a file that is not JSON at all.
+          if ! version=$(jq -r '
+            if type != "object" then ""
+            elif (.dependencies | type) != "object" then ""
+            else (.dependencies["@anthropic-ai/claude-code"] // "")
+            end' "$manifest"); then
+            echo "::error::$manifest is not valid JSON — it is the single source of truth for the groom agent CLI pin (BE-5373)."
+            exit 1
+          fi
+          if [ -z "$version" ]; then
+            echo "::error::$manifest has no dependencies[\"@anthropic-ai/claude-code\"] entry — the groom agent CLI pin must live there."
+            exit 1
+          fi
+          # Newlines stripped BEFORE the value is ever echoed. It is an arbitrary
+          # JSON string until validated, and a `::error::` line carrying an
+          # embedded newline can emit further workflow commands — `::add-mask::`,
+          # `::stop-commands::` — into this job's log stream. Only used for
+          # reporting; the value that leaves this step is the validated one.
+          printable=${version//[$'\n\r']/ }
+          # Exact versions only. The agent CLI is executable supply chain for steps
+          # that read untrusted repo content, so a floating range (^, ~, *, latest,
+          # a dist-tag) would silently re-introduce the unpinned install this pin
+          # exists to prevent. Dependabot's npm updater preserves an exact
+          # requirement as exact (`versioning-strategy: increase`), so a normal bump
+          # passes; anything else fails loudly instead of floating.
+          #
+          # Strict SemVer, not a loose suffix match. Three ways a sloppy pattern
+          # lets a NON-exact spec through, all of which npm then resolves as a
+          # mutable dist-tag rather than a version — the exact un-pinning this
+          # guard exists to reject:
+          #   - `([-+][0-9A-Za-z.-]+)*` accepts empty identifiers (`1.2.3-a..b`);
+          #   - a bare `[0-9]+` accepts leading zeros (`01.02.03`), which
+          #     node-semver rejects;
+          #   - a bare `[0-9]+` is unbounded (`9007199254740992.0.0`), and
+          #     node-semver rejects a component past 2^53-1.
+          # Hence: no leading zeros, at most 15 digits per component (the widest
+          # that cannot exceed 2^53-1), non-empty dot-separated identifiers, at
+          # most one prerelease and one build part, in that order. Build
+          # identifiers may keep leading zeros — SemVer only forbids them on
+          # NUMERIC identifiers, and a build part is never compared numerically.
+          num='(0|[1-9][0-9]{0,14})'
+          pre_id='(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)'
+          semver="^${num}\.${num}\.${num}(-${pre_id}(\.${pre_id})*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$"
+          if ! [[ "$version" =~ $semver ]]; then
+            echo "::error::@anthropic-ai/claude-code is pinned to '$printable', which is not an exact X.Y.Z version. Floating ranges and dist-tags are not allowed for the agent CLI."
+            exit 1
+          fi
+          echo "Claude Code CLI pinned at $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
   audit_find:
     # Phase 1 — the READ-ONLY finder. Holds NO write credentials (`contents:
     # read` ONLY) and reads untrusted repo content, so it is structurally
@@ -654,38 +905,17 @@ jobs:
           persist-credentials: false
           path: repo
 
-      - name: Require a pinned workflows_ref
-        # workflows_ref has no default on purpose. GitHub does NOT enforce
-        # `required: true` for workflow_call inputs, so an omitted input arrives
-        # as '' and actions/checkout would silently fall back to this repo's
-        # default branch — running MUTABLE scripts under a pin that claims
-        # otherwise. Fail fast instead. (BE-5546)
-        env:
-          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
-        run: |
-          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
-          # whitespace-only value is an empty ref to IT while sailing past a bare
-          # -z test here. Compare the stripped form, and echo only that: dropping
-          # newlines also stops a multi-line value from smuggling a ::workflow
-          # command:: into the log, and from satisfying the line-oriented grep
-          # below on one 40-hex line among many.
-          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
-          if [ -z "$REF" ]; then
-            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
-            exit 1
-          fi
-          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
-          fi
-
       - name: Load groom assets (briefs)
-        # Trusted briefs come from THIS workflow's repo (public, pinned via
-        # workflows_ref) — never from the target checkout, so a malicious repo
-        # can't rewrite the prompt to change what groom does.
+        # Trusted briefs come from THIS workflow's repo (public, pinned to the
+        # workflow's own resolved commit) — never from the target checkout, so a
+        # malicious repo can't rewrite the prompt to change what groom does.
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Comfy-Org/github-workflows
-          ref: ${{ inputs.workflows_ref }}
+          # Default to the exact commit THIS reusable workflow was resolved from
+          # (github.job_workflow_sha), so the briefs + ledger can't desync from
+          # the logic loading them; workflows_ref is an explicit override only.
+          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}
           path: _groom_assets
           persist-credentials: false
 
@@ -743,9 +973,22 @@ jobs:
         # Pinned, not floating: the agent CLI is executable supply chain for a
         # step that reads untrusted repo content, and an unannounced CLI change
         # (flag rename, default permission-mode shift) would silently break or
-        # loosen the sandbox below. 2.1.217 is the version the BE-4214 fix was
-        # validated end-to-end on. Bump deliberately, re-validating a groom run.
-        run: npm install -g @anthropic-ai/claude-code@2.1.217
+        # loosen the sandbox below. The pin itself lives in
+        # `.github/groom/package.json` and is resolved + validated once by the
+        # `gate` job (BE-5373), so this step and its two siblings in `audit_verify`
+        # and `build` can never drift apart, and Dependabot can bump all three by
+        # editing one line. Bump deliberately, re-validating a groom run.
+        #
+        # Scope, so the guarantee is not read as wider than it is: this pins the
+        # TOP-LEVEL version only. `npm install -g` has no lockfile, so transitive
+        # deps still resolve at install time and the package's lifecycle scripts
+        # still run. That top-level pin is nonetheless the accepted boundary: the
+        # tree is closed at this version (no regular deps; only same-scope
+        # platform binaries exact-pinned to it) — the boundary and its shape guard
+        # are documented in `.github/groom/README.md` (BE-5580).
+        env:
+          CLAUDE_CODE_VERSION: ${{ needs.gate.outputs.claude_code_version }}
+        run: npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION:?not resolved by the gate job from .github/groom/package.json}"
 
       - name: Lock the clone read-only
         # The finder NEVER writes into the clone — its sole output is $FINDER_OUT
@@ -766,6 +1009,15 @@ jobs:
         # `.git` all fail EACCES. /tmp is untouched, so $FINDER_OUT still works.
         run: chmod -R a-w "$GROOM_CLONE"
 
+      # NAME IS LOAD-BEARING — `interval.py` matches this step name EXACTLY
+      # (`_AGENT_STEP_NAME`) against the runs-jobs API's `steps[]` to decide
+      # whether a FAILED finder job actually spent its (billed) audit and may
+      # therefore advance the GROOM_INTERVAL_DAYS cadence clock (BE-4814). A
+      # rename here without the matching one there makes every failed run read as
+      # "agent never started", i.e. the cadence stops throttling failures — so
+      # `test_interval.py` pins both halves. Same for adding an `if:` to this
+      # step: a conditionally-skipped agent inside a SUCCEEDING job would still
+      # count, because a success is trusted on the job conclusion alone.
       - name: Run finder
         # Invoked as the CLI directly, NOT via the anthropics composite action
         # (BE-4202/BE-4214): the action cannot set a working directory, so the
@@ -1011,37 +1263,16 @@ jobs:
           persist-credentials: false
           path: repo
 
-      - name: Require a pinned workflows_ref
-        # workflows_ref has no default on purpose. GitHub does NOT enforce
-        # `required: true` for workflow_call inputs, so an omitted input arrives
-        # as '' and actions/checkout would silently fall back to this repo's
-        # default branch — running MUTABLE scripts under a pin that claims
-        # otherwise. Fail fast instead. (BE-5546)
-        env:
-          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
-        run: |
-          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
-          # whitespace-only value is an empty ref to IT while sailing past a bare
-          # -z test here. Compare the stripped form, and echo only that: dropping
-          # newlines also stops a multi-line value from smuggling a ::workflow
-          # command:: into the log, and from satisfying the line-oriented grep
-          # below on one 40-hex line among many.
-          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
-          if [ -z "$REF" ]; then
-            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
-            exit 1
-          fi
-          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
-          fi
-
       - name: Load groom assets (briefs)
         # Re-fetched fresh from THIS repo — never inherited from the finder job,
         # so a tampered brief cannot cross the job boundary.
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Comfy-Org/github-workflows
-          ref: ${{ inputs.workflows_ref }}
+          # Default to the exact commit THIS reusable workflow was resolved from
+          # (github.job_workflow_sha), so the briefs + ledger can't desync from
+          # the logic loading them; workflows_ref is an explicit override only.
+          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}
           path: _groom_assets
           persist-credentials: false
 
@@ -1084,7 +1315,11 @@ jobs:
 
       - name: Install Claude Code
         # Pinned for the same supply-chain reason as the finder job — see there.
-        run: npm install -g @anthropic-ai/claude-code@2.1.217
+        # Version comes from the gate job's single read of
+        # `.github/groom/package.json` (BE-5373), never a local literal.
+        env:
+          CLAUDE_CODE_VERSION: ${{ needs.gate.outputs.claude_code_version }}
+        run: npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION:?not resolved by the gate job from .github/groom/package.json}"
 
       - name: Lock the clone read-only
         # Same OS-level write lockdown as the finder job — see the full note there.
@@ -1332,35 +1567,14 @@ jobs:
           permission-issues: read
           permission-pull-requests: read
 
-      - name: Require a pinned workflows_ref
-        # workflows_ref has no default on purpose. GitHub does NOT enforce
-        # `required: true` for workflow_call inputs, so an omitted input arrives
-        # as '' and actions/checkout would silently fall back to this repo's
-        # default branch — running MUTABLE scripts under a pin that claims
-        # otherwise. Fail fast instead. (BE-5546)
-        env:
-          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
-        run: |
-          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
-          # whitespace-only value is an empty ref to IT while sailing past a bare
-          # -z test here. Compare the stripped form, and echo only that: dropping
-          # newlines also stops a multi-line value from smuggling a ::workflow
-          # command:: into the log, and from satisfying the line-oriented grep
-          # below on one 40-hex line among many.
-          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
-          if [ -z "$REF" ]; then
-            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
-            exit 1
-          fi
-          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
-          fi
-
       - name: Load groom assets (ledger)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Comfy-Org/github-workflows
-          ref: ${{ inputs.workflows_ref }}
+          # Default to the exact commit THIS reusable workflow was resolved from
+          # (github.job_workflow_sha), so the briefs + ledger can't desync from
+          # the logic loading them; workflows_ref is an explicit override only.
+          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}
           path: _groom_assets
           persist-credentials: false
 
@@ -1501,35 +1715,14 @@ jobs:
           # Least privilege: this job only opens `groom` issues (+ their labels).
           permission-issues: write
 
-      - name: Require a pinned workflows_ref
-        # workflows_ref has no default on purpose. GitHub does NOT enforce
-        # `required: true` for workflow_call inputs, so an omitted input arrives
-        # as '' and actions/checkout would silently fall back to this repo's
-        # default branch — running MUTABLE scripts under a pin that claims
-        # otherwise. Fail fast instead. (BE-5546)
-        env:
-          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
-        run: |
-          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
-          # whitespace-only value is an empty ref to IT while sailing past a bare
-          # -z test here. Compare the stripped form, and echo only that: dropping
-          # newlines also stops a multi-line value from smuggling a ::workflow
-          # command:: into the log, and from satisfying the line-oriented grep
-          # below on one 40-hex line among many.
-          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
-          if [ -z "$REF" ]; then
-            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
-            exit 1
-          fi
-          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
-          fi
-
       - name: Load groom assets (ledger)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Comfy-Org/github-workflows
-          ref: ${{ inputs.workflows_ref }}
+          # Default to the exact commit THIS reusable workflow was resolved from
+          # (github.job_workflow_sha), so the briefs + ledger can't desync from
+          # the logic loading them; workflows_ref is an explicit override only.
+          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}
           path: _groom_assets
           persist-credentials: false
 
@@ -1707,35 +1900,14 @@ jobs:
           persist-credentials: false
           path: repo
 
-      - name: Require a pinned workflows_ref
-        # workflows_ref has no default on purpose. GitHub does NOT enforce
-        # `required: true` for workflow_call inputs, so an omitted input arrives
-        # as '' and actions/checkout would silently fall back to this repo's
-        # default branch — running MUTABLE scripts under a pin that claims
-        # otherwise. Fail fast instead. (BE-5546)
-        env:
-          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
-        run: |
-          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
-          # whitespace-only value is an empty ref to IT while sailing past a bare
-          # -z test here. Compare the stripped form, and echo only that: dropping
-          # newlines also stops a multi-line value from smuggling a ::workflow
-          # command:: into the log, and from satisfying the line-oriented grep
-          # below on one 40-hex line among many.
-          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
-          if [ -z "$REF" ]; then
-            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
-            exit 1
-          fi
-          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
-          fi
-
       - name: Load groom assets (builder brief)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Comfy-Org/github-workflows
-          ref: ${{ inputs.workflows_ref }}
+          # Default to the exact commit THIS reusable workflow was resolved from
+          # (github.job_workflow_sha), so the briefs + ledger can't desync from
+          # the logic loading them; workflows_ref is an explicit override only.
+          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}
           path: _groom_assets
           persist-credentials: false
 
@@ -1776,7 +1948,11 @@ jobs:
 
       - name: Install Claude Code
         # Pinned for the same supply-chain reason as the finder job — see there.
-        run: npm install -g @anthropic-ai/claude-code@2.1.217
+        # Version comes from the gate job's single read of
+        # `.github/groom/package.json` (BE-5373), never a local literal.
+        env:
+          CLAUDE_CODE_VERSION: ${{ needs.gate.outputs.claude_code_version }}
+        run: npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION:?not resolved by the gate job from .github/groom/package.json}"
 
       - name: Lock the clone's .git read-only
         # Narrower than the finder/verifier lockdown: the builder's whole JOB is to
@@ -1933,7 +2109,18 @@ jobs:
       - name: Capture patch (enforce the size bail-out)
         env:
           IDX: ${{ matrix.idx }}
-          PR_SIZE_LIMIT: ${{ inputs.pr_size_limit }}
+          # Resolved (BE-6345), not `inputs.pr_size_limit`: the ceiling is now an
+          # operational knob `GROOM_CONFIG` may retune per repo, so it has to be
+          # read through the same single merge point as every other knob. A
+          # variable/`config` value that is non-numeric or negative never reaches
+          # here: config.py warns and keeps the caller's reviewed default, so the
+          # awk floor below cannot be handed a typo it would silently render as 0.
+          # The one value that CAN arrive unusable is an unusable caller default —
+          # handled by the guard in the script below, not here.
+          PR_SIZE_LIMIT: ${{ fromJSON(needs.gate.outputs.resolved).pr_size_limit }}
+          # Belt to the above's suspenders, and the pre-BE-6345 behaviour verbatim:
+          # used only if the resolved set carried no usable value at all.
+          PR_SIZE_LIMIT_INPUT: ${{ inputs.pr_size_limit }}
           # Present ONLY to scan the patch for the literal key before it becomes a
           # public PR (471). This step runs NO agent, so holding the key here adds no
           # exfil surface — the risk is an AGENT reading it, and there is none here.
@@ -1957,17 +2144,37 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/out
-          # `type: number` can arrive as a fractional string (e.g. 400.0) that the
+          # Empty means the resolved knob set somehow carried no pr_size_limit —
+          # only reachable if the CALLER's own reviewed `with:` value was itself
+          # rejected by config.py (e.g. a negative literal), since the variable
+          # layer falls back to that default rather than dropping the key. awk
+          # would render "" as 0, and a limit of 0 bails EVERY build to an issue,
+          # silently turning the builder off. Fall back to the caller's input and
+          # say so, rather than disabling PR-opening without a word.
+          if [ -z "${PR_SIZE_LIMIT//[[:space:]]/}" ]; then
+            echo "::warning::pr_size_limit resolved to an empty value — falling back to the caller's input ($PR_SIZE_LIMIT_INPUT)."
+            PR_SIZE_LIMIT="$PR_SIZE_LIMIT_INPUT"
+          fi
+          # `type: number` can arrive as a fractional string (e.g. 600.0) that the
           # integer-only `-gt` test below would abort on under `set -euo pipefail`,
           # skipping the patch upload. Floor it to an int first (mirrors the file
           # job's MAX_FINDINGS handling).
           PR_SIZE_LIMIT=$(awk -v v="$PR_SIZE_LIMIT" 'BEGIN{printf "%d", v}')
+          # No echo of the value here on purpose: the gate job already logs the
+          # whole resolved set ("Resolved knobs: {…}"), pr_size_limit included, so
+          # a variable-set ceiling — which leaves no diff and no branch — is
+          # already on the run record once per run (BE-6345). A per-build repeat
+          # would be the same fact N times.
           STATUS=$(jq -r '.status // "bail"' "$BUILDER_OUT" 2>/dev/null || echo bail)
           SUMMARY=$(jq -r '.summary // ""' "$BUILDER_OUT" 2>/dev/null || echo "")
 
           # Declared up here because the secret scan below bails through it.
+          # $2 is the `withheld` flag: true ONLY for the pre-publish secret-scan
+          # bail, which build_pr files even under `bail_sink: none` (BE-6157) —
+          # a machine field rather than a substring match on the prose reason, so
+          # rewording the message can never silently disarm that carve-out.
           bail() {
-            printf '{"status":"bail","reason":%s}\n' "$(jq -Rn --arg r "$1" '$r')" > /tmp/out/result.json
+            printf '{"status":"bail","reason":%s,"withheld":%s}\n' "$(jq -Rn --arg r "$1" '$r')" "${2:-false}" > /tmp/out/result.json
             : > /tmp/out/patch.diff
             rm -f /tmp/out/pr_body.md
           }
@@ -2001,54 +2208,51 @@ jobs:
                   || printf '%s' "$SUMMARY" | LC_ALL=C grep -qF -- "$ANTHROPIC_API_KEY" \
                   || { [ -s "$PR_BODY_OUT" ] && LC_ALL=C grep -qF -- "$ANTHROPIC_API_KEY" "$PR_BODY_OUT"; }; }; then
             echo "::error::Build $IDX output contains ANTHROPIC_API_KEY — refusing to publish the patch, summary OR PR body (possible prompt-injection exfil); filing a redacted issue instead."
-            bail "builder output withheld: it contained the model API key (possible prompt-injection exfil). Patch, summary and PR body discarded — a human must review this finding manually."
+            bail "builder output withheld: it contained the model API key (possible prompt-injection exfil). Patch, summary and PR body discarded — a human must review this finding manually." true
             exit 0
           fi
           CHANGED=$(git -C repo diff --cached --numstat | awk '{a+=($1=="-"?0:$1); d+=($2=="-"?0:$2)} END{print a+d+0}')
-          # Path policy: a patch touching `.github/workflows/` would, on the
+          # Path policy: a patch touching a CI-privileged path would, on the
           # same-repo branch push, run in CI with repository secrets + a writable
           # token BEFORE any human reviews the merge — defeating the RFC's
           # "review-gated, patch-only" boundary (review gates merge, not CI exec).
-          # A prompt-injected builder must never self-author CI. Refuse such a
-          # patch and file an issue so a human authors the workflow change.
-          #
-          # The deny-list covers the paths that actually execute in that pre-review CI:
-          # the workflow + composite-action definitions (`.github/workflows/`,
-          # `.github/actions/`) AND the build/test config the CI of a typical repo
-          # invokes — npm lifecycle scripts (`package.json`), `Makefile`, and the
-          # Python test/build config (`conftest.py`, `noxfile.py`, `tox.ini`,
-          # `pytest.ini`, `setup.py`, `setup.cfg`, `pyproject.toml`), plus
-          # `Dockerfile` and `.pre-commit-config.yaml`. Each is a "runs with
-          # repository secrets before a human reads the diff" window, exactly like a
-          # workflow file. Earlier revisions blocked only the first two and left the
-          # rest as a comment-guarded KNOWN GAP; a comment is not a control.
-          #
-          # STILL read this BEFORE setting `builder: true` on any caller: the precise
-          # list is target-repo-specific and this is a conservative DEFAULT, not a
-          # proof of completeness. A repo whose CI runs something else privileged
-          # (a checked-in `scripts/` entrypoint, a Gradle/Bazel build file) must add
-          # it here first. Erring wide is the safe direction — a false positive only
-          # downgrades a legitimate refactor from a PR to an issue, and nothing is
-          # dropped either way.
-          #
-          # Paths are compared NUL-delimited (`--name-only -z`), not via the default
-          # output: git C-quotes and double-quote-wraps any path containing a quote,
-          # backslash or control byte, so `.github/workflows/ev"il.yml` is emitted as
-          # `".github/workflows/ev\"il.yml"` — whose leading quote slips straight past
-          # the `^\.github/` anchor. `-c core.quotePath=false` did NOT fix this; it
-          # only suppresses quoting of high (non-ASCII) bytes. `-z` emits raw bytes
-          # with no quoting at all. Translating NUL to newline can only SPLIT a path
-          # that itself contains a newline, and both halves are then tested — that
-          # over-blocks, never under-blocks, which is the safe direction here.
-          TOUCHED_CI=$(git -C repo diff --cached --name-only -z | tr '\0' '\n' \
-            | grep -E '^\.github/(workflows|actions)/|(^|/)(package\.json|Makefile|GNUmakefile|conftest\.py|noxfile\.py|tox\.ini|pytest\.ini|setup\.py|setup\.cfg|pyproject\.toml|Dockerfile|\.pre-commit-config\.yaml)$' || true)
+          # A prompt-injected builder must never self-author code that pre-review CI
+          # executes. The deny-list lives in the tested `patch_policy.py` (BE-4404)
+          # so the pattern set is unit-tested, not an untestable inline grep. Two
+          # load-bearing notes survive here:
+          #   (a) it is a conservative DEFAULT, not a proof of completeness — the
+          #       precise list is target-repo-specific, so STILL read patch_policy.py
+          #       BEFORE setting `builder: true` on any caller (a repo whose CI runs
+          #       something else privileged must add it there). Erring wide is safe:
+          #       a false positive only downgrades a legit refactor from a PR to an
+          #       issue, and nothing is dropped either way.
+          #   (b) NUL-delimited comparison is mandatory (`--name-only -z`): git
+          #       C-quotes and double-quote-wraps any path with a quote/backslash/
+          #       control byte in default output, slipping the path past a `^\.github/`
+          #       anchor; `-z` emits raw bytes so patch_policy.py sees the true path.
+          # $GROOM_ASSETS already points into the _groom_assets checkout (workflow
+          # env, same var the prompt-build steps use).
+          # NO `|| true`: patch_policy.py always exits 0 on success (a no-match is
+          # empty output, not a nonzero exit, unlike the old `grep`), so `|| true`
+          # would only mask a REAL failure (missing $GROOM_ASSETS, wrong path, bad
+          # interpreter, uncaught exception). Under this step's `set -euo pipefail`,
+          # letting such a failure abort the step fails CLOSED — no PR is opened when
+          # the gate can't run — instead of fail-open (empty TOUCHED_CI => PR opened).
+          TOUCHED_CI=$(git -C repo diff --cached --name-only -z | python3 "$GROOM_ASSETS/patch_policy.py")
 
           if [ "$STATUS" != "patched" ] || [ ! -s /tmp/out/patch.diff ]; then
             echo "Build $IDX produced no patch (status=$STATUS) — will file as an issue."
             bail "${SUMMARY:-builder produced no patch}"
           elif [ -n "$TOUCHED_CI" ]; then
-            echo "::warning::Build $IDX patch edits CI-privileged file(s) [$(echo "$TOUCHED_CI" | tr '\n' ' ')] — refusing to auto-open a PR that would run in credentialed CI before human review; filing an issue instead."
-            bail "patch modifies a CI-privileged path (.github/workflows|actions, or build/test config that executes in pre-review CI) — a human must author these changes"
+            # Strip control bytes before interpolating attacker-influenced paths into
+            # a workflow-command line: `tr '\n' ' '` alone leaves CR (and other C0
+            # controls) intact, and the Actions runner treats a bare `\r` as a line
+            # terminator — a denied path named `…\r::stop-commands::…` would inject
+            # arbitrary workflow commands. `tr -d '\000-\037'` drops all C0 controls
+            # (newlines are already spaces by then); this line is human-readable only,
+            # the authoritative deny already happened above.
+            echo "::warning::Build $IDX patch edits CI-privileged file(s) [$(echo "$TOUCHED_CI" | tr '\n' ' ' | tr -d '\000-\037')] — refusing to auto-open a PR that would run in credentialed CI before human review; filing an issue instead."
+            bail "patch modifies a CI-privileged path (per .github/groom/patch_policy.py — workflow/action defs, lockfiles, or build/test config that executes in pre-review CI) — a human must author these changes"
           elif [ "$CHANGED" -gt "$PR_SIZE_LIMIT" ]; then
             echo "::warning::Build $IDX patch changed $CHANGED lines (> $PR_SIZE_LIMIT) — filing an issue instead of a giant PR."
             bail "patch too large: ${CHANGED} lines changed (> ${PR_SIZE_LIMIT})"
@@ -2094,7 +2298,13 @@ jobs:
     # never uploaded its result simply fails its own build_pr cell (fail-fast off).
     if: ${{ !cancelled() && needs.gate.outputs.should_run == 'true' && needs.build_select.outputs.have_build == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 15 -> 20. Headroom only, and deliberately the LAST line of defence rather
+    # than the fix: the 2026-08-04 cancellation was a hung fetch that produced
+    # zero bytes, so a bigger budget alone would just have bought a longer hang.
+    # The bounded two-attempt checkout below is what actually converts that stall
+    # into a recovery. This also stops build_pr from being tighter than `build`
+    # (30 min), which does strictly more work over the same checkout.
+    timeout-minutes: 20
     permissions:
       contents: read
     strategy:
@@ -2116,35 +2326,14 @@ jobs:
           permission-pull-requests: write
           permission-issues: write
 
-      - name: Require a pinned workflows_ref
-        # workflows_ref has no default on purpose. GitHub does NOT enforce
-        # `required: true` for workflow_call inputs, so an omitted input arrives
-        # as '' and actions/checkout would silently fall back to this repo's
-        # default branch — running MUTABLE scripts under a pin that claims
-        # otherwise. Fail fast instead. (BE-5546)
-        env:
-          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
-        run: |
-          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
-          # whitespace-only value is an empty ref to IT while sailing past a bare
-          # -z test here. Compare the stripped form, and echo only that: dropping
-          # newlines also stops a multi-line value from smuggling a ::workflow
-          # command:: into the log, and from satisfying the line-oriented grep
-          # below on one 40-hex line among many.
-          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
-          if [ -z "$REF" ]; then
-            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
-            exit 1
-          fi
-          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
-          fi
-
       - name: Load groom assets (signature marker)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Comfy-Org/github-workflows
-          ref: ${{ inputs.workflows_ref }}
+          # Default to the exact commit THIS reusable workflow was resolved from
+          # (github.job_workflow_sha), so the briefs + ledger can't desync from
+          # the logic loading them; workflows_ref is an explicit override only.
+          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}
           path: _groom_assets
           persist-credentials: false
 
@@ -2160,12 +2349,68 @@ jobs:
           name: groom-build-${{ matrix.idx }}
           path: /tmp/build
 
+      - name: Decide whether a working tree is needed
+        # The bail path (agent bailed / oversized patch / CI-privileged path /
+        # withheld output) only calls `gh issue create` — it never touches a git
+        # worktree. Reading the status HERE lets the checkout below be skipped
+        # entirely on that path, instead of full-cloning a large monorepo to file
+        # an issue. That is not a hypothetical saving: on 2026-08-04 both build
+        # cells bailed, and the idx-1 cell still spent its whole 15-minute budget
+        # in `git fetch` and was cancelled before it could file, dropping a
+        # CONFIRMED finding that the ledger then never suppressed.
+        id: plan
+        run: |
+          set -euo pipefail
+          # Default CLOSED: an unreadable/absent result.json means the apply step
+          # will take the bail branch (`result.get("status") != "patched"`), so the
+          # worktree is genuinely not needed. Skipping it cannot strand a patch —
+          # if the status is unreadable there is no patch to apply.
+          status=$(jq -r '.status // "bail"' /tmp/build/result.json 2>/dev/null || echo bail)
+          if [ "$status" = "patched" ]; then
+            echo "needs_worktree=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needs_worktree=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::build ${{ matrix.idx }} status=$status — no patch to apply, skipping the target-repo checkout."
+          fi
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+
+      # Two bounded attempts, NOT one unbounded one. A server-side pack
+      # negotiation can stall with zero bytes on the wire: on 2026-08-04 this
+      # fetch sat silent for 15 minutes and was killed by the job timeout, while
+      # the sibling cell ran the identical fetch 70 seconds earlier in 50s.
+      #
+      # A step `timeout-minutes` alone does NOT buy a retry — exceeding it fails
+      # the step (and the job); checkout's own retry only covers git commands that
+      # exit non-zero inside a step that is still alive, never a step the runner
+      # killed. So attempt 1 is `continue-on-error` and attempt 2 re-runs it on a
+      # fresh connection. Two 6-minute attempts fit inside the 20-minute job
+      # budget with room for the push and the PR open.
       - name: Checkout target repo (as the bot, for the push)
         # persist-credentials stays ON (default) with the bot token so the branch
         # push authenticates as the bot — this is the credentialed job by design.
+        id: checkout_target
+        if: steps.plan.outputs.needs_worktree == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        continue-on-error: true
+        timeout-minutes: 6
         with:
-          fetch-depth: 0
+          # Shallow: everything downstream needs only the default-branch tip —
+          # `checkout -b`, `git apply --index`, then `git push origin <branch>`
+          # (pushing a new branch from a shallow clone is fine, the base commit is
+          # already on the remote). Full history was never read, and on a repo of
+          # this size `fetch-depth: 0` turns a bounded cost into a variable one.
+          fetch-depth: 1
+          path: repo
+          token: ${{ steps.bot_token.outputs.token }}
+
+      - name: Checkout target repo (second attempt after a stalled fetch)
+        # No continue-on-error: if a fresh connection stalls too, fail the cell
+        # loudly rather than falling through to an apply step with no worktree.
+        if: ${{ steps.plan.outputs.needs_worktree == 'true' && steps.checkout_target.outcome == 'failure' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 6
+        with:
+          fetch-depth: 1
           path: repo
           token: ${{ steps.bot_token.outputs.token }}
 
@@ -2194,6 +2439,11 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           DRY_RUN: ${{ fromJSON(needs.gate.outputs.resolved).dry_run }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          # Resolved (BE-6157): where a BAIL goes. Reads empty when config.py
+          # dropped an unrecognized value — `normalize_bail_sink` maps that (and
+          # any other unknown) back to `issue`, so the fallback is today's
+          # behavior rather than silent suppression.
+          BAIL_SINK: ${{ fromJSON(needs.gate.outputs.resolved).bail_sink }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -2203,6 +2453,9 @@ jobs:
           # this PR (or bail issue) and never re-proposes the finding.
           sys.path.insert(0, os.path.join(os.environ["GITHUB_WORKSPACE"], "_groom_assets", ".github", "groom"))
           from ledger import signature_marker, builder_pr_body
+          # config.py owns the bail_sink allowlist (BE-6157) so the workflow and
+          # the GROOM_CONFIG coercion can never disagree about what `none` means.
+          from config import normalize_bail_sink
 
           repo = os.environ["REPO"]
           idx = int(os.environ["IDX"])
@@ -2222,6 +2475,7 @@ jobs:
           # still gets the `groom-security` label / scrutiny banner.
           is_security = str(finding.get("security")).strip().lower() != "false"
           dry_run = os.environ.get("DRY_RUN", "false").lower() == "true"
+          bail_sink = normalize_bail_sink(os.environ.get("BAIL_SINK"))
 
           def sh(cmd, check=True, **kw):
               r = subprocess.run(cmd, text=True, capture_output=True, **kw)
@@ -2229,16 +2483,64 @@ jobs:
                   raise RuntimeError(f"{' '.join(cmd)} failed: {(r.stderr or r.stdout).strip()}")
               return r
 
-          def file_issue(reason):
+          def oneline(value, limit):
+              """Model-authored text, flattened to one bounded line.
+
+              An embedded newline in a `::warning::` ends the annotation early and
+              lets the remainder pose as its own workflow command, so anything
+              that reaches an annotation goes through here first.
+              """
+              return " ".join(str(value).split())[:limit]
+
+          def summarize(line):
+              path = os.environ.get("GITHUB_STEP_SUMMARY")
+              if path:
+                  with open(path, "a", encoding="utf-8") as s:
+                      s.write(line)
+
+          def file_issue(reason, withheld=False):
               # Bail fallback (agent bailed / patch too large / apply failed):
               # file a `groom` issue so the finding is not silently dropped AND
               # the ledger records it (no re-loop next run).
+              #
+              # This guard stays FIRST, ahead of the `bail_sink` branch: a missing
+              # signature is a producer error, not an operator choice, and
+              # reporting it as "suppressed by the operator" would hide a schema
+              # failure behind a config knob.
               if not sig:
                   print(f"::warning::bailed finding idx={idx} has no signature — cannot file, skipping.")
                   return
+              if bail_sink == "none" and not withheld:
+                  # BE-6157: the operator asked for silence — file nothing, but
+                  # never SILENTLY nothing. This annotation plus the summary line
+                  # ARE the recovery path, because no issue means no signature
+                  # marker, which means the ledger does not remember this finding
+                  # and a later run may re-propose (and re-bail on) it. The title,
+                  # the signature and (on the agent-bail path) the reason are ALL
+                  # model-authored, so every one of them goes through `oneline`
+                  # before reaching the annotation or the run summary — an
+                  # embedded newline would otherwise end the annotation and let
+                  # the remainder pose as its own workflow command in a job that
+                  # holds a write-scoped bot token.
+                  print(f"::warning::bail_sink=none — NOT filing a bail issue for "
+                        f"'{oneline(title, 120)}' (idx={idx}, signature={oneline(sig, 200)}): "
+                        f"{oneline(reason, 300)}")
+                  summarize(f"- 🔇 bail suppressed (`bail_sink: none`) for **{oneline(title, 120)}** "
+                            f"(`{oneline(sig, 200)}`) — {oneline(reason, 300)}\n")
+                  return
+              # `withheld` (the pre-publish secret-scan bail) is filed even under
+              # `bail_sink: none`. `bail_sink` is an OPERATIONAL key precisely
+              # because it can only make groom quieter, never grant it privilege —
+              # and destroying the durable record of a detected key-exfil attempt,
+              # leaving only an `::error::` in run logs that expire, is the one
+              # bail where "quieter" would cross that line.
+              if withheld and bail_sink == "none":
+                  print("::warning::bail_sink=none does NOT suppress the secret-scan withhold — "
+                        f"filing the security bail for idx={idx} anyway.")
               labels = ["groom", "groom-security"] if is_security else ["groom"]
               if dry_run:
-                  print(f"[dry-run] WOULD file bail issue '[groom] {title}' labels={labels} ({reason})")
+                  print(f"[dry-run] WOULD file bail issue '[groom] {oneline(title, 120)}' "
+                        f"labels={labels} ({oneline(reason, 300)})")
                   return
               header = (f"**Groom auto-builder** — {repo}: this CONFIRMED finding could not be "
                         f"auto-built ({reason}), so it is filed for a human. · [run]({run_url})")
@@ -2250,7 +2552,8 @@ jobs:
               print(f"Filed bail issue: {out.stdout.strip()}")
 
           if result.get("status") != "patched":
-              file_issue(result.get("reason", "not built"))
+              # `withheld` is set only by the build job's secret-scan bail.
+              file_issue(result.get("reason", "not built"), withheld=bool(result.get("withheld")))
               sys.exit(0)
 
           # Base = the repo's DEFAULT branch from the event context — NOT
@@ -2284,12 +2587,9 @@ jobs:
           if dry_run:
               # Parity preview: the patch applied cleanly, but open nothing.
               changed = result.get("changed", "?")
-              print(f"[dry-run] WOULD open PR '[groom] {title}' on branch {branch} "
+              print(f"[dry-run] WOULD open PR '[groom] {oneline(title, 120)}' on branch {branch} "
                     f"(base {base}, {changed} line(s) changed).")
-              summary = os.environ.get("GITHUB_STEP_SUMMARY")
-              if summary:
-                  with open(summary, "a", encoding="utf-8") as s:
-                      s.write(f"- [dry-run] would build PR for **{title}** ({changed} lines)\n")
+              summarize(f"- [dry-run] would build PR for **{oneline(title, 120)}** ({changed} lines)\n")
               sys.exit(0)
 
           sh(["git", "-C", "repo", "commit", "-m", f"groom: {title}\n\nAuto-built groom refactor ({sig}).\nReview required — do not auto-merge."])
@@ -2330,8 +2630,5 @@ jobs:
           pr_url = out.stdout.strip()
           print(f"Opened builder PR: {pr_url}")
 
-          summary = os.environ.get("GITHUB_STEP_SUMMARY")
-          if summary:
-              with open(summary, "a", encoding="utf-8") as s:
-                  s.write(f"- 🤖 Built PR for **{title}**: {pr_url}\n")
+          summarize(f"- 🤖 Built PR for **{oneline(title, 120)}**: {pr_url}\n")
           PY
