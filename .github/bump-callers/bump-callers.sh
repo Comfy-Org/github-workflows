@@ -159,8 +159,25 @@ fi
 # the four fields with `|` and `cut -d'|' -f3` reads the label back, so a
 # pipe-bearing label truncates at the pipe and bleeds its tail into the
 # `wire_bot` field — silently flagging for identity wiring an entry that never
-# asked for it. A newline is barred for the same reason (the tuples are read
-# line-wise).
+# asked for it. `\n` and `\r` are barred for the same reason (the tuples are read
+# line-wise, and a CR would also reach `gh pr create --label` verbatim, where the
+# API rejects it as an opaque per-repo failure rather than a named rule).
+#
+# Every pattern is anchored with `\A`/`\z`, NOT `^`/`$`. jq matches with
+# Oniguruma, where `$` also matches immediately BEFORE a trailing newline — so
+# `^Comfy-Org/[A-Za-z0-9._-]+$` accepts `"Comfy-Org/legit\n"`, whose tuple then
+# splits across two lines in the `while IFS= read -r ENTRY` loop below. The
+# fragment after the split is a never-validated tuple: its `REPO` is empty and
+# reaches `::add-mask::` and `gh api repos/`, and the fragment before it has no
+# `|` at all, so `cut -d'|' -f4` returns the whole line and silently flags the
+# entry for identity wiring. `\A`/`\z` are strict whole-string anchors and close
+# that off. (`^`/`$` are NOT line anchors here — an embedded newline mid-value is
+# already rejected — but the trailing-newline case is real.)
+#
+# The `Comfy-Org/` owner is matched case-INSENSITIVELY, for the same reason
+# REPO_RE above is spelled that way: GitHub resolves an owner case-insensitively,
+# so `comfy-org/foo` is a working roster entry today and must not hard-fail the
+# whole fleet before a single repo is bumped.
 #
 # NEVER echo the offending value. Masking has not happened yet at this point
 # (the `::add-mask::` loop is below), this repo's run logs are public, and roster
@@ -172,15 +189,15 @@ if ! INVALID=$(jq -r '
   to_entries[]
   | .key as $i
   | .value as $e
-  | [ (if ($e.repo | test("^Comfy-Org/[A-Za-z0-9._-]+$"))
-          and (($e.repo | ltrimstr("Comfy-Org/")) | (. != "." and . != ".."))
+  | [ (if ($e.repo | test("\\AComfy-Org/[A-Za-z0-9._-]+\\z"; "i"))
+          and (($e.repo | sub("\\A[Cc][Oo][Mm][Ff][Yy]-[Oo][Rr][Gg]/"; "")) | (. != "." and . != ".."))
         then empty
-        else "repo must match ^Comfy-Org/[A-Za-z0-9._-]+$ and not be a dot segment" end),
-      (if ($e.file | test("^[.]github/workflows/[A-Za-z0-9._-]+[.]ya?ml$")) then empty
+        else "repo must match ^Comfy-Org/[A-Za-z0-9._-]+$ (owner case-insensitive) and not be a dot segment" end),
+      (if ($e.file | test("\\A[.]github/workflows/[A-Za-z0-9._-]+[.]ya?ml\\z")) then empty
         else "file must be a .github/workflows/<name>.yml path" end),
       (if ($e.label == null)
-          or ((($e.label | type) == "string") and (($e.label | test("[|\n]")) | not))
-        then empty else "label must be a string containing no | and no newline" end)
+          or ((($e.label | type) == "string") and (($e.label | test("[|\n\r]")) | not))
+        then empty else "label must be a string containing no |, CR or newline" end)
     ][]
   | "\($i)\t\(.)"' <<<"$CALLERS_JSON"); then
   echo "::error::${VAR_NAME} could not be validated (jq failed). Fix the variable — see the workflow header."
@@ -250,7 +267,7 @@ bump_repo() {
   # anything yet. This keeps the reset/commit path off entirely for a repo whose
   # files are all missing or already pinned (the old per-entry skips), so it
   # never resets a branch or opens a PR it doesn't need.
-  local -a PEND_FILE=() PEND_CONTENT=() LABELS=()
+  local -a PEND_FILE=() PEND_CONTENT=() LABELS=() SKIP_FILE=()
   local WIRING_ADDED_ANY=""
   local ENTRY FILE LABEL WIRE_BOT FILE_ENC CURRENT OLD_CONTENT NEW_CONTENT
   for ENTRY in "$@"; do
@@ -265,8 +282,14 @@ bump_repo() {
     # fail the whole repo even though the file was actually bumped. Fold the
     # duplicate entry's label into the set (it still applies to the one PR) but
     # do not re-stage the file.
+    #
+    # SKIP_FILE is consulted alongside PEND_FILE so the dedup also covers a path
+    # that was REJECTED rather than staged (absent, or carrying no movable pin,
+    # below). Without it a doubly-listed broken path is re-fetched, warned about
+    # twice, and counted twice in the NOPIN tally — reporting more broken files
+    # than there are distinct broken roster entries.
     local SEEN_FILE=0 P
-    for P in ${PEND_FILE[@]+"${PEND_FILE[@]}"}; do
+    for P in ${PEND_FILE[@]+"${PEND_FILE[@]}"} ${SKIP_FILE[@]+"${SKIP_FILE[@]}"}; do
       [[ "$P" == "$FILE" ]] && { SEEN_FILE=1; break; }
     done
     if (( SEEN_FILE )); then
@@ -275,17 +298,29 @@ bump_repo() {
     fi
 
     # Fetch current file, pinned to the resolved tip. Distinguish a genuine 404
-    # (this file is actually absent → an expected per-file skip) from ANY other
-    # failure (auth, rate limit, 5xx, network). Treating a transient error as
-    # "not found" and continuing would open a PR that silently OMITS this file
-    # while the job still reports success — the partial-bump class this refactor
-    # exists to kill (BE-3896). So a non-404 failure fails the whole repo.
+    # from ANY other failure (auth, rate limit, 5xx, network). Treating a
+    # transient error as "not found" and continuing would open a PR that silently
+    # OMITS this file while the job still reports success — the partial-bump class
+    # this refactor exists to kill (BE-3896). So a non-404 failure fails the whole
+    # repo.
+    #
+    # A 404 is NOT a benign skip (BE-6471): the roster named a path that does not
+    # exist, so this entry can never be bumped — the renamed- or typo'd-caller case
+    # that is the whole reason for the un-bumpable tally below, and strictly worse
+    # than the no-movable-pin case since not even the file is there. It is recorded
+    # in NOPIN and fails the job at the END (never `return 1`, which would punish
+    # this repo's other, perfectly bumpable files). This deliberately turns a
+    # previously green run red when a roster entry has gone stale; that is the
+    # point — this repo's own `ci-groom.yml` drifted for weeks behind exactly such
+    # a silent skip.
     local ERRFILE RC
     ERRFILE=$(mktemp)
     CURRENT=$(gh api "repos/${REPO}/contents/${FILE_ENC}?ref=${MAIN_SHA}" 2>"$ERRFILE"); RC=$?
     if (( RC != 0 )); then
       if grep -qi 'HTTP 404' "$ERRFILE"; then
-        echo "::warning::${REPO}: ${FILE} not found — skipping"
+        echo "::warning::${REPO}: ${FILE} not found on ${DEFAULT_BRANCH} — fix or remove its ${VAR_NAME} entry"
+        NOPIN+=("${REPO}|${FILE}")
+        SKIP_FILE+=("$FILE")
         rm -f "$ERRFILE"
         continue
       fi
@@ -371,35 +406,74 @@ bump_repo() {
     # can drift forever behind a green run: this repo's own `ci-groom.yml` was
     # absent from `GROOM_CALLERS` for weeks while nothing in the log said so.
     #
-    # "Addressable" is deliberately expressed with the SAME regexes the rewrite
-    # uses, so the two cannot drift apart — a `uses:` pin of this repo on a
-    # SHA_ADDR-eligible line, or a `workflows_ref:` key. Note what that does NOT
-    # require: a 40-hex ref. Rules 1-2 move a ref by POSITION, not by shape
-    # (BE-4662), so a caller pinned to `@v1` is self-healed to NEW_SHA rather than
-    # reported — demanding a full SHA here would fail exactly the callers the
-    # bumper exists to fix. What is left is the genuinely un-bumpable roster
-    # entry: a file that names no `Comfy-Org/github-workflows` pin (wrong file, or
-    # not a caller at all), or — via the sibling-tightened SHA_ADDR — one whose
-    # only github-workflows `uses:` belongs to a DIFFERENT fleet's reusable, where
-    # the stale entry rather than the file is the thing to fix.
+    # "Addressable" is read on the SAME SHA_ADDR-eligible lines as the rewrite,
+    # with the ASSERTION's reader (`USES_PIN_RE[^[:space:]]+`) rather than the
+    # rewrite's narrower `REF_RE`. That pairing is deliberate: this gate asks "is
+    # there a pin here at all?", and anything the assertion below would judge must
+    # count as one. Reading with REF_RE instead would classify a pin the rewrite
+    # cannot move — `uses: …@${{ inputs.ref }}`, whose ref begins with a character
+    # REF_RE excludes — as "no pin at all", skipping the file and letting the
+    # repo's OTHER files ship a PR, where the assertion previously failed the whole
+    # repo. Broad here, narrow there: the gate admits it, the assertion fails it.
+    #
+    # Note what this does NOT require: a 40-hex ref. Rules 1-2 move a ref by
+    # POSITION, not by shape (BE-4662), so a caller pinned to `@v1` is self-healed
+    # to NEW_SHA rather than reported — demanding a full SHA here would fail
+    # exactly the callers the bumper exists to fix. What is left is the genuinely
+    # un-bumpable roster entry: a file that names no `Comfy-Org/github-workflows`
+    # pin (wrong file, or not a caller at all), or one whose only github-workflows
+    # `uses:` belongs to a DIFFERENT fleet's reusable, where the stale entry rather
+    # than the file is the thing to fix.
+    #
+    # That second case is why a bare `workflows_ref:` does NOT vouch for the file
+    # once GW_HAS_SIBLING is set. SHA_ADDR's `workflows_ref` alternative is not
+    # fleet-scoped (it cannot be — see rule 2's comment above), so a sibling
+    # fleet's DOUBLE-pinning caller (groom and pr-risk callers carry both `uses:`
+    # and `workflows_ref:`) would otherwise pass this gate on its `workflows_ref:`
+    # line alone: rule 1 correctly declines its `uses:` pin, but rule 2 — which is
+    # unaddressed — would still stamp THIS fleet's NEW_SHA onto that caller's
+    # `workflows_ref`, and the post-rewrite assertion is address-filtered, so it
+    # stays silent. A green run would ship a split-pin, cross-fleet PR: precisely
+    # the misfiled roster entry this gate exists to catch. When the file calls a
+    # sibling, require an addressable `uses:` pin of OUR reusable.
+    #
+    # One known blind spot, called out so the warning is not read as gospel:
+    # SHA_ADDR's `github-workflows` literal is case-SENSITIVE while USES_PIN_RE is
+    # deliberately case-insensitive, so a caller spelled
+    # `comfy-org/GitHub-Workflows/…` yields an empty PIN_SCAN and is reported here
+    # as un-bumpable. That report is not wrong — the rewrite cannot move that pin
+    # either, and before this gate it was mis-logged as `already at <short>` — but
+    # the fix is the pin's spelling, not the roster entry, hence the hint in the
+    # warning text. No caller spells it that way today.
     #
     # Comments are stripped first, by YAML's own rule (a `#` preceded by
     # whitespace, every line pre-padded with a space so a `#` at column 0 counts),
     # for the same reason the post-rewrite assertion strips them and for the same
     # reason GW_USES is anchored to `^[^#]*uses:`: a commented-out old pin or a
     # docs URL must not vouch for a live pin that is not there.
-    local PIN_SCAN
+    local PIN_SCAN ADDR_RE
     PIN_SCAN=$(sed -E 's|^| |; s|[[:space:]]#.*$||' <<<"$OLD_CONTENT" | grep -E "$SHA_ADDR") || true
-    if ! grep -qE "${USES_PIN_RE}${REF_RE}|${INPUT_KEY_RE}" <<<"$PIN_SCAN"; then
+    ADDR_RE="${USES_PIN_RE}[^[:space:]]+|${INPUT_KEY_RE}"
+    if (( GW_HAS_SIBLING )); then ADDR_RE="${USES_PIN_RE}[^[:space:]]+"; fi
+    if ! grep -qE "$ADDR_RE" <<<"$PIN_SCAN"; then
       # ${REPO} is safe to print — it was `::add-mask::`ed at parse time, so it
       # renders as *** in the public log; ${FILE} is a `.github/workflows/` path,
       # which the roster validation above already constrained to that shape.
-      echo "::warning::${REPO}: ${FILE} carries no ${WORKFLOW_FILE} pin this bumper can move (wrong file, a sibling fleet's reusable, or not a caller at all?) — fix or remove its ${VAR_NAME} entry"
+      echo "::warning::${REPO}: ${FILE} carries no ${WORKFLOW_FILE} pin this bumper can move (wrong file, a sibling fleet's reusable, a non-canonically-cased pin, or not a caller at all?) — fix or remove its ${VAR_NAME} entry"
       # Recorded, NOT returned: the per-repo loop turns a non-zero return into a
       # whole-repo FAILED entry, which would punish this repo's OTHER, perfectly
       # bumpable files. Skip just this file and let the end-of-run accounting fail
-      # the job once every caller has had its turn.
+      # the job once every caller has had its turn. SKIP_FILE so a repo listed
+      # TWICE for this same path is warned and tallied ONCE — the PEND_FILE dedup
+      # above cannot see a file that never reaches the pending set.
+      #
+      # Skipping the file also skips the `wire_bot` block further down, so say so
+      # rather than letting a flagged entry quietly lose its identity wiring: the
+      # entry is being declared broken, and wiring a bot identity into a file we
+      # have just decided we cannot address would be the wrong half of a bump.
+      [[ -n "$WIRE_BOT" ]] && echo "::warning::${REPO}: ${FILE} is also flagged wire_bot — its identity wiring was NOT applied either"
       NOPIN+=("${REPO}|${FILE}")
+      SKIP_FILE+=("$FILE")
       continue
     fi
     #
@@ -754,7 +828,8 @@ for ENTRY in "${CALLERS[@]}"; do
 done
 
 FAILED=()
-# Caller files listed in the roster that carry no pin this fleet can move
+# Caller files listed in the roster that this fleet can never bump — absent on the
+# caller's default branch, or present but carrying no pin this fleet can move
 # (BE-6471). Appended to from inside bump_repo — a plain global on purpose, since
 # the loop below runs the function in THIS shell (no subshell, no pipe), so the
 # appends survive. Declared here, before the first call, so `set -u` sees it.
@@ -779,7 +854,7 @@ fi
 # how FAILED already behaves. Only the COUNT is printed: the per-file warnings
 # above carry the (masked) repo and the path, and the roster is private.
 if (( ${#NOPIN[@]} )); then
-  printf '::error::%d caller file(s) carry no %s pin this bumper can move — see the warnings above; fix or remove those %s entries\n' \
+  printf '::error::%d roster entr(y/ies) name a caller this bumper can never move (missing file, or no movable %s pin) — see the warnings above; fix or remove those %s entries\n' \
     "${#NOPIN[@]}" "${WORKFLOW_FILE}" "${VAR_NAME}"
 fi
 if (( ${#FAILED[@]} || ${#NOPIN[@]} )); then

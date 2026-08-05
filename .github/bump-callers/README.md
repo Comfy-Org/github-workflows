@@ -184,9 +184,14 @@ constrains the values before it makes a single API call:
 
 | Field | Rule |
 |---|---|
-| `repo` | must match `^Comfy-Org/[A-Za-z0-9._-]+$`, and the name may not be `.` or `..` (a dot-leading name like `.github` is fine; a name that is *only* dots is a path segment, not a repo) |
+| `repo` | must match `^Comfy-Org/[A-Za-z0-9._-]+$` (the owner case-insensitively, as GitHub itself resolves it), and the name may not be `.` or `..` (a dot-leading name like `.github` is fine; a name that is *only* dots is a path segment, not a repo) |
 | `file` | must match `^\.github/workflows/[A-Za-z0-9._-]+\.ya?ml$` (the class excludes `/`, so `../` traversal cannot appear) |
-| `label` | optional; when present must be a string containing no `\|` and no newline |
+| `label` | optional; when present must be a string containing no `\|`, CR or newline |
+
+Each pattern is anchored `\A…\z`, not `^…$`: jq matches with Oniguruma, where `$`
+also matches *before a trailing newline*, so `"Comfy-Org/legit\n"` would otherwise
+pass and then split into two tuples — one of them never validated, with an empty
+`repo`.
 
 A violation is a **hard fail before the fan-out**, reported as the entry's
 zero-based **index** and the rule it broke — never the value, because masking has
@@ -203,16 +208,24 @@ fleet's rewrites to itself — which the content-equality check reports as the
 reassuring `already at <short> — skipping`. That is how a wrong roster entry
 drifts forever behind a green run. Each caller file is now checked for a pin this
 fleet can address *before* the rewrite; if there is none, the run warns per file
-and then **fails** with an aggregate error naming the count. Two shapes trip it:
+and then **fails** with an aggregate error naming the count. Three shapes trip it:
 
+- the file **does not exist** on the caller's default branch (a renamed or
+  typo'd path) — previously a silent `not found — skipping`;
 - the file carries no `uses:` pin of `Comfy-Org/github-workflows` at all (wrong
   file, or not a caller);
 - its only `github-workflows` `uses:` names a **sibling** fleet's reusable, so
-  this fleet has nothing to move — the stale entry, not the file, is the bug.
+  this fleet has nothing to move — the stale entry, not the file, is the bug. A
+  bare `workflows_ref:` does not rescue such a file: that input carries no
+  workflow name, so it cannot vouch for *this* fleet, and letting it would stamp
+  this fleet's SHA onto a sibling caller's assets ref.
 
 What does **not** trip it is a pin that is merely not a full SHA. The rewrite
 matches a ref by position rather than shape, so a caller on `@v1` is *self-healed*
 to the new SHA — dragging floating pins back onto immutable ones is the point of
-the fleet, not an error. The failure lands after every caller has been processed,
+the fleet, not an error. Nor does a pin the rewrite knows about but cannot move
+(a `uses:` ref fed by a `${{ … }}` expression): that is admitted here and then
+fails loudly in the post-rewrite assertion, which is the check that owns it. The
+failure lands after every caller has been processed,
 so one bad entry never blocks the rest of the fleet's bumps; what it refuses to do
 is report success.

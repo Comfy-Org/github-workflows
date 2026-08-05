@@ -538,7 +538,7 @@ STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
   VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
   CALLERS_JSON='[{"repo":"Comfy-Org/secret-alpha","file":".github/workflows/ci.yml","label":"bug|ui"}]'
 check "exit 1"                             "[[ $RC -eq 1 ]]"
-check "error names the label rule"         "grep -q 'label must be a string containing no | and no newline' <<<\"\$OUT\""
+check "error names the label rule"         "grep -q 'label must be a string containing no |, CR or newline' <<<\"\$OUT\""
 check "the label itself was NEVER echoed"  "! grep -q 'bug|ui' <<<\"\$OUT\""
 check "wrote nothing anywhere"             "[[ -z \"\$(ls -A \"\$STUB_PUT_DIR\")\" ]]"
 check "bailed BEFORE the parse/mask loop"  "! grep -q '::add-mask::' <<<\"\$OUT\""
@@ -564,18 +564,85 @@ check "exit 0 — every legitimate shape validates" "[[ $RC -eq 0 ]]"
 check "no validation error raised"                "! grep -q 'is invalid' <<<\"\$OUT\""
 check "all three callers were bumped"             "[[ \$(cat \"\$STUB_PUT_DIR/count\") -eq 3 ]]"
 
-echo "== monorepo: a genuinely-missing (404) file is skipped, the present one still bumps =="
-# One file 404s (expected per-file skip), the other bumps. The repo must still
-# succeed and open its PR with the file that WAS present — a 404 is not a repo
-# failure.
+echo "== a TRAILING NEWLINE cannot smuggle a second, never-validated tuple (BE-6471) =="
+# jq matches with Oniguruma, where `$` also matches immediately BEFORE a trailing
+# newline — so an `^…$`-anchored rule accepts "Comfy-Org/legit\n". The tuple
+# encoding is read back line-wise, so that one entry splits in two: a fragment
+# with no `|` at all (every `cut -d'|' -fN` returns the whole line, so `wire_bot`
+# comes back non-empty and the entry is silently flagged for identity wiring) and
+# a fragment whose `repo` is EMPTY, which would reach `::add-mask::` and
+# `gh api repos/`. `\A`/`\z` are strict whole-string anchors; this is their guard.
+new_case trailnl
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-a\n","file":".github/workflows/ci.yml","label":""}]'
+check "exit 1"                              "[[ $RC -eq 1 ]]"
+check "rejected by the repo rule"           "grep -q 'index 0 is invalid (repo must match' <<<\"\$OUT\""
+check "bailed BEFORE the parse/mask loop"   "! grep -q '::add-mask::' <<<\"\$OUT\""
+check "wrote nothing anywhere"              "[[ -z \"\$(ls -A \"\$STUB_PUT_DIR\")\" ]]"
+
+new_case trailnlfile
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-a","file":".github/workflows/ci.yml\n","label":""}]'
+check "a trailing newline in file is rejected too" "[[ $RC -eq 1 ]]"
+check "rejected by the file rule"                  "grep -q 'index 0 is invalid (file must be' <<<\"\$OUT\""
+
+echo "== a CR-bearing label is a named rule violation, not an opaque gh failure (BE-6471) =="
+# `\r` survives the line-wise tuple reads (only `\n` splits them) and would reach
+# `gh pr create --label` verbatim, where the API rejects it — turning a screenable
+# roster value into a per-repo FAILED entry with no hint of the real cause. Both
+# `repo` and `file` already exclude CR via their character classes; `label` bars
+# it explicitly.
+new_case labelcr
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-a","file":".github/workflows/ci.yml","label":"ci\r"}]'
+check "exit 1"                             "[[ $RC -eq 1 ]]"
+check "error names the label rule"         "grep -q 'label must be a string containing no |, CR or newline' <<<\"\$OUT\""
+check "wrote nothing anywhere"             "[[ -z \"\$(ls -A \"\$STUB_PUT_DIR\")\" ]]"
+
+echo "== a lower-cased owner is a WORKING roster entry, not a fleet-wide hard fail (BE-6471) =="
+# GitHub resolves an owner case-insensitively — which is why REPO_RE is spelled
+# case-insensitively for `uses:` pins. The roster rule must agree: `comfy-org/x`
+# addresses the same repo and bumps fine today, so failing the whole fleet before
+# a single repo is touched (with an error that deliberately omits the value) would
+# be a self-inflicted outage. The dot-segment rule still has to bite in that
+# spelling.
+new_case ownercase
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"comfy-org/secret-a","file":".github/workflows/ci.yml","label":""}]'
+check "exit 0 — a lower-cased owner validates" "[[ $RC -eq 0 ]]"
+check "no validation error raised"             "! grep -q 'is invalid' <<<\"\$OUT\""
+check "the caller was bumped"                  "[[ \$(cat \"\$STUB_PUT_DIR/count\") -eq 1 ]]"
+
+new_case ownercasedots
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"comfy-org/..","file":".github/workflows/ci.yml","label":""}]'
+check "the dot-segment rule still bites in that spelling" "[[ $RC -eq 1 ]]"
+check "reported the repo rule"                            "grep -q 'index 0 is invalid (repo must match' <<<\"\$OUT\""
+
+echo "== monorepo: a 404 file does not block its sibling, but DOES fail the run (BE-6471) =="
+# One file 404s, the other bumps. The 404 must not be a REPO failure — the file
+# that WAS present is still committed and PR'd, which is the fan-out property.
+# But a roster entry naming a path that does not exist can never be bumped (the
+# renamed/typo'd caller), so it is tallied like any other un-bumpable entry and
+# the JOB fails at the end. It used to be a silent `not found — skipping` on a
+# green run: exactly the drift BE-6471 exists to surface.
 new_case miss404
 STUB_CONTENT_FILE="$CR_FIXTURE" STUB_404_FILE="ci-b.yml" run_bump \
   VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
   CALLERS_JSON='[{"repo":"Comfy-Org/secret-mono","file":".github/workflows/ci-a.yml","label":""},{"repo":"Comfy-Org/secret-mono","file":".github/workflows/ci-b.yml","label":""}]'
-check "exit 0 (404 is a skip, not a failure)" "[[ $RC -eq 0 ]]"
-check "reported the 404 file as not found"    "grep -q 'ci-b.yml not found' <<<\"\$OUT\""
-check "committed only the present file"        "[[ \$(cat \"\$STUB_PUT_DIR/count\") -eq 1 ]]"
-check "still opened the PR"                     "grep -q 'PR opened' <<<\"\$OUT\""
+check "exit 1 — a missing caller file is un-bumpable, not a benign skip" "[[ $RC -eq 1 ]]"
+check "named the missing file and its variable" \
+  "grep -q 'ci-b.yml not found on main — fix or remove its CURSOR_REVIEW_CALLERS entry' <<<\"\$OUT\""
+check "the 404 was NOT a repo failure"          "! grep -q 'bump failed for' <<<\"\$OUT\""
+check "committed only the present file"         "[[ \$(cat \"\$STUB_PUT_DIR/count\") -eq 1 ]]"
+check "still opened the PR for the sibling"     "grep -q 'PR opened' <<<\"\$OUT\""
+check "tallied exactly one un-bumpable entry"   "grep -q '::error::1 roster entr(y/ies) name a caller this bumper can never move' <<<\"\$OUT\""
+check "did NOT report the fleet complete"       "! grep -q 'cursor-review bump complete' <<<\"\$OUT\""
 
 echo "== transient fetch error fails the repo — NEVER a silent partial bump =="
 # A non-404 fetch error (auth/rate-limit/5xx/network) must fail the whole repo:
@@ -725,7 +792,7 @@ check "warned, naming the file and the variable" \
 check "fan-out continued — BOTH entries reached" \
   "[[ \$(grep -c 'carries no cursor-review.yml pin' <<<\"\$OUT\") -eq 2 ]]"
 check "aggregate error tallies both files" \
-  "grep -q '::error::2 caller file(s) carry no cursor-review.yml pin this bumper can move' <<<\"\$OUT\""
+  "grep -q '::error::2 roster entr(y/ies) name a caller this bumper can never move' <<<\"\$OUT\""
 check "did NOT claim the file was already current" "! grep -q 'already at $SHORT' <<<\"\$OUT\""
 check "did NOT report the fleet complete"          "! grep -q 'cursor-review bump complete' <<<\"\$OUT\""
 check "committed nothing"                          "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
@@ -753,6 +820,74 @@ check "pointed at the GROOM_CALLERS entry"      "grep -q 'GROOM_CALLERS entry' <
 check "did NOT bump the sibling fleet's pin"    "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
 check "did NOT claim it was already current"    "! grep -q 'already at $SHORT' <<<\"\$OUT\""
 
+echo "== a sibling fleet's DOUBLE-pinning caller is not rescued by its workflows_ref (BE-6471) =="
+# The sharp edge of the case above. Groom and pr-risk callers pin this repo TWICE
+# — `uses:` AND the `workflows_ref` input — and rule 2 (workflows_ref) is
+# deliberately UNADDRESSED, because the input carries no workflow name. So if a
+# bare `workflows_ref:` were allowed to vouch for the file, a groom caller
+# misfiled into another fleet's roster would sail through this gate, rule 1 would
+# correctly decline its `uses:` pin, and rule 2 would still stamp THIS fleet's SHA
+# onto the groom caller's assets ref — a split-pin, cross-fleet PR under a green
+# run. When the file calls a sibling reusable, an addressable `uses:` pin of OUR
+# reusable is required.
+new_case siblingref
+SIBREF_FIXTURE="${WORK}/sibling_double_pin.yml"
+printf '%s\n' \
+  'name: CI groom' \
+  'jobs:' \
+  '  groom:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@1111111111111111111111111111111111111111  # v1' \
+  '    with:' \
+  '      workflows_ref: 1111111111111111111111111111111111111111' \
+  > "$SIBREF_FIXTURE"
+STUB_CONTENT_FILE="$SIBREF_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-sibref","file":".github/workflows/ci-groom.yml","label":""}]'
+check "exit 1"                                   "[[ $RC -eq 1 ]]"
+check "flagged as carrying no cursor-review pin" "grep -q 'carries no cursor-review.yml pin this bumper can move' <<<\"\$OUT\""
+check "committed NOTHING"                        "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+check "did NOT stamp our SHA on its workflows_ref" \
+  "[[ ! -f \"\$STUB_PUT_DIR/put.last.txt\" ]] || ! grep -qF 'workflows_ref: $NEW_SHA' \"\$STUB_PUT_DIR/put.last.txt\""
+check "opened no PR"                             "[[ ! -f \"\$STUB_PUT_DIR/pr.log\" ]] || ! grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
+
+echo "== an EXPRESSION-pinned uses: is a pin the assertion owns, not a missing one (BE-6471) =="
+# The gate reads `uses:` with the ASSERTION's broad reader, not the rewrite's
+# narrower REF_RE. A ref fed by `${{ … }}` is deliberately never rewritten, so
+# under REF_RE this file would look like it carried no pin at all: the gate would
+# skip it and the repo's OTHER files would still ship a PR, where the post-rewrite
+# assertion used to fail the whole repo. Broad here, narrow there — the pin is
+# admitted, and the assertion fails the repo as it always did.
+new_case exprpin
+EXPR_FIXTURE="${WORK}/expr_pin_caller.yml"
+# shellcheck disable=SC2016  # the `${{ … }}` is Actions-expression YAML, not shell
+printf '%s\n' \
+  'name: CI cursor-review' \
+  'jobs:' \
+  '  review:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@${{ inputs.ref }}' \
+  > "$EXPR_FIXTURE"
+STUB_CONTENT_FILE="$EXPR_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-expr","file":".github/workflows/ci.yml","label":""}]'
+check "exit 1"                                  "[[ $RC -eq 1 ]]"
+check "NOT misreported as carrying no pin"      "! grep -q 'carries no cursor-review.yml pin' <<<\"\$OUT\""
+check "failed the whole repo, as the assertion does" "grep -q 'bump failed for 1 repo' <<<\"\$OUT\""
+check "committed nothing"                       "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+
+echo "== a doubly-listed broken path is warned and tallied ONCE (BE-6471) =="
+# The PEND_FILE dedup only sees files that were STAGED, so a path rejected before
+# staging (absent, or no movable pin) escaped it: the file was re-fetched, warned
+# about twice, and counted twice — reporting more broken files than there are
+# distinct broken roster entries. The reject paths record into SKIP_FILE, which
+# the same dedup now consults.
+new_case dupnopin
+STUB_CONTENT_FILE="$NOPIN_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-dupnopin","file":".github/workflows/ci.yml","label":""},{"repo":"Comfy-Org/secret-dupnopin","file":".github/workflows/ci.yml","label":"ci"}]'
+check "exit 1"                                 "[[ $RC -eq 1 ]]"
+check "warned exactly once"                    "[[ \$(grep -c 'carries no cursor-review.yml pin' <<<\"\$OUT\") -eq 1 ]]"
+check "tallied exactly one entry, not two"     "grep -q '::error::1 roster entr(y/ies) name a caller this bumper can never move' <<<\"\$OUT\""
+
 echo "== one un-bumpable entry does not block another repo's bump (BE-6471) =="
 # The fan-out property, and the reason the tally fires at the END rather than at
 # the offending file: a single bad roster entry must not strand every other
@@ -771,7 +906,7 @@ check "exactly ONE caller was reported so"     "[[ \$(grep -c 'carries no cursor
 check "the HEALTHY caller was still committed" "[[ \$(cat \"\$STUB_PUT_DIR/count\") -eq 1 ]]"
 check "the healthy caller's pin moved"         "grep -qF 'cursor-review.yml@$NEW_SHA' \"$PUT\""
 check "the healthy caller still got its PR"    "grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
-check "the tally counts exactly one file"      "grep -q '::error::1 caller file(s) carry no cursor-review.yml pin' <<<\"\$OUT\""
+check "the tally counts exactly one file"      "grep -q '::error::1 roster entr(y/ies) name a caller this bumper can never move' <<<\"\$OUT\""
 
 echo "== a TAG-pinned workflows_ref moves in lock-step with uses: (BE-4662) =="
 # The under-rewrite half of BE-4662. A caller pins this repo TWICE — the `uses:`
