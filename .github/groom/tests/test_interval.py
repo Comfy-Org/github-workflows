@@ -206,9 +206,12 @@ class ScopedRunDoesNotResetCadence(unittest.TestCase):
     its own prior runs instead of failing open and re-billing every tick.
     """
 
-    def scoped_finder_job(self, conclusion="success", path="services/api"):
-        return {"name": f"groom / Audit — finder {interval.scoped_job_marker(path)}",
-                "conclusion": conclusion}
+    def scoped_finder_job(self, conclusion="success", path="services/api", steps=None):
+        job = {"name": f"groom / Audit — finder {interval.scoped_job_marker(path)}",
+               "conclusion": conclusion}
+        if steps is not None:
+            job["steps"] = steps
+        return job
 
     def test_scoped_finder_job_is_not_a_whole_repo_groom(self):
         self.assertFalse(interval.run_audited([self.scoped_finder_job()]))
@@ -224,7 +227,12 @@ class ScopedRunDoesNotResetCadence(unittest.TestCase):
         # every finder job excluded, never finds a countable run, fails open on
         # every tick, and re-bills the audit daily regardless of interval_days.
         self.assertTrue(interval.run_audited([self.scoped_finder_job()], "services/api"))
-        self.assertTrue(interval.run_audited([self.scoped_finder_job("failure")], "services/api"))
+        # A failure counts too, but (BE-4814) only with evidence the agent step
+        # actually started — a bare `failure` with no steps payload is a
+        # pre-agent death and must NOT count, scoped or not.
+        billed = [pre_agent_step(conclusion="success"), agent_step()]
+        self.assertTrue(interval.run_audited([self.scoped_finder_job("failure", steps=billed)], "services/api"))
+        self.assertFalse(interval.run_audited([self.scoped_finder_job("failure")], "services/api"))
 
     def test_a_scoped_tick_ignores_a_DIFFERENT_scope_and_the_whole_repo_sweep(self):
         self.assertFalse(interval.run_audited([self.scoped_finder_job(path="packages/ui")], "services/api"))
