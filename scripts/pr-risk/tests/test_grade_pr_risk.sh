@@ -8,6 +8,9 @@
 #   * PROVENANCE ALONE IS NEVER SUFFICIENT: a runbook IDENTITY whose diff SHAPE does not
 #     assert is not a runbook, and the failure is recorded.
 #   * EXTERNAL IS NEVER OVERRIDDEN: a fork imitating a runbook's shape is still external R3.
+#   * EXTERNAL IS ABOUT FORKS AND FIRST-TIME HUMANS (new here): a repo-owned App authors with
+#     `author_association: NONE`, so it is a runbook candidate rather than an outsider — while a
+#     bot on a FORK, and a first-time human, both stay external R3.
 #   * THE UNKNOWN CONTRACT: an unreadable input is tier null + status unknown + exit 1,
 #     never a confident tier; a structurally empty map is refused outright (exit 2).
 #   * THE GRADE CARRIES ITS MAP VERSION so a map revision can be replayed later.
@@ -399,6 +402,130 @@ cp "$SANDBOX/page1norollup.json" "$SANDBOX/page1.json"
 out="$(paged_pr --self-run-id 999)"
 eq "a PR with no checks is untouched by the drain" ok "$(jq -r '.checks_status // "ok"' <<<"$out")"
 eq "and still grades" ok "$(jq -r '.risk.status' <<<"$out")"
+
+echo "— phase 21: a repo-owned App is a runbook candidate, not an outsider —"
+# A GitHub App is never an org member, so EVERY PR a repo-owned App opens arrives with
+# `author_association: NONE`. Testing that string BEFORE the login classification graded every
+# such PR `external` => R3 regardless of its diff, and no consumer lever could reach it: the
+# `bot_logins` input and .github/risk-runbooks.json are both read further down. The fix narrows
+# the association half to non-bots; the FORK half stays unconditional, which is what keeps a bot
+# on a fork from presenting a bot login to escape R3.
+cat > "$SANDBOX/app-runbooks.json" <<'FIX'
+{"registry_version":"v0-test","runbooks":[
+  {"id":"data-snapshot-refresh",
+   "why":"a repo-owned App's cron that refreshes one committed data snapshot",
+   "identity":{"logins":["cloud-code-bot[bot]"]},
+   "permitted_paths":["data/*.json"],
+   "shape":{"max_changed_files":1,"max_additions":5000,"max_deletions":5000},
+   "daily_cap":4,"lane":"data-refresh"}]}
+FIX
+app_grade() { bash "$GRADER" --stdin --runbooks "$SANDBOX/app-runbooks.json" 2>/dev/null; }
+SNAP='[{"path":"data/skills.json","additions":40,"deletions":12,"change_type":"MODIFIED"}]'
+
+# (1) non-fork App PR, author_association NONE, registry entry asserts -> runbook, R0 on the axis.
+out="$(rec 22 'cloud-code-bot[bot]' 'chore: refresh skills snapshot' "$SNAP" ok SUCCESS bot/refresh NONE false | app_grade)"
+eq "a non-fork App PR is not external" runbook "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
+eq "and names the runbook that asserted" data-snapshot-refresh "$(jq -r '.risk.axes.provenance.runbook' <<<"$out")"
+eq "provenance proposes R0" R0 "$(jq -r '.risk.axes.provenance.tier' <<<"$out")"
+# The other axes still decide: an unmapped data path floors R0 and green-but-no-test is R1, so
+# the grade now RESPONDS to the diff instead of being pinned R3 by the author's association.
+eq "the diff, not the association, decides the grade" R1 "$(jq -r '.risk.tier' <<<"$out")"
+
+# (2) the SAME App PR from a FORK is still external R3. The fork test runs first and is
+# unconditional — reordering the two would open exactly this hole.
+out="$(rec 23 'cloud-code-bot[bot]' 'chore: refresh skills snapshot' "$SNAP" ok SUCCESS bot/refresh NONE true | app_grade)"
+eq "a bot on a fork is still external" external "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
+eq "and still grades R3" R3 "$(jq -r '.risk.tier' <<<"$out")"
+
+# (3) a non-fork HUMAN with author_association NONE is untouched: the first-time-contributor
+# guard is narrowed to non-bots, not removed.
+out="$(rec 24 'drive-by-human' 'feat: my first patch' "$SNAP" ok SUCCESS feature NONE false | app_grade)"
+eq "a first-time human contributor is still external" external "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
+eq "and still grades R3" R3 "$(jq -r '.risk.tier' <<<"$out")"
+
+# (4) identity alone buys NO trust: a bot with no asserting registry entry falls back to human.
+out="$(rec 25 'unregistered-bot[bot]' 'chore: something' "$SNAP" ok SUCCESS bot/x NONE false | app_grade)"
+eq "an unregistered bot grades human, never runbook" human "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
+eq "human provenance proposes R1, not R0" R1 "$(jq -r '.risk.axes.provenance.tier' <<<"$out")"
+# ...and so does a REGISTERED bot whose diff shape does not assert (paths outside its set).
+out="$(rec 26 'cloud-code-bot[bot]' 'chore: refresh' '[{"path":"src/evil.go","additions":9,"deletions":0,"change_type":"MODIFIED"}]' ok SUCCESS bot/refresh NONE false | app_grade)"
+eq "a registered App failing its shape is human, not runbook" human "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
+sf="$(jq -r '.risk.axes.provenance.shape_failures | length' <<<"$out")"
+if [ "$sf" -ge 1 ]; then ok "and the shape failure is recorded"; else bad "and the shape failure is recorded" "$sf"; fi
+
+# (5) --bot-logins reaches the classification too: a bot login WITHOUT the `[bot]` suffix (a
+# machine user, or an App whose login the API reports unsuffixed) is only a bot if the caller
+# says so, and it must get the same non-external treatment when it is.
+out="$(rec 27 'snapshot-machine' 'chore: refresh skills snapshot' "$SNAP" ok SUCCESS bot/refresh NONE false \
+       | bash "$GRADER" --stdin --runbooks "$SANDBOX/app-runbooks.json" --bot-logins snapshot-machine 2>/dev/null)"
+eq "a --bot-logins machine user is not external" human "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
+out="$(rec 28 'snapshot-machine' 'chore: refresh skills snapshot' "$SNAP" ok SUCCESS bot/refresh NONE false | app_grade)"
+eq "and without --bot-logins it reads as a first-time human" external "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
+
+echo "— phase 22: on the LIVE path the login alone cannot tell you it is a bot —"
+# The case above is the corpus/REST record shape. The live path does not see it: GraphQL reports
+# a Bot actor login WITHOUT the `[bot]` suffix, so `cloud-code-bot[bot]` arrives as
+# `cloud-code-bot` and the resolver's suffix test never fires. Measured on the real PR in the
+# ticket: `author.login` is `cloud-code-bot`, `author.__typename` is `Bot`. That typename is
+# GitHub's own actor resolution and is what the record carries, so the fix must survive it.
+mkdir -p "$SANDBOX/binbot"
+jq '.data.repository.pullRequest.author = {"login":"cloud-code-bot","__typename":"Bot"}
+    | .data.repository.pullRequest.authorAssociation = "NONE"
+    # phase 12 left changedFiles at 5 on the shared fixture; this stub serves ONE file, and a
+    # short read is `unknown` by design — so restate it rather than inherit a truncated record.
+    | .data.repository.pullRequest.changedFiles = 1
+    | .data.repository.pullRequest.title = "data: refresh bundled skills snapshot (auto)"
+    | .data.repository.pullRequest.headRefName = "bot/refresh-skills"
+    | .data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes =
+        [{"__typename":"CheckRun","name":"unit tests","status":"COMPLETED","conclusion":"SUCCESS",
+          "checkSuite":{"workflowRun":{"databaseId":1000,"workflow":{"name":"CI"}}}}]' \
+  "$SANDBOX/fixture.json" > "$SANDBOX/botfixture.json"
+cat > "$SANDBOX/botfiles.json" <<'FIX'
+[{"filename":"data/skills.json","additions":40,"deletions":12,"status":"modified"}]
+FIX
+cat > "$SANDBOX/binbot/gh" <<'STUB'
+#!/usr/bin/env bash
+fixture=""; filter=""
+for ((i=1; i<=$#; i++)); do
+  a="${!i}"
+  case "$a" in
+    graphql)          fixture="$FIXTURE_DIR/botfixture.json" ;;
+    *pulls/*/files*)  fixture="$FIXTURE_DIR/botfiles.json" ;;
+    --jq)             n=$((i+1)); filter="${!n}" ;;
+  esac
+done
+[ -n "$fixture" ] || { echo "gh stub: unhandled args: $*" >&2; exit 1; }
+if [ -n "$filter" ]; then jq -c "$filter" "$fixture"; else cat "$fixture"; fi
+STUB
+chmod +x "$SANDBOX/binbot/gh"
+bot_pr() { PATH="$SANDBOX/binbot:$PATH" bash "$GRADER" --repo test/repo --pr 42 "$@" 2>/dev/null; }
+
+out="$(bot_pr)"
+eq "the live record carries GitHub's own actor type" true "$(jq -r '.author_is_bot' <<<"$out")"
+eq "and the login really does arrive unsuffixed" cloud-code-bot "$(jq -r '.author' <<<"$out")"
+eq "an App PR is no longer external on the live path" human "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
+# ...and with the consumer's registry entry it reaches `runbook` — the ticket's end state.
+out="$(bot_pr --runbooks "$SANDBOX/app-runbooks.json" --bot-logins '')"
+eq "an unsuffixed Bot login still fails an entry that lists only the suffixed form" \
+   human "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
+jq '.runbooks[0].identity.logins = ["cloud-code-bot[bot]","cloud-code-bot"]' \
+  "$SANDBOX/app-runbooks.json" > "$SANDBOX/app-runbooks-both.json"
+out="$(bot_pr --runbooks "$SANDBOX/app-runbooks-both.json")"
+eq "an entry listing BOTH login forms asserts" runbook "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
+eq "and the tier now responds to the diff" R0 "$(jq -r '.risk.axes.provenance.tier' <<<"$out")"
+# The fork half is unconditional on the live path too — the API fork flag, not the actor.
+jq '.data.repository.pullRequest.isCrossRepository = true' \
+  "$SANDBOX/botfixture.json" > "$SANDBOX/bf2.json" && cp "$SANDBOX/bf2.json" "$SANDBOX/botfixture.json"
+out="$(bot_pr --runbooks "$SANDBOX/app-runbooks-both.json")"
+eq "a Bot author on a fork is still external R3" external "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
+eq "and the grade is R3" R3 "$(jq -r '.risk.tier' <<<"$out")"
+# A HUMAN author on the same live path keeps the first-time-contributor guard.
+jq '.data.repository.pullRequest.isCrossRepository = false
+    | .data.repository.pullRequest.author = {"login":"drive-by","__typename":"User"}' \
+  "$SANDBOX/botfixture.json" > "$SANDBOX/bf2.json" && cp "$SANDBOX/bf2.json" "$SANDBOX/botfixture.json"
+out="$(bot_pr --runbooks "$SANDBOX/app-runbooks-both.json")"
+eq "a live first-time human is still external" external "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
+eq "and still grades R3" R3 "$(jq -r '.risk.tier' <<<"$out")"
 
 echo
 echo "passed $PASS, failed $FAIL"

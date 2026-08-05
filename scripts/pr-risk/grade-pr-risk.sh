@@ -30,7 +30,9 @@
 #     is the WORST tier over every rule any changed path matches.
 #   AXIS 2 — PROVENANCE. runbook / agent-supervised / human / external. A PR whose identity
 #     matches a runbook but whose DIFF SHAPE does not is not a runbook, and falls back to its
-#     underlying class. `external` (fork / first-time contributor) is R3 on provenance alone.
+#     underlying class. `external` (any fork, or a first-time HUMAN contributor) is R3 on
+#     provenance alone; a non-fork bot is a runbook candidate, not an outsider, because every
+#     GitHub App authors with `author_association: NONE`.
 #   AXIS 3 — REVERSIBILITY. Single clean revert? Mutates persistent state or deletes data?
 #     Did tests covering the touched lines actually run? Answered from the changed-path list
 #     + change types + the PR's own check rollup.
@@ -126,8 +128,8 @@ read_map() { # <file> <kind: map|runbooks> -> JSON on stdout, rc 0; rc 1 + reaso
         then "provenance_tiers carries a tier outside \(known)"
       # EVERY provenance class must be MAPPED, not just well-typed. Checking only the values let
       # a map that OMITS `external` pass, and the lookup then fell back to a tier of its own
-      # choosing — silently retiring the "external (fork / first-time contributor) is R3, no
-      # exceptions" invariant that both the default map comment and the README promise. A class
+      # choosing — silently retiring the "external (a fork, or a first-time human contributor) is
+      # R3, no exceptions" invariant that the default map comment and the README promise. A class
       # nobody mapped is a routing decision nobody made, so it is refused at load time.
       # (No apostrophes in here: the whole shape program is a single-quoted shell string.)
       elif ((["runbook","agent-supervised","human","external"] - [.provenance_tiers | keys[]]) | length) > 0
@@ -252,6 +254,18 @@ cat <<'JQ'
     # runbook — provenance alone is never sufficient.
     | ($r.author // null) as $author
     | ($author | classify_login($fleetl; $botl)) as $cls
+    # IS THE AUTHOR A BOT? The shared resolver answers from the login STRING — a `[bot]` suffix or
+    # the caller's `bot_logins` list — and on the live path that string is not enough on its own.
+    # GraphQL reports a Bot actor's login WITHOUT the `[bot]` suffix (`cloud-code-bot`, where REST
+    # and the web UI both show `cloud-code-bot[bot]`), so the suffix test can only ever fire on a
+    # REST-shaped or offline-corpus record. `author.__typename == "Bot"` is GitHub's OWN actor
+    # type for the same account and is not forgeable by the PR, so it is collected alongside the
+    # login and ORed in here. It is additive: a record without the field (every pre-schema-4
+    # corpus row) falls back to the resolver's answer exactly as before, and `bot_logins` still
+    # works for machine USER accounts, which are typed `User` and carry no suffix at all.
+    # Deliberately kept OUT of classify_login: that jq is shared verbatim with agent-work's
+    # grade-collect.sh, and a field only this collector emits would fork the shared definition.
+    | (($r.author_is_bot // false) or $cls == "bot") as $is_bot
     | (($r.labels // []) | index("agent-coded") != null) as $agent_coded
     # The label list has a STATUS TWIN for the same reason the file list does: `agent-coded` is
     # read from it, and a TRUNCATED label list answers "is this agent-coded?" with a confident no
@@ -264,11 +278,28 @@ cat <<'JQ'
     # class never routed unattended — silently unreachable. Unread is `unknown`, and `unknown`
     # refuses to grade the axis.
     | ($r.provenance_status // (if ($r | has("is_fork")) then "ok" else "absent" end)) as $pvst
+    # ORDER IS THE RULE HERE, AND IT IS NOT REARRANGEABLE. The fork test runs FIRST and stays
+    # unconditional: a fork PR is `external` no matter who authored it, so a bot on a fork can
+    # never escape R3 by presenting a bot login. Only AFTER that does the author-association half
+    # get narrowed to authors the shared resolver does NOT read as a bot.
+    #
+    # WHY THE NARROWING. A GitHub App is never an org member, so EVERY PR opened by a repo-owned
+    # App arrives with `author_association: NONE` — and testing that string before the login
+    # classification pinned every such PR `external` => R3 regardless of what it changed (measured
+    # on one consumer: 14 of 19 R3 grades in a 24-PR sample came from this, not from the diff).
+    # It was also unfixable from the consumer side, because both levers sit further down: the
+    # `bot_logins` input feeds `classify_login`, and `.github/risk-runbooks.json` is read by the
+    # shape assertion below. A non-fork bot now falls through to `runbook-candidate`, where the
+    # registry and its shape assertion decide — and a `runbook-candidate` with no asserting entry
+    # still lands on `human` below, so identity alone continues to buy no trust.
+    # The first-time-contributor guard is UNCHANGED for humans: `$cls` is "human" (or "unknown")
+    # for anyone the resolver does not classify as a bot, so a human's NONE still reads external.
     | (if $pvst != "ok" or $lbst != "ok" then "unknown"
-       elif ($r.is_fork // false) or (($r.author_association // "") | IN("FIRST_TIME_CONTRIBUTOR","FIRST_TIMER","NONE"))
+       elif ($r.is_fork // false) then "external"
+       elif ($is_bot | not) and (($r.author_association // "") | IN("FIRST_TIME_CONTRIBUTOR","FIRST_TIMER","NONE"))
        then "external"
        elif $agent_coded or $cls == "fleet" then "agent-supervised"
-       elif $cls == "bot" then "runbook-candidate"
+       elif $is_bot then "runbook-candidate"
        elif $cls == "human" then "human"
        else "unknown" end) as $base_class
     # The shape assertion: identity match AND every changed path inside permitted_paths AND the
@@ -467,7 +498,7 @@ fetch_pr_record() { # <repo> <num> -> record JSON on stdout, rc 1 on an unreadab
   q='query($owner:String!,$name:String!,$num:Int!){
   repository(owner:$owner,name:$name){ pullRequest(number:$num){
     number title state isDraft createdAt updatedAt closedAt mergedAt
-    author{ login } authorAssociation baseRefName headRefName isCrossRepository
+    author{ login __typename } authorAssociation baseRefName headRefName isCrossRepository
     additions deletions changedFiles
     labels(first:100){ pageInfo{ hasNextPage } nodes{ name } }
     commits(last:1){ nodes{ commit{ oid statusCheckRollup{ state
@@ -613,7 +644,14 @@ fetch_pr_record() { # <repo> <num> -> record JSON on stdout, rc 1 on an unreadab
        then {list: null, status: "unknown",
              reason: "changed-file list is short (\($files | length) of \(.changedFiles)) — GitHub caps the files API at 3000 files"}
        else {list: $files, status: "ok", reason: null} end) as $fread
-    | {schema_version:3, repo:$repo, pr:.number, title:.title, author:(.author.login // null),
+    | {schema_version:4, repo:$repo, pr:.number, title:.title, author:(.author.login // null),
+       # The actor type GitHub itself assigns the author, recorded because the LOGIN cannot answer
+       # it here: GraphQL reports a Bot login UNSUFFIXED, so `cloud-code-bot[bot]` arrives as
+       # `cloud-code-bot` and the `[bot]` test in the shared resolver never fires on this path.
+       # Additive (schema 3 -> 4): the grader reads it as `// false`, so a schema-3 corpus record
+       # still grades exactly as it did.
+       # (No apostrophes in here: this whole jq program is a single-quoted shell string.)
+       author_is_bot:((.author.__typename // "") == "Bot"),
        author_association:.authorAssociation, is_fork:(.isCrossRepository // false),
        labels:$labels, agent_coded:($labels | index("agent-coded") != null),
        labels_status:(if $labels_trunc then "unknown" else "ok" end),
