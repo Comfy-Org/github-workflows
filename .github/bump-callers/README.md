@@ -171,3 +171,48 @@ gh variable set AGENTS_MD_CALLERS --repo Comfy-Org/github-workflows \
 
 Keep the canonical `callers.json` in a private infra/ops repo so variable edits
 have a reviewed source of truth (the org audit log records each edit).
+
+### Entry format — validated, and why
+
+Every field reaches a privileged sink: `repo` is interpolated into each
+`gh api repos/<repo>/…` write and into `gh pr create --repo`, `file` becomes the
+path committed into the caller's tree, and `label` is passed to
+`gh pr create --label`. They run under an org-wide app token (`owner: Comfy-Org`,
+contents + pull-requests + issues write, no `repositories:` narrowing), and the
+roster is a **variable** — editable outside code review. So `bump-callers.sh`
+constrains the values before it makes a single API call:
+
+| Field | Rule |
+|---|---|
+| `repo` | must match `^Comfy-Org/[A-Za-z0-9._-]+$`, and the name may not be `.` or `..` (a dot-leading name like `.github` is fine; a name that is *only* dots is a path segment, not a repo) |
+| `file` | must match `^\.github/workflows/[A-Za-z0-9._-]+\.ya?ml$` (the class excludes `/`, so `../` traversal cannot appear) |
+| `label` | optional; when present must be a string containing no `\|` and no newline |
+
+A violation is a **hard fail before the fan-out**, reported as the entry's
+zero-based **index** and the rule it broke — never the value, because masking has
+not been applied at that point and this repo's run logs are public. The `label`
+rule is not cosmetic: entries are carried internally as `repo|file|label|wire_bot`
+tuples, so a pipe-bearing label would truncate and bleed its tail into the
+`wire_bot` field.
+
+### Un-bumpable entries fail the run
+
+Being in the variable is necessary, not sufficient. The bumper can only move a
+pin it can *find*, and a file with no `Comfy-Org/github-workflows` pin of this
+fleet's rewrites to itself — which the content-equality check reports as the
+reassuring `already at <short> — skipping`. That is how a wrong roster entry
+drifts forever behind a green run. Each caller file is now checked for a pin this
+fleet can address *before* the rewrite; if there is none, the run warns per file
+and then **fails** with an aggregate error naming the count. Two shapes trip it:
+
+- the file carries no `uses:` pin of `Comfy-Org/github-workflows` at all (wrong
+  file, or not a caller);
+- its only `github-workflows` `uses:` names a **sibling** fleet's reusable, so
+  this fleet has nothing to move — the stale entry, not the file, is the bug.
+
+What does **not** trip it is a pin that is merely not a full SHA. The rewrite
+matches a ref by position rather than shape, so a caller on `@v1` is *self-healed*
+to the new SHA — dragging floating pins back onto immutable ones is the point of
+the fleet, not an error. The failure lands after every caller has been processed,
+so one bad entry never blocks the rest of the fleet's bumps; what it refuses to do
+is report success.

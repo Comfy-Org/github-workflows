@@ -153,7 +153,15 @@ if [[ "$path" == *"/contents/"* ]]; then
   if [[ -n "${STUB_FETCH_FAIL:-}" ]]; then
     echo "gh: Internal Server Error (HTTP 500)" >&2; exit 1
   fi
-  b64=$(base64 < "$STUB_CONTENT_FILE" | tr -d '\n')
+  # STUB_ALT_REPO/STUB_ALT_CONTENT_FILE: serve a DIFFERENT fixture for one named
+  # repo, so a single run can carry a healthy caller and a broken one at once —
+  # which is what proves the fan-out continues past a bad entry instead of
+  # stranding the rest of the fleet.
+  src="$STUB_CONTENT_FILE"
+  if [[ -n "${STUB_ALT_REPO:-}" && "$path" == "repos/${STUB_ALT_REPO}/"* ]]; then
+    src="$STUB_ALT_CONTENT_FILE"
+  fi
+  b64=$(base64 < "$src" | tr -d '\n')
   printf '{"sha":"blobsha123","content":"%s"}' "$b64"
 elif [[ "$path" == *"/git/commits/"* ]]; then
   # Resolve the tip commit's TREE sha (distinct from the commit sha) — the script
@@ -454,6 +462,108 @@ STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
 check "exit 1 on malformed" "[[ $RC -eq 1 ]]"
 check "error explains shape" "grep -q 'not a non-empty JSON array' <<<\"\$OUT\""
 
+echo "== a roster entry naming a repo outside Comfy-Org is rejected before any API call (BE-6471) =="
+# `repo` is interpolated into every `gh api repos/${REPO}/…` write and into
+# `gh pr create --repo`, under an org-wide app token with contents +
+# pull-requests + issues write. The roster is an Actions VARIABLE — editable
+# outside code review — so an unvalidated `repo` turns roster-edit access into
+# bot-authored commits, branch force-moves and labelled PRs in any org repo the
+# app is installed on. The rejection must land BEFORE the fan-out (nothing is
+# written) and must name the INDEX and the RULE, never the value: masking has not
+# been applied at that point and this repo's run logs are public.
+new_case badrepo
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-alpha","file":".github/workflows/ci.yml","label":""},{"repo":"Evil-Org/somerepo","file":".github/workflows/ci.yml","label":""}]'
+check "exit 1"                             "[[ $RC -eq 1 ]]"
+check "error names the offending index"    "grep -q '::error::CURSOR_REVIEW_CALLERS entry at index 1 is invalid' <<<\"\$OUT\""
+check "error names the repo rule"          "grep -q 'repo must match \\^Comfy-Org/' <<<\"\$OUT\""
+check "the value itself was NEVER echoed"  "! grep -q 'Evil-Org' <<<\"\$OUT\""
+check "wrote nothing anywhere"             "[[ -z \"\$(ls -A \"\$STUB_PUT_DIR\")\" ]]"
+check "bailed BEFORE the parse/mask loop"  "! grep -q '::add-mask::' <<<\"\$OUT\""
+
+# `.` is legal in a repo name (`Comfy-Org/.github` is a real shape), so the class
+# keeps it — but a name that is ONLY dots is a path segment, not a repository, and
+# every use of `repo` is a URL built by string interpolation.
+new_case dotrepo
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/..","file":".github/workflows/ci.yml","label":""}]'
+check "exit 1 on a dot-segment repo name"  "[[ $RC -eq 1 ]]"
+check "error names the repo rule"          "grep -q 'index 0 is invalid (repo must match' <<<\"\$OUT\""
+check "wrote nothing anywhere"             "[[ -z \"\$(ls -A \"\$STUB_PUT_DIR\")\" ]]"
+check "bailed BEFORE the parse/mask loop"  "! grep -q '::add-mask::' <<<\"\$OUT\""
+
+new_case dotgithub
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/.github","file":".github/workflows/ci.yml","label":""}]'
+check "a dot-LEADING repo name is still valid" "[[ $RC -eq 0 ]]"
+check "and it was actually bumped"             "[[ \$(cat \"\$STUB_PUT_DIR/count\") -eq 1 ]]"
+
+echo "== a roster entry whose file is not a workflow path is rejected (BE-6471) =="
+# `file` becomes the path committed into the caller repo's tree, so an
+# unconstrained value lets a roster edit write anywhere in the repo. Both shapes
+# are covered: a plainly-unrelated path, and a traversal out of the workflows
+# directory — the rule's character class excludes `/`, so `../` cannot appear.
+new_case badfile
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-alpha","file":"package.json","label":""}]'
+check "exit 1 on a non-workflow path"      "[[ $RC -eq 1 ]]"
+check "error names index 0 + the file rule" \
+  "grep -q '::error::CURSOR_REVIEW_CALLERS entry at index 0 is invalid (file must be a .github/workflows/' <<<\"\$OUT\""
+check "the value itself was NEVER echoed"  "! grep -q 'package.json' <<<\"\$OUT\""
+check "wrote nothing anywhere"             "[[ -z \"\$(ls -A \"\$STUB_PUT_DIR\")\" ]]"
+check "bailed BEFORE the parse/mask loop"  "! grep -q '::add-mask::' <<<\"\$OUT\""
+
+new_case traversal
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-alpha","file":".github/workflows/../evil.yml","label":""}]'
+check "exit 1 on a traversal path"         "[[ $RC -eq 1 ]]"
+check "error names the file rule"          "grep -q 'file must be a .github/workflows/' <<<\"\$OUT\""
+check "the traversal was NEVER echoed"     "! grep -q 'evil.yml' <<<\"\$OUT\""
+check "wrote nothing anywhere"             "[[ -z \"\$(ls -A \"\$STUB_PUT_DIR\")\" ]]"
+check "bailed BEFORE the parse/mask loop"  "! grep -q '::add-mask::' <<<\"\$OUT\""
+
+echo "== a label containing the tuple delimiter is rejected, not silently truncated (BE-6471) =="
+# The entries are carried as `repo|file|label|wire_bot` tuples and read back with
+# `cut -d'|' -f3`, so a label containing `|` truncates at the pipe and its tail
+# lands in the `wire_bot` field — silently flagging an entry for identity wiring
+# that never asked for it. The label also reaches `gh pr create --label`. Reject
+# it at the door rather than shipping the truncation.
+new_case badlabel
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-alpha","file":".github/workflows/ci.yml","label":"bug|ui"}]'
+check "exit 1"                             "[[ $RC -eq 1 ]]"
+check "error names the label rule"         "grep -q 'label must be a string containing no | and no newline' <<<\"\$OUT\""
+check "the label itself was NEVER echoed"  "! grep -q 'bug|ui' <<<\"\$OUT\""
+check "wrote nothing anywhere"             "[[ -z \"\$(ls -A \"\$STUB_PUT_DIR\")\" ]]"
+check "bailed BEFORE the parse/mask loop"  "! grep -q '::add-mask::' <<<\"\$OUT\""
+
+echo "== an entry breaking two rules reports BOTH, and a valid roster still passes (BE-6471) =="
+# One jq pass emits every violation, so fixing the first does not merely reveal
+# the second on the next run. The second half is the regression guard that
+# matters most: the shapes every real roster uses — an absent label, a plain
+# label, `wire_bot` — must all still validate.
+new_case tworules
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"nope/x","file":"nope.txt","label":""}]'
+check "exit 1"                             "[[ $RC -eq 1 ]]"
+check "reported the repo rule"             "grep -q 'index 0 is invalid (repo must match' <<<\"\$OUT\""
+check "reported the file rule too"         "grep -q 'index 0 is invalid (file must be' <<<\"\$OUT\""
+
+new_case validshapes
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret_a.b-c","file":".github/workflows/ci-cursor-review.yaml"},{"repo":"Comfy-Org/secret-b","file":".github/workflows/ci.yml","label":"ci"},{"repo":"Comfy-Org/secret-c","file":".github/workflows/ci.yml","label":null}]'
+check "exit 0 — every legitimate shape validates" "[[ $RC -eq 0 ]]"
+check "no validation error raised"                "! grep -q 'is invalid' <<<\"\$OUT\""
+check "all three callers were bumped"             "[[ \$(cat \"\$STUB_PUT_DIR/count\") -eq 3 ]]"
+
 echo "== monorepo: a genuinely-missing (404) file is skipped, the present one still bumps =="
 # One file 404s (expected per-file skip), the other bumps. The repo must still
 # succeed and open its PR with the file that WAS present — a 404 is not a repo
@@ -558,6 +668,110 @@ check "exit 0" "[[ $RC -eq 0 ]]"
 check "reported already at SHORT"              "grep -q 'already at $SHORT' <<<\"\$OUT\""
 check "committed nothing"                       "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
 check "opened no PR"                            "[[ ! -f \"\$STUB_PUT_DIR/pr.log\" ]] || ! grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
+# A genuinely-converged fleet must stay GREEN now that an un-bumpable entry fails
+# the job (BE-6471): the un-bumpable tally is about files with no pin to move, not
+# files whose pin is already where it should be.
+check "raised no un-bumpable warning"           "! grep -q 'carries no cursor-review.yml pin' <<<\"\$OUT\""
+check "raised no un-bumpable tally"             "! grep -q 'caller file(s) carry no' <<<\"\$OUT\""
+check "reported the fleet complete"             "grep -q 'cursor-review bump complete' <<<\"\$OUT\""
+
+echo "== a caller pinned to a floating TAG is self-healed, not reported (BE-4662 x BE-6471) =="
+# The un-bumpable check must not demand a 40-hex ref. Rules 1-2 move a ref by
+# POSITION, not by shape, so `uses: …/cursor-review.yml@v1` IS bumpable — and a
+# floating-tag caller is precisely the caller this fleet exists to drag back onto
+# an immutable pin. A "must already be a full SHA" rule would fail those callers
+# forever instead of fixing them, so this asserts the healing, not a warning.
+new_case floatingtag
+FLOAT_FIXTURE="${WORK}/floating_caller.yml"
+printf '%s\n' \
+  'name: CI cursor-review' \
+  'jobs:' \
+  '  review:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@v1' \
+  > "$FLOAT_FIXTURE"
+STUB_CONTENT_FILE="$FLOAT_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-floating","file":".github/workflows/ci.yml","label":""}]'
+PUT="${STUB_PUT_DIR}/put.last.txt"
+check "exit 0"                                  "[[ $RC -eq 0 ]]"
+check "the tag was replaced by the new SHA"     "grep -qF 'cursor-review.yml@$NEW_SHA' \"$PUT\""
+check "no floating tag survives"                "! grep -qF 'cursor-review.yml@v1' \"$PUT\""
+check "not reported as un-bumpable"             "! grep -q 'carries no cursor-review.yml pin' <<<\"\$OUT\""
+
+echo "== a roster entry pointing at a file with NO pin of ours FAILS the run (BE-6471) =="
+# The silent-drift case the `already at <short> — skipping` line used to hide. A
+# file that carries no `Comfy-Org/github-workflows` pin at all rewrites to itself,
+# so content-equality reports it as converged and the job exits green — forever,
+# for a roster entry that is simply wrong. Two callers, both un-bumpable, so this
+# also proves the failure is aggregated at the END: the second is still reached
+# rather than the first aborting the fan-out.
+new_case nopin
+NOPIN_FIXTURE="${WORK}/nopin_caller.yml"
+printf '%s\n' \
+  'name: CI something else' \
+  'jobs:' \
+  '  build:' \
+  '    runs-on: ubuntu-latest' \
+  '    steps:' \
+  '      - uses: actions/checkout@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  # v4' \
+  '      # uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@1111111111111111111111111111111111111111' \
+  > "$NOPIN_FIXTURE"
+STUB_CONTENT_FILE="$NOPIN_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-nopin","file":".github/workflows/ci.yml","label":""},{"repo":"Comfy-Org/secret-nopin-two","file":".github/workflows/ci.yml","label":""}]'
+check "exit 1 — a no-op entry must not report success" "[[ $RC -eq 1 ]]"
+check "warned, naming the file and the variable" \
+  "grep -q '::warning::.*carries no cursor-review.yml pin this bumper can move.*CURSOR_REVIEW_CALLERS entry' <<<\"\$OUT\""
+check "fan-out continued — BOTH entries reached" \
+  "[[ \$(grep -c 'carries no cursor-review.yml pin' <<<\"\$OUT\") -eq 2 ]]"
+check "aggregate error tallies both files" \
+  "grep -q '::error::2 caller file(s) carry no cursor-review.yml pin this bumper can move' <<<\"\$OUT\""
+check "did NOT claim the file was already current" "! grep -q 'already at $SHORT' <<<\"\$OUT\""
+check "did NOT report the fleet complete"          "! grep -q 'cursor-review bump complete' <<<\"\$OUT\""
+check "committed nothing"                          "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+check "opened no PR"                               "[[ ! -f \"\$STUB_PUT_DIR/pr.log\" ]] || ! grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
+
+echo "== a file calling ONLY a sibling fleet's reusable is the roster's bug (BE-6471) =="
+# The entry names a real caller — of a DIFFERENT fleet. This fleet's rewrite is
+# address-restricted to its own reusable, so there is nothing here for it to move
+# and the file would otherwise be reported as converged on every run. The stale
+# roster entry, not the file, is what needs fixing.
+new_case wrongfleet
+WRONGFLEET_FIXTURE="${WORK}/wrongfleet_caller.yml"
+printf '%s\n' \
+  'name: CI cursor-review' \
+  'jobs:' \
+  '  review:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@1111111111111111111111111111111111111111' \
+  > "$WRONGFLEET_FIXTURE"
+STUB_CONTENT_FILE="$WRONGFLEET_FIXTURE" run_bump \
+  VAR_NAME=GROOM_CALLERS TAG=groom WORKFLOW_FILE=groom.yml ALLOW_EMPTY=true \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-wrongfleet","file":".github/workflows/ci-groom.yml","label":""}]'
+check "exit 1"                                  "[[ $RC -eq 1 ]]"
+check "warned about the missing groom pin"      "grep -q 'carries no groom.yml pin this bumper can move' <<<\"\$OUT\""
+check "pointed at the GROOM_CALLERS entry"      "grep -q 'GROOM_CALLERS entry' <<<\"\$OUT\""
+check "did NOT bump the sibling fleet's pin"    "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+check "did NOT claim it was already current"    "! grep -q 'already at $SHORT' <<<\"\$OUT\""
+
+echo "== one un-bumpable entry does not block another repo's bump (BE-6471) =="
+# The fan-out property, and the reason the tally fires at the END rather than at
+# the offending file: a single bad roster entry must not strand every other
+# caller. The healthy repo is still committed and PR'd; the job still refuses to
+# report success. (STUB_ALT_REPO serves the no-pin fixture for just one of the two
+# repos, so a single run carries both a healthy and an un-bumpable caller.)
+new_case mixednopin
+STUB_CONTENT_FILE="$CR_FIXTURE" \
+STUB_ALT_REPO="Comfy-Org/secret-bad" STUB_ALT_CONTENT_FILE="$NOPIN_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-bad","file":".github/workflows/ci.yml","label":""},{"repo":"Comfy-Org/secret-good","file":".github/workflows/ci.yml","label":""}]'
+PUT="${STUB_PUT_DIR}/put.last.txt"
+check "exit 1 — the run still refuses to pass" "[[ $RC -eq 1 ]]"
+check "the un-bumpable caller was named"       "grep -q 'carries no cursor-review.yml pin' <<<\"\$OUT\""
+check "exactly ONE caller was reported so"     "[[ \$(grep -c 'carries no cursor-review.yml pin' <<<\"\$OUT\") -eq 1 ]]"
+check "the HEALTHY caller was still committed" "[[ \$(cat \"\$STUB_PUT_DIR/count\") -eq 1 ]]"
+check "the healthy caller's pin moved"         "grep -qF 'cursor-review.yml@$NEW_SHA' \"$PUT\""
+check "the healthy caller still got its PR"    "grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
+check "the tally counts exactly one file"      "grep -q '::error::1 caller file(s) carry no cursor-review.yml pin' <<<\"\$OUT\""
 
 echo "== a TAG-pinned workflows_ref moves in lock-step with uses: (BE-4662) =="
 # The under-rewrite half of BE-4662. A caller pins this repo TWICE — the `uses:`
