@@ -7,9 +7,11 @@ repo's own workflow files.
 - **`check_workflow_pins.py`** — for every `on: workflow_call` workflow in
   `.github/workflows/`, fails if it (1) declares a `default:` for its
   `workflows_ref` input, or (2) checks out at `ref: ${{ inputs.workflows_ref }}`
-  in a job that does not run the empty-ref guard first. Text-level parsing (this
-  repo is stdlib-only — no PyYAML), the same constraint `bump-callers.sh` works
-  under.
+  in a job that does not run the empty-ref guard first — recognizing the
+  canonical `-z` guard and the length/charset shape `pr-risk.yml` uses, and
+  exempting the `github.job_workflow_sha` self-pin `groom.yml` uses instead of
+  a guard (see below). Text-level parsing (this repo is stdlib-only — no
+  PyYAML), the same constraint `bump-callers.sh` works under.
 - **`tests/`** — `unittest` suite, run by
   [`test-workflow-pins.yml`](../workflows/test-workflow-pins.yml) along with a
   CLI smoke test that a reintroduced default really exits non-zero.
@@ -26,19 +28,35 @@ defaults to a floating branch, a caller can SHA-pin `uses:` and *still* load
 **mutable** scripts — into jobs that hold write permissions. The pin then
 proves nothing about the code that actually runs.
 
-So `cursor-review.yml`, `groom.yml`, and `agents-md-integrity.yml` declare
-`workflows_ref` with `required: true` and **no default**, and each job that
-consumes it runs a fail-fast guard before its assets checkout. The guard is not
-belt-and-braces: **GitHub does not enforce `required: true` for `workflow_call`
-inputs.** An omitted input arrives as `''`, and `actions/checkout` with
-`ref: ''` silently checks out the default branch — recreating the hole exactly.
-The guard also emits a (non-fatal) `::warning::` when the ref is not a full
-40-hex SHA, since branch and tag refs can move between jobs mid-run.
+So `cursor-review.yml`, `agents-md-integrity.yml`, `pr-size.yml`, and
+`refresh-reviewers.yml` declare `workflows_ref` with `required: true` and **no
+default**, and each job that consumes it runs a fail-fast guard before its
+assets checkout. The guard is not belt-and-braces: **GitHub does not enforce
+`required: true` for `workflow_call` inputs.** An omitted input arrives as
+`''`, and `actions/checkout` with `ref: ''` silently checks out the default
+branch — recreating the hole exactly. The guard also emits a (non-fatal)
+`::warning::` when the ref is not a full 40-hex SHA, since branch and tag refs
+can move between jobs mid-run. `pr-risk.yml` writes the same guarantee as one
+length/charset test (`${#WORKFLOWS_REF} -ne 40`, OR'd with a charset check)
+instead of a separate `-z` test — the lint recognizes both shapes: a length
+check alone already rejects an empty ref (length 0), and `||` only ever widens
+what a condition rejects, so one qualifying branch is enough regardless of
+what it is OR'd with.
 
-It is copied inline into each consuming job rather than factored into a
+`groom.yml` is the one workflow that skips the guard entirely (BE-4169): its
+`workflows_ref` defaults to `''`, and every checkout falls back to
+`${{ inputs.workflows_ref || github.job_workflow_sha }}` — the exact commit
+THIS reusable workflow was itself resolved from via the caller's `uses:` pin.
+That value can never be empty or mutable, so an omitted input self-pins
+instead of reaching a floating branch — the same guarantee the guard buys,
+bought without needing one. The lint recognizes this LITERAL fallback
+expression only; anything else OR'd in (a branch, a tag, another input) is the
+same hole wearing a different hat and stays covered by both checks.
+
+The guard is copied inline into each consuming job rather than factored into a
 composite action **on purpose**: a composite would have to be loaded with
 `uses: Comfy-Org/github-workflows/.github/actions/…@<ref>` — the very ref being
-validated — and a job cannot `uses: ./…` before its checkout. Twelve copies of a
+validated — and a job cannot `uses: ./…` before its checkout. Many copies of a
 16-line guard is the cost of not making the check depend on the thing it checks.
 
 Deleting a `default:` is a one-line edit to undo, hence the lint. It covers
