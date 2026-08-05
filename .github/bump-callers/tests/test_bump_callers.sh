@@ -20,7 +20,12 @@
 #     same and a longer key ending in `workflows_ref` are neither rewritten nor
 #     misread as a stale pin,
 #   * an empty seeded-empty fleet is a clean no-op while a must-have-callers
-#     fleet still hard-fails, and a malformed variable hard-fails.
+#     fleet still hard-fails, and a malformed variable hard-fails,
+#   * the roster is FETCHED from the fleet's Actions variable when CALLERS_JSON
+#     is unset (BE-6482), with 404 folding into the existing empty-roster
+#     semantics and 403 producing the actionable Variables-grant error — while an
+#     explicitly-set CALLERS_JSON (empty or not) still overrides and makes no
+#     variables API call at all.
 #
 # No network: `gh` is a PATH stub that serves a fixture file and captures the
 # Git Data API calls (the blob content + the tree's file list) so we can inspect
@@ -140,6 +145,23 @@ case "$method:$path" in
 esac
 
 # GET dispatch by resource path.
+if [[ "$path" == *"/actions/variables/"* ]]; then
+  # The run-time roster read (BE-6482). Log EVERY call so a case can assert the
+  # fetch happened — or, for an explicit CALLERS_JSON override, that it did not.
+  echo "$path" >> "$STUB_PUT_DIR/varapi.log"
+  # STUB_VAR_STATUS models the two failures the script must tell apart: 404 (no
+  # such variable → an empty roster) and 403 (token cannot read variables at all
+  # → the operator-actionable error). gh writes the status to stderr and exits 1.
+  case "${STUB_VAR_STATUS:-}" in
+    404) echo "gh: Not Found (HTTP 404)" >&2; exit 1;;
+    403) echo "gh: Resource not accessible by integration (HTTP 403)" >&2; exit 1;;
+    5*)  echo "gh: Internal Server Error (HTTP 500)" >&2; exit 1;;
+  esac
+  # The script passes `--jq .value`; the stub's arg loop discards --jq, so emit
+  # the post-jq value directly (same convention as the git/commits branch below).
+  printf '%s\n' "${STUB_VAR_VALUE:-[]}"
+  exit 0
+fi
 if [[ "$path" == *"/contents/"* ]]; then
   # Simulate content-fetch failures so the script's 404-vs-transient handling is
   # exercised. STUB_404_FILE: a contents GET whose (decoded-ish) path contains
@@ -181,7 +203,12 @@ run_bump() { # runs the real script, capturing stdout+stderr and exit code.
   # NOT recognized as assignment prefixes, so `env` is required here.
   # OUT/RC are consumed by check()'s `eval`, which shellcheck can't see.
   # shellcheck disable=SC2034
+  # GITHUB_REPOSITORY is what the run-time roster read is keyed on (BE-6482). It
+  # is set for every case, not just the fetch ones, so a case that passes
+  # CALLERS_JSON explicitly proves the override wins on the merits — the fetch
+  # path is fully available to it and is skipped anyway.
   OUT=$(env GH_TOKEN=x NEW_SHA="$NEW_SHA" STUB_CONTENT_FILE="$STUB_CONTENT_FILE" \
+            GITHUB_REPOSITORY=Comfy-Org/github-workflows \
             STUB_PUT_DIR="$STUB_PUT_DIR" "$@" bash "$BUMP" 2>&1)
   RC=$?
 }
@@ -935,6 +962,109 @@ check "exit 0" "[[ $RC -eq 0 ]]"
 check "no spurious attribution warning"          "! grep -q 'pin comments untouched' <<<\"\$OUT\""
 check "the marker WAS refreshed"                 "grep -qF 'github-workflows main ($SHORT)' \"$PUT\""
 check "no stale short SHA left behind"           "! grep -qF 'main (1111111)' \"$PUT\""
+
+# ---------------------------------------------------------------------------
+# Run-time roster fetch (BE-6482). The roster used to arrive through the
+# entrypoint's step `env:`, which Actions prints into this PUBLIC repo's run log
+# BEFORE the step — i.e. before `::add-mask::` could cover the private names. The
+# script now reads it itself, from the Actions variable VAR_NAME names, and the
+# cases below pin the four behaviours that makes load-bearing.
+# ---------------------------------------------------------------------------
+
+echo "== CALLERS_JSON UNSET: the roster is FETCHED, masked, and bumps identically (BE-6482) =="
+new_case fetch
+FETCH_ROSTER='[{"repo":"Comfy-Org/secret-fetched","file":".github/workflows/ci-cursor-review.yml","label":""}]'
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  STUB_VAR_VALUE="$FETCH_ROSTER"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "read the fleet's variable"     "grep -qF 'repos/Comfy-Org/github-workflows/actions/variables/CURSOR_REVIEW_CALLERS' \"\$STUB_PUT_DIR/varapi.log\""
+check "masked the fetched repo name"  "grep -q '::add-mask::Comfy-Org/secret-fetched' <<<\"\$OUT\""
+# The mask directive is the FIRST use of the name; nothing above it may log the
+# roster. Anything printed before that line would be an unmasked public-log leak
+# — the exact failure this change exists to remove.
+check "mask is the first mention"     "[[ \"\$(grep -n 'secret-fetched' <<<\"\$OUT\" | head -1)\" == *'::add-mask::'* ]]"
+check "reported PR opened"            "grep -q 'PR opened' <<<\"\$OUT\""
+PUT="${STUB_PUT_DIR}/put.last.txt"
+check "bumped exactly like the injected-roster path" "grep -qF '$NEW_SHA' \"$PUT\""
+
+echo "== fetch 404 + ALLOW_EMPTY=true: absent variable == empty roster, clean no-op =="
+new_case fetch404ok
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  VAR_NAME=AGENTS_MD_CALLERS TAG=agents-md-integrity WORKFLOW_FILE=agents-md-integrity.yml ALLOW_EMPTY=true \
+  STUB_VAR_STATUS=404
+check "exit 0 on 404 + ALLOW_EMPTY" "[[ $RC -eq 0 ]]"
+check "logged the no-op"            "grep -q 'no callers yet' <<<\"\$OUT\""
+check "no commit made"              "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+check "no Variables-grant error"    "! grep -q 'Variables: read' <<<\"\$OUT\""
+
+echo "== fetch 404 + ALLOW_EMPTY=false: still the loud clobber-detecting error =="
+# A must-have-callers fleet (auto-label, cursor-review, detect-unreviewed-merge)
+# must not silently no-op just because the variable read came back empty via a
+# different route than before.
+new_case fetch404bad
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  VAR_NAME=AUTO_LABEL_CALLERS TAG=auto-label WORKFLOW_FILE=cursor-review-auto-label.yml \
+  STUB_VAR_STATUS=404
+check "exit 1 on 404 must-have fleet" "[[ $RC -eq 1 ]]"
+check "error names the variable"      "grep -q '::error::AUTO_LABEL_CALLERS variable is missing or empty' <<<\"\$OUT\""
+
+echo "== fetch 403: the actionable Variables-grant error, and NO roster in the log =="
+new_case fetch403
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  STUB_VAR_STATUS=403 STUB_VAR_VALUE="$FETCH_ROSTER"
+check "exit 1 on 403"              "[[ $RC -eq 1 ]]"
+check "names the missing grant"    "grep -q \"::error::App token cannot read Actions variables\" <<<\"\$OUT\""
+check "points at the App setting"  "grep -qF \"'Variables: read'\" <<<\"\$OUT\""
+check "roster never echoed"        "! grep -q 'secret-fetched' <<<\"\$OUT\""
+check "not misread as empty"       "! grep -q 'variable is missing or empty' <<<\"\$OUT\""
+check "no commit made"             "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+
+echo "== a non-404/403 fetch failure fails loudly, sanitized =="
+new_case fetch500
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  STUB_VAR_STATUS=500 STUB_VAR_VALUE="$FETCH_ROSTER"
+check "exit 1 on transient failure" "[[ $RC -eq 1 ]]"
+check "error names the variable"    "grep -q '::error::Could not read the CURSOR_REVIEW_CALLERS Actions variable' <<<\"\$OUT\""
+check "roster never echoed"         "! grep -q 'secret-fetched' <<<\"\$OUT\""
+
+echo "== an explicit CALLERS_JSON still OVERRIDES — no variables API call at all =="
+new_case override
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  STUB_VAR_VALUE="$FETCH_ROSTER" \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-injected","file":".github/workflows/ci-cursor-review.yml","label":""}]'
+check "exit 0"                       "[[ $RC -eq 0 ]]"
+check "no variables API call"        "[[ ! -f \"\$STUB_PUT_DIR/varapi.log\" ]]"
+check "used the injected roster"     "grep -q '::add-mask::Comfy-Org/secret-injected' <<<\"\$OUT\""
+check "ignored the variable's value" "! grep -q 'secret-fetched' <<<\"\$OUT\""
+
+echo "== CALLERS_JSON set-but-EMPTY means EMPTY, never 'go fetch' =="
+# The distinction the `+x` test exists for. `-z` here would send an explicit
+# `CALLERS_JSON=''` — a deliberate "bump nothing" — off to read the LIVE roster
+# and bump the whole fleet, and would break this suite's empty-variable cases.
+new_case emptyoverride
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  STUB_VAR_VALUE="$FETCH_ROSTER" CALLERS_JSON=''
+check "exit 1 (empty must-have fleet)" "[[ $RC -eq 1 ]]"
+check "no variables API call"          "[[ ! -f \"\$STUB_PUT_DIR/varapi.log\" ]]"
+check "error names the variable"       "grep -q 'CURSOR_REVIEW_CALLERS variable is missing or empty' <<<\"\$OUT\""
+check "no commit made"                 "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+
+echo "== fetch path needs GITHUB_REPOSITORY — unset is a named error, not a crash =="
+new_case norepo
+# shellcheck disable=SC2034
+OUT=$(env -u GITHUB_REPOSITORY GH_TOKEN=x NEW_SHA="$NEW_SHA" \
+        STUB_CONTENT_FILE="$CR_FIXTURE" STUB_PUT_DIR="$STUB_PUT_DIR" \
+        VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+        bash "$BUMP" 2>&1)
+RC=$?
+check "exit 1"                    "[[ $RC -eq 1 ]]"
+check "error names the variable"  "grep -q '::error::GITHUB_REPOSITORY is unset' <<<\"\$OUT\""
+check "no variables API call"     "[[ ! -f \"\$STUB_PUT_DIR/varapi.log\" ]]"
 
 echo
 echo "== $PASS passed, $FAIL failed =="

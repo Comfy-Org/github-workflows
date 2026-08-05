@@ -94,13 +94,14 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
           NEW_SHA: ${{ github.sha }}
+          # Names the fleet's Actions variable. bump-callers.sh READS the roster
+          # out of it at run time (BE-6482) — it is deliberately NOT passed in
+          # through this `env:` block, because Actions prints a step's env into
+          # this PUBLIC repo's run log BEFORE the step runs, i.e. before the
+          # script's `::add-mask::` could cover the private caller names.
           VAR_NAME: CURSOR_REVIEW_CALLERS
           TAG: cursor-review
           WORKFLOW_FILE: cursor-review.yml
-          # JSON array of {"repo","file","label","wire_bot"} — see the header
-          # comment for the update flow. Kept in a variable (not the file) so
-          # private caller names never land in this public repo or its logs.
-          CALLERS_JSON: ${{ vars.CURSOR_REVIEW_CALLERS }}
           # Only this fleet's callers ever carry `wire_bot` (BE-1814) — the
           # agents-md-integrity entrypoint never sets this, so bump-callers.sh
           # skips wiring there even if its variable somehow set the flag.

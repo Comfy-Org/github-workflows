@@ -82,15 +82,16 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
           NEW_SHA: ${{ github.sha }}
+          # Names the fleet's Actions variable. bump-callers.sh READS the roster
+          # out of it at run time (BE-6482) — it is deliberately NOT passed in
+          # through this `env:` block, because Actions prints a step's env into
+          # this PUBLIC repo's run log BEFORE the step runs, i.e. before the
+          # script's `::add-mask::` could cover the private caller names.
           VAR_NAME: AGENTS_MD_CALLERS
           TAG: agents-md-integrity
           WORKFLOW_FILE: agents-md-integrity.yml
           # Seeded empty; an empty list is a clean no-op, not an error.
           ALLOW_EMPTY: "true"
-          # JSON array of {"repo","file","label"} — see the header comment for the
-          # update flow. Kept in a variable (not the file) so private caller names
-          # never land in this public repo or its logs.
-          CALLERS_JSON: ${{ vars.AGENTS_MD_CALLERS }}
         run: |
           # The main-only ref guard above cannot catch a manual RE-RUN of an
           # older main run: github.ref is refs/heads/main but github.sha is

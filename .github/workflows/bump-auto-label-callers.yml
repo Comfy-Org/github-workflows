@@ -34,14 +34,13 @@ name: Bump cursor-review-auto-label callers
 # repo-level Actions variable `AUTO_LABEL_CALLERS` (config, not a credential — a
 # variable, not a secret, since secrets are write-only via the API) as a JSON
 # array of {"repo","file","label"} objects, same shape as CURSOR_REVIEW_CALLERS.
-# `bump-callers.sh` `::add-mask::`es every repo name before IT echoes anything.
-# KNOWN GAP (shared by all six entrypoints, tracked separately): passing the
-# roster through this step's `env:` means Actions prints the raw value in the
-# step's env dump before the script — and its masking — ever runs. Closing it
-# means reading the variable at run time (`gh variable get`) and masking it
-# first, which needs a token permission this fleet does not mint today; it is a
-# fleet-wide change, not one this entrypoint can make alone. Until then, treat
-# the roster as visible in the public run log.
+# `bump-callers.sh` READS that variable itself, at run time, and
+# `::add-mask::`es every repo name before anything is echoed — the roster is
+# never bound into this step's `env:`, because Actions prints a step's env block
+# into the (public) run log BEFORE the step runs, which put the raw roster in
+# front of the masking that was supposed to cover it (BE-6482, closing BE-6477).
+# The run-time read is why this fleet's App token is minted with no
+# `permission-*` downscoping: a downscoped token cannot read Actions variables.
 # Unlike the fleets seeded empty, this one is seeded NON-EMPTY (the
 # callers already existed before the bumper did), so ALLOW_EMPTY is false below:
 # an empty list here means the variable was clobbered, not that the fleet has no
@@ -112,34 +111,38 @@ jobs:
           # this token must reach are not knowable at authoring time — and naming
           # them here would leak private caller names into a public file.
           #
-          # The PERMISSIONS can be narrowed without naming anything, so they are:
-          # unset, the minted token carries every permission the app holds on every
-          # repo it is installed on, far past what this bumper needs. It commits
-          # the rewritten caller file via the Git Data API (contents) and opens or
-          # updates the bump PR (pull-requests); `gh pr create --label` stamps the
-          # caller's label through the issues API (issues) — same trio, and the
-          # same reasoning, as the groom fleet's entrypoint.
+          # The permissions are deliberately LEFT UNSET (BE-6482), so this token
+          # inherits every permission the App holds. That is a real least-privilege
+          # regression from the `permission-contents`/`pull-requests`/`issues` trio
+          # this step used to downscope to, and it is unavoidable: the bumper now
+          # READS this repo's caller roster from an Actions variable at run time
+          # (so the roster never reaches a public run log through the step env),
+          # and a downscoped App token CANNOT read Actions variables — GitHub's
+          # `app-permissions` schema, the installation-token request body, has no
+          # `variables` key at all, so there is no `permission-variables` input to
+          # ask for in ANY version of create-github-app-token. Asking for nothing
+          # is the only spelling that yields a token with the App's "Variables:
+          # read" grant, which is what the other entrypoints in this family have
+          # always minted. The token still only ever commits the rewritten caller
+          # file (contents), opens/updates the bump PR (pull-requests) and stamps
+          # its label (issues).
           owner: Comfy-Org
-          permission-contents: write
-          permission-pull-requests: write
-          permission-issues: write
 
       - name: Bump SHA in caller repos
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
           NEW_SHA: ${{ github.sha }}
+          # Names the fleet's Actions variable. bump-callers.sh READS the roster
+          # out of it at run time (BE-6482) — it is deliberately NOT passed in
+          # through this `env:` block, because Actions prints a step's env into
+          # this PUBLIC repo's run log BEFORE the step runs, i.e. before the
+          # script's `::add-mask::` could cover the private caller names.
           VAR_NAME: AUTO_LABEL_CALLERS
           TAG: auto-label
           WORKFLOW_FILE: cursor-review-auto-label.yml
           # Seeded NON-EMPTY (the callers predate this fleet), so an empty list
           # means the variable was clobbered — fail rather than no-op silently.
           ALLOW_EMPTY: "false"
-          # JSON array of {"repo","file","label"} — see the header comment for the
-          # update flow. Kept in a variable (not the file) so private caller names
-          # never land in this public repo. NOTE: this env binding is itself the
-          # known log-exposure gap documented in the header — Actions dumps the
-          # step env before the script's `::add-mask::` runs.
-          CALLERS_JSON: ${{ vars.AUTO_LABEL_CALLERS }}
         run: |
           # The main-only ref guard above cannot catch a manual RE-RUN of an
           # older main run: github.ref is refs/heads/main but github.sha is
