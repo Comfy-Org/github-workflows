@@ -132,6 +132,14 @@ STRIPPED="${CALLERS_JSON//[[:space:]]/}"
 # hard-fail so a silent no-op dispatcher (which would leave every caller
 # un-bumped) is impossible.
 if [[ "$ALLOW_EMPTY" == "true" ]] && { [[ -z "$STRIPPED" ]] || [[ "$STRIPPED" == "[]" ]]; }; then
+  # Log the fingerprint line HERE too, so "every run prints one" (README,
+  # AGENTS.md) holds on the no-op path as well. Without it the one run shape an
+  # operator most needs to recognize — a fleet that bumped nothing — is the one
+  # with no audit line at all, indistinguishable at a glance from a run that
+  # died before reaching the fingerprint. There is no digest to print: an empty
+  # roster has no canonical form, and hashing "" would publish one fixed
+  # well-known constant that says nothing.
+  echo "roster: 0 caller(s), sha256 n/a (roster empty or unset)"
   echo "${VAR_NAME} has no callers yet — nothing to bump for ${TAG}."
   exit 0
 fi
@@ -166,9 +174,20 @@ fi
 # Moving the roster into a secret (BE-6472) costs read-back: there is no
 # `gh secret get`, so an operator can no longer diff what the fleet holds against
 # the canonical callers.json. The digest restores that without disclosure — it
-# CONFIRMS a roster you already hold, and reveals nothing to anyone who does not
-# (a sha256 is not reversible). Print the count too: "9 caller(s)" is the cheap
-# sanity check that catches a truncated or half-pasted roster at a glance.
+# CONFIRMS a roster you already hold. Print the count too: "9 caller(s)" is the
+# cheap sanity check that catches a truncated or half-pasted roster at a glance.
+#
+# What it does NOT give an outside reader, stated precisely rather than as
+# "reveals nothing": a sha256 is not reversible, but it IS a check function, so
+# anyone can test a guess against it offline. The preimage is the ENTIRE
+# canonical array — every repo name, its file path and label, and the order they
+# appear in — so a confirmable guess means reconstructing the whole roster
+# verbatim, not testing whether one repo is a member. That is a far weaker
+# oracle than a per-name one, and the count is the only bound on it. If that
+# residual ever needs closing, the fix is a keyed HMAC (an operator-held
+# fingerprint key, which the reproduction command below would then need too) —
+# deliberately not done here, since it buys a new shared secret and a silent
+# fallback path for a guess space this size.
 # Keep it a HASH — never a sample, a prefix, or a per-repo listing, all of which
 # would re-leak into the public log the very names the secret move just removed.
 #
@@ -191,7 +210,17 @@ roster_sha256() {
   # "<hex>  <file>", hence the cut.
   if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi
 }
-echo "roster: ${#CALLERS[@]} caller(s), sha256 $(jq -cS . <<<"$CALLERS_JSON" | roster_sha256 | cut -d' ' -f1)"
+# Compute into a variable and SHAPE-CHECK it rather than inlining the pipeline in
+# the echo. Inlined, `echo` reports the exit status of `echo` — so if neither
+# hash command existed (or jq/cut failed), the substitution would come back empty
+# and the line would print `sha256 ` with nothing after it, on a green run, with
+# no `set -e` to catch it. An operator comparing digests would then read a
+# silently missing value as a mismatch. Say "unavailable" out loud instead.
+ROSTER_DIGEST=$(jq -cS . <<<"$CALLERS_JSON" | roster_sha256 | cut -d' ' -f1)
+if [[ ! "$ROSTER_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
+  ROSTER_DIGEST="unavailable (no sha256sum or shasum on PATH)"
+fi
+echo "roster: ${#CALLERS[@]} caller(s), sha256 ${ROSTER_DIGEST}"
 
 # Bump ONE caller repo, committing EVERY file that repo pins onto a single
 # stable bump branch. Called once per repo with that repo's entries, so a repo

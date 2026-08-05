@@ -155,6 +155,8 @@ Enrolling a repo is **two steps**, and the second is the one people miss.
    | `pr-size.yml` | `PR_SIZE_CALLERS` |
    | `agents-md-integrity.yml` | `AGENTS_MD_CALLERS` |
    | `assign-reviewers.yml` | `ASSIGN_REVIEWERS_CALLERS` |
+   | `pr-risk.yml` | `PR_RISK_CALLERS` |
+   | `detect-unreviewed-merge.yml` | `DETECT_UNREVIEWED_MERGE_CALLERS` (not seeded yet — pins move by hand until it is) |
 
    Each entry is `{"repo": "...", "file": ".github/workflows/<caller>.yml", "label": ""}`.
 

@@ -181,8 +181,10 @@ diff what a fleet holds against what you meant to set. Two things cover that:
 
 - the canonical `callers.json` in a private infra/ops repo is the **sole** source
   of truth (it always should have been), and
-- every run logs a line of the form `roster: <N> caller(s), sha256 <digest>`,
-  which you reproduce from the canonical file with
+- every run that gets past roster validation logs a line of the form
+  `roster: <N> caller(s), sha256 <digest>` (a run that hard-fails on a missing or
+  malformed roster says so in its error instead), which you reproduce from the
+  canonical file with
 
   ```bash
   jq -cS . callers.json | sha256sum
@@ -191,8 +193,21 @@ diff what a fleet holds against what you meant to set. Two things cover that:
   Equal digests mean the fleet ran exactly that roster. The digest is taken over
   the **canonical** (`jq -cS`) form, not the raw secret bytes, so pretty-printing,
   key order and a trailing newline cannot make the same roster fingerprint two
-  ways; array order is preserved, since that is the order repos are bumped in. It
-  confirms a roster you already hold and discloses nothing to anyone who does not.
+  ways; array order is preserved, since that is the order repos are bumped in.
+  A fleet that no-ops on an empty roster (`ALLOW_EMPTY: true`) logs the line too,
+  as `roster: 0 caller(s), sha256 n/a (roster empty or unset)` — there is no
+  canonical form to hash, and the point of printing it anyway is that the run
+  shape you most need to recognize is not the one with no audit line at all.
+
+  What the digest gives an outside reader, stated precisely: a sha256 is not
+  reversible, but it **is** a check function, so a guess can be tested against it
+  offline. The preimage is the entire canonical array — every repo, its file path
+  and label, and their order — so a confirmable guess means reconstructing the
+  whole roster verbatim, not testing whether one repo is a member; the count is
+  the only bound on that space. Closing even this residual means a keyed HMAC and
+  an operator-held fingerprint key (which the reproduction command would then
+  need too) — deliberately not done, and worth revisiting only if a roster's
+  contents ever become guessable in bulk.
 
 Adding/removing a caller still needs **no public commit** — set the secret:
 
@@ -202,6 +217,19 @@ jq -c . callers.json | gh secret set AGENTS_MD_CALLERS --repo Comfy-Org/github-w
 
 Keep the canonical `callers.json` in a private infra/ops repo so roster edits
 have a reviewed source of truth (the org audit log records each edit).
+
+**Finish the cutover by deleting the old variables.** A `*_CALLERS` variable left
+behind after its secret is seeded still holds the private roster in this repo's
+Actions config, readable by anything with variables-read access — the pre-BE-6472
+copy of the exact data the move exists to hide. Once a fleet's first post-merge
+run has logged the expected count and digest:
+
+```bash
+gh variable delete AGENTS_MD_CALLERS --repo Comfy-Org/github-workflows
+```
+
+Do that for every migrated fleet. Delete only **after** the run confirms the
+secret is good — the variable is the rollback.
 
 The `VAR_NAME` env key the entrypoints pass keeps its historical name even though
 it now names a secret; it exists only to name the roster in an error message.

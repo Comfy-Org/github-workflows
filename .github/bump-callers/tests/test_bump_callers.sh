@@ -211,6 +211,11 @@ check "reported fleet complete"      "grep -q 'cursor-review bump complete' <<<\
 # which shellcheck cannot see through.
 # shellcheck disable=SC2034
 ROSTER_LINE=$(grep '^roster: ' <<<"$OUT")
+# Prove the line is THERE before the negative grep below trusts it: `! grep -q`
+# over an empty string passes, so a vanished fingerprint would otherwise earn the
+# leak assertion a green it never verified — the same false-green the entrypoint
+# glob check further down defends against.
+check "logged a roster fingerprint line" "[[ -n \"\$ROSTER_LINE\" ]]"
 check "logged the roster fingerprint" \
   "grep -qE '^roster: 1 caller\\(s\\), sha256 [0-9a-f]{64}\$' <<<\"\$ROSTER_LINE\""
 check "fingerprint leaks no caller name" "! grep -q 'secret-alpha' <<<\"\$ROSTER_LINE\""
@@ -448,6 +453,9 @@ STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
 check "exit 0 on empty" "[[ $RC -eq 0 ]]"
 check "logged no-op"    "grep -q 'no callers yet' <<<\"\$OUT\""
 check "no commit made"  "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+# The no-op path prints a fingerprint line too, so "every run logs one" holds for
+# the run shape where the audit trail matters most — a fleet that bumped nothing.
+check "logged the 0-caller fingerprint" "grep -q '^roster: 0 caller(s), sha256 n/a' <<<\"\$OUT\""
 
 echo "== cursor-review fleet: empty roster is a hard error =="
 new_case crempty
@@ -960,7 +968,12 @@ echo "== STATIC: every fleet feeds CALLERS_JSON from a SECRET, never a variable 
 # leak just by copying a pre-migration entrypoint.
 WF_DIR="${SCRIPT_DIR}/../../workflows"
 GUARD_FILES=("$WF_DIR"/bump-*-callers.yml)
-check "found the fleet entrypoints to guard" "(( ${#GUARD_FILES[@]} >= 6 ))"
+# Floor tracks the family's actual size (8 today), not a stale lower bound: at
+# `>= 6`, two entrypoints could be deleted or renamed off the glob — and an
+# off-convention filename is exempt from this guard AND from the workflow's
+# `bump-*-callers.yml` path filter — while this check still reported green.
+# Raise it whenever a fleet is added; that one-line churn is the point.
+check "found the fleet entrypoints to guard" "(( ${#GUARD_FILES[@]} >= 8 ))"
 for GF in "${GUARD_FILES[@]}"; do
   GNAME=$(basename "$GF")
   # An unmatched glob comes back as the literal pattern, and `! grep` on a file
@@ -971,6 +984,16 @@ for GF in "${GUARD_FILES[@]}"; do
   # (a) no `vars.` binding anywhere in the file.
   check "${GNAME}: no CALLERS_JSON from vars." \
     "! grep -qE '^[[:space:]]*CALLERS_JSON:[[:space:]]*\\\$\\{\\{[[:space:]]*vars\\.' \"$GF\""
+  # (a2) and no roster read from a variable under ANY env key. (a) only covers
+  #      the CALLERS_JSON spelling; a fleet that bound its roster to some other
+  #      key — or staged it through an earlier step's output — would slip past
+  #      it while leaking exactly the same names in the same env dump. Matching
+  #      `vars.<ANYTHING>CALLERS` catches the whole shape. `vars.APP_ID` and the
+  #      other genuine variable reads these files make are unaffected. It matches
+  #      comments too — if a header ever needs to describe the old spelling, write
+  #      it as `vars.*_CALLERS` rather than naming a fleet.
+  check "${GNAME}: no *_CALLERS roster read from vars. at all" \
+    "! grep -qE 'vars\\.[A-Z_]*CALLERS' \"$GF\""
   # (b) every CALLERS_JSON binding is a bare secrets.<NAME> expression. Counting
   #     both sides (rather than just grepping for one good line) is what makes a
   #     SECOND, differently-spelled binding — or one wrapped in a fallback like
