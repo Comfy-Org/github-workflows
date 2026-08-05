@@ -407,6 +407,20 @@ on:
           Recovery is to re-pin to a commit that is on `main`.
 
 
+          A RED RUN HERE IS NOT A NETWORK BLIP. Because this makes two
+          unauthenticated fetches a hard precondition of every run, each one is
+          retried three times with a linear backoff and bounded by git's
+          low-speed timeout, so a transient github.com error or a secondary rate
+          limit on shared Actions egress resolves itself rather than reddening
+          every enrolled consumer at once. What is never retried is the VERDICT.
+          If the step still fails, read the annotation: it distinguishes a pin
+          that could not be FETCHED, a `main` that could not be READ, an ancestry
+          test that could not be COMPLETED (an infrastructure fault, not a
+          judgement about the pin), and a pin that is genuinely NOT AN ANCESTOR —
+          which is the only one of the four that says anything about the pin
+          itself.
+
+
           WHAT ANCESTRY DOES NOT PROVE is that the pin is the CURRENT one: a pin
           left behind when `uses:` moved is a merged ancestor too, and passes.
           The test that would close that is "equal to the commit `uses:` resolved
@@ -582,12 +596,29 @@ jobs:
           # (the repo is public), and every failure mode fails CLOSED: a fetch that errors, a `main`
           # that cannot be read, or a network outage all leave the step non-zero.
           #
-          # TWO FETCHES, NOT ONE. The depth-1 fetch is what proves the SHA exists in this repo's
-          # object network at all; the second brings `main` with an explicit refspec (rather than
-          # relying on remote-tracking config, which a bare-URL remote has none of) so that
-          # `merge-base --is-ancestor` walks a COMPLETE `main` history. The shallow boundary the first
-          # fetch leaves behind is harmless: the walk runs from `main` DOWN to the pinned commit and
-          # never needs that commit's parents.
+          # TWO FETCHES, NOT ONE, AND BOTH ARE BOUNDED. The depth-1 fetch is what proves the SHA
+          # exists in this repo's object network at all; the second brings `main` with an explicit
+          # refspec (rather than relying on remote-tracking config, which a bare-URL remote has none
+          # of) to walk down to the pin. `--filter=blob:none` holds both to a commit/tree graph — no
+          # file CONTENT is ever downloaded, because `merge-base` reads none. That bound matters most
+          # on the REJECTION path: when the pin is not an ancestor there is no shallow boundary
+          # anywhere in `main`'s ancestry, so the hostile pin is the case that fetches the MOST.
+          #
+          # THE SHALLOW BOUNDARY IS REAL, AND HARMLESS. The depth-1 fetch registers a boundary at the
+          # pinned commit and the server honours it on the second fetch, so `main` arrives TRUNCATED
+          # there — it is not a complete history and must not be reasoned about as one. What saves it
+          # is the direction of the walk: `merge-base --is-ancestor` runs from `main` DOWN to the
+          # pinned commit and stops on reaching it, so it never needs that commit's parents. Do not
+          # reorder these two fetches, or drop `--depth=1`, on the strength of a completeness the
+          # second fetch does not actually deliver.
+          #
+          # THE FETCH RETRIES; THE VERDICT DOES NOT. Two unauthenticated round-trips are now a hard
+          # precondition for every run in every enrolled consumer, and there is no opt-out — so a
+          # transient github.com error or a secondary rate limit on shared Actions egress would
+          # otherwise turn one bad minute into a fleet-wide red. Three attempts with a linear backoff
+          # absorb that, and the low-speed knobs turn a stalled connection into a fast failure rather
+          # than a hang to the job timeout. What does NOT get retried is the ANSWER: a fetch that
+          # keeps failing, and a commit that is simply not an ancestor, both still fail the step.
           #
           # `git` ECHOES THE REF ITSELF on a failed fetch (`upload-pack: not our ref <sha>`), which
           # looks like it contradicts the never-emit-the-raw-value rule above. It does not: the shape
@@ -599,17 +630,54 @@ jobs:
           # WHAT THIS STILL DOES NOT PROVE is that the pin is the CURRENT one: a stale-but-merged SHA
           # is an ancestor too, and lock-step against the commit `uses:` resolved to remains
           # unavailable from in here (see the header). Reviewing the caller still bounds that.
-          scratch=$(mktemp -d)
-          git init -q "$scratch"
-          if ! git -C "$scratch" fetch --quiet --depth=1 --no-tags https://github.com/Comfy-Org/github-workflows "$WORKFLOWS_REF"; then
-            echo "::error::workflows_ref (${safe_ref}) could not be fetched from Comfy-Org/github-workflows, so its provenance cannot be established. Failing closed."
+          #
+          # THE SCRATCH CLONE IS CLEANED UP on every path, success or rejection. Hosted runners are
+          # ephemeral and would not care; self-hosted ones would accumulate one clone of `main` per
+          # run, per job.
+          if ! scratch=$(mktemp -d); then
+            echo "::error::A scratch directory for the workflows_ref (${safe_ref}) ancestry check could not be created, so the pin's provenance cannot be established. This is an infrastructure fault, not evidence about the pin. Failing closed."
             exit 1
           fi
-          if ! git -C "$scratch" fetch --quiet --no-tags https://github.com/Comfy-Org/github-workflows +refs/heads/main:refs/heads/upstream-main; then
-            echo "::error::main of Comfy-Org/github-workflows could not be read, so workflows_ref (${safe_ref}) cannot be shown to be merged upstream. Failing closed."
+          trap 'rm -rf "$scratch"' EXIT
+          if ! git init -q "$scratch"; then
+            echo "::error::A scratch git repository for the workflows_ref (${safe_ref}) ancestry check could not be initialized, so the pin's provenance cannot be established. This is an infrastructure fault, not evidence about the pin. Failing closed."
             exit 1
           fi
-          if ! git -C "$scratch" merge-base --is-ancestor "$WORKFLOWS_REF" upstream-main; then
+          # The upstream URL is passed IN by each call site rather than baked in here, so that both
+          # fetches keep naming the repo literally, in the line a reviewer reads, while sharing one
+          # retry and transfer-bound policy. See the literal-URL note above for why it is not a var.
+          fetch_upstream() {
+            for attempt in 1 2 3; do
+              if git -C "$scratch" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 fetch --quiet --no-tags --filter=blob:none "$@"; then
+                return 0
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                sleep $((attempt * 5))
+              fi
+            done
+            return 1
+          }
+          if ! fetch_upstream --depth=1 https://github.com/Comfy-Org/github-workflows "$WORKFLOWS_REF"; then
+            echo "::error::workflows_ref (${safe_ref}) could not be fetched from Comfy-Org/github-workflows after 3 attempts, so its provenance cannot be established. Failing closed."
+            exit 1
+          fi
+          if ! fetch_upstream https://github.com/Comfy-Org/github-workflows +refs/heads/main:refs/heads/upstream-main; then
+            echo "::error::main of Comfy-Org/github-workflows could not be read after 3 attempts, so workflows_ref (${safe_ref}) cannot be shown to be merged upstream. Failing closed."
+            exit 1
+          fi
+          # `--is-ancestor` HAS THREE OUTCOMES, NOT TWO: 0 is yes, 1 is no, and anything above 1 is
+          # git failing to answer at all (an unresolvable `upstream-main`, a missing or corrupt
+          # object, a fetched ref that is not a commit). Collapsing those into the `no` branch would
+          # report an infrastructure fault to the consumer as "treat the pin-bump that introduced
+          # this as hostile" — the same cry-wolf the retry above exists to avoid. Both branches still
+          # fail closed; only the message differs.
+          ancestry_rc=0
+          git -C "$scratch" merge-base --is-ancestor "$WORKFLOWS_REF" upstream-main || ancestry_rc=$?
+          if [ "$ancestry_rc" -gt 1 ]; then
+            echo "::error::The ancestry test for workflows_ref (${safe_ref}) could not be COMPLETED — git merge-base failed rather than returning a verdict (see its output above). This is an infrastructure fault, not evidence the pin is hostile. Failing closed."
+            exit 1
+          fi
+          if [ "$ancestry_rc" -ne 0 ]; then
             echo "::error::workflows_ref (${safe_ref}) is not an ancestor of Comfy-Org/github-workflows main. A well-shaped SHA can still be a FORK-AUTHORED commit served out of this repo's own object network; only merged upstream commits may be pinned. If this is a genuine just-merged pin, re-run; otherwise treat the pin-bump that introduced it as hostile."
             exit 1
           fi
@@ -753,12 +821,29 @@ jobs:
           # (the repo is public), and every failure mode fails CLOSED: a fetch that errors, a `main`
           # that cannot be read, or a network outage all leave the step non-zero.
           #
-          # TWO FETCHES, NOT ONE. The depth-1 fetch is what proves the SHA exists in this repo's
-          # object network at all; the second brings `main` with an explicit refspec (rather than
-          # relying on remote-tracking config, which a bare-URL remote has none of) so that
-          # `merge-base --is-ancestor` walks a COMPLETE `main` history. The shallow boundary the first
-          # fetch leaves behind is harmless: the walk runs from `main` DOWN to the pinned commit and
-          # never needs that commit's parents.
+          # TWO FETCHES, NOT ONE, AND BOTH ARE BOUNDED. The depth-1 fetch is what proves the SHA
+          # exists in this repo's object network at all; the second brings `main` with an explicit
+          # refspec (rather than relying on remote-tracking config, which a bare-URL remote has none
+          # of) to walk down to the pin. `--filter=blob:none` holds both to a commit/tree graph — no
+          # file CONTENT is ever downloaded, because `merge-base` reads none. That bound matters most
+          # on the REJECTION path: when the pin is not an ancestor there is no shallow boundary
+          # anywhere in `main`'s ancestry, so the hostile pin is the case that fetches the MOST.
+          #
+          # THE SHALLOW BOUNDARY IS REAL, AND HARMLESS. The depth-1 fetch registers a boundary at the
+          # pinned commit and the server honours it on the second fetch, so `main` arrives TRUNCATED
+          # there — it is not a complete history and must not be reasoned about as one. What saves it
+          # is the direction of the walk: `merge-base --is-ancestor` runs from `main` DOWN to the
+          # pinned commit and stops on reaching it, so it never needs that commit's parents. Do not
+          # reorder these two fetches, or drop `--depth=1`, on the strength of a completeness the
+          # second fetch does not actually deliver.
+          #
+          # THE FETCH RETRIES; THE VERDICT DOES NOT. Two unauthenticated round-trips are now a hard
+          # precondition for every run in every enrolled consumer, and there is no opt-out — so a
+          # transient github.com error or a secondary rate limit on shared Actions egress would
+          # otherwise turn one bad minute into a fleet-wide red. Three attempts with a linear backoff
+          # absorb that, and the low-speed knobs turn a stalled connection into a fast failure rather
+          # than a hang to the job timeout. What does NOT get retried is the ANSWER: a fetch that
+          # keeps failing, and a commit that is simply not an ancestor, both still fail the step.
           #
           # `git` ECHOES THE REF ITSELF on a failed fetch (`upload-pack: not our ref <sha>`), which
           # looks like it contradicts the never-emit-the-raw-value rule above. It does not: the shape
@@ -770,17 +855,54 @@ jobs:
           # WHAT THIS STILL DOES NOT PROVE is that the pin is the CURRENT one: a stale-but-merged SHA
           # is an ancestor too, and lock-step against the commit `uses:` resolved to remains
           # unavailable from in here (see the header). Reviewing the caller still bounds that.
-          scratch=$(mktemp -d)
-          git init -q "$scratch"
-          if ! git -C "$scratch" fetch --quiet --depth=1 --no-tags https://github.com/Comfy-Org/github-workflows "$WORKFLOWS_REF"; then
-            echo "::error::workflows_ref (${safe_ref}) could not be fetched from Comfy-Org/github-workflows, so its provenance cannot be established. Failing closed."
+          #
+          # THE SCRATCH CLONE IS CLEANED UP on every path, success or rejection. Hosted runners are
+          # ephemeral and would not care; self-hosted ones would accumulate one clone of `main` per
+          # run, per job.
+          if ! scratch=$(mktemp -d); then
+            echo "::error::A scratch directory for the workflows_ref (${safe_ref}) ancestry check could not be created, so the pin's provenance cannot be established. This is an infrastructure fault, not evidence about the pin. Failing closed."
             exit 1
           fi
-          if ! git -C "$scratch" fetch --quiet --no-tags https://github.com/Comfy-Org/github-workflows +refs/heads/main:refs/heads/upstream-main; then
-            echo "::error::main of Comfy-Org/github-workflows could not be read, so workflows_ref (${safe_ref}) cannot be shown to be merged upstream. Failing closed."
+          trap 'rm -rf "$scratch"' EXIT
+          if ! git init -q "$scratch"; then
+            echo "::error::A scratch git repository for the workflows_ref (${safe_ref}) ancestry check could not be initialized, so the pin's provenance cannot be established. This is an infrastructure fault, not evidence about the pin. Failing closed."
             exit 1
           fi
-          if ! git -C "$scratch" merge-base --is-ancestor "$WORKFLOWS_REF" upstream-main; then
+          # The upstream URL is passed IN by each call site rather than baked in here, so that both
+          # fetches keep naming the repo literally, in the line a reviewer reads, while sharing one
+          # retry and transfer-bound policy. See the literal-URL note above for why it is not a var.
+          fetch_upstream() {
+            for attempt in 1 2 3; do
+              if git -C "$scratch" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 fetch --quiet --no-tags --filter=blob:none "$@"; then
+                return 0
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                sleep $((attempt * 5))
+              fi
+            done
+            return 1
+          }
+          if ! fetch_upstream --depth=1 https://github.com/Comfy-Org/github-workflows "$WORKFLOWS_REF"; then
+            echo "::error::workflows_ref (${safe_ref}) could not be fetched from Comfy-Org/github-workflows after 3 attempts, so its provenance cannot be established. Failing closed."
+            exit 1
+          fi
+          if ! fetch_upstream https://github.com/Comfy-Org/github-workflows +refs/heads/main:refs/heads/upstream-main; then
+            echo "::error::main of Comfy-Org/github-workflows could not be read after 3 attempts, so workflows_ref (${safe_ref}) cannot be shown to be merged upstream. Failing closed."
+            exit 1
+          fi
+          # `--is-ancestor` HAS THREE OUTCOMES, NOT TWO: 0 is yes, 1 is no, and anything above 1 is
+          # git failing to answer at all (an unresolvable `upstream-main`, a missing or corrupt
+          # object, a fetched ref that is not a commit). Collapsing those into the `no` branch would
+          # report an infrastructure fault to the consumer as "treat the pin-bump that introduced
+          # this as hostile" — the same cry-wolf the retry above exists to avoid. Both branches still
+          # fail closed; only the message differs.
+          ancestry_rc=0
+          git -C "$scratch" merge-base --is-ancestor "$WORKFLOWS_REF" upstream-main || ancestry_rc=$?
+          if [ "$ancestry_rc" -gt 1 ]; then
+            echo "::error::The ancestry test for workflows_ref (${safe_ref}) could not be COMPLETED — git merge-base failed rather than returning a verdict (see its output above). This is an infrastructure fault, not evidence the pin is hostile. Failing closed."
+            exit 1
+          fi
+          if [ "$ancestry_rc" -ne 0 ]; then
             echo "::error::workflows_ref (${safe_ref}) is not an ancestor of Comfy-Org/github-workflows main. A well-shaped SHA can still be a FORK-AUTHORED commit served out of this repo's own object network; only merged upstream commits may be pinned. If this is a genuine just-merged pin, re-run; otherwise treat the pin-bump that introduced it as hostile."
             exit 1
           fi
