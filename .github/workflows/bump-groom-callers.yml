@@ -95,26 +95,50 @@ jobs:
           # this token must reach are not knowable at authoring time — and naming
           # them here would leak private caller names into a public file.
           #
-          # The permissions are deliberately LEFT UNSET (BE-6482), so this token
-          # inherits every permission the App holds. That is a real least-privilege
-          # regression from the `permission-contents`/`pull-requests`/`issues` trio
-          # this step used to downscope to, and it is unavoidable: the bumper now
-          # READS this repo's caller roster from an Actions variable at run time
-          # (so the roster never reaches a public run log through the step env),
-          # and a downscoped App token CANNOT read Actions variables — GitHub's
-          # `app-permissions` schema, the installation-token request body, has no
-          # `variables` key at all, so there is no `permission-variables` input to
-          # ask for in ANY version of create-github-app-token. Asking for nothing
-          # is the only spelling that yields a token with the App's "Variables:
-          # read" grant, which is what the other entrypoints in this family have
-          # always minted. The token still only ever commits the rewritten caller
+          # This is the WRITE token and it STAYS downscoped to the three
+          # permissions the bumper actually uses: it commits the rewritten caller
           # file (contents), opens/updates the bump PR (pull-requests) and stamps
-          # its label (issues).
+          # its label (issues). A downscoped token cannot read Actions variables,
+          # so the run-time roster read (BE-6482) does NOT use this token — the
+          # separate, repo-scoped var_token step below does. Do not merge the two:
+          # one token for both jobs would have to be minted with no `permission-*`
+          # inputs AND owner-wide, i.e. full installation permissions on every repo
+          # the App is installed on, just to read one variable.
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
           owner: Comfy-Org
+
+      # A SECOND app token, for the ROSTER READ ALONE. Scoped to THIS repo
+      # (`repositories: github-workflows` — public, so nothing leaks by naming it)
+      # and deliberately left un-downscoped, so it carries the App's
+      # "Variables: read" grant: the `app-permissions` schema — the
+      # installation-token request body — has no `variables` key at all, so there
+      # is no `permission-variables` input to ask for in ANY version of
+      # create-github-app-token, and asking for nothing is the only spelling that
+      # yields that grant (BE-6477).
+      #
+      # It exists so the WRITE token above can stay downscoped. One token serving
+      # both purposes would have to be un-downscoped AND owner-wide — full
+      # installation permissions on EVERY repo the App is installed on, most of
+      # them private callers — purely to enable one read of this repo's own
+      # variable. This token is un-downscoped too, but `repositories:` confines it
+      # to this ONE public repo, so that is the whole of its blast radius.
+      - name: Generate roster-read token (this repo only)
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0 — pinned: see dependabot.yml ignore (v2+ breaks cross-repo `owner:` token scoping)
+        id: var_token
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+          owner: Comfy-Org
+          repositories: github-workflows
 
       - name: Bump SHA in caller repos
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
+          # The this-repo-only token, used ONLY for the roster read, so the write
+          # token above can stay downscoped (BE-6482 review).
+          VAR_TOKEN: ${{ steps.var_token.outputs.token }}
           NEW_SHA: ${{ github.sha }}
           # Names the fleet's Actions variable. bump-callers.sh READS the roster
           # out of it at run time (BE-6482) — it is deliberately NOT passed in

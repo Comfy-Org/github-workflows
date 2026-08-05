@@ -163,11 +163,31 @@ the step's `env:` block any more (BE-6482). That binding was the leak: Actions
 prints a step's env block *before* the step runs, so the raw roster reached the
 public log ahead of the masking meant to cover it. Fetching inside the script
 puts the read, the shape check and the `::add-mask::` in an order the log cannot
-get in front of. Two consequences worth knowing: each entrypoint's App token is
-minted with **no** `permission-*` downscoping (a downscoped token cannot read
-Actions variables — the app-permissions schema has no `variables` key, so there
-is no input to ask for), and the App itself needs the repository **Variables:
-read** permission or every fleet fails with an explicit error naming that grant.
+get in front of.
+
+Two consequences worth knowing:
+
+- **Two tokens, not one.** A downscoped App token cannot read Actions variables
+  — the app-permissions schema (the installation-token request body) has no
+  `variables` key, so there is no `permission-variables` input to ask for, and
+  only a token minted with *no* `permission-*` inputs carries the App's
+  **Variables: read** grant. Rather than widen the token that writes across the
+  whole fleet, each entrypoint mints a **second** token scoped to this repo alone
+  (`repositories: github-workflows`) and hands it to the script as `VAR_TOKEN`,
+  used for the roster read and nothing else. The write token (`GH_TOKEN`) keeps
+  its `contents` / `pull-requests` / `issues` downscoping. `VAR_TOKEN` is
+  optional: unset, the read falls back to `GH_TOKEN` (manual runs).
+- **The App needs the grant.** The Cloud Code Bot App itself must hold the
+  repository permission **Variables: read**, approved on the Comfy-Org
+  installation, or every fleet fails with an explicit error naming that grant.
+
+The read tries the **repo-level** variable first and falls back to the
+**org-level** one, matching what the `${{ vars.* }}` binding it replaced
+resolved (repo wins on a name clash). Absent at both scopes is an *empty roster*
+— handled by `ALLOW_EMPTY` exactly as an empty variable is — but it always logs
+a `::warning::`, because a 404 is also how GitHub answers "this token cannot see
+the repository at all".
+
 `CALLERS_JSON` still works as an explicit override for a manual run and is what
 the test suite drives; a set-but-empty value means "empty roster", not "fetch".
 
