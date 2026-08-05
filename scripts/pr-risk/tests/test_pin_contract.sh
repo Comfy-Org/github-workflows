@@ -41,9 +41,18 @@
 # `if [[ -n "$REF" ]] && echo "$REF" >> "$GITHUB_STEP_SUMMARY"` passed), its TRIGGER was itself a
 # blacklist (so `printenv WORKFLOWS_REF` and `set -euxo pipefail` were invisible), and a `has`
 # needle proves a test is PRESENT, never that it is the only path to the checkout. A trust
-# boundary this small — nine executable lines — is better served by an equality: the body is what
-# it is below, or the build is red. Widening it is then a deliberate two-place edit whose diff a
-# reviewer sees, which is the property all those scans were reaching for.
+# boundary this small — a couple of dozen executable lines — is better served by an equality: the
+# body is what it is below, or the build is red. Widening it is then a deliberate two-place edit
+# whose diff a reviewer sees, which is the property all those scans were reaching for.
+#
+# THE NAMED PROPERTIES ARE RESTATEMENTS, NOT THE DEFENCE. A few of the patterns disparaged above
+# do appear below — the ancestry anchor, the literal-URL check, "every `::error::` is followed by
+# an `exit 1`". They are not a second line of defence and must never be read as one: the equality
+# already fails on every mutation they catch, and each of them is exactly as bypassable as the
+# earlier drafts showed. They are here so that the COMMON failure — someone editing the guard on
+# purpose — reports WHICH invariant they broke instead of only printing a diff of the whole body.
+# A new property in this file is worth adding when it names a rule; it is never worth adding as a
+# substitute for extending the pinned body.
 #
 # STRUCTURE IS PINNED; PROSE IS NOT. The `::error::` message is free to be reworded (it is
 # canonicalized away before the comparison) but is separately checked to expand nothing but the
@@ -177,6 +186,20 @@ expect="$(cat <<'PINNED'
             echo "::error::<message>"
             exit 1
           fi
+          scratch=$(mktemp -d)
+          git init -q "$scratch"
+          if ! git -C "$scratch" fetch --quiet --depth=1 --no-tags https://github.com/Comfy-Org/github-workflows "$WORKFLOWS_REF"; then
+            echo "::error::<message>"
+            exit 1
+          fi
+          if ! git -C "$scratch" fetch --quiet --no-tags https://github.com/Comfy-Org/github-workflows +refs/heads/main:refs/heads/upstream-main; then
+            echo "::error::<message>"
+            exit 1
+          fi
+          if ! git -C "$scratch" merge-base --is-ancestor "$WORKFLOWS_REF" upstream-main; then
+            echo "::error::<message>"
+            exit 1
+          fi
 PINNED
 )"
 # Blank lines are noise here (the slicer keeps them so the byte-identity check above sees them),
@@ -200,6 +223,47 @@ if [ -n "$errline" ] && [ "${stripped#*\$}" = "$stripped" ]; then
 else
   bad "the annotation expands nothing but the sanitized copy" "$errline"
 fi
+
+# --- the ancestry axis, stated by name ---------------------------------------------------------
+# All three assertions below are CONSEQUENCES of the equality above — deleting the ancestry block
+# from both copies already fails it. They are restated by name for the same reason the env-binding
+# rule is: a failure that says "the guard no longer asserts ancestry" beats one that only prints a
+# diff, and the axis is the whole reason a fork-authored SHA cannot be checked out here. Each one
+# carries its own coverage self-check, so a stale anchor fails loudly rather than passing vacuously.
+ANCESTRY_LINE='          if ! git -C "$scratch" merge-base --is-ancestor "$WORKFLOWS_REF" upstream-main; then'
+nancestry=$(grep -cxF "$ANCESTRY_LINE" "$WF")
+eq "every copy of the guard asserts the pin is an ancestor of upstream main" "$guards" "$nancestry"
+
+# THE URL MUST BE A LITERAL. `github.repository` names the CALLER inside a reusable workflow and
+# `github.job_workflow_ref` only repeats the caller's `uses:` string, so nothing in the `github`
+# context can name THIS repo — which makes any expression in this position an alias a fork could
+# point back at itself, turning "is it an ancestor of upstream main?" into "is it an ancestor of
+# the attacker's main?". Comments are stripped first so the prose above the axis, which names the
+# URL, cannot satisfy this. Tokenizing on spaces and keeping the URL-shaped words is what makes a
+# `${{ github.server_url }}/${{ github.repository }}` substitution fail rather than sneak through:
+# neither fragment is URL-shaped, so the comparison sees an empty set instead of the literal.
+UPSTREAM_URL='https://github.com/Comfy-Org/github-workflows'
+fetchlines="$(grep -v '^[[:space:]]*#' "$WF" | grep -F 'git -C "$scratch" fetch')"
+nfetch=$(printf '%s\n' "$fetchlines" | grep -cF 'git -C "$scratch" fetch')
+if [ "$nfetch" = "$((guards * 2))" ]; then ok "the ancestry fetch scan matched both fetches in every copy ($nfetch)"
+else bad "the ancestry fetch scan matched both fetches in every copy" "$nfetch of $((guards * 2)) — anchors are stale, coverage is vacuous"; fi
+urltokens="$(printf '%s\n' "$fetchlines" | tr ' ' '\n' | grep -E '://|github\.com' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+eq "the ancestry fetch names the upstream repo by literal URL, never an expression" "$UPSTREAM_URL" "$urltokens"
+
+# EVERY REJECTION PATH IS FATAL. The ancestry axis adds two of them — an unfetchable SHA and a
+# non-ancestor one — and a rejection that annotates without exiting lets the checkout proceed on
+# exactly the ref the axis just rejected.
+fatal="$(printf '%s\n' "$code" | awk '
+  /::error::/ { pending = NR; next }
+  pending && $0 !~ /^[[:space:]]*exit 1[[:space:]]*$/ { print "NOEXIT:" pending }
+  { pending = 0 }
+  END { if (pending) print "NOEXIT:" pending }
+' | tr '\n' ' ' | sed 's/ $//')"
+eq "every ::error:: in the guard is immediately followed by exit 1" "" "$fatal"
+nerr=$(printf '%s\n' "$code" | grep -cF '::error::')
+if [ "$nerr" -ge 3 ]; then ok "the fatality scan saw every rejection path ($nerr)"
+else bad "the fatality scan saw every rejection path" "$nerr — anchors are stale, coverage is vacuous"; fi
+no "no path through the guard exits 0 early" "$code" "exit 0"
 
 # --- the guard cannot be neutered while staying byte-identical --------------------------------
 # The cheapest way to disarm this without tripping any check above is a step-level key:
