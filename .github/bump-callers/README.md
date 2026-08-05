@@ -16,7 +16,11 @@ forward automatically instead of silently drifting commits behind.
     @SHORT" diff) and, if a bump PR is already open, refreshes its title/body to
     the new SHA rather than opening another. A fresh PR is opened only when none
     is open (first bump, or the prior one merged/closed since the last run).
-- **`tests/`** — a `bash` functional suite (stubs `gh`, no network), run by
+- **`preflight.sh`** — the staleness/decommission guard that runs *before* the
+  bump script (see [Preflight](#preflight) below). Also one file on purpose: it
+  was an inline copy in every entrypoint, and the copies drifted.
+- **`tests/`** — `bash` functional suites (stubs `gh` / builds throwaway local
+  repos; no network), run by
   [`test-bump-callers.yml`](../workflows/test-bump-callers.yml) plus shellcheck.
 
 ## The fleets
@@ -103,6 +107,82 @@ annotate, so they are refreshed only when the file is provably ours alone;
 otherwise they are left as found and the run logs a warning. Inert for every
 caller today (all call exactly one reusable); it exists so a caller that starts
 calling two cannot be corrupted.
+
+## Preflight
+
+Before an entrypoint may bump anything it has to answer two questions: is this
+run **stale** (has a later commit already touched the watched surface, so *that*
+commit has its own run?), and has the watched surface been **decommissioned**
+(deleted, so pinning callers to this SHA would break every one of them)?
+
+`preflight.sh` is that guard. It used to be an inline copy in each
+`bump-*-callers.yml`, and the copies drifted — several skipped on a bare tip
+mismatch, which throws away the only run for a change and freezes every caller,
+and the one that compared content forgot to re-point the pin at the verified tip.
+The extracted script deliberately adopts the hardened semantics: exact-refname
+tip parse (a branch literally named `foo/refs/heads/main` matches the ls-remote
+pattern at component boundaries and must not be consumed), `FETCH_HEAD`
+verification before any object is read out of it, deletion tested through the
+`$WATCHED` **variable** rather than a second copy of the literal path, and the
+re-point that pins callers to the verified tip instead of a stale `github.sha`.
+
+| Input (env) | |
+|---|---|
+| `WATCHED` | **required** — repo-relative path of the watched reusable workflow (e.g. `.github/workflows/groom.yml`) |
+| `WATCHED_ASSETS` | optional — the watched asset directory (e.g. `.github/groom`). Empty/unset means the fleet is single-path |
+| `NEW_SHA` | the candidate SHA, normally `github.sha` |
+| `GITHUB_SHA`, `GITHUB_OUTPUT` | provided by Actions |
+
+| Output (step output) | |
+|---|---|
+| `proceed` | `true` → run `bump-callers.sh`; `false` → stale or decommissioned, do nothing |
+| `new_sha` | the SHA to pin — `NEW_SHA`, or the verified main tip when the run was re-pointed forward |
+
+Both outputs are written on **every** exit-0 path. The script exits non-zero only
+for a lookup it could not perform (failed `ls-remote`, failed fetch, unresolvable
+`FETCH_HEAD`): a lookup we couldn't perform is not evidence of staleness, so it
+fails loudly rather than silently no-opping the fleet.
+
+**A multi-path fleet must pass `WATCHED_ASSETS`.** The re-point is only sound
+because every entry in the fleet's `paths:` trigger is covered by the comparison
+— for `cursor-review` / `groom` / `pr-size` that includes the asset directory the
+reusable loads its prompts/scripts/briefs from at run time. Compare `WATCHED`
+alone on one of those and a commit touching only the assets reads as "unchanged",
+so callers get pinned to a tip whose other relevant content was never verified.
+If you widen a fleet's path filter, widen these inputs in the same change.
+
+Consumption is two steps — the guard, then the bump gated on its output:
+
+```yaml
+      - name: Preflight (staleness / decommission guard)
+        id: preflight
+        env:
+          WATCHED: .github/workflows/groom.yml
+          WATCHED_ASSETS: .github/groom   # omit for a single-path fleet
+          NEW_SHA: ${{ github.sha }}
+        run: bash .github/bump-callers/preflight.sh
+
+      - name: Bump SHA in caller repos
+        if: steps.preflight.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          NEW_SHA: ${{ steps.preflight.outputs.new_sha }}
+          # …VAR_NAME / TAG / WORKFLOW_FILE / CALLERS_JSON as before
+        run: bash .github/bump-callers/bump-callers.sh
+```
+
+`new_sha` is a **step output**, not a `$GITHUB_ENV` export, and the consuming
+step reads it through its own `env:` binding. That is deliberate: a step-level
+`env: NEW_SHA:` takes precedence over the job environment, so a `$GITHUB_ENV`
+write would be silently overridden by the very binding it is meant to correct.
+
+> **The entrypoints still carry their inline copies.** Swapping them over to this
+> script is a separate change. `bump-pr-risk-callers.yml` needs a decision rather
+> than a swap: its copy has hardening this one does not implement — a
+> `git rev-list` "did a later *commit* touch a watched path" test (rather than a
+> net-content comparison) and an is-ancestor check that refuses to pin an
+> orphaned commit — so folding it in, or keeping that fleet on its own guard, has
+> to be chosen deliberately, not by deleting the checks.
 
 ## How the pin rewrite is scoped (and why it asserts afterwards)
 
