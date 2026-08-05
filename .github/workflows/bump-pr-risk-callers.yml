@@ -21,26 +21,29 @@ name: Bump pr-risk callers
 # The caller list is NOT hardcoded here. This repo is PUBLIC (workflow file and
 # Actions run logs are both publicly viewable), and most callers are private, so
 # their names must never appear in this file or its logs. The list lives in the
-# repo-level Actions variable `PR_RISK_CALLERS` (config, not a credential — a
-# variable, not a secret, since secrets are write-only via the API) as a JSON
-# array of {"repo","file","label"} objects, same shape as the other fleets'
-# variables. `bump-callers.sh` `::add-mask::`es every repo name before IT echoes
-# anything.
-# KNOWN GAP (shared by every entrypoint in this family, tracked separately):
-# passing the roster through this step's `env:` means Actions prints the raw
-# value in the step's env dump before the script — and its masking — ever runs.
-# Closing it means reading the variable at run time (`gh variable get`) and
-# masking it first, which needs a token permission this fleet does not mint
-# today; it is a fleet-wide change, not one this entrypoint can make alone.
-# Until then, treat the roster as visible in the public run log.
-# The variable is seeded EMPTY (`[]`) — an empty list is a clean no-op here
-# (ALLOW_EMPTY below); the rollout's per-repo caller tickets add entries as
-# callers land.
+# repo-level Actions SECRET `PR_RISK_CALLERS` as a JSON array of
+# {"repo","file","label"} objects, same shape as the other fleets' rosters. An
+# empty list (`[]`, or an unset secret) is a clean no-op here (ALLOW_EMPTY
+# below); the rollout's per-repo caller tickets add entries as callers land.
+#
+# A SECRET, not a variable (BE-6472): the roster reaches the script through the
+# step's `env:` below, and Actions prints that env block BEFORE the step runs —
+# so a variable's raw value was published in this public repo's run log ahead of
+# any masking the script could do (the KNOWN GAP this header used to carry). A
+# secret is runner-masked everywhere, that dump included. The cost is read-back:
+# there is no `gh secret get`, so the canonical callers.json in the private ops
+# repo is the sole source of truth, and the run instead logs a count + sha256
+# fingerprint of the roster it used (reproduce with `jq -cS . callers.json |
+# sha256sum`) so an edit can be audited against it.
+# `bump-callers.sh` still `::add-mask::`es every repo name before IT echoes
+# anything — Actions masks the roster as ONE exact string, not each name inside
+# it, so a name echoed on its own would otherwise print in the clear.
+# NOTE: this fleet's roster is still UNSEEDED — the secret exists only once
+# someone sets it (see the update flow below).
 #
 # Update flow — adding/removing a caller needs NO public commit:
-#   gh variable set PR_RISK_CALLERS --repo Comfy-Org/github-workflows \
-#     --body "$(jq -c . callers.json)"
-# Keep the canonical callers.json in a PRIVATE infra/ops repo so variable edits
+#   jq -c . callers.json | gh secret set PR_RISK_CALLERS --repo Comfy-Org/github-workflows
+# Keep the canonical callers.json in a PRIVATE infra/ops repo so roster edits
 # have a reviewed source of truth; the org audit log records each edit. (The
 # specific home repo is intentionally not named here — this file is public.)
 #
@@ -113,7 +116,7 @@ jobs:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
           # `owner:` with no `repositories:` is deliberate and cannot be narrowed:
-          # the caller list is a runtime variable (see the header), so the repos
+          # the caller list is a runtime secret (see the header), so the repos
           # this token must reach are not knowable at authoring time — and naming
           # them here would leak private caller names into a public file.
           #
@@ -133,17 +136,22 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
           NEW_SHA: ${{ github.sha }}
+          # Names the roster to fix in an error message. It is a SECRET now, not a
+          # variable; the env key keeps its historical name so every fleet's
+          # entrypoint and the shared script stay in step.
           VAR_NAME: PR_RISK_CALLERS
           TAG: pr-risk
           WORKFLOW_FILE: pr-risk.yml
-          # Seeded empty; an empty list is a clean no-op, not an error.
+          # An empty roster — `[]`, or a secret nobody has set — is a clean no-op
+          # here, not an error.
           ALLOW_EMPTY: "true"
           # JSON array of {"repo","file","label"} — see the header comment for the
-          # update flow. Kept in a variable (not the file) so private caller names
-          # never land in this public repo. NOTE: this env binding is itself the
-          # known log-exposure gap documented in the header — Actions dumps the
-          # step env before the script's `::add-mask::` runs.
-          CALLERS_JSON: ${{ vars.PR_RISK_CALLERS }}
+          # update flow. Kept in a repo-level SECRET (not this file, and not a
+          # variable) so private caller names never land in this public repo. Actions
+          # dumps this step's env BEFORE the script — and its `::add-mask::` calls —
+          # can run, which is exactly why the roster must be a secret: the runner
+          # masks it in that dump. A variable here was the BE-6472 leak.
+          CALLERS_JSON: ${{ secrets.PR_RISK_CALLERS }}
         run: |
           # The main-only ref guard above cannot catch a manual RE-RUN of an
           # older main run: github.ref is refs/heads/main but github.sha is

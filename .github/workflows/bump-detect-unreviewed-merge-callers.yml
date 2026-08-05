@@ -22,28 +22,30 @@ name: Bump detect-unreviewed-merge callers
 # The caller list is NOT hardcoded here. This repo is PUBLIC (workflow file and
 # Actions run logs are both publicly viewable), and most callers are private, so
 # their names must never appear in this file or its logs. The list lives in the
-# repo-level Actions variable `DETECT_UNREVIEWED_MERGE_CALLERS` (config, not a
-# credential — a variable, not a secret, since secrets are write-only via the
-# API) as a JSON array of {"repo","file","label"} objects, same shape as the
-# other fleets' variables. `bump-callers.sh` `::add-mask::`es every repo name
-# before IT echoes anything.
-# KNOWN GAP (shared by every bump-* entrypoint, tracked separately): passing the
-# roster through this step's `env:` means Actions prints the raw value in the
-# step's env dump before the script — and its masking — ever runs. Closing it
-# means reading the variable at run time (`gh variable get`) and masking it
-# first, which needs a token permission this fleet does not mint today; it is a
-# fleet-wide change, not one this entrypoint can make alone. Until then, treat
-# the roster as visible in the public run log.
+# repo-level Actions SECRET `DETECT_UNREVIEWED_MERGE_CALLERS` as a JSON array of
+# {"repo","file","label"} objects, same shape as the other fleets' rosters.
 #
-# CONSEQUENCE — this fleet ships DELIBERATELY UNSEEDED. Every other seeded fleet
-# already publishes its roster this way, so their names are out; this fleet's
-# callers include two non-public repos that no existing roster contains, and
-# seeding before the masking fix lands would publish them on the very first run.
-# A public log entry cannot be unpublished; a red run can. So the variable stays
-# unset until the masking fix lands, and the resulting hard-fail is the
-# intentional nag (see ALLOW_EMPTY below) rather than an oversight. Seed it —
-# `gh variable set` per the update flow below — as the immediate follow-on to
-# that fix, NOT as a way to turn the red run green.
+# A SECRET, not a variable (BE-6472): the roster reaches the script through the
+# step's `env:` below, and Actions prints that env block BEFORE the step runs —
+# so a variable's raw value was published in this public repo's run log ahead of
+# any masking the script could do. That was the KNOWN GAP this header used to
+# document — the very gap that kept THIS fleet unseeded. A secret is
+# runner-masked everywhere, that dump included. The cost is read-back: there is
+# no `gh secret get`, so the canonical callers.json in the private ops repo is
+# the sole source of truth, and the run instead logs a count + sha256 fingerprint
+# of the roster it used so an edit can be audited against it. `bump-callers.sh`
+# still `::add-mask::`es every repo name before IT echoes anything — Actions
+# masks the roster as ONE exact string, not each name inside it, so a name echoed
+# on its own would otherwise print in the clear.
+#
+# STILL UNSEEDED, for now. This fleet's callers include two non-public repos that
+# no already-seeded roster contains, so it deliberately shipped unset rather than
+# publish them on its first run: a public log entry cannot be unpublished, a red
+# run can. The masking blocker above is now GONE, so seeding is unblocked and is
+# tracked as the immediate follow-on to this change — but it is a separate step
+# and has not happened yet, so the hard-fail below (see ALLOW_EMPTY) is still the
+# intentional nag rather than an oversight. Seed it with `gh secret set` per the
+# update flow below as that follow-on, NOT as a way to turn the red run green.
 #
 # ALLOW_EMPTY is set to "false" below — already `bump-callers.sh`'s default, but
 # stated explicitly (as `bump-auto-label-callers.yml` does) so the property
@@ -53,18 +55,16 @@ name: Bump detect-unreviewed-merge callers
 # noticing, exactly the drift this directory exists to prevent.
 #
 # READ THIS BEFORE ACTING ON A RED RUN. An empty roster right now is the EXPECTED
-# PRE-SEED STATE described above, not a clobbered variable. Until the masking fix
-# lands, the correct response to that red run is to leave it red — do NOT "fix"
-# it by seeding the variable, which is precisely the irreversible disclosure this
-# header exists to prevent. Once masking is in place, seeding is the follow-on
-# and the run goes green on its own. (After that point, and only after it, an
-# empty roster does mean the variable was clobbered and should be restored.)
-# Either way the answer is never to flip ALLOW_EMPTY on.
+# PRE-SEED STATE described above, not a clobbered roster. The right response is
+# to seed the SECRET (`gh secret set`, update flow below) as the tracked
+# follow-on — deliberately, from the canonical callers.json, not reflexively to
+# turn the run green. Once it is seeded, and only after that point, an empty
+# roster does mean the secret was clobbered and should be restored. Either way
+# the answer is never to flip ALLOW_EMPTY on.
 #
 # Update flow — adding/removing a caller needs NO public commit:
-#   gh variable set DETECT_UNREVIEWED_MERGE_CALLERS --repo Comfy-Org/github-workflows \
-#     --body "$(jq -c . callers.json)"
-# Keep the canonical callers.json in a PRIVATE infra/ops repo so variable edits
+#   jq -c . callers.json | gh secret set DETECT_UNREVIEWED_MERGE_CALLERS --repo Comfy-Org/github-workflows
+# Keep the canonical callers.json in a PRIVATE infra/ops repo so roster edits
 # have a reviewed source of truth; the org audit log records each edit. (The
 # specific home repo is intentionally not named here — this file is public.)
 
@@ -125,7 +125,7 @@ jobs:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
           # `owner:` with no `repositories:` is deliberate and cannot be narrowed:
-          # the caller list is a runtime variable (see the header), so the repos
+          # the caller list is a runtime secret (see the header), so the repos
           # this token must reach are not knowable at authoring time — and naming
           # them here would leak private caller names into a public file.
           #
@@ -145,6 +145,9 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
           NEW_SHA: ${{ github.sha }}
+          # Names the roster to fix in an error message. It is a SECRET now, not a
+          # variable; the env key keeps its historical name so every fleet's
+          # entrypoint and the shared script stay in step.
           VAR_NAME: DETECT_UNREVIEWED_MERGE_CALLERS
           TAG: detect-unreviewed-merge
           WORKFLOW_FILE: detect-unreviewed-merge.yml
@@ -154,15 +157,17 @@ jobs:
           # loudly regardless of what that default becomes. RIGHT NOW that
           # failure is EXPECTED — the roster ships unseeded until the masking
           # fix lands (header, "READ THIS BEFORE ACTING ON A RED RUN"). Do NOT
-          # respond to it by seeding the variable; only after masking is in
-          # place does an empty roster mean it was clobbered.
+          # respond to it by reflexively seeding the secret to go green; seed it
+          # deliberately, from the canonical callers.json, as the tracked
+          # follow-on. Only after that does an empty roster mean it was clobbered.
           ALLOW_EMPTY: "false"
           # JSON array of {"repo","file","label"} — see the header comment for the
-          # update flow. Kept in a variable (not the file) so private caller names
-          # never land in this public repo. NOTE: this env binding is itself the
-          # known log-exposure gap documented in the header — Actions dumps the
-          # step env before the script's `::add-mask::` runs.
-          CALLERS_JSON: ${{ vars.DETECT_UNREVIEWED_MERGE_CALLERS }}
+          # update flow. Kept in a repo-level SECRET (not this file, and not a
+          # variable) so private caller names never land in this public repo. Actions
+          # dumps this step's env BEFORE the script — and its `::add-mask::` calls —
+          # can run, which is exactly why the roster must be a secret: the runner
+          # masks it in that dump. A variable here was the BE-6472 leak.
+          CALLERS_JSON: ${{ secrets.DETECT_UNREVIEWED_MERGE_CALLERS }}
         run: |
           # The main-only ref guard above cannot catch a manual RE-RUN of an
           # older main run: github.ref is refs/heads/main but github.sha is

@@ -8,32 +8,35 @@ name: Test bump-callers script
 # repo's pin auto-bump (or, worse, leaks a private caller name into this public
 # repo's run logs) — cheap to guard with a unit run on change. Mirrors
 # test-cursor-review-scripts.yml / test-agents-md-integrity.yml.
+#
+# The suite also runs a STATIC source check over every `bump-*-callers.yml`
+# (BE-6472): each must feed CALLERS_JSON from `${{ secrets.* }}`, never
+# `${{ vars.* }}`. That is why the entrypoints are in the path filters below —
+# a change to one of them re-runs the guard.
 
+# The two `paths:` lists below are duplicated on purpose — GitHub Actions does
+# not support YAML anchors/aliases in a workflow file, so they cannot be shared.
+# Keep them identical.
 on:
   pull_request:
     paths:
       - '.github/bump-callers/**'
-      - '.github/workflows/bump-cursor-review-callers.yml'
-      - '.github/workflows/bump-agents-md-callers.yml'
-      - '.github/workflows/bump-pr-size-callers.yml'
-      - '.github/workflows/bump-pr-risk-callers.yml'
-      - '.github/workflows/bump-assign-reviewers-callers.yml'
-      - '.github/workflows/bump-groom-callers.yml'
-      - '.github/workflows/bump-auto-label-callers.yml'
-      - '.github/workflows/bump-detect-unreviewed-merge-callers.yml'
+      # A GLOB, not the eight entrypoints spelled out (BE-6472). The suite now
+      # carries a STATIC guard asserting every entrypoint feeds CALLERS_JSON
+      # from a secret rather than a variable — a variable is printed unmasked in
+      # the step env dump Actions emits before the step, publishing private
+      # caller names in this public repo's logs. An enumerated filter silently
+      # exempts the next fleet somebody adds, which is exactly the file most
+      # likely to be copied from a pre-migration template. The glob covers it on
+      # day one. (`bump-cursor-cli-pin.yml` is not a caller fleet — it does not
+      # match this pattern and is not meant to.)
+      - '.github/workflows/bump-*-callers.yml'
       - '.github/workflows/test-bump-callers.yml'
   push:
     branches: [main]
     paths:
       - '.github/bump-callers/**'
-      - '.github/workflows/bump-cursor-review-callers.yml'
-      - '.github/workflows/bump-agents-md-callers.yml'
-      - '.github/workflows/bump-pr-size-callers.yml'
-      - '.github/workflows/bump-pr-risk-callers.yml'
-      - '.github/workflows/bump-assign-reviewers-callers.yml'
-      - '.github/workflows/bump-groom-callers.yml'
-      - '.github/workflows/bump-auto-label-callers.yml'
-      - '.github/workflows/bump-detect-unreviewed-merge-callers.yml'
+      - '.github/workflows/bump-*-callers.yml'
       - '.github/workflows/test-bump-callers.yml'
 
 permissions:

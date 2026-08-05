@@ -34,7 +34,7 @@ jobs:
     uses: Comfy-Org/github-workflows/.github/workflows/assign-prs-to-author.yml@<full-commit-sha>
 ```
 
-This workflow has no `vars.*_CALLERS` roster — there is no bump fleet for it
+This workflow has no `*_CALLERS` roster secret — there is no bump fleet for it
 (see [Staying current](README.md#staying-current)) — so there is no enrollment
 step 2, and pin bumps are manual. Check periodically that your pin is not far
 behind `main`.

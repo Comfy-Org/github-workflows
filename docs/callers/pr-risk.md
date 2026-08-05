@@ -61,7 +61,7 @@ jobs:
 
 This workflow has no roster yet — it has no fleet of pinned callers to track
 (see [Staying current](README.md#staying-current)), so there is no
-`vars.*_CALLERS` entry to add.
+`*_CALLERS` roster-secret entry to add.
 
 ## Required permissions
 

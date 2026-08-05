@@ -123,13 +123,16 @@ tests — run the matching command above for whatever you touched.
 ## Conventions & gotchas
 
 - **Public repo — never leak private caller names.** Consumer repo lists live in
-  repo **variables** — one per fleet (`CURSOR_REVIEW_CALLERS`,
+  repo **secrets** — one per fleet (`CURSOR_REVIEW_CALLERS`,
   `AUTO_LABEL_CALLERS`, `AGENTS_MD_CALLERS`, `PR_SIZE_CALLERS`,
   `PR_RISK_CALLERS`, `ASSIGN_REVIEWERS_CALLERS`, `GROOM_CALLERS`,
   `DETECT_UNREVIEWED_MERGE_CALLERS`; the bump-callers README table is canonical)
   — never hardcoded in a workflow file or printed to run logs (logs are public).
-  The bumper masks names it processes. Keep private repo paths/detail out of
-  workflow files, commit messages, and PR text.
+  Secrets, not variables (BE-6472): a variable passed via a step's `env:` prints
+  unmasked in the env dump Actions emits *before* the step, so the bumper's own
+  masking can never run early enough; a secret is masked there too. The bumper
+  still masks each name. Keep private repo paths/detail out of workflow files,
+  commit messages, and PR text.
 - **Pin everything by full commit SHA**, with a trailing `# v1` comment — both
   the `uses:` in callers and every third-party action here. Bare `@v1` fails the
   pin-validation (`pinact`, `zizmor`) that consumer CI runs. See README "Pinning".
@@ -145,11 +148,12 @@ tests — run the matching command above for whatever you touched.
   callers). Do not fork the script — a forked copy is how other shared org
   machinery has drifted.
 - **Enrolling a caller is TWO steps.** Merge the caller, *and* add the repo to
-  its `vars.*_CALLERS` roster. Skipping the second is the most repeated mistake
+  its `*_CALLERS` roster secret. Skipping the second is the most repeated mistake
   here: the pin then never moves, the caller drifts behind the reusable, and it
   fails at startup much later with no obvious cause. This repo did it to its own
-  `ci-groom.yml`. When auditing, compare the roster against reality in both
-  directions — a roster entry whose caller file does not exist is equally broken.
+  `ci-groom.yml`. Rosters are write-only secrets — audit the canonical
+  `callers.json` (the run log prints a matching count + sha256) against reality
+  both ways; an entry whose caller file does not exist is equally broken.
 - **New reusable workflow?** `on: workflow_call` + a header comment documenting
   inputs/secrets/triggers + a caller-pattern example, then a
   `docs/callers/<name>.md` setup guide and a row in the README table (see
