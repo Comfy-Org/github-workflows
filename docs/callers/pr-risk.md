@@ -59,9 +59,13 @@ jobs:
       workflows_ref: <same-full-commit-sha>
 ```
 
-This workflow has no roster yet — it has no fleet of pinned callers to track
-(see [Staying current](README.md#staying-current)), so there is no
-`vars.*_CALLERS` entry to add.
+Enrolling is **two steps** — merging the caller above is only the first. Ask a
+maintainer to add this repo to the `PR_RISK_CALLERS` roster
+(see [Staying current](README.md#staying-current)); until they do, the
+[`bump-pr-risk-callers.yml`](../../.github/workflows/bump-pr-risk-callers.yml)
+fleet does not know the caller exists, so both of its pins sit frozen and the
+caller silently drifts behind the grader it runs. Skipping this half is the most
+repeated mistake in this repo.
 
 ## Required permissions
 

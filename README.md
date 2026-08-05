@@ -98,8 +98,8 @@ Enrolling a repo is **two steps**:
 
 1. Merge the caller workflow into your repo.
 2. Add the repo to the matching roster variable here — `GROOM_CALLERS`,
-   `CURSOR_REVIEW_CALLERS`, `PR_SIZE_CALLERS`, `AGENTS_MD_CALLERS`, or
-   `ASSIGN_REVIEWERS_CALLERS`.
+   `CURSOR_REVIEW_CALLERS`, `PR_SIZE_CALLERS`, `PR_RISK_CALLERS`,
+   `AGENTS_MD_CALLERS`, or `ASSIGN_REVIEWERS_CALLERS`.
 
 The `bump-*-callers.yml` workflows read those rosters to open pin-bump PRs when a
 reusable moves. **A repo absent from the roster keeps its original SHA forever**,
