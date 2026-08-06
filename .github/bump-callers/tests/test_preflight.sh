@@ -66,6 +66,25 @@ new_case() {
 
 clone_work() { rm -rf "$WORKDIR"; git clone -q "file://${ORIGIN}" "$WORKDIR"; }
 
+# Actions' own `actions/checkout` is SHALLOW by default, so the deepening arm of
+# the script's `--unshallow` probe is the one that runs in production — and a
+# full-clone fixture never exercises it. This is the variant that does.
+clone_work_shallow() {
+  rm -rf "$WORKDIR"
+  git clone -q --depth=1 "file://${ORIGIN}" "$WORKDIR"
+}
+
+# The same shallow checkout, but reached through a LINKED WORKTREE. Git keeps the
+# `shallow` marker in the COMMON git dir, while `git rev-parse --git-dir` inside a
+# linked worktree answers with that worktree's own directory — so a hand-rolled
+# `[[ -f "$(git rev-parse --git-dir)/shallow" ]]` probe reports "not shallow"
+# here and skips the deepening the ancestry guard depends on.
+clone_work_shallow_worktree() {
+  rm -rf "$WORKDIR" "${CASE}/common"
+  git clone -q --depth=1 "file://${ORIGIN}" "${CASE}/common"
+  git -C "${CASE}/common" worktree add -q --detach "$WORKDIR" HEAD
+}
+
 # Commit whatever is staged in SRC and advance origin/main to it.
 push_src() {
   git -C "$SRC" add -A
@@ -154,6 +173,162 @@ check "new_sha re-pointed to the tip" "[[ \"$N\" == \"$TIP\" ]]"
 check "new_sha is not the stale sha"  "[[ \"$N\" != \"$BEHIND\" ]]"
 check "re-point logged"               "grep -q \"pinning callers to $TIP\" <<<\"\$OUT\""
 check "no ::warning::"                "! grep -q \"::warning::\" <<<\"\$OUT\""
+
+# ---------------------------------------------------------------------------
+new_case backwards_differs 'origin main force-moved BACKWARDS, watched content differs'
+# The direction guard. Nothing above ever checks that the fetched tip DESCENDS
+# from this run's commit, so a main that moved backwards (force-push, a
+# revert-reset, or a stale replica answering the tip lookup) lands in the content
+# comparison with the older commit on the "tip" side. Here that content differs,
+# so the pre-guard script logged "the newer commit has its own run" — about a
+# commit that is OLDER — and exited GREEN, freezing every caller behind a run
+# that will never come. It has to be loud instead.
+BACK=$(origin_tip)
+printf 'name: Groom\non:\n  workflow_call:\n    inputs: {}\n' > "${SRC}/${WATCHED_PATH}"
+push_src 'edit the watched workflow'
+clone_work                             # the run's checkout IS the new tip
+TIP=$(work_head)
+git -C "$ORIGIN" update-ref refs/heads/main "$BACK"   # force-push main backwards
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP"
+check "exit 1"                        "[[ $RC -ne 0 ]]"
+check "::error:: names the direction" "grep -q \"::error::.*does not descend\" <<<\"\$OUT\""
+check "NOT the silent stale verdict"  "! grep -q \"stale run/re-run\" <<<\"\$OUT\""
+check "proceed is not false"          "[[ \"$P\" != \"false\" ]]"
+check "nothing written to output"     "[[ ! -s \"$OUTFILE\" ]]"
+
+# ---------------------------------------------------------------------------
+new_case backwards_equal 'origin main force-moved BACKWARDS, watched content identical'
+# The other half of the same bug, and the worse one. With the watched surface
+# byte-identical at both commits, the pre-guard script fell straight through to
+# the re-point and handed `new_sha` the OLDER tip — pinning every caller in the
+# fleet BACKWARDS, which is exactly what the re-point exists to avoid.
+BACK=$(origin_tip)
+printf 'unrelated file, edited\n' > "${SRC}/README.md"
+push_src 'a commit that touches only the unrelated file'
+clone_work                             # the run's checkout IS the new tip
+TIP=$(work_head)
+git -C "$ORIGIN" update-ref refs/heads/main "$BACK"
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED_ASSETS="$ASSETS_PATH"
+check "exit 1"                        "[[ $RC -ne 0 ]]"
+check "::error:: names the direction" "grep -q \"::error::.*does not descend\" <<<\"\$OUT\""
+check "did not re-point backwards"    "[[ \"$N\" != \"$BACK\" ]]"
+check "no backwards re-point logged"  "! grep -q \"pinning callers to $BACK\" <<<\"\$OUT\""
+check "nothing written to output"     "[[ ! -s \"$OUTFILE\" ]]"
+
+# ---------------------------------------------------------------------------
+new_case shallow_repoint 'a SHALLOW workdir still re-points: the --unshallow arm'
+# The guard above needs REAL history: `git merge-base --is-ancestor` against a
+# `--depth=1` graft returns false even for a legitimate forward move, so a naive
+# port would hard-fail every re-point in production — where actions/checkout is
+# shallow. This is the happy path run against that real-world shape.
+printf 'unrelated file, v1\n' > "${SRC}/README.md"
+push_src 'a second commit, so a depth=1 clone really truncates'
+clone_work_shallow
+BEHIND=$(work_head)
+check "workdir really is shallow"     "[[ -f \"${WORKDIR}/.git/shallow\" ]]"
+printf 'unrelated file, v2\n' > "${SRC}/README.md"
+push_src 'unrelated commit'
+TIP=$(origin_tip)
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" WATCHED_ASSETS="$ASSETS_PATH"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=true"                  "[[ \"$P\" == \"true\" ]]"
+check "new_sha re-pointed to the tip" "[[ \"$N\" == \"$TIP\" ]]"
+check "no ::error::"                  "! grep -q \"::error::\" <<<\"\$OUT\""
+
+# ---------------------------------------------------------------------------
+new_case shallow_worktree 'a shallow LINKED WORKTREE deepens too, and re-points'
+# Same happy path as above, one layout over: the checkout is a linked worktree of
+# a shallow clone. Git stores the `shallow` marker in the COMMON git dir, but
+# `git rev-parse --git-dir` inside a linked worktree answers with the per-worktree
+# directory — so probing for `$(git rev-parse --git-dir)/shallow` false-negatives
+# exactly here and skips the deepening. Asking git (`--is-shallow-repository`) is
+# correct in both layouts.
+# The verdict below still comes out right either way (a plain fetch into a shallow
+# clone sends the new commits down to the existing boundary, so HEAD stays
+# reachable) — which is precisely why this needs an assertion on the DEEPENING and
+# not just on the outputs. Left unfixed, the guard's soundness quietly depends on
+# that boundary behavior instead of on the `--unshallow` its comment says makes it
+# sound, and the shape that does break it (fetch grafting a parentless tip, which
+# is what the original `--depth=1` fetch did) is one refspec away.
+printf 'unrelated file, v1\n' > "${SRC}/README.md"
+push_src 'a second commit, so a depth=1 clone really truncates'
+clone_work_shallow_worktree
+BEHIND=$(work_head)
+check "the marker is NOT in --git-dir" \
+  "[[ ! -f \"\$(git -C \"$WORKDIR\" rev-parse --git-dir)/shallow\" ]]"
+check "but the repo really is shallow" \
+  "[[ \"\$(git -C \"$WORKDIR\" rev-parse --is-shallow-repository)\" == true ]]"
+printf 'unrelated file, v2\n' > "${SRC}/README.md"
+push_src 'unrelated commit'
+TIP=$(origin_tip)
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" WATCHED_ASSETS="$ASSETS_PATH"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=true"                  "[[ \"$P\" == \"true\" ]]"
+check "new_sha re-pointed to the tip" "[[ \"$N\" == \"$TIP\" ]]"
+check "no ::error::"                  "! grep -q \"::error::\" <<<\"\$OUT\""
+check "the fetch really did deepen" \
+  "[[ \"\$(git -C \"$WORKDIR\" rev-parse --is-shallow-repository)\" == false ]]"
+
+# ---------------------------------------------------------------------------
+new_case rewound_between 'main REWOUND between the tip lookup and the fetch'
+# The direction guard above only proves the fetched tip descends from THIS RUN's
+# commit — it says nothing about the tip `ls-remote` reported moments earlier. A
+# rewind that lands on a commit still AHEAD of this run therefore sails through
+# it: the objects compared, and the SHA every caller is pinned to, come from a
+# commit main was already known to be ahead of. Measure the direction of that
+# move too.
+# The fixture stages C0 (this run) → B → A on origin, then rewinds main to B in
+# the window between the two lookups, via a `git` shim on PATH that fires right
+# after the ls-remote. B still descends from C0, so ONLY the observed-tip
+# comparison can catch this.
+BEHIND=$(work_head)
+printf 'unrelated file, b\n' > "${SRC}/README.md"
+push_src 'commit B'
+REWOUND_TO=$(origin_tip)
+printf 'unrelated file, a\n' > "${SRC}/README.md"
+push_src 'commit A — what ls-remote reports'
+SHIM="${CASE}/shim"; mkdir -p "$SHIM"
+REAL_GIT="$(command -v git)"
+cat > "${SHIM}/git" <<SHIMEOF
+#!/usr/bin/env bash
+"${REAL_GIT}" "\$@"; rc=\$?
+# Rewind origin the instant the tip lookup has answered, so the fetch that
+# follows lands on the older commit.
+if [[ "\${1:-}" == "ls-remote" ]]; then
+  "${REAL_GIT}" -C "${ORIGIN}" update-ref refs/heads/main "${REWOUND_TO}" || true
+fi
+exit \$rc
+SHIMEOF
+chmod +x "${SHIM}/git"
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" PATH="${SHIM}:${PATH}"
+check "exit 1"                        "[[ $RC -ne 0 ]]"
+check "::error:: names the lookup tip" \
+  "grep -q \"::error::.*does not descend from the tip the lookup reported\" <<<\"\$OUT\""
+check "NOT read as a benign advance"  "! grep -q \"main advanced\" <<<\"\$OUT\""
+check "NOT the silent stale verdict"  "! grep -q \"stale run/re-run\" <<<\"\$OUT\""
+check "did not pin the rewound tip"   "[[ \"$N\" != \"$REWOUND_TO\" ]]"
+check "nothing written to output"     "[[ ! -s \"$OUTFILE\" ]]"
+
+# ---------------------------------------------------------------------------
+new_case land_then_revert 'land-then-revert: pin the TIP, not this stale run'
+# The case bump-pr-risk-callers.yml's `git rev-list` check exists for — and the
+# reason it is deliberately not ported here. A watched change landed and was
+# reverted, so the net content at the tip equals the content at this run's
+# commit. rev-list would call this a stale re-run; the re-point does something
+# better, pinning the VERIFIED TIP (the revert commit — forward, not backwards),
+# which is the content every caller should be on.
+BEHIND=$(work_head)
+printf 'name: Groom\non:\n  workflow_call:\n    inputs: {}\n' > "${SRC}/${WATCHED_PATH}"
+push_src 'land a watched change'
+printf 'name: Groom\non:\n  workflow_call:\n' > "${SRC}/${WATCHED_PATH}"
+push_src 'revert it'
+TIP=$(origin_tip)
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" WATCHED_ASSETS="$ASSETS_PATH"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=true"                  "[[ \"$P\" == \"true\" ]]"
+check "new_sha is the TIP"            "[[ \"$N\" == \"$TIP\" ]]"
+check "not this run's stale sha"      "[[ \"$N\" != \"$BEHIND\" ]]"
+check "no ::error::"                  "! grep -q \"::error::\" <<<\"\$OUT\""
 
 # ---------------------------------------------------------------------------
 new_case decommissioned 'the watched workflow was deleted on main: decommissioned'
