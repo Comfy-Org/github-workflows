@@ -148,12 +148,17 @@ tests — run the matching command above for whatever you touched.
   its `vars.*_CALLERS` roster. Skipping the second is the most repeated mistake
   here: the pin then never moves, the caller drifts behind the reusable, and it
   fails at startup much later with no obvious cause. This repo did it to its own
-  `ci-groom.yml`. Being listed is necessary, not sufficient: the bumper can only
-  move a pin it can *find*, so a caller pinned to a placeholder/tag/branch rather
-  than a 40-hex SHA is un-bumpable however it is registered (BE-6015) — the
-  bumper now fails the run naming it. When auditing, compare the roster against
-  reality in both directions — a roster entry whose caller file does not exist
-  (or that names no `uses:` of this fleet's reusable) is equally broken.
+  `ci-groom.yml`. Being listed is necessary, not sufficient: a caller's pin
+  shape (placeholder, tag, branch, short SHA) no longer matters — the rewrite
+  is anchored to the pin token, not to 40-hex-ness, so it self-heals any of
+  those on the next bump (BE-4662), and a shape it truly cannot move (e.g. a
+  `workflows_ref` fed by a `${{ … }}` expression) fails the run rather than
+  shipping a half-bumped caller. What the bumper *can't* fix is a roster entry
+  that names no `uses:` of this fleet's reusable at all — that is the file
+  (or the roster entry) being wrong, not a pin to move, and it also fails the
+  run naming it (BE-6015). When auditing, compare the roster against reality
+  in both directions — a roster entry whose caller file does not exist is
+  equally broken.
 - **New reusable workflow?** `on: workflow_call` + a header comment documenting
   inputs/secrets/triggers + a caller-pattern example, then a
   `docs/callers/<name>.md` setup guide and a row in the README table (see
