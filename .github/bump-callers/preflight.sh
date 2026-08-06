@@ -41,6 +41,13 @@
 #     verified TIP, which on a land-then-revert IS the revert commit, i.e.
 #     forward. Porting rev-list on top would only add a stricter staleness
 #     verdict that skips a run whose content the tip still needs pinned.
+#     That decision is about the land-then-revert case, and it is NOT a claim
+#     that an object comparison expresses everything a rev-list PATHSPEC can:
+#     pr-risk's filter carries `:(exclude)` entries, and an over-broad watched
+#     surface here has its own failure mode — see the COUPLED TO THE PATH FILTER
+#     note on the re-point below. Swapping an excluding fleet onto this script
+#     means narrowing its inputs to what the filter really watches (or keeping
+#     it on its own guard), not adding rev-list.
 #
 # Required environment:
 #   WATCHED        Repo-relative path of the watched reusable workflow file
@@ -65,9 +72,9 @@
 # watched path, a HEAD that is not GITHUB_SHA), a lookup we could not perform
 # (failed ls-remote, failed fetch, unresolvable FETCH_HEAD, a rev-parse that
 # failed rather than reporting absence), or an answer that contradicts history
-# (a fetched main tip that does not descend from this run's commit). None of
-# those is evidence of staleness — it fails loudly rather than silently
-# no-opping the fleet.
+# (a fetched main tip that does not descend from this run's commit, or from the
+# tip the ls-remote reported moments earlier). None of those is evidence of
+# staleness — it fails loudly rather than silently no-opping the fleet.
 #
 # Run from the repository root (the final decommission check tests the run's own
 # checked-out tree).
@@ -206,18 +213,36 @@ if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
   # ref the exact-refname `ls-remote` match above resolved. (bump-pr-risk's copy
   # fetches a bare `main` — do not "align" with it; that is the shadowing bug.)
   #
-  # Fetch REAL history, not just the tip. The direction guard below asks whether
-  # the fetched tip DESCENDS from HEAD, and `git merge-base --is-ancestor` cannot
+  # Fetch REAL history, not just the tip. The direction guards below ask whether
+  # one commit DESCENDS from another, and `git merge-base --is-ancestor` cannot
   # answer that against a `--depth=1` graft: a parentless FETCH_HEAD makes even a
   # legitimate forward move read as not-an-ancestor, so the naive one-liner would
   # hard-fail every re-point (verified empirically, spike BE-6670). Deepening is
-  # what makes the guard sound. actions/checkout clones shallow, and `--unshallow`
-  # errors out on an already-complete clone — hence the probe rather than an
-  # unconditional flag. Cost is negligible: this repo is ~6 MB / 137 commits and
-  # a full clone measures under 2s — and this branch only runs on a tip mismatch.
-  unshallow=()
-  [[ -f "$(git rev-parse --git-dir)/shallow" ]] && unshallow=(--unshallow)
-  if ! git fetch "${unshallow[@]}" origin refs/heads/main; then
+  # what makes the guards sound. actions/checkout clones shallow, and
+  # `--unshallow` errors out on an already-complete clone — hence the probe
+  # rather than an unconditional flag.
+  # Ask git whether the REPOSITORY is shallow; don't stat `$(git rev-parse
+  # --git-dir)/shallow`. Inside a linked worktree `--git-dir` is that worktree's
+  # own directory while the `shallow` marker lives in the COMMON git dir, so the
+  # hand-rolled probe false-negatives there and skips the deepening entirely.
+  # The verdict still comes out right today — a plain fetch into a shallow clone
+  # sends the new commits down to the existing boundary, so HEAD stays reachable
+  # (measured; test_preflight.sh's shallow_worktree case) — but that leaves the
+  # guards resting on fetch's boundary behavior instead of on the `--unshallow`
+  # this comment says makes them sound, and one refspec away from the shape that
+  # does break it. `--is-shallow-repository` is correct in both layouts (and,
+  # being a non-empty array either way, the form below is also safe under
+  # `set -u` on bash 3.2, where an empty `"${arr[@]}"` is an unbound variable).
+  # Cost: bounded by this repo's own history — a full clone of it measures well
+  # under 2s today — and this branch only runs on a tip mismatch. Deliberately no
+  # `--deepen` ceiling: a partial deepening cannot answer the ancestry question,
+  # which is the whole point of fetching here. The caller job's `timeout-minutes`
+  # is the backstop for an origin that hangs.
+  fetch_args=(origin refs/heads/main)
+  if [[ "$(git rev-parse --is-shallow-repository)" == "true" ]]; then
+    fetch_args=(--unshallow "${fetch_args[@]}")
+  fi
+  if ! git fetch "${fetch_args[@]}"; then
     echo "::error::Could not fetch the current main tip to compare $WATCHED"
     exit 1
   fi
@@ -233,10 +258,26 @@ if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
     echo "::error::Fetched main but FETCH_HEAD does not resolve to a commit — cannot compare $WATCHED"
     exit 1
   fi
-  # A benign race, not an error: main can advance in the seconds between the
-  # ls-remote and the fetch. Compare against — and re-point to — the tip whose
-  # objects we actually read, and say so in the log.
+  # main can move in the seconds between the ls-remote and the fetch. Moving
+  # FORWARD is a benign race: compare against — and re-point to — the tip whose
+  # objects we actually read, and say so in the log. But "advanced" is a
+  # DIRECTION, and it has to be measured rather than assumed: the fetch can
+  # equally land on a commit OLDER than the one ls-remote reported moments
+  # earlier (a force-push landing in that window, or a stale read replica
+  # answering the fetch). The HEAD check below does NOT catch that — a rewind to
+  # a commit that is still ahead of this run passes it, and the fleet is then
+  # silently pinned to a tip we already know main was ahead of. So require the
+  # observed tip to be an ancestor of the fetched one.
+  # A `--is-ancestor` that cannot be performed at all (exit >1: the observed tip
+  # is not even present locally after the fetch) lands here too, and correctly —
+  # in a forward move the observed tip IS an ancestor of the fetched one and
+  # therefore present, so its absence is itself evidence the move was not
+  # forward. The message names both readings.
   if [[ "$fetched_tip" != "$main_tip" ]]; then
+    if ! git merge-base --is-ancestor "$main_tip" "$fetched_tip"; then
+      echo "::error::the fetched main tip ($fetched_tip) does not descend from the tip the lookup reported moments earlier ($main_tip) — main moved backwards, or a stale replica answered the fetch (or the ancestry could not be checked at all); refusing to compare or re-point"
+      exit 1
+    fi
     echo "main advanced from $main_tip to $fetched_tip between the tip lookup and the fetch — comparing against the fetched tip"
   fi
   main_tip="$fetched_tip"
@@ -254,12 +295,19 @@ if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
   # 1) from "the check itself errored" (exit >1). There the distinction is
   # load-bearing because the two verdicts DIVERGE — absence exits 0 and skips
   # silently, a failed lookup must not. Here they converge: both are an
-  # `::error::` and exit 1, so splitting them would only reword a log line.
-  if ! git merge-base --is-ancestor HEAD FETCH_HEAD; then
-    echo "::error::the fetched main tip ($main_tip) does not descend from this run's commit $GITHUB_SHA — main moved backwards or a stale replica answered; refusing to compare or re-point"
+  # `::error::` and exit 1, so splitting them would only reword a log line — and
+  # the line already names both readings rather than asserting the diagnosis.
+  #
+  # Compare the OID we resolved and verified above, not the FETCH_HEAD ref: that
+  # ref is mutable, and anything rewriting it in between (a retry wrapper, a
+  # concurrent git operation in the same workspace, a hook) would let a commit
+  # other than the one checked here be the one whose blobs are compared and
+  # emitted as new_sha. Same reason the reads below take $fetched_tip.
+  if ! git merge-base --is-ancestor "$head_sha" "$fetched_tip"; then
+    echo "::error::the fetched main tip ($main_tip) does not descend from this run's commit $GITHUB_SHA — main moved backwards, or a stale replica answered (or the ancestry could not be checked at all); refusing to compare or re-point"
     exit 1
   fi
-  resolve_oid "FETCH_HEAD:$WATCHED"
+  resolve_oid "$fetched_tip:$WATCHED"
   tip_blob="$RESOLVED"
   # HEAD is this run's own checkout, so the lookup itself must succeed (a failure
   # exits inside resolve_oid). An EMPTY here_blob means $WATCHED is absent at
@@ -279,7 +327,7 @@ if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
   tip_assets=""
   here_assets=""
   if [[ -n "$WATCHED_ASSETS" ]]; then
-    resolve_oid "FETCH_HEAD:$WATCHED_ASSETS"
+    resolve_oid "$fetched_tip:$WATCHED_ASSETS"
     tip_assets="$RESOLVED"
     resolve_oid "HEAD:$WATCHED_ASSETS"
     here_assets="$RESOLVED"
@@ -336,6 +384,16 @@ if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
   # WATCHED_ASSETS string cannot express (see the header). Read the entrypoint's
   # `paths:` rather than trusting this list, and if you widen a fleet's filter
   # again, widen the inputs here in the same change.
+  #
+  # The inputs must not be WIDER than the filter either, and that direction is
+  # the one an excluding fleet gets wrong. A commit touching only an EXCLUDED
+  # path (pr-risk's `scripts/pr-risk/tests`, its `README.md`) starts no run of
+  # its own — but it does change the tree OID of an over-broad WATCHED_ASSETS,
+  # so the comparison above reports "the watched surface changed since" and this
+  # run skips green as a stale re-run, waiting on a later run that will never
+  # exist. That freezes the fleet exactly as a bare tip mismatch used to. An
+  # exclusion is therefore a reason to narrow the inputs (or leave that fleet on
+  # its own guard), never to point WATCHED_ASSETS at the whole directory.
   echo "main moved to $main_tip since $GITHUB_SHA, but the watched surface is unchanged — this run is still the only one for that change; pinning callers to $main_tip and proceeding"
   NEW_SHA="$main_tip"
 fi
