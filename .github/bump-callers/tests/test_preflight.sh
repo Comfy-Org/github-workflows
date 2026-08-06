@@ -66,6 +66,14 @@ new_case() {
 
 clone_work() { rm -rf "$WORKDIR"; git clone -q "file://${ORIGIN}" "$WORKDIR"; }
 
+# Actions' own `actions/checkout` is SHALLOW by default, so the deepening arm of
+# the script's `--unshallow` probe is the one that runs in production — and a
+# full-clone fixture never exercises it. This is the variant that does.
+clone_work_shallow() {
+  rm -rf "$WORKDIR"
+  git clone -q --depth=1 "file://${ORIGIN}" "$WORKDIR"
+}
+
 # Commit whatever is staged in SRC and advance origin/main to it.
 push_src() {
   git -C "$SRC" add -A
@@ -154,6 +162,88 @@ check "new_sha re-pointed to the tip" "[[ \"$N\" == \"$TIP\" ]]"
 check "new_sha is not the stale sha"  "[[ \"$N\" != \"$BEHIND\" ]]"
 check "re-point logged"               "grep -q \"pinning callers to $TIP\" <<<\"\$OUT\""
 check "no ::warning::"                "! grep -q \"::warning::\" <<<\"\$OUT\""
+
+# ---------------------------------------------------------------------------
+new_case backwards_differs 'origin main force-moved BACKWARDS, watched content differs'
+# The direction guard. Nothing above ever checks that the fetched tip DESCENDS
+# from this run's commit, so a main that moved backwards (force-push, a
+# revert-reset, or a stale replica answering the tip lookup) lands in the content
+# comparison with the older commit on the "tip" side. Here that content differs,
+# so the pre-guard script logged "the newer commit has its own run" — about a
+# commit that is OLDER — and exited GREEN, freezing every caller behind a run
+# that will never come. It has to be loud instead.
+BACK=$(origin_tip)
+printf 'name: Groom\non:\n  workflow_call:\n    inputs: {}\n' > "${SRC}/${WATCHED_PATH}"
+push_src 'edit the watched workflow'
+clone_work                             # the run's checkout IS the new tip
+TIP=$(work_head)
+git -C "$ORIGIN" update-ref refs/heads/main "$BACK"   # force-push main backwards
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP"
+check "exit 1"                        "[[ $RC -ne 0 ]]"
+check "::error:: names the direction" "grep -q \"::error::.*does not descend\" <<<\"\$OUT\""
+check "NOT the silent stale verdict"  "! grep -q \"stale run/re-run\" <<<\"\$OUT\""
+check "proceed is not false"          "[[ \"$P\" != \"false\" ]]"
+check "nothing written to output"     "[[ ! -s \"$OUTFILE\" ]]"
+
+# ---------------------------------------------------------------------------
+new_case backwards_equal 'origin main force-moved BACKWARDS, watched content identical'
+# The other half of the same bug, and the worse one. With the watched surface
+# byte-identical at both commits, the pre-guard script fell straight through to
+# the re-point and handed `new_sha` the OLDER tip — pinning every caller in the
+# fleet BACKWARDS, which is exactly what the re-point exists to avoid.
+BACK=$(origin_tip)
+printf 'unrelated file, edited\n' > "${SRC}/README.md"
+push_src 'a commit that touches only the unrelated file'
+clone_work                             # the run's checkout IS the new tip
+TIP=$(work_head)
+git -C "$ORIGIN" update-ref refs/heads/main "$BACK"
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED_ASSETS="$ASSETS_PATH"
+check "exit 1"                        "[[ $RC -ne 0 ]]"
+check "::error:: names the direction" "grep -q \"::error::.*does not descend\" <<<\"\$OUT\""
+check "did not re-point backwards"    "[[ \"$N\" != \"$BACK\" ]]"
+check "no backwards re-point logged"  "! grep -q \"pinning callers to $BACK\" <<<\"\$OUT\""
+check "nothing written to output"     "[[ ! -s \"$OUTFILE\" ]]"
+
+# ---------------------------------------------------------------------------
+new_case shallow_repoint 'a SHALLOW workdir still re-points: the --unshallow arm'
+# The guard above needs REAL history: `git merge-base --is-ancestor` against a
+# `--depth=1` graft returns false even for a legitimate forward move, so a naive
+# port would hard-fail every re-point in production — where actions/checkout is
+# shallow. This is the happy path run against that real-world shape.
+printf 'unrelated file, v1\n' > "${SRC}/README.md"
+push_src 'a second commit, so a depth=1 clone really truncates'
+clone_work_shallow
+BEHIND=$(work_head)
+check "workdir really is shallow"     "[[ -f \"${WORKDIR}/.git/shallow\" ]]"
+printf 'unrelated file, v2\n' > "${SRC}/README.md"
+push_src 'unrelated commit'
+TIP=$(origin_tip)
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" WATCHED_ASSETS="$ASSETS_PATH"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=true"                  "[[ \"$P\" == \"true\" ]]"
+check "new_sha re-pointed to the tip" "[[ \"$N\" == \"$TIP\" ]]"
+check "no ::error::"                  "! grep -q \"::error::\" <<<\"\$OUT\""
+
+# ---------------------------------------------------------------------------
+new_case land_then_revert 'land-then-revert: pin the TIP, not this stale run'
+# The case bump-pr-risk-callers.yml's `git rev-list` check exists for — and the
+# reason it is deliberately not ported here. A watched change landed and was
+# reverted, so the net content at the tip equals the content at this run's
+# commit. rev-list would call this a stale re-run; the re-point does something
+# better, pinning the VERIFIED TIP (the revert commit — forward, not backwards),
+# which is the content every caller should be on.
+BEHIND=$(work_head)
+printf 'name: Groom\non:\n  workflow_call:\n    inputs: {}\n' > "${SRC}/${WATCHED_PATH}"
+push_src 'land a watched change'
+printf 'name: Groom\non:\n  workflow_call:\n' > "${SRC}/${WATCHED_PATH}"
+push_src 'revert it'
+TIP=$(origin_tip)
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" WATCHED_ASSETS="$ASSETS_PATH"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=true"                  "[[ \"$P\" == \"true\" ]]"
+check "new_sha is the TIP"            "[[ \"$N\" == \"$TIP\" ]]"
+check "not this run's stale sha"      "[[ \"$N\" != \"$BEHIND\" ]]"
+check "no ::error::"                  "! grep -q \"::error::\" <<<\"\$OUT\""
 
 # ---------------------------------------------------------------------------
 new_case decommissioned 'the watched workflow was deleted on main: decommissioned'

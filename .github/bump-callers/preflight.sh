@@ -24,9 +24,23 @@
 # bump-detect-unreviewed-merge-callers.yml semantics (PR #117) — exact-refname
 # tip parse, FETCH_HEAD verification, `$WATCHED`-variable deletion guard, and the
 # NEW_SHA re-point — generalized to multi-path fleets. Nothing consumes it yet;
-# swapping the entrypoints over is a separate change, and the pr-risk swap in
-# particular has to decide what to do with that fleet's extra checks rather than
-# drop them.
+# swapping the entrypoints over is a separate change.
+#
+# What to do with bump-pr-risk-callers.yml's two extra checks was that swap's one
+# open decision. BE-6670 made it, and both halves are settled:
+#   * The is-ancestor DIRECTION GUARD is ADOPTED here, for every fleet (BE-6675).
+#     It was never pr-risk-specific: without it, a main that moved BACKWARDS —
+#     a force-push, a revert-reset, or a stale replica answering the tip lookup —
+#     either reads as a stale re-run and freezes the whole fleet behind a green
+#     run, or re-points every caller to the OLDER tip. See the guard below.
+#   * The `git rev-list` "did a later COMMIT touch a watched path" test is
+#     deliberately NOT ported. It exists because pr-risk has no re-point: there, a
+#     land-then-revert nets to zero content change, so a content comparison calls
+#     this run the only one for the change and pins callers BACKWARDS to
+#     github.sha. The re-point below already answers that case — it pins the
+#     verified TIP, which on a land-then-revert IS the revert commit, i.e.
+#     forward. Porting rev-list on top would only add a stricter staleness
+#     verdict that skips a run whose content the tip still needs pinned.
 #
 # Required environment:
 #   WATCHED        Repo-relative path of the watched reusable workflow file
@@ -48,10 +62,12 @@
 #            this run was re-pointed forward (see the re-point block below)
 #
 # Exits non-zero ONLY for an input we cannot trust (malformed SHA, glob-shaped
-# watched path, a HEAD that is not GITHUB_SHA) or a lookup we could not perform
+# watched path, a HEAD that is not GITHUB_SHA), a lookup we could not perform
 # (failed ls-remote, failed fetch, unresolvable FETCH_HEAD, a rev-parse that
-# failed rather than reporting absence). Neither is evidence of staleness — it
-# fails loudly rather than silently no-opping the fleet.
+# failed rather than reporting absence), or an answer that contradicts history
+# (a fetched main tip that does not descend from this run's commit). None of
+# those is evidence of staleness — it fails loudly rather than silently
+# no-opping the fleet.
 #
 # Run from the repository root (the final decommission check tests the run's own
 # checked-out tree).
@@ -187,8 +203,21 @@ if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
   # arbitrary tagged commit the FETCH_HEAD that the blob comparison and the
   # re-point below both run against — and therefore what every caller gets
   # pinned to. `refs/heads/main` can only ever be the branch, which is also the
-  # ref the exact-refname `ls-remote` match above resolved.
-  if ! git fetch --depth=1 origin refs/heads/main; then
+  # ref the exact-refname `ls-remote` match above resolved. (bump-pr-risk's copy
+  # fetches a bare `main` — do not "align" with it; that is the shadowing bug.)
+  #
+  # Fetch REAL history, not just the tip. The direction guard below asks whether
+  # the fetched tip DESCENDS from HEAD, and `git merge-base --is-ancestor` cannot
+  # answer that against a `--depth=1` graft: a parentless FETCH_HEAD makes even a
+  # legitimate forward move read as not-an-ancestor, so the naive one-liner would
+  # hard-fail every re-point (verified empirically, spike BE-6670). Deepening is
+  # what makes the guard sound. actions/checkout clones shallow, and `--unshallow`
+  # errors out on an already-complete clone — hence the probe rather than an
+  # unconditional flag. Cost is negligible: this repo is ~6 MB / 137 commits and
+  # a full clone measures under 2s — and this branch only runs on a tip mismatch.
+  unshallow=()
+  [[ -f "$(git rev-parse --git-dir)/shallow" ]] && unshallow=(--unshallow)
+  if ! git fetch "${unshallow[@]}" origin refs/heads/main; then
     echo "::error::Could not fetch the current main tip to compare $WATCHED"
     exit 1
   fi
@@ -211,6 +240,25 @@ if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
     echo "main advanced from $main_tip to $fetched_tip between the tip lookup and the fetch — comparing against the fetched tip"
   fi
   main_tip="$fetched_tip"
+  # Refuse to act on a tip that is not a descendant of this run's commit: a
+  # force-push back, a revert-reset, or a stale replica answering the lookup.
+  # Proceeding either way is wrong, and BOTH ways are silent today — if the
+  # watched content DIFFERS at the older tip, the comparison below reports a
+  # false "stale run/re-run; the newer commit has its own run" and exits green,
+  # freezing every caller behind a run that will never come; if it MATCHES, the
+  # re-point hands `new_sha` the OLDER tip and pins the whole fleet BACKWARDS.
+  # Loud, not a green skip — a lookup that contradicts history is not evidence of
+  # staleness. (Ported from bump-pr-risk-callers.yml, BE-6670.)
+  #
+  # Unlike resolve_oid, this deliberately does NOT split "not an ancestor" (exit
+  # 1) from "the check itself errored" (exit >1). There the distinction is
+  # load-bearing because the two verdicts DIVERGE — absence exits 0 and skips
+  # silently, a failed lookup must not. Here they converge: both are an
+  # `::error::` and exit 1, so splitting them would only reword a log line.
+  if ! git merge-base --is-ancestor HEAD FETCH_HEAD; then
+    echo "::error::the fetched main tip ($main_tip) does not descend from this run's commit $GITHUB_SHA — main moved backwards or a stale replica answered; refusing to compare or re-point"
+    exit 1
+  fi
   resolve_oid "FETCH_HEAD:$WATCHED"
   tip_blob="$RESOLVED"
   # HEAD is this run's own checkout, so the lookup itself must succeed (a failure
