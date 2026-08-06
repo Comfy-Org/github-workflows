@@ -413,17 +413,18 @@ on:
 
 
           A RED RUN HERE IS NOT A NETWORK BLIP. Because this makes two
-          unauthenticated fetches a hard precondition of every run, each one is
-          retried three times with a linear backoff and bounded by git's
-          low-speed timeout, so a transient github.com error or a secondary rate
-          limit on shared Actions egress resolves itself rather than reddening
-          every enrolled consumer at once. What is never retried is the VERDICT.
-          If the step still fails, read the annotation: it distinguishes a pin
-          that could not be FETCHED, a `main` that could not be READ, an ancestry
-          test that could not be COMPLETED (an infrastructure fault, not a
-          judgement about the pin), and a pin that is genuinely NOT AN ANCESTOR —
-          which is the only one of the four that says anything about the pin
-          itself.
+          unauthenticated fetches a hard precondition of every run, each one gets
+          up to 3 attempts with a linear backoff, bounded by git's low-speed
+          timeout, so a transient github.com error or a secondary rate limit on
+          shared Actions egress resolves itself rather than reddening every
+          enrolled consumer at once. What is never retried is the VERDICT. If the
+          step still fails, read the annotation: it distinguishes a scratch
+          workspace that could not be CREATED or INITIALIZED, a pin that could
+          not be FETCHED, a `main` that could not be READ, an ancestry test that
+          could not be COMPLETED (all five are infrastructure faults, not a
+          judgement about the pin), and a pin that is genuinely NOT AN
+          ANCESTOR — which is the only one of the six that says anything about
+          the pin itself.
 
 
           WHAT ANCESTRY DOES NOT PROVE is that the pin is the CURRENT one: a pin
@@ -522,7 +523,12 @@ jobs:
   gate:
     name: Resolve enablement
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # 10, not 5: the ancestry guard below makes two unauthenticated fetches, each up to 3
+    # attempts at a 40s wall-clock cap plus 15s of backoff (~135s), sequentially — ~270s worst
+    # case before the tool checkout even starts. 5 minutes left no margin for that plus runner
+    # setup; a job-timeout kill on top of it would silently swallow the guard's own ::error::
+    # annotation, the exact cry-wolf the retry/backoff exists to avoid.
+    timeout-minutes: 10
     permissions: {}
     outputs:
       enabled: ${{ steps.resolve.outputs.enabled }}
@@ -532,16 +538,19 @@ jobs:
       # tag, `refs/pull/N/head`) means that code can change after the caller was reviewed, and
       # only a full commit SHA is immutable.
       #
-      # SHAPE IS THE ONLY AXIS THIS FILE CAN CHECK, so do not read it as more. It does not say
-      # WHICH commit the ref names: a fork of this PUBLIC repo shares its object store, so a
-      # fork-authored 40-hex SHA is a perfectly well-shaped ref, and a pin left behind when
-      # `uses:` moved is too. Both would be closed by "equal to the commit `uses:` resolved to
-      # for this job" — but the runner does not hand that commit to the workflow.
-      # `github.workflow_sha` is the CALLER's top-level workflow file; `job_workflow_sha`, which
-      # is the value that would answer it, is an OIDC token CLAIM, not a `github` context
-      # property (`actionlint` rejects `github.job_workflow_sha`, and reading the claim needs
-      # `id-token: write` from every caller plus an exchange in a job that holds `permissions: {}`
-      # today). Reviewing the caller is what bounds that, and it is the only thing that can.
+      # SHAPE IS ONE AXIS; ANCESTRY (below) IS THE OTHER — together they are what this file can
+      # check. Shape alone does not say WHICH commit the ref names: a fork of this PUBLIC repo
+      # shares its object store, so a fork-authored 40-hex SHA is a perfectly well-shaped ref, and
+      # a pin left behind when `uses:` moved is too. The ancestry check ~50 lines below closes the
+      # FIRST case — a fork-authored commit is not, in general, an ancestor of this repo's own
+      # `main` — leaving only the stale-but-merged-pin case, which needs "equal to the commit
+      # `uses:` resolved to for this job." That remains unavailable: the runner does not hand this
+      # job that commit. `github.workflow_sha` is the CALLER's top-level workflow file;
+      # `job_workflow_sha`, which is the value that would answer it, is an OIDC token CLAIM, not a
+      # `github` context property (`actionlint` rejects `github.job_workflow_sha`, and reading the
+      # claim needs `id-token: write` from every caller plus an exchange in a job that holds
+      # `permissions: {}` today). Reviewing the caller is what bounds that residual, and it is the
+      # only thing that can.
       #
       # Enforced in the WORKFLOW, not in a script: the scripts are what the ref loads, so a
       # script-side check would sit inside the blast radius it is meant to bound. EVERY job that
@@ -653,7 +662,7 @@ jobs:
           # retry and transfer-bound policy. See the literal-URL note above for why it is not a var.
           fetch_upstream() {
             for attempt in 1 2 3; do
-              if git -C "$scratch" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 fetch --quiet --no-tags --filter=blob:none "$@"; then
+              if timeout 40 git -C "$scratch" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 fetch --quiet --no-tags --filter=blob:none "$@"; then
                 return 0
               fi
               if [ "$attempt" -lt 3 ]; then
@@ -677,7 +686,7 @@ jobs:
           # this as hostile" — the same cry-wolf the retry above exists to avoid. Both branches still
           # fail closed; only the message differs.
           ancestry_rc=0
-          git -C "$scratch" merge-base --is-ancestor "$WORKFLOWS_REF" upstream-main || ancestry_rc=$?
+          GIT_NO_LAZY_FETCH=1 git -C "$scratch" merge-base --is-ancestor "$WORKFLOWS_REF" upstream-main || ancestry_rc=$?
           if [ "$ancestry_rc" -gt 1 ]; then
             echo "::error::The ancestry test for workflows_ref (${safe_ref}) could not be COMPLETED — git merge-base failed rather than returning a verdict (see its output above). This is an infrastructure fault, not evidence the pin is hostile. Failing closed."
             exit 1
@@ -878,7 +887,7 @@ jobs:
           # retry and transfer-bound policy. See the literal-URL note above for why it is not a var.
           fetch_upstream() {
             for attempt in 1 2 3; do
-              if git -C "$scratch" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 fetch --quiet --no-tags --filter=blob:none "$@"; then
+              if timeout 40 git -C "$scratch" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 fetch --quiet --no-tags --filter=blob:none "$@"; then
                 return 0
               fi
               if [ "$attempt" -lt 3 ]; then
@@ -902,7 +911,7 @@ jobs:
           # this as hostile" — the same cry-wolf the retry above exists to avoid. Both branches still
           # fail closed; only the message differs.
           ancestry_rc=0
-          git -C "$scratch" merge-base --is-ancestor "$WORKFLOWS_REF" upstream-main || ancestry_rc=$?
+          GIT_NO_LAZY_FETCH=1 git -C "$scratch" merge-base --is-ancestor "$WORKFLOWS_REF" upstream-main || ancestry_rc=$?
           if [ "$ancestry_rc" -gt 1 ]; then
             echo "::error::The ancestry test for workflows_ref (${safe_ref}) could not be COMPLETED — git merge-base failed rather than returning a verdict (see its output above). This is an infrastructure fault, not evidence the pin is hostile. Failing closed."
             exit 1

@@ -197,7 +197,7 @@ expect="$(cat <<'PINNED'
           fi
           fetch_upstream() {
             for attempt in 1 2 3; do
-              if git -C "$scratch" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 fetch --quiet --no-tags --filter=blob:none "$@"; then
+              if timeout 40 git -C "$scratch" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 fetch --quiet --no-tags --filter=blob:none "$@"; then
                 return 0
               fi
               if [ "$attempt" -lt 3 ]; then
@@ -215,7 +215,7 @@ expect="$(cat <<'PINNED'
             exit 1
           fi
           ancestry_rc=0
-          git -C "$scratch" merge-base --is-ancestor "$WORKFLOWS_REF" upstream-main || ancestry_rc=$?
+          GIT_NO_LAZY_FETCH=1 git -C "$scratch" merge-base --is-ancestor "$WORKFLOWS_REF" upstream-main || ancestry_rc=$?
           if [ "$ancestry_rc" -gt 1 ]; then
             echo "::error::<message>"
             exit 1
@@ -254,7 +254,7 @@ fi
 # is: a failure that says "the guard no longer asserts ancestry" beats one that only prints a diff,
 # and the axis is the whole reason a fork-authored SHA cannot be checked out here. Each one carries
 # its own coverage self-check, so a stale anchor fails loudly rather than passing vacuously.
-ANCESTRY_LINE='          git -C "$scratch" merge-base --is-ancestor "$WORKFLOWS_REF" upstream-main || ancestry_rc=$?'
+ANCESTRY_LINE='          GIT_NO_LAZY_FETCH=1 git -C "$scratch" merge-base --is-ancestor "$WORKFLOWS_REF" upstream-main || ancestry_rc=$?'
 nancestry=$(grep -cxF "$ANCESTRY_LINE" "$WF")
 eq "every copy of the guard asserts the pin is an ancestor of upstream main" "$guards" "$nancestry"
 
