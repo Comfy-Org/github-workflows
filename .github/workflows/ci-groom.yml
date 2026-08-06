@@ -71,11 +71,13 @@ jobs:
       # need NOTHING beyond contents: read — they invoke the Claude CLI directly
       # and mint no GitHub token, so `id-token: write` is no longer required
       # (BE-4214). Grant the union below or the call is rejected.
-      # ORDERING: the pin below is at or after the BE-4214 CLI migration, so the
-      # shorter grant matches what that groom.yml declares. Never move this pin
-      # BACKWARDS past that migration — the intermediate main SHAs (#55 / #64)
-      # still declare `id-token: write` on the agent jobs and would be rejected
-      # at startup by this grant. Forward bumps (what the fleet does) are fine.
+      # ORDERING: the pinned SHA below is at/after the BE-4214 CLI migration —
+      # its groom.yml carries the agent jobs (audit_find / audit_verify / build /
+      # build_pr) and declares `id-token: write` on NONE of them — so the shorter
+      # grant is verified safe against it, not merely safe-by-predating.
+      # Never hand-bump this pin BACKWARDS to an intermediate main SHA (#55 /
+      # #64): those still declare `id-token: write` on the agent jobs and would
+      # be rejected at startup by this grant.
       contents: read
       issues: write
       pull-requests: read
@@ -87,24 +89,31 @@ jobs:
       # The gate's fail-open path is the other case: the grant is present but the
       # history read errors (fresh repo, API hiccup) -> run rather than skip.
       actions: read
-    # Pinned like any other groom caller, and kept fresh by the groom fleet
-    # (`bump-groom-callers.yml` + `vars.GROOM_CALLERS`) — do NOT reintroduce a
-    # `REPLACE_AT_MERGE_...` placeholder or a local `uses: ./` path here. BE-4004
-    # (#56) landed the interval gate behind a fail-loud placeholder meant to be
-    # hand-bumped to that PR's squash SHA; the hand-bump never happened, so every
-    # scheduled run since has died at startup on an unresolvable ref — and because
-    # the placeholder is not 40-hex, the bumper's rewrite could not move it either
-    # and reported the file as already converged. A real SHA is what puts this
-    # caller back under the fleet, where the next bump moves it automatically.
-    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@bcde90f4c5b0267d32583dc1d339ac8731c0da9a # main @ bcde90f
+    # Pinned by full SHA like every other caller — self-enrollment still loads
+    # the reusable from a MERGED main commit, never a local `./` path (AGENTS.md
+    # "Scripts are the single source of truth"). The pinned SHA was main HEAD
+    # when written and already carries the BE-4004 `gate` job plus the
+    # `interval_days` / `cadence` / `volume_gate` inputs passed below, so this
+    # call resolves — replacing the REPLACE_AT_MERGE placeholder that had been
+    # failing every daily tick at startup since it was written (the
+    # reusable-lands-then-bump-caller two-step whose second half never happened).
+    #
+    # This pin and `workflows_ref` below MUST stay byte-identical. They are
+    # auto-bumped together: this repo IS enrolled in `vars.GROOM_CALLERS` as
+    # `.github/workflows/ci-groom.yml`, and bump-callers.sh rewrites both pins
+    # and both `# main @ <short>` annotations in one pass. (The bump-callers
+    # README / AGENTS.md tell the story of this caller being MISSING from that
+    # roster in the PAST tense — a cautionary tale, not current state. Verify
+    # against the variable, not the prose, before "fixing" it.) Never hand-bump
+    # one of the pair alone.
+    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@0b6ebf5e460ca02499e362aa8d650ac4d6806a7c # main @ 0b6ebf5
     with:
       # File groom's issues as cloud-code-bot (App token), not github-actions[bot].
       bot_app_id: ${{ vars.APP_ID }}
       # Keep the assets ref (finder/verifier briefs + interval gate + dedup
       # ledger) in lock-step with the `uses:` ref above, so a run always loads the
-      # scripts that match the workflow filing them. The bumper rewrites both in
-      # one pass, so never hand-bump one alone.
-      workflows_ref: bcde90f4c5b0267d32583dc1d339ac8731c0da9a
+      # scripts that match the workflow filing them. Bump the two together.
+      workflows_ref: 0b6ebf5e460ca02499e362aa8d650ac4d6806a7c  # main @ 0b6ebf5
       # Manual dispatch can dry-run; the daily schedule always files live
       # (github.event.inputs is null on a schedule event -> '' != 'true' -> false).
       dry_run: ${{ github.event.inputs.dry_run == 'true' }}

@@ -106,6 +106,41 @@ updates:
       - dependency-name: "actions/create-github-app-token"
         update-types: ["version-update:semver-major"]
 
+  # The @anthropic-ai/claude-code CLI that groom.yml installs in its three agent
+  # jobs (BE-5373).
+  #
+  # `.github/groom/package.json` is not a project — nothing is ever installed
+  # from that directory. It is a manifest whose only job is to make this pin
+  # VISIBLE to an ecosystem: the github-actions ecosystem above only parses
+  # `uses:` refs, so the previous inline `npm install -g <pkg>@<version>` literal
+  # inside a `run:` step was watched by nothing at all and simply rotted. That
+  # matters more than a normal dev-tool pin here, because those steps run inside
+  # jobs holding a bot App token with contents / pull-requests / issues write.
+  #
+  # groom.yml's `gate` job reads the version out of that manifest once and feeds
+  # all three install steps, so a bump PR merged here moves every call site at
+  # once — there is no longer a version literal in the workflow to fall out of
+  # sync.
+  - package-ecosystem: "npm"
+    directory: "/.github/groom"
+    schedule:
+      interval: "monthly"
+    labels: ["dependencies"]
+    # Keep the requirement EXACT. `increase` rewrites "1.2.3" -> "1.2.4" in
+    # place; `widen` would turn the pin into a range, which groom.yml's gate
+    # rejects at run time on purpose (an unpinned agent CLI is the supply-chain
+    # hazard the pin exists to prevent). Stated explicitly rather than relying on
+    # the ecosystem default, since that default is what the guard depends on.
+    versioning-strategy: "increase"
+    open-pull-requests-limit: 5
+    cooldown:
+      # A bump here changes what the agent CLI *is* inside jobs that read
+      # untrusted repo content, so let a release age before adopting it. Majors
+      # get longer: a CLI major can rename a flag or shift the default permission
+      # mode, and groom's sandbox is built out of those flags.
+      default-days: 7
+      semver-major-days: 14
+
   # Dependency-free today, but declared so the day a module is added it is
   # watched rather than silently rotting — the same failure mode this file
   # exists to fix.

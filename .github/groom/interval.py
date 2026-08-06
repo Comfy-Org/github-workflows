@@ -18,9 +18,13 @@ option that needs no net-new secret and no writable durable store (a repo
 variable would need an extra `Variables: write` credential the run does not
 otherwise carry, and a missing grant would fail *silently* into a daily
 over-spend). A prior run "counts" as a real groom only if it actually reached the
-finder (its `Audit — finder` job ran, i.e. was not `skipped` by this very gate),
-so the interval-skip ticks in between never reset the clock. Run history is
-durable across the stateless CI runs and readable with only `actions: read`.
+finder (its `Audit — finder` job ran, i.e. was not `skipped` by this very gate)
+AND actually spent the audit — a job that ended BEFORE its agent step (checkout,
+asset load, prompt build) billed nothing, so it must not advance the clock
+(BE-4814, see `run_audited`). Conversely a job that hung and tripped its
+40-minute timeout billed the most of any outcome, so it must. The interval-skip
+ticks in between never reset it either. Run history is durable across the
+stateless CI runs and readable with only `actions: read`.
 
 The gate is **fail-open**, matching the volume gate: any error deriving the last
 run (API hiccup, unparseable timestamp, no history) RUNS the audit rather than
@@ -64,11 +68,63 @@ from datetime import datetime, timezone
 # `skipped`, so it never matches the audited conclusions below.
 _FINDER_JOB_HINTS = ("finder", "audit_find")
 
-# A finder job that reached success OR failure spent the (billed) audit, so both
-# count as a real run: counting a failure keeps a run that spent money but died
-# at a later step (e.g. filing) from re-spending on the very next daily tick.
-# `skipped` (the interval-skip case), `cancelled`, and a null conclusion do not.
-_AUDITED_CONCLUSIONS = {"success", "failure"}
+# A finder job that reached `success` spent the (billed) audit — nothing else to
+# check, the agent step is upstream of every step that could still fail.
+_AUDITED_CONCLUSIONS = {"success"}
+
+# The two endings that definitively spent NOTHING, so they never even reach the
+# evidence path: `skipped` is this very gate's own interval-skip, and a null
+# conclusion means the run is not finished. Deliberately a DENYLIST — every other
+# ending may or may not have billed, and is resolved by the per-step evidence in
+# `agent_step_started`: if the agent step ran, the audit was spent no matter how
+# the job was finally stamped. An allowlist here would have to enumerate the whole
+# API vocabulary (`failure`, `timed_out`, `cancelled`, and the rarer `neutral` /
+# `stale` / `action_required`), and any conclusion it forgot would silently mean
+# "billed, but never counted" — i.e. re-spent on every subsequent daily tick.
+#
+# `timed_out` and `cancelled` are the EXPENSIVE members: the finder job carries
+# `timeout-minutes: 40`, so an agent that hangs bills the full window and *then*
+# trips the job timeout — the single costliest outcome this module sees.
+#
+# The evidence requirement itself is BE-4814. Counting a failure that spent money
+# but died at a LATER step (e.g. the JSON assert) keeps it from re-spending on the
+# very next daily tick — that half is wanted. But the finder job can also die far
+# BEFORE the agent: checkout, the asset load, the prompt build, the runner itself.
+# Those spend nothing, and counting them advances the cadence clock, so a typo'd
+# input or a broken caller goes quiet for a whole GROOM_INTERVAL_DAYS window
+# instead of recurring (and being noticed) daily. This gate is fail-OPEN
+# everywhere else; that was the one branch that failed closed.
+_NEVER_AUDITED_CONCLUSIONS = {"skipped", ""}
+
+# The billed agent step inside the finder job, matched EXACTLY (after strip)
+# against the `steps[]` the runs-jobs API returns per job. The literal lives here,
+# next to the matcher that consumes it, so the producing `- name:` in groom.yml
+# and this comparison cannot drift apart silently (`test_interval.py` pins both
+# halves). Exact, not substring: the same job also has `Build finder prompt`,
+# `Assert finder produced JSON` and `Upload finder candidates`, none of which is
+# evidence that a single token was billed.
+_AGENT_STEP_NAME = "Run finder"
+
+# Step states that mean the agent step never STARTED. GitHub reports an unreached
+# step either as still `queued` (job died before it) or as `completed` with a
+# `skipped` conclusion, and which one you get depends on where the job died — so
+# both forms are checked rather than trusting either shape. Anything else
+# (in_progress, or completed with success/failure) means the agent ran and the
+# audit is spent.
+_UNSTARTED_STEP_STATUSES = {"queued", "waiting", "pending", "requested"}
+_UNSTARTED_STEP_CONCLUSIONS = {"skipped"}
+
+# `cancelled` is the ambiguous conclusion and must NOT be read as "never started":
+# GitHub stamps an already-RUNNING step `cancelled` when the workflow is cancelled
+# or the job trips its `timeout-minutes`, so a hung agent that billed for 40
+# minutes lands here — reading that as unstarted forgets the most expensive audit
+# there is. It equally stamps some unreached steps `cancelled` on the way down.
+# The conclusion alone cannot separate them; the TIMESTAMPS can. A step that
+# actually ran has a `started_at` strictly before its `completed_at`; an unreached
+# one carries no span (null timestamps, or both stamped at the same cancellation
+# instant). No demonstrable span -> no evidence -> not audited, which is the same
+# fail-open direction every other branch here takes.
+_CANCELLED_STEP_CONCLUSIONS = {"cancelled", "canceled"}
 
 # Default cadence when GROOM_INTERVAL_DAYS is unset/blank/garbage — 7 days keeps
 # the documented weekly behavior (AC: unset variable stays weekly, matching today).
@@ -105,6 +161,9 @@ _REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 # A workflow file basename the API accepts as a workflow id, e.g. `ci-groom.yml`.
 _WORKFLOW_FILE_RE = re.compile(r"^[A-Za-z0-9._-]+\.ya?ml$")
 
+# A run id is a bare positive integer — anything else came from a junk payload.
+_RUN_ID_RE = re.compile(r"^[0-9]+$")
+
 # Bound each `gh api` call so a stalled connection can't hang the gate until the
 # coarse job timeout (mirrors ledger.py).
 _FETCH_TIMEOUT_SECONDS = 30
@@ -112,6 +171,12 @@ _FETCH_TIMEOUT_SECONDS = 30
 # How many recent runs to scan back for the last real groom before giving up
 # (fail-open). Far more than any sane interval's worth of daily skip-ticks.
 _MAX_RUNS_SCANNED = 100
+
+# How many attempts of a single run to read back before giving up (fail-open).
+# Only reached for a run somebody re-ran by hand, which is already rare; the cap
+# keeps a pathological re-run count from turning this cheap gate into a storm of
+# API calls. See `audited_run_anchor`.
+_MAX_ATTEMPTS_SCANNED = 5
 
 
 def parse_interval_days(raw, default: float = _DEFAULT_INTERVAL_DAYS):
@@ -176,11 +241,103 @@ def days_since(then_iso: str, now: datetime) -> float:
     return (now - then).total_seconds() / 86400.0
 
 
+def agent_step_name() -> str:
+    """The groom.yml finder step whose start proves the (billed) audit happened.
+
+    Kept next to the matcher that reads it, so the producing `- name:` in
+    groom.yml and the consuming comparison cannot drift apart silently
+    (`test_interval.py` pins both halves against this).
+    """
+    return _AGENT_STEP_NAME
+
+
+def _text(value) -> str:
+    """A trimmed string for any JSON value; non-strings (and None) read as blank.
+
+    Every field this module reads off the API is compared as text, and the whole
+    history scan is meant not to raise on a junk payload (the upstream handler
+    would fail open anyway, but the cheap scan should not lean on that backstop).
+    Funnelling each read through here makes a `None`, number, list or dict where a
+    string was expected degrade to "no evidence" instead of an AttributeError.
+    """
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _step_has_elapsed_span(step) -> bool:
+    """True if the step's timestamps prove it actually ran for some time.
+
+    The discriminator for a `cancelled` step (see _CANCELLED_STEP_CONCLUSIONS):
+    cancelled mid-flight (billed) vs finalized on the way down (never reached).
+    Missing, unparseable or zero-width timestamps are no evidence, not proof of
+    absence — same fail-open direction as the rest of the gate.
+    """
+    started, completed = _text(step.get("started_at")), _text(step.get("completed_at"))
+    if not started or not completed:
+        return False
+    try:
+        return parse_iso8601_utc(completed) > parse_iso8601_utc(started)
+    except ValueError:
+        return False
+
+
+def agent_step_started(job) -> bool:
+    """True if this job's `steps[]` show the billed agent step actually started.
+
+    Positive evidence only, and fail-OPEN on every ambiguity: a missing, empty or
+    unmatched `steps[]` reads as "the agent never ran", which makes the run NOT
+    count and leaves the next tick due. A duplicated audit costs one run; a
+    suppressed one hides a broken caller for a full interval.
+    """
+    if not isinstance(job, dict):
+        return False
+    steps = job.get("steps")
+    for step in steps if isinstance(steps, list) else []:
+        if not isinstance(step, dict):
+            continue
+        if _text(step.get("name")) != _AGENT_STEP_NAME:
+            continue
+        status = _text(step.get("status")).lower()
+        conclusion = _text(step.get("conclusion")).lower()
+        if status in _UNSTARTED_STEP_STATUSES or conclusion in _UNSTARTED_STEP_CONCLUSIONS:
+            continue
+        if conclusion in _CANCELLED_STEP_CONCLUSIONS:
+            # Only the timestamps say whether this cancellation caught a running
+            # agent (billed) or a step that was never reached (billed nothing).
+            if _step_has_elapsed_span(step):
+                return True
+            continue
+        if not status and not conclusion:
+            # A name and nothing else says nothing about whether it ran. The API
+            # always sends `status`, so this is the malformed/unknown-shape case:
+            # no evidence -> not audited, same direction as every other branch.
+            continue
+        return True
+    return False
+
+
 def run_audited(jobs) -> bool:
-    """True if a run's jobs show the finder actually ran (not an interval-skip)."""
-    for job in jobs or []:
-        name = (job.get("name") or "").lower()
-        if any(hint in name for hint in _FINDER_JOB_HINTS) and job.get("conclusion") in _AUDITED_CONCLUSIONS:
+    """True if a run's jobs show the finder actually ran (not an interval-skip).
+
+    A `success` counts on the job conclusion alone. Every other ending except the
+    two that spent nothing by definition (`skipped`, unfinished) counts only with
+    positive evidence that the agent step started (BE-4814) — the job can end long
+    before it (checkout, asset load, prompt build), and those runs bill nothing,
+    so treating them as a spent audit would advance the cadence clock and hide the
+    breakage for a whole interval.
+    """
+    for job in jobs if isinstance(jobs, list) else []:
+        if not isinstance(job, dict):
+            continue
+        name = _text(job.get("name")).lower()
+        if not any(hint in name for hint in _FINDER_JOB_HINTS):
+            continue
+        # Normalized exactly like the step fields below it: the API returns these
+        # lowercase today, but one normalization for both halves means a casing or
+        # whitespace variance can never slip past only one of the two checks.
+        conclusion = _text(job.get("conclusion")).lower()
+        if conclusion in _AUDITED_CONCLUSIONS:
+            return True
+        if conclusion not in _NEVER_AUDITED_CONCLUSIONS and agent_step_started(job):
             return True
     return False
 
@@ -256,12 +413,89 @@ def fetch_workflow_runs(repo: str, workflow_file: str, run=subprocess.run):
     return payload.get("workflow_runs", []) if isinstance(payload, dict) else []
 
 
-def fetch_run_jobs(repo: str, run_id, run=subprocess.run):
-    """The jobs of one workflow run (single page)."""
+def fetch_run_jobs(repo: str, run_id, run=subprocess.run, attempt=None):
+    """The jobs of one workflow run (single page).
+
+    `attempt=None` asks the plain endpoint, which reports only the run's LATEST
+    attempt; pass an attempt number to read an earlier one (see
+    `audited_run_anchor`).
+    """
     if not _REPO_RE.match(repo or ""):
         raise ValueError(f"invalid repo {repo!r}: expected owner/name")
-    payload = _api_json([f"/repos/{repo}/actions/runs/{run_id}/jobs?per_page=100"], run)
+    # Guarded like `repo`: a junk run payload missing `id` would otherwise
+    # interpolate `None` into the path and spend a doomed round-trip to find out.
+    if not _RUN_ID_RE.match(str(run_id or "")):
+        raise ValueError(f"invalid run id {run_id!r}: expected a positive integer")
+    base = f"/repos/{repo}/actions/runs/{run_id}"
+    if attempt is not None:
+        base = f"{base}/attempts/{int(attempt)}"
+    payload = _api_json([f"{base}/jobs?per_page=100"], run)
     return payload.get("jobs", []) if isinstance(payload, dict) else []
+
+
+def finder_job_started_at(jobs):
+    """`started_at` of the finder job in one attempt's jobs payload, or None.
+
+    Keeps scanning past a matching job that carries no usable timestamp rather
+    than giving up on the first hint match — there is one finder job today, but a
+    payload that listed a second must not lose the answer to ordering.
+    """
+    for job in jobs if isinstance(jobs, list) else []:
+        if not isinstance(job, dict):
+            continue
+        if not any(hint in _text(job.get("name")).lower() for hint in _FINDER_JOB_HINTS):
+            continue
+        started = _text(job.get("started_at"))
+        if started:
+            return started
+    return None
+
+
+def audited_run_anchor(repo, wf_run, run=subprocess.run):
+    """The timestamp to anchor the cadence clock on for a run, or None if unaudited.
+
+    `run_audited` for the run, counting a spent audit on ANY of its attempts. The
+    plain jobs endpoint returns only the latest attempt, so a re-run that dies
+    before the agent would erase the evidence of an earlier attempt that DID reach
+    it, and the already-paid audit would repeat on the next tick — the same
+    forgotten-spend bug as a pre-agent failure, one level up. When the latest
+    attempt shows nothing and the run has earlier ones, walk them back.
+
+    Costs nothing in the normal case: `run_attempt` is 1 for every run nobody
+    re-ran by hand, and the loop is skipped entirely.
+    """
+    run_id = wf_run.get("id")
+    latest_jobs = fetch_run_jobs(repo, run_id, run=run)
+    if run_audited(latest_jobs):
+        # `run_started_at` tracks the LATEST attempt, which is the audited one
+        # here, so it is the right anchor — but share the earlier-attempt branch's
+        # fallbacks rather than dropping the whole run when it is missing.
+        return (_text(wf_run.get("run_started_at"))
+                or finder_job_started_at(latest_jobs)
+                or _text(wf_run.get("created_at"))
+                or None)
+    try:
+        attempts = int(wf_run.get("run_attempt") or 1)
+    except (TypeError, ValueError):
+        attempts = 1
+    # Newest-first, excluding the latest (already read above), and bounded so a
+    # pathologically re-run entry can't turn the cheap gate into a request storm.
+    # The window must slide with `attempts` — capping the START at
+    # _MAX_ATTEMPTS_SCANNED would scan the OLDEST attempts of a heavily re-run
+    # entry and miss a billed audit sitting on a recent one.
+    for attempt in range(attempts - 1, max(0, attempts - _MAX_ATTEMPTS_SCANNED), -1):
+        jobs = fetch_run_jobs(repo, run_id, run=run, attempt=attempt)
+        if run_audited(jobs):
+            # `run_started_at` tracks the LATEST attempt, so anchoring on it here
+            # would date a week-old paid audit to today's pre-agent re-run and
+            # suppress the next full interval — the fail-CLOSED direction this
+            # gate exists to avoid. So it is NOT in this chain at all, not even as
+            # a last resort: prefer the audited attempt's own finder-job start,
+            # then the run's creation (an older anchor means more elapsed days,
+            # i.e. fail-open), and otherwise give up on this run entirely — the
+            # scan moves to an older one, which is again the fail-open direction.
+            return finder_job_started_at(jobs) or _text(wf_run.get("created_at")) or None
+    return None
 
 
 def find_last_audited_run_at(repo, workflow_file, current_run_id, run=subprocess.run):
@@ -270,16 +504,25 @@ def find_last_audited_run_at(repo, workflow_file, current_run_id, run=subprocess
     Walks the caller workflow's runs newest-first, skips the current run and any
     still-in-progress run, and returns the first whose finder job actually ran.
     Returns None if none is found within the scanned window (-> fail-open run).
+
+    The anchor is the run's `run_started_at`, except where only an EARLIER attempt
+    supplied the evidence — see `audited_run_anchor`.
     """
     current = str(current_run_id) if current_run_id is not None else None
     for wf_run in fetch_workflow_runs(repo, workflow_file, run=run):
+        if not isinstance(wf_run, dict):
+            continue
+        # One junk entry skips that run rather than aborting the scan (which
+        # would fail open on the whole decision and forget real history).
+        if not _RUN_ID_RE.match(str(wf_run.get("id") or "")):
+            continue
         if current is not None and str(wf_run.get("id")) == current:
             continue
         if wf_run.get("status") != "completed":
             continue
-        jobs = fetch_run_jobs(repo, wf_run.get("id"), run=run)
-        if run_audited(jobs):
-            return wf_run.get("run_started_at")
+        anchor = audited_run_anchor(repo, wf_run, run=run)
+        if anchor:
+            return anchor
     return None
 
 
