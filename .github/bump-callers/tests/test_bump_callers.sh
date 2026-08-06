@@ -564,7 +564,11 @@ echo "== a roster entry pointing at a file that calls ONLY a sibling reusable is
 # ours. Telling a human to hand-pin a workflow this file does not use hides the
 # real problem — the stale entry in the fleet variable — so the warning names
 # that instead. (Silently skipping is not an option either: this file also
-# produces a no-op rewrite, i.e. the "already at" lie.)
+# produces a no-op rewrite, i.e. the "already at" lie.) The fixture also carries
+# a bare `workflows_ref:` — rule 2's rewrite is unaddressed by design (it can't
+# tell "ours" from a sibling job's `with:` input) and would otherwise happily
+# repoint the SIBLING's asset ref at this fleet's SHA and stage the file; the
+# roster check must `continue` before that rewrite runs, not just warn.
 new_case wrongfleet
 WRONGFLEET_FIXTURE="${WORK}/wrongfleet_caller.yml"
 printf '%s\n' \
@@ -572,6 +576,8 @@ printf '%s\n' \
   'jobs:' \
   '  review:' \
   '    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@1111111111111111111111111111111111111111' \
+  '    with:' \
+  '      workflows_ref: 2222222222222222222222222222222222222222' \
   > "$WRONGFLEET_FIXTURE"
 STUB_CONTENT_FILE="$WRONGFLEET_FIXTURE" run_bump \
   VAR_NAME=GROOM_CALLERS TAG=groom WORKFLOW_FILE=groom.yml \
@@ -581,7 +587,9 @@ check "blamed the roster entry, not the file" \
   "grep -q '::warning::.*has no \`uses:\` calling groom.yml.*GROOM_CALLERS.*fix the roster entry' <<<\"\$OUT\""
 check "did NOT tell a human to hand-pin groom.yml"  "! grep -q 'pin it by full SHA by hand' <<<\"\$OUT\""
 check "did NOT claim the file was already current"  "! grep -q 'already at $SHORT' <<<\"\$OUT\""
-check "did NOT bump the sibling fleet's pin"        "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+check "committed nothing (uses: AND workflows_ref both left alone)" \
+  "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+check "opened no PR"                                "[[ ! -f \"\$STUB_PUT_DIR/pr.log\" ]] || ! grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
 
 echo "== a file naming NO github-workflows reusable stays silent (no false positives) =="
 # The unusual-spelling escape hatch, now that a bad roster entry can fail the run:

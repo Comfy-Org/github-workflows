@@ -428,13 +428,27 @@ bump_repo() {
         echo "::warning::${REPO}: ${FILE} has no \`uses:\` calling ${WORKFLOW_FILE} — it is listed in ${VAR_NAME} but this fleet has nothing to bump in it; fix the roster entry"
       fi
     fi
-    # Accumulate rather than `return 1`: a roster entry with nothing of ours to
-    # bump is broken by definition, so the run must not report success — but it
-    # must also not abort the fan-out, since every OTHER caller in the fleet
-    # still deserves its bump. The aggregate `::error::` after the loop is what
-    # makes this unskimmable; BE-6015 persisted for weeks precisely because a
-    # warning in a green run reads as noise.
-    (( PIN_OK )) || UNPINNABLE+=("${REPO}:${FILE}")
+    # Accumulate AND skip rather than `return 1`: a roster entry with nothing
+    # of ours to bump is broken by definition, so the run must not report
+    # success — but it must also not abort the fan-out, since every OTHER
+    # caller in the fleet still deserves its bump. The aggregate `::error::`
+    # after the loop is what makes this unskimmable; BE-6015 persisted for
+    # weeks precisely because a warning in a green run reads as noise.
+    #
+    # The `continue` is load-bearing, not cosmetic: rule 2's `workflows_ref:`
+    # rewrite (line 336, below) is deliberately UNADDRESSED — it fires on any
+    # `workflows_ref:` key in the file regardless of SHA_ADDR, because in the
+    # legitimate multi-reusable case there is no cheap way to tell "our" input
+    # from a sibling job's. A sibling-only file (this branch) has no `uses:`
+    # of ours at all, so a bare `workflows_ref:` in it belongs entirely to the
+    # sibling — falling through to the rewrite/stage below would silently
+    # repoint that sibling's asset ref at THIS fleet's SHA and open a PR for
+    # it. Stopping here, before the rewrite, is the only way to keep the file
+    # untouched.
+    if (( ! PIN_OK )); then
+      UNPINNABLE+=("${REPO}:${FILE}")
+      continue
+    fi
 
     # ASSERT that the rewrite actually moved EVERY github-workflows pin in this
     # file, before it can be staged (BE-4662). The patterns above are precise by
