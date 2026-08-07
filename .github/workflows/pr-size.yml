@@ -23,8 +23,8 @@ name: PR Size Cap (reusable)
 # cases: `__tests__/`/`__mocks__/`/`__snapshots__/`/`testdata/` at any depth;
 # `test/`/`tests/`/`testing/`/`e2e/` at the repo root only; and those four plus
 # `it/` directly under `src/` for Maven/Gradle layouts. The root restriction is
-# load-bearing — a consumer keeps production ArgoCD manifests under
-# `infrastructure/argocd/apps/testing/`, and an any-depth rule excluded cluster
+# load-bearing — a consumer keeps production deployment manifests under
+# `deploy/envs/testing/`, and an any-depth rule excluded cluster
 # RBAC from the cap). Unlike the generated-file rules this is a convention, not a
 # proof — nothing stops production code being parked in `tests/` — which is why
 # it is opt-in rather than the default. The excluded total is ALWAYS reported on
@@ -148,9 +148,15 @@ on:
         description: >-
           Keep test-file lines out of the counted total, so the cap measures
           production code rather than test coverage. Test files are matched by
-          naming convention (`*_test.go`, `test_*.py`, `*.test.ts`,
-          `*.spec.ts`, and paths under test/, tests/, testing/, testdata/,
-          e2e/, __tests__/, __mocks__/, __snapshots__/). Off by default: it
+          naming convention: file names (`*_test.go`, `test_*.py`,
+          `conftest.py`, `*.test.ts`, `*.spec.ts`); the directories
+          `__tests__/`, `__mocks__/`, `__snapshots__/`, `testdata/` at ANY
+          depth; and `test/`, `tests/`, `testing/`, `e2e/` only at the REPO
+          ROOT or under a `src/` directory (Maven/Gradle). The depth limit is
+          deliberate — those four names also label deployment environments and
+          product areas, and matching them anywhere excluded production
+          infrastructure from a real consumer's cap. A nested
+          `packages/foo/tests/` therefore COUNTS. Off by default: it
           loosens the cap, so each repo opts in deliberately. Excluded test
           lines are always reported separately, never silently dropped. For a
           layout these conventions miss, use `extra_generated_globs` (those
@@ -468,23 +474,35 @@ jobs:
             # duplicates happen, and a maintainer (or another run) deleting one
             # between the list and the write is a real race.
             rc=0
+            patched=0
+            failed=0
             for id in $existing; do
               if gh api -X PATCH "repos/${REPO}/issues/comments/${id}" -F body=@body.md >/dev/null; then
                 echo "Updated sticky size comment ${id}."
+                patched=$((patched + 1))
               else
+                failed=$((failed + 1))
                 # gh's stderr is deliberately NOT discarded: a 403 from
                 # permission drift, a 422 on an over-long body and a concurrent
                 # delete all land here, and swallowing the message would
                 # misattribute every one of them to "deleted concurrently".
                 echo "Failed to update sticky size comment ${id} (see gh error above); continuing." >&2
-                rc=1
               fi
             done
-            # Exit non-zero if ANY patch failed, so steps.upsert.outcome is
-            # 'failure' and the degraded-mode note below actually fires.
-            # continue-on-error already keeps this from reddening the check —
-            # without this the step exits 0 even when every patch failed and the
-            # PR silently keeps a stale verdict on a green run.
+            # Fail the step only when NOTHING was patched. A partial failure is
+            # the expected case this loop exists for — a duplicate 404s on a
+            # concurrent delete while the real sticky updates fine — and
+            # reporting that as a step failure makes the degraded-mode note
+            # below claim no comment was posted and blame a permission 403,
+            # which is affirmatively false and dilutes the signal for a genuine
+            # one. Nothing patched, on the other hand, means the verdict on this
+            # PR is stale and the note is exactly right.
+            if [ "$patched" -eq 0 ] && [ "$failed" -gt 0 ]; then
+              echo "No sticky comment could be updated (${failed} failed); the PR may show a stale verdict." >&2
+              rc=1
+            elif [ "$failed" -gt 0 ]; then
+              echo "Updated ${patched} sticky comment(s); ${failed} could not be updated (see errors above)."
+            fi
             [ "$rc" -eq 0 ] || exit 1
           elif [ "$OVER" = "true" ] || [ "$DECISIVE" = "true" ]; then
             gh api -X POST "repos/${REPO}/issues/${PR_NUMBER}/comments" -F body=@body.md >/dev/null

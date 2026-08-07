@@ -159,11 +159,11 @@ equally trustworthy:
 | 3 | the same four, plus `it/` | **directly under `src/`** — Maven/Gradle nest tests at `src/test/java` and `src/it` |
 
 The root restriction in case 2 is not fussiness, it is a bug fix. A consumer
-keeps production ArgoCD manifests — cluster RBAC, ingress, cert issuers — under
-`infrastructure/argocd/apps/testing/`, where `testing` names the deployment
+keeps production deployment manifests — cluster RBAC and ingress config — under
+`deploy/envs/testing/`, where `testing` names the deployment
 *environment*, not test code. Matching that name at any depth silently excluded
-**cluster RBAC changes** from the cap. Root-anchoring keeps all 227 files of that
-repo's real `testing/` tree excluded while counting the 31 infrastructure files.
+**cluster RBAC changes** from the cap. Root-anchoring keeps that repo's whole
+root-level `testing/` tree excluded while counting the deployment files.
 
 The cost is deliberate and worth knowing: a **nested** ambiguous directory such as
 `services/checkout/e2e/` now counts. That is the safe direction — over-counting

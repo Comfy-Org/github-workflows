@@ -48,8 +48,8 @@ var lockfileNames = map[string]bool{
 // Test directories are matched in THREE cases, not one, because the segment
 // names are not equally trustworthy. Matching every name at every depth is what
 // caused the bug this split exists to fix: a real consumer keeps its production
-// ArgoCD manifests — cluster RBAC, ingress, cert issuers — under
-// `infrastructure/argocd/apps/testing/`, where `testing` names the target
+// deployment manifests — cluster RBAC and ingress config — under
+// `deploy/envs/testing/`, where `testing` names the target
 // ENVIRONMENT, not test code. An any-depth rule silently excluded cluster RBAC
 // changes from the cap, which is close to the worst thing this feature could do.
 //
@@ -71,7 +71,7 @@ var unambiguousTestSegments = map[string]bool{
 // ambiguousTestSegments usually mean tests but also legitimately name an
 // environment or product area, so they are matched ONLY at the repo root or
 // directly under a source root (see srcRoots). Root-level `testing/` is a test
-// tree; `infrastructure/argocd/apps/testing/` is a deployment target.
+// tree; `deploy/envs/testing/` is a deployment target.
 var ambiguousTestSegments = map[string]bool{
 	"e2e":     true,
 	"test":    true,
@@ -328,10 +328,27 @@ func hasTestSegment(path string) bool {
 	if ambiguousTestSegments[segs[0]] {
 		return true
 	}
-	// Case 3 — ambiguous names (plus `it`) directly under a source root.
-	if len(segs) > 1 && srcRoots[segs[0]] &&
-		(ambiguousTestSegments[segs[1]] || srcRootOnlyTestSegments[segs[1]]) {
-		return true
+	// Case 3 — ambiguous names directly under a source root, at ANY depth.
+	// `src` is not anchored to index 0 because the standard MULTI-module
+	// Maven/Gradle shape nests it — `module-a/src/test/java`,
+	// `services/payment/src/it/java` — and those are the layouts this case
+	// exists for. The cost is that a vendored `vendor/src/test/...` is also
+	// excluded; that is the over-counting-is-safer trade running the other way,
+	// and vendored trees are usually excluded as generated anyway.
+	for i := 0; i+1 < len(segs); i++ {
+		if !srcRoots[segs[i]] {
+			continue
+		}
+		next := segs[i+1]
+		if ambiguousTestSegments[next] {
+			return true
+		}
+		// `it` needs a CHILD segment (Maven failsafe always nests it as
+		// `src/it/<java|resources|...>`), because `it` is also the ISO-639-1
+		// code for Italian and a bare `src/it/` locale tree must keep counting.
+		if srcRootOnlyTestSegments[next] && i+2 < len(segs) {
+			return true
+		}
 	}
 	return false
 }

@@ -268,19 +268,23 @@ func TestIsTestPath(t *testing.T) {
 		{"spec/openapi.yaml", false},
 		{"api/specs/v1.json", false},
 		// THE REGRESSION THAT DROVE THE THREE-CASE SPLIT: `testing` here names a
-		// deployment ENVIRONMENT, and these are production ArgoCD manifests —
-		// cluster RBAC, ingress, cert issuers. They must COUNT against the cap.
-		{"infrastructure/argocd/apps/testing/charts/ephemeral-ingress/base/templates/clusterrole.yaml", false},
-		{"infrastructure/argocd/apps/testing/charts/ephemeral-ingress/base/templates/clusterrolebinding.yaml", false},
-		{"infrastructure/argocd/apps/testing/charts/cert-manager/base/values.yaml", false},
-		{"infrastructure/argocd/apps/testing/appsets/comfy-cloud-test.yaml", false},
+		// deployment ENVIRONMENT, and these are production deployment manifests —
+		// cluster RBAC and ingress config. They must COUNT against the cap.
+		{"deploy/envs/testing/charts/ingress/base/templates/clusterrole.yaml", false},
+		{"deploy/envs/testing/charts/ingress/base/templates/clusterrolebinding.yaml", false},
+		{"deploy/envs/testing/charts/certs/base/values.yaml", false},
+		{"deploy/envs/testing/appsets/values.yaml", false},
 		// Other nested ambiguous segments likewise count (safe direction).
 		{"services/checkout/e2e/flow.go", false},
 		{"internal/testing/harness.go", false},
 		{"apps/test/main.go", false},
 		// A source root only rescues the segment DIRECTLY beneath it.
 		{"src/main/java/com/x/Test.java", false},
-		{"vendor/src/test/java/x.java", false},
+		// Multi-module Maven/Gradle — the standard shape, now covered by case 3.
+		{"module-a/src/test/java/com/x/FooTest.java", true},
+		{"services/payment/src/it/java/com/x/FooIT.java", true},
+		// `it` needs a child segment, so a bare Italian locale tree still counts.
+		{"src/it/messages.properties", false},
 
 		// A file whose own name matches a test DIRECTORY is not a test file.
 		{"cmd/test", false},

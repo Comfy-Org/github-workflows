@@ -792,3 +792,15 @@ func TestRunGitFoldsStderrIntoError(t *testing.T) {
 		t.Errorf("runGit error should carry git's stderr diagnostic, got: %v", err)
 	}
 }
+
+// TestElideMiddleHonoursTinyBounds pins the case round 5's reply claimed was
+// fixed when it was not: asked for a bound below the ellipsis's own length, the
+// function must not return something longer than the bound.
+func TestElideMiddleHonoursTinyBounds(t *testing.T) {
+	t.Parallel()
+	for _, max := range []int{0, 1, 2, 3} {
+		if got := elideMiddle("some/long/path.go", max); len(got) > max {
+			t.Errorf("elideMiddle(max=%d) = %q (%d bytes) — exceeds its own bound", max, got, len(got))
+		}
+	}
+}

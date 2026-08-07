@@ -178,7 +178,13 @@ func classify(files []FileChange, base, head string, attr attrPolicy, extras Ext
 		if f.Binary {
 			continue
 		}
-		if IsLockfile(f.Path) || extras.Generated(f.Path) ||
+		// The same both-paths rule as f.Test above, for the same reason: without
+		// it, `dist/**` in extra_generated_globs plus
+		// `git mv internal/big.go dist/big.go` books the removed production
+		// lines into Generated — which takes precedence over Test in Evaluate
+		// and has no "largest excluded" list, so it is even less auditable.
+		extraGen := extras.Generated(f.Path) && (f.OldPath == "" || extras.Generated(f.OldPath))
+		if IsLockfile(f.Path) || extraGen ||
 			attrGen[f.Path] ||
 			contentGenerated(f.Path, base, head) {
 			f.Generated = true
@@ -444,7 +450,10 @@ func elideMiddle(s string, max int) string {
 		return s
 	}
 	if max <= len(ellipsis) {
-		return ellipsis
+		// Returning the ellipsis would EXCEED the bound this function promises.
+		// Unreachable at maxPathDisplay, but the helper is general and
+		// independently tested.
+		return ""
 	}
 	budget := max - len(ellipsis)
 	headBudget, tailBudget := budget/2, budget-budget/2
@@ -692,13 +701,23 @@ func runGitCapped(maxBytes int64, args ...string) ([]byte, error) {
 	return data, nil
 }
 
+// envInt reads an int from the environment, falling back to def. An unparseable
+// non-empty value WARNS rather than silently substituting: a `max_lines` that
+// arrives as `1250.5` (GitHub expressions yield decimals) or with stray
+// whitespace from a forwarded var would otherwise become the 1000 default — a
+// LOOSER cap than the caller configured, indistinguishable in the report from a
+// repo that genuinely meant 1000.
 func envInt(key string, def int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
+	v := os.Getenv(key)
+	if v == "" {
+		return def
 	}
-	return def
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "check-pr-size: %s=%q is not an integer; falling back to %d\n", key, v, def)
+		return def
+	}
+	return n
 }
 
 func envBool(key string) bool {
