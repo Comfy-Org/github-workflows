@@ -211,6 +211,9 @@ func TestIsTestPath(t *testing.T) {
 		{"web/src/util.test.js", true},
 		{"web/src/util.spec.mjs", true},
 		{"web/src/__tests__/render.tsx", true},
+		// Type tests — the `test` component need not adjoin the extension.
+		{"web/src/api.test.d.ts", true},
+		{"web/src/api.spec.d.ts", true},
 		{"web/src/__snapshots__/Button.test.tsx.snap", true},
 		{"web/src/__mocks__/fs.ts", true},
 		// Directory conventions, at any depth
@@ -233,6 +236,10 @@ func TestIsTestPath(t *testing.T) {
 		{"pkg/attestation/sigstore_test_helpers.go", false},
 		{"web/src/manifest.ts", false},
 		{"web/src/spec.ts", false},
+		{"web/src/test.ts", false},
+		// A `test`/`spec` component must not be the FIRST one.
+		{"web/src/spec.helpers.ts", false},
+		{"web/src/manifest.d.ts", false},
 		{"testify.go", false},
 		{"latest_test_results.md", false},
 		// `spec/` holds OpenAPI schemas in this org, not RSpec suites.

@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 const (
@@ -385,25 +387,36 @@ const maxPathDisplay = 160
 // fake "Excluded (tests): 0", or another sticky-comment marker — and a newline
 // reaching stdout can emit a `::` workflow command. Control characters are
 // replaced, backticks neutralized, and the result bounded by maxPathDisplay.
+// Unicode format characters (unicode.Cf) are replaced alongside the C0 controls:
+// a bidi override (U+202A–U+202E) or isolate (U+2066–U+2069) makes a path render
+// as a filename other than the one on disk, and can visually reorder the
+// adjacent (+N/-M) counts — which would defeat the "Largest excluded test files"
+// list, whose whole purpose is letting a reviewer confirm the excluded lines
+// really are tests.
+//
+// Truncation is bounded by ACCUMULATED BYTES and only ever cuts at a rune
+// boundary. Slicing the finished string at a byte offset would split a
+// multi-byte rune and emit invalid UTF-8 into the comment body — which GitHub
+// can 422 on, and continue-on-error would turn that into the silent no-comment
+// degradation maxPathDisplay exists to prevent.
 func sanitizePath(path string) string {
 	var b strings.Builder
 	for _, r := range path {
+		out := r
 		switch {
 		case r == '`':
 			// Would close the code span the caller wraps this in.
-			b.WriteRune('\'')
-		case r < 0x20 || r == 0x7f:
-			// Newlines, CR, and other control bytes: one visible placeholder.
-			b.WriteRune('?')
-		default:
-			b.WriteRune(r)
+			out = '\''
+		case r < 0x20 || r == 0x7f || unicode.Is(unicode.Cf, r):
+			// Newlines, CR, other C0 controls, and invisible format characters.
+			out = '?'
 		}
+		if b.Len()+utf8.RuneLen(out) > maxPathDisplay {
+			return b.String() + "…"
+		}
+		b.WriteRune(out)
 	}
-	s := b.String()
-	if len(s) > maxPathDisplay {
-		s = s[:maxPathDisplay] + "…"
-	}
-	return s
+	return b.String()
 }
 
 // topFiles renders a collapsed list of up to 10 matching files, largest first
@@ -458,9 +471,9 @@ func writeGitHubOutputs(res Result) {
 	}
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o644)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "check-pr-size: cannot open GITHUB_OUTPUT: %v\n", err)
 		return
 	}
-	defer f.Close()
 	// tests_excluded reports what was actually EXCLUDED, so it is 0 under the
 	// default policy — there, res.Test is a subset of counted and naming it an
 	// exclusion would assert something that did not happen.
@@ -468,8 +481,19 @@ func writeGitHubOutputs(res Result) {
 	if res.TestsExcluded {
 		testsExcluded = res.Test
 	}
-	fmt.Fprintf(f, "over_cap=%t\ncounted=%d\ntests_excluded=%d\ntests_decisive=%t\n",
+	// Both errors are surfaced rather than dropped: a partial write can lose
+	// tests_decisive while the process still exits 0, and the comment job then
+	// reads the absent flag as false and silently skips the green-check comment
+	// — the very failure this output exists to close.
+	_, werr := fmt.Fprintf(f, "over_cap=%t\ncounted=%d\ntests_excluded=%d\ntests_decisive=%t\n",
 		!res.OK, res.Counted, testsExcluded, res.ExclusionDecisive())
+	cerr := f.Close()
+	if werr != nil {
+		fmt.Fprintf(os.Stderr, "check-pr-size: writing GITHUB_OUTPUT failed: %v\n", werr)
+	}
+	if cerr != nil {
+		fmt.Fprintf(os.Stderr, "check-pr-size: closing GITHUB_OUTPUT failed: %v\n", cerr)
+	}
 }
 
 // gitTimeout bounds every git invocation so a hung git (a wedged credential

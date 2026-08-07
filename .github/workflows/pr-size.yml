@@ -43,9 +43,14 @@ name: PR Size Cap (reusable)
 # single sticky comment explaining the overage and the bypass label, then flips
 # it to ✅ once the PR is trimmed or labeled — the failing status alone does not
 # surface the bypass label. It also posts on a GREEN check when `exclude_tests`
-# is the only thing holding the PR under the cap (see `tests_decisive`). Without `bot_app_id` + BOT_APP_PRIVATE_KEY, or with
-# `comment: false`, the workflow degrades gracefully: the check status and the
-# size job's step summary still carry the full report; no comment is posted.
+# is the only thing holding the PR under the cap (see `tests_decisive`).
+#
+# Without `bot_app_id` + BOT_APP_PRIVATE_KEY, or with `comment: false`, the
+# workflow degrades gracefully: the check status and the size job's step summary
+# still carry the full report; no comment is posted. Note this also covers fork
+# and Dependabot PRs, which never receive the secret — so on those the green
+# check's excluded-test total lives only in the step summary even for a caller
+# that configured the App.
 #
 # Two-job security split: the `pr-size` job runs against PR code with a
 # read-only token; the `comment` job holds the bot write token, checks out NO
@@ -347,7 +352,6 @@ jobs:
           GH_TOKEN: ${{ steps.bot.outputs.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          BOT_APP_ID: ${{ inputs.bot_app_id }}
         run: |
           set -euo pipefail
           if [ ! -s report/pr-size-report.md ]; then
@@ -360,25 +364,55 @@ jobs:
           DECISIVE="$(cat report/pr-size-tests-decisive 2>/dev/null || true)"
           MARKER='<!-- ci-pr-size -->'
           { printf '%s\n\n' "$MARKER"; cat report/pr-size-report.md; } > body.md
-          # Find our existing sticky comment (if any) by the hidden marker, so
-          # we update one comment across pushes instead of stacking new ones.
+          # Find our existing sticky comment(s) by the hidden marker, so we
+          # update across pushes instead of stacking new ones. Both filters are
+          # load-bearing, and this mirrors `find_sticky` in
+          # scripts/pr-risk/publish-risk-surfaces.sh deliberately — same hazards,
+          # so the same shape rather than a second dialect of it.
           #
-          # The author filter is load-bearing, not defensive dressing: the marker
-          # is published in this PUBLIC workflow file, so without it a PR author
-          # can pre-seed a comment containing the marker and we would PATCH
-          # THEIR comment instead of posting ours — after which they can rewrite
-          # it freely, suppressing or falsifying the size verdict. Since
-          # `exclude_tests` makes this comment the ONLY signal for a green
-          # test-heavy PR, that is a silent hole straight through the guarantee.
-          # Matching on the app id (compared as a string, so a non-numeric input
-          # cannot make jq abort) keeps us to comments this app actually wrote.
+          #   .user.type == "Bot" — the marker is published in this PUBLIC
+          #     workflow file, so without an author filter a PR author can
+          #     pre-seed a comment carrying it and we would PATCH THEIRS instead
+          #     of posting ours, after which they rewrite it freely. Since
+          #     `exclude_tests` makes this comment the ONLY signal on a green
+          #     test-heavy PR, that is a hole straight through the guarantee.
+          #     Type is used rather than the app id because
+          #     create-github-app-token also accepts a CLIENT id (`Iv1.…`) for
+          #     `app-id`; a caller wiring that would never match the numeric app
+          #     id and would silently stack a new comment on every push.
+          #
+          #   startswith, not contains — the body renders the marker as its
+          #     FIRST line, while another bot QUOTING this comment carries the
+          #     marker nested in its own prose. `contains` would PATCH that
+          #     bot's comment away, destroying unrelated review output; the org
+          #     bot posts cursor-review and groom comments too, so an author can
+          #     induce this by quoting the marker in the PR body.
+          #
+          # The marker is passed as jq DATA (--arg), never spliced into the
+          # program text, so no value can turn the filter into a syntax error —
+          # which `set -euo pipefail` plus this step's continue-on-error would
+          # convert into a silent "no comment posted".
           existing="$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
-            --jq ".[] | select(((.performed_via_github_app.id // \"\") | tostring) == \"${BOT_APP_ID}\") | select(.body | contains(\"${MARKER}\")) | .id")"
-          existing="$(printf '%s' "$existing" | head -n1)"
+            | jq -r --arg m "$MARKER" '
+                .[] | select((.user.type // "") == "Bot")
+                    | select(((.body // "") | startswith($m)))
+                    | .id')"
           if [ -n "$existing" ]; then
-            # Update in place — flips to ✅ when a previously-flagged PR is fixed.
-            gh api -X PATCH "repos/${REPO}/issues/comments/${existing}" -F body=@body.md >/dev/null
-            echo "Updated sticky size comment ${existing}."
+            # Update EVERY match, not just the first. The find-then-post is
+            # check-then-act with no lock, and the documented caller subscribes
+            # to labeled/unlabeled alongside synchronize — so a push racing a
+            # label toggle can leave two comments. Taking `head -n1` would then
+            # pin one forever while the other sat displaying a stale verdict,
+            # which on a decisive-green PR is a wrong number with equal
+            # standing. Rewriting all of them keeps every copy truthful, and
+            # costs one extra API call in the rare case there is a second.
+            # Unquoted on purpose: the ids are numeric and newline-separated, so
+            # word splitting is exactly the right parse (and a heredoc's
+            # terminator cannot be indented inside this YAML block scalar).
+            for id in $existing; do
+              gh api -X PATCH "repos/${REPO}/issues/comments/${id}" -F body=@body.md >/dev/null
+              echo "Updated sticky size comment ${id}."
+            done
           elif [ "$OVER" = "true" ] || [ "$DECISIVE" = "true" ]; then
             gh api -X POST "repos/${REPO}/issues/${PR_NUMBER}/comments" -F body=@body.md >/dev/null
             if [ "$OVER" = "true" ]; then

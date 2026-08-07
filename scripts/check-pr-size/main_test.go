@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // These tests exercise the git-backed generated-file classification against a
@@ -586,6 +587,16 @@ func TestSanitizePath(t *testing.T) {
 			want: "a?::error::spoofed?b.go",
 		},
 		{"carriage return replaced", "a\rb.go", "a?b.go"},
+		{
+			// Trojan-source class: a bidi override renders the path as a
+			// filename other than the one on disk, in the very list a reviewer
+			// uses to confirm the excluded files really are tests.
+			name: "bidi override is replaced",
+			path: "src/‮og.tset_x/a.go",
+			want: "src/?og.tset_x/a.go",
+		},
+		{"bidi isolate is replaced", "a⁦b⁩c.go", "a?b?c.go"},
+		{"zero-width joiner is replaced", "a‍b.go", "a?b.go"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -604,6 +615,24 @@ func TestSanitizePath(t *testing.T) {
 		}
 		if !strings.HasSuffix(got, "…") {
 			t.Errorf("truncated path should be marked with an ellipsis, got %q", got[len(got)-10:])
+		}
+	})
+
+	// The ASCII case above cannot catch a cut landing mid-rune. Multi-byte runes
+	// at every offset make the byte boundary fall inside a rune for some input
+	// length, so a byte-slice truncation emits invalid UTF-8 here.
+	t.Run("truncation never splits a rune", func(t *testing.T) {
+		t.Parallel()
+		for _, r := range []string{"é", "☃", "🙂"} {
+			for n := 1; n <= 200; n++ {
+				got := sanitizePath(strings.Repeat(r, n) + ".go")
+				if !utf8.ValidString(got) {
+					t.Fatalf("sanitizePath(%d×%q) produced invalid UTF-8: %q", n, r, got)
+				}
+				if len(got) > maxPathDisplay+len("…") {
+					t.Fatalf("sanitizePath(%d×%q) len = %d, over bound", n, r, len(got))
+				}
+			}
 		}
 	})
 }

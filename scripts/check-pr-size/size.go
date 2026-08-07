@@ -311,9 +311,17 @@ func isTestFileName(base string) bool {
 		return true
 	}
 	if dot := strings.LastIndex(base, "."); dot > 0 && jsTestExts[base[dot:]] {
-		stem := base[:dot]
-		if strings.HasSuffix(stem, ".test") || strings.HasSuffix(stem, ".spec") {
-			return true
+		// Any dot-separated component of the stem AFTER the first being exactly
+		// `test` or `spec` marks a test file. Checking components rather than
+		// only the one adjoining the extension also catches type tests
+		// (`foo.test.d.ts`), which match the `*.test.*` convention the docs
+		// advertise. Requiring a NON-first component is what keeps a
+		// hand-written module literally named `spec.ts` counted.
+		parts := strings.Split(base[:dot], ".")
+		for _, p := range parts[1:] {
+			if p == "test" || p == "spec" {
+				return true
+			}
 		}
 	}
 	return false
