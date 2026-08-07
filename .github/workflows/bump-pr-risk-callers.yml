@@ -24,15 +24,15 @@ name: Bump pr-risk callers
 # repo-level Actions variable `PR_RISK_CALLERS` (config, not a credential — a
 # variable, not a secret, since secrets are write-only via the API) as a JSON
 # array of {"repo","file","label"} objects, same shape as the other fleets'
-# variables. `bump-callers.sh` `::add-mask::`es every repo name before IT echoes
-# anything.
-# KNOWN GAP (shared by every entrypoint in this family, tracked separately):
-# passing the roster through this step's `env:` means Actions prints the raw
-# value in the step's env dump before the script — and its masking — ever runs.
-# Closing it means reading the variable at run time (`gh variable get`) and
-# masking it first, which needs a token permission this fleet does not mint
-# today; it is a fleet-wide change, not one this entrypoint can make alone.
-# Until then, treat the roster as visible in the public run log.
+# variables.
+# `bump-callers.sh` READS that variable itself, at run time, and
+# `::add-mask::`es every repo name before anything is echoed — the roster is
+# never bound into this step's `env:`, because Actions prints a step's env block
+# into the (public) run log BEFORE the step runs, which put the raw roster in
+# front of the masking that was supposed to cover it (BE-6482, closing BE-6477).
+# That read needs a token able to read Actions variables, which a downscoped
+# token is not — so it runs under a SECOND, repo-scoped app token minted below,
+# leaving the fleet's WRITE token downscoped as it always was.
 # The variable is seeded EMPTY (`[]`) — an empty list is a clean no-op here
 # (ALLOW_EMPTY below); the rollout's per-repo caller tickets add entries as
 # callers land.
@@ -117,33 +117,61 @@ jobs:
           # this token must reach are not knowable at authoring time — and naming
           # them here would leak private caller names into a public file.
           #
-          # The PERMISSIONS can be narrowed without naming anything, so they are:
-          # unset, the minted token carries every permission the app holds on every
-          # repo it is installed on, far past what this bumper needs. It commits
-          # the rewritten caller file via the Git Data API (contents) and opens or
-          # updates the bump PR (pull-requests); `gh pr create --label` stamps the
-          # caller's label through the issues API (issues) — same trio, and the
-          # same reasoning, as the groom and auto-label fleets' entrypoints.
-          owner: Comfy-Org
+          # This is the WRITE token and it STAYS downscoped to the three
+          # permissions the bumper actually uses: it commits the rewritten caller
+          # file (contents), opens/updates the bump PR (pull-requests) and stamps
+          # its label (issues). A downscoped token cannot read Actions variables,
+          # so the run-time roster read (BE-6482) does NOT use this token — the
+          # separate, repo-scoped var_token step below does. Do not merge the two:
+          # one token for both jobs would have to be minted with no `permission-*`
+          # inputs AND owner-wide, i.e. full installation permissions on every repo
+          # the App is installed on, just to read one variable.
           permission-contents: write
           permission-pull-requests: write
           permission-issues: write
+          owner: Comfy-Org
+
+      # A SECOND app token, for the ROSTER READ ALONE. Scoped to THIS repo
+      # (`repositories: github-workflows` — public, so nothing leaks by naming it)
+      # and deliberately left un-downscoped, so it carries the App's
+      # "Variables: read" grant: the `app-permissions` schema — the
+      # installation-token request body — has no `variables` key at all, so there
+      # is no `permission-variables` input to ask for in ANY version of
+      # create-github-app-token, and asking for nothing is the only spelling that
+      # yields that grant (BE-6477).
+      #
+      # It exists so the WRITE token above can stay downscoped. One token serving
+      # both purposes would have to be un-downscoped AND owner-wide — full
+      # installation permissions on EVERY repo the App is installed on, most of
+      # them private callers — purely to enable one read of this repo's own
+      # variable. This token is un-downscoped too, but `repositories:` confines it
+      # to this ONE public repo, so that is the whole of its blast radius.
+      - name: Generate roster-read token (this repo only)
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0 — pinned: see dependabot.yml ignore (v2+ breaks cross-repo `owner:` token scoping)
+        id: var_token
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+          owner: Comfy-Org
+          repositories: github-workflows
 
       - name: Bump SHA in caller repos
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
+          # The this-repo-only token, used ONLY for the roster read, so the write
+          # token above can stay downscoped (BE-6482 review).
+          VAR_TOKEN: ${{ steps.var_token.outputs.token }}
           NEW_SHA: ${{ github.sha }}
+          # Names the fleet's Actions variable. bump-callers.sh READS the roster
+          # out of it at run time (BE-6482) — it is deliberately NOT passed in
+          # through this `env:` block, because Actions prints a step's env into
+          # this PUBLIC repo's run log BEFORE the step runs, i.e. before the
+          # script's `::add-mask::` could cover the private caller names.
           VAR_NAME: PR_RISK_CALLERS
           TAG: pr-risk
           WORKFLOW_FILE: pr-risk.yml
           # Seeded empty; an empty list is a clean no-op, not an error.
           ALLOW_EMPTY: "true"
-          # JSON array of {"repo","file","label"} — see the header comment for the
-          # update flow. Kept in a variable (not the file) so private caller names
-          # never land in this public repo. NOTE: this env binding is itself the
-          # known log-exposure gap documented in the header — Actions dumps the
-          # step env before the script's `::add-mask::` runs.
-          CALLERS_JSON: ${{ vars.PR_RISK_CALLERS }}
         run: |
           # The main-only ref guard above cannot catch a manual RE-RUN of an
           # older main run: github.ref is refs/heads/main but github.sha is

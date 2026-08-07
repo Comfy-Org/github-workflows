@@ -5,9 +5,9 @@ workflows from rotting. When a reusable workflow is updated on `main`, it opens
 a SHA-bump PR in every repo that pins a caller against it — so consumers move
 forward automatically instead of silently drifting commits behind.
 
-- **`bump-callers.sh`** — the one, fleet-agnostic bump script (parse the caller
-  list, mask private repo names, rewrite the pin, keep one bump PR per caller
-  current). It is the single source of truth; the workflow entrypoints are
+- **`bump-callers.sh`** — the one, fleet-agnostic bump script (fetch the caller
+  list from its fleet's Actions variable, mask private repo names, rewrite the
+  pin, keep one bump PR per caller current). It is the single source of truth; the workflow entrypoints are
   thin wrappers that only supply per-fleet parameters. A forked copy is how other
   shared machinery in the org has drifted — this stays one file on purpose.
   - **One open bump PR per (repo, fleet), updated in place.** The head branch is
@@ -38,19 +38,22 @@ Its 12 live callers are known and correctly wired (each pins a full 40-hex SHA
 against this repo's path, i.e. exactly what the rewrite moves). It is unseeded
 anyway, on purpose.
 
-Every roster reaches `bump-callers.sh` through the step's `env:` block, and
+Every roster used to reach `bump-callers.sh` through the step's `env:` block, and
 Actions prints that block — values and all — before the script's `::add-mask::`
-can run. This repo is public, so each seeded fleet already publishes its roster
-in a world-readable log. That is the known gap documented in every `bump-*`
-header. The difference here is that two of this fleet's callers are non-public
-repos that appear in **no** already-seeded roster, so seeding would publish two
-names that are not out yet — and a public log entry cannot be unpublished.
+could run. This repo is public, so each seeded fleet had already published its
+roster in a world-readable log. The difference here was that two of this fleet's
+callers are non-public repos appearing in **no** already-seeded roster, so
+seeding would have published two names that are not out yet — and a public log
+entry cannot be unpublished. The trade was: seed now and take an irreversible
+disclosure, or leave it unseeded and take a red run. The red run is reversible
+and is already the designed behaviour for an empty roster, so it won.
 
-So the trade is: seed now and take an irreversible disclosure, or leave it
-unseeded and take a red run. The red run is reversible and is already the
-designed behaviour for an empty roster, so it wins. Seed the variable as the
-immediate follow-on to the masking fix — never as a way to turn that red run
-green.
+**That blocker is gone** (BE-6482 — the roster is fetched and masked inside the
+script), but the variable is still unset, so the red run persists until someone
+seeds it. Do that once a dispatch of the entrypoint has been seen reading its
+variable *without* the "cannot read Actions variables" error — that error means
+the App still lacks **Variables: read**, and a roster the script cannot read is
+one it cannot mask either. Never seed it merely to turn the red run green.
 
 ### Reusables with no fleet — deliberate, not an oversight
 
@@ -154,13 +157,39 @@ repo-level Actions **variable** (config, not a credential) as a JSON array of
 `{"repo","file","label"}` objects (`label` optional). `bump-callers.sh`
 `::add-mask::`es every repo name out of the run logs before echoing it.
 
-> **Known gap.** Each entrypoint hands the roster to the script through the
-> step's `env:`, and Actions prints a step's env block *before* the step runs —
-> so the raw roster appears in the (public) log ahead of any masking. Closing it
-> means fetching the variable at run time (`gh variable get`) and masking it
-> before first use, which needs a token permission the fleets do not mint today.
-> It is fleet-wide; no single entrypoint can fix it. Until then, assume the
-> roster is public.
+The roster is **fetched at run time by the script**, keyed by the `VAR_NAME` its
+entrypoint passes, and masked before the first log line — it is not bound into
+the step's `env:` block any more (BE-6482). That binding was the leak: Actions
+prints a step's env block *before* the step runs, so the raw roster reached the
+public log ahead of the masking meant to cover it. Fetching inside the script
+puts the read, the shape check and the `::add-mask::` in an order the log cannot
+get in front of.
+
+Two consequences worth knowing:
+
+- **Two tokens, not one.** A downscoped App token cannot read Actions variables
+  — the app-permissions schema (the installation-token request body) has no
+  `variables` key, so there is no `permission-variables` input to ask for, and
+  only a token minted with *no* `permission-*` inputs carries the App's
+  **Variables: read** grant. Rather than widen the token that writes across the
+  whole fleet, each entrypoint mints a **second** token scoped to this repo alone
+  (`repositories: github-workflows`) and hands it to the script as `VAR_TOKEN`,
+  used for the roster read and nothing else. The write token (`GH_TOKEN`) keeps
+  its `contents` / `pull-requests` / `issues` downscoping. `VAR_TOKEN` is
+  optional: unset, the read falls back to `GH_TOKEN` (manual runs).
+- **The App needs the grant.** The Cloud Code Bot App itself must hold the
+  repository permission **Variables: read**, approved on the Comfy-Org
+  installation, or every fleet fails with an explicit error naming that grant.
+
+The read tries the **repo-level** variable first and falls back to the
+**org-level** one, matching what the `${{ vars.* }}` binding it replaced
+resolved (repo wins on a name clash). Absent at both scopes is an *empty roster*
+— handled by `ALLOW_EMPTY` exactly as an empty variable is — but it always logs
+a `::warning::`, because a 404 is also how GitHub answers "this token cannot see
+the repository at all".
+
+`CALLERS_JSON` still works as an explicit override for a manual run and is what
+the test suite drives; a set-but-empty value means "empty roster", not "fetch".
 
 Adding/removing a caller needs **no public commit** — edit the variable:
 
