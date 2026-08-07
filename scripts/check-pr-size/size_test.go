@@ -213,7 +213,7 @@ func TestIsTestPath(t *testing.T) {
 		{"web/src/__tests__/render.tsx", true},
 		// Type tests — the `test` component need not adjoin the extension.
 		{"web/src/api.test.d.ts", true},
-		{"web/src/api.spec.d.ts", true},
+		{"web/src/api.test.helpers.ts", true},
 		{"web/src/__snapshots__/Button.test.tsx.snap", true},
 		{"web/src/__mocks__/fs.ts", true},
 		// Directory conventions, at any depth
@@ -240,6 +240,15 @@ func TestIsTestPath(t *testing.T) {
 		// A `test`/`spec` component must not be the FIRST one.
 		{"web/src/spec.helpers.ts", false},
 		{"web/src/manifest.d.ts", false},
+		// `spec` matches ONLY as the final stem component: in this org these are
+		// OpenAPI production artifacts, and excluding them would UNDER-count.
+		{"web/src/api.spec.types.ts", false},
+		{"web/src/openapi.spec.client.ts", false},
+		{"web/src/payments.spec.gen.ts", false},
+		{"web/src/api.spec.d.ts", false},
+		// Unicode case folding must not widen the segment match: U+212A KELVIN
+		// SIGN lowercases to `k` under strings.ToLower.
+		{"src/__MOC\u212AS__/fs.ts", false},
 		{"testify.go", false},
 		{"latest_test_results.md", false},
 		// `spec/` holds OpenAPI schemas in this org, not RSpec suites.

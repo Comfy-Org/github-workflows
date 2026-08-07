@@ -288,11 +288,27 @@ func hasTestSegment(path string) bool {
 		return false // no directory part at all
 	}
 	for _, seg := range strings.Split(dir[:slash], "/") {
-		if testPathSegments[strings.ToLower(seg)] {
+		if testPathSegments[asciiLower(seg)] {
 			return true
 		}
 	}
 	return false
+}
+
+// asciiLower lowercases A–Z only. strings.ToLower applies Unicode simple case
+// folding, under which U+212A KELVIN SIGN lowercases to `k` — so a directory
+// named `__MOC⟨U+212A⟩S__` would fold to `__mocks__` and drop everything beneath
+// it out of the count. The casing tolerance here exists for .NET/Unity trees
+// (`Tests/`, `TestData/`), which is an ASCII concern, so ASCII is all it should
+// do.
+func asciiLower(s string) string {
+	b := []byte(s)
+	for i := range b {
+		if b[i] >= 'A' && b[i] <= 'Z' {
+			b[i] += 'a' - 'A'
+		}
+	}
+	return string(b)
 }
 
 // isTestFileName reports whether a file's base name follows a test-file naming
@@ -311,15 +327,26 @@ func isTestFileName(base string) bool {
 		return true
 	}
 	if dot := strings.LastIndex(base, "."); dot > 0 && jsTestExts[base[dot:]] {
-		// Any dot-separated component of the stem AFTER the first being exactly
-		// `test` or `spec` marks a test file. Checking components rather than
-		// only the one adjoining the extension also catches type tests
-		// (`foo.test.d.ts`), which match the `*.test.*` convention the docs
-		// advertise. Requiring a NON-first component is what keeps a
-		// hand-written module literally named `spec.ts` counted.
+		// A dot-separated stem component that is exactly `test` or `spec` marks
+		// a test file, but the two are NOT symmetric:
+		//
+		//   `test` matches in any component after the first, which catches type
+		//     tests (`foo.test.d.ts`) — the `*.test.*` convention the docs
+		//     advertise.
+		//   `spec` matches ONLY as the final stem component. In this org `spec`
+		//     names OpenAPI artifacts, so `api.spec.types.ts` and
+		//     `openapi.spec.client.ts` are PRODUCTION files — the same reasoning
+		//     that keeps `spec`/`specs` out of testPathSegments above. Matching
+		//     them would be an under-count, which is the unsafe direction:
+		//     failing to exclude a test file only over-counts, but excluding a
+		//     production file shrinks the number the cap protects.
+		//
+		// Requiring a non-first component is what keeps a hand-written module
+		// literally named `spec.ts` counted.
 		parts := strings.Split(base[:dot], ".")
-		for _, p := range parts[1:] {
-			if p == "test" || p == "spec" {
+		rest := parts[1:]
+		for i, p := range rest {
+			if p == "test" || (p == "spec" && i == len(rest)-1) {
 				return true
 			}
 		}

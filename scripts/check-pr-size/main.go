@@ -407,16 +407,60 @@ func sanitizePath(path string) string {
 		case r == '`':
 			// Would close the code span the caller wraps this in.
 			out = '\''
-		case r < 0x20 || r == 0x7f || unicode.Is(unicode.Cf, r):
-			// Newlines, CR, other C0 controls, and invisible format characters.
+		case unicode.Is(unicode.Cc, r) || unicode.Is(unicode.Cf, r) ||
+			unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r):
+			// Cc covers C0 AND C1 — U+0085 (NEL) is a C1 control that renders as
+			// a line break, as do the Zl/Zp separators U+2028/U+2029, so all
+			// three are the same list-escape this function exists to block. Cf
+			// covers the invisible format characters (bidi overrides/isolates,
+			// ZWJ). U+009B (CSI) additionally lets ANSI sequences into the
+			// public run log even though ESC itself is a C0 control.
 			out = '?'
-		}
-		if b.Len()+utf8.RuneLen(out) > maxPathDisplay {
-			return b.String() + "…"
 		}
 		b.WriteRune(out)
 	}
-	return b.String()
+	return elideMiddle(b.String(), maxPathDisplay)
+}
+
+// elideMiddle bounds s to max bytes by dropping the MIDDLE, never the tail.
+// Truncating the tail would discard the very evidence the report is being read
+// for: a long path's classifying segment usually sits at the end, so
+// `<150 bytes of prefix>/tests/prod.go` would render as a truncated
+// production-looking path in the "Largest excluded test files" list — defeating
+// the auditability that list exists to provide — and distinct paths sharing a
+// prefix would render identically. Cuts land only on rune boundaries, so the
+// result is always valid UTF-8.
+func elideMiddle(s string, max int) string {
+	const ellipsis = "…"
+	if len(s) <= max {
+		return s
+	}
+	if max <= len(ellipsis) {
+		return ellipsis
+	}
+	budget := max - len(ellipsis)
+	headBudget, tailBudget := budget/2, budget-budget/2
+
+	head := 0
+	for i := range s { // range over a string yields rune START offsets
+		if i > headBudget {
+			break
+		}
+		head = i
+	}
+	tail := len(s)
+	for i := len(s); i > 0; {
+		_, size := utf8.DecodeLastRuneInString(s[:i])
+		if len(s)-(i-size) > tailBudget {
+			break
+		}
+		i -= size
+		tail = i
+	}
+	if tail < head {
+		tail = head
+	}
+	return s[:head] + ellipsis + s[tail:]
 }
 
 // topFiles renders a collapsed list of up to 10 matching files, largest first
@@ -448,10 +492,23 @@ func topFiles(files []FileChange, summary string, keep func(FileChange) bool) st
 func report(res Result, mode, bypassLabel string) {
 	summary := renderReport(res, mode, bypassLabel)
 	fmt.Println(summary)
+	// Errors are surfaced, not swallowed: this PR makes the step summary the
+	// SOLE carrier of the excluded-test total wherever the bot comment cannot
+	// post (fork and Dependabot PRs never receive the secret), so a failed write
+	// silently removes those PRs' only surface.
 	if path := os.Getenv("GITHUB_STEP_SUMMARY"); path != "" {
-		if f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o644); err == nil {
-			defer f.Close()
-			fmt.Fprintln(f, summary)
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "check-pr-size: cannot open GITHUB_STEP_SUMMARY: %v\n", err)
+			return
+		}
+		_, werr := fmt.Fprintln(f, summary)
+		cerr := f.Close()
+		if werr != nil {
+			fmt.Fprintf(os.Stderr, "check-pr-size: writing GITHUB_STEP_SUMMARY failed: %v\n", werr)
+		}
+		if cerr != nil {
+			fmt.Fprintf(os.Stderr, "check-pr-size: closing GITHUB_STEP_SUMMARY failed: %v\n", cerr)
 		}
 	}
 }

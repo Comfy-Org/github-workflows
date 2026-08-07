@@ -352,6 +352,11 @@ jobs:
           GH_TOKEN: ${{ steps.bot.outputs.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          # The minted token's OWN bot login. app-slug comes from the token
+          # mint, so it identifies this installation whether `bot_app_id` was
+          # given as a numeric App ID or a Client ID (`Iv1.…`) — which is what
+          # made matching on the app id unreliable.
+          BOT_LOGIN: ${{ steps.bot.outputs.app-slug }}[bot]
         run: |
           set -euo pipefail
           if [ ! -s report/pr-size-report.md ]; then
@@ -370,16 +375,20 @@ jobs:
           # scripts/pr-risk/publish-risk-surfaces.sh deliberately — same hazards,
           # so the same shape rather than a second dialect of it.
           #
-          #   .user.type == "Bot" — the marker is published in this PUBLIC
-          #     workflow file, so without an author filter a PR author can
+          #   .user.login == our own bot — the marker is published in this
+          #     PUBLIC workflow file, so without an author filter a PR author can
           #     pre-seed a comment carrying it and we would PATCH THEIRS instead
           #     of posting ours, after which they rewrite it freely. Since
           #     `exclude_tests` makes this comment the ONLY signal on a green
           #     test-heavy PR, that is a hole straight through the guarantee.
-          #     Type is used rather than the app id because
-          #     create-github-app-token also accepts a CLIENT id (`Iv1.…`) for
-          #     `app-id`; a caller wiring that would never match the numeric app
-          #     id and would silently stack a new comment on every push.
+          #     Matching the LOGIN (not merely `.user.type == "Bot"`) is what
+          #     keeps us to OUR comments: any other App or github-actions[bot]
+          #     workflow in a consumer repo that echoes author-controlled text as
+          #     its first line would otherwise be claimed as ours and PATCHed
+          #     away — and while such a comment exists the POST branch below
+          #     never runs, suppressing the decisive-green comment entirely.
+          #     `.user.type` is kept as a cheap second condition, mirroring
+          #     find_sticky.
           #
           #   startswith, not contains — the body renders the marker as its
           #     FIRST line, while another bot QUOTING this comment carries the
@@ -388,13 +397,14 @@ jobs:
           #     bot posts cursor-review and groom comments too, so an author can
           #     induce this by quoting the marker in the PR body.
           #
-          # The marker is passed as jq DATA (--arg), never spliced into the
-          # program text, so no value can turn the filter into a syntax error —
-          # which `set -euo pipefail` plus this step's continue-on-error would
-          # convert into a silent "no comment posted".
+          # Both the marker and the login are passed as jq DATA (--arg), never
+          # spliced into the program text, so no value can turn the filter into a
+          # syntax error — which `set -euo pipefail` plus this step's
+          # continue-on-error would convert into a silent "no comment posted".
           existing="$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
-            | jq -r --arg m "$MARKER" '
-                .[] | select((.user.type // "") == "Bot")
+            | jq -r --arg m "$MARKER" --arg login "$BOT_LOGIN" '
+                .[] | select((.user.login // "") == $login)
+                    | select((.user.type // "") == "Bot")
                     | select(((.body // "") | startswith($m)))
                     | .id')"
           if [ -n "$existing" ]; then
@@ -409,9 +419,20 @@ jobs:
             # Unquoted on purpose: the ids are numeric and newline-separated, so
             # word splitting is exactly the right parse (and a heredoc's
             # terminator cannot be indented inside this YAML block scalar).
+            #
+            # Per-id failure is TOLERATED rather than fatal. Under
+            # `set -euo pipefail` a bare call would abort the loop on the first
+            # error and leave the remaining copies showing a stale verdict —
+            # precisely the split-brain this loop exists to prevent. A 404 is an
+            # expected case: the loop only has more than one id because
+            # duplicates happen, and a maintainer (or another run) deleting one
+            # between the list and the write is a real race.
             for id in $existing; do
-              gh api -X PATCH "repos/${REPO}/issues/comments/${id}" -F body=@body.md >/dev/null
-              echo "Updated sticky size comment ${id}."
+              if gh api -X PATCH "repos/${REPO}/issues/comments/${id}" -F body=@body.md >/dev/null 2>&1; then
+                echo "Updated sticky size comment ${id}."
+              else
+                echo "Could not update sticky size comment ${id} (deleted concurrently?); continuing." >&2
+              fi
             done
           elif [ "$OVER" = "true" ] || [ "$DECISIVE" = "true" ]; then
             gh api -X POST "repos/${REPO}/issues/${PR_NUMBER}/comments" -F body=@body.md >/dev/null

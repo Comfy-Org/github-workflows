@@ -597,6 +597,13 @@ func TestSanitizePath(t *testing.T) {
 		},
 		{"bidi isolate is replaced", "a⁦b⁩c.go", "a?b?c.go"},
 		{"zero-width joiner is replaced", "a‍b.go", "a?b.go"},
+		// C1 controls are NOT caught by `r < 0x20`; U+0085 (NEL) renders as a
+		// line break, and U+009B (CSI) opens ANSI sequences in the public log.
+		{"C1 next-line is replaced", "ab.go", "a?b.go"},
+		{"C1 CSI is replaced", "ab.go", "a?b.go"},
+		// Zl/Zp separators are line breaks too.
+		{"line separator is replaced", "a b.go", "a?b.go"},
+		{"paragraph separator is replaced", "a b.go", "a?b.go"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -613,8 +620,29 @@ func TestSanitizePath(t *testing.T) {
 		if len(got) > maxPathDisplay+len("…") {
 			t.Errorf("len = %d, want <= %d", len(got), maxPathDisplay+len("…"))
 		}
-		if !strings.HasSuffix(got, "…") {
-			t.Errorf("truncated path should be marked with an ellipsis, got %q", got[len(got)-10:])
+		// The ellipsis sits in the MIDDLE, not at the end — the tail is kept.
+		if !strings.Contains(got, "…") {
+			t.Errorf("truncated path should be marked with an ellipsis, got %q", got)
+		}
+		if !strings.HasSuffix(got, ".go") {
+			t.Errorf("the tail should survive elision, got %q", got)
+		}
+	})
+
+	// Truncating the TAIL would discard exactly the segment that explains why a
+	// file was classified as a test, in the list whose purpose is checking that
+	// classification. Eliding the middle keeps it.
+	t.Run("truncation keeps the classifying tail", func(t *testing.T) {
+		t.Parallel()
+		got := sanitizePath(strings.Repeat("a", 400) + "/tests/prod.go")
+		if !strings.HasSuffix(got, "/tests/prod.go") {
+			t.Errorf("the tail that shows WHY this counted as a test was truncated away: %q", got)
+		}
+		if !strings.Contains(got, "…") {
+			t.Errorf("an elided path should say so: %q", got)
+		}
+		if len(got) > maxPathDisplay+len("…") {
+			t.Errorf("len = %d, over bound", len(got))
 		}
 	})
 
