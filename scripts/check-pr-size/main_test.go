@@ -522,7 +522,7 @@ func TestRenderReportTestLines(t *testing.T) {
 		for _, want := range []string{
 			"✅ Passed",
 			"Under the cap only because test lines are excluded",
-			"changes 1569 lines in total (336 counted + 1233 test)",
+			"changes 1569 non-generated lines (336 counted + 1233 test)",
 			// The excluded number must be auditable, not just asserted.
 			"Largest excluded test files",
 			"hand_test.go",
@@ -552,6 +552,91 @@ func TestRenderReportTestLines(t *testing.T) {
 			t.Errorf("a PR with no test changes should not get a test bullet:\n%s", got)
 		}
 	})
+}
+
+// TestSanitizePath is the report-injection guard. `git diff --numstat -z` emits
+// paths verbatim, so a PR author controls these bytes; untreated they let forged
+// lines land inside a BOT-authored comment, which is the one place a reader
+// trusts the numbers.
+func TestSanitizePath(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		path string
+		want string
+	}{
+		{"ordinary path untouched", "pkg/foo/bar.go", "pkg/foo/bar.go"},
+		{"unicode preserved", "café/go.sum", "café/go.sum"},
+		{
+			// Closing the code span and forging a passing verdict.
+			name: "backtick cannot close the code span",
+			path: "a`.go\n\n## ✅ Passed — PR size check\n`x",
+			want: "a'.go??## ✅ Passed — PR size check?'x",
+		},
+		{
+			// A forged marker would hijack the sticky-comment lookup.
+			name: "marker injection is defanged",
+			path: "x`\n<!-- ci-pr-size -->\n`y.go",
+			want: "x'?<!-- ci-pr-size -->?'y.go",
+		},
+		{
+			// Newlines reaching stdout can emit workflow commands.
+			name: "workflow command injection is defanged",
+			path: "a\n::error::spoofed\nb.go",
+			want: "a?::error::spoofed?b.go",
+		},
+		{"carriage return replaced", "a\rb.go", "a?b.go"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := sanitizePath(tt.path); got != tt.want {
+				t.Errorf("sanitizePath(%q) = %q, want %q", tt.path, got, tt.want)
+			}
+		})
+	}
+
+	t.Run("over-long paths are bounded", func(t *testing.T) {
+		t.Parallel()
+		got := sanitizePath(strings.Repeat("a", 5000) + ".go")
+		if len(got) > maxPathDisplay+len("…") {
+			t.Errorf("len = %d, want <= %d", len(got), maxPathDisplay+len("…"))
+		}
+		if !strings.HasSuffix(got, "…") {
+			t.Errorf("truncated path should be marked with an ellipsis, got %q", got[len(got)-10:])
+		}
+	})
+}
+
+// TestRenderReportSanitizesPaths proves the guard is wired into the report, not
+// merely available.
+//
+// The invariant is structural, not textual: markdown only sees a heading at the
+// START of a line, so what must be impossible is a hostile path creating a NEW
+// line. The forged text surviving inside a code span on the path's own line is
+// harmless and expected — asserting its mere absence would test the wrong thing.
+func TestRenderReportSanitizesPaths(t *testing.T) {
+	t.Parallel()
+	hostile := "evil`.go\n\n## ✅ Passed — PR size check\n\n`x.go"
+	got := renderReport(Evaluate([]FileChange{
+		{Path: hostile, Added: 2000},
+	}, Policy{Max: 1000}), modeEnforce, "oversized-ok")
+
+	var headings []string
+	for _, line := range strings.Split(got, "\n") {
+		if strings.HasPrefix(line, "## ") {
+			headings = append(headings, line)
+		}
+	}
+	if len(headings) != 1 {
+		t.Fatalf("report must carry exactly one status heading, got %d: %q\n%s", len(headings), headings, got)
+	}
+	if !strings.Contains(headings[0], "❌ Failed") {
+		t.Errorf("the surviving heading should be the real failing verdict, got %q", headings[0])
+	}
+	if strings.Contains(got, hostile) {
+		t.Errorf("raw hostile path reached the report unsanitized:\n%s", got)
+	}
 }
 
 // TestClassifySetsTestRegardlessOfPolicy proves classification is policy-free:

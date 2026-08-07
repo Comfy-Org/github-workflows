@@ -123,12 +123,20 @@ type Policy struct {
 
 // Result is the outcome of evaluating a diff against the cap.
 type Result struct {
-	Counted   int  // changed lines from non-generated, non-binary files
-	Generated int  // changed lines excluded because the file is generated
-	Test      int  // changed lines in test files (excluded only if TestsExcluded)
-	Max       int  // the configured ceiling
-	Bypassed  bool // a bypass label was present
-	OK        bool // Bypassed OR Counted <= Max
+	// Counted is the number the cap is compared against: changed lines from
+	// non-binary files that are neither generated nor — when TestsExcluded is
+	// set — test files.
+	Counted int
+	// Generated is changed lines excluded because the file is generated. A
+	// generated file that is ALSO a test file is tallied here and not in Test.
+	Generated int
+	// Test is changed lines in non-generated test files. It is subtracted from
+	// Counted only when TestsExcluded is set; otherwise it is a subset of
+	// Counted, reported for information.
+	Test     int
+	Max      int  // the configured ceiling
+	Bypassed bool // a bypass label was present
+	OK       bool // Bypassed OR Counted <= Max
 	// TestsExcluded records whether Policy.ExcludeTests was set, so the report
 	// can say whether Test lines were subtracted from Counted or are part of it.
 	TestsExcluded bool
@@ -151,8 +159,15 @@ type Result struct {
 //
 // Bypassed results are excluded: the label already explains why the PR passed,
 // so attributing it to the exclusion would be misleading.
+//
+// Both halves of "under the cap ONLY because" are checked. Without the
+// `Counted <= Max` term a run that is over cap even after the exclusion
+// satisfies `Counted+Test > Max` trivially and would report itself decisive on a
+// RED run — harmless in today's callers (the report gates on OK, and the comment
+// job tests over-cap first) but wrong in the machine-readable output, which must
+// stand on its own.
 func (r Result) ExclusionDecisive() bool {
-	return r.TestsExcluded && !r.Bypassed && r.Counted+r.Test > r.Max
+	return r.TestsExcluded && !r.Bypassed && r.Counted <= r.Max && r.Counted+r.Test > r.Max
 }
 
 // ParseNumstat parses the output of `git diff --numstat -z`. Records are

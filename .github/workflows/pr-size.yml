@@ -27,7 +27,10 @@ name: PR Size Cap (reusable)
 # its own line, and when the exclusion is the ONLY reason a PR is under the cap
 # the bot comment is posted even though the check is green — otherwise the
 # number would be confined to the step summary in exactly the case it exists
-# for, and a large test-only PR would pass unremarked.
+# for, and a large test-only PR would pass unremarked. That green-check comment
+# needs `comment: true` plus bot credentials; a repo that sets `exclude_tests`
+# without the App keeps the loosening and loses the visibility, so configure
+# both together.
 #
 # Bypass: add the `bypass_label` (default `oversized-ok`) to the PR for a
 # legitimately large change. The check still runs (so it always posts a
@@ -344,6 +347,7 @@ jobs:
           GH_TOKEN: ${{ steps.bot.outputs.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          BOT_APP_ID: ${{ inputs.bot_app_id }}
         run: |
           set -euo pipefail
           if [ ! -s report/pr-size-report.md ]; then
@@ -358,8 +362,18 @@ jobs:
           { printf '%s\n\n' "$MARKER"; cat report/pr-size-report.md; } > body.md
           # Find our existing sticky comment (if any) by the hidden marker, so
           # we update one comment across pushes instead of stacking new ones.
+          #
+          # The author filter is load-bearing, not defensive dressing: the marker
+          # is published in this PUBLIC workflow file, so without it a PR author
+          # can pre-seed a comment containing the marker and we would PATCH
+          # THEIR comment instead of posting ours — after which they can rewrite
+          # it freely, suppressing or falsifying the size verdict. Since
+          # `exclude_tests` makes this comment the ONLY signal for a green
+          # test-heavy PR, that is a silent hole straight through the guarantee.
+          # Matching on the app id (compared as a string, so a non-numeric input
+          # cannot make jq abort) keeps us to comments this app actually wrote.
           existing="$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
-            --jq ".[] | select(.body | contains(\"${MARKER}\")) | .id")"
+            --jq ".[] | select(((.performed_via_github_app.id // \"\") | tostring) == \"${BOT_APP_ID}\") | select(.body | contains(\"${MARKER}\")) | .id")"
           existing="$(printf '%s' "$existing" | head -n1)"
           if [ -n "$existing" ]; then
             # Update in place — flips to ✅ when a previously-flagged PR is fixed.

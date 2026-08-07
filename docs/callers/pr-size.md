@@ -98,7 +98,22 @@ files so the number can be audited rather than taken on trust. When the
 exclusion is the *only* reason a PR is under the cap, the sticky comment posts
 even though the check is green — otherwise the number would live solely in the
 Actions step summary in precisely the case that matters, and a 5,000-line
-"test-only" PR really would pass unremarked. Recognized: `*_test.go`; `test_*.py`,
+"test-only" PR really would pass unremarked.
+
+**That green-check comment needs the bot App.** It requires `comment: true`
+(the default) *and* `bot_app_id` + `BOT_APP_PRIVATE_KEY` — all optional. Opt into
+`exclude_tests` without the App and you get precisely the outcome the paragraph
+above says is prevented: a green check whose excluded total is visible only to
+someone who opens the Actions step summary. **If you set `exclude_tests`,
+configure the App too** — otherwise you keep the loosening and lose the
+visibility that justifies it.
+
+Note also that `extra_generated_globs` (below) classifies matches as
+*generated*, not *test*: they never reach the excluded-test total and never
+trigger the green-check comment. A repo leaning on it for an unusual test layout
+opts out of this visibility guarantee.
+
+Recognized: `*_test.go`; `test_*.py`,
 `*_test.py`, `conftest.py`; `*.test.*` / `*.spec.*` for `.js .jsx .mjs .cjs .ts
 .tsx .mts .cts`; and any file under a `test/`, `tests/`, `testing/`,
 `testdata/`, `e2e/`, `__tests__/`, `__mocks__/` or `__snapshots__/` **directory**

@@ -509,6 +509,14 @@ func TestExclusionDecisive(t *testing.T) {
 			want: true,
 		},
 		{
+			// Over cap even after the exclusion: `Counted+Test > Max` is
+			// trivially true, so without the `Counted <= Max` term this would
+			// claim decisiveness on a RED run.
+			name: "over cap despite the exclusion is not decisive",
+			res:  Result{Counted: 1500, Test: 500, Max: 1000, TestsExcluded: true},
+			want: false,
+		},
+		{
 			name: "policy off — nothing was excluded, so nothing to explain",
 			res:  Result{Counted: 1569, Test: 1233, Max: 1000},
 			want: false,

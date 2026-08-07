@@ -344,7 +344,11 @@ func renderReport(res Result, mode, bypassLabel string) string {
 	// is the case the whole exclusion-reporting exists for, and it is also the
 	// one where the check is green and nobody has a reason to look.
 	if res.OK && res.ExclusionDecisive() {
-		fmt.Fprintf(&b, "\n**Under the cap only because test lines are excluded.** This PR changes %d lines in total (%d counted + %d test), over the %d-line cap; `exclude_tests` is what brings it under. Expected for a test-heavy change — surfaced so the real size is visible rather than implicit.\n",
+		// "non-generated" is load-bearing: res.Generated is deliberately outside
+		// this sum, so calling it the PR's total would understate a diff that
+		// also regenerated a lockfile — in the one sentence whose whole job is
+		// making the real size visible.
+		fmt.Fprintf(&b, "\n**Under the cap only because test lines are excluded.** This PR changes %d non-generated lines (%d counted + %d test), over the %d-line cap; `exclude_tests` is what brings it under. Expected for a test-heavy change — surfaced so the real size is visible rather than implicit.\n",
 			res.Counted+res.Test, res.Counted, res.Test, res.Max)
 	}
 	if res.Note != "" {
@@ -366,6 +370,42 @@ func renderReport(res Result, mode, bypassLabel string) string {
 	return b.String()
 }
 
+// maxPathDisplay bounds one rendered path. Two 10-entry lists with unbounded
+// paths could push the comment body past GitHub's 65,536-character limit, and
+// the upsert step runs under continue-on-error — so an over-long body 422s and
+// degrades SILENTLY to "no comment posted", which is precisely the unremarked
+// pass the decisive-green comment exists to prevent.
+const maxPathDisplay = 160
+
+// sanitizePath makes a repo-relative path safe to interpolate into the markdown
+// report. `git diff --numstat -z` emits paths VERBATIM (see ParseNumstat), so a
+// path may legitimately contain backticks, newlines and other control bytes.
+// Untreated, a PR author can name a file so the code span closes and forged
+// lines land inside a BOT-authored comment — a second "✅ Passed" heading, a
+// fake "Excluded (tests): 0", or another sticky-comment marker — and a newline
+// reaching stdout can emit a `::` workflow command. Control characters are
+// replaced, backticks neutralized, and the result bounded by maxPathDisplay.
+func sanitizePath(path string) string {
+	var b strings.Builder
+	for _, r := range path {
+		switch {
+		case r == '`':
+			// Would close the code span the caller wraps this in.
+			b.WriteRune('\'')
+		case r < 0x20 || r == 0x7f:
+			// Newlines, CR, and other control bytes: one visible placeholder.
+			b.WriteRune('?')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	s := b.String()
+	if len(s) > maxPathDisplay {
+		s = s[:maxPathDisplay] + "…"
+	}
+	return s
+}
+
 // topFiles renders a collapsed list of up to 10 matching files, largest first
 // (res.Files is already sorted by Changed descending). Returns "" when nothing
 // matches, so the caller can append unconditionally.
@@ -379,7 +419,7 @@ func topFiles(files []FileChange, summary string, keep func(FileChange) bool) st
 		if shown == 0 {
 			fmt.Fprintf(&b, "\n<details><summary>%s</summary>\n\n", summary)
 		}
-		fmt.Fprintf(&b, "- `%s` (+%d/-%d)\n", f.Path, f.Added, f.Deleted)
+		fmt.Fprintf(&b, "- `%s` (+%d/-%d)\n", sanitizePath(f.Path), f.Added, f.Deleted)
 		shown++
 		if shown >= 10 {
 			break
@@ -421,8 +461,15 @@ func writeGitHubOutputs(res Result) {
 		return
 	}
 	defer f.Close()
+	// tests_excluded reports what was actually EXCLUDED, so it is 0 under the
+	// default policy — there, res.Test is a subset of counted and naming it an
+	// exclusion would assert something that did not happen.
+	testsExcluded := 0
+	if res.TestsExcluded {
+		testsExcluded = res.Test
+	}
 	fmt.Fprintf(f, "over_cap=%t\ncounted=%d\ntests_excluded=%d\ntests_decisive=%t\n",
-		!res.OK, res.Counted, res.Test, res.ExclusionDecisive())
+		!res.OK, res.Counted, testsExcluded, res.ExclusionDecisive())
 }
 
 // gitTimeout bounds every git invocation so a hung git (a wedged credential
