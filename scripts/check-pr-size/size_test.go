@@ -215,6 +215,10 @@ func TestIsTestPath(t *testing.T) {
 		{"web/src/__mocks__/fs.ts", true},
 		// Directory conventions, at any depth
 		{"e2e/checkout.ts", true},
+		// Segment matching is case-insensitive (.NET/C#/Unity casing).
+		{"src/Tests/FooTests.cs", true},
+		{"src/TestData/golden.json", true},
+		{"E2E/Checkout.cs", true},
 		{"services/checkout/e2e/flow.go", true},
 		{"test/helpers.rb", true},
 		{"src/test/java/com/x/FooTest.java", true},
@@ -468,6 +472,65 @@ func TestEvaluate(t *testing.T) {
 			}
 			if got.OK != tt.wantOK {
 				t.Errorf("OK = %v, want %v", got.OK, tt.wantOK)
+			}
+		})
+	}
+}
+
+// TestExclusionDecisive pins when the report is forced to explain itself: only
+// when the exclusion is the sole reason the PR is under the cap. It drives the
+// sticky comment on a GREEN check, so a false positive means a comment on every
+// PR and a false negative means the number stays hidden in the step summary.
+func TestExclusionDecisive(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		res  Result
+		want bool
+	}{
+		{
+			name: "excluded tests are what keep it under",
+			res:  Result{Counted: 336, Test: 1233, Max: 1000, TestsExcluded: true},
+			want: true,
+		},
+		{
+			name: "would pass anyway — tests are incidental",
+			res:  Result{Counted: 100, Test: 50, Max: 1000, TestsExcluded: true},
+			want: false,
+		},
+		{
+			name: "exactly at the cap without tests is not over",
+			res:  Result{Counted: 900, Test: 100, Max: 1000, TestsExcluded: true},
+			want: false,
+		},
+		{
+			name: "one line over is decisive",
+			res:  Result{Counted: 900, Test: 101, Max: 1000, TestsExcluded: true},
+			want: true,
+		},
+		{
+			name: "policy off — nothing was excluded, so nothing to explain",
+			res:  Result{Counted: 1569, Test: 1233, Max: 1000},
+			want: false,
+		},
+		{
+			// The label already explains why it passed; crediting the exclusion
+			// would be misleading.
+			name: "bypassed results are never attributed to the exclusion",
+			res:  Result{Counted: 336, Test: 1233, Max: 1000, TestsExcluded: true, Bypassed: true},
+			want: false,
+		},
+		{
+			name: "no test lines at all",
+			res:  Result{Counted: 500, Max: 1000, TestsExcluded: true},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tt.res.ExclusionDecisive(); got != tt.want {
+				t.Errorf("ExclusionDecisive() = %v, want %v", got, tt.want)
 			}
 		})
 	}

@@ -93,12 +93,18 @@ and read `.gitattributes` from the base ref precisely so a PR cannot exempt
 itself — test detection only looks at the path. Nothing stops production code
 being parked in `tests/` to duck the cap. That is why it is off by default, and
 why the excluded total is always printed on its own line: the report shows
-`Excluded (tests): N` next to the counted number, so a 5,000-line "test-only" PR
-is visible rather than silently small. Recognized: `*_test.go`; `test_*.py`,
+`Excluded (tests): N` next to the counted number, and names the largest excluded
+files so the number can be audited rather than taken on trust. When the
+exclusion is the *only* reason a PR is under the cap, the sticky comment posts
+even though the check is green — otherwise the number would live solely in the
+Actions step summary in precisely the case that matters, and a 5,000-line
+"test-only" PR really would pass unremarked. Recognized: `*_test.go`; `test_*.py`,
 `*_test.py`, `conftest.py`; `*.test.*` / `*.spec.*` for `.js .jsx .mjs .cjs .ts
 .tsx .mts .cts`; and any file under a `test/`, `tests/`, `testing/`,
 `testdata/`, `e2e/`, `__tests__/`, `__mocks__/` or `__snapshots__/` **directory**
-segment. `spec/` is deliberately *not* a test directory — in this org it holds
+segment (segment matching is case-insensitive, so `Tests/` and `TestData/` work
+too; the file-name rules stay case-sensitive because their toolchains define
+them in lowercase). `spec/` is deliberately *not* a test directory — in this org it holds
 OpenAPI schemas, which are production artifacts. For a layout these miss, add
 `extra_generated_globs` (they land in the generated bucket instead).
 

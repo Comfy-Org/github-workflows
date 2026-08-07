@@ -453,6 +453,21 @@ func TestRenderReport(t *testing.T) {
 	})
 }
 
+// section returns the body of the named <details> block in a report, or "" if
+// absent — so a test can assert which LIST a file appears in, not merely that
+// its name occurs somewhere in the markdown.
+func section(report, summary string) string {
+	start := strings.Index(report, "<summary>"+summary+"</summary>")
+	if start < 0 {
+		return ""
+	}
+	rest := report[start:]
+	if end := strings.Index(rest, "</details>"); end >= 0 {
+		return rest[:end]
+	}
+	return rest
+}
+
 // TestRenderReportTestLines is the visibility guarantee for the exclusion: the
 // test total must appear in the report BOTH ways round — as an explicit
 // exclusion when opted in (so a large test-only PR cannot pass unremarked), and
@@ -476,9 +491,9 @@ func TestRenderReportTestLines(t *testing.T) {
 				t.Errorf("report missing %q:\n%s", want, got)
 			}
 		}
-		// The "largest counted files" list must add up to the counted number, so
-		// an excluded test file has no business in it.
-		if strings.Contains(got, "hand_test.go") {
+		// An excluded test file has no business in the COUNTED list (it does
+		// belong in the excluded one, checked separately below).
+		if strings.Contains(section(got, "Largest counted files"), "hand_test.go") {
 			t.Errorf("excluded test file must not appear in the largest-counted list:\n%s", got)
 		}
 	})
@@ -498,6 +513,35 @@ func TestRenderReportTestLines(t *testing.T) {
 		}
 		if strings.Contains(got, "Excluded (tests)") {
 			t.Errorf("tests are counted here, so nothing may claim they were excluded:\n%s", got)
+		}
+	})
+
+	t.Run("a green PR saved by the exclusion says so and lists the excluded files", func(t *testing.T) {
+		t.Parallel()
+		got := renderReport(Evaluate(files, Policy{Max: 1000, ExcludeTests: true}), modeEnforce, "oversized-ok")
+		for _, want := range []string{
+			"✅ Passed",
+			"Under the cap only because test lines are excluded",
+			"changes 1569 lines in total (336 counted + 1233 test)",
+			// The excluded number must be auditable, not just asserted.
+			"Largest excluded test files",
+			"hand_test.go",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("report missing %q:\n%s", want, got)
+			}
+		}
+	})
+
+	t.Run("a PR that would pass anyway gets no such explanation", func(t *testing.T) {
+		t.Parallel()
+		small := []FileChange{
+			{Path: "hand.go", Added: 10},
+			{Path: "hand_test.go", Added: 20, Test: true},
+		}
+		got := renderReport(Evaluate(small, Policy{Max: 1000, ExcludeTests: true}), modeEnforce, "oversized-ok")
+		if strings.Contains(got, "only because test lines are excluded") {
+			t.Errorf("a comfortably-under PR must not claim the exclusion saved it:\n%s", got)
 		}
 	})
 

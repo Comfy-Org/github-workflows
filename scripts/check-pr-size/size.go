@@ -51,6 +51,12 @@ var lockfileNames = map[string]bool{
 // directory segments are considered (never the file name itself), so a
 // hand-written file literally named `test` is still counted.
 //
+// Segment matching is case-INSENSITIVE, so .NET/C#/Unity trees (`Tests/`,
+// `TestData/`, `E2E/`) are recognized. The file-name rules below stay
+// case-sensitive on purpose: `_test.go` and `conftest.py` are spelled in
+// lowercase by their toolchains, so a capitalized variant is not the convention
+// and matching it would only add false positives.
+//
 // `spec`/`specs` are deliberately absent: in this org those hold API schemas
 // (OpenAPI), which are production artifacts. The unambiguous `*.spec.ts`
 // file-name convention is handled below instead.
@@ -131,6 +137,22 @@ type Result struct {
 	// Note is an optional human-facing explanation appended to the report (e.g.
 	// why linguist-generated exclusions were skipped). Set by the caller.
 	Note string
+}
+
+// ExclusionDecisive reports whether the test exclusion is the ONLY reason this
+// PR is under the cap — it would be over if test lines counted.
+//
+// This is the case the reporting exists for. A PR that passes on its own merits
+// needs no explanation; one that passes only because 1,200 test lines were
+// subtracted is exactly the "large test-only PR sails through unremarked" risk,
+// so the workflow uses this to force the sticky comment even when the check is
+// green (the comment otherwise posts only on overage, which would hide the
+// number in precisely the case it matters most).
+//
+// Bypassed results are excluded: the label already explains why the PR passed,
+// so attributing it to the exclusion would be misleading.
+func (r Result) ExclusionDecisive() bool {
+	return r.TestsExcluded && !r.Bypassed && r.Counted+r.Test > r.Max
 }
 
 // ParseNumstat parses the output of `git diff --numstat -z`. Records are
@@ -251,7 +273,7 @@ func hasTestSegment(path string) bool {
 		return false // no directory part at all
 	}
 	for _, seg := range strings.Split(dir[:slash], "/") {
-		if testPathSegments[seg] {
+		if testPathSegments[strings.ToLower(seg)] {
 			return true
 		}
 	}
@@ -392,9 +414,11 @@ func TouchesGitattributes(files []FileChange) bool {
 // When Policy.Bypassed is true the result is always OK, but the counts are still
 // reported.
 //
-// The three buckets never overlap: a generated file that is ALSO a test file
-// counts once, as generated, so Counted + Generated + Test is always the diff's
-// total non-binary changed lines regardless of policy.
+// Generated and Test never overlap: a file that is both counts once, as
+// generated. Whether Test overlaps Counted depends on policy. With ExcludeTests
+// set the three are a partition — Counted + Generated + Test is the diff's total
+// non-binary changed lines. WITHOUT it, Test is a SUBSET of Counted, reported
+// for information only, so that same sum double-counts the test lines.
 func Evaluate(files []FileChange, p Policy) Result {
 	// Copy before sorting so we honor the file header's "side-effect-free"
 	// contract and never reorder the caller's slice in place.

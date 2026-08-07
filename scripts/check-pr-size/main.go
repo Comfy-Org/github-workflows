@@ -161,10 +161,13 @@ func classify(files []FileChange, base, head string, attr attrPolicy, extras Ext
 	}
 	for i := range files {
 		f := &files[i]
+		// Set before the binary guard so Result.Files reports a binary fixture
+		// under testdata/ or __snapshots__/ as the test file it is. No numeric
+		// effect — Changed() is 0 for binaries either way.
+		f.Test = IsTestPath(f.Path)
 		if f.Binary {
 			continue
 		}
-		f.Test = IsTestPath(f.Path)
 		if IsLockfile(f.Path) || extras.Generated(f.Path) ||
 			attrGen[f.Path] ||
 			contentGenerated(f.Path, base, head) {
@@ -337,31 +340,55 @@ func renderReport(res Result, mode, bypassLabel string) string {
 		b.WriteString("- Split it into smaller, independently reviewable PRs (stacked PRs help).\n")
 		fmt.Fprintf(&b, "- If the size is justified, add the `%s` label to bypass this check.\n", bypassLabel)
 	}
+	// The PR passes ONLY because tests were subtracted — say so unprompted. This
+	// is the case the whole exclusion-reporting exists for, and it is also the
+	// one where the check is green and nobody has a reason to look.
+	if res.OK && res.ExclusionDecisive() {
+		fmt.Fprintf(&b, "\n**Under the cap only because test lines are excluded.** This PR changes %d lines in total (%d counted + %d test), over the %d-line cap; `exclude_tests` is what brings it under. Expected for a test-heavy change — surfaced so the real size is visible rather than implicit.\n",
+			res.Counted+res.Test, res.Counted, res.Test, res.Max)
+	}
 	if res.Note != "" {
 		fmt.Fprintf(&b, "\n> %s\n", res.Note)
 	}
-	// Largest contributing files, for quick triage. Only files that actually
-	// contribute to Counted are listed, so the list always adds up to the number
-	// above it.
+	// Largest contributors to Counted, for quick triage. Capped at 10, so this
+	// shows the biggest files rather than accounting for every counted line.
+	b.WriteString(topFiles(res.Files, "Largest counted files", func(f FileChange) bool {
+		return !f.Generated && f.Changed() > 0 && !(res.TestsExcluded && f.Test)
+	}))
+	// When tests are excluded, name the biggest of them too — otherwise
+	// `Excluded (tests): N` is an unauditable number: a reviewer sees a large
+	// exclusion with no way to check the files really are tests.
+	if res.TestsExcluded {
+		b.WriteString(topFiles(res.Files, "Largest excluded test files", func(f FileChange) bool {
+			return !f.Generated && f.Changed() > 0 && f.Test
+		}))
+	}
+	return b.String()
+}
+
+// topFiles renders a collapsed list of up to 10 matching files, largest first
+// (res.Files is already sorted by Changed descending). Returns "" when nothing
+// matches, so the caller can append unconditionally.
+func topFiles(files []FileChange, summary string, keep func(FileChange) bool) string {
+	var b strings.Builder
 	shown := 0
-	var top strings.Builder
-	for _, f := range res.Files {
-		if f.Generated || f.Changed() == 0 || (res.TestsExcluded && f.Test) {
+	for _, f := range files {
+		if !keep(f) {
 			continue
 		}
 		if shown == 0 {
-			top.WriteString("\n<details><summary>Largest counted files</summary>\n\n")
+			fmt.Fprintf(&b, "\n<details><summary>%s</summary>\n\n", summary)
 		}
-		fmt.Fprintf(&top, "- `%s` (+%d/-%d)\n", f.Path, f.Added, f.Deleted)
+		fmt.Fprintf(&b, "- `%s` (+%d/-%d)\n", f.Path, f.Added, f.Deleted)
 		shown++
 		if shown >= 10 {
 			break
 		}
 	}
-	if shown > 0 {
-		top.WriteString("\n</details>\n")
-		b.WriteString(top.String())
+	if shown == 0 {
+		return ""
 	}
+	b.WriteString("\n</details>\n")
 	return b.String()
 }
 
@@ -379,7 +406,11 @@ func report(res Result, mode, bypassLabel string) {
 // writeGitHubOutputs exposes the evaluation to later workflow steps via
 // GITHUB_OUTPUT. over_cap drives the sticky-comment job, which must post on
 // overage even in warn mode, where this process exits 0 and the job result
-// alone cannot distinguish over from under. No-op outside GitHub Actions.
+// alone cannot distinguish over from under. tests_decisive drives the same job
+// in the opposite case — green, but green only because test lines were
+// subtracted — which would otherwise post nothing and leave the excluded total
+// visible only to someone who opens the Actions step summary. No-op outside
+// GitHub Actions.
 func writeGitHubOutputs(res Result) {
 	path := os.Getenv("GITHUB_OUTPUT")
 	if path == "" {
@@ -390,7 +421,8 @@ func writeGitHubOutputs(res Result) {
 		return
 	}
 	defer f.Close()
-	fmt.Fprintf(f, "over_cap=%t\ncounted=%d\n", !res.OK, res.Counted)
+	fmt.Fprintf(f, "over_cap=%t\ncounted=%d\ntests_excluded=%d\ntests_decisive=%t\n",
+		!res.OK, res.Counted, res.Test, res.ExclusionDecisive())
 }
 
 // gitTimeout bounds every git invocation so a hung git (a wedged credential

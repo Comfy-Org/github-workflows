@@ -24,7 +24,10 @@ name: PR Size Cap (reusable)
 # `__snapshots__/`). Unlike the generated-file rules this is a convention, not a
 # proof — nothing stops production code being parked in `tests/` — which is why
 # it is opt-in rather than the default. The excluded total is ALWAYS reported on
-# its own line, so a large test-only PR cannot pass unremarked.
+# its own line, and when the exclusion is the ONLY reason a PR is under the cap
+# the bot comment is posted even though the check is green — otherwise the
+# number would be confined to the step summary in exactly the case it exists
+# for, and a large test-only PR would pass unremarked.
 #
 # Bypass: add the `bypass_label` (default `oversized-ok`) to the PR for a
 # legitimately large change. The check still runs (so it always posts a
@@ -36,7 +39,8 @@ name: PR Size Cap (reusable)
 # When a PR is over the cap and bot credentials are configured, the bot posts a
 # single sticky comment explaining the overage and the bypass label, then flips
 # it to ✅ once the PR is trimmed or labeled — the failing status alone does not
-# surface the bypass label. Without `bot_app_id` + BOT_APP_PRIVATE_KEY, or with
+# surface the bypass label. It also posts on a GREEN check when `exclude_tests`
+# is the only thing holding the PR under the cap (see `tests_decisive`). Without `bot_app_id` + BOT_APP_PRIVATE_KEY, or with
 # `comment: false`, the workflow degrades gracefully: the check status and the
 # size job's step summary still carry the full report; no comment is posted.
 #
@@ -239,14 +243,22 @@ jobs:
             --head "${HEAD_SHA}" | tee "${RUNNER_TEMP}/pr-size-report.md"
 
       - name: Record over-cap flag
-        # The comment job keys off this flag rather than the pr-size job's
-        # result, so `warn` mode (job green) still comments on overage. It
-        # rides the artifact, which — unlike job outputs — carries identically
+        # The comment job keys off these flags rather than the pr-size job's
+        # result, so `warn` mode (job green) still comments on overage. They
+        # ride the artifact, which — unlike job outputs — carries identically
         # whether this job passed or failed.
+        #
+        # tests_decisive covers the mirror-image case: the check is GREEN, but
+        # only because test lines were excluded. Without it no comment posts
+        # there, and the excluded total would be visible only in this job's step
+        # summary — hiding the number in exactly the case it exists for.
         if: always()
         env:
           OVER_CAP: ${{ steps.check.outputs.over_cap }}
-        run: printf '%s' "${OVER_CAP:-}" > "${RUNNER_TEMP}/pr-size-over-cap"
+          TESTS_DECISIVE: ${{ steps.check.outputs.tests_decisive }}
+        run: |
+          printf '%s' "${OVER_CAP:-}" > "${RUNNER_TEMP}/pr-size-over-cap"
+          printf '%s' "${TESTS_DECISIVE:-}" > "${RUNNER_TEMP}/pr-size-tests-decisive"
 
       # Hand the rendered report to the isolated `comment` job below. Uploaded
       # as an artifact (not a job output) so the job that holds the bot
@@ -259,6 +271,7 @@ jobs:
           path: |
             ${{ runner.temp }}/pr-size-report.md
             ${{ runner.temp }}/pr-size-over-cap
+            ${{ runner.temp }}/pr-size-tests-decisive
           if-no-files-found: warn
           retention-days: 7
 
@@ -338,6 +351,9 @@ jobs:
             exit 0
           fi
           OVER="$(cat report/pr-size-over-cap 2>/dev/null || true)"
+          # Green, but only because test lines were excluded — comment anyway,
+          # so the excluded total is not confined to the step summary.
+          DECISIVE="$(cat report/pr-size-tests-decisive 2>/dev/null || true)"
           MARKER='<!-- ci-pr-size -->'
           { printf '%s\n\n' "$MARKER"; cat report/pr-size-report.md; } > body.md
           # Find our existing sticky comment (if any) by the hidden marker, so
@@ -349,9 +365,13 @@ jobs:
             # Update in place — flips to ✅ when a previously-flagged PR is fixed.
             gh api -X PATCH "repos/${REPO}/issues/comments/${existing}" -F body=@body.md >/dev/null
             echo "Updated sticky size comment ${existing}."
-          elif [ "$OVER" = "true" ]; then
+          elif [ "$OVER" = "true" ] || [ "$DECISIVE" = "true" ]; then
             gh api -X POST "repos/${REPO}/issues/${PR_NUMBER}/comments" -F body=@body.md >/dev/null
-            echo "Posted oversize comment."
+            if [ "$OVER" = "true" ]; then
+              echo "Posted oversize comment."
+            else
+              echo "Under cap only via the test exclusion — posted the size breakdown."
+            fi
           else
             echo "Under cap and no existing comment — nothing to post."
           fi
