@@ -687,3 +687,32 @@ func TestRenameClassifiedConservatively(t *testing.T) {
 		t.Errorf("Counted = %d, want 920 — the 900 deleted production lines must not vanish", res.Counted)
 	}
 }
+
+// TestRenameIntoExclusionBucketsStillCounts covers every exclusion path a
+// rename could hide behind. numstat books a rename's deletions against the
+// DESTINATION, so moving production code into any excluded bucket would
+// otherwise erase those lines from the count.
+func TestRenameIntoExclusionBucketsStillCounts(t *testing.T) {
+	t.Parallel()
+	extras, err := ParseExtras("", "dist/**")
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := []FileChange{
+		{Path: "go.sum", OldPath: "src/big.go", Added: 0, Deleted: 900}, // into a lockfile
+		{Path: "dist/big.go", OldPath: "internal/big.go", Deleted: 800}, // into an extra glob
+		{Path: "tests/big.go", OldPath: "src/big.go", Deleted: 700},     // into a test dir
+		{Path: "go.sum", OldPath: "go.sum", Added: 10},                  // a genuine lockfile churn
+	}
+	classify(files, "", "", attrPolicy{}, extras)
+
+	for i, f := range files[:3] {
+		if f.Generated || f.Test {
+			t.Errorf("files[%d] %s (from %s): excluded as generated=%v test=%v — production deletions must still count",
+				i, f.Path, f.OldPath, f.Generated, f.Test)
+		}
+	}
+	if !files[3].Generated {
+		t.Errorf("a lockfile renamed from itself should stay generated")
+	}
+}

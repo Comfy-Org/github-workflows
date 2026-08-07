@@ -183,8 +183,13 @@ func classify(files []FileChange, base, head string, attr attrPolicy, extras Ext
 		// `git mv internal/big.go dist/big.go` books the removed production
 		// lines into Generated — which takes precedence over Test in Evaluate
 		// and has no "largest excluded" list, so it is even less auditable.
+		// EVERY exclusion path needs the both-paths rule, not just the two fixed
+		// so far: a rename's deletions are booked against the destination, so
+		// `git mv src/big.go go.sum` would otherwise charge removed production
+		// lines to the lockfile bucket. Three doors into the same bypass.
+		lockfile := IsLockfile(f.Path) && (f.OldPath == "" || IsLockfile(f.OldPath))
 		extraGen := extras.Generated(f.Path) && (f.OldPath == "" || extras.Generated(f.OldPath))
-		if IsLockfile(f.Path) || extraGen ||
+		if lockfile || extraGen ||
 			attrGen[f.Path] ||
 			contentGenerated(f.Path, base, head) {
 			f.Generated = true

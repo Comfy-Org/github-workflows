@@ -152,7 +152,9 @@ on:
           `conftest.py`, `*.test.ts`, `*.spec.ts`); the directories
           `__tests__/`, `__mocks__/`, `__snapshots__/`, `testdata/` at ANY
           depth; and `test/`, `tests/`, `testing/`, `e2e/` only at the REPO
-          ROOT or under a `src/` directory (Maven/Gradle). The depth limit is
+          ROOT or under a `src/` directory (Maven/Gradle; `it/` there also needs a
+          child segment, so `src/it/java/...` is excluded but `src/it/x.properties`
+          counts). The depth limit is
           deliberate — those four names also label deployment environments and
           product areas, and matching them anywhere excluded production
           infrastructure from a real consumer's cap. A nested

@@ -103,11 +103,13 @@ Actions step summary in precisely the case that matters, and a 5,000-line
 
 **That green-check comment needs the bot App.** It requires `comment: true`
 (the default) *and* `bot_app_id` + `BOT_APP_PRIVATE_KEY` — all optional. Opt into
-`exclude_tests` without the App and you get precisely the outcome the paragraph
-above says is prevented: a green check whose excluded total is visible only to
-someone who opens the Actions step summary. **If you set `exclude_tests`,
-configure the App too** — otherwise you keep the loosening and lose the
-visibility that justifies it.
+`exclude_tests` without the App and you lose the sticky comment — the only
+surface that puts the number in front of a reviewer unprompted. The check
+annotation described below still fires (it needs no credentials), so the totals
+remain reachable via the Checks tab and the run's Details link, but reaching them
+is a deliberate click. **If you set `exclude_tests`, configure the App too** —
+otherwise you keep the loosening and keep only the weaker half of the
+visibility.
 
 **Fork and Dependabot PRs are a blind spot — weigh this before opting in.** Those
 runs never receive `BOT_APP_PRIVATE_KEY` (GitHub withholds secrets from them), so
@@ -156,7 +158,7 @@ equally trustworthy:
 |---|---|---|
 | 1 | `__tests__/`, `__mocks__/`, `__snapshots__/`, `testdata/` | **any depth** — nothing else is ever called these, and Go nests `testdata` by design |
 | 2 | `test/`, `tests/`, `testing/`, `e2e/` | **repo root only** |
-| 3 | the same four, plus `it/` | **directly under `src/`** — Maven/Gradle nest tests at `src/test/java` and `src/it` |
+| 3 | the same four, plus `it/` | **under a `src/` directory at any depth** — `module-a/src/test/java` works too. `it/` additionally requires a child segment, so `src/it/java/FooIT.java` is excluded but `src/it/messages.properties` **counts** (`it` is also the ISO-639-1 code for Italian) |
 
 The root restriction in case 2 is not fussiness, it is a bug fix. A consumer
 keeps production deployment manifests — cluster RBAC and ingress config — under
