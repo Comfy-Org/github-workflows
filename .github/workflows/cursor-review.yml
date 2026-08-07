@@ -24,15 +24,15 @@ name: Cursor Review (reusable)
 #     cancel-in-progress: true
 #   jobs:
 #     cursor-review:
-#       uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@main
+#       uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@<sha>  # v1
 #       with:
 #         # Repo-specific pathspecs excluded from the size cap and the diff.
 #         diff_excludes: >-
 #           :!**/package-lock.json
 #           :!data/object_info.json.gz
-#         # Pin the assets ref to the same ref you pin `uses:` to for
-#         # reproducibility (defaults to main).
-#         workflows_ref: main
+#         # REQUIRED. Pin the assets ref to the SAME commit SHA you pin `uses:`
+#         # to — otherwise the workflow is pinned but its scripts are not.
+#         workflows_ref: <same-sha-as-uses>
 #         # Optional: post the review under your own GitHub App so its threads are
 #         # a distinct, queryable identity instead of github-actions[bot]. Supply
 #         # your App's id + private key (App IDs aren't secret, so id is an input).
@@ -91,11 +91,13 @@ on:
           :!**/*.min.css
       workflows_ref:
         description: >-
-          Ref of Comfy-Org/github-workflows to load the prompts and scripts
-          from. Pin this to the same ref you pin `uses:` to for reproducibility.
+          REQUIRED. Ref of Comfy-Org/github-workflows to load the prompts and
+          scripts from. Must be the SAME commit SHA you pin `uses:` to —
+          otherwise the workflow is pinned but the code it runs is not. There is
+          deliberately no default: a floating `main` default would silently load
+          mutable scripts into jobs that hold write permissions.
         type: string
-        required: false
-        default: main
+        required: true
       bot_app_id:
         description: >-
           GitHub App ID. When set (with the bot_app_private_key secret), the
@@ -308,7 +310,13 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: Comfy-Org/github-workflows
-          ref: ${{ inputs.workflows_ref }}
+          # This job must never fail (see the job comment), so an empty-ref
+          # guard that exits non-zero is not an option here. Fall back to the
+          # exact commit THIS reusable workflow was resolved from
+          # (github.job_workflow_sha, same pattern as groom.yml/BE-4169)
+          # instead: an omitted workflows_ref still pins to an immutable SHA,
+          # never to this repo's moving default branch.
+          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}
           path: _cursor_review_assets
           persist-credentials: false
 
@@ -463,6 +471,30 @@ jobs:
           JSON
           echo "models=$(jq -c . /tmp/models.json)" >> "$GITHUB_OUTPUT"
 
+      - name: Require a pinned workflows_ref
+        # workflows_ref has no default on purpose. GitHub does NOT enforce
+        # `required: true` for workflow_call inputs, so an omitted input arrives
+        # as '' and actions/checkout would silently fall back to this repo's
+        # default branch — running MUTABLE scripts under a pin that claims
+        # otherwise. Fail fast instead. (BE-5546)
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+        run: |
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form, and echo only that: dropping
+          # newlines also stops a multi-line value from smuggling a ::workflow
+          # command:: into the log, and from satisfying the line-oriented grep
+          # below on one 40-hex line among many.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
+            exit 1
+          fi
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
+          fi
+
       - name: Load cursor-review assets
         # Same trusted-assets checkout the review/consolidate jobs do — this
         # job needs it for install-cursor-cli.sh.
@@ -593,6 +625,30 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Require a pinned workflows_ref
+        # workflows_ref has no default on purpose. GitHub does NOT enforce
+        # `required: true` for workflow_call inputs, so an omitted input arrives
+        # as '' and actions/checkout would silently fall back to this repo's
+        # default branch — running MUTABLE scripts under a pin that claims
+        # otherwise. Fail fast instead. (BE-5546)
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+        run: |
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form, and echo only that: dropping
+          # newlines also stops a multi-line value from smuggling a ::workflow
+          # command:: into the log, and from satisfying the line-oriented grep
+          # below on one 40-hex line among many.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
+            exit 1
+          fi
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
+          fi
 
       - name: Load cursor-review assets
         # Trusted prompts/scripts come from THIS workflow's repo (public,
@@ -772,6 +828,30 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Require a pinned workflows_ref
+        # workflows_ref has no default on purpose. GitHub does NOT enforce
+        # `required: true` for workflow_call inputs, so an omitted input arrives
+        # as '' and actions/checkout would silently fall back to this repo's
+        # default branch — running MUTABLE scripts under a pin that claims
+        # otherwise. Fail fast instead. (BE-5546)
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+        run: |
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form, and echo only that: dropping
+          # newlines also stops a multi-line value from smuggling a ::workflow
+          # command:: into the log, and from satisfying the line-oriented grep
+          # below on one 40-hex line among many.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
+            exit 1
+          fi
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
+          fi
 
       - name: Load cursor-review assets
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1125,6 +1205,30 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Require a pinned workflows_ref
+        # workflows_ref has no default on purpose. GitHub does NOT enforce
+        # `required: true` for workflow_call inputs, so an omitted input arrives
+        # as '' and actions/checkout would silently fall back to this repo's
+        # default branch — running MUTABLE scripts under a pin that claims
+        # otherwise. Fail fast instead. (BE-5546)
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+        run: |
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form, and echo only that: dropping
+          # newlines also stops a multi-line value from smuggling a ::workflow
+          # command:: into the log, and from satisfying the line-oriented grep
+          # below on one 40-hex line among many.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
+            exit 1
+          fi
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
+          fi
+
       - name: Load cursor-review assets
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1179,6 +1283,30 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Require a pinned workflows_ref
+        # workflows_ref has no default on purpose. GitHub does NOT enforce
+        # `required: true` for workflow_call inputs, so an omitted input arrives
+        # as '' and actions/checkout would silently fall back to this repo's
+        # default branch — running MUTABLE scripts under a pin that claims
+        # otherwise. Fail fast instead. (BE-5546)
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+        run: |
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form, and echo only that: dropping
+          # newlines also stops a multi-line value from smuggling a ::workflow
+          # command:: into the log, and from satisfying the line-oriented grep
+          # below on one 40-hex line among many.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
+            exit 1
+          fi
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
+          fi
+
       - name: Load cursor-review assets
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

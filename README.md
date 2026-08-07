@@ -86,11 +86,20 @@ A bare `@v1` tag is technically allowed but **will fail** in repos that run pin
 validation in CI — and because `v1` is force-pushed for compatible changes, it
 silently changes what you execute.
 
-**Keep `workflows_ref` equal to your `uses:` SHA.** `groom`, `cursor-review`,
-`pr-size`, and `agents-md-integrity` load assets — agent briefs, review prompts,
-checker scripts — from `workflows_ref` at run time. It defaults to `main`, so a
-SHA-pinned caller that leaves it unset runs an old workflow against today's
-assets.
+Workflows that load their backing scripts at run time take a `workflows_ref`
+input — always set it to the *same* commit SHA you pin `uses:` to. Pinning only
+`uses:` runs a pinned workflow that loads **mutable** scripts from a floating
+branch, which defeats the pin. On `cursor-review.yml`, `agents-md-integrity.yml`,
+and `pr-size.yml` the input is **required with no default**, and the run fails
+fast when it is empty or omitted (GitHub does not enforce `required: true` for
+`workflow_call` inputs, so those workflows check at run time). `groom.yml` is
+the one exception (BE-4169): leave `workflows_ref` unset and it defaults to
+`github.job_workflow_sha` — the exact, immutable commit the reusable itself was
+resolved from — so there is nothing for the caller to keep in sync; set it only
+to override that (e.g. testing briefs from a branch).
+
+Per-workflow inputs, required secrets, and triggers are documented in each
+workflow file's header comment.
 
 ## Staying current
 
