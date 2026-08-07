@@ -68,7 +68,7 @@
     "agent-supervised": "R1",
     "human": "R1",
     "external": "R3",
-    "_why": "external (a fork / first-time contributor) is R3 on provenance alone — an unreviewed outside diff is the one provenance class never routed unattended. runbook is R0 ONLY when the shape assertion also holds (see the runbook registry); a claimed-but-shape-failed runbook falls back to its underlying class."
+    "_why": "external (ANY fork, or a first-time HUMAN contributor) is R3 on provenance alone — an unreviewed outside diff is the one provenance class never routed unattended. A non-fork bot is NOT external even though every GitHub App authors with author_association NONE: it is a runbook candidate, graded by the registry's shape assertion, and falls back to human when no entry asserts. runbook is R0 ONLY when the shape assertion also holds (see the runbook registry); a claimed-but-shape-failed runbook falls back to its underlying class."
   },
 
   "reversibility": {
