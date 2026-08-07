@@ -97,9 +97,11 @@ assets.
 Enrolling a repo is **two steps**:
 
 1. Merge the caller workflow into your repo.
-2. Add the repo to the matching roster variable here — `GROOM_CALLERS`,
-   `CURSOR_REVIEW_CALLERS`, `PR_SIZE_CALLERS`, `AGENTS_MD_CALLERS`, or
-   `ASSIGN_REVIEWERS_CALLERS`.
+2. Ask a maintainer to add the repo to the matching roster secret here —
+   `GROOM_CALLERS`, `CURSOR_REVIEW_CALLERS`, `PR_SIZE_CALLERS`,
+   `AGENTS_MD_CALLERS`, or `ASSIGN_REVIEWERS_CALLERS`. They are **secrets**, not
+   variables, so private caller names stay out of this public repo's run logs —
+   which also means there is no read-back.
 
 The `bump-*-callers.yml` workflows read those rosters to open pin-bump PRs when a
 reusable moves. **A repo absent from the roster keeps its original SHA forever**,

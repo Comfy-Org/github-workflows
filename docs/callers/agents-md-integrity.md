@@ -47,7 +47,7 @@ jobs:
       workflows_ref: <same-full-commit-sha>
 ```
 
-Then add your repo to `vars.AGENTS_MD_CALLERS`.
+Then ask a maintainer to add your repo to the `AGENTS_MD_CALLERS` roster secret.
 
 ## Required permissions
 

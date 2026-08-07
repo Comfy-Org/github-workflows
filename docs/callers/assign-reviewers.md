@@ -59,7 +59,7 @@ jobs:
       CLOUD_CODE_BOT_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
 ```
 
-Then add your repo to `vars.ASSIGN_REVIEWERS_CALLERS`.
+Then ask a maintainer to add your repo to the `ASSIGN_REVIEWERS_CALLERS` roster secret.
 
 ## Required permissions
 

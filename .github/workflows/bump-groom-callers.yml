@@ -25,19 +25,29 @@ name: Bump groom callers
 # The caller list is NOT hardcoded here. This repo is PUBLIC (workflow file and
 # Actions run logs are both publicly viewable) and callers may be private, so
 # their names must never appear in this file or its logs. The list lives in the
-# repo-level Actions variable `GROOM_CALLERS` (config, not a credential — a
-# variable, not a secret, since secrets are write-only via the API) as a JSON
-# array of {"repo","file","label"} objects. Every repo name is `::add-mask::`ed
-# out of the (public) run logs before it is ever echoed.
+# repo-level Actions SECRET `GROOM_CALLERS` as a JSON array of
+# {"repo","file","label"} objects.
+#
+# A SECRET, not a variable (BE-6472): the roster reaches the script through the
+# step's `env:` below, and Actions prints that env block BEFORE the step runs —
+# so a variable's raw value was published in this public repo's run log ahead of
+# any masking the script could do (the KNOWN GAP this header used to carry). A
+# secret is runner-masked everywhere, that dump included. The cost is read-back:
+# there is no `gh secret get`, so the canonical callers.json in the private ops
+# repo is the sole source of truth, and the run instead logs a count + sha256
+# fingerprint of the roster it used (reproduce with `jq -cS . callers.json |
+# sha256sum`) so an edit can be audited against it.
+# `bump-callers.sh` still `::add-mask::`es every repo name before IT echoes
+# anything — Actions masks the roster as ONE exact string, not each name inside
+# it, so a name echoed on its own would otherwise print in the clear.
 #
 # No WIRE_BOT_SCRIPT here: bot-identity injection is a cursor-review-only concern
 # (BE-1814). A groom caller must set `bot_app_id` itself — the reusable requires
 # it for `builder: true` — so there is nothing for the bumper to wire.
 #
 # Update flow — adding/removing a caller needs NO public commit:
-#   gh variable set GROOM_CALLERS --repo Comfy-Org/github-workflows \
-#     --body "$(jq -c . callers.json)"
-# Keep the canonical callers.json in a PRIVATE infra/ops repo so variable edits
+#   jq -c . callers.json | gh secret set GROOM_CALLERS --repo Comfy-Org/github-workflows
+# Keep the canonical callers.json in a PRIVATE infra/ops repo so roster edits
 # have a reviewed source of truth; the org audit log records each edit. (The
 # specific home repo is intentionally not named here — this file is public.)
 
@@ -91,7 +101,7 @@ jobs:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
           # `owner:` with no `repositories:` is deliberate and cannot be narrowed:
-          # the caller list is a runtime variable (see the header), so the repos
+          # the caller list is a runtime secret (see the header), so the repos
           # this token must reach are not knowable at authoring time — and naming
           # them here would leak private caller names into a public file.
           #
@@ -111,18 +121,22 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
           NEW_SHA: ${{ github.sha }}
+          # Names the roster to fix in an error message. It is a SECRET now, not a
+          # variable; the env key keeps its historical name so every fleet's
+          # entrypoint and the shared script stay in step.
           VAR_NAME: GROOM_CALLERS
           TAG: groom
           WORKFLOW_FILE: groom.yml
           # JSON array of {"repo","file","label"} — see the header comment for the
-          # update flow. Kept in a variable (not the file) so caller names never
-          # land in this public repo or its logs.
-          CALLERS_JSON: ${{ vars.GROOM_CALLERS }}
+          # update flow. Kept in a repo-level SECRET (not this file, and not a
+          # variable) so caller names never land in this public repo — nor, since a
+          # secret is masked in the step's env dump too, in its run logs.
+          CALLERS_JSON: ${{ secrets.GROOM_CALLERS }}
           # groom is still rolling out repo by repo, so an empty list is a clean
           # no-op rather than a hard failure — same posture as the agents-md /
           # pr-size / assign-reviewers fleets. Flip to the default (unset) once
           # the fleet is expected to always have callers, so a silently empty
-          # variable can never leave every caller un-bumped unnoticed.
+          # roster can never leave every caller un-bumped unnoticed.
           ALLOW_EMPTY: 'true'
         run: |
           # The main-only ref guard above cannot catch a manual RE-RUN of an
