@@ -19,9 +19,13 @@ name: PR Size Cap (reusable)
 # total so a PR is capped on the production code a reviewer must actually reason
 # about, not on its test coverage. Test files are recognized by naming
 # convention only (`*_test.go`, `test_*.py`/`*_test.py`/`conftest.py`,
-# `*.test.ts`/`*.spec.ts` & friends, and paths under `test/`, `tests/`,
-# `testing/`, `testdata/`, `e2e/`, `__tests__/`, `__mocks__/`,
-# `__snapshots__/`). Unlike the generated-file rules this is a convention, not a
+# `*.test.ts`/`*.spec.ts` & friends, plus test DIRECTORIES matched in three
+# cases: `__tests__/`/`__mocks__/`/`__snapshots__/`/`testdata/` at any depth;
+# `test/`/`tests/`/`testing/`/`e2e/` at the repo root only; and those four plus
+# `it/` directly under `src/` for Maven/Gradle layouts. The root restriction is
+# load-bearing — a consumer keeps production ArgoCD manifests under
+# `infrastructure/argocd/apps/testing/`, and an any-depth rule excluded cluster
+# RBAC from the cap). Unlike the generated-file rules this is a convention, not a
 # proof — nothing stops production code being parked in `tests/` — which is why
 # it is opt-in rather than the default. The excluded total is ALWAYS reported on
 # its own line, and when the exclusion is the ONLY reason a PR is under the cap
@@ -53,9 +57,16 @@ name: PR Size Cap (reusable)
 # So that the credential-free path is not a silent hole, a decisive test
 # exclusion ALSO emits a `::warning` annotation from the size job itself. That
 # needs no secret, so it reaches fork and Dependabot PRs — the ones that would
-# otherwise get the loosened cap with none of the visibility justifying it. The
-# invariant "the exclusion is never invisible" therefore holds on every PR;
-# the bot comment is the richer surface, not the only one.
+# otherwise get the loosened cap with none of the visibility justifying it.
+#
+# Be precise about what that buys, because it is less than a comment: an
+# annotation carrying no file/line renders on the run-summary page and behind
+# the check's Details link, and in the Checks tab — NOT in the PR conversation
+# (a passing check collapses to "All checks have passed") and NOT inline on
+# Files changed. So on a fork PR the number is recorded and reachable, but it
+# still takes a deliberate click; only the sticky comment puts it in front of a
+# reviewer unprompted. Where the App is configured, the comment remains the
+# real surface and the annotation is the backstop.
 #
 # Two-job security split: the `pr-size` job runs against PR code with a
 # read-only token; the `comment` job holds the bot write token, checks out NO
@@ -269,8 +280,15 @@ jobs:
         env:
           COUNTED: ${{ steps.check.outputs.counted }}
           TESTS: ${{ steps.check.outputs.tests_excluded }}
+          # The APPLIED cap, emitted by the tool — not the raw max_lines input.
+          # envInt falls back to the 1000 default for anything Atoi rejects (a
+          # value arriving as `1250.5` from a GitHub expression, or with stray
+          # whitespace from a forwarded var), so the input can name a cap that
+          # was never enforced. On fork PRs this annotation is the ONLY surface,
+          # with no comment to cross-check it against.
+          CAP: ${{ steps.check.outputs.max_lines }}
         run: |
-          echo "::warning title=Under the cap only via the test exclusion::This PR changes $((COUNTED + TESTS)) non-generated lines (${COUNTED} counted + ${TESTS} test) against a ${PR_SIZE_MAX_LINES}-line cap. exclude_tests is what brings it under — expected for a test-heavy change, surfaced so the real size is visible."
+          echo "::warning title=Under the cap only via the test exclusion::This PR changes $((COUNTED + TESTS)) non-generated lines (${COUNTED} counted + ${TESTS} test) against a ${CAP}-line cap. exclude_tests is what brings it under — expected for a test-heavy change, surfaced so the real size is visible."
 
       - name: Record over-cap flag
         # The comment job keys off these flags rather than the pr-size job's
@@ -449,13 +467,25 @@ jobs:
             # expected case: the loop only has more than one id because
             # duplicates happen, and a maintainer (or another run) deleting one
             # between the list and the write is a real race.
+            rc=0
             for id in $existing; do
-              if gh api -X PATCH "repos/${REPO}/issues/comments/${id}" -F body=@body.md >/dev/null 2>&1; then
+              if gh api -X PATCH "repos/${REPO}/issues/comments/${id}" -F body=@body.md >/dev/null; then
                 echo "Updated sticky size comment ${id}."
               else
-                echo "Could not update sticky size comment ${id} (deleted concurrently?); continuing." >&2
+                # gh's stderr is deliberately NOT discarded: a 403 from
+                # permission drift, a 422 on an over-long body and a concurrent
+                # delete all land here, and swallowing the message would
+                # misattribute every one of them to "deleted concurrently".
+                echo "Failed to update sticky size comment ${id} (see gh error above); continuing." >&2
+                rc=1
               fi
             done
+            # Exit non-zero if ANY patch failed, so steps.upsert.outcome is
+            # 'failure' and the degraded-mode note below actually fires.
+            # continue-on-error already keeps this from reddening the check —
+            # without this the step exits 0 even when every patch failed and the
+            # PR silently keeps a stale verdict on a green run.
+            [ "$rc" -eq 0 ] || exit 1
           elif [ "$OVER" = "true" ] || [ "$DECISIVE" = "true" ]; then
             gh api -X POST "repos/${REPO}/issues/${PR_NUMBER}/comments" -F body=@body.md >/dev/null
             if [ "$OVER" = "true" ]; then

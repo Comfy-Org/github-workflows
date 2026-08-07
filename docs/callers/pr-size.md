@@ -119,11 +119,18 @@ contributions get the least-scrutinized guardrail — and it is silent, because 
 green check with no comment looks exactly like a PR that passed on its own
 merits.
 
-**This is why a decisive exclusion also emits a check annotation.** The
-annotation comes from the size job itself and needs no credentials, so it shows
-up in the PR's Checks tab on fork and Dependabot PRs too. It carries the same
-numbers as the comment (`counted + test` against the cap), so the invariant
-holds everywhere — the bot comment is the richer surface, not the only one.
+**This is why a decisive exclusion also emits a check annotation.** It comes from
+the size job itself and needs no credentials, so it reaches fork and Dependabot
+PRs, carrying the same numbers as the comment (`counted + test` against the
+applied cap).
+
+Be clear about what it does *not* buy, though. An annotation with no file/line
+renders on the run-summary page, behind the check's **Details** link, and in the
+**Checks** tab — but **not** in the PR conversation (a passing check collapses to
+"All checks have passed") and **not** inline on Files changed. So on a fork PR the
+number is recorded and reachable, but still a deliberate click away. Only the
+sticky comment puts it in front of a reviewer unprompted. Treat the annotation as
+a backstop that makes the number *findable*, not as parity with the comment.
 
 What you still lose without the App on a fork PR is the *sticky* comment: the
 in-conversation explanation that survives pushes and flips to ✅. If that matters
@@ -134,19 +141,40 @@ Note also that `extra_generated_globs` (below) classifies matches as
 trigger the green-check comment. A repo leaning on it for an unusual test layout
 opts out of this visibility guarantee.
 
-Recognized: `*_test.go`; `test_*.py`, `*_test.py`, `conftest.py`; for
-`.js .jsx .mjs .cjs .ts .tsx .mts .cts`, a `test` component anywhere in the
-filename after the first (so `Button.test.tsx` **and** the type-test form
-`api.test.d.ts`) or a `spec` component immediately before the extension
-(`api.spec.ts`) — `spec` is deliberately narrower, because `api.spec.types.ts`
-and `openapi.spec.client.ts` are OpenAPI *production* files in this org and
-excluding them would under-count; and any file under a `test/`, `tests/`, `testing/`,
-`testdata/`, `e2e/`, `__tests__/`, `__mocks__/` or `__snapshots__/` **directory**
-segment (segment matching is case-insensitive, so `Tests/` and `TestData/` work
-too; the file-name rules stay case-sensitive because their toolchains define
-them in lowercase). `spec/` is deliberately *not* a test directory — in this org it holds
-OpenAPI schemas, which are production artifacts. For a layout these miss, add
-`extra_generated_globs` (they land in the generated bucket instead).
+**Recognized as test files.** File names: `*_test.go`; `test_*.py`, `*_test.py`,
+`conftest.py`; and for `.js .jsx .mjs .cjs .ts .tsx .mts .cts`, a `test`
+component anywhere in the name after the first (`Button.test.tsx`, and the
+type-test form `api.test.d.ts`) or a `spec` component immediately before the
+extension (`api.spec.ts`) — `spec` is narrower on purpose, because
+`api.spec.types.ts` and `openapi.spec.client.ts` are OpenAPI *production* files
+here and excluding them would under-count.
+
+**Directories are matched in three cases, not one**, because the names are not
+equally trustworthy:
+
+| Case | Segments | Where they match |
+|---|---|---|
+| 1 | `__tests__/`, `__mocks__/`, `__snapshots__/`, `testdata/` | **any depth** — nothing else is ever called these, and Go nests `testdata` by design |
+| 2 | `test/`, `tests/`, `testing/`, `e2e/` | **repo root only** |
+| 3 | the same four, plus `it/` | **directly under `src/`** — Maven/Gradle nest tests at `src/test/java` and `src/it` |
+
+The root restriction in case 2 is not fussiness, it is a bug fix. A consumer
+keeps production ArgoCD manifests — cluster RBAC, ingress, cert issuers — under
+`infrastructure/argocd/apps/testing/`, where `testing` names the deployment
+*environment*, not test code. Matching that name at any depth silently excluded
+**cluster RBAC changes** from the cap. Root-anchoring keeps all 227 files of that
+repo's real `testing/` tree excluded while counting the 31 infrastructure files.
+
+The cost is deliberate and worth knowing: a **nested** ambiguous directory such as
+`services/checkout/e2e/` now counts. That is the safe direction — over-counting
+starts an argument, under-counting silently shrinks the number the cap protects —
+but if your tests live somewhere the three cases miss, they will be counted.
+
+Segment matching is case-insensitive over ASCII (so `Tests/` and `TestData/`
+work); the file-name rules stay case-sensitive, because their toolchains define
+them in lowercase. `spec/` is deliberately *not* a test directory — in this org
+it holds OpenAPI schemas, which are production artifacts. For a layout these
+miss, add `extra_generated_globs` (they land in the generated bucket instead).
 
 Leaving it off is a real choice, not just the safe one: a 5,000-line test diff
 is genuinely slow to review, and the cap is the only thing that says so.

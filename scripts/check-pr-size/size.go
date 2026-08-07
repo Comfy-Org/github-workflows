@@ -45,31 +45,51 @@ var lockfileNames = map[string]bool{
 	"uv.lock":           true,
 }
 
-// testPathSegments are directory names that mark everything beneath them as
-// test code. Matching is on whole, slash-delimited path SEGMENTS and never on
-// substrings, so `contest/`, `attestation/` and `latest.go` are untouched. Only
-// directory segments are considered (never the file name itself), so a
-// hand-written file literally named `test` is still counted.
+// Test directories are matched in THREE cases, not one, because the segment
+// names are not equally trustworthy. Matching every name at every depth is what
+// caused the bug this split exists to fix: a real consumer keeps its production
+// ArgoCD manifests — cluster RBAC, ingress, cert issuers — under
+// `infrastructure/argocd/apps/testing/`, where `testing` names the target
+// ENVIRONMENT, not test code. An any-depth rule silently excluded cluster RBAC
+// changes from the cap, which is close to the worst thing this feature could do.
 //
-// Segment matching is case-INSENSITIVE, so .NET/C#/Unity trees (`Tests/`,
-// `TestData/`, `E2E/`) are recognized. The file-name rules below stay
-// case-sensitive on purpose: `_test.go` and `conftest.py` are spelled in
-// lowercase by their toolchains, so a capitalized variant is not the convention
-// and matching it would only add false positives.
-//
-// `spec`/`specs` are deliberately absent: in this org those hold API schemas
-// (OpenAPI), which are production artifacts. The unambiguous `*.spec.ts`
-// file-name convention is handled below instead.
-var testPathSegments = map[string]bool{
+// Matching is on whole, slash-delimited SEGMENTS, never substrings, so
+// `contest/`, `attestation/` and `latest.go` are untouched, and it is
+// case-insensitive over ASCII so .NET/Unity trees (`Tests/`, `TestData/`) work.
+// Only DIRECTORY segments are considered, never the file name itself.
+
+// unambiguousTestSegments name test code and nothing else, so they are matched
+// at ANY depth. Nobody names a production directory `__snapshots__`, and Go's
+// `testdata` is defined by the toolchain to be nested.
+var unambiguousTestSegments = map[string]bool{
 	"__mocks__":     true, // Jest/Vitest manual mocks
 	"__snapshots__": true, // Jest/Vitest snapshots
 	"__tests__":     true, // Jest/Vitest
-	"e2e":           true,
-	"test":          true, // also covers Maven/Gradle's src/test/...
-	"testdata":      true, // Go's fixture convention
-	"testing":       true,
-	"tests":         true,
+	"testdata":      true, // Go's fixture convention, nested by design
 }
+
+// ambiguousTestSegments usually mean tests but also legitimately name an
+// environment or product area, so they are matched ONLY at the repo root or
+// directly under a source root (see srcRoots). Root-level `testing/` is a test
+// tree; `infrastructure/argocd/apps/testing/` is a deployment target.
+var ambiguousTestSegments = map[string]bool{
+	"e2e":     true,
+	"test":    true,
+	"testing": true,
+	"tests":   true,
+}
+
+// srcRoots are directories under which an ambiguous segment is still a test
+// directory — Maven/Gradle put tests at `src/test/java` and integration tests at
+// `src/it`, both nested by convention. Without this case those repos would count
+// their entire test tree, so the feature would quietly UNDER-deliver for them,
+// which is the mirror of the over-delivery it caused for the ArgoCD tree.
+var srcRoots = map[string]bool{"src": true}
+
+// srcRootOnlyTestSegments are additionally allowed directly under a srcRoot.
+// `it` is Maven failsafe's integration-test directory; it is far too generic to
+// honour at the repo root.
+var srcRootOnlyTestSegments = map[string]bool{"it": true}
 
 // testFileSuffixes are base-name suffixes that mark test code. Each carries its
 // own leading separator, so a production file that merely ENDS in the word
@@ -95,7 +115,13 @@ var jsTestExts = map[string]bool{
 
 // FileChange is one file's contribution to the diff.
 type FileChange struct {
-	Path      string
+	Path string
+	// OldPath is a rename's SOURCE path, empty otherwise. It exists so
+	// classification can be conservative: `git diff --numstat` books a rename's
+	// deletions against the destination, so `git mv src/big.go tests/big.go`
+	// would otherwise charge removed PRODUCTION lines to an excluded test path
+	// and let the change slip under the cap. See IsTestPath's use in classify.
+	OldPath   string
 	Added     int
 	Deleted   int
 	Binary    bool
@@ -190,6 +216,7 @@ func ParseNumstat(r io.Reader) ([]FileChange, error) {
 		if rec == "" {
 			continue // trailing NUL or stray separator
 		}
+		var oldPath string
 		parts := strings.SplitN(rec, "\t", 3)
 		if len(parts) != 3 {
 			return nil, fmt.Errorf("malformed numstat record: %q", rec)
@@ -201,10 +228,10 @@ func ParseNumstat(r io.Reader) ([]FileChange, error) {
 			if i+2 >= len(tokens) || tokens[i+2] == "" {
 				return nil, fmt.Errorf("truncated rename record: %q", rec)
 			}
-			path = tokens[i+2]
+			oldPath, path = tokens[i+1], tokens[i+2]
 			i += 2
 		}
-		fc := FileChange{Path: path}
+		fc := FileChange{Path: path, OldPath: oldPath}
 		if parts[0] == "-" || parts[1] == "-" {
 			fc.Binary = true
 			changes = append(changes, fc)
@@ -278,19 +305,33 @@ func IsTestPath(path string) bool {
 	return hasTestSegment(path) || isTestFileName(baseName(path))
 }
 
-// hasTestSegment reports whether any DIRECTORY segment of path is a test
-// directory. The final segment (the file name) is excluded so the rule cannot
-// fire on a file that merely shares a name with a test directory.
+// hasTestSegment reports whether path sits under a test directory, applying the
+// three cases documented on the segment tables above. The final segment (the
+// file name) is never considered, so a file merely sharing a name with a test
+// directory is still counted.
 func hasTestSegment(path string) bool {
-	dir := path
-	slash := strings.LastIndex(dir, "/")
+	slash := strings.LastIndex(path, "/")
 	if slash < 0 {
 		return false // no directory part at all
 	}
-	for _, seg := range strings.Split(dir[:slash], "/") {
-		if testPathSegments[asciiLower(seg)] {
+	segs := strings.Split(path[:slash], "/")
+	for i := range segs {
+		segs[i] = asciiLower(segs[i])
+	}
+	// Case 1 — unambiguous names, any depth.
+	for _, seg := range segs {
+		if unambiguousTestSegments[seg] {
 			return true
 		}
+	}
+	// Case 2 — ambiguous names, repo root only.
+	if ambiguousTestSegments[segs[0]] {
+		return true
+	}
+	// Case 3 — ambiguous names (plus `it`) directly under a source root.
+	if len(segs) > 1 && srcRoots[segs[0]] &&
+		(ambiguousTestSegments[segs[1]] || srcRootOnlyTestSegments[segs[1]]) {
+		return true
 	}
 	return false
 }

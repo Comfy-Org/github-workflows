@@ -166,7 +166,15 @@ func classify(files []FileChange, base, head string, attr attrPolicy, extras Ext
 		// Set before the binary guard so Result.Files reports a binary fixture
 		// under testdata/ or __snapshots__/ as the test file it is. No numeric
 		// effect — Changed() is 0 for binaries either way.
-		f.Test = IsTestPath(f.Path)
+		//
+		// A RENAME is classified by BOTH of its paths and counts as test only if
+		// both agree. `git diff --numstat` books a rename's deletions against the
+		// destination, so classifying on the destination alone would let
+		// `git mv src/big.go tests/big.go` charge removed PRODUCTION lines to an
+		// excluded test path — a refactor slipping under the cap by moving code
+		// into a test directory. Requiring both keeps the failure in the
+		// over-counting direction.
+		f.Test = IsTestPath(f.Path) && (f.OldPath == "" || IsTestPath(f.OldPath))
 		if f.Binary {
 			continue
 		}
@@ -542,8 +550,11 @@ func writeGitHubOutputs(res Result) {
 	// tests_decisive while the process still exits 0, and the comment job then
 	// reads the absent flag as false and silently skips the green-check comment
 	// — the very failure this output exists to close.
-	_, werr := fmt.Fprintf(f, "over_cap=%t\ncounted=%d\ntests_excluded=%d\ntests_decisive=%t\n",
-		!res.OK, res.Counted, testsExcluded, res.ExclusionDecisive())
+	// max_lines is the APPLIED cap, so consumers annotate the number actually
+	// enforced rather than the raw input — envInt silently falls back to the
+	// default for any value Atoi rejects.
+	_, werr := fmt.Fprintf(f, "over_cap=%t\ncounted=%d\ntests_excluded=%d\ntests_decisive=%t\nmax_lines=%d\n",
+		!res.OK, res.Counted, testsExcluded, res.ExclusionDecisive(), res.Max)
 	cerr := f.Close()
 	if werr != nil {
 		fmt.Fprintf(os.Stderr, "check-pr-size: writing GITHUB_OUTPUT failed: %v\n", werr)

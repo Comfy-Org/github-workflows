@@ -45,9 +45,11 @@ func TestParseNumstat(t *testing.T) {
 		},
 		{
 			// -z renames: empty path field, then old-path and new-path tokens.
-			name:  "rename resolves to new path",
+			// The SOURCE is kept too: a rename's deletions are booked against the
+			// destination, so classification needs both paths to stay conservative.
+			name:  "rename resolves to new path and keeps the source",
 			input: nul("1\t1\t", "dir/old/file.go", "dir/new/file.go"),
-			want:  []FileChange{{Path: "dir/new/file.go", Added: 1, Deleted: 1}},
+			want:  []FileChange{{Path: "dir/new/file.go", OldPath: "dir/old/file.go", Added: 1, Deleted: 1}},
 		},
 		{
 			// A file whose literal name contains " => " must NOT be treated as a
@@ -222,10 +224,20 @@ func TestIsTestPath(t *testing.T) {
 		{"src/Tests/FooTests.cs", true},
 		{"src/TestData/golden.json", true},
 		{"E2E/Checkout.cs", true},
-		{"services/checkout/e2e/flow.go", true},
 		{"test/helpers.rb", true},
 		{"src/test/java/com/x/FooTest.java", true},
-		{"internal/testing/harness.go", true},
+
+		// --- Case 2/3: AMBIGUOUS segments only at the root or a source root ---
+		// Root-level test trees (the real ones in the consumer that drove this).
+		{"testing/e2e/framework/harness.go", true},
+		{"testing/integration/helper.go", true},
+		{"testing/smoke/result.go", true},
+		{"testing/synthetics/probe.go", true},
+		{"tests/helpers.rb", true},
+		// Maven/Gradle nest their tests by convention — case 3 keeps them.
+		{"src/it/java/com/x/FooIT.java", true},
+		// Unambiguous names stay matched at ANY depth (case 1).
+		{"pkg/deep/nested/testdata/golden.json", true},
 
 		// --- False positives the substring-matching naive version would hit ---
 		{"contest/leaderboard.go", false},
@@ -255,6 +267,21 @@ func TestIsTestPath(t *testing.T) {
 		{"services/checkout/openapi.yaml", false},
 		{"spec/openapi.yaml", false},
 		{"api/specs/v1.json", false},
+		// THE REGRESSION THAT DROVE THE THREE-CASE SPLIT: `testing` here names a
+		// deployment ENVIRONMENT, and these are production ArgoCD manifests —
+		// cluster RBAC, ingress, cert issuers. They must COUNT against the cap.
+		{"infrastructure/argocd/apps/testing/charts/ephemeral-ingress/base/templates/clusterrole.yaml", false},
+		{"infrastructure/argocd/apps/testing/charts/ephemeral-ingress/base/templates/clusterrolebinding.yaml", false},
+		{"infrastructure/argocd/apps/testing/charts/cert-manager/base/values.yaml", false},
+		{"infrastructure/argocd/apps/testing/appsets/comfy-cloud-test.yaml", false},
+		// Other nested ambiguous segments likewise count (safe direction).
+		{"services/checkout/e2e/flow.go", false},
+		{"internal/testing/harness.go", false},
+		{"apps/test/main.go", false},
+		// A source root only rescues the segment DIRECTLY beneath it.
+		{"src/main/java/com/x/Test.java", false},
+		{"vendor/src/test/java/x.java", false},
+
 		// A file whose own name matches a test DIRECTORY is not a test file.
 		{"cmd/test", false},
 		{"docs/testing", false},
@@ -626,5 +653,33 @@ func TestContentGeneratedRejectsSymlink(t *testing.T) {
 	// legitimately generated file.
 	if contentGenerated(link, "", "") {
 		t.Errorf("contentGenerated must not follow symlinks")
+	}
+}
+
+// TestRenameClassifiedConservatively is the anti-gaming guard for renames.
+// `git diff --numstat` books a rename's deletions against the DESTINATION, so
+// moving production code into a test directory would otherwise erase those
+// lines from the count.
+func TestRenameClassifiedConservatively(t *testing.T) {
+	t.Parallel()
+	files := []FileChange{
+		// Production code moved INTO a test dir: must still count.
+		{Path: "tests/big.go", OldPath: "src/big.go", Added: 20, Deleted: 900},
+		// A genuine move within the test tree: still a test.
+		{Path: "tests/b.go", OldPath: "tests/a.go", Added: 5, Deleted: 5},
+		// Non-rename test file: unaffected.
+		{Path: "tests/c.go", Added: 10},
+	}
+	classify(files, "", "", attrPolicy{}, Extras{})
+
+	want := map[string]bool{"tests/big.go": false, "tests/b.go": true, "tests/c.go": true}
+	for _, f := range files {
+		if f.Test != want[f.Path] {
+			t.Errorf("%s (from %q): Test = %v, want %v", f.Path, f.OldPath, f.Test, want[f.Path])
+		}
+	}
+	res := Evaluate(files, Policy{Max: 1000, ExcludeTests: true})
+	if res.Counted != 920 {
+		t.Errorf("Counted = %d, want 920 — the 900 deleted production lines must not vanish", res.Counted)
 	}
 }
