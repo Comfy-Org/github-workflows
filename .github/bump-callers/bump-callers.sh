@@ -394,6 +394,62 @@ bump_repo() {
       fi
     fi
 
+    # ROSTER-ENTRY CHECK (BE-6015) — asked of the ORIGINAL content, before the
+    # no-op test below. A stale roster entry can send this function to a file
+    # that calls no github-workflows reusable in a spelling this script can
+    # parse at all ("not provably ours" — treated exactly like the rewrite
+    # address above: a quiet skip) OR to a file that DOES call some
+    # github-workflows reusable, but only a SIBLING fleet's, never ours. That
+    # second case is not something the rewrite below can ever fix — there is
+    # nothing of ours in the file to bump — so it is caught here, before the
+    # no-op branch, and blamed on the roster entry rather than the file.
+    #
+    # This is narrower than it first was: two more checks used to sit here —
+    # "is `uses:` pinned by 40-hex" and "is `workflows_ref:` pinned by
+    # 40-hex" — but BE-4662 (landed on main after this PR was opened) anchored
+    # the rewrite to the pin TOKEN rather than to 40-hex-ness, so a
+    # placeholder, tag, or short-SHA pin is now self-healed by the sed above
+    # regardless of its prior shape. Keeping those two checks here would warn
+    # on — and, worse, refuse to stage — callers the bumper can in fact bump,
+    # contradicting the STALE_PINS assertion below on the very same file. The
+    # one shape STALE_PINS still cannot move, a `workflows_ref` fed by a
+    # `${{ … }}` expression, is a value the rewrite has never touched and that
+    # assertion already fails the run for.
+    local PIN_OK=1
+    if ! grep -qxF "$WORKFLOW_FILE" <<<"$GW_USES"; then
+      # `GW_USES` empty means no `uses:` line here names a github-workflows
+      # reusable in a spelling this script can parse — "not provably ours", which
+      # stays silent exactly as the rewrite address above does. Non-empty but
+      # WITHOUT our file is a different animal: the roster sent us to a file that
+      # calls only a SIBLING fleet's reusable, so there is nothing here for this
+      # fleet to bump and the stale entry — not the file — is the bug.
+      if [[ -n "$GW_USES" ]]; then
+        PIN_OK=0
+        echo "::warning::${REPO}: ${FILE} has no \`uses:\` calling ${WORKFLOW_FILE} — it is listed in ${VAR_NAME} but this fleet has nothing to bump in it; fix the roster entry"
+      fi
+    fi
+    # Accumulate AND skip rather than `return 1`: a roster entry with nothing
+    # of ours to bump is broken by definition, so the run must not report
+    # success — but it must also not abort the fan-out, since every OTHER
+    # caller in the fleet still deserves its bump. The aggregate `::error::`
+    # after the loop is what makes this unskimmable; BE-6015 persisted for
+    # weeks precisely because a warning in a green run reads as noise.
+    #
+    # The `continue` is load-bearing, not cosmetic: rule 2's `workflows_ref:`
+    # rewrite (line 336, below) is deliberately UNADDRESSED — it fires on any
+    # `workflows_ref:` key in the file regardless of SHA_ADDR, because in the
+    # legitimate multi-reusable case there is no cheap way to tell "our" input
+    # from a sibling job's. A sibling-only file (this branch) has no `uses:`
+    # of ours at all, so a bare `workflows_ref:` in it belongs entirely to the
+    # sibling — falling through to the rewrite/stage below would silently
+    # repoint that sibling's asset ref at THIS fleet's SHA and open a PR for
+    # it. Stopping here, before the rewrite, is the only way to keep the file
+    # untouched.
+    if (( ! PIN_OK )); then
+      UNPINNABLE+=("${REPO}:${FILE}")
+      continue
+    fi
+
     # ASSERT that the rewrite actually moved EVERY github-workflows pin in this
     # file, before it can be staged (BE-4662). The patterns above are precise by
     # design, and precision cuts both ways: a pin form they do not know how to
@@ -461,8 +517,10 @@ bump_repo() {
     # NEW_SHA appearing *anywhere*) also repairs a half-bumped file: if a prior
     # run left one of two refs at NEW_SHA and the other stale, the content still
     # differs here, so the file is re-staged and repaired instead of skipped.
+    # The "already at" line is claimed only when the pin check above vouched for
+    # the file; otherwise the warning it just emitted is the whole story.
     if [[ "$NEW_CONTENT" == "$OLD_CONTENT" ]]; then
-      echo "${REPO}: ${FILE} already at ${SHORT} — skipping"
+      (( PIN_OK )) && echo "${REPO}: ${FILE} already at ${SHORT} — skipping"
       continue
     fi
 
@@ -654,6 +712,10 @@ for ENTRY in "${CALLERS[@]}"; do
 done
 
 FAILED=()
+# Caller files that carry no pin this fleet can move (BE-6015). Appended to from
+# inside bump_repo — deliberately a plain global, since the bump loop below runs
+# the function in this shell (no subshell/pipe), so the accumulation survives.
+UNPINNABLE=()
 for REPO in "${REPOS[@]}"; do
   # Collect this repo's entries (in their original order) and bump them together.
   ENTRIES=()
@@ -665,6 +727,17 @@ done
 
 if (( ${#FAILED[@]} )); then
   printf '::error::bump failed for %d repo(s): %s\n' "${#FAILED[@]}" "${FAILED[*]}"
+fi
+# Every other caller has been bumped by now; failing here (rather than at the
+# first offender) keeps the fan-out complete while still refusing to report
+# success for a fleet that contains a caller the bumper cannot keep current.
+# Repo names are `::add-mask::`ed at parse time, so this prints *** in the public
+# log while the file path stays readable enough to act on.
+if (( ${#UNPINNABLE[@]} )); then
+  printf '::error::%d caller file(s) this bumper cannot keep current for %s — see the per-file warnings above: %s\n' \
+    "${#UNPINNABLE[@]}" "${WORKFLOW_FILE}" "${UNPINNABLE[*]}"
+fi
+if (( ${#FAILED[@]} || ${#UNPINNABLE[@]} )); then
   exit 1
 fi
 echo "${TAG} bump complete for all callers."
