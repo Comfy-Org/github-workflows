@@ -126,6 +126,11 @@ unrelated full SHA that merely *shares* a line with the words `github-workflows`
 or `workflows_ref` is now unreachable, and a prose comment mentioning
 `workflows_ref:` is left as prose.
 
+The ref pattern stops at whitespace *and* at YAML's flow-style delimiters (`,`,
+`}`), so the ref in `{uses: …@v1, secrets: inherit}` does not swallow the mapping's
+comma. Flow style is not rewritten — it is failed, by the assertion below — but it
+is never silently *corrupted*.
+
 Precision cuts both ways, though — a pin form the patterns don't know how to move
 would be silently left behind. So before a rewritten file can be staged, the
 script re-reads it with a deliberately **broader** reader (any non-whitespace
@@ -171,3 +176,81 @@ gh variable set AGENTS_MD_CALLERS --repo Comfy-Org/github-workflows \
 
 Keep the canonical `callers.json` in a private infra/ops repo so variable edits
 have a reviewed source of truth (the org audit log records each edit).
+
+### Entry format — validated, and why
+
+Every field reaches a privileged sink: `repo` is interpolated into each
+`gh api repos/<repo>/…` write and into `gh pr create --repo`, `file` becomes the
+path committed into the caller's tree, and `label` is passed to
+`gh pr create --label`. They run under an org-wide app token (`owner: Comfy-Org`,
+contents + pull-requests + issues write, no `repositories:` narrowing), and the
+roster is a **variable** — editable outside code review. So `bump-callers.sh`
+constrains the values before it makes a single API call:
+
+| Field | Rule |
+|---|---|
+| `repo` | must match `^Comfy-Org/[A-Za-z0-9._-]+$` (the owner case-insensitively, as GitHub itself resolves it), and the name may not consist *only* of dots — `\A[.]+\z`, so `..` and `...` alike (a dot-leading or dot-bearing name such as `.github` or `a.b.c` is fine; an all-dots name is a path segment, not a repo) |
+| `file` | must match `^\.github/workflows/[A-Za-z0-9._-]+\.ya?ml$` (the class excludes `/`, so `../` traversal cannot appear) |
+| `label` | optional; when present must be a string containing no `\|`, no comma, and no control character |
+
+Each pattern is anchored `\A…\z`, not `^…$`: jq matches with Oniguruma, where `$`
+also matches *before a trailing newline*, so `"Comfy-Org/legit\n"` would otherwise
+pass and then split into two tuples — one of them never validated, with an empty
+`repo`.
+
+A violation is a **hard fail before the fan-out**, reported as the entry's
+zero-based **index** and the rule it broke — never the value, because masking has
+not been applied at that point and this repo's run logs are public. The `label`
+rule is not cosmetic. Entries are carried internally as `repo|file|label|wire_bot`
+tuples, so a pipe-bearing label would truncate and bleed its tail into the
+`wire_bot` field; a control character is dropped or mangled somewhere between
+`jq` and the flag (bash's `read` silently discards a NUL); and `--label` is a
+cobra StringSlice, which CSV-splits, so `ci,do-not-merge` would quietly apply a
+second, potentially blocking label the entry does not appear to name. Spaces,
+`:` and `/` are all still fine — this bars what is structurally unsafe, not what
+GitHub disallows.
+
+The owner is normalised to `Comfy-Org` once validated, and repos are grouped
+case-insensitively. Accepting `comfy-org/x` without folding it would make two
+spellings of one repo into two bump runs against it, the second force-moving the
+shared bump branch off the first's commit — a green run shipping a partial bump.
+
+### Un-bumpable entries fail the run
+
+Being in the variable is necessary, not sufficient. The bumper can only move a
+pin it can *find*, and a file carrying no pin this fleet can address rewrites to
+itself — which the content-equality check then reports as the reassuring
+`already at <short> — skipping`. That is how a wrong roster entry drifts forever
+behind a green run. Each caller file is now checked for such a pin *before* the
+rewrite; if there is none, the run warns per file and then **fails** with an
+aggregate error naming how many caller files were affected. Three shapes trip it:
+
+- the file **does not exist** on the caller's default branch (a renamed or
+  typo'd path) — previously a silent `not found — skipping`;
+- the file carries no `uses:` pin of `Comfy-Org/github-workflows` at all (wrong
+  file, or not a caller);
+- its only `github-workflows` `uses:` names a **sibling** fleet's reusable, so
+  this fleet has nothing to move — the stale entry, not the file, is the bug.
+
+A `uses:` pin is required in all three cases: a bare `workflows_ref:` never
+rescues a file. That input carries no workflow name, so it cannot vouch for
+*this* fleet, and admitting it would let the run stamp this fleet's SHA onto a
+sibling caller's assets ref. Every caller of every seeded fleet carries a `uses:`
+pin today, so nothing legitimate is caught by this.
+
+"`uses:` pin" is meant literally: the check is anchored to the `uses:` key
+(optionally quoted value), not merely to a `Comfy-Org/github-workflows@<ref>`
+token somewhere on the line. A `run:` step that curls this repo, or a repo@ref
+passed as an input to some *other* action, is not a caller — and since the pin
+rewrite keys on the same token, admitting one would mean opening a bump PR
+against a file that never called us.
+
+What does **not** trip it is a pin that is merely not a full SHA. The rewrite
+matches a ref by position rather than shape, so a caller on `@v1` is *self-healed*
+to the new SHA — dragging floating pins back onto immutable ones is the point of
+the fleet, not an error. Nor does a pin the rewrite knows about but cannot move
+(a `uses:` ref fed by a `${{ … }}` expression): that is admitted here and then
+fails loudly in the post-rewrite assertion, which is the check that owns it. The
+failure lands after every caller has been processed,
+so one bad entry never blocks the rest of the fleet's bumps; what it refuses to do
+is report success.
