@@ -3,12 +3,15 @@
 //
 // It counts added + deleted lines across the PR diff, EXCLUDING generated files
 // (codegen can emit huge amounts of code that would trip the cap unfairly), and
-// fails if the remaining count exceeds a configurable ceiling. A PR label
-// provides an explicit bypass for legitimate large changes.
+// fails if the remaining count exceeds a configurable ceiling. Opting in to
+// Policy.ExcludeTests additionally keeps test-file lines out of the count, so a
+// mostly-test PR is judged on the production code a reviewer must actually
+// reason about. A PR label provides an explicit bypass for legitimate large
+// changes.
 //
 // This file holds the pure, side-effect-free logic (diff parsing, generated-file
-// classification, cap evaluation) so it can be unit tested without a git repo;
-// main.go wires it to git and the CI environment.
+// and test-file classification, cap evaluation) so it can be unit tested without
+// a git repo; main.go wires it to git and the CI environment.
 package main
 
 import (
@@ -42,6 +45,48 @@ var lockfileNames = map[string]bool{
 	"uv.lock":           true,
 }
 
+// testPathSegments are directory names that mark everything beneath them as
+// test code. Matching is on whole, slash-delimited path SEGMENTS and never on
+// substrings, so `contest/`, `attestation/` and `latest.go` are untouched. Only
+// directory segments are considered (never the file name itself), so a
+// hand-written file literally named `test` is still counted.
+//
+// `spec`/`specs` are deliberately absent: in this org those hold API schemas
+// (OpenAPI), which are production artifacts. The unambiguous `*.spec.ts`
+// file-name convention is handled below instead.
+var testPathSegments = map[string]bool{
+	"__mocks__":     true, // Jest/Vitest manual mocks
+	"__snapshots__": true, // Jest/Vitest snapshots
+	"__tests__":     true, // Jest/Vitest
+	"e2e":           true,
+	"test":          true, // also covers Maven/Gradle's src/test/...
+	"testdata":      true, // Go's fixture convention
+	"testing":       true,
+	"tests":         true,
+}
+
+// testFileSuffixes are base-name suffixes that mark test code. Each carries its
+// own leading separator, so a production file that merely ENDS in the word
+// (`latest.go`, `contest.py`) is not a match.
+var testFileSuffixes = []string{
+	"_test.go", // Go
+	"_test.py", // Python, suffix style
+}
+
+// testFileNames are exact base names that are test scaffolding wherever they sit.
+var testFileNames = map[string]bool{
+	"conftest.py": true, // pytest fixture module — no production role
+}
+
+// jsTestExts are the JavaScript/TypeScript source extensions on which the
+// `.test.` / `.spec.` infix convention applies (`Button.test.tsx`,
+// `api.spec.ts`). The infix is matched on the stem with its leading dot, so a
+// hand-written module literally named `spec.ts` is not a match.
+var jsTestExts = map[string]bool{
+	".cjs": true, ".cts": true, ".js": true, ".jsx": true,
+	".mjs": true, ".mts": true, ".ts": true, ".tsx": true,
+}
+
 // FileChange is one file's contribution to the diff.
 type FileChange struct {
 	Path      string
@@ -49,6 +94,7 @@ type FileChange struct {
 	Deleted   int
 	Binary    bool
 	Generated bool
+	Test      bool
 }
 
 // Changed returns the line count this file contributes to PR size (added +
@@ -60,13 +106,26 @@ func (f FileChange) Changed() int {
 	return f.Added + f.Deleted
 }
 
+// Policy is the configuration Evaluate applies to a classified diff. It is a
+// struct rather than positional arguments because the knobs are booleans, which
+// are silently swappable at a call site.
+type Policy struct {
+	Max          int  // the ceiling on counted lines
+	Bypassed     bool // a bypass label was present
+	ExcludeTests bool // subtract test-file lines from the counted total
+}
+
 // Result is the outcome of evaluating a diff against the cap.
 type Result struct {
 	Counted   int  // changed lines from non-generated, non-binary files
 	Generated int  // changed lines excluded because the file is generated
+	Test      int  // changed lines in test files (excluded only if TestsExcluded)
 	Max       int  // the configured ceiling
 	Bypassed  bool // a bypass label was present
 	OK        bool // Bypassed OR Counted <= Max
+	// TestsExcluded records whether Policy.ExcludeTests was set, so the report
+	// can say whether Test lines were subtracted from Counted or are part of it.
+	TestsExcluded bool
 	// Files sorted by descending Changed(), for reporting.
 	Files []FileChange
 	// Note is an optional human-facing explanation appended to the report (e.g.
@@ -167,6 +226,60 @@ func baseName(path string) string {
 		return path[slash+1:]
 	}
 	return path
+}
+
+// IsTestPath reports whether a repo-relative path is test code, by naming
+// convention: it sits under a test directory segment, or its base name matches a
+// per-language test-file convention.
+//
+// Unlike the generated-file rules this is a CONVENTION check, not a proof — the
+// content is never consulted, so nothing stops a contributor from parking
+// production code in `tests/`. That is exactly why excluding test lines from the
+// cap is opt-in per repo (`exclude_tests`) rather than the default, and why the
+// excluded total is always reported rather than silently dropped.
+func IsTestPath(path string) bool {
+	return hasTestSegment(path) || isTestFileName(baseName(path))
+}
+
+// hasTestSegment reports whether any DIRECTORY segment of path is a test
+// directory. The final segment (the file name) is excluded so the rule cannot
+// fire on a file that merely shares a name with a test directory.
+func hasTestSegment(path string) bool {
+	dir := path
+	slash := strings.LastIndex(dir, "/")
+	if slash < 0 {
+		return false // no directory part at all
+	}
+	for _, seg := range strings.Split(dir[:slash], "/") {
+		if testPathSegments[seg] {
+			return true
+		}
+	}
+	return false
+}
+
+// isTestFileName reports whether a file's base name follows a test-file naming
+// convention: an exact scaffolding name, a language suffix, Python's `test_`
+// prefix, or the JS/TS `.test.`/`.spec.` infix before a source extension.
+func isTestFileName(base string) bool {
+	if testFileNames[base] {
+		return true
+	}
+	for _, suffix := range testFileSuffixes {
+		if strings.HasSuffix(base, suffix) {
+			return true
+		}
+	}
+	if strings.HasPrefix(base, "test_") && strings.HasSuffix(base, ".py") {
+		return true
+	}
+	if dot := strings.LastIndex(base, "."); dot > 0 && jsTestExts[base[dot:]] {
+		stem := base[:dot]
+		if strings.HasSuffix(stem, ".test") || strings.HasSuffix(stem, ".spec") {
+			return true
+		}
+	}
+	return false
 }
 
 // Extras carries per-repo additions to the exclusion rules, parsed from the
@@ -275,22 +388,35 @@ func TouchesGitattributes(files []FileChange) bool {
 }
 
 // Evaluate sums the changed lines of non-generated files and compares against
-// max. A file's Generated field must already be set by the caller. When bypassed
-// is true the result is always OK, but the counts are still reported.
-func Evaluate(files []FileChange, max int, bypassed bool) Result {
+// the cap. A file's Generated and Test fields must already be set by the caller.
+// When Policy.Bypassed is true the result is always OK, but the counts are still
+// reported.
+//
+// The three buckets never overlap: a generated file that is ALSO a test file
+// counts once, as generated, so Counted + Generated + Test is always the diff's
+// total non-binary changed lines regardless of policy.
+func Evaluate(files []FileChange, p Policy) Result {
 	// Copy before sorting so we honor the file header's "side-effect-free"
 	// contract and never reorder the caller's slice in place.
 	sorted := make([]FileChange, len(files))
 	copy(sorted, files)
-	res := Result{Max: max, Bypassed: bypassed, Files: sorted}
+	res := Result{Max: p.Max, Bypassed: p.Bypassed, TestsExcluded: p.ExcludeTests, Files: sorted}
 	for _, f := range sorted {
-		if f.Generated {
+		switch {
+		case f.Generated:
 			res.Generated += f.Changed()
-			continue
+		case f.Test:
+			// Always tallied so the report can show the number either way; only
+			// kept OUT of Counted when the caller opted in.
+			res.Test += f.Changed()
+			if !p.ExcludeTests {
+				res.Counted += f.Changed()
+			}
+		default:
+			res.Counted += f.Changed()
 		}
-		res.Counted += f.Changed()
 	}
-	res.OK = bypassed || res.Counted <= max
+	res.OK = p.Bypassed || res.Counted <= p.Max
 	sort.SliceStable(res.Files, func(i, j int) bool {
 		return res.Files[i].Changed() > res.Files[j].Changed()
 	})

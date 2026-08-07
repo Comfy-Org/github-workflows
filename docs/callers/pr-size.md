@@ -10,7 +10,8 @@ keep diffs reviewable. In `mode: warn` it reports without failing.
 Excluded from the count: dependency lockfiles, `linguist-generated` files (read
 from the **base ref**, so a PR cannot exempt itself by editing
 `.gitattributes`), Go generated-code markers, and anything you add via
-`extra_lockfiles` / `extra_generated_globs`.
+`extra_lockfiles` / `extra_generated_globs`. Optionally test files too — see
+`exclude_tests` below.
 
 The counting logic and its tests live in
 [`scripts/check-pr-size/`](../../scripts/check-pr-size) and are compiled from
@@ -65,6 +66,7 @@ contents: read
 | `bypass_label` | `oversized-ok` | Waves through a legitimately large change. |
 | `extra_lockfiles` | `''` | Additional lockfiles to exclude. |
 | `extra_generated_globs` | `''` | Additional generated-path globs to exclude. |
+| `exclude_tests` | `false` | Keep test-file lines out of the count — cap production code, not coverage. Always reported separately. |
 | `comment` | `true` | Sticky bot comment explaining an overage. |
 | `bot_app_id` | `''` | Without it, degrades to status + step summary. |
 | `workflows_ref` | `main` | **Set to your `uses:` SHA** — the tool is built from this ref. |
@@ -84,6 +86,24 @@ enforce.
 **Without `bot_app_id` the bypass route is not discoverable.** The failing status
 alone does not mention `oversized-ok`; the sticky comment is what tells an author
 the escape hatch exists. Supply the App or expect confused authors.
+
+**`exclude_tests` is a naming convention, not a proof.** Unlike the
+generated-file rules — which require Go's marker *before* the package clause,
+and read `.gitattributes` from the base ref precisely so a PR cannot exempt
+itself — test detection only looks at the path. Nothing stops production code
+being parked in `tests/` to duck the cap. That is why it is off by default, and
+why the excluded total is always printed on its own line: the report shows
+`Excluded (tests): N` next to the counted number, so a 5,000-line "test-only" PR
+is visible rather than silently small. Recognized: `*_test.go`; `test_*.py`,
+`*_test.py`, `conftest.py`; `*.test.*` / `*.spec.*` for `.js .jsx .mjs .cjs .ts
+.tsx .mts .cts`; and any file under a `test/`, `tests/`, `testing/`,
+`testdata/`, `e2e/`, `__tests__/`, `__mocks__/` or `__snapshots__/` **directory**
+segment. `spec/` is deliberately *not* a test directory — in this org it holds
+OpenAPI schemas, which are production artifacts. For a layout these miss, add
+`extra_generated_globs` (they land in the generated bucket instead).
+
+Leaving it off is a real choice, not just the safe one: a 5,000-line test diff
+is genuinely slow to review, and the cap is the only thing that says so.
 
 **Go workspaces:** a consumer with a root `go.work` needs `GOWORK=off` for the
 tool build, since `go build` otherwise discovers the consumer's workspace.

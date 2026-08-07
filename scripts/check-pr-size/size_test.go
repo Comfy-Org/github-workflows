@@ -185,6 +185,73 @@ func TestIsLockfile(t *testing.T) {
 	}
 }
 
+// TestIsTestPath pins the test-file classification. The false-positive half of
+// this table matters more than the true-positive half: a production file
+// misclassified as a test silently shrinks the very number the cap protects,
+// which is strictly worse than a test file being counted.
+func TestIsTestPath(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		path string
+		want bool
+	}{
+		// Go
+		{"internal/config/feature_rollout_test.go", true},
+		{"main_test.go", true},
+		{"pkg/testdata/golden.json", true},
+		// Python
+		{"api/tests/test_models.py", true},
+		{"api/test_models.py", true},
+		{"api/models_test.py", true},
+		{"api/conftest.py", true},
+		{"conftest.py", true},
+		// JS/TS
+		{"web/src/Button.test.tsx", true},
+		{"web/src/api.spec.ts", true},
+		{"web/src/util.test.js", true},
+		{"web/src/util.spec.mjs", true},
+		{"web/src/__tests__/render.tsx", true},
+		{"web/src/__snapshots__/Button.test.tsx.snap", true},
+		{"web/src/__mocks__/fs.ts", true},
+		// Directory conventions, at any depth
+		{"e2e/checkout.ts", true},
+		{"services/checkout/e2e/flow.go", true},
+		{"test/helpers.rb", true},
+		{"src/test/java/com/x/FooTest.java", true},
+		{"internal/testing/harness.go", true},
+
+		// --- False positives the substring-matching naive version would hit ---
+		{"contest/leaderboard.go", false},
+		{"pkg/contest/entry.py", false},
+		{"internal/version/latest.go", false},
+		{"protest.go", false},
+		{"attestation/verify.go", false},
+		{"pkg/attestation/sigstore_test_helpers.go", false},
+		{"web/src/manifest.ts", false},
+		{"web/src/spec.ts", false},
+		{"testify.go", false},
+		{"latest_test_results.md", false},
+		// `spec/` holds OpenAPI schemas in this org, not RSpec suites.
+		{"services/checkout/openapi.yaml", false},
+		{"spec/openapi.yaml", false},
+		{"api/specs/v1.json", false},
+		// A file whose own name matches a test DIRECTORY is not a test file.
+		{"cmd/test", false},
+		{"docs/testing", false},
+		// Production code that merely lives next to tests.
+		{"internal/config/feature_rollout.go", false},
+		{"services/checkout/server/handlers/assets.go", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			t.Parallel()
+			if got := IsTestPath(tt.path); got != tt.want {
+				t.Errorf("IsTestPath(%q) = %v, want %v", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseExtras(t *testing.T) {
 	t.Parallel()
 	t.Run("empty inputs yield inert extras", func(t *testing.T) {
@@ -261,8 +328,10 @@ func TestEvaluate(t *testing.T) {
 		files         []FileChange
 		max           int
 		bypassed      bool
+		excludeTests  bool
 		wantCounted   int
 		wantGenerated int
+		wantTest      int
 		wantOK        bool
 	}{
 		{
@@ -324,16 +393,78 @@ func TestEvaluate(t *testing.T) {
 			wantCounted: 1000,
 			wantOK:      true,
 		},
+		{
+			// Default policy: test lines are reported but still counted, so a
+			// repo that has not opted in sees exactly today's verdict.
+			name: "tests counted by default and reported separately",
+			files: []FileChange{
+				{Path: "hand.go", Added: 300, Deleted: 36},
+				{Path: "hand_test.go", Added: 1200, Deleted: 33, Test: true},
+			},
+			max:         1000,
+			wantCounted: 1569,
+			wantTest:    1233,
+			wantOK:      false,
+		},
+		{
+			// The BE-6791 case: the same diff passes once tests are excluded,
+			// and the excluded total is still reported.
+			name: "tests excluded when opted in",
+			files: []FileChange{
+				{Path: "hand.go", Added: 300, Deleted: 36},
+				{Path: "hand_test.go", Added: 1200, Deleted: 33, Test: true},
+			},
+			max:          1000,
+			excludeTests: true,
+			wantCounted:  336,
+			wantTest:     1233,
+			wantOK:       true,
+		},
+		{
+			// Buckets must not overlap: a generated file that also matches a test
+			// path counts once, as generated, so the three totals still sum to
+			// the diff's non-binary changed lines.
+			name: "generated wins over test so buckets never double count",
+			files: []FileChange{
+				{Path: "tests/mock.gen.go", Added: 900, Deleted: 100, Generated: true, Test: true},
+				{Path: "hand_test.go", Added: 40, Deleted: 0, Test: true},
+				{Path: "hand.go", Added: 10, Deleted: 0},
+			},
+			max:           1000,
+			excludeTests:  true,
+			wantCounted:   10,
+			wantGenerated: 1000,
+			wantTest:      40,
+			wantOK:        true,
+		},
+		{
+			// A test-only PR over the cap must still FAIL without the opt-in —
+			// the exclusion is a per-repo decision, never an implicit one.
+			name: "test-only PR still fails without the opt-in",
+			files: []FileChange{
+				{Path: "big_test.go", Added: 5000, Deleted: 0, Test: true},
+			},
+			max:         1000,
+			wantCounted: 5000,
+			wantTest:    5000,
+			wantOK:      false,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := Evaluate(tt.files, tt.max, tt.bypassed)
+			got := Evaluate(tt.files, Policy{Max: tt.max, Bypassed: tt.bypassed, ExcludeTests: tt.excludeTests})
 			if got.Counted != tt.wantCounted {
 				t.Errorf("Counted = %d, want %d", got.Counted, tt.wantCounted)
 			}
 			if got.Generated != tt.wantGenerated {
 				t.Errorf("Generated = %d, want %d", got.Generated, tt.wantGenerated)
+			}
+			if got.Test != tt.wantTest {
+				t.Errorf("Test = %d, want %d", got.Test, tt.wantTest)
+			}
+			if got.TestsExcluded != tt.excludeTests {
+				t.Errorf("TestsExcluded = %v, want %v", got.TestsExcluded, tt.excludeTests)
 			}
 			if got.OK != tt.wantOK {
 				t.Errorf("OK = %v, want %v", got.OK, tt.wantOK)
@@ -348,7 +479,7 @@ func TestEvaluateSortsFilesByChangedDescending(t *testing.T) {
 		{Path: "small.go", Added: 1, Deleted: 0},
 		{Path: "big.go", Added: 500, Deleted: 100},
 		{Path: "mid.go", Added: 50, Deleted: 0},
-	}, 1000, false)
+	}, Policy{Max: 1000})
 	wantOrder := []string{"big.go", "mid.go", "small.go"}
 	for i, w := range wantOrder {
 		if res.Files[i].Path != w {
@@ -363,7 +494,7 @@ func TestEvaluateDoesNotMutateCallerSlice(t *testing.T) {
 		{Path: "small.go", Added: 1},
 		{Path: "big.go", Added: 500},
 	}
-	_ = Evaluate(files, 1000, false)
+	_ = Evaluate(files, Policy{Max: 1000})
 	if files[0].Path != "small.go" || files[1].Path != "big.go" {
 		t.Errorf("Evaluate reordered the caller's slice: %+v", files)
 	}

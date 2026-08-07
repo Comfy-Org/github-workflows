@@ -253,7 +253,7 @@ func TestClassifyPRAddedGitattributesDoesNotReduceCount(t *testing.T) {
 			t.Error("hand.go was excluded by a PR-introduced .gitattributes rule")
 		}
 	}
-	res := Evaluate(files, 1000, false)
+	res := Evaluate(files, Policy{Max: 1000})
 	if res.Counted == 0 {
 		t.Errorf("counted lines should include hand.go's changes, got %d", res.Counted)
 	}
@@ -335,7 +335,7 @@ func TestClassifyAppliesExtras(t *testing.T) {
 			t.Errorf("%s: Generated = %v, want %v", f.Path, f.Generated, wantGenerated[f.Path])
 		}
 	}
-	res := Evaluate(files, 1000, false)
+	res := Evaluate(files, Policy{Max: 1000})
 	if res.Counted != 40 {
 		t.Errorf("Counted = %d, want 40", res.Counted)
 	}
@@ -451,6 +451,102 @@ func TestRenderReport(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestRenderReportTestLines is the visibility guarantee for the exclusion: the
+// test total must appear in the report BOTH ways round — as an explicit
+// exclusion when opted in (so a large test-only PR cannot pass unremarked), and
+// as a breakdown of the counted number when not (so the knob is discoverable).
+func TestRenderReportTestLines(t *testing.T) {
+	t.Parallel()
+	files := []FileChange{
+		{Path: "hand.go", Added: 300, Deleted: 36},
+		{Path: "hand_test.go", Added: 1200, Deleted: 33, Test: true},
+	}
+
+	t.Run("excluded tests are reported and kept out of the file list", func(t *testing.T) {
+		t.Parallel()
+		got := renderReport(Evaluate(files, Policy{Max: 1000, ExcludeTests: true}), modeEnforce, "oversized-ok")
+		for _, want := range []string{
+			"✅ Passed",
+			"Changed lines counted (non-generated, non-test): **336**",
+			"Excluded (tests): 1233",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("report missing %q:\n%s", want, got)
+			}
+		}
+		// The "largest counted files" list must add up to the counted number, so
+		// an excluded test file has no business in it.
+		if strings.Contains(got, "hand_test.go") {
+			t.Errorf("excluded test file must not appear in the largest-counted list:\n%s", got)
+		}
+	})
+
+	t.Run("counted tests are broken out without changing the verdict", func(t *testing.T) {
+		t.Parallel()
+		got := renderReport(Evaluate(files, Policy{Max: 1000}), modeEnforce, "oversized-ok")
+		for _, want := range []string{
+			"❌ Failed",
+			"Changed lines counted (non-generated): **1569**",
+			"1233 are tests (`exclude_tests` is off)",
+			"1569 lines of hand-written code",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("report missing %q:\n%s", want, got)
+			}
+		}
+		if strings.Contains(got, "Excluded (tests)") {
+			t.Errorf("tests are counted here, so nothing may claim they were excluded:\n%s", got)
+		}
+	})
+
+	t.Run("no test bullet when a PR has no test changes", func(t *testing.T) {
+		t.Parallel()
+		got := renderReport(Evaluate(files[:1], Policy{Max: 1000}), modeEnforce, "oversized-ok")
+		if strings.Contains(got, "are tests") {
+			t.Errorf("a PR with no test changes should not get a test bullet:\n%s", got)
+		}
+	})
+}
+
+// TestClassifySetsTestRegardlessOfPolicy proves classification is policy-free:
+// Test is set from the path alone, so Evaluate can report the total whether or
+// not the caller opted to exclude it. Non-.go paths keep git out of the picture
+// (contentGenerated never consults it) and attr.trusted is false, so classify
+// needs no repo.
+func TestClassifySetsTestRegardlessOfPolicy(t *testing.T) {
+	t.Parallel()
+	files := []FileChange{
+		{Path: "web/src/Button.test.tsx", Added: 400},
+		{Path: "web/src/__tests__/render.tsx", Added: 200},
+		{Path: "web/src/Button.tsx", Added: 60},
+		{Path: "web/src/manifest.ts", Added: 40},
+	}
+	classify(files, "", "", attrPolicy{}, Extras{})
+
+	wantTest := map[string]bool{
+		"web/src/Button.test.tsx":      true,
+		"web/src/__tests__/render.tsx": true,
+		"web/src/Button.tsx":           false,
+		"web/src/manifest.ts":          false,
+	}
+	for _, f := range files {
+		if f.Test != wantTest[f.Path] {
+			t.Errorf("%s: Test = %v, want %v", f.Path, f.Test, wantTest[f.Path])
+		}
+		if f.Generated {
+			t.Errorf("%s: nothing here is generated, got Generated = true", f.Path)
+		}
+	}
+
+	// Same classification, two policies: only the accounting moves.
+	if res := Evaluate(files, Policy{Max: 1000}); res.Counted != 700 || res.Test != 600 {
+		t.Errorf("default policy: Counted = %d (want 700), Test = %d (want 600)", res.Counted, res.Test)
+	}
+	if res := Evaluate(files, Policy{Max: 1000, ExcludeTests: true}); res.Counted != 100 || res.Test != 600 {
+		t.Errorf("exclude policy: Counted = %d (want 100), Test = %d (want 600)", res.Counted, res.Test)
+	}
 }
 
 // TestContentGeneratedDeletedFileReadsBlob proves the deleted-file fallback

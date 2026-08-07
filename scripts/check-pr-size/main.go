@@ -38,6 +38,7 @@ func main() {
 	bypassFlag := flag.Bool("bypass", envBool("PR_SIZE_BYPASS"), "bypass the cap (set when the bypass label is present)")
 	modeFlag := flag.String("mode", envStr("PR_SIZE_MODE", modeEnforce), "'enforce' exits non-zero when over the cap; 'warn' reports without failing")
 	bypassLabel := flag.String("bypass-label", envStr("PR_SIZE_BYPASS_LABEL", defaultBypassLabel), "PR label name the report offers as the bypass")
+	excludeTests := flag.Bool("exclude-tests", envBool("PR_SIZE_EXCLUDE_TESTS"), "keep test-file lines out of the counted total (they are still reported)")
 	extraLockfiles := flag.String("extra-lockfiles", os.Getenv("PR_SIZE_EXTRA_LOCKFILES"), "extra lockfile base names to exclude (whitespace/comma separated)")
 	extraGlobs := flag.String("extra-generated-globs", os.Getenv("PR_SIZE_EXTRA_GENERATED_GLOBS"), "extra glob patterns treated as generated (whitespace/comma separated)")
 	flag.Parse()
@@ -73,7 +74,7 @@ func main() {
 	attr.trusted = attrTrusted(attr.useSource, attrModified, *bypassFlag)
 	classify(files, *base, *head, attr, extras)
 
-	res := Evaluate(files, *maxFlag, *bypassFlag)
+	res := Evaluate(files, Policy{Max: *maxFlag, Bypassed: *bypassFlag, ExcludeTests: *excludeTests})
 	if !res.OK && !attr.trusted {
 		// The check is failing and we ignored linguist-generated exclusions; tell
 		// the contributor every reason so that dropping one (e.g. the .gitattributes
@@ -139,7 +140,10 @@ func attrTrusted(useSource, attrModified, bypass bool) bool {
 // classify sets FileChange.Generated for each file using, in order: the
 // lockfile name lists (built-in + extras), the caller-supplied generated globs,
 // the linguist-generated git attribute (read from the base ref per attr), and
-// the canonical Go generated marker in the file's content.
+// the canonical Go generated marker in the file's content. It also sets
+// FileChange.Test from the path's naming convention (see IsTestPath) — always,
+// regardless of policy, so the report can show the test total whether or not the
+// caller opted to exclude it.
 //
 // The linguist-generated attribute is resolved for every non-binary path in a
 // SINGLE `git check-attr` pass (attrGeneratedBatch) rather than one subprocess
@@ -160,6 +164,7 @@ func classify(files []FileChange, base, head string, attr attrPolicy, extras Ext
 		if f.Binary {
 			continue
 		}
+		f.Test = IsTestPath(f.Path)
 		if IsLockfile(f.Path) || extras.Generated(f.Path) ||
 			attrGen[f.Path] ||
 			contentGenerated(f.Path, base, head) {
@@ -301,15 +306,29 @@ func renderReport(res Result, mode, bypassLabel string) string {
 			status = "❌ Failed"
 		}
 	}
+	// What "counted" means depends on the policy, so the label and the over-cap
+	// sentence both spell it out — a number whose meaning shifted between repos
+	// (or between runs) is worse than no number.
+	counted, handWritten := "non-generated", "hand-written"
+	if res.TestsExcluded {
+		counted, handWritten = "non-generated, non-test", "hand-written non-test"
+	}
 	fmt.Fprintf(&b, "## %s — PR size check\n\n", status)
-	fmt.Fprintf(&b, "- Changed lines counted (non-generated): **%d**\n", res.Counted)
+	fmt.Fprintf(&b, "- Changed lines counted (%s): **%d**\n", counted, res.Counted)
 	fmt.Fprintf(&b, "- Cap: **%d**\n", res.Max)
 	fmt.Fprintf(&b, "- Excluded (generated/lockfiles): %d\n", res.Generated)
+	// Always surfaced, both ways round: an exclusion nobody can see is how a
+	// large test-only PR sails through unremarked.
+	if res.TestsExcluded {
+		fmt.Fprintf(&b, "- Excluded (tests): %d\n", res.Test)
+	} else if res.Test > 0 {
+		fmt.Fprintf(&b, "- Of the counted lines, %d are tests (`exclude_tests` is off)\n", res.Test)
+	}
 	if res.Bypassed {
 		fmt.Fprintf(&b, "- Bypassed via `%s` label ✅\n", bypassLabel)
 	}
 	if !res.OK {
-		fmt.Fprintf(&b, "\n**This PR changes %d lines of hand-written code, over the %d-line cap.**\n\n", res.Counted, res.Max)
+		fmt.Fprintf(&b, "\n**This PR changes %d lines of %s code, over the %d-line cap.**\n\n", res.Counted, handWritten, res.Max)
 		if mode == modeWarn {
 			b.WriteString("This check runs in `warn` mode, so it will not fail — but consider:\n")
 		} else {
@@ -321,11 +340,13 @@ func renderReport(res Result, mode, bypassLabel string) string {
 	if res.Note != "" {
 		fmt.Fprintf(&b, "\n> %s\n", res.Note)
 	}
-	// Largest contributing files, for quick triage.
+	// Largest contributing files, for quick triage. Only files that actually
+	// contribute to Counted are listed, so the list always adds up to the number
+	// above it.
 	shown := 0
 	var top strings.Builder
 	for _, f := range res.Files {
-		if f.Generated || f.Changed() == 0 {
+		if f.Generated || f.Changed() == 0 || (res.TestsExcluded && f.Test) {
 			continue
 		}
 		if shown == 0 {

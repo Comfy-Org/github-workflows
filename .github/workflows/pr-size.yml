@@ -13,6 +13,18 @@ name: PR Size Cap (reusable)
 #     marker before the package clause (this rule simply never matches in
 #     non-Go repos, so it is unconditional)
 #   - files matching `extra_generated_globs`
+#   - test files, ONLY when `exclude_tests: true` (off by default) — see below
+#
+# `exclude_tests` (opt-in, per repo): keeps test-file lines out of the counted
+# total so a PR is capped on the production code a reviewer must actually reason
+# about, not on its test coverage. Test files are recognized by naming
+# convention only (`*_test.go`, `test_*.py`/`*_test.py`/`conftest.py`,
+# `*.test.ts`/`*.spec.ts` & friends, and paths under `test/`, `tests/`,
+# `testing/`, `testdata/`, `e2e/`, `__tests__/`, `__mocks__/`,
+# `__snapshots__/`). Unlike the generated-file rules this is a convention, not a
+# proof — nothing stops production code being parked in `tests/` — which is why
+# it is opt-in rather than the default. The excluded total is ALWAYS reported on
+# its own line, so a large test-only PR cannot pass unremarked.
 #
 # Bypass: add the `bypass_label` (default `oversized-ok`) to the PR for a
 # legitimately large change. The check still runs (so it always posts a
@@ -104,6 +116,20 @@ on:
         type: string
         required: false
         default: ''
+      exclude_tests:
+        description: >-
+          Keep test-file lines out of the counted total, so the cap measures
+          production code rather than test coverage. Test files are matched by
+          naming convention (`*_test.go`, `test_*.py`, `*.test.ts`,
+          `*.spec.ts`, and paths under test/, tests/, testing/, testdata/,
+          e2e/, __tests__/, __mocks__/, __snapshots__/). Off by default: it
+          loosens the cap, so each repo opts in deliberately. Excluded test
+          lines are always reported separately, never silently dropped. For a
+          layout these conventions miss, use `extra_generated_globs` (those
+          land in the generated bucket instead).
+        type: boolean
+        required: false
+        default: false
       comment:
         description: >-
           Post the sticky over-cap PR comment (needs bot_app_id +
@@ -144,6 +170,7 @@ env:
   PR_SIZE_BYPASS_LABEL: ${{ inputs.bypass_label }}
   PR_SIZE_EXTRA_LOCKFILES: ${{ inputs.extra_lockfiles }}
   PR_SIZE_EXTRA_GENERATED_GLOBS: ${{ inputs.extra_generated_globs }}
+  PR_SIZE_EXCLUDE_TESTS: ${{ inputs.exclude_tests }}
 
 jobs:
   pr-size:
