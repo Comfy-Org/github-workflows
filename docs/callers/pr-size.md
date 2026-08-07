@@ -109,6 +109,26 @@ someone who opens the Actions step summary. **If you set `exclude_tests`,
 configure the App too** — otherwise you keep the loosening and lose the
 visibility that justifies it.
 
+**Fork and Dependabot PRs are a blind spot — weigh this before opting in.** Those
+runs never receive `BOT_APP_PRIVATE_KEY` (GitHub withholds secrets from them), so
+the green-check comment cannot post there *even for a caller that configured the
+App correctly*. The consequence is uncomfortable and worth stating bluntly: with
+`exclude_tests: true`, a fork PR gets the **weaker cap** and loses the mechanism
+that makes the weaker cap safe. The trust gradient inverts — the least-trusted
+contributions get the least-scrutinized guardrail — and it is silent, because a
+green check with no comment looks exactly like a PR that passed on its own
+merits.
+
+**This is why a decisive exclusion also emits a check annotation.** The
+annotation comes from the size job itself and needs no credentials, so it shows
+up in the PR's Checks tab on fork and Dependabot PRs too. It carries the same
+numbers as the comment (`counted + test` against the cap), so the invariant
+holds everywhere — the bot comment is the richer surface, not the only one.
+
+What you still lose without the App on a fork PR is the *sticky* comment: the
+in-conversation explanation that survives pushes and flips to ✅. If that matters
+for your outside contributions, leave `exclude_tests` off.
+
 Note also that `extra_generated_globs` (below) classifies matches as
 *generated*, not *test*: they never reach the excluded-test total and never
 trigger the green-check comment. A repo leaning on it for an unusual test layout

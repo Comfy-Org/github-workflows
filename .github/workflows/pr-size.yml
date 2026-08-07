@@ -47,10 +47,15 @@ name: PR Size Cap (reusable)
 #
 # Without `bot_app_id` + BOT_APP_PRIVATE_KEY, or with `comment: false`, the
 # workflow degrades gracefully: the check status and the size job's step summary
-# still carry the full report; no comment is posted. Note this also covers fork
-# and Dependabot PRs, which never receive the secret — so on those the green
-# check's excluded-test total lives only in the step summary even for a caller
-# that configured the App.
+# still carry the full report; no comment is posted. This also covers fork and
+# Dependabot PRs, which never receive the secret at all.
+#
+# So that the credential-free path is not a silent hole, a decisive test
+# exclusion ALSO emits a `::warning` annotation from the size job itself. That
+# needs no secret, so it reaches fork and Dependabot PRs — the ones that would
+# otherwise get the loosened cap with none of the visibility justifying it. The
+# invariant "the exclusion is never invisible" therefore holds on every PR;
+# the bot comment is the richer surface, not the only one.
 #
 # Two-job security split: the `pr-size` job runs against PR code with a
 # read-only token; the `comment` job holds the bot write token, checks out NO
@@ -249,6 +254,23 @@ jobs:
           "${RUNNER_TEMP}/check-pr-size" \
             --base "${BASE_SHA}" \
             --head "${HEAD_SHA}" | tee "${RUNNER_TEMP}/pr-size-report.md"
+
+      - name: Annotate a decisive test exclusion
+        # An annotation is the ONE carrier that needs no bot credentials, so it
+        # is the only one that also reaches fork and Dependabot PRs — which
+        # never receive BOT_APP_PRIVATE_KEY and would otherwise get the loosened
+        # cap with none of the visibility that justifies it. That inversion is
+        # the worst shape this feature can take: the least-trusted contributions
+        # getting the least-scrutinized guardrail, silently, because a green
+        # check with no comment is indistinguishable from one that passed on its
+        # own merits. This fires on every PR regardless of secret availability,
+        # so the invariant "the exclusion is never invisible" holds everywhere.
+        if: always() && steps.check.outputs.tests_decisive == 'true'
+        env:
+          COUNTED: ${{ steps.check.outputs.counted }}
+          TESTS: ${{ steps.check.outputs.tests_excluded }}
+        run: |
+          echo "::warning title=Under the cap only via the test exclusion::This PR changes $((COUNTED + TESTS)) non-generated lines (${COUNTED} counted + ${TESTS} test) against a ${PR_SIZE_MAX_LINES}-line cap. exclude_tests is what brings it under — expected for a test-heavy change, surfaced so the real size is visible."
 
       - name: Record over-cap flag
         # The comment job keys off these flags rather than the pr-size job's
