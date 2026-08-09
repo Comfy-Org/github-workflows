@@ -29,26 +29,43 @@ name: CI - Groom
 # of those checks hold credentials. Audited 2026-08-08:
 #
 #   * the `test-*.yml` suites DO execute the PR's checkout (unittest + shellcheck
-#     over `.github/**`), and every one of them is `permissions: contents: read`
-#     with NO `secrets:` — the ordinary untrusted-PR-CI posture of any public
-#     repo, and the structural limit groom.yml's own header already states.
-#   * the only two CREDENTIALED `pull_request` workflows here — ci-cursor-review
-#     (CURSOR_API_KEY, SLACK_BOT_TOKEN, pull-requests: write) and
-#     ci-assign-reviewers (the App private key) — never EXECUTE the PR's code.
-#     Both pin the reusable by merged-main SHA and it loads its scripts from that
-#     same pinned ref, never the caller's checkout, so a PR cannot rewrite the
-#     logic judging it (the AGENTS.md "scripts are the single source of truth"
-#     property). Stated honestly: cursor-review does CHECK OUT the PR to read the
-#     diff, so machine-written text reaches an LLM in a credentialed job as
-#     DATA — the same prompt-injection surface any outside contributor's PR
-#     already carries here, unchanged in kind by this flag and only raised in
-#     volume.
+#     over `.github/**` — `test-groom-scripts.yml` literally runs
+#     `bash .github/groom/tests/sandbox-tests.sh` from the PR's tree), and every
+#     one of them is `permissions: contents: read` with NO `secrets:` — the
+#     ordinary untrusted-PR-CI posture of any public repo, and the structural
+#     limit groom.yml's own header already states.
+#   * ci-assign-reviewers (the App private key) never EXECUTES the PR's code: it
+#     reads metadata and pins the reusable by merged-main SHA, which loads its
+#     scripts from that same pinned ref, never the caller's checkout (the
+#     AGENTS.md "scripts are the single source of truth" property).
+#   * ci-cursor-review is the one that does NOT fit that sentence, and the
+#     builder makes it self-triggering, so state it exactly. `build_pr` opens
+#     every builder PR with `--label cursor-review` (groom.yml), which is this
+#     repo's review trigger; each panel cell then checks out the PR
+#     (`persist-credentials: false`, `permissions: contents: read`) and runs
+#     `cursor-agent --print --trust` — tool use auto-approved, `--sandbox`
+#     deliberately omitted — with CURSOR_API_KEY in the step env. So this is not
+#     merely "machine-written text reaches an LLM as DATA": an agent with tool
+#     use is pointed at a machine-written checkout inside a job holding a
+#     third-party API key. Two jobs do this, not one, and the second is the
+#     wider of the pair — the `consolidate` judge ALSO checks out the PR and
+#     ALSO runs `cursor-agent --print --trust`, and it is the job carrying
+#     `pull-requests: write`. Blast radius: CURSOR_API_KEY, the findings
+#     artifact, and a review comment posted under that write grant. It stops
+#     there — every one of those jobs is `contents: read`, both checkouts set
+#     `persist-credentials: false`, and the prompts/scripts load from a pinned
+#     ref of this repo rather than the PR's tree, so a patch cannot rewrite the
+#     panel judging it. Accepted because it is the SAME path any outside
+#     contributor's PR already takes here the moment the label lands — but the
+#     honest delta is that the builder both raises the volume AND removes the
+#     human who used to apply that label.
 #
-# So this caller needs NO authorship gate on a credentialed job (comfy-infra
-# needed one because `tofu plan` executes PR-supplied code while holding cloud
-# creds). If a credentialed workflow here ever starts EXECUTING the PR's own
-# scripts — a build step, a lint that imports the tree, a plan-like command —
-# that conclusion dies with it and this caller goes back to `builder: false`.
+# So this caller needs NO authorship gate on a job holding *repo write*
+# (comfy-infra needed one because `tofu plan` executes PR-supplied code while
+# holding cloud creds; nothing here does). If a workflow that holds write
+# authority — repo, cloud, or publish — ever starts EXECUTING the PR's own
+# scripts, that conclusion dies with it and this caller goes back to
+# `builder: false`.
 #
 # WHAT THE BUILDER CAN ACTUALLY PR IN THIS REPO — less than you would guess, by
 # design. The patch-path policy (BE-4404, `.github/groom/patch_policy.py`) denies
@@ -59,6 +76,16 @@ name: CI - Groom
 # agents-md-integrity,refresh-reviewers}/`) and the docs. Bail issues are NOT
 # capped by `max_findings` (BE-6157), so a bailed finding is recorded rather than
 # discarded — which matters given the live config below.
+#
+# Note what that leaves in scope, because the deny list is target-repo-agnostic
+# and this repo is an awkward target for it: those same script directories are
+# exactly what the credential-free `test-*.yml` jobs EXECUTE on a PR, and they
+# include the suites guarding `ledger.py` and `patch_policy.py` themselves. A
+# builder patch under `.github/groom/tests/` is therefore both pre-review code
+# execution and a patch to groom's own guard rails. The containment is that
+# those jobs hold no secrets and the PR is never auto-merged — a human reading
+# the diff is what stops a weakened assertion from landing, so read builder PRs
+# touching `**/tests/**` as the diffs that most need a careful reviewer.
 #
 # LIVE CONFIG IS NOT IN THIS FILE. `vars.GROOM_CONFIG` (BE-5227) OUTRANKS every
 # `with:` below, and it is set on this repo:
@@ -74,12 +101,32 @@ name: CI - Groom
 #   gh variable set GROOM_CONFIG --repo Comfy-Org/github-workflows \
 #     --body '{"interval_days":"1","cadence":"1","max_prs":"1","max_findings":0}'
 #
-# `builder` and `pr_size_limit` are deliberately NOT settable that way
-# (`config.py` `_LOCKED_KEYS`): turning the auto-builder on is a decision to let
-# an agent author code in the repo that defines the org's CI, so it belongs in a
-# reviewed commit — this one — and not in a variable edit that leaves no diff.
-# The older `GROOM_INTERVAL_DAYS` variable is still read as the pre-GROOM_CONFIG
-# fallback below; it is unset on this repo.
+# KNOW WHAT `max_findings: 0` COSTS in builder mode — it is not just "no issue
+# noise". The `file` job slices `to_file[:max_findings]`, and `to_file` in
+# builder mode is everything that did NOT become a PR: DOWNGRADE verdicts, every
+# security / auth-adjacent finding (which `build_select` fail-closes and NEVER
+# builds), and everything past `max_prs`. At 0 they are all discarded. The ledger
+# dedups off LIVE issue/PR state, so no issue means no memory of the finding,
+# which at `interval_days: 1` means it is re-found and re-verified — re-billed —
+# every day, with no durable record beyond an expiring public run log. That is
+# accepted here only because this repo's cleanup work is tracked in Linear and
+# the builder PRs themselves are the sink that matters; if a security finding
+# ever needs to persist, raise `max_findings` rather than relying on the run log.
+#
+# `builder` is deliberately NOT settable that way (`config.py` `_LOCKED_KEYS` =
+# `builder`, `sink`, `bot_app_id`, `workflows_ref`, `config`): turning the
+# auto-builder on is a decision to let an agent author code in the repo that
+# defines the org's CI, so it belongs in a reviewed commit — this one — and not
+# in a variable edit that leaves no diff. `pr_size_limit` is NOT locked, despite
+# what you might assume from that list: it is the one OPERATIONAL knob that
+# WIDENS (BE-6345), so anyone with repo write can raise the machine-written-patch
+# ceiling by variable, with no diff. `config.py` argues why that is accepted
+# (size is not what stops a patch landing; review is) — the point here is only
+# that this file cannot promise otherwise. `dry_run` is likewise operational, so
+# a `{"dry_run": false}` key in the variable would turn the hand-dispatched
+# preview below into a LIVE run; the variable does not carry that key today and
+# should not acquire it. The older `GROOM_INTERVAL_DAYS` variable is still read
+# as the pre-GROOM_CONFIG fallback below; it is unset on this repo.
 #
 # PREREQUISITE (operator): `secrets.ANTHROPIC_API_KEY` must be available to this
 # repo (org- or repo-level) — the finder, verifier and builder agents bill
@@ -87,16 +134,22 @@ name: CI - Groom
 # deliberately, so the caller is never silently inert.
 #
 # BOT IDENTITY — a HARD PRECONDITION now, not the nicety it was in finds-only
-# mode. The two sinks credential differently and only one of them degrades:
+# mode. In finds-only mode an empty `bot_app_id` merely DEGRADED the identity:
+# the issue sink reads `steps.bot_token.outputs.token || github.token`, so it
+# still filed, as github-actions[bot]. With `builder: true` that graceful path is
+# unreachable, and the failure is total rather than partial:
 #
-#   * the ISSUE sink reads `steps.bot_token.outputs.token || github.token`, so
-#     with no App token it still files, as github-actions[bot].
-#   * the PR sink (`build_pr`) reads `steps.bot_token.outputs.token` with NO
-#     fallback, for both the checkout `token:` and its `GH_TOKEN`. This caller
-#     grants `contents: read`, so there is no second way to push a branch.
+#   * `build_select`'s "Validate builder config" step exits 1 when `builder` is
+#     true and `bot_app_id` is empty — deliberately, since the PR sink
+#     (`build_pr`) reads `steps.bot_token.outputs.token` with NO fallback for
+#     both the checkout `token:` and its `GH_TOKEN`, and this caller grants only
+#     `contents: read`, so there is no second way to push a branch.
+#   * `file` is `needs: [gate, build_select]` and its `if:` uses no status
+#     function, so the implicit `success()` skips the ISSUE sink too.
 #
-# With the builder ON and no App token, every buildable finding would reach
-# `build_pr` and die there — after the finder and verifier had already billed.
+# So with the builder ON and no App token the WHOLE run is discarded — no PRs,
+# no issues, no ledger markers — after the finder and verifier have already
+# billed. Read `vars.APP_ID` as load-bearing for both sinks, not just the PR one.
 #
 # SATISFIED here, and verified by BEHAVIOUR rather than by a permissions read:
 # `vars.APP_ID` (2016716) and `secrets.CLOUD_CODE_BOT_PRIVATE_KEY` are both
@@ -164,10 +217,15 @@ on:
         # PRs with a warning. An API dispatch can still post a value past this
         # list; that is a typo guard, not a security boundary, and anyone who can
         # dispatch this workflow already has repo write.
+        #
+        # '0' is listed because the expression below is built to pass it through
+        # ("audit + file, build nothing this run") and a value you can only reach
+        # via an API dispatch is a knob nobody uses. The reusable honours it:
+        # `max(0, int(float(x)))`.
         type: choice
         required: false
         default: '1'
-        options: ['1', '2', '3', '5']
+        options: ['0', '1', '2', '3', '5']
 
 # NOTE: intentionally NO caller-level `concurrency:` here. The reusable groom.yml
 # already declares `concurrency: groom-${{ github.repository }}` (cancel-in-
@@ -218,6 +276,15 @@ jobs:
     # failing every daily tick at startup since it was written (the
     # reusable-lands-then-bump-caller two-step whose second half never happened).
     #
+    # The pin is unchanged by this commit, and it does NOT need to move for the
+    # builder: 0b6ebf5 is still main's tip for both `groom.yml` and
+    # `.github/groom/**`, and it already carries every protection the header
+    # relies on — `patch_policy.py` with its root-anchored `.github/workflows/`
+    # deny (BE-4404), `config.py`'s `_LOCKED_KEYS` (BE-5227), and the
+    # uncapped-bail `bail_sink` path (BE-6157). Re-verify with
+    # `git log 0b6ebf5..origin/main -- .github/workflows/groom.yml .github/groom/`
+    # (empty today) before assuming otherwise.
+    #
     # This pin and `workflows_ref` below MUST stay byte-identical. They are
     # auto-bumped together: this repo IS enrolled in `vars.GROOM_CALLERS` as
     # `.github/workflows/ci-groom.yml`, and bump-callers.sh rewrites both pins
@@ -230,9 +297,9 @@ jobs:
     with:
       # File groom's issues AND open its builder PRs as cloud-code-bot (App
       # token), not github-actions[bot]. With `builder: true` this is no longer
-      # optional — `build_pr` has no github.token fallback, so an empty value
-      # here means every buildable finding dies at the PR sink. See BOT IDENTITY
-      # in the header.
+      # optional — an empty value fails `build_select`'s "Validate builder
+      # config" step, which skips BOTH sinks (`file` needs it), so the run is
+      # discarded rather than degraded. See BOT IDENTITY in the header.
       bot_app_id: ${{ vars.APP_ID }}
       # Auto-builder ON (BE-6851). Locked against vars.GROOM_CONFIG on purpose
       # (config.py `_LOCKED_KEYS`) — turning this on is reviewable here, in a
@@ -244,15 +311,23 @@ jobs:
       # LIVE value is vars.GROOM_CONFIG.max_prs (2 today), which outranks this;
       # clearing that key falls back to the 1 below.
       #
-      # Tested for EMPTY, not for truthiness — deliberately NOT `|| '1'`. GitHub
-      # casts a string to a number for the `||` truthiness check and '0' casts to
-      # 0, which is falsy, so the `||` form silently turns a "build no PRs this
-      # run" dispatch into 1. '0' is not in the `options:` list above, but an API
-      # dispatch can post it and the reusable honours it (`max(0, int(float(x)))`),
-      # so honour it here too. The `== ''` test is a same-type string comparison
-      # on a dispatch (so '0' is not swallowed) and a null-vs-string comparison on
-      # the SCHEDULE event, which carries no inputs — there both sides coerce to 0
-      # and the reviewed fallback applies, as intended.
+      # Tested for EMPTY, not for truthiness. `|| '1'` would in fact also work
+      # here — GitHub's truthiness for a string is non-emptiness, with no numeric
+      # cast, so the string '0' is truthy and survives it (the numeric-falsy trap
+      # is real only for a genuine NUMBER 0, which `github.event.inputs` never
+      # yields). The explicit `== ''` is kept anyway because it states the actual
+      # question — "did the dispatcher supply a value?" — without depending on
+      # that rule, and '0' is a value this caller means to honour.
+      #
+      # Both events resolve correctly: on a DISPATCH this is a same-type string
+      # comparison (so '0' is not swallowed), and on the SCHEDULE event, which
+      # carries no inputs, it is null-vs-string — both coerce to 0, the test is
+      # true, and the reviewed fallback applies. Note the expression can never
+      # yield an empty string, which matters: an empty `max_prs` reaching the
+      # reusable is dropped by `config.py`'s numeric coercer, leaving
+      # `resolved.max_prs` absent and `build_select` falling back to its own
+      # MAX_PRS_DEFAULT of 5 — five PRs, not the 1 promised above. Preserve that
+      # property in any rewrite.
       max_prs: ${{ github.event.inputs.max_prs == '' && '1' || github.event.inputs.max_prs }}
       # Keep the assets ref (finder/verifier briefs + interval gate + dedup
       # ledger) in lock-step with the `uses:` ref above, so a run always loads the
@@ -261,6 +336,17 @@ jobs:
       # Manual dispatch can dry-run; the daily schedule always runs live — for
       # PRs as well as issues, now that the builder is on (github.event.inputs is
       # null on a schedule event -> '' != 'true' -> false).
+      #
+      # `== 'true'` is correct and not a boolean-vs-string bug: `github.event.
+      # inputs.*` carries a `type: boolean` dispatch input as the STRING 'true'
+      # (only the typed `inputs` context preserves it as a boolean). Confirmed on
+      # the real thing — the 2026-08-04 dry_run dispatch of this workflow (run
+      # 30956077668) resolved `"dry_run": true` in the gate's `Resolved knobs:`
+      # line and the file job logged `[dry-run] WOULD file`.
+      #
+      # This is a baseline the variable outranks: `dry_run` is an OPERATIONAL key
+      # in config.py, so a `{"dry_run": false}` entry in vars.GROOM_CONFIG would
+      # make this dispatch toggle inert. It carries no such key today.
       dry_run: ${{ github.event.inputs.dry_run == 'true' }}
       # Effective cadence knob (BE-4004): the daily base cron only produces a real
       # run every interval_days days. OUTRANKED by vars.GROOM_CONFIG.interval_days,
@@ -276,9 +362,10 @@ jobs:
       # exercise the full audit + dedup + builder: bypass the volume gate when
       # dispatched with dry_run:true. Otherwise a quiet window (nothing merged in
       # `cadence` days) would gate the dry-run to nothing and print no summary,
-      # defeating the dispatch's whole purpose. Live runs (the daily schedule, where inputs
-      # is null -> '' != 'true' -> true, or a dry_run:false dispatch) keep the gate
-      # on so a quiescent repo still skips the spend. (Note: a schedule tick still
+      # defeating the dispatch's whole purpose. Live runs (the daily schedule,
+      # where inputs is null -> '' != 'true' -> true, or a dry_run:false
+      # dispatch) keep the gate on so a quiescent repo still skips the spend.
+      # (Note: a schedule tick still
       # passes the interval gate first — the volume gate is the second throttle.)
       volume_gate: ${{ github.event.inputs.dry_run != 'true' }}
     secrets:
