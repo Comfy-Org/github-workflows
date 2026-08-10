@@ -20,17 +20,33 @@ name: PR Risk Grade (reusable)
 # `refs/pull/N/head` — so the grading logic cannot change after the caller was reviewed, and
 # "pin it, don't float it" is machine-checked rather than trusted prose in this header.
 #
-# WHAT SHAPE DOES NOT PROVE is WHICH commit it is. A fork of this PUBLIC repo shares its object
-# store, so a fork-authored commit is a perfectly well-shaped 40-hex SHA and would be checked out
-# into a job holding the caller's `pull-requests: write` token. Nothing inside this file can close
-# that: the check it wants is "`workflows_ref` equals the commit the caller's `uses:` resolved to",
-# and the runner does NOT expose that commit to the workflow — `github.workflow_sha` is the
-# CALLER's top-level workflow file, and `job_workflow_sha` (the value that would answer this)
-# exists only as an OIDC token claim, which would mean an `id-token: write` grant from every
-# caller and a token exchange in a job that today holds `permissions: {}`. Until that is designed,
-# this is bounded by REVIEW OF THE CALLER on its base branch — which is also the only thing that
-# can see the ref the caller actually wrote: `uses:` must name this repo at a full commit SHA and
-# `with: workflows_ref:` must be that same SHA written out LITERALLY, never an expression and
+# A SECOND AXIS, ANCESTRY, now proves WHOSE commit it is. Shape alone never could: a fork of this
+# PUBLIC repo shares its object store, and GitHub serves a fork PR's head objects from this repo's
+# own URL to an unauthenticated client — so a fork-authored commit is a perfectly well-shaped
+# 40-hex SHA, and it would have been checked out into a job holding the caller's
+# `pull-requests: write` token. Every job that checks the ref out now also fetches it from
+# `Comfy-Org/github-workflows` (URL written LITERALLY — no context can name this repo from inside a
+# reusable workflow) and requires it to be an ANCESTOR OF UPSTREAM `main`. Merged upstream history,
+# and nothing else, may be pinned. There is deliberately NO opt-out input: an opt-out would be set
+# by the very pin-bump PR the check exists to distrust. Two operational consequences, both by
+# design — pinning a NOT-YET-MERGED SHA is now rejected, so merge first and then bump (which is what
+# every consumer has always done in practice); and the axis FAILS CLOSED if this repo ever goes
+# private or `main` is force-rewritten past a consumer's pin, in which case consumers re-pin to a
+# commit that is on `main` to recover.
+#
+# WHAT ANCESTRY STILL DOES NOT PROVE is that the pin is the CURRENT one. A stale pin, left behind
+# when `uses:` moved, is a merged ancestor too and passes. The check that would close that is
+# "`workflows_ref` equals the commit the caller's `uses:` resolved to", and the runner does NOT
+# expose that commit to the workflow — `github.workflow_sha` is the CALLER's top-level workflow
+# file, and `job_workflow_sha` (the value that would answer this) exists only as an OIDC token
+# claim, which would mean an `id-token: write` grant from every caller and a token exchange in a job
+# that today holds `permissions: {}`. The other residual is narrower and irreducible: a fork commit
+# that edits THIS FILE. Such a commit is not an ancestor of upstream `main`, so the axis rejects it
+# on the way in — but a caller pinned at one would be running the fork's own copy of this guard, and
+# no check written inside a file can bound a revision of that file chosen by an attacker. Both
+# residuals are bounded by REVIEW OF THE CALLER on its base branch, which is also the only thing
+# that can see the ref the caller actually wrote: `uses:` must name this repo at a full commit SHA
+# and `with: workflows_ref:` must be that same SHA written out LITERALLY, never an expression and
 # never a tag. Call this workflow DIRECTLY; a nested `workflow_call` chain through an org wrapper
 # is unsupported. See the `workflows_ref` input for the detail.
 # A consumer repo sharpens the generic defaults by committing
@@ -371,32 +387,73 @@ on:
           with them, since this value is handed to `actions/checkout` verbatim.
 
 
-          THAT IS ONE AXIS, AND IT IS THE ONLY ONE AVAILABLE FROM IN HERE. Shape
-          proves the ref is IMMUTABLE; it says nothing about WHICH commit it
-          names. A fork of this PUBLIC repo shares its object store, so a
+          ITS ANCESTRY IS ENFORCED TOO, in the same step, before the same
+          checkout: the commit must be reachable from `main` of
+          Comfy-Org/github-workflows. Shape alone proves only that the ref is
+          IMMUTABLE, never WHICH repository authored the commit — a fork of this
+          PUBLIC repo shares its object store, and GitHub serves a fork PR's head
+          objects from this repo's own URL to an unauthenticated client, so a
           fork-authored commit is as well-shaped as any other and would be
-          checked out into a job holding the caller's write token; equally, a pin
-          left behind when `uses:` moved still passes. The test that would close
-          both is "equal to the commit `uses:` resolved to for this job" — and
-          the runner does not expose that commit to the workflow.
-          `github.workflow_sha` is the CALLER's top-level workflow file, not this
-          one; the value that would answer it, `job_workflow_sha`, exists only as
-          an OIDC token claim, which means an `id-token: write` grant from every
-          caller plus a token exchange in a job that today holds
+          checked out into a job holding the caller's write token. The step
+          fetches the pinned SHA and `main` from a LITERAL upstream URL (no
+          `github` context can name this repo from inside a reusable workflow, so
+          a variable there would be an alias a fork could point at itself) and
+          requires `merge-base --is-ancestor`. There is deliberately NO opt-out
+          input: an opt-out would be set by the very pin-bump PR the check exists
+          to distrust.
+
+
+          TWO OPERATIONAL CONSEQUENCES, BOTH BY DESIGN. Pinning a NOT-YET-MERGED
+          SHA is now rejected outright — merge to `main` first, then bump the
+          pin, which is what every consumer has always done in practice. And the
+          axis FAILS CLOSED: if this repo ever goes private, or `main` is
+          force-rewritten past a consumer's pin, the fetch or the ancestry test
+          fails and the run goes red rather than proceeding on an unproven ref.
+          Recovery is to re-pin to a commit that is on `main`.
+
+
+          A RED RUN HERE IS NOT A NETWORK BLIP. Because this makes two
+          unauthenticated fetches a hard precondition of every run, each one gets
+          up to 3 attempts with a linear backoff, bounded by git's low-speed
+          timeout, so a transient github.com error or a secondary rate limit on
+          shared Actions egress resolves itself rather than reddening every
+          enrolled consumer at once. What is never retried is the VERDICT. If the
+          step still fails, read the annotation: it distinguishes a scratch
+          workspace that could not be CREATED or INITIALIZED, a pin that could
+          not be FETCHED, a `main` that could not be READ, an ancestry test that
+          could not be COMPLETED (all five are infrastructure faults, not a
+          judgement about the pin), and a pin that is genuinely NOT AN
+          ANCESTOR — which is the only one of the six that says anything about
+          the pin itself.
+
+
+          WHAT ANCESTRY DOES NOT PROVE is that the pin is the CURRENT one: a pin
+          left behind when `uses:` moved is a merged ancestor too, and passes.
+          The test that would close that is "equal to the commit `uses:` resolved
+          to for this job" — and the runner does not expose that commit to the
+          workflow. `github.workflow_sha` is the CALLER's top-level workflow
+          file, not this one; the value that would answer it, `job_workflow_sha`,
+          exists only as an OIDC token claim, which means an `id-token: write`
+          grant from every caller plus a token exchange in a job that today holds
           `permissions: {}`. Adding that is a caller-contract change and is
-          tracked separately — do not assume this input's provenance is checked.
+          tracked separately — do not assume this pin is proven CURRENT. The
+          other residual is narrower and irreducible: a fork commit that edits
+          `pr-risk.yml` itself is not an ancestor of upstream `main`, so it is
+          rejected on the way in, but a caller pinned at one would be running the
+          fork's own copy of this guard, and nothing written inside a file can
+          bound a revision of that file an attacker chose.
 
 
-          SO REVIEW OF THE CALLER IS WHAT BOUNDS IT, and it is the only place
-          that CAN: the ref the caller actually wrote in `uses:` is never sent
-          here, so no check inside this workflow can tell a SHA-pinned caller
-          from a `@v1` one passing whatever that tag currently points at, nor a
-          written-out SHA from a context expression that re-resolves every run.
-          WHEN REVIEWING A CALLER, require `uses:` at a full commit SHA of this
-          repo (org policy already does — a floating one fails the pin-validation
-          consumer CI runs) and `with: workflows_ref:` set to that same SHA
-          LITERALLY, character-for-character. An expression of any kind here, and
-          the contract is decoration.
+          SO REVIEW OF THE CALLER IS WHAT BOUNDS BOTH RESIDUALS, and it is the
+          only place that CAN: the ref the caller actually wrote in `uses:` is
+          never sent here, so no check inside this workflow can tell a SHA-pinned
+          caller from a `@v1` one passing whatever that tag currently points at,
+          nor a written-out SHA from a context expression that re-resolves every
+          run. WHEN REVIEWING A CALLER, require `uses:` at a full commit SHA of
+          this repo (org policy already does — a floating one fails the
+          pin-validation consumer CI runs) and `with: workflows_ref:` set to that
+          same SHA LITERALLY, character-for-character. An expression of any kind
+          here, and the contract is decoration.
 
 
           CALL IT DIRECTLY — a nested `workflow_call` chain (caller → an org
@@ -466,7 +523,12 @@ jobs:
   gate:
     name: Resolve enablement
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # 10, not 5: the ancestry guard below makes two unauthenticated fetches, each up to 3
+    # attempts at a 40s wall-clock cap plus 15s of backoff (~135s), sequentially — ~270s worst
+    # case before the tool checkout even starts. 5 minutes left no margin for that plus runner
+    # setup; a job-timeout kill on top of it would silently swallow the guard's own ::error::
+    # annotation, the exact cry-wolf the retry/backoff exists to avoid.
+    timeout-minutes: 10
     permissions: {}
     outputs:
       enabled: ${{ steps.resolve.outputs.enabled }}
@@ -476,16 +538,19 @@ jobs:
       # tag, `refs/pull/N/head`) means that code can change after the caller was reviewed, and
       # only a full commit SHA is immutable.
       #
-      # SHAPE IS THE ONLY AXIS THIS FILE CAN CHECK, so do not read it as more. It does not say
-      # WHICH commit the ref names: a fork of this PUBLIC repo shares its object store, so a
-      # fork-authored 40-hex SHA is a perfectly well-shaped ref, and a pin left behind when
-      # `uses:` moved is too. Both would be closed by "equal to the commit `uses:` resolved to
-      # for this job" — but the runner does not hand that commit to the workflow.
-      # `github.workflow_sha` is the CALLER's top-level workflow file; `job_workflow_sha`, which
-      # is the value that would answer it, is an OIDC token CLAIM, not a `github` context
-      # property (`actionlint` rejects `github.job_workflow_sha`, and reading the claim needs
-      # `id-token: write` from every caller plus an exchange in a job that holds `permissions: {}`
-      # today). Reviewing the caller is what bounds that, and it is the only thing that can.
+      # SHAPE IS ONE AXIS; ANCESTRY (below) IS THE OTHER — together they are what this file can
+      # check. Shape alone does not say WHICH commit the ref names: a fork of this PUBLIC repo
+      # shares its object store, so a fork-authored 40-hex SHA is a perfectly well-shaped ref, and
+      # a pin left behind when `uses:` moved is too. The ancestry check ~50 lines below closes the
+      # FIRST case — a fork-authored commit is not, in general, an ancestor of this repo's own
+      # `main` — leaving only the stale-but-merged-pin case, which needs "equal to the commit
+      # `uses:` resolved to for this job." That remains unavailable: the runner does not hand this
+      # job that commit. `github.workflow_sha` is the CALLER's top-level workflow file;
+      # `job_workflow_sha`, which is the value that would answer it, is an OIDC token CLAIM, not a
+      # `github` context property (`actionlint` rejects `github.job_workflow_sha`, and reading the
+      # claim needs `id-token: write` from every caller plus an exchange in a job that holds
+      # `permissions: {}` today). Reviewing the caller is what bounds that residual, and it is the
+      # only thing that can.
       #
       # Enforced in the WORKFLOW, not in a script: the scripts are what the ref loads, so a
       # script-side check would sit inside the blast radius it is meant to bound. EVERY job that
@@ -527,6 +592,107 @@ jobs:
           # here is loud and fixed by lowercasing.
           if [[ ${#WORKFLOWS_REF} -ne 40 || "$WORKFLOWS_REF" == *[!0-9a-f]* ]]; then
             echo "::error::workflows_ref must be the FULL 40-hex lowercase commit SHA of Comfy-Org/github-workflows (got '${safe_ref}'). Pin it to the SAME SHA you pin uses: to — see the pr-risk.yml header. Branches, tags and refs/pull/N/head are mutable (and PR-head refs resolve fork-authored code), so they are rejected before the tool checkout."
+            exit 1
+          fi
+          # SECOND AXIS — ANCESTRY. Shape proves the value is IMMUTABLE; it does not prove WHICH
+          # REPOSITORY authored the commit it names. A fork of this PUBLIC repo shares the upstream
+          # object store, and GitHub serves a fork PR's head objects from THIS repo's URL to an
+          # UNAUTHENTICATED client — so a fork-authored 40-hex SHA passes the shape test above and is
+          # then handed to `actions/checkout` and run inside a job holding the caller's write token.
+          # Assert instead that the commit is REACHABLE FROM UPSTREAM `main`: merged upstream history,
+          # and nothing else, may be pinned. There is deliberately NO opt-out input for this — an
+          # opt-out would be set by the very pin-bump PR the check exists to distrust.
+          #
+          # THE URL IS A LITERAL ON PURPOSE. Inside a reusable workflow `github.repository` names the
+          # CALLER, and `github.job_workflow_ref` only repeats the `uses:` string the caller wrote, so
+          # no context can supply this repo's identity. A variable here would be an alias a fork could
+          # point back at itself — the exact class of bug this axis closes. Unauthenticated is correct
+          # (the repo is public), and every failure mode fails CLOSED: a fetch that errors, a `main`
+          # that cannot be read, or a network outage all leave the step non-zero.
+          #
+          # TWO FETCHES, NOT ONE, AND BOTH ARE BOUNDED. The depth-1 fetch is what proves the SHA
+          # exists in this repo's object network at all; the second brings `main` with an explicit
+          # refspec (rather than relying on remote-tracking config, which a bare-URL remote has none
+          # of) to walk down to the pin. `--filter=blob:none` holds both to a commit/tree graph — no
+          # file CONTENT is ever downloaded, because `merge-base` reads none. That bound matters most
+          # on the REJECTION path: when the pin is not an ancestor there is no shallow boundary
+          # anywhere in `main`'s ancestry, so the hostile pin is the case that fetches the MOST.
+          #
+          # THE SHALLOW BOUNDARY IS REAL, AND HARMLESS. The depth-1 fetch registers a boundary at the
+          # pinned commit and the server honours it on the second fetch, so `main` arrives TRUNCATED
+          # there — it is not a complete history and must not be reasoned about as one. What saves it
+          # is the direction of the walk: `merge-base --is-ancestor` runs from `main` DOWN to the
+          # pinned commit and stops on reaching it, so it never needs that commit's parents. Do not
+          # reorder these two fetches, or drop `--depth=1`, on the strength of a completeness the
+          # second fetch does not actually deliver.
+          #
+          # THE FETCH RETRIES; THE VERDICT DOES NOT. Two unauthenticated round-trips are now a hard
+          # precondition for every run in every enrolled consumer, and there is no opt-out — so a
+          # transient github.com error or a secondary rate limit on shared Actions egress would
+          # otherwise turn one bad minute into a fleet-wide red. Three attempts with a linear backoff
+          # absorb that, and the low-speed knobs turn a stalled connection into a fast failure rather
+          # than a hang to the job timeout. What does NOT get retried is the ANSWER: a fetch that
+          # keeps failing, and a commit that is simply not an ancestor, both still fail the step.
+          #
+          # `git` ECHOES THE REF ITSELF on a failed fetch (`upload-pack: not our ref <sha>`), which
+          # looks like it contradicts the never-emit-the-raw-value rule above. It does not: the shape
+          # test has already exited on anything that is not exactly 40 characters of `[0-9a-f]`, and
+          # such a value can carry neither a newline nor a `::`, so it cannot forge a workflow command
+          # in this PUBLIC log. That ordering is load-bearing — do not move this axis above the shape
+          # test.
+          #
+          # WHAT THIS STILL DOES NOT PROVE is that the pin is the CURRENT one: a stale-but-merged SHA
+          # is an ancestor too, and lock-step against the commit `uses:` resolved to remains
+          # unavailable from in here (see the header). Reviewing the caller still bounds that.
+          #
+          # THE SCRATCH CLONE IS CLEANED UP on every path, success or rejection. Hosted runners are
+          # ephemeral and would not care; self-hosted ones would accumulate one clone of `main` per
+          # run, per job.
+          if ! scratch=$(mktemp -d); then
+            echo "::error::A scratch directory for the workflows_ref (${safe_ref}) ancestry check could not be created, so the pin's provenance cannot be established. This is an infrastructure fault, not evidence about the pin. Failing closed."
+            exit 1
+          fi
+          trap 'rm -rf "$scratch"' EXIT
+          if ! git init -q "$scratch"; then
+            echo "::error::A scratch git repository for the workflows_ref (${safe_ref}) ancestry check could not be initialized, so the pin's provenance cannot be established. This is an infrastructure fault, not evidence about the pin. Failing closed."
+            exit 1
+          fi
+          # The upstream URL is passed IN by each call site rather than baked in here, so that both
+          # fetches keep naming the repo literally, in the line a reviewer reads, while sharing one
+          # retry and transfer-bound policy. See the literal-URL note above for why it is not a var.
+          fetch_upstream() {
+            for attempt in 1 2 3; do
+              if timeout 40 git -C "$scratch" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 fetch --quiet --no-tags --filter=blob:none "$@"; then
+                return 0
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                sleep $((attempt * 5))
+              fi
+            done
+            return 1
+          }
+          if ! fetch_upstream --depth=1 https://github.com/Comfy-Org/github-workflows "$WORKFLOWS_REF"; then
+            echo "::error::workflows_ref (${safe_ref}) could not be fetched from Comfy-Org/github-workflows after 3 attempts, so its provenance cannot be established. Failing closed."
+            exit 1
+          fi
+          if ! fetch_upstream https://github.com/Comfy-Org/github-workflows +refs/heads/main:refs/heads/upstream-main; then
+            echo "::error::main of Comfy-Org/github-workflows could not be read after 3 attempts, so workflows_ref (${safe_ref}) cannot be shown to be merged upstream. Failing closed."
+            exit 1
+          fi
+          # `--is-ancestor` HAS THREE OUTCOMES, NOT TWO: 0 is yes, 1 is no, and anything above 1 is
+          # git failing to answer at all (an unresolvable `upstream-main`, a missing or corrupt
+          # object, a fetched ref that is not a commit). Collapsing those into the `no` branch would
+          # report an infrastructure fault to the consumer as "treat the pin-bump that introduced
+          # this as hostile" — the same cry-wolf the retry above exists to avoid. Both branches still
+          # fail closed; only the message differs.
+          ancestry_rc=0
+          GIT_NO_LAZY_FETCH=1 git -C "$scratch" merge-base --is-ancestor "$WORKFLOWS_REF" upstream-main || ancestry_rc=$?
+          if [ "$ancestry_rc" -gt 1 ]; then
+            echo "::error::The ancestry test for workflows_ref (${safe_ref}) could not be COMPLETED — git merge-base failed rather than returning a verdict (see its output above). This is an infrastructure fault, not evidence the pin is hostile. Failing closed."
+            exit 1
+          fi
+          if [ "$ancestry_rc" -ne 0 ]; then
+            echo "::error::workflows_ref (${safe_ref}) is not an ancestor of Comfy-Org/github-workflows main. A well-shaped SHA can still be a FORK-AUTHORED commit served out of this repo's own object network; only merged upstream commits may be pinned. If this is a genuine just-merged pin, re-run; otherwise treat the pin-bump that introduced it as hostile."
             exit 1
           fi
       # The tool checkout is the same pinned-ref load the grade job does: the resolver is this
@@ -651,6 +817,107 @@ jobs:
           # here is loud and fixed by lowercasing.
           if [[ ${#WORKFLOWS_REF} -ne 40 || "$WORKFLOWS_REF" == *[!0-9a-f]* ]]; then
             echo "::error::workflows_ref must be the FULL 40-hex lowercase commit SHA of Comfy-Org/github-workflows (got '${safe_ref}'). Pin it to the SAME SHA you pin uses: to — see the pr-risk.yml header. Branches, tags and refs/pull/N/head are mutable (and PR-head refs resolve fork-authored code), so they are rejected before the tool checkout."
+            exit 1
+          fi
+          # SECOND AXIS — ANCESTRY. Shape proves the value is IMMUTABLE; it does not prove WHICH
+          # REPOSITORY authored the commit it names. A fork of this PUBLIC repo shares the upstream
+          # object store, and GitHub serves a fork PR's head objects from THIS repo's URL to an
+          # UNAUTHENTICATED client — so a fork-authored 40-hex SHA passes the shape test above and is
+          # then handed to `actions/checkout` and run inside a job holding the caller's write token.
+          # Assert instead that the commit is REACHABLE FROM UPSTREAM `main`: merged upstream history,
+          # and nothing else, may be pinned. There is deliberately NO opt-out input for this — an
+          # opt-out would be set by the very pin-bump PR the check exists to distrust.
+          #
+          # THE URL IS A LITERAL ON PURPOSE. Inside a reusable workflow `github.repository` names the
+          # CALLER, and `github.job_workflow_ref` only repeats the `uses:` string the caller wrote, so
+          # no context can supply this repo's identity. A variable here would be an alias a fork could
+          # point back at itself — the exact class of bug this axis closes. Unauthenticated is correct
+          # (the repo is public), and every failure mode fails CLOSED: a fetch that errors, a `main`
+          # that cannot be read, or a network outage all leave the step non-zero.
+          #
+          # TWO FETCHES, NOT ONE, AND BOTH ARE BOUNDED. The depth-1 fetch is what proves the SHA
+          # exists in this repo's object network at all; the second brings `main` with an explicit
+          # refspec (rather than relying on remote-tracking config, which a bare-URL remote has none
+          # of) to walk down to the pin. `--filter=blob:none` holds both to a commit/tree graph — no
+          # file CONTENT is ever downloaded, because `merge-base` reads none. That bound matters most
+          # on the REJECTION path: when the pin is not an ancestor there is no shallow boundary
+          # anywhere in `main`'s ancestry, so the hostile pin is the case that fetches the MOST.
+          #
+          # THE SHALLOW BOUNDARY IS REAL, AND HARMLESS. The depth-1 fetch registers a boundary at the
+          # pinned commit and the server honours it on the second fetch, so `main` arrives TRUNCATED
+          # there — it is not a complete history and must not be reasoned about as one. What saves it
+          # is the direction of the walk: `merge-base --is-ancestor` runs from `main` DOWN to the
+          # pinned commit and stops on reaching it, so it never needs that commit's parents. Do not
+          # reorder these two fetches, or drop `--depth=1`, on the strength of a completeness the
+          # second fetch does not actually deliver.
+          #
+          # THE FETCH RETRIES; THE VERDICT DOES NOT. Two unauthenticated round-trips are now a hard
+          # precondition for every run in every enrolled consumer, and there is no opt-out — so a
+          # transient github.com error or a secondary rate limit on shared Actions egress would
+          # otherwise turn one bad minute into a fleet-wide red. Three attempts with a linear backoff
+          # absorb that, and the low-speed knobs turn a stalled connection into a fast failure rather
+          # than a hang to the job timeout. What does NOT get retried is the ANSWER: a fetch that
+          # keeps failing, and a commit that is simply not an ancestor, both still fail the step.
+          #
+          # `git` ECHOES THE REF ITSELF on a failed fetch (`upload-pack: not our ref <sha>`), which
+          # looks like it contradicts the never-emit-the-raw-value rule above. It does not: the shape
+          # test has already exited on anything that is not exactly 40 characters of `[0-9a-f]`, and
+          # such a value can carry neither a newline nor a `::`, so it cannot forge a workflow command
+          # in this PUBLIC log. That ordering is load-bearing — do not move this axis above the shape
+          # test.
+          #
+          # WHAT THIS STILL DOES NOT PROVE is that the pin is the CURRENT one: a stale-but-merged SHA
+          # is an ancestor too, and lock-step against the commit `uses:` resolved to remains
+          # unavailable from in here (see the header). Reviewing the caller still bounds that.
+          #
+          # THE SCRATCH CLONE IS CLEANED UP on every path, success or rejection. Hosted runners are
+          # ephemeral and would not care; self-hosted ones would accumulate one clone of `main` per
+          # run, per job.
+          if ! scratch=$(mktemp -d); then
+            echo "::error::A scratch directory for the workflows_ref (${safe_ref}) ancestry check could not be created, so the pin's provenance cannot be established. This is an infrastructure fault, not evidence about the pin. Failing closed."
+            exit 1
+          fi
+          trap 'rm -rf "$scratch"' EXIT
+          if ! git init -q "$scratch"; then
+            echo "::error::A scratch git repository for the workflows_ref (${safe_ref}) ancestry check could not be initialized, so the pin's provenance cannot be established. This is an infrastructure fault, not evidence about the pin. Failing closed."
+            exit 1
+          fi
+          # The upstream URL is passed IN by each call site rather than baked in here, so that both
+          # fetches keep naming the repo literally, in the line a reviewer reads, while sharing one
+          # retry and transfer-bound policy. See the literal-URL note above for why it is not a var.
+          fetch_upstream() {
+            for attempt in 1 2 3; do
+              if timeout 40 git -C "$scratch" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 fetch --quiet --no-tags --filter=blob:none "$@"; then
+                return 0
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                sleep $((attempt * 5))
+              fi
+            done
+            return 1
+          }
+          if ! fetch_upstream --depth=1 https://github.com/Comfy-Org/github-workflows "$WORKFLOWS_REF"; then
+            echo "::error::workflows_ref (${safe_ref}) could not be fetched from Comfy-Org/github-workflows after 3 attempts, so its provenance cannot be established. Failing closed."
+            exit 1
+          fi
+          if ! fetch_upstream https://github.com/Comfy-Org/github-workflows +refs/heads/main:refs/heads/upstream-main; then
+            echo "::error::main of Comfy-Org/github-workflows could not be read after 3 attempts, so workflows_ref (${safe_ref}) cannot be shown to be merged upstream. Failing closed."
+            exit 1
+          fi
+          # `--is-ancestor` HAS THREE OUTCOMES, NOT TWO: 0 is yes, 1 is no, and anything above 1 is
+          # git failing to answer at all (an unresolvable `upstream-main`, a missing or corrupt
+          # object, a fetched ref that is not a commit). Collapsing those into the `no` branch would
+          # report an infrastructure fault to the consumer as "treat the pin-bump that introduced
+          # this as hostile" — the same cry-wolf the retry above exists to avoid. Both branches still
+          # fail closed; only the message differs.
+          ancestry_rc=0
+          GIT_NO_LAZY_FETCH=1 git -C "$scratch" merge-base --is-ancestor "$WORKFLOWS_REF" upstream-main || ancestry_rc=$?
+          if [ "$ancestry_rc" -gt 1 ]; then
+            echo "::error::The ancestry test for workflows_ref (${safe_ref}) could not be COMPLETED — git merge-base failed rather than returning a verdict (see its output above). This is an infrastructure fault, not evidence the pin is hostile. Failing closed."
+            exit 1
+          fi
+          if [ "$ancestry_rc" -ne 0 ]; then
+            echo "::error::workflows_ref (${safe_ref}) is not an ancestor of Comfy-Org/github-workflows main. A well-shaped SHA can still be a FORK-AUTHORED commit served out of this repo's own object network; only merged upstream commits may be pinned. If this is a genuine just-merged pin, re-run; otherwise treat the pin-bump that introduced it as hostile."
             exit 1
           fi
       - name: Load pr-risk tool
