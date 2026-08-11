@@ -51,6 +51,15 @@ on:
       # caller bump as a workflow-file change, or pinned callers silently drift
       # onto stale review behavior.
       - .github/cursor-review/**
+      # The check-pr-size classifier is BUILT at run time from the same pinned
+      # `workflows_ref` (see cursor-review.yml's "Load check-pr-size tool" /
+      # "Build check-pr-size" steps) — it decides which of a PR's files count as
+      # generated and therefore skip review. A behavior change there needs the
+      # same caller bump as a workflow-file change, or pinned callers silently
+      # drift onto a stale classifier. This fleet and the pr-size fleet both
+      # watch it deliberately: both build the tool from the caller's pin, and
+      # they push different stable branches, so there is no conflict.
+      - scripts/check-pr-size/**
 
 permissions:
   contents: read
@@ -101,7 +110,13 @@ jobs:
         env:
           NEW_SHA: ${{ github.sha }}
           WATCHED: .github/workflows/cursor-review.yml
-          WATCHED_ASSETS: .github/cursor-review
+          # Newline-separated list, one literal path per line — this fleet
+          # watches TWO asset surfaces (the review prompts/scripts and the
+          # check-pr-size classifier), and both must be compared or the re-point
+          # pins callers to a tip whose other content was never verified.
+          WATCHED_ASSETS: |
+            .github/cursor-review
+            scripts/check-pr-size
         run: bash .github/bump-callers/preflight.sh
 
       - name: Generate Cloud Code Bot token

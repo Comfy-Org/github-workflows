@@ -158,7 +158,7 @@ re-point that pins callers to the verified tip instead of a stale `github.sha`.
 | Input (env) | |
 |---|---|
 | `WATCHED` | **required** — repo-relative path of the watched reusable workflow (e.g. `.github/workflows/groom.yml`) |
-| `WATCHED_ASSETS` | optional — the watched asset directory (e.g. `.github/groom`). Empty/unset means the fleet is single-path |
+| `WATCHED_ASSETS` | optional — the watched asset directories, a **newline-separated list** of literal paths, one per line (blank lines and surrounding whitespace ignored). A single-line value is just a one-element list, so `WATCHED_ASSETS: .github/groom` keeps working unchanged; a fleet watching more than one spells it as a YAML block scalar (see below). Empty/unset means the fleet watches nothing beyond `WATCHED` |
 | `NEW_SHA` | the candidate SHA, normally `github.sha` |
 | `GITHUB_SHA`, `GITHUB_OUTPUT` | provided by Actions |
 
@@ -214,18 +214,38 @@ marker lives in the common git dir while `--git-dir` names the per-worktree one,
 so the hand-rolled form false-negatives exactly there and silently skips the
 deepening the guard is supposed to rest on.
 
-**A multi-path fleet must pass `WATCHED_ASSETS`.** The re-point is only sound
-because every entry in the fleet's `paths:` trigger is covered by the comparison
-— for `agents-md-integrity` (`.github/agents-md-integrity/**`), `cursor-review`
-(`.github/cursor-review/**`), `groom` (`.github/groom/**`) and `pr-size`
-(`scripts/check-pr-size/**`) that includes the asset directory the reusable loads
-its prompts/scripts/briefs from at run time. (`pr-risk` is multi-path too, but its
-filter also carries `:(exclude)` entries that one `WATCHED_ASSETS` string cannot
-express — see the note below.) Compare `WATCHED` alone on one of those and a
-commit touching only the assets reads as "unchanged", so callers get pinned to a
-tip whose other relevant content was never verified. Read the entrypoint's
+**A multi-path fleet must pass `WATCHED_ASSETS`, and must list EVERY asset it
+watches.** The re-point is only sound because every entry in the fleet's `paths:`
+trigger is covered by the comparison — for `agents-md-integrity`
+(`.github/agents-md-integrity/**`), `groom` (`.github/groom/**`) and `pr-size`
+(`scripts/check-pr-size/**`) that means the one asset directory the reusable
+loads its prompts/scripts/briefs from at run time. (`pr-risk` is multi-path too,
+but its filter also carries `:(exclude)` entries that `WATCHED_ASSETS` cannot
+express at all — see the note below.) Compare `WATCHED` alone on one of those and
+a commit touching only the assets reads as "unchanged", so callers get pinned to
+a tip whose other relevant content was never verified. Read the entrypoint's
 `paths:` rather than trusting this list, and if you widen a fleet's path filter,
 widen these inputs in the same change.
+
+**`cursor-review` is the two-asset fleet** (BE-7045). It watches
+`.github/cursor-review/**` for the review prompts/scripts *and*
+`scripts/check-pr-size/**` for the classifier `cursor-review.yml` builds at run
+time from the caller's pinned `workflows_ref` — that classifier decides which of
+a PR's files count as generated and therefore skip review, so a change to it
+needs the same caller bump as a workflow-file change. That is why
+`WATCHED_ASSETS` is a **list**: each entry is validated, compared and
+decommission-checked independently, with exactly the semantics a single asset
+had (any one entry absent or changed is enough to stop the bump), and a
+one-element list behaves identically to the old single-value form. Note that
+`scripts/check-pr-size` is deliberately watched by **two** fleets — `pr-size`
+consumes the same tool — which is correct and conflict-free: they push different
+stable branches.
+
+```yaml
+          WATCHED_ASSETS: |
+            .github/cursor-review
+            scripts/check-pr-size
+```
 
 They must not be **wider** than the filter either, which is the direction an
 excluding fleet gets wrong. A commit touching only an excluded path (pr-risk's
@@ -241,7 +261,9 @@ hand-written, one per entrypoint, and until BE-6476 the only thing holding them
 in step was the checklist line above — `test_preflight.sh` drives synthetic
 fixtures and never reads the entrypoints. The contract test does: it parses each
 `bump-*-callers.yml`'s `push:` `paths:` filter, normalizes `…/**` to the literal
-path, and requires set equality with that file's `WATCHED` + `WATCHED_ASSETS`.
+path, and requires set equality with that file's `WATCHED` + `WATCHED_ASSETS`
+(splitting a multi-line `WATCHED_ASSETS` into one entry per line, and reading the
+block-scalar spelling as well as the single-line one).
 A fleet on preflight whose filter grows a `:(exclude)` entry fails too (the
 freeze case above), as does a *new* entrypoint that runs no preflight at all —
 the pr-risk exemption is an explicit allow-list entry, not a silent skip, so
@@ -255,7 +277,9 @@ Consumption is two steps — the guard, then the bump gated on its output:
         id: preflight
         env:
           WATCHED: .github/workflows/groom.yml
-          WATCHED_ASSETS: .github/groom   # omit for a single-path fleet
+          WATCHED_ASSETS: .github/groom   # omit for a single-path fleet;
+                                          # use a `|` block scalar (one literal
+                                          # path per line) to watch several
           NEW_SHA: ${{ github.sha }}
         run: bash .github/bump-callers/preflight.sh
 

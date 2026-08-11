@@ -66,16 +66,52 @@ parse_push_paths() { # $1 = workflow file
 
 # A `KEY: value` from inside the Preflight step block only — so an identically
 # named env on some other step cannot answer for it.
+#
+# Two shapes are accepted, and the output is the same either way: one entry per
+# line, so a caller splits on newlines regardless.
+#
+#   KEY: value          → one line
+#   KEY: |              → a BLOCK SCALAR: every following line indented deeper
+#     a                   than the key, until the indentation returns. This is
+#     b                   how a multi-asset fleet spells WATCHED_ASSETS.
+#
+# `KEY:` with nothing after it and no indented block yields nothing — the caller
+# treats that as unparsed and fails, which is the point: a shape this cannot read
+# must never pass silently (a contract test that quietly matches nothing is worse
+# than no test at all). Only `|` and `>` are honored as block indicators; any
+# other trailing junk is left to fall through as a plain value and mismatch
+# loudly against the `paths:` filter.
 parse_preflight_env() { # $1 = workflow file, $2 = key
   awk -v key="$2" '
     /^      - name: Preflight/ { instep = 1; next }
     instep && /^      - name: / { instep = 0 }
-    instep {
+    inblock {
+      # Blank lines are part of the block; anything indented at or below the
+      # key ends it.
+      if ($0 ~ /^[ \t]*$/) next
+      match($0, /^[ \t]*/)
+      if (RLENGTH <= keyindent) { exit }
+      else {
+        v = $0
+        gsub(/^[ \t]+|[ \t]+$/, "", v)
+        if (v !~ /^#/) print v
+        next
+      }
+    }
+    instep && !inblock {
       line = $0
       sub(/^[ \t]+/, "", line)
-      if (index(line, key ": ") == 1) {
-        v = substr(line, length(key) + 3)
+      if (index(line, key ":") == 1) {
+        v = substr(line, length(key) + 2)
         gsub(/^[ \t]+|[ \t]+$/, "", v)
+        # A block indicator (with an optional chomping/indent modifier) means
+        # the value is the indented lines that follow, not this line.
+        if (v ~ /^[|>][0-9+-]*$/) {
+          match($0, /^[ \t]*/)
+          keyindent = RLENGTH
+          inblock = 1
+          next
+        }
         gsub(/^['"'"'"]|['"'"'"]$/, "", v)
         print v
         exit
@@ -150,8 +186,12 @@ for path in "${FILES[@]}"; do
   expected=()
   for p in "${filter[@]}"; do expected+=("$(normalize_glob "$p")"); done
 
+  # WATCHED_ASSETS is a LIST — one entry per line (preflight.sh parses it the
+  # same way). Appending the whole value as a single element would compare a
+  # two-line string against two separate filter entries and never match, so a
+  # multi-asset fleet would fail this test no matter how correct it was.
   actual=("$watched")
-  [[ -n "$assets" ]] && actual+=("$assets")
+  while IFS= read -r a; do [[ -n "$a" ]] && actual+=("$a"); done <<<"$assets"
 
   # Globs must have normalized away — anything left is a shape preflight.sh's
   # validate_path would reject at run time (silently verifying nothing).
