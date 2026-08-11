@@ -27,8 +27,9 @@ python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
 python3 -m unittest discover -s .github/refresh-reviewers/tests -p 'test_*.py' -v
 
 # bump-callers shell tests + lint (gh is stubbed; no network)
-shellcheck -x .github/bump-callers/bump-callers.sh .github/bump-callers/tests/test_bump_callers.sh
+shellcheck -x .github/bump-callers/bump-callers.sh .github/bump-callers/preflight.sh .github/bump-callers/tests/test_bump_callers.sh .github/bump-callers/tests/test_preflight.sh
 bash .github/bump-callers/tests/test_bump_callers.sh
+bash .github/bump-callers/tests/test_preflight.sh
 
 # run the AGENTS.md integrity checker against any repo tree
 python3 .github/agents-md-integrity/check_agents_md.py --root .
@@ -71,8 +72,10 @@ tests — run the matching command above for whatever you touched.
   (decayed commit touches, assigner-parity globs, collaborator-only) and
   surgically rewrites just the reviewer lists for a drift PR. Tests in `tests/`.
 - `.github/bump-callers/` — `bump-callers.sh`, the ONE fleet-agnostic script
-  that opens SHA-bump PRs in consumer repos when a reusable workflow changes.
-  Tests in `tests/`.
+  that opens SHA-bump PRs in consumer repos when a reusable workflow changes,
+  plus `preflight.sh` (BE-6475), the ONE staleness/decommission guard that runs
+  ahead of it — `proceed` / `new_sha` step outputs, `WATCHED` +
+  `WATCHED_ASSETS` inputs. Tests in `tests/`.
 - `README.md` — the public workflow catalog: per-workflow purpose, the SHA-pin
   usage pattern, and the versioning policy. Keep its table in sync when you add
   a workflow.
