@@ -1,7 +1,8 @@
 name: Test bump-callers script
 
-# Runs the functional tests + shellcheck for the shared caller-bump script
-# (.github/bump-callers/bump-callers.sh). That one script drives the SHA-bump
+# Runs the functional tests + shellcheck for the shared caller-bump scripts
+# (.github/bump-callers/bump-callers.sh and its preflight.sh staleness guard).
+# That one bump script drives the SHA-bump
 # fan-out for the cursor-review, cursor-review-auto-label, agents-md-integrity,
 # pr-size, pr-risk, assign-reviewers, groom AND detect-unreviewed-merge caller fleets,
 # so a regression here silently breaks every consumer
@@ -49,8 +50,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: ShellCheck the bump script + tests
-        run: shellcheck -x .github/bump-callers/bump-callers.sh .github/bump-callers/tests/test_bump_callers.sh
+      - name: ShellCheck the bump scripts + tests
+        run: shellcheck -x .github/bump-callers/bump-callers.sh .github/bump-callers/preflight.sh .github/bump-callers/tests/test_bump_callers.sh .github/bump-callers/tests/test_preflight.sh
 
       - name: Run bump-callers functional tests
         run: bash .github/bump-callers/tests/test_bump_callers.sh
+
+      - name: Run preflight functional tests
+        run: bash .github/bump-callers/tests/test_preflight.sh

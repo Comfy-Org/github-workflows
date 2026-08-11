@@ -89,24 +89,32 @@ rather than buried in a runner script.
 | Phase | Brief | Input | Output (JSON) |
 |---|---|---|---|
 | 1. Find | [`finder.md`](finder.md) | clean `origin/main` checkout + scan scope | `{repo, scope, findings:[{title, dimension, sites, evidence, proposed, value, risk, confidence, steelman}]}` at `{{FINDER_OUT}}` |
-| 2. Verify | [`verifier.md`](verifier.md) | the finder's JSON + the code | `{repo, scope, summary, findings:[{title, verdict, security, signature, body}]}` at `{{VERIFIER_OUT}}` |
+| 2. Verify | [`verifier.md`](verifier.md) | the finder's JSON + the code | `{repo, scope, summary, findings:[{title, verdict, security, sites, signature, body}]}` at `{{VERIFIER_OUT}}` |
 | 3. Build (opt-in) | [`builder.md`](builder.md) | ONE verified finding `{title, body, signature}` at `{{FINDING_IN}}` + the code | edits in the checkout + a control file `{status: patched\|bail, summary}` at `{{BUILDER_OUT}}` |
 
 - **`verdict`** is `CONFIRM` \| `DOWNGRADE` (real but narrow the scope) \|
   `REJECT` (premature / overstated / not worth it).
 - **`security: true`** marks any auth/permission/security-adjacent finding —
   those are filed as investigations, **never** auto-implemented.
-- **`signature`** is a stable dedup key, `<repo-basename>:<scope>:<path-slug>`,
-  where `<path-slug>` is the finding's **primary file or directory path** —
-  lowercased, every run of non-alphanumeric characters collapsed to a single
-  hyphen, leading/trailing hyphens trimmed (`src/tools.ts` → `src-tools-ts`,
-  `services/ingest/` → `services-ingest`). Multi-file finding: the
-  **alphabetically first** of the cited paths — a mechanical rule, because "the
-  most representative one" is a judgment the verifier would re-make differently
-  next run. Only a repo-wide pattern with no single anchor falls back to a
-  normalized subject noun-phrase. A `security: true` finding's slug is prefixed
-  `sec_` — underscore, because slugification can never produce one, so the
-  security lane for `auth.ts` (`sec_auth-ts`) cannot collide with a routine
+- **`sites`** is the `file:line` evidence the verdict actually rests on — the
+  NARROWED set on a `DOWNGRADE`. On a path-scoped run `scope.py verify` re-applies
+  the directory filter to it, because a downgrade may narrow a cross-boundary
+  finding onto its out-of-scope half.
+- **`signature`** is a stable dedup key, `<repo-basename>:<scope>:<path-slug>`.
+  The `<scope>` component is the caller's own `scope_label`, never the audited
+  directory — and `scope.py verify` rewrites it back to that value, so
+  scope-independence does not depend on the model obeying the brief (one defect
+  found by a directory-scoped run and by a whole-repo run yields ONE signature
+  and is filed ONCE). `<path-slug>` is the finding's **primary file or directory
+  path** — lowercased, every run of non-alphanumeric characters collapsed to a
+  single hyphen, leading/trailing hyphens trimmed (`src/tools.ts` →
+  `src-tools-ts`, `services/ingest/` → `services-ingest`). Multi-file finding:
+  the **alphabetically first** of the cited paths — a mechanical rule, because
+  "the most representative one" is a judgment the verifier would re-make
+  differently next run. Only a repo-wide pattern with no single anchor falls
+  back to a normalized subject noun-phrase. A `security: true` finding's slug is
+  prefixed `sec_` — underscore, because slugification can never produce one, so
+  the security lane for `auth.ts` (`sec_auth-ts`) cannot collide with a routine
   finding about `sec/auth.ts` (`sec-auth-ts`). That lane is what stops a routine
   finding already filed for a file from deduping away a security finding about
   that same file.

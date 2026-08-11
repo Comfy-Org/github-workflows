@@ -695,6 +695,18 @@ bump_repo() {
       fi
     fi
 
+    # A roster entry with no `uses:` calling ${WORKFLOW_FILE} — not provably
+    # ours, or provably a SIBLING fleet's reusable only — was formerly caught
+    # here (BE-6015). That check is now subsumed by the ADDR_RE gate above,
+    # which runs BEFORE this rewrite (not after) and closes a case this one
+    # missed: it keyed on a case-SENSITIVE `uses:` scan (GW_USES), so a
+    # differently-cased `uses:` of a sibling reusable slipped through as
+    # "not provably ours" and fell through to the rewrite/stage path below,
+    # where rule 2's unaddressed `workflows_ref:` rewrite could then repoint a
+    # sibling fleet's asset ref at THIS fleet's SHA (BE-6471). NOPIN/SKIP_FILE
+    # above is where that outcome — and the plain "roster names an
+    # unaddressable file" case — is now recorded and tallied.
+
     # ASSERT that the rewrite actually moved EVERY github-workflows pin in this
     # file, before it can be staged (BE-4662). The patterns above are precise by
     # design, and precision cuts both ways: a pin form they do not know how to
