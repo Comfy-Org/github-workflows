@@ -150,10 +150,40 @@ checkout would have it compare main against itself).
 | `new_sha` | the SHA to pin — `NEW_SHA`, or the verified main tip when the run was re-pointed forward |
 
 Both outputs are written on **every** exit-0 path. The script exits non-zero only
-for an input it cannot trust (the shape checks above) or a lookup it could not
+for an input it cannot trust (the shape checks above), a lookup it could not
 perform (failed `ls-remote`, failed fetch, unresolvable `FETCH_HEAD`, a
-`rev-parse` that *failed* rather than reporting absence): neither is evidence of
+`rev-parse` that *failed* rather than reporting absence), or an answer that
+contradicts history (the **direction guard** below): none of those is evidence of
 staleness, so it fails loudly rather than silently no-opping the fleet.
+
+**The direction guard.** When main has moved, the fetched tip must *descend from*
+this run's commit before anything is compared against it or pinned to it. If main
+moved BACKWARDS — a force-push, a revert-reset, or a stale replica answering the
+tip lookup — both outcomes are silently wrong: with the watched content differing
+at the older commit the run reads as a stale re-run and exits green ("the newer
+commit has its own run" — about an *older* commit), freezing every caller behind a
+run that will never come; with the content identical, the re-point pins the whole
+fleet BACKWARDS. So `git merge-base --is-ancestor` gates both, and a failure is an
+`::error::`, not a skip.
+
+It is measured **twice**, because descending from this run's commit is the weaker
+half. `ls-remote` and the fetch are two round trips, and a rewind landing in that
+window — or a stale replica answering the second one — can hand back a commit that
+is older than the tip just reported yet still *ahead* of this run, which sails
+through a HEAD-only check and gets compared and pinned anyway. So the tip
+`ls-remote` reported must be an ancestor of the fetched one before that move is
+logged as an advance, and the fetched one must be a descendant of this run's
+commit before anything is read out of it.
+
+Both need real history to answer: against a `--depth=1` graft `--is-ancestor`
+returns false even for a legitimate forward move, so the fetch adds `--unshallow`
+when the checkout is shallow (which `actions/checkout` makes it) — `--unshallow`
+errors out on an already-complete clone, hence a probe rather than an
+unconditional flag. The probe is `git rev-parse --is-shallow-repository`, not a
+stat of `$(git rev-parse --git-dir)/shallow`: inside a **linked worktree** that
+marker lives in the common git dir while `--git-dir` names the per-worktree one,
+so the hand-rolled form false-negatives exactly there and silently skips the
+deepening the guard is supposed to rest on.
 
 **A multi-path fleet must pass `WATCHED_ASSETS`.** The re-point is only sound
 because every entry in the fleet's `paths:` trigger is covered by the comparison
@@ -167,6 +197,15 @@ commit touching only the assets reads as "unchanged", so callers get pinned to a
 tip whose other relevant content was never verified. Read the entrypoint's
 `paths:` rather than trusting this list, and if you widen a fleet's path filter,
 widen these inputs in the same change.
+
+They must not be **wider** than the filter either, which is the direction an
+excluding fleet gets wrong. A commit touching only an excluded path (pr-risk's
+`scripts/pr-risk/tests`, its `README.md`) starts no run of its own, but it does
+change the tree OID of an over-broad `WATCHED_ASSETS` — so this run reports "the
+watched surface changed since", skips green as a stale re-run, and waits on a
+later run that will never exist. An exclusion is a reason to narrow the inputs, or
+to leave that fleet on its own guard; never to point `WATCHED_ASSETS` at the whole
+directory.
 
 Consumption is two steps — the guard, then the bump gated on its output:
 
@@ -194,12 +233,23 @@ step reads it through its own `env:` binding. That is deliberate: a step-level
 write would be silently overridden by the very binding it is meant to correct.
 
 > **The entrypoints still carry their inline copies.** Swapping them over to this
-> script is a separate change. `bump-pr-risk-callers.yml` needs a decision rather
-> than a swap: its copy has hardening this one does not implement — a
-> `git rev-list` "did a later *commit* touch a watched path" test (rather than a
-> net-content comparison) and an is-ancestor check that refuses to pin an
-> orphaned commit — so folding it in, or keeping that fleet on its own guard, has
-> to be chosen deliberately, not by deleting the checks.
+> script is a separate change. `bump-pr-risk-callers.yml` carried two checks this
+> script did not, and **BE-6670 decided both** rather than leaving the swap to
+> choose:
+>
+> - Its **is-ancestor check is adopted here, for every fleet** (BE-6675) — see
+>   the direction guard above. It was never pr-risk-specific.
+> - Its **`git rev-list` "did a later *commit* touch a watched path" test is
+>   deliberately not ported.** It exists because pr-risk has no re-point, so a
+>   land-then-revert (net content change of zero) makes that fleet call this run
+>   the only one for the change and pin callers *backwards* to `github.sha`. The
+>   re-point already answers that case by pinning the verified tip — which on a
+>   land-then-revert is the revert commit, i.e. forward. Adding rev-list on top
+>   would only skip a run whose content the tip still needs pinned. That settles
+>   land-then-revert; it is not a claim that comparing objects expresses
+>   everything a rev-list *pathspec* can. Swapping an excluding fleet across means
+>   narrowing its inputs to what its filter really watches (above), not adding
+>   rev-list back.
 
 ## How the pin rewrite is scoped (and why it asserts afterwards)
 
