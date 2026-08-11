@@ -66,15 +66,20 @@
 #   GITHUB_SHA     This run's own commit (provided by Actions). Must match HEAD.
 #   GITHUB_OUTPUT  Step-output file (provided by Actions).
 # Optional:
-#   WATCHED_ASSETS Watched asset directories for a fleet whose `paths:` filter has
-#                  more than one entry — a NEWLINE-SEPARATED LIST of literal
-#                  paths, one per line (blank lines ignored). The natural YAML
-#                  spelling is a block scalar:
+#   WATCHED_ASSETS Watched assets (a directory, or a file) for a fleet whose
+#                  `paths:` filter has more than one entry — a
+#                  NEWLINE-SEPARATED LIST of literal
+#                  paths, one per line (blank lines ignored). The YAML spelling
+#                  is a LITERAL block scalar — `|`, never the folded `>`, which
+#                  joins the lines into one space-separated string that resolves
+#                  to nothing (validate_path rejects that shape):
 #
 #                      WATCHED_ASSETS: |
 #                        .github/cursor-review
 #                        scripts/check-pr-size
 #
+#                  A block scalar has no comment syntax and takes no `- ` list
+#                  dashes; such a line is literal content and is rejected too.
 #                  A single-line value is just a one-element list, so every
 #                  single-asset fleet's existing `WATCHED_ASSETS: .github/groom`
 #                  spelling keeps working unchanged. Empty/unset means the fleet
@@ -124,6 +129,26 @@ validate_path() { # $1 = input name, $2 = value ("" = unset, skip)
   fi
   if [[ "$2" == */ ]]; then
     echo "::error::$1 must not end in a slash (got '$2') — a trailing slash resolves to nothing, so the comparison would silently verify nothing"
+    exit 1
+  fi
+  # A `|` block scalar has NO comment syntax and takes no `- ` list dashes — such
+  # a line is literal CONTENT, so it arrives here as a watched path that resolves
+  # to nothing, the same silent-decommission failure the checks above exist to
+  # prevent. Tested BEFORE the whitespace rule below purely for the diagnosis:
+  # `- .github/groom` trips both, and "you wrote a YAML list" is the message that
+  # tells the maintainer what to change.
+  if [[ "$2" == '#'* || "$2" == -* ]]; then
+    echo "::error::$1 must be a literal path, not a comment or a list item (got '$2') — a block scalar ('|') has no comment syntax and takes no '- ' dashes, so such a line is literal content that resolves to nothing"
+    exit 1
+  fi
+  # Internal whitespace is what a FOLDED YAML scalar delivers. `WATCHED_ASSETS: >`
+  # over two lines folds to the ONE string `.github/cursor-review scripts/check-pr-size`,
+  # which carries no glob and no trailing slash and so sails past every check
+  # above — then resolves to nothing, exactly like the glob does. The multi-entry
+  # spelling is a `|` BLOCK scalar; reject the folded one by shape rather than
+  # letting it become a silent decommission.
+  if [[ "$2" == *[[:space:]]* ]]; then
+    echo "::error::$1 must be a literal path with no whitespace (got '$2') — a folded YAML scalar ('>') joins a multi-entry value into one space-separated string that resolves to nothing; use a block scalar ('|') with one path per line"
     exit 1
   fi
 }
@@ -422,7 +447,13 @@ if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
     exit 0
   fi
   if [[ "$tip_blob" != "$here_blob" ]] || [[ -n "$assets_changed" ]]; then
-    echo "github.sha $GITHUB_SHA is behind main ($main_tip) and the watched surface changed since — stale run/re-run; the newer commit has its own run. Nothing to bump"
+    # NAME the surface. For a fleet that has stopped bumping, this line is the
+    # operator's only diagnostic, and "which of the watched paths moved" is the
+    # whole question — same WATCHED-then-assets-in-listed-order precedence as the
+    # decommission verdict above, so the reported path is deterministic.
+    changed_surface="$assets_changed"
+    [[ "$tip_blob" == "$here_blob" ]] || changed_surface="$WATCHED"
+    echo "github.sha $GITHUB_SHA is behind main ($main_tip) and the watched surface changed since ($changed_surface) — stale run/re-run; the newer commit has its own run. Nothing to bump"
     emit false "$NEW_SHA"
     exit 0
   fi
@@ -472,12 +503,18 @@ if [[ ! -f "$WATCHED" ]]; then
   emit false "$NEW_SHA"
   exit 0
 fi
-# Every watched asset directory gets the same test, for the same reason: ANY one
-# of them missing at this SHA means a caller pinned here would load a surface
-# that is gone. Same first-match-wins ordering as the tip comparison above.
+# Every watched asset gets the same test, for the same reason: ANY one of them
+# missing at this SHA means a caller pinned here would load a surface that is
+# gone. Same first-match-wins ordering as the tip comparison above.
+# `-e`, not `-d`: nothing else here requires an asset to be a DIRECTORY —
+# validate_path accepts a file path, and both tree-OID comparisons above resolve
+# a blob just as happily as a tree. A `-d` here would let a fleet watching a
+# single file (e.g. `scripts/check-pr-size/go.mod`) pass every comparison and
+# then trip this guard on every run, reporting a permanent no-op as a
+# decommission that never happened.
 if (( ${#asset_dirs[@]} > 0 )); then
   for asset_dir in "${asset_dirs[@]}"; do
-    if [[ ! -d "$asset_dir" ]]; then
+    if [[ ! -e "$asset_dir" ]]; then
       echo "::warning::$asset_dir absent at this SHA — treating as decommissioned and bumping nothing. If any caller still pins it, retire those callers."
       emit false "$NEW_SHA"
       exit 0

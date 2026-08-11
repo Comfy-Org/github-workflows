@@ -71,16 +71,32 @@ parse_push_paths() { # $1 = workflow file
 # line, so a caller splits on newlines regardless.
 #
 #   KEY: value          → one line
-#   KEY: |              → a BLOCK SCALAR: every following line indented deeper
-#     a                   than the key, until the indentation returns. This is
-#     b                   how a multi-asset fleet spells WATCHED_ASSETS.
+#   KEY: |              → a LITERAL BLOCK SCALAR: every following line indented
+#     a                   deeper than the key, until the indentation returns.
+#     b                   This is how a multi-asset fleet spells WATCHED_ASSETS.
 #
 # `KEY:` with nothing after it and no indented block yields nothing — the caller
 # treats that as unparsed and fails, which is the point: a shape this cannot read
 # must never pass silently (a contract test that quietly matches nothing is worse
-# than no test at all). Only `|` and `>` are honored as block indicators; any
-# other trailing junk is left to fall through as a plain value and mismatch
-# loudly against the `paths:` filter.
+# than no test at all). Anything else — including a FOLDED `>` scalar — falls
+# through as a plain value and mismatches loudly against the `paths:` filter.
+#
+# ONLY `|` IS A BLOCK INDICATOR HERE, and its modifier is at most one chomping
+# indicator plus one 1-9 indentation digit, because both looser spellings would
+# make this test certify a config the runtime reads DIFFERENTLY:
+#
+#   * `>` folds its lines into ONE space-joined string, so preflight.sh receives
+#     `.github/cursor-review scripts/check-pr-size` as a single entry that
+#     resolves to nothing (a silent proceed=false that freezes the fleet) while
+#     splitting on newlines here would show two correct entries and pass.
+#   * `|0` / `|++` / `|12` are not valid block headers at all, so GitHub cannot
+#     parse the workflow — worse than a mis-comparison, and certifiable under a
+#     `[0-9+-]*` modifier pattern.
+#
+# Block CONTENT is taken literally, `#` lines included: a YAML block scalar has
+# no comment syntax, so such a line really is a watched path as far as
+# preflight.sh is concerned (where validate_path rejects it with an ::error::).
+# Stripping it here would hide that shape behind a green contract test.
 parse_preflight_env() { # $1 = workflow file, $2 = key
   awk -v key="$2" '
     /^      - name: Preflight/ { instep = 1; next }
@@ -94,7 +110,7 @@ parse_preflight_env() { # $1 = workflow file, $2 = key
       else {
         v = $0
         gsub(/^[ \t]+|[ \t]+$/, "", v)
-        if (v !~ /^#/) print v
+        print v
         next
       }
     }
@@ -103,10 +119,17 @@ parse_preflight_env() { # $1 = workflow file, $2 = key
       sub(/^[ \t]+/, "", line)
       if (index(line, key ":") == 1) {
         v = substr(line, length(key) + 2)
+        # Strip a trailing YAML comment. On the KEY line (unlike inside a block)
+        # ` # …` really is a comment, and the bump-callers README hands
+        # maintainers exactly that spelling — `WATCHED_ASSETS: .github/groom
+        # # omit for a single-path fleet` — so not stripping it makes this test
+        # fail on a shape the docs invite. Watched paths never contain a space,
+        # so requiring leading whitespace before the `#` is unambiguous.
+        sub(/[ \t]+#.*$/, "", v)
         gsub(/^[ \t]+|[ \t]+$/, "", v)
-        # A block indicator (with an optional chomping/indent modifier) means
-        # the value is the indented lines that follow, not this line.
-        if (v ~ /^[|>][0-9+-]*$/) {
+        # A literal block indicator (with an optional chomping/indent modifier)
+        # means the value is the indented lines that follow, not this line.
+        if (v ~ /^[|]([1-9][+-]?|[+-][1-9]?)?$/) {
           match($0, /^[ \t]*/)
           keyindent = RLENGTH
           inblock = 1
@@ -231,6 +254,91 @@ for path in "${FILES[@]}"; do
     ok "${file}: token is minted only after, and only if, preflight says proceed"
   fi
 done
+
+# --- parser self-test --------------------------------------------------------
+# The loop above only sees the shapes the real entrypoints happen to use, so the
+# parser's REJECTIONS are unexercised there — and a parser that reads a shape
+# differently from preflight.sh is exactly how this test would certify a config
+# the runtime misparses. These fixtures pin the divergences that matter.
+echo
+echo "== parser self-test =="
+
+FIXTURE_DIR="$(mktemp -d)"
+trap 'rm -rf "$FIXTURE_DIR"' EXIT
+
+# $1 = case name, $2 = the WATCHED_ASSETS lines (verbatim, already indented),
+# $3 = expected parse output (newline-separated; "" = nothing parsed)
+parser_case() {
+  local name="$1" body="$2" want="$3" f="${FIXTURE_DIR}/wf.yml" got
+  {
+    printf '      - name: Preflight\n'
+    printf '        env:\n'
+    printf '          WATCHED: .github/workflows/x.yml\n'
+    printf '%s\n' "$body"
+    printf '      - name: Generate Cloud Code Bot token\n'
+  } > "$f"
+  got="$(parse_preflight_env "$f" WATCHED_ASSETS)"
+  if [[ "$got" == "$want" ]]; then
+    ok "parser: ${name}"
+  else
+    bad "parser: ${name} — got $(printf '%s' "$got" | tr '\n' '|'), want $(printf '%s' "$want" | tr '\n' '|')"
+  fi
+}
+
+# The shape the cursor-review fleet actually uses.
+parser_case 'a | block scalar yields one entry per line' \
+'          WATCHED_ASSETS: |
+            .github/cursor-review
+            scripts/check-pr-size' \
+'.github/cursor-review
+scripts/check-pr-size'
+
+# A single-line value is still a one-element list.
+parser_case 'a single-line value yields one entry' \
+'          WATCHED_ASSETS: .github/groom' \
+'.github/groom'
+
+# The README's own spelling — must not parse the comment as part of the path.
+parser_case 'a trailing YAML comment is stripped from a single-line value' \
+'          WATCHED_ASSETS: .github/groom   # omit for a single-path fleet' \
+'.github/groom'
+
+# A FOLDED scalar must NOT be read as a list: YAML joins those lines into one
+# space-separated string, which is what preflight.sh would receive. Reading it as
+# `>` (a bare, non-path value) is what makes the set-equality check below fail
+# loudly instead of certifying a config the runtime resolves to nothing.
+parser_case 'a folded > scalar is not honored as a block indicator' \
+'          WATCHED_ASSETS: >
+            .github/cursor-review
+            scripts/check-pr-size' \
+'>'
+
+# Invalid block headers GitHub itself cannot parse must not be certified either.
+for bad_header in '|0' '|++' '|12'; do
+  parser_case "an invalid block header '${bad_header}' is not honored" \
+"          WATCHED_ASSETS: ${bad_header}
+            .github/cursor-review" \
+"$bad_header"
+done
+
+# …while the valid modifiers still are.
+for good_header in '|' '|-' '|+' '|2' '|2-' '|-2'; do
+  parser_case "the valid block header '${good_header}' is honored" \
+"          WATCHED_ASSETS: ${good_header}
+            .github/cursor-review" \
+'.github/cursor-review'
+done
+
+# A `#` line inside a block scalar is literal CONTENT, not a comment. Surfacing
+# it is the point: preflight.sh's validate_path rejects it with an ::error::, so
+# the two sides agree, and the set-equality check fails loudly rather than
+# hiding a phantom watched path behind a green run.
+parser_case 'a # line inside a block scalar is literal content, not a comment' \
+'          WATCHED_ASSETS: |
+            .github/cursor-review
+            # scripts/check-pr-size' \
+'.github/cursor-review
+# scripts/check-pr-size'
 
 echo
 echo "== ${PASS} passed, ${FAIL} failed =="

@@ -158,7 +158,7 @@ re-point that pins callers to the verified tip instead of a stale `github.sha`.
 | Input (env) | |
 |---|---|
 | `WATCHED` | **required** — repo-relative path of the watched reusable workflow (e.g. `.github/workflows/groom.yml`) |
-| `WATCHED_ASSETS` | optional — the watched asset directories, a **newline-separated list** of literal paths, one per line (blank lines and surrounding whitespace ignored). A single-line value is just a one-element list, so `WATCHED_ASSETS: .github/groom` keeps working unchanged; a fleet watching more than one spells it as a YAML block scalar (see below). Empty/unset means the fleet watches nothing beyond `WATCHED` |
+| `WATCHED_ASSETS` | optional — the watched assets, a **newline-separated list** of literal paths, one per line (blank lines and surrounding whitespace ignored). A single-line value is just a one-element list, so `WATCHED_ASSETS: .github/groom` keeps working unchanged; a fleet watching more than one spells it as a YAML **literal** block scalar — `\|`, never the folded `>`, which joins the lines into one space-separated string (see below). Empty/unset means the fleet watches nothing beyond `WATCHED` |
 | `NEW_SHA` | the candidate SHA, normally `github.sha` |
 | `GITHUB_SHA`, `GITHUB_OUTPUT` | provided by Actions |
 
@@ -247,6 +247,16 @@ stable branches.
             scripts/check-pr-size
 ```
 
+**Spell it `|`, never `>`.** A folded scalar joins its lines into the single
+string `.github/cursor-review scripts/check-pr-size`, which carries no glob and
+no trailing slash — so it would pass the obvious validation, then resolve to
+nothing and emit a silent `proceed=false` decommission that freezes the fleet.
+`validate_path` therefore rejects an entry containing whitespace outright, along
+with a leading `#` or `- `: a block scalar has no comment syntax and takes no
+list dashes, so either is literal content that resolves to nothing the same way.
+The contract test honors only `|` for the same reason — it must read the value
+exactly as the runtime does, or it certifies a config preflight.sh misparses.
+
 They must not be **wider** than the filter either, which is the direction an
 excluding fleet gets wrong. A commit touching only an excluded path (pr-risk's
 `scripts/pr-risk/tests`, its `README.md`) starts no run of its own, but it does
@@ -263,7 +273,11 @@ fixtures and never reads the entrypoints. The contract test does: it parses each
 `bump-*-callers.yml`'s `push:` `paths:` filter, normalizes `…/**` to the literal
 path, and requires set equality with that file's `WATCHED` + `WATCHED_ASSETS`
 (splitting a multi-line `WATCHED_ASSETS` into one entry per line, and reading the
-block-scalar spelling as well as the single-line one).
+`|` block-scalar spelling as well as the single-line one — the parser mirrors
+preflight.sh deliberately, including honoring only `|`, taking block content
+literally, and stripping a trailing `# comment` from a single-line value; a
+parser that read the file more permissively than the runtime does would certify
+a config the runtime misparses, which is worse than no test at all).
 A fleet on preflight whose filter grows a `:(exclude)` entry fails too (the
 freeze case above), as does a *new* entrypoint that runs no preflight at all —
 the pr-risk exemption is an explicit allow-list entry, not a silent skip, so

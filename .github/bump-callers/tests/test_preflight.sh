@@ -418,6 +418,10 @@ run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" WATCHED_ASSETS="$BOTH_ASSET
 check "exit 0"                        "[[ $RC -eq 0 ]]"
 check "proceed=false"                 "[[ \"$P\" == \"false\" ]]"
 check "logged as a stale run"         "grep -q \"stale run/re-run\" <<<\"\$OUT\""
+# For a fleet that has stopped bumping, this line is the operator's only
+# diagnostic — "which watched path moved" is the whole question, so it must NAME
+# the surface rather than only report that something changed.
+check "names the changed surface"     "grep -q \"changed since (${ASSETS2_PATH})\" <<<\"\$OUT\""
 check "no ::error::"                  "! grep -q \"::error::\" <<<\"\$OUT\""
 # Listing only the FIRST asset is the under-verifying config, and it re-points —
 # so the second entry is demonstrably what produced the verdict above.
@@ -434,6 +438,7 @@ run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" WATCHED_ASSETS="$BOTH_ASSET
 check "exit 0"                        "[[ $RC -eq 0 ]]"
 check "proceed=false"                 "[[ \"$P\" == \"false\" ]]"
 check "logged as a stale run"         "grep -q \"stale run/re-run\" <<<\"\$OUT\""
+check "names the changed surface"     "grep -q \"changed since (${ASSETS_PATH})\" <<<\"\$OUT\""
 run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" WATCHED_ASSETS="$ASSETS2_PATH"
 check "second-entry-only would re-point" "[[ \"$P\" == \"true\" ]]"
 
@@ -536,6 +541,54 @@ run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED_ASSETS=$'.github/groom\ns
 check "trailing slash: exit 1"        "[[ $RC -eq 1 ]]"
 check "trailing slash: ::error::"     "grep -q \"must not end in a slash\" <<<\"\$OUT\""
 check "trailing slash: not proceed"   "[[ \"$P\" != \"true\" ]]"
+
+# ---------------------------------------------------------------------------
+new_case multi_folded 'multi-asset: a space-joined (folded-scalar) value is rejected'
+# What `WATCHED_ASSETS: >` actually delivers: YAML FOLDS the lines into ONE
+# space-separated string. It carries no glob and no trailing slash, so without a
+# whitespace check it passes validation, resolves to nothing, and emits a silent
+# proceed=false decommission that freezes the fleet — while a contract test that
+# split on newlines would show two correct entries and pass. Reject the shape.
+TIP=$(origin_tip)
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED_ASSETS="${ASSETS_PATH} ${ASSETS2_PATH}"
+check "exit 1"                        "[[ $RC -eq 1 ]]"
+check "::error:: names whitespace"    "grep -q \"::error::WATCHED_ASSETS must be a literal path with no whitespace\" <<<\"\$OUT\""
+check "::error:: names the entry"     "grep -q \"got '${ASSETS_PATH} ${ASSETS2_PATH}'\" <<<\"\$OUT\""
+check "proceed is not true"           "[[ \"$P\" != \"true\" ]]"
+check "nothing written to output"     "[[ ! -s \"$OUTFILE\" ]]"
+# A block scalar has NO comment syntax and takes no `- ` list dashes, so either
+# shape is literal CONTENT that resolves to nothing — same silent decommission.
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED_ASSETS=$'.github/groom\n# scripts/check-pr-size'
+check "comment line: exit 1"          "[[ $RC -eq 1 ]]"
+check "comment line: ::error::"       "grep -q \"not a comment or a list item\" <<<\"\$OUT\""
+check "comment line: not proceed"     "[[ \"$P\" != \"true\" ]]"
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED_ASSETS=$'- .github/groom\n- scripts/check-pr-size'
+check "list dash: exit 1"             "[[ $RC -eq 1 ]]"
+check "list dash: ::error::"          "grep -q \"not a comment or a list item\" <<<\"\$OUT\""
+check "list dash: not proceed"        "[[ \"$P\" != \"true\" ]]"
+
+# ---------------------------------------------------------------------------
+new_case asset_file 'a watched asset may be a FILE, not only a directory'
+# Nothing here requires an asset to be a directory: validate_path accepts a file
+# path and both tree-OID comparisons resolve a blob just as happily. A `-d` final
+# guard would let such a fleet pass every comparison and then trip on every run,
+# reporting a permanent no-op as a decommission that never happened.
+TIP=$(origin_tip)
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED_ASSETS="${ASSETS2_PATH}/main.go"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=true"                  "[[ \"$P\" == \"true\" ]]"
+check "no ::warning::"                "! grep -q \"::warning::\" <<<\"\$OUT\""
+check "no ::error::"                  "! grep -q \"::error::\" <<<\"\$OUT\""
+# …and a file asset that is really gone still decommissions, so `-e` did not
+# weaken the guard it replaced.
+git -C "$SRC" rm -rq "${ASSETS2_PATH}/main.go"
+push_src 'retire the classifier entrypoint at the tip'
+clone_work
+TIP=$(origin_tip)
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED_ASSETS="${ASSETS2_PATH}/main.go"
+check "gone: exit 0"                  "[[ $RC -eq 0 ]]"
+check "gone: proceed=false"           "[[ \"$P\" == \"false\" ]]"
+check "gone: ::warning:: names it"    "grep -q \"::warning::${ASSETS2_PATH}/main.go absent\" <<<\"\$OUT\""
 
 # ---------------------------------------------------------------------------
 new_case own_commit 'the watched workflow is absent at this run OWN commit'
