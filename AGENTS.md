@@ -164,13 +164,13 @@ tests — run the matching command above for whatever you touched.
   those on the next bump (BE-4662), and a shape it truly cannot move (e.g. a
   `workflows_ref` fed by a `${{ … }}` expression) fails the run rather than
   shipping a half-bumped caller. What the bumper *can't* fix is a roster entry
-  pointing at a file that names some *other* github-workflows reusable but
-  never ours — that is the roster entry being wrong, not a pin to move, and it
-  fails the run naming it (BE-6015); a file naming no github-workflows
-  reusable at all in a spelling the bumper can parse stays a quiet skip, same
-  as an untouched line. When auditing, compare the roster against reality in
-  both directions — a roster entry whose caller file does not exist is equally
-  broken.
+  pointing at a file with no pin of ours to move — absent on the caller's
+  default branch, naming some *other* github-workflows reusable but never
+  ours, or naming no github-workflows reusable at all in a spelling the
+  bumper can parse — that is the roster entry being wrong, not a pin to move,
+  and it fails the run naming it (BE-6471). When auditing, compare the roster
+  against reality in both directions — a roster entry whose caller file does
+  not exist is equally broken.
 - **New reusable workflow?** `on: workflow_call` + a header comment documenting
   inputs/secrets/triggers + a caller-pattern example, then a
   `docs/callers/<name>.md` setup guide and a row in the README table (see
