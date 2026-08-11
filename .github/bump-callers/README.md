@@ -72,6 +72,31 @@ ended up failing at startup against a reusable it had drifted away from. Before
 adding a caller anywhere, check that its fleet exists **and** that the repo is in
 the variable; the second half is the one people skip.
 
+Being in the variable is necessary, not sufficient, in two different ways:
+
+- **A pin's SHAPE doesn't matter — the rewrite self-heals it.** The
+  substitution is anchored to the pin token, not to 40-hex-ness (BE-4662), so a
+  `uses:` or `workflows_ref:` pinned to a placeholder, a tag, a branch, or a
+  short SHA all move to `NEW_SHA` on the next bump regardless of what they
+  carried before. A shape the rewrite genuinely cannot move — today, only a
+  `workflows_ref` fed by a `${{ … }}` expression — is asserted against
+  post-rewrite and **fails the run** rather than shipping a half-bumped caller
+  (a partial bump is worse than no bump). That assertion is what actually
+  caught the second way `ci-groom.yml` broke (BE-6015): registered, but pinned
+  to a `REPLACE_AT_MERGE_…` placeholder a landed PR never replaced — the
+  rewrite moves a placeholder like any other shape, so this specific case is
+  now a normal, self-healing bump, not a failure.
+- **A roster entry can point at a file with nothing of ours to bump.** If the
+  file names some *other* github-workflows reusable and none of ours, that is
+  a stale roster entry, not a movable pin — the variable is the thing to fix,
+  not the file. `bump-callers.sh` checks this against the ORIGINAL content
+  before the no-op test, warns per file, then **fails the run** with an
+  aggregate error, instead of logging the reassuring
+  `already at <short> — skipping` that hid it for `ci-groom.yml`.
+
+Both failure modes land after the whole fleet is processed, so every other
+caller still gets its bump; what they refuse to do is report success.
+
 They stay as thin entrypoints rather than one matrix because their triggers
 differ: a `cursor-review.yml` change must not spuriously bump agents-md or
 pr-size callers, and vice versa. Everything else (masking, the PR-per-caller
