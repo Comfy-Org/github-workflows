@@ -106,14 +106,14 @@ jobs:
     # roster in the PAST tense — a cautionary tale, not current state. Verify
     # against the variable, not the prose, before "fixing" it.) Never hand-bump
     # one of the pair alone.
-    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@0b6ebf5e460ca02499e362aa8d650ac4d6806a7c # main @ 0b6ebf5
+    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@eb4b26c9bc13feea5ae76c4334370158713fb23a # main @ eb4b26c
     with:
       # File groom's issues as cloud-code-bot (App token), not github-actions[bot].
       bot_app_id: ${{ vars.APP_ID }}
       # Keep the assets ref (finder/verifier briefs + interval gate + dedup
       # ledger) in lock-step with the `uses:` ref above, so a run always loads the
       # scripts that match the workflow filing them. Bump the two together.
-      workflows_ref: 0b6ebf5e460ca02499e362aa8d650ac4d6806a7c  # main @ 0b6ebf5
+      workflows_ref: eb4b26c9bc13feea5ae76c4334370158713fb23a  # main @ eb4b26c
       # Manual dispatch can dry-run; the daily schedule always files live
       # (github.event.inputs is null on a schedule event -> '' != 'true' -> false).
       dry_run: ${{ github.event.inputs.dry_run == 'true' }}
