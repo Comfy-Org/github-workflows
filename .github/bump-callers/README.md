@@ -131,16 +131,23 @@ re-point that pins callers to the verified tip instead of a stale `github.sha`.
 | `WATCHED` | **required** — repo-relative path of the watched reusable workflow (e.g. `.github/workflows/groom.yml`) |
 | `WATCHED_ASSETS` | optional — the watched asset directory (e.g. `.github/groom`). Empty/unset means the fleet is single-path |
 | `WATCHED_PATHSPECS` | optional — newline-separated git **pathspecs** (`:(exclude)` entries allowed) covering what the fleet's `paths:` filter watches. When set, they replace the `WATCHED`/`WATCHED_ASSETS` object comparison as the staleness test. **Only `pr-risk` needs this today** |
-| `WATCHED_EXEC` | optional — newline-separated repo-relative **files** a pinned caller actually executes. When set, each is probed for deletion at the tip and locally, in addition to `WATCHED`/`WATCHED_ASSETS`. **Only `pr-risk` needs this today** |
+| `WATCHED_EXEC` | optional — newline-separated repo-relative **files** a pinned caller actually executes. When set, each is probed for deletion at the tip and — unless the run was re-pointed, which makes that tip the pin target — locally too, in addition to `WATCHED`/`WATCHED_ASSETS`. **Only `pr-risk` needs this today** |
 | `NEW_SHA` | the candidate SHA, normally `github.sha` |
 | `GITHUB_SHA`, `GITHUB_OUTPUT` | provided by Actions |
 
-`WATCHED`, `WATCHED_ASSETS` and every `WATCHED_EXEC` entry are **literal paths, not the globs from the `paths:` filter** —
+`WATCHED`, `WATCHED_ASSETS` and every `WATCHED_EXEC` entry are **literal,
+repo-relative paths, not the globs from the `paths:` filter** —
 `.github/groom`, never `.github/groom/**` and never a trailing slash. A glob
 resolves to nothing (`[[ -d '.github/groom/**' ]]` is false,
 `git rev-parse 'HEAD:.github/groom/**'` is empty), so it would make every
-comparison verify nothing and the fleet a permanent silent no-op. The script
-rejects that shape up front rather than reporting it as a decommission, and it
+comparison verify nothing and the fleet a permanent silent no-op. An absolute or
+`../` path fails the other way: no tree contains one, while the local `-f`/`-d`
+probe resolves it *outside* the checkout, so the two halves of the same check
+disagree and the verdict turns on whether main happened to move. A
+`WATCHED_EXEC` entry naming a **directory** is rejected for the same reason (it
+resolves to a tree at the tip — present — and fails `[[ -f ]]` locally —
+absent); `WATCHED_ASSETS` is the input for a directory. The script rejects each
+of these shapes up front rather than reporting it as a decommission, and it
 likewise rejects a `NEW_SHA` that is not a full 40-character lowercase SHA (it is
 emitted verbatim into `$GITHUB_OUTPUT`, so a newline in it injects output lines)
 and a `HEAD` that is not `GITHUB_SHA` (a `ref:` override in the consuming
@@ -150,12 +157,26 @@ checkout would have it compare main against itself).
 to `git diff`, which does the matching itself — but only `:(exclude)<path>` magic
 is accepted there (`:!`, `:(glob)`, `:/` are rejected: a magic prefix this script
 has not reasoned about, or a typo in one, silently changes or empties what gets
-compared). A list of *only* exclusions is rejected too — git reads that as "every
-path except these", the widest possible watched surface. Both list inputs ignore
-blank and indented lines, so they can be pasted out of a YAML block scalar; a
-variable that is **set but blank** is a hard error rather than a fall-back to
-unset, because every way that shape arises means a check the entrypoint asked for
-would silently not happen.
+compared). `!path`, the `paths:` filter's *own* negation syntax, is rejected too
+and its message names the `:(exclude)` spelling — git reads the `!` literally, so
+such an entry excludes nothing and matches nothing. A list of *only* exclusions
+is rejected as well — git reads that as "every path except these", the widest
+possible watched surface. Both list inputs ignore blank lines, indentation and
+whole-line `#` comments, so the fleet's `paths:` filter can be pasted into a YAML
+block scalar with its comments intact; a variable that is **set but blank** is a
+hard error rather than a fall-back to unset, because every way that shape arises
+means a check the entrypoint asked for would silently not happen.
+
+Two more things about `WATCHED_PATHSPECS` are **enforced, not merely documented**,
+because both fail green: every positive entry must select at least one tracked
+path (in this run's tree or the tip's), and the list as a whole must select
+`WATCHED` — plus, when `WATCHED_ASSETS` is also set, something under it.
+`git diff --quiet` exits 0 both for "nothing changed under these pathspecs" and
+for "these pathspecs match nothing", and the second reads as *unchanged*, so a
+typo, a directory rename, a positive an `:(exclude)` swallows entirely, or a list
+that simply omits the reusable would re-point every caller to a tip at which
+nothing was compared. The check asks `git diff` itself what the list selects, so
+coverage is never judged by looser rules than the verdict.
 
 | Output (step output) | |
 |---|---|
@@ -229,14 +250,19 @@ and they are what let it move onto this script instead of keeping its own guard:
   verbatim to `git diff`, so the staleness test asks precisely what the filter
   asks. **It MUST mirror the filter, exclusions included** — the same coupling as
   above, and dropping one `:(exclude)` line reinstates the false-stale freeze
-  exactly. It compares two trees and walks no history, so it composes with the
-  deepening but does not need it.
+  exactly. The half of that MUST which fails *green* — a list that selects
+  nothing, or that never reaches `WATCHED` — is enforced rather than trusted (see
+  the input rules above). It compares two trees and walks no history, so it
+  composes with the deepening but does not need it.
 - Its decommission surface is the three grader scripts a caller executes, not the
   directory holding them: a commit deleting the graders while leaving `tests/` and
   the README behind satisfies a `-d scripts/pr-risk` probe and would bump every
   caller onto a SHA where the tools are gone. `WATCHED_EXEC` names those files, and
   they are probed at the tip (before the staleness test, so a deletion warns rather
-  than reading as "a newer commit has its own run") and again in this run's tree.
+  than reading as "a newer commit has its own run") and again in this run's tree —
+  the latter only when the run was *not* re-pointed, since a re-point makes that
+  same tip the SHA callers are pinned to and this checkout no longer the thing
+  worth probing.
 
 Every other fleet leaves both unset and behaves exactly as before.
 

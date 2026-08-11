@@ -609,12 +609,91 @@ check "proceed=false"                 "[[ \"$P\" == \"false\" ]]"
 check "logged as a stale run"         "grep -q \"stale run/re-run\" <<<\"\$OUT\""
 check "no ::warning::"                "! grep -q \"::warning::\" <<<\"\$OUT\""
 check "no ::error::"                  "! grep -q \"::error::\" <<<\"\$OUT\""
-# The reusable workflow file is in the pathspec list too, not just the tools.
+# The reusable workflow file is in the pathspec list too, not just the tools —
+# and asserting that needs a FRESH baseline. Reusing $BEHIND from above would
+# leave the grade-targets commit sitting between it and the tip, so the diff
+# reports a change whether or not the reusable is covered and the assertion
+# could not fail. Re-clone so HEAD is that commit, then move only the reusable.
+clone_work
+BEHIND_REUSABLE=$(work_head)
 printf 'name: PR risk\non:\n  workflow_call:\n    inputs: {}\n' > "${SRC}/${RISK_WATCHED}"
-push_src 'change the reusable itself'
-run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" \
+push_src 'change ONLY the reusable itself'
+run_preflight GITHUB_SHA="$BEHIND_REUSABLE" NEW_SHA="$BEHIND_REUSABLE" \
   WATCHED="$RISK_WATCHED" WATCHED_PATHSPECS="$RISK_PATHSPECS"
 check "reusable change is stale too"  "[[ \"$P\" == \"false\" ]]"
+check "reusable change logged stale"  "grep -q \"stale run/re-run\" <<<\"\$OUT\""
+# ...and that verdict is the coverage of the reusable doing the work, which is
+# why a list that omits it is refused rather than believed: without the guard the
+# very same commit reads as "surface unchanged" and this stale run re-points and
+# bumps in parallel with the run that commit started for itself.
+run_preflight GITHUB_SHA="$BEHIND_REUSABLE" NEW_SHA="$BEHIND_REUSABLE" \
+  WATCHED="$RISK_WATCHED" \
+  WATCHED_PATHSPECS=$'scripts/pr-risk\n:(exclude)scripts/pr-risk/tests\n:(exclude)scripts/pr-risk/README.md'
+check "a list omitting it: exit 1"    "[[ $RC -eq 1 ]]"
+check "a list omitting it: ::error::" \
+  "grep -q \"::error::WATCHED_PATHSPECS does not select WATCHED\" <<<\"\$OUT\""
+check "a list omitting it: no output" "[[ ! -s \"$OUTFILE\" ]]"
+
+# ---------------------------------------------------------------------------
+new_case pathspec_selects 'a pathspec list that selects nothing is an error, not "unchanged"'
+# `git diff --quiet` exits 0 both for "nothing changed under these pathspecs" and
+# for "these pathspecs match nothing at all" — and the second reads as
+# "unchanged", re-pointing every caller to a tip at which NOTHING was compared.
+# One typo, one directory rename, or one positive fully covered by an
+# `:(exclude)` reaches it. Each case below is paired with the baseline run that
+# shows the same commit is otherwise a legitimate re-point, so the assertions are
+# about the LIST, not about the commit.
+seed_pr_risk
+BEHIND=$(work_head)
+printf 'unrelated file, edited\n' > "${SRC}/README.md"
+push_src 'an unrelated commit, so the comparison branch is reached'
+TIP=$(origin_tip)
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" \
+  WATCHED="$RISK_WATCHED" WATCHED_PATHSPECS="$RISK_PATHSPECS"
+check "baseline: proceed=true"        "[[ \"$P\" == \"true\" ]]"
+check "baseline: re-pointed"          "[[ \"$N\" == \"$TIP\" ]]"
+# A typo'd positive — the same shape a directory rename leaves behind.
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" WATCHED="$RISK_WATCHED" \
+  WATCHED_PATHSPECS=$'.github/workflows/pr-risk.yml\nscripts/pr-riskk'
+check "typo'd positive: exit 1"       "[[ $RC -eq 1 ]]"
+check "typo'd positive: ::error::" \
+  "grep -q \"::error::WATCHED_PATHSPECS entry 'scripts/pr-riskk' selects no tracked path\" <<<\"\$OUT\""
+check "typo'd positive: not re-pointed" "! grep -q \"pinning callers to\" <<<\"\$OUT\""
+check "typo'd positive: no output"    "[[ ! -s \"$OUTFILE\" ]]"
+# A positive an exclusion swallows entirely: each entry is checked WITH the
+# exclusions applied, exactly as the comparison applies them, so this is caught
+# even though the path itself exists.
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" WATCHED="$RISK_WATCHED" \
+  WATCHED_PATHSPECS=$'.github/workflows/pr-risk.yml\nscripts/pr-risk/tests\n:(exclude)scripts/pr-risk/tests'
+check "swallowed positive: exit 1"    "[[ $RC -eq 1 ]]"
+check "swallowed positive: ::error::" \
+  "grep -q \"selects no tracked path\" <<<\"\$OUT\""
+# WATCHED_ASSETS alongside: the pathspec comparison SUPERSEDES its tree-OID
+# comparison, so a list that reaches nothing under it leaves it unverified.
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" WATCHED="$RISK_WATCHED" \
+  WATCHED_ASSETS="$RISK_TOOLS" WATCHED_PATHSPECS=".github/workflows/pr-risk.yml"
+check "assets unreached: exit 1"      "[[ $RC -eq 1 ]]"
+check "assets unreached: ::error::" \
+  "grep -q \"selects nothing under WATCHED_ASSETS\" <<<\"\$OUT\""
+# `!path` is the `paths:` filter's negation, not git's — the spelling a
+# maintainer told to MIRROR that filter pastes. git reads the `!` literally, so
+# the entry would exclude nothing, match nothing, and still satisfy the
+# all-negative guard.
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" WATCHED="$RISK_WATCHED" \
+  WATCHED_PATHSPECS=$'.github/workflows/pr-risk.yml\nscripts/pr-risk\n!scripts/pr-risk/tests'
+check "bang negation: exit 1"         "[[ $RC -eq 1 ]]"
+check "bang negation: ::error::"      "grep -q \"starts with '!'\" <<<\"\$OUT\""
+check "bang negation: names the fix" \
+  "grep -q \":(exclude)scripts/pr-risk/tests\" <<<\"\$OUT\""
+# Whole-line `#` comments are dropped, so the fleet's commented `paths:` filter
+# can be pasted verbatim: same verdict as the plain list above. Without that,
+# every comment line would be a positive matching nothing — i.e. the error two
+# cases up, on a paste the docs invite.
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" WATCHED="$RISK_WATCHED" \
+  WATCHED_PATHSPECS=$'# the reusable itself\n.github/workflows/pr-risk.yml\n# the grading logic callers execute\nscripts/pr-risk\n# ...but not its own tests or docs\n:(exclude)scripts/pr-risk/tests\n:(exclude)scripts/pr-risk/README.md'
+check "commented paste: proceed=true" "[[ \"$P\" == \"true\" ]]"
+check "commented paste: re-pointed"   "[[ \"$N\" == \"$TIP\" ]]"
+check "commented paste: no ::error::" "! grep -q \"::error::\" <<<\"\$OUT\""
 
 # ---------------------------------------------------------------------------
 new_case exec_gone_tip 'WATCHED_EXEC: an executed file deleted at the tip is decommissioned'
@@ -665,6 +744,63 @@ check "::warning:: names the file" \
 run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" \
   WATCHED="$RISK_WATCHED" WATCHED_ASSETS="$RISK_TOOLS"
 check "a -d probe would have bumped"  "[[ \"$P\" == \"true\" ]]"
+
+# ---------------------------------------------------------------------------
+new_case exec_deleted_here 'WATCHED_EXEC: a deletion by THIS run own commit is attributed to it'
+# Same verdict as exec_gone_tip — decommissioned, no bump — but the annotation
+# has to name the right SHA. WATCHED and WATCHED_ASSETS each get an explicit
+# "absent at this run's own commit" branch; without the same distinction here, a
+# file this run's commit deleted is reported as "no longer exists on main
+# ($main_tip)" and sends an operator to a commit that never touched it.
+seed_pr_risk
+git -C "$SRC" rm -q "${RISK_TOOLS}/grade-targets.sh"
+push_src 'this run own commit deletes a grader'
+clone_work
+BEHIND=$(work_head)
+printf 'unrelated file, edited\n' > "${SRC}/README.md"
+push_src 'a later unrelated commit, so main has moved on'
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" \
+  WATCHED="$RISK_WATCHED" WATCHED_PATHSPECS="$RISK_PATHSPECS" WATCHED_EXEC="$RISK_EXEC"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=false"                 "[[ \"$P\" == \"false\" ]]"
+check "::warning:: names this run sha" \
+  "grep -q \"::warning::${RISK_TOOLS}/grade-targets.sh is absent at this run's own commit ${BEHIND}\" <<<\"\$OUT\""
+check "does not blame the main tip"   "! grep -q \"no longer exists on main\" <<<\"\$OUT\""
+
+# ---------------------------------------------------------------------------
+new_case exec_added_at_tip 'WATCHED_EXEC: the local probe does not outlive the re-point'
+# Once this run has been re-pointed, `new_sha` is the TIP — so the checkout the
+# local probe reads is no longer the SHA callers get pinned to. An executed file
+# added between github.sha and that tip exists at the pin target (the tip-side
+# probe just proved it) and is absent here, and reading this tree would discard a
+# legitimate bump over a file that is not missing where it matters. Reachable
+# whenever an executed file is outside the compared surface — as here, where the
+# fleet compares WATCHED alone.
+seed_pr_risk
+BEHIND=$(work_head)
+printf '#!/usr/bin/env bash\necho grade-new v1\n' > "${SRC}/${RISK_TOOLS}/grade-new.sh"
+push_src 'add a fourth grader at the tip'
+TIP=$(origin_tip)
+check "the new grader is absent here" "[[ ! -f \"${WORKDIR}/${RISK_TOOLS}/grade-new.sh\" ]]"
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" WATCHED="$RISK_WATCHED" \
+  WATCHED_EXEC="${RISK_EXEC}"$'\nscripts/pr-risk/grade-new.sh'
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=true"                  "[[ \"$P\" == \"true\" ]]"
+check "new_sha re-pointed to the tip" "[[ \"$N\" == \"$TIP\" ]]"
+check "no false decommission"         "! grep -q \"::warning::\" <<<\"\$OUT\""
+# The local probe still guards the case it exists for — the deleting commit IS
+# the tip, so nothing was re-pointed and this checkout is the pin target. That is
+# exec_gone_local above; assert here that the skip is conditional, not blanket.
+clone_work
+git -C "$SRC" rm -q "${RISK_TOOLS}/grade-new.sh"
+push_src 'delete it again at the tip'
+clone_work
+TIP=$(origin_tip)
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED="$RISK_WATCHED" \
+  WATCHED_EXEC="${RISK_EXEC}"$'\nscripts/pr-risk/grade-new.sh'
+check "not re-pointed: probe applies" "[[ \"$P\" == \"false\" ]]"
+check "not re-pointed: ::warning::" \
+  "grep -q \"::warning::${RISK_TOOLS}/grade-new.sh absent at this SHA\" <<<\"\$OUT\""
 
 # ---------------------------------------------------------------------------
 new_case list_shapes 'the list inputs are shape-checked, not silently skipped'
@@ -718,6 +854,29 @@ run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED="$RISK_WATCHED" \
 check "empty exclusion: exit 1"       "[[ $RC -eq 1 ]]"
 check "empty exclusion: ::error::" \
   "grep -q \"names no path\" <<<\"\$OUT\""
+# A DIRECTORY in WATCHED_EXEC is the entry whose two probes disagree: the tip
+# side resolves the tree and calls it present, the local `[[ -f ]]` calls it
+# absent — so the verdict would flip on whether main happened to move.
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED="$RISK_WATCHED" \
+  WATCHED_EXEC=$'.github/workflows/pr-risk.yml\nscripts/pr-risk'
+check "directory in EXEC: exit 1"     "[[ $RC -eq 1 ]]"
+check "directory in EXEC: ::error::" \
+  "grep -q \"::error::WATCHED_EXEC entry 'scripts/pr-risk' is a directory\" <<<\"\$OUT\""
+check "directory in EXEC: names the right input" \
+  "grep -q \"Use WATCHED_ASSETS for a directory\" <<<\"\$OUT\""
+# An absolute or ../ path is the same disagreement by another route: absent from
+# every tree, yet resolvable on disk OUTSIDE the checkout by the local probe.
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED="$RISK_WATCHED" \
+  WATCHED_EXEC=$'.github/workflows/pr-risk.yml\n/etc/hosts'
+check "absolute in EXEC: exit 1"      "[[ $RC -eq 1 ]]"
+check "absolute in EXEC: ::error::"   "grep -q \"must be a repo-relative path\" <<<\"\$OUT\""
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED="$RISK_WATCHED" \
+  WATCHED_EXEC=$'.github/workflows/pr-risk.yml\n../outside/grade.sh'
+check "../ in EXEC: exit 1"           "[[ $RC -eq 1 ]]"
+check "../ in EXEC: ::error::"        "grep -q \"must be a repo-relative path\" <<<\"\$OUT\""
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED="/etc/hosts"
+check "absolute WATCHED: exit 1"      "[[ $RC -eq 1 ]]"
+check "absolute WATCHED: ::error::"   "grep -q \"must be a repo-relative path\" <<<\"\$OUT\""
 
 # ---------------------------------------------------------------------------
 new_case pathspec_unusable 'a pathspec git REFUSES is an error, not a verdict'
