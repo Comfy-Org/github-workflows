@@ -10,21 +10,29 @@
 #   2. Has the watched surface been DECOMMISSIONED — deleted — so that pinning
 #      callers to this SHA would break every one of them?
 #
-# Both questions are answered today by an inline copy of this logic in each
+# Both questions used to be answered by an inline copy of this logic in each
 # bump-* entrypoint. Eight near-copies is exactly the drift pattern this
-# directory exists to prevent (see bump-callers.sh's header), and they HAVE
-# drifted: five skip on a bare tip mismatch, which throws away the ONLY run for a
-# change; bump-auto-label-callers.yml compares content but forgets to re-point
-# the pin at the verified tip; bump-detect-unreviewed-merge-callers.yml is the
-# hardened one; and bump-pr-risk-callers.yml has since grown a different
-# hardening again (a `git rev-list` "did a later COMMIT touch a watched path"
-# test plus an is-ancestor orphan check, and no re-point).
+# directory exists to prevent (see bump-callers.sh's header), and they HAD
+# drifted: five skipped on a bare tip mismatch, which throws away the ONLY run
+# for a change; bump-auto-label-callers.yml compared content but forgot to
+# re-point the pin at the verified tip; bump-detect-unreviewed-merge-callers.yml
+# was the hardened one; and bump-pr-risk-callers.yml grew a different hardening
+# again (a `git rev-list` "did a later COMMIT touch a watched path" test plus an
+# is-ancestor orphan check, and no re-point).
 #
 # This script is the one implementation, and it deliberately adopts the
 # bump-detect-unreviewed-merge-callers.yml semantics (PR #117) — exact-refname
 # tip parse, FETCH_HEAD verification, `$WATCHED`-variable deletion guard, and the
-# NEW_SHA re-point — generalized to multi-path fleets. Nothing consumes it yet;
-# swapping the entrypoints over is a separate change.
+# NEW_SHA re-point — generalized to multi-path fleets. BE-6476 swapped the
+# entrypoints over: SEVEN of the eight now run this script, and their inline
+# copies are gone. The exception is bump-pr-risk-callers.yml, which stays on its
+# own inline guard because its `paths:` filter carries `:(exclude)` entries that
+# a single WATCHED_ASSETS string cannot express — see the COUPLED TO THE PATH
+# FILTER note on the re-point below.
+#
+# Each consuming entrypoint runs this BEFORE it mints its Cloud Code Bot token
+# and gates that step on `proceed` too, so a run this guard no-ops never mints an
+# org-wide write credential. Keep that ordering when adding a fleet.
 #
 # What to do with bump-pr-risk-callers.yml's two extra checks was that swap's one
 # open decision. BE-6670 made it, and both halves are settled:

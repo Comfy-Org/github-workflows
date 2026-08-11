@@ -236,6 +236,18 @@ later run that will never exist. An exclusion is a reason to narrow the inputs, 
 to leave that fleet on its own guard; never to point `WATCHED_ASSETS` at the whole
 directory.
 
+**`test_paths_contract.sh` enforces both directions.** These pairs are
+hand-written, one per entrypoint, and until BE-6476 the only thing holding them
+in step was the checklist line above — `test_preflight.sh` drives synthetic
+fixtures and never reads the entrypoints. The contract test does: it parses each
+`bump-*-callers.yml`'s `push:` `paths:` filter, normalizes `…/**` to the literal
+path, and requires set equality with that file's `WATCHED` + `WATCHED_ASSETS`.
+A fleet on preflight whose filter grows a `:(exclude)` entry fails too (the
+freeze case above), as does a *new* entrypoint that runs no preflight at all —
+the pr-risk exemption is an explicit allow-list entry, not a silent skip, so
+migrating it later fails the test until the entry is removed. Widen a filter and
+the test tells you to widen the inputs in the same change.
+
 Consumption is two steps — the guard, then the bump gated on its output:
 
 ```yaml
@@ -261,10 +273,17 @@ step reads it through its own `env:` binding. That is deliberate: a step-level
 `env: NEW_SHA:` takes precedence over the job environment, so a `$GITHUB_ENV`
 write would be silently overridden by the very binding it is meant to correct.
 
-> **The entrypoints still carry their inline copies.** Swapping them over to this
-> script is a separate change. `bump-pr-risk-callers.yml` carried two checks this
-> script did not, and **BE-6670 decided both** rather than leaving the swap to
-> choose:
+Run the preflight **before** the Cloud Code Bot token step, and gate that step on
+`proceed` too. The token is an org-wide contents/pull-requests/issues write
+credential; minting it for a run the guard has already decided will bump nothing
+buys nothing and leaves it live for the job. Every entrypoint is ordered that
+way, and `test_paths_contract.sh` enforces it.
+
+> **The swap is done (BE-6476).** Seven of the eight entrypoints run this script
+> and their inline copies are gone; `bump-pr-risk-callers.yml` is the one
+> holdout, kept on its own guard by the `:(exclude)` entries above.
+> `bump-pr-risk-callers.yml` carried two checks this script did not, and
+> **BE-6670 decided both** rather than leaving the swap to choose:
 >
 > - Its **is-ancestor check is adopted here, for every fleet** (BE-6675) — see
 >   the direction guard above. It was never pr-risk-specific.

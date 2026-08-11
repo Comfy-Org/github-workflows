@@ -51,10 +51,15 @@ jobs:
           persist-credentials: false
 
       - name: ShellCheck the bump scripts + tests
-        run: shellcheck -x .github/bump-callers/bump-callers.sh .github/bump-callers/preflight.sh .github/bump-callers/tests/test_bump_callers.sh .github/bump-callers/tests/test_preflight.sh
+        run: shellcheck -x .github/bump-callers/bump-callers.sh .github/bump-callers/preflight.sh .github/bump-callers/tests/test_bump_callers.sh .github/bump-callers/tests/test_preflight.sh .github/bump-callers/tests/test_paths_contract.sh
 
       - name: Run bump-callers functional tests
         run: bash .github/bump-callers/tests/test_bump_callers.sh
 
       - name: Run preflight functional tests
         run: bash .github/bump-callers/tests/test_preflight.sh
+
+      # Reads the real bump-*-callers.yml entrypoints, so it must re-run when any
+      # of them changes — the paths: filter above already lists every one.
+      - name: Run paths/preflight contract test
+        run: bash .github/bump-callers/tests/test_paths_contract.sh

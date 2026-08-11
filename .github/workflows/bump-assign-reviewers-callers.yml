@@ -69,19 +69,16 @@ jobs:
     # only ever skips stray manual runs.
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # The job is a bounded loop of `git`/`gh` network calls, plus the preflight's
+    # deepening fetch; nothing here should take minutes. Without this a hung call
+    # would hold a runner for the default 6 hours (and, via the serializing
+    # concurrency group above, block every later bump behind it).
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-
-      - name: Generate Cloud Code Bot token
-        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0 — pinned: see dependabot.yml ignore (v2+ breaks cross-repo `owner:` token scoping)
-        id: token
-        with:
-          app-id: ${{ vars.APP_ID }}
-          private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
-          owner: Comfy-Org
 
       # The shared staleness/decommission guard — one implementation for every
       # fleet, documented in .github/bump-callers/README.md "Preflight". It
@@ -98,6 +95,17 @@ jobs:
           NEW_SHA: ${{ github.sha }}
           WATCHED: .github/workflows/assign-reviewers.yml
         run: bash .github/bump-callers/preflight.sh
+
+      - name: Generate Cloud Code Bot token
+        # Stale run or decommissioned surface — don't mint an org-wide
+        # write token for a job that is about to bump nothing.
+        if: steps.preflight.outputs.proceed == 'true'
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0 — pinned: see dependabot.yml ignore (v2+ breaks cross-repo `owner:` token scoping)
+        id: token
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+          owner: Comfy-Org
 
       - name: Bump SHA in caller repos
         # Stale run or decommissioned surface — nothing to bump.

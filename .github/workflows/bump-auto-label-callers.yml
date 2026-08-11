@@ -101,7 +101,27 @@ jobs:
         with:
           persist-credentials: false
 
+      # The shared staleness/decommission guard — one implementation for every
+      # fleet, documented in .github/bump-callers/README.md "Preflight". It
+      # decides whether this run is a stale re-run (a later commit already
+      # touched the watched surface and has its own run) or the surface has been
+      # decommissioned, and emits the SHA the bump below pins.
+      # WATCHED is a LITERAL path, never a `paths:` glob. This fleet is
+      # single-path (cursor-review-auto-label.yml is self-contained — no run-time
+      # asset dir, no `workflows_ref` input), so there is no WATCHED_ASSETS; if
+      # the filter above ever grows one, add it here in the same change or the
+      # re-point silently under-verifies.
+      - name: Preflight (staleness / decommission guard)
+        id: preflight
+        env:
+          NEW_SHA: ${{ github.sha }}
+          WATCHED: .github/workflows/cursor-review-auto-label.yml
+        run: bash .github/bump-callers/preflight.sh
+
       - name: Generate Cloud Code Bot token
+        # Stale run or decommissioned surface — don't mint an org-wide
+        # write token for a job that is about to bump nothing.
+        if: steps.preflight.outputs.proceed == 'true'
         uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0 — pinned: see dependabot.yml ignore (v2+ breaks cross-repo `owner:` token scoping)
         id: token
         with:
@@ -123,23 +143,6 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
           permission-issues: write
-
-      # The shared staleness/decommission guard — one implementation for every
-      # fleet, documented in .github/bump-callers/README.md "Preflight". It
-      # decides whether this run is a stale re-run (a later commit already
-      # touched the watched surface and has its own run) or the surface has been
-      # decommissioned, and emits the SHA the bump below pins.
-      # WATCHED is a LITERAL path, never a `paths:` glob. This fleet is
-      # single-path (cursor-review-auto-label.yml is self-contained — no run-time
-      # asset dir, no `workflows_ref` input), so there is no WATCHED_ASSETS; if
-      # the filter above ever grows one, add it here in the same change or the
-      # re-point silently under-verifies.
-      - name: Preflight (staleness / decommission guard)
-        id: preflight
-        env:
-          NEW_SHA: ${{ github.sha }}
-          WATCHED: .github/workflows/cursor-review-auto-label.yml
-        run: bash .github/bump-callers/preflight.sh
 
       - name: Bump SHA in caller repos
         # Stale run or decommissioned surface — nothing to bump.

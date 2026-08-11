@@ -27,9 +27,10 @@ python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
 python3 -m unittest discover -s .github/refresh-reviewers/tests -p 'test_*.py' -v
 
 # bump-callers shell tests + lint (gh is stubbed; no network)
-shellcheck -x .github/bump-callers/bump-callers.sh .github/bump-callers/preflight.sh .github/bump-callers/tests/test_bump_callers.sh .github/bump-callers/tests/test_preflight.sh
+shellcheck -x .github/bump-callers/bump-callers.sh .github/bump-callers/preflight.sh .github/bump-callers/tests/test_bump_callers.sh .github/bump-callers/tests/test_preflight.sh .github/bump-callers/tests/test_paths_contract.sh
 bash .github/bump-callers/tests/test_bump_callers.sh
 bash .github/bump-callers/tests/test_preflight.sh
+bash .github/bump-callers/tests/test_paths_contract.sh
 
 # run the AGENTS.md integrity checker against any repo tree
 python3 .github/agents-md-integrity/check_agents_md.py --root .
