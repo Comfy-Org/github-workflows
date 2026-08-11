@@ -78,8 +78,9 @@ pr-size callers, and vice versa. Everything else (masking, the PR-per-caller
 flow, the trailing-newline fix, the single-line PR body) lives once in
 `bump-callers.sh`. Registering a new fleet is: add a thin entrypoint (copy an
 existing one, swap the path filter + `VAR_NAME`/`TAG`/`WORKFLOW_FILE`/
-`ALLOW_EMPTY`), seed its variable, and add a row to this table + the paths in
-`test-bump-callers.yml`. **Then `workflow_dispatch` the new entrypoint once.**
+`ALLOW_EMPTY` + the preflight's `WATCHED`/`WATCHED_ASSETS`), seed its variable,
+and add a row to this table + the paths in `test-bump-callers.yml`.
+**Then `workflow_dispatch` the new entrypoint once.**
 Landing a fleet does not touch the reusable it watches, so its own merge matches
 no path filter and fires no run — callers that were already stale when the fleet
 was created stay stale until the reusable next changes. Every entrypoint carries
@@ -115,8 +116,11 @@ run **stale** (has a later commit already touched the watched surface, so *that*
 commit has its own run?), and has the watched surface been **decommissioned**
 (deleted, so pinning callers to this SHA would break every one of them)?
 
-`preflight.sh` is that guard. It used to be an inline copy in each
-`bump-*-callers.yml`, and the copies drifted — several skipped on a bare tip
+`preflight.sh` is that guard, and every `bump-*-callers.yml` entrypoint runs it —
+except `bump-pr-risk-callers.yml`, which stays on its own inline guard because
+its `paths:` filter carries `:(exclude)` entries a single `WATCHED_ASSETS` string
+cannot express (see the narrowing note below). It used to be an inline copy in
+each entrypoint, and the copies drifted — several skipped on a bare tip
 mismatch, which throws away the only run for a change and freezes every caller,
 and the one that compared content forgot to re-point the pin at the verified tip.
 The extracted script deliberately adopts the hardened semantics: exact-refname

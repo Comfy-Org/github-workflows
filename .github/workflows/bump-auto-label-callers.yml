@@ -124,10 +124,34 @@ jobs:
           permission-pull-requests: write
           permission-issues: write
 
+      # The shared staleness/decommission guard — one implementation for every
+      # fleet, documented in .github/bump-callers/README.md "Preflight". It
+      # decides whether this run is a stale re-run (a later commit already
+      # touched the watched surface and has its own run) or the surface has been
+      # decommissioned, and emits the SHA the bump below pins.
+      # WATCHED is a LITERAL path, never a `paths:` glob. This fleet is
+      # single-path (cursor-review-auto-label.yml is self-contained — no run-time
+      # asset dir, no `workflows_ref` input), so there is no WATCHED_ASSETS; if
+      # the filter above ever grows one, add it here in the same change or the
+      # re-point silently under-verifies.
+      - name: Preflight (staleness / decommission guard)
+        id: preflight
+        env:
+          NEW_SHA: ${{ github.sha }}
+          WATCHED: .github/workflows/cursor-review-auto-label.yml
+        run: bash .github/bump-callers/preflight.sh
+
       - name: Bump SHA in caller repos
+        # Stale run or decommissioned surface — nothing to bump.
+        if: steps.preflight.outputs.proceed == 'true'
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
-          NEW_SHA: ${{ github.sha }}
+          # NOT github.sha: when main moved on but the watched surface is
+          # unchanged, the preflight re-points this run at the verified tip, and
+          # reading github.sha here would silently discard that re-point. This
+          # entrypoint's own guard compared content but never re-pointed, so it
+          # proceeded pinned to the stale github.sha — that is fixed here.
+          NEW_SHA: ${{ steps.preflight.outputs.new_sha }}
           VAR_NAME: AUTO_LABEL_CALLERS
           TAG: auto-label
           WORKFLOW_FILE: cursor-review-auto-label.yml
@@ -140,61 +164,4 @@ jobs:
           # known log-exposure gap documented in the header — Actions dumps the
           # step env before the script's `::add-mask::` runs.
           CALLERS_JSON: ${{ vars.AUTO_LABEL_CALLERS }}
-        run: |
-          # The main-only ref guard above cannot catch a manual RE-RUN of an
-          # older main run: github.ref is refs/heads/main but github.sha is
-          # that run's original (now stale) commit, and the bumper would
-          # force-repin every caller to it. So establish the current main tip
-          # first; the guard below decides whether this run is genuinely stale.
-          # Don't pipe into `cut`: the pipeline would report cut's status, so a
-          # failed ls-remote (network blip, remote hiccup) yields an EMPTY
-          # main_tip that then compares unequal to github.sha and silently
-          # no-ops the whole fleet bump as if the run were stale. A lookup we
-          # couldn't perform is not evidence of staleness — fail loudly.
-          if ! ls_remote=$(git ls-remote origin refs/heads/main); then
-            echo "::error::Could not look up the current main tip (git ls-remote failed)"
-            exit 1
-          fi
-          main_tip=${ls_remote%%$'\t'*}
-          if [[ -z "$main_tip" ]]; then
-            echo "::error::git ls-remote returned no SHA for refs/heads/main"
-            exit 1
-          fi
-          WATCHED=.github/workflows/cursor-review-auto-label.yml
-          if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
-            # main has moved on. That alone does NOT make this run stale: the
-            # push trigger is path-filtered to WATCHED, so an unrelated commit
-            # landing in the seconds between this run's trigger and this check
-            # starts NO run of its own. Skipping on a bare SHA mismatch would
-            # discard the only run for this change and leave every caller
-            # frozen — the exact pin-drift this fleet exists to prevent.
-            # What actually distinguishes a stale re-run is that WATCHED has
-            # CHANGED since: then a later commit did touch the path and does
-            # have its own run, which will pin the newer content.
-            if ! git fetch --depth=1 origin main; then
-              echo "::error::Could not fetch the current main tip to compare $WATCHED"
-              exit 1
-            fi
-            main_tip=$(git rev-parse FETCH_HEAD)
-            tip_blob=$(git rev-parse --verify --quiet "FETCH_HEAD:$WATCHED" || true)
-            here_blob=$(git rev-parse --verify --quiet "HEAD:$WATCHED" || true)
-            if [[ -z "$tip_blob" ]]; then
-              echo "$WATCHED no longer exists on main ($main_tip) — decommissioned; nothing to bump"
-              exit 0
-            fi
-            if [[ "$tip_blob" != "$here_blob" ]]; then
-              echo "github.sha $GITHUB_SHA is behind main ($main_tip) and $WATCHED changed since — stale run/re-run; the newer commit has its own run. Nothing to bump"
-              exit 0
-            fi
-            echo "main moved to $main_tip since $GITHUB_SHA, but $WATCHED is unchanged — this run is still the only one for that change; proceeding"
-          fi
-          # The push path filter also matches a commit that DELETES the
-          # reusable workflow; bumping callers to a SHA where the file is gone
-          # would break every caller. Deletion means decommissioning — no-op.
-          # (This fleet has no run-time asset dir — the yml is self-contained —
-          # so unlike the sibling entrypoints only the workflow file is checked.)
-          if [[ ! -f .github/workflows/cursor-review-auto-label.yml ]]; then
-            echo "cursor-review-auto-label.yml absent at this SHA — decommissioned; nothing to bump"
-            exit 0
-          fi
-          bash .github/bump-callers/bump-callers.sh
+        run: bash .github/bump-callers/bump-callers.sh
