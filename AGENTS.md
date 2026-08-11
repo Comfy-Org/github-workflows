@@ -62,11 +62,15 @@ tests — run the matching command above for whatever you touched.
   built finding is never re-proposed — and `interval.py`, the runtime cadence
   gate (`GROOM_INTERVAL_DAYS`) that early-exits a daily tick unless the interval
   has elapsed since the last real run (derived from Actions run history — no new
-  secret). Also `package.json` (BE-5373) — not a project, no lockfile, nothing is
-  installed from it: it is the one Dependabot-visible home of the
-  `@anthropic-ai/claude-code` pin, which `groom.yml`'s gate reads once and feeds
-  to all three agent jobs. Keep it exact; never re-hardcode a version in a `run:`
-  step. Tests in `tests/`.
+  secret) — and `scope.py` (BE-4757), the `path` input's enforcement: validate +
+  contain the path, hand the finder the in-scope file list, post-filter
+  out-of-scope findings. The cadence clock is PER SCOPE (a scoped run never
+  stamps "done" over the whole-repo audit, and a permanently scoped caller still
+  gets its own cadence); dedup signatures ignore `path`. Also `package.json`
+  (BE-5373) — not a project, no lockfile, nothing is installed from it: it is the
+  one Dependabot-visible home of the `@anthropic-ai/claude-code` pin, which
+  `groom.yml`'s gate reads once and feeds to all three agent jobs. Keep it exact;
+  never re-hardcode a version in a `run:` step. Tests in `tests/`.
 - `.github/refresh-reviewers/` — `generate.py`, the engine behind
   `refresh-reviewers.yml`: recomputes a caller's reviewers.yml from git history
   (decayed commit touches, assigner-parity globs, collaborator-only) and
