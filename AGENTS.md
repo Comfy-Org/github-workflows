@@ -27,8 +27,9 @@ python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
 python3 -m unittest discover -s .github/refresh-reviewers/tests -p 'test_*.py' -v
 
 # bump-callers shell tests + lint (gh is stubbed; no network)
-shellcheck -x .github/bump-callers/bump-callers.sh .github/bump-callers/tests/test_bump_callers.sh
+shellcheck -x .github/bump-callers/bump-callers.sh .github/bump-callers/preflight.sh .github/bump-callers/tests/test_bump_callers.sh .github/bump-callers/tests/test_preflight.sh
 bash .github/bump-callers/tests/test_bump_callers.sh
+bash .github/bump-callers/tests/test_preflight.sh
 
 # workflow-pins lint (no reusable workflow may default `workflows_ref`) + its tests
 python3 -m unittest discover -s .github/workflow-pins/tests -p 'test_*.py' && python3 .github/workflow-pins/check_workflow_pins.py
@@ -64,11 +65,15 @@ tests — run the matching command above for whatever you touched.
   built finding is never re-proposed — and `interval.py`, the runtime cadence
   gate (`GROOM_INTERVAL_DAYS`) that early-exits a daily tick unless the interval
   has elapsed since the last real run (derived from Actions run history — no new
-  secret). Also `package.json` (BE-5373) — not a project, no lockfile, nothing is
-  installed from it: it is the one Dependabot-visible home of the
-  `@anthropic-ai/claude-code` pin, which `groom.yml`'s gate reads once and feeds
-  to all three agent jobs. Keep it exact; never re-hardcode a version in a `run:`
-  step. Tests in `tests/`.
+  secret) — and `scope.py` (BE-4757), the `path` input's enforcement: validate +
+  contain the path, hand the finder the in-scope file list, post-filter
+  out-of-scope findings. The cadence clock is PER SCOPE (a scoped run never
+  stamps "done" over the whole-repo audit, and a permanently scoped caller still
+  gets its own cadence); dedup signatures ignore `path`. Also `package.json`
+  (BE-5373) — not a project, no lockfile, nothing is installed from it: it is the
+  one Dependabot-visible home of the `@anthropic-ai/claude-code` pin, which
+  `groom.yml`'s gate reads once and feeds to all three agent jobs. Keep it exact;
+  never re-hardcode a version in a `run:` step. Tests in `tests/`.
 - `.github/refresh-reviewers/` — `generate.py`, the engine behind
   `refresh-reviewers.yml`: recomputes a caller's reviewers.yml from git history
   and rewrites just the reviewer lists for a drift PR. Tests in `tests/`.
@@ -77,8 +82,10 @@ tests — run the matching command above for whatever you touched.
   at every checkout, with an exception for the `github.job_workflow_sha`
   self-pin (BE-4169, see below).
 - `.github/bump-callers/` — `bump-callers.sh`, the ONE fleet-agnostic script
-  that opens SHA-bump PRs in consumer repos when a reusable workflow changes.
-  Tests in `tests/`.
+  that opens SHA-bump PRs in consumer repos when a reusable workflow changes,
+  plus `preflight.sh` (BE-6475), the ONE staleness/decommission guard that runs
+  ahead of it — `proceed` / `new_sha` step outputs, `WATCHED` +
+  `WATCHED_ASSETS` inputs. Tests in `tests/`.
 - `README.md` — the public workflow catalog: per-workflow purpose, the SHA-pin
   usage pattern, and the versioning policy. Keep its table in sync when you add
   a workflow.
@@ -107,6 +114,9 @@ tests — run the matching command above for whatever you touched.
   live mutator).
 - `assign-prs-to-author.yml` — assigns unassigned open PRs to their author.
 - `detect-unreviewed-merge.yml` — SOC 2: flags PRs merged without approval.
+  THIS repo is deliberately NOT self-enrolled: nothing merged here reaches a
+  consumer until that consumer approves its own SHA-bump PR, and that repo's own
+  detector audits it. Do not re-add a `ci-detect-unreviewed-merge.yml` caller.
 - `bump-cursor-review-callers.yml` / `bump-auto-label-callers.yml` /
   `bump-agents-md-callers.yml` / `bump-pr-size-callers.yml` /
   `bump-pr-risk-callers.yml` / `bump-assign-reviewers-callers.yml` /
@@ -150,8 +160,8 @@ tests — run the matching command above for whatever you touched.
   ref of THIS repo — never from the caller's checkout. That's what makes the
   reviewer/checker tamper-proof: a PR can't rewrite the logic judging it. The
   self-enrollment callers (`ci-cursor-review.yml`, `ci-assign-reviewers.yml`,
-  `ci-detect-unreviewed-merge.yml`) deliberately pin a merged-main SHA instead
-  of a local `./` path for the same reason — do not "simplify" them to a path.
+  `ci-groom.yml`) deliberately pin a merged-main SHA instead of a local `./`
+  path for the same reason — do not "simplify" them to a path.
 - **One bumper, not several.** `bump-callers.sh` backs every fleet; the
   `bump-*-callers.yml` files are thin per-fleet wrappers (they stay separate so a
   `cursor-review.yml` change doesn't spuriously bump agents-md or pr-size
@@ -161,8 +171,19 @@ tests — run the matching command above for whatever you touched.
   its `vars.*_CALLERS` roster. Skipping the second is the most repeated mistake
   here: the pin then never moves, the caller drifts behind the reusable, and it
   fails at startup much later with no obvious cause. This repo did it to its own
-  `ci-groom.yml`. When auditing, compare the roster against reality in both
-  directions — a roster entry whose caller file does not exist is equally broken.
+  `ci-groom.yml`. Being listed is necessary, not sufficient: a caller's pin
+  shape (placeholder, tag, branch, short SHA) no longer matters — the rewrite
+  is anchored to the pin token, not to 40-hex-ness, so it self-heals any of
+  those on the next bump (BE-4662), and a shape it truly cannot move (e.g. a
+  `workflows_ref` fed by a `${{ … }}` expression) fails the run rather than
+  shipping a half-bumped caller. What the bumper *can't* fix is a roster entry
+  pointing at a file that names some *other* github-workflows reusable but
+  never ours — that is the roster entry being wrong, not a pin to move, and it
+  fails the run naming it (BE-6015); a file naming no github-workflows
+  reusable at all in a spelling the bumper can parse stays a quiet skip, same
+  as an untouched line. When auditing, compare the roster against reality in
+  both directions — a roster entry whose caller file does not exist is equally
+  broken.
 - **New reusable workflow?** `on: workflow_call` + a header comment documenting
   inputs/secrets/triggers + a caller-pattern example, then a
   `docs/callers/<name>.md` setup guide and a row in the README table (see

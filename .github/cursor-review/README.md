@@ -180,9 +180,12 @@ All optional except `workflows_ref` (required, no default) — pass them under
 | Input | Default | What it does |
 |---|---|---|
 | `judge_model` | `claude-opus-5-thinking-max` | Model that consolidates panel findings. |
-| `diff_size_cap` | `5000` | Max changed lines (after excludes); larger PRs are skipped. |
+| `diff_size_cap` | `5000` | Max counted changed lines (after generated-file exclusion and comment discounting); larger PRs are skipped. |
+| `ignore_comments` | `true` | Discount blank/comment-only lines from the size count (count-only; the panel still sees them). |
 | `review_label` | `cursor-review` | Label whose addition triggers the review. |
-| `diff_excludes` | lockfiles, `node_modules`, `dist`, `vendor`, minified/generated files | Pathspecs excluded from both the size count and the reviewed diff. |
+| `extra_generated_globs` | `node_modules`, `dist`, `vendor`, minified/`.generated.` files | Extra globs the shared `check-pr-size` classifier treats as generated — excluded from BOTH the size count and the reviewed diff. |
+| `extra_lockfiles` | `''` | Extra lockfile base names for the classifier, on top of its built-ins. |
+| `diff_excludes` | `''` | Pathspecs excluded from the reviewed diff ONLY (not the size count) — back-compat escape hatch; prefer `extra_generated_globs`. |
 | `workflows_ref` | **required** (no default) | Ref this directory's prompts/scripts are loaded from. Must be the same commit SHA as your `uses:` pin — omit it and the run fails fast, because pinning `uses:` while loading scripts from a mutable branch defeats the pin. |
 | `bot_app_id` | `''` | Optional GitHub App ID; when set (with `BOT_APP_PRIVATE_KEY`), the review posts under that App's identity instead of `github-actions[bot]`. |
 | `run_without_label` | `false` | Run on plain PR events instead of requiring the trigger label. Also requires widening the caller's `types:` — see [the setup guide](../../docs/callers/cursor-review.md). |
