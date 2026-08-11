@@ -535,14 +535,26 @@ def is_guard_step(lines, idx):
     # outright for some events while the checkout still runs. Neither is
     # evaluable here, so both disqualify the step rather than being assumed
     # benign.
-    for line in body:
+    for i, line in enumerate(body):
         if _indent(line) != key_indent:
             continue
         if _STEP_IF_RE.match(line):
             return False
         cont = _STEP_CONTINUE_RE.match(line)
-        if cont and _strip_comment(cont.group(2)).lower() not in ("false", ""):
-            return False
+        if cont:
+            value = _strip_comment(cont.group(2))
+            if not value:
+                # A comment-only (or bare) `continue-on-error:` is not
+                # necessarily unset — YAML lets the real scalar continue on
+                # the next, more-indented line, and Actions reads THAT as
+                # the value. Stopping at the colon would read this as
+                # absent and assume `false`, when the continuation can just
+                # as well say `true`.
+                nxt = body[i + 1] if i + 1 < len(body) else ""
+                if _indent(nxt) > key_indent and not _is_skippable(nxt):
+                    value = _strip_comment(nxt.strip())
+            if value.lower() not in ("false", ""):
+                return False
     names = _ref_derived_names(body)
     empty_re = _empty_test_re(names)
     whole_re = _whole_empty_test_re(names)

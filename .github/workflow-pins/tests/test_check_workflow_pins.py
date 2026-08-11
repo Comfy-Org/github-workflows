@@ -349,6 +349,25 @@ class GuardCoverageTests(unittest.TestCase):
         step = self._guard_with("        continue-on-error: false\n")
         self.assertEqual(self._jobs(step + self.CHECKOUT), [])
 
+    def test_a_comment_only_continue_on_error_line_reads_its_continuation(self):
+        # `continue-on-error:` with nothing (or only a comment) after the
+        # colon is not "unset" — YAML lets the real scalar continue on the
+        # next, more-indented line, and Actions reads THAT as the value.
+        # Stopping at the colon would treat the comment-only line as an
+        # absent key (same as `false`) while the job actually gets
+        # `continue-on-error: true` from the continuation.
+        true_continuation = self._guard_with(
+            "        continue-on-error: # temporarily tolerated\n"
+            "          true\n"
+        )
+        self.assertEqual(len(self._jobs(true_continuation + self.CHECKOUT)), 1)
+        # …but a `false` continuation is still a real guard.
+        false_continuation = self._guard_with(
+            "        continue-on-error:\n"
+            "          false\n"
+        )
+        self.assertEqual(self._jobs(false_continuation + self.CHECKOUT), [])
+
     def test_a_conditional_exit_inside_the_branch_is_not_a_guard(self):
         # The branch is entered on an empty ref but only exits if `$X` matches,
         # so the empty ref still reaches the checkout. The multiline path
