@@ -101,6 +101,9 @@ tests — run the matching command above for whatever you touched.
   live mutator).
 - `assign-prs-to-author.yml` — assigns unassigned open PRs to their author.
 - `detect-unreviewed-merge.yml` — SOC 2: flags PRs merged without approval.
+  THIS repo is deliberately NOT self-enrolled: nothing merged here reaches a
+  consumer until that consumer approves its own SHA-bump PR, and that repo's own
+  detector audits it. Do not re-add a `ci-detect-unreviewed-merge.yml` caller.
 - `bump-cursor-review-callers.yml` / `bump-auto-label-callers.yml` /
   `bump-agents-md-callers.yml` / `bump-pr-size-callers.yml` /
   `bump-pr-risk-callers.yml` / `bump-assign-reviewers-callers.yml` /
@@ -137,8 +140,8 @@ tests — run the matching command above for whatever you touched.
   ref of THIS repo — never from the caller's checkout. That's what makes the
   reviewer/checker tamper-proof: a PR can't rewrite the logic judging it. The
   self-enrollment callers (`ci-cursor-review.yml`, `ci-assign-reviewers.yml`,
-  `ci-detect-unreviewed-merge.yml`) deliberately pin a merged-main SHA instead
-  of a local `./` path for the same reason — do not "simplify" them to a path.
+  `ci-groom.yml`) deliberately pin a merged-main SHA instead of a local `./`
+  path for the same reason — do not "simplify" them to a path.
 - **One bumper, not several.** `bump-callers.sh` backs every fleet; the
   `bump-*-callers.yml` files are thin per-fleet wrappers (they stay separate so a
   `cursor-review.yml` change doesn't spuriously bump agents-md or pr-size

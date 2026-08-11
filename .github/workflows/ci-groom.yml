@@ -7,7 +7,7 @@ name: CI - Groom
 # consumer — a local `uses: ./...` path would run the PR's OWN copy of the
 # auditor, letting a PR weaken the reviewer judging it. Named ci-groom.yml
 # because the canonical caller path (groom.yml) is occupied here by the reusable
-# itself (same reason as ci-cursor-review.yml / ci-detect-unreviewed-merge.yml).
+# itself (same reason as ci-cursor-review.yml / ci-assign-reviewers.yml).
 #
 # GROOMER-ONLY mode: groom only FINDS and FILES `groom`-labeled GitHub issues —
 # no commits, no PRs, no auto-builder, never merges. It fires on a DAILY base
