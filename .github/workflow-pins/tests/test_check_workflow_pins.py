@@ -619,10 +619,12 @@ class GuardCoverageTests(unittest.TestCase):
             self.assertEqual(cwp.find_unguarded_ref_checkouts(lines), [], name)
         self.assertEqual(
             seen,
-            15,
+            16,
             "expected the 12 guarded sites BE-5546 fixed + pr-size.yml's (BE-5858) "
             "+ cursor-review.yml's preflight (hard guard) and ledger (BE-4169 "
-            "job_workflow_sha self-pin) sites picked up merging main",
+            "job_workflow_sha self-pin) sites picked up merging main + "
+            "cursor-review.yml's diff-size job's check-pr-size-tool checkout, "
+            "also picked up merging main (BE-5546 added its guard here)",
         )
 
 
