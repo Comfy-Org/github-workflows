@@ -35,6 +35,15 @@ check(){ if eval "$2"; then ok "$1"; else bad "$1 [$2]"; fi; }
 WATCHED_PATH=".github/workflows/groom.yml"
 ASSETS_PATH=".github/groom"
 
+# The paths the one EXCLUDING fleet (pr-risk) watches, in the shape its
+# entrypoint's `paths:` filter has them: a reusable, a tool directory, and two
+# negations for the parts of that directory no pinned caller executes. Its
+# decommission surface is the three grader scripts, not the directory.
+RISK_WATCHED=".github/workflows/pr-risk.yml"
+RISK_TOOLS="scripts/pr-risk"
+RISK_PATHSPECS=$'.github/workflows/pr-risk.yml\nscripts/pr-risk\n:(exclude)scripts/pr-risk/tests\n:(exclude)scripts/pr-risk/README.md'
+RISK_EXEC=$'.github/workflows/pr-risk.yml\nscripts/pr-risk/grade-pr-risk.sh\nscripts/pr-risk/grade-targets.sh\nscripts/pr-risk/resolve-enabled.sh'
+
 CASE=""; SRC=""; ORIGIN=""; WORKDIR=""; OUTFILE=""; OUT=""; RC=0; P=""; N=""
 
 # --- fixture: a bare repo as `origin`, a clone as the run workspace -----------
@@ -65,6 +74,23 @@ new_case() {
 }
 
 clone_work() { rm -rf "$WORKDIR"; git clone -q "file://${ORIGIN}" "$WORKDIR"; }
+
+# Adds the pr-risk-shaped surface to the fixture (on top of the initial commit)
+# and re-clones the workspace so HEAD carries it: the reusable, three executed
+# grader scripts, and the two things its `paths:` filter excludes — a tests/
+# directory and the tool README.
+seed_pr_risk() {
+  mkdir -p "${SRC}/${RISK_TOOLS}/tests"
+  printf 'name: PR risk\non:\n  workflow_call:\n' > "${SRC}/${RISK_WATCHED}"
+  local s
+  for s in grade-pr-risk grade-targets resolve-enabled; do
+    printf '#!/usr/bin/env bash\necho %s v1\n' "$s" > "${SRC}/${RISK_TOOLS}/${s}.sh"
+  done
+  printf 'grader test v1\n' > "${SRC}/${RISK_TOOLS}/tests/test_grade.sh"
+  printf 'tool README v1\n' > "${SRC}/${RISK_TOOLS}/README.md"
+  push_src 'seed the pr-risk tool surface'
+  clone_work
+}
 
 # Actions' own `actions/checkout` is SHALLOW by default, so the deepening arm of
 # the script's `--unshallow` probe is the one that runs in production — and a
@@ -523,6 +549,197 @@ run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP"   # HEAD is still $BEHIND
 check "exit 1"                        "[[ $RC -eq 1 ]]"
 check "::error:: annotation"          "grep -q \"::error::HEAD ($BEHIND) is not this run\" <<<\"\$OUT\""
 check "proceed is not true"           "[[ \"$P\" != \"true\" ]]"
+
+# ---------------------------------------------------------------------------
+new_case pathspec_excluded 'pathspec fleet: a commit touching only EXCLUDED paths is not stale'
+# The failure the excluding fleet's own guard documents. pr-risk's `paths:`
+# filter negates `scripts/pr-risk/tests/**` and the tool README, so a test-only
+# commit starts NO run of its own — but it does move the `scripts/pr-risk` TREE
+# OID, so the object comparison reads "the watched surface changed since",
+# discards the only real run for this change, and freezes every caller waiting
+# on a run that will never exist. The pathspec comparison asks what the filter
+# asks.
+seed_pr_risk
+BEHIND=$(work_head)
+printf 'grader test v2\n' > "${SRC}/${RISK_TOOLS}/tests/test_grade.sh"
+printf 'tool README v2\n' > "${SRC}/${RISK_TOOLS}/README.md"
+push_src 'edit only excluded paths (tests + tool README)'
+TIP=$(origin_tip)
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" \
+  WATCHED="$RISK_WATCHED" WATCHED_PATHSPECS="$RISK_PATHSPECS"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=true"                  "[[ \"$P\" == \"true\" ]]"
+check "new_sha re-pointed to the tip" "[[ \"$N\" == \"$TIP\" ]]"
+check "not reported as stale"         "! grep -q \"stale run/re-run\" <<<\"\$OUT\""
+check "no ::error::"                  "! grep -q \"::error::\" <<<\"\$OUT\""
+check "no ::warning::"                "! grep -q \"::warning::\" <<<\"\$OUT\""
+# ...and the tree-OID comparison it replaces false-stales that same commit,
+# which is what makes the pathspec input necessary rather than cosmetic.
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" \
+  WATCHED="$RISK_WATCHED" WATCHED_ASSETS="$RISK_TOOLS"
+check "tree-OID config false-stales it" "[[ \"$P\" == \"false\" ]]"
+# Blank and indented lines are ignored, so the input can be pasted straight out
+# of a YAML block scalar sitting under the `paths:` filter it mirrors.
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" \
+  WATCHED="$RISK_WATCHED" WATCHED_PATHSPECS=$'\n  .github/workflows/pr-risk.yml  \n\n  scripts/pr-risk\n  :(exclude)scripts/pr-risk/tests\n  :(exclude)scripts/pr-risk/README.md\n'
+check "blank/indented lines ignored"  "[[ \"$P\" == \"true\" ]]"
+# A negation only strips the paths it matches: a commit touching an excluded
+# path AND a watched one is a real watched change and still has its own run.
+printf '#!/usr/bin/env bash\necho grade-pr-risk v2\n' > "${SRC}/${RISK_TOOLS}/grade-pr-risk.sh"
+printf 'grader test v3\n'                            > "${SRC}/${RISK_TOOLS}/tests/test_grade.sh"
+push_src 'edit a grader AND its test'
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" \
+  WATCHED="$RISK_WATCHED" WATCHED_PATHSPECS="$RISK_PATHSPECS"
+check "mixed commit is still stale"   "[[ \"$P\" == \"false\" ]]"
+check "mixed commit logged as stale"  "grep -q \"stale run/re-run\" <<<\"\$OUT\""
+
+# ---------------------------------------------------------------------------
+new_case pathspec_watched 'pathspec fleet: a real watched change behind IS stale'
+# The other half — the verdict the excluding fleet must keep. A later commit
+# touched a path the filter watches, so that commit has its own run and will pin
+# the newer grading logic; this run is a stale re-run.
+seed_pr_risk
+BEHIND=$(work_head)
+printf '#!/usr/bin/env bash\necho grade-targets v2\n' > "${SRC}/${RISK_TOOLS}/grade-targets.sh"
+push_src 'change the grading logic callers execute'
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" \
+  WATCHED="$RISK_WATCHED" WATCHED_PATHSPECS="$RISK_PATHSPECS" WATCHED_EXEC="$RISK_EXEC"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=false"                 "[[ \"$P\" == \"false\" ]]"
+check "logged as a stale run"         "grep -q \"stale run/re-run\" <<<\"\$OUT\""
+check "no ::warning::"                "! grep -q \"::warning::\" <<<\"\$OUT\""
+check "no ::error::"                  "! grep -q \"::error::\" <<<\"\$OUT\""
+# The reusable workflow file is in the pathspec list too, not just the tools.
+printf 'name: PR risk\non:\n  workflow_call:\n    inputs: {}\n' > "${SRC}/${RISK_WATCHED}"
+push_src 'change the reusable itself'
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" \
+  WATCHED="$RISK_WATCHED" WATCHED_PATHSPECS="$RISK_PATHSPECS"
+check "reusable change is stale too"  "[[ \"$P\" == \"false\" ]]"
+
+# ---------------------------------------------------------------------------
+new_case exec_gone_tip 'WATCHED_EXEC: an executed file deleted at the tip is decommissioned'
+# The directory OUTLIVES the scripts: deleting the graders leaves `tests/` and
+# the tool README behind, so `scripts/pr-risk` still exists and a directory
+# probe reports the surface healthy. Probe the executed files instead — and
+# report it as a decommission, not as a stale re-run, because the ::warning:: is
+# the fleet's only chance to say live callers are about to hard-fail.
+seed_pr_risk
+BEHIND=$(work_head)
+git -C "$SRC" rm -q "${RISK_TOOLS}/grade-targets.sh"
+push_src 'delete one grader, leave tests/ and the README'
+check "the tool dir survives at the tip" \
+  "[[ -n \"\$(git -C \"$ORIGIN\" ls-tree main -- \"$RISK_TOOLS\")\" ]]"
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" \
+  WATCHED="$RISK_WATCHED" WATCHED_PATHSPECS="$RISK_PATHSPECS" WATCHED_EXEC="$RISK_EXEC"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=false"                 "[[ \"$P\" == \"false\" ]]"
+check "::warning:: names the file" \
+  "grep -q \"::warning::${RISK_TOOLS}/grade-targets.sh no longer exists on main\" <<<\"\$OUT\""
+check "not reported as stale"         "! grep -q \"stale run/re-run\" <<<\"\$OUT\""
+# Without WATCHED_EXEC the same deletion is just another watched change: the run
+# skips green as a stale re-run and nothing warns that the graders are gone.
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" \
+  WATCHED="$RISK_WATCHED" WATCHED_PATHSPECS="$RISK_PATHSPECS"
+check "without it: no ::warning::"    "! grep -q \"::warning::\" <<<\"\$OUT\""
+check "without it: silent stale"      "grep -q \"stale run/re-run\" <<<\"\$OUT\""
+
+# ---------------------------------------------------------------------------
+new_case exec_gone_local 'WATCHED_EXEC: an executed file absent in this run own tree'
+# The deleting commit is usually the tip itself, so none of the "main moved"
+# comparisons run at all and the LOCAL probe is the only guard left. A `-d
+# scripts/pr-risk` probe passes here — the directory still holds tests/ and the
+# README — and would bump every caller onto a SHA where the graders are gone.
+seed_pr_risk
+git -C "$SRC" rm -q "${RISK_TOOLS}/resolve-enabled.sh"
+push_src 'delete an executed grader at the tip'
+clone_work
+TIP=$(origin_tip)
+check "the tool dir survives locally" "[[ -d \"${WORKDIR}/${RISK_TOOLS}\" ]]"
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" \
+  WATCHED="$RISK_WATCHED" WATCHED_PATHSPECS="$RISK_PATHSPECS" WATCHED_EXEC="$RISK_EXEC"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=false"                 "[[ \"$P\" == \"false\" ]]"
+check "::warning:: names the file" \
+  "grep -q \"::warning::${RISK_TOOLS}/resolve-enabled.sh absent at this SHA\" <<<\"\$OUT\""
+# The directory probe this replaces bumps the fleet onto that SHA.
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" \
+  WATCHED="$RISK_WATCHED" WATCHED_ASSETS="$RISK_TOOLS"
+check "a -d probe would have bumped"  "[[ \"$P\" == \"true\" ]]"
+
+# ---------------------------------------------------------------------------
+new_case list_shapes 'the list inputs are shape-checked, not silently skipped'
+# Every one of these shapes would otherwise make the script verify LESS than the
+# entrypoint asked for, behind a green run: a set-but-blank value falls back to
+# the comparison the fleet cannot use, a glob or a magic prefix in WATCHED_EXEC
+# names a file that never exists (so every probe reports a decommission), and an
+# all-negative pathspec is git's "everything EXCEPT these" — the widest possible
+# watched surface.
+seed_pr_risk
+TIP=$(origin_tip)
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED="$RISK_WATCHED" WATCHED_PATHSPECS=""
+check "blank PATHSPECS: exit 1"       "[[ $RC -eq 1 ]]"
+check "blank PATHSPECS: ::error::" \
+  "grep -q \"::error::WATCHED_PATHSPECS is set but contains no entries\" <<<\"\$OUT\""
+check "blank PATHSPECS: no output"    "[[ ! -s \"$OUTFILE\" ]]"
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED="$RISK_WATCHED" WATCHED_PATHSPECS=$'\n   \n'
+check "whitespace PATHSPECS: exit 1"  "[[ $RC -eq 1 ]]"
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED="$RISK_WATCHED" WATCHED_EXEC=""
+check "blank EXEC: exit 1"            "[[ $RC -eq 1 ]]"
+check "blank EXEC: ::error::" \
+  "grep -q \"::error::WATCHED_EXEC is set but contains no entries\" <<<\"\$OUT\""
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED="$RISK_WATCHED" \
+  WATCHED_EXEC=$'.github/workflows/pr-risk.yml\nscripts/pr-risk/*.sh'
+check "glob in EXEC: exit 1"          "[[ $RC -eq 1 ]]"
+check "glob in EXEC: ::error::" \
+  "grep -q \"::error::WATCHED_EXEC entry must be a literal path, not a glob\" <<<\"\$OUT\""
+check "glob in EXEC: not proceed"     "[[ \"$P\" != \"true\" ]]"
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED="$RISK_WATCHED" \
+  WATCHED_EXEC="scripts/pr-risk/"
+check "trailing slash in EXEC: exit 1" "[[ $RC -eq 1 ]]"
+check "trailing slash in EXEC: ::error::" \
+  "grep -q \"must not end in a slash\" <<<\"\$OUT\""
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED="$RISK_WATCHED" \
+  WATCHED_EXEC=$'scripts/pr-risk/grade-pr-risk.sh\n:(exclude)scripts/pr-risk/tests'
+check "magic in EXEC: exit 1"         "[[ $RC -eq 1 ]]"
+check "magic in EXEC: ::error::" \
+  "grep -q \"only legal in WATCHED_PATHSPECS\" <<<\"\$OUT\""
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED="$RISK_WATCHED" \
+  WATCHED_PATHSPECS=$':(exclude)scripts/pr-risk/tests\n:(exclude)scripts/pr-risk/README.md'
+check "all-negative PATHSPECS: exit 1" "[[ $RC -eq 1 ]]"
+check "all-negative PATHSPECS: ::error::" \
+  "grep -q \"::error::WATCHED_PATHSPECS contains only\" <<<\"\$OUT\""
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED="$RISK_WATCHED" \
+  WATCHED_PATHSPECS=$'scripts/pr-risk\n:!scripts/pr-risk/tests'
+check "shorthand magic: exit 1"       "[[ $RC -eq 1 ]]"
+check "shorthand magic: ::error::" \
+  "grep -q \"unsupported pathspec magic\" <<<\"\$OUT\""
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED="$RISK_WATCHED" \
+  WATCHED_PATHSPECS=$'scripts/pr-risk\n:(exclude)'
+check "empty exclusion: exit 1"       "[[ $RC -eq 1 ]]"
+check "empty exclusion: ::error::" \
+  "grep -q \"names no path\" <<<\"\$OUT\""
+
+# ---------------------------------------------------------------------------
+new_case pathspec_unusable 'a pathspec git REFUSES is an error, not a verdict'
+# The shape checks above are deliberately narrow (globs are legal in a pathspec,
+# so most typos cannot be caught by inspection) — git is the one that decides
+# whether a pathspec is usable, and it answers with exit 128, not 0 or 1. An
+# absolute path is the reachable case: `git diff -- /etc` is "outside
+# repository". Reading that as "unchanged" would re-point every caller to a tip
+# nothing was compared at; reading it as "changed" would freeze the fleet. It
+# must be neither.
+seed_pr_risk
+BEHIND=$(work_head)
+printf 'unrelated file, edited\n' > "${SRC}/README.md"
+push_src 'an unrelated commit, so the comparison branch is reached'
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" WATCHED="$RISK_WATCHED" \
+  WATCHED_PATHSPECS=$'scripts/pr-risk\n/etc/passwd'
+check "exit 1"                        "[[ $RC -ne 0 ]]"
+check "::error:: names the compare" \
+  "grep -q \"::error::Could not compare the watched pathspecs\" <<<\"\$OUT\""
+check "not read as stale"             "! grep -q \"stale run/re-run\" <<<\"\$OUT\""
+check "not re-pointed"                "! grep -q \"pinning callers to\" <<<\"\$OUT\""
+check "nothing written to output"     "[[ ! -s \"$OUTFILE\" ]]"
 
 echo
 echo "== $PASS passed, $FAIL failed =="

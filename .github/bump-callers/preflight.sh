@@ -49,6 +49,22 @@
 #     means narrowing its inputs to what the filter really watches (or keeping
 #     it on its own guard), not adding rev-list.
 #
+# WATCHED_PATHSPECS / WATCHED_EXEC (BE-6676) are what let an EXCLUDING fleet make
+# that swap without narrowing anything away. They express pr-risk's two shapes
+# that one `WATCHED_ASSETS` string cannot:
+#   * its `paths:` filter carries `:(exclude)` entries, so comparing the bare
+#     `scripts/pr-risk` tree OID reads a test-only commit as "changed since" —
+#     a FALSE stale that discards the fleet's only real run, the same freeze a
+#     bare tip mismatch used to cause. A pathspec-aware `git diff` asks the
+#     question the filter actually asks, exclusions included.
+#   * its decommission probe is PER EXECUTED FILE (the graders), not per
+#     directory: a commit deleting `grade-pr-risk.sh` while leaving `tests/` and
+#     `README.md` behind satisfies a `-d scripts/pr-risk` probe and bumps every
+#     caller onto a SHA where the tools are gone.
+# Neither is rev-list: the staleness test is still a two-tree comparison (it
+# needs no history, so it composes with — but does not require — the deepening
+# below), and the land-then-revert verdict is still the re-point's.
+#
 # Required environment:
 #   WATCHED        Repo-relative path of the watched reusable workflow file
 #                  (e.g. .github/workflows/groom.yml). A LITERAL path, never a
@@ -61,6 +77,33 @@
 #   WATCHED_ASSETS Watched asset directory (e.g. .github/groom) for a fleet whose
 #                  `paths:` filter has more than one entry. Empty/unset means the
 #                  fleet is single-path. Also a literal path.
+#   WATCHED_PATHSPECS
+#                  Newline-separated git PATHSPECS covering the surface the
+#                  fleet's `paths:` filter watches — `:(exclude)` entries
+#                  included, which is the whole point (only pr-risk needs this
+#                  today). When set it REPLACES the WATCHED/WATCHED_ASSETS object
+#                  comparison as the "changed since" test: a `git diff --quiet`
+#                  between this run's commit and the verified tip, restricted to
+#                  these pathspecs. It MUST MIRROR THE FLEET'S `paths:` FILTER,
+#                  exclusions included — same coupling, and the same two failure
+#                  modes in both directions, as the COUPLED TO THE PATH FILTER
+#                  note on the re-point below. Unset leaves the OID comparison
+#                  exactly as it was, so the fleets that do not set it do not
+#                  change behaviour.
+#   WATCHED_EXEC   Newline-separated repo-relative FILES that a pinned caller
+#                  actually executes (e.g. pr-risk's three grader scripts). When
+#                  set, each one is probed for deletion at the tip and again in
+#                  this run's own tree, IN ADDITION to WATCHED (and
+#                  WATCHED_ASSETS, when set) — a per-file decommission check for
+#                  a fleet whose directory can outlive the scripts inside it.
+#                  Plain paths only: pathspec magic belongs in WATCHED_PATHSPECS.
+#
+# Both list inputs are newline-separated so an entrypoint can write them as a
+# YAML block scalar directly beneath the `paths:` filter they mirror. Blank lines
+# are ignored; a variable that is SET but contains nothing else is rejected
+# rather than silently treated as unset — that shape is a mis-wired expression,
+# and reading it as "this fleet is simple" is exactly the silent under-check the
+# rest of this script refuses to make.
 #
 # Outputs (written to $GITHUB_OUTPUT on every exit-0 path):
 #   proceed  "true"  → the caller should run bump-callers.sh
@@ -69,9 +112,11 @@
 #            this run was re-pointed forward (see the re-point block below)
 #
 # Exits non-zero ONLY for an input we cannot trust (malformed SHA, glob-shaped
-# watched path, a HEAD that is not GITHUB_SHA), a lookup we could not perform
-# (failed ls-remote, failed fetch, unresolvable FETCH_HEAD, a rev-parse that
-# failed rather than reporting absence), or an answer that contradicts history
+# watched path, a set-but-blank or malformed list input, a HEAD that is not
+# GITHUB_SHA), a lookup we could not perform
+# (failed ls-remote, failed fetch, unresolvable FETCH_HEAD, a rev-parse or a
+# pathspec diff that failed rather than reporting absence/equality), or an answer
+# that contradicts history
 # (a fetched main tip that does not descend from this run's commit, or from the
 # tip the ls-remote reported moments earlier). None of those is evidence of
 # staleness — it fails loudly rather than silently no-opping the fleet.
@@ -95,10 +140,11 @@ WATCHED_ASSETS="${WATCHED_ASSETS-}"
 # (`.github/groom/`) does the same. Either one would make every comparison
 # silently verify nothing and turn the whole fleet into a permanent no-op behind
 # a green run — reject the shape instead of reporting it as a decommission.
-validate_path() { # $1 = input name, $2 = value ("" = unset, skip)
+validate_path() { # $1 = input name, $2 = value ("" = unset, skip), $3 = optional glob hint
   [[ -n "$2" ]] || return 0
+  local hint="${3-pass the directory itself, e.g. .github/groom, not .github/groom/**}"
   if [[ "$2" == *'*'* || "$2" == *'?'* || "$2" == *'['* ]]; then
-    echo "::error::$1 must be a literal path, not a glob (got '$2') — pass the directory itself, e.g. .github/groom, not .github/groom/**"
+    echo "::error::$1 must be a literal path, not a glob (got '$2') — $hint"
     exit 1
   fi
   if [[ "$2" == */ ]]; then
@@ -108,6 +154,95 @@ validate_path() { # $1 = input name, $2 = value ("" = unset, skip)
 }
 validate_path WATCHED "$WATCHED"
 validate_path WATCHED_ASSETS "$WATCHED_ASSETS"
+
+# --- the two newline-separated list inputs -----------------------------------
+# Split on newlines, trim each entry, drop blank ones (a YAML block scalar always
+# ends in one). `mapfile` would do it in a line, but it is bash 4+ and this file
+# is also run by hand on macOS's bash 3.2 — hence the read loop. On that shell
+# `"${arr[@]}"` on an EMPTY array trips `set -u`, so every expansion of these two
+# arrays below is guarded by a count check first.
+LINES=()
+split_lines() { # $1 = raw value; result in $LINES
+  LINES=()
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -n "$line" ]] || continue
+    LINES+=("$line")
+  done <<< "$1"
+}
+
+# A variable that is SET but parses to zero entries is rejected, not read as
+# unset. Every way that shape actually arises — `WATCHED_EXEC: ${{ inputs.x }}`
+# with nothing bound, a block scalar whose body got deleted — means the
+# entrypoint intended a check that would then silently not happen: an excluding
+# fleet would fall back to the OID comparison it cannot use (permanent false
+# stale), and a per-file fleet would fall back to a directory probe that its
+# `tests/` dir keeps satisfying. Same not-evidence principle as everywhere else
+# here: fail loudly rather than quietly verify less than the caller asked for.
+require_entries() { # $1 = input name, $2 = entry count
+  if (( $2 == 0 )); then
+    echo "::error::$1 is set but contains no entries — either unset it or give it one path per line (a set-but-blank value would silently skip the check it was added for)"
+    exit 1
+  fi
+}
+
+watched_pathspecs=()
+if [[ -n "${WATCHED_PATHSPECS+set}" ]]; then
+  split_lines "$WATCHED_PATHSPECS"
+  require_entries WATCHED_PATHSPECS "${#LINES[@]}"   # exits on 0, so the expansion below is safe
+  watched_pathspecs=("${LINES[@]}")
+  # Pathspecs are the ONE input where glob syntax is legal — they are handed to
+  # `git diff`, which does the matching itself. What is not legal is magic other
+  # than `:(exclude)`: `:(glob)`, `:(icase)`, `:/`, and the `:!` shorthand all
+  # change what the comparison means in ways nothing here validates, and a typo
+  # in a magic prefix makes git treat the whole entry as a literal path that
+  # matches nothing — an under-verifying comparison that always reads
+  # "unchanged" and re-points on every stale re-run.
+  has_positive=""
+  for spec in "${watched_pathspecs[@]}"; do
+    case "$spec" in
+      ':(exclude)'*)
+        if [[ "$spec" == ':(exclude)' ]]; then
+          echo "::error::WATCHED_PATHSPECS entry ':(exclude)' names no path — write the path being excluded, e.g. ':(exclude)scripts/pr-risk/tests'"
+          exit 1
+        fi
+        ;;
+      :*)
+        echo "::error::WATCHED_PATHSPECS entry '$spec' uses unsupported pathspec magic — only ':(exclude)<path>' is accepted here (not ':!', ':(glob)' or ':/')"
+        exit 1
+        ;;
+      *) has_positive=1 ;;
+    esac
+  done
+  # git reads an all-negative pathspec as "everything EXCEPT these", which is the
+  # widest possible watched surface — the precise over-broad shape that makes an
+  # unrelated commit read as "changed since" and freezes the fleet. It is never
+  # what a `paths:` filter means.
+  if [[ -z "$has_positive" ]]; then
+    echo "::error::WATCHED_PATHSPECS contains only ':(exclude)' entries — git reads that as EVERY path except those, so every unrelated commit would read as a watched change. Include the positive paths the fleet's \`paths:\` filter lists."
+    exit 1
+  fi
+fi
+
+watched_exec=()
+if [[ -n "${WATCHED_EXEC+set}" ]]; then
+  split_lines "$WATCHED_EXEC"
+  require_entries WATCHED_EXEC "${#LINES[@]}"        # exits on 0, so the expansion below is safe
+  watched_exec=("${LINES[@]}")
+  for f in "${watched_exec[@]}"; do
+    # These are probed with `git rev-parse "<tip>:$f"` and `[[ -f "$f" ]]`, and
+    # neither expands anything: a glob, a trailing slash or a pathspec magic
+    # prefix simply names a file that never exists, so every probe would report
+    # a decommission and the fleet would no-op behind a green run for good.
+    if [[ "$f" == :* ]]; then
+      echo "::error::WATCHED_EXEC entry '$f' looks like a pathspec — WATCHED_EXEC takes plain repo-relative file paths, and ':(exclude)' magic is only legal in WATCHED_PATHSPECS"
+      exit 1
+    fi
+    validate_path "WATCHED_EXEC entry" "$f" "name each executed file, e.g. scripts/pr-risk/grade-pr-risk.sh"
+  done
+fi
 
 # NEW_SHA is the one value here that is never derived from a lookup — every check
 # below validates GITHUB_SHA/HEAD, while NEW_SHA is emitted verbatim into
@@ -353,6 +488,23 @@ if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
   elif [[ -n "$WATCHED_ASSETS" ]] && [[ -z "$tip_assets" ]]; then
     tip_gone="$WATCHED_ASSETS"
   fi
+  # A per-file fleet's directory can OUTLIVE the scripts inside it: pr-risk's
+  # `scripts/pr-risk` still exists once `tests/` and `README.md` are all that is
+  # left, so a directory probe would report the surface healthy and bump every
+  # caller onto a SHA where the graders it executes are gone. Probe the executed
+  # files themselves. This runs BEFORE the changed-since test below on purpose —
+  # a deletion also changes the watched surface, and reporting it as "a newer
+  # commit has its own run" would swallow the ::warning:: that is the fleet's
+  # only chance to say live callers are about to hard-fail at startup.
+  if [[ -z "$tip_gone" ]] && (( ${#watched_exec[@]} > 0 )); then
+    for f in "${watched_exec[@]}"; do
+      resolve_oid "$fetched_tip:$f"
+      if [[ -z "$RESOLVED" ]]; then
+        tip_gone="$f"
+        break
+      fi
+    done
+  fi
   if [[ -n "$tip_gone" ]]; then
     # ::warning:: not a bare echo: if the reusable was deleted while live callers
     # still pin it, they all hard-fail at startup and a silently-green run here
@@ -361,7 +513,39 @@ if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
     emit false "$NEW_SHA"
     exit 0
   fi
-  if [[ "$tip_blob" != "$here_blob" ]] || [[ "$tip_assets" != "$here_assets" ]]; then
+  # The "changed since" test, in one of two shapes.
+  #
+  # WATCHED_PATHSPECS is the pathspec shape, for a fleet whose `paths:` filter
+  # carries `:(exclude)` entries. Comparing objects cannot express an exclusion:
+  # the bare `scripts/pr-risk` tree OID moves when a test-only commit lands, so
+  # the OID comparison below would call this run stale and wait for a run that
+  # the filter guarantees never started. `git diff` takes the exclusions
+  # verbatim, so it asks exactly what the filter asks. It compares two TREES and
+  # walks no history, so it does not depend on the deepening above (it composes
+  # with it — both are true whether or not the checkout was shallow).
+  #
+  # A comparison that could not be performed is not a verdict, in EITHER
+  # direction — same not-evidence principle as resolve_oid. Reading it as
+  # "changed" freezes the fleet behind a run that never comes; reading it as
+  # "unchanged" re-points every caller to a tip nothing was verified at.
+  surface_changed=""
+  if (( ${#watched_pathspecs[@]} > 0 )); then
+    # `git diff --quiet` exits 1 for "there is a diff", 0 for "there is none",
+    # and 128 for a comparison it could not perform — an unreadable object, or a
+    # pathspec git rejects outright (an absolute or `../` path, measured: 128).
+    diff_rc=0
+    git diff --quiet "$head_sha" "$fetched_tip" -- "${watched_pathspecs[@]}" || diff_rc=$?
+    if (( diff_rc > 1 )); then
+      echo "::error::Could not compare the watched pathspecs between $GITHUB_SHA and main ($main_tip) — git diff exited $diff_rc; refusing to read a failed comparison as either verdict"
+      exit 1
+    fi
+    if (( diff_rc == 1 )); then
+      surface_changed=1
+    fi
+  elif [[ "$tip_blob" != "$here_blob" ]] || [[ "$tip_assets" != "$here_assets" ]]; then
+    surface_changed=1
+  fi
+  if [[ -n "$surface_changed" ]]; then
     echo "github.sha $GITHUB_SHA is behind main ($main_tip) and the watched surface changed since — stale run/re-run; the newer commit has its own run. Nothing to bump"
     emit false "$NEW_SHA"
     exit 0
@@ -381,7 +565,9 @@ if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
   # (.github/agents-md-integrity/**), cursor-review (.github/cursor-review/**),
   # groom (.github/groom/**) and pr-size (scripts/check-pr-size/**) — plus
   # pr-risk, whose filter also carries `:(exclude)` entries that a single
-  # WATCHED_ASSETS string cannot express (see the header). Read the entrypoint's
+  # WATCHED_ASSETS string cannot express, which is what WATCHED_PATHSPECS is for.
+  # THE SAME COUPLING BINDS IT, and more literally: the pathspec list must MIRROR
+  # the fleet's `paths:` filter, exclusions included. Read the entrypoint's
   # `paths:` rather than trusting this list, and if you widen a fleet's filter
   # again, widen the inputs here in the same change.
   #
@@ -392,8 +578,10 @@ if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
   # so the comparison above reports "the watched surface changed since" and this
   # run skips green as a stale re-run, waiting on a later run that will never
   # exist. That freezes the fleet exactly as a bare tip mismatch used to. An
-  # exclusion is therefore a reason to narrow the inputs (or leave that fleet on
-  # its own guard), never to point WATCHED_ASSETS at the whole directory.
+  # exclusion is therefore a reason to carry the filter's exclusions into
+  # WATCHED_PATHSPECS (or to narrow the inputs), never to point WATCHED_ASSETS at
+  # the whole directory. Dropping one `:(exclude)` line from the pathspec list
+  # reinstates that freeze exactly — which is why they live next to each other.
   echo "main moved to $main_tip since $GITHUB_SHA, but the watched surface is unchanged — this run is still the only one for that change; pinning callers to $main_tip and proceeding"
   NEW_SHA="$main_tip"
 fi
@@ -413,6 +601,19 @@ if [[ -n "$WATCHED_ASSETS" ]] && [[ ! -d "$WATCHED_ASSETS" ]]; then
   echo "::warning::$WATCHED_ASSETS absent at this SHA — treating as decommissioned and bumping nothing. If any caller still pins it, retire those callers."
   emit false "$NEW_SHA"
   exit 0
+fi
+# The local half of the per-file probe above: the deleting commit is often the
+# tip itself, in which case none of the "main moved" comparisons ran at all. A
+# `-d` probe on the parent directory would pass here for the same reason it
+# would there — the directory outlives the scripts — so test each executed file.
+if (( ${#watched_exec[@]} > 0 )); then
+  for f in "${watched_exec[@]}"; do
+    if [[ ! -f "$f" ]]; then
+      echo "::warning::$f absent at this SHA — treating as decommissioned and bumping nothing. If any caller still pins it, retire those callers."
+      emit false "$NEW_SHA"
+      exit 0
+    fi
+  done
 fi
 
 emit true "$NEW_SHA"
