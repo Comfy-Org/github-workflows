@@ -578,6 +578,61 @@ check "reported already at SHORT"              "grep -q 'already at $SHORT' <<<\
 check "committed nothing"                       "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
 check "opened no PR"                            "[[ ! -f \"\$STUB_PUT_DIR/pr.log\" ]] || ! grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
 
+echo "== a roster entry pointing at a file that calls ONLY a sibling reusable is the roster's bug =="
+# `GW_USES` non-empty proves the file calls SOME github-workflows reusable, not
+# ours. Telling a human to hand-pin a workflow this file does not use hides the
+# real problem — the stale entry in the fleet variable — so the warning names
+# that instead. (Silently skipping is not an option either: this file also
+# produces a no-op rewrite, i.e. the "already at" lie.) The fixture also carries
+# a bare `workflows_ref:` — rule 2's rewrite is unaddressed by design (it can't
+# tell "ours" from a sibling job's `with:` input) and would otherwise happily
+# repoint the SIBLING's asset ref at this fleet's SHA and stage the file; the
+# roster check must `continue` before that rewrite runs, not just warn.
+new_case wrongfleet
+WRONGFLEET_FIXTURE="${WORK}/wrongfleet_caller.yml"
+printf '%s\n' \
+  'name: CI cursor-review' \
+  'jobs:' \
+  '  review:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@1111111111111111111111111111111111111111' \
+  '    with:' \
+  '      workflows_ref: 2222222222222222222222222222222222222222' \
+  > "$WRONGFLEET_FIXTURE"
+STUB_CONTENT_FILE="$WRONGFLEET_FIXTURE" run_bump \
+  VAR_NAME=GROOM_CALLERS TAG=groom WORKFLOW_FILE=groom.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-wrongfleet","file":".github/workflows/ci-groom.yml","label":""}]'
+check "exit 1" "[[ $RC -eq 1 ]]"
+check "blamed the roster entry, not the file" \
+  "grep -q '::warning::.*has no \`uses:\` calling groom.yml.*GROOM_CALLERS.*fix the roster entry' <<<\"\$OUT\""
+check "did NOT tell a human to hand-pin groom.yml"  "! grep -q 'pin it by full SHA by hand' <<<\"\$OUT\""
+check "did NOT claim the file was already current"  "! grep -q 'already at $SHORT' <<<\"\$OUT\""
+check "committed nothing (uses: AND workflows_ref both left alone)" \
+  "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+check "opened no PR"                                "[[ ! -f \"\$STUB_PUT_DIR/pr.log\" ]] || ! grep -q '^pr-create' \"\$STUB_PUT_DIR/pr.log\""
+
+echo "== a file naming NO github-workflows reusable stays silent (no false positives) =="
+# The unusual-spelling escape hatch, now that a bad roster entry can fail the run:
+# `GW_USES` empty means no `uses:` line names a github-workflows reusable in a
+# spelling this script parses. "Not provably ours" must stay a quiet skip exactly
+# as the rewrite address treats it — a check that turns every unparsed caller red
+# is a check people disable.
+new_case nogw
+NOGW_FIXTURE="${WORK}/nogw_caller.yml"
+printf '%s\n' \
+  'name: CI something else' \
+  'jobs:' \
+  '  build:' \
+  '    steps:' \
+  '      - uses: actions/checkout@1111111111111111111111111111111111111111' \
+  > "$NOGW_FIXTURE"
+STUB_CONTENT_FILE="$NOGW_FIXTURE" run_bump \
+  VAR_NAME=GROOM_CALLERS TAG=groom WORKFLOW_FILE=groom.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-nogw","file":".github/workflows/ci-groom.yml","label":""}]'
+check "exit 0" "[[ $RC -eq 0 ]]"
+check "emitted no pin warning"        "! grep -q 'pin it by full SHA by hand' <<<\"\$OUT\""
+check "emitted no roster warning"     "! grep -q 'fix the roster entry' <<<\"\$OUT\""
+check "left the unrelated action pin alone" "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+
 echo "== a TAG-pinned workflows_ref moves in lock-step with uses: (BE-4662) =="
 # The under-rewrite half of BE-4662. A caller pins this repo TWICE — the `uses:`
 # sha and the `workflows_ref` input that loads the briefs/prompts/scripts. The
@@ -841,6 +896,7 @@ STUB_CONTENT_FILE="$EMPTY_FIXTURE" run_bump \
 check "exit 1 — the repo failed"                 "[[ $RC -eq 1 ]]"
 check "warning names the empty pin"              "grep -qF '(empty)' <<<\"\$OUT\""
 check "committed NOTHING"                        "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+
 
 echo "== an ALREADY-CONVERTED 'main (<short>)' marker is refreshed, not frozen (BE-4523) =="
 # The legacy `# github-workflows#NN` rule only fires once. After a caller has

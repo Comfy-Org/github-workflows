@@ -6,7 +6,7 @@ name: CI - Assign Reviewers
 # would run the PR's OWN copy of the router, letting a PR rewrite who gets
 # assigned to review it. Named ci-assign-reviewers.yml because the canonical
 # caller path (assign-reviewers.yml) is occupied here by the reusable itself,
-# same as ci-cursor-review.yml / ci-detect-unreviewed-merge.yml / ci-groom.yml.
+# same as ci-cursor-review.yml / ci-groom.yml.
 #
 # WHAT IT WRITES: the ASSIGNEE field, not reviewer requests — despite the
 # workflow's name. "This org routes/alerts people via the ASSIGNEE field"

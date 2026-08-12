@@ -45,9 +45,11 @@ func TestParseNumstat(t *testing.T) {
 		},
 		{
 			// -z renames: empty path field, then old-path and new-path tokens.
-			name:  "rename resolves to new path",
+			// The SOURCE is kept too: a rename's deletions are booked against the
+			// destination, so classification needs both paths to stay conservative.
+			name:  "rename resolves to new path and keeps the source",
 			input: nul("1\t1\t", "dir/old/file.go", "dir/new/file.go"),
-			want:  []FileChange{{Path: "dir/new/file.go", Added: 1, Deleted: 1}},
+			want:  []FileChange{{Path: "dir/new/file.go", OldPath: "dir/old/file.go", Added: 1, Deleted: 1}},
 		},
 		{
 			// A file whose literal name contains " => " must NOT be treated as a
@@ -185,6 +187,122 @@ func TestIsLockfile(t *testing.T) {
 	}
 }
 
+// TestIsTestPath pins the test-file classification. The false-positive half of
+// this table matters more than the true-positive half: a production file
+// misclassified as a test silently shrinks the very number the cap protects,
+// which is strictly worse than a test file being counted.
+func TestIsTestPath(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		path string
+		want bool
+	}{
+		// Go
+		{"internal/config/feature_rollout_test.go", true},
+		{"main_test.go", true},
+		{"pkg/testdata/golden.json", true},
+		// Python
+		{"api/tests/test_models.py", true},
+		{"api/test_models.py", true},
+		{"api/models_test.py", true},
+		{"api/conftest.py", true},
+		{"conftest.py", true},
+		// JS/TS
+		{"web/src/Button.test.tsx", true},
+		{"web/src/api.spec.ts", true},
+		{"web/src/util.test.js", true},
+		{"web/src/util.spec.mjs", true},
+		{"web/src/__tests__/render.tsx", true},
+		// Type tests — the `test` component need not adjoin the extension.
+		{"web/src/api.test.d.ts", true},
+		{"web/src/api.test.helpers.ts", true},
+		{"web/src/__snapshots__/Button.test.tsx.snap", true},
+		{"web/src/__mocks__/fs.ts", true},
+		// Directory conventions, at any depth
+		{"e2e/checkout.ts", true},
+		// Segment matching is case-insensitive (.NET/C#/Unity casing).
+		{"src/Tests/FooTests.cs", true},
+		{"src/TestData/golden.json", true},
+		{"E2E/Checkout.cs", true},
+		{"test/helpers.rb", true},
+		{"src/test/java/com/x/FooTest.java", true},
+
+		// --- Case 2/3: AMBIGUOUS segments only at the root or a source root ---
+		// Root-level test trees (the real ones in the consumer that drove this).
+		{"testing/e2e/framework/harness.go", true},
+		{"testing/integration/helper.go", true},
+		{"testing/smoke/result.go", true},
+		{"testing/synthetics/probe.go", true},
+		{"tests/helpers.rb", true},
+		// Maven/Gradle nest their tests by convention — case 3 keeps them.
+		{"src/it/java/com/x/FooIT.java", true},
+		// Unambiguous names stay matched at ANY depth (case 1).
+		{"pkg/deep/nested/testdata/golden.json", true},
+
+		// --- False positives the substring-matching naive version would hit ---
+		{"contest/leaderboard.go", false},
+		{"pkg/contest/entry.py", false},
+		{"internal/version/latest.go", false},
+		{"protest.go", false},
+		{"attestation/verify.go", false},
+		{"pkg/attestation/sigstore_test_helpers.go", false},
+		{"web/src/manifest.ts", false},
+		{"web/src/spec.ts", false},
+		{"web/src/test.ts", false},
+		// A `test`/`spec` component must not be the FIRST one.
+		{"web/src/spec.helpers.ts", false},
+		{"web/src/manifest.d.ts", false},
+		// `spec` matches ONLY as the final stem component: in this org these are
+		// OpenAPI production artifacts, and excluding them would UNDER-count.
+		{"web/src/api.spec.types.ts", false},
+		{"web/src/openapi.spec.client.ts", false},
+		{"web/src/payments.spec.gen.ts", false},
+		{"web/src/api.spec.d.ts", false},
+		// Unicode case folding must not widen the segment match: U+212A KELVIN
+		// SIGN lowercases to `k` under strings.ToLower.
+		{"src/__MOC\u212AS__/fs.ts", false},
+		{"testify.go", false},
+		{"latest_test_results.md", false},
+		// `spec/` holds OpenAPI schemas in this org, not RSpec suites.
+		{"services/checkout/openapi.yaml", false},
+		{"spec/openapi.yaml", false},
+		{"api/specs/v1.json", false},
+		// THE REGRESSION THAT DROVE THE THREE-CASE SPLIT: `testing` here names a
+		// deployment ENVIRONMENT, and these are production deployment manifests —
+		// cluster RBAC and ingress config. They must COUNT against the cap.
+		{"deploy/envs/testing/charts/ingress/base/templates/clusterrole.yaml", false},
+		{"deploy/envs/testing/charts/ingress/base/templates/clusterrolebinding.yaml", false},
+		{"deploy/envs/testing/charts/certs/base/values.yaml", false},
+		{"deploy/envs/testing/appsets/values.yaml", false},
+		// Other nested ambiguous segments likewise count (safe direction).
+		{"services/checkout/e2e/flow.go", false},
+		{"internal/testing/harness.go", false},
+		{"apps/test/main.go", false},
+		// A source root only rescues the segment DIRECTLY beneath it.
+		{"src/main/java/com/x/Test.java", false},
+		// Multi-module Maven/Gradle — the standard shape, now covered by case 3.
+		{"module-a/src/test/java/com/x/FooTest.java", true},
+		{"services/payment/src/it/java/com/x/FooIT.java", true},
+		// `it` needs a child segment, so a bare Italian locale tree still counts.
+		{"src/it/messages.properties", false},
+
+		// A file whose own name matches a test DIRECTORY is not a test file.
+		{"cmd/test", false},
+		{"docs/testing", false},
+		// Production code that merely lives next to tests.
+		{"internal/config/feature_rollout.go", false},
+		{"services/checkout/server/handlers/assets.go", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			t.Parallel()
+			if got := IsTestPath(tt.path); got != tt.want {
+				t.Errorf("IsTestPath(%q) = %v, want %v", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseExtras(t *testing.T) {
 	t.Parallel()
 	t.Run("empty inputs yield inert extras", func(t *testing.T) {
@@ -234,6 +352,11 @@ func TestExtrasGenerated(t *testing.T) {
 		{"path glob anchors to full path", "", "gen/**", "gen/a/b.ts", true},
 		{"path glob does not float", "", "gen/**", "src/gen/a.ts", false},
 		{"double star crosses segments", "", "web/**/snapshots/**", "web/a/b/snapshots/x.snap", true},
+		{"leading double star matches root level", "", "**/node_modules/**", "node_modules/pkg/index.js", true},
+		{"leading double star matches nested", "", "**/node_modules/**", "web/node_modules/pkg/index.js", true},
+		{"leading double star star matches root file", "", "**/*.min.js", "app.min.js", true},
+		{"leading double star star matches nested file", "", "**/*.min.js", "web/js/app.min.js", true},
+		{"interior double star matches zero segments", "", "web/**/snapshots/**", "web/snapshots/x.snap", true},
 		{"single star does not cross segments", "", "web/*/x.ts", "web/a/b/x.ts", false},
 		{"question mark matches one char", "", "v?.json", "schema/v1.json", true},
 		{"question mark needs a char", "", "v?.json", "v.json", false},
@@ -261,8 +384,10 @@ func TestEvaluate(t *testing.T) {
 		files         []FileChange
 		max           int
 		bypassed      bool
+		excludeTests  bool
 		wantCounted   int
 		wantGenerated int
+		wantTest      int
 		wantOK        bool
 	}{
 		{
@@ -324,19 +449,148 @@ func TestEvaluate(t *testing.T) {
 			wantCounted: 1000,
 			wantOK:      true,
 		},
+		{
+			// Default policy: test lines are reported but still counted, so a
+			// repo that has not opted in sees exactly today's verdict.
+			name: "tests counted by default and reported separately",
+			files: []FileChange{
+				{Path: "hand.go", Added: 300, Deleted: 36},
+				{Path: "hand_test.go", Added: 1200, Deleted: 33, Test: true},
+			},
+			max:         1000,
+			wantCounted: 1569,
+			wantTest:    1233,
+			wantOK:      false,
+		},
+		{
+			// The BE-6791 case: the same diff passes once tests are excluded,
+			// and the excluded total is still reported.
+			name: "tests excluded when opted in",
+			files: []FileChange{
+				{Path: "hand.go", Added: 300, Deleted: 36},
+				{Path: "hand_test.go", Added: 1200, Deleted: 33, Test: true},
+			},
+			max:          1000,
+			excludeTests: true,
+			wantCounted:  336,
+			wantTest:     1233,
+			wantOK:       true,
+		},
+		{
+			// Buckets must not overlap: a generated file that also matches a test
+			// path counts once, as generated, so the three totals still sum to
+			// the diff's non-binary changed lines.
+			name: "generated wins over test so buckets never double count",
+			files: []FileChange{
+				{Path: "tests/mock.gen.go", Added: 900, Deleted: 100, Generated: true, Test: true},
+				{Path: "hand_test.go", Added: 40, Deleted: 0, Test: true},
+				{Path: "hand.go", Added: 10, Deleted: 0},
+			},
+			max:           1000,
+			excludeTests:  true,
+			wantCounted:   10,
+			wantGenerated: 1000,
+			wantTest:      40,
+			wantOK:        true,
+		},
+		{
+			// A test-only PR over the cap must still FAIL without the opt-in —
+			// the exclusion is a per-repo decision, never an implicit one.
+			name: "test-only PR still fails without the opt-in",
+			files: []FileChange{
+				{Path: "big_test.go", Added: 5000, Deleted: 0, Test: true},
+			},
+			max:         1000,
+			wantCounted: 5000,
+			wantTest:    5000,
+			wantOK:      false,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := Evaluate(tt.files, tt.max, tt.bypassed)
+			got := Evaluate(tt.files, Policy{Max: tt.max, Bypassed: tt.bypassed, ExcludeTests: tt.excludeTests})
 			if got.Counted != tt.wantCounted {
 				t.Errorf("Counted = %d, want %d", got.Counted, tt.wantCounted)
 			}
 			if got.Generated != tt.wantGenerated {
 				t.Errorf("Generated = %d, want %d", got.Generated, tt.wantGenerated)
 			}
+			if got.Test != tt.wantTest {
+				t.Errorf("Test = %d, want %d", got.Test, tt.wantTest)
+			}
+			if got.TestsExcluded != tt.excludeTests {
+				t.Errorf("TestsExcluded = %v, want %v", got.TestsExcluded, tt.excludeTests)
+			}
 			if got.OK != tt.wantOK {
 				t.Errorf("OK = %v, want %v", got.OK, tt.wantOK)
+			}
+		})
+	}
+}
+
+// TestExclusionDecisive pins when the report is forced to explain itself: only
+// when the exclusion is the sole reason the PR is under the cap. It drives the
+// sticky comment on a GREEN check, so a false positive means a comment on every
+// PR and a false negative means the number stays hidden in the step summary.
+func TestExclusionDecisive(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		res  Result
+		want bool
+	}{
+		{
+			name: "excluded tests are what keep it under",
+			res:  Result{Counted: 336, Test: 1233, Max: 1000, TestsExcluded: true},
+			want: true,
+		},
+		{
+			name: "would pass anyway — tests are incidental",
+			res:  Result{Counted: 100, Test: 50, Max: 1000, TestsExcluded: true},
+			want: false,
+		},
+		{
+			name: "exactly at the cap without tests is not over",
+			res:  Result{Counted: 900, Test: 100, Max: 1000, TestsExcluded: true},
+			want: false,
+		},
+		{
+			name: "one line over is decisive",
+			res:  Result{Counted: 900, Test: 101, Max: 1000, TestsExcluded: true},
+			want: true,
+		},
+		{
+			// Over cap even after the exclusion: `Counted+Test > Max` is
+			// trivially true, so without the `Counted <= Max` term this would
+			// claim decisiveness on a RED run.
+			name: "over cap despite the exclusion is not decisive",
+			res:  Result{Counted: 1500, Test: 500, Max: 1000, TestsExcluded: true},
+			want: false,
+		},
+		{
+			name: "policy off — nothing was excluded, so nothing to explain",
+			res:  Result{Counted: 1569, Test: 1233, Max: 1000},
+			want: false,
+		},
+		{
+			// The label already explains why it passed; crediting the exclusion
+			// would be misleading.
+			name: "bypassed results are never attributed to the exclusion",
+			res:  Result{Counted: 336, Test: 1233, Max: 1000, TestsExcluded: true, Bypassed: true},
+			want: false,
+		},
+		{
+			name: "no test lines at all",
+			res:  Result{Counted: 500, Max: 1000, TestsExcluded: true},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tt.res.ExclusionDecisive(); got != tt.want {
+				t.Errorf("ExclusionDecisive() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -348,7 +602,7 @@ func TestEvaluateSortsFilesByChangedDescending(t *testing.T) {
 		{Path: "small.go", Added: 1, Deleted: 0},
 		{Path: "big.go", Added: 500, Deleted: 100},
 		{Path: "mid.go", Added: 50, Deleted: 0},
-	}, 1000, false)
+	}, Policy{Max: 1000})
 	wantOrder := []string{"big.go", "mid.go", "small.go"}
 	for i, w := range wantOrder {
 		if res.Files[i].Path != w {
@@ -363,7 +617,7 @@ func TestEvaluateDoesNotMutateCallerSlice(t *testing.T) {
 		{Path: "small.go", Added: 1},
 		{Path: "big.go", Added: 500},
 	}
-	_ = Evaluate(files, 1000, false)
+	_ = Evaluate(files, Policy{Max: 1000})
 	if files[0].Path != "small.go" || files[1].Path != "big.go" {
 		t.Errorf("Evaluate reordered the caller's slice: %+v", files)
 	}
@@ -378,7 +632,7 @@ func TestContentGeneratedOnlyTrustsGoFiles(t *testing.T) {
 	if err := os.WriteFile(goFile, marker, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if !contentGenerated(goFile, "", "") {
+	if !contentGenerated(goFile, "", "", false) {
 		t.Errorf("a .go file with the generated marker should be generated")
 	}
 
@@ -388,7 +642,7 @@ func TestContentGeneratedOnlyTrustsGoFiles(t *testing.T) {
 	if err := os.WriteFile(mdFile, marker, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if contentGenerated(mdFile, "", "") {
+	if contentGenerated(mdFile, "", "", false) {
 		t.Errorf("a non-.go file with a pasted marker must not be treated as generated")
 	}
 }
@@ -406,7 +660,418 @@ func TestContentGeneratedRejectsSymlink(t *testing.T) {
 	}
 	// The DoS guard must refuse to follow a symlink, even one pointing at a
 	// legitimately generated file.
-	if contentGenerated(link, "", "") {
+	if contentGenerated(link, "", "", false) {
 		t.Errorf("contentGenerated must not follow symlinks")
+	}
+}
+
+// TestCommentSyntaxFor pins the ext/basename → comment-syntax mapping, including
+// the "unknown extension gets no comment markers" (blank-only) safe default.
+func TestCommentSyntaxFor(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		path      string
+		wantLine  []string
+		wantBlock string // blockStart, "" if none
+	}{
+		{"pkg/foo.go", []string{"//"}, "/*"},
+		{"web/app.tsx", []string{"//"}, "/*"},
+		{"scripts/deploy.sh", []string{"#"}, ""},
+		{"infra/main.tf", []string{"#"}, ""},
+		{"db/schema.sql", []string{"--"}, ""},
+		{"docs/index.html", nil, "<!--"},
+		{"Makefile", []string{"#"}, ""},
+		{"build/Dockerfile", []string{"#"}, ""},
+		{"data/blob.bin", nil, ""},              // unknown ext → blank-only
+		{"README", nil, ""},                     // no extension → blank-only
+		{"path/UPPER.GO", []string{"//"}, "/*"}, // extension match is case-insensitive
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			t.Parallel()
+			cs := commentSyntaxFor(tt.path)
+			if strings.Join(cs.line, ",") != strings.Join(tt.wantLine, ",") {
+				t.Errorf("%s: line = %v, want %v", tt.path, cs.line, tt.wantLine)
+			}
+			if cs.blockStart != tt.wantBlock {
+				t.Errorf("%s: blockStart = %q, want %q", tt.path, cs.blockStart, tt.wantBlock)
+			}
+		})
+	}
+}
+
+// TestIsInsignificantLine pins the per-line heuristic: blanks and comment-prefixed
+// lines are insignificant; a comment token merely CONTAINED in code (a string
+// literal) is significant; a multi-line block-comment body (no single-line
+// close) is significant (documented limitation).
+func TestIsInsignificantLine(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		body string
+		cs   commentSyntax
+		want bool
+	}{
+		{"blank", "", cFamily, true},
+		{"whitespace only", "   \t", cFamily, true},
+		{"go line comment", "  // explain", cFamily, true},
+		{"go code", "\tx := f()", cFamily, false},
+		{"single-line block", "/* note */", cFamily, true},
+		{"block open only is significant", "/* start of a long block", cFamily, false},
+		{"go pointer deref is code, not comment", "*out = result", cFamily, false},
+		{"hash comment python", "# a note", hashCmt, true},
+		{"hash token inside string is code", `url = "http://x#frag"`, hashCmt, false},
+		{"sql dash comment", "-- drop", dashCmt, true},
+		{"html single-line comment", "<!-- hi -->", mlCmt, true},
+		{"unknown lang: blank still insignificant", "   ", commentSyntax{}, true},
+		{"unknown lang: comment-looking code counts", "// still code here", commentSyntax{}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isInsignificantLine(tt.body, tt.cs); got != tt.want {
+				t.Errorf("isInsignificantLine(%q) = %v, want %v", tt.body, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestParseDiscounts feeds a literal unified diff spanning a .go and a .py file
+// and checks the per-path blank/comment counts. It also covers the header-vs-
+// content ambiguity: an ADDED line whose own text begins with "+++" (inside a
+// hunk) must be treated as content, never as a file header.
+func TestParseDiscounts(t *testing.T) {
+	t.Parallel()
+	patch := strings.Join([]string{
+		"diff --git a/pkg/foo.go b/pkg/foo.go",
+		"index 111..222 100644",
+		"--- a/pkg/foo.go",
+		"+++ b/pkg/foo.go",
+		"@@ -1,3 +1,7 @@",
+		" package foo",
+		"+// added comment", // insignificant (go comment)
+		"+",                 // insignificant (blank)
+		"+func F() int {",   // significant
+		"+++ still content", // significant: leading + stripped -> "++ still content", not a header
+		"-x := 1",           // significant (removed code)
+		"-// old comment",   // insignificant (removed comment)
+		" return 0",
+		"diff --git a/app.py b/app.py",
+		"index 333..444 100644",
+		"--- a/app.py",
+		"+++ b/app.py",
+		"@@ -0,0 +1,2 @@",
+		"+# python comment", // insignificant
+		"+value = 42",       // significant
+		"",
+	}, "\n")
+
+	got, err := ParseDiscounts(strings.NewReader(patch))
+	if err != nil {
+		t.Fatalf("ParseDiscounts: %v", err)
+	}
+	if got["pkg/foo.go"] != 3 {
+		t.Errorf("pkg/foo.go discounted = %d, want 3 (comment, blank, removed comment)", got["pkg/foo.go"])
+	}
+	if got["app.py"] != 1 {
+		t.Errorf("app.py discounted = %d, want 1 (python comment)", got["app.py"])
+	}
+}
+
+// TestEvaluateDiscount proves Discounted lowers the counted total (not the
+// generated total) and that a fully blank/comment file drops to zero counted.
+func TestEvaluateDiscount(t *testing.T) {
+	t.Parallel()
+	files := []FileChange{
+		{Path: "a.go", Added: 100, Deleted: 0, Discounted: 40}, // 60 counted
+		{Path: "b.go", Added: 20, Deleted: 0, Discounted: 20},  // all comment → 0 counted
+		{Path: "gen.pb.go", Added: 900, Generated: true},       // excluded wholesale
+	}
+	res := Evaluate(files, Policy{Max: 1000})
+	if res.Counted != 60 {
+		t.Errorf("Counted = %d, want 60", res.Counted)
+	}
+	if res.Discounted != 60 {
+		t.Errorf("Discounted = %d, want 60 (40+20)", res.Discounted)
+	}
+	if res.Generated != 900 {
+		t.Errorf("Generated = %d, want 900 (raw, discount does not touch generated)", res.Generated)
+	}
+	// b.go contributes 0 counted lines.
+	for _, f := range res.Files {
+		if f.Path == "b.go" && f.Counted() != 0 {
+			t.Errorf("b.go Counted() = %d, want 0", f.Counted())
+		}
+	}
+}
+
+// TestFilterPatch exercises the reviewed-diff section filter against literal
+// patches: sections drop by old path, new path, or rename source/destination
+// (the whole rename goes at once — no orphaned old-path deletion), binary and
+// mode-only sections resolve via the `diff --git` fallback, and anything
+// unparseable is kept, never hidden.
+func TestFilterPatch(t *testing.T) {
+	t.Parallel()
+	drop := func(set ...string) func(string) bool {
+		m := map[string]bool{}
+		for _, p := range set {
+			m[p] = true
+		}
+		return func(p string) bool { return m[p] }
+	}
+
+	textSection := func(path, add string) string {
+		return "diff --git a/" + path + " b/" + path + "\n" +
+			"index 1111111..2222222 100644\n" +
+			"--- a/" + path + "\n" +
+			"+++ b/" + path + "\n" +
+			"@@ -1,1 +1,2 @@\n line\n+" + add + "\n"
+	}
+
+	t.Run("drops generated section, keeps hand-written", func(t *testing.T) {
+		t.Parallel()
+		patch := textSection("hand.go", "var A = 1") + textSection("gen.pb.go", "var B = 2")
+		var out strings.Builder
+		kept, dropped, err := FilterPatch(strings.NewReader(patch), &out, drop("gen.pb.go"))
+		if err != nil {
+			t.Fatalf("FilterPatch: %v", err)
+		}
+		if kept != 1 || dropped != 1 {
+			t.Errorf("kept=%d dropped=%d, want 1 and 1", kept, dropped)
+		}
+		if got := out.String(); got != textSection("hand.go", "var A = 1") {
+			t.Errorf("unexpected output:\n%s", got)
+		}
+	})
+
+	t.Run("empty drop set is the identity", func(t *testing.T) {
+		t.Parallel()
+		patch := textSection("a.go", "x") + textSection("b.go", "y")
+		var out strings.Builder
+		kept, dropped, err := FilterPatch(strings.NewReader(patch), &out, drop())
+		if err != nil {
+			t.Fatalf("FilterPatch: %v", err)
+		}
+		if kept != 2 || dropped != 0 || out.String() != patch {
+			t.Errorf("identity violated: kept=%d dropped=%d\n%s", kept, dropped, out.String())
+		}
+	})
+
+	t.Run("rename drops as one piece via destination path", func(t *testing.T) {
+		t.Parallel()
+		patch := "diff --git a/old/gen.pb.go b/new/gen.pb.go\n" +
+			"similarity index 90%\n" +
+			"rename from old/gen.pb.go\n" +
+			"rename to new/gen.pb.go\n" +
+			"index 1111111..2222222 100644\n" +
+			"--- a/old/gen.pb.go\n" +
+			"+++ b/new/gen.pb.go\n" +
+			"@@ -1,1 +1,2 @@\n line\n+more\n" +
+			textSection("hand.go", "var A = 1")
+		var out strings.Builder
+		kept, dropped, err := FilterPatch(strings.NewReader(patch), &out, drop("new/gen.pb.go"))
+		if err != nil {
+			t.Fatalf("FilterPatch: %v", err)
+		}
+		if kept != 1 || dropped != 1 {
+			t.Errorf("kept=%d dropped=%d, want 1 and 1", kept, dropped)
+		}
+		if got := out.String(); strings.Contains(got, "old/gen.pb.go") || strings.Contains(got, "new/gen.pb.go") {
+			t.Errorf("rename section should drop entirely (both sides):\n%s", got)
+		}
+	})
+
+	t.Run("pure rename with no hunks drops at section boundary", func(t *testing.T) {
+		t.Parallel()
+		patch := "diff --git a/gen.pb.go b/moved/gen.pb.go\n" +
+			"similarity index 100%\n" +
+			"rename from gen.pb.go\n" +
+			"rename to moved/gen.pb.go\n" +
+			textSection("hand.go", "var A = 1")
+		var out strings.Builder
+		kept, dropped, err := FilterPatch(strings.NewReader(patch), &out, drop("moved/gen.pb.go"))
+		if err != nil {
+			t.Fatalf("FilterPatch: %v", err)
+		}
+		if kept != 1 || dropped != 1 || strings.Contains(out.String(), "rename") {
+			t.Errorf("kept=%d dropped=%d output:\n%s", kept, dropped, out.String())
+		}
+	})
+
+	t.Run("binary section drops via diff --git fallback", func(t *testing.T) {
+		t.Parallel()
+		patch := "diff --git a/data/object_info.json.gz b/data/object_info.json.gz\n" +
+			"index 1111111..2222222 100644\n" +
+			"Binary files a/data/object_info.json.gz and b/data/object_info.json.gz differ\n" +
+			textSection("hand.go", "var A = 1")
+		var out strings.Builder
+		kept, dropped, err := FilterPatch(strings.NewReader(patch), &out, drop("data/object_info.json.gz"))
+		if err != nil {
+			t.Fatalf("FilterPatch: %v", err)
+		}
+		if kept != 1 || dropped != 1 || strings.Contains(out.String(), "object_info") {
+			t.Errorf("kept=%d dropped=%d output:\n%s", kept, dropped, out.String())
+		}
+	})
+
+	t.Run("mode-only section decides at boundary", func(t *testing.T) {
+		t.Parallel()
+		patch := "diff --git a/tool.sh b/tool.sh\n" +
+			"old mode 100644\n" +
+			"new mode 100755\n" +
+			textSection("hand.go", "var A = 1")
+		var out strings.Builder
+		kept, dropped, err := FilterPatch(strings.NewReader(patch), &out, drop("tool.sh"))
+		if err != nil {
+			t.Fatalf("FilterPatch: %v", err)
+		}
+		if kept != 1 || dropped != 1 || strings.Contains(out.String(), "tool.sh") {
+			t.Errorf("kept=%d dropped=%d output:\n%s", kept, dropped, out.String())
+		}
+	})
+
+	t.Run("paths with spaces resolve via header equality", func(t *testing.T) {
+		t.Parallel()
+		// With core.quotePath=false git leaves a spacey path unquoted and
+		// appends a tab to the ---/+++ headers; parseDiffHeaderPath strips it.
+		patch := "diff --git a/my dir/gen file.go b/my dir/gen file.go\n" +
+			"index 1111111..2222222 100644\n" +
+			"--- a/my dir/gen file.go\t\n" +
+			"+++ b/my dir/gen file.go\t\n" +
+			"@@ -1,1 +1,2 @@\n line\n+more\n"
+		var out strings.Builder
+		_, dropped, err := FilterPatch(strings.NewReader(patch), &out, drop("my dir/gen file.go"))
+		if err != nil {
+			t.Fatalf("FilterPatch: %v", err)
+		}
+		if dropped != 1 || out.String() != "" {
+			t.Errorf("spacey generated path should drop, output:\n%s", out.String())
+		}
+	})
+
+	t.Run("unparseable quoted section is kept, not hidden", func(t *testing.T) {
+		t.Parallel()
+		patch := "diff --git \"a/we\\tird.go\" \"b/we\\tird.go\"\n" +
+			"index 1111111..2222222 100644\n" +
+			"--- \"a/we\\tird.go\"\n" +
+			"+++ \"b/we\\tird.go\"\n" +
+			"@@ -1,1 +1,2 @@\n line\n+more\n"
+		var out strings.Builder
+		kept, dropped, err := FilterPatch(strings.NewReader(patch), &out, func(string) bool { return true })
+		if err != nil {
+			t.Fatalf("FilterPatch: %v", err)
+		}
+		if kept != 1 || dropped != 0 || out.String() != patch {
+			t.Errorf("unparseable section must be kept verbatim, got kept=%d dropped=%d:\n%s", kept, dropped, out.String())
+		}
+	})
+
+	t.Run("added content resembling headers stays content", func(t *testing.T) {
+		t.Parallel()
+		// Inside a hunk, +/- lines are content: an added line reading
+		// "+++ b/gen.pb.go" must not rebind the section's path.
+		patch := "diff --git a/hand.md b/hand.md\n" +
+			"index 1111111..2222222 100644\n" +
+			"--- a/hand.md\n" +
+			"+++ b/hand.md\n" +
+			"@@ -1,1 +1,3 @@\n line\n++++ b/gen.pb.go\n+diff --git a/x b/x\n"
+		var out strings.Builder
+		kept, dropped, err := FilterPatch(strings.NewReader(patch), &out, drop("gen.pb.go"))
+		if err != nil {
+			t.Fatalf("FilterPatch: %v", err)
+		}
+		if kept != 1 || dropped != 0 || out.String() != patch {
+			t.Errorf("content lines must not affect sectioning, got kept=%d dropped=%d:\n%s", kept, dropped, out.String())
+		}
+	})
+}
+
+// TestParseDiffGitPaths pins the fallback parser's conservatism: unambiguous
+// lines resolve, the equal-halves rule handles spacey non-renames, and quoted
+// or ambiguous lines yield nil (the caller keeps those sections).
+func TestParseDiffGitPaths(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		line string
+		want []string
+	}{
+		{"simple", "diff --git a/x.go b/x.go", []string{"x.go"}},
+		{"spacey same path", "diff --git a/my dir/f.gz b/my dir/f.gz", []string{"my dir/f.gz"}},
+		{"rename single separator", "diff --git a/old.go b/new.go", []string{"old.go", "new.go"}},
+		{"pathological b-slash name", "diff --git a/g.gz b/g.gz b/g.gz b/g.gz", []string{"g.gz b/g.gz"}},
+		{"quoted gives up", `diff --git "a/we\tird" "b/we\tird"`, nil},
+		{"not a diff line", "not a header", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := parseDiffGitPaths(tt.line)
+			if len(got) != len(tt.want) {
+				t.Fatalf("parseDiffGitPaths(%q) = %q, want %q", tt.line, got, tt.want)
+			}
+			for i := range tt.want {
+				if got[i] != tt.want[i] {
+					t.Errorf("parseDiffGitPaths(%q)[%d] = %q, want %q", tt.line, i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+// TestRenameClassifiedConservatively is the anti-gaming guard for renames.
+// `git diff --numstat` books a rename's deletions against the DESTINATION, so
+// moving production code into a test directory would otherwise erase those
+// lines from the count.
+func TestRenameClassifiedConservatively(t *testing.T) {
+	t.Parallel()
+	files := []FileChange{
+		// Production code moved INTO a test dir: must still count.
+		{Path: "tests/big.go", OldPath: "src/big.go", Added: 20, Deleted: 900},
+		// A genuine move within the test tree: still a test.
+		{Path: "tests/b.go", OldPath: "tests/a.go", Added: 5, Deleted: 5},
+		// Non-rename test file: unaffected.
+		{Path: "tests/c.go", Added: 10},
+	}
+	classify(files, "", "", attrPolicy{}, Extras{}, false)
+
+	want := map[string]bool{"tests/big.go": false, "tests/b.go": true, "tests/c.go": true}
+	for _, f := range files {
+		if f.Test != want[f.Path] {
+			t.Errorf("%s (from %q): Test = %v, want %v", f.Path, f.OldPath, f.Test, want[f.Path])
+		}
+	}
+	res := Evaluate(files, Policy{Max: 1000, ExcludeTests: true})
+	if res.Counted != 920 {
+		t.Errorf("Counted = %d, want 920 — the 900 deleted production lines must not vanish", res.Counted)
+	}
+}
+
+// TestRenameIntoExclusionBucketsStillCounts covers every exclusion path a
+// rename could hide behind. numstat books a rename's deletions against the
+// DESTINATION, so moving production code into any excluded bucket would
+// otherwise erase those lines from the count.
+func TestRenameIntoExclusionBucketsStillCounts(t *testing.T) {
+	t.Parallel()
+	extras, err := ParseExtras("", "dist/**")
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := []FileChange{
+		{Path: "go.sum", OldPath: "src/big.go", Added: 0, Deleted: 900}, // into a lockfile
+		{Path: "dist/big.go", OldPath: "internal/big.go", Deleted: 800}, // into an extra glob
+		{Path: "tests/big.go", OldPath: "src/big.go", Deleted: 700},     // into a test dir
+		{Path: "go.sum", OldPath: "go.sum", Added: 10},                  // a genuine lockfile churn
+	}
+	classify(files, "", "", attrPolicy{}, extras, false)
+
+	for i, f := range files[:3] {
+		if f.Generated || f.Test {
+			t.Errorf("files[%d] %s (from %s): excluded as generated=%v test=%v — production deletions must still count",
+				i, f.Path, f.OldPath, f.Generated, f.Test)
+		}
+	}
+	if !files[3].Generated {
+		t.Errorf("a lockfile renamed from itself should stay generated")
 	}
 }
