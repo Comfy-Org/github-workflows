@@ -1,10 +1,11 @@
 name: Test groom scripts
 
-# Runs the unit tests for the groom dedup/rejection ledger (ledger.py) and the
-# runtime cadence gate (interval.py). The ledger is the durable memory that stops
-# the stateless groom CI run from re-filing already-filed or human-rejected
-# findings every run, so a regression here would silently re-open the spam it
-# exists to prevent — cheap to guard with a unit run on change. It also runs the
+# Runs the unit tests behind groom's building blocks: the dedup/rejection ledger
+# (ledger.py), the cadence gate (interval.py) and the path scoper (scope.py).
+# Each is durable memory or a gate whose regression is SILENT — the ledger
+# re-opens the spam it exists to prevent, the cadence gate over- or under-runs a
+# billed audit, and the path scoper would let a scoped run stamp "done" over a
+# whole-repo one. Cheap to guard with a unit run on change. It also runs the
 # config tests and the BE-5373 pin guard, which is why the path filter reaches
 # outside `.github/groom/` — see the comment on those entries.
 
@@ -14,10 +15,13 @@ on:
       - '.github/groom/**'
       # `groom.yml` and `dependabot.yml` are trigger paths because this suite
       # asserts ACROSS files, in two independent places:
-      #   * BE-4814 — interval.py pins literals the workflow PRODUCES and the
-      #     module CONSUMES (today the finder's agent step name), so a rename in
-      #     groom.yml has to run these tests to be caught, not merge unwatched
-      #     because the change touched no file under .github/groom/.
+      #   * BE-4757/BE-4814 — interval.py pins literals the workflow PRODUCES
+      #     and the module CONSUMES (the scoped-job-name marker and the
+      #     finder's agent step name), and test_scope.py asserts against
+      #     groom.yml's own wiring (the SIG_SCOPE input that keeps dedup
+      #     signatures scope-independent) — a groom.yml-only edit has to run
+      #     these tests to be caught, not merge unwatched because the change
+      #     touched no file under .github/groom/.
       #   * BE-5373 — test_claude_code_pin.py requires the CLI version to exist
       #     only in .github/groom/package.json AND dependabot.yml to keep
       #     watching it. Without both here, the regression the guard exists to
@@ -32,10 +36,13 @@ on:
       - '.github/groom/**'
       # `groom.yml` and `dependabot.yml` are trigger paths because this suite
       # asserts ACROSS files, in two independent places:
-      #   * BE-4814 — interval.py pins literals the workflow PRODUCES and the
-      #     module CONSUMES (today the finder's agent step name), so a rename in
-      #     groom.yml has to run these tests to be caught, not merge unwatched
-      #     because the change touched no file under .github/groom/.
+      #   * BE-4757/BE-4814 — interval.py pins literals the workflow PRODUCES
+      #     and the module CONSUMES (the scoped-job-name marker and the
+      #     finder's agent step name), and test_scope.py asserts against
+      #     groom.yml's own wiring (the SIG_SCOPE input that keeps dedup
+      #     signatures scope-independent) — a groom.yml-only edit has to run
+      #     these tests to be caught, not merge unwatched because the change
+      #     touched no file under .github/groom/.
       #   * BE-5373 — test_claude_code_pin.py requires the CLI version to exist
       #     only in .github/groom/package.json AND dependabot.yml to keep
       #     watching it. Without both here, the regression the guard exists to
@@ -77,7 +84,7 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Run groom ledger unit tests
+      - name: Run groom script unit tests
         run: python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
 
   # Deterministic proofs of the agent-sandbox.sh confinement contract and the

@@ -111,10 +111,9 @@ rules:
       - .github/workflows/agents-md-integrity.yml
       - .github/workflows/test-agents-md-integrity.yml
       - .github/workflows/stale.yml
+      # The reusable only — this repo is deliberately not self-enrolled, so
+      # there is no `ci-` prefixed caller here to route.
       - .github/workflows/detect-unreviewed-merge.yml
-      # Its `ci-` prefixed self-enrollment caller, named outright for the same
-      # reason ci-assign-reviewers.yml is below: no glob here reaches it.
-      - .github/workflows/ci-detect-unreviewed-merge.yml
     reviewers:
       - wei-hai
       - deepme987
