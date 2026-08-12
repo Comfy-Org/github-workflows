@@ -33,10 +33,10 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@0096e1a0098b7fb22fc3740d63e84b349feaad04 # github-workflows main (0096e1a)
+    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@c6b3effa6d2e9fff97500d9688b54106f556c433 # github-workflows main (c6b3eff)
     with:
       # Keep the assets ref in lock-step with the `uses:` ref above.
-      workflows_ref: 0096e1a0098b7fb22fc3740d63e84b349feaad04
+      workflows_ref: c6b3effa6d2e9fff97500d9688b54106f556c433
       # No vendored/generated content in this repo; defensive excludes only.
       diff_excludes: >-
         :!**/*-lock.json
