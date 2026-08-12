@@ -27,9 +27,9 @@ forward automatically instead of silently drifting commits behind.
 
 | Entrypoint | Triggers on a change to | Caller variable | Seeded |
 |---|---|---|---|
-| [`bump-cursor-review-callers.yml`](../workflows/bump-cursor-review-callers.yml) | `cursor-review.yml` or `cursor-review/**` | `CURSOR_REVIEW_CALLERS` | non-empty (hard-fails if empty) |
+| [`bump-cursor-review-callers.yml`](../workflows/bump-cursor-review-callers.yml) | `cursor-review.yml`, `cursor-review/**` or `scripts/check-pr-size/**` (minus its `*_test.go`, which no caller executes) | `CURSOR_REVIEW_CALLERS` | non-empty (hard-fails if empty) |
 | [`bump-agents-md-callers.yml`](../workflows/bump-agents-md-callers.yml) | `agents-md-integrity.yml` or `agents-md-integrity/**` | `AGENTS_MD_CALLERS` | empty `[]` (grows as callers land) |
-| [`bump-pr-size-callers.yml`](../workflows/bump-pr-size-callers.yml) | `pr-size.yml` or `scripts/check-pr-size/**` | `PR_SIZE_CALLERS` | empty `[]` (grows as callers land) |
+| [`bump-pr-size-callers.yml`](../workflows/bump-pr-size-callers.yml) | `pr-size.yml` or `scripts/check-pr-size/**` (minus its `*_test.go`, which no caller executes) | `PR_SIZE_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-pr-risk-callers.yml`](../workflows/bump-pr-risk-callers.yml) | `pr-risk.yml` or `scripts/pr-risk/**` (minus its `tests/` and `README.md`, which no caller executes) | `PR_RISK_CALLERS` | empty `[]` allowed (grows as callers land) |
 | [`bump-assign-reviewers-callers.yml`](../workflows/bump-assign-reviewers-callers.yml) | `assign-reviewers.yml` | `ASSIGN_REVIEWERS_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-groom-callers.yml`](../workflows/bump-groom-callers.yml) | `groom.yml` or `groom/**` | `GROOM_CALLERS` | empty `[]` (grows as callers land) |
@@ -159,19 +159,53 @@ re-point that pins callers to the verified tip instead of a stale `github.sha`.
 |---|---|
 | `WATCHED` | **required** — repo-relative path of the watched reusable workflow (e.g. `.github/workflows/groom.yml`) |
 | `WATCHED_ASSETS` | optional — the watched assets, a **newline-separated list** of literal paths, one per line (blank lines and surrounding whitespace ignored). A single-line value is just a one-element list, so `WATCHED_ASSETS: .github/groom` keeps working unchanged; a fleet watching more than one spells it as a YAML **literal** block scalar — `\|`, never the folded `>`, which joins the lines into one space-separated string (see below). Empty/unset means the fleet watches nothing beyond `WATCHED` |
+| `WATCHED_PATHSPECS` | optional — newline-separated git **pathspecs** (`:(exclude)` entries allowed) covering what the fleet's `paths:` filter watches. When set, they replace the `WATCHED`/`WATCHED_ASSETS` object comparison as the staleness test. Every positive entry must select a tracked path, and the list must select `WATCHED` **and something under every `WATCHED_ASSETS` entry**. Used by `pr-risk`, `pr-size` and `cursor-review` |
+| `WATCHED_EXEC` | optional — newline-separated repo-relative **files** a pinned caller actually executes. When set, each is probed for deletion at the tip and — unless the run was re-pointed, which makes that tip the pin target — locally too, in addition to `WATCHED`/`WATCHED_ASSETS`. **Only `pr-risk` needs this today** |
 | `NEW_SHA` | the candidate SHA, normally `github.sha` |
 | `GITHUB_SHA`, `GITHUB_OUTPUT` | provided by Actions |
 
-Both watched paths are **literal paths, not the globs from the `paths:` filter** —
+`WATCHED`, `WATCHED_ASSETS` and every `WATCHED_EXEC` entry are **literal,
+repo-relative paths, not the globs from the `paths:` filter** —
 `.github/groom`, never `.github/groom/**` and never a trailing slash. A glob
 resolves to nothing (`[[ -d '.github/groom/**' ]]` is false,
 `git rev-parse 'HEAD:.github/groom/**'` is empty), so it would make every
-comparison verify nothing and the fleet a permanent silent no-op. The script
-rejects that shape up front rather than reporting it as a decommission, and it
+comparison verify nothing and the fleet a permanent silent no-op. An absolute or
+`../` path fails the other way: no tree contains one, while the local `-f`/`-d`
+probe resolves it *outside* the checkout, so the two halves of the same check
+disagree and the verdict turns on whether main happened to move. A
+`WATCHED_EXEC` entry naming a **directory** is rejected for the same reason (it
+resolves to a tree at the tip — present — and fails `[[ -f ]]` locally —
+absent); `WATCHED_ASSETS` is the input for a directory. The script rejects each
+of these shapes up front rather than reporting it as a decommission, and it
 likewise rejects a `NEW_SHA` that is not a full 40-character lowercase SHA (it is
 emitted verbatim into `$GITHUB_OUTPUT`, so a newline in it injects output lines)
 and a `HEAD` that is not `GITHUB_SHA` (a `ref:` override in the consuming
 checkout would have it compare main against itself).
+
+`WATCHED_PATHSPECS` is the one input where glob syntax is legal — the pathspecs go
+to `git diff`, which does the matching itself — but only `:(exclude)<path>` magic
+is accepted there (`:!`, `:(glob)`, `:/` are rejected: a magic prefix this script
+has not reasoned about, or a typo in one, silently changes or empties what gets
+compared). `!path`, the `paths:` filter's *own* negation syntax, is rejected too
+and its message names the `:(exclude)` spelling — git reads the `!` literally, so
+such an entry excludes nothing and matches nothing. A list of *only* exclusions
+is rejected as well — git reads that as "every path except these", the widest
+possible watched surface. Both list inputs ignore blank lines, indentation and
+whole-line `#` comments, so the fleet's `paths:` filter can be pasted into a YAML
+block scalar with its comments intact; a variable that is **set but blank** is a
+hard error rather than a fall-back to unset, because every way that shape arises
+means a check the entrypoint asked for would silently not happen.
+
+Two more things about `WATCHED_PATHSPECS` are **enforced, not merely documented**,
+because both fail green: every positive entry must select at least one tracked
+path (in this run's tree or the tip's), and the list as a whole must select
+`WATCHED` — plus, when `WATCHED_ASSETS` is also set, something under it.
+`git diff --quiet` exits 0 both for "nothing changed under these pathspecs" and
+for "these pathspecs match nothing", and the second reads as *unchanged*, so a
+typo, a directory rename, a positive an `:(exclude)` swallows entirely, or a list
+that simply omits the reusable would re-point every caller to a tip at which
+nothing was compared. The check asks `git diff` itself what the list selects, so
+coverage is never judged by looser rules than the verdict.
 
 | Output (step output) | |
 |---|---|
@@ -259,30 +293,95 @@ exactly as the runtime does, or it certifies a config preflight.sh misparses.
 
 They must not be **wider** than the filter either, which is the direction an
 excluding fleet gets wrong. A commit touching only an excluded path (pr-risk's
-`scripts/pr-risk/tests`, its `README.md`) starts no run of its own, but it does
+`scripts/pr-risk/tests` and its `README.md`; pr-size's and cursor-review's
+`scripts/check-pr-size/*_test.go`) starts no run of its own, but it does
 change the tree OID of an over-broad `WATCHED_ASSETS` — so this run reports "the
 watched surface changed since", skips green as a stale re-run, and waits on a
 later run that will never exist. An exclusion is a reason to narrow the inputs, or
-to leave that fleet on its own guard; never to point `WATCHED_ASSETS` at the whole
+to carry it into `WATCHED_PATHSPECS`; never to point `WATCHED_ASSETS` at the whole
 directory.
 
 **`test_paths_contract.sh` enforces both directions.** These pairs are
 hand-written, one per entrypoint, and until BE-6476 the only thing holding them
 in step was the checklist line above — `test_preflight.sh` drives synthetic
 fixtures and never reads the entrypoints. The contract test does: it parses each
-`bump-*-callers.yml`'s `push:` `paths:` filter, normalizes `…/**` to the literal
-path, and requires set equality with that file's `WATCHED` + `WATCHED_ASSETS`
+`bump-*-callers.yml`'s `push:` `paths:` filter, normalizes each POSITIVE entry's
+`…/**` to the literal path, and requires set equality with that file's `WATCHED`
++ `WATCHED_ASSETS` (the negations are held against `WATCHED_PATHSPECS` instead,
+below — they are precisely what those two inputs cannot express)
 (splitting a multi-line `WATCHED_ASSETS` into one entry per line, and reading the
 `|` block-scalar spelling as well as the single-line one — the parser mirrors
 preflight.sh deliberately, including honoring only `|`, taking block content
 literally, and stripping a trailing `# comment` from a single-line value; a
 parser that read the file more permissively than the runtime does would certify
 a config the runtime misparses, which is worse than no test at all).
-A fleet on preflight whose filter grows a `:(exclude)` entry fails too (the
-freeze case above), as does a *new* entrypoint that runs no preflight at all —
-the pr-risk exemption is an explicit allow-list entry, not a silent skip, so
-migrating it later fails the test until the entry is removed. Widen a filter and
-the test tells you to widen the inputs in the same change.
+A *new* entrypoint that runs no preflight at all fails too — the pr-risk
+exemption is an explicit allow-list entry, not a silent skip, so migrating it
+later fails the test until the entry is removed. Widen a filter and the test
+tells you to widen the inputs in the same change.
+
+**A filter with `!` negations must carry an equivalent `WATCHED_PATHSPECS`
+(BE-7084).** Before that input existed, a `:(exclude)` on a preflight fleet was
+rejected outright: a tree-OID comparison cannot express an exclusion, so such a
+fleet would have frozen as a permanent stale re-run. It is no longer rejected —
+it is *required to be expressible*. For a preflight fleet whose filter carries
+`!` entries the test REQUIRES `WATCHED_PATHSPECS` and compares the two as sets:
+each positive filter entry normalized (`x/**` → `x`) must appear as a positive
+pathspec, each `!x` must appear as `:(exclude)x`, and neither side may carry an
+entry the other lacks. A **file glob** in an exclusion is kept verbatim
+(`!scripts/check-pr-size/*_test.go` ↔ `:(exclude)scripts/check-pr-size/*_test.go`)
+— reducing it to the parent directory would widen the exclusion to swallow the
+whole tool and the fleet would never bump again, so the two do NOT compare equal.
+The one thing that IS normalized is a trailing `/**`, on both sides and exactly as
+it is for a positive, because `x/**` and `x` select the same set in either syntax:
+`!scripts/pr-risk/tests/**` is satisfied by `:(exclude)scripts/pr-risk/tests` (the
+spelling pr-risk's own guard and the example below use) or by
+`:(exclude)scripts/pr-risk/tests/**`, and by nothing wider. Whole-line `#`
+comments in the block are ignored here exactly as `preflight.sh` ignores them, so
+a filter pasted in with its comments intact still compares clean. A `!`-carrying
+fleet with **no** `WATCHED_PATHSPECS` still fails, naming the freeze — that is the
+case the old flat rejection existed to prevent, and it is the one that has to keep
+failing. A fleet with no `!` that sets `WATCHED_PATHSPECS` anyway is held to the
+same equivalence, so the input cannot drift away from the filter unnoticed.
+
+**Keep a `*` exclusion's directory flat.** Set-equality of the two spellings is
+textual, and there is one case where equal text selects *different* sets: a
+`paths:` filter's `*` does not cross `/`, while a bare git pathspec's does
+(`:(glob)` would fix that, and `preflight.sh` rejects that magic). While
+`scripts/check-pr-size` is flat, `!…/*_test.go` and `:(exclude)…/*_test.go` agree.
+Put a `*_test.go` in a *subdirectory* and they stop: the trigger fires on it,
+the staleness diff has already excluded it, and the run re-points having compared
+nothing that moved — the pure-churn bump BE-7084 removed, one directory down.
+`test_paths_contract.sh` measures the tree for exactly this and fails the build
+the day it becomes true, so it cannot happen quietly.
+
+**An excluding fleet passes `WATCHED_PATHSPECS`; a per-file fleet passes
+`WATCHED_EXEC`.** `pr-risk` needs both — and they are what let it move onto this
+script instead of keeping its own guard. `pr-size` and `cursor-review` need the
+first (BE-7084): each excludes `scripts/check-pr-size/*_test.go`, since a pinned
+caller builds and runs that tool and never runs `go test`, so a test-only commit
+would otherwise mint a token and fan a pure-churn bump PR to every consumer.
+
+- Its `paths:` filter negates `scripts/pr-risk/tests/**` and the tool README, and
+  no object comparison can express a negation. `WATCHED_PATHSPECS` is handed
+  verbatim to `git diff`, so the staleness test asks precisely what the filter
+  asks. **It MUST mirror the filter, exclusions included** — the same coupling as
+  above, and dropping one `:(exclude)` line reinstates the false-stale freeze
+  exactly. The half of that MUST which fails *green* — a list that selects
+  nothing, or that never reaches `WATCHED` — is enforced rather than trusted (see
+  the input rules above). It compares two trees and walks no history, so it
+  composes with the deepening but does not need it.
+- Its decommission surface is the three grader scripts a caller executes, not the
+  directory holding them: a commit deleting the graders while leaving `tests/` and
+  the README behind satisfies a `-d scripts/pr-risk` probe and would bump every
+  caller onto a SHA where the tools are gone. `WATCHED_EXEC` names those files, and
+  they are probed at the tip (before the staleness test, so a deletion warns rather
+  than reading as "a newer commit has its own run") and again in this run's tree —
+  the latter only when the run was *not* re-pointed, since a re-point makes that
+  same tip the SHA callers are pinned to and this checkout no longer the thing
+  worth probing.
+
+Every other fleet leaves both unset and behaves exactly as before.
 
 Consumption is two steps — the guard, then the bump gated on its output:
 
@@ -304,6 +403,30 @@ Consumption is two steps — the guard, then the bump gated on its output:
           NEW_SHA: ${{ steps.preflight.outputs.new_sha }}
           # …VAR_NAME / TAG / WORKFLOW_FILE / CALLERS_JSON as before
         run: bash .github/bump-callers/bump-callers.sh
+```
+
+An excluding / per-file fleet swaps the guard step's `env:` block for the list
+inputs (everything else, including the gated bump step, is unchanged):
+
+```yaml
+      - name: Preflight (staleness / decommission guard)
+        id: preflight
+        env:
+          WATCHED: .github/workflows/pr-risk.yml
+          # MIRRORS the fleet's `paths:` filter, exclusions included.
+          WATCHED_PATHSPECS: |
+            .github/workflows/pr-risk.yml
+            scripts/pr-risk
+            :(exclude)scripts/pr-risk/tests
+            :(exclude)scripts/pr-risk/README.md
+          # The files a pinned caller actually executes.
+          WATCHED_EXEC: |
+            .github/workflows/pr-risk.yml
+            scripts/pr-risk/grade-pr-risk.sh
+            scripts/pr-risk/grade-targets.sh
+            scripts/pr-risk/resolve-enabled.sh
+          NEW_SHA: ${{ github.sha }}
+        run: bash .github/bump-callers/preflight.sh
 ```
 
 `new_sha` is a **step output**, not a `$GITHUB_ENV` export, and the consuming
@@ -335,7 +458,9 @@ way, and `test_paths_contract.sh` enforces it.
 >   land-then-revert; it is not a claim that comparing objects expresses
 >   everything a rev-list *pathspec* can. Swapping an excluding fleet across means
 >   narrowing its inputs to what its filter really watches (above), not adding
->   rev-list back.
+>   rev-list back — and since BE-6676 it can express that filter directly, with
+>   `WATCHED_PATHSPECS` + `WATCHED_EXEC`, instead of narrowing anything away. The
+>   staleness test there is still a two-tree comparison, not a history walk.
 
 ## How the pin rewrite is scoped (and why it asserts afterwards)
 
