@@ -41,9 +41,18 @@
 # `if [[ -n "$REF" ]] && echo "$REF" >> "$GITHUB_STEP_SUMMARY"` passed), its TRIGGER was itself a
 # blacklist (so `printenv WORKFLOWS_REF` and `set -euxo pipefail` were invisible), and a `has`
 # needle proves a test is PRESENT, never that it is the only path to the checkout. A trust
-# boundary this small — nine executable lines — is better served by an equality: the body is what
-# it is below, or the build is red. Widening it is then a deliberate two-place edit whose diff a
-# reviewer sees, which is the property all those scans were reaching for.
+# boundary this small — a couple of dozen executable lines — is better served by an equality: the
+# body is what it is below, or the build is red. Widening it is then a deliberate two-place edit
+# whose diff a reviewer sees, which is the property all those scans were reaching for.
+#
+# THE NAMED PROPERTIES ARE RESTATEMENTS, NOT THE DEFENCE. A few of the patterns disparaged above
+# do appear below — the ancestry anchor, the literal-URL check, "every `::error::` is followed by
+# an `exit 1`". They are not a second line of defence and must never be read as one: the equality
+# already fails on every mutation they catch, and each of them is exactly as bypassable as the
+# earlier drafts showed. They are here so that the COMMON failure — someone editing the guard on
+# purpose — reports WHICH invariant they broke instead of only printing a diff of the whole body.
+# A new property in this file is worth adding when it names a rule; it is never worth adding as a
+# substitute for extending the pinned body.
 #
 # STRUCTURE IS PINNED; PROSE IS NOT. The `::error::` message is free to be reworded (it is
 # canonicalized away before the comparison) but is separately checked to expand nothing but the
@@ -177,6 +186,44 @@ expect="$(cat <<'PINNED'
             echo "::error::<message>"
             exit 1
           fi
+          if ! scratch=$(mktemp -d); then
+            echo "::error::<message>"
+            exit 1
+          fi
+          trap 'rm -rf "$scratch"' EXIT
+          if ! git init -q "$scratch"; then
+            echo "::error::<message>"
+            exit 1
+          fi
+          fetch_upstream() {
+            for attempt in 1 2 3; do
+              if timeout 40 git -C "$scratch" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 fetch --quiet --no-tags --filter=blob:none "$@"; then
+                return 0
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                sleep $((attempt * 5))
+              fi
+            done
+            return 1
+          }
+          if ! fetch_upstream --depth=1 https://github.com/Comfy-Org/github-workflows "$WORKFLOWS_REF"; then
+            echo "::error::<message>"
+            exit 1
+          fi
+          if ! fetch_upstream https://github.com/Comfy-Org/github-workflows +refs/heads/main:refs/heads/upstream-main; then
+            echo "::error::<message>"
+            exit 1
+          fi
+          ancestry_rc=0
+          GIT_NO_LAZY_FETCH=1 git -C "$scratch" merge-base --is-ancestor "$WORKFLOWS_REF" upstream-main || ancestry_rc=$?
+          if [ "$ancestry_rc" -gt 1 ]; then
+            echo "::error::<message>"
+            exit 1
+          fi
+          if [ "$ancestry_rc" -ne 0 ]; then
+            echo "::error::<message>"
+            exit 1
+          fi
 PINNED
 )"
 # Blank lines are noise here (the slicer keeps them so the byte-identity check above sees them),
@@ -200,6 +247,65 @@ if [ -n "$errline" ] && [ "${stripped#*\$}" = "$stripped" ]; then
 else
   bad "the annotation expands nothing but the sanitized copy" "$errline"
 fi
+
+# --- the ancestry axis, stated by name ---------------------------------------------------------
+# Every assertion below is a CONSEQUENCE of the equality above — deleting the ancestry block from
+# both copies already fails it. They are restated by name for the same reason the env-binding rule
+# is: a failure that says "the guard no longer asserts ancestry" beats one that only prints a diff,
+# and the axis is the whole reason a fork-authored SHA cannot be checked out here. Each one carries
+# its own coverage self-check, so a stale anchor fails loudly rather than passing vacuously.
+ANCESTRY_LINE='          GIT_NO_LAZY_FETCH=1 git -C "$scratch" merge-base --is-ancestor "$WORKFLOWS_REF" upstream-main || ancestry_rc=$?'
+nancestry=$(grep -cxF "$ANCESTRY_LINE" "$WF")
+eq "every copy of the guard asserts the pin is an ancestor of upstream main" "$guards" "$nancestry"
+
+# THE URL MUST BE A LITERAL. `github.repository` names the CALLER inside a reusable workflow and
+# `github.job_workflow_ref` only repeats the caller's `uses:` string, so nothing in the `github`
+# context can name THIS repo — which makes any expression in this position an alias a fork could
+# point back at itself, turning "is it an ancestor of upstream main?" into "is it an ancestor of
+# the attacker's main?". Comments are stripped first so the prose above the axis, which names the
+# URL, cannot satisfy this.
+#
+# PER LINE, NOT AS A SET — and that distinction is the whole check. An earlier draft `sort -u`'d the
+# URL-shaped tokens out of ALL the fetch lines and compared the result to the literal, which made
+# the assertion pass as long as ONE line still carried it: swap a single call for
+# `${{ github.server_url }}/${{ github.repository }}` (neither fragment URL-shaped, so it
+# contributes nothing to the set) and the remaining copies covered for it, with the coverage count
+# green too. So it is counted instead: every call line carries the literal, AND no OTHER URL-shaped
+# token appears on any of them.
+UPSTREAM_URL='https://github.com/Comfy-Org/github-workflows'
+FETCH_CALL='if ! fetch_upstream '
+fetchlines="$(grep -v '^[[:space:]]*#' "$WF" | grep -F "$FETCH_CALL")"
+nfetch=$(printf '%s\n' "$fetchlines" | grep -cF "$FETCH_CALL")
+if [ "$nfetch" = "$((guards * 2))" ]; then ok "the ancestry fetch scan matched both fetches in every copy ($nfetch)"
+else bad "the ancestry fetch scan matched both fetches in every copy" "$nfetch of $((guards * 2)) — anchors are stale, coverage is vacuous"; fi
+nurl=$(printf '%s\n' "$fetchlines" | grep -cF "$UPSTREAM_URL")
+eq "EVERY ancestry fetch names the upstream repo by literal URL, never an expression" "$nfetch" "$nurl"
+urltokens="$(printf '%s\n' "$fetchlines" | tr ' ' '\n' | grep -E '://|github\.com' | sort -u | tr '\n' ' ' | sed 's/ $//')"
+eq "no ancestry fetch names any URL other than the upstream one" "$UPSTREAM_URL" "$urltokens"
+
+# EVERY REJECTION PATH IS FATAL — a rejection that annotates without exiting lets the checkout
+# proceed on exactly the ref it just rejected. The `if (pending)` in the first rule is not
+# redundant: without it two CONSECUTIVE `::error::` lines would overwrite the first one's line
+# number unreported, so a `echo ::error::A; echo ::error::B; exit 1` sequence — one annotation, no
+# exit — would read as clean.
+fatal="$(printf '%s\n' "$code" | awk '
+  /::error::/ { if (pending) print "NOEXIT:" pending; pending = NR; next }
+  pending && $0 !~ /^[[:space:]]*exit 1[[:space:]]*$/ { print "NOEXIT:" pending }
+  { pending = 0 }
+  END { if (pending) print "NOEXIT:" pending }
+' | tr '\n' ' ' | sed 's/ $//')"
+eq "every ::error:: in the guard is immediately followed by exit 1" "" "$fatal"
+# The expected count is READ OFF THE PIN, not hardcoded. A literal threshold goes stale silently:
+# the previous `-ge 3` was written when the guard had three rejection paths and stayed green as it
+# grew to seven, so deleting one would have passed — the exact vacuous pass this line exists to
+# stop. Deriving it from `$expect` makes adding or removing a path a one-place edit, with the floor
+# below keeping the derivation itself from degenerating.
+nerr=$(printf '%s\n' "$code" | grep -cF '::error::')
+nerr_pinned=$(printf '%s\n' "$expect" | grep -cF '::error::')
+if [ "$nerr_pinned" -ge 3 ]; then ok "the pinned body still declares a plausible number of rejection paths ($nerr_pinned)"
+else bad "the pinned body still declares a plausible number of rejection paths" "$nerr_pinned — the pin itself has been gutted"; fi
+eq "the fatality scan saw every rejection path the pin declares" "$nerr_pinned" "$nerr"
+no "no path through the guard exits 0 early" "$code" "exit 0"
 
 # --- the guard cannot be neutered while staying byte-identical --------------------------------
 # The cheapest way to disarm this without tripping any check above is a step-level key:

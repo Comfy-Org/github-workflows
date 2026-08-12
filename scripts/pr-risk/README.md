@@ -34,9 +34,16 @@ record.
 2. **Provenance** — what PROCESS produced the diff: `runbook` (a registered
    producer in [`runbook-registry.v0.json`](runbook-registry.v0.json) whose
    identity AND diff shape both assert), `agent-supervised`, `human`, or
-   `external` (fork / first-time contributor — R3, no exceptions, even when a
-   runbook shape matches). Identity is the server-attributed author login,
-   never the forgeable commit author string.
+   `external` (any fork, or a first-time **human** contributor — R3, no
+   exceptions, even when a runbook shape matches). Identity is the
+   server-attributed author login, never the forgeable commit author string.
+   A **non-fork bot is never `external`**, even though every GitHub App authors
+   with `author_association: NONE` — it is a runbook candidate, judged by the
+   registry's shape assertion, and falls back to `human` when no entry asserts.
+   "Is this a bot?" is answered from GitHub's own actor type (`Bot`) plus the
+   `bot_logins` list, so an App needs no list entry and a machine *user* account
+   does. The fork half is unconditional, so a bot opening a PR *from a fork* is
+   still `external` R3.
 3. **Reversibility** — mutates persistent state or deletes data → R3; **removes**
    a file under a sensitive class → R3 (a delete, or a rename out of that class);
    no green check rollup → R2; green but no test file touched → R1; green with
@@ -177,7 +184,14 @@ them by committing:
 - `.github/risk.json` — the repo's own path→tier map (same schema as
   [`risk-map.v0.json`](risk-map.v0.json))
 - `.github/risk-runbooks.json` — the repo's own producer registry (same schema
-  as [`runbook-registry.v0.json`](runbook-registry.v0.json))
+  as [`runbook-registry.v0.json`](runbook-registry.v0.json)). **Name a GitHub App
+  by its suffixed login** — `"my-bot[bot]"`, the form REST and the web UI show
+  you. The grader reads the PR over GraphQL, which reports a Bot login
+  **unsuffixed**, and restores the suffix before matching — one way only, and
+  only for an author GitHub's own actor type calls a `Bot`. A bare slug
+  (`"my-bot"`) still matches literally, because a machine **user** account has no
+  suffix and needs it; but a bare slug is equally matchable by a same-named
+  *human*, who would then inherit that runbook — so never name an App with one.
 
 Both are read from the PR's **base ref**, so a PR cannot edit the rules that
 judge it (editing them — or the grader — at all is R3 by the map's own first

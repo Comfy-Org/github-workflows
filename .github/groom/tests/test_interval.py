@@ -170,9 +170,17 @@ class RunAuditedTest(unittest.TestCase):
         self.assertTrue(interval.run_audited([billed_finder_job()]))
         self.assertFalse(interval.run_audited([finder_job("failure")]))
 
-    def test_matches_job_id_form(self):
-        # Robust to GitHub rendering the nested job by id rather than display name.
-        self.assertTrue(interval.run_audited([{"name": "groom / audit_find", "conclusion": "success"}]))
+    def test_bare_job_id_form_is_unknown_scope_and_counts_for_nothing(self):
+        # groom.yml sets a `name:` on the finder job, so the jobs API renders the
+        # DISPLAY name and the `(scoped: …)` marker is readable. The bare job-id
+        # form is the hypothetical where it is not — and a name with no marker is
+        # not evidence of a WHOLE-REPO run, only evidence that the name never went
+        # through the `name:` expression. Attributing it to whole-repo is how a
+        # scoped run would silently suppress the next full sweep, so it counts for
+        # no scope at all and the gate falls through to its fail-open branch.
+        idform = [{"name": "groom / audit_find", "conclusion": "success"}]
+        self.assertFalse(interval.run_audited(idform))
+        self.assertFalse(interval.run_audited(idform, "services/api"))
 
     def test_skipped_or_missing_does_not_count(self):
         self.assertFalse(interval.run_audited([finder_job("skipped")]))
@@ -180,6 +188,133 @@ class RunAuditedTest(unittest.TestCase):
         self.assertFalse(interval.run_audited([finder_job(None)]))
         self.assertFalse(interval.run_audited([{"name": "groom / Gate", "conclusion": "success"}]))
         self.assertFalse(interval.run_audited([]))
+
+
+class ScopedRunDoesNotResetCadence(unittest.TestCase):
+    """THE headline assertion for BE-4757, and its symmetric twin.
+
+    `workflow_dispatch` bypasses the interval gate by design, so a manual
+    path-scoped groom REACHES the finder. If that run then counted as "the last
+    real groom", the next scheduled WHOLE-REPO tick would be suppressed for a
+    full GROOM_INTERVAL_DAYS — a partial audit stamping "done" over the full one.
+
+    groom.yml renames the finder job `Audit — finder (scoped: <path>)` when
+    `path` is set (the runs API does not return a run's dispatch inputs, so the
+    job name is the only per-run signal both sides can see). The PATH is in the
+    marker, so the clock is per-scope in BOTH directions: the scoped run is
+    invisible to a whole-repo tick, and a permanently scoped caller still finds
+    its own prior runs instead of failing open and re-billing every tick.
+    """
+
+    def scoped_finder_job(self, conclusion="success", path="services/api", steps=None):
+        job = {"name": f"groom / Audit — finder {interval.scoped_job_marker(path)}",
+               "conclusion": conclusion}
+        if steps is not None:
+            job["steps"] = steps
+        return job
+
+    def test_scoped_finder_job_is_not_a_whole_repo_groom(self):
+        self.assertFalse(interval.run_audited([self.scoped_finder_job()]))
+        self.assertFalse(interval.run_audited([self.scoped_finder_job("failure")]))
+
+    def test_scoped_run_does_not_mask_a_whole_repo_run_in_the_same_list(self):
+        # Belt-and-suspenders on the loop's ordering: an unscoped finder job
+        # anywhere in the list still counts.
+        self.assertTrue(interval.run_audited([self.scoped_finder_job(), finder_job("success")]))
+
+    def test_a_scoped_tick_counts_its_OWN_prior_run(self):
+        # The other half: without this, a caller pinning `path` permanently has
+        # every finder job excluded, never finds a countable run, fails open on
+        # every tick, and re-bills the audit daily regardless of interval_days.
+        self.assertTrue(interval.run_audited([self.scoped_finder_job()], "services/api"))
+        # A failure counts too, but (BE-4814) only with evidence the agent step
+        # actually started — a bare `failure` with no steps payload is a
+        # pre-agent death and must NOT count, scoped or not.
+        billed = [pre_agent_step(conclusion="success"), agent_step()]
+        self.assertTrue(interval.run_audited([self.scoped_finder_job("failure", steps=billed)], "services/api"))
+        self.assertFalse(interval.run_audited([self.scoped_finder_job("failure")], "services/api"))
+
+    def test_a_scoped_tick_ignores_a_DIFFERENT_scope_and_the_whole_repo_sweep(self):
+        self.assertFalse(interval.run_audited([self.scoped_finder_job(path="packages/ui")], "services/api"))
+        self.assertFalse(interval.run_audited([finder_job("success")], "services/api"))
+
+    def test_scopes_differing_only_in_CASE_are_separate_clocks(self):
+        # Paths are case-sensitive on the Linux runner and the path charset admits
+        # both cases, so `services/api` and `services/API` are two directories and
+        # two scopes. Matching the marker case-INSENSITIVELY would collapse them
+        # onto one clock and let a run of either suppress the other's due tick —
+        # the silent under-run this module refuses. The mismatch must instead read
+        # as "no prior run of this scope", i.e. fail open.
+        upper = [self.scoped_finder_job(path="services/API")]
+        self.assertFalse(interval.run_audited(upper, "services/api"))
+        self.assertFalse(interval.run_audited([self.scoped_finder_job(path="services/api")], "services/API"))
+        # …and the exact-case match still counts, so the fix costs nothing.
+        self.assertTrue(interval.run_audited(upper, "services/API"))
+
+    def test_permanently_scoped_caller_gets_a_real_cadence(self):
+        # End-to-end: a `path: services/api` caller ran its scoped audit 2 days
+        # ago on a 7-day interval. The scheduled tick must SKIP — the cadence knob
+        # has to work for the configuration the `path` input advertises.
+        runs = [{"id": "2", "status": "completed", "run_started_at": iso(2.0)}]
+        jobs = {"2": [self.scoped_finder_job()]}
+        decision = interval.evaluate(
+            "o/r", "ci-groom.yml", "9", 7.0, "schedule", NOW,
+            "services/api", run=make_gh_stub(runs, jobs),
+        )
+        self.assertFalse(decision["should_run"], decision["reason"])
+        self.assertEqual(decision["last_run_at"], iso(2.0))
+
+    def test_groom_yml_produces_exactly_the_marker_this_module_matches(self):
+        # The producer (a YAML expression) and the consumer (this module) live in
+        # different files and can only be kept honest by pinning the literal.
+        wf = os.path.join(os.path.dirname(__file__), "..", "..", "workflows", "groom.yml")
+        with open(wf, encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("format(' (scoped: {0})', needs.gate.outputs.path)", text)
+        self.assertEqual(interval.scoped_job_marker("services/api"), " (scoped: services/api)".strip())
+        # …and the gate must actually hand the tick's scope to the gate script.
+        # `--path=…`, not `--path …`: a directory named `-foo` is valid per
+        # scope.py's charset and argparse would read the bare form as an option.
+        self.assertIn('--event-name "$EVENT_NAME" --path="$GROOM_PATH"', text)
+
+    def test_a_whole_repo_sweep_does_not_satisfy_a_scoped_callers_cadence(self):
+        # …and the converse: the scoped unit's clock is its own, so a whole-repo
+        # sweep yesterday leaves the scoped tick DUE (fail-open, no prior run).
+        runs = [{"id": "2", "status": "completed", "run_started_at": iso(0.5)}]
+        jobs = {"2": [finder_job("success")]}
+        decision = interval.evaluate(
+            "o/r", "ci-groom.yml", "9", 7.0, "schedule", NOW,
+            "services/api", run=make_gh_stub(runs, jobs),
+        )
+        self.assertTrue(decision["should_run"], decision["reason"])
+
+    def test_scheduled_tick_after_a_scoped_run_is_still_DUE(self):
+        # End-to-end through `evaluate`: a scoped run YESTERDAY, a real whole-repo
+        # groom 8 days ago, interval 7. The scheduled tick must RUN — the scoped
+        # run must not have re-anchored the clock to yesterday.
+        runs = [
+            {"id": "3", "status": "completed", "run_started_at": iso(0.5)},   # scoped dispatch
+            {"id": "2", "status": "completed", "run_started_at": iso(8.0)},   # last real groom
+        ]
+        jobs = {"3": [self.scoped_finder_job()], "2": [finder_job("success")]}
+        decision = interval.evaluate(
+            "o/r", "ci-groom.yml", "9", 7.0, "schedule", NOW, run=make_gh_stub(runs, jobs)
+        )
+        self.assertTrue(decision["should_run"], decision["reason"])
+        self.assertEqual(decision["last_run_at"], iso(8.0))
+
+    def test_control_an_unscoped_run_yesterday_DOES_suppress_the_tick(self):
+        # The same fixture with the recent run UNSCOPED must skip — otherwise the
+        # assertion above would pass for the wrong reason (a broken gate).
+        runs = [
+            {"id": "3", "status": "completed", "run_started_at": iso(0.5)},
+            {"id": "2", "status": "completed", "run_started_at": iso(8.0)},
+        ]
+        jobs = {"3": [finder_job("success")], "2": [finder_job("success")]}
+        decision = interval.evaluate(
+            "o/r", "ci-groom.yml", "9", 7.0, "schedule", NOW, run=make_gh_stub(runs, jobs)
+        )
+        self.assertFalse(decision["should_run"], decision["reason"])
 
 
 class PreAgentFailureTest(unittest.TestCase):
