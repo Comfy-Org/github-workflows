@@ -752,6 +752,35 @@ def _collapsed_candidate_list(candidates, pinned=(), limit=None):
     return "\n".join(rows)
 
 
+def _standing_after_repin(report):
+    """Would an advisory list still hold the issue open after the urgent repin?
+
+    The urgent arm tells the reader the issue will not close once they repin.
+    That claim is made from the PRE-repin snapshot, so it has to survive the
+    repin it is describing: repinning consumes catalog ids out of the very list
+    that is holding the issue open, and a lab with nothing left over closes it
+    after all (BE-6912 review). Counted conservatively — a repin takes AT MOST
+    one id per urgent pin, from that pin's own lab, since that is where
+    `same_lab_available` sources the suggested replacements — so anything still
+    standing here is guaranteed to survive, and a `False` only means "cannot
+    promise", which the caller renders as the weaker, always-true sentence.
+
+    `unpinned_labs` is deliberately not counted: a pin whose lab has no id left
+    can only be replaced from one of those families, so they are exactly the
+    rows a repin might drain.
+    """
+    urgent_per_lab = {}
+    for item in report["delisted"]:
+        urgent_per_lab[item["lab"]] = urgent_per_lab.get(item["lab"], 0) + 1
+    for item in report.get("zdr_risk") or []:
+        lab = lab_of(item["id"])
+        urgent_per_lab[lab] = urgent_per_lab.get(lab, 0) + 1
+    return any(
+        len(group["candidates"]) > urgent_per_lab.get(group["lab"], 0)
+        for group in report["unpinned"]
+    )
+
+
 def _footer(report):
     """The trailing note: what THIS issue asks of the reader, in its own words.
 
@@ -777,18 +806,25 @@ def _footer(report):
         one issue that is also where a genuinely urgent pin failure is reported.
     """
     lead = "_Filed by the weekly `cursor-review-catalog-drift` check."
-    # Whether an advisory list is what is holding the issue open. On any real
+    # Whether an advisory list is what is holding the issue open — the advisory
+    # arm's test; the urgent arm needs the post-repin one. On any real
     # catalog it is (192 ids, 178 of them unpinned same-lab, on 2026-08-10), but
     # a report whose only finding is a stale audit date closes as soon as the
     # date is refreshed — claiming "open indefinitely" there would be this
     # footer's own bug in miniature.
     standing = bool(report["unpinned"] or report.get("unpinned_labs"))
     if report["urgent"]:
+        # Not `standing`: that is the pre-repin snapshot, and the claim below is
+        # about the state AFTER the repin — see `_standing_after_repin`. Says
+        # "above" because `render_body` appends this footer last, so every
+        # section it can point at is above it; and it names the review-me list
+        # only because that is the list `_standing_after_repin` counts, which is
+        # rendered whenever `unpinned` is non-empty.
         closing = (
-            "and it will **not** close itself once you repin — the standing review-me list below "
+            "and it will **not** close itself once you repin — the standing review-me list above "
             "holds it open, as it does on any real catalog. The next run simply rewrites this "
             "issue without the 🚨 section."
-            if standing
+            if _standing_after_repin(report)
             else "and it closes itself on the first run that finds nothing at all to report."
         )
         return (
@@ -797,10 +833,19 @@ def _footer(report):
             f"is red. The issue is sticky: each run rewrites it in place, {closing}_"
         )
     if report["has_findings"]:
+        # Two ways to be `standing`, and only one of them is about tiers: an
+        # unpinned FAMILY holds the issue open with no extra tier involved, and
+        # would close on its own if that family later left the catalog. Naming
+        # the tier reason there would be a wrong diagnosis, so each list states
+        # its own (BE-6912 review).
+        reason = (
+            "because Cursor's catalog always lists more reasoning tiers than the panel pins one of"
+            if report["unpinned"]
+            else "because the catalog lists model families the panel pins nothing from"
+        )
         closing = (
-            "and it stays open indefinitely, because Cursor's catalog always lists more reasoning "
-            "tiers than the panel pins one of. **An open issue here is not a sign anyone is "
-            "ignoring it**"
+            f"and it stays open indefinitely, {reason}. **An open issue here is not a sign anyone "
+            "is ignoring it**"
             if standing
             else "and it closes itself on the first run that finds nothing at all to report"
         )

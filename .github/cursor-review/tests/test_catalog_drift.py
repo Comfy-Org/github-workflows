@@ -733,6 +733,37 @@ class FooterTest(unittest.TestCase):
         catalog = "\n".join(PANEL) + "\n"
         return analyze(catalog=catalog, last_checked=TODAY - datetime.timedelta(days=60)), catalog
 
+    def urgent_repin_drains_the_list(self):
+        # The mirror image of the advisory overclaim, on the urgent arm: the
+        # delisted pin's lab has exactly ONE unpinned catalog id left — the
+        # obvious replacement — and no other lab offers one, so repinning to it
+        # empties `unpinned` and the issue really does close. The pre-repin
+        # snapshot says "standing list", which is why reading it as "it will not
+        # close once you repin" was wrong (BE-6912 review).
+        catalog = (
+            "\n".join(["gpt-5.6-sol-max", "claude-opus-4-8-thinking-max", "gemini-3.1-pro"])
+            + "\nkimi-k3-code\n"
+        )
+        return analyze(catalog=catalog), catalog
+
+    def families_only(self):
+        # Findings, none urgent, and the only list holding the issue open is the
+        # unpinned-FAMILIES fold: every lab the panel pins is fully pinned, so
+        # no extra reasoning tier is involved.
+        catalog = "\n".join(PANEL) + "\nfable-5-max (NO ZDR)\n"
+        return analyze(catalog=catalog), catalog
+
+    def all_arms(self):
+        return [
+            ("delisted", self.urgent_delisted()),
+            ("zdr", self.urgent_zdr()),
+            ("drained", self.urgent_repin_drains_the_list()),
+            ("advisory", self.advisory()),
+            ("families", self.families_only()),
+            ("stale_only", self.stale_only()),
+            ("clean", self.clean()),
+        ]
+
     def test_the_fixtures_map_onto_the_states_the_footer_describes(self):
         # The footer's three arms are `urgent` / findings-but-not-urgent / clean.
         # If these flags ever move, the assertions below stop testing the arm
@@ -795,6 +826,66 @@ class FooterTest(unittest.TestCase):
         self.assertNotIn("stays open indefinitely", footer)
         self.assertIn("closes itself on the first run that finds nothing at all", footer)
         self.assertIn(footer, cd.render_body(report, catalog))
+
+    def test_an_urgent_repin_that_empties_the_list_is_not_promised_a_permanent_issue(self):
+        # The urgent arm's claim is about the state AFTER the repin, but it is
+        # made from the snapshot BEFORE it. Where the repin consumes the last
+        # standing candidate, the issue does close, and the strong claim has to
+        # stand down to the weaker one that is true in every state.
+        report, catalog = self.urgent_repin_drains_the_list()
+        self.assertTrue(report["urgent"])
+        self.assertEqual([g["lab"] for g in report["unpinned"]], ["kimi"])
+        self.assertEqual(len(report["unpinned"][0]["candidates"]), 1)
+        self.assertEqual(report["unpinned_labs"], [])
+        self.assertFalse(cd._standing_after_repin(report))
+        footer = cd._footer(report)
+        self.assertIn("Act on this now", footer)
+        self.assertNotIn("will **not** close itself", footer)
+        self.assertIn("closes itself on the first run that finds nothing at all", footer)
+        # Not a hypothetical: run the repin the footer is describing and the
+        # next report has nothing left to report.
+        repinned = analyze(
+            catalog=catalog,
+            panel=["gpt-5.6-sol-max", "claude-opus-4-8-thinking-max", "gemini-3.1-pro", "kimi-k3-code"],
+        )
+        self.assertFalse(repinned["has_findings"])
+        # The stock urgent fixtures keep the strong claim — a repin there leaves
+        # `gpt-5.6-sol` standing, so this is a stand-down, not a blanket retreat.
+        for name, (other, _) in [("delisted", self.urgent_delisted()), ("zdr", self.urgent_zdr())]:
+            self.assertTrue(cd._standing_after_repin(other), name)
+
+    def test_the_families_only_arm_does_not_blame_reasoning_tiers(self):
+        # `standing` has two causes and only one of them is about tiers. A
+        # family from a lab the panel pins nothing from holds the issue open
+        # with no extra tier in sight — and would close on its own if that
+        # family left the catalog — so the stated reason has to match the list.
+        report, catalog = self.families_only()
+        self.assertFalse(report["urgent"])
+        self.assertTrue(report["has_findings"])
+        self.assertEqual(report["unpinned"], [])
+        self.assertTrue(report["unpinned_labs"])
+        footer = cd._footer(report)
+        self.assertIn("Nothing here is urgent", footer)
+        self.assertIn("stays open indefinitely", footer)
+        self.assertIn("families the panel pins nothing from", footer)
+        self.assertNotIn("reasoning tiers", footer)
+        # The tier reason still stands where tiers are in fact the cause.
+        self.assertIn("reasoning tiers", cd._footer(self.advisory()[0]))
+
+    def test_no_arm_points_the_reader_below_itself_or_names_a_missing_section(self):
+        # `render_body` appends the footer LAST, so every section it can point
+        # at is above it — "below" sends the reader into the raw-catalog fold or
+        # off the end of the issue. And a section it names by title has to be in
+        # the body it was appended to: the review-me list is gated on
+        # `report["unpinned"]` alone, so a report standing only on
+        # `unpinned_labs` renders the families fold and nothing else.
+        for name, (report, catalog) in self.all_arms():
+            footer = cd._footer(report)
+            body = cd.render_body(report, catalog)
+            self.assertTrue(body.rstrip("\n").endswith(footer), name)
+            self.assertNotIn("below", footer, name)
+            if "review-me list" in footer:
+                self.assertIn("## Unpinned same-lab catalog ids — review me", body, name)
 
     def test_only_a_clean_report_promises_a_close(self):
         report, catalog = self.clean()
