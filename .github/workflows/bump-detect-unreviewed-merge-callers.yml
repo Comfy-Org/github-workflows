@@ -23,29 +23,25 @@ name: Bump detect-unreviewed-merge callers
 # Actions run logs are both publicly viewable), and most callers are private, so
 # their names must never appear in this file or its logs. The list lives in the
 # repo-level Actions SECRET `DETECT_UNREVIEWED_MERGE_CALLERS` as a JSON array of
-# {"repo","file","label"} objects, same shape as the other fleets' rosters.
+# {"repo","file","label"} objects, same shape as the other fleets' rosters. Like
+# `bump-auto-label-callers.yml`, and unlike the fleets seeded empty, this one is
+# seeded NON-EMPTY — its callers all existed before the bumper did.
 #
 # A SECRET, not a variable (BE-6472): the roster reaches the script through the
 # step's `env:` below, and Actions prints that env block BEFORE the step runs —
 # so a variable's raw value was published in this public repo's run log ahead of
 # any masking the script could do. That was the KNOWN GAP this header used to
-# document — the very gap that kept THIS fleet unseeded. A secret is
-# runner-masked everywhere, that dump included. The cost is read-back: there is
+# document, and closing it is precisely what unblocked seeding this fleet
+# (BE-6473): two of its callers are non-public repos that appear in no other
+# roster, so under `vars.` a first run would have published two names that were
+# not out yet. A secret is runner-masked everywhere, that dump included — which
+# is why the roster below could finally be seeded. The cost is read-back: there is
 # no `gh secret get`, so the canonical callers.json in the private ops repo is
 # the sole source of truth, and the run instead logs a count + sha256 fingerprint
 # of the roster it used so an edit can be audited against it. `bump-callers.sh`
 # still `::add-mask::`es every repo name before IT echoes anything — Actions
 # masks the roster as ONE exact string, not each name inside it, so a name echoed
 # on its own would otherwise print in the clear.
-#
-# STILL UNSEEDED, for now. This fleet's callers include two non-public repos that
-# no already-seeded roster contains, so it deliberately shipped unset rather than
-# publish them on its first run: a public log entry cannot be unpublished, a red
-# run can. The masking blocker above is now GONE, so seeding is unblocked and is
-# tracked as the immediate follow-on to this change — but it is a separate step
-# and has not happened yet, so the hard-fail below (see ALLOW_EMPTY) is still the
-# intentional nag rather than an oversight. Seed it with `gh secret set` per the
-# update flow below as that follow-on, NOT as a way to turn the red run green.
 #
 # ALLOW_EMPTY is set to "false" below — already `bump-callers.sh`'s default, but
 # stated explicitly (as `bump-auto-label-callers.yml` does) so the property
@@ -54,13 +50,18 @@ name: Bump detect-unreviewed-merge callers
 # never be a silent no-op: that would leave every caller un-bumped with nobody
 # noticing, exactly the drift this directory exists to prevent.
 #
-# READ THIS BEFORE ACTING ON A RED RUN. An empty roster right now is the EXPECTED
-# PRE-SEED STATE described above, not a clobbered roster. The right response is
-# to seed the SECRET (`gh secret set`, update flow below) as the tracked
-# follow-on — deliberately, from the canonical callers.json, not reflexively to
-# turn the run green. Once it is seeded, and only after that point, an empty
-# roster does mean the secret was clobbered and should be restored. Either way
-# the answer is never to flip ALLOW_EMPTY on.
+# So an empty roster now ALWAYS means the secret was clobbered — there is no
+# longer a benign pre-seed reading of it. Restore it from the canonical
+# callers.json in the private ops repo (update flow below); never flip
+# ALLOW_EMPTY on to turn the run green, which would convert a loud, accurate
+# failure into exactly the silent no-bump drift it is there to catch.
+#
+# A roster entry naming a file that no longer exists fails the run too, by
+# design (BE-6471) — that is a stale roster, so fix the roster rather than the
+# run. NB: this repo is NOT in its own roster. It is deliberately not
+# self-enrolled in `detect-unreviewed-merge.yml` (see AGENTS.md), so there is no
+# `ci-` caller here for this fleet to bump; adding one back would be the thing
+# to reconsider, not a roster entry pointing at a file that is not there.
 #
 # Update flow — adding/removing a caller needs NO public commit:
 #   jq -c . callers.json | gh secret set DETECT_UNREVIEWED_MERGE_CALLERS --repo Comfy-Org/github-workflows
@@ -154,13 +155,9 @@ jobs:
           # Redundant with bump-callers.sh's own default, deliberately — see the
           # header: this fleet has a known non-empty set of live callers, so an
           # empty roster is never "this fleet has no members" and must fail
-          # loudly regardless of what that default becomes. RIGHT NOW that
-          # failure is EXPECTED — the roster is not seeded yet (header, "READ
-          # THIS BEFORE ACTING ON A RED RUN"). The masking blocker that used to
-          # hold it unseeded is GONE (BE-6472), so seeding is unblocked and is
-          # the tracked follow-on: do it deliberately, from the canonical
-          # callers.json — not reflexively to turn the run green. Only after
-          # that does an empty roster mean the secret was clobbered.
+          # loudly regardless of what that default becomes. The roster IS seeded
+          # (BE-6473), so an empty one here means the secret was clobbered —
+          # restore it from the canonical callers.json rather than flipping this.
           ALLOW_EMPTY: "false"
           # JSON array of {"repo","file","label"} — see the header comment for the
           # update flow. Kept in a repo-level SECRET (not this file, and not a

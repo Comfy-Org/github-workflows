@@ -126,9 +126,9 @@ tests — run the matching command above for whatever you touched.
   moves both, so never hand-bump one alone. `stale.yml` and
   `assign-prs-to-author.yml` have no fleet because they have no callers;
   `detect-unreviewed-merge.yml`'s fleet is
-  `bump-detect-unreviewed-merge-callers.yml`; its `DETECT_UNREVIEWED_MERGE_CALLERS`
-  roster is deliberately UNSEEDED (so it hard-fails) until the run-log masking
-  gap is closed — see the bump-callers README.
+  `bump-detect-unreviewed-merge-callers.yml` — live, its
+  `DETECT_UNREVIEWED_MERGE_CALLERS` roster seeded and stored as a repo secret
+  (BE-6473); this repo is not in it, being un-self-enrolled (above).
 - `bump-cursor-cli-pin.yml` — weekly PR moving `CURSOR_CLI_VERSION` /
   `CURSOR_CLI_SHA256` in `cursor-review.yml` (BE-5870). Not a caller bumper:
   merging it trips `bump-cursor-review-callers.yml`'s path filter, which rolls

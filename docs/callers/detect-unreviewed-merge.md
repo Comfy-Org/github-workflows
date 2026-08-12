@@ -85,8 +85,8 @@ in the other. Check the repo's branch-protection settings, then pick.
 not exist** and will not resolve. The workflow lives here, in
 `Comfy-Org/github-workflows`, which is what the ~11 live callers use.
 
-**The `DETECT_UNREVIEWED_MERGE_CALLERS` roster is not seeded yet**, so pin bumps
-are still manual for now — the `bump-detect-unreviewed-merge-callers.yml` fleet
-exists but has no roster to read. Check periodically that your pin is not far
-behind `main`. Seeding that roster is tracked as a follow-on; once it lands,
-enrollment is the usual two steps.
+**The `DETECT_UNREVIEWED_MERGE_CALLERS` roster is seeded**, so
+`bump-detect-unreviewed-merge-callers.yml` moves your pin for you and enrollment
+is the usual two steps: merge the caller, *and* add the repo to that roster
+secret. Skipping the second half is the common mistake — your pin then never
+moves and the caller quietly drifts behind the reusable.
