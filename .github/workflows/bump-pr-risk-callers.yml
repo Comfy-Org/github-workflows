@@ -22,24 +22,37 @@ name: Bump pr-risk callers
 # Actions run logs are both publicly viewable), and most callers are private, so
 # their names must never appear in this file or its logs. The list lives in the
 # repo-level Actions SECRET `PR_RISK_CALLERS` as a JSON array of
-# {"repo","file","label"} objects, same shape as the other fleets' rosters. An
-# empty list (`[]`, or an unset secret) is a clean no-op here (ALLOW_EMPTY
-# below); the rollout's per-repo caller tickets add entries as callers land.
+# {"repo","file","label"} objects, same shape as the other fleets' rosters.
 #
 # A SECRET, not a variable (BE-6472): the roster reaches the script through the
 # step's `env:` below, and Actions prints that env block BEFORE the step runs —
 # so a variable's raw value was published in this public repo's run log ahead of
-# any masking the script could do (the KNOWN GAP this header used to carry). A
-# secret is runner-masked everywhere, that dump included. The cost is read-back:
-# there is no `gh secret get`, so the canonical callers.json in the private ops
-# repo is the sole source of truth, and the run instead logs a count + sha256
-# fingerprint of the roster it used (reproduce with `jq -cS . callers.json |
-# sha256sum`) so an edit can be audited against it.
+# any masking the script could do (the KNOWN GAP this header used to carry).
+# That was not hypothetical: run 31414569691 (2026-08-10) printed this fleet's
+# whole roster in the clear. A secret is runner-masked everywhere, that dump
+# included. The cost is read-back: there is no `gh secret get`, so the canonical
+# callers.json in the private ops repo is the sole source of truth, and the run
+# instead logs a count + sha256 fingerprint of the roster it used (reproduce
+# with `jq -cS . callers.json | sha256sum`) so an edit can be audited against it.
 # `bump-callers.sh` still `::add-mask::`es every repo name before IT echoes
 # anything — Actions masks the roster as ONE exact string, not each name inside
 # it, so a name echoed on its own would otherwise print in the clear.
-# NOTE: this fleet's roster is still UNSEEDED — the secret exists only once
-# someone sets it (see the update flow below).
+#
+# The roster IS seeded (BE-6480), so `ALLOW_EMPTY: "false"` below makes an empty
+# roster fatal: this fleet has live callers, so an empty roster is a bug, not a
+# state to tolerate. Without the hard-fail, a roster that is emptied, renamed or
+# never-read degrades into a silent clean exit — every caller stays pinned to a
+# stale grader with nothing red anywhere to say so, which is exactly the
+# pin-drift this fleet exists to prevent. Same posture as the cursor-review and
+# auto-label fleets; the opposite of groom's, which is still rolling out.
+#
+# A secret cannot be read back, so that seeding is evidenced by the secret's
+# creation timestamp (2026-08-05, alongside the variable it replaced, which
+# carried two live callers) rather than by its contents. No run has exercised
+# the secret path yet — BE-6472 landed after the last one — so the first run is
+# what confirms it. If that run hard-fails on an empty roster, re-set the secret
+# from the canonical callers.json rather than relaxing ALLOW_EMPTY: a loud
+# failure here is the design working, not a regression.
 #
 # Update flow — adding/removing a caller needs NO public commit:
 #   jq -c . callers.json | gh secret set PR_RISK_CALLERS --repo Comfy-Org/github-workflows
@@ -142,9 +155,13 @@ jobs:
           VAR_NAME: PR_RISK_CALLERS
           TAG: pr-risk
           WORKFLOW_FILE: pr-risk.yml
-          # An empty roster — `[]`, or a secret nobody has set — is a clean no-op
-          # here, not an error.
-          ALLOW_EMPTY: "true"
+          # Hard-fail on an empty/missing roster — see the header. Already
+          # `bump-callers.sh`'s default, but stated explicitly so the property
+          # survives a future flip of that default: this fleet has live callers,
+          # so silently degrading back to a clean no-op would restore exactly the
+          # pin-drift the header says it prevents. Same as the auto-label and
+          # detect-unreviewed-merge entrypoints.
+          ALLOW_EMPTY: "false"
           # JSON array of {"repo","file","label"} — see the header comment for the
           # update flow. Kept in a repo-level SECRET (not this file, and not a
           # variable) so private caller names never land in this public repo. Actions
