@@ -752,6 +752,72 @@ def _collapsed_candidate_list(candidates, pinned=(), limit=None):
     return "\n".join(rows)
 
 
+def _footer(report):
+    """The trailing note: what THIS issue asks of the reader, in its own words.
+
+    Three arms, because the report already sorts itself into three states and a
+    single sentence cannot describe all of them honestly (BE-6912):
+
+      * `urgent` — a delisted pin or a pin marked NO-ZDR. Someone must edit
+        `cursor-review.yml` now; the run is red.
+      * findings, not urgent — the standing review-me list (and/or an audit-date
+        reminder). Advisory. This is the steady state, so the footer has to say
+        out loud that a permanently-open issue here is not neglect: `unpinned`
+        counts toward `has_findings`, and any real catalog lists more reasoning
+        tiers per pinned lab than the panel pins one of, so the close arm in
+        `cursor-review-catalog-drift.yml` is effectively unreachable. Measured
+        on the 2026-08-10 catalog (the `tests/fixtures` capture, from run
+        31363137595 / issue #144): 192 catalog ids, 178 of them unpinned
+        same-lab, 3 unpinned families — no delisted pin, no NO-ZDR pin, run
+        green, issue open ever since.
+      * no findings — the only state that closes the issue, and the ONLY arm
+        that may promise a close. The footer used to promise it unconditionally,
+        which told every reader of a permanently-open advisory issue that it
+        should have closed weeks ago — i.e. that it was being ignored — on the
+        one issue that is also where a genuinely urgent pin failure is reported.
+    """
+    lead = "_Filed by the weekly `cursor-review-catalog-drift` check."
+    # Whether an advisory list is what is holding the issue open. On any real
+    # catalog it is (192 ids, 178 of them unpinned same-lab, on 2026-08-10), but
+    # a report whose only finding is a stale audit date closes as soon as the
+    # date is refreshed — claiming "open indefinitely" there would be this
+    # footer's own bug in miniature.
+    standing = bool(report["unpinned"] or report.get("unpinned_labs"))
+    if report["urgent"]:
+        closing = (
+            "and it will **not** close itself once you repin — the standing review-me list below "
+            "holds it open, as it does on any real catalog. The next run simply rewrites this "
+            "issue without the 🚨 section."
+            if standing
+            else "and it closes itself on the first run that finds nothing at all to report."
+        )
+        return (
+            f"{lead} **Act on this now:** a pinned model is delisted or marked NO-ZDR — see the 🚨 "
+            "section(s) above and repin in `cursor-review.yml`. That is also why this check's run "
+            f"is red. The issue is sticky: each run rewrites it in place, {closing}_"
+        )
+    if report["has_findings"]:
+        closing = (
+            "and it stays open indefinitely, because Cursor's catalog always lists more reasoning "
+            "tiers than the panel pins one of. **An open issue here is not a sign anyone is "
+            "ignoring it**"
+            if standing
+            else "and it closes itself on the first run that finds nothing at all to report"
+        )
+        return (
+            f"{lead} **Nothing here is urgent:** no pinned model is delisted or marked NO-ZDR, so "
+            "the review panel is working and this check's run is green. What is above is advisory — "
+            "catalog ids for a human to review, and/or an audit-date reminder — to skim when "
+            f"convenient. The issue is sticky: each run rewrites it in place, {closing} — when a "
+            "pin actually breaks, the run goes red and this footer says **act on this now** "
+            "instead._"
+        )
+    return (
+        f"{lead} No drift at all — nothing to act on, and this is the one outcome that closes the "
+        "issue. A later run files a fresh one if drift returns._"
+    )
+
+
 def render_body(report, catalog_text, run_url=None, checked_at=None):
     """Render the sticky issue body (also used as the run's step summary)."""
     pins = report["pins"]
@@ -910,10 +976,7 @@ def render_body(report, catalog_text, run_url=None, checked_at=None):
                 f"pins and refresh the `last checked` comment in `cursor-review.yml`."
             )
 
-    footer = (
-        "_Filed by the weekly `cursor-review-catalog-drift` check. This issue is sticky — it is "
-        "updated in place each run and closed automatically once a run finds no drift._"
-    )
+    footer = _footer(report)
     # The raw fold gets whatever body budget the report has NOT used, up to the
     # MAX_CATALOG_CHARS ceiling. A fixed 40K assumed the report stayed inside
     # ~20K; a large catalog can exceed that even with every list capped, and the
