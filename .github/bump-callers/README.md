@@ -30,7 +30,7 @@ forward automatically instead of silently drifting commits behind.
 | [`bump-cursor-review-callers.yml`](../workflows/bump-cursor-review-callers.yml) | `cursor-review.yml`, `cursor-review/**` or `scripts/check-pr-size/**` (minus its `*_test.go`, which no caller executes) | `CURSOR_REVIEW_CALLERS` | non-empty (hard-fails if empty) |
 | [`bump-agents-md-callers.yml`](../workflows/bump-agents-md-callers.yml) | `agents-md-integrity.yml` or `agents-md-integrity/**` | `AGENTS_MD_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-pr-size-callers.yml`](../workflows/bump-pr-size-callers.yml) | `pr-size.yml` or `scripts/check-pr-size/**` (minus its `*_test.go`, which no caller executes) | `PR_SIZE_CALLERS` | empty `[]` (grows as callers land) |
-| [`bump-pr-risk-callers.yml`](../workflows/bump-pr-risk-callers.yml) | `pr-risk.yml` or `scripts/pr-risk/**` (minus its `tests/` and `README.md`, which no caller executes) | `PR_RISK_CALLERS` | empty `[]` allowed (grows as callers land) |
+| [`bump-pr-risk-callers.yml`](../workflows/bump-pr-risk-callers.yml) | `pr-risk.yml` or `scripts/pr-risk/**` (minus its `tests/` and `README.md`, which no caller executes) | `PR_RISK_CALLERS` | non-empty (hard-fails if empty) |
 | [`bump-assign-reviewers-callers.yml`](../workflows/bump-assign-reviewers-callers.yml) | `assign-reviewers.yml` | `ASSIGN_REVIEWERS_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-groom-callers.yml`](../workflows/bump-groom-callers.yml) | `groom.yml` or `groom/**` | `GROOM_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-auto-label-callers.yml`](../workflows/bump-auto-label-callers.yml) | `cursor-review-auto-label.yml` | `AUTO_LABEL_CALLERS` | non-empty (hard-fails if empty) |
@@ -253,13 +253,15 @@ deepening the guard is supposed to rest on.
 **A multi-path fleet must pass `WATCHED_ASSETS`, and must list EVERY asset it
 watches.** The re-point is only sound because every entry in the fleet's `paths:`
 trigger is covered by the comparison — for `agents-md-integrity`
-(`.github/agents-md-integrity/**`), `groom` (`.github/groom/**`) and `pr-size`
-(`scripts/check-pr-size/**`) that means the one asset directory the reusable
-loads its prompts/scripts/briefs from at run time. (`pr-risk` is multi-path too,
-but its filter also carries `:(exclude)` entries that `WATCHED_ASSETS` cannot
-express at all — see the note below.) Compare `WATCHED` alone on one of those and
-a commit touching only the assets reads as "unchanged", so callers get pinned to
-a tip whose other relevant content was never verified. Read the entrypoint's
+(`.github/agents-md-integrity/**`), `cursor-review` (`.github/cursor-review/**`),
+`groom` (`.github/groom/**`) and `pr-size` (`scripts/check-pr-size/**`) that
+includes the asset directory the reusable loads its prompts/scripts/briefs from at
+run time. (`pr-risk` is multi-path too, but its filter also carries `:(exclude)`
+entries that `WATCHED_ASSETS` cannot express, so its comparison is
+`WATCHED_PATHSPECS` — it still *sets* `WATCHED_ASSETS`, for a different reason;
+see the note below.) Compare `WATCHED` alone on one of those and a commit touching
+only the assets reads as "unchanged", so callers get pinned to a tip whose other
+relevant content was never verified. Read the entrypoint's
 `paths:` rather than trusting this list, and if you widen a fleet's path filter,
 widen these inputs in the same change.
 
@@ -301,7 +303,19 @@ change the tree OID of an over-broad `WATCHED_ASSETS` — so this run reports "t
 watched surface changed since", skips green as a stale re-run, and waits on a
 later run that will never exist. An exclusion is a reason to narrow the inputs, or
 to carry it into `WATCHED_PATHSPECS`; never to point `WATCHED_ASSETS` at the whole
-directory.
+directory **as the comparison**.
+
+Setting `WATCHED_ASSETS` to that directory *alongside* `WATCHED_PATHSPECS` is a
+different thing, and it is what `pr-risk` does. The pathspec diff **supersedes**
+the object comparison, so the asset tree OID is never compared and the freeze
+above cannot arise (verified: a commit touching only `scripts/pr-risk/tests` and
+the tool `README.md` still proceeds and re-points). What `WATCHED_ASSETS` buys
+there is the **coverage assertion** — the check that the pathspec list still
+selects something under it. Without it, deleting the `scripts/pr-risk` line from
+that list leaves `.github/workflows/pr-risk.yml` matching itself, satisfies every
+remaining guard, and silently stops watching the grading logic while the fleet
+keeps re-pointing callers. So: with `WATCHED_PATHSPECS`, set it; without,
+narrow it.
 
 **`test_paths_contract.sh` enforces both directions.** These pairs are
 hand-written, one per entrypoint, and until BE-6476 the only thing holding them
@@ -442,17 +456,24 @@ credential; minting it for a run the guard has already decided will bump nothing
 buys nothing and leaves it live for the job. Every entrypoint is ordered that
 way, and `test_paths_contract.sh` enforces it.
 
-> **The swap is done (BE-6476).** Seven of the eight entrypoints run this script
-> and their inline copies are gone; `bump-pr-risk-callers.yml` is the one
-> holdout, kept on its own guard by the `:(exclude)` entries above.
-> `bump-pr-risk-callers.yml` carried two checks this script did not, and
-> **BE-6670 decided both** rather than leaving the swap to choose:
+> **The swap is done — all eight entrypoints run this script and no inline copy
+> remains.** `bump-pr-risk-callers.yml` went first (BE-6677) because it was the
+> hardest: the only excluding, per-executed-file fleet, so `WATCHED_PATHSPECS`
+> and `WATCHED_EXEC` are exercised by a real caller and not just by the tests.
+> BE-6476 then swapped the remaining seven, which were a mechanical repeat of the
+> two-step block above.
+>
+> pr-risk carried two checks this script did not, and **BE-6670 decided both**
+> rather than leaving the swap to choose:
 >
 > - Its **is-ancestor check is adopted here, for every fleet** (BE-6675) — see
->   the direction guard above. It was never pr-risk-specific.
+>   the direction guard above. It was never pr-risk-specific. The swap also fixed
+>   a latent hazard in the inline copy on its way out: that one fetched a bare
+>   `main`, which resolves `refs/tags/main` ahead of `refs/heads/main`, and this
+>   repo force-moves major tags. This script fetches `refs/heads/main`.
 > - Its **`git rev-list` "did a later *commit* touch a watched path" test is
->   deliberately not ported.** It exists because pr-risk has no re-point, so a
->   land-then-revert (net content change of zero) makes that fleet call this run
+>   deliberately not ported.** It existed because pr-risk had no re-point, so a
+>   land-then-revert (net content change of zero) made that fleet call the run
 >   the only one for the change and pin callers *backwards* to `github.sha`. The
 >   re-point already answers that case by pinning the verified tip — which on a
 >   land-then-revert is the revert commit, i.e. forward. Adding rev-list on top

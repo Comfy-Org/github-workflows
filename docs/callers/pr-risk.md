@@ -63,11 +63,29 @@ jobs:
       workflows_ref: <same-full-commit-sha>
 ```
 
-This workflow **has** a fleet — `bump-pr-risk-callers.yml` opens the pin-bump PRs
-— so enrolling is the usual two steps: merge the caller, then ask a maintainer to
-add your repo to the `PR_RISK_CALLERS` roster secret (see
-[Staying current](README.md#staying-current)). Skip the second and your pin never
-moves.
+Enrolling is **two steps** — merging the caller above is only the first. Ask a
+maintainer to add this repo to the `PR_RISK_CALLERS` roster secret
+(see [Staying current](README.md#staying-current)); until they do, the
+[`bump-pr-risk-callers.yml`](../../.github/workflows/bump-pr-risk-callers.yml)
+fleet does not know the caller exists, so both of its pins sit frozen and the
+caller silently drifts behind the grader it runs. Skipping this half is the most
+repeated mistake in this repo.
+
+One thing to know about that second step:
+
+- **Enrolment does not backfill your pin.** The fleet only runs on a push to
+  `main` touching `pr-risk.yml` or `scripts/pr-risk/**`, so a repo added to the
+  roster after the fact stays on whatever SHA it merged with until the grader
+  next changes. Ask the maintainer to `workflow_dispatch`
+  `bump-pr-risk-callers.yml` once after adding you — every bump entrypoint
+  carries `workflow_dispatch` for exactly this.
+
+Enrolling a private repo used to publish its name in this public repo's run log:
+the roster was an Actions **variable** bound through `env:`, and Actions dumps
+the step env before `bump-callers.sh` can mask it. BE-6472 moved every roster to
+a **secret**, which the runner masks in that dump too, so that caveat no longer
+applies to new enrolments — but a name already printed in an old public log
+cannot be unpublished.
 
 ## Required permissions
 
