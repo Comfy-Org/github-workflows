@@ -153,9 +153,9 @@ Enrolling a repo is **two steps**, and the second is the one people miss.
    | `cursor-review.yml` | `CURSOR_REVIEW_CALLERS` |
    | `cursor-review-auto-label.yml` | `AUTO_LABEL_CALLERS` |
    | `pr-size.yml` | `PR_SIZE_CALLERS` |
+   | `pr-risk.yml` | `PR_RISK_CALLERS` |
    | `agents-md-integrity.yml` | `AGENTS_MD_CALLERS` |
    | `assign-reviewers.yml` | `ASSIGN_REVIEWERS_CALLERS` |
-   | `pr-risk.yml` | `PR_RISK_CALLERS` |
    | `detect-unreviewed-merge.yml` | `DETECT_UNREVIEWED_MERGE_CALLERS` |
 
    Each entry is `{"repo": "...", "file": ".github/workflows/<caller>.yml", "label": ""}`.

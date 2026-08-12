@@ -85,7 +85,9 @@ tests — run the matching command above for whatever you touched.
   that opens SHA-bump PRs in consumer repos when a reusable workflow changes,
   plus `preflight.sh` (BE-6475), the ONE staleness/decommission guard that runs
   ahead of it — `proceed` / `new_sha` step outputs, `WATCHED` +
-  `WATCHED_ASSETS` inputs. Tests in `tests/`.
+  `WATCHED_ASSETS` inputs, plus `WATCHED_PATHSPECS` + `WATCHED_EXEC` (BE-6676)
+  for the one excluding, per-executed-file fleet (pr-risk). Watched inputs MUST
+  mirror that fleet's `paths:` filter, exclusions included. Tests in `tests/`.
 - `README.md` — the public workflow catalog: per-workflow purpose, the SHA-pin
   usage pattern, and the versioning policy. Keep its table in sync when you add
   a workflow.
