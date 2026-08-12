@@ -49,7 +49,7 @@ jobs:
       BOT_APP_PRIVATE_KEY: ${{ secrets.BOT_APP_PRIVATE_KEY }}
 ```
 
-Then add your repo to `vars.PR_SIZE_CALLERS`.
+Then ask a maintainer to add your repo to the `PR_SIZE_CALLERS` roster secret.
 
 ## Required permissions
 

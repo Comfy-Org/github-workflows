@@ -15,10 +15,21 @@ name: Bump cursor-review callers
 # The caller list is NOT hardcoded here. This repo is PUBLIC (workflow file and
 # Actions run logs are both publicly viewable), and most callers are private, so
 # their names must never appear in this file or its logs. The list lives in the
-# repo-level Actions variable `CURSOR_REVIEW_CALLERS` (config, not a credential —
-# a variable, not a secret, since secrets are write-only via the API) as a JSON
-# array of {"repo","file","label","wire_bot"} objects. Every repo name is
-# `::add-mask::`ed out of the (public) run logs before it is ever echoed.
+# repo-level Actions SECRET `CURSOR_REVIEW_CALLERS` as a JSON array of
+# {"repo","file","label","wire_bot"} objects.
+#
+# A SECRET, not a variable (BE-6472): the roster reaches the script through the
+# step's `env:` below, and Actions prints that env block BEFORE the step runs —
+# so a variable's raw value was published in this public repo's run log ahead of
+# any masking the script could do (the KNOWN GAP this header used to carry). A
+# secret is runner-masked everywhere, that dump included. The cost is read-back:
+# there is no `gh secret get`, so the canonical callers.json in the private ops
+# repo is the sole source of truth, and the run instead logs a count + sha256
+# fingerprint of the roster it used (reproduce with `jq -cS . callers.json |
+# sha256sum`) so an edit can be audited against it.
+# `bump-callers.sh` still `::add-mask::`es every repo name before IT echoes
+# anything — Actions masks the roster as ONE exact string, not each name inside
+# it, so a name echoed on its own would otherwise print in the clear.
 #
 # A caller flagged `"wire_bot": true` also gets the cloud-code-bot review
 # identity wired in the same PR (BE-1814): the optional bot_app_id input +
@@ -33,9 +44,8 @@ name: Bump cursor-review callers
 # bump-agents-md-callers.yml.
 #
 # Update flow — adding/removing a caller needs NO public commit:
-#   gh variable set CURSOR_REVIEW_CALLERS --repo Comfy-Org/github-workflows \
-#     --body "$(jq -c . callers.json)"
-# Keep the canonical callers.json in a PRIVATE infra/ops repo so variable edits
+#   jq -c . callers.json | gh secret set CURSOR_REVIEW_CALLERS --repo Comfy-Org/github-workflows
+# Keep the canonical callers.json in a PRIVATE infra/ops repo so roster edits
 # have a reviewed source of truth; the org audit log records each edit. (The
 # specific home repo is intentionally not named here — this file is public.)
 
@@ -165,15 +175,20 @@ jobs:
           # unchanged, the preflight re-points this run at the verified tip, and
           # reading github.sha here would silently discard that re-point.
           NEW_SHA: ${{ steps.preflight.outputs.new_sha }}
+          # Names the roster to fix in an error message. It is a SECRET now, not a
+          # variable; the env key keeps its historical name so every fleet's
+          # entrypoint and the shared script stay in step.
           VAR_NAME: CURSOR_REVIEW_CALLERS
           TAG: cursor-review
           WORKFLOW_FILE: cursor-review.yml
           # JSON array of {"repo","file","label","wire_bot"} — see the header
-          # comment for the update flow. Kept in a variable (not the file) so
-          # private caller names never land in this public repo or its logs.
-          CALLERS_JSON: ${{ vars.CURSOR_REVIEW_CALLERS }}
+          # comment for the update flow. Kept in a repo-level SECRET (not this
+          # file, and not a variable) so private caller names never land in this
+          # public repo — nor, since a secret is masked in the step's env dump
+          # too, in its run logs.
+          CALLERS_JSON: ${{ secrets.CURSOR_REVIEW_CALLERS }}
           # Only this fleet's callers ever carry `wire_bot` (BE-1814) — the
           # agents-md-integrity entrypoint never sets this, so bump-callers.sh
-          # skips wiring there even if its variable somehow set the flag.
+          # skips wiring there even if its roster somehow set the flag.
           WIRE_BOT_SCRIPT: ${{ github.workspace }}/.github/cursor-review/wire-bot-identity.py
         run: bash .github/bump-callers/bump-callers.sh
