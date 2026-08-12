@@ -10,21 +10,23 @@
 #   2. Has the watched surface been DECOMMISSIONED — deleted — so that pinning
 #      callers to this SHA would break every one of them?
 #
-# Both questions are answered today by an inline copy of this logic in each
-# bump-* entrypoint. Eight near-copies is exactly the drift pattern this
-# directory exists to prevent (see bump-callers.sh's header), and they HAVE
-# drifted: five skip on a bare tip mismatch, which throws away the ONLY run for a
-# change; bump-auto-label-callers.yml compares content but forgets to re-point
-# the pin at the verified tip; bump-detect-unreviewed-merge-callers.yml is the
-# hardened one; and bump-pr-risk-callers.yml has since grown a different
-# hardening again (a `git rev-list` "did a later COMMIT touch a watched path"
-# test plus an is-ancestor orphan check, and no re-point).
+# Both questions were answered by an inline copy of this logic in each bump-*
+# entrypoint. Eight near-copies is exactly the drift pattern this directory
+# exists to prevent (see bump-callers.sh's header), and they HAVE drifted: five
+# skip on a bare tip mismatch, which throws away the ONLY run for a change;
+# bump-auto-label-callers.yml compares content but forgets to re-point the pin at
+# the verified tip; bump-detect-unreviewed-merge-callers.yml is the hardened one;
+# and bump-pr-risk-callers.yml had grown a different hardening again (a
+# `git rev-list` "did a later COMMIT touch a watched path" test plus an
+# is-ancestor orphan check, and no re-point).
 #
 # This script is the one implementation, and it deliberately adopts the
 # bump-detect-unreviewed-merge-callers.yml semantics (PR #117) — exact-refname
 # tip parse, FETCH_HEAD verification, `$WATCHED`-variable deletion guard, and the
-# NEW_SHA re-point — generalized to multi-path fleets. Nothing consumes it yet;
-# swapping the entrypoints over is a separate change.
+# NEW_SHA re-point — generalized to multi-path fleets. bump-pr-risk-callers.yml
+# consumes it (BE-6677, the first entrypoint swapped over, and the one that needs
+# the two list inputs below); swapping the remaining entrypoints over is a
+# separate change each.
 #
 # What to do with bump-pr-risk-callers.yml's two extra checks was that swap's one
 # open decision. BE-6670 made it, and both halves are settled:
@@ -745,8 +747,16 @@ if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
   # exist. That freezes the fleet exactly as a bare tip mismatch used to. An
   # exclusion is therefore a reason to carry the filter's exclusions into
   # WATCHED_PATHSPECS (or to narrow the inputs), never to point WATCHED_ASSETS at
-  # the whole directory. Dropping one `:(exclude)` line from the pathspec list
-  # reinstates that freeze exactly — which is why they live next to each other.
+  # the whole directory AS THE COMPARISON. Dropping one `:(exclude)` line from the
+  # pathspec list reinstates that freeze exactly — which is why they live next to
+  # each other.
+  #
+  # Setting WATCHED_ASSETS to that directory ALONGSIDE WATCHED_PATHSPECS is a
+  # different thing, and it is what pr-risk does: the pathspec diff supersedes the
+  # object comparison, so the asset tree OID is never compared and that freeze
+  # cannot arise. There WATCHED_ASSETS buys only the COVERAGE ASSERTION above —
+  # that the pathspec list still reaches under it — which is the one guard that
+  # catches the list silently losing its positive `scripts/pr-risk` entry.
   echo "main moved to $main_tip since $GITHUB_SHA, but the watched surface is unchanged — this run is still the only one for that change; pinning callers to $main_tip and proceeding"
   NEW_SHA="$main_tip"
   repointed=1

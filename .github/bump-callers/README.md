@@ -253,7 +253,9 @@ because every entry in the fleet's `paths:` trigger is covered by the comparison
 (`scripts/check-pr-size/**`) that includes the asset directory the reusable loads
 its prompts/scripts/briefs from at run time. (`pr-risk` is multi-path too, but its
 filter also carries `:(exclude)` entries that one `WATCHED_ASSETS` string cannot
-express — see the note below.) Compare `WATCHED` alone on one of those and a
+express, so its comparison is `WATCHED_PATHSPECS` — it still *sets*
+`WATCHED_ASSETS`, for a different reason; see the note below.) Compare `WATCHED`
+alone on one of those and a
 commit touching only the assets reads as "unchanged", so callers get pinned to a
 tip whose other relevant content was never verified. Read the entrypoint's
 `paths:` rather than trusting this list, and if you widen a fleet's path filter,
@@ -266,7 +268,19 @@ change the tree OID of an over-broad `WATCHED_ASSETS` — so this run reports "t
 watched surface changed since", skips green as a stale re-run, and waits on a
 later run that will never exist. An exclusion is a reason to narrow the inputs, or
 to carry it into `WATCHED_PATHSPECS`; never to point `WATCHED_ASSETS` at the whole
-directory.
+directory **as the comparison**.
+
+Setting `WATCHED_ASSETS` to that directory *alongside* `WATCHED_PATHSPECS` is a
+different thing, and it is what `pr-risk` does. The pathspec diff **supersedes**
+the object comparison, so the asset tree OID is never compared and the freeze
+above cannot arise (verified: a commit touching only `scripts/pr-risk/tests` and
+the tool `README.md` still proceeds and re-points). What `WATCHED_ASSETS` buys
+there is the **coverage assertion** — the check that the pathspec list still
+selects something under it. Without it, deleting the `scripts/pr-risk` line from
+that list leaves `.github/workflows/pr-risk.yml` matching itself, satisfies every
+remaining guard, and silently stops watching the grading logic while the fleet
+keeps re-pointing callers. So: with `WATCHED_PATHSPECS`, set it; without,
+narrow it.
 
 **An excluding fleet passes `WATCHED_PATHSPECS`; a per-file fleet passes
 `WATCHED_EXEC`.** Today that is exactly one fleet, `pr-risk`, which needs both —
@@ -342,16 +356,24 @@ step reads it through its own `env:` binding. That is deliberate: a step-level
 `env: NEW_SHA:` takes precedence over the job environment, so a `$GITHUB_ENV`
 write would be silently overridden by the very binding it is meant to correct.
 
-> **The entrypoints still carry their inline copies.** Swapping them over to this
-> script is a separate change. `bump-pr-risk-callers.yml` carried two checks this
-> script did not, and **BE-6670 decided both** rather than leaving the swap to
-> choose:
+> **`bump-pr-risk-callers.yml` is swapped over (BE-6677); the other entrypoints
+> still carry their inline copies.** pr-risk went first because it was the
+> hardest — the only excluding, per-executed-file fleet — so `WATCHED_PATHSPECS`
+> and `WATCHED_EXEC` are now exercised by a real caller and not just by the
+> tests. Its remaining siblings are a mechanical repeat of the two-step block
+> above, one fleet at a time.
+>
+> It carried two checks this script did not, and **BE-6670 decided both** rather
+> than leaving the swap to choose:
 >
 > - Its **is-ancestor check is adopted here, for every fleet** (BE-6675) — see
->   the direction guard above. It was never pr-risk-specific.
+>   the direction guard above. It was never pr-risk-specific. The swap also fixed
+>   a latent hazard in the inline copy on its way out: that one fetched a bare
+>   `main`, which resolves `refs/tags/main` ahead of `refs/heads/main`, and this
+>   repo force-moves major tags. This script fetches `refs/heads/main`.
 > - Its **`git rev-list` "did a later *commit* touch a watched path" test is
->   deliberately not ported.** It exists because pr-risk has no re-point, so a
->   land-then-revert (net content change of zero) makes that fleet call this run
+>   deliberately not ported.** It existed because pr-risk had no re-point, so a
+>   land-then-revert (net content change of zero) made that fleet call the run
 >   the only one for the change and pin callers *backwards* to `github.sha`. The
 >   re-point already answers that case by pinning the verified tip — which on a
 >   land-then-revert is the revert commit, i.e. forward. Adding rev-list on top
