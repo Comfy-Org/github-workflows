@@ -114,8 +114,19 @@ INPUT_KEY_RE='[[:space:],{]workflows_ref:'
 # is never half-rewritten into a broken value — an expression matches nothing
 # here, is left untouched, and is then caught by the assertion, which fails the
 # repo rather than shipping a caller whose two pins disagree.
+#
+# `,` is excluded for the same reason as `}`: it is a YAML FLOW-STYLE delimiter,
+# not part of a ref. In `{uses: …/cursor-review.yml@v1, secrets: inherit}` the
+# token after `@` is `v1,` — whitespace being the only other stop — so admitting
+# the comma would replace the delimiter along with the ref and commit YAML with
+# the mapping's separator deleted, which the post-rewrite assertion (it only asks
+# whether NEW_SHA is there) would wave through. Excluding it leaves the comma
+# behind, so the assertion reads back `<sha>,`, finds it unequal to NEW_SHA and
+# fails the repo — the same loud outcome flow style already gets on the
+# `workflows_ref:` side (see INPUT_PIN_RE above). A ref never legitimately
+# contains a comma, so nothing bumpable is lost.
 # shellcheck disable=SC2016  # `$ { }` here are regex literals, not an expansion
-REF_RE='[^[:space:]'\''"#$(){}]+'
+REF_RE='[^[:space:],'\''"#$(){}]+'
 
 STRIPPED="${CALLERS_JSON//[[:space:]]/}"
 
@@ -139,16 +150,120 @@ if ! jq -e 'type == "array" and length > 0 and all(.[]; (.repo | type == "string
   exit 1
 fi
 
+# Constrain the field VALUES, not just the JSON shape (BE-6471). Every one of
+# these reaches a privileged sink: `repo` is interpolated into each
+# `gh api repos/${REPO}/…` write and `gh pr create --repo`, `file` becomes the
+# path committed into the caller's tree, and `label` is handed to
+# `gh pr create --label`. They run under an org-wide app token
+# (`owner: Comfy-Org`, contents + pull-requests + issues write, no
+# `repositories:` narrowing) and the roster is an Actions VARIABLE, which is
+# editable outside code review — so without this, roster-edit access converts
+# into bot-authored commits, branch force-moves and labelled PRs in any org repo
+# the app is installed on. The `file` rule's character class excludes `/`, which
+# also rules out a `.github/workflows/../…` traversal out of the directory. The
+# `repo` rule keeps `.` (a repo may legitimately be named `.github`, or carry a
+# dot at all) but rejects a name that is ONLY dots, since `Comfy-Org/..` is a path
+# segment rather than a repository and every use of it is a URL built by string
+# interpolation. The test is `\A[.]+\z`, i.e. the general case rather than the two
+# literals `.` and `..`: `Comfy-Org/...` is no more a repository than `..` is, and
+# enumerating only the two would let it through the named pre-flight rule to 404
+# later as an unexplained whole-repo failure.
+#
+# `label` additionally may not contain `|`: the tuple encoding just below joins
+# the four fields with `|` and `cut -d'|' -f3` reads the label back, so a
+# pipe-bearing label truncates at the pipe and bleeds its tail into the
+# `wire_bot` field — silently flagging for identity wiring an entry that never
+# asked for it. Every C0/C7F CONTROL character is barred for the same class of
+# reason, `[[:cntrl:]]` rather than an enumeration of `\n`/`\r` so the class is
+# closed rather than sampled: the tuples are read line-wise (LF, CR), a NUL is
+# emitted by `jq -r` and then silently DISCARDED by bash's `read`, so the label
+# that reaches `gh pr create --label` differs from the one the roster names, and
+# any surviving control reaches that flag verbatim, where the API rejects it as
+# an opaque per-repo failure rather than a named rule.
+#
+# `,` is barred too, and for a reason that is not encoding at all: `--label` is a
+# cobra StringSlice, which CSV-SPLITS its value. `ci,do-not-merge` therefore
+# applies a SECOND, potentially blocking label that the entry does not appear to
+# name — the one shape here that fails by succeeding quietly. GitHub label names
+# may legitimately contain spaces, `:` and `/`, so this stays a denylist of the
+# characters that are structurally unsafe on the path to the flag, not an
+# allowlist of the ones GitHub happens to permit. Verified against the live
+# rosters: every label in use today is `""`, `ci` or `Core`.
+#
+# Every pattern is anchored with `\A`/`\z`, NOT `^`/`$`. jq matches with
+# Oniguruma, where `$` also matches immediately BEFORE a trailing newline — so
+# `^Comfy-Org/[A-Za-z0-9._-]+$` accepts `"Comfy-Org/legit\n"`, whose tuple then
+# splits across two lines in the `while IFS= read -r ENTRY` loop below. The
+# fragment after the split is a never-validated tuple: its `REPO` is empty and
+# reaches `::add-mask::` and `gh api repos/`, and the fragment before it has no
+# `|` at all, so `cut -d'|' -f4` returns the whole line and silently flags the
+# entry for identity wiring. `\A`/`\z` are strict whole-string anchors and close
+# that off. (`^`/`$` are NOT line anchors here — an embedded newline mid-value is
+# already rejected — but the trailing-newline case is real.)
+#
+# The `Comfy-Org/` owner is matched case-INSENSITIVELY, for the same reason
+# REPO_RE above is spelled that way: GitHub resolves an owner case-insensitively,
+# so `comfy-org/foo` is a working roster entry today and must not hard-fail the
+# whole fleet before a single repo is bumped.
+#
+# NEVER echo the offending value. Masking has not happened yet at this point
+# (the `::add-mask::` loop is below), this repo's run logs are public, and roster
+# values are private repo names — so report the INDEX and the violated RULE only,
+# which is all anyone needs to find the entry in the variable. One jq pass emits
+# `index<TAB>rule` for every violation, so an entry breaking two rules reports
+# both rather than hiding the second behind a fix for the first.
+if ! INVALID=$(jq -r '
+  to_entries[]
+  | .key as $i
+  | .value as $e
+  | [ (if ($e.repo | test("\\AComfy-Org/[A-Za-z0-9._-]+\\z"; "i"))
+          and (($e.repo | sub("\\A[Cc][Oo][Mm][Ff][Yy]-[Oo][Rr][Gg]/"; "")) | test("\\A[.]+\\z") | not)
+        then empty
+        else "repo must match ^Comfy-Org/[A-Za-z0-9._-]+$ (owner case-insensitive) and not be a dot segment" end),
+      (if ($e.file | test("\\A[.]github/workflows/[A-Za-z0-9._-]+[.]ya?ml\\z")) then empty
+        else "file must be a .github/workflows/<name>.yml path" end),
+      (if ($e.label == null)
+          or ((($e.label | type) == "string") and (($e.label | test("[|,]|[[:cntrl:]]")) | not))
+        then empty else "label must be a string containing no |, comma or control character" end)
+    ][]
+  | "\($i)\t\(.)"' <<<"$CALLERS_JSON"); then
+  echo "::error::${VAR_NAME} could not be validated (jq failed). Fix the variable — see the workflow header."
+  exit 1
+fi
+if [[ -n "$INVALID" ]]; then
+  while IFS=$'\t' read -r IDX RULE; do
+    echo "::error::${VAR_NAME} entry at index ${IDX} is invalid (${RULE}). Fix the variable — see the workflow header."
+  done <<<"$INVALID"
+  exit 1
+fi
+
 # Parse the JSON into repo|file|label|wire_bot tuples, and mask every repo name
 # in the (publicly viewable) run logs BEFORE the loop that echoes it, so all
 # per-repo output shows *** instead of a private repo name. jq's `//` treats
 # both `false` and `null` as falsy, so an absent/false/null wire_bot all print
 # the empty string here — exactly the "not flagged" case.
+#
+# The OWNER segment is CANONICALIZED to `Comfy-Org` on the way in. The rule above
+# accepts it case-insensitively (GitHub resolves an owner that way, so
+# `comfy-org/foo` is a working entry today and must not hard-fail the fleet), but
+# accepting two spellings without normalizing one produces two DISTINCT entries
+# for a single repo: the grouping below is byte-exact, so `Comfy-Org/foo` and
+# `comfy-org/foo` become two `REPOS` entries and `bump_repo` runs TWICE against
+# the same repo. Each run builds its commit off `MAIN_SHA` carrying only its own
+# files and force-PATCHes the shared `refs/heads/ci/bump-<tag>`, so the second
+# wipes the first's bumped files off the branch and then merely edits the
+# already-open PR — a green run reporting a partial bump, which is the BE-3896
+# class this refactor exists to kill. Canonicalizing here (rather than at the
+# grouping) means the masked value, every log line and every API path use ONE
+# spelling. The repo NAME's case is left as written: it is only ever consumed by
+# GitHub, which resolves it case-insensitively, and the grouping below matches it
+# case-insensitively too, so a `Foo`/`foo` pair collapses without the log having
+# to show a name nobody typed.
 CALLERS=()
 while IFS= read -r ENTRY; do
   echo "::add-mask::${ENTRY%%|*}"
   CALLERS+=("$ENTRY")
-done < <(jq -r '.[] | "\(.repo)|\(.file)|\(.label // "")|\(.wire_bot // "")"' <<<"$CALLERS_JSON")
+done < <(jq -r '.[] | "Comfy-Org/\(.repo | sub("\\A[^/]+/"; ""))|\(.file)|\(.label // "")|\(.wire_bot // "")"' <<<"$CALLERS_JSON")
 
 if (( ${#CALLERS[@]} == 0 )); then
   echo "::error::${VAR_NAME} parsed to zero callers — refusing to run a no-op dispatcher."
@@ -188,7 +303,13 @@ bump_repo() {
   # branch churn), so it is safe before the all-skip early return.
   local MAIN_SHA
   MAIN_SHA=$(gh api "repos/${REPO}/git/refs/heads/${DEFAULT_BRANCH}" --jq '.object.sha') || {
-    echo "::warning::${REPO}: cannot read ${DEFAULT_BRANCH} ref — skipping"
+    # The branch NAME is deliberately not interpolated into any per-file message.
+    # It comes from the private caller's repo metadata and is never `::add-mask::`ed
+    # (only repo names are), so a branch named after an internal project or codename
+    # would be printed verbatim into this public repo's run logs. Masking it instead
+    # is worse: the value is usually `main`, and masking `main` would redact the
+    # word everywhere it legitimately appears (`# main @ <sha>`, MAIN_SHA reports).
+    echo "::warning::${REPO}: cannot read the default-branch ref — skipping"
     return 1
   }
 
@@ -196,13 +317,30 @@ bump_repo() {
   # anything yet. This keeps the reset/commit path off entirely for a repo whose
   # files are all missing or already pinned (the old per-entry skips), so it
   # never resets a branch or opens a PR it doesn't need.
-  local -a PEND_FILE=() PEND_CONTENT=() LABELS=()
+  local -a PEND_FILE=() PEND_CONTENT=() LABELS=() SKIP_FILE=()
   local WIRING_ADDED_ANY=""
-  local ENTRY FILE LABEL WIRE_BOT FILE_ENC CURRENT OLD_CONTENT NEW_CONTENT
+
+  # `wire_bot` is unioned PER FILE, up front, rather than read off whichever entry
+  # happens to reach the staging code first. A repo may list one path twice (a
+  # structurally valid config the dedup below already handles), and only the FIRST
+  # of those entries is ever staged — so reading the flag per entry made the
+  # outcome depend on roster ORDER: `[{ci.yml, wire_bot: true}, {ci.yml}]` wired
+  # the identity while the reverse order silently did not. Labels are already
+  # unioned across duplicates for exactly this reason; this is the same rule for
+  # the other per-entry field. A file flagged by ANY of its entries is wired.
+  local -a WIRE_FILES=()
+  local ENTRY FILE LABEL WIRE_BOT FILE_ENC CURRENT OLD_CONTENT NEW_CONTENT P
+  for ENTRY in "$@"; do
+    [[ -n "$(cut -d'|' -f4 <<<"$ENTRY")" ]] && WIRE_FILES+=("$(cut -d'|' -f2 <<<"$ENTRY")")
+  done
+
   for ENTRY in "$@"; do
     FILE=$(cut -d'|' -f2 <<<"$ENTRY")
     LABEL=$(cut -d'|' -f3 <<<"$ENTRY")
-    WIRE_BOT=$(cut -d'|' -f4 <<<"$ENTRY")
+    WIRE_BOT=""
+    for P in ${WIRE_FILES[@]+"${WIRE_FILES[@]}"}; do
+      [[ "$P" == "$FILE" ]] && { WIRE_BOT=1; break; }
+    done
     FILE_ENC="${FILE//\//%2F}"
 
     # De-duplicate by file: a repo listed twice for the SAME path (a structurally
@@ -211,27 +349,60 @@ bump_repo() {
     # fail the whole repo even though the file was actually bumped. Fold the
     # duplicate entry's label into the set (it still applies to the one PR) but
     # do not re-stage the file.
-    local SEEN_FILE=0 P
+    #
+    # SKIP_FILE is consulted alongside PEND_FILE so the dedup also covers every
+    # path that was HANDLED but not staged — rejected (absent, or carrying no
+    # movable pin) and already-converged alike, i.e. all three of the early
+    # `continue`s below. Without it a doubly-listed broken path is re-fetched,
+    # warned about twice, and counted twice in the NOPIN tally — reporting more
+    # broken files than there are distinct broken roster entries — and a
+    # doubly-listed already-current path is re-fetched and skip-logged twice.
+    #
+    # The two sets are scanned SEPARATELY because only a PENDING match may fold
+    # its label. A duplicate of a SKIPPED path is an entry whose file is not in
+    # this PR at all, and the label-collection site below states the invariant:
+    # labels from skipped entries must not land on the repo's real bump PR, or a
+    # monorepo that lists a 404'd path twice — the second entry carrying, say,
+    # `do-not-merge` — would stamp that blocking label onto the PR built from its
+    # OTHER, healthy file.
+    local SEEN_FILE=0 SEEN_PENDING=0
     for P in ${PEND_FILE[@]+"${PEND_FILE[@]}"}; do
-      [[ "$P" == "$FILE" ]] && { SEEN_FILE=1; break; }
+      [[ "$P" == "$FILE" ]] && { SEEN_FILE=1; SEEN_PENDING=1; break; }
     done
+    if (( ! SEEN_FILE )); then
+      for P in ${SKIP_FILE[@]+"${SKIP_FILE[@]}"}; do
+        [[ "$P" == "$FILE" ]] && { SEEN_FILE=1; break; }
+      done
+    fi
     if (( SEEN_FILE )); then
-      [[ -n "$LABEL" ]] && LABELS+=("$LABEL")
+      if (( SEEN_PENDING )) && [[ -n "$LABEL" ]]; then LABELS+=("$LABEL"); fi
       continue
     fi
 
     # Fetch current file, pinned to the resolved tip. Distinguish a genuine 404
-    # (this file is actually absent → an expected per-file skip) from ANY other
-    # failure (auth, rate limit, 5xx, network). Treating a transient error as
-    # "not found" and continuing would open a PR that silently OMITS this file
-    # while the job still reports success — the partial-bump class this refactor
-    # exists to kill (BE-3896). So a non-404 failure fails the whole repo.
+    # from ANY other failure (auth, rate limit, 5xx, network). Treating a
+    # transient error as "not found" and continuing would open a PR that silently
+    # OMITS this file while the job still reports success — the partial-bump class
+    # this refactor exists to kill (BE-3896). So a non-404 failure fails the whole
+    # repo.
+    #
+    # A 404 is NOT a benign skip (BE-6471): the roster named a path that does not
+    # exist, so this entry can never be bumped — the renamed- or typo'd-caller case
+    # that is the whole reason for the un-bumpable tally below, and strictly worse
+    # than the no-movable-pin case since not even the file is there. It is recorded
+    # in NOPIN and fails the job at the END (never `return 1`, which would punish
+    # this repo's other, perfectly bumpable files). This deliberately turns a
+    # previously green run red when a roster entry has gone stale; that is the
+    # point — this repo's own `ci-groom.yml` drifted for weeks behind exactly such
+    # a silent skip.
     local ERRFILE RC
     ERRFILE=$(mktemp)
     CURRENT=$(gh api "repos/${REPO}/contents/${FILE_ENC}?ref=${MAIN_SHA}" 2>"$ERRFILE"); RC=$?
     if (( RC != 0 )); then
       if grep -qi 'HTTP 404' "$ERRFILE"; then
-        echo "::warning::${REPO}: ${FILE} not found — skipping"
+        echo "::warning::${REPO}: ${FILE} not found on the default branch — fix or remove its ${VAR_NAME} entry"
+        NOPIN+=("${REPO}|${FILE}")
+        SKIP_FILE+=("$FILE")
         rm -f "$ERRFILE"
         continue
       fi
@@ -303,9 +474,139 @@ bump_repo() {
     # un-bumped (a `workflows_ref` disagreeing with its own `uses:` pin) is the
     # worse failure. Unreachable while no caller calls two reusables; if one ever
     # does, parse the YAML instead of extending this rule.
-    local SHA_ADDR='github-workflows|workflows_ref'
+    # The address's filename half needs a LEFT delimiter. `github-workflows[^
+    # [:space:]]*groom\.yml` is satisfied by a sibling caller pinning
+    # `…/workflows/legacy-groom.yml` — the target name merely ENDS the token — so
+    # that caller would be treated as ours, repinned to this fleet's SHA by rules
+    # 1/4-6, and pass the address-filtered assertion. Requiring the `/` that
+    # starts the filename scopes it to the intended reusable. A right delimiter is
+    # unnecessary: `[^[:space:]]*` cannot cross whitespace, so the match is
+    # confined to the single `uses:` token, where `.yml` is followed by `@`.
+    #
+    # SHA_ADDR is consumed two ways and needs two spellings. `grep -E` takes it
+    # raw; sed takes it as a `/…/` ADDRESS, where an unescaped `/` would close the
+    # address early and silently change what the rules match — so the sed form
+    # escapes it, which is the delimiter-escape POSIX defines for exactly this.
+    # (The non-sibling address contains no `/`, so the two forms coincide there.)
+    local SHA_ADDR SHA_ADDR_SED
+    SHA_ADDR='github-workflows|workflows_ref'
     if (( GW_HAS_SIBLING )); then
-      SHA_ADDR="github-workflows[^[:space:]]*${WORKFLOW_FILE//./\\.}|workflows_ref"
+      SHA_ADDR="github-workflows[^[:space:]]*/${WORKFLOW_FILE//./\\.}|workflows_ref"
+    fi
+    SHA_ADDR_SED="${SHA_ADDR//\//\\/}"
+
+    # ASSERT, BEFORE the rewrite, that this file carries a pin THIS fleet can
+    # address at all (BE-6471). The post-rewrite assertion further down answers
+    # "did every pin we found move?"; it cannot answer "was there a pin to find?"
+    # — and neither can the content-equality skip below, because a file with no
+    # addressable pin rewrites to itself and is reported as `already at <short> —
+    # skipping`. That reads as convergence and is why a misconfigured roster entry
+    # can drift forever behind a green run: this repo's own `ci-groom.yml` was
+    # absent from `GROOM_CALLERS` for weeks while nothing in the log said so.
+    #
+    # "Addressable" is read on the SAME SHA_ADDR-eligible lines as the rewrite,
+    # with the ASSERTION's REF reader (`[^[:space:]]+`, hung off a `uses:`-anchored
+    # pin token — see ADDR_RE below) rather than the
+    # rewrite's narrower `REF_RE`. That pairing is deliberate: this gate asks "is
+    # there a pin here at all?", and anything the assertion below would judge must
+    # count as one. Reading with REF_RE instead would classify a pin the rewrite
+    # cannot move — `uses: …@${{ inputs.ref }}`, whose ref begins with a character
+    # REF_RE excludes — as "no pin at all", skipping the file and letting the
+    # repo's OTHER files ship a PR, where the assertion previously failed the whole
+    # repo. Broad here, narrow there: the gate admits it, the assertion fails it.
+    #
+    # Note what this does NOT require: a 40-hex ref. Rules 1-2 move a ref by
+    # POSITION, not by shape (BE-4662), so a caller pinned to `@v1` is self-healed
+    # to NEW_SHA rather than reported — demanding a full SHA here would fail
+    # exactly the callers the bumper exists to fix. What is left is the genuinely
+    # un-bumpable roster entry: a file that names no `Comfy-Org/github-workflows`
+    # pin (wrong file, or not a caller at all), or one whose only github-workflows
+    # `uses:` belongs to a DIFFERENT fleet's reusable, where the stale entry rather
+    # than the file is the thing to fix.
+    #
+    # That second case is why a bare `workflows_ref:` does NOT vouch for the file —
+    # UNCONDITIONALLY, not merely when a sibling `uses:` was detected. SHA_ADDR's
+    # `workflows_ref` alternative is not fleet-scoped (it cannot be — see rule 2's
+    # comment above), so a sibling fleet's DOUBLE-pinning caller (groom and pr-risk
+    # callers carry both `uses:` and `workflows_ref:`) would otherwise pass this
+    # gate on its `workflows_ref:` line alone: rule 1 correctly declines its `uses:`
+    # pin, but rule 2 — which is unaddressed — would still stamp THIS fleet's
+    # NEW_SHA onto that caller's `workflows_ref`, and the post-rewrite assertion is
+    # address-filtered, so it stays silent. A green run would ship a split-pin,
+    # cross-fleet PR: precisely the misfiled roster entry this gate exists to catch.
+    #
+    # Gating that requirement on GW_HAS_SIBLING left the hole open, because the
+    # flag is derived from a CASE-SENSITIVE grep (`github-workflows/\.github/…`,
+    # see GW_USES above) while a `uses:` pin is legal in any case. A caller spelled
+    # `comfy-org/GitHub-Workflows/…/groom.yml@…` — or one whose `uses:` of this
+    # repo is commented out or deleted, leaving the input behind — yields an EMPTY
+    # GW_USES, so GW_HAS_SIBLING is 0, so the relaxed address applied and the bare
+    # `workflows_ref:` vouched for the file after all. Requiring the `uses:` pin in
+    # both branches closes it, and costs nothing: a caller of this fleet always has
+    # one (`workflows_ref` is an input to a job whose `uses:` is the pin), which was
+    # checked rather than assumed — all 51 caller files across the six seeded
+    # rosters carry an addressable `uses:` pin today, so no live caller changes
+    # behaviour. It also makes the second bullet of the README's un-bumpable list
+    # true as written.
+    #
+    # Two known blind spots, called out so the warning is not read as gospel.
+    # SHA_ADDR's `github-workflows` literal is case-SENSITIVE while USES_PIN_RE is
+    # deliberately case-insensitive, so a caller spelled
+    # `comfy-org/GitHub-Workflows/…` yields an empty PIN_SCAN and is reported here
+    # as un-bumpable. That report is not wrong — the rewrite cannot move that pin
+    # either, and before this gate it was mis-logged as `already at <short>` — but
+    # the fix is the pin's spelling, not the roster entry, hence the hint in the
+    # warning text. No caller spells it that way today.
+    #
+    # The second is the price of the `uses:` anchoring below: a `uses:` whose VALUE
+    # sits on the next line (legal YAML, never written that way for `uses:`) leaves
+    # the key and the pin token on different lines, so this gate reports a file the
+    # line-wise rewrite could in fact have moved. That direction is the safe one —
+    # a false negative here is a red run naming the file, where a false POSITIVE is
+    # a bump PR opened against something that never called us — and it is the same
+    # trade every other rule in this block makes. Both spellings are named in the
+    # warning so the operator is not sent hunting the roster for a file problem.
+    #
+    # Comments are stripped first, by YAML's own rule (a `#` preceded by
+    # whitespace, every line pre-padded with a space so a `#` at column 0 counts),
+    # for the same reason the post-rewrite assertion strips them and for the same
+    # reason GW_USES is anchored to `^[^#]*uses:`: a commented-out old pin or a
+    # docs URL must not vouch for a live pin that is not there.
+    #
+    # The reader is anchored to the `uses:` KEY, not just to the pin token, so the
+    # code matches the contract the comment and README state ("carries a `uses:`
+    # pin of Comfy-Org/github-workflows"). Unanchored, `USES_PIN_RE[^[:space:]]+`
+    # is satisfied by any `Comfy-Org/github-workflows@<ref>` token anywhere on an
+    # eligible line — a `run:` curl of this repo, an `env:` scalar, a repo@ref
+    # handed to some OTHER action — none of which make the file a caller. Rule 1
+    # is addressed by the same unscoped token, so such a file cleared the gate and
+    # was then rewritten and PR'd as a bump of something that never called us.
+    # The optional quote covers the legal `uses: "…@v1"` spelling; `[[:space:]]*`
+    # rather than a single space covers `uses:  X` and the `- uses:` list form
+    # (the `-` sits left of the key, outside the match).
+    local PIN_SCAN ADDR_RE
+    PIN_SCAN=$(sed -E 's|^| |; s|[[:space:]]#.*$||' <<<"$OLD_CONTENT" | grep -E "$SHA_ADDR") || true
+    ADDR_RE="uses:[[:space:]]*['\"]?${USES_PIN_RE}[^[:space:]]+"
+    if ! grep -qE "$ADDR_RE" <<<"$PIN_SCAN"; then
+      # ${REPO} is safe to print — it was `::add-mask::`ed at parse time, so it
+      # renders as *** in the public log; ${FILE} is a `.github/workflows/` path,
+      # which the roster validation above already constrained to that shape.
+      echo "::warning::${REPO}: ${FILE} carries no ${WORKFLOW_FILE} pin this bumper can move (wrong file, a sibling fleet's reusable, a non-canonically-cased pin, a uses: value on its own line, or not a caller at all?) — fix or remove its ${VAR_NAME} entry"
+      # Recorded, NOT returned: the per-repo loop turns a non-zero return into a
+      # whole-repo FAILED entry, which would punish this repo's OTHER, perfectly
+      # bumpable files. Skip just this file and let the end-of-run accounting fail
+      # the job once every caller has had its turn. SKIP_FILE so a repo listed
+      # TWICE for this same path is warned and tallied ONCE — the PEND_FILE dedup
+      # above cannot see a file that never reaches the pending set.
+      #
+      # Skipping the file also skips the `wire_bot` block further down, so say so
+      # rather than letting a flagged entry quietly lose its identity wiring: the
+      # entry is being declared broken, and wiring a bot identity into a file we
+      # have just decided we cannot address would be the wrong half of a bump.
+      [[ -n "$WIRE_BOT" ]] && echo "::warning::${REPO}: ${FILE} is also flagged wire_bot — its identity wiring was NOT applied either"
+      NOPIN+=("${REPO}|${FILE}")
+      SKIP_FILE+=("$FILE")
+      continue
     fi
     #
     # The `# github-workflows#NN` legacy marker (and its already-converted
@@ -332,11 +633,11 @@ bump_repo() {
     # matches neither. A hex-boundary assertion (`\b`, `[[:>:]]`) would be simpler
     # but spells differently in GNU and BSD sed; this is portable ERE.
     NEW_CONTENT=$(sed -E "
-      /${SHA_ADDR}/ s|(${USES_PIN_RE})${REF_RE}|\1${NEW_SHA}|g
+      /${SHA_ADDR_SED}/ s|(${USES_PIN_RE})${REF_RE}|\1${NEW_SHA}|g
       s|^(${INPUT_PIN_RE})${REF_RE}|\1${NEW_SHA}|
-      /${SHA_ADDR}/ s|# main @ [0-9a-f]{40}|# main @ ${NEW_SHA}|g
-      /${SHA_ADDR}/ s|# main @ [0-9a-f]{7,12}([^0-9a-f])|# main @ ${SHORT}\1|g
-      /${SHA_ADDR}/ s|# main @ [0-9a-f]{7,12}\$|# main @ ${SHORT}|g
+      /${SHA_ADDR_SED}/ s|# main @ [0-9a-f]{40}|# main @ ${NEW_SHA}|g
+      /${SHA_ADDR_SED}/ s|# main @ [0-9a-f]{7,12}([^0-9a-f])|# main @ ${SHORT}\1|g
+      /${SHA_ADDR_SED}/ s|# main @ [0-9a-f]{7,12}\$|# main @ ${SHORT}|g
     " <<<"$OLD_CONTENT")
 
     # Normalize the human-readable pin annotation so it never disagrees with the
@@ -394,61 +695,17 @@ bump_repo() {
       fi
     fi
 
-    # ROSTER-ENTRY CHECK (BE-6015) — asked of the ORIGINAL content, before the
-    # no-op test below. A stale roster entry can send this function to a file
-    # that calls no github-workflows reusable in a spelling this script can
-    # parse at all ("not provably ours" — treated exactly like the rewrite
-    # address above: a quiet skip) OR to a file that DOES call some
-    # github-workflows reusable, but only a SIBLING fleet's, never ours. That
-    # second case is not something the rewrite below can ever fix — there is
-    # nothing of ours in the file to bump — so it is caught here, before the
-    # no-op branch, and blamed on the roster entry rather than the file.
-    #
-    # This is narrower than it first was: two more checks used to sit here —
-    # "is `uses:` pinned by 40-hex" and "is `workflows_ref:` pinned by
-    # 40-hex" — but BE-4662 (landed on main after this PR was opened) anchored
-    # the rewrite to the pin TOKEN rather than to 40-hex-ness, so a
-    # placeholder, tag, or short-SHA pin is now self-healed by the sed above
-    # regardless of its prior shape. Keeping those two checks here would warn
-    # on — and, worse, refuse to stage — callers the bumper can in fact bump,
-    # contradicting the STALE_PINS assertion below on the very same file. The
-    # one shape STALE_PINS still cannot move, a `workflows_ref` fed by a
-    # `${{ … }}` expression, is a value the rewrite has never touched and that
-    # assertion already fails the run for.
-    local PIN_OK=1
-    if ! grep -qxF "$WORKFLOW_FILE" <<<"$GW_USES"; then
-      # `GW_USES` empty means no `uses:` line here names a github-workflows
-      # reusable in a spelling this script can parse — "not provably ours", which
-      # stays silent exactly as the rewrite address above does. Non-empty but
-      # WITHOUT our file is a different animal: the roster sent us to a file that
-      # calls only a SIBLING fleet's reusable, so there is nothing here for this
-      # fleet to bump and the stale entry — not the file — is the bug.
-      if [[ -n "$GW_USES" ]]; then
-        PIN_OK=0
-        echo "::warning::${REPO}: ${FILE} has no \`uses:\` calling ${WORKFLOW_FILE} — it is listed in ${VAR_NAME} but this fleet has nothing to bump in it; fix the roster entry"
-      fi
-    fi
-    # Accumulate AND skip rather than `return 1`: a roster entry with nothing
-    # of ours to bump is broken by definition, so the run must not report
-    # success — but it must also not abort the fan-out, since every OTHER
-    # caller in the fleet still deserves its bump. The aggregate `::error::`
-    # after the loop is what makes this unskimmable; BE-6015 persisted for
-    # weeks precisely because a warning in a green run reads as noise.
-    #
-    # The `continue` is load-bearing, not cosmetic: rule 2's `workflows_ref:`
-    # rewrite (line 336, below) is deliberately UNADDRESSED — it fires on any
-    # `workflows_ref:` key in the file regardless of SHA_ADDR, because in the
-    # legitimate multi-reusable case there is no cheap way to tell "our" input
-    # from a sibling job's. A sibling-only file (this branch) has no `uses:`
-    # of ours at all, so a bare `workflows_ref:` in it belongs entirely to the
-    # sibling — falling through to the rewrite/stage below would silently
-    # repoint that sibling's asset ref at THIS fleet's SHA and open a PR for
-    # it. Stopping here, before the rewrite, is the only way to keep the file
-    # untouched.
-    if (( ! PIN_OK )); then
-      UNPINNABLE+=("${REPO}:${FILE}")
-      continue
-    fi
+    # A roster entry with no `uses:` calling ${WORKFLOW_FILE} — not provably
+    # ours, or provably a SIBLING fleet's reusable only — was formerly caught
+    # here (BE-6015). That check is now subsumed by the ADDR_RE gate above,
+    # which runs BEFORE this rewrite (not after) and closes a case this one
+    # missed: it keyed on a case-SENSITIVE `uses:` scan (GW_USES), so a
+    # differently-cased `uses:` of a sibling reusable slipped through as
+    # "not provably ours" and fell through to the rewrite/stage path below,
+    # where rule 2's unaddressed `workflows_ref:` rewrite could then repoint a
+    # sibling fleet's asset ref at THIS fleet's SHA (BE-6471). NOPIN/SKIP_FILE
+    # above is where that outcome — and the plain "roster names an
+    # unaddressable file" case — is now recorded and tallied.
 
     # ASSERT that the rewrite actually moved EVERY github-workflows pin in this
     # file, before it can be staged (BE-4662). The patterns above are precise by
@@ -517,10 +774,14 @@ bump_repo() {
     # NEW_SHA appearing *anywhere*) also repairs a half-bumped file: if a prior
     # run left one of two refs at NEW_SHA and the other stale, the content still
     # differs here, so the file is re-staged and repaired instead of skipped.
-    # The "already at" line is claimed only when the pin check above vouched for
-    # the file; otherwise the warning it just emitted is the whole story.
     if [[ "$NEW_CONTENT" == "$OLD_CONTENT" ]]; then
-      (( PIN_OK )) && echo "${REPO}: ${FILE} already at ${SHORT} — skipping"
+      echo "${REPO}: ${FILE} already at ${SHORT} — skipping"
+      # SKIP_FILE here too, so this third early-`continue` gets the same
+      # fetched-once/reported-once property as the other two: a repo listing the
+      # same already-converged path twice would otherwise re-fetch it and print
+      # the skip line twice. Recording it in SKIP_FILE (not PEND_FILE) is also
+      # what keeps a duplicate entry's label off the PR — this file is not in it.
+      SKIP_FILE+=("$FILE")
       continue
     fi
 
@@ -665,9 +926,14 @@ bump_repo() {
   # merged/closed — and its branch possibly auto-deleted — since the last run).
   # Apply every distinct non-empty label the repo's entries carried (they need
   # not agree; dedup so `gh pr create` isn't passed the same label twice).
-  # Exact-match membership (not a `|${L}|` substring sentinel): GitHub label
-  # names may themselves contain `|`, so a substring test could drop a distinct
-  # label whose name is a substring of an already-seen one (e.g. `bug` vs `bug|ui`).
+  # Exact-match membership, not a `|${L}|` substring sentinel: a substring test
+  # drops a distinct label whose name merely CONTAINS an already-seen one
+  # (`bug` vs `bugfix`). The original reasoning here cited `bug` vs `bug|ui` — a
+  # pipe-bearing label — which is no longer representable: the roster validation
+  # rejects `|` in a label outright, because this list is reconstructed from the
+  # `|`-joined tuples and such a label would have been truncated long before
+  # reaching here (BE-6471). Exact matching is still the right test; only the
+  # example changed.
   local -a LABEL_ARGS=() SEEN_LABELS=()
   local L S DUP
   for L in ${LABELS[@]+"${LABELS[@]}"}; do
@@ -678,13 +944,29 @@ bump_repo() {
     (( DUP )) && continue
     SEEN_LABELS+=("$L"); LABEL_ARGS+=(--label "$L")
   done
+  # `${arr[@]+"${arr[@]}"}` like every other possibly-empty array here, NOT a bare
+  # `"${LABEL_ARGS[@]}"`: under `set -u` on bash < 4.4 — the 3.2 a macOS checkout
+  # still has, which the case-folding below is deliberately written for —
+  # expanding an empty array is an unbound-variable error that aborts the shell.
+  # An entry with no label is the COMMON case, so the bare form would have taken
+  # out the whole run on the first unlabelled caller.
+  #
+  # stdout is dropped as well as stderr. On success `gh pr create` prints the new
+  # PR's URL, and that URL is built from GitHub's CANONICAL `html_url` — i.e. the
+  # repo name as GitHub spells it, which need not be the spelling the roster used.
+  # `::add-mask::` is a case-sensitive literal match on the roster's spelling, so a
+  # roster entry naming `Comfy-Org/Secret-Alpha` for a repo GitHub calls
+  # `secret-alpha` would mask one string and print the other into this public
+  # repo's run log — an irreversible disclosure of a private caller. The masked
+  # `PR opened` line below carries the same information for an operator, and the
+  # update-in-place path already discards `gh pr edit`'s output for this reason.
   if gh pr create \
     --repo "${REPO}" \
     --head "${BRANCH}" \
     --base "${DEFAULT_BRANCH}" \
     --title "${PR_TITLE}" \
     --body "${PR_BODY}" \
-    "${LABEL_ARGS[@]}" 2>/dev/null; then
+    ${LABEL_ARGS[@]+"${LABEL_ARGS[@]}"} >/dev/null 2>&1; then
     echo "${REPO}: PR opened"
     return 0
   else
@@ -701,26 +983,43 @@ bump_repo() {
 # Group the flat entry list by repo, preserving first-seen order, so each repo
 # is bumped exactly once with ALL of its files (BE-3896). `|` can't appear in a
 # repo name (it is the field delimiter), so it is a safe membership sentinel.
+#
+# Matched on a CASE-FOLDED key, because GitHub does too: it will not host two
+# repos in one owner differing only in case, so `Comfy-Org/Foo` and
+# `Comfy-Org/foo` are two spellings of ONE repo. Grouping them byte-exactly would
+# run `bump_repo` twice against it, and the second run's force-PATCH of the shared
+# bump branch would discard the first's files (see the canonicalization comment at
+# the tuple build). The owner half is already canonical by then; this closes the
+# name half. `tr` rather than `${VAR,,}` so the script keeps running under the
+# bash 3.2 a macOS checkout still has.
 REPOS=()
 SEEN_REPOS=""
 for ENTRY in "${CALLERS[@]}"; do
   REPO="${ENTRY%%|*}"
+  REPO_KEY=$(tr '[:upper:]' '[:lower:]' <<<"$REPO")
   case "$SEEN_REPOS" in
-    *"|${REPO}|"*) ;;
-    *) REPOS+=("$REPO"); SEEN_REPOS="${SEEN_REPOS}|${REPO}|" ;;
+    *"|${REPO_KEY}|"*) ;;
+    *) REPOS+=("$REPO"); SEEN_REPOS="${SEEN_REPOS}|${REPO_KEY}|" ;;
   esac
 done
 
 FAILED=()
-# Caller files that carry no pin this fleet can move (BE-6015). Appended to from
-# inside bump_repo — deliberately a plain global, since the bump loop below runs
-# the function in this shell (no subshell/pipe), so the accumulation survives.
-UNPINNABLE=()
+# Caller files listed in the roster that this fleet can never bump — absent on the
+# caller's default branch, or present but carrying no pin this fleet can move
+# (BE-6471). Appended to from inside bump_repo — a plain global on purpose, since
+# the loop below runs the function in THIS shell (no subshell, no pipe), so the
+# appends survive. Declared here, before the first call, so `set -u` sees it.
+NOPIN=()
 for REPO in "${REPOS[@]}"; do
   # Collect this repo's entries (in their original order) and bump them together.
+  # Case-folded on both sides, matching the grouping above — otherwise a
+  # `Foo`/`foo` pair would collapse into ONE `REPOS` entry (so the repo is bumped
+  # once, correctly) while the second spelling's files failed to match here and
+  # were silently dropped from the bump: the partial bump again, by the other door.
+  REPO_KEY=$(tr '[:upper:]' '[:lower:]' <<<"$REPO")
   ENTRIES=()
   for ENTRY in "${CALLERS[@]}"; do
-    [[ "${ENTRY%%|*}" == "$REPO" ]] && ENTRIES+=("$ENTRY")
+    [[ "$(tr '[:upper:]' '[:lower:]' <<<"${ENTRY%%|*}")" == "$REPO_KEY" ]] && ENTRIES+=("$ENTRY")
   done
   bump_repo "$REPO" "${ENTRIES[@]}" || FAILED+=("$REPO")
 done
@@ -728,16 +1027,48 @@ done
 if (( ${#FAILED[@]} )); then
   printf '::error::bump failed for %d repo(s): %s\n' "${#FAILED[@]}" "${FAILED[*]}"
 fi
-# Every other caller has been bumped by now; failing here (rather than at the
-# first offender) keeps the fan-out complete while still refusing to report
-# success for a fleet that contains a caller the bumper cannot keep current.
-# Repo names are `::add-mask::`ed at parse time, so this prints *** in the public
-# log while the file path stays readable enough to act on.
-if (( ${#UNPINNABLE[@]} )); then
-  printf '::error::%d caller file(s) this bumper cannot keep current for %s — see the per-file warnings above: %s\n' \
-    "${#UNPINNABLE[@]}" "${WORKFLOW_FILE}" "${UNPINNABLE[*]}"
+# An un-bumpable caller file fails the job, for the same reason an empty roster
+# does (see the ALLOW_EMPTY comment above): a silent no-op dispatcher leaves
+# callers un-bumped with nobody noticing, and a per-entry silent no-op is that
+# same failure one level down. Failing HERE rather than at the offending file
+# preserves the fan-out — one bad entry never blocks another repo's bump, which is
+# how FAILED already behaves. Only the COUNT is printed: the per-file warnings
+# above carry the (masked) repo and the path, and the roster is private.
+#
+# Counted in caller FILES, not roster entries: the SKIP_FILE dedup records one
+# element per distinct broken path per repo, so two entries naming the same
+# missing path are one element here. Reporting that as a count of entries would
+# tell an operator who removed one of the two to expect the number to fall, and
+# it would not.
+#
+# Repos in FAILED are excluded. A `return 1` from bump_repo (transient fetch
+# error, blob/tree/commit failure, the post-rewrite assertion) abandons that
+# repo's bump WHOLESALE, but any NOPIN element already appended for an earlier
+# file of the same repo survives it — so the repo would be tallied in both lists
+# and the aggregate would tell the operator to "fix or remove" roster entries for
+# a bump that was dropped for an unrelated, possibly transient reason. The
+# per-file warning above still stands on its own; only the actionable tally is
+# filtered. `|` is the tuple delimiter and cannot occur in a repo name, so it is
+# a safe sentinel here as it is in the grouping above.
+NOPIN_ACTIONABLE=0
+if (( ${#NOPIN[@]} )); then
+  FAILED_KEYS=""
+  for REPO in ${FAILED[@]+"${FAILED[@]}"}; do
+    FAILED_KEYS="${FAILED_KEYS}|$(tr '[:upper:]' '[:lower:]' <<<"$REPO")|"
+  done
+  for NP in "${NOPIN[@]}"; do
+    NP_KEY=$(tr '[:upper:]' '[:lower:]' <<<"${NP%%|*}")
+    case "$FAILED_KEYS" in
+      *"|${NP_KEY}|"*) ;;
+      *) NOPIN_ACTIONABLE=$((NOPIN_ACTIONABLE+1)) ;;
+    esac
+  done
 fi
-if (( ${#FAILED[@]} || ${#UNPINNABLE[@]} )); then
+if (( NOPIN_ACTIONABLE )); then
+  printf '::error::%d caller file(s) cannot be bumped by this fleet (missing file, or no movable %s pin) — see the warnings above; fix or remove those %s entries\n' \
+    "${NOPIN_ACTIONABLE}" "${WORKFLOW_FILE}" "${VAR_NAME}"
+fi
+if (( ${#FAILED[@]} || ${#NOPIN[@]} )); then
   exit 1
 fi
 echo "${TAG} bump complete for all callers."
