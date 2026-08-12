@@ -43,6 +43,16 @@ on:
       # behavior change here needs the same caller bump as a workflow-file
       # change, or pinned callers silently drift onto stale tool behavior.
       - scripts/check-pr-size/**
+      # …but the Go tests under that dir are NOT part of what a pinned caller
+      # executes — pr-size.yml builds the tool and runs it, and never runs
+      # `go test` — so a test-only commit would mint the org-wide bot token,
+      # force-reset the stable ci/bump-pr-size branch and fan a pure-churn
+      # SHA-bump PR (identical consumer behavior, a review round in every caller
+      # repo) across the whole fleet. Exclude them so a bump PR keeps meaning
+      # "consumer-visible behavior changed". Negations only strip the paths they
+      # match: a commit touching size.go AND its test still matches the positive
+      # pattern and still bumps.
+      - '!scripts/check-pr-size/*_test.go'
 
 permissions:
   contents: read
@@ -95,7 +105,22 @@ jobs:
         env:
           NEW_SHA: ${{ github.sha }}
           WATCHED: .github/workflows/pr-size.yml
+          # Kept alongside WATCHED_PATHSPECS deliberately. The pathspec list
+          # SUPERSEDES this input's tree-OID staleness comparison (it has to —
+          # an OID cannot express the `*_test.go` exclusion below, so a
+          # test-only commit would move this tree and freeze the fleet as a
+          # permanent stale re-run). What it does NOT supersede is the
+          # decommission probe: WATCHED_ASSETS is still what notices this
+          # directory disappearing, and preflight cross-checks that the
+          # pathspecs reach every entry of it.
           WATCHED_ASSETS: scripts/check-pr-size
+          # MIRRORS the `paths:` filter above, exclusions included — that is the
+          # coupling, not a coincidence. Widen one and you widen the other in the
+          # same change; test_paths_contract.sh fails the build otherwise.
+          WATCHED_PATHSPECS: |
+            .github/workflows/pr-size.yml
+            scripts/check-pr-size
+            :(exclude)scripts/check-pr-size/*_test.go
         run: bash .github/bump-callers/preflight.sh
 
       - name: Generate Cloud Code Bot token

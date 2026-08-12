@@ -149,6 +149,39 @@ has_preflight() { grep -q '^      - name: Preflight' "$1"; }
 # This is the same literal-path shape preflight.sh's validate_path enforces.
 normalize_glob() { local v="$1"; printf '%s' "${v%/\*\*}"; }
 
+# Set-compare a fleet's WATCHED_PATHSPECS against its `paths:` filter.
+#   $1  = the parsed WATCHED_PATHSPECS value (newline-separated)
+#   $2… = the filter's POSITIVE entries, already normalized, then its NEGATIVE
+#         (`!…`) entries verbatim — the caller splits them because the two halves
+#         translate differently.
+# Prints a two-line diagnostic and returns 1 on any mismatch; returns 0 on an
+# exact match. Extracted from the loop below so the self-test can drive it with
+# fixtures: the real entrypoints are all CORRECT by construction, so nothing in
+# this file would otherwise exercise a single rejection path.
+compare_pathspecs() { # $1 = pathspecs, $2.. = positives then negatives
+  local specs="$1"; shift
+  local want_specs=() got_specs=() p s
+  for p in "$@"; do
+    if [[ "$p" == '!'* ]]; then
+      # Exclusions keep their glob VERBATIM on both sides. `*_test.go` is a real
+      # git pathspec that git matches itself, and normalizing it to the parent
+      # directory the way a positive entry is normalized would silently widen the
+      # exclusion to swallow the whole tool — the fleet would then never bump.
+      want_specs+=(":(exclude)${p#!}")
+    else
+      want_specs+=("$p")
+    fi
+  done
+  while IFS= read -r s; do [[ -n "$s" ]] && got_specs+=("$s"); done <<<"$specs"
+  local want_sorted got_sorted
+  want_sorted="$(printf '%s\n' "${want_specs[@]}" | LC_ALL=C sort)"
+  got_sorted="$(printf '%s\n' "${got_specs[@]}" | LC_ALL=C sort)"
+  [[ "$want_sorted" == "$got_sorted" ]] && return 0
+  printf '        filter →  %s\n        pathspecs: %s' \
+    "$(echo "$want_sorted" | tr '\n' ' ')" "$(echo "$got_sorted" | tr '\n' ' ')"
+  return 1
+}
+
 # --- the contract ------------------------------------------------------------
 
 shopt -s nullglob
@@ -196,18 +229,38 @@ for path in "${FILES[@]}"; do
     continue
   fi
 
-  # An excluding filter cannot be expressed as WATCHED/WATCHED_ASSETS at all: the
-  # tree OID of the broader directory still moves when an excluded file changes,
-  # which reads as "the watched surface changed" and freezes the fleet.
-  excluded=0
-  for p in "${filter[@]}"; do [[ "$p" == '!'* ]] && excluded=1; done
-  if (( excluded )); then
-    bad "${file}: runs preflight.sh but its \`paths:\` filter carries a \`!\` exclusion, which WATCHED/WATCHED_ASSETS cannot express — every commit touching an excluded path would freeze this fleet as a permanent stale re-run"
+  # An excluding filter cannot be expressed as WATCHED/WATCHED_ASSETS: the tree
+  # OID of the broader directory still moves when an excluded file changes, which
+  # reads as "the watched surface changed" and freezes the fleet as a permanent
+  # stale re-run. Until BE-6676 there was nothing that COULD express it, so this
+  # test rejected the shape outright. WATCHED_PATHSPECS can — `git diff` takes
+  # the exclusions verbatim — so the rule is no longer "no exclusions" but
+  # "exclusions must be mirrored into WATCHED_PATHSPECS". The freeze the old
+  # rejection prevented is now the missing-input case below, which still fails.
+  pathspecs="$(parse_preflight_env "$path" WATCHED_PATHSPECS)"
+  positives=() negatives=()
+  for p in "${filter[@]}"; do
+    if [[ "$p" == '!'* ]]; then negatives+=("$p"); else positives+=("$(normalize_glob "$p")"); fi
+  done
+
+  if (( ${#negatives[@]} > 0 )) && [[ -z "$pathspecs" ]]; then
+    bad "${file}: runs preflight.sh and its \`paths:\` filter carries a \`!\` exclusion, but it sets no WATCHED_PATHSPECS — WATCHED/WATCHED_ASSETS compare tree OIDs, which cannot express an exclusion, so every commit touching an excluded path would freeze this fleet as a permanent stale re-run. Mirror the filter into WATCHED_PATHSPECS"
     continue
   fi
 
-  expected=()
-  for p in "${filter[@]}"; do expected+=("$(normalize_glob "$p")"); done
+  # Set-equivalence, in BOTH directions, whenever the input is in play — a fleet
+  # with no `!` that sets it anyway is held to the same standard, so the list
+  # cannot quietly drift away from the filter it is required to mirror.
+  if [[ -n "$pathspecs" ]]; then
+    if pathspec_diag="$(compare_pathspecs "$pathspecs" "${positives[@]}" "${negatives[@]}")"; then
+      ok "${file}: WATCHED_PATHSPECS mirrors the \`paths:\` filter, exclusions included"
+    else
+      bad "${file}: \`paths:\` filter and WATCHED_PATHSPECS disagree — the pathspec list MUST mirror the filter, exclusions included, or the staleness test asks a different question than the trigger
+${pathspec_diag}"
+    fi
+  fi
+
+  expected=("${positives[@]}")
 
   # WATCHED_ASSETS is a LIST — one entry per line (preflight.sh parses it the
   # same way). Appending the whole value as a single element would compare a
@@ -339,6 +392,105 @@ parser_case 'a # line inside a block scalar is literal content, not a comment' \
             # scripts/check-pr-size' \
 '.github/cursor-review
 # scripts/check-pr-size'
+
+# --- pathspec-equivalence self-test ------------------------------------------
+# Same reasoning as the parser fixtures above, for the BE-7084 relaxation: every
+# real entrypoint is correct by construction, so the loop only ever walks
+# compare_pathspecs' SUCCESS path. These fixtures pin the rejections — the ones
+# that matter are the two that would fail *green*, where the pathspec list and
+# the filter quietly ask different questions.
+echo
+echo "== pathspec-equivalence self-test =="
+
+# $1 = case name, $2 = expected verdict (ok|mismatch), $3 = WATCHED_PATHSPECS
+# value, $4.. = filter entries (positives normalized, negatives verbatim)
+pathspec_case() {
+  local name="$1" want_verdict="$2" specs="$3"; shift 3
+  local got_verdict=ok
+  compare_pathspecs "$specs" "$@" >/dev/null || got_verdict=mismatch
+  if [[ "$got_verdict" == "$want_verdict" ]]; then
+    ok "pathspecs: ${name}"
+  else
+    bad "pathspecs: ${name} — got ${got_verdict}, want ${want_verdict}"
+  fi
+}
+
+# The shape both fleets this ticket migrated actually use.
+pathspec_case 'the pr-size shape matches' ok \
+'.github/workflows/pr-size.yml
+scripts/check-pr-size
+:(exclude)scripts/check-pr-size/*_test.go' \
+  '.github/workflows/pr-size.yml' 'scripts/check-pr-size' '!scripts/check-pr-size/*_test.go'
+
+# Order is irrelevant — the comparison is a SET comparison, and an entrypoint
+# must not be able to fail this test by listing its pathspecs in a sane order
+# that happens to differ from its filter's.
+pathspec_case 'order does not matter' ok \
+':(exclude)scripts/check-pr-size/*_test.go
+scripts/check-pr-size
+.github/workflows/pr-size.yml' \
+  '.github/workflows/pr-size.yml' 'scripts/check-pr-size' '!scripts/check-pr-size/*_test.go'
+
+# THE case this relaxation exists to keep catching. Dropping the exclusion from
+# the pathspec list leaves the trigger excluding `*_test.go` while the staleness
+# test still compares it — a test-only commit then starts no run, and the next
+# real run reads the surface as changed and skips. Silent, and green.
+pathspec_case 'a dropped exclusion is caught' mismatch \
+'.github/workflows/pr-size.yml
+scripts/check-pr-size' \
+  '.github/workflows/pr-size.yml' 'scripts/check-pr-size' '!scripts/check-pr-size/*_test.go'
+
+# The other direction: an exclusion the filter does not have. The staleness test
+# would then ignore a path the trigger fires on, so the run that commit starts
+# re-points every caller having compared nothing that moved.
+pathspec_case 'an extra exclusion is caught' mismatch \
+'.github/workflows/pr-size.yml
+scripts/check-pr-size
+:(exclude)scripts/check-pr-size/*_test.go
+:(exclude)scripts/check-pr-size/README.md' \
+  '.github/workflows/pr-size.yml' 'scripts/check-pr-size' '!scripts/check-pr-size/*_test.go'
+
+# A missing POSITIVE is the classic under-verification: the list no longer covers
+# the reusable workflow itself, so a commit touching only it reads as unchanged.
+pathspec_case 'a missing positive is caught' mismatch \
+'scripts/check-pr-size
+:(exclude)scripts/check-pr-size/*_test.go' \
+  '.github/workflows/pr-size.yml' 'scripts/check-pr-size' '!scripts/check-pr-size/*_test.go'
+
+# The exclusion's glob is kept VERBATIM on both sides. Normalizing `*_test.go`
+# away the way a positive `x/**` is normalized would widen the exclusion to the
+# whole tool directory — the fleet would then never bump for any change at all —
+# so the two spellings must NOT compare equal.
+pathspec_case 'an exclusion normalized to its parent dir is caught' mismatch \
+'.github/workflows/pr-size.yml
+scripts/check-pr-size
+:(exclude)scripts/check-pr-size' \
+  '.github/workflows/pr-size.yml' 'scripts/check-pr-size' '!scripts/check-pr-size/*_test.go'
+
+# A `!` entry written into the list as-is, rather than translated to git's
+# `:(exclude)` magic, is not an exclusion to git at all — it is a literal path
+# named `!…`, which matches nothing.
+pathspec_case 'a raw ! entry is not accepted as an exclusion' mismatch \
+'.github/workflows/pr-size.yml
+scripts/check-pr-size
+!scripts/check-pr-size/*_test.go' \
+  '.github/workflows/pr-size.yml' 'scripts/check-pr-size' '!scripts/check-pr-size/*_test.go'
+
+# A fleet with no exclusions at all is still held to equivalence when it sets the
+# input — that is what stops the list drifting once it exists.
+pathspec_case 'a non-excluding fleet still has to match' mismatch \
+'.github/workflows/groom.yml' \
+  '.github/workflows/groom.yml' '.github/groom'
+
+# The freeze guard's trigger condition: an entrypoint that sets no
+# WATCHED_PATHSPECS must parse as EMPTY, which is what makes the
+# `!`-without-pathspecs branch above fire rather than silently comparing nothing.
+got_empty="$(parse_preflight_env <(printf '      - name: Preflight\n        env:\n          WATCHED: .github/workflows/x.yml\n      - name: Generate Cloud Code Bot token\n') WATCHED_PATHSPECS)"
+if [[ -z "$got_empty" ]]; then
+  ok "pathspecs: an absent WATCHED_PATHSPECS parses as empty (the freeze guard fires)"
+else
+  bad "pathspecs: an absent WATCHED_PATHSPECS parsed as '${got_empty}' — the \`!\`-without-pathspecs freeze guard would never fire"
+fi
 
 echo
 echo "== ${PASS} passed, ${FAIL} failed =="

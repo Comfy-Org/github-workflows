@@ -27,9 +27,9 @@ forward automatically instead of silently drifting commits behind.
 
 | Entrypoint | Triggers on a change to | Caller variable | Seeded |
 |---|---|---|---|
-| [`bump-cursor-review-callers.yml`](../workflows/bump-cursor-review-callers.yml) | `cursor-review.yml` or `cursor-review/**` | `CURSOR_REVIEW_CALLERS` | non-empty (hard-fails if empty) |
+| [`bump-cursor-review-callers.yml`](../workflows/bump-cursor-review-callers.yml) | `cursor-review.yml`, `cursor-review/**` or `scripts/check-pr-size/**` (minus its `*_test.go`, which no caller executes) | `CURSOR_REVIEW_CALLERS` | non-empty (hard-fails if empty) |
 | [`bump-agents-md-callers.yml`](../workflows/bump-agents-md-callers.yml) | `agents-md-integrity.yml` or `agents-md-integrity/**` | `AGENTS_MD_CALLERS` | empty `[]` (grows as callers land) |
-| [`bump-pr-size-callers.yml`](../workflows/bump-pr-size-callers.yml) | `pr-size.yml` or `scripts/check-pr-size/**` | `PR_SIZE_CALLERS` | empty `[]` (grows as callers land) |
+| [`bump-pr-size-callers.yml`](../workflows/bump-pr-size-callers.yml) | `pr-size.yml` or `scripts/check-pr-size/**` (minus its `*_test.go`, which no caller executes) | `PR_SIZE_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-pr-risk-callers.yml`](../workflows/bump-pr-risk-callers.yml) | `pr-risk.yml` or `scripts/pr-risk/**` (minus its `tests/` and `README.md`, which no caller executes) | `PR_RISK_CALLERS` | empty `[]` allowed (grows as callers land) |
 | [`bump-assign-reviewers-callers.yml`](../workflows/bump-assign-reviewers-callers.yml) | `assign-reviewers.yml` | `ASSIGN_REVIEWERS_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-groom-callers.yml`](../workflows/bump-groom-callers.yml) | `groom.yml` or `groom/**` | `GROOM_CALLERS` | empty `[]` (grows as callers land) |
@@ -293,7 +293,8 @@ exactly as the runtime does, or it certifies a config preflight.sh misparses.
 
 They must not be **wider** than the filter either, which is the direction an
 excluding fleet gets wrong. A commit touching only an excluded path (pr-risk's
-`scripts/pr-risk/tests`, its `README.md`) starts no run of its own, but it does
+`scripts/pr-risk/tests` and its `README.md`; pr-size's and cursor-review's
+`scripts/check-pr-size/*_test.go`) starts no run of its own, but it does
 change the tree OID of an over-broad `WATCHED_ASSETS` — so this run reports "the
 watched surface changed since", skips green as a stale re-run, and waits on a
 later run that will never exist. An exclusion is a reason to narrow the inputs, or
@@ -304,8 +305,10 @@ directory.
 hand-written, one per entrypoint, and until BE-6476 the only thing holding them
 in step was the checklist line above — `test_preflight.sh` drives synthetic
 fixtures and never reads the entrypoints. The contract test does: it parses each
-`bump-*-callers.yml`'s `push:` `paths:` filter, normalizes `…/**` to the literal
-path, and requires set equality with that file's `WATCHED` + `WATCHED_ASSETS`
+`bump-*-callers.yml`'s `push:` `paths:` filter, normalizes each POSITIVE entry's
+`…/**` to the literal path, and requires set equality with that file's `WATCHED`
++ `WATCHED_ASSETS` (the negations are held against `WATCHED_PATHSPECS` instead,
+below — they are precisely what those two inputs cannot express)
 (splitting a multi-line `WATCHED_ASSETS` into one entry per line, and reading the
 `|` block-scalar spelling as well as the single-line one — the parser mirrors
 preflight.sh deliberately, including honoring only `|`, taking block content

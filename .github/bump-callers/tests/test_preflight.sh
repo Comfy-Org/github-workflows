@@ -53,6 +53,16 @@ RISK_TOOLS="scripts/pr-risk"
 RISK_PATHSPECS=$'.github/workflows/pr-risk.yml\nscripts/pr-risk\n:(exclude)scripts/pr-risk/tests\n:(exclude)scripts/pr-risk/README.md'
 RISK_EXEC=$'.github/workflows/pr-risk.yml\nscripts/pr-risk/grade-pr-risk.sh\nscripts/pr-risk/grade-targets.sh\nscripts/pr-risk/resolve-enabled.sh'
 
+# The pr-size / cursor-review shape (BE-7084). Structurally different from
+# pr-risk's above: the exclusion is a FILE GLOB matching files that sit directly
+# in the watched directory, not a subdirectory that can be excluded wholesale.
+# `:(exclude)` with a glob is the part worth pinning — the excluded files are
+# interleaved with the watched ones, so nothing here can be expressed by naming
+# a narrower positive directory instead.
+SIZE_WATCHED=".github/workflows/pr-size.yml"
+SIZE_TOOLS="scripts/check-pr-size"
+SIZE_PATHSPECS=$'.github/workflows/pr-size.yml\nscripts/check-pr-size\n:(exclude)scripts/check-pr-size/*_test.go'
+
 CASE=""; SRC=""; ORIGIN=""; WORKDIR=""; OUTFILE=""; OUT=""; RC=0; P=""; N=""
 
 # --- fixture: a bare repo as `origin`, a clone as the run workspace -----------
@@ -99,6 +109,20 @@ seed_pr_risk() {
   printf 'grader test v1\n' > "${SRC}/${RISK_TOOLS}/tests/test_grade.sh"
   printf 'tool README v1\n' > "${SRC}/${RISK_TOOLS}/README.md"
   push_src 'seed the pr-risk tool surface'
+  clone_work
+}
+
+seed_pr_size() {
+  mkdir -p "${SRC}/${SIZE_TOOLS}"
+  printf 'name: PR size\non:\n  workflow_call:\n' > "${SRC}/${SIZE_WATCHED}"
+  printf 'package main\n\nfunc main() {}\n'        > "${SRC}/${SIZE_TOOLS}/main.go"
+  printf 'package main\n\nfunc size() int { return 1 }\n' > "${SRC}/${SIZE_TOOLS}/size.go"
+  printf 'module check-pr-size\n\ngo 1.22\n'       > "${SRC}/${SIZE_TOOLS}/go.mod"
+  # The files a pinned caller never executes: pr-size.yml builds the tool and
+  # runs it, and never runs `go test`.
+  printf 'package main\n\nfunc TestMain2(t *testing.T) {}\n' > "${SRC}/${SIZE_TOOLS}/main_test.go"
+  printf 'package main\n\nfunc TestSize(t *testing.T) {}\n'  > "${SRC}/${SIZE_TOOLS}/size_test.go"
+  push_src 'seed the check-pr-size tool surface'
   clone_work
 }
 
@@ -835,6 +859,93 @@ check "a list omitting it: exit 1"    "[[ $RC -eq 1 ]]"
 check "a list omitting it: ::error::" \
   "grep -q \"::error::WATCHED_PATHSPECS does not select WATCHED\" <<<\"\$OUT\""
 check "a list omitting it: no output" "[[ ! -s \"$OUTFILE\" ]]"
+
+# ---------------------------------------------------------------------------
+new_case pathspec_test_glob 'pr-size/cursor-review shape: a *_test.go-only commit is not stale'
+# BE-7084's literal configuration, and the reason it needs a pathspec at all.
+# `scripts/check-pr-size/**` in both fleets' filters also matches main_test.go /
+# size_test.go, which a pinned caller NEVER executes — pr-size.yml builds the
+# tool and runs it, and never runs `go test`. Excluding them from the trigger is
+# only half the fix: the tree OID of scripts/check-pr-size still moves for a
+# test-only commit, so an object comparison would call this run stale and wait
+# for a run the filter guarantees never started — the fleet freezes.
+#
+# The exclusion is a FILE GLOB over files sitting in the watched directory
+# itself, so unlike pr-risk's `tests/` subdirectory it cannot be sidestepped by
+# watching a narrower positive path.
+seed_pr_size
+BEHIND=$(work_head)
+printf 'package main\n\nfunc TestSize(t *testing.T) { _ = 2 }\n' > "${SRC}/${SIZE_TOOLS}/size_test.go"
+printf 'package main\n\nfunc TestMain2(t *testing.T) { _ = 2 }\n' > "${SRC}/${SIZE_TOOLS}/main_test.go"
+push_src 'edit ONLY the Go tests'
+TIP=$(origin_tip)
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" \
+  WATCHED="$SIZE_WATCHED" WATCHED_PATHSPECS="$SIZE_PATHSPECS"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=true"                  "[[ \"$P\" == \"true\" ]]"
+check "new_sha re-pointed to the tip" "[[ \"$N\" == \"$TIP\" ]]"
+check "not reported as stale"         "! grep -q \"stale run/re-run\" <<<\"\$OUT\""
+check "no ::error::"                  "! grep -q \"::error::\" <<<\"\$OUT\""
+check "no ::warning::"                "! grep -q \"::warning::\" <<<\"\$OUT\""
+# ...and the tree-OID config these fleets used BEFORE this ticket false-stales
+# that same commit — the freeze, reproduced, which is what makes the pathspec
+# input necessary rather than cosmetic here.
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" \
+  WATCHED="$SIZE_WATCHED" WATCHED_ASSETS="$SIZE_TOOLS"
+check "tree-OID config false-stales it" "[[ \"$P\" == \"false\" ]]"
+# Both fleets keep WATCHED_ASSETS set alongside the pathspecs (for the
+# decommission probes), so the REAL configuration is both inputs together — the
+# pathspec comparison must still supersede the asset OID for that same commit.
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" \
+  WATCHED="$SIZE_WATCHED" WATCHED_ASSETS="$SIZE_TOOLS" WATCHED_PATHSPECS="$SIZE_PATHSPECS"
+check "assets+pathspecs: proceed=true" "[[ \"$P\" == \"true\" ]]"
+check "assets+pathspecs: re-pointed"   "[[ \"$N\" == \"$TIP\" ]]"
+
+# ---------------------------------------------------------------------------
+new_case pathspec_test_glob_code 'pr-size/cursor-review shape: a code commit IS stale'
+# The other half of the pair. `size.go` is exactly what a pinned caller runs, so
+# that commit has its own run; this one is a stale re-run and must skip. If the
+# exclusion were widened to the whole directory (the normalization the contract
+# test refuses), this assertion is what would fail — the fleet would stop bumping
+# for real changes.
+seed_pr_size
+BEHIND=$(work_head)
+printf 'package main\n\nfunc size() int { return 2 }\n' > "${SRC}/${SIZE_TOOLS}/size.go"
+push_src 'change the counting logic callers execute'
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" \
+  WATCHED="$SIZE_WATCHED" WATCHED_ASSETS="$SIZE_TOOLS" WATCHED_PATHSPECS="$SIZE_PATHSPECS"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=false"                 "[[ \"$P\" == \"false\" ]]"
+check "logged as a stale run"         "grep -q \"stale run/re-run\" <<<\"\$OUT\""
+check "names the changed surface"     "grep -q \"scripts/check-pr-size/size.go\" <<<\"\$OUT\""
+check "no ::error::"                  "! grep -q \"::error::\" <<<\"\$OUT\""
+# go.mod and the reusable itself are watched too — neither is a *_test.go, so
+# neither may be swallowed by the exclusion.
+clone_work
+BEHIND_MOD=$(work_head)
+printf 'module check-pr-size\n\ngo 1.23\n' > "${SRC}/${SIZE_TOOLS}/go.mod"
+push_src 'change go.mod'
+run_preflight GITHUB_SHA="$BEHIND_MOD" NEW_SHA="$BEHIND_MOD" \
+  WATCHED="$SIZE_WATCHED" WATCHED_ASSETS="$SIZE_TOOLS" WATCHED_PATHSPECS="$SIZE_PATHSPECS"
+check "go.mod change is stale too"    "[[ \"$P\" == \"false\" ]]"
+clone_work
+BEHIND_WF=$(work_head)
+printf 'name: PR size\non:\n  workflow_call:\n    inputs: {}\n' > "${SRC}/${SIZE_WATCHED}"
+push_src 'change ONLY the reusable itself'
+run_preflight GITHUB_SHA="$BEHIND_WF" NEW_SHA="$BEHIND_WF" \
+  WATCHED="$SIZE_WATCHED" WATCHED_ASSETS="$SIZE_TOOLS" WATCHED_PATHSPECS="$SIZE_PATHSPECS"
+check "reusable change is stale too"  "[[ \"$P\" == \"false\" ]]"
+# A commit touching BOTH a test and real code still bumps: a negation only
+# strips the paths it matches. This is the claim both entrypoints' filter
+# comments make, asserted rather than trusted.
+clone_work
+BEHIND_MIX=$(work_head)
+printf 'package main\n\nfunc size() int { return 3 }\n'           > "${SRC}/${SIZE_TOOLS}/size.go"
+printf 'package main\n\nfunc TestSize(t *testing.T) { _ = 3 }\n'  > "${SRC}/${SIZE_TOOLS}/size_test.go"
+push_src 'edit size.go AND its test'
+run_preflight GITHUB_SHA="$BEHIND_MIX" NEW_SHA="$BEHIND_MIX" \
+  WATCHED="$SIZE_WATCHED" WATCHED_ASSETS="$SIZE_TOOLS" WATCHED_PATHSPECS="$SIZE_PATHSPECS"
+check "mixed commit is still stale"   "[[ \"$P\" == \"false\" ]]"
 
 # ---------------------------------------------------------------------------
 new_case pathspec_selects 'a pathspec list that selects nothing is an error, not "unchanged"'
