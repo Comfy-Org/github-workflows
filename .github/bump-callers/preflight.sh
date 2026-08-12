@@ -747,8 +747,16 @@ if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
   # exist. That freezes the fleet exactly as a bare tip mismatch used to. An
   # exclusion is therefore a reason to carry the filter's exclusions into
   # WATCHED_PATHSPECS (or to narrow the inputs), never to point WATCHED_ASSETS at
-  # the whole directory. Dropping one `:(exclude)` line from the pathspec list
-  # reinstates that freeze exactly — which is why they live next to each other.
+  # the whole directory AS THE COMPARISON. Dropping one `:(exclude)` line from the
+  # pathspec list reinstates that freeze exactly — which is why they live next to
+  # each other.
+  #
+  # Setting WATCHED_ASSETS to that directory ALONGSIDE WATCHED_PATHSPECS is a
+  # different thing, and it is what pr-risk does: the pathspec diff supersedes the
+  # object comparison, so the asset tree OID is never compared and that freeze
+  # cannot arise. There WATCHED_ASSETS buys only the COVERAGE ASSERTION above —
+  # that the pathspec list still reaches under it — which is the one guard that
+  # catches the list silently losing its positive `scripts/pr-risk` entry.
   echo "main moved to $main_tip since $GITHUB_SHA, but the watched surface is unchanged — this run is still the only one for that change; pinning callers to $main_tip and proceeding"
   NEW_SHA="$main_tip"
   repointed=1

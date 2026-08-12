@@ -128,22 +128,61 @@ jobs:
         id: preflight
         env:
           WATCHED: .github/workflows/pr-risk.yml
+          # Set even though WATCHED_PATHSPECS below SUPERSEDES the asset-tree OID
+          # comparison, so its own value here is not the comparison — it is the
+          # COVERAGE ASSERTION preflight.sh only runs when both are set: that the
+          # pathspec list still selects something under this directory. Without
+          # it, deleting the `scripts/pr-risk` line from the list below would
+          # leave `.github/workflows/pr-risk.yml` matching itself, satisfy every
+          # remaining guard, and silently stop watching the grading logic while
+          # the fleet kept re-pointing callers. The directory can never be the
+          # decommission probe on its own — `tests/` and `README.md` outlive the
+          # scripts — which is what WATCHED_EXEC is for.
+          WATCHED_ASSETS: scripts/pr-risk
           WATCHED_PATHSPECS: |
             .github/workflows/pr-risk.yml
             scripts/pr-risk
             :(exclude)scripts/pr-risk/tests
             :(exclude)scripts/pr-risk/README.md
+          # Every file under `scripts/pr-risk` whose ABSENCE breaks a pinned
+          # caller at run time — not just the entry points. The three graders
+          # were what the inline copy this step replaces listed, and that list
+          # was already short of what a caller runs (a carried-over gap, fixed
+          # here rather than ported):
+          #   * grade-targets.sh hard-`die`s without apply-risk-label.sh, and
+          #     again without publish-risk-surfaces.sh once `check_run:` or
+          #     `sticky_comment:` is enabled;
+          #   * grade-pr-risk.sh falls back to risk-map.v0.json /
+          #     runbook-registry.v0.json beside itself whenever the consumer repo
+          #     ships no `.github/risk.json` / `.github/risk-runbooks.json`
+          #     override — which is the default enrollment.
+          # A commit deleting any of them passes a three-grader probe intact, so
+          # the fleet would be re-pinned to a SHA where every caller's grade step
+          # fails — the exact failure this input exists to catch. NOTE these are
+          # literal paths: a VERSIONED rename (risk-map.v0 → v1) reads here as a
+          # decommission and no-ops the fleet behind a ::warning::, so rename
+          # them in this list in the same commit.
           WATCHED_EXEC: |
             .github/workflows/pr-risk.yml
             scripts/pr-risk/grade-pr-risk.sh
             scripts/pr-risk/grade-targets.sh
             scripts/pr-risk/resolve-enabled.sh
+            scripts/pr-risk/apply-risk-label.sh
+            scripts/pr-risk/publish-risk-surfaces.sh
+            scripts/pr-risk/risk-map.v0.json
+            scripts/pr-risk/runbook-registry.v0.json
           NEW_SHA: ${{ github.sha }}
         run: bash .github/bump-callers/preflight.sh
 
       - name: Generate Cloud Code Bot token
         uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0 — pinned: see dependabot.yml ignore (v2+ breaks cross-repo `owner:` token scoping)
         id: token
+        # Same condition as the only step that consumes this token. A run the
+        # guard already ruled stale or decommissioned has nothing to bump, so
+        # minting an org-wide contents/pull-requests/issues-write token for it is
+        # a credential issued for no work. Cheap to skip now that the guard runs
+        # AHEAD of the mint and emits a discrete `proceed`.
+        if: steps.preflight.outputs.proceed == 'true'
         with:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}

@@ -253,7 +253,9 @@ because every entry in the fleet's `paths:` trigger is covered by the comparison
 (`scripts/check-pr-size/**`) that includes the asset directory the reusable loads
 its prompts/scripts/briefs from at run time. (`pr-risk` is multi-path too, but its
 filter also carries `:(exclude)` entries that one `WATCHED_ASSETS` string cannot
-express — see the note below.) Compare `WATCHED` alone on one of those and a
+express, so its comparison is `WATCHED_PATHSPECS` — it still *sets*
+`WATCHED_ASSETS`, for a different reason; see the note below.) Compare `WATCHED`
+alone on one of those and a
 commit touching only the assets reads as "unchanged", so callers get pinned to a
 tip whose other relevant content was never verified. Read the entrypoint's
 `paths:` rather than trusting this list, and if you widen a fleet's path filter,
@@ -266,7 +268,19 @@ change the tree OID of an over-broad `WATCHED_ASSETS` — so this run reports "t
 watched surface changed since", skips green as a stale re-run, and waits on a
 later run that will never exist. An exclusion is a reason to narrow the inputs, or
 to carry it into `WATCHED_PATHSPECS`; never to point `WATCHED_ASSETS` at the whole
-directory.
+directory **as the comparison**.
+
+Setting `WATCHED_ASSETS` to that directory *alongside* `WATCHED_PATHSPECS` is a
+different thing, and it is what `pr-risk` does. The pathspec diff **supersedes**
+the object comparison, so the asset tree OID is never compared and the freeze
+above cannot arise (verified: a commit touching only `scripts/pr-risk/tests` and
+the tool `README.md` still proceeds and re-points). What `WATCHED_ASSETS` buys
+there is the **coverage assertion** — the check that the pathspec list still
+selects something under it. Without it, deleting the `scripts/pr-risk` line from
+that list leaves `.github/workflows/pr-risk.yml` matching itself, satisfies every
+remaining guard, and silently stops watching the grading logic while the fleet
+keeps re-pointing callers. So: with `WATCHED_PATHSPECS`, set it; without,
+narrow it.
 
 **An excluding fleet passes `WATCHED_PATHSPECS`; a per-file fleet passes
 `WATCHED_EXEC`.** Today that is exactly one fleet, `pr-risk`, which needs both —
