@@ -746,6 +746,24 @@ class FooterTest(unittest.TestCase):
         )
         return analyze(catalog=catalog), catalog
 
+    def urgent_repin_is_homeless(self):
+        # Round 2 of the same overclaim: the urgent pin's lab offers NO same-lab
+        # id at all (the 🚨 section prints "_(no same-lab id in the catalog)_"),
+        # so the replacement has to be taken from another lab's review-me
+        # group — and charging that repin to its own, empty, lab left the strong
+        # claim standing on the one candidate the repin consumes.
+        catalog = "gpt-5.6-sol-max\ngpt-5.6-sol\n"
+        panel = ["gpt-5.6-sol-max", "kimi-k2.7-code"]
+        return analyze(catalog=catalog, panel=panel, judge="gpt-5.6-sol-max"), catalog
+
+    def new_family_only(self):
+        # Findings, none urgent, and `unpinned` holds a wholly NEW one-tier
+        # family of a pinned lab — not an extra reasoning tier of a family the
+        # panel already pins. Pinning it (the action the review-me list asks
+        # for) empties the list, so this issue is not permanent.
+        catalog = "\n".join(PANEL) + "\ngpt-6-omega\n"
+        return analyze(catalog=catalog), catalog
+
     def families_only(self):
         # Findings, none urgent, and the only list holding the issue open is the
         # unpinned-FAMILIES fold: every lab the panel pins is fully pinned, so
@@ -758,7 +776,9 @@ class FooterTest(unittest.TestCase):
             ("delisted", self.urgent_delisted()),
             ("zdr", self.urgent_zdr()),
             ("drained", self.urgent_repin_drains_the_list()),
+            ("homeless", self.urgent_repin_is_homeless()),
             ("advisory", self.advisory()),
+            ("new_family", self.new_family_only()),
             ("families", self.families_only()),
             ("stale_only", self.stale_only()),
             ("clean", self.clean()),
@@ -795,7 +815,10 @@ class FooterTest(unittest.TestCase):
             # advisory list below keeps out of reach — the honest promise is
             # that repinning drops the 🚨 section on the next run.
             self.assertNotIn(self.BROKEN_PROMISE, footer)
-            self.assertIn("will **not** close itself once you repin", footer)
+        # The strong "it will not close once you repin" belongs to the fixture
+        # whose delisted lab still offers a same-lab replacement; the NO-ZDR
+        # fixture's lab offers none, which is the homeless case below.
+        self.assertIn("will **not** close itself once you repin", cd._footer(self.urgent_delisted()[0]))
 
     def test_an_advisory_report_says_nothing_is_urgent_and_that_staying_open_is_normal(self):
         report, catalog = self.advisory()
@@ -849,28 +872,89 @@ class FooterTest(unittest.TestCase):
             panel=["gpt-5.6-sol-max", "claude-opus-4-8-thinking-max", "gemini-3.1-pro", "kimi-k3-code"],
         )
         self.assertFalse(repinned["has_findings"])
-        # The stock urgent fixtures keep the strong claim — a repin there leaves
-        # `gpt-5.6-sol` standing, so this is a stand-down, not a blanket retreat.
-        for name, (other, _) in [("delisted", self.urgent_delisted()), ("zdr", self.urgent_zdr())]:
-            self.assertTrue(cd._standing_after_repin(other), name)
+        # The stock delisted fixture keeps the strong claim — a repin there
+        # leaves `gpt-5.6-sol` standing, so this is a stand-down, not a blanket
+        # retreat.
+        self.assertTrue(cd._standing_after_repin(self.urgent_delisted()[0]))
 
-    def test_the_families_only_arm_does_not_blame_reasoning_tiers(self):
-        # `standing` has two causes and only one of them is about tiers. A
-        # family from a lab the panel pins nothing from holds the issue open
-        # with no extra tier in sight — and would close on its own if that
-        # family left the catalog — so the stated reason has to match the list.
-        report, catalog = self.families_only()
-        self.assertFalse(report["urgent"])
-        self.assertTrue(report["has_findings"])
-        self.assertEqual(report["unpinned"], [])
-        self.assertTrue(report["unpinned_labs"])
+    def test_an_urgent_pin_whose_lab_offers_nothing_cannot_be_charged_to_that_lab(self):
+        # BE-6912 review round 2: charging the repin to the urgent pin's OWN lab
+        # assumes a same-lab replacement exists. Where it does not, the reader
+        # has to take one from another lab's review-me group, and the group
+        # holding the issue open is the one being drained.
+        report, catalog = self.urgent_repin_is_homeless()
+        self.assertTrue(report["urgent"])
+        self.assertEqual([d["id"] for d in report["delisted"]], ["kimi-k2.7-code"])
+        self.assertEqual(report["delisted"][0]["same_lab_available"], [])
+        # One lone candidate, and it is in a lab with no urgent pin at all — the
+        # exact shape the per-lab count read as "1 > 0, claim survives".
+        self.assertEqual([g["lab"] for g in report["unpinned"]], ["gpt"])
+        self.assertEqual([c["id"] for c in report["unpinned"][0]["candidates"]], ["gpt-5.6-sol"])
+        self.assertFalse(cd._standing_after_repin(report))
         footer = cd._footer(report)
-        self.assertIn("Nothing here is urgent", footer)
-        self.assertIn("stays open indefinitely", footer)
-        self.assertIn("families the panel pins nothing from", footer)
-        self.assertNotIn("reasoning tiers", footer)
-        # The tier reason still stands where tiers are in fact the cause.
-        self.assertIn("reasoning tiers", cd._footer(self.advisory()[0]))
+        self.assertIn("Act on this now", footer)
+        self.assertNotIn("will **not** close itself", footer)
+        self.assertIn("closes itself on the first run that finds nothing at all", footer)
+        # Not a hypothetical: make the only repin the catalog allows and the
+        # next report has nothing left to report.
+        repinned = analyze(
+            catalog=catalog,
+            panel=["gpt-5.6-sol-max", "gpt-5.6-sol"],
+            judge="gpt-5.6-sol-max",
+        )
+        self.assertFalse(repinned["has_findings"])
+
+    def test_a_real_catalog_urgent_report_still_keeps_the_strong_claim(self):
+        # The stand-downs above are about toy catalogs with one id to spare. On
+        # the catalog that actually prompted this (178 unpinned same-lab ids), a
+        # delisted pin still leaves the review-me list standing after the repin,
+        # so the strong claim is narrowed, not retired.
+        catalog = real_catalog()
+        report = analyze(
+            catalog=catalog,
+            panel=["gpt-5.6-sol-max", "claude-opus-5-thinking-max", "gemini-3.1-pro", "kimi-k9-gone"],
+            judge=REAL_JUDGE,
+        )
+        self.assertTrue(report["urgent"])
+        self.assertTrue(cd._standing_after_repin(report))
+        self.assertIn("will **not** close itself once you repin", cd._footer(report))
+
+    def test_only_an_already_pinned_familys_extra_tier_earns_indefinitely(self):
+        # "Stays open indefinitely" is a claim about every action the issue asks
+        # for. Promoting a tier of an already-pinned family just swaps which
+        # tier is listed, so that list refills itself — but a brand-new family
+        # (in a pinned lab or an unpinned one) can be pinned away, and then the
+        # issue closes. Claiming permanence there is a wrong prediction as well
+        # as a wrong cause (BE-6912 review round 2).
+        advisory, _ = self.advisory()
+        self.assertTrue(cd._standing_on_extra_tiers(advisory))
+        self.assertIn("stays open indefinitely", cd._footer(advisory))
+        self.assertIn("reasoning tiers", cd._footer(advisory))
+
+        for name, (report, catalog) in [
+            ("new_family", self.new_family_only()),
+            ("families", self.families_only()),
+        ]:
+            self.assertFalse(report["urgent"], name)
+            self.assertTrue(report["has_findings"], name)
+            self.assertFalse(cd._standing_on_extra_tiers(report), name)
+            footer = cd._footer(report)
+            self.assertIn("Nothing here is urgent", footer, name)
+            self.assertNotIn("stays open indefinitely", footer, name)
+            self.assertNotIn("reasoning tiers", footer, name)
+            self.assertIn("closes itself on the first run that finds nothing at all", footer, name)
+
+        # And the prediction is checked, not asserted: pinning what each list
+        # asks about really does clear the findings.
+        new_family, catalog = self.new_family_only()
+        self.assertEqual([c["id"] for c in new_family["unpinned"][0]["candidates"]], ["gpt-6-omega"])
+        self.assertFalse(analyze(catalog=catalog, panel=PANEL + ["gpt-6-omega"])["has_findings"])
+        families, _ = self.families_only()
+        self.assertEqual(families["unpinned"], [])
+        # Without the NO-ZDR marker, which would make pinning it urgent in its
+        # own right rather than clearing the fold.
+        catalog = "\n".join(PANEL) + "\nfable-5-max\n"
+        self.assertFalse(analyze(catalog=catalog, panel=PANEL + ["fable-5-max"])["has_findings"])
 
     def test_no_arm_points_the_reader_below_itself_or_names_a_missing_section(self):
         # `render_body` appends the footer LAST, so every section it can point
