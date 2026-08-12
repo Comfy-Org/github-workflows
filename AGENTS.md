@@ -31,7 +31,10 @@ shellcheck -x .github/bump-callers/bump-callers.sh .github/bump-callers/prefligh
 bash .github/bump-callers/tests/test_bump_callers.sh
 bash .github/bump-callers/tests/test_preflight.sh
 
-# run the AGENTS.md integrity checker against any repo tree
+# workflow-pins lint (no reusable workflow may default `workflows_ref`) + its tests
+python3 -m unittest discover -s .github/workflow-pins/tests -p 'test_*.py' && python3 .github/workflow-pins/check_workflow_pins.py
+
+# AGENTS.md integrity checker against any repo tree
 python3 .github/agents-md-integrity/check_agents_md.py --root .
 ```
 
@@ -73,8 +76,11 @@ tests — run the matching command above for whatever you touched.
   never re-hardcode a version in a `run:` step. Tests in `tests/`.
 - `.github/refresh-reviewers/` — `generate.py`, the engine behind
   `refresh-reviewers.yml`: recomputes a caller's reviewers.yml from git history
-  (decayed commit touches, assigner-parity globs, collaborator-only) and
-  surgically rewrites just the reviewer lists for a drift PR. Tests in `tests/`.
+  and rewrites just the reviewer lists for a drift PR. Tests in `tests/`.
+- `.github/workflow-pins/` — `check_workflow_pins.py` + `tests/`: the lint
+  forbidding a `default:` on `workflows_ref` and requiring the empty-ref guard
+  at every checkout, with an exception for the `github.job_workflow_sha`
+  self-pin (BE-4169, see below).
 - `.github/bump-callers/` — `bump-callers.sh`, the ONE fleet-agnostic script
   that opens SHA-bump PRs in consumer repos when a reusable workflow changes,
   plus `preflight.sh` (BE-6475), the ONE staleness/decommission guard that runs
@@ -143,6 +149,13 @@ tests — run the matching command above for whatever you touched.
 - **Pin everything by full commit SHA**, with a trailing `# v1` comment — both
   the `uses:` in callers and every third-party action here. Bare `@v1` fails the
   pin-validation (`pinact`, `zizmor`) that consumer CI runs. See README "Pinning".
+- **`workflows_ref` is REQUIRED, never given a `default:`** (BE-5546) — a default
+  lets a caller SHA-pin `uses:` yet load mutable scripts, and `required:` is
+  unenforced for `workflow_call` (omitted → `''` → `actions/checkout` takes the
+  default branch) — hence the empty-ref guard, in the checkout's OWN job.
+  `groom.yml` is the sanctioned exception (BE-4169): it defaults to `''` and its
+  checkouts fall back to `github.job_workflow_sha` — the exact, immutable commit
+  the reusable resolved from — so an omitted input can't reach a mutable ref.
 - **Scripts are the single source of truth**, loaded at run time from a pinned
   ref of THIS repo — never from the caller's checkout. That's what makes the
   reviewer/checker tamper-proof: a PR can't rewrite the logic judging it. The
