@@ -342,16 +342,24 @@ step reads it through its own `env:` binding. That is deliberate: a step-level
 `env: NEW_SHA:` takes precedence over the job environment, so a `$GITHUB_ENV`
 write would be silently overridden by the very binding it is meant to correct.
 
-> **The entrypoints still carry their inline copies.** Swapping them over to this
-> script is a separate change. `bump-pr-risk-callers.yml` carried two checks this
-> script did not, and **BE-6670 decided both** rather than leaving the swap to
-> choose:
+> **`bump-pr-risk-callers.yml` is swapped over (BE-6677); the other entrypoints
+> still carry their inline copies.** pr-risk went first because it was the
+> hardest — the only excluding, per-executed-file fleet — so `WATCHED_PATHSPECS`
+> and `WATCHED_EXEC` are now exercised by a real caller and not just by the
+> tests. Its remaining siblings are a mechanical repeat of the two-step block
+> above, one fleet at a time.
+>
+> It carried two checks this script did not, and **BE-6670 decided both** rather
+> than leaving the swap to choose:
 >
 > - Its **is-ancestor check is adopted here, for every fleet** (BE-6675) — see
->   the direction guard above. It was never pr-risk-specific.
+>   the direction guard above. It was never pr-risk-specific. The swap also fixed
+>   a latent hazard in the inline copy on its way out: that one fetched a bare
+>   `main`, which resolves `refs/tags/main` ahead of `refs/heads/main`, and this
+>   repo force-moves major tags. This script fetches `refs/heads/main`.
 > - Its **`git rev-list` "did a later *commit* touch a watched path" test is
->   deliberately not ported.** It exists because pr-risk has no re-point, so a
->   land-then-revert (net content change of zero) makes that fleet call this run
+>   deliberately not ported.** It existed because pr-risk had no re-point, so a
+>   land-then-revert (net content change of zero) made that fleet call the run
 >   the only one for the change and pin callers *backwards* to `github.sha`. The
 >   re-point already answers that case by pinning the verified tip — which on a
 >   land-then-revert is the revert commit, i.e. forward. Adding rev-list on top
