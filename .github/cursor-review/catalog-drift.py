@@ -752,6 +752,156 @@ def _collapsed_candidate_list(candidates, pinned=(), limit=None):
     return "\n".join(rows)
 
 
+def _standing_after_repin(report):
+    """Would the review-me list still hold the issue open after the urgent repin?
+
+    The urgent arm tells the reader the issue will not close once they repin.
+    That claim is made from the PRE-repin snapshot, so it has to survive the
+    repin it is describing: repinning consumes catalog ids out of the very list
+    that is holding the issue open, and a lab with nothing left over closes it
+    after all (BE-6912 review).
+
+    Counted as a guaranteed FLOOR on the surviving list, because a `False` only
+    means "cannot promise" and the caller then renders the weaker, always-true
+    sentence. A repin takes at most one catalog id per urgent pin, and where it
+    takes it from splits two ways:
+
+      * the pin's own lab still offers same-lab candidates — that is what the 🚨
+        section suggests and where `same_lab_available` sources it, so charge the
+        pin to its own lab's group, which stays pinned and therefore stays in the
+        review-me list at all.
+      * the pin's lab offers NONE (the 🚨 section prints "_(no same-lab id in the
+        catalog)_") — the replacement then has to come from somewhere else
+        entirely, so the charge is HOMELESS: it lands on whichever group the
+        reader picks from, and the floor has to absorb it globally. Charging it
+        to its own, empty, lab was this function's own version of the bug it was
+        added to fix (BE-6912 review round 2): with one urgent pin whose lab is
+        empty and exactly one candidate left anywhere, the strong claim survived
+        a repin that provably drains the list.
+
+    Two conservative simplifications, both in the "cannot promise" direction:
+    a NO-ZDR pin is charged the full id even though an in-lab repin hands its old
+    id straight back to that lab's candidates (net drain zero) — that credit is
+    only real when the repin stays in-lab, which is exactly the assumption the
+    homeless case shows cannot be relied on. And `unpinned_labs` is never counted
+    as standing: pinning into one of those families is itself a way to empty
+    that list, and a homeless repin is most likely to land there.
+    """
+    urgent_per_lab = {}
+    for item in report["delisted"]:
+        urgent_per_lab[item["lab"]] = urgent_per_lab.get(item["lab"], 0) + 1
+    for item in report.get("zdr_risk") or []:
+        lab = lab_of(item["id"])
+        urgent_per_lab[lab] = urgent_per_lab.get(lab, 0) + 1
+    labs_with_candidates = {group["lab"] for group in report["unpinned"]}
+    homeless = sum(
+        count for lab, count in urgent_per_lab.items() if lab not in labs_with_candidates
+    )
+    floor = sum(
+        max(0, len(group["candidates"]) - urgent_per_lab.get(group["lab"], 0))
+        for group in report["unpinned"]
+    )
+    return floor > homeless
+
+
+def _standing_on_extra_tiers(report):
+    """Is the review-me list SELF-SUSTAINING — held open by an already-pinned family?
+
+    The advisory arm's strong claim is stronger than the urgent arm's: not "it
+    survives one repin" but "it stays open indefinitely". Only one shape of
+    finding earns that, and it is the one the sentence names — an unpinned tier
+    of a family the panel ALREADY pins. Promoting it just swaps which tier of
+    that family is listed, so the list refills itself and no action the issue
+    asks for can empty it. That is the steady state on any real catalog.
+
+    Everything else in the list can be pinned away, and then the issue closes:
+    `analyze` files every unpinned id sharing a pinned lab's prefix under
+    `unpinned`, including a wholly NEW one-tier family (`gpt-6-omega`), and
+    `unpinned_labs` is a family from a lab the panel pins nothing from. Both are
+    finite: pin them and the list is gone. Claiming permanence there was both a
+    wrong cause and a wrong prediction (BE-6912 review round 2), so those reports
+    stand down to the weaker, always-true sentence instead.
+    """
+    for group in report["unpinned"]:
+        pinned_families = {family_of(pin)[0] for pin in group["pinned"]}
+        if any(family_of(item["id"])[0] in pinned_families for item in group["candidates"]):
+            return True
+    return False
+
+
+def _footer(report):
+    """The trailing note: what THIS issue asks of the reader, in its own words.
+
+    Three arms, because the report already sorts itself into three states and a
+    single sentence cannot describe all of them honestly (BE-6912):
+
+      * `urgent` — a delisted pin or a pin marked NO-ZDR. Someone must edit
+        `cursor-review.yml` now; the run is red.
+      * findings, not urgent — the standing review-me list (and/or an audit-date
+        reminder). Advisory. This is the steady state, so the footer has to say
+        out loud that a permanently-open issue here is not neglect: `unpinned`
+        counts toward `has_findings`, and any real catalog lists more reasoning
+        tiers per pinned lab than the panel pins one of, so the close arm in
+        `cursor-review-catalog-drift.yml` is effectively unreachable. Measured
+        on the 2026-08-10 catalog (the `tests/fixtures` capture, from run
+        31363137595 / issue #144): 192 catalog ids, 178 of them unpinned
+        same-lab, 3 unpinned families — no delisted pin, no NO-ZDR pin, run
+        green, issue open ever since.
+      * no findings — the only state that closes the issue, and the ONLY arm
+        that may promise a close. The footer used to promise it unconditionally,
+        which told every reader of a permanently-open advisory issue that it
+        should have closed weeks ago — i.e. that it was being ignored — on the
+        one issue that is also where a genuinely urgent pin failure is reported.
+    """
+    lead = "_Filed by the weekly `cursor-review-catalog-drift` check."
+    if report["urgent"]:
+        # Gated on the POST-repin state, not on the snapshot the report is: the
+        # claim below is about what the reader finds after doing what this arm
+        # asks — see `_standing_after_repin`. Says "above" because `render_body`
+        # appends this footer last, so every section it can point at is above it;
+        # and it names the review-me list because that is the only list the gate
+        # counts, so a `True` implies `unpinned` is non-empty and the section it
+        # names is in the body.
+        closing = (
+            "and it will **not** close itself once you repin — the standing review-me list above "
+            "holds it open, as it does on any real catalog. The next run simply rewrites this "
+            "issue without the 🚨 section."
+            if _standing_after_repin(report)
+            else "and it closes itself on the first run that finds nothing at all to report."
+        )
+        return (
+            f"{lead} **Act on this now:** a pinned model is delisted or marked NO-ZDR — see the 🚨 "
+            "section(s) above and repin in `cursor-review.yml`. That is also why this check's run "
+            f"is red. The issue is sticky: each run rewrites it in place, {closing}_"
+        )
+    if report["has_findings"]:
+        # "Indefinitely" is a claim about every action the issue asks for, not
+        # just the next run, so it is gated on the one finding shape no action
+        # can clear — see `_standing_on_extra_tiers`. A report standing only on
+        # new families (in a pinned lab or an unpinned one) or on a stale audit
+        # date really does close once they are dealt with; telling that reader
+        # the issue is permanent would be this footer's own bug in miniature.
+        closing = (
+            "and it stays open indefinitely, because Cursor's catalog always lists more reasoning "
+            "tiers than the panel pins one of. **An open issue here is not a sign anyone is "
+            "ignoring it**"
+            if _standing_on_extra_tiers(report)
+            else "and it closes itself on the first run that finds nothing at all to report"
+        )
+        return (
+            f"{lead} **Nothing here is urgent:** no pinned model is delisted or marked NO-ZDR, so "
+            "the review panel is working and this check's run is green. What is above is advisory — "
+            "catalog ids for a human to review, and/or an audit-date reminder — to skim when "
+            f"convenient. The issue is sticky: each run rewrites it in place, {closing} — when a "
+            "pin actually breaks, the run goes red and this footer says **act on this now** "
+            "instead._"
+        )
+    return (
+        f"{lead} No drift at all — nothing to act on, and this is the one outcome that closes the "
+        "issue. A later run files a fresh one if drift returns._"
+    )
+
+
 def render_body(report, catalog_text, run_url=None, checked_at=None):
     """Render the sticky issue body (also used as the run's step summary)."""
     pins = report["pins"]
@@ -910,10 +1060,7 @@ def render_body(report, catalog_text, run_url=None, checked_at=None):
                 f"pins and refresh the `last checked` comment in `cursor-review.yml`."
             )
 
-    footer = (
-        "_Filed by the weekly `cursor-review-catalog-drift` check. This issue is sticky — it is "
-        "updated in place each run and closed automatically once a run finds no drift._"
-    )
+    footer = _footer(report)
     # The raw fold gets whatever body budget the report has NOT used, up to the
     # MAX_CATALOG_CHARS ceiling. A fixed 40K assumed the report stayed inside
     # ~20K; a large catalog can exceed that even with every list capped, and the
