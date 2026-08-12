@@ -51,6 +51,25 @@ on:
       # caller bump as a workflow-file change, or pinned callers silently drift
       # onto stale review behavior.
       - .github/cursor-review/**
+      # The check-pr-size classifier is BUILT at run time from the same pinned
+      # `workflows_ref` (see cursor-review.yml's "Load check-pr-size tool" /
+      # "Build check-pr-size" steps) — it decides which of a PR's files count as
+      # generated and therefore skip review. A behavior change there needs the
+      # same caller bump as a workflow-file change, or pinned callers silently
+      # drift onto a stale classifier. This fleet and the pr-size fleet both
+      # watch it deliberately: both build the tool from the caller's pin, and
+      # they push different stable branches, so there is no conflict.
+      - scripts/check-pr-size/**
+      # …but the Go tests under that dir are NOT part of what a pinned caller
+      # executes — the "Build check-pr-size" step compiles the tool and runs it,
+      # and never runs `go test` — so a test-only commit would mint the org-wide
+      # bot token, force-reset the stable ci/bump-cursor-review branch and fan a
+      # pure-churn SHA-bump PR (identical consumer behavior, a review round in
+      # every caller repo) across the whole fleet. Exclude them so a bump PR
+      # keeps meaning "consumer-visible behavior changed". Negations only strip
+      # the paths they match: a commit touching size.go AND its test still
+      # matches the positive pattern and still bumps.
+      - '!scripts/check-pr-size/*_test.go'
 
 permissions:
   contents: read
@@ -101,7 +120,29 @@ jobs:
         env:
           NEW_SHA: ${{ github.sha }}
           WATCHED: .github/workflows/cursor-review.yml
-          WATCHED_ASSETS: .github/cursor-review
+          # Newline-separated list, one literal path per line — this fleet
+          # watches TWO asset surfaces (the review prompts/scripts and the
+          # check-pr-size classifier), and both must be compared or the re-point
+          # pins callers to a tip whose other content was never verified.
+          # Kept alongside WATCHED_PATHSPECS deliberately. The pathspec list
+          # SUPERSEDES this input's tree-OID staleness comparison (it has to —
+          # an OID cannot express the `*_test.go` exclusion below, so a
+          # test-only commit would move the scripts/check-pr-size tree and
+          # freeze the fleet as a permanent stale re-run). What it does NOT
+          # supersede is the decommission probe: these entries are still what
+          # notices either directory disappearing, and preflight cross-checks
+          # that the pathspecs reach EVERY one of them.
+          WATCHED_ASSETS: |
+            .github/cursor-review
+            scripts/check-pr-size
+          # MIRRORS the `paths:` filter above, exclusions included — that is the
+          # coupling, not a coincidence. Widen one and you widen the other in the
+          # same change; test_paths_contract.sh fails the build otherwise.
+          WATCHED_PATHSPECS: |
+            .github/workflows/cursor-review.yml
+            .github/cursor-review
+            scripts/check-pr-size
+            :(exclude)scripts/check-pr-size/*_test.go
         run: bash .github/bump-callers/preflight.sh
 
       - name: Generate Cloud Code Bot token
