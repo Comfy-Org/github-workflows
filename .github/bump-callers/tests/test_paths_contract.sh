@@ -149,6 +149,25 @@ has_preflight() { grep -q '^      - name: Preflight' "$1"; }
 # This is the same literal-path shape preflight.sh's validate_path enforces.
 normalize_glob() { local v="$1"; printf '%s' "${v%/\*\*}"; }
 
+# The same `x/**` → `x` reduction, applied to the PATH INSIDE an `:(exclude)`
+# entry and to nothing else. Keeps the two equivalent spellings of a
+# directory-wide exclusion comparing equal without touching a file glob.
+#
+# Like the positive side, this conflates a BARE `x` with `x/**` — so a filter
+# that negates a bare directory (`!x/tests`, which in an Actions filter matches
+# only a FILE at that exact path, not the subtree) reads as equivalent to
+# `:(exclude)x/tests/**`, which is not. That filter entry is already wrong on its
+# own terms, and normalize_glob has conflated the two spellings for positives
+# since BE-6476; the alternative — normalizing one side only — would fail
+# pr-risk's documented, correct config, which is the worse trade.
+normalize_exclusion() { # $1 = a pathspec entry
+  local v="$1"
+  case "$v" in
+    ':(exclude)'*) printf ':(exclude)%s' "$(normalize_glob "${v#:(exclude)}")" ;;
+    *) printf '%s' "$v" ;;
+  esac
+}
+
 # Set-compare a fleet's WATCHED_PATHSPECS against its `paths:` filter.
 #   $1  = the parsed WATCHED_PATHSPECS value (newline-separated)
 #   $2… = the filter's POSITIVE entries, already normalized, then its NEGATIVE
@@ -163,16 +182,35 @@ compare_pathspecs() { # $1 = pathspecs, $2.. = positives then negatives
   local want_specs=() got_specs=() p s
   for p in "$@"; do
     if [[ "$p" == '!'* ]]; then
-      # Exclusions keep their glob VERBATIM on both sides. `*_test.go` is a real
-      # git pathspec that git matches itself, and normalizing it to the parent
-      # directory the way a positive entry is normalized would silently widen the
-      # exclusion to swallow the whole tool — the fleet would then never bump.
-      want_specs+=(":(exclude)${p#!}")
+      # An exclusion keeps its glob VERBATIM apart from the ONE normalization a
+      # positive also gets: a trailing `/**` is stripped, on BOTH sides, because
+      # `x/**` and `x` select the same set in the filter and in git alike. That
+      # is what lets `!scripts/pr-risk/tests/**` be mirrored as
+      # `:(exclude)scripts/pr-risk/tests` — the spelling the README documents and
+      # `bump-pr-risk-callers.yml`'s own inline guard already uses, which a
+      # strictly-verbatim rule would have failed the moment pr-risk migrates onto
+      # preflight (BE-6475). Nothing else is normalized: `*_test.go` carries no
+      # `/**` suffix, so reducing it to the parent directory — which would widen
+      # the exclusion to swallow the whole tool and the fleet would then never
+      # bump — is still a mismatch, and the self-test below pins that.
+      want_specs+=(":(exclude)$(normalize_glob "${p#!}")")
     else
       want_specs+=("$p")
     fi
   done
-  while IFS= read -r s; do [[ -n "$s" ]] && got_specs+=("$s"); done <<<"$specs"
+  while IFS= read -r s; do
+    [[ -n "$s" ]] || continue
+    # preflight.sh's split_lines drops whole-line `#` comments from
+    # WATCHED_PATHSPECS (the README invites pasting the `paths:` filter "with its
+    # comments intact"), while parse_preflight_env above hands the block content
+    # through verbatim — deliberately, because WATCHED_ASSETS *rejects* such a
+    # line and hiding it would certify a path that resolves to nothing. Read the
+    # pathspec list the way its runtime reads it, or a config the README invites
+    # fails here while preflight.sh accepts it — the exact two-sides-disagree the
+    # contract exists to catch.
+    case "$s" in '#'*) continue ;; esac
+    got_specs+=("$(normalize_exclusion "$s")")
+  done <<<"$specs"
   local want_sorted got_sorted
   want_sorted="$(printf '%s\n' "${want_specs[@]}" | LC_ALL=C sort)"
   got_sorted="$(printf '%s\n' "${got_specs[@]}" | LC_ALL=C sort)"
@@ -251,13 +289,51 @@ for path in "${FILES[@]}"; do
   # Set-equivalence, in BOTH directions, whenever the input is in play — a fleet
   # with no `!` that sets it anyway is held to the same standard, so the list
   # cannot quietly drift away from the filter it is required to mirror.
+  # `negatives` is legitimately EMPTY here — that is exactly the no-`!` fleet that
+  # sets the input anyway, the case this block exists to hold — and under `set -u`
+  # bash 3.2 (macOS's /bin/bash, which this suite is run with locally) a plain
+  # `"${negatives[@]}"` on an empty array is an unbound-variable FATAL that kills
+  # the whole run before a single comparison. `${a[@]+"${a[@]}"}` expands to
+  # nothing instead; preflight.sh guards its own empty-array expansions for the
+  # same reason. `positives` cannot be empty today, but it is spelled the same way
+  # so a future all-negative filter cannot reintroduce the abort.
   if [[ -n "$pathspecs" ]]; then
-    if pathspec_diag="$(compare_pathspecs "$pathspecs" "${positives[@]}" "${negatives[@]}")"; then
+    if pathspec_diag="$(compare_pathspecs "$pathspecs" ${positives[@]+"${positives[@]}"} ${negatives[@]+"${negatives[@]}"})"; then
       ok "${file}: WATCHED_PATHSPECS mirrors the \`paths:\` filter, exclusions included"
     else
       bad "${file}: \`paths:\` filter and WATCHED_PATHSPECS disagree — the pathspec list MUST mirror the filter, exclusions included, or the staleness test asks a different question than the trigger
 ${pathspec_diag}"
     fi
+
+    # --- and the one way the two spellings can be textually equal yet select
+    # DIFFERENT sets ---------------------------------------------------------
+    # A `paths:` filter's `*` does NOT cross `/`; a bare git pathspec's does
+    # (git matches without FNM_PATHNAME unless `:(glob)` is asked for, and
+    # preflight.sh rejects that magic outright). So `!x/*_test.go` and
+    # `:(exclude)x/*_test.go` — which the comparison above pronounces equal, and
+    # which ARE equal while `x` is flat — diverge the moment a matching file
+    # appears in a SUBDIRECTORY of `x`: the filter still fires the trigger on it,
+    # while the pathspec staleness diff already excluded it, so the run reads
+    # "unchanged", re-points and fans a bump nothing asked for. That is the very
+    # churn this exclusion exists to stop, leaking back in one directory down.
+    # Nothing textual can catch it, so measure the tree instead: the day the
+    # precondition stops holding, this fails loudly rather than the fleet
+    # silently going wrong.
+    for neg in ${negatives[@]+"${negatives[@]}"}; do
+      neg="${neg#!}"
+      negbase="${neg##*/}" negdir="${neg%/*}"
+      # File globs only. A `/**` directory exclusion means "everything under
+      # here" in both syntaxes at every depth, so it cannot diverge this way.
+      case "$negbase" in *'*'*) ;; *) continue ;; esac
+      case "$negdir" in *'*'*) continue ;; esac
+      [[ "$negdir" != "$neg" && -d "${REPO_ROOT}/${negdir}" ]] || continue
+      deep="$(cd "${REPO_ROOT}/${negdir}" && find . -mindepth 2 -name "$negbase" -print 2>/dev/null | head -3)"
+      if [[ -z "$deep" ]]; then
+        ok "${file}: no '${negbase}' below the top level of ${negdir} — its \`!\`/\`:(exclude)\` pair still select the same set"
+      else
+        bad "${file}: '${negdir}' now holds '${negbase}' in a SUBDIRECTORY ($(echo "$deep" | tr '\n' ' ')), where the filter's \`!${neg}\` and the pathspec's \`:(exclude)${neg}\` stop agreeing — the filter's \`*\` does not cross \`/\` but git's does, so the trigger fires on that file while the staleness diff excludes it, and the run re-points having compared nothing that moved. Narrow the exclusion to the top level, or move those tests back up"
+      fi
+    done
   fi
 
   expected=("${positives[@]}")
@@ -481,6 +557,73 @@ scripts/check-pr-size
 pathspec_case 'a non-excluding fleet still has to match' mismatch \
 '.github/workflows/groom.yml' \
   '.github/workflows/groom.yml' '.github/groom'
+
+# The call site above reaches compare_pathspecs for such a fleet with an EMPTY
+# `negatives` array, which under `set -u` on bash 3.2 aborts the entire run
+# rather than failing one case. `pathspec_case` cannot reproduce that (its args
+# are already flattened), so drive the guarded expansion itself: on an
+# unprotected `"${empty[@]}"` this subshell dies and the case reports failure.
+empty_negs=()
+if guard_out="$(compare_pathspecs '.github/workflows/groom.yml
+.github/groom' '.github/workflows/groom.yml' '.github/groom' ${empty_negs[@]+"${empty_negs[@]}"} 2>&1)"; then
+  ok "pathspecs: an empty negatives array expands to nothing (bash 3.2 \`set -u\`)"
+else
+  bad "pathspecs: an empty negatives array did not expand cleanly — ${guard_out:-compare_pathspecs returned mismatch}"
+fi
+
+# --- the two spellings of a DIRECTORY-wide exclusion ---
+# `!x/**` and `:(exclude)x` select the same set in the filter and in git alike,
+# and the second is what the README documents and pr-risk's inline guard already
+# uses. Holding the negation strictly verbatim would have failed that documented
+# config the moment pr-risk migrates onto preflight (BE-6475) — a test failure on
+# a CORRECT config, which is the worst kind.
+pathspec_case "pr-risk's documented directory exclusion matches its \`!x/**\` filter" ok \
+'.github/workflows/pr-risk.yml
+scripts/pr-risk
+:(exclude)scripts/pr-risk/tests
+:(exclude)scripts/pr-risk/README.md' \
+  '.github/workflows/pr-risk.yml' 'scripts/pr-risk' \
+  '!scripts/pr-risk/tests/**' '!scripts/pr-risk/README.md'
+
+# The `/**` spelling of that same exclusion is equally correct, so it passes too
+# — the normalization is applied to BOTH sides, not just the filter's.
+pathspec_case 'the /** spelling of a directory exclusion also matches' ok \
+'.github/workflows/pr-risk.yml
+scripts/pr-risk
+:(exclude)scripts/pr-risk/tests/**' \
+  '.github/workflows/pr-risk.yml' 'scripts/pr-risk' '!scripts/pr-risk/tests/**'
+
+# But widening a directory exclusion to its PARENT is still caught: only the
+# trailing `/**` is stripped, so this is not "normalization", it is a different
+# exclusion that would swallow the whole tool.
+pathspec_case 'widening a directory exclusion to its parent is caught' mismatch \
+'.github/workflows/pr-risk.yml
+scripts/pr-risk
+:(exclude)scripts/pr-risk' \
+  '.github/workflows/pr-risk.yml' 'scripts/pr-risk' '!scripts/pr-risk/tests/**'
+
+# --- comments inside the pathspec block ---
+# preflight.sh's split_lines drops whole-line `#` comments from
+# WATCHED_PATHSPECS, and the README invites pasting the `paths:` filter in "with
+# its comments intact". Reading them as literal pathspecs here would fail a
+# config the runtime accepts — the two sides disagreeing, which is the one thing
+# this test exists to prevent. (WATCHED_ASSETS is the opposite case and stays
+# opposite: preflight REJECTS a `#` line there, and the parser fixture above
+# pins that it is passed through.)
+pathspec_case 'a commented pathspec block matches the filter it mirrors' ok \
+'# MIRRORS the paths: filter, exclusions included.
+.github/workflows/pr-size.yml
+scripts/check-pr-size
+# ...minus the Go tests, which no pinned caller executes.
+:(exclude)scripts/check-pr-size/*_test.go' \
+  '.github/workflows/pr-size.yml' 'scripts/check-pr-size' '!scripts/check-pr-size/*_test.go'
+
+# A trailing `#` is a legal filename character and is left alone — same rule as
+# split_lines, so an entry ending in one still has to be mirrored.
+pathspec_case 'only WHOLE-LINE comments are dropped' mismatch \
+'.github/workflows/pr-size.yml
+scripts/check-pr-size # not a comment' \
+  '.github/workflows/pr-size.yml' 'scripts/check-pr-size'
 
 # The freeze guard's trigger condition: an entrypoint that sets no
 # WATCHED_PATHSPECS must parse as EMPTY, which is what makes the

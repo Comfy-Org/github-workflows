@@ -327,14 +327,33 @@ fleet would have frozen as a permanent stale re-run. It is no longer rejected �
 it is *required to be expressible*. For a preflight fleet whose filter carries
 `!` entries the test REQUIRES `WATCHED_PATHSPECS` and compares the two as sets:
 each positive filter entry normalized (`x/**` → `x`) must appear as a positive
-pathspec, each `!x` must appear as `:(exclude)x` with the glob kept verbatim on
-both sides (`!scripts/check-pr-size/*_test.go` ↔
-`:(exclude)scripts/check-pr-size/*_test.go`), and neither side may carry an entry
-the other lacks. A `!`-carrying fleet with **no** `WATCHED_PATHSPECS` still fails,
-naming the freeze — that is the case the old flat rejection existed to prevent,
-and it is the one that has to keep failing. A fleet with no `!` that sets
-`WATCHED_PATHSPECS` anyway is held to the same equivalence, so the input cannot
-drift away from the filter unnoticed.
+pathspec, each `!x` must appear as `:(exclude)x`, and neither side may carry an
+entry the other lacks. A **file glob** in an exclusion is kept verbatim
+(`!scripts/check-pr-size/*_test.go` ↔ `:(exclude)scripts/check-pr-size/*_test.go`)
+— reducing it to the parent directory would widen the exclusion to swallow the
+whole tool and the fleet would never bump again, so the two do NOT compare equal.
+The one thing that IS normalized is a trailing `/**`, on both sides and exactly as
+it is for a positive, because `x/**` and `x` select the same set in either syntax:
+`!scripts/pr-risk/tests/**` is satisfied by `:(exclude)scripts/pr-risk/tests` (the
+spelling pr-risk's own guard and the example below use) or by
+`:(exclude)scripts/pr-risk/tests/**`, and by nothing wider. Whole-line `#`
+comments in the block are ignored here exactly as `preflight.sh` ignores them, so
+a filter pasted in with its comments intact still compares clean. A `!`-carrying
+fleet with **no** `WATCHED_PATHSPECS` still fails, naming the freeze — that is the
+case the old flat rejection existed to prevent, and it is the one that has to keep
+failing. A fleet with no `!` that sets `WATCHED_PATHSPECS` anyway is held to the
+same equivalence, so the input cannot drift away from the filter unnoticed.
+
+**Keep a `*` exclusion's directory flat.** Set-equality of the two spellings is
+textual, and there is one case where equal text selects *different* sets: a
+`paths:` filter's `*` does not cross `/`, while a bare git pathspec's does
+(`:(glob)` would fix that, and `preflight.sh` rejects that magic). While
+`scripts/check-pr-size` is flat, `!…/*_test.go` and `:(exclude)…/*_test.go` agree.
+Put a `*_test.go` in a *subdirectory* and they stop: the trigger fires on it,
+the staleness diff has already excluded it, and the run re-points having compared
+nothing that moved — the pure-churn bump BE-7084 removed, one directory down.
+`test_paths_contract.sh` measures the tree for exactly this and fails the build
+the day it becomes true, so it cannot happen quietly.
 
 **An excluding fleet passes `WATCHED_PATHSPECS`; a per-file fleet passes
 `WATCHED_EXEC`.** `pr-risk` needs both — and they are what let it move onto this
