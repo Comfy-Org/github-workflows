@@ -13,6 +13,28 @@ name: PR Size Cap (reusable)
 #     marker before the package clause (this rule simply never matches in
 #     non-Go repos, so it is unconditional)
 #   - files matching `extra_generated_globs`
+#   - test files, ONLY when `exclude_tests: true` (off by default) — see below
+#
+# `exclude_tests` (opt-in, per repo): keeps test-file lines out of the counted
+# total so a PR is capped on the production code a reviewer must actually reason
+# about, not on its test coverage. Test files are recognized by naming
+# convention only (`*_test.go`, `test_*.py`/`*_test.py`/`conftest.py`,
+# `*.test.ts`/`*.spec.ts` & friends, plus test DIRECTORIES matched in three
+# cases: `__tests__/`/`__mocks__/`/`__snapshots__/`/`testdata/` at any depth;
+# `test/`/`tests/`/`testing/`/`e2e/` at the repo root only; and those four plus
+# `it/` directly under `src/` for Maven/Gradle layouts. The root restriction is
+# load-bearing — a consumer keeps production deployment manifests under
+# `deploy/envs/testing/`, and an any-depth rule excluded cluster
+# RBAC from the cap). Unlike the generated-file rules this is a convention, not a
+# proof — nothing stops production code being parked in `tests/` — which is why
+# it is opt-in rather than the default. The excluded total is ALWAYS reported on
+# its own line, and when the exclusion is the ONLY reason a PR is under the cap
+# the bot comment is posted even though the check is green — otherwise the
+# number would be confined to the step summary in exactly the case it exists
+# for, and a large test-only PR would pass unremarked. That green-check comment
+# needs `comment: true` plus bot credentials; a repo that sets `exclude_tests`
+# without the App keeps the loosening and loses the visibility, so configure
+# both together.
 #
 # Bypass: add the `bypass_label` (default `oversized-ok`) to the PR for a
 # legitimately large change. The check still runs (so it always posts a
@@ -24,9 +46,27 @@ name: PR Size Cap (reusable)
 # When a PR is over the cap and bot credentials are configured, the bot posts a
 # single sticky comment explaining the overage and the bypass label, then flips
 # it to ✅ once the PR is trimmed or labeled — the failing status alone does not
-# surface the bypass label. Without `bot_app_id` + BOT_APP_PRIVATE_KEY, or with
-# `comment: false`, the workflow degrades gracefully: the check status and the
-# size job's step summary still carry the full report; no comment is posted.
+# surface the bypass label. It also posts on a GREEN check when `exclude_tests`
+# is the only thing holding the PR under the cap (see `tests_decisive`).
+#
+# Without `bot_app_id` + BOT_APP_PRIVATE_KEY, or with `comment: false`, the
+# workflow degrades gracefully: the check status and the size job's step summary
+# still carry the full report; no comment is posted. This also covers fork and
+# Dependabot PRs, which never receive the secret at all.
+#
+# So that the credential-free path is not a silent hole, a decisive test
+# exclusion ALSO emits a `::warning` annotation from the size job itself. That
+# needs no secret, so it reaches fork and Dependabot PRs — the ones that would
+# otherwise get the loosened cap with none of the visibility justifying it.
+#
+# Be precise about what that buys, because it is less than a comment: an
+# annotation carrying no file/line renders on the run-summary page and behind
+# the check's Details link, and in the Checks tab — NOT in the PR conversation
+# (a passing check collapses to "All checks have passed") and NOT inline on
+# Files changed. So on a fork PR the number is recorded and reachable, but it
+# still takes a deliberate click; only the sticky comment puts it in front of a
+# reviewer unprompted. Where the App is configured, the comment remains the
+# real surface and the annotation is the backstop.
 #
 # Two-job security split: the `pr-size` job runs against PR code with a
 # read-only token; the `comment` job holds the bot write token, checks out NO
@@ -54,9 +94,9 @@ name: PR Size Cap (reusable)
 #       uses: Comfy-Org/github-workflows/.github/workflows/pr-size.yml@<sha>  # v1
 #       with:
 #         max_lines: 1000
-#         # Pin the tool ref to the same ref you pin `uses:` to for
-#         # reproducibility (defaults to main).
-#         workflows_ref: <sha>
+#         # REQUIRED. Pin the tool ref to the SAME commit SHA you pin `uses:`
+#         # to — otherwise the workflow is pinned but its tool is not.
+#         workflows_ref: <same-sha-as-uses>
 #         # Optional: post the sticky comment under your GitHub App.
 #         bot_app_id: ${{ vars.APP_ID }}
 #       secrets:
@@ -104,6 +144,28 @@ on:
         type: string
         required: false
         default: ''
+      exclude_tests:
+        description: >-
+          Keep test-file lines out of the counted total, so the cap measures
+          production code rather than test coverage. Test files are matched by
+          naming convention: file names (`*_test.go`, `test_*.py`,
+          `conftest.py`, `*.test.ts`, `*.spec.ts`); the directories
+          `__tests__/`, `__mocks__/`, `__snapshots__/`, `testdata/` at ANY
+          depth; and `test/`, `tests/`, `testing/`, `e2e/` only at the REPO
+          ROOT or under a `src/` directory (Maven/Gradle; `it/` there also needs a
+          child segment, so `src/it/java/...` is excluded but `src/it/x.properties`
+          counts). The depth limit is
+          deliberate — those four names also label deployment environments and
+          product areas, and matching them anywhere excluded production
+          infrastructure from a real consumer's cap. A nested
+          `packages/foo/tests/` therefore COUNTS. Off by default: it
+          loosens the cap, so each repo opts in deliberately. Excluded test
+          lines are always reported separately, never silently dropped. For a
+          layout these conventions miss, use `extra_generated_globs` (those
+          land in the generated bucket instead).
+        type: boolean
+        required: false
+        default: false
       comment:
         description: >-
           Post the sticky over-cap PR comment (needs bot_app_id +
@@ -122,12 +184,13 @@ on:
         default: ''
       workflows_ref:
         description: >-
-          Ref of Comfy-Org/github-workflows to load the check-pr-size tool
-          from. Pin this to the same ref you pin `uses:` to for
-          reproducibility.
+          REQUIRED. Ref of Comfy-Org/github-workflows to load the check-pr-size
+          tool from. Must be the SAME commit SHA you pin `uses:` to — otherwise
+          the workflow is pinned but the code it runs is not. There is
+          deliberately no default: a floating `main` default would silently load
+          a mutable tool.
         type: string
-        required: false
-        default: main
+        required: true
     secrets:
       BOT_APP_PRIVATE_KEY:
         description: >-
@@ -144,6 +207,7 @@ env:
   PR_SIZE_BYPASS_LABEL: ${{ inputs.bypass_label }}
   PR_SIZE_EXTRA_LOCKFILES: ${{ inputs.extra_lockfiles }}
   PR_SIZE_EXTRA_GENERATED_GLOBS: ${{ inputs.extra_generated_globs }}
+  PR_SIZE_EXCLUDE_TESTS: ${{ inputs.exclude_tests }}
 
 jobs:
   pr-size:
@@ -161,6 +225,30 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Require a pinned workflows_ref
+        # workflows_ref has no default on purpose. GitHub does NOT enforce
+        # `required: true` for workflow_call inputs, so an omitted input arrives
+        # as '' and actions/checkout would silently fall back to this repo's
+        # default branch — running MUTABLE scripts under a pin that claims
+        # otherwise. Fail fast instead. (BE-5546)
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+        run: |
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form, and echo only that: dropping
+          # newlines also stops a multi-line value from smuggling a ::workflow
+          # command:: into the log, and from satisfying the line-oriented grep
+          # below on one 40-hex line among many.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
+            exit 1
+          fi
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
+          fi
 
       - name: Load check-pr-size tool
         # The tool comes from THIS workflow's repo (public, pinned via
@@ -211,15 +299,47 @@ jobs:
             --base "${BASE_SHA}" \
             --head "${HEAD_SHA}" | tee "${RUNNER_TEMP}/pr-size-report.md"
 
+      - name: Annotate a decisive test exclusion
+        # An annotation is the ONE carrier that needs no bot credentials, so it
+        # is the only one that also reaches fork and Dependabot PRs — which
+        # never receive BOT_APP_PRIVATE_KEY and would otherwise get the loosened
+        # cap with none of the visibility that justifies it. That inversion is
+        # the worst shape this feature can take: the least-trusted contributions
+        # getting the least-scrutinized guardrail, silently, because a green
+        # check with no comment is indistinguishable from one that passed on its
+        # own merits. This fires on every PR regardless of secret availability,
+        # so the invariant "the exclusion is never invisible" holds everywhere.
+        if: always() && steps.check.outputs.tests_decisive == 'true'
+        env:
+          COUNTED: ${{ steps.check.outputs.counted }}
+          TESTS: ${{ steps.check.outputs.tests_excluded }}
+          # The APPLIED cap, emitted by the tool — not the raw max_lines input.
+          # envInt falls back to the 1000 default for anything Atoi rejects (a
+          # value arriving as `1250.5` from a GitHub expression, or with stray
+          # whitespace from a forwarded var), so the input can name a cap that
+          # was never enforced. On fork PRs this annotation is the ONLY surface,
+          # with no comment to cross-check it against.
+          CAP: ${{ steps.check.outputs.max_lines }}
+        run: |
+          echo "::warning title=Under the cap only via the test exclusion::This PR changes $((COUNTED + TESTS)) non-generated lines (${COUNTED} counted + ${TESTS} test) against a ${CAP}-line cap. exclude_tests is what brings it under — expected for a test-heavy change, surfaced so the real size is visible."
+
       - name: Record over-cap flag
-        # The comment job keys off this flag rather than the pr-size job's
-        # result, so `warn` mode (job green) still comments on overage. It
-        # rides the artifact, which — unlike job outputs — carries identically
+        # The comment job keys off these flags rather than the pr-size job's
+        # result, so `warn` mode (job green) still comments on overage. They
+        # ride the artifact, which — unlike job outputs — carries identically
         # whether this job passed or failed.
+        #
+        # tests_decisive covers the mirror-image case: the check is GREEN, but
+        # only because test lines were excluded. Without it no comment posts
+        # there, and the excluded total would be visible only in this job's step
+        # summary — hiding the number in exactly the case it exists for.
         if: always()
         env:
           OVER_CAP: ${{ steps.check.outputs.over_cap }}
-        run: printf '%s' "${OVER_CAP:-}" > "${RUNNER_TEMP}/pr-size-over-cap"
+          TESTS_DECISIVE: ${{ steps.check.outputs.tests_decisive }}
+        run: |
+          printf '%s' "${OVER_CAP:-}" > "${RUNNER_TEMP}/pr-size-over-cap"
+          printf '%s' "${TESTS_DECISIVE:-}" > "${RUNNER_TEMP}/pr-size-tests-decisive"
 
       # Hand the rendered report to the isolated `comment` job below. Uploaded
       # as an artifact (not a job output) so the job that holds the bot
@@ -232,6 +352,7 @@ jobs:
           path: |
             ${{ runner.temp }}/pr-size-report.md
             ${{ runner.temp }}/pr-size-over-cap
+            ${{ runner.temp }}/pr-size-tests-decisive
           if-no-files-found: warn
           retention-days: 7
 
@@ -304,6 +425,11 @@ jobs:
           GH_TOKEN: ${{ steps.bot.outputs.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          # The minted token's OWN bot login. app-slug comes from the token
+          # mint, so it identifies this installation whether `bot_app_id` was
+          # given as a numeric App ID or a Client ID (`Iv1.…`) — which is what
+          # made matching on the app id unreliable.
+          BOT_LOGIN: ${{ steps.bot.outputs.app-slug }}[bot]
         run: |
           set -euo pipefail
           if [ ! -s report/pr-size-report.md ]; then
@@ -311,20 +437,107 @@ jobs:
             exit 0
           fi
           OVER="$(cat report/pr-size-over-cap 2>/dev/null || true)"
+          # Green, but only because test lines were excluded — comment anyway,
+          # so the excluded total is not confined to the step summary.
+          DECISIVE="$(cat report/pr-size-tests-decisive 2>/dev/null || true)"
           MARKER='<!-- ci-pr-size -->'
           { printf '%s\n\n' "$MARKER"; cat report/pr-size-report.md; } > body.md
-          # Find our existing sticky comment (if any) by the hidden marker, so
-          # we update one comment across pushes instead of stacking new ones.
+          # Find our existing sticky comment(s) by the hidden marker, so we
+          # update across pushes instead of stacking new ones. Both filters are
+          # load-bearing, and this mirrors `find_sticky` in
+          # scripts/pr-risk/publish-risk-surfaces.sh deliberately — same hazards,
+          # so the same shape rather than a second dialect of it.
+          #
+          #   .user.login == our own bot — the marker is published in this
+          #     PUBLIC workflow file, so without an author filter a PR author can
+          #     pre-seed a comment carrying it and we would PATCH THEIRS instead
+          #     of posting ours, after which they rewrite it freely. Since
+          #     `exclude_tests` makes this comment the ONLY signal on a green
+          #     test-heavy PR, that is a hole straight through the guarantee.
+          #     Matching the LOGIN (not merely `.user.type == "Bot"`) is what
+          #     keeps us to OUR comments: any other App or github-actions[bot]
+          #     workflow in a consumer repo that echoes author-controlled text as
+          #     its first line would otherwise be claimed as ours and PATCHed
+          #     away — and while such a comment exists the POST branch below
+          #     never runs, suppressing the decisive-green comment entirely.
+          #     `.user.type` is kept as a cheap second condition, mirroring
+          #     find_sticky.
+          #
+          #   startswith, not contains — the body renders the marker as its
+          #     FIRST line, while another bot QUOTING this comment carries the
+          #     marker nested in its own prose. `contains` would PATCH that
+          #     bot's comment away, destroying unrelated review output; the org
+          #     bot posts cursor-review and groom comments too, so an author can
+          #     induce this by quoting the marker in the PR body.
+          #
+          # Both the marker and the login are passed as jq DATA (--arg), never
+          # spliced into the program text, so no value can turn the filter into a
+          # syntax error — which `set -euo pipefail` plus this step's
+          # continue-on-error would convert into a silent "no comment posted".
           existing="$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
-            --jq ".[] | select(.body | contains(\"${MARKER}\")) | .id")"
-          existing="$(printf '%s' "$existing" | head -n1)"
+            | jq -r --arg m "$MARKER" --arg login "$BOT_LOGIN" '
+                .[] | select((.user.login // "") == $login)
+                    | select((.user.type // "") == "Bot")
+                    | select(((.body // "") | startswith($m)))
+                    | .id')"
           if [ -n "$existing" ]; then
-            # Update in place — flips to ✅ when a previously-flagged PR is fixed.
-            gh api -X PATCH "repos/${REPO}/issues/comments/${existing}" -F body=@body.md >/dev/null
-            echo "Updated sticky size comment ${existing}."
-          elif [ "$OVER" = "true" ]; then
+            # Update EVERY match, not just the first. The find-then-post is
+            # check-then-act with no lock, and the documented caller subscribes
+            # to labeled/unlabeled alongside synchronize — so a push racing a
+            # label toggle can leave two comments. Taking `head -n1` would then
+            # pin one forever while the other sat displaying a stale verdict,
+            # which on a decisive-green PR is a wrong number with equal
+            # standing. Rewriting all of them keeps every copy truthful, and
+            # costs one extra API call in the rare case there is a second.
+            # Unquoted on purpose: the ids are numeric and newline-separated, so
+            # word splitting is exactly the right parse (and a heredoc's
+            # terminator cannot be indented inside this YAML block scalar).
+            #
+            # Per-id failure is TOLERATED rather than fatal. Under
+            # `set -euo pipefail` a bare call would abort the loop on the first
+            # error and leave the remaining copies showing a stale verdict —
+            # precisely the split-brain this loop exists to prevent. A 404 is an
+            # expected case: the loop only has more than one id because
+            # duplicates happen, and a maintainer (or another run) deleting one
+            # between the list and the write is a real race.
+            rc=0
+            patched=0
+            failed=0
+            for id in $existing; do
+              if gh api -X PATCH "repos/${REPO}/issues/comments/${id}" -F body=@body.md >/dev/null; then
+                echo "Updated sticky size comment ${id}."
+                patched=$((patched + 1))
+              else
+                failed=$((failed + 1))
+                # gh's stderr is deliberately NOT discarded: a 403 from
+                # permission drift, a 422 on an over-long body and a concurrent
+                # delete all land here, and swallowing the message would
+                # misattribute every one of them to "deleted concurrently".
+                echo "Failed to update sticky size comment ${id} (see gh error above); continuing." >&2
+              fi
+            done
+            # Fail the step only when NOTHING was patched. A partial failure is
+            # the expected case this loop exists for — a duplicate 404s on a
+            # concurrent delete while the real sticky updates fine — and
+            # reporting that as a step failure makes the degraded-mode note
+            # below claim no comment was posted and blame a permission 403,
+            # which is affirmatively false and dilutes the signal for a genuine
+            # one. Nothing patched, on the other hand, means the verdict on this
+            # PR is stale and the note is exactly right.
+            if [ "$patched" -eq 0 ] && [ "$failed" -gt 0 ]; then
+              echo "No sticky comment could be updated (${failed} failed); the PR may show a stale verdict." >&2
+              rc=1
+            elif [ "$failed" -gt 0 ]; then
+              echo "Updated ${patched} sticky comment(s); ${failed} could not be updated (see errors above)."
+            fi
+            [ "$rc" -eq 0 ] || exit 1
+          elif [ "$OVER" = "true" ] || [ "$DECISIVE" = "true" ]; then
             gh api -X POST "repos/${REPO}/issues/${PR_NUMBER}/comments" -F body=@body.md >/dev/null
-            echo "Posted oversize comment."
+            if [ "$OVER" = "true" ]; then
+              echo "Posted oversize comment."
+            else
+              echo "Under cap only via the test exclusion — posted the size breakdown."
+            fi
           else
             echo "Under cap and no existing comment — nothing to post."
           fi

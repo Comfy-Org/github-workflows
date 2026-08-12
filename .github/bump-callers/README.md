@@ -16,12 +16,16 @@ forward automatically instead of silently drifting commits behind.
     @SHORT" diff) and, if a bump PR is already open, refreshes its title/body to
     the new SHA rather than opening another. A fresh PR is opened only when none
     is open (first bump, or the prior one merged/closed since the last run).
-- **`tests/`** — a `bash` functional suite (stubs `gh`, no network), run by
+- **`preflight.sh`** — the staleness/decommission guard that runs *before* the
+  bump script (see [Preflight](#preflight) below). Also one file on purpose: it
+  was an inline copy in every entrypoint, and the copies drifted.
+- **`tests/`** — `bash` functional suites (stubs `gh` / builds throwaway local
+  repos; no network), run by
   [`test-bump-callers.yml`](../workflows/test-bump-callers.yml) plus shellcheck.
 
 ## The fleets
 
-| Entrypoint | Triggers on a change to | Caller variable | Seeded |
+| Entrypoint | Triggers on a change to | Caller secret | Seeded |
 |---|---|---|---|
 | [`bump-cursor-review-callers.yml`](../workflows/bump-cursor-review-callers.yml) | `cursor-review.yml` or `cursor-review/**` | `CURSOR_REVIEW_CALLERS` | non-empty (hard-fails if empty) |
 | [`bump-agents-md-callers.yml`](../workflows/bump-agents-md-callers.yml) | `agents-md-integrity.yml` or `agents-md-integrity/**` | `AGENTS_MD_CALLERS` | empty `[]` (grows as callers land) |
@@ -36,21 +40,23 @@ forward automatically instead of silently drifting commits behind.
 
 Its 12 live callers are known and correctly wired (each pins a full 40-hex SHA
 against this repo's path, i.e. exactly what the rewrite moves). It is unseeded
-anyway, on purpose.
+anyway — originally on purpose, and now only because seeding it is a separate,
+deliberate step that has not happened yet.
 
-Every roster reaches `bump-callers.sh` through the step's `env:` block, and
-Actions prints that block — values and all — before the script's `::add-mask::`
-can run. This repo is public, so each seeded fleet already publishes its roster
-in a world-readable log. That is the known gap documented in every `bump-*`
-header. The difference here is that two of this fleet's callers are non-public
-repos that appear in **no** already-seeded roster, so seeding would publish two
-names that are not out yet — and a public log entry cannot be unpublished.
+The original reason was the run-log gap. Every roster reaches `bump-callers.sh`
+through the step's `env:` block, and Actions prints that block — values and all —
+before the script's `::add-mask::` can run. This repo is public, so while the
+rosters were repo **variables**, each seeded fleet published its roster in a
+world-readable log. Two of this fleet's callers are non-public repos that appear
+in **no** other roster, so seeding would have published two names that were not
+out yet — and a public log entry cannot be unpublished, while a red run can. So
+the red run won.
 
-So the trade is: seed now and take an irreversible disclosure, or leave it
-unseeded and take a red run. The red run is reversible and is already the
-designed behaviour for an empty roster, so it wins. Seed the variable as the
-immediate follow-on to the masking fix — never as a way to turn that red run
-green.
+**That blocker is gone** (BE-6472): every roster is a repo **secret** now, and
+the runner masks a secret everywhere, that env dump included. Seeding this fleet
+is unblocked and is tracked as the follow-on — do it deliberately, with
+`gh secret set` from the canonical `callers.json`, never reflexively to turn the
+red run green.
 
 ### Reusables with no fleet — deliberate, not an oversight
 
@@ -66,7 +72,32 @@ not hypothetical — the groom fleet omitted *its own* caller (`ci-groom.yml`) f
 `GROOM_CALLERS`, the pin sat unchanged from the day it was written, and the caller
 ended up failing at startup against a reusable it had drifted away from. Before
 adding a caller anywhere, check that its fleet exists **and** that the repo is in
-the variable; the second half is the one people skip.
+its roster secret; the second half is the one people skip.
+
+Being in the variable is necessary, not sufficient, in two different ways:
+
+- **A pin's SHAPE doesn't matter — the rewrite self-heals it.** The
+  substitution is anchored to the pin token, not to 40-hex-ness (BE-4662), so a
+  `uses:` or `workflows_ref:` pinned to a placeholder, a tag, a branch, or a
+  short SHA all move to `NEW_SHA` on the next bump regardless of what they
+  carried before. A shape the rewrite genuinely cannot move — today, only a
+  `workflows_ref` fed by a `${{ … }}` expression — is asserted against
+  post-rewrite and **fails the run** rather than shipping a half-bumped caller
+  (a partial bump is worse than no bump). That assertion is what actually
+  caught the second way `ci-groom.yml` broke (BE-6015): registered, but pinned
+  to a `REPLACE_AT_MERGE_…` placeholder a landed PR never replaced — the
+  rewrite moves a placeholder like any other shape, so this specific case is
+  now a normal, self-healing bump, not a failure.
+- **A roster entry can point at a file with nothing of ours to bump.** If the
+  file names some *other* github-workflows reusable and none of ours, that is
+  a stale roster entry, not a movable pin — the variable is the thing to fix,
+  not the file. `bump-callers.sh` checks this against the ORIGINAL content
+  before the no-op test, warns per file, then **fails the run** with an
+  aggregate error, instead of logging the reassuring
+  `already at <short> — skipping` that hid it for `ci-groom.yml`.
+
+Both failure modes land after the whole fleet is processed, so every other
+caller still gets its bump; what they refuse to do is report success.
 
 They stay as thin entrypoints rather than one matrix because their triggers
 differ: a `cursor-review.yml` change must not spuriously bump agents-md or
@@ -74,8 +105,8 @@ pr-size callers, and vice versa. Everything else (masking, the PR-per-caller
 flow, the trailing-newline fix, the single-line PR body) lives once in
 `bump-callers.sh`. Registering a new fleet is: add a thin entrypoint (copy an
 existing one, swap the path filter + `VAR_NAME`/`TAG`/`WORKFLOW_FILE`/
-`ALLOW_EMPTY`), seed its variable, and add a row to this table + the paths in
-`test-bump-callers.yml`. **Then `workflow_dispatch` the new entrypoint once.**
+`ALLOW_EMPTY`), seed its roster secret, and add a row to this table + the paths
+in `test-bump-callers.yml`. **Then `workflow_dispatch` the new entrypoint once.**
 Landing a fleet does not touch the reusable it watches, so its own merge matches
 no path filter and fires no run — callers that were already stale when the fleet
 was created stay stale until the reusable next changes. Every entrypoint carries
@@ -104,6 +135,234 @@ otherwise they are left as found and the run logs a warning. Inert for every
 caller today (all call exactly one reusable); it exists so a caller that starts
 calling two cannot be corrupted.
 
+## Preflight
+
+Before an entrypoint may bump anything it has to answer two questions: is this
+run **stale** (has a later commit already touched the watched surface, so *that*
+commit has its own run?), and has the watched surface been **decommissioned**
+(deleted, so pinning callers to this SHA would break every one of them)?
+
+`preflight.sh` is that guard. It used to be an inline copy in each
+`bump-*-callers.yml`, and the copies drifted — several skipped on a bare tip
+mismatch, which throws away the only run for a change and freezes every caller,
+and the one that compared content forgot to re-point the pin at the verified tip.
+The extracted script deliberately adopts the hardened semantics: exact-refname
+tip parse (a branch literally named `foo/refs/heads/main` matches the ls-remote
+pattern at component boundaries and must not be consumed), `FETCH_HEAD`
+verification before any object is read out of it, deletion tested through the
+`$WATCHED` **variable** rather than a second copy of the literal path, and the
+re-point that pins callers to the verified tip instead of a stale `github.sha`.
+
+| Input (env) | |
+|---|---|
+| `WATCHED` | **required** — repo-relative path of the watched reusable workflow (e.g. `.github/workflows/groom.yml`) |
+| `WATCHED_ASSETS` | optional — the watched asset directory (e.g. `.github/groom`). Empty/unset means the fleet is single-path |
+| `WATCHED_PATHSPECS` | optional — newline-separated git **pathspecs** (`:(exclude)` entries allowed) covering what the fleet's `paths:` filter watches. When set, they replace the `WATCHED`/`WATCHED_ASSETS` object comparison as the staleness test. **Only `pr-risk` needs this today** |
+| `WATCHED_EXEC` | optional — newline-separated repo-relative **files** a pinned caller actually executes. When set, each is probed for deletion at the tip and — unless the run was re-pointed, which makes that tip the pin target — locally too, in addition to `WATCHED`/`WATCHED_ASSETS`. **Only `pr-risk` needs this today** |
+| `NEW_SHA` | the candidate SHA, normally `github.sha` |
+| `GITHUB_SHA`, `GITHUB_OUTPUT` | provided by Actions |
+
+`WATCHED`, `WATCHED_ASSETS` and every `WATCHED_EXEC` entry are **literal,
+repo-relative paths, not the globs from the `paths:` filter** —
+`.github/groom`, never `.github/groom/**` and never a trailing slash. A glob
+resolves to nothing (`[[ -d '.github/groom/**' ]]` is false,
+`git rev-parse 'HEAD:.github/groom/**'` is empty), so it would make every
+comparison verify nothing and the fleet a permanent silent no-op. An absolute or
+`../` path fails the other way: no tree contains one, while the local `-f`/`-d`
+probe resolves it *outside* the checkout, so the two halves of the same check
+disagree and the verdict turns on whether main happened to move. A
+`WATCHED_EXEC` entry naming a **directory** is rejected for the same reason (it
+resolves to a tree at the tip — present — and fails `[[ -f ]]` locally —
+absent); `WATCHED_ASSETS` is the input for a directory. The script rejects each
+of these shapes up front rather than reporting it as a decommission, and it
+likewise rejects a `NEW_SHA` that is not a full 40-character lowercase SHA (it is
+emitted verbatim into `$GITHUB_OUTPUT`, so a newline in it injects output lines)
+and a `HEAD` that is not `GITHUB_SHA` (a `ref:` override in the consuming
+checkout would have it compare main against itself).
+
+`WATCHED_PATHSPECS` is the one input where glob syntax is legal — the pathspecs go
+to `git diff`, which does the matching itself — but only `:(exclude)<path>` magic
+is accepted there (`:!`, `:(glob)`, `:/` are rejected: a magic prefix this script
+has not reasoned about, or a typo in one, silently changes or empties what gets
+compared). `!path`, the `paths:` filter's *own* negation syntax, is rejected too
+and its message names the `:(exclude)` spelling — git reads the `!` literally, so
+such an entry excludes nothing and matches nothing. A list of *only* exclusions
+is rejected as well — git reads that as "every path except these", the widest
+possible watched surface. Both list inputs ignore blank lines, indentation and
+whole-line `#` comments, so the fleet's `paths:` filter can be pasted into a YAML
+block scalar with its comments intact; a variable that is **set but blank** is a
+hard error rather than a fall-back to unset, because every way that shape arises
+means a check the entrypoint asked for would silently not happen.
+
+Two more things about `WATCHED_PATHSPECS` are **enforced, not merely documented**,
+because both fail green: every positive entry must select at least one tracked
+path (in this run's tree or the tip's), and the list as a whole must select
+`WATCHED` — plus, when `WATCHED_ASSETS` is also set, something under it.
+`git diff --quiet` exits 0 both for "nothing changed under these pathspecs" and
+for "these pathspecs match nothing", and the second reads as *unchanged*, so a
+typo, a directory rename, a positive an `:(exclude)` swallows entirely, or a list
+that simply omits the reusable would re-point every caller to a tip at which
+nothing was compared. The check asks `git diff` itself what the list selects, so
+coverage is never judged by looser rules than the verdict.
+
+| Output (step output) | |
+|---|---|
+| `proceed` | `true` → run `bump-callers.sh`; `false` → stale or decommissioned, do nothing |
+| `new_sha` | the SHA to pin — `NEW_SHA`, or the verified main tip when the run was re-pointed forward |
+
+Both outputs are written on **every** exit-0 path. The script exits non-zero only
+for an input it cannot trust (the shape checks above), a lookup it could not
+perform (failed `ls-remote`, failed fetch, unresolvable `FETCH_HEAD`, a
+`rev-parse` that *failed* rather than reporting absence), or an answer that
+contradicts history (the **direction guard** below): none of those is evidence of
+staleness, so it fails loudly rather than silently no-opping the fleet.
+
+**The direction guard.** When main has moved, the fetched tip must *descend from*
+this run's commit before anything is compared against it or pinned to it. If main
+moved BACKWARDS — a force-push, a revert-reset, or a stale replica answering the
+tip lookup — both outcomes are silently wrong: with the watched content differing
+at the older commit the run reads as a stale re-run and exits green ("the newer
+commit has its own run" — about an *older* commit), freezing every caller behind a
+run that will never come; with the content identical, the re-point pins the whole
+fleet BACKWARDS. So `git merge-base --is-ancestor` gates both, and a failure is an
+`::error::`, not a skip.
+
+It is measured **twice**, because descending from this run's commit is the weaker
+half. `ls-remote` and the fetch are two round trips, and a rewind landing in that
+window — or a stale replica answering the second one — can hand back a commit that
+is older than the tip just reported yet still *ahead* of this run, which sails
+through a HEAD-only check and gets compared and pinned anyway. So the tip
+`ls-remote` reported must be an ancestor of the fetched one before that move is
+logged as an advance, and the fetched one must be a descendant of this run's
+commit before anything is read out of it.
+
+Both need real history to answer: against a `--depth=1` graft `--is-ancestor`
+returns false even for a legitimate forward move, so the fetch adds `--unshallow`
+when the checkout is shallow (which `actions/checkout` makes it) — `--unshallow`
+errors out on an already-complete clone, hence a probe rather than an
+unconditional flag. The probe is `git rev-parse --is-shallow-repository`, not a
+stat of `$(git rev-parse --git-dir)/shallow`: inside a **linked worktree** that
+marker lives in the common git dir while `--git-dir` names the per-worktree one,
+so the hand-rolled form false-negatives exactly there and silently skips the
+deepening the guard is supposed to rest on.
+
+**A multi-path fleet must pass `WATCHED_ASSETS`.** The re-point is only sound
+because every entry in the fleet's `paths:` trigger is covered by the comparison
+— for `agents-md-integrity` (`.github/agents-md-integrity/**`), `cursor-review`
+(`.github/cursor-review/**`), `groom` (`.github/groom/**`) and `pr-size`
+(`scripts/check-pr-size/**`) that includes the asset directory the reusable loads
+its prompts/scripts/briefs from at run time. (`pr-risk` is multi-path too, but its
+filter also carries `:(exclude)` entries that one `WATCHED_ASSETS` string cannot
+express — see the note below.) Compare `WATCHED` alone on one of those and a
+commit touching only the assets reads as "unchanged", so callers get pinned to a
+tip whose other relevant content was never verified. Read the entrypoint's
+`paths:` rather than trusting this list, and if you widen a fleet's path filter,
+widen these inputs in the same change.
+
+They must not be **wider** than the filter either, which is the direction an
+excluding fleet gets wrong. A commit touching only an excluded path (pr-risk's
+`scripts/pr-risk/tests`, its `README.md`) starts no run of its own, but it does
+change the tree OID of an over-broad `WATCHED_ASSETS` — so this run reports "the
+watched surface changed since", skips green as a stale re-run, and waits on a
+later run that will never exist. An exclusion is a reason to narrow the inputs, or
+to carry it into `WATCHED_PATHSPECS`; never to point `WATCHED_ASSETS` at the whole
+directory.
+
+**An excluding fleet passes `WATCHED_PATHSPECS`; a per-file fleet passes
+`WATCHED_EXEC`.** Today that is exactly one fleet, `pr-risk`, which needs both —
+and they are what let it move onto this script instead of keeping its own guard:
+
+- Its `paths:` filter negates `scripts/pr-risk/tests/**` and the tool README, and
+  no object comparison can express a negation. `WATCHED_PATHSPECS` is handed
+  verbatim to `git diff`, so the staleness test asks precisely what the filter
+  asks. **It MUST mirror the filter, exclusions included** — the same coupling as
+  above, and dropping one `:(exclude)` line reinstates the false-stale freeze
+  exactly. The half of that MUST which fails *green* — a list that selects
+  nothing, or that never reaches `WATCHED` — is enforced rather than trusted (see
+  the input rules above). It compares two trees and walks no history, so it
+  composes with the deepening but does not need it.
+- Its decommission surface is the three grader scripts a caller executes, not the
+  directory holding them: a commit deleting the graders while leaving `tests/` and
+  the README behind satisfies a `-d scripts/pr-risk` probe and would bump every
+  caller onto a SHA where the tools are gone. `WATCHED_EXEC` names those files, and
+  they are probed at the tip (before the staleness test, so a deletion warns rather
+  than reading as "a newer commit has its own run") and again in this run's tree —
+  the latter only when the run was *not* re-pointed, since a re-point makes that
+  same tip the SHA callers are pinned to and this checkout no longer the thing
+  worth probing.
+
+Every other fleet leaves both unset and behaves exactly as before.
+
+Consumption is two steps — the guard, then the bump gated on its output:
+
+```yaml
+      - name: Preflight (staleness / decommission guard)
+        id: preflight
+        env:
+          WATCHED: .github/workflows/groom.yml
+          WATCHED_ASSETS: .github/groom   # omit for a single-path fleet
+          NEW_SHA: ${{ github.sha }}
+        run: bash .github/bump-callers/preflight.sh
+
+      - name: Bump SHA in caller repos
+        if: steps.preflight.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          NEW_SHA: ${{ steps.preflight.outputs.new_sha }}
+          # …VAR_NAME / TAG / WORKFLOW_FILE / CALLERS_JSON as before
+        run: bash .github/bump-callers/bump-callers.sh
+```
+
+An excluding / per-file fleet swaps the guard step's `env:` block for the list
+inputs (everything else, including the gated bump step, is unchanged):
+
+```yaml
+      - name: Preflight (staleness / decommission guard)
+        id: preflight
+        env:
+          WATCHED: .github/workflows/pr-risk.yml
+          # MIRRORS the fleet's `paths:` filter, exclusions included.
+          WATCHED_PATHSPECS: |
+            .github/workflows/pr-risk.yml
+            scripts/pr-risk
+            :(exclude)scripts/pr-risk/tests
+            :(exclude)scripts/pr-risk/README.md
+          # The files a pinned caller actually executes.
+          WATCHED_EXEC: |
+            .github/workflows/pr-risk.yml
+            scripts/pr-risk/grade-pr-risk.sh
+            scripts/pr-risk/grade-targets.sh
+            scripts/pr-risk/resolve-enabled.sh
+          NEW_SHA: ${{ github.sha }}
+        run: bash .github/bump-callers/preflight.sh
+```
+
+`new_sha` is a **step output**, not a `$GITHUB_ENV` export, and the consuming
+step reads it through its own `env:` binding. That is deliberate: a step-level
+`env: NEW_SHA:` takes precedence over the job environment, so a `$GITHUB_ENV`
+write would be silently overridden by the very binding it is meant to correct.
+
+> **The entrypoints still carry their inline copies.** Swapping them over to this
+> script is a separate change. `bump-pr-risk-callers.yml` carried two checks this
+> script did not, and **BE-6670 decided both** rather than leaving the swap to
+> choose:
+>
+> - Its **is-ancestor check is adopted here, for every fleet** (BE-6675) — see
+>   the direction guard above. It was never pr-risk-specific.
+> - Its **`git rev-list` "did a later *commit* touch a watched path" test is
+>   deliberately not ported.** It exists because pr-risk has no re-point, so a
+>   land-then-revert (net content change of zero) makes that fleet call this run
+>   the only one for the change and pin callers *backwards* to `github.sha`. The
+>   re-point already answers that case by pinning the verified tip — which on a
+>   land-then-revert is the revert commit, i.e. forward. Adding rev-list on top
+>   would only skip a run whose content the tip still needs pinned. That settles
+>   land-then-revert; it is not a claim that comparing objects expresses
+>   everything a rev-list *pathspec* can. Swapping an excluding fleet across means
+>   narrowing its inputs to what its filter really watches (above), not adding
+>   rev-list back — and since BE-6676 it can express that filter directly, with
+>   `WATCHED_PATHSPECS` + `WATCHED_EXEC`, instead of narrowing anything away. The
+>   staleness test there is still a two-tree comparison, not a history walk.
+
 ## How the pin rewrite is scoped (and why it asserts afterwards)
 
 The rewrite targets the **pin token**, not "any 40-hex on a line that mentions
@@ -126,6 +385,11 @@ unrelated full SHA that merely *shares* a line with the words `github-workflows`
 or `workflows_ref` is now unreachable, and a prose comment mentioning
 `workflows_ref:` is left as prose.
 
+The ref pattern stops at whitespace *and* at YAML's flow-style delimiters (`,`,
+`}`), so the ref in `{uses: …@v1, secrets: inherit}` does not swallow the mapping's
+comma. Flow style is not rewritten — it is failed, by the assertion below — but it
+is never silently *corrupted*.
+
 Precision cuts both ways, though — a pin form the patterns don't know how to move
 would be silently left behind. So before a rewritten file can be staged, the
 script re-reads it with a deliberately **broader** reader (any non-whitespace
@@ -145,29 +409,167 @@ value survives to be compared), and the `workflows_ref` key needs a real left
 boundary, so a longer key that merely ends in it (`upstream_workflows_ref: v1`)
 is not read as this repo's pin.
 
-## The caller variables
+## The caller secrets
 
 This repo is **public** — the workflow files and Actions run logs are both
 publicly viewable — and most callers are private, so caller names must never
 appear in a committed file or in the logs. Each fleet's caller list lives in a
-repo-level Actions **variable** (config, not a credential) as a JSON array of
-`{"repo","file","label"}` objects (`label` optional). `bump-callers.sh`
-`::add-mask::`es every repo name out of the run logs before echoing it.
+repo-level Actions **secret** as a JSON array of `{"repo","file","label"}`
+objects (`label` optional). `bump-callers.sh` `::add-mask::`es every repo name
+out of the run logs before echoing it.
 
-> **Known gap.** Each entrypoint hands the roster to the script through the
-> step's `env:`, and Actions prints a step's env block *before* the step runs —
-> so the raw roster appears in the (public) log ahead of any masking. Closing it
-> means fetching the variable at run time (`gh variable get`) and masking it
-> before first use, which needs a token permission the fleets do not mint today.
-> It is fleet-wide; no single entrypoint can fix it. Until then, assume the
-> roster is public.
+### Why a secret and not a variable (BE-6472)
 
-Adding/removing a caller needs **no public commit** — edit the variable:
+These rosters are configuration, not credentials, so a variable is the intuitive
+home — and that is what they were until BE-6472. The problem is *how* the roster
+reaches the script: each entrypoint hands it over through the step's `env:`
+block, and Actions prints a step's env block **before** the step runs, so the raw
+value landed in this public repo's log ahead of any masking the script could
+possibly do. A live run of one of these fleets rendered `GH_TOKEN: ***` directly
+above an unmasked `CALLERS_JSON` in the same block — which is also the proof that
+a secret fixes it: the runner masked the secret in the very dump that printed the
+variable in full. (The run is cited in the ticket rather than here; this file is
+public, and a pointer to a log still holding the old roster is not something to
+publish.)
+
+The obvious alternative — fetch the roster at run time with `gh variable get`
+under a permission-narrowed app token — is **not implementable**:
+`actions/create-github-app-token` has no `permission-variables` input at any
+version, and the underlying `POST /app/installations/{id}/access_tokens` API has
+no variables permission key at all. A narrowed token can never read a variable.
+
+The cost of the move is **read-back**: there is no `gh secret get`, so you cannot
+diff what a fleet holds against what you meant to set. Two things cover that:
+
+- the canonical `callers.json` in a private infra/ops repo is the **sole** source
+  of truth (it always should have been), and
+- every run that gets past roster validation logs a line of the form
+  `roster: <N> caller(s), sha256 <digest>` (a run that hard-fails on a missing or
+  malformed roster says so in its error instead), which you reproduce from the
+  canonical file with
+
+  ```bash
+  jq -cS . callers.json | sha256sum
+  ```
+
+  Equal digests mean the fleet ran exactly that roster. The digest is taken over
+  the **canonical** (`jq -cS`) form, not the raw secret bytes, so pretty-printing,
+  key order and a trailing newline cannot make the same roster fingerprint two
+  ways; array order is preserved, since that is the order repos are bumped in.
+  A fleet that no-ops on an empty roster (`ALLOW_EMPTY: true`) logs the line too,
+  as `roster: 0 caller(s), sha256 n/a (roster empty or unset)` — there is no
+  canonical form to hash, and the point of printing it anyway is that the run
+  shape you most need to recognize is not the one with no audit line at all.
+
+  What the digest gives an outside reader, stated precisely: a sha256 is not
+  reversible, but it **is** a check function, so a guess can be tested against it
+  offline. The preimage is the entire canonical array — every repo, its file path
+  and label, and their order — so a confirmable guess means reconstructing the
+  whole roster verbatim, not testing whether one repo is a member; the count is
+  the only bound on that space. Closing even this residual means a keyed HMAC and
+  an operator-held fingerprint key (which the reproduction command would then
+  need too) — deliberately not done, and worth revisiting only if a roster's
+  contents ever become guessable in bulk.
+
+Adding/removing a caller still needs **no public commit** — set the secret:
 
 ```bash
-gh variable set AGENTS_MD_CALLERS --repo Comfy-Org/github-workflows \
-  --body "$(jq -c . callers.json)"
+jq -c . callers.json | gh secret set AGENTS_MD_CALLERS --repo Comfy-Org/github-workflows
 ```
 
-Keep the canonical `callers.json` in a private infra/ops repo so variable edits
+Keep the canonical `callers.json` in a private infra/ops repo so roster edits
 have a reviewed source of truth (the org audit log records each edit).
+
+### Entry format — validated, and why
+
+Every field reaches a privileged sink: `repo` is interpolated into each
+`gh api repos/<repo>/…` write and into `gh pr create --repo`, `file` becomes the
+path committed into the caller's tree, and `label` is passed to
+`gh pr create --label`. They run under an org-wide app token (`owner: Comfy-Org`,
+contents + pull-requests + issues write, no `repositories:` narrowing), and the
+roster is a **variable** — editable outside code review. So `bump-callers.sh`
+constrains the values before it makes a single API call:
+
+| Field | Rule |
+|---|---|
+| `repo` | must match `^Comfy-Org/[A-Za-z0-9._-]+$` (the owner case-insensitively, as GitHub itself resolves it), and the name may not consist *only* of dots — `\A[.]+\z`, so `..` and `...` alike (a dot-leading or dot-bearing name such as `.github` or `a.b.c` is fine; an all-dots name is a path segment, not a repo) |
+| `file` | must match `^\.github/workflows/[A-Za-z0-9._-]+\.ya?ml$` (the class excludes `/`, so `../` traversal cannot appear) |
+| `label` | optional; when present must be a string containing no `\|`, no comma, and no control character |
+
+Each pattern is anchored `\A…\z`, not `^…$`: jq matches with Oniguruma, where `$`
+also matches *before a trailing newline*, so `"Comfy-Org/legit\n"` would otherwise
+pass and then split into two tuples — one of them never validated, with an empty
+`repo`.
+
+A violation is a **hard fail before the fan-out**, reported as the entry's
+zero-based **index** and the rule it broke — never the value, because masking has
+not been applied at that point and this repo's run logs are public. The `label`
+rule is not cosmetic. Entries are carried internally as `repo|file|label|wire_bot`
+tuples, so a pipe-bearing label would truncate and bleed its tail into the
+`wire_bot` field; a control character is dropped or mangled somewhere between
+`jq` and the flag (bash's `read` silently discards a NUL); and `--label` is a
+cobra StringSlice, which CSV-splits, so `ci,do-not-merge` would quietly apply a
+second, potentially blocking label the entry does not appear to name. Spaces,
+`:` and `/` are all still fine — this bars what is structurally unsafe, not what
+GitHub disallows.
+
+The owner is normalised to `Comfy-Org` once validated, and repos are grouped
+case-insensitively. Accepting `comfy-org/x` without folding it would make two
+spellings of one repo into two bump runs against it, the second force-moving the
+shared bump branch off the first's commit — a green run shipping a partial bump.
+
+### Un-bumpable entries fail the run
+
+Being in the variable is necessary, not sufficient. The bumper can only move a
+pin it can *find*, and a file carrying no pin this fleet can address rewrites to
+itself — which the content-equality check then reports as the reassuring
+`already at <short> — skipping`. That is how a wrong roster entry drifts forever
+behind a green run. Each caller file is now checked for such a pin *before* the
+rewrite; if there is none, the run warns per file and then **fails** with an
+aggregate error naming how many caller files were affected. Three shapes trip it:
+
+- the file **does not exist** on the caller's default branch (a renamed or
+  typo'd path) — previously a silent `not found — skipping`;
+- the file carries no `uses:` pin of `Comfy-Org/github-workflows` at all (wrong
+  file, or not a caller);
+- its only `github-workflows` `uses:` names a **sibling** fleet's reusable, so
+  this fleet has nothing to move — the stale entry, not the file, is the bug.
+
+A `uses:` pin is required in all three cases: a bare `workflows_ref:` never
+rescues a file. That input carries no workflow name, so it cannot vouch for
+*this* fleet, and admitting it would let the run stamp this fleet's SHA onto a
+sibling caller's assets ref. Every caller of every seeded fleet carries a `uses:`
+pin today, so nothing legitimate is caught by this.
+
+"`uses:` pin" is meant literally: the check is anchored to the `uses:` key
+(optionally quoted value), not merely to a `Comfy-Org/github-workflows@<ref>`
+token somewhere on the line. A `run:` step that curls this repo, or a repo@ref
+passed as an input to some *other* action, is not a caller — and since the pin
+rewrite keys on the same token, admitting one would mean opening a bump PR
+against a file that never called us.
+
+What does **not** trip it is a pin that is merely not a full SHA. The rewrite
+matches a ref by position rather than shape, so a caller on `@v1` is *self-healed*
+to the new SHA — dragging floating pins back onto immutable ones is the point of
+the fleet, not an error. Nor does a pin the rewrite knows about but cannot move
+(a `uses:` ref fed by a `${{ … }}` expression): that is admitted here and then
+fails loudly in the post-rewrite assertion, which is the check that owns it. The
+failure lands after every caller has been processed,
+so one bad entry never blocks the rest of the fleet's bumps; what it refuses to do
+is report success.
+
+**Finish the cutover by deleting the old variables.** A `*_CALLERS` variable left
+behind after its secret is seeded still holds the private roster in this repo's
+Actions config, readable by anything with variables-read access — the pre-BE-6472
+copy of the exact data the move exists to hide. Once a fleet's first post-merge
+run has logged the expected count and digest:
+
+```bash
+gh variable delete AGENTS_MD_CALLERS --repo Comfy-Org/github-workflows
+```
+
+Do that for every migrated fleet. Delete only **after** the run confirms the
+secret is good — the variable is the rollback.
+
+The `VAR_NAME` env key the entrypoints pass keeps its historical name even though
+it now names a secret; it exists only to name the roster in an error message.

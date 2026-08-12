@@ -73,7 +73,7 @@ jobs:
       BOT_APP_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
 ```
 
-Then add your repo to `vars.GROOM_CALLERS` — see
+Then ask a maintainer to add your repo to the `GROOM_CALLERS` roster secret — see
 [Staying current](README.md#staying-current).
 
 ## Required permissions

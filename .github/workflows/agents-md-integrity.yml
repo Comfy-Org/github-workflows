@@ -27,9 +27,9 @@ name: AGENTS.md Integrity (reusable)
 #         contents: read
 #       uses: Comfy-Org/github-workflows/.github/workflows/agents-md-integrity.yml@<sha>  # v1
 #       with:
-#         workflows_ref: <same-sha>   # pin the checker to the same ref as `uses:`
+#         workflows_ref: <same-sha>   # REQUIRED — same SHA as `uses:` above
 #
-# INPUTS (all optional):
+# INPUTS (`workflows_ref` is REQUIRED; all others optional):
 #   max_lines            Hard line ceiling for AGENTS.md; over it FAILS.
 #                        Default 200 (official Anthropic guidance).
 #   warn_lines           Aspirational target; over it emits a non-fatal WARNING
@@ -65,9 +65,10 @@ name: AGENTS.md Integrity (reusable)
 #                        (default) an unowned AGENTS.md only WARNS; when true it
 #                        FAILS. Default false (warn only).
 #   agents_file          Path to the agents file to check. Default `AGENTS.md`.
-#   workflows_ref        Ref of Comfy-Org/github-workflows to load the check
-#                        script from. Pin this to the same ref you pin `uses:`
-#                        to for reproducibility. Default `main`.
+#   workflows_ref        REQUIRED. Ref of Comfy-Org/github-workflows to load the
+#                        check script from. Must be the SAME commit SHA you pin
+#                        `uses:` to — no default, so a caller can't pin the
+#                        workflow while loading the checker from a mutable branch.
 #
 # No secrets required.
 
@@ -131,11 +132,13 @@ on:
         default: AGENTS.md
       workflows_ref:
         description: >-
-          Ref of Comfy-Org/github-workflows to load the check script from. Pin
-          this to the same ref you pin `uses:` to for reproducibility.
+          REQUIRED. Ref of Comfy-Org/github-workflows to load the check script
+          from. Must be the SAME commit SHA you pin `uses:` to — otherwise the
+          workflow is pinned but the code it runs is not. There is deliberately
+          no default: a floating `main` default would silently load a mutable
+          checker.
         type: string
-        required: false
-        default: main
+        required: true
 
 permissions:
   contents: read
@@ -151,6 +154,30 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Require a pinned workflows_ref
+        # workflows_ref has no default on purpose. GitHub does NOT enforce
+        # `required: true` for workflow_call inputs, so an omitted input arrives
+        # as '' and actions/checkout would silently fall back to this repo's
+        # default branch — running MUTABLE scripts under a pin that claims
+        # otherwise. Fail fast instead. (BE-5546)
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+        run: |
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form, and echo only that: dropping
+          # newlines also stops a multi-line value from smuggling a ::workflow
+          # command:: into the log, and from satisfying the line-oriented grep
+          # below on one 40-hex line among many.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
+            exit 1
+          fi
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
+          fi
 
       - name: Load integrity check script
         # The checker comes from THIS repo (public, pinned via workflows_ref),

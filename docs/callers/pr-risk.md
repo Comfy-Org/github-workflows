@@ -50,9 +50,13 @@ jobs:
   pr-risk:
     permissions:
       contents: read
-      issues: write          # the risk label rides the issues API
-      pull-requests: read
-      checks: read           # the check rollup the reversibility axis reads
+      issues: write          # create the risk:* labels repo-side on first use
+      pull-requests: write   # the label write itself — labeling a PR rides the
+                             # pull-requests permission, not issues (the labels
+                             # endpoint is dual-mapped by what the "issue" is)
+      checks: write          # REQUIRED WHETHER OR NOT you set `check_run: true` —
+                             # see "Grant the whole union" below
+      actions: read          # the rollup's CheckRun -> checkSuite -> workflowRun hop
       statuses: read
     uses: Comfy-Org/github-workflows/.github/workflows/pr-risk.yml@<full-commit-sha>
     with:
@@ -60,14 +64,14 @@ jobs:
 ```
 
 Enrolling is **two steps** — merging the caller above is only the first. Ask a
-maintainer to add this repo to the `PR_RISK_CALLERS` roster
+maintainer to add this repo to the `PR_RISK_CALLERS` roster secret
 (see [Staying current](README.md#staying-current)); until they do, the
 [`bump-pr-risk-callers.yml`](../../.github/workflows/bump-pr-risk-callers.yml)
 fleet does not know the caller exists, so both of its pins sit frozen and the
 caller silently drifts behind the grader it runs. Skipping this half is the most
 repeated mistake in this repo.
 
-Two things to know about that second step:
+One thing to know about that second step:
 
 - **Enrolment does not backfill your pin.** The fleet only runs on a push to
   `main` touching `pr-risk.yml` or `scripts/pr-risk/**`, so a repo added to the
@@ -75,29 +79,44 @@ Two things to know about that second step:
   next changes. Ask the maintainer to `workflow_dispatch`
   `bump-pr-risk-callers.yml` once after adding you — every bump entrypoint
   carries `workflow_dispatch` for exactly this.
-- **The roster is currently readable in this public repo's run log.** The
-  entrypoint binds `vars.PR_RISK_CALLERS` through `env:`, and Actions dumps the
-  step env before `bump-callers.sh` can mask it (a known gap, documented in that
-  workflow's header). Enrolling a **private** repo therefore publishes its name,
-  and a public log entry cannot be unpublished — weigh that before asking.
+
+Enrolling a private repo used to publish its name in this public repo's run log:
+the roster was an Actions **variable** bound through `env:`, and Actions dumps
+the step env before `bump-callers.sh` can mask it. BE-6472 moved every roster to
+a **secret**, which the runner masks in that dump too, so that caveat no longer
+applies to new enrolments — but a name already printed in an old public log
+cannot be unpublished.
 
 ## Required permissions
 
 ```yaml
 contents: read
 issues: write
-pull-requests: read
-checks: read
+pull-requests: write
+checks: write
+actions: read
 statuses: read
 ```
+
+**Grant the whole union, including `checks: write`.** A reusable workflow can
+only narrow the caller's token, never elevate it, so GitHub validates *every*
+nested job's declared `permissions:` against this block at **startup** — before
+any job is scheduled. The `publish-check` job declares `checks: write`, and a
+job-level `if:` is a runtime condition, so leaving `check_run` at its default
+`false` does not exempt you: a short grant fails the whole run with an opaque
+"workflow file issue" and no job-level detail. Grading itself only needs
+`checks: read` (the rollup the reversibility axis reads); the write is the
+grant, not the behaviour. **Moving an existing pin onto a commit that has this
+job? Add `checks: write` to the caller in the same PR** — a pin bump alone will
+fail the caller's next run at startup.
 
 ## Inputs
 
 | Input | Default | Notes |
 |---|---|---|
-| `workflows_ref` | — (**required**) | Pin to the SAME full commit SHA as `uses:`. No default on purpose: a floating default let a caller SHA-pin `uses:` and still load the grader from HEAD of main. |
-| `fleet_logins` | `mattmillerai` | Logins whose PRs grade provenance `agent-supervised` alongside `agent-coded`. |
-| `bot_logins` | `github-actions,dependabot,renovate,coderabbitai,cursor,comfy-pr-bot,web-flow` | Extra logins treated as bots. A bot with no runbook entry still grades as human — identity alone buys no trust. |
+| `workflows_ref` | — (**required**) | Pin to the SAME full commit SHA as `uses:`. No default on purpose: a floating default let a caller SHA-pin `uses:` and still load the grader from HEAD of main. Checked before the tool checkout on two axes: it must be a full 40-hex lowercase SHA, **and** that commit must be an ancestor of `main` of this repo. So a branch, a tag, a `refs/pull/N/head` and any **not-yet-merged** SHA all fail the run — **merge the change here first, then bump the pin.** There is no opt-out. |
+| `fleet_logins` | `mattmillerai` | Logins whose PRs grade provenance `agent-supervised` alongside `agent-coded`. Both are read for **human** authors only: an author GitHub types as a `Bot` is a runbook candidate regardless, so listing a bot here (or labelling its PR) buys it nothing — only a registry entry that asserts can promote it. |
+| `bot_logins` | `github-actions,dependabot,renovate,coderabbitai,cursor,comfy-pr-bot,web-flow` | Extra logins treated as bots. Needed only for **machine USER accounts** — a real GitHub App is recognized from GitHub's own actor type, no list entry required. A bot with no runbook entry still grades as human — identity alone buys no trust. **This list is load-bearing, not a hint:** a listed login skips the first-time-contributor test, so it moves a non-fork `NONE`/`FIRST_TIME_CONTRIBUTOR` PR from `external` (R3) to `human` (R1). Nothing validates that a listed login is really a machine account, so add one only for an account you control, and remove it when it is retired. |
 | `label_map` | `''` | Rename the five grader-owned labels as `tier=label` pairs. Tier keys are fixed; only the label text is yours. |
 | `wait_for_checks_minutes` | `10` | How long to wait for the rest of the check rollup to settle before labeling (clamped to 25 — what a 30-minute job can spend waiting). `0` labels immediately, expect R2 floors from still-pending checks. |
 | `repo_map_path` | `.github/risk.json` | Consumer risk-map override, read from the PR **base ref**. |

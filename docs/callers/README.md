@@ -55,7 +55,7 @@ Three parts people leave out, in order of how much pain they cause:
 
 1. `permissions:` on the calling **job**
 2. `on:` at the top
-3. the `vars.*_CALLERS` roster entry (see [Staying current](#staying-current))
+3. the `*_CALLERS` roster entry (see [Staying current](#staying-current))
 
 ---
 
@@ -145,9 +145,9 @@ If the reusable declares none, a caller-level group is fine and often useful
 Enrolling a repo is **two steps**, and the second is the one people miss.
 
 1. Merge the caller workflow into your repo.
-2. Add the repo to the matching roster variable on **this** repo:
+2. Add the repo to the matching roster secret on **this** repo:
 
-   | Workflow | Roster variable |
+   | Workflow | Roster secret |
    |---|---|
    | `groom.yml` | `GROOM_CALLERS` |
    | `cursor-review.yml` | `CURSOR_REVIEW_CALLERS` |
@@ -156,13 +156,17 @@ Enrolling a repo is **two steps**, and the second is the one people miss.
    | `pr-risk.yml` | `PR_RISK_CALLERS` |
    | `agents-md-integrity.yml` | `AGENTS_MD_CALLERS` |
    | `assign-reviewers.yml` | `ASSIGN_REVIEWERS_CALLERS` |
-   | `detect-unreviewed-merge.yml` | `DETECT_UNREVIEWED_MERGE_CALLERS` |
-
-   ```bash
-   gh api repos/Comfy-Org/github-workflows/actions/variables/GROOM_CALLERS --jq .value
-   ```
+   | `detect-unreviewed-merge.yml` | `DETECT_UNREVIEWED_MERGE_CALLERS` (not seeded yet — pins move by hand until it is) |
 
    Each entry is `{"repo": "...", "file": ".github/workflows/<caller>.yml", "label": ""}`.
+
+   The rosters are repo **secrets**, not variables (BE-6472) — a variable handed
+   to a step through `env:` is printed unmasked in the env dump Actions emits
+   before that step, which published private caller names in this public repo's
+   logs. That means they are **write-only**: there is no read-back, so the
+   canonical `callers.json` lives in a private infra/ops repo and a maintainer
+   applies your entry from it with `gh secret set`. Ask a maintainer rather than
+   editing the roster directly.
 
 The `bump-*-callers.yml` workflows read those rosters to open pin-bump PRs when
 the reusable moves. **A repo absent from the roster keeps its original SHA
