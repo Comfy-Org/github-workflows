@@ -99,7 +99,7 @@ jobs:
     # reusable-lands-then-bump-caller two-step whose second half never happened).
     #
     # This pin and `workflows_ref` below MUST stay byte-identical. They are
-    # auto-bumped together: this repo IS enrolled in `vars.GROOM_CALLERS` as
+    # auto-bumped together: this repo IS enrolled in the `GROOM_CALLERS` roster as
     # `.github/workflows/ci-groom.yml`, and bump-callers.sh rewrites both pins
     # and both `# main @ <short>` annotations in one pass. (The bump-callers
     # README / AGENTS.md tell the story of this caller being MISSING from that

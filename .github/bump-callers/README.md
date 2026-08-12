@@ -25,7 +25,7 @@ forward automatically instead of silently drifting commits behind.
 
 ## The fleets
 
-| Entrypoint | Triggers on a change to | Caller variable | Seeded |
+| Entrypoint | Triggers on a change to | Caller secret | Seeded |
 |---|---|---|---|
 | [`bump-cursor-review-callers.yml`](../workflows/bump-cursor-review-callers.yml) | `cursor-review.yml` or `cursor-review/**` | `CURSOR_REVIEW_CALLERS` | non-empty (hard-fails if empty) |
 | [`bump-agents-md-callers.yml`](../workflows/bump-agents-md-callers.yml) | `agents-md-integrity.yml` or `agents-md-integrity/**` | `AGENTS_MD_CALLERS` | empty `[]` (grows as callers land) |
@@ -40,21 +40,23 @@ forward automatically instead of silently drifting commits behind.
 
 Its 12 live callers are known and correctly wired (each pins a full 40-hex SHA
 against this repo's path, i.e. exactly what the rewrite moves). It is unseeded
-anyway, on purpose.
+anyway — originally on purpose, and now only because seeding it is a separate,
+deliberate step that has not happened yet.
 
-Every roster reaches `bump-callers.sh` through the step's `env:` block, and
-Actions prints that block — values and all — before the script's `::add-mask::`
-can run. This repo is public, so each seeded fleet already publishes its roster
-in a world-readable log. That is the known gap documented in every `bump-*`
-header. The difference here is that two of this fleet's callers are non-public
-repos that appear in **no** already-seeded roster, so seeding would publish two
-names that are not out yet — and a public log entry cannot be unpublished.
+The original reason was the run-log gap. Every roster reaches `bump-callers.sh`
+through the step's `env:` block, and Actions prints that block — values and all —
+before the script's `::add-mask::` can run. This repo is public, so while the
+rosters were repo **variables**, each seeded fleet published its roster in a
+world-readable log. Two of this fleet's callers are non-public repos that appear
+in **no** other roster, so seeding would have published two names that were not
+out yet — and a public log entry cannot be unpublished, while a red run can. So
+the red run won.
 
-So the trade is: seed now and take an irreversible disclosure, or leave it
-unseeded and take a red run. The red run is reversible and is already the
-designed behaviour for an empty roster, so it wins. Seed the variable as the
-immediate follow-on to the masking fix — never as a way to turn that red run
-green.
+**That blocker is gone** (BE-6472): every roster is a repo **secret** now, and
+the runner masks a secret everywhere, that env dump included. Seeding this fleet
+is unblocked and is tracked as the follow-on — do it deliberately, with
+`gh secret set` from the canonical `callers.json`, never reflexively to turn the
+red run green.
 
 ### Reusables with no fleet — deliberate, not an oversight
 
@@ -70,7 +72,7 @@ not hypothetical — the groom fleet omitted *its own* caller (`ci-groom.yml`) f
 `GROOM_CALLERS`, the pin sat unchanged from the day it was written, and the caller
 ended up failing at startup against a reusable it had drifted away from. Before
 adding a caller anywhere, check that its fleet exists **and** that the repo is in
-the variable; the second half is the one people skip.
+its roster secret; the second half is the one people skip.
 
 Being in the variable is necessary, not sufficient, in two different ways:
 
@@ -103,8 +105,8 @@ pr-size callers, and vice versa. Everything else (masking, the PR-per-caller
 flow, the trailing-newline fix, the single-line PR body) lives once in
 `bump-callers.sh`. Registering a new fleet is: add a thin entrypoint (copy an
 existing one, swap the path filter + `VAR_NAME`/`TAG`/`WORKFLOW_FILE`/
-`ALLOW_EMPTY`), seed its variable, and add a row to this table + the paths in
-`test-bump-callers.yml`. **Then `workflow_dispatch` the new entrypoint once.**
+`ALLOW_EMPTY`), seed its roster secret, and add a row to this table + the paths
+in `test-bump-callers.yml`. **Then `workflow_dispatch` the new entrypoint once.**
 Landing a fleet does not touch the reusable it watches, so its own merge matches
 no path filter and fires no run — callers that were already stale when the fleet
 was created stay stale until the reusable next changes. Every entrypoint carries
@@ -322,31 +324,75 @@ value survives to be compared), and the `workflows_ref` key needs a real left
 boundary, so a longer key that merely ends in it (`upstream_workflows_ref: v1`)
 is not read as this repo's pin.
 
-## The caller variables
+## The caller secrets
 
 This repo is **public** — the workflow files and Actions run logs are both
 publicly viewable — and most callers are private, so caller names must never
 appear in a committed file or in the logs. Each fleet's caller list lives in a
-repo-level Actions **variable** (config, not a credential) as a JSON array of
-`{"repo","file","label"}` objects (`label` optional). `bump-callers.sh`
-`::add-mask::`es every repo name out of the run logs before echoing it.
+repo-level Actions **secret** as a JSON array of `{"repo","file","label"}`
+objects (`label` optional). `bump-callers.sh` `::add-mask::`es every repo name
+out of the run logs before echoing it.
 
-> **Known gap.** Each entrypoint hands the roster to the script through the
-> step's `env:`, and Actions prints a step's env block *before* the step runs —
-> so the raw roster appears in the (public) log ahead of any masking. Closing it
-> means fetching the variable at run time (`gh variable get`) and masking it
-> before first use, which needs a token permission the fleets do not mint today.
-> It is fleet-wide; no single entrypoint can fix it. Until then, assume the
-> roster is public.
+### Why a secret and not a variable (BE-6472)
 
-Adding/removing a caller needs **no public commit** — edit the variable:
+These rosters are configuration, not credentials, so a variable is the intuitive
+home — and that is what they were until BE-6472. The problem is *how* the roster
+reaches the script: each entrypoint hands it over through the step's `env:`
+block, and Actions prints a step's env block **before** the step runs, so the raw
+value landed in this public repo's log ahead of any masking the script could
+possibly do. A live run of one of these fleets rendered `GH_TOKEN: ***` directly
+above an unmasked `CALLERS_JSON` in the same block — which is also the proof that
+a secret fixes it: the runner masked the secret in the very dump that printed the
+variable in full. (The run is cited in the ticket rather than here; this file is
+public, and a pointer to a log still holding the old roster is not something to
+publish.)
+
+The obvious alternative — fetch the roster at run time with `gh variable get`
+under a permission-narrowed app token — is **not implementable**:
+`actions/create-github-app-token` has no `permission-variables` input at any
+version, and the underlying `POST /app/installations/{id}/access_tokens` API has
+no variables permission key at all. A narrowed token can never read a variable.
+
+The cost of the move is **read-back**: there is no `gh secret get`, so you cannot
+diff what a fleet holds against what you meant to set. Two things cover that:
+
+- the canonical `callers.json` in a private infra/ops repo is the **sole** source
+  of truth (it always should have been), and
+- every run that gets past roster validation logs a line of the form
+  `roster: <N> caller(s), sha256 <digest>` (a run that hard-fails on a missing or
+  malformed roster says so in its error instead), which you reproduce from the
+  canonical file with
+
+  ```bash
+  jq -cS . callers.json | sha256sum
+  ```
+
+  Equal digests mean the fleet ran exactly that roster. The digest is taken over
+  the **canonical** (`jq -cS`) form, not the raw secret bytes, so pretty-printing,
+  key order and a trailing newline cannot make the same roster fingerprint two
+  ways; array order is preserved, since that is the order repos are bumped in.
+  A fleet that no-ops on an empty roster (`ALLOW_EMPTY: true`) logs the line too,
+  as `roster: 0 caller(s), sha256 n/a (roster empty or unset)` — there is no
+  canonical form to hash, and the point of printing it anyway is that the run
+  shape you most need to recognize is not the one with no audit line at all.
+
+  What the digest gives an outside reader, stated precisely: a sha256 is not
+  reversible, but it **is** a check function, so a guess can be tested against it
+  offline. The preimage is the entire canonical array — every repo, its file path
+  and label, and their order — so a confirmable guess means reconstructing the
+  whole roster verbatim, not testing whether one repo is a member; the count is
+  the only bound on that space. Closing even this residual means a keyed HMAC and
+  an operator-held fingerprint key (which the reproduction command would then
+  need too) — deliberately not done, and worth revisiting only if a roster's
+  contents ever become guessable in bulk.
+
+Adding/removing a caller still needs **no public commit** — set the secret:
 
 ```bash
-gh variable set AGENTS_MD_CALLERS --repo Comfy-Org/github-workflows \
-  --body "$(jq -c . callers.json)"
+jq -c . callers.json | gh secret set AGENTS_MD_CALLERS --repo Comfy-Org/github-workflows
 ```
 
-Keep the canonical `callers.json` in a private infra/ops repo so variable edits
+Keep the canonical `callers.json` in a private infra/ops repo so roster edits
 have a reviewed source of truth (the org audit log records each edit).
 
 ### Entry format — validated, and why
@@ -426,3 +472,19 @@ fails loudly in the post-rewrite assertion, which is the check that owns it. The
 failure lands after every caller has been processed,
 so one bad entry never blocks the rest of the fleet's bumps; what it refuses to do
 is report success.
+
+**Finish the cutover by deleting the old variables.** A `*_CALLERS` variable left
+behind after its secret is seeded still holds the private roster in this repo's
+Actions config, readable by anything with variables-read access — the pre-BE-6472
+copy of the exact data the move exists to hide. Once a fleet's first post-merge
+run has logged the expected count and digest:
+
+```bash
+gh variable delete AGENTS_MD_CALLERS --repo Comfy-Org/github-workflows
+```
+
+Do that for every migrated fleet. Delete only **after** the run confirms the
+secret is good — the variable is the rollback.
+
+The `VAR_NAME` env key the entrypoints pass keeps its historical name even though
+it now names a secret; it exists only to name the roster in an error message.

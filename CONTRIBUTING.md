@@ -63,7 +63,7 @@ the PR body so callers bump both.
    the exact permission grant, required vs optional secrets and `vars`, and any
    footguns. A guide that omits `on:` or the permission grant is not a guide.
 4. Add a one-line row to the [README](README.md#workflows) table linking to it.
-5. If the workflow should be adopted broadly, add a `vars.<NAME>_CALLERS` roster
+5. If the workflow should be adopted broadly, add a `<NAME>_CALLERS` roster secret
    and a `bump-<name>-callers.yml` job so pins get bumped automatically. See
    [.github/bump-callers/](.github/bump-callers/).
 6. Add a `test-<name>.yml` if it ships scripts.
@@ -74,7 +74,11 @@ Two steps. Missing the second is the common mistake:
 
 1. Add the caller workflow to the consumer repo (see
    [`docs/callers/`](docs/callers/)).
-2. **Add the repo to the matching `vars.<NAME>_CALLERS` roster** on this repo.
+2. **Add the repo to the matching `<NAME>_CALLERS` roster secret** on this repo
+   (`jq -c . callers.json | gh secret set <NAME>_CALLERS --repo Comfy-Org/github-workflows`,
+   from the canonical `callers.json` in the private infra/ops repo — a secret,
+   not a variable, so caller names stay out of the public run logs, and there is
+   no read-back).
    That roster is what `bump-*-callers.yml` reads to keep pins current. A repo
    absent from it keeps its original SHA forever, drifts behind the reusable, and
    eventually breaks when the two stop being compatible.

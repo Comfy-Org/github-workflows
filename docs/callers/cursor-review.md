@@ -80,7 +80,7 @@ jobs:
       BOT_APP_PRIVATE_KEY: ${{ secrets.BOT_APP_PRIVATE_KEY }}
 ```
 
-Then add your repo to `vars.CURSOR_REVIEW_CALLERS`.
+Then ask a maintainer to add your repo to the `CURSOR_REVIEW_CALLERS` roster secret.
 
 ## Required permissions
 
