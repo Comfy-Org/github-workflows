@@ -29,6 +29,18 @@ FINDING_SCHEMA = {
         "body": {"type": "string", "minLength": 1, "maxLength": 20000},
     },
 }
+JUDGE_FINDING_SCHEMA = {
+    **FINDING_SCHEMA,
+    "properties": {
+        **FINDING_SCHEMA["properties"],
+        "repeat_of": {"type": "string", "minLength": 1, "maxLength": 2048},
+        "repeat_round": {"type": "integer", "minimum": 1},
+    },
+    "dependentRequired": {
+        "repeat_of": ["repeat_round"],
+        "repeat_round": ["repeat_of"],
+    },
+}
 
 
 def write_record(path, record):
@@ -69,12 +81,15 @@ def read_record(args):
         return initial_record(args)
 
 
-def validate_finding(value):
+def validate_finding(value, allow_repeat=False):
     if not isinstance(value, dict):
         raise ValueError("finding must be an object")
-    expected = {"file", "line", "side", "severity", "body"}
-    if set(value) != expected:
-        raise ValueError(f"finding keys must be exactly {sorted(expected)}")
+    base_keys = {"file", "line", "side", "severity", "body"}
+    repeat_keys = {"repeat_of", "repeat_round"}
+    valid_keys = (base_keys, base_keys | repeat_keys) if allow_repeat else (base_keys,)
+    if set(value) not in valid_keys:
+        choices = " or ".join(str(sorted(keys)) for keys in valid_keys)
+        raise ValueError(f"finding keys must be exactly {choices}")
 
     path = value["file"]
     if not isinstance(path, str) or not path or len(path) > 1024:
@@ -95,6 +110,13 @@ def validate_finding(value):
     body = value["body"]
     if not isinstance(body, str) or not body or len(body) > 20000:
         raise ValueError("body must be a non-empty string of at most 20000 characters")
+    if "repeat_of" in value:
+        repeat_of = value["repeat_of"]
+        if not isinstance(repeat_of, str) or not repeat_of or len(repeat_of) > 2048:
+            raise ValueError("repeat_of must be a non-empty string of at most 2048 characters")
+        repeat_round = value["repeat_round"]
+        if isinstance(repeat_round, bool) or not isinstance(repeat_round, int) or repeat_round < 1:
+            raise ValueError("repeat_round must be a positive integer")
 
     return {**value, "file": normalized}
 
@@ -139,7 +161,7 @@ def tools_for(mode):
                     "findings": {
                         "type": "array",
                         "maxItems": 10,
-                        "items": FINDING_SCHEMA,
+                        "items": JUDGE_FINDING_SCHEMA,
                     }
                 },
             },
@@ -186,7 +208,10 @@ def call_tool(args, name, arguments):
             raise ValueError("findings must be an array and the only argument")
         if len(arguments["findings"]) > 10:
             raise ValueError("final review is capped at 10 findings")
-        findings = [validate_finding(finding) for finding in arguments["findings"]]
+        findings = [
+            validate_finding(finding, allow_repeat=True)
+            for finding in arguments["findings"]
+        ]
         record = initial_record(args)
         record.update(status="ok", findings=findings)
         record.pop("error", None)

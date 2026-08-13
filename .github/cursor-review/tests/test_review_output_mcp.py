@@ -139,6 +139,31 @@ class StdioServerTest(unittest.TestCase):
         self.assertEqual(record["status"], "ok")
         self.assertEqual(record["findings"], [])
 
+    def test_judge_preserves_prior_review_repeat_metadata(self):
+        repeated = {
+            **FINDING,
+            "repeat_of": "https://github.com/example/repo/pull/1#discussion_r123",
+            "repeat_round": 2,
+        }
+        record, _ = self.run_server("judge", [
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+                "name": "cursor_review_submit_final",
+                "arguments": {"findings": [repeated]},
+            }},
+        ])
+        self.assertEqual(record["status"], "ok")
+        self.assertEqual(record["findings"], [repeated])
+
+    def test_judge_rejects_incomplete_repeat_metadata(self):
+        record, responses = self.run_server("judge", [
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+                "name": "cursor_review_submit_final",
+                "arguments": {"findings": [{**FINDING, "repeat_round": 2}]},
+            }},
+        ])
+        self.assertEqual(record["status"], "error")
+        self.assertTrue(responses[0]["result"]["isError"])
+
     def test_invalid_tool_input_does_not_replace_output(self):
         record, responses, initial_record = self.run_server("judge", [
             {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
