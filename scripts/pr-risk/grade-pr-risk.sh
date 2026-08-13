@@ -435,8 +435,19 @@ cat <<'JQ'
          # while deleting an unrelated README reported "deletes N file(s) under a sensitive class"
          # and pinned reversibility R3. The two sets have to be the same set for the sentence the
          # reason string prints to be true.
-         | ([$M.path_rules[]? | . as $rule | select($deleted | any(. as $p | $p | matches_any($rule.paths))) | .class] | unique) as $del_classes
-         | ($del_classes | any(. as $c | ($RV.delete_sensitive_classes // []) | index($c))) as $del_sensitive
+         # The delete-sensitive RULES, resolved once. The reason sentence, the $del_sensitive
+         # test and the attribution below all read this same set, so the three can never
+         # disagree about which removals were the sensitive ones.
+         | ([$M.path_rules[]? | . as $rule
+             | select((($RV.delete_sensitive_classes // []) | index($rule.class)) != null)]) as $dsr
+         # SENSITIVE removals only. Counting every removal and joining every class any removal
+         # matched printed "removes 2 file(s) under a sensitive class (auth, docs)" for a PR
+         # that removed one auth file and one README — `docs` is not a sensitive class and the
+         # README is not what pinned the tier, so the sentence overstated its own rule and
+         # disagreed with the `files` list printed beside it.
+         | ([$deleted[] | . as $p | select(any($dsr[]; . as $rule | $p | matches_any($rule.paths)))]) as $del_sens_paths
+         | ([$dsr[] | . as $rule | select($deleted | any(. as $p | $p | matches_any($rule.paths))) | .class] | unique) as $del_classes
+         | (($del_sens_paths | length) > 0) as $del_sensitive
          | ($pall | any(matches_any($M.flippable_flag_paths // []))) as $flag
          # "Did a test file change?" comes from the VERSIONED map when it says, and falls back to
          # the built-in regex when it does not. Hardcoding it meant a consumer could not fix it
@@ -459,7 +470,7 @@ cat <<'JQ'
          | (if ($irrev | length) > 0
               then {k:"irreversible-class", t:"R3", why:("touches " + ($irrev|join(", ")) + " — mutates persistent state or deletes data; reverting the code does not restore it")}
             elif (($deleted | length) > 0 and $del_sensitive)
-              then {k:"delete-sensitive", t:"R3", why:("removes " + ($deleted|length|tostring) + " file(s) under a sensitive class (" + ($del_classes|join(", ")) + ") — not a single clean revert")}
+              then {k:"delete-sensitive", t:"R3", why:("removes " + ($del_sens_paths|length|tostring) + " file(s) under a sensitive class (" + ($del_classes|join(", ")) + ") — not a single clean revert")}
             elif $checks == null or $checks != "SUCCESS"
               then {k:"no-green-checks", t: ($RV.no_green_checks_tier // "R2"),
                     why:("no GREEN check rollup (" + ($checks // "absent") + ") — cannot answer whether tests covering these lines actually ran")}
@@ -473,38 +484,50 @@ cat <<'JQ'
          # with and without the field) so a future edit here cannot quietly start grading.
          #
          # The publisher (BE-7414) uses it to ask "if the top path-floor files were peeled off
-         # this PR, would the reversibility reason go with them?" — so it is populated ONLY for
-         # the two branches that are attributable to specific files, and `null` for the other
+         # this PR, would the reversibility reason go with them?" — so it is populated ONLY on
+         # the two rungs that are attributable to specific files, and `null` on the other
          # three. `null` is not "no files": R2 ("no green rollup") is a property of the head
          # COMMIT and R1 ("no test touched") of the WHOLE change set, and neither is removable
          # by dropping files — so `null` reads as "not attributable, keep suppressing", which
          # an empty array would not.
          #
-         # Both branches record the DESTINATION path (`.path`), so the publisher's subset test
+         # Both halves record the DESTINATION path (`.path`), so the publisher's subset test
          # against axes.path_floor.files[].path compares like with like; rows come from
-         # $A1.files, which is that very list. `[]?` keeps the expression total for the
-         # $A1.files == null case (an unknown path axis) — unreachable here, since AXIS 3 is
-         # already `unknown` above whenever AXIS 1 is, but the guard costs nothing.
-         | (if $d.k == "irreversible-class"
+         # $A1.files, which is that very list.
+         #
+         # THE UNION OF BOTH ATTRIBUTABLE RUNGS, not just the one that won the ladder. The tier
+         # is decided first-match, but a PR can trip the irreversible-class rung AND remove a
+         # file under a sensitive class. Naming only the migrations there would answer the
+         # publisher's peel question "yes, the reversibility reason goes with these files" while
+         # the delete-sensitive rung silently held the axis at R3 — the conservative suppression
+         # the `null` rungs exist for, turned into a false positive. Unioning is what makes the
+         # subset test sound: peeling every path in `files` clears EVERY attributable rung, so
+         # the axis provably lands below R3. tests/test_grade_pr_risk.sh pins that property
+         # directly (peel the attributed paths, re-grade, assert the tier moved) rather than
+         # only the shape of the list.
+         #
+         # $A1.files == null (an unknown path axis) attributes `null`, not `[]`: `[]` is a
+         # subset of every peel set, so it reads as "yes, removable" — failing OPEN on exactly
+         # the input nobody could read. Unreachable today, since AXIS 3 is already `unknown`
+         # above whenever AXIS 1 is, but the fallback should point the safe way regardless.
+         | (if $A1.files == null then null
+            elif $d.k == "irreversible-class" or $d.k == "delete-sensitive"
             # The per-file rows already carry `classes`, matched on destination AND origin, so
-            # this is a pure derivation over rows the path axis computed — not a second pass.
-            then [$A1.files[]? | select(any(.classes[]?; . as $c | ($irrev | index($c)) != null)) | .path]
-            elif $d.k == "delete-sensitive"
+            # the first half is a pure derivation over rows the path axis computed.
+            then (([$A1.files[] | select(any(.classes[]?; . as $c | ($irrev | index($c)) != null)) | .path]
             # ATTRIBUTED BY ROW, never by intersecting a row's classes with the sensitive list:
             # a MODIFIED auth file also carries class `auth` and did not remove anything, so a
             # class-intersection would name it here and send the publisher peeling a file that
-            # cannot change this branch. A row qualifies when the path it REMOVED — `.path` for
+            # cannot change this rung. A row qualifies when the path it REMOVED — `.path` for
             # a DELETED row, `previous_path` for a RENAMED one, the same two halves that build
-            # $deleted — matches a rule in a delete_sensitive class. That makes the list empty
-            # exactly when $del_sensitive is false, i.e. never on this branch.
-            then ([$M.path_rules[]? | . as $rule
-                   | select((($RV.delete_sensitive_classes // []) | index($rule.class)) != null)]) as $dsr
-                 | [$A1.files[]? | . as $f
-                    | (if $f.change_type == "DELETED" then $f.path
-                       elif $f.change_type == "RENAMED" then ($f.previous_path // empty)
-                       else empty end) as $rem
-                    | select(any($dsr[]; . as $rule | $rem | matches_any($rule.paths)))
-                    | $f.path]
+            # $deleted — matches a delete-sensitive rule. That makes this half empty exactly
+            # when $del_sensitive is false, so the union collapses to the rung that did fire.
+                   + [$A1.files[] | . as $f
+                      | (if $f.change_type == "DELETED" then $f.path
+                         elif $f.change_type == "RENAMED" then ($f.previous_path // empty)
+                         else empty end) as $rem
+                      | select(any($dsr[]; . as $rule | $rem | matches_any($rule.paths)))
+                      | $f.path]) | unique)
             else null end) as $rev_files
          | {tier:$d.t, status:"ok", reason:$d.why, files:$rev_files, flag_gated:$flag, deleted_files:($deleted|length)}
        end) as $A3

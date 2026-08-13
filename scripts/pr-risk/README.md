@@ -58,8 +58,13 @@ record.
    the other three: "no green rollup" is a property of the head commit and "no
    test touched" of the whole change set, so neither is removable by dropping
    files, and `null` says exactly that rather than "attributable to nothing".
-   Like the per-file path floors, `files` is **reporting only** — it is derived
-   from the tier decision and read nowhere else, so it can never move a tier.
+   When a PR trips *both* attributable rungs the list is their **union**, not
+   the first-match one the `reason` names, so peeling every path it lists
+   provably takes the axis below R3. Unlike `path_floor.files` (rows), it is a
+   flat array of destination path **strings**, directly comparable against
+   `path_floor.files[].path`. Like the per-file path floors, `files` is
+   **reporting only** — it is derived from the tier decision and read nowhere
+   else, so it can never move a tier.
 
 Anything unreadable grades `unknown` (labeled `risk:ungraded`), never a
 confident tier, and never "the axes that did resolve" — a PR whose file list we
