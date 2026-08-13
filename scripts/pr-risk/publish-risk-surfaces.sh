@@ -160,6 +160,12 @@ cat <<'JQ'
       | if test("[`\\\\]") then md_escape else "`" + gsub("\\|"; "\\|") + "`" end;
 
     def tier_rank: {"R0":0,"R1":1,"R2":2,"R3":3}[.] // 3;
+    # Does an axis TIE the headline? One definition, called once per axis, so the tie
+    # classification, the attribution tail and the reducibility gate can never disagree about
+    # which axes tied. Takes the headline as a parameter rather than closing over `$tier`
+    # because the defs are compiled before the record is destructured.
+    def ties($t; $headline):
+      ($t != null) and ($headline != null) and (($t | tier_rank) == ($headline | tier_rank));
     def pct($p; $w): if $w <= 0 then 0 else (100 * $p / $w) | round end;
 
     . as $r
@@ -180,15 +186,48 @@ cat <<'JQ'
     # sentence because both of its conditional clauses key off it, from opposite sides: the
     # attribution tail speaks only when ANOTHER axis outranked the path floor, the reducibility
     # clause only when the path axis is what decided.
-    | ([{a:"provenance", t:($A2.tier // null), r:($A2.reason // "")},
-        {a:"reversibility", t:($A3.tier // null), r:($A3.reason // "")}]
-       | map(select(.t != null and ($tier != null) and ((.t | tier_rank) == ($tier | tier_rank))))) as $drivers
-    # THE PATH AXIS DECIDED: it is graded, no other axis ties or beats the headline, and the
-    # headline IS the floor. A TIE deliberately reads as "not decided by path" — if provenance also
+    # SPLIT BY AXIS, because the two ties mean different things to the reducibility clause below.
+    # A provenance tie is a property of the AUTHOR (the same person opens the split PR, so the tie
+    # follows the remainder); a reversibility tie is a property of specific FILES, which may be
+    # exactly the files the clause proposes peeling off. Bound separately here so the gate can
+    # treat them differently; `$drivers` keeps the combined list because the attribution tail's
+    # wording ("the provenance and reversibility axis proposes R3") is about which axes tied, and
+    # is correct either way. Order is provenance-then-reversibility because `$drivers[0].r` is the
+    # reason both the tail and the headline print.
+    | ties($A2.tier; $tier) as $prov_tie
+    | ties($A3.tier; $tier) as $rev_tie
+    | ([ (if $prov_tie then {a:"provenance",    r:($A2.reason // "")} else empty end),
+         (if $rev_tie  then {a:"reversibility", r:($A3.reason // "")} else empty end) ]) as $drivers
+    # IS THE REVERSIBILITY TIE REMOVED BY THE VERY PEEL THE CLAUSE PROPOSES? `axes.reversibility
+    # .files` (BE-7418) names the changed paths that supplied the tier, on the two rungs where the
+    # tier is attributable to files at all. When every one of them is already in `$topf` — the set
+    # the clause peels — the remainder provably carries neither the path floor nor the reversibility
+    # reason, so suppressing the clause would be a false negative rather than caution.
+    #
+    # `null` (an older record, or the R2/R1 rungs, where "no green rollup" is a property of the
+    # HEAD COMMIT and "no test touched" of the whole change set) reads as NOT removable — the
+    # fail-safe back to the unconditional suppression this replaces.
+    #
+    # THE SUBSET TEST IS LOAD-BEARING, not a formality: a consumer map override can put an
+    # irreversible-class file BELOW the path floor (remap `migrations` to R1 while leaving it in
+    # `irreversible_classes`), and there peeling `$topf` leaves the reversibility reason exactly
+    # where it was. `[]` is a subset of every set, so it is rejected by the non-empty test rather
+    # than reading as "yes, removable" — the same direction the grader's own `null` fallback points.
+    | (($A3.files // null) as $rf
+       | $rev_tie
+         and (($rf | type) == "array") and (($rf | length) > 0)
+         and (($topf | map(.path)) as $keep
+              | all($rf[]; . as $p | ($keep | index($p)) != null))) as $rev_removable
+    # THE PATH AXIS DECIDED: it is graded, the headline IS the floor, and no tie survives the peel.
+    # A provenance tie deliberately still reads as "not decided by path" — if provenance also
     # proposes R3, peeling the R3 files out changes nothing, and promising a reduction there would
-    # be the one wrong answer. Same predicate the above-the-fold `$conc_short` already gates on.
-    | ($graded and (($drivers | length) == 0)
-       and (($tier | tier_rank) == ($floor | tier_rank))) as $path_decided
+    # be the one wrong answer. A reversibility tie reads the same way UNLESS its own attributed
+    # files are all inside `$topf`, in which case the split removes both reasons at once. Same
+    # predicate the above-the-fold `$conc_short` gates on, via `$driver` below.
+    | ($graded
+       and (($tier | tier_rank) == ($floor | tier_rank))
+       and ($prov_tie | not)
+       and (($rev_tie | not) or $rev_removable)) as $path_decided
     # ---- the reducible remainder ---------------------------------------------------------------
     # The COMPLEMENT of $topf: the files strictly below the overall path floor — exactly the set the
     # sentence already counts as the below-floor share. Its worst per-file floor is what that set
@@ -291,7 +330,16 @@ cat <<'JQ'
     # used here: it is the machine trace ("worst of path_floor=R1, provenance=R2, ..."), which
     # restates the tier instead of explaining it. The formula and that trace both still appear
     # inside the <details>, so nothing is lost by leading with the axis that actually decided.
-    | (if ($drivers | length) > 0
+    # BOTH AXES, when a removable reversibility tie let the clause speak. This branch is checked
+    # FIRST precisely because the tie also puts reversibility in `$drivers`: without it the headline
+    # would credit reversibility ALONE while the <details> underneath pitches a path split, which is
+    # the contradiction the shared predicate exists to prevent. It carries reversibility's reason
+    # rather than the path floor's — reversibility is the axis a reader would otherwise think the
+    # split cannot touch, so it is the one worth naming. ($path_decided already implies the
+    # provenance tie is absent, so "path and reversibility" is the complete list here.)
+    | (if $path_decided and $rev_tie
+       then {n: "path and reversibility", r: ($A3.reason // "")}
+       elif ($drivers | length) > 0
        then {n: ([$drivers[] | .a] | join(" and ")), r: ($drivers[0].r // "")}
        # $path_decided, not a second spelling of it: the reducibility clause in the sentence above
        # and this headline attribution must name the path axis on exactly the same records, or the
@@ -301,8 +349,12 @@ cat <<'JQ'
        else {n: null, r: ""} end) as $driver
     # The concentration clause, cut to a headline-sized fragment — and shown ONLY when the path
     # axis is what drove the tier. Quoting "14% of lines set the path floor at R1" under an R2
-    # headline that provenance produced points the reader at the wrong number.
-    | (if ($driver.n == "path") and ($files | length) > 0 and $total > 0
+    # headline that provenance produced points the reader at the wrong number. Both spellings of
+    # a path-driven headline count: `path and reversibility` is one of them by construction (the
+    # branch above only produces it under $path_decided), and omitting it would leave the fragment
+    # missing on exactly the records whose <details> now DOES pitch a split.
+    | (if (($driver.n == "path") or ($driver.n == "path and reversibility"))
+          and ($files | length) > 0 and $total > 0
           and ($floor | tier_rank) > 0 and ($total - $toplines) > 0
        then " \(pct($toplines; $total))% of \($total) changed lines carry it (\($topf | length) file(s))."
        else "" end) as $conc_short

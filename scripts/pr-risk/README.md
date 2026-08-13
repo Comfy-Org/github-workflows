@@ -263,9 +263,25 @@ Labels are created on first use, color-coded green → red (gray for ungraded).
   improves) or newly fail one, and reversibility keys on the remainder's own classes and on checks
   that have not run yet — so clamping would print a number that is not a floor either. It is
   silent where a split cannot help: an irreducible diff (every line already at the floor), any
-  grade the path axis did not decide, including a *tie* where another axis proposes the same tier
-  and peeling the top files would therefore change nothing, and a remainder that rounds to **0%**
-  of the diff, where the sentence would otherwise pitch relocating a line it just called nothing.
+  grade the path axis did not decide, and a remainder that rounds to **0%** of the diff, where the
+  sentence would otherwise pitch relocating a line it just called nothing. A *tie* — another axis
+  proposing the same tier as the path floor — is read **per axis**, because the two ties do not
+  mean the same thing. A **provenance** tie always suppresses: provenance is a property of the
+  author, so it follows the remainder into the split PR and peeling the top files changes nothing.
+  A **reversibility** tie is a property of specific *files*, and those may be exactly the files the
+  clause proposes peeling — so it suppresses **unless** `axes.reversibility.files` (the paths that
+  supplied the reversibility tier) is a non-empty array **every** entry of which is already in the
+  peeled set, in which case one split provably removes both reasons at once and the clause speaks.
+  The full-subset test is load-bearing rather than a formality: a consumer map override can put an
+  irreversible-class file *below* the path floor (remap `migrations` to R1 while leaving it in
+  `irreversible_classes`), and there peeling the top files leaves the reversibility reason exactly
+  where it was. `files` absent or `null` — the R2/R1 rungs, where the reason is a property of the
+  head commit or of the whole change set, and every record graded before that field existed — reads
+  as *not* removable, failing safe back to suppression. When a removable reversibility tie does let
+  the clause speak, the above-the-fold headline names the driver **`path and reversibility`** and
+  carries reversibility's reason, so the split pitch inside the `<details>` is never sitting under a
+  headline crediting reversibility alone. The caveat stays attached and stays honest in that case:
+  the remainder re-derives reversibility from its own classes and its own checks.
   The long form lives in
   the Check Run instead, because this comment lands on PRs that already carry CodeRabbit and an
   8-cell review panel, and an advisory grade nothing routes on has the weakest claim on the

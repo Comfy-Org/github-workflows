@@ -31,25 +31,36 @@ hasnt() { if grep -qF -- "$2" <<<"$1"; then bad "$3" "$(head -c 400 <<<"$1")"; e
 # shellcheck source=/dev/null
 source "$SCRIPT"
 
-record() { # <tier> <floor> <files-json> [prov-tier] [rev-tier] -> a graded record file
-  local tier="$1" floor="$2" files="$3" prov="${4:-R1}" rev="${5:-R1}"
+# <tier> <floor> <files-json> [prov-tier] [rev-tier] [rev-files-json] [rev-reason] -> a record file.
+# `rev-files-json` is the `axes.reversibility.files` attribution grade-pr-risk.sh emits (BE-7418):
+# the paths that supplied the reversibility tier, or `null` on the rungs where the tier is not
+# attributable to files. It defaults to `null`, so every fixture written before it existed keeps
+# rendering exactly as it did — which is the backward-compatibility case the suite pins below.
+record() {
+  local tier="$1" floor="$2" files="$3" prov="${4:-R1}" rev="${5:-R1}" revfiles="${6:-null}"
+  local revreason="${7:-checks green but the diff touches no test file}"
   local f="$SANDBOX/rec-$RANDOM.json" ff="$SANDBOX/files-$RANDOM.json"
   # The files array goes in via a FILE, not --argjson. Linux caps a single argv entry at 128KiB
   # (MAX_ARG_STRLEN) regardless of the much larger total ARG_MAX, so the bounded-body fixture below
   # (~170KiB of paths) makes `jq --argjson` die with "Argument list too long" on CI while passing
   # on macOS, which has no per-argument cap. Reading it from disk is limit-free on both.
+  # `rev-files-json` stays an --argjson: it names a handful of paths, never the whole diff.
   printf '%s' "$files" > "$ff"
-  jq -n --arg t "$tier" --arg fl "$floor" --slurpfile files "$ff" --arg p "$prov" --arg rv "$rev" '
+  jq -n --arg t "$tier" --arg fl "$floor" --slurpfile files "$ff" --arg p "$prov" --arg rv "$rev" \
+        --argjson rf "$revfiles" --arg rr "$revreason" '
     {pr:7, risk:{map_version:"v0-generic", registry_version:"v0", tier:$t, status:"ok",
       reason:"worst of path_floor=\($fl), provenance=\($p), reversibility=\($rv)",
       axes:{path_floor:{tier:$fl, status:"ok", reason:"matched things", classes:["x"], files:$files[0]},
             provenance:{tier:$p, status:"ok", reason:"human"},
-            reversibility:{tier:$rv, status:"ok", reason:"checks green but the diff touches no test file"}}}}' > "$f" \
+            reversibility:{tier:$rv, status:"ok", reason:$rr, files:$rf}}}}' > "$f" \
     || printf 'FATAL: record() could not build %s\n' "$f" >&2
   printf '%s' "$f"
 }
+# <path> <tier> <additions> <deletions> [classes-json] — `classes` defaults to the placeholder every
+# pre-existing fixture used, and is spellable so a fixture can carry a real irreversible class.
 file_entry() { jq -n --arg p "$1" --arg t "$2" --argjson a "$3" --argjson d "$4" \
-                 '{path:$p, previous_path:null, additions:$a, deletions:$d, change_type:"MODIFIED", tier:$t, classes:["cls"]}'; }
+                 --argjson c "${5:-[\"cls\"]}" \
+                 '{path:$p, previous_path:null, additions:$a, deletions:$d, change_type:"MODIFIED", tier:$t, classes:$c}'; }
 
 echo "— the sticky marker is ONE constant: rendered head == what find_sticky matches —"
 # If these ever drift, every push POSTs a NEW comment instead of updating the one that exists.
@@ -184,10 +195,60 @@ np="$(render_surfaces "$(record R3 R2 "$path_r2" R3 R1)" 0 | jq -r '.concentrati
 hasnt "$np" "peeled into their own PR" "a headline another axis supplied gets NO reducibility clause"
 has "$np" "40 lines. The headline tier is R3 rather than the path floor R2" \
     "…and the sentence ends exactly as it did before, straight into the axis attribution"
-# A TIE is not "the path axis decided": if provenance also proposes R3, the remainder is R3 too and
-# the split buys nothing. This is the case a rank comparison alone would get wrong.
+# A PROVENANCE TIE is not "the path axis decided": provenance is a property of the AUTHOR, so if it
+# also proposes R3 the remainder is R3 too and the split buys nothing. This is the case a rank
+# comparison alone would get wrong.
 tied="$(render_surfaces "$(record R3 R3 "$big" R3 R1)" 0 | jq -r '.concentration')"
 hasnt "$tied" "peeled into their own PR" "an axis TIED with the path floor also suppresses the clause"
+
+echo "— …but a REVERSIBILITY tie the peel would remove lets the clause speak (BE-7419) —"
+# A reversibility tie is a property of specific FILES, not of the author — and those files can be
+# exactly the ones the clause proposes peeling. One R3 migration under 600 R0 doc lines rendered no
+# clause at all, while the identical file set at reversibility R1 rendered the full split pitch:
+# the same peel, described two ways, because the gate could not tell the two ties apart.
+mig="[$(file_entry docs/a.md R0 500 100), $(file_entry migrations/0042_drop.sql R3 30 10 '["migrations"]')]"
+MIG_WHY="touches migrations — mutates persistent state or deletes data; reverting the code does not restore it"
+rev_surf="$(render_surfaces "$(record R3 R3 "$mig" R1 R3 '["migrations/0042_drop.sql"]' "$MIG_WHY")" 0)"
+rev_conc="$(jq -r '.concentration' <<<"$rev_surf")"
+rev_body="$(jq -r '.comment_body' <<<"$rev_surf")"
+has "$rev_conc" "peeled into their own PR, the remaining 1 file(s) would path-floor at **R0**" \
+    "a reversibility tie whose attributed files are ALL inside the peeled set gets the clause"
+has "$rev_conc" "(final grade still depends on the provenance and reversibility axes at PR time)" \
+    "…keeping the caveat, which stays honest: the remainder re-derives reversibility on its own checks"
+# The <details> pitches a PATH split, so a headline crediting reversibility alone would send the
+# reader looking for a reduction on the axis it just told them decided the tier.
+has "$rev_body" "**path and reversibility**: touches migrations" \
+    "…the headline names BOTH axes and carries reversibility's reason"
+has "$rev_body" "6% of 640 changed lines carry it (1 file(s))." \
+    "…and \$conc_short fires for the combined driver, not just plain 'path'"
+
+# THE CONSUMER-OVERRIDE CASE the full-subset test exists for. A map override can put an
+# irreversible-class file BELOW the path floor — remap `migrations` to R1 while leaving it in
+# `irreversible_classes` — and there peeling $topf (the CI file) leaves the reversibility reason
+# exactly where it was. A "does reversibility name any peeled file?" test would speak here wrongly.
+override="[$(file_entry docs/a.md R0 500 100), $(file_entry migrations/0042_drop.sql R1 20 0 '["migrations"]'), $(file_entry .github/workflows/ci.yml R3 30 10)]"
+ov_surf="$(render_surfaces "$(record R3 R3 "$override" R1 R3 '["migrations/0042_drop.sql"]' "touches migrations")" 0)"
+hasnt "$(jq -r '.concentration' <<<"$ov_surf")" "peeled into their own PR" \
+      "a reversibility tie attributed to a file BELOW the floor keeps the clause SILENT"
+has   "$(jq -r '.comment_body' <<<"$ov_surf")" "**reversibility**: touches migrations" \
+      "…and the headline credits reversibility alone, exactly as it did before"
+hasnt "$(jq -r '.comment_body' <<<"$ov_surf")" "changed lines carry it" \
+      "…with no above-the-fold split fragment either"
+
+# BACKWARD COMPATIBILITY, pinned: `files` is absent/null on the R2 and R1 rungs (properties of the
+# head commit and of the whole change set, removable by dropping no files) and on every record
+# graded before BE-7418. Those must all fail SAFE, back to the unconditional suppression.
+hasnt "$(render_surfaces "$(record R3 R3 "$mig" R1 R3)" 0 | jq -r '.concentration')" "peeled into their own PR" \
+      "a reversibility tie carrying files:null (an R2-style tie, or a pre-BE-7418 record) stays SILENT"
+hasnt "$(render_surfaces "$(record R3 R3 "$mig" R1 R3 '[]')" 0 | jq -r '.concentration')" "peeled into their own PR" \
+      "…and an EMPTY attribution is rejected, not read as a subset of everything"
+hasnt "$(render_surfaces "$(record R3 R3 "$mig" R1 R3 '["migrations/0042_drop.sql","docs/a.md"]')" 0 | jq -r '.concentration')" \
+      "peeled into their own PR" \
+      "…nor is a PARTIAL subset — one attributed path outside the peeled set is enough to suppress"
+# Both ties at once: the provenance half is unaffected by any peel, so it still decides.
+hasnt "$(render_surfaces "$(record R3 R3 "$mig" R3 R3 '["migrations/0042_drop.sql"]' "$MIG_WHY")" 0 | jq -r '.concentration')" \
+      "peeled into their own PR" \
+      "a provenance tie suppresses the clause even when the reversibility tie IS removable"
 # The ungraded surfaces never reach the sentence at all.
 hasnt "$(render_surfaces "$u" 0 | jq -r '.concentration')" "peeled into their own PR" \
       "an ungradable record proposes no split"
