@@ -139,6 +139,70 @@ eq "a diff with no counted lines says so" \
    "This diff changes no counted lines across 1 file(s)." \
    "$(render_surfaces "$(record R0 R0 "[$(file_entry a.md R0 0 0)]" R0 R0)" 0 | jq -r '.concentration')"
 
+echo "— the concentration sentence carries the COMPLEMENT floor: what a split would actually buy —"
+# The share below the floor is not a verdict on its own: "94% is R0/R1/R2" is equally true of a
+# remainder that rubber-stamps at R1 and one that is still a normal R2 review. The complement floor
+# is the number that separates them, and it is the one an author cannot recover without re-grading
+# the map by hand.
+has "$c" "peeled into their own PR, the remaining 1 file(s) would path-floor at **R0**" \
+    "600 R0 doc lines under an R3 CI floor report an R0 remainder"
+has "$c" "(final grade still depends on the provenance and reversibility axes at PR time)" \
+    "…as a FLOOR with its assumptions named, never a promised grade"
+# NOT CLAMPED to the other axes, and the caveat is why: provenance and reversibility are both
+# re-derived for the split PR and can move in either direction, so max(path, provenance,
+# reversibility) would be no more a floor for the remainder than the path number alone. Path floor
+# R3 over provenance R1 / reversibility R2 still reports the remainder's own R0.
+has "$(render_surfaces "$(record R3 R3 "$big" R1 R2)" 0 | jq -r '.concentration')" \
+    "the remaining 1 file(s) would path-floor at **R0**" \
+    "a lower-ranked provenance/reversibility does NOT clamp the path-axis number"
+# Worst-of over the remainder, not the biggest or the last file: 500 R0 lines cannot cancel 100 R1
+# ones, exactly as the floor itself is a max rather than last-match-wins.
+mix="[$(file_entry docs/a.md R0 500 0), $(file_entry src/app.ts R1 100 0), $(file_entry .github/workflows/d.yml R3 30 10)]"
+has "$(render_surfaces "$(record R3 R3 "$mix")" 0 | jq -r '.concentration')" \
+    "the remaining 2 file(s) would path-floor at **R1**" \
+    "a mixed remainder takes its WORST per-file floor (R0 + R1 -> R1), over both files"
+# The ticket's worked example, and the case that makes the readout worth printing: the remainder is
+# still R2, so peeling the CI file out buys a normal review rather than the R1 rubber-stamp lane.
+worked="[$(file_entry src/app.ts R2 200 0), $(file_entry package.json R3 4 0), $(file_entry .github/workflows/ci.yml R3 10 0)]"
+has "$(render_surfaces "$(record R3 R3 "$worked")" 0 | jq -r '.concentration')" \
+    "the remaining 1 file(s) would path-floor at **R2**" \
+    "an R2 remainder says R2 — the split that is NOT worth much still reports honestly"
+
+echo "— …and stays SILENT where a split cannot help —"
+# IRREDUCIBLE: every changed line is already at the floor, so there is no remainder to peel. The
+# existing wording is the whole answer; a clause here would offer a split that does not exist.
+irr="$(render_surfaces "$(record R3 R3 "[$(file_entry .github/workflows/a.yml R3 20 0), $(file_entry .github/workflows/b.yml R3 20 0)]")" 0 | jq -r '.concentration')"
+eq "an irreducible diff renders byte-identically to before this clause existed" \
+   "All 40 changed lines sit at R3 on the path axis." "$irr"
+# NOT PATH-DECIDED: provenance supplied the headline, so peeling the top path files leaves the tier
+# where it is. Quoting a path-axis reduction under it would point the reader at the wrong number.
+# Its own fixture rather than $big, because the floor here is R2 and grade-pr-risk.sh derives the
+# floor as `worst` over the SAME per-file rules: a record whose floor is R2 while a file on it reads
+# R3 cannot be graded, so reusing $big would pin the clause against an input production never emits.
+path_r2="[$(file_entry docs/a.md R0 500 100), $(file_entry src/app.ts R2 30 10)]"
+np="$(render_surfaces "$(record R3 R2 "$path_r2" R3 R1)" 0 | jq -r '.concentration')"
+hasnt "$np" "peeled into their own PR" "a headline another axis supplied gets NO reducibility clause"
+has "$np" "40 lines. The headline tier is R3 rather than the path floor R2" \
+    "…and the sentence ends exactly as it did before, straight into the axis attribution"
+# A TIE is not "the path axis decided": if provenance also proposes R3, the remainder is R3 too and
+# the split buys nothing. This is the case a rank comparison alone would get wrong.
+tied="$(render_surfaces "$(record R3 R3 "$big" R3 R1)" 0 | jq -r '.concentration')"
+hasnt "$tied" "peeled into their own PR" "an axis TIED with the path floor also suppresses the clause"
+# The ungraded surfaces never reach the sentence at all.
+hasnt "$(render_surfaces "$u" 0 | jq -r '.concentration')" "peeled into their own PR" \
+      "an ungradable record proposes no split"
+# A REMAINDER THAT ROUNDS TO 0%: one R0 line against 9999 R3 ones. There IS a below-floor file, so
+# the set is non-empty, but the sentence has just printed "**0%** of this diff is R0/R1/R2" — and a
+# clause under that would pitch a whole extra PR to relocate a single line. The gate is the
+# sentence's own printed share, so the two halves can never contradict each other.
+tiny="$(render_surfaces "$(record R3 R3 "[$(file_entry docs/a.md R0 1 0), $(file_entry .github/workflows/d.yml R3 9999 0)]")" 0 | jq -r '.concentration')"
+has "$tiny" "**0% of this diff is R0/R1/R2**" "a 1-line remainder still rounds the share to 0%…"
+hasnt "$tiny" "peeled into their own PR" "…and a 0% remainder is offered NO split"
+# One line the other way is enough: 1% is a share the sentence prints, so the clause speaks.
+small="$(render_surfaces "$(record R3 R3 "[$(file_entry docs/a.md R0 100 0), $(file_entry .github/workflows/d.yml R3 9900 0)]")" 0 | jq -r '.concentration')"
+has "$small" "peeled into their own PR, the remaining 1 file(s) would path-floor at **R0**" \
+    "a remainder the share sentence does print (1%) keeps the clause"
+
 echo "— the body is BOUNDED under GitHub's 65536-char comment limit (measured, not estimated) —"
 # 400 files, each with a 300-char deeply-nested path — comfortably past the limit unbounded.
 deep="$(printf 'src/%.0s' $(seq 1 60))deeply/nested/path/component/that/keeps/going/and/going/file"

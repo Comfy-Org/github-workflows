@@ -175,6 +175,41 @@ cat <<'JQ'
     | ([$files[] | select((.tier | tier_rank) >= ($floor | tier_rank))]) as $topf
     | ([$topf[] | .lines] | add // 0) as $toplines
 
+    # WHICH AXIS SUPPLIED THE HEADLINE. Without this the sentence can contradict the tier printed
+    # directly above it, which is the one thing an explanation must never do. Defined BEFORE the
+    # sentence because both of its conditional clauses key off it, from opposite sides: the
+    # attribution tail speaks only when ANOTHER axis outranked the path floor, the reducibility
+    # clause only when the path axis is what decided.
+    | ([{a:"provenance", t:($A2.tier // null), r:($A2.reason // "")},
+        {a:"reversibility", t:($A3.tier // null), r:($A3.reason // "")}]
+       | map(select(.t != null and ($tier != null) and ((.t | tier_rank) == ($tier | tier_rank))))) as $drivers
+    # THE PATH AXIS DECIDED: it is graded, no other axis ties or beats the headline, and the
+    # headline IS the floor. A TIE deliberately reads as "not decided by path" — if provenance also
+    # proposes R3, peeling the R3 files out changes nothing, and promising a reduction there would
+    # be the one wrong answer. Same predicate the above-the-fold `$conc_short` already gates on.
+    | ($graded and (($drivers | length) == 0)
+       and (($tier | tier_rank) == ($floor | tier_rank))) as $path_decided
+    # ---- the reducible remainder ---------------------------------------------------------------
+    # The COMPLEMENT of $topf: the files strictly below the overall path floor — exactly the set the
+    # sentence already counts as the below-floor share. Its worst per-file floor is what that set
+    # would earn on the path axis as its own PR, and it is computed here by the same worst-of rule
+    # the floor itself uses, over floors this script did not derive (grade-pr-risk.sh did). So it is
+    # the real judge's answer, not an estimate of one — which is the whole point of printing it: the
+    # number that separates "peel 2 files and the rest rubber-stamps" from "peel 2 files and the
+    # rest is still a normal review" is not otherwise recoverable without re-grading by hand.
+    | ([$files[] | select((.tier | tier_rank) < ($floor | tier_rank))]) as $below
+    # The printed label is the RECORD's own tier string, never `"R\(rank)"` re-rendered from the
+    # number: `tier_rank` deliberately collapses anything outside R0–R3 to 3, so re-rendering would
+    # print an unrecognized tier as a confident `R3`. `max_by` applies the same worst-of rule while
+    # keeping the label tied to the data rather than to the enum's present shape.
+    | (if ($below | length) > 0 then ($below | max_by(.tier | tier_rank) | .tier) else null end) as $comp_tier
+    # The below-floor share, bound once because the clause and the sentence it hangs off have to
+    # agree about it. A remainder that ROUNDS TO 0% of the diff gets no split pitch, or the sentence
+    # reads "**0%** of this diff is R0/R1/R2 … peeled into their own PR, the remaining 1 file(s)" —
+    # offering to relocate a line it has just called nothing. The gate is the sentence's OWN printed
+    # number rather than a threshold picked here, so the two can never disagree.
+    | (pct($total - $toplines; $total)) as $below_pct
+
     # ---- the concentration sentence ----------------------------------------------------------
     # Built on the SHIPPED model (per-file PATH floors), never lifted from the superseded
     # per-file-tier model — that grader assigned every file an overall tier, which this one
@@ -185,16 +220,22 @@ cat <<'JQ'
        then "This diff changes no counted lines across \($files | length) file(s)."
        elif ($floor | tier_rank) == 0 or ($total - $toplines) <= 0
        then "All \($total) changed lines sit at \($floor) on the path axis."
-       else "**\(pct($total - $toplines; $total))% of this diff is "
+       else "**\($below_pct)% of this diff is "
             + ([range(0; ($floor | tier_rank))] | map("R\(.)") | join("/"))
             + "**; the \(pct($toplines; $total))% that puts the path floor at \($floor) is "
-            + "\($topf | length) file(s), \($toplines) lines."
+            + "\($topf | length) file(s), \($toplines) lines"
+            # A FLOOR WITH ITS ASSUMPTIONS NAMED, never a promised grade. The OTHER TWO AXES are
+            # re-derived for a split PR and this cannot anticipate either: provenance is the same
+            # author but a narrower path set, which may newly assert a runbook or newly fail one;
+            # reversibility keys on the remainder's own classes and on checks that have not run
+            # yet. Both can move in EITHER direction, so neither is a floor to clamp this number
+            # to — it says what the PATH axis would say and names plainly what it cannot answer.
+            + (if $path_decided and $comp_tier != null and $below_pct > 0
+               then "; peeled into their own PR, the remaining \($below | length) file(s) would "
+                    + "path-floor at **\($comp_tier)** (final grade still depends on the "
+                    + "provenance and reversibility axes at PR time)."
+               else "." end)
        end) as $conc_core
-    # WHICH AXIS SUPPLIED THE HEADLINE. Without this the sentence can contradict the tier printed
-    # directly above it, which is the one thing an explanation must never do.
-    | ([{a:"provenance", t:($A2.tier // null), r:($A2.reason // "")},
-        {a:"reversibility", t:($A3.tier // null), r:($A3.reason // "")}]
-       | map(select(.t != null and ($tier != null) and ((.t | tier_rank) == ($tier | tier_rank))))) as $drivers
     | (if $graded and (($tier | tier_rank) > ($floor | tier_rank)) and (($drivers | length) > 0)
        then " The headline tier is \($tier) rather than the path floor \($floor) because the "
             + ([$drivers[] | .a] | join(" and ")) + " axis proposes \($tier): "
@@ -252,7 +293,10 @@ cat <<'JQ'
     # inside the <details>, so nothing is lost by leading with the axis that actually decided.
     | (if ($drivers | length) > 0
        then {n: ([$drivers[] | .a] | join(" and ")), r: ($drivers[0].r // "")}
-       elif $graded and (($tier | tier_rank) == ($floor | tier_rank))
+       # $path_decided, not a second spelling of it: the reducibility clause in the sentence above
+       # and this headline attribution must name the path axis on exactly the same records, or the
+       # comment offers a split in the <details> under a headline crediting another axis.
+       elif $path_decided
        then {n: "path", r: ($A1.reason // "")}
        else {n: null, r: ""} end) as $driver
     # The concentration clause, cut to a headline-sized fragment — and shown ONLY when the path
