@@ -410,7 +410,9 @@ cat <<'JQ'
     #   deletes a file under a sensitive class?   -> R3 (not a single clean revert)
     #   did tests covering these lines actually run? no green rollup -> R2; green but no test
     #   file touched -> R1; green and a test touched -> R0.
-    # `flag_gated` is RECORDED but never LOWERS a tier — an axis may only move riskier.
+    # `flag_gated` is RECORDED but never LOWERS a tier — an axis may only move riskier. So is
+    # `files`, which names the changed paths that supplied the tier on the two rungs where it is
+    # attributable to specific files at all (see the attribution block below).
     | ($M.reversibility // {}) as $RV
     # Was the check rollup READ? `checks_status: ok` with a null `checks_state` is GitHub
     # genuinely reporting no rollup for this head (a repo with no CI) and IS gradeable — the
@@ -449,17 +451,62 @@ cat <<'JQ'
             | if ($tp | length) > 0 then ($plist | any(matches_any($tp)))
               else ($plist | any(test("(_test\\.|\\.test\\.|\\.spec\\.|(^|/)tests?/|-test\\.sh$)"))) end) as $touched_test
          | ($r.checks_state // null) as $checks
+         # `k` NAMES THE BRANCH THAT FIRED, and exists solely so the attribution below can be
+         # keyed on the decision itself rather than on a re-test of the same conditions. A
+         # re-test is a second copy of this ladder that can drift out of step with it — and a
+         # `files` list that disagrees with the `reason` printed beside it is worse than no
+         # list at all. `k` feeds nothing but the attribution; it never reaches `$d.t`.
          | (if ($irrev | length) > 0
-              then {t:"R3", why:("touches " + ($irrev|join(", ")) + " — mutates persistent state or deletes data; reverting the code does not restore it")}
+              then {k:"irreversible-class", t:"R3", why:("touches " + ($irrev|join(", ")) + " — mutates persistent state or deletes data; reverting the code does not restore it")}
             elif (($deleted | length) > 0 and $del_sensitive)
-              then {t:"R3", why:("removes " + ($deleted|length|tostring) + " file(s) under a sensitive class (" + ($del_classes|join(", ")) + ") — not a single clean revert")}
+              then {k:"delete-sensitive", t:"R3", why:("removes " + ($deleted|length|tostring) + " file(s) under a sensitive class (" + ($del_classes|join(", ")) + ") — not a single clean revert")}
             elif $checks == null or $checks != "SUCCESS"
-              then {t: ($RV.no_green_checks_tier // "R2"),
+              then {k:"no-green-checks", t: ($RV.no_green_checks_tier // "R2"),
                     why:("no GREEN check rollup (" + ($checks // "absent") + ") — cannot answer whether tests covering these lines actually ran")}
             elif ($touched_test | not)
-              then {t: ($RV.no_test_touched_tier // "R1"), why:"checks green but the diff touches no test file — nothing proves the suite covers THESE lines"}
-            else {t: ($RV.clean_tier // "R0"), why:"single clean revert, no persistent-state mutation, checks green, tests touched"} end) as $d
-         | {tier:$d.t, status:"ok", reason:$d.why, flag_gated:$flag, deleted_files:($deleted|length)}
+              then {k:"no-test-touched", t: ($RV.no_test_touched_tier // "R1"), why:"checks green but the diff touches no test file — nothing proves the suite covers THESE lines"}
+            else {k:"clean", t: ($RV.clean_tier // "R0"), why:"single clean revert, no persistent-state mutation, checks green, tests touched"} end) as $d
+         # WHICH FILES SUPPLIED THIS TIER — REPORTING ONLY, exactly like the per-file path
+         # floors above, and derived AFTER `$d` for the same reason: it is computed FROM the
+         # decision and read nowhere else in the grader, so it cannot become a second input to
+         # it. tests/test_grade_pr_risk.sh pins that (each fixture's tier is byte-identical
+         # with and without the field) so a future edit here cannot quietly start grading.
+         #
+         # The publisher (BE-7414) uses it to ask "if the top path-floor files were peeled off
+         # this PR, would the reversibility reason go with them?" — so it is populated ONLY for
+         # the two branches that are attributable to specific files, and `null` for the other
+         # three. `null` is not "no files": R2 ("no green rollup") is a property of the head
+         # COMMIT and R1 ("no test touched") of the WHOLE change set, and neither is removable
+         # by dropping files — so `null` reads as "not attributable, keep suppressing", which
+         # an empty array would not.
+         #
+         # Both branches record the DESTINATION path (`.path`), so the publisher's subset test
+         # against axes.path_floor.files[].path compares like with like; rows come from
+         # $A1.files, which is that very list. `[]?` keeps the expression total for the
+         # $A1.files == null case (an unknown path axis) — unreachable here, since AXIS 3 is
+         # already `unknown` above whenever AXIS 1 is, but the guard costs nothing.
+         | (if $d.k == "irreversible-class"
+            # The per-file rows already carry `classes`, matched on destination AND origin, so
+            # this is a pure derivation over rows the path axis computed — not a second pass.
+            then [$A1.files[]? | select(any(.classes[]?; . as $c | ($irrev | index($c)) != null)) | .path]
+            elif $d.k == "delete-sensitive"
+            # ATTRIBUTED BY ROW, never by intersecting a row's classes with the sensitive list:
+            # a MODIFIED auth file also carries class `auth` and did not remove anything, so a
+            # class-intersection would name it here and send the publisher peeling a file that
+            # cannot change this branch. A row qualifies when the path it REMOVED — `.path` for
+            # a DELETED row, `previous_path` for a RENAMED one, the same two halves that build
+            # $deleted — matches a rule in a delete_sensitive class. That makes the list empty
+            # exactly when $del_sensitive is false, i.e. never on this branch.
+            then ([$M.path_rules[]? | . as $rule
+                   | select((($RV.delete_sensitive_classes // []) | index($rule.class)) != null)]) as $dsr
+                 | [$A1.files[]? | . as $f
+                    | (if $f.change_type == "DELETED" then $f.path
+                       elif $f.change_type == "RENAMED" then ($f.previous_path // empty)
+                       else empty end) as $rem
+                    | select(any($dsr[]; . as $rule | $rem | matches_any($rule.paths)))
+                    | $f.path]
+            else null end) as $rev_files
+         | {tier:$d.t, status:"ok", reason:$d.why, files:$rev_files, flag_gated:$flag, deleted_files:($deleted|length)}
        end) as $A3
 
     # ---- worst wins ------------------------------------------------------------------------

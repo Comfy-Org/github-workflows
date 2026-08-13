@@ -52,7 +52,14 @@ record.
    these lines run?" with nothing, so it cannot drop the axis below R2. What
    counts as a test file is `reversibility.test_path_patterns` in the map (omit
    the key and the grader falls back to a built-in regex that only knows the
-   Go/TS shapes).
+   Go/TS shapes). The axis also records `files` — which changed paths actually
+   supplied the tier — on the two rungs that are attributable to specific files
+   (an irreversible class, or a removal under a sensitive class), and `null` on
+   the other three: "no green rollup" is a property of the head commit and "no
+   test touched" of the whole change set, so neither is removable by dropping
+   files, and `null` says exactly that rather than "attributable to nothing".
+   Like the per-file path floors, `files` is **reporting only** — it is derived
+   from the tier decision and read nowhere else, so it can never move a tier.
 
 Anything unreadable grades `unknown` (labeled `risk:ungraded`), never a
 confident tier, and never "the axes that did resolve" — a PR whose file list we
