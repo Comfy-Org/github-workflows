@@ -84,7 +84,7 @@ silently vanishing — the review tells you what didn't run.
 | [`prompt-judge.md`](prompt-judge.md) | Prompt the judge model uses to consolidate panel findings into one review. |
 | [`extract-findings.py`](extract-findings.py) | Parses a cell's raw `cursor-agent` output into a normalized findings record. Always emits structured JSON — even on empty output or parse failure — so the consolidate step has uniform input. |
 | [`post-review.py`](post-review.py) | Reads the judge's consolidated findings and posts **one** PR review with line-anchored inline comments and severity badges. |
-| [`gate-unresolved.py`](gate-unresolved.py) | **Orphaned — nothing calls this today.** Implemented the opt-in blocking gate: queries the PR's review threads and exits non-zero while any cursor-review finding thread is unresolved. The job that ran it was dropped from `cursor-review.yml` in #31; see [the regression note](#the-blocking-gate-is-currently-not-available-regressed). |
+| [`gate-unresolved.py`](gate-unresolved.py) | **Its CLI is unwired; the module is not dead code — do not delete it.** Implemented the opt-in blocking gate: queries the PR's review threads and exits non-zero while any cursor-review finding thread is unresolved. The job that ran that CLI was dropped from `cursor-review.yml` in #31 (see [the regression note](#the-blocking-gate-is-currently-not-available-regressed)), but [`build-ledger.py`](build-ledger.py) imports the module for `CONSOLIDATED_MARKER`, the paging `reviewThreads` GraphQL query and the `iter_threads` / `is_cursor_thread` helpers. |
 | [`slack-notify.sh`](slack-notify.sh) | Sends the start/complete Slack DMs to the triggerer (no-ops without a token). |
 | [`install-cursor-cli.sh`](install-cursor-cli.sh) | Installs the Cursor agent CLI from the versioned, sha256-pinned release artifact — not `curl cursor.com/install \| bash`. Used by all three CLI-using jobs; the pin (`CURSOR_CLI_VERSION` / `CURSOR_CLI_SHA256`) lives in `cursor-review.yml`'s top-level `env:`. |
 | [`build-ledger.py`](build-ledger.py) | Builds the **prior-review ledger** — what earlier rounds raised on this PR and how the author answered — and splices it into the panel/judge prompts. Also the prompt splicer, so the no-ledger path is byte-identical to the pre-ledger prompt. |
@@ -163,7 +163,10 @@ removed from `cursor-review.yml` in
 [#31](https://github.com/Comfy-Org/github-workflows/pull/31), a change whose
 stated purpose was fixing judge-findings extraction; the deletion looks
 unintentional. The gate's implementation
-([`gate-unresolved.py`](gate-unresolved.py)) is still here, orphaned and unwired.
+([`gate-unresolved.py`](gate-unresolved.py)) is still here: its CLI/`main` is
+unwired, but the module itself is live — [`build-ledger.py`](build-ledger.py)
+imports it for `CONSOLIDATED_MARKER`, the paging `reviewThreads` query and the
+`iter_threads` / `is_cursor_thread` helpers, so the file must not be deleted.
 
 Restoring it is tracked separately. Note that marking `… / Consolidate panel`
 required is **not** a substitute: GitHub counts a skipped required check as

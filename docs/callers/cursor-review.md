@@ -25,8 +25,10 @@ A real opt-in gate did exist — a `blocking:` input and a fail-closed **Blockin
 gate** job — but both were dropped from `cursor-review.yml` in
 [#31](https://github.com/Comfy-Org/github-workflows/pull/31), which was otherwise
 a judge-extraction fix. Its script (`.github/cursor-review/gate-unresolved.py`)
-is still in the tree, orphaned. Restoring it is tracked separately; until then,
-treat this review as advisory and gate on human approval.
+is still in the tree with its CLI unwired — the module itself is still imported
+by `build-ledger.py` for the shared review-thread query and helpers, so it is not
+dead code. Restoring the gate is tracked separately; until then, treat this
+review as advisory and gate on human approval.
 
 Prompts and scripts live in [`.github/cursor-review/`](../../.github/cursor-review)
 — the single source of truth, so your repo carries only a thin caller.
