@@ -34,6 +34,15 @@ check(){ if eval "$2"; then ok "$1"; else bad "$1 [$2]"; fi; }
 # real ones keeps the fixtures recognizable.
 WATCHED_PATH=".github/workflows/groom.yml"
 ASSETS_PATH=".github/groom"
+# A SECOND asset directory, for the multi-asset cases. cursor-review is the real
+# two-asset fleet (BE-7045): it watches its own prompts/scripts AND the
+# check-pr-size classifier it builds at run time from the caller's pinned SHA.
+# Every single-asset case above ignores this directory, which is the point — it
+# exists in the fixture repo throughout and changes none of their verdicts.
+ASSETS2_PATH="scripts/check-pr-size"
+# The two-entry WATCHED_ASSETS value, in the newline-separated form a block
+# scalar produces.
+BOTH_ASSETS=$'.github/groom\nscripts/check-pr-size'
 
 # The paths the one EXCLUDING fleet (pr-risk) watches, in the shape its
 # entrypoint's `paths:` filter has them: a reusable, a tool directory, and two
@@ -43,6 +52,16 @@ RISK_WATCHED=".github/workflows/pr-risk.yml"
 RISK_TOOLS="scripts/pr-risk"
 RISK_PATHSPECS=$'.github/workflows/pr-risk.yml\nscripts/pr-risk\n:(exclude)scripts/pr-risk/tests\n:(exclude)scripts/pr-risk/README.md'
 RISK_EXEC=$'.github/workflows/pr-risk.yml\nscripts/pr-risk/grade-pr-risk.sh\nscripts/pr-risk/grade-targets.sh\nscripts/pr-risk/resolve-enabled.sh'
+
+# The pr-size / cursor-review shape (BE-7084). Structurally different from
+# pr-risk's above: the exclusion is a FILE GLOB matching files that sit directly
+# in the watched directory, not a subdirectory that can be excluded wholesale.
+# `:(exclude)` with a glob is the part worth pinning — the excluded files are
+# interleaved with the watched ones, so nothing here can be expressed by naming
+# a narrower positive directory instead.
+SIZE_WATCHED=".github/workflows/pr-size.yml"
+SIZE_TOOLS="scripts/check-pr-size"
+SIZE_PATHSPECS=$'.github/workflows/pr-size.yml\nscripts/check-pr-size\n:(exclude)scripts/check-pr-size/*_test.go'
 
 CASE=""; SRC=""; ORIGIN=""; WORKDIR=""; OUTFILE=""; OUT=""; RC=0; P=""; N=""
 
@@ -62,9 +81,10 @@ new_case() {
   git -c init.defaultBranch=main init -q "$SRC"
   git -C "$SRC" config user.email preflight-tests@example.invalid
   git -C "$SRC" config user.name  'Preflight Tests'
-  mkdir -p "${SRC}/.github/workflows" "${SRC}/${ASSETS_PATH}"
+  mkdir -p "${SRC}/.github/workflows" "${SRC}/${ASSETS_PATH}" "${SRC}/${ASSETS2_PATH}"
   printf 'name: Groom\non:\n  workflow_call:\n' > "${SRC}/${WATCHED_PATH}"
   printf 'finder brief v1\n'                    > "${SRC}/${ASSETS_PATH}/finder.md"
+  printf 'package main // v1\n'                 > "${SRC}/${ASSETS2_PATH}/main.go"
   printf 'unrelated file\n'                     > "${SRC}/README.md"
   git -C "$SRC" add -A
   git -C "$SRC" commit -qm 'initial'
@@ -89,6 +109,20 @@ seed_pr_risk() {
   printf 'grader test v1\n' > "${SRC}/${RISK_TOOLS}/tests/test_grade.sh"
   printf 'tool README v1\n' > "${SRC}/${RISK_TOOLS}/README.md"
   push_src 'seed the pr-risk tool surface'
+  clone_work
+}
+
+seed_pr_size() {
+  mkdir -p "${SRC}/${SIZE_TOOLS}"
+  printf 'name: PR size\non:\n  workflow_call:\n' > "${SRC}/${SIZE_WATCHED}"
+  printf 'package main\n\nfunc main() {}\n'        > "${SRC}/${SIZE_TOOLS}/main.go"
+  printf 'package main\n\nfunc size() int { return 1 }\n' > "${SRC}/${SIZE_TOOLS}/size.go"
+  printf 'module check-pr-size\n\ngo 1.22\n'       > "${SRC}/${SIZE_TOOLS}/go.mod"
+  # The files a pinned caller never executes: pr-size.yml builds the tool and
+  # runs it, and never runs `go test`.
+  printf 'package main\n\nfunc TestMain2(t *testing.T) {}\n' > "${SRC}/${SIZE_TOOLS}/main_test.go"
+  printf 'package main\n\nfunc TestSize(t *testing.T) {}\n'  > "${SRC}/${SIZE_TOOLS}/size_test.go"
+  push_src 'seed the check-pr-size tool surface'
   clone_work
 }
 
@@ -415,6 +449,198 @@ run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND"
 check "single-path config would re-point" "[[ \"$P\" == \"true\" ]]"
 
 # ---------------------------------------------------------------------------
+# Multi-asset fleets (BE-7045). WATCHED_ASSETS is a newline-separated LIST, so a
+# fleet can watch more than one asset directory — cursor-review watches its own
+# prompts/scripts AND the check-pr-size classifier it builds at run time. Every
+# entry must be validated, compared and decommission-checked independently; the
+# cases below pin each of those per-entry semantics, and in particular that the
+# SECOND entry is really checked (a loop that only reads entry 0 passes every
+# single-asset case above).
+# ---------------------------------------------------------------------------
+
+new_case multi_second 'multi-asset: only the SECOND asset dir changed — still stale'
+# The regression a first-entry-only loop would ship: the classifier moved, that
+# commit has its own run, and this one must not re-point over it.
+BEHIND=$(work_head)
+printf 'package main // v2\n' > "${SRC}/${ASSETS2_PATH}/main.go"
+push_src 'edit the second asset dir only'
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" WATCHED_ASSETS="$BOTH_ASSETS"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=false"                 "[[ \"$P\" == \"false\" ]]"
+check "logged as a stale run"         "grep -q \"stale run/re-run\" <<<\"\$OUT\""
+# For a fleet that has stopped bumping, this line is the operator's only
+# diagnostic — "which watched path moved" is the whole question, so it must NAME
+# the surface rather than only report that something changed.
+check "names the changed surface"     "grep -q \"changed since (${ASSETS2_PATH})\" <<<\"\$OUT\""
+check "no ::error::"                  "! grep -q \"::error::\" <<<\"\$OUT\""
+# Listing only the FIRST asset is the under-verifying config, and it re-points —
+# so the second entry is demonstrably what produced the verdict above.
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" WATCHED_ASSETS="$ASSETS_PATH"
+check "first-entry-only would re-point" "[[ \"$P\" == \"true\" ]]"
+
+# ---------------------------------------------------------------------------
+new_case multi_first 'multi-asset: only the FIRST asset dir changed — still stale'
+# The mirror image, so neither entry can be the one silently skipped.
+BEHIND=$(work_head)
+printf 'finder brief v2\n' > "${SRC}/${ASSETS_PATH}/finder.md"
+push_src 'edit the first asset dir only'
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" WATCHED_ASSETS="$BOTH_ASSETS"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=false"                 "[[ \"$P\" == \"false\" ]]"
+check "logged as a stale run"         "grep -q \"stale run/re-run\" <<<\"\$OUT\""
+check "names the changed surface"     "grep -q \"changed since (${ASSETS_PATH})\" <<<\"\$OUT\""
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" WATCHED_ASSETS="$ASSETS2_PATH"
+check "second-entry-only would re-point" "[[ \"$P\" == \"true\" ]]"
+
+# ---------------------------------------------------------------------------
+new_case multi_tip_gone_second 'multi-asset: the SECOND asset dir was deleted at the tip'
+# EITHER entry gone at the tip is a decommission — the ::warning:: is the fleet's
+# only chance to say that callers pinned here would load a surface that is gone.
+BEHIND=$(work_head)
+git -C "$SRC" rm -rq "${ASSETS2_PATH}"
+push_src 'retire the classifier, everything else survives'
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" WATCHED_ASSETS="$BOTH_ASSETS"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=false"                 "[[ \"$P\" == \"false\" ]]"
+check "names the deleted second dir"  "grep -q \"::warning::${ASSETS2_PATH} no longer exists on main\" <<<\"\$OUT\""
+check "not reported as stale"         "! grep -q \"stale run/re-run\" <<<\"\$OUT\""
+
+# ---------------------------------------------------------------------------
+new_case multi_tip_gone_first 'multi-asset: the FIRST asset dir was deleted at the tip'
+BEHIND=$(work_head)
+git -C "$SRC" rm -rq "${ASSETS_PATH}"
+push_src 'retire the briefs, everything else survives'
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" WATCHED_ASSETS="$BOTH_ASSETS"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=false"                 "[[ \"$P\" == \"false\" ]]"
+check "names the deleted first dir"   "grep -q \"::warning::${ASSETS_PATH} no longer exists on main\" <<<\"\$OUT\""
+check "not reported as stale"         "! grep -q \"stale run/re-run\" <<<\"\$OUT\""
+
+# ---------------------------------------------------------------------------
+new_case multi_head_gone 'multi-asset: the SECOND asset dir is absent at this run OWN commit'
+# The deletion-commit case, per entry: it must be reported as a decommission and
+# never fall into the "changed since" branch as a stale re-run.
+git -C "$SRC" rm -rq "${ASSETS2_PATH}"
+push_src 'retire the classifier'
+clone_work
+BEHIND=$(work_head)
+printf 'unrelated file, edited again\n' > "${SRC}/README.md"
+push_src 'unrelated commit on top'
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" WATCHED_ASSETS="$BOTH_ASSETS"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=false"                 "[[ \"$P\" == \"false\" ]]"
+check "own-commit message names it"   "grep -q \"::warning::${ASSETS2_PATH} is absent at this run.s own commit\" <<<\"\$OUT\""
+check "not reported as stale"         "! grep -q \"stale run/re-run\" <<<\"\$OUT\""
+
+# ---------------------------------------------------------------------------
+new_case multi_repoint 'multi-asset: BOTH asset dirs unchanged behind the tip — re-point'
+# The happy path the whole list exists to keep sound: only when EVERY entry is
+# byte-identical at both commits may the run pin callers to the verified tip.
+BEHIND=$(work_head)
+printf 'unrelated file, edited\n' > "${SRC}/README.md"
+push_src 'unrelated commit'
+TIP=$(origin_tip)
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" WATCHED_ASSETS="$BOTH_ASSETS"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=true"                  "[[ \"$P\" == \"true\" ]]"
+check "new_sha re-pointed to the tip" "[[ \"$N\" == \"$TIP\" ]]"
+check "new_sha is not the stale sha"  "[[ \"$N\" != \"$BEHIND\" ]]"
+check "no ::warning::"                "! grep -q \"::warning::\" <<<\"\$OUT\""
+check "no ::error::"                  "! grep -q \"::error::\" <<<\"\$OUT\""
+# Blank lines and indentation are what a YAML block scalar actually delivers;
+# they must parse to the same two entries, not to a third empty one (which would
+# resolve to nothing and silently verify nothing).
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" \
+  WATCHED_ASSETS=$'\n  .github/groom  \n\nscripts/check-pr-size\n\n'
+check "blank/padded lines: exit 0"    "[[ $RC -eq 0 ]]"
+check "blank/padded lines: proceed"   "[[ \"$P\" == \"true\" ]]"
+check "blank/padded lines: no error"  "! grep -q \"::error::\" <<<\"\$OUT\""
+
+# ---------------------------------------------------------------------------
+new_case multi_local_gone 'multi-asset: current tip, the SECOND asset dir is gone locally'
+# The final `-d` decommission guard, reached when the DELETING commit is itself
+# the tip so none of the "main moved" comparisons run. It has to loop the list
+# too — checking only entry 0 there would bump the fleet onto a SHA where the
+# classifier no longer exists.
+git -C "$SRC" rm -rq "${ASSETS2_PATH}"
+push_src 'retire the classifier at the tip'
+clone_work
+TIP=$(origin_tip)
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED_ASSETS="$BOTH_ASSETS"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=false"                 "[[ \"$P\" == \"false\" ]]"
+check "::warning:: names the second"  "grep -q \"::warning::${ASSETS2_PATH} absent\" <<<\"\$OUT\""
+check "no fetch/compare happened"     "! grep -q \"main moved\" <<<\"\$OUT\""
+
+# ---------------------------------------------------------------------------
+new_case multi_glob 'multi-asset: a glob on the SECOND line is rejected per entry'
+# Per-entry validation. Validating only the joined string would let a glob on any
+# line but the first through, and a glob resolves to NOTHING — making that
+# entry's comparison verify nothing behind a green run, which is the exact
+# footgun validate_path exists to reject.
+TIP=$(origin_tip)
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED_ASSETS=$'.github/groom\nscripts/check-pr-size/**'
+check "exit 1"                        "[[ $RC -eq 1 ]]"
+check "::error:: names the shape"     "grep -q \"::error::WATCHED_ASSETS must be a literal path\" <<<\"\$OUT\""
+check "::error:: names the entry"     "grep -q \"got '${ASSETS2_PATH}/\\*\\*'\" <<<\"\$OUT\""
+check "proceed is not true"           "[[ \"$P\" != \"true\" ]]"
+check "nothing written to output"     "[[ ! -s \"$OUTFILE\" ]]"
+# A trailing slash on the second line is the same footgun with no glob character
+# in sight.
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED_ASSETS=$'.github/groom\nscripts/check-pr-size/'
+check "trailing slash: exit 1"        "[[ $RC -eq 1 ]]"
+check "trailing slash: ::error::"     "grep -q \"must not end in a slash\" <<<\"\$OUT\""
+check "trailing slash: not proceed"   "[[ \"$P\" != \"true\" ]]"
+
+# ---------------------------------------------------------------------------
+new_case multi_folded 'multi-asset: a space-joined (folded-scalar) value is rejected'
+# What `WATCHED_ASSETS: >` actually delivers: YAML FOLDS the lines into ONE
+# space-separated string. It carries no glob and no trailing slash, so without a
+# whitespace check it passes validation, resolves to nothing, and emits a silent
+# proceed=false decommission that freezes the fleet — while a contract test that
+# split on newlines would show two correct entries and pass. Reject the shape.
+TIP=$(origin_tip)
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED_ASSETS="${ASSETS_PATH} ${ASSETS2_PATH}"
+check "exit 1"                        "[[ $RC -eq 1 ]]"
+check "::error:: names whitespace"    "grep -q \"::error::WATCHED_ASSETS must be a literal path with no whitespace\" <<<\"\$OUT\""
+check "::error:: names the entry"     "grep -q \"got '${ASSETS_PATH} ${ASSETS2_PATH}'\" <<<\"\$OUT\""
+check "proceed is not true"           "[[ \"$P\" != \"true\" ]]"
+check "nothing written to output"     "[[ ! -s \"$OUTFILE\" ]]"
+# A block scalar has NO comment syntax and takes no `- ` list dashes, so either
+# shape is literal CONTENT that resolves to nothing — same silent decommission.
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED_ASSETS=$'.github/groom\n# scripts/check-pr-size'
+check "comment line: exit 1"          "[[ $RC -eq 1 ]]"
+check "comment line: ::error::"       "grep -q \"not a comment or a list item\" <<<\"\$OUT\""
+check "comment line: not proceed"     "[[ \"$P\" != \"true\" ]]"
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED_ASSETS=$'- .github/groom\n- scripts/check-pr-size'
+check "list dash: exit 1"             "[[ $RC -eq 1 ]]"
+check "list dash: ::error::"          "grep -q \"not a comment or a list item\" <<<\"\$OUT\""
+check "list dash: not proceed"        "[[ \"$P\" != \"true\" ]]"
+
+# ---------------------------------------------------------------------------
+new_case asset_file 'a watched asset may be a FILE, not only a directory'
+# Nothing here requires an asset to be a directory: validate_path accepts a file
+# path and both tree-OID comparisons resolve a blob just as happily. A `-d` final
+# guard would let such a fleet pass every comparison and then trip on every run,
+# reporting a permanent no-op as a decommission that never happened.
+TIP=$(origin_tip)
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED_ASSETS="${ASSETS2_PATH}/main.go"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=true"                  "[[ \"$P\" == \"true\" ]]"
+check "no ::warning::"                "! grep -q \"::warning::\" <<<\"\$OUT\""
+check "no ::error::"                  "! grep -q \"::error::\" <<<\"\$OUT\""
+# …and a file asset that is really gone still decommissions, so `-e` did not
+# weaken the guard it replaced.
+git -C "$SRC" rm -rq "${ASSETS2_PATH}/main.go"
+push_src 'retire the classifier entrypoint at the tip'
+clone_work
+TIP=$(origin_tip)
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" WATCHED_ASSETS="${ASSETS2_PATH}/main.go"
+check "gone: exit 0"                  "[[ $RC -eq 0 ]]"
+check "gone: proceed=false"           "[[ \"$P\" == \"false\" ]]"
+check "gone: ::warning:: names it"    "grep -q \"::warning::${ASSETS2_PATH}/main.go absent\" <<<\"\$OUT\""
+
+# ---------------------------------------------------------------------------
 new_case own_commit 'the watched workflow is absent at this run OWN commit'
 # An unresolvable HEAD:$WATCHED is the deletion-commit case; it must not fall
 # into the "changed since" branch and be reported as a stale re-run.
@@ -633,6 +859,93 @@ check "a list omitting it: exit 1"    "[[ $RC -eq 1 ]]"
 check "a list omitting it: ::error::" \
   "grep -q \"::error::WATCHED_PATHSPECS does not select WATCHED\" <<<\"\$OUT\""
 check "a list omitting it: no output" "[[ ! -s \"$OUTFILE\" ]]"
+
+# ---------------------------------------------------------------------------
+new_case pathspec_test_glob 'pr-size/cursor-review shape: a *_test.go-only commit is not stale'
+# BE-7084's literal configuration, and the reason it needs a pathspec at all.
+# `scripts/check-pr-size/**` in both fleets' filters also matches main_test.go /
+# size_test.go, which a pinned caller NEVER executes — pr-size.yml builds the
+# tool and runs it, and never runs `go test`. Excluding them from the trigger is
+# only half the fix: the tree OID of scripts/check-pr-size still moves for a
+# test-only commit, so an object comparison would call this run stale and wait
+# for a run the filter guarantees never started — the fleet freezes.
+#
+# The exclusion is a FILE GLOB over files sitting in the watched directory
+# itself, so unlike pr-risk's `tests/` subdirectory it cannot be sidestepped by
+# watching a narrower positive path.
+seed_pr_size
+BEHIND=$(work_head)
+printf 'package main\n\nfunc TestSize(t *testing.T) { _ = 2 }\n' > "${SRC}/${SIZE_TOOLS}/size_test.go"
+printf 'package main\n\nfunc TestMain2(t *testing.T) { _ = 2 }\n' > "${SRC}/${SIZE_TOOLS}/main_test.go"
+push_src 'edit ONLY the Go tests'
+TIP=$(origin_tip)
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" \
+  WATCHED="$SIZE_WATCHED" WATCHED_PATHSPECS="$SIZE_PATHSPECS"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=true"                  "[[ \"$P\" == \"true\" ]]"
+check "new_sha re-pointed to the tip" "[[ \"$N\" == \"$TIP\" ]]"
+check "not reported as stale"         "! grep -q \"stale run/re-run\" <<<\"\$OUT\""
+check "no ::error::"                  "! grep -q \"::error::\" <<<\"\$OUT\""
+check "no ::warning::"                "! grep -q \"::warning::\" <<<\"\$OUT\""
+# ...and the tree-OID config these fleets used BEFORE this ticket false-stales
+# that same commit — the freeze, reproduced, which is what makes the pathspec
+# input necessary rather than cosmetic here.
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" \
+  WATCHED="$SIZE_WATCHED" WATCHED_ASSETS="$SIZE_TOOLS"
+check "tree-OID config false-stales it" "[[ \"$P\" == \"false\" ]]"
+# Both fleets keep WATCHED_ASSETS set alongside the pathspecs (for the
+# decommission probes), so the REAL configuration is both inputs together — the
+# pathspec comparison must still supersede the asset OID for that same commit.
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" \
+  WATCHED="$SIZE_WATCHED" WATCHED_ASSETS="$SIZE_TOOLS" WATCHED_PATHSPECS="$SIZE_PATHSPECS"
+check "assets+pathspecs: proceed=true" "[[ \"$P\" == \"true\" ]]"
+check "assets+pathspecs: re-pointed"   "[[ \"$N\" == \"$TIP\" ]]"
+
+# ---------------------------------------------------------------------------
+new_case pathspec_test_glob_code 'pr-size/cursor-review shape: a code commit IS stale'
+# The other half of the pair. `size.go` is exactly what a pinned caller runs, so
+# that commit has its own run; this one is a stale re-run and must skip. If the
+# exclusion were widened to the whole directory (the normalization the contract
+# test refuses), this assertion is what would fail — the fleet would stop bumping
+# for real changes.
+seed_pr_size
+BEHIND=$(work_head)
+printf 'package main\n\nfunc size() int { return 2 }\n' > "${SRC}/${SIZE_TOOLS}/size.go"
+push_src 'change the counting logic callers execute'
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" \
+  WATCHED="$SIZE_WATCHED" WATCHED_ASSETS="$SIZE_TOOLS" WATCHED_PATHSPECS="$SIZE_PATHSPECS"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=false"                 "[[ \"$P\" == \"false\" ]]"
+check "logged as a stale run"         "grep -q \"stale run/re-run\" <<<\"\$OUT\""
+check "names the changed surface"     "grep -q \"scripts/check-pr-size/size.go\" <<<\"\$OUT\""
+check "no ::error::"                  "! grep -q \"::error::\" <<<\"\$OUT\""
+# go.mod and the reusable itself are watched too — neither is a *_test.go, so
+# neither may be swallowed by the exclusion.
+clone_work
+BEHIND_MOD=$(work_head)
+printf 'module check-pr-size\n\ngo 1.23\n' > "${SRC}/${SIZE_TOOLS}/go.mod"
+push_src 'change go.mod'
+run_preflight GITHUB_SHA="$BEHIND_MOD" NEW_SHA="$BEHIND_MOD" \
+  WATCHED="$SIZE_WATCHED" WATCHED_ASSETS="$SIZE_TOOLS" WATCHED_PATHSPECS="$SIZE_PATHSPECS"
+check "go.mod change is stale too"    "[[ \"$P\" == \"false\" ]]"
+clone_work
+BEHIND_WF=$(work_head)
+printf 'name: PR size\non:\n  workflow_call:\n    inputs: {}\n' > "${SRC}/${SIZE_WATCHED}"
+push_src 'change ONLY the reusable itself'
+run_preflight GITHUB_SHA="$BEHIND_WF" NEW_SHA="$BEHIND_WF" \
+  WATCHED="$SIZE_WATCHED" WATCHED_ASSETS="$SIZE_TOOLS" WATCHED_PATHSPECS="$SIZE_PATHSPECS"
+check "reusable change is stale too"  "[[ \"$P\" == \"false\" ]]"
+# A commit touching BOTH a test and real code still bumps: a negation only
+# strips the paths it matches. This is the claim both entrypoints' filter
+# comments make, asserted rather than trusted.
+clone_work
+BEHIND_MIX=$(work_head)
+printf 'package main\n\nfunc size() int { return 3 }\n'           > "${SRC}/${SIZE_TOOLS}/size.go"
+printf 'package main\n\nfunc TestSize(t *testing.T) { _ = 3 }\n'  > "${SRC}/${SIZE_TOOLS}/size_test.go"
+push_src 'edit size.go AND its test'
+run_preflight GITHUB_SHA="$BEHIND_MIX" NEW_SHA="$BEHIND_MIX" \
+  WATCHED="$SIZE_WATCHED" WATCHED_ASSETS="$SIZE_TOOLS" WATCHED_PATHSPECS="$SIZE_PATHSPECS"
+check "mixed commit is still stale"   "[[ \"$P\" == \"false\" ]]"
 
 # ---------------------------------------------------------------------------
 new_case pathspec_selects 'a pathspec list that selects nothing is an error, not "unchanged"'

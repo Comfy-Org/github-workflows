@@ -27,9 +27,9 @@ forward automatically instead of silently drifting commits behind.
 
 | Entrypoint | Triggers on a change to | Caller secret | Seeded |
 |---|---|---|---|
-| [`bump-cursor-review-callers.yml`](../workflows/bump-cursor-review-callers.yml) | `cursor-review.yml` or `cursor-review/**` | `CURSOR_REVIEW_CALLERS` | non-empty (hard-fails if empty) |
+| [`bump-cursor-review-callers.yml`](../workflows/bump-cursor-review-callers.yml) | `cursor-review.yml`, `cursor-review/**` or `scripts/check-pr-size/**` (minus its `*_test.go`, which no caller executes) | `CURSOR_REVIEW_CALLERS` | non-empty (hard-fails if empty) |
 | [`bump-agents-md-callers.yml`](../workflows/bump-agents-md-callers.yml) | `agents-md-integrity.yml` or `agents-md-integrity/**` | `AGENTS_MD_CALLERS` | empty `[]` (grows as callers land) |
-| [`bump-pr-size-callers.yml`](../workflows/bump-pr-size-callers.yml) | `pr-size.yml` or `scripts/check-pr-size/**` | `PR_SIZE_CALLERS` | empty `[]` (grows as callers land) |
+| [`bump-pr-size-callers.yml`](../workflows/bump-pr-size-callers.yml) | `pr-size.yml` or `scripts/check-pr-size/**` (minus its `*_test.go`, which no caller executes) | `PR_SIZE_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-pr-risk-callers.yml`](../workflows/bump-pr-risk-callers.yml) | `pr-risk.yml` or `scripts/pr-risk/**` (minus its `tests/` and `README.md`, which no caller executes) | `PR_RISK_CALLERS` | non-empty (hard-fails if empty) |
 | [`bump-assign-reviewers-callers.yml`](../workflows/bump-assign-reviewers-callers.yml) | `assign-reviewers.yml` | `ASSIGN_REVIEWERS_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-groom-callers.yml`](../workflows/bump-groom-callers.yml) | `groom.yml` or `groom/**` | `GROOM_CALLERS` | empty `[]` (grows as callers land) |
@@ -105,8 +105,9 @@ pr-size callers, and vice versa. Everything else (masking, the PR-per-caller
 flow, the trailing-newline fix, the single-line PR body) lives once in
 `bump-callers.sh`. Registering a new fleet is: add a thin entrypoint (copy an
 existing one, swap the path filter + `VAR_NAME`/`TAG`/`WORKFLOW_FILE`/
-`ALLOW_EMPTY`), seed its roster secret, and add a row to this table + the paths
-in `test-bump-callers.yml`. **Then `workflow_dispatch` the new entrypoint once.**
+`ALLOW_EMPTY` + the preflight's `WATCHED`/`WATCHED_ASSETS`), seed its roster
+secret, and add a row to this table + the paths in `test-bump-callers.yml`.
+**Then `workflow_dispatch` the new entrypoint once.**
 Landing a fleet does not touch the reusable it watches, so its own merge matches
 no path filter and fires no run — callers that were already stale when the fleet
 was created stay stale until the reusable next changes. Every entrypoint carries
@@ -142,8 +143,11 @@ run **stale** (has a later commit already touched the watched surface, so *that*
 commit has its own run?), and has the watched surface been **decommissioned**
 (deleted, so pinning callers to this SHA would break every one of them)?
 
-`preflight.sh` is that guard. It used to be an inline copy in each
-`bump-*-callers.yml`, and the copies drifted — several skipped on a bare tip
+`preflight.sh` is that guard, and every `bump-*-callers.yml` entrypoint runs it —
+except `bump-pr-risk-callers.yml`, which stays on its own inline guard because
+its `paths:` filter carries `:(exclude)` entries a single `WATCHED_ASSETS` string
+cannot express (see the narrowing note below). It used to be an inline copy in
+each entrypoint, and the copies drifted — several skipped on a bare tip
 mismatch, which throws away the only run for a change and freezes every caller,
 and the one that compared content forgot to re-point the pin at the verified tip.
 The extracted script deliberately adopts the hardened semantics: exact-refname
@@ -156,8 +160,8 @@ re-point that pins callers to the verified tip instead of a stale `github.sha`.
 | Input (env) | |
 |---|---|
 | `WATCHED` | **required** — repo-relative path of the watched reusable workflow (e.g. `.github/workflows/groom.yml`) |
-| `WATCHED_ASSETS` | optional — the watched asset directory (e.g. `.github/groom`). Empty/unset means the fleet is single-path |
-| `WATCHED_PATHSPECS` | optional — newline-separated git **pathspecs** (`:(exclude)` entries allowed) covering what the fleet's `paths:` filter watches. When set, they replace the `WATCHED`/`WATCHED_ASSETS` object comparison as the staleness test. **Only `pr-risk` needs this today** |
+| `WATCHED_ASSETS` | optional — the watched assets, a **newline-separated list** of literal paths, one per line (blank lines and surrounding whitespace ignored). A single-line value is just a one-element list, so `WATCHED_ASSETS: .github/groom` keeps working unchanged; a fleet watching more than one spells it as a YAML **literal** block scalar — `\|`, never the folded `>`, which joins the lines into one space-separated string (see below). Empty/unset means the fleet watches nothing beyond `WATCHED` |
+| `WATCHED_PATHSPECS` | optional — newline-separated git **pathspecs** (`:(exclude)` entries allowed) covering what the fleet's `paths:` filter watches. When set, they replace the `WATCHED`/`WATCHED_ASSETS` object comparison as the staleness test. Every positive entry must select a tracked path, and the list must select `WATCHED` **and something under every `WATCHED_ASSETS` entry**. Used by `pr-risk`, `pr-size` and `cursor-review` |
 | `WATCHED_EXEC` | optional — newline-separated repo-relative **files** a pinned caller actually executes. When set, each is probed for deletion at the tip and — unless the run was re-pointed, which makes that tip the pin target — locally too, in addition to `WATCHED`/`WATCHED_ASSETS`. **Only `pr-risk` needs this today** |
 | `NEW_SHA` | the candidate SHA, normally `github.sha` |
 | `GITHUB_SHA`, `GITHUB_OUTPUT` | provided by Actions |
@@ -246,24 +250,55 @@ marker lives in the common git dir while `--git-dir` names the per-worktree one,
 so the hand-rolled form false-negatives exactly there and silently skips the
 deepening the guard is supposed to rest on.
 
-**A multi-path fleet must pass `WATCHED_ASSETS`.** The re-point is only sound
-because every entry in the fleet's `paths:` trigger is covered by the comparison
-— for `agents-md-integrity` (`.github/agents-md-integrity/**`), `cursor-review`
-(`.github/cursor-review/**`), `groom` (`.github/groom/**`) and `pr-size`
-(`scripts/check-pr-size/**`) that includes the asset directory the reusable loads
-its prompts/scripts/briefs from at run time. (`pr-risk` is multi-path too, but its
-filter also carries `:(exclude)` entries that one `WATCHED_ASSETS` string cannot
-express, so its comparison is `WATCHED_PATHSPECS` — it still *sets*
-`WATCHED_ASSETS`, for a different reason; see the note below.) Compare `WATCHED`
-alone on one of those and a
-commit touching only the assets reads as "unchanged", so callers get pinned to a
-tip whose other relevant content was never verified. Read the entrypoint's
+**A multi-path fleet must pass `WATCHED_ASSETS`, and must list EVERY asset it
+watches.** The re-point is only sound because every entry in the fleet's `paths:`
+trigger is covered by the comparison — for `agents-md-integrity`
+(`.github/agents-md-integrity/**`), `cursor-review` (`.github/cursor-review/**`),
+`groom` (`.github/groom/**`) and `pr-size` (`scripts/check-pr-size/**`) that
+includes the asset directory the reusable loads its prompts/scripts/briefs from at
+run time. (`pr-risk` is multi-path too, but its filter also carries `:(exclude)`
+entries that `WATCHED_ASSETS` cannot express, so its comparison is
+`WATCHED_PATHSPECS` — it still *sets* `WATCHED_ASSETS`, for a different reason;
+see the note below.) Compare `WATCHED` alone on one of those and a commit touching
+only the assets reads as "unchanged", so callers get pinned to a tip whose other
+relevant content was never verified. Read the entrypoint's
 `paths:` rather than trusting this list, and if you widen a fleet's path filter,
 widen these inputs in the same change.
 
+**`cursor-review` is the two-asset fleet** (BE-7045). It watches
+`.github/cursor-review/**` for the review prompts/scripts *and*
+`scripts/check-pr-size/**` for the classifier `cursor-review.yml` builds at run
+time from the caller's pinned `workflows_ref` — that classifier decides which of
+a PR's files count as generated and therefore skip review, so a change to it
+needs the same caller bump as a workflow-file change. That is why
+`WATCHED_ASSETS` is a **list**: each entry is validated, compared and
+decommission-checked independently, with exactly the semantics a single asset
+had (any one entry absent or changed is enough to stop the bump), and a
+one-element list behaves identically to the old single-value form. Note that
+`scripts/check-pr-size` is deliberately watched by **two** fleets — `pr-size`
+consumes the same tool — which is correct and conflict-free: they push different
+stable branches.
+
+```yaml
+          WATCHED_ASSETS: |
+            .github/cursor-review
+            scripts/check-pr-size
+```
+
+**Spell it `|`, never `>`.** A folded scalar joins its lines into the single
+string `.github/cursor-review scripts/check-pr-size`, which carries no glob and
+no trailing slash — so it would pass the obvious validation, then resolve to
+nothing and emit a silent `proceed=false` decommission that freezes the fleet.
+`validate_path` therefore rejects an entry containing whitespace outright, along
+with a leading `#` or `- `: a block scalar has no comment syntax and takes no
+list dashes, so either is literal content that resolves to nothing the same way.
+The contract test honors only `|` for the same reason — it must read the value
+exactly as the runtime does, or it certifies a config preflight.sh misparses.
+
 They must not be **wider** than the filter either, which is the direction an
 excluding fleet gets wrong. A commit touching only an excluded path (pr-risk's
-`scripts/pr-risk/tests`, its `README.md`) starts no run of its own, but it does
+`scripts/pr-risk/tests` and its `README.md`; pr-size's and cursor-review's
+`scripts/check-pr-size/*_test.go`) starts no run of its own, but it does
 change the tree OID of an over-broad `WATCHED_ASSETS` — so this run reports "the
 watched surface changed since", skips green as a stale re-run, and waits on a
 later run that will never exist. An exclusion is a reason to narrow the inputs, or
@@ -282,9 +317,66 @@ remaining guard, and silently stops watching the grading logic while the fleet
 keeps re-pointing callers. So: with `WATCHED_PATHSPECS`, set it; without,
 narrow it.
 
+**`test_paths_contract.sh` enforces both directions.** These pairs are
+hand-written, one per entrypoint, and until BE-6476 the only thing holding them
+in step was the checklist line above — `test_preflight.sh` drives synthetic
+fixtures and never reads the entrypoints. The contract test does: it parses each
+`bump-*-callers.yml`'s `push:` `paths:` filter, normalizes each POSITIVE entry's
+`…/**` to the literal path, and requires set equality with that file's `WATCHED`
++ `WATCHED_ASSETS` (the negations are held against `WATCHED_PATHSPECS` instead,
+below — they are precisely what those two inputs cannot express)
+(splitting a multi-line `WATCHED_ASSETS` into one entry per line, and reading the
+`|` block-scalar spelling as well as the single-line one — the parser mirrors
+preflight.sh deliberately, including honoring only `|`, taking block content
+literally, and stripping a trailing `# comment` from a single-line value; a
+parser that read the file more permissively than the runtime does would certify
+a config the runtime misparses, which is worse than no test at all).
+A *new* entrypoint that runs no preflight at all fails too — the pr-risk
+exemption is an explicit allow-list entry, not a silent skip, so migrating it
+later fails the test until the entry is removed. Widen a filter and the test
+tells you to widen the inputs in the same change.
+
+**A filter with `!` negations must carry an equivalent `WATCHED_PATHSPECS`
+(BE-7084).** Before that input existed, a `:(exclude)` on a preflight fleet was
+rejected outright: a tree-OID comparison cannot express an exclusion, so such a
+fleet would have frozen as a permanent stale re-run. It is no longer rejected —
+it is *required to be expressible*. For a preflight fleet whose filter carries
+`!` entries the test REQUIRES `WATCHED_PATHSPECS` and compares the two as sets:
+each positive filter entry normalized (`x/**` → `x`) must appear as a positive
+pathspec, each `!x` must appear as `:(exclude)x`, and neither side may carry an
+entry the other lacks. A **file glob** in an exclusion is kept verbatim
+(`!scripts/check-pr-size/*_test.go` ↔ `:(exclude)scripts/check-pr-size/*_test.go`)
+— reducing it to the parent directory would widen the exclusion to swallow the
+whole tool and the fleet would never bump again, so the two do NOT compare equal.
+The one thing that IS normalized is a trailing `/**`, on both sides and exactly as
+it is for a positive, because `x/**` and `x` select the same set in either syntax:
+`!scripts/pr-risk/tests/**` is satisfied by `:(exclude)scripts/pr-risk/tests` (the
+spelling pr-risk's own guard and the example below use) or by
+`:(exclude)scripts/pr-risk/tests/**`, and by nothing wider. Whole-line `#`
+comments in the block are ignored here exactly as `preflight.sh` ignores them, so
+a filter pasted in with its comments intact still compares clean. A `!`-carrying
+fleet with **no** `WATCHED_PATHSPECS` still fails, naming the freeze — that is the
+case the old flat rejection existed to prevent, and it is the one that has to keep
+failing. A fleet with no `!` that sets `WATCHED_PATHSPECS` anyway is held to the
+same equivalence, so the input cannot drift away from the filter unnoticed.
+
+**Keep a `*` exclusion's directory flat.** Set-equality of the two spellings is
+textual, and there is one case where equal text selects *different* sets: a
+`paths:` filter's `*` does not cross `/`, while a bare git pathspec's does
+(`:(glob)` would fix that, and `preflight.sh` rejects that magic). While
+`scripts/check-pr-size` is flat, `!…/*_test.go` and `:(exclude)…/*_test.go` agree.
+Put a `*_test.go` in a *subdirectory* and they stop: the trigger fires on it,
+the staleness diff has already excluded it, and the run re-points having compared
+nothing that moved — the pure-churn bump BE-7084 removed, one directory down.
+`test_paths_contract.sh` measures the tree for exactly this and fails the build
+the day it becomes true, so it cannot happen quietly.
+
 **An excluding fleet passes `WATCHED_PATHSPECS`; a per-file fleet passes
-`WATCHED_EXEC`.** Today that is exactly one fleet, `pr-risk`, which needs both —
-and they are what let it move onto this script instead of keeping its own guard:
+`WATCHED_EXEC`.** `pr-size` and `cursor-review` need the first (BE-7084): each
+excludes `scripts/check-pr-size/*_test.go`, since a pinned caller builds and runs
+that tool and never runs `go test`, so a test-only commit would otherwise mint a
+token and fan a pure-churn bump PR to every consumer. `pr-risk` needs both — and
+they are what let it move onto this script instead of keeping its own guard:
 
 - Its `paths:` filter negates `scripts/pr-risk/tests/**` and the tool README, and
   no object comparison can express a negation. `WATCHED_PATHSPECS` is handed
@@ -314,7 +406,9 @@ Consumption is two steps — the guard, then the bump gated on its output:
         id: preflight
         env:
           WATCHED: .github/workflows/groom.yml
-          WATCHED_ASSETS: .github/groom   # omit for a single-path fleet
+          WATCHED_ASSETS: .github/groom   # omit for a single-path fleet;
+                                          # use a `|` block scalar (one literal
+                                          # path per line) to watch several
           NEW_SHA: ${{ github.sha }}
         run: bash .github/bump-callers/preflight.sh
 
@@ -356,15 +450,21 @@ step reads it through its own `env:` binding. That is deliberate: a step-level
 `env: NEW_SHA:` takes precedence over the job environment, so a `$GITHUB_ENV`
 write would be silently overridden by the very binding it is meant to correct.
 
-> **`bump-pr-risk-callers.yml` is swapped over (BE-6677); the other entrypoints
-> still carry their inline copies.** pr-risk went first because it was the
-> hardest — the only excluding, per-executed-file fleet — so `WATCHED_PATHSPECS`
-> and `WATCHED_EXEC` are now exercised by a real caller and not just by the
-> tests. Its remaining siblings are a mechanical repeat of the two-step block
-> above, one fleet at a time.
+Run the preflight **before** the Cloud Code Bot token step, and gate that step on
+`proceed` too. The token is an org-wide contents/pull-requests/issues write
+credential; minting it for a run the guard has already decided will bump nothing
+buys nothing and leaves it live for the job. Every entrypoint is ordered that
+way, and `test_paths_contract.sh` enforces it.
+
+> **The swap is done — all eight entrypoints run this script and no inline copy
+> remains.** `bump-pr-risk-callers.yml` went first (BE-6677) because it was the
+> hardest: the only excluding, per-executed-file fleet, so `WATCHED_PATHSPECS`
+> and `WATCHED_EXEC` are exercised by a real caller and not just by the tests.
+> BE-6476 then swapped the remaining seven, which were a mechanical repeat of the
+> two-step block above.
 >
-> It carried two checks this script did not, and **BE-6670 decided both** rather
-> than leaving the swap to choose:
+> pr-risk carried two checks this script did not, and **BE-6670 decided both**
+> rather than leaving the swap to choose:
 >
 > - Its **is-ancestor check is adopted here, for every fleet** (BE-6675) — see
 >   the direction guard above. It was never pr-risk-specific. The swap also fixed

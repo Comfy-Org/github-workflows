@@ -10,23 +10,29 @@
 #   2. Has the watched surface been DECOMMISSIONED — deleted — so that pinning
 #      callers to this SHA would break every one of them?
 #
-# Both questions were answered by an inline copy of this logic in each bump-*
-# entrypoint. Eight near-copies is exactly the drift pattern this directory
-# exists to prevent (see bump-callers.sh's header), and they HAVE drifted: five
-# skip on a bare tip mismatch, which throws away the ONLY run for a change;
-# bump-auto-label-callers.yml compares content but forgets to re-point the pin at
-# the verified tip; bump-detect-unreviewed-merge-callers.yml is the hardened one;
-# and bump-pr-risk-callers.yml had grown a different hardening again (a
-# `git rev-list` "did a later COMMIT touch a watched path" test plus an
+# Both questions used to be answered by an inline copy of this logic in each
+# bump-* entrypoint. Eight near-copies is exactly the drift pattern this
+# directory exists to prevent (see bump-callers.sh's header), and they HAD
+# drifted: five skipped on a bare tip mismatch, which throws away the ONLY run
+# for a change; bump-auto-label-callers.yml compared content but forgot to
+# re-point the pin at the verified tip; bump-detect-unreviewed-merge-callers.yml
+# was the hardened one; and bump-pr-risk-callers.yml grew a different hardening
+# again (a `git rev-list` "did a later COMMIT touch a watched path" test plus an
 # is-ancestor orphan check, and no re-point).
 #
 # This script is the one implementation, and it deliberately adopts the
 # bump-detect-unreviewed-merge-callers.yml semantics (PR #117) — exact-refname
 # tip parse, FETCH_HEAD verification, `$WATCHED`-variable deletion guard, and the
-# NEW_SHA re-point — generalized to multi-path fleets. bump-pr-risk-callers.yml
-# consumes it (BE-6677, the first entrypoint swapped over, and the one that needs
-# the two list inputs below); swapping the remaining entrypoints over is a
-# separate change each.
+# NEW_SHA re-point — generalized to multi-path fleets. ALL EIGHT entrypoints now
+# run this script and their inline copies are gone: bump-pr-risk-callers.yml went
+# first (BE-6677 — it is also the one that needs both list inputs below), and
+# BE-6476 swapped the remaining seven. There is no longer an entrypoint carrying
+# its own guard, so a behavior change here reaches every fleet at once — which is
+# the point, and also the reason the test suites below are the gate.
+#
+# Each consuming entrypoint runs this BEFORE it mints its Cloud Code Bot token
+# and gates that step on `proceed` too, so a run this guard no-ops never mints an
+# org-wide write credential. Keep that ordering when adding a fleet.
 #
 # What to do with bump-pr-risk-callers.yml's two extra checks was that swap's one
 # open decision. BE-6670 made it, and both halves are settled:
@@ -76,14 +82,34 @@
 #   GITHUB_SHA     This run's own commit (provided by Actions). Must match HEAD.
 #   GITHUB_OUTPUT  Step-output file (provided by Actions).
 # Optional:
-#   WATCHED_ASSETS Watched asset directory (e.g. .github/groom) for a fleet whose
-#                  `paths:` filter has more than one entry. Empty/unset means the
-#                  fleet is single-path. Also a literal path.
+#   WATCHED_ASSETS Watched assets (a directory, or a file) for a fleet whose
+#                  `paths:` filter has more than one entry — a
+#                  NEWLINE-SEPARATED LIST of literal
+#                  paths, one per line (blank lines ignored). The YAML spelling
+#                  is a LITERAL block scalar — `|`, never the folded `>`, which
+#                  joins the lines into one space-separated string that resolves
+#                  to nothing (validate_path rejects that shape):
+#
+#                      WATCHED_ASSETS: |
+#                        .github/cursor-review
+#                        scripts/check-pr-size
+#
+#                  A block scalar has no comment syntax and takes no `- ` list
+#                  dashes; such a line is literal content and is rejected too.
+#                  A single-line value is just a one-element list, so every
+#                  single-asset fleet's existing `WATCHED_ASSETS: .github/groom`
+#                  spelling keeps working unchanged. Empty/unset means the fleet
+#                  watches nothing beyond WATCHED. Each entry is validated,
+#                  compared, and decommission-checked INDEPENDENTLY, with exactly
+#                  the semantics a single asset had: any one of them absent or
+#                  changed is enough to stop the bump.
 #   WATCHED_PATHSPECS
 #                  Newline-separated git PATHSPECS covering the surface the
 #                  fleet's `paths:` filter watches — `:(exclude)` entries
-#                  included, which is the whole point (only pr-risk needs this
-#                  today). When set it REPLACES the WATCHED/WATCHED_ASSETS object
+#                  included, which is the whole point (pr-risk, and — since
+#                  BE-7084 — pr-size and cursor-review, whose filters exclude
+#                  `scripts/check-pr-size/*_test.go`). When set it REPLACES the
+#                  WATCHED/WATCHED_ASSETS object
 #                  comparison as the "changed since" test: a `git diff --quiet`
 #                  between this run's commit and the verified tip, restricted to
 #                  these pathspecs. It MUST MIRROR THE FLEET'S `paths:` FILTER,
@@ -94,7 +120,10 @@
 #                  silently green: every positive entry has to select at least
 #                  one tracked path (in either tree), and the list as a whole has
 #                  to select WATCHED (and, when WATCHED_ASSETS is also set,
-#                  something under it). Unset leaves the OID comparison exactly
+#                  something under EVERY ONE of its entries — the list input is
+#                  per-entry here exactly as it is everywhere else, so a fleet
+#                  that watches two directories cannot cover one and leave the
+#                  other unverified). Unset leaves the OID comparison exactly
 #                  as it was, so the fleets that do not set it do not change
 #                  behaviour.
 #   WATCHED_EXEC   Newline-separated repo-relative FILES that a pinned caller
@@ -108,13 +137,27 @@
 #                  pathspec magic belongs in WATCHED_PATHSPECS, and a directory
 #                  is rejected (WATCHED_ASSETS is the input for one).
 #
-# Both list inputs are newline-separated so an entrypoint can write them as a
-# YAML block scalar directly beneath the `paths:` filter they mirror. Blank lines
-# and whole-line `#` comments are ignored, so that filter can be pasted with its
-# comments intact; a variable that is SET but contains nothing else is rejected
-# rather than silently treated as unset — that shape is a mis-wired expression,
-# and reading it as "this fleet is simple" is exactly the silent under-check the
-# rest of this script refuses to make.
+# All three list inputs are newline-separated so an entrypoint can write them as
+# a YAML block scalar directly beneath the `paths:` filter they mirror. They do
+# NOT share one comment rule, and the difference is deliberate rather than an
+# oversight of the merge that brought them together:
+#
+#   * WATCHED_PATHSPECS / WATCHED_EXEC ignore blank lines and whole-line `#`
+#     comments, so the fleet's `paths:` filter can be pasted in with its comments
+#     intact — which is the point, since those two must MIRROR that filter.
+#   * WATCHED_ASSETS ignores blank lines but REJECTS a `#` or `- ` line, because
+#     a block scalar has no comment syntax: such a line is literal content, and
+#     accepting it would mean "watching" a path that resolves to nothing. It is
+#     a short hand-written list, not a pasted filter, so there is nothing to
+#     preserve and everything to catch.
+#
+# They also differ on the empty value, for the same reason. WATCHED_PATHSPECS and
+# WATCHED_EXEC reject a variable that is SET but contains no entries — that shape
+# is a mis-wired expression, and reading it as "this fleet is simple" is exactly
+# the silent under-check the rest of this script refuses to make. WATCHED_ASSETS
+# does not, because for IT the empty value is a real answer with a real meaning
+# ("this fleet watches nothing beyond WATCHED") that most fleets rely on; there
+# is no mis-wiring to catch, only a single-path fleet to let through.
 #
 # Outputs (written to $GITHUB_OUTPUT on every exit-0 path):
 #   proceed  "true"  → the caller should run bump-callers.sh
@@ -163,6 +206,26 @@ validate_path() { # $1 = input name, $2 = value ("" = unset, skip), $3 = optiona
     echo "::error::$1 must not end in a slash (got '$2') — a trailing slash resolves to nothing, so the comparison would silently verify nothing"
     exit 1
   fi
+  # A `|` block scalar has NO comment syntax and takes no `- ` list dashes — such
+  # a line is literal CONTENT, so it arrives here as a watched path that resolves
+  # to nothing, the same silent-decommission failure the checks above exist to
+  # prevent. Tested BEFORE the whitespace rule below purely for the diagnosis:
+  # `- .github/groom` trips both, and "you wrote a YAML list" is the message that
+  # tells the maintainer what to change.
+  if [[ "$2" == '#'* || "$2" == -* ]]; then
+    echo "::error::$1 must be a literal path, not a comment or a list item (got '$2') — a block scalar ('|') has no comment syntax and takes no '- ' dashes, so such a line is literal content that resolves to nothing"
+    exit 1
+  fi
+  # Internal whitespace is what a FOLDED YAML scalar delivers. `WATCHED_ASSETS: >`
+  # over two lines folds to the ONE string `.github/cursor-review scripts/check-pr-size`,
+  # which carries no glob and no trailing slash and so sails past every check
+  # above — then resolves to nothing, exactly like the glob does. The multi-entry
+  # spelling is a `|` BLOCK scalar; reject the folded one by shape rather than
+  # letting it become a silent decommission.
+  if [[ "$2" == *[[:space:]]* ]]; then
+    echo "::error::$1 must be a literal path with no whitespace (got '$2') — a folded YAML scalar ('>') joins a multi-entry value into one space-separated string that resolves to nothing; use a block scalar ('|') with one path per line"
+    exit 1
+  fi
   # Repo-relative, and only repo-relative. Every watched path is checked TWICE —
   # once inside a tree (`git rev-parse "<tip>:$p"`) and once against the
   # filesystem (`[[ -f "$p" ]]`) — and the two halves disagree about an absolute
@@ -178,7 +241,25 @@ validate_path() { # $1 = input name, $2 = value ("" = unset, skip), $3 = optiona
   esac
 }
 validate_path WATCHED "$WATCHED"
-validate_path WATCHED_ASSETS "$WATCHED_ASSETS"
+
+# WATCHED_ASSETS is a newline-separated LIST. Parse it into an array before
+# validating, so each entry gets the same glob / trailing-slash rejection a
+# single asset used to get — a fleet whose second line is `.github/groom/**`
+# must fail as loudly as one whose only line is.
+# Surrounding whitespace is stripped per entry. A flow scalar
+# (`WATCHED_ASSETS: .github/groom`) cannot carry it, but a block scalar can hold
+# trailing spaces that are invisible in review, and ` .github/groom` resolves to
+# nothing exactly like the glob above — silently verifying nothing is the failure
+# this whole validation block exists to prevent, and there is no legitimate
+# watched path with leading or trailing spaces.
+asset_dirs=()
+while IFS= read -r asset_line; do
+  asset_line="${asset_line#"${asset_line%%[![:space:]]*}"}"
+  asset_line="${asset_line%"${asset_line##*[![:space:]]}"}"
+  [[ -n "$asset_line" ]] || continue
+  validate_path WATCHED_ASSETS "$asset_line"
+  asset_dirs+=("$asset_line")
+done <<<"$WATCHED_ASSETS"
 
 # --- the two newline-separated list inputs -----------------------------------
 # Split on newlines, trim each entry, drop blank ones (a YAML block scalar always
@@ -556,37 +637,58 @@ if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
     emit false "$NEW_SHA"
     exit 0
   fi
-  # Multi-path fleets pin a second surface: the asset directory the reusable
-  # loads its prompts/scripts/briefs from at run time. Compare its TREE OID the
-  # same way — see the COUPLED TO THE PATH FILTER note on the re-point below.
-  tip_assets=""
-  here_assets=""
-  if [[ -n "$WATCHED_ASSETS" ]]; then
-    resolve_oid "$fetched_tip:$WATCHED_ASSETS"
-    tip_assets="$RESOLVED"
-    resolve_oid "HEAD:$WATCHED_ASSETS"
-    here_assets="$RESOLVED"
-    # Same reasoning as the here_blob guard above: an asset tree that is already
-    # gone at this run's own commit is a decommission, not a "changed since".
-    if [[ -z "$here_assets" ]]; then
-      echo "::warning::$WATCHED_ASSETS is absent at this run's own commit $GITHUB_SHA — treating as decommissioned and bumping nothing. If any caller still pins it, retire those callers."
-      emit false "$NEW_SHA"
-      exit 0
-    fi
+  # Multi-path fleets pin further surfaces: the asset directories the reusable
+  # loads its prompts/scripts/briefs from — or, for cursor-review, BUILDS the
+  # check-pr-size classifier from — at run time. Compare each one's TREE OID the
+  # same way, INDEPENDENTLY: any single entry differing is enough to make this a
+  # stale re-run, and any single entry missing is enough to make it a
+  # decommission. See the COUPLED TO THE PATH FILTER note on the re-point below.
+  #
+  # Every absent-at-HEAD check runs before any tip_gone verdict is acted on
+  # (that is why this loop exits on the former but only RECORDS the latter),
+  # preserving the single-asset ordering: a surface already gone at this run's
+  # own commit is a decommission, not a "changed since".
+  assets_tip_gone=""
+  assets_changed=""
+  if (( ${#asset_dirs[@]} > 0 )); then
+    for asset_dir in "${asset_dirs[@]}"; do
+      resolve_oid "$fetched_tip:$asset_dir"
+      tip_asset="$RESOLVED"
+      resolve_oid "HEAD:$asset_dir"
+      here_asset="$RESOLVED"
+      # Same reasoning as the here_blob guard above: an asset tree that is
+      # already gone at this run's own commit is a decommission, not a
+      # "changed since".
+      if [[ -z "$here_asset" ]]; then
+        echo "::warning::$asset_dir is absent at this run's own commit $GITHUB_SHA — treating as decommissioned and bumping nothing. If any caller still pins it, retire those callers."
+        emit false "$NEW_SHA"
+        exit 0
+      fi
+      # First match wins for both, so the reported path is deterministic
+      # (the entries are compared in the order the fleet lists them).
+      if [[ -z "$tip_asset" ]] && [[ -z "$assets_tip_gone" ]]; then
+        assets_tip_gone="$asset_dir"
+      fi
+      if [[ "$tip_asset" != "$here_asset" ]] && [[ -z "$assets_changed" ]]; then
+        assets_changed="$asset_dir"
+      fi
+    done
   fi
-  # EITHER watched surface being gone at the tip is a decommission — not both.
-  # Retirement is normally staged (delete the reusable, clean up its asset
-  # directory in a later commit), so an AND here would let the common case fall
+  # ANY ONE watched surface being gone at the tip is a decommission — not all of
+  # them. Retirement is normally staged (delete the reusable, clean up its asset
+  # directories in later commits), so an AND here would let the common case fall
   # through to the "stale run/re-run" branch and exit green, suppressing the
   # ::warning:: below. It would also disagree with the local -f/-d guards at the
-  # bottom of this script, which already treat either surface missing as a
+  # bottom of this script, which already treat any one surface missing as a
   # decommission — the same situation must not get two different verdicts
   # depending on which branch reached it.
+  # WATCHED is reported ahead of the assets, and the assets in the order the
+  # fleet lists them, so the named path is deterministic rather than incidental.
   tip_gone=""
   if [[ -z "$tip_blob" ]]; then
     tip_gone="$WATCHED"
-  elif [[ -n "$WATCHED_ASSETS" ]] && [[ -z "$tip_assets" ]]; then
-    tip_gone="$WATCHED_ASSETS"
+  elif [[ -n "$assets_tip_gone" ]]; then
+    tip_gone="$assets_tip_gone"
   fi
   # A per-file fleet's directory can OUTLIVE the scripts inside it: pr-risk's
   # `scripts/pr-risk` still exists once `tests/` and `README.md` are all that is
@@ -643,7 +745,14 @@ if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
   # direction — same not-evidence principle as resolve_oid. Reading it as
   # "changed" freezes the fleet behind a run that never comes; reading it as
   # "unchanged" re-points every caller to a tip nothing was verified at.
+  #
+  # Both shapes NAME the surface that moved. For a fleet that has stopped
+  # bumping, that line is the operator's only diagnostic, and "which of the
+  # watched paths moved" is the whole question — so the pathspec shape reports it
+  # too rather than leaving the fleets that need exclusions worse off than the
+  # ones that do not.
   surface_changed=""
+  changed_surface=""
   if (( ${#watched_pathspecs[@]} > 0 )); then
     # `git diff --quiet` exits 1 for "there is a diff", 0 for "there is none",
     # and 128 for a comparison it could not perform — an unreadable object, or a
@@ -696,24 +805,47 @@ if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
       echo "::error::WATCHED_PATHSPECS does not select WATCHED ($WATCHED) — the reusable workflow is the one surface every fleet compares unconditionally, and a list that omits it reads a commit touching only it as 'unchanged'. Add it (or the pathspec covering it), and check no ':(exclude)' swallows it"
       exit 1
     fi
-    if [[ -n "$WATCHED_ASSETS" ]]; then
-      covered=""
-      while IFS= read -r matched_path; do
-        if [[ "$matched_path" == "$WATCHED_ASSETS"/* ]]; then covered=1; break; fi
-      done <<<"$MATCHED"
-      if [[ -z "$covered" ]]; then
-        echo "::error::WATCHED_PATHSPECS selects nothing under WATCHED_ASSETS ($WATCHED_ASSETS) — setting both means the pathspec comparison SUPERSEDES the asset tree OID comparison, so a list that reaches none of it leaves that surface unverified. Cover it in the pathspec list, or unset WATCHED_ASSETS"
-        exit 1
-      fi
+    # EVERY entry, not the list as a whole. WATCHED_ASSETS is a list (BE-7045),
+    # and a fleet that watches two directories — cursor-review watches
+    # .github/cursor-review and scripts/check-pr-size — must not be able to cover
+    # one and leave the other silently unverified. That is the same
+    # any-one-of-them reasoning the decommission and OID comparisons already use
+    # per entry; checking the list as a whole would be strictly weaker than the
+    # comparison this input supersedes.
+    if (( ${#asset_dirs[@]} > 0 )); then
+      for asset_dir in "${asset_dirs[@]}"; do
+        covered=""
+        while IFS= read -r matched_path; do
+          # An asset entry may be a FILE as well as a directory (see the header),
+          # and a file is selected as ITSELF, never as a `<entry>/` prefix — so a
+          # prefix-only test would fail every file asset with a "covers nothing"
+          # error that the pathspec list cannot actually fix.
+          if [[ "$matched_path" == "$asset_dir" || "$matched_path" == "$asset_dir"/* ]]; then covered=1; break; fi
+        done <<<"$MATCHED"
+        if [[ -z "$covered" ]]; then
+          echo "::error::WATCHED_PATHSPECS selects nothing under WATCHED_ASSETS entry '$asset_dir' — setting both means the pathspec comparison SUPERSEDES the asset tree OID comparison, so a list that reaches none of that entry leaves it unverified. Cover it in the pathspec list, or drop it from WATCHED_ASSETS"
+          exit 1
+        fi
+      done
     fi
     if (( diff_rc == 1 )); then
       surface_changed=1
+      # `--quiet` told us THAT something moved; ask again for WHICH, under the
+      # very same pathspecs (exclusions included), so the name reported can never
+      # be a path the fleet does not actually watch. First path wins, for the
+      # same determinism the OID branch gets from its listed order.
+      changed_paths=$(git diff --name-only "$head_sha" "$fetched_tip" -- "${watched_pathspecs[@]}")
+      changed_surface="${changed_paths%%$'\n'*}"
     fi
-  elif [[ "$tip_blob" != "$here_blob" ]] || [[ "$tip_assets" != "$here_assets" ]]; then
+  elif [[ "$tip_blob" != "$here_blob" ]] || [[ -n "$assets_changed" ]]; then
     surface_changed=1
+    # Same WATCHED-then-assets-in-listed-order precedence as the decommission
+    # verdict above, so the reported path is deterministic.
+    changed_surface="$assets_changed"
+    [[ "$tip_blob" == "$here_blob" ]] || changed_surface="$WATCHED"
   fi
   if [[ -n "$surface_changed" ]]; then
-    echo "github.sha $GITHUB_SHA is behind main ($main_tip) and the watched surface changed since — stale run/re-run; the newer commit has its own run. Nothing to bump"
+    echo "github.sha $GITHUB_SHA is behind main ($main_tip) and the watched surface changed since ($changed_surface) — stale run/re-run; the newer commit has its own run. Nothing to bump"
     emit false "$NEW_SHA"
     exit 0
   fi
@@ -725,18 +857,27 @@ if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
   #
   # COUPLED TO THE PATH FILTER — this is only sound because every entry in the
   # fleet's `paths:` trigger is covered by the comparison above. A single-path
-  # fleet passes WATCHED alone; a fleet whose filter also watches an asset
-  # directory MUST pass WATCHED_ASSETS too, or the comparison silently
-  # under-verifies and callers get pinned to a tip whose other relevant content
-  # was never compared. Today that is agents-md-integrity
-  # (.github/agents-md-integrity/**), cursor-review (.github/cursor-review/**),
-  # groom (.github/groom/**) and pr-size (scripts/check-pr-size/**) — plus
-  # pr-risk, whose filter also carries `:(exclude)` entries that a single
-  # WATCHED_ASSETS string cannot express, which is what WATCHED_PATHSPECS is for.
-  # THE SAME COUPLING BINDS IT, and more literally: the pathspec list must MIRROR
-  # the fleet's `paths:` filter, exclusions included. Read the entrypoint's
-  # `paths:` rather than trusting this list, and if you widen a fleet's filter
-  # again, widen the inputs here in the same change.
+  # fleet passes WATCHED alone; a fleet whose filter also watches asset
+  # directories MUST list EVERY one of them in WATCHED_ASSETS, or the comparison
+  # silently under-verifies and callers get pinned to a tip whose other relevant
+  # content was never compared. Today that is agents-md-integrity
+  # (.github/agents-md-integrity/**), groom (.github/groom/**), pr-size
+  # (scripts/check-pr-size/**) and cursor-review, which watches TWO
+  # (.github/cursor-review/** for the review prompts/scripts and
+  # scripts/check-pr-size/** for the classifier it builds at run time).
+  #
+  # A fleet whose filter carries `:(exclude)` entries needs WATCHED_PATHSPECS on
+  # top, because no set of WATCHED_ASSETS paths can express an exclusion — the
+  # asset tree OID moves for an excluded commit just as it does for a watched
+  # one. Today that is pr-risk, plus pr-size and cursor-review, which since
+  # BE-7084 both exclude `scripts/check-pr-size/*_test.go` (a pinned caller
+  # builds and runs that tool; it never runs `go test`, so a test-only commit is
+  # pure churn to every consumer). THE SAME COUPLING BINDS IT, and more
+  # literally: the pathspec list must MIRROR the fleet's `paths:` filter,
+  # exclusions included. Read the entrypoint's `paths:` rather than trusting this
+  # list, and if you widen a fleet's filter again, widen the inputs here in the
+  # same change — test_paths_contract.sh fails the build if you don't, and for an
+  # excluding fleet it checks the two lists are EQUIVALENT, not merely present.
   #
   # The inputs must not be WIDER than the filter either, and that direction is
   # the one an excluding fleet gets wrong. A commit touching only an EXCLUDED
@@ -773,10 +914,23 @@ if [[ ! -f "$WATCHED" ]]; then
   emit false "$NEW_SHA"
   exit 0
 fi
-if [[ -n "$WATCHED_ASSETS" ]] && [[ ! -d "$WATCHED_ASSETS" ]]; then
-  echo "::warning::$WATCHED_ASSETS absent at this SHA — treating as decommissioned and bumping nothing. If any caller still pins it, retire those callers."
-  emit false "$NEW_SHA"
-  exit 0
+# Every watched asset gets the same test, for the same reason: ANY one of them
+# missing at this SHA means a caller pinned here would load a surface that is
+# gone. Same first-match-wins ordering as the tip comparison above.
+# `-e`, not `-d`: nothing else here requires an asset to be a DIRECTORY —
+# validate_path accepts a file path, and both tree-OID comparisons above resolve
+# a blob just as happily as a tree. A `-d` here would let a fleet watching a
+# single file (e.g. `scripts/check-pr-size/go.mod`) pass every comparison and
+# then trip this guard on every run, reporting a permanent no-op as a
+# decommission that never happened.
+if (( ${#asset_dirs[@]} > 0 )); then
+  for asset_dir in "${asset_dirs[@]}"; do
+    if [[ ! -e "$asset_dir" ]]; then
+      echo "::warning::$asset_dir absent at this SHA — treating as decommissioned and bumping nothing. If any caller still pins it, retire those callers."
+      emit false "$NEW_SHA"
+      exit 0
+    fi
+  done
 fi
 # The local half of the per-file probe above: the deleting commit is often the
 # tip itself, in which case none of the "main moved" comparisons ran at all. A
