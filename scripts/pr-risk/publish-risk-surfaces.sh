@@ -198,7 +198,17 @@ cat <<'JQ'
     # number that separates "peel 2 files and the rest rubber-stamps" from "peel 2 files and the
     # rest is still a normal review" is not otherwise recoverable without re-grading by hand.
     | ([$files[] | select((.tier | tier_rank) < ($floor | tier_rank))]) as $below
-    | (if ($below | length) > 0 then ([$below[] | .tier | tier_rank] | max) else null end) as $comp_rank
+    # The printed label is the RECORD's own tier string, never `"R\(rank)"` re-rendered from the
+    # number: `tier_rank` deliberately collapses anything outside R0–R3 to 3, so re-rendering would
+    # print an unrecognized tier as a confident `R3`. `max_by` applies the same worst-of rule while
+    # keeping the label tied to the data rather than to the enum's present shape.
+    | (if ($below | length) > 0 then ($below | max_by(.tier | tier_rank) | .tier) else null end) as $comp_tier
+    # The below-floor share, bound once because the clause and the sentence it hangs off have to
+    # agree about it. A remainder that ROUNDS TO 0% of the diff gets no split pitch, or the sentence
+    # reads "**0%** of this diff is R0/R1/R2 … peeled into their own PR, the remaining 1 file(s)" —
+    # offering to relocate a line it has just called nothing. The gate is the sentence's OWN printed
+    # number rather than a threshold picked here, so the two can never disagree.
+    | (pct($total - $toplines; $total)) as $below_pct
 
     # ---- the concentration sentence ----------------------------------------------------------
     # Built on the SHIPPED model (per-file PATH floors), never lifted from the superseded
@@ -210,18 +220,20 @@ cat <<'JQ'
        then "This diff changes no counted lines across \($files | length) file(s)."
        elif ($floor | tier_rank) == 0 or ($total - $toplines) <= 0
        then "All \($total) changed lines sit at \($floor) on the path axis."
-       else "**\(pct($total - $toplines; $total))% of this diff is "
+       else "**\($below_pct)% of this diff is "
             + ([range(0; ($floor | tier_rank))] | map("R\(.)") | join("/"))
             + "**; the \(pct($toplines; $total))% that puts the path floor at \($floor) is "
             + "\($topf | length) file(s), \($toplines) lines"
-            # A FLOOR WITH ITS ASSUMPTIONS NAMED, never a promised grade. The remainder's own
-            # provenance and check rollup are unknowable at render time — a human-authored split
-            # floors at R1 on provenance, and the future PR's checks have not run — so this says
-            # what the PATH axis would say and states plainly what it cannot.
-            + (if $path_decided and $comp_rank != null
+            # A FLOOR WITH ITS ASSUMPTIONS NAMED, never a promised grade. The OTHER TWO AXES are
+            # re-derived for a split PR and this cannot anticipate either: provenance is the same
+            # author but a narrower path set, which may newly assert a runbook or newly fail one;
+            # reversibility keys on the remainder's own classes and on checks that have not run
+            # yet. Both can move in EITHER direction, so neither is a floor to clamp this number
+            # to — it says what the PATH axis would say and names plainly what it cannot answer.
+            + (if $path_decided and $comp_tier != null and $below_pct > 0
                then "; peeled into their own PR, the remaining \($below | length) file(s) would "
-                    + "path-floor at **R\($comp_rank)** (final grade still depends on provenance "
-                    + "and checks at PR time)."
+                    + "path-floor at **\($comp_tier)** (final grade still depends on the "
+                    + "provenance and reversibility axes at PR time)."
                else "." end)
        end) as $conc_core
     | (if $graded and (($tier | tier_rank) > ($floor | tier_rank)) and (($drivers | length) > 0)

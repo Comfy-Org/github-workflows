@@ -146,8 +146,15 @@ echo "— the concentration sentence carries the COMPLEMENT floor: what a split 
 # the map by hand.
 has "$c" "peeled into their own PR, the remaining 1 file(s) would path-floor at **R0**" \
     "600 R0 doc lines under an R3 CI floor report an R0 remainder"
-has "$c" "(final grade still depends on provenance and checks at PR time)" \
+has "$c" "(final grade still depends on the provenance and reversibility axes at PR time)" \
     "…as a FLOOR with its assumptions named, never a promised grade"
+# NOT CLAMPED to the other axes, and the caveat is why: provenance and reversibility are both
+# re-derived for the split PR and can move in either direction, so max(path, provenance,
+# reversibility) would be no more a floor for the remainder than the path number alone. Path floor
+# R3 over provenance R1 / reversibility R2 still reports the remainder's own R0.
+has "$(render_surfaces "$(record R3 R3 "$big" R1 R2)" 0 | jq -r '.concentration')" \
+    "the remaining 1 file(s) would path-floor at **R0**" \
+    "a lower-ranked provenance/reversibility does NOT clamp the path-axis number"
 # Worst-of over the remainder, not the biggest or the last file: 500 R0 lines cannot cancel 100 R1
 # ones, exactly as the floor itself is a max rather than last-match-wins.
 mix="[$(file_entry docs/a.md R0 500 0), $(file_entry src/app.ts R1 100 0), $(file_entry .github/workflows/d.yml R3 30 10)]"
@@ -180,6 +187,17 @@ hasnt "$tied" "peeled into their own PR" "an axis TIED with the path floor also 
 # The ungraded surfaces never reach the sentence at all.
 hasnt "$(render_surfaces "$u" 0 | jq -r '.concentration')" "peeled into their own PR" \
       "an ungradable record proposes no split"
+# A REMAINDER THAT ROUNDS TO 0%: one R0 line against 9999 R3 ones. There IS a below-floor file, so
+# the set is non-empty, but the sentence has just printed "**0%** of this diff is R0/R1/R2" — and a
+# clause under that would pitch a whole extra PR to relocate a single line. The gate is the
+# sentence's own printed share, so the two halves can never contradict each other.
+tiny="$(render_surfaces "$(record R3 R3 "[$(file_entry docs/a.md R0 1 0), $(file_entry .github/workflows/d.yml R3 9999 0)]")" 0 | jq -r '.concentration')"
+has "$tiny" "**0% of this diff is R0/R1/R2**" "a 1-line remainder still rounds the share to 0%…"
+hasnt "$tiny" "peeled into their own PR" "…and a 0% remainder is offered NO split"
+# One line the other way is enough: 1% is a share the sentence prints, so the clause speaks.
+small="$(render_surfaces "$(record R3 R3 "[$(file_entry docs/a.md R0 100 0), $(file_entry .github/workflows/d.yml R3 9900 0)]")" 0 | jq -r '.concentration')"
+has "$small" "peeled into their own PR, the remaining 1 file(s) would path-floor at **R0**" \
+    "a remainder the share sentence does print (1%) keeps the clause"
 
 echo "— the body is BOUNDED under GitHub's 65536-char comment limit (measured, not estimated) —"
 # 400 files, each with a 300-char deeply-nested path — comfortably past the limit unbounded.

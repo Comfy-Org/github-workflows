@@ -241,15 +241,20 @@ Labels are created on first use, color-coded green → red (gray for ungraded).
   sentence also carries a **reducibility readout**: when the path axis is what decided the tier and
   some of the diff sits below the floor, it names what the below-floor remainder would path-floor
   at on its own — "…peeled into their own PR, the remaining 3 file(s) would path-floor at **R2**
-  (final grade still depends on provenance and checks at PR time)". That complement floor is the
-  worst per-file floor over exactly the files the share sentence already counts as below-floor,
-  computed from the grader's own per-file floors rather than estimated, and it is what tells a
-  split worth doing (the remainder lands in a cheap lane) from one that is not (it is still a
-  normal review). It is deliberately a **floor with its assumptions named, never a promised
-  grade** — the remainder's provenance and check rollup are unknowable at render time. It is
-  silent where a split cannot help: an irreducible diff (every line already at the floor), and any
+  (final grade still depends on the provenance and reversibility axes at PR time)". That complement
+  floor is the worst per-file floor over exactly the files the share sentence already counts as
+  below-floor, computed from the grader's own per-file floors rather than estimated, and it is what
+  tells a split worth doing (the remainder lands in a cheap lane) from one that is not (it is still
+  a normal review). It is deliberately a **floor with its assumptions named, never a promised
+  grade**, and deliberately **not clamped to the other two axes**: both are re-derived for the
+  split PR and can move either way — a narrower path set may newly assert a runbook (provenance
+  improves) or newly fail one, and reversibility keys on the remainder's own classes and on checks
+  that have not run yet — so clamping would print a number that is not a floor either. It is
+  silent where a split cannot help: an irreducible diff (every line already at the floor), any
   grade the path axis did not decide, including a *tie* where another axis proposes the same tier
-  and peeling the top files would therefore change nothing. The long form lives in
+  and peeling the top files would therefore change nothing, and a remainder that rounds to **0%**
+  of the diff, where the sentence would otherwise pitch relocating a line it just called nothing.
+  The long form lives in
   the Check Run instead, because this comment lands on PRs that already carry CodeRabbit and an
   8-cell review panel, and an advisory grade nothing routes on has the weakest claim on the
   reader's scroll. Every PR-controlled string it renders is escaped here — a filename may
