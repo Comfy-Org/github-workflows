@@ -31,14 +31,24 @@ hasnt() { if grep -qF -- "$2" <<<"$1"; then bad "$3" "$(head -c 400 <<<"$1")"; e
 # shellcheck source=/dev/null
 source "$SCRIPT"
 
-# <tier> <floor> <files-json> [prov-tier] [rev-tier] [rev-files-json] [rev-reason] -> a record file.
+# A fixture that fails to build leaves a ZERO-BYTE record, which render_surfaces reads back as `{}`
+# and renders as the UNGRADED surfaces — under which every `hasnt` assertion in this suite passes
+# vacuously. So a build failure has to fail the run outright. `record` runs inside a command
+# substitution, where `exit 1` would only leave the subshell, so it drops a sentinel the summary
+# below turns into a real failure.
+FIXTURE_FAIL="$SANDBOX/fixture-build-failed"
+
+# <tier> <floor> <files-json> [prov-tier] [rev-tier] [rev-files-json] [rev-reason] [rev-residual]
+#   -> a record file.
 # `rev-files-json` is the `axes.reversibility.files` attribution grade-pr-risk.sh emits (BE-7418):
 # the paths that supplied the reversibility tier, or `null` on the rungs where the tier is not
-# attributable to files. It defaults to `null`, so every fixture written before it existed keeps
-# rendering exactly as it did — which is the backward-compatibility case the suite pins below.
+# attributable to files. `rev-residual` is its `residual_tier` companion (BE-7419): the grader's
+# map-aware bound on where the axis lands once those paths are peeled. Both default to `null`, so
+# every fixture written before they existed keeps rendering exactly as it did — which is the
+# backward-compatibility case the suite pins below.
 record() {
   local tier="$1" floor="$2" files="$3" prov="${4:-R1}" rev="${5:-R1}" revfiles="${6:-null}"
-  local revreason="${7:-checks green but the diff touches no test file}"
+  local revreason="${7:-checks green but the diff touches no test file}" revres="${8:-null}"
   local f="$SANDBOX/rec-$RANDOM.json" ff="$SANDBOX/files-$RANDOM.json"
   # The files array goes in via a FILE, not --argjson. Linux caps a single argv entry at 128KiB
   # (MAX_ARG_STRLEN) regardless of the much larger total ARG_MAX, so the bounded-body fixture below
@@ -47,13 +57,13 @@ record() {
   # `rev-files-json` stays an --argjson: it names a handful of paths, never the whole diff.
   printf '%s' "$files" > "$ff"
   jq -n --arg t "$tier" --arg fl "$floor" --slurpfile files "$ff" --arg p "$prov" --arg rv "$rev" \
-        --argjson rf "$revfiles" --arg rr "$revreason" '
+        --argjson rf "$revfiles" --arg rr "$revreason" --argjson rres "$revres" '
     {pr:7, risk:{map_version:"v0-generic", registry_version:"v0", tier:$t, status:"ok",
       reason:"worst of path_floor=\($fl), provenance=\($p), reversibility=\($rv)",
       axes:{path_floor:{tier:$fl, status:"ok", reason:"matched things", classes:["x"], files:$files[0]},
             provenance:{tier:$p, status:"ok", reason:"human"},
-            reversibility:{tier:$rv, status:"ok", reason:$rr, files:$rf}}}}' > "$f" \
-    || printf 'FATAL: record() could not build %s\n' "$f" >&2
+            reversibility:{tier:$rv, status:"ok", reason:$rr, files:$rf, residual_tier:$rres}}}}' > "$f" \
+    || { printf 'FATAL: record() could not build %s\n' "$f" >&2; : > "$FIXTURE_FAIL"; }
   printf '%s' "$f"
 }
 # <path> <tier> <additions> <deletions> [classes-json] — `classes` defaults to the placeholder every
@@ -208,7 +218,7 @@ echo "— …but a REVERSIBILITY tie the peel would remove lets the clause speak
 # the same peel, described two ways, because the gate could not tell the two ties apart.
 mig="[$(file_entry docs/a.md R0 500 100), $(file_entry migrations/0042_drop.sql R3 30 10 '["migrations"]')]"
 MIG_WHY="touches migrations — mutates persistent state or deletes data; reverting the code does not restore it"
-rev_surf="$(render_surfaces "$(record R3 R3 "$mig" R1 R3 '["migrations/0042_drop.sql"]' "$MIG_WHY")" 0)"
+rev_surf="$(render_surfaces "$(record R3 R3 "$mig" R1 R3 '["migrations/0042_drop.sql"]' "$MIG_WHY" '"R1"')" 0)"
 rev_conc="$(jq -r '.concentration' <<<"$rev_surf")"
 rev_body="$(jq -r '.comment_body' <<<"$rev_surf")"
 has "$rev_conc" "peeled into their own PR, the remaining 1 file(s) would path-floor at **R0**" \
@@ -219,20 +229,30 @@ has "$rev_conc" "(final grade still depends on the provenance and reversibility 
 # reader looking for a reduction on the axis it just told them decided the tier.
 has "$rev_body" "**path and reversibility**: touches migrations" \
     "…the headline names BOTH axes and carries reversibility's reason"
-has "$rev_body" "6% of 640 changed lines carry it (1 file(s))." \
+has "$rev_body" "6% of 640 changed lines set the path floor (1 file(s))." \
     "…and \$conc_short fires for the combined driver, not just plain 'path'"
+
+# THE CONSUMER-OVERRIDE CASE `residual_tier` exists for. Same fully-attributed, fully-peeled tie —
+# but the consumer's map sets `no_green_checks_tier: "R3"`, so the grader reports the axis lands
+# back on R3 once the migration is peeled. The subset test alone still says "removable" here; only
+# the residual bound catches that the promised reduction cannot happen.
+ovr="$(render_surfaces "$(record R3 R3 "$mig" R1 R3 '["migrations/0042_drop.sql"]' "$MIG_WHY" '"R3"')" 0)"
+hasnt "$(jq -r '.concentration' <<<"$ovr")" "peeled into their own PR" \
+      "a removable tie whose residual_tier does NOT drop below the headline stays SILENT"
+has   "$(jq -r '.comment_body' <<<"$ovr")" "**reversibility**: touches migrations" \
+      "…and the headline credits reversibility alone, as it did before BE-7419"
 
 # THE CONSUMER-OVERRIDE CASE the full-subset test exists for. A map override can put an
 # irreversible-class file BELOW the path floor — remap `migrations` to R1 while leaving it in
 # `irreversible_classes` — and there peeling $topf (the CI file) leaves the reversibility reason
 # exactly where it was. A "does reversibility name any peeled file?" test would speak here wrongly.
 override="[$(file_entry docs/a.md R0 500 100), $(file_entry migrations/0042_drop.sql R1 20 0 '["migrations"]'), $(file_entry .github/workflows/ci.yml R3 30 10)]"
-ov_surf="$(render_surfaces "$(record R3 R3 "$override" R1 R3 '["migrations/0042_drop.sql"]' "touches migrations")" 0)"
+ov_surf="$(render_surfaces "$(record R3 R3 "$override" R1 R3 '["migrations/0042_drop.sql"]' "touches migrations" '"R1"')" 0)"
 hasnt "$(jq -r '.concentration' <<<"$ov_surf")" "peeled into their own PR" \
       "a reversibility tie attributed to a file BELOW the floor keeps the clause SILENT"
 has   "$(jq -r '.comment_body' <<<"$ov_surf")" "**reversibility**: touches migrations" \
       "…and the headline credits reversibility alone, exactly as it did before"
-hasnt "$(jq -r '.comment_body' <<<"$ov_surf")" "changed lines carry it" \
+hasnt "$(jq -r '.comment_body' <<<"$ov_surf")" "changed lines set the path floor" \
       "…with no above-the-fold split fragment either"
 
 # BACKWARD COMPATIBILITY, pinned: `files` is absent/null on the R2 and R1 rungs (properties of the
@@ -240,13 +260,18 @@ hasnt "$(jq -r '.comment_body' <<<"$ov_surf")" "changed lines carry it" \
 # graded before BE-7418. Those must all fail SAFE, back to the unconditional suppression.
 hasnt "$(render_surfaces "$(record R3 R3 "$mig" R1 R3)" 0 | jq -r '.concentration')" "peeled into their own PR" \
       "a reversibility tie carrying files:null (an R2-style tie, or a pre-BE-7418 record) stays SILENT"
-hasnt "$(render_surfaces "$(record R3 R3 "$mig" R1 R3 '[]')" 0 | jq -r '.concentration')" "peeled into their own PR" \
+hasnt "$(render_surfaces "$(record R3 R3 "$mig" R1 R3 '[]' "$MIG_WHY" '"R1"')" 0 | jq -r '.concentration')" "peeled into their own PR" \
       "…and an EMPTY attribution is rejected, not read as a subset of everything"
-hasnt "$(render_surfaces "$(record R3 R3 "$mig" R1 R3 '["migrations/0042_drop.sql","docs/a.md"]')" 0 | jq -r '.concentration')" \
+hasnt "$(render_surfaces "$(record R3 R3 "$mig" R1 R3 '["migrations/0042_drop.sql","docs/a.md"]' "$MIG_WHY" '"R1"')" 0 | jq -r '.concentration')" \
       "peeled into their own PR" \
       "…nor is a PARTIAL subset — one attributed path outside the peeled set is enough to suppress"
+# `files` present but `residual_tier` absent is the pre-BE-7419 record: the grader answered the
+# subset question but never the "…and does the axis actually land lower?" one. Fail safe.
+hasnt "$(render_surfaces "$(record R3 R3 "$mig" R1 R3 '["migrations/0042_drop.sql"]' "$MIG_WHY")" 0 | jq -r '.concentration')" \
+      "peeled into their own PR" \
+      "…and a record with files but NO residual_tier (graded before BE-7419) stays SILENT"
 # Both ties at once: the provenance half is unaffected by any peel, so it still decides.
-hasnt "$(render_surfaces "$(record R3 R3 "$mig" R3 R3 '["migrations/0042_drop.sql"]' "$MIG_WHY")" 0 | jq -r '.concentration')" \
+hasnt "$(render_surfaces "$(record R3 R3 "$mig" R3 R3 '["migrations/0042_drop.sql"]' "$MIG_WHY" '"R1"')" 0 | jq -r '.concentration')" \
       "peeled into their own PR" \
       "a provenance tie suppresses the clause even when the reversibility tie IS removable"
 # The ungraded surfaces never reach the sentence at all.
@@ -487,6 +512,11 @@ has "$tbody" "(truncated" "the backstop fires when everything else fails to fit"
 has "$tbody" "- [ ] $DISPUTE_TEXT" "…and the truncated body STILL carries the checkbox"
 eq "…and every <details> it opened is closed" \
    "$(grep -c '<details>' <<<"$tbody")" "$(grep -c '</details>' <<<"$tbody")"
+
+# Every negative assertion above is only meaningful if the fixture it ran against actually built.
+if [ -e "$FIXTURE_FAIL" ]; then
+  bad "record() built at least one fixture as a zero-byte file (see the FATAL above) — every 'hasnt' assertion in this run is vacuous"
+fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

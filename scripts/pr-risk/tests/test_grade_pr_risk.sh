@@ -707,8 +707,42 @@ eq "an unknown reversibility axis emits no attribution at all" null "$(jq -r '.r
 # moved out from under them.
 out="$(rec 37 dev 'feat: schema' '[{"path":"db/migrations/0001_x.sql","additions":9,"deletions":0,"change_type":"ADDED"}]' ok SUCCESS | grade)"
 eq "the reversibility record keeps every field it had" \
-   "deleted_files files flag_gated reason status tier" \
+   "deleted_files files flag_gated reason residual_tier status tier" \
    "$(jq -r '.risk.axes.reversibility | keys | join(" ")' <<<"$out")"
+
+echo "— phase 23b: residual_tier bounds where the axis lands AFTER the peel (BE-7419) —"
+# `files` alone says the CURRENTLY ATTRIBUTED reason is removable; it does not say the tier drops,
+# because the three rungs the remainder falls back to are map-configurable. `residual_tier` is that
+# missing half, and the publisher requires it to rank below the headline before it will pitch a
+# split. It is REPORTING ONLY like `files` — computed from the decision, read nowhere else here.
+paths='[{"path":"db/migrations/0001_x.sql","additions":9,"deletions":0,"change_type":"ADDED"},{"path":"docs/a.md","additions":1,"deletions":0,"change_type":"MODIFIED"}]'
+out="$(rec 39 dev 'feat: schema' "$paths" ok SUCCESS | grade)"
+# The bound has to be the tier the peel ACTUALLY produces — which phase 23 measures directly, by
+# peeling and re-grading. Asserting them equal is what stops the bound drifting into a guess.
+eq "residual_tier equals the tier a real peel produces (green rollup)" \
+   "$(peeled_tier 139 "$paths" "$out")" "$(jq -r '.risk.axes.reversibility.residual_tier' <<<"$out")"
+eq "…which on the repo map's defaults is R1" R1 "$(jq -r '.risk.axes.reversibility.residual_tier' <<<"$out")"
+# NOT GREEN: rung 3 tests the HEAD COMMIT's rollup, which no peel can change, so the remainder
+# lands exactly on no_green_checks_tier — R2 here, still below the R3 headline.
+out="$(rec 40 dev 'feat: schema' "$paths" ok PENDING | grade)"
+eq "a non-green rollup pins the residual at no_green_checks_tier" R2 \
+   "$(jq -r '.risk.axes.reversibility.residual_tier' <<<"$out")"
+# THE CONSUMER OVERRIDE the field exists to catch: raise no_green_checks_tier to R3 and the
+# remainder lands back on R3, so peeling the migration buys the PR nothing. The attribution is
+# unchanged — only the bound moves, and it is the bound the publisher gates on.
+ovmap="$SANDBOX/map-no-green-r3.json"
+jq '.reversibility.no_green_checks_tier = "R3"' "$SELF_DIR/../risk-map.v0.json" > "$ovmap"
+out="$(rec 41 dev 'feat: schema' "$paths" ok PENDING | bash "$GRADER" --stdin --map "$ovmap" 2>/dev/null)"
+eq "…and an override that raises that rung to R3 is reported as R3" R3 \
+   "$(jq -r '.risk.axes.reversibility.residual_tier' <<<"$out")"
+eq "…while the attribution itself is unchanged" '["db/migrations/0001_x.sql"]' \
+   "$(jq -c '.risk.axes.reversibility.files' <<<"$out")"
+eq "…and the tier the override cannot touch is still R3 from the irreversible class" R3 \
+   "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
+# The three non-attributable rungs answer no peel question at all, so they carry no bound either.
+out="$(rec 42 dev 'feat: x' '[{"path":"src/x.go","additions":9,"deletions":0,"change_type":"MODIFIED"}]' ok SUCCESS | grade)"
+eq "a rung with no attribution carries no residual bound either" null \
+   "$(jq -r '.risk.axes.reversibility.residual_tier' <<<"$out")"
 
 echo
 echo "passed $PASS, failed $FAIL"
