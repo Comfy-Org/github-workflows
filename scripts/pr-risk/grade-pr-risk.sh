@@ -529,7 +529,31 @@ cat <<'JQ'
                       | select(any($dsr[]; . as $rule | $rem | matches_any($rule.paths)))
                       | $f.path]) | unique)
             else null end) as $rev_files
-         | {tier:$d.t, status:"ok", reason:$d.why, files:$rev_files, flag_gated:$flag, deleted_files:($deleted|length)}
+         # WHERE THE AXIS LANDS ONCE EVERY ATTRIBUTED PATH IS PEELED — the bound that makes `files`
+         # a SAFE answer to the publisher's peel question rather than merely a true one. Peeling
+         # clears both attributable rungs, so the remainder restarts the ladder at `no-green-checks`
+         # — but those three lower rungs are MAP-CONFIGURABLE, and a consumer that sets
+         # `no_green_checks_tier: "R3"` lands the remainder right back on R3. Without this the
+         # publisher reads "every attributed path is in the peel set" as "the tier drops" and
+         # promises a reduction a legal map makes impossible.
+         #
+         # PEEL-SET-INDEPENDENT, so the grader never has to know which files the publisher would
+         # drop: rung 3 tests `$checks`, a property of the HEAD COMMIT that no peel can change, so
+         # when the rollup is not green the remainder lands EXACTLY on `no_green_checks_tier`; when
+         # it is green, rung 3 cannot fire and the worst of the two rungs below it is the bound.
+         # (Peeling can only REMOVE a test file, which moves `clean` to `no-test-touched` — riskier,
+         # already covered by taking the worst of the two.)
+         #
+         # `null` exactly when `files` is `null`: there is no peel question to answer. REPORTING
+         # ONLY, like `files` — derived from the decision, read nowhere else in this grader.
+         # The rung-3 test is copied VERBATIM from the ladder above (`$checks == null` is redundant
+         # against `!= "SUCCESS"` and is kept only so the two spellings stay byte-identical) — a
+         # paraphrase here is a second copy of the rung that can drift out of step with it.
+         | (if $rev_files == null then null
+            elif $checks == null or $checks != "SUCCESS" then ($RV.no_green_checks_tier // "R2")
+            else worst(($RV.no_test_touched_tier // "R1"); ($RV.clean_tier // "R0")) end) as $rev_residual
+         | {tier:$d.t, status:"ok", reason:$d.why, files:$rev_files, residual_tier:$rev_residual,
+            flag_gated:$flag, deleted_files:($deleted|length)}
        end) as $A3
 
     # ---- worst wins ------------------------------------------------------------------------
