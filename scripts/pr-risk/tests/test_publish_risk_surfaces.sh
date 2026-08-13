@@ -176,7 +176,11 @@ eq "an irreducible diff renders byte-identically to before this clause existed" 
    "All 40 changed lines sit at R3 on the path axis." "$irr"
 # NOT PATH-DECIDED: provenance supplied the headline, so peeling the top path files leaves the tier
 # where it is. Quoting a path-axis reduction under it would point the reader at the wrong number.
-np="$(render_surfaces "$(record R3 R2 "$big" R3 R1)" 0 | jq -r '.concentration')"
+# Its own fixture rather than $big, because the floor here is R2 and grade-pr-risk.sh derives the
+# floor as `worst` over the SAME per-file rules: a record whose floor is R2 while a file on it reads
+# R3 cannot be graded, so reusing $big would pin the clause against an input production never emits.
+path_r2="[$(file_entry docs/a.md R0 500 100), $(file_entry src/app.ts R2 30 10)]"
+np="$(render_surfaces "$(record R3 R2 "$path_r2" R3 R1)" 0 | jq -r '.concentration')"
 hasnt "$np" "peeled into their own PR" "a headline another axis supplied gets NO reducibility clause"
 has "$np" "40 lines. The headline tier is R3 rather than the path floor R2" \
     "…and the sentence ends exactly as it did before, straight into the axis attribution"
