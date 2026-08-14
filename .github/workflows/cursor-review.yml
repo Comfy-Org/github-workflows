@@ -1267,19 +1267,47 @@ jobs:
             --insert /tmp/ledger/ledger.md \
             --out /tmp/prompt-head.txt
 
+          # The reviewed diff is `git diff BASE...HEAD` — attacker-authored PR
+          # file bytes — spliced straight into this prompt, so static literal
+          # fences are no control at all: the diff can contain the close fence.
+          # The BEGIN/END markers carry an unguessable per-prompt nonce instead
+          # (BE-7645), minted HERE, long after the head SHA the diff is built
+          # from was fixed, so a PR cannot have written it into its own bytes.
+          #
+          # Minted into a SHELL variable, never a step `env:` entry and never a
+          # job output: Actions prints a step's env map into the run log before
+          # the script runs, and consumer run logs are public. Each of the 8
+          # panel cells (and the judge) mints its own, so a nonce that does leak
+          # — a model quoting a marker back in its printed output — cannot forge
+          # a fence anywhere else.
+          diff_nonce="$(python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" mint)"
+
+          # The prompt files END with the bare `=== BEGIN DIFF ===` line, which
+          # is also the splice --marker above, so it has to stay verbatim in the
+          # .md. Drop it here and let fence-diff.py re-emit it carrying the
+          # nonce, so the whole attacker-authored region — the diff AND the
+          # incremental hunks — sits inside fences a PR cannot forge.
+          # fence-diff.py copies the diff bytes through unchanged.
+          python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" strip-marker \
+            --file /tmp/prompt-head.txt \
+            --marker '=== BEGIN DIFF ==='
+
           {
             cat /tmp/prompt-head.txt
-            cat /tmp/pr-diff.patch
-            echo ""
-            echo "=== END DIFF ==="
+            python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" emit \
+              --body /tmp/pr-diff.patch --label DIFF --nonce "$diff_nonce"
             if [ -s /tmp/pr-diff-new.patch ]; then
               echo ""
-              echo "=== HUNKS NEW SINCE ROUND ${LEDGER_ROUNDS:-?} ==="
-              echo "The subset of the diff above that changed since the last reviewed"
-              echo "commit. Prioritize it — but the full diff above is still in scope."
-              cat /tmp/pr-diff-new.patch
-              echo ""
-              echo "=== END HUNKS NEW SINCE ROUND ${LEDGER_ROUNDS:-?} ==="
+              # Guidance ABOUT the block stays OUTSIDE it: instructions to the
+              # reviewer never share a fence with untrusted data. It names the
+              # block BELOW it, since it now sits between two closed regions.
+              echo "The block below is the subset of the diff above that changed since"
+              echo "the last reviewed commit. Prioritize it — but the full diff above"
+              echo "is still in scope."
+              python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" emit \
+                --body /tmp/pr-diff-new.patch \
+                --label "HUNKS NEW SINCE ROUND ${LEDGER_ROUNDS:-?}" \
+                --nonce "$diff_nonce"
             fi
           } > /tmp/prompt.txt
 
@@ -1465,22 +1493,39 @@ jobs:
             --insert /tmp/ledger/ledger-judge.md \
             --out /tmp/judge-prompt-head.txt
 
+          # Nonce'd fences as in the panel (BE-7645) — the judge reads the same
+          # attacker-authored diff, so it gets the same delimiting. Its nonce is
+          # minted HERE and is its OWN: the panel jobs never see it. That is
+          # what stops a laundering path — panel.json is model output produced
+          # with the panel's nonce in context, and it is spliced ABOVE the diff
+          # here, so a shared value could be echoed by a steered panel model into
+          # a region the judge has been told is authoritative and used to forge a
+          # close/open fence pair around a fake diff.
+          #
+          # panel.json is fenced with the same nonce for the same reason: it is
+          # model output derived from the untrusted diff, so "only a marker
+          # carrying this nonce ends a region" has to hold for it too, not just
+          # for the diff. Today only json.dump's newline escaping keeps a forged
+          # marker off a line start — that is not a control to rely on.
+          judge_nonce="$(python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" mint)"
+
+          python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" strip-marker \
+            --file /tmp/judge-prompt-head.txt \
+            --marker '=== BEGIN PANEL FINDINGS ==='
+
           {
             cat /tmp/judge-prompt-head.txt
-            cat /tmp/panel.json
+            python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" emit \
+              --body /tmp/panel.json --label "PANEL FINDINGS" --nonce "$judge_nonce"
             echo ""
-            echo "=== END PANEL FINDINGS ==="
-            echo ""
-            echo "=== BEGIN DIFF ==="
-            cat /tmp/pr-diff.patch
-            echo ""
-            echo "=== END DIFF ==="
+            python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" emit \
+              --body /tmp/pr-diff.patch --label DIFF --nonce "$judge_nonce"
             if [ -s /tmp/pr-diff-new.patch ]; then
               echo ""
-              echo "=== HUNKS NEW SINCE ROUND ${LEDGER_ROUNDS:-?} ==="
-              cat /tmp/pr-diff-new.patch
-              echo ""
-              echo "=== END HUNKS NEW SINCE ROUND ${LEDGER_ROUNDS:-?} ==="
+              python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" emit \
+                --body /tmp/pr-diff-new.patch \
+                --label "HUNKS NEW SINCE ROUND ${LEDGER_ROUNDS:-?}" \
+                --nonce "$judge_nonce"
             fi
           } > /tmp/judge-prompt.txt
 
