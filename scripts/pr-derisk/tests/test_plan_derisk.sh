@@ -48,8 +48,16 @@ PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); printf 'ok   %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); printf 'FAIL %s\n     got: %s\n' "$1" "${2:-}"; }
 eq()  { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1 (expected '$2')" "$3"; fi }
-has() { if printf '%s\n' "$2" | grep -qF -- "$3"; then ok "$1"; else bad "$1" "not found: $3"; fi }
-no()  { if printf '%s\n' "$2" | grep -qF -- "$3"; then bad "$1" "present: $3"; else ok "$1"; fi }
+# NO `grep -q` HERE, and the reason is not style. `-q` makes grep exit the instant it matches,
+# which closes the pipe under a `printf` that is still writing — and with `set -o pipefail` above,
+# that EPIPE becomes the PIPELINE's status, so a SUCCESSFUL match is reported as a failure. It is a
+# race decided by where the needle sits: a pattern near the top of a 43 KB workflow file loses,
+# one near the bottom wins, and a small haystack that fits the pipe buffer always wins — which is
+# why this passed on a developer's laptop and on every earlier CI run, and only broke once the
+# suite grew assertions against text at the START of pr-derisk.yml. It also silently inverted `no`
+# into a FALSE GREEN. Without `-q`, grep drains its input before exiting and there is no race.
+has() { if printf '%s\n' "$2" | grep -F -- "$3" >/dev/null; then ok "$1"; else bad "$1" "not found: $3"; fi }
+no()  { if printf '%s\n' "$2" | grep -F -- "$3" >/dev/null; then bad "$1" "present: $3"; else ok "$1"; fi }
 
 # ---- fixtures ------------------------------------------------------------------------------------
 # `graded <name> <changed_paths-json>` — a REAL graded record, produced by the real grader, so
