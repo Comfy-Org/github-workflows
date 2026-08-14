@@ -95,12 +95,16 @@ pull-requests: write   # posting the consolidated review
 
 | Input | Default | Notes |
 |---|---|---|
-| `judge_model` | `claude-opus-4-8-thinking-max` | Consolidates the panel into one review. |
+| `judge_model` | `claude-opus-5-thinking-max` | Consolidates the panel into one review. |
 | `diff_size_cap` | `5000` | Skip review above this diff size. |
+| `ignore_comments` | `true` | Discount blank/comment-only lines from the size count (count-only — the panel still sees them). |
 | `review_label` | `cursor-review` | The label that triggers a run. |
-| `diff_excludes` | lockfiles, `node_modules`, `.claude`, `dist`, `vendor`, `*.generated.*`, `*.min.js` | Paths kept out of **both** the size-budget count and the reviewed diff. Passing your own value **replaces** the default list, so re-state the entries you still want. |
-| `workflows_ref` | `main` | **Set to your `uses:` SHA** — prompts load from this ref at run time. |
+| `extra_generated_globs` | `node_modules`, `dist`, `vendor`, `*.generated.*`, `*.min.js`, `*.min.css` | Extra globs the shared `check-pr-size` classifier treats as generated — kept out of **both** the size-budget count and the reviewed diff. Passing your own value **replaces** the default list, so re-state the entries you still want. `.claude` is deliberately **not** in the default: hand-authored agent instructions are prose worth reviewing. A repo whose `.claude/` tree is vendored/tool-installed output (a BMAD-method install, say) should pass the defaults above plus `**/.claude/**`. |
+| `extra_lockfiles` | `''` | Extra dependency-lockfile base names, on top of the classifier's built-ins. |
+| `diff_excludes` | `''` | Pathspecs excluded from the reviewed diff **only** (not the size count) — back-compat escape hatch; prefer `extra_generated_globs`. |
+| `workflows_ref` | **required** (no default) | **Set to your `uses:` SHA** — prompts load from this ref at run time. |
 | `bot_app_id` | `''` | Post as your App. |
+| `ledger_prior_review` | `true` | Give each round the prior rounds' findings + author replies, so a refuted or deferred finding is not re-litigated. |
 | `run_without_label` | `false` | Run on every PR rather than waiting for the label. **Also requires widening your caller's `types:`** — see the gotcha. |
 
 ## Gotchas

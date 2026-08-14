@@ -102,11 +102,16 @@ on:
           as `.gitattributes`): a PR cannot hide a file from review by adding
           the marker, and a file NEW in the PR never matches it — cover newly
           generated files with a glob here or a base `.gitattributes` rule.
+          Supplying this input REPLACES the default list wholesale, so restate
+          the defaults you still want: a repo whose `.claude/` tree is
+          vendored/tool-installed output (a BMAD-method install, say) rather
+          than hand-authored agent instructions should pass the defaults plus
+          its own `**/.claude/**` glob — hand-authored agent instructions are
+          prose worth reviewing, so the default no longer excludes them.
         type: string
         required: false
         default: >-
           **/node_modules/**
-          **/.claude/**
           **/dist/**
           **/vendor/**
           **/*.generated.*
