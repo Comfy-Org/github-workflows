@@ -325,9 +325,28 @@ Labels are created on first use, color-coded green → red (gray for ungraded).
 - `tests/` — hermetic suites (synthetic records + a stubbed `gh`); run via
   [`test-pr-risk.yml`](../../.github/workflows/test-pr-risk.yml).
 
+## The next rung: `/derisk` (pr-derisk, v1)
+
+The reducibility readout above tells a reader *that* a split would help and *what the remainder
+would floor at*. It does not draft the split. That is
+[`pr-derisk`](../pr-derisk/README.md) — an on-demand `/derisk` comment command, off by default,
+which makes ONE model call for a semantic partition of the diff and then has **this grader**
+compute every step's floor via `grade-pr-risk.sh --stdin`.
+
+Two properties of that arrangement matter here rather than there:
+
+- **The grading path stays LLM-free.** pr-derisk reads this grader's output and adds a comment; it
+  cannot change a grade, a label, or a check. Nothing in `scripts/pr-risk/` knows it exists.
+- **`--stdin` is load-bearing beyond the tests.** It is what makes a proposed split's floor
+  computable by the actual judge instead of estimated by a model, so a de-risk plan can never show
+  a tier the grader did not produce. Treat it as a public contract of this script: the scorecard
+  record shape and `risk.axes.path_floor.tier` are what pr-derisk builds against, and
+  `bump-pr-derisk-callers.yml` watches `scripts/pr-risk/**` for exactly that reason.
+
 ## What is deliberately NOT here
 
-No auto-merge, no routing, no required check, no PR comment, no LLM judgement,
-no linked-ticket requirement. Those are later rungs of the ladder and each one
-is its own explicit switch — this workflow exists to accumulate the
+No auto-merge, no routing, no required check, no LLM judgement, no linked-ticket
+requirement — and no PR comment on the grading path beyond the opt-in sticky above.
+Those are later rungs of the ladder (the first of them, `/derisk`, is described
+directly above) and each one is its own explicit switch — this workflow exists to accumulate the
 agree/disagree evidence that decides whether any of them turn on.
