@@ -31,7 +31,16 @@ name: Cursor Review (reusable)
 #         # and the reviewed diff — the same codegen detection the PR-size cap
 #         # uses (lockfiles, base-ref linguist-generated, Go markers are already
 #         # built in). Use diff_excludes only for diff-only, non-generated paths.
+#         # Setting this REPLACES the default list, so the defaults are re-stated
+#         # verbatim here before the repo's own paths — a pattern with no `/`
+#         # matches the base name only, so the `**/…/**` form is load-bearing.
 #         extra_generated_globs: >-
+#           **/node_modules/**
+#           **/dist/**
+#           **/vendor/**
+#           **/*.generated.*
+#           **/*.min.js
+#           **/*.min.css
 #           data/object_info.json.gz
 #           **/*.snap
 #         # REQUIRED. Pin the assets ref to the SAME commit SHA you pin `uses:`
@@ -107,7 +116,9 @@ on:
           vendored/tool-installed output (a BMAD-method install, say) rather
           than hand-authored agent instructions should pass the defaults plus
           its own `**/.claude/**` glob — hand-authored agent instructions are
-          prose worth reviewing, so the default no longer excludes them.
+          prose worth reviewing, so the default no longer excludes them. Until
+          such a repo does, that tree counts against `diff_size_cap`, and a PR
+          over the cap is skipped silently (no review, no Slack notice).
         type: string
         required: false
         default: >-

@@ -114,10 +114,21 @@ jobs:
   cursor-review:
     uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@<sha>  # v1
     with:
-      # Exclude generated/vendored paths from BOTH the size cap and the diff.
-      diff_excludes: >-
-        :!**/package-lock.json
-        :!**/*.generated.*
+      # Repo-specific generated/vendored paths, excluded from BOTH the size cap
+      # and the diff. Dependency lockfiles, base-ref `linguist-generated` files
+      # and the Go codegen marker are built into the classifier — you never list
+      # those. Setting this input REPLACES the default list, so the defaults are
+      # re-stated verbatim below and the repo's own paths appended. A pattern
+      # with no `/` matches only the base name, so the `**/…/**` form matters.
+      extra_generated_globs: >-
+        **/node_modules/**
+        **/dist/**
+        **/vendor/**
+        **/*.generated.*
+        **/*.min.js
+        **/*.min.css
+        data/object_info.json.gz
+        **/*.snap
       # REQUIRED — the same SHA as the `uses:` pin above.
       workflows_ref: <sha>
     secrets:
@@ -186,9 +197,9 @@ All optional except `workflows_ref` (required, no default) — pass them under
 | `diff_size_cap` | `5000` | Max counted changed lines (after generated-file exclusion and comment discounting); larger PRs are skipped. |
 | `ignore_comments` | `true` | Discount blank/comment-only lines from the size count (count-only; the panel still sees them). |
 | `review_label` | `cursor-review` | Label whose addition triggers the review. |
-| `extra_generated_globs` | `node_modules`, `dist`, `vendor`, minified/`.generated.` files | Extra globs the shared `check-pr-size` classifier treats as generated — excluded from BOTH the size count and the reviewed diff. |
+| `extra_generated_globs` | `**/node_modules/**`<br>`**/dist/**`<br>`**/vendor/**`<br>`**/*.generated.*`<br>`**/*.min.js`<br>`**/*.min.css` | Extra globs the shared `check-pr-size` classifier treats as generated — excluded from BOTH the size count and the reviewed diff. Setting it **replaces** the defaults; re-state them verbatim, since a pattern with no `/` matches only the base name (bare `node_modules` excludes nothing under the directory). `.claude` is deliberately absent — see [the setup guide](../../docs/callers/cursor-review.md). |
 | `extra_lockfiles` | `''` | Extra lockfile base names for the classifier, on top of its built-ins. |
-| `diff_excludes` | `''` | Pathspecs excluded from the reviewed diff ONLY (not the size count) — back-compat escape hatch; prefer `extra_generated_globs`. |
+| `diff_excludes` | `''` | Pathspecs excluded from the reviewed diff ONLY (not the size count) — back-compat escape hatch; prefer `extra_generated_globs`. Entries need pathspec-magic (`:!…`); a plain path excludes nothing. |
 | `workflows_ref` | **required** (no default) | Ref this directory's prompts/scripts are loaded from. Must be the same commit SHA as your `uses:` pin — omit it and the run fails fast, because pinning `uses:` while loading scripts from a mutable branch defeats the pin. |
 | `bot_app_id` | `''` | Optional GitHub App ID; when set (with `BOT_APP_PRIVATE_KEY`), the review posts under that App's identity instead of `github-actions[bot]`. |
 | `run_without_label` | `false` | Run on plain PR events instead of requiring the trigger label. Also requires widening the caller's `types:` — see [the setup guide](../../docs/callers/cursor-review.md). |
