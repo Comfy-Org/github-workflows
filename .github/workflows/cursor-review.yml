@@ -65,9 +65,10 @@ on:
           after the shared classifier's generated-file exclusion and (when
           ignore_comments is true) blank/comment-line discounting. The skip is
           NOT silent: it emits a ::warning:: annotation and a step-summary block,
-          and (when bot_app_id + BOT_APP_PRIVATE_KEY are configured) upserts one
-          sticky PR comment saying no panel ran — flipped to ✅ once the PR is
-          back under the cap. The run stays green either way; nothing gates.
+          and upserts one sticky PR comment saying no panel ran — as the bot app
+          when bot_app_id + BOT_APP_PRIVATE_KEY are configured, else as
+          github-actions[bot] — flipped to ✅ once the PR is back under the cap.
+          The run stays green either way; nothing gates.
         type: number
         required: false
         default: 5000
@@ -461,6 +462,12 @@ jobs:
       # normal path and by the raw-count fallback below on the degraded one, so
       # it always agrees with whichever count actually decided `over_cap`.
       counted: ${{ steps.check.outputs.counted }}
+      # Whether that count came from the raw-numstat fallback (classifier tool
+      # failed) rather than the classifier. The over-cap comment needs it to
+      # describe the number honestly: on the degraded path NOTHING was excluded,
+      # so calling it "after generated-file exclusion" would send an author
+      # hunting for a lockfile that was, in fact, counted.
+      degraded: ${{ steps.check.outputs.degraded }}
     steps:
       - name: Checkout PR head
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -611,8 +618,11 @@ jobs:
         # whole run went green with no review and no signal — indistinguishable
         # from "the panel reviewed this and found nothing" (BE-7646). This
         # annotation + summary is the credential-free half of the signal, so it
-        # reaches fork and Dependabot PRs and consumers with no bot app, where
-        # the sticky comment below cannot post.
+        # reaches Dependabot PRs (whose runs read the Dependabot secret store,
+        # not Actions secrets) and any consumer whose comment write fails. NOT
+        # fork PRs: `gate` sets should_run=false for a cross-repo head before
+        # this job runs at all, so an over-cap fork PR reaches neither half of
+        # the signal — it is skipped for being a fork first.
         if: steps.check.outputs.over_cap == 'true'
         env:
           COUNTED: ${{ steps.check.outputs.counted }}
@@ -695,9 +705,9 @@ jobs:
   # reusable's contract for every caller. The fix here is VISIBILITY, not
   # enforcement.
   #
-  # Isolation: this job checks out NO code at all — it only reads two job
-  # outputs and calls the comments API — so the bot's write-scoped token is
-  # never present in a job that held a PR checkout.
+  # Isolation: this job checks out NO code at all — it only reads job outputs
+  # and calls the comments API — so its write-scoped token is never present in
+  # a job that held a PR checkout.
   over-cap-comment:
     name: Comment when over the diff-size cap
     needs: [gate, diff-size]
@@ -707,23 +717,38 @@ jobs:
     # "over cap" comment about a job that never counted anything. And the job
     # must ALSO run on within-cap runs, because that is the only way a stale
     # over-cap comment ever gets flipped to ✅ once the PR is trimmed.
-    if: always() && needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.result == 'success'
+    #
+    # `!cancelled()` rather than `always()`: the documented caller sets
+    # cancel-in-progress, so a superseded run reaching here would PATCH its
+    # obsolete verdict over the newer run's — and this comment's whole content
+    # is "did a review run", the one thing that must not go stale. The upsert
+    # additionally re-checks the live PR head, which covers the other half
+    # (someone manually re-running an old, uncancelled run).
+    if: ${{ !cancelled() && needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.result == 'success' }}
     runs-on: ubuntu-latest
+    # Bounded like every other job here. The work is two API calls, but the list
+    # paginates over an attacker-growable comment list, so the 6-hour default
+    # would let a rate-limited or hung call hold a runner all day.
+    timeout-minutes: 5
     permissions:
       contents: read
+      # For the GITHUB_TOKEN fallback below. Not a new demand on callers:
+      # `consolidate` already requires this exact scope to post the review, so
+      # every caller that can run this workflow at all already grants it.
+      pull-requests: write
     env:
       # The `secrets` context is unavailable in `if` conditions, so the
       # credentials-present test is evaluated here (job env allows it) and the
-      # steps below gate on the result. With no bot credentials they no-op and
-      # the annotation + step summary from `diff-size` stay the only signal.
+      # mint below gates on the result. Absent creds are NOT the end of the
+      # road any more — the upsert falls back to the run token.
       BOT_CONFIGURED: ${{ inputs.bot_app_id != '' && secrets.BOT_APP_PRIVATE_KEY != '' }}
     steps:
       - name: Mint bot token
         id: bot
         if: env.BOT_CONFIGURED == 'true'
         # Best-effort: a consumer whose bot app lacks the requested scope (or
-        # has creds misconfigured) must degrade to the annotation + summary,
-        # never get a red check from the comment path.
+        # has creds misconfigured) falls back to the run token below, and never
+        # gets a red check from the comment path.
         continue-on-error: true
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
         with:
@@ -739,33 +764,74 @@ jobs:
 
       - name: Upsert sticky over-cap comment
         id: upsert
-        if: steps.bot.outcome == 'success'
         # Same best-effort contract as the mint: a runtime permission failure
         # (e.g. a 403 because the bot app lacks Pull requests on this
         # installation) must not fail the job — "Note degraded mode" reports it.
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          # Dedicated bot identity when configured, else github-actions[bot] —
+          # the same fallback `consolidate` uses to post the review itself.
+          # Without it the sticky half of this fix would never fire for the
+          # (likely majority) of callers that configure no bot app, leaving them
+          # with exactly the silent green run BE-7646 is about.
+          GH_TOKEN: ${{ steps.bot.outputs.token || secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           # The minted token's OWN bot login. app-slug comes from the mint, so
           # it identifies this installation whether bot_app_id was given as a
-          # numeric App ID or a Client ID (`Iv1.…`).
-          BOT_LOGIN: ${{ steps.bot.outputs.app-slug }}[bot]
+          # numeric App ID or a Client ID (`Iv1.…`). Empty when no app is
+          # configured or the mint failed; RUN_LOGIN then carries the identity.
+          BOT_LOGIN: ${{ steps.bot.outputs.app-slug && format('{0}[bot]', steps.bot.outputs.app-slug) || '' }}
+          # The fallback identity. BOTH logins are matched when finding the
+          # sticky comment, because the identity can change between runs (a bot
+          # app added later, or a mint that fails once) and a finder that knew
+          # only the current one would post a second comment beside the old one
+          # and then maintain two contradictory verdicts. Still safe as an
+          # author filter: a PR author cannot post as either login.
+          RUN_LOGIN: github-actions[bot]
           WITHIN_CAP: ${{ needs.diff-size.outputs.within_cap }}
           COUNTED: ${{ needs.diff-size.outputs.counted }}
+          DEGRADED: ${{ needs.diff-size.outputs.degraded }}
         run: |
           set -euo pipefail
+          # Don't let an obsolete run overwrite a newer verdict. `!cancelled()`
+          # covers the cancel-in-progress path; this covers a manual re-run of
+          # an older run, whose event payload still carries the head SHA that
+          # was current when it was queued. Tolerant of a failed lookup (|| true
+          # → empty → proceed): a stale write is worse than a missing one, but a
+          # transient API blip must not silence the notice entirely.
+          LIVE_HEAD="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha' 2>/dev/null || true)"
+          if [ -n "$LIVE_HEAD" ] && [ "$LIVE_HEAD" != "$EVENT_HEAD_SHA" ]; then
+            echo "This run's head (${EVENT_HEAD_SHA}) is no longer the PR head (${LIVE_HEAD}) — a newer run owns the verdict. Not writing."
+            exit 0
+          fi
           # Distinct from the panel's CONSOLIDATED_MARKER (gate-unresolved.py):
           # that one matches PR *reviews*, this one an issue comment, and
           # nothing in cursor-review reads issues/*/comments at all — so the two
           # cannot collide.
           MARKER='<!-- cursor-review-over-cap -->'
           COUNTED_TEXT="${COUNTED:-an unknown number of}"
+          # On the degraded path `counted` is the RAW numstat total — the
+          # classifier never ran, so no generated file was excluded from it.
+          # Describing it as "after generated-file exclusion" there would tell
+          # an author whose lockfile tipped the PR over the cap to go shrink a
+          # number the stated rule says already excludes their lockfile.
+          if [ "${DEGRADED:-}" = "true" ]; then
+            BASIS='raw changed lines; the generated-file classifier failed on this run, so nothing was excluded from the count'
+          else
+            BASIS='changed lines, after generated-file exclusion'
+          fi
           if [ "$WITHIN_CAP" = "true" ]; then
             {
               printf '%s\n\n' "$MARKER"
-              printf '✅ **Now under the cap** — the review panel ran on the latest push.\n'
+              # Deliberately claims only what THIS job knows. It needs just
+              # `gate` + `diff-size`, so it runs alongside the panel and cannot
+              # see whether the panel finished, failed preflight, or was
+              # cancelled — asserting "the panel ran" here would re-create the
+              # false green this whole change exists to kill.
+              # shellcheck disable=SC2016
+              printf '✅ **Now under the cap** — this PR no longer exceeds `diff_size_cap`, so the review is no longer skipped for size. Check this run for the panel'"'"'s result.\n'
             } > body.md
           else
             {
@@ -773,9 +839,17 @@ jobs:
               # The backticks are a markdown code span in the comment body, not
               # a command substitution — single quotes are what keeps them so.
               # shellcheck disable=SC2016
-              printf '⚠️ **Cursor review skipped** — the counted diff (%s changed lines, after generated-file exclusion) exceeds `diff_size_cap` (%s). **No review panel ran on this PR.**\n\n' \
-                "$COUNTED_TEXT" "$DIFF_SIZE_CAP"
-              printf 'Reduce the counted diff or split the PR; the review re-runs automatically on the next push.\n'
+              printf '⚠️ **Cursor review skipped** — the counted diff (%s %s) exceeds `diff_size_cap` (%s). **No review panel ran on this PR.**\n\n' \
+                "$COUNTED_TEXT" "$BASIS" "$DIFF_SIZE_CAP"
+              # NOT "re-runs automatically on the next push": the documented
+              # caller subscribes to `types: [labeled, unlabeled]` only, so a
+              # push fires nothing and the gate only sets should_run on a
+              # `labeled` event (or in run_without_label mode). Telling the
+              # author to push would leave them waiting on a run that never
+              # starts, under a comment that never flips.
+              # shellcheck disable=SC2016
+              printf 'Reduce the counted diff or split the PR, then re-apply the `%s` label to trigger a fresh review. (If this repo runs the review on every push, a push is enough.)\n' \
+                "$REVIEW_LABEL"
             } > body.md
           fi
           # Find our existing sticky comment(s) by the hidden marker, so we
@@ -785,13 +859,15 @@ jobs:
           # deliberately — same hazards, so the same shape rather than a third
           # dialect of it.
           #
-          #   .user.login == our own bot — the marker is published in this
-          #     PUBLIC workflow file, so without an author filter a PR author
-          #     could pre-seed a comment carrying it and we would PATCH THEIRS
-          #     instead of posting ours, after which they rewrite the "no review
-          #     ran" notice freely. Matching the LOGIN (not merely
-          #     `.user.type == "Bot"`) also keeps us off any OTHER app's comment
-          #     that happens to echo author-controlled text as its first line.
+          #   .user.login is one of OUR two possible identities (the bot app, if
+          #     configured, and the run token's github-actions[bot]) — the
+          #     marker is published in this PUBLIC workflow file, so without an
+          #     author filter a PR author could pre-seed a comment carrying it
+          #     and we would PATCH THEIRS instead of posting ours, after which
+          #     they rewrite the "no review ran" notice freely. Matching the
+          #     LOGIN (not merely `.user.type == "Bot"`) also keeps us off any
+          #     OTHER app's comment that happens to echo author-controlled text
+          #     as its first line. Neither login is postable by a human.
           #
           #   startswith, not contains — the body renders the marker as its
           #     FIRST line, while another bot QUOTING this comment carries the
@@ -802,16 +878,22 @@ jobs:
           # which under `set -euo pipefail` plus continue-on-error would become
           # a silent "no comment posted".
           existing="$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" --paginate \
-            | jq -r --arg m "$MARKER" --arg login "$BOT_LOGIN" '
-                .[] | select((.user.login // "") == $login)
+            | jq -r --arg m "$MARKER" --arg login "$BOT_LOGIN" --arg run_login "$RUN_LOGIN" '
+                # $login is "" when no app token was minted; the != "" guard
+                # keeps that empty string from matching a login-less comment.
+                .[] | select(($login != "" and (.user.login // "") == $login)
+                             or (.user.login // "") == $run_login)
                     | select((.user.type // "") == "Bot")
                     | select(((.body // "") | startswith($m)))
                     | .id')"
           if [ -n "$existing" ]; then
             # Update EVERY match, not just the first: the find-then-post is
-            # check-then-act with no lock, and the documented caller subscribes
-            # to labeled/unlabeled alongside synchronize, so a push racing a
-            # label toggle can leave two comments. Taking `head -n1` would pin
+            # check-then-act with no lock, so two runs that both list before
+            # either posts leave two comments — reachable for a caller that adds
+            # `synchronize` to its `types:` (or runs in run_without_label mode),
+            # where a push can race a label toggle into a different concurrency
+            # group. Updating every copy keeps the duplicates in AGREEMENT
+            # instead of split-brained. Taking `head -n1` would pin
             # one forever while the other displayed a stale verdict — and here a
             # stale verdict says a review did or did not run, which is the whole
             # point of the comment. Unquoted on purpose: the ids are numeric and
@@ -856,24 +938,26 @@ jobs:
           fi
 
       - name: Note degraded mode
-        # Covers every path where no comment is posted, so the job never goes
-        # green silently: "creds absent" (mint skipped), "mint failed" (mint
-        # errored), "post failed" (upsert ran but failed at runtime). The
+        # The upsert no longer depends on the bot app — it falls back to the run
+        # token — so the only way no comment is written is the upsert itself
+        # failing. Reported here so the job never goes green silently; the
         # ::warning:: annotation and step summary from the diff-size job remain
-        # the signal in every one of those cases.
-        if: steps.bot.outcome != 'success' || steps.upsert.outcome == 'failure'
+        # the signal in that case. A failed MINT alone is not degraded mode (the
+        # run token covered it), but it is worth naming, since it changes which
+        # identity authored the comment.
+        if: steps.upsert.outcome == 'failure' || steps.bot.outcome == 'failure'
         env:
           BOT_OUTCOME: ${{ steps.bot.outcome }}
           UPSERT_OUTCOME: ${{ steps.upsert.outcome }}
           WITHIN_CAP: ${{ needs.diff-size.outputs.within_cap }}
         run: |
-          if [ "$UPSERT_OUTCOME" = "failure" ]; then
-            echo "Sticky comment NOT written: the upsert failed at runtime — see the 'Upsert sticky over-cap comment' step log above for the actual error (a network/5xx failure, a GitHub rate limit, or a permission 403 on an installation that has not granted Pull requests: write)."
-          elif [ "$BOT_OUTCOME" = "failure" ]; then
-            echo "Sticky comment NOT written: the bot app token could not be minted for this repo."
-          else
-            echo "Sticky comment NOT written: no bot credentials configured (bot_app_id and/or BOT_APP_PRIVATE_KEY are unset)."
+          if [ "$BOT_OUTCOME" = "failure" ]; then
+            echo "Bot app token could not be minted for this repo — the run token (github-actions[bot]) was used instead."
           fi
+          if [ "$UPSERT_OUTCOME" != "failure" ]; then
+            exit 0
+          fi
+          echo "Sticky comment NOT written: the upsert failed at runtime — see the 'Upsert sticky over-cap comment' step log above for the actual error (a network/5xx failure, a GitHub rate limit, or a 403 from a token without Pull requests: write on this repo)."
           if [ "$WITHIN_CAP" != "true" ]; then
             echo "This PR is OVER diff_size_cap and got no review panel — the ::warning:: annotation and step summary on the 'Diff size check' job are the signal."
           else

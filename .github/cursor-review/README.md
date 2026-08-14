@@ -204,17 +204,21 @@ A PR whose counted diff exceeds `diff_size_cap` gets **no review panel**, and
 that skip is not a failure — the run is green either way. So it announces itself
 rather than passing for a clean review: the *Diff size check* job emits a
 `::warning::` annotation and a step-summary block naming the counted total and
-the cap (both credential-free, so they reach fork and Dependabot PRs too), and a
-separate `over-cap-comment` job upserts one sticky PR comment saying no panel
-ran. Get the PR under the cap and the next run flips that same comment to ✅
-instead of stacking a second one; it never posts on a PR that was under the cap
-all along.
+the cap (both credential-free, so they reach Dependabot PRs, whose runs can't
+read Actions secrets), and a separate `over-cap-comment` job upserts one sticky
+PR comment saying no panel ran. Get the PR under the cap and re-trigger, and
+that same comment flips to ✅ instead of stacking a second one; it never posts on
+a PR that was under the cap all along. Neither half reaches a **fork** PR — the
+gate skips a cross-repo head before the size check runs at all, so a fork PR is
+skipped for being a fork, not for its size.
 
-The comment needs the bot app (`bot_app_id` + `BOT_APP_PRIVATE_KEY`). Without it
-— or if the token mint or the API write fails — the job degrades silently to the
-annotation + summary and logs which case applied. Mint and upsert are both
-`continue-on-error`: the size verdict lives in the `diff-size` job, so the
-comment path can never redden a run.
+The comment posts as the bot app when one is configured (`bot_app_id` +
+`BOT_APP_PRIVATE_KEY`) and as `github-actions[bot]` otherwise, so it works in the
+default configuration; the sticky finder matches both logins, so switching
+identities updates the existing comment rather than posting a second one. If the
+API write fails the job degrades to the annotation + summary and logs why. Mint
+and upsert are both `continue-on-error`: the size verdict lives in the
+`diff-size` job, so the comment path can never redden a run.
 
 ### Escape hatches
 
