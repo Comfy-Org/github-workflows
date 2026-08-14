@@ -50,7 +50,9 @@ PR gets the `cursor-review` label
 ```
 
 Slack start/complete DMs to the triggerer are sent alongside (optional —
-skipped if no Slack token is configured).
+skipped if no Slack token is configured). A skip for the diff-size cap is
+announced on the PR rather than passing for a clean review — see [Over the
+diff-size cap](#over-the-diff-size-cap).
 
 ### The panel
 
@@ -195,6 +197,24 @@ All optional except `workflows_ref` (required, no default) — pass them under
 
 There is **no `blocking` input** — see [the regression note
 above](#the-blocking-gate-is-currently-not-available-regressed).
+
+### Over the diff-size cap
+
+A PR whose counted diff exceeds `diff_size_cap` gets **no review panel**, and
+that skip is not a failure — the run is green either way. So it announces itself
+rather than passing for a clean review: the *Diff size check* job emits a
+`::warning::` annotation and a step-summary block naming the counted total and
+the cap (both credential-free, so they reach fork and Dependabot PRs too), and a
+separate `over-cap-comment` job upserts one sticky PR comment saying no panel
+ran. Get the PR under the cap and the next run flips that same comment to ✅
+instead of stacking a second one; it never posts on a PR that was under the cap
+all along.
+
+The comment needs the bot app (`bot_app_id` + `BOT_APP_PRIVATE_KEY`). Without it
+— or if the token mint or the API write fails — the job degrades silently to the
+annotation + summary and logs which case applied. Mint and upsert are both
+`continue-on-error`: the size verdict lives in the `diff-size` job, so the
+comment path can never redden a run.
 
 ### Escape hatches
 
