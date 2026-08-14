@@ -38,9 +38,21 @@ jobs:
       # Keep the assets ref in lock-step with the `uses:` ref above.
       workflows_ref: 732100bee739ef94fe650016b382a78b377c0af7
       # No vendored/generated content in this repo; defensive excludes only.
-      diff_excludes: >-
-        :!**/*-lock.json
-        :!**/dist/**
+      # These live in extra_generated_globs, not diff_excludes: since BE-7633
+      # diff_excludes leaves the reviewed diff but is still COUNTED against
+      # diff_size_cap, so it is the back-compat escape hatch, not the knob to
+      # model. Supplying this input REPLACES the default list, so the six
+      # defaults are restated verbatim before this repo's own `*-lock.json`
+      # (only `package-lock.json` is a classifier built-in). Plain globs, not
+      # git pathspecs — no `:!` prefix.
+      extra_generated_globs: >-
+        **/node_modules/**
+        **/dist/**
+        **/vendor/**
+        **/*.generated.*
+        **/*.min.js
+        **/*.min.css
+        **/*-lock.json
     secrets:
       CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
       SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
