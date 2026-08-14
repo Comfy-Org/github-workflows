@@ -134,7 +134,7 @@ class TestBytesArePreserved(unittest.TestCase):
             with open(diff, "wb") as f:
                 f.write(body)
             rc = fd.main(
-                ["emit", "--diff", diff, "--label", "DIFF", "--nonce", _NONCE, "--out", out]
+                ["emit", "--body", diff, "--label", "DIFF", "--nonce", _NONCE, "--out", out]
             )
             self.assertEqual(rc, 0)
             with open(out, "rb") as f:
@@ -163,7 +163,12 @@ class TestBytesArePreserved(unittest.TestCase):
 
 class TestFenceInputValidation(unittest.TestCase):
     def test_hunks_labels_are_accepted(self):
-        for label in ("DIFF", "HUNKS NEW SINCE ROUND 3", "HUNKS NEW SINCE ROUND ?"):
+        for label in (
+            "DIFF",
+            "PANEL FINDINGS",
+            "HUNKS NEW SINCE ROUND 3",
+            "HUNKS NEW SINCE ROUND ?",
+        ):
             with self.subTest(label=label):
                 self.assertEqual(
                     fd.open_fence(label, _NONCE), "=== BEGIN %s %s ===" % (label, _NONCE)
@@ -182,8 +187,55 @@ class TestFenceInputValidation(unittest.TestCase):
                     fd.open_fence("DIFF", nonce)
 
     def test_the_workflow_nonce_shape_is_accepted(self):
-        """`openssl rand -hex 16` — 32 lowercase hex characters."""
-        self.assertTrue(fd.NONCE_RE.match("0f" * 16))
+        """`mint` — 32 lowercase hex characters."""
+        self.assertTrue(fd.NONCE_RE.fullmatch("0f" * 16))
+
+    def test_a_trailing_newline_cannot_smuggle_itself_into_a_fence(self):
+        """`re.match` + `$` would accept these; `fullmatch` must not.
+
+        In Python `$` also matches just before a trailing newline, so a nonce of
+        `"<32 hex>\\n"` (or a label of `"DIFF\\n"`) would validate and then split
+        the fence line in two, leaving the region with no single-line close
+        fence — exactly the whitespace smuggling the alphabet restriction is
+        supposed to rule out.
+        """
+        with self.assertRaises(SystemExit):
+            fd.open_fence("DIFF", _NONCE + "\n")
+        with self.assertRaises(SystemExit):
+            fd.close_fence("DIFF", _NONCE + "\n")
+        for label in ("DIFF\n", "HUNKS NEW SINCE ROUND 3\n"):
+            with self.subTest(label=label):
+                with self.assertRaises(SystemExit):
+                    fd.open_fence(label, _NONCE)
+
+
+# --------------------------------------------------------------------------- #
+# 3b. mint: every prompt gets its OWN nonce                                    #
+# --------------------------------------------------------------------------- #
+
+
+class TestMint(unittest.TestCase):
+    def test_mint_returns_a_valid_fence_nonce(self):
+        nonce = fd.mint_nonce()
+        self.assertTrue(fd.NONCE_RE.fullmatch(nonce))
+        self.assertEqual(len(nonce), 2 * fd.NONCE_BYTES)
+
+    def test_each_call_mints_a_distinct_nonce(self):
+        """The panel cells and the judge each mint their own.
+
+        A shared nonce is what would let a steered panel model launder the
+        judge's fence token out of its own prompt and into `panel.json`, which
+        the judge splices in ABOVE the diff.
+        """
+        self.assertEqual(len({fd.mint_nonce() for _ in range(32)}), 32)
+
+    def test_cli_mint_prints_one_bare_nonce(self):
+        """`nonce="$(fence-diff.py mint)"` — nothing else on stdout."""
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(fd.main(["mint"]), 0)
+        self.assertTrue(fd.NONCE_RE.fullmatch(buf.getvalue().strip()))
+        self.assertEqual(buf.getvalue().count("\n"), 1)
 
 
 # --------------------------------------------------------------------------- #
@@ -197,6 +249,13 @@ class TestStripMarker(unittest.TestCase):
             ("instructions\n\n=== BEGIN DIFF ===\n", "instructions\n\n"),
             ("=== BEGIN DIFF ===\n", ""),
             ("instructions\n=== BEGIN DIFF ===", "instructions\n"),
+            # Trailing whitespace after the anchor still counts as "ends with
+            # the marker". Leaving it would keep a STALE un-nonce'd opener in
+            # the prompt ahead of the nonce'd one — an opener a forged
+            # `=== END DIFF ===` inside the diff body could pair with.
+            ("instructions\n=== BEGIN DIFF ===\n\n", "instructions\n"),
+            ("instructions\n=== BEGIN DIFF ===   \n", "instructions\n"),
+            ("instructions\r\n=== BEGIN DIFF ===\r\n", "instructions\r\n"),
         ]
         for text, expected in cases:
             with self.subTest(text=text):
@@ -211,6 +270,20 @@ class TestStripMarker(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertEqual(fd.strip_trailing_marker(text, _MARKER), text)
+
+    def test_an_anchorless_head_still_gets_a_trailing_newline(self):
+        """Otherwise `cat head` glues the opening fence onto the last line.
+
+        `build-ledger.py`'s degraded append path returns `prompt_text + "\\n" +
+        block` with the block's trailing newlines stripped — a head with NO
+        trailing newline. The workflow `cat`s that straight before the opening
+        fence, so without this the prompt reads `…LEDGER ===== BEGIN DIFF
+        <nonce> ===` and the diff has no valid opening marker line at all.
+        """
+        head = fd.strip_trailing_marker("instructions\n=== PRIOR LEDGER ===", _MARKER)
+        self.assertEqual(head, "instructions\n=== PRIOR LEDGER ===\n")
+        prompt = head + fd.fence_block(b"+x\n", "DIFF", _NONCE).decode("utf-8")
+        self.assertIn("\n" + fd.open_fence("DIFF", _NONCE) + "\n", prompt)
 
     def test_cli_strip_marker_rewrites_the_head_in_place(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -239,6 +312,23 @@ class TestStripMarker(unittest.TestCase):
         prompt = head_text + fd.fence_block(b"+x\n", "DIFF", _NONCE).decode("utf-8")
         self.assertIn(fd.open_fence("DIFF", _NONCE), prompt)
 
+    def test_cli_warns_and_still_terminates_an_anchorless_head(self):
+        """The warn path must not skip the trailing-newline repair."""
+        with tempfile.TemporaryDirectory() as tmp:
+            head = os.path.join(tmp, "prompt-head.txt")
+            with open(head, "w", encoding="utf-8") as f:
+                f.write("no anchor and no trailing newline")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = fd.main(["strip-marker", "--file", head, "--marker", _MARKER])
+            self.assertEqual(rc, 0)
+            self.assertIn("::warning::", buf.getvalue())
+            with open(head, encoding="utf-8") as f:
+                head_text = f.read()
+        self.assertEqual(head_text, "no anchor and no trailing newline\n")
+        prompt = head_text + fd.fence_block(b"+x\n", "DIFF", _NONCE).decode("utf-8")
+        self.assertIn("\n" + fd.open_fence("DIFF", _NONCE) + "\n", prompt)
+
 
 # --------------------------------------------------------------------------- #
 # 5. The real prompt files still carry the anchor the workflow strips          #
@@ -256,6 +346,23 @@ class TestRealPrompts(unittest.TestCase):
                 self.assertIn(_MARKER, text)
                 self.assertEqual(text.rstrip("\n").rsplit("\n", 1)[-1], _MARKER)
                 self.assertEqual(fd.strip_trailing_marker(text, _MARKER), text[: -len(_MARKER) - 1])
+
+    def test_the_judge_prompt_ends_with_its_own_splice_anchor(self):
+        """`=== BEGIN PANEL FINDINGS ===` — spliced on, then re-emitted nonce'd.
+
+        The panel-findings block is model output derived from the untrusted
+        diff, so it gets the same treatment as the diff itself.
+        """
+        anchor = "=== BEGIN PANEL FINDINGS ==="
+        with open(os.path.join(_ASSETS, "prompt-judge.md"), encoding="utf-8") as f:
+            text = f.read()
+        self.assertEqual(text.rstrip("\n").rsplit("\n", 1)[-1], anchor)
+        self.assertEqual(fd.strip_trailing_marker(text, anchor), text[: -len(anchor) - 1])
+        # And the label the workflow re-emits it under is a legal fence label.
+        self.assertEqual(
+            fd.open_fence("PANEL FINDINGS", _NONCE),
+            "=== BEGIN PANEL FINDINGS %s ===" % _NONCE,
+        )
 
     def test_every_prompt_labels_the_diff_as_untrusted_data(self):
         for filename in ("prompt-adversarial.md", "prompt-edge-case.md", "prompt-judge.md"):
