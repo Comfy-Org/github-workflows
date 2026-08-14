@@ -32,6 +32,10 @@ bash .github/bump-callers/tests/test_bump_callers.sh
 bash .github/bump-callers/tests/test_preflight.sh
 bash .github/bump-callers/tests/test_paths_contract.sh
 
+# pr-derisk planner/renderer suite + lint (model stubbed; no network, no API key)
+shellcheck -x scripts/pr-derisk/*.sh scripts/pr-derisk/tests/*.sh
+bash scripts/pr-derisk/tests/test_plan_derisk.sh
+
 # workflow-pins lint (no reusable workflow may default `workflows_ref`) + its tests
 python3 -m unittest discover -s .github/workflow-pins/tests -p 'test_*.py' && python3 .github/workflow-pins/check_workflow_pins.py
 
@@ -88,8 +92,14 @@ tests — run the matching command above for whatever you touched.
   ahead of it — `proceed` / `new_sha` step outputs, `WATCHED` +
   `WATCHED_ASSETS` inputs, plus `WATCHED_PATHSPECS` (BE-6676; the excluding
   fleets: pr-risk, and pr-size/cursor-review since BE-7084) + `WATCHED_EXEC`
-  (the per-executed-file fleet: pr-risk). Watched inputs MUST
+  (the per-executed-file fleets: pr-risk, pr-derisk). Watched inputs MUST
   mirror that fleet's `paths:` filter, exclusions included. Tests in `tests/`.
+- `scripts/pr-risk/` + `scripts/pr-derisk/` — the two rungs of the PR risk ladder.
+  v0 grades (`grade-pr-risk.sh`, deterministic — **no LLM in the grading path; keep it
+  that way**); v1 plans a split on `/derisk` (`plan-derisk.sh`), the ONLY place a model
+  runs, and every floor it shows is computed by v0's grader over a synthetic record,
+  never claimed by the model. A pr-derisk caller executes BOTH trees at its pinned ref
+  — hence its bump fleet watching `scripts/pr-risk/**`. Tests in each `tests/`.
 - `README.md` — the public workflow catalog: per-workflow purpose, the SHA-pin
   usage pattern, and the versioning policy. Keep its table in sync when you add
   a workflow.
@@ -111,6 +121,11 @@ tests — run the matching command above for whatever you touched.
   creds; briefs live in `.github/groom/`. Opt-in auto-builder (`builder: true`,
   BE-4003) turns the top CONFIRMED findings into review-gated PRs (never
   auto-merged) via a credential-free patch job + a separate bot PR job.
+- `pr-derisk.yml` — on-demand `/derisk` comment command (beta, off by default): re-grade
+  the PR, ONE model call for a split partition, floors computed by `grade-pr-risk.sh
+  --stdin`, one sticky advisory comment. Nothing gated, routed or filed; safe as a comment
+  command because `issue_comment` runs from the default branch, the commenter is
+  association-gated, and no PR code is checked out.
 - `agents-md-integrity.yml` — enforces the AGENTS.md standard on the caller repo.
 - `assign-reviewers.yml` — expertise-aware, load-balanced reviewer requests.
 - `refresh-reviewers.yml` — scheduled drift-detector: recomputes the caller's
@@ -123,10 +138,11 @@ tests — run the matching command above for whatever you touched.
   detector audits it. Do not re-add a `ci-detect-unreviewed-merge.yml` caller.
 - `bump-cursor-review-callers.yml` / `bump-auto-label-callers.yml` /
   `bump-agents-md-callers.yml` / `bump-pr-size-callers.yml` /
-  `bump-pr-risk-callers.yml` / `bump-assign-reviewers-callers.yml` /
+  `bump-pr-risk-callers.yml` / `bump-pr-derisk-callers.yml` /
+  `bump-assign-reviewers-callers.yml` /
   `bump-groom-callers.yml` / `bump-detect-unreviewed-merge-callers.yml` — thin
-  entrypoints over `bump-callers.sh` that fan SHA bumps out to consumers. A groom
-  or pr-risk caller pins TWICE (`uses:` + `workflows_ref:`); the shared rewrite
+  entrypoints over `bump-callers.sh` that fan SHA bumps out to consumers. A
+  groom, pr-risk or pr-derisk caller pins TWICE (`uses:` + `workflows_ref:`); the shared rewrite
   moves both, so never hand-bump one alone. `stale.yml` and
   `assign-prs-to-author.yml` have no fleet because they have no callers;
   `detect-unreviewed-merge.yml`'s fleet is
@@ -145,7 +161,7 @@ tests — run the matching command above for whatever you touched.
 - **Public repo — never leak private caller names.** Consumer repo lists live in
   repo **secrets** — one per fleet (`CURSOR_REVIEW_CALLERS`,
   `AUTO_LABEL_CALLERS`, `AGENTS_MD_CALLERS`, `PR_SIZE_CALLERS`,
-  `PR_RISK_CALLERS`, `ASSIGN_REVIEWERS_CALLERS`, `GROOM_CALLERS`,
+  `PR_RISK_CALLERS`, `PR_DERISK_CALLERS`, `ASSIGN_REVIEWERS_CALLERS`, `GROOM_CALLERS`,
   `DETECT_UNREVIEWED_MERGE_CALLERS`; the bump-callers README table is canonical)
   — never hardcoded in a workflow file or printed to run logs (logs are public).
   Secrets, not variables (BE-6472): a variable passed via a step's `env:` prints

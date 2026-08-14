@@ -1,0 +1,607 @@
+name: PR De-risk Plan (reusable)
+
+# Reusable ON-DEMAND de-risk planner — rung v1 of the PR risk ladder, and the first rung with a
+# model in it. Someone comments `/derisk` on a pull request; this workflow re-grades that PR with
+# the pr-risk grader, asks ONE model call for a semantic PARTITION of the diff into a chain of
+# 2–5 sequential pull requests, has the ACTUAL grader compute the path floor of every proposed
+# step, and posts the result as one sticky advisory comment.
+#
+# NOTHING IS GATED, ROUTED, MERGED OR FILED. The comment is the entire product. It is a
+# suggestion an author acts on or ignores; there is no check, no label, no ticket, and no
+# behaviour anywhere downstream keys on it.
+#
+# ── WHY THE MODEL CANNOT STATE A TIER ──────────────────────────────────────────────────────────
+# `grade = worst(path_floor, provenance, reversibility)` is deterministic, and
+# `grade-pr-risk.sh --stdin` grades synthetic records with no network — so every proposed split's
+# path floor is computable by the same judge that graded the PR. The model proposes WHICH FILES GO
+# TOGETHER and nothing else; each floor shown is recomputed from those files, and any tier the
+# model wrote is discarded before the comment is rendered. That is what keeps this rung from being
+# an LLM guessing at grades, and it is why the grader itself stays LLM-free: pr-risk's grading path
+# is unchanged by this workflow existing.
+#
+# ── OFF BY DEFAULT, EVERYWHERE ─────────────────────────────────────────────────────────────────
+# `enabled:` defaults to false and `vars.DERISK_CONFIG` on the calling repo overrides it in both
+# directions — the same two-layer switch pr-risk uses, and the same degrade direction (a malformed
+# variable falls back to the reviewed input, never to off). A repo that has not opted in gets a
+# skipped run and no comment.
+#
+# ── THE TRUST BOUNDARY, WHICH IS DIFFERENT FROM pr-risk's ──────────────────────────────────────
+# An `issue_comment` workflow always runs from the DEFAULT BRANCH of the calling repo, so a pull
+# request cannot edit the workflow that serves it — which is what makes a comment command safe to
+# hold `pull-requests: write` and a secret at all. Three further boundaries stack on that:
+#
+#   * THE COMMENTER IS GATED. Only `author_association` in OWNER / MEMBER / COLLABORATOR (the
+#     caller may narrow it) can spend the model call. `author_association` is a property of the
+#     COMMENT the API attributes, not a string the commenter writes, so it is not forgeable from a
+#     PR. A comment from anyone else skips the run: no plan, no comment, no spend.
+#   * NO PR CODE IS EVER CHECKED OUT. The diff is READ over the API and handed to a model as
+#     text. Nothing in it executes, nothing is built, and the only write anywhere in the run is
+#     one PR comment.
+#   * THE TOOL COMES FROM A PINNED, MERGED-UPSTREAM COMMIT OF THIS REPO. `workflows_ref` carries
+#     no default, its SHAPE (full 40-hex lowercase SHA) and its ANCESTRY (reachable from
+#     Comfy-Org/github-workflows `main`) are both enforced before any checkout, in EVERY job that
+#     checks it out. The guard is byte-identical to pr-risk.yml's and
+#     scripts/pr-derisk/tests/test_plan_derisk.sh fails the build if the two ever drift.
+#
+# PROMPT INJECTION IS CONTAINED BY SHAPE, not by asking the model nicely: untrusted diff in,
+# advisory comment out. The worst a crafted diff can do is talk the planner into a silly partition,
+# which is then rejected outright unless it covers the changed-file set exactly. Filing tickets
+# from a plan is rung v2 and is deliberately NOT here — it will be its own explicit command.
+#
+# ── FAILURE MODES ARE OUTCOMES, NOT SILENCE ────────────────────────────────────────────────────
+# Someone typed a command and is waiting, so every path ends in a comment: an over-budget diff
+# takes the deterministic fallback ("too large to plan", pointing back at the v0 reducibility
+# readout on the grade), a partition that cannot be validated in two attempts falls back the same
+# way, and a model or API failure posts an explicit failure comment. The one thing that never
+# happens is a run that quietly does nothing.
+#
+# SECRETS: `anthropic_api_key` — required, and used by exactly one step (the planner's single
+# HTTPS POST). No PR code runs in the job that holds it.
+#
+# ── CALLER PATTERN ─────────────────────────────────────────────────────────────────────────────
+# `issue_comment` fires on every comment in the repo, including plain issues, so the caller-side
+# `if:` is what keeps the run count sane. The reusable re-asserts the same conditions itself, so a
+# caller that forgets one is not thereby unguarded — it just boots a runner to skip.
+#
+#   name: PR de-risk
+#   on:
+#     issue_comment:
+#       types: [created]
+#   permissions: {}
+#   concurrency:
+#     # Per PR, and NOT cancel-in-progress: two `/derisk` comments in a row should queue, because
+#     # cancelling the first leaves the reader with a comment from a run that was killed mid-write.
+#     group: pr-derisk-${{ github.event.issue.number }}
+#     cancel-in-progress: false
+#   jobs:
+#     derisk:
+#       if: >-
+#         github.event.issue.pull_request &&
+#         startsWith(github.event.comment.body, '/derisk')
+#       uses: Comfy-Org/github-workflows/.github/workflows/pr-derisk.yml@<40-hex SHA>  # v1
+#       with:
+#         enabled: true
+#         workflows_ref: <the SAME 40-hex SHA>
+#       secrets:
+#         anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+#       permissions:
+#         contents: read
+#         pull-requests: write
+#         checks: read
+#         actions: read
+#         statuses: read
+#
+# THE PERMISSION BLOCK IS THE UNION OF EVERY JOB'S, INCLUDING JOBS A RUN WILL SKIP. GitHub
+# validates each nested job's declaration against the caller's block at startup, before any job
+# `if:` is evaluated — so every grant above is required whatever `enabled:` is set to. The three
+# read grants are the check-rollup traversal the grader's reversibility axis needs; `contents:
+# read` reads the consumer's `.github/risk.json` override from the PR's base ref.
+
+on:
+  workflow_call:
+    inputs:
+      workflows_ref:
+        description: >-
+          Ref of Comfy-Org/github-workflows to load the planner, the renderer and
+          the pr-risk grader from. REQUIRED, and pin it to the SAME full commit
+          SHA you pin `uses:` to. There is deliberately no default: a floating
+          default lets a caller SHA-pin `uses:` and then download the tool from
+          HEAD of main, so the two halves of one tool drift apart and the logic
+          stays mutable after review.
+
+
+          ITS SHAPE AND ITS ANCESTRY ARE BOTH ENFORCED before any checkout, in
+          every job that checks it out: exactly 40 lowercase hex characters, and
+          reachable from `main` of Comfy-Org/github-workflows. Shape alone proves
+          the ref is IMMUTABLE, never WHICH repository authored the commit — a
+          fork of this PUBLIC repo shares its object store — so merged upstream
+          history, and nothing else, may be pinned. The guard is byte-identical
+          to the one in pr-risk.yml; see that file's header for the full
+          rationale, the retry policy and the two residuals (a stale-but-merged
+          pin, and a fork commit that edits this file) that only REVIEW OF THE
+          CALLER can bound.
+
+
+          CALL IT DIRECTLY — a nested `workflow_call` chain through an org
+          wrapper is NOT supported: the wrapper's own pin and this input name
+          different files, and nothing reconciles them.
+        type: string
+        required: true
+      enabled:
+        description: >-
+          Whether `/derisk` does anything on this repository. DEFAULTS TO FALSE:
+          enrolling this workflow and switching it on are two separate decisions.
+          When it resolves false the command is a no-op — nothing is graded, no
+          model call is made, and any `/derisk` comment already on the pull
+          request is left exactly as the last enabled run left it.
+
+
+          `vars.DERISK_CONFIG` on the CALLING repo OVERRIDES this in both
+          directions — `{"enabled": true}` switches a caller on with no `with:`
+          change, and `{"enabled": false}` is a kill switch that needs no PR at
+          all. A malformed variable degrades to THIS value and says so in an
+          annotation; it must never be the reason a repo silently stops
+          answering.
+
+
+          UNLIKE pr-risk THERE IS NO DISPATCH EXEMPTION, because there is nothing
+          to exempt: every run of this workflow is already an explicit,
+          attributed act by someone with write access. This input is the only
+          switch.
+        type: boolean
+        required: false
+        default: false
+      command:
+        description: >-
+          The comment prefix that triggers a plan. Matched with
+          `startsWith`, so `/derisk please` works and a comment that merely
+          MENTIONS `/derisk` mid-sentence does not.
+        type: string
+        required: false
+        default: '/derisk'
+      allowed_associations:
+        description: >-
+          Comma-separated `author_association` values permitted to spend the
+          model call. Defaults to the three that mean "has write access or is in
+          the org". NARROW IT, never widen it: `CONTRIBUTOR` and `NONE` are
+          anyone with a GitHub account, and this command costs money.
+        type: string
+        required: false
+        default: 'OWNER,MEMBER,COLLABORATOR'
+      model:
+        description: >-
+          The Anthropic model id used for the single planning call. The partition
+          is a judgement about a whole diff, so the default is the most capable
+          model — the call happens once, on demand, on a pull request someone
+          explicitly asked about.
+        type: string
+        required: false
+        default: 'claude-opus-5'
+      max_steps:
+        description: >-
+          Ceiling on the proposed chain length. A plan with more steps than this
+          is rejected and re-prompted like any other invalid partition — a chain
+          nobody will actually open is not a plan.
+        type: number
+        required: false
+        default: 5
+      max_diff_bytes:
+        description: >-
+          Diff budget. A diff over it takes the DETERMINISTIC FALLBACK — the
+          comment says the PR is too large to plan against and points back at the
+          v0 reducibility readout on the grade. Deliberately not a truncation:
+          planning off the half of a diff that fit produces a partition that
+          silently ignores files it never saw.
+        type: number
+        required: false
+        default: 200000
+      repo_map_path:
+        description: Path to the consumer's risk-map override, read from the PR's BASE ref.
+        type: string
+        required: false
+        default: '.github/risk.json'
+      repo_runbooks_path:
+        description: Path to the consumer's runbook-registry override, read from the PR's BASE ref.
+        type: string
+        required: false
+        default: '.github/risk-runbooks.json'
+      fleet_logins:
+        description: Forwarded to the grader — logins treated as supervised agents. Same meaning as in pr-risk.yml.
+        type: string
+        required: false
+        default: ''
+      bot_logins:
+        description: Forwarded to the grader — extra logins treated as bots. Same meaning as in pr-risk.yml.
+        type: string
+        required: false
+        default: ''
+    secrets:
+      anthropic_api_key:
+        description: >-
+          Anthropic API key for the single planning call. Required — there is no
+          deterministic planner to fall back to, and a workflow that silently
+          skipped the plan on a missing key would look identical to one that
+          found nothing to split.
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Resolve enablement and the commenter gate before anything is read, spent, or written. Its own
+  # job rather than a first step of `plan` so a disabled repo — or a comment from someone without
+  # write access — pays one bare runner instead of booting the job that holds the API key. It has
+  # NO token scopes: it reads its inputs, the caller's variable, and the event payload.
+  gate:
+    name: Resolve enablement
+    # The same three conditions the caller's `if:` should carry, re-asserted here so a caller that
+    # forgets one is not thereby unguarded. `author_association` is what the API attributed to the
+    # comment, not text the commenter wrote, so it cannot be forged from inside a pull request.
+    if: >-
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, inputs.command) &&
+      contains(format('{0},', inputs.allowed_associations), format('{0},', github.event.comment.author_association))
+    runs-on: ubuntu-latest
+    # 10, not 5: the ancestry guard below makes two unauthenticated fetches, each up to 3 attempts
+    # at a 40s wall-clock cap plus 15s of backoff, sequentially — ~270s worst case before the tool
+    # checkout even starts.
+    timeout-minutes: 10
+    permissions: {}
+    outputs:
+      enabled: ${{ steps.resolve.outputs.enabled }}
+    steps:
+      - name: Enforce workflows_ref pin contract
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+        run: |
+          set -euo pipefail
+          # Never interpolate a raw value into a `::error::`. A multi-line value — exactly what the
+          # length/character test below exists to catch — would end the annotation at the first
+          # newline and leave the remainder to be re-parsed by the runner as workflow commands
+          # (`::add-mask::`, `::stop-commands::`, a forged `::notice::`) in a PUBLIC log. Anything
+          # outside the ref alphabet becomes `?` and the result is truncated, so what is echoed is
+          # always one bounded line.
+          safe_ref=$(printf '%s' "$WORKFLOWS_REF" | tr -c 'A-Za-z0-9._/-' '?')
+          safe_ref=${safe_ref:0:64}
+          # LENGTH + CHARACTER CLASS, not `grep -Eq '^[0-9a-f]{40}$'` and not `[[ =~ ]]`: both raise
+          # an anchoring question this form does not have. `grep` anchors `^…$` per LINE, so a
+          # multi-line value carrying one SHA-shaped line passes it and is then handed to checkout
+          # in full; `[[ =~ ]]` anchors the whole string, but whether `$` may ALSO match just before
+          # a trailing newline is a libc-dependent detail no trust boundary should rest on. A length
+          # test plus "contains a character outside [0-9a-f]" has no anchors at all — a newline, a
+          # space or an uppercase letter is simply a character outside the class.
+          #
+          # LOWERCASE ONLY, deliberately. The value is handed to `actions/checkout` VERBATIM, so
+          # accepting a spelling the fetch may not resolve would trade this step's clear message for
+          # an obscure failure one step later — the opposite of the point. Everything that emits a
+          # SHA (`git rev-parse`, `gh`, the REST API, the UI) emits lowercase, so a false reject
+          # here is loud and fixed by lowercasing.
+          if [[ ${#WORKFLOWS_REF} -ne 40 || "$WORKFLOWS_REF" == *[!0-9a-f]* ]]; then
+            echo "::error::workflows_ref must be the FULL 40-hex lowercase commit SHA of Comfy-Org/github-workflows (got '${safe_ref}'). Pin it to the SAME SHA you pin uses: to — see the pr-risk.yml header. Branches, tags and refs/pull/N/head are mutable (and PR-head refs resolve fork-authored code), so they are rejected before the tool checkout."
+            exit 1
+          fi
+          # SECOND AXIS — ANCESTRY. Shape proves the value is IMMUTABLE; it does not prove WHICH
+          # REPOSITORY authored the commit it names. A fork of this PUBLIC repo shares the upstream
+          # object store, and GitHub serves a fork PR's head objects from THIS repo's URL to an
+          # UNAUTHENTICATED client — so a fork-authored 40-hex SHA passes the shape test above and is
+          # then handed to `actions/checkout` and run inside a job holding the caller's write token.
+          # Assert instead that the commit is REACHABLE FROM UPSTREAM `main`: merged upstream history,
+          # and nothing else, may be pinned. There is deliberately NO opt-out input for this — an
+          # opt-out would be set by the very pin-bump PR the check exists to distrust.
+          #
+          # THE URL IS A LITERAL ON PURPOSE. Inside a reusable workflow `github.repository` names the
+          # CALLER, and `github.job_workflow_ref` only repeats the `uses:` string the caller wrote, so
+          # no context can supply this repo's identity. A variable here would be an alias a fork could
+          # point back at itself — the exact class of bug this axis closes. Unauthenticated is correct
+          # (the repo is public), and every failure mode fails CLOSED: a fetch that errors, a `main`
+          # that cannot be read, or a network outage all leave the step non-zero.
+          #
+          # TWO FETCHES, NOT ONE, AND BOTH ARE BOUNDED. The depth-1 fetch is what proves the SHA
+          # exists in this repo's object network at all; the second brings `main` with an explicit
+          # refspec (rather than relying on remote-tracking config, which a bare-URL remote has none
+          # of) to walk down to the pin. `--filter=blob:none` holds both to a commit/tree graph — no
+          # file CONTENT is ever downloaded, because `merge-base` reads none. That bound matters most
+          # on the REJECTION path: when the pin is not an ancestor there is no shallow boundary
+          # anywhere in `main`'s ancestry, so the hostile pin is the case that fetches the MOST.
+          #
+          # THE SHALLOW BOUNDARY IS REAL, AND HARMLESS. The depth-1 fetch registers a boundary at the
+          # pinned commit and the server honours it on the second fetch, so `main` arrives TRUNCATED
+          # there — it is not a complete history and must not be reasoned about as one. What saves it
+          # is the direction of the walk: `merge-base --is-ancestor` runs from `main` DOWN to the
+          # pinned commit and stops on reaching it, so it never needs that commit's parents. Do not
+          # reorder these two fetches, or drop `--depth=1`, on the strength of a completeness the
+          # second fetch does not actually deliver.
+          #
+          # THE FETCH RETRIES; THE VERDICT DOES NOT. Two unauthenticated round-trips are now a hard
+          # precondition for every run in every enrolled consumer, and there is no opt-out — so a
+          # transient github.com error or a secondary rate limit on shared Actions egress would
+          # otherwise turn one bad minute into a fleet-wide red. Three attempts with a linear backoff
+          # absorb that, and the low-speed knobs turn a stalled connection into a fast failure rather
+          # than a hang to the job timeout. What does NOT get retried is the ANSWER: a fetch that
+          # keeps failing, and a commit that is simply not an ancestor, both still fail the step.
+          #
+          # `git` ECHOES THE REF ITSELF on a failed fetch (`upload-pack: not our ref <sha>`), which
+          # looks like it contradicts the never-emit-the-raw-value rule above. It does not: the shape
+          # test has already exited on anything that is not exactly 40 characters of `[0-9a-f]`, and
+          # such a value can carry neither a newline nor a `::`, so it cannot forge a workflow command
+          # in this PUBLIC log. That ordering is load-bearing — do not move this axis above the shape
+          # test.
+          #
+          # WHAT THIS STILL DOES NOT PROVE is that the pin is the CURRENT one: a stale-but-merged SHA
+          # is an ancestor too, and lock-step against the commit `uses:` resolved to remains
+          # unavailable from in here (see the header). Reviewing the caller still bounds that.
+          #
+          # THE SCRATCH CLONE IS CLEANED UP on every path, success or rejection. Hosted runners are
+          # ephemeral and would not care; self-hosted ones would accumulate one clone of `main` per
+          # run, per job.
+          if ! scratch=$(mktemp -d); then
+            echo "::error::A scratch directory for the workflows_ref (${safe_ref}) ancestry check could not be created, so the pin's provenance cannot be established. This is an infrastructure fault, not evidence about the pin. Failing closed."
+            exit 1
+          fi
+          trap 'rm -rf "$scratch"' EXIT
+          if ! git init -q "$scratch"; then
+            echo "::error::A scratch git repository for the workflows_ref (${safe_ref}) ancestry check could not be initialized, so the pin's provenance cannot be established. This is an infrastructure fault, not evidence about the pin. Failing closed."
+            exit 1
+          fi
+          # The upstream URL is passed IN by each call site rather than baked in here, so that both
+          # fetches keep naming the repo literally, in the line a reviewer reads, while sharing one
+          # retry and transfer-bound policy. See the literal-URL note above for why it is not a var.
+          fetch_upstream() {
+            for attempt in 1 2 3; do
+              if timeout 40 git -C "$scratch" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 fetch --quiet --no-tags --filter=blob:none "$@"; then
+                return 0
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                sleep $((attempt * 5))
+              fi
+            done
+            return 1
+          }
+          if ! fetch_upstream --depth=1 https://github.com/Comfy-Org/github-workflows "$WORKFLOWS_REF"; then
+            echo "::error::workflows_ref (${safe_ref}) could not be fetched from Comfy-Org/github-workflows after 3 attempts, so its provenance cannot be established. Failing closed."
+            exit 1
+          fi
+          if ! fetch_upstream https://github.com/Comfy-Org/github-workflows +refs/heads/main:refs/heads/upstream-main; then
+            echo "::error::main of Comfy-Org/github-workflows could not be read after 3 attempts, so workflows_ref (${safe_ref}) cannot be shown to be merged upstream. Failing closed."
+            exit 1
+          fi
+          # `--is-ancestor` HAS THREE OUTCOMES, NOT TWO: 0 is yes, 1 is no, and anything above 1 is
+          # git failing to answer at all (an unresolvable `upstream-main`, a missing or corrupt
+          # object, a fetched ref that is not a commit). Collapsing those into the `no` branch would
+          # report an infrastructure fault to the consumer as "treat the pin-bump that introduced
+          # this as hostile" — the same cry-wolf the retry above exists to avoid. Both branches still
+          # fail closed; only the message differs.
+          ancestry_rc=0
+          GIT_NO_LAZY_FETCH=1 git -C "$scratch" merge-base --is-ancestor "$WORKFLOWS_REF" upstream-main || ancestry_rc=$?
+          if [ "$ancestry_rc" -gt 1 ]; then
+            echo "::error::The ancestry test for workflows_ref (${safe_ref}) could not be COMPLETED — git merge-base failed rather than returning a verdict (see its output above). This is an infrastructure fault, not evidence the pin is hostile. Failing closed."
+            exit 1
+          fi
+          if [ "$ancestry_rc" -ne 0 ]; then
+            echo "::error::workflows_ref (${safe_ref}) is not an ancestor of Comfy-Org/github-workflows main. A well-shaped SHA can still be a FORK-AUTHORED commit served out of this repo's own object network; only merged upstream commits may be pinned. If this is a genuine just-merged pin, re-run; otherwise treat the pin-bump that introduced it as hostile."
+            exit 1
+          fi
+      - name: Load pr-derisk tool
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _pr_derisk_tool
+          persist-credentials: false
+      - name: Resolve enabled
+        id: resolve
+        env:
+          INPUT_ENABLED: ${{ inputs.enabled }}
+          # Empty when the caller repo has no such variable — the common case, and NOT an error;
+          # it just means the reviewed input decides.
+          DERISK_CONFIG: ${{ vars.DERISK_CONFIG }}
+        run: bash _pr_derisk_tool/scripts/pr-derisk/resolve-enabled.sh
+
+  plan:
+    name: Plan the split
+    needs: gate
+    if: needs.gate.outputs.enabled == 'true' && !cancelled()
+    runs-on: ubuntu-latest
+    # The model call is bounded at 180s per attempt with up to 3 attempts, the grade waits on no
+    # check rollup, and everything else is a handful of API reads. 20 leaves room for the ancestry
+    # guard (~270s worst case) on top of that without letting a wedged call burn a full hour.
+    timeout-minutes: 20
+    permissions:
+      contents: read        # the consumer's .github/risk.json override, read from the BASE ref
+      pull-requests: write  # read the PR + its diff, and post/update the ONE advisory comment
+      checks: read          # the check rollup the grader's reversibility axis reads
+      actions: read         # the same rollup's CheckRun -> checkSuite -> workflowRun traversal
+      statuses: read        # the same rollup's legacy commit-status contexts
+    steps:
+      - name: Enforce workflows_ref pin contract
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+        run: |
+          set -euo pipefail
+          # Never interpolate a raw value into a `::error::`. A multi-line value — exactly what the
+          # length/character test below exists to catch — would end the annotation at the first
+          # newline and leave the remainder to be re-parsed by the runner as workflow commands
+          # (`::add-mask::`, `::stop-commands::`, a forged `::notice::`) in a PUBLIC log. Anything
+          # outside the ref alphabet becomes `?` and the result is truncated, so what is echoed is
+          # always one bounded line.
+          safe_ref=$(printf '%s' "$WORKFLOWS_REF" | tr -c 'A-Za-z0-9._/-' '?')
+          safe_ref=${safe_ref:0:64}
+          # LENGTH + CHARACTER CLASS, not `grep -Eq '^[0-9a-f]{40}$'` and not `[[ =~ ]]`: both raise
+          # an anchoring question this form does not have. `grep` anchors `^…$` per LINE, so a
+          # multi-line value carrying one SHA-shaped line passes it and is then handed to checkout
+          # in full; `[[ =~ ]]` anchors the whole string, but whether `$` may ALSO match just before
+          # a trailing newline is a libc-dependent detail no trust boundary should rest on. A length
+          # test plus "contains a character outside [0-9a-f]" has no anchors at all — a newline, a
+          # space or an uppercase letter is simply a character outside the class.
+          #
+          # LOWERCASE ONLY, deliberately. The value is handed to `actions/checkout` VERBATIM, so
+          # accepting a spelling the fetch may not resolve would trade this step's clear message for
+          # an obscure failure one step later — the opposite of the point. Everything that emits a
+          # SHA (`git rev-parse`, `gh`, the REST API, the UI) emits lowercase, so a false reject
+          # here is loud and fixed by lowercasing.
+          if [[ ${#WORKFLOWS_REF} -ne 40 || "$WORKFLOWS_REF" == *[!0-9a-f]* ]]; then
+            echo "::error::workflows_ref must be the FULL 40-hex lowercase commit SHA of Comfy-Org/github-workflows (got '${safe_ref}'). Pin it to the SAME SHA you pin uses: to — see the pr-risk.yml header. Branches, tags and refs/pull/N/head are mutable (and PR-head refs resolve fork-authored code), so they are rejected before the tool checkout."
+            exit 1
+          fi
+          # SECOND AXIS — ANCESTRY. Shape proves the value is IMMUTABLE; it does not prove WHICH
+          # REPOSITORY authored the commit it names. A fork of this PUBLIC repo shares the upstream
+          # object store, and GitHub serves a fork PR's head objects from THIS repo's URL to an
+          # UNAUTHENTICATED client — so a fork-authored 40-hex SHA passes the shape test above and is
+          # then handed to `actions/checkout` and run inside a job holding the caller's write token.
+          # Assert instead that the commit is REACHABLE FROM UPSTREAM `main`: merged upstream history,
+          # and nothing else, may be pinned. There is deliberately NO opt-out input for this — an
+          # opt-out would be set by the very pin-bump PR the check exists to distrust.
+          #
+          # THE URL IS A LITERAL ON PURPOSE. Inside a reusable workflow `github.repository` names the
+          # CALLER, and `github.job_workflow_ref` only repeats the `uses:` string the caller wrote, so
+          # no context can supply this repo's identity. A variable here would be an alias a fork could
+          # point back at itself — the exact class of bug this axis closes. Unauthenticated is correct
+          # (the repo is public), and every failure mode fails CLOSED: a fetch that errors, a `main`
+          # that cannot be read, or a network outage all leave the step non-zero.
+          #
+          # TWO FETCHES, NOT ONE, AND BOTH ARE BOUNDED. The depth-1 fetch is what proves the SHA
+          # exists in this repo's object network at all; the second brings `main` with an explicit
+          # refspec (rather than relying on remote-tracking config, which a bare-URL remote has none
+          # of) to walk down to the pin. `--filter=blob:none` holds both to a commit/tree graph — no
+          # file CONTENT is ever downloaded, because `merge-base` reads none. That bound matters most
+          # on the REJECTION path: when the pin is not an ancestor there is no shallow boundary
+          # anywhere in `main`'s ancestry, so the hostile pin is the case that fetches the MOST.
+          #
+          # THE SHALLOW BOUNDARY IS REAL, AND HARMLESS. The depth-1 fetch registers a boundary at the
+          # pinned commit and the server honours it on the second fetch, so `main` arrives TRUNCATED
+          # there — it is not a complete history and must not be reasoned about as one. What saves it
+          # is the direction of the walk: `merge-base --is-ancestor` runs from `main` DOWN to the
+          # pinned commit and stops on reaching it, so it never needs that commit's parents. Do not
+          # reorder these two fetches, or drop `--depth=1`, on the strength of a completeness the
+          # second fetch does not actually deliver.
+          #
+          # THE FETCH RETRIES; THE VERDICT DOES NOT. Two unauthenticated round-trips are now a hard
+          # precondition for every run in every enrolled consumer, and there is no opt-out — so a
+          # transient github.com error or a secondary rate limit on shared Actions egress would
+          # otherwise turn one bad minute into a fleet-wide red. Three attempts with a linear backoff
+          # absorb that, and the low-speed knobs turn a stalled connection into a fast failure rather
+          # than a hang to the job timeout. What does NOT get retried is the ANSWER: a fetch that
+          # keeps failing, and a commit that is simply not an ancestor, both still fail the step.
+          #
+          # `git` ECHOES THE REF ITSELF on a failed fetch (`upload-pack: not our ref <sha>`), which
+          # looks like it contradicts the never-emit-the-raw-value rule above. It does not: the shape
+          # test has already exited on anything that is not exactly 40 characters of `[0-9a-f]`, and
+          # such a value can carry neither a newline nor a `::`, so it cannot forge a workflow command
+          # in this PUBLIC log. That ordering is load-bearing — do not move this axis above the shape
+          # test.
+          #
+          # WHAT THIS STILL DOES NOT PROVE is that the pin is the CURRENT one: a stale-but-merged SHA
+          # is an ancestor too, and lock-step against the commit `uses:` resolved to remains
+          # unavailable from in here (see the header). Reviewing the caller still bounds that.
+          #
+          # THE SCRATCH CLONE IS CLEANED UP on every path, success or rejection. Hosted runners are
+          # ephemeral and would not care; self-hosted ones would accumulate one clone of `main` per
+          # run, per job.
+          if ! scratch=$(mktemp -d); then
+            echo "::error::A scratch directory for the workflows_ref (${safe_ref}) ancestry check could not be created, so the pin's provenance cannot be established. This is an infrastructure fault, not evidence about the pin. Failing closed."
+            exit 1
+          fi
+          trap 'rm -rf "$scratch"' EXIT
+          if ! git init -q "$scratch"; then
+            echo "::error::A scratch git repository for the workflows_ref (${safe_ref}) ancestry check could not be initialized, so the pin's provenance cannot be established. This is an infrastructure fault, not evidence about the pin. Failing closed."
+            exit 1
+          fi
+          # The upstream URL is passed IN by each call site rather than baked in here, so that both
+          # fetches keep naming the repo literally, in the line a reviewer reads, while sharing one
+          # retry and transfer-bound policy. See the literal-URL note above for why it is not a var.
+          fetch_upstream() {
+            for attempt in 1 2 3; do
+              if timeout 40 git -C "$scratch" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 fetch --quiet --no-tags --filter=blob:none "$@"; then
+                return 0
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                sleep $((attempt * 5))
+              fi
+            done
+            return 1
+          }
+          if ! fetch_upstream --depth=1 https://github.com/Comfy-Org/github-workflows "$WORKFLOWS_REF"; then
+            echo "::error::workflows_ref (${safe_ref}) could not be fetched from Comfy-Org/github-workflows after 3 attempts, so its provenance cannot be established. Failing closed."
+            exit 1
+          fi
+          if ! fetch_upstream https://github.com/Comfy-Org/github-workflows +refs/heads/main:refs/heads/upstream-main; then
+            echo "::error::main of Comfy-Org/github-workflows could not be read after 3 attempts, so workflows_ref (${safe_ref}) cannot be shown to be merged upstream. Failing closed."
+            exit 1
+          fi
+          # `--is-ancestor` HAS THREE OUTCOMES, NOT TWO: 0 is yes, 1 is no, and anything above 1 is
+          # git failing to answer at all (an unresolvable `upstream-main`, a missing or corrupt
+          # object, a fetched ref that is not a commit). Collapsing those into the `no` branch would
+          # report an infrastructure fault to the consumer as "treat the pin-bump that introduced
+          # this as hostile" — the same cry-wolf the retry above exists to avoid. Both branches still
+          # fail closed; only the message differs.
+          ancestry_rc=0
+          GIT_NO_LAZY_FETCH=1 git -C "$scratch" merge-base --is-ancestor "$WORKFLOWS_REF" upstream-main || ancestry_rc=$?
+          if [ "$ancestry_rc" -gt 1 ]; then
+            echo "::error::The ancestry test for workflows_ref (${safe_ref}) could not be COMPLETED — git merge-base failed rather than returning a verdict (see its output above). This is an infrastructure fault, not evidence the pin is hostile. Failing closed."
+            exit 1
+          fi
+          if [ "$ancestry_rc" -ne 0 ]; then
+            echo "::error::workflows_ref (${safe_ref}) is not an ancestor of Comfy-Org/github-workflows main. A well-shaped SHA can still be a FORK-AUTHORED commit served out of this repo's own object network; only merged upstream commits may be pinned. If this is a genuine just-merged pin, re-run; otherwise treat the pin-bump that introduced it as hostile."
+            exit 1
+          fi
+      - name: Load pr-derisk tool
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _pr_derisk_tool
+          persist-credentials: false
+
+      # Re-grade the PR with the SAME grader and the SAME base-ref overrides pr-risk grades
+      # against. A `/derisk` comment carries a PR number and nothing else, and a label read off the
+      # PR would be a tier nobody recomputed on a branch that may have been pushed to since.
+      - name: Collect the graded record and the diff
+        id: collect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          OUT_DIR: _derisk
+          MAX_DIFF_BYTES: ${{ inputs.max_diff_bytes }}
+          MAP_PATH: ${{ inputs.repo_map_path }}
+          RB_PATH: ${{ inputs.repo_runbooks_path }}
+          FLEET_LOGINS: ${{ inputs.fleet_logins }}
+          BOT_LOGINS: ${{ inputs.bot_logins }}
+        run: bash _pr_derisk_tool/scripts/pr-derisk/collect-pr-inputs.sh
+
+      # THE ONLY STEP THAT HOLDS THE KEY, and it holds no GitHub token: it reads two files off
+      # disk, makes one HTTPS POST, and writes a JSON plan. Nothing it produces is executed.
+      - name: Plan the split
+        id: plan
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.anthropic_api_key }}
+          RECORD: ${{ steps.collect.outputs.record }}
+          DIFF_FILE: ${{ steps.collect.outputs.diff }}
+          OVERSIZED: ${{ steps.collect.outputs.oversized == 'true' && '1' || '0' }}
+          DERISK_MODEL: ${{ inputs.model }}
+          MAX_STEPS: ${{ inputs.max_steps }}
+          # The SAME map the record was graded with, so a split's floor and the PR's grade are
+          # answers from one rule set. Empty when the consumer ships no override, which is what
+          # makes the grader fall back to the shipped defaults beside itself.
+          PR_RISK_MAP: ${{ steps.collect.outputs.map }}
+          PR_RISK_RUNBOOKS: ${{ steps.collect.outputs.runbooks }}
+        run: bash _pr_derisk_tool/scripts/pr-derisk/plan-derisk.sh > _derisk/plan.json
+
+      # `if: always()` (bounded by the job's own `!cancelled()`), because the comment is the
+      # product: a step that fell over upstream still owes the person who typed the command an
+      # explanation. The planner writes a `failed`/`fallback` plan for every failure it can see;
+      # this catches the ones it cannot.
+      - name: Post or update the plan comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          PLAN: _derisk/plan.json
+          ACTOR: ${{ github.event.comment.user.login }}
+        run: |
+          set -uo pipefail
+          if [ ! -s "$PLAN" ]; then
+            printf '%s' '{"status":"failed","note":"the de-risk run failed before a plan was produced — see the workflow run for the failing step","steps":[]}' > "$PLAN"
+          fi
+          bash _pr_derisk_tool/scripts/pr-derisk/publish-derisk-comment.sh
