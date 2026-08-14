@@ -50,7 +50,9 @@ PR gets the `cursor-review` label
 ```
 
 Slack start/complete DMs to the triggerer are sent alongside (optional —
-skipped if no Slack token is configured).
+skipped if no Slack token is configured). A skip for the diff-size cap is
+announced on the PR rather than passing for a clean review — see [Over the
+diff-size cap](#over-the-diff-size-cap).
 
 ### The panel
 
@@ -88,6 +90,7 @@ silently vanishing — the review tells you what didn't run.
 | [`slack-notify.sh`](slack-notify.sh) | Sends the start/complete Slack DMs to the triggerer (no-ops without a token). |
 | [`install-cursor-cli.sh`](install-cursor-cli.sh) | Installs the Cursor agent CLI from the versioned, sha256-pinned release artifact — not `curl cursor.com/install \| bash`. Used by all three CLI-using jobs; the pin (`CURSOR_CLI_VERSION` / `CURSOR_CLI_SHA256`) lives in `cursor-review.yml`'s top-level `env:`. |
 | [`build-ledger.py`](build-ledger.py) | Builds the **prior-review ledger** — what earlier rounds raised on this PR and how the author answered — and splices it into the panel/judge prompts. Also the prompt splicer, so the no-ledger path is byte-identical to the pre-ledger prompt. |
+| [`fence-diff.py`](fence-diff.py) | Wraps the reviewed diff (plus the incremental hunks, and the judge's panel-findings block) in `=== BEGIN/END DIFF <nonce> ===` fences. The diff is attacker-authored PR bytes, so static literal fences are not a control; the nonce is what a PR cannot forge. Each prompt-build step mints its OWN nonce (`mint`), into a shell variable rather than a step `env:` or job output — Actions dumps a step's env map into the public run log, and a per-prompt value means a leak in one job cannot forge a fence in another. Copies the body through **byte for byte** — it never defangs or normalizes the payload. |
 | [`catalog-drift.py`](catalog-drift.py) | Backs the weekly catalog-drift check. Extracts the pins from `cursor-review.yml`, diffs them against raw `cursor-agent models` output, and renders the sticky issue title + body (delisted pins, pins marked NO-ZDR, unpinned same-lab ids, catalog ids from unpinned families, stale audit date). Reports only — it never edits a pin. |
 
 ## Adopt it in your repo
@@ -215,6 +218,28 @@ All optional except `workflows_ref` (required, no default) — pass them under
 
 There is **no `blocking` input** — see [the regression note
 above](#the-blocking-gate-is-currently-not-available-regressed).
+
+### Over the diff-size cap
+
+A PR whose counted diff exceeds `diff_size_cap` gets **no review panel**, and
+that skip is not a failure — the run is green either way. So it announces itself
+rather than passing for a clean review: the *Diff size check* job emits a
+`::warning::` annotation and a step-summary block naming the counted total and
+the cap (both credential-free, so they reach Dependabot PRs, whose runs can't
+read Actions secrets), and a separate `over-cap-comment` job upserts one sticky
+PR comment saying no panel ran. Get the PR under the cap and re-trigger, and
+that same comment flips to ✅ instead of stacking a second one; it never posts on
+a PR that was under the cap all along. Neither half reaches a **fork** PR — the
+gate skips a cross-repo head before the size check runs at all, so a fork PR is
+skipped for being a fork, not for its size.
+
+The comment posts as the bot app when one is configured (`bot_app_id` +
+`BOT_APP_PRIVATE_KEY`) and as `github-actions[bot]` otherwise, so it works in the
+default configuration; the sticky finder matches both logins, so switching
+identities updates the existing comment rather than posting a second one. If the
+API write fails the job degrades to the annotation + summary and logs why. Mint
+and upsert are both `continue-on-error`: the size verdict lives in the
+`diff-size` job, so the comment path can never redden a run.
 
 ### Escape hatches
 
