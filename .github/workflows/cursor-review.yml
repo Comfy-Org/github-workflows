@@ -798,11 +798,22 @@ jobs:
           # Don't let an obsolete run overwrite a newer verdict. `!cancelled()`
           # covers the cancel-in-progress path; this covers a manual re-run of
           # an older run, whose event payload still carries the head SHA that
-          # was current when it was queued. Tolerant of a failed lookup (|| true
-          # → empty → proceed): a stale write is worse than a missing one, but a
-          # transient API blip must not silence the notice entirely.
-          LIVE_HEAD="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha' 2>/dev/null || true)"
-          if [ -n "$LIVE_HEAD" ] && [ "$LIVE_HEAD" != "$EVENT_HEAD_SHA" ]; then
+          # was current when it was queued.
+          #
+          # FAILS CLOSED. A lookup that errors leaves us unable to tell a
+          # current run from an obsolete one, and writing anyway would let a
+          # stale "no panel ran" (or a premature ✅) land on top of the right
+          # answer — the one failure this guard exists to prevent. Skipping
+          # costs little: the list and write below hit the same API with the
+          # same token, so a real outage would take them out a line later
+          # regardless. `exit 1` under continue-on-error routes it to "Note
+          # degraded mode", which reports it against the annotation + summary
+          # that remain the primary signal.
+          if ! LIVE_HEAD="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha')" || [ -z "$LIVE_HEAD" ]; then
+            echo "Could not read the PR's current head (see gh error above) — refusing to write a verdict that may already be stale." >&2
+            exit 1
+          fi
+          if [ "$LIVE_HEAD" != "$EVENT_HEAD_SHA" ]; then
             echo "This run's head (${EVENT_HEAD_SHA}) is no longer the PR head (${LIVE_HEAD}) — a newer run owns the verdict. Not writing."
             exit 0
           fi
