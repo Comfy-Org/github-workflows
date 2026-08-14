@@ -452,7 +452,38 @@ jobs:
     # small PR but can never feed an unbounded diff to the panel.
     outputs:
       within_cap: ${{ steps.check.outputs.over_cap != 'true' }}
+      # The per-run fence nonce the panel + judge wrap the reviewed diff in.
+      diff_nonce: ${{ steps.nonce.outputs.diff_nonce }}
     steps:
+      - name: Mint the diff-fence nonce
+        id: nonce
+        # The reviewed diff is `git diff BASE...HEAD` — attacker-authored PR file
+        # bytes — and it is spliced straight into the panel and judge prompts.
+        # Static literal fences are not a control against prompt injection, so
+        # the BEGIN/END markers carry an unguessable per-run nonce instead
+        # (BE-7645). A PR cannot forge the close fence because the nonce is
+        # minted HERE, at run time, after the head SHA its diff is built from is
+        # already fixed.
+        #
+        # Never echo it. Consumer run logs are public, and while a nonce leaked
+        # after the fact is useless (the diff is already fixed and the next run
+        # mints a new one), a fence token in the log is an invitation. Do NOT
+        # `::add-mask::` it either: Actions redacts masked values out of JOB
+        # OUTPUTS, so masking would hand the review and consolidate jobs `***`.
+        run: |
+          nonce="$(openssl rand -hex 16 2>/dev/null || true)"
+          if ! printf '%s' "$nonce" | grep -Eq '^[0-9a-f]{32}$'; then
+            # openssl is present on every GitHub-hosted image, but a missing or
+            # broken one must not silently degrade to a guessable fence.
+            nonce="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+          fi
+          if ! printf '%s' "$nonce" | grep -Eq '^[0-9a-f]{32}$'; then
+            echo "::error::could not generate a random diff-fence nonce"
+            exit 1
+          fi
+          echo "diff_nonce=${nonce}" >> "$GITHUB_OUTPUT"
+          echo "Minted a 16-byte diff-fence nonce (value withheld — the log is public)."
+
       - name: Checkout PR head
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -927,6 +958,7 @@ jobs:
         env:
           REVIEW_TYPE: ${{ matrix.review_type }}
           LEDGER_ROUNDS: ${{ needs.ledger.outputs.rounds }}
+          DIFF_NONCE: ${{ needs.diff-size.outputs.diff_nonce }}
         run: |
           # Splice the prior-review ledger in AFTER the static instructions and
           # BEFORE the diff. With no ledger (first round, kill switch off, or a
@@ -938,19 +970,30 @@ jobs:
             --insert /tmp/ledger/ledger.md \
             --out /tmp/prompt-head.txt
 
+          # The prompt files END with the bare `=== BEGIN DIFF ===` line, which
+          # is also the splice --marker above, so it has to stay verbatim in the
+          # .md. Drop it here and let fence-diff.py re-emit it carrying this
+          # run's nonce, so the whole attacker-authored region — the diff AND
+          # the incremental hunks — sits inside fences a PR cannot forge
+          # (BE-7645). fence-diff.py copies the diff bytes through unchanged.
+          python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" strip-marker \
+            --file /tmp/prompt-head.txt \
+            --marker '=== BEGIN DIFF ==='
+
           {
             cat /tmp/prompt-head.txt
-            cat /tmp/pr-diff.patch
-            echo ""
-            echo "=== END DIFF ==="
+            python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" emit \
+              --diff /tmp/pr-diff.patch --label DIFF --nonce "$DIFF_NONCE"
             if [ -s /tmp/pr-diff-new.patch ]; then
               echo ""
-              echo "=== HUNKS NEW SINCE ROUND ${LEDGER_ROUNDS:-?} ==="
+              # Guidance ABOUT the block stays OUTSIDE it: instructions to the
+              # reviewer never share a fence with untrusted data.
               echo "The subset of the diff above that changed since the last reviewed"
               echo "commit. Prioritize it — but the full diff above is still in scope."
-              cat /tmp/pr-diff-new.patch
-              echo ""
-              echo "=== END HUNKS NEW SINCE ROUND ${LEDGER_ROUNDS:-?} ==="
+              python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" emit \
+                --diff /tmp/pr-diff-new.patch \
+                --label "HUNKS NEW SINCE ROUND ${LEDGER_ROUNDS:-?}" \
+                --nonce "$DIFF_NONCE"
             fi
           } > /tmp/prompt.txt
 
@@ -1126,6 +1169,7 @@ jobs:
         if: steps.aggregate.outputs.ok_count != '0'
         env:
           LEDGER_ROUNDS: ${{ needs.ledger.outputs.rounds }}
+          DIFF_NONCE: ${{ needs.diff-size.outputs.diff_nonce }}
         run: |
           # The judge is the repeat-policy enforcement point, so it gets the
           # judge-flavored ledger block (repeat_of requirement + the per-review
@@ -1136,22 +1180,23 @@ jobs:
             --insert /tmp/ledger/ledger-judge.md \
             --out /tmp/judge-prompt-head.txt
 
+          # Same nonce'd fences as the panel (BE-7645) — the judge reads the
+          # same attacker-authored diff, so it gets the same delimiting. The
+          # nonce comes from diff-size, so both prompts fence with one value.
           {
             cat /tmp/judge-prompt-head.txt
             cat /tmp/panel.json
             echo ""
             echo "=== END PANEL FINDINGS ==="
             echo ""
-            echo "=== BEGIN DIFF ==="
-            cat /tmp/pr-diff.patch
-            echo ""
-            echo "=== END DIFF ==="
+            python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" emit \
+              --diff /tmp/pr-diff.patch --label DIFF --nonce "$DIFF_NONCE"
             if [ -s /tmp/pr-diff-new.patch ]; then
               echo ""
-              echo "=== HUNKS NEW SINCE ROUND ${LEDGER_ROUNDS:-?} ==="
-              cat /tmp/pr-diff-new.patch
-              echo ""
-              echo "=== END HUNKS NEW SINCE ROUND ${LEDGER_ROUNDS:-?} ==="
+              python3 "$CURSOR_REVIEW_ASSETS/fence-diff.py" emit \
+                --diff /tmp/pr-diff-new.patch \
+                --label "HUNKS NEW SINCE ROUND ${LEDGER_ROUNDS:-?}" \
+                --nonce "$DIFF_NONCE"
             fi
           } > /tmp/judge-prompt.txt
 
