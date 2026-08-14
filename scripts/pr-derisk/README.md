@@ -45,10 +45,19 @@ either way. A split can land *worse* than its floor; it can never land better.
 
 ## Honesty rules, and where they are enforced
 
-A single-class monolith — every file already at the headline tier — has no lane win available. The
-verdict line above the fold is computed from the **floors**, not from the model's prose, so in
-that case it reads "N smaller single-concern R3s, same lane" and there is no wording available to
-it that claims a reduction. A prompt can *ask* for that; only the renderer can guarantee it.
+A single-class monolith — every file already at the PR's **path floor** — has no lane win
+available. The verdict line above the fold is computed from the **floors**, not from the model's
+prose, so in that case it reads "N smaller single-concern R3s, same lane" and there is no wording
+available to it that claims a reduction. A prompt can *ask* for that; only the renderer can
+guarantee it.
+
+**The comparison axis is the PATH FLOOR, not the headline tier**, and that distinction is the rule
+rather than a detail of it. `grade = worst(path_floor, provenance, reversibility)` but a split only
+ever moves the path axis, so on a fork PR (provenance R3, path floor R0) or a `/derisk` typed while
+checks are still pending (reversibility R2) *every* step sits below the headline while the axis
+that actually set the grade is untouched. Comparing against the headline there would print a
+reduction no partition can deliver, on exactly the pull requests this rule exists for. When a
+non-path axis holds the grade up the verdict says so in the same breath as the split.
 
 Two rules the plan text carries, because they are how a split plan goes wrong:
 

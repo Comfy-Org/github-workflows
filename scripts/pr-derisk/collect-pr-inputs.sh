@@ -49,13 +49,16 @@ MAX_DIFF_BYTES="${MAX_DIFF_BYTES:-200000}"
 
 # DEFINED TWICE, here and again after the `source` below, and both copies are reachable: these
 # serve the argument checks immediately following, which run BEFORE grade-targets.sh is sourced.
-# The linter sees only the later definitions shadowing these and calls them dead (SC2329) — its
+# The linter sees only the later definitions shadowing these and calls them dead — its
 # static view has no notion of "the redefinition happens partway down the file", which is the whole
 # reason the second copy exists. Deleting either one is a real regression, in opposite directions.
+# BOTH codes are suppressed on purpose: 0.11+ reports this as SC2329 (function never invoked),
+# 0.10 and earlier as SC2317 (unreachable command). CI's runner image is not on the same version
+# as a developer's laptop, so naming only one code passes locally and fails in Actions.
 # (A comment line may not START with the linter's own name, or it is parsed as a directive.)
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 log()  { printf '[collect-pr-inputs] %s\n' "$*" >&2; }
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 warn() { printf '::warning::[collect-pr-inputs] %s\n' "$*" >&2; }
 die()  { printf '[collect-pr-inputs] ERROR %s\n' "$*" >&2; exit 2; }
 
@@ -122,6 +125,14 @@ DIFF="$OUT_DIR/diff.patch"
 oversized=false
 if ! gh api "repos/$REPO/pulls/$PR_NUMBER" -H "Accept: application/vnd.github.diff" > "$DIFF" 2>"$OUT_DIR/diff-err.txt"; then
   warn "could not read the diff of ${REPO}#${PR_NUMBER}: $(head -c 300 "$OUT_DIR/diff-err.txt" | tr '\n' ' ')"
+  rm -f "$DIFF"
+  oversized=true
+elif [ ! -s "$DIFF" ]; then
+  # A ZERO-BYTE BODY IS NOT AN EMPTY DIFF. `gh` exited 0, so the branch above did not fire, but a
+  # followed redirect can return 200 with nothing in it (grade-targets.sh's `fetch_override`
+  # documents the same trap on the contents API). Handing the planner a diff it never saw produces
+  # a confident, evidence-free partition — the one output this rung must never emit.
+  warn "the diff of ${REPO}#${PR_NUMBER} came back empty — taking the deterministic fallback rather than planning against a diff nobody read"
   rm -f "$DIFF"
   oversized=true
 else

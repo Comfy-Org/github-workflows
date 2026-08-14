@@ -54,13 +54,17 @@ no()  { if printf '%s\n' "$2" | grep -qF -- "$3"; then bad "$1" "present: $3"; e
 # ---- fixtures ------------------------------------------------------------------------------------
 # `graded <name> <changed_paths-json>` — a REAL graded record, produced by the real grader, so
 # every path floor these tests assert against is the shipped map's own answer.
+# `<extra>` is merged over the scorecard, which is how the fork case below moves the PROVENANCE
+# axis without touching the paths — the only way to produce a record whose headline is set by
+# something a split cannot move.
 graded() {
-  local name="$1" paths="$2"
-  jq -cn --argjson paths "$paths" '
+  local name="$1" paths="$2" extra="${3:-}"
+  [ -n "$extra" ] || extra='{}'
+  jq -cn --argjson paths "$paths" --argjson extra "$extra" '
     {repo:"test/repo", pr:7, title:"feat: thing", author:"dev", author_association:"MEMBER",
      is_fork:false, labels:[], head_ref:"feature", additions:50, deletions:10,
      changed_files:($paths|length), checks_state:"SUCCESS", checks_status:"ok",
-     provenance_status:"ok", changed_paths:$paths, changed_paths_status:"ok"}' \
+     provenance_status:"ok", changed_paths:$paths, changed_paths_status:"ok"} + $extra' \
     | bash "$GRADER" --stdin 2>/dev/null > "$SANDBOX/$name.json"
   printf '%s' "$SANDBOX/$name.json"
 }
@@ -87,7 +91,7 @@ echo "— phase 1: every floor is the GRADER's, never the model's —"
 # The stub states a tier on every step and calls the migration step R0. If any of that reaches the
 # reader, the whole design is decoration.
 GOOD='{"steps":[{"name":"Migration","description":"d","files":["db/migrations/0001_x.sql"],"depends_on":[],"inertness":"i","review_ask":"the chain","tier":"R0","floor":"R0"},{"name":"Rest","description":"d","files":["docs/a.md","src/a.go"],"depends_on":[0],"inertness":"i","review_ask":"","tier":"R3"}],"summary":"step 1 carries it"}'
-out="$(plan "$REC_MIXED" "$(stub "$GOOD")")"
+out="$(plan "$REC_MIXED" "$(stub "$GOOD")")"; printf '%s' "$out" > "$SANDBOX/p1-plan.json"
 eq "a valid partition plans" planned "$(jq -r .status <<<"$out")"
 eq "the migration step floors R3 (the grader), not R0 (the model)" R3 "$(jq -r '.steps[0].floor' <<<"$out")"
 eq "the docs+src step floors R0 (the grader), not R3 (the model)" R0 "$(jq -r '.steps[1].floor' <<<"$out")"
@@ -134,6 +138,56 @@ eq "both steps still floor R3" "R3 R3" "$(jq -r '[.steps[].floor] | join(" ")' <
 body="$(render "$SANDBOX/mono-plan.json")"
 has "the verdict says same lane" "$body" "same lane"
 no  "and claims no reduction" "$body" "path-floor below"
+
+echo "— phase 4b: a headline set by a NON-PATH axis is never claimed as a lane win —"
+# `grade = worst(path_floor, provenance, reversibility)` and a split only moves the PATH axis. This
+# fork PR grades R3 on PROVENANCE with a path floor of R0, so every step trivially sits below the
+# HEADLINE while the axis that actually set the grade is untouched. Comparing against the headline
+# printed "2 step(s) path-floor below R3 (100% of the changed lines)" — a reduction no partition
+# here can deliver, on exactly the pull requests the no-fake-lane-win rule exists for.
+SOFT='[{"path":"docs/a.md","change_type":"MODIFIED","additions":5,"deletions":3},
+       {"path":"src/a.go","change_type":"MODIFIED","additions":10,"deletions":5}]'
+REC_FORK="$(graded fork "$SOFT" '{"is_fork":true,"author_association":"NONE"}')"
+eq "the fixture grades R3 overall" R3 "$(jq -r '.risk.tier' "$REC_FORK")"
+eq "but its PATH floor is R0" R0 "$(jq -r '.risk.axes.path_floor.tier' "$REC_FORK")"
+FORKPLAN='{"steps":[{"name":"Docs","description":"d","files":["docs/a.md"],"depends_on":[],"inertness":"i","review_ask":""},{"name":"Code","description":"d","files":["src/a.go"],"depends_on":[0],"inertness":"i","review_ask":"the chain"}],"summary":"s"}'
+out="$(plan "$REC_FORK" "$(stub "$FORKPLAN")")"; printf '%s' "$out" > "$SANDBOX/fork-plan.json"
+eq "the plan carries the path floor separately from the headline" "R3 R0" \
+   "$(jq -r '[.headline_tier, .path_floor_tier] | join(" ")' <<<"$out")"
+body="$(render "$SANDBOX/fork-plan.json")"
+no  "no step is claimed to land below the non-path headline" "$body" "path-floor below R3"
+has "the verdict speaks in the PATH floor instead"            "$body" 'path-floors at **R0**'
+has "and names the axis a split cannot move"                  "$body" "non-path axis"
+# The same comparison must still fire normally when the PATH axis IS the one holding the grade up.
+body="$(render "$SANDBOX/p1-plan.json")"
+has "a genuine path-axis reduction is still reported" "$body" "path-floor below R3"
+no  "and carries no non-path caveat"                  "$body" "non-path axis"
+
+echo "— phase 4c: the ordering a plan exists to state cannot be impossible —"
+# A self-reference, a forward reference or a two-step cycle all render a "Lands after" nobody can
+# execute. Bounding each entry by the index of the step it sits on makes a cycle unrepresentable.
+CYCLE='{"steps":[{"name":"A","description":"d","files":["db/migrations/0001_x.sql"],"depends_on":[1],"inertness":"i","review_ask":""},{"name":"B","description":"d","files":["docs/a.md","src/a.go"],"depends_on":[1,0],"inertness":"i","review_ask":""}],"summary":"s"}'
+out="$(plan "$REC_MIXED" "$(stub "$CYCLE")")"
+eq "the plan still renders"                    planned "$(jq -r .status <<<"$out")"
+eq "a forward reference is dropped"            ""      "$(jq -r '.steps[0].depends_on | join(",")' <<<"$out")"
+eq "a self-reference is dropped, the real one kept" "0" "$(jq -r '.steps[1].depends_on | join(",")' <<<"$out")"
+# A SCALAR depends_on type-errored the merge jq, which emitted `planned` with an empty chain — the
+# steps the reader came for, silently gone, under a headline that counted them.
+SCALARDEP='{"steps":[{"name":"A","description":"d","files":["db/migrations/0001_x.sql"],"depends_on":[],"inertness":"i","review_ask":""},{"name":"B","description":"d","files":["docs/a.md","src/a.go"],"depends_on":0,"inertness":"i","review_ask":""}],"summary":"s"}'
+out="$(plan "$REC_MIXED" "$(stub "$SCALARDEP" "$SCALARDEP")")"
+eq "a scalar depends_on is rejected, not silently emptied" fallback "$(jq -r .status <<<"$out")"
+has "and the rejection says what shape was wanted" "$(jq -r .note <<<"$out")" "depends_on must be an ARRAY"
+out="$(plan "$REC_MIXED" "$(stub "$SCALARDEP" "$GOOD")")"
+eq "the retry rescues it" planned "$(jq -r .status <<<"$out")"
+eq "and every step is still present" 2 "$(jq -r '.steps | length' <<<"$out")"
+
+echo "— phase 4d: a diff that came back EMPTY is not a diff —"
+# `gh` exits 0 on a followed redirect that returned no body, so an empty file reaches the planner
+# looking like a legitimate read. Planning off it produces a confident, evidence-free partition.
+: > "$SANDBOX/empty.patch"
+out="$(env RECORD="$REC_MIXED" DIFF_FILE="$SANDBOX/empty.patch" MODEL_RESPONSE_FILE="$(stub "$GOOD")" bash "$PLANNER" 2>/dev/null)"
+eq "an empty diff file takes the deterministic fallback" fallback "$(jq -r .status <<<"$out")"
+has "and says the diff could not be read" "$(jq -r .note <<<"$out")" "could not be read"
 
 echo "— phase 5: the rendered comment cannot be forged by a filename or a step name —"
 EVIL_PATHS='[{"path":"src/a|b`c.go","change_type":"MODIFIED","additions":1,"deletions":0},
@@ -225,6 +279,18 @@ else
   # workflow is most likely to relax by accident, so they are asserted as text.
   has "the commenter is gated by association" "$(cat "$WF")" "author_association"
   has "and the trigger is an issue_comment on a PR" "$(cat "$WF")" "github.event.issue.pull_request"
+  # ANCHORED AT BOTH ENDS. `format('{0},', …)` anchors the trailing delimiter only, which makes the
+  # test an unanchored substring match: an allowlist naming FIRST_TIME_CONTRIBUTOR then also admits
+  # plain CONTRIBUTOR — anyone with one merged PR — to a command that spends money.
+  has "the association allowlist is anchored at BOTH ends" "$(cat "$WF")" \
+      "contains(format(',{0},', inputs.allowed_associations), format(',{0},', github.event.comment.author_association))"
+  no  "and never with a trailing-only anchor"              "$(cat "$WF")" \
+      "contains(format('{0},', inputs.allowed_associations)"
+  # `startsWith(body, '')` is always true, so an empty command is every comment on every PR.
+  has "an empty command prefix cannot arm the trigger" "$(cat "$WF")" "inputs.command != ''"
+  # The `always()` publisher writes into a directory only collect-pr-inputs.sh creates, and the
+  # failures it exists to cover are exactly the ones where collect never ran.
+  has "the always() publisher creates the plan directory first" "$(cat "$WF")" 'mkdir -p "$(dirname "$PLAN")"'
 fi
 
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"

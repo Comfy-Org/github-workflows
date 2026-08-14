@@ -155,16 +155,20 @@ on:
         description: >-
           The comment prefix that triggers a plan. Matched with
           `startsWith`, so `/derisk please` works and a comment that merely
-          MENTIONS `/derisk` mid-sentence does not.
+          MENTIONS `/derisk` mid-sentence does not. MUST NOT BE EMPTY — an empty
+          prefix matches every comment ever posted, so the gate rejects it.
         type: string
         required: false
         default: '/derisk'
       allowed_associations:
         description: >-
           Comma-separated `author_association` values permitted to spend the
-          model call. Defaults to the three that mean "has write access or is in
-          the org". NARROW IT, never widen it: `CONTRIBUTOR` and `NONE` are
-          anyone with a GitHub account, and this command costs money.
+          model call. NO SPACES — each entry is matched with the commas around
+          it, so ` MEMBER` never matches and is silently locked out (the gate
+          job fails loudly on a whitespace-bearing list). Defaults to the three
+          that mean "has write access or is in the org". NARROW IT, never widen
+          it: `CONTRIBUTOR` and `NONE` are anyone with a GitHub account, and
+          this command costs money.
         type: string
         required: false
         default: 'OWNER,MEMBER,COLLABORATOR'
@@ -234,13 +238,25 @@ jobs:
   # NO token scopes: it reads its inputs, the caller's variable, and the event payload.
   gate:
     name: Resolve enablement
-    # The same three conditions the caller's `if:` should carry, re-asserted here so a caller that
+    # The same conditions the caller's `if:` should carry, re-asserted here so a caller that
     # forgets one is not thereby unguarded. `author_association` is what the API attributed to the
     # comment, not text the commenter wrote, so it cannot be forged from inside a pull request.
+    #
+    # `command != ''` IS PART OF THE GATE, not a tidy-up: `startsWith(body, '')` is ALWAYS true, so
+    # a caller forwarding an unset value (`command: ${{ vars.SOMETHING }}` that resolves to empty)
+    # would turn every comment on every pull request by an allowed author into a paid model call.
+    #
+    # THE ALLOWLIST TEST IS ANCHORED AT BOTH ENDS. `format('{0},', …)` anchors only the trailing
+    # delimiter, which makes it an unanchored substring test: an allowlist naming
+    # `FIRST_TIME_CONTRIBUTOR` would then also admit plain `CONTRIBUTOR` — anyone with one merged
+    # PR — to a command that spends money. `,{0},` on both sides makes each entry match whole.
+    # The consequence is that the input must be comma-separated with NO SPACES; a malformed
+    # allowlist fails CLOSED, and the gate job's first step says so in as many words.
     if: >-
       github.event.issue.pull_request &&
+      inputs.command != '' &&
       startsWith(github.event.comment.body, inputs.command) &&
-      contains(format('{0},', inputs.allowed_associations), format('{0},', github.event.comment.author_association))
+      contains(format(',{0},', inputs.allowed_associations), format(',{0},', github.event.comment.author_association))
     runs-on: ubuntu-latest
     # 10, not 5: the ancestry guard below makes two unauthenticated fetches, each up to 3 attempts
     # at a 40s wall-clock cap plus 15s of backoff, sequentially — ~270s worst case before the tool
@@ -250,6 +266,24 @@ jobs:
     outputs:
       enabled: ${{ steps.resolve.outputs.enabled }}
     steps:
+      # The allowlist is a comma-separated string, and the job's `if:` matches each entry with the
+      # commas around it. That is what stops `FIRST_TIME_CONTRIBUTOR` from admitting `CONTRIBUTOR`
+      # — and it also means a stray space makes an entry unmatchable, so the command would simply
+      # never fire for it. Fail-closed is the right direction for a spend gate, but silent is not:
+      # this says so out loud for any commenter who did get through. (An allowlist so malformed
+      # that it admits NOBODY cannot reach this step, which is why the input's own description
+      # leads with the requirement.)
+      - name: Validate the association allowlist
+        env:
+          ALLOWED: ${{ inputs.allowed_associations }}
+        run: |
+          set -euo pipefail
+          case "$ALLOWED" in
+            *[[:space:]]*)
+              echo "::error::allowed_associations must be comma-separated with NO SPACES (e.g. 'OWNER,MEMBER,COLLABORATOR'). An entry with whitespace around it can never match, so those associations are silently locked out of /derisk."
+              exit 1 ;;
+          esac
+          [ -n "$ALLOWED" ] || { echo "::error::allowed_associations is empty — nobody can run /derisk."; exit 1; }
       - name: Enforce workflows_ref pin contract
         env:
           WORKFLOWS_REF: ${{ inputs.workflows_ref }}
@@ -402,10 +436,14 @@ jobs:
     needs: gate
     if: needs.gate.outputs.enabled == 'true' && !cancelled()
     runs-on: ubuntu-latest
-    # The model call is bounded at 180s per attempt with up to 3 attempts, the grade waits on no
-    # check rollup, and everything else is a handful of API reads. 20 leaves room for the ancestry
-    # guard (~270s worst case) on top of that without letting a wedged call burn a full hour.
-    timeout-minutes: 20
+    # BUDGETED AGAINST THE WORST CASE, not the typical one. Unbounded retries put the worst case
+    # over this ceiling — two validation rounds x three attempts at 180s plus backoff is ~1110s by
+    # itself, on top of the ancestry guard's ~270s and collect's API reads — and a job killed by
+    # `timeout-minutes` is the ONE failure the `always()` publisher below cannot catch, so the
+    # person who typed `/derisk` would get nothing at all. plan-derisk.sh therefore holds its whole
+    # model phase to DERISK_MODEL_BUDGET_SECS (600s default, ~780s counting one in-flight call) and
+    # falls back honestly when it is spent; 25 leaves that, the guard and the reads real headroom.
+    timeout-minutes: 25
     permissions:
       contents: read        # the consumer's .github/risk.json override, read from the BASE ref
       pull-requests: write  # read the PR + its diff, and post/update the ONE advisory comment
@@ -601,6 +639,11 @@ jobs:
           ACTOR: ${{ github.event.comment.user.login }}
         run: |
           set -uo pipefail
+          # `_derisk/` is created by collect-pr-inputs.sh, which is exactly the step that may not
+          # have run: if the pin guard, the tool checkout or collect's own argument validation
+          # failed first, the redirect below has nowhere to write, the publisher dies on a missing
+          # PLAN, and NO comment is posted — on precisely the failures this step exists to cover.
+          mkdir -p "$(dirname "$PLAN")"
           if [ ! -s "$PLAN" ]; then
             printf '%s' '{"status":"failed","note":"the de-risk run failed before a plan was produced — see the workflow run for the failing step","steps":[]}' > "$PLAN"
           fi

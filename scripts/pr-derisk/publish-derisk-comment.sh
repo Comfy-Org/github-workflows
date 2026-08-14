@@ -55,7 +55,9 @@ log()  { printf '[publish-derisk-comment] %s\n' "$*" >&2; }
 warn() { printf '::warning::[publish-derisk-comment] %s\n' "$*" >&2; }
 die()  { printf '[publish-derisk-comment] ERROR %s\n' "$*" >&2; exit 2; }
 
-[ -n "$PLAN" ] && [ -f "$PLAN" ] || die "PLAN (path to the plan JSON) is required and must be readable"
+if [ -z "$PLAN" ] || [ ! -f "$PLAN" ]; then
+  die "PLAN (path to the plan JSON) is required and must be readable"
+fi
 command -v jq >/dev/null 2>&1 || die "jq is required"
 if [ "$DRY_RUN" != 1 ]; then
   [ -n "$REPO" ] || die "REPO is required"
@@ -81,28 +83,41 @@ cat <<'JQ'
 
     . as $p
     | ($p.headline_tier // null) as $tier
+    # THE COMPARISON AXIS IS THE PATH FLOOR, NOT THE HEADLINE, and mixing them up is how this
+    # comment claims a lane win it cannot deliver. `grade = worst(path_floor, provenance,
+    # reversibility)` but a split only moves the PATH axis: on a fork PR (provenance R3, path floor
+    # R0) or a `/derisk` typed while checks are still pending (reversibility R2), EVERY step reads
+    # "below" the headline while the axis that actually set the grade is untouched. Older plans
+    # carry no `path_floor_tier`, so the headline is the fallback there.
+    | (($p.path_floor_tier // $p.headline_tier) // null) as $ptier
     | ($p.steps // []) as $steps
     | ($p.status // "failed") as $status
     # THE VERDICT IS COMPUTED FROM THE FLOORS, NEVER FROM THE MODEL'S PROSE. `summary` is the
     # model's sentence and is rendered as such, below the fold; the line above the fold is
     # arithmetic over tiers the grader produced. That is what makes the single-class-monolith
-    # honesty rule a property rather than a request: when nothing lands below the headline there
+    # honesty rule a property rather than a request: when nothing lands below the path floor there
     # is no wording available here that claims a lane win.
-    | ([$steps[] | select((.floor | type) == "string" and ($tier | type) == "string"
-                          and (.floor | tier_rank) < ($tier | tier_rank))]) as $cheaper
-    | ([$steps[] | select((.floor | type) == "string" and ($tier | type) == "string"
-                          and (.floor | tier_rank) >= ($tier | tier_rank))]) as $atfloor
+    | ([$steps[] | select((.floor | type) == "string" and ($ptier | type) == "string"
+                          and (.floor | tier_rank) < ($ptier | tier_rank))]) as $cheaper
+    | ([$steps[] | select((.floor | type) == "string" and ($ptier | type) == "string"
+                          and (.floor | tier_rank) >= ($ptier | tier_rank))]) as $atfloor
     | ([$cheaper[] | .lines] | add // 0) as $cheap_lines
     | ($p.total_lines // 0) as $total
     | (if $total <= 0 then 0 else (100 * $cheap_lines / $total) | round end) as $cheap_pct
+    # Named explicitly when a NON-PATH axis holds the grade up, because then even a perfect
+    # partition cannot lower the lane and the reader is owed that in the same breath as the split.
+    | (if ($tier | type) == "string" and ($ptier | type) == "string"
+           and ($tier | tier_rank) > ($ptier | tier_rank)
+        then " The pull request's overall **\($tier)** is set by a non-path axis (provenance or reversibility), which no partition moves."
+        else "" end) as $axisnote
 
     | (if $status != "planned" then
          (if $status == "fallback" then "**No split plan** · " else "**`/derisk` failed** · " end)
          + ($p.note | md_text(600))
        elif ($cheaper | length) == 0 then
-         "**\($steps | length) smaller single-concern \($tier // "?")s — same lane.** Every step still path-floors at **\($tier // "?")**, so this split buys review focus, not a cheaper lane."
+         "**\($steps | length) smaller single-concern \($ptier // "?")s — same lane.** Every step still path-floors at **\($ptier // "?")**, so this split buys review focus, not a cheaper lane." + $axisnote
        else
-         "**Split into \($steps | length): \($cheaper | length) step(s) path-floor below \($tier // "?")** (\($cheap_pct)% of the changed lines), leaving \($atfloor | length) step(s) carrying the risk."
+         "**Split into \($steps | length): \($cheaper | length) step(s) path-floor below \($ptier // "?")** (\($cheap_pct)% of the changed lines), leaving \($atfloor | length) step(s) carrying the risk." + $axisnote
        end) as $headline
 
     | ([ "| # | step | files | lines | path floor |",

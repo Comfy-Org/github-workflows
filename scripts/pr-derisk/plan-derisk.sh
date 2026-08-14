@@ -62,6 +62,11 @@
 #   GRADER             path to grade-pr-risk.sh   (default ../pr-risk/grade-pr-risk.sh beside us)
 #   PR_RISK_MAP        risk map handed to the grader for the split floors (grader's own default
 #   PR_RISK_RUNBOOKS   when unset — set BOTH to the consumer overrides the PR was graded with)
+#   DERISK_MAX_TOKENS  output ceiling for the model call (default scales with the changed-file
+#                      count: 4000 + 120/file, capped at 32000 — the reply must name every path)
+#   DERISK_MODEL_BUDGET_SECS  wall-clock ceiling on the whole model phase, counted from script
+#                      start (default 600). No attempt STARTS past it; the job's timeout is set
+#                      above it so a wedged retry chain falls back instead of killing the job.
 #   MODEL_RESPONSE_FILE  test surface: read the model's reply from this file (JSONL — one line
 #                      per attempt) instead of calling the API. No network, no key needed.
 #
@@ -84,7 +89,15 @@ MAX_STEPS="${MAX_STEPS:-5}"
 GRADER="${GRADER:-$SELF_DIR/../pr-risk/grade-pr-risk.sh}"
 MODEL_RESPONSE_FILE="${MODEL_RESPONSE_FILE:-}"
 API_URL="${ANTHROPIC_API_URL:-https://api.anthropic.com/v1/messages}"
-MAX_TOKENS="${DERISK_MAX_TOKENS:-4000}"
+# Scaled below, once the changed-file count is known: an exact-coverage partition has to echo every
+# path back, so a fixed ceiling is a truncation the reader pays for. Overridable for tests.
+MAX_TOKENS="${DERISK_MAX_TOKENS:-}"
+# WALL-CLOCK BUDGET FOR THE MODEL PHASE, counted from script start (`SECONDS`). Two rounds x three
+# attempts at `--max-time 180` plus backoff is ~1110s on its own, which overran the job's
+# `timeout-minutes` — and a job killed by timeout is the ONE path where the `always()` publisher
+# never runs, so the person who typed `/derisk` gets nothing at all. Better to stop retrying and
+# render an honest fallback than to be killed mid-retry.
+MODEL_BUDGET_SECS="${DERISK_MODEL_BUDGET_SECS:-600}"
 
 log()  { printf '[plan-derisk] %s\n' "$*" >&2; }
 warn() { printf '::warning::[plan-derisk] %s\n' "$*" >&2; }
@@ -97,6 +110,10 @@ command -v jq >/dev/null 2>&1 || die "jq is required"
 
 case "$MAX_STEPS" in ''|*[!0-9]*) MAX_STEPS=5 ;; esac
 [ "$MAX_STEPS" -ge 2 ] || MAX_STEPS=2
+# A non-numeric budget would make the `-ge` test below a fatal error rather than a bound.
+case "$MODEL_BUDGET_SECS" in ''|*[!0-9]*) MODEL_BUDGET_SECS=600 ;; esac
+# Anything but a positive integer means "unset" — i.e. fall through to the file-count scaling.
+case "${MAX_TOKENS:-}" in *[!0-9]*|0) MAX_TOKENS='' ;; esac
 
 SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/plan-derisk.XXXXXX")" || die "mktemp failed"
 trap 'rm -rf "$SCRATCH"' EXIT
@@ -105,22 +122,53 @@ trap 'rm -rf "$SCRATCH"' EXIT
 # Everything below is READ from the record; nothing is re-derived. A second reading of the diff
 # here would be a second grading model, and the whole point is that there is only one.
 TIER="$(jq -r '.risk.tier // "unknown"' "$RECORD" 2>/dev/null)"
+# THE PATH-AXIS FLOOR, CARRIED SEPARATELY FROM THE HEADLINE, and the distinction is load-bearing.
+# `grade = worst(path_floor, provenance, reversibility)`, but a split only ever moves the PATH axis.
+# Comparing a step's computed path floor against the HEADLINE would read "below R3" for every step
+# of a fork PR (provenance R3, path floor R0) or of a `/derisk` typed while checks are pending
+# (reversibility R2) — a lane win the split cannot deliver, claimed on exactly the pull requests
+# the no-fake-lane-win rule exists for. The renderer compares against this instead.
+PATH_TIER="$(jq -r '.risk.axes.path_floor.tier // ""' "$RECORD" 2>/dev/null)"
 STATUS="$(jq -r '.risk.status // "unknown"' "$RECORD" 2>/dev/null)"
 FILES_JSON="$(jq -c '[.risk.axes.path_floor.files[]? ]' "$RECORD" 2>/dev/null)"
 [ -n "$FILES_JSON" ] || FILES_JSON='[]'
 NFILES="$(jq 'length' <<<"$FILES_JSON")"
+case "$NFILES" in ''|*[!0-9]*) NFILES=0 ;; esac
+
+# The reply has to name every changed path back at us (exact coverage is validated), so the output
+# ceiling is a function of the file count, not a constant. A truncated reply is not a cheap failure:
+# it is misread as "not a single JSON object", re-prompted identically, and burns BOTH paid calls.
+if [ -z "$MAX_TOKENS" ]; then
+  MAX_TOKENS=$(( 4000 + 120 * NFILES ))
+  [ "$MAX_TOKENS" -le 32000 ] || MAX_TOKENS=32000
+fi
 
 # `emit <status> <note> [plan-json]` — the ONE exit point, so every branch produces the same
 # object shape and the renderer never has to guess which fields a given status carries.
+#
+# ASSEMBLED TO A FILE AND CHECKED, never streamed straight to stdout: this is the sole exit point,
+# and a jq that failed here would have printed nothing and still exited 0, silently breaking the
+# "ONE plan JSON object on stdout" contract AFTER the model call was already paid for. On failure
+# the fixed literal below is emitted instead — it interpolates nothing, so it cannot fail in turn.
 emit() {
-  jq -n --arg status "$1" --arg note "$2" --argjson steps "${3:-[]}" \
-        --arg tier "$TIER" --arg model "$DERISK_MODEL" \
-        --argjson files "$FILES_JSON" --argjson record "$(cat "$RECORD")" '
+  local out="$SCRATCH/emit.json"
+  # --slurpfile, not `--argjson "$(cat …)"`: the whole graded record as one argv string exceeds
+  # Linux's 128 KiB MAX_ARG_STRLEN on a PR with a few hundred changed files, and the only thing
+  # read out of it is `.risk.reason`.
+  if jq -n --arg status "$1" --arg note "$2" --argjson steps "${3:-[]}" \
+        --arg tier "$TIER" --arg path_tier "$PATH_TIER" --arg model "$DERISK_MODEL" \
+        --argjson files "$FILES_JSON" --slurpfile record "$RECORD" '
     {status:$status, note:$note, headline_tier:(if $tier == "" then null else $tier end),
+     path_floor_tier:(if $path_tier == "" then null else $path_tier end),
      model:$model, steps:$steps, changed_files:($files | length),
      total_lines: ([$files[] | (.additions // 0) + (.deletions // 0)] | add // 0),
-     record_reason: ($record.risk.reason // null)}'
-  exit 0
+     record_reason: ($record[0].risk.reason // null)}' > "$out" && [ -s "$out" ]; then
+    cat "$out"
+    exit 0
+  fi
+  log "the plan JSON could not be assembled"
+  printf '%s\n' '{"status":"failed","note":"the plan JSON could not be assembled — see the run log","headline_tier":null,"path_floor_tier":null,"steps":[],"changed_files":0,"total_lines":0}'
+  exit 2
 }
 
 if [ "$STATUS" != ok ] || [ "$TIER" = null ] || [ "$TIER" = unknown ]; then
@@ -129,7 +177,10 @@ fi
 if [ "$NFILES" -lt 2 ]; then
   emit fallback "this pull request changes $NFILES file(s) — there is nothing to partition"
 fi
-if [ "$OVERSIZED" = 1 ] || [ -z "$DIFF_FILE" ] || [ ! -f "$DIFF_FILE" ]; then
+# `-s`, not `-f`: a zero-byte diff file is a read that failed quietly (a followed redirect returns
+# 200 with an empty body — grade-targets.sh's `fetch_override` documents the same trap), and asking
+# the model to partition a diff it never saw returns a confident, evidence-free plan.
+if [ "$OVERSIZED" = 1 ] || [ -z "$DIFF_FILE" ] || [ ! -s "$DIFF_FILE" ]; then
   emit fallback "the diff is too large to plan against (or could not be read), so no partition was proposed. The v0 reducibility readout on the risk grade still names which files hold the tier up and what the remainder would floor at."
 fi
 
@@ -179,6 +230,9 @@ build_user_prompt() { # <retry-note>
 # MODEL_RESPONSE_FILE is the hermetic test surface and is checked FIRST, so the suite can drive
 # every branch below — including both validation attempts — with no key and no network.
 ATTEMPT=0
+# Set when a failure has a SPECIFIC diagnosis worth re-prompting on (today: the reply was cut off
+# at the output token limit). Empty means "the call failed and there is nothing to tell the model".
+CALL_NOTE=""
 call_model() { # <retry-note> -> raw assistant text on stdout, rc 1 on failure
   local retry="$1" body out http n
   ATTEMPT=$((ATTEMPT + 1))
@@ -206,6 +260,12 @@ call_model() { # <retry-note> -> raw assistant text on stdout, rc 1 on failure
   # A 4xx that is not 429 is definitive and is never retried.
   local try
   for try in 1 2 3; do
+    # Checked BEFORE each attempt, so the budget bounds when a call may START; the in-flight
+    # `--max-time` bounds how long it may then run. Together they cap the model phase.
+    if [ "$SECONDS" -ge "$MODEL_BUDGET_SECS" ]; then
+      log "the ${MODEL_BUDGET_SECS}s model budget is spent — not starting another attempt"
+      return 1
+    fi
     out="$SCRATCH/resp-$ATTEMPT-$try.json"
     http="$(curl -sS --max-time 180 -o "$out" -w '%{http_code}' -X POST "$API_URL" \
               -H "x-api-key: ${ANTHROPIC_API_KEY}" \
@@ -214,6 +274,15 @@ call_model() { # <retry-note> -> raw assistant text on stdout, rc 1 on failure
               --data-binary @"$body" 2>"$SCRATCH/curl-err.txt")" || http=000
     case "$http" in
       200)
+        # TRUNCATION IS ITS OWN DIAGNOSIS. A reply cut off at `max_tokens` is not malformed JSON —
+        # it is a complete answer that did not fit. Reported as "your reply was not a single JSON
+        # object" it was re-prompted with an identical, still-too-long request and burned both paid
+        # calls; named, the retry can at least ask for a more compact one.
+        if [ "$(jq -r '.stop_reason // ""' "$out" 2>/dev/null)" = "max_tokens" ]; then
+          log "the model reply was truncated at the ${MAX_TOKENS}-token output limit"
+          CALL_NOTE="your previous reply was CUT OFF at the output token limit before it was complete. Return the same partition far more compactly — one short sentence per description, inertness and review_ask — while still listing every file."
+          return 1
+        fi
         # `.content[]` filtered to text blocks, not `.content[0]`: a response whose first block is
         # not text would otherwise read back as an empty reply and be reported as a malformed plan.
         jq -er '[.content[]? | select(.type == "text") | .text] | join("") | select(length > 0)' "$out" && return 0
@@ -236,6 +305,10 @@ call_model() { # <retry-note> -> raw assistant text on stdout, rc 1 on failure
 # listed src/b.go twice" is.
 validate_partition() { # <plan-json-file> -> rc 0, or a reason on stdout with rc 1
   local pf="$1" problem
+  # Flattened: `$problem` quotes model- and PR-controlled path strings, and it is both logged and
+  # fed back into the prompt. A newline in it would put the remainder of the line at column 0 of a
+  # PUBLIC run log, where the runner parses `::add-mask::` / `::stop-commands::` / a forged
+  # `::error::`. Every other diagnostic here already goes through the same `tr`.
   problem="$(jq -r --argjson files "$FILES_JSON" --argjson max "$MAX_STEPS" '
       ([$files[] | .path]) as $want
     | (.steps // []) as $steps
@@ -244,6 +317,13 @@ validate_partition() { # <plan-json-file> -> rc 0, or a reason on stdout with rc
       elif any($steps[]; (.files | type) != "array" or (.files | length) == 0)
         then "every step must assign at least one file"
       elif any($steps[]; (.name // "") == "") then "every step must carry a name"
+      # A SCALAR `depends_on` type-errors the merge jq downstream, and that jq errors into an empty
+      # STEPS — which used to emit `planned` with no steps at all. Caught here instead, where it is
+      # a retryable, explainable rejection rather than a silent empty plan.
+      elif any($steps[]; has("depends_on") and (.depends_on | type) != "array")
+        then "depends_on must be an ARRAY of zero-based indices of earlier steps (or omitted)"
+      elif any($steps[]; (.depends_on // [])[] | type != "number")
+        then "every entry in depends_on must be a number"
       else
         ([$steps[] | .files[]]) as $got
         | ($want - $got) as $missing
@@ -253,7 +333,8 @@ validate_partition() { # <plan-json-file> -> rc 0, or a reason on stdout with rc
           elif ($dupes | length) > 0 then "these files were assigned to more than one step: \($dupes | join(", "))"
           elif ($unknown | length) > 0 then "these paths are not in this pull request: \($unknown | join(", "))"
           else "" end
-      end' "$pf" 2>/dev/null)" || problem="the reply was not a JSON object with a steps array"
+      end' "$pf" 2>/dev/null | tr '\r\n' '  ' | sed 's/[[:space:]]*$//')" \
+    || problem="the reply was not a JSON object with a steps array"
   [ -n "$problem" ] || return 0
   printf '%s' "$problem"
   return 1
@@ -277,6 +358,14 @@ GOT_PLAN=0
 FAIL_REASON=""
 for round in 1 2; do
   if ! call_model "$RETRY_NOTE" > "$SCRATCH/raw-$round.txt"; then
+    # A diagnosed failure (today: a truncated reply) is worth the second round with a note the
+    # model can act on. Everything else — HTTP, no key, no curl — is not retried here: call_model
+    # already made its own three attempts, and a second round would just repeat them.
+    if [ -n "$CALL_NOTE" ]; then
+      RETRY_NOTE="$CALL_NOTE"; CALL_NOTE=""
+      FAIL_REASON="the model's reply was truncated at its output token limit"
+      continue
+    fi
     FAIL_REASON="the model call failed (see the run log for the HTTP status)"
     break
   fi
@@ -360,15 +449,27 @@ STEPS="$(jq -sc --argjson files "$FILES_JSON" --slurpfile plan "$PLAN" '
            name: ($s.name // "step \($e.key + 1)"),
            description: ($s.description // ""),
            files: ($s.files // []),
+           # BOUNDED BY THE INDEX OF THE STEP ITSELF, not by the chain length. "Lands after: step
+           # N" is the entire product of a plan, and a self-reference, a forward reference or a
+           # two-step cycle each render an ordering nobody can execute. Only EARLIER steps may be
+           # depended on, which makes a cycle unrepresentable rather than merely unlikely.
+           # (No apostrophes in here: the whole jq program is a single-quoted shell string.)
            depends_on: ([($s.depends_on // [])[] | select(type == "number") | floor
-                         | select(. >= 0 and . < ($plan[0].steps | length))] | unique),
+                         | select(. >= 0 and . < $e.key)] | unique),
            inertness: ($s.inertness // ""),
            review_ask: ($s.review_ask // ""),
            lines: ([$sf[] | (.additions // 0) + (.deletions // 0)] | add // 0),
            floor: ($g.risk.axes.path_floor.tier // null),
            floor_status: ($g.risk.axes.path_floor.status // "unknown"),
            floor_reason: ($g.risk.axes.path_floor.reason // null)})' \
-  "$SCRATCH/graded.jsonl")"
+  "$SCRATCH/graded.jsonl")" || STEPS=""
+
+# CHECKED, because an unchecked capture here is a `planned` comment with an empty chain table: the
+# steps the reader came for, silently gone, under a headline that counts them.
+if ! jq -e 'type == "array" and length > 0' >/dev/null 2>&1 <<<"${STEPS:-}"; then
+  warn "the partition could not be merged with the computed floors"
+  emit fallback "a partition was proposed and its floors were computed, but the two could not be merged into a chain, so nothing is shown rather than a plan with steps missing from it."
+fi
 
 SUMMARY="$(jq -r '.summary // ""' "$PLAN")"
 emit planned "$SUMMARY" "$STEPS"
