@@ -117,10 +117,29 @@ jobs:
   cursor-review:
     uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@<sha>  # v1
     with:
-      # Exclude generated/vendored paths from BOTH the size cap and the diff.
-      diff_excludes: >-
-        :!**/package-lock.json
-        :!**/*.generated.*
+      # Repo-specific generated/vendored paths, excluded from BOTH the size cap
+      # and the diff. Base-ref `linguist-generated` files, the Go codegen marker
+      # and eight common lockfile base names (go.sum, go.work.sum,
+      # package-lock.json, pnpm-lock.yaml, yarn.lock, Cargo.lock, poetry.lock,
+      # uv.lock) are built into the classifier — you never list THOSE. Any other
+      # lockfile (Gemfile.lock, composer.lock, Pipfile.lock, bun.lock,
+      # flake.lock, gradle.lockfile) is NOT built in — add it to
+      # `extra_lockfiles`. Setting this input REPLACES the default list, so the
+      # defaults are re-stated verbatim below and the repo's own paths appended.
+      # Path shape is load-bearing in BOTH directions: a pattern with no `/`
+      # matches the base name only, while a pattern WITH a `/` is anchored to
+      # the whole repo-relative path unless it starts with `**/`. So
+      # `data/object_info.json.gz` below matches only the ROOT-level file — use
+      # `**/data/object_info.json.gz` to catch it at any depth.
+      extra_generated_globs: >-
+        **/node_modules/**
+        **/dist/**
+        **/vendor/**
+        **/*.generated.*
+        **/*.min.js
+        **/*.min.css
+        data/object_info.json.gz
+        **/*.snap
       # REQUIRED — the same SHA as the `uses:` pin above.
       workflows_ref: <sha>
     secrets:
@@ -189,11 +208,12 @@ All optional except `workflows_ref` (required, no default) — pass them under
 | `diff_size_cap` | `5000` | Max counted changed lines (after generated-file exclusion and comment discounting); larger PRs are skipped. |
 | `ignore_comments` | `true` | Discount blank/comment-only lines from the size count (count-only; the panel still sees them). |
 | `review_label` | `cursor-review` | Label whose addition triggers the review. |
-| `extra_generated_globs` | `node_modules`, `dist`, `vendor`, minified/`.generated.` files | Extra globs the shared `check-pr-size` classifier treats as generated — excluded from BOTH the size count and the reviewed diff. |
-| `extra_lockfiles` | `''` | Extra lockfile base names for the classifier, on top of its built-ins. |
-| `diff_excludes` | `''` | Pathspecs excluded from the reviewed diff ONLY (not the size count) — back-compat escape hatch; prefer `extra_generated_globs`. |
+| `extra_generated_globs` | `**/node_modules/**`<br>`**/dist/**`<br>`**/vendor/**`<br>`**/*.generated.*`<br>`**/*.min.js`<br>`**/*.min.css` | Extra globs the shared `check-pr-size` classifier treats as generated — excluded from BOTH the size count and the reviewed diff. Setting it **replaces** the defaults; re-state them verbatim. Path shape is load-bearing both ways: a pattern with no `/` matches only the base name (bare `node_modules` excludes nothing under the directory), while a pattern **with** a `/` is anchored to the full repo-relative path unless it opens with `**/` (`data/gen.json` misses `pkg/x/data/gen.json`). `.claude` is deliberately absent — see [the setup guide](../../docs/callers/cursor-review.md). |
+| `extra_lockfiles` | `''` | Extra lockfile **base names** for the classifier, on top of its built-ins (`go.sum`, `go.work.sum`, `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `Cargo.lock`, `poetry.lock`, `uv.lock`). Anything else — `Gemfile.lock`, `composer.lock`, `Pipfile.lock`, `bun.lock`, `flake.lock`, `gradle.lockfile` — is **not** built in and must be listed here. A path (anything containing `/`) is rejected. |
+| `diff_excludes` | `''` | Pathspecs excluded from the reviewed diff ONLY (not the size count) — back-compat escape hatch; prefer `extra_generated_globs`. Entries need pathspec-magic (`:!…`); a plain path excludes nothing. One caveat before you empty it: if `check-pr-size` itself fails, the run degrades to rebuilding the patch as `git diff "$BASE...$HEAD" -- . $DIFF_EXCLUDES`, where **only `diff_excludes` applies** and the classifier globs are not consulted — so on a degraded run a caller that moved everything to `extra_generated_globs` feeds its vendored/minified trees to all 8 panel cells plus the judge. Keeping the heaviest trees listed in both inputs is the belt-and-braces option. |
 | `workflows_ref` | **required** (no default) | Ref this directory's prompts/scripts are loaded from. Must be the same commit SHA as your `uses:` pin — omit it and the run fails fast, because pinning `uses:` while loading scripts from a mutable branch defeats the pin. |
 | `bot_app_id` | `''` | Optional GitHub App ID; when set (with `BOT_APP_PRIVATE_KEY`), the review posts under that App's identity instead of `github-actions[bot]`. |
+| `ledger_prior_review` | `true` | Give each round the prior rounds' findings + author replies, so a refuted or deferred finding is not re-litigated. |
 | `run_without_label` | `false` | Run on plain PR events instead of requiring the trigger label. Also requires widening the caller's `types:` — see [the setup guide](../../docs/callers/cursor-review.md). |
 
 There is **no `blocking` input** — see [the regression note

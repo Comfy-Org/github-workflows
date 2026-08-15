@@ -31,7 +31,20 @@ name: Cursor Review (reusable)
 #         # and the reviewed diff — the same codegen detection the PR-size cap
 #         # uses (lockfiles, base-ref linguist-generated, Go markers are already
 #         # built in). Use diff_excludes only for diff-only, non-generated paths.
+#         # Setting this REPLACES the default list, so the defaults are re-stated
+#         # verbatim here before the repo's own paths. These are plain globs, not
+#         # git pathspecs (no `:!` prefix — that is diff_excludes' syntax), and
+#         # the shape is load-bearing both ways: a pattern with no `/` matches
+#         # the base name only, while one WITH a `/` is anchored to the whole
+#         # repo-relative path unless it opens with `**/` — so the
+#         # data/object_info.json.gz below is root-only on purpose.
 #         extra_generated_globs: >-
+#           **/node_modules/**
+#           **/dist/**
+#           **/vendor/**
+#           **/*.generated.*
+#           **/*.min.js
+#           **/*.min.css
 #           data/object_info.json.gz
 #           **/*.snap
 #         # REQUIRED. Pin the assets ref to the SAME commit SHA you pin `uses:`
@@ -97,8 +110,14 @@ on:
           exact same "what is codegen" logic the PR-size cap uses, so the two
           workflows can't drift. `*` matches within a path segment, `**` across
           segments, `?` one character; a pattern without `/` matches the base
-          name at any depth. This is the preferred knob for generated/vendored
-          paths: the classifier already covers dependency lockfiles, files
+          name at any depth, while a pattern WITH a `/` is anchored to the whole
+          repo-relative path unless it opens with `**/` (`data/gen.json` misses
+          `pkg/x/data/gen.json`). These are plain globs, not git pathspecs — a
+          `:!` prefix carried over from `diff_excludes` is matched literally and
+          excludes nothing. This is the preferred knob for generated/vendored
+          paths: the classifier already covers eight common dependency lockfiles
+          (see `extra_lockfiles` for the exact set — anything outside it, e.g.
+          Gemfile.lock or composer.lock, must be added there), files
           marked `linguist-generated` in the BASE ref's `.gitattributes` (so a
           PR can't exempt itself), and the canonical Go
           `// Code generated ... DO NOT EDIT.` marker — so you rarely need more.
@@ -107,11 +126,18 @@ on:
           as `.gitattributes`): a PR cannot hide a file from review by adding
           the marker, and a file NEW in the PR never matches it — cover newly
           generated files with a glob here or a base `.gitattributes` rule.
+          Supplying this input REPLACES the default list wholesale, so restate
+          the defaults you still want: a repo whose `.claude/` tree is
+          vendored/tool-installed output (a BMAD-method install, say) rather
+          than hand-authored agent instructions should pass the defaults plus
+          its own `**/.claude/**` glob — hand-authored agent instructions are
+          prose worth reviewing, so the default no longer excludes them. Until
+          such a repo does, that tree counts against `diff_size_cap`, and a PR
+          over the cap is skipped silently (no review, no Slack notice).
         type: string
         required: false
         default: >-
           **/node_modules/**
-          **/.claude/**
           **/dist/**
           **/vendor/**
           **/*.generated.*
