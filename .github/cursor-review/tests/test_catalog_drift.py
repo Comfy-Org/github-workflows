@@ -14,8 +14,11 @@ things, so these tests pin exactly those:
     grouped by the labs the pins actually use, and the audit date goes stale at
     the threshold, not before.
   * **reporting** — NO-ZDR markers survive into the body verbatim, the raw
-    catalog is folded into a <details> block, and a clean run says so (that is
-    what closes the sticky issue).
+    catalog is folded into a <details> block, a clean run says so (that is what
+    closes the sticky issue), and the same-lab review-me list collapses
+    reasoning/speed tiers into one row per family, newest family first, so the
+    row cap drops the oldest rather than an arbitrary tail of Cursor's print
+    order (BE-6911 — see `TierCollapseTest`).
 
 Run: python3 -m unittest discover -s .github/cursor-review/tests -p 'test_*.py'
 """
@@ -83,6 +86,34 @@ fable-5-max (NO ZDR)
 PANEL = ["gpt-5.6-sol-max", "claude-opus-4-8-thinking-max", "gemini-3.1-pro", "kimi-k2.7-code"]
 JUDGE = "claude-opus-4-8-thinking-max"
 TODAY = datetime.date(2026, 7, 27)
+
+# The real `cursor-agent models` output captured verbatim in the 2026-08-10
+# sticky issue (Comfy-Org/github-workflows#144), with the pins that run reported
+# against. It is the whole reason BE-6911 exists — 178 unpinned same-lab ids, in
+# which the two genuinely new families (`gpt-5.6-terra-*`, `gpt-5.6-luna-*`) sat
+# below a 25-row head truncation — so the rendering fix is asserted against it
+# rather than against a hand-built approximation of it.
+REAL_CATALOG_PATH = os.path.join(os.path.dirname(__file__), "fixtures", "catalog-2026-08-10.txt")
+REAL_PANEL = ["gpt-5.6-sol-max", "claude-opus-5-thinking-max", "gemini-3.1-pro", "kimi-k3-max"]
+REAL_JUDGE = "claude-opus-5-thinking-max"
+
+
+def real_catalog():
+    with open(REAL_CATALOG_PATH, encoding="utf-8") as handle:
+        return handle.read()
+
+
+def lab_rows(body, lab):
+    """The rendered rows of one lab group in the same-lab review-me list."""
+    section = body[body.index("## Unpinned same-lab") :]
+    section = section[section.index(f"**`{lab}`** (pinned:") :]
+    rows = []
+    for line in section.splitlines()[1:]:
+        if line.startswith("**`") or line.startswith("<details>") or line.startswith("## "):
+            break
+        if line.startswith("- "):
+            rows.append(line)
+    return rows
 
 
 def analyze(catalog=CATALOG, panel=None, judge=JUDGE, last_checked=datetime.date(2026, 7, 14), today=TODAY):
@@ -547,7 +578,7 @@ class RenderTest(unittest.TestCase):
         self.assertIn("more", body)
         # The sections that follow the fold survive.
         self.assertIn("Raw <code>cursor-agent models</code> output", body)
-        self.assertIn("This issue is sticky", body)
+        self.assertIn("Filed by the weekly", body)
 
     def test_the_unpinned_families_fold_names_what_it_truncated(self):
         # Silent truncation would read as "these are all the families" — the one
@@ -586,7 +617,7 @@ class RenderTest(unittest.TestCase):
         self.assertNotIn("report truncated", body)
         self.assertEqual(body.count("<details>"), body.count("</details>"))
         # The sections after the big lists survive, well-formed.
-        self.assertIn("This issue is sticky", body)
+        self.assertIn("Filed by the weekly", body)
         self.assertIn("cursor-agent models", body)
 
     def test_the_raw_fold_shrinks_to_the_budget_the_report_left_over(self):
@@ -653,6 +684,512 @@ class RenderTest(unittest.TestCase):
         catalog = "\n".join(PANEL) + "\n"
         body = cd.render_body(analyze(catalog=catalog), catalog)
         self.assertIn("No drift", body)
+
+
+class FooterTest(unittest.TestCase):
+    """BE-6912 — the footer describes THIS issue's state, and only promises a close it can keep.
+
+    The defect this pins: the footer told every reader "closed automatically once
+    a run finds no drift" on an issue that cannot reach that state. `unpinned`
+    counts toward `has_findings`, and any real catalog lists more reasoning tiers
+    per pinned lab than the panel pins one of — issue #144 is the proof (178
+    unpinned same-lab ids, zero delisted pins, run green, issue open forever). A
+    reader taking the footer at face value concludes the drift has gone
+    unaddressed for weeks and skims — on the one issue that is also where a
+    delisted pin (which fails the review preflight on the very next consumer PR)
+    and a NO-ZDR pin (private diffs to a model that may retain them) get
+    reported.
+    """
+
+    # The exact promise that could never be kept. Nothing may reintroduce it on a
+    # report that has findings, in any wording that still reads as "this closes
+    # itself once the drift is dealt with".
+    BROKEN_PROMISE = "closed automatically once a run finds no drift"
+
+    def urgent_delisted(self):
+        catalog = CATALOG.replace("kimi-k2.7-code\n", "kimi-k3-code\n")
+        return analyze(catalog=catalog), catalog
+
+    def urgent_zdr(self):
+        catalog = CATALOG.replace("gemini-3.1-pro\n", "gemini-3.1-pro (NO ZDR)\n")
+        return analyze(catalog=catalog), catalog
+
+    def advisory(self):
+        # Stock fixtures: `gpt-5.6-sol` is an unpinned same-lab id and
+        # `fable-5-max` an unpinned family, so there are findings — but no pin is
+        # delisted or marked NO-ZDR, and the audit date is 13 days old. This is
+        # the steady state of the real check.
+        return analyze(), CATALOG
+
+    def clean(self):
+        catalog = "\n".join(PANEL) + "\n"
+        return analyze(catalog=catalog), catalog
+
+    def stale_only(self):
+        # The one findings state with NO standing list holding the issue open:
+        # a catalog trimmed to exactly the pins, with an overdue audit date. It
+        # really does close once the date is refreshed, so the footer must not
+        # tell this reader the issue stays open indefinitely.
+        catalog = "\n".join(PANEL) + "\n"
+        return analyze(catalog=catalog, last_checked=TODAY - datetime.timedelta(days=60)), catalog
+
+    def urgent_repin_drains_the_list(self):
+        # The mirror image of the advisory overclaim, on the urgent arm: the
+        # delisted pin's lab has exactly ONE unpinned catalog id left — the
+        # obvious replacement — and no other lab offers one, so repinning to it
+        # empties `unpinned` and the issue really does close. The pre-repin
+        # snapshot says "standing list", which is why reading it as "it will not
+        # close once you repin" was wrong (BE-6912 review).
+        catalog = (
+            "\n".join(["gpt-5.6-sol-max", "claude-opus-4-8-thinking-max", "gemini-3.1-pro"])
+            + "\nkimi-k3-code\n"
+        )
+        return analyze(catalog=catalog), catalog
+
+    def urgent_repin_is_homeless(self):
+        # Round 2 of the same overclaim: the urgent pin's lab offers NO same-lab
+        # id at all (the 🚨 section prints "_(no same-lab id in the catalog)_"),
+        # so the replacement has to be taken from another lab's review-me
+        # group — and charging that repin to its own, empty, lab left the strong
+        # claim standing on the one candidate the repin consumes.
+        catalog = "gpt-5.6-sol-max\ngpt-5.6-sol\n"
+        panel = ["gpt-5.6-sol-max", "kimi-k2.7-code"]
+        return analyze(catalog=catalog, panel=panel, judge="gpt-5.6-sol-max"), catalog
+
+    def new_family_only(self):
+        # Findings, none urgent, and `unpinned` holds a wholly NEW one-tier
+        # family of a pinned lab — not an extra reasoning tier of a family the
+        # panel already pins. Pinning it (the action the review-me list asks
+        # for) empties the list, so this issue is not permanent.
+        catalog = "\n".join(PANEL) + "\ngpt-6-omega\n"
+        return analyze(catalog=catalog), catalog
+
+    def families_only(self):
+        # Findings, none urgent, and the only list holding the issue open is the
+        # unpinned-FAMILIES fold: every lab the panel pins is fully pinned, so
+        # no extra reasoning tier is involved.
+        catalog = "\n".join(PANEL) + "\nfable-5-max (NO ZDR)\n"
+        return analyze(catalog=catalog), catalog
+
+    def all_arms(self):
+        return [
+            ("delisted", self.urgent_delisted()),
+            ("zdr", self.urgent_zdr()),
+            ("drained", self.urgent_repin_drains_the_list()),
+            ("homeless", self.urgent_repin_is_homeless()),
+            ("advisory", self.advisory()),
+            ("new_family", self.new_family_only()),
+            ("families", self.families_only()),
+            ("stale_only", self.stale_only()),
+            ("clean", self.clean()),
+        ]
+
+    def test_the_fixtures_map_onto_the_states_the_footer_describes(self):
+        # The footer's three arms are `urgent` / findings-but-not-urgent / clean.
+        # If these flags ever move, the assertions below stop testing the arm
+        # they name, so pin the mapping rather than assume it.
+        for name, (report, _) in [
+            ("delisted", self.urgent_delisted()),
+            ("zdr", self.urgent_zdr()),
+        ]:
+            self.assertTrue(report["urgent"], name)
+            self.assertTrue(report["has_findings"], name)
+        advisory, _ = self.advisory()
+        self.assertFalse(advisory["urgent"])
+        self.assertTrue(advisory["has_findings"])
+        clean, _ = self.clean()
+        self.assertFalse(clean["urgent"])
+        self.assertFalse(clean["has_findings"])
+
+    def test_an_urgent_report_tells_the_reader_to_act_now(self):
+        for name, (report, catalog) in [
+            ("delisted", self.urgent_delisted()),
+            ("zdr", self.urgent_zdr()),
+        ]:
+            body = cd.render_body(report, catalog)
+            footer = cd._footer(report)
+            self.assertTrue(body.rstrip("\n").endswith(footer), name)
+            self.assertIn("Act on this now", footer)
+            self.assertIn("delisted or marked NO-ZDR", footer)
+            # It must not tell the reader to wait for an auto-close that the
+            # advisory list below keeps out of reach — the honest promise is
+            # that repinning drops the 🚨 section on the next run.
+            self.assertNotIn(self.BROKEN_PROMISE, footer)
+        # The strong "it will not close once you repin" belongs to the fixture
+        # whose delisted lab still offers a same-lab replacement; the NO-ZDR
+        # fixture's lab offers none, which is the homeless case below.
+        self.assertIn("will **not** close itself once you repin", cd._footer(self.urgent_delisted()[0]))
+
+    def test_an_advisory_report_says_nothing_is_urgent_and_that_staying_open_is_normal(self):
+        report, catalog = self.advisory()
+        body = cd.render_body(report, catalog)
+        footer = cd._footer(report)
+        self.assertTrue(body.rstrip("\n").endswith(footer))
+        self.assertIn("Nothing here is urgent", footer)
+        self.assertIn("stays open indefinitely", footer)
+        self.assertIn("not a sign anyone is ignoring it", footer)
+        # The whole point: this arm promises no close, because it never gets one.
+        self.assertNotIn(self.BROKEN_PROMISE, footer)
+        self.assertNotIn("closes the issue", footer)
+        # And it points at how an urgent report will look instead, so a reader
+        # can tell the two apart without ever seeing the other one.
+        self.assertIn("act on this now", footer.lower().split("nothing here is urgent")[1])
+
+    def test_a_findings_report_with_no_standing_list_is_not_told_it_stays_open_forever(self):
+        # The mirror image of the bug being fixed: an issue that WILL close on
+        # its own must not be described as permanent. Only the stale audit date
+        # is open here, and refreshing it clears `has_findings`.
+        report, catalog = self.stale_only()
+        self.assertFalse(report["urgent"])
+        self.assertTrue(report["has_findings"])
+        self.assertEqual(report["unpinned"], [])
+        self.assertEqual(report["unpinned_labs"], [])
+        footer = cd._footer(report)
+        self.assertIn("Nothing here is urgent", footer)
+        self.assertNotIn("stays open indefinitely", footer)
+        self.assertIn("closes itself on the first run that finds nothing at all", footer)
+        self.assertIn(footer, cd.render_body(report, catalog))
+
+    def test_an_urgent_repin_that_empties_the_list_is_not_promised_a_permanent_issue(self):
+        # The urgent arm's claim is about the state AFTER the repin, but it is
+        # made from the snapshot BEFORE it. Where the repin consumes the last
+        # standing candidate, the issue does close, and the strong claim has to
+        # stand down to the weaker one that is true in every state.
+        report, catalog = self.urgent_repin_drains_the_list()
+        self.assertTrue(report["urgent"])
+        self.assertEqual([g["lab"] for g in report["unpinned"]], ["kimi"])
+        self.assertEqual(len(report["unpinned"][0]["candidates"]), 1)
+        self.assertEqual(report["unpinned_labs"], [])
+        self.assertFalse(cd._standing_after_repin(report))
+        footer = cd._footer(report)
+        self.assertIn("Act on this now", footer)
+        self.assertNotIn("will **not** close itself", footer)
+        self.assertIn("closes itself on the first run that finds nothing at all", footer)
+        # Not a hypothetical: run the repin the footer is describing and the
+        # next report has nothing left to report.
+        repinned = analyze(
+            catalog=catalog,
+            panel=["gpt-5.6-sol-max", "claude-opus-4-8-thinking-max", "gemini-3.1-pro", "kimi-k3-code"],
+        )
+        self.assertFalse(repinned["has_findings"])
+        # The stock delisted fixture keeps the strong claim — a repin there
+        # leaves `gpt-5.6-sol` standing, so this is a stand-down, not a blanket
+        # retreat.
+        self.assertTrue(cd._standing_after_repin(self.urgent_delisted()[0]))
+
+    def test_an_urgent_pin_whose_lab_offers_nothing_cannot_be_charged_to_that_lab(self):
+        # BE-6912 review round 2: charging the repin to the urgent pin's OWN lab
+        # assumes a same-lab replacement exists. Where it does not, the reader
+        # has to take one from another lab's review-me group, and the group
+        # holding the issue open is the one being drained.
+        report, catalog = self.urgent_repin_is_homeless()
+        self.assertTrue(report["urgent"])
+        self.assertEqual([d["id"] for d in report["delisted"]], ["kimi-k2.7-code"])
+        self.assertEqual(report["delisted"][0]["same_lab_available"], [])
+        # One lone candidate, and it is in a lab with no urgent pin at all — the
+        # exact shape the per-lab count read as "1 > 0, claim survives".
+        self.assertEqual([g["lab"] for g in report["unpinned"]], ["gpt"])
+        self.assertEqual([c["id"] for c in report["unpinned"][0]["candidates"]], ["gpt-5.6-sol"])
+        self.assertFalse(cd._standing_after_repin(report))
+        footer = cd._footer(report)
+        self.assertIn("Act on this now", footer)
+        self.assertNotIn("will **not** close itself", footer)
+        self.assertIn("closes itself on the first run that finds nothing at all", footer)
+        # Not a hypothetical: make the only repin the catalog allows and the
+        # next report has nothing left to report.
+        repinned = analyze(
+            catalog=catalog,
+            panel=["gpt-5.6-sol-max", "gpt-5.6-sol"],
+            judge="gpt-5.6-sol-max",
+        )
+        self.assertFalse(repinned["has_findings"])
+
+    def test_a_real_catalog_urgent_report_still_keeps_the_strong_claim(self):
+        # The stand-downs above are about toy catalogs with one id to spare. On
+        # the catalog that actually prompted this (178 unpinned same-lab ids), a
+        # delisted pin still leaves the review-me list standing after the repin,
+        # so the strong claim is narrowed, not retired.
+        catalog = real_catalog()
+        report = analyze(
+            catalog=catalog,
+            panel=["gpt-5.6-sol-max", "claude-opus-5-thinking-max", "gemini-3.1-pro", "kimi-k9-gone"],
+            judge=REAL_JUDGE,
+        )
+        self.assertTrue(report["urgent"])
+        self.assertTrue(cd._standing_after_repin(report))
+        self.assertIn("will **not** close itself once you repin", cd._footer(report))
+
+    def test_only_an_already_pinned_familys_extra_tier_earns_indefinitely(self):
+        # "Stays open indefinitely" is a claim about every action the issue asks
+        # for. Promoting a tier of an already-pinned family just swaps which
+        # tier is listed, so that list refills itself — but a brand-new family
+        # (in a pinned lab or an unpinned one) can be pinned away, and then the
+        # issue closes. Claiming permanence there is a wrong prediction as well
+        # as a wrong cause (BE-6912 review round 2).
+        advisory, _ = self.advisory()
+        self.assertTrue(cd._standing_on_extra_tiers(advisory))
+        self.assertIn("stays open indefinitely", cd._footer(advisory))
+        self.assertIn("reasoning tiers", cd._footer(advisory))
+
+        for name, (report, catalog) in [
+            ("new_family", self.new_family_only()),
+            ("families", self.families_only()),
+        ]:
+            self.assertFalse(report["urgent"], name)
+            self.assertTrue(report["has_findings"], name)
+            self.assertFalse(cd._standing_on_extra_tiers(report), name)
+            footer = cd._footer(report)
+            self.assertIn("Nothing here is urgent", footer, name)
+            self.assertNotIn("stays open indefinitely", footer, name)
+            self.assertNotIn("reasoning tiers", footer, name)
+            self.assertIn("closes itself on the first run that finds nothing at all", footer, name)
+
+        # And the prediction is checked, not asserted: pinning what each list
+        # asks about really does clear the findings.
+        new_family, catalog = self.new_family_only()
+        self.assertEqual([c["id"] for c in new_family["unpinned"][0]["candidates"]], ["gpt-6-omega"])
+        self.assertFalse(analyze(catalog=catalog, panel=PANEL + ["gpt-6-omega"])["has_findings"])
+        families, _ = self.families_only()
+        self.assertEqual(families["unpinned"], [])
+        # Without the NO-ZDR marker, which would make pinning it urgent in its
+        # own right rather than clearing the fold.
+        catalog = "\n".join(PANEL) + "\nfable-5-max\n"
+        self.assertFalse(analyze(catalog=catalog, panel=PANEL + ["fable-5-max"])["has_findings"])
+
+    def test_no_arm_points_the_reader_below_itself_or_names_a_missing_section(self):
+        # `render_body` appends the footer LAST, so every section it can point
+        # at is above it — "below" sends the reader into the raw-catalog fold or
+        # off the end of the issue. And a section it names by title has to be in
+        # the body it was appended to: the review-me list is gated on
+        # `report["unpinned"]` alone, so a report standing only on
+        # `unpinned_labs` renders the families fold and nothing else.
+        for name, (report, catalog) in self.all_arms():
+            footer = cd._footer(report)
+            body = cd.render_body(report, catalog)
+            self.assertTrue(body.rstrip("\n").endswith(footer), name)
+            self.assertNotIn("below", footer, name)
+            if "review-me list" in footer:
+                self.assertIn("## Unpinned same-lab catalog ids — review me", body, name)
+
+    def test_only_a_clean_report_promises_a_close(self):
+        report, catalog = self.clean()
+        footer = cd._footer(report)
+        self.assertIn("closes the issue", footer)
+        self.assertIn("No drift at all", footer)
+        self.assertIn(footer, cd.render_body(report, catalog))
+
+    def test_every_arm_still_names_the_check_that_filed_it(self):
+        # The one invariant across arms — a reader must always be able to find
+        # which workflow to blame.
+        for name, (report, _) in [
+            ("delisted", self.urgent_delisted()),
+            ("zdr", self.urgent_zdr()),
+            ("advisory", self.advisory()),
+            ("clean", self.clean()),
+        ]:
+            footer = cd._footer(report)
+            self.assertIn("Filed by the weekly `cursor-review-catalog-drift` check", footer, name)
+            # Rendered as one italic run, so it reads as a footnote rather than
+            # body copy — and hard-wrapping it would break that.
+            self.assertTrue(footer.startswith("_") and footer.endswith("_"), name)
+            self.assertNotIn("\n", footer, name)
+
+    def test_the_real_catalog_run_that_prompted_this_gets_the_advisory_footer(self):
+        # Issue #144 itself: 178 unpinned same-lab ids, no delisted pin, no
+        # NO-ZDR pin. The report that shipped the broken promise must now render
+        # the advisory arm.
+        catalog = real_catalog()
+        report = analyze(catalog=catalog, panel=list(REAL_PANEL), judge=REAL_JUDGE)
+        self.assertFalse(report["urgent"])
+        self.assertTrue(report["has_findings"])
+        footer = cd._footer(report)
+        self.assertIn("Nothing here is urgent", footer)
+        self.assertNotIn(self.BROKEN_PROMISE, footer)
+
+
+class TierCollapseTest(unittest.TestCase):
+    """BE-6911 — the same-lab review-me list is one row per FAMILY, newest first.
+
+    The defect this pins: the panel pins ONE reasoning/speed tier per family, so
+    every other tier of every already-pinned family is an "unpinned candidate"
+    forever. The 2026-08-10 run listed 178 of them and then head-truncated each
+    lab at 25 rows in Cursor's print order, which put the only two rows worth
+    reading — the brand-new `gpt-5.6-terra-*` and `gpt-5.6-luna-*` families —
+    inside the hidden "… and 57 more".
+    """
+
+    def test_family_of_splits_at_the_reasoning_tier(self):
+        self.assertEqual(cd.family_of("gpt-5.6-terra-max-fast"), ("gpt-5.6-terra", "max-fast"))
+        self.assertEqual(cd.family_of("gpt-5.6-terra-max"), ("gpt-5.6-terra", "max"))
+        self.assertEqual(cd.family_of("gemini-3.6-flash-minimal"), ("gemini-3.6-flash", "minimal"))
+
+    def test_an_id_with_no_tier_suffix_is_its_familys_default_tier(self):
+        # `gpt-5.3-codex` must land in the SAME family as `gpt-5.3-codex-high`,
+        # not strand itself as a family of one.
+        self.assertEqual(cd.family_of("gpt-5.3-codex"), ("gpt-5.3-codex", ""))
+        self.assertEqual(cd.family_of("kimi-k2.7-code"), ("kimi-k2.7-code", ""))
+
+    def test_a_bare_fast_suffix_is_a_tier_of_its_family(self):
+        # `gpt-5.3-codex-fast` is the default tier run fast — the same family.
+        self.assertEqual(cd.family_of("gpt-5.3-codex-fast"), ("gpt-5.3-codex", "fast"))
+
+    def test_the_longest_matching_tier_wins(self):
+        # `extra-high` before `high`, or the family reads as `gpt-5.5-extra`.
+        self.assertEqual(cd.family_of("gpt-5.5-extra-high"), ("gpt-5.5", "extra-high"))
+        self.assertEqual(cd.family_of("gpt-5.5-extra-high-fast"), ("gpt-5.5", "extra-high-fast"))
+
+    def test_thinking_is_not_collapsed_away(self):
+        # The panel pins ON `-thinking` (`claude-opus-5-thinking-max` vs
+        # `claude-opus-5-max`), so merging the two would hide the distinction a
+        # promotion decision turns on.
+        self.assertEqual(
+            cd.family_of("claude-opus-5-thinking-max"), ("claude-opus-5-thinking", "max")
+        )
+        self.assertEqual(cd.family_of("claude-opus-5-max"), ("claude-opus-5", "max"))
+
+    def test_collapse_groups_every_tier_into_one_row(self):
+        candidates = [
+            {"id": f"gpt-9.1-{tier}", "note": tier} for tier in ("low", "low-fast", "high", "max")
+        ]
+        groups = cd.collapse_tiers(candidates)
+        self.assertEqual([g["family"] for g in groups], ["gpt-9.1"])
+        self.assertEqual(len(groups[0]["members"]), 4)
+
+    def test_collapse_orders_families_by_version_descending(self):
+        candidates = [
+            {"id": "gpt-5.3-codex-high", "note": ""},
+            {"id": "gpt-5.6-luna-max", "note": ""},
+            {"id": "gpt-5.6-terra-max", "note": ""},
+            {"id": "gpt-5.4-high", "note": ""},
+        ]
+        # 5.6 families first (tie broken by catalog order: luna was printed
+        # first), then 5.4, then 5.3 — NOT Cursor's print order, which leads
+        # with 5.3.
+        self.assertEqual(
+            [g["family"] for g in cd.collapse_tiers(candidates)],
+            ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.4", "gpt-5.3-codex"],
+        )
+
+    def test_a_versionless_family_sorts_last_rather_than_crashing(self):
+        candidates = [{"id": "gpt-supernova-max", "note": ""}, {"id": "gpt-5.1-max", "note": ""}]
+        self.assertEqual(
+            [g["family"] for g in cd.collapse_tiers(candidates)], ["gpt-5.1", "gpt-supernova"]
+        )
+
+    def test_body_renders_one_row_per_family_naming_its_tiers(self):
+        catalog = "\n".join(PANEL) + "".join(
+            f"\ngpt-5.9-nova-{tier} - Nova {tier}" for tier in ("low", "high", "max", "max-fast")
+        )
+        body = cd.render_body(analyze(catalog=catalog), catalog)
+        rows = lab_rows(body, "gpt")
+        self.assertEqual(len(rows), 1, rows)
+        self.assertIn("`gpt-5.9-nova-*`", rows[0])
+        self.assertIn("4 tiers", rows[0])
+        for tier in ("`max`", "`max-fast`", "`high`", "`low`"):
+            self.assertIn(tier, rows[0])
+        # The row still reproduces ONE member's catalog note verbatim.
+        self.assertIn("`gpt-5.9-nova-max`", rows[0])
+        self.assertIn("Nova max", rows[0])
+
+    def test_a_family_of_one_still_renders_as_a_plain_id_row(self):
+        body = cd.render_body(analyze(), CATALOG)
+        self.assertIn("- `gpt-5.6-sol`", body)
+
+    def test_a_family_the_panel_already_pins_is_marked_as_such(self):
+        # The rows that are noise by construction: the panel pins this family,
+        # just at another tier.
+        body = cd.render_body(analyze(), CATALOG)
+        self.assertIn("panel already pins `gpt-5.6-sol-max`", body)
+
+    def test_a_collapsed_row_reproduces_a_no_zdr_marker_verbatim(self):
+        catalog = "\n".join(PANEL) + (
+            "\ngpt-5.9-nova-low - Nova Low (NO ZDR)\ngpt-5.9-nova-max - Nova Max (NO ZDR)"
+        )
+        body = cd.render_body(analyze(catalog=catalog), catalog)
+        self.assertIn("(NO ZDR)", lab_rows(body, "gpt")[0])
+
+    def test_collapsed_rows_are_capped_and_name_what_they_dropped(self):
+        # Silent truncation reads as "that is all of them" — the exact misreading
+        # this ticket exists to end.
+        ids = "".join(
+            f"\ngpt-{n}.0-fam-max - fam {n}\ngpt-{n}.0-fam-low - fam {n} low"
+            for n in range(cd.MAX_FAMILY_IDS + 3)
+        )
+        catalog = "\n".join(PANEL) + ids
+        body = cd.render_body(analyze(catalog=catalog), catalog)
+        rows = lab_rows(body, "gpt")
+        self.assertEqual(len(rows), cd.MAX_FAMILY_IDS + 1)
+        self.assertIn("… and 3 older families (6 ids)", rows[-1])
+        # And what it dropped is the OLDEST, not an arbitrary tail: `gpt-0.0-*`
+        # through `gpt-2.0-*` are the three lowest versions.
+        self.assertIn("`gpt-27.0-fam-*`", rows[0])
+        self.assertNotIn("gpt-0.0-fam", body[: body.index("<details>")])
+
+    def test_a_brand_new_family_printed_last_is_visible_without_the_raw_fold(self):
+        # The BE-6911 shape in miniature: 40 older tiers printed first, the new
+        # family printed last. Pre-change it fell inside the hidden remainder.
+        older = "".join(
+            f"\ngpt-5.0-old{n}-{tier} - old {n} {tier}"
+            for n in range(20)
+            for tier in ("low", "max")
+        )
+        catalog = "\n".join(PANEL) + older + "\ngpt-9.9-brandnew-max - Brand New Max"
+        body = cd.render_body(analyze(catalog=catalog), catalog)
+        rows = lab_rows(body, "gpt")
+        # 41 candidate ids — pre-change the 25-row cap hid the last 16, this one
+        # among them. Collapsed and version-ordered it leads the group.
+        self.assertEqual(sum(len(g["candidates"]) for g in analyze(catalog=catalog)["unpinned"]), 41)
+        self.assertIn("`gpt-9.9-brandnew-max`", rows[0])
+        self.assertNotIn("… and", "\n".join(rows))
+
+    def test_the_2026_08_10_catalog_surfaces_both_new_families_in_full(self):
+        # The acceptance case, against the catalog captured verbatim in #144.
+        catalog = real_catalog()
+        report = cd.analyze(
+            REAL_PANEL, REAL_JUDGE, catalog, datetime.date(2026, 7, 28), datetime.date(2026, 8, 10), 30
+        )
+        # The finding itself is unchanged — 178 unpinned same-lab ids, still not
+        # urgent (no pin delisted, none marked NO-ZDR). Only the rendering moved.
+        self.assertEqual(sum(len(g["candidates"]) for g in report["unpinned"]), 178)
+        self.assertFalse(report["urgent"])
+        self.assertIn("178 unpinned same-lab ids", cd.summary_line(report))
+
+        body = cd.render_body(report, catalog)
+        rendered = body[: body.index("<details>")]
+        rows = lab_rows(body, "gpt")
+        # 82 gpt ids collapse to 11 family rows — inside the cap, so no
+        # "… and N more" line, so nothing is hidden behind the raw fold.
+        self.assertEqual(len(rows), 11, rows)
+        self.assertLessEqual(len(rows), cd.MAX_FAMILY_IDS)
+        self.assertNotIn("… and", "\n".join(rows))
+        # Both new families are visible, and above the older ones the pre-change
+        # report spent its 25 visible rows on.
+        self.assertIn("`gpt-5.6-terra-*`", rendered)
+        self.assertIn("`gpt-5.6-luna-*`", rendered)
+        self.assertLess(rendered.index("gpt-5.6-terra"), rendered.index("gpt-5.3-codex"))
+        self.assertLess(rendered.index("gpt-5.6-luna"), rendered.index("gpt-5.2-"))
+        # Every lab group fits, so the whole 178 collapse to well under the cap.
+        for lab in ("claude", "gemini", "kimi"):
+            self.assertNotIn("… and", "\n".join(lab_rows(body, lab)), lab)
+
+    def test_worst_case_collapsed_rows_still_leave_room_for_the_raw_fold(self):
+        # The collapse adds a tier list to every row, so it has to be held to
+        # roughly the char cost of the id row it replaces — otherwise the report
+        # sections crowd out the raw catalog fold and reach the blunt clamp.
+        note = "context " * 60  # ~480 chars, > MAX_NOTE_CHARS
+        tiers = [t for suffix in cd.TIER_SUFFIXES for t in (suffix, suffix + "-fast")] + ["fast"]
+        lines = list(PANEL)
+        for lab in ("gpt", "claude", "gemini", "kimi"):
+            for n in range(cd.MAX_FAMILY_IDS + 5):
+                for tier in tiers:
+                    lines.append(f"{lab}-9.{n}-fam-{tier} {note}")
+        catalog = "\n".join(lines) + "\n"
+        body = cd.render_body(analyze(catalog=catalog), catalog)
+        self.assertLessEqual(len(body), cd.MAX_BODY_CHARS)
+        self.assertNotIn("report truncated", body)
+        self.assertEqual(body.count("<details>"), body.count("</details>"))
+        self.assertIn("Raw <code>cursor-agent models</code> output", body)
+        self.assertIn("Filed by the weekly", body)
 
 
 class MainTest(unittest.TestCase):

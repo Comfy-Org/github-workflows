@@ -15,10 +15,21 @@ name: Bump cursor-review callers
 # The caller list is NOT hardcoded here. This repo is PUBLIC (workflow file and
 # Actions run logs are both publicly viewable), and most callers are private, so
 # their names must never appear in this file or its logs. The list lives in the
-# repo-level Actions variable `CURSOR_REVIEW_CALLERS` (config, not a credential —
-# a variable, not a secret, since secrets are write-only via the API) as a JSON
-# array of {"repo","file","label","wire_bot"} objects. Every repo name is
-# `::add-mask::`ed out of the (public) run logs before it is ever echoed.
+# repo-level Actions SECRET `CURSOR_REVIEW_CALLERS` as a JSON array of
+# {"repo","file","label","wire_bot"} objects.
+#
+# A SECRET, not a variable (BE-6472): the roster reaches the script through the
+# step's `env:` below, and Actions prints that env block BEFORE the step runs —
+# so a variable's raw value was published in this public repo's run log ahead of
+# any masking the script could do (the KNOWN GAP this header used to carry). A
+# secret is runner-masked everywhere, that dump included. The cost is read-back:
+# there is no `gh secret get`, so the canonical callers.json in the private ops
+# repo is the sole source of truth, and the run instead logs a count + sha256
+# fingerprint of the roster it used (reproduce with `jq -cS . callers.json |
+# sha256sum`) so an edit can be audited against it.
+# `bump-callers.sh` still `::add-mask::`es every repo name before IT echoes
+# anything — Actions masks the roster as ONE exact string, not each name inside
+# it, so a name echoed on its own would otherwise print in the clear.
 #
 # A caller flagged `"wire_bot": true` also gets the cloud-code-bot review
 # identity wired in the same PR (BE-1814): the optional bot_app_id input +
@@ -33,9 +44,8 @@ name: Bump cursor-review callers
 # bump-agents-md-callers.yml.
 #
 # Update flow — adding/removing a caller needs NO public commit:
-#   gh variable set CURSOR_REVIEW_CALLERS --repo Comfy-Org/github-workflows \
-#     --body "$(jq -c . callers.json)"
-# Keep the canonical callers.json in a PRIVATE infra/ops repo so variable edits
+#   jq -c . callers.json | gh secret set CURSOR_REVIEW_CALLERS --repo Comfy-Org/github-workflows
+# Keep the canonical callers.json in a PRIVATE infra/ops repo so roster edits
 # have a reviewed source of truth; the org audit log records each edit. (The
 # specific home repo is intentionally not named here — this file is public.)
 
@@ -51,6 +61,25 @@ on:
       # caller bump as a workflow-file change, or pinned callers silently drift
       # onto stale review behavior.
       - .github/cursor-review/**
+      # The check-pr-size classifier is BUILT at run time from the same pinned
+      # `workflows_ref` (see cursor-review.yml's "Load check-pr-size tool" /
+      # "Build check-pr-size" steps) — it decides which of a PR's files count as
+      # generated and therefore skip review. A behavior change there needs the
+      # same caller bump as a workflow-file change, or pinned callers silently
+      # drift onto a stale classifier. This fleet and the pr-size fleet both
+      # watch it deliberately: both build the tool from the caller's pin, and
+      # they push different stable branches, so there is no conflict.
+      - scripts/check-pr-size/**
+      # …but the Go tests under that dir are NOT part of what a pinned caller
+      # executes — the "Build check-pr-size" step compiles the tool and runs it,
+      # and never runs `go test` — so a test-only commit would mint the org-wide
+      # bot token, force-reset the stable ci/bump-cursor-review branch and fan a
+      # pure-churn SHA-bump PR (identical consumer behavior, a review round in
+      # every caller repo) across the whole fleet. Exclude them so a bump PR
+      # keeps meaning "consumer-visible behavior changed". Negations only strip
+      # the paths they match: a commit touching size.go AND its test still
+      # matches the positive pattern and still bumps.
+      - '!scripts/check-pr-size/*_test.go'
 
 permissions:
   contents: read
@@ -76,13 +105,60 @@ jobs:
     # only ever skips stray manual runs.
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # The job is a bounded loop of `git`/`gh` network calls, plus the preflight's
+    # deepening fetch; nothing here should take minutes. Without this a hung call
+    # would hold a runner for the default 6 hours (and, via the serializing
+    # concurrency group above, block every later bump behind it).
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
+      # The shared staleness/decommission guard — one implementation for every
+      # fleet, documented in .github/bump-callers/README.md "Preflight". It
+      # decides whether this run is a stale re-run (a later commit already
+      # touched the watched surface and has its own run) or the surface has been
+      # decommissioned, and emits the SHA the bump below pins.
+      # WATCHED/WATCHED_ASSETS are LITERAL paths, never the `paths:` globs, and
+      # must cover EVERY entry in this fleet's filter above: the re-point only
+      # pins callers to a tip whose watched content it compared, so widen these
+      # inputs in the same change if you ever widen that filter.
+      - name: Preflight (staleness / decommission guard)
+        id: preflight
+        env:
+          NEW_SHA: ${{ github.sha }}
+          WATCHED: .github/workflows/cursor-review.yml
+          # Newline-separated list, one literal path per line — this fleet
+          # watches TWO asset surfaces (the review prompts/scripts and the
+          # check-pr-size classifier), and both must be compared or the re-point
+          # pins callers to a tip whose other content was never verified.
+          # Kept alongside WATCHED_PATHSPECS deliberately. The pathspec list
+          # SUPERSEDES this input's tree-OID staleness comparison (it has to —
+          # an OID cannot express the `*_test.go` exclusion below, so a
+          # test-only commit would move the scripts/check-pr-size tree and
+          # freeze the fleet as a permanent stale re-run). What it does NOT
+          # supersede is the decommission probe: these entries are still what
+          # notices either directory disappearing, and preflight cross-checks
+          # that the pathspecs reach EVERY one of them.
+          WATCHED_ASSETS: |
+            .github/cursor-review
+            scripts/check-pr-size
+          # MIRRORS the `paths:` filter above, exclusions included — that is the
+          # coupling, not a coincidence. Widen one and you widen the other in the
+          # same change; test_paths_contract.sh fails the build otherwise.
+          WATCHED_PATHSPECS: |
+            .github/workflows/cursor-review.yml
+            .github/cursor-review
+            scripts/check-pr-size
+            :(exclude)scripts/check-pr-size/*_test.go
+        run: bash .github/bump-callers/preflight.sh
+
       - name: Generate Cloud Code Bot token
+        # Stale run or decommissioned surface — don't mint an org-wide
+        # write token for a job that is about to bump nothing.
+        if: steps.preflight.outputs.proceed == 'true'
         uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0 — pinned: see dependabot.yml ignore (v2+ breaks cross-repo `owner:` token scoping)
         id: token
         with:
@@ -90,80 +166,29 @@ jobs:
           private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
           owner: Comfy-Org
 
-      # A SECOND app token, for the ROSTER READ ALONE. Scoped to THIS repo
-      # (`repositories: github-workflows` — public, so nothing leaks by naming it)
-      # and deliberately left un-downscoped, so it carries the App's
-      # "Variables: read" grant: the `app-permissions` schema — the
-      # installation-token request body — has no `variables` key at all, so there
-      # is no `permission-variables` input to ask for in ANY version of
-      # create-github-app-token, and asking for nothing is the only spelling that
-      # yields that grant (BE-6477).
-      #
-      # It exists so the WRITE token above can stay downscoped. One token serving
-      # both purposes would have to be un-downscoped AND owner-wide — full
-      # installation permissions on EVERY repo the App is installed on, most of
-      # them private callers — purely to enable one read of this repo's own
-      # variable. This token is un-downscoped too, but `repositories:` confines it
-      # to this ONE public repo, so that is the whole of its blast radius.
-      - name: Generate roster-read token (this repo only)
-        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0 — pinned: see dependabot.yml ignore (v2+ breaks cross-repo `owner:` token scoping)
-        id: var_token
-        with:
-          app-id: ${{ vars.APP_ID }}
-          private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
-          owner: Comfy-Org
-          repositories: github-workflows
-
       - name: Bump SHA in caller repos
+        # Stale run or decommissioned surface — nothing to bump.
+        if: steps.preflight.outputs.proceed == 'true'
         env:
           GH_TOKEN: ${{ steps.token.outputs.token }}
-          # The this-repo-only token, used ONLY for the roster read, so the write
-          # token above can stay downscoped (BE-6482 review).
-          VAR_TOKEN: ${{ steps.var_token.outputs.token }}
-          NEW_SHA: ${{ github.sha }}
-          # Names the fleet's Actions variable. bump-callers.sh READS the roster
-          # out of it at run time (BE-6482) — it is deliberately NOT passed in
-          # through this `env:` block, because Actions prints a step's env into
-          # this PUBLIC repo's run log BEFORE the step runs, i.e. before the
-          # script's `::add-mask::` could cover the private caller names.
+          # NOT github.sha: when main moved on but the watched surface is
+          # unchanged, the preflight re-points this run at the verified tip, and
+          # reading github.sha here would silently discard that re-point.
+          NEW_SHA: ${{ steps.preflight.outputs.new_sha }}
+          # Names the roster to fix in an error message. It is a SECRET now, not a
+          # variable; the env key keeps its historical name so every fleet's
+          # entrypoint and the shared script stay in step.
           VAR_NAME: CURSOR_REVIEW_CALLERS
           TAG: cursor-review
           WORKFLOW_FILE: cursor-review.yml
+          # JSON array of {"repo","file","label","wire_bot"} — see the header
+          # comment for the update flow. Kept in a repo-level SECRET (not this
+          # file, and not a variable) so private caller names never land in this
+          # public repo — nor, since a secret is masked in the step's env dump
+          # too, in its run logs.
+          CALLERS_JSON: ${{ secrets.CURSOR_REVIEW_CALLERS }}
           # Only this fleet's callers ever carry `wire_bot` (BE-1814) — the
           # agents-md-integrity entrypoint never sets this, so bump-callers.sh
-          # skips wiring there even if its variable somehow set the flag.
+          # skips wiring there even if its roster somehow set the flag.
           WIRE_BOT_SCRIPT: ${{ github.workspace }}/.github/cursor-review/wire-bot-identity.py
-        run: |
-          # The main-only ref guard above cannot catch a manual RE-RUN of an
-          # older main run: github.ref is refs/heads/main but github.sha is
-          # that run's original (now stale) commit, and the bumper would
-          # force-repin every caller to it. Only act from the current tip —
-          # any newer push has its own queued run that does the bump.
-          # Don't pipe into `cut`: the pipeline would report cut's status, so a
-          # failed ls-remote (network blip, remote hiccup) yields an EMPTY
-          # main_tip that then compares unequal to github.sha and silently
-          # no-ops the whole fleet bump as if the run were stale. A lookup we
-          # couldn't perform is not evidence of staleness — fail loudly.
-          if ! ls_remote=$(git ls-remote origin refs/heads/main); then
-            echo "::error::Could not look up the current main tip (git ls-remote failed)"
-            exit 1
-          fi
-          main_tip=${ls_remote%%$'\t'*}
-          if [[ -z "$main_tip" ]]; then
-            echo "::error::git ls-remote returned no SHA for refs/heads/main"
-            exit 1
-          fi
-          if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
-            echo "github.sha $GITHUB_SHA is not the current main tip ($main_tip) — stale run/re-run; nothing to bump"
-            exit 0
-          fi
-          # The push path filter also matches a commit that DELETES the
-          # reusable workflow — or the run-time assets callers load from the
-          # pinned SHA (.github/cursor-review/**); bumping callers to a SHA
-          # where either is gone would break every caller. Deletion means
-          # decommissioning — no-op.
-          if [[ ! -f .github/workflows/cursor-review.yml || ! -d .github/cursor-review ]]; then
-            echo "cursor-review.yml or .github/cursor-review/ absent at this SHA — decommissioned; nothing to bump"
-            exit 0
-          fi
-          bash .github/bump-callers/bump-callers.sh
+        run: bash .github/bump-callers/bump-callers.sh

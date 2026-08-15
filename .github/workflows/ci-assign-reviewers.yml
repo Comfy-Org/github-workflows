@@ -32,7 +32,7 @@ name: CI - Assign Reviewers
 # into a real escalation; not a trade worth making for assignee routing.
 #
 # PIN FRESHNESS (operator): the pin below only tracks assign-reviewers.yml once
-# this repo is listed in vars.ASSIGN_REVIEWERS_CALLERS, which
+# this repo is listed in the ASSIGN_REVIEWERS_CALLERS roster, which
 # bump-assign-reviewers-callers.yml fans bumps out to. Until then the pin is
 # updated by hand, same as any other consumer that isn't enrolled.
 

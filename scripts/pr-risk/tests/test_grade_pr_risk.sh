@@ -604,6 +604,146 @@ out="$(bot_pr --runbooks "$SANDBOX/app-runbooks-both.json")"
 eq "a live first-time human is still external" external "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
 eq "and still grades R3" R3 "$(jq -r '.risk.tier' <<<"$out")"
 
+echo "— phase 23: reversibility says WHICH files supplied its tier — REPORTING ONLY —"
+# `axes.reversibility.files` exists so the publisher (BE-7414) can ask "if the top path-floor
+# files were peeled off this PR, would the reversibility reason go with them?". It is derived
+# from the tier decision and read nowhere else in the grader, exactly like the per-file path
+# floors above — every tier asserted in this phase is the one the grader emitted BEFORE the
+# field existed, so a future edit cannot quietly turn the attribution into a second input.
+# The three non-attributable rungs stay `null`, which the publisher reads as "not attributable,
+# keep suppressing" — an empty array would read as "attributable to nothing", which is false.
+
+# subset_ok — every attributed path must equal some axes.path_floor.files[].path, because the
+# publisher's peel test compares the two lists directly. Both record the DESTINATION path.
+subset_ok() { jq -e '((.risk.axes.reversibility.files // []) - [.risk.axes.path_floor.files[].path]) | length == 0' >/dev/null; }
+
+# peeled_tier — the PROPERTY `files` claims, not its shape: drop exactly the attributed paths,
+# re-grade, and the axis must no longer be R3. Asserting the shape alone passes green on an
+# attribution that names a real file but not ALL the files holding the tier up, which is the
+# only reading of the field the publisher actually makes. The per-file path-floor phase pins
+# its analogue (`worst(files) == floor`); this is the reversibility equivalent.
+peeled_tier() { # <pr> <paths-json> <graded-out> -> the reversibility tier after the peel
+  local peeled
+  peeled="$(jq -c --argjson f "$(jq -c '.risk.axes.reversibility.files // []' <<<"$3")" \
+              '[.[] | . as $row | select(($f | index($row.path)) == null)]' <<<"$2")"
+  rec "$1" dev 'peel' "$peeled" ok SUCCESS | grade | jq -r '.risk.axes.reversibility.tier'
+}
+
+# (a) irreversible class: the migration supplied the tier; the docs file rode along.
+paths='[{"path":"db/migrations/0001_x.sql","additions":9,"deletions":0,"change_type":"ADDED"},{"path":"docs/a.md","additions":1,"deletions":0,"change_type":"MODIFIED"}]'
+out="$(rec 30 dev 'feat: schema' "$paths" ok SUCCESS | grade)"
+eq "irreversible-class reversibility is still R3" R3 "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
+eq "and the overall tier is still R3" R3 "$(jq -r '.risk.tier' <<<"$out")"
+eq "only the migration is attributed" '["db/migrations/0001_x.sql"]' "$(jq -c '.risk.axes.reversibility.files' <<<"$out")"
+if subset_ok <<<"$out"; then ok "attributed paths are a subset of the path-floor rows"; else bad "attributed paths are a subset of the path-floor rows" "$(jq -c '.risk.axes.reversibility.files' <<<"$out")"; fi
+eq "peeling the attributed paths drops the irreversible-class tier" R1 "$(peeled_tier 130 "$paths" "$out")"
+
+# (b) delete-sensitive: attribution is BY ROW, never by intersecting a row's classes with the
+# sensitive list. `src/auth/y.go` is MODIFIED and carries class `auth` too — a class
+# intersection would name it and send the publisher peeling a file that removed nothing. The
+# DELETED README is a delete, but not of a sensitive class, so it is not what supplied the tier
+# either (peeling it alone would leave the reason standing).
+paths='[{"path":"src/auth/x.go","additions":0,"deletions":9,"change_type":"DELETED"},{"path":"src/auth/y.go","additions":2,"deletions":1,"change_type":"MODIFIED"},{"path":"README.md","additions":0,"deletions":4,"change_type":"DELETED"}]'
+out="$(rec 31 dev 'chore: drop it' "$paths" ok SUCCESS | grade)"
+eq "delete-sensitive reversibility is still R3" R3 "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
+eq "and the overall tier is still R3" R3 "$(jq -r '.risk.tier' <<<"$out")"
+eq "only the DELETED sensitive file is attributed" '["src/auth/x.go"]' "$(jq -c '.risk.axes.reversibility.files' <<<"$out")"
+eq "the deleted_files count is untouched by the attribution" 2 "$(jq -r '.risk.axes.reversibility.deleted_files' <<<"$out")"
+if subset_ok <<<"$out"; then ok "delete attribution is a subset of the path-floor rows"; else bad "delete attribution is a subset of the path-floor rows" "$(jq -c '.risk.axes.reversibility.files' <<<"$out")"; fi
+eq "peeling the attributed path drops the delete-sensitive tier" R1 "$(peeled_tier 131 "$paths" "$out")"
+# ...and the SENTENCE agrees with the list beside it: one sensitive removal, class `auth` only.
+# The count used to be every removal and the classes every class any removal matched, so this
+# fixture printed "removes 2 file(s) under a sensitive class (auth, docs)" — with `docs` not
+# even in delete_sensitive_classes, next to a `files` naming exactly one auth file.
+eq "the reason counts only the SENSITIVE removals" \
+   "removes 1 file(s) under a sensitive class (auth) — not a single clean revert" \
+   "$(jq -r '.risk.axes.reversibility.reason' <<<"$out")"
+
+# (c) a RENAME out of a sensitive directory removes the ORIGIN path, but is recorded under its
+# DESTINATION — which is the only form the path-floor rows carry, so it is the only form the
+# publisher can compare against.
+paths='[{"path":"misc/x.go","previous_path":"src/auth/x.go","additions":1,"deletions":1,"change_type":"RENAMED"}]'
+out="$(rec 32 dev 'refactor: move things' "$paths" ok SUCCESS | grade)"
+eq "renaming out of a sensitive class is still R3" R3 "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
+eq "the renamed row is attributed under its DESTINATION" '["misc/x.go"]' "$(jq -c '.risk.axes.reversibility.files' <<<"$out")"
+if subset_ok <<<"$out"; then ok "rename attribution is a subset of the path-floor rows"; else bad "rename attribution is a subset of the path-floor rows" "$(jq -c '.risk.axes.reversibility.files' <<<"$out")"; fi
+eq "peeling the renamed row drops the tier" R1 "$(peeled_tier 132 "$paths" "$out")"
+
+# (c2) BOTH R3 RUNGS AT ONCE — the tier ladder is first-match, the attribution is NOT. This PR
+# adds a migration (irreversible class) AND deletes an auth file (sensitive removal). Naming
+# only the migration would answer the publisher's peel question "yes, the reversibility reason
+# goes with these files" while the delete-sensitive rung silently held the axis at R3 — a false
+# positive out of the very suppression the `null` rungs exist for. The peel below is the assert
+# that matters: strip everything `files` names and the axis must actually leave R3.
+paths='[{"path":"db/migrations/0002_y.sql","additions":9,"deletions":0,"change_type":"ADDED"},{"path":"src/auth/x.go","additions":0,"deletions":9,"change_type":"DELETED"},{"path":"docs/a.md","additions":1,"deletions":0,"change_type":"MODIFIED"}]'
+out="$(rec 38 dev 'feat: schema + drop auth' "$paths" ok SUCCESS | grade)"
+eq "both-rungs reversibility is still R3" R3 "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
+eq "the reason is still the FIRST rung's" \
+   "touches migrations — mutates persistent state or deletes data; reverting the code does not restore it" \
+   "$(jq -r '.risk.axes.reversibility.reason' <<<"$out")"
+eq "but BOTH rungs' files are attributed" \
+   '["db/migrations/0002_y.sql","src/auth/x.go"]' "$(jq -c '.risk.axes.reversibility.files' <<<"$out")"
+if subset_ok <<<"$out"; then ok "the union is a subset of the path-floor rows"; else bad "the union is a subset of the path-floor rows" "$(jq -c '.risk.axes.reversibility.files' <<<"$out")"; fi
+eq "peeling the union clears EVERY attributable rung" R1 "$(peeled_tier 138 "$paths" "$out")"
+
+# (d)/(e)/(f) the three non-attributable rungs. "No green rollup" is a property of the head
+# COMMIT and "no test touched" of the WHOLE change set; neither is removable by dropping files.
+out="$(rec 33 dev 'docs: x' '[{"path":"README.md","additions":1,"deletions":0,"change_type":"MODIFIED"}]' ok PENDING | grade)"
+eq "no green rollup is still R2" R2 "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
+eq "and attributes nothing" null "$(jq -r '.risk.axes.reversibility.files' <<<"$out")"
+out="$(rec 34 dev 'feat: x' '[{"path":"src/x.go","additions":9,"deletions":0,"change_type":"MODIFIED"}]' ok SUCCESS | grade)"
+eq "no test touched is still R1" R1 "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
+eq "and attributes nothing" null "$(jq -r '.risk.axes.reversibility.files' <<<"$out")"
+out="$(rec 35 dev 'test: cover x' '[{"path":"pkg/x_test.go","additions":9,"deletions":0,"change_type":"ADDED"}]' ok SUCCESS | grade)"
+eq "a clean revert is still R0" R0 "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
+eq "and attributes nothing" null "$(jq -r '.risk.axes.reversibility.files' <<<"$out")"
+
+# An unknown path axis takes reversibility unknown BEFORE the attribution runs, so the field is
+# never emitted from a file list nobody read.
+out="$(rec 36 dev 'mystery' null unknown SUCCESS | grade)"
+eq "an unknown reversibility axis emits no attribution at all" null "$(jq -r '.risk.axes.reversibility.files // "null"' <<<"$out")"
+
+# The record shape the publisher and the labeler read is ADDITIVE — nothing was renamed or
+# moved out from under them.
+out="$(rec 37 dev 'feat: schema' '[{"path":"db/migrations/0001_x.sql","additions":9,"deletions":0,"change_type":"ADDED"}]' ok SUCCESS | grade)"
+eq "the reversibility record keeps every field it had" \
+   "deleted_files files flag_gated reason residual_tier status tier" \
+   "$(jq -r '.risk.axes.reversibility | keys | join(" ")' <<<"$out")"
+
+echo "— phase 23b: residual_tier bounds where the axis lands AFTER the peel (BE-7419) —"
+# `files` alone says the CURRENTLY ATTRIBUTED reason is removable; it does not say the tier drops,
+# because the three rungs the remainder falls back to are map-configurable. `residual_tier` is that
+# missing half, and the publisher requires it to rank below the headline before it will pitch a
+# split. It is REPORTING ONLY like `files` — computed from the decision, read nowhere else here.
+paths='[{"path":"db/migrations/0001_x.sql","additions":9,"deletions":0,"change_type":"ADDED"},{"path":"docs/a.md","additions":1,"deletions":0,"change_type":"MODIFIED"}]'
+out="$(rec 39 dev 'feat: schema' "$paths" ok SUCCESS | grade)"
+# The bound has to be the tier the peel ACTUALLY produces — which phase 23 measures directly, by
+# peeling and re-grading. Asserting them equal is what stops the bound drifting into a guess.
+eq "residual_tier equals the tier a real peel produces (green rollup)" \
+   "$(peeled_tier 139 "$paths" "$out")" "$(jq -r '.risk.axes.reversibility.residual_tier' <<<"$out")"
+eq "…which on the repo map's defaults is R1" R1 "$(jq -r '.risk.axes.reversibility.residual_tier' <<<"$out")"
+# NOT GREEN: rung 3 tests the HEAD COMMIT's rollup, which no peel can change, so the remainder
+# lands exactly on no_green_checks_tier — R2 here, still below the R3 headline.
+out="$(rec 40 dev 'feat: schema' "$paths" ok PENDING | grade)"
+eq "a non-green rollup pins the residual at no_green_checks_tier" R2 \
+   "$(jq -r '.risk.axes.reversibility.residual_tier' <<<"$out")"
+# THE CONSUMER OVERRIDE the field exists to catch: raise no_green_checks_tier to R3 and the
+# remainder lands back on R3, so peeling the migration buys the PR nothing. The attribution is
+# unchanged — only the bound moves, and it is the bound the publisher gates on.
+ovmap="$SANDBOX/map-no-green-r3.json"
+jq '.reversibility.no_green_checks_tier = "R3"' "$SELF_DIR/../risk-map.v0.json" > "$ovmap"
+out="$(rec 41 dev 'feat: schema' "$paths" ok PENDING | bash "$GRADER" --stdin --map "$ovmap" 2>/dev/null)"
+eq "…and an override that raises that rung to R3 is reported as R3" R3 \
+   "$(jq -r '.risk.axes.reversibility.residual_tier' <<<"$out")"
+eq "…while the attribution itself is unchanged" '["db/migrations/0001_x.sql"]' \
+   "$(jq -c '.risk.axes.reversibility.files' <<<"$out")"
+eq "…and the tier the override cannot touch is still R3 from the irreversible class" R3 \
+   "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
+# The three non-attributable rungs answer no peel question at all, so they carry no bound either.
+out="$(rec 42 dev 'feat: x' '[{"path":"src/x.go","additions":9,"deletions":0,"change_type":"MODIFIED"}]' ok SUCCESS | grade)"
+eq "a rung with no attribution carries no residual bound either" null \
+   "$(jq -r '.risk.axes.reversibility.residual_tier' <<<"$out")"
+
 echo
 echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]

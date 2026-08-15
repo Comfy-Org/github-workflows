@@ -1,6 +1,6 @@
-name: Bump pr-risk callers
+name: Bump pr-derisk callers
 
-# When the pr-risk reusable workflow is updated on main, open a SHA-bump PR in
+# When the pr-derisk reusable workflow is updated on main, open a SHA-bump PR in
 # every repo that pins a caller against it. PRs are opened by Cloud Code Bot so
 # they are easy to filter and merge.
 #
@@ -11,17 +11,17 @@ name: Bump pr-risk callers
 # deliberate: a forked copy is how other shared machinery in the org has
 # drifted. The entrypoints differ only in their path-filter trigger and the
 # three parameters passed below. (They stay separate rather than a single
-# matrix because their triggers differ — a pr-risk.yml change must not
+# matrix because their triggers differ — a pr-derisk.yml change must not
 # spuriously bump the other fleets' callers, and vice versa.)
 #
-# A pr-risk caller pins TWICE — the `uses:` line AND the `workflows_ref:` input
+# A pr-derisk caller pins TWICE — the `uses:` line AND the `workflows_ref:` input
 # that the reusable checks itself out at (same double-pin shape as a groom
 # caller). The shared rewrite moves both, so never hand-bump one alone.
 #
 # The caller list is NOT hardcoded here. This repo is PUBLIC (workflow file and
 # Actions run logs are both publicly viewable), and most callers are private, so
 # their names must never appear in this file or its logs. The list lives in the
-# repo-level Actions SECRET `PR_RISK_CALLERS` as a JSON array of
+# repo-level Actions SECRET `PR_DERISK_CALLERS` as a JSON array of
 # {"repo","file","label"} objects, same shape as the other fleets' rosters.
 #
 # A SECRET, not a variable (BE-6472): the roster reaches the script through the
@@ -38,30 +38,28 @@ name: Bump pr-risk callers
 # anything — Actions masks the roster as ONE exact string, not each name inside
 # it, so a name echoed on its own would otherwise print in the clear.
 #
-# The roster IS seeded (BE-6480), so `ALLOW_EMPTY: "false"` below makes an empty
-# roster fatal: this fleet has live callers, so an empty roster is a bug, not a
-# state to tolerate. Without the hard-fail, a roster that is emptied, renamed or
-# never-read degrades into a silent clean exit — every caller stays pinned to a
-# stale grader with nothing red anywhere to say so, which is exactly the
-# pin-drift this fleet exists to prevent. Same posture as the cursor-review and
-# auto-label fleets; the opposite of groom's, which is still rolling out.
+# THE ROSTER DOES NOT EXIST YET, so `ALLOW_EMPTY: "true"` below is correct for
+# now: pr-derisk ships OFF everywhere and has no enrolled callers, so an empty
+# roster is the accurate state and a hard-fail would redden main on every commit
+# to this rung for no one's benefit. That is the same rolling-out posture groom
+# started from, and the OPPOSITE of the pr-risk / cursor-review / auto-label
+# fleets, whose rosters are live.
 #
-# A secret cannot be read back, so that seeding is evidenced by the secret's
-# creation timestamp (2026-08-05, alongside the variable it replaced, which
-# carried two live callers) rather than by its contents. No run has exercised
-# the secret path yet — BE-6472 landed after the last one — so the first run is
-# what confirms it. If that run hard-fails on an empty roster, re-set the secret
-# from the canonical callers.json rather than relaxing ALLOW_EMPTY: a loud
-# failure here is the design working, not a regression.
+# FLIP IT TO "false" WITH THE FIRST ENROLMENT, in the same change that sets the
+# secret. Left at "true" past that point, a roster that is emptied, renamed or
+# never-read degrades into a silent clean exit — every caller stays pinned to a
+# stale planner with nothing red anywhere to say so, which is exactly the pin
+# drift this fleet exists to prevent. Enrolling a caller is TWO steps (merge the
+# caller, set the roster secret); this is the third half of the second one.
 #
 # Update flow — adding/removing a caller needs NO public commit:
-#   jq -c . callers.json | gh secret set PR_RISK_CALLERS --repo Comfy-Org/github-workflows
+#   jq -c . callers.json | gh secret set PR_DERISK_CALLERS --repo Comfy-Org/github-workflows
 # Keep the canonical callers.json in a PRIVATE infra/ops repo so roster edits
 # have a reviewed source of truth; the org audit log records each edit. (The
 # specific home repo is intentionally not named here — this file is public.)
 #
 # Recovery note: GitHub evaluates a `paths:` filter against only the first 300
-# changed files of a push, so a `scripts/pr-risk/**` change buried in a larger
+# changed files of a push, so a `scripts/pr-derisk/**` change buried in a larger
 # main push can create NO run at all — callers then stay pinned to stale
 # grading logic with no red signal anywhere. `workflow_dispatch` above is the
 # recovery: run it once from main and the fleet catches up.
@@ -71,11 +69,16 @@ on:
   push:
     branches: [main]
     paths:
-      - .github/workflows/pr-risk.yml
+      - .github/workflows/pr-derisk.yml
       # The grading logic consumers actually run lives here, checked out from
-      # the `workflows_ref` SHA a caller pins (see pr-risk.yml's header) — a
+      # the `workflows_ref` SHA a caller pins (see pr-derisk.yml's header) — a
       # behavior change here needs the same caller bump as a workflow-file
       # change, or pinned callers silently drift onto stale tool behavior.
+      - scripts/pr-derisk/**
+      # A pr-derisk caller runs the pr-risk GRADER as well as the planner — every floor in a
+      # plan is computed by grade-pr-risk.sh, and the base-ref override read is grade-targets.sh
+      # — both loaded from the same pinned ref. So a change to either is consumer-visible here
+      # and needs this fleet bumped, independently of the pr-risk fleet's own bump.
       - scripts/pr-risk/**
       # …but the tests and the tool README under that dir are NOT part of what a
       # pinned caller executes, so a test-only or docs-only commit would fan a
@@ -84,6 +87,8 @@ on:
       # keeps meaning "consumer-visible behavior changed". Negations only strip
       # the paths they match: a commit touching a tool script AND its test still
       # matches the positive pattern and still bumps.
+      - '!scripts/pr-derisk/tests/**'
+      - '!scripts/pr-derisk/README.md'
       - '!scripts/pr-risk/tests/**'
       - '!scripts/pr-risk/README.md'
 
@@ -91,14 +96,14 @@ permissions:
   contents: read
 
 # Serialize runs of this fleet. The bumper now pushes to a STABLE branch
-# (ci/bump-pr-risk) shared across runs, so two overlapping runs (a rapid second
+# (ci/bump-pr-derisk) shared across runs, so two overlapping runs (a rapid second
 # main push, or a push racing a manual re-run) would force-reset that branch
 # and race the PR update — an older run finishing last could leave the
 # committed diff pinned to a stale SHA. cancel-in-progress: false lets the
 # running bump finish; GitHub keeps only the newest pending run, so the latest
 # SHA always wins (BE-3882).
 concurrency:
-  group: bump-pr-risk-callers
+  group: bump-pr-derisk-callers
   cancel-in-progress: false
 
 jobs:
@@ -140,48 +145,62 @@ jobs:
       - name: Preflight (staleness / decommission guard)
         id: preflight
         env:
-          WATCHED: .github/workflows/pr-risk.yml
+          WATCHED: .github/workflows/pr-derisk.yml
           # Set even though WATCHED_PATHSPECS below SUPERSEDES the asset-tree OID
           # comparison, so its own value here is not the comparison — it is the
           # COVERAGE ASSERTION preflight.sh only runs when both are set: that the
           # pathspec list still selects something under this directory. Without
-          # it, deleting the `scripts/pr-risk` line from the list below would
-          # leave `.github/workflows/pr-risk.yml` matching itself, satisfy every
+          # it, deleting the `scripts/pr-derisk` line from the list below would
+          # leave `.github/workflows/pr-derisk.yml` matching itself, satisfy every
           # remaining guard, and silently stop watching the grading logic while
           # the fleet kept re-pointing callers. The directory can never be the
           # decommission probe on its own — `tests/` and `README.md` outlive the
           # scripts — which is what WATCHED_EXEC is for.
-          WATCHED_ASSETS: scripts/pr-risk
-          WATCHED_PATHSPECS: |
-            .github/workflows/pr-risk.yml
+          #
+          # BOTH trees, because both are in the `paths:` filter above and the
+          # coverage assertion is per-entry: `scripts/pr-risk` listed here is what
+          # makes deleting its pathspec line a build failure rather than a silent
+          # narrowing, and this fleet's whole reason for watching pr-risk at all is
+          # that a `/derisk` run executes that grader.
+          WATCHED_ASSETS: |
+            scripts/pr-derisk
             scripts/pr-risk
+          WATCHED_PATHSPECS: |
+            .github/workflows/pr-derisk.yml
+            scripts/pr-derisk
+            scripts/pr-risk
+            :(exclude)scripts/pr-derisk/tests
+            :(exclude)scripts/pr-derisk/README.md
             :(exclude)scripts/pr-risk/tests
             :(exclude)scripts/pr-risk/README.md
-          # Every file under `scripts/pr-risk` whose ABSENCE breaks a pinned
-          # caller at run time — not just the entry points. The three graders
-          # were what the inline copy this step replaces listed, and that list
-          # was already short of what a caller runs (a carried-over gap, fixed
-          # here rather than ported):
-          #   * grade-targets.sh hard-`die`s without apply-risk-label.sh, and
-          #     again without publish-risk-surfaces.sh once `check_run:` or
-          #     `sticky_comment:` is enabled;
-          #   * grade-pr-risk.sh falls back to risk-map.v0.json /
-          #     runbook-registry.v0.json beside itself whenever the consumer repo
-          #     ships no `.github/risk.json` / `.github/risk-runbooks.json`
-          #     override — which is the default enrollment.
-          # A commit deleting any of them passes a three-grader probe intact, so
-          # the fleet would be re-pinned to a SHA where every caller's grade step
-          # fails — the exact failure this input exists to catch. NOTE these are
-          # literal paths: a VERSIONED rename (risk-map.v0 → v1) reads here as a
-          # decommission and no-ops the fleet behind a ::warning::, so rename
+          # Every file whose ABSENCE breaks a pinned caller at run time — not just the
+          # entry points, and NOT confined to this rung's own directory. A `/derisk`
+          # run loads BOTH trees from the pinned ref:
+          #   * collect-pr-inputs.sh SOURCES grade-targets.sh (for the base-ref
+          #     override read) and EXECS grade-pr-risk.sh; either missing is a hard
+          #     failure before any plan exists;
+          #   * plan-derisk.sh execs grade-pr-risk.sh again for the split floors, and
+          #     that grader falls back to risk-map.v0.json / runbook-registry.v0.json
+          #     beside itself whenever the consumer ships no override — which is the
+          #     default enrolment;
+          # DELIBERATELY ABSENT: apply-risk-label.sh and publish-risk-surfaces.sh.
+          # grade-targets.sh does check for them — but inside `main()`, which its
+          # `BASH_SOURCE == $0` footer runs only on a DIRECT invocation, and
+          # collect-pr-inputs.sh only SOURCES it for two helpers. Listing them would
+          # make a pr-risk-side decommission of a file no `/derisk` run ever touches
+          # freeze THIS fleet behind a `::warning::` — a false decommission, which is
+          # the same freeze the over-wide-list note above warns about, one list down.
+          # NOTE these are literal paths: a VERSIONED rename (risk-map.v0 → v1) reads
+          # here as a decommission and no-ops the fleet behind a ::warning::, so rename
           # them in this list in the same commit.
           WATCHED_EXEC: |
-            .github/workflows/pr-risk.yml
+            .github/workflows/pr-derisk.yml
+            scripts/pr-derisk/plan-derisk.sh
+            scripts/pr-derisk/publish-derisk-comment.sh
+            scripts/pr-derisk/collect-pr-inputs.sh
+            scripts/pr-derisk/resolve-enabled.sh
             scripts/pr-risk/grade-pr-risk.sh
             scripts/pr-risk/grade-targets.sh
-            scripts/pr-risk/resolve-enabled.sh
-            scripts/pr-risk/apply-risk-label.sh
-            scripts/pr-risk/publish-risk-surfaces.sh
             scripts/pr-risk/risk-map.v0.json
             scripts/pr-risk/runbook-registry.v0.json
           NEW_SHA: ${{ github.sha }}
@@ -230,21 +249,20 @@ jobs:
           # Names the roster to fix in an error message. It is a SECRET now, not a
           # variable; the env key keeps its historical name so every fleet's
           # entrypoint and the shared script stay in step.
-          VAR_NAME: PR_RISK_CALLERS
-          TAG: pr-risk
-          WORKFLOW_FILE: pr-risk.yml
-          # Hard-fail on an empty/missing roster — see the header. Already
-          # `bump-callers.sh`'s default, but stated explicitly so the property
-          # survives a future flip of that default: this fleet has live callers,
-          # so silently degrading back to a clean no-op would restore exactly the
-          # pin-drift the header says it prevents. Same as the auto-label and
-          # detect-unreviewed-merge entrypoints.
-          ALLOW_EMPTY: "false"
+          VAR_NAME: PR_DERISK_CALLERS
+          TAG: pr-derisk
+          WORKFLOW_FILE: pr-derisk.yml
+          # Tolerate an empty/missing roster — see the header. pr-derisk has no
+          # enrolled callers yet, so an empty roster is the accurate state rather
+          # than a bug. FLIP THIS TO "false" in the same change that sets
+          # PR_DERISK_CALLERS for the first enrolment; left "true" past that point
+          # it silently converts a lost roster into a clean no-op.
+          ALLOW_EMPTY: "true"
           # JSON array of {"repo","file","label"} — see the header comment for the
           # update flow. Kept in a repo-level SECRET (not this file, and not a
           # variable) so private caller names never land in this public repo. Actions
           # dumps this step's env BEFORE the script — and its `::add-mask::` calls —
           # can run, which is exactly why the roster must be a secret: the runner
           # masks it in that dump. A variable here was the BE-6472 leak.
-          CALLERS_JSON: ${{ secrets.PR_RISK_CALLERS }}
+          CALLERS_JSON: ${{ secrets.PR_DERISK_CALLERS }}
         run: bash .github/bump-callers/bump-callers.sh

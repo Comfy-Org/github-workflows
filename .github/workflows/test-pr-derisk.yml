@@ -1,0 +1,64 @@
+# CONTRACT: this is one of THIS repo's own path-filtered script tests, NOT a reusable
+# workflow. It is not callable and has no caller pattern:
+#   TRIGGERS — `pull_request` and `push` to main, both filtered to scripts/pr-derisk/**
+#              and this file. A change elsewhere in the repo does not run it.
+#   INPUTS   — none (no `workflow_call`, no `workflow_dispatch`).
+#   SECRETS  — none, and that is the point: the model layer is stubbed through
+#              MODEL_RESPONSE_FILE, so the suite makes no API call and needs no key.
+# The reusable workflow these scripts back is .github/workflows/pr-derisk.yml — that is
+# the file with the inputs/secrets/caller-pattern header.
+
+name: Test pr-derisk scripts
+
+# Runs the hermetic suite (+ shellcheck) for the split planner, the renderer and the
+# enablement resolver behind pr-derisk.yml. The floors in the suite are computed by the
+# REAL grade-pr-risk.sh, so this also catches a grader change that would silently alter
+# what a de-risk plan promises.
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/pr-derisk/**'
+      - '.github/workflows/test-pr-derisk.yml'
+      # pr-derisk.yml passes the scripts their whole input contract through env, and the suite
+      # asserts on the workflow's own `workflows_ref` guard, so a change to it can break the
+      # suite without touching a file under scripts/pr-derisk/.
+      - '.github/workflows/pr-derisk.yml'
+      # The pin guard is asserted byte-identical against pr-risk.yml's copy, and every floor
+      # the suite checks comes from the pr-risk grader — so both are inputs to this suite.
+      - '.github/workflows/pr-risk.yml'
+      - 'scripts/pr-risk/**'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/pr-derisk/**'
+      - '.github/workflows/test-pr-derisk.yml'
+      - '.github/workflows/pr-derisk.yml'
+      - '.github/workflows/pr-risk.yml'
+      - 'scripts/pr-risk/**'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: shellcheck + suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: shellcheck
+        working-directory: scripts/pr-derisk
+        run: shellcheck -x plan-derisk.sh publish-derisk-comment.sh collect-pr-inputs.sh resolve-enabled.sh tests/test_plan_derisk.sh
+
+      - name: planner + renderer suite
+        # Hermetic: the model is stubbed, the renderer runs under DRY_RUN, and the split floors
+        # are computed by the real grader. Covers the properties that separate this rung from a
+        # chatbot — every floor is the grader's, the partition is validated and retried exactly
+        # once, a single-class monolith gets no fake lane win, no failure path is silent, a
+        # crafted filename cannot forge markdown, and the `workflows_ref` guard has not drifted
+        # from pr-risk.yml's.
+        run: bash scripts/pr-derisk/tests/test_plan_derisk.sh

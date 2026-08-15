@@ -23,7 +23,12 @@ raw output of `cursor-agent models`, it reports five kinds of drift:
     which the panel does *not* pin. A REVIEW-ME list, never an auto-recommendation:
     picking "newest highest-reasoning ZDR-eligible" needs human judgment, and ZDR
     especially — Cursor only marks NO-ZDR inline (e.g. a `(NO ZDR)` suffix), so any
-    such marker on the line is surfaced verbatim rather than interpreted.
+    such marker on the line is surfaced verbatim rather than interpreted. Rendered
+    one row per model *family* rather than per id (BE-6911): the panel pins one
+    reasoning/speed tier per family, so every other tier of every pinned family is
+    an "unpinned candidate" forever — 178 rows on the 2026-08-10 catalog, in which
+    the two genuinely new families were below the truncation cut. See
+    `TIER_SUFFIXES`.
   * **unpinned model families** — catalog ids whose family prefix matches no pin
     at all. Quieter than the above (mostly labs the panel will never pin, so it
     renders collapsed and is never `urgent`), but it is the ONLY place a lab the
@@ -67,17 +72,37 @@ DEFAULT_STALE_DAYS = 30
 MAX_CATALOG_CHARS = 40000
 MAX_BODY_CHARS = 60000
 # Budgets for the report's candidate lists, so `MAX_BODY_CHARS` (a blunt
-# `body[:N]`) can never cut into their markup. MAX_FAMILY_IDS caps EVERY
-# per-lab id list (the same-lab review-me list, a delisted pin's alternatives,
-# the families fold); MAX_FAMILY_LABS plus the CHARS budget bound the families
+# `body[:N]`) can never cut into their markup. MAX_FAMILY_IDS caps the ROWS of
+# every per-lab list — but a row is not always one id: the same-lab review-me
+# list collapses a family's reasoning/speed tiers into a single row (see
+# `TIER_SUFFIXES`), while a delisted pin's alternatives and the families fold
+# still list raw ids. MAX_FAMILY_LABS plus the CHARS budget bound the families
 # fold, the one list whose group count the catalog controls — row caps alone
 # bound its rows, not its chars (40 labs × 25 capped-note rows is still ~4× the
-# body cap). All generous next to a real catalog — a few dozen models across a
-# handful of families — and every list leads with its highest-signal rows, so
-# the first rows carry it.
+# body cap).
+#
+# Sized against a real catalog rather than a guess: the 2026-08-10 one carried
+# 178 unpinned ids across the four pinned labs, which collapse to ~40 family
+# rows — so with tier collapse the cap is not reached on today's catalog at all.
+# It is still a cap, so ordering is what makes it safe: the same-lab list is
+# sorted newest-family-version-first (`_family_version`), so what MAX_FAMILY_IDS
+# drops is the oldest families rather than an arbitrary tail of Cursor's print
+# order. The families fold is a watchlist scanned whole, so it keeps catalog
+# order.
 MAX_FAMILY_LABS = 40
 MAX_FAMILY_IDS = 25
 MAX_FAMILY_FOLD_CHARS = 15000
+# Tier tokens listed on one collapsed row before it says `+N more`. The tier
+# vocabulary is fixed (`len(TIER_SUFFIXES)`, doubled by the `-fast` twins), so a
+# row is bounded either way — but "bounded" is not "small". At this value a
+# collapsed row costs about what the single id row it replaces used to, so the
+# section's worst-case char budget (every pinned lab at MAX_FAMILY_IDS rows,
+# every note at MAX_NOTE_CHARS) is unchanged by the collapse; listing all 17
+# would inflate it ~15% and eat into what is left for the raw catalog fold.
+# Tiers are listed strongest-first and the count is always stated in full ahead
+# of the list, so a truncated row still says how many tiers the family offers
+# and drops the weakest — the part a promotion decision does not use.
+MAX_TIERS_PER_ROW = 8
 # Cap on a rendered note. Notes are third-party free text repeated across
 # dozens of rows; unbounded, a single note could eat the whole body budget.
 MAX_NOTE_CHARS = 200
@@ -109,6 +134,37 @@ _NO_ZDR = re.compile(r"no[\s_-]*zdr", re.IGNORECASE)
 # from shadowing the real pin-adjacent date; the real-workflow test guards the
 # window from being too tight.
 LAST_CHECKED_WINDOW = 40
+
+# The reasoning/speed suffixes Cursor appends to a model family, and the ONE
+# place they are enumerated. Cursor ships a family at every reasoning tier and
+# most of them again as `-fast`, but the panel pins exactly ONE tier per family
+# — so without collapsing, every other tier of every family the panel ALREADY
+# pins is reported as an unpinned "candidate" forever. That is what buried the
+# two genuinely new families under 178 rows on 2026-08-10 (BE-6911).
+#
+# `extra-high` precedes `high` because the family/tier split takes the LONGEST
+# tier that matches (see `_TIER_SUFFIX_RE`) — otherwise `gpt-5.5-extra-high`
+# would read as family `gpt-5.5-extra`. A bare `-fast` with no tier in front of
+# it (`gpt-5.3-codex-fast`) is a tier too: it is the default tier, run fast.
+#
+# NOT included, deliberately: `-thinking`. It reads like a reasoning knob but
+# the panel pins ON it — `claude-opus-5-thinking-max` and `claude-opus-5-max`
+# are different products for this purpose — so collapsing the two together
+# would hide exactly the distinction a promotion decision turns on.
+TIER_SUFFIXES = ("extra-high", "minimal", "none", "low", "medium", "high", "xhigh", "max")
+SPEED_SUFFIX = "fast"
+_TIER_SUFFIX_RE = re.compile(
+    r"^(?P<family>.+?)-(?P<tier>(?:(?:{tiers})(?:-{fast})?|{fast}))$".format(
+        tiers="|".join(re.escape(tier) for tier in TIER_SUFFIXES),
+        fast=re.escape(SPEED_SUFFIX),
+    )
+)
+# Rough capability order of the tiers, weakest first. Used for ONE thing: which
+# member of a collapsed family lends the row its catalog note (the tier a human
+# would most plausibly promote). It is not a recommendation and never reaches
+# the report — the note itself is still reproduced verbatim.
+_TIER_STRENGTH = ("", "none", "minimal", "low", "medium", "high", "extra-high", "xhigh", "max")
+_VERSION_TOKEN = re.compile(r"\d+")
 
 
 class ExtractionError(Exception):
@@ -359,6 +415,57 @@ def lab_of(model_id):
     return re.split(r"[-.]", model_id, maxsplit=1)[0].lower()
 
 
+def family_of(model_id):
+    """Split an id into `(family, tier)` at its reasoning/speed suffix.
+
+    `gpt-5.6-terra-max-fast` -> `('gpt-5.6-terra', 'max-fast')`. An id carrying
+    no suffix from `TIER_SUFFIXES` is its own family at the empty (default)
+    tier — `gpt-5.3-codex` -> `('gpt-5.3-codex', '')` — which is what merges it
+    with its `-low`/`-fast`/… siblings instead of stranding it as a family of
+    one.
+
+    Deliberately a *suffix* rule and not a table: like `lab_of`, it stays
+    zero-maintenance when a lab ships a new family name. The cost is that a
+    family whose name happens to end in a tier word would be split — no such id
+    exists in Cursor's catalog, and the failure mode is a cosmetic extra row in
+    a review-me list, not a missed finding.
+    """
+    match = _TIER_SUFFIX_RE.match(model_id)
+    if not match:
+        return model_id, ""
+    return match.group("family"), match.group("tier")
+
+
+def _family_version(family):
+    """Sort key for a family — every digit run in it, in order.
+
+    `gpt-5.6-terra` -> `(5, 6)`; `claude-opus-4-8-thinking` -> `(4, 8)`;
+    `kimi-k3` -> `(3,)`; `code-supernova` -> `()`, which sorts oldest. Purely
+    positional on purpose: nothing in a bare id says which number is the version,
+    and the labs write it at least three ways (`5.6`, `4-8`, `k3`), so anything
+    smarter would be a per-lab table — the maintenance burden this checker
+    avoids everywhere else. Sorting on it descending is what makes the
+    MAX_FAMILY_IDS cut drop the OLDEST families rather than whatever Cursor
+    happened to print last.
+    """
+    return tuple(int(token) for token in _VERSION_TOKEN.findall(family))
+
+
+def _tier_strength(tier):
+    """Rank a tier for picking a collapsed row's representative — see `_TIER_STRENGTH`."""
+    base, fast = tier, False
+    # Split the SPEED half off the END, not at the first `-`: a tier can carry a
+    # hyphen itself (`extra-high`), and splitting at the first one reads its base
+    # as `extra`, which is in no ranking and would demote the family's top tier.
+    if base == SPEED_SUFFIX:  # a bare `-fast` id is the default tier, run fast
+        base, fast = "", True
+    elif base.endswith("-" + SPEED_SUFFIX):
+        base, fast = base[: -len(SPEED_SUFFIX) - 1], True
+    strength = _TIER_STRENGTH.index(base) if base in _TIER_STRENGTH else 0
+    # Prefer the non-`fast` twin, so the note reads as the family's plain top tier.
+    return (strength, 0 if fast else 1)
+
+
 def analyze(panel_models, judge_model, catalog_text, last_checked, today, stale_days):
     """Compare the pins against the catalog and return the drift report."""
     entries = catalog_entries(catalog_text)
@@ -547,11 +654,13 @@ def _inline_code(text):
 
 
 def _candidate_list(candidates, limit=None):
-    """Bullet list of `{id, note}` rows — shared by both unpinned sections.
+    """Bullet list of `{id, note}` rows, one per id — the unpinned-families fold.
 
     `limit` caps the rows and names the remainder instead of dropping it
-    silently. Every caller passes one: the number of GROUPS in the same-lab
-    list is bounded by the pins, but the ids per group come from the catalog.
+    silently; the caller passes one because the ids per group come from the
+    catalog. The same-lab review-me list uses `_collapsed_candidate_list`
+    instead — the fold is a short watchlist scanned whole, so it keeps one row
+    per id in catalog order.
     """
     shown = candidates if limit is None else candidates[:limit]
     rows = [
@@ -561,6 +670,236 @@ def _candidate_list(candidates, limit=None):
     if hidden:
         rows.append(f"- _… and {hidden} more — see the raw catalog fold below._")
     return "\n".join(rows)
+
+
+def collapse_tiers(candidates):
+    """Group `{id, note}` rows into one group per family, newest family first.
+
+    Returns `[{family, members, _order}]` where `members` are the candidate rows
+    of that family in catalog order, each carrying its `tier`, and `_order` is
+    the family's first appearance in the catalog. Ordering is `_family_version`
+    descending, ties broken by that catalog order — the "highest-signal rows
+    first" the row caps assume.
+    """
+    groups = []
+    by_family = {}
+    for index, candidate in enumerate(candidates):
+        family, tier = family_of(candidate["id"])
+        group = by_family.get(family)
+        if group is None:
+            group = by_family[family] = {"family": family, "members": [], "_order": index}
+            groups.append(group)
+        group["members"].append(dict(candidate, tier=tier))
+    # Explicit `-_order` rather than leaning on sort stability under `reverse`:
+    # the tie-break IS the contract here (catalog order), so it is written down.
+    groups.sort(key=lambda g: (_family_version(g["family"]), -g["_order"]), reverse=True)
+    return groups
+
+
+def _collapsed_candidate_list(candidates, pinned=(), limit=None):
+    """`_candidate_list`, but one row per FAMILY — the same-lab review-me list.
+
+    The panel pins one tier per family, so a per-id list reports every other
+    tier of every pinned family as a candidate, forever (BE-6911: 178 rows, with
+    both new families below the cut). One row per family names the family, how
+    many tiers the catalog offers and which, and reproduces ONE member's catalog
+    note verbatim — the strongest tier's, since that is the plausible promotion
+    target. Per-id notes are not interpreted or merged: a family whose members
+    carry differing notes (a NO-ZDR marker on some tiers only) shows the
+    representative's, and the raw catalog fold below remains the full record.
+
+    `pinned` are the lab's pinned ids, used only to mark a family the panel
+    already pins — the rows that are noise by construction.
+    """
+    groups = collapse_tiers(candidates)
+    shown = groups if limit is None else groups[:limit]
+    pinned_by_family = {}
+    for pin in pinned:
+        pinned_by_family.setdefault(family_of(pin)[0], []).append(pin)
+
+    rows = []
+    for group in shown:
+        members = group["members"]
+        # `max` keeps the FIRST maximal member, i.e. catalog order breaks ties.
+        top = max(members, key=lambda m: _tier_strength(m["tier"]))
+        note = f" — {_inline_code(top['note'])}" if top["note"] else ""
+        already = pinned_by_family.get(group["family"]) or []
+        pin_note = (
+            " · _panel already pins " + ", ".join(f"`{p}`" for p in already) + "_" if already else ""
+        )
+        if len(members) == 1:
+            rows.append(f"- `{top['id']}`{note}{pin_note}")
+            continue
+        # Strongest tier first, so MAX_TIERS_PER_ROW drops the weakest rather
+        # than whichever ones Cursor happened to print last.
+        ranked = sorted(members, key=lambda m: _tier_strength(m["tier"]), reverse=True)
+        tiers = [f"`{m['tier']}`" if m["tier"] else "_default_" for m in ranked]
+        if len(tiers) > MAX_TIERS_PER_ROW:
+            extra = len(tiers) - MAX_TIERS_PER_ROW
+            tiers = tiers[:MAX_TIERS_PER_ROW] + [f"+{extra} more"]
+        rows.append(
+            f"- `{group['family']}-*` — {len(members)} tiers ({', '.join(tiers)}); "
+            f"top `{top['id']}`{note}{pin_note}"
+        )
+
+    hidden = len(groups) - len(shown)
+    if hidden:
+        hidden_ids = sum(len(g["members"]) for g in groups[len(shown) :])
+        rows.append(
+            f"- _… and {hidden} older famil{'y' if hidden == 1 else 'ies'} "
+            f"({hidden_ids} id{'s' if hidden_ids != 1 else ''}) — see the raw catalog fold below._"
+        )
+    return "\n".join(rows)
+
+
+def _standing_after_repin(report):
+    """Would the review-me list still hold the issue open after the urgent repin?
+
+    The urgent arm tells the reader the issue will not close once they repin.
+    That claim is made from the PRE-repin snapshot, so it has to survive the
+    repin it is describing: repinning consumes catalog ids out of the very list
+    that is holding the issue open, and a lab with nothing left over closes it
+    after all (BE-6912 review).
+
+    Counted as a guaranteed FLOOR on the surviving list, because a `False` only
+    means "cannot promise" and the caller then renders the weaker, always-true
+    sentence. A repin takes at most one catalog id per urgent pin, and where it
+    takes it from splits two ways:
+
+      * the pin's own lab still offers same-lab candidates — that is what the 🚨
+        section suggests and where `same_lab_available` sources it, so charge the
+        pin to its own lab's group, which stays pinned and therefore stays in the
+        review-me list at all.
+      * the pin's lab offers NONE (the 🚨 section prints "_(no same-lab id in the
+        catalog)_") — the replacement then has to come from somewhere else
+        entirely, so the charge is HOMELESS: it lands on whichever group the
+        reader picks from, and the floor has to absorb it globally. Charging it
+        to its own, empty, lab was this function's own version of the bug it was
+        added to fix (BE-6912 review round 2): with one urgent pin whose lab is
+        empty and exactly one candidate left anywhere, the strong claim survived
+        a repin that provably drains the list.
+
+    Two conservative simplifications, both in the "cannot promise" direction:
+    a NO-ZDR pin is charged the full id even though an in-lab repin hands its old
+    id straight back to that lab's candidates (net drain zero) — that credit is
+    only real when the repin stays in-lab, which is exactly the assumption the
+    homeless case shows cannot be relied on. And `unpinned_labs` is never counted
+    as standing: pinning into one of those families is itself a way to empty
+    that list, and a homeless repin is most likely to land there.
+    """
+    urgent_per_lab = {}
+    for item in report["delisted"]:
+        urgent_per_lab[item["lab"]] = urgent_per_lab.get(item["lab"], 0) + 1
+    for item in report.get("zdr_risk") or []:
+        lab = lab_of(item["id"])
+        urgent_per_lab[lab] = urgent_per_lab.get(lab, 0) + 1
+    labs_with_candidates = {group["lab"] for group in report["unpinned"]}
+    homeless = sum(
+        count for lab, count in urgent_per_lab.items() if lab not in labs_with_candidates
+    )
+    floor = sum(
+        max(0, len(group["candidates"]) - urgent_per_lab.get(group["lab"], 0))
+        for group in report["unpinned"]
+    )
+    return floor > homeless
+
+
+def _standing_on_extra_tiers(report):
+    """Is the review-me list SELF-SUSTAINING — held open by an already-pinned family?
+
+    The advisory arm's strong claim is stronger than the urgent arm's: not "it
+    survives one repin" but "it stays open indefinitely". Only one shape of
+    finding earns that, and it is the one the sentence names — an unpinned tier
+    of a family the panel ALREADY pins. Promoting it just swaps which tier of
+    that family is listed, so the list refills itself and no action the issue
+    asks for can empty it. That is the steady state on any real catalog.
+
+    Everything else in the list can be pinned away, and then the issue closes:
+    `analyze` files every unpinned id sharing a pinned lab's prefix under
+    `unpinned`, including a wholly NEW one-tier family (`gpt-6-omega`), and
+    `unpinned_labs` is a family from a lab the panel pins nothing from. Both are
+    finite: pin them and the list is gone. Claiming permanence there was both a
+    wrong cause and a wrong prediction (BE-6912 review round 2), so those reports
+    stand down to the weaker, always-true sentence instead.
+    """
+    for group in report["unpinned"]:
+        pinned_families = {family_of(pin)[0] for pin in group["pinned"]}
+        if any(family_of(item["id"])[0] in pinned_families for item in group["candidates"]):
+            return True
+    return False
+
+
+def _footer(report):
+    """The trailing note: what THIS issue asks of the reader, in its own words.
+
+    Three arms, because the report already sorts itself into three states and a
+    single sentence cannot describe all of them honestly (BE-6912):
+
+      * `urgent` — a delisted pin or a pin marked NO-ZDR. Someone must edit
+        `cursor-review.yml` now; the run is red.
+      * findings, not urgent — the standing review-me list (and/or an audit-date
+        reminder). Advisory. This is the steady state, so the footer has to say
+        out loud that a permanently-open issue here is not neglect: `unpinned`
+        counts toward `has_findings`, and any real catalog lists more reasoning
+        tiers per pinned lab than the panel pins one of, so the close arm in
+        `cursor-review-catalog-drift.yml` is effectively unreachable. Measured
+        on the 2026-08-10 catalog (the `tests/fixtures` capture, from run
+        31363137595 / issue #144): 192 catalog ids, 178 of them unpinned
+        same-lab, 3 unpinned families — no delisted pin, no NO-ZDR pin, run
+        green, issue open ever since.
+      * no findings — the only state that closes the issue, and the ONLY arm
+        that may promise a close. The footer used to promise it unconditionally,
+        which told every reader of a permanently-open advisory issue that it
+        should have closed weeks ago — i.e. that it was being ignored — on the
+        one issue that is also where a genuinely urgent pin failure is reported.
+    """
+    lead = "_Filed by the weekly `cursor-review-catalog-drift` check."
+    if report["urgent"]:
+        # Gated on the POST-repin state, not on the snapshot the report is: the
+        # claim below is about what the reader finds after doing what this arm
+        # asks — see `_standing_after_repin`. Says "above" because `render_body`
+        # appends this footer last, so every section it can point at is above it;
+        # and it names the review-me list because that is the only list the gate
+        # counts, so a `True` implies `unpinned` is non-empty and the section it
+        # names is in the body.
+        closing = (
+            "and it will **not** close itself once you repin — the standing review-me list above "
+            "holds it open, as it does on any real catalog. The next run simply rewrites this "
+            "issue without the 🚨 section."
+            if _standing_after_repin(report)
+            else "and it closes itself on the first run that finds nothing at all to report."
+        )
+        return (
+            f"{lead} **Act on this now:** a pinned model is delisted or marked NO-ZDR — see the 🚨 "
+            "section(s) above and repin in `cursor-review.yml`. That is also why this check's run "
+            f"is red. The issue is sticky: each run rewrites it in place, {closing}_"
+        )
+    if report["has_findings"]:
+        # "Indefinitely" is a claim about every action the issue asks for, not
+        # just the next run, so it is gated on the one finding shape no action
+        # can clear — see `_standing_on_extra_tiers`. A report standing only on
+        # new families (in a pinned lab or an unpinned one) or on a stale audit
+        # date really does close once they are dealt with; telling that reader
+        # the issue is permanent would be this footer's own bug in miniature.
+        closing = (
+            "and it stays open indefinitely, because Cursor's catalog always lists more reasoning "
+            "tiers than the panel pins one of. **An open issue here is not a sign anyone is "
+            "ignoring it**"
+            if _standing_on_extra_tiers(report)
+            else "and it closes itself on the first run that finds nothing at all to report"
+        )
+        return (
+            f"{lead} **Nothing here is urgent:** no pinned model is delisted or marked NO-ZDR, so "
+            "the review panel is working and this check's run is green. What is above is advisory — "
+            "catalog ids for a human to review, and/or an audit-date reminder — to skim when "
+            f"convenient. The issue is sticky: each run rewrites it in place, {closing} — when a "
+            "pin actually breaks, the run goes red and this footer says **act on this now** "
+            "instead._"
+        )
+    return (
+        f"{lead} No drift at all — nothing to act on, and this is the one outcome that closes the "
+        "issue. A later run files a fresh one if drift returns._"
+    )
 
 
 def render_body(report, catalog_text, run_url=None, checked_at=None):
@@ -624,16 +963,25 @@ def render_body(report, catalog_text, run_url=None, checked_at=None):
     if report["unpinned"]:
         out.append(
             "## Unpinned same-lab catalog ids — review me\n\n"
-            "Catalog ids from labs the panel already pins that are **not** pinned today. This is a "
-            "**review-me list, not a recommendation**: picking the newest highest-reasoning "
-            "*ZDR-eligible* model is a human call. Cursor only marks NO-ZDR models inline, so any "
-            "marker on the catalog line is reproduced verbatim below — an id with no marker is "
-            "**not** thereby confirmed ZDR-eligible; check the catalog before promoting one."
+            "Catalog ids from labs the panel already pins that are **not** pinned today, **one row "
+            "per model family**, newest family first — ids that differ only by a reasoning/speed "
+            "tier (`-none`/`-low`/`-medium`/`-high`/`-xhigh`/`-max`, each optionally `-fast`) share "
+            "a row, since the panel pins one tier per family and the rest are not separate "
+            "candidates. This is a **review-me list, not a recommendation**: picking the newest "
+            "highest-reasoning *ZDR-eligible* model is a human call. Cursor only marks NO-ZDR "
+            "models inline, so any marker on the catalog line is reproduced verbatim below — an id "
+            "with no marker is **not** thereby confirmed ZDR-eligible; check the catalog before "
+            "promoting one. A collapsed row shows the note of the tier named after `top` only, so "
+            "consult the raw fold for the other tiers' lines before promoting."
         )
         for group in report["unpinned"]:
             pinned_now = ", ".join(f"`{m}`" for m in group["pinned"]) or "_none_"
             out.append(f"**`{group['lab']}`** (pinned: {pinned_now})")
-            out.append(_candidate_list(group["candidates"], limit=MAX_FAMILY_IDS))
+            out.append(
+                _collapsed_candidate_list(
+                    group["candidates"], pinned=group["pinned"], limit=MAX_FAMILY_IDS
+                )
+            )
 
     families = report.get("unpinned_labs") or []
     if families:
@@ -712,10 +1060,7 @@ def render_body(report, catalog_text, run_url=None, checked_at=None):
                 f"pins and refresh the `last checked` comment in `cursor-review.yml`."
             )
 
-    footer = (
-        "_Filed by the weekly `cursor-review-catalog-drift` check. This issue is sticky — it is "
-        "updated in place each run and closed automatically once a run finds no drift._"
-    )
+    footer = _footer(report)
     # The raw fold gets whatever body budget the report has NOT used, up to the
     # MAX_CATALOG_CHARS ceiling. A fixed 40K assumed the report stayed inside
     # ~20K; a large catalog can exceed that even with every list capped, and the

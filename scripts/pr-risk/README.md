@@ -52,7 +52,26 @@ record.
    these lines run?" with nothing, so it cannot drop the axis below R2. What
    counts as a test file is `reversibility.test_path_patterns` in the map (omit
    the key and the grader falls back to a built-in regex that only knows the
-   Go/TS shapes).
+   Go/TS shapes). The axis also records `files` — which changed paths actually
+   supplied the tier — on the two rungs that are attributable to specific files
+   (an irreversible class, or a removal under a sensitive class), and `null` on
+   the other three: "no green rollup" is a property of the head commit and "no
+   test touched" of the whole change set, so neither is removable by dropping
+   files, and `null` says exactly that rather than "attributable to nothing".
+   When a PR trips *both* attributable rungs the list is their **union**, not
+   the first-match one the `reason` names, so peeling every path it lists clears
+   *every* attributable rung. Unlike `path_floor.files` (rows), it is a
+   flat array of destination path **strings**, directly comparable against
+   `path_floor.files[].path`. Beside it, `residual_tier` says **where the axis
+   lands once those paths are peeled** — the half `files` cannot answer on its
+   own, because the three rungs the remainder falls back to are map-configurable
+   and a consumer that sets `no_green_checks_tier: "R3"` puts the remainder
+   straight back on R3. It is peel-set-independent: the "no green rollup" rung
+   tests the head commit, which no peel can change, so a non-green rollup pins
+   the residual at `no_green_checks_tier` exactly, and a green one bounds it by
+   the worse of the two rungs below. It is `null` exactly when `files` is.
+   Like the per-file path floors, both are **reporting only** — derived from the
+   tier decision and read nowhere else, so neither can ever move a tier.
 
 Anything unreadable grades `unknown` (labeled `risk:ungraded`), never a
 confident tier, and never "the axes that did resolve" — a PR whose file list we
@@ -237,7 +256,49 @@ Labels are created on first use, color-coded green → red (gray for ungraded).
   comment is deliberately **one line above the fold** — tier, the axis that decided it, its
   reason, plus a concentration fragment when the path axis is what decided — with the formula,
   the per-axis table, the per-file breakdown and the caveats inside a collapsed `<details>` and
-  the dispute checkbox below it. It is created once and updated in place. The long form lives in
+  the dispute checkbox below it. It is created once and updated in place. The full concentration
+  sentence also carries a **reducibility readout**: when the path axis is what decided the tier and
+  some of the diff sits below the floor, it names what the below-floor remainder would path-floor
+  at on its own — "…peeled into their own PR, the remaining 3 file(s) would path-floor at **R2**
+  (final grade still depends on the provenance and reversibility axes at PR time)". That complement
+  floor is the worst per-file floor over exactly the files the share sentence already counts as
+  below-floor, computed from the grader's own per-file floors rather than estimated, and it is what
+  tells a split worth doing (the remainder lands in a cheap lane) from one that is not (it is still
+  a normal review). It is deliberately a **floor with its assumptions named, never a promised
+  grade**, and deliberately **not clamped to the other two axes**: both are re-derived for the
+  split PR and can move either way — a narrower path set may newly assert a runbook (provenance
+  improves) or newly fail one, and reversibility keys on the remainder's own classes and on checks
+  that have not run yet — so clamping would print a number that is not a floor either. It is
+  silent where a split cannot help: an irreducible diff (every line already at the floor), any
+  grade the path axis did not decide, and a remainder that rounds to **0%** of the diff, where the
+  sentence would otherwise pitch relocating a line it just called nothing. A *tie* — another axis
+  proposing the same tier as the path floor — is read **per axis**, because the two ties do not
+  mean the same thing. A **provenance** tie always suppresses: provenance is a property of the
+  author, so it follows the remainder into the split PR and peeling the top files changes nothing.
+  A **reversibility** tie is a property of specific *files*, and those may be exactly the files the
+  clause proposes peeling — so it suppresses **unless** two things hold at once.
+  `axes.reversibility.files` (the paths that supplied the reversibility tier) must be a non-empty
+  array **every** entry of which is already in the peeled set, *and* `axes.reversibility
+  .residual_tier` (where the axis lands after that peel) must rank strictly below the headline.
+  Only then does one split provably remove both reasons, and the clause speaks.
+  Both halves are load-bearing rather than formalities, and a consumer map override defeats each
+  one separately. Against the subset test: remap `migrations` to R1 while leaving it in
+  `irreversible_classes` and the irreversible-class file sits *below* the path floor, so peeling
+  the top files leaves the reversibility reason exactly where it was. Against the residual test:
+  set `no_green_checks_tier: "R3"` and peeling every attributed path drops the remainder onto a
+  rung that is R3 all over again — the attributed reason went with the peel, but the tier did not
+  move, so the reduction the clause would promise cannot happen.
+  Either field absent or `null` — the R2/R1 rungs, where the reason is a property of the
+  head commit or of the whole change set, and every record graded before those fields existed —
+  reads as *not* removable, failing safe back to suppression. When a removable reversibility tie
+  does let the clause speak, the above-the-fold headline names the driver **`path and
+  reversibility`** and carries reversibility's reason, so the split pitch inside the `<details>` is
+  never sitting under a headline crediting reversibility alone — and it is bound to the *same*
+  predicate the pitch itself is, so a record that pitches no split (an irreducible diff, a
+  remainder that rounds to 0%) keeps the plain single-axis headline it always had.
+  The caveat stays attached and stays honest in that case:
+  the remainder re-derives reversibility from its own classes and its own checks.
+  The long form lives in
   the Check Run instead, because this comment lands on PRs that already carry CodeRabbit and an
   8-cell review panel, and an advisory grade nothing routes on has the weakest claim on the
   reader's scroll. Every PR-controlled string it renders is escaped here — a filename may
@@ -264,9 +325,28 @@ Labels are created on first use, color-coded green → red (gray for ungraded).
 - `tests/` — hermetic suites (synthetic records + a stubbed `gh`); run via
   [`test-pr-risk.yml`](../../.github/workflows/test-pr-risk.yml).
 
+## The next rung: `/derisk` (pr-derisk, v1)
+
+The reducibility readout above tells a reader *that* a split would help and *what the remainder
+would floor at*. It does not draft the split. That is
+[`pr-derisk`](../pr-derisk/README.md) — an on-demand `/derisk` comment command, off by default,
+which makes ONE model call for a semantic partition of the diff and then has **this grader**
+compute every step's floor via `grade-pr-risk.sh --stdin`.
+
+Two properties of that arrangement matter here rather than there:
+
+- **The grading path stays LLM-free.** pr-derisk reads this grader's output and adds a comment; it
+  cannot change a grade, a label, or a check. Nothing in `scripts/pr-risk/` knows it exists.
+- **`--stdin` is load-bearing beyond the tests.** It is what makes a proposed split's floor
+  computable by the actual judge instead of estimated by a model, so a de-risk plan can never show
+  a tier the grader did not produce. Treat it as a public contract of this script: the scorecard
+  record shape and `risk.axes.path_floor.tier` are what pr-derisk builds against, and
+  `bump-pr-derisk-callers.yml` watches `scripts/pr-risk/**` for exactly that reason.
+
 ## What is deliberately NOT here
 
-No auto-merge, no routing, no required check, no PR comment, no LLM judgement,
-no linked-ticket requirement. Those are later rungs of the ladder and each one
-is its own explicit switch — this workflow exists to accumulate the
+No auto-merge, no routing, no required check, no LLM judgement, no linked-ticket
+requirement — and no PR comment on the grading path beyond the opt-in sticky above.
+Those are later rungs of the ladder (the first of them, `/derisk`, is described
+directly above) and each one is its own explicit switch — this workflow exists to accumulate the
 agree/disagree evidence that decides whether any of them turn on.

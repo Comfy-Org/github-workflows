@@ -27,9 +27,14 @@ python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
 python3 -m unittest discover -s .github/refresh-reviewers/tests -p 'test_*.py' -v
 
 # bump-callers shell tests + lint (gh is stubbed; no network)
-shellcheck -x .github/bump-callers/bump-callers.sh .github/bump-callers/preflight.sh .github/bump-callers/tests/test_bump_callers.sh .github/bump-callers/tests/test_preflight.sh
+shellcheck -x .github/bump-callers/bump-callers.sh .github/bump-callers/preflight.sh .github/bump-callers/tests/test_bump_callers.sh .github/bump-callers/tests/test_preflight.sh .github/bump-callers/tests/test_paths_contract.sh
 bash .github/bump-callers/tests/test_bump_callers.sh
 bash .github/bump-callers/tests/test_preflight.sh
+bash .github/bump-callers/tests/test_paths_contract.sh
+
+# pr-derisk planner/renderer suite + lint (model stubbed; no network, no API key)
+shellcheck -x scripts/pr-derisk/*.sh scripts/pr-derisk/tests/*.sh
+bash scripts/pr-derisk/tests/test_plan_derisk.sh
 
 # workflow-pins lint (no reusable workflow may default `workflows_ref`) + its tests
 python3 -m unittest discover -s .github/workflow-pins/tests -p 'test_*.py' && python3 .github/workflow-pins/check_workflow_pins.py
@@ -85,7 +90,16 @@ tests — run the matching command above for whatever you touched.
   that opens SHA-bump PRs in consumer repos when a reusable workflow changes,
   plus `preflight.sh` (BE-6475), the ONE staleness/decommission guard that runs
   ahead of it — `proceed` / `new_sha` step outputs, `WATCHED` +
-  `WATCHED_ASSETS` inputs. Tests in `tests/`.
+  `WATCHED_ASSETS` inputs, plus `WATCHED_PATHSPECS` (BE-6676; the excluding
+  fleets: pr-risk, and pr-size/cursor-review since BE-7084) + `WATCHED_EXEC`
+  (the per-executed-file fleets: pr-risk, pr-derisk). Watched inputs MUST
+  mirror that fleet's `paths:` filter, exclusions included. Tests in `tests/`.
+- `scripts/pr-risk/` + `scripts/pr-derisk/` — the two rungs of the PR risk ladder.
+  v0 grades (`grade-pr-risk.sh`, deterministic — **no LLM in the grading path; keep it
+  that way**); v1 plans a split on `/derisk` (`plan-derisk.sh`), the ONLY place a model
+  runs, and every floor it shows is computed by v0's grader over a synthetic record,
+  never claimed by the model. A pr-derisk caller executes BOTH trees at its pinned ref
+  — hence its bump fleet watching `scripts/pr-risk/**`. Tests in each `tests/`.
 - `README.md` — the public workflow catalog: per-workflow purpose, the SHA-pin
   usage pattern, and the versioning policy. Keep its table in sync when you add
   a workflow.
@@ -107,6 +121,11 @@ tests — run the matching command above for whatever you touched.
   creds; briefs live in `.github/groom/`. Opt-in auto-builder (`builder: true`,
   BE-4003) turns the top CONFIRMED findings into review-gated PRs (never
   auto-merged) via a credential-free patch job + a separate bot PR job.
+- `pr-derisk.yml` — on-demand `/derisk` comment command (beta, off by default): re-grade
+  the PR, ONE model call for a split partition, floors computed by `grade-pr-risk.sh
+  --stdin`, one sticky advisory comment. Nothing gated, routed or filed; safe as a comment
+  command because `issue_comment` runs from the default branch, the commenter is
+  association-gated, and no PR code is checked out.
 - `agents-md-integrity.yml` — enforces the AGENTS.md standard on the caller repo.
 - `assign-reviewers.yml` — expertise-aware, load-balanced reviewer requests.
 - `refresh-reviewers.yml` — scheduled drift-detector: recomputes the caller's
@@ -119,17 +138,17 @@ tests — run the matching command above for whatever you touched.
   detector audits it. Do not re-add a `ci-detect-unreviewed-merge.yml` caller.
 - `bump-cursor-review-callers.yml` / `bump-auto-label-callers.yml` /
   `bump-agents-md-callers.yml` / `bump-pr-size-callers.yml` /
-  `bump-pr-risk-callers.yml` / `bump-assign-reviewers-callers.yml` /
+  `bump-pr-risk-callers.yml` / `bump-pr-derisk-callers.yml` /
+  `bump-assign-reviewers-callers.yml` /
   `bump-groom-callers.yml` / `bump-detect-unreviewed-merge-callers.yml` — thin
-  entrypoints over `bump-callers.sh` that fan SHA bumps out to consumers. A groom
-  or pr-risk caller pins TWICE (`uses:` + `workflows_ref:`); the shared rewrite
+  entrypoints over `bump-callers.sh` that fan SHA bumps out to consumers. A
+  groom, pr-risk or pr-derisk caller pins TWICE (`uses:` + `workflows_ref:`); the shared rewrite
   moves both, so never hand-bump one alone. `stale.yml` and
   `assign-prs-to-author.yml` have no fleet because they have no callers;
   `detect-unreviewed-merge.yml`'s fleet is
-  `bump-detect-unreviewed-merge-callers.yml`; its `DETECT_UNREVIEWED_MERGE_CALLERS`
-  roster is still UNSEEDED (so it hard-fails) — the run-log masking gap that
-  blocked seeding is closed (BE-6482), so seeding is now an operator follow-on;
-  see the bump-callers README.
+  `bump-detect-unreviewed-merge-callers.yml` — live, its
+  `DETECT_UNREVIEWED_MERGE_CALLERS` roster seeded and stored as a repo secret
+  (BE-6473); this repo is not in it, being un-self-enrolled (above).
 - `bump-cursor-cli-pin.yml` — weekly PR moving `CURSOR_CLI_VERSION` /
   `CURSOR_CLI_SHA256` in `cursor-review.yml` (BE-5870). Not a caller bumper:
   merging it trips `bump-cursor-review-callers.yml`'s path filter, which rolls
@@ -140,13 +159,16 @@ tests — run the matching command above for whatever you touched.
 ## Conventions & gotchas
 
 - **Public repo — never leak private caller names.** Consumer repo lists live in
-  repo **variables** — one per fleet (`CURSOR_REVIEW_CALLERS`,
+  repo **secrets** — one per fleet (`CURSOR_REVIEW_CALLERS`,
   `AUTO_LABEL_CALLERS`, `AGENTS_MD_CALLERS`, `PR_SIZE_CALLERS`,
-  `PR_RISK_CALLERS`, `ASSIGN_REVIEWERS_CALLERS`, `GROOM_CALLERS`,
+  `PR_RISK_CALLERS`, `PR_DERISK_CALLERS`, `ASSIGN_REVIEWERS_CALLERS`, `GROOM_CALLERS`,
   `DETECT_UNREVIEWED_MERGE_CALLERS`; the bump-callers README table is canonical)
   — never hardcoded in a workflow file or printed to run logs (logs are public).
-  The bumper masks names it processes. Keep private repo paths/detail out of
-  workflow files, commit messages, and PR text.
+  Secrets, not variables (BE-6472): a variable passed via a step's `env:` prints
+  unmasked in the env dump Actions emits *before* the step, so the bumper's own
+  masking can never run early enough; a secret is masked there too. The bumper
+  still masks each name. Keep private repo paths/detail out of workflow files,
+  commit messages, and PR text.
 - **Pin everything by full commit SHA**, with a trailing `# v1` comment — both
   the `uses:` in callers and every third-party action here. Bare `@v1` fails the
   pin-validation (`pinact`, `zizmor`) that consumer CI runs. See README "Pinning".
@@ -169,10 +191,12 @@ tests — run the matching command above for whatever you touched.
   callers). Do not fork the script — a forked copy is how other shared org
   machinery has drifted.
 - **Enrolling a caller is TWO steps.** Merge the caller, *and* add the repo to
-  its `vars.*_CALLERS` roster. Skipping the second is the most repeated mistake
+  its `*_CALLERS` roster secret. Skipping the second is the most repeated mistake
   here: the pin then never moves, the caller drifts behind the reusable, and it
   fails at startup much later with no obvious cause. This repo did it to its own
-  `ci-groom.yml`. Being listed is necessary, not sufficient: a caller's pin
+  `ci-groom.yml`. Rosters are write-only secrets — audit the canonical
+  `callers.json` (the run log prints a matching count + sha256) against
+  reality both ways. Being listed is necessary, not sufficient: a caller's pin
   shape (placeholder, tag, branch, short SHA) no longer matters — the rewrite
   is anchored to the pin token, not to 40-hex-ness, so it self-heals any of
   those on the next bump (BE-4662), and a shape it truly cannot move (e.g. a
