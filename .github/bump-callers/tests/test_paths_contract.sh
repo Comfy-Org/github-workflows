@@ -30,12 +30,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 WORKFLOWS="${REPO_ROOT}/.github/workflows"
 
-# Fleets that legitimately do NOT run preflight.sh, and why. Keeping this as an
-# explicit allow-list (rather than "skip anything without a preflight step") is
-# the point: a NEW entrypoint that forgets the guard fails here, and a fleet that
-# later migrates onto preflight.sh fails until it is removed from this list.
-EXEMPT_NO_PREFLIGHT="bump-pr-risk-callers.yml"
-
 PASS=0
 FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  ok: $1"; }
@@ -242,20 +236,13 @@ for path in "${FILES[@]}"; do
     continue
   fi
 
+  # No fleet is exempt. The one exemption this test ever carried was pr-risk's,
+  # granted only because its excluding `paths:` filter could not be expressed as
+  # a tree-OID comparison; WATCHED_PATHSPECS (BE-7084) expresses exactly that,
+  # pr-risk has migrated, and so has every other entrypoint. An allow-list would
+  # now be a list nothing can legitimately join.
   if ! has_preflight "$path"; then
-    if [[ " ${EXEMPT_NO_PREFLIGHT} " == *" ${file} "* ]]; then
-      # The documented reason for the exemption is an excluding filter. If the
-      # exclusions ever go away, the exemption should too — so require one.
-      excluded=0
-      for p in "${filter[@]}"; do [[ "$p" == '!'* ]] && excluded=1; done
-      if (( excluded )); then
-        ok "${file}: exempt from preflight (excluding \`paths:\` filter), as documented"
-      else
-        bad "${file}: exempt from preflight but its filter carries no \`!\` exclusion — the documented reason for the exemption no longer holds; migrate it onto preflight.sh and drop it from EXEMPT_NO_PREFLIGHT"
-      fi
-    else
-      bad "${file}: runs no preflight step and is not a documented exemption — every fleet must run preflight.sh"
-    fi
+    bad "${file}: runs no preflight step — every fleet must run preflight.sh"
     continue
   fi
 
