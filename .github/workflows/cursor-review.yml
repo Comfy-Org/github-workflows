@@ -565,6 +565,11 @@ jobs:
       - name: Classify generated files, check size, and build reviewed diff
         id: check
         env:
+          # This is the current target-branch tip, not necessarily the commit
+          # the PR forked from. check-pr-size resolves BASE_SHA + HEAD_SHA to
+          # their merge base once and uses that commit for both classification
+          # and the reviewed patch, so later main-only commits never enter an
+          # unrebased PR's review.
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           # Read by the tool's --ignore-comments default: discount blank/comment
