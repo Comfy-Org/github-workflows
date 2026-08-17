@@ -310,10 +310,10 @@ preflight.sh deliberately, including honoring only `|`, taking block content
 literally, and stripping a trailing `# comment` from a single-line value; a
 parser that read the file more permissively than the runtime does would certify
 a config the runtime misparses, which is worse than no test at all).
-A *new* entrypoint that runs no preflight at all fails too — the pr-risk
-exemption is an explicit allow-list entry, not a silent skip, so migrating it
-later fails the test until the entry is removed. Widen a filter and the test
-tells you to widen the inputs in the same change.
+A *new* entrypoint that runs no preflight at all fails too — there is no
+exemption list, because every fleet (pr-risk included, once `WATCHED_PATHSPECS`
+gave its excluding filter a spelling preflight can compare) now runs the guard.
+Widen a filter and the test tells you to widen the inputs in the same change.
 
 **A filter with `!` negations must carry an equivalent `WATCHED_PATHSPECS`
 (BE-7084).** Before that input existed, a `:(exclude)` on a preflight fleet was
