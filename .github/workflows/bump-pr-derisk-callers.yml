@@ -21,8 +21,22 @@ name: Bump pr-derisk callers
 # The caller list is NOT hardcoded here. This repo is PUBLIC (workflow file and
 # Actions run logs are both publicly viewable), and most callers are private, so
 # their names must never appear in this file or its logs. The list lives in the
-# repo-level Actions SECRET `PR_DERISK_CALLERS` as a JSON array of
+# repo-level Actions SECRET `PR_RISK_CALLERS` as a JSON array of
 # {"repo","file","label"} objects, same shape as the other fleets' rosters.
+#
+# That roster is SHARED with the pr-risk fleet, and this fleet reads only the
+# entries whose `file` is its own caller (`FILE_FILTER` below). A repo running
+# both rungs therefore appears TWICE in one roster — once per caller file —
+# instead of once in each of two rosters. There is no `PR_DERISK_CALLERS` secret
+# and there deliberately never will be: two rosters means two places to remember
+# a repo, and forgetting the second is precisely how a caller freezes on a stale
+# pin for weeks with every run still green. Retired before it was ever seeded, so
+# no migration was needed.
+#
+# The two fleets stay separate WORKFLOWS: they watch different assets and pin
+# different reusables, so one merged fleet would need a per-entry reusable name
+# and would fan a no-op bump PR at every pr-risk caller each time the pr-derisk
+# beta churns — including repos that run no derisk caller at all.
 #
 # A SECRET, not a variable (BE-6472): the roster reaches the script through the
 # step's `env:` below, and Actions prints that env block BEFORE the step runs —
@@ -53,7 +67,9 @@ name: Bump pr-derisk callers
 # caller, set the roster secret); this is the third half of the second one.
 #
 # Update flow — adding/removing a caller needs NO public commit:
-#   jq -c . callers.json | gh secret set PR_DERISK_CALLERS --repo Comfy-Org/github-workflows
+#   jq -c . callers.json | gh secret set PR_RISK_CALLERS --repo Comfy-Org/github-workflows
+# (that ONE roster serves both this fleet and bump-pr-risk-callers.yml — edit it
+# in the one place, and every entry keeps its own `file`)
 # Keep the canonical callers.json in a PRIVATE infra/ops repo so roster edits
 # have a reviewed source of truth; the org audit log records each edit. (The
 # specific home repo is intentionally not named here — this file is public.)
@@ -249,14 +265,21 @@ jobs:
           # Names the roster to fix in an error message. It is a SECRET now, not a
           # variable; the env key keeps its historical name so every fleet's
           # entrypoint and the shared script stay in step.
-          VAR_NAME: PR_DERISK_CALLERS
+          # SHARED with the pr-risk fleet — see FILE_FILTER below. There is no
+          # PR_DERISK_CALLERS secret and there deliberately never will be: it was
+          # retired before it was ever seeded, so there is nothing to migrate.
+          VAR_NAME: PR_RISK_CALLERS
           TAG: pr-derisk
           WORKFLOW_FILE: pr-derisk.yml
-          # Tolerate an empty/missing roster — see the header. pr-derisk has no
-          # enrolled callers yet, so an empty roster is the accurate state rather
-          # than a bug. FLIP THIS TO "false" in the same change that sets
-          # PR_DERISK_CALLERS for the first enrolment; left "true" past that point
-          # it silently converts a lost roster into a clean no-op.
+          # This fleet's half of the shared roster. Until a `ci-pr-derisk.yml`
+          # entry is added, the filter selects nothing and — with ALLOW_EMPTY below
+          # — the run is a clean green no-op, which is the accurate state.
+          FILE_FILTER: .github/workflows/ci-pr-derisk.yml
+          # Tolerate a roster with no pr-derisk entries — see the header. pr-derisk
+          # has no enrolled callers yet, so selecting nothing is the accurate state
+          # rather than a bug. FLIP THIS TO "false" in the same change that adds the
+          # first `ci-pr-derisk.yml` entry to PR_RISK_CALLERS; left "true" past that
+          # point it silently converts a lost enrolment into a clean no-op.
           ALLOW_EMPTY: "true"
           # JSON array of {"repo","file","label"} — see the header comment for the
           # update flow. Kept in a repo-level SECRET (not this file, and not a
@@ -264,5 +287,5 @@ jobs:
           # dumps this step's env BEFORE the script — and its `::add-mask::` calls —
           # can run, which is exactly why the roster must be a secret: the runner
           # masks it in that dump. A variable here was the BE-6472 leak.
-          CALLERS_JSON: ${{ secrets.PR_DERISK_CALLERS }}
+          CALLERS_JSON: ${{ secrets.PR_RISK_CALLERS }}
         run: bash .github/bump-callers/bump-callers.sh

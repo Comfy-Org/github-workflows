@@ -233,6 +233,15 @@ jobs:
           VAR_NAME: PR_RISK_CALLERS
           TAG: pr-risk
           WORKFLOW_FILE: pr-risk.yml
+          # PR_RISK_CALLERS is SHARED with the pr-derisk fleet: a repo running both
+          # rungs is enrolled ONCE, in one roster, with one entry per caller file.
+          # This filter selects the pr-risk half. The two fleets stay separate
+          # WORKFLOWS on purpose — they watch different assets and pin different
+          # reusables, so merging them would fan a no-op bump at every pr-risk
+          # caller each time the derisk beta churns — but they share the roster,
+          # because two rosters is two places to forget a repo, and forgetting one
+          # is what froze a caller for two weeks (BE-6480's lesson, relearned).
+          FILE_FILTER: .github/workflows/ci-pr-risk.yml
           # Hard-fail on an empty/missing roster — see the header. Already
           # `bump-callers.sh`'s default, but stated explicitly so the property
           # survives a future flip of that default: this fleet has live callers,

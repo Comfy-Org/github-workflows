@@ -1628,6 +1628,125 @@ check "the skip line was printed exactly once" \
   "[[ \$(grep -c 'already at $SHORT' <<<\"\$OUT\") -eq 1 ]]"
 check "committed nothing"                                 "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
 
+# --- FILE_FILTER: sibling fleets sharing ONE roster ------------------------
+#
+# Two fleets that pin DIFFERENT reusables (pr-risk / pr-derisk) read ONE roster
+# secret and each select their own entries by caller filename. The property under
+# test is that a repo is enrolled ONCE, in one place: two rosters is two places to
+# forget a repo, and forgetting the second freezes a caller on a stale pin while
+# every run stays green.
+SHARED_ROSTER='[
+  {"repo":"Comfy-Org/secret-both","file":".github/workflows/ci-pr-risk.yml","label":""},
+  {"repo":"Comfy-Org/secret-both","file":".github/workflows/ci-pr-derisk.yml","label":""},
+  {"repo":"Comfy-Org/secret-riskonly","file":".github/workflows/ci-pr-risk.yml","label":""}
+]'
+RISK_FIXTURE="${WORK}/risk_caller.yml"
+printf '%s\n' \
+  'name: CI - PR Risk Grade' \
+  'jobs:' \
+  '  grade:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/pr-risk.yml@3333333333333333333333333333333333333333  # github-workflows main (3333333)' \
+  '    with:' \
+  '      workflows_ref: 3333333333333333333333333333333333333333' \
+  > "$RISK_FIXTURE"
+
+echo "== FILE_FILTER: the pr-risk fleet takes ONLY its half of the shared roster =="
+new_case ffrisk
+STUB_CONTENT_FILE="$RISK_FIXTURE" run_bump \
+  VAR_NAME=PR_RISK_CALLERS TAG=pr-risk WORKFLOW_FILE=pr-risk.yml \
+  FILE_FILTER=.github/workflows/ci-pr-risk.yml \
+  CALLERS_JSON="$SHARED_ROSTER"
+check "exit 0"                                "[[ $RC -eq 0 ]]"
+check "committed the TWO ci-pr-risk callers"  "[[ \$(cat \"\$STUB_PUT_DIR/count\") -eq 2 ]]"
+check "did NOT touch the derisk caller file"  "! grep -q 'ci-pr-derisk.yml' \"\$STUB_PUT_DIR/branch_files\""
+check "audit line reports both counts"        "grep -q '^roster: 3 caller(s), 2 after FILE_FILTER=.github/workflows/ci-pr-risk.yml' <<<\"\$OUT\""
+FF_RISK_DIGEST=$(grep -o 'sha256 [0-9a-f]\{64\}' <<<"$OUT" | head -1)
+check "digest present"                        "[[ -n '$FF_RISK_DIGEST' ]]"
+
+echo "== FILE_FILTER: the sibling fleet takes the OTHER half of the SAME roster =="
+new_case ffderisk
+DERISK_FIXTURE="${WORK}/derisk_caller.yml"
+printf '%s\n' \
+  'name: CI - PR de-risk' \
+  'jobs:' \
+  '  derisk:' \
+  '    uses: Comfy-Org/github-workflows/.github/workflows/pr-derisk.yml@3333333333333333333333333333333333333333  # github-workflows main (3333333)' \
+  '    with:' \
+  '      workflows_ref: 3333333333333333333333333333333333333333' \
+  > "$DERISK_FIXTURE"
+STUB_CONTENT_FILE="$DERISK_FIXTURE" run_bump \
+  VAR_NAME=PR_RISK_CALLERS TAG=pr-derisk WORKFLOW_FILE=pr-derisk.yml \
+  FILE_FILTER=.github/workflows/ci-pr-derisk.yml ALLOW_EMPTY=true \
+  CALLERS_JSON="$SHARED_ROSTER"
+check "exit 0"                                 "[[ $RC -eq 0 ]]"
+check "committed the ONE ci-pr-derisk caller"  "[[ \$(cat \"\$STUB_PUT_DIR/count\") -eq 1 ]]"
+check "did NOT touch a ci-pr-risk caller file" "! grep -q 'ci-pr-risk.yml' \"\$STUB_PUT_DIR/branch_files\""
+check "audit line reports 3 -> 1"              "grep -q '^roster: 3 caller(s), 1 after FILE_FILTER=.github/workflows/ci-pr-derisk.yml' <<<\"\$OUT\""
+# The digest is of the WHOLE secret, so both fleets print the SAME one. That
+# identity IS the evidence they read one roster — a per-fleet digest would make a
+# shared roster look like two unrelated ones in the logs.
+check "digest matches the sibling fleet's"     "grep -qF '$FF_RISK_DIGEST' <<<\"\$OUT\""
+
+echo "== FILE_FILTER selecting nothing defers to ALLOW_EMPTY, both ways =="
+new_case ffempty
+STUB_CONTENT_FILE="$RISK_FIXTURE" run_bump \
+  VAR_NAME=PR_RISK_CALLERS TAG=pr-derisk WORKFLOW_FILE=pr-derisk.yml \
+  FILE_FILTER=.github/workflows/ci-pr-derisk.yml ALLOW_EMPTY=true \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-riskonly","file":".github/workflows/ci-pr-risk.yml","label":""}]'
+check "growing fleet: exit 0"        "[[ $RC -eq 0 ]]"
+check "growing fleet: named the filter in the no-op line" \
+  "grep -q 'no .github/workflows/ci-pr-derisk.yml callers yet' <<<\"\$OUT\""
+check "growing fleet: committed nothing" "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+check "growing fleet: still printed a fingerprint" "grep -q '^roster: 1 caller(s), 0 after FILE_FILTER' <<<\"\$OUT\""
+
+new_case ffemptyhard
+STUB_CONTENT_FILE="$RISK_FIXTURE" run_bump \
+  VAR_NAME=PR_RISK_CALLERS TAG=pr-risk WORKFLOW_FILE=pr-risk.yml \
+  FILE_FILTER=.github/workflows/ci-pr-risk.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-deriskonly","file":".github/workflows/ci-pr-derisk.yml","label":""}]'
+check "must-have-callers fleet: exit 1" "[[ $RC -eq 1 ]]"
+check "must-have-callers fleet: error names the filter and the count" \
+  "grep -q 'has 1 entr(ies) but none for .github/workflows/ci-pr-risk.yml' <<<\"\$OUT\""
+check "must-have-callers fleet: committed nothing" "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+
+echo "== a MALFORMED FILE_FILTER hard-fails instead of silently matching nothing =="
+# The failure mode this guards: a typo selects zero entries, which on an
+# ALLOW_EMPTY=true fleet is a green no-op indistinguishable from "not enrolled
+# yet" — and would keep every caller frozen indefinitely.
+for BAD in 'ci-pr-risk.yml' '.github/workflows/../../etc/passwd' '.github/workflows/ci-pr-risk.txt' 'x'; do
+  new_case "ffbad"
+  STUB_CONTENT_FILE="$RISK_FIXTURE" run_bump \
+    VAR_NAME=PR_RISK_CALLERS TAG=pr-risk WORKFLOW_FILE=pr-risk.yml \
+    FILE_FILTER="$BAD" ALLOW_EMPTY=true \
+    CALLERS_JSON="$SHARED_ROSTER"
+  check "rejected '$BAD' (exit 1)"      "[[ $RC -eq 1 ]]"
+  check "rejected '$BAD' (named it)"    "grep -qF \"got '$BAD'\" <<<\"\$OUT\""
+  check "rejected '$BAD' (no commit)"   "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+done
+
+echo "== validation still covers entries the filter EXCLUDES =="
+# A malformed entry belonging to the SIBLING fleet must fail this run too.
+# Otherwise the error surfaces only on whichever fleet happens to run next, and a
+# roster edit looks clean until something unrelated triggers.
+new_case ffvalidate
+STUB_CONTENT_FILE="$RISK_FIXTURE" run_bump \
+  VAR_NAME=PR_RISK_CALLERS TAG=pr-risk WORKFLOW_FILE=pr-risk.yml \
+  FILE_FILTER=.github/workflows/ci-pr-risk.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-ok","file":".github/workflows/ci-pr-risk.yml","label":""},{"repo":"Comfy-Org/../evil","file":".github/workflows/ci-pr-derisk.yml","label":""}]'
+check "exit 1 on a sibling fleet's bad entry" "[[ $RC -eq 1 ]]"
+check "error names the offending index"       "grep -q 'entry at index 1 is invalid' <<<\"\$OUT\""
+check "committed nothing"                     "[[ ! -f \"\$STUB_PUT_DIR/count\" ]]"
+
+echo "== UNSET FILE_FILTER is byte-identical to today: the whole roster bumps =="
+new_case ffunset
+STUB_CONTENT_FILE="$RISK_FIXTURE" run_bump \
+  VAR_NAME=PR_RISK_CALLERS TAG=pr-risk WORKFLOW_FILE=pr-risk.yml \
+  CALLERS_JSON="$SHARED_ROSTER"
+check "exit 0"                                  "[[ $RC -eq 0 ]]"
+check "bumped ALL THREE entries"                "[[ \$(cat \"\$STUB_PUT_DIR/count\") -eq 3 ]]"
+check "audit line keeps the un-filtered shape"  "grep -q '^roster: 3 caller(s), sha256' <<<\"\$OUT\""
+check "and says nothing about a filter"         "! grep -q 'FILE_FILTER' <<<\"\$OUT\""
+
 echo
 echo "== $PASS passed, $FAIL failed =="
 [[ $FAIL -eq 0 ]]

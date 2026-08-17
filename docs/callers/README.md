@@ -155,7 +155,7 @@ Enrolling a repo is **two steps**, and the second is the one people miss.
    | `cursor-review-auto-label.yml` | `AUTO_LABEL_CALLERS` |
    | `pr-size.yml` | `PR_SIZE_CALLERS` |
    | `pr-risk.yml` | `PR_RISK_CALLERS` |
-   | `pr-derisk.yml` | `PR_DERISK_CALLERS` |
+   | `pr-derisk.yml` | `PR_RISK_CALLERS` (shared with `pr-risk.yml` — one entry per caller file) |
    | `agents-md-integrity.yml` | `AGENTS_MD_CALLERS` |
    | `assign-reviewers.yml` | `ASSIGN_REVIEWERS_CALLERS` |
    | `detect-unreviewed-merge.yml` | `DETECT_UNREVIEWED_MERGE_CALLERS` |
