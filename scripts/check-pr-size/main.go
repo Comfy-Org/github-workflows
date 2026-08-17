@@ -64,27 +64,34 @@ func main() {
 		os.Exit(2)
 	}
 
-	files, err := diffFiles(*base, *head)
+	mergeBase, err := resolveMergeBase(*base, *head)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "check-pr-size: %v\n", err)
+		os.Exit(2)
+	}
+	fmt.Fprintf(os.Stderr, "check-pr-size: merge base %s\n", mergeBase)
+
+	files, err := diffFiles(mergeBase, *head)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "check-pr-size: %v\n", err)
 		os.Exit(2)
 	}
 
-	// The linguist-generated attribute is read from the BASE ref, never the PR
-	// head, so a PR cannot add `* linguist-generated=true` to .gitattributes and
-	// shrink its own counted LoC. Two defense-in-depth conditions disable the
-	// attribute path entirely (unless the bypass label is present): git too old
-	// to honor `check-attr --source`, or the PR diff touching .gitattributes at
-	// all. See attrGeneratedBatch / TouchesGitattributes.
-	attr := attrPolicy{source: *base, useSource: checkAttrSourceSupported(*base)}
+	// The linguist-generated attribute is read from the merge-base tree, never
+	// the PR head, so a PR cannot add `* linguist-generated=true` to
+	// .gitattributes and shrink its own counted LoC. Two defense-in-depth
+	// conditions disable the attribute path entirely (unless the bypass label is
+	// present): git too old to honor `check-attr --source`, or the PR diff
+	// touching .gitattributes at all. See attrGeneratedBatch / TouchesGitattributes.
+	attr := attrPolicy{source: mergeBase, useSource: checkAttrSourceSupported(mergeBase)}
 	attrModified := TouchesGitattributes(files)
 	attr.trusted = attrTrusted(attr.useSource, attrModified, *bypassFlag)
-	classify(files, *base, *head, attr, extras, *markerFromBase)
+	classify(files, mergeBase, *head, attr, extras, *markerFromBase)
 
 	// Discount blank/comment-only changed lines from the count (opt-in). Runs
 	// after classify so it only ever inspects non-generated, non-binary files.
 	if *ignoreComments {
-		annotateDiscounts(files, *base, *head)
+		annotateDiscounts(files, mergeBase, *head)
 	}
 
 	res := Evaluate(files, Policy{Max: *maxFlag, Bypassed: *bypassFlag, ExcludeTests: *excludeTests})
@@ -117,7 +124,7 @@ func main() {
 	// consumes a diff the gate is about to skip.
 	if *reviewedDiffOut != "" {
 		if res.OK {
-			if err := writeReviewedDiff(*base, *head, strings.Fields(*diffExcludes), files, *reviewedDiffOut); err != nil {
+			if err := writeReviewedDiff(mergeBase, *head, strings.Fields(*diffExcludes), files, *reviewedDiffOut); err != nil {
 				os.Remove(*reviewedDiffOut)
 				fmt.Fprintf(os.Stderr, "check-pr-size: could not write --reviewed-diff-out %q: %v\n", *reviewedDiffOut, err)
 				os.Exit(2)
@@ -130,6 +137,21 @@ func main() {
 	if shouldFail(res, *modeFlag) {
 		os.Exit(1)
 	}
+}
+
+// resolveMergeBase returns the commit where the PR head diverged from the base
+// history. The supplied base may be today's target-branch tip, well ahead of an
+// unrebased PR; none of those later base-only commits belong in the PR review.
+func resolveMergeBase(base, head string) (string, error) {
+	out, err := runGit("merge-base", base, head)
+	if err != nil {
+		return "", fmt.Errorf("could not resolve merge base: %w", err)
+	}
+	mergeBase := strings.TrimSpace(out)
+	if mergeBase == "" || strings.ContainsAny(mergeBase, "\r\n") {
+		return "", fmt.Errorf("could not resolve merge base: git returned %q", mergeBase)
+	}
+	return mergeBase, nil
 }
 
 // writeReviewedDiff streams `git diff base...head` (plus any caller-supplied

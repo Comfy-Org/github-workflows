@@ -57,6 +57,37 @@ func commitAll(t *testing.T, dir, msg string) string {
 	return strings.TrimSpace(gitRun(t, dir, "rev-parse", "HEAD"))
 }
 
+func TestResolveMergeBaseWithAdvancedBaseBranch(t *testing.T) {
+	dir := initTestRepo(t)
+	writeFile(t, dir, "shared.txt", "common\n")
+	forkPoint := commitAll(t, dir, "fork point")
+
+	gitRun(t, dir, "checkout", "-q", "-b", "pr")
+	writeFile(t, dir, "pr.txt", "from pr\n")
+	prHead := commitAll(t, dir, "pr change")
+
+	gitRun(t, dir, "checkout", "-q", "-b", "main", forkPoint)
+	writeFile(t, dir, "main.txt", "unrelated main change\n")
+	mainTip := commitAll(t, dir, "main advances")
+	t.Chdir(dir)
+
+	got, err := resolveMergeBase(mainTip, prHead)
+	if err != nil {
+		t.Fatalf("resolveMergeBase: %v", err)
+	}
+	if got != forkPoint {
+		t.Fatalf("resolveMergeBase(%s, %s) = %s, want fork point %s", mainTip, prHead, got, forkPoint)
+	}
+
+	files, err := diffFiles(got, prHead)
+	if err != nil {
+		t.Fatalf("diffFiles: %v", err)
+	}
+	if len(files) != 1 || files[0].Path != "pr.txt" {
+		t.Fatalf("review diff = %+v, want only pr.txt", files)
+	}
+}
+
 func TestTouchesGitattributes(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
