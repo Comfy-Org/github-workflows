@@ -94,7 +94,8 @@ else bad "CHECKED_RE matches the ticked line we render" "$(grep -F "$DISPUTE_TEX
 if grep -Eq "$CHECKED_RE" <<<"$body"; then bad "CHECKED_RE does NOT match an unticked line" "$body"
 else ok "CHECKED_RE does NOT match an unticked line"; fi
 has "$dbody" "$DISPUTE_LABEL" "the checkbox names the label it applies"
-hasnt "$dbody" "risk-dispute —" "…and never claims the human-owned risk-dispute label"
+hasnt "$dbody" "risk-dispute —" "…and never claims the legacy human dispute label"
+hasnt "$dbody" "risk-dispute:R" "…and never claims a human tier label"
 
 echo "— ADVERSARIAL FILENAME: a crafted path cannot forge a dispute or break the table —"
 # git permits `|`, backticks and newlines in a filename. Rendered raw, such a path breaks out of

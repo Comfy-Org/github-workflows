@@ -70,10 +70,9 @@
 # overwritten, and the reviewer re-ticks — which is why the body is re-read by id IMMEDIATELY
 # before the write rather than reused from the paginated scan.
 #
-# `risk-grade-disputed` (this script's) is DELIBERATELY DISTINCT from `risk-dispute` (the human
-# convention the grader never touches). One is a machine-maintained mirror of a checkbox and is
-# rewritten on every grade; the other is a human's own label and would be fought over if this
-# script owned it.
+# `risk-grade-disputed` (this script's) is DELIBERATELY DISTINCT from the human-owned
+# `risk-dispute` and `risk-dispute:R*` assessment labels. This script mirrors a checkbox; it never
+# assigns a human tier.
 #
 # Inputs (env):
 #   REPO             owner/name of the repo holding the PR                          (required)

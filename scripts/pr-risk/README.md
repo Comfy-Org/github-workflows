@@ -11,10 +11,12 @@ event is graded into a tier and gets ONE label:
 | R3 | `risk:R3` | elevated — auth, billing, migrations, IaC, CI, deps, secrets | owner + e2e |
 | — | `risk:ungraded` | an input could not be read; deliberately NOT a tier | human review |
 
-**The label is the entire product.** Nothing is gated, blocked, routed, commented
-on, or merged. Humans glance at the label and either agree or disagree.
-Disagree by adding the `risk-dispute` label (never touched by the grader) plus a
-comment saying why — disputes are the pilot's calibration data.
+Nothing is gated, blocked, routed, or merged. Humans record a different
+assessment beside the computed label with `risk-dispute:R0` through
+`risk-dispute:R3`, or `/risk-dispute R2 [optional reason]`. The legacy
+`risk-dispute` label and `/risk-dispute [optional reason]` remain valid with no
+human tier. No dispute changes the computed `risk:R*`; both forms become
+calibration data.
 
 ## How a grade is computed
 
@@ -106,8 +108,8 @@ Two CI-specific mechanics worth knowing:
 
 Every grade above is triggered by a `pull_request` event. Two things need a grade
 with no event: a repo that **enrolls mid-stream** and wants the open queue it
-already has labeled, and a **manual re-grade** after a `.github/risk.json` change
-or on a PR carrying `risk-dispute`. Both are a `workflow_dispatch` on the
+already has labeled, and a **manual re-grade** after a `.github/risk.json` change.
+Both are a `workflow_dispatch` on the
 consumer's caller, forwarding a number:
 
 ```yaml
@@ -177,7 +179,7 @@ Operational caveats for a backfill:
   re-dispatch on `pr_number` if a final grade looks wrong. The residual it costs
   instead is narrower, but it cuts both ways: the PUT is built from a snapshot
   read, so a **non-owned** label added in the read→PUT window is dropped
-  (`risk-dispute` included — re-add a dispute that lands in that instant) and one
+  (`risk-dispute` forms included — re-add a dispute that lands in that instant) and one
   **removed** in that window is resurrected. The window opens only on a run that
   actually changes the grade, and is about one API round-trip — three on the
   first grade in a repo, where the label pre-create sits inside it. A drop is not
