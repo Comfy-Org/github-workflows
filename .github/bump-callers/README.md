@@ -31,11 +31,52 @@ forward automatically instead of silently drifting commits behind.
 | [`bump-agents-md-callers.yml`](../workflows/bump-agents-md-callers.yml) | `agents-md-integrity.yml` or `agents-md-integrity/**` | `AGENTS_MD_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-pr-size-callers.yml`](../workflows/bump-pr-size-callers.yml) | `pr-size.yml` or `scripts/check-pr-size/**` (minus its `*_test.go`, which no caller executes) | `PR_SIZE_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-pr-risk-callers.yml`](../workflows/bump-pr-risk-callers.yml) | `pr-risk.yml` or `scripts/pr-risk/**` (minus its `tests/` and `README.md`, which no caller executes) | `PR_RISK_CALLERS` | non-empty (hard-fails if empty) |
-| [`bump-pr-derisk-callers.yml`](../workflows/bump-pr-derisk-callers.yml) | `pr-derisk.yml`, `scripts/pr-derisk/**` **or `scripts/pr-risk/**`** (minus both `tests/` and `README.md`) — a `/derisk` run executes the pr-risk grader as well as the planner, so a grader change is consumer-visible on this fleet too | `PR_DERISK_CALLERS` | **may be empty** (no callers enrolled yet — flip to non-empty with the first enrolment) |
+| [`bump-pr-derisk-callers.yml`](../workflows/bump-pr-derisk-callers.yml) | `pr-derisk.yml`, `scripts/pr-derisk/**` **or `scripts/pr-risk/**`** (minus both `tests/` and `README.md`) — a `/derisk` run executes the pr-risk grader as well as the planner, so a grader change is consumer-visible on this fleet too | `PR_RISK_CALLERS` **(shared — filtered to `ci-pr-derisk.yml`)** | **may select nothing** (no callers enrolled yet — flip `ALLOW_EMPTY` to `false` with the first enrolment) |
 | [`bump-assign-reviewers-callers.yml`](../workflows/bump-assign-reviewers-callers.yml) | `assign-reviewers.yml` | `ASSIGN_REVIEWERS_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-groom-callers.yml`](../workflows/bump-groom-callers.yml) | `groom.yml` or `groom/**` | `GROOM_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-auto-label-callers.yml`](../workflows/bump-auto-label-callers.yml) | `cursor-review-auto-label.yml` | `AUTO_LABEL_CALLERS` | non-empty (hard-fails if empty) |
 | [`bump-detect-unreviewed-merge-callers.yml`](../workflows/bump-detect-unreviewed-merge-callers.yml) | `detect-unreviewed-merge.yml` | `DETECT_UNREVIEWED_MERGE_CALLERS` | non-empty (hard-fails if empty) |
+
+### One roster, two fleets (`FILE_FILTER`)
+
+`pr-risk` and `pr-derisk` are separate fleets that share the **one**
+`PR_RISK_CALLERS` secret. Each entrypoint sets `FILE_FILTER` to its own caller
+filename and processes only the entries whose `file` matches, so a repo running
+both rungs appears twice in one roster — once per caller file — rather than once
+in each of two rosters:
+
+```json
+[
+  {"repo": "Comfy-Org/example", "file": ".github/workflows/ci-pr-risk.yml",   "label": ""},
+  {"repo": "Comfy-Org/example", "file": ".github/workflows/ci-pr-derisk.yml", "label": ""}
+]
+```
+
+**Why shared:** two rosters is two places to remember a repo, and forgetting the
+second is not a loud failure — the caller merges, the pin never moves, every run
+stays green, and the drift surfaces weeks later as an unexplained startup failure
+or a stale grader. One roster makes enrolment one edit.
+
+**Why still two fleets:** they watch different assets and pin different
+reusables. `bump-callers.sh` takes `WORKFLOW_FILE` per *fleet*, so one merged
+fleet would need it per *entry* — and a merged fleet fires every roster entry on
+any watched change, fanning a no-op pin bump at every `pr-risk` caller each time
+the `pr-derisk` beta churns, including repos running no derisk caller at all.
+
+**Both fleets log the same roster digest**, because the fingerprint is taken over
+the whole secret rather than the filtered subset. That identity is the evidence
+they read one roster; the audit line's `N caller(s), M after FILE_FILTER=…`
+reports the split.
+
+**Residual worth knowing:** `FILE_FILTER` matches by string equality, so every
+repo in a filtered fleet must spell its caller the same way. Fleets do not have
+that property in general — `CURSOR_REVIEW_CALLERS` carries three spellings today
+— so a repo naming its caller differently is skipped silently, by design (the
+filter's whole job is skipping entries; a warning every run would be noise). `M`
+in the audit line is the signal; glance at it after any enrolment. Only put a
+fleet on `FILE_FILTER` when you control the caller filename convention across its
+repos, which is why `pr-risk`/`pr-derisk` qualify (their caller guides specify
+the filenames literally) and `cursor-review` does not.
 
 ### Reusables with no fleet — deliberate, not an oversight
 

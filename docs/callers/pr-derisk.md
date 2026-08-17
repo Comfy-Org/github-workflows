@@ -88,8 +88,11 @@ literally. `bump-pr-derisk-callers.yml` moves both together; never hand-bump one
   validates each nested job's declaration at startup, before any `if:` is evaluated, so all five
   grants above are required whatever `enabled:` is set to.
 - **Enrolling a caller is TWO steps.** Merge the caller *and* add the repo to the
-  `PR_DERISK_CALLERS` roster secret, or the pin never moves and the caller silently drifts behind
-  the tool.
+  `PR_RISK_CALLERS` roster secret, or the pin never moves and the caller silently drifts behind
+  the tool. That is the **same** roster `pr-risk` uses — the two fleets share it and each selects
+  its own entries by caller filename — so a repo running both rungs gets **two entries**, one per
+  file, and the file must be spelled `.github/workflows/ci-pr-derisk.yml` exactly for this fleet
+  to see it.
 - **`issue_comment` runs from your DEFAULT BRANCH**, always. That is what makes a comment command
   safe to hold write permission and a secret — a pull request cannot edit the workflow that serves
   it — and it also means a change to this caller only takes effect once merged.

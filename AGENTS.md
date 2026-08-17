@@ -161,7 +161,7 @@ tests — run the matching command above for whatever you touched.
 - **Public repo — never leak private caller names.** Consumer repo lists live in
   repo **secrets** — one per fleet (`CURSOR_REVIEW_CALLERS`,
   `AUTO_LABEL_CALLERS`, `AGENTS_MD_CALLERS`, `PR_SIZE_CALLERS`,
-  `PR_RISK_CALLERS`, `PR_DERISK_CALLERS`, `ASSIGN_REVIEWERS_CALLERS`, `GROOM_CALLERS`,
+  `PR_RISK_CALLERS` (SHARED by the pr-risk + pr-derisk fleets via `FILE_FILTER` — one entry per caller file, never a second roster), `ASSIGN_REVIEWERS_CALLERS`, `GROOM_CALLERS`,
   `DETECT_UNREVIEWED_MERGE_CALLERS`; the bump-callers README table is canonical)
   — never hardcoded in a workflow file or printed to run logs (logs are public).
   Secrets, not variables (BE-6472): a variable passed via a step's `env:` prints

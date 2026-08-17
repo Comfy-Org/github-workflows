@@ -41,6 +41,37 @@
 #                    list is a hard error (a fleet that always has callers must
 #                    never silently no-op — that would leave every caller un-bumped
 #                    without anyone noticing).
+#   FILE_FILTER      A `.github/workflows/<name>.yml` path. When set, ONLY roster
+#                    entries whose `file` equals it are bumped; everything else in
+#                    the roster is ignored. This is what lets sibling fleets that
+#                    pin DIFFERENT reusables share ONE roster secret: each
+#                    entrypoint filters to its own caller filename, so a repo is
+#                    enrolled once, in one place, instead of once per fleet (the
+#                    two-roster split is how a caller silently freezes — its file
+#                    lands but the second roster never hears about it). Unset (the
+#                    default) processes the whole roster, which is every
+#                    single-reusable fleet's behavior and stays byte-identical.
+#                    A malformed value is a HARD ERROR rather than a filter that
+#                    matches nothing: silently matching nothing is indistinguishable
+#                    from an un-enrolled fleet, and on an ALLOW_EMPTY=true fleet it
+#                    would no-op green forever.
+#
+#                    RESIDUAL, stated rather than implied: the match is string
+#                    EQUALITY against the entry's `file`, so every repo in a
+#                    filtered fleet must spell its caller the same way. Fleets do
+#                    NOT have that property in general — CURSOR_REVIEW_CALLERS
+#                    today carries `ci-cursor-review.yml`, `cursor-review.yml` and
+#                    `pr-cursor-review.yaml` across its repos — so a repo whose
+#                    caller is named differently is skipped by this fleet with no
+#                    error, because skipping entries is exactly what the filter is
+#                    FOR and a warning on every run would be noise nobody reads.
+#                    The audit line's "N caller(s), M after FILE_FILTER" is the
+#                    only signal, and M is worth a glance after any enrolment.
+#                    Only put a fleet on FILE_FILTER when you control the caller
+#                    filename convention across its repos — which is why pr-risk
+#                    and pr-derisk qualify (docs/callers/*.md specify
+#                    `ci-pr-risk.yml` / `ci-pr-derisk.yml` literally) and
+#                    cursor-review does not.
 #   WIRE_BOT_SCRIPT  Path to a helper that reads a caller's YAML on stdin and
 #                    writes it back wired for some extra identity/config, idempotently
 #                    (BE-1814's .github/cursor-review/wire-bot-identity.py). Only
@@ -62,7 +93,20 @@ set -uo pipefail
 : "${WORKFLOW_FILE:?WORKFLOW_FILE is required}"
 CALLERS_JSON="${CALLERS_JSON-}"
 ALLOW_EMPTY="${ALLOW_EMPTY:-false}"
+FILE_FILTER="${FILE_FILTER-}"
 WIRE_BOT_SCRIPT="${WIRE_BOT_SCRIPT-}"
+
+# Validate FILE_FILTER's SHAPE before it is used to select entries. It is matched
+# against the roster's `file` field by string equality, so it must be spelled the
+# same way an entry is — and the entry rule below is the authority on that
+# spelling. A typo here cannot be caught later: it would simply select zero
+# entries, which on an ALLOW_EMPTY=true fleet is a clean green no-op that looks
+# exactly like "this fleet has no callers yet" and would keep every caller frozen
+# indefinitely. Fail at the top instead, where the message can name the value.
+if [[ -n "$FILE_FILTER" && ! "$FILE_FILTER" =~ ^\.github/workflows/[A-Za-z0-9._-]+\.ya?ml$ ]]; then
+  echo "::error::FILE_FILTER must be a .github/workflows/<name>.yml path (got '${FILE_FILTER}'). Fix this entrypoint's env — a filter that matches nothing would no-op the fleet silently."
+  exit 1
+fi
 
 SHORT="${NEW_SHA:0:7}"
 # Stable branch per (repo, TAG) — deliberately NOT SHA-stamped. A fixed head
@@ -278,12 +322,21 @@ CALLERS=()
 while IFS= read -r ENTRY; do
   echo "::add-mask::${ENTRY%%|*}"
   CALLERS+=("$ENTRY")
-done < <(jq -r '.[] | "Comfy-Org/\(.repo | sub("\\A[^/]+/"; ""))|\(.file)|\(.label // "")|\(.wire_bot // "")"' <<<"$CALLERS_JSON")
+#
+# FILE_FILTER (when set) selects this fleet's own entries out of a SHARED roster.
+# It is applied HERE, after validation, so every entry in the secret is still
+# shape-checked even when this fleet ignores it — a malformed entry belonging to a
+# sibling fleet must not pass validation just because this run skips it, or the
+# error would surface only on whichever fleet happens to run next.
+done < <(jq -r --arg ff "$FILE_FILTER" '
+  .[]
+  | select($ff == "" or .file == $ff)
+  | "Comfy-Org/\(.repo | sub("\\A[^/]+/"; ""))|\(.file)|\(.label // "")|\(.wire_bot // "")"' <<<"$CALLERS_JSON")
 
-if (( ${#CALLERS[@]} == 0 )); then
-  echo "::error::${VAR_NAME} parsed to zero callers — refusing to run a no-op dispatcher."
-  exit 1
-fi
+# Entries in the secret, before FILE_FILTER — the denominator the audit line
+# reports against so "5 caller(s), 2 after filter" reads as a filter doing its job
+# rather than a half-pasted roster.
+ROSTER_TOTAL=$(jq 'length' <<<"$CALLERS_JSON" 2>/dev/null || echo "?")
 
 # Roster fingerprint — the ONE auditable trace of WHICH roster this run used.
 # Moving the roster into a secret (BE-6472) costs read-back: there is no
@@ -335,7 +388,39 @@ ROSTER_DIGEST=$(jq -cS . <<<"$CALLERS_JSON" | roster_sha256 | cut -d' ' -f1)
 if [[ ! "$ROSTER_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
   ROSTER_DIGEST="unavailable (no sha256sum or shasum on PATH)"
 fi
-echo "roster: ${#CALLERS[@]} caller(s), sha256 ${ROSTER_DIGEST}"
+# The digest is of the WHOLE secret, never the filtered subset, so the documented
+# reproduction (`jq -cS . callers.json | sha256sum`) keeps working unchanged and
+# every fleet sharing a roster logs the SAME digest — which is the point: two
+# sibling fleets printing one digest is the evidence they are reading one roster.
+# A per-fleet digest would need the filter to reproduce and would make a shared
+# roster look like two different ones.
+if [[ -n "$FILE_FILTER" ]]; then
+  echo "roster: ${ROSTER_TOTAL} caller(s), ${#CALLERS[@]} after FILE_FILTER=${FILE_FILTER}, sha256 ${ROSTER_DIGEST}"
+else
+  echo "roster: ${#CALLERS[@]} caller(s), sha256 ${ROSTER_DIGEST}"
+fi
+
+# Nothing to bump. This sits BELOW the audit line on purpose: the run shape an
+# operator most needs to recognize is a fleet that bumped nothing, and it is the
+# least useful one to leave with no fingerprint printed.
+#
+# A FILE_FILTER that selects nothing out of a NON-empty roster is the shared-roster
+# spelling of "seeded empty", so it defers to ALLOW_EMPTY exactly as an empty
+# roster does: a growing fleet (derisk before its first caller lands) no-ops
+# green, while a fleet that must always have callers still hard-fails rather than
+# silently leaving every caller un-bumped.
+if (( ${#CALLERS[@]} == 0 )); then
+  if [[ "$ALLOW_EMPTY" == "true" && -n "$FILE_FILTER" ]]; then
+    echo "${VAR_NAME} has no ${FILE_FILTER} callers yet — nothing to bump for ${TAG}."
+    exit 0
+  fi
+  if [[ -n "$FILE_FILTER" ]]; then
+    echo "::error::${VAR_NAME} has ${ROSTER_TOTAL} entr(ies) but none for ${FILE_FILTER} — refusing to run a no-op dispatcher. Add this fleet's caller to the shared roster, or check FILE_FILTER for a typo."
+    exit 1
+  fi
+  echo "::error::${VAR_NAME} parsed to zero callers — refusing to run a no-op dispatcher."
+  exit 1
+fi
 
 # Bump ONE caller repo, committing EVERY file that repo pins onto a single
 # stable bump branch. Called once per repo with that repo's entries, so a repo
