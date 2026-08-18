@@ -110,8 +110,9 @@ Enrolling a repo is **two steps**:
 1. Merge the caller workflow into your repo.
 2. Ask a maintainer to add the repo to the matching roster secret here —
    `GROOM_CALLERS`, `CURSOR_REVIEW_CALLERS`, `AUTO_LABEL_CALLERS`,
-   `PR_SIZE_CALLERS`, `PR_RISK_CALLERS`, `AGENTS_MD_CALLERS`,
-   `ASSIGN_REVIEWERS_CALLERS`, or `DETECT_UNREVIEWED_MERGE_CALLERS`. They are
+   `PR_SIZE_CALLERS`, `PR_RISK_CALLERS`, `AREA_LABEL_CALLERS`,
+   `AGENTS_MD_CALLERS`, `ASSIGN_REVIEWERS_CALLERS`, or
+   `DETECT_UNREVIEWED_MERGE_CALLERS`. They are
    **secrets**, not variables, so private caller names stay out of this public
    repo's run logs — which also means there is no read-back. The
    [`docs/callers/README.md` table](docs/callers/README.md#staying-current) maps
