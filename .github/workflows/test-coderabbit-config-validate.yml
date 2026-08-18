@@ -82,6 +82,42 @@ jobs:
           echo "$out" | grep -q 'nothing to validate'
           echo "$out" | grep -q 'absent'
 
+      - name: Smoke test — the other spelling is validated, not reported absent
+        run: |
+          # CodeRabbit honours .coderabbit.yml as well. A repo on that spelling
+          # that leaves config_file at its default must not get a permanently
+          # green check over a config nobody looked at.
+          root="$(mktemp -d)"
+          python3 -c "open('$root/.coderabbit.yml','w').write('tone_instructions: ' + 'x'*300 + chr(10))"
+          if out="$(python3 "$CHECK" --root "$root")"; then
+            echo "::error::checker reported a pass while an invalid .coderabbit.yml sat beside the default name"
+            echo "$out"
+            exit 1
+          fi
+          echo "$out"
+          echo "$out" | grep -q '::warning::'
+          echo "$out" | grep -q '.coderabbit.yml'
+
+      - name: Smoke test — a config symlinked out of the tree is refused, not read
+        run: |
+          # abspath does not resolve symlinks but open() follows them, so without
+          # a realpath containment check the TARGET's content reaches this public
+          # log through the YAML error message.
+          root="$(mktemp -d)"
+          outside="$(mktemp -d)"
+          printf 'this: [is not: valid yaml\n' > "$outside/secret.yaml"
+          ln -s "$outside/secret.yaml" "$root/.coderabbit.yaml"
+          set +e
+          out="$(python3 "$CHECK" --root "$root")"
+          code=$?
+          set -e
+          echo "$out"
+          if [ "$code" != "2" ]; then
+            echo "::error::expected exit 2 for a config resolving outside the repo root, got ${code}"
+            exit 1
+          fi
+          echo "$out" | grep -q 'outside the checked-out repo root'
+
       - name: Smoke test — an over-long tone_instructions fails
         run: |
           root="$(mktemp -d)"

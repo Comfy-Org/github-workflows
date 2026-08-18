@@ -66,23 +66,84 @@ def canonical(schema):
     return json.dumps(schema, sort_keys=True, separators=(",", ":"))
 
 
-def property_paths(schema):
-    """Every dotted property path in the schema, e.g. `reviews.tools.eslint.enabled`."""
-    paths = set()
+# Keywords whose value is a single subschema, and whose contents are therefore
+# as capable of holding a cap or a property as `properties` itself.
+_SUBSCHEMA_KEYWORDS = (
+    "additionalProperties",
+    "unevaluatedProperties",
+    "propertyNames",
+    "contains",
+    "not",
+    "if",
+    "then",
+    "else",
+)
 
-    def walk(node, path):
-        if not isinstance(node, dict):
+# Keywords whose value is a LIST of subschemas.
+_BRANCH_KEYWORDS = ("anyOf", "oneOf", "allOf")
+
+
+def _subschemas(schema):
+    """Yield `(dotted path, node, kind)` for every subschema in the document.
+
+    `kind` is `"property"` when the node was reached as a named property (what
+    `property_paths` reports), and `""` otherwise.
+
+    Descending only through `properties` and a dict-valued `items` — the obvious
+    walk — is not enough, and the vendored copy already proves it: it uses
+    `knowledge_base.code_guidelines.filePatterns.items.anyOf` and
+    `reviews.mutually_exclusive_groups.additionalProperties` today. A `maxLength`
+    tightened inside one of those invalidates a config exactly as hard as one on a
+    plain property, but the narrow walk could not see it — and because the
+    property path itself is unchanged, `added`/`removed` would be empty too, so
+    the summary would claim "the drift is elsewhere".
+
+    Paths are stable and distinct across versions, which is the whole basis of
+    the diff: a combinator branch carries its index (`x<anyOf[0]>`) so two
+    branches constraining the same location cannot collide into one entry.
+    """
+    # Cycle backstop. `json.load` never shares objects, so nothing is skipped
+    # today; this only stops a self-referential schema from recursing forever.
+    seen = set()
+
+    def walk(node, path, kind):
+        if not isinstance(node, dict) or id(node) in seen:
             return
+        seen.add(id(node))
+        yield path, node, kind
+
         for name, sub in (node.get("properties") or {}).items():
-            child = f"{path}.{name}" if path else name
-            paths.add(child)
-            walk(sub, child)
+            yield from walk(sub, f"{path}.{name}" if path else name, "property")
+        for pattern, sub in (node.get("patternProperties") or {}).items():
+            child = f"{{{pattern}}}"
+            yield from walk(sub, f"{path}.{child}" if path else child, "property")
+        for name, sub in (node.get("$defs") or node.get("definitions") or {}).items():
+            yield from walk(sub, f"{path}<$defs.{name}>", "")
+
         items = node.get("items")
         if isinstance(items, dict):
-            walk(items, f"{path}[]")
+            yield from walk(items, f"{path}[]", "")
+        elif isinstance(items, list):
+            # Tuple validation: each entry constrains one position.
+            for index, sub in enumerate(items):
+                yield from walk(sub, f"{path}[{index}]", "")
 
-    walk(schema, "")
-    return paths
+        for keyword in _SUBSCHEMA_KEYWORDS:
+            sub = node.get(keyword)
+            if isinstance(sub, dict):
+                yield from walk(sub, f"{path}<{keyword}>", "")
+        for keyword in _BRANCH_KEYWORDS:
+            branches = node.get(keyword)
+            if isinstance(branches, list):
+                for index, sub in enumerate(branches):
+                    yield from walk(sub, f"{path}<{keyword}[{index}]>", "")
+
+    yield from walk(schema, "", "")
+
+
+def property_paths(schema):
+    """Every dotted property path in the schema, e.g. `reviews.tools.eslint.enabled`."""
+    return {path for path, _node, kind in _subschemas(schema) if kind == "property"}
 
 
 def length_caps(schema):
@@ -93,20 +154,10 @@ def length_caps(schema):
     into one CodeRabbit rejects whole, with no change on the config's side.
     """
     caps = {}
-
-    def walk(node, path):
-        if not isinstance(node, dict):
-            return
+    for path, node, _kind in _subschemas(schema):
         cap = node.get("maxLength")
         if isinstance(cap, int):
             caps[path or "(document root)"] = cap
-        for name, sub in (node.get("properties") or {}).items():
-            walk(sub, f"{path}.{name}" if path else name)
-        items = node.get("items")
-        if isinstance(items, dict):
-            walk(items, f"{path}[]")
-
-    walk(schema, "")
     return caps
 
 
@@ -131,11 +182,27 @@ def summarize(vendored, fetched):
     removed = old_paths - new_paths
     tightened = []
     loosened = []
-    for path, cap in sorted(new_caps.items()):
-        was = old_caps.get(path)
-        if was is None or was == cap:
+    # The UNION of both sides, not just the fetched caps. Two drift classes hide
+    # in the difference, and the first is the one this whole section exists to
+    # lead with:
+    #   * upstream ADDS a cap to a property that was uncapped
+    #     (`reviews.high_level_summary_instructions`, `reviews.auto_title_instructions`
+    #     and `pre_merge_checks.title.requirements` are all uncapped today) — the
+    #     single most config-invalidating change upstream can make;
+    #   * upstream REMOVES a cap, which never appears in `new_caps` at all.
+    # In both cases the property path is unchanged, so `added`/`removed` are
+    # empty too — skipping them would print "No property or `maxLength` changes"
+    # over exactly the drift a reviewer must not miss.
+    for path in sorted(set(old_caps) | set(new_caps)):
+        was, now = old_caps.get(path), new_caps.get(path)
+        if was == now:
             continue
-        (tightened if cap < was else loosened).append(f"{path}: {was} → {cap}")
+        if was is None:
+            tightened.append(f"{path}: uncapped → {now}")
+        elif now is None:
+            loosened.append(f"{path}: {was} → uncapped")
+        else:
+            (tightened if now < was else loosened).append(f"{path}: {was} → {now}")
 
     lines = []
     # Tightened caps first: this is the only class that can retroactively
@@ -169,19 +236,37 @@ def main(argv=None):
     try:
         vendored = load(args.vendored, "vendored")
         fetched = load(args.fetched, "fetched")
+
+        if canonical(vendored) == canonical(fetched):
+            print("No drift: the vendored schema matches upstream.")
+            return 0
+
+        summary = summarize(vendored, fetched)
+        # Written BEFORE exit 1 is returned, and inside this guard: exit 1 tells
+        # the caller "drifted", and the caller acts on it by vendoring the fetch
+        # and force-resetting a shared branch. Reporting drift while the summary
+        # that explains it does not exist strands that branch behind a PR step
+        # that then fails trying to read it.
+        if args.summary_out:
+            with open(args.summary_out, "w", encoding="utf-8") as f:
+                f.write(summary)
     except DriftInputError as exc:
         print(f"::error::coderabbit-schema-refresh: {exc}")
         return 2
+    except Exception as exc:  # noqa: BLE001 — deliberate, see below
+        # Anything unexpected — a non-UTF-8 fetch decoded here, a RecursionError
+        # on a degenerate schema, an unwritable --summary-out — must NOT reach the
+        # caller as Python's default exit 1, because 1 is the drift verdict and
+        # the caller force-resets a branch on it. A failure to compare is not a
+        # comparison: it comes back as 2, like every other unusable input.
+        print(
+            f"::error::coderabbit-schema-refresh: unexpected failure comparing the "
+            f"schemas ({type(exc).__name__}: {exc}) — treating this as "
+            f"'could not compare', not as drift."
+        )
+        return 2
 
-    if canonical(vendored) == canonical(fetched):
-        print("No drift: the vendored schema matches upstream.")
-        return 0
-
-    summary = summarize(vendored, fetched)
     print(summary)
-    if args.summary_out:
-        with open(args.summary_out, "w", encoding="utf-8") as f:
-            f.write(summary)
     return 1
 
 

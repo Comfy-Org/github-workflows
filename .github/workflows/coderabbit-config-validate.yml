@@ -171,8 +171,19 @@ jobs:
         # the standard library, and the whole value of the check is reproducing
         # the verdict CodeRabbit's own Draft 2020-12 validator reaches. See the
         # header of requirements.txt.
+        #
+        # `-P` is load-bearing, not tidiness. This step's working directory is the
+        # CALLER's checkout — i.e. the untrusted PR head — and `python3 -m pip`
+        # normally puts that directory FIRST on sys.path. A PR adding a top-level
+        # `pip/__main__.py` would therefore run its own code here, before the
+        # pinned checker ever starts, and could rewrite `_coderabbit_config/` so
+        # the tamper-proof validator grades the PR with the PR's own logic. `-P`
+        # (PYTHONSAFEPATH, 3.11+; the runner is pinned to 3.12 above) suppresses
+        # that prepend. The checker step below does not need it: running a script
+        # by path puts the SCRIPT's directory on sys.path, which is the pinned
+        # checkout, never the workspace.
         run: |
-          python3 -m pip install --disable-pip-version-check --no-input \
+          python3 -P -m pip install --disable-pip-version-check --no-input \
             --require-hashes --only-binary=:all: \
             -r "$GITHUB_WORKSPACE/_coderabbit_config/.github/coderabbit-config/requirements.txt"
 

@@ -126,6 +126,78 @@ class DriftTest(unittest.TestCase):
             self.assertIn("Read the diff", buf.getvalue())
 
 
+    def test_a_newly_capped_property_is_reported_as_tightened(self):
+        # The most config-invalidating change upstream can make: a field that was
+        # unbounded acquires a cap, so a config nobody touched is now rejected
+        # WHOLE. The path is unchanged, so added/removed are empty — before the
+        # union fix this printed "No property or maxLength changes".
+        capped = json.loads(json.dumps(BASE))
+        capped["properties"]["reviews"]["properties"]["profile"]["maxLength"] = 40
+        with tempfile.TemporaryDirectory() as tmp:
+            a = write(tmp, "a.json", BASE)
+            b = write(tmp, "b.json", capped)
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = schema_drift.main(["--vendored", a, "--fetched", b])
+            summary = buf.getvalue()
+        self.assertEqual(code, 1)
+        self.assertIn("Tightened", summary.splitlines()[0])
+        self.assertIn("reviews.profile: uncapped → 40", summary)
+        self.assertNotIn("the drift is elsewhere", summary)
+
+    def test_a_removed_cap_is_reported_as_loosened(self):
+        loosened = json.loads(json.dumps(BASE))
+        del loosened["properties"]["tone_instructions"]["maxLength"]
+        with tempfile.TemporaryDirectory() as tmp:
+            a = write(tmp, "a.json", BASE)
+            b = write(tmp, "b.json", loosened)
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = schema_drift.main(["--vendored", a, "--fetched", b])
+            summary = buf.getvalue()
+        self.assertEqual(code, 1)
+        self.assertIn("Loosened", summary)
+        self.assertIn("tone_instructions: 250 → uncapped", summary)
+        self.assertNotIn("the drift is elsewhere", summary)
+
+    def test_caps_and_properties_inside_combinators_are_visible(self):
+        # The vendored schema already uses both shapes (`filePatterns.items.anyOf`,
+        # `mutually_exclusive_groups.additionalProperties`), so a walk that stops
+        # at `properties`/dict-`items` is blind to drift the fleet would feel.
+        nested = json.loads(json.dumps(BASE))
+        nested["properties"]["reviews"]["properties"]["groups"] = {
+            "type": "object",
+            "additionalProperties": {
+                "type": "array",
+                "items": {"anyOf": [{"type": "string", "maxLength": 60}]},
+            },
+        }
+        caps = schema_drift.length_caps(nested)
+        paths = schema_drift.property_paths(nested)
+        self.assertIn("reviews.groups", paths)
+        self.assertEqual(
+            caps["reviews.groups<additionalProperties>[]<anyOf[0]>"], 60
+        )
+
+    def test_an_unexpected_failure_exits_two_not_one(self):
+        # Exit 1 means DRIFTED, and the caller force-resets a shared branch on it.
+        # An unwritable --summary-out is not a verdict.
+        with tempfile.TemporaryDirectory() as tmp:
+            a = write(tmp, "a.json", BASE)
+            changed = json.loads(json.dumps(BASE))
+            changed["properties"]["reviews"]["description"] = "new prose"
+            b = write(tmp, "b.json", changed)
+            out_dir = os.path.join(tmp, "summary-is-a-dir")
+            os.mkdir(out_dir)
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = schema_drift.main(
+                    ["--vendored", a, "--fetched", b, "--summary-out", out_dir]
+                )
+        self.assertEqual(code, 2)
+        self.assertIn("could not compare", buf.getvalue())
+
+
 class VendoredSchemaTest(unittest.TestCase):
     def test_the_committed_schema_loads_as_a_schema(self):
         # Guards the vendoring step itself: a truncated or stubbed commit of

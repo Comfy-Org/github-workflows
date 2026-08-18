@@ -27,6 +27,8 @@ Severity is split, mirroring what CodeRabbit itself does with each problem:
 | Type / enum error | **fails** | File-rejecting. |
 | Unknown / additional property | **warns** | CodeRabbit *strips* an unrecognized key rather than rejecting the file — so the config loads, but everything under that key silently does nothing. Set `strict_unknown_keys: true` to fail instead. |
 | No `.coderabbit.yaml` at all | **passes** | Reported in the log, so "no config here" never reads the same as "config validated clean". |
+| `.coderabbit.yml` present under the default name | **validated, with a warning** | CodeRabbit honours both spellings, so the file that exists is the config in effect. Validating it is the point; the warning tells you to set `config_file` explicitly. |
+| Config path outside the repo, not a regular file, or over 512 KiB | **errors (exit 2)** | "I could not check" must never look like a pass. Symlinks are resolved before the containment test. |
 
 The warning class is not cosmetic. The most common instance is a `tools:` block
 written at the document root instead of under `reviews:`; the root is closed, so
@@ -35,6 +37,13 @@ the whole block is stripped and every setting in it reverts to the schema defaul
 defaults to `true`, so a root-level `enabled: false` runs the linter it meant to
 disable). The annotation names the offending key path and suggests where it
 belongs.
+
+One limit worth knowing: the unknown-key check fires where the schema CLOSES an
+object, which upstream does at the document root and for a handful of nested
+objects. `reviews`, `chat`, `knowledge_base`, `code_generation` and the individual
+tool configs are open, so a typo *inside* one (`reviews.profil`) is not flagged
+even under `strict_unknown_keys`. What is caught is a key in the wrong PLACE —
+the failure that actually recurs.
 
 The checker and the schema it validates against live in
 [`.github/coderabbit-config/`](../../.github/coderabbit-config) and are loaded
@@ -81,7 +90,7 @@ contents: read
 
 | Input | Default | Notes |
 |---|---|---|
-| `config_file` | `.coderabbit.yaml` | Point this at `.coderabbit.yml` if that's your spelling. Must resolve inside the repo root. |
+| `config_file` | `.coderabbit.yaml` | Point this at `.coderabbit.yml` if that's your spelling — if you don't, the checker finds it anyway and warns rather than reporting "absent". Must resolve inside the repo root (symlinks resolved). |
 | `strict_unknown_keys` | `false` | Fail on an unknown/additional property instead of warning. Opt in once your config is clean, to keep it that way. |
 | `workflows_ref` | *(required)* | **Set to your `uses:` SHA** — the checker and the vendored schema load from this ref. |
 

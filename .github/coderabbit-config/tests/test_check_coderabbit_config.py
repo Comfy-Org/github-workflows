@@ -276,15 +276,110 @@ class MainTest(unittest.TestCase):
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmp:
-            with open(os.path.join(tmp, ".coderabbit.yml"), "w", encoding="utf-8") as f:
+            with open(os.path.join(tmp, "configs.yaml"), "w", encoding="utf-8") as f:
                 f.write(OVERLONG_TONE)
-            # Default name is absent -> pass; pointing at the real file -> fail.
+            # Default name is absent (and has no sibling spelling) -> pass;
+            # pointing at the real file -> fail.
             code, _ = self._run(tmp, ["--root", tmp, "--schema", SCHEMA_PATH])
             self.assertEqual(code, 0)
             code, _ = self._run(
-                tmp, ["--root", tmp, "--schema", SCHEMA_PATH, "--config", ".coderabbit.yml"]
+                tmp, ["--root", tmp, "--schema", SCHEMA_PATH, "--config", "configs.yaml"]
             )
             self.assertEqual(code, 1)
+
+    def test_the_other_spelling_is_validated_not_reported_absent(self):
+        # The quietest failure this checker can have: a repo on the `.coderabbit.yml`
+        # spelling leaves `config_file` at its default, and every PR forever gets a
+        # green check over a config nobody looked at. CodeRabbit honours both
+        # spellings, so the present one is the config in effect.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, ".coderabbit.yml"), "w", encoding="utf-8") as f:
+                f.write(OVERLONG_TONE)
+            code, out = self._run(tmp, ["--root", tmp, "--schema", SCHEMA_PATH])
+        self.assertEqual(code, 1, msg=out)
+        self.assertIn("::warning::", out)
+        self.assertIn(".coderabbit.yml", out)
+        self.assertNotIn("absent — pass", out)
+
+    def test_a_symlink_out_of_the_tree_is_refused_not_followed(self):
+        # abspath normalizes `..` but does not resolve symlinks, while isfile()
+        # and open() both follow them — so a config committed as a symlink would
+        # otherwise clear the containment guard and have the TARGET's content
+        # quoted into a public run log by a YAML error message.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as outside:
+            secret = os.path.join(outside, "secret.yaml")
+            with open(secret, "w", encoding="utf-8") as f:
+                f.write("this: [is not: valid yaml\n")
+            with tempfile.TemporaryDirectory() as tmp:
+                os.symlink(secret, os.path.join(tmp, ".coderabbit.yaml"))
+                code, out = self._run(tmp, ["--root", tmp, "--schema", SCHEMA_PATH])
+        self.assertEqual(code, 2, msg=out)
+        self.assertIn("outside the checked-out repo root", out)
+        self.assertNotIn("is not valid yaml", out)
+
+    def test_a_symlink_inside_the_tree_is_still_validated(self):
+        # The guard is containment, not "no symlinks": a repo that keeps its
+        # config behind an in-tree symlink is doing nothing wrong.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            real = os.path.join(tmp, "real.yaml")
+            with open(real, "w", encoding="utf-8") as f:
+                f.write(OVERLONG_TONE)
+            os.symlink(real, os.path.join(tmp, ".coderabbit.yaml"))
+            code, out = self._run(tmp, ["--root", tmp, "--schema", SCHEMA_PATH])
+        self.assertEqual(code, 1, msg=out)
+
+    def test_a_path_that_is_not_a_regular_file_exits_two(self):
+        # A directory or a dangling symlink is "I could not check", never a pass.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            os.mkdir(os.path.join(tmp, ".coderabbit.yaml"))
+            code, out = self._run(tmp, ["--root", tmp, "--schema", SCHEMA_PATH])
+            self.assertEqual(code, 2, msg=out)
+            self.assertIn("not a regular file", out)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            os.symlink(os.path.join(tmp, "gone.yaml"), os.path.join(tmp, ".coderabbit.yaml"))
+            code, out = self._run(tmp, ["--root", tmp, "--schema", SCHEMA_PATH])
+            self.assertEqual(code, 2, msg=out)
+
+    def test_an_absurdly_large_config_is_refused_before_parsing(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, ".coderabbit.yaml"), "w", encoding="utf-8") as f:
+                f.write("# " + ("x" * (checker.MAX_CONFIG_BYTES + 10)) + "\n")
+            code, out = self._run(tmp, ["--root", tmp, "--schema", SCHEMA_PATH])
+        self.assertEqual(code, 2, msg=out)
+        self.assertIn("refusing to read it", out)
+
+    def test_the_config_path_is_escaped_in_the_banner(self):
+        # `config_file` is a workflow_call input a PR to the caller repo can edit;
+        # a newline in it would emit a second, attacker-chosen workflow command
+        # (`::stop-commands::` suppresses every annotation printed after it).
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out = self._run(
+                tmp,
+                [
+                    "--root",
+                    tmp,
+                    "--schema",
+                    SCHEMA_PATH,
+                    "--config",
+                    "a.yaml\n::stop-commands::x",
+                ],
+            )
+        self.assertNotIn("\n::stop-commands::", out)
+        self.assertIn("%0A", out)
+        self.assertEqual(code, 0, msg=out)
 
     def test_unreadable_schema_exits_two(self):
         import tempfile

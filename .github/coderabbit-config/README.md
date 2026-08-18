@@ -30,10 +30,22 @@ a schema library calls "invalid":
 | YAML parse error | error | CodeRabbit cannot read the file at all. |
 | `maxLength` violation | error | File-rejecting. The schema carries **14** per-field caps, 50 → 20,000 chars. |
 | type / enum error | error | File-rejecting. |
-| unknown / additional property | **warning** | CodeRabbit *strips* an unrecognized key rather than rejecting the file. |
+| unknown / additional property | **warning** | CodeRabbit *strips* an unrecognized key rather than rejecting the file. Only where the schema closes the object — see below. |
+| config path that is not a regular file, or > 512 KiB | exit 2 | "I could not check" must never look like a pass. A path resolving outside the repo root (symlinks resolved) is refused the same way. |
 
 `strict_unknown_keys: true` escalates the last row to an error for a repo that has
 cleaned up and wants to stay clean.
+
+**How far the unknown-key row reaches.** It fires where the schema CLOSES an
+object — the document root, `knowledge_base.mcp`, and the two tool objects that
+declare `additionalProperties: false`. Most nested objects (`reviews`, `chat`,
+`knowledge_base`, `code_generation`, the individual tool configs) are open in
+upstream's schema, so a typo *inside* one — `reviews.profil`, or
+`golangci-lint.enabld` — produces no finding, with or without
+`strict_unknown_keys`. That is a real gap and not a claim this checker makes:
+what it catches is a key in the wrong PLACE, which is the failure that actually
+recurred here. Widening it means cross-checking parsed keys against the schema
+index rather than waiting for jsonschema to complain.
 
 A stripped key is not a cosmetic problem. The recurring instance is a `tools:`
 block written at the document root instead of under `reviews:` — the schema root

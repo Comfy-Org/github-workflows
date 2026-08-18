@@ -46,6 +46,7 @@ import json
 import os
 import re
 import sys
+from itertools import islice
 
 try:
     import yaml
@@ -69,6 +70,21 @@ except ImportError:  # pragma: no cover - exercised only on a bare interpreter
 
 DEFAULT_CONFIG = ".coderabbit.yaml"
 DEFAULT_SCHEMA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.v2.json")
+
+# CodeRabbit honours both spellings of the extension, so a repo on the other one
+# must not read as "no config here". See `_sibling_spelling`.
+_SPELLING_SWAP = {".yaml": ".yml", ".yml": ".yaml"}
+
+# The config is PR-controlled, so both the input and the output are bounded.
+#
+# 512 KiB is ~two orders of magnitude above any real `.coderabbit.yaml`; the cap
+# exists to stop a runner reading and parsing a junk file, not to police style.
+# It is NOT a defence against alias amplification — a billion-laughs document is
+# a few hundred bytes, and while PyYAML itself constructs each anchor once,
+# `iter_errors` walks the resulting DAG as a tree. That is what MAX_FINDINGS and
+# the caller's job timeout bound; the check fails closed either way.
+MAX_CONFIG_BYTES = 512 * 1024
+MAX_FINDINGS = 100
 
 # Keywords whose violation CodeRabbit tolerates by STRIPPING the offending key,
 # rather than rejecting the document. Everything else is file-rejecting.
@@ -313,7 +329,15 @@ def validate(text, schema, strict_unknown_keys=False):
             for part in error.absolute_path
         )
 
-    for error in sorted(validator.iter_errors(data), key=_order):
+    # Collected through `islice` rather than materialized whole: the document is
+    # PR-controlled, and a deeply aliased one can yield findings faster than any
+    # reviewer will read them (and flood a public run log doing it). One past the
+    # cap so the truncation can say so honestly.
+    raw_errors = list(islice(validator.iter_errors(data), MAX_FINDINGS + 1))
+    truncated = len(raw_errors) > MAX_FINDINGS
+    del raw_errors[MAX_FINDINGS:]
+
+    for error in sorted(raw_errors, key=_order):
         parent_parts = list(error.absolute_path)
         if error.validator in STRIPPED_KEYWORDS:
             extras = _extra_keys(error)
@@ -352,6 +376,12 @@ def validate(text, schema, strict_unknown_keys=False):
         path_str = _format_path(parent_parts)
         findings.append(
             ("error", path_str, _line_for_path(node, parent_parts), _describe(error, path_str))
+        )
+
+    if truncated:
+        notes.append(
+            f"more than {MAX_FINDINGS} schema violations in this file — only the "
+            f"first {MAX_FINDINGS} are reported. Fix these and re-run."
         )
 
     return findings, notes
@@ -403,7 +433,7 @@ def _emit(findings, notes, config_rel):
     if errors:
         print(
             f"\nResult: {len(errors)} error(s), {len(warnings)} warning(s) — "
-            f"{config_rel} is invalid."
+            f"{_esc_cmd(config_rel)} is invalid."
         )
         return 1
     if warnings:
@@ -411,6 +441,46 @@ def _emit(findings, notes, config_rel):
     else:
         print("\nResult: .coderabbit.yaml OK.")
     return 0
+
+
+def _contained(root_abs, path):
+    """Is `path` inside `root_abs` once symlinks on BOTH sides are resolved?
+
+    `os.path.abspath` normalizes `..` textually but does NOT resolve symlinks,
+    while `os.path.isfile` and `open` below both follow them — so a
+    `.coderabbit.yaml` committed as a symlink to a path outside the checkout
+    would clear a purely textual guard and be read anyway. Its content can then
+    reach a PUBLIC run log: a `MarkedYAMLError` embeds the offending source line,
+    and `_describe`'s type branch prints the instance in full. Resolving the root
+    too is what keeps a legitimately symlinked checkout path (`/var` → `/private/var`
+    on macOS, and how CI temp dirs are handed out) from failing every config for
+    sitting "outside" a root that is itself a symlink.
+    """
+    try:
+        return os.path.commonpath([root_abs, os.path.realpath(path)]) == root_abs
+    except ValueError:
+        # Different drives, or a mix of absolute and relative — not comparable,
+        # and therefore not containable either.
+        return False
+
+
+def _sibling_spelling(root, config_rel):
+    """The other extension CodeRabbit also honours, when THAT file is the present one.
+
+    CodeRabbit reads `.coderabbit.yaml` and `.coderabbit.yml` alike. A repo on the
+    `.yml` spelling that leaves `config_file` at its default would otherwise get a
+    permanently green "absent — pass" over a config that is real, in effect, and
+    possibly invalid — the same "checked nothing" failure the empty-path guard
+    returns 2 for, only quieter, because it looks exactly like a pass.
+    """
+    stem, ext = os.path.splitext(config_rel)
+    other_ext = _SPELLING_SWAP.get(ext.lower())
+    if not other_ext:
+        return None
+    other_rel = stem + other_ext
+    if os.path.isfile(os.path.join(root, other_rel)):
+        return other_rel
+    return None
 
 
 def _env_bool(name, default):
@@ -465,16 +535,51 @@ def main(argv=None):
     # Keep the validated file inside the tree we were pointed at. `config_file`
     # reaches here from a workflow input, and `os.path.join` silently DISCARDS
     # --root when handed an absolute path — so without this, `config_file: /etc/…`
-    # or `../../x` would read outside the caller's checkout and report on it.
-    root_abs = os.path.abspath(args.root)
-    if os.path.commonpath([root_abs, os.path.abspath(config_path)]) != root_abs:
+    # or `../../x` would read outside the caller's checkout and report on it. A
+    # symlink counts as outside too — see `_contained`.
+    root_abs = os.path.realpath(args.root)
+    if not _contained(root_abs, config_path):
         msg = (
             f"config path '{config_rel}' resolves outside the checked-out repo "
-            f"root — refusing to read it. Give a path relative to the repo root."
+            f"root — refusing to read it. Give a path relative to the repo root "
+            f"(a symlink whose target leaves the tree resolves outside it too)."
         )
         print(f"FAIL: {_esc_cmd(msg)}")
         print(f"::error::coderabbit-config: {_esc_cmd(msg)}")
         return 2
+
+    # Which file are we actually about to read? Three different states hide
+    # behind a false `isfile()`, and only one of them is "this repo has no
+    # config". Settle that BEFORE the banner below, so the banner names the file
+    # that really gets validated rather than the one that was asked for.
+    pending = []
+    if os.path.lexists(config_path) and not os.path.isfile(config_path):
+        # A directory, or a symlink with no target. We were pointed at something
+        # unusable: that is a could-not-run, not a pass.
+        msg = (
+            f"'{config_rel}' exists but is not a regular file (a directory, or a "
+            f"symlink with no target) — refusing to report a pass over it."
+        )
+        print(f"FAIL: {_esc_cmd(msg)}")
+        print(f"::error::coderabbit-config: {_esc_cmd(msg)}")
+        return 2
+
+    absent = not os.path.isfile(config_path)
+    if absent:
+        sibling = _sibling_spelling(args.root, config_rel)
+        if sibling and _contained(root_abs, os.path.join(args.root, sibling)):
+            pending.append(
+                (
+                    "warning",
+                    f"no {config_rel} in this repo, but {sibling} is — CodeRabbit "
+                    f"honours both spellings, so {sibling} is the config in "
+                    f"effect and is what was validated. Set `config_file: "
+                    f"{sibling}` to make that explicit.",
+                )
+            )
+            config_rel = sibling
+            config_path = os.path.join(args.root, sibling)
+            absent = False
 
     try:
         schema, schema_digest = load_schema(args.schema)
@@ -484,9 +589,15 @@ def main(argv=None):
         print(f"::error::coderabbit-config: {msg}")
         return 2
 
+    # Escaped like every other print in this file: `config_file` and `root` both
+    # arrive from `workflow_call` inputs a PR to the caller repo can edit, and a
+    # newline in either would emit an attacker-chosen second workflow command —
+    # `::stop-commands::` here suppresses every `::error::` annotation printed
+    # afterwards, so a failing check would silently lose its annotations.
     print(
-        f"Validating '{config_rel}' in '{args.root}' against vendored schema "
-        f"{os.path.basename(args.schema)} (sha256 {schema_digest[:12]})..."
+        f"Validating '{_esc_cmd(config_rel)}' in '{_esc_cmd(args.root)}' against "
+        f"vendored schema {_esc_cmd(os.path.basename(args.schema))} "
+        f"(sha256 {schema_digest[:12]})..."
     )
     print(
         "Unknown keys: "
@@ -494,7 +605,12 @@ def main(argv=None):
     )
     print()
 
-    if not os.path.isfile(config_path):
+    for severity, line in pending:
+        label = "WARN" if severity == "warning" else "NOTE"
+        print(f"{label}: {_esc_cmd(line)}")
+        print(f"::{severity}::coderabbit-config: {_esc_cmd(line)}")
+
+    if absent:
         # Not every consumer repo has one, and a missing file is not a defect —
         # but it IS reported, so "no config here" never looks the same in a log
         # as "config validated clean".
@@ -503,6 +619,17 @@ def main(argv=None):
         print(f"::notice::coderabbit-config: {_esc_cmd(line)}")
         print("\nResult: .coderabbit.yaml absent — pass.")
         return 0
+
+    size = os.path.getsize(config_path)
+    if size > MAX_CONFIG_BYTES:
+        msg = (
+            f"'{config_rel}' is {size} bytes, past the {MAX_CONFIG_BYTES}-byte "
+            f"limit this checker will parse — refusing to read it. A real "
+            f"CodeRabbit config is kilobytes; this is not one."
+        )
+        print(f"FAIL: {_esc_cmd(msg)}")
+        print(f"::error::coderabbit-config: {_esc_cmd(msg)}")
+        return 2
 
     with open(config_path, "r", encoding="utf-8", errors="replace") as f:
         text = f.read()

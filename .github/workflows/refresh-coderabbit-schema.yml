@@ -125,6 +125,7 @@ jobs:
           esac
 
       - name: Vendor the new schema and re-run the checker against it
+        id: invariants
         if: steps.drift.outputs.drifted == 'true'
         run: |
           set -euo pipefail
@@ -138,14 +139,37 @@ jobs:
           # against. The unit suite asserts the facts the checker's messages rest
           # on (root closed, tone_instructions capped at 250, `tools` living under
           # `reviews`, the 14-cap set), so a refresh that would quietly redefine
-          # what the check MEANS turns this PR red instead of merging green.
-          python3 -m unittest discover -s .github/coderabbit-config/tests -p 'test_*.py'
+          # what the check MEANS must not merge green. Plus a self-check: this repo
+          # has no .coderabbit.yaml, so validate a smoke fixture rather than nothing.
+          #
+          # CAPTURED, not fatal — and that distinction is the whole point. Those
+          # assertions are exact (`len(caps) == 14`, `tone_instructions == 250`), so
+          # ANY legitimate upstream cap add, removal or change fails them. Aborting
+          # this step would take every later step with it, since their
+          # `if: steps.drift.outputs.drifted == 'true'` carries an implicit
+          # success() — so no PR would be opened, and the drift class this workflow
+          # exists to catch first would be the one it silently never proposes.
+          # Instead the verdict rides in the PR body and reddens the run at the end,
+          # once there is a PR to explain it.
+          log="${RUNNER_TEMP}/invariants.log"
+          set +e
+          (
+            set -e
+            python3 -m unittest discover -s .github/coderabbit-config/tests -p 'test_*.py'
+            root="$(mktemp -d)"
+            printf 'language: en-US\nreviews:\n  profile: chill\n' > "$root/.coderabbit.yaml"
+            python3 .github/coderabbit-config/check_coderabbit_config.py --root "$root"
+          ) > "$log" 2>&1
+          code=$?
+          set -e
+          cat "$log"
 
-          # And a self-check: this repo has no .coderabbit.yaml, so validate the
-          # smoke fixture rather than nothing at all.
-          root="$(mktemp -d)"
-          printf 'language: en-US\nreviews:\n  profile: chill\n' > "$root/.coderabbit.yaml"
-          python3 .github/coderabbit-config/check_coderabbit_config.py --root "$root"
+          if [ "$code" -eq 0 ]; then
+            echo "invariants=pass" >> "$GITHUB_OUTPUT"
+          else
+            echo "invariants=fail" >> "$GITHUB_OUTPUT"
+            echo "::warning::The invariant suite fails against the proposed schema (exit ${code}). Opening the refresh PR anyway so the change is reviewable; this run ends red."
+          fi
 
       - name: Generate Cloud Code Bot token
         id: token
@@ -165,8 +189,17 @@ jobs:
           GH_TOKEN: ${{ steps.token.outputs.token }}
           BRANCH: ci/refresh-coderabbit-schema
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          INVARIANTS: ${{ steps.invariants.outputs.invariants }}
         run: |
           set -euo pipefail
+
+          # Verify the body's ingredients BEFORE the force-push. The push moves a
+          # shared branch; if drift.md were missing, the `cat` below would abort
+          # under `set -e` with the branch already reset and no PR to explain it.
+          if [ ! -s "${RUNNER_TEMP}/drift.md" ]; then
+            echo "::error::Drift was reported but ${RUNNER_TEMP}/drift.md is missing or empty — refusing to reset the shared branch with nothing to explain it."
+            exit 1
+          fi
 
           # Committer identity is cosmetic — the PR AUTHOR (what reviewers and
           # filters key off) comes from the App token used below. Same convention
@@ -195,7 +228,18 @@ jobs:
             cat "${RUNNER_TEMP}/drift.md"
             printf '\n'
             printf '%s\n\n' '**Before merging**, check the tightened-cap section above if there is one: a lowered `maxLength` retroactively invalidates configs nobody has touched, and merging this makes their next PR red. Landing the cleanup alongside is usually the right order.'
-            printf '%s\n\n' 'The unit suite ran against the proposed schema in [this run]('"$RUN_URL"') — it asserts the facts the checker'"'"'s messages rest on, so a refresh that would silently redefine the check is red rather than green.'
+            if [ "${INVARIANTS:-}" = "fail" ]; then
+              # No blank line between the marker and the body: GitHub only
+              # renders the alert when the blockquote is contiguous.
+              printf '%s\n' '> [!WARNING]'
+              printf '%s\n\n' '> **The invariant unit suite FAILS against the proposed schema** ([this run]('"$RUN_URL"')). That suite asserts the exact facts the checker'"'"'s messages rest on, so this is the signal to read closely, not a flake: either the schema change is one we must adapt the checker and its tests to, or the fetch is not what we think it is. Update those assertions in this PR, deliberately, before merging.'
+              printf '%s\n' '<details><summary>Invariant suite output</summary>'
+              printf '\n```\n'
+              tail -n 60 "${RUNNER_TEMP}/invariants.log" || echo '(invariant log unavailable)'
+              printf '```\n\n</details>\n\n'
+            else
+              printf '%s\n\n' 'The unit suite ran green against the proposed schema in [this run]('"$RUN_URL"') — it asserts the facts the checker'"'"'s messages rest on, so a refresh that would silently redefine the check cannot slip through unnoticed.'
+            fi
             printf '%s\n\n' 'Merging this touches `.github/coderabbit-config/**`, which triggers `bump-coderabbit-config-callers.yml` and rolls the SHA-pinned caller fleet forward.'
             printf '%s\n' '_Opened by the `refresh-coderabbit-schema` workflow._'
           } > "$body"
@@ -225,3 +269,11 @@ jobs:
             echo
             cat "${RUNNER_TEMP}/drift.md"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail the run when the proposed schema breaks the invariants
+        # Deliberately last: the PR is already open and carries the failure in its
+        # body, so the red run points at something reviewable instead of vanishing.
+        if: steps.invariants.outputs.invariants == 'fail'
+        run: |
+          echo "::error::The proposed schema fails the checker's invariant suite. The refresh PR is open with the output in its body — adapt the checker and its assertions there, deliberately."
+          exit 1
