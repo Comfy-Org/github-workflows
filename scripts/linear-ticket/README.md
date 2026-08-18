@@ -3,13 +3,14 @@
 The scripts behind [`linear-ticket.yml`](../../.github/workflows/linear-ticket.yml). A
 consumer repo runs the reusable workflow via a thin two-workflow caller (signal + validate)
 and keeps no logic of its own; this directory holds the decision path, loaded from the
-`workflows_ref` SHA the caller pins.
+`workflows_ref` SHA the caller pins. Standard-library Python only (no third-party deps),
+matching this repo's Python convention.
 
 | File | Role |
 |---|---|
-| `lib.sh` | Pure, network-free core — candidate extraction, `team-keys` validation, the attachment **policy gate** (`filter_issues`), Linear error classification, failure-category selection, failure copy, and the batched diagnostic-query builder. Sourced by `validate.sh` and by the test suite. |
-| `validate.sh` | The side-effecting orchestration: resolve the PR from the `workflow_run` event, refetch it, publish the `linear-ticket` commit status, query `attachmentsForURL`, apply the gate, run one batched diagnostic query, and maintain the single marker PR comment. Sources `lib.sh`. |
-| `tests/test_lib.sh` | Hermetic suite over `lib.sh` — no network. |
+| `lib.py` | Pure, network-free core — candidate extraction, `team-keys` validation, the attachment **policy gate** (`filter_issues`), Linear error classification, failure-category selection, failure copy, and the batched diagnostic-query builder. Imported by `validate.py` and by the test suite. |
+| `validate.py` | The side-effecting orchestration: resolve the PR from the `workflow_run` event, refetch it, publish the `linear-ticket` commit status, query `attachmentsForURL`, apply the gate, run one batched diagnostic query, and maintain the single marker PR comment. GitHub via the `gh` CLI (`subprocess`), Linear via `urllib`. Imports `lib.py`. |
+| `tests/test_lib.py` | Hermetic `unittest` suite over `lib.py` — no network. |
 
 ## The invariant
 
@@ -17,8 +18,7 @@ The **only** thing that turns the check green is an attachment Linear returns fo
 canonical `html_url` (`attachmentsForURL`) whose issue satisfies policy — `filter_issues`.
 That is the whole point: a `TEAM-123`-shaped string an author types is not a link. So:
 
-- The PR URL is passed to Linear as a **GraphQL variable**, never interpolated into the query
-  or a shell word.
+- The PR URL is passed to Linear as a **GraphQL variable**, never interpolated into the query.
 - The policy reads the resolved issue's **API `team.key`** and **`state.type`**, never a
   prefix or a state *name* the author controls.
 - Candidate identifiers extracted from branch/title/body (`extract_candidates`) are
@@ -31,7 +31,8 @@ That is the whole point: a `TEAM-123`-shaped string an author types is not a lin
 ## Security & failure model
 
 - Runs in the **privileged `workflow_run` job**; every PR-derived value is untrusted DATA
-  passed through env / jq args / GraphQL variables. No PR code is checked out or executed.
+  passed through `gh api` argument lists / stdin and GraphQL variables. No PR code is checked
+  out or executed.
 - The PR is resolved from **GitHub-owned** `workflow_run.pull_requests` (same-repo) or the
   commit→PR association (fork), requiring **exactly one open PR**; ambiguous associations are
   refused.
@@ -48,9 +49,8 @@ That is the whole point: a `TEAM-123`-shaped string an author types is not a lin
 ## Running the tests
 
 ```bash
-cd scripts/linear-ticket
-shellcheck -x lib.sh validate.sh tests/test_lib.sh
-bash tests/test_lib.sh
+python3 -m unittest discover -s scripts/linear-ticket/tests -p 'test_*.py' -v
+python3 -m py_compile scripts/linear-ticket/lib.py scripts/linear-ticket/validate.py
 ```
 
 The hermetic suite covers the design's acceptance cases that live in pure functions

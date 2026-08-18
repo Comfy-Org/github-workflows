@@ -185,6 +185,10 @@ jobs:
           ref: ${{ inputs.workflows_ref }}
           path: .linear-ticket-tools
           persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+        with:
+          python-version: '3.12'
       - name: Validate the linked Linear ticket
         env:
           GH_TOKEN: ${{ github.token }}
@@ -195,4 +199,4 @@ jobs:
           REQUIRE_OPEN_ISSUE: ${{ inputs.require-open-issue }}
           ENFORCE: ${{ inputs.enforce }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: bash .linear-ticket-tools/scripts/linear-ticket/validate.sh
+        run: python3 .linear-ticket-tools/scripts/linear-ticket/validate.py

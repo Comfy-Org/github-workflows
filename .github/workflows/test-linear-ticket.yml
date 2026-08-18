@@ -8,7 +8,7 @@
 
 name: Test linear-ticket scripts
 
-# Runs shellcheck + the hermetic lib suite for the linear-ticket gate. The gate decides
+# Runs the hermetic lib.py unittest suite for the linear-ticket gate. The gate decides
 # whether every consuming repo's PRs can merge, so a regression in the policy filter,
 # candidate extraction, or error classification silently passes or blocks PRs — cheap to
 # guard with a unit run on change. The real-Linear behaviours (URL canonicalization,
@@ -34,17 +34,18 @@ permissions:
 
 jobs:
   test:
-    name: shellcheck + suite
+    name: unittest
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: scripts/linear-ticket
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      - name: shellcheck
-        run: shellcheck -x lib.sh validate.sh tests/test_lib.sh
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Compile the validator (syntax gate for validate.py, which the suite does not import)
+        run: python3 -m py_compile scripts/linear-ticket/lib.py scripts/linear-ticket/validate.py
       - name: lib suite
-        run: bash tests/test_lib.sh
+        run: python3 -m unittest discover -s scripts/linear-ticket/tests -p 'test_*.py' -v
