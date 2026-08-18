@@ -1,0 +1,53 @@
+# Pinned dependencies for the .coderabbit.yaml validator.
+#
+# This repo is otherwise stdlib-only, on purpose (see AGENTS.md). Two things
+# make this checker the exception, and neither has a stdlib answer:
+#
+#   * PyYAML — the input is YAML. There is no YAML parser in the standard
+#     library, and hand-rolling one to gate 15 repos' CI would trade a real
+#     parser for a novel source of false failures.
+#   * jsonschema — the point of the check is to reproduce the verdict CodeRabbit
+#     itself reaches against its published Draft 2020-12 schema. A hand-written
+#     subset validator would agree with the real one until it didn't, and the
+#     day it diverged the check would either gate nothing or fail a valid config.
+#
+# So the dependency is accepted and PINNED HARD instead: exact versions with
+# sha256 hashes, installed with `--require-hashes`, which makes pip refuse any
+# artifact whose bytes differ from the ones reviewed here. That matches the rest
+# of the repo's supply-chain posture (SHA-pinned actions, a sha256-pinned Cursor
+# CLI) rather than departing from it.
+#
+# The wheels are the cp312 / manylinux x86_64 ones, matching the `ubuntu-latest`
+# + `python-version: '3.12'` pair every consuming job pins. A runner that is not
+# that pair fails the install LOUDLY, which is the correct direction: a silent
+# fallback to an unhashed artifact is the thing --require-hashes exists to stop.
+#
+# Dependabot watches this file (see .github/dependabot.yml, `pip` ecosystem) and
+# regenerates the hashes on a bump, so the pins do not rot the way an unwatched
+# inline `pip install x==1.2.3` does.
+#
+# Regenerate by hand with:
+#   pip download --only-binary=:all: --platform manylinux2014_x86_64 \
+#     --python-version 3.12 --implementation cp --abi cp312 -d /tmp/wheels \
+#     'jsonschema==<v>' 'PyYAML==<v>' && pip hash /tmp/wheels/*.whl
+
+jsonschema==4.25.1 \
+    --hash=sha256:3fba0169e345c7175110351d456342c364814cfcf3b964ba4587f22915230a63
+PyYAML==6.0.3 \
+    --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc
+
+# Transitive dependencies of jsonschema, pinned for the same reason.
+attrs==26.1.0 \
+    --hash=sha256:c647aa4a12dfbad9333ca4e71fe62ddc36f4e63b2d260a37a8b83d2f043ac309
+jsonschema-specifications==2025.9.1 \
+    --hash=sha256:98802fee3a11ee76ecaca44429fda8a41bff98b00a0f2838151b113f210cc6fe
+referencing==0.37.0 \
+    --hash=sha256:381329a9f99628c9069361716891d34ad94af76e461dcb0335825aecc7692231
+rpds-py==2026.6.3 \
+    --hash=sha256:ecabd69db66de867690f9797f2f8fa27ba501bbc24540cbdbdc649cd15888ba6
+# `referencing` requires this on Python < 3.13, which the pinned 3.12 is. It is
+# easy to leave out — a resolution run on a 3.13+ interpreter drops it from the
+# set — and leaving it out breaks the install only on the runner, so it is listed
+# explicitly rather than trusted to a resolver's environment.
+typing-extensions==4.16.0 \
+    --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8
