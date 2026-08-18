@@ -1,0 +1,170 @@
+name: PR Area Label (reusable)
+
+# Reusable agentic PR area-label classifier. Two responsibilities, one taxonomy that lives
+# in the CONSUMER repo (default .github/area-labels.yml):
+#
+#   sync-labels — keeps the consumer's `area:*` labels standardized. Runs on push to the
+#                 consumer's default branch (the caller filters to the taxonomy path) or a
+#                 manual full-sync, and create-or-updates every label from the YAML with
+#                 `gh label create --force`. Edit the YAML, never the GitHub UI — the UI
+#                 drifts, this heals. Needs no secret.
+#
+#   label-pr    — classifies each PR into exactly one `area:*` label. An LLM does the
+#                 classification, but it is given NO tools and NO token: PR metadata is
+#                 passed to the Anthropic Messages API as data inside <pr_data> tags, the
+#                 reply is constrained by a JSON-schema enum to the taxonomy's own names, and
+#                 a deterministic step applies the result with targeted `area:*` add/remove
+#                 ops (never a full-set PUT). So untrusted PR text can never steer a
+#                 privileged tool call — the worst a malicious PR earns itself is a (valid)
+#                 area label. The taxonomy is read from the PR's BASE ref, never its head, so
+#                 a PR cannot rewrite the rules that classify it.
+#
+# The classifier logic and scripts load from THIS repo at the pinned `workflows_ref` — never
+# from the classified PR's checkout (no PR code is checked out at all). See scripts/area-label/.
+#
+# WHY A REUSABLE. This design was first shipped in Comfy-Org/comfy-infra#815 as a repo-local
+# workflow; it moved here so cloud, comfy-infra, and any other repo share ONE hardened
+# implementation and keep only a thin caller + their own taxonomy (the risk-grader pattern).
+# Per-repo framing (the domain-vs-path judgement calls) lives in the taxonomy's optional
+# top-level `repo_context:` key, so nothing repo-specific is baked into this file.
+#
+# PERMISSIONS the caller must grant (union of both jobs — GitHub validates every nested job's
+# declared permissions against the caller at STARTUP, before any `if:` runs):
+#   contents: read          # sync reads the taxonomy from the checkout; label-pr reads none
+#   issues: write           # sync-labels: labels are an issues API surface
+#   pull-requests: write    # label-pr: apply the label
+# A short grant fails the whole run with an opaque "workflow file issue" and zero jobs.
+#
+# SECRET: ANTHROPIC_API_KEY (optional). label-pr needs it; if unset it fails soft (warns,
+# touches nothing). sync-labels needs no secret. Comfy-Org provides it org-wide.
+
+on:
+  workflow_call:
+    inputs:
+      workflows_ref:
+        description: >-
+          Full 40-hex commit SHA of THIS repo to load the classifier scripts from. Pin to
+          the SAME SHA as the caller's `uses:` — a floating ref would run new scripts under an
+          old workflow. Required; validated to be a full lowercase SHA before checkout.
+        type: string
+        required: true
+      taxonomy_path:
+        description: Path of the consumer repo's area-label taxonomy YAML.
+        type: string
+        required: false
+        default: .github/area-labels.yml
+      model:
+        description: Anthropic model id for classification.
+        type: string
+        required: false
+        default: claude-opus-4-8
+      pr_number:
+        description: >-
+          For a manual dispatch, the PR to (re)classify. Leave empty on a push/pull_request
+          run. A dispatch WITH a number classifies; WITHOUT one runs a full label sync.
+        type: string
+        required: false
+        default: ''
+      dry_run:
+        description: Classify and log the decision without applying the label.
+        type: boolean
+        required: false
+        default: false
+    secrets:
+      ANTHROPIC_API_KEY:
+        description: Anthropic API key for the classifier. Omit to run sync-only; label-pr fails soft.
+        required: false
+
+permissions: {}
+
+concurrency:
+  # One classification per PR; newer commits cancel the in-flight run.
+  group: pr-area-label-${{ github.event.pull_request.number || inputs.pr_number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sync-labels:
+    # Sync on push to the consumer's default branch (the caller filters to the taxonomy
+    # path), or a manual dispatch with no PR number.
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && inputs.pr_number == '' && inputs.dry_run != true)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read        # checkout the taxonomy file
+      issues: write         # labels are an issues API surface
+    steps:
+      - name: Validate workflows_ref is a full commit SHA
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+        run: |
+          set -euo pipefail
+          case "$WORKFLOWS_REF" in
+            *[!0-9a-f]* | "") echo "::error::workflows_ref must be a full 40-hex lowercase commit SHA"; exit 1 ;;
+          esac
+          [ "${#WORKFLOWS_REF}" -eq 40 ] || { echo "::error::workflows_ref must be a full 40-char SHA"; exit 1; }
+      - name: Checkout consumer repo (taxonomy)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Checkout classifier scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: .area-label-tools
+          persist-credentials: false
+      - name: Standardize area:* labels from taxonomy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAXONOMY_FILE: ${{ inputs.taxonomy_path }}
+        run: bash .area-label-tools/scripts/area-label/sync-labels.sh
+
+  label-pr:
+    # Only classify trusted PRs. Fork PRs run without a writable token and without the
+    # ANTHROPIC secret; Dependabot PRs run without Actions secrets — both would fail rather
+    # than label, so skip them here. workflow_dispatch with a PR number is the writable
+    # manual fallback. Guarding inside the reusable keeps the caller a bare `uses:`.
+    if: >-
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.user.login != 'dependabot[bot]' &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'workflow_dispatch' && inputs.pr_number != '')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read          # scripts checkout only; PR code is never checked out
+      pull-requests: write    # apply the label
+    steps:
+      - name: Validate workflows_ref is a full commit SHA
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+        run: |
+          set -euo pipefail
+          case "$WORKFLOWS_REF" in
+            *[!0-9a-f]* | "") echo "::error::workflows_ref must be a full 40-hex lowercase commit SHA"; exit 1 ;;
+          esac
+          [ "${#WORKFLOWS_REF}" -eq 40 ] || { echo "::error::workflows_ref must be a full 40-char SHA"; exit 1; }
+      - name: Checkout classifier scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: .area-label-tools
+          persist-credentials: false
+      - name: Classify and apply the area label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          # Trust the taxonomy from the base branch, never the PR's own copy. For a manual
+          # dispatch there is no PR base, so read it from the ref the run is on.
+          BASE_REF: ${{ github.event.pull_request.base.sha || github.sha }}
+          TAXONOMY_PATH: ${{ inputs.taxonomy_path }}
+          MODEL: ${{ inputs.model }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: bash .area-label-tools/scripts/area-label/classify-and-apply.sh
