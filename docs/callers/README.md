@@ -17,6 +17,7 @@ per-workflow pages give you a complete, copy-pasteable caller:
 | `assign-prs-to-author.yml` | [assign-prs-to-author.md](assign-prs-to-author.md) | nothing |
 | `stale.yml` | [stale.md](stale.md) | `SLACK_BOT_TOKEN` (optional) |
 | `detect-unreviewed-merge.yml` | [detect-unreviewed-merge.md](detect-unreviewed-merge.md) | `UNREVIEWED_MERGES_TOKEN` |
+| `linear-ticket.yml` | [linear-ticket.md](linear-ticket.md) | `LINEAR_API_TOKEN` + a two-workflow caller |
 
 Everything below applies to all of them. Read it once.
 
