@@ -10,7 +10,8 @@ LIB="$SELF_DIR/../lib.sh"
 [ -f "$LIB" ] || { echo "FATAL: $LIB not found" >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "FATAL: jq not found on PATH" >&2; exit 2; }
 command -v yq >/dev/null 2>&1 || { echo "FATAL: yq not found on PATH" >&2; exit 2; }
-# shellcheck source=/dev/null
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib.sh
 . "$LIB"
 
 SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/area-label-test.XXXXXX")"

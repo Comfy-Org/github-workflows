@@ -23,7 +23,8 @@
 set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=/dev/null
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=lib.sh
 . "$SELF_DIR/lib.sh"
 
 : "${GH_REPO:?GH_REPO is required}"
@@ -61,11 +62,14 @@ if ! validate_vocab "$VOCAB"; then
 fi
 
 # 2. PR context as DATA (title/body/paths/labels). Body truncated; the diff is deliberately
-#    excluded (large, untrusted, unnecessary here).
-gh pr view "$PR_NUMBER" --repo "$GH_REPO" \
-  --json title,body,files,labels \
-  -q '{title: .title, body: (.body // "" | .[0:4000]), files: [.files[].path], labels: [.labels[].name]}' \
-  > pr.json
+#    excluded (large, untrusted, unnecessary here). A transient gh/API failure fails soft.
+if ! gh pr view "$PR_NUMBER" --repo "$GH_REPO" \
+     --json title,body,files,labels \
+     -q '{title: .title, body: (.body // "" | .[0:4000]), files: [.files[].path], labels: [.labels[].name]}' \
+     > pr.json 2>/dev/null; then
+  echo "::warning::could not read PR #${PR_NUMBER} metadata; skipping classification"
+  exit 0
+fi
 
 # 3. Ask the model for exactly one label. No tools, no token; output enum-constrained to the
 #    vocabulary, so an injection in the PR text cannot produce anything but a valid label.
@@ -105,33 +109,46 @@ fi
 #    workflow's concurrency group serializes only itself, not GitHub UI edits or other label
 #    writers). Add the selected label FIRST (additive POST) so a failure here or in any later
 #    delete can never leave the PR without an area label.
-CURRENT_AREA=$(gh pr view "$PR_NUMBER" --repo "$GH_REPO" --json labels \
-  -q '[.labels[].name | select(startswith("area:"))]')
+if ! CURRENT_AREA=$(gh pr view "$PR_NUMBER" --repo "$GH_REPO" --json labels \
+     -q '[.labels[].name | select(startswith("area:"))]' 2>/dev/null); then
+  echo "::warning::could not read current labels on PR #${PR_NUMBER}; skipping label apply"
+  exit 0
+fi
 if echo "$CURRENT_AREA" | jq -e --arg a "$AREA" '. == [$a]' >/dev/null; then
   echo "already labeled $AREA — nothing to do"
   exit 0
 fi
 
-jq -n --arg a "$AREA" '{labels: [$a]}' \
-  | gh api --method POST "repos/${GH_REPO}/issues/${PR_NUMBER}/labels" --input - >/dev/null
+# Add the selected label FIRST (additive POST — preserves non-area labels). A transient
+# failure here means nothing was applied, so fail soft: the next run re-classifies.
+if ! jq -n --arg a "$AREA" '{labels: [$a]}' \
+     | gh api --method POST "repos/${GH_REPO}/issues/${PR_NUMBER}/labels" --input - >/dev/null 2>&1; then
+  echo "::warning::could not add label ${AREA} to PR #${PR_NUMBER}; leaving labels unchanged"
+  exit 0
+fi
 
 # Then remove every OTHER area:* label. Re-read a FRESH snapshot after the POST so a label
-# added concurrently between the no-op check and now is also cleaned up. URL-encode the name
-# for the path. Tolerate only 404 (already gone); surface any other error rather than
-# silently leaving a stale second area label.
-gh pr view "$PR_NUMBER" --repo "$GH_REPO" --json labels \
-  -q '[.labels[].name | select(startswith("area:"))]' \
-  | jq -r --arg a "$AREA" '.[] | select(. != $a)' \
-  | while IFS= read -r stale; do
-      [ -n "$stale" ] || continue
-      enc=$(jq -rn --arg s "$stale" '$s | @uri')
-      if ! err=$(gh api --method DELETE "repos/${GH_REPO}/issues/${PR_NUMBER}/labels/${enc}" 2>&1); then
-        if printf '%s' "$err" | grep -q "HTTP 404"; then
-          printf 'stale label %q already gone\n' "$stale"
-        else
-          printf '::error::failed to remove stale label %q: %q\n' "$stale" "$err"
-          exit 1
-        fi
-      fi
-    done
+# added concurrently between the no-op check and now is also cleaned up. The correct label is
+# already applied (add-first), so a cleanup hiccup can only leave a STALE EXTRA area label — a
+# cosmetic state the next run reconciles — never an UNLABELED PR. So a non-404 delete error
+# WARNS about the partial state rather than reding this advisory check. Read via a here-string
+# (not a pipe) so the loop runs in THIS shell — a piped `while` is a subshell whose failures
+# `set -e`/`pipefail` would surface as a red check. URL-encode the name for the path.
+stale_area=$(gh pr view "$PR_NUMBER" --repo "$GH_REPO" --json labels \
+  -q '[.labels[].name | select(startswith("area:"))]' 2>/dev/null \
+  | jq -r --arg a "$AREA" '.[] | select(. != $a)' || true)
+while IFS= read -r stale; do
+  [ -n "$stale" ] || continue
+  enc=$(jq -rn --arg s "$stale" '$s | @uri')
+  if err=$(gh api --method DELETE "repos/${GH_REPO}/issues/${PR_NUMBER}/labels/${enc}" 2>&1); then
+    continue
+  fi
+  if printf '%s' "$err" | grep -q "HTTP 404"; then
+    printf 'stale label %q already gone\n' "$stale"
+  else
+    # stale/err are untrusted (label name / API output); escape with %q so neither can forge
+    # ::...:: workflow commands in the log. Partial state: AREA is applied, this stale remains.
+    printf '::warning::set %q but could not remove stale label %q (%q); the next run reconciles\n' "$AREA" "$stale" "$err"
+  fi
+done <<< "$stale_area"
 printf 'set %s — %q\n' "$AREA" "$REASON"

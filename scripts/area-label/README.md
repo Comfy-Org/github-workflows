@@ -23,7 +23,7 @@ consumer repo runs the reusable workflow via a thin caller and keeps only its ow
   trusted to drive a label write.
 - The label is applied with **targeted `area:*` add/remove ops**, never a full-set PUT, so
   concurrent non-area label edits are preserved.
-- Everything **fails soft** (skip-with-warning) rather than reding the PR check.
+- Everything **fails soft** (skip-with-warning) rather than failing the PR check.
 
 ## Taxonomy shape
 

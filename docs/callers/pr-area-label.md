@@ -36,7 +36,8 @@ name: PR Area Label
 
 on:
   push:
-    branches: [main]
+    branches: [main]                     # replace `main` if your default branch differs —
+                                         # otherwise the label sync never runs
     paths: ['.github/area-labels.yml']   # sync labels when the taxonomy changes
   pull_request:
     types: [opened, synchronize, ready_for_review, reopened]
