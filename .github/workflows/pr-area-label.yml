@@ -95,15 +95,26 @@ jobs:
       contents: read        # checkout the taxonomy file
       issues: write         # labels are an issues API surface
     steps:
-      - name: Validate workflows_ref is a full commit SHA
+      - name: Require a pinned workflows_ref
+        # GitHub does NOT enforce `required: true` for workflow_call inputs, so an
+        # omitted input arrives as '' and actions/checkout would silently fall back
+        # to this repo's default branch — running MUTABLE scripts under a pin that
+        # claims otherwise. Fail fast, and require the FULL SHA. (BE-5546)
         env:
           WORKFLOWS_REF: ${{ inputs.workflows_ref }}
         run: |
-          set -euo pipefail
-          case "$WORKFLOWS_REF" in
-            *[!0-9a-f]* | "") echo "::error::workflows_ref must be a full 40-hex lowercase commit SHA"; exit 1 ;;
-          esac
-          [ "${#WORKFLOWS_REF}" -eq 40 ] || { echo "::error::workflows_ref must be a full 40-char SHA"; exit 1; }
+          # actions/checkout trims `ref`, so strip whitespace before the -z test
+          # (and echo only the stripped form so a multi-line value can't smuggle a
+          # ::workflow command:: into the log).
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see the caller doc)"
+            exit 1
+          fi
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::workflows_ref '$REF' must be a full 40-hex lowercase commit SHA — branch and tag refs are mutable"
+            exit 1
+          fi
       - name: Checkout consumer repo (taxonomy)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -139,15 +150,26 @@ jobs:
       contents: read          # scripts checkout only; PR code is never checked out
       pull-requests: write    # apply the label
     steps:
-      - name: Validate workflows_ref is a full commit SHA
+      - name: Require a pinned workflows_ref
+        # GitHub does NOT enforce `required: true` for workflow_call inputs, so an
+        # omitted input arrives as '' and actions/checkout would silently fall back
+        # to this repo's default branch — running MUTABLE scripts under a pin that
+        # claims otherwise. Fail fast, and require the FULL SHA. (BE-5546)
         env:
           WORKFLOWS_REF: ${{ inputs.workflows_ref }}
         run: |
-          set -euo pipefail
-          case "$WORKFLOWS_REF" in
-            *[!0-9a-f]* | "") echo "::error::workflows_ref must be a full 40-hex lowercase commit SHA"; exit 1 ;;
-          esac
-          [ "${#WORKFLOWS_REF}" -eq 40 ] || { echo "::error::workflows_ref must be a full 40-char SHA"; exit 1; }
+          # actions/checkout trims `ref`, so strip whitespace before the -z test
+          # (and echo only the stripped form so a multi-line value can't smuggle a
+          # ::workflow command:: into the log).
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see the caller doc)"
+            exit 1
+          fi
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::error::workflows_ref '$REF' must be a full 40-hex lowercase commit SHA — branch and tag refs are mutable"
+            exit 1
+          fi
       - name: Checkout classifier scripts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
