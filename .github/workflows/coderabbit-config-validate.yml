@@ -1,0 +1,191 @@
+name: CodeRabbit config validate (reusable)
+
+# Reusable workflow that validates the caller repo's `.coderabbit.yaml` against
+# CodeRabbit's published config schema, so a broken config fails on the PR that
+# breaks it.
+#
+# Why this needs a machine check. CodeRabbit rejects an invalid `.coderabbit.yaml`
+# WHOLE: the entire file is discarded and the review runs on org-wide UI defaults
+# instead, so every reviewer instruction, path filter, path instruction and
+# WIP-skip rule in it goes silently inert. Nothing about the PR looks different —
+# the file still reads fine, only the validator sees the loss.
+#
+# And the feedback is displaced by one PR: CodeRabbit validates the config on the
+# BASE branch, not the PR head. The PR that breaks the file goes green, and the
+# breakage first surfaces on the NEXT PR, attributed to a change that did not
+# cause it. So the human loop here is not merely slow — it points at the wrong
+# diff. (Two independent tickets fixed the same over-long `tone_instructions`
+# field on the same repo within six days, which is the signature of a failure
+# nothing detects.)
+#
+# It runs in the CALLER's context, so `actions/checkout` checks out the calling
+# repo and the check operates on that repo's `.coderabbit.yaml`. The checker
+# itself is loaded from THIS repo (public, pinned via `workflows_ref`) — never
+# from the caller's checkout — so a PR cannot rewrite the check that judges it.
+#
+# SEVERITY IS SPLIT, and the split mirrors what CodeRabbit itself does:
+#   * YAML parse error / `maxLength` violation / type or enum error -> FAILS.
+#     These are what CodeRabbit rejects the whole file for.
+#   * unknown / additional property -> WARNS by default. CodeRabbit STRIPS a key
+#     it does not recognize rather than rejecting the file, so the config still
+#     loads while everything under that key silently does nothing. That is a real
+#     defect — a `tools:` block written at the document root instead of under
+#     `reviews:` inverts every setting in it, because the schema defaults are the
+#     opposite of what was written — but it is not file-rejecting, and failing on
+#     it would put several org repos red on day one. `strict_unknown_keys: true`
+#     escalates it for a repo that has cleaned up and wants to stay clean.
+#
+# There is deliberately NO `paths:` filter in the caller pattern below. A
+# path-filtered check reports "skipped" rather than "success" on unrelated PRs,
+# which makes it useless as a required status check.
+#
+# The schema is VENDORED (committed at .github/coderabbit-config/schema.v2.json)
+# and never fetched at validation time: a live fetch would make every consumer's
+# CI depend on a third-party endpoint, and an upstream tightening would turn CI
+# red across the fleet with no change on our side. `refresh-coderabbit-schema.yml`
+# in this repo watches upstream for drift and proposes the bump as a reviewable
+# PR instead.
+#
+# Caller pattern (place in the consumer repo at
+# .github/workflows/coderabbit-config-validate.yml):
+#
+#   name: CodeRabbit config
+#   on:
+#     pull_request:
+#     push:
+#       branches: [main]
+#   jobs:
+#     coderabbit-config:
+#       permissions:
+#         contents: read
+#       uses: Comfy-Org/github-workflows/.github/workflows/coderabbit-config-validate.yml@<sha>  # v1
+#       with:
+#         workflows_ref: <same-sha>   # pin the checker to the same ref as `uses:`
+#
+# INPUTS:
+#   workflows_ref        REQUIRED. Ref of Comfy-Org/github-workflows to load the
+#                        checker from. Pin to the SAME commit SHA as `uses:`.
+#   config_file          Path to the config to validate, relative to the repo
+#                        root. Default `.coderabbit.yaml`. (A repo using the
+#                        `.coderabbit.yml` spelling points this at it.)
+#   strict_unknown_keys  Escalate an unknown/additional property from a warning
+#                        to a failure. Default false.
+#
+# No secrets required.
+
+on:
+  workflow_call:
+    inputs:
+      config_file:
+        description: >-
+          Path to the CodeRabbit config to validate, relative to the repo root.
+          Default `.coderabbit.yaml`. A repo with no such file passes.
+        type: string
+        required: false
+        default: .coderabbit.yaml
+      strict_unknown_keys:
+        description: >-
+          Fail on an unknown/additional property instead of warning. Default
+          false — CodeRabbit strips unknown keys rather than rejecting the file,
+          so this is opt-in for a repo that has already cleaned up.
+        type: boolean
+        required: false
+        default: false
+      workflows_ref:
+        description: >-
+          REQUIRED. Ref of Comfy-Org/github-workflows to load the checker and the
+          vendored schema from. Must be the SAME commit SHA you pin `uses:` to —
+          otherwise the workflow is pinned but the code it runs is not. There is
+          deliberately no default: a floating `main` default would silently load
+          a mutable checker.
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: CodeRabbit config validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # A YAML parse plus a schema walk over a file measured in kilobytes. Anything
+    # approaching this bound is a hung network call in `pip install`, not work.
+    timeout-minutes: 10
+    steps:
+      - name: Checkout caller repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Require a pinned workflows_ref
+        # workflows_ref has no default on purpose. GitHub does NOT enforce
+        # `required: true` for workflow_call inputs, so an omitted input arrives
+        # as '' and actions/checkout would silently fall back to this repo's
+        # default branch — running MUTABLE scripts under a pin that claims
+        # otherwise. Fail fast instead. (BE-5546)
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+        run: |
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form, and echo only that: dropping
+          # newlines also stops a multi-line value from smuggling a ::workflow
+          # command:: into the log, and from satisfying the line-oriented grep
+          # below on one 40-hex line among many.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
+            exit 1
+          fi
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
+          fi
+
+      - name: Load the checker and the vendored schema
+        # Both come from THIS repo at the pinned ref, never from the caller's
+        # checkout, so a PR can't rewrite the check — nor swap the schema it is
+        # graded against, which would be the quieter version of the same bypass.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _coderabbit_config
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install the pinned validator dependencies
+        # `--require-hashes` makes pip refuse any artifact whose bytes differ from
+        # the ones reviewed in requirements.txt. The wheels pinned there are the
+        # cp312 / manylinux x86_64 set matching the runner + interpreter above; a
+        # mismatch fails LOUDLY rather than silently falling back to an unhashed
+        # artifact, which is the point of the flag.
+        #
+        # This is the one place this otherwise stdlib-only repo takes a Python
+        # dependency, and both halves are unavoidable: there is no YAML parser in
+        # the standard library, and the whole value of the check is reproducing
+        # the verdict CodeRabbit's own Draft 2020-12 validator reaches. See the
+        # header of requirements.txt.
+        run: |
+          python3 -m pip install --disable-pip-version-check --no-input \
+            --require-hashes --only-binary=:all: \
+            -r "$GITHUB_WORKSPACE/_coderabbit_config/.github/coderabbit-config/requirements.txt"
+
+      - name: Validate .coderabbit.yaml
+        env:
+          CODERABBIT_CHECK_ROOT: ${{ github.workspace }}
+          CODERABBIT_CONFIG_FILE: ${{ inputs.config_file }}
+          STRICT_UNKNOWN_KEYS: ${{ inputs.strict_unknown_keys }}
+        run: |
+          # --root is the caller's checkout (the workspace root); the checker and
+          # the vendored schema beside it come from _coderabbit_config/, i.e. the
+          # pinned ref. Keep those two sources distinct — resolving the schema
+          # relative to --root is exactly how a PR would grade itself.
+          python3 "$GITHUB_WORKSPACE/_coderabbit_config/.github/coderabbit-config/check_coderabbit_config.py" \
+            --root "$CODERABBIT_CHECK_ROOT" \
+            --config "$CODERABBIT_CONFIG_FILE"

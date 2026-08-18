@@ -1,0 +1,105 @@
+# `coderabbit-config-validate.yml` — fail a PR that breaks `.coderabbit.yaml`
+
+Read [the shared caller contract](README.md) first.
+
+## What it does
+
+Validates your repo's `.coderabbit.yaml` against CodeRabbit's published config
+schema, on the PR that changes it.
+
+**Why that is worth a CI job.** CodeRabbit rejects an invalid `.coderabbit.yaml`
+**whole** — it discards the entire file and reviews with org-wide UI defaults
+instead. Every reviewer instruction, path filter, path instruction and WIP-skip
+rule in it goes silently inert. The file still reads fine in review; only the
+validator sees the loss.
+
+And the feedback is displaced by one PR: CodeRabbit validates the config on the
+**base** branch, not the PR head. So the PR that breaks the file goes green, and
+the breakage first surfaces on the *next* PR, attributed to a change that did not
+cause it. The human loop here is not merely slow — it points at the wrong diff.
+
+Severity is split, mirroring what CodeRabbit itself does with each problem:
+
+| Problem | Result | Why |
+|---|---|---|
+| YAML parse error | **fails** | CodeRabbit can't read the file at all. |
+| `maxLength` violation | **fails** | File-rejecting. The schema has 14 per-field caps, from 50 to 20,000 chars. |
+| Type / enum error | **fails** | File-rejecting. |
+| Unknown / additional property | **warns** | CodeRabbit *strips* an unrecognized key rather than rejecting the file — so the config loads, but everything under that key silently does nothing. Set `strict_unknown_keys: true` to fail instead. |
+| No `.coderabbit.yaml` at all | **passes** | Reported in the log, so "no config here" never reads the same as "config validated clean". |
+
+The warning class is not cosmetic. The most common instance is a `tools:` block
+written at the document root instead of under `reviews:`; the root is closed, so
+the whole block is stripped and every setting in it reverts to the schema default
+— which is often the *opposite* of what was written (`golangci-lint.enabled`
+defaults to `true`, so a root-level `enabled: false` runs the linter it meant to
+disable). The annotation names the offending key path and suggests where it
+belongs.
+
+The checker and the schema it validates against live in
+[`.github/coderabbit-config/`](../../.github/coderabbit-config) and are loaded
+from **this** repo at your pinned `workflows_ref` — never from your checkout — so
+a PR cannot rewrite the check that judges it, nor swap the schema it is graded
+against.
+
+## Prerequisites
+
+None. No secrets.
+
+## Caller
+
+`.github/workflows/coderabbit-config-validate.yml`:
+
+```yaml
+name: CodeRabbit config
+
+on:
+  pull_request:
+  push:
+    branches: [main]        # or [master] — your default branch
+
+jobs:
+  coderabbit-config:
+    permissions:
+      contents: read
+    uses: Comfy-Org/github-workflows/.github/workflows/coderabbit-config-validate.yml@<full-commit-sha>
+    with:
+      workflows_ref: <same-full-commit-sha>
+```
+
+Then ask a maintainer to add your repo to the `CODERABBIT_CONFIG_CALLERS` roster
+secret. Skipping that second step is the most repeated enrollment mistake: the pin
+never moves, and the caller quietly drifts behind the reusable.
+
+## Required permissions
+
+```yaml
+contents: read
+```
+
+## Inputs
+
+| Input | Default | Notes |
+|---|---|---|
+| `config_file` | `.coderabbit.yaml` | Point this at `.coderabbit.yml` if that's your spelling. Must resolve inside the repo root. |
+| `strict_unknown_keys` | `false` | Fail on an unknown/additional property instead of warning. Opt in once your config is clean, to keep it that way. |
+| `workflows_ref` | *(required)* | **Set to your `uses:` SHA** — the checker and the vendored schema load from this ref. |
+
+## Gotchas
+
+**Do not add a `paths:` filter.** It is tempting — the check only concerns one
+file — but a path-filtered check reports **skipped**, not **success**, on every
+unrelated PR, which makes it useless as a required status check. The run is a
+YAML parse and a schema walk over a few kilobytes; it is cheap enough to run
+always.
+
+**Adopt on `pull_request` before making it required.** Three org repos were
+invalid the day this landed. You want that visible on a PR first.
+
+**`strict_unknown_keys: true` is a one-way door for a repo that isn't clean yet.**
+Fix the unknown keys first, then turn it on.
+
+**The schema is vendored, not fetched.** Validation never touches the network, so
+an upstream schema change cannot turn your CI red without a reviewed PR here
+first. `refresh-coderabbit-schema.yml` opens that PR weekly when upstream drifts;
+merging it rolls the caller fleet forward automatically.

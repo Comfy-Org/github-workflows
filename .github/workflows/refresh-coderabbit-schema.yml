@@ -1,0 +1,227 @@
+name: Refresh CodeRabbit schema
+
+# Keep the vendored CodeRabbit config schema from going stale silently.
+#
+# `coderabbit-config-validate.yml` validates against a VENDORED copy of
+# CodeRabbit's schema (.github/coderabbit-config/schema.v2.json) rather than
+# fetching it live: a live fetch would make every consumer's CI depend on a
+# third-party endpoint, and an upstream tightening would turn CI red across the
+# fleet with no change on our side. The cost of vendoring is that the copy rots —
+# nothing moves it, so the check would keep grading configs against an
+# ever-older schema until someone noticed. This job notices instead: weekly it
+# fetches the published schema, compares it SEMANTICALLY with the vendored copy,
+# and when they differ opens a PR moving the vendored file with a summary of what
+# changed. Nothing auto-merges — a human reads the summary, which is the point.
+#
+# Merging that PR touches .github/coderabbit-config/**, which is exactly the path
+# filter bump-coderabbit-config-callers.yml watches, so the SHA-pinned caller
+# fleet rolls forward on its own. No new fleet plumbing here.
+#
+# Modelled on bump-cursor-cli-pin.yml: same main-only job guard, same
+# non-cancelling concurrency around a stable shared branch, same App-token
+# credential pattern (vars.APP_ID + secrets.CLOUD_CODE_BOT_PRIVATE_KEY, already
+# provisioned in this repo).
+#
+# The fetch uses `curl -fsSL`, and the -L is load-bearing: the schema URL
+# 301-redirects, and a bare `curl` writes a small HTML redirect stub instead. That
+# stub is neither JSON nor a schema — `schema_drift.py` refuses it with exit 2
+# rather than reporting "no drift", because a check that silently freezes is worse
+# than one that fails.
+
+on:
+  schedule:
+    # Mondays 15:00 UTC — an hour after bump-cursor-cli-pin so the two weekly
+    # PR-opening jobs don't collide on the same runner minute, and early enough
+    # in the week that a drift PR gets read before the weekend.
+    - cron: '0 15 * * 1'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+# Serialize runs: the refresh lands on a STABLE branch
+# (ci/refresh-coderabbit-schema) that is force-reset each run, so two overlapping
+# runs (a manual dispatch racing the cron) would race that reset and the PR
+# update, and the older run finishing last could leave the PR carrying a stale
+# schema. cancel-in-progress: false lets the running refresh finish; the newest
+# pending run then wins. Same reasoning as the bump fleets (BE-3882).
+concurrency:
+  group: refresh-coderabbit-schema
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    # Guard against a workflow_dispatch run from a non-main ref: this job
+    # force-resets a shared branch and mints an App token, so it must only ever
+    # run from reviewed main. The schedule trigger is already main-only, so this
+    # only skips stray manual runs.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SCHEMA_URL: https://coderabbit.ai/integrations/schema.v2.json
+      VENDORED: .github/coderabbit-config/schema.v2.json
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # `ref: main` resolves at run time, so the refresh is always built on
+          # the LIVE main tip. Without it a re-run of an older run would check out
+          # that run's (now stale) github.sha, and the force-push below would
+          # publish a branch that reverts everything merged since. The `if:` guard
+          # above already restricts this job to main.
+          ref: main
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Fetch the published schema
+        run: |
+          set -euo pipefail
+          # -L is load-bearing: the URL 301-redirects, and without it curl writes
+          # a ~167-byte HTML redirect stub that parses as neither JSON nor a
+          # schema. -f turns an HTTP error into a non-zero exit rather than a body
+          # we would happily vendor. The remaining flags mirror the hardening in
+          # bump-cursor-cli-pin.yml: https only (including across the redirect),
+          # bounded time, bounded size, bounded retries.
+          curl -fsSL \
+            --proto '=https' --proto-redir '=https' \
+            --connect-timeout 10 --max-time 60 \
+            --retry 3 --retry-all-errors --retry-delay 2 --retry-max-time 120 \
+            --max-filesize 8388608 \
+            "$SCHEMA_URL" -o "${RUNNER_TEMP}/schema.v2.json"
+
+      - name: Compare against the vendored copy
+        id: drift
+        run: |
+          set -uo pipefail
+          summary="${RUNNER_TEMP}/drift.md"
+          set +e
+          python3 .github/coderabbit-config/schema_drift.py \
+            --vendored "$VENDORED" \
+            --fetched "${RUNNER_TEMP}/schema.v2.json" \
+            --summary-out "$summary"
+          code=$?
+          set -e
+          case "$code" in
+            0)
+              echo "drifted=false" >> "$GITHUB_OUTPUT"
+              echo "Vendored CodeRabbit schema is current." >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            1)
+              echo "drifted=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              # Exit 2 is "I could not compare" — an unreadable or non-schema
+              # fetch. Fail the run: a comparison we could not perform is not
+              # evidence that nothing changed, and swallowing it here is how a
+              # vendored file freezes forever behind a green weekly run.
+              echo "::error::Could not compare the fetched schema against the vendored copy (schema_drift.py exit ${code})."
+              exit 1
+              ;;
+          esac
+
+      - name: Vendor the new schema and re-run the checker against it
+        if: steps.drift.outputs.drifted == 'true'
+        run: |
+          set -euo pipefail
+          cp "${RUNNER_TEMP}/schema.v2.json" "$VENDORED"
+
+          python3 -m pip install --disable-pip-version-check --no-input \
+            --require-hashes --only-binary=:all: \
+            -r .github/coderabbit-config/requirements.txt
+
+          # The proposed schema has to still work as the thing the fleet is graded
+          # against. The unit suite asserts the facts the checker's messages rest
+          # on (root closed, tone_instructions capped at 250, `tools` living under
+          # `reviews`, the 14-cap set), so a refresh that would quietly redefine
+          # what the check MEANS turns this PR red instead of merging green.
+          python3 -m unittest discover -s .github/coderabbit-config/tests -p 'test_*.py'
+
+          # And a self-check: this repo has no .coderabbit.yaml, so validate the
+          # smoke fixture rather than nothing at all.
+          root="$(mktemp -d)"
+          printf 'language: en-US\nreviews:\n  profile: chill\n' > "$root/.coderabbit.yaml"
+          python3 .github/coderabbit-config/check_coderabbit_config.py --root "$root"
+
+      - name: Generate Cloud Code Bot token
+        id: token
+        if: steps.drift.outputs.drifted == 'true'
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0 — pinned: see dependabot.yml ignore (v2+ breaks cross-repo `owner:` token scoping)
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+          # No `owner:` — this only ever writes to THIS repo, so the default
+          # repo-scoped installation token is both sufficient and narrower.
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Open or update the refresh PR
+        if: steps.drift.outputs.drifted == 'true'
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          BRANCH: ci/refresh-coderabbit-schema
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          # Committer identity is cosmetic — the PR AUTHOR (what reviewers and
+          # filters key off) comes from the App token used below. Same convention
+          # as bump-cursor-cli-pin.yml and groom.yml's auto-builder.
+          git config user.name 'coderabbit-schema refresher'
+          git config user.email 'coderabbit-schema-refresher@users.noreply.github.com'
+          git checkout -B "$BRANCH"
+          git add "$VENDORED"
+          git commit -m "ci(coderabbit-config): refresh the vendored CodeRabbit schema"
+
+          # Force-reset the stable branch so its diff is rebuilt from the current
+          # main tip rather than stacked on a previous week's refresh. The token is
+          # masked in the run log by the create-github-app-token action.
+          git push --force \
+            "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "HEAD:refs/heads/${BRANCH}"
+
+          # Built with printf rather than a heredoc: a heredoc terminator has to
+          # sit at column 0, which would end this YAML block scalar early.
+          body="$(mktemp "${RUNNER_TEMP}/pr-body.XXXXXX")"
+          # SC2016: the single-quoted literals hold Markdown backticks, not
+          # command substitutions — that is exactly why they are single-quoted.
+          # shellcheck disable=SC2016
+          {
+            printf '%s\n\n' 'Upstream'"'"'s CodeRabbit config schema has drifted from the copy vendored here, which is what `coderabbit-config-validate.yml` grades every enrolled repo against.'
+            cat "${RUNNER_TEMP}/drift.md"
+            printf '\n'
+            printf '%s\n\n' '**Before merging**, check the tightened-cap section above if there is one: a lowered `maxLength` retroactively invalidates configs nobody has touched, and merging this makes their next PR red. Landing the cleanup alongside is usually the right order.'
+            printf '%s\n\n' 'The unit suite ran against the proposed schema in [this run]('"$RUN_URL"') — it asserts the facts the checker'"'"'s messages rest on, so a refresh that would silently redefine the check is red rather than green.'
+            printf '%s\n\n' 'Merging this touches `.github/coderabbit-config/**`, which triggers `bump-coderabbit-config-callers.yml` and rolls the SHA-pinned caller fleet forward.'
+            printf '%s\n' '_Opened by the `refresh-coderabbit-schema` workflow._'
+          } > "$body"
+
+          # Reuse the one open PR for this branch if there is one — the force-push
+          # already refreshed its diff, so only the title/body need updating. The
+          # stable head branch guarantees at most one. Exclude cross-repository
+          # PRs: `--head` matches by branch NAME across forks, and this branch name
+          # is predictable, so a fork PR opened on it must not be mistaken for ours
+          # and stamped with the official text.
+          existing=$(gh pr list --repo "${GITHUB_REPOSITORY}" --head "$BRANCH" --state open \
+            --json number,isCrossRepository \
+            --jq 'map(select(.isCrossRepository == false)) | .[0].number // empty')
+
+          title='ci(coderabbit-config): refresh the vendored CodeRabbit schema'
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" --repo "${GITHUB_REPOSITORY}" --title "$title" --body-file "$body"
+            echo "Updated PR #${existing}"
+          else
+            gh pr create --repo "${GITHUB_REPOSITORY}" \
+              --head "$BRANCH" --base main \
+              --title "$title" --body-file "$body"
+          fi
+
+          {
+            echo "Vendored CodeRabbit schema drift proposed:"
+            echo
+            cat "${RUNNER_TEMP}/drift.md"
+          } >> "$GITHUB_STEP_SUMMARY"

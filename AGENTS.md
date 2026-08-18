@@ -10,8 +10,10 @@ themselves plus the scripts that back them.
 
 ## Commands
 
-Python is stdlib-only (no requirements file); CI uses **Python 3.12**. Run from
-the repo root. Each command mirrors a CI job (see `.github/workflows/test-*.yml`):
+Python is stdlib-only, with ONE exception — `.github/coderabbit-config/`, which
+needs a YAML parser and a real JSON Schema validator and pins both in
+`requirements.txt` (exact versions + sha256, installed `--require-hashes`).
+CI uses **Python 3.12**. Run from the repo root. Each command mirrors a CI job (see `.github/workflows/test-*.yml`):
 
 ```bash
 # cursor-review helper-script tests (extract-findings, post-review)
@@ -38,6 +40,10 @@ bash scripts/pr-derisk/tests/test_plan_derisk.sh
 
 # workflow-pins lint (no reusable workflow may default `workflows_ref`) + its tests
 python3 -m unittest discover -s .github/workflow-pins/tests -p 'test_*.py' && python3 .github/workflow-pins/check_workflow_pins.py
+
+# coderabbit-config validator tests (needs the pinned deps below; venv recommended)
+python3 -m pip install --require-hashes --only-binary=:all: -r .github/coderabbit-config/requirements.txt
+python3 -m unittest discover -s .github/coderabbit-config/tests -p 'test_*.py' -v
 
 # AGENTS.md integrity checker against any repo tree
 python3 .github/agents-md-integrity/check_agents_md.py --root .
@@ -79,6 +85,13 @@ tests — run the matching command above for whatever you touched.
   one Dependabot-visible home of the `@anthropic-ai/claude-code` pin, which
   `groom.yml`'s gate reads once and feeds to all three agent jobs. Keep it exact;
   never re-hardcode a version in a `run:` step. Tests in `tests/`.
+- `.github/coderabbit-config/` — `check_coderabbit_config.py` + the VENDORED
+  `schema.v2.json` behind `coderabbit-config-validate.yml`, plus `schema_drift.py`
+  (the comparison behind the weekly `refresh-coderabbit-schema.yml`). The schema is
+  vendored, never fetched at validation time: a live fetch makes every consumer's
+  CI depend on a third party, and an upstream tightening would redden the fleet with
+  no change here. `requirements.txt` is the repo's only Python dependency set — see
+  Commands. Tests in `tests/`.
 - `.github/refresh-reviewers/` — `generate.py`, the engine behind
   `refresh-reviewers.yml`: recomputes a caller's reviewers.yml from git history
   and rewrites just the reviewer lists for a drift PR. Tests in `tests/`.
@@ -127,6 +140,19 @@ tests — run the matching command above for whatever you touched.
   command because `issue_comment` runs from the default branch, the commenter is
   association-gated, and no PR code is checked out.
 - `agents-md-integrity.yml` — enforces the AGENTS.md standard on the caller repo.
+- `coderabbit-config-validate.yml` — validates the caller's `.coderabbit.yaml`
+  against the vendored CodeRabbit schema, on the PR that breaks it. CodeRabbit
+  rejects an invalid config WHOLE (everything in it goes inert) and validates the
+  BASE branch, so the breakage otherwise surfaces one PR late on the wrong diff.
+  Parse/`maxLength`/type errors FAIL; an unknown key WARNS (CodeRabbit strips
+  those) unless `strict_unknown_keys: true`; an absent file passes. A SIBLING of
+  agents-md-integrity, deliberately not an extension of it — that workflow is
+  scoped to agent-instruction files, and folding this in would push a Python
+  dependency and a new failure mode onto every one of its callers.
+- `refresh-coderabbit-schema.yml` — weekly PR moving the vendored
+  `schema.v2.json` when upstream drifts (fetch is `curl -fsSL`; the URL
+  301-redirects and a bare curl writes an HTML stub). Merging it trips the
+  coderabbit-config fleet, which rolls the callers.
 - `assign-reviewers.yml` — expertise-aware, load-balanced reviewer requests.
 - `refresh-reviewers.yml` — scheduled drift-detector: recomputes the caller's
   reviewers.yml from git history and opens one idempotent drift PR (never a
@@ -140,7 +166,8 @@ tests — run the matching command above for whatever you touched.
   `bump-agents-md-callers.yml` / `bump-pr-size-callers.yml` /
   `bump-pr-risk-callers.yml` / `bump-pr-derisk-callers.yml` /
   `bump-assign-reviewers-callers.yml` /
-  `bump-groom-callers.yml` / `bump-detect-unreviewed-merge-callers.yml` — thin
+  `bump-groom-callers.yml` / `bump-detect-unreviewed-merge-callers.yml` /
+  `bump-coderabbit-config-callers.yml` — thin
   entrypoints over `bump-callers.sh` that fan SHA bumps out to consumers. A
   groom, pr-risk or pr-derisk caller pins TWICE (`uses:` + `workflows_ref:`); the shared rewrite
   moves both, so never hand-bump one alone. `stale.yml` and
@@ -162,7 +189,7 @@ tests — run the matching command above for whatever you touched.
   repo **secrets** — one per fleet (`CURSOR_REVIEW_CALLERS`,
   `AUTO_LABEL_CALLERS`, `AGENTS_MD_CALLERS`, `PR_SIZE_CALLERS`,
   `PR_RISK_CALLERS` (SHARED by the pr-risk + pr-derisk fleets via `FILE_FILTER` — one entry per caller file, never a second roster), `ASSIGN_REVIEWERS_CALLERS`, `GROOM_CALLERS`,
-  `DETECT_UNREVIEWED_MERGE_CALLERS`; the bump-callers README table is canonical)
+  `DETECT_UNREVIEWED_MERGE_CALLERS`, `CODERABBIT_CONFIG_CALLERS`; the bump-callers README table is canonical)
   — never hardcoded in a workflow file or printed to run logs (logs are public).
   Secrets, not variables (BE-6472): a variable passed via a step's `env:` prints
   unmasked in the env dump Actions emits *before* the step, so the bumper's own

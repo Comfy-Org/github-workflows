@@ -141,6 +141,32 @@ updates:
       default-days: 7
       semver-major-days: 14
 
+  # The PyYAML + jsonschema pins the .coderabbit.yaml validator installs
+  # (BE-7757). This is the repo's only Python dependency set, and it is
+  # hash-pinned with `--require-hashes` — which is exactly why it needs watching:
+  # a hash pin cannot float, so without Dependabot a security fix in either
+  # package never arrives and nothing fails to say so. Dependabot regenerates the
+  # hashes on a bump, so the file stays installable.
+  - package-ecosystem: "pip"
+    directory: "/.github/coderabbit-config"
+    schedule:
+      interval: "monthly"
+    labels: ["dependencies"]
+    # Keep the requirement EXACT. `widen` would turn the pin into a range, which
+    # `--require-hashes` rejects outright at install time — the job would go red
+    # in every enrolled repo rather than degrade quietly, but red-everywhere is
+    # still not a state to schedule for yourself.
+    versioning-strategy: "increase"
+    open-pull-requests-limit: 5
+    cooldown:
+      # These run inside every consumer repo's CI, so let a release age before
+      # adopting it. Majors get longer: a jsonschema major can change validator
+      # semantics, which would silently change what this check MEANS — the unit
+      # suite asserts the verdicts, so such a bump should be read, not rubber-
+      # stamped.
+      default-days: 7
+      semver-major-days: 14
+
   # Dependency-free today, but declared so the day a module is added it is
   # watched rather than silently rotting — the same failure mode this file
   # exists to fix.

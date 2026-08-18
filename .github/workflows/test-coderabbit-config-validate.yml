@@ -1,0 +1,154 @@
+name: Test coderabbit-config-validate script
+
+# Runs the unit tests for the .coderabbit.yaml validator plus CLI smoke tests
+# that exercise each severity path end-to-end. The checker gates every consumer
+# repo's CI, so a regression here silently breaks their required status check —
+# and, worse for this particular check, a regression that makes it pass
+# everything is invisible: a validator that never fails looks exactly like a
+# fleet with no broken configs. Hence the smoke tests assert the FAILING
+# directions too, not just that a good config passes.
+
+on:
+  pull_request:
+    paths:
+      - '.github/coderabbit-config/**'
+      - '.github/workflows/test-coderabbit-config-validate.yml'
+      - '.github/workflows/coderabbit-config-validate.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/coderabbit-config/**'
+      - '.github/workflows/test-coderabbit-config-validate.yml'
+      - '.github/workflows/coderabbit-config-validate.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-coderabbit-config-validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: unittest + smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CHECK: .github/coderabbit-config/check_coderabbit_config.py
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install the pinned validator dependencies
+        # The same `--require-hashes` install the reusable workflow performs, so
+        # a requirements.txt whose hashes or transitive set are wrong fails HERE,
+        # on the PR that broke it, rather than in every consumer's CI after merge.
+        run: |
+          python3 -m pip install --disable-pip-version-check --no-input \
+            --require-hashes --only-binary=:all: \
+            -r .github/coderabbit-config/requirements.txt
+
+      - name: Run coderabbit-config unit tests
+        run: python3 -m unittest discover -s .github/coderabbit-config/tests -p 'test_*.py' -v
+
+      - name: Smoke test — a valid config passes
+        run: |
+          root="$(mktemp -d)"
+          cat > "$root/.coderabbit.yaml" <<'YAML'
+          language: en-US
+          tone_instructions: Be concise and concrete.
+          reviews:
+            profile: chill
+            tools:
+              golangci-lint:
+                enabled: false
+          YAML
+          python3 "$CHECK" --root "$root"
+
+      - name: Smoke test — an absent config passes and says so
+        run: |
+          root="$(mktemp -d)"
+          out="$(python3 "$CHECK" --root "$root")"
+          echo "$out"
+          # The log line is the contract: "no config here" must never read the
+          # same as "config validated clean".
+          echo "$out" | grep -q 'nothing to validate'
+          echo "$out" | grep -q 'absent'
+
+      - name: Smoke test — an over-long tone_instructions fails
+        run: |
+          root="$(mktemp -d)"
+          python3 -c "open('$root/.coderabbit.yaml','w').write('tone_instructions: ' + 'x'*300 + chr(10))"
+          if out="$(python3 "$CHECK" --root "$root")"; then
+            echo "::error::checker passed an over-long tone_instructions — expected a non-zero exit"
+            echo "$out"
+            exit 1
+          fi
+          echo "$out"
+          # Actual vs permitted length, both named — that is what makes the
+          # annotation actionable without opening the schema.
+          echo "$out" | grep -q '300 characters'
+          echo "$out" | grep -q '250'
+
+      - name: Smoke test — a misplaced top-level `tools` block warns, then fails under strict
+        run: |
+          root="$(mktemp -d)"
+          cat > "$root/.coderabbit.yaml" <<'YAML'
+          reviews:
+            profile: chill
+          tools:
+            # Project uses go vet + staticcheck, not golangci-lint
+            golangci-lint:
+              enabled: false
+          YAML
+          out="$(python3 "$CHECK" --root "$root")"   # must NOT fail by default
+          echo "$out"
+          echo "$out" | grep -q '::warning '
+          echo "$out" | grep -q 'unknown key `tools`'
+          echo "$out" | grep -q 'reviews.tools'
+
+          if out="$(python3 "$CHECK" --root "$root" --strict-unknown-keys)"; then
+            echo "::error::strict_unknown_keys did not fail a misplaced top-level tools block"
+            echo "$out"
+            exit 1
+          fi
+          echo "$out"
+          echo "$out" | grep -q '::error '
+
+      - name: Smoke test — malformed YAML fails
+        run: |
+          root="$(mktemp -d)"
+          printf 'reviews:\n  profile: chill\n   path_filters:\n  - "x"\n' > "$root/.coderabbit.yaml"
+          if out="$(python3 "$CHECK" --root "$root")"; then
+            echo "::error::checker passed a malformed YAML file — expected a non-zero exit"
+            echo "$out"
+            exit 1
+          fi
+          echo "$out"
+          echo "$out" | grep -q 'not valid YAML'
+
+      - name: Smoke test — an unusable schema exits 2, not 0
+        run: |
+          # The redirect-stub case: the schema URL 301-redirects and a `curl`
+          # without -L writes a 167-byte HTML stub. "I could not run the check"
+          # must never exit like "the config is fine".
+          root="$(mktemp -d)"
+          stub="$(mktemp)"
+          printf '<html><a href="/x">Moved</a></html>' > "$stub"
+          printf 'language: en-US\n' > "$root/.coderabbit.yaml"
+          set +e
+          python3 "$CHECK" --root "$root" --schema "$stub"
+          code=$?
+          set -e
+          if [ "$code" != "2" ]; then
+            echo "::error::expected exit 2 for an unusable schema, got ${code}"
+            exit 1
+          fi
+          echo "checker correctly refused to validate against a non-schema"
