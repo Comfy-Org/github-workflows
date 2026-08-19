@@ -1,0 +1,213 @@
+name: Linear Ticket (reusable)
+
+# Reusable gate that requires every PR to carry a Linear issue Linear has LINKED to that
+# exact PR before it can merge (design: pr-linear-ticket-enforcement). The only thing that
+# passes is an attachment Linear returns for this PR's canonical html_url whose issue meets
+# the configured team/state policy — a `TEAM-123`-shaped string in author text never does.
+#
+# TWO-STAGE, FORK-SAFE EXECUTION. This privileged validator is invoked by a caller that runs
+# on `workflow_run: completed` of an unprivileged, no-op signal workflow in the consumer repo.
+# GitHub gives THIS run the caller's write token and the Linear secret even when the signal
+# run (a fork or Dependabot PR) had neither. Non-negotiable constraints (design §6):
+#   * the signal workflow checks out nothing, runs no PR content, emits no artifact/cache;
+#   * this validator never downloads that run's artifacts/caches and never checks out the PR
+#     branch or merge commit — it reads only GitHub-owned data and Linear's API;
+#   * every PR-derived value (branch, title, body, labels, URL) is untrusted DATA, passed
+#     through env / GraphQL variables, never shell-interpolated.
+# The job runs on the DEFAULT branch, so its job-level check must NOT be the required merge
+# check. Instead validate.sh publishes the `linear-ticket` commit status on the refetched PR
+# head SHA; branch protection requires THAT context. See docs/callers/linear-ticket.md.
+#
+# PERMISSIONS the caller must grant (the single job's union — GitHub validates the grant at
+# STARTUP, before any `if:`):
+#   actions: read           # read the triggering workflow_run
+#   contents: read          # checkout THIS repo's scripts (no PR code is ever checked out)
+#   pull-requests: write    # the one marker diagnostic comment
+#   statuses: write         # publish the `linear-ticket` commit status
+#
+# SECRET: LINEAR_API_TOKEN (required). Store the value exactly as it goes into Linear's
+# Authorization header — a personal API key raw, an OAuth actor-auth access token prefixed
+# with `Bearer `. Missing/invalid fails the check CLOSED as an infrastructure error, never
+# green (design §7).
+#
+# Caller pattern: docs/callers/linear-ticket.md (the signal + validate pair). Do not use
+# `secrets: inherit`; pass only LINEAR_API_TOKEN.
+
+on:
+  workflow_call:
+    inputs:
+      workflows_ref:
+        description: >-
+          Full 40-hex commit SHA of THIS repo to load the validator scripts from. Pin to the
+          SAME SHA as the caller's `uses:` — a floating ref would run new scripts under an old
+          workflow. Required; validated to be a full lowercase SHA and an ancestor of this
+          repo's main before checkout.
+        type: string
+        required: true
+      team-keys:
+        description: >-
+          Optional comma-separated allow-list of Linear team keys (matched against the
+          resolved issue's API team.key, never an identifier prefix). Empty (default) accepts
+          a linked issue from any team visible to the token. Malformed or duplicate entries
+          fail the run.
+        type: string
+        required: false
+        default: ''
+      exempt-label:
+        description: >-
+          Optional single label that waives the requirement (recommended `linear-exempt`).
+          Empty disables exemption. Adding/removing it reruns the check.
+        type: string
+        required: false
+        default: ''
+      exempt-actors:
+        description: >-
+          Optional comma-separated PR-author logins whose PRs skip the check without a label
+          (e.g. `dependabot[bot],renovate[bot]`). The non-manual hatch for bot PRs that never
+          carry a ticket. Opt-in and EMPTY by default — there is no built-in bot bypass; a
+          repo that lists an actor here accepts that all of that account's PRs merge without a
+          Linear ticket.
+        type: string
+        required: false
+        default: ''
+      require-open-issue:
+        description: >-
+          When true (default), reject a linked issue whose Linear state.type is
+          completed/canceled. backlog/unstarted/started/triage pass.
+        type: boolean
+        required: false
+        default: true
+      enforce:
+        description: >-
+          true (default) fails closed on a missing/invalid link or infrastructure error.
+          false is warn-only: every outcome publishes success but the summary and marker
+          comment show the verdict enforce mode would have produced.
+        type: boolean
+        required: false
+        default: true
+    secrets:
+      LINEAR_API_TOKEN:
+        description: >-
+          Value placed verbatim into Linear's Authorization header (personal key raw, or
+          `Bearer <oauth-token>`). Required; a missing token fails the check as an
+          infrastructure error.
+        required: true
+
+permissions: {}
+
+concurrency:
+  # One validation per PR branch; a newer push/edit supersedes the in-flight run, and
+  # validate.sh additionally refetches the head SHA before any terminal status write.
+  group: linear-ticket-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    # Only a completed run of the signal workflow should reach here (the caller filters the
+    # workflow name + `types: [completed]`); guard the conclusion so a failed/cancelled signal
+    # run does not trigger a spurious validation.
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read           # read the triggering workflow_run
+      contents: read          # checkout the validator scripts; PR code is never checked out
+      pull-requests: write    # the one marker diagnostic comment
+      statuses: write         # publish the linear-ticket commit status
+    steps:
+      - name: Require a pinned workflows_ref
+        # workflows_ref runs THIS repo's scripts in a job holding the caller's write token +
+        # the LINEAR_API_TOKEN secret, so it is a code-execution trust boundary. GitHub does
+        # NOT enforce `required: true` for workflow_call inputs (an omitted input arrives as ''
+        # and checkout silently takes the default branch), so validate on TWO axes before
+        # checkout:
+        #   SHAPE    — a full 40-hex lowercase SHA; rejects everything mutable (branch, tag,
+        #              refs/pull/N/head), which could skew between jobs mid-run.
+        #   ANCESTRY — the SHA is reachable from THIS repo's upstream main. Shape proves the
+        #              value is immutable, not WHICH repo authored it: a fork of this PUBLIC
+        #              repo shares the object store and GitHub serves a fork PR's head objects
+        #              from this repo's URL unauthenticated, so a fork-authored 40-hex SHA is
+        #              just as well-shaped and would otherwise run with the caller's token. Only
+        #              merged upstream history may be pinned; no opt-out. Fails CLOSED on infra
+        #              errors. Mirrors pr-area-label.yml / pr-risk.yml. See BE-5546.
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+        run: |
+          set -euo pipefail
+          # actions/checkout trims `ref`, so strip whitespace before the -z test. Echo only a
+          # sanitized, bounded form so a multi-line value can't forge ::workflow commands:: in
+          # this PUBLIC log.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see the caller doc)"
+            exit 1
+          fi
+          safe_ref=$(printf '%s' "$REF" | tr -c 'A-Za-z0-9._/-' '?'); safe_ref=${safe_ref:0:64}
+          # Length + character-class, not `grep -Eq '^..$'`: grep anchors per LINE, so a
+          # multi-line value carrying one SHA-shaped line would pass. Lowercase only — the value
+          # is handed to checkout verbatim and everything that emits a SHA emits lowercase.
+          if [ "${#REF}" -ne 40 ] || [ -n "${REF//[0-9a-f]/}" ]; then
+            echo "::error::workflows_ref must be a full 40-hex lowercase commit SHA of Comfy-Org/github-workflows (got '${safe_ref}'). Branches, tags and PR-head refs are mutable and are rejected before checkout."
+            exit 1
+          fi
+          # ANCESTRY. The upstream URL is a LITERAL: inside a reusable workflow no github context
+          # names this repo, so a variable would be an alias a fork could point at itself. Two
+          # bounded fetches (--filter=blob:none — no file content): depth-1 proves the SHA is in
+          # this repo's object network; the second brings main to walk down to the pin. The fetch
+          # retries (a transient github.com error must not red the fleet); the verdict does not.
+          scratch=$(mktemp -d) || { echo "::error::ancestry check for workflows_ref (${safe_ref}) could not allocate scratch space; failing closed."; exit 1; }
+          trap 'rm -rf "$scratch"' EXIT
+          git init -q "$scratch" || { echo "::error::ancestry check for workflows_ref (${safe_ref}) could not init a scratch repo; failing closed."; exit 1; }
+          fetch_upstream() {
+            for attempt in 1 2 3; do
+              if timeout 40 git -C "$scratch" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=30 \
+                   fetch --quiet --no-tags --filter=blob:none "$@"; then
+                return 0
+              fi
+              [ "$attempt" -lt 3 ] && sleep $((attempt * 5))
+            done
+            return 1
+          }
+          if ! fetch_upstream --depth=1 https://github.com/Comfy-Org/github-workflows "$REF"; then
+            echo "::error::workflows_ref (${safe_ref}) could not be fetched from Comfy-Org/github-workflows after 3 attempts; failing closed."
+            exit 1
+          fi
+          if ! fetch_upstream https://github.com/Comfy-Org/github-workflows +refs/heads/main:refs/heads/upstream-main; then
+            echo "::error::main of Comfy-Org/github-workflows could not be read after 3 attempts, so workflows_ref (${safe_ref}) cannot be shown merged upstream; failing closed."
+            exit 1
+          fi
+          # --is-ancestor has THREE outcomes: 0 yes, 1 no, >1 git could not answer (infra fault).
+          # Don't report an infra fault as a hostile pin; both still fail closed, only the message differs.
+          ancestry_rc=0
+          GIT_NO_LAZY_FETCH=1 git -C "$scratch" merge-base --is-ancestor "$REF" upstream-main || ancestry_rc=$?
+          if [ "$ancestry_rc" -gt 1 ]; then
+            echo "::error::the ancestry test for workflows_ref (${safe_ref}) could not COMPLETE (git error, not a verdict); failing closed."
+            exit 1
+          fi
+          if [ "$ancestry_rc" -ne 0 ]; then
+            echo "::error::workflows_ref (${safe_ref}) is not an ancestor of Comfy-Org/github-workflows main. A well-shaped SHA can still be fork-authored; only merged upstream commits may be pinned. If this is a genuine just-merged pin, re-run."
+            exit 1
+          fi
+      - name: Checkout validator scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: .linear-ticket-tools
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+        with:
+          python-version: '3.12'
+      - name: Validate the linked Linear ticket
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          LINEAR_API_TOKEN: ${{ secrets.LINEAR_API_TOKEN }}
+          TEAM_KEYS: ${{ inputs.team-keys }}
+          EXEMPT_LABEL: ${{ inputs.exempt-label }}
+          EXEMPT_ACTORS: ${{ inputs.exempt-actors }}
+          REQUIRE_OPEN_ISSUE: ${{ inputs.require-open-issue }}
+          ENFORCE: ${{ inputs.enforce }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python3 .linear-ticket-tools/scripts/linear-ticket/validate.py
