@@ -27,7 +27,7 @@ class ExtractCandidates(unittest.TestCase):
 
     def test_reads_multiline_concatenation(self):
         self.assertEqual(
-            lib.extract_candidates("luke/be-1-x\nTitle ENG-2\nCloses OPS-3"),
+            lib.extract_candidates("feat/be-1-x\nTitle ENG-2\nCloses OPS-3"),
             ["BE-1", "ENG-2", "OPS-3"],
         )
 
@@ -179,6 +179,22 @@ class DiagnosticQuery(unittest.TestCase):
         self.assertEqual(lib.count_resolved_candidates({}), 0)
         self.assertEqual(lib.count_resolved_candidates({"errors": []}), 0)
         self.assertEqual(lib.count_resolved_candidates("not a dict"), 0)
+
+    def test_hostile_candidate_skipped(self):
+        # A candidate carrying a quote / GraphQL syntax must be dropped, never emitted as an
+        # unescaped literal — this pins the ^[A-Z0-9-]+$ injection guard so a refactor can't
+        # silently remove it and stay green. (extract_candidates never produces such a value,
+        # but build_diagnostic_query defends its input independently.)
+        query = lib.build_diagnostic_query(['BE-1", x: y(q: "', "ENG-2"])
+        self.assertEqual(query.count("issueSearch"), 1)
+        self.assertIn('query: "ENG-2"', query)
+        self.assertNotIn("x: y(q:", query)
+
+    def test_all_candidates_malformed_raises(self):
+        # Lowercase never survives extract_candidates, but if every input is unusable the
+        # builder must raise rather than emit an empty (invalid) query.
+        with self.assertRaises(ValueError):
+            lib.build_diagnostic_query(["be-1"])
 
 
 if __name__ == "__main__":

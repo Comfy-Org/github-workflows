@@ -84,8 +84,13 @@ class GitHub:
             capture_output=True,
         )
 
-    def get(self, path: str, paginate: bool = False):
-        """GET a JSON endpoint; returns the parsed body or None on failure."""
+    def get(self, path: str, *, paginate: bool = False):
+        """GET a JSON endpoint; returns the parsed body or None on failure.
+
+        For a paginated array endpoint, ``gh api --paginate`` merges every page's top-level
+        JSON array into a single flat array, so ``json.loads`` yields one combined list — no
+        ``--slurp`` or manual flattening is needed (verified against a multi-page endpoint).
+        """
         args = [path]
         if paginate:
             args.insert(0, "--paginate")
@@ -98,7 +103,15 @@ class GitHub:
         except json.JSONDecodeError:
             return None
 
-    def publish_status(self, sha: str, state: str, description: str, target_url: str) -> None:
+    def publish_status(self, sha: str, state: str, description: str, target_url: str,
+                       *, critical: bool = False) -> bool:
+        """Publish the ``linear-ticket`` commit status. Returns True on success.
+
+        A TERMINAL write (success/failure/warn-only) is ``critical=True``: if it fails, the
+        old status stays as the required context — a prior ``success`` could then keep gating
+        open under a run that meant to publish ``failure``. So a failed critical write is an
+        error the caller turns into a nonzero job exit, not a swallowed warning. A ``pending``
+        write is best-effort (``critical=False``)."""
         result = self._run([
             "--method", "POST", f"/repos/{self.repo}/statuses/{sha}",
             "-f", f"state={state}",
@@ -107,12 +120,27 @@ class GitHub:
             "-f", f"target_url={target_url}",
         ])
         if result.returncode != 0:
-            warning(f"Failed to publish '{state}' status on {sha}: {result.stderr.strip()}")
+            emit = error if critical else warning
+            emit(f"Failed to publish '{state}' status on {sha}: {result.stderr.strip()}")
+            return False
+        return True
 
     def find_marker_comment(self, pr: int) -> int | None:
-        comments = self.get(f"/repos/{self.repo}/issues/{pr}/comments", paginate=True) or []
+        """The gate's OWN marker comment, or None.
+
+        Match on the marker body AND the Actions-bot author: the marker string is public, so
+        a contributor could paste it into a comment of their own. Without the author check
+        the gate would PATCH/DELETE that foreign comment (403 → a swallowed warning, so the
+        real failure comment never lands and a stale one survives a passing run). The gate's
+        comments are always authored by ``github-actions[bot]`` (the default GITHUB_TOKEN
+        identity)."""
+        comments = self.get(f"/repos/{self.repo}/issues/{pr}/comments?per_page=100",
+                            paginate=True) or []
         for comment in comments:
-            if lib.MARKER in (comment.get("body") or ""):
+            if lib.MARKER not in (comment.get("body") or ""):
+                continue
+            user = comment.get("user") or {}
+            if user.get("type") == "Bot" and user.get("login") == "github-actions[bot]":
                 return comment.get("id")
         return None
 
@@ -233,8 +261,10 @@ class Validator:
         summary(f"Linear has linked this PR to: **{identifiers}**")
         self.gh.delete_marker_comment(self.pr_number)
         if self._guard_supersession():
-            self.gh.publish_status(self.validated_sha, "success",
-                                   f"Linked Linear issue: {identifiers}", self.run_url)
+            if not self.gh.publish_status(self.validated_sha, "success",
+                                          f"Linked Linear issue: {identifiers}", self.run_url,
+                                          critical=True):
+                return 1
         return 0
 
     def finish_exempt(self) -> int:
@@ -244,8 +274,10 @@ class Validator:
                 "is waived.")
         self.gh.delete_marker_comment(self.pr_number)
         if self._guard_supersession():
-            self.gh.publish_status(self.validated_sha, "success",
-                                   f"Exempt via {self.exempt_label} label", self.run_url)
+            if not self.gh.publish_status(self.validated_sha, "success",
+                                          f"Exempt via {self.exempt_label} label", self.run_url,
+                                          critical=True):
+                return 1
         return 0
 
     def finish_fail(self, category: str, detail: str) -> int:
@@ -275,6 +307,13 @@ class Validator:
              "or edit the PR title/body to trigger a fresh run. A repository maintainer can "
              f"waive the requirement by applying the `{self.exempt_label or 'linear-exempt'}` label."),
         ]
+
+        # Bail before mutating the PR if a newer run already owns the result: otherwise a
+        # superseded run overwrites the newer run's comment (leaving a stale failure beside a
+        # green status) even though its status write is suppressed.
+        if not self._guard_supersession():
+            return 0 if not self.enforce else 1
+
         self.gh.upsert_marker_comment(self.pr_number, "\n".join(body_lines))
 
         summary(f"## linear-ticket: {verdict}")
@@ -283,15 +322,27 @@ class Validator:
         if detail:
             summary(detail)
 
-        if self._guard_supersession():
-            self.gh.publish_status(self.validated_sha, state, short, self.run_url)
+        if not self.gh.publish_status(self.validated_sha, state, short, self.run_url,
+                                      critical=True):
+            return 1
         return 0 if not self.enforce else 1
 
     # -- the run ---------------------------------------------------------------------------
     def run(self, event: dict) -> int:
-        head_sha = (event.get("workflow_run") or {}).get("head_sha") or ""
+        wr = event.get("workflow_run") or {}
+        head_sha = wr.get("head_sha") or ""
         if not head_sha:
             error("workflow_run.head_sha missing from event")
+            return 1
+
+        # The signal workflow runs only on `pull_request`, so the triggering run's event must
+        # be `pull_request`. The caller's workflow-name + conclusion filters do not prove that;
+        # a miswired caller pointed at a `push` workflow could otherwise resolve an open PR from
+        # the pushed head SHA and publish `linear-ticket` for it. Fail fast instead.
+        wr_event = wr.get("event") or ""
+        if wr_event != "pull_request":
+            error(f"Triggering workflow_run event was '{wr_event}', not 'pull_request'. The "
+                  "signal workflow must run on pull_request; refusing to validate.")
             return 1
 
         self.pr_number = self._resolve_pr(event, head_sha)
@@ -359,6 +410,7 @@ class Validator:
         step 4). Returns (nodes, infra_error)."""
         nodes: list = []
         infra_error = False
+        queried_ok = False
         for attempt in range(5):
             result = linear_post(ATTACHMENTS_QUERY, {"url": html_url}, self.token)
             if not result.transport_ok:
@@ -374,6 +426,7 @@ class Validator:
                 log(f"Linear returned a retryable error (HTTP {result.http_status}, codes: "
                     f"{result.error_codes or 'none'}) on attempt {attempt + 1}")
             else:
+                queried_ok = True
                 nodes = (((result.payload or {}).get("data") or {}).get("attachmentsForURL")
                          or {}).get("nodes") or []
                 if lib.count_linked(nodes) > 0:
@@ -381,6 +434,14 @@ class Validator:
                 log(f"No attachment linked to this PR yet (attempt {attempt + 1})")
             if attempt < 4:
                 time.sleep(BACKOFF_SECONDS[attempt])
+        # A run that never once reached Linear (all attempts transport/retryable failures) is an
+        # infrastructure outage, not a missing ticket — fail closed rather than blaming the
+        # author (or, in warn-only, going green with the wrong diagnosis). Matches lib.py's
+        # documented infra_error contract.
+        if not infra_error and not queried_ok:
+            error("Linear could not be queried after 5 attempts (transport/retryable errors "
+                  "only). Failing closed as an infrastructure error.")
+            infra_error = True
         return nodes, infra_error
 
     def _diagnose_and_fail(self, nodes, infra_error, branch, title, body) -> int:

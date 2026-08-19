@@ -33,7 +33,7 @@ on the PR head SHA; you require **that context** once warn-only observation is d
 
 | | |
 |---|---|
-| `secrets.LINEAR_API_TOKEN` | **Required.** The value placed verbatim into Linear's `Authorization` header — a personal API key **raw**, or an OAuth actor-auth access token prefixed with `Bearer `. Missing/invalid fails the check *closed* as an infrastructure error (never green). |
+| `secrets.LINEAR_API_TOKEN` | **Required.** The value placed verbatim into Linear's `Authorization` header — a personal API key **raw**, or an OAuth actor-auth access token prefixed with `Bearer` followed by one space. Missing/invalid fails the check *closed* as an infrastructure error (never green). |
 | A Linear→GitHub integration | The workspace's GitHub integration must be connected so Linear creates the PR attachments this check reads. |
 
 ## Caller — two files
@@ -149,4 +149,4 @@ credential must not silently disable the org-wide control. Availability is handl
 retry, per-branch concurrency, the warn-only rollout, and the auditable exemption label.
 
 **Store the token in the right form.** Personal API key → raw. OAuth actor-auth token → prefixed
-with `Bearer `. The value is dropped straight into the `Authorization` header.
+with `Bearer` followed by one space. The value is dropped straight into the `Authorization` header.

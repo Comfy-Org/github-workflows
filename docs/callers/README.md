@@ -111,13 +111,20 @@ validation in CI (`pinact`, `zizmor`) **will fail** a bare tag.
 
 ### `workflows_ref` must match your pin
 
-Several workflows (`groom`, `cursor-review`, `pr-size`, `agents-md-integrity`)
-load assets — agent briefs, review prompts, checker scripts — from a ref **at run
-time**, controlled by the `workflows_ref` input. It defaults to `main`.
+Several workflows load assets — agent briefs, review prompts, checker scripts —
+from a ref **at run time**, controlled by the `workflows_ref` input. In every
+case, set it to the **same SHA** as your `uses:` pin.
 
-That default means a caller pinned to a SHA runs **old workflow + newest
-assets**. Usually harmless, occasionally not, and always confusing. Set it
-explicitly to the same SHA:
+- `groom`, `cursor-review`, `pr-size`, `agents-md-integrity` default it to
+  `main`. That default means a caller pinned to a SHA runs **old workflow +
+  newest assets** — usually harmless, occasionally not, and always confusing.
+- `pr-risk`, `pr-derisk`, `refresh-reviewers`, and `linear-ticket` make it
+  **required with no default** and reject any value that is not a full commit SHA
+  of this repo *before* checkout, so an omitted or mismatched ref fails the run
+  rather than silently loading `main`. There is nothing to "leave at `main`" —
+  you must pass the `uses:` SHA.
+
+Either way, set it explicitly to the same SHA:
 
 ```yaml
 uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@07154fb…
