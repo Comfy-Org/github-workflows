@@ -169,11 +169,83 @@ EVENT_NAME=issue_comment EVENT_ACTION=created ACTOR=outsider ACTOR_ASSOCIATION=N
   COMMENT_BODY='/risk-dispute R2' run_handler
 eq "unauthorized comments are ignored" 0 "$(wc -l <"$GH_LOG" | tr -d ' ')"
 
+echo "— the tier parser: every /risk-dispute R<anything> is a tier or a loud rejection —"
+# The regression this closes: the tier match was anchored on an UPPERCASE R followed by
+# whitespace-or-EOL, so `r2`, `R2:` and `R2,` all recorded human_tier=null with a green check, an
+# applied label and an audit comment — while `R4` failed loudly. human_tier is the single field
+# the calibration corpus exists for, so a silent degrade is the worst possible failure mode.
+for spelling in 'r2 too broad' 'R2: too broad' 'R2, too broad' 'R2- too broad' 'R2  too broad'; do
+  reset_case
+  printf '%s\n' '["risk:R1"]' >"$LABELS"
+  EVENT_NAME=issue_comment EVENT_ACTION=created ACTOR=reviewer ACTOR_ASSOCIATION=MEMBER \
+    COMMENT_BODY="/risk-dispute $spelling" run_handler
+  eq "'/risk-dispute $spelling' records the human tier" R2 "$(audit_record | jq -r '.human_tier')"
+  eq "'/risk-dispute $spelling' keeps the reason clean" "too broad" \
+    "$(audit_record | jq -r '.reason')"
+done
+
 reset_case
 printf '%s\n' '["risk:R1"]' >"$LABELS"
 EVENT_NAME=issue_comment EVENT_ACTION=created ACTOR=reviewer ACTOR_ASSOCIATION=MEMBER \
-  COMMENT_BODY='/risk-dispute R4 unsupported tier' run_handler >/dev/null 2>&1
-eq "invalid commands fail validation" 2 "$?"
+  COMMENT_BODY='/risk-dispute r3' run_handler
+eq "a bare lowercase tier still records the tier" R3 "$(audit_record | jq -r '.human_tier')"
+
+reset_case
+printf '%s\n' '["risk:R1"]' >"$LABELS"
+EVENT_NAME=issue_comment EVENT_ACTION=created ACTOR=reviewer ACTOR_ASSOCIATION=MEMBER \
+  COMMENT_BODY='/Risk-Dispute R2 mixed case' run_handler
+eq "the command name matches case-insensitively, like the caller if: does" R2 \
+  "$(audit_record | jq -r '.human_tier')"
+
+reset_case
+printf '%s\n' '["risk:R1"]' >"$LABELS"
+EVENT_NAME=issue_comment EVENT_ACTION=created ACTOR=reviewer ACTOR_ASSOCIATION=MEMBER \
+  COMMENT_BODY='/risk-dispute R2D2 is not a tier' run_handler
+eq "R<digit> not ending a word stays prose" null "$(audit_record | jq -r '.human_tier')"
+eq "…and the whole line survives as the reason" 'R2D2 is not a tier' \
+  "$(audit_record | jq -r '.reason')"
+
+reset_case
+printf '%s\n' '["risk:R1"]' >"$LABELS"
+EVENT_NAME=issue_comment EVENT_ACTION=created ACTOR=reviewer ACTOR_ASSOCIATION=MEMBER \
+  COMMENT_BODY=$'/risk-dispute\nThe reason is on the next line.' run_handler
+eq "a reason continuing on later lines is kept" 'The reason is on the next line.' \
+  "$(audit_record | jq -r '.reason')"
+
+echo "— a malformed argument answers the commenter instead of reddening a green grade —"
+# The grade step has already run and SUCCEEDED by the time this script executes. Failing here
+# reddens that run and still tells the one person who can fix it nothing.
+reset_case
+printf '%s\n' '["risk:R1"]' >"$LABELS"
+EVENT_NAME=issue_comment EVENT_ACTION=created ACTOR=reviewer ACTOR_ASSOCIATION=MEMBER \
+  COMMENT_BODY='/risk-dispute R4 unsupported tier' run_handler
+eq "an unsupported tier exits 0" 0 "$?"
+eq "…and names the bad tier back to the commenter" true \
+  "$(jq -r '.body | test("`R4` is not a risk tier")' "$AUDIT")"
+eq "…and prints the usage line" true "$(jq -r '.body | test("Usage: ")' "$AUDIT")"
+eq "…and mutates no labels" 0 "$([ -e "$LAST_PUT" ] && echo 1 || echo 0)"
+
+reset_case
+printf '%s\n' '["risk:R1"]' >"$LABELS"
+EVENT_NAME=issue_comment EVENT_ACTION=created ACTOR=reviewer ACTOR_ASSOCIATION=MEMBER \
+  COMMENT_BODY='/risk-disputed by nobody' run_handler
+eq "a look-alike command is ignored in silence" 0 "$(wc -l <"$GH_LOG" | tr -d ' ')"
+
+echo "— clear takes a trailing reason instead of misreading it as a new dispute —"
+reset_case
+printf '%s\n' '["risk:R1","risk-dispute:R2"]' >"$LABELS"
+EVENT_NAME=issue_comment EVENT_ACTION=created ACTOR=reviewer ACTOR_ASSOCIATION=MEMBER \
+  COMMENT_BODY='/risk-dispute clear because the tests were fixed' run_handler
+eq "'clear <reason>' clears rather than creating a dispute" clear \
+  "$(audit_record | jq -r '.action')"
+eq "…and keeps the reason" "because the tests were fixed" "$(audit_record | jq -r '.reason')"
+eq "…and removes the dispute label" '["risk:R1"]' "$(jq -c '.labels' "$LAST_PUT")"
+
+reset_case
+printf '%s\n' '["risk:R1","risk-dispute:R2"]' >"$LABELS"
+EVENT_NAME=issue_comment EVENT_ACTION=created ACTOR=reviewer ACTOR_ASSOCIATION=MEMBER \
+  COMMENT_BODY='/risk-dispute Clear' run_handler
+eq "'Clear' is recognized case-insensitively" clear "$(audit_record | jq -r '.action')"
 
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

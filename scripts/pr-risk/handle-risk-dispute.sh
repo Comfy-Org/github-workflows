@@ -36,6 +36,33 @@ trim() {
   sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<<"$1"
 }
 
+ERRF="$(mktemp "${TMPDIR:-/tmp}/risk-dispute-err.XXXXXX")" || die "mktemp failed"
+trap 'rm -f "$ERRF"' EXIT
+ghq() { gh "$@" 2>"$ERRF"; }
+gherr() { tr '\n' ' ' <"$ERRF" | sed 's/[[:space:]]*$//'; }
+
+# A malformed ARGUMENT to a command we do own is a human typo, not a workflow fault. The grade
+# has already run and succeeded by the time this script executes, so `die`ing here reddens a
+# green run AND still tells the commenter nothing — the one person who can fix it never learns
+# the command was rejected. Answer them on the PR and exit 0 instead. `die` stays for CONFIG
+# errors (a bad REPO, an allowlist with spaces), which no commenter can act on.
+usage() {
+  local why="$1" body
+  log "$why"
+  # shellcheck disable=SC2016  # backticks here are markdown code spans, not command substitution
+  body="$(printf '%s\n\n%s\n' \
+    "@${ACTOR:-there} — $why" \
+    'Usage: `/risk-dispute`, `/risk-dispute R0`..`R3 [reason]`, or `/risk-dispute clear [reason]`.')"
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '%s\n' "$body"
+    exit 0
+  fi
+  jq -n --arg body "$body" '{body:$body}' \
+    | ghq api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" --input - >/dev/null \
+    || fail "could not post the usage reply on $REPO#$PR_NUMBER: $(gherr)"
+  exit 0
+}
+
 action=""
 tier=""
 reason=""
@@ -56,27 +83,60 @@ case "$EVENT_NAME:$EVENT_ACTION" in
     first_line="${body%%$'\n'*}"
     remaining=""
     [[ "$body" != *$'\n'* ]] || remaining="${body#*$'\n'}"
-    if [[ "$first_line" =~ ^/risk-dispute[[:space:]]+(R[0-3])([[:space:]]+(.*))?$ ]]; then
+
+    # The caller `if:` that admits this comment is a GitHub Actions string comparison, and those
+    # are case-INSENSITIVE — so `/Risk-Dispute R2 …` passes the gate and reaches us. Match the
+    # command name the same way the gate matched it, or the gate and the parser disagree about
+    # what a command even is. A first line that is NOT our command (`/risk-disputed`, prose that
+    # merely starts with the word) is somebody else's business: exit quietly, do not answer it.
+    first_lower="${first_line,,}"
+    case "$first_lower" in
+      /risk-dispute|/risk-dispute[[:space:]]*) ;;
+      *) log "not a /risk-dispute command; ignoring"; exit 0 ;;
+    esac
+    argline="$(trim "${first_line:13}")"
+
+    if [ -z "$argline" ]; then
       action="set"
-      tier="${BASH_REMATCH[1]}"
-      reason="$(trim "${BASH_REMATCH[3]:-}")"
-      if [ -n "$(trim "$remaining")" ]; then
-        [ -z "$reason" ] || reason+=$'\n'
-        reason+="$(trim "$remaining")"
-      fi
-    elif [[ "$first_line" =~ ^/risk-dispute[[:space:]]+clear[[:space:]]*$ ]]; then
+    elif [[ "${argline,,}" =~ ^clear([[:space:]]|$) ]]; then
+      # `/risk-dispute clear because the tests were fixed` used to fall through to the legacy
+      # branch and CREATE a tier-unspecified dispute whose reason was "clear because …" — the
+      # exact opposite of what was asked. A trailing reason is now kept, not misread.
       action="clear"
-    elif [[ "$first_line" =~ ^/risk-dispute([[:space:]]+(.*))?$ ]]; then
-      reason="$(trim "${BASH_REMATCH[2]:-}")"
-      [[ "$reason" =~ ^R[0-9]+([[:space:]]|$) ]] \
-        && die "bad tier; use R0, R1, R2 or R3"
-      if [ -n "$(trim "$remaining")" ]; then
-        [ -z "$reason" ] || reason+=$'\n'
-        reason+="$(trim "$remaining")"
+      reason="$(trim "${argline:5}")"
+    else
+      # A tier token is `R<digits>` ENDING THE WORD — end of line, whitespace, or punctuation.
+      # Anchoring on an uppercase `R` followed by whitespace-or-EOL silently degraded `r2`,
+      # `R2:` and `R2,` into tier-unspecified disputes with a green check, an applied label and
+      # an audit comment, while `R4` failed loudly — exactly backwards. `human_tier` is the one
+      # field this whole feature exists to collect, so every `/risk-dispute R<anything>` shape
+      # is now either accepted as a tier or rejected out loud; none fall through silently.
+      tier_digits=""
+      tier_rest=""
+      if [[ "$argline" =~ ^[Rr]([0-9]+)(.*)$ ]]; then
+        tier_digits="${BASH_REMATCH[1]}"
+        tier_rest="${BASH_REMATCH[2]}"
+        case "$tier_rest" in
+          ""|[[:space:]]*|[[:punct:]]*) ;;
+          *) tier_digits=""; tier_rest="" ;;   # `R2D2 …` is prose, not a tier
+        esac
       fi
       action="set"
-    else
-      die "bad command; use '/risk-dispute [optional reason]', '/risk-dispute R0..R3 [optional reason]' or '/risk-dispute clear'"
+      if [ -n "$tier_digits" ]; then
+        case "$tier_digits" in
+          0|1|2|3) tier="R${tier_digits}" ;;
+          *) usage "\`R${tier_digits}\` is not a risk tier; use R0, R1, R2 or R3" ;;
+        esac
+        reason="$tier_rest"
+        [[ ! "$reason" =~ ^[[:punct:]] ]] || reason="${reason:1}"   # `R2: too broad` → `too broad`
+        reason="$(trim "$reason")"
+      else
+        reason="$argline"
+      fi
+    fi
+    if [ -n "$(trim "$remaining")" ]; then
+      [ -z "$reason" ] || reason+=$'\n'
+      reason+="$(trim "$remaining")"
     fi
     source="comment"
     ;;
@@ -113,10 +173,6 @@ case "$EVENT_NAME:$EVENT_ACTION" in
   *) exit 0 ;;
 esac
 
-ERRF="$(mktemp "${TMPDIR:-/tmp}/risk-dispute-err.XXXXXX")" || die "mktemp failed"
-trap 'rm -f "$ERRF"' EXIT
-ghq() { gh "$@" 2>"$ERRF"; }
-gherr() { tr '\n' ' ' <"$ERRF" | sed 's/[[:space:]]*$//'; }
 enc() { jq -rn --arg s "$1" '$s | @uri'; }
 color_for() {
   case "$1" in
