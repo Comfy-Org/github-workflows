@@ -37,6 +37,7 @@ forward automatically instead of silently drifting commits behind.
 | [`bump-groom-callers.yml`](../workflows/bump-groom-callers.yml) | `groom.yml` or `groom/**` | `GROOM_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-auto-label-callers.yml`](../workflows/bump-auto-label-callers.yml) | `cursor-review-auto-label.yml` | `AUTO_LABEL_CALLERS` | non-empty (hard-fails if empty) |
 | [`bump-detect-unreviewed-merge-callers.yml`](../workflows/bump-detect-unreviewed-merge-callers.yml) | `detect-unreviewed-merge.yml` | `DETECT_UNREVIEWED_MERGE_CALLERS` | non-empty (hard-fails if empty) |
+| [`bump-area-label-callers.yml`](../workflows/bump-area-label-callers.yml) | `pr-area-label.yml` or `scripts/area-label/**` (minus its `tests/` and `README.md`, which no caller executes) | `AREA_LABEL_CALLERS` | **may select nothing** (no callers enrolled yet — flip `ALLOW_EMPTY` to `false` with the first enrolment) |
 
 ### One roster, two fleets (`FILE_FILTER`)
 
