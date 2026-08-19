@@ -68,6 +68,21 @@ class NormalizeTeamKeys(unittest.TestCase):
             lib.normalize_team_keys("1BE")
 
 
+class ParseActorList(unittest.TestCase):
+    def test_empty_is_no_exemption(self):
+        self.assertEqual(lib.parse_actor_list(""), [])
+        self.assertEqual(lib.parse_actor_list("   "), [])
+
+    def test_lowercases_and_trims(self):
+        self.assertEqual(
+            lib.parse_actor_list(" Dependabot[bot] , renovate[bot] "),
+            ["dependabot[bot]", "renovate[bot]"],
+        )
+
+    def test_tolerates_stray_empty_field(self):
+        self.assertEqual(lib.parse_actor_list("a,,b"), ["a", "b"])
+
+
 def _issue(identifier, key, state):
     return {"issue": {"identifier": identifier, "team": {"key": key}, "state": {"type": state}}}
 

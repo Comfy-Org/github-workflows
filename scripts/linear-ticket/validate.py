@@ -241,6 +241,7 @@ class Validator:
         self.enforce = enforce
         self.run_url = run_url
         self.exempt_label = os.environ.get("EXEMPT_LABEL", "")
+        self.exempt_actors = lib.parse_actor_list(os.environ.get("EXEMPT_ACTORS", ""))
         self.pr_number: int | None = None
         self.validated_sha: str | None = None
 
@@ -267,16 +268,14 @@ class Validator:
                 return 1
         return 0
 
-    def finish_exempt(self) -> int:
+    def finish_exempt(self, headline: str, status_desc: str) -> int:
         summary("## linear-ticket: ✅ exempt")
         summary("")
-        summary(f"PR carries the `{self.exempt_label}` label — the Linear-ticket requirement "
-                "is waived.")
+        summary(headline)
         self.gh.delete_marker_comment(self.pr_number)
         if self._guard_supersession():
-            if not self.gh.publish_status(self.validated_sha, "success",
-                                          f"Exempt via {self.exempt_label} label", self.run_url,
-                                          critical=True):
+            if not self.gh.publish_status(self.validated_sha, "success", status_desc,
+                                          self.run_url, critical=True):
                 return 1
         return 0
 
@@ -359,14 +358,27 @@ class Validator:
         title = pr.get("title") or ""
         body = pr.get("body") or ""
         labels = [lbl.get("name") for lbl in (pr.get("labels") or [])]
+        author = (pr.get("user") or {}).get("login") or ""
 
         log(f"Validating PR #{self.pr_number} ({html_url}) at head {self.validated_sha}")
         self.gh.publish_status(self.validated_sha, "pending",
                                "Checking for a linked Linear issue…", self.run_url)
 
+        # Exemptions short-circuit before the Linear query. The actor allow-list is the
+        # non-manual hatch for bot PRs (Dependabot/Renovate never carry a ticket); it is
+        # opt-in and defaults empty, so there is still no built-in bypass.
         if self.exempt_label and self.exempt_label in labels:
             log(f"PR carries the '{self.exempt_label}' label — exempt.")
-            return self.finish_exempt()
+            return self.finish_exempt(
+                f"PR carries the `{self.exempt_label}` label — the Linear-ticket requirement "
+                "is waived.",
+                f"Exempt via {self.exempt_label} label")
+        if self.exempt_actors and author.lower() in self.exempt_actors:
+            log(f"PR author @{author} is in exempt-actors — exempt.")
+            return self.finish_exempt(
+                f"PR author `@{author}` is in `exempt-actors` — the Linear-ticket requirement "
+                "is waived for this bot/automation account.",
+                f"Exempt via exempt-actors (@{author})")
 
         nodes, infra_error = self._query_attachments(html_url)
 

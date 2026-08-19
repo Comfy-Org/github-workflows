@@ -78,8 +78,23 @@ def normalize_team_keys(raw: str) -> list[str]:
     return keys
 
 
+def parse_actor_list(raw: str) -> list[str]:
+    """Parse the caller's comma-separated ``exempt-actors`` input into lowercased logins.
+
+    Empty/whitespace-only input -> ``[]`` (no actor is exempt — the secure default; the
+    design ships no built-in bot bypass). Logins carry ``[bot]`` suffixes and other punctuation
+    so, unlike team keys, they are not shape-validated — an unknown login simply never matches.
+    Lowercased because GitHub logins are compared case-insensitively.
+    """
+    return [part.strip().lower() for part in (raw or "").split(",") if part.strip()]
+
+
 def filter_issues(nodes: list[dict], team_keys: list[str], require_open: bool) -> list[str]:
     """THE GATE. Identifiers of the linked issues that satisfy policy, sorted unique.
+
+    Not every link is validated: this returns the SUBSET that passes, and the caller treats a
+    non-empty result as a pass. So a PR linked to one open and one canceled issue passes on the
+    open one — "any linked issue satisfies policy", by design (below), not "every link is valid".
 
     ``nodes`` is Linear's ``attachmentsForURL.nodes`` array; each node carries
     ``issue{identifier, team{key}, state{type}}``. Empty result == nothing passes. Policy:

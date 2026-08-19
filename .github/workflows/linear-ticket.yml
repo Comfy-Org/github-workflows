@@ -60,6 +60,16 @@ on:
         type: string
         required: false
         default: ''
+      exempt-actors:
+        description: >-
+          Optional comma-separated PR-author logins whose PRs skip the check without a label
+          (e.g. `dependabot[bot],renovate[bot]`). The non-manual hatch for bot PRs that never
+          carry a ticket. Opt-in and EMPTY by default — there is no built-in bot bypass; a
+          repo that lists an actor here accepts that all of that account's PRs merge without a
+          Linear ticket.
+        type: string
+        required: false
+        default: ''
       require-open-issue:
         description: >-
           When true (default), reject a linked issue whose Linear state.type is
@@ -196,6 +206,7 @@ jobs:
           LINEAR_API_TOKEN: ${{ secrets.LINEAR_API_TOKEN }}
           TEAM_KEYS: ${{ inputs.team-keys }}
           EXEMPT_LABEL: ${{ inputs.exempt-label }}
+          EXEMPT_ACTORS: ${{ inputs.exempt-actors }}
           REQUIRE_OPEN_ISSUE: ${{ inputs.require-open-issue }}
           ENFORCE: ${{ inputs.enforce }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

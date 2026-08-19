@@ -82,8 +82,10 @@ jobs:
     uses: Comfy-Org/github-workflows/.github/workflows/linear-ticket.yml@<full-commit-sha>  # v1
     with:
       workflows_ref: <same-full-commit-sha>
-      # team-keys: BE,ENG            # optional; empty (default) accepts any visible team
+      # team-keys: BE,ENG            # optional; LEAVE EMPTY (default) unless you truly want
+      #                              # team scoping — a restricted list fails cross-team PRs
       # exempt-label: linear-exempt  # optional; empty disables exemption
+      # exempt-actors: dependabot[bot],renovate[bot]  # optional; bot PRs skip the check
       # require-open-issue: true     # default
       enforce: false                 # WARN-ONLY during rollout; flip to true when ready
     secrets:
@@ -111,8 +113,9 @@ job-level detail.
 | Input | Default | Notes |
 |---|---|---|
 | `workflows_ref` | — (**required**) | Pin to the SAME full commit SHA as `uses:`. Validated to be a full 40-hex lowercase SHA **and an ancestor of this repo's main** before checkout — a branch, tag, short SHA, or fork-authored SHA fails the run. |
-| `team-keys` | `''` | Comma-separated allow-list matched against the resolved issue's API `team.key`, never an identifier prefix. Empty accepts any team the token can see. Malformed or duplicate entries fail the run. |
+| `team-keys` | `''` | Comma-separated allow-list matched against the resolved issue's API `team.key`, never an identifier prefix. **Leave empty (recommended)** unless a repo genuinely wants team scoping — a restricted list fails a cross-team PR on first contact. Malformed or duplicate entries fail the run. |
 | `exempt-label` | `''` | Single label that waives the requirement (recommended `linear-exempt`). Empty disables exemption. |
+| `exempt-actors` | `''` | Comma-separated PR-author logins whose PRs skip the check without a label (e.g. `dependabot[bot],renovate[bot]`) — the non-manual hatch for bot PRs that never carry a ticket. Opt-in; empty means no bypass. Listing an actor means **all** of its PRs merge without a Linear ticket, so keep it to trusted automation accounts. |
 | `require-open-issue` | `true` | Reject a linked issue whose Linear `state.type` is `completed`/`canceled`. `backlog`/`unstarted`/`started`/`triage` pass. |
 | `enforce` | `true` | `false` is warn-only: every outcome publishes success, but the summary and marker comment show the verdict enforce mode would have produced. |
 
@@ -124,10 +127,18 @@ job-level detail.
 2. Confirm the `linear-ticket` status publishes on **same-repo, fork, and Dependabot** PR head
    SHAs, and that automatic (branch/title/body) and manual links both resolve to the same
    canonical URL.
-3. Flip `enforce: true`. Leave the check non-required for a short window.
-4. Add the **`linear-ticket`** status context to your `main` ruleset as a required check.
+3. **Track the stale-link case.** Linking an issue *in Linear* after the check went red produces
+   no GitHub event, so the status stays red until someone re-runs the workflow or edits the PR
+   (the failure comment says this). Count how often that happens during the warn-only week. If
+   it's rare, the re-run instruction is enough; if it's frequent, the fix is a
+   `repository_dispatch` driven by a Linear webhook — not a larger retry budget — and is a
+   deliberate v2 follow-up, out of scope here.
+4. Decide bot-PR handling: set `exempt-actors` (e.g. `dependabot[bot],renovate[bot]`) so
+   dependency PRs pass without hand-labelling each one.
+5. Flip `enforce: true`. Leave the check non-required for a short window.
+6. Add the **`linear-ticket`** status context to your `main` ruleset as a required check.
 
-Nothing here changes branch protection automatically — step 4 is a manual repo-admin action.
+Nothing here changes branch protection automatically — the last step is a manual repo-admin action.
 
 ## Gotchas
 
