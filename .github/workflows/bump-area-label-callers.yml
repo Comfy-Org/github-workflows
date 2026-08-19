@@ -1,0 +1,105 @@
+name: Bump area-label callers
+
+# When the pr-area-label reusable workflow (or the classifier scripts it runs) is updated on
+# main, open a SHA-bump PR in every repo that pins a caller against it. PRs are opened by
+# Cloud Code Bot so they're easy to filter and merge.
+#
+# Thin entrypoint over the shared bumper at .github/bump-callers/bump-callers.sh — the same
+# script drives the pr-risk, cursor-review and agents-md-integrity fleets. ONE implementation
+# is deliberate; a forked copy is how other shared machinery in the org has drifted.
+#
+# An area-label caller pins TWICE — the `uses:` line AND the `workflows_ref:` input the
+# reusable checks its scripts out at. The shared rewrite moves both; never hand-bump one.
+#
+# The caller list is NOT hardcoded here. This repo is PUBLIC and most callers are private, so
+# their names must never appear in this file or its logs. The list lives in the repo-level
+# Actions SECRET `AREA_LABEL_CALLERS` (a JSON array of {"repo","file","label"} objects) — a
+# secret, not a variable, so the roster is runner-masked in the env dump Actions prints before
+# the script's own masking runs (BE-6472). There is no read-back: the canonical callers.json
+# lives in the private ops repo and a maintainer applies edits with `gh secret set`.
+#
+# Update flow — adding/removing a caller needs NO public commit:
+#   jq -c . callers.json | gh secret set AREA_LABEL_CALLERS --repo Comfy-Org/github-workflows
+
+on:
+  workflow_dispatch: {}   # allow on-demand runs (e.g. to re-bump callers, or after enrolling one)
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/pr-area-label.yml
+      # The classifier logic consumers actually run, checked out from the workflows_ref SHA a
+      # caller pins — a behavior change here needs the same caller bump as a workflow change.
+      - scripts/area-label/**
+      # …but the tests and README under that dir are NOT part of what a pinned caller runs, so
+      # a test-only or docs-only commit would fan a pure-churn bump across the fleet. Exclude.
+      - '!scripts/area-label/tests/**'
+      - '!scripts/area-label/README.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bump-area-label-callers
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    # Guard against a workflow_dispatch from a non-main ref: the bumper force-resets a shared
+    # branch and runs from github.sha, so a manual run from an older ref would pin every caller
+    # to a stale SHA. The push trigger is already main-only.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Preflight (staleness / decommission guard)
+        id: preflight
+        env:
+          WATCHED: .github/workflows/pr-area-label.yml
+          WATCHED_ASSETS: scripts/area-label
+          WATCHED_PATHSPECS: |
+            .github/workflows/pr-area-label.yml
+            scripts/area-label
+            :(exclude)scripts/area-label/tests
+            :(exclude)scripts/area-label/README.md
+          # Every file whose ABSENCE breaks a pinned caller at run time — not just entry points.
+          # classify-and-apply.sh sources lib.sh; sync-labels.sh is the sync job's whole body.
+          WATCHED_EXEC: |
+            .github/workflows/pr-area-label.yml
+            scripts/area-label/lib.sh
+            scripts/area-label/sync-labels.sh
+            scripts/area-label/classify-and-apply.sh
+          NEW_SHA: ${{ github.sha }}
+        run: bash .github/bump-callers/preflight.sh
+
+      - name: Generate Cloud Code Bot token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0 — pinned: see dependabot.yml ignore (v2+ breaks cross-repo `owner:` token scoping)
+        id: token
+        if: steps.preflight.outputs.proceed == 'true'
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+          owner: Comfy-Org
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+
+      - name: Bump SHA in caller repos
+        if: steps.preflight.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          NEW_SHA: ${{ steps.preflight.outputs.new_sha }}
+          VAR_NAME: AREA_LABEL_CALLERS
+          TAG: area-label
+          WORKFLOW_FILE: pr-area-label.yml
+          FILE_FILTER: .github/workflows/pr-area-label.yml
+          # Hard-fail on an empty/missing roster once this fleet has live callers. Until the
+          # first caller is enrolled the roster is legitimately empty, so start permissive and
+          # flip to "false" when comfy-infra (or the next repo) lands its caller.
+          ALLOW_EMPTY: "true"
+          CALLERS_JSON: ${{ secrets.AREA_LABEL_CALLERS }}
+        run: bash .github/bump-callers/bump-callers.sh

@@ -1,0 +1,48 @@
+# CONTRACT: this is one of THIS repo's own path-filtered script tests, NOT a reusable
+# workflow. It is not callable and has no caller pattern:
+#   TRIGGERS — `pull_request` and `push` to main, both filtered to scripts/area-label/**
+#              and this file. A change elsewhere in the repo does not run it.
+#   INPUTS   — none. SECRETS — none. Read-only `contents: read`; the suite is hermetic and
+#              makes no network call.
+# The reusable workflow these scripts back is .github/workflows/pr-area-label.yml.
+
+name: Test area-label scripts
+
+# Runs shellcheck + the hermetic lib suite for the area-label classifier. The classifier
+# stamps an area label on every consuming repo's PRs, so a regression in taxonomy validation
+# or request-building silently mislabels PRs — cheap to guard with a unit run on change.
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/area-label/**'
+      - '.github/workflows/test-area-label.yml'
+      # pr-area-label.yml passes the scripts their whole input contract through env, so a
+      # change to it can break the suite without touching a file under scripts/area-label/.
+      - '.github/workflows/pr-area-label.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/area-label/**'
+      - '.github/workflows/test-area-label.yml'
+      - '.github/workflows/pr-area-label.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: shellcheck + suite
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: scripts/area-label
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: shellcheck
+        run: shellcheck -x lib.sh sync-labels.sh classify-and-apply.sh tests/test_lib.sh
+      - name: lib suite
+        run: bash tests/test_lib.sh

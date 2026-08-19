@@ -12,6 +12,7 @@ per-workflow pages give you a complete, copy-pasteable caller:
 | `pr-size.yml` | [pr-size.md](pr-size.md) | nothing (bot comment optional) |
 | `pr-risk.yml` | [pr-risk.md](pr-risk.md) | nothing |
 | `pr-derisk.yml` | [pr-derisk.md](pr-derisk.md) | `ANTHROPIC_API_KEY` |
+| `pr-area-label.yml` | [pr-area-label.md](pr-area-label.md) | `.github/area-labels.yml` (+ `ANTHROPIC_API_KEY`, org-wide) |
 | `agents-md-integrity.yml` | [agents-md-integrity.md](agents-md-integrity.md) | nothing |
 | `coderabbit-config-validate.yml` | [coderabbit-config-validate.md](coderabbit-config-validate.md) | nothing |
 | `assign-reviewers.yml` | [assign-reviewers.md](assign-reviewers.md) | `vars.APP_ID` + App key + `.github/reviewers.yml` |
@@ -165,6 +166,7 @@ Enrolling a repo is **two steps**, and the second is the one people miss.
    | `pr-size.yml` | `PR_SIZE_CALLERS` |
    | `pr-risk.yml` | `PR_RISK_CALLERS` |
    | `pr-derisk.yml` | `PR_RISK_CALLERS` (shared with `pr-risk.yml` — one entry per caller file) |
+   | `pr-area-label.yml` | `AREA_LABEL_CALLERS` |
    | `agents-md-integrity.yml` | `AGENTS_MD_CALLERS` |
    | `coderabbit-config-validate.yml` | `CODERABBIT_CONFIG_CALLERS` |
    | `assign-reviewers.yml` | `ASSIGN_REVIEWERS_CALLERS` |
