@@ -1,0 +1,111 @@
+name: Bump linear-ticket callers
+
+# When the linear-ticket reusable workflow (or the validator scripts it runs) is updated on
+# main, open a SHA-bump PR in every repo that pins a caller against it. PRs are opened by
+# Cloud Code Bot so they're easy to filter and merge.
+#
+# Thin entrypoint over the shared bumper at .github/bump-callers/bump-callers.sh — the same
+# script drives the pr-risk, cursor-review, agents-md-integrity and area-label fleets. ONE
+# implementation is deliberate; a forked copy is how other shared machinery in the org has
+# drifted.
+#
+# A linear-ticket caller pins TWICE — the `uses:` line AND the `workflows_ref:` input the
+# reusable checks its validator scripts out at. The shared rewrite moves both; never hand-bump
+# one alone.
+#
+# The caller list is NOT hardcoded here. This repo is PUBLIC and most callers are private, so
+# their names must never appear in this file or its logs. The list lives in the repo-level
+# Actions SECRET `LINEAR_TICKET_CALLERS` (a JSON array of {"repo","file","label"} objects) — a
+# secret, not a variable, so the roster is runner-masked in the env dump Actions prints before
+# the script's own masking runs (BE-6472). There is no read-back: the canonical callers.json
+# lives in the private ops repo and a maintainer applies edits with `gh secret set`.
+#
+# Each roster entry's `file` is the CALLER's filename — `.github/workflows/linear-ticket-validate.yml`
+# (docs/callers/linear-ticket.md specifies it literally) — not this repo's `linear-ticket.yml`.
+# FILE_FILTER pins the fleet to that exact spelling.
+#
+# Update flow — adding/removing a caller needs NO public commit:
+#   jq -c . callers.json | gh secret set LINEAR_TICKET_CALLERS --repo Comfy-Org/github-workflows
+
+on:
+  workflow_dispatch: {}   # allow on-demand runs (e.g. to re-bump callers, or after enrolling one)
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/linear-ticket.yml
+      # The validator logic consumers actually run, checked out from the workflows_ref SHA a
+      # caller pins — a behavior change here needs the same caller bump as a workflow change.
+      - scripts/linear-ticket/**
+      # …but the tests and README under that dir are NOT part of what a pinned caller runs, so
+      # a test-only or docs-only commit would fan a pure-churn bump across the fleet. Exclude.
+      - '!scripts/linear-ticket/tests/**'
+      - '!scripts/linear-ticket/README.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bump-linear-ticket-callers
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    # Guard against a workflow_dispatch from a non-main ref: the bumper force-resets a shared
+    # branch and runs from github.sha, so a manual run from an older ref would pin every caller
+    # to a stale SHA. The push trigger is already main-only.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Preflight (staleness / decommission guard)
+        id: preflight
+        env:
+          WATCHED: .github/workflows/linear-ticket.yml
+          WATCHED_ASSETS: scripts/linear-ticket
+          WATCHED_PATHSPECS: |
+            .github/workflows/linear-ticket.yml
+            scripts/linear-ticket
+            :(exclude)scripts/linear-ticket/tests
+            :(exclude)scripts/linear-ticket/README.md
+          # Every file whose ABSENCE breaks a pinned caller at run time — not just entry points.
+          # validate.py is the whole job body; it imports lib.py.
+          WATCHED_EXEC: |
+            .github/workflows/linear-ticket.yml
+            scripts/linear-ticket/lib.py
+            scripts/linear-ticket/validate.py
+          NEW_SHA: ${{ github.sha }}
+        run: bash .github/bump-callers/preflight.sh
+
+      - name: Generate Cloud Code Bot token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0 — pinned: see dependabot.yml ignore (v2+ breaks cross-repo `owner:` token scoping)
+        id: token
+        if: steps.preflight.outputs.proceed == 'true'
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+          owner: Comfy-Org
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+
+      - name: Bump SHA in caller repos
+        if: steps.preflight.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          NEW_SHA: ${{ steps.preflight.outputs.new_sha }}
+          VAR_NAME: LINEAR_TICKET_CALLERS
+          TAG: linear-ticket
+          WORKFLOW_FILE: linear-ticket.yml
+          FILE_FILTER: .github/workflows/linear-ticket-validate.yml
+          # Two live callers already pin this workflow (Comfy-Org/cloud, Comfy-Org/comfy-infra),
+          # so an empty/missing roster here is a bug, not a growing fleet — hard-fail rather than
+          # silently leaving every caller un-bumped. Seed LINEAR_TICKET_CALLERS before/soon after
+          # this file lands on main (see the PR that introduced this fleet).
+          ALLOW_EMPTY: "false"
+          CALLERS_JSON: ${{ secrets.LINEAR_TICKET_CALLERS }}
+        run: bash .github/bump-callers/bump-callers.sh

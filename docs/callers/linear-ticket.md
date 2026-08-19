@@ -94,6 +94,11 @@ jobs:
 
 Do **not** use `secrets: inherit` — pass only `LINEAR_API_TOKEN`.
 
+Then ask a maintainer to add your repo to the `LINEAR_TICKET_CALLERS` roster secret on
+`Comfy-Org/github-workflows` — that roster is what keeps your pin current
+(see [Staying current](README.md#staying-current)). Enrolment does not backfill your pin:
+ask them to `workflow_dispatch` `bump-linear-ticket-callers.yml` once after adding you.
+
 ## Required permissions
 
 ```yaml

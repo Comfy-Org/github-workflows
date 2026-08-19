@@ -167,6 +167,7 @@ Enrolling a repo is **two steps**, and the second is the one people miss.
    | `pr-risk.yml` | `PR_RISK_CALLERS` |
    | `pr-derisk.yml` | `PR_RISK_CALLERS` (shared with `pr-risk.yml` — one entry per caller file) |
    | `pr-area-label.yml` | `AREA_LABEL_CALLERS` |
+   | `linear-ticket.yml` | `LINEAR_TICKET_CALLERS` |
    | `agents-md-integrity.yml` | `AGENTS_MD_CALLERS` |
    | `coderabbit-config-validate.yml` | `CODERABBIT_CONFIG_CALLERS` |
    | `assign-reviewers.yml` | `ASSIGN_REVIEWERS_CALLERS` |
