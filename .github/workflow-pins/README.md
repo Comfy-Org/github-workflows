@@ -153,7 +153,27 @@ questions fail in opposite directions, so they get opposite answers:
   'main' }}` registered no alias, so `ref: ${{ env.WORKFLOWS_REF }}` read as no
   ref use at all and left the lint entirely, carrying the exact mutable fallback
   the lint exists to catch. Over-approximating here can only ever *demand* a
-  guard.
+  guard. Three more spellings joined it in BE-8146, each of which had been
+  failing open the same way — and none of them was caught by the `_CONSUMES_*`
+  backstop, which only runs when the input *declaration* is unparseable:
+  - **the flow-style `env: {NAME: ${{ … }}}`**, which binds exactly as the block
+    form does. Its entries are bounded at the entry boundary and each entry's
+    start is checked to be real YAML punctuation, so a `,` inside a quoted
+    scalar cannot plant a decoy binding.
+  - **index access**, `inputs['workflows_ref']` and `env['NAME']`. It is
+    documented Actions expression syntax and interchangeable with the property
+    form, so both spellings now come from one shared `_INPUT_MENTION_BODY` used
+    by every "reaches the input" pattern — including the `_CONSUMES_*` backstop,
+    so a bracket-only file with a lost declaration is still loud.
+  - **a chain of aliases**: `BASE: ${{ inputs.workflows_ref }}` then
+    `REF: ${{ env.BASE }}` binds *both*, via a fixpoint bounded by the number of
+    names bound in the file. One hop was all the scan followed, so a `ref: ${{
+    env.REF }}` two hops out was invisible.
+
+  All three widen only what counts as a ref **use**. The guard side
+  (`_GUARD_BINDING_RE`) stays block-form, dot-access only on purpose: an
+  unrecognized *guard* fails **closed** — its checkout gets reported, which is
+  loud — while an unrecognized *use* fails open and silent.
 - *Is this ref the immutable self-pin?* — judged from the **literal expression
   on the checkout line**. An alias never qualifies, so `ref: ${{ env.NAME }}`
   always needs a **bare** guard.

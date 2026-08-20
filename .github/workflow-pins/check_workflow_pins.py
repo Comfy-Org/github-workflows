@@ -62,6 +62,26 @@ DEFAULT_WORKFLOWS_DIR = ".github/workflows"
 # reusable workflow here is now held to both checks with no carve-out.
 KNOWN_EXEMPT = frozenset()
 
+# How a workflow can NAME the input, defined ONCE (BE-8146). Actions expression
+# syntax offers two interchangeable accessors for the same value — property
+# (`inputs.workflows_ref`) and index (`inputs['workflows_ref']`) — so a lint
+# that knows only the first reads a bracket-spelled checkout as no ref use at
+# all and passes it unguarded. Every "does this reach the input" pattern is
+# built from this body so the two spellings cannot drift apart again:
+# `_REF_USE_*`, `_mention_alt`, `_ENV_ALIAS_RES`, and the `_CONSUMES_*` trio.
+#
+# Widening what counts as a ref USE is the safe direction (see `_mention_alt`):
+# it can only ever DEMAND a guard, never excuse a missing one. So it is
+# deliberately NOT applied to `_GUARD_BINDING_RE` — an unrecognized guard reads
+# as ABSENT, which reports its checkout rather than passing it — nor to
+# `_FALLBACK_RES`, which is an EXEMPTION and would EXCUSE rather than demand.
+# (`\s*` inside the brackets because Actions allows whitespace around an index
+# expression — `inputs[ 'workflows_ref' ]` is the same access, and a near-miss
+# that reads as no ref use at all is the exact failure mode being fixed here.)
+_INPUT_MENTION_BODY = (
+    r"""inputs\.%s\b|inputs\[\s*['"]%s['"]\s*\]""" % (INPUT_NAME, INPUT_NAME)
+)
+
 _ON_RE = re.compile(r"""^(['"]?)on\1\s*:(.*)$""")
 _JOBS_RE = re.compile(r"""^(['"]?)jobs\1\s*:""")
 
@@ -76,8 +96,8 @@ _JOBS_RE = re.compile(r"""^(['"]?)jobs\1\s*:""")
 # — which is the same unguarded checkout, and the same one-line bypass already
 # barred for `default:`. The flow pattern stops the value at the entry boundary
 # (`[^,}]`) so a sibling entry mentioning the input can't be misread as the ref.
-_REF_USE_BLOCK_RE = re.compile(r"""^\s*(['"]?)ref\1\s*:.*inputs\.%s\b""" % INPUT_NAME)
-_REF_USE_FLOW_RE = re.compile(r"""[{,]\s*(['"]?)ref\1\s*:[^,}]*inputs\.%s\b""" % INPUT_NAME)
+_REF_USE_BLOCK_RE = re.compile(r"""^\s*(['"]?)ref\1\s*:.*(?:%s)""" % _INPUT_MENTION_BODY)
+_REF_USE_FLOW_RE = re.compile(r"""[{,]\s*(['"]?)ref\1\s*:[^,}]*(?:%s)""" % _INPUT_MENTION_BODY)
 # …and a third, because the value does not have to share the key's line at all:
 #   ref: >-              ref: |              ref:              ref:  # pinned
 #     ${{ … }}             ${{ … }}            ${{ … }}          ${{ … }}
@@ -95,7 +115,6 @@ _REF_USE_FLOW_RE = re.compile(r"""[{,]\s*(['"]?)ref\1\s*:[^,}]*inputs\.%s\b""" %
 _REF_KEY_OPEN_RE = re.compile(
     r"""^\s*(['"]?)ref\1\s*:[^\S\n]*(?:["'][^\S\n]*$|(?:[|>][+-]?\d*)?[^\S\n]*(?:#.*)?$)"""
 )
-_INPUT_MENTION_RE = re.compile(r"""inputs\.%s\b""" % INPUT_NAME)
 
 # …and a fourth shape, because a `ref:` does not have to NAME the input at all.
 # cursor-review.yml's never-fail ledger job resolves the ref one step earlier
@@ -291,23 +310,28 @@ def _ref_derived_names(body):
 # narrower than "the string appears somewhere": the test workflow's own shell
 # fixtures name the input in prose and in a `sed` script, and neither is a use.
 # Flow form included for the same reason as above — otherwise a file whose only
-# use is one-line escapes the "NOT covering this file" error too.
+# use is one-line escapes the "NOT covering this file" error too. Both accessor
+# spellings, for the same reason again (BE-8146): a file whose only use is
+# `${{ inputs['workflows_ref'] }}` would otherwise be a silent skip rather than
+# a loud "the lint is NOT covering this file". The bracket alternative carries
+# the same whole-value anchoring as the dot form — the interpolation has to BE
+# the scalar, not merely appear in it.
 # (`:[^\S\n]*(?:#…)?\s*` rather than a plain `\s*`, so a comment sitting between
 # the key and a value on the next line does not hide the use — the same gap, in
 # the backstop that is supposed to catch exactly this kind of miss.)
 _CONSUMES_BLOCK_RE = re.compile(
     r"""(?m)^\s*(['"]?)[\w.-]+\1\s*:[^\S\n]*(?:#[^\n]*)?\s*"""
-    r"""(['"]?)\$\{\{\s*inputs\.%s\s*\}\}\2\s*$""" % INPUT_NAME
+    r"""(['"]?)\$\{\{\s*(?:%s)\s*\}\}\2\s*$""" % _INPUT_MENTION_BODY
 )
 _CONSUMES_FLOW_RE = re.compile(
-    r"""[{,]\s*(['"]?)[\w.-]+\1\s*:\s*(['"]?)\$\{\{\s*inputs\.%s\s*\}\}\2\s*[,}]""" % INPUT_NAME
+    r"""[{,]\s*(['"]?)[\w.-]+\1\s*:\s*(['"]?)\$\{\{\s*(?:%s)\s*\}\}\2\s*[,}]""" % _INPUT_MENTION_BODY
 )
 # The block-scalar form, for the same reason again. (The plain multi-line form
 # already lands in _CONSUMES_BLOCK_RE, whose `\s*` spans the newline; only the
 # `|`/`>` indicator sits between the colon and the value and defeats it.)
 _CONSUMES_SCALAR_RE = re.compile(
     r"""(?m)^\s*(['"]?)[\w.-]+\1\s*:\s*[|>][+-]?\d*[^\S\n]*(?:#[^\n]*)?\n"""
-    r"""\s*\$\{\{\s*inputs\.%s\s*\}\}""" % INPUT_NAME
+    r"""\s*\$\{\{\s*(?:%s)\s*\}\}""" % _INPUT_MENTION_BODY
 )
 
 # An `env:` binding of the input to a NAME (`WORKFLOWS_REF: ${{ inputs… }}`).
@@ -331,15 +355,43 @@ _CONSUMES_SCALAR_RE = re.compile(
 # file-wide. Matched against the comment-STRIPPED child, or this becomes the one
 # place in the module reading a comment as code: `ASSETS: _dir  # checked out at
 # inputs.workflows_ref` would bind `ASSETS` and fail a compliant workflow.
-_ENV_ALIAS_RE = re.compile(
-    r"""^\s*(['"]?)([A-Za-z_]\w*)\1\s*:[^\S\n]*.*inputs\.%s\b""" % INPUT_NAME
-)
+#
+# Two shapes, because an `env:` entry does not have to sit on its own line: the
+# block form's child lines, and the flow form's entries on the `env: {…}` line
+# itself. The flow pattern bounds its value at the entry boundary (`[^,}]`),
+# exactly as `_REF_USE_FLOW_RE` bounds its own, so a SIBLING entry mentioning
+# the input cannot bind the wrong name. Group 2 is the bound NAME in both.
+#
+# Parameterized by the "reaches" test because the alias scan asks the same
+# question twice: once for the input itself, and once per pass of
+# `env_aliases`' fixpoint for `env.<a name already known to reach it>`.
+def _env_alias_res(mention):
+    """The (block, flow) `env:`-entry patterns binding a name to `mention`."""
+    return (
+        re.compile(r"""^\s*(['"]?)([A-Za-z_]\w*)\1\s*:[^\S\n]*.*(?:%s)""" % mention),
+        re.compile(r"""[{,]\s*(['"]?)([A-Za-z_]\w*)\1\s*:[^,}]*(?:%s)""" % mention),
+    )
+
+
+_ENV_ALIAS_RES = _env_alias_res(_INPUT_MENTION_BODY)
+# Every `env:` entry, whatever its value — the alias fixpoint's hard bound: no
+# pass of `env_aliases` can add a name that is not bound somewhere in this file.
+_ENV_ANY_RES = _env_alias_res(r"")
 # Scoped to `env:` blocks, not every mapping key bound to the input: the
 # checkout's own `ref: ${{ inputs.workflows_ref }}` is such a binding too, and
 # treating `ref` as an alias would make `env.ref`/`$ref` anywhere read as the
-# input. (Block form only — a flow-style `env: {…}` binds no alias here, which
-# loses nothing the `_CONSUMES_*` backstop does not already catch.)
+# input.
+#
+# BOTH `env:` spellings bind (BE-8146). The flow form used to bind nothing, on
+# the stated belief that this "loses nothing the `_CONSUMES_*` backstop does not
+# already catch" — which was false: that backstop only runs when `defaults is
+# None`, i.e. when the input DECLARATION itself was unparseable, so it caught
+# none of this. A well-formed workflow writing `env: {WORKFLOWS_REF: ${{
+# inputs.workflows_ref }}}` bound no alias, its `ref: ${{ env.WORKFLOWS_REF }}`
+# read as no ref use at all, and the checkout got a green lint unguarded. The
+# flow form binds directly now; `_env_bindings` scans that one line's entries.
 _ENV_KEY_RE = re.compile(r"""^\s*(['"]?)env\1\s*:[^\S\n]*(?:#.*)?$""")
+_ENV_FLOW_KEY_RE = re.compile(r"""^\s*(['"]?)env\1\s*:\s*\{""")
 
 # A `default` key inside a flow mapping: `{type: string, default: main}`.
 _FLOW_DEFAULT_RE = re.compile(r"""[{,]\s*(['"]?)default\1\s*:""")
@@ -482,23 +534,68 @@ def _default_value(line):
     return _strip_comment(line.split(":", 1)[1])
 
 
-def _env_bindings(lines, pattern):
-    """Names bound inside an `env:` block by `pattern`, e.g. `WORKFLOWS_REF`."""
+def _env_bindings(lines, res):
+    """Names bound inside an `env:` mapping by `res`, e.g. `WORKFLOWS_REF`.
+
+    Both spellings: the block form's child lines, and the flow form's entries on
+    the `env: {…}` line itself. Matched against the comment-STRIPPED source, or
+    this becomes the one place in the module reading a comment as code.
+    """
+    block_re, flow_re = res
     names = set()
     for i, line in enumerate(lines):
-        if not _ENV_KEY_RE.match(line):
+        if _ENV_KEY_RE.match(line):
+            for _, child in _block_body(lines, i, _indent(line)):
+                match = block_re.match(_strip_comment(child))
+                if match:
+                    names.add(match.group(2))
             continue
-        for _, child in _block_body(lines, i, _indent(line)):
-            match = pattern.match(_strip_comment(child))
-            if match:
+        code = _strip_comment(line)
+        if not _ENV_FLOW_KEY_RE.match(code):
+            continue
+        # Each entry boundary has to be real YAML punctuation, not string
+        # content: a quoted decoy (`NAME: 'a, EVIL: ${{ inputs.workflows_ref }}'`)
+        # plants a `,` inside a scalar and would otherwise bind `EVIL`. Same
+        # check `_pins_to_job_workflow_sha` applies to its own flow matcher.
+        for match in flow_re.finditer(code):
+            if _outside_quotes(code, match.start()):
                 names.add(match.group(2))
     return frozenset(names)
 
 
 def env_aliases(lines):
-    """Names whose `env:` binding REACHES the input, e.g. `WORKFLOWS_REF`."""
-    return _env_bindings(lines, _ENV_ALIAS_RE)
+    """Names whose `env:` binding REACHES the input, e.g. `WORKFLOWS_REF`.
 
+    Directly — `WORKFLOWS_REF: ${{ inputs.workflows_ref }}` — or through another
+    env name that already does (BE-8146). `BASE: ${{ inputs.workflows_ref }}`
+    followed by `REF: ${{ env.BASE }}` binds BOTH, so a `ref: ${{ env.REF }}`
+    two hops from the input is still a ref use. Following exactly one hop was
+    the whole scan, and the second hop's checkout left the lint entirely.
+
+    A fixpoint rather than a fixed hop count, bounded by the number of names
+    bound anywhere in the file — no pass can add a name that is not one of them,
+    and every pass either adds one or stops. Mirrors `_ref_derived_names`, which
+    does the same for the shell variables inside a guard step. File-wide
+    over-approximation across `env:` scopes is intended; see `_mention_alt`.
+    """
+    names = set(_env_bindings(lines, _ENV_ALIAS_RES))
+    if not names:
+        # Nothing reaches the input directly, so no chain can reach it either —
+        # and an empty alternation below would degenerate to `env\.(?:)\b`,
+        # which matches the `env.` of ANY name and would bind the whole file.
+        return frozenset()
+    for _ in range(len(_env_bindings(lines, _ENV_ANY_RES))):
+        alt = "|".join(sorted(re.escape(n) for n in names))
+        chained = _env_bindings(
+            lines,
+            _env_alias_res(
+                r"""env\.(?:%s)\b|env\[\s*['"](?:%s)['"]\s*\]""" % (alt, alt)
+            ),
+        )
+        if chained <= names:
+            break
+        names |= chained
+    return frozenset(names)
 
 
 def _mention_alt(aliases):
@@ -507,11 +604,20 @@ def _mention_alt(aliases):
     File-wide rather than scope-aware on purpose: `env:` is scoped per job and
     per step, but over-approximating can only ever DEMAND a guard, never excuse
     a missing one — the safe direction for a detector whose job is absence.
+
+    Both accessor spellings on both halves (BE-8146): `inputs.x` / `inputs['x']`
+    for the input itself, through `_INPUT_MENTION_BODY`, and `env.NAME` /
+    `env['NAME']` for an alias, each tolerating whitespace inside the brackets.
+    `${NAME}` covers the shell reading of a bound name.
     """
-    alt = r"""inputs\.%s\b""" % INPUT_NAME
+    alt = _INPUT_MENTION_BODY
     if aliases:
         names = "|".join(sorted(re.escape(a) for a in aliases))
-        alt += r"""|env\.(?:%s)\b|\$\{?(?:%s)\b""" % (names, names)
+        alt += r"""|env\.(?:%s)\b|env\[\s*['"](?:%s)['"]\s*\]|\$\{?(?:%s)\b""" % (
+            names,
+            names,
+            names,
+        )
     return alt
 
 
