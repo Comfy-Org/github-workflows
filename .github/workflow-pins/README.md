@@ -70,16 +70,41 @@ answers *mutability*; the guard answers *emptiness*; a checkout using the
 fallback is exempt from the first check and still held to the second. Until
 BE-8077 the fallback was exempt from **both**, so deleting all seven of
 `groom.yml`'s guard steps left this lint — and its whole suite — green, while
-the paragraph above already leaned on them. The guard-step detector accepts the
-`WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}` binding those
-seven use as well as the bare `${{ inputs.workflows_ref }}` one; matching only
-the bare form meant none of the seven was ever consulted, *and* falsely reported
-a checkout that dropped the fallback while keeping its guard. The fallback
-pattern is also anchored to the closing `}}` and matched against the
-comment-stripped line, so neither
-`${{ inputs.workflows_ref || job.workflow_sha || 'main' }}` (mutable in exactly
-the pre-v2.334.0 case the fallback exists for) nor a comment merely *naming* the
-expression buys the exemption. (`actionlint` ≤ 1.7.12 false-positives on
+the paragraph above already leaned on them.
+
+Three things make that enforceable, and each was a hole on its own:
+
+- **The guard-step detector knows both bindings, and keeps them apart.** It
+  accepts `WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}` as
+  well as the bare `${{ inputs.workflows_ref }}`, because matching only the bare
+  form meant none of `groom.yml`'s seven guards was ever consulted. But the two
+  are **not** equivalent, and treating either as blanket job-wide coverage is a
+  live hole: a guard on the fallback proves only that the *OR expression* is
+  non-empty, so with the input omitted it passes on `job.workflow_sha` while a
+  sibling `ref: ${{ inputs.workflows_ref }}` in the same job still gets `''`.
+  So the lint records each guard's **strength** and requires the checkout's own
+  `ref:` to be no weaker: a bare guard covers everything, a fallback guard
+  covers fallback checkouts only.
+- **The fallback pattern is anchored at both ends** — `${{` … `}}` — and matched
+  against the comment-stripped line. An extra operand on *either* side
+  reintroduces a mutable ref, and the runtime guard cannot catch it (a guard
+  proves non-emptiness, not immutability):
+  `${{ inputs.workflows_ref || job.workflow_sha || 'main' }}` resolves to the
+  default branch in exactly the pre-v2.334.0 case the fallback exists for, and
+  `${{ inputs.override || inputs.workflows_ref || job.workflow_sha }}` resolves
+  to whatever the leading operand names. A comment merely *naming* the
+  expression buys nothing either.
+- **The `default: ''` carve-out is scoped to lines that are a ref checkout.**
+  Asking "does any line self-pin?" of the whole file granted it to any file that
+  merely mentions the expression in code — most sharply the guard steps' own
+  `env:` binding — so a file whose checkouts all read the bare
+  `ref: ${{ inputs.workflows_ref }}` bought an empty default it does not
+  self-pin against.
+
+`_ENV_ALIAS_RE` knows the fallback spelling too, so hoisting that seven-times
+duplicated binding to a job-level `env:` and checking out at
+`ref: ${{ env.WORKFLOWS_REF }}` — the refactor the alias machinery exists to
+survive — keeps its coverage instead of silently dropping to zero. (`actionlint` ≤ 1.7.12 false-positives on
 `job.workflow_sha`; no CI here runs it.)
 
 The guard is copied inline into each consuming job rather than factored into a

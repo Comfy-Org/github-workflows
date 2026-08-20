@@ -631,6 +631,13 @@ jobs:
         env:
           WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}
         run: |
+          # Bracket RANGES (`A-Z`) match by COLLATION order, so under a glibc
+          # locale such as en_US.UTF-8 they also match accented letters and the
+          # negated class below quietly stops rejecting them. Hosted runners
+          # default to C.UTF-8, but the case this guard exists for is the stale
+          # SELF-HOSTED runner, whose locale is unknown — so pin the byte order
+          # rather than inherit it.
+          export LC_ALL=C
           # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
           # whitespace-only value is an empty ref to IT while sailing past a bare
           # -z test here. Compare the stripped form: dropping newlines also stops
@@ -649,14 +656,16 @@ jobs:
           # rather than sanitized. Test the shape positively: a git ref is ASCII,
           # so anything outside this class fails closed, which also covers the
           # embedded space/newline case the comment above only half-addressed.
-          # The class is narrower than git's own ref rules (which allow `+`, `@`,
-          # `%`, `,` and UTF-8) but wider than any ref this input is meant to
-          # carry: a 40-hex SHA, or a branch/tag for the documented
-          # brief-testing override. It deliberately excludes every character
-          # that means something to a shell or to a `::workflow command::`.
+          # The class is deliberately NARROWER than git's own ref rules, which
+          # also permit `(`, `)`, `,`, `%` and UTF-8 — so a legal branch like
+          # `feat(groom)/x` is rejected here. That is a policy call, not a
+          # validity claim, and the message says so: it excludes every character
+          # that means something to a shell or to a `::workflow command::`, and
+          # it still covers everything this input is meant to carry — a 40-hex
+          # SHA, or a branch/tag for the documented brief-testing override.
           case "$WORKFLOWS_REF" in
             *[!A-Za-z0-9._/@+-]*)
-              echo "::error::workflows_ref contains characters that are not valid in a git ref (allowed: A-Z a-z 0-9 . _ / - @ +). Refusing to check out the groom assets: actions/checkout trims Unicode whitespace this check cannot echo safely, and a value it trims to empty would silently load them from this repo's default branch. Set workflows_ref: to the same commit SHA the caller's uses: line pins."
+              echo "::error::workflows_ref contains characters outside the set this workflow accepts (A-Z a-z 0-9 . _ / - @ +). That is a deliberate POLICY restriction, narrower than git's own ref rules — not a claim that your ref is invalid: actions/checkout trims Unicode whitespace a shell emptiness test cannot see, and a value it trims to empty would silently load the groom assets from this repo's default branch. Set workflows_ref: to the same commit SHA the caller's uses: line pins (the documented form), or rename the branch if you are using the brief-testing override."
               exit 1
               ;;
           esac
@@ -1123,6 +1132,13 @@ jobs:
         env:
           WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}
         run: |
+          # Bracket RANGES (`A-Z`) match by COLLATION order, so under a glibc
+          # locale such as en_US.UTF-8 they also match accented letters and the
+          # negated class below quietly stops rejecting them. Hosted runners
+          # default to C.UTF-8, but the case this guard exists for is the stale
+          # SELF-HOSTED runner, whose locale is unknown — so pin the byte order
+          # rather than inherit it.
+          export LC_ALL=C
           # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
           # whitespace-only value is an empty ref to IT while sailing past a bare
           # -z test here. Compare the stripped form: dropping newlines also stops
@@ -1141,14 +1157,16 @@ jobs:
           # rather than sanitized. Test the shape positively: a git ref is ASCII,
           # so anything outside this class fails closed, which also covers the
           # embedded space/newline case the comment above only half-addressed.
-          # The class is narrower than git's own ref rules (which allow `+`, `@`,
-          # `%`, `,` and UTF-8) but wider than any ref this input is meant to
-          # carry: a 40-hex SHA, or a branch/tag for the documented
-          # brief-testing override. It deliberately excludes every character
-          # that means something to a shell or to a `::workflow command::`.
+          # The class is deliberately NARROWER than git's own ref rules, which
+          # also permit `(`, `)`, `,`, `%` and UTF-8 — so a legal branch like
+          # `feat(groom)/x` is rejected here. That is a policy call, not a
+          # validity claim, and the message says so: it excludes every character
+          # that means something to a shell or to a `::workflow command::`, and
+          # it still covers everything this input is meant to carry — a 40-hex
+          # SHA, or a branch/tag for the documented brief-testing override.
           case "$WORKFLOWS_REF" in
             *[!A-Za-z0-9._/@+-]*)
-              echo "::error::workflows_ref contains characters that are not valid in a git ref (allowed: A-Z a-z 0-9 . _ / - @ +). Refusing to check out the groom assets: actions/checkout trims Unicode whitespace this check cannot echo safely, and a value it trims to empty would silently load them from this repo's default branch. Set workflows_ref: to the same commit SHA the caller's uses: line pins."
+              echo "::error::workflows_ref contains characters outside the set this workflow accepts (A-Z a-z 0-9 . _ / - @ +). That is a deliberate POLICY restriction, narrower than git's own ref rules — not a claim that your ref is invalid: actions/checkout trims Unicode whitespace a shell emptiness test cannot see, and a value it trims to empty would silently load the groom assets from this repo's default branch. Set workflows_ref: to the same commit SHA the caller's uses: line pins (the documented form), or rename the branch if you are using the brief-testing override."
               exit 1
               ;;
           esac
@@ -1590,6 +1608,13 @@ jobs:
         env:
           WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}
         run: |
+          # Bracket RANGES (`A-Z`) match by COLLATION order, so under a glibc
+          # locale such as en_US.UTF-8 they also match accented letters and the
+          # negated class below quietly stops rejecting them. Hosted runners
+          # default to C.UTF-8, but the case this guard exists for is the stale
+          # SELF-HOSTED runner, whose locale is unknown — so pin the byte order
+          # rather than inherit it.
+          export LC_ALL=C
           # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
           # whitespace-only value is an empty ref to IT while sailing past a bare
           # -z test here. Compare the stripped form: dropping newlines also stops
@@ -1608,14 +1633,16 @@ jobs:
           # rather than sanitized. Test the shape positively: a git ref is ASCII,
           # so anything outside this class fails closed, which also covers the
           # embedded space/newline case the comment above only half-addressed.
-          # The class is narrower than git's own ref rules (which allow `+`, `@`,
-          # `%`, `,` and UTF-8) but wider than any ref this input is meant to
-          # carry: a 40-hex SHA, or a branch/tag for the documented
-          # brief-testing override. It deliberately excludes every character
-          # that means something to a shell or to a `::workflow command::`.
+          # The class is deliberately NARROWER than git's own ref rules, which
+          # also permit `(`, `)`, `,`, `%` and UTF-8 — so a legal branch like
+          # `feat(groom)/x` is rejected here. That is a policy call, not a
+          # validity claim, and the message says so: it excludes every character
+          # that means something to a shell or to a `::workflow command::`, and
+          # it still covers everything this input is meant to carry — a 40-hex
+          # SHA, or a branch/tag for the documented brief-testing override.
           case "$WORKFLOWS_REF" in
             *[!A-Za-z0-9._/@+-]*)
-              echo "::error::workflows_ref contains characters that are not valid in a git ref (allowed: A-Z a-z 0-9 . _ / - @ +). Refusing to check out the groom assets: actions/checkout trims Unicode whitespace this check cannot echo safely, and a value it trims to empty would silently load them from this repo's default branch. Set workflows_ref: to the same commit SHA the caller's uses: line pins."
+              echo "::error::workflows_ref contains characters outside the set this workflow accepts (A-Z a-z 0-9 . _ / - @ +). That is a deliberate POLICY restriction, narrower than git's own ref rules — not a claim that your ref is invalid: actions/checkout trims Unicode whitespace a shell emptiness test cannot see, and a value it trims to empty would silently load the groom assets from this repo's default branch. Set workflows_ref: to the same commit SHA the caller's uses: line pins (the documented form), or rename the branch if you are using the brief-testing override."
               exit 1
               ;;
           esac
@@ -1990,6 +2017,13 @@ jobs:
         env:
           WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}
         run: |
+          # Bracket RANGES (`A-Z`) match by COLLATION order, so under a glibc
+          # locale such as en_US.UTF-8 they also match accented letters and the
+          # negated class below quietly stops rejecting them. Hosted runners
+          # default to C.UTF-8, but the case this guard exists for is the stale
+          # SELF-HOSTED runner, whose locale is unknown — so pin the byte order
+          # rather than inherit it.
+          export LC_ALL=C
           # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
           # whitespace-only value is an empty ref to IT while sailing past a bare
           # -z test here. Compare the stripped form: dropping newlines also stops
@@ -2008,14 +2042,16 @@ jobs:
           # rather than sanitized. Test the shape positively: a git ref is ASCII,
           # so anything outside this class fails closed, which also covers the
           # embedded space/newline case the comment above only half-addressed.
-          # The class is narrower than git's own ref rules (which allow `+`, `@`,
-          # `%`, `,` and UTF-8) but wider than any ref this input is meant to
-          # carry: a 40-hex SHA, or a branch/tag for the documented
-          # brief-testing override. It deliberately excludes every character
-          # that means something to a shell or to a `::workflow command::`.
+          # The class is deliberately NARROWER than git's own ref rules, which
+          # also permit `(`, `)`, `,`, `%` and UTF-8 — so a legal branch like
+          # `feat(groom)/x` is rejected here. That is a policy call, not a
+          # validity claim, and the message says so: it excludes every character
+          # that means something to a shell or to a `::workflow command::`, and
+          # it still covers everything this input is meant to carry — a 40-hex
+          # SHA, or a branch/tag for the documented brief-testing override.
           case "$WORKFLOWS_REF" in
             *[!A-Za-z0-9._/@+-]*)
-              echo "::error::workflows_ref contains characters that are not valid in a git ref (allowed: A-Z a-z 0-9 . _ / - @ +). Refusing to check out the groom assets: actions/checkout trims Unicode whitespace this check cannot echo safely, and a value it trims to empty would silently load them from this repo's default branch. Set workflows_ref: to the same commit SHA the caller's uses: line pins."
+              echo "::error::workflows_ref contains characters outside the set this workflow accepts (A-Z a-z 0-9 . _ / - @ +). That is a deliberate POLICY restriction, narrower than git's own ref rules — not a claim that your ref is invalid: actions/checkout trims Unicode whitespace a shell emptiness test cannot see, and a value it trims to empty would silently load the groom assets from this repo's default branch. Set workflows_ref: to the same commit SHA the caller's uses: line pins (the documented form), or rename the branch if you are using the brief-testing override."
               exit 1
               ;;
           esac
@@ -2184,6 +2220,13 @@ jobs:
         env:
           WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}
         run: |
+          # Bracket RANGES (`A-Z`) match by COLLATION order, so under a glibc
+          # locale such as en_US.UTF-8 they also match accented letters and the
+          # negated class below quietly stops rejecting them. Hosted runners
+          # default to C.UTF-8, but the case this guard exists for is the stale
+          # SELF-HOSTED runner, whose locale is unknown — so pin the byte order
+          # rather than inherit it.
+          export LC_ALL=C
           # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
           # whitespace-only value is an empty ref to IT while sailing past a bare
           # -z test here. Compare the stripped form: dropping newlines also stops
@@ -2202,14 +2245,16 @@ jobs:
           # rather than sanitized. Test the shape positively: a git ref is ASCII,
           # so anything outside this class fails closed, which also covers the
           # embedded space/newline case the comment above only half-addressed.
-          # The class is narrower than git's own ref rules (which allow `+`, `@`,
-          # `%`, `,` and UTF-8) but wider than any ref this input is meant to
-          # carry: a 40-hex SHA, or a branch/tag for the documented
-          # brief-testing override. It deliberately excludes every character
-          # that means something to a shell or to a `::workflow command::`.
+          # The class is deliberately NARROWER than git's own ref rules, which
+          # also permit `(`, `)`, `,`, `%` and UTF-8 — so a legal branch like
+          # `feat(groom)/x` is rejected here. That is a policy call, not a
+          # validity claim, and the message says so: it excludes every character
+          # that means something to a shell or to a `::workflow command::`, and
+          # it still covers everything this input is meant to carry — a 40-hex
+          # SHA, or a branch/tag for the documented brief-testing override.
           case "$WORKFLOWS_REF" in
             *[!A-Za-z0-9._/@+-]*)
-              echo "::error::workflows_ref contains characters that are not valid in a git ref (allowed: A-Z a-z 0-9 . _ / - @ +). Refusing to check out the groom assets: actions/checkout trims Unicode whitespace this check cannot echo safely, and a value it trims to empty would silently load them from this repo's default branch. Set workflows_ref: to the same commit SHA the caller's uses: line pins."
+              echo "::error::workflows_ref contains characters outside the set this workflow accepts (A-Z a-z 0-9 . _ / - @ +). That is a deliberate POLICY restriction, narrower than git's own ref rules — not a claim that your ref is invalid: actions/checkout trims Unicode whitespace a shell emptiness test cannot see, and a value it trims to empty would silently load the groom assets from this repo's default branch. Set workflows_ref: to the same commit SHA the caller's uses: line pins (the documented form), or rename the branch if you are using the brief-testing override."
               exit 1
               ;;
           esac
@@ -2419,6 +2464,13 @@ jobs:
         env:
           WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}
         run: |
+          # Bracket RANGES (`A-Z`) match by COLLATION order, so under a glibc
+          # locale such as en_US.UTF-8 they also match accented letters and the
+          # negated class below quietly stops rejecting them. Hosted runners
+          # default to C.UTF-8, but the case this guard exists for is the stale
+          # SELF-HOSTED runner, whose locale is unknown — so pin the byte order
+          # rather than inherit it.
+          export LC_ALL=C
           # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
           # whitespace-only value is an empty ref to IT while sailing past a bare
           # -z test here. Compare the stripped form: dropping newlines also stops
@@ -2437,14 +2489,16 @@ jobs:
           # rather than sanitized. Test the shape positively: a git ref is ASCII,
           # so anything outside this class fails closed, which also covers the
           # embedded space/newline case the comment above only half-addressed.
-          # The class is narrower than git's own ref rules (which allow `+`, `@`,
-          # `%`, `,` and UTF-8) but wider than any ref this input is meant to
-          # carry: a 40-hex SHA, or a branch/tag for the documented
-          # brief-testing override. It deliberately excludes every character
-          # that means something to a shell or to a `::workflow command::`.
+          # The class is deliberately NARROWER than git's own ref rules, which
+          # also permit `(`, `)`, `,`, `%` and UTF-8 — so a legal branch like
+          # `feat(groom)/x` is rejected here. That is a policy call, not a
+          # validity claim, and the message says so: it excludes every character
+          # that means something to a shell or to a `::workflow command::`, and
+          # it still covers everything this input is meant to carry — a 40-hex
+          # SHA, or a branch/tag for the documented brief-testing override.
           case "$WORKFLOWS_REF" in
             *[!A-Za-z0-9._/@+-]*)
-              echo "::error::workflows_ref contains characters that are not valid in a git ref (allowed: A-Z a-z 0-9 . _ / - @ +). Refusing to check out the groom assets: actions/checkout trims Unicode whitespace this check cannot echo safely, and a value it trims to empty would silently load them from this repo's default branch. Set workflows_ref: to the same commit SHA the caller's uses: line pins."
+              echo "::error::workflows_ref contains characters outside the set this workflow accepts (A-Z a-z 0-9 . _ / - @ +). That is a deliberate POLICY restriction, narrower than git's own ref rules — not a claim that your ref is invalid: actions/checkout trims Unicode whitespace a shell emptiness test cannot see, and a value it trims to empty would silently load the groom assets from this repo's default branch. Set workflows_ref: to the same commit SHA the caller's uses: line pins (the documented form), or rename the branch if you are using the brief-testing override."
               exit 1
               ;;
           esac
@@ -2905,6 +2959,13 @@ jobs:
         env:
           WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}
         run: |
+          # Bracket RANGES (`A-Z`) match by COLLATION order, so under a glibc
+          # locale such as en_US.UTF-8 they also match accented letters and the
+          # negated class below quietly stops rejecting them. Hosted runners
+          # default to C.UTF-8, but the case this guard exists for is the stale
+          # SELF-HOSTED runner, whose locale is unknown — so pin the byte order
+          # rather than inherit it.
+          export LC_ALL=C
           # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
           # whitespace-only value is an empty ref to IT while sailing past a bare
           # -z test here. Compare the stripped form: dropping newlines also stops
@@ -2923,14 +2984,16 @@ jobs:
           # rather than sanitized. Test the shape positively: a git ref is ASCII,
           # so anything outside this class fails closed, which also covers the
           # embedded space/newline case the comment above only half-addressed.
-          # The class is narrower than git's own ref rules (which allow `+`, `@`,
-          # `%`, `,` and UTF-8) but wider than any ref this input is meant to
-          # carry: a 40-hex SHA, or a branch/tag for the documented
-          # brief-testing override. It deliberately excludes every character
-          # that means something to a shell or to a `::workflow command::`.
+          # The class is deliberately NARROWER than git's own ref rules, which
+          # also permit `(`, `)`, `,`, `%` and UTF-8 — so a legal branch like
+          # `feat(groom)/x` is rejected here. That is a policy call, not a
+          # validity claim, and the message says so: it excludes every character
+          # that means something to a shell or to a `::workflow command::`, and
+          # it still covers everything this input is meant to carry — a 40-hex
+          # SHA, or a branch/tag for the documented brief-testing override.
           case "$WORKFLOWS_REF" in
             *[!A-Za-z0-9._/@+-]*)
-              echo "::error::workflows_ref contains characters that are not valid in a git ref (allowed: A-Z a-z 0-9 . _ / - @ +). Refusing to check out the groom assets: actions/checkout trims Unicode whitespace this check cannot echo safely, and a value it trims to empty would silently load them from this repo's default branch. Set workflows_ref: to the same commit SHA the caller's uses: line pins."
+              echo "::error::workflows_ref contains characters outside the set this workflow accepts (A-Z a-z 0-9 . _ / - @ +). That is a deliberate POLICY restriction, narrower than git's own ref rules — not a claim that your ref is invalid: actions/checkout trims Unicode whitespace a shell emptiness test cannot see, and a value it trims to empty would silently load the groom assets from this repo's default branch. Set workflows_ref: to the same commit SHA the caller's uses: line pins (the documented form), or rename the branch if you are using the brief-testing override."
               exit 1
               ;;
           esac

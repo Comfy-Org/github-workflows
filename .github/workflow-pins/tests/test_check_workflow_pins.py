@@ -608,12 +608,28 @@ class GuardCoverageTests(unittest.TestCase):
         )
         self.assertEqual(self._jobs(self.GUARD_WITH_FALLBACK + checkout), [])
 
-    def test_the_fallback_guard_also_covers_a_bare_input_checkout(self):
-        # And it cuts the other way: fallback dropped from the checkout, guard
-        # left in place. That checkout IS guarded and must not be reported --
-        # the narrow binding regex used to flag exactly this, a correct guard
-        # sitting directly above it.
-        self.assertEqual(self._jobs(self.GUARD_WITH_FALLBACK + self.CHECKOUT), [])
+    def test_a_fallback_guard_does_not_cover_a_bare_input_checkout(self):
+        # The strength rule, and the reason `_GUARD_BINDING_RE` records WHICH
+        # expression each guard validated. This guard proves only that
+        # `inputs.workflows_ref || job.workflow_sha` is non-empty. With the
+        # input omitted it passes on `job.workflow_sha` while the bare
+        # `ref: ${{ inputs.workflows_ref }}` below still receives '' and
+        # checkout takes the default branch — so it must NOT mark the job
+        # guarded for that checkout. Treating any recognized binding as blanket
+        # job-wide coverage put a live hole behind a green lint.
+        self.assertEqual(len(self._jobs(self.GUARD_WITH_FALLBACK + self.CHECKOUT)), 1)
+
+    def test_a_bare_guard_covers_a_fallback_checkout(self):
+        # The permitted direction: a guard on the bare input proves the INPUT
+        # itself is non-empty, which is strictly stronger than what a fallback
+        # checkout needs.
+        checkout = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ inputs.workflows_ref || job.workflow_sha }}\n"
+        )
+        self.assertEqual(self._jobs(self.GUARD + checkout), [])
 
     def test_a_third_operand_defeats_the_fallback_exemption(self):
         # The fallback regex is anchored to the CLOSE of the interpolation on
@@ -630,6 +646,35 @@ class GuardCoverageTests(unittest.TestCase):
             "          ref: ${{ inputs.workflows_ref || job.workflow_sha || 'main' }}\n"
         )
         self.assertEqual(len(self._jobs(checkout)), 1)
+
+    def test_a_leading_operand_defeats_the_fallback_exemption(self):
+        # The anchor has to hold at BOTH ends. Anchoring only the tail still let
+        # an operand in FRONT through, and that one resolves to whatever the
+        # leading operand names — a branch, a tag, another input — which the
+        # runtime guard cannot catch, since a guard proves non-emptiness, not
+        # immutability.
+        checkout = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ inputs.override || inputs.workflows_ref || job.workflow_sha }}\n"
+        )
+        self.assertEqual(len(self._jobs(checkout)), 1)
+
+    def test_an_env_alias_of_the_fallback_binding_is_still_a_ref_use(self):
+        # `_ENV_ALIAS_RE` has to know the same spellings `_GUARD_BINDING_RE`
+        # does. Hoisting the binding to a job-level `env:` and checking out at
+        # `ref: ${{ env.WORKFLOWS_REF }}` is exactly the refactor the alias
+        # machinery exists to survive; if it registers no alias, `is_ref_use`
+        # stops seeing those checkouts and the file drops to zero coverage
+        # while reporting nothing at all.
+        self.assertEqual(
+            cwp.env_aliases(
+                "env:\n"
+                "  WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}\n".split("\n")
+            ),
+            frozenset({"WORKFLOWS_REF"}),
+        )
 
     def test_the_github_job_workflow_sha_spelling_is_no_longer_exempt(self):
         # BE-8077: `github.job_workflow_sha` is an OIDC token claim, NOT a
@@ -716,21 +761,40 @@ class GuardCoverageTests(unittest.TestCase):
             "exempt.",
         )
 
+    WORKFLOWS_DIR = os.path.normpath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "workflows")
+    )
+
+    def _workflow(self, name):
+        with open(os.path.join(self.WORKFLOWS_DIR, name), encoding="utf-8") as f:
+            return f.read().split("\n")
+
+    @staticmethod
+    def _enclosing_step(lines, idx):
+        """The lines of the `- name:` step containing `idx`."""
+        start = idx
+        while start >= 0 and not lines[start].lstrip().startswith("- name:"):
+            start -= 1
+        assert start >= 0, "line %d is not inside a step" % idx
+        indent = len(lines[start]) - len(lines[start].lstrip())
+        end = start + 1
+        while end < len(lines):
+            stripped = lines[end].strip()
+            if stripped and len(lines[end]) - len(lines[end].lstrip()) <= indent:
+                break
+            end += 1
+        return lines[start:end]
+
     def test_the_ledger_checkout_keeps_its_resolve_then_skip_guard(self):
         # BE-8077 moved cursor-review.yml's ledger checkout to
         # `ref: ${{ steps.resolve_ref.outputs.ref }}`, which no longer NAMES the
-        # input — so `is_ref_use` does not see it and the lint above cannot
-        # cover it (that is the 16 -> 15 in the count assertion). The only thing
-        # left standing between an unresolvable ref and a silent default-branch
-        # checkout of the assets this job executes is the hand-written `if:`.
+        # input — so `is_ref_use` does not see it and the lint cannot cover it
+        # (that is the 16 -> 15 in the count assertion above). The only thing
+        # standing between an unresolvable ref and a silent default-branch
+        # checkout of the assets this job EXECUTES is the hand-written `if:`.
         # Nothing lints it, so pin it here until the detector learns to follow a
         # `ref:` through a step output.
-        root = os.path.normpath(
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "workflows")
-        )
-        with open(os.path.join(root, "cursor-review.yml"), encoding="utf-8") as f:
-            lines = f.read().split("\n")
-
+        lines = self._workflow("cursor-review.yml")
         consumers = [
             i
             for i, line in enumerate(lines)
@@ -739,18 +803,57 @@ class GuardCoverageTests(unittest.TestCase):
         self.assertTrue(consumers, "ledger checkout no longer reads resolve_ref")
 
         for idx in consumers:
-            # …guarded by an `if:` demanding a non-empty output, in its own step.
-            step = lines[max(0, idx - 12) : idx]
-            self.assertTrue(
-                any("if: steps.resolve_ref.outputs.ref != ''" in s for s in step),
-                "checkout at line %d has no non-empty `if:` on resolve_ref" % (idx + 1),
+            # Scoped to the consuming step itself, and matched EXACTLY. A fixed
+            # line window let a neighbouring step's `if:` satisfy this while the
+            # consumer ran unconditionally, accepted a widened condition such as
+            # `... != '' || always()` (which runs the checkout precisely when the
+            # output is empty), and broke on a compliant step that simply grew a
+            # couple of comment lines.
+            step = [s.strip() for s in self._enclosing_step(lines, idx)]
+            self.assertIn(
+                "if: steps.resolve_ref.outputs.ref != ''",
+                step,
+                "checkout at line %d has no exact non-empty `if:` in its own step"
+                % (idx + 1),
             )
 
-        # …and the resolving step must still REJECT rather than pass through:
-        # it emits the empty string for anything that is not ref-shaped.
+        # …and the resolving step must REJECT rather than sanitize: it emits the
+        # empty string for anything not ref-shaped, under a pinned byte locale.
         body = "\n".join(lines)
         self.assertIn("id: resolve_ref", body)
         self.assertIn("*[!A-Za-z0-9._/@+-]*) REF='' ;;", body)
+        self.assertIn("export LC_ALL=C", body)
+
+    def test_every_groom_guard_carries_the_shape_check(self):
+        # The `case` block is the only thing closing the Unicode-whitespace hole
+        # (the `-z` above it runs on an ASCII-only stripped copy), and
+        # `is_guard_step` only requires an emptiness test plus an exit — so
+        # deleting all seven `case` blocks left the pin lint AND this whole suite
+        # green. cursor-review.yml's twin is pinned by the test above; this is
+        # the matching cover for groom.yml.
+        lines = self._workflow("groom.yml")
+        starts = [
+            i
+            for i, line in enumerate(lines)
+            if line.strip() == "- name: Require a resolvable workflows_ref"
+        ]
+        self.assertEqual(len(starts), 7, "expected 7 groom guard steps")
+
+        bodies = []
+        for idx in starts:
+            step = self._enclosing_step(lines, idx)
+            text = "\n".join(step)
+            self.assertIn("export LC_ALL=C", text)
+            self.assertIn('REF="$(printf \'%s\' "$WORKFLOWS_REF" | tr -d \'[:space:]\')"', text)
+            self.assertIn('if [ -z "$REF" ]; then', text)
+            self.assertIn('case "$WORKFLOWS_REF" in', text)
+            self.assertIn("*[!A-Za-z0-9._/@+-]*)", text)
+            self.assertEqual(text.count("exit 1"), 2, "both branches must exit")
+            bodies.append(text)
+
+        # Seven hand-copied guards drift; the guarantee is only as strong as the
+        # weakest copy, so require them byte-identical.
+        self.assertEqual(len(set(bodies)), 1, "the 7 groom guard steps have drifted apart")
 
 
 

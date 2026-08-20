@@ -419,6 +419,10 @@ jobs:
         env:
           WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}
         run: |
+          # Bracket RANGES (`A-Z`) match by COLLATION order, so under a glibc
+          # locale such as en_US.UTF-8 they also match accented letters and the
+          # negated class below quietly stops rejecting them. Pin the byte order.
+          export LC_ALL=C
           # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
           # whitespace-only value is an empty ref to IT while sailing past a bare
           # -z test here — and JS `trim()` strips U+00A0/U+FEFF that POSIX
@@ -426,16 +430,18 @@ jobs:
           # Nor can it emit a stripped value: `tr -d` removes INTERIOR whitespace
           # too, so `a b` would be silently rewritten into the different-but-real
           # ref `ab` instead of being rejected. Validate the SHAPE and emit the
-          # value UNTOUCHED — a git ref is ASCII, so every Unicode space, and
-          # every newline that could smuggle a ::workflow command:: into the log
-          # or into $GITHUB_OUTPUT, falls outside the class and resolves to the
-          # empty output that skips the checkout below.
+          # value UNTOUCHED. The class is deliberately narrower than git's own
+          # ref rules (which also permit `(`, `)`, `,`, `%` and UTF-8) — a policy
+          # restriction, not a validity claim — and it keeps out every Unicode
+          # space and every newline that could smuggle a ::workflow command::
+          # into the log or into $GITHUB_OUTPUT. Anything outside it resolves to
+          # the empty output that skips the checkout below.
           REF="$WORKFLOWS_REF"
           case "$REF" in
             *[!A-Za-z0-9._/@+-]*) REF='' ;;
           esac
           if [ -z "$REF" ]; then
-            echo "::warning::Could not resolve a usable ref for the cursor-review assets: either the workflows_ref input is empty AND job.workflow_sha resolved to '' (which needs an Actions runner older than v2.334.0), or the value contains characters that are not valid in a git ref (allowed: A-Z a-z 0-9 . _ / - @ +). Skipping the asset checkout rather than silently loading them from this repo's default branch — the prior-review ledger degrades to status=unknown for this run. Set workflows_ref: to the same commit SHA the caller's uses: line pins."
+            echo "::warning::Could not resolve a usable ref for the cursor-review assets: either the workflows_ref input is empty AND job.workflow_sha resolved to '' (which needs an Actions runner older than v2.334.0), or the value contains characters outside the set this workflow accepts (A-Z a-z 0-9 . _ / - @ +) — a deliberate policy restriction, narrower than git's own ref rules. Skipping the asset checkout rather than silently loading them from this repo's default branch — the prior-review ledger degrades to status=unknown for this run. Set workflows_ref: to the same commit SHA the caller's uses: line pins."
           fi
           echo "ref=$REF" >> "$GITHUB_OUTPUT"
 
