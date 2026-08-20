@@ -144,8 +144,8 @@ tests — run the matching command above for whatever you touched.
   against the vendored CodeRabbit schema, on the PR that breaks it. CodeRabbit
   rejects an invalid config WHOLE (everything in it goes inert) and validates the
   BASE branch, so the breakage otherwise surfaces one PR late on the wrong diff.
-  Parse/`maxLength`/type errors FAIL; an unknown key WARNS (only where the schema
-  CLOSES the object) unless `strict_unknown_keys: true`; an absent file passes,
+  Parse/`maxLength`/type errors FAIL; an unknown key WARNS wherever its object is
+  closed (`additionalProperties: false`, 5; or by omission, 103) unless `strict_unknown_keys: true`; an absent file passes,
   though the other extension spelling is validated, not called absent. A SIBLING of
   agents-md-integrity, deliberately not an extension of it — that workflow is
   scoped to agent-instruction files, and folding this in would push a Python

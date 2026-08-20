@@ -29,6 +29,7 @@ Severity is split, mirroring what CodeRabbit itself does with each problem:
 | No `.coderabbit.yaml` at all | **passes** | Reported in the log, so "no config here" never reads the same as "config validated clean". |
 | `.coderabbit.yml` present under the default name | **validated, with a warning** | CodeRabbit honours both spellings, so the file that exists is the config in effect. Validating it is the point; the warning tells you to set `config_file` explicitly. |
 | Config path outside the repo, not a regular file, or over 512 KiB | **errors (exit 2)** | "I could not check" must never look like a pass. Symlinks are resolved before the containment test. |
+| Unknown-key scan stopped early (a huge or heavily aliased document) | **warns; fails under `strict_unknown_keys`** | Same rule as the row above, applied to a *partial* scan: keys past the cutoff were never inspected, so a repo that asked for unknown keys to fail must not get a green check over them. |
 
 The warning class is not cosmetic. The most common instance is a `tools:` block
 written at the document root instead of under `reviews:`; the root is closed, so
@@ -38,12 +39,56 @@ defaults to `true`, so a root-level `enabled: false` runs the linter it meant to
 disable). The annotation names the offending key path and suggests where it
 belongs.
 
-One limit worth knowing: the unknown-key check fires where the schema CLOSES an
-object, which upstream does at the document root and for a handful of nested
-objects. `reviews`, `chat`, `knowledge_base`, `code_generation` and the individual
-tool configs are open, so a typo *inside* one (`reviews.profil`) is not flagged
-even under `strict_unknown_keys`. What is caught is a key in the wrong PLACE —
-the failure that actually recurs.
+The unknown-key check fires wherever a schema object accepts only the property
+names it lists. Upstream says that two ways and both are checked: **explicitly**,
+with `additionalProperties: false` (five objects, including the document root),
+and **by omission** — a `properties` block and nothing said about anything else
+(103 objects, including `reviews`, `chat`, `knowledge_base`, `code_generation` and
+every individual tool config). So a key in the wrong PLACE is caught, and so is a
+typo *inside* an object (`reviews.profil`, `golangci-lint.enabld`) and a key
+upstream has since removed.
+
+The by-omission rule is deliberately conservative: an object counts as closed only
+if it declares `properties` and none of `additionalProperties`,
+`unevaluatedProperties`, `patternProperties`, `anyOf`, `oneOf`, `allOf`, `$ref`,
+`$dynamicRef`, `if`, `dependentSchemas`, `propertyNames` or `not` — each of which
+is a way the schema legitimately accepts a name it does not list. Nothing is
+reported under `reviews.mutually_exclusive_groups` (whose group names are yours to
+choose) or inside `knowledge_base.code_guidelines.filePatterns[]` (an `anyOf`
+shape), and a document/schema shape disagreement is left to the type error that
+already describes it.
+
+**Rolling this out to a repo that already has a config.** A repo carrying
+`reviews.tools.github-checks.timeout_ms` — a key upstream removed, still present
+in several org repos — will see a NEW warning it did not see before. That is the
+point of the check: the key does nothing today. Default mode still exits 0, so
+nothing turns red on enrollment. If you plan to set `strict_unknown_keys: true`,
+run the checker locally first and remove the stale keys it names — otherwise the
+strict switch turns them into a hard failure on whatever PR happens to be open:
+
+```bash
+python3 -m pip install --require-hashes --only-binary=:all: \
+  -r .github/coderabbit-config/requirements.txt        # from a checkout of Comfy-Org/github-workflows
+python3 .github/coderabbit-config/check_coderabbit_config.py --root /path/to/your/repo
+```
+
+**The by-omission half has a staleness window — mind it before turning strict on.**
+The 103 by-omission objects are read as closed against the schema *vendored at
+your pinned `workflows_ref`*, so a property upstream ADDS — a new linter under
+`reviews.tools`, a new knob on an existing one — is an unknown key to this
+checker until two things land: the weekly `refresh-coderabbit-schema.yml` PR in
+`Comfy-Org/github-workflows`, **and** your repo's SHA bump on top of it. In
+default warn-only mode that window costs you a warning on a config CodeRabbit is
+perfectly happy with. Under `strict_unknown_keys: true` it is a hard CI failure,
+on whatever unrelated PR happens to be open, over a key you were right to add.
+The five *explicitly* closed objects (the document root among them) have no such
+window — jsonschema reports those straight from the keyword.
+
+That is the trade `strict_unknown_keys` makes, not a bug: the same freshness that
+lets the checker catch a key upstream REMOVED is what makes it briefly wrong about
+a key upstream ADDED. If you hit it, the escape hatch is to flip
+`strict_unknown_keys` back to `false` for the one PR and merge the schema refresh
+— not to delete the key.
 
 The checker and the schema it validates against live in
 [`.github/coderabbit-config/`](../../.github/coderabbit-config) and are loaded

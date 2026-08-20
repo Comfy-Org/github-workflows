@@ -30,22 +30,56 @@ a schema library calls "invalid":
 | YAML parse error | error | CodeRabbit cannot read the file at all. |
 | `maxLength` violation | error | File-rejecting. The schema carries **14** per-field caps, 50 → 20,000 chars. |
 | type / enum error | error | File-rejecting. |
-| unknown / additional property | **warning** | CodeRabbit *strips* an unrecognized key rather than rejecting the file. Only where the schema closes the object — see below. |
+| unknown / additional property | **warning** | CodeRabbit *strips* an unrecognized key rather than rejecting the file. Reported wherever the schema object accepts only the names it lists — see below. |
 | config path that is not a regular file, or > 512 KiB | exit 2 | "I could not check" must never look like a pass. A path resolving outside the repo root (symlinks resolved) is refused the same way. |
 
 `strict_unknown_keys: true` escalates the last row to an error for a repo that has
 cleaned up and wants to stay clean.
 
-**How far the unknown-key row reaches.** It fires where the schema CLOSES an
-object — the document root, `knowledge_base.mcp`, and the two tool objects that
-declare `additionalProperties: false`. Most nested objects (`reviews`, `chat`,
-`knowledge_base`, `code_generation`, the individual tool configs) are open in
-upstream's schema, so a typo *inside* one — `reviews.profil`, or
-`golangci-lint.enabld` — produces no finding, with or without
-`strict_unknown_keys`. That is a real gap and not a claim this checker makes:
-what it catches is a key in the wrong PLACE, which is the failure that actually
-recurred here. Widening it means cross-checking parsed keys against the schema
-index rather than waiting for jsonschema to complain.
+**How far the unknown-key row reaches.** It fires wherever a schema object accepts
+only the property names it lists — which upstream expresses two different ways,
+and both are checked:
+
+* **explicitly**, with `additionalProperties: false`. Five objects: the document
+  root, `knowledge_base.mcp`, `knowledge_base.linked_repositories[]`, and the
+  `htmlhint` / `stylelint` tool configs. jsonschema reports these.
+* **by omission** — a `properties` block and no statement at all about anything
+  else. **103** objects, including `reviews`, `chat`, `knowledge_base`,
+  `code_generation` and every individual tool config. jsonschema has no keyword to
+  fire on here, so a schema-walk in `_walk_unknown_keys` reports them. This is
+  what catches a typo *inside* an object — `reviews.profil`,
+  `golangci-lint.enabld` — and a key upstream has since REMOVED, such as
+  `reviews.tools.github-checks.timeout_ms`.
+
+The rule the walk applies is conservative: a node is closed by omission only when
+it declares a `properties` block and NONE of `additionalProperties`,
+`unevaluatedProperties`, `patternProperties`, `anyOf`, `oneOf`, `allOf`, `$ref`,
+`$dynamicRef`, `if`, `dependentSchemas`, `propertyNames` or `not`. Each of those
+is a way the object can legitimately accept a name its `properties` does not list,
+so reading any of them as "closed" would invent a finding — `additionalProperties`
+given a SCHEMA rather than `false` (`reviews.mutually_exclusive_groups`, where the
+group names are the user's to choose) is the live example. The walk descends only
+through matched properties and through `items`, never into a combinator branch or
+under a key it just reported, and where the document and the schema disagree about
+shape it stays silent, because that is a type error and jsonschema owns it.
+
+The two halves are disjoint at a single node — one needs the keyword present, the
+other needs it absent — and against **this** vendored schema that is enough to
+make the combined output duplicate-free. It is a fact about the schema rather than
+about the two conditions: jsonschema evaluates a document path against every
+applicable subschema, so a node the walk judges closed whose `$ref` target carried
+`additionalProperties: false` would be reported by both halves. `OpennessTest`
+pins the two premises that rule it out today — the schema carries no `$ref`, and
+no node declaring `properties` also carries a combinator — so a schema refresh
+that breaks either fails there rather than double-annotating a real PR.
+
+**The by-omission half is only as current as the vendored schema.** It reads those
+103 objects as closed against the copy committed here, so a property upstream ADDS
+is an unknown key until `refresh-coderabbit-schema.yml` lands the bump and each
+caller's pin moves. Warn-only mode absorbs that as a warning; a caller running
+`strict_unknown_keys: true` gets a hard failure on a key it was right to add. Same
+freshness, opposite sign, as catching a key upstream removed — see the caller doc's
+rollout section.
 
 A stripped key is not a cosmetic problem. The recurring instance is a `tools:`
 block written at the document root instead of under `reviews:` — the schema root

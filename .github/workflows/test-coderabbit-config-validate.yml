@@ -158,6 +158,36 @@ jobs:
           echo "$out"
           echo "$out" | grep -q '::error '
 
+      - name: Smoke test — a typo INSIDE an object warns, then fails under strict
+        run: |
+          # The closed-by-omission half. `reviews.tools.github-checks` names only
+          # `enabled` and says nothing about the rest, so jsonschema has no
+          # keyword to fire on — `timeout_ms` is a key upstream removed that is
+          # still live in several org repos, doing nothing. A regression that
+          # loses this path is invisible from the default-mode exit code alone,
+          # which is why the strict direction is asserted too.
+          root="$(mktemp -d)"
+          cat > "$root/.coderabbit.yaml" <<'YAML'
+          reviews:
+            tools:
+              github-checks:
+                enabled: true
+                timeout_ms: 90000
+          YAML
+          out="$(python3 "$CHECK" --root "$root")"   # must NOT fail by default
+          echo "$out"
+          echo "$out" | grep -q '::warning '
+          echo "$out" | grep -q 'unknown key `timeout_ms`'
+          echo "$out" | grep -q 'reviews.tools.github-checks'
+
+          if out="$(python3 "$CHECK" --root "$root" --strict-unknown-keys)"; then
+            echo "::error::strict_unknown_keys did not fail a stale key inside a tool object"
+            echo "$out"
+            exit 1
+          fi
+          echo "$out"
+          echo "$out" | grep -q '::error '
+
       - name: Smoke test — malformed YAML fails
         run: |
           root="$(mktemp -d)"
