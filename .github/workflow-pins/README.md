@@ -84,7 +84,9 @@ not a guard. A `ref:` resolved from a step that never
 touches `workflows_ref` is not this lint's subject and is left alone.
 
 Two preconditions decide whether the detector treats the resolver as one, so
-copy the idiom with both intact:
+copy the idiom with both intact. The second is now an error in its own right
+(below), but the FIRST is still silent — an unrecognized *binding* drops the
+consumer out of coverage rather than raising a different error:
 
 - **The binding is matched literally.** The producing step's `env:` must bind
   `WORKFLOWS_REF: ${{ inputs.workflows_ref }}` or
@@ -107,7 +109,10 @@ fail-open. A per-job step-id pre-scan now separates the two cases: a `ref:`
 resolved from an EARLIER step that exists but never touches `workflows_ref`
 stays out of scope, while a dangling id fails with its own message (the
 BE-8130 remedies don't apply — adding the `if:` on a nonexistent output guards
-nothing that will ever run; the fix is the id itself, or the step order).
+nothing that will ever run; the fix is the id itself, or the step order). Only
+a `ref:` that is a step's `with:` INPUT is judged this way — a job-level
+`outputs:` mapping or a `ref:` line inside a `run:` heredoc is not a checkout
+and is left alone, as it always was.
 
 **`||` fallbacks are read on this path too, with leading-operand judgment
 (BE-8215).** `ref: ${{ steps.<id>.outputs.<name> || 'main' }}` used to match
@@ -116,8 +121,18 @@ by operand order exactly as the input side is: when the FIRST `||` operand is
 the step output, the site is covered by the usual routes (a fail-closed
 resolver, or the exact `if:` — under which the fallback arm is unreachable
 dead code, so it passes); when the leading operand is anything else
-(`${{ 'main' || steps.<id>.outputs.<name> }}`), the literal wins on every
-runner and the site is unguarded unconditionally.
+(`${{ 'main' || steps.<id>.outputs.<name> }}`), it wins on every runner and the
+site is unguarded unconditionally — with its own
+message, because neither BE-8130 remedy can fix operand order. A leading
+operand `||` falls *through* (`false`, `''`, `""`, `0`, `null`) still reaches
+the output and is judged normally.
+
+Spellings this reader still does not recognize — a fallback containing a brace
+(`|| format('refs/heads/{0}', 'main')`), a parenthesized operand
+(`(steps.<id>.outputs.<name>) || 'main'`), and `&&` rather than `||` — match
+nothing and record no site, exactly as every `||` spelling did before BE-8215.
+Write the ref as a bare `${{ steps.<id>.outputs.<name> }}` under the exact
+`if:`, or as a plain `|| <literal>` fallback, and it is covered.
 
 **The lint enforces that split, rather than trusting the prose.** The fallback
 answers *mutability*; the guard answers *emptiness*; a checkout using the
