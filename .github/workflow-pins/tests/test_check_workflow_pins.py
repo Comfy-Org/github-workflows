@@ -994,6 +994,24 @@ class GuardCoverageTests(unittest.TestCase):
         wrapped = "        if: ${{ steps.resolve_ref.outputs.ref != '' }}\n"
         self.assertEqual(self._jobs(self.RESOLVER + self._step_output_checkout(wrapped)), [])
 
+    def test_a_quoted_if_scalar_passes(self):
+        # `if: "…"` is the same condition wearing YAML quotes. Failing it would
+        # fail a consumer that has the remedy already applied.
+        quoted = '        if: "steps.resolve_ref.outputs.ref != \'\'"\n'
+        self.assertEqual(self._jobs(self.RESOLVER + self._step_output_checkout(quoted)), [])
+
+    def test_a_quoted_wrapped_if_scalar_passes(self):
+        # The two spellings compose: a `${{ … }}` wrapper inside the quotes.
+        quoted = '        if: "${{ steps.resolve_ref.outputs.ref != \'\' }}"\n'
+        self.assertEqual(self._jobs(self.RESOLVER + self._step_output_checkout(quoted)), [])
+
+    def test_unwrapping_quotes_does_not_widen_the_match(self):
+        # The strip removes exactly one leading and one trailing `"`, and the
+        # comparison after it is still character-exact — an OR-widened
+        # condition stays refused when it is written as a quoted scalar.
+        widened = '        if: "steps.resolve_ref.outputs.ref != \'\' || always()"\n'
+        self.assertEqual(len(self._jobs(self.RESOLVER + self._step_output_checkout(widened))), 1)
+
     def test_a_job_level_if_does_not_cover_a_step_output_checkout(self):
         # A job-level `if:` skips the RESOLVER too, so it can never tell an
         # empty output from a populated one. Only the consuming step's own
@@ -1181,6 +1199,14 @@ class GuardCoverageTests(unittest.TestCase):
         resolver = [s.strip() for s in self._enclosing_step(lines, resolvers[0])]
         self.assertIn("*[!A-Za-z0-9._/@+-]*) REF='' ;;", resolver)
         self.assertIn("export LC_ALL=C", resolver)
+        # …and it must stay NEVER-FAIL, which the lint also cannot assert.
+        # The lint takes a fail-closed resolver as an ALTERNATIVE to the
+        # consumer's `if:`, so deleting `continue-on-error: true` here and
+        # exiting non-zero on an unresolvable ref would keep the lint green
+        # while making this job able to FAIL — and a failing ledger job takes
+        # the whole review matrix down with it, which is the one thing the job
+        # is built never to do.
+        self.assertIn("continue-on-error: true", resolver)
         # …and it must resolve from the BE-8077 fallback. Every assertion above
         # still passed with the binding swapped for `|| 'main'`, which is the
         # mutable-ref hole BE-8077 exists to close — and the lint still cannot

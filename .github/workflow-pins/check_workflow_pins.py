@@ -879,7 +879,8 @@ def _skips_on_empty_output(lines, idx, step_id, out):
     The empty case moves to the CONSUMER once the ref is resolved a step early,
     and the only thing that can carry it there is a step-level `if:` that is
     EXACTLY the non-empty test on that same output. Matched exactly, and only
-    two spellings of it — bare, and `${{ … }}`-wrapped:
+    the spellings YAML offers for that one condition — bare or `${{ … }}`-
+    wrapped, each optionally written as a double-quoted scalar:
 
     - **No OR-widening.** `steps.x.outputs.ref != '' || always()` runs the
       checkout precisely when the output is empty, which is the hole inverted.
@@ -900,6 +901,21 @@ def _skips_on_empty_output(lines, idx, step_id, out):
         if not _STEP_IF_RE.match(line):
             continue
         cond = _strip_comment(line.split(":", 1)[1])
+        # `if: "steps.x.outputs.ref != ''"` is the same condition, spelled as a
+        # quoted scalar; unwrap ONE matching pair so the quoted form is not
+        # failed for being quoted. This cannot widen what follows — the
+        # comparison below is still character-exact, so the only string the
+        # strip can newly accept is the wanted condition wearing quotes.
+        #
+        # DOUBLE quotes only. A YAML single-quoted scalar escapes its inner `'`
+        # as `''`, so this condition is spelled `'… != '''''` there, and
+        # unwrapping that without also undoing the escape would compare the
+        # wrong string. Undoing it is a second YAML rule an exact-match test has
+        # no need to learn, and the cost of not learning it is LOUD: that
+        # spelling fails the lint with the remedy naming the accepted form,
+        # rather than passing something unguarded.
+        if len(cond) >= 2 and cond[0] == '"' and cond[-1] == '"':
+            cond = cond[1:-1].strip()
         if cond.startswith("${{") and cond.endswith("}}"):
             cond = cond[3:-2].strip()
         # Runs of whitespace collapse to one space, which can only ever REJECT
