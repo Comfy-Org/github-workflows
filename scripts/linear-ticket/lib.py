@@ -29,7 +29,14 @@ MARKER = "<!-- linear-ticket-check -->"
 
 # The stable commit-status context branch protection requires. Publishing is done in
 # validate.py; the name lives here so the tests can pin it.
-CONTEXT = "linear-ticket"
+#
+# HUMAN-FACING, AND A CONTRACT. GitHub renders this verbatim as the check's name in the PR's
+# check list, so it is prose, not a slug — but it is also the exact string a consumer puts in
+# its ruleset's required-checks list. Renaming it is free only while NO caller requires the
+# context: the moment one does, a rename silently retires the required check (the new context
+# is never satisfied, the old one is never reported again) and that repo's merges hang on a
+# check nobody is publishing. Check every caller's ruleset before touching this.
+CONTEXT = "Linear ticket"
 
 # The design's case-insensitive identifier shape: [A-Z][A-Z0-9]*-\d+.
 _CANDIDATE_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*-[0-9]+")
@@ -216,7 +223,7 @@ def failure_guidance(category: str) -> str:
 # ── how a failure is REPORTED (loudness, not diagnosis) ─────────────────────────────────
 # select_failure_category above says WHY a check is red; the mode below says how loudly it is
 # reported. Whether a red check BLOCKS a merge is never decided here — that is branch
-# protection deciding whether the `linear-ticket` context is required:
+# protection deciding whether the `Linear ticket` context is required:
 #
 #   enforce                    -> failure status, exit 1. The gating configuration.
 #   warn-only + soft-fail      -> failure status, exit 0. Shows on the PR exactly like enforce
@@ -235,9 +242,18 @@ def failure_guidance(category: str) -> str:
 # A commit status description is the PR-visible one-liner. It must state the DIAGNOSIS this
 # run actually reached: "no linked Linear issue" is wrong for infra_error, where Linear could
 # not be queried at all and the run therefore determined nothing about the ticket.
+#
+# KEEP EVERY HEADLINE DISTINCT. The description no longer carries the `(category)` slug, so
+# the headline is the whole of the PR-visible diagnosis — two categories sharing one headline
+# renders them byte-identically beside the check name while their remedies differ
+# (no_candidate: add a link at all; exists_not_linked: Linear knows the issue but has not
+# attached it yet, usually the async-link race, so re-run before touching anything). The
+# category still reaches the marker comment and job summary, but upsert_marker_comment
+# downgrades a write failure to a warning, so the description can be the only signal that
+# survives. A test pins the descriptions pairwise-distinct.
 _STATUS_HEADLINE = {
     "no_candidate": "No linked Linear issue",
-    "exists_not_linked": "No linked Linear issue",
+    "exists_not_linked": "Referenced Linear issue is not linked yet",
     "policy_mismatch": "Linked Linear issue fails this repo's policy",
     "infra_error": "Could not verify — Linear could not be queried",
 }
@@ -246,7 +262,7 @@ _STATUS_HEADLINE = {
 # red X as a merge block (and nobody assumes it will stay non-blocking forever).
 #
 # WORDING IS DELIBERATELY HEDGED. This validator never reads the caller's ruleset, so it cannot
-# know whether `linear-ticket` is a required context — asserting "this does not block" would be
+# know whether `Linear ticket` is a required context — asserting "this does not block" would be
 # a flat lie in exactly the configuration docs/callers/linear-ticket.md calls a footgun
 # (warn-only + the context already required), and would send that author to debug the wrong
 # thing. So the note states what IS knowable (this workflow is not what blocks; a warn-only
@@ -255,9 +271,9 @@ _STATUS_HEADLINE = {
 _ADVISORY_BASE = (
     "> ⚠️ **Advisory — this check is warn-only.** It is reported as failing so it shows up in "
     "the PR's check list, but nothing this workflow does blocks a merge: what blocks is your "
-    "repository's ruleset requiring the `linear-ticket` status context, and a warn-only pilot "
+    "repository's ruleset requiring the `Linear ticket` status context, and a warn-only pilot "
     "is meant to run *before* that context is required. If your merge button is actually "
-    "blocked on `linear-ticket`, then the context is already required while the pilot is still "
+    "blocked on `Linear ticket`, then the context is already required while the pilot is still "
     "warn-only — tell the repository owners, because that combination is a misconfiguration."
 )
 _ADVISORY_TAIL = {
@@ -330,7 +346,7 @@ def failure_outcome(category: str, enforce: bool, soft_fail: bool) -> FailureOut
         return FailureOutcome(
             verdict=f"\u274c fail ({category})",
             state="failure",
-            description=f"{headline} ({category})",
+            description=headline,
             exit_code=1,
             advisory=False,
         )
@@ -338,14 +354,14 @@ def failure_outcome(category: str, enforce: bool, soft_fail: bool) -> FailureOut
         return FailureOutcome(
             verdict=f"\u274c fail ({category}) \u2014 warn-only",
             state="failure",
-            description=f"Warn-only: {headline[0].lower()}{headline[1:]} ({category})",
+            description=f"Warn-only: {headline[0].lower()}{headline[1:]}",
             exit_code=0,
             advisory=True,
         )
     return FailureOutcome(
         verdict=f"\u26a0\ufe0f warn-only (would fail: {category})",
         state="success",
-        description=f"warn-only: would fail ({category})",
+        description=f"Warn-only (would fail): {headline[0].lower()}{headline[1:]}",
         exit_code=0,
         advisory=False,
     )

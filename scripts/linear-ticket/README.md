@@ -9,7 +9,7 @@ matching this repo's Python convention.
 | File | Role |
 |---|---|
 | `lib.py` | Pure, network-free core — candidate extraction, `team-keys` validation, the attachment **policy gate** (`filter_issues`), Linear error classification, failure-category selection, failure copy, and the batched diagnostic-query builder. Imported by `validate.py` and by the test suite. |
-| `validate.py` | The side-effecting orchestration: resolve the PR from the `workflow_run` event, skip unprotected base branches, refetch it, publish the `linear-ticket` commit status, query `attachmentsForURL`, apply the gate, run one batched diagnostic query, and maintain the single marker PR comment. GitHub via the `gh` CLI (`subprocess`), Linear via `urllib`. Imports `lib.py`. |
+| `validate.py` | The side-effecting orchestration: resolve the PR from the `workflow_run` event, skip unprotected base branches, refetch it, publish the `Linear ticket` commit status, query `attachmentsForURL`, apply the gate, run one batched diagnostic query, and maintain the single marker PR comment. GitHub via the `gh` CLI (`subprocess`), Linear via `urllib`. Imports `lib.py`. |
 | `tests/` | Hermetic `unittest` suites over the pure core and protected-branch orchestration — no network. |
 
 ## The invariant
@@ -17,7 +17,7 @@ matching this repo's Python convention.
 The **only** thing that turns the check green is an attachment Linear returns for the PR's
 canonical `html_url` (`attachmentsForURL`) whose issue satisfies policy — `filter_issues`.
 This invariant applies when the PR targets a protected branch; an unprotected target is outside
-the gate and publishes no `linear-ticket` status or Linear query. A `TEAM-123`-shaped string an
+the gate and publishes no `Linear ticket` status or Linear query. A `TEAM-123`-shaped string an
 author types is not a link. So:
 
 - The PR URL is passed to Linear as a **GraphQL variable**, never interpolated into the query.
@@ -56,7 +56,7 @@ author types is not a link. So:
   status state, comment headline, and exit code; the diagnosis is identical in every mode.
   `enforce: true` → red status + nonzero exit. `enforce: false` (warn-only) never exits
   nonzero *on a verdict* and, with `soft-fail: true`, still publishes a **red** status — loud
-  on the PR but blocking nothing while `linear-ticket` is not a required context, with a
+  on the PR but blocking nothing while `Linear ticket` is not a required context, with a
   category-aware advisory note on the comment. `soft-fail: false` restores the silent
   always-green warn-only behaviour, and so does an **absent** `SOFT_FAIL` env: the workflow
   always passes it, so absent means a skewed `workflows_ref`/`uses:` pin, and a caller that

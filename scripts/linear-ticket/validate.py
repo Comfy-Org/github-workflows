@@ -2,7 +2,7 @@
 """Side-effecting orchestration behind linear-ticket.yml.
 
 Imports lib.py for every decision and owns only I/O: resolve the PR from the workflow_run
-event, refetch it, publish the ``linear-ticket`` commit status, query Linear's
+event, refetch it, publish the ``Linear ticket`` commit status, query Linear's
 attachmentsForURL for the PR's canonical html_url, apply the policy gate, run one batched
 diagnostic query, and maintain exactly one marker PR comment.
 
@@ -23,7 +23,7 @@ Contract (all via env, set by linear-ticket.yml):
                        exits nonzero; a broken run still can — see finish_fail and run())
     SOFT_FAIL          warn-only only: "true" publishes a red `failure` status — loud, and
                        non-blocking for as long as the caller's ruleset does not require the
-                       `linear-ticket` context; "false" (and, deliberately, an ABSENT value)
+                       `Linear ticket` context; "false" (and, deliberately, an ABSENT value)
                        keeps the silent always-green warn-only behaviour
     RUN_URL            html_url of this workflow run, for the status target and comment
     LINEAR_API_URL     optional override (default https://api.linear.app/graphql)
@@ -111,7 +111,7 @@ class GitHub:
 
     def publish_status(self, sha: str, state: str, description: str, target_url: str,
                        *, critical: bool = False) -> bool:
-        """Publish the ``linear-ticket`` commit status. Returns True on success.
+        """Publish the ``Linear ticket`` commit status. Returns True on success.
 
         A TERMINAL write (success/failure/warn-only) is ``critical=True``: if it fails, the
         old status stays as the required context — a prior ``success`` could then keep gating
@@ -365,7 +365,7 @@ class Validator:
         # The signal workflow runs only on `pull_request`, so the triggering run's event must
         # be `pull_request`. The caller's workflow-name + conclusion filters do not prove that;
         # a miswired caller pointed at a `push` workflow could otherwise resolve an open PR from
-        # the pushed head SHA and publish `linear-ticket` for it. Fail fast instead.
+        # the pushed head SHA and publish `Linear ticket` for it. Fail fast instead.
         wr_event = wr.get("event") or ""
         if wr_event != "pull_request":
             error(f"Triggering workflow_run event was '{wr_event}', not 'pull_request'. The "

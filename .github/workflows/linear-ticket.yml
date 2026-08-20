@@ -17,11 +17,11 @@ name: Linear Ticket (reusable)
 #   * every PR-derived value (branch, title, body, labels, URL) is untrusted DATA, passed
 #     through env / GraphQL variables, never shell-interpolated.
 # The job runs on the DEFAULT branch, so its job-level check must NOT be the required merge
-# check. Instead validate.sh publishes the `linear-ticket` commit status on the refetched PR
+# check. Instead validate.sh publishes the `Linear ticket` commit status on the refetched PR
 # head SHA; branch protection requires THAT context. See docs/callers/linear-ticket.md.
 #
 # REPORTING MODES — how loudly a failure is reported. This workflow NEVER decides whether a PR
-# can merge; branch protection does, by requiring the `linear-ticket` context or not:
+# can merge; branch protection does, by requiring the `Linear ticket` context or not:
 #   enforce: true                     red status, job exits nonzero. Gating (once required).
 #   enforce: false                    red status, job stays green on a failing VERDICT (a
 #     (soft-fail: true, the default)  broken run still exits nonzero). Shows on the PR exactly
@@ -36,7 +36,7 @@ name: Linear Ticket (reusable)
 #   actions: read           # read the triggering workflow_run
 #   contents: read          # checkout THIS repo's scripts (no PR code is ever checked out)
 #   pull-requests: write    # the one marker diagnostic comment
-#   statuses: write         # publish the `linear-ticket` commit status
+#   statuses: write         # publish the `Linear ticket` commit status
 #
 # SECRET: LINEAR_API_TOKEN (required). Store the value exactly as it goes into Linear's
 # Authorization header — a personal API key raw, an OAuth actor-auth access token prefixed
@@ -104,7 +104,7 @@ on:
         description: >-
           Warn-only only (ignored when `enforce: true`). true (default) publishes a red
           `failure` commit status so the PR's check list shows the check failing — loud, but
-          NON-BLOCKING for as long as `linear-ticket` is not a required status in the repo's
+          NON-BLOCKING for as long as `Linear ticket` is not a required status in the repo's
           branch protection, which is exactly what a warn-only pilot means. The marker comment
           says so. false restores the silent variant: warn-only publishes `success` and only
           the job summary and comment carry the verdict.
@@ -112,7 +112,7 @@ on:
           warn-only always published `success`, so taking a SHA bump past this commit flips
           those callers to a red (still non-required) status with no caller-side edit. Set
           `soft-fail: false` in the caller to keep the old always-green behaviour.
-          FOOTGUN: `enforce: false` + `soft-fail: true` + `linear-ticket` already required in
+          FOOTGUN: `enforce: false` + `soft-fail: true` + `Linear ticket` already required in
           branch protection WOULD block merges. Do not require the context before flipping
           `enforce: true`.
         type: boolean
@@ -146,7 +146,7 @@ jobs:
       actions: read           # read the triggering workflow_run
       contents: read          # checkout the validator scripts; PR code is never checked out
       pull-requests: write    # the one marker diagnostic comment
-      statuses: write         # publish the linear-ticket commit status
+      statuses: write         # publish the `Linear ticket` commit status
     steps:
       - name: Require a pinned workflows_ref
         # workflows_ref runs THIS repo's scripts in a job holding the caller's write token +
