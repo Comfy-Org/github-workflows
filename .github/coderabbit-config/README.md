@@ -61,9 +61,25 @@ given a SCHEMA rather than `false` (`reviews.mutually_exclusive_groups`, where t
 group names are the user's to choose) is the live example. The walk descends only
 through matched properties and through `items`, never into a combinator branch or
 under a key it just reported, and where the document and the schema disagree about
-shape it stays silent, because that is a type error and jsonschema owns it. The
-two halves are disjoint by construction: one needs the keyword present, the other
-needs it absent.
+shape it stays silent, because that is a type error and jsonschema owns it.
+
+The two halves are disjoint at a single node — one needs the keyword present, the
+other needs it absent — and against **this** vendored schema that is enough to
+make the combined output duplicate-free. It is a fact about the schema rather than
+about the two conditions: jsonschema evaluates a document path against every
+applicable subschema, so a node the walk judges closed whose `$ref` target carried
+`additionalProperties: false` would be reported by both halves. `OpennessTest`
+pins the two premises that rule it out today — the schema carries no `$ref`, and
+no node declaring `properties` also carries a combinator — so a schema refresh
+that breaks either fails there rather than double-annotating a real PR.
+
+**The by-omission half is only as current as the vendored schema.** It reads those
+103 objects as closed against the copy committed here, so a property upstream ADDS
+is an unknown key until `refresh-coderabbit-schema.yml` lands the bump and each
+caller's pin moves. Warn-only mode absorbs that as a warning; a caller running
+`strict_unknown_keys: true` gets a hard failure on a key it was right to add. Same
+freshness, opposite sign, as catching a key upstream removed — see the caller doc's
+rollout section.
 
 A stripped key is not a cosmetic problem. The recurring instance is a `tools:`
 block written at the document root instead of under `reviews:` — the schema root

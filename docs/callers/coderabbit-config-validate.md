@@ -71,6 +71,24 @@ python3 -m pip install --require-hashes --only-binary=:all: \
 python3 .github/coderabbit-config/check_coderabbit_config.py --root /path/to/your/repo
 ```
 
+**The by-omission half has a staleness window — mind it before turning strict on.**
+The 103 by-omission objects are read as closed against the schema *vendored at
+your pinned `workflows_ref`*, so a property upstream ADDS — a new linter under
+`reviews.tools`, a new knob on an existing one — is an unknown key to this
+checker until two things land: the weekly `refresh-coderabbit-schema.yml` PR in
+`Comfy-Org/github-workflows`, **and** your repo's SHA bump on top of it. In
+default warn-only mode that window costs you a warning on a config CodeRabbit is
+perfectly happy with. Under `strict_unknown_keys: true` it is a hard CI failure,
+on whatever unrelated PR happens to be open, over a key you were right to add.
+The five *explicitly* closed objects (the document root among them) have no such
+window — jsonschema reports those straight from the keyword.
+
+That is the trade `strict_unknown_keys` makes, not a bug: the same freshness that
+lets the checker catch a key upstream REMOVED is what makes it briefly wrong about
+a key upstream ADDED. If you hit it, the escape hatch is to flip
+`strict_unknown_keys` back to `false` for the one PR and merge the schema refresh
+— not to delete the key.
+
 The checker and the schema it validates against live in
 [`.github/coderabbit-config/`](../../.github/coderabbit-config) and are loaded
 from **this** repo at your pinned `workflows_ref` — never from your checkout — so

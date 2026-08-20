@@ -131,9 +131,12 @@ _OPENER_KEYWORDS = (
 # The walk's own bounds, for the same reason `iter_errors` is collected through
 # `islice`: the document is PR-controlled, and while PyYAML constructs an anchored
 # mapping once, an aliased document is walkable as a much larger tree — the same
-# billion-laughs shape in a few hundred bytes. Budgeting the number of KEYS
-# inspected (rather than nodes visited) is what makes the bound linear in real
-# work: one visit to a mapping with 100k keys costs 100k, not 1.
+# billion-laughs shape in a few hundred bytes. The budget is charged BOTH per key
+# inspected and per node visited, and it needs both halves: per-key is what keeps
+# the bound linear in real work (one visit to a mapping with 100k keys costs
+# 100k, not 1), while per-visit is what covers list traversal, which names no key
+# at all — an aliased nested list charges 1 for the outer entry and would
+# otherwise descend through thousands of elements for free.
 #
 # The depth cap is belt-and-braces rather than the working bound: descent follows
 # the SCHEMA (matched properties and `items`), whose nesting is finite and shallow,
@@ -147,6 +150,11 @@ MAX_WALK_DEPTH = 64
 # proposing a home for when the name is specific enough that a same-named
 # property elsewhere in the schema is likely the intended one.
 _SUGGESTABLE_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{2,}$")
+
+# How many homes may be named before the hint stops being a hint. A name with
+# more plausible homes than this has no single likely one, so listing the
+# alphabetically-first few is guessing out loud — see `_suggest_home`.
+_MAX_SUGGESTIONS = 3
 
 
 class ConfigError(Exception):
@@ -216,13 +224,34 @@ def _index_schema_paths(schema):
 
 
 def _suggest_home(key, schema_index, offending_path):
-    """A one-line 'did you mean' for an unknown key, or '' when there is none."""
+    """A one-line 'did you mean' for an unknown key, or '' when there is none.
+
+    Written for the root-level `tools:` case: a name specific enough that the one
+    other place the schema uses it is almost certainly where it belonged. Keys
+    found by the closed-by-omission walk break that assumption, because nested
+    unknown keys are dominated by GENERIC names — `enabled` sits at ~72 places in
+    this schema, plus `scope`, `path`, `instructions` — and for one of those the
+    three alphabetically-first paths are three homes that are all probably wrong
+    (`reviews.tools.enabled` used to be answered with `issue_enrichment.*`).
+
+    So the shortlist prefers candidates under the offending key's OWN parent —
+    that is the "written one level too high" shape the hint exists for — and a
+    name with more homes than `_MAX_SUGGESTIONS` to choose between gets no hint
+    at all. No hint is strictly better than a confident wrong one.
+    """
     if not isinstance(key, str) or not _SUGGESTABLE_KEY_RE.match(key):
         return ""
     candidates = [p for p in schema_index.get(key, []) if p != offending_path]
     if not candidates:
         return ""
-    shown = ", ".join(f"`{c}`" for c in sorted(candidates)[:3])
+    parent = offending_path.rsplit(".", 1)[0] if "." in offending_path else ""
+    if parent:
+        nearer = [c for c in candidates if c.startswith(f"{parent}.")]
+        if nearer:
+            candidates = nearer
+    if len(candidates) > _MAX_SUGGESTIONS:
+        return ""
+    shown = ", ".join(f"`{c}`" for c in sorted(candidates))
     return f" Did you mean {shown}?"
 
 
@@ -270,22 +299,42 @@ def _line_for_path(node, path_parts):
     return current.start_mark.line + 1
 
 
-def _key_line(node, parent_parts, key):
-    """1-based YAML line of the KEY `key` inside the mapping at `parent_parts`.
+def _resolved_key(key_node):
+    """The Python value a composed KEY node loads to — tag-aware, like `safe_load`.
 
-    An unknown key has no value the schema knows about, so the useful annotation
-    points at the key itself.
+    A raw text compare is not enough: `safe_load` resolves plain `true`/`on`/`yes`
+    to True, `null`/`~` to None and `0x10` to 16, so the key sitting in the loaded
+    dict and the key node's source text are routinely different objects. Going the
+    other way (compare `str(loaded)` to the text) is what dropped the line number
+    for exactly those keys. Constructing the node the way `safe_load` constructed
+    it makes the two comparable again, and gets the mirror case right too: a
+    quoted `"true"` keeps its string tag and must NOT match the boolean.
+    """
+    try:
+        return yaml.constructor.SafeConstructor().construct_object(key_node, deep=True)
+    except Exception:  # pragma: no cover - a key safe_load accepted constructs here
+        return getattr(key_node, "value", None)
+
+
+def _key_node(node, parent_parts, key):
+    """The composed KEY node for `key` inside the mapping at `parent_parts`, or None.
+
+    An unknown key has no value the schema knows about, so both the useful
+    annotation line and the name worth printing come from the key itself.
     """
     parent = node
     for part in parent_parts:
-        parent = _descend(parent, part)
         if parent is None:
             return None
+        parent = _descend(parent, part)
     if not isinstance(parent, yaml.MappingNode):
         return None
     for key_node, _ in parent.value:
-        if getattr(key_node, "value", None) == key:
-            return key_node.start_mark.line + 1
+        try:
+            if _resolved_key(key_node) == key:
+                return key_node
+        except Exception:  # pragma: no cover - an exotic key that will not compare
+            continue
     return None
 
 
@@ -311,14 +360,30 @@ def _unknown_key_finding(severity, node, parent_parts, key, schema_index):
     construction rather than by two copies staying in step.
 
     YAML keys need not be strings (`1:`, `true:`, `2026-01-01:` all parse to
-    non-strings), so the name is coerced for display: without it `_format_path`
-    would render an integer key as a LIST INDEX (`reviews[1]` for `reviews: {1: x}`)
-    and `_key_line` would compare an int against the composed node's string value
-    and silently return no line. `_suggest_home` needs no coercion guard of its
-    own — `_SUGGESTABLE_KEY_RE` already rejects anything that is not a plausible
-    property name.
+    non-strings), and the display name must be the SOURCE SPELLING, taken from
+    the composed key node. `str()` on the loaded value is not that spelling and
+    not even always a key present in the file: `true:`/`on:`/`yes:` all load as
+    True and rendered `reviews.True`, `0x10:` rendered `reviews.16`, `null:`
+    rendered `reviews.None` — each naming a key that appears nowhere, with no line
+    number to correct the impression, because the lookup then compared "True"
+    against the node's "true" and found nothing. Reading name and line off the one
+    node fixes both together.
+
+    The `str()` coercion survives as the fallback for a key whose node cannot be
+    found (an aliased or merge-keyed mapping the composed tree will not follow),
+    where it is still needed: without it `_format_path` would render an integer
+    key as a LIST INDEX (`reviews[1]` for `reviews: {1: x}`). `_suggest_home`
+    needs no coercion guard of its own — `_SUGGESTABLE_KEY_RE` already rejects
+    anything that is not a plausible property name.
     """
-    name = key if isinstance(key, str) else str(key)
+    key_node = _key_node(node, parent_parts, key)
+    text = getattr(key_node, "value", None)
+    if isinstance(text, str):
+        name = text
+        line = key_node.start_mark.line + 1
+    else:
+        name = key if isinstance(key, str) else str(key)
+        line = None
     full = _format_path(parent_parts + [name])
     where = (
         "at the document root"
@@ -328,7 +393,7 @@ def _unknown_key_finding(severity, node, parent_parts, key, schema_index):
     return (
         severity,
         full,
-        _key_line(node, parent_parts, name),
+        line,
         f"unknown key `{name}` {where}. CodeRabbit STRIPS keys it "
         f"does not recognize, so the config still loads but "
         f"everything under this key silently does nothing."
@@ -356,22 +421,40 @@ def _walk_unknown_keys(data, schema, node, schema_index, severity, limit):
         the schema wants a scalar, and so on) it stays SILENT. That is a type
         error, and reporting it is `iter_errors`' job — saying it twice, in two
         different vocabularies, is worse than saying it once.
-      * it never fires where jsonschema does. The two conditions are complements:
-        jsonschema needs the keyword present, this needs it absent. That is what
-        makes the combined output duplicate-free by construction rather than by a
-        de-duplication pass that could drift.
+      * against THIS vendored schema it never fires where jsonschema does, which
+        is what makes the combined output duplicate-free by construction rather
+        than by a de-duplication pass that could drift. Note that is a fact about
+        the schema, not a property of the two conditions: they are complements at
+        a SINGLE node — jsonschema needs the keyword present, this needs it absent
+        — but jsonschema evaluates a document path against every applicable
+        subschema, so a node reached through `properties` with no opener of its
+        own (which this walk judges closed) whose `$ref` target or a combinator
+        branch carried `additionalProperties: false` would be reported by both
+        halves. It holds today because the schema has no `$ref`, and because a
+        node that declares `properties` alongside a combinator counts as OPEN
+        here — both asserted in `OpennessTest`.
 
     `limit` caps the findings (the caller sizes it from what is left of
-    MAX_FINDINGS). Returns (findings, budget_exhausted) — the flag says the walk
-    stopped early on MAX_WALK_KEYS and therefore did NOT see the whole document,
-    which the caller reports rather than passing off as a clean bill of health.
+    MAX_FINDINGS). Returns (findings, bounded) — the flag says the walk hit one of
+    its OWN limits (`MAX_WALK_KEYS` or `MAX_WALK_DEPTH`) and therefore did NOT see
+    the whole document, which the caller reports rather than passing off as a
+    clean bill of health. It is set at the sites that actually bail, not derived
+    from the leftover budget afterwards: a document whose keys land exactly on
+    `MAX_WALK_KEYS` was walked in full and must not be reported as partial, and a
+    depth cutoff is just as partial as an exhausted budget. Stopping on `limit` is
+    NOT bounded — that is truncation, which the caller reports separately.
     """
     findings = []
     remaining_keys = [MAX_WALK_KEYS]
+    bounded = [False]
 
     def walk(value, subschema, path, depth):
-        if len(findings) >= limit or remaining_keys[0] <= 0 or depth > MAX_WALK_DEPTH:
+        if len(findings) >= limit:
             return
+        if remaining_keys[0] <= 0 or depth > MAX_WALK_DEPTH:
+            bounded[0] = True
+            return
+        remaining_keys[0] -= 1
         if isinstance(value, list):
             items = subschema.get("items")
             if isinstance(items, dict):
@@ -385,7 +468,10 @@ def _walk_unknown_keys(data, schema, node, schema_index, severity, limit):
             return
         closed = not any(keyword in subschema for keyword in _OPENER_KEYWORDS)
         for key, child in value.items():
-            if len(findings) >= limit or remaining_keys[0] <= 0:
+            if len(findings) >= limit:
+                return
+            if remaining_keys[0] <= 0:
+                bounded[0] = True
                 return
             remaining_keys[0] -= 1
             if key in properties:
@@ -399,7 +485,7 @@ def _walk_unknown_keys(data, schema, node, schema_index, severity, limit):
 
     if isinstance(schema, dict):
         walk(data, schema, [], 0)
-    return findings, remaining_keys[0] <= 0
+    return findings, bounded[0]
 
 
 def _describe(error, path_str):
@@ -519,13 +605,25 @@ def validate(text, schema, strict_unknown_keys=False):
             ("error", path_str, _line_for_path(node, parent_parts), _describe(error, path_str))
         )
 
+    # `islice` above bounds the ERROR count, not the finding count, and one error
+    # fans out to many findings: `additionalProperties: false` reports a whole
+    # mapping in a SINGLE error and `_extra_keys` splits it into one finding per
+    # unknown key, so 150 unknown root keys arrive here as 150 findings from one
+    # error. Re-apply the cap to the findings themselves before anything is
+    # derived from their number — unfixed, that overflow printed 150 annotations
+    # into a public run log with `truncated` still False, and drove `remaining`
+    # to 0, silently disabling the by-omission walk on top.
+    if len(findings) > MAX_FINDINGS:
+        del findings[MAX_FINDINGS:]
+        truncated = True
+
     # The other 103 objects: closed by OMISSION, so jsonschema said nothing about
     # them. Appended after the jsonschema findings rather than merged into their
     # sort, which keeps both halves in document order within themselves and the
     # whole list stable run to run. One past `remaining` so an overflow is
     # detectable; `remaining` can be 0, in which case a single walk finding is
     # enough to prove the combined total passed the cap.
-    remaining = max(0, MAX_FINDINGS - len(findings))
+    remaining = MAX_FINDINGS - len(findings)
     walked, walk_bounded = _walk_unknown_keys(
         data, schema, node, schema_index, unknown_severity, remaining + 1
     )
@@ -537,10 +635,24 @@ def validate(text, schema, strict_unknown_keys=False):
     if walk_bounded:
         # Say so rather than let a partial walk read as a clean one — the same
         # reason an absent config is reported instead of passing silently.
-        notes.append(
-            f"the unknown-key scan stopped after inspecting {MAX_WALK_KEYS} keys "
-            f"(a very large or heavily aliased document), so nested keys past that "
-            f"point were NOT checked."
+        #
+        # A FINDING, not a note, and carrying `unknown_severity`: a note does not
+        # reach the exit code, so a walk that gave up early still exited 0 even
+        # under `strict_unknown_keys: true` — a repo that asked for unknown keys
+        # to FAIL got a green check over keys nothing ever looked at. That is the
+        # "I could not check" reading as a pass that an oversized config exits 2
+        # for. Warn-only mode is unchanged: it stays a warning, exactly like the
+        # unknown keys it could not go looking for.
+        findings.append(
+            (
+                unknown_severity,
+                "(document root)",
+                None,
+                f"the unknown-key scan stopped early — after {MAX_WALK_KEYS} keys "
+                f"or at depth {MAX_WALK_DEPTH} (a very large or heavily aliased "
+                f"document) — so nested keys past that point were NOT checked. "
+                f"This run cannot vouch for them.",
+            )
         )
 
     if truncated:

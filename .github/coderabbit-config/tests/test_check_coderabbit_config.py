@@ -23,7 +23,9 @@ import json
 import os
 import sys
 import unittest
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
+
+import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -81,6 +83,20 @@ reviews:
    path_filters:
   - "!**/*.lock"
 """
+
+
+@contextmanager
+def budget(keys=None, depth=None):
+    """Shrink the walk's own limits so a bail-out is testable without a huge fixture."""
+    saved = (checker.MAX_WALK_KEYS, checker.MAX_WALK_DEPTH)
+    if keys is not None:
+        checker.MAX_WALK_KEYS = keys
+    if depth is not None:
+        checker.MAX_WALK_DEPTH = depth
+    try:
+        yield
+    finally:
+        checker.MAX_WALK_KEYS, checker.MAX_WALK_DEPTH = saved
 
 
 def severities(findings):
@@ -521,6 +537,42 @@ class ClosedByOmissionTest(unittest.TestCase):
         self.assertEqual(path, "reviews.1")
         self.assertEqual(line, 2)
 
+    def test_a_key_is_named_by_its_source_spelling_not_its_loaded_value(self):
+        # `safe_load` resolves plain `true`/`on`/`yes` to True, `null` to None and
+        # `0x10` to 16, so `str()` on the loaded key produced `reviews.True` /
+        # `reviews.None` / `reviews.16` — paths naming a key that appears NOWHERE
+        # in the file — and then found no line to correct the impression, because
+        # the lookup compared "True" against the node's "true".
+        for source, expected in (
+            ("true", "reviews.true"),
+            ("on", "reviews.on"),
+            ("null", "reviews.null"),
+            ("0x10", "reviews.0x10"),
+            ('"true"', "reviews.true"),
+        ):
+            with self.subTest(source=source):
+                findings, _ = checker.validate(f"reviews:\n  {source}: x\n", SCHEMA)
+                self.assertEqual(len(findings), 1, msg=f"{messages(findings)}")
+                _severity, path, line, _message = findings[0]
+                self.assertEqual(path, expected)
+                self.assertEqual(line, 2)
+
+    def test_a_generic_key_gets_no_did_you_mean_rather_than_three_wrong_ones(self):
+        # `enabled` sits at ~72 places in the schema. The hint was written for the
+        # root-level `tools:` case, where the one other path is almost certainly
+        # the intended home; for a generic name the alphabetically-first three
+        # were three wrong homes (`issue_enrichment.*` for `reviews.tools`).
+        findings, _ = checker.validate("reviews:\n  tools:\n    enabled: true\n", SCHEMA)
+        self.assertEqual(len(findings), 1, msg=f"{messages(findings)}")
+        self.assertNotIn("Did you mean", findings[0][3])
+
+    def test_the_motivating_misplaced_block_still_gets_its_hint(self):
+        # The regression guard on the test above: suppressing generic names must
+        # not suppress the case the hint exists for.
+        findings, _ = checker.validate(MISPLACED_TOOLS, SCHEMA)
+        hinted = [f for f in findings if "Did you mean `reviews.tools`?" in f[3]]
+        self.assertEqual(len(hinted), 1, msg=f"{messages(findings)}")
+
     def test_a_shape_disagreement_is_left_to_jsonschema(self):
         # `reviews.profile` is a string enum. A mapping there is a type error and
         # jsonschema says so; the walk must not add a second, differently-worded
@@ -552,14 +604,78 @@ class ClosedByOmissionTest(unittest.TestCase):
     def test_a_bounded_walk_says_so_rather_than_reporting_clean(self):
         # A partial scan must never read like a completed one. Forced via the
         # budget rather than a megabyte fixture.
-        original = checker.MAX_WALK_KEYS
-        checker.MAX_WALK_KEYS = 1
-        try:
-            findings, notes = checker.validate(STALE_GITHUB_CHECKS, SCHEMA)
-        finally:
-            checker.MAX_WALK_KEYS = original
-        self.assertEqual(findings, [])
-        self.assertTrue(any("were NOT checked" in n for n in notes), msg=f"{notes}")
+        with budget(keys=1):
+            findings, _notes = checker.validate(STALE_GITHUB_CHECKS, SCHEMA)
+        self.assertEqual(len(findings), 1, msg=f"{messages(findings)}")
+        severity, path, _line, message = findings[0]
+        self.assertEqual(severity, "warning")
+        self.assertEqual(path, "(document root)")
+        self.assertIn("were NOT checked", message)
+
+    def test_a_bounded_walk_fails_under_strict_rather_than_exiting_zero(self):
+        # A note does not reach the exit code, so a walk that gave up early used
+        # to exit 0 even for a repo that asked for unknown keys to FAIL — a green
+        # check over keys nothing looked at. Warn-only mode is unchanged.
+        with budget(keys=1):
+            warn, _ = checker.validate(STALE_GITHUB_CHECKS, SCHEMA)
+            strict, _ = checker.validate(
+                STALE_GITHUB_CHECKS, SCHEMA, strict_unknown_keys=True
+            )
+        self.assertEqual(severities(warn), ["warning"])
+        self.assertEqual(severities(strict), ["error"])
+
+    def test_a_depth_cutoff_is_reported_like_an_exhausted_budget(self):
+        # Both are "I did not see the whole document"; only one used to be said.
+        with budget(depth=0):
+            findings, _ = checker.validate(STALE_GITHUB_CHECKS, SCHEMA)
+        self.assertEqual(len(findings), 1, msg=f"{messages(findings)}")
+        self.assertIn("were NOT checked", findings[0][3])
+
+    def test_a_budget_landing_exactly_on_the_last_key_is_not_partial(self):
+        # The flag is set where the walk actually bails, not derived from the
+        # leftover budget: a document walked in FULL on its last unit of budget
+        # is complete, and saying otherwise cries wolf on every exact fit.
+        text = "reviews:\n  profil: chill\n"
+        with budget(keys=4):  # two node visits + two keys
+            exact, _ = checker.validate(text, SCHEMA)
+        with budget(keys=3):
+            short, _ = checker.validate(text, SCHEMA)
+        self.assertEqual([f[1] for f in exact], ["reviews.profil"])
+        self.assertEqual([f[1] for f in short], ["(document root)"])
+
+    def test_list_traversal_is_charged_against_the_walk_budget(self):
+        # Elements recurse without naming a key, so a key-only budget left array
+        # traversal outside the bound entirely — and a YAML-aliased document far
+        # under the 512 KiB cap can alias one inner list into thousands of outer
+        # entries, each charging 1 while everything below it is visited free.
+        text = (
+            "a: &a [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]\n"
+            "b: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a, *a]\n"
+            "c: [*b, *b, *b, *b, *b, *b, *b, *b, *b, *b]\n"
+        )
+        nested = {"type": "array", "items": {"type": "array", "items": {
+            "type": "array", "items": {"type": "object", "properties": {}}}}}
+        data = yaml.safe_load(text)
+        with budget(keys=50):  # far below the 1000+ element visits below `c`
+            _findings, bounded = checker._walk_unknown_keys(
+                {"c": data["c"]},
+                {"type": "object", "properties": {"c": nested}},
+                None,
+                {},
+                "warning",
+                100,
+            )
+        self.assertTrue(bounded)
+
+    def test_one_error_fanning_out_still_respects_the_findings_cap(self):
+        # `islice` bounds the ERROR count, not the finding count: a closed
+        # mapping reports every extra key in ONE error, which `_extra_keys`
+        # splits into one finding each. 150 unknown root keys used to emit 150
+        # annotations into a public run log with no truncation note at all.
+        text = "".join(f"unknown_root_{i}: 1\n" for i in range(checker.MAX_FINDINGS + 50))
+        findings, notes = checker.validate(text, SCHEMA)
+        self.assertEqual(len(findings), checker.MAX_FINDINGS)
+        self.assertTrue(any("only the first" in n for n in notes), msg=f"{notes}")
 
     def test_main_exits_zero_by_default_and_one_under_strict(self):
         import tempfile
@@ -646,6 +762,20 @@ class OpennessTest(unittest.TestCase):
                 continue
             used = [k for k in checker._OPENER_KEYWORDS if k in node]
             self.assertIn(used, ([], ["additionalProperties"]), msg=f"{used}")
+
+    def test_the_schema_carries_no_ref(self):
+        # `_walk_unknown_keys` claims the two unknown-key halves never report the
+        # same key. That is a fact about THIS schema, not about the conditions:
+        # jsonschema evaluates a document path against every applicable subschema,
+        # so a node this walk judges closed (no opener of its OWN) whose `$ref`
+        # target carried `additionalProperties: false` would be reported twice.
+        # A combinator sibling cannot do it — the test above pins that a node
+        # declaring `properties` never carries one — but a `$ref` could, so a
+        # refresh that introduces one should fail HERE, where the docstring's
+        # premise is written down, rather than start double-annotating real PRs.
+        raw = json.dumps(SCHEMA)
+        self.assertNotIn('"$ref"', raw)
+        self.assertNotIn('"$dynamicRef"', raw)
 
     def test_the_document_root_is_the_explicitly_closed_case(self):
         self.assertIs(SCHEMA.get("additionalProperties"), False)
