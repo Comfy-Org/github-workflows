@@ -36,11 +36,15 @@ name: PR Risk Grade (reusable)
 #
 # WHAT ANCESTRY STILL DOES NOT PROVE is that the pin is the CURRENT one. A stale pin, left behind
 # when `uses:` moved, is a merged ancestor too and passes. The check that would close that is
-# "`workflows_ref` equals the commit the caller's `uses:` resolved to", and the runner does NOT
-# expose that commit to the workflow — `github.workflow_sha` is the CALLER's top-level workflow
-# file, and `job_workflow_sha` (the value that would answer this) exists only as an OIDC token
-# claim, which would mean an `id-token: write` grant from every caller and a token exchange in a job
-# that today holds `permissions: {}`. The other residual is narrower and irreducible: a fork commit
+# "`workflows_ref` equals the commit the caller's `uses:` resolved to". That commit IS reachable,
+# just not the two ways this comment used to say it was not: `github.workflow_sha` is the CALLER's
+# top-level workflow file, and the `job_workflow_sha` OIDC claim would need an `id-token: write`
+# grant from every caller plus a token exchange in a job that today holds `permissions: {}` — but
+# `job.workflow_sha`, the `job`-context accessor added in runner v2.334.0 (Apr 2026), needs neither
+# and is what groom.yml reads (BE-8077). So this is a WIRING gap, not a runner limitation. It is
+# deliberately still open: asserting equality here would fail red on every caller whose `uses:` and
+# `workflows_ref` have drifted apart, which is a caller-contract change tracked separately. Do not
+# assume this pin is proven CURRENT. The other residual is narrower and irreducible: a fork commit
 # that edits THIS FILE. Such a commit is not an ancestor of upstream `main`, so the axis rejects it
 # on the way in — but a caller pinned at one would be running the fork's own copy of this guard, and
 # no check written inside a file can bound a revision of that file chosen by an attacker. Both
@@ -430,13 +434,15 @@ on:
           WHAT ANCESTRY DOES NOT PROVE is that the pin is the CURRENT one: a pin
           left behind when `uses:` moved is a merged ancestor too, and passes.
           The test that would close that is "equal to the commit `uses:` resolved
-          to for this job" — and the runner does not expose that commit to the
-          workflow. `github.workflow_sha` is the CALLER's top-level workflow
-          file, not this one; the value that would answer it, `job_workflow_sha`,
-          exists only as an OIDC token claim, which means an `id-token: write`
-          grant from every caller plus a token exchange in a job that today holds
-          `permissions: {}`. Adding that is a caller-contract change and is
-          tracked separately — do not assume this pin is proven CURRENT. The
+          to for this job". `github.workflow_sha` is the CALLER's top-level
+          workflow file, not this one, and the `job_workflow_sha` OIDC claim would
+          need an `id-token: write` grant from every caller plus a token exchange
+          in a job that today holds `permissions: {}` — but `job.workflow_sha`,
+          the `job`-context accessor added in runner v2.334.0, is neither of those
+          and answers it directly (BE-8077; groom.yml reads it). Wiring it in is
+          still a caller-contract change — every split pin would start failing red
+          — so it is tracked separately and NOT done: do not assume this pin is
+          proven CURRENT. The
           other residual is narrower and irreducible: a fork commit that edits
           `pr-risk.yml` itself is not an ancestor of upstream `main`, so it is
           rejected on the way in, but a caller pinned at one would be running the
@@ -544,13 +550,15 @@ jobs:
       # a pin left behind when `uses:` moved is too. The ancestry check ~50 lines below closes the
       # FIRST case — a fork-authored commit is not, in general, an ancestor of this repo's own
       # `main` — leaving only the stale-but-merged-pin case, which needs "equal to the commit
-      # `uses:` resolved to for this job." That remains unavailable: the runner does not hand this
-      # job that commit. `github.workflow_sha` is the CALLER's top-level workflow file;
-      # `job_workflow_sha`, which is the value that would answer it, is an OIDC token CLAIM, not a
-      # `github` context property (`actionlint` rejects `github.job_workflow_sha`, and reading the
-      # claim needs `id-token: write` from every caller plus an exchange in a job that holds
-      # `permissions: {}` today). Reviewing the caller is what bounds that residual, and it is the
-      # only thing that can.
+      # `uses:` resolved to for this job." `github.workflow_sha` is the CALLER's top-level workflow
+      # file; `job_workflow_sha` is an OIDC token CLAIM, not a `github` context property (which is
+      # why `actionlint` rejects `github.job_workflow_sha`), and reading the claim needs
+      # `id-token: write` from every caller plus an exchange in a job that holds `permissions: {}`
+      # today. The value IS available as `job.workflow_sha` — the `job`-context accessor added in
+      # runner v2.334.0 (Apr 2026), which groom.yml reads and which needs no extra grant (BE-8077).
+      # Asserting equality against it is deliberately NOT done here: it would fail red on every
+      # caller whose `uses:` and `workflows_ref` have drifted, so it is a caller-contract change
+      # tracked separately. Until then, reviewing the caller is what bounds that residual.
       #
       # Enforced in the WORKFLOW, not in a script: the scripts are what the ref loads, so a
       # script-side check would sit inside the blast radius it is meant to bound. EVERY job that

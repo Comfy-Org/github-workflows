@@ -47,9 +47,11 @@ the answer is yes, bump the major tag (`v1` → `v2`) and let callers opt in.
 
 **2. Does it change assets loaded at run time?** Several workflows fetch prompts,
 briefs, or checker scripts from `workflows_ref` while running. That input is
-required with no default (`groom.yml` excepted — it defaults to `''`, but should
-still be pinned; see the README), so a caller that bumps `uses:` and leaves
-`workflows_ref:` behind mixes your new workflow with its old assets. When you
+required with no default (`groom.yml` excepted — it defaults to `''` and every
+asset checkout falls back to `job.workflow_sha`, the commit the caller's `uses:`
+resolved to, so leaving it unset there is safe; see the README), so a caller that
+bumps `uses:` and leaves an explicitly-set `workflows_ref:` behind mixes your new
+workflow with its old assets. When you
 change assets and workflow together, say so in the PR body so callers bump both.
 
 ## Adding a new reusable workflow

@@ -9,8 +9,9 @@ repo's own workflow files.
   `workflows_ref` input, or (2) checks out at `ref: ${{ inputs.workflows_ref }}`
   in a job that does not run the empty-ref guard first — recognizing the
   canonical `-z` guard and the length/charset shape `pr-risk.yml` uses, and
-  exempting the `github.job_workflow_sha` self-pin `groom.yml` uses instead of
-  a guard (see below). Text-level parsing (this repo is stdlib-only — no
+  and treating the `job.workflow_sha` self-pin `groom.yml` uses as an exemption
+  from the *mutable-default* half only — it still has to carry a guard (see
+  below). Text-level parsing (this repo is stdlib-only — no
   PyYAML), the same constraint `bump-callers.sh` works under.
 - **`tests/`** — `unittest` suite, run by
   [`test-workflow-pins.yml`](../workflows/test-workflow-pins.yml) along with a
@@ -43,15 +44,123 @@ check alone already rejects an empty ref (length 0), and `||` only ever widens
 what a condition rejects, so one qualifying branch is enough regardless of
 what it is OR'd with.
 
-`groom.yml` is the one workflow that skips the guard entirely (BE-4169): its
-`workflows_ref` defaults to `''`, and every checkout falls back to
-`${{ inputs.workflows_ref || github.job_workflow_sha }}` — the exact commit
-THIS reusable workflow was itself resolved from via the caller's `uses:` pin.
-That value can never be empty or mutable, so an omitted input self-pins
-instead of reaching a floating branch — the same guarantee the guard buys,
-bought without needing one. The lint recognizes this LITERAL fallback
-expression only; anything else OR'd in (a branch, a tag, another input) is the
-same hole wearing a different hat and stays covered by both checks.
+`groom.yml` is the one workflow whose `workflows_ref` is not required (BE-4169):
+it defaults to `''`, and every checkout falls back to
+`${{ inputs.workflows_ref || job.workflow_sha }}` — the exact commit THIS
+reusable workflow was itself resolved from via the caller's `uses:` pin. That
+value is never mutable, so an omitted input self-pins instead of reaching a
+floating branch, which is what the lint's exemption is about. The lint
+recognizes this LITERAL fallback expression only; anything else OR'd in (a
+branch, a tag, another input) is the same hole wearing a different hat and stays
+covered by both checks.
+
+**The old `github.job_workflow_sha` spelling is now FLAGGED, not exempt
+(BE-8077).** That is an OIDC token claim, not a property of the `github`
+context, so Actions expanded it to `''` and `actions/checkout` read `ref: ''` as
+this repo's default branch — the exact hole this lint exists to close, blessed
+by the lint itself. `job.workflow_sha` is the `job`-context accessor added in
+runner v2.334.0 (April 2026), and because it *is* empty on an older runner,
+`groom.yml` no longer skips the guard: each of those seven jobs runs a
+fail-closed `Require a resolvable workflows_ref` step ahead of its checkout, and
+`cursor-review.yml`'s never-fail ledger job resolves the ref in a step that
+warns and skips the checkout instead.
+
+**The lint enforces that split, rather than trusting the prose.** The fallback
+answers *mutability*; the guard answers *emptiness*; a checkout using the
+fallback is exempt from the first check and still held to the second. Until
+BE-8077 the fallback was exempt from **both**, so deleting all seven of
+`groom.yml`'s guard steps left this lint — and its whole suite — green, while
+the paragraph above already leaned on them.
+
+Three things make that enforceable, and each was a hole on its own:
+
+- **The guard-step detector knows both bindings, and keeps them apart.** It
+  accepts `WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}` as
+  well as the bare `${{ inputs.workflows_ref }}`, because matching only the bare
+  form meant none of `groom.yml`'s seven guards was ever consulted. But the two
+  are **not** equivalent, and treating either as blanket job-wide coverage is a
+  live hole: a guard on the fallback proves only that the *OR expression* is
+  non-empty, so with the input omitted it passes on `job.workflow_sha` while a
+  sibling `ref: ${{ inputs.workflows_ref }}` in the same job still gets `''`.
+  So the lint records each guard's **strength** and requires the checkout's own
+  `ref:` to be no weaker: a bare guard covers everything, a fallback guard
+  covers fallback checkouts only.
+- **The fallback pattern is anchored to the whole YAML value**, not merely to
+  the `${{` … `}}` interpolation, and matched against the comment-stripped line.
+  Anchoring the interpolation alone still accepted a mutable ref, and the
+  runtime guard cannot catch one (a guard proves non-emptiness, not
+  immutability). All of these are *not* self-pins:
+  `${{ inputs.workflows_ref || job.workflow_sha || 'main' }}` (resolves to the
+  default branch in exactly the pre-v2.334.0 case the fallback exists for),
+  `${{ inputs.override || inputs.workflows_ref || job.workflow_sha }}`
+  (resolves to whatever the leading operand names),
+  `refs/heads/${{ … }}` and `${{ inputs.override }}${{ … }}` (buried in a
+  concatenation), and a flow mapping whose *sibling* entry — not its `ref:` —
+  carries the fallback. A comment merely *naming* the expression buys nothing
+  either. Three matchers do this, mirroring the `_REF_USE_*` trio: block, flow
+  (bounded at the entry boundary, exactly as `_REF_USE_FLOW_RE` bounds its own
+  value), and a continuation line that *is* the expression.
+- **The `default: ''` carve-out is scoped to actual ref checkouts**, and it asks
+  the *parser* rather than re-reading each line. Asking "does any line
+  self-pin?" of the whole file granted it to any file that merely mentions the
+  expression in code — most sharply the guard steps' own `env:` binding — so a
+  file whose checkouts all read the bare `ref: ${{ inputs.workflows_ref }}`
+  bought an empty default it does not self-pin against. Re-deriving it per line
+  went too far the other way: no single line satisfies both halves of the
+  block-scalar spelling (`ref: >-` with the expression below it), so a file that
+  genuinely self-pins that way lost the carve-out and got BE-5546's "delete the
+  default" while its checkouts got BE-8077's "the fallback IS recognized". It
+  was also quadratic — a full alias scan per line, on a 3,000-line groom.yml.
+
+**`env:` aliases are recognized as ref USES, never as self-pins.** The two
+questions fail in opposite directions, so they get opposite answers:
+
+- *Does this `env:` binding reach the input?* — `env_aliases` matches **any**
+  value mentioning `inputs.workflows_ref` (comment-stripped, so prose in an
+  unrelated value cannot bind a name). Enumerating blessed spellings made an
+  unrecognized one fail *open*: `WORKFLOWS_REF: ${{ inputs.workflows_ref ||
+  'main' }}` registered no alias, so `ref: ${{ env.WORKFLOWS_REF }}` read as no
+  ref use at all and left the lint entirely, carrying the exact mutable fallback
+  the lint exists to catch. Over-approximating here can only ever *demand* a
+  guard.
+- *Is this ref the immutable self-pin?* — judged from the **literal expression
+  on the checkout line**. An alias never qualifies, so `ref: ${{ env.NAME }}`
+  always needs a **bare** guard.
+
+Carrying an alias binding's strength to the checkout was tried and reverted.
+`env:` is scoped per step and per job and it *shadows*, while these scans are
+file-wide, so a file-wide "names bound to the fallback" set granted the
+exemption at checkouts the binding never reaches — in both directions. A
+binding in a *guard step's* `env:` is invisible to the sibling checkout step at
+run time, so `ref: ${{ env.NAME }}` there expands to `''` and takes the default
+branch while scoring as a guarded self-pin; and a step-local
+`WORKFLOWS_REF: ${{ inputs.workflows_ref || 'main' }}` inherited fallback
+strength from any *other* step binding that name strictly. `cursor-review.yml`
+binds `WORKFLOWS_REF` both ways today (line 420 with the fallback, six more
+without), so that cross-talk was not hypothetical.
+
+**The fallback cannot be hoisted to a shared `env:` at all**, so there is no
+refactor left for strength propagation to serve. The `job` context is not
+available in `jobs.<job_id>.env` — verified with `actionlint` 1.7.12 on
+`${{ job.status }}`, a `job` property its schema *does* know, which isolates
+context availability from the `job.workflow_sha` staleness noted below:
+rejected at job level with *"context \"job\" is not allowed here"*, accepted in
+a step's `env:`. And a step-level `env:` does not reach a sibling step. So
+groom.yml's seven duplicated bindings are duplicated of necessity. A job-level
+`env:` may still bind the **bare** input; the checkouts below it are then
+required to carry a bare guard, which is the correct answer.
+(`actionlint` ≤ 1.7.12 also false-positives on `job.workflow_sha` itself, whose
+`job`-context schema predates runner v2.334.0; no CI here runs it.)
+
+**The leading operand has to reach the input.** A guard proves the *input* is
+non-empty; it says nothing about an expression that never reaches the input.
+GitHub's `||` returns the first **truthy** operand, so
+`ref: ${{ 'main' || inputs.workflows_ref }}` mentions the input — making it a
+ref use that clears the guard — while resolving to a mutable branch on every
+runner, with no second input declaration involved. `check_dir` cannot see it
+either; it reads only `workflows_ref`'s own `default:`. So the first `||`
+operand of the ref expression must reach the input, or no guard in the job
+covers that checkout.
 
 The guard is copied inline into each consuming job rather than factored into a
 composite action **on purpose**: a composite would have to be loaded with

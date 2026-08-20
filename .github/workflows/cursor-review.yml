@@ -387,19 +387,73 @@ jobs:
       rounds: ${{ steps.build.outputs.rounds || steps.fallback.outputs.rounds }}
       last_reviewed_sha: ${{ steps.build.outputs.last_reviewed_sha }}
     steps:
+      - name: Resolve the asset ref
+        # This job must never fail (see the job comment), so the fail-closed
+        # `Require a pinned workflows_ref` guard the other jobs run is not an
+        # option here. Resolve the ref in a step that can only WARN instead, and
+        # let the checkout below skip itself when there is nothing safe to check
+        # out. Skipping is safe by construction: the `Build prior-review ledger`
+        # step then fails under its `continue-on-error: true`, and the
+        # `Ensure ledger artifact exists` fallback publishes status=unknown — the
+        # already-designed degraded path, reported rather than silently `empty`.
+        #
+        # The fallback is `job.workflow_sha` — the commit THIS reusable workflow
+        # was resolved from via the caller's `uses:` pin — so an omitted
+        # `workflows_ref` still pins to an immutable SHA, never to this repo's
+        # moving default branch. It is NOT `github.job_workflow_sha`, which this
+        # step used to read: that is an OIDC token claim, not a `github` context
+        # property, so Actions expanded it to '' and `actions/checkout` read
+        # `ref: ''` as "the default branch" — the exact hole the comment here
+        # claimed to close (BE-8077). `job.workflow_sha` is the `job`-context
+        # accessor added in runner v2.334.0 (Apr 2026); `ubuntu-latest` is always
+        # current, so only a stale self-hosted runner reaches the warn branch.
+        # (actionlint <= 1.7.12 false-positives on it — its `job`-context schema
+        # predates that runner release; nothing here runs actionlint.)
+        id: resolve_ref
+        continue-on-error: true
+        # Every step in this job is time-boxed BELOW the job's own
+        # `timeout-minutes` on purpose (see the job comment): a hung step must
+        # trip its own timeout, which continue-on-error absorbs, rather than the
+        # job's, which would fail the job and skip the whole review matrix.
+        timeout-minutes: 2
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}
+        run: |
+          # Bracket RANGES (`A-Z`) match by COLLATION order, so under a glibc
+          # locale such as en_US.UTF-8 they also match accented letters and the
+          # negated class below quietly stops rejecting them. Pin the byte order.
+          export LC_ALL=C
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here — and JS `trim()` strips U+00A0/U+FEFF that POSIX
+          # `[:space:]` leaves alone, so stripping cannot be how this decides.
+          # Nor can it emit a stripped value: `tr -d` removes INTERIOR whitespace
+          # too, so `a b` would be silently rewritten into the different-but-real
+          # ref `ab` instead of being rejected. Validate the SHAPE and emit the
+          # value UNTOUCHED. The class is deliberately narrower than git's own
+          # ref rules (which also permit `(`, `)`, `,`, `%` and UTF-8) — a policy
+          # restriction, not a validity claim — and it keeps out every Unicode
+          # space and every newline that could smuggle a ::workflow command::
+          # into the log or into $GITHUB_OUTPUT. Anything outside it resolves to
+          # the empty output that skips the checkout below.
+          REF="$WORKFLOWS_REF"
+          case "$REF" in
+            *[!A-Za-z0-9._/@+-]*) REF='' ;;
+          esac
+          if [ -z "$REF" ]; then
+            echo "::warning::Could not resolve a usable ref for the cursor-review assets: either the workflows_ref input is empty AND job.workflow_sha resolved to '' (which needs an Actions runner older than v2.334.0), or the value contains characters outside the set this workflow accepts (A-Z a-z 0-9 . _ / - @ +) — a deliberate policy restriction, narrower than git's own ref rules. Skipping the asset checkout rather than silently loading them from this repo's default branch — the prior-review ledger degrades to status=unknown for this run. Set workflows_ref: to the same commit SHA the caller's uses: line pins."
+          fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
       - name: Load cursor-review assets
+        # Skipped when the ref could not be resolved — see `resolve_ref` above.
+        if: steps.resolve_ref.outputs.ref != ''
         continue-on-error: true
         timeout-minutes: 5
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Comfy-Org/github-workflows
-          # This job must never fail (see the job comment), so an empty-ref
-          # guard that exits non-zero is not an option here. Fall back to the
-          # exact commit THIS reusable workflow was resolved from
-          # (github.job_workflow_sha, same pattern as groom.yml/BE-4169)
-          # instead: an omitted workflows_ref still pins to an immutable SHA,
-          # never to this repo's moving default branch.
-          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}
+          ref: ${{ steps.resolve_ref.outputs.ref }}
           path: _cursor_review_assets
           persist-credentials: false
 
@@ -455,7 +509,7 @@ jobs:
         # of the artifact all download it continue-on-error, and consolidate
         # emits the unavailable banner when the file does not arrive).
         continue-on-error: true
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: cursor-review-ledger
           path: /tmp/ledger
@@ -1259,7 +1313,7 @@ jobs:
 
       - name: Download prior-review ledger
         continue-on-error: true
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: cursor-review-ledger
           path: /tmp/ledger
@@ -1505,7 +1559,7 @@ jobs:
       - name: Download prior-review ledger
         id: ledger_download
         continue-on-error: true
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: cursor-review-ledger
           path: /tmp/ledger

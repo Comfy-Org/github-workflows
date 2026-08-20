@@ -153,22 +153,27 @@ Two caveats on "it fails fast", so you do not rely on it as a safety net:
   never evaluates it, so an omitted ref can pass a run silently.
 - One job is deliberately exempt: `cursor-review`'s `Prior-review ledger` job
   must never fail the run — the review matrix `needs:` it — so it carries no
-  guard and falls back rather than erroring.
+  fail-closed guard. Since BE-8077 it resolves the ref in a step that WARNS on
+  empty and skips the asset checkout, degrading the ledger to `status=unknown`
+  rather than checking assets out of this repo's default branch.
 
 `groom` is the one workflow that declares `workflows_ref` **without** making it
-required (it defaults to `''`). Pin it anyway, exactly like the others. The
-intent (BE-4169) was for an omitted input to fall back to the commit the
-caller's `uses:` resolved to, but the fallback is spelled
+required (it defaults to `''`), and there leaving it unset **is safe**: an
+omitted input falls back to `job.workflow_sha`, the commit the caller's `uses:`
+resolved to, and every groom job fails closed with an `::error::` if that
+resolves empty (it needs an Actions runner ≥ v2.334.0).
+
+That is only true from BE-8077 onward. BE-4169 spelled the fallback
 `github.job_workflow_sha`, which is **not** a property of the `github` context —
 GitHub documents the commit-of-the-current-job's-workflow-file value as
-`job.workflow_sha`, and this repo's own `groom.yml` says so where it reads the
+`job.workflow_sha`, and this repo's own `groom.yml` said so where it reads the
 agent CLI pin. Actions expands an unknown context property to `''` rather than
-erroring, so today an omitted `workflows_ref` resolves to the empty string and
-`actions/checkout` takes this repo's **default branch** — the mutable-assets
-hole the pin exists to close. Until groom's asset checkouts move to
-`job.workflow_sha` with an empty-ref guard, set the input.
+erroring, so on a groom pin older than BE-8077 an omitted `workflows_ref`
+resolves to the empty string and `actions/checkout` takes this repo's **default
+branch** — the mutable-assets hole the pin exists to close. On those pins, set
+the input.
 
-So, everywhere it is declared, set it explicitly to the same SHA:
+So, everywhere the input is **required**, set it explicitly to the same SHA:
 
 ```yaml
 uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@07154fb…

@@ -492,12 +492,15 @@ from `$GROOM_ASSETS`. It gets its own sparse checkout at the commit this
 That matters twice over, because this is executable supply chain rather than a
 prompt:
 
-- `workflows_ref` is `required: false` and defaults to the mutable `main`, so a
-  caller that SHA-pins `uses:` but omits it would have *what executes* inside the
-  three agent jobs tracking a branch tip, while the sandbox flags those jobs pass
-  stay frozen at the pinned SHA. Reading from `job_workflow_sha` keeps the CLI
-  version and the flags that depend on it on the same commit, so SHA-pinning
-  `uses:` alone fully pins the CLI.
+- `workflows_ref` is `required: false`, and a caller may legitimately point it at
+  a mutable BRANCH (the documented brief-testing override). A caller that SHA-pins
+  `uses:` and does that would have *what executes* inside the three agent jobs
+  tracking a branch tip, while the sandbox flags those jobs pass stay frozen at
+  the pinned SHA. Reading from `job.workflow_sha` keeps the CLI version and the
+  flags that depend on it on the same commit, so SHA-pinning `uses:` alone fully
+  pins the CLI. (Since BE-8077 the asset checkouts fall back to
+  `job.workflow_sha` too when the input is *omitted*, so on that path the two
+  agree by construction — this step simply never depended on them agreeing.)
 - The resolve step fails **closed** on a missing manifest. Read from
   `workflows_ref`, this repo's documented split-pin state (Dependabot moves
   `uses:` and leaves `workflows_ref:` behind — see
@@ -506,12 +509,23 @@ prompt:
   `groom.yml` reads the manifest also ships it.
 
 `job.workflow_sha`, **not** `github.job_workflow_sha` — the latter is the
-spelling everyone reaches for and it expands to an empty string inside a
+spelling everyone reaches for (BE-4169's asset checkouts reached for it, and
+BE-8077 moved all seven onto this one) and it expands to an empty string inside a
 reusable-workflow job, which Actions does not treat as an error. The populated
 accessor is the `job`-context one added in runner v2.334.0 (April 2026). All
 groom jobs are `ubuntu-latest`, so it is always available; the resolve step
 still re-checks it and emits a `::warning::` if it is ever empty, because the
-failure mode is otherwise invisible.
+failure mode is otherwise invisible. (`actionlint` ≤ 1.7.12 flags
+`job.workflow_sha` as an undefined property — its `job`-context schema predates
+that runner release. It is a false positive, and nothing in this repo's CI runs
+actionlint, so nothing gates on it.)
+
+The seven asset checkouts differ from this step in one way: they pair the
+fallback with a fail-**closed** `Require a resolvable workflows_ref` guard step
+that `::error::`s and exits non-zero when both `inputs.workflows_ref` and
+`job.workflow_sha` come back empty. This step warns instead, because a degraded
+CLI pin is not worth a groom outage and the pin is still validated; a
+default-branch *brief* checkout inside a job holding `ANTHROPIC_API_KEY` is.
 
 That resolve step is the **last** step in `gate` and runs only when
 `should_run == 'true'` (as does the checkout that feeds it). It is the one
