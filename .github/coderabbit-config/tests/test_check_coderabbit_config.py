@@ -880,6 +880,93 @@ class CapAndBudgetTest(unittest.TestCase):
         node = yaml.compose("a: &x [*x]\n")
         self.assertEqual(checker._merge_entries(node.value[0][1]), [])
 
+    def test_a_deep_merge_chain_degrades_instead_of_crashing(self):
+        # PR-controlled input: ~1500 `<<:` links is a few tens of KB, far inside
+        # MAX_CONFIG_BYTES. The expansion here is recursive and `RecursionError`
+        # is not a `yaml.YAMLError`, so unbounded it escapes `validate` and kills
+        # an advisory check with a traceback. Past `_MAX_MERGE_DEPTH` the merge is
+        # simply not expanded — a lost line number, not a crash.
+        n = 1500
+        text = (
+            "a0: &a0\n  profil: 1\n"
+            + "".join(f"a{i}: &a{i}\n  <<: *a{i - 1}\n" for i in range(1, n))
+            + f"reviews:\n  <<: *a{n - 1}\n"
+        )
+        findings, _ = checker.validate(text, SCHEMA)  # must not raise
+        self.assertEqual(len(findings), checker.MAX_FINDINGS)
+
+    def test_a_merge_chain_inside_the_bound_still_resolves_its_line(self):
+        # The bound is a backstop, not the working path: a chain a human might
+        # actually write still gets its key node and its line.
+        n = 20
+        text = (
+            "a0: &a0\n  profil: 1\n"
+            + "".join(f"a{i}: &a{i}\n  <<: *a{i - 1}\n" for i in range(1, n))
+            + f"reviews:\n  <<: *a{n - 1}\n"
+        )
+        findings, _ = checker.validate(text, SCHEMA)
+        merged = [f for f in findings if f[1] == "reviews.profil"]
+        self.assertEqual(len(merged), 1, msg=f"{messages(findings)}")
+        self.assertEqual(merged[0][2], 2)  # `profil:` in the first anchor
+
+    def test_a_merge_chain_the_loader_itself_cannot_build_exits_two(self):
+        # `flatten_mapping` recurses per link too, and in this shape (anchors in a
+        # lazily-constructed sequence, so `reviews` is flattened first) PyYAML
+        # blows its own stack before this file gets a turn. "I could not check
+        # this" must exit 2, like an oversized config — never 0, and never a
+        # traceback.
+        import tempfile
+
+        n = 1500
+        text = (
+            "_anchors:\n  - &a0\n    profil: 1\n"
+            + "".join(f"  - &a{i}\n    <<: *a{i - 1}\n" for i in range(1, n))
+            + f"reviews:\n  <<: *a{n - 1}\n"
+        )
+        with self.assertRaises(checker.ConfigError):
+            checker.validate(text, SCHEMA)
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, ".coderabbit.yaml"), "w", encoding="utf-8") as f:
+                f.write(text)
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = checker.main(["--root", tmp, "--schema", SCHEMA_PATH])
+            out = buf.getvalue()
+        self.assertEqual(code, 2, msg=out)
+        self.assertIn("::error::", out)
+
+    def test_an_integer_mapping_key_is_not_read_as_a_list_index(self):
+        # `reviews.mutually_exclusive_groups` accepts arbitrary property names, so
+        # `1:` is a legal key there and a rejecting error below it arrives with an
+        # INT path part while the node is a mapping. Typing the part rather than
+        # the node sent the descent down the sequence branch: no line at all, and
+        # a path (`...[1]`) naming a list position the file does not have.
+        text = "reviews:\n  mutually_exclusive_groups:\n    1:\n      - only-one\n"
+        findings, _ = checker.validate(text, SCHEMA)
+        short = [f for f in findings if "too short" in f[3]]
+        self.assertEqual(len(short), 1, msg=f"{messages(findings)}")
+        self.assertEqual(short[0][1], "reviews.mutually_exclusive_groups.1")
+        self.assertEqual(short[0][2], 4)
+
+    def test_a_duplicate_key_is_annotated_on_the_one_safe_load_kept(self):
+        # `construct_mapping` assigns per pair, so the LAST duplicate wins and the
+        # error is about ITS value — annotating line 2's valid `chill` for a
+        # complaint about line 3's `7` points the reader at the wrong line.
+        text = "reviews:\n  profile: chill\n  profile: 7\n"
+        findings, _ = checker.validate(text, SCHEMA)
+        self.assertTrue(findings, msg="expected a type/enum error")
+        self.assertEqual({f[2] for f in findings}, {3}, msg=f"{findings}")
+
+    def test_the_later_of_two_merge_keys_wins_like_safe_load(self):
+        # `flatten_mapping` accumulates a-then-b into ONE merge list and dict
+        # assignment lets b win, so a first-wins pass over the merge groups in
+        # document order picked a — the opposite of the loaded document.
+        text = "a: &a\n  profil: 1\nb: &b\n  profil: 2\nreviews:\n  <<: *a\n  <<: *b\n"
+        findings, _ = checker.validate(text, SCHEMA)
+        merged = [f for f in findings if f[1] == "reviews.profil"]
+        self.assertEqual(len(merged), 1, msg=f"{messages(findings)}")
+        self.assertEqual(merged[0][2], 4)  # b's `profil:`, not a's on line 2
+
     def test_scalar_elements_are_charged_against_the_walk_budget(self):
         # Exempting a leaf from the BAIL-OUT FLAG is not the same as exempting it
         # from the BUDGET. The list branch recurses once per element with no
@@ -996,52 +1083,79 @@ class OpennessTest(unittest.TestCase):
         self.assertNotIn('"$dynamicRef"', raw)
 
     def test_a_rejecting_error_cannot_be_crowded_out_before_ranking(self):
-        # `_apply_cap` ranks findings, but the `islice` over `iter_errors` runs a
-        # stage EARLIER and is unranked FIFO in schema order — a file-rejecting
-        # error arriving as error MAX_FINDINGS + 1 is deleted before ranking ever
-        # sees it, which is the same exit-0-on-a-whole-file-rejection the rank
-        # exists to prevent. It cannot happen against THIS schema, and this is the
-        # premise: only a STRIPPED-keyword error is non-rejecting, only a literal
-        # `false` produces one (a schema-VALUED `additionalProperties` descends
-        # and yields the child's keyword instead), and every object that closes
-        # itself that way is either unmultiplied or sits under an array whose
-        # `maxItems` bounds it. So the stripped errors one document can raise are
-        # bounded well under MAX_FINDINGS. A refresh that closes the item of an
-        # unbounded array — or adds `unevaluatedProperties: false` anywhere —
-        # reopens the hole, and should fail HERE rather than in a consumer's CI.
-        infinite = float("inf")
-        total = 0
+        """The premise `_apply_cap` cannot enforce: the `islice` runs a stage earlier.
 
-        def walk(node, multiplier):
-            nonlocal total
+        `islice(iter_errors(...), MAX_FINDINGS + 1)` is unranked FIFO in schema
+        order, so a file-rejecting error arriving past the cap is deleted before
+        ranking ever sees it — the same exit-0-on-a-whole-file-rejection the rank
+        exists to prevent. It needs MAX_FINDINGS *stripped* errors ahead of it
+        (one rejecting error among them and the exit code is 1 regardless), and
+        against THIS schema that cannot be assembled. Four facts make it so, each
+        asserted below rather than summarized in a number — `maxItems` is NOT one
+        of them as a multiplicity bound, because jsonschema keeps validating
+        elements past it (a 150-element array really does raise 150 of them).
+        """
+        stripped_false, unbounded_multipliers, arrays_over_closed = [], [], []
+
+        def walk(node, path, multiplied):
             if isinstance(node, list):
-                for item in node:
-                    walk(item, multiplier)
+                for i, item in enumerate(node):
+                    walk(item, f"{path}[{i}]", multiplied)
                 return
             if not isinstance(node, dict):
                 return
-            if any(node.get(k) is False for k in checker.STRIPPED_KEYWORDS):
-                total += multiplier
-            for key in ("properties", "patternProperties", "$defs", "definitions",
-                        "dependentSchemas"):
-                for sub in (node.get(key) or {}).values():
-                    walk(sub, multiplier)
-            for key in ("additionalProperties", "propertyNames", "not",
-                        "if", "then", "else", "unevaluatedProperties"):
-                walk(node.get(key), multiplier)
+            for keyword in checker.STRIPPED_KEYWORDS:
+                if node.get(keyword) is False:
+                    (arrays_over_closed if multiplied else stripped_false).append(path)
+            for key in ("properties", "$defs", "definitions", "dependentSchemas"):
+                for name, sub in (node.get(key) or {}).items():
+                    walk(sub, f"{path}.{key}.{name}", multiplied)
+            for key in ("propertyNames", "not", "if", "then", "else"):
+                walk(node.get(key), f"{path}.{key}", multiplied)
             for key in ("anyOf", "oneOf", "allOf"):
-                walk(node.get(key), multiplier)
-            if "items" in node:
-                # An array raises one error per ELEMENT below it; `maxItems` is
-                # the only thing that bounds how many elements there can be.
-                bound = node.get("maxItems")
-                walk(
-                    node["items"],
-                    multiplier * (bound if isinstance(bound, int) else infinite),
-                )
+                walk(node.get(key), f"{path}.{key}", multiplied)
+            # A schema-valued `additionalProperties` / `patternProperties` applies
+            # to unboundedly many properties of ONE instance object, so anything
+            # closed underneath is multiplied by nothing this bound can see.
+            for key in ("additionalProperties", "patternProperties"):
+                sub = node.get(key)
+                subs = sub.values() if key == "patternProperties" and isinstance(sub, dict) else [sub]
+                for one in subs:
+                    if isinstance(one, dict):
+                        before = len(stripped_false) + len(arrays_over_closed)
+                        walk(one, f"{path}.{key}", multiplied)
+                        if len(stripped_false) + len(arrays_over_closed) > before:
+                            unbounded_multipliers.append(f"{path}.{key}")
+            for key in ("items", "prefixItems", "unevaluatedItems", "contains"):
+                if key in node:
+                    before = len(stripped_false) + len(arrays_over_closed)
+                    walk(node[key], f"{path}.{key}", True)
+                    if len(stripped_false) + len(arrays_over_closed) > before:
+                        arrays_over_closed.append((path, node))
 
-        walk(SCHEMA, 1)
-        self.assertLess(total, checker.MAX_FINDINGS, msg=f"{total}")
+        walk(SCHEMA, "$", False)
+
+        # 1. `unevaluatedProperties` is the other stripped keyword and is absent,
+        #    so `additionalProperties: false` is the only source.
+        self.assertNotIn('"unevaluatedProperties"', json.dumps(SCHEMA))
+
+        # 2. Nothing closed sits under a schema-valued `additionalProperties` or a
+        #    `patternProperties` — one instance object could then raise arbitrarily
+        #    many stripped errors with no rejecting error implied.
+        self.assertEqual(unbounded_multipliers, [])
+
+        # 3. Every array over a closed object declares `maxItems`, and declares it
+        #    BEFORE `items` in key order. That is what actually saves this case:
+        #    exceeding it raises a REJECTING `maxItems` error, and `iter_errors`
+        #    walks a node's keywords in schema key order, so that error is emitted
+        #    ahead of the element errors it would otherwise be buried under.
+        for path, array in [x for x in arrays_over_closed if isinstance(x, tuple)]:
+            keys = list(array.keys())
+            self.assertIn("maxItems", keys, msg=path)
+            self.assertLess(keys.index("maxItems"), keys.index("items"), msg=path)
+
+        # 4. What is left is unmultiplied: at most one stripped error each.
+        self.assertLess(len(stripped_false), checker.MAX_FINDINGS, msg=f"{stripped_false}")
 
     def test_the_document_root_is_the_explicitly_closed_case(self):
         self.assertIs(SCHEMA.get("additionalProperties"), False)
