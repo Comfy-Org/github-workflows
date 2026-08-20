@@ -211,11 +211,16 @@ class GuardCoverageTests(unittest.TestCase):
         '        with: {repository: Comfy-Org/github-workflows, ref: "${{ inputs.workflows_ref }}"}\n'
     )
 
-    def _jobs(self, *jobs):
+    @staticmethod
+    def _wrap(*jobs):
+        """The step blocks as a whole workflow, one job each."""
         text = "name: F\non:\n  workflow_call:\njobs:\n"
         for i, steps in enumerate(jobs):
             text += "  job%d:\n    runs-on: ubuntu-latest\n    steps:\n%s" % (i, steps)
-        return cwp.find_unguarded_ref_checkouts(text.split("\n"))
+        return text
+
+    def _jobs(self, *jobs):
+        return cwp.find_unguarded_ref_checkouts(self._wrap(*jobs).split("\n"))
 
     def test_guarded_checkout_passes(self):
         self.assertEqual(self._jobs(self.GUARD + self.CHECKOUT), [])
@@ -663,7 +668,7 @@ class GuardCoverageTests(unittest.TestCase):
 
     def test_an_env_alias_of_the_fallback_binding_is_still_a_ref_use(self):
         # `_ENV_ALIAS_RE` has to know the same spellings `_GUARD_BINDING_RE`
-        # does. Hoisting the binding to a job-level `env:` and checking out at
+        # does. Hoisting the binding to a shared `env:` and checking out at
         # `ref: ${{ env.WORKFLOWS_REF }}` is exactly the refactor the alias
         # machinery exists to survive; if it registers no alias, `is_ref_use`
         # stops seeing those checkouts and the file drops to zero coverage
@@ -675,6 +680,124 @@ class GuardCoverageTests(unittest.TestCase):
             ),
             frozenset({"WORKFLOWS_REF"}),
         )
+
+    def test_an_alias_of_the_fallback_carries_the_fallback_STRENGTH(self):
+        # Registering the alias only kept the checkout VISIBLE. Strength was
+        # still read off the literal `ref:` line, which `ref: ${{ env.WORKFLOWS_REF }}`
+        # can never satisfy — so the blessed hoist scored BARE and was reported
+        # unguarded against a fallback guard, with BE-5546's message on it. The
+        # end-to-end lint is the assertion; `env_aliases()` alone said nothing
+        # about this.
+        aliased = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ env.WORKFLOWS_REF }}\n"
+        )
+        self.assertEqual(self._jobs(self.GUARD_WITH_FALLBACK + aliased), [])
+        lines = self._wrap(self.GUARD_WITH_FALLBACK + aliased).split("\n")
+        self.assertEqual(
+            cwp.fallback_env_aliases(lines),
+            frozenset({"WORKFLOWS_REF"}),
+        )
+        self.assertTrue(
+            any(fb for _, fb, _ in cwp.ref_checkouts(lines)),
+            "the aliased checkout should read as a self-pin",
+        )
+
+    def test_an_alias_of_a_MUTABLE_binding_does_not_carry_strength(self):
+        # The strict half of the pair. `fallback_env_aliases` grants an
+        # exemption, so unlike `env_aliases` it must fail CLOSED: a name bound
+        # to anything but the exact two-operand fallback is a bare checkout.
+        for binding in (
+            "${{ inputs.workflows_ref || 'main' }}",
+            "${{ inputs.workflows_ref }}",
+            "${{ inputs.workflows_ref || job.workflow_sha || 'main' }}",
+        ):
+            lines = (
+                "jobs:\n"
+                "  check:\n"
+                "    steps:\n"
+                "      - name: Load assets\n"
+                "        env:\n"
+                "          WORKFLOWS_REF: %s\n"
+                "        uses: actions/checkout@abc\n"
+                "        with:\n"
+                "          ref: ${{ env.WORKFLOWS_REF }}\n" % binding
+            ).split("\n")
+            self.assertEqual(cwp.fallback_env_aliases(lines), frozenset(), binding)
+            self.assertFalse(
+                any(fb for _, fb, _ in cwp.ref_checkouts(lines)), binding
+            )
+
+    def test_an_unrecognized_env_binding_still_counts_as_reaching_the_input(self):
+        # Enumerating blessed spellings made an unrecognized one fail OPEN:
+        # `WORKFLOWS_REF: ${{ inputs.workflows_ref || 'main' }}` registered no
+        # alias, so `ref: ${{ env.WORKFLOWS_REF }}` read as no ref use at all
+        # and that checkout — carrying the exact mutable fallback this lint
+        # exists to catch — left the lint entirely.
+        lines = (
+            "jobs:\n"
+            "  check:\n"
+            "    steps:\n"
+            "      - name: Load assets\n"
+            "        env:\n"
+            "          WORKFLOWS_REF: ${{ inputs.workflows_ref || 'main' }}\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ env.WORKFLOWS_REF }}\n"
+        ).split("\n")
+        self.assertEqual(cwp.env_aliases(lines), frozenset({"WORKFLOWS_REF"}))
+        self.assertEqual(len(cwp.find_unguarded_ref_checkouts(lines)), 1)
+
+    def test_the_fallback_must_be_the_WHOLE_ref_value(self):
+        # Anchoring `${{` … `}}` bounds the INTERPOLATION, not the YAML value.
+        # Each of these still scored as a self-pin — earning the weaker
+        # fallback-guard requirement and the `default: ''` carve-out while
+        # resolving to a mutable ref, or to a sibling entry's value.
+        for ref in (
+            "refs/heads/${{ inputs.workflows_ref || job.workflow_sha }}",
+            "${{ inputs.override }}${{ inputs.workflows_ref || job.workflow_sha }}",
+        ):
+            checkout = (
+                "      - name: Load assets\n"
+                "        uses: actions/checkout@abc\n"
+                "        with:\n"
+                "          ref: %s\n" % ref
+            )
+            lines = self._wrap(checkout).split("\n")
+            self.assertFalse(any(fb for _, fb, _ in cwp.ref_checkouts(lines)), ref)
+            self.assertEqual(len(self._jobs(checkout)), 1, ref)
+
+    def test_a_flow_sibling_carrying_the_fallback_is_not_the_ref(self):
+        # `_REF_USE_FLOW_RE` bounds its value at the entry boundary so a sibling
+        # cannot be misread as the ref; the self-pin matcher needs the same
+        # boundary, or the sibling's fallback exempts a bare `ref:`.
+        checkout = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with: {ref: '${{ inputs.workflows_ref }}', "
+            "x: '${{ inputs.workflows_ref || job.workflow_sha }}'}\n"
+        )
+        lines = self._wrap(checkout).split("\n")
+        self.assertFalse(any(fb for _, fb, _ in cwp.ref_checkouts(lines)))
+        self.assertEqual(len(self._jobs(checkout)), 1)
+
+    def test_a_block_scalar_self_pin_is_seen_by_the_carve_out_scan(self):
+        # The per-line scan could not see this spelling: the key line carries no
+        # expression and the continuation line carries no `ref:` key, so no
+        # single line satisfied both tests. The file self-pins, but lost the
+        # carve-out and got BE-5546's "delete the default" while its checkouts
+        # got BE-8077's "the fallback IS recognized" — contradictory advice.
+        checkout = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: >-\n"
+            "            ${{ inputs.workflows_ref || job.workflow_sha }}\n"
+        )
+        lines = self._wrap(checkout).split("\n")
+        self.assertTrue(any(fb for _, fb, _ in cwp.ref_checkouts(lines)))
 
     def test_the_github_job_workflow_sha_spelling_is_no_longer_exempt(self):
         # BE-8077: `github.job_workflow_sha` is an OIDC token claim, NOT a
@@ -819,10 +942,25 @@ class GuardCoverageTests(unittest.TestCase):
 
         # …and the resolving step must REJECT rather than sanitize: it emits the
         # empty string for anything not ref-shaped, under a pinned byte locale.
-        body = "\n".join(lines)
-        self.assertIn("id: resolve_ref", body)
-        self.assertIn("*[!A-Za-z0-9._/@+-]*) REF='' ;;", body)
-        self.assertIn("export LC_ALL=C", body)
+        #
+        # Scoped to that step, not to the whole file. Matched against the file
+        # body, any step in it satisfied these — and the file already carries
+        # six other hand-copied guards, so the natural consistency sweep that
+        # adds `export LC_ALL=C` to them would let someone delete it from
+        # `resolve_ref` with the only test covering that step still green.
+        resolvers = [i for i, line in enumerate(lines) if line.strip() == "id: resolve_ref"]
+        self.assertEqual(len(resolvers), 1, "expected exactly one resolve_ref step")
+        resolver = [s.strip() for s in self._enclosing_step(lines, resolvers[0])]
+        self.assertIn("*[!A-Za-z0-9._/@+-]*) REF='' ;;", resolver)
+        self.assertIn("export LC_ALL=C", resolver)
+        # …and it must resolve from the BE-8077 fallback. Every assertion above
+        # still passed with the binding swapped for `|| 'main'`, which is the
+        # mutable-ref hole this whole ticket exists to close.
+        self.assertIn(
+            "WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}",
+            resolver,
+            "resolve_ref no longer resolves from the job.workflow_sha fallback",
+        )
 
     def test_every_groom_guard_carries_the_shape_check(self):
         # The `case` block is the only thing closing the Unicode-whitespace hole
@@ -950,10 +1088,12 @@ class CheckDirTests(unittest.TestCase):
         self.assertEqual(checked, ["sneaky.yml"])
 
     def test_a_comment_naming_the_fallback_is_not_a_self_pin(self):
-        # `check_dir` asks "does ANY line self-pin?" across the whole file, so
-        # before comments were stripped, prose merely NAMING the expression --
-        # which this repo's workflows do at length -- bought the `default: ''`
-        # carve-out for a file whose checkout never uses the fallback at all.
+        # `check_dir` asks "does ANY ref checkout self-pin?", so prose merely
+        # NAMING the expression -- which this repo's workflows do at length --
+        # must not buy the `default: ''` carve-out for a file whose checkout
+        # never uses the fallback. Two mechanisms hold this now (the scan is
+        # scoped to checkouts, AND comments are stripped from what it reads);
+        # the trailing-comment test below is the one that pins the second.
         text = (
             "name: Fixture\n"
             "on:\n"
@@ -967,16 +1107,93 @@ class CheckDirTests(unittest.TestCase):
             "  check:\n"
             "    runs-on: ubuntu-latest\n"
             "    steps:\n"
-            "      # we could have used inputs.workflows_ref || job.workflow_sha }}\n"
             "      - name: Load assets\n"
             "        uses: actions/checkout@abc\n"
             "        with:\n"
-            "          ref: ${{ inputs.workflows_ref }}\n"
+            # A COMPLETE `${{ … }}` — spelled without the opening `${{` the
+            # fixture cannot exercise the matcher at all — both on a whole-line
+            # comment and trailing a real `ref:` line.
+            "          # we could have used ${{ inputs.workflows_ref || job.workflow_sha }}\n"
+            "          ref: ${{ inputs.workflows_ref }}  # not ${{ inputs.workflows_ref || job.workflow_sha }}\n"
         )
         self._write("commented.yml", text)
         errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
         self.assertTrue(any("BE-5546" in e and "default:" in e for e in errors), errors)
         self.assertEqual(checked, ["commented.yml"])
+
+    def test_a_trailing_comment_does_not_hide_a_REAL_self_pin(self):
+        # The other direction, and the one that actually pins the stripping:
+        # the matcher anchors the fallback to the whole YAML value, so an
+        # unstripped `# pinned` sits between the expression and the end of the
+        # line and the genuine self-pin stops being recognized — costing a
+        # compliant file its `default: ''` carve-out.
+        text = (
+            "name: Fixture\n"
+            "on:\n"
+            "  workflow_call:\n"
+            "    inputs:\n"
+            "      workflows_ref:\n"
+            "        type: string\n"
+            "        required: false\n"
+            "        default: ''\n"
+            "jobs:\n"
+            "  check:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - name: Require a resolvable workflows_ref\n"
+            "        env:\n"
+            "          WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}\n"
+            "        run: |\n"
+            "          if [ -z \"$WORKFLOWS_REF\" ]; then\n"
+            "            exit 1\n"
+            "          fi\n"
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ inputs.workflows_ref || job.workflow_sha }}  # pinned\n"
+        )
+        self._write("pinned.yml", text)
+        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        self.assertEqual(errors, [])
+        self.assertEqual(checked, ["pinned.yml"])
+
+    def test_a_block_scalar_self_pin_keeps_the_default_carve_out(self):
+        # `check_dir`'s carve-out asks the PARSER, not each line in isolation.
+        # A per-line scan cannot see this spelling — the key line carries no
+        # expression, the continuation line carries no `ref:` key — so the file
+        # lost the carve-out and got BE-5546's "delete the default" while its
+        # checkouts got BE-8077's "the fallback IS recognized": a false failure
+        # carrying contradictory advice.
+        text = (
+            "name: Fixture\n"
+            "on:\n"
+            "  workflow_call:\n"
+            "    inputs:\n"
+            "      workflows_ref:\n"
+            "        type: string\n"
+            "        required: false\n"
+            "        default: ''\n"
+            "jobs:\n"
+            "  check:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - name: Require a resolvable workflows_ref\n"
+            "        env:\n"
+            "          WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}\n"
+            "        run: |\n"
+            "          if [ -z \"$WORKFLOWS_REF\" ]; then\n"
+            "            exit 1\n"
+            "          fi\n"
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: >-\n"
+            "            ${{ inputs.workflows_ref || job.workflow_sha }}\n"
+        )
+        self._write("folded.yml", text)
+        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        self.assertEqual(errors, [])
+        self.assertEqual(checked, ["folded.yml"])
 
 
     def test_the_github_job_workflow_sha_default_is_no_longer_tolerated(self):

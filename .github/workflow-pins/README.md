@@ -85,27 +85,65 @@ Three things make that enforceable, and each was a hole on its own:
   So the lint records each guard's **strength** and requires the checkout's own
   `ref:` to be no weaker: a bare guard covers everything, a fallback guard
   covers fallback checkouts only.
-- **The fallback pattern is anchored at both ends** — `${{` … `}}` — and matched
-  against the comment-stripped line. An extra operand on *either* side
-  reintroduces a mutable ref, and the runtime guard cannot catch it (a guard
-  proves non-emptiness, not immutability):
-  `${{ inputs.workflows_ref || job.workflow_sha || 'main' }}` resolves to the
-  default branch in exactly the pre-v2.334.0 case the fallback exists for, and
-  `${{ inputs.override || inputs.workflows_ref || job.workflow_sha }}` resolves
-  to whatever the leading operand names. A comment merely *naming* the
-  expression buys nothing either.
-- **The `default: ''` carve-out is scoped to lines that are a ref checkout.**
-  Asking "does any line self-pin?" of the whole file granted it to any file that
-  merely mentions the expression in code — most sharply the guard steps' own
-  `env:` binding — so a file whose checkouts all read the bare
-  `ref: ${{ inputs.workflows_ref }}` bought an empty default it does not
-  self-pin against.
+- **The fallback pattern is anchored to the whole YAML value**, not merely to
+  the `${{` … `}}` interpolation, and matched against the comment-stripped line.
+  Anchoring the interpolation alone still accepted a mutable ref, and the
+  runtime guard cannot catch one (a guard proves non-emptiness, not
+  immutability). All of these are *not* self-pins:
+  `${{ inputs.workflows_ref || job.workflow_sha || 'main' }}` (resolves to the
+  default branch in exactly the pre-v2.334.0 case the fallback exists for),
+  `${{ inputs.override || inputs.workflows_ref || job.workflow_sha }}`
+  (resolves to whatever the leading operand names),
+  `refs/heads/${{ … }}` and `${{ inputs.override }}${{ … }}` (buried in a
+  concatenation), and a flow mapping whose *sibling* entry — not its `ref:` —
+  carries the fallback. A comment merely *naming* the expression buys nothing
+  either. Three matchers do this, mirroring the `_REF_USE_*` trio: block, flow
+  (bounded at the entry boundary, exactly as `_REF_USE_FLOW_RE` bounds its own
+  value), and a continuation line that *is* the expression.
+- **The `default: ''` carve-out is scoped to actual ref checkouts**, and it asks
+  the *parser* rather than re-reading each line. Asking "does any line
+  self-pin?" of the whole file granted it to any file that merely mentions the
+  expression in code — most sharply the guard steps' own `env:` binding — so a
+  file whose checkouts all read the bare `ref: ${{ inputs.workflows_ref }}`
+  bought an empty default it does not self-pin against. Re-deriving it per line
+  went too far the other way: no single line satisfies both halves of the
+  block-scalar spelling (`ref: >-` with the expression below it), so a file that
+  genuinely self-pins that way lost the carve-out and got BE-5546's "delete the
+  default" while its checkouts got BE-8077's "the fallback IS recognized". It
+  was also quadratic — a full alias scan per line, on a 3,000-line groom.yml.
 
-`_ENV_ALIAS_RE` knows the fallback spelling too, so hoisting that seven-times
-duplicated binding to a job-level `env:` and checking out at
-`ref: ${{ env.WORKFLOWS_REF }}` — the refactor the alias machinery exists to
-survive — keeps its coverage instead of silently dropping to zero. (`actionlint` ≤ 1.7.12 false-positives on
-`job.workflow_sha`; no CI here runs it.)
+`env_aliases` and `fallback_env_aliases` are a deliberately mismatched pair,
+because they answer questions that fail in opposite directions:
+
+- `env_aliases` — "does this `env:` binding REACH the input?" — matches **any**
+  value mentioning `inputs.workflows_ref`. Enumerating blessed spellings made an
+  unrecognized one fail *open*: `WORKFLOWS_REF: ${{ inputs.workflows_ref ||
+  'main' }}` registered no alias, so `ref: ${{ env.WORKFLOWS_REF }}` read as no
+  ref use at all and left the lint entirely, carrying the exact mutable fallback
+  the lint exists to catch. Over-approximating here can only ever *demand* a
+  guard.
+- `fallback_env_aliases` — "is this binding the immutable fallback?" — matches
+  only the exact two-operand spelling, because it grants an *exemption*. That
+  strength then travels to every `ref: ${{ env.NAME }}` reading the name.
+  Without it the alias was registered but scored **bare**, so the hoist below
+  was reported as an unguarded bare checkout with BE-5546's message on it.
+
+So hoisting that seven-times duplicated binding to a shared `env:` and checking
+out at `ref: ${{ env.WORKFLOWS_REF }}` — the refactor the alias machinery exists
+to survive — keeps both its coverage and its strength.
+
+**Keep that `env:` at STEP level.** The `job` context is not available in
+`jobs.<job_id>.env`, so a job-level hoist of the *fallback* spelling is not a
+refactor the lint mislints — it is an invalid workflow. Verified with
+`actionlint` 1.7.12 on `${{ job.status }}` (a `job` property its schema does
+know, isolating context availability from the `job.workflow_sha` staleness
+noted next): rejected at job level with *"context "job" is not allowed here"*,
+accepted at step level. All seven of groom.yml's bindings are step-level today.
+A job-level `env:` may still bind the **bare** input — `env_aliases` registers
+it and the checkouts below it then need a bare guard, which is the correct
+answer. (`actionlint` ≤ 1.7.12 also false-positives on `job.workflow_sha`
+itself, whose `job`-context schema predates runner v2.334.0; no CI here runs
+it.)
 
 The guard is copied inline into each consuming job rather than factored into a
 composite action **on purpose**: a composite would have to be loaded with

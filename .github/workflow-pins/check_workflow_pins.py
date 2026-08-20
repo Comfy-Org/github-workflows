@@ -92,11 +92,6 @@ _INPUT_MENTION_RE = re.compile(r"""inputs\.%s\b""" % INPUT_NAME)
 # checks the other half, that the step actually rejects an empty value.
 # Block form only, deliberately: a guard written in flow style reads as ABSENT,
 # which fails the lint loudly instead of passing a checkout it never verified.
-# How the guard RECEIVES the ref: through `env:` (never interpolated into the
-# script body) under this one name. Half the signature — `is_guard_step` below
-# checks the other half, that the step actually rejects an empty value.
-# Block form only, deliberately: a guard written in flow style reads as ABSENT,
-# which fails the lint loudly instead of passing a checkout it never verified.
 # A trailing comment IS tolerated — unlike the flow form that is a real guard
 # doing its job, so rejecting it would fail a compliant workflow, not catch one.
 #
@@ -277,15 +272,30 @@ _CONSUMES_SCALAR_RE = re.compile(
 # `ref: ${{ env.WORKFLOWS_REF }}` below reads as no ref use at all, dropping
 # the very checkouts this lint exists to cover. So the names bound to the input
 # are collected first, and a `ref:` reaching one of them counts as a use.
-# The `|| job.workflow_sha` spelling counts as a binding here too, or the two
-# halves of this module disagree about what a binding IS: hoisting groom.yml's
-# seven-times-duplicated `WORKFLOWS_REF:` to a job-level `env:` and checking out
-# at `ref: ${{ env.WORKFLOWS_REF }}` — exactly the refactor this regex exists to
-# survive — would register no alias, `is_ref_use` would stop seeing those
-# checkouts, and the file would drop to zero coverage while reporting nothing.
+# ANY `env:` value that MENTIONS the input registers a binding — not only the
+# bare input or the `|| job.workflow_sha` fallback. Enumerating blessed
+# spellings made an unrecognized one fail OPEN, which is the wrong direction for
+# a detector whose job is absence: `WORKFLOWS_REF: ${{ inputs.workflows_ref ||
+# 'main' }}` registered no alias, so `ref: ${{ env.WORKFLOWS_REF }}` read as no
+# ref use at all and that checkout left the lint entirely — carrying the exact
+# mutable fallback the lint exists to catch. Registering it instead hands the
+# checkout to the guard and mutability checks, which is the posture the module
+# states everywhere else (a flow-form guard "reads as ABSENT, which fails the
+# lint loudly"). Which bindings are STRONG is a separate question, answered by
+# `fallback_env_aliases` below — this one only answers "does it reach the
+# input", and hoisting groom.yml's seven-times-duplicated `WORKFLOWS_REF:` to a
+# shared `env:` and checking out at `ref: ${{ env.WORKFLOWS_REF }}` — the
+# refactor this regex exists to survive — keeps its coverage either way.
 _ENV_ALIAS_RE = re.compile(
+    r"""^\s*(['"]?)([A-Za-z_]\w*)\1\s*:[^\S\n]*.*inputs\.%s\b""" % INPUT_NAME
+)
+# …and the strict subset: bound to the EXACT two-operand fallback, nothing else.
+# `env_aliases` may fail open into "counts as a use"; this one grants the
+# `default: ''` carve-out and the weaker fallback-guard requirement, so it must
+# fail closed. Trailing comment tolerated, as on the guard binding.
+_ENV_FALLBACK_ALIAS_RE = re.compile(
     r"""^\s*(['"]?)([A-Za-z_]\w*)\1\s*:[^\S\n]*"""
-    r"""(['"]?)\$\{\{\s*inputs\.%s\s*(?:\|\|\s*job\.workflow_sha\s*)?"""
+    r"""(['"]?)\$\{\{\s*inputs\.%s\s*\|\|\s*job\.workflow_sha\s*"""
     r"""\}\}\3[^\S\n]*(?:#.*)?$""" % INPUT_NAME
 )
 # Scoped to `env:` blocks, not every mapping key bound to the input: the
@@ -322,30 +332,75 @@ _COMMENT_RE = re.compile(r"(?:^|\s)#.*$")
 # cursor-review.yml's ledger job (which must never fail) resolves it in a step
 # that warns and skips the checkout. This exemption is about the ref not being
 # MUTABLE; those runtime guards cover the empty case.
-# ANCHORED AT BOTH ENDS — `${{` … `}}` — and matched against the
-# comment-stripped line (`_pins_to_job_workflow_sha` below). Unanchored, this
-# read "contains the fallback" rather than "IS the fallback", and BOTH ends
-# matter because an extra operand on either side reintroduces a mutable ref:
-# `${{ inputs.workflows_ref || job.workflow_sha || \'main\' }}` resolves to the
-# default branch in exactly the pre-v2.334.0 case the fallback exists for, and
+# ANCHORED TO THE WHOLE YAML VALUE, not just to the interpolation, and matched
+# against the comment-stripped line. Unanchored, this read "contains the
+# fallback" rather than "IS the fallback", and every boundary matters because an
+# extra operand — or an extra character — on either side reintroduces a mutable
+# ref: `${{ inputs.workflows_ref || job.workflow_sha || 'main' }}` resolves to
+# the default branch in exactly the pre-v2.334.0 case the fallback exists for,
 # `${{ inputs.override || inputs.workflows_ref || job.workflow_sha }}` resolves
-# to whatever the LEADING operand names — a branch, a tag, another input. The
-# runtime guard cannot catch either one: a guard proves non-emptiness, not
-# immutability. Only the exact two-operand expression is a self-pin.
-_JOB_WORKFLOW_SHA_FALLBACK_RE = re.compile(
-    r"""\$\{\{\s*inputs\.%s\s*\|\|\s*job\.workflow_sha\s*\}\}""" % INPUT_NAME
-)
+# to whatever the LEADING operand names, and `refs/heads/${{ … }}` /
+# `${{ inputs.override }}${{ … }}` bury it in a concatenation. The runtime guard
+# cannot catch any of them: a guard proves non-emptiness, not immutability.
+#
+# Three spellings, mirroring the `_REF_USE_*` trio, because a `${{ … }}` sitting
+# somewhere on the line is not the same as being the REF's value:
+#   block  `ref: ${{ … }}`                  — the value is the whole rest of the line
+#   flow   `{…, ref: ${{ … }}, …}`          — bounded at the entry boundary, exactly
+#                                             as `_REF_USE_FLOW_RE` bounds its own
+#                                             value, so a SIBLING entry carrying the
+#                                             fallback cannot be misread as the ref
+#   cont.  a continuation line that IS the expression, for `ref: >-` and friends
+_FALLBACK_BODY = r"""inputs\.%s\s*\|\|\s*job\.workflow_sha""" % INPUT_NAME
 
 
-def _pins_to_job_workflow_sha(line):
-    """True when `line`'s CODE — not its comments — uses the BE-4169 fallback.
+def _fallback_body_alt(fallback_aliases=()):
+    """Expression bodies that ARE the immutable fallback — literal or aliased.
 
-    Comments are stripped first because `check_dir` asks this of every line in
-    the file: prose merely NAMING the expression (this repo\'s workflows discuss
-    it at length) would otherwise buy the `default: \'\'` carve-out for a file
-    where no checkout uses it at all.
+    An `env:` name bound to the exact fallback carries that name's STRENGTH to
+    every `ref: ${{ env.NAME }}` reading it. Without this the alias machinery
+    registered the name (so the checkout stayed visible to the lint) but scored
+    it bare, reporting the very hoist-to-`env:` refactor the README blesses as
+    an unguarded BARE checkout — a false failure, with the wrong advice on it.
+
+    Deliberately NARROWER than `env_aliases`: that set fails OPEN into "counts
+    as a ref use" (over-approximating can only DEMAND a guard), while this one
+    grants an EXEMPTION, so only the exact two-operand binding qualifies.
     """
-    return bool(_JOB_WORKFLOW_SHA_FALLBACK_RE.search(_strip_comment(line)))
+    alt = _FALLBACK_BODY
+    if fallback_aliases:
+        names = "|".join(sorted(re.escape(a) for a in fallback_aliases))
+        alt += r"""|env\.(?:%s)""" % names
+    return alt
+
+
+def _fallback_res(fallback_aliases=()):
+    """The (block, flow, continuation) matchers for "this ref IS the fallback"."""
+    value = r"""(?P<q>['"]?)\$\{\{\s*(?:%s)\s*\}\}(?P=q)""" % _fallback_body_alt(
+        fallback_aliases
+    )
+    return (
+        re.compile(r"""^\s*(?P<k>['"]?)ref(?P=k)\s*:[^\S\n]*""" + value + r"""[^\S\n]*$"""),
+        re.compile(
+            r"""[{,]\s*(?P<k>['"]?)ref(?P=k)\s*:[^\S\n]*""" + value + r"""[^\S\n]*(?=[,}])"""
+        ),
+        re.compile(r"""^\s*""" + value + r"""[^\S\n]*$"""),
+    )
+
+
+_FALLBACK_RES = _fallback_res()
+
+
+def _pins_to_job_workflow_sha(line, res=None):
+    """True when `line`'s CODE — not its comments — IS the BE-4169 fallback ref.
+
+    Comments are stripped first because prose merely NAMING the expression
+    (this repo's workflows discuss it at length) must not buy the `default: ''`
+    carve-out for a file where no checkout actually uses it.
+    """
+    block_re, flow_re, cont_re = res or _FALLBACK_RES
+    code = _strip_comment(line)
+    return bool(block_re.match(code) or flow_re.search(code) or cont_re.match(code))
 
 
 def _default_value(line):
@@ -353,17 +408,27 @@ def _default_value(line):
     return _strip_comment(line.split(":", 1)[1])
 
 
-def env_aliases(lines):
-    """Names bound to the input by an `env:` mapping, e.g. `WORKFLOWS_REF`."""
+def _env_bindings(lines, pattern):
+    """Names bound inside an `env:` block by `pattern`, e.g. `WORKFLOWS_REF`."""
     names = set()
     for i, line in enumerate(lines):
         if not _ENV_KEY_RE.match(line):
             continue
         for _, child in _block_body(lines, i, _indent(line)):
-            match = _ENV_ALIAS_RE.match(child)
+            match = pattern.match(child)
             if match:
                 names.add(match.group(2))
     return frozenset(names)
+
+
+def env_aliases(lines):
+    """Names whose `env:` binding REACHES the input, e.g. `WORKFLOWS_REF`."""
+    return _env_bindings(lines, _ENV_ALIAS_RE)
+
+
+def fallback_env_aliases(lines):
+    """The subset of `env_aliases` bound to the exact BE-4169 fallback."""
+    return _env_bindings(lines, _ENV_FALLBACK_ALIAS_RE)
 
 
 def _mention_alt(aliases):
@@ -664,8 +729,8 @@ def is_guard_step(lines, idx):
     return False
 
 
-def unguarded_ref_checkouts(lines):
-    """(1-based line, uses_fallback) for every ref checkout with no adequate guard.
+def ref_checkouts(lines):
+    """(1-based line, uses_fallback, guarded) for EVERY ref checkout in the file.
 
     A use is guarded when the empty-ref guard step appears earlier in the SAME
     job — jobs run independently, so a guard in job A does nothing for job B —
@@ -681,9 +746,19 @@ def unguarded_ref_checkouts(lines):
     `ref: ${{ inputs.workflows_ref }}`, which still receives '' and sends
     checkout to the default branch. So a fallback guard covers fallback
     checkouts only, and a bare checkout needs a bare guard.
+
+    A checkout reaching the ref through an `env:` name inherits that BINDING's
+    strength (`fallback_env_aliases`), not the shape of its own `ref:` line —
+    `ref: ${{ env.WORKFLOWS_REF }}` can never look like the fallback itself.
     """
     aliases = env_aliases(lines)
     ref_res = _ref_use_res(aliases)
+    # Computed ONCE per file, not per line: `env_aliases` is a full-file scan
+    # plus a `_block_body` walk per `env:` key, and `check_dir`'s carve-out used
+    # to rebuild both inside its own `any(...)` comprehension — quadratic on the
+    # files that matter most here (groom.yml is ~3,000 lines with dozens of
+    # `env:` blocks, and `check_dir` runs over the real tree in the CLI lint).
+    fb_res = _fallback_res(fallback_env_aliases(lines))
     mention_re = re.compile(_mention_alt(aliases))
     jobs_line = None
     for i, line in enumerate(lines):
@@ -704,7 +779,7 @@ def unguarded_ref_checkouts(lines):
         if _indent(line) == job_indent
     ]
 
-    unguarded = []
+    found = []
     for start in job_starts:
         guarded_input = False     # a guard proved the INPUT non-empty
         guarded_fallback = False  # …only the `|| job.workflow_sha` expression
@@ -720,9 +795,9 @@ def unguarded_ref_checkouts(lines):
                         # reader must find), but judge the CONTINUATION line —
                         # the key never holds the expression, so asking it
                         # whether this is a fallback always answered no.
-                        fallback = _pins_to_job_workflow_sha(line)
-                        if not (guarded_input or (fallback and guarded_fallback)):
-                            unguarded.append((pending[0] + 1, fallback))
+                        fallback = _pins_to_job_workflow_sha(line, fb_res)
+                        guarded = guarded_input or (fallback and guarded_fallback)
+                        found.append((pending[0] + 1, fallback, guarded))
                         pending = None
                     continue
                 # Scalar closed — fall through and judge this line normally.
@@ -732,13 +807,13 @@ def unguarded_ref_checkouts(lines):
                 # NO fallback exception on the guard requirement (BE-8077). The
                 # BE-4169 `inputs.workflows_ref || job.workflow_sha` form cannot
                 # resolve to a MUTABLE ref — that is what earns it the
-                # `default: \'\'` carve-out in `check_dir` — but it is NOT
+                # `default: ''` carve-out in `check_dir` — but it is NOT
                 # self-sufficient the way that story assumed: `job.workflow_sha`
-                # needs runner v2.334.0+ and expands to \'\' on anything older,
-                # and checkout reads `ref: \'\'` as the DEFAULT BRANCH. So the
+                # needs runner v2.334.0+ and expands to '' on anything older,
+                # and checkout reads `ref: ''` as the DEFAULT BRANCH. So the
                 # fallback answers MUTABILITY and the guard answers EMPTINESS,
                 # and this lint requires both. Exempting the fallback from the
-                # guard check meant deleting every one of groom.yml\'s seven
+                # guard check meant deleting every one of groom.yml's seven
                 # guard steps kept this lint green.
                 if is_guard_step(lines, i):
                     if binding.group("fallback"):
@@ -746,12 +821,26 @@ def unguarded_ref_checkouts(lines):
                     else:
                         guarded_input = True
             elif is_ref_use(line, ref_res):
-                fallback = _pins_to_job_workflow_sha(line)
-                if not (guarded_input or (fallback and guarded_fallback)):
-                    unguarded.append((i + 1, fallback))
+                # Under `guarded_input` the checkout passes with no SHAPE check
+                # on its ref expression — `ref: ${{ inputs.override || inputs.
+                # workflows_ref }}` would clear both halves of the lint on a
+                # leading operand `check_dir` never inspects (it reads only
+                # `workflows_ref`'s own `default:`). Deliberately out of scope:
+                # no workflow here declares a second ref-bearing input, and
+                # demanding a shape of every guarded ref would false-positive on
+                # the legitimate spellings this module works hard to accept. If
+                # one is ever added, this is where it has to be judged.
+                fallback = _pins_to_job_workflow_sha(line, fb_res)
+                guarded = guarded_input or (fallback and guarded_fallback)
+                found.append((i + 1, fallback, guarded))
             elif _REF_KEY_OPEN_RE.match(line):
                 pending = (i, _indent(line))
-    return unguarded
+    return found
+
+
+def unguarded_ref_checkouts(lines):
+    """(1-based line, uses_fallback) for every ref checkout with no adequate guard."""
+    return [(lineno, fb) for lineno, fb, guarded in ref_checkouts(lines) if not guarded]
 
 
 def find_unguarded_ref_checkouts(lines):
@@ -820,25 +909,31 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
         # job.workflow_sha`); this covers the matching `default: ''`, which is
         # otherwise indistinguishable from the `default: main` hole. See
         # groom.yml — which ALSO runs a fail-closed empty-ref guard in every one
-        # groom.yml — which ALSO runs a fail-closed empty-ref guard in every one
         # of those jobs, because `job.workflow_sha` needs runner v2.334.0+ and
         # expands to '' on anything older. The old `github.job_workflow_sha`
         # spelling is deliberately NOT accepted: it is an OIDC claim and expands
         # to '' on EVERY runner, so a file "self-pinning" with it pins nothing.
         #
-        # Scoped to lines that are a ref CHECKOUT, not to every line in the
-        # file. Asking it of all of them granted the carve-out to any file that
-        # merely MENTIONS the expression in code — most sharply, the guard
-        # steps' own `WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}`
+        # Scoped to actual ref CHECKOUTS, not to every line in the file. Asking
+        # it of all of them granted the carve-out to any file that merely
+        # MENTIONS the expression in code — most sharply, the guard steps' own
+        # `WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}`
         # `env:` binding — so a file whose checkouts all read the bare
         # `ref: ${{ inputs.workflows_ref }}` bought an empty default it does not
         # self-pin against. (Stripping comments closed the prose half of that;
         # this closes the code half.)
-        self_pins_to_job_workflow_sha = any(
-            _pins_to_job_workflow_sha(line)
-            for line in lines
-            if is_ref_use(line, _ref_use_res(env_aliases(lines)))
-        )
+        #
+        # Asked of the PARSER rather than re-derived line by line here. A
+        # per-line scan cannot see the block-scalar spelling the parser already
+        # handles — for `ref: >-` with the expression on the line below, the key
+        # line carries no expression and the continuation line carries no `ref:`
+        # key, so no single line satisfies both tests. That file self-pins, but
+        # lost the carve-out and got BE-5546's "delete the default" error while
+        # its checkouts simultaneously got BE-8077's "the fallback IS
+        # recognized" one. Fail-closed, but a false failure with contradictory
+        # advice. `ref_checkouts` judges the continuation line the parser
+        # matched, and computes the alias scan once instead of once per line.
+        self_pins_to_job_workflow_sha = any(fb for _, fb, _ in ref_checkouts(lines))
 
         for lineno in defaults:
             if self_pins_to_job_workflow_sha and _default_value(lines[lineno - 1]) in ("''", '""'):

@@ -176,8 +176,16 @@ expands an unknown context property to `''`, and `actions/checkout` with an empt
 mutable assets in the jobs holding your `ANTHROPIC_API_KEY` and App token, and
 the explicit pin is what keeps groom pinned. Bump past BE-8077 (or set
 `workflows_ref`) to close it. Second, `job.workflow_sha` needs an Actions runner
-≥ v2.334.0; every groom job now fails closed with an `::error::` if it resolves
-empty, so the failure is loud rather than a silent default-branch checkout.
+≥ v2.334.0; every job that checks out the **briefs and scripts** now fails
+closed with an `::error::` if the ref resolves empty, so that failure is loud
+rather than a silent default-branch checkout. The one path deliberately left
+warn-only is the **agent CLI pin**: it reads `ref: ${{ job.workflow_sha }}`
+alone — no `workflows_ref` in front of it, and no guard — so on a pre-v2.334.0
+runner it reads the CLI manifest from the default branch behind a `::warning::`
+rather than failing the run. The pin is still validated; it just stops being
+pinned by the caller's `uses:` SHA. Every groom job runs on `ubuntu-latest`,
+which is always current, so only a stale self-hosted runner reaches either
+branch.
 
 **Bumping is not usually manual.** `bump-callers.sh` rewrites a caller's
 `workflows_ref:` in the same pass as its `uses:` pin, so a caller enrolled in the
