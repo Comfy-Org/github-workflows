@@ -26,8 +26,22 @@ Dependabot PR runs. The fix is the standard **`pull_request` → `workflow_run`*
   and calls this reusable, which GitHub grants the secret and a write token even for a fork PR.
 
 The validate job runs on your **default branch**, so its job-level check is *not* the thing you
-require in branch protection. This reusable publishes a commit status named **`linear-ticket`**
+require in branch protection. This reusable publishes a commit status named **`Linear ticket`**
 on the PR head SHA; you require **that context** once warn-only observation is done.
+
+> [!IMPORTANT]
+> **The context was renamed from `linear-ticket` to `Linear ticket`.** GitHub renders it verbatim
+> as the check's name, so it is prose now rather than a slug. Two consequences when you bump past
+> that pin:
+>
+> - **If your ruleset already requires `linear-ticket`, update it in the same change.** The old
+>   context is never reported again, so a required check nobody publishes leaves every PR
+>   pending — which blocks merges exactly as a failure would. (No caller required it at the time
+>   of the rename, which is why it was done then.)
+> - **Open PRs keep the old status too.** Commit statuses are per-context and append-only, so a PR
+>   whose head was already validated shows a stale red `linear-ticket` beside the new
+>   `Linear ticket` until it gets a new commit. Nothing consumes the stale one; it ages out with
+>   the head SHA.
 
 ## Prerequisites
 
@@ -78,7 +92,7 @@ jobs:
       actions: read           # read the triggering workflow_run
       contents: read          # checkout the validator scripts; PR code is never checked out
       pull-requests: write    # the one marker diagnostic comment
-      statuses: write         # publish the `linear-ticket` commit status
+      statuses: write         # publish the `Linear ticket` commit status
     uses: Comfy-Org/github-workflows/.github/workflows/linear-ticket.yml@<full-commit-sha>  # v1
     with:
       workflows_ref: <same-full-commit-sha>
@@ -125,20 +139,20 @@ job-level detail.
 | `exempt-actors` | `''` | Comma-separated PR-author logins whose PRs skip the check without a label (e.g. `dependabot[bot],renovate[bot]`) — the non-manual hatch for bot PRs that never carry a ticket. Opt-in; empty means no bypass. Listing an actor means **all** of its PRs merge without a Linear ticket, so keep it to trusted automation accounts. |
 | `require-open-issue` | `true` | Reject a linked issue whose Linear `state.type` is `completed`/`canceled`. `backlog`/`unstarted`/`started`/`triage` pass. |
 | `enforce` | `true` | `false` is warn-only: a failing **verdict** never exits the job nonzero. `soft-fail` decides how loudly it is reported; the diagnosis is identical either way. Warn-only is not a promise the job always exits `0` — a broken *run* still does (a failed terminal status write, a missing token/repo, malformed `team-keys`, a non-`pull_request` trigger). |
-| `soft-fail` | `true` | Warn-only only (ignored when `enforce: true`). `true` publishes a **red `failure`** status, so the PR's check list shows the check failing — loud, but non-blocking for as long as `linear-ticket` is not a required status in your ruleset. `false` restores the silent variant (warn-only publishes `success`; only the summary and comment carry the verdict). **Do not** require the `linear-ticket` context while `enforce: false` — required + soft-fail would block merges. |
+| `soft-fail` | `true` | Warn-only only (ignored when `enforce: true`). `true` publishes a **red `failure`** status, so the PR's check list shows the check failing — loud, but non-blocking for as long as `Linear ticket` is not a required status in your ruleset. `false` restores the silent variant (warn-only publishes `success`; only the summary and comment carry the verdict). **Do not** require the `Linear ticket` context while `enforce: false` — required + soft-fail would block merges. |
 
 ## Upgrading an existing `enforce: false` caller
 
 `soft-fail` is new, and it defaults to `true`. **If your caller already runs `enforce: false`,
 taking a SHA bump past the commit that added this input changes what your PRs show:** warn-only
-used to publish a green `linear-ticket` status in every outcome, and now publishes a **red**
+used to publish a green `Linear ticket` status in every outcome, and now publishes a **red**
 one. Nothing about *blocking* changes — a status only blocks when your ruleset requires that
 context — but the PR check list goes from green to red, and anything you have keyed off the
 status (auto-merge bots, dashboards, other automation) sees `failure` where it saw `success`.
 
 Two things to do before you take the bump:
 
-1. **Check your ruleset.** If `linear-ticket` is already a required check while you are still on
+1. **Check your ruleset.** If `Linear ticket` is already a required check while you are still on
    `enforce: false`, the red status *will* block merges. That combination was always a
    misconfiguration (rollout step 6 is the last step for a reason), but soft-fail is what makes
    it bite. Remove the required check, or flip `enforce: true` — do not sit in between.
@@ -157,18 +171,18 @@ skewed apart, so an older `linear-ticket.yml` is running newer scripts — is tr
 
 ## Rollout (warn-only first)
 
-1. Land both caller files with `enforce: false`, and **leave `linear-ticket` out of your
+1. Land both caller files with `enforce: false`, and **leave `Linear ticket` out of your
    ruleset's required checks** — that omission, not the input, is what keeps the pilot
    non-blocking. Observe for ~a week: attachment latency, URL matching, retry counts,
    team/state outcomes, fork/Dependabot behaviour, and rate-limit headroom (the validator logs
    `X-RateLimit-*` headers).
 
    With the default `soft-fail: true`, a warn-only failure shows on the PR as a **red
-   `linear-ticket` check** plus the marker comment, which is what makes authors notice and fix
+   `Linear ticket` check** plus the marker comment, which is what makes authors notice and fix
    links during the pilot instead of discovering the requirement on flip day. Nobody is
    blocked: a non-required failing check leaves the merge button live. If you want the quieter
    first pass, set `soft-fail: false` and the status stays green.
-2. Confirm the `linear-ticket` status publishes on **same-repo, fork, and Dependabot** PR head
+2. Confirm the `Linear ticket` status publishes on **same-repo, fork, and Dependabot** PR head
    SHAs, and that automatic (branch/title/body) and manual links both resolve to the same
    canonical URL.
 3. **Track the stale-link case.** Linking an issue *in Linear* after the check went red produces
@@ -182,19 +196,27 @@ skewed apart, so an older `linear-ticket.yml` is running newer scripts — is tr
 5. Flip `enforce: true`. Leave the check non-required for a short window — the PR-visible
    result is unchanged from the soft-fail pilot; what changes is that the validator's own run
    now goes red too, so a systemic breakage is visible in the Actions tab.
-6. Add the **`linear-ticket`** status context to your `main` ruleset as a required check.
+6. Add the **`Linear ticket`** status context to your `main` ruleset as a required check.
    Only now does anything block.
 
 Nothing here changes branch protection automatically — the last step is a manual repo-admin action.
 
 ## Gotchas
 
-**The required check is a commit *status*, not the job.** Require the `linear-ticket` context in
-your ruleset; do not require the `Linear Ticket / validate` job — it runs on the default branch
-against the workflow_run event and is not tied to the PR's merge check.
+**The required check is a commit *status*, not the job — and the two names now look alike.**
+Your ruleset's check picker will offer both of these:
+
+| pick | name | what it is |
+|---|---|---|
+| ✅ | `Linear ticket` | the commit status this reusable publishes on the PR head SHA |
+| ❌ | `Linear Ticket / validate` | the validator's own job, which runs on your DEFAULT branch |
+
+They differ only by capitalisation and the ` / validate` suffix, so read carefully. Requiring the
+job instead of the status is the classic mistake here: the job is not tied to the PR's head
+commit, so the requirement is never satisfied on the PR and every merge hangs pending.
 
 **A red check is not the same as a blocked merge.** What blocks is your ruleset requiring the
-`linear-ticket` context — nothing this workflow does. That is why warn-only can (and by default
+`Linear ticket` context — nothing this workflow does. That is why warn-only can (and by default
 does) publish a red status: it is a real, visible signal that costs nobody a merge. The
 corollary is the footgun: do not add the context to your ruleset until you flip `enforce: true`,
 or the warn-only pilot starts blocking.

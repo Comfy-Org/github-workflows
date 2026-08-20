@@ -177,6 +177,25 @@ class FailureGuidance(unittest.TestCase):
 ALL_CATEGORIES = ("no_candidate", "exists_not_linked", "policy_mismatch", "infra_error")
 
 
+class StatusContext(unittest.TestCase):
+    def test_context_is_the_human_facing_name_branch_protection_requires(self):
+        # Pinned deliberately. GitHub renders this verbatim as the check's name in the PR's
+        # check list, AND it is the exact string a consumer lists in its ruleset's required
+        # checks. A rename is invisible in CI and silently retires the required check in any
+        # repo already requiring it, so make the test fail and force the caller audit.
+        self.assertEqual(lib.CONTEXT, "Linear ticket")
+
+    def test_context_reads_as_prose_not_a_slug(self):
+        self.assertNotIn("-", lib.CONTEXT)
+        self.assertNotIn("_", lib.CONTEXT)
+
+    def test_marker_is_independent_of_the_context(self):
+        # The comment marker is an HTML comment validate.py greps for; it is NOT the status
+        # context and must not be "tidied" to match a context rename, or the gate stops
+        # finding the comment it already posted and starts duplicating it.
+        self.assertEqual(lib.MARKER, "<!-- linear-ticket-check -->")
+
+
 class FailureOutcomeModes(unittest.TestCase):
     """The reporting-mode table in lib.py. The invariant under all of it: soft-fail changes
     only how LOUD a red verdict is, never the diagnosis and never the exit code contract."""
@@ -234,17 +253,29 @@ class FailureOutcomeModes(unittest.TestCase):
                     self.assertEqual(outcome.advisory,
                                      not enforce and soft_fail and outcome.state == "failure")
 
-    def test_category_is_named_in_every_verdict_and_description(self):
+    def test_category_is_named_in_every_verdict(self):
+        # The verdict heads the marker comment and job summary, where the raw category is the
+        # handle someone quotes when reporting a red check.
         for category in ALL_CATEGORIES:
             for enforce in (True, False):
                 for soft_fail in (True, False):
-                    outcome = lib.failure_outcome(category, enforce, soft_fail)
-                    self.assertIn(category, outcome.verdict)
-                    self.assertIn(category, outcome.description)
+                    self.assertIn(category,
+                                  lib.failure_outcome(category, enforce, soft_fail).verdict)
+
+    def test_status_description_carries_no_raw_category_slug(self):
+        # The description is the PR-visible one-liner beside the check name — prose, not a
+        # slug dump. The category stays in the comment and summary (test above), which is
+        # where triage happens; `(no_candidate)` next to the check name is just noise.
+        for category in ALL_CATEGORIES:
+            for enforce in (True, False):
+                for soft_fail in (True, False):
+                    desc = lib.failure_outcome(category, enforce, soft_fail).description
+                    self.assertNotIn(category, desc)
+                    self.assertNotIn("_", desc)
 
     def test_description_fits_the_github_status_limit(self):
         # publish_status truncates at 140; a description that only ever survives truncation
-        # would silently lose the category, so keep every mode's copy inside the limit.
+        # would silently lose its meaning, so keep every mode's copy inside the limit.
         for category in ALL_CATEGORIES:
             for enforce in (True, False):
                 for soft_fail in (True, False):
@@ -272,7 +303,7 @@ class AdvisoryNote(unittest.TestCase):
 
     def test_never_asserts_flatly_that_nothing_is_blocked(self):
         # The validator never reads the caller's ruleset, so it cannot know whether the
-        # `linear-ticket` context is required. In the documented footgun configuration
+        # `Linear ticket` context is required. In the documented footgun configuration
         # (warn-only + context already required) the red check IS blocking the author, and a
         # flat "this does not block the merge" would send them to debug the wrong thing.
         for category in ALL_CATEGORIES:
