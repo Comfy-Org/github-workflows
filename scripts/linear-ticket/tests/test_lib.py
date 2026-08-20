@@ -174,6 +174,79 @@ class FailureGuidance(unittest.TestCase):
             lib.failure_guidance("bogus")
 
 
+ALL_CATEGORIES = ("no_candidate", "exists_not_linked", "policy_mismatch", "infra_error")
+
+
+class FailureOutcomeModes(unittest.TestCase):
+    """The reporting-mode table in lib.py. The invariant under all of it: soft-fail changes
+    only how LOUD a red verdict is, never the diagnosis and never the exit code contract."""
+
+    def test_enforce_is_red_and_exits_nonzero(self):
+        outcome = lib.failure_outcome("no_candidate", enforce=True, soft_fail=False)
+        self.assertEqual(outcome.state, "failure")
+        self.assertEqual(outcome.exit_code, 1)
+        self.assertFalse(outcome.advisory)
+
+    def test_enforce_ignores_soft_fail(self):
+        # soft-fail is a warn-only knob; enforcing already publishes the red status it exists
+        # to produce, and must still exit nonzero.
+        self.assertEqual(lib.failure_outcome("no_candidate", enforce=True, soft_fail=True),
+                         lib.failure_outcome("no_candidate", enforce=True, soft_fail=False))
+
+    def test_soft_fail_is_red_but_exits_zero(self):
+        outcome = lib.failure_outcome("exists_not_linked", enforce=False, soft_fail=True)
+        self.assertEqual(outcome.state, "failure")   # loud: the PR check list shows a red X
+        self.assertEqual(outcome.exit_code, 0)       # but the run itself stays green
+        self.assertTrue(outcome.advisory)            # and the comment says it does not block
+
+    def test_silent_warn_only_is_green(self):
+        outcome = lib.failure_outcome("exists_not_linked", enforce=False, soft_fail=False)
+        self.assertEqual(outcome.state, "success")
+        self.assertEqual(outcome.exit_code, 0)
+        self.assertFalse(outcome.advisory)
+
+    def test_only_enforce_ever_exits_nonzero(self):
+        for category in ALL_CATEGORIES:
+            for soft_fail in (True, False):
+                self.assertEqual(
+                    lib.failure_outcome(category, enforce=False, soft_fail=soft_fail).exit_code,
+                    0, f"warn-only must not exit nonzero ({category}, soft_fail={soft_fail})")
+
+    def test_advisory_only_when_red_and_non_gating(self):
+        # The "does not block" note must never ride along with an enforcing (gating) verdict —
+        # that would tell an author to ignore a check that is actually blocking them.
+        for category in ALL_CATEGORIES:
+            for enforce in (True, False):
+                for soft_fail in (True, False):
+                    outcome = lib.failure_outcome(category, enforce, soft_fail)
+                    self.assertEqual(outcome.advisory,
+                                     not enforce and soft_fail and outcome.state == "failure")
+
+    def test_category_is_named_in_every_verdict_and_description(self):
+        for category in ALL_CATEGORIES:
+            for enforce in (True, False):
+                for soft_fail in (True, False):
+                    outcome = lib.failure_outcome(category, enforce, soft_fail)
+                    self.assertIn(category, outcome.verdict)
+                    self.assertIn(category, outcome.description)
+
+    def test_description_fits_the_github_status_limit(self):
+        # publish_status truncates at 140; a description that only ever survives truncation
+        # would silently lose the category, so keep every mode's copy inside the limit.
+        for category in ALL_CATEGORIES:
+            for enforce in (True, False):
+                for soft_fail in (True, False):
+                    outcome = lib.failure_outcome(category, enforce, soft_fail)
+                    self.assertLessEqual(len(outcome.description), 140)
+
+    def test_unknown_category_raises(self):
+        with self.assertRaises(KeyError):
+            lib.failure_outcome("bogus", enforce=False, soft_fail=True)
+
+    def test_advisory_note_is_unambiguous_about_not_blocking(self):
+        self.assertIn("does not block", lib.ADVISORY_NOTE)
+
+
 class DiagnosticQuery(unittest.TestCase):
     def test_empty_raises(self):
         with self.assertRaises(ValueError):

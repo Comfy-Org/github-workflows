@@ -43,8 +43,15 @@ That is the whole point: a `TEAM-123`-shaped string an author types is not a lin
   Linear signals rate limiting as HTTP 400 + GraphQL `RATELIMITED`, which is retried within a
   bounded budget (2s, 4s, 8s, 16s over five attempts).
 - Comment I/O is **best-effort**: a comment failure is warned, never changes the verdict.
-- `enforce: false` is **warn-only** — every outcome publishes success, but the summary and
-  marker comment show the verdict enforce mode would have produced.
+- **Reporting mode is not the verdict.** `failure_outcome()` maps (category, mode) to the
+  status state, comment headline, and exit code; the diagnosis is identical in every mode.
+  `enforce: true` → red status + nonzero exit. `enforce: false` (warn-only) never exits
+  nonzero and, with the default `soft-fail: true`, still publishes a **red** status — loud on
+  the PR but blocking nothing while `linear-ticket` is not a required context, with an
+  explicit "this does not block the merge" note on the comment. `soft-fail: false` restores
+  the silent always-green warn-only behaviour.
+- A failed **terminal status write** is exit 1 even in warn-only: soft-fail's whole point is
+  that the red status lands, and a missing write leaves the previous status standing.
 
 ## Running the tests
 
@@ -56,5 +63,5 @@ python3 -m py_compile scripts/linear-ticket/lib.py scripts/linear-ticket/validat
 The hermetic suite covers the design's acceptance cases that live in pure functions
 (extraction/dedup/cap, `team-keys` validation, the policy gate incl. multi-link and
 state/team handling, error classification, category selection, the diagnostic-query
-builder). The **real-Linear behaviours** — URL canonicalization and attachment timing — are
+builder, and the reporting-mode table). The **real-Linear behaviours** — URL canonicalization and attachment timing — are
 proven in the pilot, not by mocks (design §11).

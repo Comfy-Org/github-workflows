@@ -19,7 +19,10 @@ Contract (all via env, set by linear-ticket.yml):
     TEAM_KEYS          raw ``team-keys`` input (comma-separated; empty = any team)
     EXEMPT_LABEL       exemption label name; empty disables exemption
     REQUIRE_OPEN_ISSUE "true"/"false"
-    ENFORCE            "true" (fail closed) / "false" (warn-only: always green, same diagnosis)
+    ENFORCE            "true" (fail closed) / "false" (warn-only: never exits nonzero)
+    SOFT_FAIL          warn-only only: "true" (default) publishes a red `failure` status —
+                       loud but non-blocking while the context is not required; "false"
+                       restores the silent always-green warn-only behaviour
     RUN_URL            html_url of this workflow run, for the status target and comment
     LINEAR_API_URL     optional override (default https://api.linear.app/graphql)
     GITHUB_STEP_SUMMARY  written with the human-readable outcome
@@ -233,12 +236,14 @@ def _log_rate_limit(headers) -> None:
 
 # ── orchestration ───────────────────────────────────────────────────────────────────────
 class Validator:
-    def __init__(self, gh: GitHub, token: str, team_keys, require_open, enforce, run_url):
+    def __init__(self, gh: GitHub, token: str, team_keys, require_open, enforce, soft_fail,
+                 run_url):
         self.gh = gh
         self.token = token
         self.team_keys = team_keys
         self.require_open = require_open
         self.enforce = enforce
+        self.soft_fail = soft_fail
         self.run_url = run_url
         self.exempt_label = os.environ.get("EXEMPT_LABEL", "")
         self.exempt_actors = lib.parse_actor_list(os.environ.get("EXEMPT_ACTORS", ""))
@@ -281,24 +286,19 @@ class Validator:
 
     def finish_fail(self, category: str, detail: str) -> int:
         guidance = lib.failure_guidance(category)
-        if self.enforce:
-            verdict = f"❌ fail ({category})"
-            state = "failure"
-            short = f"No linked Linear issue ({category})"
-        else:
-            verdict = f"⚠️ warn-only (would fail: {category})"
-            state = "success"
-            short = f"warn-only: would fail ({category})"
+        outcome = lib.failure_outcome(category, self.enforce, self.soft_fail)
 
         body_lines = [
             lib.MARKER,
             "",
-            f"### Linear ticket check — {verdict}",
+            f"### Linear ticket check — {outcome.verdict}",
             "",
             guidance,
         ]
         if detail:
             body_lines += ["", detail]
+        if outcome.advisory:
+            body_lines += ["", lib.ADVISORY_NOTE]
         body_lines += [
             "",
             "---",
@@ -311,20 +311,23 @@ class Validator:
         # superseded run overwrites the newer run's comment (leaving a stale failure beside a
         # green status) even though its status write is suppressed.
         if not self._guard_supersession():
-            return 0 if not self.enforce else 1
+            return outcome.exit_code
 
         self.gh.upsert_marker_comment(self.pr_number, "\n".join(body_lines))
 
-        summary(f"## linear-ticket: {verdict}")
+        summary(f"## linear-ticket: {outcome.verdict}")
         summary("")
         summary(guidance)
         if detail:
             summary(detail)
 
-        if not self.gh.publish_status(self.validated_sha, state, short, self.run_url,
-                                      critical=True):
+        # A failed terminal status write is always exit 1, even in warn-only: the point of
+        # soft-fail is that the red status LANDS, and a silently-missing one leaves a stale
+        # prior status standing as this commit's answer.
+        if not self.gh.publish_status(self.validated_sha, outcome.state, outcome.description,
+                                      self.run_url, critical=True):
             return 1
-        return 0 if not self.enforce else 1
+        return outcome.exit_code
 
     # -- the run ---------------------------------------------------------------------------
     def run(self, event: dict) -> int:
@@ -522,9 +525,13 @@ def main() -> int:
 
     require_open = os.environ.get("REQUIRE_OPEN_ISSUE", "true") != "false"
     enforce = os.environ.get("ENFORCE", "true") != "false"
+    # Defaults TRUE, matching the workflow input: a warn-only pilot that reports green is a
+    # check nobody reads. Only an explicit "false" buys the silent variant.
+    soft_fail = os.environ.get("SOFT_FAIL", "true") != "false"
     run_url = os.environ.get("RUN_URL", "")
 
-    validator = Validator(GitHub(repo), token, team_keys, require_open, enforce, run_url)
+    validator = Validator(GitHub(repo), token, team_keys, require_open, enforce, soft_fail,
+                          run_url)
     return validator.run(event)
 
 

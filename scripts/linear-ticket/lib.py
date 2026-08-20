@@ -21,6 +21,7 @@ Standard library only (no third-party deps), matching this repo's Python convent
 from __future__ import annotations
 
 import re
+from typing import NamedTuple
 
 # The hidden marker on the single PR comment this gate maintains. validate.py finds its
 # existing comment by this exact string, so it must never change casually.
@@ -210,6 +211,87 @@ def failure_guidance(category: str) -> str:
     unknown category so a typo fails loudly rather than shipping empty copy.
     """
     return _GUIDANCE[category]
+
+
+# ── how a failure is REPORTED (loudness, not diagnosis) ─────────────────────────────────
+# select_failure_category above says WHY a check is red; the mode below says how loudly it is
+# reported. Whether a red check BLOCKS a merge is never decided here — that is branch
+# protection deciding whether the `linear-ticket` context is required:
+#
+#   enforce                    -> failure status, exit 1. The gating configuration.
+#   warn-only + soft-fail      -> failure status, exit 0. Shows on the PR exactly like enforce
+#                                 does, but blocks nothing while the context is not required.
+#                                 The loud pilot rung: a green check nobody looks at teaches a
+#                                 repo nothing, and the pilot's whole purpose is observation.
+#   warn-only, soft-fail off   -> success status, exit 0. Silent; only the job summary and the
+#                                 marker comment carry the verdict.
+#
+# The job's OWN exit code is not what a reviewer sees. This validator runs on the default
+# branch off workflow_run, so its run is not attached to the PR — the commit status is the
+# only PR-visible signal, which is why soft-fail moves the STATUS and leaves the run green.
+# A red default-branch run for a check that is deliberately not gating would read as "main is
+# broken" in the Actions tab, which is louder in the wrong place.
+
+# Appended to the marker comment whenever the check is red but non-gating, so nobody reads the
+# red X as a merge block (and nobody assumes it will stay non-blocking forever).
+ADVISORY_NOTE = (
+    "> ⚠️ **This does not block the merge.** The check is reported as failing so it is visible "
+    "in the PR's check list, but `linear-ticket` is not a required status while this repository "
+    "is in the warn-only pilot. Linking the ticket now is what keeps it from blocking you once "
+    "the pilot starts enforcing."
+)
+
+
+class FailureOutcome(NamedTuple):
+    """How one failing verdict is reported.
+
+    verdict     headline for the marker comment and job summary
+    state       commit-status state published on the PR head SHA
+    description commit-status description (validate.py truncates to GitHub's 140 chars)
+    exit_code   the validator process's exit code
+    advisory    whether to append ADVISORY_NOTE to the comment
+    """
+
+    verdict: str
+    state: str
+    description: str
+    exit_code: int
+    advisory: bool
+
+
+def failure_outcome(category: str, enforce: bool, soft_fail: bool) -> FailureOutcome:
+    """Map (category, mode) to the reported outcome. See the mode table above.
+
+    ``soft_fail`` is read only when ``enforce`` is false — enforcing already publishes the red
+    status soft-fail exists to produce, and an enforcing run must still exit nonzero. Raises
+    KeyError on an unknown category, matching failure_guidance, so a typo fails loudly instead
+    of shipping a status nobody can explain.
+    """
+    if category not in _GUIDANCE:
+        raise KeyError(category)
+    if enforce:
+        return FailureOutcome(
+            verdict=f"\u274c fail ({category})",
+            state="failure",
+            description=f"No linked Linear issue ({category})",
+            exit_code=1,
+            advisory=False,
+        )
+    if soft_fail:
+        return FailureOutcome(
+            verdict=f"\u274c fail ({category}) \u2014 advisory, not blocking",
+            state="failure",
+            description=f"Advisory (warn-only): no linked Linear issue ({category})",
+            exit_code=0,
+            advisory=True,
+        )
+    return FailureOutcome(
+        verdict=f"\u26a0\ufe0f warn-only (would fail: {category})",
+        state="success",
+        description=f"warn-only: would fail ({category})",
+        exit_code=0,
+        advisory=False,
+    )
 
 
 def build_diagnostic_query(candidates: list[str]) -> str:
