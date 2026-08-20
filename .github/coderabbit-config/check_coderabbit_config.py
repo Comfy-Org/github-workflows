@@ -366,7 +366,7 @@ def _resolved_key(key_node):
 
 
 def _index_key(value):
-    """A hashable, REFLEXIVE stand-in for a constructed key, or None if there is none.
+    """A hashable, REFLEXIVE stand-in for a constructed key, or `_UNINDEXABLE`.
 
     Two keys `safe_load` produces are not usable as dict lookups on their own.
     NaN is not equal to itself, so a `.nan:` key would miss its own entry and
@@ -393,6 +393,15 @@ def _merge_entries(value_node, seen=None):
     `str()` fallback and a lost line number again. A merge value is a mapping or
     a sequence of them; `seen` guards the self-referential alias (`a: &x [*x]`)
     that composes into a cyclic node graph.
+
+    TRANSITIVE, because `flatten_mapping` is: it flattens a merged mapping before
+    splicing it in, so `a: &a {x: 1}` / `b: &b {<<: *a}` / `reviews: {<<: *b}`
+    puts `x` under `reviews` in the loaded document. Stopping at one level would
+    index a literal `"<<"` instead and lose `x`'s line — the same defect this
+    function exists to fix, one level deeper. A merged mapping's OWN keys are
+    returned ahead of what it merged in, because `node.value = merge + node.value`
+    plus dict-assignment order is what gives them precedence, and this list is
+    consumed first-wins.
     """
     if seen is None:
         seen = set()
@@ -400,7 +409,13 @@ def _merge_entries(value_node, seen=None):
         return []
     seen.add(id(value_node))
     if isinstance(value_node, yaml.MappingNode):
-        return list(value_node.value)
+        own, inherited = [], []
+        for key_node, child in value_node.value:
+            if getattr(key_node, "tag", None) == "tag:yaml.org,2002:merge":
+                inherited.extend(_merge_entries(child, seen))
+            else:
+                own.append((key_node, child))
+        return own + inherited
     if isinstance(value_node, yaml.SequenceNode):
         out = []
         for item in value_node.value:
@@ -410,7 +425,7 @@ def _merge_entries(value_node, seen=None):
 
 
 def _resolved_key_index(parent):
-    """`{resolved key -> key node}` for one composed mapping, built once and cached.
+    """`{resolved key -> (key node, value node)}` for one mapping, built once and cached.
 
     Built once because the alternative is quadratic: `_extra_keys` can hand back
     every key in the mapping, and rescanning `parent.value` per finding —
@@ -419,7 +434,14 @@ def _resolved_key_index(parent):
     composed node, which is rebuilt per `validate` call, so it cannot go stale.
 
     Explicit keys win over merged ones, which is YAML's own merge precedence and
-    the same precedence `safe_load` applied when it built the document.
+    the same precedence `safe_load` applied when it built the document. Merge keys
+    themselves never reach the index: `_merge_entries` drops them at the single
+    point it expands them, so `merged` holds only real keys the loaded document
+    actually has.
+
+    Carries the VALUE node too, so `_descend` can route through a merge as well —
+    an ancestor that arrives via `<<:` is in the loaded document and not in the
+    composed mapping's own pairs, which is the same lost line number one level up.
     """
     index = getattr(parent, "_coderabbit_key_index", None)
     if index is not None:
@@ -432,16 +454,26 @@ def _resolved_key_index(parent):
             continue
         indexed = _index_key(_resolved_key(key_node))
         if indexed is not _UNINDEXABLE:
-            index.setdefault(indexed, key_node)
-    for key_node, _value_node in merged:
+            index.setdefault(indexed, (key_node, value_node))
+    for key_node, value_node in merged:
         indexed = _index_key(_resolved_key(key_node))
         if indexed is not _UNINDEXABLE:
-            index.setdefault(indexed, key_node)
+            index.setdefault(indexed, (key_node, value_node))
     try:
         parent._coderabbit_key_index = index
     except AttributeError:  # pragma: no cover - a node type that forbids the attribute
         pass
     return index
+
+
+def _index_entry(node, key):
+    """The `(key node, value node)` pair `key` resolves to in a composed mapping."""
+    if not isinstance(node, yaml.MappingNode):
+        return None
+    indexed = _index_key(key)
+    if indexed is _UNINDEXABLE:
+        return None
+    return _resolved_key_index(node).get(indexed)
 
 
 def _key_node(node, parent_parts, key):
@@ -455,25 +487,29 @@ def _key_node(node, parent_parts, key):
         if parent is None:
             return None
         parent = _descend(parent, part)
-    if not isinstance(parent, yaml.MappingNode):
-        return None
-    indexed = _index_key(key)
-    if indexed is _UNINDEXABLE:
-        return None
-    return _resolved_key_index(parent).get(indexed)
+    entry = _index_entry(parent, key)
+    return entry[0] if entry else None
 
 
 def _descend(node, part):
-    if isinstance(part, int):
+    """The composed value node one path step below `node`, or None.
+
+    Mapping steps go through `_resolved_key_index` rather than a raw text compare
+    on `key_node.value`, for the two reasons that index exists: a path part is a
+    key `safe_load` RESOLVED (`on:` arrives here as True, never as `"on"`), and a
+    key merged in through `<<:` lives in the loaded document but not in this
+    mapping's own pairs. Either mismatch ends the descent early, and every caller
+    reads that as "no such node" — an invented `str()` path with no line number.
+    """
+    # `not isinstance(part, bool)`: a bool IS an int in Python, and `on:` /
+    # `true:` are ordinary YAML KEYS — reading one as a list index would send the
+    # descent down the sequence branch and end it there.
+    if isinstance(part, int) and not isinstance(part, bool):
         if not isinstance(node, yaml.SequenceNode) or part >= len(node.value):
             return None
         return node.value[part]
-    if not isinstance(node, yaml.MappingNode):
-        return None
-    for key_node, value_node in node.value:
-        if getattr(key_node, "value", None) == part:
-            return value_node
-    return None
+    entry = _index_entry(node, part)
+    return entry[1] if entry else None
 
 
 def _unknown_key_finding(severity, node, parent_parts, key, schema_index):
@@ -576,18 +612,26 @@ def _walk_unknown_keys(data, schema, node, schema_index, severity, limit):
     def walk(value, subschema, path, depth):
         if len(findings) >= limit:
             return
-        # A scalar leaf or an empty container holds nothing to inspect: visiting
-        # it costs no budget and leaves nothing unchecked. Tested BEFORE the
-        # bail-out, because otherwise spending the last unit of budget on a known
-        # key whose value is a scalar (`reviews.profile: chill`) would flag the
-        # trailing visit as a partial walk — reporting a fully walked document as
-        # stopped early, which is a hard error under `strict_unknown_keys`.
-        if not isinstance(value, (dict, list)) or not value:
-            return
+        # A scalar leaf or an empty container holds nothing to inspect, so
+        # arriving at one with the budget already gone leaves nothing unchecked:
+        # spending the last unit on a known key whose value is a scalar
+        # (`reviews.profile: chill`) must not flag the trailing visit as a partial
+        # walk — reporting a fully walked document as stopped early, which is a
+        # hard error under `strict_unknown_keys`. Only the BAIL-OUT FLAG is gated
+        # on there being something to inspect; the visit itself is still CHARGED.
+        # Making leaf visits free would take the walk's call count out of
+        # `MAX_WALK_KEYS`' hands altogether — the list branch below recurses once
+        # per element with no budget check of its own, so a single aliased list of
+        # scalars would cost one unit and buy unboundedly many free calls, each
+        # allocating a fresh `path`.
+        inspectable = isinstance(value, (dict, list)) and bool(value)
         if remaining_keys[0] <= 0 or depth > MAX_WALK_DEPTH:
-            bounded[0] = True
+            if inspectable:
+                bounded[0] = True
             return
         remaining_keys[0] -= 1
+        if not inspectable:
+            return
         if isinstance(value, list):
             items = subschema.get("items")
             if isinstance(items, dict):
@@ -807,9 +851,15 @@ def validate(text, schema, strict_unknown_keys=False):
     truncated = truncated or capped
 
     if truncated:
+        # Not "the first N": `_apply_cap` drops by RANK, so what survives is no
+        # longer a prefix of the findings — for 150 unknown root keys plus one
+        # `maxLength` violation it is unknown keys 1-99 plus a violation that came
+        # after all of them. Describing the survivors as a prefix would misname
+        # what the reader is looking at.
         notes.append(
-            f"more than {MAX_FINDINGS} schema violations in this file — only the "
-            f"first {MAX_FINDINGS} are reported. Fix these and re-run."
+            f"more than {MAX_FINDINGS} schema violations in this file — {MAX_FINDINGS} "
+            f"are reported and the least consequential were dropped, so file-rejecting "
+            f"errors survive ahead of unknown keys. Fix these and re-run."
         )
 
     return findings, notes

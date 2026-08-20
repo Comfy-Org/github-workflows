@@ -599,7 +599,7 @@ class ClosedByOmissionTest(unittest.TestCase):
         nested = "reviews:\n" + "".join(f"  unknown_nested_{i}: 1\n" for i in range(60))
         findings, notes = checker.validate(root + nested, SCHEMA)
         self.assertEqual(len(findings), checker.MAX_FINDINGS)
-        self.assertTrue(any("only the first" in n for n in notes), msg=f"{notes}")
+        self.assertTrue(any("were dropped" in n for n in notes), msg=f"{notes}")
 
     def test_a_bounded_walk_says_so_rather_than_reporting_clean(self):
         # A partial scan must never read like a completed one. Forced via the
@@ -675,7 +675,7 @@ class ClosedByOmissionTest(unittest.TestCase):
         text = "".join(f"unknown_root_{i}: 1\n" for i in range(checker.MAX_FINDINGS + 50))
         findings, notes = checker.validate(text, SCHEMA)
         self.assertEqual(len(findings), checker.MAX_FINDINGS)
-        self.assertTrue(any("only the first" in n for n in notes), msg=f"{notes}")
+        self.assertTrue(any("were dropped" in n for n in notes), msg=f"{notes}")
 
     def test_main_exits_zero_by_default_and_one_under_strict(self):
         import tempfile
@@ -718,7 +718,7 @@ class CapAndBudgetTest(unittest.TestCase):
         text += "".join(f"zzz{i}: 1\n" for i in range(150))
         findings, notes = checker.validate(text, SCHEMA)
         self.assertEqual(len(findings), checker.MAX_FINDINGS)
-        self.assertTrue(any("only the first" in n for n in notes), msg=f"{notes}")
+        self.assertTrue(any("were dropped" in n for n in notes), msg=f"{notes}")
         rejecting = [f for f in findings if "characters" in f[3]]
         self.assertEqual(len(rejecting), 1, msg="the maxLength error was capped away")
         self.assertIn("error", severities(findings))
@@ -731,7 +731,7 @@ class CapAndBudgetTest(unittest.TestCase):
         self.assertLess(len(text), checker.MAX_CONFIG_BYTES)
         findings, notes = checker.validate(text, SCHEMA)
         self.assertEqual(len(findings), checker.MAX_FINDINGS)
-        self.assertTrue(any("only the first" in n for n in notes), msg=f"{notes}")
+        self.assertTrue(any("were dropped" in n for n in notes), msg=f"{notes}")
 
     def test_the_key_index_is_built_once_per_mapping(self):
         # The bound behind the test above: one construction pass per mapping, not
@@ -744,8 +744,8 @@ class CapAndBudgetTest(unittest.TestCase):
 
     def test_the_incomplete_scan_report_fits_under_the_cap(self):
         # It is a finding like any other, so a run that filled the cap and then
-        # hit a walk bound must not emit MAX_FINDINGS + 1 alongside a note saying
-        # only the first MAX_FINDINGS are reported.
+        # hit a walk bound must not emit MAX_FINDINGS + 1 alongside a note that
+        # says MAX_FINDINGS are reported.
         text = "reviews:\n" + "".join(f"  unk{i}: 1\n" for i in range(150))
         with budget(keys=3):
             findings, _ = checker.validate(text, SCHEMA)
@@ -826,10 +826,80 @@ class CapAndBudgetTest(unittest.TestCase):
         self.assertEqual(len(merged), 1, msg=f"{messages(findings)}")
         self.assertEqual(merged[0][2], 5)  # the explicit key's line, not line 2
 
+    def test_a_merge_nested_inside_an_anchor_is_expanded_too(self):
+        # PyYAML's `flatten_mapping` is TRANSITIVE — it flattens the merged
+        # mapping before splicing it in — so `profil` reaches `reviews` two merges
+        # away and is a real key of the loaded document. Expanding only one level
+        # indexed a literal `<<` instead, and the finding fell back to `str()`
+        # with no line: the defect `_merge_entries` exists to fix, one deeper.
+        text = "a: &a\n  profil: one\nb: &b\n  <<: *a\nreviews:\n  <<: *b\n"
+        findings, _ = checker.validate(text, SCHEMA)
+        merged = [f for f in findings if f[1].startswith("reviews.")]
+        self.assertEqual(len(merged), 1, msg=f"{messages(findings)}")
+        self.assertEqual(merged[0][1], "reviews.profil")
+        self.assertEqual(merged[0][2], 2)  # `profil:` in the outermost anchor
+
+    def test_a_nested_merge_does_not_index_the_merge_key_itself(self):
+        # `<<` is not a key the loaded document has, so it must never reach the
+        # index — one entry per real key, and nothing named `<<`.
+        node = yaml.compose("a: &a\n  x: 1\nb: &b\n  <<: *a\n  y: 2\n")
+        entries = checker._merge_entries(node.value[1][1])
+        self.assertEqual([k.value for k, _v in entries], ["y", "x"])
+
+    def test_a_key_under_a_merged_ANCESTOR_still_finds_its_line(self):
+        # The ancestor arrives through the merge too, so the DESCENT has to go
+        # through the index as well: `reviews.tools` is in the loaded document
+        # and nowhere in the composed `reviews` node's own pairs, so a raw
+        # text compare ended the descent at `<<` and lost the line.
+        text = (
+            "base: &b\n"
+            "  tools:\n"
+            "    htmlhint:\n"
+            "      bogus: 1\n"
+            "reviews:\n"
+            "  <<: *b\n"
+        )
+        findings, _ = checker.validate(text, SCHEMA)
+        hit = [f for f in findings if f[1].endswith("htmlhint.bogus")]
+        self.assertEqual(len(hit), 1, msg=f"{messages(findings)}")
+        self.assertEqual(hit[0][1], "reviews.tools.htmlhint.bogus")
+        self.assertEqual(hit[0][2], 4)
+
+    def test_a_descent_step_matches_the_key_safe_load_resolved(self):
+        # `_descend`'s contract, pinned at the helper: a path part is a key
+        # `safe_load` RESOLVED, so `on:` arrives as True — which a raw compare
+        # against the node's source text `"on"` never matched, and which the
+        # sequence branch would swallow as a list index (a bool IS an int).
+        text = "reviews:\n  tools:\n    on:\n      bogus: 1\n"
+        node = yaml.compose(text)
+        step = checker._descend(checker._descend(node, "reviews"), "tools")
+        self.assertIsNotNone(checker._descend(step, True))
+
     def test_a_self_referential_alias_does_not_hang_the_merge_expansion(self):
         # `&x [*x]` composes into a cyclic node graph.
         node = yaml.compose("a: &x [*x]\n")
         self.assertEqual(checker._merge_entries(node.value[0][1]), [])
+
+    def test_scalar_elements_are_charged_against_the_walk_budget(self):
+        # Exempting a leaf from the BAIL-OUT FLAG is not the same as exempting it
+        # from the BUDGET. The list branch recurses once per element with no
+        # budget check of its own, so an uncharged leaf visit would let a single
+        # aliased list of scalars cost one unit and buy unboundedly many calls —
+        # `MAX_WALK_KEYS` would then bound non-empty containers, not work done.
+        data = {"c": [1] * 50, "d": {"unk": 1}}
+        schema = {
+            "type": "object",
+            "properties": {
+                "c": {"type": "array", "items": {"type": "object", "properties": {}}},
+                "d": {"type": "object", "properties": {}},
+            },
+        }
+        with budget(keys=20):  # 6 units without the per-element charge, 56 with it
+            findings, bounded = checker._walk_unknown_keys(
+                data, schema, None, {}, "warning", 100
+            )
+        self.assertTrue(bounded, msg=f"{findings}")
+        self.assertEqual(findings, [])
 
     def test_spending_the_last_budget_on_a_scalar_is_not_a_partial_walk(self):
         # The trailing `walk(child, ...)` for a KNOWN key whose value is a scalar
@@ -924,6 +994,54 @@ class OpennessTest(unittest.TestCase):
         raw = json.dumps(SCHEMA)
         self.assertNotIn('"$ref"', raw)
         self.assertNotIn('"$dynamicRef"', raw)
+
+    def test_a_rejecting_error_cannot_be_crowded_out_before_ranking(self):
+        # `_apply_cap` ranks findings, but the `islice` over `iter_errors` runs a
+        # stage EARLIER and is unranked FIFO in schema order — a file-rejecting
+        # error arriving as error MAX_FINDINGS + 1 is deleted before ranking ever
+        # sees it, which is the same exit-0-on-a-whole-file-rejection the rank
+        # exists to prevent. It cannot happen against THIS schema, and this is the
+        # premise: only a STRIPPED-keyword error is non-rejecting, only a literal
+        # `false` produces one (a schema-VALUED `additionalProperties` descends
+        # and yields the child's keyword instead), and every object that closes
+        # itself that way is either unmultiplied or sits under an array whose
+        # `maxItems` bounds it. So the stripped errors one document can raise are
+        # bounded well under MAX_FINDINGS. A refresh that closes the item of an
+        # unbounded array — or adds `unevaluatedProperties: false` anywhere —
+        # reopens the hole, and should fail HERE rather than in a consumer's CI.
+        infinite = float("inf")
+        total = 0
+
+        def walk(node, multiplier):
+            nonlocal total
+            if isinstance(node, list):
+                for item in node:
+                    walk(item, multiplier)
+                return
+            if not isinstance(node, dict):
+                return
+            if any(node.get(k) is False for k in checker.STRIPPED_KEYWORDS):
+                total += multiplier
+            for key in ("properties", "patternProperties", "$defs", "definitions",
+                        "dependentSchemas"):
+                for sub in (node.get(key) or {}).values():
+                    walk(sub, multiplier)
+            for key in ("additionalProperties", "propertyNames", "not",
+                        "if", "then", "else", "unevaluatedProperties"):
+                walk(node.get(key), multiplier)
+            for key in ("anyOf", "oneOf", "allOf"):
+                walk(node.get(key), multiplier)
+            if "items" in node:
+                # An array raises one error per ELEMENT below it; `maxItems` is
+                # the only thing that bounds how many elements there can be.
+                bound = node.get("maxItems")
+                walk(
+                    node["items"],
+                    multiplier * (bound if isinstance(bound, int) else infinite),
+                )
+
+        walk(SCHEMA, 1)
+        self.assertLess(total, checker.MAX_FINDINGS, msg=f"{total}")
 
     def test_the_document_root_is_the_explicitly_closed_case(self):
         self.assertIs(SCHEMA.get("additionalProperties"), False)
