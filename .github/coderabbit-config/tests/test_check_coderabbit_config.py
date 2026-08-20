@@ -701,6 +701,154 @@ class ClosedByOmissionTest(unittest.TestCase):
             self.assertIn("::error ", out)
 
 
+class CapAndBudgetTest(unittest.TestCase):
+    """The cap, the walk budget, and the key lookup under adversarial input.
+
+    Every case here is a defect the review panel found in the FIRST fix for the
+    unknown-key gap, not in the code that gap was found in — so each is pinned
+    where a re-simplification would reintroduce it.
+    """
+
+    def test_a_file_rejecting_error_is_never_crowded_out_by_unknown_keys(self):
+        # The root `additionalProperties` error has an empty `absolute_path`, so
+        # it sorts FIRST, and it fans out to one finding per unknown key. A cap
+        # that just sliced the list would drop the `maxLength` violation behind
+        # 150 warnings — and exit 0 on a config CodeRabbit rejects WHOLE.
+        text = "tone_instructions: " + ("x" * 300) + "\n"
+        text += "".join(f"zzz{i}: 1\n" for i in range(150))
+        findings, notes = checker.validate(text, SCHEMA)
+        self.assertEqual(len(findings), checker.MAX_FINDINGS)
+        self.assertTrue(any("only the first" in n for n in notes), msg=f"{notes}")
+        rejecting = [f for f in findings if "characters" in f[3]]
+        self.assertEqual(len(rejecting), 1, msg="the maxLength error was capped away")
+        self.assertIn("error", severities(findings))
+
+    def test_the_unknown_key_fan_out_stops_working_at_the_cap(self):
+        # The cap bounds the OUTPUT; this bounds the WORK. `k00000: 1` is ten
+        # bytes, so ~50k unknown root keys fit inside MAX_CONFIG_BYTES, and
+        # building a finding for each one used to rescan the whole mapping.
+        text = "".join(f"k{i:05d}: 1\n" for i in range(20_000))
+        self.assertLess(len(text), checker.MAX_CONFIG_BYTES)
+        findings, notes = checker.validate(text, SCHEMA)
+        self.assertEqual(len(findings), checker.MAX_FINDINGS)
+        self.assertTrue(any("only the first" in n for n in notes), msg=f"{notes}")
+
+    def test_the_key_index_is_built_once_per_mapping(self):
+        # The bound behind the test above: one construction pass per mapping, not
+        # one per finding. Without the cache this is quadratic.
+        node = yaml.compose("reviews:\n" + "".join(f"  k{i}: 1\n" for i in range(50)))
+        reviews = node.value[0][1]
+        first = checker._resolved_key_index(reviews)
+        self.assertIs(checker._resolved_key_index(reviews), first)
+        self.assertEqual(len(first), 50)
+
+    def test_the_incomplete_scan_report_fits_under_the_cap(self):
+        # It is a finding like any other, so a run that filled the cap and then
+        # hit a walk bound must not emit MAX_FINDINGS + 1 alongside a note saying
+        # only the first MAX_FINDINGS are reported.
+        text = "reviews:\n" + "".join(f"  unk{i}: 1\n" for i in range(150))
+        with budget(keys=3):
+            findings, _ = checker.validate(text, SCHEMA)
+        self.assertLessEqual(len(findings), checker.MAX_FINDINGS)
+        self.assertTrue(any("cannot vouch" in f[3] for f in findings), msg=f"{findings}")
+
+    def test_the_incomplete_scan_report_outranks_an_unknown_key(self):
+        # Which one the cap drops matters: losing an unknown key costs one
+        # annotation, losing this one makes a partial run read as a complete one.
+        tagged = [(checker._RANK_UNKNOWN, ("warning", f"k{i}", None, "x"))
+                  for i in range(checker.MAX_FINDINGS)]
+        tagged.append((checker._RANK_INCOMPLETE, ("warning", "(document root)", None, "vouch")))
+        kept, capped = checker._apply_cap(tagged)
+        self.assertTrue(capped)
+        self.assertEqual(len(kept), checker.MAX_FINDINGS)
+        self.assertIn("vouch", [f[3] for f in kept])
+
+    def test_the_cap_keeps_survivors_in_emission_order(self):
+        tagged = [(checker._RANK_UNKNOWN, ("warning", f"k{i}", None, "x"))
+                  for i in range(checker.MAX_FINDINGS + 10)]
+        kept, capped = checker._apply_cap(tagged)
+        self.assertTrue(capped)
+        self.assertEqual([f[1] for f in kept],
+                         [f"k{i}" for i in range(checker.MAX_FINDINGS)])
+
+    def test_a_suggestion_parent_matches_across_the_two_path_vocabularies(self):
+        # `_format_path` spells an array element `[0]`; `_index_schema_paths`
+        # spells it `[]`. Unnormalized, no candidate can share the parent of a
+        # key under a list element and the parent-preference half never applies.
+        index = {"enabled": [
+            "reviews.path_instructions[].tools.golangci.enabled",
+            "chat.enabled", "code_generation.enabled", "knowledge_base.enabled",
+            "reviews.tools.a.enabled", "reviews.tools.b.enabled",
+        ]}
+        hint = checker._suggest_home(
+            "enabled", index, "reviews.path_instructions[0].tools.enabled"
+        )
+        self.assertIn("reviews.path_instructions[].tools.golangci.enabled", hint)
+
+    def test_a_suggestion_does_not_propose_the_offending_position_itself(self):
+        # Self-exclusion also has to cross the two vocabularies.
+        index = {"path": ["reviews.path_instructions[].path"]}
+        self.assertEqual(
+            checker._suggest_home("path", index, "reviews.path_instructions[0].path"), ""
+        )
+
+    def test_a_nan_key_is_still_found_in_the_composed_tree(self):
+        # NaN is not equal to itself, so a plain dict lookup misses its own entry
+        # and falls back to `str()` — the "names a key that is not in the file,
+        # with no line" defect this lookup exists to prevent.
+        findings, _ = checker.validate("reviews:\n  .nan: x\n", SCHEMA)
+        self.assertEqual(len(findings), 1, msg=f"{messages(findings)}")
+        self.assertEqual(findings[0][2], 2)
+        self.assertIn(".nan", findings[0][1])
+
+    def test_a_null_key_indexes_like_any_other(self):
+        # Regression guard on the sentinel: None is an ordinary YAML key, and
+        # must not be confused with "this key cannot be indexed".
+        findings, _ = checker.validate("reviews:\n  null: x\n", SCHEMA)
+        self.assertEqual([(f[1], f[2]) for f in findings], [("reviews.null", 2)])
+
+    def test_a_merge_key_does_not_lose_the_keys_it_brings_in(self):
+        # `safe_load` FLATTENS `<<: *anchor`, but the composed `reviews` node
+        # holds only `<<` — so a merged-in key had no node, and fell back to
+        # `str()` at `reviews.True` with no line.
+        text = "base: &b\n  true: 1\nreviews:\n  <<: *b\n"
+        findings, _ = checker.validate(text, SCHEMA)
+        merged = [f for f in findings if f[1].startswith("reviews.")]
+        self.assertEqual(len(merged), 1, msg=f"{messages(findings)}")
+        self.assertEqual(merged[0][1], "reviews.true")
+        self.assertEqual(merged[0][2], 2)
+
+    def test_an_explicit_key_wins_over_a_merged_one(self):
+        # YAML's own merge precedence, and the precedence `safe_load` applied.
+        text = "base: &b\n  profil: merged\nreviews:\n  <<: *b\n  profil: explicit\n"
+        findings, _ = checker.validate(text, SCHEMA)
+        merged = [f for f in findings if f[1] == "reviews.profil"]
+        self.assertEqual(len(merged), 1, msg=f"{messages(findings)}")
+        self.assertEqual(merged[0][2], 5)  # the explicit key's line, not line 2
+
+    def test_a_self_referential_alias_does_not_hang_the_merge_expansion(self):
+        # `&x [*x]` composes into a cyclic node graph.
+        node = yaml.compose("a: &x [*x]\n")
+        self.assertEqual(checker._merge_entries(node.value[0][1]), [])
+
+    def test_spending_the_last_budget_on_a_scalar_is_not_a_partial_walk(self):
+        # The trailing `walk(child, ...)` for a KNOWN key whose value is a scalar
+        # has nothing to inspect, so arriving there with an exhausted budget
+        # leaves nothing unchecked — and must not report a fully walked document
+        # as stopped early, which is a hard error under strict mode.
+        text = "reviews:\n  profile: chill\n"
+        with budget(keys=4):  # two node visits + two keys, nothing left over
+            findings, _ = checker.validate(text, SCHEMA)
+        self.assertEqual(findings, [], msg=f"{messages(findings)}")
+
+    def test_an_incomplete_scan_message_names_what_the_counter_counts(self):
+        # The budget is charged per node visit as well as per key, so a
+        # list-heavy document exhausts it after far fewer than MAX_WALK_KEYS keys.
+        with budget(keys=1):
+            findings, _ = checker.validate(STALE_GITHUB_CHECKS, SCHEMA)
+        self.assertIn("keys and nodes", findings[0][3])
+
+
 class OpennessTest(unittest.TestCase):
     """Facts about the VENDORED schema that decide what the walk reports.
 

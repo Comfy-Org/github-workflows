@@ -92,6 +92,19 @@ _SPELLING_SWAP = {".yaml": ".yml", ".yml": ".yaml"}
 MAX_CONFIG_BYTES = 512 * 1024
 MAX_FINDINGS = 100
 
+# What a finding costs the reader if the cap drops it, highest kept first.
+#
+# The cap cannot simply slice the list: findings come out in document order, the
+# root `additionalProperties` error has an EMPTY `absolute_path` and therefore
+# sorts first, and it fans out to one finding per unknown key. So ~150 unknown
+# root keys plus one `maxLength` violation would slice the file-rejecting error
+# away and leave 100 warnings — exit 0 on a config CodeRabbit rejects WHOLE.
+# Ranking is what keeps that from happening; the truncation note cannot, because
+# a note does not reach the exit code.
+_RANK_UNKNOWN = 0     # a stripped key: the document still loads without it
+_RANK_INCOMPLETE = 1  # "the scan did not finish" — drop it and a partial run reads as complete
+_RANK_REJECTING = 2   # CodeRabbit discards the WHOLE file over this one
+
 # Keywords whose violation CodeRabbit tolerates by STRIPPING the offending key,
 # rather than rejecting the document. Everything else is file-rejecting.
 STRIPPED_KEYWORDS = frozenset({"additionalProperties", "unevaluatedProperties"})
@@ -150,6 +163,21 @@ MAX_WALK_DEPTH = 64
 # proposing a home for when the name is specific enough that a same-named
 # property elsewhere in the schema is likely the intended one.
 _SUGGESTABLE_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{2,}$")
+
+# `_format_path` spells an array element `[0]`; `_index_schema_paths` spells the
+# same position `[]`. `_suggest_home` compares the two vocabularies, so it
+# normalizes with this first — otherwise no schema candidate can ever share the
+# parent of a key under a list element, and the parent-preference half of the
+# hint silently never applies there.
+_ARRAY_INDEX_RE = re.compile(r"\[\d+\]")
+
+# Stands in for NaN in `_index_key`, which needs a key equal to itself.
+_NAN_KEY = object()
+
+# `_index_key`'s "this key cannot be indexed at all" answer. A distinct sentinel
+# rather than None, because None is itself a perfectly ordinary YAML key (`null:`)
+# and must index like any other.
+_UNINDEXABLE = object()
 
 # How many homes may be named before the hint stops being a hint. A name with
 # more plausible homes than this has no single likely one, so listing the
@@ -241,10 +269,13 @@ def _suggest_home(key, schema_index, offending_path):
     """
     if not isinstance(key, str) or not _SUGGESTABLE_KEY_RE.match(key):
         return ""
-    candidates = [p for p in schema_index.get(key, []) if p != offending_path]
+    # Both comparisons below are against `_index_schema_paths` spellings, which
+    # write an array position `[]` where `_format_path` writes `[0]`.
+    normalized = _ARRAY_INDEX_RE.sub("[]", offending_path)
+    candidates = [p for p in schema_index.get(key, []) if p != normalized]
     if not candidates:
         return ""
-    parent = offending_path.rsplit(".", 1)[0] if "." in offending_path else ""
+    parent = normalized.rsplit(".", 1)[0] if "." in normalized else ""
     if parent:
         nearer = [c for c in candidates if c.startswith(f"{parent}.")]
         if nearer:
@@ -253,6 +284,24 @@ def _suggest_home(key, schema_index, offending_path):
         return ""
     shown = ", ".join(f"`{c}`" for c in sorted(candidates))
     return f" Did you mean {shown}?"
+
+
+def _apply_cap(tagged):
+    """Trim `[(rank, finding)]` to MAX_FINDINGS. Returns (findings, was_capped).
+
+    Drops the lowest-ranked entries first and, within a rank, the ones latest in
+    the document — so what survives is still in emission order, and a
+    file-rejecting error is never crowded out by unknown-key warnings that
+    happened to sort ahead of it.
+    """
+    if len(tagged) <= MAX_FINDINGS:
+        return [finding for _rank, finding in tagged], False
+    doomed = set(
+        sorted(range(len(tagged)), key=lambda i: (tagged[i][0], -i))[
+            : len(tagged) - MAX_FINDINGS
+        ]
+    )
+    return [f for i, (_rank, f) in enumerate(tagged) if i not in doomed], True
 
 
 def _extra_keys(error):
@@ -316,6 +365,85 @@ def _resolved_key(key_node):
         return getattr(key_node, "value", None)
 
 
+def _index_key(value):
+    """A hashable, REFLEXIVE stand-in for a constructed key, or None if there is none.
+
+    Two keys `safe_load` produces are not usable as dict lookups on their own.
+    NaN is not equal to itself, so a `.nan:` key would miss its own entry and
+    fall back to `str()` — reproducing the very "path naming a key that is not in
+    the file" defect this lookup exists to prevent. An unhashable key (a list,
+    from a complex `? [a, b]` key) cannot be indexed at all and comes back as
+    `_UNINDEXABLE` — NOT as None, which is an ordinary YAML key (`null:`).
+    """
+    if isinstance(value, float) and value != value:
+        return _NAN_KEY
+    try:
+        hash(value)
+    except TypeError:
+        return _UNINDEXABLE
+    return value
+
+
+def _merge_entries(value_node, seen=None):
+    """The (key_node, value_node) pairs a `<<:` merge brings into a mapping.
+
+    `safe_load` FLATTENS `<<: *anchor` into the mapping it sits in, but the
+    composed node keeps only the `<<` key — so without this every merged-in key
+    is a key the loaded document has and the node tree does not, which is the
+    `str()` fallback and a lost line number again. A merge value is a mapping or
+    a sequence of them; `seen` guards the self-referential alias (`a: &x [*x]`)
+    that composes into a cyclic node graph.
+    """
+    if seen is None:
+        seen = set()
+    if id(value_node) in seen:
+        return []
+    seen.add(id(value_node))
+    if isinstance(value_node, yaml.MappingNode):
+        return list(value_node.value)
+    if isinstance(value_node, yaml.SequenceNode):
+        out = []
+        for item in value_node.value:
+            out.extend(_merge_entries(item, seen))
+        return out
+    return []
+
+
+def _resolved_key_index(parent):
+    """`{resolved key -> key node}` for one composed mapping, built once and cached.
+
+    Built once because the alternative is quadratic: `_extra_keys` can hand back
+    every key in the mapping, and rescanning `parent.value` per finding —
+    constructing each candidate key on the way — is ~1e9 constructions for a 50k
+    key mapping that still fits inside `MAX_CONFIG_BYTES`. The cache lives on the
+    composed node, which is rebuilt per `validate` call, so it cannot go stale.
+
+    Explicit keys win over merged ones, which is YAML's own merge precedence and
+    the same precedence `safe_load` applied when it built the document.
+    """
+    index = getattr(parent, "_coderabbit_key_index", None)
+    if index is not None:
+        return index
+    index = {}
+    merged = []
+    for key_node, value_node in parent.value:
+        if getattr(key_node, "tag", None) == "tag:yaml.org,2002:merge":
+            merged.extend(_merge_entries(value_node))
+            continue
+        indexed = _index_key(_resolved_key(key_node))
+        if indexed is not _UNINDEXABLE:
+            index.setdefault(indexed, key_node)
+    for key_node, _value_node in merged:
+        indexed = _index_key(_resolved_key(key_node))
+        if indexed is not _UNINDEXABLE:
+            index.setdefault(indexed, key_node)
+    try:
+        parent._coderabbit_key_index = index
+    except AttributeError:  # pragma: no cover - a node type that forbids the attribute
+        pass
+    return index
+
+
 def _key_node(node, parent_parts, key):
     """The composed KEY node for `key` inside the mapping at `parent_parts`, or None.
 
@@ -329,13 +457,10 @@ def _key_node(node, parent_parts, key):
         parent = _descend(parent, part)
     if not isinstance(parent, yaml.MappingNode):
         return None
-    for key_node, _ in parent.value:
-        try:
-            if _resolved_key(key_node) == key:
-                return key_node
-        except Exception:  # pragma: no cover - an exotic key that will not compare
-            continue
-    return None
+    indexed = _index_key(key)
+    if indexed is _UNINDEXABLE:
+        return None
+    return _resolved_key_index(parent).get(indexed)
 
 
 def _descend(node, part):
@@ -450,6 +575,14 @@ def _walk_unknown_keys(data, schema, node, schema_index, severity, limit):
 
     def walk(value, subschema, path, depth):
         if len(findings) >= limit:
+            return
+        # A scalar leaf or an empty container holds nothing to inspect: visiting
+        # it costs no budget and leaves nothing unchecked. Tested BEFORE the
+        # bail-out, because otherwise spending the last unit of budget on a known
+        # key whose value is a scalar (`reviews.profile: chill`) would flag the
+        # trailing visit as a partial walk — reporting a fully walked document as
+        # stopped early, which is a hard error under `strict_unknown_keys`.
+        if not isinstance(value, (dict, list)) or not value:
             return
         if remaining_keys[0] <= 0 or depth > MAX_WALK_DEPTH:
             bounded[0] = True
@@ -576,6 +709,14 @@ def validate(text, schema, strict_unknown_keys=False):
     truncated = len(raw_errors) > MAX_FINDINGS
     del raw_errors[MAX_FINDINGS:]
 
+    # `islice` above bounds the ERROR count, not the finding count: one
+    # `additionalProperties: false` error reports a whole mapping and `_extra_keys`
+    # splits it into one finding per key, so a single error can fan out past the
+    # cap on its own. Findings are therefore collected TAGGED with what they cost
+    # the reader if dropped, and the cap is applied once, at the end, over the
+    # whole list — see `_apply_cap`.
+    tagged = []
+
     for error in sorted(raw_errors, key=_order):
         parent_parts = list(error.absolute_path)
         if error.validator in STRIPPED_KEYWORDS:
@@ -583,39 +724,45 @@ def validate(text, schema, strict_unknown_keys=False):
             if not extras:
                 # The subschema shape defeated the recomputation; report the
                 # library's own message rather than dropping the finding.
-                findings.append(
+                tagged.append(
                     (
-                        unknown_severity,
-                        _format_path(parent_parts),
-                        _line_for_path(node, parent_parts),
-                        error.message,
+                        _RANK_UNKNOWN,
+                        (
+                            unknown_severity,
+                            _format_path(parent_parts),
+                            _line_for_path(node, parent_parts),
+                            error.message,
+                        ),
                     )
                 )
                 continue
             for key in extras:
-                findings.append(
-                    _unknown_key_finding(
-                        unknown_severity, node, parent_parts, key, schema_index
+                if len(tagged) >= MAX_FINDINGS:
+                    # Stop DOING the work, not merely stop printing it. `extras`
+                    # is every extra key in the mapping, each finding costs a
+                    # key-node lookup, and `k00000: 1` is ten bytes — so a root
+                    # mapping of ~50k unknown keys fits inside MAX_CONFIG_BYTES
+                    # and would burn the job to its timeout building annotations
+                    # that the cap below then throws away.
+                    truncated = True
+                    break
+                tagged.append(
+                    (
+                        _RANK_UNKNOWN,
+                        _unknown_key_finding(
+                            unknown_severity, node, parent_parts, key, schema_index
+                        ),
                     )
                 )
             continue
 
         path_str = _format_path(parent_parts)
-        findings.append(
-            ("error", path_str, _line_for_path(node, parent_parts), _describe(error, path_str))
+        tagged.append(
+            (
+                _RANK_REJECTING,
+                ("error", path_str, _line_for_path(node, parent_parts), _describe(error, path_str)),
+            )
         )
-
-    # `islice` above bounds the ERROR count, not the finding count, and one error
-    # fans out to many findings: `additionalProperties: false` reports a whole
-    # mapping in a SINGLE error and `_extra_keys` splits it into one finding per
-    # unknown key, so 150 unknown root keys arrive here as 150 findings from one
-    # error. Re-apply the cap to the findings themselves before anything is
-    # derived from their number — unfixed, that overflow printed 150 annotations
-    # into a public run log with `truncated` still False, and drove `remaining`
-    # to 0, silently disabling the by-omission walk on top.
-    if len(findings) > MAX_FINDINGS:
-        del findings[MAX_FINDINGS:]
-        truncated = True
 
     # The other 103 objects: closed by OMISSION, so jsonschema said nothing about
     # them. Appended after the jsonschema findings rather than merged into their
@@ -623,14 +770,11 @@ def validate(text, schema, strict_unknown_keys=False):
     # whole list stable run to run. One past `remaining` so an overflow is
     # detectable; `remaining` can be 0, in which case a single walk finding is
     # enough to prove the combined total passed the cap.
-    remaining = MAX_FINDINGS - len(findings)
+    remaining = max(0, MAX_FINDINGS - len(tagged))
     walked, walk_bounded = _walk_unknown_keys(
         data, schema, node, schema_index, unknown_severity, remaining + 1
     )
-    if len(walked) > remaining:
-        del walked[remaining:]
-        truncated = True
-    findings.extend(walked)
+    tagged.extend((_RANK_UNKNOWN, f) for f in walked)
 
     if walk_bounded:
         # Say so rather than let a partial walk read as a clean one — the same
@@ -643,17 +787,24 @@ def validate(text, schema, strict_unknown_keys=False):
         # "I could not check" reading as a pass that an oversized config exits 2
         # for. Warn-only mode is unchanged: it stays a warning, exactly like the
         # unknown keys it could not go looking for.
-        findings.append(
+        tagged.append(
             (
-                unknown_severity,
-                "(document root)",
-                None,
-                f"the unknown-key scan stopped early — after {MAX_WALK_KEYS} keys "
-                f"or at depth {MAX_WALK_DEPTH} (a very large or heavily aliased "
-                f"document) — so nested keys past that point were NOT checked. "
-                f"This run cannot vouch for them.",
+                _RANK_INCOMPLETE,
+                (
+                    unknown_severity,
+                    "(document root)",
+                    None,
+                    f"the unknown-key scan stopped early — after inspecting "
+                    f"{MAX_WALK_KEYS} keys and nodes, or at depth {MAX_WALK_DEPTH} "
+                    f"(a very large or heavily aliased document) — so nested keys "
+                    f"past that point were NOT checked. This run cannot vouch for "
+                    f"them.",
+                ),
             )
         )
+
+    findings, capped = _apply_cap(tagged)
+    truncated = truncated or capped
 
     if truncated:
         notes.append(

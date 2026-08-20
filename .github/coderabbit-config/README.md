@@ -73,13 +73,16 @@ pins the two premises that rule it out today — the schema carries no `$ref`, a
 no node declaring `properties` also carries a combinator — so a schema refresh
 that breaks either fails there rather than double-annotating a real PR.
 
-**The by-omission half is only as current as the vendored schema.** It reads those
-103 objects as closed against the copy committed here, so a property upstream ADDS
-is an unknown key until `refresh-coderabbit-schema.yml` lands the bump and each
-caller's pin moves. Warn-only mode absorbs that as a warning; a caller running
+**The unknown-key check is only as current as the vendored schema.** Every object
+is judged against the copy committed here, so a property upstream ADDS is an
+unknown key until `refresh-coderabbit-schema.yml` lands the bump and each caller's
+pin moves. Warn-only mode absorbs that as a warning; a caller running
 `strict_unknown_keys: true` gets a hard failure on a key it was right to add. Same
-freshness, opposite sign, as catching a key upstream removed — see the caller doc's
-rollout section.
+freshness, opposite sign, as catching a key upstream removed. Neither half is
+exempt — a root-level addition is missing from the vendored `properties` list and
+the vendored `additionalProperties: false` rejects it just as the by-omission rule
+would; by-omission is merely the larger surface (103 objects against 5). See the
+caller doc's rollout section.
 
 A stripped key is not a cosmetic problem. The recurring instance is a `tools:`
 block written at the document root instead of under `reviews:` — the schema root
