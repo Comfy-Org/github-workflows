@@ -29,6 +29,7 @@ Severity is split, mirroring what CodeRabbit itself does with each problem:
 | No `.coderabbit.yaml` at all | **passes** | Reported in the log, so "no config here" never reads the same as "config validated clean". |
 | `.coderabbit.yml` present under the default name | **validated, with a warning** | CodeRabbit honours both spellings, so the file that exists is the config in effect. Validating it is the point; the warning tells you to set `config_file` explicitly. |
 | Config path outside the repo, not a regular file, or over 512 KiB | **errors (exit 2)** | "I could not check" must never look like a pass. Symlinks are resolved before the containment test. |
+| Unknown-key scan stopped early (a huge or heavily aliased document) | **warns; fails under `strict_unknown_keys`** | Same rule as the row above, applied to a *partial* scan: keys past the cutoff were never inspected, so a repo that asked for unknown keys to fail must not get a green check over them. |
 
 The warning class is not cosmetic. The most common instance is a `tools:` block
 written at the document root instead of under `reviews:`; the root is closed, so

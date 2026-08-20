@@ -527,10 +527,10 @@ class ClosedByOmissionTest(unittest.TestCase):
             ],
         )
 
-    def test_a_non_string_key_is_coerced_not_rendered_as_an_index(self):
-        # YAML keys need not be strings. Uncoerced, `_format_path` would render
-        # this as `reviews[1]` — a list index into an object — and `_key_line`
-        # would compare an int to the composed node's string and find no line.
+    def test_a_non_string_key_is_not_rendered_as_an_index(self):
+        # YAML keys need not be strings. Left as the loaded int, `_format_path`
+        # would render this as `reviews[1]` — a list index into an object. The
+        # sibling test below covers the keys `str()` alone still got wrong.
         findings, _ = checker.validate("reviews:\n  1: x\n", SCHEMA)
         self.assertEqual(len(findings), 1, msg=f"{messages(findings)}")
         _severity, path, line, _message = findings[0]
