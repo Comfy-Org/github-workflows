@@ -118,9 +118,18 @@ _INPUT_MENTION_RE = re.compile(r"""inputs\.%s\b""" % INPUT_NAME)
 # `_REF_USE_FLOW_RE` bounds its own value, so a SIBLING entry carrying a step
 # output cannot be misread as the ref), and a continuation line that IS the
 # expression, for the `ref: >-` / `ref: |` spellings `_REF_KEY_OPEN_RE` opens.
+#
+# The interpolation may CONTINUE past the output name, and open before it
+# (BE-8215): anchoring `}}` right after the name meant `ref: ${{
+# steps.x.outputs.ref || 'main' }}` matched nothing anywhere and recorded
+# nothing — the `||` spelling left the lint entirely, exactly the hole
+# `_leading_operand_reaches_input` closes on the input side. The `lead` group
+# carries what precedes the step output inside the interpolation so operand
+# order can be judged the same way there; both widened stretches keep the flow
+# form's `[^,}]` entry-boundary discipline.
 _STEPS_OUTPUT_BODY = (
-    r"""\$\{\{\s*steps\.(?P<id>[A-Za-z0-9_-]+)"""
-    r"""\.outputs\.(?P<out>[A-Za-z0-9_-]+)\s*\}\}"""
+    r"""\$\{\{(?P<lead>[^,}]*?)steps\.(?P<id>[A-Za-z0-9_-]+)"""
+    r"""\.outputs\.(?P<out>[A-Za-z0-9_-]+)\s*(?:\|\|[^,}]*?)?\}\}"""
 )
 _STEPS_OUTPUT_BLOCK_RE = re.compile(r"""^\s*(['"]?)ref\1\s*:.*%s""" % _STEPS_OUTPUT_BODY)
 _STEPS_OUTPUT_FLOW_RE = re.compile(r"""[{,]\s*(['"]?)ref\1\s*:[^,}]*%s""" % _STEPS_OUTPUT_BODY)
@@ -131,6 +140,12 @@ _STEPS_OUTPUT_CONT_RE = re.compile(
 # — both are valid Actions YAML — and `\S+` stops before a trailing comment on
 # its own, because YAML needs whitespace ahead of a `#` for it to open one.
 _STEP_ID_RE = re.compile(r"""^\s*(['"]?)id\1\s*:\s*(\S+)""")
+# The same key inside a flow mapping (`- {id: x, run: …}`), for the pre-scan
+# `_job_step_ids` runs (BE-8215). An id the pre-scan misses turns a compliant
+# workflow into a false FAILURE under the dangling check, so under-collection
+# is the costly direction — over-collection merely reproduces the old
+# fail-open drop for that one site.
+_STEP_ID_FLOW_RE = re.compile(r"""[{,]\s*(['"]?)id\1\s*:\s*([^,}\s]+)""")
 # How the guard RECEIVES the ref: through `env:` (never interpolated into the
 # script body) under this one name. Half the signature — `is_guard_step` below
 # checks the other half, that the step actually rejects an empty value.
@@ -530,6 +545,26 @@ def is_ref_use(line, res=None):
     return bool(block_re.match(line) or flow_re.search(line))
 
 
+def _steps_output_match(code, cont=False):
+    """The `_STEPS_OUTPUT_*` match object for `code`, or None."""
+    if cont:
+        return _STEPS_OUTPUT_CONT_RE.match(code)
+    match = _STEPS_OUTPUT_BLOCK_RE.match(code)
+    if match is None:
+        # The flow form `search`es mid-line, so its `[{,]` entry boundary can
+        # be met by a comma INSIDE a quoted sibling — planting a decoy `ref:`
+        # that resolves to a step no checkout consumes, while the real `ref:`
+        # further along the line is never examined. `_pins_to_job_workflow_sha`
+        # answers that by requiring its match to sit outside quotes; here the
+        # walk must also keep LOOKING past the decoy, because stopping at it
+        # drops the site out of coverage entirely rather than merely scoring
+        # it weaker.
+        for candidate in _STEPS_OUTPUT_FLOW_RE.finditer(code):
+            if _outside_quotes(code, candidate.start()):
+                return candidate
+    return match
+
+
 def steps_output_ref(line, cont=False):
     """(step id, output name) when `line`'s `ref:` IS a step output, else None.
 
@@ -548,25 +583,29 @@ def steps_output_ref(line, cont=False):
     # the common case before paying for the comment strip and the regexes.
     if "steps." not in line:
         return None
-    code = _strip_comment(line)
-    if cont:
-        match = _STEPS_OUTPUT_CONT_RE.match(code)
-    else:
-        match = _STEPS_OUTPUT_BLOCK_RE.match(code)
-        if match is None:
-            # The flow form `search`es mid-line, so its `[{,]` entry boundary can
-            # be met by a comma INSIDE a quoted sibling — planting a decoy `ref:`
-            # that resolves to a step no checkout consumes, while the real `ref:`
-            # further along the line is never examined. `_pins_to_job_workflow_sha`
-            # answers that by requiring its match to sit outside quotes; here the
-            # walk must also keep LOOKING past the decoy, because stopping at it
-            # drops the site out of coverage entirely rather than merely scoring
-            # it weaker.
-            for candidate in _STEPS_OUTPUT_FLOW_RE.finditer(code):
-                if _outside_quotes(code, candidate.start()):
-                    match = candidate
-                    break
+    match = _steps_output_match(_strip_comment(line), cont)
     return (match.group("id"), match.group("out")) if match else None
+
+
+def _steps_output_site(line, cont=False):
+    """(step id, output name, leading) for the walk's judgment, else None.
+
+    `leading` is True when the ref expression's first `||` operand IS the step
+    output — the step-output twin of `_leading_operand_reaches_input`. GitHub's
+    `||` returns the first truthy operand, so `ref: ${{ 'main' ||
+    steps.x.outputs.ref }}` reads the output while resolving to a mutable
+    branch on every runner; neither a hard-guard resolver nor the exact `if:`
+    can change that, so a non-leading output is unguarded unconditionally.
+    Judged from the `lead` group of the SAME match rather than from the line's
+    first interpolation, because a quoted decoy sibling can put an unrelated
+    interpolation ahead of the real one.
+    """
+    if "steps." not in line:
+        return None
+    match = _steps_output_match(_strip_comment(line), cont)
+    if match is None:
+        return None
+    return match.group("id"), match.group("out"), not match.group("lead").strip()
 
 
 def _consumes_input(text):
@@ -866,6 +905,41 @@ def _binding_step_id(lines, idx):
     return None
 
 
+def _job_step_ids(lines, start, job_indent):
+    """{step id: first line index} over the job block opened at `start`.
+
+    A pre-scan ahead of the walk (BE-8215), because the question it answers is
+    different from `resolvers`': not "which resolver covers this ref" but "does
+    the id exist AT ALL in this job, and where". Over-collection is tolerated
+    by design — an id collected from too deep a nesting (an action input named
+    `id:`, a script line that looks like one) merely reproduces the old
+    fail-open drop for that one site — while an id this scan MISSES turns a
+    compliant workflow into a false failure under the dangling check. So both
+    the block and flow spellings are read, with the same `- id:` list-marker
+    normalization `_binding_step_id` makes, and nesting depth is deliberately
+    not enforced.
+    """
+    ids = {}
+    for i, line in _block_body(lines, start, job_indent):
+        stripped = line.lstrip()
+        if stripped.startswith("- "):
+            # The list marker occupies the step's key column, so `- id: x`
+            # declares the id there exactly as a later `id:` line does.
+            line = line[: _indent(line)] + "  " + stripped[2:]
+        match = _STEP_ID_RE.match(line)
+        if match:
+            # `rstrip` before the quote strip: on the continuation line of a
+            # multi-line flow mapping (`- {uses: x,` / `id: y}`) the block
+            # pattern's `\S+` captures the closing punctuation too, and a
+            # legitimate step id can never end in `,` or `}` — leaving it on
+            # is the under-collection this scan must not commit.
+            ids.setdefault(match.group(2).rstrip(",}").strip("'\""), i)
+            continue
+        for flow in _STEP_ID_FLOW_RE.finditer(_strip_comment(line)):
+            ids.setdefault(flow.group(2).strip("'\""), i)
+    return ids
+
+
 def _consuming_step_bounds(lines, idx):
     """`_step_bounds` for a `ref:` line, tolerating the flow form.
 
@@ -952,31 +1026,54 @@ def _skips_on_empty_output(lines, idx, step_id, out):
     return False
 
 
-def _record_steps_output(found, lines, idx, resolved, resolvers):
+def _record_steps_output(found, lines, idx, resolved, resolvers, step_ids):
     """Record the `ref:` at `idx`, which reads `steps.<id>.outputs.<out>`.
 
-    Records NOTHING when `<id>` names no resolver seen earlier in this job. A
-    checkout resolved from a step that never touches `workflows_ref` — a
-    `git rev-parse`, a release lookup — is not this lint's subject, and
-    demanding an empty-ref `if:` of it would fail workflows the lint has no
-    claim on. (Fail-open only in the sense that this lint never covered such a
-    checkout in the first place; what it must not do is silently drop one that
-    IS resolved from the input, which is precisely what `resolvers` catches.)
+    Records NOTHING only when `<id>` names a real step declared AHEAD of the
+    consuming one that never touches `workflows_ref` — a `git rev-parse`, a
+    release lookup — which is not this lint's subject, and demanding an
+    empty-ref `if:` of it would fail workflows the lint has no claim on.
+
+    When `<id>` matches NO step declared before the consuming one (a typo'd
+    id, a step in another job, a resolver declared below its consumer), the
+    site is recorded as a DANGLING ref use (BE-8215): at runtime the
+    expression is `''`, `actions/checkout` reads `''` as the default branch,
+    and the checkout runs unconditionally. That used to be silently dropped —
+    fail-open on exactly the shape whose runtime behavior is the hole this
+    lint exists to close. `via_step_output` carries `'dangling'` (truthy, so
+    `unguarded_ref_checkouts` needs no change) for `check_dir`'s message.
 
     Otherwise it IS a ref use, guarded when EITHER the resolving step is itself
     a fail-closed guard (nothing empty ever leaves it), OR the consuming step
     carries the exact non-empty `if:` on that same output. The never-fail idiom
     can only take the second route: its resolver runs `continue-on-error: true`,
     which `is_guard_step` disqualifies on purpose — an `exit 1` that does not
-    fail the job leaves the checkout running anyway.
+    fail the job leaves the checkout running anyway. Neither route covers an
+    output that is not the expression's FIRST `||` operand: `${{ 'main' ||
+    steps.<id>.outputs.<out> }}` resolves to the literal on every runner, so
+    that spelling is unguarded unconditionally — while a TRAILING fallback
+    (`${{ steps.<id>.outputs.<out> || 'main' }}`) under a covering guard or
+    `if:` is unreachable dead code and passes.
 
     Recorded as a NON-fallback site: `uses_fallback` exists to compare a
     checkout's expression against the strength of the guard that covered it,
     and there is no expression to compare here — the `if:` tests the resolved
     VALUE, so guard strength is moot on this path.
     """
-    step_id, out = resolved
+    step_id, out, leading = resolved
     if step_id not in resolvers:
+        declared = step_ids.get(step_id)
+        bounds = _consuming_step_bounds(lines, idx)
+        consumer_start = bounds[0] if bounds is not None else idx
+        # A step's OWN id must not excuse a ref consuming it — during the
+        # step's `with:` evaluation its output does not exist yet — so the
+        # boundary is the consuming STEP's first line, not the `ref:` line.
+        if declared is not None and declared < consumer_start:
+            return
+        found.append((idx + 1, False, False, "dangling"))
+        return
+    if not leading:
+        found.append((idx + 1, False, False, True))
         return
     guarded = resolvers[step_id] or _skips_on_empty_output(lines, idx, step_id, out)
     found.append((idx + 1, False, guarded, True))
@@ -1009,7 +1106,11 @@ def ref_checkouts(lines):
     carry `via_step_output`, are judged by `_record_steps_output` — a
     fail-closed resolver, or the exact non-empty `if:` on the consuming step —
     and never earn the fallback-strength exemption, because the `if:` tests the
-    resolved value rather than an expression.
+    resolved value rather than an expression. `via_step_output` is three-state
+    (BE-8215): `False` (the ref names the input), `True` (a step output), or
+    `'dangling'` — a step output whose id matches no step declared before the
+    consuming one, so the expression is `''` at runtime and the checkout takes
+    the default branch unconditionally.
     """
     aliases = env_aliases(lines)
     ref_res = _ref_use_res(aliases)
@@ -1049,6 +1150,12 @@ def ref_checkouts(lines):
         # be credited; the walk order gives that ordering for free, exactly as
         # it does for the guard flags above.
         resolvers = {}
+        # EVERY step id in this job, pre-scanned (BE-8215): the walk-order
+        # `resolvers` map cannot tell "an earlier step this lint has no claim
+        # on" from "no such step at all", and the two demand opposite answers —
+        # the first is out of scope, the second is a ref that is `''` at
+        # runtime and must be reported.
+        step_ids = _job_step_ids(lines, start, job_indent)
         # An open `ref:` whose value continues below, as (line index, indent).
         # Continuation lines are the more-indented ones that follow; the first
         # line back at or above the key's indent closes the scalar.
@@ -1066,13 +1173,15 @@ def ref_checkouts(lines):
                         found.append((pending[0] + 1, fallback, guarded, False))
                         pending = None
                         continue
-                    resolved = steps_output_ref(line, cont=True)
+                    resolved = _steps_output_site(line, cont=True)
                     if resolved is not None:
                         # The `ref: >-` / `ref: |` spelling of the resolve-then-
                         # consume shape. Judged from the same place as the block
                         # form — the KEY line is the checkout, and it is the key
                         # line's own step that must carry the skip `if:`.
-                        _record_steps_output(found, lines, pending[0], resolved, resolvers)
+                        _record_steps_output(
+                            found, lines, pending[0], resolved, resolvers, step_ids
+                        )
                         pending = None
                     continue
                 # Scalar closed — fall through and judge this line normally.
@@ -1128,19 +1237,21 @@ def ref_checkouts(lines):
                 # it can never take a `ref: ${{ … }}` off the branch below.)
                 pending = (i, _indent(line))
             else:
-                resolved = steps_output_ref(line)
+                resolved = _steps_output_site(line)
                 if resolved is not None:
-                    _record_steps_output(found, lines, i, resolved, resolvers)
+                    _record_steps_output(found, lines, i, resolved, resolvers, step_ids)
     return found
 
 
 def unguarded_ref_checkouts(lines):
     """(1-based line, uses_fallback, via_step_output) for every unguarded checkout.
 
-    `via_step_output` separates the two shapes only so `check_dir` can name the
+    `via_step_output` separates the shapes only so `check_dir` can name the
     right remedy: "copy the guard step in ahead of it" is the wrong advice for a
     checkout whose ref is resolved a step earlier — there the missing piece is
-    the consuming step's own `if:`.
+    the consuming step's own `if:` — and BOTH are the wrong advice for a
+    `'dangling'` site, where no step with that id precedes the checkout at all
+    and the fix is the id itself (BE-8215).
     """
     return [
         (lineno, fb, via_step)
@@ -1253,6 +1364,24 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
             )
 
         for lineno, uses_fallback, via_step_output in unguarded_ref_checkouts(lines):
+            if via_step_output == "dangling":
+                # The `ref:` reads a step output whose id matches NO step
+                # declared before the consuming one (BE-8215). The BE-8130
+                # remedies below do not apply — adding the `if:` on a
+                # nonexistent output guards nothing that will ever run, and
+                # there is no resolving step to make fail-closed.
+                errors.append(
+                    "::error file=%s,line=%d::%s checks out at a `ref:` that "
+                    "reads `steps.<id>.outputs.<out>`, but no step `<id>` "
+                    "precedes this checkout in its job — a typo'd id, a step "
+                    "in another job, or a resolver declared below its "
+                    "consumer. At runtime that expression is '' and "
+                    "`actions/checkout` reads '' as the DEFAULT BRANCH, so "
+                    "the checkout runs unconditionally at a mutable ref. Fix "
+                    "the step id, or move the resolving step above this "
+                    "checkout. See BE-8215." % (path, lineno, name)
+                )
+                continue
             if via_step_output:
                 # The resolve-then-consume shape (BE-8130): the ref reaches the
                 # checkout through a step output, so the empty case moves to the

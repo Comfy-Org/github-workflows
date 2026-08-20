@@ -83,9 +83,8 @@ skips the resolver too. A never-fail resolver can only take the second route —
 not a guard. A `ref:` resolved from a step that never
 touches `workflows_ref` is not this lint's subject and is left alone.
 
-Two preconditions decide whether the detector SEES that site at all, and an
-unrecognized resolver is silent — it drops the consumer out of coverage rather
-than raising a different error, so copy the idiom with both intact:
+Two preconditions decide whether the detector treats the resolver as one, so
+copy the idiom with both intact:
 
 - **The binding is matched literally.** The producing step's `env:` must bind
   `WORKFLOWS_REF: ${{ inputs.workflows_ref }}` or
@@ -96,6 +95,29 @@ than raising a different error, so copy the idiom with both intact:
 - **The resolver is an EARLIER step in the SAME job.** Jobs run independently,
   and a resolver declared below its consumer cannot have run first, so neither
   is credited — the same rule the guard steps already follow.
+
+**A `ref:` naming a nonexistent or later step is an ERROR in its own right
+(BE-8215).** A step-output `ref:` whose `<id>` matches no step declared before
+the consuming one — a typo'd id, a step in another job, a resolver declared
+below its consumer — used to be silently dropped as "not this lint's subject".
+At runtime that expression is `''`, which `actions/checkout` reads as the
+default branch, so the checkout runs **unconditionally** at a mutable ref — the
+exact hole this lint exists to close, on the one spelling where it was
+fail-open. A per-job step-id pre-scan now separates the two cases: a `ref:`
+resolved from an EARLIER step that exists but never touches `workflows_ref`
+stays out of scope, while a dangling id fails with its own message (the
+BE-8130 remedies don't apply — adding the `if:` on a nonexistent output guards
+nothing that will ever run; the fix is the id itself, or the step order).
+
+**`||` fallbacks are read on this path too, with leading-operand judgment
+(BE-8215).** `ref: ${{ steps.<id>.outputs.<name> || 'main' }}` used to match
+nothing anywhere and record nothing. Now it is a site like any other, judged
+by operand order exactly as the input side is: when the FIRST `||` operand is
+the step output, the site is covered by the usual routes (a fail-closed
+resolver, or the exact `if:` — under which the fallback arm is unreachable
+dead code, so it passes); when the leading operand is anything else
+(`${{ 'main' || steps.<id>.outputs.<name> }}`), the literal wins on every
+runner and the site is unguarded unconditionally.
 
 **The lint enforces that split, rather than trusting the prose.** The fallback
 answers *mutability*; the guard answers *emptiness*; a checkout using the

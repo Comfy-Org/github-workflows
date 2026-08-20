@@ -1079,37 +1079,174 @@ class GuardCoverageTests(unittest.TestCase):
 
     def test_a_resolver_in_another_job_is_not_reachable(self):
         # Jobs run independently: `steps.resolve_ref` in job B names job B's
-        # step, not job A's. With nothing in the job binding the input, this
-        # checkout is not this lint's subject at all — not a covered site that
-        # happens to pass.
+        # step, not job A's — and job B declares no step under that id, so the
+        # output is '' at runtime and the checkout takes the default branch
+        # unconditionally. REPORTED, deliberately (BE-8215): this used to be
+        # silently dropped as "not this lint's subject", which is fail-open on
+        # exactly the runtime behavior the lint exists to close.
         sites = cwp.ref_checkouts(
             self._wrap(self.RESOLVER, self._step_output_checkout()).split("\n")
         )
-        self.assertEqual(sites, [])
+        self.assertEqual(
+            [(fb, guarded, via) for _, fb, guarded, via in sites],
+            [(False, False, "dangling")],
+        )
 
     def test_a_resolver_below_its_consumer_is_never_credited(self):
         # Declared after the checkout it would cover, so it cannot have run
-        # first. Skipped or reported, but never scored as guarding anything.
+        # first: at runtime the output is guaranteed '' and the checkout takes
+        # the DEFAULT BRANCH — the exact `if:` on it tests the same dangling
+        # output, so it cannot save the site either. Reported as the ONE
+        # unguarded dangling site (BE-8215); the per-job step-id pre-scan is
+        # what tells this apart from the legitimately out-of-scope case (an
+        # EARLIER step that exists and never touches `workflows_ref`).
         sites = cwp.ref_checkouts(
             self._wrap(self._step_output_checkout(self.EXACT_IF) + self.RESOLVER).split("\n")
         )
-        self.assertEqual([s for s in sites if s[2]], [])
-        # Pinned to the SITE LIST, not just to `guarded`: the filter above is
-        # satisfied by an empty list, so on its own it cannot tell "reported as
-        # unguarded" from "dropped and never seen". Today it is the latter —
-        # `<id>` matches no earlier step, so `_record_steps_output` returns
-        # without recording. At runtime that output is guaranteed `''` and the
-        # checkout takes the DEFAULT BRANCH, so reporting it would be the
-        # stronger answer; distinguishing it from the legitimately out-of-scope
-        # case (an earlier step that exists and never touches `workflows_ref`)
-        # needs a per-job pre-scan of step ids. Asserted as-is so the gap is
-        # visible in the suite rather than hidden behind a vacuous filter.
-        self.assertEqual(sites, [], "behaviour changed — see the note above")
+        self.assertEqual(
+            [(fb, guarded, via) for _, fb, guarded, via in sites],
+            [(False, False, "dangling")],
+        )
+
+    def test_a_typoed_step_id_is_reported_dangling(self):
+        # The resolver is present and correct — the checkout just misspells
+        # its id, so the expression is '' at runtime and checkout takes the
+        # default branch. The old early return dropped this silently.
+        steps = self.RESOLVER + self._step_output_checkout(
+            ref="${{ steps.resolve_reff.outputs.ref }}"
+        )
+        sites = cwp.ref_checkouts(self._wrap(steps).split("\n"))
+        self.assertEqual(
+            [(fb, guarded, via) for _, fb, guarded, via in sites],
+            [(False, False, "dangling")],
+        )
+        # `'dangling'` is truthy on purpose — the unguarded projection needs
+        # no change to report it.
+        self.assertEqual(len(self._jobs(steps)), 1)
+
+    def test_a_dangling_step_id_gets_its_own_error_text(self):
+        # The BE-8130 remedies (add the exact `if:`, make the resolver
+        # fail-closed) do not fix a nonexistent id — the dangling case needs
+        # its own message naming the id as the thing to fix.
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        text = _reusable(PINNED).replace(
+            "    steps:\n      - run: echo hi\n",
+            "    steps:\n"
+            + self.RESOLVER
+            + self._step_output_checkout(ref="${{ steps.resolve_reff.outputs.ref }}"),
+        )
+        with open(os.path.join(tmp, "w.yml"), "w", encoding="utf-8") as f:
+            f.write(text)
+        errors, _, _ = cwp.check_dir(tmp, exempt=frozenset())
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("BE-8215", errors[0])
+        self.assertIn("DEFAULT BRANCH", errors[0])
+        self.assertIn("Fix the step id", errors[0])
+        for be8130_remedy in ("BE-8130", "non-empty", "fail-closed", "never-fail"):
+            self.assertNotIn(be8130_remedy, errors[0])
+
+    def test_a_steps_own_id_does_not_excuse_its_own_ref(self):
+        # The checkout step's own `id:` is the referenced one — but during the
+        # step's `with:` evaluation its output does not exist yet, so the
+        # expression is '' at runtime. The pre-scan boundary is the consuming
+        # STEP's first line, not the `ref:` line, precisely so this id cannot
+        # count as "declared before".
+        steps = (
+            "      - name: Load assets\n"
+            "        id: resolve_ref\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ steps.resolve_ref.outputs.ref }}\n"
+        )
+        sites = cwp.ref_checkouts(self._wrap(steps).split("\n"))
+        self.assertEqual(
+            [(fb, guarded, via) for _, fb, guarded, via in sites],
+            [(False, False, "dangling")],
+        )
+
+    def test_a_flow_style_resolver_consumer_is_not_reported_dangling(self):
+        # `- {id: resolve_ref, …}` is the flow spelling of a step id. A
+        # flow-form guard BINDING deliberately reads as absent, so this step
+        # can never be credited as a resolver — but the id EXISTS, and the
+        # pre-scan must see it or a compliant workflow's consumer would be a
+        # false dangling FAILURE rather than the old out-of-scope drop.
+        flow_resolver = (
+            "      - {id: resolve_ref, run: echo hi}\n"
+        )
+        sites = cwp.ref_checkouts(
+            self._wrap(flow_resolver + self._step_output_checkout()).split("\n")
+        )
+        self.assertEqual(sites, [])
+
+    def test_a_trailing_or_fallback_after_a_covered_output_passes(self):
+        # `${{ steps.resolve_ref.outputs.ref || 'main' }}` under the exact
+        # `if:`: the checkout only runs when the output is non-empty, so the
+        # `|| 'main'` arm is unreachable dead code. Before BE-8215 this
+        # spelling matched nothing anywhere and recorded nothing.
+        fallback = "${{ steps.resolve_ref.outputs.ref || 'main' }}"
+        steps = self.RESOLVER + self._step_output_checkout(self.EXACT_IF, ref=fallback)
+        self.assertEqual(self._jobs(steps), [])
+        # …and it IS a covered site, not an invisible one.
+        sites = cwp.ref_checkouts(self._wrap(steps).split("\n"))
+        self.assertEqual(
+            [(fb, guarded, via) for _, fb, guarded, via in sites],
+            [(False, True, True)],
+        )
+
+    def test_a_trailing_or_fallback_without_the_if_is_reported(self):
+        # Without the `if:` the fallback IS reachable — the empty case
+        # resolves to a mutable branch instead of skipping the checkout.
+        fallback = "${{ steps.resolve_ref.outputs.ref || 'main' }}"
+        self.assertEqual(
+            len(self._jobs(self.RESOLVER + self._step_output_checkout(ref=fallback))), 1
+        )
+
+    def test_a_leading_literal_operand_is_reported_even_with_the_if(self):
+        # GitHub's `||` returns the first truthy operand, so `'main'` wins on
+        # EVERY runner — the output is never consulted and the exact `if:`
+        # guards a value the checkout does not use. Same rule as the input
+        # side's `_leading_operand_reaches_input`.
+        leading = "${{ 'main' || steps.resolve_ref.outputs.ref }}"
+        self.assertEqual(
+            len(self._jobs(self.RESOLVER + self._step_output_checkout(self.EXACT_IF, ref=leading))),
+            1,
+        )
+
+    def test_the_or_spellings_behave_the_same_in_flow_form(self):
+        flow = (
+            "      - name: Load assets\n"
+            "%s"
+            "        uses: actions/checkout@abc\n"
+            '        with: {repository: a/b, ref: "${{ %s }}"}\n'
+        )
+        trailing = "steps.resolve_ref.outputs.ref || 'main'"
+        leading = "'main' || steps.resolve_ref.outputs.ref"
+        self.assertEqual(self._jobs(self.RESOLVER + flow % (self.EXACT_IF, trailing)), [])
+        self.assertEqual(len(self._jobs(self.RESOLVER + flow % ("", trailing))), 1)
+        self.assertEqual(len(self._jobs(self.RESOLVER + flow % (self.EXACT_IF, leading))), 1)
+
+    def test_the_or_spellings_behave_the_same_in_continuation_form(self):
+        scalar = (
+            "      - name: Load assets\n"
+            "%s"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: >-\n"
+            "            ${{ %s }}\n"
+        )
+        trailing = "steps.resolve_ref.outputs.ref || 'main'"
+        leading = "'main' || steps.resolve_ref.outputs.ref"
+        self.assertEqual(self._jobs(self.RESOLVER + scalar % (self.EXACT_IF, trailing)), [])
+        self.assertEqual(len(self._jobs(self.RESOLVER + scalar % ("", trailing))), 1)
+        self.assertEqual(len(self._jobs(self.RESOLVER + scalar % (self.EXACT_IF, leading))), 1)
 
     def test_a_step_output_unrelated_to_the_input_is_not_a_ref_use(self):
         # The producing step binds no `workflows_ref`, so this checkout has
         # nothing to do with the pin contract. Demanding an empty-ref `if:` of
-        # it would fail workflows this lint has no claim on.
+        # it would fail workflows this lint has no claim on. The id EXISTS and
+        # precedes the consumer — which is what separates this from the
+        # dangling case the pre-scan now reports (BE-8215).
         sites = cwp.ref_checkouts(
             self._wrap(self.UNRELATED_RESOLVER + self._step_output_checkout()).split("\n")
         )
