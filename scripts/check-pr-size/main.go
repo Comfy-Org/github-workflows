@@ -320,11 +320,16 @@ func attrTrusted(useSource, attrModified, bypass bool) bool {
 // caller opted to exclude it.
 //
 // A RENAME is classified on BOTH its old and new path for every exclusion
-// bucket this function decides — lockfile, extra-generated glob, and test.
+// bucket this function decides — lockfile, extra-generated glob, the
+// linguist-generated attribute, and test.
 // `git diff --numstat` books a rename's deletions against the destination, so
 // classifying on the destination alone would let e.g. `git mv src/big.go
 // tests/big.go` (or `git mv src/big.go go.sum`) charge removed PRODUCTION
 // lines to an excluded bucket, silently slipping the change under the cap.
+// The attribute bucket has the same hole with an extra sting: a rename into a
+// `linguist-generated` tree hides the moved file from the --reviewed-diff-out
+// patch as well as from the count, so an edit made in the same commit reaches
+// neither the size verdict nor the review panel.
 // Requiring both paths to agree keeps every one of these failures in the safe,
 // over-counting direction.
 //
@@ -343,6 +348,13 @@ func classify(files []FileChange, base, head string, attr attrPolicy, extras Ext
 		paths := make([]string, 0, len(files))
 		for i := range files {
 			paths = append(paths, files[i].Path)
+			// A rename's source path needs its attribute resolved too, or the
+			// both-paths check below has nothing to read. check-attr resolves
+			// rules for arbitrary path strings, so batching it is safe whether
+			// or not the path still exists.
+			if files[i].OldPath != "" {
+				paths = append(paths, files[i].OldPath)
+			}
 		}
 		attrGen = attrGeneratedBatch(paths, attr.source, attr.useSource)
 	}
@@ -353,8 +365,8 @@ func classify(files []FileChange, base, head string, attr attrPolicy, extras Ext
 		f.Test = IsTestPath(f.Path) && (f.OldPath == "" || IsTestPath(f.OldPath))
 		lockfile := IsLockfile(f.Path) && (f.OldPath == "" || IsLockfile(f.OldPath))
 		extraGen := extras.Generated(f.Path) && (f.OldPath == "" || extras.Generated(f.OldPath))
-		if lockfile || extraGen ||
-			attrGen[f.Path] ||
+		attrGenOK := attrGen[f.Path] && (f.OldPath == "" || attrGen[f.OldPath])
+		if lockfile || extraGen || attrGenOK ||
 			(!f.Binary && contentGenerated(f.Path, base, head, markerFromBase)) {
 			f.Generated = true
 		}
