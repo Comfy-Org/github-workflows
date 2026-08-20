@@ -570,21 +570,36 @@ class GuardCoverageTests(unittest.TestCase):
         self.assertEqual(self._jobs(step), [])
 
     def test_a_job_workflow_sha_fallback_needs_no_guard(self):
-        # BE-4169: `inputs.workflows_ref || github.job_workflow_sha` can never
-        # resolve empty or mutable on its own, so it needs no runtime guard —
-        # see groom.yml.
+        # BE-4169: `inputs.workflows_ref || job.workflow_sha` can never resolve
+        # to a MUTABLE ref on its own, so it does not trip THIS check — see
+        # groom.yml, which additionally runs a fail-closed empty-ref guard in
+        # every such job because `job.workflow_sha` needs runner v2.334.0+.
+        checkout = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ inputs.workflows_ref || job.workflow_sha }}\n"
+        )
+        self.assertEqual(self._jobs(checkout), [])
+
+    def test_the_github_job_workflow_sha_spelling_is_no_longer_exempt(self):
+        # BE-8077: `github.job_workflow_sha` is an OIDC token claim, NOT a
+        # `github` context property, so Actions expands it to '' and checkout
+        # reads `ref: ''` as this repo's default branch. The old regex blessed
+        # exactly that. It must now be flagged like any other unguarded
+        # checkout, so the mistake cannot be reintroduced with the lint green.
         checkout = (
             "      - name: Load assets\n"
             "        uses: actions/checkout@abc\n"
             "        with:\n"
             "          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}\n"
         )
-        self.assertEqual(self._jobs(checkout), [])
+        self.assertEqual(len(self._jobs(checkout)), 1)
 
     def test_a_plain_fallback_to_a_branch_is_still_unguarded(self):
-        # Only the LITERAL `github.job_workflow_sha` fallback is exempt — a
-        # fallback to anything else (here, a floating branch) is the same
-        # `default: main` hole wearing a different hat and must still trip.
+        # Only the LITERAL `job.workflow_sha` fallback is exempt — a fallback to
+        # anything else (here, a floating branch) is the same `default: main`
+        # hole wearing a different hat and must still trip.
         checkout = (
             "      - name: Load assets\n"
             "        uses: actions/checkout@abc\n"
@@ -638,12 +653,16 @@ class GuardCoverageTests(unittest.TestCase):
             self.assertEqual(cwp.find_unguarded_ref_checkouts(lines), [], name)
         self.assertEqual(
             seen,
-            16,
+            15,
             "expected the 12 guarded sites BE-5546 fixed + pr-size.yml's (BE-5858) "
-            "+ cursor-review.yml's preflight (hard guard) and ledger (BE-4169 "
-            "job_workflow_sha self-pin) sites picked up merging main + "
-            "cursor-review.yml's diff-size job's check-pr-size-tool checkout, "
-            "also picked up merging main (BE-5546 added its guard here)",
+            "+ cursor-review.yml's preflight (hard guard) site picked up merging "
+            "main + cursor-review.yml's diff-size job's check-pr-size-tool "
+            "checkout, also picked up merging main (BE-5546 added its guard "
+            "here). cursor-review.yml's ledger checkout dropped OUT of this count "
+            "in BE-8077: it now reads `ref: ${{ steps.resolve_ref.outputs.ref }}` "
+            "— the input is resolved one step earlier, so the `ref:` line no "
+            "longer names it. groom.yml's 7 sites still do, via the "
+            "`|| job.workflow_sha` fallback the lint exempts.",
         )
 
 
@@ -675,8 +694,37 @@ class CheckDirTests(unittest.TestCase):
 
     def test_a_job_workflow_sha_default_is_tolerated(self):
         # BE-4169: `default: ''` paired with `inputs.workflows_ref ||
-        # github.job_workflow_sha` at the checkout is not the `default: main`
-        # hole — the fallback can never be empty or mutable. See groom.yml.
+        # job.workflow_sha` at the checkout is not the `default: main` hole —
+        # the fallback can never be mutable. See groom.yml.
+        text = (
+            "name: Fixture\n"
+            "on:\n"
+            "  workflow_call:\n"
+            "    inputs:\n"
+            "      workflows_ref:\n"
+            "        type: string\n"
+            "        required: false\n"
+            "        default: ''\n"
+            "jobs:\n"
+            "  check:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ inputs.workflows_ref || job.workflow_sha }}\n"
+        )
+        self._write("groom-like.yml", text)
+        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(checked, ["groom-like.yml"])
+
+    def test_the_github_job_workflow_sha_default_is_no_longer_tolerated(self):
+        # BE-8077: the same fixture spelled the OLD way is the `default: main`
+        # hole in disguise — `github.job_workflow_sha` expands to '' on every
+        # runner, so an omitted input self-pins to the default branch. Both
+        # halves must fire: the tolerated-default carve-out and the
+        # unguarded-checkout exemption.
         text = (
             "name: Fixture\n"
             "on:\n"
@@ -695,10 +743,10 @@ class CheckDirTests(unittest.TestCase):
             "        with:\n"
             "          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}\n"
         )
-        self._write("groom-like.yml", text)
+        self._write("stale-spelling.yml", text)
         errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
-        self.assertEqual(errors, [], errors)
-        self.assertEqual(checked, ["groom-like.yml"])
+        self.assertEqual(len(errors), 2, errors)
+        self.assertEqual(checked, ["stale-spelling.yml"])
 
     def test_a_default_without_the_fallback_is_still_reported(self):
         # The exemption is conditional on the fallback actually being present:

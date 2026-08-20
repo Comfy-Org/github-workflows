@@ -280,14 +280,28 @@ _FLOW_DEFAULT_RE = re.compile(r"""[{,]\s*(['"]?)default\1\s*:""")
 _COMMENT_RE = re.compile(r"(?:^|\s)#.*$")
 
 # The BE-4169 self-pinning fallback (see its use in check_dir): the LITERAL
-# expression `inputs.workflows_ref || github.job_workflow_sha`, no other
-# spelling. `github.job_workflow_sha` is the exact commit THIS reusable
-# workflow was resolved from — never empty, never mutable — so an input
-# defaulted to `''` and OR'd with it this way can't reach checkout empty or
-# on a moving ref, the same guarantee `required: true` + the runtime guard
-# buys, bought a different way.
+# expression `inputs.workflows_ref || job.workflow_sha`, no other spelling.
+# `job.workflow_sha` is the exact commit THIS reusable workflow was resolved
+# from via the caller's `uses:` pin — never mutable — so an input defaulted to
+# `''` and OR'd with it this way can't reach checkout on a moving ref, the same
+# guarantee `required: true` + the runtime guard buys, bought a different way.
+#
+# It is `job.workflow_sha` and NOT `github.job_workflow_sha` (BE-8077). The
+# latter is what this regex accepted until then, and it is a trap: it is an
+# OIDC token CLAIM, not a property of the `github` context, so Actions expands
+# it to '' and `actions/checkout` reads `ref: ''` as "the default branch" — the
+# precise hole this lint exists to close, blessed by the lint itself. The
+# populated accessor is the `job`-context one added in runner v2.334.0 (Apr
+# 2026). Anything still spelling it the old way is now FLAGGED, not exempt.
+#
+# `job.workflow_sha` is only never-empty on a current runner, so unlike the
+# BE-4169 story this expression is not self-sufficient: groom.yml pairs every
+# one of these checkouts with a fail-closed empty-ref guard step, and
+# cursor-review.yml's ledger job (which must never fail) resolves it in a step
+# that warns and skips the checkout. This exemption is about the ref not being
+# MUTABLE; those runtime guards cover the empty case.
 _JOB_WORKFLOW_SHA_FALLBACK_RE = re.compile(
-    r"""inputs\.%s\s*\|\|\s*github\.job_workflow_sha\b""" % INPUT_NAME
+    r"""inputs\.%s\s*\|\|\s*job\.workflow_sha\b""" % INPUT_NAME
 )
 
 
@@ -655,9 +669,12 @@ def find_unguarded_ref_checkouts(lines):
             if _GUARD_BINDING_RE.match(line):
                 guarded = guarded or is_guard_step(lines, i)
             elif is_ref_use(line, ref_res):
-                # BE-4169 exception: `inputs.workflows_ref || github.job_workflow_sha`
-                # can never resolve empty or mutable on its own — see check_dir's
-                # `self_pins_to_job_workflow_sha` docstring-equivalent comment.
+                # BE-4169 exception: `inputs.workflows_ref || job.workflow_sha`
+                # can never resolve to a MUTABLE ref on its own — see check_dir's
+                # `self_pins_to_job_workflow_sha` docstring-equivalent comment,
+                # and `_JOB_WORKFLOW_SHA_FALLBACK_RE` for why the old
+                # `github.job_workflow_sha` spelling is no longer accepted here
+                # (BE-8077).
                 if not guarded and not _JOB_WORKFLOW_SHA_FALLBACK_RE.search(line):
                     unguarded.append(i + 1)
             elif _REF_KEY_OPEN_RE.match(line):
@@ -715,18 +732,21 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
             # drops the default — which puts it back under the check below.
             continue
 
-        # A safe alternative to `required: true` + a runtime guard (BE-4169):
-        # default the input to '' and OR every checkout's `ref:` with
-        # `github.job_workflow_sha` — the exact commit THIS reusable workflow
-        # was itself resolved from via the caller's `uses:` pin. That value can
-        # never be empty and is never mutable, so an omitted `workflows_ref`
-        # self-pins instead of silently taking the default branch — the same
-        # guarantee `required: true` + the guard buys, bought a different way.
-        # `find_unguarded_ref_checkouts` already recognizes the checkout side
-        # of this (the LITERAL fallback `inputs.workflows_ref ||
-        # github.job_workflow_sha`); this covers the matching `default: ''`,
-        # which is otherwise indistinguishable from the `default: main` hole.
-        # See groom.yml.
+        # A safe alternative to `required: true` alone (BE-4169, corrected by
+        # BE-8077): default the input to '' and OR every checkout's `ref:` with
+        # `job.workflow_sha` — the exact commit THIS reusable workflow was itself
+        # resolved from via the caller's `uses:` pin. That value is never
+        # mutable, so an omitted `workflows_ref` self-pins instead of silently
+        # taking the default branch, which is what makes the `default: ''`
+        # tolerable here. `find_unguarded_ref_checkouts` already recognizes the
+        # checkout side of this (the LITERAL fallback `inputs.workflows_ref ||
+        # job.workflow_sha`); this covers the matching `default: ''`, which is
+        # otherwise indistinguishable from the `default: main` hole. See
+        # groom.yml — which ALSO runs a fail-closed empty-ref guard in every one
+        # of those jobs, because `job.workflow_sha` needs runner v2.334.0+ and
+        # expands to '' on anything older. The old `github.job_workflow_sha`
+        # spelling is deliberately NOT accepted: it is an OIDC claim and expands
+        # to '' on EVERY runner, so a file "self-pinning" with it pins nothing.
         self_pins_to_job_workflow_sha = any(
             _JOB_WORKFLOW_SHA_FALLBACK_RE.search(line) for line in lines
         )

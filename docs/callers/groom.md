@@ -58,7 +58,11 @@ jobs:
       actions: read   # the interval gate reads run history for the last real run
     uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@<full-commit-sha>
     with:
-      workflows_ref: <same-full-commit-sha>   # must equal the uses: SHA — see its row
+      # Optional since BE-8077 — omit it and the briefs + ledger auto-load from
+      # the commit the uses: pin above resolved to. Kept explicit here because
+      # `bump-callers.sh` moves this line and the uses: pin in ONE pass, so a
+      # roster-enrolled caller costs nothing to double-pin. See its row.
+      workflows_ref: <same-full-commit-sha>   # keep byte-identical to the uses: SHA
       bot_app_id: ${{ vars.APP_ID }}
       # Cadence knob + the matching volume-gate window (BE-4004). Wire both to
       # one repo Actions variable so they can't drift: retune weekly ->
@@ -96,8 +100,9 @@ rejects the run with "requesting 'actions: read', but is only allowed
 ## Inputs
 
 All are optional to GitHub's startup validator, and unlike the other workflows
-here `workflows_ref` is optional to groom's own guards too — but set it anyway,
-and set it to your `uses:` SHA. See its row for why. The ones that matter:
+here `workflows_ref` is optional to groom's own guards too — leaving it unset is
+safe, and it is the documented default. See its row for what it falls back to.
+The ones that matter:
 
 | Input | Default | Why you'd change it |
 |---|---|---|
@@ -109,7 +114,7 @@ and set it to your `uses:` SHA. See its row for why. The ones that matter:
 | `model` | `claude-opus-5` | The finder/verifier model. |
 | `themes` | `duplication, inconsistent patterns, missing abstractions, complexity hotspots, dead code` | Steer the finder at particular kinds of cleanup. The default mirrors the finder brief's own five dimensions, so it is a no-op; **narrow** it (e.g. `duplication, dead code`) to focus a repo. Security/auth-adjacent findings are filed regardless of theme. |
 | `scope_label` / `scope_desc` | `whole-repo` | Cosmetic labels for the scope in issue bodies. |
-| `workflows_ref` | `''` | **Set it to your `uses:` SHA.** Alone among these workflows groom does not *require* it — it defaults to `''` and each asset checkout falls back to `${{ github.job_workflow_sha }}`. That fallback does not resolve (see the gotcha below), so an omitted input loads the briefs, `ledger.py` and `interval.py` from this repo's **default branch** into jobs holding your `ANTHROPIC_API_KEY` and App token. Pin it until groom's checkouts move to `job.workflow_sha`. |
+| `workflows_ref` | `''` | **Leaving it unset is safe.** Alone among these workflows groom does not *require* it — it defaults to `''` and each asset checkout falls back to `${{ job.workflow_sha }}`, the commit your `uses:` pin resolved to, so the briefs, `ledger.py` and `interval.py` always match the logic running them with nothing to keep in sync. Set it only to test briefs from a branch. Before BE-8077 that fallback was spelled `github.job_workflow_sha` and silently loaded the assets from this repo's default branch — see the footgun below. |
 | `bot_app_id` | `''` | File as your App rather than `github-actions[bot]`. |
 | `builder` | `false` | Opt into PR-writing — see below. |
 | `max_prs` | `'5'` | Only with `builder: true`. Typed **string**, deliberately. |
@@ -156,19 +161,23 @@ declares `concurrency: groom-${{ github.repository }}` with
 Duplicating that group **deadlocks the run**: your caller holds the group while
 its `uses:` job waits for the same group, and neither yields until timeout.
 
-**Set `workflows_ref`, even though groom does not make you.** The finder and
-verifier briefs, `ledger.py` and `interval.py` are checked out at run time from
-`${{ inputs.workflows_ref || github.job_workflow_sha }}`. The intent (BE-4169)
-was that omitting the input falls back to the commit your `uses:` pin resolved
-to, leaving nothing to keep in sync. It does not: `job_workflow_sha` is **not**
-a property of the `github` context — GitHub documents that value as
-`job.workflow_sha`, which is why `groom.yml` uses that spelling where it reads
-the agent CLI pin, and calls `github.job_workflow_sha` a trap in the same
-comment. Actions expands an unknown context property to `''`, and
-`actions/checkout` with an empty `ref` takes the **default branch**, so an
-omitted input runs mutable assets in the jobs holding your `ANTHROPIC_API_KEY`
-and App token. Until those checkouts move to `job.workflow_sha` behind an
-empty-ref guard, the explicit pin is what keeps groom pinned.
+**`workflows_ref` may be left unset — but check which SHA you pinned from.**
+The finder and verifier briefs, `ledger.py` and `interval.py` are checked out at
+run time from `${{ inputs.workflows_ref || job.workflow_sha }}`: omitting the
+input falls back to the commit your `uses:` pin resolved to, leaving nothing to
+keep in sync (BE-4169's intent, delivered in BE-8077). Two things to know. First,
+if you pin `uses:` at a `github-workflows` commit **older than BE-8077**, that
+fallback is still spelled `github.job_workflow_sha` there — which is **not** a
+property of the `github` context (GitHub documents that value as
+`job.workflow_sha`, the spelling `groom.yml` has always used where it reads the
+agent CLI pin, calling the `github.` form a trap in the same comment). Actions
+expands an unknown context property to `''`, and `actions/checkout` with an empty
+`ref` takes the **default branch** — so on those older pins an omitted input runs
+mutable assets in the jobs holding your `ANTHROPIC_API_KEY` and App token, and
+the explicit pin is what keeps groom pinned. Bump past BE-8077 (or set
+`workflows_ref`) to close it. Second, `job.workflow_sha` needs an Actions runner
+≥ v2.334.0; every groom job now fails closed with an `::error::` if it resolves
+empty, so the failure is loud rather than a silent default-branch checkout.
 
 **Bumping is not usually manual.** `bump-callers.sh` rewrites a caller's
 `workflows_ref:` in the same pass as its `uses:` pin, so a caller enrolled in the

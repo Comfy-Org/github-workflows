@@ -9,8 +9,8 @@ repo's own workflow files.
   `workflows_ref` input, or (2) checks out at `ref: ${{ inputs.workflows_ref }}`
   in a job that does not run the empty-ref guard first — recognizing the
   canonical `-z` guard and the length/charset shape `pr-risk.yml` uses, and
-  exempting the `github.job_workflow_sha` self-pin `groom.yml` uses instead of
-  a guard (see below). Text-level parsing (this repo is stdlib-only — no
+  exempting the `job.workflow_sha` self-pin `groom.yml` pairs with its guards
+  (see below). Text-level parsing (this repo is stdlib-only — no
   PyYAML), the same constraint `bump-callers.sh` works under.
 - **`tests/`** — `unittest` suite, run by
   [`test-workflow-pins.yml`](../workflows/test-workflow-pins.yml) along with a
@@ -43,15 +43,27 @@ check alone already rejects an empty ref (length 0), and `||` only ever widens
 what a condition rejects, so one qualifying branch is enough regardless of
 what it is OR'd with.
 
-`groom.yml` is the one workflow that skips the guard entirely (BE-4169): its
-`workflows_ref` defaults to `''`, and every checkout falls back to
-`${{ inputs.workflows_ref || github.job_workflow_sha }}` — the exact commit
-THIS reusable workflow was itself resolved from via the caller's `uses:` pin.
-That value can never be empty or mutable, so an omitted input self-pins
-instead of reaching a floating branch — the same guarantee the guard buys,
-bought without needing one. The lint recognizes this LITERAL fallback
-expression only; anything else OR'd in (a branch, a tag, another input) is the
-same hole wearing a different hat and stays covered by both checks.
+`groom.yml` is the one workflow whose `workflows_ref` is not required (BE-4169):
+it defaults to `''`, and every checkout falls back to
+`${{ inputs.workflows_ref || job.workflow_sha }}` — the exact commit THIS
+reusable workflow was itself resolved from via the caller's `uses:` pin. That
+value is never mutable, so an omitted input self-pins instead of reaching a
+floating branch, which is what the lint's exemption is about. The lint
+recognizes this LITERAL fallback expression only; anything else OR'd in (a
+branch, a tag, another input) is the same hole wearing a different hat and stays
+covered by both checks.
+
+**The old `github.job_workflow_sha` spelling is now FLAGGED, not exempt
+(BE-8077).** That is an OIDC token claim, not a property of the `github`
+context, so Actions expanded it to `''` and `actions/checkout` read `ref: ''` as
+this repo's default branch — the exact hole this lint exists to close, blessed
+by the lint itself. `job.workflow_sha` is the `job`-context accessor added in
+runner v2.334.0 (April 2026), and because it *is* empty on an older runner,
+`groom.yml` no longer skips the guard: each of those seven jobs runs a
+fail-closed `Require a resolvable workflows_ref` step ahead of its checkout, and
+`cursor-review.yml`'s never-fail ledger job resolves the ref in a step that
+warns and skips the checkout instead. (`actionlint` ≤ 1.7.12 false-positives on
+`job.workflow_sha`; no CI here runs it.)
 
 The guard is copied inline into each consuming job rather than factored into a
 composite action **on purpose**: a composite would have to be loaded with
