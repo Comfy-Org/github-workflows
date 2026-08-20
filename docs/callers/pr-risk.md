@@ -6,9 +6,10 @@ Read [the shared caller contract](README.md) first.
 
 Grades every PR into a tier `R0` (safest) .. `R3` (riskiest) and syncs **one**
 label (`risk:R0`..`risk:R3`, or `risk:ungraded` when an input was unreadable).
-The label is the entire product: nothing is gated, routed, commented, or
-merged — a human looks at the label and agrees or disagrees (recorded with a
-`risk-dispute` label this workflow never touches).
+Nothing is gated, routed, or merged. A human can record a different assessment
+beside the computed label with `risk-dispute:R0` through `risk-dispute:R3`.
+The legacy plain `risk-dispute` marker remains valid with no human tier; neither
+form changes the computed `risk:R*`.
 
 Deterministic, no LLM: `grade = worst(path_floor, provenance, reversibility)` —
 a path-glob map, what process produced the diff (registered runbooks, forks
@@ -37,10 +38,12 @@ on:
   # a fork run under plain `pull_request` cannot write the label. See the
   # fork gotcha below before you swap it.
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+  issue_comment:
+    types: [created]
 
 concurrency:
-  group: pr-risk-${{ github.event.pull_request.number }}
+  group: pr-risk-${{ github.event.pull_request.number || github.event.issue.number }}
   cancel-in-progress: true
 
 permissions:
@@ -48,6 +51,14 @@ permissions:
 
 jobs:
   pr-risk:
+    if: >-
+      github.event_name != 'issue_comment' &&
+      (github.event_name != 'pull_request' ||
+       (((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+         github.event.label.name == 'risk-dispute' ||
+         startsWith(github.event.label.name, 'risk-dispute:')) &&
+        github.actor != 'dependabot[bot]' &&
+        github.event.pull_request.head.repo.full_name == github.repository))
     permissions:
       contents: read
       issues: write          # create the risk:* labels repo-side on first use
@@ -61,6 +72,26 @@ jobs:
     uses: Comfy-Org/github-workflows/.github/workflows/pr-risk.yml@<full-commit-sha>
     with:
       workflows_ref: <same-full-commit-sha>
+      enabled: true
+
+  risk-dispute-comment:
+    if: >-
+      github.event.issue.pull_request &&
+      (github.event.comment.body == '/risk-dispute' ||
+       startsWith(github.event.comment.body, '/risk-dispute '))
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      checks: write
+      actions: read
+      statuses: read
+    uses: Comfy-Org/github-workflows/.github/workflows/pr-risk.yml@<full-commit-sha>
+    with:
+      workflows_ref: <same-full-commit-sha>
+      enabled: true
+      pr_number: ${{ github.event.issue.number }}
+      wait_for_checks_minutes: 1
 ```
 
 Enrolling is **two steps** — merging the caller above is only the first. Ask a
@@ -118,9 +149,38 @@ fail the caller's next run at startup.
 | `fleet_logins` | `mattmillerai` | Logins whose PRs grade provenance `agent-supervised` alongside `agent-coded`. Both are read for **human** authors only: an author GitHub types as a `Bot` is a runbook candidate regardless, so listing a bot here (or labelling its PR) buys it nothing — only a registry entry that asserts can promote it. |
 | `bot_logins` | `github-actions,dependabot,renovate,coderabbitai,cursor,comfy-pr-bot,web-flow` | Extra logins treated as bots. Needed only for **machine USER accounts** — a real GitHub App is recognized from GitHub's own actor type, no list entry required. A bot with no runbook entry still grades as human — identity alone buys no trust. **This list is load-bearing, not a hint:** a listed login skips the first-time-contributor test, so it moves a non-fork `NONE`/`FIRST_TIME_CONTRIBUTOR` PR from `external` (R3) to `human` (R1). Nothing validates that a listed login is really a machine account, so add one only for an account you control, and remove it when it is retired. |
 | `label_map` | `''` | Rename the five grader-owned labels as `tier=label` pairs. Tier keys are fixed; only the label text is yours. |
+| `allowed_dispute_associations` | `OWNER,MEMBER,COLLABORATOR` | Comment authors allowed to use `/risk-dispute`. Comma-separated with no spaces. Direct label changes already require repository label permission. |
 | `wait_for_checks_minutes` | `10` | How long to wait for the rest of the check rollup to settle before labeling (clamped to 25 — what a 30-minute job can spend waiting). `0` labels immediately, expect R2 floors from still-pending checks. |
 | `repo_map_path` | `.github/risk.json` | Consumer risk-map override, read from the PR **base ref**. |
 | `repo_runbooks_path` | `.github/risk-runbooks.json` | Consumer runbook-registry override, read from the PR **base ref**. |
+
+## Risk disputes
+
+A human assessment sits beside the computed grade; it never replaces it:
+
+```text
+risk:R1
+risk-dispute:R2
+```
+
+Apply `risk-dispute:R0` through `risk-dispute:R3` directly, or comment:
+
+```text
+/risk-dispute R2 Optional reason
+```
+
+The legacy forms remain supported as a disagreement with no human-assessed tier:
+
+```text
+risk-dispute
+/risk-dispute Optional reason
+```
+
+The reason may be empty or continue on later lines. A tiered dispute replaces
+the legacy label and any previous tier. `/risk-dispute clear` clears both forms;
+removing a label clears that form, and a new push expires both. Each change posts
+a bot-authored audit record with the computed tier, nullable human tier, head
+SHA, source, actor and optional reason.
 
 ## Gotchas
 

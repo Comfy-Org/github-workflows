@@ -16,13 +16,13 @@
 # up front if any tier maps to an empty name, so the array can never degrade to the empty-labels
 # request that strips a PR. Labels it does NOT own are carried through the PUT as the snapshot read
 # saw them (see RESIDUAL), so a human who disagrees with a grade records that with their
-# OWN label (the pilot convention is `risk-dispute`) and the grader will never fight it. Editing the
-# grader-owned label by hand is futile by design: the next push re-syncs it.
+# OWN label (`risk-dispute` or `risk-dispute:R0` .. `risk-dispute:R3`) and the grader will never
+# fight it. Editing the grader-owned label by hand is futile by design: the next push re-syncs it.
 #
 # RESIDUAL — the price of atomicity, worth knowing for the pilot: the PUT is built from a SNAPSHOT
 # read, so it is an unguarded read-modify-write (the labels endpoint offers no version precondition
 # that could make it otherwise), and it clobbers BOTH directions inside that window. A NON-owned
-# label ADDED there is silently dropped — `risk-dispute` INCLUDED — and a non-owned label REMOVED
+# label ADDED there is silently dropped — `risk-dispute` forms INCLUDED — and a non-owned label REMOVED
 # there is RESURRECTED, so a `do-not-merge` or review label a human or a sibling labeler cleared in
 # that instant comes back. The window opens ONLY on a run that actually changes the grade (an
 # in-sync PR writes nothing at all) and is normally ~one API round-trip; on the FIRST grade in a

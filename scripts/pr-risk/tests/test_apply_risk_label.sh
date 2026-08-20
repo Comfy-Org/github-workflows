@@ -136,11 +136,11 @@ if grep -q -- '-X POST repos/test/repo/issues/7/labels' "$GH_LOG"; then
 else ok "and never an additive POST (that is the interleaving)"; fi
 
 echo "— unowned labels are preserved verbatim, disputes included —"
-: > "$GH_LOG"; printf 'risk:R1\nrisk-dispute\nbug\n' > "$CURRENT_LABELS"
+: > "$GH_LOG"; printf 'risk:R1\nrisk-dispute\nrisk-dispute:R2\nbug\n' > "$CURRENT_LABELS"
 PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 TIER=R3 bash "$SCRIPT" >/dev/null 2>&1
 put3="$(grep -- '-X PUT repos/test/repo/issues/7/labels ' "$GH_LOG")"
 eq "the PUT carries exactly the unowned labels plus the new target" \
-   "api -X PUT repos/test/repo/issues/7/labels -f labels[]=risk-dispute -f labels[]=bug -f labels[]=risk:R3" \
+   "api -X PUT repos/test/repo/issues/7/labels -f labels[]=risk-dispute -f labels[]=risk-dispute:R2 -f labels[]=bug -f labels[]=risk:R3" \
    "$put3"
 
 echo "— first use: the label is pre-created before the sync —"
@@ -233,7 +233,7 @@ echo "— a broken jq must fail the run, never degrade the PUT to target-only �
 # The carry-through filter used to run inside a process substitution, where its exit status is
 # structurally unobservable: `pipefail` does not reach `< <(...)` and `set -e` is off. A jq that
 # failed there appended nothing, so this destructive full-set replace silently became
-# `labels[]=$TARGET` alone — DELETING every unowned label on the PR (`risk-dispute` included)
+# `labels[]=$TARGET` alone — DELETING every unowned label on the PR (`risk-dispute` forms included)
 # while logging "synced" and exiting 0. A total replace must refuse to run on an unverified set.
 mkdir -p "$SANDBOX/binjqfail"
 cp "$SANDBOX/bin/gh" "$SANDBOX/binjqfail/gh"
@@ -244,7 +244,7 @@ for a in "$@"; do [ "$a" = --argjson ] && { echo 'jq: error: synthetic failure' 
 exec "$REAL_JQ" "$@"
 STUB
 chmod +x "$SANDBOX/binjqfail/jq"
-: > "$GH_LOG"; printf 'risk:R0\nrisk-dispute\nkeep-me\n' > "$CURRENT_LABELS"
+: > "$GH_LOG"; printf 'risk:R0\nrisk-dispute\nrisk-dispute:R3\nkeep-me\n' > "$CURRENT_LABELS"
 REAL_JQ="$(command -v jq)" PATH="$SANDBOX/binjqfail:$PATH" \
   REPO=test/repo PR_NUMBER=7 TIER=R2 bash "$SCRIPT" >/dev/null 2>&1
 eq "a failing carry-through filter exits 4" 4 "$?"

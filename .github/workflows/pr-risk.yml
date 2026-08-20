@@ -3,9 +3,10 @@ name: PR Risk Grade (reusable)
 # Reusable ADVISORY PR risk grader — the shadow-check rung of the PR risk-grading ladder.
 # Grades every PR event into a tier R0 (safest) .. R3 (riskiest) and syncs ONE label
 # (`risk:R0` .. `risk:R3`, or `risk:ungraded` when an input was unreadable). That label is
-# the entire product: nothing is gated, nothing is blocked, nothing merges, no comment is
-# posted. Humans look at the label and agree or disagree; disagreement is recorded by adding
-# the `risk-dispute` label (which this workflow never touches) plus a comment saying why.
+# the entire product: nothing is gated, nothing is blocked and nothing merges. Humans record a
+# different assessment with `risk-dispute:R0` .. `risk-dispute:R3`, either as a label or with
+# `/risk-dispute R2 [optional reason]`. The legacy `risk-dispute` label and `/risk-dispute
+# [optional reason]` remain tier-unspecified disputes. Neither changes the computed `risk:R*`.
 #
 # grade = worst(path_floor, provenance, reversibility) — three deterministic axes; the worst
 # tier wins, so no axis can move a PR into a safer lane than another axis put it. No LLM, no
@@ -67,8 +68,8 @@ name: PR Risk Grade (reusable)
 #
 # ON-DEMAND GRADING (`pr_number` / `pr_numbers`): supply a PR number and that PR is graded with
 # no `pull_request` event involved — which is how a repo enrolling mid-stream grades the open
-# queue it already has, and how a PR is re-graded after a `.github/risk.json` change or a
-# `risk-dispute`. Absent, the workflow reads the event exactly as before. Three things differ on
+# queue it already has, and how a PR is re-graded after a `.github/risk.json` change. Absent, the
+# workflow reads the event exactly as before. Three things differ on
 # the by-number path, all of them deliberate:
 #   * BOT-AUTHORED PRs ARE GRADED. The `github.actor != 'dependabot[bot]'` clause callers put in
 #     their `if:` is a TOKEN guard, not a policy one: a bot-triggered `pull_request` run gets a
@@ -110,7 +111,7 @@ name: PR Risk Grade (reusable)
 # labels on a PR under one `label_map`; remapping `label_map` orphans the old names, which is a
 # one-time repo-side cleanup. What the shape does cost is a narrower residual: the PUT is built from
 # a snapshot read, so a NON-owned label added by someone else in the read→PUT window is dropped
-# (`risk-dispute` included) and one removed in it is resurrected. That window opens only on a run
+# (`risk-dispute` forms included) and one removed in it is resurrected. That window opens only on a run
 # that actually changes the grade and is roughly one API round-trip — about three on the first
 # grade in a repo, where the label pre-create sits inside it. The drop is recorded on the PR
 # timeline as an `unlabeled` event, so re-add a dispute that happens to land in that instant.
@@ -120,8 +121,8 @@ name: PR Risk Grade (reusable)
 # quiet.
 #
 # SECRETS: none. This workflow declares no `secrets:` inputs and callers pass none — the only
-# credential in the job is the automatic `GITHUB_TOKEN` (`github.token`), used for the PR read
-# and the one label write. There is no `secrets: inherit` to add and nothing to rotate.
+# credential in the job is the automatic `GITHUB_TOKEN` (`github.token`), used for PR reads,
+# labels and dispute audit comments. There is no `secrets: inherit` to add and nothing to rotate.
 #
 # The label is applied with the plain GITHUB_TOKEN on purpose: GITHUB_TOKEN-applied labels
 # cannot fire `labeled` triggers, so the shadow check is structurally unable to start a
@@ -140,7 +141,9 @@ name: PR Risk Grade (reusable)
 #   name: CI - PR Risk Grade
 #   on:
 #     pull_request:
-#       types: [opened, synchronize, reopened, ready_for_review]
+#       types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+#     issue_comment:
+#       types: [created]
 #     workflow_dispatch:
 #       inputs:
 #         pr_number:
@@ -158,7 +161,7 @@ name: PR Risk Grade (reusable)
 #     # A `pr_numbers` LIST keys its own group, which serializes identical batches but cannot
 #     # serialize a batch against a `pull_request` run for one of its members — see "A BATCH
 #     # CANNOT SERIALIZE PER-PR" above for what that costs and how to avoid it.
-#     group: ${{ github.workflow }}-${{ inputs.pr_numbers || inputs.pr_number || github.event.pull_request.number }}
+#     group: ${{ github.workflow }}-${{ inputs.pr_numbers || inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}
 #     cancel-in-progress: true
 #   permissions:
 #     contents: read
@@ -175,8 +178,12 @@ name: PR Risk Grade (reusable)
 #       # on a dispatch the token is writable and the actor is a human, so there is nothing left
 #       # for either clause to protect.
 #       if: >-
-#         github.event_name != 'pull_request' ||
-#         (github.actor != 'dependabot[bot]' &&
+#         github.event_name != 'issue_comment' &&
+#         (github.event_name != 'pull_request' ||
+#          ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+#           github.event.label.name == 'risk-dispute' ||
+#           startsWith(github.event.label.name, 'risk-dispute:')) &&
+#          github.actor != 'dependabot[bot]' &&
 #          github.event.pull_request.head.repo.full_name == github.repository)
 #       permissions:
 #         contents: read
@@ -215,6 +222,24 @@ name: PR Risk Grade (reusable)
 #         # For a backfill, dispatch with this lowered — see ON-DEMAND GRADING above for why a
 #         # low wait is sound on the by-number path and why `0` still is not the right value.
 #         # wait_for_checks_minutes: 1
+#     risk-dispute-comment:
+#       if: >-
+#         github.event.issue.pull_request &&
+#         (github.event.comment.body == '/risk-dispute' ||
+#          startsWith(github.event.comment.body, '/risk-dispute '))
+#       permissions:
+#         contents: read
+#         issues: write
+#         pull-requests: write
+#         checks: write
+#         actions: read
+#         statuses: read
+#       uses: Comfy-Org/github-workflows/.github/workflows/pr-risk.yml@<sha>  # v1
+#       with:
+#         workflows_ref: <same sha>
+#         enabled: true
+#         pr_number: ${{ github.event.issue.number }}
+#         wait_for_checks_minutes: 1
 #
 # A SKIPPED CALLER JOB IS INVISIBLE FROM HERE. This workflow cannot detect, warn about or recover
 # from a caller whose `if:` excluded it — no run is created, so nothing of ours executes. The
@@ -248,8 +273,8 @@ on:
           `pull_request` run: with no number supplied the target, the base ref and every emitted
           label are exactly what they were before this input existed. Supplying it is what makes
           grading possible without a `pull_request` event — the enrollment backfill of an
-          already-open queue, and the manual re-grade after a risk-map change or a
-          `risk-dispute`. Bot-authored and fork PRs ARE graded on this path (see the header).
+          already-open queue, and the manual re-grade after a risk-map change.
+          Bot-authored and fork PRs ARE graded on this path (see the header).
           Typed `string` rather than `number` because `workflow_dispatch` inputs arrive as
           strings, and because an empty string is what lets the fall-through to the event's own
           number stay a single expression.
@@ -298,6 +323,14 @@ on:
         type: string
         required: false
         default: ''
+      allowed_dispute_associations:
+        description: >-
+          Comma-separated author associations allowed to use `/risk-dispute`.
+          Label-based disputes already require label permission; this gate applies
+          to the comment command. Use commas with no spaces.
+        type: string
+        required: false
+        default: 'OWNER,MEMBER,COLLABORATOR'
       wait_for_checks_minutes:
         description: >-
           How long to wait, PER TARGET, for the REST of the check rollup to settle before
@@ -342,10 +375,9 @@ on:
 
           Ticking the checkbox applies `risk-grade-disputed` on the next grade, and a re-grade
           preserves the tick rather than resetting it. That label is DISTINCT from the
-          human-owned `risk-dispute` convention, which the grader still never touches: one is a
-          machine-maintained mirror of a checkbox, rewritten on every grade; the other is a
-          human's own label. Needs no permission beyond the `pull-requests: write` the grade job
-          already holds for the label.
+          human-owned `risk-dispute` and `risk-dispute:R*` labels: one mirrors a checkbox, while
+          the others record a disagreement with an optional human tier. Needs no permission beyond
+          the `pull-requests: write` the grade job already holds for the label.
         type: boolean
         required: false
         default: false
@@ -736,8 +768,14 @@ jobs:
     # lockout. If a repo ever needs the harder guarantee, remove the caller — nothing here can
     # bind a maintainer who can edit the workflow file anyway.
     if: >-
-      needs.gate.outputs.enabled == 'true' ||
-      github.event_name == 'workflow_dispatch'
+      (needs.gate.outputs.enabled == 'true' ||
+       github.event_name == 'workflow_dispatch') &&
+      (github.event_name != 'issue_comment' ||
+       (github.event.issue.pull_request &&
+        (github.event.comment.body == '/risk-dispute' ||
+         startsWith(github.event.comment.body, '/risk-dispute ')) &&
+        contains(format(',{0},', inputs.allowed_dispute_associations),
+                 format(',{0},', github.event.comment.author_association))))
     name: Grade PR risk
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -966,6 +1004,34 @@ jobs:
           set -uo pipefail
           bash _pr_risk_tool/scripts/pr-risk/grade-targets.sh
 
+      - name: Record risk dispute
+        if: >-
+          always() && !cancelled() &&
+          (github.event_name == 'issue_comment' ||
+           (github.event_name == 'pull_request' &&
+            (github.event.action == 'opened' ||
+             github.event.action == 'reopened' ||
+             github.event.action == 'ready_for_review' ||
+             github.event.action == 'labeled' ||
+             github.event.action == 'unlabeled' ||
+             github.event.action == 'synchronize')))
+        env:
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}
+          RECORD: record-${{ inputs.pr_number || github.event.pull_request.number || github.event.issue.number }}.json
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          EVENT_LABEL: ${{ github.event.label.name }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          COMMENT_URL: ${{ github.event.comment.html_url }}
+          ACTOR: ${{ github.event.sender.login || github.actor }}
+          ACTOR_ASSOCIATION: ${{ github.event.comment.author_association }}
+          ALLOWED_ASSOCIATIONS: ${{ inputs.allowed_dispute_associations }}
+          RUN_ID: ${{ github.run_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: bash _pr_risk_tool/scripts/pr-risk/handle-risk-dispute.sh
+
       - name: Step summary
         if: always()
         env:
@@ -1068,7 +1134,7 @@ jobs:
               jq -r '"| #\(.pr) | \(.tier // "—") | \(.label // "—") | `\(.base_ref // "—")` | \(.waited)s | \(.note // "") |"' "$RESULTS"
             fi
             echo
-            echo "This label routes nothing and gates nothing. Disagree with the grade? Add the \`risk-dispute\` label and say why in a comment — the grader never touches that label."
+            echo "This label routes nothing and gates nothing. Record a human assessment with \`risk-dispute:R0\`…\`R3\` or \`/risk-dispute R0\`…\`R3 [optional reason]\`. Legacy \`risk-dispute\` remains a tier-unspecified disagreement; neither form changes \`risk:R*\`."
           } >> "$GITHUB_STEP_SUMMARY"
 
   # THE ONE JOB THAT HOLDS `checks: write`, and it reads NOTHING from a pull request. Its whole
