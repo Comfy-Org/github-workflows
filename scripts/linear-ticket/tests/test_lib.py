@@ -174,6 +174,150 @@ class FailureGuidance(unittest.TestCase):
             lib.failure_guidance("bogus")
 
 
+ALL_CATEGORIES = ("no_candidate", "exists_not_linked", "policy_mismatch", "infra_error")
+
+
+class FailureOutcomeModes(unittest.TestCase):
+    """The reporting-mode table in lib.py. The invariant under all of it: soft-fail changes
+    only how LOUD a red verdict is, never the diagnosis and never the exit code contract."""
+
+    def test_every_category_has_copy_for_every_surface(self):
+        # ALL_CATEGORIES must be exhaustive, or the loops below silently stop covering a
+        # category; and _STATUS_HEADLINE must cover exactly what _GUIDANCE does, or
+        # failure_outcome raises KeyError on a category that passed its own guard.
+        self.assertEqual(set(ALL_CATEGORIES), set(lib._GUIDANCE))
+        self.assertEqual(set(lib._STATUS_HEADLINE), set(lib._GUIDANCE))
+
+    def test_enforce_is_red_and_exits_nonzero(self):
+        outcome = lib.failure_outcome("no_candidate", enforce=True, soft_fail=False)
+        self.assertEqual(outcome.state, "failure")
+        self.assertEqual(outcome.exit_code, 1)
+        self.assertFalse(outcome.advisory)
+
+    def test_enforce_ignores_soft_fail(self):
+        # soft-fail is a warn-only knob; enforcing already publishes the red status it exists
+        # to produce, and must still exit nonzero.
+        self.assertEqual(lib.failure_outcome("no_candidate", enforce=True, soft_fail=True),
+                         lib.failure_outcome("no_candidate", enforce=True, soft_fail=False))
+
+    def test_soft_fail_is_red_but_exits_zero(self):
+        outcome = lib.failure_outcome("exists_not_linked", enforce=False, soft_fail=True)
+        self.assertEqual(outcome.state, "failure")   # loud: the PR check list shows a red X
+        self.assertEqual(outcome.exit_code, 0)       # but the run itself stays green
+        self.assertTrue(outcome.advisory)            # and the comment says it does not block
+
+    def test_silent_warn_only_is_green(self):
+        outcome = lib.failure_outcome("exists_not_linked", enforce=False, soft_fail=False)
+        self.assertEqual(outcome.state, "success")
+        self.assertEqual(outcome.exit_code, 0)
+        self.assertFalse(outcome.advisory)
+
+    def test_only_enforce_ever_exits_nonzero(self):
+        # Scope: the VERDICT's exit code. The job can still exit nonzero in warn-only for
+        # reasons that are not a verdict — a failed terminal status write (finish_fail), or a
+        # broken run (missing GH_REPO/LINEAR_API_TOKEN, malformed team-keys, a non-
+        # pull_request event). The docs say "a failing verdict", not "the job", for that
+        # reason.
+        for category in ALL_CATEGORIES:
+            for soft_fail in (True, False):
+                self.assertEqual(
+                    lib.failure_outcome(category, enforce=False, soft_fail=soft_fail).exit_code,
+                    0, f"warn-only must not exit nonzero ({category}, soft_fail={soft_fail})")
+
+    def test_advisory_only_when_red_and_non_gating(self):
+        # The "does not block" note must never ride along with an enforcing (gating) verdict —
+        # that would tell an author to ignore a check that is actually blocking them.
+        for category in ALL_CATEGORIES:
+            for enforce in (True, False):
+                for soft_fail in (True, False):
+                    outcome = lib.failure_outcome(category, enforce, soft_fail)
+                    self.assertEqual(outcome.advisory,
+                                     not enforce and soft_fail and outcome.state == "failure")
+
+    def test_category_is_named_in_every_verdict_and_description(self):
+        for category in ALL_CATEGORIES:
+            for enforce in (True, False):
+                for soft_fail in (True, False):
+                    outcome = lib.failure_outcome(category, enforce, soft_fail)
+                    self.assertIn(category, outcome.verdict)
+                    self.assertIn(category, outcome.description)
+
+    def test_description_fits_the_github_status_limit(self):
+        # publish_status truncates at 140; a description that only ever survives truncation
+        # would silently lose the category, so keep every mode's copy inside the limit.
+        for category in ALL_CATEGORIES:
+            for enforce in (True, False):
+                for soft_fail in (True, False):
+                    outcome = lib.failure_outcome(category, enforce, soft_fail)
+                    self.assertLessEqual(len(outcome.description), 140)
+
+    def test_unknown_category_raises(self):
+        with self.assertRaises(KeyError):
+            lib.failure_outcome("bogus", enforce=False, soft_fail=True)
+
+    def test_description_names_the_diagnosis_this_run_actually_reached(self):
+        # infra_error means Linear could not be queried, so the run determined NOTHING about
+        # the ticket; a status reading "no linked Linear issue" would be a diagnosis it never
+        # made. Soft-fail promotes this copy to the loudest PR-visible surface.
+        for enforce in (True, False):
+            for soft_fail in (True, False):
+                infra = lib.failure_outcome("infra_error", enforce, soft_fail)
+                self.assertNotIn("linked Linear issue", infra.description)
+        self.assertIn("linked Linear issue",
+                      lib.failure_outcome("no_candidate", True, False).description)
+
+
+class AdvisoryNote(unittest.TestCase):
+    """The note appended to a warn-only red verdict."""
+
+    def test_never_asserts_flatly_that_nothing_is_blocked(self):
+        # The validator never reads the caller's ruleset, so it cannot know whether the
+        # `linear-ticket` context is required. In the documented footgun configuration
+        # (warn-only + context already required) the red check IS blocking the author, and a
+        # flat "this does not block the merge" would send them to debug the wrong thing.
+        for category in ALL_CATEGORIES:
+            note = lib.advisory_note(category)
+            self.assertNotIn("This does not block", note)
+            self.assertIn("warn-only", note)
+            # It must still name what actually blocks, and the misconfiguration to report.
+            self.assertIn("ruleset", note)
+            self.assertIn("misconfiguration", note)
+
+    def test_infra_error_does_not_tell_the_author_to_link_a_ticket(self):
+        # A missing/invalid LINEAR_API_TOKEN is not the PR author's to fix.
+        note = lib.advisory_note("infra_error")
+        self.assertNotIn("Linking the ticket", note)
+        self.assertIn("could not reach Linear", note)
+
+    def test_ticket_categories_do_tell_the_author_to_link(self):
+        for category in ("no_candidate", "exists_not_linked", "policy_mismatch"):
+            self.assertIn("Linking the ticket", lib.advisory_note(category))
+
+    def test_unknown_category_raises(self):
+        with self.assertRaises(KeyError):
+            lib.advisory_note("bogus")
+
+
+class SoftFailEnv(unittest.TestCase):
+    """Parsing of the SOFT_FAIL env var — the pin-skew guard."""
+
+    def test_absent_is_the_silent_variant(self):
+        # linear-ticket.yml ALWAYS passes SOFT_FAIL, so absent means the workflow YAML predates
+        # the input: `workflows_ref` skewed ahead of the caller's `uses:` pin. A caller that
+        # cannot express the input must not be silently upgraded from green to red statuses.
+        self.assertFalse(lib.soft_fail_enabled(None))
+        self.assertFalse(lib.soft_fail_enabled(""))
+
+    def test_explicit_true_opts_in(self):
+        self.assertTrue(lib.soft_fail_enabled("true"))
+        self.assertTrue(lib.soft_fail_enabled("TRUE"))
+        self.assertTrue(lib.soft_fail_enabled(" true "))
+
+    def test_explicit_false_and_anything_unrecognised_stay_silent(self):
+        for raw in ("false", "False", "0", "yes", "no", "1", "maybe"):
+            self.assertFalse(lib.soft_fail_enabled(raw), raw)
+
+
 class DiagnosticQuery(unittest.TestCase):
     def test_empty_raises(self):
         with self.assertRaises(ValueError):
