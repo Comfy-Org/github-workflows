@@ -580,6 +580,44 @@ def _indent(line):
     return len(line) - len(line.lstrip(" "))
 
 
+def _marker_width(line):
+    """Columns the leading `- ` list marker and its separation spaces occupy.
+
+    0 when `line` is not a list item. YAML allows ANY run of separation spaces
+    after the `-`, so this is measured rather than assumed to be 2: a step
+    written `-  id: resolve` (siblings aligned at dash+3) is as valid as
+    `- id: resolve`, and reading it as a fixed two-column marker leaves the key
+    one column deeper than the step's real key column.
+    """
+    stripped = line.lstrip(" ")
+    if not stripped.startswith("- "):
+        # Includes the bare `-` that puts every key on the lines BELOW it:
+        # no key sits on that line, so there is no column to recover from it.
+        return 0
+    return len(stripped) - len(stripped[1:].lstrip(" "))
+
+
+def _opens_list_item(line):
+    """True when `line` opens a YAML sequence entry — `- key: v` or a bare `-`."""
+    stripped = line.lstrip(" ")
+    return stripped == "-" or stripped.startswith("- ")
+
+
+def _unmarked(line, key_indent):
+    """`line` rewritten so a key written after its `- ` marker reads at `key_indent`.
+
+    A step's first key may be written on the marker line itself (`- id: resolve`,
+    `- continue-on-error: true`), where it declares that key at the step's key
+    column exactly as a later line of its own does — but `_indent` reads the
+    marker's physical column, so every `_indent(line) != key_indent` scan skips
+    it. Rewriting normalizes it back into view. Lines that are not list items
+    pass through untouched.
+    """
+    if not _marker_width(line):
+        return line
+    return " " * key_indent + line.lstrip(" ")[1:].lstrip(" ")
+
+
 def _key_re(indent, key):
     """`key:` at exactly `indent`, bare or quoted (both are valid Actions YAML)."""
     return re.compile(r"""^ {%d}(['"]?)%s\1\s*:""" % (indent, re.escape(key)))
@@ -704,33 +742,57 @@ def _step_bounds(lines, idx):
     """
     ind = _indent(lines[idx])
     key_indent = None  # the step's own key column, i.e. where `env:`/`run:` sit
+    parent = None     # the line that opened the block the binding sits in
     for j in range(idx - 1, -1, -1):
         if _is_skippable(lines[j]):
             continue
         if _indent(lines[j]) < ind:
+            parent = j
             key_indent = _indent(lines[j])
             break
     if key_indent is None:
         return None
 
+    marker = _marker_width(lines[parent])
+    if marker:
+        # The block holding the binding hangs off the step's FIRST key and that
+        # key is written on the marker line (`- env:` with `id:`/`run:` below).
+        # The marker's physical column is NOT the step's key column — the key
+        # sits after the marker — so read the column from where the key
+        # actually starts, and take this line as the step's start. Reading the
+        # physical column instead left the scan below looking for a `- ` line
+        # shallower than the marker, finding none, and answering None:
+        # `is_guard_step` then failed closed (harmless), but `_binding_step_id`
+        # never registered the resolver and a `ref: ${{ steps.<id>.outputs.ref }}`
+        # reading it passed the lint unreported.
+        key_indent += marker
+        return parent, _step_end(lines, parent, key_indent), key_indent
+
     start = None  # the step's `- …` list-item line
     for j in range(idx, -1, -1):
         if _is_skippable(lines[j]) or _indent(lines[j]) >= key_indent:
             continue
-        if lines[j].lstrip().startswith("- "):
+        if _opens_list_item(lines[j]):
+            # A bare `-` opens the step just as `- name: …` does, with every
+            # key on the lines below it. Requiring `- ` here read it as "not a
+            # step" and answered None, which registers no resolver — so the
+            # consumer of its output passed the lint unreported.
             start = j
         break  # first shallower line decides it: a step, or not one at all
     if start is None:
         return None
 
-    end = len(lines)
+    return start, _step_end(lines, start, key_indent), key_indent
+
+
+def _step_end(lines, start, key_indent):
+    """First line past the step opened at `start`: the next line above `key_indent`."""
     for j in range(start + 1, len(lines)):
         if _is_skippable(lines[j]):
             continue
         if _indent(lines[j]) < key_indent:
-            end = j
-            break
-    return start, end, key_indent
+            return j
+    return len(lines)
 
 
 def is_guard_step(lines, idx):
@@ -754,13 +816,13 @@ def is_guard_step(lines, idx):
     # evaluable here, so both disqualify the step rather than being assumed
     # benign.
     for i, line in enumerate(body):
-        if i == 0 and line.lstrip().startswith("- "):
+        if i == 0:
             # The list marker occupies the step's key column, so
             # `- continue-on-error: true` (or `- if: …`) declares that key
             # there exactly as a later line does — the same rewrite
             # `_binding_step_id` makes to read an `id:` off it. Without it
             # a never-fail step written marker-first scores as a hard guard.
-            line = " " * key_indent + line.lstrip()[2:]
+            line = _unmarked(line, key_indent)
         if _indent(line) != key_indent:
             continue
         if _STEP_IF_RE.match(line):
@@ -848,10 +910,10 @@ def _binding_step_id(lines, idx):
         line = lines[j]
         if _is_skippable(line):
             continue
-        if j == start and line.lstrip().startswith("- "):
+        if j == start:
             # The list marker occupies the step's key column, so `- id: resolve`
             # declares the id there exactly as a later `id:` line does.
-            line = " " * key_indent + line.lstrip()[2:]
+            line = _unmarked(line, key_indent)
         if _indent(line) != key_indent:
             continue
         match = _STEP_ID_RE.match(line)
@@ -903,7 +965,17 @@ def _skips_on_empty_output(lines, idx, step_id, out):
     wanted = "steps.%s.outputs.%s != ''" % (step_id, out)
     for j in range(start, end):
         line = lines[j]
-        if _is_skippable(line) or _indent(line) != key_indent:
+        if _is_skippable(line):
+            continue
+        if j == start:
+            # `- if: steps.x.outputs.ref != ''` as the consuming step's first
+            # key is the remedy, written marker-first. Normalized into the key
+            # column like `is_guard_step` and `_binding_step_id` do, so the one
+            # accepted remedy is not refused for its spelling — with the
+            # resolver exemption gone (BE-8221) this `if:` is the ONLY coverage
+            # route, so missing it reports a checkout that is in fact guarded.
+            line = _unmarked(line, key_indent)
+        if _indent(line) != key_indent:
             continue
         if not _STEP_IF_RE.match(line):
             continue

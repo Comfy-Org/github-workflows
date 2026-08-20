@@ -964,7 +964,10 @@ class GuardCoverageTests(unittest.TestCase):
         '          echo "ref=$REF" >> "$GITHUB_OUTPUT"\n'
     )
     # The same resolver WITHOUT `continue-on-error:`, rejecting the empty value
-    # itself. It is a real guard, so its consumers need no `if:` at all.
+    # itself. It IS a real guard — and since BE-8221 that buys its consumers
+    # nothing: the guard proves the step rejects an empty INPUT, not that the
+    # value it writes to $GITHUB_OUTPUT is non-empty. Consumers still need
+    # their own exact `if:`.
     HARD_RESOLVER = RESOLVER.replace("        continue-on-error: true\n", "").replace(
         '            echo "::warning::could not resolve a usable ref"\n',
         "            exit 1\n",
@@ -1073,6 +1076,114 @@ class GuardCoverageTests(unittest.TestCase):
         lines = self._wrap(marker_resolver + self._step_output_checkout()).split("\n")
         binding = next(i for i, l in enumerate(lines) if "WORKFLOWS_REF:" in l)
         self.assertFalse(cwp.is_guard_step(lines, binding))
+
+    # The same marker-first spelling at YAML's OTHER legal separation width.
+    # A `- ` marker may be followed by any run of spaces, and the step's keys
+    # then align at dash+3 rather than dash+2. Reading the marker as exactly
+    # two columns leaves the rewritten key one column deep, where the
+    # `_indent(line) != key_indent` scan skips it again — the same hole, open
+    # to anyone who types one extra space.
+    WIDE_MARKER_RESOLVER = (
+        "      -  continue-on-error: true\n"
+        "         name: Resolve the asset ref\n"
+        "         id: resolve_ref\n"
+        "         env:\n"
+        "           WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}\n"
+        "         run: |\n"
+        '           REF="$WORKFLOWS_REF"\n'
+        '           if [ -z "$REF" ]; then\n'
+        "             exit 1\n"
+        "           fi\n"
+        '           echo "ref=$REF" >> "$GITHUB_OUTPUT"\n'
+    )
+
+    def test_a_wide_marker_continue_on_error_step_is_not_a_guard_step(self):
+        lines = self._wrap(self.WIDE_MARKER_RESOLVER + self._step_output_checkout()).split("\n")
+        binding = next(i for i, l in enumerate(lines) if "WORKFLOWS_REF:" in l)
+        self.assertFalse(cwp.is_guard_step(lines, binding))
+
+    def test_a_wide_marker_step_still_registers_its_id(self):
+        # The marker rewrite feeds `_binding_step_id` too: at dash+3 the id
+        # must still be read at the step's real key column, or the step is not
+        # registered as a resolver and its consumer drops out of coverage
+        # entirely — a silent pass, not a loud one.
+        wide = self.WIDE_MARKER_RESOLVER.replace(
+            "      -  continue-on-error: true\n         name: Resolve the asset ref\n",
+            "      -  id: resolve_ref\n         name: Resolve the asset ref\n",
+        ).replace("         id: resolve_ref\n", "", 1)
+        self.assertNotIn("continue-on-error", wide)
+        lines = self._wrap(wide + self._step_output_checkout()).split("\n")
+        binding = next(i for i, l in enumerate(lines) if "WORKFLOWS_REF:" in l)
+        self.assertEqual(cwp._binding_step_id(lines, binding), "resolve_ref")
+        self.assertEqual(len(cwp.find_unguarded_ref_checkouts(lines)), 1)
+
+    # The remedy itself, written marker-first. With the resolver exemption gone
+    # this `if:` is the ONLY route to coverage, so failing to see it reports a
+    # checkout that is in fact guarded — and tells the author to add the very
+    # line they already have.
+    MARKER_IF_CHECKOUT = (
+        "      - if: steps.resolve_ref.outputs.ref != ''\n"
+        "        name: Load assets\n"
+        "        uses: actions/checkout@abc\n"
+        "        with:\n"
+        "          ref: ${{ steps.resolve_ref.outputs.ref }}\n"
+    )
+
+    def test_a_marker_line_if_covers_a_step_output_checkout(self):
+        self.assertEqual(self._jobs(self.RESOLVER + self.MARKER_IF_CHECKOUT), [])
+
+    def test_a_marker_line_if_is_still_matched_exactly(self):
+        # Normalizing the marker line must not relax WHAT is matched there: an
+        # OR-widened condition stays refused in the marker-first spelling too.
+        widened = self.MARKER_IF_CHECKOUT.replace(
+            "!= ''\n", "!= '' || always()\n"
+        )
+        self.assertEqual(len(self._jobs(self.RESOLVER + widened)), 1)
+
+    # A resolver whose FIRST key is the binding block itself. `_step_bounds`
+    # used to read the step's key column off the marker's physical indent,
+    # find no `- ` line shallower than it, and answer None — so the id was
+    # never registered and the consumer's `ref: ${{ steps.<id>.outputs.ref }}`
+    # passed the lint unreported. Fails OPEN, unlike the guard path.
+    MARKER_ENV_RESOLVER = (
+        "      - env:\n"
+        "          WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}\n"
+        "        id: resolve_ref\n"
+        "        continue-on-error: true\n"
+        "        run: |\n"
+        '          REF="$WORKFLOWS_REF"\n'
+        '          echo "ref=$REF" >> "$GITHUB_OUTPUT"\n'
+    )
+
+    # The third marker spelling: a bare `-` with every key on the lines below
+    # it. No key sits on the marker, so nothing needs normalizing — but the
+    # step-start scan has to recognize it as opening a step at all.
+    BARE_MARKER_RESOLVER = "      -\n" + RESOLVER.replace("      - name:", "        name:", 1)
+
+    def test_a_bare_marker_resolver_is_registered(self):
+        self.assertIn("      -\n        name:", self.BARE_MARKER_RESOLVER)
+        lines = self._wrap(self.BARE_MARKER_RESOLVER + self._step_output_checkout()).split("\n")
+        binding = next(i for i, l in enumerate(lines) if "WORKFLOWS_REF:" in l)
+        self.assertEqual(cwp._binding_step_id(lines, binding), "resolve_ref")
+        self.assertEqual(len(cwp.find_unguarded_ref_checkouts(lines)), 1)
+
+    def test_a_bare_marker_consumer_is_covered_by_its_if(self):
+        consumer = "      -\n" + self._step_output_checkout(self.EXACT_IF).replace(
+            "      - name:", "        name:", 1
+        )
+        self.assertEqual(self._jobs(self.RESOLVER + consumer), [])
+
+    def test_a_marker_line_env_resolver_is_registered(self):
+        lines = self._wrap(self.MARKER_ENV_RESOLVER + self._step_output_checkout()).split("\n")
+        binding = next(i for i, l in enumerate(lines) if "WORKFLOWS_REF:" in l)
+        self.assertEqual(cwp._binding_step_id(lines, binding), "resolve_ref")
+        self.assertEqual(len(cwp.find_unguarded_ref_checkouts(lines)), 1)
+
+    def test_a_marker_line_env_resolver_with_the_exact_if_passes(self):
+        self.assertEqual(
+            self._jobs(self.MARKER_ENV_RESOLVER + self._step_output_checkout(self.EXACT_IF)),
+            [],
+        )
 
     def test_a_hard_guard_resolver_with_the_exact_if_passes(self):
         # The sound composition still works: the consumer's own `if:` covers
@@ -1282,9 +1393,10 @@ class GuardCoverageTests(unittest.TestCase):
         self.assertIn("*[!A-Za-z0-9._/@+-]*) REF='' ;;", resolver)
         self.assertIn("export LC_ALL=C", resolver)
         # …and it must stay NEVER-FAIL, which the lint also cannot assert.
-        # The lint takes a fail-closed resolver as an ALTERNATIVE to the
-        # consumer's `if:`, so deleting `continue-on-error: true` here and
-        # exiting non-zero on an unresolvable ref would keep the lint green
+        # Nothing in the lint has an opinion on `continue-on-error:` here —
+        # since BE-8221 the consumer's own `if:` is the only coverage route, so
+        # it stays green either way. Deleting `continue-on-error: true` and
+        # exiting non-zero on an unresolvable ref would therefore pass silently
         # while making this job able to FAIL — and a failing ledger job takes
         # the whole review matrix down with it, which is the one thing the job
         # is built never to do.
