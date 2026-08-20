@@ -31,17 +31,28 @@ on the PR head SHA; you require **that context** once warn-only observation is d
 
 > [!IMPORTANT]
 > **The context was renamed from `linear-ticket` to `Linear ticket`.** GitHub renders it verbatim
-> as the check's name, so it is prose now rather than a slug. Two consequences when you bump past
-> that pin:
+> as the check's name, so it is prose now rather than a slug. Three consequences when you bump
+> past that pin:
 >
 > - **If your ruleset already requires `linear-ticket`, update it in the same change.** The old
 >   context is never reported again, so a required check nobody publishes leaves every PR
 >   pending — which blocks merges exactly as a failure would. (No caller required it at the time
 >   of the rename, which is why it was done then.)
-> - **Open PRs keep the old status too.** Commit statuses are per-context and append-only, so a PR
->   whose head was already validated shows a stale red `linear-ticket` beside the new
->   `Linear ticket` until it gets a new commit. Nothing consumes the stale one; it ages out with
->   the head SHA.
+> - **Already-open PRs do not gain the new status on their own.** The signal workflow fires on
+>   `pull_request`, so moving the pin publishes nothing for a PR that is already open: until it
+>   takes a new commit, or someone re-runs its validate workflow, it carries the old context
+>   *alone* — there is no new `Linear ticket` beside it. Require the new context before those PRs
+>   are re-validated and every one of them sits pending, so backfill deliberately (push or
+>   re-run) rather than waiting for head SHAs to turn over.
+> - **The stale `linear-ticket` status survives, and it is not inert.** Commit statuses are
+>   per-context and last-write-wins, so whatever value the old context last held stays on that
+>   head SHA — and it is frequently `success`, not the red you might picture (any pass, any
+>   exemption, and *every* outcome under `soft-fail: false`). That matters twice over: while
+>   `linear-ticket` is still required, a stale `success` keeps satisfying the requirement even if
+>   the verdict has since changed underneath it (issue canceled, attachment removed, exempt label
+>   pulled, `team-keys` tightened); and either value still counts toward that commit's combined
+>   status and `statusCheckRollup`, which tooling reads — this repo's own `grade-pr-risk.sh`
+>   does. Drop `linear-ticket` from the ruleset in the same change rather than letting it age out.
 
 ## Prerequisites
 
@@ -145,15 +156,20 @@ job-level detail.
 
 `soft-fail` is new, and it defaults to `true`. **If your caller already runs `enforce: false`,
 taking a SHA bump past the commit that added this input changes what your PRs show:** warn-only
-used to publish a green `Linear ticket` status in every outcome, and now publishes a **red**
-one. Nothing about *blocking* changes — a status only blocks when your ruleset requires that
-context — but the PR check list goes from green to red, and anything you have keyed off the
-status (auto-merge bots, dashboards, other automation) sees `failure` where it saw `success`.
+used to publish a green status in every outcome, and now publishes a **red** one. (Under its
+then-name `linear-ticket` — that bump predates the context rename above, so a caller still on an
+older pin is looking for the old spelling.) Nothing about *blocking* changes — a status only
+blocks when your ruleset requires that context — but the PR check list goes from green to red,
+and anything you have keyed off the status (auto-merge bots, dashboards, other automation) sees
+`failure` where it saw `success`.
 
 Two things to do before you take the bump:
 
-1. **Check your ruleset.** If `Linear ticket` is already a required check while you are still on
-   `enforce: false`, the red status *will* block merges. That combination was always a
+1. **Check your ruleset — under the name your CURRENT pin publishes.** If the status context is
+   already a required check while you are still on `enforce: false`, the red status *will* block
+   merges. Search for `linear-ticket` if you have not yet taken the rename bump and `Linear
+   ticket` if you have; looking only for the new spelling on a pre-rename caller finds nothing
+   and reports safe while the old requirement is live. That combination was always a
    misconfiguration (rollout step 6 is the last step for a reason), but soft-fail is what makes
    it bite. Remove the required check, or flip `enforce: true` — do not sit in between.
 2. **Decide which pilot you want.** Loud (the default) is recommended: authors fix links during

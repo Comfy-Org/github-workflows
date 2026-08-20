@@ -144,7 +144,7 @@ jobs:
       actions: read           # read the triggering workflow_run
       contents: read          # checkout the validator scripts; PR code is never checked out
       pull-requests: write    # the one marker diagnostic comment
-      statuses: write         # publish the linear-ticket commit status
+      statuses: write         # publish the `Linear ticket` commit status
     steps:
       - name: Require a pinned workflows_ref
         # workflows_ref runs THIS repo's scripts in a job holding the caller's write token +

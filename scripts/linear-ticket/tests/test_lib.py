@@ -273,6 +273,21 @@ class FailureOutcomeModes(unittest.TestCase):
                     self.assertNotIn(category, desc)
                     self.assertNotIn("_", desc)
 
+    def test_each_category_gets_a_distinct_description(self):
+        # The description no longer carries the `(category)` slug, so the headline is the
+        # whole PR-visible diagnosis. Two categories collapsing onto one string would render
+        # byte-identically beside the check name while their remedies differ — which is
+        # exactly what `no_candidate` and `exists_not_linked` did before the headlines were
+        # split. The marker comment still carries the category, but its write failure is only
+        # a warning, so the description can be the only signal that survives.
+        for enforce in (True, False):
+            for soft_fail in (True, False):
+                descriptions = [lib.failure_outcome(c, enforce, soft_fail).description
+                                for c in ALL_CATEGORIES]
+                self.assertEqual(len(set(descriptions)), len(ALL_CATEGORIES),
+                                 f"collapsed descriptions at enforce={enforce} "
+                                 f"soft_fail={soft_fail}: {descriptions}")
+
     def test_description_fits_the_github_status_limit(self):
         # publish_status truncates at 140; a description that only ever survives truncation
         # would silently lose its meaning, so keep every mode's copy inside the limit.

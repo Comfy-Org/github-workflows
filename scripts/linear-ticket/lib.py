@@ -242,9 +242,18 @@ def failure_guidance(category: str) -> str:
 # A commit status description is the PR-visible one-liner. It must state the DIAGNOSIS this
 # run actually reached: "no linked Linear issue" is wrong for infra_error, where Linear could
 # not be queried at all and the run therefore determined nothing about the ticket.
+#
+# KEEP EVERY HEADLINE DISTINCT. The description no longer carries the `(category)` slug, so
+# the headline is the whole of the PR-visible diagnosis — two categories sharing one headline
+# renders them byte-identically beside the check name while their remedies differ
+# (no_candidate: add a link at all; exists_not_linked: Linear knows the issue but has not
+# attached it yet, usually the async-link race, so re-run before touching anything). The
+# category still reaches the marker comment and job summary, but upsert_marker_comment
+# downgrades a write failure to a warning, so the description can be the only signal that
+# survives. A test pins the descriptions pairwise-distinct.
 _STATUS_HEADLINE = {
     "no_candidate": "No linked Linear issue",
-    "exists_not_linked": "No linked Linear issue",
+    "exists_not_linked": "Referenced Linear issue is not linked yet",
     "policy_mismatch": "Linked Linear issue fails this repo's policy",
     "infra_error": "Could not verify — Linear could not be queried",
 }
