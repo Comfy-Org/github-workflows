@@ -700,7 +700,7 @@ class GuardCoverageTests(unittest.TestCase):
         )
         lines = self._wrap(self.GUARD_WITH_FALLBACK + aliased).split("\n")
         self.assertFalse(
-            any(fb for _, fb, _ in cwp.ref_checkouts(lines)),
+            any(fb for _, fb, _, _ in cwp.ref_checkouts(lines)),
             "an env alias must never read as a self-pin",
         )
         self.assertEqual(len(self._jobs(self.GUARD_WITH_FALLBACK + aliased)), 1)
@@ -723,7 +723,7 @@ class GuardCoverageTests(unittest.TestCase):
             "          ref: ${{ env.WORKFLOWS_REF }}\n"
         )
         lines = self._wrap(self.GUARD_WITH_FALLBACK + mixed).split("\n")
-        self.assertFalse(any(fb for _, fb, _ in cwp.ref_checkouts(lines)))
+        self.assertFalse(any(fb for _, fb, _, _ in cwp.ref_checkouts(lines)))
         self.assertEqual(len(self._jobs(self.GUARD_WITH_FALLBACK + mixed)), 1)
 
     def test_the_leading_operand_has_to_reach_the_input(self):
@@ -824,7 +824,7 @@ class GuardCoverageTests(unittest.TestCase):
                 "          ref: %s\n" % ref
             )
             lines = self._wrap(checkout).split("\n")
-            self.assertFalse(any(fb for _, fb, _ in cwp.ref_checkouts(lines)), ref)
+            self.assertFalse(any(fb for _, fb, _, _ in cwp.ref_checkouts(lines)), ref)
             self.assertEqual(len(self._jobs(checkout)), 1, ref)
 
     def test_a_flow_sibling_carrying_the_fallback_is_not_the_ref(self):
@@ -838,7 +838,7 @@ class GuardCoverageTests(unittest.TestCase):
             "x: '${{ inputs.workflows_ref || job.workflow_sha }}'}\n"
         )
         lines = self._wrap(checkout).split("\n")
-        self.assertFalse(any(fb for _, fb, _ in cwp.ref_checkouts(lines)))
+        self.assertFalse(any(fb for _, fb, _, _ in cwp.ref_checkouts(lines)))
         self.assertEqual(len(self._jobs(checkout)), 1)
 
     def test_a_block_scalar_self_pin_is_seen_by_the_carve_out_scan(self):
@@ -855,7 +855,7 @@ class GuardCoverageTests(unittest.TestCase):
             "            ${{ inputs.workflows_ref || job.workflow_sha }}\n"
         )
         lines = self._wrap(checkout).split("\n")
-        self.assertTrue(any(fb for _, fb, _ in cwp.ref_checkouts(lines)))
+        self.assertTrue(any(fb for _, fb, _, _ in cwp.ref_checkouts(lines)))
 
     def test_the_github_job_workflow_sha_spelling_is_no_longer_exempt(self):
         # BE-8077: `github.job_workflow_sha` is an OIDC token claim, NOT a
@@ -914,6 +914,180 @@ class GuardCoverageTests(unittest.TestCase):
         )
         self.assertEqual(len(self._jobs(guard + self.CHECKOUT)), 1)
 
+    # ------------------------------------------------------------------
+    # The resolve-then-consume shape (BE-8130). A job that must NEVER fail
+    # cannot run the fail-closed guard — an `exit 1` would fail it — so it
+    # resolves the ref in a warn-only step and the checkout consumes that
+    # step's OUTPUT. The `ref:` then names no input, which is how this whole
+    # family of checkouts fell out of the lint: nothing but a hand-written
+    # `if:` stood between an unresolvable ref and a silent default-branch
+    # checkout of the scripts the job EXECUTES.
+    # ------------------------------------------------------------------
+
+    RESOLVER = (
+        "      - name: Resolve the asset ref\n"
+        "        id: resolve_ref\n"
+        "        continue-on-error: true\n"
+        "        env:\n"
+        "          WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}\n"
+        "        run: |\n"
+        '          REF="$WORKFLOWS_REF"\n'
+        '          if [ -z "$REF" ]; then\n'
+        '            echo "::warning::could not resolve a usable ref"\n'
+        "          fi\n"
+        '          echo "ref=$REF" >> "$GITHUB_OUTPUT"\n'
+    )
+    # The same resolver WITHOUT `continue-on-error:`, rejecting the empty value
+    # itself. It is a real guard, so its consumers need no `if:` at all.
+    HARD_RESOLVER = RESOLVER.replace("        continue-on-error: true\n", "").replace(
+        '            echo "::warning::could not resolve a usable ref"\n',
+        "            exit 1\n",
+    )
+    # A step that produces an output from something entirely unrelated to the
+    # input. Nothing here is this lint's business.
+    UNRELATED_RESOLVER = (
+        "      - name: Resolve the tool version\n"
+        "        id: resolve_ref\n"
+        "        run: |\n"
+        '          echo "ref=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"\n'
+    )
+
+    @staticmethod
+    def _step_output_checkout(extra_keys="", ref=None):
+        return (
+            "      - name: Load assets\n"
+            + extra_keys
+            + "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: %s\n" % (ref or "${{ steps.resolve_ref.outputs.ref }}")
+        )
+
+    EXACT_IF = "        if: steps.resolve_ref.outputs.ref != ''\n"
+
+    def test_a_step_output_checkout_with_the_exact_if_passes(self):
+        steps = self.RESOLVER + self._step_output_checkout(self.EXACT_IF)
+        self.assertEqual(self._jobs(steps), [])
+        # …and it IS covered, rather than passing by being invisible — the
+        # regression this ticket exists to close.
+        sites = cwp.ref_checkouts(self._wrap(steps).split("\n"))
+        self.assertEqual(
+            [(fb, guarded, via) for _, fb, guarded, via in sites],
+            [(False, True, True)],
+            "the checkout must be a COVERED site, not an invisible one",
+        )
+
+    def test_a_step_output_checkout_with_no_if_is_reported(self):
+        self.assertEqual(len(self._jobs(self.RESOLVER + self._step_output_checkout())), 1)
+
+    def test_an_or_widened_if_does_not_cover_a_step_output_checkout(self):
+        # `... != '' || always()` runs the checkout PRECISELY when the output is
+        # empty. It reads like a superset of the right condition and is the
+        # exact inverse of one.
+        widened = "        if: steps.resolve_ref.outputs.ref != '' || always()\n"
+        self.assertEqual(len(self._jobs(self.RESOLVER + self._step_output_checkout(widened))), 1)
+
+    def test_an_if_on_a_different_output_does_not_cover_the_checkout(self):
+        other = "        if: steps.resolve_ref.outputs.status != ''\n"
+        self.assertEqual(len(self._jobs(self.RESOLVER + self._step_output_checkout(other))), 1)
+
+    def test_a_wrapped_if_expression_passes(self):
+        wrapped = "        if: ${{ steps.resolve_ref.outputs.ref != '' }}\n"
+        self.assertEqual(self._jobs(self.RESOLVER + self._step_output_checkout(wrapped)), [])
+
+    def test_a_job_level_if_does_not_cover_a_step_output_checkout(self):
+        # A job-level `if:` skips the RESOLVER too, so it can never tell an
+        # empty output from a populated one. Only the consuming step's own
+        # `if:` can.
+        text = self._wrap(self.RESOLVER + self._step_output_checkout()).replace(
+            "  job0:\n    runs-on: ubuntu-latest\n",
+            "  job0:\n    if: steps.resolve_ref.outputs.ref != ''\n    runs-on: ubuntu-latest\n",
+        )
+        self.assertEqual(len(cwp.find_unguarded_ref_checkouts(text.split("\n"))), 1)
+
+    def test_a_hard_guard_resolver_covers_its_consumer_without_an_if(self):
+        # Nothing empty can leave a resolver that exits non-zero on it, so the
+        # consumer needs no `if:`. (The never-fail idiom cannot take this route:
+        # `continue-on-error: true` means the `exit 1` does not fail the job and
+        # the checkout runs anyway — which `is_guard_step` already refuses.)
+        self.assertEqual(self._jobs(self.HARD_RESOLVER + self._step_output_checkout()), [])
+
+    def test_a_resolver_in_another_job_is_not_reachable(self):
+        # Jobs run independently: `steps.resolve_ref` in job B names job B's
+        # step, not job A's. With nothing in the job binding the input, this
+        # checkout is not this lint's subject at all — not a covered site that
+        # happens to pass.
+        sites = cwp.ref_checkouts(
+            self._wrap(self.RESOLVER, self._step_output_checkout()).split("\n")
+        )
+        self.assertEqual(sites, [])
+
+    def test_a_resolver_below_its_consumer_is_never_credited(self):
+        # Declared after the checkout it would cover, so it cannot have run
+        # first. Skipped or reported, but never scored as guarding anything.
+        sites = cwp.ref_checkouts(
+            self._wrap(self._step_output_checkout(self.EXACT_IF) + self.RESOLVER).split("\n")
+        )
+        self.assertEqual([s for s in sites if s[2]], [])
+
+    def test_a_step_output_unrelated_to_the_input_is_not_a_ref_use(self):
+        # The producing step binds no `workflows_ref`, so this checkout has
+        # nothing to do with the pin contract. Demanding an empty-ref `if:` of
+        # it would fail workflows this lint has no claim on.
+        sites = cwp.ref_checkouts(
+            self._wrap(self.UNRELATED_RESOLVER + self._step_output_checkout()).split("\n")
+        )
+        self.assertEqual(sites, [])
+
+    def test_the_flow_form_of_a_step_output_checkout_behaves_the_same(self):
+        # The whole `with:` on one line — the same one-line bypass the input
+        # spellings already bar.
+        flow = (
+            "      - name: Load assets\n"
+            "%s"
+            "        uses: actions/checkout@abc\n"
+            '        with: {repository: Comfy-Org/github-workflows, ref: "${{ steps.resolve_ref.outputs.ref }}"}\n'
+        )
+        self.assertEqual(self._jobs(self.RESOLVER + flow % self.EXACT_IF), [])
+        self.assertEqual(len(self._jobs(self.RESOLVER + flow % "")), 1)
+
+    def test_the_block_scalar_form_of_a_step_output_checkout_behaves_the_same(self):
+        # `ref: >-` leaves the key line with no expression on it and the
+        # expression line with no `ref:` key — the vertical spelling of the
+        # same bypass.
+        scalar = (
+            "      - name: Load assets\n"
+            "%s"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: >-\n"
+            "            ${{ steps.resolve_ref.outputs.ref }}\n"
+        )
+        self.assertEqual(self._jobs(self.RESOLVER + scalar % self.EXACT_IF), [])
+        unguarded = self._jobs(self.RESOLVER + scalar % "")
+        self.assertEqual(len(unguarded), 1)
+        # Reported at the `ref:` KEY line, which is the checkout a reader looks
+        # for — not at the continuation line the parser matched.
+        text = self._wrap(self.RESOLVER + scalar % "").split("\n")
+        self.assertEqual(text[unguarded[0] - 1].strip(), "ref: >-")
+
+    def test_an_unguarded_step_output_checkout_gets_its_own_remedy(self):
+        # "Copy the guard step in ahead of it" is the wrong advice here — the
+        # never-fail job cannot run one. A lint that fails with a remedy that
+        # does not apply is a lint people learn to route around.
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        text = _reusable(PINNED).replace(
+            "    steps:\n      - run: echo hi\n",
+            "    steps:\n" + self.RESOLVER + self._step_output_checkout(),
+        )
+        with open(os.path.join(tmp, "w.yml"), "w", encoding="utf-8") as f:
+            f.write(text)
+        errors, _, _ = cwp.check_dir(tmp, exempt=frozenset())
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("BE-8130", errors[0])
+        self.assertIn("resolved from a step", errors[0])
+        self.assertNotIn("BE-5546", errors[0])
+
     def test_this_repos_own_workflows_guard_every_ref_checkout(self):
         root = os.path.normpath(
             os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "workflows")
@@ -922,21 +1096,29 @@ class GuardCoverageTests(unittest.TestCase):
         for name in ("cursor-review.yml", "groom.yml", "agents-md-integrity.yml", "pr-size.yml"):
             with open(os.path.join(root, name), encoding="utf-8") as f:
                 lines = f.read().split("\n")
-            uses = [line for line in lines if cwp.is_ref_use(line)]
-            self.assertTrue(uses, "%s: no ref checkout found — fixture drifted" % name)
-            seen += len(uses)
+            # Counted through `ref_checkouts`, not a per-line `is_ref_use` scan:
+            # since BE-8130 a site can reach the ref through an earlier step's
+            # output, which no single line can be asked about — the answer
+            # depends on what the job walked past. A line scan would report the
+            # ledger site as absent while the lint covers it, which is exactly
+            # the drift this count exists to catch.
+            sites = cwp.ref_checkouts(lines)
+            self.assertTrue(sites, "%s: no ref checkout found — fixture drifted" % name)
+            seen += len(sites)
             self.assertEqual(cwp.find_unguarded_ref_checkouts(lines), [], name)
         self.assertEqual(
             seen,
-            15,
+            16,
             "expected the 12 guarded sites BE-5546 fixed + pr-size.yml's (BE-5858) "
             "+ cursor-review.yml's preflight (hard guard) site picked up merging "
             "main + cursor-review.yml's diff-size job's check-pr-size-tool "
             "checkout, also picked up merging main (BE-5546 added its guard "
-            "here). cursor-review.yml's ledger checkout dropped OUT of this count "
-            "in BE-8077: it now reads `ref: ${{ steps.resolve_ref.outputs.ref }}` "
-            "— the input is resolved one step earlier, so the `ref:` line no "
-            "longer names it. groom.yml's 7 sites still do, via the "
+            "here) + cursor-review.yml's ledger checkout, which RE-ENTERED "
+            "coverage in BE-8130: it reads `ref: ${{ steps.resolve_ref.outputs.ref "
+            "}}` and names no input, and the detector now follows the `ref:` "
+            "through that step output to the step binding `workflows_ref` (it had "
+            "dropped out in BE-8077, when the resolve-then-consume shape landed). "
+            "groom.yml's 7 sites name the input directly, via the "
             "`|| job.workflow_sha` fallback — and are clean because each one "
             "carries its guard, which BE-8077 made load-bearing rather than "
             "exempt.",
@@ -966,46 +1148,34 @@ class GuardCoverageTests(unittest.TestCase):
             end += 1
         return lines[start:end]
 
-    def test_the_ledger_checkout_keeps_its_resolve_then_skip_guard(self):
-        # BE-8077 moved cursor-review.yml's ledger checkout to
-        # `ref: ${{ steps.resolve_ref.outputs.ref }}`, which no longer NAMES the
-        # input — so `is_ref_use` does not see it and the lint cannot cover it
-        # (that is the 16 -> 15 in the count assertion above). The only thing
-        # standing between an unresolvable ref and a silent default-branch
-        # checkout of the assets this job EXECUTES is the hand-written `if:`.
-        # Nothing lints it, so pin it here until the detector learns to follow a
-        # `ref:` through a step output.
-        lines = self._workflow("cursor-review.yml")
-        consumers = [
-            i
-            for i, line in enumerate(lines)
-            if "ref: ${{ steps.resolve_ref.outputs.ref }}" in line
-        ]
-        self.assertTrue(consumers, "ledger checkout no longer reads resolve_ref")
-
-        for idx in consumers:
-            # Scoped to the consuming step itself, and matched EXACTLY. A fixed
-            # line window let a neighbouring step's `if:` satisfy this while the
-            # consumer ran unconditionally, accepted a widened condition such as
-            # `... != '' || always()` (which runs the checkout precisely when the
-            # output is empty), and broke on a compliant step that simply grew a
-            # couple of comment lines.
-            step = [s.strip() for s in self._enclosing_step(lines, idx)]
-            self.assertIn(
-                "if: steps.resolve_ref.outputs.ref != ''",
-                step,
-                "checkout at line %d has no exact non-empty `if:` in its own step"
-                % (idx + 1),
-            )
-
-        # …and the resolving step must REJECT rather than sanitize: it emits the
+    def test_the_ledger_resolver_carries_the_shape_check(self):
+        # The consumer's `if:` is LINT-COVERED since BE-8130: the detector
+        # follows the ledger checkout's `ref:` through
+        # `steps.resolve_ref.outputs.ref` back to the step binding the input,
+        # and requires exactly that non-empty `if:` (an OR-widened one such as
+        # `... != '' || always()` runs the checkout precisely when the output is
+        # empty, and is refused). So the assertion loop that used to pin it by
+        # hand is gone — `check_workflow_pins.py` itself fails now if the `if:`
+        # is deleted or widened.
+        #
+        # The resolver's SHAPE is not lint-covered, and that is what remains
+        # here: the lint proves emptiness-skip, never charset policy. This is
+        # the cursor-review twin of `test_every_groom_guard_carries_the_shape_check`
+        # below.
+        #
+        # The resolving step must REJECT rather than sanitize: it emits the
         # empty string for anything not ref-shaped, under a pinned byte locale.
+        #
+        # (That the checkout still READS `steps.resolve_ref.outputs.ref` needs no
+        # assertion here either: the count above would drop back to 15 if it
+        # stopped, since the site would leave the detector's coverage.)
         #
         # Scoped to that step, not to the whole file. Matched against the file
         # body, any step in it satisfied these — and the file already carries
         # six other hand-copied guards, so the natural consistency sweep that
         # adds `export LC_ALL=C` to them would let someone delete it from
         # `resolve_ref` with the only test covering that step still green.
+        lines = self._workflow("cursor-review.yml")
         resolvers = [i for i, line in enumerate(lines) if line.strip() == "id: resolve_ref"]
         self.assertEqual(len(resolvers), 1, "expected exactly one resolve_ref step")
         resolver = [s.strip() for s in self._enclosing_step(lines, resolvers[0])]
@@ -1013,7 +1183,12 @@ class GuardCoverageTests(unittest.TestCase):
         self.assertIn("export LC_ALL=C", resolver)
         # …and it must resolve from the BE-8077 fallback. Every assertion above
         # still passed with the binding swapped for `|| 'main'`, which is the
-        # mutable-ref hole this whole ticket exists to close.
+        # mutable-ref hole BE-8077 exists to close — and the lint still cannot
+        # see it: `_GUARD_BINDING_RE` recognizes only the bare input and the
+        # `|| job.workflow_sha` fallback, so a resolver binding `|| 'main'`
+        # registers as no resolver at all and its consumer drops out of coverage
+        # as "not this lint's subject". This assertion is what covers that for
+        # cursor-review.yml.
         self.assertIn(
             "WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}",
             resolver,

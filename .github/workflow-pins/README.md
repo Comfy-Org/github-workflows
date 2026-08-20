@@ -65,6 +65,22 @@ fail-closed `Require a resolvable workflows_ref` step ahead of its checkout, and
 `cursor-review.yml`'s never-fail ledger job resolves the ref in a step that
 warns and skips the checkout instead.
 
+**That resolve-then-consume idiom is LINTED, not exempt (BE-8130).** Its
+checkout reads `ref: ${{ steps.<id>.outputs.<name> }}`, which names no input —
+so it used to leave the lint entirely, with a hand-written `if:` as the only
+thing between an unresolvable ref and a silent default-branch checkout of the
+scripts the job executes. The detector now follows a `ref:` through the step
+output: when the producing step's `env:` binds `workflows_ref`, the checkout is
+a ref use, and it is covered only if **either** that step is itself a
+fail-closed guard, **or** the consuming step carries exactly
+`if: steps.<id>.outputs.<name> != ''` (bare or `${{ … }}`-wrapped) on that same
+output. Nothing wider: `... != '' || always()` runs the checkout precisely when
+the output is empty, an `if:` on a different output says nothing about this one,
+and a job-level `if:` skips the resolver too. A never-fail resolver can only
+take the second route — `continue-on-error: true` means its `exit 1` would not
+fail the job, so it is not a guard. A `ref:` resolved from a step that never
+touches `workflows_ref` is not this lint's subject and is left alone.
+
 **The lint enforces that split, rather than trusting the prose.** The fallback
 answers *mutability*; the guard answers *emptiness*; a checkout using the
 fallback is exempt from the first check and still held to the second. Until
