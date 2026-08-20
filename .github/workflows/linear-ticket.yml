@@ -21,10 +21,11 @@ name: Linear Ticket (reusable)
 # REPORTING MODES — how loudly a failure is reported. This workflow NEVER decides whether a PR
 # can merge; branch protection does, by requiring the `linear-ticket` context or not:
 #   enforce: true                     red status, job exits nonzero. Gating (once required).
-#   enforce: false                    red status, job stays green. Shows on the PR exactly like
-#     (soft-fail: true, the default)  enforce does but blocks nothing while the context is not
-#                                     required — the loud pilot rung, since a green check nobody
-#                                     reads teaches the repo nothing during observation.
+#   enforce: false                    red status, job stays green on a failing VERDICT (a
+#     (soft-fail: true, the default)  broken run still exits nonzero). Shows on the PR exactly
+#                                     like enforce does but blocks nothing while the context is
+#                                     not required — the loud pilot rung, since a green check
+#                                     nobody reads teaches the repo nothing during observation.
 #   enforce: false, soft-fail: false  green status; only the job summary and the marker comment
 #                                     carry the verdict. The silent variant.
 #
@@ -90,8 +91,10 @@ on:
       enforce:
         description: >-
           true (default) fails closed on a missing/invalid link or infrastructure error, and
-          the job itself exits nonzero. false is warn-only: the job never exits nonzero, and
-          `soft-fail` decides how loudly the verdict is reported.
+          the job itself exits nonzero. false is warn-only: a failing VERDICT never exits the
+          job nonzero, and `soft-fail` decides how loudly it is reported. Warn-only is not a
+          promise the job always exits 0 — a broken run still does (a failed terminal status
+          write, a missing token/repo, malformed `team-keys`, a non-`pull_request` trigger).
         type: boolean
         required: false
         default: true
@@ -101,8 +104,12 @@ on:
           `failure` commit status so the PR's check list shows the check failing — loud, but
           NON-BLOCKING for as long as `linear-ticket` is not a required status in the repo's
           branch protection, which is exactly what a warn-only pilot means. The marker comment
-          says so in as many words. false restores the silent variant: warn-only publishes
-          `success` and only the job summary and comment carry the verdict.
+          says so. false restores the silent variant: warn-only publishes `success` and only
+          the job summary and comment carry the verdict.
+          BEHAVIOUR CHANGE for callers already on `enforce: false`: before this input existed
+          warn-only always published `success`, so taking a SHA bump past this commit flips
+          those callers to a red (still non-required) status with no caller-side edit. Set
+          `soft-fail: false` in the caller to keep the old always-green behaviour.
           FOOTGUN: `enforce: false` + `soft-fail: true` + `linear-ticket` already required in
           branch protection WOULD block merges. Do not require the context before flipping
           `enforce: true`.

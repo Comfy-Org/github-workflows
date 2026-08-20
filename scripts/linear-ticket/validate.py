@@ -19,10 +19,12 @@ Contract (all via env, set by linear-ticket.yml):
     TEAM_KEYS          raw ``team-keys`` input (comma-separated; empty = any team)
     EXEMPT_LABEL       exemption label name; empty disables exemption
     REQUIRE_OPEN_ISSUE "true"/"false"
-    ENFORCE            "true" (fail closed) / "false" (warn-only: never exits nonzero)
-    SOFT_FAIL          warn-only only: "true" (default) publishes a red `failure` status —
-                       loud but non-blocking while the context is not required; "false"
-                       restores the silent always-green warn-only behaviour
+    ENFORCE            "true" (fail closed) / "false" (warn-only: a failing VERDICT never
+                       exits nonzero; a broken run still can — see finish_fail and run())
+    SOFT_FAIL          warn-only only: "true" publishes a red `failure` status — loud, and
+                       non-blocking for as long as the caller's ruleset does not require the
+                       `linear-ticket` context; "false" (and, deliberately, an ABSENT value)
+                       keeps the silent always-green warn-only behaviour
     RUN_URL            html_url of this workflow run, for the status target and comment
     LINEAR_API_URL     optional override (default https://api.linear.app/graphql)
     GITHUB_STEP_SUMMARY  written with the human-readable outcome
@@ -298,7 +300,7 @@ class Validator:
         if detail:
             body_lines += ["", detail]
         if outcome.advisory:
-            body_lines += ["", lib.ADVISORY_NOTE]
+            body_lines += ["", lib.advisory_note(category)]
         body_lines += [
             "",
             "---",
@@ -525,9 +527,10 @@ def main() -> int:
 
     require_open = os.environ.get("REQUIRE_OPEN_ISSUE", "true") != "false"
     enforce = os.environ.get("ENFORCE", "true") != "false"
-    # Defaults TRUE, matching the workflow input: a warn-only pilot that reports green is a
-    # check nobody reads. Only an explicit "false" buys the silent variant.
-    soft_fail = os.environ.get("SOFT_FAIL", "true") != "false"
+    # NOT defaulted true here even though the workflow input is: linear-ticket.yml always
+    # passes SOFT_FAIL, so an absent value means a skewed pin (old workflow YAML, new scripts)
+    # rather than a caller choosing the loud mode. See lib.soft_fail_enabled.
+    soft_fail = lib.soft_fail_enabled(os.environ.get("SOFT_FAIL"))
     run_url = os.environ.get("RUN_URL", "")
 
     validator = Validator(GitHub(repo), token, team_keys, require_open, enforce, soft_fail,

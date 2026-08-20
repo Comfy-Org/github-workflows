@@ -232,14 +232,70 @@ def failure_guidance(category: str) -> str:
 # A red default-branch run for a check that is deliberately not gating would read as "main is
 # broken" in the Actions tab, which is louder in the wrong place.
 
-# Appended to the marker comment whenever the check is red but non-gating, so nobody reads the
+# A commit status description is the PR-visible one-liner. It must state the DIAGNOSIS this
+# run actually reached: "no linked Linear issue" is wrong for infra_error, where Linear could
+# not be queried at all and the run therefore determined nothing about the ticket.
+_STATUS_HEADLINE = {
+    "no_candidate": "No linked Linear issue",
+    "exists_not_linked": "No linked Linear issue",
+    "policy_mismatch": "Linked Linear issue fails this repo's policy",
+    "infra_error": "Could not verify — Linear could not be queried",
+}
+
+# Appended to the marker comment whenever the check is red but warn-only, so nobody reads the
 # red X as a merge block (and nobody assumes it will stay non-blocking forever).
-ADVISORY_NOTE = (
-    "> ⚠️ **This does not block the merge.** The check is reported as failing so it is visible "
-    "in the PR's check list, but `linear-ticket` is not a required status while this repository "
-    "is in the warn-only pilot. Linking the ticket now is what keeps it from blocking you once "
-    "the pilot starts enforcing."
+#
+# WORDING IS DELIBERATELY HEDGED. This validator never reads the caller's ruleset, so it cannot
+# know whether `linear-ticket` is a required context — asserting "this does not block" would be
+# a flat lie in exactly the configuration docs/callers/linear-ticket.md calls a footgun
+# (warn-only + the context already required), and would send that author to debug the wrong
+# thing. So the note states what IS knowable (this workflow is not what blocks; a warn-only
+# pilot is meant to run before the context is required) and names the misconfiguration to
+# report if the merge button is in fact blocked.
+_ADVISORY_BASE = (
+    "> ⚠️ **Advisory — this check is warn-only.** It is reported as failing so it shows up in "
+    "the PR's check list, but nothing this workflow does blocks a merge: what blocks is your "
+    "repository's ruleset requiring the `linear-ticket` status context, and a warn-only pilot "
+    "is meant to run *before* that context is required. If your merge button is actually "
+    "blocked on `linear-ticket`, then the context is already required while the pilot is still "
+    "warn-only — tell the repository owners, because that combination is a misconfiguration."
 )
+_ADVISORY_TAIL = {
+    # infra_error is not the author's to fix — telling them to link a ticket would send them
+    # after a broken credential with the wrong tool.
+    "infra_error": (
+        " This run could not reach Linear, so there is nothing to fix on the PR itself: re-run "
+        "the check, and if it keeps failing contact the repository owners."
+    ),
+}
+_ADVISORY_TAIL_DEFAULT = (
+    " Linking the ticket now is what keeps this from blocking you once the pilot starts "
+    "enforcing."
+)
+
+
+def advisory_note(category: str) -> str:
+    """The non-gating note appended to the marker comment for a warn-only red verdict.
+
+    Category-aware: the shared hedged paragraph plus the one next step that is actually right
+    for this diagnosis. Raises KeyError on an unknown category, matching failure_guidance.
+    """
+    if category not in _GUIDANCE:
+        raise KeyError(category)
+    return _ADVISORY_BASE + _ADVISORY_TAIL.get(category, _ADVISORY_TAIL_DEFAULT)
+
+
+def soft_fail_enabled(raw: str | None) -> bool:
+    """Parse the ``SOFT_FAIL`` env var. An ABSENT value means the SILENT variant.
+
+    linear-ticket.yml always passes SOFT_FAIL and its own input defaults to true, so a
+    correctly-pinned caller gets the loud mode regardless of this default. An *absent* value can
+    only mean the workflow YAML predates the input — `workflows_ref` skewed ahead of the
+    caller's `uses:` pin, the skew AGENTS.md warns never to create by hand-bumping one of the
+    two pins. A caller that cannot even express the input must not be silently upgraded from a
+    green status to a red one, so only an explicit "true" opts in.
+    """
+    return (raw or "").strip().lower() == "true"
 
 
 class FailureOutcome(NamedTuple):
@@ -249,7 +305,7 @@ class FailureOutcome(NamedTuple):
     state       commit-status state published on the PR head SHA
     description commit-status description (validate.py truncates to GitHub's 140 chars)
     exit_code   the validator process's exit code
-    advisory    whether to append ADVISORY_NOTE to the comment
+    advisory    whether to append advisory_note(category) to the comment
     """
 
     verdict: str
@@ -269,19 +325,20 @@ def failure_outcome(category: str, enforce: bool, soft_fail: bool) -> FailureOut
     """
     if category not in _GUIDANCE:
         raise KeyError(category)
+    headline = _STATUS_HEADLINE[category]
     if enforce:
         return FailureOutcome(
             verdict=f"\u274c fail ({category})",
             state="failure",
-            description=f"No linked Linear issue ({category})",
+            description=f"{headline} ({category})",
             exit_code=1,
             advisory=False,
         )
     if soft_fail:
         return FailureOutcome(
-            verdict=f"\u274c fail ({category}) \u2014 advisory, not blocking",
+            verdict=f"\u274c fail ({category}) \u2014 warn-only",
             state="failure",
-            description=f"Advisory (warn-only): no linked Linear issue ({category})",
+            description=f"Warn-only: {headline[0].lower()}{headline[1:]} ({category})",
             exit_code=0,
             advisory=True,
         )

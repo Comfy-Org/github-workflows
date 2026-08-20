@@ -46,12 +46,21 @@ That is the whole point: a `TEAM-123`-shaped string an author types is not a lin
 - **Reporting mode is not the verdict.** `failure_outcome()` maps (category, mode) to the
   status state, comment headline, and exit code; the diagnosis is identical in every mode.
   `enforce: true` → red status + nonzero exit. `enforce: false` (warn-only) never exits
-  nonzero and, with the default `soft-fail: true`, still publishes a **red** status — loud on
-  the PR but blocking nothing while `linear-ticket` is not a required context, with an
-  explicit "this does not block the merge" note on the comment. `soft-fail: false` restores
-  the silent always-green warn-only behaviour.
+  nonzero *on a verdict* and, with `soft-fail: true`, still publishes a **red** status — loud
+  on the PR but blocking nothing while `linear-ticket` is not a required context, with a
+  category-aware advisory note on the comment. `soft-fail: false` restores the silent
+  always-green warn-only behaviour, and so does an **absent** `SOFT_FAIL` env: the workflow
+  always passes it, so absent means a skewed `workflows_ref`/`uses:` pin, and a caller that
+  cannot express the input is never silently upgraded to red (`lib.soft_fail_enabled`).
+- The advisory note is **hedged on purpose**: the validator never reads the caller's ruleset,
+  so it cannot claim "this does not block the merge" — in the documented footgun (warn-only +
+  the context already required) that claim would be false and would misdirect the author. It
+  names what actually blocks (your ruleset) and the misconfiguration to report.
+- Status **descriptions are category-aware**: `infra_error` means Linear could not be queried,
+  so the status must not read "no linked Linear issue" — a diagnosis the run never made.
 - A failed **terminal status write** is exit 1 even in warn-only: soft-fail's whole point is
-  that the red status lands, and a missing write leaves the previous status standing.
+  that the red status lands, and a missing write leaves the previous status standing. This is
+  one of the run-level exits that warn-only does *not* suppress.
 
 ## Running the tests
 

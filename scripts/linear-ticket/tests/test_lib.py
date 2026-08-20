@@ -181,6 +181,13 @@ class FailureOutcomeModes(unittest.TestCase):
     """The reporting-mode table in lib.py. The invariant under all of it: soft-fail changes
     only how LOUD a red verdict is, never the diagnosis and never the exit code contract."""
 
+    def test_every_category_has_copy_for_every_surface(self):
+        # ALL_CATEGORIES must be exhaustive, or the loops below silently stop covering a
+        # category; and _STATUS_HEADLINE must cover exactly what _GUIDANCE does, or
+        # failure_outcome raises KeyError on a category that passed its own guard.
+        self.assertEqual(set(ALL_CATEGORIES), set(lib._GUIDANCE))
+        self.assertEqual(set(lib._STATUS_HEADLINE), set(lib._GUIDANCE))
+
     def test_enforce_is_red_and_exits_nonzero(self):
         outcome = lib.failure_outcome("no_candidate", enforce=True, soft_fail=False)
         self.assertEqual(outcome.state, "failure")
@@ -206,6 +213,11 @@ class FailureOutcomeModes(unittest.TestCase):
         self.assertFalse(outcome.advisory)
 
     def test_only_enforce_ever_exits_nonzero(self):
+        # Scope: the VERDICT's exit code. The job can still exit nonzero in warn-only for
+        # reasons that are not a verdict — a failed terminal status write (finish_fail), or a
+        # broken run (missing GH_REPO/LINEAR_API_TOKEN, malformed team-keys, a non-
+        # pull_request event). The docs say "a failing verdict", not "the job", for that
+        # reason.
         for category in ALL_CATEGORIES:
             for soft_fail in (True, False):
                 self.assertEqual(
@@ -243,8 +255,67 @@ class FailureOutcomeModes(unittest.TestCase):
         with self.assertRaises(KeyError):
             lib.failure_outcome("bogus", enforce=False, soft_fail=True)
 
-    def test_advisory_note_is_unambiguous_about_not_blocking(self):
-        self.assertIn("does not block", lib.ADVISORY_NOTE)
+    def test_description_names_the_diagnosis_this_run_actually_reached(self):
+        # infra_error means Linear could not be queried, so the run determined NOTHING about
+        # the ticket; a status reading "no linked Linear issue" would be a diagnosis it never
+        # made. Soft-fail promotes this copy to the loudest PR-visible surface.
+        for enforce in (True, False):
+            for soft_fail in (True, False):
+                infra = lib.failure_outcome("infra_error", enforce, soft_fail)
+                self.assertNotIn("linked Linear issue", infra.description)
+        self.assertIn("linked Linear issue",
+                      lib.failure_outcome("no_candidate", True, False).description)
+
+
+class AdvisoryNote(unittest.TestCase):
+    """The note appended to a warn-only red verdict."""
+
+    def test_never_asserts_flatly_that_nothing_is_blocked(self):
+        # The validator never reads the caller's ruleset, so it cannot know whether the
+        # `linear-ticket` context is required. In the documented footgun configuration
+        # (warn-only + context already required) the red check IS blocking the author, and a
+        # flat "this does not block the merge" would send them to debug the wrong thing.
+        for category in ALL_CATEGORIES:
+            note = lib.advisory_note(category)
+            self.assertNotIn("This does not block", note)
+            self.assertIn("warn-only", note)
+            # It must still name what actually blocks, and the misconfiguration to report.
+            self.assertIn("ruleset", note)
+            self.assertIn("misconfiguration", note)
+
+    def test_infra_error_does_not_tell_the_author_to_link_a_ticket(self):
+        # A missing/invalid LINEAR_API_TOKEN is not the PR author's to fix.
+        note = lib.advisory_note("infra_error")
+        self.assertNotIn("Linking the ticket", note)
+        self.assertIn("could not reach Linear", note)
+
+    def test_ticket_categories_do_tell_the_author_to_link(self):
+        for category in ("no_candidate", "exists_not_linked", "policy_mismatch"):
+            self.assertIn("Linking the ticket", lib.advisory_note(category))
+
+    def test_unknown_category_raises(self):
+        with self.assertRaises(KeyError):
+            lib.advisory_note("bogus")
+
+
+class SoftFailEnv(unittest.TestCase):
+    """Parsing of the SOFT_FAIL env var — the pin-skew guard."""
+
+    def test_absent_is_the_silent_variant(self):
+        # linear-ticket.yml ALWAYS passes SOFT_FAIL, so absent means the workflow YAML predates
+        # the input: `workflows_ref` skewed ahead of the caller's `uses:` pin. A caller that
+        # cannot express the input must not be silently upgraded from green to red statuses.
+        self.assertFalse(lib.soft_fail_enabled(None))
+        self.assertFalse(lib.soft_fail_enabled(""))
+
+    def test_explicit_true_opts_in(self):
+        self.assertTrue(lib.soft_fail_enabled("true"))
+        self.assertTrue(lib.soft_fail_enabled("TRUE"))
+        self.assertTrue(lib.soft_fail_enabled(" true "))
+
+    def test_explicit_false_and_anything_unrecognised_stay_silent(self):
+        for raw in ("false", "False", "0", "yes", "no", "1", "maybe"):
+            self.assertFalse(lib.soft_fail_enabled(raw), raw)
 
 
 class DiagnosticQuery(unittest.TestCase):

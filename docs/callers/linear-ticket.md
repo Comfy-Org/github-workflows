@@ -124,8 +124,36 @@ job-level detail.
 | `exempt-label` | `''` | Single label that waives the requirement (recommended `linear-exempt`). Empty disables exemption. |
 | `exempt-actors` | `''` | Comma-separated PR-author logins whose PRs skip the check without a label (e.g. `dependabot[bot],renovate[bot]`) — the non-manual hatch for bot PRs that never carry a ticket. Opt-in; empty means no bypass. Listing an actor means **all** of its PRs merge without a Linear ticket, so keep it to trusted automation accounts. |
 | `require-open-issue` | `true` | Reject a linked issue whose Linear `state.type` is `completed`/`canceled`. `backlog`/`unstarted`/`started`/`triage` pass. |
-| `enforce` | `true` | `false` is warn-only: the job never exits nonzero. `soft-fail` decides how loudly the verdict is reported; the diagnosis is identical either way. |
-| `soft-fail` | `true` | Warn-only only (ignored when `enforce: true`). `true` publishes a **red `failure`** status, so the PR's check list shows the check failing — loud, but non-blocking for as long as `linear-ticket` is not a required status, and the marker comment says so explicitly. `false` restores the silent variant (warn-only publishes `success`; only the summary and comment carry the verdict). **Do not** require the `linear-ticket` context while `enforce: false` — required + soft-fail would block merges. |
+| `enforce` | `true` | `false` is warn-only: a failing **verdict** never exits the job nonzero. `soft-fail` decides how loudly it is reported; the diagnosis is identical either way. Warn-only is not a promise the job always exits `0` — a broken *run* still does (a failed terminal status write, a missing token/repo, malformed `team-keys`, a non-`pull_request` trigger). |
+| `soft-fail` | `true` | Warn-only only (ignored when `enforce: true`). `true` publishes a **red `failure`** status, so the PR's check list shows the check failing — loud, but non-blocking for as long as `linear-ticket` is not a required status in your ruleset. `false` restores the silent variant (warn-only publishes `success`; only the summary and comment carry the verdict). **Do not** require the `linear-ticket` context while `enforce: false` — required + soft-fail would block merges. |
+
+## Upgrading an existing `enforce: false` caller
+
+`soft-fail` is new, and it defaults to `true`. **If your caller already runs `enforce: false`,
+taking a SHA bump past the commit that added this input changes what your PRs show:** warn-only
+used to publish a green `linear-ticket` status in every outcome, and now publishes a **red**
+one. Nothing about *blocking* changes — a status only blocks when your ruleset requires that
+context — but the PR check list goes from green to red, and anything you have keyed off the
+status (auto-merge bots, dashboards, other automation) sees `failure` where it saw `success`.
+
+Two things to do before you take the bump:
+
+1. **Check your ruleset.** If `linear-ticket` is already a required check while you are still on
+   `enforce: false`, the red status *will* block merges. That combination was always a
+   misconfiguration (rollout step 6 is the last step for a reason), but soft-fail is what makes
+   it bite. Remove the required check, or flip `enforce: true` — do not sit in between.
+2. **Decide which pilot you want.** Loud (the default) is recommended: authors fix links during
+   the pilot instead of discovering the requirement on flip day. If you want the old behaviour,
+   add one line to your caller:
+
+   ```yaml
+   enforce: false
+   soft-fail: false   # keep the pre-soft-fail behaviour: warn-only stays green
+   ```
+
+An **absent** `SOFT_FAIL` — which only happens if your `uses:` pin and `workflows_ref` have
+skewed apart, so an older `linear-ticket.yml` is running newer scripts — is treated as
+`false`, so pin skew alone can never flip you to red. Keep both pins on the same SHA anyway.
 
 ## Rollout (warn-only first)
 
