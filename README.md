@@ -93,18 +93,24 @@ silently changes what you execute.
 Workflows that load their backing scripts at run time take a `workflows_ref`
 input — always set it to the *same* commit SHA you pin `uses:` to. Pinning only
 `uses:` runs a pinned workflow that loads **mutable** scripts from a floating
-branch, which defeats the pin. On every workflow that takes it except `groom.yml`
-— `cursor-review.yml`, `pr-size.yml`, `agents-md-integrity.yml`,
-`coderabbit-config-validate.yml`, `refresh-reviewers.yml`, `pr-risk.yml`,
-`pr-derisk.yml`, `pr-area-label.yml` and `linear-ticket.yml` — the input is
-**required with no default**, and the run fails fast when it is empty or omitted
-(GitHub does not enforce `required: true` for `workflow_call` inputs, so those
-workflows check at run time; the last four additionally reject anything that is
-not a merged full 40-hex SHA of this repo). `groom.yml` is
-the one exception (BE-4169): leave `workflows_ref` unset and it defaults to
-`github.job_workflow_sha` — the exact, immutable commit the reusable itself was
-resolved from — so there is nothing for the caller to keep in sync; set it only
-to override that (e.g. testing briefs from a branch).
+branch, which defeats the pin. Ten workflows take the input — `cursor-review.yml`,
+`pr-size.yml`, `agents-md-integrity.yml`, `coderabbit-config-validate.yml`,
+`refresh-reviewers.yml`, `pr-risk.yml`, `pr-derisk.yml`, `pr-area-label.yml`,
+`linear-ticket.yml` and `groom.yml` — and the rest of the catalog does not
+declare it at all, so do not copy the line into their callers (GitHub rejects an
+undeclared input at startup). On all of them except `groom.yml` the input is
+**required with no default**, and the job that checks the ref out fails fast when
+it is empty or omitted (GitHub does not enforce `required: true` for
+`workflow_call` inputs, so those workflows re-check at run time; `pr-risk.yml`,
+`pr-derisk.yml`, `pr-area-label.yml` and `linear-ticket.yml` additionally reject
+anything that is not a merged full 40-hex SHA of this repo). The guards are
+per-job, so a skipped job never evaluates one — and `cursor-review.yml`'s
+never-fail `Prior-review ledger` job carries none by design. `groom.yml` is the
+one workflow that does not require the input (BE-4169 meant an omitted value to
+fall back to `github.job_workflow_sha`, which is not a `github` context property
+— GitHub spells that value `job.workflow_sha` — so it currently resolves to `''`
+and checkout takes the default branch). Pin it there too, until those checkouts
+are moved onto `job.workflow_sha` behind an empty-ref guard.
 
 Per-workflow inputs, required secrets, and triggers are documented in each
 workflow file's header comment.
