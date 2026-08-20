@@ -940,6 +940,93 @@ class GuardCoverageTests(unittest.TestCase):
         self.assertNotEqual(conditional, self.GUARD, "fixture drifted")
         self.assertEqual(len(self._jobs(conditional + self.CHECKOUT)), 1)
 
+    def test_a_marker_line_one_line_guard_still_counts(self):
+        # The one-line guard written marker-first: normalizing the marker line
+        # for the DISQUALIFIER scan alone left the guard-detection scan reading
+        # the raw `- run: …`, whose `- ` defeats the run-prefix strip — a real
+        # guard missed, and its checkout reported with the remedy the author
+        # already has.
+        one_liner = (
+            '      - run: [ -z "$WORKFLOWS_REF" ] && exit 1\n'
+            "        env:\n"
+            "          WORKFLOWS_REF: ${{ inputs.workflows_ref }}\n"
+        )
+        self.assertEqual(self._jobs(one_liner + self.CHECKOUT), [])
+
+    def test_a_matrix_include_item_is_not_a_guard_step(self):
+        # A `strategy.matrix.include` entry is a list item that can carry the
+        # binding's exact shape plus a guard-shaped script — it is DATA, no
+        # shell ever runs it. Resolving it to step bounds scores it as a hard
+        # guard and blesses every later unguarded checkout in the job.
+        text = self._wrap(self.CHECKOUT).replace(
+            "    runs-on: ubuntu-latest\n",
+            "    runs-on: ubuntu-latest\n"
+            "    strategy:\n"
+            "      matrix:\n"
+            "        include:\n"
+            "          - name: probe\n"
+            "            WORKFLOWS_REF: ${{ inputs.workflows_ref }}\n"
+            "            script: |\n"
+            '              if [ -z "$WORKFLOWS_REF" ]; then\n'
+            "                exit 1\n"
+            "              fi\n",
+        )
+        self.assertEqual(len(cwp.find_unguarded_ref_checkouts(text.split("\n"))), 1)
+
+    def test_guard_shaped_text_in_a_run_scalar_is_not_a_guard(self):
+        # Step-shaped YAML inside a `run: |` block scalar — a heredoc writing a
+        # workflow file — is text, not a step. Its `- …` line must not resolve
+        # to step bounds and credit the "guard" it quotes.
+        heredoc = (
+            "      - name: Write a workflow fixture\n"
+            "        run: |\n"
+            "          cat > wf.yml <<'EOF'\n"
+            "          - name: guard\n"
+            "            env:\n"
+            "              WORKFLOWS_REF: ${{ inputs.workflows_ref }}\n"
+            '            run: [ -z "$WORKFLOWS_REF" ] && exit 1\n'
+            "          EOF\n"
+        )
+        self.assertEqual(len(self._jobs(heredoc + self.CHECKOUT)), 1)
+
+    def test_a_marker_line_env_block_still_binds_an_alias(self):
+        # `- env:` written marker-first must feed alias discovery too — it is
+        # the one path deciding whether a later `ref: ${{ env.<name> }}` is
+        # SEEN as a ref use at all, so missing the spelling is a silent pass,
+        # not a loud one.
+        steps = (
+            "      - env:\n"
+            "          ASSET_REF: ${{ inputs.workflows_ref }}\n"
+            "        run: echo ok\n"
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ env.ASSET_REF }}\n"
+        )
+        self.assertEqual(len(self._jobs(steps)), 1)
+
+    def test_a_marker_line_env_block_binds_only_its_own_members(self):
+        # The block's boundary is the KEY's column: the step's other keys sit
+        # one level shallower than the env members, and reading them as block
+        # members would bind `ref` itself as an alias — making `env.ref` and
+        # `$ref` anywhere read as the input.
+        steps = (
+            "      - env:\n"
+            "          ASSET_REF: ${{ inputs.workflows_ref }}\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ inputs.workflows_ref }}\n"
+        )
+        lines = self._wrap(steps).split("\n")
+        self.assertEqual(cwp.env_aliases(lines), frozenset({"ASSET_REF"}))
+
+    def test_a_dash_with_only_trailing_whitespace_declares_no_key(self):
+        # `- ` followed by nothing is the bare marker wearing trailing
+        # whitespace: no key sits on it, so there is no marker width to
+        # recover — the contract `_marker_width` documents for the bare `-`.
+        self.assertEqual(cwp._marker_width("      - "), 0)
+        self.assertEqual(cwp._marker_width("      -"), 0)
+
     # ------------------------------------------------------------------
     # The resolve-then-consume shape (BE-8130). A job that must NEVER fail
     # cannot run the fail-closed guard — an `exit 1` would fail it — so it
@@ -1184,6 +1271,73 @@ class GuardCoverageTests(unittest.TestCase):
             self._jobs(self.MARKER_ENV_RESOLVER + self._step_output_checkout(self.EXACT_IF)),
             [],
         )
+
+    # The binding in FLOW form. While a fail-closed resolver could stand in
+    # for the consumer's `if:`, reading this as absent failed loudly; with
+    # that exemption gone, absence means the step is never registered and its
+    # consumer is never judged at all — a silent pass.
+    FLOW_ENV_RESOLVER = (
+        "      - name: Resolve the asset ref\n"
+        "        id: resolve_ref\n"
+        "        continue-on-error: true\n"
+        '        env: {WORKFLOWS_REF: "${{ inputs.workflows_ref || job.workflow_sha }}"}\n'
+        "        run: |\n"
+        '          echo "ref=$WORKFLOWS_REF" >> "$GITHUB_OUTPUT"\n'
+    )
+    # …and flow form ON the marker line — both marker-first spellings of the
+    # same registration path.
+    MARKER_FLOW_ENV_RESOLVER = (
+        '      - env: {WORKFLOWS_REF: "${{ inputs.workflows_ref || job.workflow_sha }}"}\n'
+        "        id: resolve_ref\n"
+        "        continue-on-error: true\n"
+        "        run: |\n"
+        '          echo "ref=$WORKFLOWS_REF" >> "$GITHUB_OUTPUT"\n'
+    )
+
+    def test_a_flow_env_resolver_is_registered(self):
+        lines = self._wrap(self.FLOW_ENV_RESOLVER + self._step_output_checkout()).split("\n")
+        binding = next(i for i, l in enumerate(lines) if "WORKFLOWS_REF:" in l)
+        self.assertEqual(cwp._binding_step_id(lines, binding), "resolve_ref")
+        self.assertEqual(len(cwp.find_unguarded_ref_checkouts(lines)), 1)
+
+    def test_a_flow_env_resolver_with_the_exact_if_passes(self):
+        self.assertEqual(
+            self._jobs(self.FLOW_ENV_RESOLVER + self._step_output_checkout(self.EXACT_IF)), []
+        )
+
+    def test_a_marker_line_flow_env_resolver_is_registered(self):
+        lines = self._wrap(
+            self.MARKER_FLOW_ENV_RESOLVER + self._step_output_checkout()
+        ).split("\n")
+        binding = next(i for i, l in enumerate(lines) if "WORKFLOWS_REF:" in l)
+        self.assertEqual(cwp._binding_step_id(lines, binding), "resolve_ref")
+        self.assertEqual(len(cwp.find_unguarded_ref_checkouts(lines)), 1)
+
+    # The consumer whose FIRST key is the flow `with:`, written on the marker.
+    MARKER_FLOW_CONSUMER = (
+        '      - with: {ref: "${{ steps.resolve_ref.outputs.ref }}"}\n'
+        "        uses: actions/checkout@abc\n"
+    )
+
+    def test_a_marker_first_flow_consumer_is_not_credited_with_a_neighbours_if(self):
+        # The never-fail idiom's first checkout carries the exact `if:`; a
+        # second checkout written marker-first must not inherit it. The old
+        # shifted-retry path stopped its backward scan at the PREVIOUS step's
+        # marker and answered with bounds covering that step — whose `if:` is
+        # exactly the shape this consumer lacks.
+        steps = (
+            self.RESOLVER
+            + self._step_output_checkout(self.EXACT_IF)
+            + self.MARKER_FLOW_CONSUMER
+        )
+        self.assertEqual(len(self._jobs(steps)), 1)
+
+    def test_a_marker_first_flow_consumer_with_its_own_if_passes(self):
+        covered = self.MARKER_FLOW_CONSUMER.replace(
+            "        uses: actions/checkout@abc\n",
+            self.EXACT_IF + "        uses: actions/checkout@abc\n",
+        )
+        self.assertEqual(self._jobs(self.RESOLVER + covered), [])
 
     def test_a_hard_guard_resolver_with_the_exact_if_passes(self):
         # The sound composition still works: the consumer's own `if:` covers

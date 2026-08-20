@@ -226,9 +226,11 @@ checkout — block (`ref: ${{ … }}`), flow (`with: {…, ref: "${{ … }}"}`),
 value carried on the following line (`ref: >-`, `ref: |`, or a bare `ref:`).
 They are one checkout to Actions, so a detector that knows only one of them
 reports an unguarded job as clean. Do not "simplify" the extra patterns away.
-The guard's own signature is matched in block form **only**, deliberately: a
-guard written in flow style reads as ABSENT and fails loudly, which is the right
-bias for a check whose whole job is noticing an absence.
+The guard's binding is matched in both block and flow form (`env:
+{WORKFLOWS_REF: …}`). Flow used to be read as ABSENT on purpose — loud, and the
+right bias for noticing an absence — but once resolver *registration* rode on
+the same match (BE-8221), absence stopped being loud: an unregistered resolver
+means its consumer's step-output checkout is never judged at all.
 
 `KNOWN_EXEMPT` in the script carries workflows with the same debt that are
 tracked under their own ticket. It is **empty today** — `pr-size.yml`, its last
