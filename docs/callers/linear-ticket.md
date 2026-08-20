@@ -227,7 +227,7 @@ Your ruleset's check picker will offer both of these:
 | ✅ | `Linear ticket` | the commit status this reusable publishes on the PR head SHA |
 | ❌ | `Linear Ticket / validate` | the validator's own job, which runs on your DEFAULT branch |
 
-They differ only by capitalisation and the ` / validate` suffix, so read carefully. Requiring the
+They differ only by capitalisation and the `/ validate` suffix, so read carefully. Requiring the
 job instead of the status is the classic mistake here: the job is not tied to the PR's head
 commit, so the requirement is never satisfied on the PR and every merge hangs pending.
 
