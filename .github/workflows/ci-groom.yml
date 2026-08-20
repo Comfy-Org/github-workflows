@@ -61,11 +61,11 @@ name: CI - Groom
 #     human who used to apply that label.
 #
 # So this caller needs NO authorship gate on a job holding *repo write*
-# (one caller needed one because its CI executes PR-supplied code while this
-# repo's groom surface is pure lint). If a workflow that holds write
-# authority — repo, cloud, or publish — ever starts EXECUTING the PR's own
-# scripts, that conclusion dies with it and this caller goes back to
-# `builder: false`.
+# (one caller needed one because its CI executes PR-supplied code while
+# holding deploy creds; no job here holds repo write while executing the
+# PR's code). If a workflow that holds write authority — repo, cloud, or
+# publish — ever starts EXECUTING the PR's own scripts, that conclusion
+# dies with it and this caller goes back to `builder: false`.
 #
 # WHAT THE BUILDER CAN ACTUALLY PR IN THIS REPO — less than you would guess, by
 # design. The patch-path policy (BE-4404, `.github/groom/patch_policy.py`) denies
