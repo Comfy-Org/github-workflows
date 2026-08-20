@@ -69,7 +69,7 @@ contents: read
 | `exclude_tests` | `false` | Keep test-file lines out of the count — cap production code, not coverage. Always reported separately. |
 | `comment` | `true` | Sticky bot comment explaining an overage. |
 | `bot_app_id` | `''` | Without it, degrades to status + step summary. |
-| `workflows_ref` | `main` | **Set to your `uses:` SHA** — the tool is built from this ref. |
+| `workflows_ref` | — (**required**) | Pin to the SAME full commit SHA as `uses:`. No default on purpose; the run fails fast (`Require a pinned workflows_ref` step) if omitted or empty. The `check-pr-size` tool is built from this ref. |
 
 ## Gotchas
 

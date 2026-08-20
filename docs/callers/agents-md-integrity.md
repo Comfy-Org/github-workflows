@@ -66,7 +66,7 @@ contents: read
 | `require_shim` | `true` | A root `CLAUDE.md` shim must **exist** (and import `@AGENTS.md`). `false` still rejects a divergent `CLAUDE.md`, but tolerates its absence. |
 | `require_codeowners` | `false` | Require a CODEOWNERS DRI for `AGENTS.md`. |
 | `agents_file` | `AGENTS.md` | Override the filename. |
-| `workflows_ref` | `main` | **Set to your `uses:` SHA** — the checker script loads from this ref. |
+| `workflows_ref` | — (**required**) | Pin to the SAME full commit SHA as `uses:`. No default on purpose; the run fails fast (`Require a pinned workflows_ref` step) if omitted or empty. The checker script loads from this ref. |
 
 ## The `CLAUDE.md` shim
 
