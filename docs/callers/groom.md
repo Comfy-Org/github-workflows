@@ -58,7 +58,8 @@ jobs:
       actions: read   # the interval gate reads run history for the last real run
     uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@<full-commit-sha>
     with:
-      workflows_ref: <same-full-commit-sha>
+      # No workflows_ref: the briefs + ledger auto-load from the same commit
+      # this `uses:` pin resolves to. Set it only to test briefs from a branch.
       bot_app_id: ${{ vars.APP_ID }}
       # Cadence knob + the matching volume-gate window (BE-4004). Wire both to
       # one repo Actions variable so they can't drift: retune weekly ->
@@ -95,8 +96,8 @@ rejects the run with "requesting 'actions: read', but is only allowed
 
 ## Inputs
 
-All are optional to GitHub's startup validator, but treat `workflows_ref` as
-required — see its row. The ones that matter:
+All are optional — including `workflows_ref`, which is the one input you should
+deliberately leave alone (see its row). The ones that matter:
 
 | Input | Default | Why you'd change it |
 |---|---|---|
@@ -108,7 +109,7 @@ required — see its row. The ones that matter:
 | `model` | `claude-opus-5` | The finder/verifier model. |
 | `themes` | `duplication, inconsistent patterns, missing abstractions, complexity hotspots, dead code` | Steer the finder at particular kinds of cleanup. The default mirrors the finder brief's own five dimensions, so it is a no-op; **narrow** it (e.g. `duplication, dead code`) to focus a repo. Security/auth-adjacent findings are filed regardless of theme. |
 | `scope_label` / `scope_desc` | `whole-repo` | Cosmetic labels for the scope in issue bodies. |
-| `workflows_ref` | `main` | **Treat as required: set to your `uses:` SHA.** Briefs load from this ref at run time — a caller that SHA-pins `uses:` but leaves this at `main` still runs unreviewed HEAD briefs. |
+| `workflows_ref` | `''` (auto: `job_workflow_sha`) | **Leave it unset.** Unlike the other workflows here, groom derives it: the briefs + ledger are checked out from `github.job_workflow_sha` — the exact commit your `uses:` pin resolves to — so they always match the logic running them. Set it only to override that (e.g. test briefs from a branch), in which case it must equal your `uses:` SHA. |
 | `bot_app_id` | `''` | File as your App rather than `github-actions[bot]`. |
 | `builder` | `false` | Opt into PR-writing — see below. |
 | `max_prs` | `'5'` | Only with `builder: true`. Typed **string**, deliberately. |
@@ -155,12 +156,16 @@ declares `concurrency: groom-${{ github.repository }}` with
 Duplicating that group **deadlocks the run**: your caller holds the group while
 its `uses:` job waits for the same group, and neither yields until timeout.
 
-**Keep `workflows_ref` in lock-step with `uses:`.** The finder and verifier briefs
-and the dedup ledger load from `workflows_ref` while running. Left at the default
-`main`, a SHA-pinned caller runs an old workflow against today's briefs.
+**There is no second pin to keep in sync.** The finder and verifier briefs and the
+dedup ledger load from `github.job_workflow_sha` — the commit your `uses:` pin
+resolves to — so bumping `uses:` moves the assets with it and a run always loads
+the briefs matching the workflow that files them. Omit `workflows_ref` and there
+is nothing that can drift.
 
-**Bump the pin and `workflows_ref` together.** The two must agree, so a run always
-loads the briefs matching the workflow that files them.
+**If you do set `workflows_ref`, it is on you to keep it in lock-step.** The
+override wins over the derived ref, so a stale value runs today's workflow
+against yesterday's briefs — the drift the default exists to prevent. Use it for
+a branch test, then take it back out.
 
 ## Before you trust the schedule
 

@@ -46,10 +46,11 @@ was fine yesterday fails with an opaque "workflow file issue" and zero jobs. If
 the answer is yes, bump the major tag (`v1` → `v2`) and let callers opt in.
 
 **2. Does it change assets loaded at run time?** Several workflows fetch prompts,
-briefs, or checker scripts from `workflows_ref` while running. A caller that
-pins `uses:` to a SHA but leaves `workflows_ref: main` will mix your new assets
-with its old workflow. When you change assets and workflow together, say so in
-the PR body so callers bump both.
+briefs, or checker scripts from `workflows_ref` while running. That input is
+required with no default (`groom.yml` excepted — it derives the ref from the
+caller's `uses:` pin), so a caller that bumps `uses:` and leaves `workflows_ref:`
+behind mixes your new workflow with its old assets. When you change assets and
+workflow together, say so in the PR body so callers bump both.
 
 ## Adding a new reusable workflow
 

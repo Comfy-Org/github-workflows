@@ -50,7 +50,8 @@ jobs:
     with:
       cadence: 7
       interval_days: 7
-      workflows_ref: <same-full-commit-sha>   # see "Pinning" — do not leave this at main
+      # No workflows_ref: groom derives it from the `uses:` pin — see "Pinning".
+      # Every OTHER workflow here requires it, set to the same SHA as `uses:`.
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 ```
@@ -114,22 +115,40 @@ validation in CI (`pinact`, `zizmor`) **will fail** a bare tag.
 ### `workflows_ref` must match your pin
 
 Several workflows load assets — agent briefs, review prompts, checker scripts —
-from a ref **at run time**, controlled by the `workflows_ref` input. In every
-case, set it to the **same SHA** as your `uses:` pin.
+from a ref **at run time**, controlled by the `workflows_ref` input. The ref the
+assets come from must be the **same commit** as your `uses:` pin — otherwise the
+workflow is pinned and the code it runs is not.
 
-- `groom`, `cursor-review`, `pr-size`, `agents-md-integrity` default it to
-  `main`. That default means a caller pinned to a SHA runs **old workflow +
-  newest assets** — usually harmless, occasionally not, and always confusing.
-- `pr-risk`, `pr-derisk`, `refresh-reviewers`, and `linear-ticket` make it
-  **required with no default** and reject any value that is not a full commit SHA
-  of this repo *before* checkout, so an omitted or mismatched ref fails the run
-  rather than silently loading `main`. There is nothing to "leave at `main`" —
-  you must pass the `uses:` SHA.
+Every workflow that takes the input, `groom` excepted, makes it **required with
+no default** —
+`cursor-review`, `pr-size`, `agents-md-integrity`, `coderabbit-config-validate`,
+`refresh-reviewers`, `pr-risk`, `pr-derisk`, `pr-area-label` and `linear-ticket`.
+There is no `main` to "leave" it at: GitHub does not enforce `required:` for
+`workflow_call` inputs, so each of them re-checks it at run time: an omitted or
+empty value fails the run with an actionable
+`::error::workflows_ref is required…` instead of letting `actions/checkout`
+silently fall back to this repo's default branch. Two tiers of checking on the
+value itself:
 
-Either way, set it explicitly to the same SHA:
+- `cursor-review`, `pr-size`, `agents-md-integrity`, `coderabbit-config-validate`
+  and `refresh-reviewers` accept any non-empty ref, and `::warning::` a value
+  that is not a full 40-hex commit SHA (branches and tags are mutable and can
+  skew between jobs mid-run).
+- `pr-risk`, `pr-derisk`, `pr-area-label` and `linear-ticket` **reject** it
+  before checkout unless it is a full 40-hex lowercase SHA *and* an ancestor of
+  this repo's `main` — so a branch, a tag, a `refs/pull/N/head` and any
+  not-yet-merged SHA all fail. Merge the change here first, then bump the pin.
+
+`groom` is the single exception, and it wants the input **left unset**: its
+briefs and ledger are checked out from `github.job_workflow_sha`, the exact
+commit your `uses:` pin resolved to, so they always match the logic running them
+and there is nothing to keep in sync. Set it only to override that (e.g. test
+briefs from a branch), in which case it must equal your `uses:` SHA.
+
+Everywhere else, set it explicitly to the same SHA:
 
 ```yaml
-uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@07154fb…
+uses: Comfy-Org/github-workflows/.github/workflows/cursor-review.yml@07154fb…
 with:
   workflows_ref: 07154fb…   # keep in lock-step with the uses: SHA above
 ```
