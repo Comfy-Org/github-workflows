@@ -107,8 +107,11 @@ anything that is not a merged full 40-hex SHA of this repo). The guards are
 per-job, so a skipped job never evaluates one. `groom.yml` is the one workflow
 that does not require the input: an omitted value falls back to
 `job.workflow_sha` — the commit the caller's `uses:` pin resolved to — so
-leaving it unset is safe, and every one of those jobs still fails closed on an
-empty ref (`job.workflow_sha` needs an Actions runner ≥ v2.334.0). BE-4169
+leaving it unset is safe, and every job that checks out the briefs and scripts
+fails closed on an empty ref (`job.workflow_sha` needs an Actions runner
+≥ v2.334.0). The agent CLI pin is the deliberate exception: it reads
+`ref: ${{ job.workflow_sha }}` alone and only warns, so on an older runner it
+reads that one manifest from the default branch instead of failing the run. BE-4169
 originally spelled that fallback `github.job_workflow_sha`, which is an OIDC
 token claim rather than a `github` context property: it expanded to `''` and
 checkout took the default branch. BE-8077 moved all seven groom checkouts, and

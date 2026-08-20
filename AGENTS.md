@@ -97,8 +97,9 @@ tests — run the matching command above for whatever you touched.
   and rewrites just the reviewer lists for a drift PR. Tests in `tests/`.
 - `.github/workflow-pins/` — `check_workflow_pins.py` + `tests/`: the lint
   forbidding a `default:` on `workflows_ref` and requiring the empty-ref guard
-  at every checkout, with an exception for the `job.workflow_sha` self-pin
-  (BE-4169/BE-8077, see below).
+  at every checkout. The `job.workflow_sha` self-pin is exempt from the
+  `default:` half only — it stops the ref being MUTABLE, not being EMPTY, so it
+  still has to carry a guard (BE-4169, corrected by BE-8077; see below).
 - `.github/bump-callers/` — `bump-callers.sh`, the ONE fleet-agnostic script
   that opens SHA-bump PRs in consumer repos when a reusable workflow changes,
   plus `preflight.sh` (BE-6475), the ONE staleness/decommission guard that runs

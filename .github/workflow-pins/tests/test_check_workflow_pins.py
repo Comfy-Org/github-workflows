@@ -681,54 +681,112 @@ class GuardCoverageTests(unittest.TestCase):
             frozenset({"WORKFLOWS_REF"}),
         )
 
-    def test_an_alias_of_the_fallback_carries_the_fallback_STRENGTH(self):
-        # Registering the alias only kept the checkout VISIBLE. Strength was
-        # still read off the literal `ref:` line, which `ref: ${{ env.WORKFLOWS_REF }}`
-        # can never satisfy — so the blessed hoist scored BARE and was reported
-        # unguarded against a fallback guard, with BE-5546's message on it. The
-        # end-to-end lint is the assertion; `env_aliases()` alone said nothing
-        # about this.
+    def test_an_env_alias_NEVER_earns_the_self_pin_exemption(self):
+        # Carrying the binding's strength to `ref: ${{ env.NAME }}` was tried
+        # and reverted: `env:` is scoped per step and per job and it SHADOWS,
+        # while these scans are file-wide, so a file-wide "names bound to the
+        # fallback" set granted the exemption at checkouts the binding never
+        # reaches. This fixture is the counterexample that killed it — the
+        # binding lives in the GUARD step's `env:`, which is invisible to the
+        # sibling checkout step at run time, so `${{ env.WORKFLOWS_REF }}`
+        # expands to '' and takes the default branch. It scored a guarded
+        # self-pin. An alias is judged BARE now, so a fallback guard does not
+        # cover it and the checkout is reported.
         aliased = (
             "      - name: Load assets\n"
             "        uses: actions/checkout@abc\n"
             "        with:\n"
             "          ref: ${{ env.WORKFLOWS_REF }}\n"
         )
-        self.assertEqual(self._jobs(self.GUARD_WITH_FALLBACK + aliased), [])
         lines = self._wrap(self.GUARD_WITH_FALLBACK + aliased).split("\n")
-        self.assertEqual(
-            cwp.fallback_env_aliases(lines),
-            frozenset({"WORKFLOWS_REF"}),
-        )
-        self.assertTrue(
+        self.assertFalse(
             any(fb for _, fb, _ in cwp.ref_checkouts(lines)),
-            "the aliased checkout should read as a self-pin",
+            "an env alias must never read as a self-pin",
         )
+        self.assertEqual(len(self._jobs(self.GUARD_WITH_FALLBACK + aliased)), 1)
+        # …and a BARE guard, which proves the input itself is non-empty, does
+        # cover it. That is the correct answer, and the one left standing.
+        self.assertEqual(self._jobs(self.GUARD + aliased), [])
 
-    def test_an_alias_of_a_MUTABLE_binding_does_not_carry_strength(self):
-        # The strict half of the pair. `fallback_env_aliases` grants an
-        # exemption, so unlike `env_aliases` it must fail CLOSED: a name bound
-        # to anything but the exact two-operand fallback is a bare checkout.
-        for binding in (
-            "${{ inputs.workflows_ref || 'main' }}",
-            "${{ inputs.workflows_ref }}",
-            "${{ inputs.workflows_ref || job.workflow_sha || 'main' }}",
-        ):
-            lines = (
-                "jobs:\n"
-                "  check:\n"
-                "    steps:\n"
+    def test_a_mutable_step_local_binding_inherits_nothing(self):
+        # The other direction of the same file-wide bug: a step-local
+        # `WORKFLOWS_REF: ${{ inputs.workflows_ref || 'main' }}` inherited
+        # fallback strength from any OTHER step binding that name strictly.
+        # cursor-review.yml binds `WORKFLOWS_REF` both ways today, so this was
+        # not hypothetical.
+        mixed = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        env:\n"
+            "          WORKFLOWS_REF: ${{ inputs.workflows_ref || 'main' }}\n"
+            "        with:\n"
+            "          ref: ${{ env.WORKFLOWS_REF }}\n"
+        )
+        lines = self._wrap(self.GUARD_WITH_FALLBACK + mixed).split("\n")
+        self.assertFalse(any(fb for _, fb, _ in cwp.ref_checkouts(lines)))
+        self.assertEqual(len(self._jobs(self.GUARD_WITH_FALLBACK + mixed)), 1)
+
+    def test_the_leading_operand_has_to_reach_the_input(self):
+        # A guard proves the INPUT is non-empty; it says nothing about an
+        # expression that never reaches the input. GitHub's `||` returns the
+        # first TRUTHY operand, so both of these mention the input (so they are
+        # ref uses, and clear the guard) while resolving to a mutable ref on
+        # every runner. The literal form needs no second input declaration at
+        # all — which is why the earlier "unreachable without another input"
+        # deferral of this was wrong.
+        for ref in ("${{ 'main' || inputs.workflows_ref }}",
+                    "${{ inputs.override || inputs.workflows_ref }}"):
+            checkout = (
                 "      - name: Load assets\n"
-                "        env:\n"
-                "          WORKFLOWS_REF: %s\n"
                 "        uses: actions/checkout@abc\n"
                 "        with:\n"
-                "          ref: ${{ env.WORKFLOWS_REF }}\n" % binding
-            ).split("\n")
-            self.assertEqual(cwp.fallback_env_aliases(lines), frozenset(), binding)
-            self.assertFalse(
-                any(fb for _, fb, _ in cwp.ref_checkouts(lines)), binding
+                "          ref: %s\n" % ref
             )
+            self.assertEqual(len(self._jobs(self.GUARD + checkout)), 1, ref)
+
+    def test_the_leading_operand_check_accepts_the_legitimate_shapes(self):
+        # The narrowing must not fire on anything this module works to accept.
+        for ref in ("${{ inputs.workflows_ref }}",
+                    "${{ inputs.workflows_ref || job.workflow_sha }}",
+                    "${{ env.WORKFLOWS_REF }}"):
+            checkout = (
+                "      - name: Load assets\n"
+                "        uses: actions/checkout@abc\n"
+                "        with:\n"
+                "          ref: %s\n" % ref
+            )
+            self.assertEqual(self._jobs(self.GUARD + checkout), [], ref)
+
+    def test_a_quoted_sibling_cannot_plant_a_decoy_ref(self):
+        # The flow matcher `search`es mid-line, so its `[{,]` boundary can be
+        # met by a comma INSIDE a quoted scalar — planting a `ref:` that scores
+        # the line a self-pin while the real `ref:` on it is bare, which buys
+        # the weaker fallback-guard requirement and the `default: ''` carve-out.
+        decoy = (
+            "  with: {ref: '${{ inputs.workflows_ref }}', "
+            "path: \"x, ref: ${{ inputs.workflows_ref || job.workflow_sha }}, y\"}"
+        )
+        self.assertFalse(cwp._pins_to_job_workflow_sha(decoy))
+        # …while a real flow-form fallback, quoted or not, still counts.
+        self.assertTrue(cwp._pins_to_job_workflow_sha(
+            "  with: {repository: a/b, ref: ${{ inputs.workflows_ref || job.workflow_sha }}}"
+        ))
+        self.assertTrue(cwp._pins_to_job_workflow_sha(
+            "  with: {ref: '${{ inputs.workflows_ref || job.workflow_sha }}', x: 1}"
+        ))
+
+    def test_a_comment_does_not_bind_an_env_alias(self):
+        # The widened `_ENV_ALIAS_RE` matches any value mentioning the input, so
+        # unstripped it became the one place in the module reading a comment as
+        # code — failing a compliant workflow whose unrelated `env:` value
+        # merely mentions the input in prose.
+        lines = self._wrap(
+            "      - name: x\n"
+            "        env:\n"
+            "          GROOM_ASSETS: _groom_assets  # checked out at inputs.workflows_ref\n"
+            "        run: echo hi\n"
+        ).split("\n")
+        self.assertEqual(cwp.env_aliases(lines), frozenset())
 
     def test_an_unrecognized_env_binding_still_counts_as_reaching_the_input(self):
         # Enumerating blessed spellings made an unrecognized one fail OPEN:

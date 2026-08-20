@@ -112,38 +112,55 @@ Three things make that enforceable, and each was a hole on its own:
   default" while its checkouts got BE-8077's "the fallback IS recognized". It
   was also quadratic — a full alias scan per line, on a 3,000-line groom.yml.
 
-`env_aliases` and `fallback_env_aliases` are a deliberately mismatched pair,
-because they answer questions that fail in opposite directions:
+**`env:` aliases are recognized as ref USES, never as self-pins.** The two
+questions fail in opposite directions, so they get opposite answers:
 
-- `env_aliases` — "does this `env:` binding REACH the input?" — matches **any**
-  value mentioning `inputs.workflows_ref`. Enumerating blessed spellings made an
+- *Does this `env:` binding reach the input?* — `env_aliases` matches **any**
+  value mentioning `inputs.workflows_ref` (comment-stripped, so prose in an
+  unrelated value cannot bind a name). Enumerating blessed spellings made an
   unrecognized one fail *open*: `WORKFLOWS_REF: ${{ inputs.workflows_ref ||
   'main' }}` registered no alias, so `ref: ${{ env.WORKFLOWS_REF }}` read as no
   ref use at all and left the lint entirely, carrying the exact mutable fallback
   the lint exists to catch. Over-approximating here can only ever *demand* a
   guard.
-- `fallback_env_aliases` — "is this binding the immutable fallback?" — matches
-  only the exact two-operand spelling, because it grants an *exemption*. That
-  strength then travels to every `ref: ${{ env.NAME }}` reading the name.
-  Without it the alias was registered but scored **bare**, so the hoist below
-  was reported as an unguarded bare checkout with BE-5546's message on it.
+- *Is this ref the immutable self-pin?* — judged from the **literal expression
+  on the checkout line**. An alias never qualifies, so `ref: ${{ env.NAME }}`
+  always needs a **bare** guard.
 
-So hoisting that seven-times duplicated binding to a shared `env:` and checking
-out at `ref: ${{ env.WORKFLOWS_REF }}` — the refactor the alias machinery exists
-to survive — keeps both its coverage and its strength.
+Carrying an alias binding's strength to the checkout was tried and reverted.
+`env:` is scoped per step and per job and it *shadows*, while these scans are
+file-wide, so a file-wide "names bound to the fallback" set granted the
+exemption at checkouts the binding never reaches — in both directions. A
+binding in a *guard step's* `env:` is invisible to the sibling checkout step at
+run time, so `ref: ${{ env.NAME }}` there expands to `''` and takes the default
+branch while scoring as a guarded self-pin; and a step-local
+`WORKFLOWS_REF: ${{ inputs.workflows_ref || 'main' }}` inherited fallback
+strength from any *other* step binding that name strictly. `cursor-review.yml`
+binds `WORKFLOWS_REF` both ways today (line 420 with the fallback, six more
+without), so that cross-talk was not hypothetical.
 
-**Keep that `env:` at STEP level.** The `job` context is not available in
-`jobs.<job_id>.env`, so a job-level hoist of the *fallback* spelling is not a
-refactor the lint mislints — it is an invalid workflow. Verified with
-`actionlint` 1.7.12 on `${{ job.status }}` (a `job` property its schema does
-know, isolating context availability from the `job.workflow_sha` staleness
-noted next): rejected at job level with *"context "job" is not allowed here"*,
-accepted at step level. All seven of groom.yml's bindings are step-level today.
-A job-level `env:` may still bind the **bare** input — `env_aliases` registers
-it and the checkouts below it then need a bare guard, which is the correct
-answer. (`actionlint` ≤ 1.7.12 also false-positives on `job.workflow_sha`
-itself, whose `job`-context schema predates runner v2.334.0; no CI here runs
-it.)
+**The fallback cannot be hoisted to a shared `env:` at all**, so there is no
+refactor left for strength propagation to serve. The `job` context is not
+available in `jobs.<job_id>.env` — verified with `actionlint` 1.7.12 on
+`${{ job.status }}`, a `job` property its schema *does* know, which isolates
+context availability from the `job.workflow_sha` staleness noted below:
+rejected at job level with *"context \"job\" is not allowed here"*, accepted in
+a step's `env:`. And a step-level `env:` does not reach a sibling step. So
+groom.yml's seven duplicated bindings are duplicated of necessity. A job-level
+`env:` may still bind the **bare** input; the checkouts below it are then
+required to carry a bare guard, which is the correct answer.
+(`actionlint` ≤ 1.7.12 also false-positives on `job.workflow_sha` itself, whose
+`job`-context schema predates runner v2.334.0; no CI here runs it.)
+
+**The leading operand has to reach the input.** A guard proves the *input* is
+non-empty; it says nothing about an expression that never reaches the input.
+GitHub's `||` returns the first **truthy** operand, so
+`ref: ${{ 'main' || inputs.workflows_ref }}` mentions the input — making it a
+ref use that clears the guard — while resolving to a mutable branch on every
+runner, with no second input declaration involved. `check_dir` cannot see it
+either; it reads only `workflows_ref`'s own `default:`. So the first `||`
+operand of the ref expression must reach the input, or no guard in the job
+covers that checkout.
 
 The guard is copied inline into each consuming job rather than factored into a
 composite action **on purpose**: a composite would have to be loaded with
