@@ -241,6 +241,18 @@ func diffFiles(base, head string) ([]FileChange, error) {
 // that file counts raw — a failure can only make the cap STRICTER, never sneak a
 // large change under it. Restricts the patch to the counted paths, so a large
 // generated diff is never fetched or parsed.
+//
+// A RENAME contributes BOTH of its paths to that pathspec. Naming only the
+// destination hides the deletion side from the filtered diff, so git cannot pair
+// the rename and re-emits the destination as a whole-file ADDITION — every
+// blank/comment line in the file then counts as a discount, and the `d >
+// Changed()` clamp below drives the rename's Counted() to 0. That would silently
+// cancel classify()'s both-paths rename guard for any caller running with
+// --ignore-comments: `git mv handwritten/big.go gen/big.go` plus a large edit is
+// correctly classified non-generated and then discounted back down to nothing.
+// Discounts stay keyed by DESTINATION (idx holds f.Path only), matching the
+// paired diff's `+++` header; an unpaired old-path section finds no idx entry
+// and is skipped, so the file just counts raw.
 func annotateDiscounts(files []FileChange, base, head string) {
 	idx := make(map[string]*FileChange, len(files))
 	paths := make([]string, 0, len(files))
@@ -250,6 +262,9 @@ func annotateDiscounts(files []FileChange, base, head string) {
 			continue
 		}
 		paths = append(paths, f.Path)
+		if f.OldPath != "" {
+			paths = append(paths, f.OldPath)
+		}
 		idx[f.Path] = f
 	}
 	if len(paths) == 0 {
@@ -319,9 +334,11 @@ func attrTrusted(useSource, attrModified, bypass bool) bool {
 // regardless of policy, so the report can show the test total whether or not the
 // caller opted to exclude it.
 //
-// A RENAME is classified on BOTH its old and new path for every exclusion
-// bucket this function decides — lockfile, extra-generated glob, the
-// linguist-generated attribute, and test.
+// A RENAME is classified on BOTH its old and new path for every PATH- and
+// ATTRIBUTE-based exclusion bucket this function decides — lockfile,
+// extra-generated glob, the linguist-generated attribute, and test. (The
+// content-marker bucket is destination-only; see contentGenerated for why that
+// is not a rename hole.)
 // `git diff --numstat` books a rename's deletions against the destination, so
 // classifying on the destination alone would let e.g. `git mv src/big.go
 // tests/big.go` (or `git mv src/big.go go.sum`) charge removed PRODUCTION
@@ -332,6 +349,15 @@ func attrTrusted(useSource, attrModified, bypass bool) bool {
 // neither the size verdict nor the review panel.
 // Requiring both paths to agree keeps every one of these failures in the safe,
 // over-counting direction.
+//
+// KNOWN LIMIT of the both-paths rule: it can only be as good as git's rename
+// pairing, which an adversary with commit access to the base can bias. If the
+// generated tree already holds a file byte-identical at base to the one being
+// moved in, moving both in one PR lets the exact-rename phase pair the untouched
+// destination with the hand-written source, leaving the EDITED destination
+// paired with the in-tree generated source — both attribute-carrying, so the
+// edit is excluded again. It needs a same-content generated file planted at
+// base, so it is a documented residual, not the reported defect.
 //
 // Binary files are classified by the path- and attribute-based rules too (none
 // of those read content), so a binary lockfile or a binary matching an extra
@@ -472,6 +498,18 @@ func isUnknownFlagError(stderr string) bool {
 // code by prepending one comment line. Base-only means a file new in the PR
 // never matches the marker (it is counted and reviewed — conservative); files
 // generated at base stay excluded.
+//
+// Unlike classify's path/attribute buckets, this one reads the DESTINATION only,
+// and deliberately so — a rename grants no evasion here that an in-place edit
+// does not already grant. With markerFromBase (what --reviewed-diff-out sets) a
+// rename's destination does not exist at base, the show fails, and the bucket
+// returns false: it fails CLOSED, counting and reviewing the file. Without it,
+// the head read can be self-marked — but `git mv handwritten/big.go gen/big.go`
+// plus a pasted marker excludes exactly what pasting the marker into
+// handwritten/big.go in place already excludes, so the move adds nothing. That
+// residual is the accepted count-only tradeoff described above, not a rename
+// hole; the fix for it is --marker-from-base, which every evadability-sensitive
+// caller already passes.
 func contentGenerated(path, base, head string, markerFromBase bool) bool {
 	if !strings.HasSuffix(path, ".go") {
 		return false
