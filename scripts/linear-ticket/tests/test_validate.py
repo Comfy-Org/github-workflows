@@ -62,7 +62,7 @@ class ProtectedBaseBranch(unittest.TestCase):
     def validator(self, github):
         return validate.Validator(github, "token", [], True, True, False, "run-url")
 
-    def test_unprotected_base_skips_linear_and_publishes_success(self):
+    def test_unprotected_base_skips_linear_without_publishing_status(self):
         github = FakeGitHub(protected=False)
         validator = self.validator(github)
         validator._query_attachments = lambda _url: self.fail("Linear must not be queried")
@@ -70,8 +70,7 @@ class ProtectedBaseBranch(unittest.TestCase):
         self.assertEqual(validator.run(event()), 0)
 
         self.assertEqual(github.requested_branch, "release/next")
-        self.assertEqual([status[1] for status in github.statuses], ["pending", "success"])
-        self.assertIn("unprotected branch", github.statuses[-1][2])
+        self.assertEqual(github.statuses, [])
         self.assertEqual(github.deleted_comments, [17])
 
     def test_protected_base_runs_linear_validation(self):
@@ -96,7 +95,7 @@ class ProtectedBaseBranch(unittest.TestCase):
         validator._query_attachments = lambda _url: self.fail("Linear must not be queried")
 
         self.assertEqual(validator.run(event()), 1)
-        self.assertEqual([status[1] for status in github.statuses], ["pending"])
+        self.assertEqual(github.statuses, [])
 
     def test_retargeted_pr_does_not_publish_stale_terminal_status(self):
         github = FakeGitHub(protected=False)
@@ -105,7 +104,8 @@ class ProtectedBaseBranch(unittest.TestCase):
         validator._query_attachments = lambda _url: self.fail("Linear must not be queried")
 
         self.assertEqual(validator.run(event()), 0)
-        self.assertEqual([status[1] for status in github.statuses], ["pending"])
+        self.assertEqual(github.statuses, [])
+        self.assertEqual(github.deleted_comments, [])
 
 
 class BranchProtectionLookup(unittest.TestCase):

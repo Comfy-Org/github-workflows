@@ -17,8 +17,8 @@ matching this repo's Python convention.
 The **only** thing that turns the check green is an attachment Linear returns for the PR's
 canonical `html_url` (`attachmentsForURL`) whose issue satisfies policy — `filter_issues`.
 This invariant applies when the PR targets a protected branch; an unprotected target is outside
-the gate and passes without a Linear query. A `TEAM-123`-shaped string an author types is not a
-link. So:
+the gate and publishes no `linear-ticket` status or Linear query. A `TEAM-123`-shaped string an
+author types is not a link. So:
 
 - The PR URL is passed to Linear as a **GraphQL variable**, never interpolated into the query.
 - The policy reads the resolved issue's **API `team.key`** and **`state.type`**, never a
@@ -41,7 +41,9 @@ link. So:
 - The PR's current base branch is read from GitHub and its `protected` property determines
   whether the ticket gate applies. This covers any number of branches protected by classic
   branch protection or rulesets without a caller-maintained branch list. An unreadable
-  protection state fails closed.
+  protection state fails closed. An unprotected target publishes no commit status because
+  statuses are SHA-scoped rather than PR-scoped; publishing success could overwrite a protected
+  PR's failure when both PRs share a commit.
 - Before every terminal status write, the PR head SHA and base branch are **refetched**; if
   either changed, the run exits without publishing so a superseded validation can't overwrite
   a newer result. The base check matters when a retarget keeps the same head commit.

@@ -2,9 +2,10 @@ name: Linear Ticket (reusable)
 
 # Reusable gate that requires PRs targeting a protected branch to carry a Linear issue Linear
 # has LINKED to that exact PR before they can merge (design: pr-linear-ticket-enforcement).
-# PRs targeting an unprotected branch pass without querying Linear. The only thing that passes
-# the ticket gate is an attachment Linear returns for this PR's canonical html_url whose issue
-# meets the configured team/state policy — a `TEAM-123`-shaped string in author text never does.
+# PRs targeting an unprotected branch skip without querying Linear or publishing this context.
+# The only thing that passes the ticket gate is an attachment Linear returns for this PR's
+# canonical html_url whose issue meets the configured team/state policy — a `TEAM-123`-shaped
+# string in author text never does.
 #
 # TWO-STAGE, FORK-SAFE EXECUTION. This privileged validator is invoked by a caller that runs
 # on `workflow_run: completed` of an unprivileged, no-op signal workflow in the consumer repo.

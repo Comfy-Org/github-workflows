@@ -8,8 +8,8 @@ For a PR targeting a **protected base branch**, gates on a Linear issue that **L
 to that exact PR** — not merely a `TEAM-123`-shaped string in the branch, title, or body. The
 validator reads GitHub's `protected` property for the current base branch, so repositories can
 have any number of protected branches without duplicating a branch list in the caller. A PR
-targeting an unprotected branch receives a successful `linear-ticket` status without querying
-Linear.
+targeting an unprotected branch skips without querying Linear or publishing a `linear-ticket`
+status.
 
 For a protected branch, the only thing that turns the check green is an attachment Linear
 returns for the PR's canonical `html_url` (`attachmentsForURL`) whose issue satisfies the
@@ -202,7 +202,9 @@ against the workflow_run event and is not tied to the PR's merge check.
 
 **Protection is evaluated for the PR's current base branch.** GitHub's branch response reports
 protection from branch protection rules or rulesets. Retargeting a PR triggers a fresh run; an
-unprotected target gets a successful “not required” status and no Linear API query.
+unprotected target gets no `linear-ticket` status and no Linear API query. The status must be
+absent rather than successful because GitHub scopes commit statuses to a SHA, not a PR: success
+from an unprotected PR could otherwise overwrite failure on a protected PR sharing that commit.
 
 **A red check is not the same as a blocked merge.** What blocks is your ruleset requiring the
 `linear-ticket` context — nothing this workflow does. That is why warn-only can (and by default

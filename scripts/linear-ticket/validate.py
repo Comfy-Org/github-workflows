@@ -300,6 +300,15 @@ class Validator:
                 return 1
         return 0
 
+    def finish_not_required(self, base_branch: str) -> int:
+        if not self._guard_supersession():
+            return 0
+        summary("## linear-ticket: not required")
+        summary("")
+        summary(f"PR targets the unprotected `{base_branch}` branch.")
+        self.gh.delete_marker_comment(self.pr_number)
+        return 0
+
     def finish_fail(self, category: str, detail: str) -> int:
         guidance = lib.failure_guidance(category)
         outcome = lib.failure_outcome(category, self.enforce, self.soft_fail)
@@ -382,9 +391,6 @@ class Validator:
         author = (pr.get("user") or {}).get("login") or ""
 
         log(f"Validating PR #{self.pr_number} ({html_url}) at head {self.validated_sha}")
-        self.gh.publish_status(self.validated_sha, "pending",
-                               "Checking for a linked Linear issue…", self.run_url)
-
         if not base_branch:
             error(f"PR #{self.pr_number} has no base branch; refusing to validate.")
             return 1
@@ -395,10 +401,10 @@ class Validator:
             return 1
         if not protected:
             log(f"PR targets unprotected branch '{base_branch}' — Linear ticket not required.")
-            return self.finish_exempt(
-                f"PR targets the unprotected `{base_branch}` branch — the Linear-ticket "
-                "requirement does not apply.",
-                f"Not required for unprotected branch: {base_branch}")
+            return self.finish_not_required(base_branch)
+
+        self.gh.publish_status(self.validated_sha, "pending",
+                               "Checking for a linked Linear issue…", self.run_url)
 
         # Exemptions short-circuit before the Linear query. The actor allow-list is the
         # non-manual hatch for bot PRs (Dependabot/Renovate never carry a ticket); it is
