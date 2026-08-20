@@ -66,7 +66,7 @@ SELF_CONTEXT="${PR_RISK_SELF_CONTEXT:-}"
 SELF_RUN_ID="${PR_RISK_SELF_RUN_ID:-}"
 # How many 100-context pages of the check rollup to drain before giving up and leaving the PR
 # UNKNOWN. 30 pages = 3000 checks, the same ceiling GitHub puts on the REST changed-files
-# endpoint this script already accepts, and ~29x the largest rollup measured on Comfy-Org/cloud
+# endpoint this script already accepts, and ~29x the largest rollup measured on a live caller
 # (103). It is a runaway bound, not a policy: a rollup past it stays ungraded rather than being
 # graded off the pages that fit.
 MAX_ROLLUP_PAGES="${PR_RISK_MAX_ROLLUP_PAGES:-30}"

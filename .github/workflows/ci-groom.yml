@@ -22,8 +22,8 @@ name: CI - Groom
 # repo's full CI, and wait for a human — the reusable contains no `gh pr merge`
 # and enables auto-merge nowhere.
 #
-# WHY THAT IS SAFE *HERE* — the pre-review-CI question, asked the way the
-# comfy-infra caller had to ask it. "A human reads the PR first" gates the MERGE,
+# WHY THAT IS SAFE *HERE* — the pre-review-CI question, asked the way a
+# private caller had to ask it. "A human reads the PR first" gates the MERGE,
 # not CI EXECUTION: opening a PR runs this repo's checks against the PR's own
 # checkout before anyone has read the diff, so the real question is whether any
 # of those checks hold credentials. Audited 2026-08-08:
@@ -61,8 +61,8 @@ name: CI - Groom
 #     human who used to apply that label.
 #
 # So this caller needs NO authorship gate on a job holding *repo write*
-# (comfy-infra needed one because `tofu plan` executes PR-supplied code while
-# holding cloud creds; nothing here does). If a workflow that holds write
+# (one caller needed one because its CI executes PR-supplied code while this
+# repo's groom surface is pure lint). If a workflow that holds write
 # authority — repo, cloud, or publish — ever starts EXECUTING the PR's own
 # scripts, that conclusion dies with it and this caller goes back to
 # `builder: false`.

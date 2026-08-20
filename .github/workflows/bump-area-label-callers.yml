@@ -99,7 +99,7 @@ jobs:
           FILE_FILTER: .github/workflows/pr-area-label.yml
           # Hard-fail on an empty/missing roster once this fleet has live callers. Until the
           # first caller is enrolled the roster is legitimately empty, so start permissive and
-          # flip to "false" when comfy-infra (or the next repo) lands its caller.
+          # flip to "false" once the next caller repo lands its caller.
           ALLOW_EMPTY: "true"
           CALLERS_JSON: ${{ secrets.AREA_LABEL_CALLERS }}
         run: bash .github/bump-callers/bump-callers.sh

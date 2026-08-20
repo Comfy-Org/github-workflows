@@ -21,7 +21,7 @@ updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      # Monthly, matching the cloud repo's github-actions cadence. These are CI
+      # Monthly, matching the callers' github-actions cadence. These are CI
       # actions, not runtime dependencies; weekly churn here buys noise. Security
       # updates are advisory-driven and are NOT bound by this interval — they
       # arrive as their own ungrouped PRs (the groups below declare no
@@ -91,8 +91,8 @@ updates:
       # `owner:`-without-`repositories:` token: every bump-*-callers.yml run since
       # has 403'd with "Resource not accessible by integration" on `tree create`
       # for every caller repo, silently stranding every consumer on a stale pin.
-      # Verified against one repo across the boundary: cloud-code-bot[bot] wrote
-      # Comfy-Org/cloud at 23:03 on v1.12.0 and 403'd on the same repo, same token
+      # Verified against one repo across the boundary: the bump bot wrote one
+      # caller repo at 23:03 on v1.12.0 and 403'd on the same repo, same token
       # config, on v3.2.0. Neither the v2.0.0 nor the v3.0.0 release notes document
       # a scoping change, so this is pinned by evidence, not by changelog.
       #

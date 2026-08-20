@@ -67,7 +67,7 @@ with their top contributors — candidates for new rules, never auto-added.
 
 | knob | default | rationale |
 |---|---|---|
-| `window_months` | 12 | Long enough to cover slow-moving subsystems; validated in BE-4114 against cloud history. |
+| `window_months` | 12 | Long enough to cover slow-moving subsystems; validated in BE-4114 against a caller repo's history. |
 | `half_life_days` | 90 | The decay is what correctly aged out stale expertise (e.g. inference contributors who had moved on); 90d matched observed team reality where flat counts did not. |
 | `top_k` / `floor` | 4 / 2 | Enough experts to load-balance across without piling every rule onto the same two people. |
 | `min_touches` / `min_score` | 5 / 1.5 | Filters drive-by contributors: one huge recent commit is not sustained expertise. |

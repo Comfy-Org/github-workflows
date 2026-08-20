@@ -313,7 +313,7 @@ esac
 
 echo "— phase 20: a check rollup deeper than one page is DRAINED, not abandoned —"
 # GraphQL caps ANY connection page at 100, so a rollup with more checks than that came back
-# `hasNextPage: true` and the whole PR graded UNKNOWN. Measured on Comfy-Org/cloud: an ordinary
+# `hasNextPage: true` and the whole PR graded UNKNOWN. Measured on a live caller: an ordinary
 # code PR carries 103 checks and graded `risk:ungraded`, while the enrollment PR (66 checks)
 # graded fine — so the bug was invisible until real traffic hit it, and the busier a repo's CI
 # the more of it went ungraded.
