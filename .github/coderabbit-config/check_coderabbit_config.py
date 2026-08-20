@@ -27,6 +27,12 @@ class of problem rather than what a schema library calls "invalid":
     just not a file-rejecting one. `--strict-unknown-keys` escalates it to a
     failure for a repo that has cleaned up and wants to stay clean.
 
+An unknown key is reported wherever the schema object it sits in accepts only the
+names it lists — whether it says so with `additionalProperties: false` (five
+objects, which jsonschema reports) or simply by naming `properties` and nothing
+else (103 more, which `_walk_unknown_keys` reports). A node that opts OUT of that
+— any of `_OPENER_KEYWORDS` — is left alone in both halves.
+
 A repo with no `.coderabbit.yaml` passes, and says so in the log — not every
 consumer of the reusable workflow has one.
 
@@ -89,6 +95,53 @@ MAX_FINDINGS = 100
 # Keywords whose violation CodeRabbit tolerates by STRIPPING the offending key,
 # rather than rejecting the document. Everything else is file-rejecting.
 STRIPPED_KEYWORDS = frozenset({"additionalProperties", "unevaluatedProperties"})
+
+# Keywords that leave a schema object OPEN to keys its own `properties` block does
+# not name. Upstream's schema closes only five objects with an explicit
+# `additionalProperties: false` (the document root, the `htmlhint` and `stylelint`
+# tool objects, `knowledge_base.mcp`, and `knowledge_base.linked_repositories[]`),
+# while 103 more declare `properties` and say nothing at all about the rest. A
+# typo inside one of those — `reviews.profil`, `golangci-lint.enabld` — is stripped
+# by CodeRabbit exactly like a root-level one, but jsonschema has nothing to
+# complain about, so `iter_errors` alone reports it nowhere. `_walk_unknown_keys`
+# closes that gap by treating "declares `properties`, declares none of these" as
+# closed BY OMISSION.
+#
+# The list is deliberately wider than this schema needs (it currently carries one
+# `anyOf` and one `propertyNames`, and none of the rest). Every entry names a way
+# a node can legitimately accept a key its `properties` does not list — through a
+# combinator branch, a `$ref`, a pattern, a conditional. Reading any of them as
+# "closed" would invent a finding, so a future vendored-schema bump that starts
+# using one produces silence here rather than a false positive.
+_OPENER_KEYWORDS = (
+    "additionalProperties",
+    "unevaluatedProperties",
+    "patternProperties",
+    "anyOf",
+    "oneOf",
+    "allOf",
+    "$ref",
+    "$dynamicRef",
+    "if",
+    "dependentSchemas",
+    "propertyNames",
+    "not",
+)
+
+# The walk's own bounds, for the same reason `iter_errors` is collected through
+# `islice`: the document is PR-controlled, and while PyYAML constructs an anchored
+# mapping once, an aliased document is walkable as a much larger tree — the same
+# billion-laughs shape in a few hundred bytes. Budgeting the number of KEYS
+# inspected (rather than nodes visited) is what makes the bound linear in real
+# work: one visit to a mapping with 100k keys costs 100k, not 1.
+#
+# The depth cap is belt-and-braces rather than the working bound: descent follows
+# the SCHEMA (matched properties and `items`), whose nesting is finite and shallow,
+# and `$ref` is an opener this walk never resolves — so a self-referential future
+# schema cannot make it recurse forever. 64 is far past any real config and far
+# short of the interpreter's recursion limit.
+MAX_WALK_KEYS = 200_000
+MAX_WALK_DEPTH = 64
 
 # Guards the "did you mean" suggestion below: an unknown key is only worth
 # proposing a home for when the name is specific enough that a same-named
@@ -249,6 +302,106 @@ def _descend(node, part):
     return None
 
 
+def _unknown_key_finding(severity, node, parent_parts, key, schema_index):
+    """One finding for `key` not being recognized inside the mapping at `parent_parts`.
+
+    Shared by BOTH unknown-key paths — the `additionalProperties: false` errors
+    jsonschema raises, and the closed-by-omission walk below — so the two are
+    identical in severity, wording, path, line resolution and "did you mean" by
+    construction rather than by two copies staying in step.
+
+    YAML keys need not be strings (`1:`, `true:`, `2026-01-01:` all parse to
+    non-strings), so the name is coerced for display: without it `_format_path`
+    would render an integer key as a LIST INDEX (`reviews[1]` for `reviews: {1: x}`)
+    and `_key_line` would compare an int against the composed node's string value
+    and silently return no line. `_suggest_home` needs no coercion guard of its
+    own — `_SUGGESTABLE_KEY_RE` already rejects anything that is not a plausible
+    property name.
+    """
+    name = key if isinstance(key, str) else str(key)
+    full = _format_path(parent_parts + [name])
+    where = (
+        "at the document root"
+        if not parent_parts
+        else f"under `{_format_path(parent_parts)}`"
+    )
+    return (
+        severity,
+        full,
+        _key_line(node, parent_parts, name),
+        f"unknown key `{name}` {where}. CodeRabbit STRIPS keys it "
+        f"does not recognize, so the config still loads but "
+        f"everything under this key silently does nothing."
+        + _suggest_home(name, schema_index, full),
+    )
+
+
+def _walk_unknown_keys(data, schema, node, schema_index, severity, limit):
+    """Unknown keys inside objects the schema closes BY OMISSION.
+
+    jsonschema reports an unknown key only where the schema says `additionalProperties`
+    / `unevaluatedProperties` — five objects in upstream's schema. This walks the
+    parsed document alongside the schema and reports the other 103: a node that
+    declares a dict-valued `properties` and NONE of `_OPENER_KEYWORDS` accepts
+    exactly the names it lists, so any other key in the document is stripped.
+
+    Conservative on purpose, in three ways:
+
+      * it descends ONLY through matched `properties` values and through `items`
+        when the document has a list and the schema node's `items` is a dict.
+        Never into an `additionalProperties` schema, a combinator branch, or the
+        value under a key it just reported — a key the schema does not name has no
+        subschema, so anything below it is unjudgeable, not more findings.
+      * where the document and the schema disagree about shape (a mapping where
+        the schema wants a scalar, and so on) it stays SILENT. That is a type
+        error, and reporting it is `iter_errors`' job — saying it twice, in two
+        different vocabularies, is worse than saying it once.
+      * it never fires where jsonschema does. The two conditions are complements:
+        jsonschema needs the keyword present, this needs it absent. That is what
+        makes the combined output duplicate-free by construction rather than by a
+        de-duplication pass that could drift.
+
+    `limit` caps the findings (the caller sizes it from what is left of
+    MAX_FINDINGS). Returns (findings, budget_exhausted) — the flag says the walk
+    stopped early on MAX_WALK_KEYS and therefore did NOT see the whole document,
+    which the caller reports rather than passing off as a clean bill of health.
+    """
+    findings = []
+    remaining_keys = [MAX_WALK_KEYS]
+
+    def walk(value, subschema, path, depth):
+        if len(findings) >= limit or remaining_keys[0] <= 0 or depth > MAX_WALK_DEPTH:
+            return
+        if isinstance(value, list):
+            items = subschema.get("items")
+            if isinstance(items, dict):
+                for index, element in enumerate(value):
+                    walk(element, items, path + [index], depth + 1)
+            return
+        if not isinstance(value, dict):
+            return
+        properties = subschema.get("properties")
+        if not isinstance(properties, dict):
+            return
+        closed = not any(keyword in subschema for keyword in _OPENER_KEYWORDS)
+        for key, child in value.items():
+            if len(findings) >= limit or remaining_keys[0] <= 0:
+                return
+            remaining_keys[0] -= 1
+            if key in properties:
+                child_schema = properties[key]
+                if isinstance(child_schema, dict):
+                    walk(child, child_schema, path + [key], depth + 1)
+            elif closed:
+                findings.append(
+                    _unknown_key_finding(severity, node, path, key, schema_index)
+                )
+
+    if isinstance(schema, dict):
+        walk(data, schema, [], 0)
+    return findings, remaining_keys[0] <= 0
+
+
 def _describe(error, path_str):
     """A human sentence for one file-rejecting schema error."""
     if error.validator == "maxLength":
@@ -354,21 +507,9 @@ def validate(text, schema, strict_unknown_keys=False):
                 )
                 continue
             for key in extras:
-                full = _format_path(parent_parts + [key])
-                where = (
-                    "at the document root"
-                    if not parent_parts
-                    else f"under `{_format_path(parent_parts)}`"
-                )
                 findings.append(
-                    (
-                        unknown_severity,
-                        full,
-                        _key_line(node, parent_parts, key),
-                        f"unknown key `{key}` {where}. CodeRabbit STRIPS keys it "
-                        f"does not recognize, so the config still loads but "
-                        f"everything under this key silently does nothing."
-                        + _suggest_home(key, schema_index, full),
+                    _unknown_key_finding(
+                        unknown_severity, node, parent_parts, key, schema_index
                     )
                 )
             continue
@@ -376,6 +517,30 @@ def validate(text, schema, strict_unknown_keys=False):
         path_str = _format_path(parent_parts)
         findings.append(
             ("error", path_str, _line_for_path(node, parent_parts), _describe(error, path_str))
+        )
+
+    # The other 103 objects: closed by OMISSION, so jsonschema said nothing about
+    # them. Appended after the jsonschema findings rather than merged into their
+    # sort, which keeps both halves in document order within themselves and the
+    # whole list stable run to run. One past `remaining` so an overflow is
+    # detectable; `remaining` can be 0, in which case a single walk finding is
+    # enough to prove the combined total passed the cap.
+    remaining = max(0, MAX_FINDINGS - len(findings))
+    walked, walk_bounded = _walk_unknown_keys(
+        data, schema, node, schema_index, unknown_severity, remaining + 1
+    )
+    if len(walked) > remaining:
+        del walked[remaining:]
+        truncated = True
+    findings.extend(walked)
+
+    if walk_bounded:
+        # Say so rather than let a partial walk read as a clean one — the same
+        # reason an absent config is reported instead of passing silently.
+        notes.append(
+            f"the unknown-key scan stopped after inspecting {MAX_WALK_KEYS} keys "
+            f"(a very large or heavily aliased document), so nested keys past that "
+            f"point were NOT checked."
         )
 
     if truncated:

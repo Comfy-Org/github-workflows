@@ -38,12 +38,38 @@ defaults to `true`, so a root-level `enabled: false` runs the linter it meant to
 disable). The annotation names the offending key path and suggests where it
 belongs.
 
-One limit worth knowing: the unknown-key check fires where the schema CLOSES an
-object, which upstream does at the document root and for a handful of nested
-objects. `reviews`, `chat`, `knowledge_base`, `code_generation` and the individual
-tool configs are open, so a typo *inside* one (`reviews.profil`) is not flagged
-even under `strict_unknown_keys`. What is caught is a key in the wrong PLACE —
-the failure that actually recurs.
+The unknown-key check fires wherever a schema object accepts only the property
+names it lists. Upstream says that two ways and both are checked: **explicitly**,
+with `additionalProperties: false` (five objects, including the document root),
+and **by omission** — a `properties` block and nothing said about anything else
+(103 objects, including `reviews`, `chat`, `knowledge_base`, `code_generation` and
+every individual tool config). So a key in the wrong PLACE is caught, and so is a
+typo *inside* an object (`reviews.profil`, `golangci-lint.enabld`) and a key
+upstream has since removed.
+
+The by-omission rule is deliberately conservative: an object counts as closed only
+if it declares `properties` and none of `additionalProperties`,
+`unevaluatedProperties`, `patternProperties`, `anyOf`, `oneOf`, `allOf`, `$ref`,
+`$dynamicRef`, `if`, `dependentSchemas`, `propertyNames` or `not` — each of which
+is a way the schema legitimately accepts a name it does not list. Nothing is
+reported under `reviews.mutually_exclusive_groups` (whose group names are yours to
+choose) or inside `knowledge_base.code_guidelines.filePatterns[]` (an `anyOf`
+shape), and a document/schema shape disagreement is left to the type error that
+already describes it.
+
+**Rolling this out to a repo that already has a config.** A repo carrying
+`reviews.tools.github-checks.timeout_ms` — a key upstream removed, still present
+in several org repos — will see a NEW warning it did not see before. That is the
+point of the check: the key does nothing today. Default mode still exits 0, so
+nothing turns red on enrollment. If you plan to set `strict_unknown_keys: true`,
+run the checker locally first and remove the stale keys it names — otherwise the
+strict switch turns them into a hard failure on whatever PR happens to be open:
+
+```bash
+python3 -m pip install --require-hashes --only-binary=:all: \
+  -r .github/coderabbit-config/requirements.txt        # from a checkout of Comfy-Org/github-workflows
+python3 .github/coderabbit-config/check_coderabbit_config.py --root /path/to/your/repo
+```
 
 The checker and the schema it validates against live in
 [`.github/coderabbit-config/`](../../.github/coderabbit-config) and are loaded
