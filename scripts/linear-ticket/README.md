@@ -9,14 +9,16 @@ matching this repo's Python convention.
 | File | Role |
 |---|---|
 | `lib.py` | Pure, network-free core — candidate extraction, `team-keys` validation, the attachment **policy gate** (`filter_issues`), Linear error classification, failure-category selection, failure copy, and the batched diagnostic-query builder. Imported by `validate.py` and by the test suite. |
-| `validate.py` | The side-effecting orchestration: resolve the PR from the `workflow_run` event, refetch it, publish the `linear-ticket` commit status, query `attachmentsForURL`, apply the gate, run one batched diagnostic query, and maintain the single marker PR comment. GitHub via the `gh` CLI (`subprocess`), Linear via `urllib`. Imports `lib.py`. |
-| `tests/test_lib.py` | Hermetic `unittest` suite over `lib.py` — no network. |
+| `validate.py` | The side-effecting orchestration: resolve the PR from the `workflow_run` event, skip unprotected base branches, refetch it, publish the `linear-ticket` commit status, query `attachmentsForURL`, apply the gate, run one batched diagnostic query, and maintain the single marker PR comment. GitHub via the `gh` CLI (`subprocess`), Linear via `urllib`. Imports `lib.py`. |
+| `tests/` | Hermetic `unittest` suites over the pure core and protected-branch orchestration — no network. |
 
 ## The invariant
 
 The **only** thing that turns the check green is an attachment Linear returns for the PR's
 canonical `html_url` (`attachmentsForURL`) whose issue satisfies policy — `filter_issues`.
-That is the whole point: a `TEAM-123`-shaped string an author types is not a link. So:
+This invariant applies when the PR targets a protected branch; an unprotected target is outside
+the gate and passes without a Linear query. A `TEAM-123`-shaped string an author types is not a
+link. So:
 
 - The PR URL is passed to Linear as a **GraphQL variable**, never interpolated into the query.
 - The policy reads the resolved issue's **API `team.key`** and **`state.type`**, never a
@@ -36,8 +38,13 @@ That is the whole point: a `TEAM-123`-shaped string an author types is not a lin
 - The PR is resolved from **GitHub-owned** `workflow_run.pull_requests` (same-repo) or the
   commit→PR association (fork), requiring **exactly one open PR**; ambiguous associations are
   refused.
-- Before every terminal status write, the PR head SHA is **refetched**; if it advanced, the
-  run exits without publishing so a superseded validation can't overwrite a newer result.
+- The PR's current base branch is read from GitHub and its `protected` property determines
+  whether the ticket gate applies. This covers any number of branches protected by classic
+  branch protection or rulesets without a caller-maintained branch list. An unreadable
+  protection state fails closed.
+- Before every terminal status write, the PR head SHA and base branch are **refetched**; if
+  either changed, the run exits without publishing so a superseded validation can't overwrite
+  a newer result. The base check matters when a retarget keeps the same head commit.
 - **Fails closed**: auth, schema, malformed-response, timeout, and rate-limit-exhaustion are
   reported as an *infrastructure* error (red in enforce mode), never as an invalid ticket.
   Linear signals rate limiting as HTTP 400 + GraphQL `RATELIMITED`, which is retried within a

@@ -41,6 +41,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import lib
@@ -176,9 +177,18 @@ class GitHub:
         if result.returncode != 0:
             warning(f"Failed to delete marker comment {existing}: {result.stderr.strip()}")
 
-    def current_head_sha(self, pr: int) -> str | None:
+    def current_pr_target(self, pr: int) -> tuple[str | None, str | None]:
         data = self.get(f"/repos/{self.repo}/pulls/{pr}")
-        return (data or {}).get("head", {}).get("sha")
+        return (
+            (data or {}).get("head", {}).get("sha"),
+            (data or {}).get("base", {}).get("ref"),
+        )
+
+    def branch_is_protected(self, branch: str) -> bool | None:
+        encoded = urllib.parse.quote(branch, safe="")
+        data = self.get(f"/repos/{self.repo}/branches/{encoded}")
+        protected = (data or {}).get("protected")
+        return protected if isinstance(protected, bool) else None
 
 
 # ── Linear via urllib ─────────────────────────────────────────────────────────────────
@@ -251,15 +261,19 @@ class Validator:
         self.exempt_actors = lib.parse_actor_list(os.environ.get("EXEMPT_ACTORS", ""))
         self.pr_number: int | None = None
         self.validated_sha: str | None = None
+        self.validated_base_branch: str | None = None
 
     # -- terminal outcomes -----------------------------------------------------------------
     def _guard_supersession(self) -> bool:
-        """True to proceed with the terminal write; False to bail because the PR head
-        advanced past the SHA we validated (a newer run owns the result now)."""
-        now = self.gh.current_head_sha(self.pr_number)
-        if now and now != self.validated_sha:
-            log(f"PR head moved {self.validated_sha} -> {now}; a newer run supersedes this "
-                "one. Not writing a terminal status.")
+        """True unless the PR head or base changed after the validated snapshot."""
+        now_sha, now_base = self.gh.current_pr_target(self.pr_number)
+        if now_sha and now_sha != self.validated_sha:
+            log(f"PR head moved {self.validated_sha} -> {now_sha}; a newer run supersedes "
+                "this one. Not writing a terminal status.")
+            return False
+        if now_base and now_base != self.validated_base_branch:
+            log(f"PR base moved {self.validated_base_branch} -> {now_base}; a newer run "
+                "supersedes this one. Not writing a terminal status.")
             return False
         return True
 
@@ -360,6 +374,8 @@ class Validator:
         html_url = pr.get("html_url") or ""
         self.validated_sha = pr.get("head", {}).get("sha")
         branch = pr.get("head", {}).get("ref") or ""
+        base_branch = pr.get("base", {}).get("ref") or ""
+        self.validated_base_branch = base_branch
         title = pr.get("title") or ""
         body = pr.get("body") or ""
         labels = [lbl.get("name") for lbl in (pr.get("labels") or [])]
@@ -368,6 +384,21 @@ class Validator:
         log(f"Validating PR #{self.pr_number} ({html_url}) at head {self.validated_sha}")
         self.gh.publish_status(self.validated_sha, "pending",
                                "Checking for a linked Linear issue…", self.run_url)
+
+        if not base_branch:
+            error(f"PR #{self.pr_number} has no base branch; refusing to validate.")
+            return 1
+        protected = self.gh.branch_is_protected(base_branch)
+        if protected is None:
+            error(f"Could not determine whether base branch '{base_branch}' is protected; "
+                  "failing closed.")
+            return 1
+        if not protected:
+            log(f"PR targets unprotected branch '{base_branch}' — Linear ticket not required.")
+            return self.finish_exempt(
+                f"PR targets the unprotected `{base_branch}` branch — the Linear-ticket "
+                "requirement does not apply.",
+                f"Not required for unprotected branch: {base_branch}")
 
         # Exemptions short-circuit before the Linear query. The actor allow-list is the
         # non-manual hatch for bot PRs (Dependabot/Renovate never carry a ticket); it is
