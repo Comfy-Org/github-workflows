@@ -421,12 +421,21 @@ jobs:
         run: |
           # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
           # whitespace-only value is an empty ref to IT while sailing past a bare
-          # -z test here. Compare the stripped form, and emit only that: dropping
-          # newlines also stops a multi-line value from smuggling a ::workflow
-          # command:: into the log or into $GITHUB_OUTPUT.
-          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          # -z test here — and JS `trim()` strips U+00A0/U+FEFF that POSIX
+          # `[:space:]` leaves alone, so stripping cannot be how this decides.
+          # Nor can it emit a stripped value: `tr -d` removes INTERIOR whitespace
+          # too, so `a b` would be silently rewritten into the different-but-real
+          # ref `ab` instead of being rejected. Validate the SHAPE and emit the
+          # value UNTOUCHED — a git ref is ASCII, so every Unicode space, and
+          # every newline that could smuggle a ::workflow command:: into the log
+          # or into $GITHUB_OUTPUT, falls outside the class and resolves to the
+          # empty output that skips the checkout below.
+          REF="$WORKFLOWS_REF"
+          case "$REF" in
+            *[!A-Za-z0-9._/@+-]*) REF='' ;;
+          esac
           if [ -z "$REF" ]; then
-            echo "::warning::Could not resolve a ref for the cursor-review assets: the workflows_ref input is empty AND job.workflow_sha resolved to '' (which needs an Actions runner older than v2.334.0). Skipping the asset checkout rather than silently loading them from this repo's default branch — the prior-review ledger degrades to status=unknown for this run. Set workflows_ref: to the same commit SHA the caller's uses: line pins."
+            echo "::warning::Could not resolve a usable ref for the cursor-review assets: either the workflows_ref input is empty AND job.workflow_sha resolved to '' (which needs an Actions runner older than v2.334.0), or the value contains characters that are not valid in a git ref (allowed: A-Z a-z 0-9 . _ / - @ +). Skipping the asset checkout rather than silently loading them from this repo's default branch — the prior-review ledger degrades to status=unknown for this run. Set workflows_ref: to the same commit SHA the caller's uses: line pins."
           fi
           echo "ref=$REF" >> "$GITHUB_OUTPUT"
 
@@ -435,7 +444,7 @@ jobs:
         if: steps.resolve_ref.outputs.ref != ''
         continue-on-error: true
         timeout-minutes: 5
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Comfy-Org/github-workflows
           ref: ${{ steps.resolve_ref.outputs.ref }}
@@ -494,7 +503,7 @@ jobs:
         # of the artifact all download it continue-on-error, and consolidate
         # emits the unavailable banner when the file does not arrive).
         continue-on-error: true
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: cursor-review-ledger
           path: /tmp/ledger

@@ -9,8 +9,9 @@ repo's own workflow files.
   `workflows_ref` input, or (2) checks out at `ref: ${{ inputs.workflows_ref }}`
   in a job that does not run the empty-ref guard first — recognizing the
   canonical `-z` guard and the length/charset shape `pr-risk.yml` uses, and
-  exempting the `job.workflow_sha` self-pin `groom.yml` pairs with its guards
-  (see below). Text-level parsing (this repo is stdlib-only — no
+  and treating the `job.workflow_sha` self-pin `groom.yml` uses as an exemption
+  from the *mutable-default* half only — it still has to carry a guard (see
+  below). Text-level parsing (this repo is stdlib-only — no
   PyYAML), the same constraint `bump-callers.sh` works under.
 - **`tests/`** — `unittest` suite, run by
   [`test-workflow-pins.yml`](../workflows/test-workflow-pins.yml) along with a
@@ -62,7 +63,23 @@ runner v2.334.0 (April 2026), and because it *is* empty on an older runner,
 `groom.yml` no longer skips the guard: each of those seven jobs runs a
 fail-closed `Require a resolvable workflows_ref` step ahead of its checkout, and
 `cursor-review.yml`'s never-fail ledger job resolves the ref in a step that
-warns and skips the checkout instead. (`actionlint` ≤ 1.7.12 false-positives on
+warns and skips the checkout instead.
+
+**The lint enforces that split, rather than trusting the prose.** The fallback
+answers *mutability*; the guard answers *emptiness*; a checkout using the
+fallback is exempt from the first check and still held to the second. Until
+BE-8077 the fallback was exempt from **both**, so deleting all seven of
+`groom.yml`'s guard steps left this lint — and its whole suite — green, while
+the paragraph above already leaned on them. The guard-step detector accepts the
+`WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}` binding those
+seven use as well as the bare `${{ inputs.workflows_ref }}` one; matching only
+the bare form meant none of the seven was ever consulted, *and* falsely reported
+a checkout that dropped the fallback while keeping its guard. The fallback
+pattern is also anchored to the closing `}}` and matched against the
+comment-stripped line, so neither
+`${{ inputs.workflows_ref || job.workflow_sha || 'main' }}` (mutable in exactly
+the pre-v2.334.0 case the fallback exists for) nor a comment merely *naming* the
+expression buys the exemption. (`actionlint` ≤ 1.7.12 false-positives on
 `job.workflow_sha`; no CI here runs it.)
 
 The guard is copied inline into each consuming job rather than factored into a

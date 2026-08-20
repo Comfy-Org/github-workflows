@@ -189,6 +189,14 @@ class GuardCoverageTests(unittest.TestCase):
         "            exit 1\n"
         "          fi\n"
     )
+    # groom.yml's variant (BE-8077): same guard, but the ref reaches it via the
+    # `|| job.workflow_sha` fallback. The binding detector must accept BOTH
+    # spellings or these seven real guards are never consulted.
+    GUARD_WITH_FALLBACK = GUARD.replace(
+        "${{ inputs.workflows_ref }}",
+        "${{ inputs.workflows_ref || job.workflow_sha }}",
+    ).replace("Require a pinned", "Require a resolvable")
+
     CHECKOUT = (
         "      - name: Load assets\n"
         "        uses: actions/checkout@abc\n"
@@ -569,18 +577,59 @@ class GuardCoverageTests(unittest.TestCase):
         )
         self.assertEqual(self._jobs(step), [])
 
-    def test_a_job_workflow_sha_fallback_needs_no_guard(self):
-        # BE-4169: `inputs.workflows_ref || job.workflow_sha` can never resolve
-        # to a MUTABLE ref on its own, so it does not trip THIS check — see
-        # groom.yml, which additionally runs a fail-closed empty-ref guard in
-        # every such job because `job.workflow_sha` needs runner v2.334.0+.
+    def test_a_job_workflow_sha_fallback_still_needs_a_guard(self):
+        # BE-8077, correcting BE-4169. The fallback can never resolve to a
+        # MUTABLE ref -- which is what still earns it the `default: ''`
+        # carve-out in `check_dir` -- but it is NOT self-sufficient:
+        # `job.workflow_sha` needs runner v2.334.0+ and expands to '' on
+        # anything older, which checkout reads as the default branch. So the
+        # fallback answers mutability, the guard answers emptiness, and the
+        # lint requires BOTH. Exempting the fallback from the guard check made
+        # groom.yml's seven guard steps deletable with this lint still green.
         checkout = (
             "      - name: Load assets\n"
             "        uses: actions/checkout@abc\n"
             "        with:\n"
             "          ref: ${{ inputs.workflows_ref || job.workflow_sha }}\n"
         )
-        self.assertEqual(self._jobs(checkout), [])
+        self.assertEqual(len(self._jobs(checkout)), 1)
+
+    def test_a_guarded_job_workflow_sha_fallback_passes(self):
+        # The other direction: groom.yml's real shape -- the fallback checkout
+        # WITH its guard -- must stay clean. That guard binds the ref as
+        # `${{ inputs.workflows_ref || job.workflow_sha }}` too, and matching
+        # only the bare `${{ inputs.workflows_ref }}` binding meant this shape
+        # was never recognized as a guard at all.
+        checkout = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ inputs.workflows_ref || job.workflow_sha }}\n"
+        )
+        self.assertEqual(self._jobs(self.GUARD_WITH_FALLBACK + checkout), [])
+
+    def test_the_fallback_guard_also_covers_a_bare_input_checkout(self):
+        # And it cuts the other way: fallback dropped from the checkout, guard
+        # left in place. That checkout IS guarded and must not be reported --
+        # the narrow binding regex used to flag exactly this, a correct guard
+        # sitting directly above it.
+        self.assertEqual(self._jobs(self.GUARD_WITH_FALLBACK + self.CHECKOUT), [])
+
+    def test_a_third_operand_defeats_the_fallback_exemption(self):
+        # The fallback regex is anchored to the CLOSE of the interpolation on
+        # purpose. Unanchored it read "contains the fallback" rather than "IS
+        # the fallback", so this expression -- which resolves to the MUTABLE
+        # default branch in precisely the pre-v2.334.0 case the fallback exists
+        # for -- was blessed by the very lint meant to catch it. It is reported
+        # here because it is unguarded; `test_a_third_operand_is_not_a_self_pin`
+        # covers the `default: ''` carve-out half.
+        checkout = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ inputs.workflows_ref || job.workflow_sha || 'main' }}\n"
+        )
+        self.assertEqual(len(self._jobs(checkout)), 1)
 
     def test_the_github_job_workflow_sha_spelling_is_no_longer_exempt(self):
         # BE-8077: `github.job_workflow_sha` is an OIDC token claim, NOT a
@@ -662,8 +711,47 @@ class GuardCoverageTests(unittest.TestCase):
             "in BE-8077: it now reads `ref: ${{ steps.resolve_ref.outputs.ref }}` "
             "— the input is resolved one step earlier, so the `ref:` line no "
             "longer names it. groom.yml's 7 sites still do, via the "
-            "`|| job.workflow_sha` fallback the lint exempts.",
+            "`|| job.workflow_sha` fallback — and are clean because each one "
+            "carries its guard, which BE-8077 made load-bearing rather than "
+            "exempt.",
         )
+
+    def test_the_ledger_checkout_keeps_its_resolve_then_skip_guard(self):
+        # BE-8077 moved cursor-review.yml's ledger checkout to
+        # `ref: ${{ steps.resolve_ref.outputs.ref }}`, which no longer NAMES the
+        # input — so `is_ref_use` does not see it and the lint above cannot
+        # cover it (that is the 16 -> 15 in the count assertion). The only thing
+        # left standing between an unresolvable ref and a silent default-branch
+        # checkout of the assets this job executes is the hand-written `if:`.
+        # Nothing lints it, so pin it here until the detector learns to follow a
+        # `ref:` through a step output.
+        root = os.path.normpath(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "workflows")
+        )
+        with open(os.path.join(root, "cursor-review.yml"), encoding="utf-8") as f:
+            lines = f.read().split("\n")
+
+        consumers = [
+            i
+            for i, line in enumerate(lines)
+            if "ref: ${{ steps.resolve_ref.outputs.ref }}" in line
+        ]
+        self.assertTrue(consumers, "ledger checkout no longer reads resolve_ref")
+
+        for idx in consumers:
+            # …guarded by an `if:` demanding a non-empty output, in its own step.
+            step = lines[max(0, idx - 12) : idx]
+            self.assertTrue(
+                any("if: steps.resolve_ref.outputs.ref != ''" in s for s in step),
+                "checkout at line %d has no non-empty `if:` on resolve_ref" % (idx + 1),
+            )
+
+        # …and the resolving step must still REJECT rather than pass through:
+        # it emits the empty string for anything that is not ref-shaped.
+        body = "\n".join(lines)
+        self.assertIn("id: resolve_ref", body)
+        self.assertIn("*[!A-Za-z0-9._/@+-]*) REF='' ;;", body)
+
 
 
 class CheckDirTests(unittest.TestCase):
@@ -695,7 +783,46 @@ class CheckDirTests(unittest.TestCase):
     def test_a_job_workflow_sha_default_is_tolerated(self):
         # BE-4169: `default: ''` paired with `inputs.workflows_ref ||
         # job.workflow_sha` at the checkout is not the `default: main` hole —
-        # the fallback can never be mutable. See groom.yml.
+        # the fallback can never be mutable. See groom.yml. The guard below is
+        # what BE-8077 additionally requires: the carve-out is about the ref
+        # not being MUTABLE, and the guard is what makes it non-EMPTY.
+        text = (
+            "name: Fixture\n"
+            "on:\n"
+            "  workflow_call:\n"
+            "    inputs:\n"
+            "      workflows_ref:\n"
+            "        type: string\n"
+            "        required: false\n"
+            "        default: ''\n"
+            "jobs:\n"
+            "  check:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - name: Require a resolvable workflows_ref\n"
+            "        env:\n"
+            "          WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}\n"
+            "        run: |\n"
+            '          if [ -z "$WORKFLOWS_REF" ]; then\n'
+            '            echo "::error::empty"\n'
+            "            exit 1\n"
+            "          fi\n"
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ inputs.workflows_ref || job.workflow_sha }}\n"
+        )
+        self._write("groom-like.yml", text)
+        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(checked, ["groom-like.yml"])
+
+    def test_a_third_operand_is_not_a_self_pin(self):
+        # The `default: ''` carve-out half of the same anchoring bug. This
+        # fixture LOOKS like the groom shape and is not one: with both leading
+        # operands empty it checks out `main`, so the empty default is the
+        # BE-5546 mutable-default hole after all. The unanchored regex read the
+        # substring and waved it through.
         text = (
             "name: Fixture\n"
             "on:\n"
@@ -712,12 +839,42 @@ class CheckDirTests(unittest.TestCase):
             "      - name: Load assets\n"
             "        uses: actions/checkout@abc\n"
             "        with:\n"
-            "          ref: ${{ inputs.workflows_ref || job.workflow_sha }}\n"
+            "          ref: ${{ inputs.workflows_ref || job.workflow_sha || 'main' }}\n"
         )
-        self._write("groom-like.yml", text)
+        self._write("sneaky.yml", text)
         errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
-        self.assertEqual(errors, [], errors)
-        self.assertEqual(checked, ["groom-like.yml"])
+        self.assertTrue(any("BE-5546" in e and "default:" in e for e in errors), errors)
+        self.assertEqual(checked, ["sneaky.yml"])
+
+    def test_a_comment_naming_the_fallback_is_not_a_self_pin(self):
+        # `check_dir` asks "does ANY line self-pin?" across the whole file, so
+        # before comments were stripped, prose merely NAMING the expression --
+        # which this repo's workflows do at length -- bought the `default: ''`
+        # carve-out for a file whose checkout never uses the fallback at all.
+        text = (
+            "name: Fixture\n"
+            "on:\n"
+            "  workflow_call:\n"
+            "    inputs:\n"
+            "      workflows_ref:\n"
+            "        type: string\n"
+            "        required: false\n"
+            "        default: ''\n"
+            "jobs:\n"
+            "  check:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      # we could have used inputs.workflows_ref || job.workflow_sha }}\n"
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ inputs.workflows_ref }}\n"
+        )
+        self._write("commented.yml", text)
+        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        self.assertTrue(any("BE-5546" in e and "default:" in e for e in errors), errors)
+        self.assertEqual(checked, ["commented.yml"])
+
 
     def test_the_github_job_workflow_sha_default_is_no_longer_tolerated(self):
         # BE-8077: the same fixture spelled the OLD way is the `default: main`

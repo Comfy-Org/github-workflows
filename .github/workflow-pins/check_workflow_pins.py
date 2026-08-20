@@ -94,9 +94,16 @@ _INPUT_MENTION_RE = re.compile(r"""inputs\.%s\b""" % INPUT_NAME)
 # which fails the lint loudly instead of passing a checkout it never verified.
 # A trailing comment IS tolerated — unlike the flow form that is a real guard
 # doing its job, so rejecting it would fail a compliant workflow, not catch one.
+# BOTH bindings count: the bare input (the BE-5546 `required: true` jobs) and the
+# BE-8077 `|| job.workflow_sha` fallback (groom.yml's seven guards). Matching
+# only the bare form left every one of those seven UNCONSULTED — the checkouts
+# passed on the fallback exemption alone, so deleting all seven guards kept this
+# lint green, while dropping `|| job.workflow_sha` from one checkout reported it
+# unguarded with a correct guard directly above it. Both halves of that are the
+# lint failing at its own subject.
 _GUARD_BINDING_RE = re.compile(
-    r"""^\s*(['"]?)WORKFLOWS_REF\1\s*:\s*(['"]?)\$\{\{\s*inputs\.workflows_ref\s*\}\}\2"""
-    r"""[^\S\n]*(?:#.*)?$"""
+    r"""^\s*(['"]?)WORKFLOWS_REF\1\s*:\s*(['"]?)\$\{\{\s*inputs\.workflows_ref\s*"""
+    r"""(?:\|\|\s*job\.workflow_sha\s*)?\}\}\2[^\S\n]*(?:#.*)?$"""
 )
 # …but the binding alone is NOT the guard, it is only how the guard receives the
 # value. Keying on it by itself made ANY step that merely handles the ref — one
@@ -300,9 +307,27 @@ _COMMENT_RE = re.compile(r"(?:^|\s)#.*$")
 # cursor-review.yml's ledger job (which must never fail) resolves it in a step
 # that warns and skips the checkout. This exemption is about the ref not being
 # MUTABLE; those runtime guards cover the empty case.
+# ANCHORED to the close of the interpolation, and matched against the
+# comment-stripped line (`_pins_to_job_workflow_sha` below). Unanchored, this
+# read "contains the fallback" rather than "IS the fallback", so
+# `${{ inputs.workflows_ref || job.workflow_sha || \'main\' }}` was exempted by
+# both users of this regex — and that expression resolves to the mutable default
+# branch in exactly the pre-v2.334.0 case the fallback exists for. Requiring
+# `}}` means a third operand is a hole again, which is the whole point.
 _JOB_WORKFLOW_SHA_FALLBACK_RE = re.compile(
-    r"""inputs\.%s\s*\|\|\s*job\.workflow_sha\b""" % INPUT_NAME
+    r"""inputs\.%s\s*\|\|\s*job\.workflow_sha\s*\}\}""" % INPUT_NAME
 )
+
+
+def _pins_to_job_workflow_sha(line):
+    """True when `line`'s CODE — not its comments — uses the BE-4169 fallback.
+
+    Comments are stripped first because `check_dir` asks this of every line in
+    the file: prose merely NAMING the expression (this repo\'s workflows discuss
+    it at length) would otherwise buy the `default: \'\'` carve-out for a file
+    where no checkout uses it at all.
+    """
+    return bool(_JOB_WORKFLOW_SHA_FALLBACK_RE.search(_strip_comment(line)))
 
 
 def _default_value(line):
@@ -660,7 +685,7 @@ def find_unguarded_ref_checkouts(lines):
             if pending is not None:
                 if _indent(line) > pending[1]:
                     if mention_re.search(line):
-                        if not guarded and not _JOB_WORKFLOW_SHA_FALLBACK_RE.search(line):
+                        if not guarded:
                             unguarded.append(pending[0] + 1)
                         pending = None
                     continue
@@ -669,13 +694,20 @@ def find_unguarded_ref_checkouts(lines):
             if _GUARD_BINDING_RE.match(line):
                 guarded = guarded or is_guard_step(lines, i)
             elif is_ref_use(line, ref_res):
-                # BE-4169 exception: `inputs.workflows_ref || job.workflow_sha`
-                # can never resolve to a MUTABLE ref on its own — see check_dir's
-                # `self_pins_to_job_workflow_sha` docstring-equivalent comment,
-                # and `_JOB_WORKFLOW_SHA_FALLBACK_RE` for why the old
-                # `github.job_workflow_sha` spelling is no longer accepted here
-                # (BE-8077).
-                if not guarded and not _JOB_WORKFLOW_SHA_FALLBACK_RE.search(line):
+                # NO fallback exception here, deliberately (BE-8077). The
+                # BE-4169 `inputs.workflows_ref || job.workflow_sha` form
+                # cannot resolve to a MUTABLE ref — that is what earns it the
+                # `default: ''` carve-out in `check_dir` — but it is NOT
+                # self-sufficient the way that story assumed:
+                # `job.workflow_sha` needs runner v2.334.0+ and expands to ''
+                # on anything older, and checkout reads `ref: ''` as the
+                # DEFAULT BRANCH. So the fallback answers MUTABILITY and the
+                # guard answers EMPTINESS, and this lint has to require both.
+                # Exempting the fallback from the guard check meant deleting
+                # every one of groom.yml's seven guard steps kept this lint
+                # green, while the comments here had already made the
+                # empty-ref safety depend on them.
+                if not guarded:
                     unguarded.append(i + 1)
             elif _REF_KEY_OPEN_RE.match(line):
                 pending = (i, _indent(line))
@@ -748,7 +780,7 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
         # spelling is deliberately NOT accepted: it is an OIDC claim and expands
         # to '' on EVERY runner, so a file "self-pinning" with it pins nothing.
         self_pins_to_job_workflow_sha = any(
-            _JOB_WORKFLOW_SHA_FALLBACK_RE.search(line) for line in lines
+            _pins_to_job_workflow_sha(line) for line in lines
         )
 
         for lineno in defaults:
@@ -763,6 +795,20 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
             )
 
         for lineno in find_unguarded_ref_checkouts(lines):
+            if _pins_to_job_workflow_sha(lines[lineno - 1]):
+                # The `|| job.workflow_sha` form: immutable, but empty on a
+                # pre-v2.334.0 runner, so it still needs the guard (BE-8077).
+                errors.append(
+                    "::error file=%s,line=%d::%s checks out at `ref: ${{ inputs.%s "
+                    "|| job.workflow_sha }}` with no empty-ref guard earlier in the "
+                    "same job. The fallback stops the ref being MUTABLE, not being "
+                    "EMPTY: `job.workflow_sha` needs an Actions runner >= v2.334.0 "
+                    "and expands to '' on anything older, which checkout reads as "
+                    "the default branch. Pair it with a `Require a resolvable "
+                    "workflows_ref` step. See BE-8077."
+                    % (path, lineno, name, INPUT_NAME)
+                )
+                continue
             errors.append(
                 "::error file=%s,line=%d::%s checks out at `ref: ${{ inputs.%s }}` "
                 "with no empty-ref guard earlier in the same job. Copy the "
