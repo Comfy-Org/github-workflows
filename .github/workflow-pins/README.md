@@ -71,15 +71,16 @@ so it used to leave the lint entirely, with a hand-written `if:` as the only
 thing between an unresolvable ref and a silent default-branch checkout of the
 scripts the job executes. The detector now follows a `ref:` through the step
 output: when the producing step's `env:` binds `workflows_ref`, the checkout is
-a ref use, and it is covered only if **either** that step is itself a
-fail-closed guard, **or** the consuming step carries exactly
+a ref use, and it is covered only if the consuming step carries exactly
 `if: steps.<id>.outputs.<name> != ''` on that same output — bare or
-`${{ … }}`-wrapped, either spelling optionally double-quoted. Nothing wider:
-`... != '' || always()` runs the checkout precisely when the output is empty, an
-`if:` on a different output says nothing about this one, and a job-level `if:`
-skips the resolver too. A never-fail resolver can only take the second route —
-`continue-on-error: true` means its `exit 1` would not fail the job, so it is
-not a guard. A `ref:` resolved from a step that never
+`${{ … }}`-wrapped, either spelling optionally double-quoted. A fail-closed
+resolver does not exempt its consumer (BE-8221): a guard proves the step
+rejects an empty *input*, not that its *output* is non-empty — a
+sanitize-to-`''` branch after the guard, or a dropped or renamed
+`$GITHUB_OUTPUT` write, still emits `''`. Nothing wider than the exact `if:`
+counts: `... != '' || always()` runs the checkout precisely when the output is
+empty, an `if:` on a different output says nothing about this one, and a
+job-level `if:` skips the resolver too. A `ref:` resolved from a step that never
 touches `workflows_ref` is not this lint's subject and is left alone.
 
 Two preconditions decide whether the detector SEES that site at all, and an

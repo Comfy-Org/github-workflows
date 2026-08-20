@@ -754,6 +754,13 @@ def is_guard_step(lines, idx):
     # evaluable here, so both disqualify the step rather than being assumed
     # benign.
     for i, line in enumerate(body):
+        if i == 0 and line.lstrip().startswith("- "):
+            # The list marker occupies the step's key column, so
+            # `- continue-on-error: true` (or `- if: …`) declares that key
+            # there exactly as a later line does — the same rewrite
+            # `_binding_step_id` makes to read an `id:` off it. Without it
+            # a never-fail step written marker-first scores as a hard guard.
+            line = " " * key_indent + line.lstrip()[2:]
         if _indent(line) != key_indent:
             continue
         if _STEP_IF_RE.match(line):
@@ -937,12 +944,13 @@ def _record_steps_output(found, lines, idx, resolved, resolvers):
     checkout in the first place; what it must not do is silently drop one that
     IS resolved from the input, which is precisely what `resolvers` catches.)
 
-    Otherwise it IS a ref use, guarded when EITHER the resolving step is itself
-    a fail-closed guard (nothing empty ever leaves it), OR the consuming step
-    carries the exact non-empty `if:` on that same output. The never-fail idiom
-    can only take the second route: its resolver runs `continue-on-error: true`,
-    which `is_guard_step` disqualifies on purpose — an `exit 1` that does not
-    fail the job leaves the checkout running anyway.
+    Otherwise it IS a ref use, guarded ONLY when the consuming step carries the
+    exact non-empty `if:` on that same output. A fail-closed resolver does NOT
+    exempt its consumer (BE-8221): `is_guard_step` proves the step rejects an
+    empty INPUT, nothing about the value written to `$GITHUB_OUTPUT` — a
+    resolver that guards the input and then sanitizes a malformed ref to `''`,
+    or whose output write was dropped or renamed, or a consumer naming an
+    output the step never sets, all still hand checkout an empty ref.
 
     Recorded as a NON-fallback site: `uses_fallback` exists to compare a
     checkout's expression against the strength of the guard that covered it,
@@ -952,7 +960,7 @@ def _record_steps_output(found, lines, idx, resolved, resolvers):
     step_id, out = resolved
     if step_id not in resolvers:
         return
-    guarded = resolvers[step_id] or _skips_on_empty_output(lines, idx, step_id, out)
+    guarded = _skips_on_empty_output(lines, idx, step_id, out)
     found.append((idx + 1, False, guarded, True))
 
 
@@ -980,9 +988,11 @@ def ref_checkouts(lines):
 
     A THIRD way to reach the ref does not name the input at all: resolve it in
     an earlier step and check out at that step's OUTPUT (BE-8130). Those sites
-    carry `via_step_output`, are judged by `_record_steps_output` — a
-    fail-closed resolver, or the exact non-empty `if:` on the consuming step —
-    and never earn the fallback-strength exemption, because the `if:` tests the
+    carry `via_step_output` and are judged by `_record_steps_output` — covered
+    ONLY by the exact non-empty `if:` on the consuming step, full stop. A
+    fail-closed resolver does not exempt its consumer (BE-8221): `is_guard_step`
+    proves input rejection, not output non-emptiness. These sites never earn
+    the fallback-strength exemption either, because the `if:` tests the
     resolved value rather than an expression.
     """
     aliases = env_aliases(lines)
@@ -1016,13 +1026,14 @@ def ref_checkouts(lines):
     for start in job_starts:
         guarded_input = False     # a guard proved the INPUT non-empty
         guarded_fallback = False  # …only the `|| job.workflow_sha` expression
-        # Steps in THIS job, seen so far, whose `env:` binds the input and that
-        # carry an `id:` a later `ref:` can resolve from — `{id: is_guard_step}`.
-        # Per job and populated as the walk goes, so a resolver in another job
-        # (they run independently) or one declared BELOW its consumer can never
-        # be credited; the walk order gives that ordering for free, exactly as
-        # it does for the guard flags above.
-        resolvers = {}
+        # Ids of steps in THIS job, seen so far, whose `env:` binds the input —
+        # membership alone: registration marks the step as a resolver of the
+        # input, and coverage always comes from the consumer's own `if:`
+        # (BE-8221). Per job and populated as the walk goes, so a resolver in
+        # another job (they run independently) or one declared BELOW its
+        # consumer can never be credited; the walk order gives that ordering
+        # for free, exactly as it does for the guard flags above.
+        resolvers = set()
         # An open `ref:` whose value continues below, as (line index, indent).
         # Continuation lines are the more-indented ones that follow; the first
         # line back at or above the key's indent closes the scalar.
@@ -1066,17 +1077,17 @@ def ref_checkouts(lines):
                 # guard steps kept this lint green.
                 guard = is_guard_step(lines, i)
                 # A step that RESOLVES the ref for a later checkout to consume
-                # is registered here whether or not it guards, because the two
-                # answers differ: a hard guard covers its consumers outright,
-                # while the never-fail idiom's resolver (`continue-on-error:
-                # true`) does not and hands the empty case to the consumer's
-                # own `if:`. Strength (bare vs `|| job.workflow_sha`) is NOT
-                # recorded: that distinction exists because a guard proves
-                # something about an EXPRESSION, while the consumer's `if:`
-                # tests the actual resolved VALUE, where it is moot.
+                # is registered here, whether or not it guards. Registration
+                # only marks the step as a resolver of the input — coverage
+                # always comes from the consumer's own `if:` (BE-8221), because
+                # a hard guard proves the step rejects an empty INPUT, nothing
+                # about what it writes to `$GITHUB_OUTPUT`. Guard verdict and
+                # strength (bare vs `|| job.workflow_sha`) are therefore not
+                # recorded at all: they answer questions about an EXPRESSION,
+                # while the consumer's `if:` tests the actual resolved VALUE.
                 step_id = _binding_step_id(lines, i)
                 if step_id is not None:
-                    resolvers[step_id] = guard
+                    resolvers.add(step_id)
                 if guard:
                     if binding.group("fallback"):
                         guarded_fallback = True
@@ -1235,12 +1246,10 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
                     "::error file=%s,line=%d::%s checks out at a `ref:` resolved "
                     "from a step whose `env:` binds `inputs.%s`, but the "
                     "consuming step carries no `if: steps.<id>.outputs.<name> != "
-                    "''` on that same output — and the resolving step is not a "
-                    "fail-closed guard either. An unresolvable ref then reaches "
+                    "''` on that same output. An unresolvable ref then reaches "
                     "`actions/checkout` as '', which it reads as the default "
                     "branch. Add the exact non-empty `if:` to this step (the "
-                    "never-fail idiom, see .github/workflow-pins/README.md), or "
-                    "make the resolving step reject the empty value itself. "
+                    "never-fail idiom, see .github/workflow-pins/README.md). "
                     "See BE-8130." % (path, lineno, name, INPUT_NAME)
                 )
                 continue

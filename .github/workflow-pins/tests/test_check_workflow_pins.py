@@ -914,6 +914,32 @@ class GuardCoverageTests(unittest.TestCase):
         )
         self.assertEqual(len(self._jobs(guard + self.CHECKOUT)), 1)
 
+    def test_a_marker_line_continue_on_error_disqualifies_the_guard(self):
+        # `- continue-on-error: true` declares the key at the step's key column
+        # via the list marker, where the disqualifier scan used to miss it — a
+        # step that never fails scored as a hard guard while its `exit 1`
+        # guards nothing, and the checkout ran anyway (BE-8221).
+        never_fail = self.GUARD.replace(
+            "      - name: Require a pinned workflows_ref\n",
+            "      - continue-on-error: true\n"
+            "        name: Require a pinned workflows_ref\n",
+            1,
+        )
+        self.assertNotEqual(never_fail, self.GUARD, "fixture drifted")
+        self.assertEqual(len(self._jobs(never_fail + self.CHECKOUT)), 1)
+
+    def test_a_marker_line_if_disqualifies_the_guard(self):
+        # `- if: …` can skip the guard outright for some events while the
+        # checkout still runs — same marker-line blind spot as above.
+        conditional = self.GUARD.replace(
+            "      - name: Require a pinned workflows_ref\n",
+            "      - if: github.event_name == 'push'\n"
+            "        name: Require a pinned workflows_ref\n",
+            1,
+        )
+        self.assertNotEqual(conditional, self.GUARD, "fixture drifted")
+        self.assertEqual(len(self._jobs(conditional + self.CHECKOUT)), 1)
+
     # ------------------------------------------------------------------
     # The resolve-then-consume shape (BE-8130). A job that must NEVER fail
     # cannot run the fail-closed guard — an `exit 1` would fail it — so it
@@ -1022,12 +1048,68 @@ class GuardCoverageTests(unittest.TestCase):
         )
         self.assertEqual(len(cwp.find_unguarded_ref_checkouts(text.split("\n"))), 1)
 
-    def test_a_hard_guard_resolver_covers_its_consumer_without_an_if(self):
-        # Nothing empty can leave a resolver that exits non-zero on it, so the
-        # consumer needs no `if:`. (The never-fail idiom cannot take this route:
-        # `continue-on-error: true` means the `exit 1` does not fail the job and
-        # the checkout runs anyway — which `is_guard_step` already refuses.)
-        self.assertEqual(self._jobs(self.HARD_RESOLVER + self._step_output_checkout()), [])
+    def test_a_hard_guard_resolver_does_not_exempt_its_consumer(self):
+        # Flipped by BE-8221. The resolver's guard proves it rejects an empty
+        # INPUT — nothing about the value it writes to $GITHUB_OUTPUT: a
+        # sanitize-to-'' branch after the guard, a dropped or renamed output
+        # write, or a consumer naming an output the step never sets all still
+        # hand checkout ''. Coverage comes from the consumer's own exact `if:`,
+        # full stop.
+        self.assertEqual(len(self._jobs(self.HARD_RESOLVER + self._step_output_checkout())), 1)
+
+    def test_a_marker_line_continue_on_error_resolver_is_not_a_guard_step(self):
+        # The resolver spelling of the marker-line blind spot. Redundant as a
+        # coverage test now the resolver exemption is gone (BE-8221), so it
+        # pins `is_guard_step` DIRECTLY: `- continue-on-error: true` as the
+        # step's first key must disqualify it exactly as the key does on a
+        # line of its own.
+        marker_resolver = self.HARD_RESOLVER.replace(
+            "      - name: Resolve the asset ref\n",
+            "      - continue-on-error: true\n"
+            "        name: Resolve the asset ref\n",
+            1,
+        )
+        self.assertNotEqual(marker_resolver, self.HARD_RESOLVER, "fixture drifted")
+        lines = self._wrap(marker_resolver + self._step_output_checkout()).split("\n")
+        binding = next(i for i, l in enumerate(lines) if "WORKFLOWS_REF:" in l)
+        self.assertFalse(cwp.is_guard_step(lines, binding))
+
+    def test_a_hard_guard_resolver_with_the_exact_if_passes(self):
+        # The sound composition still works: the consumer's own `if:` covers
+        # the checkout regardless of what the resolver does or does not guard.
+        self.assertEqual(
+            self._jobs(self.HARD_RESOLVER + self._step_output_checkout(self.EXACT_IF)), []
+        )
+
+    # A resolver that guards the INPUT and then sanitizes a malformed ref to
+    # '' — the exact shape cursor-review.yml's `resolve_ref` step uses. The
+    # guard is real, and the output can still be empty.
+    SANITIZING_RESOLVER = HARD_RESOLVER.replace(
+        '          echo "ref=$REF" >> "$GITHUB_OUTPUT"\n',
+        "          case \"$REF\" in *[!A-Za-z0-9._/@+-]*) REF='' ;; esac\n"
+        '          echo "ref=$REF" >> "$GITHUB_OUTPUT"\n',
+    )
+
+    def test_a_sanitizing_resolver_does_not_exempt_its_consumer(self):
+        self.assertNotEqual(self.SANITIZING_RESOLVER, self.HARD_RESOLVER, "fixture drifted")
+        # The step IS a hard guard — which is exactly why the old exemption
+        # would have covered this consumer while the sanitize branch emits ''.
+        lines = self._wrap(self.SANITIZING_RESOLVER + self._step_output_checkout()).split("\n")
+        binding = next(i for i, l in enumerate(lines) if "WORKFLOWS_REF:" in l)
+        self.assertTrue(cwp.is_guard_step(lines, binding))
+        self.assertEqual(len(cwp.find_unguarded_ref_checkouts(lines)), 1)
+
+    # A hard-guard resolver whose $GITHUB_OUTPUT write was dropped: the
+    # consumer's `steps.<id>.outputs.<name>` is then guaranteed ''.
+    NO_OUTPUT_RESOLVER = HARD_RESOLVER.replace(
+        '          echo "ref=$REF" >> "$GITHUB_OUTPUT"\n', ""
+    )
+
+    def test_a_resolver_that_never_writes_the_output_does_not_exempt(self):
+        self.assertNotEqual(self.NO_OUTPUT_RESOLVER, self.HARD_RESOLVER, "fixture drifted")
+        self.assertEqual(
+            len(self._jobs(self.NO_OUTPUT_RESOLVER + self._step_output_checkout())), 1
+        )
 
     def test_a_resolver_in_another_job_is_not_reachable(self):
         # Jobs run independently: `steps.resolve_ref` in job B names job B's
