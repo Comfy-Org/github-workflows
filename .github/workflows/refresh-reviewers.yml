@@ -170,7 +170,7 @@ jobs:
           private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
 
       - name: Checkout caller repo (full history)
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Full history IS the input signal for the expertise scoring.
           fetch-depth: 0
@@ -207,7 +207,7 @@ jobs:
         # The generator comes from THIS repo (public, pinned via
         # workflows_ref), never from the caller's checkout, so a caller-side
         # change can't rewrite the scoring logic.
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Comfy-Org/github-workflows
           ref: ${{ inputs.workflows_ref }}
@@ -215,7 +215,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
 

@@ -1,15 +1,21 @@
-# `linear-ticket.yml` — require a linked Linear issue on every PR
+# `linear-ticket.yml` — require a linked Linear issue for protected branches
 
 Read [the shared caller contract](README.md) first.
 
 ## What it does
 
-Gates a PR on a Linear issue that **Linear has linked to that exact PR** — not merely a
-`TEAM-123`-shaped string in the branch, title, or body. The only thing that turns the check
-green is an attachment Linear returns for the PR's canonical `html_url` (`attachmentsForURL`)
-whose issue satisfies the configured team/state policy. Any supported linking method works:
-identifier in the branch name, PR title, a `Closes`/`Fixes`/`Resolves` line in the body, or
-a manual link pasted into the issue in Linear.
+For a PR targeting a **protected base branch**, gates on a Linear issue that **Linear has linked
+to that exact PR** — not merely a `TEAM-123`-shaped string in the branch, title, or body. The
+validator reads GitHub's `protected` property for the current base branch, so repositories can
+have any number of protected branches without duplicating a branch list in the caller. A PR
+targeting an unprotected branch skips without querying Linear or publishing a `Linear ticket`
+status.
+
+For a protected branch, the only thing that turns the check green is an attachment Linear
+returns for the PR's canonical `html_url` (`attachmentsForURL`) whose issue satisfies the
+configured team/state policy. Any supported linking method works: identifier in the branch
+name, PR title, a `Closes`/`Fixes`/`Resolves` line in the body, or a manual link pasted into the
+issue in Linear.
 
 Identifiers extracted from PR text are used **only** to explain a red check ("you referenced
 `BE-1234` but Linear has not linked it") — they can never make it green. Automated checks buy
@@ -212,8 +218,9 @@ skewed apart, so an older `linear-ticket.yml` is running newer scripts — is tr
 5. Flip `enforce: true`. Leave the check non-required for a short window — the PR-visible
    result is unchanged from the soft-fail pilot; what changes is that the validator's own run
    now goes red too, so a systemic breakage is visible in the Actions tab.
-6. Add the **`Linear ticket`** status context to your `main` ruleset as a required check.
-   Only now does anything block.
+6. Add the **`Linear ticket`** status context as a required check in every ruleset that protects
+   a branch where tickets are required. Only now does anything block. The validator discovers
+   every protected base branch dynamically; no branch list belongs in the workflow caller.
 
 Nothing here changes branch protection automatically — the last step is a manual repo-admin action.
 
@@ -230,6 +237,12 @@ Your ruleset's check picker will offer both of these:
 They differ only by capitalisation and the `/ validate` suffix, so read carefully. Requiring the
 job instead of the status is the classic mistake here: the job is not tied to the PR's head
 commit, so the requirement is never satisfied on the PR and every merge hangs pending.
+
+**Protection is evaluated for the PR's current base branch.** GitHub's branch response reports
+protection from branch protection rules or rulesets. Retargeting a PR triggers a fresh run; an
+unprotected target gets no `Linear ticket` status and no Linear API query. The status must be
+absent rather than successful because GitHub scopes commit statuses to a SHA, not a PR: success
+from an unprotected PR could otherwise overwrite failure on a protected PR sharing that commit.
 
 **A red check is not the same as a blocked merge.** What blocks is your ruleset requiring the
 `Linear ticket` context — nothing this workflow does. That is why warn-only can (and by default

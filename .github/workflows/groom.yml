@@ -112,7 +112,8 @@ name: Groom (reusable)
 #         # Post/act issues as cloud-code-bot instead of github-actions[bot].
 #         bot_app_id: ${{ vars.APP_ID }}
 #         # No workflows_ref: the briefs + ledger auto-load from the same commit
-#         # this `uses:` pin resolves to (github.job_workflow_sha). Set it only to
+#         # this `uses:` pin resolves to (job.workflow_sha — the runner v2.334.0+
+#         # accessor, not the empty `github.job_workflow_sha`). Set it only to
 #         # test briefs from a branch.
 #         dry_run: ${{ github.event.inputs.dry_run == 'true' }}
 #         # Forward the optional scoping input above. A schedule event carries no
@@ -342,11 +343,19 @@ on:
         description: >-
           Ref of Comfy-Org/github-workflows to load the groom briefs + ledger
           from. LEAVE UNSET (the default): the assets are then checked out from
-          `github.job_workflow_sha` — the exact commit this reusable workflow was
+          `job.workflow_sha` — the exact commit this reusable workflow was
           resolved from via the caller's `uses:` pin — so the briefs + ledger
           always match the logic running them, with nothing for the caller to
           keep in sync. Set this ONLY to override that (e.g. test briefs from a
-          branch while pinning `uses:` elsewhere).
+          branch while pinning `uses:` elsewhere). It is `job.workflow_sha`, the
+          `job`-context accessor added in runner v2.334.0 — NOT the
+          `github.job_workflow_sha` this used to name, which is an OIDC token
+          claim rather than a `github` context property and expands to '' (the
+          silent default-branch checkout BE-8077 fixed). Every job here fails
+          closed if it resolves empty, so an unset input can no longer degrade to
+          this repo's default branch. (actionlint <= 1.7.12 false-positives on
+          `job.workflow_sha` — its `job`-context schema predates the runner
+          release; nothing in this repo's CI runs actionlint.)
         type: string
         required: false
         default: ''
@@ -607,6 +616,60 @@ jobs:
       # steps. See the resolve step below for why the pin lives in a manifest.
       claude_code_version: ${{ steps.claude_version.outputs.version }}
     steps:
+      - name: Require a resolvable workflows_ref
+        # The asset checkout below falls back to `job.workflow_sha` when the
+        # caller omits `workflows_ref` — the commit the caller's `uses:` pin
+        # resolved to, so the assets always match the logic loading them. That
+        # accessor arrived with runner v2.334.0 (Apr 2026); on anything older
+        # Actions expands an unknown context property to '' rather than erroring,
+        # and `actions/checkout` reads `ref: ''` as "this repo's DEFAULT BRANCH" —
+        # loading mutable briefs and scripts into a job that holds the caller's
+        # ANTHROPIC_API_KEY and App token. Fail closed instead. Every job here is
+        # `ubuntu-latest`, which is always current, so only a stale self-hosted
+        # runner can trip this. (BE-8077, the same shape as cursor-review.yml's
+        # BE-5546 guard for the required-input case.)
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}
+        run: |
+          # Bracket RANGES (`A-Z`) match by COLLATION order, so under a glibc
+          # locale such as en_US.UTF-8 they also match accented letters and the
+          # negated class below quietly stops rejecting them. Hosted runners
+          # default to C.UTF-8, but the case this guard exists for is the stale
+          # SELF-HOSTED runner, whose locale is unknown — so pin the byte order
+          # rather than inherit it.
+          export LC_ALL=C
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form: dropping newlines also stops
+          # a multi-line value from smuggling a ::workflow command:: into the log.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::Cannot resolve a ref for the groom assets: the workflows_ref input is empty AND job.workflow_sha resolved to ''. job.workflow_sha needs an Actions runner >= v2.334.0, so a runner older than that is the only way this happens. Upgrade the runner, or set workflows_ref: to the same commit SHA the caller's uses: line pins."
+            exit 1
+          fi
+          # …but POSIX `[:space:]` is ASCII-only, while the `trim()` behind
+          # core.getInput also strips U+00A0, U+FEFF and friends. A workflows_ref
+          # made purely of those survives the test above and still reaches
+          # checkout as '' — this repo's DEFAULT BRANCH — which is the precise
+          # case this guard exists to fail closed on. The checkout below consumes
+          # the RAW expression, not "$REF", so the value has to be REJECTED here
+          # rather than sanitized. Test the shape positively: a git ref is ASCII,
+          # so anything outside this class fails closed, which also covers the
+          # embedded space/newline case the comment above only half-addressed.
+          # The class is deliberately NARROWER than git's own ref rules, which
+          # also permit `(`, `)`, `,`, `%` and UTF-8 — so a legal branch like
+          # `feat(groom)/x` is rejected here. That is a policy call, not a
+          # validity claim, and the message says so: it excludes every character
+          # that means something to a shell or to a `::workflow command::`, and
+          # it still covers everything this input is meant to carry — a 40-hex
+          # SHA, or a branch/tag for the documented brief-testing override.
+          case "$WORKFLOWS_REF" in
+            *[!A-Za-z0-9._/@+-]*)
+              echo "::error::workflows_ref contains characters outside the set this workflow accepts (A-Z a-z 0-9 . _ / - @ +). That is a deliberate POLICY restriction, narrower than git's own ref rules — not a claim that your ref is invalid: actions/checkout trims Unicode whitespace a shell emptiness test cannot see, and a value it trims to empty would silently load the groom assets from this repo's default branch. Set workflows_ref: to the same commit SHA the caller's uses: line pins (the documented form), or rename the branch if you are using the brief-testing override."
+              exit 1
+              ;;
+          esac
+
       - name: Load groom assets (interval gate)
         # interval.py is loaded from THIS repo at the pinned ref — a single
         # source of truth like the briefs + ledger, never the target checkout.
@@ -614,9 +677,10 @@ jobs:
         with:
           repository: Comfy-Org/github-workflows
           # Default to the exact commit THIS reusable workflow was resolved from
-          # (github.job_workflow_sha), so interval.py can't desync from the logic
-          # loading it; workflows_ref is an explicit override only.
-          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}
+          # (`job.workflow_sha`, NOT `github.job_workflow_sha` — see the guard
+          # above), so interval.py can't desync from the logic loading it;
+          # workflows_ref is an explicit override only.
+          ref: ${{ inputs.workflows_ref || job.workflow_sha }}
           path: _groom_assets
           persist-credentials: false
 
@@ -859,16 +923,21 @@ jobs:
 
       - name: Load the agent CLI pin
         # Deliberately NOT from `$GROOM_ASSETS` (which tracks `inputs.workflows_ref`,
-        # a `required: false` input defaulting to the mutable `main`). Two reasons,
-        # both about this being executable supply chain rather than a brief:
+        # a `required: false` input a caller may legitimately point at a mutable
+        # BRANCH). Two reasons, both about this being executable supply chain
+        # rather than a brief:
         #
-        # 1. A caller that SHA-pins `uses:` but omits `workflows_ref` would have the
-        #    CLI version — and therefore what actually executes inside the three
-        #    agent jobs — governed by a branch tip, while the sandbox flags those
-        #    jobs pass are frozen at the pinned `uses:` SHA. The two could diverge.
+        # 1. A caller that SHA-pins `uses:` but sets `workflows_ref` to a branch —
+        #    the documented brief-testing override — would have the CLI version,
+        #    and therefore what actually executes inside the three agent jobs,
+        #    governed by a branch tip, while the sandbox flags those jobs pass are
+        #    frozen at the pinned `uses:` SHA. The two could diverge.
         #    `job.workflow_sha` IS the commit this very workflow file was read
         #    from, so the pin and the flags that depend on it are always the same
-        #    commit, and SHA-pinning `uses:` alone fully pins the CLI.
+        #    commit, and SHA-pinning `uses:` alone fully pins the CLI. (Since
+        #    BE-8077 the asset checkouts fall back to `job.workflow_sha` too when
+        #    the input is OMITTED, so on that path the two now agree by
+        #    construction — this step simply never depended on them agreeing.)
         # 2. The resolve step below fails CLOSED on a missing manifest. Read from
         #    `workflows_ref`, that turns this repo's documented split-pin state
         #    (Dependabot moves `uses:` and leaves `workflows_ref:` behind — see
@@ -935,11 +1004,14 @@ jobs:
         run: |
           set -euo pipefail
           # WARN rather than fail: an empty `job.workflow_sha` means the checkout
-          # above silently fell back to the default branch, which is no worse than
-          # the pre-BE-5373 behaviour (`workflows_ref` also defaults to `main`) and
-          # is not worth turning into a groom outage. But it does mean the caller's
-          # `uses:` SHA no longer pins the CLI, so it must not pass unremarked —
-          # this is precisely the silent-empty trap `github.job_workflow_sha` sets.
+          # above silently fell back to the default branch. Since BE-8077 that can
+          # only happen when the caller DID set `workflows_ref` (an explicitly
+          # pinned run on a pre-v2.334.0 runner) — with the input omitted, this
+          # job's `Require a resolvable workflows_ref` guard has already failed the
+          # run closed. Degrading the CLI pin is not worth turning that narrower
+          # case into a groom outage, but the caller's `uses:` SHA no longer pins
+          # the CLI, so it must not pass unremarked — this is precisely the
+          # silent-empty trap `github.job_workflow_sha` sets on every runner.
           if [ -z "${WORKFLOW_SHA:-}" ]; then
             echo "::warning::job.workflow_sha is empty, so the agent CLI pin was read from the default branch rather than the ref this workflow was called at. The pin is still validated, but the caller's uses: SHA no longer pins it."
           fi
@@ -1045,6 +1117,60 @@ jobs:
           persist-credentials: false
           path: repo
 
+      - name: Require a resolvable workflows_ref
+        # The asset checkout below falls back to `job.workflow_sha` when the
+        # caller omits `workflows_ref` — the commit the caller's `uses:` pin
+        # resolved to, so the assets always match the logic loading them. That
+        # accessor arrived with runner v2.334.0 (Apr 2026); on anything older
+        # Actions expands an unknown context property to '' rather than erroring,
+        # and `actions/checkout` reads `ref: ''` as "this repo's DEFAULT BRANCH" —
+        # loading mutable briefs and scripts into a job that holds the caller's
+        # ANTHROPIC_API_KEY and App token. Fail closed instead. Every job here is
+        # `ubuntu-latest`, which is always current, so only a stale self-hosted
+        # runner can trip this. (BE-8077, the same shape as cursor-review.yml's
+        # BE-5546 guard for the required-input case.)
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}
+        run: |
+          # Bracket RANGES (`A-Z`) match by COLLATION order, so under a glibc
+          # locale such as en_US.UTF-8 they also match accented letters and the
+          # negated class below quietly stops rejecting them. Hosted runners
+          # default to C.UTF-8, but the case this guard exists for is the stale
+          # SELF-HOSTED runner, whose locale is unknown — so pin the byte order
+          # rather than inherit it.
+          export LC_ALL=C
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form: dropping newlines also stops
+          # a multi-line value from smuggling a ::workflow command:: into the log.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::Cannot resolve a ref for the groom assets: the workflows_ref input is empty AND job.workflow_sha resolved to ''. job.workflow_sha needs an Actions runner >= v2.334.0, so a runner older than that is the only way this happens. Upgrade the runner, or set workflows_ref: to the same commit SHA the caller's uses: line pins."
+            exit 1
+          fi
+          # …but POSIX `[:space:]` is ASCII-only, while the `trim()` behind
+          # core.getInput also strips U+00A0, U+FEFF and friends. A workflows_ref
+          # made purely of those survives the test above and still reaches
+          # checkout as '' — this repo's DEFAULT BRANCH — which is the precise
+          # case this guard exists to fail closed on. The checkout below consumes
+          # the RAW expression, not "$REF", so the value has to be REJECTED here
+          # rather than sanitized. Test the shape positively: a git ref is ASCII,
+          # so anything outside this class fails closed, which also covers the
+          # embedded space/newline case the comment above only half-addressed.
+          # The class is deliberately NARROWER than git's own ref rules, which
+          # also permit `(`, `)`, `,`, `%` and UTF-8 — so a legal branch like
+          # `feat(groom)/x` is rejected here. That is a policy call, not a
+          # validity claim, and the message says so: it excludes every character
+          # that means something to a shell or to a `::workflow command::`, and
+          # it still covers everything this input is meant to carry — a 40-hex
+          # SHA, or a branch/tag for the documented brief-testing override.
+          case "$WORKFLOWS_REF" in
+            *[!A-Za-z0-9._/@+-]*)
+              echo "::error::workflows_ref contains characters outside the set this workflow accepts (A-Z a-z 0-9 . _ / - @ +). That is a deliberate POLICY restriction, narrower than git's own ref rules — not a claim that your ref is invalid: actions/checkout trims Unicode whitespace a shell emptiness test cannot see, and a value it trims to empty would silently load the groom assets from this repo's default branch. Set workflows_ref: to the same commit SHA the caller's uses: line pins (the documented form), or rename the branch if you are using the brief-testing override."
+              exit 1
+              ;;
+          esac
+
       - name: Load groom assets (briefs)
         # Trusted briefs come from THIS workflow's repo (public, pinned to the
         # workflow's own resolved commit) — never from the target checkout, so a
@@ -1053,9 +1179,10 @@ jobs:
         with:
           repository: Comfy-Org/github-workflows
           # Default to the exact commit THIS reusable workflow was resolved from
-          # (github.job_workflow_sha), so the briefs + ledger can't desync from
-          # the logic loading them; workflows_ref is an explicit override only.
-          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}
+          # (`job.workflow_sha`, NOT `github.job_workflow_sha` — see the guard
+          # above), so the briefs + ledger can't desync from the logic loading
+          # them; workflows_ref is an explicit override only.
+          ref: ${{ inputs.workflows_ref || job.workflow_sha }}
           path: _groom_assets
           persist-credentials: false
 
@@ -1466,6 +1593,60 @@ jobs:
           persist-credentials: false
           path: repo
 
+      - name: Require a resolvable workflows_ref
+        # The asset checkout below falls back to `job.workflow_sha` when the
+        # caller omits `workflows_ref` — the commit the caller's `uses:` pin
+        # resolved to, so the assets always match the logic loading them. That
+        # accessor arrived with runner v2.334.0 (Apr 2026); on anything older
+        # Actions expands an unknown context property to '' rather than erroring,
+        # and `actions/checkout` reads `ref: ''` as "this repo's DEFAULT BRANCH" —
+        # loading mutable briefs and scripts into a job that holds the caller's
+        # ANTHROPIC_API_KEY and App token. Fail closed instead. Every job here is
+        # `ubuntu-latest`, which is always current, so only a stale self-hosted
+        # runner can trip this. (BE-8077, the same shape as cursor-review.yml's
+        # BE-5546 guard for the required-input case.)
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}
+        run: |
+          # Bracket RANGES (`A-Z`) match by COLLATION order, so under a glibc
+          # locale such as en_US.UTF-8 they also match accented letters and the
+          # negated class below quietly stops rejecting them. Hosted runners
+          # default to C.UTF-8, but the case this guard exists for is the stale
+          # SELF-HOSTED runner, whose locale is unknown — so pin the byte order
+          # rather than inherit it.
+          export LC_ALL=C
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form: dropping newlines also stops
+          # a multi-line value from smuggling a ::workflow command:: into the log.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::Cannot resolve a ref for the groom assets: the workflows_ref input is empty AND job.workflow_sha resolved to ''. job.workflow_sha needs an Actions runner >= v2.334.0, so a runner older than that is the only way this happens. Upgrade the runner, or set workflows_ref: to the same commit SHA the caller's uses: line pins."
+            exit 1
+          fi
+          # …but POSIX `[:space:]` is ASCII-only, while the `trim()` behind
+          # core.getInput also strips U+00A0, U+FEFF and friends. A workflows_ref
+          # made purely of those survives the test above and still reaches
+          # checkout as '' — this repo's DEFAULT BRANCH — which is the precise
+          # case this guard exists to fail closed on. The checkout below consumes
+          # the RAW expression, not "$REF", so the value has to be REJECTED here
+          # rather than sanitized. Test the shape positively: a git ref is ASCII,
+          # so anything outside this class fails closed, which also covers the
+          # embedded space/newline case the comment above only half-addressed.
+          # The class is deliberately NARROWER than git's own ref rules, which
+          # also permit `(`, `)`, `,`, `%` and UTF-8 — so a legal branch like
+          # `feat(groom)/x` is rejected here. That is a policy call, not a
+          # validity claim, and the message says so: it excludes every character
+          # that means something to a shell or to a `::workflow command::`, and
+          # it still covers everything this input is meant to carry — a 40-hex
+          # SHA, or a branch/tag for the documented brief-testing override.
+          case "$WORKFLOWS_REF" in
+            *[!A-Za-z0-9._/@+-]*)
+              echo "::error::workflows_ref contains characters outside the set this workflow accepts (A-Z a-z 0-9 . _ / - @ +). That is a deliberate POLICY restriction, narrower than git's own ref rules — not a claim that your ref is invalid: actions/checkout trims Unicode whitespace a shell emptiness test cannot see, and a value it trims to empty would silently load the groom assets from this repo's default branch. Set workflows_ref: to the same commit SHA the caller's uses: line pins (the documented form), or rename the branch if you are using the brief-testing override."
+              exit 1
+              ;;
+          esac
+
       - name: Load groom assets (briefs)
         # Re-fetched fresh from THIS repo — never inherited from the finder job,
         # so a tampered brief cannot cross the job boundary.
@@ -1473,9 +1654,10 @@ jobs:
         with:
           repository: Comfy-Org/github-workflows
           # Default to the exact commit THIS reusable workflow was resolved from
-          # (github.job_workflow_sha), so the briefs + ledger can't desync from
-          # the logic loading them; workflows_ref is an explicit override only.
-          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}
+          # (`job.workflow_sha`, NOT `github.job_workflow_sha` — see the guard
+          # above), so the briefs + ledger can't desync from the logic loading
+          # them; workflows_ref is an explicit override only.
+          ref: ${{ inputs.workflows_ref || job.workflow_sha }}
           path: _groom_assets
           persist-credentials: false
 
@@ -1820,14 +2002,69 @@ jobs:
           permission-issues: read
           permission-pull-requests: read
 
+      - name: Require a resolvable workflows_ref
+        # The asset checkout below falls back to `job.workflow_sha` when the
+        # caller omits `workflows_ref` — the commit the caller's `uses:` pin
+        # resolved to, so the assets always match the logic loading them. That
+        # accessor arrived with runner v2.334.0 (Apr 2026); on anything older
+        # Actions expands an unknown context property to '' rather than erroring,
+        # and `actions/checkout` reads `ref: ''` as "this repo's DEFAULT BRANCH" —
+        # loading mutable briefs and scripts into a job that holds the caller's
+        # ANTHROPIC_API_KEY and App token. Fail closed instead. Every job here is
+        # `ubuntu-latest`, which is always current, so only a stale self-hosted
+        # runner can trip this. (BE-8077, the same shape as cursor-review.yml's
+        # BE-5546 guard for the required-input case.)
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}
+        run: |
+          # Bracket RANGES (`A-Z`) match by COLLATION order, so under a glibc
+          # locale such as en_US.UTF-8 they also match accented letters and the
+          # negated class below quietly stops rejecting them. Hosted runners
+          # default to C.UTF-8, but the case this guard exists for is the stale
+          # SELF-HOSTED runner, whose locale is unknown — so pin the byte order
+          # rather than inherit it.
+          export LC_ALL=C
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form: dropping newlines also stops
+          # a multi-line value from smuggling a ::workflow command:: into the log.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::Cannot resolve a ref for the groom assets: the workflows_ref input is empty AND job.workflow_sha resolved to ''. job.workflow_sha needs an Actions runner >= v2.334.0, so a runner older than that is the only way this happens. Upgrade the runner, or set workflows_ref: to the same commit SHA the caller's uses: line pins."
+            exit 1
+          fi
+          # …but POSIX `[:space:]` is ASCII-only, while the `trim()` behind
+          # core.getInput also strips U+00A0, U+FEFF and friends. A workflows_ref
+          # made purely of those survives the test above and still reaches
+          # checkout as '' — this repo's DEFAULT BRANCH — which is the precise
+          # case this guard exists to fail closed on. The checkout below consumes
+          # the RAW expression, not "$REF", so the value has to be REJECTED here
+          # rather than sanitized. Test the shape positively: a git ref is ASCII,
+          # so anything outside this class fails closed, which also covers the
+          # embedded space/newline case the comment above only half-addressed.
+          # The class is deliberately NARROWER than git's own ref rules, which
+          # also permit `(`, `)`, `,`, `%` and UTF-8 — so a legal branch like
+          # `feat(groom)/x` is rejected here. That is a policy call, not a
+          # validity claim, and the message says so: it excludes every character
+          # that means something to a shell or to a `::workflow command::`, and
+          # it still covers everything this input is meant to carry — a 40-hex
+          # SHA, or a branch/tag for the documented brief-testing override.
+          case "$WORKFLOWS_REF" in
+            *[!A-Za-z0-9._/@+-]*)
+              echo "::error::workflows_ref contains characters outside the set this workflow accepts (A-Z a-z 0-9 . _ / - @ +). That is a deliberate POLICY restriction, narrower than git's own ref rules — not a claim that your ref is invalid: actions/checkout trims Unicode whitespace a shell emptiness test cannot see, and a value it trims to empty would silently load the groom assets from this repo's default branch. Set workflows_ref: to the same commit SHA the caller's uses: line pins (the documented form), or rename the branch if you are using the brief-testing override."
+              exit 1
+              ;;
+          esac
+
       - name: Load groom assets (ledger)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Comfy-Org/github-workflows
           # Default to the exact commit THIS reusable workflow was resolved from
-          # (github.job_workflow_sha), so the briefs + ledger can't desync from
-          # the logic loading them; workflows_ref is an explicit override only.
-          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}
+          # (`job.workflow_sha`, NOT `github.job_workflow_sha` — see the guard
+          # above), so the briefs + ledger can't desync from the logic loading
+          # them; workflows_ref is an explicit override only.
+          ref: ${{ inputs.workflows_ref || job.workflow_sha }}
           path: _groom_assets
           persist-credentials: false
 
@@ -1968,14 +2205,69 @@ jobs:
           # Least privilege: this job only opens `groom` issues (+ their labels).
           permission-issues: write
 
+      - name: Require a resolvable workflows_ref
+        # The asset checkout below falls back to `job.workflow_sha` when the
+        # caller omits `workflows_ref` — the commit the caller's `uses:` pin
+        # resolved to, so the assets always match the logic loading them. That
+        # accessor arrived with runner v2.334.0 (Apr 2026); on anything older
+        # Actions expands an unknown context property to '' rather than erroring,
+        # and `actions/checkout` reads `ref: ''` as "this repo's DEFAULT BRANCH" —
+        # loading mutable briefs and scripts into a job that holds the caller's
+        # ANTHROPIC_API_KEY and App token. Fail closed instead. Every job here is
+        # `ubuntu-latest`, which is always current, so only a stale self-hosted
+        # runner can trip this. (BE-8077, the same shape as cursor-review.yml's
+        # BE-5546 guard for the required-input case.)
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}
+        run: |
+          # Bracket RANGES (`A-Z`) match by COLLATION order, so under a glibc
+          # locale such as en_US.UTF-8 they also match accented letters and the
+          # negated class below quietly stops rejecting them. Hosted runners
+          # default to C.UTF-8, but the case this guard exists for is the stale
+          # SELF-HOSTED runner, whose locale is unknown — so pin the byte order
+          # rather than inherit it.
+          export LC_ALL=C
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form: dropping newlines also stops
+          # a multi-line value from smuggling a ::workflow command:: into the log.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::Cannot resolve a ref for the groom assets: the workflows_ref input is empty AND job.workflow_sha resolved to ''. job.workflow_sha needs an Actions runner >= v2.334.0, so a runner older than that is the only way this happens. Upgrade the runner, or set workflows_ref: to the same commit SHA the caller's uses: line pins."
+            exit 1
+          fi
+          # …but POSIX `[:space:]` is ASCII-only, while the `trim()` behind
+          # core.getInput also strips U+00A0, U+FEFF and friends. A workflows_ref
+          # made purely of those survives the test above and still reaches
+          # checkout as '' — this repo's DEFAULT BRANCH — which is the precise
+          # case this guard exists to fail closed on. The checkout below consumes
+          # the RAW expression, not "$REF", so the value has to be REJECTED here
+          # rather than sanitized. Test the shape positively: a git ref is ASCII,
+          # so anything outside this class fails closed, which also covers the
+          # embedded space/newline case the comment above only half-addressed.
+          # The class is deliberately NARROWER than git's own ref rules, which
+          # also permit `(`, `)`, `,`, `%` and UTF-8 — so a legal branch like
+          # `feat(groom)/x` is rejected here. That is a policy call, not a
+          # validity claim, and the message says so: it excludes every character
+          # that means something to a shell or to a `::workflow command::`, and
+          # it still covers everything this input is meant to carry — a 40-hex
+          # SHA, or a branch/tag for the documented brief-testing override.
+          case "$WORKFLOWS_REF" in
+            *[!A-Za-z0-9._/@+-]*)
+              echo "::error::workflows_ref contains characters outside the set this workflow accepts (A-Z a-z 0-9 . _ / - @ +). That is a deliberate POLICY restriction, narrower than git's own ref rules — not a claim that your ref is invalid: actions/checkout trims Unicode whitespace a shell emptiness test cannot see, and a value it trims to empty would silently load the groom assets from this repo's default branch. Set workflows_ref: to the same commit SHA the caller's uses: line pins (the documented form), or rename the branch if you are using the brief-testing override."
+              exit 1
+              ;;
+          esac
+
       - name: Load groom assets (ledger)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Comfy-Org/github-workflows
           # Default to the exact commit THIS reusable workflow was resolved from
-          # (github.job_workflow_sha), so the briefs + ledger can't desync from
-          # the logic loading them; workflows_ref is an explicit override only.
-          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}
+          # (`job.workflow_sha`, NOT `github.job_workflow_sha` — see the guard
+          # above), so the briefs + ledger can't desync from the logic loading
+          # them; workflows_ref is an explicit override only.
+          ref: ${{ inputs.workflows_ref || job.workflow_sha }}
           path: _groom_assets
           persist-credentials: false
 
@@ -2157,14 +2449,69 @@ jobs:
           persist-credentials: false
           path: repo
 
+      - name: Require a resolvable workflows_ref
+        # The asset checkout below falls back to `job.workflow_sha` when the
+        # caller omits `workflows_ref` — the commit the caller's `uses:` pin
+        # resolved to, so the assets always match the logic loading them. That
+        # accessor arrived with runner v2.334.0 (Apr 2026); on anything older
+        # Actions expands an unknown context property to '' rather than erroring,
+        # and `actions/checkout` reads `ref: ''` as "this repo's DEFAULT BRANCH" —
+        # loading mutable briefs and scripts into a job that holds the caller's
+        # ANTHROPIC_API_KEY and App token. Fail closed instead. Every job here is
+        # `ubuntu-latest`, which is always current, so only a stale self-hosted
+        # runner can trip this. (BE-8077, the same shape as cursor-review.yml's
+        # BE-5546 guard for the required-input case.)
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}
+        run: |
+          # Bracket RANGES (`A-Z`) match by COLLATION order, so under a glibc
+          # locale such as en_US.UTF-8 they also match accented letters and the
+          # negated class below quietly stops rejecting them. Hosted runners
+          # default to C.UTF-8, but the case this guard exists for is the stale
+          # SELF-HOSTED runner, whose locale is unknown — so pin the byte order
+          # rather than inherit it.
+          export LC_ALL=C
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form: dropping newlines also stops
+          # a multi-line value from smuggling a ::workflow command:: into the log.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::Cannot resolve a ref for the groom assets: the workflows_ref input is empty AND job.workflow_sha resolved to ''. job.workflow_sha needs an Actions runner >= v2.334.0, so a runner older than that is the only way this happens. Upgrade the runner, or set workflows_ref: to the same commit SHA the caller's uses: line pins."
+            exit 1
+          fi
+          # …but POSIX `[:space:]` is ASCII-only, while the `trim()` behind
+          # core.getInput also strips U+00A0, U+FEFF and friends. A workflows_ref
+          # made purely of those survives the test above and still reaches
+          # checkout as '' — this repo's DEFAULT BRANCH — which is the precise
+          # case this guard exists to fail closed on. The checkout below consumes
+          # the RAW expression, not "$REF", so the value has to be REJECTED here
+          # rather than sanitized. Test the shape positively: a git ref is ASCII,
+          # so anything outside this class fails closed, which also covers the
+          # embedded space/newline case the comment above only half-addressed.
+          # The class is deliberately NARROWER than git's own ref rules, which
+          # also permit `(`, `)`, `,`, `%` and UTF-8 — so a legal branch like
+          # `feat(groom)/x` is rejected here. That is a policy call, not a
+          # validity claim, and the message says so: it excludes every character
+          # that means something to a shell or to a `::workflow command::`, and
+          # it still covers everything this input is meant to carry — a 40-hex
+          # SHA, or a branch/tag for the documented brief-testing override.
+          case "$WORKFLOWS_REF" in
+            *[!A-Za-z0-9._/@+-]*)
+              echo "::error::workflows_ref contains characters outside the set this workflow accepts (A-Z a-z 0-9 . _ / - @ +). That is a deliberate POLICY restriction, narrower than git's own ref rules — not a claim that your ref is invalid: actions/checkout trims Unicode whitespace a shell emptiness test cannot see, and a value it trims to empty would silently load the groom assets from this repo's default branch. Set workflows_ref: to the same commit SHA the caller's uses: line pins (the documented form), or rename the branch if you are using the brief-testing override."
+              exit 1
+              ;;
+          esac
+
       - name: Load groom assets (builder brief)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Comfy-Org/github-workflows
           # Default to the exact commit THIS reusable workflow was resolved from
-          # (github.job_workflow_sha), so the briefs + ledger can't desync from
-          # the logic loading them; workflows_ref is an explicit override only.
-          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}
+          # (`job.workflow_sha`, NOT `github.job_workflow_sha` — see the guard
+          # above), so the briefs + ledger can't desync from the logic loading
+          # them; workflows_ref is an explicit override only.
+          ref: ${{ inputs.workflows_ref || job.workflow_sha }}
           path: _groom_assets
           persist-credentials: false
 
@@ -2597,14 +2944,69 @@ jobs:
           permission-pull-requests: write
           permission-issues: write
 
+      - name: Require a resolvable workflows_ref
+        # The asset checkout below falls back to `job.workflow_sha` when the
+        # caller omits `workflows_ref` — the commit the caller's `uses:` pin
+        # resolved to, so the assets always match the logic loading them. That
+        # accessor arrived with runner v2.334.0 (Apr 2026); on anything older
+        # Actions expands an unknown context property to '' rather than erroring,
+        # and `actions/checkout` reads `ref: ''` as "this repo's DEFAULT BRANCH" —
+        # loading mutable briefs and scripts into a job that holds the caller's
+        # ANTHROPIC_API_KEY and App token. Fail closed instead. Every job here is
+        # `ubuntu-latest`, which is always current, so only a stale self-hosted
+        # runner can trip this. (BE-8077, the same shape as cursor-review.yml's
+        # BE-5546 guard for the required-input case.)
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}
+        run: |
+          # Bracket RANGES (`A-Z`) match by COLLATION order, so under a glibc
+          # locale such as en_US.UTF-8 they also match accented letters and the
+          # negated class below quietly stops rejecting them. Hosted runners
+          # default to C.UTF-8, but the case this guard exists for is the stale
+          # SELF-HOSTED runner, whose locale is unknown — so pin the byte order
+          # rather than inherit it.
+          export LC_ALL=C
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form: dropping newlines also stops
+          # a multi-line value from smuggling a ::workflow command:: into the log.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::Cannot resolve a ref for the groom assets: the workflows_ref input is empty AND job.workflow_sha resolved to ''. job.workflow_sha needs an Actions runner >= v2.334.0, so a runner older than that is the only way this happens. Upgrade the runner, or set workflows_ref: to the same commit SHA the caller's uses: line pins."
+            exit 1
+          fi
+          # …but POSIX `[:space:]` is ASCII-only, while the `trim()` behind
+          # core.getInput also strips U+00A0, U+FEFF and friends. A workflows_ref
+          # made purely of those survives the test above and still reaches
+          # checkout as '' — this repo's DEFAULT BRANCH — which is the precise
+          # case this guard exists to fail closed on. The checkout below consumes
+          # the RAW expression, not "$REF", so the value has to be REJECTED here
+          # rather than sanitized. Test the shape positively: a git ref is ASCII,
+          # so anything outside this class fails closed, which also covers the
+          # embedded space/newline case the comment above only half-addressed.
+          # The class is deliberately NARROWER than git's own ref rules, which
+          # also permit `(`, `)`, `,`, `%` and UTF-8 — so a legal branch like
+          # `feat(groom)/x` is rejected here. That is a policy call, not a
+          # validity claim, and the message says so: it excludes every character
+          # that means something to a shell or to a `::workflow command::`, and
+          # it still covers everything this input is meant to carry — a 40-hex
+          # SHA, or a branch/tag for the documented brief-testing override.
+          case "$WORKFLOWS_REF" in
+            *[!A-Za-z0-9._/@+-]*)
+              echo "::error::workflows_ref contains characters outside the set this workflow accepts (A-Z a-z 0-9 . _ / - @ +). That is a deliberate POLICY restriction, narrower than git's own ref rules — not a claim that your ref is invalid: actions/checkout trims Unicode whitespace a shell emptiness test cannot see, and a value it trims to empty would silently load the groom assets from this repo's default branch. Set workflows_ref: to the same commit SHA the caller's uses: line pins (the documented form), or rename the branch if you are using the brief-testing override."
+              exit 1
+              ;;
+          esac
+
       - name: Load groom assets (signature marker)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Comfy-Org/github-workflows
           # Default to the exact commit THIS reusable workflow was resolved from
-          # (github.job_workflow_sha), so the briefs + ledger can't desync from
-          # the logic loading them; workflows_ref is an explicit override only.
-          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}
+          # (`job.workflow_sha`, NOT `github.job_workflow_sha` — see the guard
+          # above), so the briefs + ledger can't desync from the logic loading
+          # them; workflows_ref is an explicit override only.
+          ref: ${{ inputs.workflows_ref || job.workflow_sha }}
           path: _groom_assets
           persist-credentials: false
 

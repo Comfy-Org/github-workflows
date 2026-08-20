@@ -97,8 +97,9 @@ tests — run the matching command above for whatever you touched.
   and rewrites just the reviewer lists for a drift PR. Tests in `tests/`.
 - `.github/workflow-pins/` — `check_workflow_pins.py` + `tests/`: the lint
   forbidding a `default:` on `workflows_ref` and requiring the empty-ref guard
-  at every checkout, with an exception for the `github.job_workflow_sha`
-  self-pin (BE-4169, see below).
+  at every checkout. The `job.workflow_sha` self-pin is exempt from the
+  `default:` half only — it stops the ref being MUTABLE, not being EMPTY, so it
+  still has to carry a guard (BE-4169, corrected by BE-8077; see below).
 - `.github/bump-callers/` — `bump-callers.sh`, the ONE fleet-agnostic script
   that opens SHA-bump PRs in consumer repos when a reusable workflow changes,
   plus `preflight.sh` (BE-6475), the ONE staleness/decommission guard that runs
@@ -144,8 +145,8 @@ tests — run the matching command above for whatever you touched.
   against the vendored CodeRabbit schema, on the PR that breaks it. CodeRabbit
   rejects an invalid config WHOLE (everything in it goes inert) and validates the
   BASE branch, so the breakage otherwise surfaces one PR late on the wrong diff.
-  Parse/`maxLength`/type errors FAIL; an unknown key WARNS (only where the schema
-  CLOSES the object) unless `strict_unknown_keys: true`; an absent file passes,
+  Parse/`maxLength`/type errors FAIL; an unknown key WARNS wherever its object is
+  closed (`additionalProperties: false`, 5; or by omission, 103) unless `strict_unknown_keys: true`; an absent file passes,
   though the other extension spelling is validated, not called absent. A SIBLING of
   agents-md-integrity, deliberately not an extension of it — that workflow is
   scoped to agent-instruction files, and folding this in would push a Python
@@ -204,9 +205,16 @@ tests — run the matching command above for whatever you touched.
   lets a caller SHA-pin `uses:` yet load mutable scripts, and `required:` is
   unenforced for `workflow_call` (omitted → `''` → `actions/checkout` takes the
   default branch) — hence the empty-ref guard, in the checkout's OWN job.
-  `groom.yml` is the sanctioned exception (BE-4169): it defaults to `''` and its
-  checkouts fall back to `github.job_workflow_sha` — the exact, immutable commit
-  the reusable resolved from — so an omitted input can't reach a mutable ref.
+  `groom.yml` is the sanctioned exception (BE-4169, fixed in BE-8077): it
+  defaults to `''` and its checkouts fall back to `job.workflow_sha` — the exact,
+  immutable commit the reusable resolved from — so an omitted input can't reach a
+  mutable ref. It is `job.workflow_sha`, NOT `github.job_workflow_sha`: that one
+  is an OIDC claim, not a `github` context property, so it expands to `''` and
+  checkout takes the default branch — which is why every one of those jobs also
+  runs a fail-closed empty-ref guard (`job.workflow_sha` needs runner v2.334.0+),
+  and why the pin lint now FLAGS the old spelling. `cursor-review.yml`'s
+  never-fail ledger job warns and skips its checkout instead. (actionlint
+  ≤ 1.7.12 false-positives on `job.workflow_sha`; nothing here runs actionlint.)
 - **Scripts are the single source of truth**, loaded at run time from a pinned
   ref of THIS repo — never from the caller's checkout. That's what makes the
   reviewer/checker tamper-proof: a PR can't rewrite the logic judging it. The
