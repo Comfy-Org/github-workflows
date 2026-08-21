@@ -107,12 +107,15 @@ default branch, so the checkout runs **unconditionally** at a mutable ref — th
 exact hole this lint exists to close, on the one spelling where it was
 fail-open. A per-job step-id pre-scan now separates the two cases: a `ref:`
 resolved from an EARLIER step that exists but never touches `workflows_ref`
-stays out of scope, while a dangling id fails with its own message (the
+stays out of scope — in **any** operand position, since the lint has no claim
+on that step either way — while a dangling id fails with its own message (the
 BE-8130 remedies don't apply — adding the `if:` on a nonexistent output guards
 nothing that will ever run; the fix is the id itself, or the step order). Only
 a `ref:` that is a step's `with:` INPUT is judged this way — a job-level
 `outputs:` mapping or a `ref:` line inside a `run:` heredoc is not a checkout
-and is left alone, as it always was.
+and is left alone, as it always was — including a heredoc emitting a whole
+STEP, where the enclosing key is a `with:` the script itself printed: an open
+`|`/`>` block scalar is tracked so its body is read as text, not structure.
 
 **`||` fallbacks are read on this path too, with leading-operand judgment
 (BE-8215).** `ref: ${{ steps.<id>.outputs.<name> || 'main' }}` used to match
@@ -135,15 +138,23 @@ counts more mentions than the second could account for, the site is reported —
 the lint says it cannot judge this expression and names the spellings it can.
 Unrecognized spellings include a fallback containing a brace
 (`|| format('refs/heads/{0}', 'main')`), a parenthesized operand
-(`(steps.<id>.outputs.<name>) || 'main'`), `&&` rather than `||`, and — in the
-flow form only, whose entry boundary is a comma — a fallback containing one
-(`|| 'a,b'`). Each of those used to match nothing and record no site, so the
-lint PASSED a workflow it had never read while failing the identical one
-spelled bare. Write the ref as a bare `${{ steps.<id>.outputs.<name> }}` under
-the exact `if:`, or as that expression with a trailing `|| <literal>` fallback,
-and it is covered. The reader does not evaluate `format()`, `&&` or
-parenthesized expressions on purpose: an unknown spelling asks its author for a
-supported one rather than growing an expression parser inside the lint.
+(`(steps.<id>.outputs.<name>) || 'main'`), a TRAILING `&&`
+(`${{ steps.<id>.outputs.<name> && 'main' }}`), and — in the flow form only,
+whose interpolation body still stops at a comma even though `BE-8253` made its
+*entry* boundary interpolation-aware — a fallback whose literal contains one
+(`with: {ref: "${{ steps.<id>.outputs.<name> || 'a,b' }}"}`; the block form
+reads this spelling fine). Each of those used to match nothing and record no
+site, so the lint PASSED a workflow it had never read while failing the
+identical one spelled bare; now the site is reported `'unparsed'` and refused.
+A *leading* `&&` is the opposite case, not this one: it MATCHES, nothing but an
+`||` chain clears the leading-operand check, and a site the lint has a claim on
+at all — one naming a resolver, or a dangling id — fails as `non-leading`, red
+CI rather than silence. Write the ref as a bare
+`${{ steps.<id>.outputs.<name> }}` under the exact `if:`, or as that expression
+with a trailing `|| <literal>` fallback, and it is covered. The reader does not
+evaluate `format()`, `&&` or parenthesized expressions on purpose: an unknown
+spelling asks its author for a supported one rather than growing an expression
+parser inside the lint.
 
 **Every operand is judged, and the strongest requirement wins (BE-8253).** A
 `ref:` value can read more than one step output, and each one is a ref the

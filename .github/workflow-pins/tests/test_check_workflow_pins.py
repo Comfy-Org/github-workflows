@@ -1349,6 +1349,138 @@ class GuardCoverageTests(unittest.TestCase):
         )
         self.assertEqual(cwp.ref_checkouts(self._wrap(heredoc).split("\n")), [])
 
+    def test_an_unrelated_earlier_step_stays_out_of_scope_in_any_operand_position(self):
+        # `ref: ${{ inputs.pr_sha || steps.detect.outputs.sha }}` resolved from
+        # a REAL earlier step that never touches `workflows_ref` is an ordinary
+        # checkout this lint has no claim on. Judging operand order ahead of
+        # scope hoisted it past the out-of-scope return and hard-failed it as
+        # 'non-leading' — printing an error that demands an operand reorder,
+        # which changes the workflow's runtime semantics.
+        ref = "${{ inputs.pr_sha || steps.resolve_ref.outputs.ref }}"
+        steps = self.UNRELATED_RESOLVER + self._step_output_checkout(ref=ref)
+        self.assertEqual(cwp.ref_checkouts(self._wrap(steps).split("\n")), [])
+        # …and the same step in the LEADING position is equally out of scope,
+        # which is the behavior that was already correct.
+        self.assertEqual(
+            cwp.ref_checkouts(
+                self._wrap(
+                    self.UNRELATED_RESOLVER + self._step_output_checkout()
+                ).split("\n")
+            ),
+            [],
+        )
+
+    def test_a_dangling_id_behind_a_leading_operand_is_reported_non_leading(self):
+        # Scope moved ahead of operand order; the ordering between DANGLING and
+        # 'non-leading' did not. With the leading operand winning, the output is
+        # never consulted, so "no such step" is a red herring and fixing the id
+        # changes nothing — operand order is the only fix, and it needs the
+        # message that says so.
+        ref = "${{ 'main' || steps.resolve_reff.outputs.ref }}"
+        sites = cwp.ref_checkouts(
+            self._wrap(self.RESOLVER + self._step_output_checkout(ref=ref)).split("\n")
+        )
+        self.assertEqual(
+            [(fb, guarded, via) for _, fb, guarded, via in sites],
+            [(False, False, "non-leading")],
+        )
+
+    def test_a_with_key_on_the_list_marker_line_is_seen(self):
+        # Mapping keys are unordered, so `- with:` ahead of `uses:` is valid
+        # Actions YAML — and the marker holds the key column, exactly as it does
+        # for `- id:` and `- if:`. Without the same normalization the `with:`
+        # gate answers False and the site is DROPPED, turning a fail-closed
+        # report into a silent fail-open on the shape the lint exists to close.
+        marker = (
+            "      - with:\n"
+            "          ref: ${{ steps.resolve_ref.outputs.ref }}\n"
+            "        uses: actions/checkout@abc\n"
+        )
+        self.assertEqual(len(self._jobs(self.RESOLVER + marker)), 1)
+        # …and it is a real COVERED site once the exact `if:` is on it, rather
+        # than passing by being invisible.
+        guarded_marker = marker + self.EXACT_IF
+        sites = cwp.ref_checkouts(self._wrap(self.RESOLVER + guarded_marker).split("\n"))
+        self.assertEqual(
+            [(fb, guarded, via) for _, fb, guarded, via in sites], [(False, True, True)]
+        )
+
+    def test_a_heredoc_emitting_a_whole_step_is_not_a_checkout(self):
+        # The flat heredoc is not the only shape: a script emitting a STEP puts
+        # the word `with:` at exactly the indent the enclosing-key walk stops
+        # on, so indentation alone reads script output as an action input and
+        # hard-fails a compliant workflow. The open `|` block scalar is what
+        # tells the two apart. Both the block and the flow spelling.
+        for emitted in (
+            "          with:\n            ref: ${{ steps.resolve_ref.outputs.ref }}\n",
+            '          - uses: actions/checkout@abc\n'
+            '            with: {ref: "${{ steps.resolve_ref.outputs.ref }}"}\n',
+        ):
+            with self.subTest(emitted=emitted.strip()):
+                heredoc = (
+                    "      - name: Write a fixture\n"
+                    "        run: |\n"
+                    "          cat <<'EOF' > f.yml\n" + emitted + "          EOF\n"
+                )
+                self.assertEqual(cwp.ref_checkouts(self._wrap(heredoc).split("\n")), [])
+        # The scalar CLOSES: a real checkout after the heredoc is still judged.
+        after = (
+            "      - name: Write a fixture\n"
+            "        run: |\n"
+            "          cat <<'EOF' > f.yml\n"
+            "          with:\n"
+            "          EOF\n"
+        ) + self._step_output_checkout()
+        self.assertEqual(len(self._jobs(self.RESOLVER + after)), 1)
+
+    def test_a_folded_ref_split_across_lines_is_read_as_one_expression(self):
+        # `ref: >-` folds its continuation lines into ONE value, so an
+        # expression split across two of them is at runtime exactly the
+        # mutable-fallback ref BE-8215 closed. Matching each physical line on
+        # its own left a single newline enough to hide it.
+        split = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: >-\n"
+            "            ${{ steps.resolve_ref.outputs.ref ||\n"
+            "            'main' }}\n"
+        )
+        self.assertEqual(len(self._jobs(self.RESOLVER + split)), 1)
+        # Reported at the `ref:` KEY line — the checkout the reader must find —
+        # as the single-line continuation spelling already is.
+        text = self._wrap(self.RESOLVER + split).split("\n")
+        self.assertEqual(text[cwp.find_unguarded_ref_checkouts(text)[0] - 1].strip(), "ref: >-")
+        # …and the exact `if:` on the consuming step still covers it.
+        guarded = split.replace(
+            "      - name: Load assets\n",
+            "      - name: Load assets\n" + self.EXACT_IF,
+            1,
+        )
+        self.assertEqual(self._jobs(self.RESOLVER + guarded), [])
+
+    def test_a_folded_unparseable_ref_split_across_lines_is_still_refused(self):
+        # The fold-join (BE-8220) and the two-tier reader (BE-8253) compose: a
+        # spelling this reader can never parse — a TRAILING `&&` — split
+        # across the same two physical lines the fold test above joins into a
+        # PARSEABLE expression. The single first line alone reads `UNPARSED`
+        # (an unclosed `${{`), which must not be finalized early — that would
+        # report the site before the second line is ever read, and on a
+        # single-continuation-line scalar it would also just be correct by
+        # accident. Joining confirms the interpolation is genuinely
+        # unparseable rather than merely incomplete, and refuses it — the
+        # fold must never let a site that used to record nothing regress to
+        # silently recording nothing again.
+        split = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: >-\n"
+            "            ${{ steps.resolve_ref.outputs.ref &&\n"
+            "            'main' }}\n"
+        )
+        self.assertEqual(self._states(self.RESOLVER + split), [(False, False, "unparsed")])
+
     def test_a_fallback_containing_a_comma_is_still_read(self):
         # `[^,}]` is the FLOW form's entry boundary and nothing else's.
         # Carrying it into the block form dropped every fallback holding a
