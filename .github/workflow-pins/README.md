@@ -70,8 +70,9 @@ checkout reads `ref: ${{ steps.<id>.outputs.<name> }}`, which names no input —
 so it used to leave the lint entirely, with a hand-written `if:` as the only
 thing between an unresolvable ref and a silent default-branch checkout of the
 scripts the job executes. The detector now follows a `ref:` through the step
-output: when the producing step's `env:` binds `workflows_ref`, the checkout is
-a ref use, and it is covered only if **either** that step is itself a
+output: when the producing step's `env:` binds `workflows_ref` *in one of the
+two literal spellings below*, the checkout is a ref use, and it is covered only
+if **either** that step is itself a
 fail-closed guard, **or** the consuming step carries exactly
 `if: steps.<id>.outputs.<name> != ''` on that same output — bare or
 `${{ … }}`-wrapped, either spelling optionally double-quoted. Nothing wider:
