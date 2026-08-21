@@ -317,11 +317,14 @@ checkout — block (`ref: ${{ … }}`), flow (`with: {…, ref: "${{ … }}"}`),
 value carried on the following line (`ref: >-`, `ref: |`, or a bare `ref:`).
 They are one checkout to Actions, so a detector that knows only one of them
 reports an unguarded job as clean. Do not "simplify" the extra patterns away.
-The guard's binding is matched in both block and flow form (`env:
-{WORKFLOWS_REF: …}`). Flow used to be read as ABSENT on purpose — loud, and the
-right bias for noticing an absence — but once resolver *registration* rode on
-the same match (BE-8221), absence stopped being loud: an unregistered resolver
-means its consumer's step-output checkout is never judged at all.
+The guard's binding is now RECOGNIZED in both block and flow form (`env:
+{WORKFLOWS_REF: …}`), so a flow-form resolver still registers (BE-8221) — an
+unregistered one left its consumer's step-output checkout unjudged entirely,
+a silent pass. But recognition is not credit: only the block form can earn
+`guarded_input`/`guarded_fallback` and excuse a checkout that consumes the
+INPUT directly — widening what counts as a use may only ever DEMAND a guard,
+never widening what counts as a guard to EXCUSE one, so a flow-form guard on
+a *direct* checkout still reads as ABSENT and fails loudly.
 
 `KNOWN_EXEMPT` in the script carries workflows with the same debt that are
 tracked under their own ticket. It is **empty today** — `pr-size.yml`, its last
