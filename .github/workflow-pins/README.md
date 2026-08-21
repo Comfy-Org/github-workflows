@@ -202,7 +202,48 @@ questions fail in opposite directions, so they get opposite answers:
   'main' }}` registered no alias, so `ref: ${{ env.WORKFLOWS_REF }}` read as no
   ref use at all and left the lint entirely, carrying the exact mutable fallback
   the lint exists to catch. Over-approximating here can only ever *demand* a
-  guard.
+  guard. Three more spellings joined it in BE-8146, each of which had been
+  failing open the same way — and none of them was caught by the `_CONSUMES_*`
+  backstop, which only runs when the input *declaration* is unparseable:
+  - **the flow-style `env: {NAME: ${{ … }}}`**, walked structurally rather than
+    through a single bounded regex: a `,` or `}` only ends an entry (or the
+    mapping) when it sits outside a quoted scalar and outside a nested
+    `${{ … }}`, so a quoted value with a comma or brace of its own
+    (`format('{0}', …)`, two interpolations in one string) still binds, and a
+    genuine decoy — a `,` inside a *quoted* scalar planting a fake key — still
+    does not. The mapping itself is not required to close on the line that
+    opens it either: `env: {` alone, with its entries on the lines below, is
+    walked the same way.
+  - **index access**, `inputs['workflows_ref']` and `env['NAME']`, tolerant of
+    whitespace on either side of the bracket (`inputs ['x']` is the same access
+    as the tight spelling) and of the YAML single-quote escape (`''` doubles to
+    a literal `'`, so `'${{ inputs[''workflows_ref''] }}'` — the whole value
+    forced single-quoted — decodes to the same access too). It is documented
+    Actions expression syntax and interchangeable with the property form, so
+    both spellings now come from one shared `_INPUT_MENTION_BODY` used by every
+    "reaches the input" pattern — including the `_CONSUMES_*` backstop, so a
+    bracket-only file with a lost declaration is still loud.
+  - **a chain of aliases**: `BASE: ${{ inputs.workflows_ref }}` then
+    `REF: ${{ env.BASE }}` binds *both*, via a fixpoint bounded by the number of
+    names bound in the file. One hop was all the scan followed, so a `ref: ${{
+    env.REF }}` two hops out was invisible.
+  - **a hyphenated name** (`WORKFLOWS-REF`), which the bracket form exists to
+    read back (`env.WORKFLOWS-REF` is not valid property-access syntax), and a
+    value that continues on the line *below* its key (`REF:` / `REF: >-`) —
+    the same shape `ref:` itself already followed.
+
+  All of these widen only what counts as a ref **use**, and `_GUARD_BINDING_RE`
+  picked up the accessor half of it too (BE-8146): it is also the only thing
+  that registers a step as a *resolver* for the resolve-then-consume idiom
+  below, and an unrecognized accessor there does not fail loud — it drops the
+  step out of `resolvers` entirely, and every checkout resolved from its
+  output vanishes from the lint rather than being reported. What stays exact
+  is the `fallback` group (`|| job.workflow_sha`, no other spelling): that is
+  what proves *immutability*, a question the accessor spelling has nothing to
+  do with. An unrecognized *guard* still fails **closed** — its checkout gets
+  reported — while an unrecognized *use* fails open and silent, which is why
+  the flow *form* (as opposed to the accessor spelling) stays unrecognized for
+  the guard binding on purpose.
 - *Is this ref the immutable self-pin?* — judged from the **literal expression
   on the checkout line**. An alias never qualifies, so `ref: ${{ env.NAME }}`
   always needs a **bare** guard.
