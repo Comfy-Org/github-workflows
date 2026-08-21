@@ -9,9 +9,9 @@ name: Stale PRs (reusable)
 #   • Issues are left untouched (days-before-issue-* = -1)
 #
 # The Slack digest names the source repo (`github.repository`) in the header AND
-# on every individual PR line (`Comfy-Org/cloud#158`), so two repos' batches
+# on every individual PR line (`owner/repo#158`), so two repos' batches
 # posted to the same channel are unambiguous — a bare "#158" looks identical
-# whether it's from cloud or comfy-infra, and a line quoted or read on its own
+# whichever repo it came from, and a line quoted or read on its own
 # still says which repo it came from.
 #
 # Caller pattern (place in source repo at .github/workflows/stale.yml). The

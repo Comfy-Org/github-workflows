@@ -102,10 +102,10 @@ jobs:
           TAG: linear-ticket
           WORKFLOW_FILE: linear-ticket.yml
           FILE_FILTER: .github/workflows/linear-ticket-validate.yml
-          # Two live callers already pin this workflow (Comfy-Org/cloud, Comfy-Org/comfy-infra),
-          # so an empty/missing roster here is a bug, not a growing fleet — hard-fail rather than
-          # silently leaving every caller un-bumped. Seed LINEAR_TICKET_CALLERS before/soon after
-          # this file lands on main (see the PR that introduced this fleet).
+          # Live callers already pin this workflow, so an empty/missing roster here is a bug,
+          # not a growing fleet — hard-fail rather than silently leaving every caller un-bumped.
+          # Seed LINEAR_TICKET_CALLERS before/soon after this file lands on main (see the PR
+          # that introduced this fleet).
           ALLOW_EMPTY: "false"
           CALLERS_JSON: ${{ secrets.LINEAR_TICKET_CALLERS }}
         run: bash .github/bump-callers/bump-callers.sh

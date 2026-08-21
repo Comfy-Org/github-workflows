@@ -196,7 +196,7 @@ def derive_scope(path: str, scope_label, scope_desc) -> dict:
 
     A filed issue must say WHERE the finding came from, so a scoped run should
     read `services/api`, not `whole-repo`. But an explicit caller override has to
-    win — the studio fleet already labels its cloud subtrees itself. An Actions
+    win — the studio fleet already labels those subtrees itself. An Actions
     reusable cannot see whether an input was supplied, so "still equal to the
     documented default" is the (only, and stated) proxy for "not overridden".
     """

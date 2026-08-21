@@ -6,7 +6,7 @@ name: Refresh Reviewers (reusable)
 # DETECTOR, never a live mutator: nothing is assigned, nothing merges — the
 # whole deliverable is one reviewable single-file PR a human accepts or edits.
 #
-# HOW IT SCORES (validated in the BE-4114 spike against cloud history):
+# HOW IT SCORES (validated in the BE-4114 spike against a caller repo's history):
 # recency-decayed commit touches per rule bucket — per commit, per rule glob
 # matched by >=1 surviving changed file, score += 0.5^(age_days/half_life_days)
 # and touches += 1. Line counts are intentionally unused. Bot authors,

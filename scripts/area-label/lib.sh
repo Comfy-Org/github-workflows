@@ -6,8 +6,8 @@
 # side-effecting orchestration (fetch the taxonomy from the base ref, curl the API, write
 # the label) lives in classify-and-apply.sh, which sources this.
 #
-# The security posture this file underwrites is the same one the comfy-infra port carried
-# and CodeRabbit hardened (Comfy-Org/comfy-infra#815): the model gets NO tools and NO
+# The security posture this file underwrites is the same one the original private-repo port
+# carried and CodeRabbit hardened in review: the model gets NO tools and NO
 # token, the PR text is passed as DATA inside <pr_data> tags, and the reply is constrained
 # to the taxonomy's own names by a JSON-schema enum — so the worst a prompt-injected PR can
 # do is earn itself a valid label. That guarantee only holds if the taxonomy driving the

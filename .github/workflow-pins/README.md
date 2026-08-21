@@ -72,15 +72,16 @@ thing between an unresolvable ref and a silent default-branch checkout of the
 scripts the job executes. The detector now follows a `ref:` through the step
 output: when the producing step's `env:` binds `workflows_ref` *in one of the
 two literal spellings below*, the checkout is a ref use, and it is covered only
-if **either** that step is itself a
-fail-closed guard, **or** the consuming step carries exactly
+if the consuming step carries exactly
 `if: steps.<id>.outputs.<name> != ''` on that same output — bare or
-`${{ … }}`-wrapped, either spelling optionally double-quoted. Nothing wider:
-`... != '' || always()` runs the checkout precisely when the output is empty, an
-`if:` on a different output says nothing about this one, and a job-level `if:`
-skips the resolver too. A never-fail resolver can only take the second route —
-`continue-on-error: true` means its `exit 1` would not fail the job, so it is
-not a guard. A `ref:` resolved from a step that never
+`${{ … }}`-wrapped, either spelling optionally double-quoted. A fail-closed
+resolver does not exempt its consumer (BE-8221): a guard proves the step
+rejects an empty *input*, not that its *output* is non-empty — a
+sanitize-to-`''` branch after the guard, or a dropped or renamed
+`$GITHUB_OUTPUT` write, still emits `''`. Nothing wider than the exact `if:`
+counts: `... != '' || always()` runs the checkout precisely when the output is
+empty, an `if:` on a different output says nothing about this one, and a
+job-level `if:` skips the resolver too. A `ref:` resolved from a step that never
 touches `workflows_ref` is not this lint's subject and is left alone.
 
 Two preconditions decide whether the detector treats the resolver as one, so
@@ -121,9 +122,10 @@ STEP, where the enclosing key is a `with:` the script itself printed: an open
 (BE-8215).** `ref: ${{ steps.<id>.outputs.<name> || 'main' }}` used to match
 nothing anywhere and record nothing. Now it is a site like any other, judged
 by operand order exactly as the input side is: when the FIRST `||` operand is
-the step output, the site is covered by the usual routes (a fail-closed
-resolver, or the exact `if:` — under which the fallback arm is unreachable
-dead code, so it passes); when the leading operand is anything else
+the step output, the site is covered the usual way — the exact `if:` on the
+consuming step (BE-8221; a fail-closed resolver does not exempt it), under
+which the fallback arm is unreachable dead code, so it passes; when the
+leading operand is anything else
 (`${{ 'main' || steps.<id>.outputs.<name> }}`), it wins on every runner and the
 site is unguarded unconditionally — with its own
 message, because neither BE-8130 remedy can fix operand order. A leading
@@ -339,9 +341,14 @@ checkout — block (`ref: ${{ … }}`), flow (`with: {…, ref: "${{ … }}"}`),
 value carried on the following line (`ref: >-`, `ref: |`, or a bare `ref:`).
 They are one checkout to Actions, so a detector that knows only one of them
 reports an unguarded job as clean. Do not "simplify" the extra patterns away.
-The guard's own signature is matched in block form **only**, deliberately: a
-guard written in flow style reads as ABSENT and fails loudly, which is the right
-bias for a check whose whole job is noticing an absence.
+The guard's binding is now RECOGNIZED in both block and flow form (`env:
+{WORKFLOWS_REF: …}`), so a flow-form resolver still registers (BE-8221) — an
+unregistered one left its consumer's step-output checkout unjudged entirely,
+a silent pass. But recognition is not credit: only the block form can earn
+`guarded_input`/`guarded_fallback` and excuse a checkout that consumes the
+INPUT directly — widening what counts as a use may only ever DEMAND a guard,
+never widening what counts as a guard to EXCUSE one, so a flow-form guard on
+a *direct* checkout still reads as ABSENT and fails loudly.
 
 `KNOWN_EXEMPT` in the script carries workflows with the same debt that are
 tracked under their own ticket. It is **empty today** — `pr-size.yml`, its last

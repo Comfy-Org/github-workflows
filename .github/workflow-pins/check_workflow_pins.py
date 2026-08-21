@@ -262,10 +262,10 @@ _STEP_ID_FLOW_RE = re.compile(r"""[{,]\s*(['"]?)id\1\s*:\s*([^,}\s]+)""")
 # How the guard RECEIVES the ref: through `env:` (never interpolated into the
 # script body) under this one name. Half the signature — `is_guard_step` below
 # checks the other half, that the step actually rejects an empty value.
-# Block form only, deliberately: a guard written in flow style reads as ABSENT,
-# which fails the lint loudly instead of passing a checkout it never verified.
-# A trailing comment IS tolerated — unlike the flow form that is a real guard
-# doing its job, so rejecting it would fail a compliant workflow, not catch one.
+# The block form; the flow spelling has its own regex just below — reading it
+# as absent stopped being loud once registration became load-bearing (BE-8221).
+# A trailing comment IS tolerated — a guard carrying one is a real guard doing
+# its job, so rejecting it would fail a compliant workflow, not catch one.
 #
 # BOTH bindings are recognized, but they are NOT equivalent, and the `fallback`
 # group is what keeps them apart. A guard on the bare input proves the INPUT is
@@ -295,6 +295,17 @@ _GUARD_BINDING_RE = re.compile(
     r"""^\s*(['"]?)WORKFLOWS_REF\1\s*:\s*(['"]?)\$\{\{\s*(?:%s)\s*"""
     r"""(?P<fallback>\|\|\s*job\.workflow_sha\s*)?\}\}\2[^\S\n]*(?:#.*)?$"""
     % _INPUT_MENTION_BODY
+)
+# The same binding inside a flow mapping: `env: {WORKFLOWS_REF: ${{ … }}}`.
+# While a fail-closed resolver could stand in for the consumer's `if:`, reading
+# the flow form as ABSENT failed loudly — the checkout was reported and the
+# author pushed toward the block form. With that exemption gone (BE-8221),
+# absence on the resolver path means the step is never REGISTERED, so its
+# consumer's `ref: ${{ steps.<id>.outputs.ref }}` is never judged at all — a
+# silent pass, which is why the binding scan now has to see this spelling too.
+_GUARD_BINDING_FLOW_RE = re.compile(
+    r"""[{,]\s*(['"]?)WORKFLOWS_REF\1\s*:\s*(['"]?)\$\{\{\s*inputs\.workflows_ref\s*"""
+    r"""(?P<fallback>\|\|\s*job\.workflow_sha\s*)?\}\}\2\s*[,}]"""
 )
 # …but the binding alone is NOT the guard, it is only how the guard receives the
 # value. Keying on it by itself made ANY step that merely handles the ref — one
@@ -472,9 +483,9 @@ _CONSUMES_SCALAR_RE = re.compile(
 # 'main' }}` registered no alias, so `ref: ${{ env.WORKFLOWS_REF }}` read as no
 # ref use at all and that checkout left the lint entirely — carrying the exact
 # mutable fallback the lint exists to catch. Registering it instead hands the
-# checkout to the guard and mutability checks, which is the posture the module
-# states everywhere else (a flow-form guard "reads as ABSENT, which fails the
-# lint loudly"). It answers ONLY "does this name reach the input" — never "is
+# checkout to the guard and mutability checks — absence must fail LOUDLY or not
+# at all, the posture the module states everywhere else.
+# It answers ONLY "does this name reach the input" — never "is
 # it strong": an alias never earns the self-pin exemption (see `_FALLBACK_RES`),
 # because `env:` shadows and is scoped per step/job while this scan is
 # file-wide. Matched against the comment-STRIPPED child, or this becomes the one
@@ -854,8 +865,15 @@ def _env_bindings(lines, res):
     block_re, mention_re = res
     names = set()
     for i, line in enumerate(lines):
+        # `- env:` — the step's first key written on its list marker — opens
+        # the same block a plain `env:` line does, so it must bind aliases
+        # too (`_ENV_KEY_RE` already tolerates the marker). The block's
+        # boundary is measured at the KEY's column, not the marker's physical
+        # one: off the marker, the step's OTHER keys (one level shallower
+        # than the env members) would read as block members, and a `ref:`
+        # among them would bind `ref` as a false alias.
         if _ENV_KEY_RE.match(line):
-            children = list(_block_body(lines, i, _indent(line)))
+            children = list(_block_body(lines, i, _indent(line) + _marker_width(line)))
             for idx, (_, child) in enumerate(children):
                 stripped = _strip_comment(child)
                 match = block_re.match(stripped)
@@ -1227,6 +1245,46 @@ def _indent(line):
     return len(line) - len(line.lstrip(" "))
 
 
+def _marker_width(line):
+    """Columns the leading `- ` list marker and its separation spaces occupy.
+
+    0 when `line` is not a list item. YAML allows ANY run of separation spaces
+    after the `-`, so this is measured rather than assumed to be 2: a step
+    written `-  id: resolve` (siblings aligned at dash+3) is as valid as
+    `- id: resolve`, and reading it as a fixed two-column marker leaves the key
+    one column deeper than the step's real key column.
+    """
+    stripped = line.rstrip().lstrip(" ")
+    if not stripped.startswith("- "):
+        # Includes the bare `-` that puts every key on the lines BELOW it —
+        # with or without trailing whitespace, which is why the rstrip comes
+        # first: `-` followed by nothing but spaces declares no key either,
+        # so there is no column to recover from it.
+        return 0
+    return len(stripped) - len(stripped[1:].lstrip(" "))
+
+
+def _opens_list_item(line):
+    """True when `line` opens a YAML sequence entry — `- key: v` or a bare `-`."""
+    stripped = line.lstrip(" ")
+    return stripped == "-" or stripped.startswith("- ")
+
+
+def _unmarked(line, key_indent):
+    """`line` rewritten so a key written after its `- ` marker reads at `key_indent`.
+
+    A step's first key may be written on the marker line itself (`- id: resolve`,
+    `- continue-on-error: true`), where it declares that key at the step's key
+    column exactly as a later line of its own does — but `_indent` reads the
+    marker's physical column, so every `_indent(line) != key_indent` scan skips
+    it. Rewriting normalizes it back into view. Lines that are not list items
+    pass through untouched.
+    """
+    if not _marker_width(line):
+        return line
+    return " " * key_indent + line.lstrip(" ")[1:].lstrip(" ")
+
+
 def _dedash(line):
     """`line` with a leading `- ` list marker rewritten as two spaces.
 
@@ -1359,50 +1417,115 @@ def find_workflows_ref_defaults(lines):
     return hits
 
 
+_STEPS_KEY_RE = re.compile(r"""^\s*(['"]?)steps\1\s*:[^\S\n]*(?:#.*)?$""")
+
+
+def _in_steps_sequence(lines, marker):
+    """True when the list item opened at `marker` is an entry of a `steps:` sequence.
+
+    A real step's `- ` marker is a direct child of `steps:`, so the nearest
+    shallower non-skippable line above it is the `steps:` key itself (sibling
+    steps sit at the SAME indent and their bodies deeper, so neither can be
+    the first strictly-shallower line). Anything else — an `include:` item
+    under `strategy.matrix`, a `- …`-shaped line of shell text inside a
+    `run: |` block scalar — is a list item this lint must never read as a
+    step: crediting one as a guard turns arbitrary text into a job-wide
+    verdict, fail-open.
+    """
+    ind = _indent(lines[marker])
+    for j in range(marker - 1, -1, -1):
+        if _is_skippable(lines[j]):
+            continue
+        if _indent(lines[j]) < ind:
+            return bool(_STEPS_KEY_RE.match(lines[j]))
+    return False
+
+
 def _step_bounds(lines, idx):
-    """(start, end, key_indent) of the STEP whose `env:` holds the binding at `idx`.
+    """(start, end, key_indent) of the STEP holding the binding at `idx`.
 
     None when the binding is not inside a step at all — a job-level `env:`
-    hoists the value out of every step, which is a binding but not a guard.
+    hoists the value out of every step, which is a binding but not a guard —
+    and, fail-closed, for any list item that is not an entry of a `steps:`
+    sequence (see `_in_steps_sequence`).
     """
+    marker = _marker_width(lines[idx])
+    if marker:
+        # The asked line ITSELF opens the step, its first key holding the
+        # binding in flow form (`- env: {WORKFLOWS_REF: …}`,
+        # `- with: {…, ref: …}`). The step is this line: resolving it here —
+        # rather than letting the parent scan below walk past it — is also
+        # what keeps `_consuming_step_bounds`'s shifted retry from stopping
+        # at the PRECEDING sibling step and crediting this checkout with its
+        # neighbour's `if:`.
+        key_indent = _indent(lines[idx]) + marker
+        if not _in_steps_sequence(lines, idx):
+            return None
+        return idx, _step_end(lines, idx, key_indent), key_indent
+
     ind = _indent(lines[idx])
     key_indent = None  # the step's own key column, i.e. where `env:`/`run:` sit
+    parent = None     # the line that opened the block the binding sits in
     for j in range(idx - 1, -1, -1):
         if _is_skippable(lines[j]):
             continue
         if _indent(lines[j]) < ind:
-            # The enclosing key may RIDE the list marker (`- with:`, `- env:`),
-            # where it sits at the step's key column and not at the marker's.
-            # Reading the marker's column instead put `key_indent` a level too
-            # shallow, and the `start` scan below — which looks for the marker
-            # BENEATH `key_indent` — then found nothing and answered None,
-            # leaving the step unresolvable: no `id:`, no `if:`, no guard. The
-            # scan below still wants the marker's OWN column, so only this
-            # question is normalized.
-            dedashed = _indent(_dedash(lines[j]))
-            key_indent = dedashed if dedashed < ind else _indent(lines[j])
+            parent = j
+            key_indent = _indent(lines[j])
             break
     if key_indent is None:
         return None
+
+    marker = _marker_width(lines[parent])
+    if marker:
+        # The block holding the binding hangs off the step's FIRST key and that
+        # key is written on the marker line (`- env:` with `id:`/`run:` below).
+        # The marker's physical column is NOT the step's key column — the key
+        # sits after the marker — so read the column from where the key
+        # actually starts, and take this line as the step's start. Reading the
+        # physical column instead left the scan below looking for a `- ` line
+        # shallower than the marker, finding none, and answering None:
+        # `is_guard_step` then failed closed (harmless), but `_binding_step_id`
+        # never registered the resolver and a `ref: ${{ steps.<id>.outputs.ref }}`
+        # reading it passed the lint unreported.
+        #
+        # Two gates keep this branch fail-closed. The item must be a real step
+        # (`_in_steps_sequence`), and the asked line must actually SIT inside
+        # the item's bounds — the nearest-shallower scan above can land on the
+        # marker of the PREVIOUS step when `idx` is a shifted copy of a
+        # marker-line consumer, and answering with that step's bounds credits
+        # this checkout with its neighbour's `if:`.
+        key_indent += marker
+        end = _step_end(lines, parent, key_indent)
+        if idx >= end or not _in_steps_sequence(lines, parent):
+            return None
+        return parent, end, key_indent
 
     start = None  # the step's `- …` list-item line
     for j in range(idx, -1, -1):
         if _is_skippable(lines[j]) or _indent(lines[j]) >= key_indent:
             continue
-        if lines[j].lstrip().startswith("- "):
+        if _opens_list_item(lines[j]):
+            # A bare `-` opens the step just as `- name: …` does, with every
+            # key on the lines below it. Requiring `- ` here read it as "not a
+            # step" and answered None, which registers no resolver — so the
+            # consumer of its output passed the lint unreported.
             start = j
         break  # first shallower line decides it: a step, or not one at all
-    if start is None:
+    if start is None or not _in_steps_sequence(lines, start):
         return None
 
-    end = len(lines)
+    return start, _step_end(lines, start, key_indent), key_indent
+
+
+def _step_end(lines, start, key_indent):
+    """First line past the step opened at `start`: the next line above `key_indent`."""
     for j in range(start + 1, len(lines)):
         if _is_skippable(lines[j]):
             continue
         if _indent(lines[j]) < key_indent:
-            end = j
-            break
-    return start, end, key_indent
+            return j
+    return len(lines)
 
 
 def is_guard_step(lines, idx):
@@ -1417,6 +1540,18 @@ def is_guard_step(lines, idx):
         return False
     start, end, key_indent = bounds
     body = lines[start:end]
+    if body:
+        # The list marker occupies the step's key column, so a first key
+        # written on it (`- continue-on-error: true`, `- if: …`,
+        # `- run: [ -z "$WORKFLOWS_REF" ] && exit 1`) declares that key there
+        # exactly as a later line of its own does — the same rewrite
+        # `_binding_step_id` makes to read an `id:` off it. Normalized ONCE,
+        # because BOTH scans below read the line: without it the disqualifier
+        # scan lets a never-fail step written marker-first score as a hard
+        # guard, and the guard-detection scan misses a one-line guard written
+        # marker-first — reporting the checkout behind a guard the author
+        # already has.
+        body[0] = _unmarked(body[0], key_indent)
 
     # Two Actions-level ways a perfectly-written guard still guards nothing —
     # and they never touch the shell, so every check below would pass them:
@@ -1513,10 +1648,10 @@ def _binding_step_id(lines, idx):
         line = lines[j]
         if _is_skippable(line):
             continue
-        if j == start and line.lstrip().startswith("- "):
+        if j == start:
             # The list marker occupies the step's key column, so `- id: resolve`
             # declares the id there exactly as a later `id:` line does.
-            line = " " * key_indent + line.lstrip()[2:]
+            line = _unmarked(line, key_indent)
         if _indent(line) != key_indent:
             continue
         match = _STEP_ID_RE.match(line)
@@ -1664,14 +1799,15 @@ def _is_ref_input(lines, idx):
 def _consuming_step_bounds(lines, idx):
     """`_step_bounds` for a `ref:` line, tolerating the flow form.
 
-    `_step_bounds` resolves a step from a line nested BELOW its key column (an
-    `env:`/`with:` member) and answers None at the key column itself, by design.
-    A block `ref:` sits under `with:`, one level deeper, so it resolves
-    directly — but the flow form writes the whole mapping on the step's own
-    `with: {…, ref: …}` line, which IS that column. Re-ask from a copy of that
-    line pushed one column deeper: the same question, asked from where the block
-    form already asks it, rather than a second copy of the boundary logic that
-    could drift from the first.
+    `_step_bounds` now resolves every consuming spelling directly: a block
+    `ref:` sits under `with:`, one level deeper, and a flow `with: {…, ref: …}`
+    resolves off the marker line above it — or, written marker-first
+    (`- with: {…}`), off the asked line itself. The shifted retry below is a
+    belt-and-braces backstop for a spelling the direct paths miss, kept only
+    because `_step_bounds`'s bounds gates make it safe: it can no longer stop
+    at the PRECEDING step's marker and answer with bounds that exclude the
+    asked line, which is what used to credit a marker-first flow consumer with
+    its neighbour's `if:`.
     """
     bounds = _step_bounds(lines, idx)
     if bounds is not None:
@@ -1706,12 +1842,14 @@ def _skips_on_empty_output(lines, idx, step_id, out):
         line = lines[j]
         if _is_skippable(line):
             continue
-        if j == start and line.lstrip().startswith("- "):
-            # The list marker occupies the step's key column, so `- if: …`
-            # declares the condition there exactly as a later `if:` line does.
-            # Same rewrite `_binding_step_id` makes to read an `id:` off it —
-            # without it a correctly guarded checkout reads as unguarded.
-            line = " " * key_indent + line.lstrip()[2:]
+        if j == start:
+            # `- if: steps.x.outputs.ref != ''` as the consuming step's first
+            # key is the remedy, written marker-first. Normalized into the key
+            # column like `is_guard_step` and `_binding_step_id` do, so the one
+            # accepted remedy is not refused for its spelling — with the
+            # resolver exemption gone (BE-8221) this `if:` is the ONLY coverage
+            # route, so missing it reports a checkout that is in fact guarded.
+            line = _unmarked(line, key_indent)
         if _indent(line) != key_indent:
             continue
         if not _STEP_IF_RE.match(line):
@@ -1783,17 +1921,18 @@ def _record_steps_output(found, lines, idx, sites, resolvers, step_ids):
     lint exists to close. `via_step_output` carries `'dangling'` (truthy, so
     `unguarded_ref_checkouts` needs no change) for `check_dir`'s message.
 
-    Otherwise it IS a ref use, guarded when EITHER the resolving step is itself
-    a fail-closed guard (nothing empty ever leaves it), OR the consuming step
-    carries the exact non-empty `if:` on that same output. The never-fail idiom
-    can only take the second route: its resolver runs `continue-on-error: true`,
-    which `is_guard_step` disqualifies on purpose — an `exit 1` that does not
-    fail the job leaves the checkout running anyway. Neither route covers an
-    output that is not the expression's FIRST `||` operand: `${{ 'main' ||
-    steps.<id>.outputs.<out> }}` resolves to the literal on every runner, so
-    that spelling is unguarded unconditionally — while a TRAILING fallback
-    (`${{ steps.<id>.outputs.<out> || 'main' }}`) under a covering guard or
-    `if:` is unreachable dead code and passes.
+    Otherwise it IS a ref use, guarded ONLY when the consuming step carries the
+    exact non-empty `if:` on that same output. A fail-closed resolver does NOT
+    exempt its consumer (BE-8221): `is_guard_step` proves the step rejects an
+    empty INPUT, nothing about the value written to `$GITHUB_OUTPUT` — a
+    resolver that guards the input and then sanitizes a malformed ref to `''`,
+    or whose output write was dropped or renamed, or a consumer naming an
+    output the step never sets, all still hand checkout an empty ref. That
+    `if:` route also does not cover an output that is not the expression's
+    FIRST `||` operand: `${{ 'main' || steps.<id>.outputs.<out> }}` resolves to
+    the literal on every runner, so that spelling is unguarded unconditionally
+    — while a TRAILING fallback (`${{ steps.<id>.outputs.<out> || 'main' }}`)
+    under a covering `if:` is unreachable dead code and passes.
 
     Recorded as a NON-fallback site: `uses_fallback` exists to compare a
     checkout's expression against the strength of the guard that covered it,
@@ -1847,9 +1986,13 @@ def _record_steps_output(found, lines, idx, sites, resolvers, step_ids):
         if not leading:
             verdicts.append("non-leading")
             continue
-        verdicts.append(
-            bool(resolvers[step_id] or _skips_on_empty_output(lines, idx, step_id, out))
-        )
+        # Coverage is ONLY the consuming step's own exact non-empty `if:` on
+        # this output (BE-8221) — `resolvers` proves membership now, nothing
+        # about guard strength: a fail-closed resolver proves it rejects an
+        # empty INPUT, nothing about the value it writes to `$GITHUB_OUTPUT`
+        # (a sanitize-to-`''` branch, or a dropped/renamed output write, still
+        # hands the checkout an empty ref).
+        verdicts.append(bool(_skips_on_empty_output(lines, idx, step_id, out)))
     if not verdicts:
         # Every operand was out of scope — the same drop the single-operand
         # reader made, for the same reason.
@@ -1889,9 +2032,11 @@ def ref_checkouts(lines):
 
     A THIRD way to reach the ref does not name the input at all: resolve it in
     an earlier step and check out at that step's OUTPUT (BE-8130). Those sites
-    carry `via_step_output`, are judged by `_record_steps_output` — a
-    fail-closed resolver, or the exact non-empty `if:` on the consuming step —
-    and never earn the fallback-strength exemption, because the `if:` tests the
+    carry `via_step_output` and are judged by `_record_steps_output` — covered
+    ONLY by the exact non-empty `if:` on the consuming step, full stop. A
+    fail-closed resolver does not exempt its consumer (BE-8221): `is_guard_step`
+    proves input rejection, not output non-emptiness. These sites never earn
+    the fallback-strength exemption either, because the `if:` tests the
     resolved value rather than an expression. `via_step_output` is five-state
     (BE-8215, BE-8253), every non-`False` value truthy so the unguarded
     projection needs no change: `False` (the ref names the input), `True` (a
@@ -1934,15 +2079,16 @@ def ref_checkouts(lines):
     for start in job_starts:
         guarded_input = False     # a guard proved the INPUT non-empty
         guarded_fallback = False  # …only the `|| job.workflow_sha` expression
-        # Steps in THIS job, seen so far, whose `env:` binds the input and that
-        # carry an `id:` a later `ref:` can resolve from — `{id: is_guard_step}`.
-        # Per job and populated as the walk goes, so a resolver in another job
-        # (they run independently) or one declared BELOW its consumer can never
-        # be credited; the walk order gives that ordering for free, exactly as
-        # it does for the guard flags above.
-        resolvers = {}
+        # Ids of steps in THIS job, seen so far, whose `env:` binds the input —
+        # membership alone: registration marks the step as a resolver of the
+        # input, and coverage always comes from the consumer's own `if:`
+        # (BE-8221). Per job and populated as the walk goes, so a resolver in
+        # another job (they run independently) or one declared BELOW its
+        # consumer can never be credited; the walk order gives that ordering
+        # for free, exactly as it does for the guard flags above.
+        resolvers = set()
         # EVERY step id in this job, pre-scanned (BE-8215): the walk-order
-        # `resolvers` map cannot tell "an earlier step this lint has no claim
+        # `resolvers` set cannot tell "an earlier step this lint has no claim
         # on" from "no such step at all", and the two demand opposite answers —
         # the first is out of scope, the second is a ref that is `''` at
         # runtime and must be reported.
@@ -2014,6 +2160,15 @@ def ref_checkouts(lines):
                 # Scalar closed — fall through and judge this line normally.
                 pending = None
             binding = _GUARD_BINDING_RE.match(line)
+            flow_binding = False
+            ref_use = binding is None and is_ref_use(line, ref_res)
+            if binding is None and not ref_use:
+                # The flow binding is only taken for a line that is not ALSO a
+                # ref use — a whole step written as one flow mapping can carry
+                # both, and the binding branch would swallow the checkout
+                # unreported. Reporting wins: fail-closed, as everywhere else.
+                binding = _GUARD_BINDING_FLOW_RE.search(line)
+                flow_binding = binding is not None
             if binding:
                 # NO fallback exception on the guard requirement (BE-8077). The
                 # BE-4169 `inputs.workflows_ref || job.workflow_sha` form cannot
@@ -2028,23 +2183,31 @@ def ref_checkouts(lines):
                 # guard steps kept this lint green.
                 guard = is_guard_step(lines, i)
                 # A step that RESOLVES the ref for a later checkout to consume
-                # is registered here whether or not it guards, because the two
-                # answers differ: a hard guard covers its consumers outright,
-                # while the never-fail idiom's resolver (`continue-on-error:
-                # true`) does not and hands the empty case to the consumer's
-                # own `if:`. Strength (bare vs `|| job.workflow_sha`) is NOT
-                # recorded: that distinction exists because a guard proves
-                # something about an EXPRESSION, while the consumer's `if:`
-                # tests the actual resolved VALUE, where it is moot.
+                # is registered here, whether or not it guards. Registration
+                # only marks the step as a resolver of the input — coverage
+                # always comes from the consumer's own `if:` (BE-8221), because
+                # a hard guard proves the step rejects an empty INPUT, nothing
+                # about what it writes to `$GITHUB_OUTPUT`. Guard verdict and
+                # strength (bare vs `|| job.workflow_sha`) are therefore not
+                # recorded at all: they answer questions about an EXPRESSION,
+                # while the consumer's `if:` tests the actual resolved VALUE.
                 step_id = _binding_step_id(lines, i)
                 if step_id is not None:
-                    resolvers[step_id] = guard
-                if guard:
+                    resolvers.add(step_id)
+                # Registration (above) has to see the flow spelling — an
+                # unregistered resolver leaves its `steps.<id>.outputs.ref`
+                # consumer unjudged entirely. But excusing a checkout that
+                # consumes the INPUT directly is the unsafe direction to
+                # widen (ref-use recognition may only ever DEMAND a guard,
+                # never the reverse — see `is_ref_use`'s callers) — so a
+                # flow-form binding registers as a resolver without ALSO
+                # earning `guarded_input`/`guarded_fallback` credit.
+                if guard and not flow_binding:
                     if binding.group("fallback"):
                         guarded_fallback = True
                     else:
                         guarded_input = True
-            elif is_ref_use(line, ref_res):
+            elif ref_use:
                 fallback = _pins_to_job_workflow_sha(line)
                 guarded = guarded_input or (fallback and guarded_fallback)
                 # A guard proves the INPUT is non-empty. It says nothing about
@@ -2276,12 +2439,10 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
                     "::error file=%s,line=%d::%s checks out at a `ref:` resolved "
                     "from a step whose `env:` binds `inputs.%s`, but the "
                     "consuming step carries no `if: steps.<id>.outputs.<name> != "
-                    "''` on that same output — and the resolving step is not a "
-                    "fail-closed guard either. An unresolvable ref then reaches "
+                    "''` on that same output. An unresolvable ref then reaches "
                     "`actions/checkout` as '', which it reads as the default "
                     "branch. Add the exact non-empty `if:` to this step (the "
-                    "never-fail idiom, see .github/workflow-pins/README.md), or "
-                    "make the resolving step reject the empty value itself. "
+                    "never-fail idiom, see .github/workflow-pins/README.md). "
                     "See BE-8130." % (path, lineno, name, INPUT_NAME)
                 )
                 continue
