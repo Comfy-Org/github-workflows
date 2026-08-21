@@ -678,6 +678,22 @@ def _indent(line):
     return len(line) - len(line.lstrip(" "))
 
 
+def _dedash(line):
+    """`line` with a leading `- ` list marker rewritten as two spaces.
+
+    The marker occupies the step's key column, so `- with:` declares that key
+    exactly where a later `with:` line does. `_binding_step_id` and
+    `_skips_on_empty_output` make the same normalization inline, against a
+    `key_indent` they already hold; this is the form for readers that must
+    DERIVE the column, so they cannot drift apart. Column-preserving: the key
+    lands where YAML puts it, which is what indentation comparisons need.
+    """
+    stripped = line.lstrip()
+    if not stripped.startswith("- "):
+        return line
+    return line[: _indent(line)] + "  " + stripped[2:]
+
+
 def _key_re(indent, key):
     """`key:` at exactly `indent`, bare or quoted (both are valid Actions YAML)."""
     return re.compile(r"""^ {%d}(['"]?)%s\1\s*:""" % (indent, re.escape(key)))
@@ -806,7 +822,16 @@ def _step_bounds(lines, idx):
         if _is_skippable(lines[j]):
             continue
         if _indent(lines[j]) < ind:
-            key_indent = _indent(lines[j])
+            # The enclosing key may RIDE the list marker (`- with:`, `- env:`),
+            # where it sits at the step's key column and not at the marker's.
+            # Reading the marker's column instead put `key_indent` a level too
+            # shallow, and the `start` scan below — which looks for the marker
+            # BENEATH `key_indent` — then found nothing and answered None,
+            # leaving the step unresolvable: no `id:`, no `if:`, no guard. The
+            # scan below still wants the marker's OWN column, so only this
+            # question is normalized.
+            dedashed = _indent(_dedash(lines[j]))
+            key_indent = dedashed if dedashed < ind else _indent(lines[j])
             break
     if key_indent is None:
         return None
@@ -961,17 +986,12 @@ def _job_step_ids(lines, start, job_indent):
     `id:`, a script line that looks like one) merely reproduces the old
     fail-open drop for that one site — while an id this scan MISSES turns a
     compliant workflow into a false failure under the dangling check. So both
-    the block and flow spellings are read, with the same `- id:` list-marker
-    normalization `_binding_step_id` makes, and nesting depth is deliberately
-    not enforced.
+    the block and flow spellings are read, through the shared `_dedash`
+    list-marker normalization, and nesting depth is deliberately not enforced.
     """
     ids = {}
     for i, line in _block_body(lines, start, job_indent):
-        stripped = line.lstrip()
-        if stripped.startswith("- "):
-            # The list marker occupies the step's key column, so `- id: x`
-            # declares the id there exactly as a later `id:` line does.
-            line = line[: _indent(line)] + "  " + stripped[2:]
+        line = _dedash(line)
         match = _STEP_ID_RE.match(line)
         if match:
             # `rstrip` before the quote strip: on the continuation line of a
@@ -989,6 +1009,54 @@ def _job_step_ids(lines, start, job_indent):
 # A step's `with:` key, block form and flow form (`- {uses: …, with: {…}}`).
 _WITH_KEY_RE = re.compile(r"""^\s*(['"]?)with\1\s*:""")
 _WITH_FLOW_RE = re.compile(r"""(?:^|[{,\s])(['"]?)with\1\s*:\s*\{""")
+# A key whose value is a BLOCK SCALAR (`run: |`, `script: >-`). Everything
+# indented past it is literal TEXT — a shell script, a heredoc emitting fixture
+# YAML — and must never be read as workflow structure. `\d*` is the explicit
+# indentation indicator, `[+-]?` the chomping indicator; both are optional and
+# may appear in either order, but Actions workflows in the wild write at most
+# one, so accepting `|`/`>` plus an optional suffix is enough.
+_BLOCK_SCALAR_OPEN_RE = re.compile(
+    r"""^\s*(['"]?)[A-Za-z0-9_.-]+\1\s*:[^\S\n]*[|>][+-]?\d*[^\S\n]*(?:#.*)?$"""
+)
+
+
+def _in_block_scalar(lines, idx):
+    """True when `lines[idx]` is TEXT inside an open `|`/`>` block scalar.
+
+    `_is_ref_input` answers "which key encloses this `ref:`" from indentation,
+    and indentation cannot by itself tell a step's real `with:` from the word
+    `with:` printed by a heredoc: a `run: |` emitting a whole STEP —
+
+        run: |
+          cat <<'EOF' > f.yml
+          with:
+            ref: ${{ steps.x.outputs.ref }}
+          EOF
+
+    — puts a `with:` line at exactly the indent the backward walk stops on, so
+    script output was judged a checkout and hard-failed a compliant workflow
+    with the dangling error. Tracking the open scalar answers it directly:
+    inside one, there is no enclosing key to find, because there is no YAML.
+
+    Scanned forward, since a block scalar is opened by its key and closed by
+    the first non-skippable line back at or above that key's column. `idx`
+    itself is never consulted as an opener — the `ref: >-` continuation
+    spelling is reported at its own KEY line, which OPENS a scalar rather than
+    sitting inside one.
+    """
+    open_indent = None
+    for j in range(idx):
+        if _is_skippable(lines[j]):
+            continue
+        line = _dedash(lines[j])
+        ind = _indent(line)
+        if open_indent is not None:
+            if ind > open_indent:
+                continue
+            open_indent = None
+        if _BLOCK_SCALAR_OPEN_RE.match(line):
+            open_indent = ind
+    return open_indent is not None and _indent(lines[idx]) > open_indent
 
 
 def _is_ref_input(lines, idx):
@@ -1005,6 +1073,10 @@ def _is_ref_input(lines, idx):
     the one thing every real site has and neither of those does: a checkout's
     `ref:` is an entry of its step's `with:` mapping.
 
+    An open `|`/`>` block scalar is tracked first, because indentation alone
+    cannot tell a step's real `with:` from one a `run:` script PRINTS — see
+    `_in_block_scalar`.
+
     Answered from the enclosing key rather than from `_consuming_step_bounds`,
     which resolves the `- ` list item and so cannot see the difference between
     `with:` and `run:` — a heredoc line is inside a step exactly as an input
@@ -1017,6 +1089,11 @@ def _is_ref_input(lines, idx):
     the dangling check existed. Narrowing a false FAILURE back to the old miss
     is the safe direction; the reverse is not.
     """
+    if _in_block_scalar(lines, idx):
+        # Script text, not YAML — asked FIRST, so it also closes the flow
+        # spelling's copy of the same hole (a heredoc line reading
+        # `with: {ref: "${{ … }}"}` carries its own false answer).
+        return False
     if _WITH_FLOW_RE.search(_strip_comment(lines[idx])):
         return True
     ind = _indent(lines[idx])
@@ -1024,7 +1101,14 @@ def _is_ref_input(lines, idx):
         if _is_skippable(lines[j]):
             continue
         if _indent(lines[j]) < ind:
-            return bool(_WITH_KEY_RE.match(lines[j]))
+            # `_dedash` because `with:` may ride the list-item line: mapping
+            # keys are unordered, so `- with:` / `ref: …` / `uses: checkout`
+            # is valid Actions YAML. Without it the marker holds the key
+            # column, the match fails, and the site is DROPPED — turning the
+            # fail-closed report this gate protects into a silent fail-open on
+            # exactly the shape the lint exists to close, one an author could
+            # pick deliberately to evade it.
+            return bool(_WITH_KEY_RE.match(_dedash(lines[j])))
     return False
 
 
@@ -1122,6 +1206,10 @@ def _record_steps_output(found, lines, idx, resolved, resolvers, step_ids):
     release lookup — which is not this lint's subject, and demanding an
     empty-ref `if:` of it would fail workflows the lint has no claim on.
 
+    That scope question is asked FIRST, ahead of operand order, because it
+    holds in every operand position — the lint has no claim on such a step
+    whether or not the ref's expression starts with its output.
+
     When `<id>` matches NO step declared before the consuming one (a typo'd
     id, a step in another job, a resolver declared below its consumer), the
     site is recorded as a DANGLING ref use (BE-8215): at runtime the
@@ -1153,16 +1241,6 @@ def _record_steps_output(found, lines, idx, resolved, resolvers, step_ids):
         # Not an action input, so not a checkout — a job-level `outputs:`
         # mapping, a `run:` heredoc. Nothing to judge and nothing to fail.
         return
-    if not leading:
-        # Judged BEFORE step existence on purpose: when the leading operand
-        # wins, the output is never consulted, so "no such step" is a red
-        # herring and fixing the id changes nothing. Operand order is the only
-        # fix, and it needs its own message to say so.
-        found.append((idx + 1, False, False, "non-leading"))
-        return
-    # From here the output IS what the expression resolves to, so the two
-    # questions that remain — does the step exist, and does anything cover it —
-    # are worth asking.
     if step_id not in resolvers:
         declared = step_ids.get(step_id)
         bounds = _consuming_step_bounds(lines, idx)
@@ -1171,8 +1249,27 @@ def _record_steps_output(found, lines, idx, resolved, resolvers, step_ids):
         # step's `with:` evaluation its output does not exist yet — so the
         # boundary is the consuming STEP's first line, not the `ref:` line.
         if declared is not None and declared < consumer_start:
+            # OUT OF SCOPE, and asked ahead of operand order on purpose: a
+            # `ref:` resolved from a real earlier step that never touches
+            # `workflows_ref` is not this lint's subject in ANY operand
+            # position. Judging `leading` first reported
+            # `ref: ${{ inputs.pr_sha || steps.detect.outputs.sha }}` — a
+            # perfectly ordinary checkout — as 'non-leading', printing an
+            # error that demands an operand reorder which CHANGES the
+            # workflow's runtime semantics.
             return
-        found.append((idx + 1, False, False, "dangling"))
+        if leading:
+            # No step of that id runs ahead of the checkout, and the output IS
+            # what the expression resolves to: `''` at runtime, which
+            # `actions/checkout` reads as the default branch.
+            found.append((idx + 1, False, False, "dangling"))
+            return
+        # A dangling id whose operand does not lead falls through to the
+        # non-leading verdict below: the leading operand wins, so the output is
+        # never consulted, "no such step" is a red herring, and fixing the id
+        # changes nothing. Operand order is the only fix.
+    if not leading:
+        found.append((idx + 1, False, False, "non-leading"))
         return
     guarded = resolvers[step_id] or _skips_on_empty_output(lines, idx, step_id, out)
     found.append((idx + 1, False, guarded, True))
@@ -1261,6 +1358,13 @@ def ref_checkouts(lines):
         # Continuation lines are the more-indented ones that follow; the first
         # line back at or above the key's indent closes the scalar.
         pending = None
+        # Those continuation lines, stripped, in order. A block scalar may
+        # split the ref's `${{ … }}` across PHYSICAL lines and still fold to
+        # one expression at runtime, so matching each line on its own left a
+        # single newline enough to hide the very spelling BE-8215 closed:
+        # `ref: >-` / `${{ steps.r.outputs.ref ||` / `'main' }}` matched
+        # neither continuation arm and recorded no site.
+        pending_parts = []
         for i, line in _block_body(lines, start, job_indent):
             if pending is not None:
                 if _indent(line) > pending[1]:
@@ -1274,7 +1378,16 @@ def ref_checkouts(lines):
                         found.append((pending[0] + 1, fallback, guarded, False))
                         pending = None
                         continue
+                    pending_parts.append(_strip_comment(line))
                     resolved = _steps_output_site(line, cont=True)
+                    if resolved is None and len(pending_parts) > 1:
+                        # Ask the FOLDED value — what the runtime actually
+                        # sees — only once the single line has failed, so the
+                        # common one-line spelling keeps its exact behavior and
+                        # the join can only ever ADD a site. The `[^}]` bounds
+                        # still cannot cross a `}}`, so a join can never span
+                        # two interpolations.
+                        resolved = _steps_output_site(" ".join(pending_parts), cont=True)
                     if resolved is not None:
                         # The `ref: >-` / `ref: |` spelling of the resolve-then-
                         # consume shape. Judged from the same place as the block
@@ -1337,6 +1450,7 @@ def ref_checkouts(lines):
                 # (`_REF_KEY_OPEN_RE` needs end-of-line right after the key, so
                 # it can never take a `ref: ${{ … }}` off the branch below.)
                 pending = (i, _indent(line))
+                pending_parts = []
             else:
                 resolved = _steps_output_site(line)
                 if resolved is not None:
