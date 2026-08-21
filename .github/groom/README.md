@@ -141,8 +141,8 @@ single-brace JSON in the briefs). A consumer replaces every occurrence:
 
 | Placeholder | Expands to |
 |---|---|
-| `{{REPO}}` | target repo, `owner/name` (e.g. `Comfy-Org/cloud`) |
-| `{{REPO_BASENAME}}` | just the repo name (e.g. `cloud`) — used in the dedup `signature` |
+| `{{REPO}}` | target repo, `owner/name` (e.g. `Comfy-Org/example`) |
+| `{{REPO_BASENAME}}` | just the repo name (e.g. `example`) — used in the dedup `signature` |
 | `{{CLONE}}` | absolute path of the clean `origin/main` checkout |
 | `{{SCOPE_DESC}}` | human scan-scope sentence (a package, or "the whole repository") |
 | `{{SCOPE_LABEL}}` | short scope label (the package path, or `whole-repo`) |

@@ -33,7 +33,7 @@ name: Groom (reusable)
 # the finder/verifier BRIEFS + the dedup ledger live under .github/groom/, so a
 # consumer carries only a thin caller and there's no logic to keep in sync).
 #
-# Security boundary (per cloud/.github/workflows/model-gap-detector.yml): the
+# Security boundary (per the model-gap-detector pattern a private caller established): the
 # agent reads UNTRUSTED repo content, so credentials never live in the agent
 # step. The two `audit_*` jobs that run the agents have `contents: read` ONLY —
 # they are structurally incapable of writing anything to GitHub. The finder and
@@ -368,7 +368,7 @@ on:
           context inside a reusable resolves against the CALLER's repository, so a
           consumer opts in by setting that variable and needs no `with:` change at
           all (verified in-org: assign-reviewers.yml reads `vars.REVIEWER_LOAD_CAP`,
-          which is set on `cloud` and NOT on this repo).
+          which is set on a caller repo and NOT on this repo).
 
 
           Ranks ABOVE `vars.GROOM_CONFIG`, which makes it the slot for a one-run

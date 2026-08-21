@@ -22,9 +22,9 @@ name: PR Area Label (reusable)
 # The classifier logic and scripts load from THIS repo at the pinned `workflows_ref` — never
 # from the classified PR's checkout (no PR code is checked out at all). See scripts/area-label/.
 #
-# WHY A REUSABLE. This design was first shipped in Comfy-Org/comfy-infra#815 as a repo-local
-# workflow; it moved here so cloud, comfy-infra, and any other repo share ONE hardened
-# implementation and keep only a thin caller + their own taxonomy (the risk-grader pattern).
+# WHY A REUSABLE. This design was first shipped in a private caller repo as a repo-local
+# workflow; it moved here so every caller shares ONE hardened implementation and keeps only
+# a thin caller + its own taxonomy (the risk-grader pattern).
 # Per-repo framing (the domain-vs-path judgement calls) lives in the taxonomy's optional
 # top-level `repo_context:` key, so nothing repo-specific is baked into this file.
 #

@@ -9,7 +9,7 @@ bucket, and surgically rewrites ONLY the `reviewers: [...]` / `default_pool:
 [...]` lists — every comment and all other bytes are preserved, because the
 config's comments are its documentation.
 
-Signal model (validated against cloud history in the BE-4114 spike):
+Signal model (validated against a caller repo's history in the BE-4114 spike):
   - per commit, per rule bucket touched by >=1 surviving file:
       score[bucket][login] += 0.5 ** (age_days / half_life_days)
       touches[bucket][login] += 1
