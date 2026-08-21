@@ -62,6 +62,49 @@ DEFAULT_WORKFLOWS_DIR = ".github/workflows"
 # reusable workflow here is now held to both checks with no carve-out.
 KNOWN_EXEMPT = frozenset()
 
+# A bracket-index accessor for an alternation of names — `[ 'NAME' ]`,
+# `[ "NAME" ]`, or `[ ''NAME'' ]` — shared by every "does this NAME the input
+# (or an alias of it)" pattern below. `\s*` because Actions allows whitespace
+# around an index expression (`inputs[ 'workflows_ref' ]` is the same access
+# as the tight spelling, and `inputs ['workflows_ref']` — space before the
+# bracket too — is the same access again); a near-miss that reads as no ref
+# use at all is the exact failure mode BE-8146 exists to close. The doubled
+# `''NAME''` alternative is not a typo: a YAML *single*-quoted scalar escapes
+# an inner `'` by doubling it, so `ref: '${{ inputs[''workflows_ref''] }}'`
+# — the whole value single-quoted, forcing that escape — decodes to the exact
+# same bracket access as the unescaped spelling and must read the same way.
+def _bracket_body(name_alt):
+    return r"""\[\s*(?:''(?:%s)''|'(?:%s)'|"(?:%s)")\s*\]""" % (
+        name_alt,
+        name_alt,
+        name_alt,
+    )
+
+
+# How a workflow can NAME the input, defined ONCE (BE-8146). Actions expression
+# syntax offers two interchangeable accessors for the same value — property
+# (`inputs.workflows_ref`) and index (`inputs['workflows_ref']`) — so a lint
+# that knows only the first reads a bracket-spelled checkout as no ref use at
+# all and passes it unguarded. Every "does this reach the input" pattern is
+# built from this body so the two spellings cannot drift apart again:
+# `_REF_USE_*`, `_mention_alt`, `_ENV_ALIAS_RES`, and the `_CONSUMES_*` trio.
+#
+# Widening what counts as a ref USE is the safe direction (see `_mention_alt`):
+# it can only ever DEMAND a guard, never excuse a missing one. `_GUARD_BINDING_RE`
+# uses it too now, but only on the ACCESSOR SPELLING, which carries none of that
+# risk — it is still the exact same value, `inputs.workflows_ref`, just written
+# a different way. What stays deliberately narrow there is the `fallback` group
+# (`|| job.workflow_sha`, no other spelling): that is what proves IMMUTABILITY,
+# a question the accessor spelling has nothing to do with. `_FALLBACK_RES` (the
+# self-pin EXEMPTION) is not widened at all — it would EXCUSE rather than demand.
+# (`\s*` before the bracket too — Actions allows whitespace between `inputs`
+# and `[`, and `inputs ['workflows_ref']` is the same access as the tight
+# spelling.)
+_INPUT_MENTION_BODY = r"""inputs\s*\.\s*%s\b|inputs\s*%s""" % (
+    INPUT_NAME,
+    _bracket_body(re.escape(INPUT_NAME)),
+)
+
 _ON_RE = re.compile(r"""^(['"]?)on\1\s*:(.*)$""")
 _JOBS_RE = re.compile(r"""^(['"]?)jobs\1\s*:""")
 
@@ -76,8 +119,8 @@ _JOBS_RE = re.compile(r"""^(['"]?)jobs\1\s*:""")
 # — which is the same unguarded checkout, and the same one-line bypass already
 # barred for `default:`. The flow pattern stops the value at the entry boundary
 # (`[^,}]`) so a sibling entry mentioning the input can't be misread as the ref.
-_REF_USE_BLOCK_RE = re.compile(r"""^\s*(['"]?)ref\1\s*:.*inputs\.%s\b""" % INPUT_NAME)
-_REF_USE_FLOW_RE = re.compile(r"""[{,]\s*(['"]?)ref\1\s*:[^,}]*inputs\.%s\b""" % INPUT_NAME)
+_REF_USE_BLOCK_RE = re.compile(r"""^\s*(['"]?)ref\1\s*:.*(?:%s)""" % _INPUT_MENTION_BODY)
+_REF_USE_FLOW_RE = re.compile(r"""[{,]\s*(['"]?)ref\1\s*:[^,}]*(?:%s)""" % _INPUT_MENTION_BODY)
 # …and a third, because the value does not have to share the key's line at all:
 #   ref: >-              ref: |              ref:              ref:  # pinned
 #     ${{ … }}             ${{ … }}            ${{ … }}          ${{ … }}
@@ -95,7 +138,6 @@ _REF_USE_FLOW_RE = re.compile(r"""[{,]\s*(['"]?)ref\1\s*:[^,}]*inputs\.%s\b""" %
 _REF_KEY_OPEN_RE = re.compile(
     r"""^\s*(['"]?)ref\1\s*:[^\S\n]*(?:["'][^\S\n]*$|(?:[|>][+-]?\d*)?[^\S\n]*(?:#.*)?$)"""
 )
-_INPUT_MENTION_RE = re.compile(r"""inputs\.%s\b""" % INPUT_NAME)
 
 # …and a fourth shape, because a `ref:` does not have to NAME the input at all.
 # cursor-review.yml's never-fail ledger job resolves the ref one step earlier
@@ -119,6 +161,16 @@ _INPUT_MENTION_RE = re.compile(r"""inputs\.%s\b""" % INPUT_NAME)
 # output cannot be misread as the ref), and a continuation line that IS the
 # expression, for the `ref: >-` / `ref: |` spellings `_REF_KEY_OPEN_RE` opens.
 #
+# `<id>` and `<out>` each get their own dot/bracket alternative (BE-8146),
+# named distinctly per branch (`id`/`id_idx`, `out`/`out_idx`) because Python's
+# `re` rejects a duplicate group name even across alternatives that can never
+# both match — the caller reads whichever pair actually fired. Bracket
+# access on `steps`/`outputs` themselves stays out of scope: unlike `<id>` and
+# `<out>`, which are workflow-chosen identifiers an author writes either way,
+# the literal property names `steps`/`outputs` are never spelled with a
+# bracket in practice, and reaching for it here would be scope with no
+# observed shape behind it.
+#
 # The interpolation may CONTINUE past the output name, and open before it
 # (BE-8215): anchoring `}}` right after the name meant `ref: ${{
 # steps.x.outputs.ref || 'main' }}` matched nothing anywhere and recorded
@@ -138,8 +190,10 @@ _INPUT_MENTION_RE = re.compile(r"""inputs\.%s\b""" % INPUT_NAME)
 def _steps_output_body(bound):
     """The `${{ … steps.<id>.outputs.<out> … }}` body, bounded by `bound`."""
     return (
-        r"""\$\{\{(?P<lead>%s*?)steps\.(?P<id>[A-Za-z0-9_-]+)"""
-        r"""\.outputs\.(?P<out>[A-Za-z0-9_-]+)\s*(?:\|\|%s*?)?\}\}"""
+        r"""\$\{\{(?P<lead>%s*?)"""
+        r"""(?:steps\.(?P<id>[A-Za-z0-9_-]+)|steps\[\s*['"](?P<id_idx>[A-Za-z0-9_-]+)['"]\s*\])"""
+        r"""\.(?:outputs\.(?P<out>[A-Za-z0-9_-]+)|outputs\[\s*['"](?P<out_idx>[A-Za-z0-9_-]+)['"]\s*\])"""
+        r"""\s*(?:\|\|%s*?)?\}\}"""
     ) % (bound, bound)
 
 
@@ -179,9 +233,25 @@ _STEP_ID_FLOW_RE = re.compile(r"""[{,]\s*(['"]?)id\1\s*:\s*([^,}\s]+)""")
 # '' and checkout takes the default branch. `find_unguarded_ref_checkouts`
 # therefore records the STRENGTH of each guard and requires the checkout's own
 # `ref:` to be no weaker.
+#
+# The RHS DOES use `_INPUT_MENTION_BODY` (BE-8146), unlike the rest of this
+# binding, which stays deliberately narrow. This regex plays a second role
+# `find_unguarded_ref_checkouts` leans on: it is also the ONLY thing that
+# registers a step in `resolvers` (via `_binding_step_id`) for the resolve-then-
+# consume idiom below, and an unrecognized RHS there does not "read as ABSENT
+# and report the checkout" the way an unrecognized ref use does — it leaves the
+# step out of `resolvers` entirely, so `_record_steps_output` returns silently
+# for its id and the checkout it feeds never enters `found` at all. A bracket-
+# spelled resolver (`WORKFLOWS_REF: ${{ inputs['workflows_ref'] }}`) must not
+# vanish from the lint that way, so the accessor spelling is widened here too —
+# it is still the exact same value, just written differently, and widening it
+# carries none of the risk widening the `fallback` group would: that group is
+# what proves IMMUTABILITY and stays exact, `|| job.workflow_sha` and nothing
+# else.
 _GUARD_BINDING_RE = re.compile(
-    r"""^\s*(['"]?)WORKFLOWS_REF\1\s*:\s*(['"]?)\$\{\{\s*inputs\.workflows_ref\s*"""
+    r"""^\s*(['"]?)WORKFLOWS_REF\1\s*:\s*(['"]?)\$\{\{\s*(?:%s)\s*"""
     r"""(?P<fallback>\|\|\s*job\.workflow_sha\s*)?\}\}\2[^\S\n]*(?:#.*)?$"""
+    % _INPUT_MENTION_BODY
 )
 # The same binding inside a flow mapping: `env: {WORKFLOWS_REF: ${{ … }}}`.
 # While a fail-closed resolver could stand in for the consumer's `if:`, reading
@@ -333,23 +403,28 @@ def _ref_derived_names(body):
 # narrower than "the string appears somewhere": the test workflow's own shell
 # fixtures name the input in prose and in a `sed` script, and neither is a use.
 # Flow form included for the same reason as above — otherwise a file whose only
-# use is one-line escapes the "NOT covering this file" error too.
+# use is one-line escapes the "NOT covering this file" error too. Both accessor
+# spellings, for the same reason again (BE-8146): a file whose only use is
+# `${{ inputs['workflows_ref'] }}` would otherwise be a silent skip rather than
+# a loud "the lint is NOT covering this file". The bracket alternative carries
+# the same whole-value anchoring as the dot form — the interpolation has to BE
+# the scalar, not merely appear in it.
 # (`:[^\S\n]*(?:#…)?\s*` rather than a plain `\s*`, so a comment sitting between
 # the key and a value on the next line does not hide the use — the same gap, in
 # the backstop that is supposed to catch exactly this kind of miss.)
 _CONSUMES_BLOCK_RE = re.compile(
     r"""(?m)^\s*(['"]?)[\w.-]+\1\s*:[^\S\n]*(?:#[^\n]*)?\s*"""
-    r"""(['"]?)\$\{\{\s*inputs\.%s\s*\}\}\2\s*$""" % INPUT_NAME
+    r"""(['"]?)\$\{\{\s*(?:%s)\s*\}\}\2\s*$""" % _INPUT_MENTION_BODY
 )
 _CONSUMES_FLOW_RE = re.compile(
-    r"""[{,]\s*(['"]?)[\w.-]+\1\s*:\s*(['"]?)\$\{\{\s*inputs\.%s\s*\}\}\2\s*[,}]""" % INPUT_NAME
+    r"""[{,]\s*(['"]?)[\w.-]+\1\s*:\s*(['"]?)\$\{\{\s*(?:%s)\s*\}\}\2\s*[,}]""" % _INPUT_MENTION_BODY
 )
 # The block-scalar form, for the same reason again. (The plain multi-line form
 # already lands in _CONSUMES_BLOCK_RE, whose `\s*` spans the newline; only the
 # `|`/`>` indicator sits between the colon and the value and defeats it.)
 _CONSUMES_SCALAR_RE = re.compile(
     r"""(?m)^\s*(['"]?)[\w.-]+\1\s*:\s*[|>][+-]?\d*[^\S\n]*(?:#[^\n]*)?\n"""
-    r"""\s*\$\{\{\s*inputs\.%s\s*\}\}""" % INPUT_NAME
+    r"""\s*\$\{\{\s*(?:%s)\s*\}\}""" % _INPUT_MENTION_BODY
 )
 
 # An `env:` binding of the input to a NAME (`WORKFLOWS_REF: ${{ inputs… }}`).
@@ -373,21 +448,78 @@ _CONSUMES_SCALAR_RE = re.compile(
 # file-wide. Matched against the comment-STRIPPED child, or this becomes the one
 # place in the module reading a comment as code: `ASSETS: _dir  # checked out at
 # inputs.workflows_ref` would bind `ASSETS` and fail a compliant workflow.
-_ENV_ALIAS_RE = re.compile(
-    r"""^\s*(['"]?)([A-Za-z_]\w*)\1\s*:[^\S\n]*.*inputs\.%s\b""" % INPUT_NAME
+#
+# Two shapes, because an `env:` entry does not have to sit on its own line: the
+# block form's child lines, and the flow form's entries on the `env: {…}` line
+# (or lines — see `_flow_mapping_text`). Group 2 is the bound NAME in the block
+# pattern; the flow form is walked structurally by `_flow_entries` instead of a
+# single bounded regex (see there for why).
+#
+# The NAME grammar allows a hyphen (`WORKFLOWS-REF`), not just `\w`: it is not
+# read as a shell variable here, only as an `env.NAME`/`env['NAME']` expression
+# key, and Actions accepts a hyphenated one (via the bracket spelling, since
+# `env.WORKFLOWS-REF` is not valid property-access syntax) — excluding it just
+# means `ref: ${{ env['WORKFLOWS-REF'] }}` reads as no ref use at all.
+#
+# Parameterized by the "reaches" test because the alias scan asks the same
+# question twice: once for the input itself, and once per pass of
+# `env_aliases`' fixpoint for `env.<a name already known to reach it>`.
+def _env_alias_res(mention):
+    """The (block-same-line, mention) patterns for `_env_bindings`.
+
+    `block_re` binds a name whose value mentions `mention` on the KEY's own
+    line. `mention_re` is `mention` alone, compiled — used both to test a flow
+    entry's value (`_flow_entries` already isolates it) and a block key's
+    CONTINUATION line, when the value sits on the line below instead
+    (`REF:` / `REF: >-` with the mention one line down, the same shape
+    `_REF_KEY_OPEN_RE` opens for a `ref:`).
+    """
+    return (
+        re.compile(r"""^\s*(['"]?)([A-Za-z_][\w-]*)\1\s*:[^\S\n]*.*(?:%s)""" % mention),
+        re.compile(mention),
+    )
+
+
+# A `NAME:` (or `NAME: >-` / `NAME: |`) that opens a scalar continued on the
+# NEXT, more-indented line rather than carrying its value on its own — the
+# same shape `_REF_KEY_OPEN_RE` recognizes for `ref:`, generalized to any env
+# key name so the alias scan can follow it too. Group 2 is the NAME.
+_ALIAS_KEY_OPEN_RE = re.compile(
+    r"""^\s*(['"]?)([A-Za-z_][\w-]*)\1\s*:[^\S\n]*(?:["'][^\S\n]*$|(?:[|>][+-]?\d*)?[^\S\n]*(?:#.*)?$)"""
 )
+# The same NAME grammar as `_ALIAS_KEY_OPEN_RE`'s group 2, standalone — used to
+# validate a flow entry's key, which `_flow_entries` reads structurally rather
+# than through a keyed regex.
+_ALIAS_NAME_RE = re.compile(r"""^[A-Za-z_][\w-]*$""")
+
+_ENV_ALIAS_RES = _env_alias_res(_INPUT_MENTION_BODY)
+# Every `env:` entry, whatever its value — the alias fixpoint's hard bound: no
+# pass of `env_aliases` can add a name that is not bound somewhere in this file.
+_ENV_ANY_RES = _env_alias_res(r"")
 # Scoped to `env:` blocks, not every mapping key bound to the input: the
 # checkout's own `ref: ${{ inputs.workflows_ref }}` is such a binding too, and
 # treating `ref` as an alias would make `env.ref`/`$ref` anywhere read as the
-# input. (Block form only — a flow-style `env: {…}` binds no alias here, which
-# loses nothing the `_CONSUMES_*` backstop does not already catch.)
-_ENV_KEY_RE = re.compile(r"""^\s*(['"]?)env\1\s*:[^\S\n]*(?:#.*)?$""")
+# input.
+#
+# BOTH `env:` spellings bind (BE-8146). The flow form used to bind nothing, on
+# the stated belief that this "loses nothing the `_CONSUMES_*` backstop does not
+# already catch" — which was false: that backstop only runs when `defaults is
+# None`, i.e. when the input DECLARATION itself was unparseable, so it caught
+# none of this. A well-formed workflow writing `env: {WORKFLOWS_REF: ${{
+# inputs.workflows_ref }}}` bound no alias, its `ref: ${{ env.WORKFLOWS_REF }}`
+# read as no ref use at all, and the checkout got a green lint unguarded. The
+# flow form binds directly now; `_env_bindings` scans it via `_flow_entries`.
+#
+# `(?:-\s+)?` tolerates the list marker sitting on THIS key's own line: an
+# `env:` written as a step's first key (`- env:` / `- env: {…}`) carries it,
+# and without this the marker character sits where `env` is expected and the
+# match fails outright — the block body is never walked, or the flow line
+# never recognized, and every alias that step would have bound is gone.
+_ENV_KEY_RE = re.compile(r"""^\s*(?:-\s+)?(['"]?)env\1\s*:[^\S\n]*(?:#.*)?$""")
+_ENV_FLOW_KEY_RE = re.compile(r"""^\s*(?:-\s+)?(['"]?)env\1\s*:\s*\{""")
 
 # A `default` key inside a flow mapping: `{type: string, default: main}`.
 _FLOW_DEFAULT_RE = re.compile(r"""[{,]\s*(['"]?)default\1\s*:""")
-
-# A `#` opens a comment at the start of a value or after whitespace.
-_COMMENT_RE = re.compile(r"(?:^|\s)#.*$")
 
 # The BE-4169 self-pinning fallback (see its use in check_dir): the LITERAL
 # expression `inputs.workflows_ref || job.workflow_sha`, no other spelling.
@@ -470,14 +602,32 @@ _FALLBACK_RES = (
 
 
 def _outside_quotes(line, pos):
-    """True when `pos` sits outside any quoted scalar on `line`."""
+    """True when `pos` sits outside any quoted scalar on `line`.
+
+    YAML-aware, not a bare toggle: a single-quoted scalar escapes an inner `'`
+    by doubling it (`''`), and a double-quoted one escapes a `"` with a
+    backslash. Toggling on every quote character misreads either as closing
+    the scalar, which then reads whatever comes after as string content (or
+    vice versa) until an unrelated quote happens to toggle it back.
+    """
     quote = None
-    for ch in line[:pos]:
+    i = 0
+    while i < pos:
+        ch = line[i]
         if quote:
-            if ch == quote:
+            if quote == "'" and ch == "'":
+                if i + 1 < pos and line[i + 1] == "'":
+                    i += 2
+                    continue
+                quote = None
+            elif quote == '"' and ch == "\\":
+                i += 2
+                continue
+            elif quote == '"' and ch == '"':
                 quote = None
         elif ch in "'\"":
             quote = ch
+        i += 1
     return quote is None
 
 
@@ -524,35 +674,223 @@ def _default_value(line):
     return _strip_comment(line.split(":", 1)[1])
 
 
-def _env_bindings(lines, pattern):
-    """Names bound inside an `env:` block by `pattern`, e.g. `WORKFLOWS_REF`."""
+def _flow_mapping_text(lines, start, open_col):
+    """The flow mapping opening at `lines[start][open_col]` (a `{`), joined
+    across as many following lines as it takes to reach the matching `}` —
+    `None` if the file ends first.
+
+    A flow mapping is not required to close on the line that opens it
+    (`env: {` alone, with its entries on the lines below, is valid YAML), and
+    the single-line scan used to miss that shape entirely: `_ENV_KEY_RE`
+    rejects a line ending in `{`, so the block-body walk never runs either,
+    and the line-bound flow scan finds no entries on a key line that IS just
+    `env: {`. Comments are stripped PER LINE before joining — a comment is
+    scoped to its own line, and joining the raw text first would let one
+    swallow the lines after it. Brace-depth aware while scanning for the
+    close, so a nested `${{ … }}` (every one opens and closes a balanced
+    pair) is never misread as the mapping's own end.
+    """
+    text = _strip_comment(lines[start])[open_col:]
+    depth = 0
+    quote = None
+    i = 0
+    j = start
+    while True:
+        if i >= len(text):
+            j += 1
+            if j >= len(lines):
+                return None
+            text += "\n" + _strip_comment(lines[j])
+            continue
+        ch = text[i]
+        if quote:
+            if quote == "'" and ch == "'":
+                if i + 1 < len(text) and text[i + 1] == "'":
+                    i += 2
+                    continue
+                quote = None
+            elif quote == '"' and ch == "\\":
+                i += 2
+                continue
+            elif quote == '"' and ch == '"':
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[: i + 1]
+        i += 1
+
+
+def _flow_entries(text, open_pos):
+    """Yield (key, value) for each top-level entry of the flow mapping whose
+    `{` sits at `text[open_pos]`.
+
+    A hand-rolled walk rather than a bounded regex (`[^,}]*` and its kin),
+    because that bound is not safe: it stops at the FIRST `,` or `}`, but
+    either can sit inside the value without ending the entry — a quoted
+    scalar (`"${{ inputs.dir }}/${{ inputs.workflows_ref }}"`, one value, two
+    interpolations) or a nested expression call (`format('{0}', …)`, braces
+    of its own). This walk tracks quote state (with the same `''`/`\\"`
+    escapes `_outside_quotes` does) and `{}` depth together, so only a `,` or
+    `}` that is real top-level YAML punctuation — outside any quote, at
+    depth 0 — ends an entry or the mapping, and a quoted key or value
+    containing either cannot manufacture a decoy boundary.
+    """
+    n = len(text)
+    i = open_pos + 1
+    while i < n:
+        while i < n and text[i] in " \t\n":
+            i += 1
+        if i >= n or text[i] == "}":
+            return
+        key_start = i
+        quote = None
+        while i < n:
+            ch = text[i]
+            if quote:
+                if quote == "'" and ch == "'":
+                    if i + 1 < n and text[i + 1] == "'":
+                        i += 2
+                        continue
+                    quote = None
+                elif quote == '"' and ch == "\\":
+                    i += 2
+                    continue
+                elif quote == '"' and ch == '"':
+                    quote = None
+                i += 1
+                continue
+            if ch in "'\"":
+                quote = ch
+                i += 1
+                continue
+            if ch == ":":
+                break
+            i += 1
+        key = text[key_start:i].strip().strip("'\"")
+        i += 1  # past the ':'
+        while i < n and text[i] in " \t\n":
+            i += 1
+        value_start = i
+        depth = 0
+        quote = None
+        while i < n:
+            ch = text[i]
+            if quote:
+                if quote == "'" and ch == "'":
+                    if i + 1 < n and text[i + 1] == "'":
+                        i += 2
+                        continue
+                    quote = None
+                elif quote == '"' and ch == "\\":
+                    i += 2
+                    continue
+                elif quote == '"' and ch == '"':
+                    quote = None
+                i += 1
+                continue
+            if ch in "'\"":
+                quote = ch
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                if depth == 0:
+                    break
+                depth -= 1
+            elif ch == "," and depth == 0:
+                break
+            i += 1
+        yield key, text[value_start:i]
+        if i < n and text[i] == ",":
+            i += 1
+
+
+def _env_bindings(lines, res):
+    """Names bound inside an `env:` mapping by `res`, e.g. `WORKFLOWS_REF`.
+
+    Both spellings: the block form's child lines (including a NAME whose
+    value continues on the line below), and the flow form's entries, walked
+    structurally by `_flow_entries` over `_flow_mapping_text` — which also
+    covers a mapping that wraps across lines. Matched against the
+    comment-STRIPPED source, or this becomes the one place in the module
+    reading a comment as code.
+    """
+    block_re, mention_re = res
     names = set()
     for i, line in enumerate(lines):
         # `- env:` — the step's first key written on its list marker — opens
         # the same block a plain `env:` line does, so it must bind aliases
-        # too: this scan is the one path deciding whether a later
-        # `ref: ${{ env.<name> }}` is SEEN as a ref use at all, and skipping
-        # the marker spelling made that checkout leave the lint unreported.
-        # (`_unmarked` passes non-marker lines through untouched; file-wide
-        # over-collection only ever DEMANDS a guard — see `_mention_alt`.)
-        if not _ENV_KEY_RE.match(_unmarked(line, _indent(line))):
+        # too (`_ENV_KEY_RE` already tolerates the marker). The block's
+        # boundary is measured at the KEY's column, not the marker's physical
+        # one: off the marker, the step's OTHER keys (one level shallower
+        # than the env members) would read as block members, and a `ref:`
+        # among them would bind `ref` as a false alias.
+        if _ENV_KEY_RE.match(line):
+            children = list(_block_body(lines, i, _indent(line) + _marker_width(line)))
+            for idx, (_, child) in enumerate(children):
+                stripped = _strip_comment(child)
+                match = block_re.match(stripped)
+                if match:
+                    names.add(match.group(2))
+                    continue
+                # The value may not share the key's own line at all (`REF:`
+                # or `REF: >-`, mention on the line below) — the same shape
+                # `_REF_KEY_OPEN_RE` opens for `ref:`, generalized here to any
+                # key name via `_ALIAS_KEY_OPEN_RE`.
+                open_match = _ALIAS_KEY_OPEN_RE.match(child)
+                if not open_match or idx + 1 >= len(children):
+                    continue
+                _, nxt = children[idx + 1]
+                if _indent(nxt) > _indent(child) and mention_re.search(_strip_comment(nxt)):
+                    names.add(open_match.group(2))
             continue
-        # The block's boundary is the KEY's column, not the marker's physical
-        # one: measured off the marker, the step's OTHER keys (one level
-        # shallower than the env members) would read as block members, and a
-        # `ref:` among them would bind `ref` as an alias — the exact false
-        # binding `_ENV_ALIAS_RE`'s scoping note bars.
-        for _, child in _block_body(lines, i, _indent(line) + _marker_width(line)):
-            match = pattern.match(_strip_comment(child))
-            if match:
-                names.add(match.group(2))
+        code = _strip_comment(line)
+        if not _ENV_FLOW_KEY_RE.match(code):
+            continue
+        text = _flow_mapping_text(lines, i, code.index("{"))
+        if text is None:
+            continue
+        for key, value in _flow_entries(text, 0):
+            if _ALIAS_NAME_RE.match(key) and mention_re.search(value):
+                names.add(key)
     return frozenset(names)
 
 
 def env_aliases(lines):
-    """Names whose `env:` binding REACHES the input, e.g. `WORKFLOWS_REF`."""
-    return _env_bindings(lines, _ENV_ALIAS_RE)
+    """Names whose `env:` binding REACHES the input, e.g. `WORKFLOWS_REF`.
 
+    Directly — `WORKFLOWS_REF: ${{ inputs.workflows_ref }}` — or through another
+    env name that already does (BE-8146). `BASE: ${{ inputs.workflows_ref }}`
+    followed by `REF: ${{ env.BASE }}` binds BOTH, so a `ref: ${{ env.REF }}`
+    two hops from the input is still a ref use. Following exactly one hop was
+    the whole scan, and the second hop's checkout left the lint entirely.
+
+    A fixpoint rather than a fixed hop count, bounded by the number of names
+    bound anywhere in the file — no pass can add a name that is not one of them,
+    and every pass either adds one or stops. Mirrors `_ref_derived_names`, which
+    does the same for the shell variables inside a guard step. File-wide
+    over-approximation across `env:` scopes is intended; see `_mention_alt`.
+    """
+    names = set(_env_bindings(lines, _ENV_ALIAS_RES))
+    if not names:
+        # Nothing reaches the input directly, so no chain can reach it either —
+        # and an empty alternation below would degenerate to `env\.(?:)\b`,
+        # which matches the `env.` of ANY name and would bind the whole file.
+        return frozenset()
+    for _ in range(len(_env_bindings(lines, _ENV_ANY_RES))):
+        alt = "|".join(sorted(re.escape(n) for n in names))
+        chained = _env_bindings(
+            lines,
+            _env_alias_res(r"""env\s*\.\s*(?:%s)\b|env\s*%s""" % (alt, _bracket_body(alt))),
+        )
+        if chained <= names:
+            break
+        names |= chained
+    return frozenset(names)
 
 
 def _mention_alt(aliases):
@@ -561,11 +899,20 @@ def _mention_alt(aliases):
     File-wide rather than scope-aware on purpose: `env:` is scoped per job and
     per step, but over-approximating can only ever DEMAND a guard, never excuse
     a missing one — the safe direction for a detector whose job is absence.
+
+    Both accessor spellings on both halves (BE-8146): `inputs.x` / `inputs['x']`
+    for the input itself, through `_INPUT_MENTION_BODY`, and `env.NAME` /
+    `env['NAME']` for an alias, each tolerating whitespace inside the brackets.
+    `${NAME}` covers the shell reading of a bound name.
     """
-    alt = r"""inputs\.%s\b""" % INPUT_NAME
+    alt = _INPUT_MENTION_BODY
     if aliases:
         names = "|".join(sorted(re.escape(a) for a in aliases))
-        alt += r"""|env\.(?:%s)\b|\$\{?(?:%s)\b""" % (names, names)
+        alt += r"""|env\s*\.\s*(?:%s)\b|env\s*%s|\$\{?(?:%s)\b""" % (
+            names,
+            _bracket_body(names),
+            names,
+        )
     return alt
 
 
@@ -618,12 +965,17 @@ def steps_output_ref(line, cont=False):
     ${{ steps.x.outputs.ref }}`) is not a checkout resolved from one.
     """
     # Asked of nearly every line of every job (the `else` arm of the walk), and
-    # a `steps.` substring is a precondition of all three patterns — so answer
-    # the common case before paying for the comment strip and the regexes.
-    if "steps." not in line:
+    # a `steps.`/`steps[` substring is a precondition of all three patterns —
+    # so answer the common case before paying for the comment strip and the
+    # regexes.
+    if "steps." not in line and "steps[" not in line:
         return None
     match = _steps_output_match(_strip_comment(line), cont)
-    return (match.group("id"), match.group("out")) if match else None
+    if not match:
+        return None
+    step_id = match.group("id") or match.group("id_idx")
+    out = match.group("out") or match.group("out_idx")
+    return (step_id, out)
 
 
 # Operands `||` falls THROUGH, so a leading one of these still lets the step
@@ -669,12 +1021,14 @@ def _steps_output_site(line, cont=False):
     first interpolation, because a quoted decoy sibling can put an unrelated
     interpolation ahead of the real one.
     """
-    if "steps." not in line:
+    if "steps." not in line and "steps[" not in line:
         return None
     match = _steps_output_match(_strip_comment(line), cont)
     if match is None:
         return None
-    return match.group("id"), match.group("out"), _lead_reaches_output(match.group("lead"))
+    step_id = match.group("id") or match.group("id_idx")
+    out = match.group("out") or match.group("out_idx")
+    return step_id, out, _lead_reaches_output(match.group("lead"))
 
 
 def _consumes_input(text):
@@ -687,8 +1041,37 @@ def _consumes_input(text):
 
 
 def _strip_comment(value):
-    """Drop a trailing `# …` comment from a scalar value."""
-    return _COMMENT_RE.sub("", value).strip()
+    """Drop a trailing `# …` comment from a scalar value.
+
+    Quote-aware, with the same escape rules `_outside_quotes` uses (`''`
+    inside a single-quoted scalar, `\\"` inside a double-quoted one): a `#`
+    that sits inside a quoted entry's own value (`MSG: "a # b"`) is string
+    content, not a comment opener, and stripping from the FIRST `#` on the
+    line — as a plain regex does — truncates every sibling entry after it
+    too. Falls back to the whole value when no unquoted `#` is found.
+    """
+    quote = None
+    i = 0
+    n = len(value)
+    while i < n:
+        ch = value[i]
+        if quote:
+            if quote == "'" and ch == "'":
+                if i + 1 < n and value[i + 1] == "'":
+                    i += 2
+                    continue
+                quote = None
+            elif quote == '"' and ch == "\\":
+                i += 2
+                continue
+            elif quote == '"' and ch == '"':
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#" and (i == 0 or value[i - 1].isspace()):
+            return value[:i].strip()
+        i += 1
+    return value.strip()
 
 
 def _is_skippable(line):
@@ -1548,6 +1931,7 @@ def ref_checkouts(lines):
                 # Scalar closed — fall through and judge this line normally.
                 pending = None
             binding = _GUARD_BINDING_RE.match(line)
+            flow_binding = False
             ref_use = binding is None and is_ref_use(line, ref_res)
             if binding is None and not ref_use:
                 # The flow binding is only taken for a line that is not ALSO a
@@ -1555,6 +1939,7 @@ def ref_checkouts(lines):
                 # both, and the binding branch would swallow the checkout
                 # unreported. Reporting wins: fail-closed, as everywhere else.
                 binding = _GUARD_BINDING_FLOW_RE.search(line)
+                flow_binding = binding is not None
             if binding:
                 # NO fallback exception on the guard requirement (BE-8077). The
                 # BE-4169 `inputs.workflows_ref || job.workflow_sha` form cannot
@@ -1580,7 +1965,15 @@ def ref_checkouts(lines):
                 step_id = _binding_step_id(lines, i)
                 if step_id is not None:
                     resolvers.add(step_id)
-                if guard:
+                # Registration (above) has to see the flow spelling — an
+                # unregistered resolver leaves its `steps.<id>.outputs.ref`
+                # consumer unjudged entirely. But excusing a checkout that
+                # consumes the INPUT directly is the unsafe direction to
+                # widen (ref-use recognition may only ever DEMAND a guard,
+                # never the reverse — see `is_ref_use`'s callers) — so a
+                # flow-form binding registers as a resolver without ALSO
+                # earning `guarded_input`/`guarded_fallback` credit.
+                if guard and not flow_binding:
                     if binding.group("fallback"):
                         guarded_fallback = True
                     else:

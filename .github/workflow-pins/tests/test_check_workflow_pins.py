@@ -808,6 +808,381 @@ class GuardCoverageTests(unittest.TestCase):
         self.assertEqual(cwp.env_aliases(lines), frozenset({"WORKFLOWS_REF"}))
         self.assertEqual(len(cwp.find_unguarded_ref_checkouts(lines)), 1)
 
+    # ── Three spellings that left a checkout invisible to BOTH halves of the
+    # lint until BE-8146, each failing OPEN: the `_CONSUMES_*` backstop only
+    # runs when `defaults is None` (the input DECLARATION was unparseable), so
+    # a well-formed workflow using any of them got a green lint with an
+    # unguarded checkout. ──
+
+    # 1. The flow-style `env:` — the same binding as the block form, on one
+    # line. `_ENV_KEY_RE` requires `env:` to END its line, so nothing bound.
+    FLOW_ENV_CHECKOUT = (
+        "      - name: Load assets\n"
+        "        uses: actions/checkout@abc\n"
+        "        env: {WORKFLOWS_REF: \"${{ inputs.workflows_ref }}\"}\n"
+        "        with:\n"
+        "          ref: ${{ env.WORKFLOWS_REF }}\n"
+    )
+    # 2a. Index access on `inputs` — documented Actions expression syntax, and
+    # interchangeable with the property access every mention regex knew.
+    BRACKET_INPUT_CHECKOUT = (
+        "      - name: Load assets\n"
+        "        uses: actions/checkout@abc\n"
+        "        with:\n"
+        "          ref: ${{ inputs[\'workflows_ref\'] }}\n"
+    )
+    # 2b. …and on `env`, so a bound alias was unreachable the same way.
+    BRACKET_ENV_CHECKOUT = (
+        "      - name: Load assets\n"
+        "        uses: actions/checkout@abc\n"
+        "        env:\n"
+        "          WORKFLOWS_REF: ${{ inputs.workflows_ref }}\n"
+        "        with:\n"
+        "          ref: ${{ env[\'WORKFLOWS_REF\'] }}\n"
+    )
+    # 3. One alias into another. The scan followed exactly one hop, so `REF`
+    # never registered and `ref: ${{ env.REF }}` read as no ref use at all.
+    ALIAS_CHAIN_CHECKOUT = (
+        "      - name: Load assets\n"
+        "        uses: actions/checkout@abc\n"
+        "        env:\n"
+        "          BASE: ${{ inputs.workflows_ref }}\n"
+        "          REF: ${{ env.BASE }}\n"
+        "        with:\n"
+        "          ref: ${{ env.REF }}\n"
+    )
+
+    def test_a_flow_form_env_alias_is_not_an_escape_hatch(self):
+        self.assertEqual(len(self._jobs(self.FLOW_ENV_CHECKOUT)), 1)
+
+    def test_a_guarded_flow_form_env_alias_checkout_passes(self):
+        self.assertEqual(self._jobs(self.GUARD + self.FLOW_ENV_CHECKOUT), [])
+
+    def test_a_flow_form_env_binds_the_alias(self):
+        self.assertEqual(
+            cwp.env_aliases(self._wrap(self.FLOW_ENV_CHECKOUT).split("\n")),
+            frozenset({"WORKFLOWS_REF"}),
+        )
+
+    def test_a_bracket_input_checkout_is_not_an_escape_hatch(self):
+        self.assertEqual(len(self._jobs(self.BRACKET_INPUT_CHECKOUT)), 1)
+
+    def test_a_guarded_bracket_input_checkout_passes(self):
+        self.assertEqual(self._jobs(self.GUARD + self.BRACKET_INPUT_CHECKOUT), [])
+
+    def test_a_bracket_env_alias_checkout_is_not_an_escape_hatch(self):
+        self.assertEqual(len(self._jobs(self.BRACKET_ENV_CHECKOUT)), 1)
+
+    def test_a_guarded_bracket_env_alias_checkout_passes(self):
+        self.assertEqual(self._jobs(self.GUARD + self.BRACKET_ENV_CHECKOUT), [])
+
+    def test_an_env_alias_chain_is_followed_to_the_input(self):
+        self.assertEqual(len(self._jobs(self.ALIAS_CHAIN_CHECKOUT)), 1)
+
+    def test_a_guarded_env_alias_chain_checkout_passes(self):
+        self.assertEqual(self._jobs(self.GUARD + self.ALIAS_CHAIN_CHECKOUT), [])
+
+    def test_an_env_alias_chain_binds_every_name_on_it(self):
+        # BOTH names, not just the far end: a `ref:` may reach in at either hop.
+        self.assertEqual(
+            cwp.env_aliases(self._wrap(self.ALIAS_CHAIN_CHECKOUT).split("\n")),
+            frozenset({"BASE", "REF"}),
+        )
+
+    def test_a_bracket_spelled_flow_env_binds_through_the_chain(self):
+        # All three widenings at once — the flow form, index access on both
+        # `inputs` and `env`, and a hop between two aliases.
+        steps = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        env: {BASE: \"${{ inputs[\'workflows_ref\'] }}\", REF: \"${{ env[\'BASE\'] }}\"}\n"
+            "        with:\n"
+            "          ref: ${{ env[\'REF\'] }}\n"
+        )
+        self.assertEqual(
+            cwp.env_aliases(self._wrap(steps).split("\n")), frozenset({"BASE", "REF"})
+        )
+        self.assertEqual(len(self._jobs(steps)), 1)
+        self.assertEqual(self._jobs(self.GUARD + steps), [])
+
+    # ── …and the boundaries those three widenings must not cross. ──
+
+    def test_whitespace_inside_the_index_brackets_is_the_same_access(self):
+        # Actions allows whitespace around an index expression, so this is the
+        # same access as `inputs['workflows_ref']` — and a near-miss that read
+        # as no ref use at all is the exact failure mode BE-8146 is about.
+        steps = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        env:\n"
+            "          WORKFLOWS_REF: ${{ inputs[ \'workflows_ref\' ] }}\n"
+            "        with:\n"
+            "          ref: ${{ env[ \'WORKFLOWS_REF\' ] }}\n"
+        )
+        self.assertEqual(
+            cwp.env_aliases(self._wrap(steps).split("\n")), frozenset({"WORKFLOWS_REF"})
+        )
+        self.assertEqual(len(self._jobs(steps)), 1)
+        self.assertEqual(self._jobs(self.GUARD + steps), [])
+
+    def test_a_flow_env_binding_an_unrelated_name_binds_no_alias(self):
+        # Demanding a guard for an unrelated variable fails a compliant
+        # workflow — the one cost of over-approximating, so it stays bounded.
+        lines = self._wrap(
+            "      - name: x\n"
+            "        env: {GROOM_ASSETS: _groom_assets, RUNNER: ubuntu}\n"
+            "        run: echo hi\n"
+        ).split("\n")
+        self.assertEqual(cwp.env_aliases(lines), frozenset())
+
+    def test_a_quoted_decoy_in_a_flow_env_is_not_its_own_entry(self):
+        # The entry boundary has to be real YAML punctuation: this `,` is
+        # string content, so `EVIL` is not a second entry and binds no alias
+        # of its own. `SAFE` still binds, though — Actions interpolates
+        # `${{ … }}` wherever it sits inside a string scalar, quoted or not,
+        # so SAFE's actual value DOES embed the resolved input at runtime,
+        # and demanding a guard for it is the safe direction. Same quote
+        # tracking the flow self-pin matcher's `_outside_quotes` applies.
+        lines = self._wrap(
+            "      - name: x\n"
+            "        env: {SAFE: \'a, EVIL: ${{ inputs.workflows_ref }}\'}\n"
+            "        run: echo hi\n"
+        ).split("\n")
+        self.assertEqual(cwp.env_aliases(lines), frozenset({"SAFE"}))
+
+    def test_a_wrapped_flow_env_mapping_still_binds(self):
+        # A flow mapping is not required to close on the line that opens it.
+        # `_ENV_KEY_RE` used to reject a line ending in `{` (so the block-body
+        # walk never ran) while the single-line flow scan found no entries on
+        # a key line that was just `env: {` — the same silent fail-open one
+        # newline from the shape already closed.
+        lines = self._wrap(
+            "      - name: x\n"
+            "        env: {\n"
+            "          WORKFLOWS_REF: \"${{ inputs.workflows_ref }}\"\n"
+            "        }\n"
+            "        run: echo hi\n"
+        ).split("\n")
+        self.assertEqual(cwp.env_aliases(lines), frozenset({"WORKFLOWS_REF"}))
+        checkout = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        env: {\n"
+            "          WORKFLOWS_REF: \"${{ inputs.workflows_ref }}\"\n"
+            "        }\n"
+            "        with:\n"
+            "          ref: ${{ env.WORKFLOWS_REF }}\n"
+        )
+        self.assertEqual(len(self._jobs(checkout)), 1)
+        self.assertEqual(self._jobs(self.GUARD + checkout), [])
+
+    def test_a_quoted_comment_marker_in_an_earlier_flow_entry_does_not_truncate(self):
+        # `_strip_comment` used to run on the WHOLE flow line before any
+        # per-entry scan, and its regex was not quote-aware, so a `#` inside
+        # an EARLIER entry's own quoted value truncated every entry after it
+        # — a blast radius the block form (one entry per line) never had.
+        lines = self._wrap(
+            "      - name: x\n"
+            '        env: {MSG: "a # b", WORKFLOWS_REF: "${{ inputs.workflows_ref }}"}\n'
+            "        run: echo hi\n"
+        ).split("\n")
+        self.assertEqual(cwp.env_aliases(lines), frozenset({"WORKFLOWS_REF"}))
+
+    def test_an_interpolation_preceding_the_mention_does_not_defeat_the_bind(self):
+        # The old `[^,}]*` value bound stopped at the FIRST `,` or `}`, so any
+        # nested expression call (`format('{0}', …)`, braces of its own) or a
+        # second interpolation ahead of the mention (two `${{ … }}` in one
+        # quoted value) kept the bind from ever reaching it. The structural
+        # walk tracks quotes and `{}` depth together instead, so a `,`/`}`
+        # inside the quoted value is not a boundary at all.
+        for value in (
+            "\"${{ format('{0}', inputs.workflows_ref) }}\"",
+            '"${{ inputs.dir }}/${{ inputs.workflows_ref }}"',
+        ):
+            lines = self._wrap(
+                "      - name: x\n"
+                "        env: {REF: %s}\n"
+                "        run: echo hi\n" % value
+            ).split("\n")
+            self.assertEqual(cwp.env_aliases(lines), frozenset({"REF"}), value)
+
+    def test_a_hyphenated_env_key_binds_through_the_bracket_spelling(self):
+        # `env.WORKFLOWS-REF` is not valid property-access syntax, so a
+        # hyphenated name can ONLY be read back through the bracket form —
+        # which means the alias scan has to accept a hyphen in the NAME it
+        # binds, not just in the reference reading it back.
+        lines = self._wrap(
+            "      - name: x\n"
+            "        env:\n"
+            "          WORKFLOWS-REF: ${{ inputs.workflows_ref }}\n"
+            "        run: echo hi\n"
+        ).split("\n")
+        self.assertEqual(cwp.env_aliases(lines), frozenset({"WORKFLOWS-REF"}))
+        checkout = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        env:\n"
+            "          WORKFLOWS-REF: ${{ inputs.workflows_ref }}\n"
+            "        with:\n"
+            "          ref: ${{ env['WORKFLOWS-REF'] }}\n"
+        )
+        self.assertEqual(len(self._jobs(checkout)), 1)
+        self.assertEqual(self._jobs(self.GUARD + checkout), [])
+
+    def test_an_env_alias_value_on_the_next_line_still_binds(self):
+        # The block alias scan required the mention on the KEY's own line,
+        # unlike `ref:` (`_REF_KEY_OPEN_RE`) or the `_CONSUMES_*` backstop,
+        # which both already follow a value onto the line below.
+        lines = self._wrap(
+            "      - name: x\n"
+            "        env:\n"
+            "          WORKFLOWS_REF: >-\n"
+            "            ${{ inputs.workflows_ref }}\n"
+            "        run: echo hi\n"
+        ).split("\n")
+        self.assertEqual(cwp.env_aliases(lines), frozenset({"WORKFLOWS_REF"}))
+
+    def test_a_list_marker_env_key_still_binds(self):
+        # A step's FIRST key carries the `- ` list marker on its own line
+        # (`- env:` / `- env: {…}`), which sits where `_ENV_KEY_RE` and
+        # `_ENV_FLOW_KEY_RE` expected `env` itself — so a step written this
+        # way bound no alias at all, block or flow.
+        block = self._wrap(
+            "      - env:\n"
+            "          WORKFLOWS_REF: ${{ inputs.workflows_ref }}\n"
+            "        run: echo hi\n"
+        ).split("\n")
+        self.assertEqual(cwp.env_aliases(block), frozenset({"WORKFLOWS_REF"}))
+        flow = self._wrap(
+            "      - env: {WORKFLOWS_REF: \"${{ inputs.workflows_ref }}\"}\n"
+            "        run: echo hi\n"
+        ).split("\n")
+        self.assertEqual(cwp.env_aliases(flow), frozenset({"WORKFLOWS_REF"}))
+
+    def test_whitespace_before_the_input_bracket_is_the_same_access(self):
+        # The index alternative required `[` adjacent to `inputs`, but Actions
+        # tolerates whitespace between tokens generally — `inputs ['x']` is
+        # the same access as the tight spelling.
+        checkout = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ inputs [\'workflows_ref\'] }}\n"
+        )
+        self.assertEqual(len(self._jobs(checkout)), 1)
+        self.assertEqual(self._jobs(self.GUARD + checkout), [])
+
+    def test_the_yaml_escaped_bracket_spelling_is_the_same_access(self):
+        # A single-quoted YAML value escapes its inner `'` by doubling it, so
+        # `ref: '${{ inputs[''workflows_ref''] }}'` — the whole value forced
+        # single-quoted — decodes to the exact same bracket access as the
+        # unescaped spelling and must read the same way.
+        checkout = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: '${{ inputs[''workflows_ref''] }}'\n"
+        )
+        self.assertEqual(len(self._jobs(checkout)), 1)
+        self.assertEqual(self._jobs(self.GUARD + checkout), [])
+
+    def test_an_env_chain_not_rooted_at_the_input_is_not_a_ref_use(self):
+        # A two-hop chain off a DIFFERENT input reaches nothing this lint
+        # covers. The fixpoint must not treat "chained" as "reaching".
+        steps = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        env:\n"
+            "          BASE: ${{ inputs.some_other }}\n"
+            "          REF: ${{ env.BASE }}\n"
+            "        with:\n"
+            "          ref: ${{ env.REF }}\n"
+        )
+        self.assertEqual(cwp.env_aliases(self._wrap(steps).split("\n")), frozenset())
+        self.assertEqual(self._jobs(steps), [])
+
+    def test_an_unrooted_cyclic_env_chain_terminates_and_binds_nothing(self):
+        # Two names defined in terms of each other and neither rooted at the
+        # input. Since neither mentions the input at all, `env_aliases` returns
+        # at its `if not names` guard before the fixpoint loop runs — a cheaper
+        # way to bind nothing than exercising the loop, and covered on its own
+        # by `test_an_env_chain_not_rooted_at_the_input_is_not_a_ref_use`.
+        lines = self._wrap(
+            "      - name: x\n"
+            "        env:\n"
+            "          A: ${{ env.B }}\n"
+            "          B: ${{ env.A }}\n"
+            "        run: echo hi\n"
+        ).split("\n")
+        self.assertEqual(cwp.env_aliases(lines), frozenset())
+
+    def test_a_cyclic_env_chain_rooted_at_the_input_terminates(self):
+        # A cycle that DOES reach the input on its first hop, so the fixpoint
+        # loop actually runs: `A` binds directly, then each pass tries to grow
+        # from `env.<name already known>` — `B` reaches via `env.A`, `C` via
+        # `env.B`, and a further pass finds nothing new (`A` is already bound,
+        # and `B`'s own `env.C` closes the cycle without adding a name), so it
+        # converges instead of spinning.
+        lines = self._wrap(
+            "      - name: x\n"
+            "        env:\n"
+            "          A: ${{ inputs.workflows_ref }}\n"
+            "          B: ${{ env.A }}${{ env.C }}\n"
+            "          C: ${{ env.B }}\n"
+            "        run: echo hi\n"
+        ).split("\n")
+        self.assertEqual(cwp.env_aliases(lines), frozenset({"A", "B", "C"}))
+
+    def test_the_guard_side_is_NOT_widened_to_the_flow_form(self):
+        # Deliberately asymmetric: widening a ref USE can only DEMAND a guard,
+        # but widening GUARD recognition would EXCUSE a checkout. A flow-form
+        # guard binding therefore still reads as ABSENT — which fails closed,
+        # reporting the checkout it precedes rather than passing it.
+        flow_guard = (
+            "      - name: Require a pinned workflows_ref\n"
+            "        env: {WORKFLOWS_REF: \"${{ inputs.workflows_ref }}\"}\n"
+            "        run: |\n"
+            '          if [ -z "$WORKFLOWS_REF" ]; then\n'
+            "            exit 1\n"
+            "          fi\n"
+        )
+        self.assertEqual(len(self._jobs(flow_guard + self.CHECKOUT)), 1)
+
+    def test_bracket_access_NEVER_earns_the_self_pin_exemption(self):
+        # `_FALLBACK_RES` is an EXEMPTION, so widening it is the unsafe
+        # direction and it stays literal/dot-form. The bracket spelling is a
+        # ref use (it reaches the input) but not a recognized self-pin, so it
+        # gets the plain "no empty-ref guard" report — loud, not excused.
+        checkout = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ inputs[\'workflows_ref\'] || job.workflow_sha }}\n"
+        )
+        self.assertFalse(
+            cwp._pins_to_job_workflow_sha("          ref: ${{ inputs[\'workflows_ref\'] || job.workflow_sha }}")
+        )
+        self.assertEqual(
+            cwp.unguarded_ref_checkouts(self._wrap(checkout).split("\n")),
+            [(11, False, False)],
+        )
+
+    def test_prose_and_sed_mentions_of_either_spelling_are_not_a_use(self):
+        # The backstop\'s whole point is telling "not applicable" apart from "I
+        # could not read this", so it stays anchored to the WHOLE value in both
+        # accessor spellings — the test workflow\'s own shell fixtures name the
+        # input in prose and in a `sed` script, and neither is a use.
+        self.assertFalse(
+            cwp._consumes_input(
+                "# the workflow is checked out at inputs[\'workflows_ref\'] by the caller\n"
+                "jobs:\n"
+                "  j:\n"
+                "    steps:\n"
+                "      - run: sed -i \"s/inputs[\'workflows_ref\']/x/\" f.yml\n"
+                "      - run: echo \"reads inputs.workflows_ref, but only in prose\"\n"
+            )
+        )
+
     def test_the_fallback_must_be_the_WHOLE_ref_value(self):
         # Anchoring `${{` … `}}` bounds the INTERPOLATION, not the YAML value.
         # Each of these still scored as a self-pin — earning the weaker
@@ -1646,6 +2021,38 @@ class GuardCoverageTests(unittest.TestCase):
         text = self._wrap(self.RESOLVER + scalar % "").split("\n")
         self.assertEqual(text[unguarded[0] - 1].strip(), "ref: >-")
 
+    def test_a_bracket_spelled_resolver_still_registers(self):
+        # `_GUARD_BINDING_RE` is also the ONLY thing that registers a step in
+        # `resolvers` (via `_binding_step_id`), so a bracket-spelled binding
+        # that it fails to recognize does not just go unreported as a guard —
+        # it drops the step out of `resolvers` entirely, and every checkout
+        # resolved from its output then vanishes from `found` rather than
+        # being reported. The bracket spelling is the exact same value as the
+        # dot form, so it must register the resolver just the same.
+        bracket_resolver = self.RESOLVER.replace(
+            "inputs.workflows_ref", "inputs['workflows_ref']"
+        )
+        self.assertEqual(len(self._jobs(bracket_resolver + self._step_output_checkout())), 1)
+        self.assertEqual(
+            self._jobs(bracket_resolver + self._step_output_checkout(self.EXACT_IF)), []
+        )
+
+    def test_a_bracket_spelled_step_output_checkout_is_recognized(self):
+        # `steps_output_ref` had the same dot-only gap on its OWN accessor:
+        # `steps['id'].outputs['out']` is the identical access to the dot
+        # form, and reading it as no step output at all silently dropped the
+        # checkout from the lint rather than reporting it.
+        bracket_ref = "${{ steps['resolve_ref'].outputs['ref'] }}"
+        self.assertEqual(
+            len(self._jobs(self.RESOLVER + self._step_output_checkout(ref=bracket_ref))), 1
+        )
+        self.assertEqual(
+            self._jobs(
+                self.RESOLVER + self._step_output_checkout(self.EXACT_IF, ref=bracket_ref)
+            ),
+            [],
+        )
+
     def test_an_unguarded_step_output_checkout_gets_its_own_remedy(self):
         # "Copy the guard step in ahead of it" is the wrong advice here — the
         # never-fail job cannot run one. A lint that fails with a remedy that
@@ -2350,6 +2757,29 @@ class CheckDirTests(unittest.TestCase):
             "    steps:\n"
             "      - uses: actions/checkout@abc\n"
             '        with: {repository: Comfy-Org/github-workflows, ref: "${{ inputs.workflows_ref }}"}\n',
+        )
+        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("NOT covering this file", errors[0])
+        self.assertEqual(checked, [])
+
+    def test_a_lost_declaration_is_caught_through_a_bracket_use(self):
+        # Backstop parity for index access (BE-8146): a file whose only use is
+        # `inputs['workflows_ref']` was a silent skip, so a lost declaration
+        # there looked exactly like "not applicable" — the one thing this error
+        # exists to prevent.
+        self._write(
+            "unparseable.yml",
+            "name: F\n"
+            "on:\n"
+            "  workflow_call:\n"
+            "jobs:\n"
+            "  j:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ inputs['workflows_ref'] }}\n",
         )
         errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
         self.assertEqual(len(errors), 1, errors)
