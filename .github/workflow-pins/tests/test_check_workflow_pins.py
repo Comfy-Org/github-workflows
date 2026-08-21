@@ -1436,6 +1436,262 @@ class GuardCoverageTests(unittest.TestCase):
         self.assertIn("no step `resolve_reff` precedes", error)
         self.assertNotIn("<id>", error)
 
+    # ------------------------------------------------------------------
+    # The two-tier reader (BE-8253). One regex per line gives one verdict per
+    # line, so a `ref:` value the strict reader cannot chew — or one holding
+    # SEVERAL step outputs — used to record no site and pass the lint, while
+    # the identical workflow spelled bare failed. Loose tier: does the
+    # comment-stripped VALUE mention a step output at all? Strict tier: every
+    # interpolation, every top-level `||` operand. Loose > strict = refuse.
+    # ------------------------------------------------------------------
+
+    def _states(self, steps):
+        """(uses_fallback, guarded, via_step_output) for each site in one job."""
+        return [
+            (fb, guarded, via)
+            for _, fb, guarded, via in cwp.ref_checkouts(self._wrap(steps).split("\n"))
+        ]
+
+    def _second_resolver(self, base, step_id="lookup"):
+        """`base` re-declared under a second id, so a two-operand `ref:` can
+        have each of its operands covered — or not — independently."""
+        other = base.replace("id: resolve_ref", "id: %s" % step_id).replace(
+            "Resolve the asset ref", "Resolve the %s ref" % step_id
+        )
+        self.assertNotEqual(other, base, "fixture drifted")
+        return other
+
+    def test_a_fallback_containing_a_brace_is_refused_not_skipped(self):
+        # The `}` in `{0}` breaks the fallback stretch, so the strict reader
+        # matches nothing and the line used to leave the lint entirely — a
+        # confirmed fail-open through the real CLI: this workflow passed while
+        # the identical one spelled bare failed.
+        ref = "${{ steps.resolve_ref.outputs.ref || format('refs/heads/{0}', 'main') }}"
+        steps = self.RESOLVER + self._step_output_checkout(self.EXACT_IF, ref=ref)
+        self.assertEqual(self._states(steps), [(False, False, "unparsed")])
+        self.assertEqual(len(self._jobs(steps)), 1)
+
+    def test_a_parenthesized_operand_is_refused_not_skipped(self):
+        # `)` after the output name matches neither `||` nor `}}`, so the
+        # strict reader stops — but the value plainly reads a step output.
+        ref = "${{ (steps.resolve_ref.outputs.ref) || 'main' }}"
+        steps = self.RESOLVER + self._step_output_checkout(self.EXACT_IF, ref=ref)
+        self.assertEqual(self._states(steps), [(False, False, "unparsed")])
+
+    def test_an_and_operator_after_the_output_is_refused_not_skipped(self):
+        # Only `||` is read. `&&` is wrong in BOTH arms at runtime — truthy
+        # checks out at the mutable literal, falsey resolves to '' and checkout
+        # takes the default branch — so the one shape that must NOT happen is
+        # the lint staying quiet about it.
+        ref = "${{ steps.resolve_ref.outputs.ref && 'main' }}"
+        steps = self.RESOLVER + self._step_output_checkout(self.EXACT_IF, ref=ref)
+        self.assertEqual(self._states(steps), [(False, False, "unparsed")])
+
+    def test_the_flow_and_continuation_spellings_refuse_it_too(self):
+        # Same treatment on all three spellings — a shape refused in the block
+        # form and skipped in the other two is the one-line bypass again.
+        expr = "${{ steps.resolve_ref.outputs.ref && 'main' }}"
+        flow = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            '        with: {repository: Comfy-Org/github-workflows, ref: "%s"}\n' % expr
+        )
+        scalar = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: >-\n"
+            "            %s\n" % expr
+        )
+        for spelling, steps in (("flow", flow), ("block scalar", scalar)):
+            with self.subTest(spelling=spelling):
+                self.assertEqual(
+                    self._states(self.RESOLVER + steps), [(False, False, "unparsed")]
+                )
+
+    def test_a_flow_fallback_holding_a_comma_is_refused_not_skipped(self):
+        # `[^,}]` is the flow form's entry boundary, so a fallback carrying a
+        # comma is a spelling the strict reader genuinely cannot read there.
+        # The block form reads it (`test_a_fallback_containing_a_comma_is_still_read`);
+        # the flow form now REFUSES it instead of dropping the site.
+        flow = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            '        with: {ref: "${{ steps.resolve_ref.outputs.ref || \'a,b\' }}"}\n'
+        )
+        self.assertEqual(
+            self._states(self.RESOLVER + flow), [(False, False, "unparsed")]
+        )
+
+    def test_a_commented_out_step_output_is_not_a_ref_use(self):
+        # The loose tier is permissive by design, so it MUST run on the
+        # comment-stripped value only — prose naming a step output is not a
+        # checkout resolved from one, and reporting it would fail a workflow
+        # whose `ref:` is a plain literal.
+        checkout = self._step_output_checkout(ref="main  # was ${{ steps.resolve_ref.outputs.ref }}")
+        self.assertEqual(self._states(self.RESOLVER + checkout), [])
+
+    def test_an_unparseable_expression_outside_a_with_input_is_not_a_checkout(self):
+        # The `_is_ref_input` gate, on the new state. The walk asks EVERY line
+        # of the job, so a job-level `outputs:` mapping and a `run:` heredoc
+        # emitting fixture YAML both reach the recorder — and hard-failing a
+        # compliant workflow with an error naming a checkout where there is no
+        # checkout is the false-CI-failure channel BE-8215 already had to close
+        # once. Do not reopen it.
+        expr = "${{ steps.resolve_ref.outputs.ref && 'main' }}"
+        heredoc = (
+            "      - name: Write a fixture\n"
+            "        run: |\n"
+            "          cat <<'EOF' > f.yml\n"
+            "          ref: %s\n"
+            "          EOF\n" % expr
+        )
+        self.assertEqual(self._states(self.RESOLVER + heredoc), [])
+        job_outputs = (
+            "name: F\non:\n  workflow_call:\njobs:\n"
+            "  job0:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    outputs:\n"
+            "      ref: %s\n"
+            "    steps:\n" % expr
+        ) + self.RESOLVER
+        self.assertEqual(cwp.ref_checkouts(job_outputs.split("\n")), [])
+
+    def test_a_quoted_decoy_does_not_hide_an_unparseable_real_ref(self):
+        # The decoy discipline and the new state compose: a `ref:` planted in
+        # string content meets the flow matcher's `[{,]` boundary, and stopping
+        # there would drop the REAL ref — which is itself unparseable — out of
+        # coverage entirely.
+        flow = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            '        with: {path: "x, ref: ${{ steps.decoy.outputs.ref }}", '
+            'ref: "${{ (steps.resolve_ref.outputs.ref) || \'main\' }}"}\n'
+        )
+        self.assertEqual(
+            self._states(self.RESOLVER + flow), [(False, False, "unparsed")]
+        )
+
+    def test_both_concatenated_interpolations_are_judged(self):
+        # The block pattern's greedy `.*` landed on the LAST interpolation, so
+        # the first was never judged at all. Both feed the ref's value, so both
+        # must be covered — a fail-closed resolver each, since one step can
+        # carry only one exact `if:`.
+        ref = "${{ steps.lookup.outputs.ref }}${{ steps.resolve_ref.outputs.ref }}"
+        checkout = self._step_output_checkout(ref='"%s"' % ref)
+        both_hard = self._second_resolver(self.HARD_RESOLVER) + self.HARD_RESOLVER
+        self.assertEqual(self._jobs(both_hard + checkout), [])
+        # Cover only the SECOND — the one the old reader judged — and the site
+        # must still fail on the first.
+        one_hard = self._second_resolver(self.RESOLVER) + self.HARD_RESOLVER
+        self.assertEqual(len(self._jobs(one_hard + checkout)), 1)
+        # …and only the first: the same failure, from the other side.
+        other_hard = self._second_resolver(self.HARD_RESOLVER) + self.RESOLVER
+        self.assertEqual(len(self._jobs(other_hard + checkout)), 1)
+
+    def test_every_or_operand_must_be_covered(self):
+        # `A || B` with both operands step outputs: the fallback stretch
+        # swallowed `B`, so a covered `A` passed the whole site while `B`
+        # reached an output nothing had judged. An unresolved `A` really is
+        # falsey, so `B` really can be the ref.
+        ref = "${{ steps.lookup.outputs.ref || steps.resolve_ref.outputs.ref }}"
+        checkout = self._step_output_checkout(ref=ref)
+        both_hard = self._second_resolver(self.HARD_RESOLVER) + self.HARD_RESOLVER
+        self.assertEqual(self._jobs(both_hard + checkout), [])
+        # Leading operand covered, trailing one not — the shape that used to
+        # pass. A covered sibling excuses nothing.
+        lead_hard = self._second_resolver(self.HARD_RESOLVER) + self.RESOLVER
+        self.assertEqual(len(self._jobs(lead_hard + checkout)), 1)
+        # …and the trailing operand is not reported `'non-leading'` merely for
+        # sitting behind another step output: `||` falls through an empty one.
+        self.assertEqual(self._states(lead_hard + checkout), [(False, False, True)])
+
+    def test_a_second_operand_naming_no_step_is_dangling(self):
+        # The exhaustive reader sees the operand the old one swallowed, so a
+        # typo in it is caught rather than excused by a covered leading operand.
+        ref = "${{ steps.resolve_ref.outputs.ref || steps.resolve_reff.outputs.ref }}"
+        steps = self.HARD_RESOLVER + self._step_output_checkout(ref=ref)
+        self.assertEqual(self._states(steps), [(False, False, "dangling")])
+
+    def test_the_supported_spellings_are_unchanged(self):
+        # No behavior change for a parsed single-operand site — the whole point
+        # of leaving the strict reader alone and adding a tier around it.
+        for ref in (
+            "${{ steps.resolve_ref.outputs.ref }}",
+            "${{ steps.resolve_ref.outputs.ref || 'main' }}",
+            "${{ steps.resolve_ref.outputs.ref || 'a,b' }}",
+        ):
+            with self.subTest(ref=ref):
+                self.assertEqual(
+                    self._states(
+                        self.RESOLVER + self._step_output_checkout(self.EXACT_IF, ref=ref)
+                    ),
+                    [(False, True, True)],
+                    ref,
+                )
+                self.assertEqual(
+                    self._states(self.RESOLVER + self._step_output_checkout(ref=ref)),
+                    [(False, False, True)],
+                    ref,
+                )
+
+    def test_a_continuation_value_with_a_literal_prefix_is_a_site(self):
+        # The block form always read a value that only CONTAINS the
+        # interpolation (`ref: refs/heads/${{ … }}`); the continuation form used
+        # to demand the whole line BE one, so the same concatenation under
+        # `ref: >-` recorded no site. Reading the value the same way in all
+        # three spellings is the point — a checkout is not less of a checkout
+        # for having a prefix, and the value still resolves through the output.
+        scalar = (
+            "      - name: Load assets\n"
+            "%s"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: >-\n"
+            "            refs/heads/${{ steps.resolve_ref.outputs.ref }}\n"
+        )
+        self.assertEqual(
+            self._states(self.RESOLVER + scalar % ""), [(False, False, True)]
+        )
+        self.assertEqual(self._jobs(self.RESOLVER + scalar % self.EXACT_IF), [])
+
+    def test_an_unparsed_ref_gets_its_own_error_text(self):
+        # Every other remedy presumes a parse — an id to name, an operand order
+        # to fix, an `if:` on a known output — so printing one of those here
+        # sends the author to edit something the lint never read. The message
+        # has to name the SUPPORTED spellings instead.
+        ref = "${{ steps.resolve_ref.outputs.ref || format('refs/heads/{0}', 'main') }}"
+        error = self._one_error(
+            self.RESOLVER + self._step_output_checkout(self.EXACT_IF, ref=ref)
+        )
+        self.assertIn("cannot parse", error)
+        self.assertIn("BE-8253", error)
+        self.assertIn(".github/workflow-pins/README.md", error)
+        for wrong_remedy in ("BE-8130", "does not START with it", "no step `"):
+            self.assertNotIn(wrong_remedy, error)
+
+    def test_a_multi_operand_error_does_not_name_the_wrong_step(self):
+        # The dangling message's whole value is naming the id to fix, and with
+        # two operands only one of them is the offending one — naming the first
+        # would send the author to edit a sibling that is fine. Step existence
+        # is a property of the JOB, not the line, so the placeholders are the
+        # honest answer there; a NON-leading operand is answerable from the
+        # line itself, so that one is still named exactly.
+        dangling = "${{ steps.resolve_ref.outputs.ref || steps.resolve_reff.outputs.ref }}"
+        error = self._one_error(
+            self.HARD_RESOLVER + self._step_output_checkout(ref=dangling)
+        )
+        self.assertIn("no step `<id>` precedes", error)
+        self.assertNotIn("no step `resolve_ref` precedes", error)
+        non_leading = "${{ steps.resolve_ref.outputs.ref || 'main' || steps.lookup.outputs.ref }}"
+        error = self._one_error(
+            self._second_resolver(self.HARD_RESOLVER)
+            + self.HARD_RESOLVER
+            + self._step_output_checkout(ref=non_leading)
+        )
+        self.assertIn("steps.lookup.outputs.ref", error)
+        self.assertNotIn("<id>", error)
+
     def test_this_repos_own_workflows_guard_every_ref_checkout(self):
         root = os.path.normpath(
             os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "workflows")

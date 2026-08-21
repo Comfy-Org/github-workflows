@@ -127,12 +127,36 @@ message, because neither BE-8130 remedy can fix operand order. A leading
 operand `||` falls *through* (`false`, `''`, `""`, `0`, `null`) still reaches
 the output and is judged normally.
 
-Spellings this reader still does not recognize — a fallback containing a brace
+**A spelling the reader cannot parse is REFUSED, not skipped (BE-8253).** The
+reader is two-tier: a permissive tier asks whether the comment-stripped `ref:`
+value mentions `steps.<id>.outputs.<name>` at all, and the strict tier reads
+every interpolation and every top-level `||` operand in it. When the first
+counts more mentions than the second could account for, the site is reported —
+the lint says it cannot judge this expression and names the spellings it can.
+Unrecognized spellings include a fallback containing a brace
 (`|| format('refs/heads/{0}', 'main')`), a parenthesized operand
-(`(steps.<id>.outputs.<name>) || 'main'`), and `&&` rather than `||` — match
-nothing and record no site, exactly as every `||` spelling did before BE-8215.
-Write the ref as a bare `${{ steps.<id>.outputs.<name> }}` under the exact
-`if:`, or as a plain `|| <literal>` fallback, and it is covered.
+(`(steps.<id>.outputs.<name>) || 'main'`), `&&` rather than `||`, and — in the
+flow form only, whose entry boundary is a comma — a fallback containing one
+(`|| 'a,b'`). Each of those used to match nothing and record no site, so the
+lint PASSED a workflow it had never read while failing the identical one
+spelled bare. Write the ref as a bare `${{ steps.<id>.outputs.<name> }}` under
+the exact `if:`, or as that expression with a trailing `|| <literal>` fallback,
+and it is covered. The reader does not evaluate `format()`, `&&` or
+parenthesized expressions on purpose: an unknown spelling asks its author for a
+supported one rather than growing an expression parser inside the lint.
+
+**Every operand is judged, and the strongest requirement wins (BE-8253).** A
+`ref:` value can read more than one step output, and each one is a ref the
+checkout can really resolve to — so each must independently pass (declared as
+an earlier step, covered by a fail-closed resolver or the exact non-empty `if:`,
+and reachable by operand order). A covered sibling excuses nothing. Two shapes
+used to slip through on a single verdict per line:
+`ref: "${{ steps.a.outputs.ref }}${{ steps.b.outputs.ref }}"`, where only the
+LAST interpolation was judged even though both feed the value, and
+`ref: ${{ steps.a.outputs.ref || steps.b.outputs.ref }}`, where the fallback
+stretch swallowed `b`. A step output ahead of another operand does not make it
+non-leading: an unresolved output is `''`, so `||` really can fall through to
+what follows — and that leading output is judged in its own right.
 
 **The lint enforces that split, rather than trusting the prose.** The fallback
 answers *mutability*; the guard answers *emptiness*; a checkout using the
