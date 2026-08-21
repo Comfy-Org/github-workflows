@@ -575,7 +575,20 @@ def steps_output_ref(line, cont=False):
     if cont:
         match = _STEPS_OUTPUT_CONT_RE.match(code)
     else:
-        match = _STEPS_OUTPUT_BLOCK_RE.match(code) or _STEPS_OUTPUT_FLOW_RE.search(code)
+        match = _STEPS_OUTPUT_BLOCK_RE.match(code)
+        if match is None:
+            # The flow form `search`es mid-line, so its `[{,]` entry boundary can
+            # be met by a comma INSIDE a quoted sibling — planting a decoy `ref:`
+            # that resolves to a step no checkout consumes, while the real `ref:`
+            # further along the line is never examined. `_pins_to_job_workflow_sha`
+            # answers that by requiring its match to sit outside quotes; here the
+            # walk must also keep LOOKING past the decoy, because stopping at it
+            # drops the site out of coverage entirely rather than merely scoring
+            # it weaker.
+            for candidate in _STEPS_OUTPUT_FLOW_RE.finditer(code):
+                if _outside_quotes(code, candidate.start()):
+                    match = candidate
+                    break
     return (match.group("id"), match.group("out")) if match else None
 
 
@@ -1080,8 +1093,13 @@ def _skips_on_empty_output(lines, idx, step_id, out):
             cond = cond[3:-2].strip()
         # Runs of whitespace collapse to one space, which can only ever REJECT
         # a condition that is not the wanted one — it never removes a character
-        # and so can never manufacture the `''` this test hinges on.
-        if re.sub(r"\s+", " ", cond) == wanted:
+        # and so can never manufacture the `''` this test hinges on. The spacing
+        # AROUND `!=` is then pinned to one space either side, because Actions
+        # accepts `…outputs.ref!=''` and a lint that failed it would be failing
+        # the remedy it just asked for. Normalizing spacing cannot turn a
+        # different condition into this one: every other character still has to
+        # match exactly, `!=` included.
+        if re.sub(r"\s*!=\s*", " != ", re.sub(r"\s+", " ", cond)) == wanted:
             return True
     return False
 
