@@ -904,7 +904,20 @@ def steps_output_ref(line, cont=False):
     if cont:
         match = _STEPS_OUTPUT_CONT_RE.match(code)
     else:
-        match = _STEPS_OUTPUT_BLOCK_RE.match(code) or _STEPS_OUTPUT_FLOW_RE.search(code)
+        match = _STEPS_OUTPUT_BLOCK_RE.match(code)
+        if match is None:
+            # The flow form `search`es mid-line, so its `[{,]` entry boundary can
+            # be met by a comma INSIDE a quoted sibling — planting a decoy `ref:`
+            # that resolves to a step no checkout consumes, while the real `ref:`
+            # further along the line is never examined. `_pins_to_job_workflow_sha`
+            # answers that by requiring its match to sit outside quotes; here the
+            # walk must also keep LOOKING past the decoy, because stopping at it
+            # drops the site out of coverage entirely rather than merely scoring
+            # it weaker.
+            for candidate in _STEPS_OUTPUT_FLOW_RE.finditer(code):
+                if _outside_quotes(code, candidate.start()):
+                    match = candidate
+                    break
     if not match:
         return None
     step_id = match.group("id") or match.group("id_idx")
@@ -1281,7 +1294,15 @@ def _skips_on_empty_output(lines, idx, step_id, out):
     wanted = "steps.%s.outputs.%s != ''" % (step_id, out)
     for j in range(start, end):
         line = lines[j]
-        if _is_skippable(line) or _indent(line) != key_indent:
+        if _is_skippable(line):
+            continue
+        if j == start and line.lstrip().startswith("- "):
+            # The list marker occupies the step's key column, so `- if: …`
+            # declares the condition there exactly as a later `if:` line does.
+            # Same rewrite `_binding_step_id` makes to read an `id:` off it —
+            # without it a correctly guarded checkout reads as unguarded.
+            line = " " * key_indent + line.lstrip()[2:]
+        if _indent(line) != key_indent:
             continue
         if not _STEP_IF_RE.match(line):
             continue
@@ -1305,8 +1326,13 @@ def _skips_on_empty_output(lines, idx, step_id, out):
             cond = cond[3:-2].strip()
         # Runs of whitespace collapse to one space, which can only ever REJECT
         # a condition that is not the wanted one — it never removes a character
-        # and so can never manufacture the `''` this test hinges on.
-        if re.sub(r"\s+", " ", cond) == wanted:
+        # and so can never manufacture the `''` this test hinges on. The spacing
+        # AROUND `!=` is then pinned to one space either side, because Actions
+        # accepts `…outputs.ref!=''` and a lint that failed it would be failing
+        # the remedy it just asked for. Normalizing spacing cannot turn a
+        # different condition into this one: every other character still has to
+        # match exactly, `!=` included.
+        if re.sub(r"\s*!=\s*", " != ", re.sub(r"\s+", " ", cond)) == wanted:
             return True
     return False
 

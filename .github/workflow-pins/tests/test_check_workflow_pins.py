@@ -1387,6 +1387,54 @@ class GuardCoverageTests(unittest.TestCase):
         widened = '        if: "steps.resolve_ref.outputs.ref != \'\' || always()"\n'
         self.assertEqual(len(self._jobs(self.RESOLVER + self._step_output_checkout(widened))), 1)
 
+    def test_the_id_on_the_list_marker_line_registers_the_resolver(self):
+        # `_binding_step_id` normalizes the marker so `- id: …` is read at the
+        # step's key column. Without it the resolver registers under no id, and
+        # the consuming checkout drops out of coverage — silently, since an
+        # unresolvable `<id>` is treated as "not this lint's subject".
+        marker_resolver = self.RESOLVER.replace(
+            "      - name: Resolve the asset ref\n        id: resolve_ref\n",
+            "      - id: resolve_ref\n        name: Resolve the asset ref\n",
+            1,
+        )
+        self.assertNotEqual(marker_resolver, self.RESOLVER, "fixture drifted")
+        sites = cwp.ref_checkouts(
+            self._wrap(marker_resolver + self._step_output_checkout(self.EXACT_IF)).split("\n")
+        )
+        self.assertEqual(
+            [(fb, guarded, via) for _, fb, guarded, via in sites], [(False, True, True)]
+        )
+
+    def test_the_if_on_the_list_marker_line_is_seen(self):
+        # `- if: …` puts the condition at the step's key column via the list
+        # marker. Missing it reports a correctly guarded checkout as unguarded —
+        # `_binding_step_id` already normalizes the same marker to read an `id:`.
+        marker = (
+            "      - if: steps.resolve_ref.outputs.ref != ''\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ steps.resolve_ref.outputs.ref }}\n"
+        )
+        self.assertEqual(self._jobs(self.RESOLVER + marker), [])
+
+    def test_a_tightly_spaced_if_passes(self):
+        # `a!=''` is valid Actions, and failing it would fail the very remedy
+        # the lint asks for.
+        tight = "        if: steps.resolve_ref.outputs.ref!=''\n"
+        self.assertEqual(self._jobs(self.RESOLVER + self._step_output_checkout(tight)), [])
+
+    def test_normalizing_the_spacing_does_not_widen_the_match(self):
+        # Spacing is normalized; nothing else is. An OR-widened condition and an
+        # `if:` naming a different output stay refused however they are spaced.
+        for cond in (
+            "        if: steps.resolve_ref.outputs.ref!=''||always()\n",
+            "        if: steps.resolve_ref.outputs.status!=''\n",
+        ):
+            with self.subTest(cond=cond.strip()):
+                self.assertEqual(
+                    len(self._jobs(self.RESOLVER + self._step_output_checkout(cond))), 1
+                )
+
     def test_a_job_level_if_does_not_cover_a_step_output_checkout(self):
         # A job-level `if:` skips the RESOLVER too, so it can never tell an
         # empty output from a populated one. Only the consuming step's own
@@ -1421,6 +1469,17 @@ class GuardCoverageTests(unittest.TestCase):
             self._wrap(self._step_output_checkout(self.EXACT_IF) + self.RESOLVER).split("\n")
         )
         self.assertEqual([s for s in sites if s[2]], [])
+        # Pinned to the SITE LIST, not just to `guarded`: the filter above is
+        # satisfied by an empty list, so on its own it cannot tell "reported as
+        # unguarded" from "dropped and never seen". Today it is the latter —
+        # `<id>` matches no earlier step, so `_record_steps_output` returns
+        # without recording. At runtime that output is guaranteed `''` and the
+        # checkout takes the DEFAULT BRANCH, so reporting it would be the
+        # stronger answer; distinguishing it from the legitimately out-of-scope
+        # case (an earlier step that exists and never touches `workflows_ref`)
+        # needs a per-job pre-scan of step ids. Asserted as-is so the gap is
+        # visible in the suite rather than hidden behind a vacuous filter.
+        self.assertEqual(sites, [], "behaviour changed — see the note above")
 
     def test_a_step_output_unrelated_to_the_input_is_not_a_ref_use(self):
         # The producing step binds no `workflows_ref`, so this checkout has
@@ -1442,6 +1501,21 @@ class GuardCoverageTests(unittest.TestCase):
         )
         self.assertEqual(self._jobs(self.RESOLVER + flow % self.EXACT_IF), [])
         self.assertEqual(len(self._jobs(self.RESOLVER + flow % "")), 1)
+
+    def test_a_quoted_sibling_cannot_plant_a_decoy_step_output(self):
+        # The twin of `test_a_quoted_sibling_cannot_plant_a_decoy_ref`, on this
+        # path. A comma inside a quoted sibling meets the flow matcher's `[{,]`
+        # boundary, so the leftmost match can be a `ref:` that is string
+        # CONTENT — naming a step no `resolvers` entry holds, which drops the
+        # real checkout out of coverage entirely. Keep looking past it.
+        line = (
+            "        with: {path: \"x, ref: ${{ steps.other.outputs.ref }}\", "
+            "ref: \"${{ steps.resolve_ref.outputs.ref }}\"}"
+        )
+        self.assertEqual(cwp.steps_output_ref(line), ("resolve_ref", "ref"))
+        # …and a real flow-form step output is still read, decoy or not.
+        plain = "        with: {repository: a/b, ref: ${{ steps.r.outputs.ref }}}"
+        self.assertEqual(cwp.steps_output_ref(plain), ("r", "ref"))
 
     def test_the_block_scalar_form_of_a_step_output_checkout_behaves_the_same(self):
         # `ref: >-` leaves the key line with no expression on it and the

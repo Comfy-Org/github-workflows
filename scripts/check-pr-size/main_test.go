@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -335,6 +336,162 @@ func TestClassifyHonorsLegitBaseGitattributes(t *testing.T) {
 	}
 	if !handCounted {
 		t.Error("hand.go should still be counted")
+	}
+}
+
+// TestClassifyRenameIntoAttrGeneratedTreeStillCounts is the attribute half of
+// the rename anti-gaming guard (the path-based buckets are covered by
+// TestRenameIntoExclusionBucketsStillCounts, which cannot reach this one — the
+// attribute lookup needs a real repo). Renaming a hand-written file INTO a
+// `linguist-generated` tree and editing it in the same commit must not hide the
+// edit: classifying on the destination alone excluded it from both the size
+// count and the --reviewed-diff-out patch fed to the review panel. A rename
+// whose BOTH ends carry the attribute is still excluded, so genuine moves
+// inside a generated tree are unaffected.
+func TestClassifyRenameIntoAttrGeneratedTreeStillCounts(t *testing.T) {
+	dir := initTestRepo(t)
+	// The two base files must NOT be byte-identical: gen/keep2.json below is an
+	// exact-blob rename of gen/keep.json, and if handwritten/x.json carried the
+	// same bytes git's exact-rename phase could pair keep2 with the hand-written
+	// source instead (neither basename matches, so the tie-break is hashmap
+	// order and varies by git version), inverting both OldPath assertions.
+	body := strings.Repeat("{\"k\": \"v\"}\n", 40)
+	keepBody := strings.Repeat("{\"keep\": \"generated\"}\n", 25)
+	writeFile(t, dir, ".gitattributes", "gen/** linguist-generated=true\n")
+	writeFile(t, dir, "handwritten/x.json", body)
+	writeFile(t, dir, "gen/keep.json", keepBody)
+	base := commitAll(t, dir, "base")
+
+	// PR head, touching NOTHING under .gitattributes: a hand-written file moves
+	// into the generated tree carrying an injected edit, and a genuinely
+	// generated file moves within that tree.
+	gitRun(t, dir, "mv", "handwritten/x.json", "gen/x.json")
+	writeFile(t, dir, "gen/x.json", body+"{\"injected\": \"marker\"}\n")
+	gitRun(t, dir, "mv", "gen/keep.json", "gen/keep2.json")
+	head := commitAll(t, dir, "head")
+	t.Chdir(dir)
+
+	// Probe AFTER the chdir: base is a SHA in this throwaway repo, so running it
+	// from the outer repo would fail for "not a valid object" — which
+	// checkAttrSourceSupported deliberately reports as supported — and the skip
+	// could never fire on a runner whose git predates check-attr --source.
+	if !checkAttrSourceSupported(base) {
+		t.Skip("git too old for check-attr --source")
+	}
+
+	files, err := diffFiles(base, head)
+	if err != nil {
+		t.Fatalf("diffFiles: %v", err)
+	}
+	attr := attrPolicy{source: base, useSource: true}
+	attr.trusted = attrTrusted(attr.useSource, TouchesGitattributes(files), false)
+	if !attr.trusted {
+		t.Fatal("attribute path should be trusted (PR does not touch .gitattributes)")
+	}
+	classify(files, base, head, attr, Extras{}, false)
+
+	byPath := make(map[string]FileChange, len(files))
+	for _, f := range files {
+		byPath[f.Path] = f
+	}
+	moved, ok := byPath["gen/x.json"]
+	if !ok {
+		t.Fatalf("git did not report gen/x.json as changed; got %+v", files)
+	}
+	if moved.OldPath != "handwritten/x.json" {
+		t.Fatalf("gen/x.json OldPath = %q, want handwritten/x.json (rename detection did not fire)", moved.OldPath)
+	}
+	if moved.Generated {
+		t.Error("a hand-written file renamed INTO a linguist-generated tree must not be classified generated — its edit would vanish from both the count and the reviewed diff")
+	}
+	kept, ok := byPath["gen/keep2.json"]
+	if !ok {
+		t.Fatalf("git did not report gen/keep2.json as changed; got %+v", files)
+	}
+	if !kept.Generated {
+		t.Error("a rename whose source AND destination both carry linguist-generated should stay excluded")
+	}
+
+	res := Evaluate(files, Policy{Max: 1000})
+	if res.Counted == 0 {
+		t.Errorf("Counted = %d, want the injected edit counted", res.Counted)
+	}
+
+	// End-to-end on the second symptom: the injected edit must reach the patch
+	// the review panel reads, while the genuinely generated rename stays out.
+	out := filepath.Join(t.TempDir(), "pr-diff.patch")
+	if err := writeReviewedDiff(base, head, nil, files, out); err != nil {
+		t.Fatalf("writeReviewedDiff: %v", err)
+	}
+	patch, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(patch), "injected") {
+		t.Error("the injected edit is missing from the --reviewed-diff-out patch — the review panel would never see it")
+	}
+	if strings.Contains(string(patch), "keep2.json") {
+		t.Error("a rename entirely inside a generated tree should still be dropped from the reviewed diff")
+	}
+}
+
+// TestAnnotateDiscountsPairsRenamesSoTheEditStillCounts guards the downstream
+// half of the rename guard. classify() correctly leaves a hand-written file
+// renamed out of its tree non-generated, but annotateDiscounts then re-derives a
+// patch from git; naming only the DESTINATION in that pathspec hid the deletion
+// side, git could not pair the rename, and it re-emitted the file as a
+// whole-file ADDITION whose every comment/blank line became a discount. Clamped
+// at Changed(), that drove the rename's Counted() to 0 — silently cancelling the
+// guard for any caller running with --ignore-comments (cursor-review's
+// ignore_comments input feeds exactly that).
+func TestAnnotateDiscountsPairsRenamesSoTheEditStillCounts(t *testing.T) {
+	dir := initTestRepo(t)
+	// Comment-heavy on purpose: unpaired, the whole-file addition discounts far
+	// more lines than the rename actually changed, so the clamp zeroes it out.
+	var sb strings.Builder
+	sb.WriteString("package hw\n")
+	for i := 0; i < 200; i++ {
+		fmt.Fprintf(&sb, "// comment line %d\n\nvar V%d = %d\n", i, i, i)
+	}
+	writeFile(t, dir, "handwritten/big.go", sb.String())
+	base := commitAll(t, dir, "base")
+
+	if err := os.MkdirAll(filepath.Join(dir, "moved"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, dir, "mv", "handwritten/big.go", "moved/big.go")
+	writeFile(t, dir, "moved/big.go", sb.String()+"var Injected = 42\n")
+	head := commitAll(t, dir, "head")
+	t.Chdir(dir)
+
+	files, err := diffFiles(base, head)
+	if err != nil {
+		t.Fatalf("diffFiles: %v", err)
+	}
+	classify(files, base, head, attrPolicy{}, Extras{}, false)
+
+	var moved *FileChange
+	for i := range files {
+		if files[i].Path == "moved/big.go" {
+			moved = &files[i]
+		}
+	}
+	if moved == nil {
+		t.Fatalf("git did not report moved/big.go as changed; got %+v", files)
+	}
+	if moved.OldPath != "handwritten/big.go" {
+		t.Fatalf("moved/big.go OldPath = %q, want handwritten/big.go (rename detection did not fire)", moved.OldPath)
+	}
+	if moved.Generated {
+		t.Fatal("a plain hand-written rename must not be classified generated")
+	}
+
+	annotateDiscounts(files, base, head)
+	if moved.Discounted != 0 {
+		t.Errorf("Discounted = %d, want 0 — the rename was re-read as a whole-file addition", moved.Discounted)
+	}
+	if got := Evaluate(files, Policy{Max: 1000}).Counted; got != 1 {
+		t.Errorf("Counted = %d, want 1 (the injected line); discounting cancelled the rename guard", got)
 	}
 }
 
