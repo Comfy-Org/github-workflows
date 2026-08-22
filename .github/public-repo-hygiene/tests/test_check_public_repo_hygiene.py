@@ -19,6 +19,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 
@@ -179,6 +180,471 @@ class InternalMarkerCategoryTest(CheckerTestCase):
             "https://posthog.com/docs and https://slack.com/intl/en-gb/\n",
         )
         self.assertEqual(self.findings(), [])
+
+    # Neighbouring REGISTRABLE domains -- anyone can buy these, which is what
+    # makes flagging them a leak-report someone has to triage.
+    LOOKALIKE_HOSTS = (
+        "https://fooslack.com/archives/x",
+        "https://evil-posthog.com/project/1",
+        "https://my-linear.app/x",
+        "https://foonotion.so/page",
+        "https://app.slack.com.evil.com/",
+    )
+    # Same-namespace neighbours of the google-led patterns. Only Google can
+    # create `*.google.com`, so these are not third-party lookalikes and pin
+    # something narrower: the left anchor drops a host inside the SAME
+    # registrable domain, not just a neighbouring one.
+    #
+    # `myapp.datadoghq.com` is deliberately NOT here. Datadog hands customers
+    # their own `<name>.datadoghq.com` sub-domain, so that namespace is not
+    # vendor-only and a custom-sub-domain org really would be missed -- a
+    # genuine gap, recorded under README "Known limitations" rather than
+    # pinned here as if it were correct. (BE-8729 review.)
+    SAME_NAMESPACE_HOSTS = (
+        "https://mydocs.google.com/doc/1",
+        "https://xdrive.google.com/file/d/abc",
+    )
+
+    def test_lookalike_hosts_are_not_flagged(self):
+        # Every one of these was a finding before the DNS-label anchors: `\b`
+        # is not a host boundary (a hyphen is a non-word character, so
+        # `\bposthog\.com` matched inside `evil-posthog.com`) and half the
+        # patterns carried no left anchor at all. A letter, digit or hyphen
+        # before the host means a DIFFERENT registrable domain; only a dot is a
+        # real subdomain edge. `app.slack.com.evil.com` is the right-hand twin:
+        # it is the one host-only pattern, so `\b` accepted a following label.
+        #
+        # `notlinear.app` is deliberately absent -- `t`->`l` puts a word
+        # character where `\blinear` needed a boundary, so it never matched
+        # even before the fix and would pin nothing.
+        for marker in self.LOOKALIKE_HOSTS + self.SAME_NAMESPACE_HOSTS:
+            with self.subTest(marker=marker):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write("notes.md", marker + "\n")
+                self.assertEqual(checker.run_checks(repo.root).findings, [])
+
+    PORTED_MARKERS = (
+        "https://www.notion.so:443/team/page",
+        "https://app.datadoghq.com:8443/x",
+        "https://linear.app:443/comfy/issue/AA-1",
+    )
+
+    def test_an_explicit_port_does_not_bypass_the_check(self):
+        # A port sits between the host and the path, so every pattern that
+        # required `/` straight after the host was a one-token bypass away
+        # from silence.
+        for marker in self.PORTED_MARKERS:
+            with self.subTest(marker=marker):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write("notes.md", marker + "\n")
+                findings = [
+                    f
+                    for f in checker.run_checks(repo.root).findings
+                    if "collaboration-tool marker" in f
+                ]
+                self.assertGreaterEqual(len(findings), 1, f"{marker}: {findings}")
+
+    def test_an_empty_port_does_not_bypass_the_check(self):
+        # `port = *DIGIT` in RFC 3986, so `https://notion.so:/page` is a valid
+        # URL whose host is `notion.so` -- an empty port just means the default.
+        # `(?::\d+)?` could not match the bare colon and then could not match
+        # the required `/` either, which is the same one-token bypass `:443`
+        # was. (BE-8729 review.)
+        for marker in (
+            "https://notion.so:/page",
+            "https://docs.google.com:/document/d/abc",
+            "https://comfy.slack.com:/archives/C123",
+        ):
+            with self.subTest(marker=marker):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write("notes.md", marker + "\n")
+                findings = [
+                    f
+                    for f in checker.run_checks(repo.root).findings
+                    if "collaboration-tool marker" in f
+                ]
+                self.assertGreaterEqual(len(findings), 1, f"{marker}: {findings}")
+
+    def test_a_port_that_is_not_a_port_still_flags_the_readable_host(self):
+        # Rounds 3 and 4 rejected `app.slack.com:443.evil.com` with a
+        # `:\d+\.[A-Za-z0-9-]` alternative, on the premise that the host
+        # "continues past the port" and really resolves to `evil.com`. It does
+        # not. `port = *DIGIT`, so WHATWG's port state fails on the `.` and the
+        # URL does not parse at all; `urlsplit(...).hostname` is
+        # `app.slack.com`; curl and Go's `net/url` both error on the port. The
+        # only host any parser reads on that line is the internal one, so
+        # suppressing the line was a MISS, and it also cost the `:2.5` /
+        # `:1.0.1` prose misses that shared the shape. Round 5 removed the
+        # alternative; all four of these must now be flagged. The genuine
+        # phishing form is `...@evil.com`, which the `[.:]...@` alternative
+        # rejects -- pinned separately below. Do NOT restore `:\d+\.` (nor the
+        # `_PORT` group round 3 shed) to "fix" a suffix host: this test is what
+        # says the suffix host is not the leak. (BE-8729 review, round 5.)
+        for marker in (
+            "https://app.slack.com:443.evil.com/x",
+            "https://app.slack.com:8443.evil.com",
+            "See app.slack.com:2.5 release notes",
+            "See app.slack.com:1.0.1 release notes",
+        ):
+            with self.subTest(marker=marker):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write("notes.md", marker + "\n")
+                findings = [
+                    f
+                    for f in checker.run_checks(repo.root).findings
+                    if "collaboration-tool marker" in f
+                ]
+                self.assertEqual(len(findings), 1, f"{marker}: {findings}")
+
+    def test_the_phishing_form_of_a_ported_suffix_host_is_still_rejected(self):
+        # The half of the shape above that IS a bypass: with userinfo, the real
+        # host is `evil.com` whatever precedes the `@`. This is what licenses
+        # removing `:\d+\.[A-Za-z0-9-]` -- the phishing case never needed it.
+        for marker in (
+            "https://app.slack.com:443.evil.com@evil.com/",
+            "https://app.slack.com:8443.evil.com@evil.com/x",
+        ):
+            with self.subTest(marker=marker):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write("notes.md", marker + "\n")
+                self.assertEqual(checker.run_checks(repo.root).findings, [])
+
+    def test_the_userinfo_delimiter_is_not_read_as_a_host_boundary(self):
+        # `https://app.slack.com@evil.com/` has host `evil.com` -- the `@`
+        # makes everything before it userinfo. That is the same lookalike-host
+        # false positive as `app.slack.com.evil.com`, in the canonical phishing
+        # shape, so the right anchor rejects `@` too. A leading `admin@` is the
+        # other direction and still matches, since `_HOST_L` only bars a label
+        # character. (BE-8729 review.)
+        for marker, want in (
+            ("https://app.slack.com@evil.com/", 0),
+            ("https://app.slack.com:443@evil.com/", 0),
+            # Userinfo BETWEEN the host and the `@`. The first cut only
+            # rejected an `@` adjacent to the host or to an all-digit port, so
+            # all three of these stayed flagged. (BE-8729 review, round 3.)
+            ("https://app.slack.com:@evil.com/", 0),
+            ("https://app.slack.com:secret@evil.com/", 0),
+            ("https://app.slack.com.@evil.com/", 0),
+            # ...but the rejection must not reach across prose to an unrelated
+            # address, which is why it is anchored on a leading `.`/`:` and
+            # stops at a URL delimiter.
+            ("mail admin@app.slack.com about it", 1),
+            ("app.slack.com, and email bob@example.com", 1),
+            ("app.slack.com,bob@example.com", 1),
+        ):
+            with self.subTest(marker=marker):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write("notes.md", marker + "\n")
+                findings = [
+                    f
+                    for f in checker.run_checks(repo.root).findings
+                    if "collaboration-tool marker" in f
+                ]
+                self.assertEqual(len(findings), want, f"{marker}: {findings}")
+
+    def test_unicode_case_folding_does_not_read_another_domain_as_the_real_host(self):
+        # `re.IGNORECASE` on its own folds Unicode, so Python matched U+0131
+        # and U+0130 against `i` and these read as the real hosts. UTS-46 does
+        # NOT: it leaves U+0131 alone and maps U+0130 to `i` + a combining dot,
+        # so neither host resolves anywhere near the real one. Flagging them
+        # was a false positive and `re.ASCII` removes it, the same way
+        # `REPO_REF_RE` scopes its ignore-case flag. (BE-8729 review.)
+        for marker in (
+            "https://l\u0131near.app/x",
+            "https://not\u0130on.so/page",
+        ):
+            with self.subTest(marker=marker):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write("notes.md", marker + "\n")
+                self.assertEqual(checker.run_checks(repo.root).findings, [])
+
+    def test_a_uts46_mapped_spelling_of_a_covered_host_is_out_of_scope(self):
+        # The OTHER half of the `re.ASCII` trade, pinned separately because it
+        # is a miss rather than a fix and the distinction is easy to lose.
+        # UTS-46 *maps* U+017F to `s` and U+212A to `k`, so unlike the two
+        # above these really do resolve to the covered host in any client, and
+        # narrowing the ignore-case flag makes them silent. That is the same
+        # scope line the README already draws for punycode, percent-encoded and
+        # defanged spellings: this is a guard against an accidental paste, not
+        # against someone spelling a link so it does not look like one.
+        # (BE-8729 review.)
+        for marker in (
+            "https://\u017flack.com/archives/C123",
+            "https://slac\u212a.com/archives/C123",
+        ):
+            with self.subTest(marker=marker):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write("notes.md", marker + "\n")
+                findings = [
+                    f
+                    for f in checker.run_checks(repo.root).findings
+                    if "collaboration-tool marker" in f
+                ]
+                self.assertEqual(findings, [], f"{marker}: {findings}")
+
+    def test_an_idn_neighbour_still_reports_as_the_real_host(self):
+        # A KNOWN LIMITATION, pinned so changing it is deliberate. The left
+        # anchor is ASCII, so `énotion.so` clears it and reports as
+        # `notion.so`. The blunt fix -- a second lookbehind rejecting any
+        # non-ASCII character -- would also silence a real link written after a
+        # curly quote, an em dash or CJK prose, and a missed leak costs more
+        # than an extra finding. See README "Known limitations".
+        repo = RepoFixture()
+        self.addCleanup(repo.cleanup)
+        repo.write("notes.md", "https://\u00e9notion.so/page\n")
+        findings = [
+            f
+            for f in checker.run_checks(repo.root).findings
+            if "collaboration-tool marker" in f
+        ]
+        self.assertEqual(len(findings), 1, findings)
+
+    def test_the_host_only_pattern_tolerates_a_trailing_root_label(self):
+        # The README scopes the trailing-root-label limitation to the
+        # `/`-requiring patterns, because this one does NOT share it: its right
+        # anchor rejects a following LABEL, and `.` followed by `/` is not one.
+        # (BE-8729 review.)
+        repo = RepoFixture()
+        self.addCleanup(repo.cleanup)
+        repo.write("notes.md", "https://app.slack.com./x\n")
+        findings = [
+            f
+            for f in checker.run_checks(repo.root).findings
+            if "collaboration-tool marker" in f
+        ]
+        self.assertGreaterEqual(len(findings), 1, findings)
+
+    def test_the_host_only_pattern_still_ends_on_punctuation_or_a_port(self):
+        # The right anchor replacing `\b` on `app.slack.com` is
+        # `(?!\.?[A-Za-z0-9-]|@|[.:][A-Za-z0-9._~%:-]{0,64}@)`, which has to
+        # reject a following LABEL and the userinfo family -- without rejecting
+        # ordinary punctuation, a real port, or end of line. Quote it in full
+        # when it changes: one revision of this comment read `:\d`, the
+        # alternative round 3 removed because it lost `app.slack.com:2FA`, and
+        # the next read `:\d+\.[A-Za-z0-9-]`, the one round 5 removed because
+        # a non-numeric port is not a host continuation at all. Both are
+        # pinned as must-match below. A stale quote here points the next editor
+        # at a regression its own test data forbids.
+        # (BE-8729 review, rounds 4 and 5.)
+        for marker in (
+            "Ask in app.slack.com.",
+            "Ask in app.slack.com:443 if you self-host.",
+            "https://app.slack.com",
+            # A colon in PROSE, not a port -- each one lost by a different cut
+            # of the backtracking fix, which is why they are all pinned. The
+            # bare-`:` alternative lost the two `:general` shapes (the
+            # `: the #general` one survived it, because `\d*` let the port
+            # swallow the lone colon). Narrowing that to `:\d` restored them
+            # and lost `:2FA` instead. Not consuming the port at all is what
+            # keeps every one of them. (BE-8729 review, rounds 2 and 3.)
+            "Ask in app.slack.com: the #general channel.",
+            "Ask in app.slack.com:general, not here.",
+            "Ask in app.slack.com:443: our workspace.",
+            "Configure app.slack.com:2FA settings before then.",
+        ):
+            with self.subTest(marker=marker):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write("notes.md", marker + "\n")
+                findings = [
+                    f
+                    for f in checker.run_checks(repo.root).findings
+                    if "collaboration-tool marker" in f
+                ]
+                self.assertEqual(len(findings), 1, f"{marker}: {findings}")
+
+    def test_the_userinfo_run_does_not_reach_across_prose_to_a_later_at(self):
+        # The userinfo alternative is `[.:][A-Za-z0-9._~%:-]{0,64}@`, and the
+        # CLASS is what keeps it honest. The first cut was `[.:][^\s/?#@]*@`,
+        # "anything but a URL delimiter", which crossed commas, quotes and
+        # braces -- so any unrelated `@` later in the same non-whitespace run
+        # satisfied the lookahead and silenced a REAL reference. Every line
+        # here matched the pre-PR `\bapp\.slack\.com\b` and must keep matching:
+        # a miss is the one direction this guard cannot afford.
+        #
+        # It stops the run on SPECIFIC characters, not on "prose" generally:
+        # whitespace, `/?#`, quotes, commas, braces and the sub-delims
+        # (`+!$&'()*;=`). `:` is deliberately IN the class, so a colon-chained
+        # run does still reach a later `@` -- see
+        # `test_a_colon_chained_run_still_reaches_a_later_at`.
+        for marker in (
+            # A comma is not a credential character; the address is separate.
+            "app.slack.com:443,ops@example.com",
+            # JSON: `"` closed the run, but the old class walked straight past
+            # it into an entirely different field's value.
+            '{"slack":"app.slack.com:443","owner":"bob@example.com"}',
+            # The shape the stop is SUPPOSED to keep matching, and the one the
+            # round-3 suite left unpinned -- `/` ends the authority, so the
+            # `@` in the query string is not userinfo and the real host here
+            # really is `app.slack.com`. Without a case, a "simplification"
+            # back to `[.:]\S*@` would pass the whole suite.
+            "https://app.slack.com:443/ssb/redirect?to=bob@x.com",
+            # A non-breaking space is not whitespace under `re.ASCII`, so the
+            # old `[^\s/?#@]*` crossed it too. The class excludes it outright.
+            "app.slack.com:443\u00a0ops@example.com",
+        ):
+            with self.subTest(marker=marker):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write("notes.md", marker + "\n")
+                findings = [
+                    f
+                    for f in checker.run_checks(repo.root).findings
+                    if "collaboration-tool marker" in f
+                ]
+                self.assertEqual(len(findings), 1, f"{marker}: {findings}")
+
+    def test_a_colon_chained_run_still_reaches_a_later_at(self):
+        # A KNOWN MISS, pinned so it cannot drift unnoticed. `:` is inside the
+        # userinfo class because `:user:pass@evil.com` is real userinfo and
+        # dropping it would reopen that phishing shape -- but the same colon
+        # lets the run chain past prose to an unrelated `@`, so each of these
+        # satisfies `[.:][A-Za-z0-9._~%:-]{0,64}@` and goes silent where the
+        # pre-PR `\bapp\.slack\.com\b` matched. This is the residue of the
+        # round-4 class narrowing, which fixed the comma, quote, brace and
+        # non-breaking-space cases pinned above; the colon case survives it by
+        # design. Documented in the README's "Known limitations".
+        # (BE-8729 review, round 5.)
+        for marker in (
+            "app.slack.com:443:ops@example.com",
+            "slack=app.slack.com:owner:ops@example.com",
+            "app.slack.com:2024-01-15:incident@comfy.org",
+        ):
+            with self.subTest(marker=marker):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write("notes.md", marker + "\n")
+                findings = [
+                    f
+                    for f in checker.run_checks(repo.root).findings
+                    if "collaboration-tool marker" in f
+                ]
+                self.assertEqual(findings, [], f"{marker}: {findings}")
+
+    def test_the_userinfo_length_bound_over_flags_past_64_characters(self):
+        # BOTH sides of the `{0,64}` boundary, so a future edit to the bound
+        # cannot tell itself it is free. The bound exists for cost (see the
+        # timing test below), but it has a correctness cost too, in the
+        # over-flag direction: userinfo longer than 64 characters puts the `@`
+        # out of the run's reach, every backtrack fails, no other alternative
+        # fires (`\.?[A-Za-z0-9-]` sees `:`, bare `@` sees `:`), and the line
+        # is flagged as `app.slack.com` although the real host is `evil.com`.
+        # Realistic when a token or JWT rides as the basic-auth password.
+        # Not a leak -- a leak guard may over-flag -- but it is a real trade
+        # and the bullet beside the pattern names it. (BE-8729 review, round 5.)
+        for length, want in ((64, 0), (65, 1)):
+            marker = "https://app.slack.com:" + ("a" * length) + "@evil.com/"
+            with self.subTest(length=length):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write("notes.md", marker + "\n")
+                findings = [
+                    f
+                    for f in checker.run_checks(repo.root).findings
+                    if "collaboration-tool marker" in f
+                ]
+                self.assertEqual(len(findings), want, f"{length}: {findings}")
+
+    def test_a_label_character_adjacent_to_the_host_is_a_known_miss(self):
+        # KNOWN MISSES, pinned together because they are one trade seen from
+        # both sides: a label character (letter, digit, hyphen, and on the
+        # right also a non-ASCII continuation) touching the host reads as part
+        # of a different name.
+        #
+        # For the TWO-label hosts that is exactly right -- `fooslack.com` IS a
+        # different registrable domain, which is the false positive this PR
+        # removed. For the THREE-label hosts it over-corrects: `my-app.slack.com`
+        # is a real slack.com workspace host and matched before, as a
+        # substring. Same for a prose hyphen on the right
+        # (`app.slack.com-hosted`), where `\b` used to hold because a hyphen is
+        # a non-word character. Recovering either costs an over-flag on a shape
+        # that really IS a different registrable name (`app.slack.com-evil.com`
+        # -> `com-evil.com`), and closing the non-ASCII side is the same blunt
+        # fix the IDN-neighbour limitation already declines on the left.
+        # All are in the README's "Known limitations". (BE-8729 review, round 5.)
+        for marker in (
+            "https://my-app.slack.com/ssb/redirect",
+            "app.slack.com-hosted workspace",
+            "Ask in app.slack.com--we use it daily.",
+        ):
+            with self.subTest(marker=marker):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write("notes.md", marker + "\n")
+                findings = [
+                    f
+                    for f in checker.run_checks(repo.root).findings
+                    if "collaboration-tool marker" in f
+                ]
+                self.assertEqual(findings, [], f"{marker}: {findings}")
+
+    def test_a_non_ascii_label_continuation_reports_as_the_literal_host(self):
+        # The right-hand half of the IDN-neighbour limitation, which was
+        # written for the LEFT boundary only. The right anchor's classes are
+        # ASCII, so a non-ASCII label continuation is not rejected and the
+        # checker reports `app.slack.com` where the real host differs. Same
+        # safe (over-flag) direction and same cause as the left-hand case, and
+        # declined for the same reason: rejecting any non-ASCII character
+        # adjacent to a host would silence a real link written against CJK
+        # prose. (BE-8729 review, round 5.)
+        for marker in (
+            "https://app.slack.com.\u4e2d\u56fd/",
+            "https://app.slack.com\u00e9vil.com/",
+        ):
+            with self.subTest(marker=marker):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write("notes.md", marker + "\n")
+                findings = [
+                    f
+                    for f in checker.run_checks(repo.root).findings
+                    if "collaboration-tool marker" in f
+                ]
+                self.assertEqual(len(findings), 1, f"{marker}: {findings}")
+
+    def test_the_userinfo_run_is_length_bounded_so_cost_stays_linear(self):
+        # `MAX_FILE_BYTES` bounds a FILE; nothing bounds a LINE. With an
+        # unbounded `[^\s/?#@]*@`, each of the ~L/14 host positions on
+        # `('app.slack.com:' * N) + '@'` rescanned the whole remaining tail
+        # before the lookahead succeeded -- quadratic, ~10^12 character steps
+        # at the 5 MiB cap, so a tracked file could turn a required check into
+        # an unexplained 15-minute job timeout. `{0,64}` caps the per-position
+        # work, which is what makes total cost linear in line length.
+        #
+        # An ABSOLUTE ceiling, not a ratio. A ratio looks tempting but does not
+        # discriminate: quadratic growth is only ~4x per doubling, which is too
+        # close to linear's ~2x to gate on a noisy shared runner -- and the
+        # bounded pattern matches at the first position anyway, so its timings
+        # are sub-millisecond and their ratio is pure noise. The gap in
+        # absolute terms is enormous and is what this asserts: on this input
+        # the bounded pattern finishes in well under a millisecond while the
+        # unbounded one takes ~6s, so the 2s ceiling has ~3x margin below the
+        # regression and several orders of magnitude above the correct
+        # behaviour. A slower runner only pushes the regression further past
+        # the ceiling.
+        pattern = next(
+            p
+            for p in checker.INTERNAL_MARKER_RES
+            if r"app\.slack\.com" in p.pattern
+        )
+        line = ("app.slack.com:" * (200_000 // 14)) + "@"
+        start = time.perf_counter()
+        pattern.search(line)
+        elapsed = time.perf_counter() - start
+        self.assertLess(
+            elapsed,
+            2.0,
+            f"scanning one {len(line)}-character line took {elapsed:.2f}s; "
+            "the userinfo run looks unbounded again (quadratic backtracking)",
+        )
 
 
 class RepoReferenceCategoryTest(CheckerTestCase):
@@ -579,6 +1045,31 @@ class CoverageReportingTest(CheckerTestCase):
         self.assertEqual(result.findings, [])
         self.assertEqual(len(result.warnings), 1, result.warnings)
         self.assertIn("locked/secret.md", result.warnings[0])
+        self.assertIn("NOT scanned", result.warnings[0])
+        self.assertEqual(result.skipped, [("unreadable", 1)])
+
+    def test_an_unopenable_file_warns_instead_of_crashing(self):
+        # REGRESSION. The test above reaches the `os.lstat` failure path (the
+        # directory itself is unreadable). This one reaches `open()`'s: a
+        # mode-000 REGULAR file in a readable directory, so `lstat` succeeds
+        # and only the read fails. That branch returned a FIVE-tuple while the
+        # docstring, every sibling branch and the single caller's unpack use
+        # four, so any EACCES/EMFILE/IO error on a tracked file raised
+        # `ValueError: too many values to unpack (expected 4)` and exited 1 --
+        # which `public-repo-hygiene.yml` renders as "internal-only references
+        # found", with no finding listed, on a repo that is in fact clean.
+        # (BE-8729 review, round 5.)
+        locked = self.repo.write("locked.md", "clean\n")
+        self.repo.write("ok.md", "clean\n")
+        os.chmod(locked, 0o000)
+        self.addCleanup(os.chmod, locked, 0o644)
+        if os.access(locked, os.R_OK):
+            # root ignores the mode bits, and CI containers often run as root.
+            raise unittest.SkipTest("permissions are not enforced for this user")
+        result = self.run_checks()
+        self.assertEqual(result.findings, [])
+        self.assertEqual(len(result.warnings), 1, result.warnings)
+        self.assertIn("locked.md", result.warnings[0])
         self.assertIn("NOT scanned", result.warnings[0])
         self.assertEqual(result.skipped, [("unreadable", 1)])
 

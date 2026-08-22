@@ -14,7 +14,7 @@ false positive is a one-line list edit instead of a mystery.
 | # | Category | Shape |
 |---|---|---|
 | 1 | Ticket-style identifiers | `\b[A-Z]{2,6}-\d{2,6}\b` — a generic SHAPE, never a list of real internal team keys, so the check itself discloses no internal naming scheme. Common tech acronyms that fit (`UTF-8`, `SHA-256`, `RFC-3339`, …) are allowlisted; a caller extends that list with the `ticket_allowlist:` input. Well-known **public identifier namespaces** clear by PREFIX rather than as exact tokens — `CVE-`, `CWE-`, `PEP-`, `RFC-`, `ISO-`, `UTF-` — because `CVE-2021-44228` presents to this regex as `CVE-2021` (the `\b` holds against the following hyphen), so a SECURITY.md or a dependency changelog reddened a required check, and an exact carve-out would cost one entry per year prefix and break again each January. None of those is a plausible internal team key. |
-| 2 | Internal collaboration-tool links | Notion (`notion.so`/`notion.site`), Slack (`slack.com/archives`, `slack.com/client`, `app.slack.com`), Google Docs/Drive, `app.datadoghq.com`, `posthog.com/project/`, `linear.app`, and `incident-NNN`. Case-insensitive. Public marketing pages on the same hosts (`posthog.com/docs`) are not matched. |
+| 2 | Internal collaboration-tool links | Notion (`notion.so`/`notion.site`), Slack (`slack.com/archives`, `slack.com/client`, `app.slack.com`), Google Docs/Drive, `app.datadoghq.com`, `posthog.com/project/`, `linear.app`, and `incident-NNN`. Case-insensitive. Public marketing pages on the same hosts (`posthog.com/docs`) are not matched. Each host is anchored on **DNS-label boundaries**, not on `\b`: a preceding dot is a real subdomain edge (`comfy.slack.com/archives/C123`, `www.notion.so/team/page` are those services and are matched — spelled with their paths, because the left anchor is only half of what each pattern requires), while a preceding letter, digit or hyphen makes it a different registrable domain (`fooslack.com`, `evil-posthog.com`, `my-linear.app` are not matched). An explicit **port** is tolerated, so neither `notion.so:443/` nor the empty-port `notion.so:/` (both valid URLs for that host) can walk past a pattern that requires `/` after the host. The **host** patterns compile with `re.ASCII` (`incident-NNN` is not a host and keeps plain `re.IGNORECASE`), so Unicode case-folding no longer reads a different domain — `lınear.app`, `notİon.so` — as the real one. The trade is that a UTS-46-*mapped* spelling of a covered host (`ſlack.com`, `slacK.com` with U+212A) becomes a miss instead; that is grouped with the other obfuscated spellings under "Known limitations". On the right, the required `/` after host+port is what rejects a suffix (`notion.so.evil.com/`); `app.slack.com` is the one host-only pattern and carries a right anchor of its own, `(?!\.?[A-Za-z0-9-]|@|[.:][A-Za-z0-9._~%:-]{0,64}@)`, which rejects a following label (`app.slack.com.evil.com`) and the userinfo family (`app.slack.com@evil.com`, `:@`, `:secret@`, `.@`, `:443.evil.com@evil.com` — where the real host is `evil.com`), while still allowing a sentence-final period, a real port, a colon in prose (`app.slack.com:general`, `app.slack.com:2FA`) and end of line. It does **not** reject a non-numeric “port” such as `app.slack.com:443.evil.com`: `port = *DIGIT`, so that URL does not parse at all and the only host any parser reads on the line is `app.slack.com` — an earlier revision suppressed it as a suffix host, which was a miss rather than a false-positive fix. The userinfo run matches the characters a real credential uses, and is length-bounded: an earlier `[^\s/?#@]*` (“anything but a URL delimiter”) crossed commas, quotes and braces, so an unrelated `@` later on the line silenced the host (`app.slack.com:443,ops@example.com`) — and, being unbounded, made a long single line quadratic to scan. Both bounds have a cost, in the over-flag direction and both listed under "Known limitations": the class still lets a **colon-chained** run cross prose to a later `@`, and userinfo past 64 characters is out of the run's reach. Narrowing a class inside a *negative* lookahead can only ever flag more, never less. It deliberately does **not** consume the port: an optional greedy port in front of a negative lookahead backtracks, and reasoning about every port split is what put a hole and then a regression into two earlier revisions of this anchor. |
 | 3 | `Comfy-Org/<repo>` references | **Default-deny** against `PUBLIC_COMFY_ORG_REPOS`. Anything else is flagged so a maintainer either scrubs it or adds it once confirmed public. A leading `@` makes the match a CODEOWNERS **team** handle instead, checked against `PUBLIC_COMFY_ORG_TEAMS` — team handles are inherently public on a public repo (GitHub renders CODEOWNERS owners to anyone who can see it), so an allowlisted one is not a leak. That same `@Comfy-Org/<name>` spelling is also how npm and GitHub Packages write a **scope**, so the `@` path accepts either allowlist; the reverse crossing is not allowed, since a bare `Comfy-Org/<name>` is unambiguously a repo path. A trailing `.git` is stripped, because `Foo.git` in a `repository.url` still references the public repo `Foo`, and a trailing `.` is stripped as sentence punctuation on both paths (a GitHub slug can never end in a dot); a reference left naming nothing (`Comfy-Org/.`, `Comfy-Org/.git`) is not a finding. Case-insensitive throughout — GitHub resolves owner names case-insensitively, so `comfy-org/<repo>` is checked exactly like `Comfy-Org/<repo>`, the `.git` suffix is stripped whatever its casing, and allowlist membership is compared casefolded. The repo-name class itself stays ASCII on purpose (the ignore-case flag is scoped to the org segment): a whole-pattern flag would let Unicode case-folding admit `ſ`/`K` into the name and fold them onto allowlisted spellings. Both ends of the match are bounded: the org segment must **start a token** (`NotComfy-Org/x` is a different org, not a reference to this one), and a name the ASCII class could only **partly read** is never cleared — a Unicode letter or a homoglyph dash immediately after the capture is the *rest of the name*, not a boundary, so `Comfy-Org/comfyui‐internal` written with U+2010 would otherwise test `comfyui` against the allowlist and pass while the full private name sat in the tree. Such a reference is reported whole, with its own remedy (rewrite it in ASCII), because "add it to the allowlist" is not the fix for a homoglyph. The npm/Packages crossing is narrowed to a spelling that could actually **be** an npm coordinate — those are required to be lowercase — so `@Comfy-Org/comfyui`, a team named after the repo it owns, does not clear the team allowlist by borrowing the repo one. |
 
 Only **tracked** files are scanned (`git ls-files -z`), so build output, `node_modules` and
@@ -147,15 +147,79 @@ asserts the same end-to-end.
 What this checker still does not see. The two limitations the per-repo scripts had here — a
 sentence-final period swallowed by the repo-name class, and an org segment matched
 case-sensitively — were fixed in BE-8697 and are pinned by unit tests; that is where detection
-parity with those scripts deliberately ended.
+parity with those scripts deliberately ended. BE-8729 took the category-2 host patterns off `\b`
+and onto DNS-label boundaries, taught them about ports and pinned the host patterns to ASCII, which
+removed the lookalike-host false positives, the `:443` and empty-port bypasses, and the
+Unicode-case-folding lookalikes listed above.
 
 - **The scan is line-oriented.** A reference split across two lines is not matched.
+- **A colon-chained run before an unrelated `@` silences `app.slack.com`.** The right anchor's
+  userinfo alternative keeps `:` in its character class, because `:user:pass@evil.com` is real
+  userinfo and the real host there *is* `evil.com`. The same colon lets the run chain across prose,
+  so `app.slack.com:443:ops@example.com` and a log line like
+  `app.slack.com:2024-01-15:incident@comfy.org` go silent. What *does* stop the run is everything
+  outside the credential class: whitespace, `/?#`, quotes, commas, braces and the sub-delims — the
+  round-4 narrowing that recovered `app.slack.com:443,ops@example.com`. Dropping `:` would reopen
+  the genuine `:user:pass@` phishing shape, so the miss is kept and pinned by
+  `test_a_colon_chained_run_still_reaches_a_later_at`.
+- **Userinfo longer than 64 characters over-flags.** The same alternative is length-bounded at 64
+  because an unbounded run made a long single line quadratic to scan (`MAX_FILE_BYTES` bounds a
+  *file*; nothing bounds a *line*). Past that bound the `@` is out of reach, so
+  `https://app.slack.com:<65-char token>@evil.com/` is reported as `app.slack.com` although the
+  real host is `evil.com` — realistic when a token or JWT rides as the basic-auth password. Over-flag,
+  not a leak, and both sides of the boundary are pinned by
+  `test_the_userinfo_length_bound_over_flags_past_64_characters` so moving the bound cannot
+  silently retrade it.
+- **A host written with a trailing root label is not matched by the `/`-requiring patterns.**
+  `https://notion.so./page` is the same host to a resolver, but those patterns want `/` (or a port
+  then `/`) directly after the host, so the extra dot walks past them. The limitation is scoped:
+  `app.slack.com` is the one host-only pattern, and its right anchor deliberately tolerates a dot
+  followed by a non-label character, so `https://app.slack.com./x` IS matched. This predates the
+  DNS-label anchoring and is unchanged by it; obfuscated spellings of the same hosts —
+  percent-encoding (`%2E`), punycode (`xn--`), defanging (`notion[.]so`), a backslash separator
+  (browsers resolve `https://notion.so\page` to `notion.so/page` for special schemes, but the
+  patterns want a literal `/`), and UTS-46-*mapped* characters (`ſlack.com`, `slacK.com` with
+  U+212A, both of which really do resolve to `slack.com`) — are likewise not matched. This is a
+  hygiene guard against an accidental paste, not an adversary who is actively hiding a link.
+- **An internationalized neighbour of a category-2 host reports as that host.** The left anchor is
+  ASCII, so `https://énotion.so/page` — a different registrable domain — is flagged as
+  `notion.so`. Rejecting *any* non-ASCII character in front would fix it and cost more than it
+  saves: it would also silence a real link written straight after a curly quote, an em dash or CJK
+  prose, and a missed leak is worse here than an extra finding. **The right-hand side has the same
+  gap**, since the `app.slack.com` anchor's classes are ASCII too: `https://app.slack.com.中国/`
+  (IDNA-mapped to `app.slack.com.xn--fiqs8s`) and `https://app.slack.comévil.com/` are both
+  reported as `app.slack.com`, pinned by
+  `test_a_non_ascii_label_continuation_reports_as_the_literal_host`. **ASCII `_` is the same shape
+  in the same direction** — `_` is unreserved and WHATWG accepts it in a host, so
+  `https://evil_notion.so/page` reports as `notion.so`, and on the right
+  `https://app.slack.com_user@evil.example/` (userinfo `app.slack.com_user`, host `evil.example`)
+  reports as Slack. Adding `_` to the classes is not free either: it would silence a real link
+  written in markdown emphasis (`_notion.so/page_`). The reverse direction is narrowed, not closed —
+  the category-2 **host** patterns compile with `re.ASCII`, so Unicode case-folding no longer
+  reads `lınear.app/x` or `notİon.so/page` as the real hosts. Those two are genuinely different
+  hosts under UTS-46; `ſlack.com` and `slacK.com` are not, so they move from over-flag to miss and
+  are listed with the other obfuscated spellings above.
 - **A `Comfy-Org/<name>` reference butted straight against non-Latin prose is a finding.** The
   name class is ASCII, so anything outside it immediately after the capture is treated as the rest
   of the *name* rather than as a boundary — that is what stops a U+2010 homoglyph from clearing as
   `comfyui`, and the price is that `Comfy-Org/ComfyUIを使う` (no separator) reports. A space
   clears it, and the finding message says so. Narrowing the rule to characters that casefold onto
   ASCII would reopen the bypass for every alphabet that does not, so it is deliberately broad.
+- **Only the literal `app.datadoghq.com` host is covered.** Datadog hands an organization its own
+  `<name>.datadoghq.com` sub-domain, so unlike `*.google.com` that namespace is not vendor-only —
+  and a dashboard on a custom sub-domain (`comfyapp.datadoghq.com/dashboard/1`) is a different
+  host to the DNS-label anchor and is not matched. Before BE-8729 the pattern carried no left
+  anchor and caught such a host by accident, as a substring; that was never a rule the pattern
+  set stated. Add a second pattern if an org sub-domain is ever in use.
+- **A label character adjacent to a three-label host silences it.** Same cause as the Datadog
+  bullet, seen from both sides. "A letter, digit or hyphen in front means a different registrable
+  name" is exact only for the *two-label* patterns (`notion.so`, `slack.com`, `posthog.com`,
+  `linear.app`); for a three-label host it just extends the third-level label, so
+  `https://my-app.slack.com/ssb/redirect` — a real slack.com workspace host — is not matched, and
+  neither is a prose hyphen on the right (`app.slack.com-hosted workspace`, where `\b` used to hold
+  because a hyphen is a non-word character). Recovering either costs an over-flag on a shape that
+  really *is* a different registrable name (`app.slack.com-evil.com` → `com-evil.com`), so both are
+  kept and pinned by `test_a_label_character_adjacent_to_the_host_is_a_known_miss`.
 - **Only file *contents* are scanned, never file *paths*.** A `docs/<TICKET>-migration.md` or a
   `notion-exports/` directory passes clean.
 - **Git-LFS content, submodule contents and the far side of a symlink are not scanned** — each is

@@ -97,15 +97,190 @@ TICKET_ALLOWED_PREFIXES = frozenset(
 )
 
 # --- Category 2: internal collaboration-tool links/markers -----------------
+# Anchored on real DNS-label boundaries, not on `\b` and not on nothing.
+#
+# A host name is a dot-separated sequence of labels made of letters, digits and
+# hyphens, so the only character that can precede a host we care about and still
+# leave it THAT host is a dot (a genuine subdomain edge) or something outside the
+# label alphabet entirely (`/`, `@`, a space, start of line). A letter, digit or
+# hyphen in front means a DIFFERENT registrable name: `comfy.slack.com` and
+# `www.notion.so` really are those services, while `fooslack.com` and
+# `evil-posthog.com` are unrelated domains that the bare patterns used to flag.
+# `\b` did not help -- a hyphen is a non-word character, so `\bposthog\.com`
+# matched inside `evil-posthog.com` -- and half these patterns had no left
+# anchor at all. Do NOT "tighten" this to `(?<![A-Za-z0-9.-])`: barring a
+# preceding dot rejects every subdomain-prefixed positive the fixtures pin.
+#
+# "A DIFFERENT registrable name" is exact only for the TWO-label patterns
+# (`notion.so`, `slack.com`, `posthog.com`, `linear.app`), where the anchored
+# host IS the registrable name. For the THREE-label hosts a preceding label
+# character just extends the third-level label, so `my-app.slack.com` is still
+# a slack.com workspace host and `comfyapp.datadoghq.com` still a Datadog
+# customer sub-domain -- both matched before this change, as a substring, and
+# both are silent now. That buys nothing in lookalike rejection (no
+# `<x>-app.slack.com` can be a different registrable domain) and is the same
+# customer-sub-domain shape the README documents for Datadog; the workspace
+# case is listed beside it and pinned by
+# `test_a_label_character_adjacent_to_the_host_is_a_known_miss`.
+#
+# The class is ASCII, so an IDN neighbour still clears it and `énotion.so/x` is
+# reported as `notion.so`. That is left alone deliberately: the blunt fix, a
+# second lookbehind rejecting any non-ASCII character, silences a REAL link
+# written after a curly quote, an em dash or CJK prose (`“notion.so/page`), and
+# a false negative costs more than a false positive in a leak guard. Documented
+# as a limitation in the README instead. The same gap exists for ASCII `_`,
+# which is unreserved and which WHATWG accepts in a host: `evil_notion.so/page`
+# is a different name and reports as `notion.so`. Adding `_` to the class is
+# NOT free -- it would silence a real link written in markdown emphasis
+# (`_notion.so/page_`) -- so it is documented with the IDN case rather than
+# closed. (BE-8729 review, rounds 1 and 5.)
+_HOST_L = r"(?<![A-Za-z0-9-])"
+# An explicit port sits between the host and the path, so a pattern that
+# requires `/` straight after the host is bypassed by `notion.so:443/`. The
+# digits are `*`, not `+`: `port = *DIGIT` in RFC 3986, so `https://notion.so:/x`
+# is a valid URL whose host is still `notion.so` (an empty port means the
+# default) -- and it was the same one-token bypass `:443` was. (BE-8729 review.)
+_PORT = r"(?::\d*)?"
+# ASCII on both counts. `re.IGNORECASE` alone folds Unicode, and the fold is
+# not one boundary but two, so be precise about which one this buys:
+#
+#   * U+0131 / U+0130 are DIFFERENT hosts. Python matches both against `i`, so
+#     `lınear.app/x` and `notİon.so/page` read as the real hosts -- but UTS-46
+#     leaves U+0131 alone and maps U+0130 to `i` + a combining dot, so neither
+#     resolves anywhere near `linear.app` or `notion.so`. Flagging them was a
+#     false positive, and `re.ASCII` removes it. This is the same widening
+#     `REPO_REF_RE` below scopes its flag to avoid.
+#   * U+017F / U+212A are the SAME host. UTS-46 *maps* them to `s` and `k`, so
+#     `ſlack.com/archives/C123` really does resolve to `slack.com` in any
+#     client. `re.ASCII` therefore turns those two into misses. That is a
+#     deliberate scope call, not an oversight: they are obfuscated spellings of
+#     a covered host, exactly like the punycode (`xn--`), percent-encoded and
+#     defanged spellings the README already lists as out of scope for a guard
+#     against an accidental paste. Do not read the tests below as claiming
+#     `ſlack.com` is somebody else's domain -- it is not.
+#
+# `re.ASCII` also pins `_PORT`'s `\d` to `[0-9]`, which is all a real port can
+# be; a port typed in another script's digits is likewise a spelling no client
+# resolves. (BE-8729 review.)
+_HOST_FLAGS = re.IGNORECASE | re.ASCII
 INTERNAL_MARKER_RES = (
-    re.compile(r"notion\.(so|site)/", re.IGNORECASE),
-    re.compile(r"slack\.com/(archives|client)/", re.IGNORECASE),
-    re.compile(r"\bapp\.slack\.com\b", re.IGNORECASE),
-    re.compile(r"docs\.google\.com/", re.IGNORECASE),
-    re.compile(r"drive\.google\.com/", re.IGNORECASE),
-    re.compile(r"app\.datadoghq\.com/", re.IGNORECASE),
-    re.compile(r"\bposthog\.com/project/", re.IGNORECASE),
-    re.compile(r"\blinear\.app/", re.IGNORECASE),
+    re.compile(_HOST_L + r"notion\.(so|site)" + _PORT + "/", _HOST_FLAGS),
+    re.compile(_HOST_L + r"slack\.com" + _PORT + "/(archives|client)/", _HOST_FLAGS),
+    # The one host-only pattern, so it needs a right anchor of its own -- and
+    # it does NOT consume `_PORT`. Two review rounds were lost to the fact that
+    # an optional, greedy port followed by a negative lookahead BACKTRACKS: the
+    # engine hands digits back one at a time until the lookahead is satisfied,
+    # so every alternative added to the lookahead had to be reasoned about
+    # against every possible port split, and two of the three attempts shipped
+    # a hole (`app.slack.com:443.evil.com` matching) or a regression
+    # (`app.slack.com:general` and `app.slack.com:2FA` going silent).
+    #
+    # A `search()` only needs a boolean, so nothing here has to be consumed.
+    # One lookahead reads the whole tail, and the port never enters the match:
+    # no optional group, no backtracking, each alternative independent.
+    #   `\.?[A-Za-z0-9-]`      a following label -- `app.slack.com.evil.com`,
+    #                          which is what `\b` used to accept. A dot is
+    #                          allowed only when what follows is NOT a label,
+    #                          so `app.slack.com./x` still matches. The class
+    #                          is ASCII on both sides of the host, so a
+    #                          non-ASCII label continuation is NOT rejected and
+    #                          `app.slack.com.中国/` reports as the literal
+    #                          host -- the right-hand half of the IDN-neighbour
+    #                          limitation, README "Known limitations".
+    #                          It also admits a hyphen at the FIRST position,
+    #                          so a prose hyphen reads as a continuing label
+    #                          and `app.slack.com-hosted workspace` is a MISS
+    #                          (`\b` held there, since a hyphen is a non-word
+    #                          character). Restricting the hyphen to the
+    #                          post-dot position would recover it and over-flag
+    #                          `app.slack.com-evil.com`, whose registrable name
+    #                          really is `com-evil.com`; left as-is to match
+    #                          `_HOST_L`, which makes the same trade on the
+    #                          left (`my-app.slack.com`). Both are pinned by
+    #                          `test_a_label_character_adjacent_to_the_host_is_a_known_miss`.
+    #   `@`                    the userinfo delimiter: in
+    #                          `https://app.slack.com@evil.com/` the real host
+    #                          is `evil.com`, the canonical phishing shape.
+    #   `[.:][A-Za-z0-9._~%:-]{0,64}@`
+    #                          the same thing with userinfo in between --
+    #                          `:@`, `:secret@`, `.@`. Two bounds, and both are
+    #                          load-bearing (BE-8729 review, round 4):
+    #                            * The CLASS is the userinfo characters a real
+    #                              credential uses (unreserved + `%` + the
+    #                              `user:pass` colon), NOT "anything but a URL
+    #                              delimiter". `[^\s/?#@]*` crossed commas,
+    #                              quotes and braces, so any later `@` on the
+    #                              line silenced the host:
+    #                              `app.slack.com:443,ops@example.com` and
+    #                              `{"slack":"app.slack.com:443","owner":"bob@x"}`
+    #                              both went quiet -- a MISS, the one direction
+    #                              this guard cannot afford. Narrowing a class
+    #                              inside a NEGATIVE lookahead can only ever
+    #                              flag MORE, so it cannot add a miss of its own;
+    #                              the cost is a false positive on a lookalike
+    #                              whose userinfo holds a sub-delim (`:p+w@`),
+    #                              which is a maintainer glance, not a leak.
+    #                              What stops the run is precisely: whitespace,
+    #                              `/`, `?`, `#`, a quote, a brace, and the
+    #                              sub-delims `! $ & ' ( ) * + , ; =`.
+    #                              `:` is IN the class, because `:user:pass@`
+    #                              is real userinfo -- so a colon-chained run
+    #                              still crosses prose to an unrelated `@` and
+    #                              `app.slack.com:2024-01-15:incident@comfy.org`
+    #                              is a MISS. Dropping `:` would reopen the
+    #                              genuine `:user:pass@evil.com` shape, so the
+    #                              miss is kept, documented in the README and
+    #                              pinned by
+    #                              `test_a_colon_chained_run_still_reaches_a_later_at`.
+    #                            * The LENGTH is bounded because `*` here was
+    #                              quadratic: nothing bounds a LINE (only
+    #                              `MAX_FILE_BYTES` bounds a file), and on
+    #                              `('app.slack.com:' * N) + '@'` each of the
+    #                              ~L/14 host positions rescanned the whole tail
+    #                              -- ~10^12 character steps at the 5 MiB cap,
+    #                              i.e. author-controlled content turning a
+    #                              required check into a mystery 15-minute
+    #                              timeout. Real userinfo is short; 64 is slack.
+    #                              Its correctness cost, in the same over-flag
+    #                              direction as the CLASS bound: userinfo
+    #                              LONGER than 64 characters (a token or JWT
+    #                              carried as the basic-auth password) puts the
+    #                              `@` out of the run's reach, so
+    #                              `https://app.slack.com:<65 chars>@evil.com/`
+    #                              is flagged although the real host is
+    #                              `evil.com`. Both sides of the boundary are
+    #                              pinned by
+    #                              `test_the_userinfo_length_bound_over_flags_past_64_characters`,
+    #                              so moving the bound cannot silently retrade this.
+    # A leading `admin@` is the other direction and is untouched -- `_HOST_L`
+    # only bars a label character.
+    #
+    # There is deliberately NO `:\d+\.[A-Za-z0-9-]` alternative (removed in
+    # round 5). It was there to reject `app.slack.com:443.evil.com` as "a port
+    # the host continues past", but that shape is not a bypass: `port = *DIGIT`,
+    # so WHATWG's port state fails on the `.` and the URL does not parse at all,
+    # `urlsplit(...).hostname` returns `app.slack.com`, and curl and Go's
+    # `net/url` both error on the port. No mainstream parser resolves that line
+    # to `evil.com`, so the only readable host on it is the internal one and
+    # suppressing it was a MISS, not a false-positive fix -- paid for with the
+    # `:2.5` / `:1.0.1` prose misses it also caused. The genuine phishing form,
+    # `app.slack.com:443.evil.com@evil.com`, is rejected by the `[.:]...@`
+    # alternative above and needs nothing here. (Removing an alternative from a
+    # NEGATIVE lookahead flags MORE, never less -- the class note above states
+    # the same rule; an earlier revision of this comment had that direction
+    # backwards.) (BE-8729 review, rounds 2, 3, 4 and 5.)
+    re.compile(
+        _HOST_L
+        + r"app\.slack\.com"
+        + r"(?!\.?[A-Za-z0-9-]|@|[.:][A-Za-z0-9._~%:-]{0,64}@)",
+        _HOST_FLAGS,
+    ),
+    re.compile(_HOST_L + r"docs\.google\.com" + _PORT + "/", _HOST_FLAGS),
+    re.compile(_HOST_L + r"drive\.google\.com" + _PORT + "/", _HOST_FLAGS),
+    re.compile(_HOST_L + r"app\.datadoghq\.com" + _PORT + "/", _HOST_FLAGS),
+    re.compile(_HOST_L + r"posthog\.com" + _PORT + "/project/", _HOST_FLAGS),
+    re.compile(_HOST_L + r"linear\.app" + _PORT + "/", _HOST_FLAGS),
+    # Not a host, so it keeps default (Unicode) semantics and its own `\b`.
     re.compile(r"\bincident-\d+\b", re.IGNORECASE),
 )
 
@@ -634,7 +809,15 @@ def _read_text(path):
             # as truncated.
             data = fh.read(MAX_FILE_BYTES + 1)
     except OSError as exc:
-        return None, [unreadable.format(exc.strerror or exc)], "unreadable", False, False
+        # FOUR values, like every other route out of here and like the single
+        # caller's unpack. A stray fifth crashed this path with `ValueError:
+        # too many values to unpack` on any unreadable tracked file (EACCES on
+        # a mode-000 blob, EMFILE, an I/O error), so the intended "unreadable,
+        # so NOT scanned" warning became a traceback and exit 1 -- which the
+        # workflow renders as "internal-only references found" with no finding
+        # listed. Pinned by `test_an_unopenable_file_warns_instead_of_crashing`.
+        # (BE-8729 review, round 5.)
+        return None, [unreadable.format(exc.strerror or exc)], "unreadable", False
 
     truncated = len(data) > MAX_FILE_BYTES
     if truncated:

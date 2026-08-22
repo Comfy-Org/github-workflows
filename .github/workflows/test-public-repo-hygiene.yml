@@ -62,6 +62,27 @@ jobs:
           printf 'See Comfy-Org/ComfyUI and Comfy-Org/comfy-cli, encoded UTF-8\n' > "$root/README.md"
           printf 'Built on Comfy-Org/ComfyUI. Cloned comfy-org/comfyui.git.\n' > "$root/NOTES.md"
           printf 'Owned by @Comfy-Org/Comfy-Cloud-Team.\n' > "$root/OWNERS.md"
+          # BE-8729: lookalike third-party hosts. `\b` is not a host boundary,
+          # so `evil-posthog.com` and friends used to be category-2 findings;
+          # only a dot in front is a real subdomain edge. The three appended
+          # below are the review follow-ups: a homoglyph domain that Unicode
+          # case-folding read as the real one, and the two userinfo shapes
+          # whose real host is `evil.com` -- the only fixtures exercising the
+          # host-only pattern's `@` rejection end to end. The second of those
+          # replaced a bare `app.slack.com:443.evil.com/x` line, which round 5
+          # established is NOT a lookalike at all: `port = *DIGIT`, so that URL
+          # does not parse and the only host on it is the internal one, which
+          # the checker now correctly flags. Carrying it here as *clean* is
+          # what a stale round-3 explanation about "backtracking past the
+          # optional port" used to justify; there is no port group to backtrack
+          # through (round 3 shed it) and no `:\d+\.` alternative either
+          # (round 5 removed it). Do not restore either to make a suffix host
+          # go quiet -- with userinfo it is already quiet, and without userinfo
+          # it is a real reference.
+          printf 'Unrelated: https://fooslack.com/archives/x https://evil-posthog.com/project/1\n' > "$root/LOOKALIKES.md"
+          printf 'Also unrelated: https://lınear.app/x\n' >> "$root/LOOKALIKES.md"
+          printf 'Userinfo, so the real host is evil.com: https://app.slack.com@evil.com/\n' >> "$root/LOOKALIKES.md"
+          printf 'Userinfo again, non-numeric port and all: https://app.slack.com:443.evil.com@evil.com/\n' >> "$root/LOOKALIKES.md"
           printf '* @Comfy-Org/comfy-cloud-team\n' > "$root/CODEOWNERS"
           git -C "$root" add -A
           python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root"
@@ -113,6 +134,17 @@ jobs:
           check_one 'lowercased org segment, team handle' \
             'owner @comfy-org/not-a-public-team' \
             'a team not in the known-public allowlist'
+          # BE-8729: an explicit port sits between the host and the path, so
+          # every pattern requiring `/` straight after the host was one token
+          # away from silence.
+          check_one 'ported internal link' \
+            'dashboard https://app.datadoghq.com:8443/dash/1' \
+            'internal collaboration-tool marker'
+          # ...and `port = *DIGIT`, so the empty port is a valid URL for the
+          # same host and was the same one-token bypass.
+          check_one 'empty-port internal link' \
+            'notes https://notion.so:/team/page' \
+            'internal collaboration-tool marker'
 
       # ── The acceptance criterion this whole workflow exists for ────────────
       - name: Smoke test — a caller-side edit to the allowlist has NO effect
