@@ -1,0 +1,436 @@
+name: Test public-repo-hygiene script
+
+# Runs the unit tests for the public-repo hygiene checker plus CLI smoke tests
+# that exercise each detection category end-to-end and — the one this workflow
+# exists for — that a CALLER-SIDE edit to the allowlist has NO effect. The
+# checker gates every consumer repo's CI and is the org's only guard against
+# publishing an internal reference, so a regression here is silent in both
+# directions: a checker that stopped firing looks exactly like a clean repo.
+
+on:
+  pull_request:
+    paths:
+      - '.github/public-repo-hygiene/**'
+      - '.github/workflows/test-public-repo-hygiene.yml'
+      - '.github/workflows/public-repo-hygiene.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/public-repo-hygiene/**'
+      - '.github/workflows/test-public-repo-hygiene.yml'
+      - '.github/workflows/public-repo-hygiene.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: unittest + smoke
+    runs-on: ubuntu-latest
+    # The fixtures here deliberately create a FIFO and a symlink to /dev/zero,
+    # so a regression that reads one blocks forever — and without this the job
+    # would burn the 6-hour Actions default before the check ever reports. Only
+    # the symlink smoke step is individually bounded (`timeout 60`); this
+    # bounds the unittest step and the job as a whole. Matches the 15 minutes
+    # `public-repo-hygiene.yml` sets on its own scan job.
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Run public-repo-hygiene unit tests
+        run: python3 -m unittest discover -s .github/public-repo-hygiene/tests -p 'test_*.py' -v
+
+      # The smoke tests below build throwaway git work trees, because the
+      # checker scans TRACKED files — an exported directory is not the thing it
+      # runs against in CI.
+      - name: Smoke test — a clean repo passes
+        run: |
+          root="$(mktemp -d)"
+          git -C "$root" init -q
+          # Sentence-final periods and non-canonical org/name casing are all
+          # clean as of BE-8697: the period is stripped as punctuation (a
+          # GitHub slug can never end in one) and both the org segment and
+          # allowlist membership are matched case-insensitively.
+          printf 'See Comfy-Org/ComfyUI and Comfy-Org/comfy-cli, encoded UTF-8\n' > "$root/README.md"
+          printf 'Built on Comfy-Org/ComfyUI. Cloned comfy-org/comfyui.git.\n' > "$root/NOTES.md"
+          printf 'Owned by @Comfy-Org/Comfy-Cloud-Team.\n' > "$root/OWNERS.md"
+          printf '* @Comfy-Org/comfy-cloud-team\n' > "$root/CODEOWNERS"
+          git -C "$root" add -A
+          python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root"
+
+      - name: Smoke test — each category fails a dirty repo
+        run: |
+          # One category per fixture, asserting the SPECIFIC message rather
+          # than merely "non-zero": an exit-2 config error or a traceback is
+          # also non-zero and would mask a checker broken for every repo.
+          check_one() {
+            name="$1"; content="$2"; expect="$3"
+            root="$(mktemp -d)"
+            git -C "$root" init -q
+            printf '%s\n' "$content" > "$root/notes.md"
+            git -C "$root" add -A
+            set +e
+            out="$(python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root" 2>&1)"
+            code=$?
+            set -e
+            echo "$out"
+            if [ "$code" -ne 1 ]; then
+              echo "::error::$name: expected exit 1, got $code"
+              exit 1
+            fi
+            grep -qF "$expect" <<<"$out" || {
+              echo "::error::$name: expected a finding containing '$expect'"
+              exit 1
+            }
+            echo "OK: $name"
+          }
+          check_one 'ticket id' \
+            'tracked as ABCDEF-123456 upstream' \
+            'possible internal ticket ID'
+          check_one 'internal marker' \
+            'dashboard https://app.datadoghq.com/dash/1' \
+            'internal collaboration-tool marker'
+          check_one 'repo default-deny' \
+            'built from Comfy-Org/not-a-public-repo' \
+            'which is not in the known-public allowlist'
+          check_one 'codeowners team handle' \
+            'owner @Comfy-Org/not-a-public-team' \
+            'a team not in the known-public allowlist'
+          # BE-8697: GitHub resolves owner names case-insensitively, so a
+          # lowercased org segment reaches the same repo. It used to be a
+          # one-keystroke bypass of the whole default-deny category.
+          check_one 'lowercased org segment' \
+            'built from comfy-org/not-a-public-repo' \
+            'which is not in the known-public allowlist'
+          check_one 'lowercased org segment, team handle' \
+            'owner @comfy-org/not-a-public-team' \
+            'a team not in the known-public allowlist'
+
+      # ── The acceptance criterion this whole workflow exists for ────────────
+      - name: Smoke test — a caller-side edit to the allowlist has NO effect
+        run: |
+          # The scanned tree contains a wide-open copy of the checker at BOTH
+          # the historical per-repo path and the centralized one, plus a config
+          # file — every shape a PR author might reach for to widen the
+          # allowlist from inside the repo being checked. The checker we
+          # actually run is the pinned one from THIS repo, so the verdict must
+          # not move.
+          root="$(mktemp -d)"
+          git -C "$root" init -q
+          mkdir -p "$root/scripts" "$root/.github/public-repo-hygiene"
+          printf 'Tracking BE-1234 in Comfy-Org/super-secret-repo.\n' > "$root/LEAK.md"
+          cat > "$root/scripts/check_public_repo_hygiene.py" <<'PY'
+          PUBLIC_COMFY_ORG_REPOS = {"super-secret-repo"}
+          TICKET_ALLOWLIST = {"BE-1234"}
+          PY
+          cp "$root/scripts/check_public_repo_hygiene.py" \
+             "$root/.github/public-repo-hygiene/check_public_repo_hygiene.py"
+          printf '{"public_repos": ["super-secret-repo"]}\n' > "$root/.public-repo-hygiene.json"
+          git -C "$root" add -A
+
+          set +e
+          out="$(python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root" 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+          if [ "$code" -ne 1 ]; then
+            echo "::error::tamper fixture: expected exit 1, got $code — an in-tree allowlist edit changed the verdict"
+            exit 1
+          fi
+          grep -qF 'Comfy-Org/super-secret-repo' <<<"$out" || {
+            echo "::error::an in-tree checker copy suppressed the repo finding"
+            exit 1
+          }
+          grep -qF "'BE-1234'" <<<"$out" || {
+            echo "::error::an in-tree checker copy suppressed the ticket finding"
+            exit 1
+          }
+          echo "caller-side allowlist edits are correctly inert"
+
+      - name: Smoke test — the caller inputs are additive, never a loosening
+        run: |
+          # `ticket_allowlist` takes acronyms and `exclude_paths` drops files;
+          # neither can reach the known-public repo/team allowlist. Proven by
+          # passing the private repo name through BOTH knobs and watching the
+          # finding survive.
+          root="$(mktemp -d)"
+          git -C "$root" init -q
+          printf 'Comfy-Org/super-secret-repo tracked as BE-1234\n' > "$root/LEAK.md"
+          git -C "$root" add -A
+          set +e
+          out="$(python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root" \
+                   --ticket-allow 'super-secret-repo,BE-1234' --exclude 'nothing-here/' 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+          if [ "$code" -ne 1 ]; then
+            echo "::error::expected exit 1, got $code — a caller input suppressed a repo finding"
+            exit 1
+          fi
+          grep -qF 'Comfy-Org/super-secret-repo' <<<"$out" || {
+            echo "::error::ticket_allowlist reached the repo allowlist"
+            exit 1
+          }
+          # An exclusion that matched nothing must still be visible in the log.
+          grep -qF "EXCLUDED: 0 file(s) matched 'nothing-here/'" <<<"$out" || {
+            echo "::error::an exclusion that matched nothing left no trace in the log"
+            exit 1
+          }
+          echo "caller inputs are correctly additive"
+
+      - name: Smoke test — a root-wide exclusion is rejected
+        run: |
+          root="$(mktemp -d)"
+          git -C "$root" init -q
+          printf 'clean\n' > "$root/README.md"
+          git -C "$root" add -A
+          set +e
+          python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root" --exclude '.'
+          code=$?
+          set -e
+          if [ "$code" -ne 2 ]; then
+            echo "::error::expected exit 2 for a root-wide exclusion, got $code"
+            exit 1
+          fi
+          echo "checker correctly rejected a root-wide exclusion"
+
+      - name: Smoke test — a scan that read nothing is exit 2, not a pass
+        run: |
+          # Naming every top-level directory in exclude_paths disables the whole
+          # scan without ever naming the repo root, so rejecting a root-wide
+          # exclusion is only half the guard. Zero coverage is a failure.
+          root="$(mktemp -d)"
+          git -C "$root" init -q
+          mkdir -p "$root/docs"
+          printf 'clean\n' > "$root/docs/a.md"
+          git -C "$root" add -A
+          set +e
+          out="$(python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root" --exclude 'docs/' 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+          if [ "$code" -ne 2 ]; then
+            echo "::error::expected exit 2 for a scan that read zero files, got $code"
+            exit 1
+          fi
+          grep -qF 'SCANNED: 0 file(s) read as text' <<<"$out" || {
+            echo "::error::a zero-coverage run did not report its scanned count"
+            exit 1
+          }
+          echo "checker correctly refused to call zero coverage clean"
+
+      - name: Smoke test — the reserved checkout path cannot be a parking spot
+        run: |
+          # `_public_repo_hygiene/` is where this repo gets checked out inside
+          # the caller's workspace. Tracked content there is shadowed by that
+          # checkout, so skipping it quietly would leave a path any PR could
+          # park an internal reference in and still ship green.
+          root="$(mktemp -d)"
+          git -C "$root" init -q
+          mkdir -p "$root/_public_repo_hygiene"
+          printf 'Comfy-Org/super-secret-repo\n' > "$root/_public_repo_hygiene/parked.md"
+          printf 'clean\n' > "$root/README.md"
+          git -C "$root" add -A
+          set +e
+          out="$(python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root" 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+          if [ "$code" -ne 2 ]; then
+            echo "::error::expected exit 2 for tracked content at the reserved path, got $code"
+            exit 1
+          fi
+          grep -qF 'RESERVED' <<<"$out" || {
+            echo "::error::the reserved-path failure did not explain itself"
+            exit 1
+          }
+          echo "checker correctly refused a tracked reserved path"
+
+      - name: Smoke test — a symlink is read as its target string, never followed
+        run: |
+          # `open()` follows a symlink, so scanning one reads whatever it points
+          # AT rather than the link target git stores. A link out of the repo
+          # would pull arbitrary runner content into this PUBLIC run log; a link
+          # to /dev/zero would hang or OOM the job. The target STRING, though, is
+          # exactly what this repo publishes, so it is scanned in its place —
+          # `os.readlink` returns it without opening anything (BE-8654 review).
+          root="$(mktemp -d)"
+          outside="$(mktemp -d)"
+          printf 'Comfy-Org/super-secret-repo\n' > "$outside/outside.md"
+          git -C "$root" init -q
+          ln -s "$outside/outside.md" "$root/link.md"
+          ln -s /dev/zero "$root/zero.md"
+          # A link whose TARGET STRING is itself the leak — the case skipping
+          # the entry outright used to miss entirely.
+          ln -s '../Comfy-Org/private-thing/notes.md' "$root/leaky.md"
+          printf 'clean\n' > "$root/README.md"
+          git -C "$root" add -A
+          set +e
+          out="$(timeout 60 python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root" 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+          if [ "$code" -ne 1 ]; then
+            echo "::error::expected exit 1 (the leaky link target must be flagged), got $code"
+            exit 1
+          fi
+          grep -qF 'super-secret-repo' <<<"$out" && {
+            echo "::error::the checker followed a symlink out of the repo and echoed its content into a public log"
+            exit 1
+          }
+          grep -qF 'Comfy-Org/private-thing' <<<"$out" || {
+            echo "::error::a symlink whose target string names a non-public repo was not flagged"
+            exit 1
+          }
+          grep -qF 'TARGET STRING' <<<"$out" || {
+            echo "::error::a scanned symlink left no trace saying the body was not read"
+            exit 1
+          }
+          echo "checker read link targets without ever following one"
+
+      - name: Smoke test — a work-tree encoding conversion is refused
+        run: |
+          # `working-tree-encoding=UTF-16` keeps the committed blob UTF-8 —
+          # plainly readable on github.com, in the API and in the diff — while
+          # checkout writes NUL-laden UTF-16 to disk, which this scan reads and
+          # skips as binary. A green run over content the guard never looked at,
+          # from a two-line commit, so it is exit 2 (BE-8654 review).
+          root="$(mktemp -d)"
+          git -C "$root" init -q
+          printf '*.md working-tree-encoding=UTF-16\n' > "$root/.gitattributes"
+          # iconv emits the BOM git requires for a bare `UTF-16` declaration.
+          printf 'See Comfy-Org/super-secret-repo\n' \
+            | iconv -f UTF-8 -t UTF-16 > "$root/leak.md"
+          git -C "$root" add -A
+          set +e
+          out="$(python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root" 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+          if [ "$code" -ne 2 ]; then
+            echo "::error::expected exit 2 for a work-tree encoding conversion, got $code"
+            exit 1
+          fi
+          grep -qF 'working-tree-encoding' <<<"$out" || {
+            echo "::error::the conversion failure did not explain itself"
+            exit 1
+          }
+          grep -qF 'leak.md' <<<"$out" || {
+            echo "::error::the conversion failure did not name the file"
+            exit 1
+          }
+          echo "checker correctly refused a converted work tree"
+
+      - name: Smoke test — an all-LFS repo cannot report coverage it never had
+        run: |
+          # `actions/checkout` leaves LFS off, so an LFS-tracked file is present
+          # only as its ~130-byte pointer stub. Counting the stub as scanned let
+          # `git lfs track '*.md'` plus a leaking commit exit 0 on a required
+          # check; the stub is a SKIP with a named kind instead (BE-8654 review).
+          root="$(mktemp -d)"
+          git -C "$root" init -q
+          printf 'version https://git-lfs.github.com/spec/v1\noid sha256:%064d\nsize 42\n' 0 \
+            > "$root/doc.md"
+          git -C "$root" add -A
+          set +e
+          out="$(python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root" 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+          if [ "$code" -ne 2 ]; then
+            echo "::error::expected exit 2 for a repo whose only file is an LFS stub, got $code"
+            exit 1
+          fi
+          grep -qF 'SCANNED: 0 file(s)' <<<"$out" || {
+            echo "::error::an LFS pointer stub was still counted as scanned"
+            exit 1
+          }
+          grep -qF 'git-LFS pointer' <<<"$out" || {
+            echo "::error::the LFS skip was not named in the NOT SCANNED totals"
+            exit 1
+          }
+          echo "checker correctly refused to count LFS stubs as coverage"
+
+      - name: Smoke test — the LFS skip is a classification, not an opt-out
+        run: |
+          # Classifying on the pointer's FIRST LINE alone turned the skip into
+          # an opt-out any tracked file could take: type the magic line, and
+          # everything below it went unread while the file still rendered as
+          # plain text on github.com — and with one other clean file present the
+          # zero-scan net above never fired either. A stub has to satisfy the
+          # whole grammar (a sha256 oid, a byte size, stub-sized) (BE-8654
+          # review).
+          root="$(mktemp -d)"
+          git -C "$root" init -q
+          printf 'version https://git-lfs.github.com/spec/v1\nComfy-Org/super-secret-repo tracked as BE-1234\n' \
+            > "$root/notes.md"
+          printf 'clean\n' > "$root/README.md"
+          git -C "$root" add -A
+          set +e
+          out="$(python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root" 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+          if [ "$code" -ne 1 ]; then
+            echo "::error::expected exit 1 — a file merely starting with the pointer line was skipped whole, got $code"
+            exit 1
+          fi
+          grep -qF 'Comfy-Org/super-secret-repo' <<<"$out" || {
+            echo "::error::a pointer-lookalike file suppressed a repo finding"
+            exit 1
+          }
+          grep -qF 'NOT SCANNED' <<<"$out" && {
+            echo "::error::a pointer-lookalike file was classified as an LFS stub"
+            exit 1
+          }
+          echo "checker correctly scanned a file only pretending to be a stub"
+
+      - name: Smoke test — a homoglyph cannot borrow a public repo's name
+        run: |
+          # The capture class is ASCII, so the match stops at the first
+          # character outside it — and the allowlist was then tested against a
+          # PREFIX of what the file says. U+2010 HYPHEN renders identically to
+          # `-` on github.com, so this cleared as `comfyui` while the full
+          # private name sat in the tree (BE-8654 review).
+          root="$(mktemp -d)"
+          git -C "$root" init -q
+          printf 'See Comfy-Org/comfyui\xe2\x80\x90internal for the rollout.\n' > "$root/notes.md"
+          git -C "$root" add -A
+          set +e
+          out="$(python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root" 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+          if [ "$code" -ne 1 ]; then
+            echo "::error::expected exit 1 for a homoglyph repo name, got $code"
+            exit 1
+          fi
+          grep -qF 'homoglyph' <<<"$out" || {
+            echo "::error::a partly-read repo name was cleared against the allowlist"
+            exit 1
+          }
+          echo "checker correctly refused to clear a partly-read name"
+
+      - name: Smoke test — a non-git tree is a loud config error, not a pass
+        run: |
+          # The scan is over TRACKED files. If the checkout is missing or the
+          # tree was exported, "nothing to scan" must never read as "clean".
+          root="$(mktemp -d)"
+          printf 'Comfy-Org/super-secret-repo\n' > "$root/LEAK.md"
+          set +e
+          python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root"
+          code=$?
+          set -e
+          if [ "$code" -ne 2 ]; then
+            echo "::error::expected exit 2 for a non-git tree, got $code"
+            exit 1
+          fi
+          echo "checker correctly refused a non-git tree"

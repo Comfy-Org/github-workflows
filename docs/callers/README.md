@@ -14,6 +14,7 @@ per-workflow pages give you a complete, copy-pasteable caller:
 | `pr-derisk.yml` | [pr-derisk.md](pr-derisk.md) | `ANTHROPIC_API_KEY` |
 | `pr-area-label.yml` | [pr-area-label.md](pr-area-label.md) | `.github/area-labels.yml` (+ `ANTHROPIC_API_KEY`, org-wide) |
 | `agents-md-integrity.yml` | [agents-md-integrity.md](agents-md-integrity.md) | nothing |
+| `public-repo-hygiene.yml` | [public-repo-hygiene.md](public-repo-hygiene.md) | nothing |
 | `coderabbit-config-validate.yml` | [coderabbit-config-validate.md](coderabbit-config-validate.md) | nothing |
 | `assign-reviewers.yml` | [assign-reviewers.md](assign-reviewers.md) | `vars.APP_ID` + App key + `.github/reviewers.yml` |
 | `assign-prs-to-author.yml` | [assign-prs-to-author.md](assign-prs-to-author.md) | nothing |
@@ -119,24 +120,36 @@ assets come from must be the **same commit** as your `uses:` pin — otherwise t
 workflow is pinned and the code it runs is not.
 
 **Only some workflows take the input at all.** `cursor-review`, `pr-size`,
-`agents-md-integrity`, `coderabbit-config-validate`, `refresh-reviewers`,
-`pr-risk`, `pr-derisk`, `pr-area-label`, `linear-ticket` and `groom` declare it;
+`agents-md-integrity`, `public-repo-hygiene`, `coderabbit-config-validate`,
+`refresh-reviewers`, `pr-risk`, `pr-derisk`, `pr-area-label`, `linear-ticket`
+and `groom` declare it;
 `assign-reviewers`, `cursor-review-auto-label`, `detect-unreviewed-merge`,
 `assign-prs-to-author` and `stale` do **not**. GitHub rejects an undeclared
 `with:` key at startup, so copying the line into one of those callers fails the
 run before any job starts.
 
-Of the ten that do declare it, all but `groom` make it **required with no
+Of the eleven that do declare it, all but `groom` make it **required with no
 default**. There is no `main` to "leave" it at: GitHub does not enforce
 `required:` for `workflow_call` inputs, so each of them re-checks the value at
 run time, in the checkout's own job, rather than letting `actions/checkout`
-silently fall back to this repo's default branch. Two tiers of checking:
+silently fall back to this repo's default branch. Three tiers of checking:
 
-- `cursor-review`, `pr-size`, `agents-md-integrity`, `coderabbit-config-validate`
-  and `refresh-reviewers` accept any non-empty ref, and `::warning::` a value
+- `cursor-review`, `pr-size`, `agents-md-integrity`,
+  `coderabbit-config-validate` and `refresh-reviewers` accept any non-empty ref, and `::warning::` a value
   that is not a full 40-hex commit SHA (branches and tags are mutable and can
   skew between jobs mid-run). An empty or omitted value fails with
   `::error::workflows_ref is required…`.
+- `public-repo-hygiene` **rejects** anything but a full 40-hex commit SHA that
+  is also **equal to `job.workflow_sha`** — the commit your `uses:` line
+  resolved to. A branch, a tag, `main` and the `v1` tag all fail, and so does a
+  valid SHA that simply is not the one you pinned. It is stricter than the tier
+  above because it is the only workflow whose entire purpose is that a PR
+  cannot pick the checker judging it: a 40-hex ref alone is satisfied by any
+  immutable commit, including the head of a PR opened against this public repo.
+  For the same reason it fails, rather than warns, when `job.workflow_sha` is
+  empty — so it needs an Actions runner **≥ v2.334.0** (GitHub-hosted runners
+  are well past it; older self-hosted runners are unsupported). Set `uses:` and
+  `workflows_ref:` to the same SHA and the bumper keeps both in step.
 - `pr-risk`, `pr-derisk`, `pr-area-label` and `linear-ticket` **reject** it
   before checkout unless it is a full 40-hex lowercase SHA *and* an ancestor of
   this repo's `main` — so a branch, a tag, a `refs/pull/N/head` and any
@@ -216,6 +229,7 @@ Enrolling a repo is **two steps**, and the second is the one people miss.
    | `pr-area-label.yml` | `AREA_LABEL_CALLERS` |
    | `linear-ticket.yml` | `LINEAR_TICKET_CALLERS` |
    | `agents-md-integrity.yml` | `AGENTS_MD_CALLERS` |
+   | `public-repo-hygiene.yml` | `PUBLIC_REPO_HYGIENE_CALLERS` |
    | `coderabbit-config-validate.yml` | `CODERABBIT_CONFIG_CALLERS` |
    | `assign-reviewers.yml` | `ASSIGN_REVIEWERS_CALLERS` |
    | `detect-unreviewed-merge.yml` | `DETECT_UNREVIEWED_MERGE_CALLERS` |
@@ -269,14 +283,15 @@ gh workflow run groom.yml --repo <your-org>/<your-repo> -f dry_run=true
 ```
 
 **PR-triggered callers** — `cursor-review`, `cursor-review-auto-label`, `pr-size`,
-`agents-md-integrity`, `assign-reviewers`. As shown in their setup guides these
+`agents-md-integrity`, `public-repo-hygiene`, `assign-reviewers`. As shown in their setup guides these
 declare **no `workflow_dispatch` and no `dry_run`**, so `gh workflow run` errors out
 instead of starting a run. Verify by opening a throwaway PR — and for
 `cursor-review`, applying the review label.
 
 Adding `workflow_dispatch` to the caller is only worth it for
-`agents-md-integrity`, which has no event dependency at all: it checks out the repo
-and validates the files, so a manual dispatch is a genuine smoke test. For the
+`agents-md-integrity` and `public-repo-hygiene`, which have no event dependency at
+all: they check out the repo and validate its files, so a manual dispatch is a
+genuine smoke test. For the
 others it buys nothing — `cursor-review`, `cursor-review-auto-label` and `pr-size`
 read `github.event.pull_request`, which a dispatch does not populate, and
 `assign-reviewers` logs `Not a pull_request event — nothing to do` and exits.

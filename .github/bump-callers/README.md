@@ -39,6 +39,7 @@ forward automatically instead of silently drifting commits behind.
 | [`bump-detect-unreviewed-merge-callers.yml`](../workflows/bump-detect-unreviewed-merge-callers.yml) | `detect-unreviewed-merge.yml` | `DETECT_UNREVIEWED_MERGE_CALLERS` | non-empty (hard-fails if empty) |
 | [`bump-area-label-callers.yml`](../workflows/bump-area-label-callers.yml) | `pr-area-label.yml` or `scripts/area-label/**` (minus its `tests/` and `README.md`, which no caller executes) | `AREA_LABEL_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-linear-ticket-callers.yml`](../workflows/bump-linear-ticket-callers.yml) | `linear-ticket.yml` or `scripts/linear-ticket/**` (minus its `tests/` and `README.md`, which no caller executes) | `LINEAR_TICKET_CALLERS` | non-empty (hard-fails if empty) |
+| [`bump-public-repo-hygiene-callers.yml`](../workflows/bump-public-repo-hygiene-callers.yml) | `public-repo-hygiene.yml` or `public-repo-hygiene/**` (minus its `tests/` and `README.md`, which no caller executes) | `PUBLIC_REPO_HYGIENE_CALLERS` | **not seeded yet** — the reusable landed before its first caller, so `ALLOW_EMPTY` is `true`; flip it to `false` with the first enrolment. The pinned SHA decides which known-public **allowlist** a caller scans against, so an un-bumped caller here is a caller failing on a repo the org has since made public |
 
 ### One roster, two fleets (`FILE_FILTER`)
 

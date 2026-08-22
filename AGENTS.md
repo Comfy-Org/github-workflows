@@ -22,6 +22,9 @@ python3 -m unittest discover -s .github/cursor-review/tests -p 'test_*.py' -v
 # agents-md-integrity checker tests
 python3 -m unittest discover -s .github/agents-md-integrity/tests -p 'test_*.py' -v
 
+# public-repo-hygiene checker tests (incl. the caller-can't-edit-the-allowlist assertions)
+python3 -m unittest discover -s .github/public-repo-hygiene/tests -p 'test_*.py' -v
+
 # groom dedup/rejection ledger tests
 python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
 
@@ -67,6 +70,13 @@ tests — run the matching command above for whatever you touched.
   duplicate the model list. Tests in `tests/`.
 - `.github/agents-md-integrity/` — `check_agents_md.py`, the checker behind
   `agents-md-integrity.yml` (enforces this AGENTS.md standard). Tests in `tests/`.
+- `.github/public-repo-hygiene/` — `check_public_repo_hygiene.py`, the checker
+  behind `public-repo-hygiene.yml` (BE-8654), and the ORG-WIDE known-public repo
+  allowlist it default-denies against. The allowlist is deliberately NOT a
+  workflow input: one a caller can pass is one a PR in the caller repo can widen,
+  which is the hole this replaced (two per-repo copies, each run from the PR's own
+  checkout). Safe in a public repo because it lists PUBLIC names only — that is
+  what default-deny buys. Tests in `tests/`.
 - `.github/groom/` — briefs + building blocks behind the reusable **groom**
   code-cleanup workflow (`groom.yml`, epic BE-3870): `finder.md` / `verifier.md`
   / `builder.md` (the phase-1/2/3 prompts, single source of truth, loaded at run
@@ -105,8 +115,10 @@ tests — run the matching command above for whatever you touched.
   plus `preflight.sh` (BE-6475), the ONE staleness/decommission guard that runs
   ahead of it — `proceed` / `new_sha` step outputs, `WATCHED` +
   `WATCHED_ASSETS` inputs, plus `WATCHED_PATHSPECS` (BE-6676; the excluding
-  fleets: pr-risk, and pr-size/cursor-review since BE-7084) + `WATCHED_EXEC`
-  (the per-executed-file fleets: pr-risk, pr-derisk). Watched inputs MUST
+  fleets: pr-risk, pr-size/cursor-review since BE-7084, linear-ticket and
+  public-repo-hygiene) + `WATCHED_EXEC`
+  (the per-executed-file fleets: pr-risk, pr-derisk, public-repo-hygiene).
+  Watched inputs MUST
   mirror that fleet's `paths:` filter, exclusions included. Tests in `tests/`.
 - `scripts/pr-risk/` + `scripts/pr-derisk/` — the two rungs of the PR risk ladder.
   v0 grades (`grade-pr-risk.sh`, deterministic — **no LLM in the grading path; keep it
@@ -141,6 +153,15 @@ tests — run the matching command above for whatever you touched.
   command because `issue_comment` runs from the default branch, the commenter is
   association-gated, and no PR code is checked out.
 - `agents-md-integrity.yml` — enforces the AGENTS.md standard on the caller repo.
+- `public-repo-hygiene.yml` — fails a PUBLIC caller's CI on internal-only
+  references in its tracked files: ticket-shaped ids, internal collaboration-tool
+  links, and `Comfy-Org/<repo>` outside a default-deny allowlist (plus the
+  `@Comfy-Org/<team>` CODEOWNERS case). Same shape as agents-md-integrity, for the
+  same reason: checker + allowlist load from `workflows_ref`, never the caller's
+  checkout. `ticket_allowlist:`/`exclude_paths:` are the per-repo knobs and are
+  ADDITIVE — neither reaches the repo allowlist. NOT self-enrolled here: this repo's
+  own fixtures and `(BE-####)` commit convention are internal-reference-shaped by
+  design.
 - `coderabbit-config-validate.yml` — validates the caller's `.coderabbit.yaml`
   against the vendored CodeRabbit schema, on the PR that breaks it. CodeRabbit
   rejects an invalid config WHOLE (everything in it goes inert) and validates the
@@ -169,7 +190,8 @@ tests — run the matching command above for whatever you touched.
   `bump-pr-risk-callers.yml` / `bump-pr-derisk-callers.yml` /
   `bump-assign-reviewers-callers.yml` /
   `bump-groom-callers.yml` / `bump-detect-unreviewed-merge-callers.yml` /
-  `bump-coderabbit-config-callers.yml` — thin
+  `bump-coderabbit-config-callers.yml` /
+  `bump-public-repo-hygiene-callers.yml` — thin
   entrypoints over `bump-callers.sh` that fan SHA bumps out to consumers. A
   groom, pr-risk or pr-derisk caller pins TWICE (`uses:` + `workflows_ref:`); the shared rewrite
   moves both, so never hand-bump one alone. `stale.yml` and
@@ -191,7 +213,8 @@ tests — run the matching command above for whatever you touched.
   repo **secrets** — one per fleet (`CURSOR_REVIEW_CALLERS`,
   `AUTO_LABEL_CALLERS`, `AGENTS_MD_CALLERS`, `PR_SIZE_CALLERS`,
   `PR_RISK_CALLERS` (SHARED by the pr-risk + pr-derisk fleets via `FILE_FILTER` — one entry per caller file, never a second roster), `ASSIGN_REVIEWERS_CALLERS`, `GROOM_CALLERS`,
-  `DETECT_UNREVIEWED_MERGE_CALLERS`, `CODERABBIT_CONFIG_CALLERS`; the bump-callers README table is canonical)
+  `DETECT_UNREVIEWED_MERGE_CALLERS`, `CODERABBIT_CONFIG_CALLERS`,
+  `PUBLIC_REPO_HYGIENE_CALLERS`; the bump-callers README table is canonical)
   — never hardcoded in a workflow file or printed to run logs (logs are public).
   Secrets, not variables (BE-6472): a variable passed via a step's `env:` prints
   unmasked in the env dump Actions emits *before* the step, so the bumper's own
@@ -278,4 +301,5 @@ tests — run the matching command above for whatever you touched.
 - [`SECURITY.md`](SECURITY.md) — disclosure process + the agent credential boundary.
 - [`.github/cursor-review/README.md`](.github/cursor-review/README.md) — review panel internals + adoption.
 - [`.github/agents-md-integrity/README.md`](.github/agents-md-integrity/README.md) — the checker + its knobs.
+- [`.github/public-repo-hygiene/README.md`](.github/public-repo-hygiene/README.md) — the leak guard, its tamper boundary + known limitations.
 - [`.github/bump-callers/README.md`](.github/bump-callers/README.md) — the shared bumper + its fleets.
