@@ -284,6 +284,71 @@ class RepoReferenceCategoryTest(CheckerTestCase):
         self.assertIn("@Comfy-Org/secret-squad", findings[0])
         self.assertIn("a team not in the known-public allowlist", findings[0])
 
+    def test_npm_scope_of_a_public_repo_is_not_a_team_finding(self):
+        # `@comfy-org/<pkg>` is an npm / GitHub Packages scope, not a CODEOWNERS
+        # handle, and those coordinates are REQUIRED to be lowercase. Before the
+        # org segment matched case-insensitively this spelling did not match at
+        # all; once it did, it landed in the `@` branch and a dependency on a
+        # known-PUBLIC repo was reported as "a team not in the known-public
+        # allowlist" -- with no caller-side escape short of `exclude_paths:`,
+        # since neither allowlist is a workflow input. The `@` branch therefore
+        # admits the repo allowlist too.
+        self.repo.write(
+            "package.json",
+            '{"dependencies": {"@comfy-org/comfy-typescript-sdk": "^1.0.0",\n'
+            '  "@Comfy-Org/ComfyUI_frontend": "^2.0.0"}}\n',
+        )
+        self.assertEqual(self.findings(), [])
+
+    def test_at_prefixed_name_on_neither_allowlist_is_still_flagged(self):
+        # Admitting the repo allowlist widens the `@` branch by exactly the
+        # public repo names and nothing else -- default-deny still holds.
+        self.repo.write("package.json", '{"x": "@comfy-org/secret-pkg"}\n')
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("@Comfy-Org/secret-pkg", findings[0])
+
+    def test_trailing_git_suffix_is_stripped_case_insensitively(self):
+        # The `.git` strip has to be as case-insensitive as the match above it
+        # and the membership test below it, or `ComfyUI.GIT` keeps its suffix,
+        # casefolds to `comfyui.git` and is reported as a leak for a repo the
+        # allowlist already covers.
+        self.repo.write(
+            "docs/install.md",
+            "Clone Comfy-Org/ComfyUI.GIT or Comfy-Org/comfy-cli.Git\n",
+        )
+        self.assertEqual(self.findings(), [])
+
+    def test_case_insensitive_git_strip_does_not_admit_a_private_name(self):
+        self.repo.write("README.md", "Comfy-Org/some-internal-thing.GIT\n")
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("Comfy-Org/some-internal-thing", findings[0])
+
+    def test_org_slash_dotgit_names_no_repo(self):
+        # `Comfy-Org/.git` clears the period strip untouched (it has no TRAILING
+        # dot) and is then consumed WHOLE by the `.git` strip, so the empty
+        # check has to run after that strip too -- otherwise this yields the
+        # repo-less "reference to Comfy-Org/" that names nothing actionable.
+        self.repo.write("README.md", "The bare remote is Comfy-Org/.git\n")
+        self.assertEqual(self.findings(), [])
+
+    def test_name_class_stays_ascii_under_the_scoped_ignorecase(self):
+        # `re.IGNORECASE` applied to the WHOLE pattern also widens `[A-Za-z]`:
+        # under Unicode case-folding it matches U+017F and U+212A, so `.casefold()`
+        # at the membership test would fold `comfy-typeſcript-sdk` back onto an
+        # allowlisted name (a default-deny bypass), and `comfyui` followed by a
+        # Kelvin sign would be absorbed into the name and flagged. Scoping the
+        # flag to the org segment keeps the capture ASCII, so the first is still
+        # a finding and the second is still clean.
+        self.repo.write("README.md", "Comfy-Org/comfy-typeſcript-sdk\n")
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertNotIn("ſ", findings[0])
+
+        self.repo.write("other.md", "Built on Comfy-Org/comfyuiK\n")
+        self.assertEqual(self.findings(), findings)
+
     def test_team_allowlist_does_not_leak_into_repo_allowlist(self):
         # A team handle and a repo reference share a namespace in the source
         # text but not in the allowlists; crossing them would let a public team

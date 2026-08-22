@@ -95,8 +95,12 @@ GitHub resolves owner names case-insensitively, so `comfy-org/<repo>` is checked
 `Comfy-Org/<repo>` — a lowercased reference to a non-public repo is a finding, and a
 differently-cased reference to a public one is not. A trailing `.` is treated as sentence
 punctuation and stripped before the allowlist lookup (`…built on Comfy-Org/ComfyUI.` is clean), on
-both the repo and the `@Comfy-Org/<team>` path, because a GitHub slug can never end in a dot. What
-is still not matched is a reference split across two lines — the scan is line-oriented. See
+both the repo and the `@Comfy-Org/<team>` path, because a GitHub slug can never end in a dot. A
+`.git` suffix is stripped whatever its casing, and because npm / GitHub Packages spell a **scope**
+the same way a CODEOWNERS handle is spelled, an `@comfy-org/<name>` dependency clears if the name
+is on either the team or the repo allowlist — so a lockfile entry for a public Comfy-Org package is
+not a finding. What is still not matched is a reference split across two lines — the scan is
+line-oriented. See
 [the checker README](../../.github/public-repo-hygiene/README.md#known-limitations).
 
 **A skip is always visible.** An exclusion is logged with its file count even when it matched

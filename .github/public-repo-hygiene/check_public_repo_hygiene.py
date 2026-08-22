@@ -142,12 +142,20 @@ _PUBLIC_TEAMS_CF = frozenset(name.casefold() for name in PUBLIC_COMFY_ORG_TEAMS)
 # Case-INSENSITIVE, because GitHub resolves owner names case-insensitively:
 # `comfy-org/<private-repo>` reaches exactly the same repository as
 # `Comfy-Org/<private-repo>`, so matching only the canonical spelling left a
-# one-keystroke bypass of a default-deny control (BE-8697). Whole-pattern
-# `re.IGNORECASE` is equivalent to org-segment-only here: the capture class is
-# already case-complete, so group(1) is returned exactly as written either way,
-# and the allowlist tests below casefold rather than lowercase so a
-# differently-cased spelling of a PUBLIC name is not reported as a leak.
-REPO_REF_RE = re.compile(r"Comfy-Org/([A-Za-z0-9_.-]+)", re.IGNORECASE)
+# one-keystroke bypass of a default-deny control (BE-8697). The allowlist tests
+# below casefold rather than lowercase, so a differently-cased spelling of a
+# PUBLIC name is not reported as a leak either.
+#
+# The `(?i:...)` scope is load-bearing, not style. Whole-pattern `re.IGNORECASE`
+# on a `str` pattern ALSO widens the name class: under Unicode case-folding
+# `[A-Za-z]` then matches U+017F `ſ`, U+212A `K`, U+0130 `İ` and U+0131 `ı`, so
+# the class stops being ASCII and `.casefold()` folds `ſ`/`K` back to `s`/`k`
+# at the membership test -- `Comfy-Org/comfy-typeſcript-sdk` would clear a
+# default-deny allowlist, and a public reference followed immediately by one of
+# those characters would be absorbed into the name and flagged. Scoping the flag
+# to the org segment (which contains no `s`, `k` or `i` to widen) keeps the
+# capture class ASCII, which is what the allowlists are written in.
+REPO_REF_RE = re.compile(r"(?i:Comfy-Org)/([A-Za-z0-9_.-]+)")
 
 # Where the reusable workflow checks THIS repo out inside the caller's
 # workspace (`path:` in public-repo-hygiene.yml — keep the two spellings in
@@ -491,9 +499,27 @@ def _file_findings(rel, text, ticket_allowlist):
             name = name.rstrip(".")
             if not name:
                 continue
-            # A leading `@` makes this a CODEOWNERS team handle, not a repo ref.
+            # A leading `@` makes this a CODEOWNERS team handle, not a repo ref
+            # -- OR an npm / GitHub Packages scope, which is spelled exactly the
+            # same way and is required to be lowercase. Before BE-8697 made the
+            # org segment case-insensitive, the canonical `@comfy-org/<pkg>`
+            # spelling in a `package.json` or lockfile did not match at all;
+            # now it does, so this branch has to admit BOTH readings or a
+            # dependency on a known-PUBLIC repo becomes "a team not in the
+            # known-public allowlist" with no caller-side escape (the repo
+            # allowlist is deliberately not a workflow input).
+            #
+            # The reverse crossing stays forbidden on purpose -- a bare
+            # `Comfy-Org/<name>` is unambiguously a repo path, since there is no
+            # syntax that writes a team without the `@`, so admitting team names
+            # there would weaken default-deny with no false positive to justify
+            # it. See test_team_allowlist_does_not_leak_into_repo_allowlist.
             if match.start() > 0 and line[match.start() - 1] == "@":
-                if name.casefold() not in _PUBLIC_TEAMS_CF:
+                folded = name.casefold()
+                if (
+                    folded not in _PUBLIC_TEAMS_CF
+                    and folded not in _PUBLIC_REPOS_CF
+                ):
                     yield (
                         f"{rel}:{lineno}: reference to "
                         f"@Comfy-Org/{_bounded(name)}, a "
@@ -506,8 +532,19 @@ def _file_findings(rel, text, ticket_allowlist):
                 continue
             # Strip a trailing `.git`: repository URLs (package.json
             # `repository.url`, git remotes) conventionally end in `.git`, and
-            # `Foo.git` is still a reference to the public repo `Foo`.
-            repo = re.sub(r"\.git$", "", name)
+            # `Foo.git` is still a reference to the public repo `Foo`. Matched
+            # case-insensitively like everything else on this path (BE-8697) --
+            # a case-SENSITIVE strip here would leave `ComfyUI.GIT` carrying its
+            # suffix into a membership test that then misses `comfyui`.
+            repo = re.sub(r"\.git$", "", name, flags=re.IGNORECASE)
+            # `Comfy-Org/.git` reaches here with the whole name consumed: the
+            # period strip above left `.git` alone (no TRAILING dot) and the
+            # suffix strip took the rest. Like `Comfy-Org/.`, it names no repo,
+            # so there is nothing to report -- and reporting it would print the
+            # repo-less "reference to Comfy-Org/" the guard above exists to
+            # prevent.
+            if not repo:
+                continue
             if repo.casefold() not in _PUBLIC_REPOS_CF:
                 yield (
                     f"{rel}:{lineno}: reference to "
