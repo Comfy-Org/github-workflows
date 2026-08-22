@@ -189,14 +189,19 @@ class InternalMarkerCategoryTest(CheckerTestCase):
         "https://foonotion.so/page",
         "https://app.slack.com.evil.com/",
     )
-    # Same-namespace neighbours of the four subdomain-led patterns. Only Google
-    # can create `*.google.com`, so these are not third-party lookalikes and
-    # pin something narrower: the left anchor drops a host inside the SAME
-    # registrable domain, not just a neighbouring one. (BE-8729 review.)
+    # Same-namespace neighbours of the google-led patterns. Only Google can
+    # create `*.google.com`, so these are not third-party lookalikes and pin
+    # something narrower: the left anchor drops a host inside the SAME
+    # registrable domain, not just a neighbouring one.
+    #
+    # `myapp.datadoghq.com` is deliberately NOT here. Datadog hands customers
+    # their own `<name>.datadoghq.com` sub-domain, so that namespace is not
+    # vendor-only and a custom-sub-domain org really would be missed -- a
+    # genuine gap, recorded under README "Known limitations" rather than
+    # pinned here as if it were correct. (BE-8729 review.)
     SAME_NAMESPACE_HOSTS = (
         "https://mydocs.google.com/doc/1",
         "https://xdrive.google.com/file/d/abc",
-        "https://myapp.datadoghq.com/dash",
     )
 
     def test_lookalike_hosts_are_not_flagged(self):
@@ -279,15 +284,38 @@ class InternalMarkerCategoryTest(CheckerTestCase):
                 repo.write("notes.md", marker + "\n")
                 self.assertEqual(checker.run_checks(repo.root).findings, [])
 
-    def test_unicode_case_folding_does_not_read_a_homoglyph_as_the_real_host(self):
-        # `re.IGNORECASE` on its own folds Unicode: Python matches U+0131 and
-        # U+0130 against `i`, U+017F against `s` and U+212A against `k`, so
-        # these different registrable domains read as the real hosts and were
-        # flagged. `re.ASCII` on the category-2 patterns closes it, the same
-        # way `REPO_REF_RE` scopes its ignore-case flag. (BE-8729 review.)
+    def test_the_userinfo_delimiter_is_not_read_as_a_host_boundary(self):
+        # `https://app.slack.com@evil.com/` has host `evil.com` -- the `@`
+        # makes everything before it userinfo. That is the same lookalike-host
+        # false positive as `app.slack.com.evil.com`, in the canonical phishing
+        # shape, so the right anchor rejects `@` too. A leading `admin@` is the
+        # other direction and still matches, since `_HOST_L` only bars a label
+        # character. (BE-8729 review.)
+        for marker, want in (
+            ("https://app.slack.com@evil.com/", 0),
+            ("https://app.slack.com:443@evil.com/", 0),
+            ("mail admin@app.slack.com about it", 1),
+        ):
+            with self.subTest(marker=marker):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write("notes.md", marker + "\n")
+                findings = [
+                    f
+                    for f in checker.run_checks(repo.root).findings
+                    if "collaboration-tool marker" in f
+                ]
+                self.assertEqual(len(findings), want, f"{marker}: {findings}")
+
+    def test_unicode_case_folding_does_not_read_another_domain_as_the_real_host(self):
+        # `re.IGNORECASE` on its own folds Unicode, so Python matched U+0131
+        # and U+0130 against `i` and these read as the real hosts. UTS-46 does
+        # NOT: it leaves U+0131 alone and maps U+0130 to `i` + a combining dot,
+        # so neither host resolves anywhere near the real one. Flagging them
+        # was a false positive and `re.ASCII` removes it, the same way
+        # `REPO_REF_RE` scopes its ignore-case flag. (BE-8729 review.)
         for marker in (
             "https://l\u0131near.app/x",
-            "https://\u017flack.com/archives/C123",
             "https://not\u0130on.so/page",
         ):
             with self.subTest(marker=marker):
@@ -295,6 +323,31 @@ class InternalMarkerCategoryTest(CheckerTestCase):
                 self.addCleanup(repo.cleanup)
                 repo.write("notes.md", marker + "\n")
                 self.assertEqual(checker.run_checks(repo.root).findings, [])
+
+    def test_a_uts46_mapped_spelling_of_a_covered_host_is_out_of_scope(self):
+        # The OTHER half of the `re.ASCII` trade, pinned separately because it
+        # is a miss rather than a fix and the distinction is easy to lose.
+        # UTS-46 *maps* U+017F to `s` and U+212A to `k`, so unlike the two
+        # above these really do resolve to the covered host in any client, and
+        # narrowing the ignore-case flag makes them silent. That is the same
+        # scope line the README already draws for punycode, percent-encoded and
+        # defanged spellings: this is a guard against an accidental paste, not
+        # against someone spelling a link so it does not look like one.
+        # (BE-8729 review.)
+        for marker in (
+            "https://\u017flack.com/archives/C123",
+            "https://slac\u212a.com/archives/C123",
+        ):
+            with self.subTest(marker=marker):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write("notes.md", marker + "\n")
+                findings = [
+                    f
+                    for f in checker.run_checks(repo.root).findings
+                    if "collaboration-tool marker" in f
+                ]
+                self.assertEqual(findings, [], f"{marker}: {findings}")
 
     def test_an_idn_neighbour_still_reports_as_the_real_host(self):
         # A KNOWN LIMITATION, pinned so changing it is deliberate. The left
@@ -330,15 +383,21 @@ class InternalMarkerCategoryTest(CheckerTestCase):
 
     def test_the_host_only_pattern_still_ends_on_punctuation_or_a_port(self):
         # The right anchor replacing `\b` on `app.slack.com` is
-        # `(?!\.?[A-Za-z0-9-])`, which has to reject a following LABEL without
-        # also rejecting ordinary punctuation, a port, or end of line.
+        # `(?!\.?[A-Za-z0-9-]|:\d|@)`, which has to reject a following LABEL,
+        # a port that turns out to be a suffix host, and the userinfo
+        # delimiter -- without rejecting ordinary punctuation, a real port, or
+        # end of line.
         for marker in (
             "Ask in app.slack.com.",
             "Ask in app.slack.com:443 if you self-host.",
             "https://app.slack.com",
-            # The `|:` added for the backtracking case must not cost this one:
-            # `\d*` lets `_PORT` swallow the prose colon itself.
+            # A colon in PROSE, not a port. The first cut of the backtracking
+            # fix rejected a bare `:` and silently lost all three of these,
+            # which `\b` had matched; `:\d` closes the backtrack instead.
+            # (BE-8729 review.)
             "Ask in app.slack.com: the #general channel.",
+            "Ask in app.slack.com:general, not here.",
+            "Ask in app.slack.com:443: our workspace.",
         ):
             with self.subTest(marker=marker):
                 repo = RepoFixture()

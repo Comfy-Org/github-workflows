@@ -124,28 +124,54 @@ _HOST_L = r"(?<![A-Za-z0-9-])"
 # is a valid URL whose host is still `notion.so` (an empty port means the
 # default) -- and it was the same one-token bypass `:443` was. (BE-8729 review.)
 _PORT = r"(?::\d*)?"
-# ASCII on both counts. `re.IGNORECASE` alone folds Unicode: Python matches
-# U+0131/U+0130 against `i` and U+017F/U+212A against `s`/`k`, so `lınear.app/x`
-# and `ſlack.com/archives/x` -- different registrable domains, reachable by
-# anyone -- read as the real hosts and were flagged. That is the same widening
-# `REPO_REF_RE` below scopes its flag to avoid. `re.ASCII` also pins `_PORT`'s
-# `\d` to `[0-9]`, which is all a real port can be -- the price is that a
-# port typed in another script's digits no longer clears the pattern, which
-# is not a URL any client resolves. (BE-8729 review.)
+# ASCII on both counts. `re.IGNORECASE` alone folds Unicode, and the fold is
+# not one boundary but two, so be precise about which one this buys:
+#
+#   * U+0131 / U+0130 are DIFFERENT hosts. Python matches both against `i`, so
+#     `lınear.app/x` and `notİon.so/page` read as the real hosts -- but UTS-46
+#     leaves U+0131 alone and maps U+0130 to `i` + a combining dot, so neither
+#     resolves anywhere near `linear.app` or `notion.so`. Flagging them was a
+#     false positive, and `re.ASCII` removes it. This is the same widening
+#     `REPO_REF_RE` below scopes its flag to avoid.
+#   * U+017F / U+212A are the SAME host. UTS-46 *maps* them to `s` and `k`, so
+#     `ſlack.com/archives/C123` really does resolve to `slack.com` in any
+#     client. `re.ASCII` therefore turns those two into misses. That is a
+#     deliberate scope call, not an oversight: they are obfuscated spellings of
+#     a covered host, exactly like the punycode (`xn--`), percent-encoded and
+#     defanged spellings the README already lists as out of scope for a guard
+#     against an accidental paste. Do not read the tests below as claiming
+#     `ſlack.com` is somebody else's domain -- it is not.
+#
+# `re.ASCII` also pins `_PORT`'s `\d` to `[0-9]`, which is all a real port can
+# be; a port typed in another script's digits is likewise a spelling no client
+# resolves. (BE-8729 review.)
 _HOST_FLAGS = re.IGNORECASE | re.ASCII
 INTERNAL_MARKER_RES = (
     re.compile(_HOST_L + r"notion\.(so|site)" + _PORT + "/", _HOST_FLAGS),
     re.compile(_HOST_L + r"slack\.com" + _PORT + "/(archives|client)/", _HOST_FLAGS),
     # The one host-only pattern, so it needs a right anchor of its own. `\b`
     # accepted `app.slack.com.evil.com`; this rejects a following label while
-    # still allowing a sentence-final period, a port and end of line. The `|:`
-    # is load-bearing: `_PORT` is optional, so without it the engine backtracks
-    # -- on `app.slack.com:443.evil.com` the greedy `:443` makes the lookahead
-    # fail on `.evil`, the port retries empty, and the lookahead then passes on
-    # `:`, flagging the lookalike after all. Rejecting a bare `:` kills that
-    # path without costing the real one, because `\d*` lets `_PORT` swallow a
-    # prose colon (`app.slack.com: our workspace`) itself. (BE-8729 review.)
-    re.compile(_HOST_L + r"app\.slack\.com" + _PORT + r"(?!\.?[A-Za-z0-9-]|:)", _HOST_FLAGS),
+    # still allowing a sentence-final period, a port and end of line.
+    #
+    # `|:\d` is load-bearing. `_PORT` is optional AND `\d*` is greedy, so the
+    # engine backtracks through it: on `app.slack.com:443.evil.com` the greedy
+    # `:443` fails the lookahead on `.evil`, the port gives digits back one at
+    # a time and finally retries empty, and a lookahead that stopped at
+    # `\.?[A-Za-z0-9-]` then passed on `:` -- flagging the lookalike after all.
+    # It must be `:\d`, not a bare `:`: a bare `:` also killed
+    # `app.slack.com:general` and `app.slack.com:443: our workspace`, where the
+    # colon is prose rather than a port and the pre-`\b` pattern matched.
+    # `:\d` still blocks every backtrack above, because the empty-port retry
+    # always faces `:4`. `|@` is the userinfo delimiter: in
+    # `https://app.slack.com@evil.com/` the real host is `evil.com`, which is
+    # the same lookalike false positive this pattern set exists to drop, in the
+    # canonical phishing shape. `app.slack.com@` never begins a genuine
+    # reference to that host, and the `/`-requiring patterns cannot hit the gap
+    # because a `/` can never follow `@`. (BE-8729 review.)
+    re.compile(
+        _HOST_L + r"app\.slack\.com" + _PORT + r"(?!\.?[A-Za-z0-9-]|:\d|@)",
+        _HOST_FLAGS,
+    ),
     re.compile(_HOST_L + r"docs\.google\.com" + _PORT + "/", _HOST_FLAGS),
     re.compile(_HOST_L + r"drive\.google\.com" + _PORT + "/", _HOST_FLAGS),
     re.compile(_HOST_L + r"app\.datadoghq\.com" + _PORT + "/", _HOST_FLAGS),

@@ -70,6 +70,7 @@ jobs:
           # Unicode case-folding read as the real one.
           printf 'Unrelated: https://fooslack.com/archives/x https://evil-posthog.com/project/1\n' > "$root/LOOKALIKES.md"
           printf 'Also unrelated: https://app.slack.com:443.evil.com/x https://lınear.app/x\n' >> "$root/LOOKALIKES.md"
+          printf 'Userinfo, so the real host is evil.com: https://app.slack.com@evil.com/\n' >> "$root/LOOKALIKES.md"
           printf '* @Comfy-Org/comfy-cloud-team\n' > "$root/CODEOWNERS"
           git -C "$root" add -A
           python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root"
