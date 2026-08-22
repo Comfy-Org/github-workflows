@@ -45,6 +45,7 @@ Run locally:
 
 import argparse
 import collections
+import itertools
 import os
 import re
 import stat
@@ -156,6 +157,26 @@ SCRIPT_CHECKOUT_DIR = "_public_repo_hygiene/"
 # the unread tail is a visible hole rather than a silent one.
 MAX_FILE_BYTES = 5 * 1024 * 1024
 
+# The read cap above bounds the bytes read PER FILE; these bound what is DERIVED
+# from them, which is where the memory and the log volume actually go. A
+# category-2 finding copies the matched LINE, so one 5 MiB single-line file
+# matching all nine markers would retain ~45 MiB of strings, and 5 MiB of
+# repeated `AA-12` yields ~800k findings -- each materialised twice more in
+# `_emit` (plain line plus `::error::`) and flooding a PUBLIC run log. Hitting
+# either cap never softens the verdict: the run still exits 1, it just stops
+# enumerating. (BE-8654 review.)
+MAX_EXCERPT_CHARS = 200
+MAX_FINDINGS_PER_FILE = 200
+MAX_FINDINGS_TOTAL = 2000
+
+# git-lfs writes a ~130-byte pointer stub in place of the real content, and
+# `actions/checkout` leaves `lfs: false` by default. The stub is what is in the
+# work tree, so the scan reads IT and would otherwise count the file as covered
+# while the real content -- publicly downloadable from the same repo -- was
+# never examined. Detected and named, per "everything the scan declines to look
+# at leaves a trace". (BE-8654 review.)
+LFS_POINTER_PREFIX = "version https://git-lfs.github.com/spec/v1"
+
 # What `run_checks` reports. Named rather than a bare tuple because the two
 # coverage fields (`skipped`, `scanned`) are what the exit code turns on, and a
 # positional 5-tuple is how a caller ends up reading "scanned" as "findings".
@@ -249,8 +270,26 @@ def tracked_files(root):
             check=True,
             capture_output=True,
         ).stdout
-    except FileNotFoundError as exc:  # pragma: no cover - git absent
+    except FileNotFoundError as exc:
+        # `cwd=root` makes this ambiguous: FileNotFoundError is raised both when
+        # `git` is missing from PATH and when `root` does not exist, and a
+        # typo'd --root / HYGIENE_CHECK_ROOT reported as "git is not available"
+        # sends the operator after the wrong cause entirely (BE-8654 review).
+        if not os.path.isdir(root):
+            raise ConfigError(
+                f"'{root}' is not an existing directory, so there was nothing "
+                f"to scan. Check the --root argument / HYGIENE_CHECK_ROOT."
+            ) from exc
         raise ConfigError(f"git is not available: {exc}") from exc
+    except OSError as exc:
+        # The other ways applying `cwd` fails: NotADirectoryError when the root
+        # names a FILE, PermissionError when it is unreadable. Uncaught these
+        # escape as a traceback, which exits 1 -- the code the workflow reads as
+        # "internal-only references found" rather than the exit 2 every other
+        # unusable-configuration path returns.
+        raise ConfigError(
+            f"cannot run git in '{root}': {exc.strerror or exc}"
+        ) from exc
     except subprocess.CalledProcessError as exc:
         stderr = (exc.stderr or b"").decode("utf-8", "replace").strip()
         raise ConfigError(
@@ -262,7 +301,7 @@ def tracked_files(root):
 
 
 def _read_text(path):
-    """Return (text, warning, skip_kind). `skip_kind` is None iff text is not.
+    """Return (text, warnings, skip_kind). `skip_kind` is None iff text is not.
 
     Binary files are out of scope. A NUL byte is the crude-but-reliable marker
     (what the JavaScript copy used); an undecodable byte is the other (what the
@@ -272,92 +311,157 @@ def _read_text(path):
     Every route out of here is COUNTED by `run_checks` and reported, because a
     file the scan declined to read is a hole in coverage whichever route it took
     (see README "Everything the scan declines to look at leaves a trace"). The
-    two ordinary ones — binary and non-UTF-8 — are a per-run count only, so they
-    do not bury the two that name a specific file with a `::warning::`:
+    two ordinary ones -- binary and non-UTF-8 -- are a per-run count only, so
+    they do not bury the ones that name a specific file with a `::warning::`:
 
-    * UNREADABLE — a permission problem, a vanished path. A tracked path the
+    * UNREADABLE -- a permission problem, a vanished path. A tracked path the
       checker cannot open at all is worth naming.
-    * NOT A REGULAR FILE — a symlink, FIFO, socket or device node. `open()`
-      FOLLOWS a symlink, so scanning one reads whatever it points at rather
-      than the link target string git actually stores in the blob: a link out
-      of the repo would pull arbitrary runner content into a public run log
-      (category-2 findings echo the whole matched line), and a link to
-      `/dev/zero` or a FIFO would turn the read below into an OOM or a hang.
-      `os.lstat` answers this WITHOUT following, so the decision is made on
-      the entry git actually tracks rather than on whatever it points at.
+    * NOT A REGULAR FILE -- a FIFO, socket or device node. Reading one would
+      block on the device or turn the read below into an OOM, and none of it is
+      content this repo stores. `os.lstat` answers this WITHOUT following a
+      link, so the decision is made on the entry git actually tracks.
+
+    A SYMLINK is neither read nor skipped outright. `open()` FOLLOWS it, so
+    scanning it would read whatever it points at -- a link out of the repo would
+    pull arbitrary runner content into a public run log, since category-2
+    findings echo the matched line. But the link TARGET STRING is the entry git
+    stores in the blob and publishes in the tree, so a tracked link naming a
+    private `Comfy-Org/<repo>` or carrying a ticket id is exactly the leak this
+    checker exists to catch. `os.readlink` returns that string without opening
+    anything, so the target string is scanned IN PLACE OF the file body.
 
     A regular file larger than `MAX_FILE_BYTES` is scanned up to the cap and the
-    truncation is warned about, rather than skipped outright — most of a large
+    truncation is warned about, rather than skipped outright -- most of a large
     file is still worth checking, and the unread tail is named.
     """
     unreadable = "unreadable, so it was NOT scanned: {}"
     try:
         st = os.lstat(path)
     except OSError as exc:
-        return None, unreadable.format(exc.strerror or exc), "unreadable"
+        return None, [unreadable.format(exc.strerror or exc)], "unreadable"
+
+    if stat.S_ISLNK(st.st_mode):
+        try:
+            target = os.readlink(path)
+        except OSError as exc:
+            return None, [unreadable.format(exc.strerror or exc)], "unreadable"
+        return (
+            target,
+            [
+                "is a symlink: only the link TARGET STRING git tracks was "
+                "scanned, never the file it points at -- that content is not "
+                "this repo's, and echoing it would be the leak, not the guard"
+            ],
+            None,
+        )
+
     if not stat.S_ISREG(st.st_mode):
         return (
             None,
-            "is not a regular file (symlink, FIFO, socket or device node), so "
-            "it was NOT scanned: reading it would follow the link or block on "
-            "the device rather than read anything this repo stores",
+            [
+                "is not a regular file (FIFO, socket or device node), so it "
+                "was NOT scanned: reading it would block on the device rather "
+                "than read anything this repo stores"
+            ],
             "not a regular file",
         )
+
     try:
         with open(path, "rb") as fh:
             # One byte past the cap, so "exactly at the cap" is not misreported
             # as truncated.
             data = fh.read(MAX_FILE_BYTES + 1)
     except OSError as exc:
-        return None, unreadable.format(exc.strerror or exc), "unreadable"
+        return None, [unreadable.format(exc.strerror or exc)], "unreadable"
 
     truncated = len(data) > MAX_FILE_BYTES
     if truncated:
         data = data[:MAX_FILE_BYTES]
     if b"\x00" in data:
-        return None, None, "binary"
+        return None, [], "binary"
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError as exc:
-        if not truncated:
-            return None, None, "non-UTF-8"
-        # The cap can land mid-codepoint. Dropping the partial tail beats
-        # reporting a perfectly ordinary large text file as non-UTF-8 and
-        # scanning none of it.
-        try:
-            text = data[: exc.start].decode("utf-8")
-        except UnicodeDecodeError:
-            return None, None, "non-UTF-8"
+        # ONLY the cap landing mid-codepoint is recoverable here, and the test
+        # has to be that narrow. `data[:exc.start]` is valid UTF-8 BY
+        # CONSTRUCTION -- everything before the first bad byte decoded fine --
+        # so an unqualified fallback "succeeds" for a genuinely non-UTF-8 file
+        # too: a >5 MiB file whose first invalid byte sits near the TOP would be
+        # scanned only that far, still counted in `scanned`, and reported under
+        # a warning stating the opposite ("only the first N were scanned").
+        # Commit 5 MiB of filler, one `\xff`, then the internal references and
+        # that passes clean with a coverage claim that overstates what was read.
+        # A UTF-8 sequence is at most 4 bytes, so an error starting further than
+        # that from the end of the truncated buffer cannot be the cut. (BE-8654
+        # review.)
+        if not truncated or len(data) - exc.start >= 4:
+            return None, [], "non-UTF-8"
+        text = data[: exc.start].decode("utf-8")
 
-    warning = None
+    warnings = []
     if truncated:
-        warning = (
+        warnings.append(
             f"is larger than {MAX_FILE_BYTES} bytes; only the first "
             f"{MAX_FILE_BYTES} were scanned"
         )
-    return text, warning, None
+    if text.startswith(LFS_POINTER_PREFIX):
+        warnings.append(
+            "is a git-LFS pointer stub, so only the ~130-byte stub was "
+            "scanned, NOT the real content it stands for. The content is "
+            "publicly downloadable from this repo but is not in the work tree "
+            "(`actions/checkout` does not fetch LFS objects by default), so "
+            "this file is a hole in the scan's coverage"
+        )
+    return text, warnings, None
 
 
-def check_file(root, rel, ticket_allowlist):
-    """Return (findings, warning, skip_kind) for one file, in report order."""
-    findings = []
-    text, warning, skip_kind = _read_text(os.path.join(root, rel))
-    if text is None:
-        return findings, warning, skip_kind
+def _excerpt(line):
+    """A bounded, stripped excerpt of a matched line, for the report.
 
+    Category-2 findings echo the matched line rather than just the match, which
+    is what makes them actionable -- but the line is attacker-controlled and can
+    be the whole file. Bound it (see MAX_EXCERPT_CHARS).
+    """
+    stripped = line.strip()
+    if len(stripped) <= MAX_EXCERPT_CHARS:
+        return stripped
+    return stripped[:MAX_EXCERPT_CHARS] + "... (line truncated)"
+
+
+def _bounded(token):
+    """Bound a matched TOKEN before interpolating it into a finding.
+
+    `REPO_REF_RE`'s name class is unbounded, so `Comfy-Org/` followed by 5 MiB
+    of word characters is ONE match whose text is the whole file: the same
+    unbounded-derived-output problem `_excerpt` solves for whole lines, reached
+    through a different door. `TICKET_RE` needs no equivalent -- it is bounded
+    to 13 characters by its own quantifiers.
+    """
+    if len(token) <= MAX_EXCERPT_CHARS:
+        return token
+    return token[:MAX_EXCERPT_CHARS] + "... (truncated)"
+
+
+def _file_findings(rel, text, ticket_allowlist):
+    """Yield one file's findings lazily, in report order.
+
+    A generator rather than a list so `check_file` can stop it at the per-file
+    cap: a 5 MiB line of repeated `AA-12` must not be fully enumerated just to
+    throw the tail away.
+    """
     for lineno, line in enumerate(text.splitlines(), start=1):
         for match in TICKET_RE.finditer(line):
             if match.group(0).upper() not in ticket_allowlist:
-                findings.append(
+                yield (
                     f"{rel}:{lineno}: possible internal ticket ID: "
                     f"{match.group(0)!r}"
                 )
 
         for pattern in INTERNAL_MARKER_RES:
             if pattern.search(line):
-                findings.append(
+                yield (
                     f"{rel}:{lineno}: internal collaboration-tool marker: "
-                    f"{line.strip()!r}"
+                    f"{_excerpt(line)!r}"
                 )
 
         for match in REPO_REF_RE.finditer(line):
@@ -365,8 +469,9 @@ def check_file(root, rel, ticket_allowlist):
             # A leading `@` makes this a CODEOWNERS team handle, not a repo ref.
             if match.start() > 0 and line[match.start() - 1] == "@":
                 if name not in PUBLIC_COMFY_ORG_TEAMS:
-                    findings.append(
-                        f"{rel}:{lineno}: reference to @Comfy-Org/{name}, a "
+                    yield (
+                        f"{rel}:{lineno}: reference to "
+                        f"@Comfy-Org/{_bounded(name)}, a "
                         "team not in the known-public allowlist "
                         "(Comfy-Org/github-workflows "
                         ".github/public-repo-hygiene/"
@@ -379,8 +484,9 @@ def check_file(root, rel, ticket_allowlist):
             # `Foo.git` is still a reference to the public repo `Foo`.
             repo = re.sub(r"\.git$", "", name)
             if repo not in PUBLIC_COMFY_ORG_REPOS:
-                findings.append(
-                    f"{rel}:{lineno}: reference to Comfy-Org/{repo}, which is "
+                yield (
+                    f"{rel}:{lineno}: reference to "
+                    f"Comfy-Org/{_bounded(repo)}, which is "
                     "not in the known-public allowlist "
                     "(Comfy-Org/github-workflows "
                     ".github/public-repo-hygiene/check_public_repo_hygiene.py)"
@@ -388,7 +494,28 @@ def check_file(root, rel, ticket_allowlist):
                     "reference"
                 )
 
-    return findings, warning, None
+
+def check_file(root, rel, ticket_allowlist):
+    """Return (findings, warnings, skip_kind) for one file, in report order."""
+    text, warnings, skip_kind = _read_text(os.path.join(root, rel))
+    if text is None:
+        return [], warnings, skip_kind
+
+    # One past the cap, so "capped" is distinguishable from "exactly at it".
+    findings = list(
+        itertools.islice(
+            _file_findings(rel, text, ticket_allowlist),
+            MAX_FINDINGS_PER_FILE + 1,
+        )
+    )
+    if len(findings) > MAX_FINDINGS_PER_FILE:
+        del findings[MAX_FINDINGS_PER_FILE:]
+        warnings.append(
+            f"produced more than {MAX_FINDINGS_PER_FILE} findings; only the "
+            f"first {MAX_FINDINGS_PER_FILE} are listed. This file needs fixing "
+            f"wholesale rather than finding-by-finding -- the run still FAILS"
+        )
+    return findings, warnings, None
 
 
 def run_checks(root, excludes=(), extra_ticket_allow=()):
@@ -426,19 +553,35 @@ def run_checks(root, excludes=(), extra_ticket_allow=()):
     skipped = collections.Counter()
     findings, warnings = [], []
     scanned = 0
+    truncated_report = False
     for rel in tracked:
         hit = _is_excluded(rel, excludes)
         if hit is not None:
             counts[hit] += 1
             continue
-        found, warning, skip_kind = check_file(root, rel, ticket_allowlist)
+        found, file_warnings, skip_kind = check_file(root, rel, ticket_allowlist)
+        # Per-RUN cap on top of the per-file one, so a tree of many mid-sized
+        # offenders cannot flood the log either. Scanning CONTINUES past it --
+        # only the enumeration stops -- because `scanned`/`skipped` are the
+        # coverage claim and must stay complete.
+        room = MAX_FINDINGS_TOTAL - len(findings)
+        if len(found) > room:
+            truncated_report = True
+            found = found[:room]
         findings.extend(found)
-        if warning:
+        for warning in file_warnings:
             warnings.append(f"{rel}: {warning}")
         if skip_kind is None:
             scanned += 1
         else:
             skipped[skip_kind] += 1
+
+    if truncated_report:
+        warnings.append(
+            f"more than {MAX_FINDINGS_TOTAL} findings were produced across the "
+            f"repo; only the first {MAX_FINDINGS_TOTAL} are listed. The exit "
+            f"code is unaffected -- this run still FAILS"
+        )
 
     exclusions = [(p, counts[p]) for p in excludes]
     if scanned == 0:

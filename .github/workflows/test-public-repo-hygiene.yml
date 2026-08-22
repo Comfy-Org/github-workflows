@@ -235,18 +235,23 @@ jobs:
           }
           echo "checker correctly refused a tracked reserved path"
 
-      - name: Smoke test — a symlink is named, never followed
+      - name: Smoke test — a symlink is read as its target string, never followed
         run: |
           # `open()` follows a symlink, so scanning one reads whatever it points
           # AT rather than the link target git stores. A link out of the repo
           # would pull arbitrary runner content into this PUBLIC run log; a link
-          # to /dev/zero would hang or OOM the job.
+          # to /dev/zero would hang or OOM the job. The target STRING, though, is
+          # exactly what this repo publishes, so it is scanned in its place —
+          # `os.readlink` returns it without opening anything (BE-8654 review).
           root="$(mktemp -d)"
           outside="$(mktemp -d)"
           printf 'Comfy-Org/super-secret-repo\n' > "$outside/outside.md"
           git -C "$root" init -q
           ln -s "$outside/outside.md" "$root/link.md"
           ln -s /dev/zero "$root/zero.md"
+          # A link whose TARGET STRING is itself the leak — the case skipping
+          # the entry outright used to miss entirely.
+          ln -s '../Comfy-Org/private-thing/notes.md' "$root/leaky.md"
           printf 'clean\n' > "$root/README.md"
           git -C "$root" add -A
           set +e
@@ -254,19 +259,23 @@ jobs:
           code=$?
           set -e
           echo "$out"
-          if [ "$code" -ne 0 ]; then
-            echo "::error::expected exit 0 (symlinks skipped, nothing of the repo's own to flag), got $code"
+          if [ "$code" -ne 1 ]; then
+            echo "::error::expected exit 1 (the leaky link target must be flagged), got $code"
             exit 1
           fi
           grep -qF 'super-secret-repo' <<<"$out" && {
             echo "::error::the checker followed a symlink out of the repo and echoed its content into a public log"
             exit 1
           }
-          grep -qF 'not a regular file' <<<"$out" || {
-            echo "::error::a skipped symlink left no trace in the log"
+          grep -qF 'Comfy-Org/private-thing' <<<"$out" || {
+            echo "::error::a symlink whose target string names a non-public repo was not flagged"
             exit 1
           }
-          echo "checker correctly refused to follow symlinks"
+          grep -qF 'TARGET STRING' <<<"$out" || {
+            echo "::error::a scanned symlink left no trace saying the body was not read"
+            exit 1
+          }
+          echo "checker read link targets without ever following one"
 
       - name: Smoke test — a non-git tree is a loud config error, not a pass
         run: |

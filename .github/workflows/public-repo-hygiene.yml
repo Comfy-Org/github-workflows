@@ -167,12 +167,22 @@ jobs:
           # against a runner that ever changes that.
           SHA="$(printf '%s' "$WORKFLOW_SHA" | tr -d '[:space:]' | tr 'A-Z' 'a-z')"
           if [ -z "$SHA" ]; then
-            # WARN, not fail: job.workflow_sha needs an Actions runner >= 2.334.0,
-            # so an older runner is the only way this is empty. The 40-hex test
-            # above has already run, so the ref is still immutable — only the
-            # "same commit as uses:" half is unverifiable here.
-            echo "::warning::job.workflow_sha is empty (Actions runner older than v2.334.0), so workflows_ref could not be cross-checked against the commit this workflow was called at. The ref is still required to be a full commit SHA."
-          elif [ "$REF" != "$SHA" ]; then
+            # FAIL, not warn. job.workflow_sha needs an Actions runner >=
+            # 2.334.0, so an older runner is the only way this is empty — but
+            # degrading to a warning leaves the 40-hex shape test as the ONLY
+            # surviving check, and shape is not the property that matters here.
+            # Immutability is not the attack; picking a DIFFERENT immutable
+            # commit is. Any commit reachable in this public repo is 40-hex and
+            # immutable, including the head of a PR anyone can open against it,
+            # which actions/checkout will happily fetch by raw SHA. Equality
+            # with the commit the caller's `uses:` line resolved to is the only
+            # thing binding the loaded checker to the reviewed one, so a runner
+            # that cannot supply it cannot run this workflow. Runners older than
+            # v2.334.0 are unsupported here, deliberately. (BE-8654 review.)
+            echo "::error::job.workflow_sha is empty, so workflows_ref cannot be cross-checked against the commit this workflow was called at. That equality is the ONLY check binding the hygiene checker to your uses: pin — a 40-hex ref alone is satisfied by any immutable commit, including one an attacker chose. This needs an Actions runner >= v2.334.0; runners older than that are not supported by this workflow. Upgrade the runner (GitHub-hosted runners are already past it)."
+            exit 1
+          fi
+          if [ "$REF" != "$SHA" ]; then
             echo "::error::workflows_ref ($REF) is not the commit this workflow was called at ($SHA). The uses: pin and workflows_ref MUST name the same commit — otherwise the workflow is pinned but the checker and its allowlist are loaded from somewhere else, which is the exact hole this workflow exists to close. Set both to $SHA."
             exit 1
           fi

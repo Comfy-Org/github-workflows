@@ -97,11 +97,25 @@ scripts this replaces and documented in
 it by rephrasing, or by excluding the file, until it is fixed.
 
 **A skip is always visible.** An exclusion is logged with its file count even when it matched
-nothing; an unreadable file or a symlink becomes a `::warning::` naming it; binary and non-UTF-8
-files get a per-run `NOT SCANNED:` count; and every run prints `SCANNED: <n> file(s) read as
-text`. A run that read **zero** files exits **2**, not 0 — enumerating every top-level directory
+nothing; an unreadable file, a device node, a git-LFS pointer stub or a symlink becomes a
+`::warning::` naming it; binary and non-UTF-8 files get a per-run `NOT SCANNED:` count; and every
+run prints `SCANNED: <n> file(s) read as text`. A run that read **zero** files exits **2**, not 0 — enumerating every top-level directory
 in `exclude_paths` disables the whole scan, and a green "clean" there would prove nothing. If you
 see one of those lines, the run did less than it looks like.
+
+**A symlink is scanned as its target *string*, never followed.** `open()` would read whatever the
+link points at — content that is not your repo's, and that would land in a public run log. The
+target string git actually tracks *is* yours and is published in the tree, so that string is what
+gets scanned. A `::warning::` names each one.
+
+**Git LFS content is not scanned.** The workflow checks you out without LFS, so an LFS-tracked file
+is present only as its ~130-byte pointer stub. The stub is scanned and the file is named in a
+`::warning::` — the real content, though publicly downloadable, is never examined.
+
+**Findings are capped, the verdict is not.** At most 200 findings per file and 2000 per run are
+listed, and a matched line is echoed as a 200-character excerpt. Hitting a cap adds a `::warning::`
+saying so; the run still **fails**. The caps bound run-log volume and runner memory, which the
+scanned repo's own content would otherwise control.
 
 **`_public_repo_hygiene/` is a reserved path.** That is where the workflow checks the checker out
 inside your workspace. It normally lands untracked, so you will never meet this — but if your repo

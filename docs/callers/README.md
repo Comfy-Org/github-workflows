@@ -132,13 +132,24 @@ Of the eleven that do declare it, all but `groom` make it **required with no
 default**. There is no `main` to "leave" it at: GitHub does not enforce
 `required:` for `workflow_call` inputs, so each of them re-checks the value at
 run time, in the checkout's own job, rather than letting `actions/checkout`
-silently fall back to this repo's default branch. Two tiers of checking:
+silently fall back to this repo's default branch. Three tiers of checking:
 
-- `cursor-review`, `pr-size`, `agents-md-integrity`, `public-repo-hygiene`,
+- `cursor-review`, `pr-size`, `agents-md-integrity`,
   `coderabbit-config-validate` and `refresh-reviewers` accept any non-empty ref, and `::warning::` a value
   that is not a full 40-hex commit SHA (branches and tags are mutable and can
   skew between jobs mid-run). An empty or omitted value fails with
   `::error::workflows_ref is required…`.
+- `public-repo-hygiene` **rejects** anything but a full 40-hex commit SHA that
+  is also **equal to `job.workflow_sha`** — the commit your `uses:` line
+  resolved to. A branch, a tag, `main` and the `v1` tag all fail, and so does a
+  valid SHA that simply is not the one you pinned. It is stricter than the tier
+  above because it is the only workflow whose entire purpose is that a PR
+  cannot pick the checker judging it: a 40-hex ref alone is satisfied by any
+  immutable commit, including the head of a PR opened against this public repo.
+  For the same reason it fails, rather than warns, when `job.workflow_sha` is
+  empty — so it needs an Actions runner **≥ v2.334.0** (GitHub-hosted runners
+  are well past it; older self-hosted runners are unsupported). Set `uses:` and
+  `workflows_ref:` to the same SHA and the bumper keeps both in step.
 - `pr-risk`, `pr-derisk`, `pr-area-label` and `linear-ticket` **reject** it
   before checkout unless it is a full 40-hex lowercase SHA *and* an ancestor of
   this repo's `main` — so a branch, a tag, a `refs/pull/N/head` and any

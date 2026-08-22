@@ -285,6 +285,26 @@ class ScanScopeTest(CheckerTestCase):
             with self.assertRaises(checker.ConfigError):
                 checker.run_checks(plain)
 
+    def test_a_root_that_does_not_exist_says_so_rather_than_blaming_git(self):
+        # subprocess.run(cwd=...) raises FileNotFoundError both when `git` is
+        # missing and when the cwd does not exist, so an unqualified handler
+        # sends the operator hunting for a git that is right there (BE-8654
+        # review).
+        missing = os.path.join(self.repo.root, "no-such-dir")
+        with self.assertRaises(checker.ConfigError) as caught:
+            checker.run_checks(missing)
+        self.assertIn("not an existing directory", str(caught.exception))
+        self.assertNotIn("git is not available", str(caught.exception))
+
+    def test_a_root_naming_a_file_is_a_config_error_not_a_traceback(self):
+        # NotADirectoryError escaping uncaught exits 1 -- the code the workflow
+        # reads as "internal-only references found" rather than the exit 2 every
+        # other unusable-configuration path returns.
+        not_a_dir = self.repo.write("plain.md", "clean\n")
+        with self.assertRaises(checker.ConfigError) as caught:
+            checker.run_checks(not_a_dir)
+        self.assertIn("cannot run git in", str(caught.exception))
+
 
 class CoverageReportingTest(CheckerTestCase):
     """Nothing the checker skips may be invisible in the log (BE-8654).
@@ -314,30 +334,69 @@ class CoverageReportingTest(CheckerTestCase):
         self.assertIn("NOT scanned", result.warnings[0])
         self.assertEqual(result.skipped, [("unreadable", 1)])
 
-    def test_symlinks_are_named_and_never_followed(self):
-        # `open()` follows a symlink, so scanning one reads whatever it points
-        # AT rather than the link target string git stores in the blob: a link
-        # out of the repo would pull arbitrary runner content into a PUBLIC run
-        # log, and one to /dev/zero or a FIFO would hang or OOM the job.
+    def test_symlink_target_string_is_scanned_but_never_followed(self):
+        # `open()` follows a symlink, so scanning one would read whatever it
+        # points AT rather than the target string git stores in the blob: a
+        # link out of the repo would pull arbitrary runner content into a
+        # PUBLIC run log, and one to /dev/zero or a FIFO would hang or OOM the
+        # job. But the TARGET STRING is what this repo publishes, so skipping
+        # the entry outright discarded the one thing worth checking (BE-8654
+        # review): `os.readlink` reads it without opening anything.
         outside = os.path.join(tempfile.mkdtemp(), "outside.md")
         self.addCleanup(os.remove, outside)
         with open(outside, "w") as fh:
             fh.write("Comfy-Org/super-secret-repo\n")
         os.symlink(outside, os.path.join(self.repo.root, "link.md"))
-        # ...and the dangling case, which cannot be opened at all.
-        os.symlink("nowhere-at-all", os.path.join(self.repo.root, "dangling"))
+        # ...and the dangling case, which cannot be opened at all -- yet its
+        # target string is still tracked, still published, and here it leaks.
+        os.symlink(
+            "../Comfy-Org/private-thing/BE-4242.md",
+            os.path.join(self.repo.root, "dangling"),
+        )
         self.repo._git("add", "--", "link.md", "dangling")
         self.repo.write("ok.md", "clean\n")
 
         result = self.run_checks()
         # The content on the far side of the link is NOT reported -- it is not
         # this repo's, and echoing it would be the leak, not the guard.
+        self.assertFalse(
+            any("super-secret-repo" in f for f in result.findings),
+            result.findings,
+        )
+        # The target STRING is, on both the resolvable and the dangling link.
+        self.assertEqual(len(result.findings), 2, result.findings)
+        self.assertTrue(
+            any("Comfy-Org/private-thing" in f for f in result.findings),
+            result.findings,
+        )
+        self.assertTrue(
+            any("BE-4242" in f for f in result.findings), result.findings
+        )
+        # Reading the target string IS coverage, so these count as scanned --
+        # but each still names itself, because the file body was not read.
+        self.assertEqual(result.skipped, [])
+        self.assertEqual(result.scanned, 3)
+        link_warnings = [w for w in result.warnings if "symlink" in w]
+        self.assertEqual(len(link_warnings), 2, result.warnings)
+        for w in link_warnings:
+            self.assertIn("TARGET STRING", w)
+
+    def test_a_fifo_is_still_skipped_outright(self):
+        # A symlink has a target string worth scanning; a device node or FIFO
+        # has nothing this repo stores, and reading one blocks. git cannot
+        # track a FIFO directly, so reach the case the way reality would: a
+        # tracked regular file that IS one by the time the scan lstats it.
+        fifo = self.repo.write("pipe", "clean\n")
+        os.remove(fifo)
+        os.mkfifo(fifo)
+        self.addCleanup(os.remove, fifo)
+        self.repo.write("ok.md", "clean\n")
+        result = self.run_checks()
         self.assertEqual(result.findings, [])
-        self.assertEqual(result.skipped, [("not a regular file", 2)])
-        self.assertEqual(len(result.warnings), 2, result.warnings)
-        for w in result.warnings:
-            self.assertIn("not a regular file", w)
-            self.assertIn("NOT scanned", w)
+        self.assertEqual(result.skipped, [("not a regular file", 1)])
+        self.assertEqual(result.scanned, 1)
+        self.assertEqual(len(result.warnings), 1, result.warnings)
+        self.assertIn("not a regular file", result.warnings[0])
 
     def test_oversized_file_is_truncated_loudly_not_dropped(self):
         # An unbounded read is a runner-memory DoS a PR author controls. Most
@@ -366,6 +425,99 @@ class CoverageReportingTest(CheckerTestCase):
             result = self.run_checks()
         self.assertEqual(len(result.findings), 1, result.findings)
         self.assertEqual(result.skipped, [])
+
+    def test_a_bad_byte_far_from_the_cap_is_non_utf8_not_a_short_scan(self):
+        # The mid-codepoint fallback must be GATED on the error landing at the
+        # truncation boundary. `data[:exc.start]` is valid UTF-8 by
+        # construction, so an ungated fallback silently "succeeds" for a
+        # genuinely non-UTF-8 file: commit filler past the cap, one bad byte
+        # near the TOP, then the internal references, and the file is scanned
+        # only up to that byte, still counted as scanned, and reported under a
+        # warning claiming the whole cap was read (BE-8654 review).
+        with unittest.mock.patch.object(checker, "MAX_FILE_BYTES", 64):
+            self.repo.write(
+                "sneaky.md",
+                b"ok\n\xff\nComfy-Org/nope\nBE-1234\n" + b"x" * 200,
+                track=True,
+            )
+            self.repo.write("ok.md", "clean\n")
+            result = self.run_checks()
+        # Not scanned-to-the-bad-byte-and-called-covered: a real skip, counted.
+        self.assertEqual(result.findings, [])
+        self.assertEqual(result.skipped, [("non-UTF-8", 1)])
+        self.assertEqual(result.scanned, 1)
+        # And no warning that overstates what was read.
+        self.assertFalse(
+            any("only the first" in w for w in result.warnings), result.warnings
+        )
+
+    def test_a_git_lfs_pointer_stub_is_named_as_a_coverage_hole(self):
+        # `actions/checkout` leaves LFS off, so an LFS-tracked file is present
+        # only as its pointer stub. Reading the stub and counting the file as
+        # covered is a silent hole -- and one a PR could use deliberately.
+        self.repo.write(
+            "asset.bin",
+            checker.LFS_POINTER_PREFIX
+            + "\noid sha256:" + "a" * 64 + "\nsize 12345\n",
+        )
+        self.repo.write("ok.md", "clean\n")
+        result = self.run_checks()
+        self.assertEqual(result.findings, [])
+        # The stub itself IS text and was read, so it counts as scanned...
+        self.assertEqual(result.scanned, 2)
+        # ...but the file it stands for was not, and that is said out loud.
+        lfs = [w for w in result.warnings if "git-LFS" in w]
+        self.assertEqual(len(lfs), 1, result.warnings)
+        self.assertIn("asset.bin", lfs[0])
+
+    def test_findings_are_capped_per_file_without_softening_the_verdict(self):
+        # The read cap bounds bytes READ; nothing bounded what was DERIVED from
+        # them. One matching line copied once per matching pattern is how a
+        # 5 MiB file becomes tens of MiB of retained strings and a flooded
+        # PUBLIC run log (BE-8654 review).
+        with unittest.mock.patch.object(checker, "MAX_FINDINGS_PER_FILE", 5):
+            self.repo.write("many.md", "Comfy-Org/nope\n" * 50)
+            result = self.run_checks()
+        self.assertEqual(len(result.findings), 5, result.findings)
+        capped = [w for w in result.warnings if "more than 5 findings" in w]
+        self.assertEqual(len(capped), 1, result.warnings)
+        self.assertIn("many.md", capped[0])
+        # Capping is an enumeration limit, never an amnesty.
+        self.assertIn("still FAILS", capped[0])
+        self.assertEqual(checker._emit(result), 1)
+
+    def test_findings_are_capped_per_run_too(self):
+        with unittest.mock.patch.object(checker, "MAX_FINDINGS_TOTAL", 3):
+            self.repo.write("a.md", "Comfy-Org/nope\n" * 5)
+            self.repo.write("b.md", "Comfy-Org/nope\n" * 5)
+            result = self.run_checks()
+        self.assertEqual(len(result.findings), 3, result.findings)
+        self.assertTrue(
+            any("across the repo" in w for w in result.warnings), result.warnings
+        )
+        # Coverage accounting stays COMPLETE past the cap -- only the
+        # enumeration stops.
+        self.assertEqual(result.scanned, 2)
+        self.assertEqual(checker._emit(result), 1)
+
+    def test_a_matched_line_is_echoed_only_as_a_bounded_excerpt(self):
+        # Category-2 findings echo the whole matched line, which is
+        # attacker-controlled and can be the entire file.
+        self.repo.write("huge.md", "https://notion.so/" + "z" * 5000 + "\n")
+        result = self.run_checks()
+        self.assertEqual(len(result.findings), 1, result.findings)
+        self.assertIn("line truncated", result.findings[0])
+        self.assertLess(len(result.findings[0]), 400, result.findings[0])
+
+    def test_an_unbounded_repo_name_match_is_bounded_in_the_finding(self):
+        # REPO_REF_RE's name class has no length bound, so `Comfy-Org/` plus
+        # 5 MiB of word characters is ONE match whose text is the whole file --
+        # the excerpt bound on whole LINES does not cover it.
+        self.repo.write("wide.md", "Comfy-Org/" + "a" * 5000 + "\n")
+        result = self.run_checks()
+        self.assertEqual(len(result.findings), 1, result.findings)
+        self.assertIn("truncated", result.findings[0])
+        self.assertLess(len(result.findings[0]), 600, len(result.findings[0]))
 
     def test_binary_and_non_utf8_skips_are_counted_not_warned(self):
         # These are ordinary, expected skips, so warning on each would bury the

@@ -20,10 +20,15 @@ false positive is a one-line list edit instead of a mystery.
 Only **tracked** files are scanned (`git ls-files -z`), so build output, `node_modules` and
 anything untracked is out of scope by construction. Binary files are skipped (a NUL byte or an
 undecodable UTF-8 sequence), and only **regular** files are opened at all: `open()` follows a
-symlink, so scanning one would read whatever it points *at* rather than the link target git
-actually stores — a link out of the repo pulls arbitrary runner content into a public run log, and
-one to `/dev/zero` or a FIFO turns the read into an OOM or a hang. A regular file is read up to
-`MAX_FILE_BYTES` (5 MiB) and no further.
+symlink, so scanning one would read whatever it points *at* — a link out of the repo pulls
+arbitrary runner content into a public run log, and one to `/dev/zero` or a FIFO turns the read
+into an OOM or a hang. A symlink is not skipped outright, though: `os.readlink()` returns the
+target **string**, which is the entry git actually tracks and publishes in the tree, so that
+string is scanned in place of the file body. A regular file is read up to `MAX_FILE_BYTES` (5 MiB)
+and no further, and what is *derived* from those bytes is capped too — `MAX_FINDINGS_PER_FILE`
+(200), `MAX_FINDINGS_TOTAL` (2000) and a `MAX_EXCERPT_CHARS` (200) bound on the echoed line, since
+a category-2 finding copies the matched line and the scanned repo controls how long that is.
+Hitting a cap adds a `::warning::` and never softens the verdict: the run still fails.
 
 Everything the scan declines to look at leaves a trace, because a guard that silently skips
 something is worse than no guard — the green run reads as coverage:
@@ -31,8 +36,13 @@ something is worse than no guard — the green run reads as coverage:
 - every run prints `SCANNED: <n> file(s) read as text` — the number the rest of this list has to
   account for;
 - an exclusion is logged with its skipped-file count, **including one that skipped nothing**;
-- a file that cannot be *read* (a permission problem) or that is *not a regular file* (a symlink,
-  FIFO, socket or device node) is a `::warning::` naming it, not a silent drop;
+- a file that cannot be *read* (a permission problem) or that is *not a regular file* (a FIFO,
+  socket or device node) is a `::warning::` naming it, not a silent drop;
+- a **symlink** is a `::warning::` naming it too, saying that only the target string was read —
+  it counts as scanned, because that string *is* what this repo publishes there;
+- a **git-LFS pointer stub** is a `::warning::` naming it: `actions/checkout` does not fetch LFS
+  objects, so the work tree holds the ~130-byte stub and the real content — publicly downloadable
+  from the same repo — is never examined. Without this the file would count as covered;
 - binary and non-UTF-8 files are expected skips, so they are a per-run `NOT SCANNED: <n>` count
   rather than a warning each — a count they must have, because one stray byte otherwise hides a
   whole file that still renders as text on GitHub;

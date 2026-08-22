@@ -117,7 +117,8 @@ tests — run the matching command above for whatever you touched.
   `WATCHED_ASSETS` inputs, plus `WATCHED_PATHSPECS` (BE-6676; the excluding
   fleets: pr-risk, pr-size/cursor-review since BE-7084, linear-ticket and
   public-repo-hygiene) + `WATCHED_EXEC`
-  (the per-executed-file fleets: pr-risk, pr-derisk). Watched inputs MUST
+  (the per-executed-file fleets: pr-risk, pr-derisk, public-repo-hygiene).
+  Watched inputs MUST
   mirror that fleet's `paths:` filter, exclusions included. Tests in `tests/`.
 - `scripts/pr-risk/` + `scripts/pr-derisk/` — the two rungs of the PR risk ladder.
   v0 grades (`grade-pr-risk.sh`, deterministic — **no LLM in the grading path; keep it
