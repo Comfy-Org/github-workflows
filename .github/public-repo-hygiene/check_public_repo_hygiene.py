@@ -149,27 +149,40 @@ _HOST_FLAGS = re.IGNORECASE | re.ASCII
 INTERNAL_MARKER_RES = (
     re.compile(_HOST_L + r"notion\.(so|site)" + _PORT + "/", _HOST_FLAGS),
     re.compile(_HOST_L + r"slack\.com" + _PORT + "/(archives|client)/", _HOST_FLAGS),
-    # The one host-only pattern, so it needs a right anchor of its own. `\b`
-    # accepted `app.slack.com.evil.com`; this rejects a following label while
-    # still allowing a sentence-final period, a port and end of line.
+    # The one host-only pattern, so it needs a right anchor of its own -- and
+    # it does NOT consume `_PORT`. Two review rounds were lost to the fact that
+    # an optional, greedy port followed by a negative lookahead BACKTRACKS: the
+    # engine hands digits back one at a time until the lookahead is satisfied,
+    # so every alternative added to the lookahead had to be reasoned about
+    # against every possible port split, and two of the three attempts shipped
+    # a hole (`app.slack.com:443.evil.com` matching) or a regression
+    # (`app.slack.com:general` and `app.slack.com:2FA` going silent).
     #
-    # `|:\d` is load-bearing. `_PORT` is optional AND `\d*` is greedy, so the
-    # engine backtracks through it: on `app.slack.com:443.evil.com` the greedy
-    # `:443` fails the lookahead on `.evil`, the port gives digits back one at
-    # a time and finally retries empty, and a lookahead that stopped at
-    # `\.?[A-Za-z0-9-]` then passed on `:` -- flagging the lookalike after all.
-    # It must be `:\d`, not a bare `:`: a bare `:` also killed
-    # `app.slack.com:general` and `app.slack.com:443: our workspace`, where the
-    # colon is prose rather than a port and the pre-`\b` pattern matched.
-    # `:\d` still blocks every backtrack above, because the empty-port retry
-    # always faces `:4`. `|@` is the userinfo delimiter: in
-    # `https://app.slack.com@evil.com/` the real host is `evil.com`, which is
-    # the same lookalike false positive this pattern set exists to drop, in the
-    # canonical phishing shape. `app.slack.com@` never begins a genuine
-    # reference to that host, and the `/`-requiring patterns cannot hit the gap
-    # because a `/` can never follow `@`. (BE-8729 review.)
+    # A `search()` only needs a boolean, so nothing here has to be consumed.
+    # One lookahead reads the whole tail, and the port never enters the match:
+    # no optional group, no backtracking, each alternative independent.
+    #   `\.?[A-Za-z0-9-]`      a following label -- `app.slack.com.evil.com`,
+    #                          which is what `\b` used to accept. A dot is
+    #                          allowed only when what follows is NOT a label,
+    #                          so `app.slack.com./x` still matches.
+    #   `:\d+\.[A-Za-z0-9-]`    a real port and then a dot-label, i.e. the host
+    #                          continues past the port: `app.slack.com:443.evil.com`.
+    #                          The `\.` is required. `:\d` alone also rejected
+    #                          `app.slack.com:2FA`, where the colon is prose.
+    #   `@`                    the userinfo delimiter: in
+    #                          `https://app.slack.com@evil.com/` the real host
+    #                          is `evil.com`, the canonical phishing shape.
+    #   `[.:][^\s/?#@]*@`       the same thing with userinfo in between --
+    #                          `:@`, `:secret@`, `.@`. Anchored on a leading
+    #                          `.`/`:` and stopped at a URL delimiter so it
+    #                          cannot reach across prose: `app.slack.com,bob@x`
+    #                          and `app.slack.com and email bob@x` still match.
+    # A leading `admin@` is the other direction and is untouched -- `_HOST_L`
+    # only bars a label character. (BE-8729 review, rounds 2 and 3.)
     re.compile(
-        _HOST_L + r"app\.slack\.com" + _PORT + r"(?!\.?[A-Za-z0-9-]|:\d|@)",
+        _HOST_L
+        + r"app\.slack\.com"
+        + r"(?!\.?[A-Za-z0-9-]|:\d+\.[A-Za-z0-9-]|@|[.:][^\s/?#@]*@)",
         _HOST_FLAGS,
     ),
     re.compile(_HOST_L + r"docs\.google\.com" + _PORT + "/", _HOST_FLAGS),

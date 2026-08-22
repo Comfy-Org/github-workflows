@@ -294,7 +294,18 @@ class InternalMarkerCategoryTest(CheckerTestCase):
         for marker, want in (
             ("https://app.slack.com@evil.com/", 0),
             ("https://app.slack.com:443@evil.com/", 0),
+            # Userinfo BETWEEN the host and the `@`. The first cut only
+            # rejected an `@` adjacent to the host or to an all-digit port, so
+            # all three of these stayed flagged. (BE-8729 review, round 3.)
+            ("https://app.slack.com:@evil.com/", 0),
+            ("https://app.slack.com:secret@evil.com/", 0),
+            ("https://app.slack.com.@evil.com/", 0),
+            # ...but the rejection must not reach across prose to an unrelated
+            # address, which is why it is anchored on a leading `.`/`:` and
+            # stops at a URL delimiter.
             ("mail admin@app.slack.com about it", 1),
+            ("app.slack.com, and email bob@example.com", 1),
+            ("app.slack.com,bob@example.com", 1),
         ):
             with self.subTest(marker=marker):
                 repo = RepoFixture()
@@ -391,13 +402,17 @@ class InternalMarkerCategoryTest(CheckerTestCase):
             "Ask in app.slack.com.",
             "Ask in app.slack.com:443 if you self-host.",
             "https://app.slack.com",
-            # A colon in PROSE, not a port. The first cut of the backtracking
-            # fix rejected a bare `:` and silently lost all three of these,
-            # which `\b` had matched; `:\d` closes the backtrack instead.
-            # (BE-8729 review.)
+            # A colon in PROSE, not a port -- each one lost by a different cut
+            # of the backtracking fix, which is why they are all pinned. The
+            # bare-`:` alternative lost the two `:general` shapes (the
+            # `: the #general` one survived it, because `\d*` let the port
+            # swallow the lone colon). Narrowing that to `:\d` restored them
+            # and lost `:2FA` instead. Not consuming the port at all is what
+            # keeps every one of them. (BE-8729 review, rounds 2 and 3.)
             "Ask in app.slack.com: the #general channel.",
             "Ask in app.slack.com:general, not here.",
             "Ask in app.slack.com:443: our workspace.",
+            "Configure app.slack.com:2FA settings before then.",
         ):
             with self.subTest(marker=marker):
                 repo = RepoFixture()

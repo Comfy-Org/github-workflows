@@ -64,10 +64,12 @@ jobs:
           printf 'Owned by @Comfy-Org/Comfy-Cloud-Team.\n' > "$root/OWNERS.md"
           # BE-8729: lookalike third-party hosts. `\b` is not a host boundary,
           # so `evil-posthog.com` and friends used to be category-2 findings;
-          # only a dot in front is a real subdomain edge. The last two are the
-          # review follow-ups: a suffix host that used to sneak back in by
-          # backtracking past the optional port, and a homoglyph domain that
-          # Unicode case-folding read as the real one.
+          # only a dot in front is a real subdomain edge. The three appended
+          # below are the review follow-ups: a suffix host that used to sneak
+          # back in by backtracking past the optional port, a homoglyph domain
+          # that Unicode case-folding read as the real one, and a userinfo URL
+          # whose real host is `evil.com` -- the only fixture exercising the
+          # host-only pattern's `@` rejection end to end.
           printf 'Unrelated: https://fooslack.com/archives/x https://evil-posthog.com/project/1\n' > "$root/LOOKALIKES.md"
           printf 'Also unrelated: https://app.slack.com:443.evil.com/x https://lınear.app/x\n' >> "$root/LOOKALIKES.md"
           printf 'Userinfo, so the real host is evil.com: https://app.slack.com@evil.com/\n' >> "$root/LOOKALIKES.md"
