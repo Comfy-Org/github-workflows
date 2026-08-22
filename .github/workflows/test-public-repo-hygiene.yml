@@ -183,6 +183,91 @@ jobs:
           fi
           echo "checker correctly rejected a root-wide exclusion"
 
+      - name: Smoke test — a scan that read nothing is exit 2, not a pass
+        run: |
+          # Naming every top-level directory in exclude_paths disables the whole
+          # scan without ever naming the repo root, so rejecting a root-wide
+          # exclusion is only half the guard. Zero coverage is a failure.
+          root="$(mktemp -d)"
+          git -C "$root" init -q
+          mkdir -p "$root/docs"
+          printf 'clean\n' > "$root/docs/a.md"
+          git -C "$root" add -A
+          set +e
+          out="$(python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root" --exclude 'docs/' 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+          if [ "$code" -ne 2 ]; then
+            echo "::error::expected exit 2 for a scan that read zero files, got $code"
+            exit 1
+          fi
+          grep -qF 'SCANNED: 0 file(s) read as text' <<<"$out" || {
+            echo "::error::a zero-coverage run did not report its scanned count"
+            exit 1
+          }
+          echo "checker correctly refused to call zero coverage clean"
+
+      - name: Smoke test — the reserved checkout path cannot be a parking spot
+        run: |
+          # `_public_repo_hygiene/` is where this repo gets checked out inside
+          # the caller's workspace. Tracked content there is shadowed by that
+          # checkout, so skipping it quietly would leave a path any PR could
+          # park an internal reference in and still ship green.
+          root="$(mktemp -d)"
+          git -C "$root" init -q
+          mkdir -p "$root/_public_repo_hygiene"
+          printf 'Comfy-Org/super-secret-repo\n' > "$root/_public_repo_hygiene/parked.md"
+          printf 'clean\n' > "$root/README.md"
+          git -C "$root" add -A
+          set +e
+          out="$(python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root" 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+          if [ "$code" -ne 2 ]; then
+            echo "::error::expected exit 2 for tracked content at the reserved path, got $code"
+            exit 1
+          fi
+          grep -qF 'RESERVED' <<<"$out" || {
+            echo "::error::the reserved-path failure did not explain itself"
+            exit 1
+          }
+          echo "checker correctly refused a tracked reserved path"
+
+      - name: Smoke test — a symlink is named, never followed
+        run: |
+          # `open()` follows a symlink, so scanning one reads whatever it points
+          # AT rather than the link target git stores. A link out of the repo
+          # would pull arbitrary runner content into this PUBLIC run log; a link
+          # to /dev/zero would hang or OOM the job.
+          root="$(mktemp -d)"
+          outside="$(mktemp -d)"
+          printf 'Comfy-Org/super-secret-repo\n' > "$outside/outside.md"
+          git -C "$root" init -q
+          ln -s "$outside/outside.md" "$root/link.md"
+          ln -s /dev/zero "$root/zero.md"
+          printf 'clean\n' > "$root/README.md"
+          git -C "$root" add -A
+          set +e
+          out="$(timeout 60 python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root" 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+          if [ "$code" -ne 0 ]; then
+            echo "::error::expected exit 0 (symlinks skipped, nothing of the repo's own to flag), got $code"
+            exit 1
+          fi
+          grep -qF 'super-secret-repo' <<<"$out" && {
+            echo "::error::the checker followed a symlink out of the repo and echoed its content into a public log"
+            exit 1
+          }
+          grep -qF 'not a regular file' <<<"$out" || {
+            echo "::error::a skipped symlink left no trace in the log"
+            exit 1
+          }
+          echo "checker correctly refused to follow symlinks"
+
       - name: Smoke test — a non-git tree is a loud config error, not a pass
         run: |
           # The scan is over TRACKED files. If the checkout is missing or the

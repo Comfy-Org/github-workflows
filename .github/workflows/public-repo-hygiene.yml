@@ -54,8 +54,10 @@ name: Public Repo Hygiene (reusable)
 #                      invisibly. A value naming the repo root (`/`, `.`) is
 #                      rejected and the run fails. Default empty.
 #   workflows_ref      REQUIRED. Ref of Comfy-Org/github-workflows to load the
-#                      check script from. Must be the SAME commit SHA you pin
-#                      `uses:` to — no default, so a caller can't pin the
+#                      check script from. Must be a full 40-hex commit SHA and
+#                      must EQUAL the SHA `uses:` above is pinned to — both are
+#                      ENFORCED at run time against `job.workflow_sha`, not
+#                      merely documented. No default, so a caller can't pin the
 #                      workflow while loading the checker from a mutable branch.
 #
 # No secrets required.
@@ -82,11 +84,13 @@ on:
         default: ''
       workflows_ref:
         description: >-
-          REQUIRED. Ref of Comfy-Org/github-workflows to load the check script
-          from. Must be the SAME commit SHA you pin `uses:` to — otherwise the
-          workflow is pinned but the code it runs is not. There is deliberately
-          no default: a floating `main` default would silently load a mutable
-          checker, which is the exact hole this workflow exists to close.
+          REQUIRED. A full 40-hex commit SHA, equal to the one you pin `uses:`
+          to — otherwise the workflow is pinned but the code it runs is not.
+          Both halves are enforced, not just documented: the job fails on a ref
+          that is not a 40-hex SHA and on one that differs from the commit this
+          workflow itself was resolved from. There is deliberately no default —
+          a floating `main` default would silently load a mutable checker, which
+          is the exact hole this workflow exists to close.
         type: string
         required: true
 
@@ -97,6 +101,11 @@ jobs:
   check:
     name: public-repo-hygiene
     runs-on: ubuntu-latest
+    # The scan reads every tracked file in the caller's repo, and both the file
+    # list and the file contents are things a PR author controls. Without this,
+    # a pathological tree burns the 6-hour default before anyone notices the
+    # required check never reported.
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -113,8 +122,30 @@ jobs:
         # as '' and actions/checkout would silently fall back to this repo's
         # default branch — running MUTABLE scripts under a pin that claims
         # otherwise. Fail fast instead. (BE-5546)
+        #
+        # Non-empty is not enough here, and this workflow is the reason. A
+        # `pull_request` caller runs the workflow FILE from the PR head, so a PR
+        # can edit `workflows_ref:` without touching the far more visible
+        # `uses:` line — point it at `refs/pull/<n>/head` of a PR opened against
+        # this public repo and the next step checks THAT out, running the PR
+        # author's own `check_public_repo_hygiene.py` and reporting the required
+        # check green. Every claim this workflow makes about a PR being unable
+        # to weaken the check judging it rests on the two tests below, so they
+        # fail the run rather than warn:
+        #
+        #   1. a full 40-hex SHA — a branch, tag or `refs/pull/*` ref is mutable
+        #      and can be moved after review;
+        #   2. equal to `job.workflow_sha` — the commit THIS reusable workflow
+        #      was itself resolved from, i.e. exactly what the caller's `uses:`
+        #      pin points at. It is computed by the runner from the `uses:`
+        #      line, so a caller cannot set it, and matching against it is what
+        #      makes "the checker comes from the commit you pinned" a fact
+        #      rather than a convention. (`job.workflow_sha`, NOT
+        #      `github.job_workflow_sha` — that one is an OIDC claim, absent
+        #      from the `github` context, and expands to ''.)
         env:
           WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+          WORKFLOW_SHA: ${{ job.workflow_sha }}
         run: |
           # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
           # whitespace-only value is an empty ref to IT while sailing past a bare
@@ -128,7 +159,22 @@ jobs:
             exit 1
           fi
           if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
+            echo "::error::workflows_ref '$REF' is not a full 40-hex commit SHA. Branch, tag and refs/pull/* refs are MUTABLE, so the checker they load is not the one that was reviewed. Set workflows_ref: to the same 40-hex SHA the caller's uses: line pins."
+            exit 1
+          fi
+          # Lower-case both sides: the grep above already fixes REF's case, and
+          # job.workflow_sha is lower-case hex, so this is belt-and-braces
+          # against a runner that ever changes that.
+          SHA="$(printf '%s' "$WORKFLOW_SHA" | tr -d '[:space:]' | tr 'A-Z' 'a-z')"
+          if [ -z "$SHA" ]; then
+            # WARN, not fail: job.workflow_sha needs an Actions runner >= 2.334.0,
+            # so an older runner is the only way this is empty. The 40-hex test
+            # above has already run, so the ref is still immutable — only the
+            # "same commit as uses:" half is unverifiable here.
+            echo "::warning::job.workflow_sha is empty (Actions runner older than v2.334.0), so workflows_ref could not be cross-checked against the commit this workflow was called at. The ref is still required to be a full commit SHA."
+          elif [ "$REF" != "$SHA" ]; then
+            echo "::error::workflows_ref ($REF) is not the commit this workflow was called at ($SHA). The uses: pin and workflows_ref MUST name the same commit — otherwise the workflow is pinned but the checker and its allowlist are loaded from somewhere else, which is the exact hole this workflow exists to close. Set both to $SHA."
+            exit 1
           fi
 
       - name: Load hygiene check script

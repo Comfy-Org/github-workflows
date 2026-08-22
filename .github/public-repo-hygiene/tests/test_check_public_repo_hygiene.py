@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -65,10 +66,10 @@ class CheckerTestCase(unittest.TestCase):
         return checker.run_checks(self.repo.root, **kwargs)
 
     def findings(self, **kwargs):
-        return self.run_checks(**kwargs)[0]
+        return self.run_checks(**kwargs).findings
 
     def warnings(self, **kwargs):
-        return self.run_checks(**kwargs)[2]
+        return self.run_checks(**kwargs).warnings
 
 
 class TicketIdCategoryTest(CheckerTestCase):
@@ -137,7 +138,7 @@ class InternalMarkerCategoryTest(CheckerTestCase):
                 repo.write("notes.md", marker + "\n")
                 findings = [
                     f
-                    for f in checker.run_checks(repo.root)[0]
+                    for f in checker.run_checks(repo.root).findings
                     if "collaboration-tool marker" in f
                 ]
                 self.assertGreaterEqual(len(findings), 1, f"{marker}: {findings}")
@@ -231,36 +232,43 @@ class ScanScopeTest(CheckerTestCase):
 
     def test_binary_files_are_skipped(self):
         self.repo.write("blob.bin", b"BE-1234\x00\xff\xfe", track=True)
-        self.assertEqual(self.findings(), [])
+        self.repo.write("ok.md", "clean\n")
+        result = self.run_checks()
+        self.assertEqual(result.findings, [])
+        self.assertEqual(result.skipped, [("binary", 1)])
 
     def test_undecodable_text_is_skipped(self):
         self.repo.write("latin.txt", b"BE-1234 caf\xe9\n", track=True)
-        self.assertEqual(self.findings(), [])
+        self.repo.write("ok.md", "clean\n")
+        result = self.run_checks()
+        self.assertEqual(result.findings, [])
+        self.assertEqual(result.skipped, [("non-UTF-8", 1)])
 
     def test_directory_exclusion_prunes_subtree_and_is_counted(self):
         self.repo.write("src/generated/a.py", "BE-1234\n")
         self.repo.write("src/generated/deep/b.py", "BE-5678\n")
         self.repo.write("src/hand.py", "BE-9999\n")
-        findings, exclusions, _ = self.run_checks(excludes=["src/generated/"])
-        self.assertEqual(len(findings), 1, findings)
-        self.assertIn("src/hand.py", findings[0])
-        self.assertEqual(exclusions, [("src/generated/", 2)])
+        result = self.run_checks(excludes=["src/generated/"])
+        self.assertEqual(len(result.findings), 1, result.findings)
+        self.assertIn("src/hand.py", result.findings[0])
+        self.assertEqual(result.exclusions, [("src/generated/", 2)])
 
     def test_file_exclusion_is_exact(self):
         self.repo.write("scripts/check.py", "BE-1234\n")
         self.repo.write("scripts/check.py.bak", "BE-5678\n")
-        findings, exclusions, _ = self.run_checks(excludes=["scripts/check.py"])
-        self.assertEqual(len(findings), 1, findings)
-        self.assertIn("scripts/check.py.bak", findings[0])
-        self.assertEqual(exclusions, [("scripts/check.py", 1)])
+        result = self.run_checks(excludes=["scripts/check.py"])
+        self.assertEqual(len(result.findings), 1, result.findings)
+        self.assertIn("scripts/check.py.bak", result.findings[0])
+        self.assertEqual(result.exclusions, [("scripts/check.py", 1)])
 
     def test_exclusion_that_matches_nothing_is_still_reported(self):
         # A typo'd exclusion has to be visible in the log. Reporting only the
         # ones that fired is how a repo ends up believing it excluded a tree
         # it never named correctly.
         self.repo.write("a.md", "hello\n")
-        _, exclusions, _ = self.run_checks(excludes=["typo/"])
-        self.assertEqual(exclusions, [("typo/", 0)])
+        self.assertEqual(
+            self.run_checks(excludes=["typo/"]).exclusions, [("typo/", 0)]
+        )
 
     def test_root_exclusion_is_rejected(self):
         for bad in ("/", ".", "./", "", "   "):
@@ -287,30 +295,111 @@ class CoverageReportingTest(CheckerTestCase):
     warning, and a run that scanned nothing at all says so.
     """
 
-    def test_unreadable_file_warns_rather_than_disappearing(self):
-        # A dangling symlink is tracked, is not binary, and cannot be opened.
-        os.symlink("nowhere-at-all", os.path.join(self.repo.root, "dangling"))
-        self.repo._git("add", "--", "dangling")
+    def test_unreadable_file_is_named_rather_than_disappearing(self):
+        # A tracked path the checker cannot read at all -- here a directory
+        # that git tracks a file under, made unreadable. Unlike binary/
+        # non-UTF-8 this is not an expected skip, so it names the file.
+        self.repo.write("locked/secret.md", "clean\n")
         self.repo.write("ok.md", "clean\n")
-        findings, _, warnings = self.run_checks()
-        self.assertEqual(findings, [])
-        self.assertEqual(len(warnings), 1, warnings)
-        self.assertIn("dangling", warnings[0])
-        self.assertIn("NOT scanned", warnings[0])
+        locked = os.path.join(self.repo.root, "locked")
+        os.chmod(locked, 0o000)
+        self.addCleanup(os.chmod, locked, 0o755)
+        if os.access(os.path.join(locked, "secret.md"), os.R_OK):
+            # root ignores the mode bits, and CI containers often run as root.
+            raise unittest.SkipTest("permissions are not enforced for this user")
+        result = self.run_checks()
+        self.assertEqual(result.findings, [])
+        self.assertEqual(len(result.warnings), 1, result.warnings)
+        self.assertIn("locked/secret.md", result.warnings[0])
+        self.assertIn("NOT scanned", result.warnings[0])
+        self.assertEqual(result.skipped, [("unreadable", 1)])
 
-    def test_binary_and_non_utf8_skips_are_not_warnings(self):
-        # These are ordinary, expected skips; warning on them would bury the
-        # unreadable case in noise.
+    def test_symlinks_are_named_and_never_followed(self):
+        # `open()` follows a symlink, so scanning one reads whatever it points
+        # AT rather than the link target string git stores in the blob: a link
+        # out of the repo would pull arbitrary runner content into a PUBLIC run
+        # log, and one to /dev/zero or a FIFO would hang or OOM the job.
+        outside = os.path.join(tempfile.mkdtemp(), "outside.md")
+        self.addCleanup(os.remove, outside)
+        with open(outside, "w") as fh:
+            fh.write("Comfy-Org/super-secret-repo\n")
+        os.symlink(outside, os.path.join(self.repo.root, "link.md"))
+        # ...and the dangling case, which cannot be opened at all.
+        os.symlink("nowhere-at-all", os.path.join(self.repo.root, "dangling"))
+        self.repo._git("add", "--", "link.md", "dangling")
+        self.repo.write("ok.md", "clean\n")
+
+        result = self.run_checks()
+        # The content on the far side of the link is NOT reported -- it is not
+        # this repo's, and echoing it would be the leak, not the guard.
+        self.assertEqual(result.findings, [])
+        self.assertEqual(result.skipped, [("not a regular file", 2)])
+        self.assertEqual(len(result.warnings), 2, result.warnings)
+        for w in result.warnings:
+            self.assertIn("not a regular file", w)
+            self.assertIn("NOT scanned", w)
+
+    def test_oversized_file_is_truncated_loudly_not_dropped(self):
+        # An unbounded read is a runner-memory DoS a PR author controls. Most
+        # of a large file is still worth scanning, so the cap truncates and
+        # names the unread tail rather than skipping the file.
+        with unittest.mock.patch.object(checker, "MAX_FILE_BYTES", 64):
+            self.repo.write("big.md", "Comfy-Org/nope\n" + "x" * 200 + "\nBE-1234\n")
+            result = self.run_checks()
+        # The part within the cap is still checked...
+        self.assertEqual(len(result.findings), 1, result.findings)
+        self.assertIn("Comfy-Org/nope", result.findings[0])
+        # ...and the part beyond it is a named warning, not a silent drop.
+        self.assertEqual(result.scanned, 1)
+        self.assertEqual(result.skipped, [])
+        self.assertEqual(len(result.warnings), 1, result.warnings)
+        self.assertIn("big.md", result.warnings[0])
+        self.assertIn("only the first 64", result.warnings[0])
+
+    def test_truncation_landing_mid_codepoint_still_scans_the_head(self):
+        # The cap can split a multi-byte character. Reporting the whole file as
+        # non-UTF-8 would turn a size limit into a detection hole.
+        with unittest.mock.patch.object(checker, "MAX_FILE_BYTES", 20):
+            self.repo.write(
+                "wide.md", ("Comfy-Org/nope\n" + "é" * 40).encode()
+            )
+            result = self.run_checks()
+        self.assertEqual(len(result.findings), 1, result.findings)
+        self.assertEqual(result.skipped, [])
+
+    def test_binary_and_non_utf8_skips_are_counted_not_warned(self):
+        # These are ordinary, expected skips, so warning on each would bury the
+        # unreadable case in noise -- but silent is not an option either: one
+        # stray byte appended to a document hides the whole file while it still
+        # renders as text on GitHub. They get a per-run count.
         self.repo.write("blob.bin", b"\x00\xff", track=True)
         self.repo.write("latin.txt", b"caf\xe9\n", track=True)
-        self.assertEqual(self.warnings(), [])
+        self.repo.write("ok.md", "clean\n")
+        result = self.run_checks()
+        self.assertEqual(result.warnings, [])
+        self.assertEqual(result.skipped, [("binary", 1), ("non-UTF-8", 1)])
+        self.assertEqual(result.scanned, 1)
 
     def test_scanning_nothing_is_never_reported_as_clean(self):
         self.repo.write("only.md", "clean\n")
-        findings, _, warnings = self.run_checks(excludes=["only.md"])
-        self.assertEqual(findings, [])
+        result = self.run_checks(excludes=["only.md"])
+        self.assertEqual(result.findings, [])
+        self.assertEqual(result.scanned, 0)
         self.assertTrue(
-            any("no files were scanned" in w for w in warnings), warnings
+            any("no files were scanned" in w for w in result.warnings),
+            result.warnings,
+        )
+
+    def test_a_repo_whose_files_are_all_unscannable_is_not_clean(self):
+        # The zero-scan net has to count files the READER declined too, not
+        # just excluded ones -- otherwise a tree of binaries reports "scanned"
+        # coverage it never had.
+        self.repo.write("blob.bin", b"\x00\xff", track=True)
+        result = self.run_checks()
+        self.assertEqual(result.scanned, 0)
+        self.assertTrue(
+            any("no files were scanned" in w for w in result.warnings),
+            result.warnings,
         )
 
     def test_empty_repo_warns_too(self):
@@ -318,21 +407,29 @@ class CoverageReportingTest(CheckerTestCase):
             any("no files were scanned" in w for w in self.warnings())
         )
 
-    def test_script_checkout_dir_is_skipped_and_reported(self):
+    def test_tracked_content_at_the_reserved_path_is_a_hard_failure(self):
         # The reusable workflow checks THIS repo out at `_public_repo_hygiene/`
-        # in the caller's workspace. A caller that tracks a directory of that
-        # name would otherwise have this repo's own ticket ids and Comfy-Org
-        # references scanned as its own.
+        # inside the caller's workspace, so tracked content there is shadowed
+        # by that checkout and can never be examined. Skipping it quietly would
+        # have made the reserved path a parking spot for internal references
+        # that still ships green; it is exit 2 instead.
         self.repo.write("_public_repo_hygiene/x.py", "BE-1234 Comfy-Org/private\n")
         self.repo.write("real.md", "clean\n")
-        findings, exclusions, _ = self.run_checks()
-        self.assertEqual(findings, [])
-        self.assertIn(("_public_repo_hygiene/", 1), exclusions)
+        with self.assertRaises(checker.ConfigError) as ctx:
+            self.run_checks()
+        self.assertIn("_public_repo_hygiene/", str(ctx.exception))
+        self.assertIn("RESERVED", str(ctx.exception))
+        self.assertEqual(
+            checker.main(["--root", self.repo.root]), 2
+        )
 
-    def test_script_checkout_skip_is_silent_when_it_skips_nothing(self):
+    def test_the_reserved_path_costs_nothing_when_it_is_absent(self):
+        # The ordinary case: the workflow's checkout lands UNTRACKED there, so
+        # `git ls-files` never lists it and the run says nothing about it.
         self.repo.write("real.md", "clean\n")
-        _, exclusions, _ = self.run_checks()
-        self.assertEqual(exclusions, [])
+        result = self.run_checks()
+        self.assertEqual(result.exclusions, [])
+        self.assertEqual(result.skipped, [])
 
     def test_undecodable_path_bytes_do_not_crash_the_report(self):
         # `git ls-files` paths arrive via surrogateescape, so a filename holding
@@ -481,6 +578,15 @@ class OutputTest(CheckerTestCase):
         self.assertEqual(checker.main(["--root", self.repo.root]), 1)
         self.assertEqual(
             checker.main(["--root", self.repo.root, "--exclude", "/"]), 2
+        )
+
+    def test_a_scan_that_read_nothing_exits_2_not_0(self):
+        # Enumerating every top-level directory in `exclude_paths` disables the
+        # whole scan without ever naming the repo root, so the root-exclusion
+        # rejection alone would be one spelling away from pointless.
+        self.repo.write("docs/only.md", "clean\n")
+        self.assertEqual(
+            checker.main(["--root", self.repo.root, "--exclude", "docs/"]), 2
         )
 
     def test_multi_value_inputs_are_split(self):

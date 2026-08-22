@@ -31,8 +31,11 @@ neither reaches the known-public repo/team allowlist at all — that one is not
 caller-tunable in any form. Every exclusion is echoed to the run log, including
 one that matched nothing, so coverage cannot rot invisibly.
 
-Exit codes: 0 pass, 1 one or more internal-only references found, 2 bad config
-(an unusable `--exclude` value, or a root that is not a git work tree).
+Exit codes: 0 pass, 1 one or more internal-only references found, 2 the run
+proves nothing (an unusable `--exclude` value, a root that is not a git work
+tree, tracked content at the reserved `_public_repo_hygiene/` path, or a scan
+that ended up reading zero files). Exit 2 is never "clean" -- a guard that
+looked at nothing has to be as loud as one that found something.
 
 Run locally:
     python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root .
@@ -41,8 +44,10 @@ Run locally:
 """
 
 import argparse
+import collections
 import os
 import re
+import stat
 import subprocess
 import sys
 
@@ -132,14 +137,31 @@ REPO_REF_RE = re.compile(r"Comfy-Org/([A-Za-z0-9_.-]+)")
 
 # Where the reusable workflow checks THIS repo out inside the caller's
 # workspace (`path:` in public-repo-hygiene.yml — keep the two spellings in
-# step). Normally it is UNTRACKED there, so `git ls-files` never lists it. It is
-# skipped unconditionally anyway, for the one case where that is not true: a
-# caller that happens to track a directory of that name would otherwise have
-# THIS repo's own files scanned as if they were its own, and this repo is full
-# of ticket ids and Comfy-Org references by design — a guaranteed false failure
-# nobody could act on. The skip is reported like any other exclusion when it
-# actually skips something, so it can never hide real coverage silently.
+# step). The checkout lands UNTRACKED there, so `git ls-files` never lists it
+# and an ordinary run never meets this path at all.
+#
+# A caller that TRACKS content at that path is therefore not a false-positive
+# case to skip past, it is a broken one: the checkout overwrites the tracked
+# content before the scan reads it, so whatever the repo actually stores there
+# is never examined. Skipping it silently would have made the reserved path a
+# parking spot — commit internal references under `_public_repo_hygiene/` and
+# the run stays green with a `::notice::`. It is a hard config error (exit 2)
+# instead, naming the path so the fix is "rename the directory".
 SCRIPT_CHECKOUT_DIR = "_public_repo_hygiene/"
+
+# A tracked file is read up to this cap and no further. `fh.read()` with no
+# bound is a runner-memory DoS that a PR author controls by committing (or
+# symlinking to) something enormous, and the caller job has a finite budget for
+# the whole scan. Truncation is reported as a `::warning::` naming the file, so
+# the unread tail is a visible hole rather than a silent one.
+MAX_FILE_BYTES = 5 * 1024 * 1024
+
+# What `run_checks` reports. Named rather than a bare tuple because the two
+# coverage fields (`skipped`, `scanned`) are what the exit code turns on, and a
+# positional 5-tuple is how a caller ends up reading "scanned" as "findings".
+ScanResult = collections.namedtuple(
+    "ScanResult", "findings exclusions warnings skipped scanned"
+)
 
 
 class ConfigError(Exception):
@@ -240,38 +262,88 @@ def tracked_files(root):
 
 
 def _read_text(path):
-    """Return (text, skip_reason). Exactly one of the two is None.
+    """Return (text, warning, skip_kind). `skip_kind` is None iff text is not.
 
     Binary files are out of scope. A NUL byte is the crude-but-reliable marker
     (what the JavaScript copy used); an undecodable byte is the other (what the
     Python copy used). Honouring BOTH keeps the merged checker a superset of the
     two it replaces rather than a compromise between them.
 
-    An UNREADABLE file is reported rather than dropped. Binary and non-UTF-8 are
-    ordinary, expected skips; a tracked path the checker cannot open at all
-    (a dangling symlink, a permission problem) is a hole in coverage, and a hole
-    nobody is told about is where a leak sits unnoticed. `_emit` turns the
-    reason into a `::warning::`.
+    Every route out of here is COUNTED by `run_checks` and reported, because a
+    file the scan declined to read is a hole in coverage whichever route it took
+    (see README "Everything the scan declines to look at leaves a trace"). The
+    two ordinary ones — binary and non-UTF-8 — are a per-run count only, so they
+    do not bury the two that name a specific file with a `::warning::`:
+
+    * UNREADABLE — a permission problem, a vanished path. A tracked path the
+      checker cannot open at all is worth naming.
+    * NOT A REGULAR FILE — a symlink, FIFO, socket or device node. `open()`
+      FOLLOWS a symlink, so scanning one reads whatever it points at rather
+      than the link target string git actually stores in the blob: a link out
+      of the repo would pull arbitrary runner content into a public run log
+      (category-2 findings echo the whole matched line), and a link to
+      `/dev/zero` or a FIFO would turn the read below into an OOM or a hang.
+      `os.lstat` answers this WITHOUT following, so the decision is made on
+      the entry git actually tracks rather than on whatever it points at.
+
+    A regular file larger than `MAX_FILE_BYTES` is scanned up to the cap and the
+    truncation is warned about, rather than skipped outright — most of a large
+    file is still worth checking, and the unread tail is named.
     """
+    unreadable = "unreadable, so it was NOT scanned: {}"
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        return None, unreadable.format(exc.strerror or exc), "unreadable"
+    if not stat.S_ISREG(st.st_mode):
+        return (
+            None,
+            "is not a regular file (symlink, FIFO, socket or device node), so "
+            "it was NOT scanned: reading it would follow the link or block on "
+            "the device rather than read anything this repo stores",
+            "not a regular file",
+        )
     try:
         with open(path, "rb") as fh:
-            data = fh.read()
+            # One byte past the cap, so "exactly at the cap" is not misreported
+            # as truncated.
+            data = fh.read(MAX_FILE_BYTES + 1)
     except OSError as exc:
-        return None, f"unreadable, so it was NOT scanned: {exc.strerror or exc}"
+        return None, unreadable.format(exc.strerror or exc), "unreadable"
+
+    truncated = len(data) > MAX_FILE_BYTES
+    if truncated:
+        data = data[:MAX_FILE_BYTES]
     if b"\x00" in data:
-        return None, None  # binary
+        return None, None, "binary"
     try:
-        return data.decode("utf-8"), None
-    except UnicodeDecodeError:
-        return None, None  # not UTF-8 text
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        if not truncated:
+            return None, None, "non-UTF-8"
+        # The cap can land mid-codepoint. Dropping the partial tail beats
+        # reporting a perfectly ordinary large text file as non-UTF-8 and
+        # scanning none of it.
+        try:
+            text = data[: exc.start].decode("utf-8")
+        except UnicodeDecodeError:
+            return None, None, "non-UTF-8"
+
+    warning = None
+    if truncated:
+        warning = (
+            f"is larger than {MAX_FILE_BYTES} bytes; only the first "
+            f"{MAX_FILE_BYTES} were scanned"
+        )
+    return text, warning, None
 
 
 def check_file(root, rel, ticket_allowlist):
-    """Return (findings, skip_reason) for one tracked file, in report order."""
+    """Return (findings, warning, skip_kind) for one file, in report order."""
     findings = []
-    text, skipped = _read_text(os.path.join(root, rel))
+    text, warning, skip_kind = _read_text(os.path.join(root, rel))
     if text is None:
-        return findings, skipped
+        return findings, warning, skip_kind
 
     for lineno, line in enumerate(text.splitlines(), start=1):
         for match in TICKET_RE.finditer(line):
@@ -316,54 +388,73 @@ def check_file(root, rel, ticket_allowlist):
                     "reference"
                 )
 
-    return findings, None
+    return findings, warning, None
 
 
 def run_checks(root, excludes=(), extra_ticket_allow=()):
-    """Scan `root`, returning (findings, exclusion_counts, warnings).
+    """Scan `root`, returning a `ScanResult`.
 
-    `exclusion_counts` is [(pattern, files_skipped)] in the caller's order,
-    INCLUDING patterns that skipped nothing -- a typo'd exclusion that matches
-    no file has to be visible in the log, not silently inert. The built-in
-    SCRIPT_CHECKOUT_DIR skip is appended only when it actually skipped
-    something, so it costs a log line only when it matters.
+    `exclusions` is [(pattern, files_skipped)] in the caller's order, INCLUDING
+    patterns that skipped nothing -- a typo'd exclusion that matches no file has
+    to be visible in the log, not silently inert. `skipped` is the same
+    accounting for the files the reader itself declined, [(kind, count)]. Both
+    exist for one reason: `scanned` is the number of files this run actually
+    read, and every file that is tracked but not in it has to be attributable to
+    a named reason.
     """
     excludes = [_normalize_exclude(p) for p in excludes]
     # Additive, never a replacement: a caller can name extra acronyms, it can
     # never drop a built-in one.
     ticket_allowlist = TICKET_ALLOWLIST | {a.upper() for a in extra_ticket_allow}
 
+    tracked = tracked_files(root)
+    reserved = [r for r in tracked if _is_excluded(r, (SCRIPT_CHECKOUT_DIR,))]
+    if reserved:
+        raise ConfigError(
+            f"the repo tracks {len(reserved)} file(s) under "
+            f"'{SCRIPT_CHECKOUT_DIR}' (first: '{reserved[0]}'), which is a "
+            f"RESERVED path: the reusable workflow checks the hygiene checker "
+            f"out there inside your workspace, so that checkout -- not your "
+            f"content -- is what sits at that path by the time the scan runs, "
+            f"and nothing tracked beneath it can be examined. Rename the "
+            f"directory. Scanning it as if it were yours would fail every run "
+            f"on THIS repo's own ticket ids; skipping it would leave a path "
+            f"any PR could park an internal reference in and stay green."
+        )
+
     counts = {p: 0 for p in excludes}
-    builtin_skipped = 0
+    skipped = collections.Counter()
     findings, warnings = [], []
     scanned = 0
-    for rel in tracked_files(root):
-        if _is_excluded(rel, (SCRIPT_CHECKOUT_DIR,)) is not None:
-            builtin_skipped += 1
-            continue
+    for rel in tracked:
         hit = _is_excluded(rel, excludes)
         if hit is not None:
             counts[hit] += 1
             continue
-        scanned += 1
-        found, skipped = check_file(root, rel, ticket_allowlist)
+        found, warning, skip_kind = check_file(root, rel, ticket_allowlist)
         findings.extend(found)
-        if skipped:
-            warnings.append(f"{rel}: {skipped}")
+        if warning:
+            warnings.append(f"{rel}: {warning}")
+        if skip_kind is None:
+            scanned += 1
+        else:
+            skipped[skip_kind] += 1
 
     exclusions = [(p, counts[p]) for p in excludes]
-    if builtin_skipped:
-        exclusions.append((SCRIPT_CHECKOUT_DIR, builtin_skipped))
     if scanned == 0:
         # "Nothing to scan" is never the same as "clean". A repo whose every
         # tracked file was excluded, or that has no tracked files at all,
-        # produces a green run that proves nothing -- say so out loud.
+        # produces a green run that proves nothing -- say so out loud, and (in
+        # `_emit`) exit 2 rather than 0, exactly as the non-git-root case does.
         warnings.append(
-            "no files were scanned at all (nothing tracked, or everything "
-            "excluded) -- this run proves nothing about the repo"
+            "no files were scanned at all (nothing tracked, everything "
+            "excluded, or nothing readable as text) -- this run proves "
+            "nothing about the repo"
         )
 
-    return findings, exclusions, warnings
+    return ScanResult(
+        findings, exclusions, warnings, sorted(skipped.items()), scanned
+    )
 
 
 def _esc_cmd(text):
@@ -387,24 +478,44 @@ def _esc_cmd(text):
     return out.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 
-def _emit(findings, exclusions=(), warnings=()):
+def _emit(result):
     """Print human lines plus Actions annotations, and return the exit code."""
-    for pattern, count in exclusions:
+    for pattern, count in result.exclusions:
         line = f"EXCLUDED: {count} file(s) matched {_esc_cmd(pattern)!r}"
         print(line)
         print(f"::notice::public-repo-hygiene: {line}")
 
-    for w in warnings:
+    # Binary and non-UTF-8 files are ordinary skips, so they are a per-run count
+    # rather than a warning each -- but a count they must have. Silent, they hide
+    # a whole file behind one stray byte while it still renders as text on
+    # GitHub, and `scanned` above would have no way to say so.
+    for kind, count in result.skipped:
+        line = f"NOT SCANNED: {count} file(s) skipped as {_esc_cmd(kind)}"
+        print(line)
+        print(f"::notice::public-repo-hygiene: {line}")
+    print(f"SCANNED: {result.scanned} file(s) read as text")
+
+    for w in result.warnings:
         w = _esc_cmd(w)
         print(f"WARN: {w}")
         print(f"::warning::public-repo-hygiene: {w}")
 
-    if not findings:
+    if result.scanned == 0:
+        # Green here would make the root-exclusion rejection one spelling away
+        # from pointless: a caller that names every top-level directory in
+        # `exclude_paths` disables the whole scan without ever naming the root.
+        print(
+            "\nResult: nothing was scanned, so this run proves nothing about "
+            "the repo. Treated as a configuration failure, not a pass."
+        )
+        return 2
+
+    if not result.findings:
         print("\nResult: no internal-only references found.")
         return 0
 
     print("\nERROR: possible internal-only references found in this public repo:\n")
-    for finding in findings:
+    for finding in result.findings:
         escaped = _esc_cmd(finding)
         print(f"  {escaped}")
         print(f"::error::public-repo-hygiene: {escaped}")
@@ -417,7 +528,7 @@ def _emit(findings, exclusions=(), warnings=()):
         "allowlist is org-wide and deliberately not editable from a caller "
         "repo."
     )
-    print(f"\nResult: {len(findings)} internal-only reference(s) found.")
+    print(f"\nResult: {len(result.findings)} internal-only reference(s) found.")
     return 1
 
 
@@ -467,7 +578,7 @@ def main(argv=None):
     print()
 
     try:
-        findings, exclusions, warnings = run_checks(args.root, excludes, ticket_allow)
+        result = run_checks(args.root, excludes, ticket_allow)
     except ConfigError as exc:
         msg = _esc_cmd(exc)
         print(f"FAIL: {msg}")
@@ -475,7 +586,7 @@ def main(argv=None):
         print("\nResult: invalid configuration.")
         return 2
 
-    return _emit(findings, exclusions, warnings)
+    return _emit(result)
 
 
 if __name__ == "__main__":

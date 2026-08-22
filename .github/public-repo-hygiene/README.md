@@ -19,18 +19,34 @@ false positive is a one-line list edit instead of a mystery.
 
 Only **tracked** files are scanned (`git ls-files -z`), so build output, `node_modules` and
 anything untracked is out of scope by construction. Binary files are skipped (a NUL byte or an
-undecodable UTF-8 sequence).
+undecodable UTF-8 sequence), and only **regular** files are opened at all: `open()` follows a
+symlink, so scanning one would read whatever it points *at* rather than the link target git
+actually stores — a link out of the repo pulls arbitrary runner content into a public run log, and
+one to `/dev/zero` or a FIFO turns the read into an OOM or a hang. A regular file is read up to
+`MAX_FILE_BYTES` (5 MiB) and no further.
 
 Everything the scan declines to look at leaves a trace, because a guard that silently skips
 something is worse than no guard — the green run reads as coverage:
 
+- every run prints `SCANNED: <n> file(s) read as text` — the number the rest of this list has to
+  account for;
 - an exclusion is logged with its skipped-file count, **including one that skipped nothing**;
-- a tracked file that cannot be *opened* (a dangling symlink, a permission problem) is a
-  `::warning::` naming it, not a silent drop — unlike binary/non-UTF-8, which are expected;
-- a run that scanned **zero** files (nothing tracked, or everything excluded) says so, rather
-  than reporting a clean repo;
+- a file that cannot be *read* (a permission problem) or that is *not a regular file* (a symlink,
+  FIFO, socket or device node) is a `::warning::` naming it, not a silent drop;
+- binary and non-UTF-8 files are expected skips, so they are a per-run `NOT SCANNED: <n>` count
+  rather than a warning each — a count they must have, because one stray byte otherwise hides a
+  whole file that still renders as text on GitHub;
+- a file larger than the read cap is scanned up to it and the unread tail is a `::warning::`
+  naming the file — truncated loudly, never dropped;
+- a run that read **zero** files (nothing tracked, everything excluded, or nothing readable as
+  text) **exits 2**, not 0. Rejecting a root-wide exclusion would otherwise be one spelling away
+  from pointless: naming each top-level directory in `exclude_paths` disables the whole scan
+  without ever naming the root;
 - `_public_repo_hygiene/` — where the workflow checks this repo out inside the caller's
-  workspace — is always skipped, and reported when it actually matched something.
+  workspace — is a **reserved** path. The checkout lands untracked, so an ordinary run never meets
+  it; a caller that *tracks* content there fails with exit 2 and is told to rename the directory,
+  because that content is shadowed by the checkout and can never be examined. Skipping it quietly
+  is how the reserved path would have become a parking spot that ships green.
 
 ## Why the allowlist lives here (BE-8654)
 
@@ -57,6 +73,7 @@ is the entire point of default-deny, and what makes this shareable at all.
 | Knob | Where it lives | Can a PR in the caller repo change it? |
 |---|---|---|
 | `PUBLIC_COMFY_ORG_REPOS` / `PUBLIC_COMFY_ORG_TEAMS` | this file, pinned by `workflows_ref` | **No.** Not an input in any form. An allowlist a caller can pass is an allowlist a PR in the caller repo can widen. |
+| Which commit `workflows_ref` loads | the caller's workflow file | **No, in practice.** A `pull_request` caller runs its workflow file from the PR head, so a PR *can* edit `workflows_ref:` — which is why the workflow fails the run unless it is a full 40-hex SHA **equal to `job.workflow_sha`**, the commit the `uses:` pin resolved to. Pointing it at a `refs/pull/*` ref of this repo would otherwise run the PR author's own checker and report green. |
 | Detection regexes | this file, pinned by `workflows_ref` | **No.** |
 | `ticket_allowlist:` | the caller's workflow file | Yes — but it is **additive** (it can add an acronym, never drop a built-in one) and it reaches category 1 only. |
 | `exclude_paths:` | the caller's workflow file | Yes — it drops files from the scan. It cannot widen a category, a value naming the repo root is rejected outright, and every entry is echoed to the run log with its skipped-file count *including one that skipped nothing*. |
@@ -97,8 +114,9 @@ python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root . \
 python3 -m unittest discover -s .github/public-repo-hygiene/tests -p 'test_*.py' -v
 ```
 
-Exit codes: `0` clean, `1` findings, `2` bad configuration (an unusable `--exclude`, or a root
-that is not a git work tree — "nothing to scan" must never read as "clean").
+Exit codes: `0` clean, `1` findings, `2` the run proves nothing — an unusable `--exclude`, a root
+that is not a git work tree, tracked content at the reserved `_public_repo_hygiene/` path, or a
+scan that read zero files. "Nothing to scan" must never read as "clean".
 
 ## Adding a repo to the allowlist
 

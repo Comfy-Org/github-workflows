@@ -65,7 +65,7 @@ contents: read
 |---|---|---|
 | `ticket_allowlist` | `''` | Newline- or comma-separated acronyms that look like ticket IDs but are not (`GPU-100`, a SKU, a spec number). **Additive** on the built-in list — you can extend it, never shrink it. Matched case-insensitively. |
 | `exclude_paths` | `''` | Newline- or comma-separated tracked paths to skip. `src/generated/` (trailing slash) excludes that subtree; `scripts/thing.py` excludes that exact file. A value naming the repo root (`/`, `.`) is rejected and the run fails. Every entry is reported in the log with its skipped-file count, including one that skipped nothing. |
-| `workflows_ref` | — (**required**) | Pin to the SAME full commit SHA as `uses:`. No default on purpose; the run fails fast (`Require a pinned workflows_ref` step) if omitted or empty. The checker script — and the allowlist — load from this ref. |
+| `workflows_ref` | — (**required**) | Pin to the SAME full commit SHA as `uses:`. No default on purpose, and the `Require a pinned workflows_ref` step FAILS the run — not warns — when it is empty, is not a full 40-hex SHA, or names a different commit than `uses:` (cross-checked against `job.workflow_sha`). The checker script — and the allowlist — load from this ref, so anything short of that would let a PR pick which checker judges it. |
 
 Note what is **not** an input: the known-public repo and team allowlists. An allowlist a caller
 can pass is an allowlist a PR in the caller repo can widen, which is the hole this workflow
@@ -97,8 +97,16 @@ scripts this replaces and documented in
 it by rephrasing, or by excluding the file, until it is fixed.
 
 **A skip is always visible.** An exclusion is logged with its file count even when it matched
-nothing, an unreadable tracked file becomes a `::warning::`, and a run that scanned zero files
-says so instead of reporting clean. If you see one of those, the run did less than it looks like.
+nothing; an unreadable file or a symlink becomes a `::warning::` naming it; binary and non-UTF-8
+files get a per-run `NOT SCANNED:` count; and every run prints `SCANNED: <n> file(s) read as
+text`. A run that read **zero** files exits **2**, not 0 — enumerating every top-level directory
+in `exclude_paths` disables the whole scan, and a green "clean" there would prove nothing. If you
+see one of those lines, the run did less than it looks like.
+
+**`_public_repo_hygiene/` is a reserved path.** That is where the workflow checks the checker out
+inside your workspace. It normally lands untracked, so you will never meet this — but if your repo
+*tracks* anything at that path, the run fails with exit 2 telling you to rename the directory.
+Tracked content there is shadowed by the checkout and could never be scanned.
 
 **Findings quote the offending line into the run log.** On a public repo that line is already in
 the public diff, so this adds no exposure — but if you enable this on a *private* repo, note that
