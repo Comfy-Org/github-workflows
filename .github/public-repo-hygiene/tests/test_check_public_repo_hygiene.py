@@ -180,13 +180,23 @@ class InternalMarkerCategoryTest(CheckerTestCase):
         )
         self.assertEqual(self.findings(), [])
 
+    # Neighbouring REGISTRABLE domains -- anyone can buy these, which is what
+    # makes flagging them a leak-report someone has to triage.
     LOOKALIKE_HOSTS = (
         "https://fooslack.com/archives/x",
         "https://evil-posthog.com/project/1",
         "https://my-linear.app/x",
-        "https://mydocs.google.com/doc/1",
         "https://foonotion.so/page",
         "https://app.slack.com.evil.com/",
+    )
+    # Same-namespace neighbours of the four subdomain-led patterns. Only Google
+    # can create `*.google.com`, so these are not third-party lookalikes and
+    # pin something narrower: the left anchor drops a host inside the SAME
+    # registrable domain, not just a neighbouring one. (BE-8729 review.)
+    SAME_NAMESPACE_HOSTS = (
+        "https://mydocs.google.com/doc/1",
+        "https://xdrive.google.com/file/d/abc",
+        "https://myapp.datadoghq.com/dash",
     )
 
     def test_lookalike_hosts_are_not_flagged(self):
@@ -201,7 +211,7 @@ class InternalMarkerCategoryTest(CheckerTestCase):
         # `notlinear.app` is deliberately absent -- `t`->`l` puts a word
         # character where `\blinear` needed a boundary, so it never matched
         # even before the fix and would pin nothing.
-        for marker in self.LOOKALIKE_HOSTS:
+        for marker in self.LOOKALIKE_HOSTS + self.SAME_NAMESPACE_HOSTS:
             with self.subTest(marker=marker):
                 repo = RepoFixture()
                 self.addCleanup(repo.cleanup)
@@ -230,6 +240,94 @@ class InternalMarkerCategoryTest(CheckerTestCase):
                 ]
                 self.assertGreaterEqual(len(findings), 1, f"{marker}: {findings}")
 
+    def test_an_empty_port_does_not_bypass_the_check(self):
+        # `port = *DIGIT` in RFC 3986, so `https://notion.so:/page` is a valid
+        # URL whose host is `notion.so` -- an empty port just means the default.
+        # `(?::\d+)?` could not match the bare colon and then could not match
+        # the required `/` either, which is the same one-token bypass `:443`
+        # was. (BE-8729 review.)
+        for marker in (
+            "https://notion.so:/page",
+            "https://docs.google.com:/document/d/abc",
+            "https://comfy.slack.com:/archives/C123",
+        ):
+            with self.subTest(marker=marker):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write("notes.md", marker + "\n")
+                findings = [
+                    f
+                    for f in checker.run_checks(repo.root).findings
+                    if "collaboration-tool marker" in f
+                ]
+                self.assertGreaterEqual(len(findings), 1, f"{marker}: {findings}")
+
+    def test_a_port_does_not_let_a_suffix_host_backtrack_past_the_anchor(self):
+        # The host-only pattern's right anchor has to survive BACKTRACKING.
+        # `_PORT` is optional, so on `app.slack.com:443.evil.com` the greedy
+        # `:443` makes the lookahead fail on `.evil`, the port group retries
+        # empty, and a lookahead that only rejected `\.?[A-Za-z0-9-]` then
+        # passed on `:` -- flagging the lookalike the anchor exists to reject.
+        # (BE-8729 review.)
+        for marker in (
+            "https://app.slack.com:443.evil.com/x",
+            "https://app.slack.com:8443.evil.com",
+        ):
+            with self.subTest(marker=marker):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write("notes.md", marker + "\n")
+                self.assertEqual(checker.run_checks(repo.root).findings, [])
+
+    def test_unicode_case_folding_does_not_read_a_homoglyph_as_the_real_host(self):
+        # `re.IGNORECASE` on its own folds Unicode: Python matches U+0131 and
+        # U+0130 against `i`, U+017F against `s` and U+212A against `k`, so
+        # these different registrable domains read as the real hosts and were
+        # flagged. `re.ASCII` on the category-2 patterns closes it, the same
+        # way `REPO_REF_RE` scopes its ignore-case flag. (BE-8729 review.)
+        for marker in (
+            "https://l\u0131near.app/x",
+            "https://\u017flack.com/archives/C123",
+            "https://not\u0130on.so/page",
+        ):
+            with self.subTest(marker=marker):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write("notes.md", marker + "\n")
+                self.assertEqual(checker.run_checks(repo.root).findings, [])
+
+    def test_an_idn_neighbour_still_reports_as_the_real_host(self):
+        # A KNOWN LIMITATION, pinned so changing it is deliberate. The left
+        # anchor is ASCII, so `énotion.so` clears it and reports as
+        # `notion.so`. The blunt fix -- a second lookbehind rejecting any
+        # non-ASCII character -- would also silence a real link written after a
+        # curly quote, an em dash or CJK prose, and a missed leak costs more
+        # than an extra finding. See README "Known limitations".
+        repo = RepoFixture()
+        self.addCleanup(repo.cleanup)
+        repo.write("notes.md", "https://\u00e9notion.so/page\n")
+        findings = [
+            f
+            for f in checker.run_checks(repo.root).findings
+            if "collaboration-tool marker" in f
+        ]
+        self.assertEqual(len(findings), 1, findings)
+
+    def test_the_host_only_pattern_tolerates_a_trailing_root_label(self):
+        # The README scopes the trailing-root-label limitation to the
+        # `/`-requiring patterns, because this one does NOT share it: its right
+        # anchor rejects a following LABEL, and `.` followed by `/` is not one.
+        # (BE-8729 review.)
+        repo = RepoFixture()
+        self.addCleanup(repo.cleanup)
+        repo.write("notes.md", "https://app.slack.com./x\n")
+        findings = [
+            f
+            for f in checker.run_checks(repo.root).findings
+            if "collaboration-tool marker" in f
+        ]
+        self.assertGreaterEqual(len(findings), 1, findings)
+
     def test_the_host_only_pattern_still_ends_on_punctuation_or_a_port(self):
         # The right anchor replacing `\b` on `app.slack.com` is
         # `(?!\.?[A-Za-z0-9-])`, which has to reject a following LABEL without
@@ -238,6 +336,9 @@ class InternalMarkerCategoryTest(CheckerTestCase):
             "Ask in app.slack.com.",
             "Ask in app.slack.com:443 if you self-host.",
             "https://app.slack.com",
+            # The `|:` added for the backtracking case must not cost this one:
+            # `\d*` lets `_PORT` swallow the prose colon itself.
+            "Ask in app.slack.com: the #general channel.",
         ):
             with self.subTest(marker=marker):
                 repo = RepoFixture()

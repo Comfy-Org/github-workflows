@@ -110,22 +110,48 @@ TICKET_ALLOWED_PREFIXES = frozenset(
 # matched inside `evil-posthog.com` -- and half these patterns had no left
 # anchor at all. Do NOT "tighten" this to `(?<![A-Za-z0-9.-])`: barring a
 # preceding dot rejects every subdomain-prefixed positive the fixtures pin.
+#
+# The class is ASCII, so an IDN neighbour still clears it and `énotion.so/x` is
+# reported as `notion.so`. That is left alone deliberately: the blunt fix, a
+# second lookbehind rejecting any non-ASCII character, silences a REAL link
+# written after a curly quote, an em dash or CJK prose (`“notion.so/page`), and
+# a false negative costs more than a false positive in a leak guard. Documented
+# as a limitation in the README instead. (BE-8729 review.)
 _HOST_L = r"(?<![A-Za-z0-9-])"
 # An explicit port sits between the host and the path, so a pattern that
-# requires `/` straight after the host is bypassed by `notion.so:443/`.
-_PORT = r"(?::\d+)?"
+# requires `/` straight after the host is bypassed by `notion.so:443/`. The
+# digits are `*`, not `+`: `port = *DIGIT` in RFC 3986, so `https://notion.so:/x`
+# is a valid URL whose host is still `notion.so` (an empty port means the
+# default) -- and it was the same one-token bypass `:443` was. (BE-8729 review.)
+_PORT = r"(?::\d*)?"
+# ASCII on both counts. `re.IGNORECASE` alone folds Unicode: Python matches
+# U+0131/U+0130 against `i` and U+017F/U+212A against `s`/`k`, so `lınear.app/x`
+# and `ſlack.com/archives/x` -- different registrable domains, reachable by
+# anyone -- read as the real hosts and were flagged. That is the same widening
+# `REPO_REF_RE` below scopes its flag to avoid. `re.ASCII` also pins `_PORT`'s
+# `\d` to `[0-9]`, which is all a real port can be -- the price is that a
+# port typed in another script's digits no longer clears the pattern, which
+# is not a URL any client resolves. (BE-8729 review.)
+_HOST_FLAGS = re.IGNORECASE | re.ASCII
 INTERNAL_MARKER_RES = (
-    re.compile(_HOST_L + r"notion\.(so|site)" + _PORT + "/", re.IGNORECASE),
-    re.compile(_HOST_L + r"slack\.com" + _PORT + "/(archives|client)/", re.IGNORECASE),
+    re.compile(_HOST_L + r"notion\.(so|site)" + _PORT + "/", _HOST_FLAGS),
+    re.compile(_HOST_L + r"slack\.com" + _PORT + "/(archives|client)/", _HOST_FLAGS),
     # The one host-only pattern, so it needs a right anchor of its own. `\b`
     # accepted `app.slack.com.evil.com`; this rejects a following label while
-    # still allowing a sentence-final period, a port and end of line.
-    re.compile(_HOST_L + r"app\.slack\.com" + _PORT + r"(?!\.?[A-Za-z0-9-])", re.IGNORECASE),
-    re.compile(_HOST_L + r"docs\.google\.com" + _PORT + "/", re.IGNORECASE),
-    re.compile(_HOST_L + r"drive\.google\.com" + _PORT + "/", re.IGNORECASE),
-    re.compile(_HOST_L + r"app\.datadoghq\.com" + _PORT + "/", re.IGNORECASE),
-    re.compile(_HOST_L + r"posthog\.com" + _PORT + "/project/", re.IGNORECASE),
-    re.compile(_HOST_L + r"linear\.app" + _PORT + "/", re.IGNORECASE),
+    # still allowing a sentence-final period, a port and end of line. The `|:`
+    # is load-bearing: `_PORT` is optional, so without it the engine backtracks
+    # -- on `app.slack.com:443.evil.com` the greedy `:443` makes the lookahead
+    # fail on `.evil`, the port retries empty, and the lookahead then passes on
+    # `:`, flagging the lookalike after all. Rejecting a bare `:` kills that
+    # path without costing the real one, because `\d*` lets `_PORT` swallow a
+    # prose colon (`app.slack.com: our workspace`) itself. (BE-8729 review.)
+    re.compile(_HOST_L + r"app\.slack\.com" + _PORT + r"(?!\.?[A-Za-z0-9-]|:)", _HOST_FLAGS),
+    re.compile(_HOST_L + r"docs\.google\.com" + _PORT + "/", _HOST_FLAGS),
+    re.compile(_HOST_L + r"drive\.google\.com" + _PORT + "/", _HOST_FLAGS),
+    re.compile(_HOST_L + r"app\.datadoghq\.com" + _PORT + "/", _HOST_FLAGS),
+    re.compile(_HOST_L + r"posthog\.com" + _PORT + "/project/", _HOST_FLAGS),
+    re.compile(_HOST_L + r"linear\.app" + _PORT + "/", _HOST_FLAGS),
+    # Not a host, so it keeps default (Unicode) semantics and its own `\b`.
     re.compile(r"\bincident-\d+\b", re.IGNORECASE),
 )
 

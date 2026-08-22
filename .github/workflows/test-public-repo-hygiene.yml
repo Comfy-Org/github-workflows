@@ -64,8 +64,12 @@ jobs:
           printf 'Owned by @Comfy-Org/Comfy-Cloud-Team.\n' > "$root/OWNERS.md"
           # BE-8729: lookalike third-party hosts. `\b` is not a host boundary,
           # so `evil-posthog.com` and friends used to be category-2 findings;
-          # only a dot in front is a real subdomain edge.
+          # only a dot in front is a real subdomain edge. The last two are the
+          # review follow-ups: a suffix host that used to sneak back in by
+          # backtracking past the optional port, and a homoglyph domain that
+          # Unicode case-folding read as the real one.
           printf 'Unrelated: https://fooslack.com/archives/x https://evil-posthog.com/project/1\n' > "$root/LOOKALIKES.md"
+          printf 'Also unrelated: https://app.slack.com:443.evil.com/x https://lınear.app/x\n' >> "$root/LOOKALIKES.md"
           printf '* @Comfy-Org/comfy-cloud-team\n' > "$root/CODEOWNERS"
           git -C "$root" add -A
           python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root"
@@ -122,6 +126,11 @@ jobs:
           # away from silence.
           check_one 'ported internal link' \
             'dashboard https://app.datadoghq.com:8443/dash/1' \
+            'internal collaboration-tool marker'
+          # ...and `port = *DIGIT`, so the empty port is a valid URL for the
+          # same host and was the same one-token bypass.
+          check_one 'empty-port internal link' \
+            'notes https://notion.so:/team/page' \
             'internal collaboration-tool marker'
 
       # ── The acceptance criterion this whole workflow exists for ────────────
