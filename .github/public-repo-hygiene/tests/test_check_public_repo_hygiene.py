@@ -19,6 +19,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 
@@ -267,13 +268,14 @@ class InternalMarkerCategoryTest(CheckerTestCase):
                 ]
                 self.assertGreaterEqual(len(findings), 1, f"{marker}: {findings}")
 
-    def test_a_port_does_not_let_a_suffix_host_backtrack_past_the_anchor(self):
-        # The host-only pattern's right anchor has to survive BACKTRACKING.
-        # `_PORT` is optional, so on `app.slack.com:443.evil.com` the greedy
-        # `:443` makes the lookahead fail on `.evil`, the port group retries
-        # empty, and a lookahead that only rejected `\.?[A-Za-z0-9-]` then
-        # passed on `:` -- flagging the lookalike the anchor exists to reject.
-        # (BE-8729 review.)
+    def test_a_port_followed_by_a_suffix_host_is_rejected(self):
+        # `app.slack.com:443.evil.com` resolves to `evil.com`, so the anchor
+        # has to reject it. It is NOT rejected by backtracking any more: the
+        # host-only pattern stopped consuming `_PORT` (round 3), so there is no
+        # optional port group left to hand digits back, and the
+        # `:\d+\.[A-Za-z0-9-]` alternative rejects this shape outright.
+        # Do not "restore" the port group to explain this test -- shedding it
+        # is the entire point of that round. (BE-8729 review, rounds 3 and 4.)
         for marker in (
             "https://app.slack.com:443.evil.com/x",
             "https://app.slack.com:8443.evil.com",
@@ -394,10 +396,15 @@ class InternalMarkerCategoryTest(CheckerTestCase):
 
     def test_the_host_only_pattern_still_ends_on_punctuation_or_a_port(self):
         # The right anchor replacing `\b` on `app.slack.com` is
-        # `(?!\.?[A-Za-z0-9-]|:\d|@)`, which has to reject a following LABEL,
-        # a port that turns out to be a suffix host, and the userinfo
-        # delimiter -- without rejecting ordinary punctuation, a real port, or
-        # end of line.
+        # `(?!\.?[A-Za-z0-9-]|:\d+\.[A-Za-z0-9-]|@|[.:][A-Za-z0-9._~%:-]{0,64}@)`,
+        # which has to reject a following LABEL, a port that turns out to be a
+        # suffix host, and the userinfo family -- without rejecting ordinary
+        # punctuation, a real port, or end of line. Quote it in full when it
+        # changes: an earlier revision of this comment still read `:\d`, the
+        # one alternative round 3 REMOVED because it lost `app.slack.com:2FA`,
+        # which the case list below pins as must-match. A stale quote here
+        # points the next editor at a regression its own test data forbids.
+        # (BE-8729 review, round 4.)
         for marker in (
             "Ask in app.slack.com.",
             "Ask in app.slack.com:443 if you self-host.",
@@ -424,6 +431,103 @@ class InternalMarkerCategoryTest(CheckerTestCase):
                     if "collaboration-tool marker" in f
                 ]
                 self.assertEqual(len(findings), 1, f"{marker}: {findings}")
+
+    def test_the_userinfo_run_does_not_reach_across_prose_to_a_later_at(self):
+        # The userinfo alternative is `[.:][A-Za-z0-9._~%:-]{0,64}@`, and the
+        # CLASS is what keeps it honest. The first cut was `[.:][^\s/?#@]*@`,
+        # "anything but a URL delimiter", which crossed commas, quotes and
+        # braces -- so any unrelated `@` later in the same non-whitespace run
+        # satisfied the lookahead and silenced a REAL reference. Every line
+        # here matched the pre-PR `\bapp\.slack\.com\b` and must keep matching:
+        # a miss is the one direction this guard cannot afford.
+        for marker in (
+            # A comma is not a credential character; the address is separate.
+            "app.slack.com:443,ops@example.com",
+            # JSON: `"` closed the run, but the old class walked straight past
+            # it into an entirely different field's value.
+            '{"slack":"app.slack.com:443","owner":"bob@example.com"}',
+            # The shape the stop is SUPPOSED to keep matching, and the one the
+            # round-3 suite left unpinned -- `/` ends the authority, so the
+            # `@` in the query string is not userinfo and the real host here
+            # really is `app.slack.com`. Without a case, a "simplification"
+            # back to `[.:]\S*@` would pass the whole suite.
+            "https://app.slack.com:443/ssb/redirect?to=bob@x.com",
+            # A non-breaking space is not whitespace under `re.ASCII`, so the
+            # old `[^\s/?#@]*` crossed it too. The class excludes it outright.
+            "app.slack.com:443\u00a0ops@example.com",
+        ):
+            with self.subTest(marker=marker):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write("notes.md", marker + "\n")
+                findings = [
+                    f
+                    for f in checker.run_checks(repo.root).findings
+                    if "collaboration-tool marker" in f
+                ]
+                self.assertEqual(len(findings), 1, f"{marker}: {findings}")
+
+    def test_a_dotted_number_after_the_colon_is_a_known_miss(self):
+        # Pinning a MISS, not an achievement. `:\d+\.[A-Za-z0-9-]` cannot tell
+        # a port-then-suffix-host (`:443.evil.com`) from a dotted version in
+        # prose (`:2.5`), because a digit-leading DNS label is legal, so both
+        # are colon-digits-dot-label. Requiring a letter after the dot would
+        # recover these two and reopen `app.slack.com:443.1evil.com` -- one
+        # miss traded for another, in the direction that flags LESS.
+        # Documented in the README's "Known limitations" and beside the
+        # pattern. If a future round finds a discriminator, delete this test;
+        # until then it stops the behaviour drifting unnoticed in either
+        # direction. (BE-8729 review, round 4.)
+        for marker in (
+            "See app.slack.com:2.5 release notes",
+            "See app.slack.com:1.0.1 release notes",
+        ):
+            with self.subTest(marker=marker):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write("notes.md", marker + "\n")
+                findings = [
+                    f
+                    for f in checker.run_checks(repo.root).findings
+                    if "collaboration-tool marker" in f
+                ]
+                self.assertEqual(findings, [], f"{marker}: {findings}")
+
+    def test_the_userinfo_run_is_length_bounded_so_cost_stays_linear(self):
+        # `MAX_FILE_BYTES` bounds a FILE; nothing bounds a LINE. With an
+        # unbounded `[^\s/?#@]*@`, each of the ~L/14 host positions on
+        # `('app.slack.com:' * N) + '@'` rescanned the whole remaining tail
+        # before the lookahead succeeded -- quadratic, ~10^12 character steps
+        # at the 5 MiB cap, so a tracked file could turn a required check into
+        # an unexplained 15-minute job timeout. `{0,64}` caps the per-position
+        # work, which is what makes total cost linear in line length.
+        #
+        # An ABSOLUTE ceiling, not a ratio. A ratio looks tempting but does not
+        # discriminate: quadratic growth is only ~4x per doubling, which is too
+        # close to linear's ~2x to gate on a noisy shared runner -- and the
+        # bounded pattern matches at the first position anyway, so its timings
+        # are sub-millisecond and their ratio is pure noise. The gap in
+        # absolute terms is enormous and is what this asserts: on this input
+        # the bounded pattern finishes in well under a millisecond while the
+        # unbounded one takes ~6s, so the 2s ceiling has ~3x margin below the
+        # regression and several orders of magnitude above the correct
+        # behaviour. A slower runner only pushes the regression further past
+        # the ceiling.
+        pattern = next(
+            p
+            for p in checker.INTERNAL_MARKER_RES
+            if r"app\.slack\.com" in p.pattern
+        )
+        line = ("app.slack.com:" * (200_000 // 14)) + "@"
+        start = time.perf_counter()
+        pattern.search(line)
+        elapsed = time.perf_counter() - start
+        self.assertLess(
+            elapsed,
+            2.0,
+            f"scanning one {len(line)}-character line took {elapsed:.2f}s; "
+            "the userinfo run looks unbounded again (quadratic backtracking)",
+        )
 
 
 class RepoReferenceCategoryTest(CheckerTestCase):

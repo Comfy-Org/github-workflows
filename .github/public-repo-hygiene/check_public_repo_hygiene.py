@@ -169,20 +169,50 @@ INTERNAL_MARKER_RES = (
     #                          continues past the port: `app.slack.com:443.evil.com`.
     #                          The `\.` is required. `:\d` alone also rejected
     #                          `app.slack.com:2FA`, where the colon is prose.
+    #                          Accepted cost: a dotted NUMBER in prose has the
+    #                          same shape, so `app.slack.com:2.5` is a miss.
+    #                          Requiring a letter after the dot would recover it
+    #                          and reopen `app.slack.com:443.1evil.com`, a
+    #                          legal digit-leading label -- a miss for a miss,
+    #                          in the direction that flags less. Pinned by
+    #                          `test_a_dotted_number_after_the_colon_is_a_known_miss`.
     #   `@`                    the userinfo delimiter: in
     #                          `https://app.slack.com@evil.com/` the real host
     #                          is `evil.com`, the canonical phishing shape.
-    #   `[.:][^\s/?#@]*@`       the same thing with userinfo in between --
-    #                          `:@`, `:secret@`, `.@`. Anchored on a leading
-    #                          `.`/`:` and stopped at a URL delimiter so it
-    #                          cannot reach across prose: `app.slack.com,bob@x`
-    #                          and `app.slack.com and email bob@x` still match.
+    #   `[.:][A-Za-z0-9._~%:-]{0,64}@`
+    #                          the same thing with userinfo in between --
+    #                          `:@`, `:secret@`, `.@`. Two bounds, and both are
+    #                          load-bearing (BE-8729 review, round 4):
+    #                            * The CLASS is the userinfo characters a real
+    #                              credential uses (unreserved + `%` + the
+    #                              `user:pass` colon), NOT "anything but a URL
+    #                              delimiter". `[^\s/?#@]*` crossed commas,
+    #                              quotes and braces, so any later `@` on the
+    #                              line silenced the host:
+    #                              `app.slack.com:443,ops@example.com` and
+    #                              `{"slack":"app.slack.com:443","owner":"bob@x"}`
+    #                              both went quiet -- a MISS, the one direction
+    #                              this guard cannot afford. Narrowing a class
+    #                              inside a NEGATIVE lookahead can only ever
+    #                              flag MORE, so it cannot add a miss of its own;
+    #                              the cost is a false positive on a lookalike
+    #                              whose userinfo holds a sub-delim (`:p+w@`),
+    #                              which is a maintainer glance, not a leak.
+    #                            * The LENGTH is bounded because `*` here was
+    #                              quadratic: nothing bounds a LINE (only
+    #                              `MAX_FILE_BYTES` bounds a file), and on
+    #                              `('app.slack.com:' * N) + '@'` each of the
+    #                              ~L/14 host positions rescanned the whole tail
+    #                              -- ~10^12 character steps at the 5 MiB cap,
+    #                              i.e. author-controlled content turning a
+    #                              required check into a mystery 15-minute
+    #                              timeout. Real userinfo is short; 64 is slack.
     # A leading `admin@` is the other direction and is untouched -- `_HOST_L`
-    # only bars a label character. (BE-8729 review, rounds 2 and 3.)
+    # only bars a label character. (BE-8729 review, rounds 2, 3 and 4.)
     re.compile(
         _HOST_L
         + r"app\.slack\.com"
-        + r"(?!\.?[A-Za-z0-9-]|:\d+\.[A-Za-z0-9-]|@|[.:][^\s/?#@]*@)",
+        + r"(?!\.?[A-Za-z0-9-]|:\d+\.[A-Za-z0-9-]|@|[.:][A-Za-z0-9._~%:-]{0,64}@)",
         _HOST_FLAGS,
     ),
     re.compile(_HOST_L + r"docs\.google\.com" + _PORT + "/", _HOST_FLAGS),
