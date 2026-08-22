@@ -312,6 +312,15 @@ PUBLIC_COMFY_ORG_REPOS = frozenset(
         # `Comfy-Org/github-workflows/.github/workflows/...` -- failed the very
         # check it was being added alongside. Verified public.
         "github-workflows",
+        # Adopted the public-repo-hygiene caller in comfy-mcp#254 and hit a
+        # false positive on its own self-references (README, CI comments,
+        # issue templates). Verified public via the GitHub API
+        # (`private: false`).
+        "comfy-mcp",
+        # Referenced from comfy-cli's refresh-cql-catalogs.yml workflow
+        # (comfy-cli#758). Verified public: an unauthenticated
+        # raw.githubusercontent.com fetch of its README returns 200.
+        "comfy-complete",
     }
 )
 # CODEOWNERS team handles (`@Comfy-Org/<team>`) are inherently public on a
