@@ -83,12 +83,12 @@ if [[ "$sub" == "pr" ]]; then
 fi
 [[ "$sub" == "api" ]] || exit 0
 
-method="GET"; path=""; content=""
+method="GET"; path=""; content=""; apijq=""
 args=("$@"); i=0
 while (( i < ${#args[@]} )); do
   case "${args[$i]}" in
     --method) method="${args[$((i+1))]}"; i=$((i+2));;
-    --jq)     i=$((i+2));;
+    --jq)     apijq="${args[$((i+1))]}"; i=$((i+2));;
     --field|-f|-F)
       f="${args[$((i+1))]}"
       [[ "$f" == content=* ]] && content="${f#content=}"
@@ -170,6 +170,19 @@ elif [[ "$path" == *"/git/commits/"* ]]; then
   echo "maintreesha1"
 elif [[ "$path" == *"/git/refs/heads/"* ]]; then
   echo "1234567890abcdef1234567890abcdef12345678"
+elif [[ "$apijq" == *full_name* ]]; then
+  # repos/<repo> asked for `.full_name` — the canonicalization probe. Default to
+  # echoing back the requested name (the no-rename case). STUB_CANONICAL_REPO
+  # overrides it to model a renamed/re-cased repo, and STUB_CANONICAL_GARBAGE
+  # models a response that is NOT an owner/name pair, which the script must
+  # reject rather than adopt as a repo name.
+  if [[ -n "${STUB_CANONICAL_GARBAGE:-}" ]]; then
+    echo "$STUB_CANONICAL_GARBAGE"
+  elif [[ -n "${STUB_CANONICAL_REPO:-}" ]]; then
+    echo "$STUB_CANONICAL_REPO"
+  else
+    echo "${path#repos/}"
+  fi
 else
   echo "main"   # repos/<repo> default_branch
 fi
@@ -303,6 +316,39 @@ check "actions/checkout pin untouched"        "grep -qF 'actions/checkout@abcdef
 # max_prs forwards a workflow_dispatch string (see groom.yml's input docs); the
 # bumper must not mangle the expression while rewriting the pins around it.
 check "max_prs forward expression intact"     "grep -qF \"github.event.inputs.max_prs || '1'\" \"$PUT\""
+
+echo "== a roster entry with a STALE spelling is bumped under GitHub's canonical name =="
+# The 307 bug: a renamed or re-cased repo keeps its old name resolvable via a
+# redirect, `gh` follows it on GET but NOT on POST, so the run read metadata fine
+# and then died at `git/blobs` with `blob create ... failed`. Three cursor-review
+# callers failed every run for days on nothing but stale spellings — two of them
+# differing from canonical only in CASE.
+new_case canonical
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  STUB_CANONICAL_REPO="Comfy-Org/secret-Alpha" \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-alpha","file":".github/workflows/ci-cursor-review.yml","label":""}]'
+check "exit 0"                                  "[[ $RC -eq 0 ]]"
+check "the caller was actually bumped"          "[[ \$(cat \"\$STUB_PUT_DIR/count\") -eq 1 ]]"
+check "warns that the roster spelling is stale" "grep -q 'roster spelling is not GitHub'\\''s canonical name' <<<\"\$OUT\""
+check "masks the canonical spelling too"        "grep -q '::add-mask::Comfy-Org/secret-Alpha' <<<\"\$OUT\""
+
+echo "== a canonical-name probe that is NOT owner/name is IGNORED, not adopted =="
+# Regression guard. The probe reuses `gh api repos/<repo>`, whose other caller
+# asks for `.default_branch` and gets a bare branch name. Anything that answers
+# the probe with a non-owner/name string (a stub, a proxy, a future gh change)
+# must be discarded: adopting it would try to bump a repo literally called
+# `main` AND `::add-mask::` the word "main", redacting an ordinary branch name
+# out of every line of the run.
+new_case canonical_garbage
+STUB_CONTENT_FILE="$CR_FIXTURE" run_bump \
+  STUB_CANONICAL_GARBAGE="main" \
+  VAR_NAME=CURSOR_REVIEW_CALLERS TAG=cursor-review WORKFLOW_FILE=cursor-review.yml \
+  CALLERS_JSON='[{"repo":"Comfy-Org/secret-alpha","file":".github/workflows/ci-cursor-review.yml","label":""}]'
+check "exit 0"                              "[[ $RC -eq 0 ]]"
+check "still bumped under the roster name"  "[[ \$(cat \"\$STUB_PUT_DIR/count\") -eq 1 ]]"
+check "did NOT mask the word main"          "! grep -q '::add-mask::main' <<<\"\$OUT\""
+check "did NOT warn about a stale spelling" "! grep -q 'roster spelling is not' <<<\"\$OUT\""
 
 echo "== cursor-review fleet: an open bump PR is UPDATED IN PLACE, not re-opened (BE-3882) =="
 new_case reuse

@@ -447,6 +447,53 @@ bump_repo() {
     return 1
   }
 
+  # Canonicalize the repo name before any WRITE touches it.
+  #
+  # A renamed or re-cased repo keeps its old name resolvable through a redirect,
+  # and `gh` follows that redirect on GET but NOT on POST: a POST to a
+  # redirecting path returns 307, which `gh api` surfaces as a failure. So a
+  # roster entry holding a stale spelling reads fine above and then dies at
+  # `git/blobs` with `blob create ... failed`. That is not hypothetical — three
+  # cursor-review callers failed every run from at least 2026-08-17 on nothing
+  # but stale spellings, two differing from canonical only in CASE.
+  #
+  # MASK BEFORE USE, and the ordering is load-bearing. `::add-mask::` is a
+  # case-sensitive literal match and the roster's spelling was masked at parse
+  # time, so the canonical spelling is UNMASKED until the line below runs. A
+  # private caller whose canonical name differs from its roster name would
+  # otherwise be printed verbatim into this public repo's run log by the first
+  # thing that echoed it — the same disclosure `gh pr create`'s discarded output
+  # exists to avoid. Masking both spellings is what makes using the canonical one
+  # safe at all.
+  #
+  # Deliberately a SEPARATE, best-effort call rather than folding `full_name`
+  # into the `--jq` above: canonicalization is an optimization, and it must not
+  # be able to break the main path. Any failure, or an unparseable answer, leaves
+  # REPO exactly as the roster spelled it — the pre-existing behaviour.
+  # The answer is VALIDATED as an `owner/name` pair before it is trusted, not
+  # merely checked for non-emptiness. A caller that ignores `--jq` (a stub, a
+  # future `gh` change, a proxy returning a bare string) would otherwise hand
+  # back something like `main` — and this code would then mask the word "main"
+  # and try to bump a repo called `main`. Masking `main` is itself harmful: it
+  # redacts an ordinary branch name out of every log line in the run, which the
+  # branch-name comment further down explains at length. Anything not shaped like
+  # `owner/name` is discarded and the roster spelling stands.
+  local CANONICAL_REPO
+  CANONICAL_REPO=$(gh api "repos/${REPO}" --jq '.full_name' 2>/dev/null) || CANONICAL_REPO=""
+  case "$CANONICAL_REPO" in
+    */*/*|*' '*|'') CANONICAL_REPO="" ;;                      # more than one slash, whitespace, or empty
+    */*) : ;;                                                  # owner/name — the only accepted shape
+    *)   CANONICAL_REPO="" ;;                                  # no slash at all (e.g. a bare "main")
+  esac
+  if [ -n "$CANONICAL_REPO" ] && [ "$CANONICAL_REPO" != "$REPO" ]; then
+    echo "::add-mask::${CANONICAL_REPO}"
+    # Both spellings are masked by now, so this line discloses neither. It names
+    # the ROSTER spelling (masked at parse time) so an operator can locate the
+    # entry to correct.
+    echo "::warning::${REPO}: roster spelling is not GitHub's canonical name — bumping the canonical repo; update the roster entry"
+    REPO="$CANONICAL_REPO"
+  fi
+
   # Resolve the default-branch tip ONCE, up front. Every Pass-1 fetch is pinned
   # to this immutable SHA (not the mutable `?ref=<branch>`), and Pass 2 uses the
   # same commit as the new commit's parent AND (via its resolved tree) as the
