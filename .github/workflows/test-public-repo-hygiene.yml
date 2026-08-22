@@ -65,14 +65,24 @@ jobs:
           # BE-8729: lookalike third-party hosts. `\b` is not a host boundary,
           # so `evil-posthog.com` and friends used to be category-2 findings;
           # only a dot in front is a real subdomain edge. The three appended
-          # below are the review follow-ups: a suffix host that used to sneak
-          # back in by backtracking past the optional port, a homoglyph domain
-          # that Unicode case-folding read as the real one, and a userinfo URL
-          # whose real host is `evil.com` -- the only fixture exercising the
-          # host-only pattern's `@` rejection end to end.
+          # below are the review follow-ups: a homoglyph domain that Unicode
+          # case-folding read as the real one, and the two userinfo shapes
+          # whose real host is `evil.com` -- the only fixtures exercising the
+          # host-only pattern's `@` rejection end to end. The second of those
+          # replaced a bare `app.slack.com:443.evil.com/x` line, which round 5
+          # established is NOT a lookalike at all: `port = *DIGIT`, so that URL
+          # does not parse and the only host on it is the internal one, which
+          # the checker now correctly flags. Carrying it here as *clean* is
+          # what a stale round-3 explanation about "backtracking past the
+          # optional port" used to justify; there is no port group to backtrack
+          # through (round 3 shed it) and no `:\d+\.` alternative either
+          # (round 5 removed it). Do not restore either to make a suffix host
+          # go quiet -- with userinfo it is already quiet, and without userinfo
+          # it is a real reference.
           printf 'Unrelated: https://fooslack.com/archives/x https://evil-posthog.com/project/1\n' > "$root/LOOKALIKES.md"
-          printf 'Also unrelated: https://app.slack.com:443.evil.com/x https://lınear.app/x\n' >> "$root/LOOKALIKES.md"
+          printf 'Also unrelated: https://lınear.app/x\n' >> "$root/LOOKALIKES.md"
           printf 'Userinfo, so the real host is evil.com: https://app.slack.com@evil.com/\n' >> "$root/LOOKALIKES.md"
+          printf 'Userinfo again, non-numeric port and all: https://app.slack.com:443.evil.com@evil.com/\n' >> "$root/LOOKALIKES.md"
           printf '* @Comfy-Org/comfy-cloud-team\n' > "$root/CODEOWNERS"
           git -C "$root" add -A
           python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root"
