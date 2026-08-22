@@ -185,18 +185,87 @@ class RepoReferenceCategoryTest(CheckerTestCase):
         )
         self.assertEqual(self.findings(), [])
 
-    def test_sentence_final_period_is_a_known_false_positive(self):
-        # Carried over DELIBERATELY from both scripts this replaces: the repo
-        # name class includes `.`, so prose ending "...see Comfy-Org/ComfyUI."
-        # is flagged as `ComfyUI.`. Pinning it here makes the behaviour a
-        # reviewed decision rather than an accident -- the parity proof for
-        # this migration is only worth something if the migration changed
-        # nothing, so the fix belongs in its own change. See README.md
-        # "Known limitations".
+    def test_sentence_final_period_is_stripped(self):
+        # BE-8697, the change this test was flipped by: the repo-name class
+        # includes `.`, so prose ending "...built on Comfy-Org/ComfyUI." used
+        # to be flagged as `ComfyUI.`. Both per-repo scripts did that and this
+        # checker carried it over on purpose, because the migration's proof was
+        # findings-parity against them -- a proof that ended when that
+        # migration merged. A GitHub slug can never end in `.`, so a trailing
+        # one is always sentence punctuation.
         self.repo.write("README.md", "Built on Comfy-Org/ComfyUI.\n")
+        self.assertEqual(self.findings(), [])
+
+    def test_lowercase_org_segment_is_still_flagged(self):
+        # The bypass BE-8697 closes: GitHub resolves owner names
+        # case-insensitively, so `comfy-org/x` reaches the same repo as
+        # `Comfy-Org/x` and default-deny has to see both spellings.
+        self.repo.write("README.md", "See comfy-org/some-internal-thing.\n")
         findings = self.findings()
         self.assertEqual(len(findings), 1, findings)
-        self.assertIn("Comfy-Org/ComfyUI.", findings[0])
+        self.assertIn("not in the known-public allowlist", findings[0])
+        self.assertIn("some-internal-thing", findings[0])
+
+    def test_org_segment_casings_of_public_repos_pass(self):
+        # Widening the match must not turn public references into findings.
+        self.repo.write(
+            "README.md",
+            "comfy-org/comfyui and COMFY-ORG/ComfyUI and CoMfY-oRg/comfy-cli\n",
+        )
+        self.assertEqual(self.findings(), [])
+
+    def test_repo_allowlist_membership_is_case_insensitive(self):
+        # `ComfyUI` and `Comfy-Desktop` are stored in their canonical GitHub
+        # spelling; a differently-cased reference resolves to the same public
+        # repo, so it is not a leak.
+        self.repo.write(
+            "README.md",
+            "Comfy-Org/comfyui Comfy-Org/comfy-desktop Comfy-Org/COMFYUI_FRONTEND\n",
+        )
+        self.assertEqual(self.findings(), [])
+
+    def test_near_miss_repo_name_is_still_flagged(self):
+        # Casefolding admits no name that is not in the allowlist -- only
+        # other CASINGS of names that are.
+        self.repo.write("README.md", "Comfy-Org/ComfyUI2\n")
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("Comfy-Org/ComfyUI2", findings[0])
+
+    def test_team_handle_casing_and_sentence_final_period(self):
+        # The empirically-confirmed false positive: CODEOWNERS spells the
+        # handle `@Comfy-Org/Comfy-Cloud-Team` while the allowlist stores the
+        # slug, and prose puts a period after it. The period strip runs BEFORE
+        # the team/repo fork, so the team branch gets it too -- the `.git`
+        # strip further down is repo-branch-only and never reaches here.
+        self.repo.write(
+            "docs/owners.md",
+            "Owned by @Comfy-Org/Comfy-Cloud-Team.\n"
+            "Also @Comfy-Org/Core-Engine-Team and @comfy-org/comfy-cloud-team.\n",
+        )
+        self.assertEqual(self.findings(), [])
+
+    def test_unknown_team_with_lowercase_org_is_flagged(self):
+        self.repo.write(".github/CODEOWNERS", "docs/ @comfy-org/secret-squad\n")
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("@Comfy-Org/secret-squad", findings[0])
+        self.assertIn("a team not in the known-public allowlist", findings[0])
+
+    def test_bare_org_slash_period_is_not_a_finding(self):
+        # `Comfy-Org/.` names no repo at all once the sentence punctuation is
+        # stripped, so there is nothing to report and nothing to crash on.
+        self.repo.write("README.md", "Everything lives under Comfy-Org/.\n")
+        self.assertEqual(self.findings(), [])
+
+    def test_trailing_git_suffix_survives_the_period_strip(self):
+        # The `.git` strip runs on the already-period-stripped name, so a URL
+        # at the end of a sentence still resolves to the public repo.
+        self.repo.write(
+            "docs/install.md",
+            "Clone https://github.com/Comfy-Org/comfy-typescript-sdk.git.\n",
+        )
+        self.assertEqual(self.findings(), [])
 
     def test_trailing_git_suffix_is_stripped(self):
         self.repo.write(
@@ -214,6 +283,71 @@ class RepoReferenceCategoryTest(CheckerTestCase):
         self.assertEqual(len(findings), 1, findings)
         self.assertIn("@Comfy-Org/secret-squad", findings[0])
         self.assertIn("a team not in the known-public allowlist", findings[0])
+
+    def test_npm_scope_of_a_public_repo_is_not_a_team_finding(self):
+        # `@comfy-org/<pkg>` is an npm / GitHub Packages scope, not a CODEOWNERS
+        # handle, and those coordinates are REQUIRED to be lowercase. Before the
+        # org segment matched case-insensitively this spelling did not match at
+        # all; once it did, it landed in the `@` branch and a dependency on a
+        # known-PUBLIC repo was reported as "a team not in the known-public
+        # allowlist" -- with no caller-side escape short of `exclude_paths:`,
+        # since neither allowlist is a workflow input. The `@` branch therefore
+        # admits the repo allowlist too.
+        self.repo.write(
+            "package.json",
+            '{"dependencies": {"@comfy-org/comfy-typescript-sdk": "^1.0.0",\n'
+            '  "@Comfy-Org/ComfyUI_frontend": "^2.0.0"}}\n',
+        )
+        self.assertEqual(self.findings(), [])
+
+    def test_at_prefixed_name_on_neither_allowlist_is_still_flagged(self):
+        # Admitting the repo allowlist widens the `@` branch by exactly the
+        # public repo names and nothing else -- default-deny still holds.
+        self.repo.write("package.json", '{"x": "@comfy-org/secret-pkg"}\n')
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("@Comfy-Org/secret-pkg", findings[0])
+
+    def test_trailing_git_suffix_is_stripped_case_insensitively(self):
+        # The `.git` strip has to be as case-insensitive as the match above it
+        # and the membership test below it, or `ComfyUI.GIT` keeps its suffix,
+        # casefolds to `comfyui.git` and is reported as a leak for a repo the
+        # allowlist already covers.
+        self.repo.write(
+            "docs/install.md",
+            "Clone Comfy-Org/ComfyUI.GIT or Comfy-Org/comfy-cli.Git\n",
+        )
+        self.assertEqual(self.findings(), [])
+
+    def test_case_insensitive_git_strip_does_not_admit_a_private_name(self):
+        self.repo.write("README.md", "Comfy-Org/some-internal-thing.GIT\n")
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("Comfy-Org/some-internal-thing", findings[0])
+
+    def test_org_slash_dotgit_names_no_repo(self):
+        # `Comfy-Org/.git` clears the period strip untouched (it has no TRAILING
+        # dot) and is then consumed WHOLE by the `.git` strip, so the empty
+        # check has to run after that strip too -- otherwise this yields the
+        # repo-less "reference to Comfy-Org/" that names nothing actionable.
+        self.repo.write("README.md", "The bare remote is Comfy-Org/.git\n")
+        self.assertEqual(self.findings(), [])
+
+    def test_name_class_stays_ascii_under_the_scoped_ignorecase(self):
+        # `re.IGNORECASE` applied to the WHOLE pattern also widens `[A-Za-z]`:
+        # under Unicode case-folding it matches U+017F and U+212A, so `.casefold()`
+        # at the membership test would fold `comfy-typeſcript-sdk` back onto an
+        # allowlisted name (a default-deny bypass), and `comfyui` followed by a
+        # Kelvin sign would be absorbed into the name and flagged. Scoping the
+        # flag to the org segment keeps the capture ASCII, so the first is still
+        # a finding and the second is still clean.
+        self.repo.write("README.md", "Comfy-Org/comfy-typeſcript-sdk\n")
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertNotIn("ſ", findings[0])
+
+        self.repo.write("other.md", "Built on Comfy-Org/comfyuiK\n")
+        self.assertEqual(self.findings(), findings)
 
     def test_team_allowlist_does_not_leak_into_repo_allowlist(self):
         # A team handle and a repo reference share a namespace in the source
@@ -696,8 +830,34 @@ class TamperResistanceTest(CheckerTestCase):
             checker.PUBLIC_COMFY_ORG_REPOS,
             checker.PUBLIC_COMFY_ORG_TEAMS,
             checker.TICKET_ALLOWLIST,
+            # The casefolded views are what membership actually consults
+            # (BE-8697), so they carry the same invariant as the lists they
+            # derive from -- a mutable one would be the same hole one hop down.
+            checker._PUBLIC_REPOS_CF,
+            checker._PUBLIC_TEAMS_CF,
         ):
             self.assertIsInstance(const, frozenset)
+
+    def test_casefolded_views_cover_their_source_lists(self):
+        # The views are derived at import so they cannot drift, but pin it:
+        # an entry that vanished under casefold (or a hand-written second copy
+        # of the list) would silently un-allowlist a public name.
+        self.assertEqual(
+            checker._PUBLIC_REPOS_CF,
+            {n.casefold() for n in checker.PUBLIC_COMFY_ORG_REPOS},
+        )
+        self.assertEqual(
+            checker._PUBLIC_TEAMS_CF,
+            {n.casefold() for n in checker.PUBLIC_COMFY_ORG_TEAMS},
+        )
+        # And no two canonical entries collide under casefold, which would mean
+        # the human-edited list carries a duplicate spelling.
+        self.assertEqual(
+            len(checker._PUBLIC_REPOS_CF), len(checker.PUBLIC_COMFY_ORG_REPOS)
+        )
+        self.assertEqual(
+            len(checker._PUBLIC_TEAMS_CF), len(checker.PUBLIC_COMFY_ORG_TEAMS)
+        )
 
     def test_allowlist_contains_no_obviously_private_shape(self):
         # The allowlist is safe to host in a public repo only because it lists
