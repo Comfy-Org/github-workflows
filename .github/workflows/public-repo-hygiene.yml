@@ -1,0 +1,172 @@
+name: Public Repo Hygiene (reusable)
+
+# Reusable workflow that scans a PUBLIC repo's TRACKED files for internal-only
+# references, in three categories: ticket-style identifiers (`TEAM-1234`),
+# internal collaboration-tool links (Notion, Slack archives, Google Docs/Drive,
+# Datadog, PostHog projects, Linear, `incident-NNN`), and `Comfy-Org/<repo>`
+# references outside a DEFAULT-DENY known-public allowlist (including the
+# `@Comfy-Org/<team>` CODEOWNERS-handle case). It is a lightweight regression
+# guard, not a secrets scanner. It runs in the CALLER's context, so
+# `actions/checkout` checks out the calling repo and the scan operates on that
+# repo's tracked files. Fails with a non-zero exit (and GitHub annotations) so
+# it can be wired as a required status check.
+#
+# The check script is loaded from THIS repo (public, pinned via `workflows_ref`)
+# — never from the caller's checkout — so a PR can't rewrite the checker OR its
+# allowlist. That is the whole point (BE-8654): the two per-repo copies this
+# replaces were run straight out of the PR's own checkout, so a PR could add a
+# private repo name to the in-tree allowlist and then leak it, green. The
+# known-public repo/team allowlist is deliberately NOT an input — an allowlist a
+# caller can pass is an allowlist a PR in the caller repo can widen.
+#
+# Hosting the allowlist here leaks nothing: it lists public repo names only, by
+# design. No private repo name is ever listed — that is what default-deny buys.
+#
+# Caller pattern (place in the consumer repo at
+# .github/workflows/public-repo-hygiene.yml):
+#
+#   name: Public Repo Hygiene
+#   on:
+#     pull_request:
+#     push:
+#       branches: [main, master]
+#   jobs:
+#     hygiene:
+#       permissions:
+#         contents: read
+#       uses: Comfy-Org/github-workflows/.github/workflows/public-repo-hygiene.yml@<sha>  # v1
+#       with:
+#         workflows_ref: <same-sha>   # REQUIRED — same SHA as `uses:` above
+#
+# INPUTS (`workflows_ref` is REQUIRED; all others optional):
+#   ticket_allowlist   Newline- or comma-separated acronyms that LOOK like
+#                      ticket IDs but are not (`GPU-100`, a product SKU, a spec
+#                      number). ADDITIVE on top of the built-in list (UTF-8,
+#                      SHA-256, RFC-3339, …) — a caller can extend it, never
+#                      shrink it. Matched case-insensitively. Default empty.
+#   exclude_paths      Newline- or comma-separated tracked paths to skip.
+#                      `src/generated/` (trailing slash) excludes that subtree;
+#                      `scripts/thing.py` excludes that exact file. This is the
+#                      per-repo scanning scope — vendored specs, generated
+#                      clients, fixtures. Every entry is echoed to the run log
+#                      with the number of files it skipped, INCLUDING an entry
+#                      that skipped none, so a typo can't rot coverage
+#                      invisibly. A value naming the repo root (`/`, `.`) is
+#                      rejected and the run fails. Default empty.
+#   workflows_ref      REQUIRED. Ref of Comfy-Org/github-workflows to load the
+#                      check script from. Must be the SAME commit SHA you pin
+#                      `uses:` to — no default, so a caller can't pin the
+#                      workflow while loading the checker from a mutable branch.
+#
+# No secrets required.
+
+on:
+  workflow_call:
+    inputs:
+      ticket_allowlist:
+        description: >-
+          Newline- or comma-separated acronyms to treat as NOT ticket IDs (e.g.
+          `GPU-100`). Additive on top of the built-in allowlist; a caller can
+          extend it, never shrink it. Default empty.
+        type: string
+        required: false
+        default: ''
+      exclude_paths:
+        description: >-
+          Newline- or comma-separated tracked paths to skip. A trailing slash
+          means "this subtree" (`src/generated/`); otherwise it is one exact
+          file. Every entry is reported in the run log with its skipped-file
+          count. A value naming the repo root is rejected. Default empty.
+        type: string
+        required: false
+        default: ''
+      workflows_ref:
+        description: >-
+          REQUIRED. Ref of Comfy-Org/github-workflows to load the check script
+          from. Must be the SAME commit SHA you pin `uses:` to — otherwise the
+          workflow is pinned but the code it runs is not. There is deliberately
+          no default: a floating `main` default would silently load a mutable
+          checker, which is the exact hole this workflow exists to close.
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: public-repo-hygiene
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout caller repo
+        # Default depth (1) on purpose: the scan reads the working tree, never
+        # history, so there is nothing a deeper fetch would let it see.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Require a pinned workflows_ref
+        # workflows_ref has no default on purpose. GitHub does NOT enforce
+        # `required: true` for workflow_call inputs, so an omitted input arrives
+        # as '' and actions/checkout would silently fall back to this repo's
+        # default branch — running MUTABLE scripts under a pin that claims
+        # otherwise. Fail fast instead. (BE-5546)
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+        run: |
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form, and echo only that: dropping
+          # newlines also stops a multi-line value from smuggling a ::workflow
+          # command:: into the log, and from satisfying the line-oriented grep
+          # below on one 40-hex line among many.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
+            exit 1
+          fi
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
+          fi
+
+      - name: Load hygiene check script
+        # The checker AND its known-public allowlist come from THIS repo
+        # (public, pinned via workflows_ref), never from the caller's checkout,
+        # so a PR can't rewrite the check that is judging it. `path:` matches
+        # SCRIPT_CHECKOUT_DIR in the checker; it lands untracked in the caller's
+        # workspace, so `git ls-files` never scans it.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _public_repo_hygiene
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Scan for internal-only references
+        env:
+          HYGIENE_CHECK_ROOT: ${{ github.workspace }}
+          TICKET_ALLOWLIST: ${{ inputs.ticket_allowlist }}
+          EXCLUDE_PATHS: ${{ inputs.exclude_paths }}
+        run: |
+          # Each optional flag is added ONLY when the caller set a non-blank
+          # value, so a caller that never heard of these inputs runs the exact
+          # bare command.
+          args=(--root "$HYGIENE_CHECK_ROOT")
+          if [ -n "$(printf '%s' "$EXCLUDE_PATHS" | tr -d '[:space:]')" ]; then
+            # Attached form: as a separate token, a legitimate path starting
+            # with a hyphen is parsed by argparse as an unknown option and the
+            # job dies with a usage error.
+            args+=("--exclude=$EXCLUDE_PATHS")
+          fi
+          if [ -n "$(printf '%s' "$TICKET_ALLOWLIST" | tr -d '[:space:]')" ]; then
+            args+=("--ticket-allow=$TICKET_ALLOWLIST")
+          fi
+          python3 "$GITHUB_WORKSPACE/_public_repo_hygiene/.github/public-repo-hygiene/check_public_repo_hygiene.py" \
+            "${args[@]}"

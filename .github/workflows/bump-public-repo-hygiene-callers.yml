@@ -1,0 +1,127 @@
+name: Bump public-repo-hygiene callers
+
+# When the public-repo-hygiene reusable workflow (or the checker script it runs) is updated on
+# main, open a SHA-bump PR in every repo that pins a caller against it. PRs are opened by
+# Cloud Code Bot so they're easy to filter and merge.
+#
+# Thin entrypoint over the shared bumper at .github/bump-callers/bump-callers.sh — the same
+# script drives the agents-md-integrity, cursor-review, pr-risk and linear-ticket fleets. ONE
+# implementation is deliberate; a forked copy is how other shared machinery in the org has
+# drifted.
+#
+# A public-repo-hygiene caller pins TWICE — the `uses:` line AND the `workflows_ref:` input the
+# reusable checks its checker out at. The shared rewrite moves both; never hand-bump one alone.
+#
+# This fleet matters more than most: the pinned SHA decides which ALLOWLIST a caller scans
+# against, and "which Comfy-Org repos are public" is org-wide knowledge that changes. A caller
+# left un-bumped is a caller failing on a repo the org has since made public — the exact stale
+# copy problem centralizing the list was meant to end (BE-8654).
+#
+# The caller list is NOT hardcoded here. This repo is PUBLIC and callers may be private, so
+# their names must never appear in this file or its logs. The list lives in the repo-level
+# Actions SECRET `PUBLIC_REPO_HYGIENE_CALLERS` (a JSON array of {"repo","file","label"}
+# objects) — a secret, not a variable, so the roster is runner-masked in the env dump Actions
+# prints before the script's own masking runs (BE-6472). There is no read-back: the canonical
+# callers.json lives in the private ops repo and a maintainer applies edits with `gh secret set`.
+#
+# Update flow — adding/removing a caller needs NO public commit:
+#   jq -c . callers.json | gh secret set PUBLIC_REPO_HYGIENE_CALLERS --repo Comfy-Org/github-workflows
+#
+# Enrolling a caller is TWO steps: merge the caller AND add it to the roster. Skipping the
+# second is the most repeated mistake in this repo — the pin then never moves and the caller
+# drifts behind the allowlist with no obvious cause.
+
+on:
+  workflow_dispatch: {}   # allow on-demand runs (e.g. to re-bump callers, or after enrolling one)
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/public-repo-hygiene.yml
+      # The checker consumers actually run, checked out from the workflows_ref SHA a caller
+      # pins — an allowlist or detection change here needs the same caller bump as a workflow
+      # change, or the caller keeps scanning against the old list.
+      - .github/public-repo-hygiene/**
+      # …but the tests and README under that dir are NOT part of what a pinned caller runs, so
+      # a test-only or docs-only commit would fan a pure-churn bump across the fleet. Exclude.
+      - '!.github/public-repo-hygiene/tests/**'
+      - '!.github/public-repo-hygiene/README.md'
+
+permissions:
+  contents: read
+
+# Serialize runs of this fleet. The bumper pushes to a STABLE branch shared across runs, so two
+# overlapping runs would force-reset that branch and race the PR update — an older run finishing
+# last could leave the committed diff pinned to a stale SHA. cancel-in-progress: false lets the
+# running bump finish; GitHub keeps only the newest pending run, so the latest SHA always wins.
+concurrency:
+  group: bump-public-repo-hygiene-callers
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    # Guard against a workflow_dispatch from a non-main ref: the bumper force-resets a shared
+    # branch and runs from github.sha, so a manual run from an older ref would pin every caller
+    # to a stale SHA. The push trigger is already main-only.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The shared staleness/decommission guard — one implementation for every fleet,
+      # documented in .github/bump-callers/README.md "Preflight". WATCHED/WATCHED_ASSETS are
+      # LITERAL paths, never the `paths:` globs, and WATCHED_PATHSPECS must mirror the filter
+      # above INCLUDING its exclusions: the re-point only pins callers to a tip whose watched
+      # content it compared, so widen these inputs in the same change if you widen that filter.
+      - name: Preflight (staleness / decommission guard)
+        id: preflight
+        env:
+          WATCHED: .github/workflows/public-repo-hygiene.yml
+          WATCHED_ASSETS: .github/public-repo-hygiene
+          WATCHED_PATHSPECS: |
+            .github/workflows/public-repo-hygiene.yml
+            .github/public-repo-hygiene
+            :(exclude).github/public-repo-hygiene/tests
+            :(exclude).github/public-repo-hygiene/README.md
+          # Every file whose ABSENCE breaks a pinned caller at run time. The checker is the
+          # whole job body and imports nothing outside the stdlib.
+          WATCHED_EXEC: |
+            .github/workflows/public-repo-hygiene.yml
+            .github/public-repo-hygiene/check_public_repo_hygiene.py
+          NEW_SHA: ${{ github.sha }}
+        run: bash .github/bump-callers/preflight.sh
+
+      - name: Generate Cloud Code Bot token
+        # Stale run or decommissioned surface — don't mint an org-wide write token for a job
+        # that is about to bump nothing.
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0 — pinned: see dependabot.yml ignore (v2+ breaks cross-repo `owner:` token scoping)
+        id: token
+        if: steps.preflight.outputs.proceed == 'true'
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+          owner: Comfy-Org
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+
+      - name: Bump SHA in caller repos
+        if: steps.preflight.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          # NOT github.sha: when main moved on but the watched surface is unchanged, the
+          # preflight re-points this run at the verified tip, and reading github.sha here would
+          # silently discard that re-point.
+          NEW_SHA: ${{ steps.preflight.outputs.new_sha }}
+          VAR_NAME: PUBLIC_REPO_HYGIENE_CALLERS
+          TAG: public-repo-hygiene
+          WORKFLOW_FILE: public-repo-hygiene.yml
+          # No callers are enrolled yet — this workflow lands before its first consumer, so an
+          # empty roster is the expected state, not a bug. Flip to "false" once the fleet is
+          # seeded, so a later roster wipe hard-fails instead of silently bumping nobody.
+          ALLOW_EMPTY: "true"
+          CALLERS_JSON: ${{ secrets.PUBLIC_REPO_HYGIENE_CALLERS }}
+        run: bash .github/bump-callers/bump-callers.sh

@@ -105,11 +105,17 @@ rules:
       - wei-hai
       - deepme987
 
-  # AGENTS.md standard checker + housekeeping workflows.
+  # Repo-standard checkers (AGENTS.md, public-repo leak guard) + housekeeping
+  # workflows. public-repo-hygiene sits here because it is the same shape as
+  # agents-md-integrity: a checker whose logic and allowlist load from a pinned
+  # ref of this repo rather than the caller's checkout.
   - paths:
       - .github/agents-md-integrity/**
       - .github/workflows/agents-md-integrity.yml
       - .github/workflows/test-agents-md-integrity.yml
+      - .github/public-repo-hygiene/**
+      - .github/workflows/public-repo-hygiene.yml
+      - .github/workflows/test-public-repo-hygiene.yml
       - .github/workflows/stale.yml
       # The reusable only — this repo is deliberately not self-enrolled, so
       # there is no `ci-` prefixed caller here to route.

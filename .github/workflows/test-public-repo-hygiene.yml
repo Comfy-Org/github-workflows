@@ -1,0 +1,200 @@
+name: Test public-repo-hygiene script
+
+# Runs the unit tests for the public-repo hygiene checker plus CLI smoke tests
+# that exercise each detection category end-to-end and — the one this workflow
+# exists for — that a CALLER-SIDE edit to the allowlist has NO effect. The
+# checker gates every consumer repo's CI and is the org's only guard against
+# publishing an internal reference, so a regression here is silent in both
+# directions: a checker that stopped firing looks exactly like a clean repo.
+
+on:
+  pull_request:
+    paths:
+      - '.github/public-repo-hygiene/**'
+      - '.github/workflows/test-public-repo-hygiene.yml'
+      - '.github/workflows/public-repo-hygiene.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/public-repo-hygiene/**'
+      - '.github/workflows/test-public-repo-hygiene.yml'
+      - '.github/workflows/public-repo-hygiene.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: unittest + smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Run public-repo-hygiene unit tests
+        run: python3 -m unittest discover -s .github/public-repo-hygiene/tests -p 'test_*.py' -v
+
+      # The smoke tests below build throwaway git work trees, because the
+      # checker scans TRACKED files — an exported directory is not the thing it
+      # runs against in CI.
+      - name: Smoke test — a clean repo passes
+        run: |
+          root="$(mktemp -d)"
+          git -C "$root" init -q
+          # No sentence-final period after a repo reference: the repo-name
+          # character class swallows it, which is a carried-over false positive
+          # documented in .github/public-repo-hygiene/README.md.
+          printf 'See Comfy-Org/ComfyUI and Comfy-Org/comfy-cli, encoded UTF-8\n' > "$root/README.md"
+          printf '* @Comfy-Org/comfy-cloud-team\n' > "$root/CODEOWNERS"
+          git -C "$root" add -A
+          python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root"
+
+      - name: Smoke test — each category fails a dirty repo
+        run: |
+          # One category per fixture, asserting the SPECIFIC message rather
+          # than merely "non-zero": an exit-2 config error or a traceback is
+          # also non-zero and would mask a checker broken for every repo.
+          check_one() {
+            name="$1"; content="$2"; expect="$3"
+            root="$(mktemp -d)"
+            git -C "$root" init -q
+            printf '%s\n' "$content" > "$root/notes.md"
+            git -C "$root" add -A
+            set +e
+            out="$(python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root" 2>&1)"
+            code=$?
+            set -e
+            echo "$out"
+            if [ "$code" -ne 1 ]; then
+              echo "::error::$name: expected exit 1, got $code"
+              exit 1
+            fi
+            grep -qF "$expect" <<<"$out" || {
+              echo "::error::$name: expected a finding containing '$expect'"
+              exit 1
+            }
+            echo "OK: $name"
+          }
+          check_one 'ticket id' \
+            'tracked as ABCDEF-123456 upstream' \
+            'possible internal ticket ID'
+          check_one 'internal marker' \
+            'dashboard https://app.datadoghq.com/dash/1' \
+            'internal collaboration-tool marker'
+          check_one 'repo default-deny' \
+            'built from Comfy-Org/not-a-public-repo' \
+            'which is not in the known-public allowlist'
+          check_one 'codeowners team handle' \
+            'owner @Comfy-Org/not-a-public-team' \
+            'a team not in the known-public allowlist'
+
+      # ── The acceptance criterion this whole workflow exists for ────────────
+      - name: Smoke test — a caller-side edit to the allowlist has NO effect
+        run: |
+          # The scanned tree contains a wide-open copy of the checker at BOTH
+          # the historical per-repo path and the centralized one, plus a config
+          # file — every shape a PR author might reach for to widen the
+          # allowlist from inside the repo being checked. The checker we
+          # actually run is the pinned one from THIS repo, so the verdict must
+          # not move.
+          root="$(mktemp -d)"
+          git -C "$root" init -q
+          mkdir -p "$root/scripts" "$root/.github/public-repo-hygiene"
+          printf 'Tracking BE-1234 in Comfy-Org/super-secret-repo.\n' > "$root/LEAK.md"
+          cat > "$root/scripts/check_public_repo_hygiene.py" <<'PY'
+          PUBLIC_COMFY_ORG_REPOS = {"super-secret-repo"}
+          TICKET_ALLOWLIST = {"BE-1234"}
+          PY
+          cp "$root/scripts/check_public_repo_hygiene.py" \
+             "$root/.github/public-repo-hygiene/check_public_repo_hygiene.py"
+          printf '{"public_repos": ["super-secret-repo"]}\n' > "$root/.public-repo-hygiene.json"
+          git -C "$root" add -A
+
+          set +e
+          out="$(python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root" 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+          if [ "$code" -ne 1 ]; then
+            echo "::error::tamper fixture: expected exit 1, got $code — an in-tree allowlist edit changed the verdict"
+            exit 1
+          fi
+          grep -qF 'Comfy-Org/super-secret-repo' <<<"$out" || {
+            echo "::error::an in-tree checker copy suppressed the repo finding"
+            exit 1
+          }
+          grep -qF "'BE-1234'" <<<"$out" || {
+            echo "::error::an in-tree checker copy suppressed the ticket finding"
+            exit 1
+          }
+          echo "caller-side allowlist edits are correctly inert"
+
+      - name: Smoke test — the caller inputs are additive, never a loosening
+        run: |
+          # `ticket_allowlist` takes acronyms and `exclude_paths` drops files;
+          # neither can reach the known-public repo/team allowlist. Proven by
+          # passing the private repo name through BOTH knobs and watching the
+          # finding survive.
+          root="$(mktemp -d)"
+          git -C "$root" init -q
+          printf 'Comfy-Org/super-secret-repo tracked as BE-1234\n' > "$root/LEAK.md"
+          git -C "$root" add -A
+          set +e
+          out="$(python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root" \
+                   --ticket-allow 'super-secret-repo,BE-1234' --exclude 'nothing-here/' 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+          if [ "$code" -ne 1 ]; then
+            echo "::error::expected exit 1, got $code — a caller input suppressed a repo finding"
+            exit 1
+          fi
+          grep -qF 'Comfy-Org/super-secret-repo' <<<"$out" || {
+            echo "::error::ticket_allowlist reached the repo allowlist"
+            exit 1
+          }
+          # An exclusion that matched nothing must still be visible in the log.
+          grep -qF "EXCLUDED: 0 file(s) matched 'nothing-here/'" <<<"$out" || {
+            echo "::error::an exclusion that matched nothing left no trace in the log"
+            exit 1
+          }
+          echo "caller inputs are correctly additive"
+
+      - name: Smoke test — a root-wide exclusion is rejected
+        run: |
+          root="$(mktemp -d)"
+          git -C "$root" init -q
+          printf 'clean\n' > "$root/README.md"
+          git -C "$root" add -A
+          set +e
+          python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root" --exclude '.'
+          code=$?
+          set -e
+          if [ "$code" -ne 2 ]; then
+            echo "::error::expected exit 2 for a root-wide exclusion, got $code"
+            exit 1
+          fi
+          echo "checker correctly rejected a root-wide exclusion"
+
+      - name: Smoke test — a non-git tree is a loud config error, not a pass
+        run: |
+          # The scan is over TRACKED files. If the checkout is missing or the
+          # tree was exported, "nothing to scan" must never read as "clean".
+          root="$(mktemp -d)"
+          printf 'Comfy-Org/super-secret-repo\n' > "$root/LEAK.md"
+          set +e
+          python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root"
+          code=$?
+          set -e
+          if [ "$code" -ne 2 ]; then
+            echo "::error::expected exit 2 for a non-git tree, got $code"
+            exit 1
+          fi
+          echo "checker correctly refused a non-git tree"

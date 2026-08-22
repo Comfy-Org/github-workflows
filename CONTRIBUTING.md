@@ -22,6 +22,9 @@ python3 -m unittest discover -s .github/cursor-review/tests -p 'test_*.py' -v
 # AGENTS.md standard checker
 python3 -m unittest discover -s .github/agents-md-integrity/tests -p 'test_*.py' -v
 
+# public-repo leak guard (allowlist + the caller-can't-edit-it assertions)
+python3 -m unittest discover -s .github/public-repo-hygiene/tests -p 'test_*.py' -v
+
 # caller-bump machinery
 shellcheck -x .github/bump-callers/bump-callers.sh .github/bump-callers/tests/test_bump_callers.sh
 bash .github/bump-callers/tests/test_bump_callers.sh
