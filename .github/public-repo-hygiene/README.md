@@ -15,7 +15,7 @@ false positive is a one-line list edit instead of a mystery.
 |---|---|---|
 | 1 | Ticket-style identifiers | `\b[A-Z]{2,6}-\d{2,6}\b` — a generic SHAPE, never a list of real internal team keys, so the check itself discloses no internal naming scheme. Common tech acronyms that fit (`UTF-8`, `SHA-256`, `RFC-3339`, …) are allowlisted; a caller extends that list with the `ticket_allowlist:` input. |
 | 2 | Internal collaboration-tool links | Notion (`notion.so`/`notion.site`), Slack (`slack.com/archives`, `slack.com/client`, `app.slack.com`), Google Docs/Drive, `app.datadoghq.com`, `posthog.com/project/`, `linear.app`, and `incident-NNN`. Case-insensitive. Public marketing pages on the same hosts (`posthog.com/docs`) are not matched. |
-| 3 | `Comfy-Org/<repo>` references | **Default-deny** against `PUBLIC_COMFY_ORG_REPOS`. Anything else is flagged so a maintainer either scrubs it or adds it once confirmed public. A leading `@` makes the match a CODEOWNERS **team** handle instead, checked against `PUBLIC_COMFY_ORG_TEAMS` — team handles are inherently public on a public repo (GitHub renders CODEOWNERS owners to anyone who can see it), so an allowlisted one is not a leak. A trailing `.git` is stripped, because `Foo.git` in a `repository.url` still references the public repo `Foo`. |
+| 3 | `Comfy-Org/<repo>` references | **Default-deny** against `PUBLIC_COMFY_ORG_REPOS`. Anything else is flagged so a maintainer either scrubs it or adds it once confirmed public. A leading `@` makes the match a CODEOWNERS **team** handle instead, checked against `PUBLIC_COMFY_ORG_TEAMS` — team handles are inherently public on a public repo (GitHub renders CODEOWNERS owners to anyone who can see it), so an allowlisted one is not a leak. A trailing `.git` is stripped, because `Foo.git` in a `repository.url` still references the public repo `Foo`, and a trailing `.` is stripped as sentence punctuation on both paths (a GitHub slug can never end in a dot). Case-insensitive throughout — GitHub resolves owner names case-insensitively, so `comfy-org/<repo>` is checked exactly like `Comfy-Org/<repo>`, and allowlist membership is compared casefolded. |
 
 Only **tracked** files are scanned (`git ls-files -z`), so build output, `node_modules` and
 anything untracked is out of scope by construction. Binary files are skipped (a NUL byte or an
@@ -100,18 +100,11 @@ asserts the same end-to-end.
 
 ## Known limitations
 
-Carried over deliberately from the two scripts this replaces. The migration was proven by running
-old and new over the same trees and diffing findings, which is only worth something if the
-migration changed nothing — so each of these is its own change, not a rider on the centralization.
+What this checker still does not see. The two limitations the per-repo scripts had here — a
+sentence-final period swallowed by the repo-name class, and an org segment matched
+case-sensitively — were fixed in BE-8697 and are pinned by unit tests; that is where detection
+parity with those scripts deliberately ended.
 
-- **A sentence-final period is swallowed by the repo-name class.** Prose ending
-  `…built on Comfy-Org/ComfyUI.` is flagged as `ComfyUI.`, which is not in the allowlist. Both
-  original copies did this. It is pinned by a unit test so it stays a decision rather than an
-  accident. This is the first thing to fix before rolling out beyond a handful of repos — it fires
-  on ordinary English.
-- **The org segment is matched case-sensitively.** GitHub resolves owner names
-  case-insensitively, so a lowercased `comfy-org/<private-repo>` reference is not flagged. Both
-  original copies had this blind spot too.
 - **The scan is line-oriented.** A reference split across two lines is not matched.
 
 ## Running it

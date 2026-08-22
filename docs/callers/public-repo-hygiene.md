@@ -90,11 +90,14 @@ instead of one per consumer.
 will surface genuine findings on its first run — that is the point, but it is a triage ramp, not
 a flip. Land the scrub first, then make it required.
 
-**Sentence-final periods are false positives today.** `…built on Comfy-Org/ComfyUI.` is flagged as
-`ComfyUI.` because the repo-name character class includes `.`. Carried over from the per-repo
-scripts this replaces and documented in
-[the checker README](../../.github/public-repo-hygiene/README.md#known-limitations). Work around
-it by rephrasing, or by excluding the file, until it is fixed.
+**Repo and team references are matched case-insensitively, and sentence punctuation is stripped.**
+GitHub resolves owner names case-insensitively, so `comfy-org/<repo>` is checked exactly like
+`Comfy-Org/<repo>` — a lowercased reference to a non-public repo is a finding, and a
+differently-cased reference to a public one is not. A trailing `.` is treated as sentence
+punctuation and stripped before the allowlist lookup (`…built on Comfy-Org/ComfyUI.` is clean), on
+both the repo and the `@Comfy-Org/<team>` path, because a GitHub slug can never end in a dot. What
+is still not matched is a reference split across two lines — the scan is line-oriented. See
+[the checker README](../../.github/public-repo-hygiene/README.md#known-limitations).
 
 **A skip is always visible.** An exclusion is logged with its file count even when it matched
 nothing; an unreadable file, a device node, a git-LFS pointer stub or a symlink becomes a

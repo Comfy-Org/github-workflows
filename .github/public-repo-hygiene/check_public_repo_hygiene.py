@@ -129,12 +129,25 @@ PUBLIC_COMFY_ORG_REPOS = frozenset(
 # surfaces.
 PUBLIC_COMFY_ORG_TEAMS = frozenset({"comfy-cloud-team", "core-engine-team"})
 
-# Case-sensitive on the org segment, matching both scripts this replaces.
-# GitHub resolves owner names case-insensitively, so a lowercased
-# `comfy-org/<repo>` reference is a known blind spot -- see README.md
-# "Known limitations". Widening it is a detection change, deliberately not
-# bundled into the centralization.
-REPO_REF_RE = re.compile(r"Comfy-Org/([A-Za-z0-9_.-]+)")
+# Casefolded views of the two lists above, used for MEMBERSHIP only (BE-8697).
+# The lists themselves stay the human-edited source of truth in their canonical
+# GitHub spelling, and a finding still quotes the name exactly as it appeared in
+# the file, so "add it to the allowlist" stays a copy-paste. Casefolding cannot
+# weaken the control: no private name is in either allowlist under any casing,
+# so the only references it newly clears are differently-cased spellings of
+# names GitHub already resolves to an allowlisted PUBLIC repo or team.
+_PUBLIC_REPOS_CF = frozenset(name.casefold() for name in PUBLIC_COMFY_ORG_REPOS)
+_PUBLIC_TEAMS_CF = frozenset(name.casefold() for name in PUBLIC_COMFY_ORG_TEAMS)
+
+# Case-INSENSITIVE, because GitHub resolves owner names case-insensitively:
+# `comfy-org/<private-repo>` reaches exactly the same repository as
+# `Comfy-Org/<private-repo>`, so matching only the canonical spelling left a
+# one-keystroke bypass of a default-deny control (BE-8697). Whole-pattern
+# `re.IGNORECASE` is equivalent to org-segment-only here: the capture class is
+# already case-complete, so group(1) is returned exactly as written either way,
+# and the allowlist tests below casefold rather than lowercase so a
+# differently-cased spelling of a PUBLIC name is not reported as a leak.
+REPO_REF_RE = re.compile(r"Comfy-Org/([A-Za-z0-9_.-]+)", re.IGNORECASE)
 
 # Where the reusable workflow checks THIS repo out inside the caller's
 # workspace (`path:` in public-repo-hygiene.yml — keep the two spellings in
@@ -466,9 +479,21 @@ def _file_findings(rel, text, ticket_allowlist):
 
         for match in REPO_REF_RE.finditer(line):
             name = match.group(1)
+            # Strip a sentence-final period BEFORE the team/repo fork: a GitHub
+            # repo or team slug can never end in `.`, so a trailing one is
+            # always prose punctuation the `.`-permitting name class swallowed
+            # (BE-8697). It has to happen here rather than in the repo branch
+            # below, because the team branch needs it too -- `@Comfy-Org/
+            # Comfy-Cloud-Team.` at the end of a sentence is the confirmed
+            # false positive that motivated this. `rstrip` also handles the
+            # ellipsis case, and a reference that is nothing BUT the period
+            # (`Comfy-Org/.`) names no repo at all, so it is not a finding.
+            name = name.rstrip(".")
+            if not name:
+                continue
             # A leading `@` makes this a CODEOWNERS team handle, not a repo ref.
             if match.start() > 0 and line[match.start() - 1] == "@":
-                if name not in PUBLIC_COMFY_ORG_TEAMS:
+                if name.casefold() not in _PUBLIC_TEAMS_CF:
                     yield (
                         f"{rel}:{lineno}: reference to "
                         f"@Comfy-Org/{_bounded(name)}, a "
@@ -483,7 +508,7 @@ def _file_findings(rel, text, ticket_allowlist):
             # `repository.url`, git remotes) conventionally end in `.git`, and
             # `Foo.git` is still a reference to the public repo `Foo`.
             repo = re.sub(r"\.git$", "", name)
-            if repo not in PUBLIC_COMFY_ORG_REPOS:
+            if repo.casefold() not in _PUBLIC_REPOS_CF:
                 yield (
                     f"{rel}:{lineno}: reference to "
                     f"Comfy-Org/{_bounded(repo)}, which is "
