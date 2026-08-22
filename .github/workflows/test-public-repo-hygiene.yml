@@ -27,6 +27,13 @@ jobs:
   test:
     name: unittest + smoke
     runs-on: ubuntu-latest
+    # The fixtures here deliberately create a FIFO and a symlink to /dev/zero,
+    # so a regression that reads one blocks forever — and without this the job
+    # would burn the 6-hour Actions default before the check ever reports. Only
+    # the symlink smoke step is individually bounded (`timeout 60`); this
+    # bounds the unittest step and the job as a whole. Matches the 15 minutes
+    # `public-repo-hygiene.yml` sets on its own scan job.
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -288,6 +295,69 @@ jobs:
             exit 1
           }
           echo "checker read link targets without ever following one"
+
+      - name: Smoke test — a work-tree encoding conversion is refused
+        run: |
+          # `working-tree-encoding=UTF-16` keeps the committed blob UTF-8 —
+          # plainly readable on github.com, in the API and in the diff — while
+          # checkout writes NUL-laden UTF-16 to disk, which this scan reads and
+          # skips as binary. A green run over content the guard never looked at,
+          # from a two-line commit, so it is exit 2 (BE-8654 review).
+          root="$(mktemp -d)"
+          git -C "$root" init -q
+          printf '*.md working-tree-encoding=UTF-16\n' > "$root/.gitattributes"
+          # iconv emits the BOM git requires for a bare `UTF-16` declaration.
+          printf 'See Comfy-Org/super-secret-repo\n' \
+            | iconv -f UTF-8 -t UTF-16 > "$root/leak.md"
+          git -C "$root" add -A
+          set +e
+          out="$(python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root" 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+          if [ "$code" -ne 2 ]; then
+            echo "::error::expected exit 2 for a work-tree encoding conversion, got $code"
+            exit 1
+          fi
+          grep -qF 'working-tree-encoding' <<<"$out" || {
+            echo "::error::the conversion failure did not explain itself"
+            exit 1
+          }
+          grep -qF 'leak.md' <<<"$out" || {
+            echo "::error::the conversion failure did not name the file"
+            exit 1
+          }
+          echo "checker correctly refused a converted work tree"
+
+      - name: Smoke test — an all-LFS repo cannot report coverage it never had
+        run: |
+          # `actions/checkout` leaves LFS off, so an LFS-tracked file is present
+          # only as its ~130-byte pointer stub. Counting the stub as scanned let
+          # `git lfs track '*.md'` plus a leaking commit exit 0 on a required
+          # check; the stub is a SKIP with a named kind instead (BE-8654 review).
+          root="$(mktemp -d)"
+          git -C "$root" init -q
+          printf 'version https://git-lfs.github.com/spec/v1\noid sha256:%064d\nsize 42\n' 0 \
+            > "$root/doc.md"
+          git -C "$root" add -A
+          set +e
+          out="$(python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root" 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+          if [ "$code" -ne 2 ]; then
+            echo "::error::expected exit 2 for a repo whose only file is an LFS stub, got $code"
+            exit 1
+          fi
+          grep -qF 'SCANNED: 0 file(s)' <<<"$out" || {
+            echo "::error::an LFS pointer stub was still counted as scanned"
+            exit 1
+          }
+          grep -qF 'git-LFS pointer' <<<"$out" || {
+            echo "::error::the LFS skip was not named in the NOT SCANNED totals"
+            exit 1
+          }
+          echo "checker correctly refused to count LFS stubs as coverage"
 
       - name: Smoke test — a non-git tree is a loud config error, not a pass
         run: |

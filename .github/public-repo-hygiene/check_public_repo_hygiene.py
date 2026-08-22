@@ -33,9 +33,11 @@ one that matched nothing, so coverage cannot rot invisibly.
 
 Exit codes: 0 pass, 1 one or more internal-only references found, 2 the run
 proves nothing (an unusable `--exclude` value, a root that is not a git work
-tree, tracked content at the reserved `_public_repo_hygiene/` path, or a scan
-that ended up reading zero files). Exit 2 is never "clean" -- a guard that
-looked at nothing has to be as loud as one that found something.
+tree, tracked content at the reserved `_public_repo_hygiene/` path, a
+`working-tree-encoding` gitattribute that makes the work tree differ from what
+git stores, or a scan that ended up reading zero files). Exit 2 is never
+"clean" -- a guard that looked at nothing has to be as loud as one that found
+something.
 
 Run locally:
     python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root .
@@ -190,6 +192,17 @@ MAX_EXCERPT_CHARS = 200
 MAX_FINDINGS_PER_FILE = 200
 MAX_FINDINGS_TOTAL = 2000
 
+# The same bound, applied to the OTHER accumulator. `warnings` is per-file and
+# embeds the path, and there are now six producers of one (unreadable, symlink,
+# submodule gitlink, non-regular file, oversize truncation, LFS stub) -- so a
+# tree of tens of thousands of tracked symlinks (a ~20-byte blob apiece) floods
+# a PUBLIC run log and retains the strings, reaching the finding caps' problem
+# through a door they do not cover. Only the per-FILE warnings are capped: the
+# whole-run ones (zero coverage, report truncation) are appended after the scan
+# and always survive, and `skipped`/`scanned` are counts, so the coverage claim
+# stays complete however many warnings are dropped. (BE-8654 review.)
+MAX_WARNINGS_TOTAL = 200
+
 # git-lfs writes a ~130-byte pointer stub in place of the real content, and
 # `actions/checkout` leaves `lfs: false` by default. The stub is what is in the
 # work tree, so the scan reads IT and would otherwise count the file as covered
@@ -321,6 +334,54 @@ def tracked_files(root):
     return [p for p in out.decode("utf-8", "surrogateescape").split("\0") if p]
 
 
+def _work_tree_encoded(root, paths):
+    """Tracked paths whose WORK-TREE bytes are not the bytes git stores.
+
+    `working-tree-encoding=UTF-16` in a tracked `.gitattributes` keeps the
+    committed blob UTF-8 while checkout writes NUL-laden UTF-16 to disk. This
+    scan reads the work tree, so such a file is skipped as `binary` -- a
+    `NOT SCANNED` count, never a failure -- while the internal references sit
+    plainly visible in the blob GitHub serves on the web, in the API and in the
+    diff a reviewer reads. That is a green run over content the guard never
+    looked at, reachable from a two-line commit, so it is a hard configuration
+    error like every other route by which this checker would decline to look and
+    still report clean. (BE-8654 review.)
+
+    Asked of git rather than re-parsed here: `git check-attr` resolves the
+    attribute exactly as checkout does, honouring `.gitattributes` at every
+    directory level plus `.git/info/attributes`, which a hand-rolled reader of
+    the top-level file would miss.
+    """
+    if not paths:
+        return []
+    try:
+        out = subprocess.run(
+            ["git", "check-attr", "--stdin", "-z", "working-tree-encoding"],
+            cwd=root,
+            input="\0".join(paths).encode("utf-8", "surrogateescape"),
+            check=True,
+            capture_output=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as exc:
+        # Loud, not lenient: if we cannot establish that the work tree holds the
+        # committed bytes, we cannot claim to have scanned the committed bytes.
+        raise ConfigError(
+            f"could not resolve gitattributes via 'git check-attr' in "
+            f"'{root}': {exc}. That check is what rules out a work-tree "
+            f"encoding conversion hiding tracked content from this scan, so it "
+            f"cannot be skipped."
+        ) from exc
+    # `-z` output is a flat NUL-delimited stream of (path, attribute, value)
+    # triples; only the third field of each is of interest.
+    fields = out.decode("utf-8", "surrogateescape").split("\0")
+    converted = []
+    for i in range(0, len(fields) - 2, 3):
+        path, value = fields[i], fields[i + 2]
+        if value not in ("unspecified", "unset"):
+            converted.append(path)
+    return converted
+
+
 def _read_text(path):
     """Return (text, warnings, skip_kind). `skip_kind` is None iff text is not.
 
@@ -337,10 +398,16 @@ def _read_text(path):
 
     * UNREADABLE -- a permission problem, a vanished path. A tracked path the
       checker cannot open at all is worth naming.
+    * SUBMODULE GITLINK -- a directory entry. Its files belong to another
+      repository and are out of this scan's scope whichever way it was checked
+      out, so it is named as what it is rather than as a device node.
     * NOT A REGULAR FILE -- a FIFO, socket or device node. Reading one would
       block on the device or turn the read below into an OOM, and none of it is
       content this repo stores. `os.lstat` answers this WITHOUT following a
       link, so the decision is made on the entry git actually tracks.
+    * GIT-LFS POINTER -- the work tree holds a ~130-byte stub, not the file. The
+      stub reads fine as text, which is exactly why it must NOT count as
+      scanned.
 
     A SYMLINK is neither read nor skipped outright. `open()` FOLLOWS it, so
     scanning it would read whatever it points at -- a link out of the repo would
@@ -374,6 +441,25 @@ def _read_text(path):
                 "this repo's, and echoing it would be the leak, not the guard"
             ],
             None,
+        )
+
+    if stat.S_ISDIR(st.st_mode):
+        # A gitlink. `git ls-files` lists submodule paths like any other entry,
+        # and this is by far the commonest way a tracked path is not a regular
+        # file -- so it must not be reported as a device node. The submodule's
+        # own files are tracked in ITS repo and are never in this scan's scope
+        # whether or not they were fetched (the reusable workflow checks the
+        # caller out without `submodules:`, so the directory is usually empty).
+        # (BE-8654 review.)
+        return (
+            None,
+            [
+                "is a submodule gitlink, so it was NOT scanned: its files are "
+                "tracked in the submodule's own repository and need their own "
+                "hygiene run there (this workflow checks the caller out "
+                "without `submodules:`, so the directory is empty here)"
+            ],
+            "submodule gitlink",
         )
 
     if not stat.S_ISREG(st.st_mode):
@@ -426,13 +512,20 @@ def _read_text(path):
             f"{MAX_FILE_BYTES} were scanned"
         )
     if text.startswith(LFS_POINTER_PREFIX):
+        # SKIPPED, not scanned. The stub is text and does parse, but it carries
+        # none of the file's actual bytes, so counting it in `scanned` let it
+        # prop up the coverage claim: `git lfs track '*.md'` plus a commit
+        # carrying internal references would hold the zero-scan net open and
+        # exit 0 on a required check. A file whose content was never examined
+        # belongs in `skipped` with a named kind, like every other such route.
+        # (BE-8654 review.)
         warnings.append(
-            "is a git-LFS pointer stub, so only the ~130-byte stub was "
-            "scanned, NOT the real content it stands for. The content is "
-            "publicly downloadable from this repo but is not in the work tree "
-            "(`actions/checkout` does not fetch LFS objects by default), so "
-            "this file is a hole in the scan's coverage"
+            "is a git-LFS pointer stub, so it was NOT scanned: the real "
+            "content it stands for is publicly downloadable from this repo but "
+            "is not in the work tree (`actions/checkout` does not fetch LFS "
+            "objects by default), and the ~130-byte stub is not the file's text"
         )
+        return None, warnings, "git-LFS pointer"
     return text, warnings, None
 
 
@@ -590,6 +683,11 @@ def run_checks(root, excludes=(), extra_ticket_allow=()):
     exist for one reason: `scanned` is the number of files this run actually
     read, and every file that is tracked but not in it has to be attributable to
     a named reason.
+
+    Raises `ConfigError` (exit 2) before reading anything when the tree cannot
+    be scanned honestly at all: tracked content at the reserved checkout path,
+    or a `working-tree-encoding` gitattribute that makes the bytes on disk
+    differ from the bytes git stores.
     """
     excludes = [_normalize_exclude(p) for p in excludes]
     # Additive, never a replacement: a caller can name extra acronyms, it can
@@ -611,11 +709,32 @@ def run_checks(root, excludes=(), extra_ticket_allow=()):
             f"any PR could park an internal reference in and stay green."
         )
 
+    # Only over what this run would actually READ: an encoding conversion on a
+    # path the caller excluded hides nothing this scan was going to look at, and
+    # failing the run over it would be a false alarm the caller cannot clear.
+    converted = _work_tree_encoded(
+        root, [r for r in tracked if _is_excluded(r, excludes) is None]
+    )
+    if converted:
+        raise ConfigError(
+            f"{len(converted)} tracked file(s) carry a `working-tree-encoding` "
+            f"gitattribute (first: '{converted[0]}'), so what checkout writes "
+            f"to disk is NOT the bytes git stores. This checker reads the work "
+            f"tree, so a UTF-16 conversion turns the file into NUL-laden bytes "
+            f"it skips as binary -- while the committed blob GitHub serves on "
+            f"the web, in the API and in the diff stays plainly readable. That "
+            f"would be a green run over content this guard never looked at. "
+            f"Drop the attribute, or exclude those paths explicitly via "
+            f"`exclude_paths:` so the hole is named in the log instead of "
+            f"hidden."
+        )
+
     counts = {p: 0 for p in excludes}
     skipped = collections.Counter()
     findings, warnings = [], []
     scanned = 0
     truncated_report = False
+    suppressed_warnings = 0
     for rel in tracked:
         hit = _is_excluded(rel, excludes)
         if hit is not None:
@@ -632,11 +751,26 @@ def run_checks(root, excludes=(), extra_ticket_allow=()):
             found = found[:room]
         findings.extend(found)
         for warning in file_warnings:
-            warnings.append(f"{rel}: {warning}")
+            # Per-run cap, for the same reason the findings have one. Coverage
+            # accounting is deliberately NOT capped: every file dropped here is
+            # still counted in `skipped` or `scanned` below.
+            if len(warnings) < MAX_WARNINGS_TOTAL:
+                warnings.append(f"{rel}: {warning}")
+            else:
+                suppressed_warnings += 1
         if skip_kind is None:
             scanned += 1
         else:
             skipped[skip_kind] += 1
+
+    if suppressed_warnings:
+        warnings.append(
+            f"+{suppressed_warnings} more per-file warning(s) were produced "
+            f"and are NOT listed; only the first {MAX_WARNINGS_TOTAL} are. The "
+            f"exit code is unaffected, and so is coverage accounting -- every "
+            f"file behind a suppressed warning is still counted in the "
+            f"NOT SCANNED totals or in SCANNED above"
+        )
 
     if truncated_report:
         warnings.append(

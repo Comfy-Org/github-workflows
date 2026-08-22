@@ -20,9 +20,10 @@ GitHub annotations, so it wires in cleanly as a required status check. The check
 [`.github/public-repo-hygiene/`](../../.github/public-repo-hygiene).
 
 **The checker and its allowlist are loaded from this repo at the SHA you pin, never from your
-checkout** — so a PR in your repo cannot weaken or disable the check that is judging it. That is
-the difference from a `scripts/check-hygiene.py` you run yourself, and it is the reason this
-workflow exists.
+checkout** — so a PR in your repo cannot weaken or disable the check that is judging it *through
+this workflow's inputs*. That is the difference from a `scripts/check-hygiene.py` you run yourself,
+and it is the reason this workflow exists. See "Protect the `uses:` line" under Gotchas for the one
+thing no reusable workflow can enforce from the inside.
 
 ## Prerequisites
 
@@ -104,11 +105,34 @@ line-oriented. See
 [the checker README](../../.github/public-repo-hygiene/README.md#known-limitations).
 
 **A skip is always visible.** An exclusion is logged with its file count even when it matched
-nothing; an unreadable file, a device node, a git-LFS pointer stub or a symlink becomes a
-`::warning::` naming it; binary and non-UTF-8 files get a per-run `NOT SCANNED:` count; and every
-run prints `SCANNED: <n> file(s) read as text`. A run that read **zero** files exits **2**, not 0 — enumerating every top-level directory
+nothing; an unreadable file, a device node, a submodule gitlink, a git-LFS pointer stub or a
+symlink becomes a `::warning::` naming it; binary, non-UTF-8, submodule and LFS files get a per-run
+`NOT SCANNED:` count; and every run prints `SCANNED: <n> file(s) read as text`. A run that read
+**zero** files exits **2**, not 0 — enumerating every top-level directory
 in `exclude_paths` disables the whole scan, and a green "clean" there would prove nothing. If you
-see one of those lines, the run did less than it looks like.
+see one of those lines, the run did less than it looks like. Per-file warnings are capped at 200
+with a `+N more` tail so a repo full of symlinks cannot flood a public run log; the counts are not
+capped, so the coverage arithmetic stays complete.
+
+**Protect the `uses:` line.** What this workflow enforces is that the checker comes from the commit
+your `uses:` line resolved to (`workflows_ref` must equal `job.workflow_sha`). What it cannot
+enforce from the inside is *which* `uses:` line runs: a `pull_request` caller executes its workflow
+file from the PR head, so a PR that rewrites `uses:` **and** `workflows_ref` together — to another
+commit here, or to a fork — runs a different workflow entirely. That is true of every reusable
+workflow on GitHub. If you are making this a **required** status check, also protect
+`.github/workflows/` with CODEOWNERS and/or a repository ruleset requiring review, so that line
+cannot move without a human approving it.
+
+**`working-tree-encoding` is refused, not worked around.** If a tracked `.gitattributes` sets it on
+a path this run would read, the run exits **2** naming the file. The attribute makes what checkout
+writes to disk differ from what git stores — a `UTF-16` conversion reads as binary to this scan
+while the committed blob GitHub serves stays plainly readable, which would be a green run over
+content the guard never looked at. Drop the attribute, or name those paths in `exclude_paths:` so
+the hole is counted in the log instead of hidden.
+
+**Submodules are not scanned.** `git ls-files` lists a gitlink, and the workflow checks you out
+without `submodules:`, so the directory is empty here. Each is named in a `::warning::` and counted
+under `NOT SCANNED:`. A submodule's own files need their own hygiene run in their own repo.
 
 **A symlink is scanned as its target *string*, never followed.** `open()` would read whatever the
 link points at — content that is not your repo's, and that would land in a public run log. The
@@ -116,8 +140,10 @@ target string git actually tracks *is* yours and is published in the tree, so th
 gets scanned. A `::warning::` names each one.
 
 **Git LFS content is not scanned.** The workflow checks you out without LFS, so an LFS-tracked file
-is present only as its ~130-byte pointer stub. The stub is scanned and the file is named in a
-`::warning::` — the real content, though publicly downloadable, is never examined.
+is present only as its ~130-byte pointer stub. The file is named in a `::warning::` and counted
+under `NOT SCANNED:` — the real content, though publicly downloadable, is never examined, so it
+deliberately does not count towards `SCANNED:`. A repo whose every text file is LFS-tracked
+therefore exits **2**, not 0.
 
 **Findings are capped, the verdict is not.** At most 200 findings per file and 2000 per run are
 listed, and a matched line is echoed as a 200-character excerpt. Hitting a cap adds a `::warning::`
@@ -126,8 +152,9 @@ scanned repo's own content would otherwise control.
 
 **`_public_repo_hygiene/` is a reserved path.** That is where the workflow checks the checker out
 inside your workspace. It normally lands untracked, so you will never meet this — but if your repo
-*tracks* anything at that path, the run fails with exit 2 telling you to rename the directory.
-Tracked content there is shadowed by the checkout and could never be scanned.
+*tracks* anything at that path, or anything already exists there, the run fails **before that
+checkout happens**, telling you to rename the directory. Tracked content there is shadowed by the
+checkout and could never be scanned; a symlink there would have had its target's contents removed.
 
 **Findings quote the offending line into the run log.** On a public repo that line is already in
 the public diff, so this adds no exposure — but if you enable this on a *private* repo, note that

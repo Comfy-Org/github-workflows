@@ -104,8 +104,14 @@ undeclared input at startup). On all of them except `groom.yml` the input is
 it is empty or omitted (GitHub does not enforce `required: true` for
 `workflow_call` inputs, so those workflows re-check at run time; `pr-risk.yml`,
 `pr-derisk.yml`, `pr-area-label.yml` and `linear-ticket.yml` additionally reject
-anything that is not a merged full 40-hex SHA of this repo). The guards are
-per-job, so a skipped job never evaluates one. `groom.yml` is the one workflow
+anything that is not a merged full 40-hex SHA of this repo, and
+`public-repo-hygiene.yml` is stricter still — it rejects anything that is not a
+full 40-hex SHA **equal to `job.workflow_sha`**, the commit your `uses:` line
+resolved to, so a valid SHA that simply is not the one you pinned fails too. For
+the same reason it fails rather than warns when `job.workflow_sha` is empty, so
+it needs an Actions runner **≥ v2.334.0**; GitHub-hosted runners are well past
+it. See [the caller docs](docs/callers/README.md) for the three tiers.) The
+guards are per-job, so a skipped job never evaluates one. `groom.yml` is the one workflow
 that does not require the input: an omitted value falls back to
 `job.workflow_sha` — the commit the caller's `uses:` pin resolved to — so
 leaving it unset is safe, and every job that checks out the briefs and scripts

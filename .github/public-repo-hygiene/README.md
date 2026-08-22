@@ -38,11 +38,18 @@ something is worse than no guard — the green run reads as coverage:
 - an exclusion is logged with its skipped-file count, **including one that skipped nothing**;
 - a file that cannot be *read* (a permission problem) or that is *not a regular file* (a FIFO,
   socket or device node) is a `::warning::` naming it, not a silent drop;
+- a **submodule gitlink** is named as one — `git ls-files` lists it, and the workflow checks the
+  caller out without `submodules:`, so it is an empty directory here. Its files belong to another
+  repository and need their own hygiene run there;
 - a **symlink** is a `::warning::` naming it too, saying that only the target string was read —
-  it counts as scanned, because that string *is* what this repo publishes there;
-- a **git-LFS pointer stub** is a `::warning::` naming it: `actions/checkout` does not fetch LFS
-  objects, so the work tree holds the ~130-byte stub and the real content — publicly downloadable
-  from the same repo — is never examined. Without this the file would count as covered;
+  it counts as scanned, because that string *is* the blob git stores at that path and publishes in
+  the tree; the file it points at is not this repo's content and echoing it into a public run log
+  would be the leak, not the guard;
+- a **git-LFS pointer stub** is a `::warning::` naming it *and* a `NOT SCANNED:` count:
+  `actions/checkout` does not fetch LFS objects, so the work tree holds the ~130-byte stub and the
+  real content — publicly downloadable from the same repo — is never examined. It deliberately does
+  **not** count as scanned: otherwise `git lfs track '*.md'` plus a commit carrying internal
+  references would hold the zero-scan net below open and exit 0 on a required check;
 - binary and non-UTF-8 files are expected skips, so they are a per-run `NOT SCANNED: <n>` count
   rather than a warning each — a count they must have, because one stray byte otherwise hides a
   whole file that still renders as text on GitHub;
@@ -56,7 +63,16 @@ something is worse than no guard — the green run reads as coverage:
   workspace — is a **reserved** path. The checkout lands untracked, so an ordinary run never meets
   it; a caller that *tracks* content there fails with exit 2 and is told to rename the directory,
   because that content is shadowed by the checkout and can never be examined. Skipping it quietly
-  is how the reserved path would have become a parking spot that ships green.
+  is how the reserved path would have become a parking spot that ships green. The reusable workflow
+  refuses *before* its own checkout too, so nothing at that path is ever replaced;
+- a `working-tree-encoding` gitattribute on any path this run would read **exits 2**. It makes the
+  bytes on disk differ from the bytes git stores, so a `UTF-16` conversion reads as binary here
+  while the committed blob GitHub serves stays plainly readable — a green run over content the
+  guard never looked at. An excluded path may carry one: that hole is already named by its
+  exclusion count;
+- per-file warnings are capped at `MAX_WARNINGS_TOTAL` (200) with a `+N more` tail, for the same
+  reason the findings are. The **counts** are never capped, so the coverage claim above stays
+  complete however many warnings are dropped.
 
 ## Why the allowlist lives here (BE-8654)
 
@@ -93,6 +109,19 @@ honest boundary: this design makes weakening the *rule* impossible from a caller
 narrowing the *scope* loud. Adding a repo to the allowlist is now one reviewed PR here rather
 than one edit per consumer.
 
+**Where the guarantee stops — the `uses:` line itself.** Everything above is about what a caller
+can pass *in*. What no reusable workflow can enforce from the inside is *which* reusable runs: a
+`pull_request` caller executes its workflow FILE from the PR head, so a PR that rewrites the
+`uses:` line **and** `workflows_ref` together — to another commit of this repo, or to a fork of it
+that never contained these checks — runs a different workflow, and the equality check inside *that*
+one says nothing about this one. This is a property of GitHub Actions, not of this workflow, and it
+applies equally to `agents-md-integrity.yml` and every other entry in the catalog. The control is
+out of band: an adopter making this a **required** status check should also protect
+`.github/workflows/` with CODEOWNERS and/or a repository ruleset requiring review, so the `uses:`
+line cannot move without a human approving it. Stated precisely, what this design buys is that a
+PR cannot reach the checker or the allowlist *through this workflow's inputs* — the failure the two
+per-repo copies had, where an in-tree allowlist edit was all it took.
+
 `tests/test_check_public_repo_hygiene.py::TamperResistanceTest` asserts the checker half (an
 in-tree copy of the checker, a config file, and environment variables named after the constants
 are all inert). [`test-public-repo-hygiene.yml`](../workflows/test-public-repo-hygiene.yml)
@@ -106,6 +135,15 @@ case-sensitively — were fixed in BE-8697 and are pinned by unit tests; that is
 parity with those scripts deliberately ended.
 
 - **The scan is line-oriented.** A reference split across two lines is not matched.
+- **Only file *contents* are scanned, never file *paths*.** A `docs/<TICKET>-migration.md` or a
+  `notion-exports/` directory passes clean.
+- **Git-LFS content, submodule contents and the far side of a symlink are not scanned** — each is
+  counted under `NOT SCANNED:` (or, for a symlink, scanned as the link target *string* git actually
+  stores) rather than silently treated as covered. See the coverage rules below.
+- **A `working-tree-encoding` gitattribute is refused, not worked around.** It would make the bytes
+  on disk differ from the bytes git stores — `UTF-16` on disk reads as binary here while the
+  committed blob GitHub serves stays plainly readable — so a tree carrying one on any path this run
+  would read is a hard configuration error (exit 2), naming the file.
 
 ## Running it
 
@@ -118,8 +156,9 @@ python3 -m unittest discover -s .github/public-repo-hygiene/tests -p 'test_*.py'
 ```
 
 Exit codes: `0` clean, `1` findings, `2` the run proves nothing — an unusable `--exclude`, a root
-that is not a git work tree, tracked content at the reserved `_public_repo_hygiene/` path, or a
-scan that read zero files. "Nothing to scan" must never read as "clean".
+that is not a git work tree, tracked content at the reserved `_public_repo_hygiene/` path, a
+`working-tree-encoding` gitattribute on a path this run would read, or a scan that read zero files.
+"Nothing to scan" must never read as "clean".
 
 ## Adding a repo to the allowlist
 

@@ -13,7 +13,8 @@ name: Public Repo Hygiene (reusable)
 #
 # The check script is loaded from THIS repo (public, pinned via `workflows_ref`)
 # — never from the caller's checkout — so a PR can't rewrite the checker OR its
-# allowlist. That is the whole point (BE-8654): the two per-repo copies this
+# allowlist (see "WHERE THAT GUARANTEE STOPS" below for the one thing this
+# cannot enforce). That is the whole point (BE-8654): the two per-repo copies this
 # replaces were run straight out of the PR's own checkout, so a PR could add a
 # private repo name to the in-tree allowlist and then leak it, green. The
 # known-public repo/team allowlist is deliberately NOT an input — an allowlist a
@@ -21,6 +22,22 @@ name: Public Repo Hygiene (reusable)
 #
 # Hosting the allowlist here leaks nothing: it lists public repo names only, by
 # design. No private repo name is ever listed — that is what default-deny buys.
+#
+# WHERE THAT GUARANTEE STOPS. What is enforced here is that the checker comes
+# from the commit the caller's `uses:` line resolved to — `workflows_ref` must
+# be a 40-hex SHA equal to `job.workflow_sha` (below). What is NOT enforceable
+# from inside a reusable workflow is which `uses:` line runs: a `pull_request`
+# caller executes its workflow FILE from the PR head, so a PR in the caller repo
+# that rewrites BOTH the `uses:` line and `workflows_ref` — to another commit of
+# this repo, or to a fork of it altogether — runs a different reusable, and the
+# equality check inside THAT one proves nothing about this one. This is true of
+# every reusable workflow on GitHub, not a defect specific to this one, and the
+# control for it is out of band: protect the caller's `.github/workflows/`
+# directory with CODEOWNERS and/or a repository ruleset requiring review, so the
+# `uses:` line cannot move without a human approving it. Adopters wiring this as
+# a REQUIRED status check should do that; without it the honest claim is the
+# narrower one — a PR cannot reach the checker or the allowlist *through this
+# workflow's inputs*. (BE-8654 review.)
 #
 # Caller pattern (place in the consumer repo at
 # .github/workflows/public-repo-hygiene.yml):
@@ -184,6 +201,30 @@ jobs:
           fi
           if [ "$REF" != "$SHA" ]; then
             echo "::error::workflows_ref ($REF) is not the commit this workflow was called at ($SHA). The uses: pin and workflows_ref MUST name the same commit — otherwise the workflow is pinned but the checker and its allowlist are loaded from somewhere else, which is the exact hole this workflow exists to close. Set both to $SHA."
+            exit 1
+          fi
+
+      - name: Reject a collision at the reserved checkout path
+        # The checker rejects TRACKED content at `_public_repo_hygiene/` too
+        # (exit 2), but it runs two steps below this — AFTER the checkout has
+        # already resolved that path, so it reports the collision rather than
+        # preventing it. `actions/checkout` resolves `path:` lexically and then
+        # stats it FOLLOWING symlinks, so a caller that tracks a directory
+        # symlink by that name passes the under-workspace test and has the
+        # contents of the link TARGET cleaned out before the clone — outside
+        # the workspace, and outside the job's lifetime on a self-hosted
+        # runner. Refuse before anything is deleted; the checker's own guard
+        # stays as the in-tree backstop for the ordinary case. (BE-8654 review.)
+        env:
+          RESERVED: _public_repo_hygiene
+        run: |
+          if [ -e "$RESERVED" ] || [ -L "$RESERVED" ]; then
+            echo "::error::'$RESERVED' already exists in the workspace and is a RESERVED path — it is where this workflow checks the hygiene checker out. Refusing to continue: the checkout would replace it, and if it is a symlink the contents of its TARGET would be removed. Rename the directory in your repo."
+            exit 1
+          fi
+          tracked="$(git ls-files -- "$RESERVED")"
+          if [ -n "$tracked" ]; then
+            echo "::error::your repo tracks content under '$RESERVED/' — a RESERVED path, where this workflow checks the hygiene checker out inside your workspace. That checkout shadows your content, so nothing tracked there could ever be scanned. Rename the directory."
             exit 1
           fi
 

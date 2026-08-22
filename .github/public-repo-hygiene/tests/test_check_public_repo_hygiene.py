@@ -597,12 +597,117 @@ class CoverageReportingTest(CheckerTestCase):
         self.repo.write("ok.md", "clean\n")
         result = self.run_checks()
         self.assertEqual(result.findings, [])
-        # The stub itself IS text and was read, so it counts as scanned...
-        self.assertEqual(result.scanned, 2)
-        # ...but the file it stands for was not, and that is said out loud.
+        # The stub parses as text, but none of the file's actual bytes were
+        # read, so it must NOT prop up the coverage claim: only `ok.md` counts.
+        self.assertEqual(result.scanned, 1)
+        self.assertEqual(result.skipped, [("git-LFS pointer", 1)])
         lfs = [w for w in result.warnings if "git-LFS" in w]
         self.assertEqual(len(lfs), 1, result.warnings)
         self.assertIn("asset.bin", lfs[0])
+
+    def test_an_all_lfs_repo_cannot_hold_the_zero_scan_net_open(self):
+        # The reason the stub had to move out of `scanned`: `git lfs track
+        # '*.md'` plus a commit carrying internal references would otherwise
+        # exit 0 on a required status check, having read no content at all.
+        self.repo.write(
+            "doc.md",
+            checker.LFS_POINTER_PREFIX
+            + "\noid sha256:" + "b" * 64 + "\nsize 99\n",
+        )
+        result = self.run_checks()
+        self.assertEqual(result.scanned, 0)
+        self.assertEqual(result.skipped, [("git-LFS pointer", 1)])
+        self.assertTrue(
+            any("no files were scanned" in w for w in result.warnings),
+            result.warnings,
+        )
+        self.assertEqual(checker._emit(result), 2)
+
+    def test_a_submodule_gitlink_is_named_as_one_not_as_a_device_node(self):
+        # `git ls-files` lists gitlinks, and the reusable workflow checks the
+        # caller out without `submodules:` -- so this is the commonest way a
+        # tracked path is not a regular file, and reporting it as a FIFO or
+        # device node is the wrong type AND the wrong reason.
+        self.repo.write("ok.md", "clean\n")
+        sub = os.path.join(self.repo.root, "vendor", "lib")
+        os.makedirs(sub)
+        subprocess.run(["git", "init", "-q"], cwd=sub, check=True,
+                       capture_output=True)
+        for key, value in (("user.email", "t@example.invalid"),
+                           ("user.name", "t")):
+            subprocess.run(["git", "config", key, value], cwd=sub, check=True,
+                           capture_output=True)
+        with open(os.path.join(sub, "f.txt"), "w") as fh:
+            fh.write("x\n")
+        subprocess.run(["git", "add", "-A"], cwd=sub, check=True,
+                       capture_output=True)
+        subprocess.run(["git", "commit", "-qm", "s"], cwd=sub, check=True,
+                       capture_output=True)
+        env = dict(os.environ, GIT_ALLOW_PROTOCOL="file")
+        subprocess.run(
+            ["git", "-c", "protocol.file.allow=always", "submodule", "add",
+             "-q", "./vendor/lib", "vendor/lib"],
+            cwd=self.repo.root, check=True, capture_output=True, env=env,
+        )
+        result = self.run_checks()
+        gitlink = [w for w in result.warnings if "vendor/lib:" in w]
+        self.assertEqual(len(gitlink), 1, result.warnings)
+        self.assertIn("submodule gitlink", gitlink[0])
+        self.assertNotIn("device node", gitlink[0])
+        self.assertIn(("submodule gitlink", 1), result.skipped)
+
+    def test_a_work_tree_encoding_attribute_is_a_hard_failure(self):
+        # The blob git stores stays UTF-8 and plainly readable on GitHub, while
+        # checkout writes NUL-laden UTF-16 to disk -- which this scan, which
+        # reads the WORK TREE, skips as binary. A green run over content the
+        # guard never looked at, from a two-line commit.
+        self.repo.write(".gitattributes", "*.md working-tree-encoding=UTF-16\n")
+        # Written as the work tree would actually hold it -- git validates the
+        # round-trip on `add`, and the blob it stores from these bytes is UTF-8
+        # with the reference in plain view.
+        self.repo.write(
+            "leak.md", "See Comfy-Org/definitely-not-public\n".encode("utf-16")
+        )
+        with self.assertRaises(checker.ConfigError) as ctx:
+            self.run_checks()
+        self.assertIn("working-tree-encoding", str(ctx.exception))
+        self.assertIn("leak.md", str(ctx.exception))
+
+    def test_an_excluded_path_may_carry_a_work_tree_encoding_attribute(self):
+        # The conversion only hides something this run was going to read. On an
+        # excluded path the hole is already named in the log by its exclusion
+        # count, so failing there would be a false alarm with no way to clear it.
+        # Lower-cased encoding name (git accepts either) purely so the
+        # fixture's own `.gitattributes` is not itself a category-1 finding:
+        # `UTF-16` fits TICKET_RE and is not on the built-in acronym allowlist,
+        # unlike its neighbour `UTF-8`. That gap is one of the category-1
+        # allowlist follow-ups off this PR's review round, not something this
+        # test should quietly paper over by widening the allowlist here.
+        self.repo.write(
+            ".gitattributes", "vendor/* working-tree-encoding=utf-16\n"
+        )
+        self.repo.write("vendor/blob.md", "clean\n".encode("utf-16"))
+        self.repo.write("ok.md", "clean\n")
+        result = self.run_checks(excludes=["vendor/"])
+        self.assertEqual(result.findings, [])
+        self.assertEqual(result.scanned, 2)
+
+    def test_per_file_warnings_are_capped_without_losing_the_accounting(self):
+        # `warnings` embeds a path per entry and has six producers; uncapped, a
+        # tree of tens of thousands of tracked symlinks floods a PUBLIC run log
+        # -- the same derived-output problem the finding caps close, through a
+        # door they do not cover.
+        self.repo.write("ok.md", "clean\n")
+        count = checker.MAX_WARNINGS_TOTAL + 5
+        for i in range(count):
+            link = os.path.join(self.repo.root, f"link{i}")
+            os.symlink("target.txt", link)
+            self.repo._git("add", "--", f"link{i}")
+        result = self.run_checks()
+        self.assertEqual(len(result.warnings), checker.MAX_WARNINGS_TOTAL + 1)
+        self.assertIn("+5 more per-file warning(s)", result.warnings[-1])
+        # Coverage accounting is NOT capped: every symlink is still counted.
+        self.assertEqual(result.scanned, count + 1)
 
     def test_findings_are_capped_per_file_without_softening_the_verdict(self):
         # The read cap bounds bytes READ; nothing bounded what was DERIVED from
