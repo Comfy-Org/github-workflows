@@ -180,6 +180,76 @@ class InternalMarkerCategoryTest(CheckerTestCase):
         )
         self.assertEqual(self.findings(), [])
 
+    LOOKALIKE_HOSTS = (
+        "https://fooslack.com/archives/x",
+        "https://evil-posthog.com/project/1",
+        "https://my-linear.app/x",
+        "https://mydocs.google.com/doc/1",
+        "https://foonotion.so/page",
+        "https://app.slack.com.evil.com/",
+    )
+
+    def test_lookalike_hosts_are_not_flagged(self):
+        # Every one of these was a finding before the DNS-label anchors: `\b`
+        # is not a host boundary (a hyphen is a non-word character, so
+        # `\bposthog\.com` matched inside `evil-posthog.com`) and half the
+        # patterns carried no left anchor at all. A letter, digit or hyphen
+        # before the host means a DIFFERENT registrable domain; only a dot is a
+        # real subdomain edge. `app.slack.com.evil.com` is the right-hand twin:
+        # it is the one host-only pattern, so `\b` accepted a following label.
+        #
+        # `notlinear.app` is deliberately absent -- `t`->`l` puts a word
+        # character where `\blinear` needed a boundary, so it never matched
+        # even before the fix and would pin nothing.
+        for marker in self.LOOKALIKE_HOSTS:
+            with self.subTest(marker=marker):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write("notes.md", marker + "\n")
+                self.assertEqual(checker.run_checks(repo.root).findings, [])
+
+    PORTED_MARKERS = (
+        "https://www.notion.so:443/team/page",
+        "https://app.datadoghq.com:8443/x",
+        "https://linear.app:443/comfy/issue/AA-1",
+    )
+
+    def test_an_explicit_port_does_not_bypass_the_check(self):
+        # A port sits between the host and the path, so every pattern that
+        # required `/` straight after the host was a one-token bypass away
+        # from silence.
+        for marker in self.PORTED_MARKERS:
+            with self.subTest(marker=marker):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write("notes.md", marker + "\n")
+                findings = [
+                    f
+                    for f in checker.run_checks(repo.root).findings
+                    if "collaboration-tool marker" in f
+                ]
+                self.assertGreaterEqual(len(findings), 1, f"{marker}: {findings}")
+
+    def test_the_host_only_pattern_still_ends_on_punctuation_or_a_port(self):
+        # The right anchor replacing `\b` on `app.slack.com` is
+        # `(?!\.?[A-Za-z0-9-])`, which has to reject a following LABEL without
+        # also rejecting ordinary punctuation, a port, or end of line.
+        for marker in (
+            "Ask in app.slack.com.",
+            "Ask in app.slack.com:443 if you self-host.",
+            "https://app.slack.com",
+        ):
+            with self.subTest(marker=marker):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write("notes.md", marker + "\n")
+                findings = [
+                    f
+                    for f in checker.run_checks(repo.root).findings
+                    if "collaboration-tool marker" in f
+                ]
+                self.assertEqual(len(findings), 1, f"{marker}: {findings}")
+
 
 class RepoReferenceCategoryTest(CheckerTestCase):
     def test_unknown_repo_is_flagged_default_deny(self):

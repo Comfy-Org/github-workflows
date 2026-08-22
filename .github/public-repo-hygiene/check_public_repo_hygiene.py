@@ -97,15 +97,35 @@ TICKET_ALLOWED_PREFIXES = frozenset(
 )
 
 # --- Category 2: internal collaboration-tool links/markers -----------------
+# Anchored on real DNS-label boundaries, not on `\b` and not on nothing.
+#
+# A host name is a dot-separated sequence of labels made of letters, digits and
+# hyphens, so the only character that can precede a host we care about and still
+# leave it THAT host is a dot (a genuine subdomain edge) or something outside the
+# label alphabet entirely (`/`, `@`, a space, start of line). A letter, digit or
+# hyphen in front means a DIFFERENT registrable name: `comfy.slack.com` and
+# `www.notion.so` really are those services, while `fooslack.com` and
+# `evil-posthog.com` are unrelated domains that the bare patterns used to flag.
+# `\b` did not help -- a hyphen is a non-word character, so `\bposthog\.com`
+# matched inside `evil-posthog.com` -- and half these patterns had no left
+# anchor at all. Do NOT "tighten" this to `(?<![A-Za-z0-9.-])`: barring a
+# preceding dot rejects every subdomain-prefixed positive the fixtures pin.
+_HOST_L = r"(?<![A-Za-z0-9-])"
+# An explicit port sits between the host and the path, so a pattern that
+# requires `/` straight after the host is bypassed by `notion.so:443/`.
+_PORT = r"(?::\d+)?"
 INTERNAL_MARKER_RES = (
-    re.compile(r"notion\.(so|site)/", re.IGNORECASE),
-    re.compile(r"slack\.com/(archives|client)/", re.IGNORECASE),
-    re.compile(r"\bapp\.slack\.com\b", re.IGNORECASE),
-    re.compile(r"docs\.google\.com/", re.IGNORECASE),
-    re.compile(r"drive\.google\.com/", re.IGNORECASE),
-    re.compile(r"app\.datadoghq\.com/", re.IGNORECASE),
-    re.compile(r"\bposthog\.com/project/", re.IGNORECASE),
-    re.compile(r"\blinear\.app/", re.IGNORECASE),
+    re.compile(_HOST_L + r"notion\.(so|site)" + _PORT + "/", re.IGNORECASE),
+    re.compile(_HOST_L + r"slack\.com" + _PORT + "/(archives|client)/", re.IGNORECASE),
+    # The one host-only pattern, so it needs a right anchor of its own. `\b`
+    # accepted `app.slack.com.evil.com`; this rejects a following label while
+    # still allowing a sentence-final period, a port and end of line.
+    re.compile(_HOST_L + r"app\.slack\.com" + _PORT + r"(?!\.?[A-Za-z0-9-])", re.IGNORECASE),
+    re.compile(_HOST_L + r"docs\.google\.com" + _PORT + "/", re.IGNORECASE),
+    re.compile(_HOST_L + r"drive\.google\.com" + _PORT + "/", re.IGNORECASE),
+    re.compile(_HOST_L + r"app\.datadoghq\.com" + _PORT + "/", re.IGNORECASE),
+    re.compile(_HOST_L + r"posthog\.com" + _PORT + "/project/", re.IGNORECASE),
+    re.compile(_HOST_L + r"linear\.app" + _PORT + "/", re.IGNORECASE),
     re.compile(r"\bincident-\d+\b", re.IGNORECASE),
 )
 
