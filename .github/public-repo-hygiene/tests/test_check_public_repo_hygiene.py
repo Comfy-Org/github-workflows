@@ -14,6 +14,7 @@ this file from a pinned ref instead of the caller's checkout -- is asserted by
 `.github/workflows/test-public-repo-hygiene.yml`.
 """
 
+import codecs
 import os
 import subprocess
 import sys
@@ -96,6 +97,27 @@ class TicketIdCategoryTest(CheckerTestCase):
         )
         flagged = sorted(f.split(": ")[-1] for f in self.findings())
         self.assertEqual(flagged, ["'ABCDEF-123456'", "'BE-12'"])
+
+    def test_public_identifier_namespaces_clear_by_prefix(self):
+        # `\b[A-Z]{2,6}-\d{2,6}\b` matches `CVE-2021` INSIDE `CVE-2021-44228`
+        # (the `\b` holds against the following hyphen), so a SECURITY.md or a
+        # dependency changelog reddened what adopters wire in as a REQUIRED
+        # check. An exact-token carve-out would cost one entry per year prefix
+        # and break again each January, so the namespace is allowlisted instead.
+        self.repo.write(
+            "SECURITY.md",
+            "Patched CVE-2021-44228 (see also CVE-2024-3094).\n"
+            "Classified as CWE-89; the API follows PEP-484 and RFC-9110,\n"
+            "with ISO-19115 metadata written as UTF-16 or UTF-32.\n",
+        )
+        self.assertEqual(self.findings(), [])
+
+    def test_an_allowlisted_prefix_does_not_clear_a_longer_acronym(self):
+        # The carve-out is the namespace token itself, not any acronym starting
+        # with those letters -- `CVEX-1234` is still ticket-shaped.
+        self.repo.write("README.md", "See CVEX-1234 and ISOP-99 for context.\n")
+        findings = self.findings()
+        self.assertEqual(len(findings), 2, findings)
 
     def test_extra_ticket_allow_is_additive(self):
         self.repo.write("README.md", "GPU-100 and SHA-256 and BE-1234.\n")
@@ -292,13 +314,26 @@ class RepoReferenceCategoryTest(CheckerTestCase):
         # known-PUBLIC repo was reported as "a team not in the known-public
         # allowlist" -- with no caller-side escape short of `exclude_paths:`,
         # since neither allowlist is a workflow input. The `@` branch therefore
-        # admits the repo allowlist too.
+        # admits the repo allowlist too, for a spelling that could BE an npm
+        # coordinate.
         self.repo.write(
             "package.json",
-            '{"dependencies": {"@comfy-org/comfy-typescript-sdk": "^1.0.0",\n'
-            '  "@Comfy-Org/ComfyUI_frontend": "^2.0.0"}}\n',
+            '{"dependencies": {"@comfy-org/comfy-typescript-sdk": "^1.0.0"}}\n',
         )
         self.assertEqual(self.findings(), [])
+
+    def test_the_npm_crossing_does_not_clear_a_github_team_spelling(self):
+        # Naming a team after the repo it owns is the commonest CODEOWNERS
+        # convention there is, so an unconditional crossing cleared exactly the
+        # likely collision: a team handle waved through because a public repo
+        # shares its name. npm scopes cannot be spelled with a capital, so the
+        # canonical GitHub team casing does not reach the crossing and
+        # default-deny holds for it.
+        self.repo.write("CODEOWNERS", "* @Comfy-Org/ComfyUI_frontend\n")
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("@Comfy-Org/ComfyUI_frontend", findings[0])
+        self.assertIn("team not in the known-public allowlist", findings[0])
 
     def test_at_prefixed_name_on_neither_allowlist_is_still_flagged(self):
         # Admitting the repo allowlist widens the `@` branch by exactly the
@@ -335,19 +370,98 @@ class RepoReferenceCategoryTest(CheckerTestCase):
 
     def test_name_class_stays_ascii_under_the_scoped_ignorecase(self):
         # `re.IGNORECASE` applied to the WHOLE pattern also widens `[A-Za-z]`:
-        # under Unicode case-folding it matches U+017F and U+212A, so `.casefold()`
-        # at the membership test would fold `comfy-typeſcript-sdk` back onto an
-        # allowlisted name (a default-deny bypass), and `comfyui` followed by a
-        # Kelvin sign would be absorbed into the name and flagged. Scoping the
-        # flag to the org segment keeps the capture ASCII, so the first is still
-        # a finding and the second is still clean.
+        # under Unicode case-folding it matches U+017F and U+212A, so
+        # `.casefold()` at the membership test would fold `comfy-typeſcript-sdk`
+        # back onto an allowlisted name -- a default-deny bypass. Scoping the
+        # flag to the org segment keeps the CAPTURE ASCII; the characters it
+        # cannot read are then handled as a partly-read name (below) rather than
+        # as a name boundary.
         self.repo.write("README.md", "Comfy-Org/comfy-typeſcript-sdk\n")
         findings = self.findings()
         self.assertEqual(len(findings), 1, findings)
-        self.assertNotIn("ſ", findings[0])
+        self.assertIn("homoglyph", findings[0])
 
+    def test_a_name_the_ascii_class_only_partly_read_is_never_cleared(self):
+        # The capture class has no right boundary, so the match stops at the
+        # first non-ASCII character -- and the allowlist would then be tested
+        # against a PREFIX of what the file actually says. U+2010 HYPHEN renders
+        # identically to `-` on github.com, so `Comfy-Org/comfyui‐internal`
+        # captured `comfyui`, casefolded into the known-public set and passed
+        # clean while the full private name sat in the tree.
+        self.repo.write("README.md", "See Comfy-Org/comfyui‐internal\n")
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        # The finding quotes the WHOLE name, not the prefix that was read.
+        self.assertIn("comfyui‐internal", findings[0])
+        self.assertIn("homoglyph", findings[0])
+        # "Add it to the allowlist" is not the remedy for a homoglyph, so the
+        # ordinary message would send the reader the wrong way.
+        self.assertNotIn("confirm it's public and add it", findings[0])
+
+    def test_a_kelvin_sign_after_a_public_name_is_a_finding_not_a_pass(self):
+        # U+212A casefolds to `k`, so absorbing it silently would clear a name
+        # that is not the allowlisted one. It is a letter, so it continues the
+        # name, so the reference is only partly read and is never cleared.
         self.repo.write("other.md", "Built on Comfy-Org/comfyuiK\n")
-        self.assertEqual(self.findings(), findings)
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("homoglyph", findings[0])
+
+    def test_a_cyrillic_homoglyph_is_caught_like_the_dash_one(self):
+        # The rule is every non-ASCII name character, not just the ones that
+        # casefold onto ASCII: Cyrillic `а` folds to nothing ASCII, so narrowing
+        # the rule to fold-collisions would leave the capture stopping at it and
+        # `comfyui` clearing on its own -- the same bypass, one alphabet over.
+        self.repo.write("README.md", "Comfy-Org/comfyui\u0430internal\n")
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("homoglyph", findings[0])
+
+    def test_prose_butted_against_an_allowlisted_name_is_a_known_cost(self):
+        # The flip side of the rule above, asserted so it is a DECISION rather
+        # than a surprise: non-Latin prose immediately after an allowlisted name
+        # (no separator) reads as part of the name and is reported. The message
+        # names the remedy, and a separator clears it.
+        self.repo.write("ja.md", "Comfy-Org/ComfyUIを使う\n")
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("adjacent PROSE", findings[0])
+
+        self.repo.write("ja.md", "Comfy-Org/ComfyUI を使う\n")
+        self.assertEqual(self.findings(), [])
+
+    def test_the_partly_read_rule_covers_the_team_branch_too(self):
+        self.repo.write("CODEOWNERS", "* @Comfy-Org/core-engine‐team\n")
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("@Comfy-Org/core-engine‐team", findings[0])
+
+    def test_ordinary_prose_after_a_public_name_is_not_a_partial_read(self):
+        # Only characters that CONTINUE a name (letters, digits, marks, dash and
+        # connector punctuation) mean the class stopped mid-token. A curly
+        # apostrophe, an em dash and an ellipsis end it -- otherwise every
+        # changelog written with smart quotes would produce homoglyph findings
+        # for repos that are on the allowlist.
+        self.repo.write(
+            "README.md",
+            "Comfy-Org/ComfyUI’s frontend — see Comfy-Org/comfy-cli…\n",
+        )
+        self.assertEqual(self.findings(), [])
+
+    def test_the_org_segment_must_start_a_token(self):
+        # Without a left boundary the org segment matched inside a longer word,
+        # so `NotComfy-Org/private` was reported as a reference to THIS org.
+        self.repo.write("README.md", "NotComfy-Org/whatever is a different org\n")
+        self.assertEqual(self.findings(), [])
+
+        # Every real spelling begins at a separator, and all of them still match.
+        self.repo.write(
+            "urls.md",
+            "https://github.com/Comfy-Org/secret-one\n"
+            "see Comfy-Org/secret-two\n"
+            '"Comfy-Org/secret-three"\n',
+        )
+        self.assertEqual(len(self.findings()), 3, self.findings())
 
     def test_team_allowlist_does_not_leak_into_repo_allowlist(self):
         # A team handle and a repo reference share a namespace in the source
@@ -585,6 +699,56 @@ class CoverageReportingTest(CheckerTestCase):
             any("only the first" in w for w in result.warnings), result.warnings
         )
 
+    def test_a_committed_utf16_blob_is_decoded_rather_than_called_binary(self):
+        # No gitattribute is involved here: the NUL bytes are in what git
+        # STORES, so `_work_tree_encoded` never sees this file, and the `binary`
+        # skip would drop it from the scan entirely -- a per-run count that
+        # never touches the verdict -- while GitHub still renders the blob as
+        # readable text. Every one of these encodings is self-describing via a
+        # BOM, so the decode is exact rather than guessed.
+        for name, encoding in (
+            ("le.md", "utf-16-le"),
+            ("be.md", "utf-16-be"),
+            ("u32.md", "utf-32-le"),
+        ):
+            with self.subTest(encoding=encoding):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                bom = {
+                    "utf-16-le": codecs.BOM_UTF16_LE,
+                    "utf-16-be": codecs.BOM_UTF16_BE,
+                    "utf-32-le": codecs.BOM_UTF32_LE,
+                }[encoding]
+                repo.write(
+                    name,
+                    bom + "See Comfy-Org/definitely-not-public\n".encode(encoding),
+                )
+                result = checker.run_checks(repo.root)
+                self.assertEqual(result.skipped, [], result.skipped)
+                self.assertEqual(result.scanned, 1)
+                self.assertEqual(len(result.findings), 1, result.findings)
+
+    def test_a_utf8_bom_does_not_hide_a_reference_on_the_first_line(self):
+        # UTF-8 is not in the BOM table -- these bytes decode down the ordinary
+        # path, leaving a U+FEFF at the head of line 1. That must not swallow a
+        # reference sitting immediately behind it: U+FEFF is not a word
+        # character, so neither the ticket pattern's `\b` nor the repo pattern's
+        # left boundary is affected.
+        self.repo.write(
+            "bom.md", codecs.BOM_UTF8 + b"Comfy-Org/definitely-not-public BE-1234\n"
+        )
+        result = self.run_checks()
+        self.assertEqual(result.scanned, 1)
+        self.assertEqual(len(result.findings), 2, result.findings)
+
+    def test_a_bom_over_bytes_that_do_not_decode_is_still_not_scanned(self):
+        # Failing OPEN here would be worse than the binary skip it replaces: a
+        # mislabelled BOM must not become "scanned, found nothing".
+        self.repo.write("lie.md", codecs.BOM_UTF32_LE + b"\xff\xff\xff")
+        result = self.run_checks()
+        self.assertEqual(result.skipped, [("non-UTF-8", 1)])
+        self.assertEqual(result.scanned, 0)
+
     def test_a_git_lfs_pointer_stub_is_named_as_a_coverage_hole(self):
         # `actions/checkout` leaves LFS off, so an LFS-tracked file is present
         # only as its pointer stub. Reading the stub and counting the file as
@@ -604,6 +768,55 @@ class CoverageReportingTest(CheckerTestCase):
         lfs = [w for w in result.warnings if "git-LFS" in w]
         self.assertEqual(len(lfs), 1, result.warnings)
         self.assertIn("asset.bin", lfs[0])
+
+    def test_a_file_only_pretending_to_be_an_lfs_stub_is_still_scanned(self):
+        # Classifying on the first line alone made the skip an OPT-OUT any
+        # tracked file could take: type the magic line, and everything below it
+        # went unread while the file still rendered as plain text on github.com
+        # -- and with one other clean file present the zero-scan net did not
+        # fire either. A genuine stub has to satisfy the whole pointer grammar.
+        self.repo.write(
+            "notes.md",
+            checker.LFS_POINTER_PREFIX
+            + "\nSee Comfy-Org/definitely-not-public and BE-1234\n",
+        )
+        self.repo.write("ok.md", "clean\n")
+        result = self.run_checks()
+        self.assertEqual(len(result.findings), 2, result.findings)
+        self.assertEqual(result.scanned, 2)
+        self.assertEqual(result.skipped, [])
+
+    def test_an_oversized_pointer_lookalike_is_not_a_stub_either(self):
+        # A real stub is ~130 bytes. The size ceiling stops a file that carries
+        # a valid-looking header ABOVE a payload from riding the classification.
+        self.repo.write(
+            "big.md",
+            checker.LFS_POINTER_PREFIX
+            + "\noid sha256:" + "c" * 64 + "\nsize 1\n"
+            + "# padding Comfy-Org/definitely-not-public\n"
+            + "x" * checker.LFS_POINTER_MAX_BYTES + "\n",
+        )
+        result = self.run_checks()
+        self.assertEqual(result.skipped, [])
+        self.assertEqual(result.scanned, 1)
+        self.assertEqual(len(result.findings), 1, result.findings)
+
+    def test_a_genuine_stub_is_read_even_though_it_does_not_count_as_scanned(self):
+        # Coverage and detection are separate questions, and this is the one
+        # file kind where they diverge: the stub is not the file (so it cannot
+        # prop up `scanned`), but it IS text this run has in hand, so it is
+        # still checked. A real stub is hex and digits, so it yields nothing --
+        # which is exactly why scanning it is free.
+        self.repo.write(
+            "asset.bin",
+            checker.LFS_POINTER_PREFIX
+            + "\noid sha256:" + "d" * 64 + "\nsize 7\n",
+        )
+        self.repo.write("ok.md", "clean\n")
+        result = self.run_checks()
+        self.assertEqual(result.findings, [])
+        self.assertEqual(result.scanned, 1)
+        self.assertEqual(result.skipped, [("git-LFS pointer", 1)])
 
     def test_an_all_lfs_repo_cannot_hold_the_zero_scan_net_open(self):
         # The reason the stub had to move out of `scanned`: `git lfs track
@@ -677,18 +890,80 @@ class CoverageReportingTest(CheckerTestCase):
         # The conversion only hides something this run was going to read. On an
         # excluded path the hole is already named in the log by its exclusion
         # count, so failing there would be a false alarm with no way to clear it.
-        # Lower-cased encoding name (git accepts either) purely so the
-        # fixture's own `.gitattributes` is not itself a category-1 finding:
-        # `UTF-16` fits TICKET_RE and is not on the built-in acronym allowlist,
-        # unlike its neighbour `UTF-8`. That gap is one of the category-1
-        # allowlist follow-ups off this PR's review round, not something this
-        # test should quietly paper over by widening the allowlist here.
+        # `UTF-16` fits TICKET_RE, so the fixture's own `.gitattributes` would
+        # once have been a category-1 finding in its own right; the `UTF`
+        # namespace now clears by prefix (TICKET_ALLOWED_PREFIXES), so the
+        # canonical spelling is safe to write here.
         self.repo.write(
-            ".gitattributes", "vendor/* working-tree-encoding=utf-16\n"
+            ".gitattributes", "vendor/* working-tree-encoding=UTF-16\n"
         )
         self.repo.write("vendor/blob.md", "clean\n".encode("utf-16"))
         self.repo.write("ok.md", "clean\n")
         result = self.run_checks(excludes=["vendor/"])
+        self.assertEqual(result.findings, [])
+        self.assertEqual(result.scanned, 2)
+
+    def test_a_mangled_work_tree_gitattributes_cannot_hide_the_conversion(self):
+        # Resolved from the WORK TREE, the guard reads the same `.gitattributes`
+        # a conversion may itself have mangled: a commit that applies
+        # `working-tree-encoding=UTF-16` to the attributes file ALONGSIDE the
+        # leaking file leaves an unparseable attributes file on disk, every path
+        # comes back `unspecified`, and the guard fails open over exactly the
+        # commit it exists to catch. The property being asserted is about the
+        # bytes git STORES, so the question goes to the index (`--cached`).
+        self.repo.write(".gitattributes", "*.md working-tree-encoding=UTF-16\n")
+        self.repo.write(
+            "leak.md", "See Comfy-Org/definitely-not-public\n".encode("utf-16")
+        )
+        # Mangle only the work-tree copy; the INDEX still holds the readable
+        # rule, which is what checkout acted on.
+        self.repo.write(
+            ".gitattributes",
+            "*.md working-tree-encoding=UTF-16\n".encode("utf-16"),
+            track=False,
+        )
+        with self.assertRaises(checker.ConfigError) as ctx:
+            self.run_checks()
+        self.assertIn("leak.md", str(ctx.exception))
+
+    def test_a_utf8_working_tree_encoding_is_not_a_conversion(self):
+        # UTF-8 is the identity mapping git skips re-encoding for, so it hides
+        # nothing -- and an exit 2 the caller can only clear by excluding paths
+        # costs real coverage.
+        self.repo.write(".gitattributes", "*.md working-tree-encoding=UTF-8\n")
+        self.repo.write("doc.md", "clean\n")
+        result = self.run_checks()
+        self.assertEqual(result.findings, [])
+        self.assertEqual(result.scanned, 2)
+
+    def test_the_utf8_exemption_does_not_cover_the_bom_variants(self):
+        # `UTF-8-BOM` and `UTF-8BOM` DO rewrite the bytes, so they stay fatal.
+        # Asserted against the resolver rather than a fixture because git
+        # refuses to stage a file whose declared BOM variant it cannot
+        # round-trip, so the case cannot be built as a repo.
+        for value in ("UTF-8-BOM", "utf-8bom", "UTF-16"):
+            with self.subTest(value=value):
+                out = "\0".join(["a.md", "working-tree-encoding", value]) + "\0"
+                with unittest.mock.patch.object(
+                    checker.subprocess,
+                    "run",
+                    return_value=unittest.mock.Mock(stdout=out.encode()),
+                ):
+                    self.repo.write("a.md", "clean\n")
+                    self.assertEqual(
+                        checker._work_tree_encoded(self.repo.root, ["a.md"]),
+                        ["a.md"],
+                    )
+
+    def test_an_encoding_rule_matching_a_symlink_is_not_a_conversion(self):
+        # `git check-attr` answers purely by PATH PATTERN, so a rule like
+        # `*.bin working-tree-encoding=UTF-16` also "converts" a tracked symlink
+        # named `notes.bin` -- an entry checkout writes with no encoding step at
+        # all. Only a regular file can actually be re-encoded.
+        self.repo.write(".gitattributes", "*.bin working-tree-encoding=UTF-16\n")
+        os.symlink("target.txt", os.path.join(self.repo.root, "notes.bin"))
+        self.repo._git("add", "--", "notes.bin")
+        result = self.run_checks()
         self.assertEqual(result.findings, [])
         self.assertEqual(result.scanned, 2)
 
@@ -708,6 +983,40 @@ class CoverageReportingTest(CheckerTestCase):
         self.assertIn("+5 more per-file warning(s)", result.warnings[-1])
         # Coverage accounting is NOT capped: every symlink is still counted.
         self.assertEqual(result.scanned, count + 1)
+
+    def test_a_buried_truncation_warning_still_leaves_a_coverage_count(self):
+        # `scanned`/`skipped` cannot express "read, but not all of it": a file
+        # truncated at the read cap counts as `scanned` with no skipped kind, so
+        # before `partial` the per-file `::warning::` was the ONLY record that
+        # coverage was partial -- and that warning is subject to the cap above.
+        # Enough cheap tracked symlinks sorting ahead of a large file therefore
+        # buried the one line saying its tail was never read, and the report
+        # then claimed full coverage over a file it had only partly read.
+        for i in range(checker.MAX_WARNINGS_TOTAL):
+            os.symlink("target.txt", os.path.join(self.repo.root, f"aaa{i:04d}"))
+            self.repo._git("add", "--", f"aaa{i:04d}")
+        with unittest.mock.patch.object(checker, "MAX_FILE_BYTES", 64):
+            self.repo.write("zz-big.md", "clean\n" + "x" * 200 + "\n")
+            result = self.run_checks()
+        # The warning naming the file lost its budget to the symlinks...
+        self.assertFalse(
+            [w for w in result.warnings if "zz-big.md" in w], result.warnings
+        )
+        # ...but the coverage arithmetic survives it.
+        self.assertEqual(result.partial, [(checker.PARTIAL_READ, 1)])
+
+    def test_a_capped_findings_file_is_counted_as_partial_too(self):
+        # The per-FILE findings cap is the other producer with no count of its
+        # own: the file is fully read but only partly REPORTED.
+        with unittest.mock.patch.object(checker, "MAX_FINDINGS_PER_FILE", 3):
+            self.repo.write("many.md", "Comfy-Org/nope\n" * 10)
+            result = self.run_checks()
+        self.assertEqual(len(result.findings), 3, result.findings)
+        self.assertEqual(result.partial, [(checker.PARTIAL_FINDINGS, 1)])
+
+    def test_a_clean_run_reports_no_partial_coverage(self):
+        self.repo.write("ok.md", "clean\n")
+        self.assertEqual(self.run_checks().partial, [])
 
     def test_findings_are_capped_per_file_without_softening_the_verdict(self):
         # The read cap bounds bytes READ; nothing bounded what was DERIVED from

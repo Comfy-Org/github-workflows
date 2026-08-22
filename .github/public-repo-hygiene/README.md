@@ -13,9 +13,9 @@ false positive is a one-line list edit instead of a mystery.
 
 | # | Category | Shape |
 |---|---|---|
-| 1 | Ticket-style identifiers | `\b[A-Z]{2,6}-\d{2,6}\b` — a generic SHAPE, never a list of real internal team keys, so the check itself discloses no internal naming scheme. Common tech acronyms that fit (`UTF-8`, `SHA-256`, `RFC-3339`, …) are allowlisted; a caller extends that list with the `ticket_allowlist:` input. |
+| 1 | Ticket-style identifiers | `\b[A-Z]{2,6}-\d{2,6}\b` — a generic SHAPE, never a list of real internal team keys, so the check itself discloses no internal naming scheme. Common tech acronyms that fit (`UTF-8`, `SHA-256`, `RFC-3339`, …) are allowlisted; a caller extends that list with the `ticket_allowlist:` input. Well-known **public identifier namespaces** clear by PREFIX rather than as exact tokens — `CVE-`, `CWE-`, `PEP-`, `RFC-`, `ISO-`, `UTF-` — because `CVE-2021-44228` presents to this regex as `CVE-2021` (the `\b` holds against the following hyphen), so a SECURITY.md or a dependency changelog reddened a required check, and an exact carve-out would cost one entry per year prefix and break again each January. None of those is a plausible internal team key. |
 | 2 | Internal collaboration-tool links | Notion (`notion.so`/`notion.site`), Slack (`slack.com/archives`, `slack.com/client`, `app.slack.com`), Google Docs/Drive, `app.datadoghq.com`, `posthog.com/project/`, `linear.app`, and `incident-NNN`. Case-insensitive. Public marketing pages on the same hosts (`posthog.com/docs`) are not matched. |
-| 3 | `Comfy-Org/<repo>` references | **Default-deny** against `PUBLIC_COMFY_ORG_REPOS`. Anything else is flagged so a maintainer either scrubs it or adds it once confirmed public. A leading `@` makes the match a CODEOWNERS **team** handle instead, checked against `PUBLIC_COMFY_ORG_TEAMS` — team handles are inherently public on a public repo (GitHub renders CODEOWNERS owners to anyone who can see it), so an allowlisted one is not a leak. That same `@Comfy-Org/<name>` spelling is also how npm and GitHub Packages write a **scope**, so the `@` path accepts either allowlist; the reverse crossing is not allowed, since a bare `Comfy-Org/<name>` is unambiguously a repo path. A trailing `.git` is stripped, because `Foo.git` in a `repository.url` still references the public repo `Foo`, and a trailing `.` is stripped as sentence punctuation on both paths (a GitHub slug can never end in a dot); a reference left naming nothing (`Comfy-Org/.`, `Comfy-Org/.git`) is not a finding. Case-insensitive throughout — GitHub resolves owner names case-insensitively, so `comfy-org/<repo>` is checked exactly like `Comfy-Org/<repo>`, the `.git` suffix is stripped whatever its casing, and allowlist membership is compared casefolded. The repo-name class itself stays ASCII on purpose (the ignore-case flag is scoped to the org segment): a whole-pattern flag would let Unicode case-folding admit `ſ`/`K` into the name and fold them onto allowlisted spellings. |
+| 3 | `Comfy-Org/<repo>` references | **Default-deny** against `PUBLIC_COMFY_ORG_REPOS`. Anything else is flagged so a maintainer either scrubs it or adds it once confirmed public. A leading `@` makes the match a CODEOWNERS **team** handle instead, checked against `PUBLIC_COMFY_ORG_TEAMS` — team handles are inherently public on a public repo (GitHub renders CODEOWNERS owners to anyone who can see it), so an allowlisted one is not a leak. That same `@Comfy-Org/<name>` spelling is also how npm and GitHub Packages write a **scope**, so the `@` path accepts either allowlist; the reverse crossing is not allowed, since a bare `Comfy-Org/<name>` is unambiguously a repo path. A trailing `.git` is stripped, because `Foo.git` in a `repository.url` still references the public repo `Foo`, and a trailing `.` is stripped as sentence punctuation on both paths (a GitHub slug can never end in a dot); a reference left naming nothing (`Comfy-Org/.`, `Comfy-Org/.git`) is not a finding. Case-insensitive throughout — GitHub resolves owner names case-insensitively, so `comfy-org/<repo>` is checked exactly like `Comfy-Org/<repo>`, the `.git` suffix is stripped whatever its casing, and allowlist membership is compared casefolded. The repo-name class itself stays ASCII on purpose (the ignore-case flag is scoped to the org segment): a whole-pattern flag would let Unicode case-folding admit `ſ`/`K` into the name and fold them onto allowlisted spellings. Both ends of the match are bounded: the org segment must **start a token** (`NotComfy-Org/x` is a different org, not a reference to this one), and a name the ASCII class could only **partly read** is never cleared — a Unicode letter or a homoglyph dash immediately after the capture is the *rest of the name*, not a boundary, so `Comfy-Org/comfyui‐internal` written with U+2010 would otherwise test `comfyui` against the allowlist and pass while the full private name sat in the tree. Such a reference is reported whole, with its own remedy (rewrite it in ASCII), because "add it to the allowlist" is not the fix for a homoglyph. The npm/Packages crossing is narrowed to a spelling that could actually **be** an npm coordinate — those are required to be lowercase — so `@Comfy-Org/comfyui`, a team named after the repo it owns, does not clear the team allowlist by borrowing the repo one. |
 
 Only **tracked** files are scanned (`git ls-files -z`), so build output, `node_modules` and
 anything untracked is out of scope by construction. Binary files are skipped (a NUL byte or an
@@ -49,12 +49,20 @@ something is worse than no guard — the green run reads as coverage:
   `actions/checkout` does not fetch LFS objects, so the work tree holds the ~130-byte stub and the
   real content — publicly downloadable from the same repo — is never examined. It deliberately does
   **not** count as scanned: otherwise `git lfs track '*.md'` plus a commit carrying internal
-  references would hold the zero-scan net below open and exit 0 on a required check;
+  references would hold the zero-scan net below open and exit 0 on a required check. Coverage and
+  detection are separate questions here, and this is the one file kind where they diverge — the
+  stub is **still checked for references**, and the classification requires the *whole* pointer
+  grammar (a `sha256` oid, a byte size, stub-sized). A first line alone would have made the skip an
+  opt-out any file could take by typing the magic line;
 - binary and non-UTF-8 files are expected skips, so they are a per-run `NOT SCANNED: <n>` count
   rather than a warning each — a count they must have, because one stray byte otherwise hides a
-  whole file that still renders as text on GitHub;
+  whole file that still renders as text on GitHub. **UTF-16/UTF-32 is decoded, not skipped**: those
+  encodings are self-describing via a BOM, and a blob committed in one carries its NUL bytes in
+  what git *stores*, so no gitattribute is involved and the rule below would never see it;
 - a file larger than the read cap is scanned up to it and the unread tail is a `::warning::`
-  naming the file — truncated loudly, never dropped;
+  naming the file — truncated loudly, never dropped. It also gets a `PARTIAL: <n>` count, as does a
+  file whose findings hit the per-file cap: both are "read, but not all of it", which `SCANNED:`
+  and `NOT SCANNED:` cannot express, and unlike the per-file warning a **count is never capped**;
 - a run that read **zero** files (nothing tracked, everything excluded, or nothing readable as
   text) **exits 2**, not 0. Rejecting a root-wide exclusion would otherwise be one spelling away
   from pointless: naming each top-level directory in `exclude_paths` disables the whole scan
@@ -68,8 +76,13 @@ something is worse than no guard — the green run reads as coverage:
 - a `working-tree-encoding` gitattribute on any path this run would read **exits 2**. It makes the
   bytes on disk differ from the bytes git stores, so a `UTF-16` conversion reads as binary here
   while the committed blob GitHub serves stays plainly readable — a green run over content the
-  guard never looked at. An excluded path may carry one: that hole is already named by its
-  exclusion count;
+  guard never looked at. The attributes are resolved from the **index** (`git check-attr --cached`),
+  because the property is about the bytes git stores — and because a commit that converts
+  `.gitattributes` itself would otherwise leave an unparseable attributes file on disk and the guard
+  would fail open over exactly that commit. `UTF-8` is exempt (it is the identity mapping, and the
+  BOM variants stay fatal), as are symlinks and gitlinks matching an encoding rule — `check-attr`
+  answers by path pattern, and only a regular file can be re-encoded. An excluded path may carry
+  one: that hole is already named by its exclusion count;
 - per-file warnings are capped at `MAX_WARNINGS_TOTAL` (200) with a `+N more` tail, for the same
   reason the findings are. The **counts** are never capped, so the coverage claim above stays
   complete however many warnings are dropped.
@@ -117,8 +130,10 @@ that never contained these checks — runs a different workflow, and the equalit
 one says nothing about this one. This is a property of GitHub Actions, not of this workflow, and it
 applies equally to `agents-md-integrity.yml` and every other entry in the catalog. The control is
 out of band: an adopter making this a **required** status check should also protect
-`.github/workflows/` with CODEOWNERS and/or a repository ruleset requiring review, so the `uses:`
-line cannot move without a human approving it. Stated precisely, what this design buys is that a
+`.github/workflows/` with a branch-protection rule or repository ruleset that **requires an
+approving review from someone other than the author**, so the `uses:` line cannot move unreviewed.
+CODEOWNERS on its own is **not** that control — it only *requests* reviewers, and blocks nothing
+until a rule requires Code Owner approval. Stated precisely, what this design buys is that a
 PR cannot reach the checker or the allowlist *through this workflow's inputs* — the failure the two
 per-repo copies had, where an in-tree allowlist edit was all it took.
 
@@ -135,6 +150,12 @@ case-sensitively — were fixed in BE-8697 and are pinned by unit tests; that is
 parity with those scripts deliberately ended.
 
 - **The scan is line-oriented.** A reference split across two lines is not matched.
+- **A `Comfy-Org/<name>` reference butted straight against non-Latin prose is a finding.** The
+  name class is ASCII, so anything outside it immediately after the capture is treated as the rest
+  of the *name* rather than as a boundary — that is what stops a U+2010 homoglyph from clearing as
+  `comfyui`, and the price is that `Comfy-Org/ComfyUIを使う` (no separator) reports. A space
+  clears it, and the finding message says so. Narrowing the rule to characters that casefold onto
+  ASCII would reopen the bypass for every alphabet that does not, so it is deliberately broad.
 - **Only file *contents* are scanned, never file *paths*.** A `docs/<TICKET>-migration.md` or a
   `notion-exports/` directory passes clean.
 - **Git-LFS content, submodule contents and the far side of a symlink are not scanned** — each is

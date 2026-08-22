@@ -46,6 +46,7 @@ Run locally:
 """
 
 import argparse
+import codecs
 import collections
 import itertools
 import os
@@ -53,6 +54,7 @@ import re
 import stat
 import subprocess
 import sys
+import unicodedata
 
 # --- Category 1: ticket-shaped identifiers (TEAM-1234) ---------------------
 # A generic SHAPE rather than a guessed list of real internal team keys, so we
@@ -79,6 +81,19 @@ TICKET_ALLOWLIST = frozenset(
         "WIN-32",
         "WIN-64",
     }
+)
+# Well-known PUBLIC identifier namespaces, allowlisted by PREFIX rather than as
+# exact tokens. `\b[A-Z]{2,6}-\d{2,6}\b` matches `CVE-2021` inside
+# `CVE-2021-44228` -- the `\b` holds against the following hyphen -- so a
+# SECURITY.md, a dependency changelog or a patch note trips what adopters wire in
+# as a REQUIRED check. Clearing that token-by-token would cost one entry per year
+# prefix and break again each January; `CWE-89`, `PEP-484` and any
+# `RFC-####`/`ISO-####` outside the three hard-coded RFCs above are the same
+# shape -- as is `UTF-16`/`UTF-32`, which the exact list above carried only for
+# `UTF-8`. None of these is a plausible internal team key, so the namespace is
+# the right granularity. (BE-8654 review.)
+TICKET_ALLOWED_PREFIXES = frozenset(
+    {"CVE", "CWE", "PEP", "RFC", "ISO", "UTF"}
 )
 
 # --- Category 2: internal collaboration-tool links/markers -----------------
@@ -157,7 +172,30 @@ _PUBLIC_TEAMS_CF = frozenset(name.casefold() for name in PUBLIC_COMFY_ORG_TEAMS)
 # those characters would be absorbed into the name and flagged. Scoping the flag
 # to the org segment (which contains no `s`, `k` or `i` to widen) keeps the
 # capture class ASCII, which is what the allowlists are written in.
-REPO_REF_RE = re.compile(r"(?i:Comfy-Org)/([A-Za-z0-9_.-]+)")
+#
+# BOTH boundaries are explicit, because an unbounded edge is read as a boundary
+# that is not there (BE-8654 review). On the LEFT, `(?<![A-Za-z0-9_])` stops
+# `NotComfy-Org/x` from being reported as a reference to the org -- the org
+# segment has to start a token, and every real spelling is preceded by a
+# separator (`/` in a URL, whitespace, a quote, or the `@` of a team handle,
+# none of which are in the class). On the RIGHT there is no lookahead at all,
+# deliberately: refusing to MATCH a name the class cannot fully read would turn
+# a partly-readable name into no finding, which is the bypass upside down. The
+# match is made and `_nonascii_tail` below decides what it means.
+REPO_REF_RE = re.compile(r"(?<![A-Za-z0-9_])(?i:Comfy-Org)/([A-Za-z0-9_.-]+)")
+
+# ASCII characters the name class accepts -- the source of truth for how far a
+# name extends, shared by `REPO_REF_RE` and the tail walk below.
+_REPO_NAME_ASCII = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-"
+)
+
+# Unicode categories that continue a NAME rather than end it: letters (L*),
+# numbers (N*), combining marks (M*), and the dash/connector punctuation that
+# supplies the homoglyphs -- U+2010 HYPHEN renders identically to `-` on
+# github.com. Quote and bracket categories are deliberately absent, so ordinary
+# prose like `Comfy-Org/ComfyUI’s frontend` stays a clean reference.
+_NAME_CONTINUING_CATEGORIES = frozenset({"Pd", "Pc"})
 
 # Where the reusable workflow checks THIS repo out inside the caller's
 # workspace (`path:` in public-repo-hygiene.yml — keep the two spellings in
@@ -210,13 +248,56 @@ MAX_WARNINGS_TOTAL = 200
 # never examined. Detected and named, per "everything the scan declines to look
 # at leaves a trace". (BE-8654 review.)
 LFS_POINTER_PREFIX = "version https://git-lfs.github.com/spec/v1"
+# The FULL pointer grammar, not just that first line. A bare `startswith` let
+# any ordinary tracked file opt out of the scan by opening with that one line:
+# everything below it would go unread while the file still renders as plain text
+# on github.com. A genuine stub is a handful of `key value` lines carrying a
+# `sha256` oid and a byte size, and it is ~130 bytes -- so the grammar plus a
+# size ceiling is what separates "git put a placeholder here" from "someone
+# typed the magic line". (BE-8654 review.)
+LFS_POINTER_MAX_BYTES = 1024
+_LFS_OID_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+
+# A committed UTF-16/UTF-32 blob needs no gitattribute at all -- the NUL bytes
+# are in the bytes git STORES, so `_work_tree_encoded` never sees it -- and the
+# `binary` skip would then drop the whole file from the scan while GitHub still
+# renders it as readable text. Every one of these encodings is required to be
+# self-describing via a BOM, so sniffing one and decoding is exact rather than
+# guesswork. UTF-32's BOMs are tested FIRST: `\xff\xfe\x00\x00` starts with the
+# UTF-16-LE BOM, so the shorter marker would swallow it. A UTF-8 BOM is
+# deliberately NOT listed: those bytes already decode as UTF-8 down the ordinary
+# path, which carries a recovery for a read cap landing mid-codepoint that this
+# table has no equivalent of, and a leading U+FEFF hides nothing (it is not a
+# word character, so neither `TICKET_RE`'s `\b` nor the repo pattern's left
+# boundary is affected by it). (BE-8654 review.)
+_BOM_CODECS = (
+    (codecs.BOM_UTF32_LE, "utf-32", 4),
+    (codecs.BOM_UTF32_BE, "utf-32", 4),
+    (codecs.BOM_UTF16_LE, "utf-16", 2),
+    (codecs.BOM_UTF16_BE, "utf-16", 2),
+)
 
 # What `run_checks` reports. Named rather than a bare tuple because the two
 # coverage fields (`skipped`, `scanned`) are what the exit code turns on, and a
 # positional 5-tuple is how a caller ends up reading "scanned" as "findings".
+#
+# `partial` is the third coverage field and exists because the other two cannot
+# express "read, but not all of it": an oversize file truncated at the read cap
+# counts as `scanned` with no skipped kind, and a file whose findings were capped
+# has no count at all -- so before this the per-file `::warning::` was the ONLY
+# record that coverage was partial, and that warning is subject to
+# MAX_WARNINGS_TOTAL. 200 cheap tracked symlinks sorting ahead of a large file
+# therefore buried the one line saying its tail was never read. Counts are never
+# capped, so the coverage arithmetic survives any log truncation. (BE-8654
+# review.)
 ScanResult = collections.namedtuple(
-    "ScanResult", "findings exclusions warnings skipped scanned"
+    "ScanResult", "findings exclusions warnings skipped scanned partial"
 )
+
+# `partial` kinds. Named constants because `_emit` prints them and the tests
+# assert on them.
+PARTIAL_READ = "read only up to the size cap"
+PARTIAL_FINDINGS = "reported only up to the per-file findings cap"
 
 
 class ConfigError(Exception):
@@ -351,12 +432,27 @@ def _work_tree_encoded(root, paths):
     attribute exactly as checkout does, honouring `.gitattributes` at every
     directory level plus `.git/info/attributes`, which a hand-rolled reader of
     the top-level file would miss.
+
+    `--cached` asks the INDEX rather than the work tree, because the property
+    being asserted is about the bytes git STORES. Without it the attributes are
+    read from the same on-disk `.gitattributes` a conversion may have mangled:
+    a commit that applies `working-tree-encoding=UTF-16` to `.gitattributes`
+    ALONG WITH the leaking file leaves an unparseable attributes file on disk,
+    every path comes back `unspecified`, and this guard fails open over exactly
+    the commit it exists to catch. (BE-8654 review.)
     """
     if not paths:
         return []
     try:
         out = subprocess.run(
-            ["git", "check-attr", "--stdin", "-z", "working-tree-encoding"],
+            [
+                "git",
+                "check-attr",
+                "--cached",
+                "--stdin",
+                "-z",
+                "working-tree-encoding",
+            ],
             cwd=root,
             input="\0".join(paths).encode("utf-8", "surrogateescape"),
             check=True,
@@ -377,13 +473,64 @@ def _work_tree_encoded(root, paths):
     converted = []
     for i in range(0, len(fields) - 2, 3):
         path, value = fields[i], fields[i + 2]
-        if value not in ("unspecified", "unset"):
-            converted.append(path)
+        if value in ("unspecified", "unset"):
+            continue
+        # UTF-8 is the identity mapping git skips re-encoding for, so it
+        # converts nothing and must not cost the caller a hard failure it can
+        # only clear by excluding paths (which costs real coverage). Matched
+        # case-insensitively like git does, and NARROWLY: the BOM variants
+        # (`UTF-8BOM`, `UTF-8-BOM`) do rewrite the bytes and stay fatal.
+        # (BE-8654 review.)
+        if value.casefold() in ("utf-8", "utf8"):
+            continue
+        # `git check-attr` answers purely by PATH PATTERN, so a rule like
+        # `*.txt working-tree-encoding=UTF-16` also "converts" a tracked symlink
+        # or a submodule gitlink named `notes.txt` -- entries checkout writes
+        # with no encoding step at all. Only a regular file can actually be
+        # re-encoded. A path we cannot stat stays in the list: unresolvable is
+        # not the same as harmless.
+        try:
+            if not stat.S_ISREG(os.lstat(os.path.join(root, path)).st_mode):
+                continue
+        except OSError:
+            pass
+        converted.append(path)
     return converted
 
 
+def _is_lfs_pointer(text, nbytes):
+    """True only for text matching the FULL git-lfs pointer grammar.
+
+    A stub is `version <spec-url>` followed by sorted `key value` lines that
+    MUST include a `sha256` oid and a byte size, and it is ~130 bytes. Checking
+    the first line alone made the skip an opt-out any file could take by opening
+    with that line; requiring the grammar (and a size ceiling no real stub
+    exceeds) makes it a classification instead. (BE-8654 review.)
+    """
+    if nbytes > LFS_POINTER_MAX_BYTES:
+        return False
+    lines = text.splitlines()
+    if not lines or lines[0] != LFS_POINTER_PREFIX:
+        return False
+    fields = {}
+    for line in lines[1:]:
+        key, sep, value = line.partition(" ")
+        if not sep or not key:
+            return False
+        fields[key] = value
+    return bool(_LFS_OID_RE.match(fields.get("oid", ""))) and fields.get(
+        "size", ""
+    ).isdigit()
+
+
 def _read_text(path):
-    """Return (text, warnings, skip_kind). `skip_kind` is None iff text is not.
+    """Return (text, warnings, skip_kind, truncated).
+
+    `text` is None exactly when nothing could be read. `skip_kind` names why a
+    file does not count toward coverage -- it is NOT the inverse of `text`: a
+    git-LFS pointer stub is returned as text AND as a skip (see below), because
+    the stub is readable but is not the file. `truncated` says the read stopped
+    at the size cap, which `check_file` turns into a `partial` count.
 
     Binary files are out of scope. A NUL byte is the crude-but-reliable marker
     (what the JavaScript copy used); an undecodable byte is the other (what the
@@ -426,13 +573,18 @@ def _read_text(path):
     try:
         st = os.lstat(path)
     except OSError as exc:
-        return None, [unreadable.format(exc.strerror or exc)], "unreadable"
+        return None, [unreadable.format(exc.strerror or exc)], "unreadable", False
 
     if stat.S_ISLNK(st.st_mode):
         try:
             target = os.readlink(path)
         except OSError as exc:
-            return None, [unreadable.format(exc.strerror or exc)], "unreadable"
+            return (
+                None,
+                [unreadable.format(exc.strerror or exc)],
+                "unreadable",
+                False,
+            )
         return (
             target,
             [
@@ -441,6 +593,7 @@ def _read_text(path):
                 "this repo's, and echoing it would be the leak, not the guard"
             ],
             None,
+            False,
         )
 
     if stat.S_ISDIR(st.st_mode):
@@ -460,6 +613,7 @@ def _read_text(path):
                 "without `submodules:`, so the directory is empty here)"
             ],
             "submodule gitlink",
+            False,
         )
 
     if not stat.S_ISREG(st.st_mode):
@@ -471,6 +625,7 @@ def _read_text(path):
                 "than read anything this repo stores"
             ],
             "not a regular file",
+            False,
         )
 
     try:
@@ -479,13 +634,20 @@ def _read_text(path):
             # as truncated.
             data = fh.read(MAX_FILE_BYTES + 1)
     except OSError as exc:
-        return None, [unreadable.format(exc.strerror or exc)], "unreadable"
+        return None, [unreadable.format(exc.strerror or exc)], "unreadable", False, False
 
     truncated = len(data) > MAX_FILE_BYTES
     if truncated:
         data = data[:MAX_FILE_BYTES]
+
+    text = _decode_bom(data, truncated)
+    if text is _UNDECODABLE:
+        return None, [], "non-UTF-8", truncated
+    if text is not None:
+        return _finish_text(text, len(data), truncated)
+
     if b"\x00" in data:
-        return None, [], "binary"
+        return None, [], "binary", truncated
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -502,31 +664,64 @@ def _read_text(path):
         # that from the end of the truncated buffer cannot be the cut. (BE-8654
         # review.)
         if not truncated or len(data) - exc.start >= 4:
-            return None, [], "non-UTF-8"
+            return None, [], "non-UTF-8", truncated
         text = data[: exc.start].decode("utf-8")
 
+    return _finish_text(text, len(data), truncated)
+
+
+# Sentinel: a BOM was recognised but the bytes behind it would not decode.
+_UNDECODABLE = object()
+
+
+def _decode_bom(data, truncated):
+    """Decode BOM-marked UTF-16/UTF-32; None if there is no such BOM."""
+    for bom, codec, unit in _BOM_CODECS:
+        if not data.startswith(bom):
+            continue
+        for drop in (0, unit):
+            # The read cap can cut a code unit (or a surrogate pair) in half.
+            # Only a TRUNCATED buffer earns that retry: on a complete file a
+            # decode failure means the BOM was a lie, not that the tail is short.
+            if drop and not truncated:
+                break
+            try:
+                return data[: len(data) - drop].decode(codec)
+            except UnicodeDecodeError:
+                continue
+        return _UNDECODABLE
+    return None
+
+
+def _finish_text(text, nbytes, truncated):
+    """Shared tail: the truncation warning and the git-LFS classification."""
     warnings = []
     if truncated:
         warnings.append(
             f"is larger than {MAX_FILE_BYTES} bytes; only the first "
             f"{MAX_FILE_BYTES} were scanned"
         )
-    if text.startswith(LFS_POINTER_PREFIX):
-        # SKIPPED, not scanned. The stub is text and does parse, but it carries
-        # none of the file's actual bytes, so counting it in `scanned` let it
-        # prop up the coverage claim: `git lfs track '*.md'` plus a commit
-        # carrying internal references would hold the zero-scan net open and
-        # exit 0 on a required check. A file whose content was never examined
-        # belongs in `skipped` with a named kind, like every other such route.
-        # (BE-8654 review.)
+    if _is_lfs_pointer(text, nbytes):
+        # Skipped for COVERAGE, still scanned for FINDINGS -- the two are
+        # separate questions and this is the one file kind where they diverge.
+        # It cannot count as `scanned`: the stub carries none of the file's
+        # actual bytes, so `git lfs track '*.md'` plus a commit carrying
+        # internal references would otherwise hold the zero-scan net open and
+        # exit 0 on a required check. But it must still be READ, because the
+        # only thing standing between "this is a stub" and "this is a file
+        # pretending to be one" is the grammar above -- and a genuine stub is
+        # three lines of hex and digits that yield no findings anyway, so
+        # scanning it costs nothing and closes the classification off as a
+        # bypass. (BE-8654 review.)
         warnings.append(
-            "is a git-LFS pointer stub, so it was NOT scanned: the real "
-            "content it stands for is publicly downloadable from this repo but "
-            "is not in the work tree (`actions/checkout` does not fetch LFS "
-            "objects by default), and the ~130-byte stub is not the file's text"
+            "is a git-LFS pointer stub, so it does NOT count as scanned: the "
+            "real content it stands for is publicly downloadable from this "
+            "repo but is not in the work tree (`actions/checkout` does not "
+            "fetch LFS objects by default), and the ~130-byte stub is not the "
+            "file's text (the stub itself was still checked for references)"
         )
-        return None, warnings, "git-LFS pointer"
-    return text, warnings, None
+        return text, warnings, "git-LFS pointer", truncated
+    return text, warnings, None, truncated
 
 
 def _excerpt(line):
@@ -540,6 +735,45 @@ def _excerpt(line):
     if len(stripped) <= MAX_EXCERPT_CHARS:
         return stripped
     return stripped[:MAX_EXCERPT_CHARS] + "... (line truncated)"
+
+
+def _nonascii_tail(line, end):
+    """The name characters after `end` that `REPO_REF_RE`'s ASCII class dropped.
+
+    `REPO_REF_RE` captures ASCII only, so the match stops at the first character
+    outside that class -- but a Unicode letter or a homoglyph dash is not the END
+    of the name, it is the REST of it. Without this, the allowlist is tested
+    against a PREFIX of what the file actually says: `Comfy-Org/comfyui<U+2010>internal`
+    captures `comfyui`, casefolds into the known-public set and passes clean
+    while the full private name sits in the tree. (BE-8654 review.)
+
+    Returns "" for an ordinary match. A non-empty tail means the reference was
+    only partly read, and `_file_findings` never CLEARS such a name -- casefold
+    membership cannot be trusted over it either way round, since `.casefold()`
+    folds U+017F back to `s` and would admit `comfy-type<U+017F>cript-sdk`.
+
+    The rule is deliberately every non-ASCII name character, not just the ones
+    that fold onto ASCII. Narrowing it to those would still clear
+    `Comfy-Org/comfyui<U+0430>internal` (Cyrillic a: a homoglyph that folds to
+    nothing ASCII, so the capture stops and `comfyui` clears on its own). The
+    cost is that an allowlisted name butted straight against non-Latin PROSE
+    (`Comfy-Org/ComfyUI<CJK>`) is a finding rather than a pass; the message says
+    how to clear it, and a separator is all it takes.
+    """
+    if end >= len(line) or line[end].isascii():
+        return ""
+    out = []
+    for ch in line[end:]:
+        if ch.isascii():
+            if ch not in _REPO_NAME_ASCII:
+                break
+        elif not (
+            unicodedata.category(ch)[0] in "LNM"
+            or unicodedata.category(ch) in _NAME_CONTINUING_CATEGORIES
+        ):
+            break
+        out.append(ch)
+    return "".join(out)
 
 
 def _bounded(token):
@@ -565,11 +799,18 @@ def _file_findings(rel, text, ticket_allowlist):
     """
     for lineno, line in enumerate(text.splitlines(), start=1):
         for match in TICKET_RE.finditer(line):
-            if match.group(0).upper() not in ticket_allowlist:
-                yield (
-                    f"{rel}:{lineno}: possible internal ticket ID: "
-                    f"{match.group(0)!r}"
-                )
+            token = match.group(0).upper()
+            if token in ticket_allowlist:
+                continue
+            # A PUBLIC identifier namespace clears by prefix, not by exact
+            # token (see TICKET_ALLOWED_PREFIXES): `CVE-2021-44228` presents
+            # here as `CVE-2021`, and the year makes an exact carve-out expire.
+            if token.split("-", 1)[0] in TICKET_ALLOWED_PREFIXES:
+                continue
+            yield (
+                f"{rel}:{lineno}: possible internal ticket ID: "
+                f"{match.group(0)!r}"
+            )
 
         for pattern in INTERNAL_MARKER_RES:
             if pattern.search(line):
@@ -580,6 +821,11 @@ def _file_findings(rel, text, ticket_allowlist):
 
         for match in REPO_REF_RE.finditer(line):
             name = match.group(1)
+            # Characters the ASCII name class could not read are the REST of the
+            # name, not a boundary. Carry them into what is reported, and (below)
+            # never clear a name they appear in. (BE-8654 review.)
+            tail = _nonascii_tail(line, match.end())
+            name += tail
             # Strip a sentence-final period BEFORE the team/repo fork: a GitHub
             # repo or team slug can never end in `.`, so a trailing one is
             # always prose punctuation the `.`-permitting name class swallowed
@@ -591,6 +837,26 @@ def _file_findings(rel, text, ticket_allowlist):
             # (`Comfy-Org/.`) names no repo at all, so it is not a finding.
             name = name.rstrip(".")
             if not name:
+                continue
+            at_prefixed = match.start() > 0 and line[match.start() - 1] == "@"
+            if tail:
+                # Never cleared, and never SILENTLY cleared either: casefold
+                # membership is untrustworthy in both directions over a name
+                # like this -- `comfy-type<U+017F>cript-sdk` folds ONTO an
+                # allowlisted name, and `comfyui<U+2010>internal` folds off the
+                # end of one. Reported with its own remedy, because "add it to
+                # the allowlist" is not the fix for a homoglyph. (BE-8654
+                # review.)
+                yield (
+                    f"{rel}:{lineno}: reference to "
+                    f"{'@' if at_prefixed else ''}Comfy-Org/{_bounded(name)}, "
+                    "whose name carries non-ASCII characters that can render "
+                    "identically to ASCII ones on github.com (a homoglyph), so "
+                    "it is NOT cleared against the known-public allowlist -- "
+                    "rewrite the name in ASCII, remove the reference, or (if "
+                    "the non-ASCII text is adjacent PROSE rather than part of "
+                    "the name) put a separator between them"
+                )
                 continue
             # A leading `@` makes this a CODEOWNERS team handle, not a repo ref
             # -- OR an npm / GitHub Packages scope, which is spelled exactly the
@@ -607,11 +873,20 @@ def _file_findings(rel, text, ticket_allowlist):
             # syntax that writes a team without the `@`, so admitting team names
             # there would weaken default-deny with no false positive to justify
             # it. See test_team_allowlist_does_not_leak_into_repo_allowlist.
-            if match.start() > 0 and line[match.start() - 1] == "@":
+            if at_prefixed:
                 folded = name.casefold()
-                if (
-                    folded not in _PUBLIC_TEAMS_CF
-                    and folded not in _PUBLIC_REPOS_CF
+                # The crossing is NARROWED to a spelling that could actually BE
+                # an npm coordinate: those are required to be lowercase, so
+                # `@comfy-org/comfy-cli` crosses and the canonical GitHub team
+                # spelling `@Comfy-Org/comfy-cli` does not. Naming a team after
+                # the repo it owns is the commonest CODEOWNERS convention there
+                # is, so an unconditional crossing cleared exactly the likely
+                # collision -- a team handle that is not in the team allowlist,
+                # waved through because a public repo happens to share its name.
+                # (BE-8654 review.)
+                npm_scope = line[match.start() : match.end()].islower()
+                if folded not in _PUBLIC_TEAMS_CF and not (
+                    npm_scope and folded in _PUBLIC_REPOS_CF
                 ):
                     yield (
                         f"{rel}:{lineno}: reference to "
@@ -651,10 +926,16 @@ def _file_findings(rel, text, ticket_allowlist):
 
 
 def check_file(root, rel, ticket_allowlist):
-    """Return (findings, warnings, skip_kind) for one file, in report order."""
-    text, warnings, skip_kind = _read_text(os.path.join(root, rel))
+    """Return (findings, warnings, skip_kind, partial) for one file.
+
+    `partial` is the list of PARTIAL_* kinds this file earned -- the coverage
+    counterpart of the `::warning::` lines, which the per-run warning cap can
+    drop.
+    """
+    text, warnings, skip_kind, truncated = _read_text(os.path.join(root, rel))
+    partial = [PARTIAL_READ] if truncated else []
     if text is None:
-        return [], warnings, skip_kind
+        return [], warnings, skip_kind, partial
 
     # One past the cap, so "capped" is distinguishable from "exactly at it".
     findings = list(
@@ -665,12 +946,13 @@ def check_file(root, rel, ticket_allowlist):
     )
     if len(findings) > MAX_FINDINGS_PER_FILE:
         del findings[MAX_FINDINGS_PER_FILE:]
+        partial.append(PARTIAL_FINDINGS)
         warnings.append(
             f"produced more than {MAX_FINDINGS_PER_FILE} findings; only the "
             f"first {MAX_FINDINGS_PER_FILE} are listed. This file needs fixing "
             f"wholesale rather than finding-by-finding -- the run still FAILS"
         )
-    return findings, warnings, None
+    return findings, warnings, skip_kind, partial
 
 
 def run_checks(root, excludes=(), extra_ticket_allow=()):
@@ -731,6 +1013,7 @@ def run_checks(root, excludes=(), extra_ticket_allow=()):
 
     counts = {p: 0 for p in excludes}
     skipped = collections.Counter()
+    partial = collections.Counter()
     findings, warnings = [], []
     scanned = 0
     truncated_report = False
@@ -740,7 +1023,11 @@ def run_checks(root, excludes=(), extra_ticket_allow=()):
         if hit is not None:
             counts[hit] += 1
             continue
-        found, file_warnings, skip_kind = check_file(root, rel, ticket_allowlist)
+        found, file_warnings, skip_kind, file_partial = check_file(
+            root, rel, ticket_allowlist
+        )
+        for kind in file_partial:
+            partial[kind] += 1
         # Per-RUN cap on top of the per-file one, so a tree of many mid-sized
         # offenders cannot flood the log either. Scanning CONTINUES past it --
         # only the enumeration stops -- because `scanned`/`skipped` are the
@@ -753,7 +1040,7 @@ def run_checks(root, excludes=(), extra_ticket_allow=()):
         for warning in file_warnings:
             # Per-run cap, for the same reason the findings have one. Coverage
             # accounting is deliberately NOT capped: every file dropped here is
-            # still counted in `skipped` or `scanned` below.
+            # still counted in `skipped`, `partial` or `scanned` below.
             if len(warnings) < MAX_WARNINGS_TOTAL:
                 warnings.append(f"{rel}: {warning}")
             else:
@@ -769,7 +1056,7 @@ def run_checks(root, excludes=(), extra_ticket_allow=()):
             f"and are NOT listed; only the first {MAX_WARNINGS_TOTAL} are. The "
             f"exit code is unaffected, and so is coverage accounting -- every "
             f"file behind a suppressed warning is still counted in the "
-            f"NOT SCANNED totals or in SCANNED above"
+            f"NOT SCANNED / PARTIAL totals or in SCANNED above"
         )
 
     if truncated_report:
@@ -792,7 +1079,12 @@ def run_checks(root, excludes=(), extra_ticket_allow=()):
         )
 
     return ScanResult(
-        findings, exclusions, warnings, sorted(skipped.items()), scanned
+        findings,
+        exclusions,
+        warnings,
+        sorted(skipped.items()),
+        scanned,
+        sorted(partial.items()),
     )
 
 
@@ -830,6 +1122,14 @@ def _emit(result):
     # GitHub, and `scanned` above would have no way to say so.
     for kind, count in result.skipped:
         line = f"NOT SCANNED: {count} file(s) skipped as {_esc_cmd(kind)}"
+        print(line)
+        print(f"::notice::public-repo-hygiene: {line}")
+    # Never capped, unlike the per-file warnings that name each one: a file
+    # read only as far as the size cap still counts in `scanned`, so without
+    # this line a buried warning would leave the report claiming full coverage
+    # over a file whose tail was never read. (BE-8654 review.)
+    for kind, count in result.partial:
+        line = f"PARTIAL: {count} file(s) {_esc_cmd(kind)}"
         print(line)
         print(f"::notice::public-repo-hygiene: {line}")
     print(f"SCANNED: {result.scanned} file(s) read as text")

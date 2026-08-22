@@ -359,6 +359,66 @@ jobs:
           }
           echo "checker correctly refused to count LFS stubs as coverage"
 
+      - name: Smoke test — the LFS skip is a classification, not an opt-out
+        run: |
+          # Classifying on the pointer's FIRST LINE alone turned the skip into
+          # an opt-out any tracked file could take: type the magic line, and
+          # everything below it went unread while the file still rendered as
+          # plain text on github.com — and with one other clean file present the
+          # zero-scan net above never fired either. A stub has to satisfy the
+          # whole grammar (a sha256 oid, a byte size, stub-sized) (BE-8654
+          # review).
+          root="$(mktemp -d)"
+          git -C "$root" init -q
+          printf 'version https://git-lfs.github.com/spec/v1\nComfy-Org/super-secret-repo tracked as BE-1234\n' \
+            > "$root/notes.md"
+          printf 'clean\n' > "$root/README.md"
+          git -C "$root" add -A
+          set +e
+          out="$(python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root" 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+          if [ "$code" -ne 1 ]; then
+            echo "::error::expected exit 1 — a file merely starting with the pointer line was skipped whole, got $code"
+            exit 1
+          fi
+          grep -qF 'Comfy-Org/super-secret-repo' <<<"$out" || {
+            echo "::error::a pointer-lookalike file suppressed a repo finding"
+            exit 1
+          }
+          grep -qF 'NOT SCANNED' <<<"$out" && {
+            echo "::error::a pointer-lookalike file was classified as an LFS stub"
+            exit 1
+          }
+          echo "checker correctly scanned a file only pretending to be a stub"
+
+      - name: Smoke test — a homoglyph cannot borrow a public repo's name
+        run: |
+          # The capture class is ASCII, so the match stops at the first
+          # character outside it — and the allowlist was then tested against a
+          # PREFIX of what the file says. U+2010 HYPHEN renders identically to
+          # `-` on github.com, so this cleared as `comfyui` while the full
+          # private name sat in the tree (BE-8654 review).
+          root="$(mktemp -d)"
+          git -C "$root" init -q
+          printf 'See Comfy-Org/comfyui\xe2\x80\x90internal for the rollout.\n' > "$root/notes.md"
+          git -C "$root" add -A
+          set +e
+          out="$(python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root" 2>&1)"
+          code=$?
+          set -e
+          echo "$out"
+          if [ "$code" -ne 1 ]; then
+            echo "::error::expected exit 1 for a homoglyph repo name, got $code"
+            exit 1
+          fi
+          grep -qF 'homoglyph' <<<"$out" || {
+            echo "::error::a partly-read repo name was cleared against the allowlist"
+            exit 1
+          }
+          echo "checker correctly refused to clear a partly-read name"
+
       - name: Smoke test — a non-git tree is a loud config error, not a pass
         run: |
           # The scan is over TRACKED files. If the checkout is missing or the

@@ -9,7 +9,10 @@ CI if it finds any:
 
 1. **Ticket-style identifiers** — `TEAM-1234`-shaped tokens. A generic shape, never a list of
    real internal team keys, so the check itself discloses nothing. Common tech acronyms
-   (`UTF-8`, `SHA-256`, `RFC-3339`, …) are allowlisted; add your own with `ticket_allowlist:`.
+   (`UTF-8`, `SHA-256`, `RFC-3339`, …) are allowlisted, as are the public identifier namespaces
+   `CVE-`, `CWE-`, `PEP-`, `RFC-`, `ISO-` and `UTF-` **by prefix** (so a SECURITY.md citing
+   `CVE-2021-44228` is clean, and stays clean next January); add your own with
+   `ticket_allowlist:`.
 2. **Internal collaboration-tool links** — Notion, Slack archives/client, Google Docs and Drive,
    Datadog, PostHog project URLs, Linear, and `incident-NNN` strings.
 3. **`Comfy-Org/<repo>` references outside a default-deny known-public allowlist** — plus the
@@ -100,14 +103,27 @@ both the repo and the `@Comfy-Org/<team>` path, because a GitHub slug can never 
 `.git` suffix is stripped whatever its casing, and because npm / GitHub Packages spell a **scope**
 the same way a CODEOWNERS handle is spelled, an `@comfy-org/<name>` dependency clears if the name
 is on either the team or the repo allowlist — so a lockfile entry for a public Comfy-Org package is
-not a finding. What is still not matched is a reference split across two lines — the scan is
-line-oriented. See
+not a finding. That crossing needs the all-lowercase spelling npm requires: `@Comfy-Org/<name>` is
+read as a team handle and checked against the team allowlist only, so a team named after the repo
+it owns does not clear itself. What is still not matched is a reference split across two lines —
+the scan is line-oriented.
+
+**A name is never cleared if it was only partly read.** The name class is ASCII, so a non-ASCII
+character immediately after a reference is treated as the *rest of the name*, not as the end of it
+— otherwise `Comfy-Org/comfyui‐internal` written with U+2010 (which renders identically to `-` on
+github.com) would be checked as `comfyui` and pass. The cost is one false positive shape: an
+allowlisted name butted straight against non-Latin prose with no separator
+(`Comfy-Org/ComfyUIを使う`) is reported. Put a space between them and it is clean; the finding
+message says so. See
 [the checker README](../../.github/public-repo-hygiene/README.md#known-limitations).
 
 **A skip is always visible.** An exclusion is logged with its file count even when it matched
 nothing; an unreadable file, a device node, a submodule gitlink, a git-LFS pointer stub or a
 symlink becomes a `::warning::` naming it; binary, non-UTF-8, submodule and LFS files get a per-run
-`NOT SCANNED:` count; and every run prints `SCANNED: <n> file(s) read as text`. A run that read
+`NOT SCANNED:` count; a file read only as far as the 5 MiB cap (or reported only as far as the
+per-file findings cap) gets a `PARTIAL: <n>` count; and every run prints
+`SCANNED: <n> file(s) read as text`. A **UTF-16/UTF-32** file is decoded rather than skipped as
+binary — those encodings carry a BOM, so committing one is not a way to sit out the scan. A run that read
 **zero** files exits **2**, not 0 — enumerating every top-level directory
 in `exclude_paths` disables the whole scan, and a green "clean" there would prove nothing. If you
 see one of those lines, the run did less than it looks like. Per-file warnings are capped at 200
@@ -120,8 +136,10 @@ enforce from the inside is *which* `uses:` line runs: a `pull_request` caller ex
 file from the PR head, so a PR that rewrites `uses:` **and** `workflows_ref` together — to another
 commit here, or to a fork — runs a different workflow entirely. That is true of every reusable
 workflow on GitHub. If you are making this a **required** status check, also protect
-`.github/workflows/` with CODEOWNERS and/or a repository ruleset requiring review, so that line
-cannot move without a human approving it.
+`.github/workflows/` with a branch-protection rule or repository ruleset that **requires an
+approving review from someone other than the author**, so that line cannot move unreviewed.
+A CODEOWNERS file on its own is **not** that control: it only *requests* reviewers, and blocks
+nothing until a rule requires Code Owner approval.
 
 **`working-tree-encoding` is refused, not worked around.** If a tracked `.gitattributes` sets it on
 a path this run would read, the run exits **2** naming the file. The attribute makes what checkout

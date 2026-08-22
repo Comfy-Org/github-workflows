@@ -33,8 +33,12 @@ name: Public Repo Hygiene (reusable)
 # equality check inside THAT one proves nothing about this one. This is true of
 # every reusable workflow on GitHub, not a defect specific to this one, and the
 # control for it is out of band: protect the caller's `.github/workflows/`
-# directory with CODEOWNERS and/or a repository ruleset requiring review, so the
-# `uses:` line cannot move without a human approving it. Adopters wiring this as
+# directory with a branch-protection rule or repository ruleset that REQUIRES an
+# approving review from someone other than the author, so the `uses:` line
+# cannot move unreviewed. CODEOWNERS alone is not that control — it only
+# REQUESTS reviewers and blocks nothing until a rule requires Code Owner
+# approval, so an adopter who reads "CODEOWNERS" as sufficient leaves the
+# `uses:` line editable by the very PR it is meant to gate. Adopters wiring this as
 # a REQUIRED status check should do that; without it the honest claim is the
 # narrower one — a PR cannot reach the checker or the allowlist *through this
 # workflow's inputs*. (BE-8654 review.)
