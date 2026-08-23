@@ -789,6 +789,58 @@ class RepoReferenceCategoryTest(CheckerTestCase):
         )
         self.assertEqual(self.findings(), [])
 
+    def test_npm_crossing_survives_the_codeowners_gate_in_a_manifest(self):
+        # The BE-8857 gate is keyed on the FILE, so it must not disturb the
+        # crossing anywhere else: `@comfy-org/comfy-cli` -- a lowercase name
+        # that collides with an allowlisted repo, i.e. exactly the spelling the
+        # gate denies in CODEOWNERS -- still clears in a manifest, which is the
+        # false-positive class the crossing exists to fix.
+        self.repo.write(
+            "package.json",
+            '{"dependencies": {"@comfy-org/comfy-cli": "^1.0.0"}}\n',
+        )
+        self.assertEqual(self.findings(), [])
+
+    def test_lowercase_team_spelling_in_codeowners_is_flagged(self):
+        # GitHub team slugs are lowercase BY CONSTRUCTION and GitHub resolves
+        # the org segment case-insensitively, so `@comfy-org/comfy-cli` in a
+        # CODEOWNERS file is a real, functional team handle -- yet the
+        # lowercase-only narrowing cleared it against the REPO allowlist, and
+        # silently, because `comfy-cli` is a public repo. In a CODEOWNERS file
+        # an `@`-prefixed reference is unambiguously an owner handle (npm
+        # coordinates never appear there), so the crossing is denied and
+        # default-deny is restored. (BE-8857.)
+        self.repo.write("CODEOWNERS", "* @comfy-org/comfy-cli\n")
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("@Comfy-Org/comfy-cli", findings[0])
+        self.assertIn("team not in the known-public allowlist", findings[0])
+
+    def test_codeowners_gate_matches_by_basename_in_every_honored_location(
+        self,
+    ):
+        # GitHub honors CODEOWNERS at the repo root, `.github/` and `docs/`.
+        # The gate matches on the posix BASENAME, so all three are covered --
+        # and `rel` is a git-tracked path, `/`-separated on every host OS.
+        for rel in ("CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS"):
+            with self.subTest(rel=rel):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write(rel, "* @comfy-org/comfy-cli\n")
+                findings = checker.run_checks(repo.root).findings
+                self.assertEqual(len(findings), 1, findings)
+                self.assertIn("@Comfy-Org/comfy-cli", findings[0])
+                self.assertIn(
+                    "team not in the known-public allowlist", findings[0]
+                )
+
+    def test_codeowners_gate_leaves_the_team_allowlist_path_alone(self):
+        # The gate denies the repo CROSSING only. An allowlisted TEAM spelled
+        # the way GitHub actually stores it (lowercase) still clears, or the
+        # gate would flag every legitimate owner line in the file.
+        self.repo.write("CODEOWNERS", "* @comfy-org/comfy-cloud-team\n")
+        self.assertEqual(self.findings(), [])
+
     def test_the_npm_crossing_does_not_clear_a_github_team_spelling(self):
         # Naming a team after the repo it owns is the commonest CODEOWNERS
         # convention there is, so an unconditional crossing cleared exactly the
@@ -800,6 +852,16 @@ class RepoReferenceCategoryTest(CheckerTestCase):
         findings = self.findings()
         self.assertEqual(len(findings), 1, findings)
         self.assertIn("@Comfy-Org/ComfyUI_frontend", findings[0])
+        self.assertIn("team not in the known-public allowlist", findings[0])
+
+    def test_canonical_team_casing_in_codeowners_stays_flagged(self):
+        # The BE-8857 gate is additive: the canonical `@Comfy-Org/<name>`
+        # spelling never reached the crossing to begin with (it is not
+        # lowercase), so it is reported exactly as it was before the gate.
+        self.repo.write("CODEOWNERS", "* @Comfy-Org/comfy-cli\n")
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("@Comfy-Org/comfy-cli", findings[0])
         self.assertIn("team not in the known-public allowlist", findings[0])
 
     def test_at_prefixed_name_on_neither_allowlist_is_still_flagged(self):

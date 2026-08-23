@@ -50,6 +50,7 @@ import codecs
 import collections
 import itertools
 import os
+import posixpath
 import re
 import stat
 import subprocess
@@ -1088,6 +1089,17 @@ def _file_findings(rel, text, ticket_allowlist):
             # known-public allowlist" with no caller-side escape (the repo
             # allowlist is deliberately not a workflow input).
             #
+            # EXCEPT inside a CODEOWNERS file, where only ONE of the two
+            # readings is possible: every `@`-prefixed reference there is an
+            # owner handle and npm coordinates never appear, so the repo
+            # crossing is denied outright and team-allowlist membership is
+            # required. Matched by BASENAME with `posixpath` -- `rel` is a
+            # git-tracked path, `/`-separated whatever the host OS is. GitHub
+            # only honors CODEOWNERS at `CODEOWNERS`, `.github/CODEOWNERS` and
+            # `docs/CODEOWNERS`, so a basename match also covers files GitHub
+            # ignores; that is the SAFE direction (it re-enables default-deny
+            # on a file where no npm coordinate can live). (BE-8857.)
+            #
             # The reverse crossing stays forbidden on purpose -- a bare
             # `Comfy-Org/<name>` is unambiguously a repo path, since there is no
             # syntax that writes a team without the `@`, so admitting team names
@@ -1103,8 +1115,24 @@ def _file_findings(rel, text, ticket_allowlist):
                 # is, so an unconditional crossing cleared exactly the likely
                 # collision -- a team handle that is not in the team allowlist,
                 # waved through because a public repo happens to share its name.
-                # (BE-8654 review.)
-                npm_scope = line[match.start() : match.end()].islower()
+                # (BE-8654 review.) That narrowing is not enough on its own:
+                # team slugs are lowercase BY CONSTRUCTION and GitHub resolves
+                # the org segment case-insensitively, so `@comfy-org/comfy-cli`
+                # in a CODEOWNERS file is a real, functional team handle that
+                # the lowercase test alone waved through. Hence the CODEOWNERS
+                # gate. Elsewhere the lowercase narrowing stands, because a
+                # lowercase mention in a README, a Dockerfile `npm i` line or a
+                # CI shell script genuinely could be an npm coordinate -- that
+                # residual ambiguity is ACCEPTED: in prose the two readings are
+                # indistinguishable, and re-denying there would re-open the
+                # false-positive class the crossing exists to fix (see
+                # test_npm_scope_of_a_public_repo_is_not_a_team_finding).
+                # (BE-8857.)
+                is_codeowners = posixpath.basename(rel) == "CODEOWNERS"
+                npm_scope = (
+                    not is_codeowners
+                    and line[match.start() : match.end()].islower()
+                )
                 if folded not in _PUBLIC_TEAMS_CF and not (
                     npm_scope and folded in _PUBLIC_REPOS_CF
                 ):
