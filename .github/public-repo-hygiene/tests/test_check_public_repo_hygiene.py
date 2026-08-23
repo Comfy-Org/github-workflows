@@ -1018,6 +1018,133 @@ class RepoReferenceCategoryTest(CheckerTestCase):
                 self.assertEqual(len(findings), 1, findings)
                 self.assertIn("@Comfy-Org/comfy-cli", findings[0])
 
+    def test_only_ascii_space_and_tab_delimit_a_codeowners_field(self):
+        # `\s` on a `str` pattern is Unicode-wide, but GitHub delimits
+        # CODEOWNERS fields on space and tab: with U+00A0 (and a mid-file
+        # U+FEFF, which the round-3 BOM fix discarded on EVERY line) in the
+        # leading class, each of these read as a whole-line comment, computed
+        # no span, and let the handle fall back to the lowercase crossing and
+        # clear against the REPO allowlist -- the round-2 `*#` bypass one
+        # invisible character along, while GitHub reads field one as
+        # `\xa0#`/`\ufeff#` and the handle as a functional owner.
+        # (BE-8857 review, round 4.)
+        for label, body in (
+            ("nbsp before the hash", "\xa0# @comfy-org/comfy-cli\n"),
+            (
+                "BOM after line 1",
+                "* @comfy-org/comfy-cloud-team\n"
+                "\ufeff# @comfy-org/comfy-cli\n",
+            ),
+            ("nbsp inside the pattern", "*\xa0 @comfy-org/comfy-cli\n"),
+        ):
+            with self.subTest(label=label):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write("CODEOWNERS", body)
+                findings = checker.run_checks(repo.root).findings
+                self.assertEqual(len(findings), 1, findings)
+                self.assertIn("@Comfy-Org/comfy-cli", findings[0])
+
+    def test_a_bom_is_only_skipped_on_the_first_line(self):
+        # The BOM skip is decoding residue at offset 0 of the FILE, so it is
+        # keyed on the line NUMBER rather than on a charset. Both directions
+        # of line 1 still behave as round 3 fixed them.
+        # (BE-8857 review, round 4.)
+        self.repo.write(
+            "CODEOWNERS", "\ufeff@comfy-org/comfy-cli\n".encode("utf-8")
+        )
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("@Comfy-Org/comfy-cli", findings[0])
+
+    def test_a_codeowners_line_ends_only_at_a_newline(self):
+        # `str.splitlines()` also ends a line at `\r`, `\v`, `\f`,
+        # `\x1c`-`\x1e`, `\x85`, U+2028 and U+2029, but a CODEOWNERS line
+        # ends only at `\n`. That used to affect just the reported line
+        # number; since the owner-field gate it decides a VERDICT, and one
+        # control character handed the checker a second "line" starting `#`
+        # -- no span, so the handle cleared through the lowercase crossing,
+        # while GitHub sees ONE line with that handle in its owner fields.
+        # (BE-8857 review, round 4.)
+        for sep in ("\r", "\x0b", "\x0c", "\x1c", "\x85", "\u2028"):
+            with self.subTest(sep=sep):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write(
+                    "CODEOWNERS",
+                    "* @comfy-org/comfy-cloud-team"
+                    + sep
+                    + "# @comfy-org/comfy-cli\n",
+                )
+                findings = checker.run_checks(repo.root).findings
+                self.assertEqual(len(findings), 1, findings)
+                self.assertIn("@Comfy-Org/comfy-cli", findings[0])
+
+    def test_a_crlf_codeowners_file_still_reads_its_owner_fields(self):
+        # The `\n`-only split keeps a TRAILING `\r` off the last token: it is
+        # a CRLF file's terminator, not content, and carrying it in would
+        # strip owner shape off a default-owners line and drop the span.
+        # (BE-8857 review, round 4.)
+        for body in (
+            "* @comfy-org/comfy-cli\r\n",
+            "@comfy-org/comfy-cli\r\n",
+        ):
+            with self.subTest(body=body):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write("CODEOWNERS", body)
+                findings = checker.run_checks(repo.root).findings
+                self.assertEqual(len(findings), 1, findings)
+                self.assertIn("@Comfy-Org/comfy-cli", findings[0])
+
+    def test_owner_only_branch_needs_the_handle_to_be_the_only_field(self):
+        # Owner SHAPE alone only catches the GLOB spellings of a pattern. On a
+        # line that HAS a second field, GitHub reads field one as the pattern
+        # however it is spelled, so a root-level scoped package directory --
+        # one `/`, no trailing `/`, no metacharacter, i.e. handle-SHAPED --
+        # handed its own `comfy-cli` to the deny and hard-failed a required
+        # check, with `exclude_paths:` the only caller-side remedy. That is
+        # the round-3 false positive one spelling along.
+        # (BE-8857 review, round 4.)
+        self.repo.write(
+            "CODEOWNERS",
+            "@comfy-org/comfy-cli @comfy-org/comfy-cloud-team\n",
+        )
+        self.assertEqual(self.findings(), [])
+
+    def test_a_second_field_makes_field_one_a_pattern_not_an_owner(self):
+        # The other direction of the same bound: field one is no longer read
+        # as an owner, so a handle in the REAL owner fields is still denied.
+        self.repo.write(
+            "CODEOWNERS", "@comfy-org/comfy-cloud-team @comfy-org/comfy-cli\n"
+        )
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("@Comfy-Org/comfy-cli", findings[0])
+
+    def test_codeowners_file_name_compares_lowercased_not_casefolded(self):
+        # A fold is not a case-insensitive comparison:
+        # `"codeownerſ".casefold()` is `"codeowners"` (U+017F folds to `s`),
+        # so a tracked `codeownerſ` -- not a case variant of anything GitHub
+        # reads -- got owner-field grammar and its prose parsed as
+        # pattern-then-owners into a hard finding on a required check. Same
+        # distinction round 3 drew for the DIRECTORY.
+        # (BE-8857 review, round 4.)
+        self.repo.write("codeowner\u017f", "Owned by @comfy-org/comfy-cli today\n")
+        self.assertEqual(self.findings(), [])
+
+    def test_an_invisible_leading_character_makes_a_pattern_only_line(self):
+        # ACCEPTED, pinned rather than closed. Once fields delimit on ASCII
+        # space and tab, `\xa0@comfy-org/comfy-cli` is a single field, and
+        # GitHub reads a single field as a PATTERN -- the line grants nobody
+        # ownership, so there are no owner fields to deny and the ordinary
+        # crossing applies, exactly as it does for a pattern with no owners.
+        # Default-deny still covers the leak case: the crossing clears only
+        # names already in the PUBLIC repo allowlist.
+        # (BE-8857 review, round 4.)
+        self.repo.write("CODEOWNERS", "\xa0@comfy-org/comfy-cli\n")
+        self.assertEqual(self.findings(), [])
+
     def test_codeowners_gate_leaves_the_team_allowlist_path_alone(self):
         # The gate denies the repo CROSSING only. An allowlisted TEAM spelled
         # the way GitHub actually stores it (lowercase) still clears, or the
