@@ -105,7 +105,28 @@ the same way a CODEOWNERS handle is spelled, an `@comfy-org/<name>` dependency c
 is on either the team or the repo allowlist — so a lockfile entry for a public Comfy-Org package is
 not a finding. That crossing needs the all-lowercase spelling npm requires: `@Comfy-Org/<name>` is
 read as a team handle and checked against the team allowlist only, so a team named after the repo
-it owns does not clear itself. What is still not matched is a reference split across two lines —
+it owns does not clear itself. It is also switched off **in the owner fields of a
+`CODEOWNERS` file** — the three locations GitHub actually reads one from (`CODEOWNERS`,
+`.github/CODEOWNERS`, `docs/CODEOWNERS`), with the name matched case-insensitively but the
+location not widened, so a `tests/fixtures/CODEOWNERS` or a `docs/notes/codeowners` note is
+untouched: team slugs are lowercase by construction, so the lowercase test alone let
+`* @comfy-org/<name>` clear against the REPO allowlist there even though it is a real owner handle.
+On an owner line only the team allowlist applies. The rest of such a file is untouched — a
+whole-line `#` comment naming a package, and a scoped path pattern like
+`/packages/@comfy-org/comfy-cli/**`, are not owner handles and still clear. A `#` part-way through
+a line is not a comment to GitHub and does not end the owner fields, so a package named in trailing
+prose after a real owner (`* @Comfy-Org/comfy-cloud-team  # see @comfy-org/comfy-cli on npm`)
+*is* reported — reword the comment, or move it to its own line. A line whose **only** field is an
+owner handle rather than a path (`@comfy-org/<team>`, the "default owners" shape) is read as all
+owners; as soon as a line has a second field, field one is a path pattern however it is spelled,
+so neither `@comfy-org/<name>/**` nor the metacharacter-free `@comfy-org/<name>` is read as an
+owner there. Fields are delimited on ASCII space and tab, a leading UTF-8 BOM is skipped on line 1
+only, and the file is split into lines on `\n` alone — all three because that is what GitHub's
+parser does, and a gate whose line-and-field model disagrees with it is bypassable by one
+invisible character (U+00A0, a mid-file U+FEFF or a bare `\r`).
+Everywhere else — a README, a Dockerfile `npm i` line, a CI script — the lowercase spelling
+is genuinely ambiguous and still clears, which is the deliberate trade that keeps package mentions
+out of the findings. What is still not matched is a reference split across two lines —
 the scan is line-oriented.
 
 **A name is never cleared if it was only partly read.** The name class is ASCII, so a non-ASCII
