@@ -105,13 +105,16 @@ the same way a CODEOWNERS handle is spelled, an `@comfy-org/<name>` dependency c
 is on either the team or the repo allowlist — so a lockfile entry for a public Comfy-Org package is
 not a finding. That crossing needs the all-lowercase spelling npm requires: `@Comfy-Org/<name>` is
 read as a team handle and checked against the team allowlist only, so a team named after the repo
-it owns does not clear itself. It is also switched off entirely **in a file named `CODEOWNERS`**
-(any directory — that covers the three locations GitHub honors, `CODEOWNERS`, `.github/CODEOWNERS`
-and `docs/CODEOWNERS`): team slugs are lowercase by construction, so the lowercase test alone let
-`* @comfy-org/<name>` clear against the REPO allowlist there even though it is a real owner handle.
-In a CODEOWNERS file only the team allowlist applies. Everywhere else — a README, a Dockerfile
-`npm i` line, a CI script — the lowercase spelling is genuinely ambiguous and still clears, which
-is the deliberate trade that keeps package mentions out of the findings. What is still not matched is a reference split across two lines —
+it owns does not clear itself. It is also switched off **in the owner fields of a
+`CODEOWNERS` file** (any directory, name matched case-insensitively — that covers the three
+locations GitHub honors, `CODEOWNERS`, `.github/CODEOWNERS` and `docs/CODEOWNERS`): team slugs are
+lowercase by construction, so the lowercase test alone let `* @comfy-org/<name>` clear against the
+REPO allowlist there even though it is a real owner handle. On an owner line only the team
+allowlist applies. The rest of such a file is untouched — a `#` comment naming a package, and a
+scoped path pattern like `/packages/@comfy-org/comfy-cli/**`, are not owner handles and still
+clear. Everywhere else — a README, a Dockerfile `npm i` line, a CI script — the lowercase spelling
+is genuinely ambiguous and still clears, which is the deliberate trade that keeps package mentions
+out of the findings. What is still not matched is a reference split across two lines —
 the scan is line-oriented.
 
 **A name is never cleared if it was only partly read.** The name class is ASCII, so a non-ASCII

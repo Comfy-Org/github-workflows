@@ -834,6 +834,63 @@ class RepoReferenceCategoryTest(CheckerTestCase):
                     "team not in the known-public allowlist", findings[0]
                 )
 
+    def test_codeowners_gate_only_reads_the_owner_fields(self):
+        # The gate is keyed on the OWNER FIELDS of a CODEOWNERS line, not on
+        # the file as a whole. A scoped monorepo PATH PATTERN carries the same
+        # `@comfy-org/<name>` spelling without being an owner handle, so
+        # classifying the file wholesale turned it into a hard "team not in the
+        # known-public allowlist" finding on a required check. The pattern
+        # keeps the npm crossing (`comfy-cli` is a public repo); the owner
+        # after it is an allowlisted team. Neither is a finding.
+        # (BE-8857 review.)
+        self.repo.write(
+            ".github/CODEOWNERS",
+            "/packages/@comfy-org/comfy-cli/** @comfy-org/comfy-cloud-team\n",
+        )
+        self.assertEqual(self.findings(), [])
+
+    def test_codeowners_gate_does_not_read_a_comment_as_an_owner(self):
+        # CODEOWNERS legally carries `#` comments, and a comment naming a
+        # package is not an owner handle. (BE-8857 review.)
+        self.repo.write(
+            "CODEOWNERS",
+            "# we depend on @comfy-org/comfy-cli from npm\n",
+        )
+        self.assertEqual(self.findings(), [])
+
+    def test_codeowners_gate_still_reads_owners_before_a_trailing_comment(
+        self,
+    ):
+        # Excluding comment text must not cost the owner fields in front of it.
+        self.repo.write(
+            "CODEOWNERS", "* @comfy-org/comfy-cli  # owns everything\n"
+        )
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("@Comfy-Org/comfy-cli", findings[0])
+
+    def test_codeowners_gate_ignores_a_pattern_with_no_owners(self):
+        # A line with no owner fields has no owner handle to deny, so the
+        # crossing behaves as it does in every other file.
+        self.repo.write("CODEOWNERS", "@comfy-org/comfy-cli\n")
+        self.assertEqual(self.findings(), [])
+
+    def test_codeowners_gate_matches_the_file_name_case_insensitively(self):
+        # Git records the file name the author typed, and this was the only
+        # exact-case identity test left on a path where the org segment, the
+        # `.git` strip and both allowlists are all case-insensitive -- so a
+        # `codeowners` spelling walked the gate and the lowercase crossing
+        # cleared a real team handle against the REPO allowlist again.
+        # (BE-8857 review.)
+        for rel in ("codeowners", "Codeowners", ".github/CODEOWNERS"):
+            with self.subTest(rel=rel):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write(rel, "* @comfy-org/comfy-cli\n")
+                findings = checker.run_checks(repo.root).findings
+                self.assertEqual(len(findings), 1, findings)
+                self.assertIn("@Comfy-Org/comfy-cli", findings[0])
+
     def test_codeowners_gate_leaves_the_team_allowlist_path_alone(self):
         # The gate denies the repo CROSSING only. An allowlisted TEAM spelled
         # the way GitHub actually stores it (lowercase) still clears, or the

@@ -1011,6 +1011,49 @@ def _bounded(token):
     return token[:MAX_EXCERPT_CHARS] + "... (truncated)"
 
 
+# Everything before the first UNESCAPED `#`, i.e. the non-comment body of a
+# CODEOWNERS line. Both of these deliberately use DISJOINT alternation branches
+# (`[^\\#]` / `[^\s\\]` cannot match the `\` that starts the escape branch), so
+# each quantifier is linear. The ambiguous spellings (`(?:\\.|.)*`, `(?:\\.|\S)+`)
+# backtrack exponentially over a long backslash run that nothing follows -- and
+# these run over every line of a file that may be `MAX_FILE_BYTES` on one line.
+_CODEOWNERS_BODY_RE = re.compile(r"(?:\\.|[^\\#])*")
+# The leading PATH PATTERN plus the whitespace that ends it; owners follow.
+_CODEOWNERS_PATTERN_RE = re.compile(r"\s*(?:\\.|[^\s\\])+\s+")
+
+
+# A CODEOWNERS line is `<pattern> <owner>...`, with `#` starting a comment --
+# the syntax the BE-8857 gate needs in order to key on the OWNER FIELDS rather
+# than on the whole file. Classifying the file wholesale read every
+# `@Comfy-Org/<name>` token in it as an owner handle, but two other things
+# legally carry that spelling and are NOT handles: a `#` comment naming a
+# package, and a scoped monorepo PATH PATTERN such as
+# `/packages/@comfy-org/comfy-cli/**`. Both would have become hard "team not in
+# the known-public allowlist" findings on a required check. (BE-8857 review.)
+def _codeowners_owner_span(line):
+    """Return the `(start, end)` offsets of LINE's owner fields, or `None`.
+
+    `None` means "this line has no owner fields" -- a blank line, a comment, or
+    a pattern with no owners after it -- and leaves the npm/Packages crossing
+    exactly as it behaves in every other file. That fallback is the same
+    accepted ambiguity documented for prose, not a new hole: the crossing still
+    requires membership in the PUBLIC repo allowlist.
+
+    Text after an unescaped `#` is treated as a comment. GitHub documents only
+    whole-line comments, so a TRAILING `#` may in truth be owner text; excluding
+    it can only fall back to the crossing (never widen the deny), and `#` is not
+    a character a real owner handle contains.
+    """
+    body = _CODEOWNERS_BODY_RE.match(line).group(0)
+    match = _CODEOWNERS_PATTERN_RE.match(body)
+    if match is None:
+        return None
+    end = len(body.rstrip())
+    if match.end() >= end:
+        return None
+    return (match.end(), end)
+
+
 def _file_findings(rel, text, ticket_allowlist):
     """Yield one file's findings lazily, in report order.
 
@@ -1018,6 +1061,9 @@ def _file_findings(rel, text, ticket_allowlist):
     cap: a 5 MiB line of repeated `AA-12` must not be fully enumerated just to
     throw the tail away.
     """
+    # Per FILE, not per line or per match: the BE-8857 gate below needs it on
+    # every owner line, and the answer cannot change within one file.
+    is_codeowners = posixpath.basename(rel).casefold() == "codeowners"
     for lineno, line in enumerate(text.splitlines(), start=1):
         for match in TICKET_RE.finditer(line):
             token = match.group(0).upper()
@@ -1040,6 +1086,10 @@ def _file_findings(rel, text, ticket_allowlist):
                     f"{_excerpt(line)!r}"
                 )
 
+        # Per LINE, not per match: `_codeowners_owner_span` walks the line, so
+        # recomputing it inside the match loop is quadratic on a single long
+        # line -- the same shape `_excerpt` and `_bounded` guard against.
+        owner_span = _codeowners_owner_span(line) if is_codeowners else None
         for match in REPO_REF_RE.finditer(line):
             name = match.group(1)
             # Characters the ASCII name class could not read are the REST of the
@@ -1089,16 +1139,19 @@ def _file_findings(rel, text, ticket_allowlist):
             # known-public allowlist" with no caller-side escape (the repo
             # allowlist is deliberately not a workflow input).
             #
-            # EXCEPT inside a CODEOWNERS file, where only ONE of the two
-            # readings is possible: every `@`-prefixed reference there is an
-            # owner handle and npm coordinates never appear, so the repo
-            # crossing is denied outright and team-allowlist membership is
-            # required. Matched by BASENAME with `posixpath` -- `rel` is a
+            # EXCEPT on the OWNER FIELDS of a CODEOWNERS line, where only ONE
+            # of the two readings is possible: an `@`-prefixed owner is a
+            # handle and npm coordinates never appear there, so the repo
+            # crossing is denied and team-allowlist membership is required.
+            # The FILE is matched by BASENAME with `posixpath` -- `rel` is a
             # git-tracked path, `/`-separated whatever the host OS is. GitHub
             # only honors CODEOWNERS at `CODEOWNERS`, `.github/CODEOWNERS` and
             # `docs/CODEOWNERS`, so a basename match also covers files GitHub
             # ignores; that is the SAFE direction (it re-enables default-deny
-            # on a file where no npm coordinate can live). (BE-8857.)
+            # on a file where no npm coordinate can live). Within the file the
+            # deny is scoped by `_codeowners_owner_span`, because a `#` comment
+            # and a scoped path pattern carry the same spelling without being
+            # handles. (BE-8857, + its review.)
             #
             # The reverse crossing stays forbidden on purpose -- a bare
             # `Comfy-Org/<name>` is unambiguously a repo path, since there is no
@@ -1128,9 +1181,20 @@ def _file_findings(rel, text, ticket_allowlist):
                 # false-positive class the crossing exists to fix (see
                 # test_npm_scope_of_a_public_repo_is_not_a_team_finding).
                 # (BE-8857.)
-                is_codeowners = posixpath.basename(rel) == "CODEOWNERS"
+                # Keyed on the OWNER FIELDS of a CODEOWNERS line, not on the
+                # file as a whole: a `#` comment and a scoped path pattern
+                # (`/packages/@comfy-org/comfy-cli/**`) legally carry the same
+                # spelling without being handles. (BE-8857 review.) The
+                # basename that produced `owner_span` compares CASEFOLDED --
+                # git records the name the author typed, and this was the only
+                # exact-case identity test left on a path where the org
+                # segment, the `.git` strip and both allowlists are all
+                # case-insensitive, so a `codeowners` spelling walked the gate.
+                in_owner_field = owner_span is not None and (
+                    owner_span[0] <= match.start() < owner_span[1]
+                )
                 npm_scope = (
-                    not is_codeowners
+                    not in_owner_field
                     and line[match.start() : match.end()].islower()
                 )
                 if folded not in _PUBLIC_TEAMS_CF and not (
