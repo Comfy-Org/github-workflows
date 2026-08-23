@@ -248,7 +248,11 @@ that is not a git work tree, tracked content at the reserved `_public_repo_hygie
 ## Adding a repo to the allowlist
 
 Confirm it is genuinely public first — `gh repo view Comfy-Org/<name> --json visibility` — then
-add the name to `PUBLIC_COMFY_ORG_REPOS` with a one-line comment, and merge. The
+add the name to `PUBLIC_COMFY_ORG_REPOS` with a one-line comment, in its **case-insensitive
+alphabetical slot** — not appended at the bottom. A `frozenset` has no order at run time, so the
+source text is the only place the order lives, and it is the view a human reads to check whether a
+name is already there; `AllowlistSourceOrderTest` fails the build on an out-of-order or duplicated
+entry rather than leaving it to review. Then merge. The
 `bump-public-repo-hygiene-callers.yml` fleet rolls the new SHA out to every enrolled caller; a
 caller that is not on the roster keeps scanning against the old list, which is the usual
 two-step-enrollment footgun this repo documents in `AGENTS.md`.

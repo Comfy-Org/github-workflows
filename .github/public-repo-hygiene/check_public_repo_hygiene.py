@@ -295,32 +295,55 @@ INTERNAL_MARKER_RES = (
 # This is the ORG-WIDE single source of truth. It is deliberately NOT a
 # workflow input: an allowlist a caller could pass in would be an allowlist a
 # PR in the caller repo could widen, which is the hole this file closes.
+#
+# Entries are kept in case-insensitive alphabetical order, and that ordering is
+# ASSERTED by `test_repo_allowlist_is_sorted_and_duplicate_free` rather than
+# left to review (BE-8855). A `frozenset` has no order of its own, so the only
+# place the order exists is this source text -- which is exactly where a human
+# reads it to answer "is <name> already allowlisted?" before appending a
+# duplicate to the bottom. New names go in their alphabetical slot, each with a
+# one-line comment recording where the reference came from and that it was
+# verified public.
 PUBLIC_COMFY_ORG_REPOS = frozenset(
     {
         "comfy-api-proxy",
         "comfy-cla",
         "comfy-cli",
         "comfy-cloud-mcp-server",
+        # Referenced from comfy-cli's refresh-cql-catalogs.yml workflow
+        # (comfy-cli#758). Verified public: an unauthenticated
+        # raw.githubusercontent.com fetch of its README returns 200.
+        "comfy-complete",
         "Comfy-Desktop",
-        "comfy-python-sdk",
-        "comfy-swift-sdk",
-        "comfy-typescript-sdk",
-        "ComfyUI_frontend",
-        "ComfyUI",
-        # BE-8654: this repo. Both SDK copies were missing it, so the caller
-        # every one of them needs -- a pin at
-        # `Comfy-Org/github-workflows/.github/workflows/...` -- failed the very
-        # check it was being added alongside. Verified public.
-        "github-workflows",
         # Adopted the public-repo-hygiene caller in comfy-mcp#254 and hit a
         # false positive on its own self-references (README, CI comments,
         # issue templates). Verified public via the GitHub API
         # (`private: false`).
         "comfy-mcp",
-        # Referenced from comfy-cli's refresh-cql-catalogs.yml workflow
-        # (comfy-cli#758). Verified public: an unauthenticated
-        # raw.githubusercontent.com fetch of its README returns 200.
-        "comfy-complete",
+        "comfy-python-sdk",
+        # BE-8855: referenced from comfy-cli (2 findings). Verified public.
+        "comfy-skills",
+        "comfy-swift-sdk",
+        "comfy-typescript-sdk",
+        "ComfyUI",
+        # BE-8855: referenced from comfy-cli (3 findings). Verified public.
+        "ComfyUI-Manager",
+        # BE-8855: referenced from comfy-cli (1 finding). Verified public.
+        "ComfyUI-test-framework",
+        "ComfyUI_frontend",
+        # BE-8855: referenced from comfy-cli (1 finding). Verified public.
+        "cookiecutter-comfy-extension",
+        # BE-8855: referenced from comfy-cli (1 finding). Verified public.
+        "CustomNodeComfyMath",
+        # BE-8654: this repo. Both SDK copies were missing it, so the caller
+        # every one of them needs -- a pin at
+        # `Comfy-Org/github-workflows/.github/workflows/...` -- failed the very
+        # check it was being added alongside. Verified public.
+        "github-workflows",
+        # BE-8855: the biggest single false-positive source in comfy-cli, at 21
+        # findings -- it is the template pack comfy-cli ships against. Verified
+        # public.
+        "workflow_templates",
     }
 )
 # CODEOWNERS team handles (`@Comfy-Org/<team>`) are inherently public on a

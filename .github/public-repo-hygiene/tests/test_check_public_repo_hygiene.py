@@ -14,6 +14,7 @@ this file from a pinned ref instead of the caller's checkout -- is asserted by
 `.github/workflows/test-public-repo-hygiene.yml`.
 """
 
+import ast
 import codecs
 import os
 import subprocess
@@ -1772,6 +1773,90 @@ class TamperResistanceTest(CheckerTestCase):
         for name in checker.PUBLIC_COMFY_ORG_REPOS | checker.PUBLIC_COMFY_ORG_TEAMS:
             self.assertIsInstance(name, str)
             self.assertRegex(name, r"^[A-Za-z0-9._-]+$")
+
+
+class AllowlistSourceOrderTest(unittest.TestCase):
+    """The allowlists are edited as SOURCE TEXT, so pin the source text.
+
+    `PUBLIC_COMFY_ORG_REPOS` is a `frozenset`, which has no order at all at
+    run time -- the only place an order exists is the literal in the module,
+    and that is precisely where a human looks to answer "is `<name>` already
+    in here?" before adding one. Left to review, entries accrete at the bottom
+    in arrival order (BE-8855 found three appended that way), the list stops
+    being scannable, and the next addition is a duplicate nobody spots.
+
+    An exact textual duplicate is invisible to every other assertion in this
+    file, because the set literal silently collapses it before any test can
+    see it -- `{"a", "a"}` is just `{"a"}`. So it has to be caught in the AST,
+    which is the one view that still has both copies.
+    """
+
+    def _literal_entries(self, name):
+        """The set literal's elements, in the order they appear in the file."""
+        with open(checker.__file__, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), filename=checker.__file__)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            if not any(
+                isinstance(t, ast.Name) and t.id == name for t in node.targets
+            ):
+                continue
+            # `frozenset({...})` -- unwrap the call to reach the set literal.
+            self.assertIsInstance(node.value, ast.Call, name)
+            self.assertEqual(len(node.value.args), 1, name)
+            literal = node.value.args[0]
+            self.assertIsInstance(literal, ast.Set, name)
+            entries = []
+            for elt in literal.elts:
+                self.assertIsInstance(elt, ast.Constant, name)
+                self.assertIsInstance(elt.value, str, name)
+                entries.append(elt.value)
+            return entries
+        self.fail(f"no assignment to {name} found in {checker.__file__}")
+
+    def _assert_sorted_and_unique(self, name, runtime):
+        entries = self._literal_entries(name)
+        # Casefolded, because that is how a reader alphabetizes and how
+        # membership is tested (BE-8697); a case-sensitive sort would demand
+        # `ComfyUI` sort before `comfy-cli`, which reads as unsorted.
+        self.assertEqual(
+            entries,
+            sorted(entries, key=str.casefold),
+            f"{name} is not in case-insensitive alphabetical order",
+        )
+        duplicates = sorted({e for e in entries if entries.count(e) > 1})
+        self.assertEqual(duplicates, [], f"{name} has duplicate entries")
+        # And the literal this test read is the one the module actually uses,
+        # not some other assignment that happens to share the name.
+        self.assertEqual(set(entries), set(runtime), name)
+        self.assertEqual(len(entries), len(runtime), name)
+
+    def test_repo_allowlist_is_sorted_and_duplicate_free(self):
+        self._assert_sorted_and_unique(
+            "PUBLIC_COMFY_ORG_REPOS", checker.PUBLIC_COMFY_ORG_REPOS
+        )
+
+    def test_team_allowlist_is_sorted_and_duplicate_free(self):
+        self._assert_sorted_and_unique(
+            "PUBLIC_COMFY_ORG_TEAMS", checker.PUBLIC_COMFY_ORG_TEAMS
+        )
+
+    def test_the_six_repos_verified_public_for_be_8855_are_allowlisted(self):
+        # Each verified PUBLIC at implementation time, twice: `gh repo view
+        # Comfy-Org/<name> --json visibility` returned PUBLIC, and an
+        # UNAUTHENTICATED `api.github.com/repos/Comfy-Org/<name>` returned 200
+        # (a private repo 404s to an anonymous caller). Pinned here so a later
+        # reshuffle of the literal cannot drop one on the floor.
+        for name in (
+            "comfy-skills",
+            "ComfyUI-Manager",
+            "ComfyUI-test-framework",
+            "cookiecutter-comfy-extension",
+            "CustomNodeComfyMath",
+            "workflow_templates",
+        ):
+            self.assertIn(name.casefold(), checker._PUBLIC_REPOS_CF, name)
 
 
 class OutputTest(CheckerTestCase):
