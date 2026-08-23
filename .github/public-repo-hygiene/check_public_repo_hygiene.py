@@ -351,6 +351,11 @@ PUBLIC_COMFY_ORG_REPOS = frozenset(
 # repo, so listing them here is not a leak. An `@Comfy-Org/<team>` handle NOT
 # in this set is still flagged, so a genuinely-internal team reference
 # surfaces.
+#
+# Same editing rule as the repo allowlist above, and asserted the same way by
+# `test_team_allowlist_is_sorted_and_duplicate_free`: new team slugs go in
+# their case-insensitive alphabetical slot, not at the end, and a duplicate
+# (in any casing) fails the build rather than collapsing silently into the set.
 PUBLIC_COMFY_ORG_TEAMS = frozenset({"comfy-cloud-team", "core-engine-team"})
 
 # Casefolded views of the two lists above, used for MEMBERSHIP only (BE-8697).

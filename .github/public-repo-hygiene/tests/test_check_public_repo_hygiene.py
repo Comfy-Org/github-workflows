@@ -1825,8 +1825,19 @@ class AllowlistSourceOrderTest(unittest.TestCase):
             sorted(entries, key=str.casefold),
             f"{name} is not in case-insensitive alphabetical order",
         )
-        duplicates = sorted({e for e in entries if entries.count(e) > 1})
-        self.assertEqual(duplicates, [], f"{name} has duplicate entries")
+        # Duplicates are counted CASEFOLDED for the same reason the sort is:
+        # membership is casefolded (BE-8697), so `comfyui` next to `ComfyUI`
+        # is two spellings of ONE allowlist entry. That is also the duplicate
+        # shape this list is most likely to grow, and the one nothing else
+        # here can see -- a case-sensitive count sees no repeat, the casefold
+        # sort is stable so the pair stays adjacent and reads as ordered, and
+        # the frozenset keeps both spellings so the set and len comparisons
+        # below hold.
+        folded = [e.casefold() for e in entries]
+        duplicates = sorted({f for f in folded if folded.count(f) > 1})
+        self.assertEqual(
+            duplicates, [], f"{name} has duplicate entries (case-insensitive)"
+        )
         # And the literal this test read is the one the module actually uses,
         # not some other assignment that happens to share the name.
         self.assertEqual(set(entries), set(runtime), name)
@@ -1846,8 +1857,20 @@ class AllowlistSourceOrderTest(unittest.TestCase):
         # Each verified PUBLIC at implementation time, twice: `gh repo view
         # Comfy-Org/<name> --json visibility` returned PUBLIC, and an
         # UNAUTHENTICATED `api.github.com/repos/Comfy-Org/<name>` returned 200
-        # (a private repo 404s to an anonymous caller). Pinned here so a later
-        # reshuffle of the literal cannot drop one on the floor.
+        # (a private repo 404s to an anonymous caller). Pinned here so the
+        # reshuffle BE-8855 performed on this literal -- and the next one --
+        # cannot drop one on the floor; `_assert_sorted_and_unique` above
+        # constrains ORDER and uniqueness, not membership, so nothing else
+        # notices a deletion.
+        #
+        # This records a point-in-time check; it is NOT a live visibility
+        # probe and must not be read as one (a unit test cannot reach the
+        # network, and a scheduled drift check that can is tracked
+        # separately). So if one of these repos is later confirmed PRIVATE,
+        # dropping it from `PUBLIC_COMFY_ORG_REPOS` is the security-correct
+        # fix and this tuple is expected to shrink with it in the same commit
+        # -- the red build is a prompt to edit both, never a reason to keep a
+        # private name on a default-deny allowlist.
         for name in (
             "comfy-skills",
             "ComfyUI-Manager",
