@@ -50,7 +50,6 @@ import codecs
 import collections
 import itertools
 import os
-import posixpath
 import re
 import stat
 import subprocess
@@ -1011,20 +1010,61 @@ def _bounded(token):
     return token[:MAX_EXCERPT_CHARS] + "... (truncated)"
 
 
-# Everything before the first UNESCAPED `#`, i.e. the non-comment body of a
-# CODEOWNERS line. Both of these deliberately use DISJOINT alternation branches
-# (`[^\\#]` / `[^\s\\]` cannot match the `\` that starts the escape branch), so
-# each quantifier is linear. The ambiguous spellings (`(?:\\.|.)*`, `(?:\\.|\S)+`)
-# backtrack exponentially over a long backslash run that nothing follows -- and
-# these run over every line of a file that may be `MAX_FILE_BYTES` on one line.
-_CODEOWNERS_BODY_RE = re.compile(r"(?:\\.|[^\\#])*")
-# The leading PATH PATTERN plus the whitespace that ends it; owners follow.
-_CODEOWNERS_PATTERN_RE = re.compile(r"\s*(?:\\.|[^\s\\])+\s+")
+# The directories GitHub actually reads a CODEOWNERS file from: the repo root,
+# `.github/` and `docs/`. Keying the gate on the BASENAME ALONE gave owner-field
+# grammar to any file spelled that way -- a `tests/fixtures/CODEOWNERS`, or a
+# `docs/notes/codeowners` design note whose prose line `Owned by
+# @comfy-org/comfy-cli today` parses as pattern-then-owners -- and turned a line
+# that cleared before BE-8857 into a hard finding on a required check, with
+# `exclude_paths:` (which drops the file from all THREE categories) as the only
+# caller-side remedy. "No npm coordinate can live there" is an argument about
+# real CODEOWNERS files, not about a basename. (BE-8857 review, round 2.)
+_CODEOWNERS_DIRS = frozenset({"", ".github", "docs"})
+# A comment is a WHOLE line. GitHub honors `#` as a comment introducer only at
+# the start of one, so treating the first `#` ANYWHERE as the end of the body
+# handed out a one-character bypass of the entire gate: `docs/#archive/**
+# @comfy-org/comfy-cli` and `*# @comfy-org/comfy-cli` both left the line with no
+# computable owner span, and `* @comfy-org/<team> #x @comfy-org/comfy-cli` cut
+# the span before the second handle -- in each case the handle fell back to the
+# lowercase crossing and cleared against the REPO allowlist, which is precisely
+# the path BE-8857 exists to close. A trailing `#` now stays INSIDE the span,
+# which is the over-flag direction. (BE-8857 review, round 2.)
+_CODEOWNERS_COMMENT_RE = re.compile(r"\s*#")
+# `\s*` + the first token + the whitespace that ends it, if any. No escape
+# branch: `\ ` as a literal space let `foo\ @comfy-org/<team> @other` read the
+# FIRST handle as pattern text and clear it through the crossing -- a bypass,
+# where dropping the branch costs at most a false positive. GitHub's CODEOWNERS
+# parser diverges from gitignore on escapes anyway (`\#` is documented as not
+# escapable). Dropping it also makes both quantifiers single-charset, so CPython
+# compiles them to `REPEAT_ONE` rather than pushing a `MAX_UNTIL` match context
+# per character consumed -- on the input this scans in the worst case, one
+# `MAX_FILE_BYTES` line, an alternation body is millions of heap frames and a
+# `MemoryError` no caller catches. (BE-8857 review, round 2.)
+_CODEOWNERS_TOKENS_RE = re.compile(r"(\s*)(\S+)(\s+)?")
 
 
-# A CODEOWNERS line is `<pattern> <owner>...`, with `#` starting a comment --
-# the syntax the BE-8857 gate needs in order to key on the OWNER FIELDS rather
-# than on the whole file. Classifying the file wholesale read every
+def _is_codeowners(rel):
+    """Is REL one of the files GitHub reads as CODEOWNERS?
+
+    The basename compares CASEFOLDED (as does the directory): git records the
+    name the author typed, and this was the only exact-case identity test left
+    on a path where the org segment, the `.git` strip and both allowlists are
+    all case-insensitive, so a tracked `codeowners` walked the gate. Widening
+    the NAME within the three honored locations is the safe direction -- a
+    misspelled-case file GitHub does not honor still holds a real team name
+    somebody wrote as an owner. Widening the LOCATION is not; see
+    `_CODEOWNERS_DIRS`.
+    """
+    directory, _, base = rel.rpartition("/")
+    return (
+        base.casefold() == "codeowners"
+        and directory.casefold() in _CODEOWNERS_DIRS
+    )
+
+
+# A CODEOWNERS line is `<pattern> <owner>...`, with `#` commenting out a whole
+# line -- the syntax the BE-8857 gate needs in order to key on the OWNER FIELDS
+# rather than on the whole file. Classifying the file wholesale read every
 # `@Comfy-Org/<name>` token in it as an owner handle, but two other things
 # legally carry that spelling and are NOT handles: a `#` comment naming a
 # package, and a scoped monorepo PATH PATTERN such as
@@ -1033,23 +1073,28 @@ _CODEOWNERS_PATTERN_RE = re.compile(r"\s*(?:\\.|[^\s\\])+\s+")
 def _codeowners_owner_span(line):
     """Return the `(start, end)` offsets of LINE's owner fields, or `None`.
 
-    `None` means "this line has no owner fields" -- a blank line, a comment, or
-    a pattern with no owners after it -- and leaves the npm/Packages crossing
-    exactly as it behaves in every other file. That fallback is the same
-    accepted ambiguity documented for prose, not a new hole: the crossing still
-    requires membership in the PUBLIC repo allowlist.
+    `None` means "this line has no owner fields" -- a blank line, a whole-line
+    comment, or a pattern with no owners after it -- and leaves the
+    npm/Packages crossing exactly as it behaves in every other file. That
+    fallback is the same accepted ambiguity documented for prose, not a new
+    hole: the crossing still requires membership in the PUBLIC repo allowlist.
 
-    Text after an unescaped `#` is treated as a comment. GitHub documents only
-    whole-line comments, so a TRAILING `#` may in truth be owner text; excluding
-    it can only fall back to the crossing (never widen the deny), and `#` is not
-    a character a real owner handle contains.
+    A line whose FIRST token is `@`-prefixed carries no path pattern, so the
+    whole line is owners -- the "default owners" shape people write under a
+    `# default owners` comment. Reading its lone token as a pattern left a real
+    owner handle on the crossing, which the filename-casefold rationale ("still
+    a real team name someone wrote as an owner") argues against verbatim.
     """
-    body = _CODEOWNERS_BODY_RE.match(line).group(0)
-    match = _CODEOWNERS_PATTERN_RE.match(body)
+    if _CODEOWNERS_COMMENT_RE.match(line):
+        return None
+    match = _CODEOWNERS_TOKENS_RE.match(line)
     if match is None:
         return None
-    end = len(body.rstrip())
-    if match.end() >= end:
+    end = len(line.rstrip())
+    token_start = match.end(1)
+    if line[token_start] == "@":
+        return (token_start, end)
+    if match.group(3) is None or match.end() >= end:
         return None
     return (match.end(), end)
 
@@ -1063,7 +1108,7 @@ def _file_findings(rel, text, ticket_allowlist):
     """
     # Per FILE, not per line or per match: the BE-8857 gate below needs it on
     # every owner line, and the answer cannot change within one file.
-    is_codeowners = posixpath.basename(rel).casefold() == "codeowners"
+    is_codeowners = _is_codeowners(rel)
     for lineno, line in enumerate(text.splitlines(), start=1):
         for match in TICKET_RE.finditer(line):
             token = match.group(0).upper()
@@ -1143,15 +1188,13 @@ def _file_findings(rel, text, ticket_allowlist):
             # of the two readings is possible: an `@`-prefixed owner is a
             # handle and npm coordinates never appear there, so the repo
             # crossing is denied and team-allowlist membership is required.
-            # The FILE is matched by BASENAME with `posixpath` -- `rel` is a
-            # git-tracked path, `/`-separated whatever the host OS is. GitHub
-            # only honors CODEOWNERS at `CODEOWNERS`, `.github/CODEOWNERS` and
-            # `docs/CODEOWNERS`, so a basename match also covers files GitHub
-            # ignores; that is the SAFE direction (it re-enables default-deny
-            # on a file where no npm coordinate can live). Within the file the
-            # deny is scoped by `_codeowners_owner_span`, because a `#` comment
-            # and a scoped path pattern carry the same spelling without being
-            # handles. (BE-8857, + its review.)
+            # WHICH files get this treatment is `_is_codeowners`: the three
+            # locations GitHub actually reads CODEOWNERS from (`rel` is a
+            # git-tracked path, `/`-separated whatever the host OS is), with
+            # the name matched case-insensitively. WHERE on a line it applies
+            # is `_codeowners_owner_span`, because a `#` comment and a scoped
+            # path pattern carry the same spelling without being handles.
+            # (BE-8857, + its review.)
             #
             # The reverse crossing stays forbidden on purpose -- a bare
             # `Comfy-Org/<name>` is unambiguously a repo path, since there is no
@@ -1184,12 +1227,7 @@ def _file_findings(rel, text, ticket_allowlist):
                 # Keyed on the OWNER FIELDS of a CODEOWNERS line, not on the
                 # file as a whole: a `#` comment and a scoped path pattern
                 # (`/packages/@comfy-org/comfy-cli/**`) legally carry the same
-                # spelling without being handles. (BE-8857 review.) The
-                # basename that produced `owner_span` compares CASEFOLDED --
-                # git records the name the author typed, and this was the only
-                # exact-case identity test left on a path where the org
-                # segment, the `.git` strip and both allowlists are all
-                # case-insensitive, so a `codeowners` spelling walked the gate.
+                # spelling without being handles. (BE-8857 review.)
                 in_owner_field = owner_span is not None and (
                     owner_span[0] <= match.start() < owner_span[1]
                 )

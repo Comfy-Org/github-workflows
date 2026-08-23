@@ -861,7 +861,9 @@ class RepoReferenceCategoryTest(CheckerTestCase):
     def test_codeowners_gate_still_reads_owners_before_a_trailing_comment(
         self,
     ):
-        # Excluding comment text must not cost the owner fields in front of it.
+        # A trailing `#` is not a comment introducer to GitHub, so it stays
+        # INSIDE the span (the over-flag direction). Either way the owner
+        # fields in front of it are read. (BE-8857 review, round 2.)
         self.repo.write(
             "CODEOWNERS", "* @comfy-org/comfy-cli  # owns everything\n"
         )
@@ -869,11 +871,75 @@ class RepoReferenceCategoryTest(CheckerTestCase):
         self.assertEqual(len(findings), 1, findings)
         self.assertIn("@Comfy-Org/comfy-cli", findings[0])
 
-    def test_codeowners_gate_ignores_a_pattern_with_no_owners(self):
-        # A line with no owner fields has no owner handle to deny, so the
-        # crossing behaves as it does in every other file.
+    def test_codeowners_gate_reads_an_owner_only_line(self):
+        # A line whose FIRST token is `@`-prefixed carries no path pattern, so
+        # the whole line is owners -- the "default owners" shape people write
+        # under a `# default owners` comment. Reading its lone token as a
+        # pattern left a real owner handle on the crossing, which the
+        # filename-casefold rationale argues against verbatim.
+        # (BE-8857 review, round 2.)
         self.repo.write("CODEOWNERS", "@comfy-org/comfy-cli\n")
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("@Comfy-Org/comfy-cli", findings[0])
+
+    def test_codeowners_gate_ignores_a_pattern_with_no_owners(self):
+        # A pattern-only line has no owner fields to deny, so the crossing
+        # behaves as it does in every other file.
+        self.repo.write(
+            "CODEOWNERS", "docs/\n# @comfy-org/comfy-cli is on npm\n"
+        )
         self.assertEqual(self.findings(), [])
+
+    def test_a_hash_only_comments_out_a_WHOLE_codeowners_line(self):
+        # GitHub honors `#` as a comment introducer only at the START of a
+        # line. Ending the scanned body at the first `#` ANYWHERE was a
+        # one-character bypass of the whole gate: each of these left the handle
+        # outside any computed span, so it fell back to the lowercase crossing
+        # and cleared against the REPO allowlist -- the exact path BE-8857
+        # exists to close. (BE-8857 review, round 2.)
+        for line in (
+            "docs/#archive/** @comfy-org/comfy-cli",
+            "*# @comfy-org/comfy-cli",
+            "* @comfy-org/comfy-cloud-team #x @comfy-org/comfy-cli",
+        ):
+            with self.subTest(line=line):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write("CODEOWNERS", line + "\n")
+                findings = checker.run_checks(repo.root).findings
+                self.assertEqual(len(findings), 1, findings)
+                self.assertIn("@Comfy-Org/comfy-cli", findings[0])
+
+    def test_codeowners_gate_does_not_split_the_pattern_on_an_escaped_space(
+        self,
+    ):
+        # Honoring `\ ` as a literal space inside the pattern let the FIRST
+        # owner handle be read as pattern text and cleared through the
+        # crossing. GitHub's CODEOWNERS parser diverges from gitignore on
+        # escapes anyway, and the worst case of not honoring it is a false
+        # positive rather than a bypass. (BE-8857 review, round 2.)
+        self.repo.write("CODEOWNERS", "foo\\ @comfy-org/comfy-cli\n")
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("@Comfy-Org/comfy-cli", findings[0])
+
+    def test_codeowners_gate_only_covers_the_locations_github_honors(self):
+        # Keying on the BASENAME alone gave owner-field grammar to any file
+        # spelled that way, so PROSE in an unrelated file parsed as
+        # pattern-then-owners and a line that cleared before BE-8857 became a
+        # hard finding on a required check. GitHub reads CODEOWNERS from the
+        # repo root, `.github/` and `docs/` only. (BE-8857 review, round 2.)
+        for rel in (
+            "tests/fixtures/CODEOWNERS",
+            "docs/notes/codeowners",
+            "a/b/CODEOWNERS",
+        ):
+            with self.subTest(rel=rel):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write(rel, "Owned by @comfy-org/comfy-cli today\n")
+                self.assertEqual(checker.run_checks(repo.root).findings, [])
 
     def test_codeowners_gate_matches_the_file_name_case_insensitively(self):
         # Git records the file name the author typed, and this was the only
