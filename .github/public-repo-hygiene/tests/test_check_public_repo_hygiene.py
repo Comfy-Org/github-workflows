@@ -930,16 +930,77 @@ class RepoReferenceCategoryTest(CheckerTestCase):
         # pattern-then-owners and a line that cleared before BE-8857 became a
         # hard finding on a required check. GitHub reads CODEOWNERS from the
         # repo root, `.github/` and `docs/` only. (BE-8857 review, round 2.)
+        # The NAME matches case-insensitively, but the DIRECTORY does not:
+        # `DOCS/` and `.GitHub/` are distinct tracked paths GitHub does not
+        # read. (BE-8857 review, round 3.)
         for rel in (
             "tests/fixtures/CODEOWNERS",
             "docs/notes/codeowners",
             "a/b/CODEOWNERS",
+            "DOCS/CODEOWNERS",
+            ".GitHub/CODEOWNERS",
         ):
             with self.subTest(rel=rel):
                 repo = RepoFixture()
                 self.addCleanup(repo.cleanup)
                 repo.write(rel, "Owned by @comfy-org/comfy-cli today\n")
                 self.assertEqual(checker.run_checks(repo.root).findings, [])
+
+    def test_codeowners_gate_does_not_read_a_scoped_pattern_as_owners(self):
+        # GitHub parses field one as the path pattern UNCONDITIONALLY, so the
+        # "first token is `@`-prefixed, therefore the line is all owners"
+        # branch has to test owner SHAPE (at most one `/`, no trailing `/`, no
+        # glob) or a root-level scoped pattern hands its own `comfy-cli` to the
+        # deny -- a hard finding on a required check, while the rooted spelling
+        # `/packages/@comfy-org/comfy-cli/**` cleared. (BE-8857 review, r3.)
+        for line in (
+            "@comfy-org/comfy-cli/** @comfy-org/comfy-cloud-team",
+            "@comfy-org/comfy-cli/**",
+            "@comfy-org/comfy-cli/",
+        ):
+            with self.subTest(line=line):
+                repo = RepoFixture()
+                self.addCleanup(repo.cleanup)
+                repo.write("CODEOWNERS", line + "\n")
+                self.assertEqual(checker.run_checks(repo.root).findings, [])
+
+    def test_codeowners_gate_looks_past_a_utf8_bom(self):
+        # A UTF-8 BOM survives decoding (`_BOM_CODECS` handles only UTF-16/32)
+        # and U+FEFF is not `\s`, so it joined the first token and defeated
+        # both first-character decisions on line 1: the handle below yielded no
+        # span at all and cleared against the REPO allowlist.
+        # (BE-8857 review, round 3.)
+        self.repo.write(
+            "CODEOWNERS", "\ufeff@comfy-org/comfy-cli\n".encode("utf-8")
+        )
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("@Comfy-Org/comfy-cli", findings[0])
+
+    def test_codeowners_gate_looks_past_a_utf8_bom_on_a_comment(self):
+        # The other direction of the same bug: a BOM'd comment line stopped
+        # being recognized as one, putting a package mention in the span.
+        self.repo.write(
+            "CODEOWNERS",
+            "\ufeff# we depend on @comfy-org/comfy-cli\n".encode("utf-8"),
+        )
+        self.assertEqual(self.findings(), [])
+
+    def test_codeowners_gate_over_flags_a_package_in_trailing_prose(self):
+        # ACCEPTED, pinned rather than narrowed. GitHub does not read a
+        # trailing `#` as a comment, so the span runs to end of line and a
+        # package named in trailing prose is reported. Stopping at a
+        # whitespace-delimited `#` token would re-open the round-2 bypass
+        # `* @comfy-org/<team> #x @comfy-org/comfy-cli`, and over-flagging is
+        # the direction a leak gate should be wrong in -- the remedy is to
+        # reword the comment. (BE-8857 review, round 3.)
+        self.repo.write(
+            "CODEOWNERS",
+            "* @comfy-org/comfy-cloud-team  # see @comfy-org/comfy-cli on npm\n",
+        )
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("@Comfy-Org/comfy-cli", findings[0])
 
     def test_codeowners_gate_matches_the_file_name_case_insensitively(self):
         # Git records the file name the author typed, and this was the only

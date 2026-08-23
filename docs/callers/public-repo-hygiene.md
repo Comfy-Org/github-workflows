@@ -114,7 +114,11 @@ untouched: team slugs are lowercase by construction, so the lowercase test alone
 On an owner line only the team allowlist applies. The rest of such a file is untouched — a
 whole-line `#` comment naming a package, and a scoped path pattern like
 `/packages/@comfy-org/comfy-cli/**`, are not owner handles and still clear. A `#` part-way through
-a line is not a comment to GitHub and does not end the owner fields. Everywhere else — a README, a Dockerfile `npm i` line, a CI script — the lowercase spelling
+a line is not a comment to GitHub and does not end the owner fields, so a package named in trailing
+prose after a real owner (`* @Comfy-Org/core-team  # see @comfy-org/comfy-cli on npm`) *is*
+reported — reword the comment, or move it to its own line. A line that starts with an owner handle
+rather than a path (`@comfy-org/<team>`, the "default owners" shape) is read as all owners, but a
+scoped path pattern in that leading position (`@comfy-org/<name>/**`) is still a pattern. Everywhere else — a README, a Dockerfile `npm i` line, a CI script — the lowercase spelling
 is genuinely ambiguous and still clears, which is the deliberate trade that keeps package mentions
 out of the findings. What is still not matched is a reference split across two lines —
 the scan is line-oriented.

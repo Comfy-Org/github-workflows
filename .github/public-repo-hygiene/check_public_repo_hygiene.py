@@ -1020,16 +1020,27 @@ def _bounded(token):
 # caller-side remedy. "No npm coordinate can live there" is an argument about
 # real CODEOWNERS files, not about a basename. (BE-8857 review, round 2.)
 _CODEOWNERS_DIRS = frozenset({"", ".github", "docs"})
-# A comment is a WHOLE line. GitHub honors `#` as a comment introducer only at
-# the start of one, so treating the first `#` ANYWHERE as the end of the body
-# handed out a one-character bypass of the entire gate: `docs/#archive/**
+# A comment is a WHOLE line -- one whose first non-blank character is `#`. The
+# leading `[\s\ufeff]*` is the gitignore-family reading CODEOWNERS inherits (a
+# parser trims indentation before looking), stated here rather than left to be
+# read off the regex, since "start of the line" and "start of the CONTENT of
+# the line" differ by exactly one tab and that is the shape of every bypass
+# below. GitHub honors `#` ONLY in that position, so treating the first `#`
+# ANYWHERE as the end of the body handed out a one-character bypass of the
+# entire gate: `docs/#archive/**
 # @comfy-org/comfy-cli` and `*# @comfy-org/comfy-cli` both left the line with no
 # computable owner span, and `* @comfy-org/<team> #x @comfy-org/comfy-cli` cut
 # the span before the second handle -- in each case the handle fell back to the
 # lowercase crossing and cleared against the REPO allowlist, which is precisely
 # the path BE-8857 exists to close. A trailing `#` now stays INSIDE the span,
 # which is the over-flag direction. (BE-8857 review, round 2.)
-_CODEOWNERS_COMMENT_RE = re.compile(r"\s*#")
+# U+FEFF is in both leading classes because a UTF-8 BOM SURVIVES decoding here
+# (`_BOM_CODECS` handles only UTF-16/32) and U+FEFF is not `\s`, so it joined
+# the first token and defeated both first-character decisions on line 1:
+# `\ufeff@comfy-org/comfy-cli` yielded no span at all -- the handle fell back to
+# the crossing and cleared against the REPO allowlist -- while `\ufeff# ...` was
+# no longer read as a whole-line comment. (BE-8857 review, round 3.)
+_CODEOWNERS_COMMENT_RE = re.compile(r"[\s\ufeff]*#")
 # `\s*` + the first token + the whitespace that ends it, if any. No escape
 # branch: `\ ` as a literal space let `foo\ @comfy-org/<team> @other` read the
 # FIRST handle as pattern text and clear it through the crossing -- a bypass,
@@ -1040,7 +1051,17 @@ _CODEOWNERS_COMMENT_RE = re.compile(r"\s*#")
 # per character consumed -- on the input this scans in the worst case, one
 # `MAX_FILE_BYTES` line, an alternation body is millions of heap frames and a
 # `MemoryError` no caller catches. (BE-8857 review, round 2.)
-_CODEOWNERS_TOKENS_RE = re.compile(r"(\s*)(\S+)(\s+)?")
+_CODEOWNERS_TOKENS_RE = re.compile(r"([\s\ufeff]*)(\S+)(\s+)?")
+# What an OWNER may look like when it is the FIRST token on a line, i.e. the
+# test for "this line has no path pattern". A GitHub owner is `@user` or
+# `@org/team`: at most one `/`, no trailing `/`, and no glob metacharacter.
+# Accepting any `@`-prefixed first token re-opened the scoped-pattern false
+# positive in the leading position -- GitHub parses field one as the pattern
+# unconditionally, so `@comfy-org/comfy-cli/** @comfy-org/<team>` handed the
+# PATTERN's own `comfy-cli` to the deny and hard-failed a required check, while
+# the rooted spelling `/packages/@comfy-org/comfy-cli/**` cleared.
+# (BE-8857 review, round 3.)
+_CODEOWNERS_HANDLE_RE = re.compile(r"@[^\s/*?\[\]]+(?:/[^\s/*?\[\]]+)?\Z")
 
 
 def _is_codeowners(rel):
@@ -1056,10 +1077,14 @@ def _is_codeowners(rel):
     `_CODEOWNERS_DIRS`.
     """
     directory, _, base = rel.rpartition("/")
-    return (
-        base.casefold() == "codeowners"
-        and directory.casefold() in _CODEOWNERS_DIRS
-    )
+    # The DIRECTORY compares exactly. Casefolding it widened the location this
+    # docstring says is deliberately not widened -- `DOCS/CODEOWNERS` and
+    # `.GitHub/CODEOWNERS` are distinct tracked paths GitHub does not read, and
+    # Unicode casefold even folds a `docſ/` directory onto `docs` -- so their
+    # prose got owner-field grammar and hard-failed a required check, the exact
+    # false positive `tests/fixtures/CODEOWNERS` was excluded for.
+    # (BE-8857 review, round 3.)
+    return base.casefold() == "codeowners" and directory in _CODEOWNERS_DIRS
 
 
 # A CODEOWNERS line is `<pattern> <owner>...`, with `#` commenting out a whole
@@ -1079,11 +1104,21 @@ def _codeowners_owner_span(line):
     fallback is the same accepted ambiguity documented for prose, not a new
     hole: the crossing still requires membership in the PUBLIC repo allowlist.
 
-    A line whose FIRST token is `@`-prefixed carries no path pattern, so the
-    whole line is owners -- the "default owners" shape people write under a
-    `# default owners` comment. Reading its lone token as a pattern left a real
-    owner handle on the crossing, which the filename-casefold rationale ("still
-    a real team name someone wrote as an owner") argues against verbatim.
+    A line whose FIRST token has OWNER SHAPE (`_CODEOWNERS_HANDLE_RE`) carries
+    no path pattern, so the whole line is owners -- the "default owners" shape
+    people write under a `# default owners` comment. Reading its lone token as
+    a pattern left a real owner handle on the crossing, which the
+    filename-casefold rationale ("still a real team name someone wrote as an
+    owner") argues against verbatim. The shape test is what keeps that branch
+    from swallowing a root-level scoped PATTERN.
+
+    A trailing `#` stays inside the span, since GitHub does not read one as a
+    comment. That over-flags a package mentioned in trailing prose
+    (`* @Comfy-Org/core-team  # see @comfy-org/comfy-cli on npm` reports
+    `comfy-cli`), which is accepted and pinned by a test rather than narrowed:
+    stopping at a whitespace-delimited `#` token would re-open the
+    `* @comfy-org/<team> #x @comfy-org/comfy-cli` bypass, and over-flagging is
+    the direction a leak gate should be wrong in. (BE-8857 review, round 3.)
     """
     if _CODEOWNERS_COMMENT_RE.match(line):
         return None
@@ -1091,8 +1126,10 @@ def _codeowners_owner_span(line):
     if match is None:
         return None
     end = len(line.rstrip())
-    token_start = match.end(1)
-    if line[token_start] == "@":
+    token_start, token_end = match.span(2)
+    if line[token_start] == "@" and _CODEOWNERS_HANDLE_RE.match(
+        line, token_start, token_end
+    ):
         return (token_start, end)
     if match.group(3) is None or match.end() >= end:
         return None
