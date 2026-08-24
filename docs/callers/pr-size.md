@@ -95,6 +95,13 @@ soon as the label lands. What you give up is the number: the report says the
 check was bypassed, not "1500 counted / 1000 cap", because nothing counted the
 lines. Remove the label to get the counted report back.
 
+**Size runs are serialized per PR, newest wins.** The workflow carries a
+`concurrency` group keyed on the PR number with `cancel-in-progress: true`, so a
+new commit — or adding/removing the bypass label — cancels the run still in
+flight. That is what keeps the seconds-long bypassed run from being overwritten
+by a minutes-long counted run that started first and finishes last, leaving a
+stale red comment on a PR that is now labelled. A cancelled run posts nothing.
+
 **`exclude_tests` is a naming convention, not a proof.** Unlike the
 generated-file rules — which require Go's marker *before* the package clause,
 and read `.gitattributes` from the base ref precisely so a PR cannot exempt

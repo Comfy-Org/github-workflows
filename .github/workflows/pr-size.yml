@@ -225,6 +225,19 @@ env:
   PR_SIZE_EXTRA_GENERATED_GLOBS: ${{ inputs.extra_generated_globs }}
   PR_SIZE_EXCLUDE_TESTS: ${{ inputs.exclude_tests }}
 
+concurrency:
+  # One size run per PR; a newer commit or label event cancels the in-flight
+  # one. Load-bearing for the bypass short-circuit below: `Report the bypass`
+  # finishes in seconds while a counted run takes minutes, so labelling a PR
+  # whose `synchronize` run is still in flight would otherwise let the slow run
+  # finish LAST and overwrite the ✅ bypass report with the stale red verdict
+  # (and, in enforce mode, a red check). Before the short-circuit both paths
+  # cost about the same and losing that race was incidental; now it is the
+  # likely outcome. Cancelled runs post nothing — the `comment` job below bails
+  # out on `needs.pr-size.result == 'cancelled'`.
+  group: pr-size-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   pr-size:
     name: Cap PR size (LoC)
@@ -281,8 +294,16 @@ jobs:
           # errors.
           B64="$(printf 'x-access-token:%s' "$FETCH_TOKEN" | base64 | tr -d '\n')"
           echo "::add-mask::${B64}"
+          # SCOPED to the server, exactly as `actions/checkout` writes
+          # `http.https://github.com/.extraheader`. An unscoped
+          # `http.extraheader` rides along on every request this step's git
+          # processes make, including a redirect to another host — git does not
+          # strip a header injected through config the way curl strips its own
+          # auth. Bounded (read-only token, origin is the only remote), but
+          # there is no reason to leave it unscoped.
           export GIT_CONFIG_COUNT=1
-          export GIT_CONFIG_KEY_0=http.extraheader
+          SERVER_URL="${GITHUB_SERVER_URL:-https://github.com}"
+          export GIT_CONFIG_KEY_0="http.${SERVER_URL%/}/.extraheader"
           export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${B64}"
 
           # Naming the two SHAs explicitly is the whole fix: the server walks
@@ -292,10 +313,49 @@ jobs:
           fetch() {
             git fetch --no-tags --no-recurse-submodules --quiet "$@" origin "$BASE_SHA" "$HEAD_SHA"
           }
-          have_merge_base() { git merge-base "$BASE_SHA" "$HEAD_SHA" >/dev/null 2>&1; }
           is_shallow() { [ "$(git rev-parse --is-shallow-repository)" = "true" ]; }
 
-          fetch --depth=100
+          # A merge base read off a SHALLOW graph can be WRONG, not merely
+          # missing: grafted boundary commits look parentless, so while the true
+          # fork point is still hidden `git merge-base` will happily return an
+          # older common ancestor that some other path does reach — a long-lived
+          # branch rooted before the fork point and merged into the base branch
+          # recently is enough. The tool would then diff from there and count
+          # every base-branch change in between, reddening a small PR with no
+          # error to explain it. `fetch-depth: 0` could not produce that false
+          # positive, so the narrowing must not either.
+          #
+          # An answer is trustworthy once every shallow boundary this walk can
+          # reach is itself an ancestor of that answer: everything the graft
+          # hides is then OLDER than the merge base, and a better (newer) common
+          # ancestor cannot be hiding in it. Where that is not provable this
+          # returns false and the ladder deepens — worst case all the way to the
+          # complete-history fallback, which is the correct answer and still
+          # only these two commits' worth of history.
+          have_merge_base() {
+            local mb shallow_file boundary
+            mb="$(git merge-base "$BASE_SHA" "$HEAD_SHA" 2>/dev/null)" || return 1
+            is_shallow || return 0
+            shallow_file="$(git rev-parse --git-path shallow)"
+            [ -f "$shallow_file" ] || return 0
+            while read -r boundary; do
+              [ -n "$boundary" ] || continue
+              # Boundaries left behind by other refs cannot hide anything from
+              # THIS walk; only the ones inside it matter.
+              git merge-base --is-ancestor "$boundary" "$BASE_SHA" 2>/dev/null ||
+                git merge-base --is-ancestor "$boundary" "$HEAD_SHA" 2>/dev/null ||
+                continue
+              git merge-base --is-ancestor "$boundary" "$mb" 2>/dev/null || return 1
+            done < "$shallow_file"
+            return 0
+          }
+
+          # The first rung is mandatory, but no more fatal than the deepen
+          # rungs below it: under `set -e` a transient network or 5xx failure
+          # here would exit the step and redden a consumer's check, when a retry
+          # — or the fallback further down, which fetches the same two SHAs —
+          # recovers. Retry once, then let the ladder carry it.
+          fetch --depth=100 || { sleep 3; fetch --depth=100; } || true
 
           # Deepen until the merge base is reachable. The distance to the fork
           # point is unknown — a monorepo's base branch can be far ahead of it —
@@ -307,10 +367,12 @@ jobs:
           for extra in 400 1600 6400; do
             have_merge_base && break
             is_shallow || break
-            # A rung that errors is NOT fatal. The fallback below is a complete
-            # answer one fetch away, so a transient failure part-way up the
-            # ladder must degrade to it rather than redden a consumer's check.
-            fetch "--deepen=${extra}" || break
+            # A rung that errors is NOT fatal — and must not skip the rest of
+            # the ladder either. `continue` retries at the next depth; only a
+            # genuinely exhausted ladder should reach the fallback below, which
+            # is the most expensive git operation in this step and runs inside
+            # a 5-minute budget on the very monorepos this change speeds up.
+            fetch "--deepen=${extra}" || continue
           done
 
           # Last resort: complete history — but still only for these two
@@ -321,9 +383,10 @@ jobs:
           fi
 
           # Hard-fail rather than let the tool report `could not resolve merge
-          # base` from three steps away.
+          # base` from three steps away — or, worse, count a diff from a merge
+          # base the shallow graph cannot vouch for.
           if ! have_merge_base; then
-            echo "::error::could not resolve the merge base of ${BASE_SHA} and ${HEAD_SHA} after fetching both commits' history"
+            echo "::error::could not resolve a trustworthy merge base of ${BASE_SHA} and ${HEAD_SHA} after fetching both commits' history"
             exit 1
           fi
 
