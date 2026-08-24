@@ -1500,7 +1500,17 @@ jobs:
     needs: [gate, diff-size, preflight, review, ledger]
     if: always() && needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true' && needs.review.result != 'skipped'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # At least the `review` cap above, never under it. The judge reads all 8
+    # cell artifacts with the same top reasoning tier one cell uses, so it is
+    # the strictly harder call — yet at 15m it was capped at HALF the panel it
+    # adjudicates. A diff slow enough to stretch the panel stretches the judge
+    # with it, so the failure mode was the expensive one: all 8 cells run green
+    # for ~25m, then the judge is killed at the last step and every cell's work
+    # is discarded with nothing posted to the PR. GitHub reports a
+    # timeout-minutes kill as `cancelled`, not `failed`, so it reads on the run
+    # page like a human stopped it — which is how this went unnoticed. Observed
+    # twice in one day on Comfy-Org/cloud, both at 15m0Xs (~3% of runs).
+    timeout-minutes: 30
     permissions:
       contents: read
       pull-requests: write
