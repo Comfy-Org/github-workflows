@@ -83,7 +83,7 @@ jobs:
           printf 'Also unrelated: https://lınear.app/x\n' >> "$root/LOOKALIKES.md"
           printf 'Userinfo, so the real host is evil.com: https://app.slack.com@evil.com/\n' >> "$root/LOOKALIKES.md"
           printf 'Userinfo again, non-numeric port and all: https://app.slack.com:443.evil.com@evil.com/\n' >> "$root/LOOKALIKES.md"
-          # BE-8910: `Comfy-Org/<name>` is not GitHub's namespace alone. The
+          # `Comfy-Org/<name>` is not GitHub's namespace alone. The
           # org publishes model weights under `huggingface.co/Comfy-Org/`, and
           # those names are unallowlistable (no GitHub repo exists to confirm
           # public) and unremovable (the URL tells a user where to get the
@@ -94,12 +94,12 @@ jobs:
           printf 'Weights: https://huggingface.co/Comfy-Org/stable-diffusion-v1-5-archive/resolve/main/\n' > "$root/MODELS.md"
           printf 'Also [Comfy-Org/Qwen-Image-Edit_ComfyUI](https://huggingface.co/Comfy-Org/Qwen-Image-Edit_ComfyUI)\n' >> "$root/MODELS.md"
           printf 'And a dataset: https://huggingface.co/datasets/Comfy-Org/a-dataset\n' >> "$root/MODELS.md"
-          # BE-8910 review: the anchor now demands an authority position, so
-          # the two real spellings that carry no scheme are guarded here --
-          # over-flagging THESE is the cost that tightening could have had.
+          # `_AUTHORITY_L` demands a delimiter before the host, so the two
+          # real spellings that carry no scheme are guarded here --
+          # over-flagging THESE is the cost that anchoring could have had.
           printf 'Protocol-relative: //huggingface.co/Comfy-Org/a-model\n' >> "$root/MODELS.md"
           printf 'Bare: huggingface.co/Comfy-Org/a-model has the weights.\n' >> "$root/MODELS.md"
-          # BE-8910 review: the label skip reads a BOUNDED destination, and a
+          # The label skip reads a BOUNDED destination, and a
           # real Hugging Face file URL runs well past that bound. Declining to
           # read a long destination would have re-opened the false positives
           # this skip exists to close, so the truncation is detected instead --
@@ -167,8 +167,8 @@ jobs:
           check_one 'empty-port internal link' \
             'notes https://notion.so:/team/page' \
             'internal collaboration-tool marker'
-          # BE-8910: host awareness must not become a bypass. The hosts are a
-          # narrow allowlist anchored on DNS labels, so a lookalike, an
+          # Host awareness must not become a bypass. The hosts are a narrow
+          # allowlist anchored on a URL authority, so a lookalike, an
           # unrecognised host, a userinfo spelling whose real host is
           # elsewhere, and a markdown label naming a DIFFERENT repo than its
           # link are all still default-deny findings.
@@ -184,26 +184,26 @@ jobs:
           check_one 'markdown label naming another repo' \
             '[Comfy-Org/not-a-public-repo](https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI)' \
             'which is not in the known-public allowlist'
-          # BE-8910 review: the host must be the URL's AUTHORITY. A subdomain
-          # and a path segment merely spelled like the host both satisfied the
-          # DNS-label anchor category 2 uses, which over-flags safely for a
-          # DETECTOR and fails open for this SUPPRESSOR.
+          # The host must be the URL's AUTHORITY. A subdomain and a path
+          # segment merely spelled like the host both satisfy the DNS-label
+          # anchor category 2 uses, which over-flags safely for a DETECTOR and
+          # fails open for this SUPPRESSOR -- hence `_AUTHORITY_L`.
           check_one 'subdomain of the model host' \
             'weights https://evil.huggingface.co/Comfy-Org/not-a-public-repo' \
             'which is not in the known-public allowlist'
           check_one 'model host as a path segment' \
             'weights https://evil.example/huggingface.co/Comfy-Org/not-a-public-repo' \
             'which is not in the known-public allowlist'
-          # BE-8910 review round 2. The anchor's reject class is matched under
-          # `re.ASCII`, so an ASCII-only class let ANY non-ASCII character read
-          # as a boundary -- a scheme-bearing URL included, since the accented
-          # character sits between the `://` and the host.
+          # `_HOST_FLAGS` is `re.ASCII`, so an anchor spelled as an ASCII-only
+          # character class lets ANY non-ASCII character read as a boundary --
+          # a scheme-bearing URL included, since the accented character sits
+          # between the `://` and the host.
           check_one 'non-ASCII neighbour of the model host' \
             'weights https://éhuggingface.co/Comfy-Org/not-a-public-repo' \
             'which is not in the known-public allowlist'
-          # ... and the label shape is now checked at BOTH ends: the reference
-          # has to OPEN the label, and the target has to name the same repo
-          # across a whole path segment rather than merely start with it.
+          # The label shape is checked at BOTH ends: the reference has to OPEN
+          # the label, and the target has to name the same repo across a whole
+          # path segment rather than merely start with it.
           check_one 'label over a target that only starts with the name' \
             '[Comfy-Org/not-a-public-repo](https://huggingface.co/Comfy-Org/not-a-public-repo%2Dother)' \
             'which is not in the known-public allowlist'

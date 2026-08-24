@@ -134,9 +134,10 @@ weights under `huggingface.co/Comfy-Org/`, and those names are unclearable by ev
 they cannot go on the known-public allowlist (there is no GitHub repo to confirm public — all five
 in the sweep that motivated this return `NOT_FOUND` from `gh repo view`), and the URL is the
 product content telling a user where to download the weights, so it cannot be deleted either. Two
-spellings therefore clear. A reference **preceded by** `huggingface.co` or `hf.co` — optionally
-through one of the fixed segments Hugging Face interposes (`datasets/`, `spaces/`, `models/`,
-`api/models/`, `api/datasets/`, `api/spaces/`) — is that host's path, not a GitHub one. And a
+spellings therefore clear. A reference **immediately preceded by** `huggingface.co` or `hf.co` —
+with an optional scheme and port, and optionally through one of the routes that put an owner
+straight after it (`/models/`, `/datasets/`, `/spaces/`, `/collections/`, or the API's
+`/api/…/`) — is that host's path, not a GitHub one. And a
 **markdown link label** whose target is such a URL for the **same name**, the shape
 `[Comfy-Org/<model>](https://huggingface.co/Comfy-Org/<model>)`, clears too, because there the bare
 token is link text rather than a path. Everything else is exactly as strict as before: a bare
@@ -149,9 +150,10 @@ naming a *different* repo than its link all stay findings — the host has to si
 for the same reason: the reference has to **open** the label, and the link target has to name the
 same repo across a **whole path segment**, so a target that merely starts with the label's name
 (`…/Comfy-Org/<model>‐variant`, `…/Comfy-Org/<model>%2Dvariant`) does not clear it.
-The host list is deliberately short rather than "anything that is not github.com"; if
+The route segments are case-sensitive, matching Hugging Face's own routing, so `/MODELS/` does
+not clear. The host list is deliberately short rather than "anything that is not github.com"; if
 another non-GitHub host starts publishing under the org name, that is a one-line addition to
-`NON_GITHUB_ORG_NAMESPACE_HOSTS` in the checker, in the same PR-against-this-repo way a new public
+`MODEL_HOST_PREFIX_RE` in the checker, in the same PR-against-this-repo way a new public
 repo name is added — not a caller input, for the same reason the allowlists are not.
 
 **A name is never cleared if it was only partly read.** The name class is ASCII, so a non-ASCII

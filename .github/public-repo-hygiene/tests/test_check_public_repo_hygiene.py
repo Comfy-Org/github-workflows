@@ -721,6 +721,143 @@ class RepoReferenceCategoryTest(CheckerTestCase):
         self.assertEqual(len(findings), 1, findings)
         self.assertIn("Comfy-Org/ComfyUI2", findings[0])
 
+    def test_model_host_url_is_a_different_namespace(self):
+        # The false-positive class this skip exists for: comfy-cli ships
+        # download URLs for public Comfy-Org model weights on Hugging Face, and
+        # 19 of its 29 findings were those URLs tested against a GITHUB-repo
+        # allowlist they could never be in.
+        self.repo.write(
+            "download.py",
+            "URL = 'https://huggingface.co/Comfy-Org/"
+            "stable-diffusion-v1-5-archive/resolve/main/v1-5.safetensors'\n",
+        )
+        self.assertEqual(self.findings(), [])
+
+    def test_model_host_spellings_that_put_an_owner_after_a_path_segment(self):
+        # `hf.co` is Hugging Face's own short domain, and the API, collections
+        # and datasets/spaces routes put the owner one segment further along.
+        # Every one has to end exactly where `Comfy-Org` starts or the skip
+        # misses. `collections/` is an owner-first route like the others, and
+        # omitting it left those URLs reporting as GitHub-repo leaks -- the
+        # same false-positive class this change exists to remove.
+        self.repo.write(
+            "notes.md",
+            "https://hf.co/Comfy-Org/ace_step_1.5_ComfyUI_files\n"
+            "https://huggingface.co/api/models/Comfy-Org/Qwen-Image_ComfyUI\n"
+            "https://huggingface.co/datasets/Comfy-Org/some-eval-set\n"
+            "https://huggingface.co/spaces/Comfy-Org/some-demo\n"
+            "https://huggingface.co/collections/Comfy-Org/some-set-abc123\n",
+        )
+        self.assertEqual(self.findings(), [])
+
+    def test_model_host_url_shapes_that_still_anchor(self):
+        # `_AUTHORITY_L` requires a delimiter or start-of-line before the
+        # match, and the scheme separator is consumed rather than tolerated --
+        # so these ordinary embeddings have to keep clearing.
+        self.repo.write(
+            "notes.md",
+            "http://huggingface.co/Comfy-Org/plain-http\n"
+            "//huggingface.co/Comfy-Org/protocol-relative\n"
+            "huggingface.co/Comfy-Org/bare-host-at-line-start\n"
+            "See [weights](https://hf.co/Comfy-Org/in-a-markdown-link) here\n"
+            "<https://hf.co/Comfy-Org/in-angle-brackets>\n"
+            'url="https://hf.co/Comfy-Org/in-double-quotes"\n'
+            "https://HuggingFace.co:443/Comfy-Org/host-case-and-port\n",
+        )
+        self.assertEqual(self.findings(), [])
+
+    def test_a_path_segment_is_not_a_url_authority(self):
+        # The skip gates a SUPPRESSION, so its left anchor is `_AUTHORITY_L`,
+        # not the detection-side `_HOST_L`: under `_HOST_L` a model host
+        # appearing as a PATH segment of some other host satisfied the
+        # lookbehind (`/` is not a DNS-label character) and silenced the
+        # reference. Only a real authority may clear one.
+        self.repo.write(
+            "README.md",
+            "https://internal.example/mirror/hf.co/Comfy-Org/"
+            "some-internal-thing\n",
+        )
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("some-internal-thing", findings[0])
+
+    def test_an_api_route_without_a_resource_segment_is_not_a_model_host(self):
+        # Hugging Face routes `/api/{models,datasets,spaces}/<owner>`, never
+        # `/api/<owner>`, so pairing `api/` with a required resource segment
+        # keeps the exception inside URLs that actually resolve.
+        self.repo.write(
+            "README.md",
+            "https://huggingface.co/api/Comfy-Org/some-internal-thing\n",
+        )
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("some-internal-thing", findings[0])
+
+    def test_model_host_path_segments_are_case_sensitive(self):
+        # `_HOST_FLAGS`'s `re.IGNORECASE` is there for the HOST, where DNS
+        # really is case-insensitive, and it reaches the path too. HF route
+        # segments are case-SENSITIVE, so `(?-i:...)` scopes the flag back off
+        # and these spellings -- which resolve nowhere -- no longer clear.
+        self.repo.write(
+            "README.md",
+            "https://huggingface.co/MODELS/Comfy-Org/upper-case-route\n"
+            "https://huggingface.co/Datasets/Comfy-Org/title-case-route\n",
+        )
+        findings = self.findings()
+        self.assertEqual(len(findings), 2, findings)
+        self.assertIn("upper-case-route", " ".join(findings))
+        self.assertIn("title-case-route", " ".join(findings))
+
+    def test_model_host_skip_does_not_reach_github_on_the_same_line(self):
+        # The skip is keyed on the offset the model-host prefix ENDS at, not on
+        # the line containing one, so a github.com reference sitting beside a
+        # Hugging Face URL is still denied.
+        self.repo.write(
+            "README.md",
+            "Weights at https://huggingface.co/Comfy-Org/some-model, code at "
+            "https://github.com/Comfy-Org/some-internal-thing\n",
+        )
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("some-internal-thing", findings[0])
+        self.assertNotIn("some-model", findings[0])
+
+    def test_a_model_host_lookalike_does_not_get_the_skip(self):
+        # A different registrable name is not the model host, so a reference
+        # hidden behind one is still a finding. All three spellings are
+        # covered, not just the hyphen: `_` and a non-ASCII leading letter both
+        # satisfied the detection-side `_HOST_L` lookbehind this used to reuse,
+        # which is exactly how a suppression gated on it failed OPEN. Pinning
+        # only `evil-huggingface.co` read as lookalike coverage it did not have.
+        for host in (
+            "evil-huggingface.co",
+            "evil_huggingface.co",
+            "\u00e9huggingface.co",
+            "evil-hf.co",
+            "hf.co.evil.example",
+        ):
+            with self.subTest(host=host):
+                self.repo.write(
+                    "README.md",
+                    f"https://{host}/Comfy-Org/some-internal-thing\n",
+                )
+                findings = self.findings()
+                self.assertEqual(len(findings), 1, findings)
+                self.assertIn("some-internal-thing", findings[0])
+
+    def test_a_bare_name_is_not_cleared_by_a_model_host_elsewhere(self):
+        # Default-deny is unchanged for the spelling that actually leaks: a
+        # bare `Comfy-Org/<name>` in prose names a GitHub repo whatever URLs
+        # sit around it.
+        self.repo.write(
+            "README.md",
+            "See https://huggingface.co/Comfy-Org/some-model and also "
+            "Comfy-Org/some-model for the code.\n",
+        )
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("some-model", findings[0])
+
     def test_team_handle_casing_and_sentence_final_period(self):
         # The empirically-confirmed false positive: CODEOWNERS spells the
         # handle `@Comfy-Org/Comfy-Cloud-Team` while the allowlist stores the
@@ -1313,8 +1450,8 @@ class RepoReferenceCategoryTest(CheckerTestCase):
         self.assertIn("which is not in the known-public allowlist", findings[0])
 
 
-class NonGitHubHostReferenceTest(CheckerTestCase):
-    """BE-8910: `Comfy-Org/<name>` is not GitHub's alone.
+class ModelHostLinkLabelTest(CheckerTestCase):
+    """The markdown-label shape of the model-host false positive.
 
     Comfy-Org publishes model weights under `huggingface.co/Comfy-Org/`, and
     those names collided with the GitHub default-deny with no remedy available
@@ -1322,20 +1459,19 @@ class NonGitHubHostReferenceTest(CheckerTestCase):
     `gh repo view` returns NOT_FOUND for all five in the comfy-cli sweep) and
     they cannot be deleted (they tell users where to download the weights).
 
-    The four cases the ticket pins are, in order: the URL shape clears, the
-    markdown-label shape clears, a bare reference is STILL flagged, and a
-    `github.com/` one is STILL flagged.
-    """
+    `MODEL_HOST_PREFIX_RE`, and its tests in `RepoReferenceCategoryTest`, cover
+    the URL shape, where the host sits in front of the reference. This class
+    covers the shape the line-level scan cannot reach: in
+    `[Comfy-Org/<model>](https://huggingface.co/Comfy-Org/<model>)` the same
+    name appears twice and only the target has a host in front of it, so the
+    label is a bare token preceded by `[`, and the link TARGET is what says
+    which namespace it names.
 
-    def test_huggingface_url_is_not_a_github_repo_reference(self):
-        # Shape 1, the common case -- comfy-cli's
-        # `comfy_cli/command/run/preflight.py:176` verbatim.
-        self.repo.write(
-            "preflight.py",
-            '    "https://huggingface.co/Comfy-Org/'
-            'stable-diffusion-v1-5-archive/resolve/main/"\n',
-        )
-        self.assertEqual(self.findings(), [])
+    Deliberately narrow: the host spellings, routes, ports, lookalikes and IDN
+    neighbours are the URL shape's business and are pinned there, so nothing
+    here re-tests them. What is here is the label shape clearing, and the ways
+    clearing it could become a bypass.
+    """
 
     def test_markdown_label_over_a_huggingface_link_is_not_a_reference(self):
         # Shape 2, from comfy-cli's gallery fixtures: the bare token really is
@@ -1346,13 +1482,6 @@ class NonGitHubHostReferenceTest(CheckerTestCase):
             "(https://huggingface.co/Comfy-Org/Qwen-Image-Edit_ComfyUI)\n",
         )
         self.assertEqual(self.findings(), [])
-
-    def test_bare_reference_with_no_host_is_still_flagged(self):
-        # The default-deny control itself: host awareness must not weaken it.
-        self.repo.write("README.md", "See Comfy-Org/some-internal-thing.\n")
-        findings = self.findings()
-        self.assertEqual(len(findings), 1, findings)
-        self.assertIn("not in the known-public allowlist", findings[0])
 
     def test_github_url_is_still_flagged(self):
         self.repo.write(
@@ -1388,72 +1517,6 @@ class NonGitHubHostReferenceTest(CheckerTestCase):
         )
         self.assertEqual(len(self.findings()), 2, self.findings())
 
-    def test_lookalike_host_does_not_silence_the_reference(self):
-        # The DNS-label anchoring BE-8729 built for category 2, reused here:
-        # `myhuggingface.co` is a different registrable name.
-        self.repo.write(
-            "README.md",
-            "https://myhuggingface.co/Comfy-Org/some-internal-thing\n",
-        )
-        self.assertEqual(len(self.findings()), 1, self.findings())
-
-    def test_userinfo_spelling_does_not_silence_the_reference(self):
-        # `https://huggingface.co@evil.com/...` -- the real host is evil.com
-        # and the allowlisted name is userinfo. The prefix pattern requires the
-        # `/` immediately after host-and-port, so `@` ends it.
-        self.repo.write(
-            "README.md",
-            "https://huggingface.co@evil.com/Comfy-Org/some-internal-thing\n",
-        )
-        self.assertEqual(len(self.findings()), 1, self.findings())
-
-    def test_an_unrecognised_host_does_not_silence_the_reference(self):
-        # The hosts are a narrow allowlist, NOT "any host that is not
-        # github.com": default-deny stays default-deny everywhere it is not
-        # explicitly narrowed.
-        self.repo.write(
-            "README.md",
-            "https://gitlab.com/Comfy-Org/some-internal-thing\n",
-        )
-        self.assertEqual(len(self.findings()), 1, self.findings())
-
-    def test_a_path_segment_is_not_a_host(self):
-        # A versioned relative path is the shape a fuzzy looks-like-a-hostname
-        # test would have cleared.
-        self.repo.write("README.md", "docs/v1.2/Comfy-Org/some-internal-thing\n")
-        self.assertEqual(len(self.findings()), 1, self.findings())
-
-    def test_a_path_segment_spelled_like_the_host_does_not_silence_it(self):
-        # BE-8910 review. `_HOST_L`, the category-2 anchor this originally
-        # reused, is satisfied by `/`, so a path SEGMENT spelled like the host
-        # read as the host and silenced a default-deny finding whose real
-        # authority is `evil.example`. The anchor for a SUPPRESSOR has to
-        # require the authority position; a detector's anchor fails open here.
-        self.repo.write(
-            "README.md",
-            "https://evil.example/huggingface.co/Comfy-Org/some-internal-thing\n",
-        )
-        self.assertEqual(len(self.findings()), 1, self.findings())
-
-    def test_a_doubled_path_separator_does_not_silence_the_reference(self):
-        # The `//` that begins a scheme-relative authority also occurs INSIDE a
-        # path; only the second one is an authority.
-        self.repo.write(
-            "README.md",
-            "https://evil.example//huggingface.co/Comfy-Org/some-internal-thing\n",
-        )
-        self.assertEqual(len(self.findings()), 1, self.findings())
-
-    def test_a_subdomain_of_the_host_does_not_silence_the_reference(self):
-        # BE-8910 review, the other half: `_HOST_L` is satisfied by `.` too, so
-        # any `<label>.huggingface.co` cleared. `myhuggingface.co` was already
-        # pinned above; this is the dotted spelling of the same hole.
-        self.repo.write(
-            "README.md",
-            "https://evil.huggingface.co/Comfy-Org/some-internal-thing\n",
-        )
-        self.assertEqual(len(self.findings()), 1, self.findings())
-
     def test_a_label_over_a_path_segment_host_link_is_still_flagged(self):
         # The label shape runs the SAME host test against the link target, so
         # the tightened anchor has to hold on that path as well: two findings,
@@ -1464,90 +1527,6 @@ class NonGitHubHostReferenceTest(CheckerTestCase):
             "(https://evil.example/huggingface.co/Comfy-Org/some-internal-thing)\n",
         )
         self.assertEqual(len(self.findings()), 2, self.findings())
-
-    def test_scheme_relative_and_bare_spellings_still_clear(self):
-        # The tightening must not cost the real spellings that have no scheme:
-        # a protocol-relative URL, and a bare host starting a token.
-        self.repo.write(
-            "README.md",
-            "//huggingface.co/Comfy-Org/a-model\n"
-            "See huggingface.co/Comfy-Org/a-model for weights.\n"
-            '"huggingface.co/Comfy-Org/a-model"\n',
-        )
-        self.assertEqual(self.findings(), [])
-
-    def test_a_userinfo_prefixed_host_is_a_known_non_clearing_spelling(self):
-        # `https://user@huggingface.co/...` really does have the allowlisted
-        # host, and is NOT cleared: `@` is in the reject class. Pinned as the
-        # deliberate safe-direction miss it is, not as a claim about the host.
-        self.repo.write(
-            "README.md",
-            "https://user@huggingface.co/Comfy-Org/some-internal-thing\n",
-        )
-        self.assertEqual(len(self.findings()), 1, self.findings())
-
-    def test_a_huggingface_link_does_not_clear_a_later_bare_reference(self):
-        # The prefix test is anchored at the START of the match, so a host
-        # earlier on the line cannot reach across whitespace to silence a bare
-        # reference after it.
-        self.repo.write(
-            "README.md",
-            "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI and "
-            "Comfy-Org/some-internal-thing\n",
-        )
-        findings = self.findings()
-        self.assertEqual(len(findings), 1, findings)
-        self.assertIn("Comfy-Org/some-internal-thing", findings[0])
-
-    def test_dataset_space_and_api_paths_clear(self):
-        # The path segments Hugging Face interposes between host and org.
-        self.repo.write(
-            "README.md",
-            "https://huggingface.co/datasets/Comfy-Org/a-dataset\n"
-            "https://huggingface.co/spaces/Comfy-Org/a-space\n"
-            "https://huggingface.co/api/models/Comfy-Org/a-model\n"
-            "https://hf.co/Comfy-Org/a-model\n",
-        )
-        self.assertEqual(self.findings(), [])
-
-    def test_an_unenumerated_path_segment_is_still_flagged(self):
-        # The enumerated prefixes are what keep the lookback a bounded
-        # constant; anything else falls through to default-deny, which is the
-        # safe direction and the remedy is one more entry in the tuple.
-        self.repo.write(
-            "README.md",
-            "https://huggingface.co/somewhere/Comfy-Org/some-internal-thing\n",
-        )
-        self.assertEqual(len(self.findings()), 1, self.findings())
-
-    def test_host_prefix_lookback_covers_the_longest_spelling(self):
-        # `_HOST_PREFIX_LOOKBACK` is derived from the two tuples; this pins the
-        # derivation against the longest prefix either can produce, since a
-        # window one character short silently reintroduces the false positive.
-        #
-        # The port term is part of "the longest spelling" and was missing here,
-        # which left the assertion satisfied by a window six characters short:
-        # deleting `len(":65535")` from the constant would have re-flagged
-        # `https://huggingface.co:8443/api/datasets/Comfy-Org/x` with this test
-        # still green. The spelling itself is pinned by the test below.
-        # (BE-8910 review.)
-        longest = (
-            max(len(h) for h in checker.NON_GITHUB_ORG_NAMESPACE_HOSTS)
-            + len(":65535")
-            + 1
-            + max(len(p) for p in checker._NON_GITHUB_HOST_PATH_PREFIXES)
-        )
-        self.assertGreaterEqual(checker._HOST_PREFIX_LOOKBACK, longest)
-
-    def test_an_explicit_port_on_the_longest_path_prefix_clears(self):
-        # The lookback's port term, exercised rather than only asserted: the
-        # longest host, a real port and the longest enumerated path prefix at
-        # once is the widest window the constant has to cover.
-        self.repo.write(
-            "README.md",
-            "https://huggingface.co:8443/api/datasets/Comfy-Org/a-dataset\n",
-        )
-        self.assertEqual(self.findings(), [])
 
     def test_a_non_ascii_name_after_a_huggingface_host_is_not_a_homoglyph_finding(
         self,
@@ -1580,20 +1559,6 @@ class NonGitHubHostReferenceTest(CheckerTestCase):
         findings = self.findings()
         self.assertEqual(len(findings), 1, findings)
         self.assertIn("team not in the known-public allowlist", findings[0])
-
-    def test_a_non_ascii_neighbour_does_not_silence_the_reference(self):
-        # `_HOST_FLAGS` is `re.ASCII`, so an ASCII-only reject class left every
-        # non-ASCII neighbour reading as a boundary and both spellings below
-        # cleared -- the scheme-bearing one included, because the accented
-        # character sits between the `://` and the host and defeats that
-        # alternative too. `\u00e9huggingface.co` is a different registrable
-        # name, exactly as `myhuggingface.co` is. (BE-8910 review.)
-        self.repo.write(
-            "README.md",
-            "https://\u00e9huggingface.co/Comfy-Org/some-internal-thing\n"
-            "\u4e2dhuggingface.co/Comfy-Org/another-internal-thing\n",
-        )
-        self.assertEqual(len(self.findings()), 2, self.findings())
 
     def test_a_homoglyph_tail_on_the_link_target_does_not_clear_the_label(self):
         # `REPO_REF_RE`'s name class is ASCII, so the target was compared on a
