@@ -396,6 +396,50 @@ _PUBLIC_TEAMS_CF = frozenset(name.casefold() for name in PUBLIC_COMFY_ORG_TEAMS)
 # match is made and `_nonascii_tail` below decides what it means.
 REPO_REF_RE = re.compile(r"(?<![A-Za-z0-9_])(?i:Comfy-Org)/([A-Za-z0-9_.-]+)")
 
+# `Comfy-Org/<name>` under a MODEL HOST is a different namespace from the same
+# spelling under github.com, and this pattern is how the two are told apart.
+#
+# Comfy-Org owns a namespace on Hugging Face as well as on GitHub, and
+# `REPO_REF_RE` has no host anchor by design -- it reads `Comfy-Org/x` out of a
+# `huggingface.co` URL exactly as it reads one out of a `github.com` URL. Every
+# such URL was therefore tested against a GitHub-repo allowlist it could never
+# be in and reported as a leak: 19 of comfy-cli's 29 findings were public model
+# weights it ships download URLs for (`Qwen-Image_ComfyUI`,
+# `stable-diffusion-v1-5-archive`, `ace_step_1.5_ComfyUI_files`, ...). That is a
+# category error in the matcher, not a leak, and it recurs with every model
+# ComfyUI ships -- the churn is what gets a required check switched off.
+#
+# The fix is host-scoped rather than name-scoped ON PURPOSE. Adding those names
+# to `PUBLIC_COMFY_ORG_REPOS` would put Hugging Face names in a GitHub allowlist
+# and, worse, silently clear any FUTURE github.com/Comfy-Org repo that ever took
+# the same name -- a default-deny hole that outlives the reference that opened
+# it. Skipping on the host leaves the GitHub allowlist meaning exactly what it
+# says, and a bare `Comfy-Org/<name>` in prose is still denied.
+#
+# RESIDUAL AMBIGUITY, accepted: a `huggingface.co/Comfy-Org/<private-github-repo>`
+# URL now clears, so a name can be hidden behind a host prefix that does not
+# resolve to it. This is the same trade the npm-scope crossing below already
+# makes and for the same reason -- the guard is against an accidental paste, and
+# a fake URL naming a private repo is not one, while re-denying here restores
+# the false-positive class this exists to fix. It is NOT the homoglyph case:
+# nothing here renders as something else on github.com.
+#
+# Built from the same `_HOST_L` / `_PORT` / `_HOST_FLAGS` primitives as
+# `INTERNAL_MARKER_RES`, so the DNS-label boundary, the empty-port bypass and
+# the `re.ASCII` scoping are the ones already reasoned about and pinned by tests
+# up there, not a second set. `hf.co` is Hugging Face's own short domain, not a
+# lookalike. The optional path segments are the spellings that put an owner
+# straight after them (`/api/models/<owner>/`, `/datasets/<owner>/`); they are
+# greedy, so on `huggingface.co/models/Comfy-Org/x` the match ends exactly where
+# `Comfy-Org` starts, which is the offset the caller compares against.
+MODEL_HOST_PREFIX_RE = re.compile(
+    _HOST_L
+    + r"(?:huggingface\.co|hf\.co)"
+    + _PORT
+    + r"/(?:api/)?(?:models/|datasets/|spaces/)?",
+    _HOST_FLAGS,
+)
+
 # ASCII characters the name class accepts -- the source of truth for how far a
 # name extends, shared by `REPO_REF_RE` and the tail walk below.
 _REPO_NAME_ASCII = frozenset(
@@ -1242,7 +1286,21 @@ def _file_findings(rel, text, ticket_allowlist):
         owner_span = (
             _codeowners_owner_span(line, lineno) if is_codeowners else None
         )
+        # Per LINE for the same reason as `owner_span`: the alternative is
+        # searching backwards from every match, which is O(line) per match and
+        # so quadratic on the one `MAX_FILE_BYTES` line this has to survive.
+        # Offsets where a model-host URL prefix ENDS are exactly the offsets a
+        # `Comfy-Org/` match may START at and not be a github.com reference.
+        model_host_ends = frozenset(
+            m.end() for m in MODEL_HOST_PREFIX_RE.finditer(line)
+        )
         for match in REPO_REF_RE.finditer(line):
+            # See `MODEL_HOST_PREFIX_RE`: a different namespace, not a leak.
+            # Checked before the homoglyph branch below, because that branch's
+            # remedy ("rewrite the name in ASCII") is wrong advice for a model
+            # repo whose name is not ours to rewrite.
+            if match.start() in model_host_ends:
+                continue
             name = match.group(1)
             # Characters the ASCII name class could not read are the REST of the
             # name, not a boundary. Carry them into what is reported, and (below)

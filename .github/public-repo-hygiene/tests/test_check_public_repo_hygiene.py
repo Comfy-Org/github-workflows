@@ -721,6 +721,70 @@ class RepoReferenceCategoryTest(CheckerTestCase):
         self.assertEqual(len(findings), 1, findings)
         self.assertIn("Comfy-Org/ComfyUI2", findings[0])
 
+    def test_model_host_url_is_a_different_namespace(self):
+        # The false-positive class this skip exists for: comfy-cli ships
+        # download URLs for public Comfy-Org model weights on Hugging Face, and
+        # 19 of its 29 findings were those URLs tested against a GITHUB-repo
+        # allowlist they could never be in.
+        self.repo.write(
+            "download.py",
+            "URL = 'https://huggingface.co/Comfy-Org/"
+            "stable-diffusion-v1-5-archive/resolve/main/v1-5.safetensors'\n",
+        )
+        self.assertEqual(self.findings(), [])
+
+    def test_model_host_spellings_that_put_an_owner_after_a_path_segment(self):
+        # `hf.co` is Hugging Face's own short domain, and the API and
+        # datasets/spaces routes put the owner one segment further along. All
+        # four have to end exactly where `Comfy-Org` starts or the skip misses.
+        self.repo.write(
+            "notes.md",
+            "https://hf.co/Comfy-Org/ace_step_1.5_ComfyUI_files\n"
+            "https://huggingface.co/api/models/Comfy-Org/Qwen-Image_ComfyUI\n"
+            "https://huggingface.co/datasets/Comfy-Org/some-eval-set\n"
+            "https://huggingface.co/spaces/Comfy-Org/some-demo\n",
+        )
+        self.assertEqual(self.findings(), [])
+
+    def test_model_host_skip_does_not_reach_github_on_the_same_line(self):
+        # The skip is keyed on the offset the model-host prefix ENDS at, not on
+        # the line containing one, so a github.com reference sitting beside a
+        # Hugging Face URL is still denied.
+        self.repo.write(
+            "README.md",
+            "Weights at https://huggingface.co/Comfy-Org/some-model, code at "
+            "https://github.com/Comfy-Org/some-internal-thing\n",
+        )
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("some-internal-thing", findings[0])
+        self.assertNotIn("some-model", findings[0])
+
+    def test_a_model_host_lookalike_does_not_get_the_skip(self):
+        # `_HOST_L` is the same DNS-label boundary `INTERNAL_MARKER_RES` uses:
+        # `evil-huggingface.co` is a different registrable name, so a reference
+        # hidden behind one is still a finding.
+        self.repo.write(
+            "README.md",
+            "https://evil-huggingface.co/Comfy-Org/some-internal-thing\n",
+        )
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("some-internal-thing", findings[0])
+
+    def test_a_bare_name_is_not_cleared_by_a_model_host_elsewhere(self):
+        # Default-deny is unchanged for the spelling that actually leaks: a
+        # bare `Comfy-Org/<name>` in prose names a GitHub repo whatever URLs
+        # sit around it.
+        self.repo.write(
+            "README.md",
+            "See https://huggingface.co/Comfy-Org/some-model and also "
+            "Comfy-Org/some-model for the code.\n",
+        )
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("some-model", findings[0])
+
     def test_team_handle_casing_and_sentence_final_period(self):
         # The empirically-confirmed false positive: CODEOWNERS spells the
         # handle `@Comfy-Org/Comfy-Cloud-Team` while the allowlist stores the
