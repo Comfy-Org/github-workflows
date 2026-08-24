@@ -503,6 +503,47 @@ _REPO_NAME_ASCII = frozenset(
 # prose like `Comfy-Org/ComfyUI’s frontend` stays a clean reference.
 _NAME_CONTINUING_CATEGORIES = frozenset({"Pd", "Pc"})
 
+# --- The model-host false positive's SECOND shape: a markdown link LABEL.
+# `MODEL_HOST_PREFIX_RE` above clears a reference the host sits in front of.
+# comfy-cli's gallery fixtures carry the other spelling, where the same name
+# appears twice on the line and only one copy has a host in front of it:
+#
+#     [Comfy-Org/Qwen-Image-Edit_ComfyUI](https://huggingface.co/Comfy-Org/Qwen-Image-Edit_ComfyUI)
+#
+# The label is a bare token preceded by `[`, so no offset the line-level scan
+# produces can reach it, and it is exactly as unfixable from the caller's side
+# as the URL is -- the name cannot go on a GitHub allowlist (no GitHub repo of
+# that name exists) and the link is the product content telling a user where to
+# download the weights. `_labels_non_github_link` clears it, and ONLY when the
+# link target is a model-host URL naming the SAME repo.
+#
+# The opening of a markdown inline link, matched at the END of a bare reference:
+# `](`, CommonMark's optional space/tab, an optional `<` destination wrapper,
+# then the destination itself. The destination is bounded rather than greedy for
+# the reason every other derived string here is (see `_bounded`): the line is
+# scanned-repo-controlled and can be the whole file.
+#
+# The bound TRUNCATES; it does not decline, and the difference is load-bearing.
+# Searching a truncated head lets a destination whose first 256 characters
+# happen to end at a name boundary clear a label the rest of the URL does not
+# name. Declining an over-long destination outright is not the fix either: real
+# Hugging Face destinations run past 256 characters routinely
+# (`.../resolve/main/split_files/diffusion_models/<file>.safetensors`), and
+# refusing to read them would re-open the false-positive class this whole skip
+# exists to close. So the truncation is DETECTED, by `_md_link_destination`
+# below, and only the one comparison it can corrupt -- a name that runs to the
+# cut -- is refused.
+_MD_LINK_DEST_MAX = 256
+_MD_LINK_OPEN_RE = re.compile(
+    r"\]\([ \t]*<?([^\s<>()]{0," + str(_MD_LINK_DEST_MAX) + r"})"
+)
+
+# What ends a path segment in a link destination, for the whole-name check in
+# `_labels_non_github_link`. End-of-destination counts as a terminator too --
+# but only when the destination is COMPLETE, which is what the truncation flag
+# is for.
+_PATH_SEGMENT_END = frozenset("/?#")
+
 # Where the reusable workflow checks THIS repo out inside the caller's
 # workspace (`path:` in public-repo-hygiene.yml — keep the two spellings in
 # step). The checkout lands UNTRACKED there, so `git ls-files` never lists it
@@ -1090,6 +1131,98 @@ def _nonascii_tail(line, end):
     return "".join(out)
 
 
+def _md_link_destination(line, end):
+    """The destination of a markdown inline link opening at END, and whether
+    it was CUT by `_MD_LINK_DEST_MAX`.
+
+    Returns `(None, False)` when no link opens there. A capture that reached the
+    bound is reported as cut: the class is greedy, so it stops at the bound only
+    when more destination was available. A destination whose real length is
+    exactly the bound is therefore reported as cut when it is not -- an
+    over-flag on one length, which is the safe direction here.
+    """
+    opened = _MD_LINK_OPEN_RE.match(line, end)
+    if opened is None:
+        return None, False
+    target = opened.group(1)
+    return target, len(target) == _MD_LINK_DEST_MAX
+
+
+def _labels_non_github_link(line, start, end, name):
+    """Is the bare reference at START..END the LABEL of a link to the same URL?
+
+    The second shape of the model-host false positive, and the one
+    `MODEL_HOST_PREFIX_RE` alone cannot reach. Present in comfy-cli's gallery
+    fixtures:
+
+        [Comfy-Org/Qwen-Image-Edit_ComfyUI](https://huggingface.co/Comfy-Org/Qwen-Image-Edit_ComfyUI)
+
+    The bare token genuinely IS in the file, so no model host precedes it --
+    what precedes it is `[`, and the host-prefix offsets computed for the line
+    therefore do not contain this match's start. The link TARGET is what says
+    which namespace the label names, so the same host test is run against the
+    destination instead of against the line.
+
+    The name must MATCH. Clearing on the target's host alone would clear
+    `[Comfy-Org/<private-repo>](https://huggingface.co/Comfy-Org/something-else)`
+    -- a label naming one repo over a link to another is exactly the shape a
+    leak takes once someone edits half of a line, and there is no false positive
+    on the other side of that trade: a Hugging Face link whose label is a
+    DIFFERENT `Comfy-Org/<name>` is not a reference to the model it points at.
+    The target's own copy of the reference is cleared separately, by the
+    line-level `MODEL_HOST_PREFIX_RE` scan.
+
+    NAME is the label's name after the trailing-period strip; the target's is
+    stripped the same way so the two are compared on equal terms, and the
+    comparison is casefolded like every other name comparison on this path
+    (BE-8697).
+
+    Both ENDS of the label are checked, not just the `](` on the right.
+    `_MD_LINK_OPEN_RE` only looks forward, so a bare reference sitting in prose
+    or code that merely happened to be followed by `](<matching URL>` was read
+    as link text and cleared without any `[` ever opening a label. The reference
+    has to START the label -- the shape this docstring, the README and
+    `docs/callers/public-repo-hygiene.md` all describe, and the shape every
+    instance in the swept corpus is written in. (BE-8910 review.)
+
+    The target's name has to span a WHOLE path segment, too. `REPO_REF_RE`'s
+    name class is ASCII, so the target was compared on a PARTIAL read while the
+    label side was whole: `[Comfy-Org/<private>](https://huggingface.co/
+    Comfy-Org/<private>\u2010model)` and a `%2D`-escaped sibling both read the
+    target as `<private>`, compared equal, and silenced the label. That is the
+    prefix-vs-full-name hole `_nonascii_tail` was added for in BE-8654, reached
+    through the other door, and it broke this function's own guarantee that a
+    label naming one repo over a link to another stays a finding. Requiring the
+    next character to END the segment (`/`, `?`, `#`, or the destination's end)
+    closes both spellings -- and the destination's end only counts when the
+    destination was read WHOLE, since a name running to a truncation is the same
+    partial read by a third door. (BE-8910 review.)
+    """
+    if start == 0 or line[start - 1] != "[":
+        return False
+    target, cut = _md_link_destination(line, end)
+    if target is None:
+        return False
+    folded = name.casefold()
+    for ref in REPO_REF_RE.finditer(target):
+        if ref.group(1).rstrip(".").casefold() != folded:
+            continue
+        if ref.end() >= len(target):
+            if cut:
+                continue
+        elif target[ref.end()] not in _PATH_SEGMENT_END:
+            continue
+        # The same offset test the line-level scan makes, against the
+        # destination: a model-host prefix has to END exactly where the
+        # target's own reference STARTS.
+        if any(
+            m.end() == ref.start()
+            for m in MODEL_HOST_PREFIX_RE.finditer(target)
+        ):
+            return True
+    return False
+
+
 def _bounded(token):
     """Bound a matched TOKEN before interpolating it into a finding.
 
@@ -1379,6 +1512,19 @@ def _file_findings(rel, text, ticket_allowlist):
             if not name:
                 continue
             at_prefixed = match.start() > 0 and line[match.start() - 1] == "@"
+            # The markdown-label shape (BE-8910). Gated on `not tail` because
+            # the comparison below is over what the ASCII class read, and on
+            # `not at_prefixed` because a team handle or an npm coordinate
+            # labelling a model link is not a spelling to clear -- both keep the
+            # skip to the shape the fixtures actually carry.
+            if (
+                not tail
+                and not at_prefixed
+                and _labels_non_github_link(
+                    line, match.start(), match.end(), name
+                )
+            ):
+                continue
             if tail:
                 # Never cleared, and never SILENTLY cleared either: casefold
                 # membership is untrustworthy in both directions over a name

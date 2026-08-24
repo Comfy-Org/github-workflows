@@ -129,6 +129,33 @@ is genuinely ambiguous and still clears, which is the deliberate trade that keep
 out of the findings. What is still not matched is a reference split across two lines —
 the scan is line-oriented.
 
+**A `Comfy-Org/<name>` on a non-GitHub host is not a GitHub reference.** Comfy-Org publishes model
+weights under `huggingface.co/Comfy-Org/`, and those names are unclearable by every other route:
+they cannot go on the known-public allowlist (there is no GitHub repo to confirm public — all five
+in the sweep that motivated this return `NOT_FOUND` from `gh repo view`), and the URL is the
+product content telling a user where to download the weights, so it cannot be deleted either. Two
+spellings therefore clear. A reference **immediately preceded by** `huggingface.co` or `hf.co` —
+with an optional scheme and port, and optionally through one of the routes that put an owner
+straight after it (`/models/`, `/datasets/`, `/spaces/`, `/collections/`, or the API's
+`/api/…/`) — is that host's path, not a GitHub one. And a
+**markdown link label** whose target is such a URL for the **same name**, the shape
+`[Comfy-Org/<model>](https://huggingface.co/Comfy-Org/<model>)`, clears too, because there the bare
+token is link text rather than a path. Everything else is exactly as strict as before: a bare
+`Comfy-Org/<name>`, a `github.com/Comfy-Org/<name>`, any unrecognised host, a lookalike host
+(`myhuggingface.co/…`), a subdomain (`evil.huggingface.co/…`), a path segment that merely reads
+like the host (`evil.example/huggingface.co/…`), a userinfo spelling whose real host is elsewhere
+(`huggingface.co@evil.example/…`), a non-ASCII neighbour (`éhuggingface.co/…`), and a label
+naming a *different* repo than its link all stay findings — the host has to sit in the URL's
+**authority** position, not just somewhere to the left. The label shape is checked at both ends
+for the same reason: the reference has to **open** the label, and the link target has to name the
+same repo across a **whole path segment**, so a target that merely starts with the label's name
+(`…/Comfy-Org/<model>‐variant`, `…/Comfy-Org/<model>%2Dvariant`) does not clear it.
+The route segments are case-sensitive, matching Hugging Face's own routing, so `/MODELS/` does
+not clear. The host list is deliberately short rather than "anything that is not github.com"; if
+another non-GitHub host starts publishing under the org name, that is a one-line addition to
+`MODEL_HOST_PREFIX_RE` in the checker, in the same PR-against-this-repo way a new public
+repo name is added — not a caller input, for the same reason the allowlists are not.
+
 **A name is never cleared if it was only partly read.** The name class is ASCII, so a non-ASCII
 character immediately after a reference is treated as the *rest of the name*, not as the end of it
 — otherwise `Comfy-Org/comfyui‐internal` written with U+2010 (which renders identically to `-` on
