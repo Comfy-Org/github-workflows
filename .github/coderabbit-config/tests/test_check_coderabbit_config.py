@@ -1057,7 +1057,7 @@ class OpennessTest(unittest.TestCase):
                 omitted.append(node)
         # Not an arbitrary snapshot: this is the size of the gap being closed.
         self.assertEqual(len(explicit), 5)
-        self.assertEqual(len(omitted), 103)
+        self.assertEqual(len(omitted), 104)
 
     def test_every_explicitly_open_object_uses_additional_properties(self):
         # The audit behind `_OPENER_KEYWORDS`: the schema uses one opener today,

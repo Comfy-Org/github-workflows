@@ -245,7 +245,7 @@
 				},
 				"request_changes_workflow": {
 					"default": false,
-					"description": "Automatically approve once CodeRabbit’s comments are resolved and no pre-merge checks are failing. Note: In GitLab, all discussions must be resolved.",
+					"description": "Automatically approve when CodeRabbit’s comments are resolved, the latest commit has been reviewed, and no pre-merge checks are failing. Note: In GitLab, all discussions must be resolved.",
 					"type": "boolean"
 				},
 				"high_level_summary": {
@@ -488,7 +488,7 @@
 					"type": "boolean"
 				},
 				"slop_detection": {
-					"description": "Anti-Slop | Settings for detecting and managing spam or low-quality PRs. Only for public repos, only for GitHub as of now.",
+					"description": "Anti-Slop | Settings for detecting and managing spam or low-quality PRs on GitHub. Available for public repositories on all plans and private repositories on the Pro plan and above.",
 					"default": {},
 					"type": "object",
 					"properties": {
@@ -628,7 +628,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Fix Failing CI | Enable the fix-ci finishing touch. When CI fails on a pull request, Finishing Touches offers mutually exclusive options to open a stacked pull request or commit fixes directly to the current branch. The `@coderabbitai fix-ci` command opens a stacked pull request by default; `@coderabbitai fix-ci commit` commits directly. When disabled, both commands are removed from help and CodeRabbit declines fix-ci requests. GitHub only; requires a Pro Plus plan.",
+									"description": "Fix Failing CI | Enable the fix-ci finishing touch on GitHub and Azure DevOps; requires a Pro Plus plan. When CI failures are attributed to the current pull request, Finishing Touches offers the delivery modes supported by the repository. Where both modes are available, it offers mutually exclusive stacked-pull-request and direct-commit options; where stacked-pull-request delivery is unavailable but direct commits are supported, it offers direct commit only. The `@coderabbitai fix-ci` command requests a stacked pull request by default, but commits in place on a CodeRabbit-authored pull request to avoid creating another stacked pull request. Use `@coderabbitai fix-ci commit` to request a direct commit. When disabled, both commands are removed from help and CodeRabbit declines fix-ci requests.",
 									"type": "boolean"
 								}
 							}
@@ -1111,7 +1111,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Checkov | Checkov is a static code analysis tool for infrastructure-as-code files. | v3.3.9",
+									"description": "Enable Checkov | Checkov is a static code analysis tool for infrastructure-as-code files. | v3.3.10",
 									"type": "boolean"
 								}
 							}
@@ -1313,6 +1313,18 @@
 								}
 							}
 						},
+						"verilator": {
+							"description": "Verilator statically analyzes Verilog and SystemVerilog source files.",
+							"default": {},
+							"type": "object",
+							"properties": {
+								"enabled": {
+									"default": true,
+									"description": "Enable Verilator | Verilator lints Verilog and SystemVerilog for syntax, width, connectivity, and behavioral correctness issues. | v5.050",
+									"type": "boolean"
+								}
+							}
+						},
 						"opengrep": {
 							"description": "OpenGrep is a high-performance static code analysis engine, compatible with Semgrep configurations.",
 							"default": {},
@@ -1400,7 +1412,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Trivy for security scanning of IaC files (Terraform, Kubernetes, Docker, etc.) | v0.72.0",
+									"description": "Enable Trivy for security scanning of IaC files (Terraform, Kubernetes, Docker, etc.) | v0.73.0",
 									"type": "boolean"
 								}
 							}
@@ -1436,7 +1448,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Oxlint | Oxlint is a JavaScript/TypeScript linter for OXC written in Rust. | v1.76.0",
+									"description": "Enable Oxlint | Oxlint is a JavaScript/TypeScript linter for OXC written in Rust. | v1.77.0",
 									"type": "boolean"
 								}
 							}
@@ -1448,7 +1460,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Shopify Theme Check | A linter for Shopify themes that helps you follow Shopify theme & Liquid best practices | cli 4.1.0 | theme 3.58.2",
+									"description": "Enable Shopify Theme Check | A linter for Shopify themes that helps you follow Shopify theme & Liquid best practices | cli 4.6.0 | theme 3.58.2",
 									"type": "boolean"
 								}
 							}
@@ -1558,7 +1570,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable React Doctor | React Doctor scans React codebases for security, performance, correctness, and accessibility issues. | v0.9.3",
+									"description": "Enable React Doctor | React Doctor scans React codebases for security, performance, correctness, and accessibility issues. | v0.9.6",
 									"type": "boolean"
 								}
 							}
@@ -1722,7 +1734,7 @@
 						},
 						"filePatterns": {
 							"default": [],
-							"description": "File Patterns | Patterns for your coding guideline documents. CodeRabbit scans these files to learn your standards and apply them during reviews. Multiple files supported; file names are case-sensitive. Defaults include: (**/.cursorrules, .github/copilot-instructions.md, **/CLAUDE.md, **/GEMINI.md, **/.cursor/rules/*, **/.windsurfrules, **/.clinerules/*, **/.rules/*, **/AGENT.md, **/AGENTS.md, **/REVIEW.md).",
+							"description": "File Patterns | Patterns for your coding guideline documents. CodeRabbit scans these files to learn your standards and apply them during reviews. Multiple files supported; file names are case-sensitive. An entry may also reference a same-organization repository the CodeRabbit installation can read, as repo:path or owner/repo:path (e.g. engineering-standards:frontend/react.md, globs supported); such files are read at that repository's default branch. Defaults include: (**/.cursorrules, .github/copilot-instructions.md, **/CLAUDE.md, **/GEMINI.md, **/.cursor/rules/*, **/.windsurfrules, **/.clinerules/*, **/.rules/*, **/AGENT.md, **/AGENTS.md, **/REVIEW.md).",
 							"type": "array",
 							"items": {
 								"anyOf": [
