@@ -87,6 +87,14 @@ enforce.
 alone does not mention `oversized-ok`; the sticky comment is what tells an author
 the escape hatch exists. Supply the App or expect confused authors.
 
+**A bypassed run reports no line count.** With the bypass label present the job
+short-circuits: it skips both checkouts, the Go setup and the tool build, and
+writes a "Bypassed via `oversized-ok` ✅" report directly — so it costs seconds
+instead of minutes, and the sticky comment on a PR that was red flips to ✅ as
+soon as the label lands. What you give up is the number: the report says the
+check was bypassed, not "1500 counted / 1000 cap", because nothing counted the
+lines. Remove the label to get the counted report back.
+
 **`exclude_tests` is a naming convention, not a proof.** Unlike the
 generated-file rules — which require Go's marker *before* the package clause,
 and read `.gitattributes` from the base ref precisely so a PR cannot exempt

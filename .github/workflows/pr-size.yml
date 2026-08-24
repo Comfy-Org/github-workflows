@@ -37,8 +37,14 @@ name: PR Size Cap (reusable)
 # both together.
 #
 # Bypass: add the `bypass_label` (default `oversized-ok`) to the PR for a
-# legitimately large change. The check still runs (so it always posts a
-# status) and reports green.
+# legitimately large change. The job still runs (so it always posts a status)
+# and reports green, but it SHORT-CIRCUITS: with the label present the verdict
+# is a foregone conclusion, so both checkouts, the Go setup and the tool build
+# are all skipped and a bypassed report is written directly. That report still
+# carries the sticky comment and its flag files — a PR that went red and was
+# THEN labelled must have its comment flipped to ✅, and an empty report
+# artifact would leave the stale red one in place. The tradeoff is deliberate:
+# the bypassed report shows no line count, because nothing counted the lines.
 #
 # Rollout: `mode: warn` reports (and comments) on overage but never fails the
 # check — use it to trial a cap on a repo before flipping to `enforce`.
@@ -72,6 +78,16 @@ name: PR Size Cap (reusable)
 # read-only token; the `comment` job holds the bot write token, checks out NO
 # PR code, and receives the report as an artifact — so a write-scoped token is
 # never present in a job that touched PR-authored content.
+#
+# What the size job fetches: the head commit, the base commit, and just enough
+# history to resolve their merge base — never every branch and every tag. That
+# is all the tool asks git for (merge-base, the three-dot diff, `.gitattributes`
+# at base, and blob content for changed files), and on a large monorepo consumer
+# the all-refs fetch that used to sit here consumed the whole `timeout-minutes`
+# budget before any size logic ran. The PR checkout stays credential-free; the
+# one fetch that needs a credential injects the job's own read-only
+# `GITHUB_TOKEN` for the lifetime of that single git process, so nothing is left
+# in `.git/config` while PR-authored content is on disk.
 #
 # The counting logic + its unit tests live in scripts/check-pr-size/ in THIS
 # repo; the size job builds it from the `workflows_ref` checkout, so consumer
@@ -218,13 +234,98 @@ jobs:
       contents: read
     steps:
       - name: Checkout PR head
+        # Skipped entirely on a bypassed run — see "Report the bypass" below.
+        if: env.PR_SIZE_BYPASS != 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          # Full history for all refs, so the base SHA and the merge-base
-          # three-dot diff resolve without a separate authenticated fetch.
-          fetch-depth: 0
+          # The head commit and its tree, nothing else. This used to be
+          # `fetch-depth: 0` for "full history for all refs", and on a large
+          # monorepo consumer that refspec — `+refs/heads/*:… +refs/tags/*:…`,
+          # every branch and every tag despite `--no-tags` — routinely ate the
+          # job's entire timeout budget before any size logic ran, and dominated
+          # the runs that did finish. The tool needs two commits, their merge
+          # base, and blob content either side of the diff; the next step
+          # fetches exactly that. (BE-8940)
+          fetch-depth: 1
+          # Deliberate, and load-bearing for the two-job security split in the
+          # header: this job holds a PR checkout, so no credential is left in
+          # `.git/config` for PR-authored content to sit next to. It is also why
+          # the fetch below carries its own single-process credential rather
+          # than relying on one surviving this step.
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Fetch the base commit and the merge-base history
+        # The other half of the fetch narrowing. `persist-credentials: false`
+        # above means there is nothing left to fetch with, and the consumer
+        # repos are private — which is also why a partial clone (`filter:
+        # blob:none`) is NOT the fix here: it would defer blob fetches to a
+        # point where no credential exists to make them, working on a public
+        # repo and failing on every private one.
+        if: env.PR_SIZE_BYPASS != 'true'
+        env:
+          # The job's own read-only token (`permissions: contents: read`).
+          FETCH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # One-shot credential. GIT_CONFIG_COUNT/KEY/VALUE applies
+          # http.extraheader to the git processes this step starts and nothing
+          # else: it is never written to `.git/config` (so the checkout's
+          # hardening still holds while the tool runs) and, unlike `git -c`, it
+          # never reaches argv where another process could read it. Masked
+          # because the base64 form is not the literal GITHUB_TOKEN the runner
+          # already masks, and git echoes request headers on some transport
+          # errors.
+          B64="$(printf 'x-access-token:%s' "$FETCH_TOKEN" | base64 | tr -d '\n')"
+          echo "::add-mask::${B64}"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0=http.extraheader
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${B64}"
+
+          # Naming the two SHAs explicitly is the whole fix: the server walks
+          # these two commits and nothing else. GitHub allows fetching an
+          # arbitrary commit by SHA, and a fork PR's head is reachable in the
+          # base repo (refs/pull/N/head), so this covers forks too.
+          fetch() {
+            git fetch --no-tags --no-recurse-submodules --quiet "$@" origin "$BASE_SHA" "$HEAD_SHA"
+          }
+          have_merge_base() { git merge-base "$BASE_SHA" "$HEAD_SHA" >/dev/null 2>&1; }
+          is_shallow() { [ "$(git rev-parse --is-shallow-repository)" = "true" ]; }
+
+          fetch --depth=100
+
+          # Deepen until the merge base is reachable. The distance to the fork
+          # point is unknown — a monorepo's base branch can be far ahead of it —
+          # and a shallow graft hides the ancestry `merge-base` walks, so guessing
+          # one depth is not an option. Each rung is incremental, so the cost is
+          # the depth actually needed rather than the sum of the rungs, and the
+          # loop stops the moment the repo stops being shallow (deepening past
+          # the root cannot help).
+          for extra in 400 1600 6400; do
+            have_merge_base && break
+            is_shallow || break
+            # A rung that errors is NOT fatal. The fallback below is a complete
+            # answer one fetch away, so a transient failure part-way up the
+            # ladder must degrade to it rather than redden a consumer's check.
+            fetch "--deepen=${extra}" || break
+          done
+
+          # Last resort: complete history — but still only for these two
+          # commits, which is the part `fetch-depth: 0` got wrong. `--unshallow`
+          # refuses to run on an already-complete repo, hence the guard.
+          if ! have_merge_base && is_shallow; then
+            fetch --unshallow || fetch --depth=2147483647 || true
+          fi
+
+          # Hard-fail rather than let the tool report `could not resolve merge
+          # base` from three steps away.
+          if ! have_merge_base; then
+            echo "::error::could not resolve the merge base of ${BASE_SHA} and ${HEAD_SHA} after fetching both commits' history"
+            exit 1
+          fi
 
       - name: Require a pinned workflows_ref
         # workflows_ref has no default on purpose. GitHub does NOT enforce
@@ -254,6 +355,12 @@ jobs:
         # The tool comes from THIS workflow's repo (public, pinned via
         # workflows_ref) — never from the PR checkout, so no PR-authored code
         # runs in this job.
+        #
+        # The `Require a pinned workflows_ref` guard above stays UNCONDITIONAL
+        # on purpose: a caller that forgot the pin is misconfigured whether or
+        # not this particular PR happens to carry the bypass label, and the
+        # guard is a shell test that costs nothing.
+        if: env.PR_SIZE_BYPASS != 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: Comfy-Org/github-workflows
@@ -262,6 +369,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Go
+        if: env.PR_SIZE_BYPASS != 'true'
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           go-version-file: _pr_size_tool/scripts/check-pr-size/go.mod
@@ -269,6 +377,7 @@ jobs:
           cache: false
 
       - name: Build check-pr-size
+        if: env.PR_SIZE_BYPASS != 'true'
         env:
           # The tool is checked out into `_pr_size_tool/` UNDER the consumer
           # repo's checkout, so `go build` discovers that repo's root `go.work`
@@ -290,6 +399,7 @@ jobs:
 
       - name: Check PR size
         id: check
+        if: env.PR_SIZE_BYPASS != 'true'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -298,6 +408,43 @@ jobs:
           "${RUNNER_TEMP}/check-pr-size" \
             --base "${BASE_SHA}" \
             --head "${HEAD_SHA}" | tee "${RUNNER_TEMP}/pr-size-report.md"
+
+      - name: Report the bypass
+        # The whole of the bypassed path. With the label present the verdict is
+        # a foregone conclusion, so every step above is skipped and this writes
+        # the artifacts they would have produced.
+        #
+        # It MUST write pr-size-report.md AND both flag files, not just exit
+        # green: the `comment` job bails out on an empty report artifact and
+        # leaves any existing sticky comment untouched, so a PR that was red and
+        # then got bypass-labelled would keep its stale red comment forever —
+        # strictly worse than paying for the full run. Writing the report is
+        # what flips that comment to ✅.
+        #
+        # Deliberate tradeoff: this report carries no line count. Recovering one
+        # means the checkout, the build and the diff this step exists to skip.
+        if: env.PR_SIZE_BYPASS == 'true'
+        env:
+          BYPASS_LABEL: ${{ inputs.bypass_label }}
+        run: |
+          set -euo pipefail
+          # Same heading and bullet as the tool's own bypassed report, so the
+          # sticky comment reads identically whichever path produced it.
+          {
+            printf '## ✅ Passed — PR size check\n\n'
+            printf -- '- Bypassed via `%s` label ✅\n\n' "${BYPASS_LABEL}"
+            printf 'The size check was skipped before any checkout, so no line count was computed. Remove the `%s` label to get the counted report back.\n' "${BYPASS_LABEL}"
+          } > "${RUNNER_TEMP}/pr-size-report.md"
+          # The step summary is the surface that survives with no bot
+          # credentials (fork and Dependabot PRs), so the bypassed report has to
+          # reach it too.
+          cat "${RUNNER_TEMP}/pr-size-report.md" >> "${GITHUB_STEP_SUMMARY}"
+          # Written explicitly rather than left absent: the comment job reads
+          # these to decide whether to POST a new comment, and `false` is the
+          # answer that flips an existing one without spawning one on a PR that
+          # never had it.
+          printf 'false' > "${RUNNER_TEMP}/pr-size-over-cap"
+          printf 'false' > "${RUNNER_TEMP}/pr-size-tests-decisive"
 
       - name: Annotate a decisive test exclusion
         # An annotation is the ONE carrier that needs no bot credentials, so it
@@ -333,7 +480,12 @@ jobs:
         # only because test lines were excluded. Without it no comment posts
         # there, and the excluded total would be visible only in this job's step
         # summary — hiding the number in exactly the case it exists for.
-        if: always()
+        #
+        # Not on the bypassed path: `Report the bypass` already wrote both flags
+        # and `steps.check` never ran, so letting this overwrite them with the
+        # empty strings of a skipped step's outputs would only make the files
+        # less legible.
+        if: always() && env.PR_SIZE_BYPASS != 'true'
         env:
           OVER_CAP: ${{ steps.check.outputs.over_cap }}
           TESTS_DECISIVE: ${{ steps.check.outputs.tests_decisive }}
