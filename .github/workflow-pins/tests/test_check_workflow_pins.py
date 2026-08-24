@@ -1901,6 +1901,186 @@ class GuardCoverageTests(unittest.TestCase):
         )
         self.assertEqual(sites, [])
 
+    # ------------------------------------------------------------------
+    # The pre-scan reads step ITEMS, not lines (BE-8254). Anything shaped
+    # like an `id:` key used to register as a declared step id at any nesting
+    # depth, and a phantom id silences the dangling verdict outright: the
+    # consumer resolves to an "earlier step out of scope" that does not exist.
+    # ------------------------------------------------------------------
+
+    WITH_INPUT_NAMED_ID = (
+        "      - name: Run a tool\n"
+        "        uses: some/action@abc\n"
+        "        with:\n"
+        "          id: resolve_ref\n"
+    )
+    # A `run:` block scalar emitting fixture YAML — the shape `cursor-review.yml`
+    # and `groom.yml` write heavily. The emitted line is not workflow structure
+    # at all, but it is indented like it and it starts with `id:`.
+    HEREDOC_STEP_ID = (
+        "      - name: Write a fixture workflow\n"
+        "        run: |\n"
+        "          cat <<'EOF' > fixture.yml\n"
+        "          steps:\n"
+        "            - id: resolve_ref\n"
+        "              run: echo hi\n"
+        "          EOF\n"
+    )
+    HEREDOC_QUOTED_STEP_ID = HEREDOC_STEP_ID.replace(
+        "            - id: resolve_ref\n", '            "id": resolve_ref\n'
+    )
+
+    def _dangling_states(self, steps):
+        return [
+            (fb, guarded, via)
+            for _, fb, guarded, via in cwp.ref_checkouts(self._wrap(steps).split("\n"))
+        ]
+
+    def test_an_action_input_named_id_declares_no_step(self):
+        # `with:` members sit DEEPER than the step's own keys, so reading the
+        # id at the item's key column excludes this structurally. Registering
+        # it turned the consumer below into a silent pass.
+        steps = self.WITH_INPUT_NAMED_ID + self._step_output_checkout()
+        self.assertEqual(self._dangling_states(steps), [(False, False, "dangling")])
+        self.assertEqual(len(self._jobs(steps)), 1)
+
+    def test_a_heredoc_emitted_step_id_declares_no_step(self):
+        # YAML puts a block scalar's content deeper than the key that opens
+        # it, so script TEXT can never land on the item's key column — and the
+        # scalar is skipped outright besides.
+        steps = self.HEREDOC_STEP_ID + self._step_output_checkout()
+        self.assertEqual(self._dangling_states(steps), [(False, False, "dangling")])
+
+    def test_a_heredoc_emitted_quoted_step_id_declares_no_step(self):
+        # The quoted spelling `"id": x` matches the same block pattern.
+        self.assertIn('"id": resolve_ref', self.HEREDOC_QUOTED_STEP_ID)
+        steps = self.HEREDOC_QUOTED_STEP_ID + self._step_output_checkout()
+        self.assertEqual(self._dangling_states(steps), [(False, False, "dangling")])
+
+    def test_a_real_id_beside_a_phantom_one_is_still_registered(self):
+        # The narrowing must not cost the ids that ARE declared: the same job
+        # carries a phantom `with:` input AND a real resolver, and the
+        # consumer of the real one stays the old out-of-scope drop.
+        steps = (
+            self.WITH_INPUT_NAMED_ID + self.RESOLVER + self._step_output_checkout(self.EXACT_IF)
+        )
+        self.assertEqual(self._dangling_states(steps), [(False, True, True)])
+
+    def test_a_marker_line_id_is_read_at_the_items_key_column(self):
+        # `- id: x` declares the id at the step's key column, where `_indent`
+        # reads the MARKER's column instead — so the marker-line spelling is
+        # normalized back into view exactly as `_binding_step_id` does. The
+        # step binds nothing, so it is never registered as a resolver and the
+        # pre-scan is the ONLY thing standing between a compliant workflow and
+        # a false dangling failure. (`WIDE_MARKER_RESOLVER` cannot pin this:
+        # it binds the input, so `resolvers` answers before the pre-scan is
+        # ever consulted.)
+        for marker in ("      - id: resolve_ref\n", "      -  id: resolve_ref\n"):
+            unrelated = marker + " " * (len(marker) - len(marker.lstrip(" ")) + 2) + "run: echo hi\n"
+            sites = cwp.ref_checkouts(
+                self._wrap(unrelated + self._step_output_checkout()).split("\n")
+            )
+            self.assertEqual(sites, [], unrelated)
+
+    def test_a_multi_line_flow_step_still_registers_its_id(self):
+        # `- {uses: x,` / `id: y}` — a flow mapping spanning physical lines.
+        # The id sits on a CONTINUATION line, at no particular column, so it
+        # is read by tracking the unbalanced `{` the marker line opened. An id
+        # missed here is a compliant workflow reported as a false failure.
+        multi_line_flow = (
+            "      - {uses: some/action@abc,\n"
+            "         id: resolve_ref}\n"
+        )
+        sites = cwp.ref_checkouts(
+            self._wrap(multi_line_flow + self._step_output_checkout()).split("\n")
+        )
+        self.assertEqual(sites, [])
+
+    def test_a_flow_input_named_id_declares_no_step_in_either_spelling(self):
+        # The flow pattern is read only where a flow mapping actually OPENS —
+        # a marker line whose value begins `{`. Read on every marker line it
+        # also matches `- with: {id: x}`, where `id` is an action INPUT; read
+        # on every line it matches the member spelling below as well.
+        member = "      - uses: some/action@abc\n        with: {id: resolve_ref}\n"
+        marker = "      - with: {id: resolve_ref}\n        uses: some/action@abc\n"
+        for step in (member, marker):
+            steps = step + self._step_output_checkout()
+            self.assertEqual(
+                self._dangling_states(steps), [(False, False, "dangling")], step
+            )
+
+    # ------------------------------------------------------------------
+    # The fail-loud escape: a `steps:` shape the item walk cannot read.
+    # ------------------------------------------------------------------
+
+    FLOW_STEPS_JOB = (
+        "  job0:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps: [{id: resolve_ref, run: echo hi},"
+        " {uses: actions/checkout@abc,"
+        ' with: {ref: "${{ steps.resolve_reff.outputs.ref }}"}}]\n'
+    )
+
+    def test_a_fully_flow_steps_list_is_unknown_not_empty(self):
+        # `steps: [ … ]` on the key line opens no item the walk can read, so
+        # the pre-scan answers None — "unknown" — rather than an empty map
+        # that would read as "this job declares no step at all".
+        lines = ("name: F\non:\n  workflow_call:\njobs:\n" + self.FLOW_STEPS_JOB).split("\n")
+        start = next(i for i, l in enumerate(lines) if l.startswith("  job0:"))
+        self.assertIsNone(cwp._job_step_ids(lines, start, 2))
+
+    def test_a_fully_flow_steps_list_yields_no_dangling_verdict(self):
+        # …and the caller keeps the pre-BE-8215 fail-open drop for that job
+        # rather than manufacturing a failure out of a pre-scan that could not
+        # run. Note the id here is TYPO'D — with a working pre-scan this would
+        # be dangling; unknown is not the same as absent.
+        text = "name: F\non:\n  workflow_call:\njobs:\n" + self.FLOW_STEPS_JOB
+        self.assertEqual(cwp.ref_checkouts(text.split("\n")), [])
+        self.assertEqual(cwp.find_unguarded_ref_checkouts(text.split("\n")), [])
+
+    def test_a_flow_steps_job_does_not_silence_its_siblings(self):
+        # The escape is per JOB. A sibling job written normally is judged
+        # exactly as before.
+        sibling = "  job1:\n    runs-on: ubuntu-latest\n    steps:\n%s" % (
+            self.RESOLVER + self._step_output_checkout(ref="${{ steps.resolve_reff.outputs.ref }}")
+        )
+        text = "name: F\non:\n  workflow_call:\njobs:\n" + self.FLOW_STEPS_JOB + sibling
+        self.assertEqual(
+            [(fb, guarded, via) for _, fb, guarded, via in cwp.ref_checkouts(text.split("\n"))],
+            [(False, False, "dangling")],
+        )
+
+    def test_a_caller_job_with_no_steps_is_empty_not_unknown(self):
+        # A reusable-workflow CALLER job (`uses:` + `with:`) declares no step
+        # at all, so `steps.<id>.outputs.<out>` in its `with:` is `''` at
+        # runtime exactly as a typo'd id is — the empty map, not "unknown".
+        # Answering "unknown" here would drop a real finding on the one job
+        # shape that cannot possibly have the step.
+        text = (
+            "name: F\non:\n  workflow_call:\njobs:\n"
+            "  job0:\n"
+            "    uses: org/repo/.github/workflows/w.yml@abc\n"
+            "    with:\n"
+            '      ref: "${{ steps.resolve_ref.outputs.ref }}"\n'
+        )
+        lines = text.split("\n")
+        start = next(i for i, l in enumerate(lines) if l.startswith("  job0:"))
+        self.assertEqual(cwp._job_step_ids(lines, start, 2), {})
+        self.assertEqual(
+            [(fb, guarded, via) for _, fb, guarded, via in cwp.ref_checkouts(lines)],
+            [(False, False, "dangling")],
+        )
+
+    def test_a_steps_key_with_no_list_item_is_unknown(self):
+        # `steps:` present but opening no `- ` item — a shape with no reading,
+        # answered the same way.
+        lines = (
+            "name: F\non:\n  workflow_call:\njobs:\n"
+            "  job0:\n    runs-on: ubuntu-latest\n    steps:\n      not-an-item: true\n"
+        ).split("\n")
+        start = next(i for i, l in enumerate(lines) if l.startswith("  job0:"))
+        self.assertIsNone(cwp._job_step_ids(lines, start, 2))
+
     def test_a_trailing_or_fallback_after_a_covered_output_passes(self):
         # `${{ steps.resolve_ref.outputs.ref || 'main' }}` under the exact
         # `if:`: the checkout only runs when the output is non-empty, so the

@@ -118,6 +118,26 @@ and is left alone, as it always was — including a heredoc emitting a whole
 STEP, where the enclosing key is a `with:` the script itself printed: an open
 `|`/`>` block scalar is tracked so its body is read as text, not structure.
 
+**That pre-scan reads step ITEMS, not lines (BE-8254).** An id counts as
+declared only where a step actually declares one — at the item's own key
+column, or inside a flow mapping the item opens (`- {id: x, …}`, including the
+multi-line spelling). Two shapes used to register as phantom steps and so
+SILENCE the dangling verdict on a real finding: an action input literally named
+`id:` under an earlier step's `with:` (nested deeper than the step's keys), and
+a `run:` block scalar whose heredoc emits a line beginning `- id:` / `"id":`
+(fixture YAML this repo's own workflows write). Both are excluded structurally
+now — YAML puts a `with:` member and a block scalar's body deeper than the key
+column either way.
+
+**A `steps:` the item walk cannot read makes that job's dangling verdict
+fail-open, not fail-loud.** Flow-style `steps: [ … ]` on the key line, or a
+`steps:` opening no `- ` item, leaves the pre-scan with no answer at all — so
+for that job (only) a would-be-dangling site is dropped, exactly as it was
+before BE-8215. Under-collection is the costly direction here: a missed id
+turns a compliant workflow into a false FAILURE, while a dropped site merely
+reproduces the coverage this lint had before the dangling check existed.
+Resolver and guard verdicts are unaffected, in that job and every other.
+
 **`||` fallbacks are read on this path too, with leading-operand judgment
 (BE-8215).** `ref: ${{ steps.<id>.outputs.<name> || 'main' }}` used to match
 nothing anywhere and record nothing. Now it is a site like any other, judged
