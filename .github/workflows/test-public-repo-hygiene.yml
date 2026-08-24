@@ -83,6 +83,17 @@ jobs:
           printf 'Also unrelated: https://lınear.app/x\n' >> "$root/LOOKALIKES.md"
           printf 'Userinfo, so the real host is evil.com: https://app.slack.com@evil.com/\n' >> "$root/LOOKALIKES.md"
           printf 'Userinfo again, non-numeric port and all: https://app.slack.com:443.evil.com@evil.com/\n' >> "$root/LOOKALIKES.md"
+          # BE-8910: `Comfy-Org/<name>` is not GitHub's namespace alone. The
+          # org publishes model weights under `huggingface.co/Comfy-Org/`, and
+          # those names are unallowlistable (no GitHub repo exists to confirm
+          # public) and unremovable (the URL tells a user where to get the
+          # weights). Both shapes are here: the URL, and the markdown link
+          # whose LABEL is the bare token -- the second one has no host in
+          # front of it at all, so only the link target says which namespace
+          # it names.
+          printf 'Weights: https://huggingface.co/Comfy-Org/stable-diffusion-v1-5-archive/resolve/main/\n' > "$root/MODELS.md"
+          printf 'Also [Comfy-Org/Qwen-Image-Edit_ComfyUI](https://huggingface.co/Comfy-Org/Qwen-Image-Edit_ComfyUI)\n' >> "$root/MODELS.md"
+          printf 'And a dataset: https://huggingface.co/datasets/Comfy-Org/a-dataset\n' >> "$root/MODELS.md"
           printf '* @Comfy-Org/comfy-cloud-team\n' > "$root/CODEOWNERS"
           git -C "$root" add -A
           python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root"
@@ -145,6 +156,23 @@ jobs:
           check_one 'empty-port internal link' \
             'notes https://notion.so:/team/page' \
             'internal collaboration-tool marker'
+          # BE-8910: host awareness must not become a bypass. The hosts are a
+          # narrow allowlist anchored on DNS labels, so a lookalike, an
+          # unrecognised host, a userinfo spelling whose real host is
+          # elsewhere, and a markdown label naming a DIFFERENT repo than its
+          # link are all still default-deny findings.
+          check_one 'lookalike model host' \
+            'weights https://myhuggingface.co/Comfy-Org/not-a-public-repo' \
+            'which is not in the known-public allowlist'
+          check_one 'unrecognised host' \
+            'mirror https://gitlab.com/Comfy-Org/not-a-public-repo' \
+            'which is not in the known-public allowlist'
+          check_one 'model host as userinfo' \
+            'link https://huggingface.co@evil.com/Comfy-Org/not-a-public-repo' \
+            'which is not in the known-public allowlist'
+          check_one 'markdown label naming another repo' \
+            '[Comfy-Org/not-a-public-repo](https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI)' \
+            'which is not in the known-public allowlist'
 
       # ── The acceptance criterion this whole workflow exists for ────────────
       - name: Smoke test — a caller-side edit to the allowlist has NO effect

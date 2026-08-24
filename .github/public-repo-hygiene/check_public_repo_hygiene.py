@@ -409,6 +409,86 @@ _REPO_NAME_ASCII = frozenset(
 # prose like `Comfy-Org/ComfyUI’s frontend` stays a clean reference.
 _NAME_CONTINUING_CATEGORIES = frozenset({"Pd", "Pc"})
 
+# --- Host awareness: which `Comfy-Org/<name>` is a GITHUB reference (BE-8910)
+# `REPO_REF_RE` matches the bare shape with no regard for the host in front of
+# it, and the org name is not GitHub's alone: Comfy-Org publishes model weights
+# under `huggingface.co/Comfy-Org/`, where the same token names a Hugging Face
+# repository with no GitHub existence at all. Those references reach the
+# default-deny above as findings a caller has NO way to clear -- the names
+# cannot go in `PUBLIC_COMFY_ORG_REPOS` because they are not GitHub repos (all
+# five in the comfy-cli sweep return NOT_FOUND from `gh repo view`), and the
+# URLs are product content telling users where to download weights, so they
+# cannot be removed either.
+#
+# The hosts are an explicit, NARROW allowlist rather than "any host that is not
+# github.com". The broad rule reads as the tidy one, and it is the wrong trade
+# for a default-deny leak guard: it silences `<anything>.<tld>/Comfy-Org/
+# <private-repo>` wholesale, and to recognise a host at all it needs a fuzzy
+# looks-like-a-hostname test that an ordinary versioned relative path
+# (`docs/v1.2/Comfy-Org/notes`) also satisfies. Naming the hosts leaves every
+# other spelling -- bare, `github.com/`, an unrecognised host -- exactly as
+# strict as it was, and adding a host is the same one-line edit in the same
+# unreachable-by-callers file that adding a repo name is.
+NON_GITHUB_ORG_NAMESPACE_HOSTS = ("huggingface.co", "hf.co")
+
+# The path segments Hugging Face interposes between the host and the org
+# segment: a model lives at `huggingface.co/<org>/<name>`, while a dataset, a
+# space and the JSON API each prepend one or two fixed segments. Enumerated
+# rather than "any path", so the lookback below stays a bounded CONSTANT. That
+# bound is the point: the prefix test runs once per match, so a `search` over
+# the whole preceding line would be quadratic on the 5 MiB single line
+# `MAX_FILE_BYTES` still admits -- the shape `_codeowners_owner_span` is hoisted
+# out of the match loop to avoid.
+_NON_GITHUB_HOST_PATH_PREFIXES = (
+    "datasets/",
+    "spaces/",
+    "models/",
+    "api/models/",
+    "api/datasets/",
+    "api/spaces/",
+)
+# Same DNS-label anchoring as the category-2 host patterns (`_HOST_L`, `_PORT`,
+# `_HOST_FLAGS`, all from BE-8729 -- reused rather than re-derived, per that
+# ticket's coordination note), and for the same reason: `myhuggingface.co/` is a
+# different registrable name and must NOT silence the reference. Anchored on the
+# RIGHT with `\Z`, which the caller pins to the start of the match, so the host
+# (plus at most one enumerated path prefix) has to sit IMMEDIATELY before the
+# org segment -- a `huggingface.co` link earlier in the line cannot reach across
+# to a later bare reference.
+_NON_GITHUB_HOST_PREFIX_RE = re.compile(
+    _HOST_L
+    + "(?:"
+    + "|".join(re.escape(h) for h in NON_GITHUB_ORG_NAMESPACE_HOSTS)
+    + ")"
+    + _PORT
+    + "/(?:"
+    + "|".join(re.escape(p) for p in _NON_GITHUB_HOST_PATH_PREFIXES)
+    + r")?\Z",
+    _HOST_FLAGS,
+)
+# How far back the test above has to look: the longest host, a real port, the
+# `/` after it, and the longest path prefix. Derived from the tuples so it
+# cannot drift when one gains an entry. A port longer than `:65535` is not a
+# port any client resolves (`port = *DIGIT` still parses it, so `_PORT` accepts
+# the digits) and would push the host outside the window -- the reference is
+# then FLAGGED, which is the safe direction.
+_HOST_PREFIX_LOOKBACK = (
+    max(len(h) for h in NON_GITHUB_ORG_NAMESPACE_HOSTS)
+    + len(":65535")
+    + 1
+    + max(len(p) for p in _NON_GITHUB_HOST_PATH_PREFIXES)
+)
+
+# The opening of a markdown inline link, matched at the END of a bare reference:
+# `](`, CommonMark's optional space/tab, an optional `<` destination wrapper,
+# then the destination itself. The destination is bounded rather than greedy for
+# the reason every other derived string here is (see `_bounded`): the line is
+# scanned-repo-controlled and can be the whole file. 256 characters is past the
+# longest `https://huggingface.co/api/datasets/Comfy-Org/<name>` that GitHub's
+# and Hugging Face's own name limits allow, and a destination longer than that
+# simply is not cleared.
+_MD_LINK_OPEN_RE = re.compile(r"\]\([ \t]*<?([^\s<>()]{0,256})")
+
 # Where the reusable workflow checks THIS repo out inside the caller's
 # workspace (`path:` in public-repo-hygiene.yml — keep the two spellings in
 # step). The checkout lands UNTRACKED there, so `git ls-files` never lists it
@@ -996,6 +1076,72 @@ def _nonascii_tail(line, end):
     return "".join(out)
 
 
+def _is_non_github_host_prefixed(text, start):
+    """Is the `Comfy-Org/...` reference at START the path of a NON-GitHub URL?
+
+    Shape 1 of BE-8910, and the common case:
+    `https://huggingface.co/Comfy-Org/stable-diffusion-v1-5-archive/resolve/main/`.
+    The token after that host is a Hugging Face repository, so the GitHub
+    default-deny simply does not apply to it -- there is no GitHub repo of that
+    name to confirm public or scrub.
+
+    Only the hosts in `NON_GITHUB_ORG_NAMESPACE_HOSTS` do this. A bare
+    reference, a `github.com/` one and one after any UNRECOGNISED host all
+    return False and stay subject to the allowlist exactly as before, so the
+    default-deny control is narrowed at two named hosts and nowhere else.
+
+    The window is bounded (`_HOST_PREFIX_LOOKBACK`) rather than "everything
+    before the match", because this runs once per match and an unbounded
+    `search` is quadratic on one very long line. The `_HOST_L` lookbehind still
+    reads the character BEFORE the window, which is what keeps
+    `myhuggingface.co/Comfy-Org/x` a finding.
+    """
+    return (
+        _NON_GITHUB_HOST_PREFIX_RE.search(
+            text, max(0, start - _HOST_PREFIX_LOOKBACK), start
+        )
+        is not None
+    )
+
+
+def _labels_non_github_link(line, end, name):
+    """Is the bare reference ending at END the LABEL of a link to the same URL?
+
+    Shape 2 of BE-8910, present in comfy-cli's gallery fixtures:
+
+        [Comfy-Org/Qwen-Image-Edit_ComfyUI](https://huggingface.co/Comfy-Org/Qwen-Image-Edit_ComfyUI)
+
+    The bare token genuinely IS in the file, so the host-prefix test above
+    cannot see it -- what precedes it is `[`. The link TARGET is what says which
+    namespace the label names.
+
+    The name must MATCH. Clearing on the target's host alone would clear
+    `[Comfy-Org/<private-repo>](https://huggingface.co/Comfy-Org/something-else)`
+    -- a label naming one repo over a link to another is exactly the shape a
+    leak takes once someone edits half of a line, and there is no false positive
+    on the other side of that trade: a Hugging Face link whose label is a
+    DIFFERENT `Comfy-Org/<name>` is not a reference to the model it points at.
+    The target's own copy of the reference is cleared separately, by
+    `_is_non_github_host_prefixed`.
+
+    NAME is the label's name after the trailing-period strip; the target's is
+    stripped the same way so the two are compared on equal terms, and the
+    comparison is casefolded like every other name comparison on this path
+    (BE-8697).
+    """
+    opened = _MD_LINK_OPEN_RE.match(line, end)
+    if opened is None:
+        return False
+    target = opened.group(1)
+    folded = name.casefold()
+    for ref in REPO_REF_RE.finditer(target):
+        if ref.group(1).rstrip(".").casefold() != folded:
+            continue
+        if _is_non_github_host_prefixed(target, ref.start()):
+            return True
+    return False
+
+
 def _bounded(token):
     """Bound a matched TOKEN before interpolating it into a finding.
 
@@ -1243,6 +1389,12 @@ def _file_findings(rel, text, ticket_allowlist):
             _codeowners_owner_span(line, lineno) if is_codeowners else None
         )
         for match in REPO_REF_RE.finditer(line):
+            # BEFORE anything else, including the homoglyph branch below: a
+            # `huggingface.co/Comfy-Org/<model>` path is not a GitHub reference
+            # at all, so neither the allowlist nor the "rewrite it in ASCII"
+            # remedy has anything to say about it. (BE-8910.)
+            if _is_non_github_host_prefixed(line, match.start()):
+                continue
             name = match.group(1)
             # Characters the ASCII name class could not read are the REST of the
             # name, not a boundary. Carry them into what is reported, and (below)
@@ -1262,6 +1414,17 @@ def _file_findings(rel, text, ticket_allowlist):
             if not name:
                 continue
             at_prefixed = match.start() > 0 and line[match.start() - 1] == "@"
+            # The markdown-label shape (BE-8910). Gated on `not tail` because
+            # the comparison below is over what the ASCII class read, and on
+            # `not at_prefixed` because a team handle or an npm coordinate
+            # labelling a model link is not a spelling to clear -- both keep the
+            # skip to the shape the fixtures actually carry.
+            if (
+                not tail
+                and not at_prefixed
+                and _labels_non_github_link(line, match.end(), name)
+            ):
+                continue
             if tail:
                 # Never cleared, and never SILENTLY cleared either: casefold
                 # membership is untrustworthy in both directions over a name
