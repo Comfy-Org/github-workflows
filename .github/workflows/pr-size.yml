@@ -37,8 +37,14 @@ name: PR Size Cap (reusable)
 # both together.
 #
 # Bypass: add the `bypass_label` (default `oversized-ok`) to the PR for a
-# legitimately large change. The check still runs (so it always posts a
-# status) and reports green.
+# legitimately large change. The job still runs (so it always posts a status)
+# and reports green, but it SHORT-CIRCUITS: with the label present the verdict
+# is a foregone conclusion, so both checkouts, the Go setup and the tool build
+# are all skipped and a bypassed report is written directly. That report still
+# carries the sticky comment and its flag files — a PR that went red and was
+# THEN labelled must have its comment flipped to ✅, and an empty report
+# artifact would leave the stale red one in place. The tradeoff is deliberate:
+# the bypassed report shows no line count, because nothing counted the lines.
 #
 # Rollout: `mode: warn` reports (and comments) on overage but never fails the
 # check — use it to trial a cap on a repo before flipping to `enforce`.
@@ -72,6 +78,16 @@ name: PR Size Cap (reusable)
 # read-only token; the `comment` job holds the bot write token, checks out NO
 # PR code, and receives the report as an artifact — so a write-scoped token is
 # never present in a job that touched PR-authored content.
+#
+# What the size job fetches: the head commit, the base commit, and just enough
+# history to resolve their merge base — never every branch and every tag. That
+# is all the tool asks git for (merge-base, the three-dot diff, `.gitattributes`
+# at base, and blob content for changed files), and on a large monorepo consumer
+# the all-refs fetch that used to sit here consumed the whole `timeout-minutes`
+# budget before any size logic ran. The PR checkout stays credential-free; the
+# one fetch that needs a credential injects the job's own read-only
+# `GITHUB_TOKEN` for the lifetime of that single git process, so nothing is left
+# in `.git/config` while PR-authored content is on disk.
 #
 # The counting logic + its unit tests live in scripts/check-pr-size/ in THIS
 # repo; the size job builds it from the `workflows_ref` checkout, so consumer
@@ -209,6 +225,38 @@ env:
   PR_SIZE_EXTRA_GENERATED_GLOBS: ${{ inputs.extra_generated_globs }}
   PR_SIZE_EXCLUDE_TESTS: ${{ inputs.exclude_tests }}
 
+concurrency:
+  # One size run per PR; a newer commit or label event cancels the in-flight
+  # one. Load-bearing for the bypass short-circuit below: `Report the bypass`
+  # finishes in seconds while a counted run takes minutes, so labelling a PR
+  # whose `synchronize` run is still in flight would otherwise let the slow run
+  # finish LAST and overwrite the ✅ bypass report with the stale red verdict
+  # (and, in enforce mode, a red check). Before the short-circuit both paths
+  # cost about the same and losing that race was incidental; now it is the
+  # likely outcome. A cancelled run posts nothing — that is the `comment` job's
+  # `!cancelled()` gate, NOT its `needs.pr-size.result` test, which only sees
+  # the narrower case where cancellation lands while `pr-size` is still running.
+  #
+  # WORKFLOW level, not `jobs.pr-size.concurrency`, on purpose. A job-scoped
+  # group only ever cancels a `pr-size` job that is STILL RUNNING; the losing
+  # case is the other one — a counted run whose `pr-size` job already finished
+  # red, superseded a moment later by a bypass run. Nothing is left to cancel,
+  # so its `comment` job goes on to PATCH the stale red report over the newer
+  # ✅. Cancelling at run scope reaches that queued `comment` job, which is the
+  # exact overwrite this block exists to prevent.
+  #
+  # CALLERS MUST STAY OUT OF THIS GROUP. A caller that declares the same group
+  # name deadlocks its own run — it holds the group while its reusable `uses:`
+  # job waits to acquire the same one (see the note in `ci-groom.yml`) — so the
+  # `-reusable-` infix keeps the name outside what a caller would naturally
+  # pick. And because cancellation is RUN-scoped, call this from a dedicated
+  # workflow file rather than as one job of a larger `ci.yml`, or a label event
+  # on the PR will cancel that run's unrelated jobs too. Both constraints are
+  # written up for consumers in docs/callers/pr-size.md. Same shape as the
+  # reusable `groom.yml` and `pr-area-label.yml` here.
+  group: pr-size-reusable-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   pr-size:
     name: Cap PR size (LoC)
@@ -218,13 +266,183 @@ jobs:
       contents: read
     steps:
       - name: Checkout PR head
+        # Skipped entirely on a bypassed run — see "Report the bypass" below.
+        if: env.PR_SIZE_BYPASS != 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
-          # Full history for all refs, so the base SHA and the merge-base
-          # three-dot diff resolve without a separate authenticated fetch.
-          fetch-depth: 0
+          # The head commit and its tree, nothing else. This used to be
+          # `fetch-depth: 0` for "full history for all refs", and on a large
+          # monorepo consumer that refspec — `+refs/heads/*:… +refs/tags/*:…`,
+          # every branch and every tag despite `--no-tags` — routinely ate the
+          # job's entire timeout budget before any size logic ran, and dominated
+          # the runs that did finish. The tool needs two commits, their merge
+          # base, and blob content either side of the diff; the next step
+          # fetches exactly that. (BE-8940)
+          fetch-depth: 1
+          # Deliberate, and load-bearing for the two-job security split in the
+          # header: this job holds a PR checkout, so no credential is left in
+          # `.git/config` for PR-authored content to sit next to. It is also why
+          # the fetch below carries its own single-process credential rather
+          # than relying on one surviving this step.
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Fetch the base commit and the merge-base history
+        # The other half of the fetch narrowing. `persist-credentials: false`
+        # above means there is nothing left to fetch with, and the consumer
+        # repos are private — which is also why a partial clone (`filter:
+        # blob:none`) is NOT the fix here: it would defer blob fetches to a
+        # point where no credential exists to make them, working on a public
+        # repo and failing on every private one.
+        if: env.PR_SIZE_BYPASS != 'true'
+        env:
+          # The job's own read-only token (`permissions: contents: read`).
+          FETCH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # One-shot credential. GIT_CONFIG_COUNT/KEY/VALUE applies
+          # http.extraheader to the git processes this step starts and nothing
+          # else: it is never written to `.git/config` (so the checkout's
+          # hardening still holds while the tool runs) and, unlike `git -c`, it
+          # never reaches argv where another process could read it. Masked
+          # because the base64 form is not the literal GITHUB_TOKEN the runner
+          # already masks, and git echoes request headers on some transport
+          # errors.
+          B64="$(printf 'x-access-token:%s' "$FETCH_TOKEN" | base64 | tr -d '\n')"
+          echo "::add-mask::${B64}"
+          # SCOPED to the server, exactly as `actions/checkout` writes
+          # `http.https://github.com/.extraheader`. An unscoped
+          # `http.extraheader` rides along on every request this step's git
+          # processes make, including a redirect to another host — git does not
+          # strip a header injected through config the way curl strips its own
+          # auth. Bounded (read-only token, origin is the only remote), but
+          # there is no reason to leave it unscoped.
+          export GIT_CONFIG_COUNT=1
+          SERVER_URL="${GITHUB_SERVER_URL:-https://github.com}"
+          export GIT_CONFIG_KEY_0="http.${SERVER_URL%/}/.extraheader"
+          export GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${B64}"
+
+          # Naming the two SHAs explicitly is the whole fix: the server walks
+          # these two commits and nothing else. GitHub allows fetching an
+          # arbitrary commit by SHA, and a fork PR's head is reachable in the
+          # base repo (refs/pull/N/head), so this covers forks too.
+          #
+          # Every rung's failure is recorded rather than discarded. Without this
+          # the ladder degrades so thoroughly that a PERMANENT problem — a
+          # force-pushed and GC'd base SHA, a pruned fork PR ref, a token that
+          # cannot read the repo — is silently relabelled as a merge-base
+          # problem by the error at the bottom of this step, sending the reader
+          # to the wrong place. A transient 5xx still degrades exactly as
+          # before; only the final message changes.
+          LAST_FETCH_ERR=''
+          fetch() {
+            local out
+            if out="$(git fetch --no-tags --no-recurse-submodules --quiet "$@" origin "$BASE_SHA" "$HEAD_SHA" 2>&1)"; then
+              # Cleared on success so the variable means "the LAST fetch failed",
+              # not "some fetch failed once" — a rung that failed and then
+              # recovered must not relabel a genuine merge-base failure below.
+              LAST_FETCH_ERR=''
+              return 0
+            fi
+            # Last line only: git can echo the request (headers included) on a
+            # transport error, and the whole point is a one-line attribution.
+            # The base64 credential is ::add-mask::ed above, so a leak through
+            # this path is masked either way.
+            LAST_FETCH_ERR="$(printf '%s' "$out" | tail -n 1)"
+            # Capturing stderr must not cost the log the failure itself. Plain
+            # stderr, not ::warning::, so a transient rung does not annotate a
+            # check that goes on to succeed.
+            printf 'git fetch %s failed: %s\n' "$*" "$LAST_FETCH_ERR" >&2
+            return 1
+          }
+          is_shallow() { [ "$(git rev-parse --is-shallow-repository)" = "true" ]; }
+
+          # A merge base read off a SHALLOW graph can be WRONG, not merely
+          # missing: grafted boundary commits look parentless, so while the true
+          # fork point is still hidden `git merge-base` will happily return an
+          # older common ancestor that some other path does reach — a long-lived
+          # branch rooted before the fork point and merged into the base branch
+          # recently is enough. The tool would then diff from there and count
+          # every base-branch change in between, reddening a small PR with no
+          # error to explain it. `fetch-depth: 0` could not produce that false
+          # positive, so the narrowing must not either.
+          #
+          # An answer is trustworthy once every shallow boundary this walk can
+          # reach is itself an ancestor of that answer: everything the graft
+          # hides is then OLDER than the merge base, and a better (newer) common
+          # ancestor cannot be hiding in it. Where that is not provable this
+          # returns false and the ladder deepens — worst case all the way to the
+          # complete-history fallback, which is the correct answer and still
+          # only these two commits' worth of history.
+          #
+          # Asked in ONE pass rather than three `merge-base --is-ancestor` calls
+          # per boundary line: `rev-list BASE HEAD --not mb` IS the set of
+          # commits this walk reaches that are not ancestors of `mb`, so a
+          # shallow boundary appearing in it is exactly a boundary that is
+          # inside the walk and not covered by `mb` — the same predicate the
+          # per-boundary loop computed, with the boundary count out of the
+          # subprocess budget.
+          have_merge_base() {
+            local mb shallow_file reachable_beyond_mb
+            mb="$(git merge-base "$BASE_SHA" "$HEAD_SHA" 2>/dev/null)" || return 1
+            is_shallow || return 0
+            shallow_file="$(git rev-parse --git-path shallow)"
+            # -s, not -f: an empty shallow file would make `grep -f` match
+            # nothing anyway, but the early return keeps the intent explicit.
+            [ -s "$shallow_file" ] || return 0
+            reachable_beyond_mb="$(git rev-list "$BASE_SHA" "$HEAD_SHA" --not "$mb" 2>/dev/null)" || return 1
+            if printf '%s\n' "$reachable_beyond_mb" | grep -qxF -f "$shallow_file"; then
+              return 1
+            fi
+            return 0
+          }
+
+          # The first rung is mandatory, but no more fatal than the deepen
+          # rungs below it: under `set -e` a transient network or 5xx failure
+          # here would exit the step and redden a consumer's check, when a retry
+          # — or the fallback further down, which fetches the same two SHAs —
+          # recovers. Retry once, then let the ladder carry it.
+          fetch --depth=100 || { sleep 3; fetch --depth=100; } || true
+
+          # Deepen until the merge base is reachable. The distance to the fork
+          # point is unknown — a monorepo's base branch can be far ahead of it —
+          # and a shallow graft hides the ancestry `merge-base` walks, so guessing
+          # one depth is not an option. Each rung is incremental, so the cost is
+          # the depth actually needed rather than the sum of the rungs, and the
+          # loop stops the moment the repo stops being shallow (deepening past
+          # the root cannot help).
+          for extra in 400 1600 6400; do
+            have_merge_base && break
+            is_shallow || break
+            # A rung that errors is NOT fatal — and must not skip the rest of
+            # the ladder either. `continue` retries at the next depth; only a
+            # genuinely exhausted ladder should reach the fallback below, which
+            # is the most expensive git operation in this step and runs inside
+            # a 5-minute budget on the very monorepos this change speeds up.
+            fetch "--deepen=${extra}" || continue
+          done
+
+          # Last resort: complete history — but still only for these two
+          # commits, which is the part `fetch-depth: 0` got wrong. `--unshallow`
+          # refuses to run on an already-complete repo, hence the guard.
+          if ! have_merge_base && is_shallow; then
+            fetch --unshallow || fetch --depth=2147483647 || true
+          fi
+
+          # Hard-fail rather than let the tool report `could not resolve merge
+          # base` from three steps away — or, worse, count a diff from a merge
+          # base the shallow graph cannot vouch for.
+          if ! have_merge_base; then
+            if [ -n "$LAST_FETCH_ERR" ]; then
+              echo "::error::could not fetch the history of ${BASE_SHA} and ${HEAD_SHA} — the last git fetch failed: ${LAST_FETCH_ERR}. A base SHA that was force-pushed and garbage-collected, a pruned fork PR ref, or a token without read access all land here; this is a fetch failure, not a merge-base one."
+            else
+              echo "::error::could not resolve a trustworthy merge base of ${BASE_SHA} and ${HEAD_SHA} after fetching both commits' history"
+            fi
+            exit 1
+          fi
 
       - name: Require a pinned workflows_ref
         # workflows_ref has no default on purpose. GitHub does NOT enforce
@@ -254,6 +472,12 @@ jobs:
         # The tool comes from THIS workflow's repo (public, pinned via
         # workflows_ref) — never from the PR checkout, so no PR-authored code
         # runs in this job.
+        #
+        # The `Require a pinned workflows_ref` guard above stays UNCONDITIONAL
+        # on purpose: a caller that forgot the pin is misconfigured whether or
+        # not this particular PR happens to carry the bypass label, and the
+        # guard is a shell test that costs nothing.
+        if: env.PR_SIZE_BYPASS != 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: Comfy-Org/github-workflows
@@ -262,6 +486,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Go
+        if: env.PR_SIZE_BYPASS != 'true'
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
         with:
           go-version-file: _pr_size_tool/scripts/check-pr-size/go.mod
@@ -269,6 +494,7 @@ jobs:
           cache: false
 
       - name: Build check-pr-size
+        if: env.PR_SIZE_BYPASS != 'true'
         env:
           # The tool is checked out into `_pr_size_tool/` UNDER the consumer
           # repo's checkout, so `go build` discovers that repo's root `go.work`
@@ -290,6 +516,7 @@ jobs:
 
       - name: Check PR size
         id: check
+        if: env.PR_SIZE_BYPASS != 'true'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -298,6 +525,43 @@ jobs:
           "${RUNNER_TEMP}/check-pr-size" \
             --base "${BASE_SHA}" \
             --head "${HEAD_SHA}" | tee "${RUNNER_TEMP}/pr-size-report.md"
+
+      - name: Report the bypass
+        # The whole of the bypassed path. With the label present the verdict is
+        # a foregone conclusion, so every step above is skipped and this writes
+        # the artifacts they would have produced.
+        #
+        # It MUST write pr-size-report.md AND both flag files, not just exit
+        # green: the `comment` job bails out on an empty report artifact and
+        # leaves any existing sticky comment untouched, so a PR that was red and
+        # then got bypass-labelled would keep its stale red comment forever —
+        # strictly worse than paying for the full run. Writing the report is
+        # what flips that comment to ✅.
+        #
+        # Deliberate tradeoff: this report carries no line count. Recovering one
+        # means the checkout, the build and the diff this step exists to skip.
+        if: env.PR_SIZE_BYPASS == 'true'
+        env:
+          BYPASS_LABEL: ${{ inputs.bypass_label }}
+        run: |
+          set -euo pipefail
+          # Same heading and bullet as the tool's own bypassed report, so the
+          # sticky comment reads identically whichever path produced it.
+          {
+            printf '## ✅ Passed — PR size check\n\n'
+            printf -- '- Bypassed via `%s` label ✅\n\n' "${BYPASS_LABEL}"
+            printf 'The size check was skipped before any checkout, so no line count was computed. Remove the `%s` label to get the counted report back.\n' "${BYPASS_LABEL}"
+          } > "${RUNNER_TEMP}/pr-size-report.md"
+          # The step summary is the surface that survives with no bot
+          # credentials (fork and Dependabot PRs), so the bypassed report has to
+          # reach it too.
+          cat "${RUNNER_TEMP}/pr-size-report.md" >> "${GITHUB_STEP_SUMMARY}"
+          # Written explicitly rather than left absent: the comment job reads
+          # these to decide whether to POST a new comment, and `false` is the
+          # answer that flips an existing one without spawning one on a PR that
+          # never had it.
+          printf 'false' > "${RUNNER_TEMP}/pr-size-over-cap"
+          printf 'false' > "${RUNNER_TEMP}/pr-size-tests-decisive"
 
       - name: Annotate a decisive test exclusion
         # An annotation is the ONE carrier that needs no bot credentials, so it
@@ -333,7 +597,12 @@ jobs:
         # only because test lines were excluded. Without it no comment posts
         # there, and the excluded total would be visible only in this job's step
         # summary — hiding the number in exactly the case it exists for.
-        if: always()
+        #
+        # Not on the bypassed path: `Report the bypass` already wrote both flags
+        # and `steps.check` never ran, so letting this overwrite them with the
+        # empty strings of a skipped step's outputs would only make the files
+        # less legible.
+        if: always() && env.PR_SIZE_BYPASS != 'true'
         env:
           OVER_CAP: ${{ steps.check.outputs.over_cap }}
           TESTS_DECISIVE: ${{ steps.check.outputs.tests_decisive }}
@@ -368,8 +637,15 @@ jobs:
   comment:
     name: Comment when oversize
     needs: pr-size
-    # always(): the interesting case is exactly when pr-size failed.
-    if: always() && inputs.comment && needs.pr-size.result != 'cancelled' && needs.pr-size.result != 'skipped'
+    # `!cancelled()`, not `always()`: the interesting case is exactly when
+    # pr-size FAILED, so `success()` is wrong — but `always()` also runs the job
+    # when the RUN was cancelled, and `needs.pr-size.result != 'cancelled'` only
+    # catches cancellation that lands while `pr-size` is still going. A run
+    # superseded after its `pr-size` job already finished would otherwise still
+    # publish its stale report over the newer one, which is the whole point of
+    # the concurrency group above. Same spelling `cursor-review.yml` uses for
+    # this hazard.
+    if: ${{ !cancelled() && inputs.comment && needs.pr-size.result != 'cancelled' && needs.pr-size.result != 'skipped' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

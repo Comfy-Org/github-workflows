@@ -87,6 +87,49 @@ enforce.
 alone does not mention `oversized-ok`; the sticky comment is what tells an author
 the escape hatch exists. Supply the App or expect confused authors.
 
+**A bypassed run reports no line count.** With the bypass label present the job
+short-circuits: it skips both checkouts, the Go setup and the tool build, and
+writes a "Bypassed via `oversized-ok` ✅" report directly — so it costs seconds
+instead of minutes, and the sticky comment on a PR that was red flips to ✅ as
+soon as the label lands. What you give up is the number: the report says the
+check was bypassed, not "1500 counted / 1000 cap", because nothing counted the
+lines. Remove the label to get the counted report back.
+
+**Size runs are serialized per PR, newest wins — and the group is the reusable
+workflow's, not yours.** `pr-size.yml` declares a workflow-level `concurrency`
+group, `pr-size-reusable-<PR number>`, with `cancel-in-progress: true`, so a new
+commit — or adding/removing the bypass label — cancels the run still in flight.
+That is what keeps the seconds-long bypassed run from being overwritten by a
+minutes-long counted run that started first and finishes last, leaving a stale
+red comment on a PR that is now labelled. A cancelled run posts nothing. Two
+consequences for your caller:
+
+- **Do not declare that group name yourself.** A caller holding the same group
+  while its reusable `uses:` job waits to acquire it deadlocks the run until it
+  times out. Serialization lives in the reusable; stay out of it. (Unlike
+  `pr-risk.yml`, which has no group of its own and asks callers to add one.)
+- **Call it from a dedicated workflow file, not as one job of a larger
+  `ci.yml`.** Cancellation is run-scoped, so a label event on the PR cancels the
+  whole run — including jobs that have nothing to do with the size cap.
+
+**Consider gating on the label name.** GitHub cannot filter `labeled`/`unlabeled`
+triggers by label, so with the caller below *any* label event — including an
+auto-labeler such as `pr-area-label.yml` — starts a fresh size run and cancels
+the counted one in flight, re-paying the fetch. Only the bypass label changes the
+verdict, so skipping the rest costs nothing:
+
+```yaml
+jobs:
+  pr-size:
+    if: >-
+      !contains(fromJSON('["labeled","unlabeled"]'), github.event.action)
+      || github.event.label.name == 'oversized-ok'
+    uses: Comfy-Org/github-workflows/.github/workflows/pr-size.yml@<sha>  # v1
+```
+
+Match the label name to your `bypass_label` if you have overridden it. Leaving
+the guard off is safe, just wasteful.
+
 **`exclude_tests` is a naming convention, not a proof.** Unlike the
 generated-file rules — which require Go's marker *before* the package clause,
 and read `.gitattributes` from the base ref precisely so a PR cannot exempt
