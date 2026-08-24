@@ -163,6 +163,27 @@ _PORT = r"(?::\d*)?"
 # be; a port typed in another script's digits is likewise a spelling no client
 # resolves. (BE-8729 review.)
 _HOST_FLAGS = re.IGNORECASE | re.ASCII
+# A left anchor for a pattern that gates a SUPPRESSION rather than a detection.
+# `_HOST_L` bars only a preceding DNS-label character, which is the right trade
+# when over-matching costs an extra finding; when over-matching SILENCES one it
+# is fail-open, because `_`, a non-ASCII letter and `/` all satisfy it and each
+# is a way to write a host that is not the one intended (`evil_huggingface.co`,
+# an IDN neighbour, `internal.example/mirror/hf.co/`).
+#
+# This says the opposite thing: the character before the match must be a
+# DELIMITER -- whitespace, a quote, a bracket, or one of the few punctuation
+# marks a URL is embedded after in prose, markup and config -- or the match must
+# be at the start of the line. Written as a negated class inside a negative
+# lookbehind so it stays fixed-width (Python requires that) and so start-of-line
+# succeeds for free. `/` is deliberately NOT a delimiter, which is what stops a
+# path segment from passing as an authority; the scheme separator is instead
+# CONSUMED by the optional `(?:(?:https?:)?//)?` at the use site, so
+# `https://`, `http://` and protocol-relative `//` all still anchor.
+#
+# Under `re.ASCII` (see `_HOST_FLAGS`) `\s` is ASCII whitespace only, so a URL
+# preceded by U+00A0 does not match and the reference is REPORTED -- the
+# fail-closed direction, unlike every gap `_HOST_L` leaves.
+_AUTHORITY_L = r"""(?<![^\s"'`(\[{<>,;=|*])"""
 INTERNAL_MARKER_RES = (
     re.compile(_HOST_L + r"notion\.(so|site)" + _PORT + "/", _HOST_FLAGS),
     re.compile(_HOST_L + r"slack\.com" + _PORT + "/(archives|client)/", _HOST_FLAGS),
@@ -418,25 +439,54 @@ REPO_REF_RE = re.compile(r"(?<![A-Za-z0-9_])(?i:Comfy-Org)/([A-Za-z0-9_.-]+)")
 #
 # RESIDUAL AMBIGUITY, accepted: a `huggingface.co/Comfy-Org/<private-github-repo>`
 # URL now clears, so a name can be hidden behind a host prefix that does not
-# resolve to it. This is the same trade the npm-scope crossing below already
-# makes and for the same reason -- the guard is against an accidental paste, and
-# a fake URL naming a private repo is not one, while re-denying here restores
-# the false-positive class this exists to fix. It is NOT the homoglyph case:
-# nothing here renders as something else on github.com.
+# resolve to it. The npm-scope crossing below rests on the same reasoning --
+# the guard is against an accidental paste, and a deliberately fabricated URL
+# naming a private repo is not one, while re-denying here restores the
+# false-positive class this exists to fix -- but it is a NARROWER exception,
+# and a future reader adding the next host should size this one honestly. That
+# crossing still requires the name to be in `PUBLIC_COMFY_ORG_REPOS`; this
+# branch skips BEFORE any allowlist test, so it clears an arbitrary name. What
+# holds the line here is the HOST anchor, not the name: it has to be a real
+# model host reached through a real URL authority (see `_AUTHORITY_L`), which
+# is what keeps the widening to a shape nobody pastes by accident. It is NOT
+# the homoglyph case: nothing here renders as something else on github.com.
 #
-# Built from the same `_HOST_L` / `_PORT` / `_HOST_FLAGS` primitives as
-# `INTERNAL_MARKER_RES`, so the DNS-label boundary, the empty-port bypass and
-# the `re.ASCII` scoping are the ones already reasoned about and pinned by tests
-# up there, not a second set. `hf.co` is Hugging Face's own short domain, not a
-# lookalike. The optional path segments are the spellings that put an owner
-# straight after them (`/api/models/<owner>/`, `/datasets/<owner>/`); they are
-# greedy, so on `huggingface.co/models/Comfy-Org/x` the match ends exactly where
-# `Comfy-Org` starts, which is the offset the caller compares against.
+# The left anchor is `_AUTHORITY_L`, NOT the `_HOST_L` that `INTERNAL_MARKER_RES`
+# uses, and the difference is the whole reason it exists. `_HOST_L` is a DNS-label
+# lookbehind tuned for DETECTION, where over-matching only costs one extra
+# finding; here it would gate a SUPPRESSION, where over-matching silences one, so
+# every gap it documents as an accepted trade flips from fail-safe to FAIL-OPEN.
+# It bars neither `_`, nor a non-ASCII character, nor `/`, so under it
+# `https://evil_huggingface.co/Comfy-Org/<private>`,
+# `https://ehuggingface.co/Comfy-Org/<private>` spelled with a leading non-ASCII
+# letter, and `https://internal.example/mirror/hf.co/Comfy-Org/<private>` would
+# all have cleared. A suppression has to be anchored to an actual URL AUTHORITY,
+# which is what `_AUTHORITY_L` plus the optional scheme below is: the host either
+# follows a scheme separator, or starts a token.
+#
+# `_PORT` and `_HOST_FLAGS` ARE the primitives from up there -- the empty-port
+# bypass and the `re.ASCII` host scoping are the ones already reasoned about and
+# pinned by tests. `hf.co` is Hugging Face's own short domain, not a lookalike.
+#
+# The path segments are the spellings that put an OWNER straight after them, and
+# each one is a real Hugging Face route: `/<owner>/`, `/models|datasets|spaces/
+# <owner>/`, `/collections/<owner>/` and the API's `/api/models|datasets|spaces/
+# <owner>/`. `api/` is therefore NOT optional on its own -- HF routes no
+# `/api/<owner>/`, and admitting it would widen a default-deny exception past
+# any URL that resolves. They are wrapped in `(?-i:...)` because `_HOST_FLAGS`'s
+# `re.IGNORECASE` is there for the HOST, where DNS really is case-insensitive,
+# and it reaches the path too: HF route segments are case-SENSITIVE, so an
+# unscoped flag cleared `/MODELS/` and `/Datasets/`, spellings that resolve
+# nowhere. Both narrowings fail CLOSED (the reference is reported), which is the
+# direction this checker's default-deny wants. The segments are greedy, so on
+# `huggingface.co/models/Comfy-Org/x` the match ends exactly where `Comfy-Org`
+# starts, which is the offset the caller compares against.
 MODEL_HOST_PREFIX_RE = re.compile(
-    _HOST_L
+    _AUTHORITY_L
+    + r"(?:(?:https?:)?//)?"
     + r"(?:huggingface\.co|hf\.co)"
     + _PORT
-    + r"/(?:api/)?(?:models/|datasets/|spaces/)?",
+    + r"/(?:(?:(?-i:api)/)?(?-i:models|datasets|spaces|collections)/)?",
     _HOST_FLAGS,
 )
 
@@ -1286,15 +1336,24 @@ def _file_findings(rel, text, ticket_allowlist):
         owner_span = (
             _codeowners_owner_span(line, lineno) if is_codeowners else None
         )
-        # Per LINE for the same reason as `owner_span`: the alternative is
-        # searching backwards from every match, which is O(line) per match and
-        # so quadratic on the one `MAX_FILE_BYTES` line this has to survive.
         # Offsets where a model-host URL prefix ENDS are exactly the offsets a
         # `Comfy-Org/` match may START at and not be a github.com reference.
-        model_host_ends = frozenset(
-            m.end() for m in MODEL_HOST_PREFIX_RE.finditer(line)
-        )
+        # Computed at most once per LINE for the same reason as `owner_span`:
+        # the alternative is searching backwards from every match, which is
+        # O(line) per match and so quadratic on the one `MAX_FILE_BYTES` line
+        # this has to survive. Deferred until a first `Comfy-Org/` match exists,
+        # because it is the one derived structure on this path with no cap --
+        # on the 5 MiB single line `MAX_FILE_BYTES` deliberately admits, a line
+        # of repeated `hf.co/` yields ~870k end offsets and a set of ints that
+        # large is tens of MB of runner memory. Almost no line has a match, so
+        # the common case now allocates nothing at all; when one does, the scan
+        # still runs exactly once.
+        model_host_ends = None
         for match in REPO_REF_RE.finditer(line):
+            if model_host_ends is None:
+                model_host_ends = frozenset(
+                    m.end() for m in MODEL_HOST_PREFIX_RE.finditer(line)
+                )
             # See `MODEL_HOST_PREFIX_RE`: a different namespace, not a leak.
             # Checked before the homoglyph branch below, because that branch's
             # remedy ("rewrite the name in ASCII") is wrong advice for a model

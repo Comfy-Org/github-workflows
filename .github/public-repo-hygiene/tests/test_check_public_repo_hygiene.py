@@ -734,17 +734,79 @@ class RepoReferenceCategoryTest(CheckerTestCase):
         self.assertEqual(self.findings(), [])
 
     def test_model_host_spellings_that_put_an_owner_after_a_path_segment(self):
-        # `hf.co` is Hugging Face's own short domain, and the API and
-        # datasets/spaces routes put the owner one segment further along. All
-        # four have to end exactly where `Comfy-Org` starts or the skip misses.
+        # `hf.co` is Hugging Face's own short domain, and the API, collections
+        # and datasets/spaces routes put the owner one segment further along.
+        # Every one has to end exactly where `Comfy-Org` starts or the skip
+        # misses. `collections/` is an owner-first route like the others, and
+        # omitting it left those URLs reporting as GitHub-repo leaks -- the
+        # same false-positive class this change exists to remove.
         self.repo.write(
             "notes.md",
             "https://hf.co/Comfy-Org/ace_step_1.5_ComfyUI_files\n"
             "https://huggingface.co/api/models/Comfy-Org/Qwen-Image_ComfyUI\n"
             "https://huggingface.co/datasets/Comfy-Org/some-eval-set\n"
-            "https://huggingface.co/spaces/Comfy-Org/some-demo\n",
+            "https://huggingface.co/spaces/Comfy-Org/some-demo\n"
+            "https://huggingface.co/collections/Comfy-Org/some-set-abc123\n",
         )
         self.assertEqual(self.findings(), [])
+
+    def test_model_host_url_shapes_that_still_anchor(self):
+        # `_AUTHORITY_L` requires a delimiter or start-of-line before the
+        # match, and the scheme separator is consumed rather than tolerated --
+        # so these ordinary embeddings have to keep clearing.
+        self.repo.write(
+            "notes.md",
+            "http://huggingface.co/Comfy-Org/plain-http\n"
+            "//huggingface.co/Comfy-Org/protocol-relative\n"
+            "huggingface.co/Comfy-Org/bare-host-at-line-start\n"
+            "See [weights](https://hf.co/Comfy-Org/in-a-markdown-link) here\n"
+            "<https://hf.co/Comfy-Org/in-angle-brackets>\n"
+            'url="https://hf.co/Comfy-Org/in-double-quotes"\n'
+            "https://HuggingFace.co:443/Comfy-Org/host-case-and-port\n",
+        )
+        self.assertEqual(self.findings(), [])
+
+    def test_a_path_segment_is_not_a_url_authority(self):
+        # The skip gates a SUPPRESSION, so its left anchor is `_AUTHORITY_L`,
+        # not the detection-side `_HOST_L`: under `_HOST_L` a model host
+        # appearing as a PATH segment of some other host satisfied the
+        # lookbehind (`/` is not a DNS-label character) and silenced the
+        # reference. Only a real authority may clear one.
+        self.repo.write(
+            "README.md",
+            "https://internal.example/mirror/hf.co/Comfy-Org/"
+            "some-internal-thing\n",
+        )
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("some-internal-thing", findings[0])
+
+    def test_an_api_route_without_a_resource_segment_is_not_a_model_host(self):
+        # Hugging Face routes `/api/{models,datasets,spaces}/<owner>`, never
+        # `/api/<owner>`, so pairing `api/` with a required resource segment
+        # keeps the exception inside URLs that actually resolve.
+        self.repo.write(
+            "README.md",
+            "https://huggingface.co/api/Comfy-Org/some-internal-thing\n",
+        )
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("some-internal-thing", findings[0])
+
+    def test_model_host_path_segments_are_case_sensitive(self):
+        # `_HOST_FLAGS`'s `re.IGNORECASE` is there for the HOST, where DNS
+        # really is case-insensitive, and it reaches the path too. HF route
+        # segments are case-SENSITIVE, so `(?-i:...)` scopes the flag back off
+        # and these spellings -- which resolve nowhere -- no longer clear.
+        self.repo.write(
+            "README.md",
+            "https://huggingface.co/MODELS/Comfy-Org/upper-case-route\n"
+            "https://huggingface.co/Datasets/Comfy-Org/title-case-route\n",
+        )
+        findings = self.findings()
+        self.assertEqual(len(findings), 2, findings)
+        self.assertIn("upper-case-route", " ".join(findings))
+        self.assertIn("title-case-route", " ".join(findings))
 
     def test_model_host_skip_does_not_reach_github_on_the_same_line(self):
         # The skip is keyed on the offset the model-host prefix ENDS at, not on
@@ -761,16 +823,27 @@ class RepoReferenceCategoryTest(CheckerTestCase):
         self.assertNotIn("some-model", findings[0])
 
     def test_a_model_host_lookalike_does_not_get_the_skip(self):
-        # `_HOST_L` is the same DNS-label boundary `INTERNAL_MARKER_RES` uses:
-        # `evil-huggingface.co` is a different registrable name, so a reference
-        # hidden behind one is still a finding.
-        self.repo.write(
-            "README.md",
-            "https://evil-huggingface.co/Comfy-Org/some-internal-thing\n",
-        )
-        findings = self.findings()
-        self.assertEqual(len(findings), 1, findings)
-        self.assertIn("some-internal-thing", findings[0])
+        # A different registrable name is not the model host, so a reference
+        # hidden behind one is still a finding. All three spellings are
+        # covered, not just the hyphen: `_` and a non-ASCII leading letter both
+        # satisfied the detection-side `_HOST_L` lookbehind this used to reuse,
+        # which is exactly how a suppression gated on it failed OPEN. Pinning
+        # only `evil-huggingface.co` read as lookalike coverage it did not have.
+        for host in (
+            "evil-huggingface.co",
+            "evil_huggingface.co",
+            "\u00e9huggingface.co",
+            "evil-hf.co",
+            "hf.co.evil.example",
+        ):
+            with self.subTest(host=host):
+                self.repo.write(
+                    "README.md",
+                    f"https://{host}/Comfy-Org/some-internal-thing\n",
+                )
+                findings = self.findings()
+                self.assertEqual(len(findings), 1, findings)
+                self.assertIn("some-internal-thing", findings[0])
 
     def test_a_bare_name_is_not_cleared_by_a_model_host_elsewhere(self):
         # Default-deny is unchanged for the spelling that actually leaks: a
