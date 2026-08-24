@@ -1423,6 +1423,69 @@ class NonGitHubHostReferenceTest(CheckerTestCase):
         self.repo.write("README.md", "docs/v1.2/Comfy-Org/some-internal-thing\n")
         self.assertEqual(len(self.findings()), 1, self.findings())
 
+    def test_a_path_segment_spelled_like_the_host_does_not_silence_it(self):
+        # BE-8910 review. `_HOST_L`, the category-2 anchor this originally
+        # reused, is satisfied by `/`, so a path SEGMENT spelled like the host
+        # read as the host and silenced a default-deny finding whose real
+        # authority is `evil.example`. The anchor for a SUPPRESSOR has to
+        # require the authority position; a detector's anchor fails open here.
+        self.repo.write(
+            "README.md",
+            "https://evil.example/huggingface.co/Comfy-Org/some-internal-thing\n",
+        )
+        self.assertEqual(len(self.findings()), 1, self.findings())
+
+    def test_a_doubled_path_separator_does_not_silence_the_reference(self):
+        # The `//` that begins a scheme-relative authority also occurs INSIDE a
+        # path; only the second one is an authority.
+        self.repo.write(
+            "README.md",
+            "https://evil.example//huggingface.co/Comfy-Org/some-internal-thing\n",
+        )
+        self.assertEqual(len(self.findings()), 1, self.findings())
+
+    def test_a_subdomain_of_the_host_does_not_silence_the_reference(self):
+        # BE-8910 review, the other half: `_HOST_L` is satisfied by `.` too, so
+        # any `<label>.huggingface.co` cleared. `myhuggingface.co` was already
+        # pinned above; this is the dotted spelling of the same hole.
+        self.repo.write(
+            "README.md",
+            "https://evil.huggingface.co/Comfy-Org/some-internal-thing\n",
+        )
+        self.assertEqual(len(self.findings()), 1, self.findings())
+
+    def test_a_label_over_a_path_segment_host_link_is_still_flagged(self):
+        # The label shape runs the SAME host test against the link target, so
+        # the tightened anchor has to hold on that path as well: two findings,
+        # the label and the target's own copy.
+        self.repo.write(
+            "gallery.md",
+            "[Comfy-Org/some-internal-thing]"
+            "(https://evil.example/huggingface.co/Comfy-Org/some-internal-thing)\n",
+        )
+        self.assertEqual(len(self.findings()), 2, self.findings())
+
+    def test_scheme_relative_and_bare_spellings_still_clear(self):
+        # The tightening must not cost the real spellings that have no scheme:
+        # a protocol-relative URL, and a bare host starting a token.
+        self.repo.write(
+            "README.md",
+            "//huggingface.co/Comfy-Org/a-model\n"
+            "See huggingface.co/Comfy-Org/a-model for weights.\n"
+            '"huggingface.co/Comfy-Org/a-model"\n',
+        )
+        self.assertEqual(self.findings(), [])
+
+    def test_a_userinfo_prefixed_host_is_a_known_non_clearing_spelling(self):
+        # `https://user@huggingface.co/...` really does have the allowlisted
+        # host, and is NOT cleared: `@` is in the reject class. Pinned as the
+        # deliberate safe-direction miss it is, not as a claim about the host.
+        self.repo.write(
+            "README.md",
+            "https://user@huggingface.co/Comfy-Org/some-internal-thing\n",
+        )
+        self.assertEqual(len(self.findings()), 1, self.findings())
+
     def test_a_huggingface_link_does_not_clear_a_later_bare_reference(self):
         # The prefix test is anchored at the START of the match, so a host
         # earlier on the line cannot reach across whitespace to silence a bare

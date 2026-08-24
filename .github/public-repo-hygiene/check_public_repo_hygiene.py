@@ -447,16 +447,56 @@ _NON_GITHUB_HOST_PATH_PREFIXES = (
     "api/datasets/",
     "api/spaces/",
 )
-# Same DNS-label anchoring as the category-2 host patterns (`_HOST_L`, `_PORT`,
-# `_HOST_FLAGS`, all from BE-8729 -- reused rather than re-derived, per that
-# ticket's coordination note), and for the same reason: `myhuggingface.co/` is a
-# different registrable name and must NOT silence the reference. Anchored on the
-# RIGHT with `\Z`, which the caller pins to the start of the match, so the host
-# (plus at most one enumerated path prefix) has to sit IMMEDIATELY before the
-# org segment -- a `huggingface.co` link earlier in the line cannot reach across
-# to a later bare reference.
+# The left anchor is NOT `_HOST_L`, and the difference is the whole point.
+#
+# `_HOST_L` (`(?<![A-Za-z0-9-])`) was written for the category-2 patterns, which
+# DETECT: there, matching more than the exact host over-flags, and over-flagging
+# is the safe direction for a leak guard. This pattern SUPPRESSES, so the same
+# looseness fails OPEN -- `_HOST_L` is satisfied by `.` and by `/`, so both
+# `evil.huggingface.co/Comfy-Org/x` (a subdomain, not the host) and
+# `https://evil.example/huggingface.co/Comfy-Org/x` (a path SEGMENT spelled like
+# the host) would have silenced a default-deny finding. An anchor is only as
+# reusable as its polarity. (BE-8910 review.)
+#
+# So the host has to be the URL's AUTHORITY, in one of the three ways an
+# authority can begin:
+#   `(?<=://)`            an absolute URL -- the scheme's own `//`.
+#   `(?<=//)(?<!.//)`     scheme-relative `//huggingface.co/...`, where the
+#                         negative lookbehind (a URL-character class, so it is
+#                         fixed-width) is what keeps a doubled separator INSIDE
+#                         a path (`evil.example//huggingface.co/...`) out.
+#   `(?<![...])`          a bare `huggingface.co/Comfy-Org/x`, which has to
+#                         START a token: the class holds every character that
+#                         could continue a host label (`myhuggingface.co`,
+#                         `evil.huggingface.co`) or a path segment
+#                         (`evil.example/huggingface.co`), so a real bare
+#                         spelling -- line start, after whitespace, a quote, a
+#                         bracket -- still clears.
+# `@` is in the reject class, so `https://user@huggingface.co/...` is NOT
+# cleared even though its host really is the allowlisted one: that is the safe
+# direction, no corpus instance exists, and admitting `@` here would mean
+# reasoning about userinfo splits on the left as well as the right.
+#
+# `_PORT` and `_HOST_FLAGS` ARE still shared with category 2 (per BE-8729's
+# coordination note) -- their semantics do not depend on polarity.
+#
+# Anchored on the RIGHT with `\Z`, which the caller pins to the start of the
+# match, so the host (plus at most one enumerated path prefix) has to sit
+# IMMEDIATELY before the org segment -- a `huggingface.co` link earlier in the
+# line cannot reach across to a later bare reference.
+# Characters that continue a host label or a path segment. `/` is deliberately
+# absent from the first spelling and present in the second: a `/` before the
+# host is exactly what the `//` alternatives above are there to adjudicate.
+_URL_TOKEN_CHARS = r"A-Za-z0-9._~%@:+-"
+_NON_GITHUB_HOST_AUTHORITY_L = (
+    r"(?:"
+    r"(?<=://)"
+    r"|(?<=//)(?<![" + _URL_TOKEN_CHARS + r"]//)"
+    r"|(?<![" + _URL_TOKEN_CHARS + r"/])"
+    r")"
+)
 _NON_GITHUB_HOST_PREFIX_RE = re.compile(
-    _HOST_L
+    _NON_GITHUB_HOST_AUTHORITY_L
     + "(?:"
     + "|".join(re.escape(h) for h in NON_GITHUB_ORG_NAMESPACE_HOSTS)
     + ")"

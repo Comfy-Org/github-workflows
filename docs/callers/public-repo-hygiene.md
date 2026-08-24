@@ -141,9 +141,10 @@ through one of the fixed segments Hugging Face interposes (`datasets/`, `spaces/
 `[Comfy-Org/<model>](https://huggingface.co/Comfy-Org/<model>)`, clears too, because there the bare
 token is link text rather than a path. Everything else is exactly as strict as before: a bare
 `Comfy-Org/<name>`, a `github.com/Comfy-Org/<name>`, any unrecognised host, a lookalike host
-(`myhuggingface.co/…`), a userinfo spelling whose real host is elsewhere
+(`myhuggingface.co/…`), a subdomain (`evil.huggingface.co/…`), a path segment that merely reads
+like the host (`evil.example/huggingface.co/…`), a userinfo spelling whose real host is elsewhere
 (`huggingface.co@evil.example/…`), and a label naming a *different* repo than its link all stay
-findings. The host list is deliberately short rather than "anything that is not github.com"; if
+findings — the host has to sit in the URL's **authority** position, not just somewhere to the left. The host list is deliberately short rather than "anything that is not github.com"; if
 another non-GitHub host starts publishing under the org name, that is a one-line addition to
 `NON_GITHUB_ORG_NAMESPACE_HOSTS` in the checker, in the same PR-against-this-repo way a new public
 repo name is added — not a caller input, for the same reason the allowlists are not.
