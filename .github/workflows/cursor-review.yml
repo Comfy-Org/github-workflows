@@ -1223,6 +1223,13 @@ jobs:
     needs: [gate, diff-size, preflight, ledger]
     if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true'
     runs-on: ubuntu-latest
+    # COUPLED to `consolidate` below — bump this and you must bump those too.
+    # The judge reads all 8 of this panel's artifacts at the same reasoning
+    # tier, so it needs at least a cell's budget: its `Run judge` step cap
+    # tracks THIS number, and its job cap sits above the step so a hung judge
+    # trips the step (degraded fallback still posts) rather than the job (all
+    # 8 cells discarded). Letting this cap outgrow them recreates exactly the
+    # silent skew that fix was for.
     timeout-minutes: 30
     permissions:
       contents: read
@@ -1500,17 +1507,28 @@ jobs:
     needs: [gate, diff-size, preflight, review, ledger]
     if: always() && needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true' && needs.review.result != 'skipped'
     runs-on: ubuntu-latest
-    # At least the `review` cap above, never under it. The judge reads all 8
-    # cell artifacts with the same top reasoning tier one cell uses, so it is
-    # the strictly harder call — yet at 15m it was capped at HALF the panel it
+    # ABOVE the `review` cap, never under it. The judge reads all 8 cell
+    # artifacts with the same top reasoning tier one cell uses, so it is the
+    # strictly harder call — yet at 15m it was capped at HALF the panel it
     # adjudicates. A diff slow enough to stretch the panel stretches the judge
     # with it, so the failure mode was the expensive one: all 8 cells run green
     # for ~25m, then the judge is killed at the last step and every cell's work
     # is discarded with nothing posted to the PR. GitHub reports a
     # timeout-minutes kill as `cancelled`, not `failed`, so it reads on the run
     # page like a human stopped it — which is how this went unnoticed. Observed
-    # twice in one day on Comfy-Org/cloud, both at 15m0Xs (~3% of runs).
-    timeout-minutes: 30
+    # twice in one day on a consumer repo, both at 15m0Xs (~3% of runs).
+    #
+    # Deliberately longer than the `Run judge` step cap below, same idiom as
+    # the `ledger` job: raising the JOB cap alone would only move the cliff,
+    # since a job-level kill takes `Build consolidated findings file` and
+    # `Post review` with it and is the one failure mode that can never reach
+    # the degraded panel-union fallback. The step trips first and is absorbed,
+    # so a hung judge costs the adjudication, not the panel. The slack over
+    # the step (10m) covers this job's own overhead — a `fetch-depth: 0`
+    # checkout, the CLI install, three artifact downloads and the post — which
+    # a panel cell does not all pay, so the judge's effective MODEL budget is
+    # the step cap, not this one.
+    timeout-minutes: 40
     permissions:
       contents: read
       pull-requests: write
@@ -1731,6 +1749,19 @@ jobs:
 
       - name: Run judge
         if: steps.aggregate.outputs.ok_count != '0'
+        # Time-boxed BELOW the job cap and absorbed, so a hung judge loses only
+        # the adjudication: the steps below then read the `--init` seed left by
+        # `Configure structured final review` (status=error), take the degraded
+        # panel-union path and still post what the 8 cells found. Equal to the
+        # `review` panel cap so the judge is never given less model time than
+        # one of the cells it reads. `continue-on-error` is what makes the
+        # timeout absorbable — without it the step failure fails the job and
+        # lands back on the all-cells-discarded outcome this is fixing. It
+        # hides no real signal: the cursor-agent exit code is already captured
+        # in-script, and a judge that did not submit is reported to the PR as
+        # `judge_status` by `Post review`.
+        continue-on-error: true
+        timeout-minutes: 30
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
         run: |
