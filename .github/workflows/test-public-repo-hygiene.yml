@@ -99,6 +99,12 @@ jobs:
           # over-flagging THESE is the cost that tightening could have had.
           printf 'Protocol-relative: //huggingface.co/Comfy-Org/a-model\n' >> "$root/MODELS.md"
           printf 'Bare: huggingface.co/Comfy-Org/a-model has the weights.\n' >> "$root/MODELS.md"
+          # BE-8910 review: the label skip reads a BOUNDED destination, and a
+          # real Hugging Face file URL runs well past that bound. Declining to
+          # read a long destination would have re-opened the false positives
+          # this skip exists to close, so the truncation is detected instead --
+          # and this is the spelling that proves the detection is not a refusal.
+          printf '%s\n' 'Long: [Comfy-Org/a-model](https://huggingface.co/Comfy-Org/a-model/resolve/main/split_files/diffusion_models/a_very_long_checkpoint_file_name_that_pushes_this_link_destination_comfortably_past_the_two_hundred_and_fifty_six_character_length_bound_that_the_label_skip_reads_a_destination_with.safetensors)' >> "$root/MODELS.md"
           printf '* @Comfy-Org/comfy-cloud-team\n' > "$root/CODEOWNERS"
           git -C "$root" add -A
           python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root "$root"
@@ -187,6 +193,22 @@ jobs:
             'which is not in the known-public allowlist'
           check_one 'model host as a path segment' \
             'weights https://evil.example/huggingface.co/Comfy-Org/not-a-public-repo' \
+            'which is not in the known-public allowlist'
+          # BE-8910 review round 2. The anchor's reject class is matched under
+          # `re.ASCII`, so an ASCII-only class let ANY non-ASCII character read
+          # as a boundary -- a scheme-bearing URL included, since the accented
+          # character sits between the `://` and the host.
+          check_one 'non-ASCII neighbour of the model host' \
+            'weights https://éhuggingface.co/Comfy-Org/not-a-public-repo' \
+            'which is not in the known-public allowlist'
+          # ... and the label shape is now checked at BOTH ends: the reference
+          # has to OPEN the label, and the target has to name the same repo
+          # across a whole path segment rather than merely start with it.
+          check_one 'label over a target that only starts with the name' \
+            '[Comfy-Org/not-a-public-repo](https://huggingface.co/Comfy-Org/not-a-public-repo%2Dother)' \
+            'which is not in the known-public allowlist'
+          check_one 'bare reference that opens no label' \
+            'see Comfy-Org/not-a-public-repo](https://huggingface.co/Comfy-Org/not-a-public-repo)' \
             'which is not in the known-public allowlist'
 
       # ── The acceptance criterion this whole workflow exists for ────────────

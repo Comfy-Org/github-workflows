@@ -487,7 +487,21 @@ _NON_GITHUB_HOST_PATH_PREFIXES = (
 # Characters that continue a host label or a path segment. `/` is deliberately
 # absent from the first spelling and present in the second: a `/` before the
 # host is exactly what the `//` alternatives above are there to adjudicate.
-_URL_TOKEN_CHARS = r"A-Za-z0-9._~%@:+-"
+#
+# The class ends with the whole NON-ASCII range, and that is not decoration.
+# `_HOST_FLAGS` carries `re.ASCII`, and the ASCII spellings alone left the
+# bare-token alternative satisfied by any non-ASCII neighbour, so
+# `https://\u00e9huggingface.co/Comfy-Org/<private-repo>` and
+# `\u4e2dhuggingface.co/Comfy-Org/<private-repo>` were both SILENCED -- a
+# scheme-bearing URL included, because `\u00e9` sits between the `://` and the
+# host and defeats that alternative too. A non-ASCII character before the host
+# is no more a boundary than an ASCII letter is: `\u00e9huggingface.co` is a
+# different registrable name, exactly as `myhuggingface.co` is. The accepted
+# cost is the mirror image of the one `_nonascii_tail` already takes on the
+# right -- a real bare host butted straight against non-Latin prose or a curly
+# quote is a finding rather than a pass, which is the over-flag direction, and
+# a separator or a scheme clears it. (BE-8910 review.)
+_URL_TOKEN_CHARS = r"A-Za-z0-9._~%@:+\-\x80-\U0010FFFF"
 _NON_GITHUB_HOST_AUTHORITY_L = (
     r"(?:"
     r"(?<=://)"
@@ -523,11 +537,29 @@ _HOST_PREFIX_LOOKBACK = (
 # `](`, CommonMark's optional space/tab, an optional `<` destination wrapper,
 # then the destination itself. The destination is bounded rather than greedy for
 # the reason every other derived string here is (see `_bounded`): the line is
-# scanned-repo-controlled and can be the whole file. 256 characters is past the
-# longest `https://huggingface.co/api/datasets/Comfy-Org/<name>` that GitHub's
-# and Hugging Face's own name limits allow, and a destination longer than that
-# simply is not cleared.
-_MD_LINK_OPEN_RE = re.compile(r"\]\([ \t]*<?([^\s<>()]{0,256})")
+# scanned-repo-controlled and can be the whole file.
+#
+# The bound TRUNCATES; it does not decline. An earlier comment here claimed a
+# longer destination "simply is not cleared", and that was the one thing the
+# bound did not do -- the first 256 characters were still searched, so a
+# destination whose head happened to end at a name boundary cleared a label the
+# rest of the URL does not name. Declining outright is not the fix either: real
+# Hugging Face destinations run past 256 characters routinely
+# (`.../resolve/main/split_files/diffusion_models/<file>.safetensors`), and
+# refusing to read them would re-open the false-positive class this whole skip
+# exists to close. So the truncation is DETECTED instead, by
+# `_md_link_destination` below, and only the one comparison it can corrupt --
+# a name that runs to the cut -- is refused. (BE-8910 review.)
+_MD_LINK_DEST_MAX = 256
+_MD_LINK_OPEN_RE = re.compile(
+    r"\]\([ \t]*<?([^\s<>()]{0," + str(_MD_LINK_DEST_MAX) + r"})"
+)
+
+# What ends a path segment in a link destination, for the whole-name check in
+# `_labels_non_github_link`. End-of-destination counts as a terminator too --
+# but only when the destination is COMPLETE, which is what the truncation flag
+# is for.
+_PATH_SEGMENT_END = frozenset("/?#")
 
 # Where the reusable workflow checks THIS repo out inside the caller's
 # workspace (`path:` in public-repo-hygiene.yml — keep the two spellings in
@@ -1144,8 +1176,25 @@ def _is_non_github_host_prefixed(text, start):
     )
 
 
-def _labels_non_github_link(line, end, name):
-    """Is the bare reference ending at END the LABEL of a link to the same URL?
+def _md_link_destination(line, end):
+    """The destination of a markdown inline link opening at END, and whether
+    it was CUT by `_MD_LINK_DEST_MAX`.
+
+    Returns `(None, False)` when no link opens there. A capture that reached the
+    bound is reported as cut: the class is greedy, so it stops at the bound only
+    when more destination was available. A destination whose real length is
+    exactly the bound is therefore reported as cut when it is not -- an
+    over-flag on one length, which is the safe direction here.
+    """
+    opened = _MD_LINK_OPEN_RE.match(line, end)
+    if opened is None:
+        return None, False
+    target = opened.group(1)
+    return target, len(target) == _MD_LINK_DEST_MAX
+
+
+def _labels_non_github_link(line, start, end, name):
+    """Is the bare reference at START..END the LABEL of a link to the same URL?
 
     Shape 2 of BE-8910, present in comfy-cli's gallery fixtures:
 
@@ -1168,14 +1217,41 @@ def _labels_non_github_link(line, end, name):
     stripped the same way so the two are compared on equal terms, and the
     comparison is casefolded like every other name comparison on this path
     (BE-8697).
+
+    Both ENDS of the label are checked, not just the `](` on the right.
+    `_MD_LINK_OPEN_RE` only looks forward, so a bare reference sitting in prose
+    or code that merely happened to be followed by `](<matching URL>` was read
+    as link text and cleared without any `[` ever opening a label. The reference
+    has to START the label -- the shape this docstring, the README and
+    `docs/callers/public-repo-hygiene.md` all describe, and the shape every
+    instance in the swept corpus is written in. (BE-8910 review.)
+
+    The target's name has to span a WHOLE path segment, too. `REPO_REF_RE`'s
+    name class is ASCII, so the target was compared on a PARTIAL read while the
+    label side was whole: `[Comfy-Org/<private>](https://huggingface.co/
+    Comfy-Org/<private>\u2010model)` and a `%2D`-escaped sibling both read the
+    target as `<private>`, compared equal, and silenced the label. That is the
+    prefix-vs-full-name hole `_nonascii_tail` was added for in BE-8654, reached
+    through the other door, and it broke this function's own guarantee that a
+    label naming one repo over a link to another stays a finding. Requiring the
+    next character to END the segment (`/`, `?`, `#`, or the destination's end)
+    closes both spellings -- and the destination's end only counts when the
+    destination was read WHOLE, since a name running to a truncation is the same
+    partial read by a third door. (BE-8910 review.)
     """
-    opened = _MD_LINK_OPEN_RE.match(line, end)
-    if opened is None:
+    if start == 0 or line[start - 1] != "[":
         return False
-    target = opened.group(1)
+    target, cut = _md_link_destination(line, end)
+    if target is None:
+        return False
     folded = name.casefold()
     for ref in REPO_REF_RE.finditer(target):
         if ref.group(1).rstrip(".").casefold() != folded:
+            continue
+        if ref.end() >= len(target):
+            if cut:
+                continue
+        elif target[ref.end()] not in _PATH_SEGMENT_END:
             continue
         if _is_non_github_host_prefixed(target, ref.start()):
             return True
@@ -1462,7 +1538,9 @@ def _file_findings(rel, text, ticket_allowlist):
             if (
                 not tail
                 and not at_prefixed
-                and _labels_non_github_link(line, match.end(), name)
+                and _labels_non_github_link(
+                    line, match.start(), match.end(), name
+                )
             ):
                 continue
             if tail:

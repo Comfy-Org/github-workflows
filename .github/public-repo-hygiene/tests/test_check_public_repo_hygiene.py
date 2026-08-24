@@ -1524,12 +1524,30 @@ class NonGitHubHostReferenceTest(CheckerTestCase):
         # `_HOST_PREFIX_LOOKBACK` is derived from the two tuples; this pins the
         # derivation against the longest prefix either can produce, since a
         # window one character short silently reintroduces the false positive.
+        #
+        # The port term is part of "the longest spelling" and was missing here,
+        # which left the assertion satisfied by a window six characters short:
+        # deleting `len(":65535")` from the constant would have re-flagged
+        # `https://huggingface.co:8443/api/datasets/Comfy-Org/x` with this test
+        # still green. The spelling itself is pinned by the test below.
+        # (BE-8910 review.)
         longest = (
             max(len(h) for h in checker.NON_GITHUB_ORG_NAMESPACE_HOSTS)
+            + len(":65535")
             + 1
             + max(len(p) for p in checker._NON_GITHUB_HOST_PATH_PREFIXES)
         )
         self.assertGreaterEqual(checker._HOST_PREFIX_LOOKBACK, longest)
+
+    def test_an_explicit_port_on_the_longest_path_prefix_clears(self):
+        # The lookback's port term, exercised rather than only asserted: the
+        # longest host, a real port and the longest enumerated path prefix at
+        # once is the widest window the constant has to cover.
+        self.repo.write(
+            "README.md",
+            "https://huggingface.co:8443/api/datasets/Comfy-Org/a-dataset\n",
+        )
+        self.assertEqual(self.findings(), [])
 
     def test_a_non_ascii_name_after_a_huggingface_host_is_not_a_homoglyph_finding(
         self,
@@ -1546,14 +1564,110 @@ class NonGitHubHostReferenceTest(CheckerTestCase):
     def test_an_at_prefixed_label_over_a_huggingface_link_is_still_checked(self):
         # A team handle / npm coordinate labelling a model link is not a
         # spelling the label skip clears -- it stays on the team path.
+        #
+        # Written as a REAL markdown label. The original fixture was
+        # `@Comfy-Org/some-team(https://...)` with no `]` before the `(`, so
+        # `_MD_LINK_OPEN_RE` never matched and the assertion held on the missing
+        # bracket rather than on the guard it names -- it passed identically
+        # with `not at_prefixed` deleted. Two independent guards now hold this
+        # shape (the `@` is not a `[`, and `at_prefixed` short-circuits before
+        # the call), so what is pinned is the OUTCOME. (BE-8910 review.)
         self.repo.write(
             "CODEOWNERS",
-            "* @Comfy-Org/some-team"
+            "* [@Comfy-Org/some-team]"
             "(https://huggingface.co/Comfy-Org/some-team)\n",
         )
         findings = self.findings()
         self.assertEqual(len(findings), 1, findings)
         self.assertIn("team not in the known-public allowlist", findings[0])
+
+    def test_a_non_ascii_neighbour_does_not_silence_the_reference(self):
+        # `_HOST_FLAGS` is `re.ASCII`, so an ASCII-only reject class left every
+        # non-ASCII neighbour reading as a boundary and both spellings below
+        # cleared -- the scheme-bearing one included, because the accented
+        # character sits between the `://` and the host and defeats that
+        # alternative too. `\u00e9huggingface.co` is a different registrable
+        # name, exactly as `myhuggingface.co` is. (BE-8910 review.)
+        self.repo.write(
+            "README.md",
+            "https://\u00e9huggingface.co/Comfy-Org/some-internal-thing\n"
+            "\u4e2dhuggingface.co/Comfy-Org/another-internal-thing\n",
+        )
+        self.assertEqual(len(self.findings()), 2, self.findings())
+
+    def test_a_homoglyph_tail_on_the_link_target_does_not_clear_the_label(self):
+        # `REPO_REF_RE`'s name class is ASCII, so the target was compared on a
+        # PARTIAL read while the label side was whole: the target here names
+        # `some-internal-thing<U+2010>model`, a DIFFERENT repo, and used to
+        # compare equal and silence the label. The label is the finding; the
+        # target's own copy is a Hugging Face path and clears. (BE-8910 review.)
+        self.repo.write(
+            "gallery.md",
+            "[Comfy-Org/some-internal-thing]"
+            "(https://huggingface.co/Comfy-Org/some-internal-thing\u2010model)\n",
+        )
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("Comfy-Org/some-internal-thing", findings[0])
+
+    def test_a_percent_escape_on_the_link_target_does_not_clear_the_label(self):
+        # The same prefix-vs-full-name hole reached through an escape rather
+        # than a homoglyph: `%` ends the ASCII name class, so the target read as
+        # `some-internal-thing` while it actually names `...%2Dother`.
+        self.repo.write(
+            "gallery.md",
+            "[Comfy-Org/some-internal-thing]"
+            "(https://huggingface.co/Comfy-Org/some-internal-thing%2Dother)\n",
+        )
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("Comfy-Org/some-internal-thing", findings[0])
+
+    def test_a_label_over_a_truncated_destination_is_not_cleared(self):
+        # The destination bound TRUNCATES, so a name running to the cut is read
+        # partially -- the third door into the prefix-vs-full-name hole. The
+        # name here is sized so the cut lands exactly on it: what is left of the
+        # bound after `https://huggingface.co/Comfy-Org/`. The URL actually
+        # names `<name>bcd`, a different repo. Synthetic on purpose -- no real
+        # GitHub or Hugging Face name is this long -- because the bound, not the
+        # name, is what is under test. (BE-8910 review.)
+        name = "a" * (
+            checker._MD_LINK_DEST_MAX - len("https://huggingface.co/Comfy-Org/")
+        )
+        self.repo.write(
+            "gallery.md",
+            f"[Comfy-Org/{name}]"
+            f"(https://huggingface.co/Comfy-Org/{name}bcd)\n",
+        )
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("Comfy-Org/" + "a" * 40, findings[0])
+
+    def test_a_label_over_a_long_but_complete_destination_still_clears(self):
+        # The other side of that trade, and the reason truncation is DETECTED
+        # rather than declined: real Hugging Face destinations run past the
+        # bound routinely, and refusing to read a long one would re-open the
+        # false-positive class this skip exists to close. This destination is
+        # comfortably over 256 characters and the name is nowhere near the cut.
+        deep = "/resolve/main/split_files/diffusion_models/" + "x" * 200
+        dest = f"https://huggingface.co/Comfy-Org/a-model{deep}.safetensors"
+        self.assertGreater(len(dest), checker._MD_LINK_DEST_MAX)
+        self.repo.write("gallery.md", f"[Comfy-Org/a-model]({dest})\n")
+        self.assertEqual(self.findings(), [])
+
+    def test_a_bare_reference_that_opens_no_label_is_still_flagged(self):
+        # `_MD_LINK_OPEN_RE` only looks FORWARD, so a bare reference in prose
+        # that merely happened to be followed by `](<matching URL>` was read as
+        # link text with no `[` ever opening a label. The reference has to start
+        # the label. (BE-8910 review.)
+        self.repo.write(
+            "notes.md",
+            "see Comfy-Org/some-internal-thing"
+            "](https://huggingface.co/Comfy-Org/some-internal-thing)\n",
+        )
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("Comfy-Org/some-internal-thing", findings[0])
 
 
 class ScanScopeTest(CheckerTestCase):
