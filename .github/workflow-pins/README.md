@@ -118,6 +118,80 @@ and is left alone, as it always was — including a heredoc emitting a whole
 STEP, where the enclosing key is a `with:` the script itself printed: an open
 `|`/`>` block scalar is tracked so its body is read as text, not structure.
 
+**That pre-scan reads step ITEMS, not lines (BE-8254).** An id counts as
+declared only where a step actually declares one — at the item's own key
+column, or inside a flow mapping the item opens (`- {id: x, …}`, including the
+multi-line spelling). Two shapes used to register as phantom steps and so
+SILENCE the dangling verdict on a real finding: an action input literally named
+`id:` under an earlier step's `with:` (nested deeper than the step's keys), and
+a `run:` block scalar whose heredoc emits a line beginning `- id:` / `"id":`
+(fixture YAML this repo's own workflows write). Both are excluded structurally
+now — YAML puts a `with:` member and a block scalar's body deeper than the key
+column either way. One residue is TOLERATED rather than fixed: a `with:`
+written inside a FLOW item (`- {uses: …, with: {id: x}}`) still registers `x`,
+because the flow pattern is flat and scoping it to the outermost mapping's
+depth is the under-collection direction — get that wrong and a compliant
+workflow fails. It is pinned by a test so any change to it is a deliberate
+one; the shape occurs 0 times in this tree.
+
+Reading items rather than lines means the walk has to accept every spelling of
+an item YAML does, because a missed id is a false FAILURE on a compliant
+workflow. It reads the **indentless** sequence (`steps:` and its `- ` items at
+the SAME column, which Actions accepts), a marker line whose remainder is only
+a comment (`-   # set up`, whose keys land on the lines below), a bare `-`
+whose item is a flow mapping on the next line, an item carrying an `&anchor` or
+`!tag` node property in front of its mapping (`- &resolver {id: x, …}`), and a
+flow mapping spanning physical lines — including one whose continuation dedents
+past the dash, which YAML permits inside `{ … }`. Braces are counted **outside
+quoted scalars**, so a `{` or `}` that is string content (`run: "echo {"`)
+neither wedges flow mode open nor closes it early. An `id:` inside a flow
+mapping is gated the same way: the pattern asks only for a preceding `{` or
+`,`, and a comma that is string content meets that boundary too, so
+`- {run: "build, id: x"}` used to conjure a step nothing declares and silence a
+real dangling verdict.
+
+**A quote opens a scalar only where a YAML node can START** — at the start of
+the text, or after `{`, `[`, `,`, a `:` key separator, or a `- ` list marker.
+YAML forbids a quote only as a plain scalar's FIRST character, so `don't` is a
+legal plain scalar and `- {name: don't, id: real}` a legal step; a bare
+open-on-any-quote toggle read that apostrophe as opening a string, swallowed
+the real entry comma before `id:` (so `real` was never registered — a false
+`dangling` FAILURE on a compliant workflow) and left the closing `}` uncounted,
+wedging flow mode open so every later block item was lost too. One scan
+(`_quote_mask`) answers this for all three readers that need it —
+`_outside_quotes`, `_strip_comment` and the flow `id:` boundary — and it is
+hoisted per line rather than re-run per match, so a long flow line with many
+`id:` candidates costs O(len) rather than O(matches x len).
+
+A step id is refused outright if it still carries a quote once its closing flow
+punctuation and one MATCHED quote wrapper are stripped: an Actions step id is
+`[A-Za-z0-9_-]`, so a stray `'`/`"` marks the tail of a quoted scalar that
+opened on an EARLIER physical line (`- {name: "a` / `  id: phantom", …}`) —
+which would otherwise register the exact phantom this pre-scan exists to
+exclude. Cross-line quote state itself remains out of scope module-wide (every
+reader here is per-line, `_strip_comment` included, and it runs first), so one
+residue survives: a continuation line whose id value carries no quote at all
+still over-collects. That is the tolerated direction — it silences one site,
+exactly as a real earlier out-of-scope step does — and it is pinned by a test;
+the shape occurs 0 times in this tree.
+
+**A `steps:` the item walk cannot read makes that job's dangling verdict
+fail-open, not fail-loud.** Flow-style `steps: [ … ]` on the key line, or a
+`steps:` opening no `- ` item, leaves the pre-scan with no answer at all — so
+for that job (only) a site whose id names no tracked resolver is dropped,
+exactly as it was before BE-8215. That is every verdict resting on "no step of
+that id exists": `dangling`, and the `non-leading` one an absent id also
+reaches — the same pair a real earlier out-of-scope step drops today. Under-
+collection is the costly direction here: a missed id turns a compliant
+workflow into a false FAILURE, while a dropped site merely reproduces the
+coverage this lint had before the dangling check existed. Resolver and guard
+verdicts are unaffected, in that job and every other.
+
+The fail-open is deliberate but it is not free: reformatting a job's `steps:`
+into one of those shapes is an in-band way to switch that job's dangling check
+off, and nothing says so in the output. Making it observable needs a
+non-fatal channel `check_dir` does not have yet — tracked separately.
+
 **`||` fallbacks are read on this path too, with leading-operand judgment
 (BE-8215).** `ref: ${{ steps.<id>.outputs.<name> || 'main' }}` used to match
 nothing anywhere and record nothing. Now it is a site like any other, judged
