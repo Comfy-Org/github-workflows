@@ -2225,9 +2225,7 @@ def _skips_on_empty_output(lines, idx, step_id, out):
     return False
 
 
-def _record_steps_output(
-    found, lines, idx, sites, resolvers, step_ids, job_start=None, job_indent=None, dropped=None
-):
+def _record_steps_output(found, lines, idx, sites, resolvers, step_ids, drop=None):
     """Record the `ref:` at `idx`, which reads `steps.<id>.outputs.<out>`.
 
     `sites` is EVERY step output the value reads (BE-8253), and every one of
@@ -2262,15 +2260,39 @@ def _record_steps_output(
     earlier out-of-scope step does to both today. Sites whose id names a
     tracked resolver are judged exactly as always.
 
-    `dropped`, when a caller passes a list, collects
-    `(job_start, job_indent, idx)` for every site that escape swallows
-    (BE-9045). The drop itself is right — a fail-CLOSED escape manufactures
-    false CI failures out of a pre-scan that could not run — but it is
-    INVISIBLE, so reformatting a job's `steps:` into one of those shapes is an
-    in-band way to switch that job's dangling check off with nothing in the
-    output to say so. The collector is the observability channel and nothing
-    more: it never changes a verdict, and `check_dir` turns it into a
+    `drop`, when a caller passes one, is `(job_start, job_indent, out_list)`
+    and `out_list` collects `(job_start, job_indent, idx)` for every SITE that
+    escape swallows (BE-9045). The drop itself is right — a fail-CLOSED escape
+    manufactures false CI failures out of a pre-scan that could not run — but
+    it is INVISIBLE, so reformatting a job's `steps:` into one of those shapes
+    is an in-band way to switch that job's dangling check off with nothing in
+    the output to say so. The collector is the observability channel and
+    nothing more: it never changes a verdict, and `check_dir` turns it into a
     non-fatal `::warning` that leaves the exit status alone.
+
+    ONE parameter, not three, because the list is USELESS without the job
+    coordinates: the annotation names the job and points at its `steps:` line.
+    Three independently-defaulting parameters let a caller pass the documented
+    out-parameter alone and collect `(None, None, idx)`, whose `lines[None]`
+    is an exit-1 `TypeError` traceback out of the one path whose entire
+    purpose is to be non-fatal. Bundled, that call cannot be written.
+
+    Recorded once per SITE this call leaves with NO `found` entry at all, not
+    once per swallowed OPERAND. A site is a line — the unit this function
+    itself works in, appending at most one `found` entry per call — so the
+    per-operand append counted a two-operand value twice. And a site whose
+    SIBLING operand names a tracked resolver still lands in `found`: it WAS
+    judged, by the operand this reader could read, so recording it would let
+    one `ref:` line carry a BE-8130/BE-8215 `::error` AND be counted in a
+    `::warning` saying it went unjudged. Only a site that came away with no
+    verdict at all actually lost coverage to the escape.
+
+    That second case has no end-to-end fixture because it cannot be reached
+    today: `_step_bounds` refuses the same `steps:` shapes `_job_step_ids`
+    does, so no resolver ever registers inside an escaped job and `resolvers`
+    is empty there. Written as an invariant rather than as a live fix — the
+    two are separate walks over the same key, and the count should stay
+    honest if they diverge.
 
     When `<id>` matches NO step declared before the consuming one (a typo'd
     id, a step in another job, a resolver declared below its consumer), the
@@ -2307,19 +2329,14 @@ def _record_steps_output(
         found.append((idx + 1, False, False, UNPARSED))
         return
     verdicts = []
+    # Did the BE-8254 escape swallow an operand here? Noted, not recorded:
+    # the drop is only worth reporting if NO operand of this site reached a
+    # verdict — see the `drop` paragraph above.
+    escaped = False
     for step_id, out, leading in sites:
         if step_id not in resolvers:
             if step_ids is None:
-                if dropped is not None:
-                    # Record the drop for `check_dir`'s non-fatal warning
-                    # (BE-9045) BEFORE the `continue` that loses it. Carries
-                    # the job's own coordinates because the annotation names
-                    # the job and points at its `steps:` line, and `check_dir`
-                    # has neither by the time it sees this list. Per OPERAND,
-                    # so a value reading two escaped outputs appends twice —
-                    # `check_dir` counts distinct `idx`, which is what
-                    # "checkout(s)" means in the message.
-                    dropped.append((job_start, job_indent, idx))
+                escaped = True
                 # The job's `steps:` is a shape `_job_step_ids` will not stand
                 # behind, so "no such step" and "a real earlier step this lint
                 # has no claim on" are indistinguishable here. Drop the site —
@@ -2380,6 +2397,12 @@ def _record_steps_output(
     if not verdicts:
         # Every operand was out of scope — the same drop the single-operand
         # reader made, for the same reason.
+        if escaped and drop is not None:
+            # This site produced no `found` entry and at least one operand was
+            # swallowed by the escape, so the escape is what cost it its
+            # verdict. That is exactly the site `check_dir` warns about.
+            job_start, job_indent, out_list = drop
+            out_list.append((job_start, job_indent, idx))
         return
     # A failing operand decides the site, and its state decides the REMEDY the
     # message prints, so the two states with their own message come first.
@@ -2436,8 +2459,9 @@ def ref_checkouts(lines, dropped=None):
     (BE-9045): the returned tuple is what 49 call sites read, so the
     observability channel for the BE-8254 fail-open is a list the caller
     passes in and `_record_steps_output` appends `(job_start, job_indent,
-    idx)` to. Passing one changes no verdict and no return value — only
-    `check_dir` does, and only to emit a non-fatal `::warning`.
+    idx)` to — once per SITE it leaves unjudged, never per operand. Passing
+    one changes no verdict and no return value — only `check_dir` does, and
+    only to emit a non-fatal `::warning`.
     """
     aliases = env_aliases(lines)
     ref_res = _ref_use_res(aliases)
@@ -2488,6 +2512,9 @@ def ref_checkouts(lines, dropped=None):
         # resting on "no such step" (`dangling`, and the `non-leading` one an
         # absent id also reaches). Resolver and guard verdicts are unchanged.
         step_ids = _job_step_ids(lines, start, job_indent)
+        # The BE-9045 collector, bound to THIS job's coordinates once so the
+        # list can never travel without them (`_record_steps_output`'s `drop`).
+        drop = None if dropped is None else (start, job_indent, dropped)
         # An open `ref:` whose value continues below, as (line index, indent).
         # Continuation lines are the more-indented ones that follow; the first
         # line back at or above the key's indent closes the scalar.
@@ -2532,15 +2559,7 @@ def ref_checkouts(lines, dropped=None):
                         # checkout, and it is the key line's own step that
                         # must carry the skip `if:`.
                         _record_steps_output(
-                            found,
-                            lines,
-                            pending[0],
-                            resolved,
-                            resolvers,
-                            step_ids,
-                            start,
-                            job_indent,
-                            dropped,
+                            found, lines, pending[0], resolved, resolvers, step_ids, drop
                         )
                         pending = None
                     elif resolved == UNPARSED:
@@ -2634,15 +2653,7 @@ def ref_checkouts(lines, dropped=None):
                 resolved = _steps_output_sites(line)
                 if resolved is not None:
                     _record_steps_output(
-                        found,
-                        lines,
-                        i,
-                        resolved,
-                        resolvers,
-                        step_ids,
-                        start,
-                        job_indent,
-                        dropped,
+                        found, lines, i, resolved, resolvers, step_ids, drop
                     )
     return found
 
@@ -2672,8 +2683,42 @@ def find_unguarded_ref_checkouts(lines):
     return [lineno for lineno, _, _ in unguarded_ref_checkouts(lines)]
 
 
+def _ann_msg(value):
+    """`value`, safe to interpolate into a workflow command's MESSAGE.
+
+    Every name this file annotates comes from a directory listing or from
+    file CONTENT, and neither is trusted text: git permits newlines in a
+    filename, and a `.yml` whose NAME carries one puts whatever follows at the
+    start of a log line — where `::stop-commands::` is a real workflow command
+    that suppresses every annotation printed after it. Since BE-9045 prints
+    notices AHEAD of the errors, the annotations it would suppress are the
+    ERROR ones (the exit status is unaffected — the run still fails — but a
+    reader scanning the PR's annotations would see nothing to explain it).
+    A `::` in the MIDDLE of a message opens nothing, so escaping the newline
+    is what closes this; `%` and `\\r` come along per GitHub's documented set.
+
+    A no-op for every name a workflow file actually has.
+    """
+    return str(value).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def _ann_prop(value):
+    """`value`, safe to interpolate into a workflow command PROPERTY (`file=…`).
+
+    A property list is `,`-separated and `:`-terminated, so those two escape
+    on top of `_ann_msg`'s set — otherwise a filename containing either walks
+    out of `file=` and forges the rest of the annotation's properties.
+    """
+    return _ann_msg(value).replace(":", "%3A").replace(",", "%2C")
+
+
 def _escaped_steps_warning(path, name, lines, job_start, job_indent, count):
     """The non-fatal `::warning` for one job whose `steps:` escaped the pre-scan.
+
+    `path` and `name` arrive ALREADY annotation-escaped (`_ann_prop` /
+    `_ann_msg`), as they do for every error `check_dir` builds; `job_name`
+    comes from file content and is escaped here, at the one place that reads
+    it.
 
     Points at the `steps:` line rather than the job key, because that line IS
     the shape to rewrite — recomputed with the SAME lookup `_job_step_ids`
@@ -2684,11 +2729,23 @@ def _escaped_steps_warning(path, name, lines, job_start, job_indent, count):
     `_strip_comment`, not by trimming the raw line: `  build:  # the mapper`
     is legal YAML and a raw trim prints the comment as part of the job's name,
     in the one annotation whose whole job is to name the job.
+
+    …and it is cut at the key's OWN mapping colon, not merely stripped of a
+    trailing one. A job key line may carry a VALUE — `  build: &common`, an
+    anchor on the key line, which is one of the three escape shapes this very
+    message enumerates and therefore a routine way to reach it — and trimming
+    only a trailing `:` printed "job `build: &common`" in the one annotation
+    whose whole job is to name the job. The colon is found on the shared
+    `_quote_mask` scan so a quoted key that CONTAINS one (`"deploy: prod":`)
+    is cut at its own delimiter rather than inside its name.
     """
     job_name = _strip_comment(lines[job_start]).strip()
-    if job_name.endswith(":"):
-        job_name = job_name[:-1]
-    job_name = job_name.strip().strip("'\"")
+    mask = _quote_mask(job_name)
+    for pos, ch in enumerate(job_name):
+        if ch == ":" and mask[pos]:
+            job_name = job_name[:pos]
+            break
+    job_name = _ann_msg(job_name.strip().strip("'\""))
     steps_line = None
     job_child = _first_child_indent(lines, job_start, job_indent)
     if job_child is not None:
@@ -2698,11 +2755,14 @@ def _escaped_steps_warning(path, name, lines, job_start, job_indent, count):
     return (
         "::warning file=%s,line=%d::%s job `%s`: its `steps:` could not be read "
         "as a step sequence (`steps: [ … ]` / an anchor on the key line, or no "
-        "`- ` item below it), so the dangling-ref check did NOT run for %d "
+        "`- ` item below it), so the dangling-ref check could NOT run for %d "
         "`ref:` site(s) in this job — one per `ref:` LINE, this lint's unit "
-        "throughout — and the checkout(s) they feed were passed unjudged. "
-        "Rewrite `steps:` as a block sequence (`steps:` then `- uses: … ` "
-        "items) to restore it. See BE-9045."
+        "throughout — and they were passed WITHOUT it. This is lost coverage, "
+        "not a finding: each of those refs may well be fine, and a real "
+        "earlier step this lint has no claim on would have been dropped "
+        "anyway; with the pre-scan defeated, a dangling id and that step are "
+        "indistinguishable here. Rewrite `steps:` as a block sequence "
+        "(`steps:` then `- uses: … ` items) to restore it. See BE-9045."
         % (path, steps_line + 1, name, job_name, count)
     )
 
@@ -2730,6 +2790,11 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
     )
     for name in names:
         path = os.path.join(workflows_dir, name)
+        # Annotation-safe forms of the two values every message below
+        # interpolates. They come from `os.listdir`, which is not trusted
+        # text — see `_ann_msg`. A no-op for every real workflow filename.
+        ann_path = _ann_prop(path)
+        ann_name = _ann_msg(name)
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             text = f.read()
         lines = text.split("\n")
@@ -2745,7 +2810,7 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
                     "could not find its input declaration — the lint is NOT "
                     "covering this file. Fix the workflow's shape or teach "
                     ".github/workflow-pins/check_workflow_pins.py the new one."
-                    % (path, name, INPUT_NAME)
+                    % (ann_path, ann_name, INPUT_NAME)
                 )
             continue
         checked.append(name)
@@ -2759,7 +2824,7 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
                     "::error file=%s::%s is in KNOWN_EXEMPT but its %s input no "
                     "longer has a default — delete it from KNOWN_EXEMPT in "
                     ".github/workflow-pins/check_workflow_pins.py"
-                    % (path, name, INPUT_NAME)
+                    % (ann_path, ann_name, INPUT_NAME)
                 )
             # An exempt workflow still has its default, so an omitted input can
             # never reach checkout as ''. The guard is moot until its own ticket
@@ -2812,15 +2877,16 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
 
         # One warning per JOB, first-seen order, and only for a job that
         # actually lost a site: a flow-`steps:` job with no
-        # `steps.<id>.outputs.<out>` consumer never reaches the drop branch and
-        # stays silent. Counted over DISTINCT `idx` because the collector
-        # appends per OPERAND, while a SITE is a line — which is this lint's
-        # unit everywhere (`_record_steps_output` appends at most one `found`
-        # entry per call, keyed on the line). Two flow-style checkouts written
-        # on ONE physical line are therefore one site here, exactly as they
-        # are one entry in `found`; the message says "`ref:` site(s)" rather
-        # than "checkouts" so the number cannot be read as a claim the reader
-        # can check against the job's step count.
+        # `steps.<id>.outputs.<out>` consumer never reaches the drop branch
+        # and stays silent, and neither does a site whose sibling operand
+        # still earned it a verdict. The collector already appends once per
+        # SITE — a line, which is this lint's unit everywhere — so two
+        # flow-style checkouts written on ONE physical line are one site here,
+        # exactly as they are one entry in `found`. Kept a set anyway so the
+        # count stays a count of LINES if a line is ever walked twice; the
+        # message says "`ref:` site(s)" rather than "checkouts" so the number
+        # cannot be read as a claim the reader can check against the job's
+        # step count.
         by_job = {}
         for job_start, job_indent, idx in dropped:
             job = by_job.setdefault((job_start, job_indent), set())
@@ -2828,7 +2894,7 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
         for (job_start, job_indent), sites in by_job.items():
             notices.append(
                 _escaped_steps_warning(
-                    path, name, lines, job_start, job_indent, len(sites)
+                    ann_path, ann_name, lines, job_start, job_indent, len(sites)
                 )
             )
 
@@ -2840,7 +2906,7 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
                 "input. Delete it (and keep `required: true` + the runtime "
                 "empty-ref guard): a default lets a caller SHA-pin `uses:` while "
                 "loading scripts from a mutable ref. See BE-5546."
-                % (path, lineno, name, INPUT_NAME)
+                % (ann_path, lineno, ann_name, INPUT_NAME)
             )
 
         for lineno, uses_fallback, via_step_output in unguarded_ref_checkouts(lines):
@@ -2865,7 +2931,7 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
                     "non-empty `if:` on this step, or as that expression with "
                     "a trailing `|| <literal>` fallback — the supported "
                     "spellings in .github/workflow-pins/README.md. "
-                    "See BE-8253." % (path, lineno, name)
+                    "See BE-8253." % (ann_path, lineno, ann_name)
                 )
                 continue
             if via_step_output in ("dangling", "non-leading"):
@@ -2892,7 +2958,7 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
                     "the checkout runs unconditionally at a mutable ref. Fix "
                     "the step id, or move the resolving step above this "
                     "checkout. See BE-8215."
-                    % (path, lineno, name, step_id, out, step_id)
+                    % (ann_path, lineno, ann_name, step_id, out, step_id)
                 )
                 continue
             if via_step_output == "non-leading":
@@ -2914,7 +2980,7 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
                     "`steps.%s.outputs.%s` the expression's FIRST operand (a "
                     "trailing `|| <literal>` fallback is fine), or drop what "
                     "precedes it. See BE-8215."
-                    % (path, lineno, name, step_id, out, step_id, out)
+                    % (ann_path, lineno, ann_name, step_id, out, step_id, out)
                 )
                 continue
             if via_step_output:
@@ -2929,7 +2995,7 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
                     "`actions/checkout` as '', which it reads as the default "
                     "branch. Add the exact non-empty `if:` to this step (the "
                     "never-fail idiom, see .github/workflow-pins/README.md). "
-                    "See BE-8130." % (path, lineno, name, INPUT_NAME)
+                    "See BE-8130." % (ann_path, lineno, ann_name, INPUT_NAME)
                 )
                 continue
             # `uses_fallback` comes from the line the parser MATCHED, which for a
@@ -2947,7 +3013,7 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
                     "and expands to '' on anything older, which checkout reads as "
                     "the default branch. Pair it with a `Require a resolvable "
                     "workflows_ref` step. See BE-8077."
-                    % (path, lineno, name, INPUT_NAME)
+                    % (ann_path, lineno, ann_name, INPUT_NAME)
                 )
                 continue
             errors.append(
@@ -2956,7 +3022,7 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
                 "`Require a pinned workflows_ref` step in ahead of it: `required: "
                 "true` is unenforced for workflow_call, so an omitted input "
                 "arrives as '' and checkout silently takes the default branch. "
-                "See BE-5546." % (path, lineno, name, INPUT_NAME)
+                "See BE-5546." % (ann_path, lineno, ann_name, INPUT_NAME)
             )
 
     # A KNOWN_EXEMPT entry naming a workflow that no longer declares the input
@@ -2968,7 +3034,7 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
             "input under that name (renamed, deleted, or already fixed) — delete "
             "it from KNOWN_EXEMPT in "
             ".github/workflow-pins/check_workflow_pins.py"
-            % (name, workflows_dir, INPUT_NAME)
+            % (_ann_msg(name), _ann_msg(workflows_dir), INPUT_NAME)
         )
 
     return errors, checked, exempt_ok, notices
@@ -2984,7 +3050,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if not os.path.isdir(args.workflows_dir):
-        print("::error::no such directory: %s" % args.workflows_dir)
+        print("::error::no such directory: %s" % _ann_msg(args.workflows_dir))
         return 2
 
     # KNOWN_EXEMPT names files in THIS repo's workflows dir, and the staleness

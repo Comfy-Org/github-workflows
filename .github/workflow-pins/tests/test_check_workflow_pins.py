@@ -3862,7 +3862,12 @@ class CheckDirTests(unittest.TestCase):
         errors, _, _, notices = cwp.check_dir(self.dir, exempt=frozenset())
         self.assertEqual(errors, [], errors)
         self.assertEqual(len(notices), 1, notices)
-        self.assertIn("did NOT run for 2 `ref:` site(s)", notices[0])
+        self.assertIn("could NOT run for 2 `ref:` site(s)", notices[0])
+        # …and it says so as LOST COVERAGE, not as a finding against those
+        # refs: the escape makes a dangling id and a real earlier out-of-scope
+        # step indistinguishable, and the readable path drops the second one
+        # silently too.
+        self.assertIn("lost coverage, not a finding", notices[0])
 
     def test_notices_never_fail_the_run(self):
         # The CLI half, end to end: the warning reaches stdout (so it lands in
@@ -3877,6 +3882,124 @@ class CheckDirTests(unittest.TestCase):
         self.assertEqual(status, 0, out.getvalue())
         self.assertIn("::warning", out.getvalue())
         self.assertIn("every JUDGED ref checkout guarded", out.getvalue())
+
+    def test_only_a_site_left_with_no_verdict_is_recorded(self):
+        # The collector's contract, at the unit: record a site the escape left
+        # with NO `found` entry, and nothing else. Both halves matter.
+        #
+        # (a) Every operand swallowed -> one record, and ONE, not one per
+        #     operand: a site is a LINE here, the unit `_record_steps_output`
+        #     itself works in.
+        found, dropped = [], []
+        lines = [
+            "jobs:",
+            "  job0:",
+            "    steps: &anchored",
+            "      - uses: actions/checkout@abc",
+            "        with:",
+            '          ref: "${{ steps.a.outputs.r || steps.b.outputs.r }}"',
+        ]
+        cwp._record_steps_output(
+            found, lines, 5,
+            [("a", "r", True), ("b", "r", True)],
+            set(), None, drop=(1, 2, dropped),
+        )
+        self.assertEqual(found, [])
+        self.assertEqual(dropped, [(1, 2, 5)])
+
+        # (b) A sibling operand naming a tracked resolver still earns the site
+        #     a `found` entry — it WAS judged, by the operand this reader could
+        #     read — so recording it too would let one `ref:` line carry an
+        #     `::error` and a `::warning` saying it went unjudged.
+        found, dropped = [], []
+        cwp._record_steps_output(
+            found, lines, 5,
+            [("a", "r", True), ("b", "r", False)],
+            {"b"}, None, drop=(1, 2, dropped),
+        )
+        self.assertEqual(len(found), 1, found)
+        self.assertEqual(dropped, [])
+        # No end-to-end fixture for (b) on purpose: `_step_bounds` refuses the
+        # same `steps:` shapes `_job_step_ids` does, so no resolver registers
+        # inside an escaped job today and `resolvers` is empty there. The
+        # guard keeps the count honest if those two readers ever diverge —
+        # they are separate walks over the same key.
+
+    def test_an_anchor_on_the_job_key_line_is_not_printed_as_the_job_name(self):
+        # `  job0: &common` is one of the three escape shapes the message
+        # itself enumerates, so it is a ROUTINE way to reach this annotation —
+        # and trimming only a trailing `:` printed "job `job0: &common`" in
+        # the one annotation whose whole job is to name the job.
+        self._write(
+            "anchor.yml",
+            self._ESCAPED_HEAD
+            + "  job0: &common\n"
+            "    runs-on: ubuntu-latest\n"
+            '    steps: [{uses: actions/checkout@abc, with: {ref: "${{ steps.t1.outputs.ref }}"}}]\n',
+        )
+        _, _, _, notices = cwp.check_dir(self.dir, exempt=frozenset())
+        self.assertEqual(len(notices), 1, notices)
+        self.assertIn("job `job0`:", notices[0])
+        self.assertNotIn("&common", notices[0])
+
+    def test_a_quoted_job_key_keeps_its_own_colon(self):
+        # The cut is at the key's own MAPPING colon, found on the shared
+        # quote-aware scan — not at the first `:` on the line, which would
+        # slice a quoted key in half.
+        self._write(
+            "quoted.yml",
+            self._ESCAPED_HEAD
+            + '  "deploy: prod":\n'
+            "    runs-on: ubuntu-latest\n"
+            '    steps: [{uses: actions/checkout@abc, with: {ref: "${{ steps.t1.outputs.ref }}"}}]\n',
+        )
+        _, _, _, notices = cwp.check_dir(self.dir, exempt=frozenset())
+        self.assertEqual(len(notices), 1, notices)
+        self.assertIn("job `deploy: prod`:", notices[0])
+
+    def test_annotation_values_are_escaped(self):
+        # `path`/`name` come from a directory listing and git permits newlines
+        # and commas in a filename. Unescaped, a crafted name walks out of
+        # `file=` — or, since notices print AHEAD of the errors, starts a line
+        # with `::stop-commands::` and suppresses the error annotations after
+        # it. The escape is a no-op for every real workflow filename.
+        self.assertEqual(cwp._ann_msg("plain.yml"), "plain.yml")
+        self.assertEqual(cwp._ann_prop(".github/workflows/a.yml"), ".github/workflows/a.yml")
+        self.assertEqual(
+            cwp._ann_msg("a\n::stop-commands::b"), "a%0A::stop-commands::b"
+        )
+        self.assertEqual(cwp._ann_prop("a,b:c%d"), "a%2Cb%3Ac%25d")
+        # …and the emitter actually uses them.
+        self._write(
+            "esc,ape.yml",
+            self._ESCAPED_HEAD + GuardCoverageTests.FLOW_STEPS_JOB,
+        )
+        _, _, _, notices = cwp.check_dir(self.dir, exempt=frozenset())
+        self.assertEqual(len(notices), 1, notices)
+        self.assertIn("esc%2Cape.yml,line=", notices[0])
+
+    def test_the_drop_collector_cannot_travel_without_its_job(self):
+        # `_record_steps_output`'s out-parameter is ONE bundle, not three
+        # independently-defaulting arguments: passing the list alone used to
+        # collect `(None, None, idx)`, and `lines[None]` is an exit-1
+        # `TypeError` out of the one path whose entire purpose is non-fatal.
+        import inspect
+
+        params = list(inspect.signature(cwp._record_steps_output).parameters)
+        self.assertNotIn("job_start", params)
+        self.assertNotIn("job_indent", params)
+        self.assertIn("drop", params)
+        # And the coordinates that DO arrive are always real ones.
+        lines = (
+            self._ESCAPED_HEAD + GuardCoverageTests.FLOW_STEPS_JOB
+        ).split("\n")
+        dropped = []
+        cwp.ref_checkouts(lines, dropped=dropped)
+        self.assertTrue(dropped)
+        for job_start, job_indent, idx in dropped:
+            self.assertIsInstance(job_start, int)
+            self.assertIsInstance(job_indent, int)
+            self.assertIsInstance(idx, int)
 
 
 if __name__ == "__main__":
