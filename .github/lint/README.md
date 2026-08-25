@@ -32,7 +32,7 @@ why it is safe:
 comfy-cli                   # public (also on the org-wide PUBLIC_COMFY_ORG_REPOS list)
 ```
 
-Entries are shell globs, matched case-insensitively; a trailing `.git` suffix
+Entries are literal names, compared case-insensitively; a trailing `.git` suffix
 and trailing periods are stripped from the literal before comparison. A trailing
 `-` or `_` is **not** stripped — both are legal at the end of a real slug, so
 stripping them would let `<allowlisted>-` clear on `<allowlisted>`. For a
@@ -47,17 +47,15 @@ Scoping team slugs this way is what stops a CODEOWNERS fixture's team name from
 also clearing a literal reference to a *private repo* of the same name; the
 org-wide checker splits the two lists for the same reason.
 
-**No entry may match an arbitrary name.** An entry that clears **either** of two
-unrelated probe names is a configuration error (exit `2`), not an allowlist
-line: `*`, `**`, `?*`, `[a-z]*`, `[a-y]*`, `[!z]*` and `*[a-z]` all read as
-ordinary edits while switching the whole control off. *Either*, not both —
-requiring both would honour any glob that missed one probe, and `[a-y]*` is a
-single keystroke from `[a-z]*`. The two probes differ in first character, last
-character and separator, so a glob anchored at any of those positions trips one
-of them; every real entry is a plain literal that trips neither. For the same
-reason, prefer enumerating a test-fixture family over globbing it — a
-`secret-*` line pre-approves an unbounded set of names on a list whose entire
-value is that each name was reviewed once.
+**No globs.** An entry containing `*`, `?`, `[` or `]` is a configuration error
+(exit `2`), not an allowlist line: `*`, `**`, `?*`, `[a-z]*`, `[!qz]*` and
+`secret-*` all read as ordinary edits while clearing most or all of the
+namespace. Rejecting the metacharacters is what makes that deterministic — an
+earlier revision tested entries against two fixed probe names instead, and two
+probes cannot decide breadth in general (`[!qz]*` and `[a-p]*` match neither yet
+clear nearly everything). Enumerate a test-fixture family rather than globbing
+it: a `secret-*` line would pre-approve an unbounded set of names on a list
+whose entire value is that each name was reviewed once.
 
 ## Why not `public-repo-hygiene`?
 
@@ -73,8 +71,10 @@ new detection belongs there rather than here.
 
 ## Known limitations
 
-Run `bash check-org-repo-literals.sh --help` for the authoritative list. In
-short:
+Run `bash check-org-repo-literals.sh --help` for the authoritative list — the
+script's numbered KNOWN LIMITATIONS block. Every entry there has a bullet below,
+in the same order, except limitation 5 (*this lint is one category of
+`public-repo-hygiene`*), which is the section above. In short:
 
 - Only **org-prefixed** literals are caught. A bare repo name cannot be linted
   without a denylist that is itself the leak — that half stays with review and
@@ -104,6 +104,16 @@ short:
   through that needs the name spelled exactly like an allowlisted team slug.
   `public-repo-hygiene` reads the `@` from the same position and shares the
   residual.
+- **`_` is identifier-continuation in the left boundary**, so a literal written
+  directly after an underscore is not read as a reference at all — the
+  markdown-italic spelling `_<org>/<name>_` matches nothing. The same accepted
+  trade `public-repo-hygiene` makes, kept identical on purpose so a name cannot
+  pass one checker and fail the other.
+- **Contents only.** The pattern is applied to what a tracked file *contains*,
+  never to the tracked **path** and never to a **symlink's target string** — so
+  a name published as a directory component (`docs/<org>/<name>/placeholder`) or
+  as a link target is not a finding here. `public-repo-hygiene` does scan a
+  symlink's target string; neither checker scans the path itself.
 
 ## Running it
 

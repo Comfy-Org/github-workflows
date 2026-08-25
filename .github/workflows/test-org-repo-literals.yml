@@ -137,18 +137,22 @@ jobs:
 
           exit "$fail"
 
-      - name: Smoke test — an over-broad allowlist entry is rejected, not honoured
+      - name: Smoke test — a globbed allowlist entry is rejected, not honoured
         run: |
-          # The one edit that would silently neuter the whole control is a glob
-          # that matches everything. `*` is only the shortest spelling: `**`,
-          # `?*` and `[a-z]*` all clear every name that reaches the matcher and
-          # all read as ordinary allowlist lines. Each must fail as a
-          # configuration error (exit 2).
+          # The one edit that would silently neuter the whole control is a glob.
+          # `*` is only the shortest spelling: `**`, `?*` and `[a-z]*` all clear
+          # every name that reaches the matcher and all read as ordinary
+          # allowlist lines. Each must fail as a configuration error (exit 2).
+          #
           # `[a-y]*`, `[!z]*` and `*[a-z]` are the same class one keystroke
-          # further out: each misses ONE of the two probes, so a guard that
-          # required both would honour them and then clear almost every name.
+          # further out. `[!qz]*`, `[a-p]*` and `[!q-z]*` are the reason the
+          # guard rejects METACHARACTERS rather than testing entries against two
+          # fixed probe names: each of those three matches NEITHER probe and
+          # still clears nearly the whole namespace, and `secret-*` — a
+          # plausible-looking abbreviation of the fixture block — pre-approves an
+          # unbounded family the same way.
           fail=0
-          for entry in '*' '**' '?*' '[a-z]*' '[a-y]*' '[!z]*' '*[a-z]'; do
+          for entry in '*' '**' '?*' '[a-z]*' '[a-y]*' '[!z]*' '*[a-z]' '[!qz]*' '[a-p]*' '[!q-z]*' 'secret-*' 'secret-?' 'secret-[ab]'; do
             dir="$(mktemp -d)"
             mkdir -p "$dir/.github/lint"
             printf '%s  # oops\n' "$entry" > "$dir/.github/lint/org-repo-allowlist.txt"
@@ -163,6 +167,22 @@ jobs:
               echo "ok (2): allowlist entry '$entry' rejected"
             fi
           done
+
+          # The other half: a plain literal entry must still be honoured, or
+          # "reject globs" could be satisfied by rejecting everything.
+          dir="$(mktemp -d)"
+          mkdir -p "$dir/.github/lint"
+          printf 'not-on-the-main-allowlist  # fixture\n' > "$dir/.github/lint/org-repo-allowlist.txt"
+          printf '%s/%s\n' 'Comfy-Org' 'not-on-the-main-allowlist' > "$dir/fixture.md"
+          status=0
+          output="$(bash .github/lint/check-org-repo-literals.sh --root "$dir" 2>&1)" || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error::a literal allowlist entry exited $status — expected 0"
+            printf '%s\n' "$output"
+            fail=1
+          else
+            echo 'ok (0): a literal allowlist entry still clears its name'
+          fi
           exit "$fail"
 
       - name: Smoke test — a scan that could not run is not a clean tree
@@ -239,6 +259,58 @@ jobs:
           else
             echo "ok (2): an unreadable allowlist is a configuration error"
           fi
+
+          # The git path's own version of the binary-only tree. `git ls-files`
+          # would list this blob (it is INDEXED), while `git grep -I` reads
+          # none of it and exits 1 — "no matches" — so an index-based probe
+          # would print the clean-tree OK line for a tree the scan never read,
+          # the fail-open the fallback already refuses two cases above.
+          tracked_binary="$(mktemp -d)"
+          git -C "$tracked_binary" init -q
+          printf 'a\000b\n' > "$tracked_binary/blob.bin"
+          git -C "$tracked_binary" add blob.bin
+          status=0
+          output="$(bash .github/lint/check-org-repo-literals.sh --root "$tracked_binary" 2>&1)" || status=$?
+          if [ "$status" -ne 2 ]; then
+            echo "::error::a work tree whose only tracked file is binary exited $status — expected 2"
+            printf '%s\n' "$output"
+            fail=1
+          else
+            echo 'ok (2): a work tree with no scannable tracked text file is not reported clean'
+          fi
+
+          # An exported CDPATH makes bash `cd` into a same-named directory
+          # elsewhere AND echo the resolved path on stdout, which lands inside
+          # the command substitution and reaches the hit loop as a bogus
+          # `file:line:match`. The script unsets it; this pins that.
+          cd_outer="$(mktemp -d)"
+          mkdir -p "$cd_outer/decoy/fixture" "$cd_outer/real/fixture"
+          printf 'nothing to see\n' > "$cd_outer/decoy/fixture/decoy.md"
+          printf '%s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$cd_outer/real/fixture/fixture.md"
+          #
+          # The STATUS alone proves nothing here: with CDPATH honoured the run
+          # still exits 1, because the absolute path `cd` echoed is itself
+          # parsed as a hit and reported as a finding. Assert the finding names
+          # the fixture instead.
+          status=0
+          output="$(cd "$cd_outer/real" && CDPATH="$cd_outer/decoy" \
+            bash "$GITHUB_WORKSPACE/.github/lint/check-org-repo-literals.sh" --root fixture 2>/dev/null)" || status=$?
+          if [ "$status" -ne 1 ]; then
+            echo "::error::an exported CDPATH changed the scanned directory (exited $status, expected 1)"
+            printf '%s\n' "$output"
+            fail=1
+          else
+            case "$output" in
+              'fixture.md:1: '*)
+                echo 'ok (1): an exported CDPATH does not move the scan'
+                ;;
+              *)
+                echo '::error::an exported CDPATH reached the hit loop — the finding does not name the fixture'
+                printf '%s\n' "$output"
+                fail=1
+                ;;
+            esac
+          fi
           exit "$fail"
 
       # Every case above runs against a `mktemp -d` root OUTSIDE any checkout,
@@ -291,4 +363,47 @@ jobs:
               fail=1
               ;;
           esac
+
+          # `color.grep=always` injects ANSI bytes INTO the match text, so the
+          # lowercased name stops equalling its allowlist entry and an
+          # allowlisted literal turns into a finding. Assert the status: this
+          # one changes the VERDICT, not just the location.
+          color_dir="$(mktemp -d)"
+          git -C "$color_dir" init -q
+          printf 'see %s/%s\n' 'Comfy-Org' 'comfy-cli' > "$color_dir/fixture.md"
+          git -C "$color_dir" add fixture.md
+          git -C "$color_dir" config color.grep always
+          status=0
+          output="$(bash .github/lint/check-org-repo-literals.sh --root "$color_dir" 2>&1)" || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error::color.grep=always turned an allowlisted name into a finding (exit $status)"
+            printf '%s\n' "$output"
+            fail=1
+          else
+            echo 'ok (0): a hostile color.grep config does not corrupt the match text'
+          fi
+
+          # The name class is unbounded, so one line of `<org>/` + a long run of
+          # name characters is a SINGLE match whose text is most of the file —
+          # printed once to stdout and again as an `::error` annotation. The
+          # finding must be bounded; the allowlist comparison still sees the
+          # whole name (this one is not allowlisted, so it must still fire).
+          long_dir="$(mktemp -d)"
+          long_name="$(printf 'a%.0s' $(seq 1 5000))"
+          printf 'see %s/%s\n' 'Comfy-Org' "$long_name" > "$long_dir/fixture.md"
+          status=0
+          long_out="$(bash .github/lint/check-org-repo-literals.sh --root "$long_dir" 2>/dev/null)" || status=$?
+          longest=0
+          while IFS= read -r long_line; do
+            [ "${#long_line}" -gt "$longest" ] && longest="${#long_line}"
+          done <<< "$long_out"
+          if [ "$status" -ne 1 ]; then
+            echo "::error::a very long name exited $status — expected 1 (a finding)"
+            fail=1
+          elif [ "$longest" -gt 400 ]; then
+            echo "::error::an unbounded match reached the output: longest line is $longest chars"
+            fail=1
+          else
+            echo "ok (1): a very long match is reported bounded ($longest chars)"
+          fi
           exit "$fail"

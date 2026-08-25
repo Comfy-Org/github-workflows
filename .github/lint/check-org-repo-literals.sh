@@ -45,6 +45,26 @@
 #      its tests and docs are full of deliberate fake-private fixtures, and it
 #      references ticket ids by convention throughout. This lint is the subset
 #      that this repo CAN enforce on itself today.
+#   6. A team `@` is judged by POSITION, not by grammar. An `@` glued to the
+#      tail of an identifier (`user@<org>/<name>`, email-shaped) still reads as
+#      a package scope, so such a literal may additionally draw on the
+#      `@`-scoped TEAM entries. Reaching a private name through it needs the
+#      name spelled exactly like an allowlisted team slug.
+#      `public-repo-hygiene` reads the `@` from the same position and shares
+#      this residual.
+#   7. `_` counts as identifier-CONTINUATION in the left boundary, so a literal
+#      written directly after an underscore is not read as a reference at all:
+#      the markdown-italic spelling `_<org>/<name>_` matches NOTHING. That is
+#      the same accepted trade `public-repo-hygiene` makes, kept identical on
+#      purpose so a name cannot pass one checker and fail the other.
+#   8. CONTENTS only. PATTERN is applied to what a tracked file CONTAINS, never
+#      to the tracked PATH itself and never to a symlink's target string
+#      (neither scan path reads one: `git grep` skips the non-regular worktree
+#      entry, and `grep -r` does not follow a discovered link). A name
+#      published as a directory component -- `docs/<org>/<name>/placeholder` --
+#      or as a link target is therefore not a finding here.
+#      `public-repo-hygiene` does scan a symlink's target string; neither
+#      checker scans the tracked path itself.
 #
 # TAMPER BOUNDARY: unlike the reusable checkers this repo publishes, this lint
 # runs from the PR's own checkout, so a PR here can edit both the script and the
@@ -65,6 +85,13 @@ set -euo pipefail
 # both `grep` and the `tr` below, so a green run here means the same thing it
 # means on CI.
 export LC_ALL=C
+
+# Both `cd -- "$root"` calls below take a caller-supplied, possibly RELATIVE
+# path. With `CDPATH` exported, `cd` can land in a same-named directory that is
+# not the one `[ -d "$root" ]` validated -- and it echoes the resolved absolute
+# path on stdout, which lands inside a command substitution and reaches the hit
+# loop as a bogus `file:line:match` line.
+unset CDPATH
 
 ORG='Comfy-Org'
 # Deliberately assembled rather than written whole: a literal org-prefixed name
@@ -155,26 +182,19 @@ fi
 # exit 2; so is this one.
 [ -r "$allowlist" ] || { echo "error: allowlist '$allowlist' is not readable" >&2; exit 2; }
 
-# Two names no allowlist entry has any business matching. An entry that clears
-# EITHER is not an allowlist line, it is an off switch: `*`, `**`, `?*` and
-# `[a-z]*` all read as ordinary-looking edits while clearing every name that
-# reaches the `case` below. Testing behaviour rather than spelling is what makes
-# the guard cover the spellings nobody thought to enumerate.
+# The one edit that would silently neuter this whole control is a GLOB: `*`,
+# `**`, `?*` and `[a-z]*` all read as ordinary-looking allowlist lines while
+# clearing every name that reaches the comparison below.
 #
-# EITHER, not both. Requiring both leaves any glob that misses ONE probe
-# honoured, which is a single keystroke from the spellings above: `[a-y]*` misses
-# probe A (it starts with `z`) and then clears every name beginning a-y, and
-# `[!z]*` and `*[a-z]` slip through the same gap. Rejecting on either costs
-# nothing -- both probes are nonsense strings, and every entry on the list today
-# is a plain literal that matches neither.
-#
-# The two differ in FIRST character, LAST character and separator on purpose
-# (`z`/`q`, a letter/a digit, `-`/`.`), so a glob anchored at any of those three
-# positions trips at least one of them.
-OVERBROAD_PROBE_A='zzq0probe-not-a-real-name-9f3d'
-OVERBROAD_PROBE_B='qx7probe.not-a-real-name-2b8'
+# Earlier revisions tested entries against two fixed nonsense probe names and
+# rejected an entry that matched either. That cannot decide breadth in general:
+# `[!qz]*`, `[a-p]*` and `[!q-z]*` match NEITHER probe and still clear almost
+# the whole namespace, and `secret-*` pre-approves an unbounded family the same
+# way. So the METACHARACTERS are what is rejected, which is deterministic and
+# free -- every entry on the list is a plain literal, and enumerating a fixture
+# family rather than globbing it is already the documented house style.
 
-# Allowlist entries are shell globs, matched case-insensitively (GitHub
+# Allowlist entries are LITERAL names compared case-insensitively (GitHub
 # resolves owner/repo names case-insensitively, so a case variant of an
 # allowlisted PUBLIC name is the same repo — and no private name is on this
 # list under any casing, so folding case cannot clear one).
@@ -183,10 +203,10 @@ OVERBROAD_PROBE_B='qx7probe.not-a-real-name-2b8'
 # `@`-prefixed literal. A plain entry clears either spelling, because
 # `@<org>/<name>` is also how npm and GitHub Packages write a package scope for
 # a repo of that name — the same asymmetry `public-repo-hygiene` documents.
-patterns=()
-pattern_count=0
-team_patterns=()
-team_pattern_count=0
+entries=()
+entry_count=0
+team_entries=()
+team_entry_count=0
 # `|| [ -n "$line" ]` so a final entry with no trailing newline is not dropped.
 while IFS= read -r line || [ -n "$line" ]; do
   line="${line%%#*}"                       # strip the trailing "why it's safe" comment
@@ -199,29 +219,26 @@ while IFS= read -r line || [ -n "$line" ]; do
     @*) is_team=1; entry="${entry#@}" ;;
   esac
   [ -n "$entry" ] || { echo "error: allowlist '$allowlist' has an entry that is a bare '@'" >&2; exit 2; }
-  overbroad=0
-  # shellcheck disable=SC2254  # $entry is intentionally a glob, not a literal
-  case "$OVERBROAD_PROBE_A" in $entry) overbroad=1 ;; esac
-  # shellcheck disable=SC2254
-  case "$OVERBROAD_PROBE_B" in $entry) overbroad=1 ;; esac
-  if [ "$overbroad" -eq 1 ]; then
-    echo "error: allowlist '$allowlist' entry '$line' matches an arbitrary name, which allows every name" >&2
-    exit 2
-  fi
+  case "$entry" in
+    *[][*?]*)
+      echo "error: allowlist '$allowlist' entry '$line' contains a glob metacharacter ([, ], * or ?); entries are literal names, and a glob can allow every name" >&2
+      exit 2
+      ;;
+  esac
   if [ "$is_team" -eq 1 ]; then
-    team_patterns+=("$entry")
-    team_pattern_count=$((team_pattern_count + 1))
+    team_entries+=("$entry")
+    team_entry_count=$((team_entry_count + 1))
   else
-    patterns+=("$entry")
-    pattern_count=$((pattern_count + 1))
+    entries+=("$entry")
+    entry_count=$((entry_count + 1))
   fi
 done < "$allowlist"
 
-# Counted rather than `${#patterns[@]}`: bash 3.2 (still /bin/bash on macOS)
+# Counted rather than `${#entries[@]}`: bash 3.2 (still /bin/bash on macOS)
 # treats an empty array as unset under `set -u`, so the guard would abort with
 # `unbound variable` instead of this message. The `for` loops below are only
 # reached with a non-empty array for the same reason.
-if [ "$((pattern_count + team_pattern_count))" -eq 0 ]; then
+if [ "$((entry_count + team_entry_count))" -eq 0 ]; then
   echo "error: allowlist '$allowlist' has no entries" >&2
   exit 2
 fi
@@ -238,10 +255,26 @@ if git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   # tracked files, `git grep` matches nothing, exits 1, and that is
   # indistinguishable from a clean tree. Fail closed instead, and report the
   # scope actually scanned rather than claiming the whole tracked tree.
+  #
+  # The probe has to be THE SAME READ the scan makes, not merely a read of the
+  # same tree. `git ls-files` enumerates the INDEX, which counts blobs the scan
+  # below skips: a scope whose tracked files are all binary (one `*.md binary`
+  # attribute line, a UTF-16 subtree, `--root assets/`) or all empty has a
+  # non-empty index while `git grep -I` reads none of it, so an index probe
+  # would clear and the scan would then exit 1 -- "no matches" -- and print the
+  # clean-tree OK line for a tree it never read. `git grep -Il -e ''` lists
+  # exactly the files the scan can open, which is also what the fallback's
+  # `grep -rIl -e ''` probe lists, so both paths give a binary-only tree the
+  # same verdict. `-E` is passed for the same reason the scan passes it: to
+  # override a `grep.patternType` that would reinterpret the empty pattern.
+  #
+  # `|| true` and an emptiness test rather than a status test, because `head`
+  # closing the pipe early makes `git grep` die of SIGPIPE and `pipefail` would
+  # read that as a scan error on a perfectly good tree.
   scope="the tracked files under '$root'"
-  first_tracked="$(git -C "$root" ls-files -- . 2>/dev/null | head -n 1 || true)"
-  if [ -z "$first_tracked" ]; then
-    echo "error: no tracked files under '$root' — refusing to report a clean tree" >&2
+  first_scannable="$(git -C "$root" grep -IlE -e '' -- . 2>/dev/null | head -n 1 || true)"
+  if [ -z "$first_scannable" ]; then
+    echo "error: no scannable tracked text file under '$root' — refusing to report a clean tree" >&2
     exit 2
   fi
   # The allowlist file itself is NOT excluded. Its entries are bare names that
@@ -258,7 +291,14 @@ if git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   # text is authoritative) but every printed location and `::error` annotation
   # would point at the wrong place. `-E` is passed explicitly for the same reason
   # and overrides `grep.patternType`.
-  hits="$(git -C "$root" -c grep.column=false -c grep.lineNumber=true -c grep.fullName=false grep -oiInE -- "$PATTERN" -- .)" || scan_status=$?
+  #
+  # `color.grep` and `core.quotePath` reshape the same output and are pinned
+  # alongside them: `color.grep=always` injects ANSI bytes into the match text,
+  # which corrupts the lowercased name so an allowlisted entry stops matching,
+  # and `core.quotePath=true` (git's DEFAULT) emits a path holding a non-ASCII
+  # byte quoted and octal-escaped, so the `::error file=` annotation would name
+  # a path that does not exist -- while the fallback `grep -r` prints it raw.
+  hits="$(git -C "$root" -c grep.column=false -c grep.lineNumber=true -c grep.fullName=false -c color.grep=false -c core.quotePath=false grep -oiInE -- "$PATTERN" -- .)" || scan_status=$?
 else
   # `cd` + a `.` root rather than grepping "$root" and stripping the prefix
   # afterwards: the strip would be a `sed` expression built from a path this
@@ -372,27 +412,32 @@ while IFS= read -r hit; do
   [ -n "$lower" ] || continue
 
   allowed=0
-  if [ "$pattern_count" -gt 0 ]; then
-    for p in "${patterns[@]}"; do
-      # shellcheck disable=SC2254  # $p is intentionally a glob, not a literal
-      case "$lower" in
-        $p) allowed=1; break ;;
-      esac
+  if [ "$entry_count" -gt 0 ]; then
+    for known in "${entries[@]}"; do
+      if [ "$lower" = "$known" ]; then allowed=1; break; fi
     done
   fi
-  if [ "$allowed" -eq 0 ] && [ "$is_at" -eq 1 ] && [ "$team_pattern_count" -gt 0 ]; then
-    for p in "${team_patterns[@]}"; do
-      # shellcheck disable=SC2254  # $p is intentionally a glob, not a literal
-      case "$lower" in
-        $p) allowed=1; break ;;
-      esac
+  if [ "$allowed" -eq 0 ] && [ "$is_at" -eq 1 ] && [ "$team_entry_count" -gt 0 ]; then
+    for known in "${team_entries[@]}"; do
+      if [ "$lower" = "$known" ]; then allowed=1; break; fi
     done
   fi
 
   if [ "$allowed" -eq 0 ]; then
     findings=$((findings + 1))
-    echo "$file:$lineno: $match is not on $allowlist_rel"
-    echo "::error file=$file,line=$lineno::unapproved ${ORG} repo literal: $match"
+    # Bound the literal before it is printed. The name class is unbounded, so
+    # one tracked line of `<org>/` followed by a long run of name characters is
+    # a SINGLE match whose text is most of the file -- printed once to stdout
+    # and once more as an `::error` annotation. `public-repo-hygiene` bounds the
+    # same token for the same reason (`_bounded`, 200 chars); the cut is
+    # display-only, so what is compared against the allowlist is still the whole
+    # name and a truncated finding can never be a cleared one.
+    shown="$match"
+    if [ "${#shown}" -gt 200 ]; then
+      shown="${shown:0:200}... (truncated)"
+    fi
+    echo "$file:$lineno: $shown is not on $allowlist_rel"
+    echo "::error file=$file,line=$lineno::unapproved ${ORG} repo literal: $shown"
   fi
 done <<< "$hits"
 

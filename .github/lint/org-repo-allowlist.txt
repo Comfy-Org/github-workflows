@@ -2,7 +2,7 @@
 # that may appear as literals in this public repo's tracked tree.
 #
 # One entry per line, each with a trailing `#` comment saying WHY it is safe.
-# Entries are shell globs and are matched case-insensitively (GitHub resolves
+# Entries are LITERAL names, compared case-insensitively (GitHub resolves
 # owner/repo names case-insensitively). A trailing `.git` suffix and trailing
 # periods are stripped from the literal before it is compared; a trailing `-`
 # or `_` is NOT, because both are legal at the end of a real slug and
@@ -14,12 +14,12 @@
 # repo namespace is why a CODEOWNERS fixture's team name does not also clear a
 # literal reference to a private REPO of that name.
 #
-# No entry may match an arbitrary name: an entry that clears EITHER of two
-# unrelated probe names is rejected as a configuration error (exit 2), because
-# `*`, `**`, `?*`, `[a-z]*`, `[a-y]*`, `[!z]*` and `*[a-z]` all read as ordinary
-# allowlist edits while switching the whole control off. Either, not both: a
-# glob that missed one probe would otherwise be honoured, and that is a single
-# keystroke from the spellings above.
+# NO GLOBS. An entry containing `*`, `?`, `[` or `]` is rejected as a
+# configuration error (exit 2), because `*`, `**`, `?*`, `[a-z]*`, `[!qz]*` and
+# `secret-*` all read as ordinary allowlist edits while clearing most or all of
+# the namespace — and no fixed set of probe names can decide breadth in general,
+# which is why the metacharacters themselves are what is refused. Every name
+# here is spelled out; a family of test fixtures is enumerated, not globbed.
 #
 # Adding a line here is the ratification step: it is what makes "this name is
 # safe to publish" a reviewed decision instead of an assumption. Never add a
@@ -85,6 +85,15 @@ notes                       # path-shaped example (`docs/v1.2/<org>/notes`) in t
 # This org publishes weights under a Hugging Face namespace of the same name, so
 # these names have no GitHub existence at all. They are product content, not
 # references.
+#
+# Allowlist membership is GLOBAL, not per-host: these lines clear a
+# `github.com/<org>/<name>` reference just as they clear the model-host one that
+# justifies them. A KNOWN CROSSING, named here the way the team block above
+# names its own, so the host-specific rationale does not read as a host-specific
+# exception. Residual: if a private GitHub repo ever took one of these names,
+# the reference would ship without its own ratification step. None of them is a
+# repository in this org today. The doc-example and fixture blocks below carry
+# the same crossing for the same reason.
 qwen-image-edit_comfyui     # public HF model, quoted in the public-repo-hygiene docs/tests
 qwen-image_comfyui          # public HF model, quoted in the public-repo-hygiene tests
 ace_step_1.5_comfyui_files  # public HF model, quoted in the public-repo-hygiene tests
@@ -98,11 +107,12 @@ some-set-abc123             # HF-route fixture in the public-repo-hygiene tests
 
 # ── Test fixtures — invented names, no such repo ──
 # These are the fake "private" names the bump-callers and public-repo-hygiene
-# suites use to prove masking and default-deny. Enumerated rather than globbed:
-# a `secret-*` glob would pre-approve an unbounded family on a default-deny
-# list, so a real private repo whose name began `secret-` would ship without
-# tripping the lint. A NEW fixture name needs a line here, on purpose: that edit
-# is where a reviewer confirms it is invented.
+# suites use to prove masking and default-deny. Enumerated rather than globbed
+# — and a `secret-*` line is now REJECTED outright, because pre-approving an
+# unbounded family on a default-deny list would let a real private repo whose
+# name began `secret-` ship without tripping the lint. A NEW fixture name needs
+# a line here, on purpose: that edit is where a reviewer confirms it is
+# invented.
 comfyui2                    # public-repo-hygiene fixture: invented near-miss of a real public name
 a.b.c                       # bump-callers fixture (dotted name shape)
 not-a-public-repo           # public-repo-hygiene fixture
