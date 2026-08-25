@@ -2225,7 +2225,9 @@ def _skips_on_empty_output(lines, idx, step_id, out):
     return False
 
 
-def _record_steps_output(found, lines, idx, sites, resolvers, step_ids):
+def _record_steps_output(
+    found, lines, idx, sites, resolvers, step_ids, job_start=None, job_indent=None, dropped=None
+):
     """Record the `ref:` at `idx`, which reads `steps.<id>.outputs.<out>`.
 
     `sites` is EVERY step output the value reads (BE-8253), and every one of
@@ -2259,6 +2261,16 @@ def _record_steps_output(found, lines, idx, sites, resolvers, step_ids):
     (both rest on "no step of that id exists"), which is also what a real
     earlier out-of-scope step does to both today. Sites whose id names a
     tracked resolver are judged exactly as always.
+
+    `dropped`, when a caller passes a list, collects
+    `(job_start, job_indent, idx)` for every site that escape swallows
+    (BE-9045). The drop itself is right — a fail-CLOSED escape manufactures
+    false CI failures out of a pre-scan that could not run — but it is
+    INVISIBLE, so reformatting a job's `steps:` into one of those shapes is an
+    in-band way to switch that job's dangling check off with nothing in the
+    output to say so. The collector is the observability channel and nothing
+    more: it never changes a verdict, and `check_dir` turns it into a
+    non-fatal `::warning` that leaves the exit status alone.
 
     When `<id>` matches NO step declared before the consuming one (a typo'd
     id, a step in another job, a resolver declared below its consumer), the
@@ -2298,6 +2310,16 @@ def _record_steps_output(found, lines, idx, sites, resolvers, step_ids):
     for step_id, out, leading in sites:
         if step_id not in resolvers:
             if step_ids is None:
+                if dropped is not None:
+                    # Record the drop for `check_dir`'s non-fatal warning
+                    # (BE-9045) BEFORE the `continue` that loses it. Carries
+                    # the job's own coordinates because the annotation names
+                    # the job and points at its `steps:` line, and `check_dir`
+                    # has neither by the time it sees this list. Per OPERAND,
+                    # so a value reading two escaped outputs appends twice —
+                    # `check_dir` counts distinct `idx`, which is what
+                    # "checkout(s)" means in the message.
+                    dropped.append((job_start, job_indent, idx))
                 # The job's `steps:` is a shape `_job_step_ids` will not stand
                 # behind, so "no such step" and "a real earlier step this lint
                 # has no claim on" are indistinguishable here. Drop the site —
@@ -2370,7 +2392,7 @@ def _record_steps_output(found, lines, idx, sites, resolvers, step_ids):
     found.append((idx + 1, False, all(verdicts), True))
 
 
-def ref_checkouts(lines):
+def ref_checkouts(lines, dropped=None):
     """(1-based line, uses_fallback, guarded, via_step_output) for EVERY ref checkout.
 
     A use is guarded when the empty-ref guard step appears earlier in the SAME
@@ -2409,6 +2431,13 @@ def ref_checkouts(lines):
     start with, so something ahead of it decides the value — or `'unparsed'`,
     a value that plainly reads a step output in a spelling this reader cannot
     judge at all, which used to record no site and pass.
+
+    `dropped` is an OPTIONAL out-parameter, not a return-shape change
+    (BE-9045): the returned tuple is what 49 call sites read, so the
+    observability channel for the BE-8254 fail-open is a list the caller
+    passes in and `_record_steps_output` appends `(job_start, job_indent,
+    idx)` to. Passing one changes no verdict and no return value — only
+    `check_dir` does, and only to emit a non-fatal `::warning`.
     """
     aliases = env_aliases(lines)
     ref_res = _ref_use_res(aliases)
@@ -2503,7 +2532,15 @@ def ref_checkouts(lines):
                         # checkout, and it is the key line's own step that
                         # must carry the skip `if:`.
                         _record_steps_output(
-                            found, lines, pending[0], resolved, resolvers, step_ids
+                            found,
+                            lines,
+                            pending[0],
+                            resolved,
+                            resolvers,
+                            step_ids,
+                            start,
+                            job_indent,
+                            dropped,
                         )
                         pending = None
                     elif resolved == UNPARSED:
@@ -2596,7 +2633,17 @@ def ref_checkouts(lines):
             else:
                 resolved = _steps_output_sites(line)
                 if resolved is not None:
-                    _record_steps_output(found, lines, i, resolved, resolvers, step_ids)
+                    _record_steps_output(
+                        found,
+                        lines,
+                        i,
+                        resolved,
+                        resolvers,
+                        step_ids,
+                        start,
+                        job_indent,
+                        dropped,
+                    )
     return found
 
 
@@ -2625,11 +2672,55 @@ def find_unguarded_ref_checkouts(lines):
     return [lineno for lineno, _, _ in unguarded_ref_checkouts(lines)]
 
 
+def _escaped_steps_warning(path, name, lines, job_start, job_indent, count):
+    """The non-fatal `::warning` for one job whose `steps:` escaped the pre-scan.
+
+    Points at the `steps:` line rather than the job key, because that line IS
+    the shape to rewrite — recomputed with the SAME lookup `_job_step_ids`
+    uses, so the two can never disagree about which key they mean, and falling
+    back to the job line only where the lookup finds none at all.
+
+    The job name is read off the key line through the module's quote-aware
+    `_strip_comment`, not by trimming the raw line: `  build:  # the mapper`
+    is legal YAML and a raw trim prints the comment as part of the job's name,
+    in the one annotation whose whole job is to name the job.
+    """
+    job_name = _strip_comment(lines[job_start]).strip()
+    if job_name.endswith(":"):
+        job_name = job_name[:-1]
+    job_name = job_name.strip().strip("'\"")
+    steps_line = None
+    job_child = _first_child_indent(lines, job_start, job_indent)
+    if job_child is not None:
+        steps_line = _find_key(lines, "steps", job_start, job_child, job_indent)
+    if steps_line is None:
+        steps_line = job_start
+    return (
+        "::warning file=%s,line=%d::%s job `%s`: its `steps:` could not be read "
+        "as a step sequence (`steps: [ … ]` / an anchor on the key line, or no "
+        "`- ` item below it), so the dangling-ref check did NOT run for %d "
+        "`ref:` site(s) in this job — one per `ref:` LINE, this lint's unit "
+        "throughout — and the checkout(s) they feed were passed unjudged. "
+        "Rewrite `steps:` as a block sequence (`steps:` then `- uses: … ` "
+        "items) to restore it. See BE-9045."
+        % (path, steps_line + 1, name, job_name, count)
+    )
+
+
 def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
-    """Returns (errors, checked, exempt_ok) — errors are annotation-ready strings."""
+    """Returns (errors, checked, exempt_ok, notices) — errors and notices are annotation-ready strings; only errors fail the run.
+
+    `notices` carries the BE-9045 observability channel: one `::warning` per
+    job whose `steps:` defeated the BE-8254 pre-scan AND actually cost a site
+    its dangling verdict. It NEVER affects the exit status — `main` prints it
+    and still returns 0 — because the drop it reports is a deliberate
+    fail-open (a fail-CLOSED escape manufactures false CI failures out of a
+    pre-scan that could not run); what was wrong was that the drop was silent.
+    """
     errors = []
     checked = []
     exempt_ok = []
+    notices = []
     seen_exempt = set()
 
     names = sorted(
@@ -2710,7 +2801,36 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
         # recognized" one. Fail-closed, but a false failure with contradictory
         # advice. `ref_checkouts` judges the continuation line the parser
         # matched, and computes the alias scan once instead of once per line.
-        self_pins_to_job_workflow_sha = any(fb for _, fb, _, _ in ref_checkouts(lines))
+        #
+        # `dropped` rides along on this SAME walk (BE-9045) rather than adding
+        # a third one: the sites the BE-8254 fail-open swallows are collected
+        # where they are dropped, and turned into non-fatal warnings below.
+        dropped = []
+        self_pins_to_job_workflow_sha = any(
+            fb for _, fb, _, _ in ref_checkouts(lines, dropped=dropped)
+        )
+
+        # One warning per JOB, first-seen order, and only for a job that
+        # actually lost a site: a flow-`steps:` job with no
+        # `steps.<id>.outputs.<out>` consumer never reaches the drop branch and
+        # stays silent. Counted over DISTINCT `idx` because the collector
+        # appends per OPERAND, while a SITE is a line — which is this lint's
+        # unit everywhere (`_record_steps_output` appends at most one `found`
+        # entry per call, keyed on the line). Two flow-style checkouts written
+        # on ONE physical line are therefore one site here, exactly as they
+        # are one entry in `found`; the message says "`ref:` site(s)" rather
+        # than "checkouts" so the number cannot be read as a claim the reader
+        # can check against the job's step count.
+        by_job = {}
+        for job_start, job_indent, idx in dropped:
+            job = by_job.setdefault((job_start, job_indent), set())
+            job.add(idx)
+        for (job_start, job_indent), sites in by_job.items():
+            notices.append(
+                _escaped_steps_warning(
+                    path, name, lines, job_start, job_indent, len(sites)
+                )
+            )
 
         for lineno in defaults:
             if self_pins_to_job_workflow_sha and _default_value(lines[lineno - 1]) in ("''", '""'):
@@ -2851,7 +2971,7 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
             % (name, workflows_dir, INPUT_NAME)
         )
 
-    return errors, checked, exempt_ok
+    return errors, checked, exempt_ok, notices
 
 
 def main(argv=None):
@@ -2872,13 +2992,19 @@ def main(argv=None):
     # ad-hoc --workflows-dir (a fixture, another repo) every entry looks stale,
     # so the list only applies where it means something.
     exempt = KNOWN_EXEMPT if args.workflows_dir == DEFAULT_WORKFLOWS_DIR else frozenset()
-    errors, checked, exempt_ok = check_dir(args.workflows_dir, exempt=exempt)
+    errors, checked, exempt_ok, notices = check_dir(args.workflows_dir, exempt=exempt)
 
     for name in checked:
         note = " (KNOWN_EXEMPT — tracked separately)" if name in exempt_ok else ""
         print("checked %s%s" % (name, note))
     if not checked:
         print("no reusable workflow declares a `%s` input" % INPUT_NAME)
+
+    # Ahead of the errors and OUTSIDE the exit-status logic (BE-9045): a
+    # warning names coverage this run did not have, never a problem with the
+    # workflow it names.
+    for notice in notices:
+        print(notice)
 
     for err in errors:
         print(err)
@@ -2889,6 +3015,18 @@ def main(argv=None):
             "empty value first." % (len(errors), INPUT_NAME)
         )
         return 1
+
+    if notices:
+        # Do NOT claim full coverage over a run that skipped jobs: the
+        # difference between "every checkout is guarded" and "every checkout I
+        # could JUDGE is guarded" is the whole point of the warnings above.
+        print(
+            "\nOK — %d workflow(s) declare `%s`, none with a default, every "
+            "JUDGED ref checkout guarded (%d exempt); %d job(s) skipped the "
+            "dangling-ref check — see the warning(s) above."
+            % (len(checked), INPUT_NAME, len(exempt_ok), len(notices))
+        )
+        return 0
 
     print(
         "\nOK — %d workflow(s) declare `%s`, none with a default, every ref "

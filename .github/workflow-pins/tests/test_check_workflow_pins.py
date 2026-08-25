@@ -10,6 +10,8 @@ in the header comment, a caller's `with:` value of the same name, and a
 `default:` belonging to the NEXT input.
 """
 
+import contextlib
+import io
 import os
 import shutil
 import sys
@@ -1860,7 +1862,7 @@ class GuardCoverageTests(unittest.TestCase):
         )
         with open(os.path.join(tmp, "w.yml"), "w", encoding="utf-8") as f:
             f.write(text)
-        errors, _, _ = cwp.check_dir(tmp, exempt=frozenset())
+        errors, _, _, _ = cwp.check_dir(tmp, exempt=frozenset())
         self.assertEqual(len(errors), 1, errors)
         self.assertIn("BE-8215", errors[0])
         self.assertIn("DEFAULT BRANCH", errors[0])
@@ -2603,7 +2605,7 @@ class GuardCoverageTests(unittest.TestCase):
         )
         with open(os.path.join(tmp, "w.yml"), "w", encoding="utf-8") as f:
             f.write(text)
-        errors, _, _ = cwp.check_dir(tmp, exempt=frozenset())
+        errors, _, _, _ = cwp.check_dir(tmp, exempt=frozenset())
         self.assertEqual(len(errors), 1, errors)
         self.assertIn("BE-8130", errors[0])
         self.assertIn("resolved from a step", errors[0])
@@ -2820,7 +2822,7 @@ class GuardCoverageTests(unittest.TestCase):
         )
         with open(os.path.join(tmp, "w.yml"), "w", encoding="utf-8") as f:
             f.write(text)
-        errors, _, _ = cwp.check_dir(tmp, exempt=frozenset())
+        errors, _, _, _ = cwp.check_dir(tmp, exempt=frozenset())
         self.assertEqual(len(errors), 1, errors)
         return errors[0]
 
@@ -3293,14 +3295,14 @@ class CheckDirTests(unittest.TestCase):
     def test_clean_dir_passes(self):
         self._write("good.yml", _reusable(PINNED))
         self._write("unrelated.yml", "name: F\non: [push]\njobs: {}\n")
-        errors, checked, exempt_ok = cwp.check_dir(self.dir, exempt=frozenset())
+        errors, checked, exempt_ok, _ = cwp.check_dir(self.dir, exempt=frozenset())
         self.assertEqual(errors, [])
         self.assertEqual(checked, ["good.yml"])
         self.assertEqual(exempt_ok, [])
 
     def test_defaulted_dir_fails_with_an_annotation(self):
         self._write("bad.yml", _reusable(DEFAULTED))
-        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        errors, checked, _, _ = cwp.check_dir(self.dir, exempt=frozenset())
         self.assertEqual(len(errors), 1, errors)
         self.assertTrue(errors[0].startswith("::error file="), errors[0])
         self.assertIn("bad.yml", errors[0])
@@ -3340,7 +3342,7 @@ class CheckDirTests(unittest.TestCase):
             "          ref: ${{ inputs.workflows_ref || job.workflow_sha }}\n"
         )
         self._write("groom-like.yml", text)
-        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        errors, checked, _, _ = cwp.check_dir(self.dir, exempt=frozenset())
         self.assertEqual(errors, [], errors)
         self.assertEqual(checked, ["groom-like.yml"])
 
@@ -3369,7 +3371,7 @@ class CheckDirTests(unittest.TestCase):
             "          ref: ${{ inputs.workflows_ref || job.workflow_sha || 'main' }}\n"
         )
         self._write("sneaky.yml", text)
-        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        errors, checked, _, _ = cwp.check_dir(self.dir, exempt=frozenset())
         self.assertTrue(any("BE-5546" in e and "default:" in e for e in errors), errors)
         self.assertEqual(checked, ["sneaky.yml"])
 
@@ -3403,7 +3405,7 @@ class CheckDirTests(unittest.TestCase):
             "          ref: ${{ inputs.workflows_ref }}  # not ${{ inputs.workflows_ref || job.workflow_sha }}\n"
         )
         self._write("commented.yml", text)
-        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        errors, checked, _, _ = cwp.check_dir(self.dir, exempt=frozenset())
         self.assertTrue(any("BE-5546" in e and "default:" in e for e in errors), errors)
         self.assertEqual(checked, ["commented.yml"])
 
@@ -3439,7 +3441,7 @@ class CheckDirTests(unittest.TestCase):
             "          ref: ${{ inputs.workflows_ref || job.workflow_sha }}  # pinned\n"
         )
         self._write("pinned.yml", text)
-        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        errors, checked, _, _ = cwp.check_dir(self.dir, exempt=frozenset())
         self.assertEqual(errors, [])
         self.assertEqual(checked, ["pinned.yml"])
 
@@ -3477,7 +3479,7 @@ class CheckDirTests(unittest.TestCase):
             "            ${{ inputs.workflows_ref || job.workflow_sha }}\n"
         )
         self._write("folded.yml", text)
-        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        errors, checked, _, _ = cwp.check_dir(self.dir, exempt=frozenset())
         self.assertEqual(errors, [])
         self.assertEqual(checked, ["folded.yml"])
 
@@ -3507,7 +3509,7 @@ class CheckDirTests(unittest.TestCase):
             "          ref: ${{ inputs.workflows_ref || github.job_workflow_sha }}\n"
         )
         self._write("stale-spelling.yml", text)
-        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        errors, checked, _, _ = cwp.check_dir(self.dir, exempt=frozenset())
         self.assertEqual(len(errors), 2, errors)
         self.assertEqual(checked, ["stale-spelling.yml"])
 
@@ -3535,19 +3537,19 @@ class CheckDirTests(unittest.TestCase):
             "          ref: ${{ inputs.workflows_ref }}\n"
         )
         self._write("bad.yml", text)
-        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        errors, checked, _, _ = cwp.check_dir(self.dir, exempt=frozenset())
         self.assertEqual(len(errors), 2, errors)
 
     def test_exempt_workflow_is_tolerated(self):
         self._write("legacy.yml", _reusable(DEFAULTED))
-        errors, checked, exempt_ok = cwp.check_dir(self.dir, exempt=frozenset({"legacy.yml"}))
+        errors, checked, exempt_ok, _ = cwp.check_dir(self.dir, exempt=frozenset({"legacy.yml"}))
         self.assertEqual(errors, [])
         self.assertEqual(exempt_ok, ["legacy.yml"])
         self.assertEqual(checked, ["legacy.yml"])
 
     def test_stale_exemption_fails_so_the_list_drains(self):
         self._write("legacy.yml", _reusable(PINNED))
-        errors, _, exempt_ok = cwp.check_dir(self.dir, exempt=frozenset({"legacy.yml"}))
+        errors, _, exempt_ok, _ = cwp.check_dir(self.dir, exempt=frozenset({"legacy.yml"}))
         self.assertEqual(len(errors), 1, errors)
         self.assertIn("KNOWN_EXEMPT", errors[0])
         self.assertEqual(exempt_ok, [])
@@ -3569,7 +3571,7 @@ class CheckDirTests(unittest.TestCase):
             "        with:\n"
             "          ref: ${{ inputs.workflows_ref }}\n",
         )
-        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        errors, checked, _, _ = cwp.check_dir(self.dir, exempt=frozenset())
         self.assertEqual(len(errors), 1, errors)
         self.assertIn("NOT covering this file", errors[0])
         self.assertEqual(checked, [])
@@ -3590,7 +3592,7 @@ class CheckDirTests(unittest.TestCase):
             "      - uses: actions/checkout@abc\n"
             '        with: {repository: Comfy-Org/github-workflows, ref: "${{ inputs.workflows_ref }}"}\n',
         )
-        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        errors, checked, _, _ = cwp.check_dir(self.dir, exempt=frozenset())
         self.assertEqual(len(errors), 1, errors)
         self.assertIn("NOT covering this file", errors[0])
         self.assertEqual(checked, [])
@@ -3613,7 +3615,7 @@ class CheckDirTests(unittest.TestCase):
             "        with:\n"
             "          ref: ${{ inputs['workflows_ref'] }}\n",
         )
-        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        errors, checked, _, _ = cwp.check_dir(self.dir, exempt=frozenset())
         self.assertEqual(len(errors), 1, errors)
         self.assertIn("NOT covering this file", errors[0])
         self.assertEqual(checked, [])
@@ -3635,7 +3637,7 @@ class CheckDirTests(unittest.TestCase):
             "          ref: >-\n"
             "            ${{ inputs.workflows_ref }}\n",
         )
-        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        errors, checked, _, _ = cwp.check_dir(self.dir, exempt=frozenset())
         self.assertEqual(len(errors), 1, errors)
         self.assertIn("NOT covering this file", errors[0])
         self.assertEqual(checked, [])
@@ -3653,7 +3655,7 @@ class CheckDirTests(unittest.TestCase):
                 "            ${{ inputs.workflows_ref }}\n",
             ),
         )
-        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        errors, checked, _, _ = cwp.check_dir(self.dir, exempt=frozenset())
         self.assertEqual(len(errors), 1, errors)
         self.assertIn("no empty-ref guard", errors[0])
         self.assertEqual(checked, ["leaky.yml"])
@@ -3676,7 +3678,7 @@ class CheckDirTests(unittest.TestCase):
             "          ref:  # the pinned ref\n"
             "            ${{ inputs.workflows_ref }}\n",
         )
-        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        errors, checked, _, _ = cwp.check_dir(self.dir, exempt=frozenset())
         self.assertEqual(len(errors), 1, errors)
         self.assertIn("NOT covering this file", errors[0])
         self.assertEqual(checked, [])
@@ -3692,14 +3694,14 @@ class CheckDirTests(unittest.TestCase):
                 "            ${{ inputs.workflows_ref }}\n",
             ),
         )
-        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        errors, checked, _, _ = cwp.check_dir(self.dir, exempt=frozenset())
         self.assertEqual(len(errors), 1, errors)
         self.assertIn("no empty-ref guard", errors[0])
         self.assertEqual(checked, ["leaky.yml"])
 
     def test_an_unrelated_workflow_is_still_a_silent_skip(self):
         self._write("unrelated.yml", "name: F\non: [push]\njobs: {}\n")
-        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        errors, checked, _, _ = cwp.check_dir(self.dir, exempt=frozenset())
         self.assertEqual((errors, checked), ([], []))
 
     def test_an_unguarded_ref_checkout_fails_the_lint(self):
@@ -3712,7 +3714,7 @@ class CheckDirTests(unittest.TestCase):
                 "          ref: ${{ inputs.workflows_ref }}\n",
             ),
         )
-        errors, checked, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        errors, checked, _, _ = cwp.check_dir(self.dir, exempt=frozenset())
         self.assertEqual(len(errors), 1, errors)
         self.assertIn("no empty-ref guard", errors[0])
         self.assertEqual(checked, ["leaky.yml"])
@@ -3729,7 +3731,7 @@ class CheckDirTests(unittest.TestCase):
                 "          ref: ${{ inputs.workflows_ref }}\n",
             ),
         )
-        errors, _, exempt_ok = cwp.check_dir(self.dir, exempt=frozenset({"legacy.yml"}))
+        errors, _, exempt_ok, _ = cwp.check_dir(self.dir, exempt=frozenset({"legacy.yml"}))
         self.assertEqual(errors, [])
         self.assertEqual(exempt_ok, ["legacy.yml"])
 
@@ -3737,14 +3739,14 @@ class CheckDirTests(unittest.TestCase):
         # Rename or delete the workflow and the entry would otherwise survive
         # forever, pre-exempting whatever later reuses the filename.
         self._write("good.yml", _reusable(PINNED))
-        errors, _, _ = cwp.check_dir(self.dir, exempt=frozenset({"renamed-away.yml"}))
+        errors, _, _, _ = cwp.check_dir(self.dir, exempt=frozenset({"renamed-away.yml"}))
         self.assertEqual(len(errors), 1, errors)
         self.assertIn("renamed-away.yml", errors[0])
         self.assertIn("KNOWN_EXEMPT", errors[0])
 
     def test_an_exemption_for_a_workflow_that_dropped_the_input_fails(self):
         self._write("legacy.yml", "name: F\non: [push]\njobs: {}\n")
-        errors, _, _ = cwp.check_dir(self.dir, exempt=frozenset({"legacy.yml"}))
+        errors, _, _, _ = cwp.check_dir(self.dir, exempt=frozenset({"legacy.yml"}))
         self.assertEqual(len(errors), 1, errors)
         self.assertIn("KNOWN_EXEMPT", errors[0])
 
@@ -3754,17 +3756,127 @@ class CheckDirTests(unittest.TestCase):
         root = os.path.normpath(
             os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "workflows")
         )
-        errors, checked, exempt_ok = cwp.check_dir(root)
+        errors, checked, exempt_ok, _ = cwp.check_dir(root)
         self.assertEqual(errors, [], errors)
         self.assertEqual(sorted(exempt_ok), sorted(cwp.KNOWN_EXEMPT))
 
     def test_this_repos_own_workflows_pass(self):
         # The real forcing function: the checked-in tree must stay clean.
         root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "workflows")
-        errors, checked, _ = cwp.check_dir(os.path.normpath(root))
+        errors, checked, _, notices = cwp.check_dir(os.path.normpath(root))
         self.assertEqual(errors, [], errors)
+        # …and FULLY judged: every `steps:` in this tree is a bare block
+        # sequence, so a warning here is a regression in the BE-9045 collector
+        # (or a job that really did stop being judged), never a finding.
+        self.assertEqual(notices, [], notices)
         for name in ("cursor-review.yml", "groom.yml", "agents-md-integrity.yml", "pr-size.yml"):
             self.assertIn(name, checked)
+
+    # ------------------------------------------------------------------
+    # BE-9045: the BE-8254 fail-open is announced, never enforced.
+    # ------------------------------------------------------------------
+
+    # `on: workflow_call` with a `workflows_ref` input, so the file is CHECKED
+    # at all — `check_dir` skips a file whose input it cannot find.
+    _ESCAPED_HEAD = (
+        "name: Escaped\n"
+        "on:\n"
+        "  workflow_call:\n"
+        "    inputs:\n"
+        "      workflows_ref:\n"
+        "        type: string\n"
+        "        required: true\n"
+        "jobs:\n"
+    )
+
+    def test_an_escaped_steps_job_with_a_dropped_site_emits_a_warning(self):
+        # The whole point: the drop stays a drop (no error, exit 0), but it is
+        # now NAMED — the job, its `steps:` line, and how many checkouts went
+        # unjudged.
+        text = self._ESCAPED_HEAD + GuardCoverageTests.FLOW_STEPS_JOB
+        self._write("escaped.yml", text)
+        errors, checked, _, notices = cwp.check_dir(self.dir, exempt=frozenset())
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(checked, ["escaped.yml"])
+        self.assertEqual(len(notices), 1, notices)
+        self.assertTrue(notices[0].startswith("::warning file="), notices[0])
+        self.assertIn("job `job0`", notices[0])
+        self.assertIn("BE-9045", notices[0])
+        rows = text.split("\n")
+        steps_line = next(
+            i for i, row in enumerate(rows) if row.lstrip().startswith("steps:")
+        ) + 1
+        self.assertIn("line=%d" % steps_line, notices[0])
+
+    def test_an_escaped_steps_job_with_no_consumer_emits_nothing(self):
+        # The same unreadable `steps:` shape, with nothing reading a step
+        # output: `_record_steps_output`'s drop branch is never reached, so
+        # this job lost no coverage and must stay silent. A warning per
+        # flow-`steps:` job would be noise, not signal.
+        self._write(
+            "quiet.yml",
+            self._ESCAPED_HEAD
+            + "  job0:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps: [{uses: actions/checkout@abc, with: {ref: main}}]\n",
+        )
+        errors, _, _, notices = cwp.check_dir(self.dir, exempt=frozenset())
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(notices, [])
+
+    def test_a_readable_steps_job_emits_no_notice(self):
+        # The control: the identical typo'd id under a block-sequence `steps:`
+        # is JUDGED — a dangling error, and no warning, because nothing was
+        # skipped.
+        self._write(
+            "readable.yml",
+            self._ESCAPED_HEAD
+            + "  job0:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - id: resolve_ref\n"
+            "        run: echo hi\n"
+            "      - uses: actions/checkout@abc\n"
+            "        with:\n"
+            '          ref: "${{ steps.resolve_reff.outputs.ref }}"\n',
+        )
+        errors, _, _, notices = cwp.check_dir(self.dir, exempt=frozenset())
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("BE-8215", errors[0])
+        self.assertEqual(notices, [])
+
+    def test_a_warning_counts_the_sites_the_job_lost(self):
+        # The count is per `ref:` SITE, which is per LINE — the unit
+        # `_record_steps_output` itself works in (at most one `found` entry per
+        # call). A flow sequence broken over two physical lines therefore
+        # counts two, and the message names the unit so the number cannot be
+        # misread as a step count.
+        self._write(
+            "two.yml",
+            self._ESCAPED_HEAD
+            + "  job0:\n"
+            "    runs-on: ubuntu-latest\n"
+            '    steps: [{uses: actions/checkout@abc, with: {ref: "${{ steps.t1.outputs.ref }}"}},\n'
+            '            {uses: actions/checkout@abc, with: {ref: "${{ steps.t2.outputs.ref }}"}}]\n',
+        )
+        errors, _, _, notices = cwp.check_dir(self.dir, exempt=frozenset())
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(len(notices), 1, notices)
+        self.assertIn("did NOT run for 2 `ref:` site(s)", notices[0])
+
+    def test_notices_never_fail_the_run(self):
+        # The CLI half, end to end: the warning reaches stdout (so it lands in
+        # the PR annotations) and the process still exits 0. Asserting it on
+        # `check_dir` alone would leave `main` free to reintroduce the failure.
+        self._write(
+            "escaped.yml", self._ESCAPED_HEAD + GuardCoverageTests.FLOW_STEPS_JOB
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = cwp.main(["--workflows-dir", self.dir])
+        self.assertEqual(status, 0, out.getvalue())
+        self.assertIn("::warning", out.getvalue())
+        self.assertIn("every JUDGED ref checkout guarded", out.getvalue())
 
 
 if __name__ == "__main__":
