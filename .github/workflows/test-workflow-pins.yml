@@ -106,3 +106,41 @@ jobs:
             exit 1
           fi
           echo "lint correctly rejected the unguarded checkout"
+
+      - name: Smoke test — an unreadable `steps:` warns but does not fail
+        run: |
+          # The third state (BE-9045): a job whose `steps:` the pre-scan cannot
+          # read keeps its fail-open drop — a fail-CLOSED escape would
+          # manufacture false CI failures — but it must SAY so. Both halves are
+          # pinned here because either one alone is a silent regression: a
+          # warning that started failing the run, or a drop that went quiet
+          # again.
+          dir="$(mktemp -d)"
+          # Same placeholder trick as the step above, for the same two reasons.
+          D='$'
+          sed "s|__REF__|${D}{{ steps.typo.outputs.ref }}|" > "$dir/escaped.yml" <<'YAML'
+          name: Escaped
+          on:
+            workflow_call:
+              inputs:
+                workflows_ref:
+                  type: string
+                  required: true
+          jobs:
+            run:
+              runs-on: ubuntu-latest
+              steps: [{id: resolve, run: echo hi}, {uses: actions/checkout@abc, with: {ref: "__REF__"}}]
+          YAML
+          grep -q 'steps.typo.outputs.ref' "$dir/escaped.yml"  # fixture intact
+          status=0
+          python3 .github/workflow-pins/check_workflow_pins.py --workflows-dir "$dir" > "$dir/out.txt" 2>&1 || status=$?
+          cat "$dir/out.txt"
+          if [ "$status" -ne 0 ]; then
+            echo "::error::lint FAILED on a job whose steps: it could not read — the escape must stay fail-open (exit $status)"
+            exit 1
+          fi
+          if ! grep -q '::warning' "$dir/out.txt"; then
+            echo "::error::lint dropped a checkout in an unreadable steps: job and said nothing — expected a ::warning annotation"
+            exit 1
+          fi
+          echo "lint warned about the unjudged job without failing the run"

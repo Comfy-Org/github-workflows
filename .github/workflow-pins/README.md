@@ -189,8 +189,27 @@ verdicts are unaffected, in that job and every other.
 
 The fail-open is deliberate but it is not free: reformatting a job's `steps:`
 into one of those shapes is an in-band way to switch that job's dangling check
-off, and nothing says so in the output. Making it observable needs a
-non-fatal channel `check_dir` does not have yet — tracked separately.
+off. So the CLI now SAYS SO (BE-9045). `check_dir` returns a fourth value,
+`notices`, alongside `(errors, checked, exempt_ok)` — annotation-ready strings
+that never touch the exit status — and `main` prints them ahead of any errors.
+One `::warning` per JOB (not per site, and `::warning` rather than `::notice`
+so it appears in the PR annotations), naming the job, pointing at its `steps:`
+line, and counting the `ref:` SITES that went unjudged — one per `ref:` line,
+this lint's unit throughout, so two flow-style checkouts on one physical line
+count once. It fires ONLY where the escape actually cost a site its verdict:
+a flow-`steps:` job that reads no `steps.<id>.outputs.<name>` never reaches
+the drop and stays silent, and a site that still came away with a verdict —
+because a SIBLING operand named a tracked resolver — is not counted either,
+so one `ref:` line can never carry both an `::error` and a `::warning` saying
+it went unjudged. So the warning marks lost coverage rather than a shape.
+
+Lost coverage is all it marks. A counted site is not an accusation: with the
+pre-scan defeated, a dangling id and a real earlier step this lint has no
+claim on are indistinguishable, and the readable path drops that second one
+silently too — so the message says the check *could not run*, not that the
+refs are wrong. The OK summary drops its "every ref checkout guarded" claim
+for "every JUDGED ref checkout guarded" whenever a warning fired — the run
+still exits 0, but it no longer reports coverage it did not have.
 
 **`||` fallbacks are read on this path too, with leading-operand judgment
 (BE-8215).** `ref: ${{ steps.<id>.outputs.<name> || 'main' }}` used to match
