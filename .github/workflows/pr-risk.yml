@@ -70,14 +70,21 @@ name: PR Risk Grade (reusable)
 # queue it already has, and how a PR is re-graded after a `.github/risk.json` change or a
 # `risk-dispute`. Absent, the workflow reads the event exactly as before. Three things differ on
 # the by-number path, all of them deliberate:
-#   * BOT-AUTHORED PRs ARE GRADED. The `github.actor != 'dependabot[bot]'` clause callers put in
-#     their `if:` is a TOKEN guard, not a policy one: a bot-triggered `pull_request` run gets a
-#     read-only GITHUB_TOKEN, so the label write — this workflow's entire product — would 403.
-#     On a dispatch the actor is the human who pressed the button and the token is writable, so
-#     the reason evaporates. Excluding them would also bias any backfill corpus badly; bots
-#     author a substantial minority of merged PRs. The same is true of the fork clause, and for
-#     the same reason — fork RISK is unaffected either way, because `external` is derived from
-#     the API's `isCrossRepository`, never from the actor, and forks grade R3 with no exceptions.
+#   * FORK PRs ARE GRADED. The `head.repo.full_name == github.repository` clause callers put in
+#     their `if:` is a TOKEN guard, not a policy one: a fork's `pull_request` run gets a
+#     read-only GITHUB_TOKEN that the caller's `permissions:` block cannot elevate, so the label
+#     write — this workflow's entire product — would 403. On a dispatch the token is writable, so
+#     the reason evaporates. Fork RISK is unaffected either way, because `external` is derived
+#     from the API's `isCrossRepository`, never from the actor, and forks grade R3 with no
+#     exceptions. DEPENDABOT-TRIGGERED RUNS need no such hatch and are graded on BOTH paths: the
+#     caller pattern below deliberately carries no `github.actor != 'dependabot[bot]'` clause,
+#     because the caller's `permissions:` block elevates Dependabot's read-only token and this
+#     workflow declares no secrets (see that pattern for the citation, for the one thing the
+#     clause did buy, and for the callers the reasoning does NOT transfer to). Read that clause
+#     literally: `github.actor` is who TRIGGERED the run, not who authored the PR, so it never
+#     keyed on bot authorship — a human pushing to a Dependabot branch made the actor human and
+#     the PR graded even with the clause in place. Skipping those runs would also bias any
+#     backfill corpus badly; bots author a substantial minority of merged PRs.
 #   * THE BASE REF IS RE-READ FROM THE API, per target, because there is no event payload to take
 #     it from. It is load-bearing rather than cosmetic: it selects which branch's
 #     `.github/risk.json` judges the PR, live PRs are commonly stacked on feature branches rather
@@ -164,20 +171,49 @@ name: PR Risk Grade (reusable)
 #     contents: read
 #   jobs:
 #     pr-risk:
-#       # SCOPE EVERY GUARD CLAUSE TO THE EVENT IT DESCRIBES. Both clauses below are TOKEN
-#       # guards: a fork's and a bot's `pull_request` run gets a read-only GITHUB_TOKEN, so the
-#       # label write would 403 and the check would go red on every dependency bump. Neither is
-#       # a risk judgement — forks are graded R3 from the API's own fork flag, never from the
-#       # actor. On a workflow_dispatch there is no `github.event.pull_request`, so an
-#       # unscoped `head.repo.full_name == github.repository` is FALSE and the job SKIPS
-#       # SILENTLY: the dispatch button appears to do nothing, no run, no error, no annotation.
-#       # Keeping the clauses behind the event test is what makes the button work at all — and
-#       # on a dispatch the token is writable and the actor is a human, so there is nothing left
-#       # for either clause to protect.
+#       # ONE CLAUSE, AND IT STAYS SCOPED TO THE EVENT IT DESCRIBES. The fork clause is a TOKEN
+#       # guard, not a risk judgement: a fork's `pull_request` run gets a read-only GITHUB_TOKEN,
+#       # the `permissions:` block below CANNOT elevate it (the Dependabot carve-out below does
+#       # not extend to forks), so the label write would 403 and the check would go red. Fork
+#       # RISK is untouched either way — forks grade R3 from the API's own fork flag, never from
+#       # the actor — so a fork PR is simply ungraded-by-absence here; grade it by dispatching on
+#       # `pr_number`, or enroll with `pull_request_target` instead, which is safe by construction
+#       # for this workflow (see the fork paragraph above). Keep the clause BEHIND the event test:
+#       # on a workflow_dispatch there is no `github.event.pull_request`, so an unscoped
+#       # `head.repo.full_name == github.repository` is FALSE and the job SKIPS SILENTLY — the
+#       # dispatch button appears to do nothing, no run, no error, no annotation. That event test
+#       # is what makes the button work at all, and on a dispatch the token is writable anyway, so
+#       # there is nothing left for the clause to protect.
+#       #
+#       # THERE IS DELIBERATELY NO `github.actor != 'dependabot[bot]'` CLAUSE, AND ADDING ONE BACK
+#       # IS A REGRESSION. Dependabot's `pull_request` runs do start from a read-only
+#       # GITHUB_TOKEN, but the `permissions:` block below ELEVATES it — GitHub documents exactly
+#       # that under "Changing GITHUB_TOKEN permissions" in *Troubleshooting Dependabot on GitHub
+#       # Actions* / *Automating Dependabot with GitHub Actions* — and this workflow declares NO
+#       # secrets, so the other half of the Dependabot restriction (a Dependabot run sees
+#       # Dependabot secrets only, never Actions secrets) costs it nothing. Skipping those runs
+#       # instead leaves most repos' highest-volume automated PR producer ungraded.
+#       #
+#       # ONE THING THE CLAUSE DID BUY, and it does not earn the cost: a Dependabot
+#       # github-actions PR that bumps THIS caller's own `uses:` pin now runs the newly pinned
+#       # reusable inside that PR's own run (a `pull_request` run evaluates the HEAD's workflow
+#       # file) under the elevated token, where the clause used to skip it. The exposure is
+#       # narrow — Dependabot only proposes SHAs behind this repo's own published tags, the tool
+#       # checkout is separately gated on `workflows_ref` being an ancestor of `main`, and the
+#       # fleet's own bump PRs always had this property because the actor clause never covered
+#       # them. Review that PR before merging it for a different reason: Dependabot rewrites
+#       # `uses:` only and leaves `workflows_ref` behind, and the equality check that would catch
+#       # that is a deliberate open gap (see "WHAT ANCESTRY STILL DOES NOT PROVE" above), so an
+#       # unedited Dependabot bump runs a NEW workflow file against an OLD tool checkout. Fix the
+#       # input in the same PR.
+#       #
+#       # THIS REASONING DOES NOT TRANSFER to a caller that needs an ACTIONS SECRET — an app
+#       # private key, an API token; `cursor-review-auto-label.yml` in this repo is the local
+#       # example. Those callers still need the dependabot skip, because no `permissions:` block
+#       # can hand a Dependabot-triggered run an Actions secret.
 #       if: >-
 #         github.event_name != 'pull_request' ||
-#         (github.actor != 'dependabot[bot]' &&
-#          github.event.pull_request.head.repo.full_name == github.repository)
+#         github.event.pull_request.head.repo.full_name == github.repository
 #       permissions:
 #         contents: read
 #         issues: write         # create the risk:* labels repo-side on first use
