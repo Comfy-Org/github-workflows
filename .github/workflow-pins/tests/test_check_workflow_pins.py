@@ -2204,6 +2204,152 @@ class GuardCoverageTests(unittest.TestCase):
                 job = self._job0(steps)
                 self.assertEqual(set(self._job0_step_ids(job)), {expected})
 
+    def test_an_apostrophe_in_a_PLAIN_scalar_opens_no_quote(self):
+        # YAML forbids a quote only as a plain scalar's FIRST character, so
+        # `don't` is a legal plain scalar and this a legal step. Opening quote
+        # state on it swallows the rest of the line: the real entry-separating
+        # comma before `id:` reads as string CONTENT, `real` is never
+        # registered — a false `dangling` FAILURE on a compliant workflow —
+        # and the closing `}` goes uncounted, so `flow_depth` wedges open and
+        # the later block item is lost too.
+        job = self._job0(
+            "      - {name: don't, id: real}\n"
+            "      - id: later\n"
+            "        run: echo hi\n"
+        )
+        self.assertEqual(set(self._job0_step_ids(job)), {"real", "later"})
+
+    def test_a_plain_scalar_quote_does_not_wedge_the_brace_count(self):
+        # The same rule at the OTHER site the miscount reaches: with the
+        # apostrophe read as an opener the closing `}` sits "inside a string",
+        # the delta comes back +1, and flow mode stays open for the rest of
+        # the job.
+        self.assertEqual(cwp._flow_brace_delta("- {name: don't, id: real}"), 0)
+        self.assertEqual(cwp._flow_brace_delta("- {name: it's {x}, id: real}"), 0)
+
+    def test_strip_comment_keeps_the_WEAKER_reading_on_purpose(self):
+        # `_strip_comment` shares the scan but NOT the scalar-start rule, and
+        # the split is deliberate: it is asked about every physical line,
+        # `run: |` script bodies included, where `echo "PR #${n}"` is literal
+        # text. Strictly that `"` follows the plain word `echo` and opens
+        # nothing, so the ` #` would read as a comment and truncate a line
+        # whose tail may carry the very `ref:` this lint exists to find.
+        self.assertEqual(
+            cwp._strip_comment('echo "Updated PR #${existing}"'),
+            'echo "Updated PR #${existing}"',
+        )
+        # A `#` inside a genuinely quoted scalar is content under either rule.
+        self.assertEqual(cwp._strip_comment('MSG: "a # b"'), 'MSG: "a # b"')
+        # And a real trailing comment is still stripped.
+        self.assertEqual(cwp._strip_comment("uses: org/act@abc  # v1"), "uses: org/act@abc")
+
+    def test_the_strict_rule_is_still_what_the_structural_readers_use(self):
+        # The split must not quietly revert the fix: the flow readers keep the
+        # scalar-start rule, so a plain-scalar apostrophe opens nothing there.
+        self.assertTrue(cwp._outside_quotes("{name: don't, id: real}", 12))
+        self.assertEqual(cwp._flow_brace_delta("- {name: don't, id: real}"), 0)
+
+    def test_a_QUOTED_step_id_value_survives_the_quote_refusal(self):
+        # The refusal is on a STRAY quote — the tail of a scalar opened on an
+        # earlier line — not on a legitimately quoted value. `id: 'real'` is
+        # an ordinary spelling in both styles, and dropping it is the
+        # false-`dangling` direction.
+        for steps in (
+            "      - {id: 'real', uses: org/act@abc}\n",
+            '      - {id: "real", uses: org/act@abc}\n',
+            "      - uses: org/act@abc\n        id: 'real'\n",
+            '      - uses: org/act@abc\n        id: "real"\n',
+            "      - {uses: org/act@abc,\n         id: 'real'}\n",
+        ):
+            with self.subTest(steps=steps):
+                self.assertEqual(set(self._job0_step_ids(self._job0(steps))), {"real"})
+
+    def test_the_scalar_start_rule_still_opens_every_real_quote(self):
+        # The rule NARROWS, and the positions a quoted scalar really can start
+        # at must all keep opening one — otherwise a decoy comma inside a
+        # genuinely quoted scalar starts registering phantoms again.
+        for text, pos_inside in (
+            ('a: "x, y"', 5),        # after a `:` key separator
+            ("- 'x, y'", 4),         # after a `- ` list marker
+            ('{a: 1, b: "x, y"}', 12),  # after a `,` entry separator
+            ('["x, y"]', 4),         # after a `[` flow-sequence indicator
+            ('"x, y"', 3),           # at the start of the text
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(cwp._outside_quotes(text, pos_inside))
+
+    def test_a_node_property_does_not_hide_a_flow_step(self):
+        # `- &resolver {id: resolve_ref, …}` is valid YAML that Actions
+        # accepts. With the gate testing for a `{` immediately after the
+        # marker, the property defeats it and the item falls through to the
+        # block pattern, which cannot match a line beginning `&resolver {` —
+        # the id is lost and its consumer becomes a false `dangling` failure.
+        for steps in (
+            "      - &resolver {id: resolve_ref, run: echo hi}\n",
+            "      - !!map {id: resolve_ref, run: echo hi}\n",
+            "      - &resolver !!map {id: resolve_ref, run: echo hi}\n",
+            "      -\n        &resolver {id: resolve_ref, run: echo hi}\n",
+        ):
+            with self.subTest(steps=steps):
+                job = self._job0(steps + "      - id: later\n        run: echo hi\n")
+                self.assertEqual(
+                    set(self._job0_step_ids(job)), {"resolve_ref", "later"}
+                )
+
+    def test_a_node_property_does_not_widen_what_is_collected(self):
+        # The skip is consulted ONLY to ask "does the content begin `{`", so
+        # the marker-line narrowing it sits behind still holds: `- &a with:
+        # {id: x}` declares an action INPUT named `id`, not a step.
+        job = self._job0("      - &a with: {id: x}\n        uses: org/act@abc\n")
+        self.assertEqual(set(self._job0_step_ids(job)), set())
+
+    # ------------------------------------------------------------------
+    # A quoted scalar spanning PHYSICAL LINES. Every reader here is per-line
+    # (`_strip_comment` included, and it runs FIRST), so cross-line quote
+    # state is out of scope module-wide rather than a gap in this walk — but
+    # the two shapes that state would have gotten wrong are closed anyway,
+    # from the value side, and the residue that survives is pinned so any
+    # future change to it is a deliberate one.
+    # ------------------------------------------------------------------
+
+    def test_a_CROSS_LINE_quote_does_not_register_a_phantom(self):
+        # `- {name: "a` / `  id: phantom", …}` — the continuation line looks
+        # like a step id to a per-line reader, and registering it silences the
+        # dangling verdict this whole change exists to restore. Refused from
+        # the VALUE side instead of the quote-state side: no Actions step id
+        # carries a `"`, so the tail of a scalar that opened above cannot pass
+        # for one.
+        job = self._job0(
+            '      - {name: "a\n'
+            '        id: phantom", run: echo hi}\n'
+        )
+        self.assertEqual(set(self._job0_step_ids(job)), set())
+
+    def test_a_CROSS_LINE_quote_does_not_lose_a_real_id(self):
+        # The mirror: the CLOSING quote of `- {name: "two` / `  lines", id:
+        # real}` must not read as a fresh opener, which would hide the real
+        # `id:` after it and make its consumer a false `dangling` failure.
+        # A quote opens a scalar only where a NODE can start, and this one
+        # follows the plain text `lines`.
+        job = self._job0(
+            '      - {name: "two\n'
+            '        lines", id: real}\n'
+        )
+        self.assertEqual(set(self._job0_step_ids(job)), {"real"})
+
+    def test_a_CROSS_LINE_quote_residue_is_pinned_not_claimed_closed(self):
+        # What the value-side guard does NOT reach: a continuation line whose
+        # id value carries no quote at all. This reader is still per-line, so
+        # the shape over-collects — the TOLERATED direction (it silences one
+        # site, exactly as a real earlier out-of-scope step does), and the one
+        # a cross-line quote contract would have to close. 0 occurrences in
+        # the tree.
+        job = self._job0(
+            '      - {name: "a\n'
+            '        id: phantom, more": run}\n'
+        )
+        self.assertEqual(set(self._job0_step_ids(job)), {"phantom"})
+
     def test_a_quoted_comma_decoy_leaves_a_real_dangling_ref_loud(self):
         # End to end: the point of refusing the phantom is that the genuine
         # finding it was covering for is reported again.

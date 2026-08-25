@@ -644,34 +644,108 @@ _FALLBACK_RES = (
 )
 
 
-def _outside_quotes(line, pos):
-    """True when `pos` sits outside any quoted scalar on `line`.
+# Characters after which a YAML node — and so a QUOTED scalar — can begin.
+# `-` is handled separately: it opens a node only as a standalone list marker.
+_NODE_OPENERS = "{[,:"
 
-    YAML-aware, not a bare toggle: a single-quoted scalar escapes an inner `'`
-    by doubling it (`''`), and a double-quoted one escapes a `"` with a
-    backslash. Toggling on every quote character misreads either as closing
-    the scalar, which then reads whatever comes after as string content (or
-    vice versa) until an unrelated quote happens to toggle it back.
+
+def _opens_quoted_scalar(text, i):
+    """True when the quote at `i` STARTS a quoted scalar, not sits inside a plain one.
+
+    YAML forbids a quote only as a plain scalar's FIRST character, so `don't`
+    is a perfectly legal plain scalar and `- {name: don't, id: real}` a legal
+    step. Reading that apostrophe as an opener swallows the rest of the line:
+    the real entry-separating comma before `id:` becomes string CONTENT, so
+    `real` is never registered — the false-`dangling` direction this reader
+    calls costly — and the closing `}` goes uncounted, wedging `flow_depth`
+    open so every later block item is lost too.
+
+    A quoted scalar can only begin where a node can: at the start of the text,
+    after a flow indicator (`{`, `[`, `,`), after a `:` key separator, or after
+    a `- ` block-sequence marker. Anywhere else the quote is content.
+
+    NARROWING only — it can never open a scalar the bare toggle left closed —
+    so every caller moves in the same direction: toward reading real YAML
+    punctuation as punctuation.
     """
+    j = i - 1
+    while j >= 0 and text[j] in " \t":
+        j -= 1
+    if j < 0:
+        return True
+    if text[j] in _NODE_OPENERS:
+        return True
+    # A `-` opens a node only as a standalone list marker (`- 'x'`); inside a
+    # plain scalar (`utf-8'`) it is an ordinary character.
+    return (
+        text[j] == "-"
+        and (j == 0 or text[j - 1] in " \t")
+        and j + 1 < len(text)
+        and text[j + 1] in " \t"
+    )
+
+
+def _quote_mask(text, node_start_only=True):
+    """Per-index `[bool]`: True where that index sits OUTSIDE any quoted scalar.
+
+    `len(text) + 1` entries, so the position just past the end is answerable
+    too. Each entry is the state BEFORE that index is consumed, which puts an
+    OPENING quote outside its own scalar and a CLOSING one inside it.
+
+    YAML-aware, not a bare toggle, in both directions: a quote only opens where
+    a node can start (`_opens_quoted_scalar`), a single-quoted scalar escapes
+    an inner `'` by doubling it (`''`), and a double-quoted one escapes a `"`
+    with a backslash. Get any of the three wrong and the scanner reads whatever
+    follows as string content (or vice versa) until an unrelated quote happens
+    to toggle it back.
+
+    ONE left-to-right pass, so a caller testing many positions on one line —
+    `_collect_flow_step_ids` runs a `finditer` over every flow `id:` candidate —
+    pays O(len) once instead of O(len) per test.
+
+    `node_start_only=False` drops the scalar-start rule and opens on ANY quote.
+    That is the weaker reading, and it exists for `_strip_comment` alone: that
+    one is asked about EVERY physical line, block-scalar bodies included, where
+    a `run: |` script's `echo "PR #${n}"` is literal text and not a YAML node at
+    all. Under the strict rule that `"` follows the plain word `echo`, so it
+    opens nothing, and the ` #` after it reads as a comment opener — truncating
+    a line whose tail may carry the very `ref:` this lint is looking for. The
+    structural readers are not asked about script text and take the strict rule.
+
+    Per LINE, like every reader here: a quote opened on one physical line and
+    closed on the next is out of scope, as it is for `_strip_comment`.
+    """
+    n = len(text)
+    mask = [True] * (n + 1)
     quote = None
     i = 0
-    while i < pos:
-        ch = line[i]
+    while i < n:
+        mask[i] = quote is None
+        ch = text[i]
         if quote:
             if quote == "'" and ch == "'":
-                if i + 1 < pos and line[i + 1] == "'":
+                if i + 1 < n and text[i + 1] == "'":
+                    mask[i + 1] = False
                     i += 2
                     continue
                 quote = None
             elif quote == '"' and ch == "\\":
+                if i + 1 < n:
+                    mask[i + 1] = False
                 i += 2
                 continue
             elif quote == '"' and ch == '"':
                 quote = None
-        elif ch in "'\"":
+        elif ch in "'\"" and (not node_start_only or _opens_quoted_scalar(text, i)):
             quote = ch
         i += 1
-    return quote is None
+    mask[n] = quote is None
+    return mask
+
+
+def _outside_quotes(line, pos):
+    """True when `pos` sits outside any quoted scalar on `line`."""
+    return _quote_mask(line)[min(pos, len(line))]
 
 
 # The `${{ … }}` body of the FIRST interpolation on a line, and its leading
@@ -1204,34 +1278,25 @@ def _consumes_input(text):
 def _strip_comment(value):
     """Drop a trailing `# …` comment from a scalar value.
 
-    Quote-aware, with the same escape rules `_outside_quotes` uses (`''`
-    inside a single-quoted scalar, `\\"` inside a double-quoted one): a `#`
-    that sits inside a quoted entry's own value (`MSG: "a # b"`) is string
-    content, not a comment opener, and stripping from the FIRST `#` on the
-    line — as a plain regex does — truncates every sibling entry after it
-    too. Falls back to the whole value when no unquoted `#` is found.
+    Quote-aware, on the shared `_quote_mask` scan (`''` inside a single-quoted
+    scalar, `\\"` inside a double-quoted one): a `#` that sits inside a quoted
+    entry's own value (`MSG: "a # b"`) is string content, not a comment opener,
+    and stripping from the FIRST `#` on the line — as a plain regex does —
+    truncates every sibling entry after it too. Falls back to the whole value
+    when no unquoted `#` is found.
+
+    Deliberately WITHOUT the scalar-start rule the structural readers use. This
+    one is asked about every physical line, `run: |` script bodies included,
+    where `echo "PR #${n}"` is literal text: strictly, that `"` follows a plain
+    word and opens nothing, so the ` #` would read as a comment and truncate a
+    line whose tail may carry the `ref:` this lint exists to find. Opening on
+    any quote over-protects such a line instead, which is the safe direction
+    for a reader that cannot see whether it is looking at YAML or at shell.
     """
-    quote = None
-    i = 0
-    n = len(value)
-    while i < n:
-        ch = value[i]
-        if quote:
-            if quote == "'" and ch == "'":
-                if i + 1 < n and value[i + 1] == "'":
-                    i += 2
-                    continue
-                quote = None
-            elif quote == '"' and ch == "\\":
-                i += 2
-                continue
-            elif quote == '"' and ch == '"':
-                quote = None
-        elif ch in "'\"":
-            quote = ch
-        elif ch == "#" and (i == 0 or value[i - 1].isspace()):
+    mask = _quote_mask(value, node_start_only=False)
+    for i, ch in enumerate(value):
+        if ch == "#" and mask[i] and (i == 0 or value[i - 1].isspace()):
             return value[:i].strip()
-        i += 1
     return value.strip()
 
 
@@ -1249,36 +1314,43 @@ def _flow_brace_delta(text):
     block-at-column pattern there) stops being read at all and its consumer
     becomes a false `dangling` failure.
 
-    Same quote rules `_strip_comment` applies (`''` inside a single-quoted
-    scalar, `\\"` inside a double-quoted one). Per LINE, like every reader
+    On the shared `_quote_mask` scan, in its STRICT reading — a quote opens a
+    scalar only where a YAML node can start — so the apostrophe of a plain
+    `- {name: don't, id: real}` leaves the closing `}` counted instead of
+    wedging the mapping open. (`_strip_comment` takes the weaker reading of the
+    same scan, deliberately; see `_quote_mask`.) Per LINE, like every reader
     here: a quote opened on one physical line and closed on the next is out of
     scope, as it is for `_strip_comment`.
     """
-    depth = 0
-    quote = None
-    i = 0
-    n = len(text)
-    while i < n:
-        ch = text[i]
-        if quote:
-            if quote == "'" and ch == "'":
-                if i + 1 < n and text[i + 1] == "'":
-                    i += 2
-                    continue
-                quote = None
-            elif quote == '"' and ch == "\\":
-                i += 2
-                continue
-            elif quote == '"' and ch == '"':
-                quote = None
-        elif ch in "'\"":
-            quote = ch
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-        i += 1
-    return depth
+    mask = _quote_mask(text)
+    return sum(
+        1 if ch == "{" else -1
+        for i, ch in enumerate(text)
+        if ch in "{}" and mask[i]
+    )
+
+
+def _step_id_value(raw):
+    """The step id `raw` names, or None when it cannot be one.
+
+    Drops the closing punctuation a flow CONTINUATION line leaves on the block
+    pattern's `\\S+` (`- {uses: x,` / `id: real}` captures `real}`, and no
+    legitimate id ends in `,` or `}`), then ONE matched quote wrapper. What is
+    left may contain no quote at all: an Actions step id is `[A-Za-z0-9_-]`, so
+    a stray `'`/`"` means this is not an id but the tail of a quoted scalar
+    that OPENED on an earlier physical line — `- {name: "a` / `  id: phantom",
+    …}` — which would otherwise register the exact phantom this reader exists
+    to exclude, silencing a genuine `dangling` verdict.
+
+    NARROWING only: no legal step id carries a quote, so this cannot refuse a
+    real one and manufacture the false failure under-collection costs here.
+    """
+    value = raw.strip().rstrip(",}")
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        value = value[1:-1]
+    if not value or "'" in value or '"' in value:
+        return None
+    return value
 
 
 def _collect_flow_step_ids(ids, text, i):
@@ -1290,20 +1362,49 @@ def _collect_flow_step_ids(ids, text, i):
     inside the quoted scalar, so a step nothing declares registers and
     SILENCES the dangling verdict on a genuine finding — the same phantom
     this reader exists to exclude, arriving through another door. So the
-    boundary is held to `_outside_quotes` — the same test
+    boundary is held to the shared `_quote_mask` scan — the same test
     `_pins_to_job_workflow_sha` and `_ref_values` already apply before
-    trusting a flow match of their own.
+    trusting a flow match of their own, hoisted to ONE pass so many candidates
+    on one long flow line cost O(len) rather than O(matches x len).
 
     Narrowing, never widening: a real `id:` is only ever reached across an
     unquoted `{` or `,`, so the guard cannot drop one and manufacture the
     false `dangling` failure under-collection costs here.
 
+    A quote only opens a scalar where a node can START, so the apostrophe of a
+    plain `- {name: don't, id: real}` no longer hides the real entry comma.
+
     Per LINE, like every reader here: a quote opened on one physical line and
     closed on the next is out of scope, as it is for `_flow_brace_delta`.
     """
+    mask = _quote_mask(text)
     for flow in _STEP_ID_FLOW_RE.finditer(text):
-        if _outside_quotes(text, flow.start()):
-            ids.setdefault(flow.group(2).strip("'\""), i)
+        if mask[flow.start()]:
+            value = _step_id_value(flow.group(2))
+            if value is not None:
+                ids.setdefault(value, i)
+
+
+# `&anchor` / `!tag` node properties, which may precede a node's own content.
+_NODE_PROPERTIES_RE = re.compile(r"""^(?:[&!]\S*[^\S\n]+)+""")
+
+
+def _after_node_properties(value):
+    """`value` past any leading `&anchor` / `!tag` node properties.
+
+    A step item may carry either in front of its mapping — `- &resolver {id:
+    resolve_ref, run: echo hi}` is valid YAML that Actions accepts — and the
+    flow-mapping gate in `_job_step_ids` tests for a `{` where the item's
+    content begins. Left unskipped the property defeats that gate: the item
+    falls through to the block pattern, which cannot match a line beginning
+    `&resolver {`, its real id is never collected, and a later
+    `steps.resolve_ref` consumer becomes a false `dangling` FAILURE — the
+    costly direction.
+
+    Only ever consulted to ask "does the content begin `{`", so skipping a
+    token that is not really a property cannot widen what is collected.
+    """
+    return _NODE_PROPERTIES_RE.sub("", value)
 
 
 def _is_skippable(line):
@@ -1854,11 +1955,14 @@ def _job_step_ids(lines, start, job_indent):
             _collect_flow_step_ids(ids, text, i)
             match = _STEP_ID_RE.match(line)
             if match:
-                # `rstrip` before the quote strip: on the continuation line of
-                # a multi-line flow mapping (`- {uses: x,` / `id: y}`) the
-                # block pattern's `\S+` captures the closing punctuation too,
-                # and a legitimate step id can never end in `,` or `}`.
-                ids.setdefault(match.group(2).rstrip(",}").strip("'\""), i)
+                # `_step_id_value` both trims the closing punctuation this
+                # continuation-line spelling leaves on the block pattern's
+                # `\S+` (`- {uses: x,` / `id: y}`) and refuses a value
+                # carrying a stray quote — the tail of a scalar that opened on
+                # an earlier physical line, which is no id at all.
+                value = _step_id_value(match.group(2))
+                if value is not None:
+                    ids.setdefault(value, i)
             flow_depth = max(0, flow_depth + _flow_brace_delta(text))
             continue
         if indent == marker_column and not _opens_list_item(line):
@@ -1884,7 +1988,7 @@ def _job_step_ids(lines, start, job_indent):
                 key_column = None
                 continue
             key_column = marker_column + marker
-            if text[1:].lstrip().startswith("{"):
+            if _after_node_properties(text[1:].lstrip()).startswith("{"):
                 # The whole step written as a flow mapping. ONLY this shape is
                 # read with the flow pattern: applied to any marker line it
                 # also matches `- with: {id: x}`, where `id` is an action
@@ -1897,7 +2001,7 @@ def _job_step_ids(lines, start, job_indent):
             line = _unmarked(line, key_column)
         elif key_column is None:
             text = _strip_comment(line)
-            if text.startswith("{"):
+            if _after_node_properties(text).startswith("{"):
                 # A bare `-` whose item is written flow-style on the line
                 # BELOW it — the same mapping as `- {id: x, …}`, one line
                 # down. Read with the block pattern alone a line opening `{`
@@ -1920,7 +2024,9 @@ def _job_step_ids(lines, start, job_indent):
             continue
         match = _STEP_ID_RE.match(line)
         if match:
-            ids.setdefault(match.group(2).strip("'\""), i)
+            value = _step_id_value(match.group(2))
+            if value is not None:
+                ids.setdefault(value, i)
     return ids
 
 
