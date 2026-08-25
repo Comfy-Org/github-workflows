@@ -127,7 +127,12 @@ SILENCE the dangling verdict on a real finding: an action input literally named
 a `run:` block scalar whose heredoc emits a line beginning `- id:` / `"id":`
 (fixture YAML this repo's own workflows write). Both are excluded structurally
 now — YAML puts a `with:` member and a block scalar's body deeper than the key
-column either way.
+column either way. One residue is TOLERATED rather than fixed: a `with:`
+written inside a FLOW item (`- {uses: …, with: {id: x}}`) still registers `x`,
+because the flow pattern is flat and scoping it to the outermost mapping's
+depth is the under-collection direction — get that wrong and a compliant
+workflow fails. It is pinned by a test so any change to it is a deliberate
+one; the shape occurs 0 times in this tree.
 
 Reading items rather than lines means the walk has to accept every spelling of
 an item YAML does, because a missed id is a false FAILURE on a compliant
@@ -138,7 +143,10 @@ whose item is a flow mapping on the next line, and a flow mapping spanning
 physical lines — including one whose continuation dedents past the dash, which
 YAML permits inside `{ … }`. Braces are counted **outside quoted scalars**, so
 a `{` or `}` that is string content (`run: "echo {"`) neither wedges flow mode
-open nor closes it early.
+open nor closes it early. An `id:` inside a flow mapping is gated the same
+way: the pattern asks only for a preceding `{` or `,`, and a comma that is
+string content meets that boundary too, so `- {run: "build, id: x"}` used to
+conjure a step nothing declares and silence a real dangling verdict.
 
 **A `steps:` the item walk cannot read makes that job's dangling verdict
 fail-open, not fail-loud.** Flow-style `steps: [ … ]` on the key line, or a

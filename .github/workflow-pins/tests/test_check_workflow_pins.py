@@ -2019,7 +2019,7 @@ class GuardCoverageTests(unittest.TestCase):
     @staticmethod
     def _job0_step_ids(job_text):
         lines = ("name: F\non:\n  workflow_call:\njobs:\n" + job_text).split("\n")
-        start = next(i for i, l in enumerate(lines) if l.startswith("  job0:"))
+        start = next(i for i, line in enumerate(lines) if line.startswith("  job0:"))
         return cwp._job_step_ids(lines, start, 2)
 
     @staticmethod
@@ -2159,6 +2159,68 @@ class GuardCoverageTests(unittest.TestCase):
         job = self._job0("      - {uses: some/action@abc, with: {id: resolve_ref}}\n")
         self.assertEqual(set(self._job0_step_ids(job)), {"resolve_ref"})
 
+    def test_a_comma_inside_a_quoted_scalar_declares_no_flow_step(self):
+        # `_STEP_ID_FLOW_RE` asks only for a preceding `[{,]`, and a comma
+        # that is string CONTENT meets it. Ungated, this registers `phantom`
+        # and SILENCES the dangling verdict on a genuine finding — the same
+        # phantom the block-form fixes above exclude, through another door.
+        job = self._job0('      - {run: "build, id: phantom", uses: org/act@abc}\n')
+        self.assertEqual(set(self._job0_step_ids(job)), set())
+
+    def test_the_quoted_comma_decoy_is_refused_on_a_continuation_line(self):
+        # The same decoy on the CONTINUATION line of a multi-line flow
+        # mapping, which is collected by a second call site.
+        job = self._job0(
+            "      - {uses: org/act@abc,\n"
+            '         name: "a, id: phantom"}\n'
+        )
+        self.assertEqual(set(self._job0_step_ids(job)), set())
+
+    def test_the_quoted_comma_decoy_is_refused_after_a_bare_dash(self):
+        # And on the third site: a bare `-` whose flow mapping opens on the
+        # line below it.
+        job = self._job0(
+            "      -\n"
+            '        {run: "x, id: phantom", uses: org/act@abc}\n'
+        )
+        self.assertEqual(set(self._job0_step_ids(job)), set())
+
+    def test_the_quote_guard_never_drops_a_real_flow_id(self):
+        # The guard NARROWS: a real `id:` is only ever reached across an
+        # unquoted `{` or `,`, so every legitimate spelling — including one
+        # sitting after a quoted scalar that itself contains a comma, and one
+        # whose double-quoted neighbour carries an apostrophe — survives it.
+        # Under-collection is the costly direction: it manufactures a false
+        # `dangling` FAILURE on a compliant workflow.
+        for steps, expected in (
+            ("      - {id: real, uses: org/act@abc}\n", "real"),
+            ('      - {name: "a, b", id: real, uses: org/act@abc}\n', "real"),
+            ("      - {'id': real, uses: org/act@abc}\n", "real"),
+            ('      - {name: "it\'s fine", id: real}\n', "real"),
+            ("      - {uses: org/act@abc,\n         id: real}\n", "real"),
+            ("      -\n        {id: real, run: echo hi}\n", "real"),
+        ):
+            with self.subTest(steps=steps):
+                job = self._job0(steps)
+                self.assertEqual(set(self._job0_step_ids(job)), {expected})
+
+    def test_a_quoted_comma_decoy_leaves_a_real_dangling_ref_loud(self):
+        # End to end: the point of refusing the phantom is that the genuine
+        # finding it was covering for is reported again.
+        text = (
+            "name: F\non:\n  workflow_call:\njobs:\n"
+            + self._job0(
+                '      - {run: "build, id: phantom", uses: org/act@abc}\n'
+                "      - uses: actions/checkout@abc\n"
+                "        with:\n"
+                '          ref: "${{ steps.phantom.outputs.ref }}"\n'
+            )
+        )
+        self.assertEqual(
+            [(fb, guarded, via) for _, fb, guarded, via in cwp.ref_checkouts(text.split("\n"))],
+            [(False, False, "dangling")],
+        )
+
     # ------------------------------------------------------------------
     # The fail-loud escape: a `steps:` shape the item walk cannot read.
     # ------------------------------------------------------------------
@@ -2176,7 +2238,7 @@ class GuardCoverageTests(unittest.TestCase):
         # the pre-scan answers None — "unknown" — rather than an empty map
         # that would read as "this job declares no step at all".
         lines = ("name: F\non:\n  workflow_call:\njobs:\n" + self.FLOW_STEPS_JOB).split("\n")
-        start = next(i for i, l in enumerate(lines) if l.startswith("  job0:"))
+        start = next(i for i, line in enumerate(lines) if line.startswith("  job0:"))
         self.assertIsNone(cwp._job_step_ids(lines, start, 2))
 
     def test_a_fully_flow_steps_list_yields_no_dangling_verdict(self):
@@ -2214,7 +2276,7 @@ class GuardCoverageTests(unittest.TestCase):
             '      ref: "${{ steps.resolve_ref.outputs.ref }}"\n'
         )
         lines = text.split("\n")
-        start = next(i for i, l in enumerate(lines) if l.startswith("  job0:"))
+        start = next(i for i, line in enumerate(lines) if line.startswith("  job0:"))
         self.assertEqual(cwp._job_step_ids(lines, start, 2), {})
         self.assertEqual(
             [(fb, guarded, via) for _, fb, guarded, via in cwp.ref_checkouts(lines)],
@@ -2228,7 +2290,7 @@ class GuardCoverageTests(unittest.TestCase):
             "name: F\non:\n  workflow_call:\njobs:\n"
             "  job0:\n    runs-on: ubuntu-latest\n    steps:\n      not-an-item: true\n"
         ).split("\n")
-        start = next(i for i, l in enumerate(lines) if l.startswith("  job0:"))
+        start = next(i for i, line in enumerate(lines) if line.startswith("  job0:"))
         self.assertIsNone(cwp._job_step_ids(lines, start, 2))
 
     def test_a_trailing_or_fallback_after_a_covered_output_passes(self):

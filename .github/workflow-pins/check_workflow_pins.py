@@ -1281,6 +1281,31 @@ def _flow_brace_delta(text):
     return depth
 
 
+def _collect_flow_step_ids(ids, text, i):
+    """Register every flow-mapping `id:` on `text`, keyed to its line `i`.
+
+    `_STEP_ID_FLOW_RE` asks only for a preceding `[{,]`, and a comma that is
+    string CONTENT meets that boundary as readily as a real entry separator:
+    in `- {run: "build, id: phantom", uses: org/act@sha}` the comma sits
+    inside the quoted scalar, so a step nothing declares registers and
+    SILENCES the dangling verdict on a genuine finding — the same phantom
+    this reader exists to exclude, arriving through another door. So the
+    boundary is held to `_outside_quotes` — the same test
+    `_pins_to_job_workflow_sha` and `_ref_values` already apply before
+    trusting a flow match of their own.
+
+    Narrowing, never widening: a real `id:` is only ever reached across an
+    unquoted `{` or `,`, so the guard cannot drop one and manufacture the
+    false `dangling` failure under-collection costs here.
+
+    Per LINE, like every reader here: a quote opened on one physical line and
+    closed on the next is out of scope, as it is for `_flow_brace_delta`.
+    """
+    for flow in _STEP_ID_FLOW_RE.finditer(text):
+        if _outside_quotes(text, flow.start()):
+            ids.setdefault(flow.group(2).strip("'\""), i)
+
+
 def _is_skippable(line):
     """Blank lines and whole-line comments never open or close a YAML block."""
     stripped = line.strip()
@@ -1826,8 +1851,7 @@ def _job_step_ids(lines, start, job_indent):
             scalar_indent = None
         if flow_depth:
             text = _strip_comment(line)
-            for flow in _STEP_ID_FLOW_RE.finditer(text):
-                ids.setdefault(flow.group(2).strip("'\""), i)
+            _collect_flow_step_ids(ids, text, i)
             match = _STEP_ID_RE.match(line)
             if match:
                 # `rstrip` before the quote strip: on the continuation line of
@@ -1865,8 +1889,7 @@ def _job_step_ids(lines, start, job_indent):
                 # read with the flow pattern: applied to any marker line it
                 # also matches `- with: {id: x}`, where `id` is an action
                 # INPUT and no step is declared at all.
-                for flow in _STEP_ID_FLOW_RE.finditer(text):
-                    ids.setdefault(flow.group(2).strip("'\""), i)
+                _collect_flow_step_ids(ids, text, i)
                 flow_depth = max(0, _flow_brace_delta(text))
                 continue
             # A key written on the marker line declares it at the step's key
@@ -1879,8 +1902,7 @@ def _job_step_ids(lines, start, job_indent):
                 # BELOW it — the same mapping as `- {id: x, …}`, one line
                 # down. Read with the block pattern alone a line opening `{`
                 # matches nothing and the item's real id is lost.
-                for flow in _STEP_ID_FLOW_RE.finditer(text):
-                    ids.setdefault(flow.group(2).strip("'\""), i)
+                _collect_flow_step_ids(ids, text, i)
                 flow_depth = max(0, _flow_brace_delta(text))
                 continue
             # First member line after a bare `-` — its indent IS the item's
