@@ -27,10 +27,27 @@ why it is safe:
 comfy-cli                   # public (also on the org-wide PUBLIC_COMFY_ORG_REPOS list)
 ```
 
-Entries are shell globs, matched case-insensitively; a trailing `.git` and
-trailing sentence punctuation are stripped from the literal before comparison.
-For a **real** repo, "why it is safe" means you confirmed it is public. If it is
+Entries are shell globs, matched case-insensitively; a trailing `.git` suffix
+and trailing periods are stripped from the literal before comparison. A trailing
+`-` or `_` is **not** stripped — both are legal at the end of a real slug, so
+stripping them would let `<allowlisted>-` clear on `<allowlisted>`. For a
+**real** repo, "why it is safe" means you confirmed it is public. If it is
 private, the fix is to remove the reference, not to add the line.
+
+**Team handles are a separate namespace.** An entry written with a leading `@`
+clears only an `@`-prefixed literal — a CODEOWNERS team handle, or an npm /
+GitHub Packages scope. A plain entry clears either spelling, because
+`@<org>/<name>` is also how a package scope for a repo of that name is written.
+Scoping team slugs this way is what stops a CODEOWNERS fixture's team name from
+also clearing a literal reference to a *private repo* of the same name; the
+org-wide checker splits the two lists for the same reason.
+
+**No entry may match an arbitrary name.** An entry that clears two unrelated
+probe names is a configuration error (exit `2`), not an allowlist line: `*`,
+`**`, `?*` and `[a-z]*` all read as ordinary edits while switching the whole
+control off. For the same reason, prefer enumerating a test-fixture family over
+globbing it — a `secret-*` line pre-approves an unbounded set of names on a
+list whose entire value is that each name was reviewed once.
 
 ## Why not `public-repo-hygiene`?
 
@@ -47,12 +64,23 @@ new detection belongs there rather than here.
 ## Known limitations
 
 Run `bash check-org-repo-literals.sh --help` for the authoritative list. In
-short: only **org-prefixed** literals are caught (a bare repo name cannot be
-linted without a denylist that is itself the leak — that half stays with review
-and AGENTS.md), and the name class is ASCII, so a name whose tail is non-ASCII
-is read only as far as its ASCII prefix. The scan runs under `LC_ALL=C` so that
-second limit is the same on every machine rather than a function of the runner's
-locale.
+short:
+
+- Only **org-prefixed** literals are caught. A bare repo name cannot be linted
+  without a denylist that is itself the leak — that half stays with review and
+  AGENTS.md.
+- The name class is **ASCII**, so a name whose tail is non-ASCII (a U+2010
+  homoglyph dash, a U+017F long s, CJK text) is read only as far as its ASCII
+  prefix. The class cannot simply be widened to high bytes: this tree
+  legitimately writes an ellipsis, an em dash and CJK text flush against a real
+  name in prose, so widening turns those into findings. The scan runs under
+  `LC_ALL=C` so this limit is the same on every machine rather than a function
+  of the runner's locale. Closing it properly needs the offset-aware scan
+  [`public-repo-hygiene`](../public-repo-hygiene/) already implements.
+- **Binary blobs are never read.** Both scan paths pass `-I`, so a UTF-16 file,
+  a file carrying a stray NUL, or one `.gitattributes` line (`*.md binary`)
+  takes whole file types out of the scan with no signal in the run output. Text
+  is the only surface this lint claims.
 
 ## Running it
 

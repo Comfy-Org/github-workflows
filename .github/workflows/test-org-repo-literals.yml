@@ -52,60 +52,127 @@ jobs:
       # scanned by the step above and would have to be allowlisted — which
       # would defeat the fixture, since the point is that it is NOT allowlisted.
       # (`%s/%s` is not a match: the name class cannot start with `%`.)
-      - name: Smoke test — an unlisted name fails the lint
+      #
+      # Each negative case asserts the EXACT status. "any non-zero" would let a
+      # lint that died with exit 2 (renamed allowlist, unreadable root, an
+      # argument rejected after a refactor) read as "correctly rejected the
+      # name" while nothing was scanned. Output is captured and echoed only on
+      # failure, because a finding prints a `::error file=…` workflow command
+      # and a SUCCESSFUL run must not publish annotations pointing at a temp
+      # file that is not in the repo.
+      - name: Smoke test — findings exit 1, allowlisted names exit 0
         run: |
+          fail=0
+          expect() {  # expect <want-status> <label> <printf-fmt> <arg>...
+            local want="$1" label="$2" fmt="$3"; shift 3
+            local dir status=0 output
+            dir="$(mktemp -d)"
+            # shellcheck disable=SC2059  # $fmt is the caller-supplied format
+            printf "$fmt" "$@" > "$dir/fixture.md"
+            output="$(bash .github/lint/check-org-repo-literals.sh --root "$dir" 2>&1)" || status=$?
+            if [ "$status" -ne "$want" ]; then
+              echo "::error::$label: exited $status, expected $want"
+              printf '%s\n' "$output"
+              fail=1
+            else
+              echo "ok ($status): $label"
+            fi
+          }
+
           # Proves the lint is wired to FAIL, not just to run: the step above
-          # exercises the clean path, this exercises the CLI's exit status.
-          dir="$(mktemp -d)"
-          printf 'see %s/%s for details\n' 'Comfy-Org' 'not-on-the-allowlist' > "$dir/fixture.md"
-          if bash .github/lint/check-org-repo-literals.sh --root "$dir"; then
-            echo "::error::lint passed an unallowlisted org repo literal — expected a non-zero exit"
-            exit 1
-          fi
-          echo "lint correctly rejected the unallowlisted name"
+          # exercises the clean path, these exercise the CLI's exit status.
+          expect 1 'an unlisted name' 'see %s/%s for details\n' 'Comfy-Org' 'not-on-the-allowlist'
 
-      - name: Smoke test — a lowercased org spelling still fails
-        run: |
-          # GitHub resolves owner names case-insensitively, so `comfy-org/<name>`
-          # reaches the same repository as the canonical spelling. Matching only
-          # the canonical one would be a one-keystroke bypass of a default-deny
-          # control (the same hole BE-8697 closed in public-repo-hygiene).
-          dir="$(mktemp -d)"
-          printf '%s/%s\n' 'comfy-org' 'Not-On-The-Allowlist' > "$dir/fixture.md"
-          if bash .github/lint/check-org-repo-literals.sh --root "$dir"; then
-            echo "::error::lint passed a lowercased org spelling — expected a non-zero exit"
-            exit 1
-          fi
-          echo "lint correctly rejected the lowercased org spelling"
+          # GitHub resolves owner names case-insensitively, so a lowercased org
+          # spelling reaches the same repository as the canonical one. Matching
+          # only the canonical spelling would be a one-keystroke bypass of a
+          # default-deny control (the same hole BE-8697 closed in
+          # public-repo-hygiene).
+          expect 1 'a lowercased org spelling' '%s/%s\n' 'comfy-org' 'Not-On-The-Allowlist'
 
-      - name: Smoke test — an allowlisted name passes
-        run: |
+          # `-`/`_` are LEGAL as a slug's last character, so normalization must
+          # not strip them: `<allowlisted>-` is a different, real repo and must
+          # not clear on the allowlisted entry.
+          expect 1 'a trailing-hyphen variant of an allowlisted name' '%s/%s\n' 'Comfy-Org' 'private-'
+          expect 1 'a trailing-underscore variant of an allowlisted name' '%s/%s\n' 'Comfy-Org' 'private_'
+
+          # A team slug is allowlisted `@`-scoped, so it must NOT also clear a
+          # bare reference to a repo of the same name.
+          expect 1 'a bare repo reference spelled like a team slug' '%s/%s\n' 'Comfy-Org' 'backend'
+          expect 0 'the same slug as a CODEOWNERS team handle' '@%s/%s\n' 'Comfy-Org' 'backend'
+
           # The other half: a lint that always fails proves nothing either. This
-          # also pins the `.git` suffix and trailing-punctuation stripping, so a
-          # normalization regression cannot hide behind the clean-tree run above.
-          dir="$(mktemp -d)"
-          {
-            printf 'plain %s/%s\n' 'Comfy-Org' 'github-workflows'
-            printf 'clone %s/%s.\n' 'Comfy-Org' 'github-workflows.git'
-            printf 'glob  %s/%s\n' 'Comfy-Org' 'secret-alpha'
-            printf 'empty %s/%s\n' 'Comfy-Org' '.git'
-          } > "$dir/fixture.md"
-          bash .github/lint/check-org-repo-literals.sh --root "$dir"
-          echo "lint correctly accepted the allowlisted names"
+          # also pins the `.git` suffix and trailing-period stripping, so a
+          # normalization regression cannot hide behind the clean-tree run.
+          expect 0 'a plain allowlisted name' 'plain %s/%s\n' 'Comfy-Org' 'github-workflows'
+          expect 0 'a .git suffix and a trailing period' 'clone %s/%s.\n' 'Comfy-Org' 'github-workflows.git'
+          expect 0 'a reference naming nothing' 'empty %s/%s\n' 'Comfy-Org' '.git'
 
-      - name: Smoke test — a bare '*' allowlist entry is rejected, not honoured
+          exit "$fail"
+
+      - name: Smoke test — an over-broad allowlist entry is rejected, not honoured
         run: |
-          # The one edit that would silently neuter the whole control is a
-          # single '*' on an allowlist line. It must fail as a configuration
-          # error (exit 2), not clear every name.
-          dir="$(mktemp -d)"
-          mkdir -p "$dir/.github/lint"
-          printf '*  # oops\n' > "$dir/.github/lint/org-repo-allowlist.txt"
-          printf '%s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$dir/fixture.md"
+          # The one edit that would silently neuter the whole control is a glob
+          # that matches everything. `*` is only the shortest spelling: `**`,
+          # `?*` and `[a-z]*` all clear every name that reaches the matcher and
+          # all read as ordinary allowlist lines. Each must fail as a
+          # configuration error (exit 2).
+          fail=0
+          for entry in '*' '**' '?*' '[a-z]*'; do
+            dir="$(mktemp -d)"
+            mkdir -p "$dir/.github/lint"
+            printf '%s  # oops\n' "$entry" > "$dir/.github/lint/org-repo-allowlist.txt"
+            printf '%s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$dir/fixture.md"
+            status=0
+            output="$(bash .github/lint/check-org-repo-literals.sh --root "$dir" 2>&1)" || status=$?
+            if [ "$status" -ne 2 ]; then
+              echo "::error::allowlist entry '$entry' exited $status — expected 2 (configuration error)"
+              printf '%s\n' "$output"
+              fail=1
+            else
+              echo "ok (2): allowlist entry '$entry' rejected"
+            fi
+          done
+          exit "$fail"
+
+      - name: Smoke test — a scan that could not run is not a clean tree
+        run: |
+          # `git grep` and `grep` both exit 1 for "no matches", so a scan that
+          # never ran must not land on that status. A --root inside a work tree
+          # but holding no tracked files, and a root that cannot be entered,
+          # are the two ways that happens; both must be configuration errors.
+          fail=0
+          empty_repo="$(mktemp -d)"
+          git -C "$empty_repo" init -q
           status=0
-          bash .github/lint/check-org-repo-literals.sh --root "$dir" || status=$?
+          output="$(bash .github/lint/check-org-repo-literals.sh --root "$empty_repo" 2>&1)" || status=$?
           if [ "$status" -ne 2 ]; then
-            echo "::error::a bare '*' allowlist entry exited $status — expected 2 (configuration error)"
-            exit 1
+            echo "::error::a work tree with no tracked files exited $status — expected 2"
+            printf '%s\n' "$output"
+            fail=1
+          else
+            echo "ok (2): a work tree with no tracked files is not reported clean"
           fi
-          echo "lint correctly rejected the wildcard allowlist entry"
+
+          # `chmod 000` does not stop root, so this half only means something
+          # as an unprivileged user (which is what `runs-on: ubuntu-latest`
+          # gives us). Skip rather than assert a guarantee we do not have.
+          if [ "$(id -u)" -eq 0 ]; then
+            echo "skip: running as root, chmod 000 would not block the cd"
+            exit "$fail"
+          fi
+          outer="$(mktemp -d)"
+          mkdir "$outer/sub"
+          printf 'placeholder\n' > "$outer/sub/fixture.md"
+          chmod 000 "$outer/sub"
+          status=0
+          output="$(bash .github/lint/check-org-repo-literals.sh --root "$outer/sub" 2>&1)" || status=$?
+          chmod 755 "$outer/sub"
+          if [ "$status" -ne 2 ]; then
+            echo "::error::an unenterable root exited $status — expected 2"
+            printf '%s\n' "$output"
+            fail=1
+          else
+            echo "ok (2): an unenterable root is not reported clean"
+          fi
+          exit "$fail"

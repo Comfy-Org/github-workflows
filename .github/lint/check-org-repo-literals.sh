@@ -9,21 +9,28 @@
 #
 # ALLOWLIST, NEVER DENYLIST. A denylist grep would have to commit the private
 # names into this public repo to match them — the lint would BE the leak. So
-# every `Comfy-Org/<name>` literal in the tracked tree is a finding unless
-# <name> is on the committed allowlist. Adding a name is an allowlist edit,
+# every org-prefixed repo literal in the tracked tree is a finding unless the
+# name is on the committed allowlist. Adding a name is an allowlist edit,
 # which review sees.
 #
 # KNOWN LIMITATIONS — read these before trusting a green run:
 #   1. Only ORG-PREFIXED literals are caught. A bare repo name written without
-#      the `Comfy-Org/` prefix cannot be linted without committing a denylist
-#      that is itself the leak. Bare-name discipline stays with review and
-#      AGENTS.md.
+#      the org prefix cannot be linted without committing a denylist that is
+#      itself the leak. Bare-name discipline stays with review and AGENTS.md.
 #   2. The name class is ASCII and the scan runs in the C locale, so a name
 #      whose tail is non-ASCII -- a U+2010 homoglyph dash, a U+017F long s, CJK
 #      text -- is read only as far as its ASCII PREFIX, and a private name
-#      spelled that way can clear on an allowlisted prefix. Handling that needs
-#      the offset-aware scan `public-repo-hygiene` does; see limitation 3.
-#   3. Category 3 only. `.github/public-repo-hygiene/` is the rigorous,
+#      spelled that way can clear on an allowlisted prefix. The class cannot
+#      simply be widened to high bytes: this tree legitimately writes an
+#      ellipsis, an em dash and CJK text flush against a real name in prose, so
+#      widening turns those into findings. Handling it properly needs the
+#      offset-aware scan `public-repo-hygiene` does; see limitation 4.
+#   3. Both scan paths pass `-I`, so a tracked blob git classifies as BINARY is
+#      never read: a UTF-16 file, a file carrying a stray NUL, or one
+#      `.gitattributes` line (`*.md binary`) removes whole file types from the
+#      scan and a green run says nothing about them. Text is the only surface
+#      this lint claims.
+#   4. Category 3 only. `.github/public-repo-hygiene/` is the rigorous,
 #      org-wide implementation of this idea (it also covers ticket ids,
 #      internal collaboration-tool links and the homoglyph case above). This
 #      repo cannot adopt that caller as-is: it is that checker's own home, so
@@ -56,11 +63,18 @@ ORG='Comfy-Org'
 # anywhere in this file would be a finding against this very lint.
 #
 # Matched case-INSENSITIVELY (`grep -i`), because GitHub resolves owner names
-# case-insensitively: `comfy-org/<private-repo>` reaches the same repository, so
+# case-insensitively: a lowercased org spelling reaches the same repository, so
 # matching only the canonical spelling would leave a one-keystroke bypass of a
 # default-deny control. The name class is already both cases, so `-i` widens
 # nothing but the org segment.
-PATTERN="${ORG}/[A-Za-z0-9_.-]+"
+#
+# The optional leading `@` is CAPTURED, not skipped: an `@`-prefixed match is a
+# CODEOWNERS team handle or an npm/GitHub Packages scope, and team handles are
+# allowlisted separately from repo names (see `@`-entries below). Without the
+# capture the two share one namespace, so a team slug allowlisted for a
+# CODEOWNERS fixture would also clear a literal reference to a private REPO of
+# the same name. `public-repo-hygiene` splits the two for the same reason.
+PATTERN="@?${ORG}/[A-Za-z0-9_.-]+"
 
 root='.'
 allowlist_rel='.github/lint/org-repo-allowlist.txt'
@@ -104,30 +118,66 @@ else
   exit 2
 fi
 
+# Two names no allowlist entry has any business matching. An entry that clears
+# BOTH is not an allowlist line, it is an off switch: `*`, `**`, `?*` and
+# `[a-z]*` all read as ordinary-looking edits while clearing every name that
+# reaches the `case` below. Testing behaviour rather than spelling is what makes
+# the guard cover the spellings nobody thought to enumerate; requiring BOTH
+# probes keeps a narrow-but-odd glob from tripping it.
+OVERBROAD_PROBE_A='zzq0probe-not-a-real-name-9f3d'
+OVERBROAD_PROBE_B='qx7probe.not-a-real-name-2b8'
+
 # Allowlist entries are shell globs, matched case-insensitively (GitHub
 # resolves owner/repo names case-insensitively, so a case variant of an
 # allowlisted PUBLIC name is the same repo — and no private name is on this
 # list under any casing, so folding case cannot clear one).
+#
+# An entry written with a leading `@` is a TEAM/scope entry: it clears only an
+# `@`-prefixed literal. A plain entry clears either spelling, because
+# `@<org>/<name>` is also how npm and GitHub Packages write a package scope for
+# a repo of that name — the same asymmetry `public-repo-hygiene` documents.
 patterns=()
 pattern_count=0
+team_patterns=()
+team_pattern_count=0
 # `|| [ -n "$line" ]` so a final entry with no trailing newline is not dropped.
 while IFS= read -r line || [ -n "$line" ]; do
   line="${line%%#*}"                       # strip the trailing "why it's safe" comment
   line="${line#"${line%%[![:space:]]*}"}"  # ltrim
   line="${line%"${line##*[![:space:]]}"}"  # rtrim
   [ -n "$line" ] || continue
-  # A bare `*` would clear every name and neuter the whole control. Reject it
-  # loudly rather than letting one character pass as an ordinary allowlist edit.
-  [ "$line" != '*' ] || { echo "error: allowlist '$allowlist' has a bare '*' entry, which allows every name" >&2; exit 2; }
-  patterns+=("$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')")
-  pattern_count=$((pattern_count + 1))
+  entry="$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')"
+  is_team=0
+  case "$entry" in
+    @*) is_team=1; entry="${entry#@}" ;;
+  esac
+  [ -n "$entry" ] || { echo "error: allowlist '$allowlist' has an entry that is a bare '@'" >&2; exit 2; }
+  # shellcheck disable=SC2254  # $entry is intentionally a glob, not a literal
+  case "$OVERBROAD_PROBE_A" in
+    $entry)
+      # shellcheck disable=SC2254
+      case "$OVERBROAD_PROBE_B" in
+        $entry)
+          echo "error: allowlist '$allowlist' entry '$line' matches arbitrary names, which allows every name" >&2
+          exit 2
+          ;;
+      esac
+      ;;
+  esac
+  if [ "$is_team" -eq 1 ]; then
+    team_patterns+=("$entry")
+    team_pattern_count=$((team_pattern_count + 1))
+  else
+    patterns+=("$entry")
+    pattern_count=$((pattern_count + 1))
+  fi
 done < "$allowlist"
 
 # Counted rather than `${#patterns[@]}`: bash 3.2 (still /bin/bash on macOS)
 # treats an empty array as unset under `set -u`, so the guard would abort with
-# `unbound variable` instead of this message. The `for` below is only reached
-# with a non-empty array for the same reason.
-if [ "$pattern_count" -eq 0 ]; then
+# `unbound variable` instead of this message. The `for` loops below are only
+# reached with a non-empty array for the same reason.
+if [ "$((pattern_count + team_pattern_count))" -eq 0 ]; then
   echo "error: allowlist '$allowlist' has no entries" >&2
   exit 2
 fi
@@ -138,13 +188,35 @@ fi
 hits=''
 scan_status=0
 if git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  hits="$(git -C "$root" grep -oiInE -- "$PATTERN" \
-    -- . ":(exclude)$allowlist_rel")" || scan_status=$?
+  # `--is-inside-work-tree` is true for any directory NESTED under a work tree,
+  # not just its root, and the `.` pathspec resolves relative to `$root`. So a
+  # `--root` below the top scans only that subtree — and if the subtree holds no
+  # tracked files, `git grep` matches nothing, exits 1, and that is
+  # indistinguishable from a clean tree. Fail closed instead, and report the
+  # scope actually scanned rather than claiming the whole tracked tree.
+  scope="the tracked files under '$root'"
+  first_tracked="$(git -C "$root" ls-files -- . 2>/dev/null | head -n 1 || true)"
+  if [ -z "$first_tracked" ]; then
+    echo "error: no tracked files under '$root' — refusing to report a clean tree" >&2
+    exit 2
+  fi
+  # The allowlist file itself is NOT excluded. Its entries are bare names that
+  # cannot match PATTERN anyway, so an exclusion would buy only one thing:
+  # letting its free-text rationale comments go unchecked, so that a line like
+  # `foo  # mirrors <org>/<private>` would publish an unapproved name with CI
+  # green. The non-git path below never excluded it either.
+  hits="$(git -C "$root" grep -oiInE -- "$PATTERN" -- .)" || scan_status=$?
 else
   # `cd` + a `.` root rather than grepping "$root" and stripping the prefix
   # afterwards: the strip would be a `sed` expression built from a path this
   # script does not control.
-  hits="$(cd "$root" && grep -rIoiEn --exclude-dir=.git -- "$PATTERN" .)" || scan_status=$?
+  #
+  # `|| exit 3` rather than `&&`: a failed `cd` would otherwise exit 1, which is
+  # grep's "no matches" status, and the guard below would wave it through as a
+  # clean tree. `[ -d "$root" ]` above does not cover it (a directory with no
+  # execute bit, or a TOCTOU replacement between the two).
+  scope="'$root'"
+  hits="$(cd -- "$root" || exit 3; grep -rIoiEn --exclude-dir=.git -- "$PATTERN" .)" || scan_status=$?
 fi
 # Both tools exit 1 for "no matches" and >1 for a real error. Swallowing the
 # latter with `|| true` would report a clean tree because the scan never ran --
@@ -158,13 +230,18 @@ fi
 # Trailing sentence punctuation the name class swallowed, then a `.git` suffix
 # (`Foo.git` still references the repo `Foo`), then punctuation again --
 # `<org>/foo.git.` needs both passes, and stripping `.git` first leaves the
-# suffix stuck behind the period. A GitHub slug can end in none of these, so
-# every pass can only narrow the name.
-trim_trailing_punctuation() {
+# suffix stuck behind the period.
+#
+# ONLY `.` is stripped. A GitHub slug may not END in a period, so dropping one
+# can only narrow the name. `-` and `_` are different: both are LEGAL as a
+# slug's last character, so stripping them would WIDEN the match — a literal for
+# a private repo named `<allowlisted>-` or `<allowlisted>_` would normalize onto
+# the allowlisted entry and clear this default-deny check.
+trim_trailing_dots() {
   local value="$1"
   while [ -n "$value" ]; do
     case "$value" in
-      *.|*-|*_) value="${value%?}" ;;
+      *.) value="${value%?}" ;;
       *) break ;;
     esac
   done
@@ -182,22 +259,38 @@ while IFS= read -r hit; do
   file="${where%:*}"
   file="${file#./}"
   lineno="${where##*:}"
-  name="${match#*/}"
+  # An `@`-prefixed literal may additionally draw on the team/scope entries.
+  is_at=0
+  qualified="$match"
+  case "$qualified" in
+    @*) is_at=1; qualified="${qualified#@}" ;;
+  esac
+  name="${qualified#*/}"
 
   lower="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
-  lower="$(trim_trailing_punctuation "$lower")"
+  lower="$(trim_trailing_dots "$lower")"
   lower="${lower%.git}"
-  lower="$(trim_trailing_punctuation "$lower")"
+  lower="$(trim_trailing_dots "$lower")"
   # A reference left naming nothing (`<org>/.`, `<org>/.git`) is not a finding.
   [ -n "$lower" ] || continue
 
   allowed=0
-  for p in "${patterns[@]}"; do
-    # shellcheck disable=SC2254  # $p is intentionally a glob, not a literal
-    case "$lower" in
-      $p) allowed=1; break ;;
-    esac
-  done
+  if [ "$pattern_count" -gt 0 ]; then
+    for p in "${patterns[@]}"; do
+      # shellcheck disable=SC2254  # $p is intentionally a glob, not a literal
+      case "$lower" in
+        $p) allowed=1; break ;;
+      esac
+    done
+  fi
+  if [ "$allowed" -eq 0 ] && [ "$is_at" -eq 1 ] && [ "$team_pattern_count" -gt 0 ]; then
+    for p in "${team_patterns[@]}"; do
+      # shellcheck disable=SC2254  # $p is intentionally a glob, not a literal
+      case "$lower" in
+        $p) allowed=1; break ;;
+      esac
+    done
+  fi
 
   if [ "$allowed" -eq 0 ]; then
     findings=$((findings + 1))
@@ -218,4 +311,4 @@ MSG
   exit 1
 fi
 
-echo "OK: every ${ORG} repo literal in the tracked tree is on $allowlist_rel"
+echo "OK: every ${ORG} repo literal in $scope is on $allowlist_rel"
