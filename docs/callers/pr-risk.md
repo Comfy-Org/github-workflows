@@ -133,6 +133,28 @@ your own steps (or jobs) that check out or run PR head code under it reopens
 the classic pwn-request hole. Same-repo-only callers (private org repos that
 take no fork PRs) should stay on plain `pull_request`.
 
+**Bot PRs are graded — do not add a `github.actor != 'dependabot[bot]'` skip.**
+Dependabot's `pull_request` runs do start from a read-only `GITHUB_TOKEN`, but
+the caller's `permissions:` block elevates it — that is GitHub's documented
+behaviour ([Changing `GITHUB_TOKEN`
+permissions](https://docs.github.com/en/code-security/dependabot/troubleshooting-dependabot/troubleshooting-dependabot-on-github-actions#changing-github_token-permissions))
+— and this workflow declares no secrets, so the label write succeeds. A
+dependabot skip therefore buys nothing and leaves most repos' highest-volume
+automated PR producer ungraded. The reasoning is specific to *this* workflow: a
+caller that needs an **Actions secret** (an app private key, an API token —
+[`cursor-review-auto-label.yml`](cursor-review-auto-label.md) is the org's
+example) still needs the skip, because a Dependabot-triggered run sees Dependabot
+secrets only and no `permissions:` block can change that. Fork PRs are the
+opposite case: the `permissions:` elevation does not extend to them, which is why
+the fork gotcha above is still a real token guard.
+
+**Already carrying that skip? Removing it is yours to do, not the fleet's** —
+[`bump-pr-risk-callers.yml`](../../.github/workflows/bump-pr-risk-callers.yml)
+moves SHA pins only and will never edit your `if:`, so drop the clause in your
+own repo, and update in the same PR anything repo-side that mirrors the caller's
+`if:`/`concurrency` shape (a unit test asserting on the caller's YAML is the
+usual one).
+
 **Enroll it as its own workflow, not a job inside an existing CI workflow.**
 The grading job excludes its own *run* from the check rollup it reads; a job
 sharing a run with the rest of CI excludes its siblings too and lands on the
