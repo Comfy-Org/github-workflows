@@ -18,11 +18,16 @@ the line starts with the tracked path, and a tracked file named
 suppresses every annotation after it. The annotation's `file=` value is
 percent-escaped for the same reason, and `line=` is *validated* rather than
 escaped: a line number is always digits, so a non-numeric field means the
-`file:line:match` record did not parse and the run refuses it (exit `2`). The way
-that happens is a tracked path containing a newline — both scan paths print paths
-raw, so one hit arrives as two records and the leading fragment would otherwise
-be reported as a literal cut out of a filename, against a path that does not
-exist.
+`file:line:match` record did not parse and the run refuses it (exit `2`). The
+record's **shape** is checked too — after the boundary drop the match must still
+begin with the org prefix — because a numeric line field does not prove the split
+landed where it appears to. The way both fire is a tracked path containing a
+newline on the `grep -r` **fallback** path, which prints paths raw: one hit
+arrives as two records, and the leading fragment would otherwise be reported as a
+literal cut out of a filename against a path that does not exist. The **git**
+path has no split — `git grep` C-quotes newline, tab, `\` and `"` in a path
+whatever `core.quotePath` says (that governs only bytes ≥ 0x80) — so there such a
+file is one record, a real finding with a C-quoted location.
 
 The org segment has to **start a token**, so `Not<org>/whatever` — a different
 owner whose name happens to end in ours — is not a reference to this org and is
@@ -85,10 +90,13 @@ summary says to add it to the allowlist, so accepting it would yield an inert
 line and a rerun still insisting the name is missing from a file that visibly
 contains it. Rejected with the spelling that does work.
 
-**No name ending in `.<org>` or `-<org>`.** That is the shape of a *merged*
-literal, not a repo name: `grep -o` takes non-overlapping matches and the name
-class holds `.` and `-`, so `<org>/public.<org>/private` scans as one match whose
-name reads `public.<org>` and the second name is never examined. It fails closed
+**No name ending in the org name.** That is the shape of a *merged* literal, not
+a repo name: `grep -o` takes non-overlapping matches, so `<org>/public.<org>/private`
+scans as one match whose name reads `public.<org>` and the second name is never
+examined. The suffix test is complete rather than a sample of separators — the
+merged token always ends at the `/` that starts the second name, so `foo.<org>`,
+`foo-<org>`, `foo_<org>` (the name class holds `_`) and the bare `<org>` that
+`<org>/<org>/private` produces are all one rule. It fails closed
 (no merged token is on the list, so the line is always a finding), but the
 obvious way to silence so confusing a finding is to allowlist the token it
 quotes — and that would clear the private reference with the run green. Making
@@ -160,7 +168,8 @@ in the same order, except limitation 5 (*this lint is one category of
   symlink's target string; neither checker scans the path itself.
 - **Two adjacent literals scan as one.** `<org>/public.<org>/private` is a single
   `grep -o` match whose name reads `public.<org>`; the second name is never
-  compared and the scan resumes past it. It fails closed — that token is on no
+  compared and the scan resumes past it. Any separator in the name class does it
+  — `.`, `-`, `_`, or none at all for `<org>/<org>/private`. It fails closed — that token is on no
   list, so the line is always a finding — and the remedy that *would* be
   dangerous (allowlisting the quoted token) is rejected by the loader, above.
 - **The per-hit loop is linear in the hit count**, and the 200-finding print cap
@@ -200,12 +209,24 @@ public run log nor the annotation list.
 `--root` is resolved robustly rather than trustingly: `CDPATH`, `GIT_DIR`,
 `GIT_WORK_TREE` and `GIT_INDEX_FILE` are unset (each can silently move the scan
 off the directory the run then reports as its scope), and so are
-`GIT_CONFIG_COUNT`, `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` — those inject
-arbitrary config, and `core.attributesFile` pointing at one `*.md binary` line
-marks a subset of the tree binary, which `git grep -I` then silently skips. That
-one fails *open*: the scannability probe still clears, the scan reads less than
-the tree, and the OK line still claims the whole scope. (`GIT_CONFIG_KEY_n`/
-`_VALUE_n` are inert once the count is gone.)
+`GIT_CONFIG_COUNT`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM` and
+`GIT_CONFIG_PARAMETERS` — those inject arbitrary config, and
+`core.attributesFile` pointing at one `*.md binary` line marks a subset of the
+tree binary, which `git grep -I` then silently skips. That one fails *open*: the
+scannability probe still clears, the scan reads less than the tree, and the OK
+line still claims the whole scope. (`GIT_CONFIG_KEY_n`/`_VALUE_n` are inert once
+the count is gone. `GIT_CONFIG_PARAMETERS` is the non-obvious one: it is how `-c`
+propagates to child git processes and is read unconditionally, so it delivers the
+same fail-open with the count already unset.)
+
+What that does *not* do: unsetting `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`
+restores git's **default** config search rather than disabling it, so a
+runner-level `core.attributesFile` still applies. Pointing both at `/dev/null`
+plus `GIT_CONFIG_NOSYSTEM=1` would close that and is deliberately not done — it
+would also drop a runner's legitimate `safe.directory`, which makes `rev-parse`
+fail and silently takes the `grep -r` fallback. The environment is hardened; the
+runner's own config is trusted, the same way the tamper boundary trusts the
+checkout.
 
 The git/`grep -r` branch is chosen from `rev-parse --is-inside-work-tree`'s
 **output** rather than its exit status (it prints `false` and exits `0` for a

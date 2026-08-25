@@ -86,8 +86,12 @@
 #      a finding. The residual is the REMEDY, not the miss: the finding quotes a
 #      token that is not a repo, and the obvious way to silence something so
 #      confusing is to allowlist the quoted token -- which would clear the
-#      private reference with the run green. So the loader REJECTS an entry
-#      ending in `.<org>` or `-<org>`, the only spelling that could do it.
+#      private reference with the run green. So the loader REJECTS any entry
+#      ending in the org name. That is the COMPLETE test, not a sample of
+#      separators: `grep -o` stops the merged token at the `/` that starts the
+#      second name, so such a token always ends in the org -- `foo.<org>`,
+#      `foo-<org>`, `foo_<org>` (the name class holds `_`) and the bare `<org>`
+#      that `<org>/<org>/private` produces are all covered by the one suffix.
 #  11. The per-hit loop is LINEAR IN THE HIT COUNT, and `MAX_REPORTED` does not
 #      bound it: past the cap a hit stops printing but is still folded,
 #      normalized and compared against the list, because the reported count and
@@ -147,8 +151,23 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
 # the guard clears, the scan reads LESS than the tree, and the OK line still
 # claims "the tracked files under '$root'". `GIT_CONFIG_KEY_n`/`_VALUE_n` are
 # inert once `GIT_CONFIG_COUNT` is gone (git reads the count first and then
-# exactly that many pairs), so the three names below are the whole mechanism.
-unset GIT_CONFIG_COUNT GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM
+# exactly that many pairs), so they need no unset of their own.
+#
+# `GIT_CONFIG_PARAMETERS` is the FOURTH and is not obvious: it is the channel
+# `-c` uses to propagate to child git processes, and git reads it from the
+# environment unconditionally, so `GIT_CONFIG_PARAMETERS="'core.attributesFile=…'"`
+# delivers the same fail-open with `GIT_CONFIG_COUNT` already gone (measured).
+#
+# What this does NOT do: unsetting `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`
+# restores git's DEFAULT search (`$HOME`/XDG, `/etc/gitconfig`) rather than
+# disabling config, so a runner-level `core.attributesFile` still applies.
+# Pointing both at `/dev/null` plus `GIT_CONFIG_NOSYSTEM=1` would close that,
+# and is deliberately not done: it would also drop a runner's legitimate
+# `safe.directory`, which makes `rev-parse` fail and silently takes the
+# `grep -r` fallback -- trading a hazard nobody can reach from a PR for a
+# scope change on every run. The env is hardened; the runner's own config is
+# trusted, the same way the TAMPER BOUNDARY block below trusts the checkout.
+unset GIT_CONFIG_COUNT GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_PARAMETERS
 
 ORG='Comfy-Org'
 # Deliberately assembled rather than written whole: a literal org-prefixed name
@@ -262,8 +281,21 @@ script_repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" || {
   echo "error: cannot resolve this script's repo root from '${BASH_SOURCE[0]}'" >&2
   exit 2
 }
+# `--root` explicitly supports a directory BELOW a work tree, and for such a
+# root `$root/$allowlist_rel` is not where the scanned repo keeps its allowlist
+# -- its top level is. Without this step `--root /somewhere/repo/docs` validated
+# that repo's literals against THIS repo's list, which is not what the comment
+# above promises. `|| true` because a non-repo root is the normal fallback case,
+# not an error, and `-d` because `--show-toplevel` prints nothing useful when it
+# fails.
+root_repo_top=''
+if [ "$(git -C "$root" rev-parse --is-inside-work-tree 2>/dev/null)" = true ]; then
+  root_repo_top="$(git -C "$root" rev-parse --show-toplevel 2>/dev/null || true)"
+fi
 if [ -f "$root/$allowlist_rel" ]; then
   allowlist="$root/$allowlist_rel"
+elif [ -n "$root_repo_top" ] && [ -f "$root_repo_top/$allowlist_rel" ]; then
+  allowlist="$root_repo_top/$allowlist_rel"
 elif [ -f "$script_repo_root/$allowlist_rel" ]; then
   allowlist="$script_repo_root/$allowlist_rel"
 else
@@ -352,8 +384,8 @@ while IFS= read -r line || [ -n "$line" ]; do
       ;;
   esac
   case "$entry" in
-    *[.-]"$org_lc")
-      echo "error: allowlist '$allowlist' entry '$line' ends in '.$ORG' or '-$ORG'; that is the shape of a MERGED literal (see limitation 10, '<org>/a.<org>/b' scans as one match) and allowlisting it would clear the second, unexamined name with the run green" >&2
+    *"$org_lc")
+      echo "error: allowlist '$allowlist' entry '$line' ends in '$ORG'; that is the shape of a MERGED literal (see limitation 10, '<org>/a.<org>/b' scans as one match named 'a.<org>') and allowlisting it would clear the second, unexamined name with the run green" >&2
       exit 2
       ;;
   esac
@@ -593,12 +625,19 @@ while IFS= read -r hit; do
 
   # A line number is always DIGITS, so anything else means this record is not a
   # `file:line:match` triple and the split above produced three fabrications.
-  # The way that happens is a tracked path containing a NEWLINE: both scan paths
-  # print the path raw (`core.quotePath=false` on the git side, `grep -r` on the
-  # other), so one hit arrives as two records and the leading fragment yields a
-  # file that does not exist, a `line=` that is a path, and a "literal" cut out
-  # of the filename. Reporting it would also put the raw `:`/`,` of a path into
-  # the `file=`/`line=` properties that `escape_property` exists to protect.
+  # The way that happens is a tracked path containing a NEWLINE on the `grep -r`
+  # FALLBACK path, which prints the path raw: one hit arrives as two records and
+  # the leading fragment yields a file that does not exist, a `line=` that is a
+  # path, and a "literal" cut out of the filename. Reporting it would also put
+  # the raw `:`/`,` of a path into the `file=`/`line=` properties that
+  # `escape_property` exists to protect.
+  #
+  # The GIT path does not have the split: `git grep` C-quotes newline, tab, `\`
+  # and `"` in a path whatever `core.quotePath` says (that setting governs only
+  # bytes >= 0x80), so such a file arrives as ONE record with a numeric line
+  # field and a C-quoted pseudo-path. That is a real finding with a quoted
+  # location, not a fabrication, and it is left as such -- the annotation's
+  # delimiters (`:` and `,`) are still escaped.
   #
   # Refused rather than escaped or skipped: escaping would still publish the
   # fabricated finding, and skipping would drop a record on a parse this script
@@ -636,7 +675,26 @@ while IFS= read -r hit; do
   case "$match_head" in
     $org_glob/*) ;;                     # column 0 — no boundary was consumed
     "@"$org_glob/*) is_at=1 ;;
-    *) match="${match#?}" ;;
+    *)
+      match="${match#?}"
+      # A numeric line field does NOT prove the record parsed, so the shape is
+      # checked here too: after the boundary drop what remains must still begin
+      # with the org prefix, because that is all PATTERN can match. A tracked
+      # path named `a:1:foo<LF>x.md` splits into the fragment `./a:1:foo`, which
+      # passes the digit test above (file=`a`, line=`1`) and would otherwise be
+      # printed as the finding `oo` against a path that does not exist.
+      # shellcheck disable=SC2254  # $org_glob is a GLOB by construction — its
+      # `[Cc]` classes are the case-insensitive match, so quoting it would break
+      # the test. (The two patterns above end in `*`, which is why ShellCheck
+      # reads those as intentional and only flags this one.)
+      case "${match:0:$((${#ORG} + 1))}" in
+        $org_glob/) ;;
+        *)
+          echo "error: could not parse the scan output — a record's match text does not begin with the org prefix, so 'file:line:match' did not split where it appears to. A tracked path containing a newline splits one record in two; rename it, or narrow --root past it." >&2
+          exit 2
+          ;;
+      esac
+      ;;
   esac
 
   # COST bound, applied before anything folds or forks on the WHOLE match text.

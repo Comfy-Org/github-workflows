@@ -14,12 +14,27 @@
 # repo namespace is why a CODEOWNERS fixture's team name does not also clear a
 # literal reference to a private REPO of that name.
 #
-# NO GLOBS. An entry containing `*`, `?`, `[` or `]` is rejected as a
-# configuration error (exit 2), because `*`, `**`, `?*`, `[a-z]*`, `[!qz]*` and
-# `secret-*` all read as ordinary allowlist edits while clearing most or all of
-# the namespace — and no fixed set of probe names can decide breadth in general,
-# which is why the metacharacters themselves are what is refused. Every name
-# here is spelled out; a family of test fixtures is enumerated, not globbed.
+# THREE SHAPES ARE REFUSED as configuration errors (exit 2). Each reads as an
+# ordinary allowlist edit while doing something other than what its author meant.
+#
+#   NO GLOBS — an entry containing `*`, `?`, `[` or `]`. Note what this is
+#   today: entries are compared with EXACT EQUALITY, so a `[a-z]*` entry clears
+#   nothing but a literal `[a-z]*`; no entry reaches the comparison as a
+#   pattern. The rejection is DEFENCE-IN-DEPTH should that comparison ever go
+#   back to a `case` glob — do not read it as evidence that entries already
+#   match as patterns, and do not "simplify" the `=` into one. (It is also why
+#   no fixed set of probe names is used instead: no two probes can decide
+#   breadth in general.) Every name here is spelled out; a family of test
+#   fixtures is enumerated, not globbed.
+#
+#   NO `/` — entries are bare repo NAMES, compared against the name alone, so
+#   `<org>/foo` can never match anything. That is the spelling the tool invites,
+#   since a finding quotes the whole literal; write just `foo`.
+#
+#   NO NAME ENDING IN THE ORG NAME — that is the shape of a MERGED literal, not
+#   of a repo. `<org>/public.<org>/private` scans as ONE match named
+#   `public.<org>`, and allowlisting the token such a finding quotes would clear
+#   the second, never-examined name with the run green.
 #
 # Adding a line here is the ratification step: it is what makes "this name is
 # safe to publish" a reviewed decision instead of an assumption. Never add a

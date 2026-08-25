@@ -238,6 +238,9 @@ jobs:
             "$(printf 'a/b')" \
             "$(printf 'public-name.%s' 'Comfy-Org')" \
             "$(printf 'public-name-%s' 'Comfy-Org')" \
+            "$(printf 'public-name_%s' 'Comfy-Org')" \
+            "$(printf 'public-name%s' 'Comfy-Org')" \
+            "$(printf '%s' 'Comfy-Org')" \
             "$(printf 'public-name.%s' 'comfy-org')" \
           ; do
             dir="$(mktemp -d)"
@@ -660,7 +663,11 @@ jobs:
           # normalized, and a period run past the 8-byte strip headroom, are
           # reported rather than cleared. Widening the bound must not have
           # opened a way through it.
-          expect 1 'a 120-character name is still unallowlistable' "$n98" 'see %s/%s\n' 'Comfy-Org' "$n120"
+          # $n120 is its OWN allowlist entry, so exit 1 can only come from
+          # `oversize` skipping both comparisons. With $n98 on the list instead,
+          # this passed for the trivial reason that $n120 was not listed —
+          # delete MAX_NAME entirely and it would still have gone green.
+          expect 1 'a 120-character name is still unallowlistable' "$n120" 'see %s/%s\n' 'Comfy-Org' "$n120"
           expect 1 'a period run past the strip headroom is still reported' "$n100" 'see %s/%s.........\n' 'Comfy-Org' "$n100"
 
           # Two adjacent literals scan as ONE match (limitation 10). It must
@@ -704,20 +711,38 @@ jobs:
           # `docs/x.md` as `x.md` and emitted an annotation GitHub resolves
           # against the repo root and drops. The status is 1 either way; the
           # LOCATION is the regression.
+          #
+          # The fixture also pins WHICH allowlist a subtree run resolves. Its top
+          # level carries a list holding only `subtree-local-name`, a name that is
+          # NOT on this repo's list — so `x.md` clearing while `y.md` fails is
+          # only possible if the SCANNED repo's list was used. An earlier version
+          # of this test wrote a `placeholder` list and passed green while the
+          # script silently validated that repo against THIS repo's list.
           sub_dir="$(mktemp -d)"
           git -C "$sub_dir" init -q
           mkdir -p "$sub_dir/docs" "$sub_dir/.github/lint"
-          printf 'placeholder  # fixture\n' > "$sub_dir/.github/lint/org-repo-allowlist.txt"
-          printf 'see %s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$sub_dir/docs/x.md"
+          printf 'subtree-local-name  # fixture\n' > "$sub_dir/.github/lint/org-repo-allowlist.txt"
+          printf 'see %s/%s\n' 'Comfy-Org' 'subtree-local-name' > "$sub_dir/docs/x.md"
+          printf 'see %s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$sub_dir/docs/y.md"
           git -C "$sub_dir" add -A
           sub_out="$(bash .github/lint/check-org-repo-literals.sh --root "$sub_dir/docs" 2>/dev/null || true)"
           case "$sub_out" in
-            'unapproved: docs/x.md:1: '*)
+            'unapproved: docs/y.md:1: '*)
               echo 'ok: a subtree run reports its location relative to the repo root'
               ;;
             *)
               echo "::error::a subtree run reported a location the annotation cannot resolve: $sub_out"
               fail=1
+              ;;
+          esac
+          case "$sub_out" in
+            *'docs/x.md'*)
+              echo "::error::the subtree run did not resolve the scanned repo's own allowlist"
+              printf '%s\n' "$sub_out"
+              fail=1
+              ;;
+            *)
+              echo "ok: a subtree run resolves the scanned repo's own allowlist"
               ;;
           esac
 
@@ -745,6 +770,76 @@ jobs:
             fail=1
           else
             echo 'ok (2): an unparseable scan record is refused, not reported'
+          fi
+
+          # A NUMERIC line field does not prove the record parsed. A path named
+          # `a:1:foo<LF>x.md` splits into the fragment `./a:1:foo`, which clears
+          # the digit test (file=`a`, line=`1`) and was printed as the finding
+          # `oo` — the boundary drop eats its first byte — against a path that
+          # does not exist. The record SHAPE is what catches this one: after the
+          # boundary drop the match must still begin with the org prefix.
+          num_dir="$(mktemp -d)"
+          mkdir -p "$num_dir/.github/lint"
+          printf 'placeholder  # fixture\n' > "$num_dir/.github/lint/org-repo-allowlist.txt"
+          num_name="$(printf 'a:1:foo\nx.md')"
+          printf 'see %s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$num_dir/$num_name"
+          status=0
+          output="$(bash .github/lint/check-org-repo-literals.sh --root "$num_dir" 2>&1)" || status=$?
+          if [ "$status" -ne 2 ]; then
+            echo "::error::a numeric-looking path fragment exited $status — expected 2 (unparseable scan output)"
+            printf '%s\n' "$output"
+            fail=1
+          elif printf '%s\n' "$output" | grep -q '^unapproved: '; then
+            echo '::error::a numeric-looking path fragment still produced a finding line'
+            printf '%s\n' "$output"
+            fail=1
+          else
+            echo 'ok (2): a numeric line field alone does not make a record parsed'
+          fi
+
+          # The GIT path has no split to refuse: `git grep` C-quotes newline,
+          # tab, `\` and `"` in a path whatever `core.quotePath` says (that
+          # governs only bytes >= 0x80), so the same file arrives as ONE record
+          # with a numeric line field. That is a REAL finding with a quoted
+          # location, and it must stay exit 1 — the two refusals above must not
+          # have turned the git path's legitimate finding into a hard error.
+          gitnl_dir="$(mktemp -d)"
+          git -C "$gitnl_dir" init -q
+          mkdir -p "$gitnl_dir/.github/lint"
+          printf 'placeholder  # fixture\n' > "$gitnl_dir/.github/lint/org-repo-allowlist.txt"
+          printf 'see %s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$gitnl_dir/$num_name"
+          git -C "$gitnl_dir" add -A
+          status=0
+          output="$(bash .github/lint/check-org-repo-literals.sh --root "$gitnl_dir" 2>&1)" || status=$?
+          if [ "$status" -ne 1 ]; then
+            echo "::error::a newline path on the GIT path exited $status — expected 1 (one real finding)"
+            printf '%s\n' "$output"
+            fail=1
+          else
+            echo 'ok (1): the git path reports a newline-path literal rather than refusing it'
+          fi
+
+          # `GIT_CONFIG_PARAMETERS` is the channel `-c` uses to reach child git
+          # processes and is read UNCONDITIONALLY, so it delivers the same
+          # fail-open as `GIT_CONFIG_COUNT` with the count already unset. Same
+          # fixture shape as above: a second, non-markdown tracked file keeps the
+          # scannability probe clearing, so the unfixed script prints the
+          # clean-tree OK line and exits 0.
+          gcp_dir="$(mktemp -d)"
+          git -C "$gcp_dir" init -q
+          printf 'see %s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$gcp_dir/fixture.md"
+          printf 'nothing to see\n' > "$gcp_dir/other.txt"
+          git -C "$gcp_dir" add fixture.md other.txt
+          printf '*.md binary\n' > "$gcp_dir/attrs"
+          status=0
+          output="$(GIT_CONFIG_PARAMETERS="'core.attributesFile=$gcp_dir/attrs'" \
+            bash .github/lint/check-org-repo-literals.sh --root "$gcp_dir" 2>&1)" || status=$?
+          if [ "$status" -ne 1 ]; then
+            echo "::error::GIT_CONFIG_PARAMETERS hid the tree from the scan (exited $status, expected 1)"
+            printf '%s\n' "$output"
+            fail=1
+          else
+            echo 'ok (1): GIT_CONFIG_PARAMETERS cannot shrink the scanned scope either'
           fi
 
           exit "$fail"
