@@ -1235,6 +1235,52 @@ def _strip_comment(value):
     return value.strip()
 
 
+def _flow_brace_delta(text):
+    """`{` minus `}` in `text`, counting only braces OUTSIDE quoted scalars.
+
+    `_job_step_ids` tracks a flow mapping that spans physical lines by the
+    braces it has left unbalanced, and a raw `text.count("{")` counts braces
+    that are string CONTENT: `- {run: "echo {"}` wedges flow mode open for the
+    rest of the job, `- {name: "}"}` closes it a character early. Neither
+    miscount is harmless — while flow mode is open every later line is read
+    column-agnostically, which is exactly how a `run:` heredoc emitting
+    `- id: x` registers the phantom step that reader exists to exclude, while
+    a real block item (`- id: resolve_ref`, matching neither flow nor
+    block-at-column pattern there) stops being read at all and its consumer
+    becomes a false `dangling` failure.
+
+    Same quote rules `_strip_comment` applies (`''` inside a single-quoted
+    scalar, `\\"` inside a double-quoted one). Per LINE, like every reader
+    here: a quote opened on one physical line and closed on the next is out of
+    scope, as it is for `_strip_comment`.
+    """
+    depth = 0
+    quote = None
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if quote:
+            if quote == "'" and ch == "'":
+                if i + 1 < n and text[i + 1] == "'":
+                    i += 2
+                    continue
+                quote = None
+            elif quote == '"' and ch == "\\":
+                i += 2
+                continue
+            elif quote == '"' and ch == '"':
+                quote = None
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+        i += 1
+    return depth
+
+
 def _is_skippable(line):
     """Blank lines and whole-line comments never open or close a YAML block."""
     stripped = line.strip()
@@ -1684,16 +1730,34 @@ def _job_step_ids(lines, start, job_indent):
     belt-and-braces for odd indentation-indicator edges.
 
     Flow spellings are read too, but only where a flow mapping actually opens:
-    on a marker line whose value begins `{` (`- {id: x, run: …}`), and on the
-    continuation lines of one that spans several physical lines
-    (`- {uses: x,` / `id: y}`) — tracked by unbalanced braces. Reading the flow
+    on a marker line whose value begins `{` (`- {id: x, run: …}`), on the first
+    member line of a bare `-` when THAT begins `{`, and on the continuation
+    lines of one that spans several physical lines (`- {uses: x,` / `id: y}`)
+    — tracked by braces counted OUTSIDE quoted scalars (`_flow_brace_delta`;
+    a raw count reads `run: "echo {"` as opening one). Reading the flow
     pattern on every line is how `with: {id: x}` registered a phantom step.
+
+    Reading items rather than lines means accepting every spelling of an item
+    YAML has, because a missed id manufactures a false FAILURE on a compliant
+    workflow. So the walk also reads: the INDENTLESS sequence, where `steps:`
+    and its `- ` items share a column (valid YAML, and Actions accepts it), so
+    the sequence is looked for at or DEEPER than the key's own indent and
+    closed by the first non-item line back at the marker column; a marker line whose remainder is
+    only a comment (`-   # set up`), which declares no key and leaves the
+    column to the members below, hence the width measured on the
+    comment-STRIPPED line; and a flow continuation dedented past the dash,
+    which `{ … }` permits — the sequence-closing break is suppressed while a
+    mapping is open, but never past the JOB, which bounds a `flow_depth` a
+    miscount left stuck.
 
     Returns None — "unknown", not "empty" — when the job HAS a `steps:` this
     walk cannot stand behind: written flow-style on the key line
     (`steps: [ … ]`), or opening no `- ` item. The caller then keeps the
-    pre-BE-8215 fail-open drop for would-be-dangling sites in that job,
-    because UNDER-collection is the costly direction here:
+    pre-BE-8215 fail-open drop for that job's sites — every verdict that rests
+    on "no step of that id exists", so `'dangling'` AND the `'non-leading'`
+    one an absent id also reaches, exactly as a real earlier out-of-scope step
+    drops both today. Resolver and guard verdicts are untouched, here and
+    everywhere. UNDER-collection is the costly direction here:
     a missed id turns a compliant workflow into a false FAILURE, while a
     dropped site merely reproduces the coverage this lint had before the
     dangling check existed. Over-collection stays tolerated for the same
@@ -1717,11 +1781,20 @@ def _job_step_ids(lines, start, job_indent):
         # are no item lines to walk, so answer "unknown" rather than "none".
         return None
 
+    steps_indent = _indent(lines[steps_line])
     marker_column = None
-    for _, line in _block_body(lines, steps_line, _indent(lines[steps_line])):
-        # The FIRST child of `steps:` opens the sequence; anything else is a
-        # shape this walk has no reading of.
-        if _opens_list_item(line):
+    for i in range(steps_line + 1, len(lines)):
+        line = lines[i]
+        if _is_skippable(line):
+            continue
+        # The FIRST line under `steps:` opens the sequence; anything else is a
+        # shape this walk has no reading of. At or DEEPER than the key's own
+        # column, because YAML lets a block sequence sit at its key's column —
+        # `steps:` and `- uses: …` both at 4, the "indentless" style Actions
+        # accepts and plenty of real workflows write. Reading only the
+        # strictly-deeper body finds no item there and escapes a job this walk
+        # reads perfectly well, silently dropping its dangling verdicts.
+        if _indent(line) >= steps_indent and _opens_list_item(line):
             marker_column = _indent(line)
         break
     if marker_column is None:
@@ -1736,9 +1809,13 @@ def _job_step_ids(lines, start, job_indent):
         if _is_skippable(line):
             continue
         indent = _indent(line)
-        if indent < marker_column:
+        if indent < marker_column and (not flow_depth or indent <= job_indent):
             # Back out at the sequence's own column: the list is closed and
-            # this line belongs to the job (or to `jobs:`).
+            # this line belongs to the job (or to `jobs:`). A flow mapping
+            # spanning several physical lines is exempt — YAML constrains no
+            # indentation inside `{ … }`, so a dedented continuation closes
+            # nothing and breaking there loses every id below it — but never
+            # past the JOB, which bounds a `flow_depth` this reader left open.
             break
         if scalar_indent is not None:
             if indent > scalar_indent:
@@ -1758,10 +1835,24 @@ def _job_step_ids(lines, start, job_indent):
                 # block pattern's `\S+` captures the closing punctuation too,
                 # and a legitimate step id can never end in `,` or `}`.
                 ids.setdefault(match.group(2).rstrip(",}").strip("'\""), i)
-            flow_depth = max(0, flow_depth + text.count("{") - text.count("}"))
+            flow_depth = max(0, flow_depth + _flow_brace_delta(text))
             continue
-        if indent == marker_column and _opens_list_item(line):
-            marker = _marker_width(line)
+        if indent == marker_column and not _opens_list_item(line):
+            # A line at the sequence's OWN column that opens no item ends the
+            # sequence — the shape that exists only in the indentless style,
+            # where `steps:`'s sibling keys share the marker column. Every
+            # member of an item sits at `key_column`, which is strictly deeper
+            # than the marker in both styles, so no line inside the sequence
+            # can land here.
+            break
+        if indent == marker_column:
+            text = _strip_comment(line)
+            # Measured on the COMMENT-STRIPPED line: `-   # set up` declares no
+            # key at all — YAML puts that item's keys on the lines below at the
+            # usual marker width — so measuring the raw line locks `key_column`
+            # to the comment's column and the item's real `id:` is then never
+            # read, the under-collection direction this reader calls costly.
+            marker = _marker_width(text)
             if not marker:
                 # A bare `-` puts every key on the lines BELOW it, so the
                 # column is not recoverable from the marker — the first member
@@ -1769,7 +1860,6 @@ def _job_step_ids(lines, start, job_indent):
                 key_column = None
                 continue
             key_column = marker_column + marker
-            text = _strip_comment(line)
             if text[1:].lstrip().startswith("{"):
                 # The whole step written as a flow mapping. ONLY this shape is
                 # read with the flow pattern: applied to any marker line it
@@ -1777,12 +1867,22 @@ def _job_step_ids(lines, start, job_indent):
                 # INPUT and no step is declared at all.
                 for flow in _STEP_ID_FLOW_RE.finditer(text):
                     ids.setdefault(flow.group(2).strip("'\""), i)
-                flow_depth = max(0, text.count("{") - text.count("}"))
+                flow_depth = max(0, _flow_brace_delta(text))
                 continue
             # A key written on the marker line declares it at the step's key
             # column exactly as a line of its own does — see `_binding_step_id`.
             line = _unmarked(line, key_column)
         elif key_column is None:
+            text = _strip_comment(line)
+            if text.startswith("{"):
+                # A bare `-` whose item is written flow-style on the line
+                # BELOW it — the same mapping as `- {id: x, …}`, one line
+                # down. Read with the block pattern alone a line opening `{`
+                # matches nothing and the item's real id is lost.
+                for flow in _STEP_ID_FLOW_RE.finditer(text):
+                    ids.setdefault(flow.group(2).strip("'\""), i)
+                flow_depth = max(0, _flow_brace_delta(text))
+                continue
             # First member line after a bare `-` — its indent IS the item's
             # key column.
             key_column = indent
@@ -2027,7 +2127,9 @@ def _record_steps_output(found, lines, idx, sites, resolvers, step_ids):
     `step_ids` is None when the pre-scan could not read this job's `steps:`
     at all (BE-8254). The scope question then has no answer, so every id the
     walk has not already registered as a resolver is DROPPED — the pre-BE-8215
-    behavior for that job's would-be-dangling sites. Sites whose id names a
+    behavior. That reaches the `'non-leading'` verdict as well as `'dangling'`
+    (both rest on "no step of that id exists"), which is also what a real
+    earlier out-of-scope step does to both today. Sites whose id names a
     tracked resolver are judged exactly as always.
 
     When `<id>` matches NO step declared before the consuming one (a typo'd
@@ -2073,7 +2175,13 @@ def _record_steps_output(found, lines, idx, sites, resolvers, step_ids):
                 # has no claim on" are indistinguishable here. Drop the site —
                 # exactly what this reader did before the dangling check
                 # existed — rather than manufacture a false failure out of a
-                # pre-scan that could not run.
+                # pre-scan that could not run. Ahead of the `leading` test on
+                # purpose: judging it first would print `'non-leading'` for an
+                # id that may well name a real earlier step, and the readable
+                # path drops THAT site too (the out-of-scope return below is
+                # likewise reached before `leading`). So the escape costs the
+                # `'non-leading'` verdict as well, and says so rather than
+                # trading a dropped site for a false failure.
                 continue
             declared = step_ids.get(step_id)
             bounds = _consuming_step_bounds(lines, idx)
@@ -2218,9 +2326,10 @@ def ref_checkouts(lines):
         # on" from "no such step at all", and the two demand opposite answers —
         # the first is out of scope, the second is a ref that is `''` at
         # runtime and must be reported. None when the job's `steps:` defeats
-        # the walk (BE-8254) — `_record_steps_output` then skips ONLY the
-        # dangling verdict for this job; resolver and guard verdicts are
-        # unchanged.
+        # the walk (BE-8254) — `_record_steps_output` then drops this job's
+        # sites whose id names no tracked resolver, which is every verdict
+        # resting on "no such step" (`dangling`, and the `non-leading` one an
+        # absent id also reaches). Resolver and guard verdicts are unchanged.
         step_ids = _job_step_ids(lines, start, job_indent)
         # An open `ref:` whose value continues below, as (line index, indent).
         # Continuation lines are the more-indented ones that follow; the first

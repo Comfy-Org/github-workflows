@@ -129,14 +129,33 @@ a `run:` block scalar whose heredoc emits a line beginning `- id:` / `"id":`
 now — YAML puts a `with:` member and a block scalar's body deeper than the key
 column either way.
 
+Reading items rather than lines means the walk has to accept every spelling of
+an item YAML does, because a missed id is a false FAILURE on a compliant
+workflow. It reads the **indentless** sequence (`steps:` and its `- ` items at
+the SAME column, which Actions accepts), a marker line whose remainder is only
+a comment (`-   # set up`, whose keys land on the lines below), a bare `-`
+whose item is a flow mapping on the next line, and a flow mapping spanning
+physical lines — including one whose continuation dedents past the dash, which
+YAML permits inside `{ … }`. Braces are counted **outside quoted scalars**, so
+a `{` or `}` that is string content (`run: "echo {"`) neither wedges flow mode
+open nor closes it early.
+
 **A `steps:` the item walk cannot read makes that job's dangling verdict
 fail-open, not fail-loud.** Flow-style `steps: [ … ]` on the key line, or a
 `steps:` opening no `- ` item, leaves the pre-scan with no answer at all — so
-for that job (only) a would-be-dangling site is dropped, exactly as it was
-before BE-8215. Under-collection is the costly direction here: a missed id
-turns a compliant workflow into a false FAILURE, while a dropped site merely
-reproduces the coverage this lint had before the dangling check existed.
-Resolver and guard verdicts are unaffected, in that job and every other.
+for that job (only) a site whose id names no tracked resolver is dropped,
+exactly as it was before BE-8215. That is every verdict resting on "no step of
+that id exists": `dangling`, and the `non-leading` one an absent id also
+reaches — the same pair a real earlier out-of-scope step drops today. Under-
+collection is the costly direction here: a missed id turns a compliant
+workflow into a false FAILURE, while a dropped site merely reproduces the
+coverage this lint had before the dangling check existed. Resolver and guard
+verdicts are unaffected, in that job and every other.
+
+The fail-open is deliberate but it is not free: reformatting a job's `steps:`
+into one of those shapes is an in-band way to switch that job's dangling check
+off, and nothing says so in the output. Making it observable needs a
+non-fatal channel `check_dir` does not have yet — tracked separately.
 
 **`||` fallbacks are read on this path too, with leading-operand judgment
 (BE-8215).** `ref: ${{ steps.<id>.outputs.<name> || 'main' }}` used to match

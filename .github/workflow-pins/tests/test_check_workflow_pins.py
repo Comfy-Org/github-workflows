@@ -2010,6 +2010,156 @@ class GuardCoverageTests(unittest.TestCase):
             )
 
     # ------------------------------------------------------------------
+    # Shapes the item walk must read the SAME as a line scan did (BE-8254
+    # review). Every one of these is the costly direction: an id the pre-scan
+    # misses turns a compliant workflow into a false `dangling` FAILURE, or
+    # escapes the job outright and drops a real finding.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _job0_step_ids(job_text):
+        lines = ("name: F\non:\n  workflow_call:\njobs:\n" + job_text).split("\n")
+        start = next(i for i, l in enumerate(lines) if l.startswith("  job0:"))
+        return cwp._job_step_ids(lines, start, 2)
+
+    @staticmethod
+    def _job0(steps):
+        return "  job0:\n    runs-on: ubuntu-latest\n    steps:\n" + steps
+
+    def test_an_indentless_steps_sequence_is_walked_not_escaped(self):
+        # YAML lets a block sequence sit at its KEY's own column — `steps:`
+        # and `- uses: …` both at 4 — and Actions accepts it. Reading only the
+        # strictly-deeper body finds no `- ` item there, so the walk escapes a
+        # job it can read perfectly well and silently drops every dangling
+        # verdict in it. This is neither of the two shapes the escape is for.
+        job = self._job0(
+            "    - uses: actions/checkout@abc\n"
+            "      id: checkout\n"
+            "    - id: resolve_ref\n"
+            "      run: echo hi\n"
+        )
+        self.assertEqual(set(self._job0_step_ids(job)), {"checkout", "resolve_ref"})
+
+    def test_an_indentless_steps_sequence_still_reports_a_dangling_ref(self):
+        # End to end, with a TYPO'D consumer: escaping this job would report
+        # nothing at all.
+        job = self._job0(
+            "    - id: resolve_ref\n"
+            "      run: echo hi\n"
+            "    - uses: actions/checkout@abc\n"
+            "      with:\n"
+            '        ref: "${{ steps.resolve_reff.outputs.ref }}"\n'
+        )
+        lines = ("name: F\non:\n  workflow_call:\njobs:\n" + job).split("\n")
+        self.assertEqual(
+            [(fb, guarded, via) for _, fb, guarded, via in cwp.ref_checkouts(lines)],
+            [(False, False, "dangling")],
+        )
+
+    def test_an_indentless_sequence_ends_at_its_siblings_column(self):
+        # In the indentless style `steps:`'s SIBLING keys share the marker
+        # column, so a non-item line there closes the sequence. Walking past
+        # it reads a later job-level key's members as step ids — over-
+        # collection, which silences the dangling verdict.
+        job = self._job0(
+            "    - id: resolve_ref\n"
+            "      run: echo hi\n"
+            "    env:\n"
+            "      id: phantom\n"
+        )
+        self.assertEqual(set(self._job0_step_ids(job)), {"resolve_ref"})
+
+    def test_a_brace_inside_a_quoted_scalar_does_not_wedge_flow_mode_open(self):
+        # `text.count("{")` counts braces that are string CONTENT. Left open,
+        # flow mode reads every later line column-agnostically: the heredoc
+        # below registers `phantom` (the exact shape this change removes) and
+        # the real block item `- id: resolve_ref` matches neither pattern
+        # there, so it is lost.
+        job = self._job0(
+            '      - {id: flow_step, run: "echo {"}\n'
+            "      - id: resolve_ref\n"
+            "        run: |\n"
+            "          echo '- id: phantom'\n"
+        )
+        self.assertEqual(set(self._job0_step_ids(job)), {"flow_step", "resolve_ref"})
+
+    def test_a_quoted_close_brace_does_not_end_flow_mode_early(self):
+        # The mirror miscount: a `}` inside a quoted scalar closing the
+        # mapping a character early drops the ids after it.
+        job = self._job0(
+            '      - {name: "}", id: flow_step,\n'
+            "         uses: some/action@abc}\n"
+        )
+        self.assertEqual(set(self._job0_step_ids(job)), {"flow_step"})
+
+    def test_a_quoted_brace_on_a_flow_CONTINUATION_line_is_counted_the_same(self):
+        # The continuation update runs the same count, so it needs the same
+        # quote-awareness: one `{` of string content here leaves the mapping
+        # "open" past its real `}`, and the next block item's `- id: later`
+        # matches neither pattern the flow branch applies, so it is lost and
+        # its consumer becomes a false `dangling` failure.
+        job = self._job0(
+            "      - {uses: some/action@abc,\n"
+            '         run: "echo {",\n'
+            "         id: resolve_ref}\n"
+            "      - id: later\n"
+            "        run: echo hi\n"
+        )
+        self.assertEqual(set(self._job0_step_ids(job)), {"resolve_ref", "later"})
+
+    def test_an_unbalanced_flow_mapping_cannot_leak_into_the_next_job(self):
+        # Quote-awareness narrows the miscount but cannot remove it, so the
+        # walk's own bound stays load-bearing: an open `flow_depth` suppresses
+        # the dedent break only DOWN TO the job, never past it.
+        job = self._job0('      - {id: resolve_ref, run: echo "{"\n') + (
+            "  job1:\n    runs-on: ubuntu-latest\n    steps:\n"
+            "      - name: A step of somebody else's job\n"
+            "        id: other_job_step\n"
+        )
+        self.assertEqual(set(self._job0_step_ids(job)), {"resolve_ref"})
+
+    def test_a_comment_only_marker_line_leaves_the_key_column_to_the_members(self):
+        # `-   # set up` declares no key: YAML puts that item's keys on the
+        # lines below at the usual marker width. Measuring the marker on the
+        # RAW line locks `key_column` to the comment's column instead, and the
+        # item's real `id:` is then never read.
+        job = self._job0(
+            "      -   # set up the ref\n"
+            "        id: resolve_ref\n"
+            "        run: echo hi\n"
+        )
+        self.assertEqual(set(self._job0_step_ids(job)), {"resolve_ref"})
+
+    def test_a_bare_marker_whose_item_is_a_flow_mapping_registers_its_id(self):
+        # A bare `-` whose item is written flow-style on the line BELOW it.
+        # Read with the block pattern alone, a line opening `{` matches
+        # nothing and the id is lost.
+        job = self._job0("      -\n        {id: resolve_ref, run: echo hi}\n")
+        self.assertEqual(set(self._job0_step_ids(job)), {"resolve_ref"})
+
+    def test_a_dedented_flow_continuation_does_not_end_the_walk(self):
+        # YAML constrains no indentation inside `{ … }`, so a continuation
+        # line may sit BELOW the dash column. Breaking there ends the whole
+        # pre-scan and loses every id after it.
+        job = self._job0(
+            "      - {uses: some/action@abc,\n"
+            "    id: resolve_ref}\n"
+            "      - id: later\n"
+            "        run: echo hi\n"
+        )
+        self.assertEqual(set(self._job0_step_ids(job)), {"resolve_ref", "later"})
+
+    def test_a_nested_flow_input_named_id_is_a_tolerated_residual(self):
+        # PINNED, not fixed. `_STEP_ID_FLOW_RE` is a flat pattern with no
+        # nesting awareness, so inside a flow mapping the `with: {id: x}`
+        # spelling this change closes for the BLOCK form still registers.
+        # Over-collection merely reproduces the pre-BE-8215 fail-open drop for
+        # that one site; narrowing it wrong manufactures a false FAILURE. No
+        # occurrence exists in this tree (0 of 69 jobs).
+        job = self._job0("      - {uses: some/action@abc, with: {id: resolve_ref}}\n")
+        self.assertEqual(set(self._job0_step_ids(job)), {"resolve_ref"})
+
+    # ------------------------------------------------------------------
     # The fail-loud escape: a `steps:` shape the item walk cannot read.
     # ------------------------------------------------------------------
 
