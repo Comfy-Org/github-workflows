@@ -127,18 +127,23 @@ which PR is read, plus three consequences worth knowing:
   clause in the caller's `if:` is a **token** guard — a fork's `pull_request` run
   gets a read-only `GITHUB_TOKEN` that the caller's `permissions:` block cannot
   elevate, so the label write would 403 and the check would go red. On a dispatch
-  the token is writable and the actor is a human, so it does not apply. Fork
-  **risk** is untouched: `external` comes from the API's own fork flag, never
-  from the actor, and still grades R3. **Bot-authored PRs need no such hatch —
-  they are graded on the event path too**, so the caller pattern carries no
-  `github.actor != 'dependabot[bot]'` clause and one must not be added back:
+  the token is writable, so it does not apply. Fork **risk** is untouched:
+  `external` comes from the API's own fork flag, never from the actor, and still
+  grades R3. **Dependabot-triggered runs need no such
+  hatch — they are graded on the event path too**, so the caller pattern carries
+  no `github.actor != 'dependabot[bot]'` clause and one must not be added back:
   Dependabot's `pull_request` runs start read-only, but the caller's
   `permissions:` block elevates the token ([Changing `GITHUB_TOKEN`
   permissions](https://docs.github.com/en/code-security/dependabot/troubleshooting-dependabot/troubleshooting-dependabot-on-github-actions#changing-github_token-permissions)),
   and this workflow declares no secrets — the other half of the Dependabot
   restriction (Dependabot secrets only, never Actions secrets) costs it nothing.
   That last clause is why the reasoning does **not** transfer to a caller which
-  needs an Actions secret, such as `cursor-review-auto-label.yml`.
+  needs an Actions secret, such as `cursor-review-auto-label.yml`. Note the
+  removed clause keyed on `github.actor` — who **triggered** the run, not who
+  authored the PR — so it never selected bot authorship: a human pushing to a
+  Dependabot branch made the actor human and the PR graded regardless. What it
+  did select is exactly the read-only-token set the `permissions:` block now
+  covers.
 - **The fork clause must be scoped to the event, or the dispatch is a silent
   no-op.** There is no `github.event.pull_request` on a `workflow_dispatch`, so
   an unscoped fork clause is false and the job skips with no run, no error and no
