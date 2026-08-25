@@ -1,0 +1,111 @@
+name: Test org repo literals
+
+# Regression lint (BE-8192): every org-prefixed repo literal in this public
+# repo's tracked tree must be on `.github/lint/org-repo-allowlist.txt`.
+#
+# AGENTS.md's first convention is "never leak private caller names", and it was
+# convention-enforced only. This is the same move test-workflow-pins.yml made
+# for the `workflows_ref` default rule: take a rule a reviewer had to remember
+# and make CI remember it instead.
+#
+# ALLOWLIST, NEVER DENYLIST — a denylist grep would have to commit the private
+# names into this public repo to match them, so the lint would BE the leak.
+# Adding a name is an allowlist edit, which review sees.
+#
+# NO `paths:` FILTER, deliberately. The leak surface is the whole tree (past
+# leaks sat in `scripts/`, `.github/dependabot.yml` and a component README), so
+# gating this on workflow-file paths would exempt exactly the files most likely
+# to carry one.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# One lint run per ref: a push that supersedes an in-flight run should cancel
+# it, not race it for a runner.
+concurrency:
+  group: test-org-repo-literals-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: shellcheck + lint this repo
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: ShellCheck the lint script
+        run: shellcheck -x .github/lint/check-org-repo-literals.sh
+
+      - name: Lint this repo's org repo literals
+        run: bash .github/lint/check-org-repo-literals.sh
+
+      # Every fixture below assembles the literal with `printf` instead of
+      # writing it out. A literal org-prefixed name in this file would be
+      # scanned by the step above and would have to be allowlisted — which
+      # would defeat the fixture, since the point is that it is NOT allowlisted.
+      # (`%s/%s` is not a match: the name class cannot start with `%`.)
+      - name: Smoke test — an unlisted name fails the lint
+        run: |
+          # Proves the lint is wired to FAIL, not just to run: the step above
+          # exercises the clean path, this exercises the CLI's exit status.
+          dir="$(mktemp -d)"
+          printf 'see %s/%s for details\n' 'Comfy-Org' 'not-on-the-allowlist' > "$dir/fixture.md"
+          if bash .github/lint/check-org-repo-literals.sh --root "$dir"; then
+            echo "::error::lint passed an unallowlisted org repo literal — expected a non-zero exit"
+            exit 1
+          fi
+          echo "lint correctly rejected the unallowlisted name"
+
+      - name: Smoke test — a lowercased org spelling still fails
+        run: |
+          # GitHub resolves owner names case-insensitively, so `comfy-org/<name>`
+          # reaches the same repository as the canonical spelling. Matching only
+          # the canonical one would be a one-keystroke bypass of a default-deny
+          # control (the same hole BE-8697 closed in public-repo-hygiene).
+          dir="$(mktemp -d)"
+          printf '%s/%s\n' 'comfy-org' 'Not-On-The-Allowlist' > "$dir/fixture.md"
+          if bash .github/lint/check-org-repo-literals.sh --root "$dir"; then
+            echo "::error::lint passed a lowercased org spelling — expected a non-zero exit"
+            exit 1
+          fi
+          echo "lint correctly rejected the lowercased org spelling"
+
+      - name: Smoke test — an allowlisted name passes
+        run: |
+          # The other half: a lint that always fails proves nothing either. This
+          # also pins the `.git` suffix and trailing-punctuation stripping, so a
+          # normalization regression cannot hide behind the clean-tree run above.
+          dir="$(mktemp -d)"
+          {
+            printf 'plain %s/%s\n' 'Comfy-Org' 'github-workflows'
+            printf 'clone %s/%s.\n' 'Comfy-Org' 'github-workflows.git'
+            printf 'glob  %s/%s\n' 'Comfy-Org' 'secret-alpha'
+            printf 'empty %s/%s\n' 'Comfy-Org' '.git'
+          } > "$dir/fixture.md"
+          bash .github/lint/check-org-repo-literals.sh --root "$dir"
+          echo "lint correctly accepted the allowlisted names"
+
+      - name: Smoke test — a bare '*' allowlist entry is rejected, not honoured
+        run: |
+          # The one edit that would silently neuter the whole control is a
+          # single '*' on an allowlist line. It must fail as a configuration
+          # error (exit 2), not clear every name.
+          dir="$(mktemp -d)"
+          mkdir -p "$dir/.github/lint"
+          printf '*  # oops\n' > "$dir/.github/lint/org-repo-allowlist.txt"
+          printf '%s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$dir/fixture.md"
+          status=0
+          bash .github/lint/check-org-repo-literals.sh --root "$dir" || status=$?
+          if [ "$status" -ne 2 ]; then
+            echo "::error::a bare '*' allowlist entry exited $status — expected 2 (configuration error)"
+            exit 1
+          fi
+          echo "lint correctly rejected the wildcard allowlist entry"

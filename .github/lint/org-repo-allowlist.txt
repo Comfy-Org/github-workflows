@@ -1,0 +1,97 @@
+# Allowlist for check-org-repo-literals.sh — the ONLY org-prefixed repo names
+# that may appear as literals in this public repo's tracked tree.
+#
+# One entry per line, each with a trailing `#` comment saying WHY it is safe.
+# Entries are shell globs and are matched case-insensitively (GitHub resolves
+# owner/repo names case-insensitively). A trailing `.git` and trailing sentence
+# punctuation are stripped from the literal before it is compared.
+#
+# Adding a line here is the ratification step: it is what makes "this name is
+# safe to publish" a reviewed decision instead of an assumption. Never add a
+# name you have not confirmed is publishable — for a real repo that means
+# confirming it is PUBLIC.
+#
+# The org-wide known-public repo list lives in
+# .github/public-repo-hygiene/check_public_repo_hygiene.py and is the source of
+# truth for other repos; this file is repo-local because this repo additionally
+# carries that checker's own fake-private test fixtures.
+
+# ── Real Comfy-Org repos, verified public ──
+github-workflows            # this repo, public
+.github                     # org meta repo, public
+comfy-cli                   # public (also on the org-wide PUBLIC_COMFY_ORG_REPOS list)
+comfy-desktop               # public (org-wide list: Comfy-Desktop)
+comfy-typescript-sdk        # public (org-wide list)
+comfyui                     # public (org-wide list: ComfyUI)
+comfyui_frontend            # public (org-wide list: ComfyUI_frontend)
+
+# ── Documented exceptions ──
+unreviewed-merges           # private, but deliberately published in README/docs as the SOC-2 tracker destination — human-ratified exception
+
+# ── CODEOWNERS team handles (`@Comfy-Org/<team>`) ──
+# Team handles are inherently public on a public repo: GitHub renders CODEOWNERS
+# owners to anyone who can see the repo. Mirrors PUBLIC_COMFY_ORG_TEAMS.
+comfy-cloud-team            # team handle, org-wide PUBLIC_COMFY_ORG_TEAMS
+core-engine-team            # team handle, org-wide PUBLIC_COMFY_ORG_TEAMS
+backend                     # team handle in the agents-md-integrity suite's CODEOWNERS fixture — a team slug, not a repo
+
+# ── Documentation examples — no such repo exists ──
+github-workflows-tools      # doc example in the bump-callers docs
+github-workflows-actions    # doc example in the bump-callers docs
+example                     # generic doc/test placeholder
+foo                         # generic doc/test placeholder
+legit                       # bump-callers doc/test placeholder
+x                           # single-letter placeholder in the public-repo-hygiene docs
+notes                       # path-shaped example (`docs/v1.2/<org>/notes`) in the public-repo-hygiene docs
+
+# ── Hugging Face model/dataset namespaces, not GitHub repos ──
+# Comfy-Org publishes weights under huggingface.co/Comfy-Org/, so these names
+# have no GitHub existence at all. They are product content, not references.
+qwen-image-edit_comfyui     # public HF model, quoted in the public-repo-hygiene docs/tests
+qwen-image_comfyui          # public HF model, quoted in the public-repo-hygiene tests
+ace_step_1.5_comfyui_files  # public HF model, quoted in the public-repo-hygiene tests
+stable-diffusion-v1-5-archive  # public HF model, quoted in the public-repo-hygiene tests
+a-model                     # HF-route fixture in the public-repo-hygiene tests
+a-dataset                   # HF-route fixture in the public-repo-hygiene tests
+some-model                  # HF-route fixture in the public-repo-hygiene tests
+some-demo                   # HF-route fixture in the public-repo-hygiene tests
+some-eval-set               # HF-route fixture in the public-repo-hygiene tests
+some-set-abc123             # HF-route fixture in the public-repo-hygiene tests
+
+# ── Test fixtures — invented names, no such repo ──
+# These are the fake "private" names the bump-callers and public-repo-hygiene
+# suites use to prove masking and default-deny. A NEW fixture name needs a line
+# here, on purpose: that edit is where a reviewer confirms it is invented.
+secret-*                    # bump-callers + public-repo-hygiene fixture family
+secret_a.b-c                # bump-callers fixture (dot/underscore name shape)
+a.b.c                       # bump-callers fixture (dotted name shape)
+comfyui2                    # public-repo-hygiene fixture: invented near-miss of a real public name
+some-team                   # public-repo-hygiene fixture team handle
+not-a-public-team           # public-repo-hygiene fixture team handle
+not-a-public-repo           # public-repo-hygiene fixture
+private                     # public-repo-hygiene fixture
+private-thing               # public-repo-hygiene fixture
+super-secret-repo           # public-repo-hygiene fixture
+some-internal-thing         # public-repo-hygiene fixture
+something-else              # public-repo-hygiene fixture
+definitely-not-public       # public-repo-hygiene fixture
+nope                        # public-repo-hygiene fixture
+whatever                    # public-repo-hygiene fixture
+bare-host-at-line-start     # public-repo-hygiene model-host anchor fixture
+host-case-and-port          # public-repo-hygiene model-host anchor fixture
+in-a-markdown-link          # public-repo-hygiene model-host anchor fixture
+in-angle-brackets           # public-repo-hygiene model-host anchor fixture
+in-double-quotes            # public-repo-hygiene model-host anchor fixture
+plain-http                  # public-repo-hygiene model-host anchor fixture
+protocol-relative           # public-repo-hygiene model-host anchor fixture
+title-case-route            # public-repo-hygiene model-host route fixture
+upper-case-route            # public-repo-hygiene model-host route fixture
+
+# ── ASCII prefixes of the public-repo-hygiene suite's homoglyph fixtures ──
+# That suite deliberately commits names whose tail is non-ASCII, to prove its
+# own homoglyph handling. This lint's name class is ASCII (limitation 2 in
+# check-org-repo-literals.sh), so it reads only the prefix. Each of these is
+# the prefix of an INVENTED fixture name, not of a real repo.
+comfy-type                  # prefix of the `comfy-type<U+017F>cript-sdk` fixture
+core-engine                 # prefix of the `core-engine<U+2010>team` fixture
+mod                         # prefix of the `mod<U+2010>el` HF-route fixture

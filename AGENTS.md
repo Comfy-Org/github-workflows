@@ -48,15 +48,19 @@ python3 -m unittest discover -s .github/workflow-pins/tests -p 'test_*.py' && py
 python3 -m pip install --require-hashes --only-binary=:all: -r .github/coderabbit-config/requirements.txt
 python3 -m unittest discover -s .github/coderabbit-config/tests -p 'test_*.py' -v
 
+# org repo literal allowlist lint + its shellcheck (runs on EVERY change)
+shellcheck -x .github/lint/check-org-repo-literals.sh && bash .github/lint/check-org-repo-literals.sh
+
 # AGENTS.md integrity checker against any repo tree
 python3 .github/agents-md-integrity/check_agents_md.py --root .
 ```
 
 There is no repo-wide formatter/linter config (no ruff/black/pyproject,
 no pre-commit). Shell is linted by `shellcheck` in CI; Python is guarded by the
-`unittest` suites above. Every test workflow is **path-filtered**, so a change
-that touches only the files under a given directory runs only that directory's
-tests — run the matching command above for whatever you touched.
+`unittest` suites above. Every test workflow is **path-filtered** EXCEPT
+`test-org-repo-literals.yml` (the leak surface is the whole tree), so a change
+that touches only the files under a given directory runs that directory's tests
+plus the literal lint — run the matching commands above for whatever you touched.
 
 ## Layout
 
@@ -110,6 +114,10 @@ tests — run the matching command above for whatever you touched.
   at every checkout. The `job.workflow_sha` self-pin is exempt from the
   `default:` half only — it stops the ref being MUTABLE, not being EMPTY, so it
   still has to carry a guard (BE-4169, corrected by BE-8077; see below).
+- `.github/lint/` — `check-org-repo-literals.sh` + `org-repo-allowlist.txt`, the
+  repo-LOCAL lint behind `test-org-repo-literals.yml` (BE-8192): the repo-name
+  subset of `public-repo-hygiene`, which this repo cannot adopt as a caller
+  because it is that checker's HOME (its fake-private fixtures live here).
 - `.github/bump-callers/` — `bump-callers.sh`, the ONE fleet-agnostic script
   that opens SHA-bump PRs in consumer repos when a reusable workflow changes,
   plus `preflight.sh` (BE-6475), the ONE staleness/decommission guard that runs
@@ -220,7 +228,10 @@ tests — run the matching command above for whatever you touched.
   unmasked in the env dump Actions emits *before* the step, so the bumper's own
   masking can never run early enough; a secret is masked there too. The bumper
   still masks each name. Keep private repo paths/detail out of workflow files,
-  commit messages, and PR text.
+  commit messages, and PR text. **CI-enforced (BE-8192)**:
+  `test-org-repo-literals.yml` fails any org-prefixed repo literal whose name is
+  not on `.github/lint/org-repo-allowlist.txt`, so publishing a name is an
+  allowlist edit review sees; BARE names stay with review (a denylist would leak).
 - **Pin everything by full commit SHA**, with a trailing `# v1` comment — both
   the `uses:` in callers and every third-party action here. Bare `@v1` fails the
   pin-validation (`pinact`, `zizmor`) that consumer CI runs. See README "Pinning".
@@ -303,3 +314,4 @@ tests — run the matching command above for whatever you touched.
 - [`.github/agents-md-integrity/README.md`](.github/agents-md-integrity/README.md) — the checker + its knobs.
 - [`.github/public-repo-hygiene/README.md`](.github/public-repo-hygiene/README.md) — the leak guard, its tamper boundary + known limitations.
 - [`.github/bump-callers/README.md`](.github/bump-callers/README.md) — the shared bumper + its fleets.
+- [`.github/lint/README.md`](.github/lint/README.md) — the org-repo-literal allowlist lint + how to add a name.
