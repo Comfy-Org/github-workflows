@@ -35,6 +35,11 @@ jobs:
   test:
     name: shellcheck + lint this repo
     runs-on: ubuntu-latest
+    # Matches the sibling lint-test workflows. The lint's per-hit loop forks a
+    # `printf | tr` and two command substitutions per match over an unbounded hit
+    # count, so a pathological tree should fail in minutes rather than spin to
+    # GitHub's 360-minute default.
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -108,6 +113,28 @@ jobs:
           expect 0 'a .git suffix and a trailing period' 'clone %s/%s.\n' 'Comfy-Org' 'github-workflows.git'
           expect 0 'a reference naming nothing' 'empty %s/%s\n' 'Comfy-Org' '.git'
 
+          # The org segment has to START A TOKEN, or `grep -o` reads this org's
+          # name out of the middle of a DIFFERENT owner's and reddens CI on a
+          # reference that has nothing to do with us.
+          expect 0 'a different owner whose name ends in this one' 'see Not%s/%s here\n' 'Comfy-Org' 'not-on-the-allowlist'
+
+          # The boundary character the pattern consumes may itself be a colon,
+          # which puts a fourth colon on a `file:line:match` line. This pins that
+          # the split still fires AND still reports the right line: the fixture
+          # puts the literal on line 2, and a mis-split reads the match text as
+          # the location.
+          expect 1 'a literal glued to a colon' 'first line\nsee:%s/%s\n' 'Comfy-Org' 'not-on-the-allowlist'
+          colon_dir="$(mktemp -d)"
+          printf 'first line\nsee:%s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$colon_dir/fixture.md"
+          colon_out="$(bash .github/lint/check-org-repo-literals.sh --root "$colon_dir" 2>/dev/null || true)"
+          case "$colon_out" in
+            'fixture.md:2: '*) echo 'ok: a colon boundary still reports file:line' ;;
+            *)
+              echo "::error::a colon boundary mis-split the location: $colon_out"
+              fail=1
+              ;;
+          esac
+
           exit "$fail"
 
       - name: Smoke test — an over-broad allowlist entry is rejected, not honoured
@@ -117,8 +144,11 @@ jobs:
           # `?*` and `[a-z]*` all clear every name that reaches the matcher and
           # all read as ordinary allowlist lines. Each must fail as a
           # configuration error (exit 2).
+          # `[a-y]*`, `[!z]*` and `*[a-z]` are the same class one keystroke
+          # further out: each misses ONE of the two probes, so a guard that
+          # required both would honour them and then clear almost every name.
           fail=0
-          for entry in '*' '**' '?*' '[a-z]*'; do
+          for entry in '*' '**' '?*' '[a-z]*' '[a-y]*' '[!z]*' '*[a-z]'; do
             dir="$(mktemp -d)"
             mkdir -p "$dir/.github/lint"
             printf '%s  # oops\n' "$entry" > "$dir/.github/lint/org-repo-allowlist.txt"
@@ -175,4 +205,90 @@ jobs:
           else
             echo "ok (2): an unenterable root is not reported clean"
           fi
+
+          # A root holding only blobs `-I` skips is the third way the fallback
+          # `grep` lands on "no matches" having read nothing.
+          binary_only="$(mktemp -d)"
+          printf 'a\000b\n' > "$binary_only/blob.bin"
+          status=0
+          output="$(bash .github/lint/check-org-repo-literals.sh --root "$binary_only" 2>&1)" || status=$?
+          if [ "$status" -ne 2 ]; then
+            echo "::error::a root holding only binary blobs exited $status — expected 2"
+            printf '%s\n' "$output"
+            fail=1
+          else
+            echo "ok (2): a root with no scannable text file is not reported clean"
+          fi
+
+          # An unreadable allowlist clears the `-f` resolution and would
+          # otherwise die under `set -e` with status 1 — the status that means
+          # FINDINGS, making an unusable setup indistinguishable from a scan
+          # that found something.
+          unreadable="$(mktemp -d)"
+          mkdir -p "$unreadable/.github/lint"
+          printf 'placeholder  # unreadable-allowlist fixture\n' > "$unreadable/.github/lint/org-repo-allowlist.txt"
+          printf 'placeholder\n' > "$unreadable/fixture.md"
+          chmod 000 "$unreadable/.github/lint/org-repo-allowlist.txt"
+          status=0
+          output="$(bash .github/lint/check-org-repo-literals.sh --root "$unreadable" 2>&1)" || status=$?
+          chmod 644 "$unreadable/.github/lint/org-repo-allowlist.txt"
+          if [ "$status" -ne 2 ]; then
+            echo "::error::an unreadable allowlist exited $status — expected 2"
+            printf '%s\n' "$output"
+            fail=1
+          else
+            echo "ok (2): an unreadable allowlist is a configuration error"
+          fi
+          exit "$fail"
+
+      # Every case above runs against a `mktemp -d` root OUTSIDE any checkout,
+      # so `rev-parse --is-inside-work-tree` is false and all of them exercise
+      # the `grep -r` FALLBACK. The only step reaching `git grep` is the
+      # whole-repo scan, which is asserted CLEAN — so without this step nothing
+      # asserts that the production scan path can produce a finding at all,
+      # which is how both git-branch-only defects reviewed in round 1 (the
+      # `:(exclude)` pathspec and the subtree scan) shipped.
+      - name: Smoke test — the git scan path fires too, not just the fallback
+        run: |
+          fail=0
+          git_expect() {  # git_expect <want-status> <label> <printf-fmt> <arg>...
+            local want="$1" label="$2" fmt="$3"; shift 3
+            local dir status=0 output
+            dir="$(mktemp -d)"
+            git -C "$dir" init -q
+            # shellcheck disable=SC2059  # $fmt is the caller-supplied format
+            printf "$fmt" "$@" > "$dir/fixture.md"
+            git -C "$dir" add fixture.md
+            output="$(bash .github/lint/check-org-repo-literals.sh --root "$dir" 2>&1)" || status=$?
+            if [ "$status" -ne "$want" ]; then
+              echo "::error::$label: exited $status, expected $want"
+              printf '%s\n' "$output"
+              fail=1
+            else
+              echo "ok ($status): $label"
+            fi
+          }
+
+          git_expect 1 'an unlisted name in a TRACKED file' '%s/%s\n' 'Comfy-Org' 'not-on-the-allowlist'
+          git_expect 0 'an allowlisted name in a TRACKED file' 'see %s/%s\n' 'Comfy-Org' 'comfy-cli'
+
+          # `git grep` honours `grep.column` / `grep.fullName` from the repo's
+          # own config, and `grep.column=true` alone turns the output into
+          # `file:line:col:match`, which the right-anchored parse reads as a
+          # column-for-line-number. The finding still fires, so only the
+          # LOCATION shows the regression — assert it rather than the status.
+          cfg_dir="$(mktemp -d)"
+          git -C "$cfg_dir" init -q
+          printf 'first line\nsee %s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$cfg_dir/fixture.md"
+          git -C "$cfg_dir" add fixture.md
+          git -C "$cfg_dir" config grep.column true
+          git -C "$cfg_dir" config grep.fullName true
+          cfg_out="$(bash .github/lint/check-org-repo-literals.sh --root "$cfg_dir" 2>/dev/null || true)"
+          case "$cfg_out" in
+            'fixture.md:2: '*) echo 'ok: a hostile grep.column/grep.fullName config does not move the location' ;;
+            *)
+              echo "::error::grep.* config changed the reported location: $cfg_out"
+              fail=1
+              ;;
+          esac
           exit "$fail"

@@ -24,13 +24,21 @@
 #      simply be widened to high bytes: this tree legitimately writes an
 #      ellipsis, an em dash and CJK text flush against a real name in prose, so
 #      widening turns those into findings. Handling it properly needs the
-#      offset-aware scan `public-repo-hygiene` does; see limitation 4.
+#      offset-aware scan `public-repo-hygiene` does; see limitation 5.
 #   3. Both scan paths pass `-I`, so a tracked blob git classifies as BINARY is
 #      never read: a UTF-16 file, a file carrying a stray NUL, or one
 #      `.gitattributes` line (`*.md binary`) removes whole file types from the
 #      scan and a green run says nothing about them. Text is the only surface
 #      this lint claims.
-#   4. Category 3 only. `.github/public-repo-hygiene/` is the rigorous,
+#   4. Only a literal WRITTEN WHOLE is caught. An org literal assembled at run
+#      time -- `printf '%s/%s' '<org>' '<name>'`, `"${ORG}/<name>"`, a name
+#      split across a string concatenation -- never matches PATTERN, so it needs
+#      no allowlist edit while the run still reports its scope clean. This is
+#      not hypothetical here: this lint's own smoke tests use exactly that
+#      spelling on purpose, so it is the house style for org literals in this
+#      repo's workflow files. It is also fully human-readable in the source, so
+#      review is what catches it.
+#   5. Category 3 only. `.github/public-repo-hygiene/` is the rigorous,
 #      org-wide implementation of this idea (it also covers ticket ids,
 #      internal collaboration-tool links and the homoglyph case above). This
 #      repo cannot adopt that caller as-is: it is that checker's own home, so
@@ -68,13 +76,36 @@ ORG='Comfy-Org'
 # default-deny control. The name class is already both cases, so `-i` widens
 # nothing but the org segment.
 #
-# The optional leading `@` is CAPTURED, not skipped: an `@`-prefixed match is a
-# CODEOWNERS team handle or an npm/GitHub Packages scope, and team handles are
-# allowlisted separately from repo names (see `@`-entries below). Without the
-# capture the two share one namespace, so a team slug allowlisted for a
-# CODEOWNERS fixture would also clear a literal reference to a private REPO of
-# the same name. `public-repo-hygiene` splits the two for the same reason.
-PATTERN="@?${ORG}/[A-Za-z0-9_.-]+"
+# The org segment must START A TOKEN. `grep -E` has no lookbehind, so the
+# boundary is written as an alternation and the character in front of the org is
+# CONSUMED by the match (the loop below drops it again). Without it `grep -o`
+# reads straight into the middle of a longer token, so `Not${ORG}/whatever` --
+# a DIFFERENT owner -- is extracted as one of this org's repos and reddens CI on
+# a reference that has nothing to do with us. The boundary class is
+# `public-repo-hygiene`'s `REPO_REF_RE` lookbehind verbatim, so the two agree on
+# what counts as a reference: every real spelling is preceded by a separator
+# (`/` in a URL, whitespace, a quote, or the `@` of a team handle), and none of
+# those is in the class. The class treats `_` as identifier-continuation, so the
+# markdown-italic spelling `_${ORG}/<name>_` is NOT read as a reference -- the
+# same accepted trade that checker makes, kept identical on purpose so a name
+# cannot pass one checker and fail the other.
+#
+# The `@` of a team handle is that boundary character rather than part of the
+# pattern. An `@`-prefixed match is a CODEOWNERS team handle or an npm/GitHub
+# Packages scope, and team handles are allowlisted separately from repo names
+# (see `@`-entries below); without the split the two share one namespace, so a
+# team slug allowlisted for a CODEOWNERS fixture would also clear a literal
+# reference to a private REPO of the same name. `public-repo-hygiene` splits
+# them the same way and reads the `@` from the same position -- including its
+# residual, which this shares: the `@` is judged by POSITION alone, so one glued
+# to the tail of an identifier (`user@${ORG}/<name>`, email-shaped) still reads
+# as a scope. Reaching a private name through that needs the name to be spelled
+# exactly like an allowlisted TEAM slug.
+PATTERN="(^|[^A-Za-z0-9_])${ORG}/[A-Za-z0-9_.-]+"
+
+# Lowercased once for the `case` tests in the hit loop (matching is
+# case-insensitive, and bash 3.2 has no `${var,,}`).
+org_lc="$(printf '%s' "$ORG" | tr '[:upper:]' '[:lower:]')"
 
 root='.'
 allowlist_rel='.github/lint/org-repo-allowlist.txt'
@@ -117,13 +148,29 @@ else
   echo "error: allowlist '$allowlist_rel' not found under '$root' or '$script_repo_root'" >&2
   exit 2
 fi
+# A regular but UNREADABLE allowlist clears the `-f` tests above, and the
+# redirection that reads it below would then fail under `set -e` with status 1 --
+# the status documented as FINDINGS, so a caller could not tell an unusable setup
+# from a completed scan that found something. Every other setup failure here is
+# exit 2; so is this one.
+[ -r "$allowlist" ] || { echo "error: allowlist '$allowlist' is not readable" >&2; exit 2; }
 
 # Two names no allowlist entry has any business matching. An entry that clears
-# BOTH is not an allowlist line, it is an off switch: `*`, `**`, `?*` and
+# EITHER is not an allowlist line, it is an off switch: `*`, `**`, `?*` and
 # `[a-z]*` all read as ordinary-looking edits while clearing every name that
 # reaches the `case` below. Testing behaviour rather than spelling is what makes
-# the guard cover the spellings nobody thought to enumerate; requiring BOTH
-# probes keeps a narrow-but-odd glob from tripping it.
+# the guard cover the spellings nobody thought to enumerate.
+#
+# EITHER, not both. Requiring both leaves any glob that misses ONE probe
+# honoured, which is a single keystroke from the spellings above: `[a-y]*` misses
+# probe A (it starts with `z`) and then clears every name beginning a-y, and
+# `[!z]*` and `*[a-z]` slip through the same gap. Rejecting on either costs
+# nothing -- both probes are nonsense strings, and every entry on the list today
+# is a plain literal that matches neither.
+#
+# The two differ in FIRST character, LAST character and separator on purpose
+# (`z`/`q`, a letter/a digit, `-`/`.`), so a glob anchored at any of those three
+# positions trips at least one of them.
 OVERBROAD_PROBE_A='zzq0probe-not-a-real-name-9f3d'
 OVERBROAD_PROBE_B='qx7probe.not-a-real-name-2b8'
 
@@ -152,18 +199,15 @@ while IFS= read -r line || [ -n "$line" ]; do
     @*) is_team=1; entry="${entry#@}" ;;
   esac
   [ -n "$entry" ] || { echo "error: allowlist '$allowlist' has an entry that is a bare '@'" >&2; exit 2; }
+  overbroad=0
   # shellcheck disable=SC2254  # $entry is intentionally a glob, not a literal
-  case "$OVERBROAD_PROBE_A" in
-    $entry)
-      # shellcheck disable=SC2254
-      case "$OVERBROAD_PROBE_B" in
-        $entry)
-          echo "error: allowlist '$allowlist' entry '$line' matches arbitrary names, which allows every name" >&2
-          exit 2
-          ;;
-      esac
-      ;;
-  esac
+  case "$OVERBROAD_PROBE_A" in $entry) overbroad=1 ;; esac
+  # shellcheck disable=SC2254
+  case "$OVERBROAD_PROBE_B" in $entry) overbroad=1 ;; esac
+  if [ "$overbroad" -eq 1 ]; then
+    echo "error: allowlist '$allowlist' entry '$line' matches an arbitrary name, which allows every name" >&2
+    exit 2
+  fi
   if [ "$is_team" -eq 1 ]; then
     team_patterns+=("$entry")
     team_pattern_count=$((team_pattern_count + 1))
@@ -205,7 +249,16 @@ if git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   # letting its free-text rationale comments go unchecked, so that a line like
   # `foo  # mirrors <org>/<private>` would publish an unapproved name with CI
   # green. The non-git path below never excluded it either.
-  hits="$(git -C "$root" grep -oiInE -- "$PATTERN" -- .)" || scan_status=$?
+  #
+  # The `-c grep.*` pins are the same move as `LC_ALL=C` above: `git grep`
+  # honours `grep.column`, `grep.lineNumber` and `grep.fullName` from system or
+  # global config and from `GIT_CONFIG_*`, and `grep.column=true` alone turns the
+  # output into `file:line:col:match`, which the right-anchored parse below reads
+  # as `file:line` + a column-as-line-number. Findings would still fire (the match
+  # text is authoritative) but every printed location and `::error` annotation
+  # would point at the wrong place. `-E` is passed explicitly for the same reason
+  # and overrides `grep.patternType`.
+  hits="$(git -C "$root" -c grep.column=false -c grep.lineNumber=true -c grep.fullName=false grep -oiInE -- "$PATTERN" -- .)" || scan_status=$?
 else
   # `cd` + a `.` root rather than grepping "$root" and stripping the prefix
   # afterwards: the strip would be a `sed` expression built from a path this
@@ -216,6 +269,25 @@ else
   # clean tree. `[ -d "$root" ]` above does not cover it (a directory with no
   # execute bit, or a TOCTOU replacement between the two).
   scope="'$root'"
+  # The same "refusing to report a clean tree" guard the git path has, for the
+  # same reason: `grep` exits 1 both for "no matches" and for a root that holds
+  # nothing this scan can read, so a stale or mistyped `--root` would otherwise
+  # print the clean-tree OK line having scanned nothing -- fail-open on exactly
+  # the path the git branch fails closed on. `-rIl -e ''` enumerates precisely
+  # what the scan below can read: every file it would open, with the same `-I`
+  # excluding the binaries it would skip. An empty result therefore means there
+  # was no scannable file, whether because the tree is empty, because everything
+  # in it is binary, or because the root could not be entered at all.
+  #
+  # `|| true` and an emptiness test rather than a status test: `head` closing the
+  # pipe early makes `grep` die of SIGPIPE, and under `set -o pipefail` that
+  # status would read as a scan error on a perfectly good tree. Any real failure
+  # still lands on empty output here, which is exit 2 either way.
+  first_scannable="$(cd -- "$root" 2>/dev/null && grep -rIl --exclude-dir=.git -e '' . 2>/dev/null | head -n 1 || true)"
+  if [ -z "$first_scannable" ]; then
+    echo "error: no readable text file under '$root' — refusing to report a clean tree" >&2
+    exit 2
+  fi
   hits="$(cd -- "$root" || exit 3; grep -rIoiEn --exclude-dir=.git -- "$PATTERN" .)" || scan_status=$?
 fi
 # Both tools exit 1 for "no matches" and >1 for a real error. Swallowing the
@@ -251,24 +323,46 @@ trim_trailing_dots() {
 findings=0
 while IFS= read -r hit; do
   [ -n "$hit" ] || continue
-  # `file:line:match` — the match holds no colon, and neither does the line
-  # number, so both come off the RIGHT. Cutting the file off the LEFT instead
-  # would mangle any path that contains a colon.
+  # `file:line:match` — the line number holds no colon, so both come off the
+  # RIGHT. Cutting the file off the LEFT instead would mangle any path that
+  # contains a colon.
   match="${hit##*:}"
   where="${hit%:*}"
+  # The boundary character PATTERN consumes may ITSELF be a colon: `uses:`,
+  # `repository:` and prose like `see:${ORG}/x` are all real spellings, and each
+  # puts a fourth colon on the line, shifting the right-anchored split by one
+  # field. A line number is never empty, so an empty trailing field is that case
+  # and nothing else.
+  if [ -z "${where##*:}" ]; then
+    match=":$match"
+    where="${where%:}"
+  fi
   file="${where%:*}"
   file="${file#./}"
   lineno="${where##*:}"
-  # An `@`-prefixed literal may additionally draw on the team/scope entries.
-  is_at=0
-  qualified="$match"
-  case "$qualified" in
-    @*) is_at=1; qualified="${qualified#@}" ;;
-  esac
-  name="${qualified#*/}"
 
-  lower="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
-  lower="$(trim_trailing_dots "$lower")"
+  # `grep -E` has no lookbehind, so a match that did not start at column 0
+  # carries the boundary character in front of the literal. Drop it -- and read
+  # the team/scope namespace off it first, because an `@` in that position is
+  # the `@` of a CODEOWNERS handle or a package scope, which may additionally
+  # draw on the team entries. The `@` stays on `$match` so the finding quotes
+  # the literal as written and "add it to the allowlist" stays a copy-paste.
+  lower="$(printf '%s' "$match" | tr '[:upper:]' '[:lower:]')"
+  is_at=0
+  case "$lower" in
+    "$org_lc"/*) ;;                       # column 0 — no boundary was consumed
+    *)
+      case "$lower" in
+        "@$org_lc"/*) is_at=1 ;;
+        *) match="${match#?}" ;;
+      esac
+      lower="${lower#?}"
+      ;;
+  esac
+  name="${lower#*/}"
+
+  lower="$(trim_trailing_dots "$name")"
+
   lower="${lower%.git}"
   lower="$(trim_trailing_dots "$lower")"
   # A reference left naming nothing (`<org>/.`, `<org>/.git`) is not a finding.

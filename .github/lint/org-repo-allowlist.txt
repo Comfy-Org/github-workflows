@@ -14,10 +14,12 @@
 # repo namespace is why a CODEOWNERS fixture's team name does not also clear a
 # literal reference to a private REPO of that name.
 #
-# No entry may match an arbitrary name: an entry that clears two unrelated probe
-# names is rejected as a configuration error (exit 2), because `*`, `**`,
-# `?*` and `[a-z]*` all read as ordinary allowlist edits while switching the
-# whole control off.
+# No entry may match an arbitrary name: an entry that clears EITHER of two
+# unrelated probe names is rejected as a configuration error (exit 2), because
+# `*`, `**`, `?*`, `[a-z]*`, `[a-y]*`, `[!z]*` and `*[a-z]` all read as ordinary
+# allowlist edits while switching the whole control off. Either, not both: a
+# glob that missed one probe would otherwise be honoured, and that is a single
+# keystroke from the spellings above.
 #
 # Adding a line here is the ratification step: it is what makes "this name is
 # safe to publish" a reviewed decision instead of an assumption. Never add a
@@ -55,9 +57,20 @@ unreviewed-merges           # private, but deliberately published in README/docs
 
 # ── Team handles that ALSO appear bare, as fixtures ──
 # The public-repo-hygiene suite writes these without the `@` on purpose, to
-# prove the bare path is checked against the repo list. Both are invented.
-comfy-cloud-team            # team handle, org-wide PUBLIC_COMFY_ORG_TEAMS; also written bare in a public-repo-hygiene fixture
-some-team                   # fixture team handle, also written bare in a public-repo-hygiene HF-route fixture
+# prove the bare path is checked against the repo LIST. The bare spelling is the
+# one that has to clear, so unlike the block above these two stay in the REPO
+# namespace — a KNOWN CROSSING of the `@`-split, named here so that split does
+# not read as complete. Residual: a private repo named exactly `comfy-cloud-team`
+# or `some-team` would clear on these lines. Neither name is a repository in
+# this org.
+#
+# They are safe to publish for different reasons, so they are not "both
+# invented": `comfy-cloud-team` is a REAL org team, already on the org-wide
+# PUBLIC_COMFY_ORG_TEAMS list (a team handle is inherently public on a public
+# repo — GitHub renders CODEOWNERS owners to anyone who can see it), while
+# `some-team` is an invented fixture slug.
+comfy-cloud-team            # REAL org team, on the org-wide PUBLIC_COMFY_ORG_TEAMS list; also written bare in a public-repo-hygiene fixture
+some-team                   # INVENTED fixture team handle, also written bare in a public-repo-hygiene HF-route fixture
 
 # ── Documentation examples — no such repo exists ──
 github-workflows-tools      # doc example in the bump-callers docs
