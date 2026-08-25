@@ -17,13 +17,19 @@ Findings file shape:
         ]
     }
 
+Given `--diff`, findings whose line is not in the reviewed diff are rendered in
+the review BODY and the rest still anchor. Without it (or if the diff cannot be
+read) every finding is sent inline, as before.
+
 Falls back to a body-only review (no inline anchors) if GitHub rejects the
-inline payload — typical cause is line numbers that don't match the diff.
+inline payload anyway — the API is all-or-nothing, so one bad position costs
+every anchor in the request.
 """
 
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -175,6 +181,122 @@ def post_or_degrade(repo, pr_number, payload, summary_markdown, context) -> bool
         return True
     print(f"{context} POST failed: {result.stderr}", file=sys.stderr)
     return False
+
+
+def anchorable_lines(diff_text: str) -> dict:
+    """Map new-side path -> the set of line numbers a RIGHT-side comment may anchor to.
+
+    GitHub accepts a review comment only on a line the diff actually carries — added
+    or context, inside a hunk. Anything else is rejected, and the rejection is
+    WHOLESALE: `POST /pulls/{n}/reviews` takes the comments array as one unit, so a
+    single out-of-range position costs every anchor in the request (observed in the
+    field: 10 findings, 1 line outside the hunks, 0 comments anchored, HTTP 422).
+    Parsing the diff up front lets the 9 good ones land.
+
+    Deliberately a hand-rolled scan, matching build-ledger.py/fence-diff.py: the
+    consumers run on a stock runner with no third-party diff library available.
+    """
+    anchors: dict = {}
+    path = None
+    right = 0
+    # splitlines(), not split("\n"): the latter yields a trailing "" for the diff's final
+    # newline, which the blank-line arm below would then number as one line past the end of
+    # the last hunk — an anchor GitHub rejects, i.e. the 422 this function exists to prevent.
+    for raw in diff_text.splitlines():
+        if raw.startswith("+++ "):
+            # `+++ b/path`, or `+++ /dev/null` for a delete (no new side at all).
+            target = raw[4:].strip()
+            if target == "/dev/null":
+                path = None
+            else:
+                path = target[2:] if target.startswith(("a/", "b/")) else target
+                anchors.setdefault(path, set())
+            continue
+        if raw.startswith("@@"):
+            m = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", raw)
+            # An unparseable hunk header means the following lines cannot be numbered.
+            # Drop the file rather than number them from a guess: a WRONG anchor set is
+            # worse than none, since it would send back the 422 this exists to avoid.
+            right = int(m.group(1)) if m else 0
+            if not m:
+                path = None
+            continue
+        if path is None or right == 0:
+            continue
+        if raw.startswith("+") or raw.startswith(" "):
+            anchors[path].add(right)
+            right += 1
+        elif raw.startswith("-") or raw.startswith("\\"):
+            # Removed lines advance only the OLD side; `\ No newline at end of file`
+            # is a marker, not content.
+            continue
+        else:
+            # Anything else inside a hunk is a line this parser cannot number: a bare ""
+            # (unified diff renders a context blank as " ", so a truly empty line means
+            # the text has been through something lossy) or a stray non-diff line. Drop
+            # the FILE rather than guess, because from here on every number would be a
+            # guess, and a wrong anchor is what sends back the 422. The cost of dropping
+            # is that the file's findings render in the body — visible, not lost.
+            path = None
+    return anchors
+
+
+def partition_by_anchor(enriched: list, anchors) -> tuple:
+    """Split enriched findings into (inline, body_only) against the diff's anchors.
+
+    `anchors` of None means "no diff was supplied" — everything stays inline, which
+    is the pre-existing behaviour and the fail-OPEN direction: a diff we could not
+    read must never cost a finding its anchor on a PR where it would have worked.
+    """
+    if anchors is None:
+        return list(enriched), []
+    inline, body_only = [], []
+    for item in enriched:
+        c = item["comment"]
+        if c["line"] in anchors.get(c["path"], set()):
+            inline.append(item)
+        else:
+            body_only.append(item)
+    return inline, body_only
+
+
+def load_anchors(diff_path):
+    """Read the reviewed diff and build its anchor map, or None if unusable.
+
+    Every failure lands on None (= keep today's all-inline behaviour) and says so on
+    stderr. The one thing this must not do is return a PARTIAL map on a read error:
+    that would silently demote real anchors to prose.
+    """
+    if not diff_path:
+        return None
+    try:
+        with open(diff_path, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError as e:
+        print(f"Anchors: cannot read diff {diff_path} ({e}) — sending all findings inline.", file=sys.stderr)
+        return None
+    if not text.strip():
+        print(f"Anchors: diff {diff_path} is empty — sending all findings inline.", file=sys.stderr)
+        return None
+    anchors = anchorable_lines(text)
+    if not anchors:
+        print(f"Anchors: no hunks parsed from {diff_path} — sending all findings inline.", file=sys.stderr)
+        return None
+    return anchors
+
+
+def render_body_only_findings(items: list) -> str:
+    """Render findings that could not be anchored, for inclusion in the review body."""
+    if not items:
+        return ""
+    md = (
+        "_The finding(s) below cite a line outside the reviewed diff, so they could "
+        "not be anchored inline:_\n\n"
+    )
+    for item in items:
+        c = item["comment"]
+        md += f"**`{c['path']}:{c['line']}`** — {c['body']}\n\n"
+    return md.rstrip("\n")
 
 
 def render_findings_markdown(review_body: str, comments: list[dict]) -> str:
@@ -332,6 +454,15 @@ def main():
     parser.add_argument("--pr-number", required=True)
     parser.add_argument("--repo", required=True)
     parser.add_argument("--commit-sha", required=True)
+    parser.add_argument(
+        "--diff",
+        default=None,
+        help=(
+            "Path to the reviewed diff. Findings citing a line the diff does not carry "
+            "are rendered in the review body so the rest still anchor inline. Omitted "
+            "or unreadable means every finding is sent inline (pre-existing behaviour)."
+        ),
+    )
     parser.add_argument("--triggered-by", default=None)
     parser.add_argument("--error-message", default=None, help="If set, post an error review with this message")
     parser.add_argument(
@@ -411,9 +542,13 @@ def main():
 
     enriched = normalize_comments(findings)
     enriched, repeats_dropped = enforce_repeat_cap(enriched)
-    comments = [item["comment"] for item in enriched]
+    # Anchor-aware split. The COUNT below stays the total across both halves — a finding
+    # that lands in the body is still a finding, and a headline that shrank because an
+    # anchor missed would misreport the review.
+    inline_items, body_only_items = partition_by_anchor(enriched, load_anchors(args.diff))
+    comments = [item["comment"] for item in inline_items]
 
-    review_body = f"{header}\n\nFound **{len(comments)}** finding(s)."
+    review_body = f"{header}\n\nFound **{len(enriched)}** finding(s)."
     if repeats_dropped:
         review_body += (
             f"\n\n_{repeats_dropped} re-raise(s) of already-answered findings were dropped "
@@ -424,8 +559,11 @@ def main():
         review_body += f"\n\n{severity_summary}"
     if panel_summary:
         review_body += f"\n\n{panel_summary}"
-    if not comments and findings:
+    if not enriched and findings:
         review_body += "\n\n_(All findings had invalid file/line references and were dropped.)_"
+    body_only_md = render_body_only_findings(body_only_items)
+    if body_only_md:
+        review_body += f"\n\n---\n\n{body_only_md}"
 
     payload = json.dumps(
         {

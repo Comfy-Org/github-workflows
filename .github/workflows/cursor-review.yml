@@ -1943,6 +1943,7 @@ jobs:
               --repo "$REPO" \
               --commit-sha "$HEAD_SHA" \
               --triggered-by "$TRIGGERED_BY" \
+              --diff /tmp/pr-diff.patch \
               --ledger-note "$LEDGER_NOTE"
           elif [ "${CONSOLIDATED_COUNT:-0}" != "0" ]; then
             JUDGE_ERROR=$(python3 -c "import json; print(json.load(open('/tmp/judge-findings.json')).get('error','(no error message)'))")
@@ -1952,6 +1953,7 @@ jobs:
               --repo "$REPO" \
               --commit-sha "$HEAD_SHA" \
               --triggered-by "$TRIGGERED_BY" \
+              --diff /tmp/pr-diff.patch \
               --ledger-note "$LEDGER_NOTE" \
               --notice "⚠️ The judge step did not submit a final review through its structured-output tool (status=${JUDGE_STATUS}). The findings below are the raw, un-adjudicated panel output — they may contain duplicates or false positives the judge would normally filter."
           else
