@@ -76,6 +76,29 @@
 #      or as a link target is therefore not a finding here.
 #      `public-repo-hygiene` does scan a symlink's target string; neither
 #      checker scans the tracked path itself.
+#  10. Two ADJACENT literals scan as ONE. `grep -o` takes non-overlapping
+#      matches, and the name class holds `.` and `-`, which are also characters
+#      that can SEPARATE two literals -- so `<org>/public.<org>/private` is a
+#      SINGLE match whose name reads `public.<org>`. The second name is never
+#      compared, never printed, and the scan resumes at `/private`, which no
+#      longer matches. It fails CLOSED, because a merged token always ends in
+#      the org name and nothing on the allowlist does, so such a line is always
+#      a finding. The residual is the REMEDY, not the miss: the finding quotes a
+#      token that is not a repo, and the obvious way to silence something so
+#      confusing is to allowlist the quoted token -- which would clear the
+#      private reference with the run green. So the loader REJECTS an entry
+#      ending in `.<org>` or `-<org>`, the only spelling that could do it.
+#  11. The per-hit loop is LINEAR IN THE HIT COUNT, and `MAX_REPORTED` does not
+#      bound it: past the cap a hit stops printing but is still folded,
+#      normalized and compared against the list, because the reported count and
+#      the exit status have to stay the true ones. Measured after the fold above
+#      was replaced by a glob: ~5.4ms per hit past the cap (2000 hits in one
+#      tracked file, 11.7s, against 2.1s at 200), so the caller's
+#      `timeout-minutes: 10` is reached at roughly 110,000 hits in one scan --
+#      and `$hits` buffers the whole scan before the loop starts. Documented
+#      rather than capped: this tree's largest tracked file is under 600 lines,
+#      and capping the scan would trade an unreachable timeout for a truncated
+#      count, which is the one number a red run's summary turns on.
 #
 # TAMPER BOUNDARY: unlike the reusable checkers this repo publishes, this lint
 # runs from the PR's own checkout, so a PR here can edit both the script and the
@@ -110,6 +133,22 @@ unset CDPATH
 # (measured: `GIT_DIR=b/.git GIT_WORK_TREE=b git -C a grep -l -e ''` lists b's
 # files, not a's). Same class of hazard as `CDPATH`, unset in the same place.
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+
+# The config-INJECTION variables, unset for the same reason but against a
+# hazard that fails the other way. `GIT_CONFIG_COUNT` with `GIT_CONFIG_KEY_n`/
+# `GIT_CONFIG_VALUE_n`, and `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`, can set
+# `core.attributesFile` and so mark a subset of the tree `binary` -- which
+# `git grep -I` then silently skips. That is limitation 3's hazard delivered
+# through the environment rather than through a tracked `.gitattributes`, and
+# the `-c grep.*`/`color.grep`/`core.quotePath` pins on the scan cannot cover it
+# because the injected key is not one of the pinned ones.
+#
+# Unlike `GIT_DIR` this one fails OPEN: `first_scannable` still finds a file, so
+# the guard clears, the scan reads LESS than the tree, and the OK line still
+# claims "the tracked files under '$root'". `GIT_CONFIG_KEY_n`/`_VALUE_n` are
+# inert once `GIT_CONFIG_COUNT` is gone (git reads the count first and then
+# exactly that many pairs), so the three names below are the whole mechanism.
+unset GIT_CONFIG_COUNT GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM
 
 ORG='Comfy-Org'
 # Deliberately assembled rather than written whole: a literal org-prefixed name
@@ -158,6 +197,27 @@ PATTERN="(^|[^A-Za-z0-9_])${ORG}/[A-Za-z0-9_.-]+"
 # Lowercased once for the `case` tests in the hit loop (matching is
 # case-insensitive, and bash 3.2 has no `${var,,}`).
 org_lc="$(printf '%s' "$ORG" | tr '[:upper:]' '[:lower:]')"
+
+# The same org name as a case-insensitive GLOB — `Comfy-Org` becomes
+# `[Cc][Oo][Mm][Ff][Yy]-[Oo][Rr][Gg]`. Built ONCE here (two forks total) so the
+# hit loop can decide the `@`/boundary case with a `case` test instead of
+# folding the match's head through `printf | tr`, which cost two forks on every
+# hit. Letters become a two-character class; every other byte -- `-` here, which
+# is literal outside a bracket expression -- is copied as-is, so the glob
+# matches exactly the names the fold did and no others.
+org_uc="$(printf '%s' "$ORG" | tr '[:lower:]' '[:upper:]')"
+org_glob=''
+i=0
+while [ "$i" -lt "${#ORG}" ]; do
+  lc_char="${org_lc:$i:1}"
+  uc_char="${org_uc:$i:1}"
+  if [ "$lc_char" = "$uc_char" ]; then
+    org_glob="$org_glob$lc_char"
+  else
+    org_glob="${org_glob}[$uc_char$lc_char]"
+  fi
+  i=$((i + 1))
+done
 
 root='.'
 allowlist_rel='.github/lint/org-repo-allowlist.txt'
@@ -217,17 +277,42 @@ fi
 # exit 2; so is this one.
 [ -r "$allowlist" ] || { echo "error: allowlist '$allowlist' is not readable" >&2; exit 2; }
 
-# The one edit that would silently neuter this whole control is a GLOB: `*`,
-# `**`, `?*` and `[a-z]*` all read as ordinary-looking allowlist lines while
-# clearing every name that reaches the comparison below.
+# Three shapes of entry are rejected outright rather than loaded, because each
+# of them reads as an ordinary allowlist line while doing something other than
+# what its author meant.
 #
-# Earlier revisions tested entries against two fixed nonsense probe names and
-# rejected an entry that matched either. That cannot decide breadth in general:
-# `[!qz]*`, `[a-p]*` and `[!q-z]*` match NEITHER probe and still clear almost
-# the whole namespace, and `secret-*` pre-approves an unbounded family the same
-# way. So the METACHARACTERS are what is rejected, which is deterministic and
-# free -- every entry on the list is a plain literal, and enumerating a fixture
+# A GLOB (`*`, `**`, `?*`, `[a-z]*`, `secret-*`) is the first. Note what this
+# guard is and is NOT today: the comparisons below are exact (`[ "$lower" =
+# "$known" ]`), so a `*` entry already clears nothing but a literal `*` -- no
+# entry reaches the comparison AS A PATTERN any more. The rejection is
+# DEFENCE-IN-DEPTH against that comparison going back to a `case` glob, kept so
+# that a later reader "simplifying" `=` into one does not silently re-arm every
+# metacharacter on the list. It is also why an earlier revision's approach --
+# testing each entry against two fixed nonsense probe names -- was dropped: two
+# probes cannot decide breadth in general (`[!qz]*`, `[a-p]*` and `[!q-z]*`
+# match NEITHER probe and still clear almost the whole namespace), whereas
+# rejecting the metacharacters is deterministic and free. Enumerating a fixture
 # family rather than globbing it is already the documented house style.
+#
+# An entry containing `/` is the second, and unlike the glob it is a live
+# foot-gun rather than a latent one. The comparisons below run against the BARE
+# name (`${lower#*/}`), so `<org>/foo` can never equal an entry -- yet `<org>/foo`
+# is exactly the spelling the tool invites, because the finding line quotes the
+# whole literal and the summary says to add it to the allowlist. Accepting it
+# would yield an inert line and a rerun still insisting the name is not on a
+# file that visibly contains it. Rejected with the spelling that does work.
+#
+# An entry whose name ENDS in `.<org>` or `-<org>` is the third; see limitation
+# 10. `grep -o` takes non-overlapping matches and the name class contains the
+# characters that also separate two adjacent literals, so
+# `<org>/public-name.<org>/private-name` is ONE match whose name reads
+# `public-name.<org>` -- and the second name is never compared, never printed,
+# and the scan resumes past it. It fails closed today (that merged token is on
+# no list), but the obvious way to silence so confusing a finding is to
+# allowlist the token it quotes, and THAT would clear the private reference with
+# CI green. Making the merged token unallowlistable removes the foot-gun; a real
+# repo name in this shape is a namespace collision with the merge artefact and
+# has to be spelled some other way regardless.
 
 # Allowlist entries are LITERAL names compared case-insensitively (GitHub
 # resolves owner/repo names case-insensitively, so a case variant of an
@@ -257,6 +342,18 @@ while IFS= read -r line || [ -n "$line" ]; do
   case "$entry" in
     *[][*?]*)
       echo "error: allowlist '$allowlist' entry '$line' contains a glob metacharacter ([, ], * or ?); entries are literal names, and a glob can allow every name" >&2
+      exit 2
+      ;;
+  esac
+  case "$entry" in
+    */*)
+      echo "error: allowlist '$allowlist' entry '$line' contains '/'; entries are bare repo NAMES compared against the name alone, so an entry written as '$ORG/<name>' can never match anything — write just '<name>'" >&2
+      exit 2
+      ;;
+  esac
+  case "$entry" in
+    *[.-]"$org_lc")
+      echo "error: allowlist '$allowlist' entry '$line' ends in '.$ORG' or '-$ORG'; that is the shape of a MERGED literal (see limitation 10, '<org>/a.<org>/b' scans as one match) and allowlisting it would clear the second, unexamined name with the run green" >&2
       exit 2
       ;;
   esac
@@ -338,7 +435,17 @@ if [ "$(git -C "$root" rev-parse --is-inside-work-tree 2>/dev/null)" = true ]; t
   # and `core.quotePath=true` (git's DEFAULT) emits a path holding a non-ASCII
   # byte quoted and octal-escaped, so the `::error file=` annotation would name
   # a path that does not exist -- while the fallback `grep -r` prints it raw.
-  hits="$(git -C "$root" -c grep.column=false -c grep.lineNumber=true -c grep.fullName=false -c color.grep=false -c core.quotePath=false grep -oiInE -- "$PATTERN" -- .)" || scan_status=$?
+  #
+  # `grep.fullName=TRUE` is the pinned value, not `false`. Of the two stable
+  # settings only one keeps a subtree run's locations usable: with `false` git
+  # prints paths relative to the CWD, which `git -C "$root"` has set to `$root`,
+  # so `--root docs` reports a hit in `docs/x.md` as `x.md` and emits
+  # `::error file=x.md` -- an annotation GitHub resolves against the repo root
+  # and then drops. `true` prints it relative to the repo top, which is the
+  # frame the annotation is read in. Both settings are equally immune to the
+  # `file:line:col` parse regression the rest of these pins exist for (neither
+  # adds a field), so pinning the correct one costs nothing.
+  hits="$(git -C "$root" -c grep.column=false -c grep.lineNumber=true -c grep.fullName=true -c color.grep=false -c core.quotePath=false grep -oiInE -- "$PATTERN" -- .)" || scan_status=$?
 else
   # `cd` + a `.` root rather than grepping "$root" and stripping the prefix
   # afterwards: the strip would be a `sed` expression built from a path this
@@ -440,6 +547,22 @@ MAX_REPORTED=200
 # GitHub's own repo-name limit; see the cap in the loop below.
 MAX_NAME=100
 
+# How many bytes NORMALIZATION is allowed to peel off a name before the length
+# test gives up on it. Normalization only ever removes a SUFFIX -- trailing
+# periods, then at most one `.git`, then trailing periods again -- so a name
+# that is over the limit AS WRITTEN can still normalize onto an allowlisted
+# one, and testing the length first is what forced `<org>/<98-char>.git`, or a
+# 100-character name followed by a sentence period, into `oversize`. That
+# matters because `oversize` skips BOTH allowlist comparisons, so the finding
+# named a remedy that could not silence it.
+#
+# The test therefore runs after the strips, and this bounds their input: 8 bytes
+# is `.git` plus a sentence period plus an ellipsis, which covers every way a
+# real reference gets punctuated in prose. A longer run of periods is still
+# `oversize` -- fail-closed, and it is what keeps `trim_trailing_dots`, whose
+# peel is quadratic in the run it removes, off unbounded input.
+MAX_STRIP=8
+
 findings=0
 while IFS= read -r hit; do
   [ -n "$hit" ] || continue
@@ -468,12 +591,26 @@ while IFS= read -r hit; do
   file="${file#./}"
   lineno="${where##*:}"
 
-  # COST bound, applied before anything copies, folds or forks on the match
-  # text. A match longer than `boundary + org + '/' + MAX_NAME` cannot spell a
-  # name of MAX_NAME characters or fewer whatever the boundary character is, so
-  # the exact `${#name}` test below would reach the same verdict; this only
-  # skips the work of getting there. Deliberately coarse — the exact rule stays
-  # in one place.
+  # A line number is always DIGITS, so anything else means this record is not a
+  # `file:line:match` triple and the split above produced three fabrications.
+  # The way that happens is a tracked path containing a NEWLINE: both scan paths
+  # print the path raw (`core.quotePath=false` on the git side, `grep -r` on the
+  # other), so one hit arrives as two records and the leading fragment yields a
+  # file that does not exist, a `line=` that is a path, and a "literal" cut out
+  # of the filename. Reporting it would also put the raw `:`/`,` of a path into
+  # the `file=`/`line=` properties that `escape_property` exists to protect.
+  #
+  # Refused rather than escaped or skipped: escaping would still publish the
+  # fabricated finding, and skipping would drop a record on a parse this script
+  # has already lost confidence in. Exit 2 is the same "refusing to report"
+  # verdict every other unusable-scan branch here returns.
+  case "$lineno" in
+    ''|*[!0-9]*)
+      echo "error: could not parse the scan output — expected 'file:line:match', got a non-numeric line field. A tracked path containing a newline splits one record in two; rename it, or narrow --root past it." >&2
+      exit 2
+      ;;
+  esac
+
   # `grep -E` has no lookbehind, so a match that did not start at column 0
   # carries the boundary character in front of the literal. Drop it -- and read
   # the team/scope namespace off it first, because an `@` in that position is
@@ -484,16 +621,22 @@ while IFS= read -r hit; do
   # Decided from a BOUNDED head slice (`@` + org + `/` is all it takes), not
   # from the whole match folded to lower case: the match text is unbounded, and
   # this runs on every hit including the oversize ones the block below skips.
-  head_lc="$(printf '%s' "${match:0:$((${#ORG} + 2))}" | tr '[:upper:]' '[:lower:]')"
+  #
+  # The case-insensitive comparison is a GLOB built once from `$ORG`
+  # (`[Cc][Oo]...`), not a `printf | tr` fold. The fold cost two forks on EVERY
+  # hit -- including every hit past `MAX_REPORTED`, which prints nothing and so
+  # buys only the count -- and it was the larger half of the per-hit cost.
+  # Measured on a fixture of 2000 unapproved literals in one tracked file:
+  # 18.4s before, 11.7s after (8.6ms -> 5.4ms per hit past the printing cap).
+  # The glob is exact (each letter becomes a
+  # two-character class, every other byte is copied literally), so it decides
+  # the same three cases the fold did.
+  match_head="${match:0:$((${#ORG} + 2))}"
   is_at=0
-  case "$head_lc" in
-    "$org_lc"/*) ;;                     # column 0 — no boundary was consumed
-    *)
-      case "$head_lc" in
-        "@$org_lc"/*) is_at=1 ;;
-        *) match="${match#?}" ;;
-      esac
-      ;;
+  case "$match_head" in
+    $org_glob/*) ;;                     # column 0 — no boundary was consumed
+    "@"$org_glob/*) is_at=1 ;;
+    *) match="${match#?}" ;;
   esac
 
   # COST bound, applied before anything folds or forks on the WHOLE match text.
@@ -503,7 +646,7 @@ while IFS= read -r hit; do
   # of getting there. Deliberately coarse — the exact rule stays in one place.
   lower=''
   oversize=0
-  if [ "${#match}" -gt "$((MAX_NAME + ${#ORG} + 2))" ]; then
+  if [ "${#match}" -gt "$((MAX_NAME + MAX_STRIP + ${#ORG} + 2))" ]; then
     oversize=1
   fi
 
@@ -511,18 +654,24 @@ while IFS= read -r hit; do
     lower="$(printf '%s' "$match" | tr '[:upper:]' '[:lower:]')"
     name="${lower#*/}"
 
-    # A GitHub repo slug is at most MAX_NAME characters, so anything longer is
-    # not a reference to a real repository under ANY normalization and
-    # therefore cannot be on the allowlist — it is reported without being
-    # normalized at all. This is also what bounds `trim_trailing_dots`, whose
-    # `${value%?}` peel is quadratic in the run it removes: unbounded, one
-    # tracked line of `${ORG}/foo` followed by a long run of periods ran for
-    # over two minutes, which would burn the caller's whole `timeout-minutes`
-    # and turn a would-be finding into an inconclusive run. It fails CLOSED —
-    # an over-long name is always reported, never cleared — so the bound cannot
-    # let a name through. For scale: the longest literal really in this tree is
-    # 29 characters.
-    if [ "${#name}" -gt "$MAX_NAME" ]; then
+    # A GitHub repo slug is at most MAX_NAME characters, so a name longer than
+    # that AFTER normalization is not a reference to a real repository under any
+    # normalization and therefore cannot be on the allowlist — it is reported
+    # without being compared at all. The `MAX_STRIP` headroom is what lets the
+    # strips run first: peeling is the only thing that can bring an over-long
+    # name back under the limit, and skipping it turned `<org>/<98-char>.git`
+    # into an `oversize` finding whose stated remedy — the allowlist — is
+    # skipped for exactly that class. Past the headroom the peel is refused
+    # rather than run, because `trim_trailing_dots`'s `${value%?}` is quadratic
+    # in the run it removes: unbounded, one tracked line of `${ORG}/foo`
+    # followed by a long run of periods ran for over two minutes, which would
+    # burn the caller's whole `timeout-minutes` and turn a would-be finding into
+    # an inconclusive run.
+    #
+    # Both bounds fail CLOSED — an over-long name is always reported, never
+    # cleared — so neither can let a name through. For scale: the longest
+    # literal really in this tree is 29 characters.
+    if [ "${#name}" -gt "$((MAX_NAME + MAX_STRIP))" ]; then
       oversize=1
     else
       lower="$(trim_trailing_dots "$name")"
@@ -532,6 +681,12 @@ while IFS= read -r hit; do
       # A reference left naming nothing (`<org>/.`, `<org>/.git`) is not a
       # finding.
       [ -n "$lower" ] || continue
+      # The exact test, now that the strips have run and there is a real name to
+      # measure. Only a name that is STILL over the limit after normalization is
+      # unallowlistable.
+      if [ "${#lower}" -gt "$MAX_NAME" ]; then
+        oversize=1
+      fi
     fi
   fi
 

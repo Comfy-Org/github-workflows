@@ -15,8 +15,14 @@ repo-name part on `org-repo-allowlist.txt`. Anything else fails the run, with
 annotation. The `unapproved: ` prefix is constant and load-bearing: without it
 the line starts with the tracked path, and a tracked file named
 `::stop-commands::x.md` would emit a *workflow command* at column zero that
-suppresses every annotation after it. The annotation's `file=`/`line=` values are
-percent-escaped for the same reason.
+suppresses every annotation after it. The annotation's `file=` value is
+percent-escaped for the same reason, and `line=` is *validated* rather than
+escaped: a line number is always digits, so a non-numeric field means the
+`file:line:match` record did not parse and the run refuses it (exit `2`). The way
+that happens is a tracked path containing a newline — both scan paths print paths
+raw, so one hit arrives as two records and the leading fragment would otherwise
+be reported as a literal cut out of a filename, against a path that does not
+exist.
 
 The org segment has to **start a token**, so `Not<org>/whatever` — a different
 owner whose name happens to end in ours — is not a reference to this org and is
@@ -56,15 +62,37 @@ Scoping team slugs this way is what stops a CODEOWNERS fixture's team name from
 also clearing a literal reference to a *private repo* of the same name; the
 org-wide checker splits the two lists for the same reason.
 
-**No globs.** An entry containing `*`, `?`, `[` or `]` is a configuration error
-(exit `2`), not an allowlist line: `*`, `**`, `?*`, `[a-z]*`, `[!qz]*` and
-`secret-*` all read as ordinary edits while clearing most or all of the
-namespace. Rejecting the metacharacters is what makes that deterministic — an
-earlier revision tested entries against two fixed probe names instead, and two
-probes cannot decide breadth in general (`[!qz]*` and `[a-p]*` match neither yet
-clear nearly everything). Enumerate a test-fixture family rather than globbing
-it: a `secret-*` line would pre-approve an unbounded set of names on a list
-whose entire value is that each name was reviewed once.
+Three shapes of entry are a configuration error (exit `2`) rather than an
+allowlist line, because each reads as an ordinary edit while doing something
+other than what its author meant.
+
+**No globs.** An entry containing `*`, `?`, `[` or `]` is rejected. Note what
+this guard is today: entries are compared with *exact equality*, so a `*` entry
+already clears nothing but a literal `*` — nothing reaches the comparison as a
+pattern any more. The rejection is **defence-in-depth** against that comparison
+going back to a `case` glob, kept so a later reader "simplifying" `=` into one
+does not silently re-arm every metacharacter on the list. It is also why an
+earlier revision's approach — testing entries against two fixed probe names — was
+dropped: two probes cannot decide breadth in general (`[!qz]*` and `[a-p]*` match
+neither yet clear nearly everything). Enumerate a test-fixture family rather than
+globbing it: a `secret-*` line would pre-approve an unbounded set of names on a
+list whose entire value is that each name was reviewed once.
+
+**No `/`.** Entries are bare repo *names* — the comparison runs against the name
+alone, so an entry written `<org>/foo` can never match anything. That is exactly
+the spelling the tool invites, since a finding quotes the whole literal and the
+summary says to add it to the allowlist, so accepting it would yield an inert
+line and a rerun still insisting the name is missing from a file that visibly
+contains it. Rejected with the spelling that does work.
+
+**No name ending in `.<org>` or `-<org>`.** That is the shape of a *merged*
+literal, not a repo name: `grep -o` takes non-overlapping matches and the name
+class holds `.` and `-`, so `<org>/public.<org>/private` scans as one match whose
+name reads `public.<org>` and the second name is never examined. It fails closed
+(no merged token is on the list, so the line is always a finding), but the
+obvious way to silence so confusing a finding is to allowlist the token it
+quotes — and that would clear the private reference with the run green. Making
+the merged token unallowlistable removes the foot-gun.
 
 ## Why not `public-repo-hygiene`?
 
@@ -130,6 +158,19 @@ in the same order, except limitation 5 (*this lint is one category of
   a name published as a directory component (`docs/<org>/<name>/placeholder`) or
   as a link target is not a finding here. `public-repo-hygiene` does scan a
   symlink's target string; neither checker scans the path itself.
+- **Two adjacent literals scan as one.** `<org>/public.<org>/private` is a single
+  `grep -o` match whose name reads `public.<org>`; the second name is never
+  compared and the scan resumes past it. It fails closed — that token is on no
+  list, so the line is always a finding — and the remedy that *would* be
+  dangerous (allowlisting the quoted token) is rejected by the loader, above.
+- **The per-hit loop is linear in the hit count**, and the 200-finding print cap
+  does not bound it: past the cap a hit stops printing but is still normalized
+  and compared, because the reported count and the exit status have to stay the
+  true ones. Measured at ~5.4 ms per hit past the cap, so the caller's
+  `timeout-minutes: 10` is reached at roughly **110,000** hits in one scan.
+  Documented rather than capped — this tree's largest tracked file is under 600
+  lines, and capping the scan would trade an unreachable timeout for a truncated
+  count, the one number a red run's summary turns on.
 
 ## Running it
 
@@ -143,18 +184,34 @@ Exit `0` clean, `1` findings, `2` usage/setup error.
 
 Two bounds keep one hostile tracked line from turning the lint into an
 inconclusive run rather than a verdict. A name longer than GitHub's
-**100-character** repo-name limit is reported without being normalized (it
-cannot be a real repo, so it can never be allowlisted — the bound fails
-*closed*), because normalizing it is quadratic in its length: unbounded, a single
-line of `<org>/<name>` followed by 400 KB of periods ran for over two minutes.
+**100-character** repo-name limit *after* normalization is reported without
+being compared (it cannot be a real repo, so it can never be allowlisted — the
+bound fails *closed*). The strips run first on purpose: peeling is the only thing
+that can bring an over-long name back under the limit, and measuring first turned
+`<org>/<98-char-name>.git` into a finding whose stated remedy — the allowlist — is
+skipped for exactly that class. Their input is bounded to 8 bytes of headroom
+(`.git`, a sentence period, an ellipsis) because the peel is quadratic in the run
+it removes: unbounded, a single line of `<org>/<name>` followed by 400 KB of
+periods ran for over two minutes.
 And past **200** findings the per-hit lines stop printing — the count and the
 exit status stay the true ones — so a badly-seeded allowlist floods neither the
 public run log nor the annotation list.
 
 `--root` is resolved robustly rather than trustingly: `CDPATH`, `GIT_DIR`,
 `GIT_WORK_TREE` and `GIT_INDEX_FILE` are unset (each can silently move the scan
-off the directory the run then reports as its scope), the git/`grep -r` branch is
-chosen from `rev-parse --is-inside-work-tree`'s **output** rather than its exit
-status (it prints `false` and exits `0` for a bare repo and for a path under
-`.git`), and `git grep`'s output-shaping config (`grep.column`, `grep.fullName`,
-`color.grep`, `core.quotePath`) is pinned on the command line.
+off the directory the run then reports as its scope), and so are
+`GIT_CONFIG_COUNT`, `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` — those inject
+arbitrary config, and `core.attributesFile` pointing at one `*.md binary` line
+marks a subset of the tree binary, which `git grep -I` then silently skips. That
+one fails *open*: the scannability probe still clears, the scan reads less than
+the tree, and the OK line still claims the whole scope. (`GIT_CONFIG_KEY_n`/
+`_VALUE_n` are inert once the count is gone.)
+
+The git/`grep -r` branch is chosen from `rev-parse --is-inside-work-tree`'s
+**output** rather than its exit status (it prints `false` and exits `0` for a
+bare repo and for a path under `.git`), and `git grep`'s output-shaping config
+(`grep.column`, `grep.fullName`, `color.grep`, `core.quotePath`) is pinned on the
+command line. `grep.fullName` is pinned **`true`**, not `false`: with `false` git
+prints paths relative to the cwd, which `git -C "$root"` has set to `$root`, so
+`--root docs` would report `docs/x.md` as `x.md` and emit an annotation GitHub
+resolves against the repo root and drops.

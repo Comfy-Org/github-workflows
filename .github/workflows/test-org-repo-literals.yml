@@ -35,10 +35,12 @@ jobs:
   test:
     name: shellcheck + lint this repo
     runs-on: ubuntu-latest
-    # Matches the sibling lint-test workflows. The lint's per-hit loop forks a
-    # `printf | tr` and two command substitutions per match over an unbounded hit
-    # count, so a pathological tree should fail in minutes rather than spin to
-    # GitHub's 360-minute default.
+    # Matches the sibling lint-test workflows. The lint's per-hit loop is linear
+    # in the hit count and forks one `printf | tr` per match (the head-slice fold
+    # is now a glob), so a pathological tree should fail in minutes rather than
+    # spin to GitHub's 360-minute default. Measured at ~5.4ms per hit past the
+    # 200-finding print cap, this budget is reached at roughly 110,000 hits in a
+    # single scan — see KNOWN LIMITATIONS 11 in the script.
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -219,6 +221,59 @@ jobs:
           else
             echo 'ok (0): a literal allowlist entry still clears its name'
           fi
+
+          # An entry containing `/` is compared against the BARE name, so it can
+          # never match — and it is exactly the spelling the tool invites, since
+          # the finding quotes the whole literal and the summary says to add it
+          # to the allowlist. Accepting it would give an inert line and a rerun
+          # insisting the name is missing from a file that visibly contains it.
+          #
+          # An entry ending in `.<org>`/`-<org>` is the shape of a MERGED
+          # literal (`<org>/a.<org>/b` scans as one match, name `a.<org>`), not
+          # of a repo. Allowlisting the token a merged finding quotes would clear
+          # the second, never-examined name with the run green.
+          for entry in \
+            "$(printf '%s/%s' 'Comfy-Org' 'foo')" \
+            "$(printf '@%s/%s' 'Comfy-Org' 'foo')" \
+            "$(printf 'a/b')" \
+            "$(printf 'public-name.%s' 'Comfy-Org')" \
+            "$(printf 'public-name-%s' 'Comfy-Org')" \
+            "$(printf 'public-name.%s' 'comfy-org')" \
+          ; do
+            dir="$(mktemp -d)"
+            mkdir -p "$dir/.github/lint"
+            printf '%s  # oops\n' "$entry" > "$dir/.github/lint/org-repo-allowlist.txt"
+            printf '%s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$dir/fixture.md"
+            status=0
+            output="$(bash .github/lint/check-org-repo-literals.sh --root "$dir" 2>&1)" || status=$?
+            if [ "$status" -ne 2 ]; then
+              echo "::error::allowlist entry '$entry' exited $status — expected 2 (configuration error)"
+              printf '%s\n' "$output"
+              fail=1
+            else
+              echo "ok (2): allowlist entry '$entry' rejected"
+            fi
+          done
+
+          # The other half again: a name that merely CONTAINS the org token, or
+          # merely contains a period, is an ordinary public name and must still
+          # be honoured — `<org>.github.io` is the obvious real one. Rejecting
+          # every such name would satisfy the guard above by over-reaching.
+          for good in "$(printf '%s.github.io' 'comfy-org')" 'foo.bar' 'a-b-c'; do
+            dir="$(mktemp -d)"
+            mkdir -p "$dir/.github/lint"
+            printf '%s  # fixture\n' "$good" > "$dir/.github/lint/org-repo-allowlist.txt"
+            printf 'see %s/%s\n' 'Comfy-Org' "$good" > "$dir/fixture.md"
+            status=0
+            output="$(bash .github/lint/check-org-repo-literals.sh --root "$dir" 2>&1)" || status=$?
+            if [ "$status" -ne 0 ]; then
+              echo "::error::allowlist entry '$good' exited $status — expected 0 (a legitimate name)"
+              printf '%s\n' "$output"
+              fail=1
+            else
+              echo "ok (0): allowlist entry '$good' still clears its name"
+            fi
+          done
           exit "$fail"
 
       - name: Smoke test — a scan that could not run is not a clean tree
@@ -560,6 +615,136 @@ jobs:
             fail=1
           else
             echo 'ok (1): findings past the cap stop printing but are still counted'
+          fi
+
+          exit "$fail"
+
+      # Round 5 of the review panel. Each case below is a fix whose regression
+      # is INVISIBLE in the exit status alone, so each asserts the thing that
+      # actually moved: the verdict on a name that normalization brings back
+      # under the limit, the scope a config-injected `.gitattributes` silently
+      # shrank, and the location a subtree run reports.
+      - name: Smoke test — normalization, scope and location fixes
+        run: |
+          fail=0
+          expect() {  # expect <want-status> <label> <allowlist-entry> <fmt> <arg>...
+            local want="$1" label="$2" entry="$3" fmt="$4"; shift 4
+            local dir status=0 output
+            dir="$(mktemp -d)"
+            mkdir -p "$dir/.github/lint"
+            printf '%s  # fixture\n' "$entry" > "$dir/.github/lint/org-repo-allowlist.txt"
+            # shellcheck disable=SC2059  # $fmt is the caller-supplied format
+            printf "$fmt" "$@" > "$dir/fixture.md"
+            output="$(bash .github/lint/check-org-repo-literals.sh --root "$dir" 2>&1)" || status=$?
+            if [ "$status" -ne "$want" ]; then
+              echo "::error::$label: exited $status, expected $want"
+              printf '%s\n' "$output"
+              fail=1
+            else
+              echo "ok ($status): $label"
+            fi
+          }
+
+          # The length test runs AFTER the strips. Measuring first forced
+          # `<org>/<98-char>.git`, and a 100-character name followed by a
+          # sentence period, into the `oversize` branch — which skips BOTH
+          # allowlist comparisons, so the finding named a remedy that could not
+          # silence it. `n98`/`n100` are allowlisted; the run must be clean.
+          n98="$(printf 'a%.0s' $(seq 1 98))"
+          n100="$(printf 'b%.0s' $(seq 1 100))"
+          n120="$(printf 'c%.0s' $(seq 1 120))"
+          expect 0 'a .git suffix on a 98-character allowlisted name' "$n98" 'see %s/%s.git here\n' 'Comfy-Org' "$n98"
+          expect 0 'a sentence period after a 100-character allowlisted name' "$n100" 'see %s/%s.\n' 'Comfy-Org' "$n100"
+          expect 0 'a .git suffix on a short allowlisted name' 'foo' 'see %s/%s.git\n' 'Comfy-Org' 'foo'
+          # Both bounds still fail CLOSED: a name that is over the limit once
+          # normalized, and a period run past the 8-byte strip headroom, are
+          # reported rather than cleared. Widening the bound must not have
+          # opened a way through it.
+          expect 1 'a 120-character name is still unallowlistable' "$n98" 'see %s/%s\n' 'Comfy-Org' "$n120"
+          expect 1 'a period run past the strip headroom is still reported' "$n100" 'see %s/%s.........\n' 'Comfy-Org' "$n100"
+
+          # Two adjacent literals scan as ONE match (limitation 10). It must
+          # still be a finding — the merged token is on no list — and the
+          # loader's rejection of `.<org>`-suffixed entries (asserted above) is
+          # what stops it from being silenced by allowlisting what it quotes.
+          expect 1 'two adjacent literals are still a finding' 'foo' '%s/%s.%s/%s\n' 'Comfy-Org' 'foo' 'Comfy-Org' 'private-name'
+
+          # `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n` inject arbitrary config, and
+          # `core.attributesFile` pointing at one `*.md binary` line takes every
+          # markdown file out of `git grep -I`. This one fails OPEN: without the
+          # unset the scannability probe still clears, the scan reads less than
+          # the tree, and the run prints the clean-tree OK line for a literal it
+          # never read. Assert the VERDICT, not the location.
+          attr_dir="$(mktemp -d)"
+          git -C "$attr_dir" init -q
+          printf 'see %s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$attr_dir/fixture.md"
+          # A second, NON-markdown tracked file, so the scannability probe still
+          # finds something once `*.md` is marked binary. Without it the probe
+          # comes up empty and the run exits 2 — fail-closed by accident, which
+          # would let this assertion pass on the unfixed script for the wrong
+          # reason. With it, the unfixed script prints the clean-tree OK line
+          # and exits 0, which is the fail-OPEN this pins.
+          printf 'nothing to see\n' > "$attr_dir/other.txt"
+          git -C "$attr_dir" add fixture.md other.txt
+          printf '*.md binary\n' > "$attr_dir/attrs"
+          status=0
+          output="$(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.attributesFile \
+            GIT_CONFIG_VALUE_0="$attr_dir/attrs" \
+            bash .github/lint/check-org-repo-literals.sh --root "$attr_dir" 2>&1)" || status=$?
+          if [ "$status" -ne 1 ]; then
+            echo "::error::an injected core.attributesFile hid the tree from the scan (exited $status, expected 1)"
+            printf '%s\n' "$output"
+            fail=1
+          else
+            echo 'ok (1): GIT_CONFIG_* cannot shrink the scanned scope'
+          fi
+
+          # `grep.fullName=false` prints paths relative to the CWD, which
+          # `git -C "$root"` has set to `$root` — so a subtree run reported
+          # `docs/x.md` as `x.md` and emitted an annotation GitHub resolves
+          # against the repo root and drops. The status is 1 either way; the
+          # LOCATION is the regression.
+          sub_dir="$(mktemp -d)"
+          git -C "$sub_dir" init -q
+          mkdir -p "$sub_dir/docs" "$sub_dir/.github/lint"
+          printf 'placeholder  # fixture\n' > "$sub_dir/.github/lint/org-repo-allowlist.txt"
+          printf 'see %s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$sub_dir/docs/x.md"
+          git -C "$sub_dir" add -A
+          sub_out="$(bash .github/lint/check-org-repo-literals.sh --root "$sub_dir/docs" 2>/dev/null || true)"
+          case "$sub_out" in
+            'unapproved: docs/x.md:1: '*)
+              echo 'ok: a subtree run reports its location relative to the repo root'
+              ;;
+            *)
+              echo "::error::a subtree run reported a location the annotation cannot resolve: $sub_out"
+              fail=1
+              ;;
+          esac
+
+          # A tracked path containing a NEWLINE splits one grep record in two,
+          # and the leading fragment parsed into a file that does not exist, a
+          # `line=` holding a path, and a "literal" cut out of the filename —
+          # publishing raw `:`/`,` into the very properties `escape_property`
+          # exists to protect. A line number is always digits, so a non-numeric
+          # field is a parse failure and the run refuses it (exit 2) rather than
+          # reporting a fabrication.
+          nl_dir="$(mktemp -d)"
+          mkdir -p "$nl_dir/.github/lint"
+          printf 'placeholder  # fixture\n' > "$nl_dir/.github/lint/org-repo-allowlist.txt"
+          nl_name="$(printf 'a:bc\nd.md')"
+          printf 'see %s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$nl_dir/$nl_name"
+          status=0
+          output="$(bash .github/lint/check-org-repo-literals.sh --root "$nl_dir" 2>&1)" || status=$?
+          if [ "$status" -ne 2 ]; then
+            echo "::error::a newline in a tracked path exited $status — expected 2 (unparseable scan output)"
+            printf '%s\n' "$output"
+            fail=1
+          elif printf '%s\n' "$output" | grep -q '^unapproved: '; then
+            echo '::error::a newline in a tracked path still produced a finding line'
+            printf '%s\n' "$output"
+            fail=1
+          else
+            echo 'ok (2): an unparseable scan record is refused, not reported'
           fi
 
           exit "$fail"
