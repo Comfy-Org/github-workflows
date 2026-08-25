@@ -283,7 +283,10 @@ else
   # pipe early makes `grep` die of SIGPIPE, and under `set -o pipefail` that
   # status would read as a scan error on a perfectly good tree. Any real failure
   # still lands on empty output here, which is exit 2 either way.
-  first_scannable="$(cd -- "$root" 2>/dev/null && grep -rIl --exclude-dir=.git -e '' . 2>/dev/null | head -n 1 || true)"
+  first_scannable="$(
+    cd -- "$root" 2>/dev/null || exit 0   # unenterable: no scannable file, same verdict
+    grep -rIl --exclude-dir=.git -e '' . 2>/dev/null | head -n 1 || true
+  )"
   if [ -z "$first_scannable" ]; then
     echo "error: no readable text file under '$root' — refusing to report a clean tree" >&2
     exit 2
