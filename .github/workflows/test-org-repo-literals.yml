@@ -118,6 +118,16 @@ jobs:
           # reference that has nothing to do with us.
           expect 0 'a different owner whose name ends in this one' 'see Not%s/%s here\n' 'Comfy-Org' 'not-on-the-allowlist'
 
+          # The token boundary is NOT an owner-name boundary, and this pins the
+          # difference (limitation 8 in the script header): `-` is legal in a
+          # GitHub owner name but is not an identifier character, so the
+          # HYPHENATED sibling owner satisfies the boundary and IS read as one
+          # of ours — a known false positive, asserted so the limitation cannot
+          # drift silently. Kept rather than fixed because the boundary class is
+          # `public-repo-hygiene`'s verbatim and a name must not pass one
+          # checker and fail the other; widening it is a change to BOTH.
+          expect 1 'a hyphenated sibling owner (known false positive)' 'see Not-%s/%s here\n' 'Comfy-Org' 'not-on-the-allowlist'
+
           # The boundary character the pattern consumes may itself be a colon,
           # which puts a fourth colon on a `file:line:match` line. This pins that
           # the split still fires AND still reports the right line: the fixture
@@ -128,9 +138,35 @@ jobs:
           printf 'first line\nsee:%s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$colon_dir/fixture.md"
           colon_out="$(bash .github/lint/check-org-repo-literals.sh --root "$colon_dir" 2>/dev/null || true)"
           case "$colon_out" in
-            'fixture.md:2: '*) echo 'ok: a colon boundary still reports file:line' ;;
+            'unapproved: fixture.md:2: '*) echo 'ok: a colon boundary still reports file:line' ;;
             *)
               echo "::error::a colon boundary mis-split the location: $colon_out"
+              fail=1
+              ;;
+          esac
+
+          # A tracked PATH is untrusted input to the runner and reaches both
+          # output lines. `::stop-commands::…` at column zero is a workflow
+          # COMMAND that suppresses every `::error` annotation after it, and a
+          # `,` or `:` in a path corrupts the `file=` property so the annotation
+          # points nowhere. The constant `unapproved: ` prefix and the
+          # percent-escaping are what stop both; assert the emitted bytes.
+          hostile="$(mktemp -d)"
+          printf '%s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$hostile/::stop-commands::a,b.md"
+          hostile_out="$(bash .github/lint/check-org-repo-literals.sh --root "$hostile" 2>/dev/null || true)"
+          case "$hostile_out" in
+            '::'*)
+              echo '::error::a tracked path reached column zero as a workflow command'
+              fail=1
+              ;;
+            *) echo 'ok: a hostile tracked path cannot start the plain output line' ;;
+          esac
+          case "$hostile_out" in
+            *'::error file=%3A%3Astop-commands%3A%3Aa%2Cb.md,line=1::'*)
+              echo "ok: the annotation escapes the colon and comma in the path"
+              ;;
+            *)
+              echo "::error::the annotation did not escape the path: $hostile_out"
               fail=1
               ;;
           esac
@@ -204,26 +240,34 @@ jobs:
             echo "ok (2): a work tree with no tracked files is not reported clean"
           fi
 
-          # `chmod 000` does not stop root, so this half only means something
-          # as an unprivileged user (which is what `runs-on: ubuntu-latest`
-          # gives us). Skip rather than assert a guarantee we do not have.
+          # `chmod 000` does not stop root, so the two cases that depend on it
+          # only mean something as an unprivileged user (which is what
+          # `runs-on: ubuntu-latest` gives us). Each is skipped INDIVIDUALLY.
+          # `exit "$fail"` here instead would take the whole step with it, so a
+          # container job or a self-hosted root runner would silently skip the
+          # privilege-INDEPENDENT assertions below — the newest regression pins
+          # in this file — and still report the step green.
+          unprivileged=1
           if [ "$(id -u)" -eq 0 ]; then
-            echo "skip: running as root, chmod 000 would not block the cd"
-            exit "$fail"
+            unprivileged=0
+            echo "skip: running as root, chmod 000 blocks nothing"
           fi
-          outer="$(mktemp -d)"
-          mkdir "$outer/sub"
-          printf 'placeholder\n' > "$outer/sub/fixture.md"
-          chmod 000 "$outer/sub"
-          status=0
-          output="$(bash .github/lint/check-org-repo-literals.sh --root "$outer/sub" 2>&1)" || status=$?
-          chmod 755 "$outer/sub"
-          if [ "$status" -ne 2 ]; then
-            echo "::error::an unenterable root exited $status — expected 2"
-            printf '%s\n' "$output"
-            fail=1
-          else
-            echo "ok (2): an unenterable root is not reported clean"
+
+          if [ "$unprivileged" -eq 1 ]; then
+            outer="$(mktemp -d)"
+            mkdir "$outer/sub"
+            printf 'placeholder\n' > "$outer/sub/fixture.md"
+            chmod 000 "$outer/sub"
+            status=0
+            output="$(bash .github/lint/check-org-repo-literals.sh --root "$outer/sub" 2>&1)" || status=$?
+            chmod 755 "$outer/sub"
+            if [ "$status" -ne 2 ]; then
+              echo "::error::an unenterable root exited $status — expected 2"
+              printf '%s\n' "$output"
+              fail=1
+            else
+              echo "ok (2): an unenterable root is not reported clean"
+            fi
           fi
 
           # A root holding only blobs `-I` skips is the third way the fallback
@@ -244,20 +288,22 @@ jobs:
           # otherwise die under `set -e` with status 1 — the status that means
           # FINDINGS, making an unusable setup indistinguishable from a scan
           # that found something.
-          unreadable="$(mktemp -d)"
-          mkdir -p "$unreadable/.github/lint"
-          printf 'placeholder  # unreadable-allowlist fixture\n' > "$unreadable/.github/lint/org-repo-allowlist.txt"
-          printf 'placeholder\n' > "$unreadable/fixture.md"
-          chmod 000 "$unreadable/.github/lint/org-repo-allowlist.txt"
-          status=0
-          output="$(bash .github/lint/check-org-repo-literals.sh --root "$unreadable" 2>&1)" || status=$?
-          chmod 644 "$unreadable/.github/lint/org-repo-allowlist.txt"
-          if [ "$status" -ne 2 ]; then
-            echo "::error::an unreadable allowlist exited $status — expected 2"
-            printf '%s\n' "$output"
-            fail=1
-          else
-            echo "ok (2): an unreadable allowlist is a configuration error"
+          if [ "$unprivileged" -eq 1 ]; then
+            unreadable="$(mktemp -d)"
+            mkdir -p "$unreadable/.github/lint"
+            printf 'placeholder  # unreadable-allowlist fixture\n' > "$unreadable/.github/lint/org-repo-allowlist.txt"
+            printf 'placeholder\n' > "$unreadable/fixture.md"
+            chmod 000 "$unreadable/.github/lint/org-repo-allowlist.txt"
+            status=0
+            output="$(bash .github/lint/check-org-repo-literals.sh --root "$unreadable" 2>&1)" || status=$?
+            chmod 644 "$unreadable/.github/lint/org-repo-allowlist.txt"
+            if [ "$status" -ne 2 ]; then
+              echo "::error::an unreadable allowlist exited $status — expected 2"
+              printf '%s\n' "$output"
+              fail=1
+            else
+              echo "ok (2): an unreadable allowlist is a configuration error"
+            fi
           fi
 
           # The git path's own version of the binary-only tree. `git ls-files`
@@ -301,7 +347,7 @@ jobs:
             fail=1
           else
             case "$output" in
-              'fixture.md:1: '*)
+              'unapproved: fixture.md:1: '*)
                 echo 'ok (1): an exported CDPATH does not move the scan'
                 ;;
               *)
@@ -357,7 +403,7 @@ jobs:
           git -C "$cfg_dir" config grep.fullName true
           cfg_out="$(bash .github/lint/check-org-repo-literals.sh --root "$cfg_dir" 2>/dev/null || true)"
           case "$cfg_out" in
-            'fixture.md:2: '*) echo 'ok: a hostile grep.column/grep.fullName config does not move the location' ;;
+            'unapproved: fixture.md:2: '*) echo 'ok: a hostile grep.column/grep.fullName config does not move the location' ;;
             *)
               echo "::error::grep.* config changed the reported location: $cfg_out"
               fail=1
@@ -406,4 +452,114 @@ jobs:
           else
             echo "ok (1): a very long match is reported bounded ($longest chars)"
           fi
+
+          # The match text being bounded on OUTPUT is not the same as the loop
+          # being bounded in TIME. Every right-anchored `${var##*:}` and every
+          # `${value%?}` peel is quadratic in what it removes, and the name
+          # class is unbounded, so one tracked line of `<org>/<allowlisted>`
+          # followed by a long run of periods used to run for over two minutes
+          # and would burn this job's `timeout-minutes` — turning a lint into an
+          # inconclusive run. 400 KB completes in seconds now; 60 s is a loose
+          # bound that still catches a return to quadratic (it was 65 s for
+          # 400 KB, and the growth is quadratic, so a regression blows past it).
+          slow_dir="$(mktemp -d)"
+          {
+            printf 'see %s/%s' 'Comfy-Org' 'comfy-cli'
+            head -c 400000 /dev/zero | tr '\0' '.'
+            printf '\n'
+          } > "$slow_dir/fixture.md"
+          slow_start="$SECONDS"
+          status=0
+          bash .github/lint/check-org-repo-literals.sh --root "$slow_dir" >/dev/null 2>&1 || status=$?
+          slow_elapsed=$((SECONDS - slow_start))
+          if [ "$slow_elapsed" -gt 60 ]; then
+            echo "::error::400 KB of trailing periods took ${slow_elapsed}s — the per-hit work is quadratic again"
+            fail=1
+          else
+            echo "ok: 400 KB of trailing periods completes in ${slow_elapsed}s (exit $status)"
+          fi
+
+          # The bound fails CLOSED: a name past GitHub's 100-character limit is
+          # not a real repo under any normalization, so it is REPORTED rather
+          # than normalized down onto an allowlisted entry. This is the case
+          # above read as a verdict rather than as a stopwatch — without it the
+          # cheap way to pass the timing assertion would be to truncate first
+          # and clear the name.
+          if [ "$status" -ne 1 ]; then
+            echo "::error::an over-long name exited $status — expected 1 (reported, not normalized onto 'comfy-cli')"
+            fail=1
+          else
+            echo 'ok (1): an over-long name is reported, not normalized onto an allowlisted entry'
+          fi
+
+          # `rev-parse --is-inside-work-tree` answers on STDOUT and exits 0
+          # while printing `false` for a bare repo and for a path under `.git`.
+          # Branching on its status sent both down the `git grep` path, where
+          # git cannot run, and died with the misleading "no scannable tracked
+          # text file" instead of using the fallback that exists for them.
+          bare_dir="$(mktemp -d)"
+          git -C "$bare_dir" init -q --bare
+          status=0
+          output="$(bash .github/lint/check-org-repo-literals.sh --root "$bare_dir" 2>&1)" || status=$?
+          case "$status:$output" in
+            0:*) echo 'ok (0): a bare repo takes the grep fallback' ;;
+            *)
+              echo "::error::a bare repo exited $status — expected 0 via the fallback"
+              printf '%s\n' "$output"
+              fail=1
+              ;;
+          esac
+
+          # `GIT_DIR`/`GIT_WORK_TREE` OVERRIDE `git -C`, so with either set the
+          # probe and the scan answer about a DIFFERENT repository while the OK
+          # line still reports the scope as `--root`. Measured before the fix:
+          # a clean root scanned with GIT_DIR pointed at a dirty repo reported
+          # the dirty repo's finding. The script unsets them; this pins that a
+          # clean root stays clean.
+          clean_dir="$(mktemp -d)"
+          git -C "$clean_dir" init -q
+          printf 'nothing to see here\n' > "$clean_dir/clean.md"
+          git -C "$clean_dir" add clean.md
+          dirty_dir="$(mktemp -d)"
+          git -C "$dirty_dir" init -q
+          printf 'see %s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$dirty_dir/dirty.md"
+          git -C "$dirty_dir" add dirty.md
+          status=0
+          output="$(GIT_DIR="$dirty_dir/.git" GIT_WORK_TREE="$dirty_dir" \
+            bash .github/lint/check-org-repo-literals.sh --root "$clean_dir" 2>&1)" || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error::GIT_DIR in the environment redirected the scan (exited $status on a clean root)"
+            printf '%s\n' "$output"
+            fail=1
+          else
+            echo 'ok (0): GIT_DIR/GIT_WORK_TREE do not move the scan off --root'
+          fi
+
+          # Past MAX_REPORTED the per-finding lines stop so a badly-seeded
+          # allowlist floods neither the public run log nor the annotation list,
+          # but the COUNT and the exit status must still be the true ones — a
+          # cap that also capped the count would under-report the tree.
+          many_dir="$(mktemp -d)"
+          i=0
+          while [ "$i" -lt 250 ]; do
+            printf 'see %s/%s\n' 'Comfy-Org' "not-on-the-allowlist-$i"
+            i=$((i + 1))
+          done > "$many_dir/fixture.md"
+          status=0
+          output="$(bash .github/lint/check-org-repo-literals.sh --root "$many_dir" 2>&1)" || status=$?
+          printed="$(printf '%s\n' "$output" | grep -c '^unapproved: ' || true)"
+          if [ "$status" -ne 1 ]; then
+            echo "::error::250 findings exited $status — expected 1"
+            fail=1
+          elif [ "$printed" -ne 200 ]; then
+            echo "::error::expected 200 printed findings at the cap, got $printed"
+            fail=1
+          elif ! printf '%s\n' "$output" | grep -q '^250 unapproved '; then
+            echo "::error::the summary did not report the true total of 250"
+            printf '%s\n' "$output" | tail -8
+            fail=1
+          else
+            echo 'ok (1): findings past the cap stop printing but are still counted'
+          fi
+
           exit "$fail"

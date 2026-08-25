@@ -11,12 +11,21 @@ gate instead of something a reviewer has to remember, the same move
 
 Every org-prefixed repo literal in this repo's **tracked** tree must have its
 repo-name part on `org-repo-allowlist.txt`. Anything else fails the run, with
-`file:line:match` for each hit.
+`unapproved: file:line: match` for each hit plus a matching `::error`
+annotation. The `unapproved: ` prefix is constant and load-bearing: without it
+the line starts with the tracked path, and a tracked file named
+`::stop-commands::x.md` would emit a *workflow command* at column zero that
+suppresses every annotation after it. The annotation's `file=`/`line=` values are
+percent-escaped for the same reason.
 
 The org segment has to **start a token**, so `Not<org>/whatever` — a different
 owner whose name happens to end in ours — is not a reference to this org and is
 not reported. That is `public-repo-hygiene`'s left-boundary rule verbatim, so
-the two checkers agree on what counts as a reference.
+the two checkers agree on what counts as a reference. A token boundary is not an
+*owner-name* boundary, though: `-` is legal in a GitHub owner name and is not an
+identifier character, so the hyphenated sibling `Not-<org>/whatever` **is** read
+as one of ours. That false positive is limitation 8 below, kept rather than fixed
+so the boundary stays byte-identical to that checker's.
 
 **Allowlist, never denylist.** A denylist grep would have to commit the private
 names into this public repo in order to match them — the lint would *be* the
@@ -109,6 +118,13 @@ in the same order, except limitation 5 (*this lint is one category of
   markdown-italic spelling `_<org>/<name>_` matches nothing. The same accepted
   trade `public-repo-hygiene` makes, kept identical on purpose so a name cannot
   pass one checker and fail the other.
+- **A left boundary is not an owner-name boundary.** Only the *unhyphenated*
+  `Not<org>/x` is excluded; `Not-<org>/x`, an equally real different owner, still
+  satisfies the boundary and is reported as one of ours. This is a false
+  positive, not a miss, and it is kept rather than fixed so the boundary class
+  stays byte-identical to `public-repo-hygiene`'s `REPO_REF_RE` — a name must not
+  pass one checker and fail the other. Both spellings are pinned by the smoke
+  tests; widening the class is a change to **both** checkers.
 - **Contents only.** The pattern is applied to what a tracked file *contains*,
   never to the tracked **path** and never to a **symlink's target string** — so
   a name published as a directory component (`docs/<org>/<name>/placeholder`) or
@@ -124,3 +140,21 @@ shellcheck -x .github/lint/check-org-repo-literals.sh
 ```
 
 Exit `0` clean, `1` findings, `2` usage/setup error.
+
+Two bounds keep one hostile tracked line from turning the lint into an
+inconclusive run rather than a verdict. A name longer than GitHub's
+**100-character** repo-name limit is reported without being normalized (it
+cannot be a real repo, so it can never be allowlisted — the bound fails
+*closed*), because normalizing it is quadratic in its length: unbounded, a single
+line of `<org>/<name>` followed by 400 KB of periods ran for over two minutes.
+And past **200** findings the per-hit lines stop printing — the count and the
+exit status stay the true ones — so a badly-seeded allowlist floods neither the
+public run log nor the annotation list.
+
+`--root` is resolved robustly rather than trustingly: `CDPATH`, `GIT_DIR`,
+`GIT_WORK_TREE` and `GIT_INDEX_FILE` are unset (each can silently move the scan
+off the directory the run then reports as its scope), the git/`grep -r` branch is
+chosen from `rev-parse --is-inside-work-tree`'s **output** rather than its exit
+status (it prints `false` and exits `0` for a bare repo and for a path under
+`.git`), and `git grep`'s output-shaping config (`grep.column`, `grep.fullName`,
+`color.grep`, `core.quotePath`) is pinned on the command line.

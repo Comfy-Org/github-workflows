@@ -57,7 +57,18 @@
 #      the markdown-italic spelling `_<org>/<name>_` matches NOTHING. That is
 #      the same accepted trade `public-repo-hygiene` makes, kept identical on
 #      purpose so a name cannot pass one checker and fail the other.
-#   8. CONTENTS only. PATTERN is applied to what a tracked file CONTAINS, never
+#   8. A LEFT boundary is not an owner-name boundary. The org segment must
+#      start a token, but `-` is not an identifier character and IS legal in a
+#      GitHub owner name, so a DIFFERENT owner whose name ends in this one --
+#      `Not-${ORG}/x` -- satisfies the boundary and is read as one of this
+#      org's repos, reddening a required lint on a reference that has nothing
+#      to do with us. Only the unhyphenated `Not${ORG}/x` spelling is excluded.
+#      This is a FALSE POSITIVE, not a miss, and it is kept rather than fixed
+#      so the boundary stays byte-identical to `public-repo-hygiene`'s
+#      `REPO_REF_RE` -- a name must not pass one checker and fail the other.
+#      Both spellings are pinned by the smoke tests. Widening the class is a
+#      change to BOTH checkers, not to this one.
+#   9. CONTENTS only. PATTERN is applied to what a tracked file CONTAINS, never
 #      to the tracked PATH itself and never to a symlink's target string
 #      (neither scan path reads one: `git grep` skips the non-regular worktree
 #      entry, and `grep -r` does not follow a discovered link). A name
@@ -93,6 +104,13 @@ export LC_ALL=C
 # loop as a bogus `file:line:match` line.
 unset CDPATH
 
+# `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE` OVERRIDE `git -C`, so with any
+# of them set in the environment the probe and the scan below answer about a
+# DIFFERENT repository while the OK line still reports the scope as `$root`
+# (measured: `GIT_DIR=b/.git GIT_WORK_TREE=b git -C a grep -l -e ''` lists b's
+# files, not a's). Same class of hazard as `CDPATH`, unset in the same place.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+
 ORG='Comfy-Org'
 # Deliberately assembled rather than written whole: a literal org-prefixed name
 # anywhere in this file would be a finding against this very lint.
@@ -116,6 +134,13 @@ ORG='Comfy-Org'
 # markdown-italic spelling `_${ORG}/<name>_` is NOT read as a reference -- the
 # same accepted trade that checker makes, kept identical on purpose so a name
 # cannot pass one checker and fail the other.
+#
+# The token boundary is NOT an owner-name boundary, and the difference is
+# limitation 8: `-` is legal in a GitHub owner name but is not an identifier
+# character, so only the UNHYPHENATED `Not${ORG}/x` is excluded here --
+# `Not-${ORG}/x`, an equally real different owner, still satisfies the
+# alternation and is read as one of ours. Kept for byte-parity with that
+# checker rather than fixed here; widening the class is a change to both.
 #
 # The `@` of a team handle is that boundary character rather than part of the
 # pattern. An `@`-prefixed match is a CODEOWNERS team handle or an npm/GitHub
@@ -166,7 +191,17 @@ done
 # The allowlist is resolved against the REPO being scanned when it has one, and
 # otherwise against this script's own repo — that is what lets the smoke test
 # point --root at a bare fixture directory and still get the real allowlist.
-script_repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# `|| exit 2`: this is the one setup step that could otherwise exit 1 -- the
+# status the header documents as FINDINGS. If the `cd`/`pwd` fails (this
+# script's own directory removed or replaced under it, a stale mount,
+# `BASH_SOURCE[0]` resolving somewhere unenterable) the substitution returns
+# non-zero, the assignment fails, and `set -e` would exit 1 with only bash's
+# `cd:` message and no finding lines -- the same hole the `-r` guard below
+# closes, on a line that runs ahead of every `-d`/`-f`/`-r` check.
+script_repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" || {
+  echo "error: cannot resolve this script's repo root from '${BASH_SOURCE[0]}'" >&2
+  exit 2
+}
 if [ -f "$root/$allowlist_rel" ]; then
   allowlist="$root/$allowlist_rel"
 elif [ -f "$script_repo_root/$allowlist_rel" ]; then
@@ -248,7 +283,12 @@ fi
 # which is the path the smoke test's fixture directory takes.
 hits=''
 scan_status=0
-if git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+# The OUTPUT is tested, not the exit status: `rev-parse --is-inside-work-tree`
+# answers on stdout and exits 0 while printing `false` for a bare repo and for a
+# path under `.git`. On the status test those roots took the git branch, where
+# `git grep` cannot run, and died with the misleading `no scannable tracked text
+# file` instead of using the fallback that exists for exactly them.
+if [ "$(git -C "$root" rev-parse --is-inside-work-tree 2>/dev/null)" = true ]; then
   # `--is-inside-work-tree` is true for any directory NESTED under a work tree,
   # not just its root, and the `.` pathspec resolves relative to `$root`. So a
   # `--root` below the top scans only that subtree — and if the subtree holds no
@@ -352,6 +392,12 @@ fi
 # slug's last character, so stripping them would WIDEN the match — a literal for
 # a private repo named `<allowlisted>-` or `<allowlisted>_` would normalize onto
 # the allowlisted entry and clear this default-deny check.
+#
+# The peel is quadratic in the length of the run, so it is only safe because
+# MAX_NAME below bounds its input first. There is no cheap pure-bash
+# alternative: `${value%%"${value##*[!.]}"}`, the obvious two-expansion
+# rewrite, is quadratic in bash as well (measured: on a 200 KB run of periods
+# both forms run past two minutes).
 trim_trailing_dots() {
   local value="$1"
   while [ -n "$value" ]; do
@@ -363,14 +409,52 @@ trim_trailing_dots() {
   printf '%s' "$value"
 }
 
+# GitHub workflow-command escaping. A tracked PATH is untrusted input to the
+# runner -- it reaches both output lines below -- and `,`/`:` in it would
+# otherwise corrupt the `file=`/`line=` properties so the annotation points
+# nowhere, while `%`/CR would corrupt the message. `%` must be replaced FIRST or
+# it re-escapes the escapes.
+escape_data() {
+  local value="$1"
+  value="${value//'%'/%25}"
+  value="${value//$'\r'/%0D}"
+  value="${value//$'\n'/%0A}"
+  printf '%s' "$value"
+}
+escape_property() {
+  local value
+  value="$(escape_data "$1")"
+  value="${value//':'/%3A}"
+  value="${value//','/%2C}"
+  printf '%s' "$value"
+}
+
+# A tracked tree can hold an unbounded number of unapproved literals, and every
+# one of them prints twice. Past this many the count keeps rising (the summary
+# below still reports the true total, and the exit status is still 1) but the
+# per-finding lines stop, so a badly-seeded allowlist floods neither the public
+# run log nor the annotation list. `public-repo-hygiene` caps the same two ways
+# (`MAX_FINDINGS_PER_FILE`/`MAX_FINDINGS_TOTAL`).
+MAX_REPORTED=200
+
+# GitHub's own repo-name limit; see the cap in the loop below.
+MAX_NAME=100
+
 findings=0
 while IFS= read -r hit; do
   [ -n "$hit" ] || continue
   # `file:line:match` — the line number holds no colon, so both come off the
   # RIGHT. Cutting the file off the LEFT instead would mangle any path that
   # contains a colon.
-  match="${hit##*:}"
+  #
+  # `${hit%:*}` and then an OFFSET, rather than the equivalent `${hit##*:}`:
+  # `##` re-matches `*:` against a progressively shorter prefix, so it is
+  # QUADRATIC in the length of the match text it removes, and the name class is
+  # unbounded. Measured on one tracked line of `${ORG}/foo` + 400 KB of name
+  # characters: 62 seconds here, against 65 for the whole run. `%` and
+  # `${var:offset}` are both linear, and split at exactly the same colon.
   where="${hit%:*}"
+  match="${hit:$((${#where} + 1))}"
   # The boundary character PATTERN consumes may ITSELF be a colon: `uses:`,
   # `repository:` and prose like `see:${ORG}/x` are all real spellings, and each
   # puts a fourth colon on the line, shifting the right-anchored split by one
@@ -384,40 +468,80 @@ while IFS= read -r hit; do
   file="${file#./}"
   lineno="${where##*:}"
 
+  # COST bound, applied before anything copies, folds or forks on the match
+  # text. A match longer than `boundary + org + '/' + MAX_NAME` cannot spell a
+  # name of MAX_NAME characters or fewer whatever the boundary character is, so
+  # the exact `${#name}` test below would reach the same verdict; this only
+  # skips the work of getting there. Deliberately coarse — the exact rule stays
+  # in one place.
   # `grep -E` has no lookbehind, so a match that did not start at column 0
   # carries the boundary character in front of the literal. Drop it -- and read
   # the team/scope namespace off it first, because an `@` in that position is
   # the `@` of a CODEOWNERS handle or a package scope, which may additionally
   # draw on the team entries. The `@` stays on `$match` so the finding quotes
   # the literal as written and "add it to the allowlist" stays a copy-paste.
-  lower="$(printf '%s' "$match" | tr '[:upper:]' '[:lower:]')"
+  #
+  # Decided from a BOUNDED head slice (`@` + org + `/` is all it takes), not
+  # from the whole match folded to lower case: the match text is unbounded, and
+  # this runs on every hit including the oversize ones the block below skips.
+  head_lc="$(printf '%s' "${match:0:$((${#ORG} + 2))}" | tr '[:upper:]' '[:lower:]')"
   is_at=0
-  case "$lower" in
-    "$org_lc"/*) ;;                       # column 0 — no boundary was consumed
+  case "$head_lc" in
+    "$org_lc"/*) ;;                     # column 0 — no boundary was consumed
     *)
-      case "$lower" in
+      case "$head_lc" in
         "@$org_lc"/*) is_at=1 ;;
         *) match="${match#?}" ;;
       esac
-      lower="${lower#?}"
       ;;
   esac
-  name="${lower#*/}"
 
-  lower="$(trim_trailing_dots "$name")"
+  # COST bound, applied before anything folds or forks on the WHOLE match text.
+  # A match longer than `org + '/' + MAX_NAME` (plus the `@` a scope keeps)
+  # cannot spell a name of MAX_NAME characters or fewer, so the exact
+  # `${#name}` test below would reach the same verdict; this only skips the work
+  # of getting there. Deliberately coarse — the exact rule stays in one place.
+  lower=''
+  oversize=0
+  if [ "${#match}" -gt "$((MAX_NAME + ${#ORG} + 2))" ]; then
+    oversize=1
+  fi
 
-  lower="${lower%.git}"
-  lower="$(trim_trailing_dots "$lower")"
-  # A reference left naming nothing (`<org>/.`, `<org>/.git`) is not a finding.
-  [ -n "$lower" ] || continue
+  if [ "$oversize" -eq 0 ]; then
+    lower="$(printf '%s' "$match" | tr '[:upper:]' '[:lower:]')"
+    name="${lower#*/}"
+
+    # A GitHub repo slug is at most MAX_NAME characters, so anything longer is
+    # not a reference to a real repository under ANY normalization and
+    # therefore cannot be on the allowlist — it is reported without being
+    # normalized at all. This is also what bounds `trim_trailing_dots`, whose
+    # `${value%?}` peel is quadratic in the run it removes: unbounded, one
+    # tracked line of `${ORG}/foo` followed by a long run of periods ran for
+    # over two minutes, which would burn the caller's whole `timeout-minutes`
+    # and turn a would-be finding into an inconclusive run. It fails CLOSED —
+    # an over-long name is always reported, never cleared — so the bound cannot
+    # let a name through. For scale: the longest literal really in this tree is
+    # 29 characters.
+    if [ "${#name}" -gt "$MAX_NAME" ]; then
+      oversize=1
+    else
+      lower="$(trim_trailing_dots "$name")"
+
+      lower="${lower%.git}"
+      lower="$(trim_trailing_dots "$lower")"
+      # A reference left naming nothing (`<org>/.`, `<org>/.git`) is not a
+      # finding.
+      [ -n "$lower" ] || continue
+    fi
+  fi
 
   allowed=0
-  if [ "$entry_count" -gt 0 ]; then
+  if [ "$oversize" -eq 0 ] && [ "$entry_count" -gt 0 ]; then
     for known in "${entries[@]}"; do
       if [ "$lower" = "$known" ]; then allowed=1; break; fi
     done
   fi
-  if [ "$allowed" -eq 0 ] && [ "$is_at" -eq 1 ] && [ "$team_entry_count" -gt 0 ]; then
+  if [ "$allowed" -eq 0 ] && [ "$oversize" -eq 0 ] && [ "$is_at" -eq 1 ] && [ "$team_entry_count" -gt 0 ]; then
     for known in "${team_entries[@]}"; do
       if [ "$lower" = "$known" ]; then allowed=1; break; fi
     done
@@ -432,14 +556,30 @@ while IFS= read -r hit; do
     # same token for the same reason (`_bounded`, 200 chars); the cut is
     # display-only, so what is compared against the allowlist is still the whole
     # name and a truncated finding can never be a cleared one.
-    shown="$match"
-    if [ "${#shown}" -gt 200 ]; then
-      shown="${shown:0:200}... (truncated)"
+    if [ "$findings" -le "$MAX_REPORTED" ]; then
+      shown="$match"
+      if [ "${#shown}" -gt 200 ]; then
+        shown="${shown:0:200}... (truncated)"
+      fi
+      # `unapproved:` is a CONSTANT prefix, and it is load-bearing: without it
+      # this line starts with the tracked path, so a tracked file named
+      # `::stop-commands::x.md` would emit a workflow COMMAND at column zero
+      # that suppresses every `::error` annotation after it. A path cannot
+      # reach column zero here.
+      if [ "$oversize" -eq 1 ]; then
+        why="is longer than GitHub's ${MAX_NAME}-character repo-name limit, so it cannot be allowlisted"
+      else
+        why="is not on $allowlist_rel"
+      fi
+      echo "unapproved: $file:$lineno: $shown $why"
+      echo "::error file=$(escape_property "$file"),line=$lineno::unapproved ${ORG} repo literal: $(escape_data "$shown") $(escape_data "$why")"
     fi
-    echo "$file:$lineno: $shown is not on $allowlist_rel"
-    echo "::error file=$file,line=$lineno::unapproved ${ORG} repo literal: $shown"
   fi
 done <<< "$hits"
+
+if [ "$findings" -gt "$MAX_REPORTED" ]; then
+  echo "note: $((findings - MAX_REPORTED)) further finding(s) were counted but not printed (cap: $MAX_REPORTED)." >&2
+fi
 
 if [ "$findings" -gt 0 ]; then
   cat >&2 <<MSG

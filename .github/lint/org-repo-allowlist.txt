@@ -32,7 +32,11 @@
 # carries that checker's own fake-private test fixtures.
 #
 # This file is scanned like every other tracked file — the comments above and
-# below are NOT exempt, so a rationale that quotes a private name is a finding.
+# below are NOT exempt, so a rationale that quotes ANOTHER, unlisted name is a
+# finding. The one place the scan structurally cannot look is an entry's own
+# line, because the entry clears it: state the DECISION there ("published by
+# decision — see <doc>"), never a confidentiality attribute of the name, since
+# "X is private" is itself the private detail AGENTS.md keeps out of this tree.
 
 # ── Real repos in this org, verified public ──
 github-workflows            # this repo, public
@@ -44,7 +48,7 @@ comfyui                     # public (org-wide list: ComfyUI)
 comfyui_frontend            # public (org-wide list: ComfyUI_frontend)
 
 # ── Documented exceptions ──
-unreviewed-merges           # private, but deliberately published in README/docs as the SOC-2 tracker destination — human-ratified exception
+unreviewed-merges           # published by decision as the SOC-2 tracker destination — see README and docs/callers/detect-unreviewed-merge.md
 
 # ── CODEOWNERS team handles / package scopes (`@`-prefixed literals only) ──
 # Team handles are inherently public on a public repo: GitHub renders CODEOWNERS
