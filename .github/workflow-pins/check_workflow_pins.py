@@ -2629,6 +2629,20 @@ def ref_checkouts(lines, dropped=None):
                         guarded_fallback = True
                     else:
                         guarded_input = True
+                # Registration (above) and site-recording answer different
+                # questions about this line. A step written as ONE flow
+                # mapping can bind `WORKFLOWS_REF` in its `env:` AND read a
+                # step output in its `with: {ref: …}`; the binding arm is
+                # not terminal for the second question, or the checkout is
+                # never judged at all — no verdict, no drop, no notice
+                # (BE-9098). The block `env:` binding can never share a
+                # line with `ref:` (`_GUARD_BINDING_RE` is line-anchored),
+                # so only the flow spelling reaches here with a site.
+                resolved = _steps_output_sites(line)
+                if resolved is not None:
+                    _record_steps_output(
+                        found, lines, i, resolved, resolvers, step_ids, drop
+                    )
             elif ref_use:
                 fallback = _pins_to_job_workflow_sha(line)
                 guarded = guarded_input or (fallback and guarded_fallback)

@@ -99,6 +99,12 @@ consumer out of coverage rather than raising a different error:
   and a resolver declared below its consumer cannot have run first, so neither
   is credited — the same rule the guard steps already follow.
 
+A step written as ONE flow mapping that both binds `WORKFLOWS_REF` in its `env:`
+and reads a step output in its `with: {ref: … }` is judged like any other
+step-output checkout (BE-9098) — the binding on that line is not what the line
+gets judged as, so the `ref:` still earns its own verdict instead of slipping
+through unjudged.
+
 **A `ref:` naming a nonexistent or later step is an ERROR in its own right
 (BE-8215).** A step-output `ref:` whose `<id>` matches no step declared before
 the consuming one — a typo'd id, a step in another job, a resolver declared
