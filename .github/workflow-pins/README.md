@@ -103,7 +103,21 @@ A step written as ONE flow mapping that both binds `WORKFLOWS_REF` in its `env:`
 and reads a step output in its `with: {ref: … }` is judged like any other
 step-output checkout (BE-9098) — the binding on that line is not what the line
 gets judged as, so the `ref:` still earns its own verdict instead of slipping
-through unjudged.
+through unjudged. **Coverage still comes only from the step's own `if:` KEY.**
+An `if:` written inside the flow mapping is not read, so such a step is always
+reported unguarded even when it is in fact guarded at runtime; the remedy is one
+line — promote the `if:` to its own key and leave `env:`/`with:` as flow maps:
+
+```yaml
+- if: steps.resolve_ref.outputs.ref != ''
+  uses: actions/checkout@<sha>  # v5
+  env: {WORKFLOWS_REF: "${{ inputs.workflows_ref }}"}
+  with: {ref: "${{ steps.resolve_ref.outputs.ref }}"}
+```
+
+The RESOLVER may equally be written as one flow mapping (`- {id: resolve_ref,
+env: {WORKFLOWS_REF: …}, run: …}`): its `id:` is registered from that spelling
+too (BE-9099), so its consumer is judged rather than silently dropped.
 
 **A `ref:` naming a nonexistent or later step is an ERROR in its own right
 (BE-8215).** A step-output `ref:` whose `<id>` matches no step declared before

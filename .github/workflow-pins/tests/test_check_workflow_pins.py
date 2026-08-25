@@ -1983,10 +1983,16 @@ class GuardCoverageTests(unittest.TestCase):
 
     def test_a_self_referencing_flow_step_is_dangling(self):
         # The step's own `id:` is the referenced one, but during its `with:`
-        # evaluation that output does not exist yet — and registration cannot
-        # rescue it either, because `_record_steps_output` compares the
-        # declaring line against the CONSUMING step's first line, and a step's
-        # own id never precedes itself.
+        # evaluation that output does not exist yet, so the expression is ''
+        # at runtime and checkout takes the DEFAULT BRANCH.
+        #
+        # What holds the verdict is ORDER, not the reach of `_binding_step_id`
+        # (BE-9099): the site is recorded BEFORE this line registers its own
+        # id, so it is judged on `step_ids`, whose arm compares the declaring
+        # line against the CONSUMING step's first line — and a step's own id
+        # never precedes itself. The `resolvers` arm has no such ordering
+        # check, so registering first would route this down it and judge the
+        # step on an `if:` instead.
         steps = (self.FLOW_BINDING_AND_REF % "resolve_ref").replace(
             "{uses: actions/checkout@abc,", "{id: resolve_ref, uses: actions/checkout@abc,"
         )
@@ -1994,6 +2000,79 @@ class GuardCoverageTests(unittest.TestCase):
         self.assertEqual(
             [(fb, guarded, via) for _, fb, guarded, via in cwp.ref_checkouts(lines)],
             [(False, False, "dangling")],
+        )
+
+    def test_a_flow_form_resolver_registers_and_its_consumer_is_judged(self):
+        # The RESOLVER side of the same hole (BE-9099). `_GUARD_BINDING_FLOW_RE`
+        # already read this binding, but the block `id:` pattern cannot match a
+        # line opening `{`, so the step registered no id — and an unregistered
+        # resolver fails SILENTLY: the consumer's `ref:` reads as "a real
+        # earlier step this lint has no claim on" and is dropped with no
+        # verdict, switching the BE-8130/BE-8221 requirement off for it.
+        resolver = (
+            '      - {id: r, env: {WORKFLOWS_REF: "${{ inputs.workflows_ref }}"},'
+            ' run: echo "ref=x" >> "$GITHUB_OUTPUT"}\n'
+        )
+        consumer = (
+            "      - uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ steps.r.outputs.ref }}\n"
+        )
+        lines = self._wrap(resolver + consumer).split("\n")
+        lineno = next(i for i, row in enumerate(lines, 1) if "steps.r.outputs" in row)
+        # Judged, and judged UNGUARDED — the consumer carries no `if:`. The
+        # block-form resolver has always earned exactly this verdict.
+        self.assertEqual(cwp.ref_checkouts(lines), [(lineno, False, False, True)])
+        # ...and the one accepted remedy clears it, so the flow spelling is not
+        # a shape that simply cannot pass.
+        covered = "      - if: steps.r.outputs.ref != ''\n" + consumer.replace(
+            "      - uses:", "        uses:"
+        )
+        self.assertEqual(
+            cwp.unguarded_ref_checkouts(self._wrap(resolver + covered).split("\n")), []
+        )
+
+    def test_a_flow_resolver_spanning_two_lines_registers_its_real_id(self):
+        # The same BE-9099 drop, one spelling over: a flow mapping broken
+        # across physical lines leaves the `}` on `_STEP_ID_RE`'s `\S+`, so
+        # `_binding_step_id` registered `r}` while the pre-scan read `r`. An
+        # id no consumer can name registers nothing usable, and the consumer
+        # is dropped with no verdict — silently, exactly as an unregistered
+        # resolver is. Both readers now narrow through `_step_id_value`.
+        resolver = (
+            '      - {env: {WORKFLOWS_REF: "${{ inputs.workflows_ref }}"},\n'
+            "        id: r}\n"
+        )
+        consumer = (
+            "      - uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ steps.r.outputs.ref }}\n"
+        )
+        lines = self._wrap(resolver + consumer).split("\n")
+        lineno = next(i for i, row in enumerate(lines, 1) if "steps.r.outputs" in row)
+        self.assertEqual(cwp.ref_checkouts(lines), [(lineno, False, False, True)])
+
+    def test_a_flow_with_id_input_does_not_register_a_phantom_resolver(self):
+        # The over-collection hazard the BE-9099 widening had to dodge: read on
+        # a BLOCK key line the flow `id:` pattern also matches `with: {id: x}`,
+        # where `id` is an action INPUT and no step is declared at all. That
+        # would register a phantom resolver and judge its "consumer" on an
+        # `if:` — a false failure — instead of the dangling verdict the absent
+        # step earns. Gated to lines where a flow mapping actually OPENS.
+        steps = (
+            "      - name: Not a resolver\n"
+            "        uses: org/act@abc\n"
+            "        env:\n"
+            "          WORKFLOWS_REF: ${{ inputs.workflows_ref }}\n"
+            "        with: {id: phantom}\n"
+            "      - uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ steps.phantom.outputs.ref }}\n"
+        )
+        lines = self._wrap(steps).split("\n")
+        lineno = next(i for i, row in enumerate(lines, 1) if "steps.phantom" in row)
+        self.assertEqual(
+            cwp.ref_checkouts(lines), [(lineno, False, False, "dangling")]
         )
 
     # ------------------------------------------------------------------

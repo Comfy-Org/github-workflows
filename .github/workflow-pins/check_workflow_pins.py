@@ -1811,6 +1811,24 @@ def _binding_step_id(lines, idx):
     — or to the next step down — is never attributed to this one. A step with no
     id produces no output anything can consume, so None simply means no checkout
     can resolve from here.
+
+    The whole-step FLOW spelling is read too (BE-9099). `_GUARD_BINDING_FLOW_RE`
+    already recognizes `- {id: r, env: {WORKFLOWS_REF: ${{ inputs.workflows_ref
+    }}}, run: …}` as a binding, but the block `id:` pattern cannot match a line
+    opening `{`, so the step registered no id — and an unregistered resolver is
+    not a loud failure, it is a SILENT one: `_record_steps_output` reads a later
+    `ref: ${{ steps.r.outputs.ref }}` as "a real earlier step this lint has no
+    claim on" and drops it with no verdict at all. Spelling the resolver
+    flow-style therefore switched the BE-8130/BE-8221 requirement off for its
+    consumer — the same fail-open this reader's consumer-side twin closes.
+
+    Gated exactly as `_job_step_ids` gates its own flow reading: ONLY where a
+    flow mapping actually OPENS, on a key-column line whose content begins `{`.
+    Applied to a block key line the flow pattern also matches `with: {id: x}`,
+    where `id` is an action INPUT and no step is declared at all — the phantom
+    step that would register a non-resolver and demand an `if:` of a consumer
+    this lint has no claim on. Ids are read through the same `_collect_flow_step_ids`
+    quote-mask scan, so a `,` inside a quoted scalar cannot smuggle one in.
     """
     bounds = _step_bounds(lines, idx)
     if bounds is None:
@@ -1826,9 +1844,28 @@ def _binding_step_id(lines, idx):
             line = _unmarked(line, key_indent)
         if _indent(line) != key_indent:
             continue
+        text = _strip_comment(line)
+        if _after_node_properties(text.lstrip()).startswith("{"):
+            # The step written as one flow mapping — on the marker line
+            # (`- {id: r, …}`) or on the first member line of a bare `-`.
+            flow_ids = {}
+            _collect_flow_step_ids(flow_ids, text, j)
+            for value in flow_ids:
+                return value
+            continue
         match = _STEP_ID_RE.match(line)
         if match:
-            return match.group(2).strip("'\"")
+            # Read through the same narrowing `_job_step_ids` applies, so the
+            # two readers cannot disagree about WHICH id a step declares. They
+            # did: `_STEP_ID_RE`'s `\S+` keeps the `}` a flow CONTINUATION line
+            # leaves on it (`- {env: {…},` / `id: r}` → `r}`), while the
+            # pre-scan reads `r` — and a resolver registered under an id no
+            # consumer can name is not a loud failure but the same SILENT drop
+            # BE-9099 closes one spelling over. `_step_id_value` only ever
+            # narrows, so it cannot manufacture a registration either.
+            value = _step_id_value(match.group(2))
+            if value is not None:
+                return value
     return None
 
 
@@ -2604,6 +2641,32 @@ def ref_checkouts(lines, dropped=None):
                 # guard check meant deleting every one of groom.yml's seven
                 # guard steps kept this lint green.
                 guard = is_guard_step(lines, i)
+                # Site-recording runs BEFORE registration, because the two
+                # answer different questions about this ONE physical line: a
+                # step written as a single flow mapping can bind
+                # `WORKFLOWS_REF` in its `env:` AND read a step output in its
+                # `with: {ref: …}`, and the binding arm is not terminal for
+                # the second question, or the checkout is never judged at all
+                # — no verdict, no drop, no notice (BE-9098). The block `env:`
+                # binding can never share a line with `ref:`
+                # (`_GUARD_BINDING_RE` is line-anchored), so only the flow
+                # spelling reaches here with a site.
+                #
+                # Recording FIRST is what keeps a SELF-referencing flow step
+                # dangling. `_record_steps_output`'s `resolvers` arm carries
+                # no `declared < consumer_start` ordering check of its own —
+                # only the `step_ids` arm does — so registering this step
+                # first would route its own `ref: ${{ steps.<self>.outputs.…
+                # }}` down the resolver arm and judge it on an `if:`, when
+                # during its OWN `with:` evaluation that output does not exist
+                # yet and the expression is '' at runtime. Order, not the
+                # narrowness of `_binding_step_id`, is what makes that verdict
+                # right — so it survives the reader widening below.
+                resolved = _steps_output_sites(line)
+                if resolved is not None:
+                    _record_steps_output(
+                        found, lines, i, resolved, resolvers, step_ids, drop
+                    )
                 # A step that RESOLVES the ref for a later checkout to consume
                 # is registered here, whether or not it guards. Registration
                 # only marks the step as a resolver of the input — coverage
@@ -2629,20 +2692,6 @@ def ref_checkouts(lines, dropped=None):
                         guarded_fallback = True
                     else:
                         guarded_input = True
-                # Registration (above) and site-recording answer different
-                # questions about this line. A step written as ONE flow
-                # mapping can bind `WORKFLOWS_REF` in its `env:` AND read a
-                # step output in its `with: {ref: …}`; the binding arm is
-                # not terminal for the second question, or the checkout is
-                # never judged at all — no verdict, no drop, no notice
-                # (BE-9098). The block `env:` binding can never share a
-                # line with `ref:` (`_GUARD_BINDING_RE` is line-anchored),
-                # so only the flow spelling reaches here with a site.
-                resolved = _steps_output_sites(line)
-                if resolved is not None:
-                    _record_steps_output(
-                        found, lines, i, resolved, resolvers, step_ids, drop
-                    )
             elif ref_use:
                 fallback = _pins_to_job_workflow_sha(line)
                 guarded = guarded_input or (fallback and guarded_fallback)
@@ -3009,7 +3058,11 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
                     "`actions/checkout` as '', which it reads as the default "
                     "branch. Add the exact non-empty `if:` to this step (the "
                     "never-fail idiom, see .github/workflow-pins/README.md). "
-                    "See BE-8130." % (ann_path, lineno, ann_name, INPUT_NAME)
+                    "An `if:` riding INSIDE a flow mapping "
+                    "(`- {if: …, with: {ref: …}}`) is not read as coverage — "
+                    "promote it to the step's own `if:` key, leaving `env:` "
+                    "and `with:` as flow maps. See BE-8130."
+                    % (ann_path, lineno, ann_name, INPUT_NAME)
                 )
                 continue
             # `uses_fallback` comes from the line the parser MATCHED, which for a
