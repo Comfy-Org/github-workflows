@@ -146,17 +146,31 @@ def is_read_only_token_error(result: subprocess.CompletedProcess) -> bool:
     return "Resource not accessible by integration" in blob or "HTTP 403" in blob
 
 
-def write_step_summary(markdown: str) -> None:
-    """Render the review into the Actions run summary as a no-write fallback.
+READ_ONLY_SUMMARY_NOTE = (
+    "> ℹ️ This review could not be posted on the PR because the run's "
+    "`GITHUB_TOKEN` is read-only (e.g. read-only default workflow "
+    "permissions). Posting it here instead.\n\n"
+)
 
-    Used when the PR can't be written to (read-only token): the content is
-    still delivered — in the run's Summary tab — instead of being lost.
+POST_FAILED_SUMMARY_NOTE = (
+    "> ⚠️ This review could not be posted on the PR (the API rejected the "
+    "request). Posting it here instead — see the run log for the error.\n\n"
+)
+
+TRUNCATED_SUMMARY_NOTE = (
+    "> ℹ️ The review posted on the PR was truncated at GitHub's body-size "
+    "limit. The full text is below.\n\n"
+)
+
+
+def write_step_summary(markdown: str, note: str = READ_ONLY_SUMMARY_NOTE) -> None:
+    """Render the review into the Actions run summary when the PR copy is lossy.
+
+    The banner says which degradation happened: nothing could be posted (read-only
+    token, or the API rejected the request), or the post SUCCEEDED but had to be
+    clamped — `clamp_review_body`'s note promises the full text is here, and this is
+    what makes that promise true.
     """
-    note = (
-        "> ℹ️ This review could not be posted on the PR because the run's "
-        "`GITHUB_TOKEN` is read-only (e.g. read-only default workflow "
-        "permissions). Posting it here instead.\n\n"
-    )
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not path:
         # No summary file (e.g. a local run) — fall back to stdout so the
@@ -167,16 +181,27 @@ def write_step_summary(markdown: str) -> None:
         f.write(note + markdown + "\n")
 
 
-def post_or_degrade(repo, pr_number, payload, summary_markdown, context) -> bool:
+def post_or_degrade(repo, pr_number, payload, summary_markdown, context, truncated=False) -> bool:
     """POST a review; degrade to the step summary on a read-only token.
 
     Returns True when the review was delivered — either posted on the PR, or
     (when the token is read-only) written to the job step summary. Returns
     False only on a genuine POST failure the caller should handle itself
     (e.g. retry without inline anchors).
+
+    `truncated` says the posted body was clamped, so the whole of it goes to the
+    summary even on success — otherwise the clamp note points at a summary that
+    was never written.
     """
     result = gh_post_review(repo, pr_number, payload)
     if result.returncode == 0:
+        if truncated:
+            print(
+                f"{context}: body hit GitHub's size limit — full text written to "
+                "the job summary.",
+                file=sys.stderr,
+            )
+            write_step_summary(summary_markdown, note=TRUNCATED_SUMMARY_NOTE)
         return True
     if is_read_only_token_error(result):
         print(
@@ -196,20 +221,53 @@ def post_or_degrade(repo, pr_number, payload, summary_markdown, context) -> bool
 HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
+# git's C-style escapes, minus the octal ones handled separately below.
+C_ESCAPES = {
+    "a": 0x07, "b": 0x08, "f": 0x0C, "n": 0x0A,
+    "r": 0x0D, "t": 0x09, "v": 0x0B, "\\": 0x5C, '"': 0x22,
+}
+
+
 def unquote_header_path(target: str):
     """Undo git's C-style quoting of a header path, or return None if it won't decode.
 
     `core.quotePath` defaults to ON, so any path with a non-ASCII byte, a `"`, a `\\`
     or a control character arrives as `+++ "b/caf\\303\\251.py"`. Used raw, the quotes
     ride along into the key and no finding in that file can ever anchor.
+
+    Only the BACKSLASH escapes are resolved; every other character is taken verbatim.
+    That covers both quoting modes: with `quotePath` off git still quotes a name
+    containing `"`, `\\` or a control character but leaves its UTF-8 bytes alone, so a
+    blanket latin-1 round-trip would mangle a real `é` into U+FFFD (or raise on an
+    astral character) and silently strand every finding in that file.
     """
-    try:
-        # The escapes are octal/C byte escapes: resolve them to code points, then read
-        # those code points back as the bytes they stand for and decode as UTF-8.
-        raw = target[1:-1].encode("latin-1").decode("unicode_escape").encode("latin-1")
-    except (UnicodeDecodeError, UnicodeEncodeError):
-        return None
-    return raw.decode("utf-8", "replace")
+    body = target[1:-1]
+    out = bytearray()
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch != "\\":
+            out += ch.encode("utf-8")
+            i += 1
+            continue
+        i += 1
+        if i >= len(body):
+            return None  # trailing backslash: not quoting git wrote
+        esc = body[i]
+        if esc in C_ESCAPES:
+            out.append(C_ESCAPES[esc])
+            i += 1
+            continue
+        digits = body[i : i + 3]
+        if len(digits) == 3 and all(d in "01234567" for d in digits):
+            value = int(digits, 8)
+            if value > 0xFF:
+                return None  # \400+ is not a byte git emits
+            out.append(value)
+            i += 3
+            continue
+        return None  # an escape git does not emit — do not guess at the path
+    return out.decode("utf-8", "replace")
 
 
 def header_new_path(raw: str):
@@ -348,9 +406,14 @@ def anchorable_lines(diff_text: str):
             m = HUNK_HEADER_RE.match(raw)
             if not m:
                 # An unparseable hunk header means the following lines cannot be
-                # numbered. Drop the file rather than number them from a guess.
+                # numbered. Drop the file rather than number them from a guess — and
+                # desync, because without the hunk's counts the scan no longer knows
+                # where its CONTENT ends: a `-- x` / `++ b/evil.py` pair inside that
+                # content would otherwise be read as a file header and number the rest
+                # under a spoofed path. A `diff --git` line resynchronizes.
                 path = None
                 right = 0
+                desynced = True
                 continue
             right = int(m.group(3))
             pending_old = int(m.group(2)) if m.group(2) is not None else 1
@@ -391,7 +454,12 @@ def load_anchors(diff_path):
     if not diff_path:
         return None
     try:
-        with open(diff_path, encoding="utf-8", errors="replace") as f:
+        # newline="" so universal-newline mode does NOT rewrite a lone \r (or a \r\n)
+        # to \n before the parser sees it: a content line carrying a bare CR — mixed
+        # line endings, a minified asset — would otherwise be split in two, desyncing
+        # the hunk budget or shifting every later anchor in that file. The parser owns
+        # the splitting, and header_new_path's rstrip("\r") handles the CRLF case.
+        with open(diff_path, encoding="utf-8", errors="replace", newline="") as f:
             text = f.read()
     except OSError as e:
         print(f"Anchors: cannot read diff {diff_path} ({e}) — sending all findings inline.", file=sys.stderr)
@@ -446,6 +514,21 @@ def render_code_ref(path, line) -> str:
     return f"{fence}{pad}{text}{pad}{fence}"
 
 
+def render_finding_entry(c: dict) -> str:
+    """One finding, as a blockquote its own markdown cannot break out of.
+
+    `c["body"]` is model output derived from PR content and only passes through
+    neutralize_mentions, which touches mentions and nothing structural. Interpolated
+    flat, it could open a heading, a rule, a forged `**path:line** — …` row, or an
+    unterminated code fence that swallows the rest of the review — and demotion turned
+    that from a rare fallback render into a per-run one. Inside a blockquote the
+    damage is confined: the block ends at the blank line before the next finding, so
+    an unclosed fence closes with it.
+    """
+    text = f"**{render_code_ref(c['path'], c['line'])}** — {c['body']}"
+    return "\n".join(f"> {ln}" if ln else ">" for ln in text.split("\n"))
+
+
 def render_body_only_findings(items: list) -> str:
     """Render findings that could not be anchored, for inclusion in the review body."""
     if not items:
@@ -455,8 +538,7 @@ def render_body_only_findings(items: list) -> str:
         "carries, so they are reported here instead of inline:_\n\n"
     )
     for item in items:
-        c = item["comment"]
-        md += f"**{render_code_ref(c['path'], c['line'])}** — {c['body']}\n\n"
+        md += render_finding_entry(item["comment"]) + "\n\n"
     return md.rstrip("\n")
 
 
@@ -470,7 +552,7 @@ def render_findings_markdown(review_body: str, comments: list[dict]) -> str:
     if comments:
         md += "\n\n---\n\n"
         for c in comments:
-            md += f"**{render_code_ref(c['path'], c['line'])}** — {c['body']}\n\n"
+            md += render_finding_entry(c) + "\n\n"
     return md
 
 
@@ -709,19 +791,26 @@ def main():
     inline_items, body_only_items = partition_by_anchor(enriched, load_anchors(args.diff))
     comments = [item["comment"] for item in inline_items]
 
-    review_body = f"{header}\n\nFound **{len(enriched)}** finding(s)."
+    # The head is every finding-independent part of the review. Kept separate from the
+    # demoted-findings block below so the body-only renders (step summary, wholesale
+    # fallback) can list ALL findings once, in severity order, instead of appending the
+    # inline half AFTER a block that already ends with the demoted half — which put a
+    # demoted nit ahead of a lost critical and made the size clamp cut the wrong end.
+    review_head = f"{header}\n\nFound **{len(enriched)}** finding(s)."
     if repeats_dropped:
-        review_body += (
+        review_head += (
             f"\n\n_{repeats_dropped} re-raise(s) of already-answered findings were dropped "
             f"(cap: {REPEAT_CAP} per review). They are still open on their original threads._"
         )
     severity_summary = build_severity_summary(enriched)
     if severity_summary:
-        review_body += f"\n\n{severity_summary}"
+        review_head += f"\n\n{severity_summary}"
     if panel_summary:
-        review_body += f"\n\n{panel_summary}"
+        review_head += f"\n\n{panel_summary}"
     if not enriched and findings:
-        review_body += "\n\n_(All findings had invalid file/line references and were dropped.)_"
+        review_head += "\n\n_(All findings had invalid file/line references and were dropped.)_"
+
+    review_body = review_head
     body_only_md = render_body_only_findings(body_only_items)
     if body_only_md:
         # KNOWN GAP (BE-9531): build-ledger.py derives its entries from review-COMMENT
@@ -732,9 +821,13 @@ def main():
         # so the ledger should learn to carry these. Tracked as a follow-up.
         review_body += f"\n\n---\n\n{body_only_md}"
 
+    # Every finding, most → least urgent, for any render that has no inline half.
+    prose_body = render_findings_markdown(review_head, [i["comment"] for i in enriched])
+
+    posted_body = clamp_review_body(review_body)
     payload = json.dumps(
         {
-            "body": clamp_review_body(review_body),
+            "body": posted_body,
             "event": "COMMENT",
             "commit_id": args.commit_sha,
             "comments": comments,
@@ -743,41 +836,69 @@ def main():
 
     result = gh_post_review(args.repo, args.pr_number, payload)
 
-    if result.returncode != 0:
-        # A read-only token rejects any write, so the inline-less fallback below
-        # would fail the same way — degrade straight to the job summary instead.
-        if is_read_only_token_error(result):
+    if result.returncode == 0:
+        if posted_body != review_body:
+            # The clamp note tells the reader the full text is in the job summary.
+            # Nothing else on this path writes one, so write it here or the note lies
+            # and the cut findings are gone from both places.
             print(
-                "Review: token is read-only — writing the review to the job "
-                "summary instead of the PR.",
+                "Review: body hit GitHub's size limit — full text written to the "
+                "job summary.",
                 file=sys.stderr,
             )
-            write_step_summary(render_findings_markdown(review_body, comments))
-            return
+            write_step_summary(prose_body, note=TRUNCATED_SUMMARY_NOTE)
+        return
 
-        print(f"Review POST failed: {result.stderr}", file=sys.stderr)
-        # Fallback: same body without inline anchors. Typical cause is line
-        # numbers that fall outside the diff context — often the model picked
-        # a line near the change but not on the change.
-        fallback_body = render_findings_markdown(review_body, comments)
-        if comments:
-            # Only true when there WERE inline comments to lose. Anchor-aware posting
-            # makes an empty `comments` routine, and the note would then claim a
-            # demotion that never happened and point at nothing "above".
-            fallback_body += "\n_(Inline comments could not be anchored to the diff; listed above instead.)_"
-
-        fallback_payload = json.dumps(
-            {
-                # Clamped for the API; the step-summary copy below stays whole.
-                "body": clamp_review_body(fallback_body),
-                "event": "COMMENT",
-                "commit_id": args.commit_sha,
-            }
+    # A read-only token rejects any write, so the inline-less fallback below
+    # would fail the same way — degrade straight to the job summary instead.
+    if is_read_only_token_error(result):
+        print(
+            "Review: token is read-only — writing the review to the job "
+            "summary instead of the PR.",
+            file=sys.stderr,
         )
-        if not post_or_degrade(
-            args.repo, args.pr_number, fallback_payload, fallback_body, "Fallback review"
-        ):
-            raise SystemExit(1)
+        write_step_summary(prose_body)
+        return
+
+    print(f"Review POST failed: {result.stderr}", file=sys.stderr)
+    if not comments:
+        # There is no inline half to drop, so the fallback body would be identical to
+        # the request that just failed — it cannot fix a size or malformed-body
+        # rejection, and if GitHub committed the write before erroring it publishes a
+        # duplicate review. Deliver the text to the summary and let the step go red.
+        print(
+            "Review: no inline comments to drop — the fallback would repost the same "
+            "body, so writing it to the job summary instead.",
+            file=sys.stderr,
+        )
+        write_step_summary(prose_body, note=POST_FAILED_SUMMARY_NOTE)
+        raise SystemExit(1)
+
+    # Fallback: same findings without inline anchors. Typical cause is line
+    # numbers that fall outside the diff context — often the model picked
+    # a line near the change but not on the change.
+    fallback_body = (
+        prose_body
+        + "\n_(Inline comments could not be anchored to the diff; listed above instead.)_"
+    )
+    clamped_fallback = clamp_review_body(fallback_body)
+    fallback_payload = json.dumps(
+        {
+            # Clamped for the API; the step-summary copy stays whole.
+            "body": clamped_fallback,
+            "event": "COMMENT",
+            "commit_id": args.commit_sha,
+        }
+    )
+    if not post_or_degrade(
+        args.repo,
+        args.pr_number,
+        fallback_payload,
+        fallback_body,
+        "Fallback review",
+        truncated=clamped_fallback != fallback_body,
+    ):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

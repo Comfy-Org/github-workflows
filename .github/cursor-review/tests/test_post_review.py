@@ -159,7 +159,8 @@ class LoadAnchorsFailsOpenTest(unittest.TestCase):
 class EndToEndPostTest(unittest.TestCase):
     """Drive main() with a stubbed `gh` and read the payload it would have sent."""
 
-    def run_main(self, findings, with_diff=True, post_returncode=0, stderr=""):
+    def run_main(self, findings, with_diff=True, post_returncode=0, stderr="", summaries=None):
+        """Return the POSTed payloads. Pass `summaries` (a list) to collect step-summary writes."""
         posted = []
 
         def fake_post(repo, pr_number, payload):
@@ -167,6 +168,10 @@ class EndToEndPostTest(unittest.TestCase):
             return subprocess.CompletedProcess(
                 args=["gh"], returncode=post_returncode, stdout="", stderr=stderr
             )
+
+        def fake_summary(markdown, note=None):
+            if summaries is not None:
+                summaries.append(markdown)
 
         with tempfile.TemporaryDirectory() as d:
             fpath = os.path.join(d, "consolidated.json")
@@ -186,7 +191,7 @@ class EndToEndPostTest(unittest.TestCase):
                 argv += ["--diff", dpath]
             with mock.patch.object(PR, "gh_post_review", side_effect=fake_post), \
                  mock.patch.object(PR.sys, "argv", argv), \
-                 mock.patch.object(PR, "write_step_summary"):
+                 mock.patch.object(PR, "write_step_summary", side_effect=fake_summary):
                 try:
                     PR.main()
                 except SystemExit:
@@ -446,19 +451,81 @@ class BodyBudgetTest(unittest.TestCase):
         self.assertEqual(len(posted), 1)
         self.assertLessEqual(len(posted[0]["body"]), PR.MAX_REVIEW_BODY_CHARS)
 
+    def test_a_clamped_post_actually_writes_the_summary_it_promises(self):
+        # The clamp note says "the full text is in the job summary of this run". On the
+        # SUCCESS path nothing else writes one, so without this the cut findings are
+        # absent from both the PR and the summary while the header still counts them.
+        findings = [
+            finding("elsewhere.py", 100 + i, body="z" * 19000) for i in range(10)
+        ]
+        summaries = []
+        posted = EndToEndPostTest().run_main(findings, summaries=summaries)
+        self.assertIn("truncated here", posted[0]["body"])
+        self.assertEqual(len(summaries), 1, "the promised job summary was written")
+        self.assertGreater(len(summaries[0]), PR.MAX_REVIEW_BODY_CHARS, "and it is whole")
+        for i in range(10):
+            self.assertIn(f"elsewhere.py:{100 + i}", summaries[0])
+
+    def test_a_short_review_writes_no_summary(self):
+        # The summary is a degradation channel, not a mirror: an intact review must
+        # not double-post itself into the run summary on every green round.
+        summaries = []
+        EndToEndPostTest().run_main([finding("app.py", 11)], summaries=summaries)
+        self.assertEqual(summaries, [])
+
+    def test_the_clamp_cuts_the_least_urgent_finding_in_the_fallback(self):
+        # The fallback body used to be review_body (ending with the DEMOTED half) plus
+        # the inline half appended after it, so clamping from the end dropped the
+        # findings that had just lost their anchors while a demoted nit survived.
+        findings = [finding("app.py", 11, severity="critical", body="C" * 19000)]
+        findings += [finding("elsewhere.py", 7, severity="low", body="L" * 19000)]
+        findings += [finding("app.py", 12, severity="high", body="H" * 19000)]
+        findings += [finding("elsewhere.py", 8, severity="medium", body="M" * 19000)]
+        posted = EndToEndPostTest().run_main(
+            findings, post_returncode=1, stderr="gh: Unprocessable Entity (HTTP 422)"
+        )
+        body = posted[1]["body"]
+        self.assertIn("truncated here", body)
+        # Severity order now holds across BOTH halves, so the cut lands on the low.
+        # Before, the demoted half came first and the inline half was appended after
+        # it, so the high (inline) was dropped whole while the low (demoted) survived.
+        self.assertIn("C" * 19000, body, "the critical survives")
+        self.assertIn("H" * 19000, body, "so does the high")
+        self.assertIn("M" * 19000, body, "and the medium")
+        self.assertNotIn("L" * 19000, body, "the low is what gets cut")
+
+    def test_no_finding_is_rendered_twice_in_the_fallback(self):
+        posted = EndToEndPostTest().run_main(
+            [
+                finding("app.py", 11, body="anchored one"),
+                finding("elsewhere.py", 7, body="demoted one"),
+            ],
+            post_returncode=1,
+            stderr="gh: Unprocessable Entity (HTTP 422)",
+        )
+        body = posted[1]["body"]
+        self.assertEqual(body.count("anchored one"), 1)
+        self.assertEqual(body.count("demoted one"), 1)
+
 
 class FallbackSuffixTest(unittest.TestCase):
-    def test_no_inline_comments_means_no_could_not_be_anchored_note(self):
-        # Every finding already demoted, then the POST fails for an unrelated reason:
-        # nothing was "listed above instead", so the note would be a lie.
+    def test_no_inline_comments_means_no_second_identical_post(self):
+        # Every finding already demoted, then the POST fails for an unrelated reason.
+        # With no inline half to drop, the "fallback" body is byte-identical to the
+        # request that just failed: it cannot fix a size or malformed-body rejection,
+        # and if GitHub committed the write before erroring it publishes a DUPLICATE
+        # review. Degrade to the summary and let the step go red instead.
+        summaries = []
         posted = EndToEndPostTest().run_main(
             [finding("elsewhere.py", 7)],
             post_returncode=1,
             stderr="gh: Server Error (HTTP 500)",
+            summaries=summaries,
         )
-        self.assertEqual(len(posted), 2)
-        self.assertNotIn("Inline comments could not be anchored", posted[1]["body"])
-        self.assertIn("elsewhere.py:7", posted[1]["body"])
+        self.assertEqual(len(posted), 1, "no second POST of the same body")
+        self.assertEqual(len(summaries), 1, "but the review is still delivered")
+        self.assertIn("elsewhere.py:7", summaries[0])
+        self.assertNotIn("Inline comments could not be anchored", summaries[0])
 
     def test_lost_inline_comments_still_carry_the_note(self):
         posted = EndToEndPostTest().run_main(
@@ -467,6 +534,126 @@ class FallbackSuffixTest(unittest.TestCase):
             stderr="gh: Unprocessable Entity (HTTP 422)",
         )
         self.assertIn("Inline comments could not be anchored", posted[1]["body"])
+
+
+class DiffReadingTest(unittest.TestCase):
+    """load_anchors must not let Python's line-ending translation edit the diff."""
+
+    def load(self, raw: bytes):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "pr-diff.patch")
+            with open(path, "wb") as f:
+                f.write(raw)
+            return PR.load_anchors(path)
+
+    def test_a_lone_cr_inside_a_content_line_does_not_split_it(self):
+        # Universal-newline mode (the default) rewrites a bare \r to \n before the
+        # parser can see it, splitting one added line into two: the tail has no
+        # +/-/space prefix, so it trips the desync arm and the whole file is dropped.
+        # A mixed-ending file or a minified asset produces exactly this.
+        raw = (
+            b"--- a/x.py\n+++ b/x.py\n@@ -1,1 +1,3 @@\n"
+            b" context_1\n+added_2\rstill_line_2\n+added_3\n"
+        )
+        self.assertEqual(self.load(raw)["x.py"], {1, 2, 3})
+
+    def test_a_crlf_diff_still_numbers_and_keys_correctly(self):
+        # With newline="" the \r survives to the parser — which is what makes
+        # header_new_path's rstrip("\r") load-bearing in production, not just in a
+        # direct-call unit test.
+        raw = (
+            b"--- a/x.py\r\n+++ b/x.py\r\n@@ -1,1 +1,2 @@\r\n"
+            b" context_1\r\n+added_2\r\n"
+        )
+        self.assertEqual(self.load(raw), {"x.py": {1, 2}})
+
+
+class QuotePathModesTest(unittest.TestCase):
+    """A quoted header path must decode under BOTH of git's quoting modes."""
+
+    def test_octal_escapes_decode(self):
+        # core.quotePath ON (the default): every non-ASCII byte is octal-escaped.
+        self.assertEqual(PR.header_new_path('+++ "b/caf\\303\\251.py"'), "café.py")
+
+    def test_verbatim_utf8_beside_an_escaped_quote_survives(self):
+        # core.quotePath OFF: git still quotes a name containing a `"`, but leaves the
+        # UTF-8 bytes alone. The old latin-1 round-trip turned that é into U+FFFD, so
+        # the key stopped matching the path findings cite and the file went silent.
+        self.assertEqual(PR.header_new_path('+++ "b/café\\"x.py"'), 'café"x.py')
+
+    def test_an_astral_character_beside_an_escape_survives(self):
+        # And this one used to raise UnicodeEncodeError and drop the file entirely.
+        self.assertEqual(PR.header_new_path('+++ "b/\U0001F389\\"x.py"'), '\U0001F389"x.py')
+
+    def test_escaped_backslash_and_control_characters(self):
+        self.assertEqual(PR.header_new_path('+++ "b/a\\\\b\\tc.py"'), "a\\b\tc.py")
+
+    def test_an_escape_git_never_emits_fails_safe(self):
+        # None => the file is anchorless => its findings render in the body. Guessing
+        # at the path is what sends back the 422 this whole path exists to prevent.
+        self.assertIsNone(PR.header_new_path('+++ "b/a\\q.py"'))
+        self.assertIsNone(PR.header_new_path('+++ "b/trailing\\"'))
+
+
+class UnparseableHunkHeaderTest(unittest.TestCase):
+    def test_it_desyncs_so_content_cannot_spoof_the_next_header(self):
+        # Without the hunk's counts the scan cannot know where its CONTENT ends, so a
+        # removed line reading `-- x` and an added line reading `++ b/evil.py` — emitted
+        # as `--- x` / `+++ b/evil.py` — would be read as a header pair and number the
+        # rest of the file under a path the diff never touched.
+        diff = (
+            "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n"
+            "@@ this is not a hunk header @@\n"
+            "--- x\n+++ b/evil.py\n@@ -1,1 +1,2 @@\n context\n+added\n"
+        )
+        anchors = PR.anchorable_lines(diff)
+        self.assertNotIn("evil.py", anchors)
+        self.assertEqual(anchors["x.py"], set())
+
+    def test_a_later_file_still_parses(self):
+        # `diff --git` is the one line content can never impersonate, so it clears the
+        # desync: the damage stops at the file that carried the bad header.
+        diff = (
+            "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ bogus @@\n+added\n"
+            "diff --git a/y.py b/y.py\n--- a/y.py\n+++ b/y.py\n@@ -1,1 +1,2 @@\n c\n+a\n"
+        )
+        self.assertEqual(PR.anchorable_lines(diff)["y.py"], {1, 2})
+
+
+class BodyStructureTest(unittest.TestCase):
+    """A model-supplied finding body must not restructure the review around it."""
+
+    def test_a_finding_body_cannot_open_a_section_or_swallow_the_review(self):
+        hostile = "see below\n\n## Forged heading\n```\nunterminated fence"
+        items = PR.normalize_comments([finding("app.py", 11, body=hostile)])
+        md = PR.render_body_only_findings(items)
+        for line in md.splitlines():
+            if line and not line.startswith("_"):
+                self.assertTrue(
+                    line.startswith(">"),
+                    f"structural line escaped the blockquote: {line!r}",
+                )
+        self.assertNotIn("\n## Forged", md)
+        self.assertIn("Forged heading", md, "the text is still reported, just contained")
+
+    def test_the_same_containment_covers_the_body_only_render(self):
+        hostile = "x\n# Forged"
+        md = PR.render_findings_markdown("head", [{"path": "a.py", "line": 1, "body": hostile}])
+        self.assertNotIn("\n# Forged", md)
+        self.assertIn("> # Forged", md)
+
+
+class StepSummaryNoteTest(unittest.TestCase):
+    def test_the_banner_says_why_the_summary_exists(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "summary.md")
+            with mock.patch.dict(PR.os.environ, {"GITHUB_STEP_SUMMARY": path}):
+                PR.write_step_summary("body", note=PR.TRUNCATED_SUMMARY_NOTE)
+                PR.write_step_summary("body2")
+            with open(path, encoding="utf-8") as f:
+                written = f.read()
+        self.assertIn("truncated at GitHub's body-size limit", written)
+        self.assertIn("read-only", written, "the default banner is unchanged")
 
 
 if __name__ == "__main__":
