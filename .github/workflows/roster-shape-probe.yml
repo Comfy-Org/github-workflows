@@ -1,0 +1,511 @@
+name: Roster shape probe (TEMPORARY)
+
+# TEMPORARY — DELETE THIS FILE ONCE THE ROSTERS ARE CAPTURED. It also EXPIRES:
+# the `EXPIRES` date below makes every dispatch after it fail before the secret
+# is read, so a forgotten copy on `main` goes dead on its own instead of staying
+# a re-runnable roster endpoint until someone remembers.
+#
+# Why this exists. A caller roster lives ONLY inside a write-only Actions secret:
+# `gh secret set` overwrites wholesale and there is no `gh secret get`. So nobody
+# can add one caller without risking silently dropping the rest — which is the
+# exact trap `.github/bump-callers/README.md` was written about, and which is
+# currently blocking an enrolment request against `CURSOR_REVIEW_CALLERS`.
+#
+# `bump-callers.sh` already prints a count + sha256 of the roster it used, and
+# that is enough to VERIFY a candidate reconstruction but not to BUILD one. This
+# prints the few extra structural facts that close the gap.
+#
+# ── The disclosure rule this file is built around ────────────────────────────
+# This repo is PUBLIC and so are its run logs. Actions masks a secret's exact
+# value, but NOT anything derived from it — so "it came from a secret" buys
+# nothing here. Every line below is therefore non-disclosing BY CONSTRUCTION,
+# not by masking:
+#
+#   * field NAMES — and only the four the bumper documents (`repo`, `file`,
+#     `label`, `wire_bot`). Any other key prints as `<unlisted-key>`: the
+#     bumper tolerates unknown keys, so a stray `"note": "<codename>"` or a
+#     paste mistake shaped like `{"Comfy-Org/<private>": {…}}` is a roster it
+#     would accept, and a key name is a value as far as a public log is
+#     concerned;
+#   * booleans and TYPE markers, never the strings they describe — and never a
+#     string's LENGTH either: over a three-word label vocabulary a length is
+#     the label;
+#   * whether each position's filename is drawn from the public caller
+#     vocabulary (`<listed>`) or not (`<unlisted>`) — never the NAME itself,
+#     public or otherwise. Each name alone is public, but the ORDERED MULTISET
+#     is the fleet's adoption profile; on the shared `PR_RISK_CALLERS`,
+#     counting `pr-derisk` entries would publish how many repos enrolled in a
+#     beta fleet. A filename is a value, not shape, and the operator already
+#     holds every one of them from the fleet's own bump PRs;
+#   * NO digest at all. The probe CONFIRMS a digest the operator supplies from a
+#     bump run's audit line and prints only whether it matched — so no
+#     fingerprint enters the log that was not public before the run started. An
+#     earlier revision printed it behind a self-attestation checkbox; nothing
+#     bound that tick to the roster the run actually read, and a re-run
+#     preserves inputs while re-resolving secrets, so an edit in between
+#     published the NEW roster's first fingerprint. Certainly no per-field
+#     digests: `sha256(map(.repo))` beside the count is an unsalted membership
+#     oracle over an enumerable `Comfy-Org/*` namespace;
+#   * and, for a roster of fewer than `MIN_SHAPE_COUNT` DISTINCT repos, no shape
+#     lines at all — count only, plus whether the supplied digest matched.
+#     The shape lines pin every component of the `jq -cS` preimage except the
+#     ordered repo list, and for a handful of entries that list is small enough
+#     to search offline against an already-public digest. Below the threshold
+#     the operator does the inverse search locally instead: the per-entry
+#     shape space (which keys, wire_bot state, label presence) is a few dozen
+#     states, trivially enumerable against the digest for a few entries.
+#
+# What is deliberately NOT printed: any repo name, any label text or LENGTH,
+# any repo name LENGTH, any key name outside the documented four, and any
+# filename outside the public vocabulary. A name length would be a genuine (if
+# small) fingerprint of a private repo, and "small" is not the standard this
+# repo holds itself to.
+#
+# Residual, stated plainly, because the probe cannot close it from the secret
+# alone: the digest's preimage is the ordered repo list plus label text once the
+# shape lines are known, and MIN_SHAPE_COUNT counts DISTINCT repos, which is not
+# the same as CONCEALED ones. A roster entry names a caller file inside the
+# consumer repo, so any caller living in a PUBLIC repo is already observable as a
+# member and an attacker subtracts it before searching. Eight distinct repos of
+# which seven are public callers leaves one unknown name, and the threshold does
+# not see the difference. For a fleet-sized roster of mostly-private callers the
+# space is not enumerable offline; skewed public, it is weaker than the number
+# suggests. That residual is the bumper's audit line's
+# residual already (it prints count + digest on every run, and filenames are
+# guessable by convention) — `MIN_SHAPE_COUNT` keeps this probe from making it
+# worse for small rosters — and `.github/bump-callers/README.md` names the only
+# real fix, a keyed HMAC, which is out of scope for a throwaway probe.
+#
+# Adding a line here means re-answering that question for the new line. If you
+# cannot state why it discloses nothing, it does not go in.
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_digest:
+        description: >-
+          The 64-hex sha256 from this fleet's bump run audit line ("roster: N
+          caller(s), sha256 <hex>"). Leave blank and the probe captures nothing:
+          it CONFIRMS a digest that is already public, it never publishes one.
+          A value that does not match fails the run without printing.
+        required: false
+        type: string
+        default: ''
+      roster:
+        description: Which roster secret to probe
+        required: true
+        type: choice
+        # Every roster in the bump-callers README fleet table. `AREA_LABEL_CALLERS`
+        # is NOT `AUTO_LABEL_CALLERS` — area-label is the `pr-area-label.yml`
+        # fleet, auto-label is the `cursor-review-auto-label.yml` one.
+        # `PR_RISK_CALLERS` is shared by the pr-risk and pr-derisk fleets.
+        options:
+          - CURSOR_REVIEW_CALLERS
+          - AGENTS_MD_CALLERS
+          - AREA_LABEL_CALLERS
+          - AUTO_LABEL_CALLERS
+          - GROOM_CALLERS
+          - PR_SIZE_CALLERS
+          - PR_RISK_CALLERS
+          - LINEAR_TICKET_CALLERS
+          - ASSIGN_REVIEWERS_CALLERS
+          - DETECT_UNREVIEWED_MERGE_CALLERS
+          - CODERABBIT_CONFIG_CALLERS
+          - PUBLIC_REPO_HYGIENE_CALLERS
+
+# Nothing here checks out or calls `gh`, so the job needs no `GITHUB_TOKEN`
+# scope at all — least privilege for a job whose only purpose is reading a
+# production secret.
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Runs BEFORE any step that carries the secret in its `env:`, and fails
+      # loudly instead of skipping: a job-level `if:` would report a non-main
+      # dispatch as a green no-op with nothing in the log saying why.
+      #
+      # Be honest about what the ref check is. It is NOT a security boundary:
+      # `workflow_dispatch` runs the workflow file as it exists on the
+      # DISPATCHED ref, with the repo's secrets, so anyone with push access can
+      # branch, replace this body with `echo "$CALLERS_JSON"` and dispatch that.
+      # That is GitHub's trust model for every secret in every repo — write
+      # access is secrets access — and every `bump-*-callers.yml` entrypoint
+      # sits on the same footing. What this check DOES do is keep the reviewed
+      # body on `main` the one that runs by default, refuse a stale ref, and
+      # make a mistaken dispatch red rather than silently green. A protected
+      # `environment:` with required reviewers would be a real gate; it is a
+      # repo-settings change, not a workflow-file one, and a throwaway probe
+      # with a hard expiry date does not earn a permanent environment.
+      - name: Refuse a non-main ref, an unknown roster name, or an expired probe
+        env:
+          REF: ${{ github.ref }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          ROSTER_NAME: ${{ inputs.roster }}
+          # After this date every dispatch fails here. Bump it deliberately if
+          # the capture genuinely needs longer; do not let it float.
+          #
+          # KEEP IT QUOTED and ISO (YYYY-MM-DD): the script validates the shape
+          # and hard-fails on anything else, because the expiry compare is a
+          # lexicographic one that is only correct on that shape — `2026-9-30`
+          # would never sort below a later 2026 date (the probe silently stops
+          # expiring), and an unquoted `2026-10-31` is a YAML timestamp that can
+          # reach the env reformatted and compare the other way.
+          EXPIRES: "2026-09-30"
+        run: |
+          set -euo pipefail
+
+          if [[ "$REF" != "refs/heads/main" ]]; then
+            echo "::error::This probe reads a production secret and only runs from main (dispatched from ${REF}). Re-dispatch on main."
+            exit 1
+          fi
+
+          # Deleting this file from `main` does NOT retire it. Re-running an
+          # EXISTING run replays the workflow file and `github.ref` as they were
+          # — so the check above still passes — while re-resolving secrets at run
+          # time. Every past run would therefore stay a live probe of the CURRENT
+          # roster after the file is gone, bounded only by EXPIRES. Refuse
+          # anything but a first attempt.
+          if [[ "${RUN_ATTEMPT:-1}" != "1" ]]; then
+            echo "::error::This is run attempt ${RUN_ATTEMPT}. A re-run replays a possibly-deleted workflow file against the CURRENT secret, so past runs would outlive the file itself. Dispatch a fresh run instead."
+            exit 1
+          fi
+
+          # A literal allowlist, independent of the `type: choice` validation
+          # above. The next step indexes the `secrets` context by this name, so
+          # if `type:` is ever relaxed the choice list must not become the only
+          # thing standing between a free-text input and every secret on the
+          # repo (set/unset + is-it-a-JSON-array, per secret name).
+          case "$ROSTER_NAME" in
+            CURSOR_REVIEW_CALLERS|AGENTS_MD_CALLERS|AREA_LABEL_CALLERS|AUTO_LABEL_CALLERS|GROOM_CALLERS|PR_SIZE_CALLERS|PR_RISK_CALLERS|LINEAR_TICKET_CALLERS|ASSIGN_REVIEWERS_CALLERS|DETECT_UNREVIEWED_MERGE_CALLERS|CODERABBIT_CONFIG_CALLERS|PUBLIC_REPO_HYGIENE_CALLERS) ;;
+            *)
+              echo "::error::'${ROSTER_NAME}' is not a roster this probe knows. Add it to BOTH the choice list and this case list, or pick one of the listed rosters."
+              exit 1
+              ;;
+          esac
+
+          # The expiry is the only automatic retirement a forgotten copy on
+          # `main` gets, so it must fail CLOSED: a malformed date is an error,
+          # not a date that happens to compare as "not yet".
+          ISO_DATE='^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+          if [[ ! "$EXPIRES" =~ $ISO_DATE ]]; then
+            echo "::error::EXPIRES must be a quoted ISO date (YYYY-MM-DD); got '${EXPIRES}'. A malformed value would compare wrongly and the probe would silently stop expiring — fix it, do not remove the check."
+            exit 1
+          fi
+          # Shape is not enough, and the gap is the fail-OPEN direction this
+          # whole block exists to avoid: `2026-19-30` and `2026-90-30` are
+          # digit-placement-valid, sort ABOVE every real 2026 date, and would
+          # slide the only automatic retirement silently into 2027 on a green
+          # run. Round-trip the value through `date` instead — a real date
+          # normalizes to itself, an impossible month or day does not.
+          if ! ROUNDTRIP=$(date -u -d "$EXPIRES" +%F 2>/dev/null) || [[ "$ROUNDTRIP" != "$EXPIRES" ]]; then
+            echo "::error::EXPIRES '${EXPIRES}' is not a real calendar date (it does not round-trip through \`date\`; got '${ROUNDTRIP:-<error>}'). A digit-placement-valid but impossible date sorts above every real one, so the probe would stop expiring."
+            exit 1
+          fi
+          TODAY=$(date -u +%F)
+          if [[ ! "$TODAY" =~ $ISO_DATE ]]; then
+            echo "::error::date -u +%F returned '${TODAY}', not an ISO date; refusing to compare against EXPIRES."
+            exit 1
+          fi
+          if [[ "$TODAY" > "$EXPIRES" ]]; then
+            echo "::error::This probe expired on ${EXPIRES} (today is ${TODAY}). It was TEMPORARY — delete .github/workflows/roster-shape-probe.yml, or bump EXPIRES on purpose if a capture is still outstanding."
+            exit 1
+          fi
+
+      - name: Probe roster structure
+        env:
+          # Indexed off the (allowlisted, above) choice input so one throwaway
+          # workflow can capture every uncaptured roster instead of needing a
+          # dozen near-copies — the drift pattern `.github/bump-callers/` exists
+          # to prevent.
+          #
+          # A SECRET, exactly as in every bump entrypoint (BE-6472): Actions
+          # prints a step's `env:` block BEFORE the step runs, so a variable's
+          # raw value would be published here in the clear, ahead of anything
+          # this script could do about it.
+          CALLERS_JSON: ${{ secrets[inputs.roster] }}
+          ROSTER_NAME: ${{ inputs.roster }}
+          EXPECTED_DIGEST: ${{ inputs.expected_digest }}
+          # Below this many entries only count + digest are printed — see the
+          # header. Ordered n-tuples over a guessable `Comfy-Org/*` namespace of
+          # a couple of hundred names are an offline job at n=5 (~10^11
+          # digests) and not at n=8 (~10^17); below the threshold the operator
+          # searches the small per-entry shape space locally instead.
+          MIN_SHAPE_COUNT: "8"
+          # The public filename vocabulary: every reusable this repo ships,
+          # optionally under the `ci-` prefix its own self-enrolment callers
+          # use. Anchored `\A`/`\z` for the same reason `bump-callers.sh` is
+          # (`$` matches before a trailing newline). A filename outside this
+          # set is NOT printed — see the header.
+          #
+          # This is a hand-copied snapshot of `.github/workflows/` (the job
+          # deliberately has no checkout to derive it from), so it can go STALE:
+          # a reusable added or renamed after this file's commit degrades a
+          # legitimate entry to `<unlisted>`, which is the fail-CLOSED direction
+          # and is indistinguishable here from a suppressed private filename.
+          # The output says so whenever an `<unlisted>` appears.
+          # A roster's `file` is the CALLER's filename in the CONSUMER repo, not
+          # the name of the reusable this repo ships — and the two differ in
+          # published, documented ways. `bump-callers.sh` records
+          # `pr-cursor-review.yaml` as a live CURSOR_REVIEW_CALLERS spelling, and
+          # `docs/callers/linear-ticket.md` specifies the caller file as
+          # `linear-ticket-validate.yml`; a `(ci-)?<stem>` vocabulary matches
+          # NEITHER, so those positions printed `<unlisted>` and sent the
+          # operator to `.github/workflows/` for a cause that was never there —
+          # while also making the position unreconcilable against the digest.
+          # So: an optional `ci-`/`pr-` prefix and an ENUMERATED `-signal` /
+          # `-validate` tail, which is what the caller docs publish. The tail is
+          # a closed set, NOT an open `-[a-z0-9]+`: an open tail would admit
+          # `ci-cursor-review-<codename>.yml` — a well-formed path naming a
+          # private product — which is precisely the disclosure this allowlist
+          # exists to stop. Closed vocabulary at BOTH ends; anything else is
+          # still `<unlisted>`.
+          FILE_ALLOW: '\A[.]github/workflows/(ci-|pr-)?(agents-md-integrity|assign-prs-to-author|assign-reviewers|coderabbit-config-validate|cursor-review|cursor-review-auto-label|detect-unreviewed-merge|groom|linear-ticket|pr-area-label|pr-derisk|pr-risk|pr-size|public-repo-hygiene|refresh-reviewers|stale)(-(signal|validate))?[.]ya?ml\z'
+        run: |
+          set -euo pipefail
+
+          # MIN_SHAPE_COUNT and FILE_ALLOW are the two hand-edited safety
+          # constants the rest of this file leans on, and BOTH fail open if
+          # mis-edited. In `(( COUNT < MIN_SHAPE_COUNT ))` an empty value
+          # evaluates to 0 and a non-numeric one is re-expanded as an unset
+          # variable name — either makes the comparison false and prints the
+          # full shape lines for a ONE-entry roster. An empty FILE_ALLOW makes
+          # jq's `test($re)` match every string, so every filename prints
+          # verbatim and the carve-out this file is built around disappears.
+          # `set -e` cannot catch either (an `if` condition is exempt), so both
+          # are shape-checked here, exactly as EXPIRES, COUNT and DIGEST are.
+          if [[ ! "$MIN_SHAPE_COUNT" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::MIN_SHAPE_COUNT must be a positive integer; got '${MIN_SHAPE_COUNT}'. An empty or non-numeric value makes the withholding comparison false and publishes the shape lines for a one-entry roster."
+            exit 1
+          fi
+          # Since filenames print as `<listed>`/`<unlisted>` rather than
+          # verbatim, an over-broad FILE_ALLOW no longer leaks a NAME — what it
+          # does is mark every position `<listed>`, silently suppressing the
+          # staleness note and telling the operator every filename reconciles
+          # when none was actually checked. Emptiness is the one shape testable
+          # here (a mis-anchored pattern is not) and the most permissive of all.
+          if [[ -z "$FILE_ALLOW" ]]; then
+            echo "::error::FILE_ALLOW is empty, so jq's test() matches every string and every position would report <listed> — the staleness note suppressed, no filename actually checked. Restore the pattern."
+            exit 1
+          fi
+
+          if [[ -z "${CALLERS_JSON:-}" ]]; then
+            echo "::error::${ROSTER_NAME} is unset or empty on this repo — nothing to probe."
+            echo "(What that means depends on the fleet: an ALLOW_EMPTY=true bump entrypoint treats it as a dormant fleet and exits 0, an ALLOW_EMPTY=false one hard-fails on every dispatch. See the fleet table in .github/bump-callers/README.md.)"
+            exit 1
+          fi
+
+          # Fail on a roster that is not EXACTLY ONE JSON array OF OBJECTS
+          # before reading fields off it, so a malformed secret reports as
+          # malformed rather than as a roster with zero entries — or, worse,
+          # as a green run with blank fields because `has()`/`.file`/`keys`
+          # errored on a string. Slurped (`-s`) and pinned to one document
+          # because `jq -e` otherwise runs once per JSON text and takes its
+          # status from the LAST one: a concatenated `[…] […]` paste would pass
+          # a per-text gate, then print a multi-line count and hash the whole
+          # stream into a digest no reconstruction can match.
+          if ! jq -e -s 'length == 1 and (.[0] | type == "array" and all(.[]; type == "object"))' >/dev/null 2>&1 <<<"$CALLERS_JSON"; then
+            echo "::error::${ROSTER_NAME} did not parse as exactly one JSON array of objects."
+            exit 1
+          fi
+
+          # Every value is computed INTO A VARIABLE and only then printed.
+          # Inside `echo "$(jq …)"` a failing jq is invisible to errexit: the
+          # substitution's status is discarded, the line prints a blank field
+          # and the step stays green — and a digest line would then hash empty
+          # stdin and print e3b0c442…b855, a well-formed 64-hex digest of
+          # nothing that no reconstruction can ever match. `bump-callers.sh`
+          # guards the same trap the same way.
+
+          # (1) Entry count — cross-checks the bumper's own audit line, and
+          #     decides whether the shape lines are printed at all.
+          COUNT=$(jq -c 'length' <<<"$CALLERS_JSON")
+          if [[ ! "$COUNT" =~ ^[0-9]+$ ]]; then
+            echo "::error::roster length did not come back as an integer (got '${COUNT}'); nothing printed."
+            exit 1
+          fi
+
+          # (2) The whole-roster digest, computed exactly as the bumper's audit
+          #     line does. Reproduce locally against a reconstruction:
+          #       jq -cS . candidate.json | sha256sum
+          DIGEST=$(jq -cS . <<<"$CALLERS_JSON" | sha256sum | cut -d' ' -f1)
+          if [[ ! "$DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::roster digest did not come back as 64 hex chars (got '${DIGEST}') — sha256sum/cut failed; nothing printed."
+            exit 1
+          fi
+
+          # DISTINCT repos, not array length. `PR_RISK_CALLERS` is SHARED by the
+          # pr-risk and pr-derisk fleets and lists a repo once PER CALLER FILE,
+          # so an 8-entry paired roster conceals only ~4 names — and the
+          # withholding threshold is about how many independent NAMES an
+          # offline search would have to guess, not how many rows there are.
+          # Gate on the quantity the threshold is actually reasoning about.
+          # `strings` and `ascii_downcase`, both load-bearing and both fail-OPEN
+          # without them. The array-of-objects gate proves nothing about `.repo`,
+          # so an entry missing the key contributes `null` to `unique` and seven
+          # real names plus one paste mistake would report eight and publish the
+          # shape. And `bump-callers.sh` groups repos CASE-FOLDED (GitHub
+          # resolves owners case-insensitively), so `Comfy-Org/foo` and
+          # `comfy-org/foo` are one repo to the bumper and would be two here.
+          NAMES=$(jq -c '[.[] | .repo | strings | ascii_downcase] | unique | length' <<<"$CALLERS_JSON")
+          if [[ ! "$NAMES" =~ ^[0-9]+$ ]]; then
+            echo "::error::distinct-repo count did not come back as an integer (got '${NAMES}'); nothing printed."
+            exit 1
+          fi
+
+          echo "=== ${ROSTER_NAME} — structure only, no names, no label text ==="
+          echo "count:         ${COUNT}"
+
+          # An EMPTY roster is the documented seed state for several fleets, and
+          # it must not read as a healthy one. `bump-callers.sh` prints
+          # `sha256 n/a (roster empty or unset)` there, so publishing the
+          # well-known digest of `[]` would give the operator a cross-check with
+          # nothing on the other side — a wiped roster looking exactly like a
+          # populated one. Mirror the bumper instead.
+          if (( COUNT == 0 )); then
+            echo "roster_sha256: n/a (roster empty)"
+            echo "note:          an ALLOW_EMPTY=true fleet treats this as dormant and its bump exits 0;"
+            echo "               an ALLOW_EMPTY=false fleet hard-fails every run. See the fleet table in"
+            echo "               .github/bump-callers/README.md before reading this as healthy."
+            echo "=== end ==="
+            exit 0
+          fi
+
+          # THIS PROBE NEVER PUBLISHES A DIGEST. It only CONFIRMS one that is
+          # already public.
+          #
+          # The earlier design printed the digest behind a `digest_already_public`
+          # checkbox, which was an unverified self-attestation: nothing bound the
+          # tick to the roster this run actually read, and a re-run preserves the
+          # inputs while re-resolving secrets, so a secret edited in between
+          # published the NEW roster's first fingerprint — exactly what the gate
+          # existed to prevent. Taking the already-logged digest as the INPUT
+          # closes that by construction: a value the operator copied out of a
+          # bump run's audit line is public before this workflow starts, and
+          # comparing against it adds nothing to the log that was not already
+          # there.
+          #
+          # It also makes the shape lines and the digest one decision rather than
+          # two independent gates. Those gates could disagree — printing the
+          # shape (which the header itself calls the sensitive artifact: it pins
+          # every component of the `jq -cS` preimage bar the ordered repo list)
+          # while withholding the digest it exists to be reconciled against, so
+          # the gate deferred nothing and cost one permanent shape dump. Both, or
+          # neither.
+          if [[ -z "${EXPECTED_DIGEST//[[:space:]]/}" ]]; then
+            echo "roster_sha256: (not confirmed — nothing else captured)"
+            echo "               This probe confirms a digest, it never publishes one. To capture this"
+            echo "               roster: find the bump-*-callers.yml whose VAR_NAME is ${ROSTER_NAME}"
+            echo "               (the fleet table in .github/bump-callers/README.md maps them; the"
+            echo "               workflow is named after the FLEET, not the secret), run it, copy the"
+            echo "               64-hex from its 'roster: N caller(s), sha256 <hex>' log line, then"
+            echo "               re-dispatch this probe with that value in the 'expected_digest' field"
+            echo "               on the Run workflow form."
+            echo "=== end ==="
+            exit 0
+          fi
+          if [[ ! "$EXPECTED_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::expected_digest must be the 64-hex sha256 from a bump run's audit line; got '${EXPECTED_DIGEST}'."
+            exit 1
+          fi
+          if [[ "$DIGEST" != "$EXPECTED_DIGEST" ]]; then
+            # Loud, and nothing printed. A mismatch means the secret is NOT the
+            # one that audit line fingerprinted — it was edited since, or the
+            # digest came from a different fleet. Emitting the shape here would
+            # describe a roster whose digest is not public, which is the whole
+            # thing being avoided.
+            echo "::error::this roster does not match expected_digest, so its digest is NOT already public. The secret was edited since that audit line, or the digest came from another fleet. Nothing printed."
+            exit 1
+          fi
+          echo "roster_sha256: confirmed — matches the digest you supplied"
+
+          # ABOVE the threshold gate on purpose. An entry carrying a key outside
+          # the documented four is hashed into the digest by its NAME as well as
+          # its value, while the name itself is never printed — so a
+          # reconstruction cannot converge, and the operator reads the inevitable
+          # mismatch as wrong repo names. The BELOW-threshold path is where that
+          # bites hardest (its only advice is to search the shape space against
+          # the digest), so a check that lives after the early `exit 0` misses
+          # the case it was added for. It needs only CALLERS_JSON and discloses
+          # one boolean.
+          if jq -e 'any(.[]; keys | any(. as $k | ["file","label","repo","wire_bot"] | index($k) | not))' >/dev/null <<<"$CALLERS_JSON"; then
+            echo "warn:          this roster carries key(s) outside the documented four. Their NAMES are"
+            echo "               never printed but ARE hashed into the digest, so a reconstruction built"
+            echo "               only from these lines CANNOT match it. A mismatch is the unlisted key,"
+            echo "               not wrong repo names."
+          fi
+
+          # The comparison result, never the number. `${NAMES}` beside the
+          # always-printed `count:` would publish a third secret-derived figure
+          # the bumper never logs, and `COUNT - NAMES` is the count of repos
+          # enrolled more than once — on the shared `PR_RISK_CALLERS` that is the
+          # pr-derisk adoption figure the `<listed>` filename suppression exists
+          # to protect.
+          if (( NAMES < MIN_SHAPE_COUNT )); then
+            echo "shape:         (withheld — fewer than ${MIN_SHAPE_COUNT} distinct repo(s); see the header)"
+            echo "               Reconstruct by searching the small per-entry shape space locally"
+            echo "               (which of repo/file/label/wire_bot are present, wire_bot state, label"
+            echo "               presence) against the digest you supplied, with the names and filenames"
+            echo "               already recovered from the fleet's bump PRs."
+            echo "=== end ==="
+            exit 0
+          fi
+
+
+          # (3) The field set PER POSITION (`keys` sorts, as `jq -cS` will), so
+          #     the operator sees which index carries which shape rather than a
+          #     union that cannot say. Names outside the documented four print
+          #     as `<unlisted-key>` — see the header — so the count of unlisted
+          #     keys per entry is visible but never their names; re-sorted
+          #     AFTER the substitution so the placeholder's position does not
+          #     hint at where the real name sorts.
+          KEYS=$(jq -c '[.[] | keys | map(if IN("file", "label", "repo", "wire_bot") then . else "<unlisted-key>" end) | sort]' <<<"$CALLERS_JSON")
+
+          # (4) Per-position booleans / type markers. Four states are kept
+          #     DISTINCT because they serialize differently under `jq -cS` and
+          #     a reconstruction must reproduce the digest byte-for-byte:
+          #       absent key            -> "absent"
+          #       present, JSON null    -> null
+          #       present, boolean      -> true / false   (wire_bot only)
+          #       present, other type   -> "<type>"       (so a label prints
+          #                                "<string>" — never its text, and
+          #                                never its length: lengths 0/2/4
+          #                                over a vocabulary of ""/ci/Core ARE
+          #                                the text — and a numeric label
+          #                                prints "<number>", not its value)
+          #     `has()` rather than `// null`: only null and false are falsy in
+          #     jq, so `.wire_bot // null` reports a present-and-FALSE wire_bot
+          #     and an ABSENT one identically.
+          WIRE_BOT=$(jq -c '[.[] | if has("wire_bot") then (.wire_bot | if type == "boolean" or type == "null" then . else "<\(type)>" end) else "absent" end]' <<<"$CALLERS_JSON")
+          LABEL=$(jq -c '[.[] | if has("label") then (.label | if type == "null" then null else "<\(type)>" end) else "absent" end]' <<<"$CALLERS_JSON")
+
+          # (5) Filenames in roster order, under the SAME four-state encoding as
+          #     (4) — absent / null / "<type>" — so every position reconciles
+          #     byte-for-byte; a present STRING prints as `<listed>` when drawn
+          #     from the public FILE_ALLOW vocabulary and `<unlisted>` otherwise
+          #     — the NAME is never printed, even a public one. Each name on its own is public vocabulary, but the ORDERED
+          #     MULTISET is not: it is the fleet's adoption profile, derived from
+          #     a secret and written permanently to a public log. The sharpest
+          #     case is the shared `PR_RISK_CALLERS`, where counting the
+          #     `pr-derisk` entries reveals how many repos have enrolled in a
+          #     fleet the bump-callers README still describes as possibly
+          #     selecting nothing. Nothing is lost: a filename is a VALUE, not
+          #     shape, and the operator already recovered every one of them from
+          #     the fleet's own bump PRs — `<listed>` still says which positions
+          #     carry a usable filename, and a roster mixing spellings is a
+          #     bounded local search against the digest, exactly as the
+          #     below-threshold path already recommends.
+          FILES=$(jq -c --arg re "$FILE_ALLOW" '[.[] | if (has("file") | not) then "absent" elif (.file | type) == "null" then null elif (.file | type) != "string" then "<\(.file | type)>" elif (.file | test($re)) then "<listed>" else "<unlisted>" end]' <<<"$CALLERS_JSON")
+          echo "keys:          ${KEYS}"
+          echo "wire_bot:      ${WIRE_BOT}"
+          echo "label:         ${LABEL}"
+          echo "files:         ${FILES}"
+          if jq -e 'any(. == "<unlisted>")' >/dev/null <<<"$FILES"; then
+            echo "note:          an <unlisted> filename is either a name outside the public reusable"
+            echo "               vocabulary (deliberately suppressed) OR a reusable added/renamed since"
+            echo "               FILE_ALLOW was written — check .github/workflows/ on main before reading"
+            echo "               it as suppression."
+          fi
+          echo "=== end ==="
