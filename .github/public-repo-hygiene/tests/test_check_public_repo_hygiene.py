@@ -1809,38 +1809,182 @@ class TrackedPathSurfaceTest(CheckerTestCase):
         self.assertIn("(tracked path)", findings[0])
         self.assertIn("internal collaboration-tool marker", findings[0])
 
-    def test_the_path_surface_inherits_the_content_suppressors(self):
-        # Both false-positive suppressors the repo category carries apply here
-        # too, for the same reason the allowlists do: one matcher, not two.
-        # The npm/GitHub Packages scope crossing...
+    def test_the_path_surface_inherits_the_non_syntax_suppressors(self):
+        # The allowlists, the ticket knobs and the npm/GitHub Packages scope
+        # crossing are not URL syntax, so they reach the path surface for the
+        # same reason the allowlists do: one matcher, not two.
         self.repo.write(
             "packages/@comfy-org/comfy-cli/package.json", "{}\n"
         )
-        # ...and the model-host prefix, which reads as a DIFFERENT namespace.
-        self.repo.write("hf.co/Comfy-Org/some-model/config.json", "{}\n")
         self.assertEqual(self.findings(), [])
 
-    def test_a_nested_model_host_mirror_path_over_flags(self):
-        # KNOWN, ACCEPTED over-flag, pinned so a later "tidy-up" of
-        # `MODEL_HOST_PREFIX_RE` notices it: the suppressor's left anchor
-        # (`_AUTHORITY_L`) rejects a preceding `/`, since in prose a slash
-        # before a host means the host is really a PATH segment of something
-        # else. On a tracked path every segment is preceded by a slash, so a
-        # mirror checked out UNDER a directory is not suppressed while the
-        # same mirror at the tree root is. Over-flagging is the safe direction
-        # for a leak guard, and a repo that really vendors such a tree clears
-        # it with one `exclude_paths:` entry. Measured across the 11,415
-        # tracked paths of nine Comfy-Org public repos: zero occurrences.
+    def test_the_url_syntax_suppressors_do_not_reach_the_path_surface(self):
+        # `MODEL_HOST_PREFIX_RE` and `_labels_non_github_link` read URL /
+        # markdown SYNTAX -- an authority in front of the name, a link whose
+        # label names the same model repo. A tracked path has neither: there
+        # is no authority in a path, so `hf.co/Comfy-Org/<x>/` is a directory
+        # that happens to be called `hf.co`, not a different namespace, and
+        # inheriting the suppressor would let a tree park a private name
+        # under it and stay green (BE-9399 review). Both are gated off via
+        # `url_suppressors=False`; the same shapes in CONTENTS stay cleared.
+        self.repo.write(
+            "hf.co/Comfy-Org/some-private-repo/config.json", "{}\n"
+        )
+        self.repo.write(
+            "[Comfy-Org/some-private-repo](https:/huggingface.co/"
+            "Comfy-Org/some-private-repo)/x.md",
+            "clean\n",
+        )
+        findings = self.findings()
+        # Three, not two: the markdown-shaped path names the repo TWICE (label
+        # and destination) and neither copy is cleared on this surface.
+        self.assertEqual(len(findings), 3, findings)
+        self.assertTrue(all("(tracked path)" in f for f in findings), findings)
+        self.assertTrue(
+            all("some-private-repo" in f for f in findings), findings
+        )
+        # Contents: the same two shapes are still suppressed (existing
+        # behaviour, re-pinned here so a later change to the gate cannot
+        # flip it the other way).
+        self.repo.write(
+            "clean/README.md",
+            "https://hf.co/Comfy-Org/some-model\n"
+            "[Comfy-Org/some-model](https://huggingface.co/Comfy-Org/some-model)\n",
+        )
+        self.assertEqual(
+            [f for f in self.findings() if "README.md:" in f], []
+        )
+
+    def test_a_model_host_mirror_path_over_flags_wherever_it_sits(self):
+        # KNOWN, ACCEPTED over-flag: a vendored model mirror is reported on
+        # its path at the tree root and under a directory alike, because the
+        # model-host suppressor is URL syntax and is switched off on the path
+        # surface (see the test above). Over-flagging is the safe direction
+        # for a leak guard; a repo that really vendors such a tree clears it
+        # with one `exclude_paths:` entry -- at the cost of that subtree's
+        # CONTENTS no longer being scanned either, which the docs now say.
+        # Measured across the 11,415 tracked paths of nine Comfy-Org public
+        # repos: zero occurrences of either shape.
+        self.repo.write("hf.co/Comfy-Org/some-model/config.json", "{}\n")
         self.repo.write(
             "models/hf.co/Comfy-Org/some-model/config.json", "{}\n"
         )
         findings = self.findings()
+        self.assertEqual(len(findings), 2, findings)
+        self.assertTrue(all("(tracked path)" in f for f in findings), findings)
+        self.assertTrue(
+            all("Comfy-Org/some-model" in f for f in findings), findings
+        )
+        self.assertEqual(
+            self.findings(excludes=["models/", "hf.co/"]), []
+        )
+
+    def test_an_allowlisted_name_with_a_file_extension_over_flags(self):
+        # KNOWN, ACCEPTED over-flag, pinned so it is a decision and not an
+        # accident: `REPO_REF_RE`'s name class admits `.`, and only `.git` and
+        # a trailing period are stripped, so `docs/Comfy-Org/ComfyUI.md`
+        # reads as the repo `ComfyUI.md`, which is not allowlisted. Stripping
+        # an arbitrary extension would clear `Comfy-Org/ComfyUI.internal` on
+        # the strength of its prefix -- a private repo may legally carry a
+        # dot -- which is the fail-open direction. Rename the file or use
+        # `exclude_paths:`; the directory form `docs/Comfy-Org/ComfyUI/x.md`
+        # is clean (see test_an_allowlisted_repo_name_in_a_path_is_clean).
+        self.repo.write("docs/Comfy-Org/ComfyUI.md", "clean\n")
+        findings = self.findings()
         self.assertEqual(len(findings), 1, findings)
         self.assertIn("(tracked path)", findings[0])
-        self.assertIn("Comfy-Org/some-model", findings[0])
+        self.assertIn("Comfy-Org/ComfyUI.md", findings[0])
+
+    def test_a_lowercase_ticket_id_in_a_path_is_a_known_miss(self):
+        # `TICKET_RE` is case-sensitive on every surface: folding it for paths
+        # would turn `sha-256`, `iso-8601`, `rfc-2119` and every kebab-cased
+        # `<word>-<digits>` component into a finding. Documented as a known
+        # miss rather than folded (BE-9399 review).
+        self.repo.write("notes/be-1234/plan.md", "clean\n")
+        self.assertEqual(self.findings(), [])
+
+    def test_a_surrogate_inside_a_path_name_is_never_a_boundary(self):
+        # `tracked_files` decodes with `surrogateescape`, so a non-UTF-8 byte
+        # inside a path component arrives as a lone surrogate (category `Cs`).
+        # It has to READ AS PART OF THE NAME: as a boundary,
+        # `Comfy-Org/ComfyUI\xff-private` would be the bare allowlisted
+        # `ComfyUI` and clear -- the prefix-vs-full-name hole `_nonascii_tail`
+        # exists to close, reopened on the one surface that can carry such
+        # input (non-UTF-8 CONTENTS are declined outright). Driven through the
+        # helper directly: macOS refuses to create a file with an invalid-UTF-8
+        # name, so the tree cannot be built portably.
+        rel = "docs/Comfy-Org/ComfyUI\udcff-private/x.md"
+        findings, _, _ = checker._path_findings(rel, checker.TICKET_ALLOWLIST)
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("homoglyph", findings[0])
+        self.assertIn("(tracked path)", findings[0])
         self.assertEqual(
-            self.findings(excludes=["models/"]), []
+            checker._nonascii_tail("ComfyUI\udcff-private", 7),
+            "\udcff-private",
         )
+        # ...and the finding survives printing: `_esc_cmd` round-trips it.
+        self.assertIn("\\udcff", checker._esc_cmd(findings[0]))
+
+    def test_path_findings_are_capped_and_counted_as_partial(self):
+        # A path is scanned-repo controlled like a line is (git allows ~4 KiB
+        # of `AA-12/` components), so it gets the same per-file cap and the
+        # same `PARTIAL_FINDINGS` accounting as the contents -- a bare
+        # `list()` would exceed the documented cap with no `PARTIAL:` line.
+        # Driven through the helper: the path is longer than PATH_MAX, so the
+        # tree cannot be built.
+        cap = checker.MAX_FINDINGS_PER_FILE
+        rel = "/".join(f"AA-{10 + i}" for i in range(cap + 5)) + "/x.md"
+        findings, warnings, partial = checker._path_findings(
+            rel, checker.TICKET_ALLOWLIST
+        )
+        self.assertEqual(len(findings), cap, len(findings))
+        self.assertEqual(partial, [checker.PARTIAL_FINDINGS])
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("tracked path", warnings[0])
+        # Exactly AT the cap is not partial.
+        rel = "/".join(f"AA-{10 + i}" for i in range(cap)) + "/x.md"
+        findings, warnings, partial = checker._path_findings(
+            rel, checker.TICKET_ALLOWLIST
+        )
+        self.assertEqual(len(findings), cap)
+        self.assertEqual((warnings, partial), ([], []))
+
+    def test_a_partial_path_file_is_counted_once_in_the_run(self):
+        # Both surfaces of one file can earn PARTIAL_FINDINGS; the run counts
+        # the FILE once per kind, not once per surface.
+        cap = checker.MAX_FINDINGS_PER_FILE
+        rel = "/".join(f"AA-{10 + i}" for i in range(cap + 5)) + "/x.md"
+        capped = (
+            [f"{rel} (tracked path): finding"] * cap,
+            [f"{rel}: its tracked path produced too many"],
+            [checker.PARTIAL_FINDINGS],
+        )
+        content = (
+            [f"{rel}:1: finding"] * cap,
+            ["produced more than"],
+            None,
+            [checker.PARTIAL_FINDINGS],
+        )
+        self.repo.write("ok.md", "clean\n")
+        with unittest.mock.patch.object(
+            checker, "tracked_files", return_value=["ok.md", rel]
+        ), unittest.mock.patch.object(
+            checker, "_work_tree_encoded", return_value=[]
+        ), unittest.mock.patch.object(
+            checker,
+            "_path_findings",
+            side_effect=lambda r, a: capped if r == rel else ([], [], []),
+        ), unittest.mock.patch.object(
+            checker,
+            "check_file",
+            side_effect=lambda root, r, a: (
+                content if r == rel else ([], [], None, [])
+            ),
+        ):
+            result = checker.run_checks(self.repo.root)
+        self.assertEqual(result.partial, [(checker.PARTIAL_FINDINGS, 1)])
+        self.assertEqual(len(result.findings), 2 * cap)
+        self.assertEqual(result.scanned, 2)
 
     def test_excluding_the_leaky_path_suppresses_it_and_still_counts(self):
         # `exclude_paths:` is the caller's escape hatch for a false positive,

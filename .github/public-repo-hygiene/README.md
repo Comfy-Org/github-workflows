@@ -245,14 +245,42 @@ category 3 host-aware, which removed the `huggingface.co/Comfy-Org/<model>` fals
   because a hyphen is a non-word character). Recovering either costs an over-flag on a shape that
   really *is* a different registrable name (`app.slack.com-evil.com` → `com-evil.com`), so both are
   kept and pinned by `test_a_label_character_adjacent_to_the_host_is_a_known_miss`.
-- **A model-host mirror checked out *under* a directory over-flags on its path.** The
-  `MODEL_HOST_PREFIX_RE` suppressor's left anchor rejects a preceding `/`, because in prose a
-  slash before a host means the host is really a path segment of something else. Every segment of
-  a tracked path *is* preceded by a slash, so `hf.co/Comfy-Org/<model>/config.json` at the tree
-  root is suppressed while `models/hf.co/Comfy-Org/<model>/config.json` is reported. Over-flagging
-  is the safe direction for a leak guard, one `exclude_paths:` entry clears it, and the shape did
-  not occur once across the 11,415 tracked paths of nine Comfy-Org public repos — so it is pinned
-  by `test_a_nested_model_host_mirror_path_over_flags` rather than narrowed.
+- **The two URL-syntax suppressors are switched off on the path surface, so a vendored
+  model mirror over-flags on its path.** `MODEL_HOST_PREFIX_RE` (a model-host authority in front
+  of the name) and `_labels_non_github_link` (a markdown link whose label names the same model
+  repo) read URL / markdown *syntax*, and a tracked path has neither: `hf.co/Comfy-Org/<x>/` is a
+  directory that happens to be called `hf.co`, not a different namespace, and inheriting the
+  suppressor would let a tree park a private name under such a directory and stay green. So
+  `hf.co/Comfy-Org/<model>/config.json` is reported on its path wherever it sits in the tree —
+  over-flagging is the safe direction for a leak guard. The allowlists, the ticket knobs, the
+  npm-scope crossing and the homoglyph handling are not syntax and reach both surfaces unchanged.
+  The shape did not occur once across the 11,415 tracked paths of nine Comfy-Org public repos;
+  pinned by `test_a_model_host_mirror_path_over_flags_wherever_it_sits`.
+- **`exclude_paths:` is the caller-side remedy for a path over-flag, and it is not free.** An
+  excluded subtree is not scanned as a path *or* for its **contents** — excluding `models/` to
+  clear a vendored mirror stops every file beneath it being read. Prefer renaming, or the
+  narrowest entry that clears the finding (an exact file path rather than its directory).
+- **An allowlisted repo name carrying a file extension over-flags.** `REPO_REF_RE`'s name class
+  admits `.` and only `.git` and a trailing period are stripped, so `docs/Comfy-Org/ComfyUI.md`
+  reads as the repo `ComfyUI.md`. Stripping an arbitrary extension would clear
+  `Comfy-Org/ComfyUI.internal` on the strength of its prefix (a repo name may legally carry a
+  dot), which is the fail-open direction, so it is not done; the directory form
+  `docs/Comfy-Org/ComfyUI/x.md` is clean. Pinned by
+  `test_an_allowlisted_name_with_a_file_extension_over_flags`.
+- **Lowercase ticket ids in a path are a known miss.** `TICKET_RE` is case-sensitive on every
+  surface (see above), so kebab-cased `notes/be-1234/plan.md` passes while `notes/BE-1234/plan.md`
+  fires. Folding case for paths would turn `sha-256`, `iso-8601`, `rfc-2119` and every other
+  `<word>-<digits>` component into a finding. Pinned by
+  `test_a_lowercase_ticket_id_in_a_path_is_a_known_miss`.
+- **Most category-2 host patterns need a `/` after the host**, which a URL always has and a
+  path's *last* component never does: `docs/notion.so/x.md` fires (the host is a directory)
+  while `docs/notion.so.md`, `docs/app.slack.com-notes.md` and a `notion-exports/` directory
+  pass — the last because it is not a host at all. The path surface catches a host used as a
+  directory name, not a host-like fragment inside a file name.
+- **Exit 2 can now carry findings.** The path is scanned even for entries whose body is never
+  read, so a repo of nothing but binaries can list path findings while `SCANNED:` is 0. Exit 2
+  wins (the run proves nothing about the *contents*) and the findings are printed above the
+  verdict; read 2 as "not a pass", never as "no findings".
 - **Paths and contents are scanned; the repository's *history* and its refs are not.** A path that
   once existed and was renamed or deleted stays in every clone, as do branch and tag names, and
   none of those is a tracked file. Scrubbing a name out of the tree does not scrub it out of the

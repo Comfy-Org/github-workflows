@@ -47,7 +47,12 @@ tree, tracked content at the reserved `_public_repo_hygiene/` path, a
 `working-tree-encoding` gitattribute that makes the work tree differ from what
 git stores, or a scan that ended up reading zero files). Exit 2 is never
 "clean" -- a guard that looked at nothing has to be as loud as one that found
-something.
+something. Since BE-9399 the two can co-occur: the tracked PATH is scanned even
+for entries whose body is never read, so a zero-coverage run may still list
+findings. Exit 2 wins there (the run still proves nothing about the CONTENTS),
+and the findings are printed above the verdict rather than swallowed -- a
+wrapper keying on the exit code alone should read 2 as "not a pass", never as
+"no findings".
 
 Run locally:
     python3 .github/public-repo-hygiene/check_public_repo_hygiene.py --root .
@@ -510,8 +515,15 @@ _REPO_NAME_ASCII = frozenset(
 # numbers (N*), combining marks (M*), and the dash/connector punctuation that
 # supplies the homoglyphs -- U+2010 HYPHEN renders identically to `-` on
 # github.com. Quote and bracket categories are deliberately absent, so ordinary
-# prose like `Comfy-Org/ComfyUI’s frontend` stays a clean reference.
-_NAME_CONTINUING_CATEGORIES = frozenset({"Pd", "Pc"})
+# prose like `Comfy-Org/ComfyUI’s frontend` stays a clean reference. `Cs`
+# (a lone surrogate) is here too: `tracked_files` decodes paths with
+# `surrogateescape`, so a byte that is not valid UTF-8 inside a path component
+# arrives as one, and it can only be sitting INSIDE the name -- treating it as
+# a boundary would read `Comfy-Org/ComfyUI\xff-private` as the bare allowlisted
+# `ComfyUI` and clear it, the prefix-vs-full-name hole `_nonascii_tail` exists
+# to close. File CONTENTS never carry one (non-UTF-8 bodies are declined), so
+# this only ever fires on the path surface. (BE-9399 review.)
+_NAME_CONTINUING_CATEGORIES = frozenset({"Pd", "Pc", "Cs"})
 
 # --- The model-host false positive's SECOND shape: a markdown link LABEL.
 # `MODEL_HOST_PREFIX_RE` above clears a reference the host sits in front of.
@@ -1436,7 +1448,9 @@ def _codeowners_lines(text):
     ]
 
 
-def _line_findings(location, line, ticket_allowlist, owner_span):
+def _line_findings(
+    location, line, ticket_allowlist, owner_span, *, url_suppressors=True
+):
     """Yield LINE's findings, each prefixed with LOCATION.
 
     Shared by BOTH scanned surfaces rather than forked, so they can never drift
@@ -1455,6 +1469,18 @@ def _line_findings(location, line, ticket_allowlist, owner_span):
     line. Passed in rather than derived here because deriving it needs both the
     file's CODEOWNERS-ness and the line NUMBER (a UTF-8 BOM is decoding residue
     only at offset 0 of the file), neither of which means anything on a path.
+
+    URL_SUPPRESSORS is False on the path surface. Two of the repo category's
+    false-positive suppressors read URL / markdown SYNTAX -- a model-host
+    authority in front of the name (`MODEL_HOST_PREFIX_RE`) and a markdown link
+    whose label names the same model repo (`_labels_non_github_link`) -- and
+    that syntax has no meaning in a tracked path: there is no authority in a
+    path, so `hf.co/Comfy-Org/<name>/x` is a directory that happens to be
+    called `hf.co`, not a different namespace. Inheriting them wholesale
+    would let a tree park a private name under an `hf.co/` directory and stay
+    green, which is the leak this surface was added to catch. The allowlists,
+    the ticket knobs, the npm-scope crossing and the homoglyph handling are
+    NOT syntax and reach both surfaces unchanged. (BE-9399 review.)
     """
     for match in TICKET_RE.finditer(line):
         token = match.group(0).upper()
@@ -1488,7 +1514,7 @@ def _line_findings(location, line, ticket_allowlist, owner_span):
     # large is tens of MB of runner memory. Almost no line has a match, so
     # the common case now allocates nothing at all; when one does, the scan
     # still runs exactly once.
-    model_host_ends = None
+    model_host_ends = None if url_suppressors else frozenset()
     for match in REPO_REF_RE.finditer(line):
         if model_host_ends is None:
             model_host_ends = frozenset(
@@ -1525,7 +1551,8 @@ def _line_findings(location, line, ticket_allowlist, owner_span):
         # labelling a model link is not a spelling to clear -- both keep the
         # skip to the shape the fixtures actually carry.
         if (
-            not tail
+            url_suppressors
+            and not tail
             and not at_prefixed
             and _labels_non_github_link(
                 line, match.start(), match.end(), name
@@ -1679,6 +1706,39 @@ def _file_findings(rel, text, ticket_allowlist):
         )
 
 
+def _path_findings(rel, ticket_allowlist):
+    """Return (findings, warnings, partial) for one tracked PATH string.
+
+    The path-surface twin of `check_file`, with the same per-file findings cap
+    and the same `PARTIAL_FINDINGS` accounting: a path is scanned-repo
+    controlled too (git allows 4 KiB of `AA-12/` components), so a bare `list()`
+    here could both exceed the documented per-file cap and skip the `PARTIAL:`
+    line that says the enumeration was cut. (BE-9399 review.)
+    """
+    findings = list(
+        itertools.islice(
+            _line_findings(
+                f"{rel} (tracked path)",
+                rel,
+                ticket_allowlist,
+                None,
+                url_suppressors=False,
+            ),
+            MAX_FINDINGS_PER_FILE + 1,
+        )
+    )
+    warnings, partial = [], []
+    if len(findings) > MAX_FINDINGS_PER_FILE:
+        del findings[MAX_FINDINGS_PER_FILE:]
+        partial.append(PARTIAL_FINDINGS)
+        warnings.append(
+            f"its tracked path produced more than {MAX_FINDINGS_PER_FILE} "
+            f"findings; only the first {MAX_FINDINGS_PER_FILE} are listed. "
+            f"The path needs renaming wholesale -- the run still FAILS"
+        )
+    return findings, warnings, partial
+
+
 def check_file(root, rel, ticket_allowlist):
     """Return (findings, warnings, skip_kind, partial) for one file.
 
@@ -1796,22 +1856,26 @@ def run_checks(root, excludes=(), extra_ticket_allow=()):
         #
         # `owner_span=None` unconditionally, even when the path IS a CODEOWNERS
         # file: `_is_codeowners` decides how to read that file's LINES, and a
-        # path string is not an owner line.
+        # path string is not an owner line. `url_suppressors=False` (inside
+        # `_path_findings`): a path has no URL authority and no markdown
+        # syntax, so the two suppressors that read those would fail OPEN here.
         #
         # `rel` comes from `git ls-files -z` decoded with `surrogateescape`
         # (see `tracked_files`), so it is a `/`-separated posix string that may
-        # carry lone surrogates -- which is exactly the input the helper's
-        # non-ASCII / homoglyph handling already covers.
-        found = list(
-            _line_findings(
-                f"{rel} (tracked path)", rel, ticket_allowlist, None
-            )
+        # carry lone surrogates; `_nonascii_tail` treats one as part of the
+        # name (category `Cs` is in `_NAME_CONTINUING_CATEGORIES`), so a
+        # non-UTF-8 byte inside a name can never turn it into an allowlisted
+        # prefix of itself.
+        found, file_warnings, file_partial = _path_findings(
+            rel, ticket_allowlist
         )
-        content_found, file_warnings, skip_kind, file_partial = check_file(
-            root, rel, ticket_allowlist
+        content_found, content_warnings, skip_kind, content_partial = (
+            check_file(root, rel, ticket_allowlist)
         )
         found += content_found
-        for kind in file_partial:
+        file_warnings += content_warnings
+        # A file counts ONCE per kind, whichever surface(s) earned it.
+        for kind in sorted(set(file_partial) | set(content_partial)):
             partial[kind] += 1
         # Per-RUN cap on top of the per-file one, so a tree of many mid-sized
         # offenders cannot flood the log either. Scanning CONTINUES past it --

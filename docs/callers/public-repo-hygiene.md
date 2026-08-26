@@ -208,11 +208,16 @@ never read (binary, non-UTF-8, submodule gitlink, LFS stub, unreadable): the pat
 whatever the entry type. A path finding is labelled `<path> (tracked path):` instead of
 `<path>:<lineno>:`, because the fix is to rename the file rather than edit it, and it does not
 make an unread entry count towards `SCANNED:`. `exclude_paths:` covers this surface as well — an
-excluded path is not scanned as a path either, and still reports its skipped-file count. Two
-consequences worth knowing before you make the check required: a *vendored model mirror* nested
-under a directory (`models/hf.co/Comfy-Org/<model>/…`) is reported, because the model-host
-suppressor's anchor rejects a preceding slash — exclude that subtree; and scrubbing a name out of
-the **tree** does not scrub it out of the **history**, which this checker does not read.
+excluded path is not scanned as a path either, and still reports its skipped-file count. Three
+consequences worth knowing before you make the check required: a *vendored model mirror*
+(`hf.co/Comfy-Org/<model>/…`, at the root or nested) is reported on its path, because the
+model-host suppressor reads URL syntax that a path does not have; `exclude_paths:` clears that,
+but an excluded subtree is not scanned for its **contents** either, so prefer renaming or the
+narrowest entry that clears the finding; and scrubbing a name out of the **tree** does not scrub
+it out of the **history**, which this checker does not read. Two shapes are documented rather than
+handled: an allowlisted name with a file extension (`docs/Comfy-Org/ComfyUI.md`) over-flags, and
+a lowercase ticket id in a path (`notes/be-1234/`) is a miss — the full list is in the checker
+README's known limitations.
 
 **Submodules are not scanned.** `git ls-files` lists a gitlink, and the workflow checks you out
 without `submodules:`, so the directory is empty here. Each is named in a `::warning::` and counted
