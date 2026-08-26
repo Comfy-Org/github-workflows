@@ -1,0 +1,129 @@
+name: Roster shape probe (TEMPORARY)
+
+# TEMPORARY — DELETE THIS FILE ONCE THE ROSTERS ARE CAPTURED.
+#
+# Why this exists. A caller roster lives ONLY inside a write-only Actions secret:
+# `gh secret set` overwrites wholesale and there is no `gh secret get`. So nobody
+# can add one caller without risking silently dropping the rest — which is the
+# exact trap `.github/bump-callers/README.md` was written about, and which is
+# currently blocking an enrolment request against `CURSOR_REVIEW_CALLERS`.
+#
+# `bump-callers.sh` already prints a count + sha256 of the roster it used, and
+# that is enough to VERIFY a candidate reconstruction but not to BUILD one. This
+# prints the few extra structural facts that close the gap.
+#
+# ── The disclosure rule this file is built around ────────────────────────────
+# This repo is PUBLIC and so are its run logs. Actions masks a secret's exact
+# value, but NOT anything derived from it — so "it came from a secret" buys
+# nothing here. Every line below is therefore non-disclosing BY CONSTRUCTION,
+# not by masking:
+#
+#   * field NAMES, never values;
+#   * booleans and LENGTHS, never the strings they measure;
+#   * workflow FILENAMES, which are `.github/workflows/*.yml` paths shared across
+#     repos and name no repo;
+#   * a sha256 over the repo list, which verifies a reconstruction I already hold
+#     while revealing nothing about one I do not — the same trick, and the same
+#     reasoning, as the bumper's own audit line.
+#
+# What is deliberately NOT printed: any repo name, any label text, and any repo
+# name LENGTH. The last one would be a genuine (if small) fingerprint of a
+# private repo, and "small" is not the standard this repo holds itself to.
+#
+# Adding a line here means re-answering that question for the new line. If you
+# cannot state why it discloses nothing, it does not go in.
+
+on:
+  workflow_dispatch:
+    inputs:
+      roster:
+        description: Which roster secret to probe
+        required: true
+        type: choice
+        options:
+          - CURSOR_REVIEW_CALLERS
+          - AGENTS_MD_CALLERS
+          - AUTO_LABEL_CALLERS
+          - GROOM_CALLERS
+          - PR_SIZE_CALLERS
+          - PR_RISK_CALLERS
+          - LINEAR_TICKET_CALLERS
+          - ASSIGN_REVIEWERS_CALLERS
+          - DETECT_UNREVIEWED_MERGE_CALLERS
+          - CODERABBIT_CONFIG_CALLERS
+          - PUBLIC_REPO_HYGIENE_CALLERS
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    # Same main-only guard every bump entrypoint carries: this reads a
+    # production secret, so it must not be runnable from an unreviewed ref.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe roster structure
+        env:
+          # Indexed off the choice input so one throwaway workflow can capture
+          # every uncaptured roster instead of needing eleven near-copies — the
+          # drift pattern `.github/bump-callers/` exists to prevent.
+          #
+          # A SECRET, exactly as in every bump entrypoint (BE-6472): Actions
+          # prints a step's `env:` block BEFORE the step runs, so a variable's
+          # raw value would be published here in the clear, ahead of anything
+          # this script could do about it.
+          CALLERS_JSON: ${{ secrets[format('{0}', inputs.roster)] }}
+          ROSTER_NAME: ${{ inputs.roster }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${CALLERS_JSON:-}" ]]; then
+            echo "::error::${ROSTER_NAME} is unset or empty on this repo — nothing to probe."
+            echo "(That is itself the answer: an unset roster and a dormant fleet both exit 0 today.)"
+            exit 1
+          fi
+
+          # Fail on a roster that is not a JSON array BEFORE reading fields off
+          # it, so a malformed secret reports as malformed rather than as a
+          # roster with zero entries.
+          if ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$CALLERS_JSON"; then
+            echo "::error::${ROSTER_NAME} did not parse as a JSON array."
+            exit 1
+          fi
+
+          echo "=== ${ROSTER_NAME} — structure only, no names, no label text ==="
+
+          # (1) The exact field set(s). `unique` collapses entries that agree, so
+          #     one element means every entry has the same shape and more than
+          #     one names the entries that differ.
+          echo "keys:          $(jq -cS 'map(keys) | unique' <<<"$CALLERS_JSON")"
+
+          # (2) Entry count — cross-checks the bumper's own audit line.
+          echo "count:         $(jq -c 'length' <<<"$CALLERS_JSON")"
+
+          # (3) Per-position booleans and lengths, keyed on `has()` rather than
+          #     on `// null`. That distinction is the whole point: `false // null`
+          #     is null in jq (only `null` and `false` are falsy), so the shorter
+          #     spelling reports a present-and-false `wire_bot` and an ABSENT one
+          #     identically — and those two serialize differently under `jq -cS`,
+          #     which would leave the reconstruction unfalsifiable against the
+          #     digest. `has()` reports absence and value independently.
+          echo "wire_bot:      $(jq -c '[.[] | if has("wire_bot") then .wire_bot else null end]' <<<"$CALLERS_JSON")"
+          echo "label_len:     $(jq -c '[.[] | if has("label") then (.label | length) else null end]' <<<"$CALLERS_JSON")"
+
+          # (4) Filenames in roster order. These are `.github/workflows/*.yml`
+          #     paths, shared across repos and naming none of them.
+          echo "files:         $(jq -c '[.[] | .file]' <<<"$CALLERS_JSON")"
+
+          # (5) Digests that VERIFY a candidate without revealing the original.
+          #     Reproduce locally against a reconstruction:
+          #       jq -cS 'map(.repo)'  candidate.json | sha256sum
+          #       jq -cS 'map(.label)' candidate.json | sha256sum
+          #       jq -cS .             candidate.json | sha256sum   # the full one
+          echo "repos_sha256:  $(jq -cS 'map(.repo)'  <<<"$CALLERS_JSON" | sha256sum | cut -d' ' -f1)"
+          echo "labels_sha256: $(jq -cS 'map(.label)' <<<"$CALLERS_JSON" | sha256sum | cut -d' ' -f1)"
+          echo "roster_sha256: $(jq -cS .             <<<"$CALLERS_JSON" | sha256sum | cut -d' ' -f1)"
+
+          echo "=== end ==="
