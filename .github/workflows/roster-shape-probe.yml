@@ -1,6 +1,9 @@
 name: Roster shape probe (TEMPORARY)
 
-# TEMPORARY — DELETE THIS FILE ONCE THE ROSTERS ARE CAPTURED.
+# TEMPORARY — DELETE THIS FILE ONCE THE ROSTERS ARE CAPTURED. It also EXPIRES:
+# the `EXPIRES` date below makes every dispatch after it fail before the secret
+# is read, so a forgotten copy on `main` goes dead on its own instead of staying
+# a re-runnable roster endpoint until someone remembers.
 #
 # Why this exists. A caller roster lives ONLY inside a write-only Actions secret:
 # `gh secret set` overwrites wholesale and there is no `gh secret get`. So nobody
@@ -19,16 +22,34 @@ name: Roster shape probe (TEMPORARY)
 # not by masking:
 #
 #   * field NAMES, never values;
-#   * booleans and LENGTHS, never the strings they measure;
-#   * workflow FILENAMES, which are `.github/workflows/*.yml` paths shared across
-#     repos and name no repo;
-#   * a sha256 over the repo list, which verifies a reconstruction I already hold
-#     while revealing nothing about one I do not — the same trick, and the same
-#     reasoning, as the bumper's own audit line.
+#   * booleans, LENGTHS and TYPE markers, never the strings they measure;
+#   * workflow FILENAMES — but only ones drawn from the public vocabulary of
+#     reusables THIS repo ships (`cursor-review.yml`, `ci-groom.yml`, …). An
+#     entry whose filename is anything else prints as `<unlisted>`: the roster
+#     is exactly what this probe cannot vouch for, and a path like
+#     `ci-cursor-review-<codename>.yml` is a well-formed path that names a
+#     private product;
+#   * ONE sha256, over the whole canonical roster — the bumper's existing audit
+#     digest, reproduced here so the run that printed the shape and the digest
+#     it must reconcile against are the same run. It verifies a reconstruction
+#     the operator already holds. No per-field digests: `sha256(map(.repo))`
+#     with the count and filenames published beside it is an unsalted
+#     membership oracle over an enumerable `Comfy-Org/*` namespace, and
+#     `sha256(map(.label))` over a three-word label vocabulary is just the
+#     labels in a thin wrapper.
 #
-# What is deliberately NOT printed: any repo name, any label text, and any repo
-# name LENGTH. The last one would be a genuine (if small) fingerprint of a
-# private repo, and "small" is not the standard this repo holds itself to.
+# What is deliberately NOT printed: any repo name, any label text, any repo
+# name LENGTH, and any filename outside the public vocabulary. A name length
+# would be a genuine (if small) fingerprint of a private repo, and "small" is
+# not the standard this repo holds itself to.
+#
+# Residual, stated plainly: the whole-roster digest's preimage is the ordered
+# repo list plus label text once the shape lines are known. For a fleet-sized
+# roster that space is not enumerable offline; for a ONE-entry roster it
+# collapses to "is it this repo?". That residual is the bumper's audit line's
+# residual already (it prints count + digest on every run, and filenames are
+# guessable by convention), and `.github/bump-callers/README.md` names the
+# only real fix — a keyed HMAC — which is out of scope for a throwaway probe.
 #
 # Adding a line here means re-answering that question for the new line. If you
 # cannot state why it discloses nothing, it does not go in.
@@ -40,9 +61,14 @@ on:
         description: Which roster secret to probe
         required: true
         type: choice
+        # Every roster in the bump-callers README fleet table. `AREA_LABEL_CALLERS`
+        # is NOT `AUTO_LABEL_CALLERS` — area-label is the `pr-area-label.yml`
+        # fleet, auto-label is the `cursor-review-auto-label.yml` one.
+        # `PR_RISK_CALLERS` is shared by the pr-risk and pr-derisk fleets.
         options:
           - CURSOR_REVIEW_CALLERS
           - AGENTS_MD_CALLERS
+          - AREA_LABEL_CALLERS
           - AUTO_LABEL_CALLERS
           - GROOM_CALLERS
           - PR_SIZE_CALLERS
@@ -58,24 +84,78 @@ permissions:
 
 jobs:
   probe:
-    # Same main-only guard every bump entrypoint carries: this reads a
-    # production secret, so it must not be runnable from an unreviewed ref.
-    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      # Runs BEFORE any step that carries the secret in its `env:`, and fails
+      # loudly instead of skipping: a job-level `if:` would report a non-main
+      # dispatch as a green no-op with nothing in the log saying why.
+      #
+      # Be honest about what the ref check is. It is NOT a security boundary:
+      # `workflow_dispatch` runs the workflow file as it exists on the
+      # DISPATCHED ref, with the repo's secrets, so anyone with push access can
+      # branch, replace this body with `echo "$CALLERS_JSON"` and dispatch that.
+      # That is GitHub's trust model for every secret in every repo — write
+      # access is secrets access — and every `bump-*-callers.yml` entrypoint
+      # sits on the same footing. What this check DOES do is keep the reviewed
+      # body on `main` the one that runs by default, refuse a stale ref, and
+      # make a mistaken dispatch red rather than silently green. A protected
+      # `environment:` with required reviewers would be a real gate; it is a
+      # repo-settings change, not a workflow-file one, and a throwaway probe
+      # with a hard expiry date does not earn a permanent environment.
+      - name: Refuse a non-main ref, an unknown roster name, or an expired probe
+        env:
+          REF: ${{ github.ref }}
+          ROSTER_NAME: ${{ inputs.roster }}
+          # After this date every dispatch fails here. Bump it deliberately if
+          # the capture genuinely needs longer; do not let it float.
+          EXPIRES: "2026-09-30"
+        run: |
+          set -euo pipefail
+
+          if [[ "$REF" != "refs/heads/main" ]]; then
+            echo "::error::This probe reads a production secret and only runs from main (dispatched from ${REF}). Re-dispatch on main."
+            exit 1
+          fi
+
+          # A literal allowlist, independent of the `type: choice` validation
+          # above. The next step indexes the `secrets` context by this name, so
+          # if `type:` is ever relaxed the choice list must not become the only
+          # thing standing between a free-text input and every secret on the
+          # repo (set/unset + is-it-a-JSON-array, per secret name).
+          case "$ROSTER_NAME" in
+            CURSOR_REVIEW_CALLERS|AGENTS_MD_CALLERS|AREA_LABEL_CALLERS|AUTO_LABEL_CALLERS|GROOM_CALLERS|PR_SIZE_CALLERS|PR_RISK_CALLERS|LINEAR_TICKET_CALLERS|ASSIGN_REVIEWERS_CALLERS|DETECT_UNREVIEWED_MERGE_CALLERS|CODERABBIT_CONFIG_CALLERS|PUBLIC_REPO_HYGIENE_CALLERS) ;;
+            *)
+              echo "::error::'${ROSTER_NAME}' is not a roster this probe knows. Add it to BOTH the choice list and this case list, or pick one of the listed rosters."
+              exit 1
+              ;;
+          esac
+
+          TODAY=$(date -u +%F)
+          if [[ "$TODAY" > "$EXPIRES" ]]; then
+            echo "::error::This probe expired on ${EXPIRES} (today is ${TODAY}). It was TEMPORARY — delete .github/workflows/roster-shape-probe.yml, or bump EXPIRES on purpose if a capture is still outstanding."
+            exit 1
+          fi
+
       - name: Probe roster structure
         env:
-          # Indexed off the choice input so one throwaway workflow can capture
-          # every uncaptured roster instead of needing eleven near-copies — the
-          # drift pattern `.github/bump-callers/` exists to prevent.
+          # Indexed off the (allowlisted, above) choice input so one throwaway
+          # workflow can capture every uncaptured roster instead of needing a
+          # dozen near-copies — the drift pattern `.github/bump-callers/` exists
+          # to prevent.
           #
           # A SECRET, exactly as in every bump entrypoint (BE-6472): Actions
           # prints a step's `env:` block BEFORE the step runs, so a variable's
           # raw value would be published here in the clear, ahead of anything
           # this script could do about it.
-          CALLERS_JSON: ${{ secrets[format('{0}', inputs.roster)] }}
+          CALLERS_JSON: ${{ secrets[inputs.roster] }}
           ROSTER_NAME: ${{ inputs.roster }}
+          # The public filename vocabulary: every reusable this repo ships,
+          # optionally under the `ci-` prefix its own self-enrolment callers
+          # use. Anchored `\A`/`\z` for the same reason `bump-callers.sh` is
+          # (`$` matches before a trailing newline). A filename outside this
+          # set is NOT printed — see the header.
+          FILE_ALLOW: '\A[.]github/workflows/(ci-)?(agents-md-integrity|assign-prs-to-author|assign-reviewers|coderabbit-config-validate|cursor-review|cursor-review-auto-label|detect-unreviewed-merge|groom|linear-ticket|pr-area-label|pr-derisk|pr-risk|pr-size|public-repo-hygiene|refresh-reviewers|stale)[.]ya?ml\z'
         run: |
           set -euo pipefail
 
@@ -85,45 +165,67 @@ jobs:
             exit 1
           fi
 
-          # Fail on a roster that is not a JSON array BEFORE reading fields off
-          # it, so a malformed secret reports as malformed rather than as a
-          # roster with zero entries.
-          if ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$CALLERS_JSON"; then
-            echo "::error::${ROSTER_NAME} did not parse as a JSON array."
+          # Fail on a roster that is not a JSON array OF OBJECTS before reading
+          # fields off it, so a malformed secret reports as malformed rather
+          # than as a roster with zero entries — or, worse, as a green run with
+          # blank fields because `has()`/`.file`/`keys` errored on a string.
+          if ! jq -e 'type == "array" and all(.[]; type == "object")' >/dev/null 2>&1 <<<"$CALLERS_JSON"; then
+            echo "::error::${ROSTER_NAME} did not parse as a JSON array of objects."
             exit 1
           fi
 
-          echo "=== ${ROSTER_NAME} — structure only, no names, no label text ==="
+          # Every value is computed INTO A VARIABLE and only then printed.
+          # Inside `echo "$(jq …)"` a failing jq is invisible to errexit: the
+          # substitution's status is discarded, the line prints a blank field
+          # and the step stays green — and a digest line would then hash empty
+          # stdin and print e3b0c442…b855, a well-formed 64-hex digest of
+          # nothing that no reconstruction can ever match. `bump-callers.sh`
+          # guards the same trap the same way.
 
           # (1) The exact field set(s). `unique` collapses entries that agree, so
           #     one element means every entry has the same shape and more than
           #     one names the entries that differ.
-          echo "keys:          $(jq -cS 'map(keys) | unique' <<<"$CALLERS_JSON")"
+          KEYS=$(jq -cS 'map(keys) | unique' <<<"$CALLERS_JSON")
 
           # (2) Entry count — cross-checks the bumper's own audit line.
-          echo "count:         $(jq -c 'length' <<<"$CALLERS_JSON")"
+          COUNT=$(jq -c 'length' <<<"$CALLERS_JSON")
 
-          # (3) Per-position booleans and lengths, keyed on `has()` rather than
-          #     on `// null`. That distinction is the whole point: `false // null`
-          #     is null in jq (only `null` and `false` are falsy), so the shorter
-          #     spelling reports a present-and-false `wire_bot` and an ABSENT one
-          #     identically — and those two serialize differently under `jq -cS`,
-          #     which would leave the reconstruction unfalsifiable against the
-          #     digest. `has()` reports absence and value independently.
-          echo "wire_bot:      $(jq -c '[.[] | if has("wire_bot") then .wire_bot else null end]' <<<"$CALLERS_JSON")"
-          echo "label_len:     $(jq -c '[.[] | if has("label") then (.label | length) else null end]' <<<"$CALLERS_JSON")"
+          # (3) Per-position booleans / lengths / type markers. Four states are
+          #     kept DISTINCT because they serialize differently under `jq -cS`
+          #     and a reconstruction must reproduce the digest byte-for-byte:
+          #       absent key            -> "absent"
+          #       present, JSON null    -> null
+          #       present, boolean      -> true / false   (wire_bot)
+          #       present, string       -> its length     (label; never text)
+          #       present, other type   -> "<type>"       (a numeric label must
+          #                                not print its own value: jq's
+          #                                `length` of a number is |n|)
+          #     `has()` rather than `// null`: only null and false are falsy in
+          #     jq, so `.wire_bot // null` reports a present-and-FALSE wire_bot
+          #     and an ABSENT one identically.
+          WIRE_BOT=$(jq -c '[.[] | if has("wire_bot") then (.wire_bot | if type == "boolean" or type == "null" then . else "<\(type)>" end) else "absent" end]' <<<"$CALLERS_JSON")
+          LABEL_LEN=$(jq -c '[.[] | if has("label") then (.label | if type == "string" then length elif type == "null" then null else "<\(type)>" end) else "absent" end]' <<<"$CALLERS_JSON")
 
-          # (4) Filenames in roster order. These are `.github/workflows/*.yml`
-          #     paths, shared across repos and naming none of them.
-          echo "files:         $(jq -c '[.[] | .file]' <<<"$CALLERS_JSON")"
+          # (4) Filenames in roster order — verbatim ONLY when drawn from the
+          #     public vocabulary in FILE_ALLOW, `<unlisted>` otherwise (which
+          #     still tells the operator which positions to reconcile against
+          #     the filenames recovered from the fleet's own bump PRs).
+          FILES=$(jq -c --arg re "$FILE_ALLOW" '[.[] | if has("file") and (.file | type == "string") and (.file | test($re)) then .file else "<unlisted>" end]' <<<"$CALLERS_JSON")
 
-          # (5) Digests that VERIFY a candidate without revealing the original.
-          #     Reproduce locally against a reconstruction:
-          #       jq -cS 'map(.repo)'  candidate.json | sha256sum
-          #       jq -cS 'map(.label)' candidate.json | sha256sum
-          #       jq -cS .             candidate.json | sha256sum   # the full one
-          echo "repos_sha256:  $(jq -cS 'map(.repo)'  <<<"$CALLERS_JSON" | sha256sum | cut -d' ' -f1)"
-          echo "labels_sha256: $(jq -cS 'map(.label)' <<<"$CALLERS_JSON" | sha256sum | cut -d' ' -f1)"
-          echo "roster_sha256: $(jq -cS .             <<<"$CALLERS_JSON" | sha256sum | cut -d' ' -f1)"
+          # (5) The whole-roster digest, computed exactly as the bumper's audit
+          #     line does. Reproduce locally against a reconstruction:
+          #       jq -cS . candidate.json | sha256sum
+          DIGEST=$(jq -cS . <<<"$CALLERS_JSON" | sha256sum | cut -d' ' -f1)
+          if [[ ! "$DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::roster digest did not come back as 64 hex chars (got '${DIGEST}') — sha256sum/cut failed; nothing printed."
+            exit 1
+          fi
 
+          echo "=== ${ROSTER_NAME} — structure only, no names, no label text ==="
+          echo "keys:          ${KEYS}"
+          echo "count:         ${COUNT}"
+          echo "wire_bot:      ${WIRE_BOT}"
+          echo "label_len:     ${LABEL_LEN}"
+          echo "files:         ${FILES}"
+          echo "roster_sha256: ${DIGEST}"
           echo "=== end ==="
