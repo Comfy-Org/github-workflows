@@ -119,19 +119,41 @@ checkout out of the lint:
   (whether the quote opens alone at end of line or with text — `ref: "${{` /
   `inputs.workflows_ref }}"` — both open the continuation window), where the
   `#` is literal content — only the plain `ref:`-then-value spelling ends at
-  one;
-- on any line the line ABOVE left mid-scalar, such as the tail of a flow
-  mapping split across lines (`- {name: "foo` / `bar # baz", …}`) — the
-  stripper rescans each physical line from scratch and would read that closing
-  quote's `#` as an opener.
+  one. Both halves of the continuation read that same text: the step-output
+  reader is handed it too, so `ref: >-` / `x # ${{ steps.r.outputs.ref }}` is
+  a checkout at the step output, not an `x`;
+- on any line while a quoted scalar opened ABOVE is still open, such as the
+  tail of a flow mapping split across lines (`- {name: "foo` / `bar` /
+  `baz # qux", …}`) — the stripper rescans each physical line from scratch and
+  would read that closing quote's `#` as an opener. The walk carries the
+  quote state forward, line to line, until a line actually closes the scalar;
+  it reads quotes the strict way (a quote opens a scalar only where a YAML
+  node can start — after `:`, `,`, `{`, `[`, a `- ` marker, or a `&anchor` /
+  `!tag` in that position), so the apostrophe of a `name: don't fail` does
+  not suspend the strip for the rest of the job.
 
-Both fall back to the raw line, which is only ever the fail-closed direction:
-worst case a comment there costs an annotation, never coverage. For the same
-reason the strip is deliberately over-protective about quotes — **any** quote
-opens a masked region, so an apostrophe earlier on the line (`name: don't
-resolve  # …`) leaves the `#` unstripped and the comment is read as config
-after all. Rare, and it fails closed; if a comment is somehow changing a
-verdict, that is the first thing to look for.
+Both fall back to the raw line — the pre-BE-9129 reading, and the value the
+runtime folds into the ref — so the site is never dropped: worst case the text
+past a `#` costs an annotation. Note that "raw" means judged as *value*: a
+`# resolved from inputs.workflows_ref` inside a `|` body is a named mention of
+the input and is read exactly as the same words spelled on one line without
+the `#` — an input use, not a step-output checkout — because inside that body
+it is not a comment at all (and the ref it produces, `<sha>  # resolved from
+…`, is not a git ref any checkout can land on). For the same reason the strip
+is deliberately over-protective about quotes — **any** quote opens a masked
+region, so an apostrophe earlier on the line (`name: don't resolve  # …`)
+leaves the `#` unstripped and the comment is read as config after all. Rare,
+and it fails closed; if a comment is somehow changing a verdict, that is the
+first thing to look for.
+
+The continuation window itself opens on every spelling YAML gives a multi-line
+`ref:`: the bare `ref:`, a `|`/`>` header with its chomping and indentation
+indicators in either order (`>-2` and `>2-` alike), a quote left open at end
+of line or after text (`ref: "${{`), and a plain scalar that carries text on
+the key line and folds onto the more-indented lines below (`ref: ${{` /
+`inputs.workflows_ref }}`, `ref: ${{ 'main' ||` / `steps.r.outputs.ref }}`).
+A `ref: main` that stands alone opens nothing — the next line at or above its
+indent closes the window with nothing recorded.
 
 A step written as ONE flow mapping that both binds `WORKFLOWS_REF` in its `env:`
 and reads a step output in its `with: {ref: … }` is judged like any other

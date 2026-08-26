@@ -3697,6 +3697,205 @@ class GuardCoverageTests(unittest.TestCase):
         self.assertEqual(self._states(steps), [])
         self.assertEqual(self._jobs(steps), [])
 
+    # ------------------------------------------------------------------
+    # Review round 2 (BE-9129): the raw-line fallbacks above are only worth
+    # their name if they engage wherever the stripper would truncate value —
+    # so the gate that decides "is this `#` a comment" is pinned from both
+    # sides, on every shape the panel found it silent for.
+    # ------------------------------------------------------------------
+
+    def test_a_scalar_left_open_across_a_quote_free_middle_line_stays_open(self):
+        # The quote state is CARRIED across physical lines, not re-derived
+        # from each: the middle line here has no quote at all, so a per-line
+        # scan read it as closing nothing and the tail's closing `"` as an
+        # opener — the ` #` before it was then stripped, checkout and all.
+        steps = (
+            '      - {name: "foo\n'
+            "        bar\n"
+            '        baz # qux", uses: actions/checkout@abc, '
+            'with: {ref: "${{ inputs.workflows_ref }}"}}\n'
+        )
+        self.assertEqual(len(self._jobs(steps)), 1)
+        # …and across MORE than one, including one whose quotes are balanced.
+        deeper = steps.replace("        bar\n", "        bar\n        'b' c\n")
+        self.assertNotEqual(deeper, steps, "fixture drifted")
+        self.assertEqual(len(self._jobs(deeper)), 1)
+
+    def test_the_carried_quote_state_ends_where_the_scalar_closes(self):
+        # Sticky only until a line actually closes the scalar: the step after
+        # the split flow mapping is judged stripped again, so its explanatory
+        # comment does not turn a guarded step-output checkout unguarded.
+        steps = (
+            self.COMMENT_RESOLVER
+            + '      - {name: "foo\n'
+            "        bar\n"
+            '        baz # qux", run: echo hi}\n'
+            + self.COMMENTED_CONSUMER
+        )
+        self.assertEqual(self._states(steps), [(False, True, True)])
+        self.assertEqual(self._jobs(steps), [])
+
+    def test_a_ref_key_inside_a_carried_open_scalar_opens_no_window(self):
+        # While the line above's scalar is still open, a `ref: "${{` on this
+        # line is string CONTENT of that scalar (the step's `name:` here), not
+        # a key — so it must not open the quoted continuation window and blame
+        # the mention on the next line on a checkout that does not exist. The
+        # step's real `ref:` is `main`; nothing is recorded.
+        steps = (
+            "      - {name: 'foo\n"
+            '        ref: "${{\n'
+            "          inputs.workflows_ref }}', uses: actions/checkout@abc, "
+            "with: {ref: main}}\n"
+        )
+        self.assertEqual(self._states(steps), [])
+
+    def test_a_quote_behind_node_properties_opens_a_scalar(self):
+        # `&anchor` / `!tag` sit between the `:` and the node's content, and
+        # the strict quote reading used to walk back only over spaces and
+        # openers — so the gate saw no open scalar on the first line while the
+        # stripper truncated the second at its ` #`. A two-line span, so this
+        # is independent of the carried state above.
+        steps = (
+            '      - {name: &label !!str "resolve\n'
+            '        literal # content", uses: actions/checkout@abc, '
+            'with: {ref: "${{ inputs.workflows_ref }}"}}\n'
+        )
+        self.assertEqual(len(self._jobs(steps)), 1)
+        # The same property in front of a one-line value: `_flow_brace_delta`
+        # and the flow id scan read through the same rule, so a `,` and a `}`
+        # inside that scalar are content — the real `id:` is still collected
+        # and its consumer is judged, not dropped as a stranger's step.
+        self.assertTrue(cwp._opens_quoted_scalar('- {name: &a !!str "x', 18))
+        self.assertTrue(cwp._opens_quoted_scalar("- !!str 'x", 8))
+        # …while a token that merely CONTAINS the character is a plain scalar.
+        self.assertFalse(cwp._opens_quoted_scalar("- {name: a&b 'c", 13))
+        self.assertFalse(cwp._opens_quoted_scalar("- {name: x!y'z", 12))
+
+    def test_a_block_scalar_body_keeps_a_step_output_past_a_hash(self):
+        # The step-output half of the continuation reads the SAME gated text
+        # as the input-mention half: inside a `>-` body the ` #` is content the
+        # runtime folds into the ref, so `x # ${{ steps.r.outputs.ref }}` is a
+        # checkout at the step output — used to strip to `x` and record
+        # nothing. Judged on the consumer's `if:`, like the one-line spelling.
+        consumer = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: >-\n"
+            "            x # ${{ steps.r.outputs.ref }}\n"
+        )
+        self.assertEqual(
+            self._states(self.COMMENT_RESOLVER + consumer), [(False, False, True)]
+        )
+        self.assertEqual(len(self._jobs(self.COMMENT_RESOLVER + consumer)), 1)
+        guarded = consumer.replace(
+            "        uses:", "        if: steps.r.outputs.ref != ''\n        uses:"
+        )
+        self.assertEqual(
+            self._states(self.COMMENT_RESOLVER + guarded), [(False, True, True)]
+        )
+
+    def test_a_hash_in_a_block_body_is_judged_as_the_same_words_on_one_line(self):
+        # Inside a `|` body the text past a ` #` is VALUE, not a comment, and
+        # it is judged exactly as the same words spelled on one line without
+        # the `#`: a named mention of the input, so an input use — whatever
+        # the ref resolves to at runtime. Pinned so the two spellings cannot
+        # drift apart.
+        block = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: |\n"
+            "            ${{ steps.r.outputs.ref }}  # resolved from inputs.workflows_ref\n"
+        )
+        one_line = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ steps.r.outputs.ref }} resolved from inputs.workflows_ref\n"
+        )
+        self.assertEqual(
+            self._states(self.COMMENT_RESOLVER + block),
+            self._states(self.COMMENT_RESOLVER + one_line),
+        )
+        self.assertEqual(self._states(self.COMMENT_RESOLVER + block), [(False, False, False)])
+
+    def test_the_plain_gate_alone_decides_whether_a_continuation_is_stripped(self):
+        # Isolates `pending[2]`: the mention sits after an unquoted ` #` on a
+        # continuation whose predecessor left NO quote open, so the carried
+        # state cannot rescue it — only the opener's style can. Under `>-` the
+        # `#` is content and the input is checked out; under the bare `ref:`
+        # YAML ends the scalar at the ` #`, the runtime ref is `x`, and there
+        # is nothing to report.
+        folded = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: >-\n"
+            "            x # ${{ inputs.workflows_ref }}\n"
+        )
+        self.assertEqual(len(self._jobs(folded)), 1)
+        plain = folded.replace("ref: >-", "ref:")
+        self.assertNotEqual(plain, folded, "fixture drifted")
+        self.assertEqual(self._jobs(plain), [])
+
+    def test_a_block_header_with_its_indicators_reversed_still_opens_the_window(self):
+        # YAML takes the chomping and explicit-indentation indicators in
+        # either order; the opener accepted `>-2` and rejected `>2-`, a
+        # one-character bypass of the whole window.
+        for header in (">2-", "|2-", ">-2", "|+2", ">2", "|2+"):
+            steps = self.FOLDED_CHECKOUT.replace("ref: >-", "ref: " + header)
+            self.assertNotEqual(steps, self.FOLDED_CHECKOUT, header)
+            self.assertEqual(len(self._jobs(steps)), 1, header)
+            self.assertEqual(self._jobs(self.GUARD + steps), [], header)
+
+    # A plain scalar that carries text on the key line and continues below.
+    # YAML folds `${{` / `inputs.workflows_ref }}` to the one-line checkout at
+    # the input; the key line names no input and no quote or block indicator
+    # opened it, so no reader saw a window at all.
+    PLAIN_SPLIT_CHECKOUT = FOLDED_CHECKOUT.replace(
+        "ref: >-\n            ${{ inputs.workflows_ref }}",
+        "ref: ${{\n            inputs.workflows_ref }}",
+    )
+
+    def test_a_plain_scalar_split_after_its_opening_text_is_not_an_escape_hatch(self):
+        self.assertNotEqual(self.PLAIN_SPLIT_CHECKOUT, self.FOLDED_CHECKOUT, "fixture drifted")
+        self.assertEqual(len(self._jobs(self.PLAIN_SPLIT_CHECKOUT)), 1)
+        self.assertEqual(self._jobs(self.GUARD + self.PLAIN_SPLIT_CHECKOUT), [])
+        # A prefix ahead of the interpolation is the same fold.
+        prefixed = self.PLAIN_SPLIT_CHECKOUT.replace("ref: ${{", "ref: refs/heads/${{")
+        self.assertEqual(len(self._jobs(prefixed)), 1)
+
+    def test_a_plain_split_step_output_is_folded_before_it_is_judged(self):
+        # The seeded fold: the key line's `${{ 'main' ||` parses nothing on
+        # its own, and the continuation's bare `steps.r.outputs.ref }}` is a
+        # loose mention the strict tier cannot place — joined, it is the
+        # non-leading operand BE-8215 refuses.
+        steps = (
+            self.COMMENT_RESOLVER
+            + "      - name: Load assets\n"
+            "        if: steps.r.outputs.ref != ''\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ 'main' ||\n"
+            "            steps.r.outputs.ref }}\n"
+        )
+        self.assertEqual(self._states(steps), [(False, False, "non-leading")])
+
+    def test_a_plain_ref_that_stands_alone_opens_nothing(self):
+        # `ref: main` followed by a shallower key: the window closes with
+        # nothing recorded, and the input on that key is not blamed on it.
+        steps = (
+            "      - name: Literal ref\n"
+            "        with:\n"
+            "          ref: main  # ${{ inputs.workflows_ref }}\n"
+            "        env:\n"
+            "          X: ${{ inputs.workflows_ref }}\n"
+        )
+        self.assertEqual(self._states(steps), [])
+        # …and as the LAST line of the job, where no line ever closes it.
+        self.assertEqual(self._states(steps[: steps.index("        env:")]), [])
+
 
 
 class CheckDirTests(unittest.TestCase):
