@@ -3453,6 +3453,140 @@ class GuardCoverageTests(unittest.TestCase):
         # weakest copy, so require them byte-identical.
         self.assertEqual(len(set(bodies)), 1, "the 7 groom guard steps have drifted apart")
 
+    # ------------------------------------------------------------------
+    # Trailing comments (BE-9129). The per-line arm selection used to run on
+    # the RAW physical line, and `_REF_USE_BLOCK_RE`'s `.*` spans a trailing
+    # `#` comment — so a `ref: ${{ steps.r.outputs.ref }}  # from
+    # inputs.workflows_ref` took the INPUT-use arm and a correctly
+    # `if:`-guarded checkout was reported unguarded, while a comment carrying
+    # `{WORKFLOWS_REF: "${{ … }}"}` registered a resolver that does not exist.
+    # Both directions are the arm selection reading prose as config.
+    # ------------------------------------------------------------------
+
+    # The minimal resolve-then-consume pair, deliberately smaller than
+    # `RESOLVER`: the comment, not the guard shape, is what is under test.
+    COMMENT_RESOLVER = (
+        "      - name: Resolve the asset ref\n"
+        "        id: r\n"
+        "        env:\n"
+        "          WORKFLOWS_REF: ${{ inputs.workflows_ref }}\n"
+        '        run: echo "ref=x" >> "$GITHUB_OUTPUT"\n'
+    )
+    COMMENTED_CONSUMER = (
+        "      - name: Load assets\n"
+        "        if: steps.r.outputs.ref != ''\n"
+        "        uses: actions/checkout@abc\n"
+        "        with:\n"
+        "          ref: ${{ steps.r.outputs.ref }}  # resolved from inputs.workflows_ref\n"
+    )
+    # The same consumer with the value on its own line — the block-scalar /
+    # plain multi-line spelling, judged on the CONTINUATION line, which had the
+    # identical raw-line bug in `mention_re.search`.
+    COMMENTED_CONSUMER_CONT = (
+        "      - name: Load assets\n"
+        "        if: steps.r.outputs.ref != ''\n"
+        "        uses: actions/checkout@abc\n"
+        "        with:\n"
+        "          ref:\n"
+        "            ${{ steps.r.outputs.ref }}  # resolved from inputs.workflows_ref\n"
+    )
+
+    def test_an_explanatory_comment_does_not_unguard_a_step_output_checkout(self):
+        # Before the fix: (False, False, False) and one unguarded site — the
+        # comment alone flipped a compliant workflow red.
+        steps = self.COMMENT_RESOLVER + self.COMMENTED_CONSUMER
+        self.assertEqual(self._states(steps), [(False, True, True)])
+        self.assertEqual(self._jobs(steps), [])
+
+    def test_an_explanatory_comment_on_a_continuation_line_does_not_unguard(self):
+        steps = self.COMMENT_RESOLVER + self.COMMENTED_CONSUMER_CONT
+        self.assertEqual(self._states(steps), [(False, True, True)])
+        self.assertEqual(self._jobs(steps), [])
+
+    def test_a_comment_that_looks_like_a_flow_binding_registers_no_resolver(self):
+        # `_GUARD_BINDING_FLOW_RE` searches unanchored, so a binding spelled
+        # inside a COMMENT used to register `d` as a resolver of the input —
+        # which pulled its consumer into scope as a covered-by-`if:` site and
+        # then reported it for having no `if:`. The comment configures nothing;
+        # the step must be as invisible as it is without it.
+        decoy = (
+            '      - name: resolve  # {WORKFLOWS_REF: "${{ inputs.workflows_ref }}"}\n'
+            "        id: d\n"
+            "        run: echo ok\n"
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ steps.d.outputs.ref }}\n"
+        )
+        # Before the fix: [(False, False, True)] — an unguarded site invented
+        # out of a comment.
+        self.assertEqual(self._states(decoy), [])
+        self.assertEqual(self._jobs(decoy), [])
+        # …and identical to the same steps with the comment deleted, which is
+        # the whole claim: the comment changes no verdict.
+        plain = decoy.replace(
+            '  # {WORKFLOWS_REF: "${{ inputs.workflows_ref }}"}', ""
+        )
+        self.assertNotEqual(plain, decoy, "fixture drifted")
+        self.assertEqual(self._states(plain), [])
+
+    def test_a_literal_ref_with_the_input_only_in_a_comment_is_not_a_ref_use(self):
+        # `ref: main` checks out a branch, not the input. The mention lives
+        # entirely past the `#`.
+        steps = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: main  # {WORKFLOWS_REF: ${{ inputs.workflows_ref }}}\n"
+        )
+        self.assertEqual(self._states(steps), [])
+        self.assertEqual(self._jobs(steps), [])
+
+    def test_a_real_binding_still_guards_when_it_carries_a_comment(self):
+        # Fail-closed direction: stripping must not cost a REAL guard its
+        # binding. `_GUARD_BINDING_RE` already tolerated a trailing comment, so
+        # this pins that the stripped-text arm selection keeps it that way.
+        guard = self.GUARD.replace(
+            "WORKFLOWS_REF: ${{ inputs.workflows_ref }}",
+            "WORKFLOWS_REF: ${{ inputs.workflows_ref }}  # bound",
+        )
+        self.assertNotEqual(guard, self.GUARD, "fixture drifted")
+        steps = guard + self.CHECKOUT
+        self.assertEqual(self._states(steps), [(False, True, False)])
+        self.assertEqual(self._jobs(steps), [])
+
+    def test_an_unguarded_input_checkout_with_a_comment_is_still_reported(self):
+        # The other fail-closed direction, both spellings: a comment must not
+        # buy an unguarded checkout its way OUT of the lint either.
+        same_line = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ inputs.workflows_ref }}  # note\n"
+        )
+        self.assertEqual(len(self._jobs(same_line)), 1)
+        continuation = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref:\n"
+            "            ${{ inputs.workflows_ref }}  # note\n"
+        )
+        self.assertEqual(len(self._jobs(continuation)), 1)
+
+    def test_a_run_body_line_mentioning_the_input_records_no_site(self):
+        # `_strip_comment` deliberately OVER-protects a line it cannot prove is
+        # YAML (see its docstring): inside a `run: |` body, `# PR #${n}` is
+        # literal shell, not a comment. Unchanged by this fix in either
+        # direction — no site before, no site after.
+        steps = (
+            "      - name: Say\n"
+            "        run: |\n"
+            '          echo "ref: ${{ inputs.workflows_ref }} # PR #${n}"\n'
+        )
+        self.assertEqual(self._states(steps), [])
+        self.assertEqual(self._jobs(steps), [])
+
 
 
 class CheckDirTests(unittest.TestCase):

@@ -2566,7 +2566,10 @@ def ref_checkouts(lines, dropped=None):
         for i, line in _block_body(lines, start, job_indent):
             if pending is not None:
                 if _indent(line) > pending[1]:
-                    if mention_re.search(line):
+                    # Stripped for the same reason the arm selection below
+                    # is — a trailing `# … inputs.workflows_ref` on the
+                    # continuation is prose, not the value the runtime folds.
+                    if mention_re.search(_strip_comment(line)):
                         # Report the `ref:` KEY line (that is the checkout the
                         # reader must find), but judge the CONTINUATION line —
                         # the key never holds the expression, so asking it
@@ -2618,15 +2621,28 @@ def ref_checkouts(lines, dropped=None):
                     continue
                 # Scalar closed — fall through and judge this line normally.
                 pending = None
-            binding = _GUARD_BINDING_RE.match(line)
+            # Arm selection reads the COMMENT-STRIPPED text, not the raw
+            # line: `_REF_USE_BLOCK_RE`'s `.*` otherwise spans a trailing
+            # comment, so `ref: ${{ steps.r.outputs.ref }}  # from
+            # inputs.workflows_ref` takes the input-use arm and a correctly
+            # `if:`-guarded checkout is reported unguarded — and the same `.*`
+            # the other way lets a comment carrying `{WORKFLOWS_REF: "${{
+            # inputs.workflows_ref }}"}` register a phantom resolver. Same
+            # precedent as `_steps_output_sites`, which strips before either
+            # tier, and the `_STEP_IF_RE` consumers that read `_unmarked`.
+            # ONLY these three classifiers see `code`; every other reader in
+            # this loop keeps the RAW line, because `_strip_comment` also drops
+            # the leading indentation they judge by column.
+            code = _strip_comment(line)
+            binding = _GUARD_BINDING_RE.match(code)
             flow_binding = False
-            ref_use = binding is None and is_ref_use(line, ref_res)
+            ref_use = binding is None and is_ref_use(code, ref_res)
             if binding is None and not ref_use:
                 # The flow binding is only taken for a line that is not ALSO a
                 # ref use — a whole step written as one flow mapping can carry
                 # both, and the binding branch would swallow the checkout
                 # unreported. Reporting wins: fail-closed, as everywhere else.
-                binding = _GUARD_BINDING_FLOW_RE.search(line)
+                binding = _GUARD_BINDING_FLOW_RE.search(code)
                 flow_binding = binding is not None
             if binding:
                 # NO fallback exception on the guard requirement (BE-8077). The
