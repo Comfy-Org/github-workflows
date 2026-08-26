@@ -21,8 +21,15 @@ name: Roster shape probe (TEMPORARY)
 # nothing here. Every line below is therefore non-disclosing BY CONSTRUCTION,
 # not by masking:
 #
-#   * field NAMES, never values;
-#   * booleans, LENGTHS and TYPE markers, never the strings they measure;
+#   * field NAMES — and only the four the bumper documents (`repo`, `file`,
+#     `label`, `wire_bot`). Any other key prints as `<unlisted-key>`: the
+#     bumper tolerates unknown keys, so a stray `"note": "<codename>"` or a
+#     paste mistake shaped like `{"Comfy-Org/<private>": {…}}` is a roster it
+#     would accept, and a key name is a value as far as a public log is
+#     concerned;
+#   * booleans and TYPE markers, never the strings they describe — and never a
+#     string's LENGTH either: over a three-word label vocabulary a length is
+#     the label;
 #   * workflow FILENAMES — but only ones drawn from the public vocabulary of
 #     reusables THIS repo ships (`cursor-review.yml`, `ci-groom.yml`, …). An
 #     entry whose filename is anything else prints as `<unlisted>`: the roster
@@ -36,20 +43,30 @@ name: Roster shape probe (TEMPORARY)
 #     with the count and filenames published beside it is an unsalted
 #     membership oracle over an enumerable `Comfy-Org/*` namespace, and
 #     `sha256(map(.label))` over a three-word label vocabulary is just the
-#     labels in a thin wrapper.
+#     labels in a thin wrapper;
+#   * and, for a roster SMALLER than `MIN_SHAPE_COUNT`, no shape lines at all —
+#     count + digest only (both already public via the bumper's audit line).
+#     The shape lines pin every component of the `jq -cS` preimage except the
+#     ordered repo list, and for a handful of entries that list is small enough
+#     to search offline against an already-public digest. Below the threshold
+#     the operator does the inverse search locally instead: the per-entry
+#     shape space (which keys, wire_bot state, label presence) is a few dozen
+#     states, trivially enumerable against the digest for a few entries.
 #
-# What is deliberately NOT printed: any repo name, any label text, any repo
-# name LENGTH, and any filename outside the public vocabulary. A name length
-# would be a genuine (if small) fingerprint of a private repo, and "small" is
-# not the standard this repo holds itself to.
+# What is deliberately NOT printed: any repo name, any label text or LENGTH,
+# any repo name LENGTH, any key name outside the documented four, and any
+# filename outside the public vocabulary. A name length would be a genuine (if
+# small) fingerprint of a private repo, and "small" is not the standard this
+# repo holds itself to.
 #
 # Residual, stated plainly: the whole-roster digest's preimage is the ordered
 # repo list plus label text once the shape lines are known. For a fleet-sized
 # roster that space is not enumerable offline; for a ONE-entry roster it
 # collapses to "is it this repo?". That residual is the bumper's audit line's
 # residual already (it prints count + digest on every run, and filenames are
-# guessable by convention), and `.github/bump-callers/README.md` names the
-# only real fix — a keyed HMAC — which is out of scope for a throwaway probe.
+# guessable by convention) — `MIN_SHAPE_COUNT` keeps this probe from making it
+# worse for small rosters — and `.github/bump-callers/README.md` names the only
+# real fix, a keyed HMAC, which is out of scope for a throwaway probe.
 #
 # Adding a line here means re-answering that question for the new line. If you
 # cannot state why it discloses nothing, it does not go in.
@@ -79,8 +96,10 @@ on:
           - CODERABBIT_CONFIG_CALLERS
           - PUBLIC_REPO_HYGIENE_CALLERS
 
-permissions:
-  contents: read
+# Nothing here checks out or calls `gh`, so the job needs no `GITHUB_TOKEN`
+# scope at all — least privilege for a job whose only purpose is reading a
+# production secret.
+permissions: {}
 
 jobs:
   probe:
@@ -109,6 +128,13 @@ jobs:
           ROSTER_NAME: ${{ inputs.roster }}
           # After this date every dispatch fails here. Bump it deliberately if
           # the capture genuinely needs longer; do not let it float.
+          #
+          # KEEP IT QUOTED and ISO (YYYY-MM-DD): the script validates the shape
+          # and hard-fails on anything else, because the expiry compare is a
+          # lexicographic one that is only correct on that shape — `2026-9-30`
+          # would never sort below a later 2026 date (the probe silently stops
+          # expiring), and an unquoted `2026-10-31` is a YAML timestamp that can
+          # reach the env reformatted and compare the other way.
           EXPIRES: "2026-09-30"
         run: |
           set -euo pipefail
@@ -131,7 +157,19 @@ jobs:
               ;;
           esac
 
+          # The expiry is the only automatic retirement a forgotten copy on
+          # `main` gets, so it must fail CLOSED: a malformed date is an error,
+          # not a date that happens to compare as "not yet".
+          ISO_DATE='^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+          if [[ ! "$EXPIRES" =~ $ISO_DATE ]]; then
+            echo "::error::EXPIRES must be a quoted ISO date (YYYY-MM-DD); got '${EXPIRES}'. A malformed value would compare wrongly and the probe would silently stop expiring — fix it, do not remove the check."
+            exit 1
+          fi
           TODAY=$(date -u +%F)
+          if [[ ! "$TODAY" =~ $ISO_DATE ]]; then
+            echo "::error::date -u +%F returned '${TODAY}', not an ISO date; refusing to compare against EXPIRES."
+            exit 1
+          fi
           if [[ "$TODAY" > "$EXPIRES" ]]; then
             echo "::error::This probe expired on ${EXPIRES} (today is ${TODAY}). It was TEMPORARY — delete .github/workflows/roster-shape-probe.yml, or bump EXPIRES on purpose if a capture is still outstanding."
             exit 1
@@ -150,27 +188,45 @@ jobs:
           # this script could do about it.
           CALLERS_JSON: ${{ secrets[inputs.roster] }}
           ROSTER_NAME: ${{ inputs.roster }}
+          # Below this many entries only count + digest are printed — see the
+          # header. Ordered n-tuples over a guessable `Comfy-Org/*` namespace of
+          # a couple of hundred names are an offline job at n=5 (~10^11
+          # digests) and not at n=8 (~10^17); below the threshold the operator
+          # searches the small per-entry shape space locally instead.
+          MIN_SHAPE_COUNT: "8"
           # The public filename vocabulary: every reusable this repo ships,
           # optionally under the `ci-` prefix its own self-enrolment callers
           # use. Anchored `\A`/`\z` for the same reason `bump-callers.sh` is
           # (`$` matches before a trailing newline). A filename outside this
           # set is NOT printed — see the header.
+          #
+          # This is a hand-copied snapshot of `.github/workflows/` (the job
+          # deliberately has no checkout to derive it from), so it can go STALE:
+          # a reusable added or renamed after this file's commit degrades a
+          # legitimate entry to `<unlisted>`, which is the fail-CLOSED direction
+          # and is indistinguishable here from a suppressed private filename.
+          # The output says so whenever an `<unlisted>` appears.
           FILE_ALLOW: '\A[.]github/workflows/(ci-)?(agents-md-integrity|assign-prs-to-author|assign-reviewers|coderabbit-config-validate|cursor-review|cursor-review-auto-label|detect-unreviewed-merge|groom|linear-ticket|pr-area-label|pr-derisk|pr-risk|pr-size|public-repo-hygiene|refresh-reviewers|stale)[.]ya?ml\z'
         run: |
           set -euo pipefail
 
           if [[ -z "${CALLERS_JSON:-}" ]]; then
             echo "::error::${ROSTER_NAME} is unset or empty on this repo — nothing to probe."
-            echo "(That is itself the answer: an unset roster and a dormant fleet both exit 0 today.)"
+            echo "(What that means depends on the fleet: an ALLOW_EMPTY=true bump entrypoint treats it as a dormant fleet and exits 0, an ALLOW_EMPTY=false one hard-fails on every dispatch. See the fleet table in .github/bump-callers/README.md.)"
             exit 1
           fi
 
-          # Fail on a roster that is not a JSON array OF OBJECTS before reading
-          # fields off it, so a malformed secret reports as malformed rather
-          # than as a roster with zero entries — or, worse, as a green run with
-          # blank fields because `has()`/`.file`/`keys` errored on a string.
-          if ! jq -e 'type == "array" and all(.[]; type == "object")' >/dev/null 2>&1 <<<"$CALLERS_JSON"; then
-            echo "::error::${ROSTER_NAME} did not parse as a JSON array of objects."
+          # Fail on a roster that is not EXACTLY ONE JSON array OF OBJECTS
+          # before reading fields off it, so a malformed secret reports as
+          # malformed rather than as a roster with zero entries — or, worse,
+          # as a green run with blank fields because `has()`/`.file`/`keys`
+          # errored on a string. Slurped (`-s`) and pinned to one document
+          # because `jq -e` otherwise runs once per JSON text and takes its
+          # status from the LAST one: a concatenated `[…] […]` paste would pass
+          # a per-text gate, then print a multi-line count and hash the whole
+          # stream into a digest no reconstruction can match.
+          if ! jq -e -s 'length == 1 and (.[0] | type == "array" and all(.[]; type == "object"))' >/dev/null 2>&1 <<<"$CALLERS_JSON"; then
+            echo "::error::${ROSTER_NAME} did not parse as exactly one JSON array of objects."
             exit 1
           fi
 
@@ -182,37 +238,15 @@ jobs:
           # nothing that no reconstruction can ever match. `bump-callers.sh`
           # guards the same trap the same way.
 
-          # (1) The exact field set(s). `unique` collapses entries that agree, so
-          #     one element means every entry has the same shape and more than
-          #     one names the entries that differ.
-          KEYS=$(jq -cS 'map(keys) | unique' <<<"$CALLERS_JSON")
-
-          # (2) Entry count — cross-checks the bumper's own audit line.
+          # (1) Entry count — cross-checks the bumper's own audit line, and
+          #     decides whether the shape lines are printed at all.
           COUNT=$(jq -c 'length' <<<"$CALLERS_JSON")
+          if [[ ! "$COUNT" =~ ^[0-9]+$ ]]; then
+            echo "::error::roster length did not come back as an integer (got '${COUNT}'); nothing printed."
+            exit 1
+          fi
 
-          # (3) Per-position booleans / lengths / type markers. Four states are
-          #     kept DISTINCT because they serialize differently under `jq -cS`
-          #     and a reconstruction must reproduce the digest byte-for-byte:
-          #       absent key            -> "absent"
-          #       present, JSON null    -> null
-          #       present, boolean      -> true / false   (wire_bot)
-          #       present, string       -> its length     (label; never text)
-          #       present, other type   -> "<type>"       (a numeric label must
-          #                                not print its own value: jq's
-          #                                `length` of a number is |n|)
-          #     `has()` rather than `// null`: only null and false are falsy in
-          #     jq, so `.wire_bot // null` reports a present-and-FALSE wire_bot
-          #     and an ABSENT one identically.
-          WIRE_BOT=$(jq -c '[.[] | if has("wire_bot") then (.wire_bot | if type == "boolean" or type == "null" then . else "<\(type)>" end) else "absent" end]' <<<"$CALLERS_JSON")
-          LABEL_LEN=$(jq -c '[.[] | if has("label") then (.label | if type == "string" then length elif type == "null" then null else "<\(type)>" end) else "absent" end]' <<<"$CALLERS_JSON")
-
-          # (4) Filenames in roster order — verbatim ONLY when drawn from the
-          #     public vocabulary in FILE_ALLOW, `<unlisted>` otherwise (which
-          #     still tells the operator which positions to reconcile against
-          #     the filenames recovered from the fleet's own bump PRs).
-          FILES=$(jq -c --arg re "$FILE_ALLOW" '[.[] | if has("file") and (.file | type == "string") and (.file | test($re)) then .file else "<unlisted>" end]' <<<"$CALLERS_JSON")
-
-          # (5) The whole-roster digest, computed exactly as the bumper's audit
+          # (2) The whole-roster digest, computed exactly as the bumper's audit
           #     line does. Reproduce locally against a reconstruction:
           #       jq -cS . candidate.json | sha256sum
           DIGEST=$(jq -cS . <<<"$CALLERS_JSON" | sha256sum | cut -d' ' -f1)
@@ -222,10 +256,62 @@ jobs:
           fi
 
           echo "=== ${ROSTER_NAME} — structure only, no names, no label text ==="
-          echo "keys:          ${KEYS}"
           echo "count:         ${COUNT}"
-          echo "wire_bot:      ${WIRE_BOT}"
-          echo "label_len:     ${LABEL_LEN}"
-          echo "files:         ${FILES}"
           echo "roster_sha256: ${DIGEST}"
+
+          if (( COUNT < MIN_SHAPE_COUNT )); then
+            echo "shape:         (withheld — fewer than ${MIN_SHAPE_COUNT} entries; see the header)"
+            echo "               Reconstruct by searching the small per-entry shape space locally"
+            echo "               (which of repo/file/label/wire_bot are present, wire_bot state, label"
+            echo "               presence) against roster_sha256 with the names and filenames already"
+            echo "               recovered from the fleet's bump PRs."
+            echo "=== end ==="
+            exit 0
+          fi
+
+          # (3) The field set PER POSITION (`keys` sorts, as `jq -cS` will), so
+          #     the operator sees which index carries which shape rather than a
+          #     union that cannot say. Names outside the documented four print
+          #     as `<unlisted-key>` — see the header — so the count of unlisted
+          #     keys per entry is visible but never their names; re-sorted
+          #     AFTER the substitution so the placeholder's position does not
+          #     hint at where the real name sorts.
+          KEYS=$(jq -c '[.[] | keys | map(if IN("file", "label", "repo", "wire_bot") then . else "<unlisted-key>" end) | sort]' <<<"$CALLERS_JSON")
+
+          # (4) Per-position booleans / type markers. Four states are kept
+          #     DISTINCT because they serialize differently under `jq -cS` and
+          #     a reconstruction must reproduce the digest byte-for-byte:
+          #       absent key            -> "absent"
+          #       present, JSON null    -> null
+          #       present, boolean      -> true / false   (wire_bot only)
+          #       present, other type   -> "<type>"       (so a label prints
+          #                                "<string>" — never its text, and
+          #                                never its length: lengths 0/2/4
+          #                                over a vocabulary of ""/ci/Core ARE
+          #                                the text — and a numeric label
+          #                                prints "<number>", not its value)
+          #     `has()` rather than `// null`: only null and false are falsy in
+          #     jq, so `.wire_bot // null` reports a present-and-FALSE wire_bot
+          #     and an ABSENT one identically.
+          WIRE_BOT=$(jq -c '[.[] | if has("wire_bot") then (.wire_bot | if type == "boolean" or type == "null" then . else "<\(type)>" end) else "absent" end]' <<<"$CALLERS_JSON")
+          LABEL=$(jq -c '[.[] | if has("label") then (.label | if type == "null" then null else "<\(type)>" end) else "absent" end]' <<<"$CALLERS_JSON")
+
+          # (5) Filenames in roster order, under the SAME four-state encoding as
+          #     (4) — absent / null / "<type>" — so every position reconciles
+          #     byte-for-byte; a present STRING then prints verbatim ONLY when
+          #     drawn from the public vocabulary in FILE_ALLOW and `<unlisted>`
+          #     otherwise (which still tells the operator which positions to
+          #     reconcile against the filenames recovered from the bump PRs).
+          FILES=$(jq -c --arg re "$FILE_ALLOW" '[.[] | if (has("file") | not) then "absent" elif (.file | type) == "null" then null elif (.file | type) != "string" then "<\(.file | type)>" elif (.file | test($re)) then .file else "<unlisted>" end]' <<<"$CALLERS_JSON")
+
+          echo "keys:          ${KEYS}"
+          echo "wire_bot:      ${WIRE_BOT}"
+          echo "label:         ${LABEL}"
+          echo "files:         ${FILES}"
+          if jq -e 'any(. == "<unlisted>")' >/dev/null <<<"$FILES"; then
+            echo "note:          an <unlisted> filename is either a name outside the public reusable"
+            echo "               vocabulary (deliberately suppressed) OR a reusable added/renamed since"
+            echo "               FILE_ALLOW was written — check .github/workflows/ on main before reading"
+            echo "               it as suppression."
+          fi
           echo "=== end ==="
