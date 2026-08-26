@@ -8,8 +8,9 @@ name: Public Repo Hygiene (reusable)
 # `@Comfy-Org/<team>` CODEOWNERS-handle case). It is a lightweight regression
 # guard, not a secrets scanner. It runs in the CALLER's context, so
 # `actions/checkout` checks out the calling repo and the scan operates on that
-# repo's tracked files. Fails with a non-zero exit (and GitHub annotations) so
-# it can be wired as a required status check.
+# repo's tracked files — their CONTENTS, their tracked PATHS, and a symlink's
+# target string, all three through the same matcher. Fails with a non-zero exit
+# (and GitHub annotations) so it can be wired as a required status check.
 #
 # The check script is loaded from THIS repo (public, pinned via `workflows_ref`)
 # — never from the caller's checkout — so a PR can't rewrite the checker OR its

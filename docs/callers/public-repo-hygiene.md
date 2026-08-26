@@ -18,6 +18,9 @@ CI if it finds any:
 3. **`Comfy-Org/<repo>` references outside a default-deny known-public allowlist** — plus the
    `@Comfy-Org/<team>` CODEOWNERS-handle case, checked against a separate team allowlist.
 
+Each category is applied to the file's **contents**, to its tracked **path**, and — for a symlink
+— to its target string. See "Tracked paths are scanned too" below.
+
 It is a lightweight regression guard, **not** a secrets scanner. Fails with a non-zero exit and
 GitHub annotations, so it wires in cleanly as a required status check. The checker lives in
 [`.github/public-repo-hygiene/`](../../.github/public-repo-hygiene).
@@ -195,6 +198,21 @@ writes to disk differ from what git stores — a `UTF-16` conversion reads as bi
 while the committed blob GitHub serves stays plainly readable, which would be a green run over
 content the guard never looked at. Drop the attribute, or name those paths in `exclude_paths:` so
 the hole is counted in the log instead of hidden.
+
+**Tracked paths are scanned too, not just file contents.** A tree containing
+`docs/Comfy-Org/<a-private-repo>/placeholder.md` or `notes/TEAM-1234/plan.md` publishes those
+names to anyone who browses or clones the repo, however spotless the files themselves are — so
+the path string goes through the same matcher, the same allowlists and the same knobs the
+contents do. It runs for **every** non-excluded tracked entry, including the ones whose body is
+never read (binary, non-UTF-8, submodule gitlink, LFS stub, unreadable): the path is published
+whatever the entry type. A path finding is labelled `<path> (tracked path):` instead of
+`<path>:<lineno>:`, because the fix is to rename the file rather than edit it, and it does not
+make an unread entry count towards `SCANNED:`. `exclude_paths:` covers this surface as well — an
+excluded path is not scanned as a path either, and still reports its skipped-file count. Two
+consequences worth knowing before you make the check required: a *vendored model mirror* nested
+under a directory (`models/hf.co/Comfy-Org/<model>/…`) is reported, because the model-host
+suppressor's anchor rejects a preceding slash — exclude that subtree; and scrubbing a name out of
+the **tree** does not scrub it out of the **history**, which this checker does not read.
 
 **Submodules are not scanned.** `git ls-files` lists a gitlink, and the workflow checks you out
 without `submodules:`, so the directory is empty here. Each is named in a `::warning::` and counted

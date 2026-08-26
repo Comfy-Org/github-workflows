@@ -8,6 +8,16 @@ allowlist — not credentials. It uses small, explicit allow/deny lists instead
 of one clever regex, so a false positive is a one-line list edit instead of a
 mystery.
 
+THREE SURFACES, ONE MATCHER (BE-9399). A tracked entry publishes more than its
+bytes: its CONTENTS, its symlink TARGET STRING if it is a link, and its tracked
+PATH are all visible to anyone who browses or clones a public repo. A tree
+holding `docs/Comfy-Org/<a-private-repo>/placeholder.md` names that repo even
+if every file in it is spotless, so the path is scanned too — for every
+non-excluded entry, including the ones whose body the reader declines (binary,
+gitlink, FIFO, unreadable). All three go through `_line_findings`, never a
+forked matcher, so the allowlists and the caller-tunable knobs apply
+identically to each.
+
 WHY IT LIVES HERE (BE-8654). It started as two copies — a Python one in the
 Python SDK and a JavaScript one in the TypeScript SDK — each run from the PR's
 OWN checkout. That had two defects. (1) A PR could weaken or delete the checker
@@ -1426,6 +1436,222 @@ def _codeowners_lines(text):
     ]
 
 
+def _line_findings(location, line, ticket_allowlist, owner_span):
+    """Yield LINE's findings, each prefixed with LOCATION.
+
+    Shared by BOTH scanned surfaces rather than forked, so they can never drift
+    apart: a file's CONTENTS (`_file_findings`, LOCATION `<path>:<lineno>`) and
+    the tracked PATH string itself (`run_checks`, LOCATION
+    `<path> (tracked path)`). A public tree publishes
+    `docs/Comfy-Org/<a-private-repo>/notes.md` exactly as loudly as it
+    publishes that name inside a file, so the same regexes, the same
+    allowlists and the same suppressors have to reach both -- a second matcher
+    would be a second place to forget an allowlist entry, and the
+    caller-tunable knobs would reach only one of them. (BE-9399.)
+
+    OWNER_SPAN is `_codeowners_owner_span`'s answer for this line, or None when
+    the line has no CODEOWNERS owner fields -- which a tracked PATH always is,
+    even the path OF a CODEOWNERS file, because a path string is not an owner
+    line. Passed in rather than derived here because deriving it needs both the
+    file's CODEOWNERS-ness and the line NUMBER (a UTF-8 BOM is decoding residue
+    only at offset 0 of the file), neither of which means anything on a path.
+    """
+    for match in TICKET_RE.finditer(line):
+        token = match.group(0).upper()
+        if token in ticket_allowlist:
+            continue
+        # A PUBLIC identifier namespace clears by prefix, not by exact
+        # token (see TICKET_ALLOWED_PREFIXES): `CVE-2021-44228` presents
+        # here as `CVE-2021`, and the year makes an exact carve-out expire.
+        if token.split("-", 1)[0] in TICKET_ALLOWED_PREFIXES:
+            continue
+        yield (
+            f"{location}: possible internal ticket ID: "
+            f"{match.group(0)!r}"
+        )
+
+    for pattern in INTERNAL_MARKER_RES:
+        if pattern.search(line):
+            yield (
+                f"{location}: internal collaboration-tool marker: "
+                f"{_excerpt(line)!r}"
+            )
+    # Offsets where a model-host URL prefix ENDS are exactly the offsets a
+    # `Comfy-Org/` match may START at and not be a github.com reference.
+    # Computed at most once per LINE for the same reason as `owner_span`:
+    # the alternative is searching backwards from every match, which is
+    # O(line) per match and so quadratic on the one `MAX_FILE_BYTES` line
+    # this has to survive. Deferred until a first `Comfy-Org/` match exists,
+    # because it is the one derived structure on this path with no cap --
+    # on the 5 MiB single line `MAX_FILE_BYTES` deliberately admits, a line
+    # of repeated `hf.co/` yields ~870k end offsets and a set of ints that
+    # large is tens of MB of runner memory. Almost no line has a match, so
+    # the common case now allocates nothing at all; when one does, the scan
+    # still runs exactly once.
+    model_host_ends = None
+    for match in REPO_REF_RE.finditer(line):
+        if model_host_ends is None:
+            model_host_ends = frozenset(
+                m.end() for m in MODEL_HOST_PREFIX_RE.finditer(line)
+            )
+        # See `MODEL_HOST_PREFIX_RE`: a different namespace, not a leak.
+        # Checked before the homoglyph branch below, because that branch's
+        # remedy ("rewrite the name in ASCII") is wrong advice for a model
+        # repo whose name is not ours to rewrite.
+        if match.start() in model_host_ends:
+            continue
+        name = match.group(1)
+        # Characters the ASCII name class could not read are the REST of the
+        # name, not a boundary. Carry them into what is reported, and (below)
+        # never clear a name they appear in. (BE-8654 review.)
+        tail = _nonascii_tail(line, match.end())
+        name += tail
+        # Strip a sentence-final period BEFORE the team/repo fork: a GitHub
+        # repo or team slug can never end in `.`, so a trailing one is
+        # always prose punctuation the `.`-permitting name class swallowed
+        # (BE-8697). It has to happen here rather than in the repo branch
+        # below, because the team branch needs it too -- `@Comfy-Org/
+        # Comfy-Cloud-Team.` at the end of a sentence is the confirmed
+        # false positive that motivated this. `rstrip` also handles the
+        # ellipsis case, and a reference that is nothing BUT the period
+        # (`Comfy-Org/.`) names no repo at all, so it is not a finding.
+        name = name.rstrip(".")
+        if not name:
+            continue
+        at_prefixed = match.start() > 0 and line[match.start() - 1] == "@"
+        # The markdown-label shape (BE-8910). Gated on `not tail` because
+        # the comparison below is over what the ASCII class read, and on
+        # `not at_prefixed` because a team handle or an npm coordinate
+        # labelling a model link is not a spelling to clear -- both keep the
+        # skip to the shape the fixtures actually carry.
+        if (
+            not tail
+            and not at_prefixed
+            and _labels_non_github_link(
+                line, match.start(), match.end(), name
+            )
+        ):
+            continue
+        if tail:
+            # Never cleared, and never SILENTLY cleared either: casefold
+            # membership is untrustworthy in both directions over a name
+            # like this -- `comfy-type<U+017F>cript-sdk` folds ONTO an
+            # allowlisted name, and `comfyui<U+2010>internal` folds off the
+            # end of one. Reported with its own remedy, because "add it to
+            # the allowlist" is not the fix for a homoglyph. (BE-8654
+            # review.)
+            yield (
+                f"{location}: reference to "
+                f"{'@' if at_prefixed else ''}Comfy-Org/{_bounded(name)}, "
+                "whose name carries non-ASCII characters that can render "
+                "identically to ASCII ones on github.com (a homoglyph), so "
+                "it is NOT cleared against the known-public allowlist -- "
+                "rewrite the name in ASCII, remove the reference, or (if "
+                "the non-ASCII text is adjacent PROSE rather than part of "
+                "the name) put a separator between them"
+            )
+            continue
+        # A leading `@` makes this a CODEOWNERS team handle, not a repo ref
+        # -- OR an npm / GitHub Packages scope, which is spelled exactly the
+        # same way and is required to be lowercase. Before BE-8697 made the
+        # org segment case-insensitive, the canonical `@comfy-org/<pkg>`
+        # spelling in a `package.json` or lockfile did not match at all;
+        # now it does, so this branch has to admit BOTH readings or a
+        # dependency on a known-PUBLIC repo becomes "a team not in the
+        # known-public allowlist" with no caller-side escape (the repo
+        # allowlist is deliberately not a workflow input).
+        #
+        # EXCEPT on the OWNER FIELDS of a CODEOWNERS line, where only ONE
+        # of the two readings is possible: an `@`-prefixed owner is a
+        # handle and npm coordinates never appear there, so the repo
+        # crossing is denied and team-allowlist membership is required.
+        # WHICH files get this treatment is `_is_codeowners`: the three
+        # locations GitHub actually reads CODEOWNERS from (`rel` is a
+        # git-tracked path, `/`-separated whatever the host OS is), with
+        # the name matched case-insensitively. WHERE on a line it applies
+        # is `_codeowners_owner_span`, because a `#` comment and a scoped
+        # path pattern carry the same spelling without being handles.
+        # (BE-8857, + its review.)
+        #
+        # The reverse crossing stays forbidden on purpose -- a bare
+        # `Comfy-Org/<name>` is unambiguously a repo path, since there is no
+        # syntax that writes a team without the `@`, so admitting team names
+        # there would weaken default-deny with no false positive to justify
+        # it. See test_team_allowlist_does_not_leak_into_repo_allowlist.
+        if at_prefixed:
+            folded = name.casefold()
+            # The crossing is NARROWED to a spelling that could actually BE
+            # an npm coordinate: those are required to be lowercase, so
+            # `@comfy-org/comfy-cli` crosses and the canonical GitHub team
+            # spelling `@Comfy-Org/comfy-cli` does not. Naming a team after
+            # the repo it owns is the commonest CODEOWNERS convention there
+            # is, so an unconditional crossing cleared exactly the likely
+            # collision -- a team handle that is not in the team allowlist,
+            # waved through because a public repo happens to share its name.
+            # (BE-8654 review.) That narrowing is not enough on its own:
+            # team slugs are lowercase BY CONSTRUCTION and GitHub resolves
+            # the org segment case-insensitively, so `@comfy-org/comfy-cli`
+            # in a CODEOWNERS file is a real, functional team handle that
+            # the lowercase test alone waved through. Hence the CODEOWNERS
+            # gate. Elsewhere the lowercase narrowing stands, because a
+            # lowercase mention in a README, a Dockerfile `npm i` line or a
+            # CI shell script genuinely could be an npm coordinate -- that
+            # residual ambiguity is ACCEPTED: in prose the two readings are
+            # indistinguishable, and re-denying there would re-open the
+            # false-positive class the crossing exists to fix (see
+            # test_npm_scope_of_a_public_repo_is_not_a_team_finding).
+            # (BE-8857.)
+            # Keyed on the OWNER FIELDS of a CODEOWNERS line, not on the
+            # file as a whole: a `#` comment and a scoped path pattern
+            # (`/packages/@comfy-org/comfy-cli/**`) legally carry the same
+            # spelling without being handles. (BE-8857 review.)
+            in_owner_field = owner_span is not None and (
+                owner_span[0] <= match.start() < owner_span[1]
+            )
+            npm_scope = (
+                not in_owner_field
+                and line[match.start() : match.end()].islower()
+            )
+            if folded not in _PUBLIC_TEAMS_CF and not (
+                npm_scope and folded in _PUBLIC_REPOS_CF
+            ):
+                yield (
+                    f"{location}: reference to "
+                    f"@Comfy-Org/{_bounded(name)}, a "
+                    "team not in the known-public allowlist "
+                    "(Comfy-Org/github-workflows "
+                    ".github/public-repo-hygiene/"
+                    "check_public_repo_hygiene.py) -- confirm it's public "
+                    "and add it, or remove the reference"
+                )
+            continue
+        # Strip a trailing `.git`: repository URLs (package.json
+        # `repository.url`, git remotes) conventionally end in `.git`, and
+        # `Foo.git` is still a reference to the public repo `Foo`. Matched
+        # case-insensitively like everything else on this path (BE-8697) --
+        # a case-SENSITIVE strip here would leave `ComfyUI.GIT` carrying its
+        # suffix into a membership test that then misses `comfyui`.
+        repo = re.sub(r"\.git$", "", name, flags=re.IGNORECASE)
+        # `Comfy-Org/.git` reaches here with the whole name consumed: the
+        # period strip above left `.git` alone (no TRAILING dot) and the
+        # suffix strip took the rest. Like `Comfy-Org/.`, it names no repo,
+        # so there is nothing to report -- and reporting it would print the
+        # repo-less "reference to Comfy-Org/" the guard above exists to
+        # prevent.
+        if not repo:
+            continue
+        if repo.casefold() not in _PUBLIC_REPOS_CF:
+            yield (
+                f"{location}: reference to "
+                f"Comfy-Org/{_bounded(repo)}, which is "
+                "not in the known-public allowlist "
+                "(Comfy-Org/github-workflows "
+                ".github/public-repo-hygiene/check_public_repo_hygiene.py)"
+                " -- confirm it's public and add it, or remove the "
+                "reference"
+            )
+
+
 def _file_findings(rel, text, ticket_allowlist):
     """Yield one file's findings lazily, in report order.
 
@@ -1442,207 +1668,15 @@ def _file_findings(rel, text, ticket_allowlist):
     # the long-standing behaviour the other two categories are pinned to.
     lines = _codeowners_lines(text) if is_codeowners else text.splitlines()
     for lineno, line in enumerate(lines, start=1):
-        for match in TICKET_RE.finditer(line):
-            token = match.group(0).upper()
-            if token in ticket_allowlist:
-                continue
-            # A PUBLIC identifier namespace clears by prefix, not by exact
-            # token (see TICKET_ALLOWED_PREFIXES): `CVE-2021-44228` presents
-            # here as `CVE-2021`, and the year makes an exact carve-out expire.
-            if token.split("-", 1)[0] in TICKET_ALLOWED_PREFIXES:
-                continue
-            yield (
-                f"{rel}:{lineno}: possible internal ticket ID: "
-                f"{match.group(0)!r}"
-            )
-
-        for pattern in INTERNAL_MARKER_RES:
-            if pattern.search(line):
-                yield (
-                    f"{rel}:{lineno}: internal collaboration-tool marker: "
-                    f"{_excerpt(line)!r}"
-                )
-
         # Per LINE, not per match: `_codeowners_owner_span` walks the line, so
         # recomputing it inside the match loop is quadratic on a single long
         # line -- the same shape `_excerpt` and `_bounded` guard against.
         owner_span = (
             _codeowners_owner_span(line, lineno) if is_codeowners else None
         )
-        # Offsets where a model-host URL prefix ENDS are exactly the offsets a
-        # `Comfy-Org/` match may START at and not be a github.com reference.
-        # Computed at most once per LINE for the same reason as `owner_span`:
-        # the alternative is searching backwards from every match, which is
-        # O(line) per match and so quadratic on the one `MAX_FILE_BYTES` line
-        # this has to survive. Deferred until a first `Comfy-Org/` match exists,
-        # because it is the one derived structure on this path with no cap --
-        # on the 5 MiB single line `MAX_FILE_BYTES` deliberately admits, a line
-        # of repeated `hf.co/` yields ~870k end offsets and a set of ints that
-        # large is tens of MB of runner memory. Almost no line has a match, so
-        # the common case now allocates nothing at all; when one does, the scan
-        # still runs exactly once.
-        model_host_ends = None
-        for match in REPO_REF_RE.finditer(line):
-            if model_host_ends is None:
-                model_host_ends = frozenset(
-                    m.end() for m in MODEL_HOST_PREFIX_RE.finditer(line)
-                )
-            # See `MODEL_HOST_PREFIX_RE`: a different namespace, not a leak.
-            # Checked before the homoglyph branch below, because that branch's
-            # remedy ("rewrite the name in ASCII") is wrong advice for a model
-            # repo whose name is not ours to rewrite.
-            if match.start() in model_host_ends:
-                continue
-            name = match.group(1)
-            # Characters the ASCII name class could not read are the REST of the
-            # name, not a boundary. Carry them into what is reported, and (below)
-            # never clear a name they appear in. (BE-8654 review.)
-            tail = _nonascii_tail(line, match.end())
-            name += tail
-            # Strip a sentence-final period BEFORE the team/repo fork: a GitHub
-            # repo or team slug can never end in `.`, so a trailing one is
-            # always prose punctuation the `.`-permitting name class swallowed
-            # (BE-8697). It has to happen here rather than in the repo branch
-            # below, because the team branch needs it too -- `@Comfy-Org/
-            # Comfy-Cloud-Team.` at the end of a sentence is the confirmed
-            # false positive that motivated this. `rstrip` also handles the
-            # ellipsis case, and a reference that is nothing BUT the period
-            # (`Comfy-Org/.`) names no repo at all, so it is not a finding.
-            name = name.rstrip(".")
-            if not name:
-                continue
-            at_prefixed = match.start() > 0 and line[match.start() - 1] == "@"
-            # The markdown-label shape (BE-8910). Gated on `not tail` because
-            # the comparison below is over what the ASCII class read, and on
-            # `not at_prefixed` because a team handle or an npm coordinate
-            # labelling a model link is not a spelling to clear -- both keep the
-            # skip to the shape the fixtures actually carry.
-            if (
-                not tail
-                and not at_prefixed
-                and _labels_non_github_link(
-                    line, match.start(), match.end(), name
-                )
-            ):
-                continue
-            if tail:
-                # Never cleared, and never SILENTLY cleared either: casefold
-                # membership is untrustworthy in both directions over a name
-                # like this -- `comfy-type<U+017F>cript-sdk` folds ONTO an
-                # allowlisted name, and `comfyui<U+2010>internal` folds off the
-                # end of one. Reported with its own remedy, because "add it to
-                # the allowlist" is not the fix for a homoglyph. (BE-8654
-                # review.)
-                yield (
-                    f"{rel}:{lineno}: reference to "
-                    f"{'@' if at_prefixed else ''}Comfy-Org/{_bounded(name)}, "
-                    "whose name carries non-ASCII characters that can render "
-                    "identically to ASCII ones on github.com (a homoglyph), so "
-                    "it is NOT cleared against the known-public allowlist -- "
-                    "rewrite the name in ASCII, remove the reference, or (if "
-                    "the non-ASCII text is adjacent PROSE rather than part of "
-                    "the name) put a separator between them"
-                )
-                continue
-            # A leading `@` makes this a CODEOWNERS team handle, not a repo ref
-            # -- OR an npm / GitHub Packages scope, which is spelled exactly the
-            # same way and is required to be lowercase. Before BE-8697 made the
-            # org segment case-insensitive, the canonical `@comfy-org/<pkg>`
-            # spelling in a `package.json` or lockfile did not match at all;
-            # now it does, so this branch has to admit BOTH readings or a
-            # dependency on a known-PUBLIC repo becomes "a team not in the
-            # known-public allowlist" with no caller-side escape (the repo
-            # allowlist is deliberately not a workflow input).
-            #
-            # EXCEPT on the OWNER FIELDS of a CODEOWNERS line, where only ONE
-            # of the two readings is possible: an `@`-prefixed owner is a
-            # handle and npm coordinates never appear there, so the repo
-            # crossing is denied and team-allowlist membership is required.
-            # WHICH files get this treatment is `_is_codeowners`: the three
-            # locations GitHub actually reads CODEOWNERS from (`rel` is a
-            # git-tracked path, `/`-separated whatever the host OS is), with
-            # the name matched case-insensitively. WHERE on a line it applies
-            # is `_codeowners_owner_span`, because a `#` comment and a scoped
-            # path pattern carry the same spelling without being handles.
-            # (BE-8857, + its review.)
-            #
-            # The reverse crossing stays forbidden on purpose -- a bare
-            # `Comfy-Org/<name>` is unambiguously a repo path, since there is no
-            # syntax that writes a team without the `@`, so admitting team names
-            # there would weaken default-deny with no false positive to justify
-            # it. See test_team_allowlist_does_not_leak_into_repo_allowlist.
-            if at_prefixed:
-                folded = name.casefold()
-                # The crossing is NARROWED to a spelling that could actually BE
-                # an npm coordinate: those are required to be lowercase, so
-                # `@comfy-org/comfy-cli` crosses and the canonical GitHub team
-                # spelling `@Comfy-Org/comfy-cli` does not. Naming a team after
-                # the repo it owns is the commonest CODEOWNERS convention there
-                # is, so an unconditional crossing cleared exactly the likely
-                # collision -- a team handle that is not in the team allowlist,
-                # waved through because a public repo happens to share its name.
-                # (BE-8654 review.) That narrowing is not enough on its own:
-                # team slugs are lowercase BY CONSTRUCTION and GitHub resolves
-                # the org segment case-insensitively, so `@comfy-org/comfy-cli`
-                # in a CODEOWNERS file is a real, functional team handle that
-                # the lowercase test alone waved through. Hence the CODEOWNERS
-                # gate. Elsewhere the lowercase narrowing stands, because a
-                # lowercase mention in a README, a Dockerfile `npm i` line or a
-                # CI shell script genuinely could be an npm coordinate -- that
-                # residual ambiguity is ACCEPTED: in prose the two readings are
-                # indistinguishable, and re-denying there would re-open the
-                # false-positive class the crossing exists to fix (see
-                # test_npm_scope_of_a_public_repo_is_not_a_team_finding).
-                # (BE-8857.)
-                # Keyed on the OWNER FIELDS of a CODEOWNERS line, not on the
-                # file as a whole: a `#` comment and a scoped path pattern
-                # (`/packages/@comfy-org/comfy-cli/**`) legally carry the same
-                # spelling without being handles. (BE-8857 review.)
-                in_owner_field = owner_span is not None and (
-                    owner_span[0] <= match.start() < owner_span[1]
-                )
-                npm_scope = (
-                    not in_owner_field
-                    and line[match.start() : match.end()].islower()
-                )
-                if folded not in _PUBLIC_TEAMS_CF and not (
-                    npm_scope and folded in _PUBLIC_REPOS_CF
-                ):
-                    yield (
-                        f"{rel}:{lineno}: reference to "
-                        f"@Comfy-Org/{_bounded(name)}, a "
-                        "team not in the known-public allowlist "
-                        "(Comfy-Org/github-workflows "
-                        ".github/public-repo-hygiene/"
-                        "check_public_repo_hygiene.py) -- confirm it's public "
-                        "and add it, or remove the reference"
-                    )
-                continue
-            # Strip a trailing `.git`: repository URLs (package.json
-            # `repository.url`, git remotes) conventionally end in `.git`, and
-            # `Foo.git` is still a reference to the public repo `Foo`. Matched
-            # case-insensitively like everything else on this path (BE-8697) --
-            # a case-SENSITIVE strip here would leave `ComfyUI.GIT` carrying its
-            # suffix into a membership test that then misses `comfyui`.
-            repo = re.sub(r"\.git$", "", name, flags=re.IGNORECASE)
-            # `Comfy-Org/.git` reaches here with the whole name consumed: the
-            # period strip above left `.git` alone (no TRAILING dot) and the
-            # suffix strip took the rest. Like `Comfy-Org/.`, it names no repo,
-            # so there is nothing to report -- and reporting it would print the
-            # repo-less "reference to Comfy-Org/" the guard above exists to
-            # prevent.
-            if not repo:
-                continue
-            if repo.casefold() not in _PUBLIC_REPOS_CF:
-                yield (
-                    f"{rel}:{lineno}: reference to "
-                    f"Comfy-Org/{_bounded(repo)}, which is "
-                    "not in the known-public allowlist "
-                    "(Comfy-Org/github-workflows "
-                    ".github/public-repo-hygiene/check_public_repo_hygiene.py)"
-                    " -- confirm it's public and add it, or remove the "
-                    "reference"
-                )
+        yield from _line_findings(
+            f"{rel}:{lineno}", line, ticket_allowlist, owner_span
+        )
 
 
 def check_file(root, rel, ticket_allowlist):
@@ -1743,9 +1777,40 @@ def run_checks(root, excludes=(), extra_ticket_allow=()):
         if hit is not None:
             counts[hit] += 1
             continue
-        found, file_warnings, skip_kind, file_partial = check_file(
+        # The tracked PATH is a published string in its own right: a public
+        # tree's file listing shows `docs/Comfy-Org/<a-private-repo>/x.md` to
+        # anyone, and before BE-9399 only the file's CONTENTS were read, so
+        # that tree passed clean. Scanned with the SAME `_line_findings` the
+        # contents get -- same regexes, same allowlists, same suppressors, and
+        # the same caller-side `--ticket-allow` / `--exclude` knobs (the
+        # `_is_excluded` `continue` above is what makes an `exclude_paths:`
+        # entry cover the path surface too, while still counting the file in
+        # the exclusion tally).
+        #
+        # Run for EVERY non-excluded entry, ahead of `check_file` and
+        # independent of it: the path is published whether or not the body is
+        # ever read, so an entry `check_file` declines (binary, submodule
+        # gitlink, FIFO, unreadable) still gets its path examined. It does not
+        # make such an entry count as `scanned` -- that number is files READ AS
+        # TEXT, and a path finding proves nothing about the bytes inside.
+        #
+        # `owner_span=None` unconditionally, even when the path IS a CODEOWNERS
+        # file: `_is_codeowners` decides how to read that file's LINES, and a
+        # path string is not an owner line.
+        #
+        # `rel` comes from `git ls-files -z` decoded with `surrogateescape`
+        # (see `tracked_files`), so it is a `/`-separated posix string that may
+        # carry lone surrogates -- which is exactly the input the helper's
+        # non-ASCII / homoglyph handling already covers.
+        found = list(
+            _line_findings(
+                f"{rel} (tracked path)", rel, ticket_allowlist, None
+            )
+        )
+        content_found, file_warnings, skip_kind, file_partial = check_file(
             root, rel, ticket_allowlist
         )
+        found += content_found
         for kind in file_partial:
             partial[kind] += 1
         # Per-RUN cap on top of the per-file one, so a tree of many mid-sized
@@ -1859,6 +1924,29 @@ def _emit(result):
         print(f"WARN: {w}")
         print(f"::warning::public-repo-hygiene: {w}")
 
+    # Listed BEFORE the zero-coverage verdict below, because since BE-9399 the
+    # two can co-occur: the tracked PATH is scanned for every entry, including
+    # the ones whose body is never read, so a repo of nothing but binaries can
+    # leak in its own file listing while `scanned` stays 0. The exit code is
+    # still 2 there -- a run that read no text proves nothing about the
+    # contents -- but swallowing the one thing it DID find would send the
+    # operator hunting a configuration problem instead of the leak.
+    if result.findings:
+        print("\nERROR: possible internal-only references found in this public repo:\n")
+        for finding in result.findings:
+            escaped = _esc_cmd(finding)
+            print(f"  {escaped}")
+            print(f"::error::public-repo-hygiene: {escaped}")
+        print(
+            "\nIf this is a genuine false positive, either add the acronym via "
+            "the workflow's `ticket_allowlist:` input, or -- for a Comfy-Org "
+            "repo you have CONFIRMED is public -- open a PR against "
+            "Comfy-Org/github-workflows adding it to PUBLIC_COMFY_ORG_REPOS in "
+            ".github/public-repo-hygiene/check_public_repo_hygiene.py. The repo "
+            "allowlist is org-wide and deliberately not editable from a caller "
+            "repo."
+        )
+
     if result.scanned == 0:
         # Green here would make the root-exclusion rejection one spelling away
         # from pointless: a caller that names every top-level directory in
@@ -1873,20 +1961,6 @@ def _emit(result):
         print("\nResult: no internal-only references found.")
         return 0
 
-    print("\nERROR: possible internal-only references found in this public repo:\n")
-    for finding in result.findings:
-        escaped = _esc_cmd(finding)
-        print(f"  {escaped}")
-        print(f"::error::public-repo-hygiene: {escaped}")
-    print(
-        "\nIf this is a genuine false positive, either add the acronym via the "
-        "workflow's `ticket_allowlist:` input, or -- for a Comfy-Org repo you "
-        "have CONFIRMED is public -- open a PR against "
-        "Comfy-Org/github-workflows adding it to PUBLIC_COMFY_ORG_REPOS in "
-        ".github/public-repo-hygiene/check_public_repo_hygiene.py. The repo "
-        "allowlist is org-wide and deliberately not editable from a caller "
-        "repo."
-    )
     print(f"\nResult: {len(result.findings)} internal-only reference(s) found.")
     return 1
 

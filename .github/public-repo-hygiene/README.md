@@ -2,7 +2,8 @@
 
 The checker behind [`public-repo-hygiene.yml`](../workflows/public-repo-hygiene.yml): a
 lightweight regression guard that fails CI when a **public** repo's tracked files carry
-internal-only references. Setup guide for consumers:
+internal-only references — in their contents, in their tracked **paths**, or in a symlink's
+target string. Setup guide for consumers:
 [`docs/callers/public-repo-hygiene.md`](../../docs/callers/public-repo-hygiene.md).
 
 It is **not** a secrets scanner. It looks for three categories of internal-only *reference*, not
@@ -29,6 +30,24 @@ and no further, and what is *derived* from those bytes is capped too — `MAX_FI
 (200), `MAX_FINDINGS_TOTAL` (2000) and a `MAX_EXCERPT_CHARS` (200) bound on the echoed line, since
 a category-2 finding copies the matched line and the scanned repo controls how long that is.
 Hitting a cap adds a `::warning::` and never softens the verdict: the run still fails.
+
+**Three surfaces, one matcher.** A tracked file publishes *three* strings, not one: its contents,
+its symlink target string if it is a link, and its **path**. A tree containing
+`docs/Comfy-Org/<a-private-repo>/placeholder.md` names that repo to anyone who browses or clones
+the repository even if every file in it is spotless, and until BE-9399 that tree passed clean
+because only the first two were read. The path is now scanned as well, for **every** non-excluded
+tracked entry — including the ones whose body the reader declines (binary, non-UTF-8, submodule
+gitlink, FIFO, unreadable), since the path is published whatever the entry type. All three
+surfaces go through the same `_line_findings`, so the same regexes, the same allowlists and the
+same caller-side `ticket_allowlist:` / `exclude_paths:` knobs reach all of them; a second matcher
+would be a second place to forget an allowlist entry. Paths come from `git ls-files -z` as
+`/`-separated posix strings, and the token rules are the ones the contents get: `/` is not in the
+repo-reference lookbehind, so `docs/Comfy-Org/x/y.md` matches while `aComfy-Org/x` does not, and
+`\b` fires at both `/` and `-`, so `notes/TEAM-1234/plan.md` and `TEAM-1234-notes.md` both match.
+A path finding is labelled `<path> (tracked path):` rather than `<path>:<lineno>:`, because
+"rename the file" and "edit the file" are different fixes. It does **not** make an entry count as
+`SCANNED:` — that number is files read as *text*, and a path finding proves nothing about the
+bytes inside.
 
 Everything the scan declines to look at leaves a trace, because a guard that silently skips
 something is worse than no guard — the green run reads as coverage:
@@ -226,8 +245,18 @@ category 3 host-aware, which removed the `huggingface.co/Comfy-Org/<model>` fals
   because a hyphen is a non-word character). Recovering either costs an over-flag on a shape that
   really *is* a different registrable name (`app.slack.com-evil.com` → `com-evil.com`), so both are
   kept and pinned by `test_a_label_character_adjacent_to_the_host_is_a_known_miss`.
-- **Only file *contents* are scanned, never file *paths*.** A `docs/<TICKET>-migration.md` or a
-  `notion-exports/` directory passes clean.
+- **A model-host mirror checked out *under* a directory over-flags on its path.** The
+  `MODEL_HOST_PREFIX_RE` suppressor's left anchor rejects a preceding `/`, because in prose a
+  slash before a host means the host is really a path segment of something else. Every segment of
+  a tracked path *is* preceded by a slash, so `hf.co/Comfy-Org/<model>/config.json` at the tree
+  root is suppressed while `models/hf.co/Comfy-Org/<model>/config.json` is reported. Over-flagging
+  is the safe direction for a leak guard, one `exclude_paths:` entry clears it, and the shape did
+  not occur once across the 11,415 tracked paths of nine Comfy-Org public repos — so it is pinned
+  by `test_a_nested_model_host_mirror_path_over_flags` rather than narrowed.
+- **Paths and contents are scanned; the repository's *history* and its refs are not.** A path that
+  once existed and was renamed or deleted stays in every clone, as do branch and tag names, and
+  none of those is a tracked file. Scrubbing a name out of the tree does not scrub it out of the
+  history that still carries it.
 - **Git-LFS content, submodule contents and the far side of a symlink are not scanned** — each is
   counted under `NOT SCANNED:` (or, for a symlink, scanned as the link target *string* git actually
   stores) rather than silently treated as covered. See the coverage rules below.
