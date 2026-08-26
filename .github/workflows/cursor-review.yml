@@ -1957,7 +1957,14 @@ jobs:
               --ledger-note "$LEDGER_NOTE" \
               --notice "⚠️ The judge step did not submit a final review through its structured-output tool (status=${JUDGE_STATUS}). The findings below are the raw, un-adjudicated panel output — they may contain duplicates or false positives the judge would normally filter."
           else
-            JUDGE_ERROR=$(python3 -c "import json; print(json.load(open('/tmp/judge-findings.json')).get('error','(no error message)'))")
+            # Bound the message HERE, before it becomes a single argv element: Linux
+            # rejects one argument over ~128 KiB at execve, so an unbounded
+            # $JUDGE_ERROR would fail the exec and produce no error review and no job
+            # summary at all — precisely the largest failures post-review.py's own
+            # message budget was added for, which can only run once Python has started.
+            # 100 KB leaves room for the prefix and still exceeds that char budget, so
+            # post-review.py's "(truncated…)" note still fires.
+            JUDGE_ERROR=$(python3 -c "import json; e = str(json.load(open('/tmp/judge-findings.json')).get('error', '(no error message)')); print(e.encode('utf-8', 'replace')[:100000].decode('utf-8', 'ignore'))")
             python3 "$CURSOR_REVIEW_ASSETS/post-review.py" \
               --findings /tmp/consolidated.json \
               --pr-number "$PR_NUMBER" \

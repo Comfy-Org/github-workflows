@@ -64,6 +64,10 @@ MAX_REVIEW_BODY_CHARS = 60000
 # The error review's message is unbounded CLI/model text; bounded well under
 # MAX_REVIEW_BODY_CHARS so the header, the fence and the re-trigger line always fit.
 MAX_ERROR_MESSAGE_CHARS = 40000
+# Longest ``` fence the error review will build. The fence is emitted twice, so this
+# bounds the delimiters at 2 * MAX_FENCE_CHARS regardless of what the error text
+# contains; a backtick run at or over the cap is broken up rather than out-fenced.
+MAX_FENCE_CHARS = 64
 
 # Max re-raises of an already-answered finding allowed in one review (BE-5109).
 # Nothing already-answered is ever silently suppressed — a wrong or premature
@@ -178,12 +182,26 @@ MAX_STEP_SUMMARY_BYTES = 900_000
 # summaries, which carry no severity-ordered list to be cut from.
 STEP_SUMMARY_TRUNCATED_NOTE = (
     "\n\n_…truncated here: this run's job summary reached the Actions per-step size "
-    "limit. See the run log for the whole of it._"
+    "limit. The whole of it was echoed to this job's run log._"
 )
+
+
+def encodable(text: str) -> str:
+    """Return `text` with anything UTF-8 cannot encode replaced.
+
+    Python's JSON decoder happily produces a lone surrogate from `"\\ud800"`, and
+    review-output-mcp.py's `validate_finding` checks type/non-empty/length only — so a
+    finding body can carry one all the way here, where `.encode("utf-8")` (and the
+    step-summary file write) would raise `UnicodeEncodeError` and take down the very
+    channel that exists so nothing is lost. Round-trip through `errors="replace"` once,
+    up front, so every later encode on this text is total.
+    """
+    return text.encode("utf-8", "replace").decode("utf-8")
 
 
 def clamp_to_bytes(text: str, limit: int) -> str:
     """Trim `text` to at most `limit` UTF-8 bytes, never splitting a character."""
+    text = encodable(text)
     encoded = text.encode("utf-8")
     if len(encoded) <= limit:
         return text
@@ -199,22 +217,27 @@ def write_step_summary(markdown: str, note: str = READ_ONLY_SUMMARY_NOTE) -> Non
     clamped — `clamp_review_body`'s note promises the full text is here, and this is
     what makes that promise true.
     """
-    payload = note + markdown
+    payload = encodable(note + markdown)
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        # No summary file (e.g. a local run) — fall back to stdout so the content
+        # isn't silently dropped. No budget applies: the cap is on the file.
+        print(payload)
+        return
     # Leave room for the trailing newline and the note that says where the cut landed.
     budget = MAX_STEP_SUMMARY_BYTES - len(STEP_SUMMARY_TRUNCATED_NOTE.encode("utf-8")) - 1
     if len(payload.encode("utf-8")) > MAX_STEP_SUMMARY_BYTES - 1:
         print(
             "Step summary: content exceeds the Actions per-step size limit — cutting "
-            "it rather than letting the whole upload be discarded.",
+            "it rather than letting the whole upload be discarded. The whole payload "
+            "follows.",
             file=sys.stderr,
         )
-        payload = clamp_to_bytes(payload, budget).rstrip() + STEP_SUMMARY_TRUNCATED_NOTE
-    path = os.environ.get("GITHUB_STEP_SUMMARY")
-    if not path:
-        # No summary file (e.g. a local run) — fall back to stdout so the
-        # content isn't silently dropped.
+        # STEP_SUMMARY_TRUNCATED_NOTE sends the reader to the run log, and this is the
+        # only thing that puts the text there: past the cut it is otherwise absent from
+        # the PR (whose clamp note points here) *and* from the summary.
         print(payload)
-        return
+        payload = clamp_to_bytes(payload, budget).rstrip() + STEP_SUMMARY_TRUNCATED_NOTE
     with open(path, "a", encoding="utf-8") as f:
         f.write(payload + "\n")
 
@@ -373,12 +396,15 @@ def anchorable_lines(diff_text: str):
     desynced = False
     # A `diff --git ` line has been seen, i.e. this really is git's own output rather
     # than a bare concatenated `diff -u`. When it is, git ALWAYS emits `diff --git `
-    # before each file's `--- `/`+++ ` pair, so a header pair reached from inside a
-    # file's hunk region is not something git wrote — see `in_hunk_region` below.
+    # before each file's `--- `/`+++ ` pair, so a SECOND pair under the same
+    # `diff --git ` is not something git wrote — see `awaiting_header` below.
     saw_git_header = False
-    # A `@@` has been parsed for the CURRENT file. Reset by `diff --git `, and by an
-    # honoured `+++` header (which opens a new file).
-    in_hunk_region = False
+    # This file's `--- `/`+++ ` pair has not been honoured yet. Set by `diff --git `,
+    # cleared by an honoured `+++`. git emits exactly one pair per `diff --git `, so in
+    # git-output mode a pair arriving while this is False is content impersonating a
+    # header — which is stricter than "inside a hunk region": it also refuses a pair
+    # sitting between an honoured `+++` and that file's first `@@`.
+    awaiting_header = True
     # split("\n") with the trailing element dropped, not splitlines(): splitlines also
     # breaks on \v, \f, \x1c-\x1e, U+0085 and U+2028/9, none of which advance git's
     # line numbering. A form feed in a Python file would otherwise split one content
@@ -389,21 +415,29 @@ def anchorable_lines(diff_text: str):
     for raw in lines:
         saw_old_header_before, saw_old_header = saw_old_header, False
         if pending_old > 0 or pending_new > 0:
-            # Inside hunk content: consume the budget so the hunk's end is known.
-            if raw.startswith("+"):
+            # Inside hunk content: consume the budget so the hunk's end is known. Each
+            # prefix is gated on ITS OWN side's counter, because the branch is entered
+            # while EITHER side still has budget: on `@@ -1,2 +1,1 @@` a second `+`
+            # would otherwise record an anchor and drive `pending_new` negative, and on
+            # a too-large `+count` the next file's `--- `/`+++ ` pair is swallowed as
+            # content — `+++ b/y.py` counted as an added line FABRICATES an anchor in
+            # the previous file. A side that overruns means the declared counts
+            # disagree with the body, which is exactly the untrustworthy state the
+            # fall-through below already drops the file for.
+            if raw.startswith("+") and pending_new > 0:
                 pending_new -= 1
                 if path is not None and right:
                     anchors[path].add(right)
                 right += 1
                 continue
-            if raw.startswith(" "):
+            if raw.startswith(" ") and pending_old > 0 and pending_new > 0:
                 pending_old -= 1
                 pending_new -= 1
                 if path is not None and right:
                     anchors[path].add(right)
                 right += 1
                 continue
-            if raw.startswith("-"):
+            if raw.startswith("-") and pending_old > 0:
                 # Removed lines advance only the OLD side.
                 pending_old -= 1
                 continue
@@ -447,7 +481,7 @@ def anchorable_lines(diff_text: str):
             desynced = False
             saw_marker = True
             saw_git_header = True
-            in_hunk_region = False
+            awaiting_header = True
             path = None
             right = 0
             continue
@@ -455,16 +489,18 @@ def anchorable_lines(diff_text: str):
             saw_old_header = True
             continue
         if raw.startswith("+++ "):
-            if not saw_old_header_before or desynced or (saw_git_header and in_hunk_region):
+            if not saw_old_header_before or desynced or (saw_git_header and not awaiting_header):
                 # A `+++` with no `---` in front of it is not a header git wrote. Do not
                 # trust it, and drop the current file rather than keep numbering lines
                 # that may belong to another one.
                 #
-                # `saw_git_header and in_hunk_region` closes the remaining seam: if the
-                # miscount is exactly two lines, the overflow lines ARE the `--- `/`+++ `
-                # pair and the desync above never fires. git always emits `diff --git `
-                # before a file's header pair, so a pair reached from inside a hunk
-                # region of git's own output is content impersonating one. Gated on
+                # `saw_git_header and not awaiting_header` closes the remaining seam: if
+                # the miscount is exactly two lines, the overflow lines ARE the
+                # `--- `/`+++ ` pair and the desync above never fires. git always emits
+                # `diff --git ` before a file's header pair and exactly one pair after
+                # it, so a SECOND pair in git's own output is content impersonating one
+                # — including one landing between the honoured `+++` and the first `@@`,
+                # which a hunk-region test would still have honoured. Gated on
                 # saw_git_header so a prefix-less concatenated `diff -u`, whose files
                 # legitimately follow one another with no `diff --git`, still parses.
                 path = None
@@ -474,7 +510,7 @@ def anchorable_lines(diff_text: str):
             saw_marker = True
             path = header_new_path(raw)
             right = 0
-            in_hunk_region = False
+            awaiting_header = False
             if path is not None:
                 anchors.setdefault(path, set())
             continue
@@ -494,7 +530,6 @@ def anchorable_lines(diff_text: str):
             right = int(m.group(3))
             pending_old = int(m.group(2)) if m.group(2) is not None else 1
             pending_new = int(m.group(4)) if m.group(4) is not None else 1
-            in_hunk_region = True
     if not saw_marker:
         return None
     return anchors
@@ -779,27 +814,56 @@ def post_error_review(repo, pr_number, commit_sha, header, error_message):
     body is clamped afterwards as a hard guarantee.
     """
     safe = neutralize_mentions(error_message)
+    # Break the fence-defeating runs BEFORE the length budget, so the markers this
+    # substitution inserts are themselves inside the budget rather than added after it.
+    if re.search("`" * MAX_FENCE_CHARS, safe):
+        safe = re.sub(
+            "`{%d,}" % MAX_FENCE_CHARS,
+            "`" * (MAX_FENCE_CHARS - 1) + "…(backtick run truncated)",
+            safe,
+        )
     if len(safe) > MAX_ERROR_MESSAGE_CHARS:
         safe = safe[:MAX_ERROR_MESSAGE_CHARS].rstrip() + (
             "\n…(truncated: the error text hit the review body's size limit — see "
             "the run log for the whole of it)"
         )
     # A ``` run inside the message would close the fence early and let the rest of the
-    # error render as markdown; CommonMark lets the fence be longer instead.
-    longest = max((len(run) for run in re.findall(r"`+", safe)), default=0)
+    # error render as markdown; CommonMark lets the fence be longer instead. But the
+    # fence is emitted TWICE and `safe` may be MAX_ERROR_MESSAGE_CHARS of nothing but
+    # backticks — a degenerate model/CLI repetition loop is both what fills `error` and
+    # what produces a run that long — so an unbounded fence blows past
+    # MAX_REVIEW_BODY_CHARS on the delimiters alone and `clamp_review_body` cuts the
+    # END: exactly the closing fence and the re-trigger line the message-side budget
+    # exists to preserve. Break any run at or over the cap instead; a run that long is
+    # noise, and no fence could contain it inside the body budget anyway.
+    longest = min(
+        max((len(run) for run in re.findall(r"`+", safe)), default=0),
+        MAX_FENCE_CHARS - 1,
+    )
     fence = "`" * max(3, longest + 1)
-    body_text = clamp_review_body(
+    unclamped = (
         f"{header}\n\n⚠️ **Review failed**\n\n{fence}\n{safe}\n{fence}\n\n"
         "Re-trigger by removing and re-adding the `cursor-review` label."
     )
+    body_text = clamp_review_body(unclamped)
     payload = json.dumps(
         {"body": body_text, "event": "COMMENT", "commit_id": commit_sha}
     )
-    if not post_or_degrade(repo, pr_number, payload, body_text, "Error review"):
+    # The whole text as the summary copy, not the already-cut one — the read-only
+    # degradation exists to deliver what the PR could not — and `truncated` so a
+    # SUCCESSFUL but clamped POST still writes the summary its clamp note points at.
+    if not post_or_degrade(
+        repo,
+        pr_number,
+        payload,
+        unclamped,
+        "Error review",
+        truncated=body_text != unclamped,
+    ):
         # Same contract as the review paths: a genuine POST failure still delivers the
         # text somewhere. post_or_degrade writes the summary itself on the paths that
         # return True, so this cannot double-write.
-        write_step_summary(body_text, note=POST_FAILED_SUMMARY_NOTE)
+        write_step_summary(unclamped, note=POST_FAILED_SUMMARY_NOTE)
         raise SystemExit(1)
 
 
@@ -892,6 +956,11 @@ def main():
         if not post_or_degrade(
             args.repo, args.pr_number, payload, body_text, "No-findings review"
         ):
+            # Same contract as the other three exit paths: a genuine POST failure still
+            # delivers the text somewhere. On the all-failed branch that text is the one
+            # artifact explaining why no review happened — the panel summary naming
+            # which cells errored — so losing it is exactly when it is needed most.
+            write_step_summary(body_text, note=POST_FAILED_SUMMARY_NOTE)
             raise SystemExit(1)
         return
 

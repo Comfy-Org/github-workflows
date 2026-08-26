@@ -867,5 +867,184 @@ class FallbackFailureDeliveryTest(unittest.TestCase):
         self.assertIn("Inline comments could not be anchored", summaries[0])
 
 
+class HeaderPairPositionTest(unittest.TestCase):
+    """git emits exactly ONE `--- `/`+++ ` pair per `diff --git `; a second is content."""
+
+    def test_a_pair_between_the_honoured_header_and_the_first_hunk_is_refused(self):
+        # The seam a hunk-region test leaves open: an honoured `+++` clears the region
+        # flag and only the next `@@` sets it again, so a pair landing BETWEEN them was
+        # honoured even in git-output mode — `evil.py` keys merged into the map.
+        diff = (
+            "diff --git a/app.py b/app.py\n"
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            "--- x\n"
+            "+++ b/evil.py\n"
+            "@@ -1,0 +1,3 @@\n"
+            "+e1\n+e2\n+e3\n"
+        )
+        self.assertNotIn("evil.py", PR.anchorable_lines(diff))
+
+    def test_a_prefixless_concatenated_diff_still_parses_file_after_file(self):
+        # The gate is `saw_git_header`-only for exactly this shape: no `diff --git`
+        # anywhere, so consecutive header pairs are legitimate.
+        diff = (
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            "@@ -1,0 +1,1 @@\n"
+            "+a1\n"
+            "--- a/util.py\n"
+            "+++ b/util.py\n"
+            "@@ -9,0 +9,1 @@\n"
+            "+u9\n"
+        )
+        self.assertEqual(PR.anchorable_lines(diff), {"app.py": {1}, "util.py": {9}})
+
+    def test_normal_multi_file_git_output_is_unaffected(self):
+        diff = (
+            "diff --git a/app.py b/app.py\n"
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            "@@ -1,0 +1,1 @@\n"
+            "+a1\n"
+            "diff --git a/util.py b/util.py\n"
+            "--- a/util.py\n"
+            "+++ b/util.py\n"
+            "@@ -9,0 +9,2 @@\n"
+            "+u9\n+u10\n"
+        )
+        self.assertEqual(PR.anchorable_lines(diff), {"app.py": {1}, "util.py": {9, 10}})
+
+
+class BudgetOverrunTest(unittest.TestCase):
+    """Each prefix is consumed against ITS OWN side's counter, not `either side left`."""
+
+    def test_a_too_large_new_count_does_not_fabricate_an_anchor(self):
+        # `+++ b/y.py` starts with `+`, so on a too-large `+count` it was counted as an
+        # added line: it FABRICATED `x.py:2` and swallowed y.py's header entirely.
+        diff = (
+            "--- a/x.py\n"
+            "+++ b/x.py\n"
+            "@@ -1,0 +1,3 @@\n"
+            "+x1\n"
+            "--- a/y.py\n"
+            "+++ b/y.py\n"
+            "@@ -1,0 +1,2 @@\n"
+            "+y1\n"
+            "+y2\n"
+        )
+        anchors = PR.anchorable_lines(diff)
+        self.assertEqual(anchors.get("x.py"), {1}, "no fabricated x.py:2")
+
+    def test_a_plus_line_on_a_spent_new_side_records_no_anchor(self):
+        # Entered on `pending_old > 0 or pending_new > 0`, so with `-1,2 +1,1` a second
+        # `+` still recorded an anchor while `pending_new` went negative.
+        diff = (
+            "diff --git a/app.py b/app.py\n"
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            "@@ -1,2 +1,1 @@\n"
+            "+kept\n"
+            "+extra\n"
+        )
+        self.assertEqual(PR.anchorable_lines(diff), {"app.py": {1}})
+
+    def test_a_well_formed_hunk_is_unaffected(self):
+        diff = (
+            "diff --git a/app.py b/app.py\n"
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            "@@ -1,2 +1,3 @@\n"
+            " ctx\n"
+            "-gone\n"
+            "+new_a\n"
+            "+new_b\n"
+        )
+        self.assertEqual(PR.anchorable_lines(diff), {"app.py": {1, 2, 3}})
+
+
+class BacktickFenceBudgetTest(unittest.TestCase):
+    """The fence is emitted TWICE, so an unbounded run blows the body on delimiters."""
+
+    def test_a_degenerate_backtick_run_keeps_the_body_terminated(self):
+        posted, _ = ErrorReviewBudgetTest().post("`" * (PR.MAX_ERROR_MESSAGE_CHARS + 10))
+        body = posted[0]["body"]
+        self.assertLessEqual(len(body), PR.MAX_REVIEW_BODY_CHARS)
+        fence = "`" * PR.MAX_FENCE_CHARS
+        self.assertIn(fence, body, "a bounded fence is still opened")
+        self.assertTrue(
+            body.rstrip().endswith("`cursor-review` label."),
+            "the closing fence and the re-trigger line survive the clamp",
+        )
+        self.assertEqual(body.count(fence + "\n"), 2, "opened and closed, nothing more")
+
+    def test_a_run_under_the_cap_still_out_fences_normally(self):
+        posted, _ = ErrorReviewBudgetTest().post("stack:\n" + "`" * 10 + "\nnot the end")
+        body = posted[0]["body"]
+        self.assertIn("`" * 11 + "\nstack:", body)
+
+
+class SurrogateSafeSummaryTest(unittest.TestCase):
+    """json accepts a lone surrogate; encoding one must not kill the delivery channel."""
+
+    def test_a_lone_surrogate_does_not_break_the_step_summary(self):
+        markdown = json.loads(r'"a \ud800 b"')
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "summary.md")
+            with mock.patch.dict(PR.os.environ, {"GITHUB_STEP_SUMMARY": path}):
+                PR.write_step_summary(markdown)
+            with open(path, "rb") as f:
+                written = f.read()
+        written.decode("utf-8")  # raises if an unencodable surrogate got through
+        self.assertIn(b"a ", written)
+        self.assertIn(b" b", written)
+
+    def test_clamp_to_bytes_is_surrogate_safe(self):
+        text = json.loads(r'"\ud800"') * 10
+        PR.clamp_to_bytes(text, 5).encode("utf-8")
+
+
+class ErrorReviewSummaryContractTest(unittest.TestCase):
+    """The error path owes the same truncation contract as the review paths."""
+
+    def test_a_clamped_but_successful_post_writes_the_whole_text_to_the_summary(self):
+        # The message budget alone rarely trips the body clamp, so drive it from the
+        # other side: a header big enough that header + bounded message overflows.
+        posted, summaries = [], []
+
+        def fake_post(repo, pr_number, payload):
+            posted.append(json.loads(payload))
+            return subprocess.CompletedProcess(args=["gh"], returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(PR, "gh_post_review", side_effect=fake_post), \
+             mock.patch.object(PR, "write_step_summary",
+                               side_effect=lambda m, note=None: summaries.append(m)):
+            PR.post_error_review("o/r", "1", "deadbeef", "h" * 30_000, "boom " * 20_000)
+
+        self.assertLessEqual(len(posted[0]["body"]), PR.MAX_REVIEW_BODY_CHARS)
+        self.assertEqual(len(summaries), 1, "clamp note points at a summary that exists")
+        self.assertGreater(
+            len(summaries[0]), len(posted[0]["body"]), "the summary copy is the whole text"
+        )
+        self.assertIn("Re-trigger by removing", summaries[0])
+
+    def test_an_unclamped_successful_post_writes_no_summary(self):
+        _, summaries = ErrorReviewBudgetTest().post("judge exited 3")
+        self.assertEqual(summaries, [])
+
+
+class NoFindingsDeliveryTest(unittest.TestCase):
+    """The fourth exit path: a failed no-findings POST still owes the text somewhere."""
+
+    def test_a_failed_no_findings_post_writes_the_panel_summary_to_the_job_summary(self):
+        summaries = []
+        posted = EndToEndPostTest().run_main(
+            [], post_returncode=1, stderr="gh: Server Error (HTTP 500)", summaries=summaries
+        )
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(len(summaries), 1, "the one artifact saying no review happened")
+        self.assertIn("No high-signal findings", summaries[0])
+
+
 if __name__ == "__main__":
     unittest.main()
