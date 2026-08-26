@@ -2958,5 +2958,131 @@ class OutputTest(CheckerTestCase):
         )
 
 
+class PrTextSurfaceTest(CheckerTestCase):
+    """The PR title/description surface (BE-9652).
+
+    Both cases below are real leaks that happened on a public PR of this repo
+    and that the tracked-file scan structurally cannot see, because PR text is
+    never a tracked file.
+    """
+
+    def surface(self, text, label="<PR description>"):
+        return self.run_checks(texts=[(label, text)]).findings
+
+    def test_internal_collaboration_link_in_a_pr_body_is_flagged(self):
+        found = self.surface(
+            "Anne asked for this.\n"
+            "See the [thread](https://comfy-organization.slack.com"
+            "/archives/C09BAQDNDG8/p1787705844771499).\n"
+        )
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("internal collaboration-tool marker", found[0])
+        # Line numbers are reported for a surface exactly as for a file, which
+        # is what makes a finding in a long PR body locatable.
+        self.assertTrue(found[0].startswith("<PR description>:2:"), found[0])
+
+    def test_private_repo_reference_in_a_pr_body_is_flagged(self):
+        found = self.surface("Commit it to Comfy-Org/github-workflows-ops first.\n")
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("github-workflows-ops", found[0])
+
+    def test_a_known_public_repo_reference_is_not_flagged(self):
+        self.assertEqual(
+            self.surface("See Comfy-Org/github-workflows for the bumper.\n"), []
+        )
+
+    def test_ticket_ids_are_NOT_flagged_on_this_surface(self):
+        # The load-bearing one. This org's commit convention REQUIRES a
+        # `(BE-####)` suffix on PR titles, so flagging tickets here would fail
+        # roughly every second PR -- and a required check that fires on correct
+        # behaviour gets switched off, taking the two categories that catch real
+        # leaks with it. If someone ever "fixes" this by passing ALL_CATEGORIES,
+        # this test is what says no.
+        self.assertEqual(
+            self.surface(
+                "ci(rosters): add a leak-safe roster shape probe (BE-9651)",
+                label="<PR title>",
+            ),
+            [],
+        )
+        # ...while the very same string in a tracked FILE still is flagged, so
+        # this is a per-surface policy and not a hole in the category itself.
+        self.repo.write("README.md", "ci(rosters): probe (BE-9651)\n")
+        self.assertEqual(len(self.findings()), 1)
+
+    def test_surfaces_do_not_disturb_the_file_scan(self):
+        self.repo.write("README.md", "clean\n")
+        result = self.run_checks(texts=[("<PR title>", "clean title")])
+        self.assertEqual(result.findings, [])
+        # `scanned` counts FILES; a surface is not one, so coverage accounting
+        # is unchanged and a green run still means the same thing it did.
+        self.assertEqual(result.scanned, 1)
+
+    def test_no_surfaces_is_byte_identical_to_before(self):
+        self.repo.write("README.md", "See Comfy-Org/github-workflows-ops.\n")
+        self.assertEqual(self.run_checks(), self.run_checks(texts=[]))
+
+    def test_a_surface_is_capped_like_a_file(self):
+        body = "Comfy-Org/nope-private\n" * (checker.MAX_FINDINGS_PER_FILE + 25)
+        found = self.surface(body)
+        self.assertEqual(len(found), checker.MAX_FINDINGS_PER_FILE)
+        self.assertTrue(
+            any("still FAILS" in w for w in self.run_checks(
+                texts=[("<PR description>", body)]
+            ).warnings)
+        )
+
+    def test_findings_are_reported_before_file_findings(self):
+        # A surface finding is the highest-signal thing this checker emits (it
+        # is already published on a public PR page) and the cheapest to fix, so
+        # it must never be the thing `MAX_FINDINGS_TOTAL` truncates away.
+        self.repo.write("a.md", "Comfy-Org/some-private-repo\n")
+        found = self.run_checks(
+            texts=[("<PR description>", "Comfy-Org/other-private-repo\n")]
+        ).findings
+        self.assertTrue(found[0].startswith("<PR description>:"), found)
+
+
+class ScanTextCliTest(CheckerTestCase):
+    def _write(self, name, text):
+        path = os.path.join(self.repo.root, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        return path
+
+    def test_label_equals_path_is_parsed_and_scanned(self):
+        self.repo.write("README.md", "clean\n")
+        path = self._write("title.txt", "Comfy-Org/github-workflows-ops\n")
+        self.assertEqual(
+            checker.main(["--root", self.repo.root, f"--scan-text=<PR title>={path}"]),
+            1,
+        )
+
+    def test_a_malformed_spec_is_a_config_error(self):
+        self.repo.write("README.md", "clean\n")
+        self.assertEqual(
+            checker.main(["--root", self.repo.root, "--scan-text=no-separator"]), 2
+        )
+
+    def test_an_unreadable_surface_fails_rather_than_scanning_nothing(self):
+        # "A lookup we could not perform is not evidence." Treating a missing
+        # file as an empty surface would report a green run over text nobody
+        # read -- which is exactly the silent pass this checker exists to deny.
+        self.repo.write("README.md", "clean\n")
+        missing = os.path.join(self.repo.root, "does-not-exist.txt")
+        self.assertEqual(
+            checker.main(["--root", self.repo.root, f"--scan-text=<PR title>={missing}"]),
+            2,
+        )
+
+    def test_a_path_containing_an_equals_sign_survives(self):
+        self.repo.write("README.md", "clean\n")
+        path = self._write("od=d.txt", "clean text\n")
+        self.assertEqual(
+            checker.main(["--root", self.repo.root, f"--scan-text=<PR title>={path}"]),
+            0,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

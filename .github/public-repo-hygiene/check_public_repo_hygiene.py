@@ -668,6 +668,35 @@ ScanResult = collections.namedtuple(
 PARTIAL_READ = "read only up to the size cap"
 PARTIAL_FINDINGS = "reported only up to the per-file findings cap"
 
+# The three checks, nameable so a SURFACE can select a subset -- the same idea
+# as `url_suppressors` on `_line_findings`, one level up: what a surface means
+# decides which checks apply to it, not just how one check reads.
+CAT_TICKET = "ticket"
+CAT_MARKER = "marker"
+CAT_REPO = "repo"
+ALL_CATEGORIES = frozenset({CAT_TICKET, CAT_MARKER, CAT_REPO})
+
+# What a PR's TITLE and DESCRIPTION are scanned for (BE-9652). Deliberately not
+# all three, and that is a policy decision rather than an oversight.
+#
+# The ticket category is left OUT because this org's commit convention REQUIRES
+# a `(BE-####)` Linear suffix on the PR title (`AGENTS.md`, "Commit style"). A
+# ticket id in a public PR title is therefore deliberate org-wide practice, not
+# a leak: half of this repo's own recent merged PR titles carry one. Scanning
+# for it here would fail roughly every second PR on every enrolled repo -- and a
+# required check that fires on CORRECT behaviour does not get fixed, it gets
+# switched off, taking the two categories that catch real leaks with it.
+#
+# Those two are what this surface is for, and both are drawn from live incidents
+# on a public PR of THIS repo: an internal collaboration-tool permalink pasted
+# into a description (exposing a workspace and channel id), and a PRIVATE
+# `Comfy-Org/<repo>` named in a body. Neither has a convention arguing for it,
+# and neither is caught anywhere else -- no file scan can see PR text.
+#
+# If a repo ever wants tickets checked here, that is a new input, not a default
+# flip: the default has to stay the one that keeps the check switched on.
+SURFACE_CATEGORIES = frozenset({CAT_MARKER, CAT_REPO})
+
 
 class ConfigError(Exception):
     """A value passed by the caller is unusable (exit 2, not a finding)."""
@@ -1449,7 +1478,13 @@ def _codeowners_lines(text):
 
 
 def _line_findings(
-    location, line, ticket_allowlist, owner_span, *, url_suppressors=True
+    location,
+    line,
+    ticket_allowlist,
+    owner_span,
+    *,
+    url_suppressors=True,
+    categories=ALL_CATEGORIES,
 ):
     """Yield LINE's findings, each prefixed with LOCATION.
 
@@ -1481,8 +1516,13 @@ def _line_findings(
     green, which is the leak this surface was added to catch. The allowlists,
     the ticket knobs, the npm-scope crossing and the homoglyph handling are
     NOT syntax and reach both surfaces unchanged. (BE-9399 review.)
+
+    CATEGORIES selects which of the three checks run, defaulting to all of them
+    so both tracked-file surfaces are unchanged. It exists for the PR-text
+    surface, which runs `SURFACE_CATEGORIES` -- see there for why a ticket id in
+    a PR title is convention rather than a leak. (BE-9652.)
     """
-    for match in TICKET_RE.finditer(line):
+    for match in TICKET_RE.finditer(line) if CAT_TICKET in categories else ():
         token = match.group(0).upper()
         if token in ticket_allowlist:
             continue
@@ -1496,7 +1536,7 @@ def _line_findings(
             f"{match.group(0)!r}"
         )
 
-    for pattern in INTERNAL_MARKER_RES:
+    for pattern in INTERNAL_MARKER_RES if CAT_MARKER in categories else ():
         if pattern.search(line):
             yield (
                 f"{location}: internal collaboration-tool marker: "
@@ -1515,7 +1555,7 @@ def _line_findings(
     # the common case now allocates nothing at all; when one does, the scan
     # still runs exactly once.
     model_host_ends = None if url_suppressors else frozenset()
-    for match in REPO_REF_RE.finditer(line):
+    for match in REPO_REF_RE.finditer(line) if CAT_REPO in categories else ():
         if model_host_ends is None:
             model_host_ends = frozenset(
                 m.end() for m in MODEL_HOST_PREFIX_RE.finditer(line)
@@ -1739,6 +1779,54 @@ def _path_findings(rel, ticket_allowlist):
     return findings, warnings, partial
 
 
+def check_text(label, text, ticket_allowlist, categories=SURFACE_CATEGORIES):
+    """Return (findings, warnings) for one free-text surface (PR title/body).
+
+    The third surface, alongside a file's CONTENTS and its tracked PATH, and
+    built the same way as the other two: through `_line_findings`, never a
+    second matcher. A PR description publishes an internal link exactly as
+    loudly as a committed file does, so the same regexes, allowlists and
+    suppressors have to reach it -- and a forked matcher is a second place to
+    forget an allowlist entry. What differs is only WHICH categories apply
+    (`SURFACE_CATEGORIES`) and that there is no CODEOWNERS reading to do: a PR
+    body is prose, so `owner_span` is None and the `\\n`-only line model does not
+    apply. (BE-9652.)
+
+    LABEL stands in for the path in the finding line, so it must read as a
+    surface and not as a path -- `<PR title>`, not `PR-title`. Line numbers are
+    still reported, which is what makes a finding in a 40-line body locatable.
+
+    Capped exactly as a file and a path are: PR text is author-controlled and
+    unbounded, so a body of repeated `Comfy-Org/x` must not be fully enumerated
+    only to throw the tail away.
+    """
+    findings = list(
+        itertools.islice(
+            (
+                finding
+                for lineno, line in enumerate(text.splitlines(), start=1)
+                for finding in _line_findings(
+                    f"{label}:{lineno}",
+                    line,
+                    ticket_allowlist,
+                    None,
+                    categories=categories,
+                )
+            ),
+            MAX_FINDINGS_PER_FILE + 1,
+        )
+    )
+    warnings = []
+    if len(findings) > MAX_FINDINGS_PER_FILE:
+        del findings[MAX_FINDINGS_PER_FILE:]
+        warnings.append(
+            f"{label}: produced more than {MAX_FINDINGS_PER_FILE} findings; "
+            f"only the first {MAX_FINDINGS_PER_FILE} are listed -- the run "
+            f"still FAILS"
+        )
+    return findings, warnings
+
+
 def check_file(root, rel, ticket_allowlist):
     """Return (findings, warnings, skip_kind, partial) for one file.
 
@@ -1769,8 +1857,12 @@ def check_file(root, rel, ticket_allowlist):
     return findings, warnings, skip_kind, partial
 
 
-def run_checks(root, excludes=(), extra_ticket_allow=()):
+def run_checks(root, excludes=(), extra_ticket_allow=(), texts=()):
     """Scan `root`, returning a `ScanResult`.
+
+    `texts` is an optional [(label, text)] of free-text surfaces -- a PR title
+    and body -- scanned with `SURFACE_CATEGORIES` alongside the tracked files.
+    Empty by default, so a caller that passes nothing behaves exactly as before.
 
     `exclusions` is [(pattern, files_skipped)] in the caller's order, INCLUDING
     patterns that skipped nothing -- a typo'd exclusion that matches no file has
@@ -1829,6 +1921,17 @@ def run_checks(root, excludes=(), extra_ticket_allow=()):
     skipped = collections.Counter()
     partial = collections.Counter()
     findings, warnings = [], []
+
+    # PR-text surfaces go FIRST, before any file finding can reach the per-run
+    # report cap. There are at most two of them, they are the highest-signal
+    # findings this checker produces (already PUBLISHED on a public PR page,
+    # not merely committed), and they are the ones an author fixes in fifteen
+    # seconds. Ordering them behind a flood of file findings would let
+    # `MAX_FINDINGS_TOTAL` truncate exactly the ones worth acting on.
+    for _label, _text in texts:
+        _found, _warn = check_text(_label, _text, ticket_allowlist)
+        findings.extend(_found)
+        warnings.extend(_warn)
     scanned = 0
     truncated_report = False
     suppressed_warnings = 0
@@ -2060,10 +2163,55 @@ def main(argv=None):
             "single value may be comma- or newline-separated."
         ),
     )
+    parser.add_argument(
+        "--scan-text",
+        action="append",
+        default=[],
+        metavar="LABEL=PATH",
+        help=(
+            "Also scan a free-text surface (a PR title or description) read "
+            "from PATH, reported under LABEL. Repeatable. Scanned for internal "
+            "collaboration-tool links and non-public Comfy-Org repo references "
+            "only -- NOT ticket ids, which this org's commit convention "
+            "requires in public PR titles."
+        ),
+    )
     args = parser.parse_args(argv)
 
     excludes = _split_values(args.exclude)
     ticket_allow = _split_values(args.ticket_allow)
+
+    # A FILE, never an argv value. A PR title and body are author-controlled
+    # text of unbounded length that routinely contains newlines, quotes and
+    # shell metacharacters; passing them through argv would put them on the
+    # command line of a job that runs on every PR, against ARG_MAX, and would
+    # force the workflow to interpolate untrusted text into a `run:` block --
+    # the classic Actions script-injection shape. The workflow writes them to
+    # files from `env:` instead and passes paths.
+    texts = []
+    for spec in args.scan_text:
+        label, sep, path = spec.partition("=")
+        if not sep or not label or not path:
+            msg = f"--scan-text expects LABEL=PATH, got '{_esc_cmd(spec)}'"
+            print(f"FAIL: {msg}")
+            print(f"::error::public-repo-hygiene: {msg}")
+            return 2
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                texts.append((label, handle.read()))
+        except OSError as exc:
+            # A surface NAMED but unreadable is a FAILURE, not an empty scan.
+            # Treating it as "" would report a green run over text nobody read
+            # -- the same not-evidence principle this checker applies to a tree
+            # it cannot enumerate.
+            msg = (
+                f"cannot read the {_esc_cmd(label)} surface "
+                f"({_esc_cmd(exc)}); refusing to report a green run over text "
+                f"that was never read"
+            )
+            print(f"FAIL: {msg}")
+            print(f"::error::public-repo-hygiene: {msg}")
+            return 2
 
     print(f"Scanning tracked files in '{_esc_cmd(args.root)}' for internal-only references...")
     # Echo the CONFIGURED knobs, not only their effect: a caller-side tuning
@@ -2072,10 +2220,19 @@ def main(argv=None):
         print("Exclusions: " + ", ".join(_esc_cmd(p) for p in excludes))
     if ticket_allow:
         print("Extra ticket allowlist: " + ", ".join(_esc_cmd(t) for t in ticket_allow))
+    if texts:
+        # Name the surfaces AND their sizes. "Scanned the PR title" over an
+        # empty string is the failure mode worth seeing: a PR with no
+        # description is legitimately 0 chars, but so is a mis-wired `env:`,
+        # and only the count tells them apart at a glance.
+        print(
+            "Also scanning: "
+            + ", ".join(f"{_esc_cmd(l)} ({len(t)} chars)" for l, t in texts)
+        )
     print()
 
     try:
-        result = run_checks(args.root, excludes, ticket_allow)
+        result = run_checks(args.root, excludes, ticket_allow, texts)
     except ConfigError as exc:
         msg = _esc_cmd(exc)
         print(f"FAIL: {msg}")
