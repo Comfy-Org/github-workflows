@@ -37,17 +37,17 @@ name: Roster shape probe (TEMPORARY)
 #     counting `pr-derisk` entries would publish how many repos enrolled in a
 #     beta fleet. A filename is a value, not shape, and the operator already
 #     holds every one of them from the fleet's own bump PRs;
-#   * ONE sha256, over the whole canonical roster — the bumper's existing audit
-#     digest, reproduced here so the run that printed the shape and the digest
-#     it must reconcile against are the same run. It verifies a reconstruction
-#     the operator already holds. No per-field digests: `sha256(map(.repo))`
-#     with the count and filenames published beside it is an unsalted
-#     membership oracle over an enumerable `Comfy-Org/*` namespace, and
-#     `sha256(map(.label))` over a three-word label vocabulary is just the
-#     labels in a thin wrapper;
-#   * and, for a roster SMALLER than `MIN_SHAPE_COUNT` distinct repos, no
-#     shape lines at all — count + digest only (the digest itself only when the
-#     `digest_already_public` input says a bump run has already logged it).
+#   * NO digest at all. The probe CONFIRMS a digest the operator supplies from a
+#     bump run's audit line and prints only whether it matched — so no
+#     fingerprint enters the log that was not public before the run started. An
+#     earlier revision printed it behind a self-attestation checkbox; nothing
+#     bound that tick to the roster the run actually read, and a re-run
+#     preserves inputs while re-resolving secrets, so an edit in between
+#     published the NEW roster's first fingerprint. Certainly no per-field
+#     digests: `sha256(map(.repo))` beside the count is an unsalted membership
+#     oracle over an enumerable `Comfy-Org/*` namespace;
+#   * and, for a roster of fewer than `MIN_SHAPE_COUNT` DISTINCT repos, no shape
+#     lines at all — count only, plus whether the supplied digest matched.
 #     The shape lines pin every component of the `jq -cS` preimage except the
 #     ordered repo list, and for a handful of entries that list is small enough
 #     to search offline against an already-public digest. Below the threshold
@@ -61,10 +61,16 @@ name: Roster shape probe (TEMPORARY)
 # small) fingerprint of a private repo, and "small" is not the standard this
 # repo holds itself to.
 #
-# Residual, stated plainly: the whole-roster digest's preimage is the ordered
-# repo list plus label text once the shape lines are known. For a fleet-sized
-# roster that space is not enumerable offline; for a ONE-entry roster it
-# collapses to "is it this repo?". That residual is the bumper's audit line's
+# Residual, stated plainly, because the probe cannot close it from the secret
+# alone: the digest's preimage is the ordered repo list plus label text once the
+# shape lines are known, and MIN_SHAPE_COUNT counts DISTINCT repos, which is not
+# the same as CONCEALED ones. A roster entry names a caller file inside the
+# consumer repo, so any caller living in a PUBLIC repo is already observable as a
+# member and an attacker subtracts it before searching. Eight distinct repos of
+# which seven are public callers leaves one unknown name, and the threshold does
+# not see the difference. For a fleet-sized roster of mostly-private callers the
+# space is not enumerable offline; skewed public, it is weaker than the number
+# suggests. That residual is the bumper's audit line's
 # residual already (it prints count + digest on every run, and filenames are
 # guessable by convention) — `MIN_SHAPE_COUNT` keeps this probe from making it
 # worse for small rosters — and `.github/bump-callers/README.md` names the only
@@ -76,15 +82,15 @@ name: Roster shape probe (TEMPORARY)
 on:
   workflow_dispatch:
     inputs:
-      digest_already_public:
+      expected_digest:
         description: >-
-          Tick ONLY after confirming a bump-<fleet> run has already logged a
-          real "roster: N caller(s), sha256 <hex>" line for this exact roster.
-          Unticked, the digest is withheld — publishing it otherwise would be
-          this roster's FIRST public fingerprint, not a repeat of the bumper's.
+          The 64-hex sha256 from this fleet's bump run audit line ("roster: N
+          caller(s), sha256 <hex>"). Leave blank and the probe captures nothing:
+          it CONFIRMS a digest that is already public, it never publishes one.
+          A value that does not match fails the run without printing.
         required: false
-        type: boolean
-        default: false
+        type: string
+        default: ''
       roster:
         description: Which roster secret to probe
         required: true
@@ -136,6 +142,7 @@ jobs:
       - name: Refuse a non-main ref, an unknown roster name, or an expired probe
         env:
           REF: ${{ github.ref }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
           ROSTER_NAME: ${{ inputs.roster }}
           # After this date every dispatch fails here. Bump it deliberately if
           # the capture genuinely needs longer; do not let it float.
@@ -152,6 +159,17 @@ jobs:
 
           if [[ "$REF" != "refs/heads/main" ]]; then
             echo "::error::This probe reads a production secret and only runs from main (dispatched from ${REF}). Re-dispatch on main."
+            exit 1
+          fi
+
+          # Deleting this file from `main` does NOT retire it. Re-running an
+          # EXISTING run replays the workflow file and `github.ref` as they were
+          # — so the check above still passes — while re-resolving secrets at run
+          # time. Every past run would therefore stay a live probe of the CURRENT
+          # roster after the file is gone, bounded only by EXPIRES. Refuse
+          # anything but a first attempt.
+          if [[ "${RUN_ATTEMPT:-1}" != "1" ]]; then
+            echo "::error::This is run attempt ${RUN_ATTEMPT}. A re-run replays a possibly-deleted workflow file against the CURRENT secret, so past runs would outlive the file itself. Dispatch a fresh run instead."
             exit 1
           fi
 
@@ -209,7 +227,7 @@ jobs:
           # this script could do about it.
           CALLERS_JSON: ${{ secrets[inputs.roster] }}
           ROSTER_NAME: ${{ inputs.roster }}
-          DIGEST_ALREADY_PUBLIC: ${{ inputs.digest_already_public }}
+          EXPECTED_DIGEST: ${{ inputs.expected_digest }}
           # Below this many entries only count + digest are printed — see the
           # header. Ordered n-tuples over a guessable `Comfy-Org/*` namespace of
           # a couple of hundred names are an offline job at n=5 (~10^11
@@ -262,8 +280,14 @@ jobs:
             echo "::error::MIN_SHAPE_COUNT must be a positive integer; got '${MIN_SHAPE_COUNT}'. An empty or non-numeric value makes the withholding comparison false and publishes the shape lines for a one-entry roster."
             exit 1
           fi
+          # Since filenames print as `<listed>`/`<unlisted>` rather than
+          # verbatim, an over-broad FILE_ALLOW no longer leaks a NAME — what it
+          # does is mark every position `<listed>`, silently suppressing the
+          # staleness note and telling the operator every filename reconciles
+          # when none was actually checked. Emptiness is the one shape testable
+          # here (a mis-anchored pattern is not) and the most permissive of all.
           if [[ -z "$FILE_ALLOW" ]]; then
-            echo "::error::FILE_ALLOW is empty, so every filename would match and print verbatim — that is the disclosure carve-out this probe is built around. Restore the pattern."
+            echo "::error::FILE_ALLOW is empty, so jq's test() matches every string and every position would report <listed> — the staleness note suppressed, no filename actually checked. Restore the pattern."
             exit 1
           fi
 
@@ -318,7 +342,14 @@ jobs:
           # withholding threshold is about how many independent NAMES an
           # offline search would have to guess, not how many rows there are.
           # Gate on the quantity the threshold is actually reasoning about.
-          NAMES=$(jq -c '[.[] | .repo] | unique | length' <<<"$CALLERS_JSON")
+          # `strings` and `ascii_downcase`, both load-bearing and both fail-OPEN
+          # without them. The array-of-objects gate proves nothing about `.repo`,
+          # so an entry missing the key contributes `null` to `unique` and seven
+          # real names plus one paste mistake would report eight and publish the
+          # shape. And `bump-callers.sh` groups repos CASE-FOLDED (GitHub
+          # resolves owners case-insensitively), so `Comfy-Org/foo` and
+          # `comfy-org/foo` are one repo to the bumper and would be two here.
+          NAMES=$(jq -c '[.[] | .repo | strings | ascii_downcase] | unique | length' <<<"$CALLERS_JSON")
           if [[ ! "$NAMES" =~ ^[0-9]+$ ]]; then
             echo "::error::distinct-repo count did not come back as an integer (got '${NAMES}'); nothing printed."
             exit 1
@@ -342,35 +373,86 @@ jobs:
             exit 0
           fi
 
-          # THE DIGEST IS ONLY ZERO-DELTA IF A BUMP RUN HAS ALREADY PUBLISHED IT.
-          # The header's whole claim for this line is that it repeats what
-          # `bump-callers.sh` already logs on every run. That is FALSE for a
-          # fleet whose roster was seeded `[]` (the bumper short-circuits to
-          # `sha256 n/a`, so no real digest has ever been logged) and in the
-          # window between a `gh secret set` and the next bump — which is this
-          # probe's primary use case. Publishing there would make this the FIRST
-          # public fingerprint of that roster, which is a new oracle, not a
-          # repetition of an old one. So the operator must confirm a bump run
-          # has already fingerprinted this exact roster; unconfirmed, the shape
-          # lines are still useful and the digest is withheld.
-          if [[ "${DIGEST_ALREADY_PUBLIC:-false}" != "true" ]]; then
-            echo "roster_sha256: (withheld — set DIGEST_ALREADY_PUBLIC=true only after confirming a"
-            echo "               bump-${ROSTER_NAME} run has already logged a real 'roster: N caller(s),"
-            echo "               sha256 <hex>' line for this exact roster. Until then this would be the"
-            echo "               FIRST public fingerprint of it, not a repeat of one.)"
-          else
-            echo "roster_sha256: ${DIGEST}"
-          fi
-
-          if (( NAMES < MIN_SHAPE_COUNT )); then
-            echo "shape:         (withheld — only ${NAMES} distinct repo(s), fewer than ${MIN_SHAPE_COUNT}; see the header)"
-            echo "               Reconstruct by searching the small per-entry shape space locally"
-            echo "               (which of repo/file/label/wire_bot are present, wire_bot state, label"
-            echo "               presence) against roster_sha256 with the names and filenames already"
-            echo "               recovered from the fleet's bump PRs."
+          # THIS PROBE NEVER PUBLISHES A DIGEST. It only CONFIRMS one that is
+          # already public.
+          #
+          # The earlier design printed the digest behind a `digest_already_public`
+          # checkbox, which was an unverified self-attestation: nothing bound the
+          # tick to the roster this run actually read, and a re-run preserves the
+          # inputs while re-resolving secrets, so a secret edited in between
+          # published the NEW roster's first fingerprint — exactly what the gate
+          # existed to prevent. Taking the already-logged digest as the INPUT
+          # closes that by construction: a value the operator copied out of a
+          # bump run's audit line is public before this workflow starts, and
+          # comparing against it adds nothing to the log that was not already
+          # there.
+          #
+          # It also makes the shape lines and the digest one decision rather than
+          # two independent gates. Those gates could disagree — printing the
+          # shape (which the header itself calls the sensitive artifact: it pins
+          # every component of the `jq -cS` preimage bar the ordered repo list)
+          # while withholding the digest it exists to be reconciled against, so
+          # the gate deferred nothing and cost one permanent shape dump. Both, or
+          # neither.
+          if [[ -z "${EXPECTED_DIGEST//[[:space:]]/}" ]]; then
+            echo "roster_sha256: (not confirmed — nothing else captured)"
+            echo "               This probe confirms a digest, it never publishes one. To capture this"
+            echo "               roster: find the bump-*-callers.yml whose VAR_NAME is ${ROSTER_NAME}"
+            echo "               (the fleet table in .github/bump-callers/README.md maps them; the"
+            echo "               workflow is named after the FLEET, not the secret), run it, copy the"
+            echo "               64-hex from its 'roster: N caller(s), sha256 <hex>' log line, then"
+            echo "               re-dispatch this probe with that value in the 'expected_digest' field"
+            echo "               on the Run workflow form."
             echo "=== end ==="
             exit 0
           fi
+          if [[ ! "$EXPECTED_DIGEST" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::expected_digest must be the 64-hex sha256 from a bump run's audit line; got '${EXPECTED_DIGEST}'."
+            exit 1
+          fi
+          if [[ "$DIGEST" != "$EXPECTED_DIGEST" ]]; then
+            # Loud, and nothing printed. A mismatch means the secret is NOT the
+            # one that audit line fingerprinted — it was edited since, or the
+            # digest came from a different fleet. Emitting the shape here would
+            # describe a roster whose digest is not public, which is the whole
+            # thing being avoided.
+            echo "::error::this roster does not match expected_digest, so its digest is NOT already public. The secret was edited since that audit line, or the digest came from another fleet. Nothing printed."
+            exit 1
+          fi
+          echo "roster_sha256: confirmed — matches the digest you supplied"
+
+          # ABOVE the threshold gate on purpose. An entry carrying a key outside
+          # the documented four is hashed into the digest by its NAME as well as
+          # its value, while the name itself is never printed — so a
+          # reconstruction cannot converge, and the operator reads the inevitable
+          # mismatch as wrong repo names. The BELOW-threshold path is where that
+          # bites hardest (its only advice is to search the shape space against
+          # the digest), so a check that lives after the early `exit 0` misses
+          # the case it was added for. It needs only CALLERS_JSON and discloses
+          # one boolean.
+          if jq -e 'any(.[]; keys | any(. as $k | ["file","label","repo","wire_bot"] | index($k) | not))' >/dev/null <<<"$CALLERS_JSON"; then
+            echo "warn:          this roster carries key(s) outside the documented four. Their NAMES are"
+            echo "               never printed but ARE hashed into the digest, so a reconstruction built"
+            echo "               only from these lines CANNOT match it. A mismatch is the unlisted key,"
+            echo "               not wrong repo names."
+          fi
+
+          # The comparison result, never the number. `${NAMES}` beside the
+          # always-printed `count:` would publish a third secret-derived figure
+          # the bumper never logs, and `COUNT - NAMES` is the count of repos
+          # enrolled more than once — on the shared `PR_RISK_CALLERS` that is the
+          # pr-derisk adoption figure the `<listed>` filename suppression exists
+          # to protect.
+          if (( NAMES < MIN_SHAPE_COUNT )); then
+            echo "shape:         (withheld — fewer than ${MIN_SHAPE_COUNT} distinct repo(s); see the header)"
+            echo "               Reconstruct by searching the small per-entry shape space locally"
+            echo "               (which of repo/file/label/wire_bot are present, wire_bot state, label"
+            echo "               presence) against the digest you supplied, with the names and filenames"
+            echo "               already recovered from the fleet's bump PRs."
+            echo "=== end ==="
+            exit 0
+          fi
+
 
           # (3) The field set PER POSITION (`keys` sorts, as `jq -cS` will), so
           #     the operator sees which index carries which shape rather than a
@@ -416,18 +498,6 @@ jobs:
           #     bounded local search against the digest, exactly as the
           #     below-threshold path already recommends.
           FILES=$(jq -c --arg re "$FILE_ALLOW" '[.[] | if (has("file") | not) then "absent" elif (.file | type) == "null" then null elif (.file | type) != "string" then "<\(.file | type)>" elif (.file | test($re)) then "<listed>" else "<unlisted>" end]' <<<"$CALLERS_JSON")
-
-          # An entry carrying a key outside the documented four is hashed into
-          # the digest by its NAME as well as its value, while the name itself
-          # is suppressed to `<unlisted-key>` here — so a reconstruction cannot
-          # converge, and the operator would read the mismatch as wrong repo
-          # names and go hunting the wrong thing. Say so rather than let them.
-          if jq -e 'any(.[]; keys | any(. as $k | ["file","label","repo","wire_bot"] | index($k) | not))' >/dev/null <<<"$CALLERS_JSON"; then
-            echo "warn:          this roster carries key(s) outside the documented four. Their NAMES are"
-            echo "               suppressed above but are hashed into roster_sha256, so a reconstruction"
-            echo "               built only from these lines CANNOT match the digest. A mismatch here is"
-            echo "               the unlisted key, not wrong repo names."
-          fi
           echo "keys:          ${KEYS}"
           echo "wire_bot:      ${WIRE_BOT}"
           echo "label:         ${LABEL}"
