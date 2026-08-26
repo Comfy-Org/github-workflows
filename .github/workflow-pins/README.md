@@ -107,9 +107,29 @@ correctly guarded `ref: ${{ steps.<id>.outputs.ref }}` made the line read as a
 direct *input* checkout and reported a compliant workflow unguarded, while a
 comment spelling out `{WORKFLOWS_REF: "${{ inputs.workflows_ref }}"}`
 registered a resolver step that does not exist. So annotate a `ref:` freely —
-the comment changes no verdict. Only the classification is stripped; the
-column-sensitive readers (indentation, the step's own `id:`, the guard-step
-scan) still see the raw line.
+on an ordinary line the comment changes no verdict. Only the classification is
+stripped; the column-sensitive readers (indentation, the step's own `id:`, the
+guard-step scan) still see the raw line.
+
+Stripping stops wherever a `#` is not a comment at all, because there the text
+past it is value the runtime still folds in and dropping it would let a real
+checkout out of the lint:
+
+- inside a `|` / `>` block scalar and inside a multi-line quoted `ref:` scalar,
+  where the `#` is literal content — only the plain `ref:`-then-value spelling
+  ends at one;
+- on any line the line ABOVE left mid-scalar, such as the tail of a flow
+  mapping split across lines (`- {name: "foo` / `bar # baz", …}`) — the
+  stripper rescans each physical line from scratch and would read that closing
+  quote's `#` as an opener.
+
+Both fall back to the raw line, which is only ever the fail-closed direction:
+worst case a comment there costs an annotation, never coverage. For the same
+reason the strip is deliberately over-protective about quotes — **any** quote
+opens a masked region, so an apostrophe earlier on the line (`name: don't
+resolve  # …`) leaves the `#` unstripped and the comment is read as config
+after all. Rare, and it fails closed; if a comment is somehow changing a
+verdict, that is the first thing to look for.
 
 A step written as ONE flow mapping that both binds `WORKFLOWS_REF` in its `env:`
 and reads a step output in its `with: {ref: … }` is judged like any other

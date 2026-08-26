@@ -135,8 +135,15 @@ _REF_USE_FLOW_RE = re.compile(r"""[{,]\s*(['"]?)ref\1\s*:[^,}]*(?:%s)""" % _INPU
 # block header (`ref: |  # pinned`). Requiring end-of-line right after the key
 # read both as ordinary scalars and lost the continuation. Not after an opening
 # QUOTE, though — there a `#` is string content, not a comment.
+#
+# `quoted` and `block` capture WHICH spelling opened the scalar, because that
+# decides whether a ` #` on the CONTINUATION lines is a comment at all: only a
+# plain multi-line scalar (neither group) ends at one. Inside a `|`/`>` body
+# and inside a multi-line quoted scalar a `#` is literal content the runtime
+# still folds into the ref, so `ref_checkouts` must not strip there (BE-9129).
 _REF_KEY_OPEN_RE = re.compile(
-    r"""^\s*(['"]?)ref\1\s*:[^\S\n]*(?:["'][^\S\n]*$|(?:[|>][+-]?\d*)?[^\S\n]*(?:#.*)?$)"""
+    r"""^\s*(['"]?)ref\1\s*:[^\S\n]*"""
+    r"""(?:(?P<quoted>["'])[^\S\n]*$|(?P<block>[|>][+-]?\d*)?[^\S\n]*(?:#.*)?$)"""
 )
 
 # …and a fourth shape, because a `ref:` does not have to NAME the input at all.
@@ -2552,10 +2559,24 @@ def ref_checkouts(lines, dropped=None):
         # The BE-9045 collector, bound to THIS job's coordinates once so the
         # list can never travel without them (`_record_steps_output`'s `drop`).
         drop = None if dropped is None else (start, job_indent, dropped)
-        # An open `ref:` whose value continues below, as (line index, indent).
-        # Continuation lines are the more-indented ones that follow; the first
-        # line back at or above the key's indent closes the scalar.
+        # An open `ref:` whose value continues below, as (line index, indent,
+        # plain). Continuation lines are the more-indented ones that follow;
+        # the first line back at or above the key's indent closes the scalar.
+        # `plain` is True only for the bare `ref:` spelling — the one YAML ends
+        # at a ` #`. A `|`/`>` body and a multi-line quoted scalar both carry
+        # their `#` as CONTENT, so their continuations are never stripped.
         pending = None
+        # Did the PREVIOUS physical line end inside a quoted scalar? A flow
+        # mapping split across lines does that, and `_strip_comment` restarts
+        # its scan per line — so the closing `"` of `- {name: "foo` /
+        # `bar # baz", …, with: {ref: …}}` reads as an opener-less ` #` and
+        # truncates a real checkout out of the classification (BE-9129). Cross-
+        # line quotes are out of scope for the stripper by its own docstring,
+        # so this loop keeps the RAW line whenever the previous one left a
+        # scalar open — the pre-strip reading, which is the fail-closed one.
+        # Per-line like every reader here: the scan is recomputed fresh, which
+        # answers "did THIS line leave one open" and not the state it inherited.
+        quote_open = False
         # Those continuation lines, stripped, in order. A block scalar may
         # split the ref's `${{ … }}` across PHYSICAL lines and still fold to
         # one expression at runtime, so matching each line on its own left a
@@ -2564,12 +2585,22 @@ def ref_checkouts(lines, dropped=None):
         # neither continuation arm and recorded no site.
         pending_parts = []
         for i, line in _block_body(lines, start, job_indent):
+            after_open_quote = quote_open
+            quote_open = not _quote_mask(line)[len(line)]
             if pending is not None:
                 if _indent(line) > pending[1]:
                     # Stripped for the same reason the arm selection below
                     # is — a trailing `# … inputs.workflows_ref` on the
                     # continuation is prose, not the value the runtime folds.
-                    if mention_re.search(_strip_comment(line)):
+                    # Only where the `#` really opens a comment, though: not in
+                    # a `|`/`>` or quoted body (`pending[2]`), and not on a
+                    # line the one above left mid-scalar.
+                    cont = (
+                        _strip_comment(line)
+                        if pending[2] and not after_open_quote
+                        else line.strip()
+                    )
+                    if mention_re.search(cont):
                         # Report the `ref:` KEY line (that is the checkout the
                         # reader must find), but judge the CONTINUATION line —
                         # the key never holds the expression, so asking it
@@ -2579,7 +2610,7 @@ def ref_checkouts(lines, dropped=None):
                         found.append((pending[0] + 1, fallback, guarded, False))
                         pending = None
                         continue
-                    pending_parts.append(_strip_comment(line))
+                    pending_parts.append(cont)
                     resolved = _steps_output_sites(line, cont=True)
                     if not isinstance(resolved, list) and len(pending_parts) > 1:
                         # Ask the FOLDED value — what the runtime actually
@@ -2633,7 +2664,19 @@ def ref_checkouts(lines, dropped=None):
             # ONLY these three classifiers see `code`; every other reader in
             # this loop keeps the RAW line, because `_strip_comment` also drops
             # the leading indentation they judge by column.
-            code = _strip_comment(line)
+            #
+            # …and only where a ` #` opens a comment at all. A line the one
+            # above left inside a quoted scalar is still string CONTENT, and
+            # the stripper scans each line from scratch, so it would truncate
+            # the tail of a multi-line flow mapping — checkout and all. There
+            # the raw line stands, which is what this arm read before BE-9129.
+            code = line if after_open_quote else _strip_comment(line)
+            # Matched here rather than in its own `elif` only so the arm can
+            # read WHICH spelling opened the scalar; the arms are still tried
+            # in order, so this decides nothing on its own. RAW line, like the
+            # other structural readers — this pattern handles a trailing `#`
+            # itself (see its definition) and needs the key at its column.
+            key_open = _REF_KEY_OPEN_RE.match(line)
             binding = _GUARD_BINDING_RE.match(code)
             flow_binding = False
             ref_use = binding is None and is_ref_use(code, ref_res)
@@ -2723,10 +2766,14 @@ def ref_checkouts(lines, dropped=None):
                 if not _leading_operand_reaches_input(line, mention_re):
                     guarded = False
                 found.append((i + 1, fallback, guarded, False))
-            elif _REF_KEY_OPEN_RE.match(line):
+            elif key_open:
                 # (`_REF_KEY_OPEN_RE` needs end-of-line right after the key, so
                 # it can never take a `ref: ${{ … }}` off the branch below.)
-                pending = (i, _indent(line))
+                # Neither capture set means the bare `ref:` spelling — a PLAIN
+                # multi-line scalar, the only one whose continuations a ` #`
+                # can comment out.
+                plain = not (key_open.group("quoted") or key_open.group("block"))
+                pending = (i, _indent(line), plain)
                 pending_parts = []
             else:
                 resolved = _steps_output_sites(line)

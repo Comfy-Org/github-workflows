@@ -3574,6 +3574,74 @@ class GuardCoverageTests(unittest.TestCase):
         )
         self.assertEqual(len(self._jobs(continuation)), 1)
 
+    # ------------------------------------------------------------------
+    # …and the two places a `#` is NOT a comment, where stripping would move
+    # the lint fail-OPEN — the one direction it may never move. Both were
+    # reported by the review panel on the first cut of BE-9129, and both are
+    # pinned here against the RAW-line reading they restore.
+    # ------------------------------------------------------------------
+
+    def test_a_hash_inside_a_block_scalar_body_is_content_not_a_comment(self):
+        # A `|`/`>` body is literal text: YAML opens no comment there, so the
+        # whole folded line reaches the runtime and this expression resolves to
+        # the input. Stripping at the ` #` hid the mention and the checkout
+        # left the lint entirely.
+        steps = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: >-\n"
+            "            ${{ 'foo\n"
+            "            bar # baz' && inputs.workflows_ref }}\n"
+        )
+        self.assertEqual(len(self._jobs(steps)), 1)
+
+    def test_a_quoted_multi_line_ref_scalar_keeps_a_hash_in_its_body(self):
+        # Same rule for the other non-plain opener: inside a `ref: "` scalar
+        # continued below, the `#` is string content.
+        steps = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            '          ref: "\n'
+            '            ${{ format(\'a#b\') != \'\' && inputs.workflows_ref }}"\n'
+        )
+        self.assertEqual(len(self._jobs(steps)), 1)
+
+    def test_a_plain_multi_line_ref_scalar_still_strips_its_comment(self):
+        # The complement, so the gate above cannot be read as "never strip a
+        # continuation": the bare `ref:` spelling IS ended by a ` #`, and that
+        # is the spelling `COMMENTED_CONSUMER_CONT` exercises. Asserted here on
+        # the fail-closed side too — an unguarded input use with a trailing
+        # comment is still reported.
+        steps = (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref:\n"
+            "            ${{ inputs.workflows_ref }}  # note\n"
+        )
+        self.assertEqual(len(self._jobs(steps)), 1)
+
+    def test_a_quote_opened_on_the_previous_line_suspends_the_strip(self):
+        # `_strip_comment` restarts its quote scan on every physical line, so a
+        # flow mapping split across lines has its closing `"` read as an
+        # opener-less ` #` — truncating the entry that carries the checkout.
+        # The line the one above left mid-scalar is judged RAW instead.
+        steps = (
+            '      - {name: "foo\n'
+            '        bar # baz", uses: actions/checkout@abc, '
+            'with: {ref: "${{ inputs.workflows_ref }}"}}\n'
+        )
+        self.assertEqual(len(self._jobs(steps)), 1)
+        # The single-line spelling of the same step agrees — the split is not
+        # what decides the verdict.
+        one_line = (
+            '      - {name: "foo bar # baz", uses: actions/checkout@abc, '
+            'with: {ref: "${{ inputs.workflows_ref }}"}}\n'
+        )
+        self.assertEqual(len(self._jobs(one_line)), 1)
+
     def test_a_run_body_line_mentioning_the_input_records_no_site(self):
         # `_strip_comment` deliberately OVER-protects a line it cannot prove is
         # YAML (see its docstring): inside a `run: |` body, `# PR #${n}` is
