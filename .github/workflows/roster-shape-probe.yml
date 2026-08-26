@@ -45,8 +45,9 @@ name: Roster shape probe (TEMPORARY)
 #     membership oracle over an enumerable `Comfy-Org/*` namespace, and
 #     `sha256(map(.label))` over a three-word label vocabulary is just the
 #     labels in a thin wrapper;
-#   * and, for a roster SMALLER than `MIN_SHAPE_COUNT`, no shape lines at all —
-#     count + digest only (both already public via the bumper's audit line).
+#   * and, for a roster SMALLER than `MIN_SHAPE_COUNT` distinct repos, no
+#     shape lines at all — count + digest only (the digest itself only when the
+#     `digest_already_public` input says a bump run has already logged it).
 #     The shape lines pin every component of the `jq -cS` preimage except the
 #     ordered repo list, and for a handful of entries that list is small enough
 #     to search offline against an already-public digest. Below the threshold
@@ -400,10 +401,9 @@ jobs:
 
           # (5) Filenames in roster order, under the SAME four-state encoding as
           #     (4) — absent / null / "<type>" — so every position reconciles
-          #     byte-for-byte; a present STRING then prints verbatim ONLY when
-          #     `<listed>` when drawn from the public FILE_ALLOW vocabulary and
-          #     `<unlisted>` otherwise — the NAME is never printed, even a public
-          #     one. Each name on its own is public vocabulary, but the ORDERED
+          #     byte-for-byte; a present STRING prints as `<listed>` when drawn
+          #     from the public FILE_ALLOW vocabulary and `<unlisted>` otherwise
+          #     — the NAME is never printed, even a public one. Each name on its own is public vocabulary, but the ORDERED
           #     MULTISET is not: it is the fleet's adoption profile, derived from
           #     a secret and written permanently to a public log. The sharpest
           #     case is the shared `PR_RISK_CALLERS`, where counting the
