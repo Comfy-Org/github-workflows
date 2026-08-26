@@ -115,9 +115,11 @@ Stripping stops wherever a `#` is not a comment at all, because there the text
 past it is value the runtime still folds in and dropping it would let a real
 checkout out of the lint:
 
-- inside a `|` / `>` block scalar and inside a multi-line quoted `ref:` scalar,
-  where the `#` is literal content — only the plain `ref:`-then-value spelling
-  ends at one;
+- inside a `|` / `>` block scalar and inside a multi-line quoted `ref:` scalar
+  (whether the quote opens alone at end of line or with text — `ref: "${{` /
+  `inputs.workflows_ref }}"` — both open the continuation window), where the
+  `#` is literal content — only the plain `ref:`-then-value spelling ends at
+  one;
 - on any line the line ABOVE left mid-scalar, such as the tail of a flow
   mapping split across lines (`- {name: "foo` / `bar # baz", …}`) — the
   stripper rescans each physical line from scratch and would read that closing

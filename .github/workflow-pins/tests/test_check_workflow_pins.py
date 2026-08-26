@@ -572,6 +572,48 @@ class GuardCoverageTests(unittest.TestCase):
         )
         self.assertEqual(self._jobs(step), [])
 
+    # A quoted scalar that opens WITH text and closes on a later line. The
+    # runtime folds it to the one-line `${{ inputs.workflows_ref }}`, but the
+    # key line names no input and the quote does not end the line, so neither
+    # the same-line pattern nor the end-of-line opener saw a checkout at all.
+    QUOTED_SPLIT_CHECKOUT = FOLDED_CHECKOUT.replace(
+        "ref: >-\n            ${{ inputs.workflows_ref }}",
+        'ref: "${{\n            inputs.workflows_ref }}"',
+    )
+
+    def test_a_quoted_scalar_split_after_its_opening_text_is_not_an_escape_hatch(self):
+        self.assertEqual(len(self._jobs(self.QUOTED_SPLIT_CHECKOUT)), 1)
+        self.assertEqual(
+            len(self._jobs(self.QUOTED_SPLIT_CHECKOUT.replace('"', "'"))), 1
+        )
+
+    def test_a_guarded_split_quoted_checkout_passes(self):
+        self.assertEqual(self._jobs(self.GUARD + self.QUOTED_SPLIT_CHECKOUT), [])
+
+    def test_a_hash_inside_a_split_quoted_ref_is_content(self):
+        # The continuation is still inside the quoted scalar, so its ` #` is
+        # part of the value and must not comment the input mention out.
+        step = self.QUOTED_SPLIT_CHECKOUT.replace(
+            'inputs.workflows_ref }}"', 'x # inputs.workflows_ref }}"'
+        )
+        self.assertEqual(len(self._jobs(step)), 1)
+
+    def test_a_split_quoted_ref_naming_no_input_is_not_a_use(self):
+        step = self.QUOTED_SPLIT_CHECKOUT.replace("inputs.workflows_ref", "main")
+        self.assertEqual(self._jobs(step), [])
+
+    def test_a_quoted_ref_closed_on_its_own_line_opens_no_window(self):
+        # `ref: "main"` is finished; the input on the next, shallower key is
+        # someone else's value and must not be blamed on the ref.
+        step = (
+            "      - name: Literal ref\n"
+            "        with:\n"
+            '          ref: "main"\n'
+            "        env:\n"
+            "          X: ${{ inputs.workflows_ref }}\n"
+        )
+        self.assertEqual(self._jobs(step), [])
+
     def test_the_input_after_a_ref_scalar_closes_is_not_attributed_to_it(self):
         # `ref:` is pinned; the input feeds a LATER, shallower key. Running the
         # continuation scan past the scalar's end would blame it on the `ref:`.

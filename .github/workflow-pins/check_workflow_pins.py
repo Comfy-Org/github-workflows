@@ -750,6 +750,16 @@ def _quote_mask(text, node_start_only=True):
     return mask
 
 
+def _ref_value_starts_quoted(line):
+    """True when `line` is a `ref:` key whose value opens with a `'` or `"`.
+
+    Says nothing about whether that quote CLOSES on the line — `_quote_mask`
+    answers that; this only confirms the scalar it left open is the ref's.
+    """
+    match = _REF_KEY_VALUE_RE.match(line)
+    return match is not None and match.group("value").lstrip()[:1] in ("'", '"')
+
+
 def _outside_quotes(line, pos):
     """True when `pos` sits outside any quoted scalar on `line`."""
     return _quote_mask(line)[min(pos, len(line))]
@@ -2677,6 +2687,18 @@ def ref_checkouts(lines, dropped=None):
             # other structural readers — this pattern handles a trailing `#`
             # itself (see its definition) and needs the key at its column.
             key_open = _REF_KEY_OPEN_RE.match(line)
+            # …and the quoted scalar that carries text on its opening line and
+            # closes on a LATER one — `ref: "${{` / `inputs.workflows_ref }}"`
+            # — which the pattern's end-of-line anchor cannot see. The runtime
+            # folds that to the same `${{ inputs.workflows_ref }}`, so it must
+            # open the same window. `quote_open` already answers whether THIS
+            # line left a scalar unclosed; all that is left is confirming the
+            # unclosed scalar is the `ref:` value, not some sibling's.
+            quoted_open = (
+                key_open is None
+                and quote_open
+                and _ref_value_starts_quoted(line)
+            )
             binding = _GUARD_BINDING_RE.match(code)
             flow_binding = False
             ref_use = binding is None and is_ref_use(code, ref_res)
@@ -2766,13 +2788,16 @@ def ref_checkouts(lines, dropped=None):
                 if not _leading_operand_reaches_input(line, mention_re):
                     guarded = False
                 found.append((i + 1, fallback, guarded, False))
-            elif key_open:
+            elif key_open or quoted_open:
                 # (`_REF_KEY_OPEN_RE` needs end-of-line right after the key, so
                 # it can never take a `ref: ${{ … }}` off the branch below.)
                 # Neither capture set means the bare `ref:` spelling — a PLAIN
                 # multi-line scalar, the only one whose continuations a ` #`
-                # can comment out.
-                plain = not (key_open.group("quoted") or key_open.group("block"))
+                # can comment out. `quoted_open` is by construction a quoted
+                # one, so it is never plain.
+                plain = bool(key_open) and not (
+                    key_open.group("quoted") or key_open.group("block")
+                )
                 pending = (i, _indent(line), plain)
                 pending_parts = []
             else:
