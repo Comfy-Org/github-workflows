@@ -99,6 +99,8 @@ foo                         # generic doc/test placeholder
 legit                       # bump-callers doc/test placeholder
 x                           # single-letter placeholder in the public-repo-hygiene docs
 notes                       # path-shaped example (`docs/v1.2/<org>/notes`) in the public-repo-hygiene docs
+ComfyUI.md                  # doc example: extension over-flag limitation (public-repo-hygiene README/docs/tests)
+ComfyUI.internal            # doc example: extension over-flag limitation (public-repo-hygiene README/docs/tests)
 
 # ── Hugging Face model/dataset namespaces, not GitHub repos ──
 # This org publishes weights under a Hugging Face namespace of the same name, so
@@ -142,7 +144,11 @@ some-internal-thing         # public-repo-hygiene fixture
 something-else              # public-repo-hygiene fixture
 definitely-not-public       # public-repo-hygiene fixture
 nope                        # public-repo-hygiene fixture
+nope-private                # public-repo-hygiene fixture
 whatever                    # public-repo-hygiene fixture
+some-private-repo           # public-repo-hygiene fixture
+other-private-repo          # public-repo-hygiene fixture
+github-workflows-ops        # public-repo-hygiene fixture
 bare-host-at-line-start     # public-repo-hygiene model-host anchor fixture
 host-case-and-port          # public-repo-hygiene model-host anchor fixture
 in-a-markdown-link          # public-repo-hygiene model-host anchor fixture
