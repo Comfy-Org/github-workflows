@@ -61,6 +61,9 @@ DEFAULT_SEVERITY = "medium"
 # approached. Clamp under it: an oversize body 422s, and the wholesale fallback is
 # strictly LARGER than what just failed, so it 422s too and the whole review is lost.
 MAX_REVIEW_BODY_CHARS = 60000
+# The error review's message is unbounded CLI/model text; bounded well under
+# MAX_REVIEW_BODY_CHARS so the header, the fence and the re-trigger line always fit.
+MAX_ERROR_MESSAGE_CHARS = 40000
 
 # Max re-raises of an already-answered finding allowed in one review (BE-5109).
 # Nothing already-answered is ever silently suppressed — a wrong or premature
@@ -162,6 +165,31 @@ TRUNCATED_SUMMARY_NOTE = (
     "limit. The full text is below.\n\n"
 )
 
+# Actions caps $GITHUB_STEP_SUMMARY at 1 MiB per step and discards an overflowing
+# upload WHOLE rather than truncating it — so an oversize write loses the summary that
+# TRUNCATED_SUMMARY_NOTE and clamp_review_body both point the reader at, leaving the
+# review absent past the cut on the PR *and* absent here. Budgeted under the cap in
+# BYTES (the limit is on the file, and a finding body is not ASCII-only). Reachable on
+# the un-adjudicated panel path: review-output-mcp.py caps only the judge at 10
+# findings, reviewer mode has no count cap, and the degraded branch unions all 8 cells.
+MAX_STEP_SUMMARY_BYTES = 900_000
+
+# No claim about WHAT was cut: this note also rides the error-review and no-findings
+# summaries, which carry no severity-ordered list to be cut from.
+STEP_SUMMARY_TRUNCATED_NOTE = (
+    "\n\n_…truncated here: this run's job summary reached the Actions per-step size "
+    "limit. See the run log for the whole of it._"
+)
+
+
+def clamp_to_bytes(text: str, limit: int) -> str:
+    """Trim `text` to at most `limit` UTF-8 bytes, never splitting a character."""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= limit:
+        return text
+    # errors="ignore" drops a partial trailing sequence rather than emitting U+FFFD.
+    return encoded[:limit].decode("utf-8", "ignore")
+
 
 def write_step_summary(markdown: str, note: str = READ_ONLY_SUMMARY_NOTE) -> None:
     """Render the review into the Actions run summary when the PR copy is lossy.
@@ -171,14 +199,24 @@ def write_step_summary(markdown: str, note: str = READ_ONLY_SUMMARY_NOTE) -> Non
     clamped — `clamp_review_body`'s note promises the full text is here, and this is
     what makes that promise true.
     """
+    payload = note + markdown
+    # Leave room for the trailing newline and the note that says where the cut landed.
+    budget = MAX_STEP_SUMMARY_BYTES - len(STEP_SUMMARY_TRUNCATED_NOTE.encode("utf-8")) - 1
+    if len(payload.encode("utf-8")) > MAX_STEP_SUMMARY_BYTES - 1:
+        print(
+            "Step summary: content exceeds the Actions per-step size limit — cutting "
+            "it rather than letting the whole upload be discarded.",
+            file=sys.stderr,
+        )
+        payload = clamp_to_bytes(payload, budget).rstrip() + STEP_SUMMARY_TRUNCATED_NOTE
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not path:
         # No summary file (e.g. a local run) — fall back to stdout so the
         # content isn't silently dropped.
-        print(note + markdown)
+        print(payload)
         return
     with open(path, "a", encoding="utf-8") as f:
-        f.write(note + markdown + "\n")
+        f.write(payload + "\n")
 
 
 def post_or_degrade(repo, pr_number, payload, summary_markdown, context, truncated=False) -> bool:
@@ -333,6 +371,14 @@ def anchorable_lines(diff_text: str):
     # `diff --git` line — which content can never impersonate, since every content
     # line carries a +/-/space/backslash prefix — resynchronizes the scan.
     desynced = False
+    # A `diff --git ` line has been seen, i.e. this really is git's own output rather
+    # than a bare concatenated `diff -u`. When it is, git ALWAYS emits `diff --git `
+    # before each file's `--- `/`+++ ` pair, so a header pair reached from inside a
+    # file's hunk region is not something git wrote — see `in_hunk_region` below.
+    saw_git_header = False
+    # A `@@` has been parsed for the CURRENT file. Reset by `diff --git `, and by an
+    # honoured `+++` header (which opens a new file).
+    in_hunk_region = False
     # split("\n") with the trailing element dropped, not splitlines(): splitlines also
     # breaks on \v, \f, \x1c-\x1e, U+0085 and U+2028/9, none of which advance git's
     # line numbering. A form feed in a Python file would otherwise split one content
@@ -373,6 +419,24 @@ def anchorable_lines(diff_text: str):
             right = 0
             pending_old = pending_new = 0
             desynced = True
+        elif raw[:1] in ("+", "-", " ") and not (
+            raw.startswith("--- ") or raw.startswith("+++ ")
+        ):
+            # The mirror of the branch above. There the declared counts were too LARGE
+            # (budget left, content gone); here they were too SMALL — the budget is
+            # spent but content lines keep coming. Those lines used to fall through and
+            # match nothing, silently, which put the `--- `/`+++ ` header test back in
+            # force INSIDE hunk content: a removed `-- x` emits as `--- x`, the added
+            # `++ b/app.py` after it emits as `+++ b/app.py`, and the pair would number
+            # the rest of the hunk under a real file's key — the wrong-position 422
+            # this parser exists to prevent. Desync instead, until a `diff --git`.
+            # A `\ No newline` marker legitimately arrives on a spent budget, and the
+            # header forms are excluded here because a prefix-less multi-file `diff -u`
+            # really does start its next file that way (the `saw_git_header` gate below
+            # is what covers that case when the input IS git output).
+            path = None
+            right = 0
+            desynced = True
 
         if raw.startswith("diff --git "):
             # The one line a content line can never be (every content line carries a
@@ -382,6 +446,8 @@ def anchorable_lines(diff_text: str):
             # attributing its lines to the PREVIOUS file.
             desynced = False
             saw_marker = True
+            saw_git_header = True
+            in_hunk_region = False
             path = None
             right = 0
             continue
@@ -389,16 +455,26 @@ def anchorable_lines(diff_text: str):
             saw_old_header = True
             continue
         if raw.startswith("+++ "):
-            if not saw_old_header_before or desynced:
+            if not saw_old_header_before or desynced or (saw_git_header and in_hunk_region):
                 # A `+++` with no `---` in front of it is not a header git wrote. Do not
                 # trust it, and drop the current file rather than keep numbering lines
                 # that may belong to another one.
+                #
+                # `saw_git_header and in_hunk_region` closes the remaining seam: if the
+                # miscount is exactly two lines, the overflow lines ARE the `--- `/`+++ `
+                # pair and the desync above never fires. git always emits `diff --git `
+                # before a file's header pair, so a pair reached from inside a hunk
+                # region of git's own output is content impersonating one. Gated on
+                # saw_git_header so a prefix-less concatenated `diff -u`, whose files
+                # legitimately follow one another with no `diff --git`, still parses.
                 path = None
                 right = 0
+                desynced = True
                 continue
             saw_marker = True
             path = header_new_path(raw)
             right = 0
+            in_hunk_region = False
             if path is not None:
                 anchors.setdefault(path, set())
             continue
@@ -418,6 +494,7 @@ def anchorable_lines(diff_text: str):
             right = int(m.group(3))
             pending_old = int(m.group(2)) if m.group(2) is not None else 1
             pending_new = int(m.group(4)) if m.group(4) is not None else 1
+            in_hunk_region = True
     if not saw_marker:
         return None
     return anchors
@@ -492,6 +569,11 @@ def clamp_review_body(body: str, limit: int = MAX_REVIEW_BODY_CHARS) -> str:
     return body[: limit - len(note)].rstrip() + note
 
 
+# Every line ending CommonMark recognizes. `\r` alone is one of them, so a blockquote
+# built by splitting on `\n` only would leak the text after a bare CR out of the quote.
+MD_LINE_BREAK_RE = re.compile(r"\r\n|\r|\n")
+
+
 def render_code_ref(path, line) -> str:
     """Render a `path:line` reference safe to drop into markdown.
 
@@ -526,7 +608,14 @@ def render_finding_entry(c: dict) -> str:
     an unclosed fence closes with it.
     """
     text = f"**{render_code_ref(c['path'], c['line'])}** — {c['body']}"
-    return "\n".join(f"> {ln}" if ln else ">" for ln in text.split("\n"))
+    # MD_LINE_BREAK_RE, not split("\n"): CommonMark (and GitHub's cmark-gfm) ends a
+    # line on a bare \r too, and nothing upstream strips control characters —
+    # review-output-mcp.py's validate_finding checks only type/non-empty/length, and
+    # neutralize_mentions touches `@` alone. A body of "safe\r## Forged" split on \n
+    # alone keeps the heading inside ONE element, so it is emitted with no "> " prefix
+    # and renders outside the blockquote — the exact forged-heading escape this
+    # function exists to contain.
+    return "\n".join(f"> {ln}" if ln else ">" for ln in MD_LINE_BREAK_RE.split(text))
 
 
 def render_body_only_findings(items: list) -> str:
@@ -679,15 +768,38 @@ def enforce_repeat_cap(enriched: list[dict], cap: int = REPEAT_CAP) -> tuple[lis
 
 
 def post_error_review(repo, pr_number, commit_sha, header, error_message):
+    """Post the "why the review failed" review, with the message bounded and fenced.
+
+    `error_message` is `$JUDGE_ERROR` on the judge-failure path — read straight out of
+    judge-findings.json's `error` field, i.e. unbounded CLI/model text. Over GitHub's
+    65,536-char body limit the POST 422s and this raises, losing the error review
+    entirely: the one path whose whole job is to report why the review failed. So the
+    message is cut to its own budget (which keeps the trailing re-trigger instruction,
+    where clamping the assembled body would drop it and leave the fence open), and the
+    body is clamped afterwards as a hard guarantee.
+    """
     safe = neutralize_mentions(error_message)
-    body_text = (
-        f"{header}\n\n⚠️ **Review failed**\n\n```\n{safe}\n```\n\n"
+    if len(safe) > MAX_ERROR_MESSAGE_CHARS:
+        safe = safe[:MAX_ERROR_MESSAGE_CHARS].rstrip() + (
+            "\n…(truncated: the error text hit the review body's size limit — see "
+            "the run log for the whole of it)"
+        )
+    # A ``` run inside the message would close the fence early and let the rest of the
+    # error render as markdown; CommonMark lets the fence be longer instead.
+    longest = max((len(run) for run in re.findall(r"`+", safe)), default=0)
+    fence = "`" * max(3, longest + 1)
+    body_text = clamp_review_body(
+        f"{header}\n\n⚠️ **Review failed**\n\n{fence}\n{safe}\n{fence}\n\n"
         "Re-trigger by removing and re-adding the `cursor-review` label."
     )
     payload = json.dumps(
         {"body": body_text, "event": "COMMENT", "commit_id": commit_sha}
     )
     if not post_or_degrade(repo, pr_number, payload, body_text, "Error review"):
+        # Same contract as the review paths: a genuine POST failure still delivers the
+        # text somewhere. post_or_degrade writes the summary itself on the paths that
+        # return True, so this cannot double-write.
+        write_step_summary(body_text, note=POST_FAILED_SUMMARY_NOTE)
         raise SystemExit(1)
 
 
@@ -862,10 +974,12 @@ def main():
 
     print(f"Review POST failed: {result.stderr}", file=sys.stderr)
     if not comments:
-        # There is no inline half to drop, so the fallback body would be identical to
-        # the request that just failed — it cannot fix a size or malformed-body
-        # rejection, and if GitHub committed the write before erroring it publishes a
-        # duplicate review. Deliver the text to the summary and let the step go red.
+        # There is no inline half to drop, so a fallback POST would carry the same
+        # findings as the request that just failed (only the demotion intro and the
+        # anchor note differ) — it cannot fix a size or malformed-body rejection, and
+        # if GitHub committed the write before erroring it publishes a DUPLICATE
+        # review no one can un-post. That duplicate risk, not byte-identity, is the
+        # reason to skip it. Deliver the text to the summary and let the step go red.
         print(
             "Review: no inline comments to drop — the fallback would repost the same "
             "body, so writing it to the job summary instead.",
@@ -898,6 +1012,13 @@ def main():
         "Fallback review",
         truncated=clamped_fallback != fallback_body,
     ):
+        # Both attempts failed for a non-403 reason (an API outage, a stale commit_id
+        # after a force-push, a body-level rejection dropping the anchors cannot fix).
+        # Without this the whole review is gone from the PR *and* the summary, which
+        # contradicts the no-inline branch above — and this is the branch carrying
+        # MORE content, since it has an inline half. post_or_degrade only writes a
+        # summary on the paths that return True, so there is no double write here.
+        write_step_summary(fallback_body, note=POST_FAILED_SUMMARY_NOTE)
         raise SystemExit(1)
 
 

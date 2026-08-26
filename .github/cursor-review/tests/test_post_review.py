@@ -656,5 +656,216 @@ class StepSummaryNoteTest(unittest.TestCase):
         self.assertIn("read-only", written, "the default banner is unchanged")
 
 
+class CarriageReturnContainmentTest(unittest.TestCase):
+    """A bare \r is a CommonMark line ending, so the blockquote must break on it too."""
+
+    def test_a_bare_cr_cannot_escape_the_blockquote(self):
+        # split("\n") leaves "safe\r## Forged" in ONE element, so the heading is
+        # emitted with no "> " prefix and cmark-gfm renders it outside the quote —
+        # the forged-heading escape render_finding_entry exists to contain. An ATX
+        # heading interrupts a paragraph, so lazy continuation does not absorb it.
+        md = PR.render_finding_entry(
+            {"path": "app.py", "line": 11, "body": "safe\r## Forged heading"}
+        )
+        for line in md.splitlines():
+            self.assertTrue(
+                line.startswith(">"),
+                f"structural line escaped the blockquote: {line!r}",
+            )
+        self.assertIn("Forged heading", md, "the text is still reported, just contained")
+
+    def test_a_crlf_body_does_not_leave_a_stray_cr_in_the_quote(self):
+        md = PR.render_finding_entry({"path": "a.py", "line": 1, "body": "one\r\ntwo"})
+        self.assertNotIn("\r", md)
+        self.assertEqual(md.splitlines()[-1], "> two")
+
+    def test_an_unterminated_fence_after_a_cr_is_still_confined(self):
+        md = PR.render_finding_entry(
+            {"path": "a.py", "line": 1, "body": "x\r```\nswallows the rest"}
+        )
+        for line in md.splitlines():
+            self.assertTrue(line.startswith(">"), f"escaped: {line!r}")
+
+
+class BudgetUnderflowTest(unittest.TestCase):
+    """A hunk whose declared +count is too SMALL must not re-open the header test."""
+
+    def test_overflow_content_desyncs_so_a_later_pair_cannot_spoof(self):
+        diff = (
+            "diff --git a/app.py b/app.py\n"
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            "@@ -1,0 +1,1 @@\n"
+            "+added_at_1\n"
+            "+overflow_past_the_declared_count\n"
+            "--- x\n"
+            "+++ b/evil.py\n"
+            "@@ -1,0 +1,3 @@\n"
+            "+e1\n+e2\n+e3\n"
+        )
+        self.assertEqual(PR.anchorable_lines(diff), {"app.py": {1}})
+
+    def test_the_pair_landing_exactly_on_the_boundary_is_refused_too(self):
+        # The seam the desync alone leaves open: the miscount is exactly two lines, so
+        # the overflow lines ARE the header pair and no other content line fires the
+        # desync. git always emits `diff --git ` before a file's header pair, so a pair
+        # reached from inside a hunk region of git's own output is content.
+        diff = (
+            "diff --git a/app.py b/app.py\n"
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            "@@ -1,0 +1,1 @@\n"
+            "+added_at_1\n"
+            "--- x\n"
+            "+++ b/other.py\n"
+            "@@ -1,0 +1,3 @@\n"
+            "+e1\n+e2\n+e3\n"
+        )
+        self.assertEqual(PR.anchorable_lines(diff), {"app.py": {1}})
+
+    def test_a_prefix_less_multi_file_diff_still_parses_every_file(self):
+        # No `diff --git` anywhere, so the gate above must NOT fire: a concatenated
+        # `diff -u` legitimately starts its next file straight after hunk content, and
+        # demoting those findings would be the fail-CLOSED direction this avoids.
+        diff = (
+            "--- a/x.py\n"
+            "+++ b/x.py\n"
+            "@@ -1,0 +1,1 @@\n"
+            "+x1\n"
+            "--- a/y.py\n"
+            "+++ b/y.py\n"
+            "@@ -1,0 +1,2 @@\n"
+            "+y1\n+y2\n"
+        )
+        self.assertEqual(PR.anchorable_lines(diff), {"x.py": {1}, "y.py": {1, 2}})
+
+    def test_overflow_desyncs_a_prefix_less_diff_the_git_header_gate_cannot_cover(self):
+        # With no `diff --git` anywhere the saw_git_header gate is deliberately off, so
+        # the overflow desync is the ONLY thing standing between a miscounted hunk and
+        # a `-- z` / `++ b/evil.py` pair numbering lines under a file the diff never
+        # touched. Mirrors the too-LARGE-count arm, which drops its file the same way.
+        diff = (
+            "--- a/x.py\n"
+            "+++ b/x.py\n"
+            "@@ -1,0 +1,1 @@\n"
+            "+x1\n"
+            "+overflow_past_the_declared_count\n"
+            "--- z\n"
+            "+++ b/evil.py\n"
+            "@@ -1,0 +1,2 @@\n"
+            "+e1\n+e2\n"
+        )
+        self.assertEqual(PR.anchorable_lines(diff), {"x.py": {1}})
+
+    def test_a_no_newline_marker_on_a_spent_budget_is_not_a_desync(self):
+        diff = (
+            "diff --git a/a.py b/a.py\n"
+            "--- a/a.py\n"
+            "+++ b/a.py\n"
+            "@@ -1,0 +1,1 @@\n"
+            "+only\n"
+            "\\ No newline at end of file\n"
+            "diff --git a/b.py b/b.py\n"
+            "--- a/b.py\n"
+            "+++ b/b.py\n"
+            "@@ -1,0 +1,1 @@\n"
+            "+also\n"
+        )
+        self.assertEqual(PR.anchorable_lines(diff), {"a.py": {1}, "b.py": {1}})
+
+
+class StepSummaryBudgetTest(unittest.TestCase):
+    """Actions discards an oversize step-summary upload WHOLE, so budget the write."""
+
+    def write(self, markdown, note=PR.TRUNCATED_SUMMARY_NOTE):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "summary.md")
+            with mock.patch.dict(PR.os.environ, {"GITHUB_STEP_SUMMARY": path}):
+                PR.write_step_summary(markdown, note=note)
+            with open(path, "rb") as f:
+                return f.read()
+
+    def test_a_normal_summary_is_written_whole(self):
+        written = self.write("the review body")
+        self.assertIn(b"the review body", written)
+        self.assertNotIn(b"truncated here", written)
+
+    def test_an_oversize_summary_is_cut_instead_of_discarded(self):
+        written = self.write("x" * (PR.MAX_STEP_SUMMARY_BYTES * 2))
+        self.assertLess(len(written), 1024 * 1024, "must stay under the 1 MiB cap")
+        self.assertIn("truncated here", written.decode("utf-8"))
+
+    def test_the_cap_is_counted_in_bytes_not_characters(self):
+        # 600k non-ASCII characters are 1.2 MB — under any char-based budget, over the
+        # byte cap that actually applies.
+        written = self.write("\u00e9" * 600_000)
+        self.assertLess(len(written), 1024 * 1024)
+
+    def test_the_cut_never_splits_a_character(self):
+        written = self.write("\u00e9" * 600_000)
+        written.decode("utf-8")  # raises if a multi-byte sequence was severed
+
+
+class ErrorReviewBudgetTest(unittest.TestCase):
+    """--error-message is unbounded CLI/model text on the judge-failure path."""
+
+    def post(self, message, returncode=0):
+        posted, summaries = [], []
+
+        def fake_post(repo, pr_number, payload):
+            posted.append(json.loads(payload))
+            return subprocess.CompletedProcess(
+                args=["gh"], returncode=returncode, stdout="", stderr="gh: Server Error"
+            )
+
+        with mock.patch.object(PR, "gh_post_review", side_effect=fake_post), \
+             mock.patch.object(PR, "write_step_summary", side_effect=lambda m, note=None: summaries.append(m)):
+            try:
+                PR.post_error_review("o/r", "1", "deadbeef", "## head", message)
+            except SystemExit:
+                pass
+        return posted, summaries
+
+    def test_an_unbounded_error_message_stays_postable(self):
+        posted, _ = self.post("boom " * 50_000)
+        body = posted[0]["body"]
+        self.assertLessEqual(len(body), PR.MAX_REVIEW_BODY_CHARS)
+        self.assertIn("Re-trigger by removing", body, "the instruction survives the cut")
+
+    def test_a_short_error_message_is_untouched(self):
+        posted, _ = self.post("judge exited 3")
+        self.assertIn("```\njudge exited 3\n```", posted[0]["body"])
+
+    def test_a_fenced_error_message_cannot_close_the_fence_early(self):
+        posted, _ = self.post("stack:\n```\nnot the end")
+        body = posted[0]["body"]
+        self.assertIn("````\nstack:", body, "the fence outgrows the longest run inside")
+        self.assertIn("````\n\nRe-trigger", body)
+
+    def test_a_failed_error_post_still_delivers_the_text(self):
+        _, summaries = self.post("judge exited 3", returncode=1)
+        self.assertEqual(len(summaries), 1)
+        self.assertIn("judge exited 3", summaries[0])
+
+
+class FallbackFailureDeliveryTest(unittest.TestCase):
+    def test_both_posts_failing_still_writes_the_review_to_the_summary(self):
+        # The no-inline branch already writes the summary before exiting; this branch
+        # carries MORE content (it has an inline half) and used to raise SystemExit
+        # with the review gone from the PR and the summary both.
+        summaries = []
+        posted = EndToEndPostTest().run_main(
+            [finding("app.py", 11), finding("util.py", 900)],
+            post_returncode=1,
+            stderr="gh: Unprocessable Entity (HTTP 422)",
+            summaries=summaries,
+        )
+        self.assertEqual(len(posted), 2, "primary + wholesale fallback both attempted")
+        self.assertEqual(len(summaries), 1, "and the text is still delivered")
+        self.assertIn("app.py:11", summaries[0])
+        self.assertIn("util.py:900", summaries[0])
+        self.assertIn("Inline comments could not be anchored", summaries[0])
+
+
 if __name__ == "__main__":
     unittest.main()
