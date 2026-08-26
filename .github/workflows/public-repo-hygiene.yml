@@ -8,8 +8,9 @@ name: Public Repo Hygiene (reusable)
 # `@Comfy-Org/<team>` CODEOWNERS-handle case). It is a lightweight regression
 # guard, not a secrets scanner. It runs in the CALLER's context, so
 # `actions/checkout` checks out the calling repo and the scan operates on that
-# repo's tracked files. Fails with a non-zero exit (and GitHub annotations) so
-# it can be wired as a required status check.
+# repo's tracked files — their CONTENTS, their tracked PATHS, and a symlink's
+# target string, all three through the same matcher. Fails with a non-zero exit
+# (and GitHub annotations) so it can be wired as a required status check.
 #
 # The check script is loaded from THIS repo (public, pinned via `workflows_ref`)
 # — never from the caller's checkout — so a PR can't rewrite the checker OR its
@@ -250,11 +251,56 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Capture the PR title and description
+        # The tracked-file scan cannot see PR text, and PR text is published on
+        # a public repo the moment it is typed — so it is a leak surface with no
+        # guard at all today. Two real ones, both on a public PR of THIS repo:
+        # an internal collaboration-tool permalink in a description (exposing a
+        # workspace and channel id), and a PRIVATE `Comfy-Org/<repo>` named in
+        # the body. Neither is caught anywhere else. (BE-9652)
+        #
+        # Only when the triggering event actually carries a pull request. The
+        # payload is read from the EVENT, never taken as a workflow input: an
+        # input is something the caller supplies, and a caller that can supply
+        # the text being judged can supply different text. Same reasoning as
+        # loading the checker from `workflows_ref` rather than the caller's
+        # checkout — a PR must not get to choose what the check reads.
+        if: github.event.pull_request != null
+        env:
+          # Interpolated into an `env:` VALUE, never into the `run:` body.
+          # A PR title and description are attacker-controlled strings, and
+          # `${{ … }}` inside a shell script is textual substitution before the
+          # shell ever sees it — `$(…)` in a PR title would execute on the
+          # runner. As an env var the shell only ever sees data. This is the
+          # single most important line in the step.
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          # RUNNER_TEMP, deliberately NOT the workspace: anything written into
+          # the workspace would sit inside the tree the scan walks. Untracked,
+          # so `git ls-files` would not list it — but writing the text being
+          # judged into the directory being judged is a trap waiting for the
+          # first future change that scans untracked files too.
+          dir="$RUNNER_TEMP/hygiene-pr-text"
+          mkdir -p "$dir"
+          # `printf '%s'`, not `echo`: a body beginning with `-n` or containing
+          # backslashes is mangled by echo on some shells, and this text has to
+          # reach the checker byte-for-byte or the scan is over something the
+          # reader never saw. A null body (no description) arrives as the empty
+          # string, which is a legitimate 0-byte surface, not an error.
+          printf '%s' "$PR_TITLE" > "$dir/title.txt"
+          printf '%s' "$PR_BODY"  > "$dir/body.txt"
+
       - name: Scan for internal-only references
         env:
           HYGIENE_CHECK_ROOT: ${{ github.workspace }}
           TICKET_ALLOWLIST: ${{ inputs.ticket_allowlist }}
           EXCLUDE_PATHS: ${{ inputs.exclude_paths }}
+          # Empty on a non-PR event (push, schedule, dispatch), which is what
+          # makes the surface scan additive rather than a new failure mode for
+          # callers that do not run this on pull_request.
+          PR_TEXT_DIR: ${{ github.event.pull_request != null && format('{0}/hygiene-pr-text', runner.temp) || '' }}
         run: |
           # Each optional flag is added ONLY when the caller set a non-blank
           # value, so a caller that never heard of these inputs runs the exact
@@ -268,6 +314,18 @@ jobs:
           fi
           if [ -n "$(printf '%s' "$TICKET_ALLOWLIST" | tr -d '[:space:]')" ]; then
             args+=("--ticket-allow=$TICKET_ALLOWLIST")
+          fi
+          # The two PR surfaces, when the event carried one. The labels read as
+          # surfaces rather than paths (`<PR title>`, not `PR-title`) so a
+          # finding line cannot be mistaken for a file in the tree.
+          #
+          # Passed as PATHS, never as values: the title and body are unbounded
+          # author-controlled text, and putting them on the command line would
+          # count against ARG_MAX and force them back through the shell. The
+          # previous step already wrote them, from `env:`, as bytes.
+          if [ -n "$PR_TEXT_DIR" ]; then
+            args+=("--scan-text=<PR title>=$PR_TEXT_DIR/title.txt")
+            args+=("--scan-text=<PR description>=$PR_TEXT_DIR/body.txt")
           fi
           python3 "$GITHUB_WORKSPACE/_public_repo_hygiene/.github/public-repo-hygiene/check_public_repo_hygiene.py" \
             "${args[@]}"

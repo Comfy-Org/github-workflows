@@ -135,8 +135,22 @@ _REF_USE_FLOW_RE = re.compile(r"""[{,]\s*(['"]?)ref\1\s*:[^,}]*(?:%s)""" % _INPU
 # block header (`ref: |  # pinned`). Requiring end-of-line right after the key
 # read both as ordinary scalars and lost the continuation. Not after an opening
 # QUOTE, though — there a `#` is string content, not a comment.
+#
+# `quoted` and `block` capture WHICH spelling opened the scalar, because that
+# decides whether a ` #` on the CONTINUATION lines is a comment at all: only a
+# plain multi-line scalar (neither group) ends at one. Inside a `|`/`>` body
+# and inside a multi-line quoted scalar a `#` is literal content the runtime
+# still folds into the ref, so `ref_checkouts` must not strip there (BE-9129).
+#
+# The block header takes its chomping (`+`/`-`) and explicit-indentation
+# (`\d`) indicators in EITHER order — `>2-` is as valid as `>-2` — and the
+# `ref:` window is a coverage boundary, so a spelling YAML accepts and this
+# class rejected was a one-character bypass: `ref: >2-` opened no window and
+# the unguarded input on the line below was never inspected (BE-9129).
+_BLOCK_HEADER = r"""[|>](?:[+-]\d*|\d+[+-]?)?"""
 _REF_KEY_OPEN_RE = re.compile(
-    r"""^\s*(['"]?)ref\1\s*:[^\S\n]*(?:["'][^\S\n]*$|(?:[|>][+-]?\d*)?[^\S\n]*(?:#.*)?$)"""
+    r"""^\s*(['"]?)ref\1\s*:[^\S\n]*"""
+    r"""(?:(?P<quoted>["'])[^\S\n]*$|(?P<block>%s)?[^\S\n]*(?:#.*)?$)""" % _BLOCK_HEADER
 )
 
 # …and a fourth shape, because a `ref:` does not have to NAME the input at all.
@@ -466,8 +480,8 @@ _CONSUMES_FLOW_RE = re.compile(
 # already lands in _CONSUMES_BLOCK_RE, whose `\s*` spans the newline; only the
 # `|`/`>` indicator sits between the colon and the value and defeats it.)
 _CONSUMES_SCALAR_RE = re.compile(
-    r"""(?m)^\s*(['"]?)[\w.-]+\1\s*:\s*[|>][+-]?\d*[^\S\n]*(?:#[^\n]*)?\n"""
-    r"""\s*\$\{\{\s*(?:%s)\s*\}\}""" % _INPUT_MENTION_BODY
+    r"""(?m)^\s*(['"]?)[\w.-]+\1\s*:\s*%s[^\S\n]*(?:#[^\n]*)?\n"""
+    r"""\s*\$\{\{\s*(?:%s)\s*\}\}""" % (_BLOCK_HEADER, _INPUT_MENTION_BODY)
 )
 
 # An `env:` binding of the input to a NAME (`WORKFLOWS_REF: ${{ inputs… }}`).
@@ -528,12 +542,18 @@ def _env_alias_res(mention):
 # same shape `_REF_KEY_OPEN_RE` recognizes for `ref:`, generalized to any env
 # key name so the alias scan can follow it too. Group 2 is the NAME.
 _ALIAS_KEY_OPEN_RE = re.compile(
-    r"""^\s*(['"]?)([A-Za-z_][\w-]*)\1\s*:[^\S\n]*(?:["'][^\S\n]*$|(?:[|>][+-]?\d*)?[^\S\n]*(?:#.*)?$)"""
+    r"""^\s*(['"]?)([A-Za-z_][\w-]*)\1\s*:[^\S\n]*(?:["'][^\S\n]*$|(?:%s)?[^\S\n]*(?:#.*)?$)"""
+    % _BLOCK_HEADER
 )
 # The same NAME grammar as `_ALIAS_KEY_OPEN_RE`'s group 2, standalone — used to
 # validate a flow entry's key, which `_flow_entries` reads structurally rather
 # than through a keyed regex.
 _ALIAS_NAME_RE = re.compile(r"""^[A-Za-z_][\w-]*$""")
+# Any env key with the rest of its line as `value` — the `_REF_KEY_VALUE_RE`
+# of the alias scan, for the two openers `_ALIAS_KEY_OPEN_RE` cannot see: a
+# quote left open AFTER text (`WORKFLOWS_REF: "${{` / `inputs.workflows_ref
+# }}"`) and a plain scalar folding onto the lines below (BE-9129).
+_ALIAS_KEY_VALUE_RE = re.compile(r"""^\s*(['"]?)([A-Za-z_][\w-]*)\1\s*:(?P<value>.*)$""")
 
 _ENV_ALIAS_RES = _env_alias_res(_INPUT_MENTION_BODY)
 # Every `env:` entry, whatever its value — the alias fixpoint's hard bound: no
@@ -677,16 +697,52 @@ def _opens_quoted_scalar(text, i):
         return True
     # A `-` opens a node only as a standalone list marker (`- 'x'`); inside a
     # plain scalar (`utf-8'`) it is an ordinary character.
-    return (
+    if (
         text[j] == "-"
         and (j == 0 or text[j - 1] in " \t")
         and j + 1 < len(text)
         and text[j + 1] in " \t"
-    )
+    ):
+        return True
+    # A `&anchor` / `!tag` node PROPERTY sits between the opener and the node's
+    # content (`name: &label !!str "resolve`), so the quote opens wherever the
+    # property itself could have. Only a whole whitespace-delimited token that
+    # begins `&`/`!`, and only with whitespace between it and the quote — an
+    # `a&b'c` is a plain scalar with an apostrophe in it. Still NARROWING
+    # relative to the bare toggle: this can only open where YAML does, and
+    # missing it left the strict readers blind to a scalar the weak one
+    # (`_strip_comment`) saw — the one gap through which the two could
+    # disagree in the fail-open direction (BE-9129).
+    # Walked as a LOOP, not by recursion: a frame per property token is a
+    # frame per two characters of a `- ! ! ! … 'x` line, and a `run:` body
+    # is free to carry a thousand of them (BE-9129).
+    while j < i - 1:
+        k = j
+        while k >= 0 and text[k] not in " \t":
+            k -= 1
+        if text[k + 1] not in "&!":
+            return False
+        i = k + 1
+        j = i - 1
+        while j >= 0 and text[j] in " \t":
+            j -= 1
+        if j < 0 or text[j] in _NODE_OPENERS:
+            return True
+        if (
+            text[j] == "-"
+            and (j == 0 or text[j - 1] in " \t")
+            and j + 1 < len(text)
+            and text[j + 1] in " \t"
+        ):
+            return True
+    return False
 
 
 def _quote_mask(text, node_start_only=True):
     """Per-index `[bool]`: True where that index sits OUTSIDE any quoted scalar.
+
+    `_quote_scan` with the state dropped — see it for a caller that needs the
+    quote a line leaves OPEN, to hand to the next line.
 
     `len(text) + 1` entries, so the position just past the end is answerable
     too. Each entry is the state BEFORE that index is consumed, which puts an
@@ -715,9 +771,25 @@ def _quote_mask(text, node_start_only=True):
     Per LINE, like every reader here: a quote opened on one physical line and
     closed on the next is out of scope, as it is for `_strip_comment`.
     """
+    return _quote_scan(text, node_start_only)[0]
+
+
+def _quote_scan(text, node_start_only=True, quote=None):
+    """`(mask, quote)`: `_quote_mask`'s mask, plus the quote left OPEN at the end.
+
+    `quote` is the quote character the scan STARTS inside (None for none), and
+    the returned one is the state at end of text — the open quote character or
+    None — so a caller walking physical lines can hand what one line leaves
+    open to the next. That is the ONE reader here that is not per-line, and
+    it exists because a flow mapping split across lines (`- {name: "foo` /
+    `bar` / `baz # qux", …}`) keeps its scalar open across every middle line,
+    quotes or no quotes; re-deriving the state from each line alone reads the
+    middle line as closing nothing, the tail's `"` as an opener, and the ` #`
+    before it as a comment — truncating the checkout out of the classification
+    (BE-9129). The state is sticky until a line actually CLOSES the scalar.
+    """
     n = len(text)
     mask = [True] * (n + 1)
-    quote = None
     i = 0
     while i < n:
         mask[i] = quote is None
@@ -740,7 +812,82 @@ def _quote_mask(text, node_start_only=True):
             quote = ch
         i += 1
     mask[n] = quote is None
-    return mask
+    return mask, quote
+
+
+def _plain_ref_value(code):
+    """The PLAIN scalar `code` gives a `ref:` key on its own line, or None.
+
+    None for anything that is not a `ref:` key, for an empty value (that is
+    `_REF_KEY_OPEN_RE`'s window), and for a value opened by a quote, a block
+    indicator or a flow collection — each has its own reader. What is left is
+    a plain scalar, which YAML CONTINUES onto any more-indented line below:
+    `ref: ${{` / `inputs.workflows_ref }}` folds to the one-line checkout at
+    the input, and neither the same-line patterns (no mention on the key
+    line) nor the end-of-line opener (text after the key) saw it (BE-9129).
+    `code` is the comment-stripped line: a `ref: main  # …` is just `main`.
+    """
+    match = _REF_KEY_VALUE_RE.match(code)
+    if match is None:
+        return None
+    value = match.group("value").strip()
+    if not value or value[0] in "'\"|>{[":
+        return None
+    return value
+
+
+def _open_quoted_value(line, key_re):
+    """The text after a quoted value's opening quote, if the line leaves it open.
+
+    `key_re` matches the key and captures `value`. None unless the value
+    opens with a `'`/`"` AND that very quote is still open at end of line —
+    judged at the value's own offset on the scan mask, not from whatever the
+    line as a whole leaves open: `ref: "${{ steps.r.outputs.ref }}"  # see:
+    "docs` closes the ref's scalar and opens another in its comment, and that
+    one is nobody's continuation window (BE-9129). The returned text is the
+    scalar's content so far, to seed the fold the continuations complete.
+    """
+    match = key_re.match(line)
+    if match is None:
+        return None
+    start = match.start("value")
+    value = match.group("value")
+    offset = start + (len(value) - len(value.lstrip()))
+    if line[offset : offset + 1] not in ("'", '"'):
+        return None
+    mask = _quote_mask(line)
+    if any(mask[offset + 1 :]):
+        return None
+    return line[offset + 1 :].strip()
+
+
+def _strip_after_carried_quote(line, quote, keep_quote=True):
+    """`line` with any comment PAST the close of the carried `quote` dropped.
+
+    A line the one above left mid-scalar is string content only UNTIL the
+    scalar closes: past the closing quote YAML opens a real comment again, so
+    `steps.r.outputs.ref }}"  # resolved from inputs.workflows_ref` must not
+    be read as a mention of the input (BE-9129). The text inside the scalar
+    is kept raw; the remainder is handed to `_strip_comment` like any other
+    line. Still open at the end — the whole line is content. `keep_quote=False`
+    drops the closing quote itself, for a caller folding the scalar's VALUE.
+    """
+    mask = _quote_scan(line, quote=quote)[0]
+    close = next((k for k, outside in enumerate(mask) if outside), None)
+    if close is None:
+        return line.strip()
+    head = line[:close] if keep_quote else line[: close - 1]
+    return (head + _strip_comment(line[close:])).strip()
+
+
+def _continues_below(lines, i):
+    """True when the next structural line is indented deeper than `lines[i]`."""
+    indent = _indent(lines[i])
+    for j in range(i + 1, len(lines)):
+        if _is_skippable(lines[j]):
+            continue
+        return _indent(lines[j]) > indent
+    return False
 
 
 def _outside_quotes(line, pos):
@@ -755,13 +902,15 @@ def _outside_quotes(line, pos):
 _INTERPOLATION_RE = re.compile(r"""\$\{\{(.*?)\}\}""", re.S)
 
 
-def _leading_operand_reaches_input(line, mention_re):
+def _leading_operand_reaches_input(line, mention_re, strip=True):
     """True when the ref expression's first `||` operand reaches the input.
 
     Lines with no interpolation at all (a literal `ref: main` never reaches
     here — it is not a ref use) answer True, so this only ever narrows.
+    `strip=False` takes `line` as already comment-handled — the folded value
+    of a multi-line `ref:`, whose ` #` may be content (BE-9129).
     """
-    match = _INTERPOLATION_RE.search(_strip_comment(line))
+    match = _INTERPOLATION_RE.search(_strip_comment(line) if strip else line)
     if not match:
         return True
     return bool(mention_re.search(match.group(1).split("||")[0]))
@@ -959,11 +1108,40 @@ def _env_bindings(lines, res):
                 # `_REF_KEY_OPEN_RE` opens for `ref:`, generalized here to any
                 # key name via `_ALIAS_KEY_OPEN_RE`.
                 open_match = _ALIAS_KEY_OPEN_RE.match(child)
-                if not open_match or idx + 1 >= len(children):
+                if open_match and idx + 1 < len(children):
+                    _, nxt = children[idx + 1]
+                    if _indent(nxt) > _indent(child) and mention_re.search(
+                        _strip_comment(nxt)
+                    ):
+                        names.add(open_match.group(2))
                     continue
-                _, nxt = children[idx + 1]
-                if _indent(nxt) > _indent(child) and mention_re.search(_strip_comment(nxt)):
-                    names.add(open_match.group(2))
+                # …and the two openers `_REF_KEY_OPEN_RE` cannot see either,
+                # which `ref_checkouts` gained in BE-9129: a quote left open
+                # after text, and a plain scalar that folds onto the deeper
+                # lines below. The same split hides the binding the way it
+                # hid the checkout — `WORKFLOWS_REF: ${{` / `inputs.workflows_ref
+                # }}` registered no alias, so a later `ref: ${{
+                # env.WORKFLOWS_REF }}` was no ref use at all. Judged on the
+                # FOLD of the value and every deeper line that follows.
+                key_match = _ALIAS_KEY_VALUE_RE.match(child)
+                if key_match is None:
+                    continue
+                quoted = _open_quoted_value(child, _ALIAS_KEY_VALUE_RE)
+                if quoted is not None:
+                    parts = [quoted]
+                    strip = False
+                else:
+                    value = _strip_comment(key_match.group("value"))
+                    if not value or value[0] in "'\"|>{[":
+                        continue
+                    parts = [value]
+                    strip = True
+                for _, more in children[idx + 1 :]:
+                    if _indent(more) <= _indent(child):
+                        break
+                    parts.append(_strip_comment(more) if strip else more.strip())
+                if len(parts) > 1 and mention_re.search(" ".join(parts)):
+                    names.add(key_match.group(2))
             continue
         code = _strip_comment(line)
         if not _ENV_FLOW_KEY_RE.match(code):
@@ -1186,7 +1364,7 @@ def _strict_steps_output_sites(value, flow):
 UNPARSED = "unparsed"
 
 
-def _steps_output_sites(line, cont=False):
+def _steps_output_sites(line, cont=False, strip=True):
     """Every step output `line`'s `ref:` reads, `UNPARSED`, or None (BE-8253).
 
     None when the value names no step output at all — the common case, and the
@@ -1206,6 +1384,11 @@ def _steps_output_sites(line, cont=False):
     Otherwise the list, one tuple per operand, for `_record_steps_output` to
     judge INDEPENDENTLY. `cont=True` judges a CONTINUATION line instead: the
     value under a `ref: >-` / `ref: |` key, which carries no `ref:` of its own.
+    `strip=False` takes `line` as ALREADY comment-handled: the continuation
+    walk in `ref_checkouts` decides per scalar style whether a ` #` is a
+    comment at all (inside a `|`/`>` body it is content the runtime folds
+    into the ref), and this reader must not second-guess that with a strip of
+    its own.
     """
     # Asked of nearly every line of every job (the `else` arm of the walk), and
     # a `steps.`/`steps[` substring is a precondition of every pattern below —
@@ -1213,7 +1396,7 @@ def _steps_output_sites(line, cont=False):
     # scan.
     if "steps." not in line and "steps[" not in line:
         return None
-    code = _strip_comment(line)
+    code = _strip_comment(line) if strip else line.strip()
     for value, flow in _ref_values(code, cont):
         mentions = len(_LOOSE_STEPS_OUTPUT_RE.findall(value))
         if not mentions:
@@ -1811,6 +1994,24 @@ def _binding_step_id(lines, idx):
     — or to the next step down — is never attributed to this one. A step with no
     id produces no output anything can consume, so None simply means no checkout
     can resolve from here.
+
+    The whole-step FLOW spelling is read too (BE-9099). `_GUARD_BINDING_FLOW_RE`
+    already recognizes `- {id: r, env: {WORKFLOWS_REF: ${{ inputs.workflows_ref
+    }}}, run: …}` as a binding, but the block `id:` pattern cannot match a line
+    opening `{`, so the step registered no id — and an unregistered resolver is
+    not a loud failure, it is a SILENT one: `_record_steps_output` reads a later
+    `ref: ${{ steps.r.outputs.ref }}` as "a real earlier step this lint has no
+    claim on" and drops it with no verdict at all. Spelling the resolver
+    flow-style therefore switched the BE-8130/BE-8221 requirement off for its
+    consumer — the same fail-open this reader's consumer-side twin closes.
+
+    Gated exactly as `_job_step_ids` gates its own flow reading: ONLY where a
+    flow mapping actually OPENS, on a key-column line whose content begins `{`.
+    Applied to a block key line the flow pattern also matches `with: {id: x}`,
+    where `id` is an action INPUT and no step is declared at all — the phantom
+    step that would register a non-resolver and demand an `if:` of a consumer
+    this lint has no claim on. Ids are read through the same `_collect_flow_step_ids`
+    quote-mask scan, so a `,` inside a quoted scalar cannot smuggle one in.
     """
     bounds = _step_bounds(lines, idx)
     if bounds is None:
@@ -1826,9 +2027,28 @@ def _binding_step_id(lines, idx):
             line = _unmarked(line, key_indent)
         if _indent(line) != key_indent:
             continue
+        text = _strip_comment(line)
+        if _after_node_properties(text.lstrip()).startswith("{"):
+            # The step written as one flow mapping — on the marker line
+            # (`- {id: r, …}`) or on the first member line of a bare `-`.
+            flow_ids = {}
+            _collect_flow_step_ids(flow_ids, text, j)
+            for value in flow_ids:
+                return value
+            continue
         match = _STEP_ID_RE.match(line)
         if match:
-            return match.group(2).strip("'\"")
+            # Read through the same narrowing `_job_step_ids` applies, so the
+            # two readers cannot disagree about WHICH id a step declares. They
+            # did: `_STEP_ID_RE`'s `\S+` keeps the `}` a flow CONTINUATION line
+            # leaves on it (`- {env: {…},` / `id: r}` → `r}`), while the
+            # pre-scan reads `r` — and a resolver registered under an id no
+            # consumer can name is not a loud failure but the same SILENT drop
+            # BE-9099 closes one spelling over. `_step_id_value` only ever
+            # narrows, so it cannot manufacture a registration either.
+            value = _step_id_value(match.group(2))
+            if value is not None:
+                return value
     return None
 
 
@@ -2035,12 +2255,12 @@ _WITH_KEY_RE = re.compile(r"""^\s*(['"]?)with\1\s*:""")
 _WITH_FLOW_RE = re.compile(r"""(?:^|[{,\s])(['"]?)with\1\s*:\s*\{""")
 # A key whose value is a BLOCK SCALAR (`run: |`, `script: >-`). Everything
 # indented past it is literal TEXT — a shell script, a heredoc emitting fixture
-# YAML — and must never be read as workflow structure. `\d*` is the explicit
-# indentation indicator, `[+-]?` the chomping indicator; both are optional and
-# may appear in either order, but Actions workflows in the wild write at most
-# one, so accepting `|`/`>` plus an optional suffix is enough.
+# YAML — and must never be read as workflow structure. `_BLOCK_HEADER` is the
+# `|`/`>` indicator plus its optional chomping / explicit-indentation
+# indicators, in either order — the one grammar every block-header reader
+# here shares, so none of them can accept a spelling another rejects.
 _BLOCK_SCALAR_OPEN_RE = re.compile(
-    r"""^\s*(['"]?)[A-Za-z0-9_.-]+\1\s*:[^\S\n]*[|>][+-]?\d*[^\S\n]*(?:#.*)?$"""
+    r"""^\s*(['"]?)[A-Za-z0-9_.-]+\1\s*:[^\S\n]*%s[^\S\n]*(?:#.*)?$""" % _BLOCK_HEADER
 )
 
 
@@ -2515,10 +2735,41 @@ def ref_checkouts(lines, dropped=None):
         # The BE-9045 collector, bound to THIS job's coordinates once so the
         # list can never travel without them (`_record_steps_output`'s `drop`).
         drop = None if dropped is None else (start, job_indent, dropped)
-        # An open `ref:` whose value continues below, as (line index, indent).
-        # Continuation lines are the more-indented ones that follow; the first
-        # line back at or above the key's indent closes the scalar.
+        # An open `ref:` whose value continues below, as (line index, indent,
+        # plain). Continuation lines are the more-indented ones that follow;
+        # the first line back at or above the key's indent closes the scalar.
+        # `plain` is True only for the bare `ref:` spelling — the one YAML ends
+        # at a ` #`. A `|`/`>` body and a multi-line quoted scalar both carry
+        # their `#` as CONTENT, so their continuations are never stripped.
         pending = None
+        # The quote character the PREVIOUS physical line left open, or None. A
+        # flow mapping split across lines does that, and `_strip_comment`
+        # restarts its scan per line — so the closing `"` of `- {name: "foo` /
+        # `bar # baz", …, with: {ref: …}}` reads as an opener-less ` #` and
+        # truncates a real checkout out of the classification (BE-9129). Cross-
+        # line quotes are out of scope for the stripper by its own docstring,
+        # so this loop keeps the RAW line whenever the previous one left a
+        # scalar open — the pre-strip reading, which is the fail-closed one.
+        # CARRIED, not re-derived: `_quote_scan` starts each line inside the
+        # quote the one above left open, so a quote-free middle line keeps the
+        # scalar open rather than resetting it, and only a line that actually
+        # closes the scalar ends the fallback. Strict (`node_start_only`)
+        # reading, deliberately — the weak one the stripper takes would open
+        # on the apostrophe of a `name: don't fail` and, carried forward,
+        # suspend the strip for the rest of the job.
+        #
+        # BOUNDED by indentation, too. YAML continues a flow node or quoted
+        # scalar only onto lines indented DEEPER than the line that opened
+        # it, so a carried quote can never legitimately reach a line at or
+        # above its opener's column. Without that bound the state was scanned
+        # over every line `_block_body` yields — `run:` bodies included — and
+        # never resynchronized: one unbalanced `'` in a script (`echo "note:
+        # 'x"`) held the state open for the rest of the job, and every gate
+        # keyed on it (the quoted and plain `ref:` windows, the strip itself)
+        # switched off for every later step. The opener's indent is the
+        # structural boundary a stray quote cannot cross (BE-9129).
+        open_quote = None
+        open_quote_indent = 0
         # Those continuation lines, stripped, in order. A block scalar may
         # split the ref's `${{ … }}` across PHYSICAL lines and still fold to
         # one expression at runtime, so matching each line on its own left a
@@ -2527,20 +2778,62 @@ def ref_checkouts(lines, dropped=None):
         # neither continuation arm and recorded no site.
         pending_parts = []
         for i, line in _block_body(lines, start, job_indent):
+            if open_quote is not None and _indent(line) <= open_quote_indent:
+                open_quote = None
+            carried_quote = open_quote
+            after_open_quote = carried_quote is not None
+            open_quote = _quote_scan(line, quote=open_quote)[1]
+            if open_quote is not None and not after_open_quote:
+                open_quote_indent = _indent(line)
             if pending is not None:
                 if _indent(line) > pending[1]:
-                    if mention_re.search(line):
+                    # Stripped for the same reason the arm selection below
+                    # is — a trailing `# … inputs.workflows_ref` on the
+                    # continuation is prose, not the value the runtime folds.
+                    # Only where the `#` really opens a comment, though: not in
+                    # a `|`/`>` or quoted body (`pending[2]`), and not on a
+                    # line the one above left mid-scalar — until the scalar
+                    # CLOSES on this line, past which a ` #` is a comment
+                    # again (`steps.r.outputs.ref }}"  # resolved from
+                    # inputs.workflows_ref` names no input).
+                    if after_open_quote:
+                        cont = _strip_after_carried_quote(
+                            line, carried_quote, keep_quote=False
+                        )
+                    elif pending[2]:
+                        cont = _strip_comment(line)
+                    else:
+                        cont = line.strip()
+                    pending_parts.append(cont)
+                    # Judge the FOLD — what the runtime sees — not the physical
+                    # line alone: `${{ inputs[` / `'workflows_ref'] }}` names
+                    # the input on neither line and on both together.
+                    joined = " ".join(pending_parts)
+                    if mention_re.search(joined):
                         # Report the `ref:` KEY line (that is the checkout the
-                        # reader must find), but judge the CONTINUATION line —
-                        # the key never holds the expression, so asking it
-                        # whether this is a fallback always answered no.
+                        # reader must find), but judge the CONTINUATION — the
+                        # key never holds the expression, so asking it whether
+                        # this is a fallback always answered no.
                         fallback = _pins_to_job_workflow_sha(line)
                         guarded = guarded_input or (fallback and guarded_fallback)
+                        # The same leading-operand rule the one-line arm below
+                        # applies: `ref: ${{ 'main' ||` / `inputs.workflows_ref
+                        # }}` folds to the byte-identical expression, and the
+                        # split must not turn its finding into a pass.
+                        if not _leading_operand_reaches_input(
+                            joined, mention_re, strip=False
+                        ):
+                            guarded = False
                         found.append((pending[0] + 1, fallback, guarded, False))
                         pending = None
                         continue
-                    pending_parts.append(_strip_comment(line))
-                    resolved = _steps_output_sites(line, cont=True)
+                    # The SAME gated text as the mention test above, with the
+                    # callee's own strip switched off: handed the raw line it
+                    # would re-strip a `|`/`>` body at a ` #` that is content
+                    # there, and `ref: >-` / `x # ${{ steps.r.outputs.ref }}`
+                    # — a value the runtime folds whole — would count zero
+                    # mentions and close the scalar with nothing recorded.
+                    resolved = _steps_output_sites(cont, cont=True, strip=False)
                     if not isinstance(resolved, list) and len(pending_parts) > 1:
                         # Ask the FOLDED value — what the runtime actually
                         # sees — only once more than one physical line has
@@ -2548,7 +2841,7 @@ def ref_checkouts(lines, dropped=None):
                         # exact behavior and the join can only ever ADD a
                         # site or complete a parse the lone line could not.
                         joined_resolved = _steps_output_sites(
-                            " ".join(pending_parts), cont=True
+                            " ".join(pending_parts), cont=True, strip=False
                         )
                         if joined_resolved is not None:
                             resolved = joined_resolved
@@ -2581,15 +2874,57 @@ def ref_checkouts(lines, dropped=None):
                     continue
                 # Scalar closed — fall through and judge this line normally.
                 pending = None
-            binding = _GUARD_BINDING_RE.match(line)
+            # Arm selection reads the COMMENT-STRIPPED text, not the raw
+            # line: `_REF_USE_BLOCK_RE`'s `.*` otherwise spans a trailing
+            # comment, so `ref: ${{ steps.r.outputs.ref }}  # from
+            # inputs.workflows_ref` takes the input-use arm and a correctly
+            # `if:`-guarded checkout is reported unguarded — and the same `.*`
+            # the other way lets a comment carrying `{WORKFLOWS_REF: "${{
+            # inputs.workflows_ref }}"}` register a phantom resolver. Same
+            # precedent as `_steps_output_sites`, which strips before either
+            # tier, and the `_STEP_IF_RE` consumers that read `_unmarked`.
+            # ONLY these three classifiers see `code`; every other reader in
+            # this loop keeps the RAW line, because `_strip_comment` also drops
+            # the leading indentation they judge by column.
+            #
+            # …and only where a ` #` opens a comment at all. A line the one
+            # above left inside a quoted scalar is still string CONTENT, and
+            # the stripper scans each line from scratch, so it would truncate
+            # the tail of a multi-line flow mapping — checkout and all. There
+            # the raw line stands, which is what this arm read before BE-9129.
+            code = (
+                _strip_after_carried_quote(line, carried_quote)
+                if after_open_quote
+                else _strip_comment(line)
+            )
+            # Matched here rather than in its own `elif` only so the arm can
+            # read WHICH spelling opened the scalar; the arms are still tried
+            # in order, so this decides nothing on its own. RAW line, like the
+            # other structural readers — this pattern handles a trailing `#`
+            # itself (see its definition) and needs the key at its column.
+            key_open = _REF_KEY_OPEN_RE.match(line)
+            # …and the quoted scalar that carries text on its opening line and
+            # closes on a LATER one — `ref: "${{` / `inputs.workflows_ref }}"`
+            # — which the pattern's end-of-line anchor cannot see. The runtime
+            # folds that to the same `${{ inputs.workflows_ref }}`, so it must
+            # open the same window — seeded with the text after the quote, so
+            # the fold the continuations complete is the whole value. Judged
+            # at the ref value's OWN quote: a quote some trailing comment
+            # leaves open is not the ref's.
+            quoted_open = (
+                None
+                if key_open is not None or after_open_quote
+                else _open_quoted_value(line, _REF_KEY_VALUE_RE)
+            )
+            binding = _GUARD_BINDING_RE.match(code)
             flow_binding = False
-            ref_use = binding is None and is_ref_use(line, ref_res)
+            ref_use = binding is None and is_ref_use(code, ref_res)
             if binding is None and not ref_use:
                 # The flow binding is only taken for a line that is not ALSO a
                 # ref use — a whole step written as one flow mapping can carry
                 # both, and the binding branch would swallow the checkout
                 # unreported. Reporting wins: fail-closed, as everywhere else.
-                binding = _GUARD_BINDING_FLOW_RE.search(line)
+                binding = _GUARD_BINDING_FLOW_RE.search(code)
                 flow_binding = binding is not None
             if binding:
                 # NO fallback exception on the guard requirement (BE-8077). The
@@ -2604,6 +2939,32 @@ def ref_checkouts(lines, dropped=None):
                 # guard check meant deleting every one of groom.yml's seven
                 # guard steps kept this lint green.
                 guard = is_guard_step(lines, i)
+                # Site-recording runs BEFORE registration, because the two
+                # answer different questions about this ONE physical line: a
+                # step written as a single flow mapping can bind
+                # `WORKFLOWS_REF` in its `env:` AND read a step output in its
+                # `with: {ref: …}`, and the binding arm is not terminal for
+                # the second question, or the checkout is never judged at all
+                # — no verdict, no drop, no notice (BE-9098). The block `env:`
+                # binding can never share a line with `ref:`
+                # (`_GUARD_BINDING_RE` is line-anchored), so only the flow
+                # spelling reaches here with a site.
+                #
+                # Recording FIRST is what keeps a SELF-referencing flow step
+                # dangling. `_record_steps_output`'s `resolvers` arm carries
+                # no `declared < consumer_start` ordering check of its own —
+                # only the `step_ids` arm does — so registering this step
+                # first would route its own `ref: ${{ steps.<self>.outputs.…
+                # }}` down the resolver arm and judge it on an `if:`, when
+                # during its OWN `with:` evaluation that output does not exist
+                # yet and the expression is '' at runtime. Order, not the
+                # narrowness of `_binding_step_id`, is what makes that verdict
+                # right — so it survives the reader widening below.
+                resolved = _steps_output_sites(line)
+                if resolved is not None:
+                    _record_steps_output(
+                        found, lines, i, resolved, resolvers, step_ids, drop
+                    )
                 # A step that RESOLVES the ref for a later checkout to consume
                 # is registered here, whether or not it guards. Registration
                 # only marks the step as a resolver of the input — coverage
@@ -2644,17 +3005,51 @@ def ref_checkouts(lines, dropped=None):
                 if not _leading_operand_reaches_input(line, mention_re):
                     guarded = False
                 found.append((i + 1, fallback, guarded, False))
-            elif _REF_KEY_OPEN_RE.match(line):
+            elif key_open or quoted_open is not None:
                 # (`_REF_KEY_OPEN_RE` needs end-of-line right after the key, so
                 # it can never take a `ref: ${{ … }}` off the branch below.)
-                pending = (i, _indent(line))
-                pending_parts = []
+                # Neither capture set means the bare `ref:` spelling — a PLAIN
+                # multi-line scalar, the only one whose continuations a ` #`
+                # can comment out. `quoted_open` is by construction a quoted
+                # one, so it is never plain.
+                plain = bool(key_open) and not (
+                    key_open.group("quoted") or key_open.group("block")
+                )
+                pending = (i, _indent(line), plain)
+                pending_parts = [] if quoted_open is None else [quoted_open]
             else:
-                resolved = _steps_output_sites(line)
+                # A plain value that names neither the input nor a step output
+                # on its own line may still CONTINUE below (`ref: ${{` /
+                # `inputs.workflows_ref }}`, `ref: ${{ 'main' ||` /
+                # `steps.r.outputs.ref }}`): YAML folds every more-indented
+                # line into the same scalar, so open the plain window and seed
+                # the fold with this line's value. Nothing changes for a `ref:
+                # main` that stands alone — the next line at or above the key's
+                # indent closes the window with nothing recorded, exactly as
+                # `ref:` alone does. Not while a scalar from the line above
+                # is still open: the `ref:` is then string content.
+                value = None if after_open_quote else _plain_ref_value(code)
+                # A step output on the key line is judged HERE only when the
+                # value is complete there. With its `${{` still open and a
+                # deeper line below (`ref: ${{ steps.prefix.outputs.p }}${{` /
+                # `inputs.workflows_ref }}`), the fold is the value, and the
+                # window judges it whole — recording the key line's half now
+                # would drop the prefix as out of scope and never look at the
+                # input the continuation carries (BE-9129).
+                unclosed = (
+                    value is not None
+                    and value.count("${{") > value.count("}}")
+                    and _continues_below(lines, i)
+                )
+                resolved = None if unclosed else _steps_output_sites(line)
                 if resolved is not None:
                     _record_steps_output(
                         found, lines, i, resolved, resolvers, step_ids, drop
                     )
+                    continue
+                if value is not None:
+                    pending = (i, _indent(line), True)
+                    pending_parts = [value]
     return found
 
 
@@ -2995,7 +3390,11 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
                     "`actions/checkout` as '', which it reads as the default "
                     "branch. Add the exact non-empty `if:` to this step (the "
                     "never-fail idiom, see .github/workflow-pins/README.md). "
-                    "See BE-8130." % (ann_path, lineno, ann_name, INPUT_NAME)
+                    "An `if:` riding INSIDE a flow mapping "
+                    "(`- {if: …, with: {ref: …}}`) is not read as coverage — "
+                    "promote it to the step's own `if:` key, leaving `env:` "
+                    "and `with:` as flow maps. See BE-8130."
+                    % (ann_path, lineno, ann_name, INPUT_NAME)
                 )
                 continue
             # `uses_fallback` comes from the line the parser MATCHED, which for a
