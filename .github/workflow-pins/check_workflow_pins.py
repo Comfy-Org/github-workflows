@@ -549,6 +549,11 @@ _ALIAS_KEY_OPEN_RE = re.compile(
 # validate a flow entry's key, which `_flow_entries` reads structurally rather
 # than through a keyed regex.
 _ALIAS_NAME_RE = re.compile(r"""^[A-Za-z_][\w-]*$""")
+# Any env key with the rest of its line as `value` — the `_REF_KEY_VALUE_RE`
+# of the alias scan, for the two openers `_ALIAS_KEY_OPEN_RE` cannot see: a
+# quote left open AFTER text (`WORKFLOWS_REF: "${{` / `inputs.workflows_ref
+# }}"`) and a plain scalar folding onto the lines below (BE-9129).
+_ALIAS_KEY_VALUE_RE = re.compile(r"""^\s*(['"]?)([A-Za-z_][\w-]*)\1\s*:(?P<value>.*)$""")
 
 _ENV_ALIAS_RES = _env_alias_res(_INPUT_MENTION_BODY)
 # Every `env:` entry, whatever its value — the alias fixpoint's hard bound: no
@@ -708,12 +713,28 @@ def _opens_quoted_scalar(text, i):
     # missing it left the strict readers blind to a scalar the weak one
     # (`_strip_comment`) saw — the one gap through which the two could
     # disagree in the fail-open direction (BE-9129).
-    if j < i - 1:
+    # Walked as a LOOP, not by recursion: a frame per property token is a
+    # frame per two characters of a `- ! ! ! … 'x` line, and a `run:` body
+    # is free to carry a thousand of them (BE-9129).
+    while j < i - 1:
         k = j
         while k >= 0 and text[k] not in " \t":
             k -= 1
-        if text[k + 1] in "&!":
-            return _opens_quoted_scalar(text, k + 1)
+        if text[k + 1] not in "&!":
+            return False
+        i = k + 1
+        j = i - 1
+        while j >= 0 and text[j] in " \t":
+            j -= 1
+        if j < 0 or text[j] in _NODE_OPENERS:
+            return True
+        if (
+            text[j] == "-"
+            and (j == 0 or text[j - 1] in " \t")
+            and j + 1 < len(text)
+            and text[j + 1] in " \t"
+        ):
+            return True
     return False
 
 
@@ -815,14 +836,58 @@ def _plain_ref_value(code):
     return value
 
 
-def _ref_value_starts_quoted(line):
-    """True when `line` is a `ref:` key whose value opens with a `'` or `"`.
+def _open_quoted_value(line, key_re):
+    """The text after a quoted value's opening quote, if the line leaves it open.
 
-    Says nothing about whether that quote CLOSES on the line — `_quote_mask`
-    answers that; this only confirms the scalar it left open is the ref's.
+    `key_re` matches the key and captures `value`. None unless the value
+    opens with a `'`/`"` AND that very quote is still open at end of line —
+    judged at the value's own offset on the scan mask, not from whatever the
+    line as a whole leaves open: `ref: "${{ steps.r.outputs.ref }}"  # see:
+    "docs` closes the ref's scalar and opens another in its comment, and that
+    one is nobody's continuation window (BE-9129). The returned text is the
+    scalar's content so far, to seed the fold the continuations complete.
     """
-    match = _REF_KEY_VALUE_RE.match(line)
-    return match is not None and match.group("value").lstrip()[:1] in ("'", '"')
+    match = key_re.match(line)
+    if match is None:
+        return None
+    start = match.start("value")
+    value = match.group("value")
+    offset = start + (len(value) - len(value.lstrip()))
+    if line[offset : offset + 1] not in ("'", '"'):
+        return None
+    mask = _quote_mask(line)
+    if any(mask[offset + 1 :]):
+        return None
+    return line[offset + 1 :].strip()
+
+
+def _strip_after_carried_quote(line, quote, keep_quote=True):
+    """`line` with any comment PAST the close of the carried `quote` dropped.
+
+    A line the one above left mid-scalar is string content only UNTIL the
+    scalar closes: past the closing quote YAML opens a real comment again, so
+    `steps.r.outputs.ref }}"  # resolved from inputs.workflows_ref` must not
+    be read as a mention of the input (BE-9129). The text inside the scalar
+    is kept raw; the remainder is handed to `_strip_comment` like any other
+    line. Still open at the end — the whole line is content. `keep_quote=False`
+    drops the closing quote itself, for a caller folding the scalar's VALUE.
+    """
+    mask = _quote_scan(line, quote=quote)[0]
+    close = next((k for k, outside in enumerate(mask) if outside), None)
+    if close is None:
+        return line.strip()
+    head = line[:close] if keep_quote else line[: close - 1]
+    return (head + _strip_comment(line[close:])).strip()
+
+
+def _continues_below(lines, i):
+    """True when the next structural line is indented deeper than `lines[i]`."""
+    indent = _indent(lines[i])
+    for j in range(i + 1, len(lines)):
+        if _is_skippable(lines[j]):
+            continue
+        return _indent(lines[j]) > indent
+    return False
 
 
 def _outside_quotes(line, pos):
@@ -837,13 +902,15 @@ def _outside_quotes(line, pos):
 _INTERPOLATION_RE = re.compile(r"""\$\{\{(.*?)\}\}""", re.S)
 
 
-def _leading_operand_reaches_input(line, mention_re):
+def _leading_operand_reaches_input(line, mention_re, strip=True):
     """True when the ref expression's first `||` operand reaches the input.
 
     Lines with no interpolation at all (a literal `ref: main` never reaches
     here — it is not a ref use) answer True, so this only ever narrows.
+    `strip=False` takes `line` as already comment-handled — the folded value
+    of a multi-line `ref:`, whose ` #` may be content (BE-9129).
     """
-    match = _INTERPOLATION_RE.search(_strip_comment(line))
+    match = _INTERPOLATION_RE.search(_strip_comment(line) if strip else line)
     if not match:
         return True
     return bool(mention_re.search(match.group(1).split("||")[0]))
@@ -1041,11 +1108,40 @@ def _env_bindings(lines, res):
                 # `_REF_KEY_OPEN_RE` opens for `ref:`, generalized here to any
                 # key name via `_ALIAS_KEY_OPEN_RE`.
                 open_match = _ALIAS_KEY_OPEN_RE.match(child)
-                if not open_match or idx + 1 >= len(children):
+                if open_match and idx + 1 < len(children):
+                    _, nxt = children[idx + 1]
+                    if _indent(nxt) > _indent(child) and mention_re.search(
+                        _strip_comment(nxt)
+                    ):
+                        names.add(open_match.group(2))
                     continue
-                _, nxt = children[idx + 1]
-                if _indent(nxt) > _indent(child) and mention_re.search(_strip_comment(nxt)):
-                    names.add(open_match.group(2))
+                # …and the two openers `_REF_KEY_OPEN_RE` cannot see either,
+                # which `ref_checkouts` gained in BE-9129: a quote left open
+                # after text, and a plain scalar that folds onto the deeper
+                # lines below. The same split hides the binding the way it
+                # hid the checkout — `WORKFLOWS_REF: ${{` / `inputs.workflows_ref
+                # }}` registered no alias, so a later `ref: ${{
+                # env.WORKFLOWS_REF }}` was no ref use at all. Judged on the
+                # FOLD of the value and every deeper line that follows.
+                key_match = _ALIAS_KEY_VALUE_RE.match(child)
+                if key_match is None:
+                    continue
+                quoted = _open_quoted_value(child, _ALIAS_KEY_VALUE_RE)
+                if quoted is not None:
+                    parts = [quoted]
+                    strip = False
+                else:
+                    value = _strip_comment(key_match.group("value"))
+                    if not value or value[0] in "'\"|>{[":
+                        continue
+                    parts = [value]
+                    strip = True
+                for _, more in children[idx + 1 :]:
+                    if _indent(more) <= _indent(child):
+                        break
+                    parts.append(_strip_comment(more) if strip else more.strip())
+                if len(parts) > 1 and mention_re.search(" ".join(parts)):
+                    names.add(key_match.group(2))
             continue
         code = _strip_comment(line)
         if not _ENV_FLOW_KEY_RE.match(code):
@@ -2661,7 +2757,19 @@ def ref_checkouts(lines, dropped=None):
         # reading, deliberately — the weak one the stripper takes would open
         # on the apostrophe of a `name: don't fail` and, carried forward,
         # suspend the strip for the rest of the job.
+        #
+        # BOUNDED by indentation, too. YAML continues a flow node or quoted
+        # scalar only onto lines indented DEEPER than the line that opened
+        # it, so a carried quote can never legitimately reach a line at or
+        # above its opener's column. Without that bound the state was scanned
+        # over every line `_block_body` yields — `run:` bodies included — and
+        # never resynchronized: one unbalanced `'` in a script (`echo "note:
+        # 'x"`) held the state open for the rest of the job, and every gate
+        # keyed on it (the quoted and plain `ref:` windows, the strip itself)
+        # switched off for every later step. The opener's indent is the
+        # structural boundary a stray quote cannot cross (BE-9129).
         open_quote = None
+        open_quote_indent = 0
         # Those continuation lines, stripped, in order. A block scalar may
         # split the ref's `${{ … }}` across PHYSICAL lines and still fold to
         # one expression at runtime, so matching each line on its own left a
@@ -2670,9 +2778,13 @@ def ref_checkouts(lines, dropped=None):
         # neither continuation arm and recorded no site.
         pending_parts = []
         for i, line in _block_body(lines, start, job_indent):
-            after_open_quote = open_quote is not None
+            if open_quote is not None and _indent(line) <= open_quote_indent:
+                open_quote = None
+            carried_quote = open_quote
+            after_open_quote = carried_quote is not None
             open_quote = _quote_scan(line, quote=open_quote)[1]
-            quote_open = open_quote is not None
+            if open_quote is not None and not after_open_quote:
+                open_quote_indent = _indent(line)
             if pending is not None:
                 if _indent(line) > pending[1]:
                     # Stripped for the same reason the arm selection below
@@ -2680,23 +2792,41 @@ def ref_checkouts(lines, dropped=None):
                     # continuation is prose, not the value the runtime folds.
                     # Only where the `#` really opens a comment, though: not in
                     # a `|`/`>` or quoted body (`pending[2]`), and not on a
-                    # line the one above left mid-scalar.
-                    cont = (
-                        _strip_comment(line)
-                        if pending[2] and not after_open_quote
-                        else line.strip()
-                    )
-                    if mention_re.search(cont):
+                    # line the one above left mid-scalar — until the scalar
+                    # CLOSES on this line, past which a ` #` is a comment
+                    # again (`steps.r.outputs.ref }}"  # resolved from
+                    # inputs.workflows_ref` names no input).
+                    if after_open_quote:
+                        cont = _strip_after_carried_quote(
+                            line, carried_quote, keep_quote=False
+                        )
+                    elif pending[2]:
+                        cont = _strip_comment(line)
+                    else:
+                        cont = line.strip()
+                    pending_parts.append(cont)
+                    # Judge the FOLD — what the runtime sees — not the physical
+                    # line alone: `${{ inputs[` / `'workflows_ref'] }}` names
+                    # the input on neither line and on both together.
+                    joined = " ".join(pending_parts)
+                    if mention_re.search(joined):
                         # Report the `ref:` KEY line (that is the checkout the
-                        # reader must find), but judge the CONTINUATION line —
-                        # the key never holds the expression, so asking it
-                        # whether this is a fallback always answered no.
+                        # reader must find), but judge the CONTINUATION — the
+                        # key never holds the expression, so asking it whether
+                        # this is a fallback always answered no.
                         fallback = _pins_to_job_workflow_sha(line)
                         guarded = guarded_input or (fallback and guarded_fallback)
+                        # The same leading-operand rule the one-line arm below
+                        # applies: `ref: ${{ 'main' ||` / `inputs.workflows_ref
+                        # }}` folds to the byte-identical expression, and the
+                        # split must not turn its finding into a pass.
+                        if not _leading_operand_reaches_input(
+                            joined, mention_re, strip=False
+                        ):
+                            guarded = False
                         found.append((pending[0] + 1, fallback, guarded, False))
                         pending = None
                         continue
-                    pending_parts.append(cont)
                     # The SAME gated text as the mention test above, with the
                     # callee's own strip switched off: handed the raw line it
                     # would re-strip a `|`/`>` body at a ` #` that is content
@@ -2762,7 +2892,11 @@ def ref_checkouts(lines, dropped=None):
             # the stripper scans each line from scratch, so it would truncate
             # the tail of a multi-line flow mapping — checkout and all. There
             # the raw line stands, which is what this arm read before BE-9129.
-            code = line if after_open_quote else _strip_comment(line)
+            code = (
+                _strip_after_carried_quote(line, carried_quote)
+                if after_open_quote
+                else _strip_comment(line)
+            )
             # Matched here rather than in its own `elif` only so the arm can
             # read WHICH spelling opened the scalar; the arms are still tried
             # in order, so this decides nothing on its own. RAW line, like the
@@ -2773,14 +2907,14 @@ def ref_checkouts(lines, dropped=None):
             # closes on a LATER one — `ref: "${{` / `inputs.workflows_ref }}"`
             # — which the pattern's end-of-line anchor cannot see. The runtime
             # folds that to the same `${{ inputs.workflows_ref }}`, so it must
-            # open the same window. `quote_open` already answers whether THIS
-            # line left a scalar unclosed; all that is left is confirming the
-            # unclosed scalar is the `ref:` value, not some sibling's.
+            # open the same window — seeded with the text after the quote, so
+            # the fold the continuations complete is the whole value. Judged
+            # at the ref value's OWN quote: a quote some trailing comment
+            # leaves open is not the ref's.
             quoted_open = (
-                key_open is None
-                and quote_open
-                and not after_open_quote
-                and _ref_value_starts_quoted(line)
+                None
+                if key_open is not None or after_open_quote
+                else _open_quoted_value(line, _REF_KEY_VALUE_RE)
             )
             binding = _GUARD_BINDING_RE.match(code)
             flow_binding = False
@@ -2871,7 +3005,7 @@ def ref_checkouts(lines, dropped=None):
                 if not _leading_operand_reaches_input(line, mention_re):
                     guarded = False
                 found.append((i + 1, fallback, guarded, False))
-            elif key_open or quoted_open:
+            elif key_open or quoted_open is not None:
                 # (`_REF_KEY_OPEN_RE` needs end-of-line right after the key, so
                 # it can never take a `ref: ${{ … }}` off the branch below.)
                 # Neither capture set means the bare `ref:` spelling — a PLAIN
@@ -2882,14 +3016,8 @@ def ref_checkouts(lines, dropped=None):
                     key_open.group("quoted") or key_open.group("block")
                 )
                 pending = (i, _indent(line), plain)
-                pending_parts = []
+                pending_parts = [] if quoted_open is None else [quoted_open]
             else:
-                resolved = _steps_output_sites(line)
-                if resolved is not None:
-                    _record_steps_output(
-                        found, lines, i, resolved, resolvers, step_ids, drop
-                    )
-                    continue
                 # A plain value that names neither the input nor a step output
                 # on its own line may still CONTINUE below (`ref: ${{` /
                 # `inputs.workflows_ref }}`, `ref: ${{ 'main' ||` /
@@ -2901,6 +3029,24 @@ def ref_checkouts(lines, dropped=None):
                 # `ref:` alone does. Not while a scalar from the line above
                 # is still open: the `ref:` is then string content.
                 value = None if after_open_quote else _plain_ref_value(code)
+                # A step output on the key line is judged HERE only when the
+                # value is complete there. With its `${{` still open and a
+                # deeper line below (`ref: ${{ steps.prefix.outputs.p }}${{` /
+                # `inputs.workflows_ref }}`), the fold is the value, and the
+                # window judges it whole — recording the key line's half now
+                # would drop the prefix as out of scope and never look at the
+                # input the continuation carries (BE-9129).
+                unclosed = (
+                    value is not None
+                    and value.count("${{") > value.count("}}")
+                    and _continues_below(lines, i)
+                )
+                resolved = None if unclosed else _steps_output_sites(line)
+                if resolved is not None:
+                    _record_steps_output(
+                        found, lines, i, resolved, resolvers, step_ids, drop
+                    )
+                    continue
                 if value is not None:
                     pending = (i, _indent(line), True)
                     pending_parts = [value]

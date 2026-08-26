@@ -126,11 +126,18 @@ checkout out of the lint:
   tail of a flow mapping split across lines (`- {name: "foo` / `bar` /
   `baz # qux", …}`) — the stripper rescans each physical line from scratch and
   would read that closing quote's `#` as an opener. The walk carries the
-  quote state forward, line to line, until a line actually closes the scalar;
-  it reads quotes the strict way (a quote opens a scalar only where a YAML
-  node can start — after `:`, `,`, `{`, `[`, a `- ` marker, or a `&anchor` /
-  `!tag` in that position), so the apostrophe of a `name: don't fail` does
-  not suspend the strip for the rest of the job.
+  quote state forward, line to line, until a line actually closes the scalar
+  — and past that closing quote the rest of the line is ordinary YAML again,
+  so a `}}"  # resolved from inputs.workflows_ref` is stripped like any other
+  trailing comment. It reads quotes the strict way (a quote opens a scalar
+  only where a YAML node can start — after `:`, `,`, `{`, `[`, a `- ` marker,
+  or a `&anchor` / `!tag` in that position), so the apostrophe of a `name:
+  don't fail` does not suspend the strip for the rest of the job; and the
+  carried state is **bounded by indentation**: YAML continues a scalar only
+  onto lines indented deeper than the one that opened it, so the state resets
+  at the opener's own column. An unbalanced quote in a `run:` line or script
+  body (`echo "note: 'x"`) therefore affects nothing past its own block —
+  it cannot switch the windows or the strip off for the steps that follow.
 
 Both fall back to the raw line — the pre-BE-9129 reading, and the value the
 runtime folds into the ref — so the site is never dropped: worst case the text
@@ -153,7 +160,18 @@ of line or after text (`ref: "${{`), and a plain scalar that carries text on
 the key line and folds onto the more-indented lines below (`ref: ${{` /
 `inputs.workflows_ref }}`, `ref: ${{ 'main' ||` / `steps.r.outputs.ref }}`).
 A `ref: main` that stands alone opens nothing — the next line at or above its
-indent closes the window with nothing recorded.
+indent closes the window with nothing recorded. The window is judged on the
+**fold** — the key line's own text plus every continuation, joined — which is
+the value the runtime sees: `${{ inputs[` / `'workflows_ref'] }}` names the
+input on neither physical line and on both together; `ref: "${{
+steps.r.outputs.ref` / `}}"` is the step-output checkout its one-line
+spelling is; and a leading operand that never reaches the input (`ref: ${{
+'main' ||` / `inputs.workflows_ref }}`) gets the same verdict split as it does
+on one line. Only the ref value's *own* quote opens a quoted window — one a
+trailing comment leaves open (`ref: "main"  # see: "x`) is nobody's
+continuation. The `env:` alias scan follows the same split spellings, so a
+`WORKFLOWS_REF: "${{` / `inputs.workflows_ref }}"` binds the alias exactly as
+the one-line binding does.
 
 A step written as ONE flow mapping that both binds `WORKFLOWS_REF` in its `env:`
 and reads a step output in its `with: {ref: … }` is judged like any other
