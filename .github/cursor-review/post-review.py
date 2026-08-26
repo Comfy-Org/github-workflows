@@ -164,9 +164,13 @@ POST_FAILED_SUMMARY_NOTE = (
     "request). Posting it here instead — see the run log for the error.\n\n"
 )
 
+# "as much as fits", not "the full text": write_step_summary budgets against
+# MAX_STEP_SUMMARY_BYTES, so an oversize body is cut HERE too and the remainder then
+# exists in no channel at all. STEP_SUMMARY_TRUNCATED_NOTE marks where that cut landed;
+# this note must not promise more than that one can deliver.
 TRUNCATED_SUMMARY_NOTE = (
     "> ℹ️ The review posted on the PR was truncated at GitHub's body-size "
-    "limit. The full text is below.\n\n"
+    "limit. As much of it as fits is below.\n\n"
 )
 
 # Actions caps $GITHUB_STEP_SUMMARY at 1 MiB per step and discards an overflowing
@@ -233,8 +237,8 @@ def write_step_summary(markdown: str, note: str = READ_ONLY_SUMMARY_NOTE) -> Non
     if len(payload.encode("utf-8")) > MAX_STEP_SUMMARY_BYTES - 1:
         print(
             "Step summary: content exceeds the Actions per-step size limit — cutting "
-            "it rather than letting the whole upload be discarded. The whole payload "
-            "follows.",
+            "it rather than letting the whole upload be discarded. The remainder past "
+            "the cut is not delivered anywhere.",
             file=sys.stderr,
         )
         payload = clamp_to_bytes(payload, budget).rstrip() + STEP_SUMMARY_TRUNCATED_NOTE
@@ -341,6 +345,16 @@ def header_new_path(raw: str):
     # rstrip("\r") for a CRLF-terminated diff, but no .strip(): a trailing space is a
     # legal (if unusual) part of a filename, and eating it breaks the key.
     target = raw[4:].rstrip("\r")
+    # git terminates the header path with a TAB whenever the name contains a space
+    # (verified against git itself: `--- a/my dir/app.py\t`, and `--- "a/caf\\303\\251 x.py"\t`
+    # when quoted — the tab lands AFTER the closing quote, so this has to run BEFORE the
+    # quoted-path test). Keeping it would key the file as `my dir/app.py\t`, which no
+    # finding's `file` can ever match, so every finding in a spacey-path file would lose
+    # its anchor. Splitting on the FIRST tab is safe in both quoting modes: a name that
+    # really contains a tab is a control character, which git quotes as `\\t` even with
+    # `core.quotePath=false`, so an UNQUOTED target never carries a literal one. A legal
+    # trailing SPACE still survives (`--- a/sp.py \t` -> `sp.py `).
+    target = target.split("\t", 1)[0]
     if len(target) >= 2 and target.startswith('"') and target.endswith('"'):
         target = unquote_header_path(target)
         if target is None:
@@ -405,6 +419,11 @@ def anchorable_lines(diff_text: str):
     # header — which is stricter than "inside a hunk region": it also refuses a pair
     # sitting between an honoured `+++` and that file's first `@@`.
     awaiting_header = True
+    # The PREVIOUS line was a `--- ` header FORM consumed as hunk content. Both git and
+    # a bare `diff -u` emit the old-side header immediately before the new-side one, so
+    # a `+++ ` form arriving right after one means an over-declared hunk is eating the
+    # next file's header pair — see the `+` arm below.
+    ate_old_header = False
     # split("\n") with the trailing element dropped, not splitlines(): splitlines also
     # breaks on \v, \f, \x1c-\x1e, U+0085 and U+2028/9, none of which advance git's
     # line numbering. A form feed in a Python file would otherwise split one content
@@ -414,6 +433,7 @@ def anchorable_lines(diff_text: str):
         lines.pop()
     for raw in lines:
         saw_old_header_before, saw_old_header = saw_old_header, False
+        ate_old_header_before, ate_old_header = ate_old_header, False
         if pending_old > 0 or pending_new > 0:
             # Inside hunk content: consume the budget so the hunk's end is known. Each
             # prefix is gated on ITS OWN side's counter, because the branch is entered
@@ -425,6 +445,26 @@ def anchorable_lines(diff_text: str):
             # disagree with the body, which is exactly the untrustworthy state the
             # fall-through below already drops the file for.
             if raw.startswith("+") and pending_new > 0:
+                if ate_old_header_before and raw.startswith("+++ "):
+                    # Gating each prefix on its own counter (above) only covers an
+                    # over-declaration on ONE side. When BOTH are over by one, the next
+                    # file's `--- `/`+++ ` pair is swallowed whole — the `--- ` on the
+                    # `-` arm, this `+++ ` here — so neither that gate nor the
+                    # spent-budget arm below ever fires: counting this line as added
+                    # FABRICATES an anchor in the previous file, and the following `@@`
+                    # is then honoured with `path` still pointing at it, renumbering the
+                    # next file's lines under the previous file's key (observed:
+                    # `{"x.py": {1, 2, 3, 500, 501}}`, y.py absent). An eaten header pair
+                    # means the declared counts disagree with the body, so drop the file
+                    # and stay desynced until a `diff --git ` resynchronizes. A genuine
+                    # diff OF a patch file trips this too; demoting that one file's
+                    # findings to the review body is the fail-SAFE direction, because a
+                    # single wrong anchor costs every anchor in the request.
+                    path = None
+                    right = 0
+                    pending_old = pending_new = 0
+                    desynced = True
+                    continue
                 pending_new -= 1
                 if path is not None and right:
                     anchors[path].add(right)
@@ -440,6 +480,7 @@ def anchorable_lines(diff_text: str):
             if raw.startswith("-") and pending_old > 0:
                 # Removed lines advance only the OLD side.
                 pending_old -= 1
+                ate_old_header = raw.startswith("--- ")
                 continue
             if raw.startswith("\\"):
                 # `\ No newline at end of file` is a marker, not content.
@@ -454,7 +495,8 @@ def anchorable_lines(diff_text: str):
             pending_old = pending_new = 0
             desynced = True
         elif raw[:1] in ("+", "-", " ") and not (
-            raw.startswith("--- ") or raw.startswith("+++ ")
+            (awaiting_header or not saw_git_header)
+            and (raw.startswith("--- ") or raw.startswith("+++ "))
         ):
             # The mirror of the branch above. There the declared counts were too LARGE
             # (budget left, content gone); here they were too SMALL — the budget is
@@ -466,8 +508,15 @@ def anchorable_lines(diff_text: str):
             # this parser exists to prevent. Desync instead, until a `diff --git`.
             # A `\ No newline` marker legitimately arrives on a spent budget, and the
             # header forms are excluded here because a prefix-less multi-file `diff -u`
-            # really does start its next file that way (the `saw_git_header` gate below
-            # is what covers that case when the input IS git output).
+            # really does start its next file that way — but ONLY when the input could
+            # legitimately be doing that. In git's own output every header pair is
+            # preceded by a `diff --git `, so `awaiting_header` is exactly "the pair git
+            # owes us has not arrived yet": a `--- ` reaching a spent budget with the
+            # pair already honoured is not a header git wrote. Without this gate that
+            # `--- ` fell straight through to the metadata branch below — whose
+            # `saw_git_header and not awaiting_header` guard sits only on the `+++ `
+            # side — leaving `path` and `desynced` untouched, so the NEXT `@@` was
+            # honoured under the stale path and fabricated anchors in it.
             path = None
             right = 0
             desynced = True
@@ -527,9 +576,48 @@ def anchorable_lines(diff_text: str):
                 right = 0
                 desynced = True
                 continue
-            right = int(m.group(3))
+            new_start = int(m.group(3))
+            new_count = int(m.group(4)) if m.group(4) is not None else 1
+            if new_start == 0 and new_count > 0:
+                # Real diff output pairs a `+0` start only with a count of 0 (an empty
+                # new side). `@@ -1,0 +0,3 @@` would number its added lines from 0, and
+                # the `path is not None and right` test in the `+` arm reads that 0 as
+                # "no hunk header yet" and silently skips it — recording the SECOND and
+                # third added lines as 1 and 2, a set shifted by one and anchored on
+                # lines the diff never carried. Drop the file and desync, which is what
+                # every other unusable-header case in this scan does.
+                path = None
+                right = 0
+                pending_old = pending_new = 0
+                desynced = True
+                continue
+            right = new_start
             pending_old = int(m.group(2)) if m.group(2) is not None else 1
-            pending_new = int(m.group(4)) if m.group(4) is not None else 1
+            pending_new = new_count
+    if pending_old > 0 or pending_new > 0:
+        # The text ran out mid-hunk, so this file's map is a PREFIX of its real one:
+        # `@@ -1,3 +1,3 @@` followed by a single ` one` yields `{"x.py": {1}}` and
+        # findings on the lines 2 and 3 the real diff carries demote to the body.
+        # Say so, because that demotion is otherwise indistinguishable from a finding
+        # the model simply put outside the diff.
+        #
+        # The map is NOT dropped, and this is the one counts-disagree case where that
+        # is right: the other arms desync because the scan LOST TRACK of the numbering
+        # and would record wrong lines from there on. Here nothing follows — every line
+        # already recorded sits inside a real hunk and anchors correctly. Dropping the
+        # file (or failing open with None) would cost the good anchors too, and None
+        # would additionally send the unanchorable findings inline — the 422 this whole
+        # function exists to prevent. A short map still honours the contract: every line
+        # in it is one a RIGHT-side comment may use.
+        # `path` is None when the cut file has no new side at all (a delete's
+        # `+++ /dev/null`), which has nothing to anchor either way — name the file only
+        # when there is one to name.
+        where = f"{path!r}'s anchors stop" if path is not None else "its anchors stop"
+        print(
+            f"Anchors: the diff ends mid-hunk, so {where} at the cut — findings past "
+            "it will render in the review body.",
+            file=sys.stderr,
+        )
     if not saw_marker:
         return None
     return anchors
@@ -591,12 +679,18 @@ def load_anchors(diff_path):
 
 
 def clamp_review_body(body: str, limit: int = MAX_REVIEW_BODY_CHARS) -> str:
-    """Trim a review body to GitHub's size limit, saying where it was cut."""
+    """Trim a review body to GitHub's size limit, saying where it was cut.
+
+    Also the choke point every POSTed body passes through, so the surrogate scrub runs
+    here too — see the note in normalize_comments. Applied before the length test so a
+    replacement never lands after the cut was measured.
+    """
+    body = encodable(body)
     if len(body) <= limit:
         return body
     note = (
-        "\n\n_…truncated here: the review body reached GitHub's size limit. The full "
-        "text is in the job summary of this run._"
+        "\n\n_…truncated here: the review body reached GitHub's size limit. As much "
+        "of it as fits is in the job summary of this run._"
     )
     if limit <= len(note):
         # Degenerate limit (tests, a future tightening): the cut still has to hold.
@@ -735,7 +829,15 @@ def normalize_comments(findings: list[dict]) -> list[dict]:
                     "path": path,
                     "line": line_int,
                     "side": "RIGHT",
-                    "body": badge + neutralize_mentions(body) + repeat_line,
+                    # encodable() here, not just in write_step_summary: json.load turns
+                    # `"\ud800"` into a lone surrogate and review-output-mcp.py's
+                    # validate_finding checks only type/non-empty/length, so one rides
+                    # this far. json.dumps would then hand the API a literal \ud800
+                    # escape; if GitHub rejects it the wholesale fallback carries the
+                    # same escape and fails identically, leaving the review only in the
+                    # job summary — the one copy that WAS sanitized, so the two channels
+                    # would disagree on the finding's text.
+                    "body": encodable(badge + neutralize_mentions(body) + repeat_line),
                 },
             }
         )

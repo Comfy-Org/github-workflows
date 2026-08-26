@@ -454,7 +454,8 @@ class BodyBudgetTest(unittest.TestCase):
         self.assertLessEqual(len(posted[0]["body"]), PR.MAX_REVIEW_BODY_CHARS)
 
     def test_a_clamped_post_actually_writes_the_summary_it_promises(self):
-        # The clamp note says "the full text is in the job summary of this run". On the
+        # The clamp note says "as much of it as fits is in the job summary of this
+        # run". On the
         # SUCCESS path nothing else writes one, so without this the cut findings are
         # absent from both the PR and the summary while the header still counts them.
         findings = [
@@ -1073,6 +1074,297 @@ class NoFindingsDeliveryTest(unittest.TestCase):
         self.assertEqual(len(posted), 1)
         self.assertEqual(len(summaries), 1, "the one artifact saying no review happened")
         self.assertIn("No high-signal findings", summaries[0])
+
+
+class TabTerminatedHeaderPathTest(unittest.TestCase):
+    """git terminates the header path with a TAB when the name contains a space."""
+
+    def test_a_spacey_path_is_keyed_without_its_tab(self):
+        # Verified against git itself: `git diff` on `my dir/app.py` emits
+        # `--- a/my dir/app.py\t`. Keeping the tab keys the file as `my dir/app.py\t`,
+        # which no finding's `file` can match — so every finding in it loses its anchor.
+        diff = (
+            "diff --git a/my dir/app.py b/my dir/app.py\n"
+            "--- a/my dir/app.py\t\n"
+            "+++ b/my dir/app.py\t\n"
+            "@@ -1,0 +1,1 @@\n"
+            "+added\n"
+        )
+        self.assertEqual(PR.anchorable_lines(diff), {"my dir/app.py": {1}})
+
+    def test_a_quoted_spacey_path_is_keyed_without_its_tab(self):
+        # git appends the tab AFTER the closing quote, so the tab strip has to run
+        # BEFORE the quoted-path test or the target no longer ends in `"`.
+        diff = (
+            'diff --git "a/caf\\303\\251 x.py" "b/caf\\303\\251 x.py"\n'
+            '--- "a/caf\\303\\251 x.py"\t\n'
+            '+++ "b/caf\\303\\251 x.py"\t\n'
+            "@@ -1,0 +1,1 @@\n"
+            "+added\n"
+        )
+        self.assertEqual(PR.anchorable_lines(diff), {"café x.py": {1}})
+
+    def test_a_trailing_space_survives_the_tab_strip(self):
+        # git emits `--- a/trail \t` for a name ending in a space: the tab goes, the
+        # space stays, or the key is wrong in the other direction.
+        diff = "--- a/trail \t\n+++ b/trail \t\n@@ -1,0 +1,1 @@\n+added\n"
+        self.assertEqual(PR.anchorable_lines(diff), {"trail ": {1}})
+
+    def test_a_crlf_spacey_path_strips_both(self):
+        diff = "--- a/my dir/x.py\t\r\n+++ b/my dir/x.py\t\r\n@@ -1,0 +1,1 @@\r\n+a\r\n"
+        self.assertEqual(PR.anchorable_lines(diff), {"my dir/x.py": {1}})
+
+
+class SwallowedHeaderPairTest(unittest.TestCase):
+    """Both sides over-declared eats the next file's header pair as hunk content."""
+
+    def test_an_over_declared_hunk_does_not_absorb_the_next_file(self):
+        # `-1,2 +1,3` declares one line more than the body carries on EACH side, so the
+        # `--- ` lands on the `-` arm and the `+++ ` on the `+` arm — fabricating x.py:3
+        # — and the following `@@` is then honoured with `path` still x.py, renumbering
+        # y.py's added lines into x.py's key. Drop x.py instead of anchoring a guess.
+        diff = (
+            "--- a/x.py\n"
+            "+++ b/x.py\n"
+            "@@ -1,2 +1,3 @@\n"
+            " ctx\n"
+            "+x1\n"
+            "--- a/y.py\n"
+            "+++ b/y.py\n"
+            "@@ -500,0 +500,2 @@\n"
+            "+y1\n"
+            "+y2\n"
+        )
+        anchors = PR.anchorable_lines(diff)
+        self.assertEqual(anchors.get("x.py", set()) & {3, 500, 501}, set())
+
+    def test_the_scan_resynchronizes_on_the_next_diff_git(self):
+        # The drop is scoped to the poisoned file: a `diff --git ` line content can
+        # never impersonate brings the scan back, so later files still anchor.
+        diff = (
+            "diff --git a/x.py b/x.py\n"
+            "--- a/x.py\n"
+            "+++ b/x.py\n"
+            "@@ -1,2 +1,3 @@\n"
+            " ctx\n"
+            "+x1\n"
+            "--- a/y.py\n"
+            "+++ b/y.py\n"
+            "diff --git a/z.py b/z.py\n"
+            "--- a/z.py\n"
+            "+++ b/z.py\n"
+            "@@ -1,0 +1,1 @@\n"
+            "+z1\n"
+        )
+        self.assertEqual(PR.anchorable_lines(diff).get("z.py"), {1})
+
+    def test_a_real_removed_and_added_pair_still_anchors(self):
+        # The guard fires only on the `--- `/`+++ ` FORMS, so ordinary removed/added
+        # content around them is untouched.
+        diff = (
+            "diff --git a/x.py b/x.py\n"
+            "--- a/x.py\n"
+            "+++ b/x.py\n"
+            "@@ -1,2 +1,2 @@\n"
+            "-old\n"
+            "+new\n"
+            " ctx\n"
+        )
+        self.assertEqual(PR.anchorable_lines(diff), {"x.py": {1, 2}})
+
+
+class SpentBudgetOldHeaderTest(unittest.TestCase):
+    """In git output a `--- ` reaching a spent budget is not a header git wrote."""
+
+    def test_an_overflow_dash_line_cannot_carry_the_path_into_the_next_hunk(self):
+        # `+1,1` is short by one, so the overflow line `--- x` (a removed line whose
+        # text starts `-- `) arrives on a spent budget. The `saw_git_header` gate sits
+        # only on the `+++ ` branch, so this used to fall through untouched and the next
+        # `@@` renumbered under the still-current path — fabricating app.py:100 and 101.
+        diff = (
+            "diff --git a/app.py b/app.py\n"
+            "--- a/app.py\n"
+            "+++ b/app.py\n"
+            "@@ -1,0 +1,1 @@\n"
+            "+a1\n"
+            "--- x\n"
+            "@@ -100,0 +100,2 @@\n"
+            "+b1\n"
+            "+b2\n"
+        )
+        self.assertEqual(PR.anchorable_lines(diff).get("app.py", set()), {1})
+
+    def test_a_prefixless_diff_u_still_starts_its_next_file(self):
+        # Without a `diff --git ` line the input may legitimately be a concatenated
+        # `diff -u`, whose next file really does begin with `--- ` on a spent budget.
+        diff = (
+            "--- a/one.py\n"
+            "+++ b/one.py\n"
+            "@@ -1,0 +1,1 @@\n"
+            "+a\n"
+            "--- a/two.py\n"
+            "+++ b/two.py\n"
+            "@@ -1,0 +1,1 @@\n"
+            "+b\n"
+        )
+        self.assertEqual(PR.anchorable_lines(diff), {"one.py": {1}, "two.py": {1}})
+
+    def test_a_normal_git_diff_of_several_files_is_unaffected(self):
+        diff = (
+            "diff --git a/one.py b/one.py\n"
+            "--- a/one.py\n"
+            "+++ b/one.py\n"
+            "@@ -1,0 +1,1 @@\n"
+            "+a\n"
+            "diff --git a/two.py b/two.py\n"
+            "--- a/two.py\n"
+            "+++ b/two.py\n"
+            "@@ -5,0 +5,2 @@\n"
+            "+b\n"
+            "+c\n"
+        )
+        self.assertEqual(PR.anchorable_lines(diff), {"one.py": {1}, "two.py": {5, 6}})
+
+
+class ZeroNewStartHunkTest(unittest.TestCase):
+    """A `+0` start pairs only with a count of 0 in real diff output."""
+
+    def test_a_zero_start_with_a_positive_count_drops_the_file(self):
+        # `+0,3` numbers its added lines from 0; the `right` truthiness test reads that
+        # 0 as "no header yet" and skips the first, recording the second and third as
+        # 1 and 2 — a set shifted by one onto lines the diff never carried.
+        diff = (
+            "diff --git a/x.py b/x.py\n"
+            "--- a/x.py\n"
+            "+++ b/x.py\n"
+            "@@ -1,0 +0,3 @@\n"
+            "+a\n"
+            "+b\n"
+            "+c\n"
+        )
+        self.assertEqual(PR.anchorable_lines(diff).get("x.py", set()), set())
+
+    def test_a_delete_only_hunk_with_a_zero_start_still_parses(self):
+        # `@@ -1,3 +0,0 @@` is what git really emits for a whole-file delete: start 0
+        # with count 0, which must stay a legal (anchorless) hunk.
+        diff = (
+            "diff --git a/x.py b/x.py\n"
+            "--- a/x.py\n"
+            "+++ b/x.py\n"
+            "@@ -1,3 +0,0 @@\n"
+            "-a\n"
+            "-b\n"
+            "-c\n"
+        )
+        self.assertEqual(PR.anchorable_lines(diff), {"x.py": set()})
+
+
+class TruncatedTailHunkTest(unittest.TestCase):
+    """A hunk cut short at EOF yields a PREFIX map — correct, just incomplete."""
+
+    def test_a_hunk_cut_short_at_eof_keeps_the_anchors_it_proved(self):
+        # `-1,3 +1,3` with only ` one` present yields {"x.py": {1}}. Line 1 sits inside
+        # a real hunk and anchors fine; dropping the file (or failing open with None)
+        # would cost that anchor for nothing, since nothing follows the cut to be
+        # mis-numbered. Findings on 2 and 3 demote to the body, which is fail-safe.
+        diff = (
+            "diff --git a/x.py b/x.py\n"
+            "--- a/x.py\n"
+            "+++ b/x.py\n"
+            "@@ -1,3 +1,3 @@\n"
+            " one\n"
+        )
+        self.assertEqual(PR.anchorable_lines(diff), {"x.py": {1}})
+
+    def test_a_mid_hunk_cut_is_reported_on_stderr(self):
+        # The demotion is otherwise indistinguishable from a finding the model simply
+        # placed outside the diff, so the run log has to name the cut.
+        diff = (
+            "diff --git a/x.py b/x.py\n"
+            "--- a/x.py\n"
+            "+++ b/x.py\n"
+            "@@ -1,3 +1,3 @@\n"
+            " one\n"
+        )
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            PR.anchorable_lines(diff)
+        self.assertIn("ends mid-hunk", err.getvalue())
+        self.assertIn("x.py", err.getvalue())
+
+    def test_a_complete_diff_reports_nothing(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            PR.anchorable_lines("--- a/x.py\n+++ b/x.py\n@@ -1,0 +1,1 @@\n+a\n")
+        self.assertNotIn("mid-hunk", err.getvalue())
+
+    def test_a_cut_delete_hunk_names_no_file(self):
+        # `+++ /dev/null` leaves `path` None, so the note has no file to name and must
+        # not print "None's anchors".
+        diff = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ /dev/null\n@@ -1,3 +0,0 @@\n-a\n"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(PR.anchorable_lines(diff), {})
+        self.assertIn("ends mid-hunk", err.getvalue())
+        self.assertNotIn("None", err.getvalue())
+
+    def test_the_files_before_the_truncation_keep_their_anchors(self):
+        # done.py is whole and cut.py keeps the one line it proved — the cut costs only
+        # the lines the text never reached.
+        diff = (
+            "diff --git a/done.py b/done.py\n"
+            "--- a/done.py\n"
+            "+++ b/done.py\n"
+            "@@ -1,0 +1,1 @@\n"
+            "+a\n"
+            "diff --git a/cut.py b/cut.py\n"
+            "--- a/cut.py\n"
+            "+++ b/cut.py\n"
+            "@@ -1,3 +1,3 @@\n"
+            " one\n"
+        )
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(PR.anchorable_lines(diff), {"done.py": {1}, "cut.py": {1}})
+
+    def test_a_complete_final_hunk_is_untouched(self):
+        diff = (
+            "diff --git a/x.py b/x.py\n"
+            "--- a/x.py\n"
+            "+++ b/x.py\n"
+            "@@ -1,1 +1,2 @@\n"
+            " one\n"
+            "+two\n"
+        )
+        self.assertEqual(PR.anchorable_lines(diff), {"x.py": {1, 2}})
+
+
+class SurrogateSafePostTest(unittest.TestCase):
+    """encodable() has to be total: the PR copy and the summary must not disagree."""
+
+    def test_a_lone_surrogate_in_a_finding_body_never_reaches_json_dumps(self):
+        body = json.loads('"boom \\ud800 tail"')
+        enriched = PR.normalize_comments(
+            [{"file": "x.py", "line": 1, "body": body, "severity": "high"}]
+        )
+        self.assertEqual(len(enriched), 1)
+        # Without the scrub json.dumps emits a literal \ud800 escape for the API, and
+        # the wholesale fallback carries the same one — leaving the PR copy and the
+        # (sanitized) job summary disagreeing on the finding's text.
+        json.dumps(enriched[0]["comment"]).encode("utf-8")
+        enriched[0]["comment"]["body"].encode("utf-8")
+        self.assertIn("boom", enriched[0]["comment"]["body"])
+        self.assertIn("tail", enriched[0]["comment"]["body"])
+
+    def test_a_lone_surrogate_in_a_repeat_url_is_scrubbed_too(self):
+        url = json.loads('"https://example.test/\\ud800"')
+        enriched = PR.normalize_comments(
+            [{"file": "x.py", "line": 1, "body": "b", "severity": "low", "repeat_of": url}]
+        )
+        enriched[0]["comment"]["body"].encode("utf-8")
+
+    def test_clamp_review_body_scrubs_the_assembled_body(self):
+        # The choke point every POSTed body passes through.
+        PR.clamp_review_body(json.loads('"head \\ud800 tail"')).encode("utf-8")
 
 
 if __name__ == "__main__":

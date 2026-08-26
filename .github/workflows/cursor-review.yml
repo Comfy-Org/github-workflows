@@ -1946,7 +1946,14 @@ jobs:
               --diff /tmp/pr-diff.patch \
               --ledger-note "$LEDGER_NOTE"
           elif [ "${CONSOLIDATED_COUNT:-0}" != "0" ]; then
-            JUDGE_ERROR=$(python3 -c "import json; print(json.load(open('/tmp/judge-findings.json')).get('error','(no error message)'))")
+            # No JUDGE_ERROR is read here on purpose: this branch passes --notice with
+            # $JUDGE_STATUS and never --error-message, so the message had nowhere to go
+            # — and extracting it could still kill the step. json.load accepts an
+            # escaped lone surrogate in `error`, print() then raises UnicodeEncodeError,
+            # and under this step's `bash -e` a standalone assignment inherits its
+            # command substitution's exit status, so the shell would exit before the raw
+            # un-adjudicated panel review is posted. That review is the whole point of
+            # this branch.
             python3 "$CURSOR_REVIEW_ASSETS/post-review.py" \
               --findings /tmp/consolidated.json \
               --pr-number "$PR_NUMBER" \
@@ -1962,9 +1969,15 @@ jobs:
             # $JUDGE_ERROR would fail the exec and produce no error review and no job
             # summary at all — precisely the largest failures post-review.py's own
             # message budget was added for, which can only run once Python has started.
-            # 100 KB leaves room for the prefix and still exceeds that char budget, so
-            # post-review.py's "(truncated…)" note still fires.
-            JUDGE_ERROR=$(python3 -c "import json; e = str(json.load(open('/tmp/judge-findings.json')).get('error', '(no error message)')); print(e.encode('utf-8', 'replace')[:100000].decode('utf-8', 'ignore'))")
+            # A BYTE cut cannot guarantee post-review.py's CHARACTER budget
+            # (MAX_ERROR_MESSAGE_CHARS) then trips: 100 KB of emoji decodes to 25,000
+            # characters and of CJK to ~33,000, both under it, so a message severed here
+            # would reach post_error_review looking complete and carry no "(truncated…)"
+            # marker. Raising the byte cut to make that impossible would breach
+            # MAX_ARG_STRLEN, so say it HERE instead — the marker is appended only when
+            # the cut actually fired. (Command substitution also strips trailing
+            # newlines and cannot carry NUL; neither changes what the reader is told.)
+            JUDGE_ERROR=$(python3 -c "import json; e = str(json.load(open('/tmp/judge-findings.json')).get('error', '(no error message)')).encode('utf-8', 'replace'); cut = e[:100000]; print(cut.decode('utf-8', 'ignore') + ('' if len(cut) == len(e) else ' …(truncated: the error message exceeded the 100 KB argument budget)'))")
             python3 "$CURSOR_REVIEW_ASSETS/post-review.py" \
               --findings /tmp/consolidated.json \
               --pr-number "$PR_NUMBER" \
