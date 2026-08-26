@@ -99,6 +99,18 @@ consumer out of coverage rather than raising a different error:
   and a resolver declared below its consumer cannot have run first, so neither
   is credited — the same rule the guard steps already follow.
 
+**Neither the binding nor the `ref:` is read out of a `#` comment (BE-9129).**
+Line classification runs on the comment-stripped text, the same reading the
+fallback matchers and `env_aliases` already take, because it fails in both
+directions otherwise: a trailing `# resolved from inputs.workflows_ref` on a
+correctly guarded `ref: ${{ steps.<id>.outputs.ref }}` made the line read as a
+direct *input* checkout and reported a compliant workflow unguarded, while a
+comment spelling out `{WORKFLOWS_REF: "${{ inputs.workflows_ref }}"}`
+registered a resolver step that does not exist. So annotate a `ref:` freely —
+the comment changes no verdict. Only the classification is stripped; the
+column-sensitive readers (indentation, the step's own `id:`, the guard-step
+scan) still see the raw line.
+
 A step written as ONE flow mapping that both binds `WORKFLOWS_REF` in its `env:`
 and reads a step output in its `with: {ref: … }` is judged like any other
 step-output checkout (BE-9098) — the binding on that line is not what the line
