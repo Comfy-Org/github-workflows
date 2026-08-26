@@ -99,6 +99,80 @@ consumer out of coverage rather than raising a different error:
   and a resolver declared below its consumer cannot have run first, so neither
   is credited — the same rule the guard steps already follow.
 
+**Neither the binding nor the `ref:` is read out of a `#` comment (BE-9129).**
+Line classification runs on the comment-stripped text, the same reading the
+fallback matchers and `env_aliases` already take, because it fails in both
+directions otherwise: a trailing `# resolved from inputs.workflows_ref` on a
+correctly guarded `ref: ${{ steps.<id>.outputs.ref }}` made the line read as a
+direct *input* checkout and reported a compliant workflow unguarded, while a
+comment spelling out `{WORKFLOWS_REF: "${{ inputs.workflows_ref }}"}`
+registered a resolver step that does not exist. So annotate a `ref:` freely —
+on an ordinary line the comment changes no verdict. Only the classification is
+stripped; the column-sensitive readers (indentation, the step's own `id:`, the
+guard-step scan) still see the raw line.
+
+Stripping stops wherever a `#` is not a comment at all, because there the text
+past it is value the runtime still folds in and dropping it would let a real
+checkout out of the lint:
+
+- inside a `|` / `>` block scalar and inside a multi-line quoted `ref:` scalar
+  (whether the quote opens alone at end of line or with text — `ref: "${{` /
+  `inputs.workflows_ref }}"` — both open the continuation window), where the
+  `#` is literal content — only the plain `ref:`-then-value spelling ends at
+  one. Both halves of the continuation read that same text: the step-output
+  reader is handed it too, so `ref: >-` / `x # ${{ steps.r.outputs.ref }}` is
+  a checkout at the step output, not an `x`;
+- on any line while a quoted scalar opened ABOVE is still open, such as the
+  tail of a flow mapping split across lines (`- {name: "foo` / `bar` /
+  `baz # qux", …}`) — the stripper rescans each physical line from scratch and
+  would read that closing quote's `#` as an opener. The walk carries the
+  quote state forward, line to line, until a line actually closes the scalar
+  — and past that closing quote the rest of the line is ordinary YAML again,
+  so a `}}"  # resolved from inputs.workflows_ref` is stripped like any other
+  trailing comment. It reads quotes the strict way (a quote opens a scalar
+  only where a YAML node can start — after `:`, `,`, `{`, `[`, a `- ` marker,
+  or a `&anchor` / `!tag` in that position), so the apostrophe of a `name:
+  don't fail` does not suspend the strip for the rest of the job; and the
+  carried state is **bounded by indentation**: YAML continues a scalar only
+  onto lines indented deeper than the one that opened it, so the state resets
+  at the opener's own column. An unbalanced quote in a `run:` line or script
+  body (`echo "note: 'x"`) therefore affects nothing past its own block —
+  it cannot switch the windows or the strip off for the steps that follow.
+
+Both fall back to the raw line — the pre-BE-9129 reading, and the value the
+runtime folds into the ref — so the site is never dropped: worst case the text
+past a `#` costs an annotation. Note that "raw" means judged as *value*: a
+`# resolved from inputs.workflows_ref` inside a `|` body is a named mention of
+the input and is read exactly as the same words spelled on one line without
+the `#` — an input use, not a step-output checkout — because inside that body
+it is not a comment at all (and the ref it produces, `<sha>  # resolved from
+…`, is not a git ref any checkout can land on). For the same reason the strip
+is deliberately over-protective about quotes — **any** quote opens a masked
+region, so an apostrophe earlier on the line (`name: don't resolve  # …`)
+leaves the `#` unstripped and the comment is read as config after all. Rare,
+and it fails closed; if a comment is somehow changing a verdict, that is the
+first thing to look for.
+
+The continuation window itself opens on every spelling YAML gives a multi-line
+`ref:`: the bare `ref:`, a `|`/`>` header with its chomping and indentation
+indicators in either order (`>-2` and `>2-` alike), a quote left open at end
+of line or after text (`ref: "${{`), and a plain scalar that carries text on
+the key line and folds onto the more-indented lines below (`ref: ${{` /
+`inputs.workflows_ref }}`, `ref: ${{ 'main' ||` / `steps.r.outputs.ref }}`).
+A `ref: main` that stands alone opens nothing — the next line at or above its
+indent closes the window with nothing recorded. The window is judged on the
+**fold** — the key line's own text plus every continuation, joined — which is
+the value the runtime sees: `${{ inputs[` / `'workflows_ref'] }}` names the
+input on neither physical line and on both together; `ref: "${{
+steps.r.outputs.ref` / `}}"` is the step-output checkout its one-line
+spelling is; and a leading operand that never reaches the input (`ref: ${{
+'main' ||` / `inputs.workflows_ref }}`) gets the same verdict split as it does
+on one line. Only the ref value's *own* quote opens a quoted window — one a
+trailing comment leaves open (`ref: "main"  # see: "x`) is nobody's
+continuation. The `env:` alias scan follows the same split spellings, so a
+`WORKFLOWS_REF: "${{` / `inputs.workflows_ref }}"` binds the alias exactly as
+the one-line binding does.
+
 A step written as ONE flow mapping that both binds `WORKFLOWS_REF` in its `env:`
 and reads a step output in its `with: {ref: … }` is judged like any other
 step-output checkout (BE-9098) — the binding on that line is not what the line
