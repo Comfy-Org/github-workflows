@@ -30,12 +30,13 @@ name: Roster shape probe (TEMPORARY)
 #   * booleans and TYPE markers, never the strings they describe — and never a
 #     string's LENGTH either: over a three-word label vocabulary a length is
 #     the label;
-#   * workflow FILENAMES — but only ones drawn from the public vocabulary of
-#     reusables THIS repo ships (`cursor-review.yml`, `ci-groom.yml`, …). An
-#     entry whose filename is anything else prints as `<unlisted>`: the roster
-#     is exactly what this probe cannot vouch for, and a path like
-#     `ci-cursor-review-<codename>.yml` is a well-formed path that names a
-#     private product;
+#   * whether each position's filename is drawn from the public caller
+#     vocabulary (`<listed>`) or not (`<unlisted>`) — never the NAME itself,
+#     public or otherwise. Each name alone is public, but the ORDERED MULTISET
+#     is the fleet's adoption profile; on the shared `PR_RISK_CALLERS`,
+#     counting `pr-derisk` entries would publish how many repos enrolled in a
+#     beta fleet. A filename is a value, not shape, and the operator already
+#     holds every one of them from the fleet's own bump PRs;
 #   * ONE sha256, over the whole canonical roster — the bumper's existing audit
 #     digest, reproduced here so the run that printed the shape and the digest
 #     it must reconcile against are the same run. It verifies a reconstruction
@@ -74,6 +75,15 @@ name: Roster shape probe (TEMPORARY)
 on:
   workflow_dispatch:
     inputs:
+      digest_already_public:
+        description: >-
+          Tick ONLY after confirming a bump-<fleet> run has already logged a
+          real "roster: N caller(s), sha256 <hex>" line for this exact roster.
+          Unticked, the digest is withheld — publishing it otherwise would be
+          this roster's FIRST public fingerprint, not a repeat of the bumper's.
+        required: false
+        type: boolean
+        default: false
       roster:
         description: Which roster secret to probe
         required: true
@@ -165,6 +175,16 @@ jobs:
             echo "::error::EXPIRES must be a quoted ISO date (YYYY-MM-DD); got '${EXPIRES}'. A malformed value would compare wrongly and the probe would silently stop expiring — fix it, do not remove the check."
             exit 1
           fi
+          # Shape is not enough, and the gap is the fail-OPEN direction this
+          # whole block exists to avoid: `2026-19-30` and `2026-90-30` are
+          # digit-placement-valid, sort ABOVE every real 2026 date, and would
+          # slide the only automatic retirement silently into 2027 on a green
+          # run. Round-trip the value through `date` instead — a real date
+          # normalizes to itself, an impossible month or day does not.
+          if ! ROUNDTRIP=$(date -u -d "$EXPIRES" +%F 2>/dev/null) || [[ "$ROUNDTRIP" != "$EXPIRES" ]]; then
+            echo "::error::EXPIRES '${EXPIRES}' is not a real calendar date (it does not round-trip through \`date\`; got '${ROUNDTRIP:-<error>}'). A digit-placement-valid but impossible date sorts above every real one, so the probe would stop expiring."
+            exit 1
+          fi
           TODAY=$(date -u +%F)
           if [[ ! "$TODAY" =~ $ISO_DATE ]]; then
             echo "::error::date -u +%F returned '${TODAY}', not an ISO date; refusing to compare against EXPIRES."
@@ -188,6 +208,7 @@ jobs:
           # this script could do about it.
           CALLERS_JSON: ${{ secrets[inputs.roster] }}
           ROSTER_NAME: ${{ inputs.roster }}
+          DIGEST_ALREADY_PUBLIC: ${{ inputs.digest_already_public }}
           # Below this many entries only count + digest are printed — see the
           # header. Ordered n-tuples over a guessable `Comfy-Org/*` namespace of
           # a couple of hundred names are an offline job at n=5 (~10^11
@@ -206,9 +227,44 @@ jobs:
           # legitimate entry to `<unlisted>`, which is the fail-CLOSED direction
           # and is indistinguishable here from a suppressed private filename.
           # The output says so whenever an `<unlisted>` appears.
-          FILE_ALLOW: '\A[.]github/workflows/(ci-)?(agents-md-integrity|assign-prs-to-author|assign-reviewers|coderabbit-config-validate|cursor-review|cursor-review-auto-label|detect-unreviewed-merge|groom|linear-ticket|pr-area-label|pr-derisk|pr-risk|pr-size|public-repo-hygiene|refresh-reviewers|stale)[.]ya?ml\z'
+          # A roster's `file` is the CALLER's filename in the CONSUMER repo, not
+          # the name of the reusable this repo ships — and the two differ in
+          # published, documented ways. `bump-callers.sh` records
+          # `pr-cursor-review.yaml` as a live CURSOR_REVIEW_CALLERS spelling, and
+          # `docs/callers/linear-ticket.md` specifies the caller file as
+          # `linear-ticket-validate.yml`; a `(ci-)?<stem>` vocabulary matches
+          # NEITHER, so those positions printed `<unlisted>` and sent the
+          # operator to `.github/workflows/` for a cause that was never there —
+          # while also making the position unreconcilable against the digest.
+          # So: an optional `ci-`/`pr-` prefix and an ENUMERATED `-signal` /
+          # `-validate` tail, which is what the caller docs publish. The tail is
+          # a closed set, NOT an open `-[a-z0-9]+`: an open tail would admit
+          # `ci-cursor-review-<codename>.yml` — a well-formed path naming a
+          # private product — which is precisely the disclosure this allowlist
+          # exists to stop. Closed vocabulary at BOTH ends; anything else is
+          # still `<unlisted>`.
+          FILE_ALLOW: '\A[.]github/workflows/(ci-|pr-)?(agents-md-integrity|assign-prs-to-author|assign-reviewers|coderabbit-config-validate|cursor-review|cursor-review-auto-label|detect-unreviewed-merge|groom|linear-ticket|pr-area-label|pr-derisk|pr-risk|pr-size|public-repo-hygiene|refresh-reviewers|stale)(-(signal|validate))?[.]ya?ml\z'
         run: |
           set -euo pipefail
+
+          # MIN_SHAPE_COUNT and FILE_ALLOW are the two hand-edited safety
+          # constants the rest of this file leans on, and BOTH fail open if
+          # mis-edited. In `(( COUNT < MIN_SHAPE_COUNT ))` an empty value
+          # evaluates to 0 and a non-numeric one is re-expanded as an unset
+          # variable name — either makes the comparison false and prints the
+          # full shape lines for a ONE-entry roster. An empty FILE_ALLOW makes
+          # jq's `test($re)` match every string, so every filename prints
+          # verbatim and the carve-out this file is built around disappears.
+          # `set -e` cannot catch either (an `if` condition is exempt), so both
+          # are shape-checked here, exactly as EXPIRES, COUNT and DIGEST are.
+          if [[ ! "$MIN_SHAPE_COUNT" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::MIN_SHAPE_COUNT must be a positive integer; got '${MIN_SHAPE_COUNT}'. An empty or non-numeric value makes the withholding comparison false and publishes the shape lines for a one-entry roster."
+            exit 1
+          fi
+          if [[ -z "$FILE_ALLOW" ]]; then
+            echo "::error::FILE_ALLOW is empty, so every filename would match and print verbatim — that is the disclosure carve-out this probe is built around. Restore the pattern."
+            exit 1
+          fi
 
           if [[ -z "${CALLERS_JSON:-}" ]]; then
             echo "::error::${ROSTER_NAME} is unset or empty on this repo — nothing to probe."
@@ -255,12 +311,58 @@ jobs:
             exit 1
           fi
 
+          # DISTINCT repos, not array length. `PR_RISK_CALLERS` is SHARED by the
+          # pr-risk and pr-derisk fleets and lists a repo once PER CALLER FILE,
+          # so an 8-entry paired roster conceals only ~4 names — and the
+          # withholding threshold is about how many independent NAMES an
+          # offline search would have to guess, not how many rows there are.
+          # Gate on the quantity the threshold is actually reasoning about.
+          NAMES=$(jq -c '[.[] | .repo] | unique | length' <<<"$CALLERS_JSON")
+          if [[ ! "$NAMES" =~ ^[0-9]+$ ]]; then
+            echo "::error::distinct-repo count did not come back as an integer (got '${NAMES}'); nothing printed."
+            exit 1
+          fi
+
           echo "=== ${ROSTER_NAME} — structure only, no names, no label text ==="
           echo "count:         ${COUNT}"
-          echo "roster_sha256: ${DIGEST}"
 
-          if (( COUNT < MIN_SHAPE_COUNT )); then
-            echo "shape:         (withheld — fewer than ${MIN_SHAPE_COUNT} entries; see the header)"
+          # An EMPTY roster is the documented seed state for several fleets, and
+          # it must not read as a healthy one. `bump-callers.sh` prints
+          # `sha256 n/a (roster empty or unset)` there, so publishing the
+          # well-known digest of `[]` would give the operator a cross-check with
+          # nothing on the other side — a wiped roster looking exactly like a
+          # populated one. Mirror the bumper instead.
+          if (( COUNT == 0 )); then
+            echo "roster_sha256: n/a (roster empty)"
+            echo "note:          an ALLOW_EMPTY=true fleet treats this as dormant and its bump exits 0;"
+            echo "               an ALLOW_EMPTY=false fleet hard-fails every run. See the fleet table in"
+            echo "               .github/bump-callers/README.md before reading this as healthy."
+            echo "=== end ==="
+            exit 0
+          fi
+
+          # THE DIGEST IS ONLY ZERO-DELTA IF A BUMP RUN HAS ALREADY PUBLISHED IT.
+          # The header's whole claim for this line is that it repeats what
+          # `bump-callers.sh` already logs on every run. That is FALSE for a
+          # fleet whose roster was seeded `[]` (the bumper short-circuits to
+          # `sha256 n/a`, so no real digest has ever been logged) and in the
+          # window between a `gh secret set` and the next bump — which is this
+          # probe's primary use case. Publishing there would make this the FIRST
+          # public fingerprint of that roster, which is a new oracle, not a
+          # repetition of an old one. So the operator must confirm a bump run
+          # has already fingerprinted this exact roster; unconfirmed, the shape
+          # lines are still useful and the digest is withheld.
+          if [[ "${DIGEST_ALREADY_PUBLIC:-false}" != "true" ]]; then
+            echo "roster_sha256: (withheld — set DIGEST_ALREADY_PUBLIC=true only after confirming a"
+            echo "               bump-${ROSTER_NAME} run has already logged a real 'roster: N caller(s),"
+            echo "               sha256 <hex>' line for this exact roster. Until then this would be the"
+            echo "               FIRST public fingerprint of it, not a repeat of one.)"
+          else
+            echo "roster_sha256: ${DIGEST}"
+          fi
+
+          if (( NAMES < MIN_SHAPE_COUNT )); then
+            echo "shape:         (withheld — only ${NAMES} distinct repo(s), fewer than ${MIN_SHAPE_COUNT}; see the header)"
             echo "               Reconstruct by searching the small per-entry shape space locally"
             echo "               (which of repo/file/label/wire_bot are present, wire_bot state, label"
             echo "               presence) against roster_sha256 with the names and filenames already"
@@ -299,11 +401,33 @@ jobs:
           # (5) Filenames in roster order, under the SAME four-state encoding as
           #     (4) — absent / null / "<type>" — so every position reconciles
           #     byte-for-byte; a present STRING then prints verbatim ONLY when
-          #     drawn from the public vocabulary in FILE_ALLOW and `<unlisted>`
-          #     otherwise (which still tells the operator which positions to
-          #     reconcile against the filenames recovered from the bump PRs).
-          FILES=$(jq -c --arg re "$FILE_ALLOW" '[.[] | if (has("file") | not) then "absent" elif (.file | type) == "null" then null elif (.file | type) != "string" then "<\(.file | type)>" elif (.file | test($re)) then .file else "<unlisted>" end]' <<<"$CALLERS_JSON")
+          #     `<listed>` when drawn from the public FILE_ALLOW vocabulary and
+          #     `<unlisted>` otherwise — the NAME is never printed, even a public
+          #     one. Each name on its own is public vocabulary, but the ORDERED
+          #     MULTISET is not: it is the fleet's adoption profile, derived from
+          #     a secret and written permanently to a public log. The sharpest
+          #     case is the shared `PR_RISK_CALLERS`, where counting the
+          #     `pr-derisk` entries reveals how many repos have enrolled in a
+          #     fleet the bump-callers README still describes as possibly
+          #     selecting nothing. Nothing is lost: a filename is a VALUE, not
+          #     shape, and the operator already recovered every one of them from
+          #     the fleet's own bump PRs — `<listed>` still says which positions
+          #     carry a usable filename, and a roster mixing spellings is a
+          #     bounded local search against the digest, exactly as the
+          #     below-threshold path already recommends.
+          FILES=$(jq -c --arg re "$FILE_ALLOW" '[.[] | if (has("file") | not) then "absent" elif (.file | type) == "null" then null elif (.file | type) != "string" then "<\(.file | type)>" elif (.file | test($re)) then "<listed>" else "<unlisted>" end]' <<<"$CALLERS_JSON")
 
+          # An entry carrying a key outside the documented four is hashed into
+          # the digest by its NAME as well as its value, while the name itself
+          # is suppressed to `<unlisted-key>` here — so a reconstruction cannot
+          # converge, and the operator would read the mismatch as wrong repo
+          # names and go hunting the wrong thing. Say so rather than let them.
+          if jq -e 'any(.[]; keys | any(. as $k | ["file","label","repo","wire_bot"] | index($k) | not))' >/dev/null <<<"$CALLERS_JSON"; then
+            echo "warn:          this roster carries key(s) outside the documented four. Their NAMES are"
+            echo "               suppressed above but are hashed into roster_sha256, so a reconstruction"
+            echo "               built only from these lines CANNOT match the digest. A mismatch here is"
+            echo "               the unlisted key, not wrong repo names."
+          fi
           echo "keys:          ${KEYS}"
           echo "wire_bot:      ${WIRE_BOT}"
           echo "label:         ${LABEL}"
