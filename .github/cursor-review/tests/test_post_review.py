@@ -1006,12 +1006,10 @@ class SurrogateSafeSummaryTest(unittest.TestCase):
         PR.clamp_to_bytes(text, 5).encode("utf-8")
 
 
-class TruncatedSummaryEchoTest(unittest.TestCase):
-    """STEP_SUMMARY_TRUNCATED_NOTE points at the run log; something must put it there."""
+class TruncatedSummaryNotePromiseTest(unittest.TestCase):
+    """The cut note must not point anywhere the text isn't."""
 
-    def test_the_whole_payload_reaches_stdout_before_the_cut(self):
-        tail = "THE-TAIL-THAT-THE-FILE-LOSES"
-        markdown = "x" * (PR.MAX_STEP_SUMMARY_BYTES * 2) + tail
+    def summarize(self, markdown):
         buf = io.StringIO()
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "summary.md")
@@ -1019,19 +1017,20 @@ class TruncatedSummaryEchoTest(unittest.TestCase):
                  contextlib.redirect_stdout(buf):
                 PR.write_step_summary(markdown)
             with open(path, encoding="utf-8") as f:
-                written = f.read()
-        self.assertNotIn(tail, written, "the file copy is genuinely cut")
-        self.assertIn("truncated here", written)
-        self.assertIn(tail, buf.getvalue(), "...and the run log carries the whole of it")
+                return f.read(), buf.getvalue()
 
-    def test_a_summary_under_the_cap_is_not_echoed(self):
-        buf = io.StringIO()
-        with tempfile.TemporaryDirectory() as d:
-            path = os.path.join(d, "summary.md")
-            with mock.patch.dict(PR.os.environ, {"GITHUB_STEP_SUMMARY": path}), \
-                 contextlib.redirect_stdout(buf):
-                PR.write_step_summary("the review body")
-        self.assertEqual(buf.getvalue(), "", "no log noise on the ordinary path")
+    def test_the_cut_note_promises_no_other_copy(self):
+        written, _ = self.summarize("x" * (PR.MAX_STEP_SUMMARY_BYTES * 2))
+        self.assertIn("could not be delivered", written)
+        self.assertNotIn("run log", written, "nothing writes the text there")
+
+    def test_the_summary_write_never_echoes_the_payload_to_stdout(self):
+        # Echoing ~900 KB per call hung the CI job for >13 minutes; stdout stays quiet
+        # on both the ordinary and the truncated path.
+        _, cut_stdout = self.summarize("x" * (PR.MAX_STEP_SUMMARY_BYTES * 2))
+        _, small_stdout = self.summarize("the review body")
+        self.assertEqual(cut_stdout, "")
+        self.assertEqual(small_stdout, "")
 
 
 class ErrorReviewSummaryContractTest(unittest.TestCase):

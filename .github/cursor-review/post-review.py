@@ -178,11 +178,15 @@ TRUNCATED_SUMMARY_NOTE = (
 # findings, reviewer mode has no count cap, and the degraded branch unions all 8 cells.
 MAX_STEP_SUMMARY_BYTES = 900_000
 
-# No claim about WHAT was cut: this note also rides the error-review and no-findings
-# summaries, which carry no severity-ordered list to be cut from.
+# Promises nothing about where the rest is, because there is nowhere honest to point.
+# Echoing the whole payload to stdout was tried and reverted: the budget only fires
+# near 900 KB, and pushing that into the Actions log made the CI job hang for >13
+# minutes against the 8s it takes otherwise — a delivery channel that stalls the run
+# is not a delivery channel. It also has no claim about WHAT was cut: this note rides
+# the error-review and no-findings summaries too, which carry no severity-ordered list.
 STEP_SUMMARY_TRUNCATED_NOTE = (
     "\n\n_…truncated here: this run's job summary reached the Actions per-step size "
-    "limit. The whole of it was echoed to this job's run log._"
+    "limit, so the remainder could not be delivered._"
 )
 
 
@@ -233,10 +237,6 @@ def write_step_summary(markdown: str, note: str = READ_ONLY_SUMMARY_NOTE) -> Non
             "follows.",
             file=sys.stderr,
         )
-        # STEP_SUMMARY_TRUNCATED_NOTE sends the reader to the run log, and this is the
-        # only thing that puts the text there: past the cut it is otherwise absent from
-        # the PR (whose clamp note points here) *and* from the summary.
-        print(payload)
         payload = clamp_to_bytes(payload, budget).rstrip() + STEP_SUMMARY_TRUNCATED_NOTE
     with open(path, "a", encoding="utf-8") as f:
         f.write(payload + "\n")
