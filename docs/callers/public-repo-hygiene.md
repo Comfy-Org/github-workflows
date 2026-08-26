@@ -45,6 +45,8 @@ name: Public Repo Hygiene
 
 on:
   pull_request:
+    # `edited` is LOAD-BEARING, not tidiness — see below.
+    types: [opened, synchronize, reopened, edited]
   push:
     branches: [main]        # or [master] — your default branch
 
@@ -56,6 +58,20 @@ jobs:
     with:
       workflows_ref: <same-full-commit-sha>
 ```
+
+### Why `types:` must include `edited`
+
+The scan covers the PR **title and description** as well as tracked files, because
+both are published the moment they are typed and no file scan can see them.
+
+GitHub's default `pull_request` types are `opened`, `synchronize` and `reopened` —
+and **none of them fire when someone edits the title or body**. Without `edited`,
+a PR can be opened clean, go green, and then have an internal link pasted into its
+description with the required check still showing a pass over text it never read.
+
+The reusable cannot enforce this: `on:` belongs to your caller, and a workflow has
+no way to read the trigger types it was configured with. So it is on this page,
+and it is the one line of the example you should not simplify away.
 
 Then ask a maintainer to add your repo to the `PUBLIC_REPO_HYGIENE_CALLERS` roster secret — the
 pin does not move on its own, and a stale pin means a stale allowlist.

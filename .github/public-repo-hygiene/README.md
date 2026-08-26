@@ -29,6 +29,35 @@ string is scanned in place of the file body. A regular file is read up to `MAX_F
 and no further, and what is *derived* from those bytes is capped too — `MAX_FINDINGS_PER_FILE`
 (200), `MAX_FINDINGS_TOTAL` (2000) and a `MAX_EXCERPT_CHARS` (200) bound on the echoed line, since
 a category-2 finding copies the matched line and the scanned repo controls how long that is.
+
+## Surfaces scanned
+
+Three surfaces, all sharing one matcher (`_line_findings`) so they can never drift apart: a
+tracked file's **contents**, its tracked **path** string (BE-9399), and the **PR title and
+description** (BE-9652).
+
+PR text is scanned when the triggering event carries a pull request. It is published the moment it
+is typed and no file scan can ever see it — both leaks that motivated this were on a public PR of
+`github-workflows` itself: an internal collaboration-tool permalink in a description, and a
+non-public org repo named in a body.
+
+Three properties are deliberate:
+
+- **Categories 2 and 3 only — never category 1.** This org's commit convention *requires* a
+  `(BE-####)` Linear suffix on PR titles, so ticket ids there are org-wide practice, not a leak;
+  half of this repo's own recent merged PR titles carry one. Flagging them would fail roughly every
+  second PR, and a required check that fires on correct behaviour does not get fixed — it gets
+  switched off, taking the two categories that catch real leaks with it. A test pins this.
+- **Read from the event, never from a workflow input.** A caller that could supply the text being
+  judged could supply *different* text. Same reasoning as loading this checker from `workflows_ref`
+  rather than the caller's checkout.
+- **Passed to the checker as file paths, never as argv values.** PR text is unbounded,
+  author-controlled and full of shell metacharacters; the workflow writes it from `env:` to
+  `RUNNER_TEMP` and passes `--scan-text '<label>=<path>'`. Interpolating it into a `run:` body would
+  be the classic Actions script-injection shape.
+
+Findings from these surfaces are reported **before** file findings, so `MAX_FINDINGS_TOTAL` can
+never truncate away the highest-signal, cheapest-to-fix ones.
 Hitting a cap adds a `::warning::` and never softens the verdict: the run still fails.
 
 **Three surfaces, one matcher.** A tracked file publishes *three* strings, not one: its contents,
@@ -175,6 +204,8 @@ category 3 host-aware, which removed the `huggingface.co/Comfy-Org/<model>` fals
 `github.com/` spellings.
 
 - **The scan is line-oriented.** A reference split across two lines is not matched.
+- **A non-public repo named WITHOUT the org prefix is not caught, on any surface.** Category 3 keys on `Comfy-Org/<name>`; a bare `<name>` in prose is indistinguishable from an ordinary word without a list of non-public repo names — and such a list is exactly what cannot live in a public repo. That is the whole reason the allowlist is default-deny over *public* names. Worked example: of the three real leaks that motivated the PR-text surface, it catches the collaboration-tool permalink and the prefixed reference, but **not** a bare `` `<repo>` `` in the same body.
+- **PR text is only re-scanned when the caller's `on:` includes `edited`.** GitHub's default `pull_request` types (`opened`, `synchronize`, `reopened`) do not fire on a title or body edit, so without it a PR can go green and *then* have an internal link pasted into its description. The reusable cannot enforce this — `on:` belongs to the caller, and a workflow cannot read the trigger types it was configured with — so it is documented in [the caller guide](../../docs/callers/public-repo-hygiene.md) instead.
 - **The model-host list is a list, so a new one starts out over-flagging.** Only `huggingface.co` and `hf.co` clear a `Comfy-Org/<name>` reference today. A second model or package host publishing under the same org name is a false positive until it is added to `MODEL_HOST_PREFIX_RE` — the same one-line edit, in the same caller-unreachable file, that adding a repo name is. The routes between host and owner are enumerated for the same reason, so `huggingface.co/somewhere/Comfy-Org/x` is a finding. Both fail toward flagging, never toward silence.
 - **The host has to be the URL's authority, and a userinfo spelling is the accepted cost.** `_AUTHORITY_L` asks for a delimiter (or line start) before the host and consumes the scheme separator, so the one real spelling it turns away is `https://user@huggingface.co/…`, whose host genuinely is allowlisted: `@` is not a delimiter. That fails toward flagging and no corpus instance exists. One residual is documented rather than closed, because closing it costs a real false positive: a host embedded in a **query string** (`?u=huggingface.co/Comfy-Org/x`) still clears, since `=` has to stay a delimiter or a bare `VAR=huggingface.co/…` assignment over-flags.
 - **The markdown-label skip reads a BOUNDED link destination.** The destination is capped (`_MD_LINK_DEST_MAX`), and a capture that reaches the cap is treated as an incomplete read: a name running to the cut is not a whole-segment match, so it does not clear the label. Declining an over-long destination outright would be the wrong direction — real Hugging Face file URLs pass the cap routinely — so a long destination whose name ends before the cut still clears, and a destination whose real length is exactly the cap is reported as cut when it is not, over-flagging on that one length. **Reference-style links are not handled at all**: `[Comfy-Org/<model>][ref]` with the URL defined on another line stays a finding, because resolving link definitions across lines is not something a line-oriented scan can do.
