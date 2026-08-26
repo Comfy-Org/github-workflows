@@ -29,7 +29,9 @@ What is asserted, and why each case is here rather than assumed:
 Run: python3 -m unittest discover -s .github/cursor-review/tests -p 'test_*.py'
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -1002,6 +1004,34 @@ class SurrogateSafeSummaryTest(unittest.TestCase):
     def test_clamp_to_bytes_is_surrogate_safe(self):
         text = json.loads(r'"\ud800"') * 10
         PR.clamp_to_bytes(text, 5).encode("utf-8")
+
+
+class TruncatedSummaryEchoTest(unittest.TestCase):
+    """STEP_SUMMARY_TRUNCATED_NOTE points at the run log; something must put it there."""
+
+    def test_the_whole_payload_reaches_stdout_before_the_cut(self):
+        tail = "THE-TAIL-THAT-THE-FILE-LOSES"
+        markdown = "x" * (PR.MAX_STEP_SUMMARY_BYTES * 2) + tail
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "summary.md")
+            with mock.patch.dict(PR.os.environ, {"GITHUB_STEP_SUMMARY": path}), \
+                 contextlib.redirect_stdout(buf):
+                PR.write_step_summary(markdown)
+            with open(path, encoding="utf-8") as f:
+                written = f.read()
+        self.assertNotIn(tail, written, "the file copy is genuinely cut")
+        self.assertIn("truncated here", written)
+        self.assertIn(tail, buf.getvalue(), "...and the run log carries the whole of it")
+
+    def test_a_summary_under_the_cap_is_not_echoed(self):
+        buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "summary.md")
+            with mock.patch.dict(PR.os.environ, {"GITHUB_STEP_SUMMARY": path}), \
+                 contextlib.redirect_stdout(buf):
+                PR.write_step_summary("the review body")
+        self.assertEqual(buf.getvalue(), "", "no log noise on the ordinary path")
 
 
 class ErrorReviewSummaryContractTest(unittest.TestCase):
