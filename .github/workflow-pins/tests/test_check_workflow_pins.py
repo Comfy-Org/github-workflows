@@ -658,6 +658,141 @@ class GuardCoverageTests(unittest.TestCase):
         )
         self.assertEqual(self._jobs(self.GUARD_WITH_FALLBACK + checkout), [])
 
+    # Every folded spelling below puts the `ref:` key on line 19 of `_wrap`'s
+    # output, which is the line the continuation window reports — so the whole
+    # family shares one expected site.
+    FOLDED_SITE = [(19, True, True, False)]
+
+    # The one-line fallback checkout the folded spellings must agree with.
+    FALLBACK_CHECKOUT = (
+        "      - name: Load assets\n"
+        "        uses: actions/checkout@abc\n"
+        "        with:\n"
+        "          ref: ${{ inputs.workflows_ref || job.workflow_sha }}\n"
+    )
+
+    @staticmethod
+    def _folded(*value_lines):
+        """The fallback checkout with its ref written as a `>-` block scalar."""
+        return (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: >-\n"
+        ) + "".join("            %s\n" % v for v in value_lines)
+
+    def _sites(self, *jobs):
+        return cwp.ref_checkouts(self._wrap(*jobs).split("\n"))
+
+    def test_a_folded_job_workflow_sha_fallback_agrees_with_the_one_line_spelling(self):
+        # A block scalar folds to ONE value at runtime, so every split of the
+        # BE-4169 fallback is the same expression as the one-line spelling and
+        # must earn the same verdict. `_FALLBACK_RES`' continuation form needs
+        # the WHOLE expression in the text it is handed, and the continuation
+        # arm records at the FIRST line mentioning the input — which spelling
+        # (a) leaves mid-expression. Judged one physical line at a time, that
+        # site recorded `uses_fallback=False`, so the fallback guard above it
+        # no longer covered it and the checkout was reported UNGUARDED with
+        # the wrong (bare-input) remedy (BE-9648).
+        spellings = (
+            # (a) trailing split — the mention lands one line ABOVE the close,
+            # which is why folding only over the lines already seen is not
+            # enough and the fold has to read forward.
+            self._folded("${{ inputs.workflows_ref ||", "job.workflow_sha }}"),
+            # (b) leading split — `${{` alone, then the whole expression.
+            self._folded("${{", "inputs.workflows_ref || job.workflow_sha }}"),
+            # (c) split at both — three physical lines, no two of which are
+            # the expression.
+            self._folded("${{", "inputs.workflows_ref ||", "job.workflow_sha }}"),
+        )
+        one_line = self._sites(self.GUARD_WITH_FALLBACK + self.FALLBACK_CHECKOUT)
+        self.assertEqual(one_line, self.FOLDED_SITE)
+        for i, checkout in enumerate(spellings):
+            with self.subTest(spelling="abc"[i]):
+                self.assertEqual(
+                    self._sites(self.GUARD_WITH_FALLBACK + checkout), self.FOLDED_SITE
+                )
+                self.assertEqual(self._jobs(self.GUARD_WITH_FALLBACK + checkout), [])
+
+    def test_a_folded_fallback_as_the_files_last_line_is_still_judged(self):
+        # The forward fold reads lines BELOW the site, so the shape to prove is
+        # the one with nothing below it: the checkout as the last field of the
+        # last step, `rstrip`ped so the scalar's final line is the file's. A
+        # deferred flush would be the fragile design here — this arm records at
+        # its own site, so the walk ending has nothing left to drop.
+        text = self._wrap(
+            self.GUARD_WITH_FALLBACK
+            + self._folded("${{ inputs.workflows_ref ||", "job.workflow_sha }}")
+        ).rstrip()
+        self.assertTrue(text.endswith("job.workflow_sha }}"), text[-40:])
+        self.assertEqual(cwp.ref_checkouts(text.split("\n")), self.FOLDED_SITE)
+
+    def test_a_folded_bare_input_is_not_a_folded_fallback(self):
+        # The negative control the fold must not swallow. `${{
+        # inputs.workflows_ref` / `}}` folds to the BARE input, which a
+        # fallback-strength guard does not cover (see
+        # `test_a_fallback_guard_does_not_cover_a_bare_input_checkout`) — so
+        # the site stays a non-fallback and stays unguarded.
+        checkout = self._folded("${{ inputs.workflows_ref", "}}")
+        self.assertEqual(
+            self._sites(self.GUARD_WITH_FALLBACK + checkout), [(19, False, False, False)]
+        )
+        self.assertEqual(self._jobs(self.GUARD_WITH_FALLBACK + checkout), [19])
+
+    def test_a_folded_weak_fallback_is_not_a_folded_fallback(self):
+        # The other negative control: `|| 'main'` is not `|| job.workflow_sha`.
+        # Folding must judge WHICH expression closed the interpolation, not
+        # merely that one did — this one resolves to a MUTABLE branch whenever
+        # the input is omitted, the exact hole the fallback exists to avoid.
+        checkout = self._folded("${{ inputs.workflows_ref ||", "'main' }}")
+        self.assertEqual(
+            self._sites(self.GUARD_WITH_FALLBACK + checkout), [(19, False, False, False)]
+        )
+        self.assertEqual(self._jobs(self.GUARD_WITH_FALLBACK + checkout), [19])
+
+    def test_a_folded_third_operand_defeats_the_fallback_exemption(self):
+        # `test_a_third_operand_defeats_the_fallback_exemption`'s folded twin,
+        # and the reason the fold is handed to the SAME anchored matcher
+        # rather than to a "contains the fallback" test. Splitting the
+        # expression must not become the way to smuggle a third operand past
+        # an anchor the one-line spelling is held to — this one resolves to
+        # `main` in exactly the pre-v2.334.0 case the fallback exists for.
+        checkout = self._folded(
+            "${{ inputs.workflows_ref ||", "job.workflow_sha || 'main' }}"
+        )
+        self.assertEqual(
+            self._sites(self.GUARD_WITH_FALLBACK + checkout), [(19, False, False, False)]
+        )
+        self.assertEqual(self._jobs(self.GUARD_WITH_FALLBACK + checkout), [19])
+
+    def test_a_blank_line_inside_the_scalar_does_not_end_the_fold(self):
+        # A blank line neither opens nor closes a YAML block, and the runtime
+        # folds right across it — so the fold skips it exactly as the walk
+        # that feeds it does. Reading it as the end of the scalar would strand
+        # the fallback one line short and put the site back where it started.
+        checkout = self._folded("${{ inputs.workflows_ref ||") + (
+            "\n" "            job.workflow_sha }}\n"
+        )
+        self.assertEqual(
+            self._sites(self.GUARD_WITH_FALLBACK + checkout), self.FOLDED_SITE
+        )
+
+    def test_the_forward_fold_stops_at_the_end_of_the_scalar(self):
+        # The fold is bounded by the `ref:` key's own column, exactly as the
+        # continuation window is. An interpolation left open at the end of the
+        # scalar must not reach into the NEXT step to find its close — that
+        # would let an unrelated `job.workflow_sha }}` elsewhere in the job
+        # score this checkout a self-pin it does not have.
+        checkout = self._folded("${{ inputs.workflows_ref ||") + (
+            "      - name: Unrelated\n"
+            "        env:\n"
+            "          NOTE: job.workflow_sha }}\n"
+            "        run: 'true'\n"
+        )
+        self.assertEqual(
+            self._sites(self.GUARD_WITH_FALLBACK + checkout), [(19, False, False, False)]
+        )
+
     def test_a_fallback_guard_does_not_cover_a_bare_input_checkout(self):
         # The strength rule, and the reason `_GUARD_BINDING_RE` records WHICH
         # expression each guard validated. This guard proves only that
@@ -4258,6 +4393,46 @@ class CheckDirTests(unittest.TestCase):
         errors, checked, _, _ = cwp.check_dir(self.dir, exempt=frozenset())
         self.assertEqual(errors, [])
         self.assertEqual(checked, ["folded.yml"])
+
+    def test_a_fallback_split_ACROSS_lines_keeps_the_default_carve_out(self):
+        # The test above puts the whole expression on ONE continuation line.
+        # Split it once more and neither physical line is the expression, so
+        # the carve-out scan saw no self-pin anywhere in the file and the two
+        # contradictory errors came back together: BE-5546's "delete the
+        # `default:`" on line 8 plus BE-8077's unguarded-checkout error, on a
+        # file that self-pins and guards correctly (BE-9648). The fold the
+        # runtime performs is the value both halves have to be asked about.
+        text = (
+            "name: Fixture\n"
+            "on:\n"
+            "  workflow_call:\n"
+            "    inputs:\n"
+            "      workflows_ref:\n"
+            "        type: string\n"
+            "        required: false\n"
+            "        default: ''\n"
+            "jobs:\n"
+            "  check:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - name: Require a resolvable workflows_ref\n"
+            "        env:\n"
+            "          WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}\n"
+            "        run: |\n"
+            '          if [ -z "$WORKFLOWS_REF" ]; then\n'
+            "            exit 1\n"
+            "          fi\n"
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: >-\n"
+            "            ${{ inputs.workflows_ref ||\n"
+            "            job.workflow_sha }}\n"
+        )
+        self._write("split-folded.yml", text)
+        errors, checked, _, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(checked, ["split-folded.yml"])
 
 
     def test_the_github_job_workflow_sha_default_is_no_longer_tolerated(self):

@@ -880,6 +880,47 @@ def _strip_after_carried_quote(line, quote, keep_quote=True):
     return (head + _strip_comment(line[close:])).strip()
 
 
+def _folded_scalar_from(lines, i, parts, stop_indent, plain):
+    """`parts`, read FORWARD from `lines[i]` until its interpolation closes.
+
+    A block scalar folds its physical lines into ONE value at runtime, but
+    `ref_checkouts`' continuation arm records its verdict at the FIRST line
+    that mentions the input — which for `ref: >-` / `${{ inputs.workflows_ref
+    ||` / `job.workflow_sha }}` is one line short of the whole expression. The
+    lines already walked cannot complete it; the ones BELOW can, so read them
+    here instead of deferring the verdict. Folding FORWARD is what makes the
+    verdict stay at its own site, so the caller needs no pending flush and the
+    last field of the last step can never be dropped — the hazard the UNPARSED
+    branch guards separately (BE-9648).
+
+    Reads only while the `${{` is still open AND the scalar has not closed:
+    the first structural line back at or above `stop_indent` — the `ref:`
+    key's own column — ends the window, exactly as it ends the caller's.
+    `plain` picks the same strip the caller's continuation branch picks: a
+    plain scalar's value ends at a ` #`, while a `|`/`>` body carries one as
+    CONTENT. A quoted scalar's carried-quote state is not reconstructible from
+    a lookahead, so it takes the raw reading — the fail-closed one, as it is
+    in the caller's `else`.
+
+    Returns `(parts, joined)`, `parts` a FRESH list: the caller's own
+    continuation record must not gain lines this only PEEKED at, or the next
+    continuation would be folded against text the walk has yet to reach.
+    """
+    parts = list(parts)
+    joined = " ".join(parts)
+    j = i + 1
+    while joined.count("${{") > joined.count("}}") and j < len(lines):
+        nxt = lines[j]
+        j += 1
+        if _is_skippable(nxt):
+            continue
+        if _indent(nxt) <= stop_indent:
+            break
+        parts.append(_strip_comment(nxt) if plain else nxt.strip())
+        joined = " ".join(parts)
+    return parts, joined
+
+
 def _continues_below(lines, i):
     """True when the next structural line is indented deeper than `lines[i]`."""
     indent = _indent(lines[i])
@@ -2776,6 +2817,13 @@ def ref_checkouts(lines, dropped=None):
         # single newline enough to hide the very spelling BE-8215 closed:
         # `ref: >-` / `${{ steps.r.outputs.ref ||` / `'main' }}` matched
         # neither continuation arm and recorded no site.
+        #
+        # Those are the lines ABOVE, which is all the arms below need to
+        # RECOGNIZE a site — a mention anywhere in the fold is one. JUDGING it
+        # can need the lines below as well, because the arm fires at the first
+        # mentioning line and a fallback may finish after it, so the
+        # fallback-strength read folds FORWARD from here too
+        # (`_folded_scalar_from`, BE-9648).
         pending_parts = []
         for i, line in _block_body(lines, start, job_indent):
             if open_quote is not None and _indent(line) <= open_quote_indent:
@@ -2815,6 +2863,29 @@ def ref_checkouts(lines, dropped=None):
                         # key never holds the expression, so asking it whether
                         # this is a fallback always answered no.
                         fallback = _pins_to_job_workflow_sha(line)
+                        if not fallback:
+                            # The single-line answer stands FIRST, so the
+                            # one-line spelling behaves byte for byte as it
+                            # did and the fold can only ever ADD the fallback.
+                            # Then judge the FOLDED value: a block scalar may
+                            # split `${{ inputs.workflows_ref ||
+                            # job.workflow_sha }}` across physical lines, and
+                            # `_FALLBACK_RES`' continuation form needs the
+                            # WHOLE expression in the text it is handed. So a
+                            # folded fallback recorded `uses_fallback=False`,
+                            # was then reported unguarded with the bare-input
+                            # remedy — and where every site in a file folded,
+                            # `check_dir` lost the `default: ''` carve-out
+                            # too, both at once (BE-9648). The lines above are
+                            # not enough on their own: this arm fires at the
+                            # first MENTIONING line, which the trailing-split
+                            # spelling leaves mid-expression, so the fold has
+                            # to read forward.
+                            parts, folded = _folded_scalar_from(
+                                lines, i, pending_parts, pending[1], pending[2]
+                            )
+                            if len(parts) > 1:
+                                fallback = _pins_to_job_workflow_sha(folded)
                         guarded = guarded_input or (fallback and guarded_fallback)
                         # The same leading-operand rule the one-line arm below
                         # applies: `ref: ${{ 'main' ||` / `inputs.workflows_ref
