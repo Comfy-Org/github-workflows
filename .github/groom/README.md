@@ -774,6 +774,10 @@ ecosystems. Matching is **case-insensitive** — macOS/Windows CI runners resolv
 - The list is a conservative **default, not a proof of completeness** — over-block
   is safe (a false positive only downgrades a PR to an issue), under-block is the
   hole. A repo whose CI runs something else privileged must add it here first.
+- It also denies **owner-gated dataset-of-record paths** (BE-9609) — graded eval
+  cases under `suites/*/cases/*.y*ml`, whose merge publishes immutable case
+  versions reserved for the dataset owner — so any caller with such a tree gets
+  the downgrade-to-issue treatment for free, no configuration needed.
 
 ```bash
 python3 -m unittest discover -s .github/groom/tests -p test_patch_policy.py -v

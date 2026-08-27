@@ -22,7 +22,10 @@ name: Groom (reusable)
 # Patch-path policy (BE-4404): a builder patch that touches a CI-privileged path
 # (workflow/action defs, dependency lockfiles, package manifests, build/test
 # config) is downgraded from a PR to a filed issue — that code would execute in
-# credentialed pre-review CI. The deny-list is the tested `.github/groom/
+# credentialed pre-review CI. The same downgrade covers owner-gated
+# dataset-of-record paths (BE-9609): graded eval cases under `suites/*/cases/`,
+# whose merge publishes immutable versions reserved for the dataset owner. The
+# deny-list is the tested `.github/groom/
 # patch_policy.py`. STRUCTURAL LIMIT: the deny-list guards privileged-CONFIG
 # surfaces, but ANY patch's source still executes when the caller's CI runs its
 # tests — a review-gated PR is still untrusted code running before merge. Callers
@@ -2869,8 +2872,8 @@ jobs:
             # arbitrary workflow commands. `tr -d '\000-\037'` drops all C0 controls
             # (newlines are already spaces by then); this line is human-readable only,
             # the authoritative deny already happened above.
-            echo "::warning::Build $IDX patch edits CI-privileged file(s) [$(echo "$TOUCHED_CI" | tr '\n' ' ' | tr -d '\000-\037')] — refusing to auto-open a PR that would run in credentialed CI before human review; filing an issue instead."
-            bail "patch modifies a CI-privileged path (per .github/groom/patch_policy.py — workflow/action defs, lockfiles, or build/test config that executes in pre-review CI) — a human must author these changes"
+            echo "::warning::Build $IDX patch edits CI-privileged or dataset-of-record file(s) [$(echo "$TOUCHED_CI" | tr '\n' ' ' | tr -d '\000-\037')] — refusing to auto-open a PR for a path a human must author; filing an issue instead."
+            bail "patch modifies a CI-privileged or dataset-of-record path (per .github/groom/patch_policy.py — workflow/action defs, lockfiles, build/test config that executes in pre-review CI, or graded eval cases under suites/*/cases/) — a human must author these changes"
           elif [ "$CHANGED" -gt "$PR_SIZE_LIMIT" ]; then
             echo "::warning::Build $IDX patch changed $CHANGED lines (> $PR_SIZE_LIMIT) — filing an issue instead of a giant PR."
             bail "patch too large: ${CHANGED} lines changed (> ${PR_SIZE_LIMIT})"

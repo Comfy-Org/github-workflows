@@ -191,6 +191,31 @@ class PanelHardeningTest(unittest.TestCase):
             self.assertTrue(denied(p), p)
 
 
+class DatasetOfRecordTest(unittest.TestCase):
+    """Owner-gated dataset-of-record paths (BE-9609): graded eval cases under
+    `suites/*/cases/` whose merge publishes immutable versions — denied so a
+    human authors the change, not the builder."""
+
+    def test_dataset_of_record_cases(self):
+        for p in (
+            "suites/agent/cases/foo.yaml",
+            "suites/cloud-mcp/cases/x.yml",
+            "suites/creative/cases/deep/y.yaml",   # any depth under cases/
+            "sub/suites/a/cases/b.yaml",           # segment-anchored, nested tree
+            "SUITES/Agent/CASES/z.YAML",           # case-insensitive
+        ):
+            self.assertTrue(denied(p), p)
+        for p in (
+            "suites/cloud-mcp/driver-claude-mcp.yaml",  # suite config, not a case
+            "suites/agent/README.md",
+            "suites/agent/cases/README.md",             # not YAML
+            "cases/foo.yaml",                           # missing suites/ segment
+            "suites/cases/foo.yaml",                    # missing suite segment
+            "packages/x/suites/agent/cases.yaml",       # cases.yaml file, not cases/ dir
+        ):
+            self.assertFalse(denied(p), p)
+
+
 class ApiGuardTest(unittest.TestCase):
     """`denied_paths` must reject a bare str/bytes (a silent character-iteration footgun)."""
 

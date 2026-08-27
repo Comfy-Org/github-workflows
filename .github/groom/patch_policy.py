@@ -8,7 +8,10 @@ push runs the caller's CI (with repository secrets + a writable token) BEFORE an
 human reads the diff. So a patch that touches a path the caller's pre-review CI
 *executes* is a code-execution primitive, not a doc change. This module is the
 deny-list that downgrades such a patch from an auto-PR to a filed issue (a human
-authors the privileged change instead).
+authors the privileged change instead). It also covers owner-gated
+**dataset-of-record** paths (BE-9609): graded eval cases whose merge publishes
+immutable versions and whose changes are reserved for the dataset owner — not a
+CI-execution risk, but the same downgrade-to-issue treatment.
 
 `denied_paths(paths)` returns the subset of changed paths that are CI-privileged;
 `main()` reads NUL-delimited paths from stdin (the `git diff --cached
@@ -140,6 +143,17 @@ _PATH_SUFFIXES = (
     r"\.cargo/config",
 )
 
+# Dataset-of-record paths (BE-9609). NOT CI-privileged — these are graded eval
+# cases whose merge triggers a caller's importer that publishes IMMUTABLE case
+# versions (and retires keys whose `id:` changed), a change class that caller's
+# conventions reserve for the dataset owner. A builder patch here is downgraded
+# to an issue so a human authors it. Segment-anchored so a nested `suites/` tree
+# is covered too; any depth under `cases/` (the importer only reads one level,
+# but erring wide is the safe direction).
+_DATASET_OF_RECORD_REGEXES = (
+    r"suites/[^/]+/cases/.+\.ya?ml",
+)
+
 # Basename globs (`*` = any run of non-`/` chars), privileged at ANY depth.
 _BASENAME_GLOBS = (
     "requirements*.txt",  # requirements.txt, requirements-dev.txt, ...
@@ -177,6 +191,7 @@ _PATTERN = re.compile(
         + [rf"(?:^|/){re.escape(b)}$" for b in _BASENAMES]
         + [rf"(?:^|/){_glob_to_regex(g)}$" for g in _BASENAME_GLOBS]
         + [rf"(?:^|/){s}$" for s in _PATH_SUFFIXES]
+        + [rf"(?:^|/){r}$" for r in _DATASET_OF_RECORD_REGEXES]
     ),
     re.IGNORECASE,
 )
