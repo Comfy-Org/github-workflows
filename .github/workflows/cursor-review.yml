@@ -10,6 +10,21 @@ name: Cursor Review (reusable)
 # thin caller — they don't carry copies of the review logic, so there's no
 # drift to keep in sync.
 #
+# Credential isolation (same two-job split pr-size.yml uses). The invariant:
+# NO job both checks out PR code and holds a write-scoped credential. The jobs
+# that check out PR code and run cursor-agent over it — `review` and
+# `consolidate` — hold `contents: read` and nothing else; the consolidated
+# review is posted from a separate `post-review` job that checks out NO PR code
+# and receives its payload as an artifact. The two jobs that DO carry
+# `pull-requests: write` and the BOT_APP_PRIVATE_KEY mint — `post-review` and
+# `over-cap-comment` — check out nothing but this repo's pinned assets. The
+# panel and the judge run `cursor-agent --print --trust` without `--sandbox`,
+# and print mode can use write and shell tools, so a prompt-injected model could
+# rewrite the assets checkout or a downloaded action inside its own job; on a
+# fresh runner with a fresh pinned checkout there is nothing tampered for the
+# minted token to meet. `.github/cursor-review/tests/test_workflow_job_isolation.py`
+# pins this.
+#
 # Caller pattern (place in source repo at .github/workflows/ci-cursor-review.yml):
 #
 #   name: CI - Cursor Review
@@ -818,7 +833,7 @@ jobs:
     permissions:
       contents: read
       # For the GITHUB_TOKEN fallback below. Not a new demand on callers:
-      # `consolidate` already requires this exact scope to post the review, so
+      # `post-review` already requires this exact scope to post the review, so
       # every caller that can run this workflow at all already grants it.
       pull-requests: write
     env:
@@ -1503,6 +1518,11 @@ jobs:
   consolidate:
     # Adjudicates the 8 cell artifacts into one consolidated review.
     # Calls cursor-agent one more time as the judge, with prompt-judge.md.
+    #
+    # Holds no write credential: the payload is handed to the `post-review` job
+    # below as an artifact, and that job does the mint + post. See the header's
+    # "Credential isolation" note for why the judge must not share a job with
+    # a write-scoped token.
     name: Consolidate panel
     needs: [gate, diff-size, preflight, review, ledger]
     if: always() && needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true' && needs.review.result != 'skipped'
@@ -1520,18 +1540,20 @@ jobs:
     #
     # Deliberately longer than the `Run judge` step cap below, same idiom as
     # the `ledger` job: raising the JOB cap alone would only move the cliff,
-    # since a job-level kill takes `Build consolidated findings file` and
-    # `Post review` with it and is the one failure mode that can never reach
+    # since a job-level kill takes `Build consolidated findings file` and the
+    # payload upload with it and is the one failure mode that can never reach
     # the degraded panel-union fallback. The step trips first and is absorbed,
     # so a hung judge costs the adjudication, not the panel. The slack over
     # the step (10m) covers this job's own overhead — a `fetch-depth: 0`
-    # checkout, the CLI install, three artifact downloads and the post — which
-    # a panel cell does not all pay, so the judge's effective MODEL budget is
-    # the step cap, not this one.
+    # checkout, the CLI install, three artifact downloads and the upload —
+    # which a panel cell does not all pay, so the judge's effective MODEL
+    # budget is the step cap, not this one.
     timeout-minutes: 40
+    # contents: read ONLY. This job checks out PR-authored code and runs the
+    # judge agent over it, so it must carry nothing write-scoped — `post-review`
+    # below holds pull-requests: write and the bot credentials instead.
     permissions:
       contents: read
-      pull-requests: write
     steps:
       - name: Checkout PR repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1880,6 +1902,178 @@ jobs:
             echo "triggered_by=$GH_ACTOR" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Bundle consolidate outputs
+        # Hand the review payload to the isolated `post-review` job below.
+        # The step outputs ride in a small JSON file rather than as job outputs
+        # so a single artifact download reconstitutes everything that job needs.
+        # `ledger_download` travels with them because the ledger banner asks two
+        # separate questions — did the JUDGE get prior-round context (this job's
+        # download), and can the poster READ the note (its own download).
+        # `degraded` is diagnostic: the review's own degradation banner keys on
+        # `judge_status`, so this only ever reaches the run log.
+        env:
+          JUDGE_STATUS: ${{ steps.consolidated.outputs.judge_status }}
+          CONSOLIDATED_COUNT: ${{ steps.consolidated.outputs.consolidated_count }}
+          DEGRADED: ${{ steps.consolidated.outputs.degraded }}
+          TRIGGERED_BY: ${{ steps.triggerer.outputs.triggered_by }}
+          LEDGER_DOWNLOAD: ${{ steps.ledger_download.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+
+          # Collapse newlines: every value below is written back out as one
+          # `key=value` GITHUB_OUTPUT line in the post job, and triggered_by is
+          # derived from PR data, so a smuggled newline must not become a second
+          # line there.
+          def one_line(value):
+              return " ".join(value.splitlines()).strip()
+
+          meta = {
+              key.lower(): one_line(os.environ.get(key, ""))
+              for key in (
+                  "JUDGE_STATUS",
+                  "CONSOLIDATED_COUNT",
+                  "DEGRADED",
+                  "TRIGGERED_BY",
+                  "LEDGER_DOWNLOAD",
+              )
+          }
+          with open("/tmp/consolidated-meta.json", "w", encoding="utf-8") as f:
+              json.dump(meta, f)
+          print(json.dumps(meta, indent=2))
+          PY
+
+      - name: Upload consolidated review payload
+        # An artifact, not job outputs: the job holding the bot write-token must
+        # never run in the same context as the PR checkout and the judge agent.
+        # Deliberately NOT `if: always()` — a consolidate that died before this
+        # step produced no review to post, and `post-review` says so loudly
+        # rather than posting a half-built one.
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: cursor-review-consolidated
+          path: |
+            /tmp/consolidated.json
+            /tmp/judge-findings.json
+            /tmp/consolidated-meta.json
+          if-no-files-found: error
+          retention-days: 7
+
+  post-review:
+    # Posts the ONE consolidated review on the PR, under the bot identity when
+    # the caller configured one.
+    #
+    # This is the write half of the credential split described in the header.
+    # It checks out NO PR code — just this repo's assets at the pinned
+    # `workflows_ref`, plus artifacts. Both untrusted inputs it renders (the consolidated
+    # findings, the reviewed diff) are downloaded, not re-derived from a
+    # checkout, and the diff comes from the `pr-diff` artifact `diff-size`
+    # published rather than from the copy the judge job had shell access to.
+    name: Post review
+    needs: [consolidate, ledger]
+    # always(): the interesting cases include a judge that never submitted, so
+    # this runs whenever `consolidate` actually ran. `!= 'cancelled'` keeps a
+    # superseded run (the documented caller sets cancel-in-progress) from
+    # posting over a newer one.
+    if: always() && needs.consolidate.result != 'skipped' && needs.consolidate.result != 'cancelled'
+    runs-on: ubuntu-latest
+    # Three artifact downloads, a token mint, and post-review.py's ONE
+    # `gh api POST /pulls/N/reviews` carrying every inline comment in a single
+    # payload — minutes of work at most. Bounded like every other job here so a
+    # rate-limited or hung call cannot hold a runner for the 6-hour default.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Require a pinned workflows_ref
+        # workflows_ref has no default on purpose. GitHub does NOT enforce
+        # `required: true` for workflow_call inputs, so an omitted input arrives
+        # as '' and actions/checkout would silently fall back to this repo's
+        # default branch — running MUTABLE scripts under a pin that claims
+        # otherwise. Fail fast instead. (BE-5546)
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+        run: |
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form, and echo only that: dropping
+          # newlines also stops a multi-line value from smuggling a ::workflow
+          # command:: into the log, and from satisfying the line-oriented grep
+          # below on one 40-hex line among many.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
+            exit 1
+          fi
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
+          fi
+
+      - name: Load cursor-review assets
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _cursor_review_assets
+          persist-credentials: false
+
+      - name: Download consolidated review payload
+        id: payload
+        # Tolerated here so the guard below can name the real cause; a bare
+        # download failure reads as "artifact plumbing broke" when what actually
+        # happened is upstream.
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: cursor-review-consolidated
+          path: /tmp/consolidated
+
+      - name: Require the consolidated payload
+        if: steps.payload.outcome != 'success'
+        run: |
+          echo "::error::The consolidate job did not publish cursor-review-consolidated, so there is no review to post — see that job for the failure."
+          exit 1
+
+      - name: Download reviewed diff
+        # The same generated-file-excluded diff the panel and the judge read,
+        # taken from `diff-size`'s artifact — post-review.py anchors its inline
+        # comments against it, so this job needs no PR checkout.
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: pr-diff
+          path: /tmp
+
+      - name: Download prior-review ledger
+        id: ledger_download
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: cursor-review-ledger
+          path: /tmp/ledger
+
+      - name: Read consolidate outputs
+        id: meta
+        run: |
+          python3 - <<'PY'
+          import json, os
+
+          with open("/tmp/consolidated/consolidated-meta.json", encoding="utf-8") as f:
+              meta = json.load(f)
+          print(json.dumps(meta, indent=2))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as g:
+              # `degraded` is deliberately absent: it is diagnostic, printed
+              # above with the rest of the payload, and no step below reads it.
+              for key in (
+                  "judge_status",
+                  "consolidated_count",
+                  "triggered_by",
+                  "ledger_download",
+              ):
+                  value = " ".join(str(meta.get(key, "")).splitlines()).strip()
+                  g.write(f"{key}={value}\n")
+          PY
+
       - name: Mint bot-identity token (optional)
         id: bot_token
         if: ${{ inputs.bot_app_id != '' }}
@@ -1895,11 +2089,14 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          TRIGGERED_BY: ${{ steps.triggerer.outputs.triggered_by }}
-          JUDGE_STATUS: ${{ steps.consolidated.outputs.judge_status }}
-          CONSOLIDATED_COUNT: ${{ steps.consolidated.outputs.consolidated_count }}
+          TRIGGERED_BY: ${{ steps.meta.outputs.triggered_by }}
+          JUDGE_STATUS: ${{ steps.meta.outputs.judge_status }}
+          CONSOLIDATED_COUNT: ${{ steps.meta.outputs.consolidated_count }}
           LEDGER_STATUS: ${{ needs.ledger.outputs.status }}
+          # This job's own download (can the poster READ the note) …
           LEDGER_DOWNLOAD: ${{ steps.ledger_download.outcome }}
+          # … and the consolidate job's (did the JUDGE get prior-round context).
+          LEDGER_DOWNLOAD_JUDGE: ${{ steps.meta.outputs.ledger_download }}
         run: |
           # Prior-review ledger line for the review header: either the
           # round/ledger summary, or the "context unavailable" banner naming the
@@ -1908,17 +2105,19 @@ jobs:
           # first-round review.
           #
           # The DELIVERY of the ledger is checked separately from its CONTENT.
-          # Both downloads are continue-on-error, so an upload or download that
-          # failed leaves no ledger-note.txt while the ledger job still reports
-          # status=ok — and the panel prompts were spliced with an EMPTY block.
-          # Reading only LEDGER_STATUS there would emit no banner and the
+          # Every ledger download is continue-on-error, so an upload or download
+          # that failed leaves no ledger-note.txt while the ledger job still
+          # reports status=ok — and the panel prompts were spliced with an EMPTY
+          # block. Reading only LEDGER_STATUS there would emit no banner and the
           # context-free re-review would render as a genuine first round, the
           # exact partial failure the banner exists to catch. So: file ABSENT
           # (delivery failed) is a banner; file PRESENT but empty is a real
           # "nothing to say" (first round / kill switch / no prior findings).
           LEDGER_NOTE=""
-          if [ "${LEDGER_DOWNLOAD:-failure}" != "success" ] || [ ! -f /tmp/ledger/ledger-note.txt ]; then
-            LEDGER_NOTE="⚠️ prior-review context unavailable (ledger artifact did not reach the consolidate job: download=${LEDGER_DOWNLOAD:-missing}) — the panel ran without prior-round context, so findings may repeat earlier rounds."
+          if [ "${LEDGER_DOWNLOAD:-failure}" != "success" ] \
+            || [ "${LEDGER_DOWNLOAD_JUDGE:-failure}" != "success" ] \
+            || [ ! -f /tmp/ledger/ledger-note.txt ]; then
+            LEDGER_NOTE="⚠️ prior-review context unavailable (ledger artifact did not reach the review jobs: judge=${LEDGER_DOWNLOAD_JUDGE:-missing}, post=${LEDGER_DOWNLOAD:-missing}) — the panel ran without prior-round context, so findings may repeat earlier rounds."
           else
             LEDGER_NOTE="$(cat /tmp/ledger/ledger-note.txt)"
             if [ -z "$LEDGER_NOTE" ]; then
@@ -1938,7 +2137,7 @@ jobs:
           # 3. Judge failed, no findings       → honest error review.
           if [ "$JUDGE_STATUS" = "ok" ]; then
             python3 "$CURSOR_REVIEW_ASSETS/post-review.py" \
-              --findings /tmp/consolidated.json \
+              --findings /tmp/consolidated/consolidated.json \
               --pr-number "$PR_NUMBER" \
               --repo "$REPO" \
               --commit-sha "$HEAD_SHA" \
@@ -1955,7 +2154,7 @@ jobs:
             # un-adjudicated panel review is posted. That review is the whole point of
             # this branch.
             python3 "$CURSOR_REVIEW_ASSETS/post-review.py" \
-              --findings /tmp/consolidated.json \
+              --findings /tmp/consolidated/consolidated.json \
               --pr-number "$PR_NUMBER" \
               --repo "$REPO" \
               --commit-sha "$HEAD_SHA" \
@@ -1977,9 +2176,9 @@ jobs:
             # MAX_ARG_STRLEN, so say it HERE instead — the marker is appended only when
             # the cut actually fired. (Command substitution also strips trailing
             # newlines and cannot carry NUL; neither changes what the reader is told.)
-            JUDGE_ERROR=$(python3 -c "import json; e = str(json.load(open('/tmp/judge-findings.json')).get('error', '(no error message)')).encode('utf-8', 'replace'); cut = e[:100000]; print(cut.decode('utf-8', 'ignore') + ('' if len(cut) == len(e) else ' …(truncated: the error message exceeded the 100 KB argument budget)'))")
+            JUDGE_ERROR=$(python3 -c "import json; e = str(json.load(open('/tmp/consolidated/judge-findings.json')).get('error', '(no error message)')).encode('utf-8', 'replace'); cut = e[:100000]; print(cut.decode('utf-8', 'ignore') + ('' if len(cut) == len(e) else ' …(truncated: the error message exceeded the 100 KB argument budget)'))")
             python3 "$CURSOR_REVIEW_ASSETS/post-review.py" \
-              --findings /tmp/consolidated.json \
+              --findings /tmp/consolidated/consolidated.json \
               --pr-number "$PR_NUMBER" \
               --repo "$REPO" \
               --commit-sha "$HEAD_SHA" \
@@ -2068,7 +2267,7 @@ jobs:
 
   notify-complete:
     name: Notify complete
-    needs: [gate, diff-size, review, consolidate]
+    needs: [gate, diff-size, review, consolidate, post-review]
     if: always() && needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true' && needs.review.result != 'skipped'
     runs-on: ubuntu-latest
     permissions:
@@ -2136,16 +2335,26 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_URL: ${{ github.event.pull_request.html_url }}
           CONSOLIDATE_RESULT: ${{ needs.consolidate.result }}
+          POST_REVIEW_RESULT: ${{ needs.post-review.result }}
         run: |
           chmod +x "$CURSOR_REVIEW_ASSETS/slack-notify.sh"
-          if [ "$CONSOLIDATE_RESULT" = "success" ]; then
+          # Keyed on the POST job, not on consolidate: since the credential
+          # split it is `post-review` that puts the review on the PR, so a green
+          # consolidate alone no longer justifies "one consolidated review is on
+          # the PR". The two failures are distinguished so the DM says which
+          # half broke.
+          if [ "$POST_REVIEW_RESULT" = "success" ]; then
             STATUS="success"
             TITLE="Cursor review complete"
             DETAIL="One consolidated review is on the PR."
-          else
+          elif [ "$CONSOLIDATE_RESULT" != "success" ]; then
             STATUS="warning"
             TITLE="Cursor review failed to post"
             DETAIL="Consolidate step did not succeed — see the run for details."
+          else
+            STATUS="warning"
+            TITLE="Cursor review failed to post"
+            DETAIL="The panel consolidated, but the post-review job did not succeed — see the run for details."
           fi
           MSG="*${PR_TITLE}*"$'\n'"${PR_URL}"$'\n'"${DETAIL}"
           "$CURSOR_REVIEW_ASSETS/slack-notify.sh" \

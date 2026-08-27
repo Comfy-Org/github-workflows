@@ -3369,7 +3369,7 @@ class GuardCoverageTests(unittest.TestCase):
             self.assertEqual(cwp.find_unguarded_ref_checkouts(lines), [], name)
         self.assertEqual(
             seen,
-            16,
+            17,
             "expected the 12 guarded sites BE-5546 fixed + pr-size.yml's (BE-5858) "
             "+ cursor-review.yml's preflight (hard guard) site picked up merging "
             "main + cursor-review.yml's diff-size job's check-pr-size-tool "
@@ -3382,7 +3382,10 @@ class GuardCoverageTests(unittest.TestCase):
             "groom.yml's 7 sites name the input directly, via the "
             "`|| job.workflow_sha` fallback — and are clean because each one "
             "carries its guard, which BE-8077 made load-bearing rather than "
-            "exempt.",
+            "exempt. The 17th is cursor-review.yml's `post-review` job: the "
+            "credential split gave the review post its own checkout-free job, "
+            "which loads the assets from `workflows_ref` itself and therefore "
+            "carries its own copy of the guard.",
         )
 
     WORKFLOWS_DIR = os.path.normpath(

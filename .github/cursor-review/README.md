@@ -54,6 +54,21 @@ skipped if no Slack token is configured). A skip for the diff-size cap is
 announced on the PR rather than passing for a clean review — see [Over the
 diff-size cap](#over-the-diff-size-cap).
 
+**Post review is its own job, and that is a security boundary.** No job both
+checks out PR code and holds a write-scoped credential. Every job that checks out
+PR code and runs `cursor-agent` over it — the 8 panel cells and the judge's
+`Consolidate panel` — holds `contents: read` and nothing else. They hand their
+result to `Post review` as an artifact; that job checks out no PR code, loads
+only this directory's scripts from the pinned `workflows_ref`, and carries
+`pull-requests: write` plus the review bot's App-key mint (as does the
+over-the-cap comment job, which likewise checks out nothing).
+The panel and the judge run `--print --trust` with no `--sandbox`, and
+print mode can use write and shell tools — so a model steered by a malicious diff
+could rewrite the assets checkout or a downloaded action *inside its own job*. On
+a fresh runner with a fresh pinned checkout there is nothing tampered left for the
+minted token to meet. `tests/test_workflow_job_isolation.py` pins the property, and
+[`pr-size.yml`](../workflows/pr-size.yml) uses the identical split for its comment job.
+
 ### The panel
 
 | Lab | Model (Cursor catalog) |
