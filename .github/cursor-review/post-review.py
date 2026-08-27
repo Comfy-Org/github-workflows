@@ -699,6 +699,32 @@ def load_anchors(diff_path):
     return anchors
 
 
+def drop_unterminated_comment(cut: str) -> str:
+    """Remove a trailing `<!--` the size clamp left with no `-->` to close it.
+
+    A CommonMark HTML block opened by `<!--` ends only at `-->`, so a cut landing inside
+    the body-only sentinel's JSON does not merely lose the sentinel — GitHub swallows
+    everything after the dangling opener as part of the unterminated comment, including
+    clamp_review_body's own "as much of it as fits is in the job summary" note. The
+    review then renders as a header with no visible findings and no explanation of why.
+
+    Fixed HERE rather than by giving the sentinel a byte budget at render time, because
+    a budget cannot actually promise this: whether the sentinel survives depends on how
+    much body precedes it, which render_body_only_findings does not know. The clamp is
+    the one place that knows where the cut lands, and closing it here covers every HTML
+    comment in every posted body rather than the one we happen to be thinking about.
+
+    Dropping the fragment is safe on its own terms: the section's prose marker sits
+    ABOVE the sentinel, so a cut deep enough to reach it still leaves build-ledger.py
+    the evidence that findings WERE demoted, and that round degrades loudly instead of
+    reading as a round that found nothing.
+    """
+    opener = cut.rfind("<!--")
+    if opener == -1 or "-->" in cut[opener:]:
+        return cut
+    return cut[:opener].rstrip()
+
+
 def clamp_review_body(body: str, limit: int = MAX_REVIEW_BODY_CHARS) -> str:
     """Trim a review body to GitHub's size limit, saying where it was cut.
 
@@ -716,7 +742,7 @@ def clamp_review_body(body: str, limit: int = MAX_REVIEW_BODY_CHARS) -> str:
     if limit <= len(note):
         # Degenerate limit (tests, a future tightening): the cut still has to hold.
         return body[:limit]
-    return body[: limit - len(note)].rstrip() + note
+    return drop_unterminated_comment(body[: limit - len(note)].rstrip()) + note
 
 
 # Every line ending CommonMark recognizes. `\r` alone is one of them, so a blockquote
@@ -791,6 +817,16 @@ def defang_body_only_contract(text: str) -> str:
 
     A zero-width space is invisible where the text is rendered for a human and defeats
     both literals, so what was quoted still reads exactly as it arrived.
+
+    This only works because the READER matches both halves as exact literals too. While
+    its sentinel pattern still tolerated whitespace runs, `…body-only-findings\\tv1` was
+    a spelling that satisfied the reader and carried none of the literal replaced here —
+    undefanged, and accepted. The reader is pinned to the single-spaced opener for that
+    reason, and test_build_ledger.py pins the two spellings together.
+
+    Belt and braces, not the only control: build-ledger.py ALSO refuses the error-review
+    shape outright, which is what covers error reviews already sitting on consumer PRs
+    from before this existed — bodies no writer-side change can reach.
     """
     return text.replace(
         BODY_ONLY_SENTINEL_PREFIX,
@@ -1322,11 +1358,23 @@ def main():
     # degradation for a round on which EVERY finding is body-only, so a fallback-posted
     # round read as a review that found nothing and the round after it looked like a
     # first round. The marker alone costs a sentence and keeps the disclosure honest.
-    fallback_body = (
-        prose_body
-        + f"\n\n_(Inline comments {BODY_ONLY_PROSE_MARKER}, so every finding is listed "
-        "above instead. None of them has a review thread, so there is nowhere to "
+    #
+    # It goes in the HEAD, for exactly the reason the section marker had to move above
+    # the sentinel: clamp_review_body cuts the TAIL. Appended after the findings the
+    # note was the FIRST thing any clamp took, so a fallback over MAX_REVIEW_BODY_CHARS
+    # posted without it and the silent round came straight back — on the one path where
+    # EVERY finding is body-only, and a reachable one: this body carries every finding
+    # at its full length, with no count cap on the un-adjudicated panel path.
+    # review_head is finding-independent and bounded (a header, a count, a severity
+    # table, a panel summary), so the note sits within a few hundred chars of the top
+    # and outlives every cut that leaves a body at all.
+    fallback_head = review_head + (
+        f"\n\n_(Inline comments {BODY_ONLY_PROSE_MARKER}, so every finding is listed "
+        "below instead. None of them has a review thread, so there is nowhere to "
         "reply to one or resolve it.)_"
+    )
+    fallback_body = render_findings_markdown(
+        fallback_head, [i["comment"] for i in enriched]
     )
     clamped_fallback = clamp_review_body(fallback_body)
     fallback_payload = json.dumps(

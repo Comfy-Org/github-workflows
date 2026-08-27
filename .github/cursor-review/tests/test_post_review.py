@@ -528,6 +528,40 @@ class BodyBudgetTest(unittest.TestCase):
         self.assertIn(PROSE_MARKER, fallback["body"])
         self.assertNotIn(PR.BODY_ONLY_SENTINEL_PREFIX, fallback["body"], "no sentinel here")
 
+    def test_the_fallback_s_marker_survives_the_clamp_that_cuts_the_findings(self):
+        """The round-1 fix put the marker at the TAIL of the fallback body, and
+        clamp_review_body cuts the tail — so the note was the FIRST thing any clamp
+        took, on the one path where EVERY finding is body-only. The round then read as
+        a review that found nothing and the round after it looked like a first round:
+        exactly the silence this PR exists to remove, reached through the cut that
+        actually happens rather than a hypothetical one.
+
+        It is reachable: prose_body carries every finding at its full length with no
+        count cap on the un-adjudicated panel path, so a few long findings overrun
+        MAX_REVIEW_BODY_CHARS on their own. The findings below do that — no clamp limit
+        is passed in, the real one applies.
+        """
+        big = "x" * 19000
+        findings = [finding("app.py", 11, body="anchorable " + big)]
+        findings += [finding("app.py", 900 + n, body=f"demoted {n} " + big) for n in range(5)]
+        posted = EndToEndPostTest().run_main(
+            findings, post_returncode=1, stderr="gh: Unprocessable Entity (HTTP 422)"
+        )
+        fallback = posted[1]["body"]
+        self.assertGreater(
+            len("".join(f["body"] for f in findings)), PR.MAX_REVIEW_BODY_CHARS,
+            "the findings really do overrun the limit",
+        )
+        self.assertEqual(len(fallback), PR.MAX_REVIEW_BODY_CHARS, "and the clamp really fired")
+        self.assertIn(PROSE_MARKER, fallback, "the disclosure outlived the cut")
+        # Not merely present — present because it is near the HEAD, ahead of every
+        # finding. A marker that only happens to survive is the shape that regressed.
+        self.assertLess(
+            fallback.index(PROSE_MARKER), 2000,
+            "the marker sits in the finding-independent head, not after the findings",
+        )
+        self.assertIn("job summary", fallback, "and the clamp still says where the rest went")
+
     def test_no_finding_is_rendered_twice_in_the_fallback(self):
         posted = EndToEndPostTest().run_main(
             [
@@ -540,6 +574,57 @@ class BodyBudgetTest(unittest.TestCase):
         body = posted[1]["body"]
         self.assertEqual(body.count("anchored one"), 1)
         self.assertEqual(body.count("demoted one"), 1)
+
+
+class DanglingCommentClampTest(unittest.TestCase):
+    """A cut landing inside an HTML comment must not swallow the rest of the body.
+
+    A CommonMark HTML block opened by `<!--` ends only at `-->`. So a clamp that cuts
+    mid-sentinel does not merely lose the sentinel: GitHub renders everything after the
+    dangling opener as comment, including clamp_review_body's OWN note saying where the
+    rest of the review went. The review then shows a header, no findings, and no
+    explanation. The clamp is the only place that knows where the cut lands, so it is
+    the only place that can promise this.
+    """
+
+    def _sentinel(self, items):
+        payload = ",".join(
+            '{"path":"a.py","line":%d,"severity":"low","body":"%s"}' % (n, "x" * 400)
+            for n in range(items)
+        )
+        return "<!-- cursor-review:body-only-findings v1 [" + payload + "] -->"
+
+    def test_a_cut_inside_a_comment_leaves_no_unterminated_opener(self):
+        body = "HEADER\n\n" + self._sentinel(40) + "\n\nprose that must stay visible"
+        clamped = PR.clamp_review_body(body, limit=len(body) // 2)
+        opener = clamped.rfind("<!--")
+        self.assertTrue(
+            opener == -1 or "-->" in clamped[opener:],
+            "no `<!--` may be left without a `-->` to close it",
+        )
+        self.assertIn("job summary", clamped, "the clamp's own note is still visible")
+
+    def test_a_comment_that_fits_is_left_alone(self):
+        body = "A\n<!-- keep me -->\n" + "z" * 400
+        self.assertIn("<!-- keep me -->", PR.clamp_review_body(body, limit=300))
+        # And an unclamped body is returned untouched.
+        self.assertEqual(PR.clamp_review_body(body), body)
+
+    def test_the_marker_still_outlives_a_cut_that_takes_the_whole_sentinel(self):
+        """Dropping the fragment is only safe because the prose marker sits ABOVE it.
+        Whatever the clamp takes, build-ledger.py still sees that findings WERE
+        demoted, so the round degrades loudly instead of reading as an empty one."""
+        section = PR.render_body_only_findings(
+            [
+                {"severity": "high", "comment": {"path": "far.py", "line": 900 + n,
+                                                 "body": "🟠 **High** — " + "y" * 900}}
+                for n in range(30)
+            ]
+        )
+        body = "HEADER\n\n" + section
+        clamped = PR.clamp_review_body(body, limit=len(body) // 3)
+        self.assertNotIn(PR.BODY_ONLY_SENTINEL_PREFIX, clamped, "the sentinel is gone")
+        self.assertIn(PROSE_MARKER, clamped, "but the disclosure is not")
 
 
 class FallbackSuffixTest(unittest.TestCase):
