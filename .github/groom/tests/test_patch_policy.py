@@ -284,6 +284,24 @@ class RawDiffModeTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             policy.parse_raw_z(b":100644 100644 0000000 1111111 M\x00")
 
+    def test_parse_raw_z_rejects_rename_records(self):
+        # Pins the module invariant-2 / `parse_raw_z` docstring claim that a
+        # two-path R/C record fails CLOSED. Reachable only if a future editor
+        # drops `--no-renames` from groom.yml's producer — the one edit that
+        # would hide a rename's SOURCE (the denied side) from the policy and
+        # rename this gate out of existence. Both arities must raise:
+        rename = (
+            b":100644 100644 0000000 1111111 R100\x00"
+            b"suites/s1/cases/c1.yaml\x00suites/s1/retired.yaml\x00"
+        )
+        # one record -> 3 fields, caught by the odd-parity check;
+        with self.assertRaises(ValueError):
+            policy.parse_raw_z(rename)
+        # two -> 6 fields, EVEN (parity check passes), caught only because the
+        # misaligned meta slot holds a path that `_RAW_META` refuses.
+        with self.assertRaises(ValueError):
+            policy.parse_raw_z(rename * 2)
+
     def test_symlink_in_suites_tree_denied_by_mode(self):
         for path in (
             b"suites/newthing",        # a suite-dir-shaped link: no cases, no YAML
