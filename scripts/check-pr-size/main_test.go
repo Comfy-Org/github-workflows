@@ -30,10 +30,28 @@ func gitRun(t *testing.T, dir string, args ...string) string {
 // initTestRepo creates an empty git repo with a committer identity configured.
 func initTestRepo(t *testing.T) string {
 	t.Helper()
+	// Neutralize the developer's global/system git config for the whole test:
+	// a global diff.renames=false (or a low diff.renameLimit) would empty the
+	// OldPath values the rename tests assert on, and a global core.hooksPath /
+	// core.excludesFile would change what commitAll stages. This is t.Setenv
+	// rather than gitRun's cmd.Env because the production helpers under test
+	// (diffFiles, checkAttrSourceSupported, ...) spawn their own git from this
+	// process. Safe here: these tests are already non-parallel (see above).
+	// Same idiom as .github/groom/tests/test_scope.py and groom.yml. Both vars
+	// need git >= 2.32; older git simply ignores them, which is no worse than
+	// today.
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_SYSTEM", os.DevNull)
 	dir := t.TempDir()
 	// Pin the initial branch so the fixture never collides with a developer's
-	// init.defaultBranch (tests below create their own "main" branch).
-	gitRun(t, dir, "init", "-q", "-b", "groom-test-base")
+	// init.defaultBranch (tests below create their own "main" branch). Set via
+	// `-c` rather than `init -b`: -b needs git >= 2.28, and gitRun turns any
+	// non-zero exit into t.Fatalf, so on older git every repo-backed test here
+	// would die in initTestRepo instead of reaching its
+	// "git too old for check-attr --source" skip. Pre-2.28 git ignores the
+	// unknown key harmlessly -- it does not honor init.defaultBranch, so it
+	// cannot collide in the first place.
+	gitRun(t, dir, "-c", "init.defaultBranch=pr-size-test-base", "init", "-q")
 	gitRun(t, dir, "config", "user.email", "test@example.com")
 	gitRun(t, dir, "config", "user.name", "Test")
 	gitRun(t, dir, "config", "commit.gpgsign", "false")
