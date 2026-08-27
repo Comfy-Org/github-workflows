@@ -31,7 +31,9 @@ func gitRun(t *testing.T, dir string, args ...string) string {
 func initTestRepo(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	gitRun(t, dir, "init", "-q")
+	// Pin the initial branch so the fixture never collides with a developer's
+	// init.defaultBranch (tests below create their own "main" branch).
+	gitRun(t, dir, "init", "-q", "-b", "groom-test-base")
 	gitRun(t, dir, "config", "user.email", "test@example.com")
 	gitRun(t, dir, "config", "user.name", "Test")
 	gitRun(t, dir, "config", "commit.gpgsign", "false")
