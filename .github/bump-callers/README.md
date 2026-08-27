@@ -509,6 +509,125 @@ way, and `test_paths_contract.sh` enforces it.
 >   `WATCHED_PATHSPECS` + `WATCHED_EXEC`, instead of narrowing anything away. The
 >   staleness test there is still a two-tree comparison, not a history walk.
 
+### Suppressing a churn bump (`Skip-caller-bump: true`)
+
+A commit that only rewords comments or docs *inside* a watched surface still
+matches the fleet's `paths:` filter, so it fans a pure-churn SHA-bump PR — a
+review round in every caller repo — for a change no caller can observe. A
+reviewed commit on `main` can declare itself bump-irrelevant with a
+commit-message trailer:
+
+```text
+docs(groom): reword the finder brief's intro comment
+
+Skip-caller-bump: true
+```
+
+The preflight then skips (`proceed=false`, `new_sha` still emitted, exit 0) —
+but ONLY when all of these hold; on any other condition, **including any
+read/parse failure of the event payload, the gate falls through to bumping**.
+It fails open on purpose: its worst bug must be status-quo churn (a bump that
+could have been skipped), never pin drift (a skip that suppressed a real bump).
+
+- the run is a `push` event. A `workflow_dispatch` run always bumps — dispatch
+  is the fleets' documented recovery path, and doubles as the manual override
+  if a trailer turns out to have been a mistake;
+- the push payload's `.commits` array has 1–2047 entries. GitHub documents the
+  push **webhook** payload — which is what `$GITHUB_EVENT_PATH` holds — as
+  carrying "a maximum of 2048 commits"; the far lower 20-entry cap belongs to
+  the Events API's `PushEvent`, a different representation, and the webhook
+  payload carries no `.size` to compare a length against, so the count is the
+  only truncation signal there is. At 2048 the array may be incomplete, and
+  skipping on an incompletely-checked push could suppress a behavioral bump —
+  the gate refuses to skip instead;
+- **every** commit in the push carries a line matching
+  `^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$` **in its trailing
+  trailer block** — the maximal suffix of *body* lines (the title paragraph is
+  never scanned, so a message with no blank line at all is untrailered) that are
+  blank or `Token: value` shaped, *and* which starts a paragraph (a blank line
+  precedes it, or it opens the body right after the title), i.e.
+  `git interpret-trailers --parse` semantics rather than a body-wide search. A
+  body-wide search reads the token
+  as a *declaration* when it is only being *quoted*: a `git cherry-pick -x` copy
+  (whose appended `(cherry picked from commit …)` line is not trailer-shaped, so
+  it correctly ends the block), a reapply carrying the original body, or a
+  commit whose prose documents this feature at column 0. The paragraph-start
+  half covers the quote that is the paragraph's *last* line —
+
+  ```text
+  docs: explain the gate
+
+  A churn commit ends with:
+  Skip-caller-bump: true
+  ```
+
+  — which the suffix rule alone accepts, because the scan stops on the prose
+  above having already taken the token. Blank lines are allowed *inside* the
+  block, so GitHub's appended `Co-authored-by:` paragraph does not push a valid
+  trailer out of it (nor does it launder a quote like the one above, since the
+  scan walks back through it to the same prose).
+
+All commits, not just those touching watched paths — on a **direct push to
+`main`** that is what stops a mixed push (one behavioral commit, one trailered
+docs commit) from skipping. It is not what guards the shape changes actually
+arrive in here. This repo squash-merges with
+`squash_merge_commit_message: COMMIT_MESSAGES`, so a whole PR lands as **one**
+commit and the all-commits rule is then trivially the head-commit rule. What
+guards that path is the trailer-block requirement plus review: GitHub's squashed
+body concatenates the branch commits in order, so only a trailer in the **last**
+commit's message survives into the squashed message's trailer block — which is
+also the text the squash-merge UI shows the person pressing the button. A
+trailer that reaches `main` therefore claims the **whole PR** is
+bump-irrelevant, for **every** fleet, and reviewers reject it on a PR carrying
+behavioral changes exactly as they would any other reviewed line. Legitimate
+only for comment/docs-only edits to watched surfaces; when in doubt, leave it
+off and let the fleet bump.
+
+The gate runs **last**, immediately before the final `proceed=true`, so every
+loud validation, staleness and decommission verdict above keeps precedence — a
+trailer can never mask an error or relabel a stale/decommission verdict. On the
+re-point path the run has already logged "pinning callers to … and proceeding";
+the skip `::notice::` names that line and says it overrides it, so the log never
+ends on two contradictory statements.
+
+**The hand-off guard.** The staleness skip earlier in the preflight is sound
+only because of what its own message claims — the newer commit "has its own
+run, which will pin the newer content". Once a run can *decline* on a trailer,
+that hand-off breaks: behavioral commit A lands on a watched surface, trailered
+churn commit B rewords a comment in the same surface moments later, A's run
+defers to B's run, B's run skips, and A reaches no caller until some later
+behavioral commit happens along. So before deferring, the staleness branch asks
+whether **every** commit `main` gained since this one **that touches the watched
+surface** is trailered; if so it does *not* defer — it pins the verified tip and
+proceeds, because it is the last run that will pin this content.
+
+Restricted to the watched surface because the question is "will any newer run
+pin this content?", and only a commit matching the fleet's `paths:` filter
+*starts* a run at all: an unwatched commit can neither decline nor pin, so
+counting it would defer this run to a run that was never triggered. The
+pathspecs handed to the guard are whichever shape the staleness comparison
+itself used (`WATCHED_PATHSPECS`, or `WATCHED` + `WATCHED_ASSETS`), so the two
+mean the same thing by construction. Its commit bound is the same 2047 as the
+gate's `.commits` bound, so no range the gate would skip commit-by-commit is one
+the guard declines to evaluate — the two disagreeing (50 vs 2047) was itself a
+pin-drift window.
+
+A range it cannot read (no `jq`, a failed history walk, no watched commit
+selected, a range past that bound) leaves the pre-existing stale verdict
+standing — the guard narrows that skip, and an inability to check is not grounds
+to widen it — but logs a **distinct** line first saying the hand-off is
+*unverified*, so a fleet that quietly stopped bumping leaves a trace of which of
+the two happened.
+
+**Known limit.** A bump run is also the *catch-up* for an earlier watched change
+whose own run never bumped — one that failed at the token mint or inside
+`bump-callers.sh`, was cancelled, or never started because a `paths:` filter is
+evaluated against only the first 300 changed files of a push. Declining here
+declines that catch-up too, and nothing in the push payload can see it; the
+hand-off guard covers only the concurrent-run case, which is the one the
+preflight *can* observe. Until that is closed, keep trailered pushes small and
+reach for `workflow_dispatch` if a fleet looks behind.
+
 ## How the pin rewrite is scoped (and why it asserts afterwards)
 
 The rewrite targets the **pin token**, not "any 40-hex on a line that mentions
