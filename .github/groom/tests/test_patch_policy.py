@@ -203,6 +203,9 @@ class DatasetOfRecordTest(unittest.TestCase):
             "suites/s2/cases/x.yml",
             "suites/s1/cases/deep/y.yaml",         # any depth under cases/
             "sub/suites/s1/cases/b.yaml",          # segment-anchored, nested tree
+            "suites/cases/foo.yaml",               # flat layout — `**` spans ZERO
+            #                                        segments, so the advertised
+            #                                        suites/**/cases/ surface holds
             "SUITES/S1/CASES/z.YAML",              # case-insensitive
         ):
             self.assertTrue(denied(p), p)
@@ -211,7 +214,6 @@ class DatasetOfRecordTest(unittest.TestCase):
             "suites/s1/README.md",
             "suites/s1/cases/README.md",           # not YAML
             "cases/foo.yaml",                      # missing suites/ segment
-            "suites/cases/foo.yaml",               # missing suite segment
             "packages/x/suites/s1/cases.yaml",     # cases.yaml file, not cases/ dir
         ):
             self.assertFalse(denied(p), p)
@@ -237,15 +239,77 @@ class DatasetOfRecordTest(unittest.TestCase):
         for p in (
             "suites/s1/cases",
             "sub/suites/s1/group/cases",
+            "suites/cases",                        # flat layout — zero mid segments
             "SUITES/S1/CASES",
         ):
             self.assertTrue(denied(p), p)
         for p in (
             "cases",                               # no suites/ segment
-            "suites/cases",                        # no suite segment between
             "suites/s1/testcases",                 # segment-anchored, not a suffix
         ):
             self.assertFalse(denied(p), p)
+
+
+class RawDiffModeTest(unittest.TestCase):
+    """`--raw -z` parsing plus the MODE-visible deny (BE-9612): a symlink-typed
+    change in a `suites` tree is the indirection path shape cannot express — a
+    link at `suites/<x>` has no `cases` segment and no YAML tail, yet a
+    `suites/**/cases/*.yaml` importer resolves straight through it."""
+
+    @staticmethod
+    def raw(*entries):
+        """Encode (old_mode, new_mode, path) byte triples as `--raw -z` output."""
+        return b"".join(
+            b":" + old + b" " + new + b" 0000000 1111111 M\x00" + path + b"\x00"
+            for old, new, path in entries
+        )
+
+    def test_parse_raw_z_extracts_modes_and_paths(self):
+        data = self.raw(
+            (b"100644", b"100644", b"src/foo.py"),
+            (b"000000", b"120000", b"suites/link"),
+        )
+        self.assertEqual(
+            policy.parse_raw_z(data),
+            [("100644", "100644", "src/foo.py"), ("000000", "120000", "suites/link")],
+        )
+
+    def test_parse_raw_z_empty_and_malformed(self):
+        self.assertEqual(policy.parse_raw_z(b""), [])
+        # A field where a meta record must sit but doesn't parse fails LOUD (the
+        # gate runs under `set -euo pipefail`, so a raise fails closed, not open):
+        # name-only-shaped input (the old producer) and an unpaired field both die.
+        with self.assertRaises(ValueError):
+            policy.parse_raw_z(b"package.json\x00")
+        with self.assertRaises(ValueError):
+            policy.parse_raw_z(b":100644 100644 0000000 1111111 M\x00")
+
+    def test_symlink_in_suites_tree_denied_by_mode(self):
+        for path in (
+            b"suites/newthing",        # a suite-dir-shaped link: no cases, no YAML
+            b"suites",                 # the glob's root component itself
+            b"sub/suites",             # nested tree's root component
+            b"suites/s1/cases/link",   # inside cases/ with no YAML tail
+            b"SUITES/lnk",             # case-insensitive runners (see _PATTERN)
+        ):
+            entries = policy.parse_raw_z(self.raw((b"000000", b"120000", path)))
+            self.assertEqual(policy.denied_entries(entries), [path.decode()], path)
+
+    def test_symlink_replaced_by_file_still_denied(self):
+        # old mode 120000 → new 100644: retiring the link changes resolution too;
+        # either side being a symlink denies (over-block is the safe direction).
+        entries = policy.parse_raw_z(self.raw((b"120000", b"100644", b"suites/s1")))
+        self.assertEqual(policy.denied_entries(entries), ["suites/s1"])
+
+    def test_regular_files_fall_through_to_path_policy(self):
+        entries = policy.parse_raw_z(
+            self.raw(
+                (b"100644", b"100644", b"suites/s1/harness.py"),  # suites, not a link
+                (b"100644", b"100644", b"package.json"),          # path-denied as ever
+                (b"000000", b"120000", b"docs/latest"),           # link OUTSIDE suites
+            )
+        )
+        self.assertEqual(policy.denied_entries(entries), ["package.json"])
 
 
 class ApiGuardTest(unittest.TestCase):
@@ -271,8 +335,11 @@ class MainStdoutTest(unittest.TestCase):
 
         # A denied path (package.json) whose DIRECTORY segment carries a raw non-UTF-8
         # byte (0xff) — the basename still anchors, so it is denied. git -z emits it
-        # verbatim; parse_nul_delimited holds the byte as a lone surrogate.
-        raw = b"p\xffkg/package.json\x00package.json\x00"
+        # verbatim; parse_raw_z holds the byte as a lone surrogate.
+        raw = (
+            b":100644 100644 0000000 1111111 M\x00p\xffkg/package.json\x00"
+            b":100644 100644 0000000 1111111 M\x00package.json\x00"
+        )
         stdin = io.BytesIO(raw)
         stdout_buf = io.BytesIO()
 
@@ -327,28 +394,34 @@ class NegativeCasesTest(unittest.TestCase):
 class RawByteRegressionTest(unittest.TestCase):
     """git C-quotes exotic paths in DEFAULT output; the policy reads raw `-z` bytes."""
 
+    @staticmethod
+    def _paths(raw_paths):
+        """Wrap raw path bytes in `--raw -z` records and parse them back out."""
+        data = b"".join(
+            b":100644 100644 0000000 1111111 M\x00" + p + b"\x00" for p in raw_paths
+        )
+        return [path for _old, _new, path in policy.parse_raw_z(data)]
+
     def test_embedded_quote_caught_from_raw_bytes(self):
         # `.github/workflows/ev"il.yml` — default git output would quote-wrap this,
         # slipping the leading quote past a `^\.github/` anchor. Raw -z bytes don't.
-        raw = b'.github/workflows/ev"il.yml'
-        paths = policy.parse_nul_delimited(raw)
+        paths = self._paths([b'.github/workflows/ev"il.yml'])
         self.assertEqual(policy.denied_paths(paths), ['.github/workflows/ev"il.yml'])
 
     def test_embedded_newline_split_both_lines_tested(self):
         # A single path carrying a raw newline arrives (via -z) as one field; the
         # policy splits it and tests BOTH lines. Match on either => denied.
         # (a) match on the first line
-        paths = policy.parse_nul_delimited(b".github/workflows/x.yml\nsecond-line")
+        paths = self._paths([b".github/workflows/x.yml\nsecond-line"])
         self.assertEqual(len(paths), 1)
         self.assertEqual(policy.denied_paths(paths), paths)
         # (b) match on the SECOND line — proves both are tested, not just the first
-        paths = policy.parse_nul_delimited(b"innocent-first\npackage.json")
+        paths = self._paths([b"innocent-first\npackage.json"])
         self.assertEqual(len(paths), 1)
         self.assertEqual(policy.denied_paths(paths), paths)
 
-    def test_nul_delimited_multiple_paths_partition(self):
-        raw = b".github/workflows/ci.yml\x00README.md\x00package-lock.json\x00"
-        paths = policy.parse_nul_delimited(raw)
+    def test_multiple_records_partition(self):
+        paths = self._paths([b".github/workflows/ci.yml", b"README.md", b"package-lock.json"])
         self.assertEqual(paths, [".github/workflows/ci.yml", "README.md", "package-lock.json"])
         self.assertEqual(
             policy.denied_paths(paths),
@@ -356,8 +429,9 @@ class RawByteRegressionTest(unittest.TestCase):
         )
 
     def test_empty_input_denies_nothing(self):
-        self.assertEqual(policy.parse_nul_delimited(b""), [])
+        self.assertEqual(policy.parse_raw_z(b""), [])
         self.assertEqual(policy.denied_paths([]), [])
+        self.assertEqual(policy.denied_entries([]), [])
 
 
 if __name__ == "__main__":

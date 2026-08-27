@@ -478,7 +478,9 @@ on:
           `pr-size.yml` counts *non-generated* changed lines — it strips
           lockfiles and generated output first, and offers an `oversized-ok`
           bypass label — whereas this counts changed lines straight off
-          `git diff --cached --numstat`, with no content-based exclusions. Note
+          `git diff --cached --no-renames --numstat` (no rename detection, same
+          diff the path policy reads — a pure move counts as delete+add rather
+          than 0), with no content-based exclusions. Note
           that this basis is not a byte budget: `numstat` reports `-` for binary
           files (counted as 0 here), and a line is a line however long, so one
           minified line clears any ceiling. It bounds review effort in the
@@ -2832,7 +2834,12 @@ jobs:
             bail "builder output withheld: it contained the model API key (possible prompt-injection exfil). Patch, summary and PR body discarded — a human must review this finding manually." true
             exit 0
           fi
-          CHANGED=$(git -C repo diff --cached --numstat | awk '{a+=($1=="-"?0:$1); d+=($2=="-"?0:$2)} END{print a+d+0}')
+          # `--no-renames` here too, so BOTH gates below read the SAME diff as the
+          # path policy: with rename detection on, a pure rename scores 0\t0, so a
+          # patch that only relocates files would clear PR_SIZE_LIMIT no matter how
+          # much it moves. Counting a move as delete+add over-counts — the safe
+          # direction (worst case a big relocation is filed as an issue, not dropped).
+          CHANGED=$(git -C repo diff --cached --no-renames --numstat | awk '{a+=($1=="-"?0:$1); d+=($2=="-"?0:$2)} END{print a+d+0}')
           # Path policy: a patch touching a CI-privileged path would, on the
           # same-repo branch push, run in CI with repository secrets + a writable
           # token BEFORE any human reviews the merge — defeating the RFC's
@@ -2847,15 +2854,20 @@ jobs:
           #       something else privileged must add it there). Erring wide is safe:
           #       a false positive only downgrades a legit refactor from a PR to an
           #       issue, and nothing is dropped either way.
-          #   (b) NUL-delimited comparison is mandatory (`--name-only -z`): git
-          #       C-quotes and double-quote-wraps any path with a quote/backslash/
-          #       control byte in default output, slipping the path past a `^\.github/`
-          #       anchor; `-z` emits raw bytes so patch_policy.py sees the true path.
+          #   (b) NUL-delimited comparison is mandatory (`-z`): git C-quotes and
+          #       double-quote-wraps any path with a quote/backslash/control byte in
+          #       default output, slipping the path past a `^\.github/` anchor; `-z`
+          #       emits raw bytes so patch_policy.py sees the true path.
           #   (c) `--no-renames` is mandatory too: with git's default rename
-          #       detection `--name-only` reports ONLY a rename's DESTINATION, so a
+          #       detection a rename reports ONLY its DESTINATION pairing, so a
           #       patch that MOVES a denied path to an undenied one (e.g. retiring a
           #       dataset-of-record case out of its `cases/` dir) would show the
           #       policy nothing and open a PR. `--no-renames` emits both sides.
+          #   (d) `--raw`, not `--name-only`: the raw records carry MODE bits, which
+          #       is how patch_policy.py denies a SYMLINK-typed change in a `suites`
+          #       tree — the indirection a path-only check cannot see (a link at
+          #       `suites/<x>` has no `cases` segment and no YAML tail, yet a
+          #       `suites/**/cases/*.yaml` importer resolves straight through it).
           # $GROOM_ASSETS already points into the _groom_assets checkout (workflow
           # env, same var the prompt-build steps use).
           # NO `|| true`: patch_policy.py always exits 0 on success (a no-match is
@@ -2864,7 +2876,7 @@ jobs:
           # interpreter, uncaught exception). Under this step's `set -euo pipefail`,
           # letting such a failure abort the step fails CLOSED — no PR is opened when
           # the gate can't run — instead of fail-open (empty TOUCHED_CI => PR opened).
-          TOUCHED_CI=$(git -C repo diff --cached --no-renames --name-only -z | python3 "$GROOM_ASSETS/patch_policy.py")
+          TOUCHED_CI=$(git -C repo diff --cached --no-renames --raw -z | python3 "$GROOM_ASSETS/patch_policy.py")
 
           if [ "$STATUS" != "patched" ] || [ ! -s /tmp/out/patch.diff ]; then
             echo "Build $IDX produced no patch (status=$STATUS) — will file as an issue."
@@ -2878,7 +2890,7 @@ jobs:
             # (newlines are already spaces by then); this line is human-readable only,
             # the authoritative deny already happened above.
             echo "::warning::Build $IDX patch edits CI-privileged or dataset-of-record file(s) [$(echo "$TOUCHED_CI" | tr '\n' ' ' | tr -d '\000-\037')] — refusing to auto-open a PR for a path a human must author; filing an issue instead."
-            bail "patch modifies a CI-privileged or dataset-of-record path (per .github/groom/patch_policy.py — workflow/action defs, lockfiles, build/test config that executes in pre-review CI, or graded eval cases under a suites/**/cases/ tree) — a human must author these changes"
+            bail "patch modifies a CI-privileged or dataset-of-record path (per .github/groom/patch_policy.py — workflow/action defs, lockfiles, build/test config that executes in pre-review CI, graded eval cases under a suites/**/cases/ tree, or a symlink into such a tree) — a human must author these changes"
           elif [ "$CHANGED" -gt "$PR_SIZE_LIMIT" ]; then
             echo "::warning::Build $IDX patch changed $CHANGED lines (> $PR_SIZE_LIMIT) — filing an issue instead of a giant PR."
             bail "patch too large: ${CHANGED} lines changed (> ${PR_SIZE_LIMIT})"
