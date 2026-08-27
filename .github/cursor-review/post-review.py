@@ -93,6 +93,10 @@ BODY_ONLY_SENTINEL_PREFIX = "cursor-review:body-only-findings v1"
 # own. Duplicated rather than imported (neither module imports the other); pinned
 # together by test_build_ledger.py.
 BODY_ONLY_SENTINEL_BODY_CHARS = 600
+# The prose half of the body-only contract. build-ledger.py keys on this sentence to
+# tell "this round demoted findings and the sentinel is unreadable" apart from "this
+# round demoted nothing", so it is a constant here rather than a literal in the render.
+BODY_ONLY_PROSE_MARKER = "could not be anchored to a line the reviewed diff carries"
 BODY_ONLY_TRUNCATION_MARKER = " …[truncated]"
 
 
@@ -776,6 +780,47 @@ def strip_severity_badge(severity: str, body: str) -> str:
     return body[len(badge):] if body.startswith(badge) else body
 
 
+def defang_body_only_contract(text: str) -> str:
+    """Break both halves of the body-only sentinel contract inside imported text.
+
+    build-ledger.py accepts a sentinel only when the prose marker sits on the line
+    above it, and both are matched as exact literals. Forging the sentinel alone would
+    fabricate ledger entries with attacker-chosen path/severity/body; forging the
+    marker alone would fabricate a "findings were lost" truncation note in the next
+    round's prompt. Neither is much of a prize, but neither is text we wrote.
+
+    A zero-width space is invisible where the text is rendered for a human and defeats
+    both literals, so what was quoted still reads exactly as it arrived.
+    """
+    return text.replace(
+        BODY_ONLY_SENTINEL_PREFIX,
+        BODY_ONLY_SENTINEL_PREFIX.replace(":", ":\u200b", 1),
+    ).replace(
+        BODY_ONLY_PROSE_MARKER,
+        BODY_ONLY_PROSE_MARKER.replace(" ", "\u200b ", 1),
+    )
+
+
+def strip_repeat_line(repeat_line: str, body: str) -> str:
+    """Drop the `↩︎ re-raise of <url> (round N)` trailer normalize_comments appended.
+
+    build-ledger.py deliberately OMITS `discussion_url:` for an unanchorable entry so
+    the judge can never emit it as a `repeat_of` — a demoted finding has no thread for
+    one to point at. Carrying the trailer inside the sentinel's `body` puts a live
+    thread URL straight back into the prose the judge reads, and on a likely path: a
+    re-raise often cites a line the NEW diff no longer carries, which is exactly what
+    gets demoted.
+
+    Reconstructed from the string normalize_comments actually appended rather than
+    re-matched with a regex, for the same reason strip_severity_badge is: if the format
+    changes this stops matching and the sentinel carries a visible trailer — cosmetic —
+    instead of silently eating the tail of a finding.
+    """
+    if repeat_line and body.endswith(repeat_line):
+        return body[: -len(repeat_line)].rstrip()
+    return body
+
+
 def truncate_sentinel_body(body: str) -> str:
     """Cut a finding body to the ledger's own limit, marked, so the cut is visible.
 
@@ -814,11 +859,14 @@ def render_body_only_sentinel(items: list) -> str:
             # model output until it is rendered — and this render is still a POSTed
             # review body, so an `@handle` in it would fire a live mention from the bot
             # account. An HTML comment is not a reliable place to hide one.
-            "path": neutralize_mentions(item["comment"]["path"]),
+            "path": MD_LINE_BREAK_RE.sub(" ", neutralize_mentions(item["comment"]["path"])),
             "line": item["comment"]["line"],
             "severity": item["severity"],
             "body": truncate_sentinel_body(
-                strip_severity_badge(item["severity"], item["comment"]["body"])
+                strip_repeat_line(
+                    item.get("repeat_of") or "",
+                    strip_severity_badge(item["severity"], item["comment"]["body"]),
+                )
             ),
         }
         for item in items
@@ -832,13 +880,23 @@ def render_body_only_findings(items: list) -> str:
     """Render findings that could not be anchored, for inclusion in the review body."""
     if not items:
         return ""
-    # Sentinel FIRST, before the prose. clamp_review_body cuts the tail, so anchoring
-    # the machine-readable copy at the head of the section is what keeps it recoverable
-    # for as long as any of the section survives the clamp at all.
+    # Order is load-bearing, and it is marker → sentinel → prose.
+    #
+    # clamp_review_body cuts the TAIL, so the machine-readable copy sits as near the
+    # head of the section as it can and stays recoverable for as long as any of the
+    # section survives. But it cannot be first: a clamp landing INSIDE the JSON takes
+    # the closing `-->` with it, and with the marker below that it took the evidence
+    # too — build-ledger.py saw neither a parseable sentinel nor the marker, and a
+    # fully-demoted round read as a review that found nothing. That is the one cut that
+    # actually happens, and it was the silent one.
+    #
+    # One short line above the sentinel costs ~140 chars of recoverability and makes
+    # every such cut LOUD. It is also the sentinel's required predecessor on the read
+    # side, which is what scopes build-ledger.py's search to this section.
     md = (
+        f"_The finding(s) below {BODY_ONLY_PROSE_MARKER}, so they are reported here "
+        "instead of inline:_\n\n"
         f"{render_body_only_sentinel(items)}\n\n"
-        "_The finding(s) below could not be anchored to a line the reviewed diff "
-        "carries, so they are reported here instead of inline:_\n\n"
     )
     for item in items:
         md += render_finding_entry(item["comment"]) + "\n\n"
@@ -1009,6 +1067,12 @@ def post_error_review(repo, pr_number, commit_sha, header, error_message):
             "`" * (MAX_FENCE_CHARS - 1) + "…(backtick run truncated)",
             safe,
         )
+    # `safe` lands in a FENCE, not a blockquote, so unlike every rendered finding its
+    # lines sit at column 0 — this is the only consolidated review body where imported
+    # text can satisfy build-ledger.py's line-anchored sentinel match. Same idea as the
+    # backtick run above: break it at the WRITER, before the length budget, and keep
+    # what was quoted readable.
+    safe = defang_body_only_contract(safe)
     if len(safe) > MAX_ERROR_MESSAGE_CHARS:
         safe = safe[:MAX_ERROR_MESSAGE_CHARS].rstrip() + (
             "\n…(truncated: the error text hit the review body's size limit — see "
@@ -1187,9 +1251,10 @@ def main():
         # build-ledger.py parses back out of this body, so a fully-demoted round can no
         # longer read as a review that found nothing. Those entries are permanently
         # UNANSWERED, hence cap-exempt, which is the same rule an unanswered thread
-        # already gets. What is still open: the demoted half of a WHOLESALE fallback
-        # body (the 422 path below) carries no sentinel, because it is not rendered
-        # through render_body_only_findings.
+        # already gets. What is still open: the WHOLESALE fallback body (the 422 path
+        # below) carries no sentinel, because it is not rendered through
+        # render_body_only_findings — so its findings do not reach the ledger. It does
+        # carry the prose marker, so that round degrades loudly rather than silently.
         review_body += f"\n\n---\n\n{body_only_md}"
 
     # Every finding, most → least urgent, for any render that has no inline half.
@@ -1250,9 +1315,18 @@ def main():
     # Fallback: same findings without inline anchors. Typical cause is line
     # numbers that fall outside the diff context — often the model picked
     # a line near the change but not on the change.
+    # The note carries BODY_ONLY_PROSE_MARKER deliberately. This body has no sentinel —
+    # it is not rendered through render_body_only_findings, and adding one is the wrong
+    # move on a request that just 422'd for being unacceptable (see the PR's Residual).
+    # But without the marker, next round's build_ledger saw neither entries NOR a
+    # degradation for a round on which EVERY finding is body-only, so a fallback-posted
+    # round read as a review that found nothing and the round after it looked like a
+    # first round. The marker alone costs a sentence and keeps the disclosure honest.
     fallback_body = (
         prose_body
-        + "\n_(Inline comments could not be anchored to the diff; listed above instead.)_"
+        + f"\n\n_(Inline comments {BODY_ONLY_PROSE_MARKER}, so every finding is listed "
+        "above instead. None of them has a review thread, so there is nowhere to "
+        "reply to one or resolve it.)_"
     )
     clamped_fallback = clamp_review_body(fallback_body)
     fallback_payload = json.dumps(

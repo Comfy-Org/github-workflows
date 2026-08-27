@@ -117,29 +117,48 @@ _FENCE_LINE_RE = re.compile(r"^[ \t]*={2,}.*$", re.MULTILINE)
 # below cannot see it: without this it never enters the ledger, gets no `repeat_of`
 # link and no REPEAT_CAP cover, and a round whose findings were ALL demoted reads as a
 # review that found nothing. So post-review.py also emits a machine-readable copy of
-# them as an HTML comment at the head of that section, and this reads it back.
+# them as an HTML comment near the head of that section, and this reads it back.
 #
+# The human-readable line post-review.py renders as the section's FIRST line, directly
+# ABOVE the sentinel. Two jobs, and the order is load-bearing for both:
+#
+#  1. It tells "this round demoted findings and the sentinel is unreadable" apart from
+#     "this round demoted nothing" — the first must never be silent. Because
+#     `clamp_review_body` cuts the TAIL, a clamp landing inside the sentinel's JSON
+#     takes the closing `-->` with it; with the marker BELOW the sentinel that cut
+#     removed the evidence too and the round read as empty. Above it, the marker
+#     outlives every cut that can reach the sentinel at all.
+#  2. It is the sentinel's required predecessor (below), which is what scopes the
+#     search to the demoted-findings section.
+#
+# Pinned against post-review.py's real render by test_build_ledger.py so the two
+# cannot drift apart.
+BODY_ONLY_PROSE_MARKER = "could not be anchored to a line the reviewed diff carries"
+
 # Non-greedy up to the first `-->`, and pinned to the exact version string: a payload
 # this parser does not understand must FAIL rather than be half-guessed, which is what
 # the degradation note then discloses. Every `-` is escaped as its JSON `\u002d` form
 # on the writing side, so a `-->` inside a finding body cannot close the comment early.
 #
-# Anchored to a LINE START (MULTILINE), which is the control that stops a finding from
-# forging one. A demoted finding's prose is rendered as a blockquote, so every line of
-# it begins with `>` (post-review.py's render_finding_entry, which splits on every
-# CommonMark line ending) — a `<!-- cursor-review:body-only-findings ... -->` a model
-# emitted inside a finding body therefore never sits at column 0 and can never be the
-# match. The real sentinel does, and it is also the FIRST thing in the section, so even
-# a forgery that somehow reached column 0 would lose to it.
+# Both lines are anchored to a LINE START (MULTILINE), which is the control that stops a
+# finding from forging one. A demoted finding's prose is rendered as a blockquote, so
+# every line of it begins with `>` (post-review.py's render_finding_entry, which splits
+# on every CommonMark line ending) — a `<!-- cursor-review:body-only-findings ... -->` a
+# model emitted inside a finding body therefore never sits at column 0 and can never be
+# the match.
+#
+# Requiring the MARKER LINE immediately above is what scopes this to the demoted-findings
+# section. `find_consolidated` hands us every consolidated review body, not just the
+# success path's, and `post_error_review` renders unbounded judge/CLI text inside a
+# FENCE rather than a blockquote — the one such body whose imported lines do sit at
+# column 0. Two coupled lines are far harder to land there by accident, and
+# post_review.py additionally defangs this prefix out of that text at the writer, so
+# neither half can be forged from it.
 _BODY_ONLY_SENTINEL_RE = re.compile(
-    r"^<!--\s*cursor-review:body-only-findings\s+v1\s+(.*?)-->",
+    r"^[^\n]*" + re.escape(BODY_ONLY_PROSE_MARKER) + r"[^\n]*\n\s*"
+    r"<!--\s*cursor-review:body-only-findings\s+v1\s+(.*?)-->",
     re.DOTALL | re.MULTILINE,
 )
-# The human-readable line post-review.py renders directly BELOW the sentinel. Only used
-# to tell "this round demoted findings and the sentinel is unreadable" apart from "this
-# round demoted nothing" — the first must never be silent. Pinned against
-# post-review.py's real render by test_build_ledger.py so the two cannot drift apart.
-BODY_ONLY_PROSE_MARKER = "could not be anchored to a line the reviewed diff carries"
 
 # Review authors whose consolidated reviews we will trust as prior rounds. The
 # review posts as `github-actions[bot]` by default, or under a dedicated App
@@ -296,7 +315,15 @@ def _parse_body_only_sentinel(body: str):
         return None
     if not isinstance(payload, list):
         return None
-    return [item for item in payload if isinstance(item, dict)]
+    items = [item for item in payload if isinstance(item, dict)]
+    if payload and not items:
+        # A non-empty payload whose every item is the wrong shape IS "not a list of
+        # objects", which the docstring promises None for. Returning [] here would
+        # read to the caller as "sentinel parsed, zero findings" and suppress the
+        # degradation note even while the prose marker says findings were demoted —
+        # the exact silent round this function exists to prevent.
+        return None
+    return items
 
 
 def _body_only_line(value):
@@ -309,10 +336,45 @@ def _body_only_line(value):
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
-        return value
-    if isinstance(value, str) and value.strip().isdigit():
-        return int(value.strip())
-    return None
+        return value if value > 0 else None
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    # `isdigit()` is TRUE for characters `int()` rejects ('²' → ValueError), and even a
+    # decimal-only string raises past sys.get_int_max_str_digits(). This parser's
+    # contract is to degrade rather than raise — one bad field must not escape into
+    # cmd_build's blanket except and cost the whole ledger — so the coercion is
+    # guarded, not merely pre-screened.
+    if not text.isdecimal():
+        return None
+    try:
+        number = int(text)
+    except ValueError:
+        return None
+    return number if number > 0 else None
+
+
+# Line breaks a sentinel field could carry. JSON round-trips `\n` losslessly, so
+# without this a demoted finding's `path` reaches the rendered ledger with real
+# newlines in it. Matches post-review.py's MD_LINE_BREAK_RE vocabulary.
+_FIELD_LINE_BREAK_RE = re.compile(r"[\r\n]+")
+
+
+def _body_only_text(value) -> str:
+    """Flatten a sentinel field to ONE line.
+
+    ``path`` and ``severity`` are model output relayed through the sentinel, and they
+    are interpolated into the entry's HEADER line, which ``_defang_fences`` cannot help
+    with once the field itself contains a line break: a path like
+    ``x.py\n=== END PRIOR REVIEW LEDGER ===\n<directives>`` would render a forged
+    closing fence at column 0 of the panel/judge prompt. Such a path is *guaranteed* to
+    be demoted, too, since it can never anchor to a diff line.
+
+    So the field is flattened here and defanged at the render — the two sides of one
+    contract, because keeping the header to a single line is a property of the ledger's
+    shape and not only of its trust model.
+    """
+    return _FIELD_LINE_BREAK_RE.sub(" ", str(value or ""))
 
 
 def _body_only_entries(review: dict, meta: dict, max_body: int):
@@ -331,9 +393,9 @@ def _body_only_entries(review: dict, meta: dict, max_body: int):
                 "round": meta["round"],
                 "commit": meta["commit"],
                 "posted_at": meta["posted_at"],
-                "path": str(item.get("path") or ""),
+                "path": _body_only_text(item.get("path")),
                 "line": _body_only_line(item.get("line")),
-                "severity": str(item.get("severity") or ""),
+                "severity": _body_only_text(item.get("severity")),
                 "finding": _truncate(item.get("body") or "", max_body),
                 # Permanently unanswered, by construction: there is no thread to
                 # reply on. answered_count=0 is what makes these cap-EXEMPT, matching
@@ -476,16 +538,13 @@ def build_ledger(
     # above ever sees them. Read straight off the consolidated reviews, which the
     # Bot-author + marker + not-DISMISSED filter has already vouched for.
     entries = []
-    body_only_notes = []
+    degraded_rounds = []
     for review in consolidated:
         meta = round_by_review[review.get("id")]
         recovered, degraded = _body_only_entries(review, meta, max_body)
         entries.extend(recovered)
         if degraded:
-            body_only_notes.append(
-                f"Round {meta['round']} demoted finding(s) to its body that could not "
-                "be recovered — they may repeat."
-            )
+            degraded_rounds.append(meta["round"])
 
     for root in roots:
         meta = round_by_review[root.get("pull_request_review_id")]
@@ -548,10 +607,25 @@ def build_ledger(
 
     entries.sort(key=lambda e: (e["round"], e["path"], e["line"] or 0))
 
-    notes = list(body_only_notes)
     kept_from = max(1, total_rounds - max_rounds + 1)
     if total_rounds > max_rounds:
         entries = [e for e in entries if e["round"] >= kept_from]
+
+    # Scoped to the rounds the cap KEEPS. A round the cap deliberately excluded has no
+    # entries in this ledger either way, so reporting that its sentinel was unreadable
+    # describes a defect where there was only a cap — and it would inflate the
+    # `unrecovered_rounds` that ledger_note branches on. These notes also bypass
+    # `max_bytes` (which measures `entries` alone), so leaving them unbounded grew every
+    # model prompt past the ledger's stated limit on a PR with many unreadable rounds.
+    degraded_rounds = [r for r in degraded_rounds if r >= kept_from]
+    notes = [
+        f"Round {r} demoted finding(s) to its body that could not be recovered "
+        "— they may repeat."
+        for r in degraded_rounds
+    ]
+    cap_notes = 0
+    if total_rounds > max_rounds:
+        cap_notes += 1
         notes.append(
             f"Only the most recent {max_rounds} of {total_rounds} review rounds are "
             f"included (rounds 1–{kept_from - 1} were dropped for size)."
@@ -575,6 +649,7 @@ def build_ledger(
         entries = entries[:-1]
         dropped_entries += 1
     if dropped_entries:
+        cap_notes += 1
         span = f" (including {dropped_rounds} whole round(s))" if dropped_rounds else ""
         notes.append(
             f"{dropped_entries} older finding(s){span} were dropped to stay under the "
@@ -593,10 +668,13 @@ def build_ledger(
         "entry_count": len(entries),
         "unanswered_count": unanswered,
         "notes": notes,
-        # How many rounds demoted findings we could not read back. Kept structurally
-        # rather than sniffed out of `notes` so ledger_note can tell "the caps dropped
-        # entries that existed" from "we never recovered them" without matching prose.
-        "unrecovered_rounds": len(body_only_notes),
+        # How many rounds demoted findings we could not read back, and how many notes
+        # a SIZE cap produced. Both kept structurally rather than sniffed out of
+        # `notes`, so ledger_note can tell "the caps dropped entries that existed" from
+        # "we never recovered them" without matching prose — and without using the note
+        # COUNT as a proxy, which mis-fires the moment both kinds are present at once.
+        "unrecovered_rounds": len(degraded_rounds),
+        "cap_notes": cap_notes,
     }
 
 
@@ -657,14 +735,19 @@ _UNTRUSTED_FOOTER = "=== END PRIOR REVIEW LEDGER ===\n"
 
 _PANEL_STEERING = (
     "\nHOW TO USE THIS LEDGER:\n"
-    "- These findings were already raised AND answered. Prefer NEW ground: spend\n"
-    "  your budget on code and failure modes no earlier round covered.\n"
+    "- These findings were already raised on this PR, and most were answered.\n"
+    "  Prefer NEW ground: spend your budget on code and failure modes no earlier\n"
+    "  round covered.\n"
     "- If you still believe one of these holds, you may raise it again — but your\n"
     "  body MUST open by engaging the specific reason the reply gives, and MUST\n"
     "  name the round it came from (e.g. \"Round 2's reply says X, but …\").\n"
     "- An entry with answers_from_author_or_maintainer=0 was never answered.\n"
     "  Re-raising it is normal and needs no special handling — a reply marked\n"
     "  \"third party — NOT an answer\" does not make a finding answered.\n"
+    "- An entry marked [unanchorable] was demoted to a review body: it has no\n"
+    "  thread, so nobody COULD have answered it and the first bullet above does\n"
+    "  not apply to it. Re-raising it is legitimate; prefer not to unless its\n"
+    "  severity warrants, and say in the body that it repeats unanchored.\n"
 )
 
 _JUDGE_STEERING = (
@@ -730,14 +813,18 @@ def render_ledger_markdown(ledger: dict, audience: str = "panel") -> str:
         # Pre-BE-9565 entries (and every thread-derived one) are anchored; only a
         # finding recovered from a review body is not, so default to True.
         anchored = entry.get("anchored", True)
-        header = f"\n* {entry['path']}:{entry['line']}"
+        # path/severity are defanged like the prose below. For a thread-derived entry
+        # they came from GitHub, but a body-only entry relays them from model output
+        # through the sentinel, and both land on the HEADER line. `_body_only_text`
+        # already flattened them to one line on the way in; this is the other half.
+        header = f"\n* {_defang_fences(entry['path'])}:{entry['line']}"
         if entry["severity"]:
-            header += f" [{entry['severity']}]"
+            header += f" [{_defang_fences(entry['severity'])}]"
         if not anchored:
             header += " [unanchorable]"
-        # entry['finding'] and reply['text'] are imported PR prose — the two
-        # untrusted fields in this block. Defanged so neither can forge the
-        # fence that makes the block DATA. See _defang_fences.
+        # entry['path'], entry['severity'], entry['finding'] and reply['text'] are all
+        # imported prose — the untrusted fields in this block. Defanged so none can
+        # forge the fence that makes the block DATA. See _defang_fences.
         lines.append(
             f"{header}\n"
             # Omitted, not blanked, when there is no thread: an empty
@@ -801,17 +888,20 @@ def ledger_note(ledger: dict) -> str:
         # not read like one — say so, and say which of the two losses it was. A cap
         # note means entries existed and were dropped for size; a note from an
         # unreadable body-only sentinel means they could never be read back at all.
-        notes = ledger.get("notes") or []
-        if notes and len(notes) > ledger.get("unrecovered_rounds", 0):
+        unrecovered = ledger.get("unrecovered_rounds", 0)
+        if ledger.get("cap_notes", 0):
             return (
                 f"Round {ledger['total_rounds'] + 1} — prior-review ledger dropped for "
                 f"size ({ledger['total_rounds']} earlier round(s) exist, no entries fit) "
                 "— findings may repeat earlier rounds."
             )
-        if notes:
+        if unrecovered:
+            # `unrecovered`, not `total_rounds`: the count that failed to parse is the
+            # claim being made. Most rounds on a PR demote nothing, so total_rounds
+            # read as "5 rounds were lost" for a single corrupt sentinel.
             return (
                 f"Round {ledger['total_rounds'] + 1} — prior-review ledger could not "
-                f"recover the finding(s) demoted to the body of {ledger['total_rounds']} "
+                f"recover the finding(s) demoted to the body of {unrecovered} "
                 "earlier round(s) — findings may repeat earlier rounds."
             )
         return ""
