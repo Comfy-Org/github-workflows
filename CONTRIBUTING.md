@@ -97,10 +97,13 @@ token, emitting a patch or findings that a **separate** job applies as a GitHub
 App. Preserving that boundary matters more than convenience — do not give an agent
 job a write token to save a step.
 
-The split is clean for `groom.yml` and for `cursor-review.yml`'s 8 panel cells.
-It is **not** clean for cursor-review's judge: `Consolidate panel` runs the judge
-model and posts the review in one `pull-requests: write` job. Treat that as a known
-rough edge to work *toward* the boundary, not as licence to widen it elsewhere. See
+The split is clean for `groom.yml` and across the whole of `cursor-review.yml`:
+the 8 panel cells **and** the `Consolidate panel` judge job check out PR code and
+hold `contents: read` only, and the review is posted from a separate `Post review`
+job that checks out no PR code and receives its payload as an artifact. No job
+both checks out PR code and holds a write-scoped credential. That is a structural
+invariant, not a convention — `.github/cursor-review/tests/test_workflow_job_isolation.py`
+fails the build if a checkout or a write grant crosses back over. See
 [SECURITY.md](SECURITY.md).
 
 ## Review

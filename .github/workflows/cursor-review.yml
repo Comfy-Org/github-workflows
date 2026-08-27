@@ -1947,8 +1947,10 @@ jobs:
         # An artifact, not job outputs: the job holding the bot write-token must
         # never run in the same context as the PR checkout and the judge agent.
         # Deliberately NOT `if: always()` — a consolidate that died before this
-        # step produced no review to post, and `post-review` says so loudly
-        # rather than posting a half-built one.
+        # step produced no review to post, and a half-built payload must not be
+        # posted. `post-review` is gated on this job SUCCEEDING, so it simply
+        # does not run; the failure stays visible as this job's own red status
+        # and `notify-complete` names which half broke.
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: cursor-review-consolidated
@@ -1971,11 +1973,29 @@ jobs:
     # published rather than from the copy the judge job had shell access to.
     name: Post review
     needs: [consolidate, ledger]
-    # always(): the interesting cases include a judge that never submitted, so
-    # this runs whenever `consolidate` actually ran. `!= 'cancelled'` keeps a
-    # superseded run (the documented caller sets cancel-in-progress) from
-    # posting over a newer one.
-    if: always() && needs.consolidate.result != 'skipped' && needs.consolidate.result != 'cancelled'
+    # `!cancelled()` rather than `always()`, for the same reason
+    # `over-cap-comment` documents at its own `if:`: the documented caller sets
+    # `cancel-in-progress: true`, and `always()` runs a job even when the RUN is
+    # cancelled. In the common supersede ordering `consolidate` has already
+    # finished and uploaded before the new push cancels the run, so its result
+    # is still `success` and a `needs.consolidate.result != 'cancelled'` test
+    # sails right past — this job would then post a review pinned to the
+    # superseded head SHA, alongside the new run's. Splitting the post into its
+    # own job WIDENED that window (cancellation used to kill the post step
+    # mid-job), so the run-level test is the one that has to be here.
+    #
+    # `== 'success'` rather than "ran at all": this job's whole input is a
+    # downloaded artifact, and artifact names are run-global. A prompt-injected
+    # panel cell (the header concedes those have shell access) can claim
+    # `cursor-review-consolidated` first; v4+ artifacts are immutable without
+    # `overwrite`, so the REAL upload then fails, `consolidate` goes red — and a
+    # gate that accepted a failed consolidate would download the spoofed payload
+    # and post it under the bot's write token. A failed `consolidate` is already
+    # visible as its own red job and is reported by `notify-complete`; there is
+    # nothing here worth posting on that path. A judge that never submitted is
+    # NOT this case: its step is `continue-on-error`, so `consolidate` still
+    # succeeds and the degraded review still posts.
+    if: ${{ !cancelled() && needs.consolidate.result == 'success' }}
     runs-on: ubuntu-latest
     # Three artifact downloads, a token mint, and post-review.py's ONE
     # `gh api POST /pulls/N/reviews` carrying every inline comment in a single
@@ -2030,10 +2050,30 @@ jobs:
           path: /tmp/consolidated
 
       - name: Require the consolidated payload
-        if: steps.payload.outcome != 'success'
+        env:
+          PAYLOAD_OUTCOME: ${{ steps.payload.outcome }}
         run: |
-          echo "::error::The consolidate job did not publish cursor-review-consolidated, so there is no review to post — see that job for the failure."
-          exit 1
+          if [ "$PAYLOAD_OUTCOME" != "success" ]; then
+            echo "::error::The consolidate job did not publish cursor-review-consolidated, so there is no review to post — see that job for the failure."
+            exit 1
+          fi
+
+          # A successful download is not a complete bundle. `if-no-files-found:
+          # error` on the upload fires only when ZERO of its three paths match,
+          # so a partial artifact uploads cleanly. Name the missing file here:
+          # the alternative is an unhandled FileNotFoundError inside `Read
+          # consolidate outputs` or inside the JUDGE_ERROR one-liner, which
+          # reads as "the poster is broken" when what happened is upstream —
+          # and which kills the run on exactly the degraded path the panel-union
+          # fallback exists to survive.
+          MISSING=""
+          for f in consolidated.json consolidated-meta.json judge-findings.json; do
+            [ -f "/tmp/consolidated/$f" ] || MISSING="$MISSING $f"
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::cursor-review-consolidated downloaded but is missing:${MISSING} — the consolidate job uploaded a partial payload, see that job."
+            exit 1
+          fi
 
       - name: Download reviewed diff
         # The same generated-file-excluded diff the panel and the judge read,
@@ -2056,7 +2096,22 @@ jobs:
         id: meta
         run: |
           python3 - <<'PY'
-          import json, os
+          import json, os, re
+
+          # `triggered_by` is the one header field post-review.py interpolates
+          # RAW — `_Triggered by @{value}._`, not routed through
+          # neutralize_mentions. That was safe while the value was `github.actor`
+          # read in the posting job itself; since the split it arrives out of a
+          # meta file assembled inside the job this workflow declares
+          # prompt-injectable, so it now crosses the trust boundary the split
+          # draws. Pin it to the shape of a GitHub login (39 chars max,
+          # alphanumerics and hyphens, plus the `[bot]` suffix `Resolve
+          # triggerer` can legitimately emit) and drop anything else: an
+          # `@org/team` mass-mention, a `[text](url)` phishing link or arbitrary
+          # markdown must not reach a review posted under the bot's write-scoped
+          # identity. post-review.py omits the attribution line entirely for an
+          # empty value, so dropping degrades to "no attribution", not to a lie.
+          LOGIN = re.compile(r"^[A-Za-z0-9-]{1,39}(\[bot\])?$")
 
           with open("/tmp/consolidated/consolidated-meta.json", encoding="utf-8") as f:
               meta = json.load(f)
@@ -2071,6 +2126,12 @@ jobs:
                   "ledger_download",
               ):
                   value = " ".join(str(meta.get(key, "")).splitlines()).strip()
+                  if key == "triggered_by" and value and not LOGIN.match(value):
+                      print(
+                          f"::warning::meta triggered_by is not a GitHub login shape "
+                          f"({len(value)} chars) — dropping the attribution line."
+                      )
+                      value = ""
                   g.write(f"{key}={value}\n")
           PY
 
@@ -2113,11 +2174,29 @@ jobs:
           # exact partial failure the banner exists to catch. So: file ABSENT
           # (delivery failed) is a banner; file PRESENT but empty is a real
           # "nothing to say" (first round / kill switch / no prior findings).
+          #
+          # The two halves are reported SEPARATELY because they mean different
+          # things to the author. If the JUDGE's download failed, the panel
+          # genuinely reviewed without prior-round context and findings may
+          # repeat earlier rounds. If only the POSTER's download failed — a case
+          # that exists only because this job now fetches the note itself — the
+          # panel and judge DID have the context and only this header could not
+          # be rendered; telling the author "findings may repeat" there would be
+          # false.
           LEDGER_NOTE=""
-          if [ "${LEDGER_DOWNLOAD:-failure}" != "success" ] \
-            || [ "${LEDGER_DOWNLOAD_JUDGE:-failure}" != "success" ] \
-            || [ ! -f /tmp/ledger/ledger-note.txt ]; then
-            LEDGER_NOTE="⚠️ prior-review context unavailable (ledger artifact did not reach the review jobs: judge=${LEDGER_DOWNLOAD_JUDGE:-missing}, post=${LEDGER_DOWNLOAD:-missing}) — the panel ran without prior-round context, so findings may repeat earlier rounds."
+          JUDGE_LEDGER_OK=true
+          if [ "${LEDGER_DOWNLOAD_JUDGE:-failure}" != "success" ]; then
+            JUDGE_LEDGER_OK=false
+          fi
+          POST_LEDGER_OK=true
+          if [ "${LEDGER_DOWNLOAD:-failure}" != "success" ] || [ ! -f /tmp/ledger/ledger-note.txt ]; then
+            POST_LEDGER_OK=false
+          fi
+
+          if [ "$JUDGE_LEDGER_OK" != "true" ]; then
+            LEDGER_NOTE="⚠️ prior-review context unavailable (the ledger artifact did not reach the review jobs: judge=${LEDGER_DOWNLOAD_JUDGE:-missing}, post=${LEDGER_DOWNLOAD:-missing}) — the panel ran without prior-round context, so findings may repeat earlier rounds."
+          elif [ "$POST_LEDGER_OK" != "true" ]; then
+            LEDGER_NOTE="⚠️ prior-review summary unavailable (the ledger note did not reach the posting job: post=${LEDGER_DOWNLOAD:-missing}). The panel and judge DID read prior-round context, so findings are not repeats for want of it — only this header could not be rendered."
           else
             LEDGER_NOTE="$(cat /tmp/ledger/ledger-note.txt)"
             if [ -z "$LEDGER_NOTE" ]; then
