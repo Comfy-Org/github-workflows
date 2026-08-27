@@ -110,18 +110,31 @@ CONSOLIDATED_MARKER = gate_unresolved.CONSOLIDATED_MARKER
 # non-whitespace — today's emoji, one this version has never seen, or none at all — so
 # the ledger keeps parsing bodies written by an OLDER post-review.py still live on a
 # pinned caller ref; sharing the strict formatter would lose that. The tolerance is not
-# a check: a forged `<anything>**Critical** — ` prefix strips just as happily, which is
-# safe only because the one caller reads thread roots of Bot-authored consolidated
-# reviews — bodies this workflow itself wrote. Narrow it before pointing _strip_badge at
-# imported PR text.
+# a check: a forged `<anything>**Critical** — ` prefix strips just as happily. What the
+# one caller actually enforces on the bodies it feeds here is _consolidated_reviews'
+# gate — author type Bot, PLUS a marker that this public repo puts within anyone's
+# reach — so the guarantee is "some Bot wrote it", not "this workflow wrote it". That
+# is enough only because clearing that gate already hands the forger the entry's whole
+# prose, badge or no badge. Narrow the prefix before pointing _strip_badge at imported
+# PR text, where the author is not gated at all.
 #
 # The literals pin the LABELS and the dash CHARACTER only; the `\s*` runs absorb any
 # spacing change. The duplication is pinned by test, not shared: test_build_ledger.py
 # drives post-review.py's real renderer through this pattern for every key of
 # SEVERITY_EMOJI — the table `normalize_severity` actually gates the renderable
 # vocabulary on — so adding a severity, renaming a label or changing the dash fails
-# there rather than silently stopping the strip. On a rename, ADD the new label and
-# KEEP the old: rounds already posted by a caller on an older ref still carry it.
+# there rather than silently stopping the strip.
+#
+# Two editing rules that red test cannot state for you:
+#   * ADD, never replace. On a label rename, keep the old label in the alternation
+#     beside the new one — rounds already posted by a caller pinned to an older ref
+#     still carry it. The dash has the IDENTICAL old-ref exposure, so a dash change
+#     means widening `—` to a character class holding both, not swapping it: replace
+#     it and those rounds stop stripping silently, with nothing left to fail.
+#   * A new label's lowercase MUST equal its severity key. _strip_badge derives the
+#     ledger's severity from `match.group(1).lower()`, so a label-only rename (`Nit`
+#     -> `Nitpick`, key still `nit`) files entries under a severity string none of
+#     post-review.py's tables use. Rename both, or map label -> key here.
 _BADGE_RE = re.compile(r"^\S*\s*\*\*(Critical|High|Medium|Low|Nit)\*\*\s*—\s*", re.UNICODE)
 
 # Every character that STARTS A NEW LINE for `str.splitlines()` — and so, plausibly,

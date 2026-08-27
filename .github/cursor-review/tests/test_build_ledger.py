@@ -41,6 +41,7 @@ def _load(name, filename):
 
 bl = _load("build_ledger", "build-ledger.py")
 pr = _load("post_review", "post-review.py")
+mcp = _load("review_output_mcp", "review-output-mcp.py")
 
 MARKER = bl.CONSOLIDATED_MARKER
 
@@ -1446,14 +1447,35 @@ class TestSeverityBadgeContract(unittest.TestCase):
         self.assertEqual(len(comments), 1)
         return comments[0]["comment"]["body"]
 
-    def test_the_three_severity_tables_carry_the_same_keys(self):
+    def test_every_copy_of_the_severity_vocabulary_carries_the_same_keys(self):
         """Guards the loop below, which would pass vacuously over an emptied table —
         and catches a severity added to EMOJI/LABEL (so post-review.py renders it)
         but left out of ORDER, which the sort-order loop would never have exercised.
+
+        `review-output-mcp.py`'s SEVERITIES is in here as the fourth copy: it is the
+        ingress schema deciding what a model may submit at all, so a severity added to
+        post-review.py's tables and to `_BADGE_RE` but not to it is rejected at
+        submission and never reaches either end of the badge contract.
         """
         self.assertTrue(pr.SEVERITY_EMOJI)
         self.assertEqual(set(pr.SEVERITY_EMOJI), set(pr.SEVERITY_LABEL))
         self.assertEqual(set(pr.SEVERITY_EMOJI), set(pr.SEVERITY_ORDER))
+        self.assertEqual(set(pr.SEVERITY_EMOJI), set(mcp.SEVERITIES))
+
+    def test_the_default_severity_is_one_post_review_can_render(self):
+        """The one relationship here whose breach CRASHES rather than degrades.
+
+        `normalize_severity` maps every unknown/missing severity to DEFAULT_SEVERITY
+        and `normalize_comments` then indexes `SEVERITY_EMOJI[severity]` unguarded, so
+        a severity key renamed consistently across all three tables leaves the equality
+        above green while the first model-supplied unknown severity raises KeyError —
+        killing the consolidate job after the whole panel and the judge have run.
+        """
+        self.assertIn(pr.DEFAULT_SEVERITY, pr.SEVERITY_EMOJI)
+        self.assertEqual(
+            bl._strip_badge(self._rendered_body("not-a-severity")),
+            (pr.DEFAULT_SEVERITY, self.PROSE),
+        )
 
     def test_every_severity_post_review_renders_is_stripped_by_the_ledger(self):
         for severity in pr.SEVERITY_EMOJI:
@@ -1462,8 +1484,14 @@ class TestSeverityBadgeContract(unittest.TestCase):
                 self.assertEqual(bl._strip_badge(body), (severity, self.PROSE))
 
     def test_the_ledger_recovers_the_severity_of_an_older_or_emojiless_badge(self):
-        """The tolerant prefix is the point of not sharing the formatter — hold it."""
-        for prefix in ("", "🔴 ", "🆕 "):
+        """The tolerant prefix is the point of not sharing the formatter — hold it.
+
+        The spaceless entry is not padding: `^\\S*` is greedy, so on `🔴**Critical** — `
+        it first swallows the label too and only backtracks to the emoji. That is the
+        behaviour the comment in build-ledger.py leans on, and no other case here
+        exercises it — every other prefix ends in the whitespace `\\s*` consumes.
+        """
+        for prefix in ("", "🔴 ", "🆕 ", "🔴"):
             with self.subTest(prefix=prefix):
                 self.assertEqual(
                     bl._strip_badge(f"{prefix}**Critical** — {self.PROSE}"),
