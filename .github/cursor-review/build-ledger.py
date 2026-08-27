@@ -112,6 +112,35 @@ _BADGE_RE = re.compile(r"^\S*\s*\*\*(Critical|High|Medium|Low|Nit)\*\*\s*—\s*"
 # `=== BEGIN PANEL FINDINGS ===`. See _defang_fences.
 _FENCE_LINE_RE = re.compile(r"^[ \t]*={2,}.*$", re.MULTILINE)
 
+# post-review.py demotes a finding whose line the reviewed diff does not carry into the
+# review BODY (BE-9531). Such a finding has no review comment, so the thread-root scan
+# below cannot see it: without this it never enters the ledger, gets no `repeat_of`
+# link and no REPEAT_CAP cover, and a round whose findings were ALL demoted reads as a
+# review that found nothing. So post-review.py also emits a machine-readable copy of
+# them as an HTML comment at the head of that section, and this reads it back.
+#
+# Non-greedy up to the first `-->`, and pinned to the exact version string: a payload
+# this parser does not understand must FAIL rather than be half-guessed, which is what
+# the degradation note then discloses. Every `-` is escaped as its JSON `\u002d` form
+# on the writing side, so a `-->` inside a finding body cannot close the comment early.
+#
+# Anchored to a LINE START (MULTILINE), which is the control that stops a finding from
+# forging one. A demoted finding's prose is rendered as a blockquote, so every line of
+# it begins with `>` (post-review.py's render_finding_entry, which splits on every
+# CommonMark line ending) — a `<!-- cursor-review:body-only-findings ... -->` a model
+# emitted inside a finding body therefore never sits at column 0 and can never be the
+# match. The real sentinel does, and it is also the FIRST thing in the section, so even
+# a forgery that somehow reached column 0 would lose to it.
+_BODY_ONLY_SENTINEL_RE = re.compile(
+    r"^<!--\s*cursor-review:body-only-findings\s+v1\s+(.*?)-->",
+    re.DOTALL | re.MULTILINE,
+)
+# The human-readable line post-review.py renders directly BELOW the sentinel. Only used
+# to tell "this round demoted findings and the sentinel is unreadable" apart from "this
+# round demoted nothing" — the first must never be silent. Pinned against
+# post-review.py's real render by test_build_ledger.py so the two cannot drift apart.
+BODY_ONLY_PROSE_MARKER = "could not be anchored to a line the reviewed diff carries"
+
 # Review authors whose consolidated reviews we will trust as prior rounds. The
 # review posts as `github-actions[bot]` by default, or under a dedicated App
 # when the caller sets `bot_app_id`; both are GitHub user type "Bot", so this
@@ -243,6 +272,89 @@ def _consolidated_reviews(reviews: list) -> list:
     return ours
 
 
+def _parse_body_only_sentinel(body: str):
+    """Recover the demoted findings post-review.py encoded in a review body.
+
+    Returns a list of raw finding dicts, or ``None`` when there is nothing this
+    parser can trust — no sentinel, a version it does not know, a payload the tail
+    clamp cut mid-JSON, or a shape that is not a list of objects. ``None`` is never
+    the same as ``[]``: the caller turns it into a disclosed degradation note when the
+    prose marker says findings WERE demoted, and that is what keeps a round whose
+    sentinel is unreadable from silently reading as a round that found nothing.
+
+    Provenance is the caller's: only Bot-authored, marker-carrying, non-dismissed
+    reviews reach here, which is the same control that gates every other thing the
+    ledger imports. Types are still checked, because a payload that got this far is
+    still text and a malformed one must degrade rather than raise.
+    """
+    match = _BODY_ONLY_SENTINEL_RE.search(body or "")
+    if not match:
+        return None
+    try:
+        payload = json.loads(match.group(1).strip())
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, list):
+        return None
+    return [item for item in payload if isinstance(item, dict)]
+
+
+def _body_only_line(value):
+    """Coerce a sentinel's ``line`` to an int, or None.
+
+    ``bool`` is excluded explicitly because it is a subclass of ``int`` and would
+    otherwise render as line ``True``/``False`` — the same trap render_repeat_round
+    already guards in post-review.py.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def _body_only_entries(review: dict, meta: dict, max_body: int):
+    """(entries, degraded) for one consolidated review's demoted findings.
+
+    ``degraded`` is True when the review says it demoted findings but the sentinel
+    could not be read — the caller discloses that as a truncation note.
+    """
+    parsed = _parse_body_only_sentinel(review.get("body") or "")
+    if parsed is None:
+        return [], BODY_ONLY_PROSE_MARKER in (review.get("body") or "")
+    entries = []
+    for item in parsed:
+        entries.append(
+            {
+                "round": meta["round"],
+                "commit": meta["commit"],
+                "posted_at": meta["posted_at"],
+                "path": str(item.get("path") or ""),
+                "line": _body_only_line(item.get("line")),
+                "severity": str(item.get("severity") or ""),
+                "finding": _truncate(item.get("body") or "", max_body),
+                # Permanently unanswered, by construction: there is no thread to
+                # reply on. answered_count=0 is what makes these cap-EXEMPT, matching
+                # the existing rule that only an ANSWERED finding costs a repeat slot.
+                "thread": {
+                    "resolved": False,
+                    "outdated": False,
+                    "reply_count": 0,
+                    "answered_count": 0,
+                },
+                "replies": [],
+                "dropped_replies": 0,
+                # No thread means no permalink. Rendered as an omitted line rather
+                # than an empty one, so the judge can never emit it as a `repeat_of`.
+                "discussion_url": "",
+                "anchored": False,
+            }
+        )
+    return entries, False
+
+
 def _resolve_root_id(comment: dict, by_id: dict):
     """Walk in_reply_to_id up to the thread root (GitHub nests at most shallowly,
     but the walk is bounded anyway so a cyclic/broken chain can't hang)."""
@@ -360,7 +472,21 @@ def build_ledger(
             continue
         replies_by_root.setdefault(root_id, []).append(comment)
 
+    # Findings this round DEMOTED into its own body: no comment, so no thread root
+    # above ever sees them. Read straight off the consolidated reviews, which the
+    # Bot-author + marker + not-DISMISSED filter has already vouched for.
     entries = []
+    body_only_notes = []
+    for review in consolidated:
+        meta = round_by_review[review.get("id")]
+        recovered, degraded = _body_only_entries(review, meta, max_body)
+        entries.extend(recovered)
+        if degraded:
+            body_only_notes.append(
+                f"Round {meta['round']} demoted finding(s) to its body that could not "
+                "be recovered — they may repeat."
+            )
+
     for root in roots:
         meta = round_by_review[root.get("pull_request_review_id")]
         severity, finding = _strip_badge(root.get("body") or "")
@@ -414,12 +540,15 @@ def build_ledger(
                 "replies": replies,
                 "dropped_replies": dropped_replies,
                 "discussion_url": root.get("html_url") or "",
+                # Has a real review thread — so it CAN be answered/resolved, and it is
+                # the only kind of entry a `repeat_of` may point at.
+                "anchored": True,
             }
         )
 
     entries.sort(key=lambda e: (e["round"], e["path"], e["line"] or 0))
 
-    notes = []
+    notes = list(body_only_notes)
     kept_from = max(1, total_rounds - max_rounds + 1)
     if total_rounds > max_rounds:
         entries = [e for e in entries if e["round"] >= kept_from]
@@ -464,6 +593,10 @@ def build_ledger(
         "entry_count": len(entries),
         "unanswered_count": unanswered,
         "notes": notes,
+        # How many rounds demoted findings we could not read back. Kept structurally
+        # rather than sniffed out of `notes` so ledger_note can tell "the caps dropped
+        # entries that existed" from "we never recovered them" without matching prose.
+        "unrecovered_rounds": len(body_only_notes),
     }
 
 
@@ -552,6 +685,11 @@ _JUDGE_STEERING = (
     "  only when the reply gives a checkable technical reason that defeats it.\n"
     "  A deferral (\"real, but deferred\") is not a refutation — but re-raising a\n"
     "  deferral costs one of your repeat slots, so spend it on severity.\n"
+    "- An entry marked [unanchorable] has NO discussion_url and never takes\n"
+    "  repeat_of — it was demoted to a review body, so no thread exists and nobody\n"
+    "  could have answered it. If the same unanchorable finding appears in several\n"
+    "  recent rounds, prefer NOT re-raising it unless its severity warrants; if you\n"
+    "  do re-raise it, say in the body that it repeats unanchored.\n"
 )
 
 
@@ -589,14 +727,24 @@ def render_ledger_markdown(ledger: dict, audience: str = "panel") -> str:
                 f"posted {entry['posted_at'] or '?'}) ---\n"
             )
         thread = entry["thread"]
+        # Pre-BE-9565 entries (and every thread-derived one) are anchored; only a
+        # finding recovered from a review body is not, so default to True.
+        anchored = entry.get("anchored", True)
+        header = f"\n* {entry['path']}:{entry['line']}"
+        if entry["severity"]:
+            header += f" [{entry['severity']}]"
+        if not anchored:
+            header += " [unanchorable]"
         # entry['finding'] and reply['text'] are imported PR prose — the two
         # untrusted fields in this block. Defanged so neither can forge the
         # fence that makes the block DATA. See _defang_fences.
         lines.append(
-            f"\n* {entry['path']}:{entry['line']}"
-            f"{' [' + entry['severity'] + ']' if entry['severity'] else ''}\n"
-            f"  discussion_url: {entry['discussion_url']}\n"
-            f"  thread: resolved={str(thread['resolved']).lower()} "
+            f"{header}\n"
+            # Omitted, not blanked, when there is no thread: an empty
+            # `discussion_url:` line reads as a field the judge could fill in, and
+            # repeat_of must point at a real thread or nothing.
+            + (f"  discussion_url: {entry['discussion_url']}\n" if anchored else "")
+            + f"  thread: resolved={str(thread['resolved']).lower()} "
             f"outdated={str(thread['outdated']).lower()} "
             f"replies={thread['reply_count']} "
             f"answers_from_author_or_maintainer={thread['answered_count']}\n"
@@ -618,7 +766,15 @@ def render_ledger_markdown(ledger: dict, audience: str = "panel") -> str:
                 # judge must not treat it as one.
                 tag = " (third party — NOT an answer)"
             lines.append(f"  reply from {who}{tag}: {_defang_fences(reply['text'])}\n")
-        if thread["answered_count"] == 0:
+        if not anchored:
+            # Stronger than "never answered": nobody COULD have answered it. Said
+            # explicitly so the judge does not read a bare answered_count=0 as an
+            # author who ignored the finding.
+            lines.append(
+                "  (unanchorable — demoted to the review body, no thread exists, "
+                "cannot be answered or resolved; re-raising needs no repeat_of)\n"
+            )
+        elif thread["answered_count"] == 0:
             lines.append(
                 "  (never answered by the author or a maintainer — re-raising this "
                 "needs no repeat_of)\n"
@@ -641,13 +797,22 @@ def ledger_note(ledger: dict) -> str:
     if status != "ok":
         return ""
     if not ledger.get("entries"):
-        # Caps dropped every entry. Prior rounds exist, so this is NOT a first
-        # round and must not read like one — say the context was dropped.
-        if ledger.get("notes"):
+        # Something was lost. Prior rounds exist, so this is NOT a first round and must
+        # not read like one — say so, and say which of the two losses it was. A cap
+        # note means entries existed and were dropped for size; a note from an
+        # unreadable body-only sentinel means they could never be read back at all.
+        notes = ledger.get("notes") or []
+        if notes and len(notes) > ledger.get("unrecovered_rounds", 0):
             return (
                 f"Round {ledger['total_rounds'] + 1} — prior-review ledger dropped for "
                 f"size ({ledger['total_rounds']} earlier round(s) exist, no entries fit) "
                 "— findings may repeat earlier rounds."
+            )
+        if notes:
+            return (
+                f"Round {ledger['total_rounds'] + 1} — prior-review ledger could not "
+                f"recover the finding(s) demoted to the body of {ledger['total_rounds']} "
+                "earlier round(s) — findings may repeat earlier rounds."
             )
         return ""
     return (

@@ -631,6 +631,11 @@ class BodyStructureTest(unittest.TestCase):
         items = PR.normalize_comments([finding("app.py", 11, body=hostile)])
         md = PR.render_body_only_findings(items)
         for line in md.splitlines():
+            # The sentinel (BE-9565) is an HTML comment, not rendered prose — it is
+            # exempt from the blockquote rule, and the next assertion is what holds it
+            # to its own containment contract instead.
+            if line.startswith(f"<!-- {PR.BODY_ONLY_SENTINEL_PREFIX} "):
+                continue
             if line and not line.startswith("_"):
                 self.assertTrue(
                     line.startswith(">"),
@@ -638,6 +643,12 @@ class BodyStructureTest(unittest.TestCase):
                 )
         self.assertNotIn("\n## Forged", md)
         self.assertIn("Forged heading", md, "the text is still reported, just contained")
+        # The sentinel's containment is JSON escaping: the hostile body's newlines are
+        # encoded, so it stays on ONE line and cannot open a heading or a fence either.
+        sentinel = PR.render_body_only_sentinel(items)
+        self.assertTrue(sentinel.startswith("<!-- ") and sentinel.endswith(" -->"))
+        self.assertNotIn("\n", sentinel, "the hostile body's newlines stayed JSON-escaped")
+        self.assertEqual(md.splitlines()[0], sentinel, "and it is the section's first line")
 
     def test_the_same_containment_covers_the_body_only_render(self):
         hostile = "x\n# Forged"
@@ -1365,6 +1376,126 @@ class SurrogateSafePostTest(unittest.TestCase):
     def test_clamp_review_body_scrubs_the_assembled_body(self):
         # The choke point every POSTed body passes through.
         PR.clamp_review_body(json.loads('"head \\ud800 tail"')).encode("utf-8")
+
+
+class BodyOnlySentinelTest(unittest.TestCase):
+    """The machine-readable handoff to build-ledger.py (BE-9565).
+
+    A demoted finding has no review comment, so the ledger cannot see it from the
+    thread roots. This comment is the only channel it has, which makes three things
+    load-bearing: it comes FIRST (the clamp cuts the tail), it round-trips as JSON,
+    and no finding body can close it early with a `-->`.
+    """
+
+    def _sentinel(self, md):
+        self.assertTrue(md.startswith("<!-- "), md[:80])
+        return md.splitlines()[0]
+
+    def _payload(self, md):
+        sentinel = self._sentinel(md)
+        return json.loads(sentinel[len("<!-- ") + len(PR.BODY_ONLY_SENTINEL_PREFIX) : -len(" -->")])
+
+    def test_the_sentinel_precedes_the_prose_and_round_trips(self):
+        items = PR.normalize_comments(
+            [finding("a/b.py", 42, severity="critical", body="drop the lock first")]
+        )
+        md = PR.render_body_only_findings(items)
+        sentinel_end = md.index(" -->") + len(" -->")
+        self.assertLess(sentinel_end, md.index("could not be anchored"))
+        self.assertEqual(
+            self._payload(md),
+            [
+                {
+                    "path": "a/b.py",
+                    "line": 42,
+                    "severity": "critical",
+                    # The badge normalize_comments prefixed is stripped back off:
+                    # severity is its own field, and the ledger re-renders it.
+                    "body": "drop the lock first",
+                }
+            ],
+        )
+
+    def test_no_body_can_close_the_comment_early(self):
+        for hostile in (
+            "closes here --> and the rest leaks",
+            "-" * 50,
+            "a--b--c-->d",
+            "trailing dash-",
+            "<!-- nested --> comment",
+        ):
+            with self.subTest(hostile=hostile):
+                items = PR.normalize_comments([finding("x.py", 1, body=hostile)])
+                sentinel = self._sentinel(PR.render_body_only_findings(items))
+                inner = sentinel[len("<!-- ") : -len(" -->")]
+                self.assertNotIn("--", inner, "a `--` run can close the comment early")
+                payload_json = inner[len(PR.BODY_ONLY_SENTINEL_PREFIX) :]
+                self.assertNotIn(
+                    "-", payload_json, "every dash in the payload is escaped, so none can pair up"
+                )
+                self.assertEqual(
+                    json.loads(payload_json)[0]["body"],
+                    hostile,
+                    "and the escape is lossless — JSON decodes it back",
+                )
+
+    def test_a_body_is_truncated_to_the_ledger_cap_and_says_so(self):
+        items = PR.normalize_comments([finding("x.py", 1, body="z" * 5000)])
+        body = self._payload(PR.render_body_only_findings(items))[0]["body"]
+        self.assertLessEqual(len(body), PR.BODY_ONLY_SENTINEL_BODY_CHARS)
+        # Marked, not just cut: build-ledger.py truncates to the SAME number, so a body
+        # trimmed to exactly it would arrive on the reading side looking complete.
+        self.assertTrue(body.endswith(PR.BODY_ONLY_TRUNCATION_MARKER), body[-40:])
+
+    def test_a_body_at_the_cap_is_left_alone(self):
+        exact = "z" * PR.BODY_ONLY_SENTINEL_BODY_CHARS
+        self.assertEqual(PR.truncate_sentinel_body(exact), exact)
+        self.assertEqual(PR.truncate_sentinel_body("short"), "short")
+
+    def test_a_hostile_path_cannot_fire_a_mention_from_the_sentinel(self):
+        items = PR.normalize_comments([finding("dir/@security-team.py", 1)])
+        md = PR.render_body_only_findings(items)
+        self.assertNotIn("@security-team", md)
+        self.assertIn("security-team", self._payload(md)[0]["path"])
+
+    def test_the_sentinel_survives_the_clamp_that_cuts_the_prose(self):
+        """The reason it goes first. A body over the limit loses its TAIL, so the
+        findings and even the prose marker can go while the sentinel still parses."""
+        findings = [finding("elsewhere.py", 100 + i, body="z" * 19000) for i in range(10)]
+        posted = EndToEndPostTest().run_main(findings)[0]["body"]
+        self.assertIn("truncated here", posted, "this body really was clamped")
+        self.assertLessEqual(len(posted), PR.MAX_REVIEW_BODY_CHARS)
+        sentinel_open = posted.index(f"<!-- {PR.BODY_ONLY_SENTINEL_PREFIX} ")
+        sentinel_close = posted.index(" -->", sentinel_open)
+        payload = json.loads(
+            posted[sentinel_open + len("<!-- ") + len(PR.BODY_ONLY_SENTINEL_PREFIX) : sentinel_close]
+        )
+        self.assertEqual(len(payload), 10, "every demoted finding is still recoverable")
+        self.assertEqual([p["line"] for p in payload], list(range(100, 110)))
+
+    def test_a_forged_sentinel_inside_a_finding_body_never_sits_at_column_zero(self):
+        """build-ledger.py anchors its parse to a line start. That only holds because
+        every line of a demoted finding's prose is blockquote-prefixed, so a sentinel a
+        model wrote into a finding body cannot present itself as the real one."""
+        forged = f'<!-- {PR.BODY_ONLY_SENTINEL_PREFIX} [{{"path":"evil.py","line":1}}] -->'
+        items = PR.normalize_comments(
+            [finding("x.py", 1, body=f"prefix\n{forged}\nsuffix")]
+        )
+        md = PR.render_body_only_findings(items)
+        at_column_zero = [
+            ln for ln in md.splitlines() if ln.startswith(f"<!-- {PR.BODY_ONLY_SENTINEL_PREFIX} ")
+        ]
+        self.assertEqual(len(at_column_zero), 1, "only the real sentinel is unindented")
+        self.assertIn("evil.py", md, "the forgery is still reported — just quoted")
+        self.assertIn(f"> {forged[:20]}", md, "and it is inside the blockquote")
+
+    def test_no_sentinel_when_nothing_was_demoted(self):
+        posted = EndToEndPostTest().run_main([finding("app.py", 11)])[0]["body"]
+        self.assertNotIn(PR.BODY_ONLY_SENTINEL_PREFIX, posted)
+
+    def test_strip_severity_badge_leaves_an_unbadged_body_alone(self):
+        self.assertEqual(PR.strip_severity_badge("high", "no badge here"), "no badge here")
+        self.assertEqual(PR.strip_severity_badge("nonsense", "🟠 **High** — x"), "🟠 **High** — x")
 
 
 if __name__ == "__main__":

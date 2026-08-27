@@ -78,6 +78,23 @@ MAX_FENCE_CHARS = 64
 # what the judge prompt block quotes.
 REPEAT_CAP = 2
 
+# Machine-readable handoff for findings demoted to the review body (BE-9565).
+# build-ledger.py derives its entries from review-COMMENT thread roots, and a demoted
+# finding has no comment — so without this it never reaches the next round's ledger and
+# a fully-demoted round reads as a review that found nothing. The prose below the
+# sentinel is what humans read; THIS is the contract, and the version suffix is what
+# lets the reader reject a payload it does not understand instead of guessing.
+BODY_ONLY_SENTINEL_PREFIX = "cursor-review:body-only-findings v1"
+# Mirrors build-ledger.py's MAX_BODY_CHARS: the ledger truncates to that anyway, so
+# encoding more only spends review-body budget that the clamp would take back. The
+# marker mirrors its TRUNCATION_MARKER for the same reason — cutting to exactly the
+# ledger's own limit would leave a cut body indistinguishable from a whole one on the
+# reading side, since the ledger's `_truncate` then no-ops and adds no marker of its
+# own. Duplicated rather than imported (neither module imports the other); pinned
+# together by test_build_ledger.py.
+BODY_ONLY_SENTINEL_BODY_CHARS = 600
+BODY_ONLY_TRUNCATION_MARKER = " …[truncated]"
+
 
 def normalize_severity(value) -> str:
     """Coerce a model-supplied severity into one of SEVERITY_ORDER.
@@ -747,11 +764,79 @@ def render_finding_entry(c: dict) -> str:
     return "\n".join(f"> {ln}" if ln else ">" for ln in MD_LINE_BREAK_RE.split(text))
 
 
+def strip_severity_badge(severity: str, body: str) -> str:
+    """Remove the badge normalize_comments prefixed, leaving the finding's own prose.
+
+    Reconstructed from the same two tables that built it rather than re-matched with a
+    regex, so the two can never drift: if the badge format changes, this stops matching
+    and the sentinel carries a badge-prefixed body — cosmetic — instead of silently
+    eating the first line of a finding the way a loose pattern would.
+    """
+    badge = f"{SEVERITY_EMOJI.get(severity, '')} **{SEVERITY_LABEL.get(severity, '')}** — "
+    return body[len(badge):] if body.startswith(badge) else body
+
+
+def truncate_sentinel_body(body: str) -> str:
+    """Cut a finding body to the ledger's own limit, marked, so the cut is visible.
+
+    Sized so the RESULT is within the limit: build-ledger.py truncates to the same
+    number, so a body cut to exactly it would arrive looking complete.
+    """
+    if len(body) <= BODY_ONLY_SENTINEL_BODY_CHARS:
+        return body
+    keep = BODY_ONLY_SENTINEL_BODY_CHARS - len(BODY_ONLY_TRUNCATION_MARKER)
+    return body[:keep].rstrip() + BODY_ONLY_TRUNCATION_MARKER
+
+
+def render_body_only_sentinel(items: list) -> str:
+    """The machine-readable half of the demoted-findings section (BE-9565).
+
+    One HTML comment carrying the demoted findings as compact JSON, so build-ledger.py
+    can recover from the posted review body what has no thread to be recovered from.
+
+    The `-` escaping is the load-bearing part. Finding bodies are model output derived
+    from PR content, so one can contain `-->` and close the comment early — which would
+    spill the remainder of the JSON into the rendered review AND hand the ledger a
+    truncated payload. Escaping EVERY `-` as `\\u002d` after encoding (JSON decodes it
+    back to `-`) removes the character entirely, so no `--` run can exist inside the
+    comment at all. Post-encode is the only place this works: escaping before encoding
+    would have json.dumps escape the backslash and the reader would decode six literal
+    characters instead of a dash.
+
+    That blanket replace is safe because the only JSON tokens outside string literals
+    here are `[`, `]`, `{`, `}`, `,`, `:` and the digits of `line` — normalize_comments
+    guarantees `line` is a POSITIVE int, so no `-` can appear as a number's sign.
+    """
+    payload = [
+        {
+            # neutralize_mentions, like render_code_ref does for the prose half. The
+            # body was already neutralized in normalize_comments, but `path` is raw
+            # model output until it is rendered — and this render is still a POSTed
+            # review body, so an `@handle` in it would fire a live mention from the bot
+            # account. An HTML comment is not a reliable place to hide one.
+            "path": neutralize_mentions(item["comment"]["path"]),
+            "line": item["comment"]["line"],
+            "severity": item["severity"],
+            "body": truncate_sentinel_body(
+                strip_severity_badge(item["severity"], item["comment"]["body"])
+            ),
+        }
+        for item in items
+    ]
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    escaped = encoded.replace("-", "\\u002d")
+    return f"<!-- {BODY_ONLY_SENTINEL_PREFIX} {escaped} -->"
+
+
 def render_body_only_findings(items: list) -> str:
     """Render findings that could not be anchored, for inclusion in the review body."""
     if not items:
         return ""
+    # Sentinel FIRST, before the prose. clamp_review_body cuts the tail, so anchoring
+    # the machine-readable copy at the head of the section is what keeps it recoverable
+    # for as long as any of the section survives the clamp at all.
     md = (
+        f"{render_body_only_sentinel(items)}\n\n"
         "_The finding(s) below could not be anchored to a line the reviewed diff "
         "carries, so they are reported here instead of inline:_\n\n"
     )
@@ -1096,12 +1181,15 @@ def main():
     review_body = review_head
     body_only_md = render_body_only_findings(body_only_items)
     if body_only_md:
-        # KNOWN GAP (BE-9531): build-ledger.py derives its entries from review-COMMENT
-        # thread roots, so a finding demoted to the body carries no thread — no place to
-        # answer or resolve it, no `repeat_of` link next round, and no REPEAT_CAP cover.
-        # Acceptable here because the alternative was losing every anchor to a 422, but
-        # demotion is now a routine success path rather than an all-or-nothing failure,
-        # so the ledger should learn to carry these. Tracked as a follow-up.
+        # A demoted finding still carries no THREAD — there is no place to answer or
+        # resolve it — but since BE-9565 it does reach the next round's ledger: the
+        # section opens with the `cursor-review:body-only-findings` sentinel that
+        # build-ledger.py parses back out of this body, so a fully-demoted round can no
+        # longer read as a review that found nothing. Those entries are permanently
+        # UNANSWERED, hence cap-exempt, which is the same rule an unanswered thread
+        # already gets. What is still open: the demoted half of a WHOLESALE fallback
+        # body (the 422 path below) carries no sentinel, because it is not rendered
+        # through render_body_only_findings.
         review_body += f"\n\n---\n\n{body_only_md}"
 
     # Every finding, most → least urgent, for any render that has no inline half.
