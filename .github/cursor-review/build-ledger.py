@@ -39,9 +39,11 @@ replier is the PR author) and let the judge read the rest.
 
 Prompt injection
 ----------------
-The ledger imports PR comment text into a reviewer prompt on a workflow whose
-``consolidate`` job holds ``pull-requests: write``, so it is a new untrusted
-channel. The workflow's ``gate`` job already skips fork PRs, so the surface is
+The ledger imports PR comment text into a reviewer prompt read by agent jobs
+that hold ``contents: read`` only, so it cannot reach a write-scoped credential
+directly — but it is still a new untrusted channel: it steers what the panel and
+the judge report, and the review those jobs produce is posted verbatim by the
+separate ``post-review`` job. The workflow's ``gate`` job already skips fork PRs, so the surface is
 same-repo PRs plus bot-authored text (Dependabot, cloud-code-bot) — and, on a
 public repo, anything any reader can post to the PR. Four controls, in order of
 how much they carry:
@@ -763,9 +765,9 @@ def unknown_ledger(call: str, reason: str) -> dict:
     """A ledger that could not be read. NEVER reported as `empty`.
 
     A guard that cannot read its input says so: the prompt section is omitted
-    (there is nothing truthful to put in it) and consolidate renders a banner on
-    the review naming the failed call, so a context-free re-review can never look
-    identical to a genuine first round.
+    (there is nothing truthful to put in it) and the `post-review` job renders a
+    banner on the review naming the failed call, so a context-free re-review can
+    never look identical to a genuine first round.
     """
     return {
         "status": "unknown",

@@ -19,7 +19,9 @@ check. GitHub counts a *skipped* required check as passing, and that job is
 review already exists for the head SHA (the dedupe below), when the diff is over
 `diff_size_cap`, on fork PRs, and when the panel itself is skipped. So the check
 goes green in exactly the cases where no review ran, which is the opposite of a
-gate.
+gate. The `… / Post review` job is no better a candidate: it `needs:` Consolidate
+panel and runs only when that job SUCCEEDS, so it skips in every one of those
+cases and in the failure cases besides.
 
 A real opt-in gate did exist — a `blocking:` input and a fail-closed **Blocking
 gate** job — but both were dropped from `cursor-review.yml` in
