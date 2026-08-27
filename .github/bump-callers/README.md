@@ -542,10 +542,12 @@ could have been skipped), never pin drift (a skip that suppressed a real bump).
   the gate refuses to skip instead;
 - **every** commit in the push carries a line matching
   `^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$` **in its trailing
-  trailer block** — the maximal suffix of lines that are blank or
-  `Token: value` shaped, *and* which starts a paragraph (a blank line precedes
-  it, or it is the whole message), i.e. `git interpret-trailers --parse`
-  semantics rather than a body-wide search. A body-wide search reads the token
+  trailer block** — the maximal suffix of *body* lines (the title paragraph is
+  never scanned, so a message with no blank line at all is untrailered) that are
+  blank or `Token: value` shaped, *and* which starts a paragraph (a blank line
+  precedes it, or it opens the body right after the title), i.e.
+  `git interpret-trailers --parse` semantics rather than a body-wide search. A
+  body-wide search reads the token
   as a *declaration* when it is only being *quoted*: a `git cherry-pick -x` copy
   (whose appended `(cherry picked from commit …)` line is not trailer-shaped, so
   it correctly ends the block), a reapply carrying the original body, or a

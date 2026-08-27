@@ -1429,15 +1429,22 @@ new_case trailer_block 'Skip-caller-bump: only the TRAILING TRAILER BLOCK declar
 # LAST line ("A churn commit ends with:" / "Skip-caller-bump: true") ends up in
 # the suffix, because the scan stops on the prose ABOVE it having already
 # accumulated the token. The block must therefore also START a paragraph — be
-# preceded by a blank line, or be the whole message — which is what git itself
-# requires. A trailing `Co-authored-by:` paragraph must not launder such a quote
-# either, since the scan walks back through it to the same prose.
+# preceded by a blank line, or open the body right after the title — which is
+# what git itself requires. A trailing `Co-authored-by:` paragraph must not
+# launder such a quote either, since the scan walks back through it to the same
+# prose. The TITLE paragraph never declares: git reads no trailers out of a
+# message with no blank line at all, even when a conventional-commit subject
+# (`fix: …`) is itself token-shaped. Conversely a last paragraph made entirely
+# of token-shaped lines IS a trailer block to git, a lead-in like `Example:`
+# included — every expectation here is pinned to what
+# `git interpret-trailers --parse` prints for the same message.
 TIP=$(origin_tip)
 EVENT="${CASE}/event.json"
 for accepted in \
   $'subject\n\nbody prose here\n\nSkip-caller-bump: true' \
   $'subject\n\nSkip-caller-bump: true\n\nCo-authored-by: A Bot <bot@example.invalid>' \
   $'subject\n\nSkip-caller-bump: true\nCo-authored-by: A Bot <bot@example.invalid>' \
+  $'docs: explain the gate\n\nExample:\nSkip-caller-bump: true' \
   ; do
   write_push_event "$EVENT" "$accepted"
   run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" \
@@ -1450,6 +1457,8 @@ for rejected in \
   $'docs: explain the gate\n\nAuthors write\nSkip-caller-bump: true\nat the end of a churn commit.' \
   $'docs: explain the gate\n\nA churn commit ends with:\nSkip-caller-bump: true' \
   $'docs: explain the gate\n\nA churn commit ends with:\nSkip-caller-bump: true\n\nCo-authored-by: A Bot <bot@example.invalid>' \
+  $'fix: a behavioral change\nSkip-caller-bump: true' \
+  $'Skip-caller-bump: true' \
   ; do
   write_push_event "$EVENT" "$rejected"
   run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" \

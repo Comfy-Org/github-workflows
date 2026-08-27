@@ -518,15 +518,25 @@ emit() {
 # prevent.
 #
 # A trailer counts only inside the message's TRAILING TRAILER BLOCK — the
-# maximal suffix of lines that are blank or `Token: value` shaped, AND which
-# starts at a PARAGRAPH BOUNDARY (a blank line precedes it, or it is the whole
-# message) — rather than anywhere in the body. That is
-# `git interpret-trailers --parse` semantics, and it is what stops the token
+# maximal suffix of BODY lines that are blank or `Token: value` shaped, AND
+# which starts at a PARAGRAPH BOUNDARY (a blank line precedes it, or it opens
+# the body right after the title) — rather than anywhere in the message. That
+# is `git interpret-trailers --parse` semantics, and it is what stops the token
 # being read as a DECLARATION when it is only being QUOTED: a
 # `git cherry-pick -x` copy of a trailered commit (whose appended
 # "(cherry picked from commit ...)" line is not trailer-shaped, so it correctly
 # ends the block), a commit whose prose documents this very feature at column 0,
 # or a reapply carrying the original body along.
+#
+# The scan never reaches the TITLE: everything through the first blank line is
+# dropped before it, because git reads no trailers out of the title paragraph —
+# a message with no blank line at all is one paragraph of title and
+# unconditionally untrailered, even when a conventional-commit subject
+# (`docs: …`) is itself `Token: value` shaped and would otherwise be swallowed
+# into the suffix. (A last paragraph made ENTIRELY of token-shaped lines is a
+# trailer block even when a lead-in like `Example:` reads as prose to a human —
+# that too is exactly how git parses it, and the reviewer gate below is the
+# guard for a trailer quoted onto a behavioral PR.)
 #
 # The paragraph-boundary half is what covers the quote that is the paragraph's
 # LAST line, which the maximal-suffix rule alone does not:
@@ -558,14 +568,17 @@ SKIP_TRAILER_JQ='
     (. // "")
     | split("\n")
     | map(sub("[[:space:]]+$"; ""))
-    | . as $lines
-    | (reduce ($lines | reverse | .[]) as $line ([true, []];
-         if .[0] and (($line == "") or ($line | test("^[A-Za-z][A-Za-z0-9-]*:")))
-         then [true, (.[1] + [$line])]
-         else [false, .[1]]
-         end) | .[1] | reverse) as $block
-    | ((($block | length) == ($lines | length)) or (($block | first) == ""))
-      and ($block | any(test("^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$")));
+    | (index("") // -1) as $title_end
+    | ($title_end >= 0) and (
+        .[($title_end + 1):] as $body
+        | (reduce ($body | reverse | .[]) as $line ([true, []];
+             if .[0] and (($line == "") or ($line | test("^[A-Za-z][A-Za-z0-9-]*:")))
+             then [true, (.[1] + [$line])]
+             else [false, .[1]]
+             end) | .[1] | reverse) as $block
+        | ((($block | length) == ($body | length)) or (($block | first) == ""))
+          and ($block | any(test("^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$")))
+      );
 '
 
 # Asks whether every commit the range <from>..<to> gained ON THE WATCHED SURFACE
