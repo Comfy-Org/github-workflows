@@ -1424,6 +1424,14 @@ new_case trailer_block 'Skip-caller-bump: only the TRAILING TRAILER BLOCK declar
 # trailer block (blank or `Token: value` lines) counts. Blank lines are allowed
 # INSIDE that block, or GitHub's appended `Co-authored-by:` paragraph would push
 # an otherwise valid trailer out of it.
+#
+# The maximal-suffix rule alone is not enough: a quote that is the paragraph's
+# LAST line ("A churn commit ends with:" / "Skip-caller-bump: true") ends up in
+# the suffix, because the scan stops on the prose ABOVE it having already
+# accumulated the token. The block must therefore also START a paragraph — be
+# preceded by a blank line, or be the whole message — which is what git itself
+# requires. A trailing `Co-authored-by:` paragraph must not launder such a quote
+# either, since the scan walks back through it to the same prose.
 TIP=$(origin_tip)
 EVENT="${CASE}/event.json"
 for accepted in \
@@ -1440,6 +1448,8 @@ for rejected in \
   $'fix: a real change\n\nSkip-caller-bump: true\n\n(cherry picked from commit 0123456789abcdef0123456789abcdef01234567)' \
   $'fix: a real change\n\nSkip-caller-bump: true\n\nOn reflection this still changes behavior, so it does need the bump.' \
   $'docs: explain the gate\n\nAuthors write\nSkip-caller-bump: true\nat the end of a churn commit.' \
+  $'docs: explain the gate\n\nA churn commit ends with:\nSkip-caller-bump: true' \
+  $'docs: explain the gate\n\nA churn commit ends with:\nSkip-caller-bump: true\n\nCo-authored-by: A Bot <bot@example.invalid>' \
   ; do
   write_push_event "$EVENT" "$rejected"
   run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" \
@@ -1473,7 +1483,11 @@ check "says it must not defer"        "grep -q \"::notice::.*must not defer\" <<
 check "pins the verified tip"         "[[ \"$N\" == \"$TIP\" ]]"
 check "not this run's own sha"        "[[ \"$N\" != \"$BEHIND\" ]]"
 check "no ::error::"                  "! grep -q \"::error::\" <<<\"\$OUT\""
-# One untrailered commit anywhere in the range and the stale verdict stands —
+# The shared re-point line below the guard says "the watched surface is
+# unchanged" — which on THIS path is false, and directly contradicts the notice
+# two lines above it. The guard's own verdict must be the only one printed.
+check "no contradictory unchanged line" "! grep -q \"watched surface is unchanged\" <<<\"\$OUT\""
+# One untrailered WATCHED commit anywhere in the range and the stale verdict stands —
 # that newer run WILL bump, so deferring to it is still correct.
 printf 'name: Groom\non:\n  workflow_call:\n    inputs: {x: 1}\n' > "${SRC}/${WATCHED_PATH}"
 push_src 'fix(groom): a behavioral change to the reusable'
@@ -1571,6 +1585,106 @@ check "::notice:: annotation"         "grep -q \"::notice::\" <<<\"\$OUT\""
 # contradictory statements with nothing saying which verdict won.
 check "notice names the overridden line" "grep -q \"OVERRIDES the .pinning callers to ${TIP} and proceeding.\" <<<\"\$OUT\""
 check "no ::error::"                  "! grep -q \"::error::\" <<<\"\$OUT\""
+
+# ---------------------------------------------------------------------------
+new_case trailer_handoff_unwatched 'Skip-caller-bump: the hand-off guard ignores UNWATCHED commits'
+# The guard asks "will any newer run pin this content?", and only a commit
+# matching the fleet's `paths:` filter STARTS a run. An untrailered commit that
+# touches nothing watched can neither decline nor pin, so counting it would
+# defer this run to a run that was never triggered: behavioral commit A,
+# trailered watched commit B, untrailered README-only commit U — B declines, U
+# started nothing, and A would reach no caller.
+BEHIND=$(work_head)
+printf 'name: Groom\non:\n  workflow_call:\n    inputs: {}\n' > "${SRC}/${WATCHED_PATH}"
+git -C "$SRC" add -A
+git -C "$SRC" commit -qm $'docs(groom): reword a comment in the reusable\n\nSkip-caller-bump: true'
+printf 'unrelated file, edited by a commit no fleet watches\n' > "${SRC}/README.md"
+git -C "$SRC" add -A
+git -C "$SRC" commit -qm 'docs: reword the top-level README (starts no fleet run)'
+git -C "$SRC" push -q origin main
+TIP=$(origin_tip)
+EVENT="${CASE}/event.json"
+write_push_event "$EVENT" "$PLAIN_MSG"
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" \
+  GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$EVENT"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=true"                  "[[ \"$P\" == \"true\" ]]"
+check "NOT the stale verdict"         "! grep -q \"stale run/re-run\" <<<\"\$OUT\""
+check "says it must not defer"        "grep -q \"::notice::.*must not defer\" <<<\"\$OUT\""
+check "pins the verified tip"         "[[ \"$N\" == \"$TIP\" ]]"
+check "no ::error::"                  "! grep -q \"::error::\" <<<\"\$OUT\""
+# ...and the same shape for the pathspec fleet, whose watched surface is a
+# pathspec list rather than WATCHED + WATCHED_ASSETS. The excluded paths are
+# unwatched for exactly the same reason, so an untrailered commit touching only
+# `scripts/pr-risk/tests` must not make the guard defer either.
+new_case trailer_handoff_unwatched_pathspecs 'Skip-caller-bump: the hand-off guard honors :(exclude) too'
+seed_pr_risk
+BEHIND=$(work_head)
+printf '#!/usr/bin/env bash\necho grade-pr-risk v2\n' > "${SRC}/${RISK_TOOLS}/grade-pr-risk.sh"
+git -C "$SRC" add -A
+git -C "$SRC" commit -qm $'docs(pr-risk): reword a comment in the grader\n\nSkip-caller-bump: true'
+printf 'grader test v2\n' > "${SRC}/${RISK_TOOLS}/tests/test_grade.sh"
+git -C "$SRC" add -A
+git -C "$SRC" commit -qm 'test(pr-risk): extend the grader tests (excluded from the filter)'
+git -C "$SRC" push -q origin main
+TIP=$(origin_tip)
+EVENT="${CASE}/event.json"
+write_push_event "$EVENT" "$PLAIN_MSG"
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" \
+  WATCHED="$RISK_WATCHED" WATCHED_PATHSPECS="$RISK_PATHSPECS" WATCHED_EXEC="$RISK_EXEC" \
+  GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$EVENT"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=true"                  "[[ \"$P\" == \"true\" ]]"
+check "says it must not defer"        "grep -q \"::notice::.*must not defer\" <<<\"\$OUT\""
+check "pins the verified tip"         "[[ \"$N\" == \"$TIP\" ]]"
+
+# ---------------------------------------------------------------------------
+new_case trailer_handoff_unknown 'Skip-caller-bump: a range the guard cannot READ says so distinctly'
+# "Found an untrailered commit" and "could not evaluate the range" are the same
+# verdict (keep the stale skip) but NOT the same fact: the first means a newer
+# run really will pin this content, the second means nothing verified that. With
+# one line for both, a fleet that quietly stopped bumping leaves no trace of
+# which happened. A jq that fails is the reachable shape of "cannot read".
+BEHIND=$(work_head)
+printf 'name: Groom\non:\n  workflow_call:\n    inputs: {}\n' > "${SRC}/${WATCHED_PATH}"
+git -C "$SRC" add -A
+git -C "$SRC" commit -qm $'docs(groom): reword a comment in the reusable\n\nSkip-caller-bump: true'
+git -C "$SRC" push -q origin main
+EVENT="${CASE}/event.json"
+write_push_event "$EVENT" "$PLAIN_MSG"
+SHIMBIN="${CASE}/shim"
+mkdir -p "$SHIMBIN"
+printf '#!/usr/bin/env bash\nexit 3\n' > "${SHIMBIN}/jq"
+chmod +x "${SHIMBIN}/jq"
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" PATH="${SHIMBIN}:${PATH}" \
+  GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$EVENT"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=false"                 "[[ \"$P\" == \"false\" ]]"
+check "the stale verdict still stands" "grep -q \"stale run/re-run\" <<<\"\$OUT\""
+check "says it could not evaluate"    "grep -q \"Could not evaluate\" <<<\"\$OUT\""
+check "names it UNVERIFIED"           "grep -q \"UNVERIFIED\" <<<\"\$OUT\""
+check "names the dispatch recovery"   "grep -q \"workflow_dispatch\" <<<\"\$OUT\""
+check "not a hard failure"            "! grep -q \"::error::\" <<<\"\$OUT\""
+# With jq working, the very same range is the readable, all-trailered hand-off —
+# which is what proves the line above reports the guard's inability, not the range.
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" \
+  GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$EVENT"
+check "readable range: proceed=true"  "[[ \"$P\" == \"true\" ]]"
+check "readable range: no such line"  "! grep -q \"Could not evaluate\" <<<\"\$OUT\""
+
+# ---------------------------------------------------------------------------
+new_case trailer_bounds 'Skip-caller-bump: the guard bound and the gate bound agree'
+# The two consumers of one declaration must not disagree on how many commits
+# they will consider. They did — 50 in the hand-off guard, 2047 at the gate —
+# and the gap was silent pin drift: an all-trailered range of 51..2047 commits
+# made the guard answer "defer", while every newer push in it was inside the
+# gate's bound and declined, so nobody pinned. This asserts the two numbers,
+# which live 500 lines apart, stay one number.
+GUARD_BOUND=$(sed -n 's/^SKIP_TRAILER_RANGE_MAX=\([0-9]*\)$/\1/p' "$PREFLIGHT")
+GATE_BOUND=$(sed -n 's/.*(\.commits | length) <= \([0-9]*\)$/\1/p' "$PREFLIGHT")
+check "guard bound is a number"       "[[ \"$GUARD_BOUND\" =~ ^[0-9]+$ ]]"
+check "gate bound is a number"        "[[ \"$GATE_BOUND\" =~ ^[0-9]+$ ]]"
+check "the two bounds are equal"      "[[ \"$GUARD_BOUND\" == \"$GATE_BOUND\" ]]"
 
 echo
 echo "== $PASS passed, $FAIL failed =="

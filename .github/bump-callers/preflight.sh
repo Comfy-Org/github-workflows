@@ -172,19 +172,24 @@
 #            this run was re-pointed forward (see the re-point block below)
 #
 # One more skip verdict runs ahead of the final proceed=true, AFTER every check
-# above (BE-9561's follow-up): a push whose EVERY commit message carries a line
-# matching the anchored, case-insensitive-key regex
+# above (BE-9561's follow-up): a push whose EVERY commit message carries the
+# anchored, case-insensitive-key line
 #   ^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$
-# — the `Skip-caller-bump: true` trailer — declares itself bump-irrelevant
-# (comment/docs-only churn inside a watched surface) and skips with
-# proceed=false. Push events only: a workflow_dispatch run always bumps, which
-# is both the fleets' documented recovery path and the manual override after a
-# mistaken trailer. ALL commits in the push must carry the trailer (a mixed
-# push still bumps), and the payload's `.commits` must have <= 19 entries — the
-# push payload truncates that array at 20, and an incompletely-checked push
-# must not skip. Any read/parse failure falls through to bumping: the gate
-# FAILS OPEN, so its worst bug is status-quo churn, never pin drift. Full
-# contract at the gate itself, at the bottom of this file.
+# — the `Skip-caller-bump: true` trailer — IN ITS TRAILING TRAILER BLOCK
+# declares itself bump-irrelevant (comment/docs-only churn inside a watched
+# surface) and skips with proceed=false. The block requirement is not a detail:
+# a body-wide line search would read the token as a DECLARATION when it is only
+# being QUOTED, so a behavioral commit that merely describes this feature would
+# suppress its own bump. Push events only: a workflow_dispatch run always bumps,
+# which is both the fleets' documented recovery path and the manual override
+# after a mistaken trailer. ALL commits in the push must carry the trailer (a
+# mixed push still bumps), and the payload's `.commits` must have 1..2047
+# entries — GitHub documents the push WEBHOOK payload (what GITHUB_EVENT_PATH
+# holds) as carrying at most 2048 commits, so 2048 may be TRUNCATED and an
+# incompletely-checked push must not skip. The far lower 20-entry cap belongs to
+# the Events API's `PushEvent`, which this is not. Any read/parse failure falls
+# through to bumping: the gate FAILS OPEN, so its worst bug is status-quo churn,
+# never pin drift. Full contract at the gate itself, at the bottom of this file.
 #
 # Exits non-zero ONLY for an input we cannot trust (malformed SHA, a glob-shaped,
 # slash-terminated or non-repo-relative watched path, a set-but-blank or
@@ -513,15 +518,32 @@ emit() {
 # prevent.
 #
 # A trailer counts only inside the message's TRAILING TRAILER BLOCK — the
-# maximal suffix of lines that are blank or `Token: value` shaped — rather than
-# anywhere in the body. That is `git interpret-trailers --parse` semantics, and
-# it is what stops the token being read as a DECLARATION when it is only being
-# QUOTED: a `git cherry-pick -x` copy of a trailered commit (whose appended
+# maximal suffix of lines that are blank or `Token: value` shaped, AND which
+# starts at a PARAGRAPH BOUNDARY (a blank line precedes it, or it is the whole
+# message) — rather than anywhere in the body. That is
+# `git interpret-trailers --parse` semantics, and it is what stops the token
+# being read as a DECLARATION when it is only being QUOTED: a
+# `git cherry-pick -x` copy of a trailered commit (whose appended
 # "(cherry picked from commit ...)" line is not trailer-shaped, so it correctly
 # ends the block), a commit whose prose documents this very feature at column 0,
-# or a reapply carrying the original body along. Blank lines are allowed INSIDE
-# the block, which is what keeps GitHub's appended `Co-authored-by:` paragraph
-# from pushing an otherwise valid trailer out of it.
+# or a reapply carrying the original body along.
+#
+# The paragraph-boundary half is what covers the quote that is the paragraph's
+# LAST line, which the maximal-suffix rule alone does not:
+#   docs: explain the gate
+#
+#   A churn commit ends with:
+#   Skip-caller-bump: true
+# The suffix scan accumulates the token line and stops on the prose above it —
+# but that prose is not a blank line, so the block does not begin a paragraph
+# and the message reads as untrailered, exactly as git reads it. A trailing
+# `Co-authored-by:` paragraph does not rescue such a quote either, because the
+# scan walking back through it still lands on non-blank prose.
+#
+# Blank lines are allowed INSIDE the block, which is what keeps GitHub's
+# appended `Co-authored-by:` paragraph from pushing an otherwise valid trailer
+# out of it — and the leading blank the scan swallows on its way out of the
+# block IS the paragraph boundary being asserted.
 #
 # The value match is exact and anchored:
 #   ^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$
@@ -536,49 +558,77 @@ SKIP_TRAILER_JQ='
     (. // "")
     | split("\n")
     | map(sub("[[:space:]]+$"; ""))
-    | reverse
-    | (reduce .[] as $line ([true, []];
+    | . as $lines
+    | (reduce ($lines | reverse | .[]) as $line ([true, []];
          if .[0] and (($line == "") or ($line | test("^[A-Za-z][A-Za-z0-9-]*:")))
          then [true, (.[1] + [$line])]
          else [false, .[1]]
-         end) | .[1])
-    | any(test("^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$"));
+         end) | .[1] | reverse) as $block
+    | ((($block | length) == ($lines | length)) or (($block | first) == ""))
+      and ($block | any(test("^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$")));
 '
 
-# True when ONE raw commit message carries the trailer. `jq -Rs` slurps stdin as
-# a single JSON string, so a message containing quotes, backslashes or newlines
-# needs no escaping of our own. No jq, or any jq failure, answers false.
-message_has_skip_trailer() {
-  command -v jq >/dev/null 2>&1 || return 1
-  local verdict
-  verdict=$(printf '%s' "$1" | jq -Rrs "$SKIP_TRAILER_JQ"'
-    if skip_trailer then "yes" else "no" end' 2>/dev/null) || return 1
-  [[ "$verdict" == "yes" ]]
-}
-
-# True when EVERY commit in the range <from>..<to> carries the trailer. Callers
-# are in the staleness branch, which has already deepened the clone and proved
-# <to> descends from <from>, so the range is well defined and present locally.
+# Asks whether every commit the range <from>..<to> gained ON THE WATCHED SURFACE
+# carries the trailer. Callers are in the staleness branch, which has already
+# deepened the clone and proved <to> descends from <from>, so the range is well
+# defined and present locally. The watched surface is passed as pathspecs in
+# $3.. — the SAME ones the surface comparison above used, so the two agree by
+# construction.
 #
-# The bound is a cost stop, not a correctness one: a manual re-run of a
-# months-old run would otherwise walk (and shell out over) an unbounded range.
-# Such a range is essentially certain to contain an untrailered commit anyway —
-# rev-list answers newest-first, so the common case exits on the first one — and
-# exceeding the bound answers false, which is the status quo.
-SKIP_TRAILER_RANGE_MAX=50
+# Restricted to that surface deliberately, because the question this actually
+# answers is "will any newer run pin this content?" and only a commit matching
+# the fleet's `paths:` filter STARTS a run at all. An unwatched commit can
+# neither decline nor pin, so reading it as "untrailered, so defer" defers to a
+# run that was never triggered: behavioral commit A, trailered watched commit B
+# and an untrailered README-only commit U landing in one window would leave A
+# reaching no caller — B's run declines on the trailer and U's run does not
+# exist. Only a watched, untrailered commit is a real hand-off.
+#
+# Three exit codes, not a boolean, because "found an untrailered commit" and
+# "could not evaluate the range" must not print the same line: with one verdict
+# for both, a log could not tell a genuinely safe hand-off from a guard that
+# declined to run, on exactly the manual re-run the bound exists for.
+#   0  every watched commit in the range is trailered — this run must NOT defer
+#   1  at least one watched commit is untrailered — deferring is correct
+#   2  could not evaluate (no jq, a failed walk, no watched commit selected, or
+#      a range past the bound). The caller keeps the pre-existing stale verdict
+#      — an inability to check is not grounds to widen a skip — but says so
+#      distinctly, so the trace shows the pin-drift window may be open.
+#
+# The bound MATCHES the gate's own `.commits` bound at the foot of this file, so
+# no range the gate would skip commit-by-commit is one this guard declines to
+# evaluate. The two used to disagree (50 here, 2047 there), which left an
+# all-trailered 51..2047-commit range answering "defer" here while every newer
+# push in it declined there — nobody pinning, which is the drift this guard was
+# added to close. It is enforced by `-n` on the walk itself rather than by
+# collecting the whole range and then discarding it, so nothing unbounded is
+# ever materialized — which is what makes the bound affordable at the gate's
+# number rather than a number picked to keep the old per-commit shell-outs cheap.
+SKIP_TRAILER_RANGE_MAX=2047
 range_all_skip_trailered() {
-  command -v jq >/dev/null 2>&1 || return 1
-  local shas sha msg count=0
-  shas=$(git rev-list "$1..$2" --) || return 1
-  [[ -n "$shas" ]] || return 1
-  while IFS= read -r sha; do
-    [[ -n "$sha" ]] || continue
-    count=$((count + 1))
-    (( count <= SKIP_TRAILER_RANGE_MAX )) || return 1
-    msg=$(git log -1 --format=%B "$sha") || return 1
-    message_has_skip_trailer "$msg" || return 1
-  done <<<"$shas"
-  return 0
+  command -v jq >/dev/null 2>&1 || return 2
+  local from="$1" to="$2"
+  shift 2
+  local raw verdict
+  # One `git log` and one jq pass, not a shell-out per commit: the walk costs
+  # the same whether the range is one commit or the whole bound, which is what
+  # makes the bound affordable at the gate's number. \x1e (ASCII record
+  # separator) delimits the messages — NUL would be dropped by the command
+  # substitution, and every printable byte can legitimately appear in a message.
+  raw=$(git log -n "$((SKIP_TRAILER_RANGE_MAX + 1))" --format=$'\x1e%B' "$from..$to" -- "$@") || return 2
+  [[ -n "$raw" ]] || return 2
+  verdict=$(printf '%s' "$raw" | jq -Rrs "$SKIP_TRAILER_JQ"'
+    split("\u001e")
+    | .[1:]
+    | if length == 0 or length > '"$SKIP_TRAILER_RANGE_MAX"' then "unknown"
+      elif all(.[]; skip_trailer) then "all"
+      else "some"
+      end' 2>/dev/null) || return 2
+  case "$verdict" in
+    all) return 0 ;;
+    some) return 1 ;;
+    *) return 2 ;;
+  esac
 }
 
 # The main-only ref guard in the entrypoints cannot catch a manual RE-RUN of an
@@ -954,32 +1004,61 @@ if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
     # the pin drift the gate's header promises cannot happen.
     #
     # So ask whether the newer commits are the kind that will decline. If EVERY
-    # commit main gained since this one is trailered churn, this run is the last
-    # one that will pin this content, and it must not defer. Pin the verified
-    # TIP: every commit between here and it is author-declared bump-irrelevant,
-    # so the tip is this run's change plus nothing a caller can observe, at a
-    # commit that is actually current — the same argument the re-point below
+    # commit main gained since this one ON THE WATCHED SURFACE is trailered
+    # churn, this run is the last one that will pin this content, and it must
+    # not defer. Pin the verified TIP: every watched commit between here and it
+    # is author-declared bump-irrelevant and every other one started no run at
+    # all, so the tip is this run's change plus nothing a caller can observe, at
+    # a commit that is actually current — the same argument the re-point below
     # makes from byte-identity, made instead from the author's declaration.
     #
-    # A range this cannot READ — no jq, a failed rev-list, a range longer than
-    # the sanity bound (a manual re-run of an ancient commit) — answers false
-    # and leaves the pre-existing stale verdict standing. This guard NARROWS the
-    # stale skip; an inability to check is not grounds to widen it.
-    if range_all_skip_trailered "$head_sha" "$fetched_tip"; then
-      echo "::notice::main moved to $main_tip since $GITHUB_SHA and the watched surface changed since ($changed_surface), but EVERY commit in between carries a 'Skip-caller-bump: true' trailer — the newer commit's own run will decline to bump, so this run must not defer to it. Pinning callers to $main_tip and proceeding"
-      NEW_SHA="$main_tip"
-      repointed=1
+    # A range this cannot READ — no jq, a failed walk, a range longer than the
+    # sanity bound (a manual re-run of an ancient commit) — leaves the
+    # pre-existing stale verdict standing. This guard NARROWS the stale skip; an
+    # inability to check is not grounds to widen it. It says so on its own line
+    # first, though: the stale message claims a newer run will pin this content,
+    # and when the guard could not check, nothing verified that claim.
+    #
+    # The pathspecs handed over are whichever shape the comparison above used,
+    # so "the watched surface" means the same thing to both.
+    handoff_pathspecs=()
+    if (( ${#watched_pathspecs[@]} > 0 )); then
+      handoff_pathspecs=("${watched_pathspecs[@]}")
     else
+      # Expanded in two steps: `"${asset_dirs[@]}"` on an EMPTY array is an
+      # unbound-variable error under `set -u` on bash 3.2 (macOS), which this
+      # suite runs on.
+      handoff_pathspecs=("$WATCHED")
+      if (( ${#asset_dirs[@]} > 0 )); then
+        handoff_pathspecs+=("${asset_dirs[@]}")
+      fi
+    fi
+    handoff_rc=0
+    range_all_skip_trailered "$head_sha" "$fetched_tip" "${handoff_pathspecs[@]}" || handoff_rc=$?
+    if (( handoff_rc == 0 )); then
+      echo "::notice::main moved to $main_tip since $GITHUB_SHA and the watched surface changed since ($changed_surface), but EVERY commit in between that touches a watched path carries a 'Skip-caller-bump: true' trailer — those runs will decline to bump, so this run must not defer to them. Pinning callers to $main_tip and proceeding"
+      # Falls through to the shared re-point below, which sets NEW_SHA/repointed
+      # for both entry paths.
+    else
+      if (( handoff_rc != 1 )); then
+        echo "Could not evaluate whether the commits main gained since $GITHUB_SHA are all trailered churn (no jq, a failed history walk, or a range past ${SKIP_TRAILER_RANGE_MAX} commits) — keeping the stale verdict below unchanged, but it is UNVERIFIED: if every newer run declines on a 'Skip-caller-bump: true' trailer, this content reaches no caller until the next behavioral bump. A workflow_dispatch run of this fleet forces one."
+      fi
       echo "github.sha $GITHUB_SHA is behind main ($main_tip) and the watched surface changed since ($changed_surface) — stale run/re-run; the newer commit has its own run. Nothing to bump"
       emit false "$NEW_SHA"
       exit 0
     fi
   fi
-  # Pin callers to the VERIFIED TIP, not to this run's stale github.sha. We have
-  # just proved every watched object is byte-identical at both, so the tip is the
-  # same reusable content at a commit that is actually current — pinning the
-  # older SHA would hand every caller a non-tip commit (and, on a
-  # land-then-revert, re-pin them backwards).
+  # Pin callers to the VERIFIED TIP, not to this run's stale github.sha. Two
+  # entry paths reach here and each carries its own proof that the tip is safe
+  # to pin: the common one has just proved every watched object is
+  # byte-identical at both, and the hand-off guard above has just proved every
+  # watched commit in between declares itself bump-irrelevant. Either way the
+  # tip is the same observable content at a commit that is actually current —
+  # pinning the older SHA would hand every caller a non-tip commit (and, on a
+  # land-then-revert, re-pin them backwards). The line printed below therefore
+  # belongs to the byte-identity path ONLY: the guard has already printed its
+  # own ::notice::, and repeating "the watched surface is unchanged" after it
+  # would contradict the verdict two lines up.
   #
   # COUPLED TO THE PATH FILTER — this is only sound because every entry in the
   # fleet's `paths:` trigger is covered by the comparison above. A single-path
@@ -1024,7 +1103,9 @@ if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
   # cannot arise. There WATCHED_ASSETS buys only the COVERAGE ASSERTION above —
   # that the pathspec list still reaches under it — which is the one guard that
   # catches the list silently losing its positive `scripts/pr-risk` entry.
-  echo "main moved to $main_tip since $GITHUB_SHA, but the watched surface is unchanged — this run is still the only one for that change; pinning callers to $main_tip and proceeding"
+  if [[ -z "$surface_changed" ]]; then
+    echo "main moved to $main_tip since $GITHUB_SHA, but the watched surface is unchanged — this run is still the only one for that change; pinning callers to $main_tip and proceeding"
+  fi
   NEW_SHA="$main_tip"
   repointed=1
 fi

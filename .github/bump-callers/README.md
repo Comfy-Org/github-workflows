@@ -543,14 +543,27 @@ could have been skipped), never pin drift (a skip that suppressed a real bump).
 - **every** commit in the push carries a line matching
   `^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$` **in its trailing
   trailer block** — the maximal suffix of lines that are blank or
-  `Token: value` shaped, i.e. `git interpret-trailers --parse` semantics rather
-  than a body-wide search. A body-wide search reads the token as a
-  *declaration* when it is only being *quoted*: a `git cherry-pick -x` copy
+  `Token: value` shaped, *and* which starts a paragraph (a blank line precedes
+  it, or it is the whole message), i.e. `git interpret-trailers --parse`
+  semantics rather than a body-wide search. A body-wide search reads the token
+  as a *declaration* when it is only being *quoted*: a `git cherry-pick -x` copy
   (whose appended `(cherry picked from commit …)` line is not trailer-shaped, so
   it correctly ends the block), a reapply carrying the original body, or a
-  commit whose prose documents this feature at column 0. Blank lines are allowed
-  *inside* the block, so GitHub's appended `Co-authored-by:` paragraph does not
-  push a valid trailer out of it.
+  commit whose prose documents this feature at column 0. The paragraph-start
+  half covers the quote that is the paragraph's *last* line —
+
+  ```text
+  docs: explain the gate
+
+  A churn commit ends with:
+  Skip-caller-bump: true
+  ```
+
+  — which the suffix rule alone accepts, because the scan stops on the prose
+  above having already taken the token. Blank lines are allowed *inside* the
+  block, so GitHub's appended `Co-authored-by:` paragraph does not push a valid
+  trailer out of it (nor does it launder a quote like the one above, since the
+  scan walks back through it to the same prose).
 
 All commits, not just those touching watched paths — on a **direct push to
 `main`** that is what stops a mixed push (one behavioral commit, one trailered
@@ -582,12 +595,27 @@ that hand-off breaks: behavioral commit A lands on a watched surface, trailered
 churn commit B rewords a comment in the same surface moments later, A's run
 defers to B's run, B's run skips, and A reaches no caller until some later
 behavioral commit happens along. So before deferring, the staleness branch asks
-whether **every** commit `main` gained since this one is trailered; if so it
-does *not* defer — it pins the verified tip and proceeds, because it is the last
-run that will pin this content. A range it cannot read (no `jq`, a failed
-`rev-list`, a range past the sanity bound) leaves the pre-existing stale verdict
-standing: the guard narrows that skip, and an inability to check is not grounds
-to widen it.
+whether **every** commit `main` gained since this one **that touches the watched
+surface** is trailered; if so it does *not* defer — it pins the verified tip and
+proceeds, because it is the last run that will pin this content.
+
+Restricted to the watched surface because the question is "will any newer run
+pin this content?", and only a commit matching the fleet's `paths:` filter
+*starts* a run at all: an unwatched commit can neither decline nor pin, so
+counting it would defer this run to a run that was never triggered. The
+pathspecs handed to the guard are whichever shape the staleness comparison
+itself used (`WATCHED_PATHSPECS`, or `WATCHED` + `WATCHED_ASSETS`), so the two
+mean the same thing by construction. Its commit bound is the same 2047 as the
+gate's `.commits` bound, so no range the gate would skip commit-by-commit is one
+the guard declines to evaluate — the two disagreeing (50 vs 2047) was itself a
+pin-drift window.
+
+A range it cannot read (no `jq`, a failed history walk, no watched commit
+selected, a range past that bound) leaves the pre-existing stale verdict
+standing — the guard narrows that skip, and an inability to check is not grounds
+to widen it — but logs a **distinct** line first saying the hand-off is
+*unverified*, so a fleet that quietly stopped bumping leaves a trace of which of
+the two happened.
 
 **Known limit.** A bump run is also the *catch-up* for an earlier watched change
 whose own run never bumped — one that failed at the token mint or inside
