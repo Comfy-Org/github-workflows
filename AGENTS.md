@@ -116,10 +116,10 @@ a second catalog drifts, and this one already had. Three facts it cannot tell yo
   `bump-*-callers.yml` wrappers stay separate only so one reusable's change does not
   bump another fleet. Never fork it — forking is how other shared org machinery drifted.
 - **Comment/docs-only edit inside a watched surface? Add `Skip-caller-bump: true`**
-  as a commit trailer — the shared preflight then skips the fleet fan-out (squash
-  keeps branch trailers, so it declares the WHOLE PR bump-irrelevant). Reviewers
-  must reject it on any commit with behavioral changes; when in doubt, leave it
-  off and let the fleet bump. A `workflow_dispatch` run overrides a mistaken one.
+  as the LAST commit's trailer — only the squashed message's trailing trailer
+  block counts, and it declares the WHOLE PR bump-irrelevant for EVERY fleet.
+  Reviewers must reject it on any PR with behavioral changes; when in doubt,
+  leave it off and let the fleet bump. `workflow_dispatch` overrides a mistake.
 - **Enrolling a caller is TWO steps.** Merge the caller, *and* add the repo to its
   `*_CALLERS` roster secret. Skipping the second is the most repeated mistake here
   — the pin never moves, and it fails at startup much later with no obvious cause.

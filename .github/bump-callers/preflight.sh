@@ -504,6 +504,83 @@ emit() {
   printf 'new_sha=%s\n' "$2" >> "$GITHUB_OUTPUT"
 }
 
+# --- Skip-caller-bump trailer recognition (shared) ----------------------------
+# ONE definition of what "this commit declares itself bump-irrelevant" means,
+# read by BOTH consumers of that declaration: the hand-off guard in the
+# staleness branch below (which reads messages out of git) and the trailer gate
+# at the foot of this file (which reads them out of the push event payload). A
+# second copy of this regex is precisely the drift this directory exists to
+# prevent.
+#
+# A trailer counts only inside the message's TRAILING TRAILER BLOCK — the
+# maximal suffix of lines that are blank or `Token: value` shaped — rather than
+# anywhere in the body. That is `git interpret-trailers --parse` semantics, and
+# it is what stops the token being read as a DECLARATION when it is only being
+# QUOTED: a `git cherry-pick -x` copy of a trailered commit (whose appended
+# "(cherry picked from commit ...)" line is not trailer-shaped, so it correctly
+# ends the block), a commit whose prose documents this very feature at column 0,
+# or a reapply carrying the original body along. Blank lines are allowed INSIDE
+# the block, which is what keeps GitHub's appended `Co-authored-by:` paragraph
+# from pushing an otherwise valid trailer out of it.
+#
+# The value match is exact and anchored:
+#   ^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$
+# each word's first letter case-insensitive, whitespace around the value free —
+# `false`, an all-caps key, and an indented line all read as untrailered, i.e.
+# as "bump". Lines are right-trimmed first, and the regex is applied PER LINE
+# rather than with a multiline flag, so `[[:space:]]*` can never swallow a
+# newline and match a value on the following line.
+# shellcheck disable=SC2016  # a jq PROGRAM: $line is jq's variable, not the shell's
+SKIP_TRAILER_JQ='
+  def skip_trailer:
+    (. // "")
+    | split("\n")
+    | map(sub("[[:space:]]+$"; ""))
+    | reverse
+    | (reduce .[] as $line ([true, []];
+         if .[0] and (($line == "") or ($line | test("^[A-Za-z][A-Za-z0-9-]*:")))
+         then [true, (.[1] + [$line])]
+         else [false, .[1]]
+         end) | .[1])
+    | any(test("^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$"));
+'
+
+# True when ONE raw commit message carries the trailer. `jq -Rs` slurps stdin as
+# a single JSON string, so a message containing quotes, backslashes or newlines
+# needs no escaping of our own. No jq, or any jq failure, answers false.
+message_has_skip_trailer() {
+  command -v jq >/dev/null 2>&1 || return 1
+  local verdict
+  verdict=$(printf '%s' "$1" | jq -Rrs "$SKIP_TRAILER_JQ"'
+    if skip_trailer then "yes" else "no" end' 2>/dev/null) || return 1
+  [[ "$verdict" == "yes" ]]
+}
+
+# True when EVERY commit in the range <from>..<to> carries the trailer. Callers
+# are in the staleness branch, which has already deepened the clone and proved
+# <to> descends from <from>, so the range is well defined and present locally.
+#
+# The bound is a cost stop, not a correctness one: a manual re-run of a
+# months-old run would otherwise walk (and shell out over) an unbounded range.
+# Such a range is essentially certain to contain an untrailered commit anyway —
+# rev-list answers newest-first, so the common case exits on the first one — and
+# exceeding the bound answers false, which is the status quo.
+SKIP_TRAILER_RANGE_MAX=50
+range_all_skip_trailered() {
+  command -v jq >/dev/null 2>&1 || return 1
+  local shas sha msg count=0
+  shas=$(git rev-list "$1..$2" --) || return 1
+  [[ -n "$shas" ]] || return 1
+  while IFS= read -r sha; do
+    [[ -n "$sha" ]] || continue
+    count=$((count + 1))
+    (( count <= SKIP_TRAILER_RANGE_MAX )) || return 1
+    msg=$(git log -1 --format=%B "$sha") || return 1
+    message_has_skip_trailer "$msg" || return 1
+  done <<<"$shas"
+  return 0
+}
+
 # The main-only ref guard in the entrypoints cannot catch a manual RE-RUN of an
 # older main run: github.ref is refs/heads/main but github.sha is that run's
 # original (now stale) commit, and the bumper would force-repin every caller to
@@ -866,9 +943,37 @@ if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
     [[ "$tip_blob" == "$here_blob" ]] || changed_surface="$WATCHED"
   fi
   if [[ -n "$surface_changed" ]]; then
-    echo "github.sha $GITHUB_SHA is behind main ($main_tip) and the watched surface changed since ($changed_surface) — stale run/re-run; the newer commit has its own run. Nothing to bump"
-    emit false "$NEW_SHA"
-    exit 0
+    # HAND-OFF GUARD (BE-9571). Deferring here is sound only because of what the
+    # message says: the newer commit "has its own run, which will pin the newer
+    # content". Since the Skip-caller-bump gate at the foot of this file exists,
+    # that run can DECLINE — and then nobody pins anything. Sequence: behavioral
+    # commit A lands on a watched surface; trailered churn commit B rewords a
+    # comment in the same surface moments later; A's run reads the surface as
+    # changed and defers to B's run; B's run skips on the trailer; A reaches no
+    # caller until some later behavioral commit happens along. That is exactly
+    # the pin drift the gate's header promises cannot happen.
+    #
+    # So ask whether the newer commits are the kind that will decline. If EVERY
+    # commit main gained since this one is trailered churn, this run is the last
+    # one that will pin this content, and it must not defer. Pin the verified
+    # TIP: every commit between here and it is author-declared bump-irrelevant,
+    # so the tip is this run's change plus nothing a caller can observe, at a
+    # commit that is actually current — the same argument the re-point below
+    # makes from byte-identity, made instead from the author's declaration.
+    #
+    # A range this cannot READ — no jq, a failed rev-list, a range longer than
+    # the sanity bound (a manual re-run of an ancient commit) — answers false
+    # and leaves the pre-existing stale verdict standing. This guard NARROWS the
+    # stale skip; an inability to check is not grounds to widen it.
+    if range_all_skip_trailered "$head_sha" "$fetched_tip"; then
+      echo "::notice::main moved to $main_tip since $GITHUB_SHA and the watched surface changed since ($changed_surface), but EVERY commit in between carries a 'Skip-caller-bump: true' trailer — the newer commit's own run will decline to bump, so this run must not defer to it. Pinning callers to $main_tip and proceeding"
+      NEW_SHA="$main_tip"
+      repointed=1
+    else
+      echo "github.sha $GITHUB_SHA is behind main ($main_tip) and the watched surface changed since ($changed_surface) — stale run/re-run; the newer commit has its own run. Nothing to bump"
+      emit false "$NEW_SHA"
+      exit 0
+    fi
   fi
   # Pin callers to the VERIFIED TIP, not to this run's stale github.sha. We have
   # just proved every watched object is byte-identical at both, so the tip is the
@@ -993,15 +1098,31 @@ fi
 #     bump: dispatch is the fleets' documented recovery path, and doubles as
 #     the manual override after a mistaken trailer.
 #   * GITHUB_EVENT_PATH names a readable file that jq parses.
-#   * The payload's `.commits` array has >= 1 and <= 19 entries. The push
-#     payload TRUNCATES `commits` at 20 entries, so at 20 the array may be
-#     incomplete — and skipping on an incompletely-checked push could suppress
-#     a behavioral bump. Refuse to skip instead.
-#   * EVERY entry's `.message` contains a line matching the anchored,
-#     case-insensitive-key regex
-#       ^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$
-#     ALL commits, not just those touching watched paths: a mixed push of one
-#     behavioral commit and one trailered docs commit must still bump.
+#   * The payload's `.commits` array has >= 1 and <= 2047 entries. GitHub
+#     documents the push WEBHOOK payload — which is what $GITHUB_EVENT_PATH
+#     holds — as carrying "a maximum of 2048 commits"; the far lower 20-entry
+#     cap belongs to the Events API's `PushEvent` representation, which this is
+#     not, and the webhook payload carries no `.size` to compare a length
+#     against, so the count IS the only truncation signal available. At 2048 the
+#     array may therefore be incomplete — an unchecked 2049th commit could be
+#     behavioral — and skipping on an incompletely-checked push could suppress a
+#     behavioral bump. Refuse to skip instead.
+#   * EVERY entry's `.message` carries the trailer in its TRAILING TRAILER
+#     BLOCK, per the one shared `skip_trailer` definition above.
+#
+#     ALL commits, not just those touching watched paths. On a DIRECT push to
+#     main that is what stops a mixed push — one behavioral commit, one
+#     trailered docs commit — from skipping. It is NOT what guards the shape
+#     changes actually arrive in here: this repo squash-merges, so a whole PR
+#     lands as ONE commit and the all-commits rule is then trivially the
+#     head-commit rule. What does the guarding there is the trailer-BLOCK
+#     requirement plus review: GitHub's squashed body concatenates the branch
+#     commits in order, so only a trailer in the LAST commit's message survives
+#     into the squashed message's trailer block — which is also the text the
+#     squash-merge UI shows the person pressing the button. A trailer that
+#     reaches main therefore claims the WHOLE PR is bump-irrelevant, for EVERY
+#     fleet, and reviewers reject it on a PR carrying behavioral changes exactly
+#     as they would any other reviewed line.
 #
 # On ANY other condition — a missing/unreadable payload, malformed JSON, no jq
 # on PATH, an empty or absent `.commits` — fall through to `emit true`: the
@@ -1011,10 +1132,22 @@ fi
 # every probe is `||`-guarded under this file's `set -euo pipefail` (an abort
 # would fail the run loudly, the one thing worse than either verdict here).
 #
+# KNOWN LIMIT (BE-9571 follow-up): a bump run is also the CATCH-UP for an
+# earlier watched change whose own run never bumped — one that failed at the
+# token mint or inside bump-callers.sh, was cancelled, or never started because
+# a `paths:` filter is evaluated against only the first 300 changed files of a
+# push. Declining here declines that catch-up too, and nothing in the push
+# payload can see it; the hand-off guard above covers only the concurrent-run
+# case, which is the one this file CAN observe. Until that is closed, the
+# trailer is for small comment/docs pushes and `workflow_dispatch` is the
+# recovery.
+#
 # Messages are read from the EVENT PAYLOAD (`.commits[].message`), never
 # `git log`: the default checkout is fetch-depth 1, so the push range's parent
 # commits are not present locally, and fetching them for this would be
-# avoidable cost and failure surface.
+# avoidable cost and failure surface. (The hand-off guard above is the one
+# reader that does use git — it runs only in the branch that has already
+# deepened the clone for its ancestry checks.)
 SKIP_BUMP_COMMITS=""
 skip_caller_bump_requested() {
   [[ "${GITHUB_EVENT_NAME-}" == "push" ]] || return 1
@@ -1025,15 +1158,11 @@ skip_caller_bump_requested() {
   # Any evaluation error — malformed JSON, a non-object commit entry, a
   # non-string message — fails the whole program, and reads as "bump".
   local verdict
-  verdict=$(jq -r '
-    def trailered:
-      (.message // "")
-      | split("\n")
-      | any(test("^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$"));
+  verdict=$(jq -r "$SKIP_TRAILER_JQ"'
     if (.commits | type) == "array"
        and (.commits | length) >= 1
-       and (.commits | length) <= 19
-       and all(.commits[]; trailered)
+       and (.commits | length) <= 2047
+       and all(.commits[]; .message | skip_trailer)
     then "skip \(.commits | length)"
     else "bump"
     end' "$GITHUB_EVENT_PATH" 2>/dev/null) || return 1
@@ -1045,7 +1174,14 @@ skip_caller_bump_requested() {
 if skip_caller_bump_requested; then
   # ::notice::, not a bare echo — a fleet that "mysteriously" did not bump
   # needs this to surface on the run summary, with both recovery paths named.
-  echo "::notice::Skipping this bump: every one of the ${SKIP_BUMP_COMMITS} commit(s) in push ${GITHUB_SHA} carries a 'Skip-caller-bump: true' trailer. No pin drifts — the next behavioral bump re-points callers to the then-current tip, and if the trailer was a mistake, a workflow_dispatch run of this fleet forces a bump immediately."
+  # On the re-pointed path the run has ALREADY logged "pinning callers to <tip>
+  # and proceeding"; name that line and say this one overrides it, rather than
+  # ending the log on two contradictory statements with nothing saying which won.
+  skip_override=""
+  if [[ -n "$repointed" ]]; then
+    skip_override=" This OVERRIDES the \"pinning callers to $NEW_SHA and proceeding\" line above: nothing is bumped, and new_sha is emitted only for a later manual consumer of these outputs."
+  fi
+  echo "::notice::Skipping this bump: every one of the ${SKIP_BUMP_COMMITS} commit(s) in push ${GITHUB_SHA} carries a 'Skip-caller-bump: true' trailer.${skip_override} Callers stay where they are until the next behavioral bump re-points them to the then-current tip; a run racing this one is covered by the hand-off guard above; and if the trailer was a mistake, a workflow_dispatch run of this fleet forces a bump immediately."
   emit false "$NEW_SHA"
   exit 0
 fi

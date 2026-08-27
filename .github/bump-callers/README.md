@@ -532,28 +532,71 @@ could have been skipped), never pin drift (a skip that suppressed a real bump).
 - the run is a `push` event. A `workflow_dispatch` run always bumps — dispatch
   is the fleets' documented recovery path, and doubles as the manual override
   if a trailer turns out to have been a mistake;
-- the push payload's `.commits` array has 1–19 entries. GitHub truncates that
-  array at 20, so at 20 it may be incomplete, and skipping on an
-  incompletely-checked push could suppress a behavioral bump — the gate refuses
-  to skip instead;
+- the push payload's `.commits` array has 1–2047 entries. GitHub documents the
+  push **webhook** payload — which is what `$GITHUB_EVENT_PATH` holds — as
+  carrying "a maximum of 2048 commits"; the far lower 20-entry cap belongs to
+  the Events API's `PushEvent`, a different representation, and the webhook
+  payload carries no `.size` to compare a length against, so the count is the
+  only truncation signal there is. At 2048 the array may be incomplete, and
+  skipping on an incompletely-checked push could suppress a behavioral bump —
+  the gate refuses to skip instead;
 - **every** commit in the push carries a line matching
-  `^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$` — all commits, not
-  just those touching watched paths, so a mixed push of one behavioral commit
-  and one trailered docs commit still bumps.
+  `^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$` **in its trailing
+  trailer block** — the maximal suffix of lines that are blank or
+  `Token: value` shaped, i.e. `git interpret-trailers --parse` semantics rather
+  than a body-wide search. A body-wide search reads the token as a
+  *declaration* when it is only being *quoted*: a `git cherry-pick -x` copy
+  (whose appended `(cherry picked from commit …)` line is not trailer-shaped, so
+  it correctly ends the block), a reapply carrying the original body, or a
+  commit whose prose documents this feature at column 0. Blank lines are allowed
+  *inside* the block, so GitHub's appended `Co-authored-by:` paragraph does not
+  push a valid trailer out of it.
+
+All commits, not just those touching watched paths — on a **direct push to
+`main`** that is what stops a mixed push (one behavioral commit, one trailered
+docs commit) from skipping. It is not what guards the shape changes actually
+arrive in here. This repo squash-merges with
+`squash_merge_commit_message: COMMIT_MESSAGES`, so a whole PR lands as **one**
+commit and the all-commits rule is then trivially the head-commit rule. What
+guards that path is the trailer-block requirement plus review: GitHub's squashed
+body concatenates the branch commits in order, so only a trailer in the **last**
+commit's message survives into the squashed message's trailer block — which is
+also the text the squash-merge UI shows the person pressing the button. A
+trailer that reaches `main` therefore claims the **whole PR** is
+bump-irrelevant, for **every** fleet, and reviewers reject it on a PR carrying
+behavioral changes exactly as they would any other reviewed line. Legitimate
+only for comment/docs-only edits to watched surfaces; when in doubt, leave it
+off and let the fleet bump.
 
 The gate runs **last**, immediately before the final `proceed=true`, so every
 loud validation, staleness and decommission verdict above keeps precedence — a
-trailer can never mask an error or relabel a stale/decommission verdict. And a
-skip loses nothing durable: the next behavioral bump re-points callers to the
-then-current tip, which is exactly what the re-point exists for.
+trailer can never mask an error or relabel a stale/decommission verdict. On the
+re-point path the run has already logged "pinning callers to … and proceeding";
+the skip `::notice::` names that line and says it overrides it, so the log never
+ends on two contradictory statements.
 
-This repo squash-merges with `squash_merge_commit_message: COMMIT_MESSAGES`, so
-a trailer on **any** branch commit survives into the single squashed commit's
-body and the anchored line-match sees it. The trailer therefore claims the
-WHOLE PR is bump-irrelevant — reviewers treat it like any other reviewed line
-and reject it on a PR with behavioral changes. Legitimate only for
-comment/docs-only edits to watched surfaces; when in doubt, leave it off and
-let the fleet bump.
+**The hand-off guard.** The staleness skip earlier in the preflight is sound
+only because of what its own message claims — the newer commit "has its own
+run, which will pin the newer content". Once a run can *decline* on a trailer,
+that hand-off breaks: behavioral commit A lands on a watched surface, trailered
+churn commit B rewords a comment in the same surface moments later, A's run
+defers to B's run, B's run skips, and A reaches no caller until some later
+behavioral commit happens along. So before deferring, the staleness branch asks
+whether **every** commit `main` gained since this one is trailered; if so it
+does *not* defer — it pins the verified tip and proceeds, because it is the last
+run that will pin this content. A range it cannot read (no `jq`, a failed
+`rev-list`, a range past the sanity bound) leaves the pre-existing stale verdict
+standing: the guard narrows that skip, and an inability to check is not grounds
+to widen it.
+
+**Known limit.** A bump run is also the *catch-up* for an earlier watched change
+whose own run never bumped — one that failed at the token mint or inside
+`bump-callers.sh`, was cancelled, or never started because a `paths:` filter is
+evaluated against only the first 300 changed files of a push. Declining here
+declines that catch-up too, and nothing in the push payload can see it; the
+hand-off guard covers only the concurrent-run case, which is the one the
+preflight *can* observe. Until that is closed, keep trailered pushes small and
+reach for `workflow_dispatch` if a fleet looks behind.
 
 ## How the pin rewrite is scoped (and why it asserts afterwards)
 

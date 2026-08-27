@@ -1287,30 +1287,46 @@ check "all trailered: proceed=false"  "[[ \"$P\" == \"false\" ]]"
 check "all trailered: counts all 3"   "grep -q \"every one of the 3 commit\" <<<\"\$OUT\""
 
 # ---------------------------------------------------------------------------
-new_case trailer_truncated 'Skip-caller-bump: a 20-commit payload refuses to skip'
-# The push payload TRUNCATES `.commits` at 20 entries. At 20 the array may be
-# incomplete — an unchecked 21st commit could be behavioral — so a fully
-# trailered 20-entry payload must bump anyway. 19 is the last complete count.
+new_case trailer_truncated 'Skip-caller-bump: a possibly-TRUNCATED payload refuses to skip'
+# GitHub documents the push WEBHOOK payload's `.commits` as carrying "a maximum
+# of 2048 commits" (the 20-entry cap belongs to the Events API's PushEvent, a
+# different representation, and the webhook payload has no `.size` to compare a
+# length against — the count is the only truncation signal there is). At 2048
+# the array may be incomplete, so an unchecked 2049th commit could be
+# behavioral: a fully trailered 2048-entry payload must bump anyway. 2047 is the
+# last count that is certainly complete.
 TIP=$(origin_tip)
 EVENT="${CASE}/event.json"
 TRAILER_MSGS=()
 i=1
-while [[ $i -le 19 ]]; do
+while [[ $i -le 2047 ]]; do
   TRAILER_MSGS+=("docs: churn commit $i"$'\n\nSkip-caller-bump: true')
   i=$((i+1))
 done
 write_push_event "$EVENT" "${TRAILER_MSGS[@]}"
 run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" \
   GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$EVENT"
-check "19 commits: proceed=false"     "[[ \"$P\" == \"false\" ]]"
-check "19 commits: counts all 19"     "grep -q \"every one of the 19 commit\" <<<\"\$OUT\""
-TRAILER_MSGS+=("docs: churn commit 20"$'\n\nSkip-caller-bump: true')
+check "2047 commits: proceed=false"   "[[ \"$P\" == \"false\" ]]"
+check "2047 commits: counts all"      "grep -q \"every one of the 2047 commit\" <<<\"\$OUT\""
+TRAILER_MSGS+=("docs: churn commit 2048"$'\n\nSkip-caller-bump: true')
 write_push_event "$EVENT" "${TRAILER_MSGS[@]}"
 run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" \
   GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$EVENT"
-check "20 commits: exit 0"            "[[ $RC -eq 0 ]]"
-check "20 commits: proceed=true"      "[[ \"$P\" == \"true\" ]]"
-check "20 commits: no ::notice::"     "! grep -q \"::notice::\" <<<\"\$OUT\""
+check "2048 commits: exit 0"          "[[ $RC -eq 0 ]]"
+check "2048 commits: proceed=true"    "[[ \"$P\" == \"true\" ]]"
+check "2048 commits: no ::notice::"   "! grep -q \"::notice::\" <<<\"\$OUT\""
+# The old 20-entry bound came from the wrong payload representation: a modest
+# all-trailered push is complete and must still skip.
+TRAILER_MSGS=()
+i=1
+while [[ $i -le 25 ]]; do
+  TRAILER_MSGS+=("docs: churn commit $i"$'\n\nSkip-caller-bump: true')
+  i=$((i+1))
+done
+write_push_event "$EVENT" "${TRAILER_MSGS[@]}"
+run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" \
+  GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$EVENT"
+check "25 commits: proceed=false"     "[[ \"$P\" == \"false\" ]]"
 
 # ---------------------------------------------------------------------------
 new_case trailer_dispatch 'Skip-caller-bump: a workflow_dispatch run always bumps'
@@ -1400,6 +1416,99 @@ for rejected in \
 done
 
 # ---------------------------------------------------------------------------
+new_case trailer_block 'Skip-caller-bump: only the TRAILING TRAILER BLOCK declares'
+# A body-wide line match reads the token as a DECLARATION when it is only being
+# QUOTED — a `git cherry-pick -x` copy, a reapply carrying the original body, a
+# commit whose prose documents this very feature at column 0 — and each of those
+# is a behavioral commit silently suppressing its own bump. Only the trailing
+# trailer block (blank or `Token: value` lines) counts. Blank lines are allowed
+# INSIDE that block, or GitHub's appended `Co-authored-by:` paragraph would push
+# an otherwise valid trailer out of it.
+TIP=$(origin_tip)
+EVENT="${CASE}/event.json"
+for accepted in \
+  $'subject\n\nbody prose here\n\nSkip-caller-bump: true' \
+  $'subject\n\nSkip-caller-bump: true\n\nCo-authored-by: A Bot <bot@example.invalid>' \
+  $'subject\n\nSkip-caller-bump: true\nCo-authored-by: A Bot <bot@example.invalid>' \
+  ; do
+  write_push_event "$EVENT" "$accepted"
+  run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" \
+    GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$EVENT"
+  check "in-block variant skips ($(tail -1 <<<"$accepted"))" "[[ \"$P\" == \"false\" ]]"
+done
+for rejected in \
+  $'fix: a real change\n\nSkip-caller-bump: true\n\n(cherry picked from commit 0123456789abcdef0123456789abcdef01234567)' \
+  $'fix: a real change\n\nSkip-caller-bump: true\n\nOn reflection this still changes behavior, so it does need the bump.' \
+  $'docs: explain the gate\n\nAuthors write\nSkip-caller-bump: true\nat the end of a churn commit.' \
+  ; do
+  write_push_event "$EVENT" "$rejected"
+  run_preflight GITHUB_SHA="$TIP" NEW_SHA="$TIP" \
+    GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$EVENT"
+  check "out-of-block variant bumps ($(tail -1 <<<"$rejected"))" "[[ \"$P\" == \"true\" ]]"
+done
+
+# ---------------------------------------------------------------------------
+new_case trailer_handoff 'Skip-caller-bump: a stale run does NOT defer to a run that will decline'
+# The stale skip is sound only because of what its own message claims: the newer
+# commit "has its own run, which will pin the newer content". Once a run can
+# DECLINE on a trailer, that hand-off breaks — behavioral commit A defers to
+# trailered churn commit B, B skips, and A reaches no caller. So when EVERY
+# commit main gained since this one is trailered, this run must not defer; it
+# pins the verified tip instead. Its own push is the behavioral one (untrailered),
+# so the gate at the foot of the script does not fire either.
+BEHIND=$(work_head)
+printf 'name: Groom\non:\n  workflow_call:\n    inputs: {}\n' > "${SRC}/${WATCHED_PATH}"
+git -C "$SRC" add -A
+git -C "$SRC" commit -qm $'docs(groom): reword a comment in the reusable\n\nSkip-caller-bump: true'
+git -C "$SRC" push -q origin main
+TIP=$(origin_tip)
+EVENT="${CASE}/event.json"
+write_push_event "$EVENT" "$PLAIN_MSG"
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" \
+  GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$EVENT"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=true"                  "[[ \"$P\" == \"true\" ]]"
+check "NOT the stale verdict"         "! grep -q \"stale run/re-run\" <<<\"\$OUT\""
+check "says it must not defer"        "grep -q \"::notice::.*must not defer\" <<<\"\$OUT\""
+check "pins the verified tip"         "[[ \"$N\" == \"$TIP\" ]]"
+check "not this run's own sha"        "[[ \"$N\" != \"$BEHIND\" ]]"
+check "no ::error::"                  "! grep -q \"::error::\" <<<\"\$OUT\""
+# One untrailered commit anywhere in the range and the stale verdict stands —
+# that newer run WILL bump, so deferring to it is still correct.
+printf 'name: Groom\non:\n  workflow_call:\n    inputs: {x: 1}\n' > "${SRC}/${WATCHED_PATH}"
+push_src 'fix(groom): a behavioral change to the reusable'
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" \
+  GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$EVENT"
+check "mixed range: proceed=false"    "[[ \"$P\" == \"false\" ]]"
+check "mixed range: stale verdict"    "grep -q \"stale run/re-run\" <<<\"\$OUT\""
+check "mixed range: no ::notice::"    "! grep -q \"::notice::\" <<<\"\$OUT\""
+
+# ---------------------------------------------------------------------------
+new_case trailer_handoff_shallow 'Skip-caller-bump: the hand-off guard works on a SHALLOW workdir'
+# The guard reads commit messages out of git, and production checkouts are
+# `actions/checkout`-shallow. It runs only inside the branch that has already
+# `--unshallow`ed for its ancestry checks — this is that real-world shape.
+printf 'unrelated file, v1\n' > "${SRC}/README.md"
+push_src 'a second commit, so a depth=1 clone really truncates'
+clone_work_shallow
+BEHIND=$(work_head)
+check "workdir really is shallow"     "[[ -f \"${WORKDIR}/.git/shallow\" ]]"
+printf 'name: Groom\non:\n  workflow_call:\n    inputs: {}\n' > "${SRC}/${WATCHED_PATH}"
+git -C "$SRC" add -A
+git -C "$SRC" commit -qm $'docs(groom): reword a comment in the reusable\n\nSkip-caller-bump: true'
+git -C "$SRC" push -q origin main
+TIP=$(origin_tip)
+EVENT="${CASE}/event.json"
+write_push_event "$EVENT" "$PLAIN_MSG"
+run_preflight GITHUB_SHA="$BEHIND" NEW_SHA="$BEHIND" \
+  GITHUB_EVENT_NAME=push GITHUB_EVENT_PATH="$EVENT"
+check "exit 0"                        "[[ $RC -eq 0 ]]"
+check "proceed=true"                  "[[ \"$P\" == \"true\" ]]"
+check "pins the verified tip"         "[[ \"$N\" == \"$TIP\" ]]"
+check "says it must not defer"        "grep -q \"::notice::.*must not defer\" <<<\"\$OUT\""
+check "no ::error::"                  "! grep -q \"::error::\" <<<\"\$OUT\""
+
+# ---------------------------------------------------------------------------
 new_case trailer_stale 'Skip-caller-bump: the stale verdict wins over the trailer'
 # The gate runs LAST, so every earlier verdict keeps precedence. A trailered
 # push that is ALSO a stale re-run (the watched surface changed at the tip) must
@@ -1457,6 +1566,10 @@ check "proceed=false"                 "[[ \"$P\" == \"false\" ]]"
 check "new_sha is the re-pointed tip" "[[ \"$N\" == \"$TIP\" ]]"
 check "not this run's stale sha"      "[[ \"$N\" != \"$BEHIND\" ]]"
 check "::notice:: annotation"         "grep -q \"::notice::\" <<<\"\$OUT\""
+# The re-point already logged "pinning callers to <tip> and proceeding". The
+# notice must name that line and say it lost, or the log ends on two directly
+# contradictory statements with nothing saying which verdict won.
+check "notice names the overridden line" "grep -q \"OVERRIDES the .pinning callers to ${TIP} and proceeding.\" <<<\"\$OUT\""
 check "no ::error::"                  "! grep -q \"::error::\" <<<\"\$OUT\""
 
 echo
