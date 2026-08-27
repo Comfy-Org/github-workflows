@@ -509,6 +509,52 @@ way, and `test_paths_contract.sh` enforces it.
 >   `WATCHED_PATHSPECS` + `WATCHED_EXEC`, instead of narrowing anything away. The
 >   staleness test there is still a two-tree comparison, not a history walk.
 
+### Suppressing a churn bump (`Skip-caller-bump: true`)
+
+A commit that only rewords comments or docs *inside* a watched surface still
+matches the fleet's `paths:` filter, so it fans a pure-churn SHA-bump PR — a
+review round in every caller repo — for a change no caller can observe. A
+reviewed commit on `main` can declare itself bump-irrelevant with a
+commit-message trailer:
+
+```text
+docs(groom): reword the finder brief's intro comment
+
+Skip-caller-bump: true
+```
+
+The preflight then skips (`proceed=false`, `new_sha` still emitted, exit 0) —
+but ONLY when all of these hold; on any other condition, **including any
+read/parse failure of the event payload, the gate falls through to bumping**.
+It fails open on purpose: its worst bug must be status-quo churn (a bump that
+could have been skipped), never pin drift (a skip that suppressed a real bump).
+
+- the run is a `push` event. A `workflow_dispatch` run always bumps — dispatch
+  is the fleets' documented recovery path, and doubles as the manual override
+  if a trailer turns out to have been a mistake;
+- the push payload's `.commits` array has 1–19 entries. GitHub truncates that
+  array at 20, so at 20 it may be incomplete, and skipping on an
+  incompletely-checked push could suppress a behavioral bump — the gate refuses
+  to skip instead;
+- **every** commit in the push carries a line matching
+  `^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$` — all commits, not
+  just those touching watched paths, so a mixed push of one behavioral commit
+  and one trailered docs commit still bumps.
+
+The gate runs **last**, immediately before the final `proceed=true`, so every
+loud validation, staleness and decommission verdict above keeps precedence — a
+trailer can never mask an error or relabel a stale/decommission verdict. And a
+skip loses nothing durable: the next behavioral bump re-points callers to the
+then-current tip, which is exactly what the re-point exists for.
+
+This repo squash-merges with `squash_merge_commit_message: COMMIT_MESSAGES`, so
+a trailer on **any** branch commit survives into the single squashed commit's
+body and the anchored line-match sees it. The trailer therefore claims the
+WHOLE PR is bump-irrelevant — reviewers treat it like any other reviewed line
+and reject it on a PR with behavioral changes. Legitimate only for
+comment/docs-only edits to watched surfaces; when in doubt, leave it off and
+let the fleet bump.
+
 ## How the pin rewrite is scoped (and why it asserts afterwards)
 
 The rewrite targets the **pin token**, not "any 40-hex on a line that mentions

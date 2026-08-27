@@ -136,6 +136,11 @@
 #                  scripts inside it. Plain repo-relative FILE paths only —
 #                  pathspec magic belongs in WATCHED_PATHSPECS, and a directory
 #                  is rejected (WATCHED_ASSETS is the input for one).
+#   GITHUB_EVENT_NAME / GITHUB_EVENT_PATH
+#                  Provided by Actions to every step (no entrypoint wiring
+#                  needed); read ONLY by the Skip-caller-bump trailer gate at
+#                  the bottom of this file. Absent, unreadable or malformed is
+#                  never an error — that gate fails open toward bumping.
 #
 # All three list inputs are newline-separated so an entrypoint can write them as
 # a YAML block scalar directly beneath the `paths:` filter they mirror. They do
@@ -161,9 +166,25 @@
 #
 # Outputs (written to $GITHUB_OUTPUT on every exit-0 path):
 #   proceed  "true"  → the caller should run bump-callers.sh
-#            "false" → stale or decommissioned; the caller should do nothing
+#            "false" → stale, decommissioned, or a trailer-declared churn push
+#                      (below); the caller should do nothing
 #   new_sha  the SHA to pin callers to — NEW_SHA, or the verified main tip when
 #            this run was re-pointed forward (see the re-point block below)
+#
+# One more skip verdict runs ahead of the final proceed=true, AFTER every check
+# above (BE-9561's follow-up): a push whose EVERY commit message carries a line
+# matching the anchored, case-insensitive-key regex
+#   ^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$
+# — the `Skip-caller-bump: true` trailer — declares itself bump-irrelevant
+# (comment/docs-only churn inside a watched surface) and skips with
+# proceed=false. Push events only: a workflow_dispatch run always bumps, which
+# is both the fleets' documented recovery path and the manual override after a
+# mistaken trailer. ALL commits in the push must carry the trailer (a mixed
+# push still bumps), and the payload's `.commits` must have <= 19 entries — the
+# push payload truncates that array at 20, and an incompletely-checked push
+# must not skip. Any read/parse failure falls through to bumping: the gate
+# FAILS OPEN, so its worst bug is status-quo churn, never pin drift. Full
+# contract at the gate itself, at the bottom of this file.
 #
 # Exits non-zero ONLY for an input we cannot trust (malformed SHA, a glob-shaped,
 # slash-terminated or non-repo-relative watched path, a set-but-blank or
@@ -954,6 +975,79 @@ if [[ -z "$repointed" ]] && (( ${#watched_exec[@]} > 0 )); then
       exit 0
     fi
   done
+fi
+
+# --- Skip-caller-bump trailer gate (last, deliberately) -----------------------
+# A commit that only rewords comments/docs inside a watched surface still
+# matches the fleet's `paths:` filter and fans a pure-churn SHA-bump PR — a
+# review round in every caller repo — for a change no caller can observe. A
+# reviewed commit on main can declare itself bump-irrelevant with a
+# `Skip-caller-bump: true` commit-message trailer; this gate honors it. It runs
+# immediately before the final `emit true`, on both the normal and the
+# re-pointed path, so every loud validation / staleness / decommission verdict
+# above keeps precedence — the trailer can never mask an error or convert a
+# stale/decommission verdict into a quiet skip.
+#
+# Skip (proceed=false, new_sha as computed, exit 0) ONLY when ALL of:
+#   * GITHUB_EVENT_NAME is exactly `push`. A workflow_dispatch run must always
+#     bump: dispatch is the fleets' documented recovery path, and doubles as
+#     the manual override after a mistaken trailer.
+#   * GITHUB_EVENT_PATH names a readable file that jq parses.
+#   * The payload's `.commits` array has >= 1 and <= 19 entries. The push
+#     payload TRUNCATES `commits` at 20 entries, so at 20 the array may be
+#     incomplete — and skipping on an incompletely-checked push could suppress
+#     a behavioral bump. Refuse to skip instead.
+#   * EVERY entry's `.message` contains a line matching the anchored,
+#     case-insensitive-key regex
+#       ^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$
+#     ALL commits, not just those touching watched paths: a mixed push of one
+#     behavioral commit and one trailered docs commit must still bump.
+#
+# On ANY other condition — a missing/unreadable payload, malformed JSON, no jq
+# on PATH, an empty or absent `.commits` — fall through to `emit true`: the
+# gate FAILS OPEN toward bumping. It is optional sugar, so its worst bug must
+# be status-quo churn (a bump that could have been skipped), never pin drift (a
+# skip that suppressed a real bump) — and never a hard failure, which is why
+# every probe is `||`-guarded under this file's `set -euo pipefail` (an abort
+# would fail the run loudly, the one thing worse than either verdict here).
+#
+# Messages are read from the EVENT PAYLOAD (`.commits[].message`), never
+# `git log`: the default checkout is fetch-depth 1, so the push range's parent
+# commits are not present locally, and fetching them for this would be
+# avoidable cost and failure surface.
+SKIP_BUMP_COMMITS=""
+skip_caller_bump_requested() {
+  [[ "${GITHUB_EVENT_NAME-}" == "push" ]] || return 1
+  [[ -n "${GITHUB_EVENT_PATH-}" ]] || return 1
+  [[ -f "$GITHUB_EVENT_PATH" && -r "$GITHUB_EVENT_PATH" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  # One jq pass answers both halves (count in range, every message trailered).
+  # Any evaluation error — malformed JSON, a non-object commit entry, a
+  # non-string message — fails the whole program, and reads as "bump".
+  local verdict
+  verdict=$(jq -r '
+    def trailered:
+      (.message // "")
+      | split("\n")
+      | any(test("^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$"));
+    if (.commits | type) == "array"
+       and (.commits | length) >= 1
+       and (.commits | length) <= 19
+       and all(.commits[]; trailered)
+    then "skip \(.commits | length)"
+    else "bump"
+    end' "$GITHUB_EVENT_PATH" 2>/dev/null) || return 1
+  case "$verdict" in
+    'skip '*) SKIP_BUMP_COMMITS="${verdict#skip }" ;;
+    *) return 1 ;;
+  esac
+}
+if skip_caller_bump_requested; then
+  # ::notice::, not a bare echo — a fleet that "mysteriously" did not bump
+  # needs this to surface on the run summary, with both recovery paths named.
+  echo "::notice::Skipping this bump: every one of the ${SKIP_BUMP_COMMITS} commit(s) in push ${GITHUB_SHA} carries a 'Skip-caller-bump: true' trailer. No pin drifts — the next behavioral bump re-points callers to the then-current tip, and if the trailer was a mistake, a workflow_dispatch run of this fleet forces a bump immediately."
+  emit false "$NEW_SHA"
+  exit 0
 fi
 
 emit true "$NEW_SHA"
