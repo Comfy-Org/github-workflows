@@ -1421,13 +1421,20 @@ class TestSeverityBadgeContract(unittest.TestCase):
     `strip_severity_badge` avoids that by rebuilding the badge from the tables that
     printed it; the ledger deliberately does not, because its tolerant `^\\S*\\s*`
     prefix has to keep parsing bodies written by an OLDER post-review.py still live on
-    a pinned caller ref. So pin the two here instead: adding a severity, renaming a
-    label, or changing the dash/spacing would leave post-review.py working while the
-    ledger silently stopped stripping, carrying badge-prefixed bodies into the
-    prior-review context and degrading the repeat matching the ledger exists for.
+    a pinned caller ref. So pin the two here instead: adding a severity or renaming a
+    label would leave post-review.py working while the ledger silently stopped
+    stripping, carrying badge-prefixed bodies into the prior-review context and
+    degrading the repeat matching the ledger exists for.
+
+    Scope of the pin, so nobody expects more of it than it gives: the LABELS and the
+    dash CHARACTER are pinned; `_BADGE_RE`'s `\\s*` runs absorb any spacing change
+    around the dash, so a spacing-only edit stays green here and strips fine.
 
     The badge under test comes from `normalize_comments` — the real renderer — not
-    from a format string re-typed here, which would drift with it.
+    from a format string re-typed here, which would drift with it. The loop runs over
+    `SEVERITY_EMOJI`, not `SEVERITY_ORDER`: `normalize_severity` gates the renderable
+    vocabulary on `SEVERITY_EMOJI` membership, so that table — not the sort order — is
+    what decides which badges can ever reach the ledger.
     """
 
     PROSE = "the finding's own prose"
@@ -1439,11 +1446,19 @@ class TestSeverityBadgeContract(unittest.TestCase):
         self.assertEqual(len(comments), 1)
         return comments[0]["comment"]["body"]
 
+    def test_the_three_severity_tables_carry_the_same_keys(self):
+        """Guards the loop below, which would pass vacuously over an emptied table —
+        and catches a severity added to EMOJI/LABEL (so post-review.py renders it)
+        but left out of ORDER, which the sort-order loop would never have exercised.
+        """
+        self.assertTrue(pr.SEVERITY_EMOJI)
+        self.assertEqual(set(pr.SEVERITY_EMOJI), set(pr.SEVERITY_LABEL))
+        self.assertEqual(set(pr.SEVERITY_EMOJI), set(pr.SEVERITY_ORDER))
+
     def test_every_severity_post_review_renders_is_stripped_by_the_ledger(self):
-        for severity in pr.SEVERITY_ORDER:
+        for severity in pr.SEVERITY_EMOJI:
             with self.subTest(severity=severity):
                 body = self._rendered_body(severity)
-                self.assertNotEqual(body, self.PROSE, "post-review.py prefixed a badge")
                 self.assertEqual(bl._strip_badge(body), (severity, self.PROSE))
 
     def test_the_ledger_recovers_the_severity_of_an_older_or_emojiless_badge(self):

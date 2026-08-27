@@ -106,12 +106,22 @@ CONSOLIDATED_MARKER = gate_unresolved.CONSOLIDATED_MARKER
 # rendering, not inferring a disposition from author prose.
 #
 # The vocabulary and the badge's shape are re-typed here as literals, NOT shared with
-# post-review.py's SEVERITY_LABEL/SEVERITY_EMOJI: `^\S*\s*` accepts any emoji or none
-# on purpose, so the ledger keeps parsing bodies written by an OLDER post-review.py
-# still live on a pinned caller ref, and sharing the strict formatter would lose that.
-# The duplication is pinned instead — test_build_ledger.py drives post-review.py's real
-# renderer through this pattern for EVERY severity, so adding one, renaming a label or
-# changing the dash/spacing fails there rather than silently stopping the strip.
+# post-review.py's SEVERITY_LABEL/SEVERITY_EMOJI. `^\S*` swallows ANY leading run of
+# non-whitespace — today's emoji, one this version has never seen, or none at all — so
+# the ledger keeps parsing bodies written by an OLDER post-review.py still live on a
+# pinned caller ref; sharing the strict formatter would lose that. The tolerance is not
+# a check: a forged `<anything>**Critical** — ` prefix strips just as happily, which is
+# safe only because the one caller reads thread roots of Bot-authored consolidated
+# reviews — bodies this workflow itself wrote. Narrow it before pointing _strip_badge at
+# imported PR text.
+#
+# The literals pin the LABELS and the dash CHARACTER only; the `\s*` runs absorb any
+# spacing change. The duplication is pinned by test, not shared: test_build_ledger.py
+# drives post-review.py's real renderer through this pattern for every key of
+# SEVERITY_EMOJI — the table `normalize_severity` actually gates the renderable
+# vocabulary on — so adding a severity, renaming a label or changing the dash fails
+# there rather than silently stopping the strip. On a rename, ADD the new label and
+# KEEP the old: rounds already posted by a caller on an older ref still carry it.
 _BADGE_RE = re.compile(r"^\S*\s*\*\*(Critical|High|Medium|Low|Nit)\*\*\s*—\s*", re.UNICODE)
 
 # Every character that STARTS A NEW LINE for `str.splitlines()` — and so, plausibly,
