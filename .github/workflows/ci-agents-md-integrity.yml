@@ -1,0 +1,23 @@
+name: CI - AGENTS.md Integrity
+
+# Thin caller enrolling THIS repo in its own reusable agents-md-integrity
+# workflow. Pinned to a merged-main SHA rather than a local `./` path, like
+# ci-cursor-review.yml: a local path would run the PR's OWN copy of the
+# checker, letting a PR weaken the check judging it. The bump-agents-md-callers
+# fleet keeps the pin fresh once this repo is added to the AGENTS_MD_CALLERS
+# roster secret (separate human step — see the enrollment bullet in AGENTS.md).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    permissions:
+      contents: read
+    uses: Comfy-Org/github-workflows/.github/workflows/agents-md-integrity.yml@75685ed9fd20a8ab4e74b3d17d2002dae63224c2  # v1 — github-workflows main (75685ed)
+    with:
+      # Keep in lock-step with the `uses:` ref above (workflows_ref is REQUIRED,
+      # no default — BE-5546).
+      workflows_ref: 75685ed9fd20a8ab4e74b3d17d2002dae63224c2
