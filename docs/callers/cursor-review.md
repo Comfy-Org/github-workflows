@@ -4,7 +4,7 @@ Read [the shared caller contract](README.md) first.
 
 ## What it does
 
-A 4-lab × 2-review-type `cursor-agent` panel runs adversarial and edge-case
+A 3-lab × 2-review-type `cursor-agent` panel runs adversarial and edge-case
 passes over the PR diff. A judge model consolidates them into **one** PR review
 with per-finding severity badges. The person who applied the label gets Slack
 start/complete DMs.
@@ -97,7 +97,9 @@ pull-requests: write   # posting the consolidated review
 
 | Input | Default | Notes |
 |---|---|---|
-| `judge_model` | `claude-opus-5-thinking-max` | Consolidates the panel into one review. |
+| `judge_model` | `claude-opus-5-thinking-xhigh` | Consolidates the panel into one review. |
+| `panel_models` | `''` | JSON array of model ids replacing the built-in panel list (each runs both review types; preflight validates them against the live catalog). Use for per-repo experiments such as a reasoning-tier A/B. |
+| `skip_bot_branch_prefixes` | `ci/bump- chore/refresh- auto/refresh-` | Skip the panel for Bot-authored PRs on these branch prefixes (machine pin bumps / refreshes). `''` to review every bot PR. |
 | `diff_size_cap` | `5000` | Skip review above this diff size. An over-cap PR is not silent — see the gotcha below. |
 | `ignore_comments` | `true` | Discount blank/comment-only lines from the size count (count-only — the panel still sees them). |
 | `review_label` | `cursor-review` | The label that triggers a run. |
@@ -177,7 +179,7 @@ concurrency:
 **Drop `github.event.label.name` from the concurrency group when you widen
 `types:`.** That expression is empty on `opened`/`synchronize`/`reopened`, so
 label events and plain PR events resolve to *different* groups and cannot cancel
-each other. A push racing a label toggle then runs two 8-cell panels
+each other. A push racing a label toggle then runs two full panels
 concurrently — and because the head-SHA dedupe is evaluated before either posts,
 both pass it and you get two panels and two reviews. Keying on the PR number
 alone keeps every trigger in one group.

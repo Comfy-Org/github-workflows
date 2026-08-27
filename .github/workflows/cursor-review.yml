@@ -1,7 +1,8 @@
 name: Cursor Review (reusable)
 
-# Reusable, label-triggered multi-model code review. A 4-lab × 2-review-type
-# panel (8 cursor-agent cells) runs adversarial + edge-case passes, then a
+# Reusable, label-triggered multi-model code review. A multi-lab × 2-review-type
+# panel (one cursor-agent cell per model × pass; 6 by default) runs adversarial +
+# edge-case passes, then a
 # judge model consolidates the findings into ONE review posted on the PR,
 # with per-finding severity badges (critical/high/medium/low/nit).
 #
@@ -81,11 +82,13 @@ on:
       judge_model:
         description: >-
           Single judge model that adjudicates panel findings into one
-          consolidated review. Picked to match the highest reasoning tier in
-          the panel.
+          consolidated review. Same model family as the panel's Anthropic cell,
+          one reasoning tier below `max`: the judge adjudicates a bounded text
+          payload with no tools, and ran at xhigh until 2026-07-18 with no
+          recorded quality gap, while `max` cost ~10% of every run's spend.
         type: string
         required: false
-        default: claude-opus-5-thinking-max
+        default: claude-opus-5-thinking-xhigh
       diff_size_cap:
         description: >-
           Max counted changed lines. PRs over the cap are skipped — too large
@@ -227,6 +230,32 @@ on:
         type: boolean
         required: false
         default: false
+      panel_models:
+        description: >-
+          Optional JSON array of Cursor catalog model ids that REPLACES the
+          default panel list (see the preflight "Define panel models" step for
+          the current defaults). Each id still runs both review types and is
+          validated against the live catalog by preflight, so a typo or a
+          delisted id fails loud before any cell spends. Intended for
+          per-repo experiments — e.g. an A/B of `-xhigh` vs `-max` reasoning
+          tiers — without forking the workflow. Empty (default) = built-in list.
+        type: string
+        required: false
+        default: ''
+      skip_bot_branch_prefixes:
+        description: >-
+          Space-separated head-branch prefixes that skip the review when the PR
+          AUTHOR is a GitHub App / Bot account. Targets machine-generated pin
+          bumps and catalog refreshes (`ci/bump-…`, `chore/refresh-…`,
+          `auto/refresh-…`) that otherwise pay for a full panel with nothing a
+          reviewer can judge. Matched only for `user.type == Bot` authors, so a
+          human pushing to a `ci/bump-…` branch is still reviewed. Set to '' to
+          review every bot PR. Skips are logged in the gate step, and the
+          `skip-cursor-review` label remains the per-PR override in both
+          directions.
+        type: string
+        required: false
+        default: ci/bump- chore/refresh- auto/refresh-
     secrets:
       CURSOR_API_KEY:
         description: Cursor API key for cursor-agent (the panel + judge models bill through it).
@@ -281,6 +310,10 @@ jobs:
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           BASE_REPO: ${{ github.repository }}
           RUN_WITHOUT_LABEL: ${{ inputs.run_without_label }}
+          PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          SKIP_BOT_PREFIXES: ${{ inputs.skip_bot_branch_prefixes }}
         run: |
           # PRs from forks can't run this review. The pull_request event grants
           # fork PRs no access to secrets — so CURSOR_API_KEY is empty and every
@@ -300,6 +333,24 @@ jobs:
             echo "skip-cursor-review label present — skipping."
             echo "should_run=false" >> "$GITHUB_OUTPUT"
             exit 0
+          fi
+
+          # Machine-generated PRs (bot author AND a configured branch prefix)
+          # skip the panel: a pinned-SHA bump or a catalog refresh has nothing a
+          # reviewer can judge, and each one otherwise costs a full matrix run.
+          # Author TYPE is checked, not just the branch, so a human pushing a
+          # `ci/bump-…` branch is still reviewed. Configurable per caller via
+          # skip_bot_branch_prefixes ('' disables).
+          if [ "$PR_AUTHOR_TYPE" = "Bot" ]; then
+            for prefix in $SKIP_BOT_PREFIXES; do
+              case "$HEAD_REF" in
+                "$prefix"*)
+                  echo "Bot-authored PR ($PR_AUTHOR) on '$HEAD_REF' matches skip prefix '$prefix' — skipping the panel."
+                  echo "should_run=false" >> "$GITHUB_OUTPUT"
+                  exit 0
+                  ;;
+              esac
+            done
           fi
 
           # Label-free mode (run_without_label input): callers in repos with no
@@ -1100,29 +1151,46 @@ jobs:
         # validates every entry — so a bump only ever touches this one list.
         # Keep in sync with the README model table.
         #
-        # Pinned to each lab's newest highest-reasoning tier in Cursor's
-        # catalog (last checked 2026-07-28). OpenAI: GPT-5.6 Sol is the
+        # Three labs (last checked 2026-08-27). OpenAI: GPT-5.6 Sol is the
         # 5.6-family coding flagship (Luna is the cost tier, Terra mid; the
         # Codex line stops at 5.3). Anthropic: Fable 5 tops the catalog but
         # all Fable entries are marked NO ZDR in Cursor, and this panel
         # reviews private-repo diffs, so it is excluded; Opus 5 thinking at
         # its max tier is ZDR-eligible (confirmed against the live catalog —
         # no NO-ZDR marker, see PR BE-4818 for the run link) and replaces
-        # Opus 4.8 at identical per-token pricing. Gemini: 3.1 Pro is still
-        # the only Pro-line entry (3.5/3.6 are Flash tier). Moonshot: Kimi K3
-        # (max tier) supersedes K2.7 Code; no NO-ZDR marker in the catalog
-        # (same evidentiary bar as every other pin), ~3.2x/3.75x the
-        # per-token cost of K2.7 on this lab's two panel cells (~+10-15%
-        # total panel cost per PR).
+        # Opus 4.8 at identical per-token pricing. Moonshot: Kimi K3 at the
+        # `high` tier — same model as the former `kimi-k3-max` pin, one
+        # reasoning notch lower; no NO-ZDR marker in the catalog.
+        #
+        # Gemini 3.1 Pro was removed 2026-08-27. Over 1,450 judge-kept
+        # findings (172 PRs), its two cells were the sole raiser of 2.5% of
+        # kept findings and 3 of 213 critical/high ones, while costing ~9% of
+        # every run; every other Gemini finding was also raised by the OpenAI
+        # or Anthropic cell. The Kimi tier drop and the judge's move to
+        # `-xhigh` come from the same spend review. The `panel_models` input
+        # overrides this list per caller for A/B experiments.
+        env:
+          PANEL_MODELS_OVERRIDE: ${{ inputs.panel_models }}
         run: |
           cat > /tmp/models.json <<'JSON'
           [
             "gpt-5.6-sol-max",
             "claude-opus-5-thinking-max",
-            "gemini-3.1-pro",
-            "kimi-k3-max"
+            "kimi-k3-high"
           ]
           JSON
+          if [ -n "$(printf '%s' "$PANEL_MODELS_OVERRIDE" | tr -d '[:space:]')" ]; then
+            # Caller override. Must be a non-empty JSON array of catalog-shaped
+            # ids; the shape check here and the live-catalog check below both
+            # fail loud, so a bad override costs zero cells.
+            if ! printf '%s' "$PANEL_MODELS_OVERRIDE" | jq -e \
+                 'type == "array" and length > 0 and all(.[]; type == "string" and test("^[a-z0-9][a-z0-9._-]*$"))' > /dev/null; then
+              echo "::error::panel_models must be a non-empty JSON array of Cursor model ids (e.g. [\"gpt-5.6-sol-xhigh\", \"claude-opus-5-thinking-xhigh\"]); got: $PANEL_MODELS_OVERRIDE"
+              exit 1
+            fi
+            printf '%s' "$PANEL_MODELS_OVERRIDE" | jq -c 'unique' > /tmp/models.json
+            echo "panel_models override in effect: $(cat /tmp/models.json)"
+          fi
           echo "models=$(jq -c . /tmp/models.json)" >> "$GITHUB_OUTPUT"
 
       - name: Require a pinned workflows_ref
@@ -1470,6 +1538,17 @@ jobs:
           echo "Prompt size: $(wc -c < /tmp/prompt.txt) bytes"
 
       - name: Run cursor review
+        # Step cap, absorbed by continue-on-error (same idiom as the judge
+        # step): healthy cells finish in 3-7 min and every cell's p90 is under
+        # 12 min, but a stalled agent — almost always one that never reaches
+        # its MCP submission — used to run to the 30-min JOB timeout, which
+        # GitHub reports as a cancelled job and a cancelled run, and stretched
+        # the whole review to 35+ min. Killing the step instead leaves the
+        # pre-seeded status=error artifact for the judge to count as a
+        # non-contributing cell, exactly what the job timeout produced, but
+        # 15 minutes sooner and green.
+        continue-on-error: true
+        timeout-minutes: 15
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
           MODEL: ${{ matrix.model }}
@@ -1516,7 +1595,7 @@ jobs:
           retention-days: 7
 
   consolidate:
-    # Adjudicates the 8 cell artifacts into one consolidated review.
+    # Adjudicates the panel cell artifacts into one consolidated review.
     # Calls cursor-agent one more time as the judge, with prompt-judge.md.
     #
     # Holds no write credential: the payload is handed to the `post-review` job
