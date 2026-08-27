@@ -13,10 +13,10 @@ authors the privileged change instead). It also covers owner-gated
 immutable versions and whose changes are reserved for the dataset owner — not a
 CI-execution risk, but the same downgrade-to-issue treatment.
 
-`denied_paths(paths)` returns the subset of changed paths that are CI-privileged;
+`denied_paths(paths)` returns the subset of changed paths in either class;
 `main()` reads NUL-delimited paths from stdin (the `git diff --cached
---name-only -z` producer in groom.yml's `Capture patch` step) and prints the
-matches, exit 0 always — the caller tests non-emptiness, not the exit code.
+--no-renames --name-only -z` producer in groom.yml's `Capture patch` step) and
+prints the matches, exit 0 always — the caller tests non-emptiness, not the exit code.
 
 Two load-bearing invariants (see also the trimmed comment in groom.yml):
 
@@ -34,9 +34,16 @@ Two load-bearing invariants (see also the trimmed comment in groom.yml):
    so `.github/workflows/ev"il.yml` is emitted as `".github/workflows/ev\"il.yml"`
    whose leading quote slips past a `^\.github/` anchor. `-z` emits raw bytes with
    no quoting; this module reads those bytes. A path may itself contain a newline
-   (`-z` does not escape it), so each path is split on newlines and EVERY line is
-   tested — mirroring the old `tr '\0' '\n' | grep` line semantics; that
-   over-blocks a newline-bearing path, never under-blocks (the safe direction).
+   (`-z` does not escape it), so each path is tested WHOLE **and** split on
+   newlines with EVERY line tested — the split mirrors the old
+   `tr '\0' '\n' | grep` line semantics, and the whole-path test catches a match
+   that straddles the newline (which the split alone would miss for any
+   `$`-anchored branch). Both directions only ADD denials — over-block, never
+   under-block (the safe direction).
+
+   The producer must also pass `--no-renames` (see groom.yml): with git's default
+   rename detection, `--name-only` reports ONLY a rename's DESTINATION, so moving
+   a denied path to an undenied one shows the policy nothing at all.
 
 Run/test: python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
 """
@@ -144,14 +151,24 @@ _PATH_SUFFIXES = (
 )
 
 # Dataset-of-record paths (BE-9609). NOT CI-privileged — these are graded eval
-# cases whose merge triggers a caller's importer that publishes IMMUTABLE case
-# versions (and retires keys whose `id:` changed), a change class that caller's
-# conventions reserve for the dataset owner. A builder patch here is downgraded
-# to an issue so a human authors it. Segment-anchored so a nested `suites/` tree
-# is covered too; any depth under `cases/` (the importer only reads one level,
-# but erring wide is the safe direction).
+# cases whose merge publishes IMMUTABLE, owner-owned versions downstream, a change
+# class a caller reserves for the dataset owner. A builder patch here is downgraded
+# to an issue so a human authors it. Deliberately WIDE per invariant 1 (an
+# over-block only downgrades a PR to an issue; an under-block is the hole):
+#   * segment-anchored (`(?:^|/)`), so a nested `suites/` tree is covered;
+#   * `(?:[^/]+/)+` — ANY depth between `suites/` and `cases/`, so grouped or
+#     versioned layouts (`suites/eval/agent/cases/`, `suites/agent/v2/cases/`)
+#     are not a bypass;
+#   * `(?s:.*)` tail — any depth under `cases/`, an empty stem (`cases/.yaml`),
+#     and a raw newline in the name (see `_is_denied`: a glob-driven importer
+#     still picks such a file up, so the gate must too);
+#   * second alternative: a change whose FINAL segment is `cases` under a suite.
+#     git tracks no directories, so that path shape is a file or a SYMLINK — the
+#     indirection that would otherwise let a builder point `suites/<x>/cases` at
+#     an undenied directory and have a globbing importer follow it.
 _DATASET_OF_RECORD_REGEXES = (
-    r"suites/[^/]+/cases/.+\.ya?ml",
+    r"suites/(?:[^/]+/)+cases/(?s:.*)\.ya?ml",
+    r"suites/(?:[^/]+/)+cases",
 )
 
 # Basename globs (`*` = any run of non-`/` chars), privileged at ANY depth.
@@ -198,15 +215,30 @@ _PATTERN = re.compile(
 
 
 def _is_denied(path: str) -> bool:
-    """True if `path` (or any of its newline-split lines) is CI-privileged."""
+    """True if `path` — whole, or any of its newline-split lines — is denied."""
     # Split on newlines and test every line: git -z can emit a path containing a
     # raw newline, and the old grep matched line-by-line. Testing every line
     # over-blocks such a path, never under-blocks (the safe direction).
-    return any(_PATTERN.search(line) for line in path.split("\n"))
+    #
+    # ALSO test the unsplit path. Splitting alone under-blocks any `$`-anchored
+    # branch whose match would STRADDLE the newline: `suites/s/cases/a\nb.yaml`
+    # splits into `suites/s/cases/a` + `b.yaml`, and neither line matches — yet a
+    # `suites/*/cases/*.yaml` glob importer happily reads that file. The
+    # dataset-of-record tail uses `(?s:.*)` so it matches across the newline here.
+    # Strictly widening: this only ever adds denials, per invariant 1.
+    return any(_PATTERN.search(s) for s in (path, *path.split("\n")))
 
 
 def denied_paths(paths: Iterable[str]) -> list[str]:
-    """Return the subset of `paths` that touch a CI-privileged surface."""
+    """Return the subset of `paths` a human must author, not the builder.
+
+    Two distinct classes, deliberately returned UNDIFFERENTIATED because the sole
+    consumer (groom.yml's `Capture patch` gate) only tests non-emptiness: paths
+    the caller's pre-review CI EXECUTES, and owner-gated dataset-of-record paths.
+    Both get the same downgrade-to-issue treatment. A future caller that needs to
+    ask "would this path execute in pre-review CI?" must return the class too —
+    do not infer it from membership in this list.
+    """
     # A bare `str` is iterable; without this guard a caller that passes one path as
     # a string would iterate its characters and silently under-block. Fail loud.
     if isinstance(paths, (str, bytes)):

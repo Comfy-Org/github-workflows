@@ -192,26 +192,58 @@ class PanelHardeningTest(unittest.TestCase):
 
 
 class DatasetOfRecordTest(unittest.TestCase):
-    """Owner-gated dataset-of-record paths (BE-9609): graded eval cases under
-    `suites/*/cases/` whose merge publishes immutable versions — denied so a
-    human authors the change, not the builder."""
+    """Owner-gated dataset-of-record paths (BE-9609): graded eval case files under
+    a `suites/**/cases/` tree, whose merge publishes immutable versions — denied so
+    a human authors the change, not the builder. Fixtures are deliberately generic
+    (`s1`, `s2`): this is a PUBLIC repo, so no caller's real suite names appear."""
 
     def test_dataset_of_record_cases(self):
         for p in (
-            "suites/agent/cases/foo.yaml",
-            "suites/cloud-mcp/cases/x.yml",
-            "suites/creative/cases/deep/y.yaml",   # any depth under cases/
-            "sub/suites/a/cases/b.yaml",           # segment-anchored, nested tree
-            "SUITES/Agent/CASES/z.YAML",           # case-insensitive
+            "suites/s1/cases/foo.yaml",
+            "suites/s2/cases/x.yml",
+            "suites/s1/cases/deep/y.yaml",         # any depth under cases/
+            "sub/suites/s1/cases/b.yaml",          # segment-anchored, nested tree
+            "SUITES/S1/CASES/z.YAML",              # case-insensitive
         ):
             self.assertTrue(denied(p), p)
         for p in (
-            "suites/cloud-mcp/driver-claude-mcp.yaml",  # suite config, not a case
-            "suites/agent/README.md",
-            "suites/agent/cases/README.md",             # not YAML
-            "cases/foo.yaml",                           # missing suites/ segment
-            "suites/cases/foo.yaml",                    # missing suite segment
-            "packages/x/suites/agent/cases.yaml",       # cases.yaml file, not cases/ dir
+            "suites/s1/driver.yaml",               # suite config, not a case
+            "suites/s1/README.md",
+            "suites/s1/cases/README.md",           # not YAML
+            "cases/foo.yaml",                      # missing suites/ segment
+            "suites/cases/foo.yaml",               # missing suite segment
+            "packages/x/suites/s1/cases.yaml",     # cases.yaml file, not cases/ dir
+        ):
+            self.assertFalse(denied(p), p)
+
+    def test_dataset_of_record_no_shape_bypass(self):
+        """The tail and the mid-segments must not be a bypass: erring WIDE is the
+        contract (invariant 1), so grouped/versioned layouts, an empty stem and a
+        newline-bearing name are all denied."""
+        for p in (
+            "suites/group/s1/cases/x.yaml",        # extra segment ABOVE cases/
+            "suites/s1/v2/deep/cases/x.yml",       # several segments above cases/
+            "suites/s1/cases/.yaml",               # empty stem — `.+` missed this
+            "suites/s1/cases/a\nb.yaml",           # match STRADDLES a raw newline:
+            #                                        the line-split alone misses it,
+            #                                        a `*.yaml` importer glob does not
+        ):
+            self.assertTrue(denied(p), p)
+
+    def test_dataset_of_record_cases_symlink_shape(self):
+        """git tracks no directories, so a change AT `suites/<x>/cases` is a file or
+        a symlink — the indirection that would point the importer's glob at an
+        undenied tree. Denied; a real `cases/`-as-directory never has this shape."""
+        for p in (
+            "suites/s1/cases",
+            "sub/suites/s1/group/cases",
+            "SUITES/S1/CASES",
+        ):
+            self.assertTrue(denied(p), p)
+        for p in (
+            "cases",                               # no suites/ segment
+            "suites/cases",                        # no suite segment between
+            "suites/s1/testcases",                 # segment-anchored, not a suffix
         ):
             self.assertFalse(denied(p), p)
 

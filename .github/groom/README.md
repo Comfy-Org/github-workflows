@@ -766,18 +766,31 @@ common build files across the JS/Python/Rust/Ruby/Swift/Go/Gradle/Bazel/CMake
 ecosystems. Matching is **case-insensitive** — macOS/Windows CI runners resolve
 `PACKAGE.JSON` to the real file, so the Linux checker must too.
 
-- `denied_paths(paths)` returns the CI-privileged subset of the changed paths.
+- `denied_paths(paths)` returns the subset of changed paths a human must author
+  — CI-privileged **and** dataset-of-record, undifferentiated (the gate only
+  tests non-emptiness). Do not read membership as "executes in pre-review CI".
 - `main()` reads NUL-delimited paths from stdin (matching `git diff --cached
-  --name-only -z`) and prints the matches, **exit 0 always** — the caller tests
-  non-emptiness. NUL delimiting is mandatory: git C-quotes exotic paths in its
-  default output, slipping them past the anchors; `-z` emits raw bytes.
+  --no-renames --name-only -z`) and prints the matches, **exit 0 always** — the
+  caller tests non-emptiness. NUL delimiting is mandatory: git C-quotes exotic
+  paths in its default output, slipping them past the anchors; `-z` emits raw
+  bytes. `--no-renames` is mandatory too: with rename detection on, `--name-only`
+  reports only a rename's DESTINATION, so a patch MOVING a denied path out to an
+  undenied one would show the policy nothing.
 - The list is a conservative **default, not a proof of completeness** — over-block
   is safe (a false positive only downgrades a PR to an issue), under-block is the
   hole. A repo whose CI runs something else privileged must add it here first.
-- It also denies **owner-gated dataset-of-record paths** (BE-9609) — graded eval
-  cases under `suites/*/cases/*.y*ml`, whose merge publishes immutable case
-  versions reserved for the dataset owner — so any caller with such a tree gets
-  the downgrade-to-issue treatment for free, no configuration needed.
+- It also denies **owner-gated dataset-of-record paths** (BE-9609) — `.yml`/`.yaml`
+  files at any depth under a `suites/**/cases/` tree, plus any change whose final
+  path segment is `cases` under a suite (that shape can only be a file or a
+  symlink, the indirection that would otherwise point an importer's glob at an
+  undenied tree). Their merge publishes immutable case versions reserved for the
+  dataset owner. This is the one entry with **no CI-execution justification**, and
+  it is currently hardcoded rather than caller-gated: a caller with an unrelated
+  `…/suites/<x>/cases/*.yaml` fixture tree inherits the deny with no opt-out, and
+  because a path bail is deterministic it recurs every run and re-spends a
+  `max_prs` slot. Over-block is still the safe direction here (the finding is
+  filed as an issue, never dropped) — but if a second consumer needs its own path
+  family, make the class a caller input instead of extending this tuple.
 
 ```bash
 python3 -m unittest discover -s .github/groom/tests -p test_patch_policy.py -v
