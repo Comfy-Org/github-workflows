@@ -2,10 +2,22 @@ name: CI - AGENTS.md Integrity
 
 # Thin caller enrolling THIS repo in its own reusable agents-md-integrity
 # workflow. Pinned to a merged-main SHA rather than a local `./` path, like
-# ci-cursor-review.yml: a local path would run the PR's OWN copy of the
-# checker, letting a PR weaken the check judging it. The bump-agents-md-callers
-# fleet keeps the pin fresh once this repo is added to the AGENTS_MD_CALLERS
-# roster secret (separate human step — see the enrollment bullet in AGENTS.md).
+# ci-cursor-review.yml: a local path would run the PR's OWN copy of the checker
+# script, letting a PR rewrite the logic judging it.
+#
+# The pin protects the CHECKER, not the INVOCATION. On `pull_request` GitHub
+# reads this caller file from the PR's own ref, so a PR can still weaken the
+# gate judging it by loosening `with:`, repointing `uses:`/`agents_file:`, or
+# deleting the job — and the run still reports green under the same check name.
+# Closing that half takes a CODEOWNERS entry for `.github/workflows/**` (this
+# repo has no CODEOWNERS at any of the three paths GitHub honors) or a branch
+# rule; both are repo-policy changes, deliberately out of scope here.
+#
+# The bump-agents-md-callers fleet keeps the pin fresh only once this repo is
+# added to the AGENTS_MD_CALLERS roster — a separate step, see the "Enrolling a
+# caller is TWO steps" bullet in AGENTS.md. Until that lands, the bumper exits 0
+# against a roster that does not name this repo, both pins below stay frozen,
+# and no run log reports the drift.
 
 on:
   pull_request:
@@ -16,7 +28,7 @@ jobs:
   check:
     permissions:
       contents: read
-    uses: Comfy-Org/github-workflows/.github/workflows/agents-md-integrity.yml@75685ed9fd20a8ab4e74b3d17d2002dae63224c2  # v1 — github-workflows main (75685ed)
+    uses: Comfy-Org/github-workflows/.github/workflows/agents-md-integrity.yml@75685ed9fd20a8ab4e74b3d17d2002dae63224c2  # github-workflows main (75685ed)
     with:
       # Keep in lock-step with the `uses:` ref above (workflows_ref is REQUIRED,
       # no default — BE-5546).
