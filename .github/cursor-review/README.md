@@ -1,6 +1,6 @@
 # Cursor Review — multi-model PR review panel
 
-Label-triggered code review that runs a **panel of frontier models from four
+Label-triggered code review that runs a **panel of frontier models from three
 labs**, has each one review your PR from two angles, then has a single judge
 model consolidate everything into **one** PR review with per-finding severity
 badges.
@@ -27,17 +27,16 @@ PR gets the `cursor-review` label
    └────┬────┘   commit was already reviewed (idempotent)
         │ should_run
         ▼
-   ┌──────────────────── Panel (8 cells, in parallel) ────────────────────┐
+   ┌──────────────────── Panel (6 cells, in parallel) ────────────────────┐
    │                                                                       │
    │            adversarial (security/abuse)   edge-case (correctness)     │
    │   OpenAI          ▢                              ▢                    │
    │   Anthropic       ▢                              ▢                    │
-   │   Google          ▢                              ▢                    │
    │   Moonshot        ▢                              ▢                    │
    │                                                                       │
    │   each cell: cursor-agent records findings through a stdio MCP tool   │
    └───────────────────────────────┬───────────────────────────────────────┘
-                                    │ 8 findings artifacts
+                                    │ 6 findings artifacts
                                     ▼
                             ┌───────────────┐   prompt-judge.md: drop dupes,
                             │  Judge model  │   false positives, and noise;
@@ -75,8 +74,13 @@ minted token to meet. `tests/test_workflow_job_isolation.py` pins the property, 
 |---|---|
 | OpenAI | `gpt-5.6-sol-max` |
 | Anthropic | `claude-opus-5-thinking-max` |
-| Google | `gemini-3.1-pro` |
-| Moonshot | `kimi-k3-max` |
+| Moonshot | `kimi-k3-high` |
+
+Gemini 3.1 Pro was dropped on 2026-08-27 after a spend review: across 1,450
+judge-kept findings its two cells were the sole raiser of 2.5% of findings and
+3 of 213 critical/high ones, at ~9% of every run's cost. Kimi moved from `-max`
+to `-high` and the judge from `-max` to `-xhigh` in the same review. Callers can
+override the panel list with the `panel_models` input (see below).
 
 Each model runs **two review types**:
 
@@ -88,7 +92,7 @@ Each model runs **two review types**:
   [`prompt-edge-case.md`](prompt-edge-case.md).
 
 A single **judge** model ([`prompt-judge.md`](prompt-judge.md)) then adjudicates
-all 8 cells' findings and submits the final review through the same slim stdio
+all cells' findings and submits the final review through the same slim stdio
 MCP server. Model prose is never parsed for results: tool schemas validate the
 records before writing them, which removes formatting drift, markdown fences,
 truncated JSON, and reformat retries from the result path. If a cell fails
@@ -222,13 +226,15 @@ All optional except `workflows_ref` (required, no default) — pass them under
 
 | Input | Default | What it does |
 |---|---|---|
-| `judge_model` | `claude-opus-5-thinking-max` | Model that consolidates panel findings. |
+| `judge_model` | `claude-opus-5-thinking-xhigh` | Model that consolidates panel findings. |
+| `panel_models` | `''` (built-in list) | JSON array of Cursor model ids that **replaces** the panel list; each still runs both review types and is validated against the live catalog by preflight. For per-repo experiments (e.g. `-xhigh` vs `-max` tiers). |
+| `skip_bot_branch_prefixes` | `ci/bump- chore/refresh- auto/refresh-` | Skip the panel when the PR author is a Bot **and** the head branch starts with one of these prefixes (machine pin bumps / catalog refreshes). `''` reviews every bot PR. |
 | `diff_size_cap` | `5000` | Max counted changed lines (after generated-file exclusion and comment discounting); larger PRs are skipped. |
 | `ignore_comments` | `true` | Discount blank/comment-only lines from the size count (count-only; the panel still sees them). |
 | `review_label` | `cursor-review` | Label whose addition triggers the review. |
 | `extra_generated_globs` | `**/node_modules/**`<br>`**/dist/**`<br>`**/vendor/**`<br>`**/*.generated.*`<br>`**/*.min.js`<br>`**/*.min.css` | Extra globs the shared `check-pr-size` classifier treats as generated — excluded from BOTH the size count and the reviewed diff. Setting it **replaces** the defaults; re-state them verbatim. Path shape is load-bearing both ways: a pattern with no `/` matches only the base name (bare `node_modules` excludes nothing under the directory), while a pattern **with** a `/` is anchored to the full repo-relative path unless it opens with `**/` (`data/gen.json` misses `pkg/x/data/gen.json`). `.claude` is deliberately absent — see [the setup guide](../../docs/callers/cursor-review.md). |
 | `extra_lockfiles` | `''` | Extra lockfile **base names** for the classifier, on top of its built-ins (`go.sum`, `go.work.sum`, `package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `Cargo.lock`, `poetry.lock`, `uv.lock`). Anything else — `Gemfile.lock`, `composer.lock`, `Pipfile.lock`, `bun.lock`, `flake.lock`, `gradle.lockfile` — is **not** built in and must be listed here. A path (anything containing `/`) is rejected. |
-| `diff_excludes` | `''` | Pathspecs excluded from the reviewed diff ONLY (not the size count) — back-compat escape hatch; prefer `extra_generated_globs`. Entries need pathspec-magic (`:!…`); a plain path excludes nothing. One caveat before you empty it: if `check-pr-size` itself fails, the run degrades to rebuilding the patch as `git diff "$BASE...$HEAD" -- . $DIFF_EXCLUDES`, where **only `diff_excludes` applies** and the classifier globs are not consulted — so on a degraded run a caller that moved everything to `extra_generated_globs` feeds its vendored/minified trees to all 8 panel cells plus the judge. Keeping the heaviest trees listed in both inputs is the belt-and-braces option. |
+| `diff_excludes` | `''` | Pathspecs excluded from the reviewed diff ONLY (not the size count) — back-compat escape hatch; prefer `extra_generated_globs`. Entries need pathspec-magic (`:!…`); a plain path excludes nothing. One caveat before you empty it: if `check-pr-size` itself fails, the run degrades to rebuilding the patch as `git diff "$BASE...$HEAD" -- . $DIFF_EXCLUDES`, where **only `diff_excludes` applies** and the classifier globs are not consulted — so on a degraded run a caller that moved everything to `extra_generated_globs` feeds its vendored/minified trees to every panel cell plus the judge. Keeping the heaviest trees listed in both inputs is the belt-and-braces option. |
 | `workflows_ref` | **required** (no default) | Ref this directory's prompts/scripts are loaded from. Must be the same commit SHA as your `uses:` pin — omit it and the run fails fast, because pinning `uses:` while loading scripts from a mutable branch defeats the pin. |
 | `bot_app_id` | `''` | Optional GitHub App ID; when set (with `BOT_APP_PRIVATE_KEY`), the review posts under that App's identity instead of `github-actions[bot]`. |
 | `ledger_prior_review` | `true` | Give each round the prior rounds' findings + author replies, so a refuted or deferred finding is not re-litigated. |
