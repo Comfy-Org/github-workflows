@@ -1410,5 +1410,51 @@ class TestBodyOnlyFindings(unittest.TestCase):
         )
 
 
+# --------------------------------------------------------------------------- #
+# The severity badge is WRITTEN in post-review.py and READ BACK by _BADGE_RE    #
+# --------------------------------------------------------------------------- #
+
+
+class TestSeverityBadgeContract(unittest.TestCase):
+    """`_BADGE_RE` re-types post-review.py's severity vocabulary as a literal
+    alternation, and its `**Label** — ` shape as a literal too. post-review.py's own
+    `strip_severity_badge` avoids that by rebuilding the badge from the tables that
+    printed it; the ledger deliberately does not, because its tolerant `^\\S*\\s*`
+    prefix has to keep parsing bodies written by an OLDER post-review.py still live on
+    a pinned caller ref. So pin the two here instead: adding a severity, renaming a
+    label, or changing the dash/spacing would leave post-review.py working while the
+    ledger silently stopped stripping, carrying badge-prefixed bodies into the
+    prior-review context and degrading the repeat matching the ledger exists for.
+
+    The badge under test comes from `normalize_comments` — the real renderer — not
+    from a format string re-typed here, which would drift with it.
+    """
+
+    PROSE = "the finding's own prose"
+
+    def _rendered_body(self, severity: str) -> str:
+        comments = pr.normalize_comments(
+            [{"file": "app.py", "line": 12, "severity": severity, "body": self.PROSE}]
+        )
+        self.assertEqual(len(comments), 1)
+        return comments[0]["comment"]["body"]
+
+    def test_every_severity_post_review_renders_is_stripped_by_the_ledger(self):
+        for severity in pr.SEVERITY_ORDER:
+            with self.subTest(severity=severity):
+                body = self._rendered_body(severity)
+                self.assertNotEqual(body, self.PROSE, "post-review.py prefixed a badge")
+                self.assertEqual(bl._strip_badge(body), (severity, self.PROSE))
+
+    def test_the_ledger_recovers_the_severity_of_an_older_or_emojiless_badge(self):
+        """The tolerant prefix is the point of not sharing the formatter — hold it."""
+        for prefix in ("", "🔴 ", "🆕 "):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(
+                    bl._strip_badge(f"{prefix}**Critical** — {self.PROSE}"),
+                    ("critical", self.PROSE),
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

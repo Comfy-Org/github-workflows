@@ -104,6 +104,14 @@ CONSOLIDATED_MARKER = gate_unresolved.CONSOLIDATED_MARKER
 # post-review.py renders every inline finding as "<emoji> **<Label>** — <body>".
 # Recovering the severity from that badge is reading back our own structured
 # rendering, not inferring a disposition from author prose.
+#
+# The vocabulary and the badge's shape are re-typed here as literals, NOT shared with
+# post-review.py's SEVERITY_LABEL/SEVERITY_EMOJI: `^\S*\s*` accepts any emoji or none
+# on purpose, so the ledger keeps parsing bodies written by an OLDER post-review.py
+# still live on a pinned caller ref, and sharing the strict formatter would lose that.
+# The duplication is pinned instead — test_build_ledger.py drives post-review.py's real
+# renderer through this pattern for EVERY severity, so adding one, renaming a label or
+# changing the dash/spacing fails there rather than silently stopping the strip.
 _BADGE_RE = re.compile(r"^\S*\s*\*\*(Critical|High|Medium|Low|Nit)\*\*\s*—\s*", re.UNICODE)
 
 # Every character that STARTS A NEW LINE for `str.splitlines()` — and so, plausibly,
