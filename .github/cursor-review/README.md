@@ -58,7 +58,7 @@ thread is unresolved — see
 
 **Post review is its own job, and that is a security boundary.** No job both
 checks out PR code and holds a write-scoped credential. Every job that checks out
-PR code and runs `cursor-agent` over it — the 8 panel cells and the judge's
+PR code and runs `cursor-agent` over it — every panel cell and the judge's
 `Consolidate panel` — holds `contents: read` and nothing else. They hand their
 result to `Post review` as an artifact; that job checks out no PR code, loads
 only this directory's scripts from the pinned `workflows_ref`, and carries

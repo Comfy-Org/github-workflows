@@ -98,7 +98,7 @@ App. Preserving that boundary matters more than convenience — do not give an a
 job a write token to save a step.
 
 The split is clean for `groom.yml` and across the whole of `cursor-review.yml`:
-the 8 panel cells **and** the `Consolidate panel` judge job check out PR code and
+every panel cell **and** the `Consolidate panel` judge job check out PR code and
 hold `contents: read` only, and the review is posted from a separate `Post review`
 job that checks out no PR code and receives its payload as an artifact. No job
 both checks out PR code and holds a write-scoped credential. That is a structural
