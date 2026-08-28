@@ -167,7 +167,12 @@ input on neither physical line and on both together; `ref: "${{
 steps.r.outputs.ref` / `}}"` is the step-output checkout its one-line
 spelling is; and a leading operand that never reaches the input (`ref: ${{
 'main' ||` / `inputs.workflows_ref }}`) gets the same verdict split as it does
-on one line. Only the ref value's *own* quote opens a quoted window — one a
+on one line. A site is *recognized* from the lines seen so far — a mention
+anywhere in the fold is one — but *judging* its fallback strength also reads
+FORWARD, because the window records at the first mentioning line and the
+fallback may finish below it: `ref: >-` / `${{ inputs.workflows_ref ||` /
+`job.workflow_sha }}` mentions the input on the middle line and completes on
+the last. Only the ref value's *own* quote opens a quoted window — one a
 trailing comment leaves open (`ref: "main"  # see: "x`) is nobody's
 continuation. The `env:` alias scan follows the same split spellings, so a
 `WORKFLOWS_REF: "${{` / `inputs.workflows_ref }}"` binds the alias exactly as
@@ -392,7 +397,11 @@ Three things make that enforceable, and each was a hole on its own:
   carries the fallback. A comment merely *naming* the expression buys nothing
   either. Three matchers do this, mirroring the `_REF_USE_*` trio: block, flow
   (bounded at the entry boundary, exactly as `_REF_USE_FLOW_RE` bounds its own
-  value), and a continuation line that *is* the expression.
+  value), and a continuation line that *is* the expression — asked of the
+  **fold**, not of one physical line, so `ref: >-` / `${{ inputs.workflows_ref
+  ||` / `job.workflow_sha }}` is the self-pin its one-line spelling is. The
+  single-line reading is tried first and the fold only ever *adds* the
+  fallback, so no spelling that already scored one can lose it.
 - **The `default: ''` carve-out is scoped to actual ref checkouts**, and it asks
   the *parser* rather than re-reading each line. Asking "does any line
   self-pin?" of the whole file granted it to any file that merely mentions the
