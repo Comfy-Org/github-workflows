@@ -766,14 +766,44 @@ common build files across the JS/Python/Rust/Ruby/Swift/Go/Gradle/Bazel/CMake
 ecosystems. Matching is **case-insensitive** — macOS/Windows CI runners resolve
 `PACKAGE.JSON` to the real file, so the Linux checker must too.
 
-- `denied_paths(paths)` returns the CI-privileged subset of the changed paths.
-- `main()` reads NUL-delimited paths from stdin (matching `git diff --cached
-  --name-only -z`) and prints the matches, **exit 0 always** — the caller tests
-  non-emptiness. NUL delimiting is mandatory: git C-quotes exotic paths in its
-  default output, slipping them past the anchors; `-z` emits raw bytes.
+- `denied_paths(paths)` returns the subset of changed paths a human must author
+  — CI-privileged **and** dataset-of-record, undifferentiated (the gate only
+  tests non-emptiness). Do not read membership as "executes in pre-review CI".
+  `denied_entries(entries)` wraps it for `(old_mode, new_mode, path)` raw-diff
+  entries, adding the symlink-mode deny described below.
+- `main()` reads raw diff records from stdin (matching `git diff --cached
+  --no-renames --raw -z`) and prints the denied paths, **exit 0 always** — the
+  caller tests non-emptiness. Each producer flag is load-bearing. `-z`: git
+  C-quotes exotic paths in its default output, slipping them past the anchors,
+  while `-z` emits raw bytes. `--no-renames`: with rename detection on, a rename
+  reports only its DESTINATION pairing, so a patch MOVING a denied path out to
+  an undenied one would show the policy nothing. `--raw` (not `--name-only`):
+  the raw records carry file MODE bits, which is how `denied_entries` sees
+  symlinks — path shape alone cannot.
 - The list is a conservative **default, not a proof of completeness** — over-block
   is safe (a false positive only downgrades a PR to an issue), under-block is the
   hole. A repo whose CI runs something else privileged must add it here first.
+- It also denies **owner-gated dataset-of-record paths** (BE-9609) — `.yml`/`.yaml`
+  files at any depth under a `suites/**/cases/` tree (`**` spanning zero or more
+  segments, so a flat `suites/cases/` layout is inside the surface), plus any
+  change whose final path segment is `cases` under a suite (git tracks no
+  directories, so that shape is a file or a symlink), plus — by MODE, via the
+  `--raw` producer — any symlink-typed change carrying a `suites` segment: a
+  link at any other component the importer's glob traverses (`suites` itself, a
+  suite dir, a non-YAML name inside `cases/`) would silently redirect resolution
+  to an undenied tree. One residual stays open by construction: the policy sees
+  only the builder's diff, so a **pre-existing, human-authored** symlink into an
+  outside tree already extends the importable surface, and a builder file added
+  under that target tree matches nothing — a caller whose dataset surface
+  extends beyond literal `suites/` paths must extend the list (the conservative
+  default rule below). Their merge publishes immutable case versions reserved for the
+  dataset owner. This is the one entry with **no CI-execution justification**, and
+  it is currently hardcoded rather than caller-gated: a caller with an unrelated
+  `…/suites/<x>/cases/*.yaml` fixture tree inherits the deny with no opt-out, and
+  because a path bail is deterministic it recurs every run and re-spends a
+  `max_prs` slot. Over-block is still the safe direction here (the finding is
+  filed as an issue, never dropped) — but if a second consumer needs its own path
+  family, make the class a caller input instead of extending this tuple.
 
 ```bash
 python3 -m unittest discover -s .github/groom/tests -p test_patch_policy.py -v
