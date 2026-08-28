@@ -70,6 +70,13 @@ name: Cursor Review (reusable)
 #         # a distinct, queryable identity instead of github-actions[bot]. Supply
 #         # your App's id + private key (App IDs aren't secret, so id is an input).
 #         bot_app_id: ${{ vars.REVIEW_BOT_APP_ID }}
+#         # Optional: make the review blocking. true → the "Blocking gate" check
+#         # goes red while any cursor-review finding thread is unresolved. To
+#         # actually block merge you must ALSO mark "Blocking gate" as a required
+#         # status check in this repo's branch-protection / ruleset settings —
+#         # see docs/callers/cursor-review.md for the full flow, including the
+#         # pull_request_review_thread trigger that re-checks on thread resolution.
+#         blocking: true
 #       secrets:
 #         CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
 #         SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
@@ -256,6 +263,26 @@ on:
         type: string
         required: false
         default: ci/bump- chore/refresh- auto/refresh-
+      blocking:
+        description: >-
+          Opt-in merge gate (restored by BE-4691 after #31 dropped it). false
+          (default) → the review is advisory, exactly as before: it posts
+          findings but never fails a check on them, so no caller's behavior
+          changes until it opts in. true → a final "Blocking gate" job fails
+          (red check) while the PR has unresolved, non-outdated cursor-review
+          finding threads, and passes once they are all resolved — idempotent
+          on re-run, and fail-closed: a fresh panel that was supposed to post
+          its review and didn't refuses to pass. NOTE: this workflow cannot set
+          branch protection. To actually block the merge you must ALSO mark the
+          "Blocking gate" check as a required status check in the caller repo's
+          branch-protection / ruleset settings — until you do, the red check is
+          visible but non-blocking. Require THIS check and no other: a skipped
+          required check counts as passing, and "Consolidate panel" /
+          "Post review" skip exactly when no review ran. See
+          docs/callers/cursor-review.md for the resolve→re-check flow.
+        type: boolean
+        required: false
+        default: false
     secrets:
       CURSOR_API_KEY:
         description: Cursor API key for cursor-agent (the panel + judge models bill through it).
@@ -849,12 +876,12 @@ jobs:
   # ::warning:: annotation and step summary), and this path may never redden the
   # run — hence continue-on-error on both the mint and the upsert.
   #
-  # Non-blocking on purpose. cursor-review is advisory — it posts a review, it
-  # does not gate (no cursor-review job is a required status check on the
-  # largest consumer's default branch, checked live via the rulesets API), so
-  # failing the run over an over-cap PR would gate nothing while breaking the
-  # reusable's contract for every caller. The fix here is VISIBILITY, not
-  # enforcement.
+  # Non-blocking on purpose. cursor-review is advisory by default — it posts a
+  # review, it does not gate (gating is the opt-in `blocking` input's separate
+  # Blocking gate job, and even for a blocking caller an over-cap skip is a
+  # documented pass-through there, not a failure) — so failing the run over an
+  # over-cap PR would gate nothing while breaking the reusable's contract for
+  # every caller. The fix here is VISIBILITY, not enforcement.
   #
   # Isolation: this job checks out NO code at all — it only reads job outputs
   # and calls the comments API — so its write-scoped token is never present in
@@ -2344,6 +2371,112 @@ jobs:
               --ledger-note "$LEDGER_NOTE" \
               --error-message "Judge call failed (status=${JUDGE_STATUS}): ${JUDGE_ERROR}"
           fi
+
+  blocking-gate:
+    # Opt-in merge gate (inputs.blocking), restored by BE-4691 after #31
+    # dropped it unintentionally. Fails this check while the PR has unresolved,
+    # non-outdated cursor-review finding threads, so a caller that marks
+    # "Blocking gate" a required status check blocks merge until every finding
+    # thread is addressed. With blocking:false (default) this job is skipped
+    # entirely — the review stays advisory and no enrolled caller's behavior
+    # changes.
+    #
+    # With blocking on, this job runs on EVERY delivered event — deliberately
+    # NOT conditioned on `should_run`, unlike the original #16 job. A skipped
+    # required check counts as PASSING, so any run where the trigger step says
+    # "don't review" (an unrelated label toggled, skip-cursor-review present,
+    # the trigger label removed) would otherwise mint a green "Blocking gate"
+    # over open finding threads. Running unconditionally makes the verdict
+    # event-independent: are there live unresolved cursor-review threads on
+    # this PR right now. That is also what makes a pull_request_review_thread
+    # trigger in the caller's `on:` block a pure re-check — the trigger step
+    # leaves should_run=false, so the panel, comments and DMs all stay skipped
+    # while this gate re-queries thread state and flips green on the last
+    # resolve. The same holds for plain PR events under a label-gated caller,
+    # so a blocking caller that widens its `types:` gets a gate verdict on
+    # every push instead of a required check stuck at "Expected".
+    # (Fork PRs never gate red: their runs can post no review, so they have no
+    # finding threads to be unresolved.)
+    #
+    # `needs: post-review` orders it after the review's threads exist on a
+    # fresh run; `!cancelled()` rather than `always()` both lets it run when
+    # the upstream path is skipped and, for the same supersede reason
+    # post-review documents at its own `if:`, keeps a cancelled run from
+    # racing the run that replaced it.
+    name: Blocking gate
+    needs: [gate, diff-size, post-review]
+    if: ${{ !cancelled() && inputs.blocking }}
+    runs-on: ubuntu-latest
+    # One paged GraphQL query through gh — minutes at most; bounded like every
+    # other job here so a hung API call cannot hold a runner for the 6-hour
+    # default.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Fail if the fresh review did not post
+        # Fail-closed guard. A gate that passed while the review it gates on
+        # never posted would be fail-OPEN: no threads exist yet, the query
+        # below finds nothing, green check. So on the fresh path — the trigger
+        # step said a panel should run and no dedupe hit — refuse to pass
+        # unless the pipeline delivered: diff-size succeeded, and either the
+        # PR was over the cap (a documented, announced skip) or post-review
+        # succeeded. post-review, not consolidate, is the terminal write since
+        # the credential split: a consolidate that succeeded into a failed
+        # post still posted nothing. The non-review paths (should_run=false
+        # events, already_reviewed re-trigger, over-cap) are intentionally
+        # exempt — they fall through to the live thread query, which is the
+        # whole verdict on those runs.
+        if: ${{ needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && (needs.diff-size.result != 'success' || (needs.diff-size.outputs.within_cap == 'true' && needs.post-review.result != 'success')) }}
+        env:
+          DIFF_SIZE_RESULT: ${{ needs.diff-size.result }}
+          POST_REVIEW_RESULT: ${{ needs.post-review.result }}
+        run: |
+          echo "A fresh review was triggered but did not post (diff-size: $DIFF_SIZE_RESULT, post-review: $POST_REVIEW_RESULT) — refusing to pass the blocking gate."
+          exit 1
+
+      - name: Require a pinned workflows_ref
+        # workflows_ref has no default on purpose. GitHub does NOT enforce
+        # `required: true` for workflow_call inputs, so an omitted input arrives
+        # as '' and actions/checkout would silently fall back to this repo's
+        # default branch — running MUTABLE scripts under a pin that claims
+        # otherwise. Fail fast instead. (BE-5546)
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+        run: |
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form, and echo only that: dropping
+          # newlines also stops a multi-line value from smuggling a ::workflow
+          # command:: into the log, and from satisfying the line-oriented grep
+          # below on one 40-hex line among many.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
+            exit 1
+          fi
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
+          fi
+
+      - name: Load cursor-review assets
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _cursor_review_assets
+          persist-credentials: false
+
+      - name: Fail on unresolved cursor-review threads
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 "$CURSOR_REVIEW_ASSETS/gate-unresolved.py" \
+            --repo "$REPO" \
+            --pr-number "$PR_NUMBER"
 
   notify-start:
     name: Notify start

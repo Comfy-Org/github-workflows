@@ -9,28 +9,34 @@ passes over the PR diff. A judge model consolidates them into **one** PR review
 with per-finding severity badges. The person who applied the label gets Slack
 start/complete DMs.
 
-**Advisory only, and there is currently no supported way to make it blocking.**
-The panel posts the review and succeeds regardless of what it found; no input
-fails the run on findings.
+**Advisory by default, blocking on opt-in.** Out of the box the panel posts the
+review and succeeds regardless of what it found. Passing `blocking: true` adds a
+fail-closed **Blocking gate** job that goes red while the PR has unresolved,
+non-outdated cursor-review finding threads: resolve every thread — or push a fix
+and re-review, since a thread whose hunk changed is outdated and stops counting
+— and it goes green. Blocking the merge takes **two switches**, because a
+workflow cannot set branch protection: the input turns the check on, and marking
+`<caller job id> / Blocking gate` (with the caller below, `review / Blocking
+gate`) a required status check in your branch-protection / ruleset settings is
+what makes red actually block. Until you flip the second switch the red check is
+visible but advisory — a deliberate rollout state. Read [the blocking-gate
+gotchas](#blocking-gate-gotchas) before requiring the check. (The gate shipped
+in [#16](https://github.com/Comfy-Org/github-workflows/pull/16), was dropped by
+accident in [#31](https://github.com/Comfy-Org/github-workflows/pull/31), and
+was restored by BE-4691.)
 
-Do **not** try to build a gate by marking `… / Consolidate panel` a required
-check. GitHub counts a *skipped* required check as passing, and that job is
-`if:`-gated on five conditions — it skips when the trigger label is absent, when a
-review already exists for the head SHA (the dedupe below), when the diff is over
-`diff_size_cap`, on fork PRs, and when the panel itself is skipped. So the check
-goes green in exactly the cases where no review ran, which is the opposite of a
-gate. The `… / Post review` job is no better a candidate: it `needs:` Consolidate
-panel and runs only when that job SUCCEEDS, so it skips in every one of those
-cases and in the failure cases besides.
-
-A real opt-in gate did exist — a `blocking:` input and a fail-closed **Blocking
-gate** job — but both were dropped from `cursor-review.yml` in
-[#31](https://github.com/Comfy-Org/github-workflows/pull/31), which was otherwise
-a judge-extraction fix. Its script (`.github/cursor-review/gate-unresolved.py`)
-is still in the tree with its CLI unwired — the module itself is still imported
-by `build-ledger.py` for the shared review-thread query and helpers, so it is not
-dead code. Restoring the gate is tracked separately; until then, treat this
-review as advisory and gate on human approval.
+Require the **Blocking gate** check and no other. Do **not** try to build a gate
+by marking `… / Consolidate panel` a required check. GitHub counts a *skipped*
+required check as passing, and that job is `if:`-gated on five conditions — it
+skips when the trigger label is absent, when a review already exists for the
+head SHA (the dedupe below), when the diff is over `diff_size_cap`, on fork PRs,
+and when the panel itself is skipped. So the check goes green in exactly the
+cases where no review ran, which is the opposite of a gate. The `… / Post
+review` job is no better a candidate: it `needs:` Consolidate panel and runs
+only when that job SUCCEEDS, so it skips in every one of those cases and in the
+failure cases besides. The Blocking gate does not have this hole: with
+`blocking: true` it runs on every event the caller delivers, so its verdict is
+always a live query of the PR's thread state, never a skip.
 
 Prompts and scripts live in [`.github/cursor-review/`](../../.github/cursor-review)
 — the single source of truth, so your repo carries only a thin caller.
@@ -110,6 +116,7 @@ pull-requests: write   # posting the consolidated review
 | `bot_app_id` | `''` | Post as your App. |
 | `ledger_prior_review` | `true` | Give each round the prior rounds' findings + author replies, so a refuted or deferred finding is not re-litigated. |
 | `run_without_label` | `false` | Run on every PR rather than waiting for the label. **Also requires widening your caller's `types:`** — see the gotcha. |
+| `blocking` | `false` | Adds the fail-closed **Blocking gate** check: red while any cursor-review finding thread is unresolved and non-outdated. Turning red into a merge block is a second, separate switch — see [the blocking-gate gotchas](#blocking-gate-gotchas). |
 
 ## Gotchas
 
@@ -190,3 +197,61 @@ stays live alongside it, which is how you force a re-review on an unchanged comm
 
 **`run_without_label: true` reviews every PR.** On a busy repo that is a large
 step up in spend. Start label-gated.
+
+## Blocking-gate gotchas
+
+Everything in this section applies only once you pass `blocking: true`.
+
+**Widen your triggers before you require the check, or pushes brick the PR.**
+A required check that never *reports* on the head SHA blocks merge as
+"Expected", and the label-only caller above delivers no event on push — so
+after any push the PR stays blocked until someone toggles the label. The
+blocking caller shape is:
+
+```yaml
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize, labeled, unlabeled]
+  pull_request_review_thread:
+    types: [resolved, unresolved]
+
+concurrency:
+  # PR number only — label.name is empty on the widened events, and split
+  # groups can't cancel each other (see the run_without_label gotcha).
+  group: cursor-review-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+```
+
+These extra events are cheap: unless you also set `run_without_label: true`,
+the gate's trigger step says "don't review" on all of them, so the panel, the
+DMs and the over-cap comment all stay skipped — the only thing that runs is the
+Blocking gate itself, re-querying live thread state and reporting on the new
+SHA. The `pull_request_review_thread` events are what flip the check green the
+moment the last thread is resolved, with no label dance.
+
+**The gate enforces "no unresolved findings", not "a review happened".** A PR
+that never gets the trigger label has no finding threads, so its gate reports
+green. If you want every PR reviewed, pair `blocking: true` with
+[`cursor-review-auto-label.yml`](cursor-review-auto-label.md) or
+`run_without_label: true` — the gate then binds what those trigger. Fork PRs
+are the same story: they can't run the panel (see above), so they never gate
+red.
+
+**Neither the skip label nor removing the trigger label waives the gate.**
+`skip-cursor-review` stops new panels from running; it does not resolve the
+threads an earlier panel already posted, and neither does taking the trigger
+label off. Once findings exist, the ways out are resolving each thread, pushing
+a fix that outdates them, or a ruleset bypass. Dismissing the review does not
+clear it either — dismissal changes the review's state, not its threads'.
+
+**Anyone with write access — including the PR author — can resolve threads.**
+GitHub's thread-resolution permission is what it is: this gate guarantees every
+finding was explicitly looked at and closed out, not that a second person
+approved the closure. It complements a required human approval; it does not
+replace one.
+
+**The fresh-review path is fail-closed.** When a run was supposed to produce a
+review (label just added, diff under the cap) and the pipeline broke — the diff
+check failed, the judge crashed, the post 403'd — the gate refuses to pass
+rather than reporting green over a review that never landed. Re-run the failed
+jobs or re-trigger the review to clear it.
