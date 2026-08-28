@@ -219,6 +219,16 @@ would go green in precisely the cases a gate is meant to catch. The Blocking
 gate closes that hole by running on every delivered event when `blocking` is on
 — its verdict is a live thread-state query, never a skip.
 
+An empty thread query is not by itself a pass, either. The gate's fail-closed
+guards hold the check red when the trigger job failed, when the pipeline broke,
+when post-review exited zero without actually delivering a review to the PR (a
+read-only token, an error review, an all-cells-failed round), when every finding
+landed in the review body with no thread, when the diff was over
+`diff_size_cap`, and when the run was cancelled — because each of those leaves
+zero threads for reasons that have nothing to do with the PR being clean. The
+full list, and the two things the gate still cannot promise, are in
+[the setup guide](../../docs/callers/cursor-review.md#blocking-gate-gotchas).
+
 ## Configuration knobs
 
 All optional except `workflows_ref` (required, no default) — pass them under
@@ -240,7 +250,7 @@ All optional except `workflows_ref` (required, no default) — pass them under
 | `bot_app_id` | `''` | Optional GitHub App ID; when set (with `BOT_APP_PRIVATE_KEY`), the review posts under that App's identity instead of `github-actions[bot]`. |
 | `ledger_prior_review` | `true` | Give each round the prior rounds' findings + author replies, so a refuted or deferred finding is not re-litigated. |
 | `run_without_label` | `false` | Run on plain PR events instead of requiring the trigger label. Also requires widening the caller's `types:` — see [the setup guide](../../docs/callers/cursor-review.md). |
-| `blocking` | `false` | Adds the fail-closed **Blocking gate** check: red while any cursor-review finding thread is unresolved and non-outdated. Blocking the merge additionally requires marking that check required in the caller's ruleset — see [the blocking section above](#optional-make-the-review-blocking). |
+| `blocking` | `false` | Adds the fail-closed **Blocking gate** check: red while any cursor-review finding thread is unresolved and non-outdated, and red when the round that should have produced those threads did not land (including an over-cap skip). Blocking the merge additionally requires marking that check required in the caller's ruleset — see [the blocking section above](#optional-make-the-review-blocking). |
 
 ### Over the diff-size cap
 

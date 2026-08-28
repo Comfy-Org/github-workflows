@@ -106,7 +106,7 @@ pull-requests: write   # posting the consolidated review
 | `judge_model` | `claude-opus-5-thinking-xhigh` | Consolidates the panel into one review. |
 | `panel_models` | `''` | JSON array of model ids replacing the built-in panel list (each runs both review types; preflight validates them against the live catalog). Use for per-repo experiments such as a reasoning-tier A/B. |
 | `skip_bot_branch_prefixes` | `ci/bump- chore/refresh- auto/refresh-` | Skip the panel for Bot-authored PRs on these branch prefixes (machine pin bumps / refreshes). `''` to review every bot PR. |
-| `diff_size_cap` | `5000` | Skip review above this diff size. An over-cap PR is not silent — see the gotcha below. |
+| `diff_size_cap` | `5000` | Skip review above this diff size. An over-cap PR is not silent — see the gotcha below. Under `blocking: true` it is also not green: an unreviewed PR cannot pass the gate. |
 | `ignore_comments` | `true` | Discount blank/comment-only lines from the size count (count-only — the panel still sees them). |
 | `review_label` | `cursor-review` | The label that triggers a run. |
 | `extra_generated_globs` | `**/node_modules/**`<br>`**/dist/**`<br>`**/vendor/**`<br>`**/*.generated.*`<br>`**/*.min.js`<br>`**/*.min.css` | Extra globs the shared `check-pr-size` classifier treats as generated — kept out of **both** the size-budget count and the reviewed diff. Passing your own value **replaces** the default list, so re-state the entries you still want — **copy them verbatim**, `**/…/**` and all: a pattern with no `/` matches only the *base name*, so a bare `node_modules` matches a file literally named `node_modules` and excludes nothing under the directory; and conversely a pattern that *does* contain a `/` is anchored to the whole repo-relative path unless it opens with `**/`, so `data/gen.json` matches only the root-level file and misses `packages/x/data/gen.json`. These are plain globs, **not** git pathspecs — never carry a `:!` prefix over from `diff_excludes` (see that row). `.claude` is deliberately **not** in the default: hand-authored agent instructions are prose worth reviewing. A repo whose `.claude/` tree is vendored/tool-installed output (a BMAD-method install, say) should pass the defaults above plus `**/.claude/**` — otherwise that tree now counts toward `diff_size_cap`, and a PR over the cap is skipped silently (no review comment, no Slack notice). |
@@ -116,7 +116,7 @@ pull-requests: write   # posting the consolidated review
 | `bot_app_id` | `''` | Post as your App. |
 | `ledger_prior_review` | `true` | Give each round the prior rounds' findings + author replies, so a refuted or deferred finding is not re-litigated. |
 | `run_without_label` | `false` | Run on every PR rather than waiting for the label. **Also requires widening your caller's `types:`** — see the gotcha. |
-| `blocking` | `false` | Adds the fail-closed **Blocking gate** check: red while any cursor-review finding thread is unresolved and non-outdated. Turning red into a merge block is a second, separate switch — see [the blocking-gate gotchas](#blocking-gate-gotchas). |
+| `blocking` | `false` | Adds the fail-closed **Blocking gate** check: red while any cursor-review finding thread is unresolved and non-outdated, and red when the round that should have produced those threads did not land (including an over-cap skip). Turning red into a merge block is a second, separate switch — see [the blocking-gate gotchas](#blocking-gate-gotchas). |
 
 ## Gotchas
 
@@ -141,7 +141,7 @@ above it does **not** by itself start a run — `types: [labeled, unlabeled]` om
 the label. Add `synchronize` to `types:` if you want every push re-reviewed (and
 see the spend warning below).
 
-**An over-cap PR gets no review, and now says so.** When the counted diff exceeds `diff_size_cap` the panel is skipped and the run still goes green — nothing about it is a failure. So the skip announces itself in three places instead: a `::warning::` annotation and a step-summary block on the *Diff size check* job (both credential-free, so they still show on Dependabot PRs, whose runs can't read Actions secrets), plus a sticky PR comment naming the counted total and the cap. Get the PR under the cap and **re-apply the label** — with the label-gated caller above a push alone starts no run — and that comment flips to ✅. The comment posts as your bot app when `bot_app_id` + `BOT_APP_PRIVATE_KEY` are set and as `github-actions[bot]` otherwise, so it works out of the box; if the write fails it degrades to the annotation and the summary and the job log says why. The comment path is best-effort throughout — it never reddens the run. Note that **fork PRs get neither half**: the gate skips a cross-repo head before the size check runs, so a fork PR is skipped for being a fork, whatever its size.
+**An over-cap PR gets no review, and now says so.** When the counted diff exceeds `diff_size_cap` the panel is skipped and the run still goes green — nothing about it is a failure. So the skip announces itself in three places instead: a `::warning::` annotation and a step-summary block on the *Diff size check* job (both credential-free, so they still show on Dependabot PRs, whose runs can't read Actions secrets), plus a sticky PR comment naming the counted total and the cap. Get the PR under the cap and **re-apply the label** — with the label-gated caller above a push alone starts no run — and that comment flips to ✅. The comment posts as your bot app when `bot_app_id` + `BOT_APP_PRIVATE_KEY` are set and as `github-actions[bot]` otherwise, so it works out of the box; if the write fails it degrades to the annotation and the summary and the job log says why. The comment path is best-effort throughout — it never reddens the run. Note that **fork PRs get neither half**: the gate skips a cross-repo head before the size check runs, so a fork PR is skipped for being a fork, whatever its size. **Under `blocking: true` an over-cap PR does not go green** — the Blocking gate holds it red, because diff size is author-controlled and "too big to review" is not evidence a PR is clean; see [the blocking-gate gotchas](#blocking-gate-gotchas).
 
 **Dependabot PRs are not covered by the fork skip.** Dependabot's branches live in
 the base repo, so the gate's cross-repo check treats them as ordinary PRs — but
@@ -251,7 +251,48 @@ approved the closure. It complements a required human approval; it does not
 replace one.
 
 **The fresh-review path is fail-closed.** When a run was supposed to produce a
-review (label just added, diff under the cap) and the pipeline broke — the diff
-check failed, the judge crashed, the post 403'd — the gate refuses to pass
-rather than reporting green over a review that never landed. Re-run the failed
-jobs or re-trigger the review to clear it.
+review and the pipeline broke, the gate refuses to pass rather than reporting
+green over a review that never landed. Re-run the failed jobs or re-trigger the
+review to clear it. It holds the check red on all of:
+
+* the trigger job itself failing, so whether the PR should have been reviewed is
+  unknown;
+* the diff-size or post-review job failing;
+* a post-review job that *succeeded* without delivering a review to the PR. A
+  zero exit is not proof: post-review writes the review to the job summary
+  instead when its token is read-only (403), posts a body-only "Review failed"
+  review when the judge crashed, and posts a no-findings review when every panel
+  cell errored. It reports which of those happened as a job output, and the gate
+  requires the positive statement rather than inferring it from the exit code;
+* a review that landed but whose findings all went into the review *body* with no
+  inline thread (the anchors missed the reviewed diff, or GitHub rejected the
+  inline payload) — findings a thread query cannot see;
+* **the diff being over `diff_size_cap`.** No panel ran, so nothing was reviewed.
+  Get the PR under the cap, or raise the cap on the caller;
+* being triggered by an event with no pull request in its payload (`merge_group`,
+  `push`, `workflow_dispatch`), which the gate cannot judge — use the trigger
+  shape above.
+
+Cancelling a run does not waive it either: the gate runs on cancellation too,
+because GitHub counts a *skipped* required check as passing.
+
+**Two things the gate still cannot promise.** Both are limits of what review
+threads can express, not bugs, and it is worth knowing them before you require
+the check:
+
+* **It does not prove the current head SHA was reviewed.** A thread stops
+  counting once its hunk changes (`isOutdated`), and with a label-gated caller a
+  push runs no new panel — so a cosmetic edit to the flagged lines can outdate
+  every finding and turn the check green with no re-review. Pair `blocking: true`
+  with [`cursor-review-auto-label.yml`](cursor-review-auto-label.md) or
+  `run_without_label: true` if you need every head SHA actually reviewed. (The
+  `isOutdated` waiver is deliberate: without it, findings a fix already
+  superseded would have to be resolved by hand before the check could ever go
+  green.)
+* **It gates the findings that got a thread, not every finding.** In a round
+  where *some* findings were demoted to the review body, the gate holds red on
+  the inline half and is silent about the demoted half — deliberately, since a
+  body-only finding has no thread to resolve and failing on it would be a check
+  nothing could ever clear. Read the review body, not just the threads. The
+  fully-demoted case, where *no* finding got a thread, is caught by the
+  fail-closed list above.

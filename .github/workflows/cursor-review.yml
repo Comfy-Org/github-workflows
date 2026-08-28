@@ -30,13 +30,26 @@ name: Cursor Review (reusable)
 #
 #   name: CI - Cursor Review
 #   on:
+#     # The BLOCKING caller shape, because this example sets `blocking: true`
+#     # below. A required check must report on the head SHA, and a label-only
+#     # `types: [labeled, unlabeled]` delivers no event on push — the check
+#     # would sit at "Expected" and brick the PR until someone toggled the
+#     # label. `pull_request_review_thread` is what flips the gate green the
+#     # moment the last finding thread is resolved. Advisory callers
+#     # (`blocking` unset) can keep the narrower label-only pair; see
+#     # docs/callers/cursor-review.md for both shapes.
 #     pull_request:
-#       types: [labeled, unlabeled]
+#       types: [opened, reopened, ready_for_review, synchronize, labeled, unlabeled]
+#     pull_request_review_thread:
+#       types: [resolved, unresolved]
 #   permissions:
 #     contents: read
 #     pull-requests: write
 #   concurrency:
-#     group: cursor-review-pr-${{ github.event.pull_request.number }}-${{ github.event.label.name }}
+#     # PR number ONLY. `github.event.label.name` is empty on every widened
+#     # event, so keying on it splits one PR across groups that cannot cancel
+#     # each other.
+#     group: cursor-review-pr-${{ github.event.pull_request.number }}
 #     cancel-in-progress: true
 #   jobs:
 #     cursor-review:
@@ -436,8 +449,30 @@ jobs:
           #
           # API failure falls through to running, not skipping — better to
           # double-review than silently no-op.
+          #
+          # The `user.type == "Bot"` term is a permission check, not a tidiness
+          # one (BE-4691). The consolidated marker is PUBLIC text in a public
+          # repo, and anyone who can open a PR can submit a review on it — so
+          # matching the body alone let any user post a body-only review
+          # carrying the marker and have this step declare the SHA already
+          # reviewed. That skips the panel, the judge and the post, and under
+          # `blocking: true` it also waives the gate's fresh-review guard and
+          # greens a required check over a PR nothing ever looked at. It also
+          # made the documented remedy for a genuine error review (re-trigger on
+          # the same SHA) a silent no-op, since that review carries the marker
+          # too.
+          #
+          # Matched on the TYPE rather than a login because the poster is
+          # caller-configurable: `github-actions[bot]` by default, or whatever
+          # bot the caller's `bot_app_id` App resolves to — a login this job
+          # cannot know without minting that token, which is the credential
+          # split's whole point. `Bot` narrows the set from "every GitHub user"
+          # to "Apps a repo admin installed here", which is the boundary that
+          # matters. Residual, accepted: another installed App could post a
+          # marked review. Closing THAT needs the identity check to move into
+          # the posting job, where the token exists.
           EXISTING=$(gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" 2>/dev/null \
-            | jq --arg sha "$HEAD_SHA" '[.[] | select(.commit_id == $sha and .state != "DISMISSED" and (.body | startswith("## 🔍 Cursor Review — Consolidated panel")))] | length' \
+            | jq --arg sha "$HEAD_SHA" '[.[] | select(.commit_id == $sha and .state != "DISMISSED" and (.user.type == "Bot") and (.body | startswith("## 🔍 Cursor Review — Consolidated panel")))] | length' \
             2>/dev/null || echo 0)
 
           if [ "$EXISTING" -gt 0 ]; then
@@ -2111,6 +2146,18 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+    # The blocking gate's POSITIVE delivery signal (BE-4691). This job's
+    # `result` cannot answer "did a review carrying resolvable finding threads
+    # land on the PR" — post-review.py exits 0 after a read-only-token 403, after
+    # the body-only "Review failed" review, after the all-cells-failed
+    # no-findings review and after the 422 inline fallback, and every one of
+    # those leaves the gate's thread query empty. So the script states it
+    # instead; see its emit_delivery for the contract. Unset (the script died
+    # before deciding) reads as false at the gate — fail-closed by default.
+    outputs:
+      delivered: ${{ steps.post.outputs.delivered }}
+      gated_findings: ${{ steps.post.outputs.gated_findings }}
+      ungated_findings: ${{ steps.post.outputs.ungated_findings }}
     steps:
       - name: Require a pinned workflows_ref
         # workflows_ref has no default on purpose. GitHub does NOT enforce
@@ -2250,6 +2297,7 @@ jobs:
           private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
 
       - name: Post review
+        id: post
         env:
           # Dedicated bot identity when configured (bot_app_id), else github-actions[bot].
           GH_TOKEN: ${{ steps.bot_token.outputs.token || secrets.GITHUB_TOKEN }}
@@ -2399,13 +2447,20 @@ jobs:
     # finding threads to be unresolved.)
     #
     # `needs: post-review` orders it after the review's threads exist on a
-    # fresh run; `!cancelled()` rather than `always()` both lets it run when
-    # the upstream path is skipped and, for the same supersede reason
-    # post-review documents at its own `if:`, keeps a cancelled run from
-    # racing the run that replaced it.
+    # fresh run; `always()` (not `!cancelled()`) is what keeps it reporting.
+    # post-review uses `!cancelled()` because it WRITES and must not race the
+    # run that superseded it — this job writes nothing, it re-reads live thread
+    # state, so a superseded run and its replacement can only agree. What
+    # `!cancelled()` would cost is the whole point of the job: a cancelled run
+    # skips it, GitHub counts a skipped required check as PASSING, and the
+    # documented caller makes cancellation easy to reach (`cancel-in-progress`
+    # puts thread-resolve events in the same group as panel runs, and an author
+    # can cancel by hand). Green-on-cancel is the exact fail-OPEN this job
+    # exists to close, so it runs on cancellation too — and if the teardown
+    # takes its steps down with it, the check goes RED, which is the safe side.
     name: Blocking gate
     needs: [gate, diff-size, post-review]
-    if: ${{ !cancelled() && inputs.blocking }}
+    if: ${{ always() && inputs.blocking }}
     runs-on: ubuntu-latest
     # One paged GraphQL query through gh — minutes at most; bounded like every
     # other job here so a hung API call cannot hold a runner for the 6-hour
@@ -2415,26 +2470,113 @@ jobs:
       contents: read
       pull-requests: read
     steps:
-      - name: Fail if the fresh review did not post
-        # Fail-closed guard. A gate that passed while the review it gates on
-        # never posted would be fail-OPEN: no threads exist yet, the query
-        # below finds nothing, green check. So on the fresh path — the trigger
-        # step said a panel should run and no dedupe hit — refuse to pass
-        # unless the pipeline delivered: diff-size succeeded, and either the
-        # PR was over the cap (a documented, announced skip) or post-review
-        # succeeded. post-review, not consolidate, is the terminal write since
-        # the credential split: a consolidate that succeeded into a failed
-        # post still posted nothing. The non-review paths (should_run=false
-        # events, already_reviewed re-trigger, over-cap) are intentionally
-        # exempt — they fall through to the live thread query, which is the
-        # whole verdict on those runs.
-        if: ${{ needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && (needs.diff-size.result != 'success' || (needs.diff-size.outputs.within_cap == 'true' && needs.post-review.result != 'success')) }}
+      - name: Fail if the trigger decision itself failed
+        # FIRST fail-closed guard, and it has to come first because every guard
+        # below is phrased in terms of `needs.gate.outputs.*`. Those outputs are
+        # EMPTY when the gate job failed — its dup-check API call and its label
+        # `jq` can both error — so `should_run == 'true'` is false, every
+        # downstream guard skips, and the run falls through to a thread query
+        # that finds nothing on a PR nobody ever decided to review. That is a
+        # green required check produced by a red job, on exactly the path these
+        # guards exist to close. An undecided run is not a clean run.
+        if: ${{ needs.gate.result != 'success' }}
+        env:
+          GATE_RESULT: ${{ needs.gate.result }}
+        run: |
+          echo "::error::The cursor-review trigger job did not succeed (gate: $GATE_RESULT), so whether this PR should have been reviewed is unknown — refusing to pass the blocking gate. Re-run the failed job."
+          exit 1
+
+      - name: Fail if the fresh review did not land
+        # SECOND fail-closed guard. A gate that passed while the review it gates
+        # on never landed would be fail-OPEN: no threads exist, the query below
+        # finds nothing, green check. So on the fresh path — the trigger step
+        # said a panel should run and no dedupe hit — refuse to pass unless the
+        # pipeline actually delivered a review.
+        #
+        # Two things are checked, and BOTH are needed:
+        #
+        # * `needs.post-review.result == 'success'`. post-review, not
+        #   consolidate, is the terminal write since the credential split: a
+        #   consolidate that succeeded into a failed post still posted nothing.
+        # * `needs.post-review.outputs.delivered == 'true'`. The job result is
+        #   NOT sufficient on its own — post-review.py exits 0 after a
+        #   read-only-token 403 (review written to the job summary, never to the
+        #   PR), after the body-only "Review failed" error review, after the
+        #   no-findings review a run posts when every panel cell errored, and
+        #   after the 422 inline-anchor fallback. Each of those is a zero exit
+        #   over a round that adjudicated nothing, and each leaves the thread
+        #   query below empty. The script therefore emits the claim positively
+        #   (see its emit_delivery); an unset value — the script died before
+        #   deciding — is not `'true'`, so the default is closed.
+        #
+        # Over the cap is NOT exempt any more. It used to fall through to the
+        # thread query as a "documented, announced skip", but diff size is fully
+        # author-controlled: padding a PR past `diff_size_cap` skipped the panel
+        # AND outdated every thread an earlier under-cap round had posted, so one
+        # commit both cleared the existing findings and greened the gate. "Too
+        # big to review" is not evidence a PR is clean. For a blocking caller the
+        # over-cap path now holds the check red (post-review is skipped, so this
+        # guard fires) until the diff comes under the cap or the caller raises
+        # `diff_size_cap`. Only the genuinely review-free paths stay exempt —
+        # should_run=false events and the already_reviewed re-trigger — and those
+        # fall through to the live thread query, which is the whole verdict there.
+        if: ${{ needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && (needs.diff-size.result != 'success' || needs.post-review.result != 'success' || needs.post-review.outputs.delivered != 'true') }}
         env:
           DIFF_SIZE_RESULT: ${{ needs.diff-size.result }}
+          WITHIN_CAP: ${{ needs.diff-size.outputs.within_cap }}
           POST_REVIEW_RESULT: ${{ needs.post-review.result }}
+          DELIVERED: ${{ needs.post-review.outputs.delivered }}
         run: |
-          echo "A fresh review was triggered but did not post (diff-size: $DIFF_SIZE_RESULT, post-review: $POST_REVIEW_RESULT) — refusing to pass the blocking gate."
+          if [ "$DIFF_SIZE_RESULT" = "success" ] && [ "$WITHIN_CAP" != "true" ]; then
+            echo "::error::This PR's counted diff exceeds diff_size_cap, so no review ran — and an unreviewed PR cannot pass a blocking gate. Split the PR under the cap and re-trigger the review, or raise diff_size_cap on the caller."
+            exit 1
+          fi
+          echo "::error::A fresh review was triggered but did not land on this PR (diff-size: $DIFF_SIZE_RESULT, post-review: $POST_REVIEW_RESULT, delivered: ${DELIVERED:-<unset>}) — refusing to pass the blocking gate. Re-run the failed jobs or re-trigger the review."
           exit 1
+
+      - name: Fail if the review landed with no resolvable threads
+        # THIRD fail-closed guard, for the one delivery that is real and still
+        # invisible to the query below. post-review.py demotes a finding whose
+        # anchor misses the reviewed diff into the review BODY, and falls back to
+        # a wholly body-only review when GitHub 422s the inline payload. Neither
+        # creates a thread. A round in which EVERY finding was demoted posts N
+        # real findings and leaves zero threads — indistinguishable, to a thread
+        # query, from a clean PR — so the gate would report green over findings
+        # nobody can even reply to, which is precisely the "every finding was
+        # explicitly looked at and closed out" claim falsified.
+        #
+        # Scoped to the fully-degraded round (threads == 0 while body-only
+        # findings exist) on purpose. A PARTIALLY demoted round keeps its inline
+        # half, so the gate already holds red on those threads; failing on the
+        # demoted half too would be a check no thread resolution could ever clear
+        # — a bricked PR rather than a gate. That residual is documented in the
+        # setup guide's blocking-gate gotchas rather than papered over here.
+        if: ${{ needs.post-review.outputs.delivered == 'true' && needs.post-review.outputs.gated_findings == '0' && needs.post-review.outputs.ungated_findings != '0' && needs.post-review.outputs.ungated_findings != '' }}
+        env:
+          UNGATED: ${{ needs.post-review.outputs.ungated_findings }}
+        run: |
+          echo "::error::The review landed but every one of its $UNGATED finding(s) was posted in the review body with no inline thread (the anchors missed the reviewed diff, or GitHub rejected the inline payload), so there is nothing for this gate to watch resolve. Read the findings in the review body, push a fix, and re-trigger the review."
+          exit 1
+
+      - name: Require a pull-request event
+        # gate-unresolved.py's --pr-number is argparse `type=int`, and this job
+        # runs on EVERY delivered event by design. On any payload without a pull
+        # request — `merge_group` (which a merge queue runs required checks on),
+        # `workflow_dispatch`, `push`, `issue_comment` — the expression below is
+        # empty and argparse exits 2, leaving a required check permanently red
+        # whose only explanation is a traceback and which no thread resolution
+        # can clear. Say what is wrong instead. Still a FAILURE, not a skip: a
+        # skipped required check counts as passing, and this gate cannot judge a
+        # PR it was not handed. The fix is the caller's `on:` block — see the
+        # blocking caller shape in docs/callers/cursor-review.md.
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ -z "$PR_NUMBER" ]; then
+            echo "::error::The blocking gate was triggered by '$EVENT_NAME', which carries no pull_request payload, so it cannot read this PR's review threads. Trigger cursor-review from pull_request / pull_request_review_thread events (see the blocking caller shape in docs/callers/cursor-review.md)."
+            exit 1
+          fi
 
       - name: Require a pinned workflows_ref
         # workflows_ref has no default on purpose. GitHub does NOT enforce

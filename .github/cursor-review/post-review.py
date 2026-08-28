@@ -85,6 +85,52 @@ REPEAT_CAP = 2
 # sentinel is what humans read; THIS is the contract, and the version suffix is what
 # lets the reader reject a payload it does not understand instead of guessing.
 BODY_ONLY_SENTINEL_PREFIX = "cursor-review:body-only-findings v1"
+
+# --- the blocking gate's delivery signal (BE-4691) -------------------------
+# `needs.post-review.result == 'success'` cannot stand in for "a review carrying
+# resolvable finding threads landed on the PR": this script exits 0 after a
+# read-only-token 403 (the review went to the job summary, not the PR), after the
+# body-only "Review failed" error review, after the no-findings review a run posts
+# when every panel cell errored, and after the 422 inline-anchor fallback. Each of
+# those satisfies a zero-exit guard while the gate's thread query legitimately finds
+# nothing — a green required check over a round that never reviewed anything, which
+# is the fail-OPEN the gate exists to prevent. So say it POSITIVELY instead, and let
+# the gate require the statement rather than infer it from an exit code.
+#
+#   delivered         true only when a real review — one whose findings were actually
+#                     adjudicated — reached the PR itself.
+#   gated_findings    findings that carry an inline thread, i.e. that a human can
+#                     resolve and that the gate can therefore hold the merge on.
+#   ungated_findings  findings that reached the review BODY only (anchor missed the
+#                     reviewed diff, or the whole inline payload 422'd). Real
+#                     findings with nowhere to reply — no thread resolution can ever
+#                     clear them, so the gate must not read their absence as clean.
+#
+# Emitted exactly once (first call wins): the paths below can fall through each
+# other, and duplicate keys in $GITHUB_OUTPUT are ambiguous. Nothing is written when
+# the script dies before deciding, which leaves the gate reading an empty
+# `delivered` — false, i.e. fail-closed by default.
+_DELIVERY_EMITTED = False
+
+
+def emit_delivery(delivered: bool, gated: int = 0, ungated: int = 0) -> None:
+    """Write the blocking gate's delivery signal to $GITHUB_OUTPUT."""
+    global _DELIVERY_EMITTED
+    if _DELIVERY_EMITTED:
+        return
+    _DELIVERY_EMITTED = True
+    print(
+        f"delivery: delivered={'true' if delivered else 'false'} "
+        f"gated_findings={gated} ungated_findings={ungated}",
+        file=sys.stderr,
+    )
+    path = os.environ.get("GITHUB_OUTPUT")
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"delivered={'true' if delivered else 'false'}\n")
+        f.write(f"gated_findings={gated}\n")
+        f.write(f"ungated_findings={ungated}\n")
 # Mirrors build-ledger.py's MAX_BODY_CHARS: the ledger truncates to that anyway, so
 # encoding more only spends review-body budget that the clamp would take back. The
 # marker mirrors its TRUNCATION_MARKER for the same reason — cutting to exactly the
@@ -267,7 +313,17 @@ def write_step_summary(markdown: str, note: str = READ_ONLY_SUMMARY_NOTE) -> Non
         f.write(payload + "\n")
 
 
-def post_or_degrade(repo, pr_number, payload, summary_markdown, context, truncated=False) -> bool:
+def post_or_degrade(
+    repo,
+    pr_number,
+    payload,
+    summary_markdown,
+    context,
+    truncated=False,
+    delivers=True,
+    gated=0,
+    ungated=0,
+) -> bool:
     """POST a review; degrade to the step summary on a read-only token.
 
     Returns True when the review was delivered — either posted on the PR, or
@@ -278,9 +334,18 @@ def post_or_degrade(repo, pr_number, payload, summary_markdown, context, truncat
     `truncated` says the posted body was clamped, so the whole of it goes to the
     summary even on success — otherwise the clamp note points at a summary that
     was never written.
+
+    `delivers` says whether a SUCCESSFUL post of this particular body counts as a
+    review for the blocking gate. It does not for the two bodies that report a
+    failure rather than a review — the "Review failed" error review and the
+    all-cells-failed no-findings review — which is the whole reason the gate
+    cannot read this function's `True` as "a review happened". Note that the
+    read-only branch returns True as well and is never a delivery: the review
+    reached a job summary, not the PR, so no thread exists to hold the merge on.
     """
     result = gh_post_review(repo, pr_number, payload)
     if result.returncode == 0:
+        emit_delivery(delivers, gated, ungated)
         if truncated:
             print(
                 f"{context}: body hit GitHub's size limit — full text written to "
@@ -295,6 +360,7 @@ def post_or_degrade(repo, pr_number, payload, summary_markdown, context, truncat
             "summary instead of the PR.",
             file=sys.stderr,
         )
+        emit_delivery(False)
         write_step_summary(summary_markdown)
         return True
     print(f"{context} POST failed: {result.stderr}", file=sys.stderr)
@@ -1146,10 +1212,14 @@ def post_error_review(repo, pr_number, commit_sha, header, error_message):
         unclamped,
         "Error review",
         truncated=body_text != unclamped,
+        # This body REPORTS a failure; it adjudicates nothing and anchors no
+        # thread. Posting it must never green the blocking gate.
+        delivers=False,
     ):
         # Same contract as the review paths: a genuine POST failure still delivers the
         # text somewhere. post_or_degrade writes the summary itself on the paths that
         # return True, so this cannot double-write.
+        emit_delivery(False)
         write_step_summary(unclamped, note=POST_FAILED_SUMMARY_NOTE)
         raise SystemExit(1)
 
@@ -1241,12 +1311,21 @@ def main():
             {"body": body_text, "event": "COMMENT", "commit_id": args.commit_sha}
         )
         if not post_or_degrade(
-            args.repo, args.pr_number, payload, body_text, "No-findings review"
+            args.repo,
+            args.pr_number,
+            payload,
+            body_text,
+            "No-findings review",
+            # `all_failed` is "every reviewer errored", not "the reviewers found
+            # nothing" — zero threads there means nothing was reviewed, so it is
+            # exactly the round the gate must refuse to pass.
+            delivers=not all_failed,
         ):
             # Same contract as the other three exit paths: a genuine POST failure still
             # delivers the text somewhere. On the all-failed branch that text is the one
             # artifact explaining why no review happened — the panel summary naming
             # which cells errored — so losing it is exactly when it is needed most.
+            emit_delivery(False)
             write_step_summary(body_text, note=POST_FAILED_SUMMARY_NOTE)
             raise SystemExit(1)
         return
@@ -1309,6 +1388,11 @@ def main():
     result = gh_post_review(args.repo, args.pr_number, payload)
 
     if result.returncode == 0:
+        # The split the gate needs: `comments` are the findings that got a thread a
+        # human can resolve; `body_only_items` reached the body and can never be
+        # resolved. A round where the second is non-empty and the first is empty is
+        # a review whose every finding is invisible to a thread query.
+        emit_delivery(True, gated=len(comments), ungated=len(body_only_items))
         if posted_body != review_body:
             # The clamp note tells the reader the full text is in the job summary.
             # Nothing else on this path writes one, so write it here or the note lies
@@ -1329,6 +1413,7 @@ def main():
             "summary instead of the PR.",
             file=sys.stderr,
         )
+        emit_delivery(False)
         write_step_summary(prose_body)
         return
 
@@ -1345,6 +1430,7 @@ def main():
             "body, so writing it to the job summary instead.",
             file=sys.stderr,
         )
+        emit_delivery(False)
         write_step_summary(prose_body, note=POST_FAILED_SUMMARY_NOTE)
         raise SystemExit(1)
 
@@ -1392,6 +1478,12 @@ def main():
         fallback_body,
         "Fallback review",
         truncated=clamped_fallback != fallback_body,
+        # This body reached the PR, so it IS a delivery — but the inline half is
+        # exactly what was dropped to make it postable, so none of its findings
+        # carries a thread. Reported as ungated so the gate refuses to read the
+        # empty thread query as "nothing was found".
+        gated=0,
+        ungated=len(enriched),
     ):
         # Both attempts failed for a non-403 reason (an API outage, a stale commit_id
         # after a force-push, a body-level rejection dropping the anchors cannot fix).
@@ -1399,6 +1491,7 @@ def main():
         # contradicts the no-inline branch above — and this is the branch carrying
         # MORE content, since it has an inline half. post_or_degrade only writes a
         # summary on the paths that return True, so there is no double write here.
+        emit_delivery(False)
         write_step_summary(fallback_body, note=POST_FAILED_SUMMARY_NOTE)
         raise SystemExit(1)
 
