@@ -34,7 +34,7 @@ and grant credentials to. In scope:
   to make that step hold a write token — or to influence the privileged job from
   inside the unprivileged one — is a vulnerability. The separation is real for
   groom and across the whole of cursor-review, where no job both checks out PR
-  code and holds a write-scoped credential: the 8 panel cells **and** the
+  code and holds a write-scoped credential: every panel cell **and** the
   `Consolidate panel` judge job hold `contents: read` only, and the review is
   posted from a separate `Post review` job that checks out no PR code and
   receives its payload as an artifact. A way to collapse that split — a model

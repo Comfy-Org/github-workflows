@@ -51,11 +51,14 @@ PR gets the `cursor-review` label
 Slack start/complete DMs to the triggerer are sent alongside (optional —
 skipped if no Slack token is configured). A skip for the diff-size cap is
 announced on the PR rather than passing for a clean review — see [Over the
-diff-size cap](#over-the-diff-size-cap).
+diff-size cap](#over-the-diff-size-cap). With `blocking: true` a final
+**Blocking gate** job follows Post review and fails while any posted finding
+thread is unresolved — see
+[Optional: make the review blocking](#optional-make-the-review-blocking).
 
 **Post review is its own job, and that is a security boundary.** No job both
 checks out PR code and holds a write-scoped credential. Every job that checks out
-PR code and runs `cursor-agent` over it — the 8 panel cells and the judge's
+PR code and runs `cursor-agent` over it — every panel cell and the judge's
 `Consolidate panel` — holds `contents: read` and nothing else. They hand their
 result to `Post review` as an artifact; that job checks out no PR code, loads
 only this directory's scripts from the pinned `workflows_ref`, and carries
@@ -108,7 +111,7 @@ tagged `error` rather than silently vanishing.
 | [`prompt-judge.md`](prompt-judge.md) | Prompt the judge model uses to consolidate panel findings into one review. |
 | [`review-output-mcp.py`](review-output-mcp.py) | Dependency-free stdio MCP server. Reviewers record individual findings and finish; the judge submits the final findings array. It validates and atomically writes the normalized records consumed by later jobs. |
 | [`post-review.py`](post-review.py) | Reads the judge's consolidated findings and posts **one** PR review with line-anchored inline comments and severity badges. |
-| [`gate-unresolved.py`](gate-unresolved.py) | **Its CLI is unwired; the module is not dead code — do not delete it.** Implemented the opt-in blocking gate: queries the PR's review threads and exits non-zero while any cursor-review finding thread is unresolved. The job that ran that CLI was dropped from `cursor-review.yml` in #31 (see [the regression note](#the-blocking-gate-is-currently-not-available-regressed)), but [`build-ledger.py`](build-ledger.py) imports the module for `CONSOLIDATED_MARKER`, the paging `reviewThreads` GraphQL query and the `iter_threads` / `is_cursor_thread` helpers. |
+| [`gate-unresolved.py`](gate-unresolved.py) | The opt-in blocking gate (`blocking: true` → the **Blocking gate** job): queries the PR's review threads and exits non-zero while any cursor-review finding thread is unresolved and non-outdated. Dropped from `cursor-review.yml` by accident in #31 and restored by BE-4691 — see [the blocking section](#optional-make-the-review-blocking). Double-billed: [`build-ledger.py`](build-ledger.py) also imports it for `CONSOLIDATED_MARKER`, the paging `reviewThreads` GraphQL query and the `iter_threads` / `is_cursor_thread` helpers, so the gate and the ledger can never disagree about which threads are ours. |
 | [`slack-notify.sh`](slack-notify.sh) | Sends the start/complete Slack DMs to the triggerer (no-ops without a token). |
 | [`install-cursor-cli.sh`](install-cursor-cli.sh) | Installs the Cursor agent CLI from the versioned, sha256-pinned release artifact — not `curl cursor.com/install \| bash`. Used by all three CLI-using jobs; the pin (`CURSOR_CLI_VERSION` / `CURSOR_CLI_SHA256`) lives in `cursor-review.yml`'s top-level `env:`. |
 | [`build-ledger.py`](build-ledger.py) | Builds the **prior-review ledger** — what earlier rounds raised on this PR and how the author answered — and splices it into the panel/judge prompts. Also the prompt splicer, so the no-ledger path is byte-identical to the pre-ledger prompt. |
@@ -190,33 +193,41 @@ an app token is required). The opt-in roster lives in the caller's
 `vars.CURSOR_REVIEW_OPTED_IN_LOGINS`. See that workflow's header for the full
 example and the `vars.APP_ID` / `CLOUD_CODE_BOT_PRIVATE_KEY` requirements.
 
-### The blocking gate is currently NOT available (regressed)
+### Optional: make the review blocking
 
-> **Do not pass `blocking: true`.** `cursor-review.yml` declares no such input
-> today, and GitHub rejects an undeclared input at startup — a caller that passes
-> it gets a zero-job `startup_failure` with no logs to explain it.
+By default the review is **advisory**: it posts findings as PR review threads,
+and an unresolved (red) review never blocks merge. Passing `blocking: true` adds
+a fail-closed **Blocking gate** job that fails while the PR has unresolved,
+non-outdated cursor-review finding threads — resolve every thread, or push a fix
+that outdates them, and it passes. (Shipped in
+[#16](https://github.com/Comfy-Org/github-workflows/pull/16) (BE-1891), dropped
+by accident in [#31](https://github.com/Comfy-Org/github-workflows/pull/31),
+restored by BE-4691.)
 
-The review is **advisory**: it posts findings as PR review threads, and an
-unresolved (red) review never blocks merge.
+The input alone only turns the check red — a workflow cannot set branch
+protection. To block the merge, ALSO mark `<caller job id> / Blocking gate` as a
+required status check in the caller repo's branch-protection / ruleset settings,
+and widen the caller's triggers first so pushes and thread resolutions re-report
+the check — the trigger shape, and the rest of the semantics (what waives the
+gate, what doesn't, who can resolve), live in
+[the setup guide's blocking-gate gotchas](../../docs/callers/cursor-review.md#blocking-gate-gotchas).
 
-An opt-in gate did exist. A `blocking:` input and a fail-closed **Blocking gate**
-job — which queried the PR's review threads and failed while any cursor-review
-finding thread was unresolved — shipped in
-[#16](https://github.com/Comfy-Org/github-workflows/pull/16) (BE-1891). Both were
-removed from `cursor-review.yml` in
-[#31](https://github.com/Comfy-Org/github-workflows/pull/31), a change whose
-stated purpose was fixing judge-findings extraction; the deletion looks
-unintentional. The gate's implementation
-([`gate-unresolved.py`](gate-unresolved.py)) is still here: its CLI/`main` is
-unwired, but the module itself is live — [`build-ledger.py`](build-ledger.py)
-imports it for `CONSOLIDATED_MARKER`, the paging `reviewThreads` query and the
-`iter_threads` / `is_cursor_thread` helpers, so the file must not be deleted.
+Marking `… / Consolidate panel` required is **not** a substitute: GitHub counts
+a skipped required check as passing, and that job skips whenever no review runs
+(no trigger label, dedupe hit, diff over `diff_size_cap`, fork PR), so the check
+would go green in precisely the cases a gate is meant to catch. The Blocking
+gate closes that hole by running on every delivered event when `blocking` is on
+— its verdict is a live thread-state query, never a skip.
 
-Restoring it is tracked separately. Note that marking `… / Consolidate panel`
-required is **not** a substitute: GitHub counts a skipped required check as
-passing, and that job skips whenever no review runs (no trigger label, dedupe hit,
-diff over `diff_size_cap`, fork PR), so the check would go green in precisely the
-cases a gate is meant to catch.
+An empty thread query is not by itself a pass, either. The gate's fail-closed
+guards hold the check red when the trigger job failed, when the pipeline broke,
+when post-review exited zero without actually delivering a review to the PR (a
+read-only token, an error review, an all-cells-failed round), when every finding
+landed in the review body with no thread, when the diff was over
+`diff_size_cap`, and when the run was cancelled — because each of those leaves
+zero threads for reasons that have nothing to do with the PR being clean. The
+full list, and the two things the gate still cannot promise, are in
+[the setup guide](../../docs/callers/cursor-review.md#blocking-gate-gotchas).
 
 ## Configuration knobs
 
@@ -239,9 +250,7 @@ All optional except `workflows_ref` (required, no default) — pass them under
 | `bot_app_id` | `''` | Optional GitHub App ID; when set (with `BOT_APP_PRIVATE_KEY`), the review posts under that App's identity instead of `github-actions[bot]`. |
 | `ledger_prior_review` | `true` | Give each round the prior rounds' findings + author replies, so a refuted or deferred finding is not re-litigated. |
 | `run_without_label` | `false` | Run on plain PR events instead of requiring the trigger label. Also requires widening the caller's `types:` — see [the setup guide](../../docs/callers/cursor-review.md). |
-
-There is **no `blocking` input** — see [the regression note
-above](#the-blocking-gate-is-currently-not-available-regressed).
+| `blocking` | `false` | Adds the fail-closed **Blocking gate** check: red while any cursor-review finding thread is unresolved and non-outdated, and red when the round that should have produced those threads did not land (including an over-cap skip). Blocking the merge additionally requires marking that check required in the caller's ruleset — see [the blocking section above](#optional-make-the-review-blocking). |
 
 ### Over the diff-size cap
 

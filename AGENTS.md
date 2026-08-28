@@ -133,7 +133,7 @@ a second catalog drifts, and this one already had. Three facts it cannot tell yo
   so a phantom input in the docs is a broken caller for whoever copies it. Check
   `on.workflow_call.inputs` first. **Deleting an input is a docs change too** —
   grep the repo for its name in the same commit. (`cursor-review`'s `blocking:` is
-  the worked example: deleted in #31, its docs outlived it in three places.)
+  the worked example: deleted in #31, docs outlived it in three places; restored by BE-4691.)
 - **Versioning:** semver-style major tags (`v1`, `v2`). Breaking changes bump the
   major; compatible changes move the tag in place — `git tag -f v1 <sha> && git
   push -f origin v1`. Without the push the public tag never moves. That force-move

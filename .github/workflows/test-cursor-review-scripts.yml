@@ -12,6 +12,15 @@ name: Test cursor-review scripts
 # test_workflow_job_isolation.py pins the credential split (no job both checks
 # out PR code and holds the bot key / pull-requests: write). Both assertions are
 # only worth anything if they run when the file they parse changes.
+#
+# docs/callers/cursor-review.md is here for the same reason and, specifically,
+# for the drift direction test_workflow_inputs_docs.py was written to catch:
+# that suite pins set-equality between the workflow's declared inputs and the
+# tables in BOTH .github/cursor-review/README.md (already covered by the
+# .github/cursor-review/** entry) and the setup guide. Without this line a
+# docs-only PR that deletes the `blocking` row — the #31 scenario exactly —
+# matches no filter and runs no job, so the alarm cannot fire on the very edit
+# it exists for.
 
 on:
   pull_request:
@@ -20,6 +29,7 @@ on:
       - '.github/workflows/cursor-review.yml'
       - '.github/workflows/cursor-review-catalog-drift.yml'
       - '.github/workflows/test-cursor-review-scripts.yml'
+      - 'docs/callers/cursor-review.md'
   push:
     branches: [main]
     paths:
@@ -27,6 +37,7 @@ on:
       - '.github/workflows/cursor-review.yml'
       - '.github/workflows/cursor-review-catalog-drift.yml'
       - '.github/workflows/test-cursor-review-scripts.yml'
+      - 'docs/callers/cursor-review.md'
 
 permissions:
   contents: read
