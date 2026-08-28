@@ -293,7 +293,7 @@ jobs:
     # roster in the PAST tense — a cautionary tale, not current state. Verify
     # against the variable, not the prose, before "fixing" it.) Never hand-bump
     # one of the pair alone.
-    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@eaee6df998c39943bc6133ea6fa7cee8d504c41f # main @ eaee6df
+    uses: Comfy-Org/github-workflows/.github/workflows/groom.yml@c2315350ee0d60d0c5f16c1bdb0da7ecffc6d465 # main @ c231535
     with:
       # File groom's issues AND open its builder PRs as cloud-code-bot (App
       # token), not github-actions[bot]. With `builder: true` this is no longer
@@ -332,7 +332,7 @@ jobs:
       # Keep the assets ref (finder/verifier briefs + interval gate + dedup
       # ledger) in lock-step with the `uses:` ref above, so a run always loads the
       # scripts that match the workflow filing them. Bump the two together.
-      workflows_ref: eaee6df998c39943bc6133ea6fa7cee8d504c41f  # main @ eaee6df
+      workflows_ref: c2315350ee0d60d0c5f16c1bdb0da7ecffc6d465  # main @ c231535
       # Manual dispatch can dry-run; the daily schedule always runs live — for
       # PRs as well as issues, now that the builder is on (github.event.inputs is
       # null on a schedule event -> '' != 'true' -> false).
