@@ -5,10 +5,10 @@ event is graded into a tier and gets ONE label:
 
 | tier | label (default) | meaning | eventual routing (later phases — nothing routes today) |
 |---|---|---|---|
-| R0 | `risk:R0` | inert — docs, tests, provably-shaped runbook output | auto-merge candidate |
-| R1 | `risk:R1` | contained — bounded, covered, revertable in one click | rubber-stamp |
-| R2 | `risk:R2` | standard — ordinary product code | normal review |
-| R3 | `risk:R3` | elevated — auth, billing, migrations, IaC, CI, deps, secrets | owner + e2e |
+| low | `risk:low` | inert — docs, tests, provably-shaped runbook output | auto-merge candidate |
+| medium | `risk:medium` | contained — bounded, covered, revertable in one click | rubber-stamp |
+| high | `risk:high` | standard — ordinary product code | normal review |
+| xhigh | `risk:xhigh` | elevated — auth, billing, migrations, IaC, CI, deps, secrets | owner + e2e |
 | — | `risk:ungraded` | an input could not be read; deliberately NOT a tier | human review |
 
 **The label is the entire product.** Nothing is gated, blocked, routed, commented
@@ -34,7 +34,7 @@ record.
 2. **Provenance** — what PROCESS produced the diff: `runbook` (a registered
    producer in [`runbook-registry.v0.json`](runbook-registry.v0.json) whose
    identity AND diff shape both assert), `agent-supervised`, `human`, or
-   `external` (any fork, or a first-time **human** contributor — R3, no
+   `external` (any fork, or a first-time **human** contributor — xhigh, no
    exceptions, even when a runbook shape matches). Identity is the
    server-attributed author login, never the forgeable commit author string.
    A **non-fork bot is never `external`**, even though every GitHub App authors
@@ -43,13 +43,13 @@ record.
    "Is this a bot?" is answered from GitHub's own actor type (`Bot`) plus the
    `bot_logins` list, so an App needs no list entry and a machine *user* account
    does. The fork half is unconditional, so a bot opening a PR *from a fork* is
-   still `external` R3.
-3. **Reversibility** — mutates persistent state or deletes data → R3; **removes**
-   a file under a sensitive class → R3 (a delete, or a rename out of that class);
-   no green check rollup → R2; green but no test file touched → R1; green with
-   tests touched → R0. "Green" means at least one check actually CONCLUDED
+   still `external` xhigh.
+3. **Reversibility** — mutates persistent state or deletes data → xhigh; **removes**
+   a file under a sensitive class → xhigh (a delete, or a rename out of that class);
+   no green check rollup → high; green but no test file touched → medium; green with
+   tests touched → low. "Green" means at least one check actually CONCLUDED
    success: a rollup of nothing but skipped/neutral answers "did tests covering
-   these lines run?" with nothing, so it cannot drop the axis below R2. What
+   these lines run?" with nothing, so it cannot drop the axis below high. What
    counts as a test file is `reversibility.test_path_patterns` in the map (omit
    the key and the grader falls back to a built-in regex that only knows the
    Go/TS shapes). The axis also records `files` — which changed paths actually
@@ -65,8 +65,8 @@ record.
    `path_floor.files[].path`. Beside it, `residual_tier` says **where the axis
    lands once those paths are peeled** — the half `files` cannot answer on its
    own, because the three rungs the remainder falls back to are map-configurable
-   and a consumer that sets `no_green_checks_tier: "R3"` puts the remainder
-   straight back on R3. It is peel-set-independent: the "no green rollup" rung
+   and a consumer that sets `no_green_checks_tier: "xhigh"` puts the remainder
+   straight back on xhigh. It is peel-set-independent: the "no green rollup" rung
    tests the head commit, which no peel can change, so a non-green rollup pins
    the residual at `no_green_checks_tier` exactly, and a green one bounds it by
    the worse of the two rungs below. It is `null` exactly when `files` is.
@@ -82,12 +82,12 @@ Two CI-specific mechanics worth knowing:
 - **The grading run excludes itself from the check rollup it reads** (its own
   check is always in-flight at grade time), and the job re-polls until the rest
   of the rollup settles or `wait_for_checks_minutes` runs out — otherwise every
-  live grade would floor at R2 as an artifact of the measurement. Exclusion is
+  live grade would floor at high as an artifact of the measurement. Exclusion is
   keyed on `github.run_id` (`--self-run-id`), and a **FAILING check is never
   excluded**: self-exclusion may only ever hide our own pending run, never a red
   one. Enroll pr-risk as its **own workflow** rather than a job inside an
   existing CI workflow — a job sharing a run with the rest of CI excludes its
-  siblings too, and lands on the honest R2 floor instead of a full rollup.
+  siblings too, and lands on the honest high floor instead of a full rollup.
 - **A caller grants the UNION of every job's `permissions:`, including jobs it
   will never run.** GitHub validates each nested job's *declaration* against the
   caller's block at startup, before any job `if:` is evaluated, so `checks:
@@ -129,7 +129,7 @@ which PR is read, plus three consequences worth knowing:
   elevate, so the label write would 403 and the check would go red. On a dispatch
   the token is writable, so it does not apply. Fork **risk** is untouched:
   `external` comes from the API's own fork flag, never from the actor, and still
-  grades R3. **Dependabot-triggered runs need no such
+  grades xhigh. **Dependabot-triggered runs need no such
   hatch — they are graded on the event path too**, so the caller pattern carries
   no `github.actor != 'dependabot[bot]'` clause and one must not be added back:
   Dependabot's `pull_request` runs start read-only, but the caller's
@@ -158,7 +158,7 @@ which PR is read, plus three consequences worth knowing:
   to the PR's head commit, so it is not in that rollup at all and a settled PR
   reads its true state on the first poll. `0` still breaks out after a single
   read, ahead of the "require a settled reading to repeat" confirmation, so a
-  target someone pushed to minutes ago lands the honest R2 floor. `1` costs one
+  target someone pushed to minutes ago lands the honest high floor. `1` costs one
   15s backoff per PR and keeps the confirmation.
 
 A batch grades one target at a time and **one unreadable PR is reported without
@@ -198,11 +198,10 @@ Operational caveats for a backfill:
   invisible: GitHub records it on the PR timeline as an `unlabeled` event by the
   grader token. Dispatch when the queue is quiet, and use `pr_number` when you
   want the per-PR group to serialize a re-grade against event runs.
-- **Remapping `label_map` orphans the old names.** Ownership is defined by the
-  *current* map, so labels applied under a previous one are no longer owned:
-  they ride through every future PUT beside the new target and no re-grade will
-  clear them. Delete the retired label names repo-side once, as part of the
-  remap.
+- **Remapping `label_map` orphans custom old names.** The four former defaults
+  (`risk:R0`..`risk:R3`) are explicitly retired by the labeler, so the first
+  canonical re-grade removes them. Any custom value from an older map is
+  unknowable and still needs one-time repo-side cleanup.
 - **The pre-grader reads retry.** Rate limits are global, not per-PR, so the
   base-ref and override reads — the first hop for every target — retry a
   transient failure with backoff, as the grader already does. Without it one
@@ -227,7 +226,7 @@ them by committing:
   *human*, who would then inherit that runbook — so never name an App with one.
 
 Both are read from the PR's **base ref**, so a PR cannot edit the rules that
-judge it (editing them — or the grader — at all is R3 by the map's own first
+judge it (editing them — or the grader — at all is xhigh by the map's own first
 rule). A genuine 404 falls back to the shipped defaults; a present-but-invalid
 file fails the run loudly rather than silently grading generic, and so does any
 non-404 read failure (a 403 rate-limit or 5xx must not quietly demote the PR to
@@ -242,14 +241,30 @@ Every graded record carries `map_version` + `registry_version`, so grades made
 under different maps stay comparable and a map revision can be replayed against
 accumulated records.
 
-## Relabeling (R0–R3 vs R1–R4 and friends)
+## Tier vocabulary and deprecated aliases
 
-Tier SEMANTICS are fixed (R0 safest .. R3 riskiest, `unknown` separate)
+`low`, `medium`, `high`, and `xhigh` are canonical in maps, graded records,
+labels, comments, and Check Runs. The former names remain input-only aliases:
+
+| Deprecated alias | Canonical tier |
+|---|---|
+| `R0` | `low` |
+| `R1` | `medium` |
+| `R2` | `high` |
+| `R3` | `xhigh` |
+
+Existing consumer maps and `label_map` inputs using those aliases still work
+and emit a deprecation warning. They are normalized at load time, so newly
+graded records and newly rendered surfaces always use the canonical names.
+
+## Custom label text
+
+Tier SEMANTICS are fixed (low safest .. xhigh riskiest, `unknown` separate)
 everywhere records are stored. The label TEXT is the caller's, via `label_map`:
 
 ```yaml
 with:
-  label_map: "R0=risk:R1,R1=risk:R2,R2=risk:R3,R3=risk:R4,unknown=risk:ungraded"
+  label_map: "low=risk:1,medium=risk:2,high=risk:3,xhigh=risk:4,unknown=risk:ungraded"
 ```
 
 Labels are created on first use, color-coded green → red (gray for ungraded).
@@ -273,7 +288,7 @@ Labels are created on first use, color-coded green → red (gray for ungraded).
   the dispute checkbox below it. It is created once and updated in place. The full concentration
   sentence also carries a **reducibility readout**: when the path axis is what decided the tier and
   some of the diff sits below the floor, it names what the below-floor remainder would path-floor
-  at on its own — "…peeled into their own PR, the remaining 3 file(s) would path-floor at **R2**
+  at on its own — "…peeled into their own PR, the remaining 3 file(s) would path-floor at **high**
   (final grade still depends on the provenance and reversibility axes at PR time)". That complement
   floor is the worst per-file floor over exactly the files the share sentence already counts as
   below-floor, computed from the grader's own per-file floors rather than estimated, and it is what
@@ -296,13 +311,13 @@ Labels are created on first use, color-coded green → red (gray for ungraded).
   .residual_tier` (where the axis lands after that peel) must rank strictly below the headline.
   Only then does one split provably remove both reasons, and the clause speaks.
   Both halves are load-bearing rather than formalities, and a consumer map override defeats each
-  one separately. Against the subset test: remap `migrations` to R1 while leaving it in
+  one separately. Against the subset test: remap `migrations` to medium while leaving it in
   `irreversible_classes` and the irreversible-class file sits *below* the path floor, so peeling
   the top files leaves the reversibility reason exactly where it was. Against the residual test:
-  set `no_green_checks_tier: "R3"` and peeling every attributed path drops the remainder onto a
-  rung that is R3 all over again — the attributed reason went with the peel, but the tier did not
+  set `no_green_checks_tier: "xhigh"` and peeling every attributed path drops the remainder onto a
+  rung that is xhigh all over again — the attributed reason went with the peel, but the tier did not
   move, so the reduction the clause would promise cannot happen.
-  Either field absent or `null` — the R2/R1 rungs, where the reason is a property of the
+  Either field absent or `null` — the high/medium rungs, where the reason is a property of the
   head commit or of the whole change set, and every record graded before those fields existed —
   reads as *not* removable, failing safe back to suppression. When a removable reversibility tie
   does let the clause speak, the above-the-fold headline names the driver **`path and
@@ -332,9 +347,10 @@ Labels are created on first use, color-coded green → red (gray for ungraded).
 - `apply-risk-label.sh` — the one write, and it is literally one request: a
   single atomic `PUT` of the PR's full label set — every label the script does
   not own, carried through verbatim from the snapshot read, plus the computed
-  one. Owns exactly the five mapped labels (matched case-insensitively, as GitHub
-  label identity is), so a PR it has written to carries exactly one of them even
-  when two grading runs race. An already-in-sync PR writes nothing at all.
+  one. Owns the five mapped labels plus the four deprecated default labels
+  (`risk:R0`..`risk:R3`), matched case-insensitively, so a re-grade removes the
+  old default automatically and concurrent grading runs still leave one current
+  grade. Custom retired label-map values still need one-time cleanup.
 - `risk-map.v0.json` / `runbook-registry.v0.json` — the generic defaults.
 - `tests/` — hermetic suites (synthetic records + a stubbed `gh`); run via
   [`test-pr-risk.yml`](../../.github/workflows/test-pr-risk.yml).

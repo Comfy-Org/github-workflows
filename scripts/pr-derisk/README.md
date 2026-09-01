@@ -25,7 +25,7 @@ The model proposes a **partition**: which files go in which step, in what order,
 step is inert. **It never states a tier.** Every floor rendered in the comment is computed by
 `grade-pr-risk.sh --stdin` over a synthetic scorecard record built from that step's files — the
 same deterministic judge, the same map, the same rules that graded the PR. A model that
-hallucinates "this split lands R0" cannot put that number in front of a reviewer: the plan object
+hallucinates "this split lands low" cannot put that number in front of a reviewer: the plan object
 is rebuilt field by field from a fixed list, so a model-claimed `tier` key does not survive.
 
 That is also why this lives *outside* the grader rather than inside it. pr-risk's grading path
@@ -47,14 +47,14 @@ either way. A split can land *worse* than its floor; it can never land better.
 
 A single-class monolith — every file already at the PR's **path floor** — has no lane win
 available. The verdict line above the fold is computed from the **floors**, not from the model's
-prose, so in that case it reads "N smaller single-concern R3s, same lane" and there is no wording
+prose, so in that case it reads "N smaller single-concern xhigh tiers, same lane" and there is no wording
 available to it that claims a reduction. A prompt can *ask* for that; only the renderer can
 guarantee it.
 
 **The comparison axis is the PATH FLOOR, not the headline tier**, and that distinction is the rule
 rather than a detail of it. `grade = worst(path_floor, provenance, reversibility)` but a split only
-ever moves the path axis, so on a fork PR (provenance R3, path floor R0) or a `/derisk` typed while
-checks are still pending (reversibility R2) *every* step sits below the headline while the axis
+ever moves the path axis, so on a fork PR (provenance xhigh, path floor low) or a `/derisk` typed while
+checks are still pending (reversibility high) *every* step sits below the headline while the axis
 that actually set the grade is untouched. Comparing against the headline there would print a
 reduction no partition can deliver, on exactly the pull requests this rule exists for. When a
 non-path axis holds the grade up the verdict says so in the same breath as the split.
@@ -112,6 +112,6 @@ which is then rejected unless it covers the changed-file set exactly.
 
 ## What is deliberately NOT here
 
-No auto-running on every R3 (on-demand only in beta), no ticket filing from a plan (its own rung,
+No auto-running on every xhigh (on-demand only in beta), no ticket filing from a plan (its own rung,
 behind its own command), no routing, no check, no label, no auto-merge. The offer threshold and
 which repos see it at all are post-merge flips of a repo variable, not code.

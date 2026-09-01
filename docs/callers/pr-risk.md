@@ -4,15 +4,20 @@ Read [the shared caller contract](README.md) first.
 
 ## What it does
 
-Grades every PR into a tier `R0` (safest) .. `R3` (riskiest) and syncs **one**
-label (`risk:R0`..`risk:R3`, or `risk:ungraded` when an input was unreadable).
+Grades every PR into a tier `low` (safest) .. `xhigh` (riskiest) and syncs **one**
+label (`risk:low`..`risk:xhigh`, or `risk:ungraded` when an input was unreadable).
 The label is the entire product: nothing is gated, routed, commented, or
 merged — a human looks at the label and agrees or disagrees (recorded with a
 `risk-dispute` label this workflow never touches).
 
+`R0`, `R1`, `R2`, and `R3` remain accepted in existing risk maps and
+`label_map` keys as deprecated aliases for `low`, `medium`, `high`, and
+`xhigh`. New maps and integrations should use only the canonical names; output
+records and publish surfaces always do.
+
 Deterministic, no LLM: `grade = worst(path_floor, provenance, reversibility)` —
 a path-glob map, what process produced the diff (registered runbooks, forks
-always `R3`), and revertability (persistent-state mutation, sensitive
+always `xhigh`), and revertability (persistent-state mutation, sensitive
 deletions, whether green checks actually covered the changed lines). The
 grader and its generic defaults live in
 [`scripts/pr-risk/`](../../scripts/pr-risk) and load from **this repo** at the
@@ -116,9 +121,9 @@ fail the caller's next run at startup.
 |---|---|---|
 | `workflows_ref` | — (**required**) | Pin to the SAME full commit SHA as `uses:`. No default on purpose: a floating default let a caller SHA-pin `uses:` and still load the grader from HEAD of main. Checked before the tool checkout on two axes: it must be a full 40-hex lowercase SHA, **and** that commit must be an ancestor of `main` of this repo. So a branch, a tag, a `refs/pull/N/head` and any **not-yet-merged** SHA all fail the run — **merge the change here first, then bump the pin.** There is no opt-out. |
 | `fleet_logins` | `mattmillerai` | Logins whose PRs grade provenance `agent-supervised` alongside `agent-coded`. Both are read for **human** authors only: an author GitHub types as a `Bot` is a runbook candidate regardless, so listing a bot here (or labelling its PR) buys it nothing — only a registry entry that asserts can promote it. |
-| `bot_logins` | `github-actions,dependabot,renovate,coderabbitai,cursor,comfy-pr-bot,web-flow` | Extra logins treated as bots. Needed only for **machine USER accounts** — a real GitHub App is recognized from GitHub's own actor type, no list entry required. A bot with no runbook entry still grades as human — identity alone buys no trust. **This list is load-bearing, not a hint:** a listed login skips the first-time-contributor test, so it moves a non-fork `NONE`/`FIRST_TIME_CONTRIBUTOR` PR from `external` (R3) to `human` (R1). Nothing validates that a listed login is really a machine account, so add one only for an account you control, and remove it when it is retired. |
-| `label_map` | `''` | Rename the five grader-owned labels as `tier=label` pairs. Tier keys are fixed; only the label text is yours. |
-| `wait_for_checks_minutes` | `10` | How long to wait for the rest of the check rollup to settle before labeling (clamped to 25 — what a 30-minute job can spend waiting). `0` labels immediately, expect R2 floors from still-pending checks. |
+| `bot_logins` | `github-actions,dependabot,renovate,coderabbitai,cursor,comfy-pr-bot,web-flow` | Extra logins treated as bots. Needed only for **machine USER accounts** — a real GitHub App is recognized from GitHub's own actor type, no list entry required. A bot with no runbook entry still grades as human — identity alone buys no trust. **This list is load-bearing, not a hint:** a listed login skips the first-time-contributor test, so it moves a non-fork `NONE`/`FIRST_TIME_CONTRIBUTOR` PR from `external` (xhigh) to `human` (medium). Nothing validates that a listed login is really a machine account, so add one only for an account you control, and remove it when it is retired. |
+| `label_map` | `''` | Rename the five grader-owned labels as `tier=label` pairs. Canonical keys are `low`, `medium`, `high`, `xhigh`, and `unknown`; deprecated `R0`–`R3` keys remain accepted. |
+| `wait_for_checks_minutes` | `10` | How long to wait for the rest of the check rollup to settle before labeling (clamped to 25 — what a 30-minute job can spend waiting). `0` labels immediately, expect high floors from still-pending checks. |
 | `repo_map_path` | `.github/risk.json` | Consumer risk-map override, read from the PR **base ref**. |
 | `repo_runbooks_path` | `.github/risk-runbooks.json` | Consumer runbook-registry override, read from the PR **base ref**. |
 
@@ -179,7 +184,7 @@ usual one).
 **Enroll it as its own workflow, not a job inside an existing CI workflow.**
 The grading job excludes its own *run* from the check rollup it reads; a job
 sharing a run with the rest of CI excludes its siblings too and lands on the
-honest R2 floor instead of grading off the full rollup.
+honest high floor instead of grading off the full rollup.
 
 **Pair the caller with a per-PR `cancel-in-progress` concurrency group** (shown
 above). The reversibility axis waits for other checks to settle, so a stale run
