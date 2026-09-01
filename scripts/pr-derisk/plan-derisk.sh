@@ -13,7 +13,7 @@
 # is inert. It NEVER states a tier. Every floor rendered in the comment is computed by
 # grade-pr-risk.sh --stdin over a synthetic scorecard record built from that step's files — the
 # same deterministic judge, the same map, the same rules that graded the PR. So a model that
-# hallucinates "this split lands R0" cannot put that number in front of a reviewer: the number
+# hallucinates "this split lands low" cannot put that number in front of a reviewer: the number
 # comes from the grader or it does not appear.
 #
 # That is also why this lives OUTSIDE the grader rather than inside it. pr-risk's grading path
@@ -124,9 +124,9 @@ trap 'rm -rf "$SCRATCH"' EXIT
 TIER="$(jq -r '.risk.tier // "unknown"' "$RECORD" 2>/dev/null)"
 # THE PATH-AXIS FLOOR, CARRIED SEPARATELY FROM THE HEADLINE, and the distinction is load-bearing.
 # `grade = worst(path_floor, provenance, reversibility)`, but a split only ever moves the PATH axis.
-# Comparing a step's computed path floor against the HEADLINE would read "below R3" for every step
-# of a fork PR (provenance R3, path floor R0) or of a `/derisk` typed while checks are pending
-# (reversibility R2) — a lane win the split cannot deliver, claimed on exactly the pull requests
+# Comparing a step's computed path floor against the HEADLINE would read "below xhigh" for every step
+# of a fork PR (provenance xhigh, path floor low) or of a `/derisk` typed while checks are pending
+# (reversibility high) — a lane win the split cannot deliver, claimed on exactly the pull requests
 # the no-fake-lane-win rule exists for. The renderer compares against this instead.
 PATH_TIER="$(jq -r '.risk.axes.path_floor.tier // ""' "$RECORD" 2>/dev/null)"
 STATUS="$(jq -r '.risk.status // "unknown"' "$RECORD" 2>/dev/null)"

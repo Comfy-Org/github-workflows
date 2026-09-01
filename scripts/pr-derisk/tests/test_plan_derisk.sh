@@ -80,7 +80,7 @@ graded() {
 MIXED='[{"path":"db/migrations/0001_x.sql","change_type":"ADDED","additions":20,"deletions":0},
         {"path":"docs/a.md","change_type":"MODIFIED","additions":5,"deletions":3},
         {"path":"src/a.go","change_type":"MODIFIED","additions":10,"deletions":5}]'
-# Every file under one R3 rule: the single-class monolith, where no split can buy a cheaper lane.
+# Every file under one xhigh rule: the single-class monolith, where no split can buy a cheaper lane.
 MONO='[{"path":"db/migrations/0001_x.sql","change_type":"ADDED","additions":20,"deletions":0},
        {"path":"db/migrations/0002_y.sql","change_type":"ADDED","additions":10,"deletions":0}]'
 
@@ -96,16 +96,26 @@ plan() { # <record> <stub-file> [extra env assignments...]
 render() { PLAN="$1" DRY_RUN=1 bash "$PUBLISHER" 2>/dev/null; }
 
 echo "— phase 1: every floor is the GRADER's, never the model's —"
-# The stub states a tier on every step and calls the migration step R0. If any of that reaches the
+# The stub states a tier on every step and calls the migration step low. If any of that reaches the
 # reader, the whole design is decoration.
-GOOD='{"steps":[{"name":"Migration","description":"d","files":["db/migrations/0001_x.sql"],"depends_on":[],"inertness":"i","review_ask":"the chain","tier":"R0","floor":"R0"},{"name":"Rest","description":"d","files":["docs/a.md","src/a.go"],"depends_on":[0],"inertness":"i","review_ask":"","tier":"R3"}],"summary":"step 1 carries it"}'
+GOOD='{"steps":[{"name":"Migration","description":"d","files":["db/migrations/0001_x.sql"],"depends_on":[],"inertness":"i","review_ask":"the chain","tier":"low","floor":"low"},{"name":"Rest","description":"d","files":["docs/a.md","src/a.go"],"depends_on":[0],"inertness":"i","review_ask":"","tier":"xhigh"}],"summary":"step 1 carries it"}'
 out="$(plan "$REC_MIXED" "$(stub "$GOOD")")"; printf '%s' "$out" > "$SANDBOX/p1-plan.json"
 eq "a valid partition plans" planned "$(jq -r .status <<<"$out")"
-eq "the migration step floors R3 (the grader), not R0 (the model)" R3 "$(jq -r '.steps[0].floor' <<<"$out")"
-eq "the docs+src step floors R0 (the grader), not R3 (the model)" R0 "$(jq -r '.steps[1].floor' <<<"$out")"
+eq "the migration step floors xhigh (the grader), not low (the model)" xhigh "$(jq -r '.steps[0].floor' <<<"$out")"
+eq "the docs+src step floors low (the grader), not xhigh (the model)" low "$(jq -r '.steps[1].floor' <<<"$out")"
 eq "the model's own tier key is dropped from the step" null "$(jq -r '.steps[0].tier // "null"' <<<"$out")"
 eq "line counts come from the graded record" 20 "$(jq -r '.steps[0].lines' <<<"$out")"
 eq "depends_on survives" 0 "$(jq -r '.steps[1].depends_on[0]' <<<"$out")"
+
+echo "— phase 1b: historical R0..R3 plans render with canonical names —"
+jq '
+  def legacy:
+    if . == "low" then "R0" elif . == "medium" then "R1"
+    elif . == "high" then "R2" elif . == "xhigh" then "R3" else . end;
+  walk(if type == "string" then legacy else . end)' "$SANDBOX/p1-plan.json" > "$SANDBOX/legacy-plan.json"
+legacy_body="$(render "$SANDBOX/legacy-plan.json")"
+has "legacy plan tiers render canonically" "$legacy_body" "path-floor below xhigh"
+no "legacy tier names are not re-published" "$legacy_body" "**R3**"
 
 echo "— phase 2: the partition must cover the changed set EXACTLY —"
 DROPS='{"steps":[{"name":"A","description":"d","files":["db/migrations/0001_x.sql"],"depends_on":[],"inertness":"i","review_ask":""},{"name":"B","description":"d","files":["docs/a.md"],"depends_on":[],"inertness":"i","review_ask":""}],"summary":"s"}'
@@ -140,35 +150,35 @@ out="$(plan "$SANDBOX/ungraded.json" "$(stub "$GOOD")")"
 eq "an ungraded PR is not planned against" fallback "$(jq -r .status <<<"$out")"
 
 echo "— phase 4: the single-class monolith gets no fake lane win —"
-MONOPLAN='{"steps":[{"name":"First migration","description":"d","files":["db/migrations/0001_x.sql"],"depends_on":[],"inertness":"i","review_ask":"the chain"},{"name":"Second migration","description":"d","files":["db/migrations/0002_y.sql"],"depends_on":[0],"inertness":"i","review_ask":""}],"summary":"both are R3"}'
+MONOPLAN='{"steps":[{"name":"First migration","description":"d","files":["db/migrations/0001_x.sql"],"depends_on":[],"inertness":"i","review_ask":"the chain"},{"name":"Second migration","description":"d","files":["db/migrations/0002_y.sql"],"depends_on":[0],"inertness":"i","review_ask":""}],"summary":"both are xhigh"}'
 out="$(plan "$REC_MONO" "$(stub "$MONOPLAN")")"; printf '%s' "$out" > "$SANDBOX/mono-plan.json"
-eq "both steps still floor R3" "R3 R3" "$(jq -r '[.steps[].floor] | join(" ")' <<<"$out")"
+eq "both steps still floor xhigh" "xhigh xhigh" "$(jq -r '[.steps[].floor] | join(" ")' <<<"$out")"
 body="$(render "$SANDBOX/mono-plan.json")"
 has "the verdict says same lane" "$body" "same lane"
 no  "and claims no reduction" "$body" "path-floor below"
 
 echo "— phase 4b: a headline set by a NON-PATH axis is never claimed as a lane win —"
 # `grade = worst(path_floor, provenance, reversibility)` and a split only moves the PATH axis. This
-# fork PR grades R3 on PROVENANCE with a path floor of R0, so every step trivially sits below the
+# fork PR grades xhigh on PROVENANCE with a path floor of low, so every step trivially sits below the
 # HEADLINE while the axis that actually set the grade is untouched. Comparing against the headline
-# printed "2 step(s) path-floor below R3 (100% of the changed lines)" — a reduction no partition
+# printed "2 step(s) path-floor below xhigh (100% of the changed lines)" — a reduction no partition
 # here can deliver, on exactly the pull requests the no-fake-lane-win rule exists for.
 SOFT='[{"path":"docs/a.md","change_type":"MODIFIED","additions":5,"deletions":3},
        {"path":"src/a.go","change_type":"MODIFIED","additions":10,"deletions":5}]'
 REC_FORK="$(graded fork "$SOFT" '{"is_fork":true,"author_association":"NONE"}')"
-eq "the fixture grades R3 overall" R3 "$(jq -r '.risk.tier' "$REC_FORK")"
-eq "but its PATH floor is R0" R0 "$(jq -r '.risk.axes.path_floor.tier' "$REC_FORK")"
+eq "the fixture grades xhigh overall" xhigh "$(jq -r '.risk.tier' "$REC_FORK")"
+eq "but its PATH floor is low" low "$(jq -r '.risk.axes.path_floor.tier' "$REC_FORK")"
 FORKPLAN='{"steps":[{"name":"Docs","description":"d","files":["docs/a.md"],"depends_on":[],"inertness":"i","review_ask":""},{"name":"Code","description":"d","files":["src/a.go"],"depends_on":[0],"inertness":"i","review_ask":"the chain"}],"summary":"s"}'
 out="$(plan "$REC_FORK" "$(stub "$FORKPLAN")")"; printf '%s' "$out" > "$SANDBOX/fork-plan.json"
-eq "the plan carries the path floor separately from the headline" "R3 R0" \
+eq "the plan carries the path floor separately from the headline" "xhigh low" \
    "$(jq -r '[.headline_tier, .path_floor_tier] | join(" ")' <<<"$out")"
 body="$(render "$SANDBOX/fork-plan.json")"
-no  "no step is claimed to land below the non-path headline" "$body" "path-floor below R3"
-has "the verdict speaks in the PATH floor instead"            "$body" 'path-floors at **R0**'
+no  "no step is claimed to land below the non-path headline" "$body" "path-floor below xhigh"
+has "the verdict speaks in the PATH floor instead"            "$body" 'path-floors at **low**'
 has "and names the axis a split cannot move"                  "$body" "non-path axis"
 # The same comparison must still fire normally when the PATH axis IS the one holding the grade up.
 body="$(render "$SANDBOX/p1-plan.json")"
-has "a genuine path-axis reduction is still reported" "$body" "path-floor below R3"
+has "a genuine path-axis reduction is still reported" "$body" "path-floor below xhigh"
 no  "and carries no non-path caveat"                  "$body" "non-path axis"
 
 echo "— phase 4c: the ordering a plan exists to state cannot be impossible —"

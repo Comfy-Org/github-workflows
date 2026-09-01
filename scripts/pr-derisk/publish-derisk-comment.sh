@@ -79,14 +79,27 @@ cat <<'JQ'
     def md_path:
       (flat | if length > 160 then .[0:160] + "…" else . end)
       | if test("[`\\\\]") then md_escape else "`" + gsub("\\|"; "\\|") + "`" end;
-    def tier_rank: {"R0":0,"R1":1,"R2":2,"R3":3}[.] // 3;
+    def canonical_tier:
+      if type != "string" then .
+      else {"R0":"low","R1":"medium","R2":"high","R3":"xhigh"}[.] // . end;
+    def canonical_plan:
+      if type != "object" then .
+      else (if has("headline_tier") then .headline_tier |= canonical_tier else . end)
+        | (if has("path_floor_tier") then .path_floor_tier |= canonical_tier else . end)
+        | (if (.steps | type) == "array"
+           then .steps |= map(if type == "object" and has("floor") then .floor |= canonical_tier else . end)
+           else . end)
+      end;
+    def tier_rank:
+      canonical_tier | if type == "string" then {"low":0,"medium":1,"high":2,"xhigh":3}[.] // 3 else 3 end;
 
-    . as $p
+    # Historical plans remain renderable, but every surface uses canonical tier names.
+    (. | canonical_plan) as $p
     | ($p.headline_tier // null) as $tier
     # THE COMPARISON AXIS IS THE PATH FLOOR, NOT THE HEADLINE, and mixing them up is how this
     # comment claims a lane win it cannot deliver. `grade = worst(path_floor, provenance,
-    # reversibility)` but a split only moves the PATH axis: on a fork PR (provenance R3, path floor
-    # R0) or a `/derisk` typed while checks are still pending (reversibility R2), EVERY step reads
+    # reversibility)` but a split only moves the PATH axis: on a fork PR (provenance xhigh, path floor
+    # low) or a `/derisk` typed while checks are still pending (reversibility high), EVERY step reads
     # "below" the headline while the axis that actually set the grade is untouched. Older plans
     # carry no `path_floor_tier`, so the headline is the fallback there.
     | (($p.path_floor_tier // $p.headline_tier) // null) as $ptier
