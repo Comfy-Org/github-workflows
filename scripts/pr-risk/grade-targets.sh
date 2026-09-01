@@ -286,7 +286,7 @@ fetch_override() { # <path> <outfile> <base-ref> -> prints the outfile, or nothi
 # checks. On a workflow_dispatch the grading run's own check is attached to the dispatched ref,
 # not to the PR's head commit, so there is nothing of ours in that rollup to wait out and a
 # settled PR reads its true state on the first poll — which is what makes a LOW wait the right
-# setting for a backfill, and why a low wait there does not reproduce the R2 floors that
+# setting for a backfill, and why a low wait there does not reproduce the high floors that
 # `wait_for_checks_minutes: 0` produces on the event path.
 settle_grade() { # <num> <record-file> <map-override|""> <rb-override|""> <settle-deadline>
   local num="$1" record="$2" map_override="$3" rb_override="$4" deadline="$5"
@@ -344,7 +344,7 @@ settle_grade() { # <num> <record-file> <map-override|""> <rb-override|""> <settl
       # An EMPTY rollup is checks that have not registered yet, not CI that finished — exiting
       # the poll here would apply a label that a check appearing a second later never revises.
       # Bounded by a SHORT grace window rather than the whole budget, so a repo with genuinely no
-      # CI is not made to wait 25 minutes on every PR to arrive at the same honest R2.
+      # CI is not made to wait 25 minutes on every PR to arrive at the same honest high.
       settled_once=0
     elif [ "$settled_once" -eq 0 ]; then
       # First settled reading. Require it to REPEAT before labeling: one transiently-quiet poll
@@ -542,7 +542,7 @@ main() {
   #   JOB_DEADLINE is when a new target may no longer be STARTED, and it is the JOB's own timeout
   #   minus headroom for the in-flight label write and the summary step.
   # Gating the start on the WAIT budget conflated them: a spent wait budget only means no remaining
-  # target may sleep, and grading with zero wait is still a real grade (an honest R2 floor at
+  # target may sleep, and grading with zero wait is still a real grade (an honest high floor at
   # worst), so targets there was ample time to grade were reported un-attempted instead. At
   # JOB_TIMEOUT_MINUTES <= 5 the wait budget is 0 from the first instant, which made a batch record
   # every target `skipped` and grade NOTHING.

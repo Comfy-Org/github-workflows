@@ -15,11 +15,11 @@
 #     which is what an empty `?ref=` silently resolves to.
 #   * ONE BAD TARGET NEVER ABANDONS THE REST. A batch reports the bad one and grades the others.
 #   * `ungraded` IS NOT A FAILED RUN, on either path — an unreadable PR is a reported verdict.
-#   * FORKS AND BOTS. Forks still grade R3 from the API-derived fork flag; bot-authored PRs DO
+#   * FORKS AND BOTS. Forks still grade xhigh from the API-derived fork flag; bot-authored PRs DO
 #     grade on the by-number path (the actor guard that skips them is a token guard on the event
 #     path only).
 #   * SELF-EXCLUSION SURVIVES A DISPATCH: a run id that is not in the PR's rollup excludes
-#     nothing, and a settled rollup therefore reads its true SUCCESS instead of an R2 floor.
+#     nothing, and a settled rollup therefore reads its true SUCCESS instead of a high floor.
 #
 #   bash tests/test_grade_targets.sh        # exit 0 = all green
 #
@@ -173,9 +173,9 @@ run_targets PR_NUMBERS=42 BASE_REF=main
 eq "the run succeeds"                       0 "$RC"
 eq "one result recorded"                    1 "$(results | jq -s length)"
 eq "status is graded"                       graded "$(res '.status')"
-eq "the docs PR grades R1"                  R1 "$(res '.tier')"
+eq "the docs PR grades medium"                  medium "$(res '.tier')"
 eq "the event's base ref is the one used"   main "$(res '.base_ref')"
-eq "the label is the mapped R1 label"       risk:R1 "$(res '.label')"
+eq "the label is the mapped medium label"       risk:medium "$(res '.label')"
 # The BC proof: the event path spends no API call re-reading a base ref it was handed. `pulls/42`
 # appears only as the grader's own `pulls/42/files` read.
 no_text "no base-ref PR read is issued" "pulls/42 " "$(calls | grep -v files || true)"
@@ -193,7 +193,7 @@ has_text "the base ref is read once" "repos/test/repo/pulls/42 " "$(calls | grep
 has_text "the risk map is read from THAT ref" "contents/.github/risk.json?ref=release%2Fv2" "$(calls)"
 has_text "and so is the runbook registry" "contents/.github/risk-runbooks.json?ref=release%2Fv2" "$(calls)"
 no_text  "never from an empty ref" "?ref=" "$(calls | grep 'contents/' | grep -F '?ref=' | grep -v 'ref=release%2Fv2' || true)"
-eq "the tier is unchanged by the path taken" R1 "$(res '.tier')"
+eq "the tier is unchanged by the path taken" medium "$(res '.tier')"
 
 echo "— phase 3: a 404 override falls back to the shipped default and still grades —"
 eq "contents_mode is 404 for this phase" 404 "$(cat "$STUB_DIR/contents_mode")"
@@ -241,7 +241,7 @@ eq "all three targets are recorded" 3 "$(results | jq -s length)"
 eq "the first target graded"        graded   "$(res '.status' 0)"
 eq "the unreadable one failed"      failed   "$(res '.status' 1)"
 eq "the LAST target still graded"   graded   "$(res '.status' 2)"
-eq "and it carries a real tier"     R1       "$(res '.tier' 2)"
+eq "and it carries a real tier"     medium       "$(res '.tier' 2)"
 has_text "the batch summary counts both outcomes" "2 graded, 0 ungraded, 1 failed" "$OUT"
 rm -f "$STUB_DIR/fail_numbers"
 
@@ -263,14 +263,14 @@ touch "$STUB_DIR/label_fail"
 run_targets PR_NUMBERS=42 BASE_REF=main DRY_RUN=0
 eq "the run fails"                 1 "$RC"
 eq "the target is recorded failed" failed "$(res '.status')"
-eq "the tier it computed is kept"  R1 "$(res '.tier')"
+eq "the tier it computed is kept"  medium "$(res '.tier')"
 has_text "and the note says the label did not land" "label write FAILED" "$(results)"
 rm -f "$STUB_DIR/label_fail"
 
-echo "— phase 10: forks still grade R3 from the API-derived fork flag, on the by-number path —"
+echo "— phase 10: forks still grade xhigh from the API-derived fork flag, on the by-number path —"
 write_fixture dev NONE true
 run_targets PR_NUMBERS=42
-eq "a fork grades R3"          R3 "$(res '.tier')"
+eq "a fork grades xhigh"          xhigh "$(res '.tier')"
 eq "provenance is external"    external \
    "$(jq -r '.risk.axes.provenance.provenance' "$WORK/record-42.json" 2>/dev/null)"
 write_fixture
@@ -282,24 +282,24 @@ echo "— phase 11: a BOT-authored PR grades on the by-number path —"
 write_fixture 'dependabot[bot]' CONTRIBUTOR false
 run_targets PR_NUMBERS=42
 eq "the bot's PR is graded, not skipped" graded "$(res '.status')"
-eq "and it carries a real tier"          R1 "$(res '.tier')"
+eq "and it carries a real tier"          medium "$(res '.tier')"
 write_fixture
 
 echo "— phase 12: self-exclusion survives a dispatch — a foreign run id excludes nothing —"
 # A dispatched run's check is attached to the dispatched ref, not the PR's head, so it is absent
-# from the rollup entirely. The rollup must then read its true settled state rather than the R2
+# from the rollup entirely. The rollup must then read its true settled state rather than the high
 # floor a still-pending self check produces on the event path.
 run_targets PR_NUMBERS=42 SELF_RUN_ID=777777
 eq "the settled rollup reads SUCCESS" SUCCESS \
    "$(jq -r '.checks_state' "$WORK/record-42.json" 2>/dev/null)"
 eq "nothing reads as pending"         false \
    "$(jq -r '.checks_pending_excl_self' "$WORK/record-42.json" 2>/dev/null)"
-# R1 = "checks green but no test file touched" (the fixture's only file is a README), which is
-# the point: the axis ANSWERED the question. An R2 here would mean "no green rollup" — the floor
+# medium = "checks green but no test file touched" (the fixture's only file is a README), which is
+# the point: the axis ANSWERED the question. A high here would mean "no green rollup" — the floor
 # the event path pays when its own check is still in flight, and the one a dispatch must not pay.
-eq "so reversibility is not floored at R2" R1 \
+eq "so reversibility is not floored at high" medium \
    "$(jq -r '.risk.axes.reversibility.tier' "$WORK/record-42.json" 2>/dev/null)"
-eq "and the grade is a real tier"     R1 "$(res '.tier')"
+eq "and the grade is a real tier"     medium "$(res '.tier')"
 
 echo "— phase 13: the target list is validated, and a dispatch with no target FAILS LOUDLY —"
 run_targets PR_NUMBERS=""

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # grade-pr-risk.sh — deterministic PR risk grader for CI (the reusable pr-risk.yml workflow).
 #
-# Grades ONE pull request into a risk tier R0 (safest) .. R3 (riskiest), or refuses with
+# Grades ONE pull request into a risk tier low (safest) .. xhigh (riskiest), or refuses with
 # `unknown` when an input could not be read. The tier is advisory: this script only COMPUTES;
 # the workflow around it leaves the label. Nothing here gates, blocks, comments, or merges.
 #
@@ -30,7 +30,7 @@
 #     is the WORST tier over every rule any changed path matches.
 #   AXIS 2 — PROVENANCE. runbook / agent-supervised / human / external. A PR whose identity
 #     matches a runbook but whose DIFF SHAPE does not is not a runbook, and falls back to its
-#     underlying class. `external` (any fork, or a first-time HUMAN contributor) is R3 on
+#     underlying class. `external` (any fork, or a first-time HUMAN contributor) is xhigh on
 #     provenance alone; a non-fork bot is a runbook candidate, not an outsider, because every
 #     GitHub App authors with `author_association: NONE`.
 #   AXIS 3 — REVERSIBILITY. Single clean revert? Mutates persistent state or deletes data?
@@ -101,24 +101,48 @@ USAGE
 }
 
 # ---- the map ---------------------------------------------------------------------------------
-# An unreadable map is fatal — grading against one would grade every PR R0. VALID JSON IS NOT
+# An unreadable map is fatal — grading against one would grade every PR low. VALID JSON IS NOT
 # ENOUGH: `{}` parses, so a syntactically-valid but STRUCTURALLY EMPTY map used to sail through
-# upstream — `default_tier` fell back to R0, no path rule matched anything, and every PR graded
-# R0. So the shape is checked too, and every tier STRING in the file is checked against the tier
+# upstream — `default_tier` fell back to low, no path rule matched anything, and every PR graded
+# low. So the shape is checked too, and every tier STRING in the file is checked against the tier
 # enum here rather than being tolerated downstream: `tier_rank` cannot rank a tier it does not
 # know, and a fail-safe rank is a worse answer than a refusal at load time.
 read_map() { # <file> <kind: map|runbooks> -> JSON on stdout, rc 0; rc 1 + reason on stderr
-  local f="$1" kind="${2:-map}" raw shape
+  local f="$1" kind="${2:-map}" raw shape legacy normalize
   [ -f "$f" ] || { echo "$kind $f not found" >&2; return 1; }
   raw="$(cat "$f" 2>/dev/null)" || { echo "cannot read $f" >&2; return 1; }
   jq -e . >/dev/null 2>&1 <<<"$raw" || { echo "$kind is not valid JSON" >&2; return 1; }
   if [ "$kind" = map ]; then
+    legacy="$(jq -r '[.. | strings | select(IN("R0","R1","R2","R3"))] | unique | join(", ")' <<<"$raw")"
+    if [ -n "$legacy" ]; then
+      warn "risk map uses deprecated tier aliases ($legacy); use low, medium, high, xhigh"
+    fi
+    # Normalize once at the trust boundary. Everything downstream sees only the canonical names,
+    # while existing consumer maps keep working until they are migrated.
+    normalize='
+      def canonical:
+        if . == "R0" then "low" elif . == "R1" then "medium"
+        elif . == "R2" then "high" elif . == "R3" then "xhigh" else . end;
+      if has("tiers") and (.tiers | type) == "array" then .tiers |= map(canonical) else . end
+      | if has("default_tier") then .default_tier |= canonical else . end
+      | if (.path_rules | type) == "array"
+        then .path_rules |= map(if has("tier") then .tier |= canonical else . end) else . end
+      | if (.provenance_tiers | type) == "object"
+        then .provenance_tiers |= with_entries(
+          if (.key | startswith("_")) then . else .value |= canonical end) else . end
+      | if (.reversibility | type) == "object"
+        then .reversibility |= (
+          if has("no_green_checks_tier") then .no_green_checks_tier |= canonical else . end
+          | if has("no_test_touched_tier") then .no_test_touched_tier |= canonical else . end
+          | if has("clean_tier") then .clean_tier |= canonical else . end)
+        else . end'
+    raw="$(jq -c "$normalize" <<<"$raw")" || { echo "could not normalize $kind" >&2; return 1; }
     # shellcheck disable=SC2016  # jq program: $vars belong to jq
     shape='
-      def known: ["R0","R1","R2","R3"];
+      def known: ["low","medium","high","xhigh"];
       if type != "object" then "not a JSON object"
       elif (.path_rules | type) != "array" then "path_rules is missing or not an array"
-      elif (.path_rules | length) == 0 then "path_rules is EMPTY — an empty rule set would grade every PR R0"
+      elif (.path_rules | length) == 0 then "path_rules is EMPTY — an empty rule set would grade every PR low"
       elif ([.path_rules[] | select((.class | type) != "string" or (.paths | type) != "array" or (.paths | length) == 0)] | length) > 0
         then "a path rule is missing a class or a non-empty paths list"
       elif ([.path_rules[] | .tier | select(IN(known[]) | not)] | length) > 0
@@ -129,14 +153,14 @@ read_map() { # <file> <kind: map|runbooks> -> JSON on stdout, rc 0; rc 1 + reaso
       # EVERY provenance class must be MAPPED, not just well-typed. Checking only the values let
       # a map that OMITS `external` pass, and the lookup then fell back to a tier of its own
       # choosing — silently retiring the "external (a fork, or a first-time human contributor) is
-      # R3, no exceptions" invariant that the default map comment and the README promise. A class
+      # xhigh, no exceptions" invariant that the default map comment and the README promise. A class
       # nobody mapped is a routing decision nobody made, so it is refused at load time.
       # (No apostrophes in here: the whole shape program is a single-quoted shell string.)
       elif ((["runbook","agent-supervised","human","external"] - [.provenance_tiers | keys[]]) | length) > 0
         then "provenance_tiers is missing a class: \(["runbook","agent-supervised","human","external"] - [.provenance_tiers | keys[]]) — an unmapped class would be graded off a tier nobody chose"
       elif ((.reversibility // {}) | has("test_path_patterns")) and (((.reversibility // {}).test_path_patterns | type) != "array")
         then "reversibility.test_path_patterns is present but not an array"
-      elif (.default_tier // "R0") as $d | ($d | IN(known[])) | not then "default_tier is outside \(known)"
+      elif (.default_tier // "low") as $d | ($d | IN(known[])) | not then "default_tier is outside \(known)"
       elif [(.reversibility // {}) | .no_green_checks_tier, .no_test_touched_tier, .clean_tier | select(. != null and (IN(known[]) | not))] | length > 0
         then "a reversibility tier is outside \(known)"
       else empty end'
@@ -194,27 +218,27 @@ cat <<'JQ'
     def matches_any($globs): . as $p | any($globs[]?; . as $g | ($p | test($g | glob2re)));
     # An UNRECOGNIZED tier ranks as the RISKIEST, never the safest. read_map already refuses a
     # map carrying one, so this is defence in depth — but the direction matters: defaulting to
-    # R0 would let a typo'd or future tier silently DOWNGRADE a PR's grade, which inverts the
+    # low would let a typo'd or future tier silently DOWNGRADE a PR's grade, which inverts the
     # "unknown is never safe" contract in the one place it decides routing.
-    def tier_rank: {"R0":0,"R1":1,"R2":2,"R3":3}[.] // 3;
+    def tier_rank: {"low":0,"medium":1,"high":2,"xhigh":3}[.] // 3;
     def worst($a; $b): if ($a | tier_rank) >= ($b | tier_rank) then $a else $b end;
 
     $map as $M | $rb as $RB
     | ($fleet | logins) as $fleetl | ($bots | logins) as $botl
-    | ($M.default_tier // "R0") as $DEF
+    | ($M.default_tier // "low") as $DEF
     | .  as $r
     | (.changed_paths) as $paths
     | ([$paths[]? | .path]) as $plist
     # EVERY path the diff touches, DESTINATION *and* ORIGIN. A RENAMED file is recorded under its
     # destination only, so matching `.path` alone let a rename out of a sensitive directory escape
     # the floor entirely: move `.github/workflows/deploy.yml` or an `auth/` file to an innocuous
-    # name and the R3 rule that guards it never matches. The origin path is part of what the PR
+    # name and the xhigh rule that guards it never matches. The origin path is part of what the PR
     # did, so it is graded too.
     | ([$paths[]? | .path, (.previous_path // empty)] | unique) as $pall
 
     # ---- AXIS 1: PATH FLOOR ---------------------------------------------------------------
-    # WORST over every rule any changed path matches. An R0 rule (docs, tests) can never cancel
-    # an R3 rule (migrations) in the same PR — that is why this is a max, not a last-match-wins.
+    # WORST over every rule any changed path matches. A low rule (docs, tests) can never cancel
+    # an xhigh rule (migrations) in the same PR — that is why this is a max, not a last-match-wins.
     | (if $r.changed_paths_status != "ok" or $paths == null
        then {tier:null, status:"unknown",
              reason:("changed-path list is " + ($r.changed_paths_status // "absent") + " — a PR whose files we cannot read is exactly the PR that might touch auth"),
@@ -223,7 +247,7 @@ cat <<'JQ'
          ([$M.path_rules[]? | . as $rule | select($pall | any(. as $p | $p | matches_any($rule.paths)))]) as $hit
          # PER-FILE FLOORS, for REPORTING ONLY. The same rules, matched one file at a time, so the
          # publish surfaces can say WHICH files put the floor where it is ("94% of this diff is
-         # R0/R1; the 6% that makes it R3 is these two files") instead of printing an opaque tier.
+         # low/medium; the 6% that makes it xhigh is these two files") instead of printing an opaque tier.
          # This CANNOT move the grade: `worst` over these per-file floors is by construction the
          # same value as `worst` over every matched rule, because each file's floor already starts
          # at $DEF and every matched rule is some file's rule. tests/test_grade_pr_risk.sh pins
@@ -273,7 +297,7 @@ cat <<'JQ'
     #
     # NO STATUS TWIN HERE, deliberately, and it is the only provenance input without one. The
     # twins exist where the un-collected default would ANSWER — reading an absent `is_fork` as
-    # "not a fork" retires `external => R3`. This default runs the other way: absent means "not
+    # "not a fork" retires `external => xhigh`. This default runs the other way: absent means "not
     # known to be a bot", which sends the author BACK through the association test and grades it
     # the stricter way, exactly as a pre-schema-4 record graded before. Nothing is retired, so
     # there is nothing to refuse to answer. A schema-3 corpus row therefore still grades an App
@@ -288,19 +312,19 @@ cat <<'JQ'
     | ($r.labels_status // "ok") as $lbst
     # `external` is decided from is_fork + author_association, and those arrive with a STATUS
     # twin — whether they were actually read has to be asked before they are believed. Reading
-    # an un-collected `is_fork` as "not a fork" would make `external => R3` — the one provenance
+    # an un-collected `is_fork` as "not a fork" would make `external => xhigh` — the one provenance
     # class never routed unattended — silently unreachable. Unread is `unknown`, and `unknown`
     # refuses to grade the axis.
     | ($r.provenance_status // (if ($r | has("is_fork")) then "ok" else "absent" end)) as $pvst
     # ORDER IS THE RULE HERE, AND IT IS NOT REARRANGEABLE. The fork test runs FIRST and stays
     # unconditional: a fork PR is `external` no matter who authored it, so a bot on a fork can
-    # never escape R3 by presenting a bot login. Only AFTER that does the author-association half
+    # never escape xhigh by presenting a bot login. Only AFTER that does the author-association half
     # get narrowed to authors the shared resolver does NOT read as a bot.
     #
     # WHY THE NARROWING. A GitHub App is never an org member, so EVERY PR opened by a repo-owned
     # App arrives with `author_association: NONE` — and testing that string before the login
-    # classification pinned every such PR `external` => R3 regardless of what it changed (measured
-    # on one consumer: 14 of 19 R3 grades in a 24-PR sample came from this, not from the diff).
+    # classification pinned every such PR `external` => xhigh regardless of what it changed (measured
+    # on one consumer: 14 of 19 xhigh grades in a 24-PR sample came from this, not from the diff).
     # It was also unfixable from the consumer side, because both levers sit further down: the
     # `bot_logins` input feeds `classify_login`, and `.github/risk-runbooks.json` is read by the
     # shape assertion below. A non-fork bot now falls through to `runbook-candidate`, where the
@@ -323,9 +347,9 @@ cat <<'JQ'
     # assertion below resolves `$rbk != null` to `runbook` ahead of `$base_class` either way.
     # What it fixes is the UNREGISTERED bot, which either half would classify `agent-supervised`
     # — contradicting this axis's stated promise (and the map's `_why`) that a non-fork bot with
-    # no asserting entry falls back to `human`. The default map tiers both R1, so nothing moves
+    # no asserting entry falls back to `human`. The default map tiers both medium, so nothing moves
     # there; the two classes exist so a CONSUMER map can tier them apart, and a consumer that
-    # trusts its own supervised agents at R0 would otherwise hand R0 to any bot PR someone
+    # trusts its own supervised agents at low would otherwise hand low to any bot PR someone
     # labelled `agent-coded`. Trust in this axis is earned by the shape assertion, never by a label.
     | (if $pvst != "ok" or $lbst != "ok" then "unknown"
        elif ($r.is_fork // false) then "external"
@@ -385,16 +409,16 @@ cat <<'JQ'
     | (if $prov == "unknown" or $author == null
        then {tier:null, status:"unknown",
              reason:(if $pvst != "ok"
-                     then "fork / author-association were not collected (\($pvst)) — the `external` provenance class is un-decidable, and defaulting it to 'not a fork' would silently retire the external => R3 rule"
+                     then "fork / author-association were not collected (\($pvst)) — the `external` provenance class is un-decidable, and defaulting it to 'not a fork' would silently retire the external => xhigh rule"
                      elif $lbst != "ok"
                      then "the PR label list is \($lbst) — `agent-coded` cannot be read off a truncated list, and reading it as absent would be a confident answer from a source nobody finished reading"
                      else "PR author did not resolve to a GitHub account — provenance is unattributable" end),
              provenance:null}
-       # An UNMAPPED class falls back to the RISKIEST tier, never R1 — same direction as
+       # An UNMAPPED class falls back to the RISKIEST tier, never medium — same direction as
        # tier_rank. read_map now REQUIRES all four classes, so this is defence in depth; the
-       # direction is what matters, because defaulting to R1 is how a map that omitted `external`
+       # direction is what matters, because defaulting to medium is how a map that omitted `external`
        # used to grade a fork the same as a teammate.
-       else {tier: (($M.provenance_tiers // {})[$prov] // "R3"), status:"ok",
+       else {tier: (($M.provenance_tiers // {})[$prov] // "xhigh"), status:"ok",
              provenance: $prov,
              runbook: (if $rbk == null then null else $rbk.id end),
              runbook_lane: (if $rbk == null then null else $rbk.lane end),
@@ -406,17 +430,17 @@ cat <<'JQ'
 
     # ---- AXIS 3: REVERSIBILITY ------------------------------------------------------------
     # Four questions, answered deterministically and in worsening order:
-    #   mutates persistent state / deletes data?  -> R3 (reverting code does not restore state)
-    #   deletes a file under a sensitive class?   -> R3 (not a single clean revert)
-    #   did tests covering these lines actually run? no green rollup -> R2; green but no test
-    #   file touched -> R1; green and a test touched -> R0.
+    #   mutates persistent state / deletes data?  -> xhigh (reverting code does not restore state)
+    #   deletes a file under a sensitive class?   -> xhigh (not a single clean revert)
+    #   did tests covering these lines actually run? no green rollup -> high; green but no test
+    #   file touched -> medium; green and a test touched -> low.
     # `flag_gated` is RECORDED but never LOWERS a tier — an axis may only move riskier. So is
     # `files`, which names the changed paths that supplied the tier on the two rungs where it is
     # attributable to specific files at all (see the attribution block below).
     | ($M.reversibility // {}) as $RV
     # Was the check rollup READ? `checks_status: ok` with a null `checks_state` is GitHub
     # genuinely reporting no rollup for this head (a repo with no CI) and IS gradeable — the
-    # honest R2. A rollup that was never collected is not: reading it as "no green rollup"
+    # honest high. A rollup that was never collected is not: reading it as "no green rollup"
     # would be a confident answer computed from a source nobody read.
     | ($r.checks_status // (if ($r | has("checks_state")) then "ok" else "absent" end)) as $ckst
     | (if $r.changed_paths_status != "ok" or $paths == null
@@ -433,7 +457,7 @@ cat <<'JQ'
          # Sensitive-class match over the DELETED paths ONLY. This was computed from $A1.classes —
          # the classes matched by ANY changed file — so a PR that merely MODIFIED an auth file
          # while deleting an unrelated README reported "deletes N file(s) under a sensitive class"
-         # and pinned reversibility R3. The two sets have to be the same set for the sentence the
+         # and pinned reversibility xhigh. The two sets have to be the same set for the sentence the
          # reason string prints to be true.
          # The delete-sensitive RULES, resolved once. The reason sentence, the $del_sensitive
          # test and the attribution below all read this same set, so the three can never
@@ -453,7 +477,7 @@ cat <<'JQ'
          # the built-in regex when it does not. Hardcoding it meant a consumer could not fix it
          # with .github/risk.json — the one lever the workflow gives them — and the regex misses
          # `test_*.py`, `*_test.py`, `*Test.java` and `*_spec.rb`, so whole ecosystems could never
-         # reach clean_tier and sat at R1 forever.
+         # reach clean_tier and sat at medium forever.
          # DESTINATION paths only ($plist, not $pall): renaming `x_test.go` to `x.go` REMOVES a
          # test, and matching the origin path would read that as "a test file changed" and let it
          # reach clean_tier. The path floor uses $pall because widening it there can only ever
@@ -468,15 +492,15 @@ cat <<'JQ'
          # `files` list that disagrees with the `reason` printed beside it is worse than no
          # list at all. `k` feeds nothing but the attribution; it never reaches `$d.t`.
          | (if ($irrev | length) > 0
-              then {k:"irreversible-class", t:"R3", why:("touches " + ($irrev|join(", ")) + " — mutates persistent state or deletes data; reverting the code does not restore it")}
+              then {k:"irreversible-class", t:"xhigh", why:("touches " + ($irrev|join(", ")) + " — mutates persistent state or deletes data; reverting the code does not restore it")}
             elif (($deleted | length) > 0 and $del_sensitive)
-              then {k:"delete-sensitive", t:"R3", why:("removes " + ($del_sens_paths|length|tostring) + " file(s) under a sensitive class (" + ($del_classes|join(", ")) + ") — not a single clean revert")}
+              then {k:"delete-sensitive", t:"xhigh", why:("removes " + ($del_sens_paths|length|tostring) + " file(s) under a sensitive class (" + ($del_classes|join(", ")) + ") — not a single clean revert")}
             elif $checks == null or $checks != "SUCCESS"
-              then {k:"no-green-checks", t: ($RV.no_green_checks_tier // "R2"),
+              then {k:"no-green-checks", t: ($RV.no_green_checks_tier // "high"),
                     why:("no GREEN check rollup (" + ($checks // "absent") + ") — cannot answer whether tests covering these lines actually ran")}
             elif ($touched_test | not)
-              then {k:"no-test-touched", t: ($RV.no_test_touched_tier // "R1"), why:"checks green but the diff touches no test file — nothing proves the suite covers THESE lines"}
-            else {k:"clean", t: ($RV.clean_tier // "R0"), why:"single clean revert, no persistent-state mutation, checks green, tests touched"} end) as $d
+              then {k:"no-test-touched", t: ($RV.no_test_touched_tier // "medium"), why:"checks green but the diff touches no test file — nothing proves the suite covers THESE lines"}
+            else {k:"clean", t: ($RV.clean_tier // "low"), why:"single clean revert, no persistent-state mutation, checks green, tests touched"} end) as $d
          # WHICH FILES SUPPLIED THIS TIER — REPORTING ONLY, exactly like the per-file path
          # floors above, and derived AFTER `$d` for the same reason: it is computed FROM the
          # decision and read nowhere else in the grader, so it cannot become a second input to
@@ -486,8 +510,8 @@ cat <<'JQ'
          # The publisher (BE-7414) uses it to ask "if the top path-floor files were peeled off
          # this PR, would the reversibility reason go with them?" — so it is populated ONLY on
          # the two rungs that are attributable to specific files, and `null` on the other
-         # three. `null` is not "no files": R2 ("no green rollup") is a property of the head
-         # COMMIT and R1 ("no test touched") of the WHOLE change set, and neither is removable
+         # three. `null` is not "no files": high ("no green rollup") is a property of the head
+         # COMMIT and medium ("no test touched") of the WHOLE change set, and neither is removable
          # by dropping files — so `null` reads as "not attributable, keep suppressing", which
          # an empty array would not.
          #
@@ -499,10 +523,10 @@ cat <<'JQ'
          # is decided first-match, but a PR can trip the irreversible-class rung AND remove a
          # file under a sensitive class. Naming only the migrations there would answer the
          # publisher's peel question "yes, the reversibility reason goes with these files" while
-         # the delete-sensitive rung silently held the axis at R3 — the conservative suppression
+         # the delete-sensitive rung silently held the axis at xhigh — the conservative suppression
          # the `null` rungs exist for, turned into a false positive. Unioning is what makes the
          # subset test sound: peeling every path in `files` clears EVERY attributable rung, so
-         # the axis provably lands below R3. tests/test_grade_pr_risk.sh pins that property
+         # the axis provably lands below xhigh. tests/test_grade_pr_risk.sh pins that property
          # directly (peel the attributed paths, re-grade, assert the tier moved) rather than
          # only the shape of the list.
          #
@@ -533,7 +557,7 @@ cat <<'JQ'
          # a SAFE answer to the publisher's peel question rather than merely a true one. Peeling
          # clears both attributable rungs, so the remainder restarts the ladder at `no-green-checks`
          # — but those three lower rungs are MAP-CONFIGURABLE, and a consumer that sets
-         # `no_green_checks_tier: "R3"` lands the remainder right back on R3. Without this the
+         # `no_green_checks_tier: "xhigh"` lands the remainder right back on xhigh. Without this the
          # publisher reads "every attributed path is in the peel set" as "the tier drops" and
          # promises a reduction a legal map makes impossible.
          #
@@ -550,8 +574,8 @@ cat <<'JQ'
          # against `!= "SUCCESS"` and is kept only so the two spellings stay byte-identical) — a
          # paraphrase here is a second copy of the rung that can drift out of step with it.
          | (if $rev_files == null then null
-            elif $checks == null or $checks != "SUCCESS" then ($RV.no_green_checks_tier // "R2")
-            else worst(($RV.no_test_touched_tier // "R1"); ($RV.clean_tier // "R0")) end) as $rev_residual
+            elif $checks == null or $checks != "SUCCESS" then ($RV.no_green_checks_tier // "high")
+            else worst(($RV.no_test_touched_tier // "medium"); ($RV.clean_tier // "low")) end) as $rev_residual
          | {tier:$d.t, status:"ok", reason:$d.why, files:$rev_files, residual_tier:$rev_residual,
             flag_gated:$flag, deleted_files:($deleted|length)}
        end) as $A3
@@ -566,7 +590,7 @@ cat <<'JQ'
         registry_version: ($RB.registry_version // "unknown"),
         graded_at: $now,
         tier: (if ($unk|length) > 0 then null
-               else (reduce [$A1.tier, $A2.tier, $A3.tier][] as $t ("R0"; worst(.; $t))) end),
+               else (reduce [$A1.tier, $A2.tier, $A3.tier][] as $t ("low"; worst(.; $t))) end),
         status: (if ($unk|length) > 0 then "unknown" else "ok" end),
         reason: (if ($unk|length) > 0
                  then "unknown: " + ([$unk[] | .reason] | join(" | "))
@@ -589,7 +613,7 @@ grade_stream() {
 #
 # THE GRADING JOB IS PART OF THE ROLLUP IT READS. When this script runs inside a workflow on
 # the PR it is grading, its own check run is in progress, so the raw statusCheckRollup.state
-# can never be SUCCESS at grade time — every CI-time grade would floor at R2 and the tiers
+# can never be SUCCESS at grade time — every CI-time grade would floor at high and the tiers
 # would be an artifact of the measurement. With --self-run-id (preferred) or --self-context
 # the rollup is therefore recomputed from the individual contexts, EXCLUDING our own check
 # runs: any remaining pending => PENDING, any remaining SUCCESS => SUCCESS, remaining contexts
@@ -603,13 +627,13 @@ grade_stream() {
 #     own PENDING; it must never be able to hide a red check. Matching on the workflow NAME
 #     dropped every sibling job of a consumer that put the grading job inside its existing CI
 #     workflow, so a FAILED test job vanished and the remaining green contexts aggregated to
-#     SUCCESS — reversibility then graded R0/R1 on a red PR.
+#     SUCCESS — reversibility then graded low/medium on a red PR.
 #   * SUCCESS requires at least one context that actually CONCLUDED SUCCESS. A rollup of
 #     nothing but SKIPPED / NEUTRAL / null establishes nothing about whether tests ran, which
-#     is the axis's whole question, so it aggregates to NEUTRAL and floors at R2.
+#     is the axis's whole question, so it aggregates to NEUTRAL and floors at high.
 # --self-run-id also makes the match EXACT (github.run_id), so a same-named workflow in the
 # consumer repo is no longer excluded. A caller that still embeds the grading job inside a
-# multi-job workflow has all of that run's siblings excluded and lands on the honest R2 floor
+# multi-job workflow has all of that run's siblings excluded and lands on the honest high floor
 # rather than a false green — enroll pr-risk as its OWN workflow to grade off a full rollup.
 fetch_pr_record() { # <repo> <num> -> record JSON on stdout, rc 1 on an unreadable PR
   # Token note: the checkSuite -> workflowRun traversal below is an ACTIONS resource, so the
@@ -623,7 +647,7 @@ fetch_pr_record() { # <repo> <num> -> record JSON on stdout, rc 1 on an unreadab
   # and the half-record never reaches jq. That matters: if a nulled `workflowRun` DID reach jq,
   # `is_self`'s `(.checkSuite.workflowRun.databaseId // -1)` fallback would match nothing,
   # self-exclusion would silently stop working, our own in-progress run would read PENDING
-  # forever, and the PR would land a confident-looking R2 floor after burning the whole wait
+  # forever, and the PR would land a confident-looking high floor after burning the whole wait
   # budget. Rejecting the read outright is what keeps that from being reachable — so do NOT
   # "recover" partial data here by dropping the rc check.
   local repo="$1" num="$2" q qctx ctxsel resp files fstatus errf
@@ -846,11 +870,12 @@ main() {
 
   # The REASON is captured alongside the value in ONE call each: re-running read_map just to
   # collect its stderr would read the file twice, and the two reads could disagree. An unusable
-  # map is fatal — grading against one would grade every PR R0.
+  # map is fatal — grading against one would grade every PR low.
   local map rb errf
   errf="$(mktemp "${TMPDIR:-/tmp}/grade-pr-risk-err.XXXXXX")" || die "mktemp failed"
   map="$(read_map "$RISK_MAP" map 2>"$errf")" \
-    || die "risk map unusable ($RISK_MAP): $(tr '\n' ' ' < "$errf")— refusing to grade: an unusable map would grade every PR R0"
+    || die "risk map unusable ($RISK_MAP): $(tr '\n' ' ' < "$errf")— refusing to grade: an unusable map would grade every PR low"
+  [ ! -s "$errf" ] || { cat "$errf" >&2; : > "$errf"; }
   rb="$(read_map "$RUNBOOKS" runbooks 2>"$errf")" \
     || die "runbook registry unusable ($RUNBOOKS): $(tr '\n' ' ' < "$errf")— refusing to grade"
   rm -f "$errf"

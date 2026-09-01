@@ -3,19 +3,19 @@
 # feed synthetic scorecard records to --stdin, and the live-PR phase stubs `gh` on PATH with a
 # fixture GraphQL response. Ported from the fleet's offline grader suite (BE-5507) — the
 # safety properties proven there are re-proven here against the extracted script:
-#   * WORST-WINS: an R0 path rule cannot cancel an R3 one; a runbook (provenance R0) still
-#     grades R3 when the path floor says R3 — an axis may only ever move a PR RISKIER.
+#   * WORST-WINS: a low path rule cannot cancel an xhigh one; a runbook (provenance low) still
+#     grades xhigh when the path floor says xhigh — an axis may only ever move a PR RISKIER.
 #   * PROVENANCE ALONE IS NEVER SUFFICIENT: a runbook IDENTITY whose diff SHAPE does not
 #     assert is not a runbook, and the failure is recorded.
-#   * EXTERNAL IS NEVER OVERRIDDEN: a fork imitating a runbook's shape is still external R3.
+#   * EXTERNAL IS NEVER OVERRIDDEN: a fork imitating a runbook's shape is still external xhigh.
 #   * EXTERNAL IS ABOUT FORKS AND FIRST-TIME HUMANS (new here): a repo-owned App authors with
 #     `author_association: NONE`, so it is a runbook candidate rather than an outsider — while a
-#     bot on a FORK, and a first-time human, both stay external R3.
+#     bot on a FORK, and a first-time human, both stay external xhigh.
 #   * THE UNKNOWN CONTRACT: an unreadable input is tier null + status unknown + exit 1,
 #     never a confident tier; a structurally empty map is refused outright (exit 2).
 #   * THE GRADE CARRIES ITS MAP VERSION so a map revision can be replayed later.
 #   * SELF-EXCLUDING ROLLUP (new here): with --self-context, the grading workflow's own
-#     in-progress check run does not floor every live grade at R2.
+#     in-progress check run does not floor every live grade at high.
 #
 #   bash tests/test_grade_pr_risk.sh        # exit 0 = all green
 
@@ -52,16 +52,16 @@ rec() { # <pr> <author> <title> <paths-json> <paths-status> <checks> [head_ref] 
 grade() { bash "$GRADER" --stdin 2>/dev/null; }
 
 echo "— phase 1: worst-wins on the path floor —"
-# docs (R0 rule) + migration (R3 rule) in one PR: the R0 rule must not cancel the R3 one.
+# docs (low rule) + migration (xhigh rule) in one PR: the low rule must not cancel the xhigh one.
 out="$(rec 1 dev 'fix: tweak' '[{"path":"README.md","additions":1,"deletions":0,"change_type":"MODIFIED"},{"path":"db/migrations/0001_x.sql","additions":9,"deletions":0,"change_type":"ADDED"}]' ok SUCCESS | grade)"
-eq "docs cannot cancel migrations" R3 "$(jq -r '.risk.axes.path_floor.tier' <<<"$out")"
-eq "overall is R3" R3 "$(jq -r '.risk.tier' <<<"$out")"
+eq "docs cannot cancel migrations" xhigh "$(jq -r '.risk.axes.path_floor.tier' <<<"$out")"
+eq "overall is xhigh" xhigh "$(jq -r '.risk.tier' <<<"$out")"
 
 echo "— phase 2: a runbook cannot buy its way past the path floor —"
 out="$(rec 2 'dependabot[bot]' 'chore(deps): bump x from 1 to 2' '[{"path":"go.mod","additions":1,"deletions":1,"change_type":"MODIFIED"},{"path":"go.sum","additions":2,"deletions":2,"change_type":"MODIFIED"}]' ok SUCCESS 'dependabot/go_modules/x-2' CONTRIBUTOR | grade)"
 eq "provenance is runbook" runbook "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
-eq "provenance proposes R0" R0 "$(jq -r '.risk.axes.provenance.tier' <<<"$out")"
-eq "path floor still decides R3" R3 "$(jq -r '.risk.tier' <<<"$out")"
+eq "provenance proposes low" low "$(jq -r '.risk.axes.provenance.tier' <<<"$out")"
+eq "path floor still decides xhigh" xhigh "$(jq -r '.risk.tier' <<<"$out")"
 
 echo "— phase 3: provenance alone is never sufficient (shape assertion) —"
 # dependabot's identity, but the diff touches a path outside its permitted set.
@@ -73,7 +73,7 @@ if [ "$sf" -ge 1 ]; then ok "shape failure recorded"; else bad "shape failure re
 echo "— phase 4: external is never overridden by a runbook match —"
 out="$(rec 4 'dependabot[bot]' 'chore(deps): bump x from 1 to 2' '[{"path":"go.mod","additions":1,"deletions":1,"change_type":"MODIFIED"}]' ok SUCCESS 'dependabot/go_modules/x-2' NONE true | grade)"
 eq "fork stays external" external "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
-eq "external grades R3" R3 "$(jq -r '.risk.tier' <<<"$out")"
+eq "external grades xhigh" xhigh "$(jq -r '.risk.tier' <<<"$out")"
 
 echo "— phase 5: the unknown contract —"
 out="$(rec 5 dev 'mystery' null unknown SUCCESS | grade)"
@@ -87,6 +87,23 @@ out="$(rec 6 dev 'docs: x' '[{"path":"README.md","additions":1,"deletions":0,"ch
 eq "map version stamped" v0-generic "$(jq -r '.risk.map_version' <<<"$out")"
 eq "registry version stamped" v0-generic "$(jq -r '.risk.registry_version' <<<"$out")"
 
+echo "— phase 6b: legacy R0..R3 maps remain compatible but emit canonical tiers —"
+LEGACY_MAP="$SANDBOX/legacy-map.json"
+jq '
+  def legacy:
+    if . == "low" then "R0" elif . == "medium" then "R1"
+    elif . == "high" then "R2" elif . == "xhigh" then "R3" else . end;
+  walk(if type == "string" then legacy else . end)' "$SELF_DIR/../risk-map.v0.json" > "$LEGACY_MAP"
+out="$(rec 61 dev 'fix: legacy map' '[{"path":"db/migrations/0001_x.sql","additions":1,"deletions":0,"change_type":"ADDED"}]' ok SUCCESS \
+  | bash "$GRADER" --stdin --map "$LEGACY_MAP" 2>"$SANDBOX/legacy-map.err")"
+eq "a legacy map still grades" xhigh "$(jq -r '.risk.tier' <<<"$out")"
+eq "legacy path tiers are normalized in the record" xhigh "$(jq -r '.risk.axes.path_floor.tier' <<<"$out")"
+if grep -F 'deprecated tier aliases' "$SANDBOX/legacy-map.err" >/dev/null; then
+  ok "legacy map use emits a deprecation warning"
+else
+  bad "legacy map use emits a deprecation warning" "$(cat "$SANDBOX/legacy-map.err")"
+fi
+
 echo "— phase 7: a structurally empty map is refused outright —"
 echo "— per-file path floors are REPORTING ONLY: worst(files) == the floor itself —"
 # publish-risk-surfaces.sh renders one row per file from risk.axes.path_floor.files. Those
@@ -95,14 +112,14 @@ echo "— per-file path floors are REPORTING ONLY: worst(files) == the floor its
 # with the tier printed above it.
 # ONE line: --stdin is JSONL, and a pretty-printed record is dropped by the per-line reader.
 inv="$(grade <<<'{"changed_paths_status":"ok","author":"someone","is_fork":false,"labels":[],"checks_status":"ok","checks_state":"SUCCESS","provenance_status":"ok","changed_paths":[{"path":".github/workflows/a.yml","change_type":"MODIFIED"},{"path":"docs/a.md","change_type":"MODIFIED"},{"path":"src/plain.go","change_type":"MODIFIED"}]}')"
-eq "the floor is R3 (the ci rule)" "R3" "$(jq -r '.risk.axes.path_floor.tier' <<<"$inv")"
-eq "worst over the per-file floors equals it" "R3" \
-   "$(jq -r '[.risk.axes.path_floor.files[].tier] | map({"R0":0,"R1":1,"R2":2,"R3":3}[.]) | max
-             | ["R0","R1","R2","R3"][.]' <<<"$inv")"
+eq "the floor is xhigh (the ci rule)" "xhigh" "$(jq -r '.risk.axes.path_floor.tier' <<<"$inv")"
+eq "worst over the per-file floors equals it" "xhigh" \
+   "$(jq -r '[.risk.axes.path_floor.files[].tier] | map({"low":0,"medium":1,"high":2,"xhigh":3}[.]) | max
+             | ["low","medium","high","xhigh"][.]' <<<"$inv")"
 eq "every changed file gets exactly one row" 3 "$(jq '.risk.axes.path_floor.files | length' <<<"$inv")"
-eq "an unmapped path falls to the map default, not to the floor" "R0" \
+eq "an unmapped path falls to the map default, not to the floor" "low" \
    "$(jq -r '.risk.axes.path_floor.files[] | select(.path == "src/plain.go") | .tier' <<<"$inv")"
-eq "the docs rule keeps its own R0 row under an R3 floor" "R0" \
+eq "the docs rule keeps its own low row under an xhigh floor" "low" \
    "$(jq -r '.risk.axes.path_floor.files[] | select(.path == "docs/a.md") | .tier' <<<"$inv")"
 
 printf '{}' > "$SANDBOX/empty-map.json"
@@ -112,10 +129,10 @@ eq "empty map exits 2" 2 "$?"
 
 echo "— phase 8: reversibility floors and rungs —"
 out="$(rec 8 dev 'docs: x' '[{"path":"README.md","additions":1,"deletions":0,"change_type":"MODIFIED"}]' ok PENDING | grade)"
-eq "pending checks floor reversibility at R2" R2 "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
+eq "pending checks floor reversibility at high" high "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
 out="$(rec 9 dev 'test: cover x' '[{"path":"pkg/x_test.go","additions":9,"deletions":0,"change_type":"ADDED"}]' ok SUCCESS | grade)"
-eq "green + test touched grades reversibility R0" R0 "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
-eq "human provenance keeps overall at R1" R1 "$(jq -r '.risk.tier' <<<"$out")"
+eq "green + test touched grades reversibility low" low "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
+eq "human provenance keeps overall at medium" medium "$(jq -r '.risk.tier' <<<"$out")"
 
 echo "— phase 9: --pr with a stubbed gh: the self-excluding rollup —"
 # Fixture: our own workflow's check run is IN_PROGRESS (it always is, mid-run); one other
@@ -171,7 +188,7 @@ eq "self-excluded rollup reads SUCCESS (by name)" SUCCESS "$(jq -r '.checks_stat
 eq "the record carries the graded head sha" \
    "c0ffee1234567890abcdef1234567890abcdef12" "$(jq -r '.head_sha' <<<"$out")"
 eq "nothing else pending" false "$(jq -r '.checks_pending_excl_self' <<<"$out")"
-eq "live docs PR grades R1" R1 "$(jq -r '.risk.tier' <<<"$out")"
+eq "live docs PR grades medium" medium "$(jq -r '.risk.tier' <<<"$out")"
 # --self-run-id is the EXACT selector: same result, but keyed on github.run_id, so a
 # same-named workflow elsewhere in the consumer repo is no longer swept out of the rollup.
 out="$(graded_pr --self-run-id 999)"
@@ -194,19 +211,19 @@ echo "— phase 10: self-exclusion can never HIDE a red check —"
 # The failing check belongs to OUR OWN run (the case a consumer creates by putting the grading
 # job inside its existing CI workflow — every sibling job then shares our run id). Excluding it
 # from the rollup would aggregate the remaining green contexts to SUCCESS and grade a RED PR
-# R0/R1, so the FAILURE scan deliberately covers self too.
+# low/medium, so the FAILURE scan deliberately covers self too.
 jq '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[1] =
       {"__typename":"CheckRun","name":"unit tests","status":"COMPLETED","conclusion":"FAILURE",
        "checkSuite":{"workflowRun":{"databaseId":999,"workflow":{"name":"CI - PR Risk Grade"}}}}' \
   "$SANDBOX/fixture.json" > "$SANDBOX/f2.json" && cp "$SANDBOX/f2.json" "$SANDBOX/fixture.json"
 out="$(graded_pr --self-run-id 999)"
 eq "a failing check in our own run still reads FAILURE" FAILURE "$(jq -r '.checks_state' <<<"$out")"
-eq "and reversibility cannot go below R2" R2 "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
+eq "and reversibility cannot go below high" high "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
 
 echo "— phase 11: a rollup of nothing but SKIPPED is not a green rollup —"
 # SKIPPED / NEUTRAL / null conclusions establish NOTHING about whether tests covering these
 # lines ran, which is the reversibility axis's entire question — so they must not aggregate to
-# SUCCESS and let the axis drop to R0/R1.
+# SUCCESS and let the axis drop to low/medium.
 jq '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes =
       [{"__typename":"CheckRun","name":"Grade PR risk","status":"IN_PROGRESS","conclusion":null,
         "checkSuite":{"workflowRun":{"databaseId":999,"workflow":{"name":"CI - PR Risk Grade"}}}},
@@ -215,7 +232,7 @@ jq '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.conte
   "$SANDBOX/fixture.json" > "$SANDBOX/f2.json" && cp "$SANDBOX/f2.json" "$SANDBOX/fixture.json"
 out="$(graded_pr --self-run-id 999)"
 eq "all-SKIPPED does not aggregate to SUCCESS" NEUTRAL "$(jq -r '.checks_state' <<<"$out")"
-eq "no green rollup floors reversibility at R2" R2 "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
+eq "no green rollup floors reversibility at high" high "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
 
 echo "— phase 12: a SHORT changed-file read is unknown, never a floor from the files that fit —"
 # GraphQL says 5 changed files, the file endpoint returned 1. The old `files(first:100)` path
@@ -229,31 +246,31 @@ eq "and the overall grade refuses" null "$(jq -r '.risk.tier' <<<"$out")"
 
 echo "— phase 13: a RENAME cannot walk a file out of its guarded directory —"
 # The origin path is graded too: `git mv src/auth/x.go misc/x.go` used to be recorded under the
-# destination ALONE, so the R3 `auth` rule never matched and the move escaped the floor.
+# destination ALONE, so the xhigh `auth` rule never matched and the move escaped the floor.
 out="$(rec 13 dev 'refactor: move things' '[{"path":"misc/x.go","previous_path":"src/auth/x.go","additions":1,"deletions":1,"change_type":"RENAMED"}]' ok SUCCESS | grade)"
-eq "the origin path still hits the auth floor" R3 "$(jq -r '.risk.axes.path_floor.tier' <<<"$out")"
-eq "renaming a file out of a sensitive class is not a clean revert" R3 "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
+eq "the origin path still hits the auth floor" xhigh "$(jq -r '.risk.axes.path_floor.tier' <<<"$out")"
+eq "renaming a file out of a sensitive class is not a clean revert" xhigh "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
 
 echo "— phase 14: 'deletes a sensitive file' means the DELETED files, not any changed file —"
 # MODIFIES an auth file and DELETES an unrelated README. The sensitive-class match used to run
 # over every changed file, so this reported "deletes N file(s) under a sensitive class" and
-# pinned reversibility R3 — a true tier from a false sentence.
+# pinned reversibility xhigh — a true tier from a false sentence.
 out="$(rec 14 dev 'chore: tidy' '[{"path":"src/auth/x.go","additions":2,"deletions":1,"change_type":"MODIFIED"},{"path":"README.md","additions":0,"deletions":9,"change_type":"DELETED"}]' ok SUCCESS | grade)"
-eq "deleting a doc is not deleting an auth file" R1 "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
-eq "the auth path floor still decides the grade" R3 "$(jq -r '.risk.tier' <<<"$out")"
-# ...and a genuinely deleted auth file still pins R3.
+eq "deleting a doc is not deleting an auth file" medium "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
+eq "the auth path floor still decides the grade" xhigh "$(jq -r '.risk.tier' <<<"$out")"
+# ...and a genuinely deleted auth file still pins xhigh.
 out="$(rec 15 dev 'chore: drop it' '[{"path":"src/auth/x.go","additions":0,"deletions":9,"change_type":"DELETED"}]' ok SUCCESS | grade)"
-eq "deleting an auth file is R3 on reversibility" R3 "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
+eq "deleting an auth file is xhigh on reversibility" xhigh "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
 
 echo "— phase 15: the default map's globs match at DEPTH, not just at the repo root —"
 # `*` does not cross `/`, so an unprefixed glob compiles to a root-only match and the rule
-# silently matches nothing in a real tree. The grader + its map are R3: a PR that edits the
+# silently matches nothing in a real tree. The grader + its map are xhigh: a PR that edits the
 # judge must not be graded safest by that judge.
 out="$(rec 16 dev 'chore: retune' '[{"path":"scripts/pr-risk/risk-map.v0.json","additions":3,"deletions":1,"change_type":"MODIFIED"}]' ok SUCCESS | grade)"
-eq "a nested risk map is R3" R3 "$(jq -r '.risk.axes.path_floor.tier' <<<"$out")"
+eq "a nested risk map is xhigh" xhigh "$(jq -r '.risk.axes.path_floor.tier' <<<"$out")"
 out="$(rec 17 dev 'chore: retune' '[{"path":"scripts/pr-risk/grade-pr-risk.sh","additions":3,"deletions":1,"change_type":"MODIFIED"}]' ok SUCCESS | grade)"
-eq "the grader itself is R3" R3 "$(jq -r '.risk.axes.path_floor.tier' <<<"$out")"
-# A shell test OUTSIDE a tests/ directory must still match the R0 tests class.
+eq "the grader itself is xhigh" xhigh "$(jq -r '.risk.axes.path_floor.tier' <<<"$out")"
+# A shell test OUTSIDE a tests/ directory must still match the low tests class.
 out="$(rec 18 dev 'test: smoke' '[{"path":"hack/smoke-test.sh","additions":3,"deletions":0,"change_type":"ADDED"}]' ok SUCCESS | grade)"
 if jq -e '.risk.axes.path_floor.classes | index("tests")' >/dev/null <<<"$out"; then
   ok "a nested *-test.sh matches the tests class"
@@ -261,15 +278,15 @@ else bad "a nested *-test.sh matches the tests class" "$(jq -c '.risk.axes.path_
 
 echo "— phase 16: 'did a test file change?' comes from the MAP, so every ecosystem can answer —"
 # The built-in regex knows only the Go/TS shapes, so a Python or Java consumer could never
-# reach clean_tier and sat at R1 forever. test_path_patterns in the map is the fix.
+# reach clean_tier and sat at medium forever. test_path_patterns in the map is the fix.
 for p in pkg/test_foo.py pkg/foo_test.py app/FooTest.java spec/foo_spec.rb; do
   out="$(rec 19 dev 'test: cover it' "[{\"path\":\"$p\",\"additions\":9,\"deletions\":0,\"change_type\":\"ADDED\"}]" ok SUCCESS | grade)"
-  eq "$p counts as a touched test" R0 "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
+  eq "$p counts as a touched test" low "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
 done
 
 echo "— phase 17: a map that forgets a provenance class is refused, not guessed —"
 # `{}`-shaped omissions used to pass validation and then grade forks off a fallback tier
-# nobody chose, silently retiring "external is R3, no exceptions".
+# nobody chose, silently retiring "external is xhigh, no exceptions".
 jq 'del(.provenance_tiers.external)' "$SELF_DIR/../risk-map.v0.json" > "$SANDBOX/no-external.json"
 rec 20 dev 'docs: x' '[{"path":"README.md","additions":1,"deletions":0,"change_type":"MODIFIED"}]' ok SUCCESS \
   | bash "$GRADER" --stdin --map "$SANDBOX/no-external.json" >/dev/null 2>&1
@@ -406,10 +423,10 @@ eq "and still grades" ok "$(jq -r '.risk.status' <<<"$out")"
 echo "— phase 21: a repo-owned App is a runbook candidate, not an outsider —"
 # A GitHub App is never an org member, so EVERY PR a repo-owned App opens arrives with
 # `author_association: NONE`. Testing that string BEFORE the login classification graded every
-# such PR `external` => R3 regardless of its diff, and no consumer lever could reach it: the
+# such PR `external` => xhigh regardless of its diff, and no consumer lever could reach it: the
 # `bot_logins` input and .github/risk-runbooks.json are both read further down. The fix narrows
 # the association half to non-bots; the FORK half stays unconditional, which is what keeps a bot
-# on a fork from presenting a bot login to escape R3.
+# on a fork from presenting a bot login to escape xhigh.
 cat > "$SANDBOX/app-runbooks.json" <<'FIX'
 {"registry_version":"v0-test","runbooks":[
   {"id":"data-snapshot-refresh",
@@ -422,31 +439,31 @@ FIX
 app_grade() { bash "$GRADER" --stdin --runbooks "$SANDBOX/app-runbooks.json" 2>/dev/null; }
 SNAP='[{"path":"data/skills.json","additions":40,"deletions":12,"change_type":"MODIFIED"}]'
 
-# (1) non-fork App PR, author_association NONE, registry entry asserts -> runbook, R0 on the axis.
+# (1) non-fork App PR, author_association NONE, registry entry asserts -> runbook, low on the axis.
 out="$(rec 22 'cloud-code-bot[bot]' 'chore: refresh skills snapshot' "$SNAP" ok SUCCESS bot/refresh NONE false | app_grade)"
 eq "a non-fork App PR is not external" runbook "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
 eq "and names the runbook that asserted" data-snapshot-refresh "$(jq -r '.risk.axes.provenance.runbook' <<<"$out")"
-eq "provenance proposes R0" R0 "$(jq -r '.risk.axes.provenance.tier' <<<"$out")"
-# The other axes still decide: an unmapped data path floors R0 and green-but-no-test is R1, so
-# the grade now RESPONDS to the diff instead of being pinned R3 by the author's association.
-eq "the diff, not the association, decides the grade" R1 "$(jq -r '.risk.tier' <<<"$out")"
+eq "provenance proposes low" low "$(jq -r '.risk.axes.provenance.tier' <<<"$out")"
+# The other axes still decide: an unmapped data path floors low and green-but-no-test is medium, so
+# the grade now RESPONDS to the diff instead of being pinned xhigh by the author's association.
+eq "the diff, not the association, decides the grade" medium "$(jq -r '.risk.tier' <<<"$out")"
 
-# (2) the SAME App PR from a FORK is still external R3. The fork test runs first and is
+# (2) the SAME App PR from a FORK is still external xhigh. The fork test runs first and is
 # unconditional — reordering the two would open exactly this hole.
 out="$(rec 23 'cloud-code-bot[bot]' 'chore: refresh skills snapshot' "$SNAP" ok SUCCESS bot/refresh NONE true | app_grade)"
 eq "a bot on a fork is still external" external "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
-eq "and still grades R3" R3 "$(jq -r '.risk.tier' <<<"$out")"
+eq "and still grades xhigh" xhigh "$(jq -r '.risk.tier' <<<"$out")"
 
 # (3) a non-fork HUMAN with author_association NONE is untouched: the first-time-contributor
 # guard is narrowed to non-bots, not removed.
 out="$(rec 24 'drive-by-human' 'feat: my first patch' "$SNAP" ok SUCCESS feature NONE false | app_grade)"
 eq "a first-time human contributor is still external" external "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
-eq "and still grades R3" R3 "$(jq -r '.risk.tier' <<<"$out")"
+eq "and still grades xhigh" xhigh "$(jq -r '.risk.tier' <<<"$out")"
 
 # (4) identity alone buys NO trust: a bot with no asserting registry entry falls back to human.
 out="$(rec 25 'unregistered-bot[bot]' 'chore: something' "$SNAP" ok SUCCESS bot/x NONE false | app_grade)"
 eq "an unregistered bot grades human, never runbook" human "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
-eq "human provenance proposes R1, not R0" R1 "$(jq -r '.risk.axes.provenance.tier' <<<"$out")"
+eq "human provenance proposes medium, not low" medium "$(jq -r '.risk.axes.provenance.tier' <<<"$out")"
 # ...and so does a REGISTERED bot whose diff shape does not assert (paths outside its set).
 out="$(rec 26 'cloud-code-bot[bot]' 'chore: refresh' '[{"path":"src/evil.go","additions":9,"deletions":0,"change_type":"MODIFIED"}]' ok SUCCESS bot/refresh NONE false | app_grade)"
 eq "a registered App failing its shape is human, not runbook" human "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
@@ -468,17 +485,17 @@ eq "and without --bot-logins it reads as a first-time human" external "$(jq -r '
 # A REGISTERED producer was never at risk (the shape assertion resolves to `runbook` ahead of
 # the base class either way) — this pins that, then pins the case that WAS wrong: the
 # UNREGISTERED bot, which either half classified `agent-supervised`, contradicting the promise
-# that a bot with no asserting entry falls back to `human`. The default map tiers both R1, so
+# that a bot with no asserting entry falls back to `human`. The default map tiers both medium, so
 # no grade moves here; the classes exist so a CONSUMER map can tier them apart, and a consumer
-# that trusts its supervised agents at R0 would otherwise hand R0 to any `agent-coded` bot PR.
+# that trusts its supervised agents at low would otherwise hand low to any `agent-coded` bot PR.
 out="$(rec 29 'cloud-code-bot[bot]' 'chore: refresh skills snapshot' "$SNAP" ok SUCCESS bot/refresh NONE false \
        | jq -c '.labels = ["agent-coded"]' | app_grade)"
 eq "a registered App is runbook with or without the label" runbook "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
-eq "and still earns R0 from the shape assertion" R0 "$(jq -r '.risk.axes.provenance.tier' <<<"$out")"
+eq "and still earns low from the shape assertion" low "$(jq -r '.risk.axes.provenance.tier' <<<"$out")"
 out="$(rec 30 'unregistered-bot[bot]' 'chore: something' "$SNAP" ok SUCCESS bot/x NONE false \
        | jq -c '.labels = ["agent-coded"]' | app_grade)"
 eq "an agent-coded unregistered bot is human, not agent-supervised" human "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
-eq "and human is R1, exactly what agent-supervised was" R1 "$(jq -r '.risk.axes.provenance.tier' <<<"$out")"
+eq "and human is medium, exactly what agent-supervised was" medium "$(jq -r '.risk.axes.provenance.tier' <<<"$out")"
 # The same for `fleet_logins`. That collision exists only because `author_is_bot` no longer
 # comes from the login string: a Bot actor's GraphQL login arrives UNSUFFIXED, so an operator
 # who lists it in --fleet-logins makes `classify_login` say "fleet" while GitHub says Bot. The
@@ -502,7 +519,7 @@ eq "an agent-coded human is still agent-supervised" agent-supervised "$(jq -r '.
 # (7) `author_is_bot` is tested `== true`, NOT for jq truthiness. It is the one field that can
 # switch the `external` guard off, and in jq the STRING "false" — what a foreign collector
 # writing JSON by hand emits — is truthy. Read loosely, that grades a first-time outsider
-# `human` R1 on a field nobody set to true.
+# `human` medium on a field nobody set to true.
 for junk in '"false"' '0' '""' 'null'; do
   out="$(rec 34 'drive-by-human' 'feat: my first patch' "$SNAP" ok SUCCESS feature NONE false \
          | jq -c ".author_is_bot = $junk" | app_grade)"
@@ -527,7 +544,7 @@ jq '.data.repository.pullRequest.author = {"login":"cloud-code-bot","__typename"
     | .data.repository.pullRequest.title = "data: refresh bundled skills snapshot (auto)"
     | .data.repository.pullRequest.headRefName = "bot/refresh-skills"
     # ...and the ROLLUP STATE with it. Without --self-run-id the grader reads `.state` directly,
-    # and phase 9 left it PENDING — which floored reversibility R2 and meant the SUCCESS CheckRun
+    # and phase 9 left it PENDING — which floored reversibility high and meant the SUCCESS CheckRun
     # below was never actually consulted, so the fixture implied coverage it did not have.
     | .data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.state = "SUCCESS"
     | .data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes =
@@ -564,11 +581,11 @@ eq "an App PR is no longer external on the live path" human "$(jq -r '.risk.axes
 out="$(bot_pr --runbooks "$SANDBOX/app-runbooks.json" --bot-logins '')"
 eq "an entry listing only the SUFFIXED form asserts against an unsuffixed Bot login" \
    runbook "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
-eq "and the tier now responds to the diff" R0 "$(jq -r '.risk.axes.provenance.tier' <<<"$out")"
+eq "and the tier now responds to the diff" low "$(jq -r '.risk.axes.provenance.tier' <<<"$out")"
 # The rollup really is read on this path: green, but no test file in the diff, so reversibility
-# proposes R1 and that — not the author's account type — is what decides the grade.
-eq "the green rollup is actually consulted" R1 "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
-eq "and the overall grade is R1, decided by the diff" R1 "$(jq -r '.risk.tier' <<<"$out")"
+# proposes medium and that — not the author's account type — is what decides the grade.
+eq "the green rollup is actually consulted" medium "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
+eq "and the overall grade is medium, decided by the diff" medium "$(jq -r '.risk.tier' <<<"$out")"
 # THE SYNTHESIS IS ONE-WAY AND GATED ON GITHUB'S ACTOR TYPE, which is the whole safety argument:
 # the suffix is only ever ADDED, and only for an author GitHub types `Bot`. A USER account that
 # happens to be named `cloud-code-bot` presents `cloud-code-bot` and nothing turns the entry's
@@ -594,15 +611,15 @@ jq '.runbooks[0].identity.logins = ["cloud-code-bot[bot]","cloud-code-bot"]' \
 jq '.data.repository.pullRequest.isCrossRepository = true' \
   "$SANDBOX/botfixture.json" > "$SANDBOX/bf2.json" && cp "$SANDBOX/bf2.json" "$SANDBOX/botfixture.json"
 out="$(bot_pr --runbooks "$SANDBOX/app-runbooks-both.json")"
-eq "a Bot author on a fork is still external R3" external "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
-eq "and the grade is R3" R3 "$(jq -r '.risk.tier' <<<"$out")"
+eq "a Bot author on a fork is still external xhigh" external "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
+eq "and the grade is xhigh" xhigh "$(jq -r '.risk.tier' <<<"$out")"
 # A HUMAN author on the same live path keeps the first-time-contributor guard.
 jq '.data.repository.pullRequest.isCrossRepository = false
     | .data.repository.pullRequest.author = {"login":"drive-by","__typename":"User"}' \
   "$SANDBOX/botfixture.json" > "$SANDBOX/bf2.json" && cp "$SANDBOX/bf2.json" "$SANDBOX/botfixture.json"
 out="$(bot_pr --runbooks "$SANDBOX/app-runbooks-both.json")"
 eq "a live first-time human is still external" external "$(jq -r '.risk.axes.provenance.provenance' <<<"$out")"
-eq "and still grades R3" R3 "$(jq -r '.risk.tier' <<<"$out")"
+eq "and still grades xhigh" xhigh "$(jq -r '.risk.tier' <<<"$out")"
 
 echo "— phase 23: reversibility says WHICH files supplied its tier — REPORTING ONLY —"
 # `axes.reversibility.files` exists so the publisher (BE-7414) can ask "if the top path-floor
@@ -618,7 +635,7 @@ echo "— phase 23: reversibility says WHICH files supplied its tier — REPORTI
 subset_ok() { jq -e '((.risk.axes.reversibility.files // []) - [.risk.axes.path_floor.files[].path]) | length == 0' >/dev/null; }
 
 # peeled_tier — the PROPERTY `files` claims, not its shape: drop exactly the attributed paths,
-# re-grade, and the axis must no longer be R3. Asserting the shape alone passes green on an
+# re-grade, and the axis must no longer be xhigh. Asserting the shape alone passes green on an
 # attribution that names a real file but not ALL the files holding the tier up, which is the
 # only reading of the field the publisher actually makes. The per-file path-floor phase pins
 # its analogue (`worst(files) == floor`); this is the reversibility equivalent.
@@ -632,11 +649,11 @@ peeled_tier() { # <pr> <paths-json> <graded-out> -> the reversibility tier after
 # (a) irreversible class: the migration supplied the tier; the docs file rode along.
 paths='[{"path":"db/migrations/0001_x.sql","additions":9,"deletions":0,"change_type":"ADDED"},{"path":"docs/a.md","additions":1,"deletions":0,"change_type":"MODIFIED"}]'
 out="$(rec 30 dev 'feat: schema' "$paths" ok SUCCESS | grade)"
-eq "irreversible-class reversibility is still R3" R3 "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
-eq "and the overall tier is still R3" R3 "$(jq -r '.risk.tier' <<<"$out")"
+eq "irreversible-class reversibility is still xhigh" xhigh "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
+eq "and the overall tier is still xhigh" xhigh "$(jq -r '.risk.tier' <<<"$out")"
 eq "only the migration is attributed" '["db/migrations/0001_x.sql"]' "$(jq -c '.risk.axes.reversibility.files' <<<"$out")"
 if subset_ok <<<"$out"; then ok "attributed paths are a subset of the path-floor rows"; else bad "attributed paths are a subset of the path-floor rows" "$(jq -c '.risk.axes.reversibility.files' <<<"$out")"; fi
-eq "peeling the attributed paths drops the irreversible-class tier" R1 "$(peeled_tier 130 "$paths" "$out")"
+eq "peeling the attributed paths drops the irreversible-class tier" medium "$(peeled_tier 130 "$paths" "$out")"
 
 # (b) delete-sensitive: attribution is BY ROW, never by intersecting a row's classes with the
 # sensitive list. `src/auth/y.go` is MODIFIED and carries class `auth` too — a class
@@ -645,12 +662,12 @@ eq "peeling the attributed paths drops the irreversible-class tier" R1 "$(peeled
 # either (peeling it alone would leave the reason standing).
 paths='[{"path":"src/auth/x.go","additions":0,"deletions":9,"change_type":"DELETED"},{"path":"src/auth/y.go","additions":2,"deletions":1,"change_type":"MODIFIED"},{"path":"README.md","additions":0,"deletions":4,"change_type":"DELETED"}]'
 out="$(rec 31 dev 'chore: drop it' "$paths" ok SUCCESS | grade)"
-eq "delete-sensitive reversibility is still R3" R3 "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
-eq "and the overall tier is still R3" R3 "$(jq -r '.risk.tier' <<<"$out")"
+eq "delete-sensitive reversibility is still xhigh" xhigh "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
+eq "and the overall tier is still xhigh" xhigh "$(jq -r '.risk.tier' <<<"$out")"
 eq "only the DELETED sensitive file is attributed" '["src/auth/x.go"]' "$(jq -c '.risk.axes.reversibility.files' <<<"$out")"
 eq "the deleted_files count is untouched by the attribution" 2 "$(jq -r '.risk.axes.reversibility.deleted_files' <<<"$out")"
 if subset_ok <<<"$out"; then ok "delete attribution is a subset of the path-floor rows"; else bad "delete attribution is a subset of the path-floor rows" "$(jq -c '.risk.axes.reversibility.files' <<<"$out")"; fi
-eq "peeling the attributed path drops the delete-sensitive tier" R1 "$(peeled_tier 131 "$paths" "$out")"
+eq "peeling the attributed path drops the delete-sensitive tier" medium "$(peeled_tier 131 "$paths" "$out")"
 # ...and the SENTENCE agrees with the list beside it: one sensitive removal, class `auth` only.
 # The count used to be every removal and the classes every class any removal matched, so this
 # fixture printed "removes 2 file(s) under a sensitive class (auth, docs)" — with `docs` not
@@ -664,38 +681,38 @@ eq "the reason counts only the SENSITIVE removals" \
 # publisher can compare against.
 paths='[{"path":"misc/x.go","previous_path":"src/auth/x.go","additions":1,"deletions":1,"change_type":"RENAMED"}]'
 out="$(rec 32 dev 'refactor: move things' "$paths" ok SUCCESS | grade)"
-eq "renaming out of a sensitive class is still R3" R3 "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
+eq "renaming out of a sensitive class is still xhigh" xhigh "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
 eq "the renamed row is attributed under its DESTINATION" '["misc/x.go"]' "$(jq -c '.risk.axes.reversibility.files' <<<"$out")"
 if subset_ok <<<"$out"; then ok "rename attribution is a subset of the path-floor rows"; else bad "rename attribution is a subset of the path-floor rows" "$(jq -c '.risk.axes.reversibility.files' <<<"$out")"; fi
-eq "peeling the renamed row drops the tier" R1 "$(peeled_tier 132 "$paths" "$out")"
+eq "peeling the renamed row drops the tier" medium "$(peeled_tier 132 "$paths" "$out")"
 
-# (c2) BOTH R3 RUNGS AT ONCE — the tier ladder is first-match, the attribution is NOT. This PR
+# (c2) BOTH xhigh RUNGS AT ONCE — the tier ladder is first-match, the attribution is NOT. This PR
 # adds a migration (irreversible class) AND deletes an auth file (sensitive removal). Naming
 # only the migration would answer the publisher's peel question "yes, the reversibility reason
-# goes with these files" while the delete-sensitive rung silently held the axis at R3 — a false
+# goes with these files" while the delete-sensitive rung silently held the axis at xhigh — a false
 # positive out of the very suppression the `null` rungs exist for. The peel below is the assert
-# that matters: strip everything `files` names and the axis must actually leave R3.
+# that matters: strip everything `files` names and the axis must actually leave xhigh.
 paths='[{"path":"db/migrations/0002_y.sql","additions":9,"deletions":0,"change_type":"ADDED"},{"path":"src/auth/x.go","additions":0,"deletions":9,"change_type":"DELETED"},{"path":"docs/a.md","additions":1,"deletions":0,"change_type":"MODIFIED"}]'
 out="$(rec 38 dev 'feat: schema + drop auth' "$paths" ok SUCCESS | grade)"
-eq "both-rungs reversibility is still R3" R3 "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
+eq "both-rungs reversibility is still xhigh" xhigh "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
 eq "the reason is still the FIRST rung's" \
    "touches migrations — mutates persistent state or deletes data; reverting the code does not restore it" \
    "$(jq -r '.risk.axes.reversibility.reason' <<<"$out")"
 eq "but BOTH rungs' files are attributed" \
    '["db/migrations/0002_y.sql","src/auth/x.go"]' "$(jq -c '.risk.axes.reversibility.files' <<<"$out")"
 if subset_ok <<<"$out"; then ok "the union is a subset of the path-floor rows"; else bad "the union is a subset of the path-floor rows" "$(jq -c '.risk.axes.reversibility.files' <<<"$out")"; fi
-eq "peeling the union clears EVERY attributable rung" R1 "$(peeled_tier 138 "$paths" "$out")"
+eq "peeling the union clears EVERY attributable rung" medium "$(peeled_tier 138 "$paths" "$out")"
 
 # (d)/(e)/(f) the three non-attributable rungs. "No green rollup" is a property of the head
 # COMMIT and "no test touched" of the WHOLE change set; neither is removable by dropping files.
 out="$(rec 33 dev 'docs: x' '[{"path":"README.md","additions":1,"deletions":0,"change_type":"MODIFIED"}]' ok PENDING | grade)"
-eq "no green rollup is still R2" R2 "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
+eq "no green rollup is still high" high "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
 eq "and attributes nothing" null "$(jq -r '.risk.axes.reversibility.files' <<<"$out")"
 out="$(rec 34 dev 'feat: x' '[{"path":"src/x.go","additions":9,"deletions":0,"change_type":"MODIFIED"}]' ok SUCCESS | grade)"
-eq "no test touched is still R1" R1 "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
+eq "no test touched is still medium" medium "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
 eq "and attributes nothing" null "$(jq -r '.risk.axes.reversibility.files' <<<"$out")"
 out="$(rec 35 dev 'test: cover x' '[{"path":"pkg/x_test.go","additions":9,"deletions":0,"change_type":"ADDED"}]' ok SUCCESS | grade)"
-eq "a clean revert is still R0" R0 "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
+eq "a clean revert is still low" low "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
 eq "and attributes nothing" null "$(jq -r '.risk.axes.reversibility.files' <<<"$out")"
 
 # An unknown path axis takes reversibility unknown BEFORE the attribution runs, so the field is
@@ -721,23 +738,23 @@ out="$(rec 39 dev 'feat: schema' "$paths" ok SUCCESS | grade)"
 # peeling and re-grading. Asserting them equal is what stops the bound drifting into a guess.
 eq "residual_tier equals the tier a real peel produces (green rollup)" \
    "$(peeled_tier 139 "$paths" "$out")" "$(jq -r '.risk.axes.reversibility.residual_tier' <<<"$out")"
-eq "…which on the repo map's defaults is R1" R1 "$(jq -r '.risk.axes.reversibility.residual_tier' <<<"$out")"
+eq "…which on the repo map's defaults is medium" medium "$(jq -r '.risk.axes.reversibility.residual_tier' <<<"$out")"
 # NOT GREEN: rung 3 tests the HEAD COMMIT's rollup, which no peel can change, so the remainder
-# lands exactly on no_green_checks_tier — R2 here, still below the R3 headline.
+# lands exactly on no_green_checks_tier — high here, still below the xhigh headline.
 out="$(rec 40 dev 'feat: schema' "$paths" ok PENDING | grade)"
-eq "a non-green rollup pins the residual at no_green_checks_tier" R2 \
+eq "a non-green rollup pins the residual at no_green_checks_tier" high \
    "$(jq -r '.risk.axes.reversibility.residual_tier' <<<"$out")"
-# THE CONSUMER OVERRIDE the field exists to catch: raise no_green_checks_tier to R3 and the
-# remainder lands back on R3, so peeling the migration buys the PR nothing. The attribution is
+# THE CONSUMER OVERRIDE the field exists to catch: raise no_green_checks_tier to xhigh and the
+# remainder lands back on xhigh, so peeling the migration buys the PR nothing. The attribution is
 # unchanged — only the bound moves, and it is the bound the publisher gates on.
 ovmap="$SANDBOX/map-no-green-r3.json"
-jq '.reversibility.no_green_checks_tier = "R3"' "$SELF_DIR/../risk-map.v0.json" > "$ovmap"
+jq '.reversibility.no_green_checks_tier = "xhigh"' "$SELF_DIR/../risk-map.v0.json" > "$ovmap"
 out="$(rec 41 dev 'feat: schema' "$paths" ok PENDING | bash "$GRADER" --stdin --map "$ovmap" 2>/dev/null)"
-eq "…and an override that raises that rung to R3 is reported as R3" R3 \
+eq "…and an override that raises that rung to xhigh is reported as xhigh" xhigh \
    "$(jq -r '.risk.axes.reversibility.residual_tier' <<<"$out")"
 eq "…while the attribution itself is unchanged" '["db/migrations/0001_x.sql"]' \
    "$(jq -c '.risk.axes.reversibility.files' <<<"$out")"
-eq "…and the tier the override cannot touch is still R3 from the irreversible class" R3 \
+eq "…and the tier the override cannot touch is still xhigh from the irreversible class" xhigh \
    "$(jq -r '.risk.axes.reversibility.tier' <<<"$out")"
 # The three non-attributable rungs answer no peel question at all, so they carry no bound either.
 out="$(rec 42 dev 'feat: x' '[{"path":"src/x.go","additions":9,"deletions":0,"change_type":"MODIFIED"}]' ok SUCCESS | grade)"

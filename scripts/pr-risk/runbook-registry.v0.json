@@ -36,7 +36,7 @@
       "identity": { "logins": ["dependabot[bot]", "dependabot"],
                     "head_ref_patterns": ["dependabot/**"] },
       "_logins_note": "The bare `dependabot` is the ONE sanctioned exception to \"never name an App with a bare slug\", and it is here for the OFFLINE corpus, not the live path: pre-schema-4 rows carry the unsuffixed GraphQL login with no `author_is_bot`, so the grader cannot restore the suffix for them and only a literal entry matches. It costs little — the head_ref_patterns above additionally require a `dependabot/**` branch, so a same-named human would have to push one. Do NOT copy the pattern into a consumer registry.",
-      "_permitted_paths_note": "MUST stay a superset of the `deps` class in risk-map.v0.json. Two manifest lists that must agree are one list too many: when this one is SHORT, a Ruby or PHP dependabot PR fails paths_ok, falls back to `human`, and records a shape_failure that says dependabot failed to look like dependabot. The overall tier does not move — the path floor pins those manifests R3 anyway — but the noise trains readers to skip the one field designed to catch real impersonation.",
+      "_permitted_paths_note": "MUST stay a superset of the `deps` class in risk-map.v0.json. Two manifest lists that must agree are one list too many: when this one is SHORT, a Ruby or PHP dependabot PR fails paths_ok, falls back to `human`, and records a shape_failure that says dependabot failed to look like dependabot. The overall tier does not move — the path floor pins those manifests xhigh anyway — but the noise trains readers to skip the one field designed to catch real impersonation.",
       "permitted_paths": ["go.mod", "go.sum", "**/go.mod", "**/go.sum", "**/go.work*",
                           "**/package.json", "**/package-lock.json", "**/npm-shrinkwrap.json",
                           "**/pnpm-lock.yaml", "**/yarn.lock",
@@ -50,7 +50,7 @@
                  "title_regex": "(?i)^((chore|build|fix)\\(deps[^)]*\\):?|bump)[[:space:]]" },
       "daily_cap": 20,
       "lane": "dependency-bump",
-      "_note": "permitted_paths deliberately include the dependency manifests the path map pins R3 — worst-wins keeps the R3 floor. A runbook can never buy its way past the path map; provenance can only PROPOSE a tier."
+      "_note": "permitted_paths deliberately include the dependency manifests the path map pins xhigh — worst-wins keeps the xhigh floor. A runbook can never buy its way past the path map; provenance can only PROPOSE a tier."
     }
   ]
 }
