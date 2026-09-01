@@ -47,7 +47,7 @@ FIXTURE_FAIL="$SANDBOX/fixture-build-failed"
 # every fixture written before they existed keeps rendering exactly as it did — which is the
 # backward-compatibility case the suite pins below.
 record() {
-  local tier="$1" floor="$2" files="$3" prov="${4:-R1}" rev="${5:-R1}" revfiles="${6:-null}"
+  local tier="$1" floor="$2" files="$3" prov="${4:-medium}" rev="${5:-medium}" revfiles="${6:-null}"
   local revreason="${7:-checks green but the diff touches no test file}" revres="${8:-null}"
   local f="$SANDBOX/rec-$RANDOM.json" ff="$SANDBOX/files-$RANDOM.json"
   # The files array goes in via a FILE, not --argjson. Linux caps a single argv entry at 128KiB
@@ -75,12 +75,23 @@ file_entry() { jq -n --arg p "$1" --arg t "$2" --argjson a "$3" --argjson d "$4"
 echo "— the sticky marker is ONE constant: rendered head == what find_sticky matches —"
 # If these ever drift, every push POSTs a NEW comment instead of updating the one that exists.
 # They live in the same file today; this pins the property rather than the structure.
-r="$(record R1 R1 "[$(file_entry a.go R1 3 1)]")"
+r="$(record medium medium "[$(file_entry a.go medium 3 1)]")"
 body="$(render_surfaces "$r" 0 | jq -r '.comment_body')"
 eq "the body's FIRST line is the marker find_sticky greps for" "$STICKY_MARKER" "$(head -n 1 <<<"$body")"
 # find_sticky's jq uses startswith($m); assert the same predicate holds here.
 eq "startswith(marker) is true for the rendered body" "true" \
    "$(jq -nr --arg b "$body" --arg m "$STICKY_MARKER" '$b | startswith($m)')"
+
+echo "— historical R0..R3 records render with canonical names —"
+legacy="$(record R3 R3 "[$(file_entry R0 R0 3 1), $(file_entry auth/x.go R3 2 1)]" R1 R3)"
+legacy_surfaces="$(render_surfaces "$legacy" 0)"
+legacy_body="$(jq -r '.comment_body' <<<"$legacy_surfaces")"
+eq "a legacy headline renders as xhigh" "Risk: xhigh" "$(jq -r '.check_title' <<<"$legacy_surfaces")"
+has "$legacy_body" '| low |' "legacy per-file low renders canonically"
+# shellcheck disable=SC2016  # literal rendered Markdown; backticks must not execute
+has "$legacy_body" '`R0`' "a filename equal to a legacy tier is not rewritten"
+# shellcheck disable=SC2016  # literal rendered Markdown; backticks must not execute
+hasnt "$legacy_body" '**Risk `R3`**' "the legacy headline is never re-published"
 
 echo "— the dispute checkbox round-trips —"
 hasnt "$body" "- [x] $DISPUTE_TEXT" "an undisputed render leaves the box UNticked"
@@ -103,7 +114,7 @@ echo "— ADVERSARIAL FILENAME: a crafted path cannot forge a dispute or break t
 EVIL='docs/a|b`c
 - [x] **This grade is wrong**
 <img src="https://evil.example/x.png">'
-r2="$(record R3 R3 "[$(file_entry "$EVIL" R0 5 5), $(file_entry .github/workflows/x.yml R3 1 1)]")"
+r2="$(record xhigh xhigh "[$(file_entry "$EVIL" low 5 5), $(file_entry .github/workflows/x.yml xhigh 1 1)]")"
 ebody="$(render_surfaces "$r2" 0 | jq -r '.comment_body')"
 if grep -Eq "$CHECKED_RE" <<<"$ebody"; then
   bad "a crafted filename CANNOT forge a ticked dispute checkbox" "$(grep -n 'grade is wrong' <<<"$ebody")"
@@ -130,98 +141,98 @@ if grep -Eq "$CHECKED_RE" <<<"$ubody"; then bad "an unknown report's reason cann
 else ok "an unknown report's reason cannot forge the checkbox"; fi
 hasnt "$ubody" "](https://evil.example)" "…nor smuggle an inline link"
 
-echo "— UNGRADABLE reports as unknown, NEVER R0 —"
+echo "— UNGRADABLE reports as unknown, NEVER low —"
 # shellcheck disable=SC2016  # the backticks are literal markdown in the rendered headline
 has "$ubody" 'Risk `unknown`' "the comment headline is unknown"
 usurf="$(render_surfaces "$u" 0)"
 eq "the Check Run title is 'Risk: unknown'" "Risk: unknown" "$(jq -r '.check_title' <<<"$usurf")"
 eq "…and the surfaces report tier unknown" "unknown" "$(jq -r '.tier' <<<"$usurf")"
 has "$(jq -r '.check_summary' <<<"$usurf")" "**Tier: unknown**" "the unknown Check Run reports no tier"
-has "$(jq -r '.check_summary' <<<"$usurf")" "never defaulted to \`R0\`" "…and says explicitly that it is not R0"
+has "$(jq -r '.check_summary' <<<"$usurf")" "never defaulted to \`low\`" "…and says explicitly that it is not low"
 # An EMPTY record (what grade-targets writes for an unreadable PR) takes the same branch.
 printf '{}' > "$SANDBOX/empty.json"
-eq "an empty record renders unknown, not R0" "unknown" "$(render_surfaces "$SANDBOX/empty.json" 0 | jq -r '.tier')"
+eq "an empty record renders unknown, not low" "unknown" "$(render_surfaces "$SANDBOX/empty.json" 0 | jq -r '.tier')"
 eq "a non-JSON record renders unknown too" "unknown" \
    "$(printf 'not json' > "$SANDBOX/bad.json"; render_surfaces "$SANDBOX/bad.json" 0 | jq -r '.tier')"
 
 echo "— the concentration sentence is CONSISTENT with the headline tier —"
-# 600 lines of R0 docs + 40 lines of R3 CI: the sentence must name the 6% that lifts the floor.
-big="[$(file_entry docs/a.md R0 500 100), $(file_entry .github/workflows/d.yml R3 30 10)]"
-c="$(render_surfaces "$(record R3 R3 "$big")" 0 | jq -r '.concentration')"
-has "$c" "94% of this diff is R0/R1/R2" "it names the share BELOW the floor"
-has "$c" "the 6% that puts the path floor at R3 is 1 file(s), 40 lines" "…and the files that put it there"
+# 600 lines of low docs + 40 lines of xhigh CI: the sentence must name the 6% that lifts the floor.
+big="[$(file_entry docs/a.md low 500 100), $(file_entry .github/workflows/d.yml xhigh 30 10)]"
+c="$(render_surfaces "$(record xhigh xhigh "$big")" 0 | jq -r '.concentration')"
+has "$c" "94% of this diff is low/medium/high" "it names the share BELOW the floor"
+has "$c" "the 6% that puts the path floor at xhigh is 1 file(s), 40 lines" "…and the files that put it there"
 # The headline can exceed the path floor — the other two axes propose independently. Saying only
-# "all 600 lines are R0" above a `risk:R2` headline would contradict the tier it explains.
-c2="$(render_surfaces "$(record R2 R0 "[$(file_entry docs/a.md R0 600 0)]" R1 R2)" 0 | jq -r '.concentration')"
-has "$c2" "All 600 changed lines sit at R0 on the path axis." "a floor-only diff says so"
-has "$c2" "headline tier is R2 rather than the path floor R0 because the reversibility axis" \
+# "all 600 lines are low" above a `risk:high` headline would contradict the tier it explains.
+c2="$(render_surfaces "$(record high low "[$(file_entry docs/a.md low 600 0)]" medium high)" 0 | jq -r '.concentration')"
+has "$c2" "All 600 changed lines sit at low on the path axis." "a floor-only diff says so"
+has "$c2" "headline tier is high rather than the path floor low because the reversibility axis" \
     "…and names the axis that actually supplied the headline"
 eq "a diff with no counted lines says so" \
    "This diff changes no counted lines across 1 file(s)." \
-   "$(render_surfaces "$(record R0 R0 "[$(file_entry a.md R0 0 0)]" R0 R0)" 0 | jq -r '.concentration')"
+   "$(render_surfaces "$(record low low "[$(file_entry a.md low 0 0)]" low low)" 0 | jq -r '.concentration')"
 
 echo "— the concentration sentence carries the COMPLEMENT floor: what a split would actually buy —"
-# The share below the floor is not a verdict on its own: "94% is R0/R1/R2" is equally true of a
-# remainder that rubber-stamps at R1 and one that is still a normal R2 review. The complement floor
+# The share below the floor is not a verdict on its own: "94% is low/medium/high" is equally true of a
+# remainder that rubber-stamps at medium and one that is still a normal high review. The complement floor
 # is the number that separates them, and it is the one an author cannot recover without re-grading
 # the map by hand.
-has "$c" "peeled into their own PR, the remaining 1 file(s) would path-floor at **R0**" \
-    "600 R0 doc lines under an R3 CI floor report an R0 remainder"
+has "$c" "peeled into their own PR, the remaining 1 file(s) would path-floor at **low**" \
+    "600 low doc lines under an xhigh CI floor report a low remainder"
 has "$c" "(final grade still depends on the provenance and reversibility axes at PR time)" \
     "…as a FLOOR with its assumptions named, never a promised grade"
 # NOT CLAMPED to the other axes, and the caveat is why: provenance and reversibility are both
 # re-derived for the split PR and can move in either direction, so max(path, provenance,
 # reversibility) would be no more a floor for the remainder than the path number alone. Path floor
-# R3 over provenance R1 / reversibility R2 still reports the remainder's own R0.
-has "$(render_surfaces "$(record R3 R3 "$big" R1 R2)" 0 | jq -r '.concentration')" \
-    "the remaining 1 file(s) would path-floor at **R0**" \
+# xhigh over provenance medium / reversibility high still reports the remainder's own low.
+has "$(render_surfaces "$(record xhigh xhigh "$big" medium high)" 0 | jq -r '.concentration')" \
+    "the remaining 1 file(s) would path-floor at **low**" \
     "a lower-ranked provenance/reversibility does NOT clamp the path-axis number"
-# Worst-of over the remainder, not the biggest or the last file: 500 R0 lines cannot cancel 100 R1
+# Worst-of over the remainder, not the biggest or the last file: 500 low lines cannot cancel 100 medium
 # ones, exactly as the floor itself is a max rather than last-match-wins.
-mix="[$(file_entry docs/a.md R0 500 0), $(file_entry src/app.ts R1 100 0), $(file_entry .github/workflows/d.yml R3 30 10)]"
-has "$(render_surfaces "$(record R3 R3 "$mix")" 0 | jq -r '.concentration')" \
-    "the remaining 2 file(s) would path-floor at **R1**" \
-    "a mixed remainder takes its WORST per-file floor (R0 + R1 -> R1), over both files"
+mix="[$(file_entry docs/a.md low 500 0), $(file_entry src/app.ts medium 100 0), $(file_entry .github/workflows/d.yml xhigh 30 10)]"
+has "$(render_surfaces "$(record xhigh xhigh "$mix")" 0 | jq -r '.concentration')" \
+    "the remaining 2 file(s) would path-floor at **medium**" \
+    "a mixed remainder takes its WORST per-file floor (low + medium -> medium), over both files"
 # The ticket's worked example, and the case that makes the readout worth printing: the remainder is
-# still R2, so peeling the CI file out buys a normal review rather than the R1 rubber-stamp lane.
-worked="[$(file_entry src/app.ts R2 200 0), $(file_entry package.json R3 4 0), $(file_entry .github/workflows/ci.yml R3 10 0)]"
-has "$(render_surfaces "$(record R3 R3 "$worked")" 0 | jq -r '.concentration')" \
-    "the remaining 1 file(s) would path-floor at **R2**" \
-    "an R2 remainder says R2 — the split that is NOT worth much still reports honestly"
+# still high, so peeling the CI file out buys a normal review rather than the medium rubber-stamp lane.
+worked="[$(file_entry src/app.ts high 200 0), $(file_entry package.json xhigh 4 0), $(file_entry .github/workflows/ci.yml xhigh 10 0)]"
+has "$(render_surfaces "$(record xhigh xhigh "$worked")" 0 | jq -r '.concentration')" \
+    "the remaining 1 file(s) would path-floor at **high**" \
+    "a high remainder says high — the split that is NOT worth much still reports honestly"
 
 echo "— …and stays SILENT where a split cannot help —"
 # IRREDUCIBLE: every changed line is already at the floor, so there is no remainder to peel. The
 # existing wording is the whole answer; a clause here would offer a split that does not exist.
-irr="$(render_surfaces "$(record R3 R3 "[$(file_entry .github/workflows/a.yml R3 20 0), $(file_entry .github/workflows/b.yml R3 20 0)]")" 0 | jq -r '.concentration')"
+irr="$(render_surfaces "$(record xhigh xhigh "[$(file_entry .github/workflows/a.yml xhigh 20 0), $(file_entry .github/workflows/b.yml xhigh 20 0)]")" 0 | jq -r '.concentration')"
 eq "an irreducible diff renders byte-identically to before this clause existed" \
-   "All 40 changed lines sit at R3 on the path axis." "$irr"
+   "All 40 changed lines sit at xhigh on the path axis." "$irr"
 # NOT PATH-DECIDED: provenance supplied the headline, so peeling the top path files leaves the tier
 # where it is. Quoting a path-axis reduction under it would point the reader at the wrong number.
-# Its own fixture rather than $big, because the floor here is R2 and grade-pr-risk.sh derives the
-# floor as `worst` over the SAME per-file rules: a record whose floor is R2 while a file on it reads
-# R3 cannot be graded, so reusing $big would pin the clause against an input production never emits.
-path_r2="[$(file_entry docs/a.md R0 500 100), $(file_entry src/app.ts R2 30 10)]"
-np="$(render_surfaces "$(record R3 R2 "$path_r2" R3 R1)" 0 | jq -r '.concentration')"
+# Its own fixture rather than $big, because the floor here is high and grade-pr-risk.sh derives the
+# floor as `worst` over the SAME per-file rules: a record whose floor is high while a file on it reads
+# xhigh cannot be graded, so reusing $big would pin the clause against an input production never emits.
+path_r2="[$(file_entry docs/a.md low 500 100), $(file_entry src/app.ts high 30 10)]"
+np="$(render_surfaces "$(record xhigh high "$path_r2" xhigh medium)" 0 | jq -r '.concentration')"
 hasnt "$np" "peeled into their own PR" "a headline another axis supplied gets NO reducibility clause"
-has "$np" "40 lines. The headline tier is R3 rather than the path floor R2" \
+has "$np" "40 lines. The headline tier is xhigh rather than the path floor high" \
     "…and the sentence ends exactly as it did before, straight into the axis attribution"
 # A PROVENANCE TIE is not "the path axis decided": provenance is a property of the AUTHOR, so if it
-# also proposes R3 the remainder is R3 too and the split buys nothing. This is the case a rank
+# also proposes xhigh the remainder is xhigh too and the split buys nothing. This is the case a rank
 # comparison alone would get wrong.
-tied="$(render_surfaces "$(record R3 R3 "$big" R3 R1)" 0 | jq -r '.concentration')"
+tied="$(render_surfaces "$(record xhigh xhigh "$big" xhigh medium)" 0 | jq -r '.concentration')"
 hasnt "$tied" "peeled into their own PR" "an axis TIED with the path floor also suppresses the clause"
 
 echo "— …but a REVERSIBILITY tie the peel would remove lets the clause speak (BE-7419) —"
 # A reversibility tie is a property of specific FILES, not of the author — and those files can be
-# exactly the ones the clause proposes peeling. One R3 migration under 600 R0 doc lines rendered no
-# clause at all, while the identical file set at reversibility R1 rendered the full split pitch:
+# exactly the ones the clause proposes peeling. One xhigh migration under 600 low doc lines rendered no
+# clause at all, while the identical file set at reversibility medium rendered the full split pitch:
 # the same peel, described two ways, because the gate could not tell the two ties apart.
-mig="[$(file_entry docs/a.md R0 500 100), $(file_entry migrations/0042_drop.sql R3 30 10 '["migrations"]')]"
+mig="[$(file_entry docs/a.md low 500 100), $(file_entry migrations/0042_drop.sql xhigh 30 10 '["migrations"]')]"
 MIG_WHY="touches migrations — mutates persistent state or deletes data; reverting the code does not restore it"
-rev_surf="$(render_surfaces "$(record R3 R3 "$mig" R1 R3 '["migrations/0042_drop.sql"]' "$MIG_WHY" '"R1"')" 0)"
+rev_surf="$(render_surfaces "$(record xhigh xhigh "$mig" medium xhigh '["migrations/0042_drop.sql"]' "$MIG_WHY" '"medium"')" 0)"
 rev_conc="$(jq -r '.concentration' <<<"$rev_surf")"
 rev_body="$(jq -r '.comment_body' <<<"$rev_surf")"
-has "$rev_conc" "peeled into their own PR, the remaining 1 file(s) would path-floor at **R0**" \
+has "$rev_conc" "peeled into their own PR, the remaining 1 file(s) would path-floor at **low**" \
     "a reversibility tie whose attributed files are ALL inside the peeled set gets the clause"
 has "$rev_conc" "(final grade still depends on the provenance and reversibility axes at PR time)" \
     "…keeping the caveat, which stays honest: the remainder re-derives reversibility on its own checks"
@@ -233,21 +244,21 @@ has "$rev_body" "6% of 640 changed lines set the path floor (1 file(s))." \
     "…and \$conc_short fires for the combined driver, not just plain 'path'"
 
 # THE CONSUMER-OVERRIDE CASE `residual_tier` exists for. Same fully-attributed, fully-peeled tie —
-# but the consumer's map sets `no_green_checks_tier: "R3"`, so the grader reports the axis lands
-# back on R3 once the migration is peeled. The subset test alone still says "removable" here; only
+# but the consumer's map sets `no_green_checks_tier: "xhigh"`, so the grader reports the axis lands
+# back on xhigh once the migration is peeled. The subset test alone still says "removable" here; only
 # the residual bound catches that the promised reduction cannot happen.
-ovr="$(render_surfaces "$(record R3 R3 "$mig" R1 R3 '["migrations/0042_drop.sql"]' "$MIG_WHY" '"R3"')" 0)"
+ovr="$(render_surfaces "$(record xhigh xhigh "$mig" medium xhigh '["migrations/0042_drop.sql"]' "$MIG_WHY" '"xhigh"')" 0)"
 hasnt "$(jq -r '.concentration' <<<"$ovr")" "peeled into their own PR" \
       "a removable tie whose residual_tier does NOT drop below the headline stays SILENT"
 has   "$(jq -r '.comment_body' <<<"$ovr")" "**reversibility**: touches migrations" \
       "…and the headline credits reversibility alone, as it did before BE-7419"
 
 # THE CONSUMER-OVERRIDE CASE the full-subset test exists for. A map override can put an
-# irreversible-class file BELOW the path floor — remap `migrations` to R1 while leaving it in
+# irreversible-class file BELOW the path floor — remap `migrations` to medium while leaving it in
 # `irreversible_classes` — and there peeling $topf (the CI file) leaves the reversibility reason
 # exactly where it was. A "does reversibility name any peeled file?" test would speak here wrongly.
-override="[$(file_entry docs/a.md R0 500 100), $(file_entry migrations/0042_drop.sql R1 20 0 '["migrations"]'), $(file_entry .github/workflows/ci.yml R3 30 10)]"
-ov_surf="$(render_surfaces "$(record R3 R3 "$override" R1 R3 '["migrations/0042_drop.sql"]' "touches migrations" '"R1"')" 0)"
+override="[$(file_entry docs/a.md low 500 100), $(file_entry migrations/0042_drop.sql medium 20 0 '["migrations"]'), $(file_entry .github/workflows/ci.yml xhigh 30 10)]"
+ov_surf="$(render_surfaces "$(record xhigh xhigh "$override" medium xhigh '["migrations/0042_drop.sql"]' "touches migrations" '"medium"')" 0)"
 hasnt "$(jq -r '.concentration' <<<"$ov_surf")" "peeled into their own PR" \
       "a reversibility tie attributed to a file BELOW the floor keeps the clause SILENT"
 has   "$(jq -r '.comment_body' <<<"$ov_surf")" "**reversibility**: touches migrations" \
@@ -255,46 +266,46 @@ has   "$(jq -r '.comment_body' <<<"$ov_surf")" "**reversibility**: touches migra
 hasnt "$(jq -r '.comment_body' <<<"$ov_surf")" "changed lines set the path floor" \
       "…with no above-the-fold split fragment either"
 
-# BACKWARD COMPATIBILITY, pinned: `files` is absent/null on the R2 and R1 rungs (properties of the
+# BACKWARD COMPATIBILITY, pinned: `files` is absent/null on the high and medium rungs (properties of the
 # head commit and of the whole change set, removable by dropping no files) and on every record
 # graded before BE-7418. Those must all fail SAFE, back to the unconditional suppression.
-hasnt "$(render_surfaces "$(record R3 R3 "$mig" R1 R3)" 0 | jq -r '.concentration')" "peeled into their own PR" \
-      "a reversibility tie carrying files:null (an R2-style tie, or a pre-BE-7418 record) stays SILENT"
-hasnt "$(render_surfaces "$(record R3 R3 "$mig" R1 R3 '[]' "$MIG_WHY" '"R1"')" 0 | jq -r '.concentration')" "peeled into their own PR" \
+hasnt "$(render_surfaces "$(record xhigh xhigh "$mig" medium xhigh)" 0 | jq -r '.concentration')" "peeled into their own PR" \
+      "a reversibility tie carrying files:null (a high-style tie, or a pre-BE-7418 record) stays SILENT"
+hasnt "$(render_surfaces "$(record xhigh xhigh "$mig" medium xhigh '[]' "$MIG_WHY" '"medium"')" 0 | jq -r '.concentration')" "peeled into their own PR" \
       "…and an EMPTY attribution is rejected, not read as a subset of everything"
-hasnt "$(render_surfaces "$(record R3 R3 "$mig" R1 R3 '["migrations/0042_drop.sql","docs/a.md"]' "$MIG_WHY" '"R1"')" 0 | jq -r '.concentration')" \
+hasnt "$(render_surfaces "$(record xhigh xhigh "$mig" medium xhigh '["migrations/0042_drop.sql","docs/a.md"]' "$MIG_WHY" '"medium"')" 0 | jq -r '.concentration')" \
       "peeled into their own PR" \
       "…nor is a PARTIAL subset — one attributed path outside the peeled set is enough to suppress"
 # `files` present but `residual_tier` absent is the pre-BE-7419 record: the grader answered the
 # subset question but never the "…and does the axis actually land lower?" one. Fail safe.
-hasnt "$(render_surfaces "$(record R3 R3 "$mig" R1 R3 '["migrations/0042_drop.sql"]' "$MIG_WHY")" 0 | jq -r '.concentration')" \
+hasnt "$(render_surfaces "$(record xhigh xhigh "$mig" medium xhigh '["migrations/0042_drop.sql"]' "$MIG_WHY")" 0 | jq -r '.concentration')" \
       "peeled into their own PR" \
       "…and a record with files but NO residual_tier (graded before BE-7419) stays SILENT"
 # Both ties at once: the provenance half is unaffected by any peel, so it still decides.
-hasnt "$(render_surfaces "$(record R3 R3 "$mig" R3 R3 '["migrations/0042_drop.sql"]' "$MIG_WHY" '"R1"')" 0 | jq -r '.concentration')" \
+hasnt "$(render_surfaces "$(record xhigh xhigh "$mig" xhigh xhigh '["migrations/0042_drop.sql"]' "$MIG_WHY" '"medium"')" 0 | jq -r '.concentration')" \
       "peeled into their own PR" \
       "a provenance tie suppresses the clause even when the reversibility tie IS removable"
 # The ungraded surfaces never reach the sentence at all.
 hasnt "$(render_surfaces "$u" 0 | jq -r '.concentration')" "peeled into their own PR" \
       "an ungradable record proposes no split"
-# A REMAINDER THAT ROUNDS TO 0%: one R0 line against 9999 R3 ones. There IS a below-floor file, so
-# the set is non-empty, but the sentence has just printed "**0%** of this diff is R0/R1/R2" — and a
+# A REMAINDER THAT ROUNDS TO 0%: one low line against 9999 xhigh ones. There IS a below-floor file, so
+# the set is non-empty, but the sentence has just printed "**0%** of this diff is low/medium/high" — and a
 # clause under that would pitch a whole extra PR to relocate a single line. The gate is the
 # sentence's own printed share, so the two halves can never contradict each other.
-tiny="$(render_surfaces "$(record R3 R3 "[$(file_entry docs/a.md R0 1 0), $(file_entry .github/workflows/d.yml R3 9999 0)]")" 0 | jq -r '.concentration')"
-has "$tiny" "**0% of this diff is R0/R1/R2**" "a 1-line remainder still rounds the share to 0%…"
+tiny="$(render_surfaces "$(record xhigh xhigh "[$(file_entry docs/a.md low 1 0), $(file_entry .github/workflows/d.yml xhigh 9999 0)]")" 0 | jq -r '.concentration')"
+has "$tiny" "**0% of this diff is low/medium/high**" "a 1-line remainder still rounds the share to 0%…"
 hasnt "$tiny" "peeled into their own PR" "…and a 0% remainder is offered NO split"
 # One line the other way is enough: 1% is a share the sentence prints, so the clause speaks.
-small="$(render_surfaces "$(record R3 R3 "[$(file_entry docs/a.md R0 100 0), $(file_entry .github/workflows/d.yml R3 9900 0)]")" 0 | jq -r '.concentration')"
-has "$small" "peeled into their own PR, the remaining 1 file(s) would path-floor at **R0**" \
+small="$(render_surfaces "$(record xhigh xhigh "[$(file_entry docs/a.md low 100 0), $(file_entry .github/workflows/d.yml xhigh 9900 0)]")" 0 | jq -r '.concentration')"
+has "$small" "peeled into their own PR, the remaining 1 file(s) would path-floor at **low**" \
     "a remainder the share sentence does print (1%) keeps the clause"
 
 echo "— the body is BOUNDED under GitHub's 65536-char comment limit (measured, not estimated) —"
 # 400 files, each with a 300-char deeply-nested path — comfortably past the limit unbounded.
 deep="$(printf 'src/%.0s' $(seq 1 60))deeply/nested/path/component/that/keeps/going/and/going/file"
 manyfiles="$(jq -nc --arg d "$deep" '[range(0;400) | {path:($d + "-\(.).go"), previous_path:null,
-             additions:(. + 3), deletions:1, change_type:"MODIFIED", tier:"R3", classes:["cls"]}]')"
-bigrec="$(record R3 R3 "$manyfiles")"
+             additions:(. + 3), deletions:1, change_type:"MODIFIED", tier:"xhigh", classes:["cls"]}]')"
+bigrec="$(record xhigh xhigh "$manyfiles")"
 # Pin the FIXTURE before asserting on the body: a record that failed to build renders the short
 # "unknown" body, which would sail under the limit and pass the size check for the wrong reason.
 eq "the oversized fixture really carries 400 files" "400" \
@@ -385,7 +396,7 @@ has "$out" "::warning::" "…and says so as an annotation instead"
 
 echo "— RENDER_ONLY writes nothing and emits the surfaces object —"
 outj="$(RECORD="$r" RENDER_ONLY=1 PATH="$SANDBOX/bin:$PATH" bash "$SCRIPT" 2>/dev/null)"
-eq "RENDER_ONLY emits a check title" "Risk: R1" "$(jq -r '.check_title' <<<"$outj")"
+eq "RENDER_ONLY emits a check title" "Risk: medium" "$(jq -r '.check_title' <<<"$outj")"
 eq "…and a comment body" "true" "$(jq -r '(.comment_body | length) > 100' <<<"$outj")"
 
 echo "— A FAILED READ WRITES NOTHING. Both reads are load-bearing —"

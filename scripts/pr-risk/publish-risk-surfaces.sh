@@ -17,18 +17,18 @@
 # even that as a warning on the target rather than a failed grade.
 #
 # ── WHY A PER-FILE BREAKDOWN AT ALL ────────────────────────────────────────────────────────────
-# A bare `risk:R3` is unexplained: the only way to learn why was to open the Actions run. The
-# concentration sentence ("94% of this diff is R0/R1; the 6% that makes it R3 is these two files,
-# 40 lines") is what makes an R3 actionable rather than opaque, and what tells a reviewer when an
-# R3 is a technicality.
+# A bare `risk:xhigh` is unexplained: the only way to learn why was to open the Actions run. The
+# concentration sentence ("94% of this diff is low/medium; the 6% that makes it xhigh is these two files,
+# 40 lines") is what makes an xhigh actionable rather than opaque, and what tells a reviewer when an
+# xhigh is a technicality.
 #
 # THE BREAKDOWN IS THE PATH AXIS, AND SAYS SO. The shipped grade is
 # worst(path_floor, provenance, reversibility) and only the PATH axis is per-file at all — the
 # other two are properties of the PR, not of any file. So each row carries that file's PATH
 # FLOOR, and whenever the headline tier is above the path floor the sentence names the axis that
 # supplied it and quotes its reason. That is what keeps the sentence consistent with the headline
-# it sits under: without it, a diff of nothing but docs can headline R2 (no green checks) directly
-# above "all 40 changed lines are R0", and the explanation contradicts the tier it explains.
+# it sits under: without it, a diff of nothing but docs can headline high (no green checks) directly
+# above "all 40 changed lines are low", and the explanation contradicts the tier it explains.
 # The per-file floors come from grade-pr-risk.sh (`risk.axes.path_floor.files`), computed from
 # the SAME rules as the floor itself, so this file re-derives nothing and cannot drift into a
 # second grading model.
@@ -79,7 +79,7 @@
 #   REPO             owner/name of the repo holding the PR                          (required)
 #   PR_NUMBER        the PR number                                                  (required)
 #   RECORD           path to the graded record from grade-pr-risk.sh                (required)
-#                    `{}` / an unreadable record renders the UNKNOWN surfaces — never R0.
+#                    `{}` / an unreadable record renders the UNKNOWN surfaces — never low.
 #   HEAD_SHA         head commit for the Check Run (read from the API when empty)
 #   PUBLISH_CHECK    1 = create the Check Run                       (default 0)
 #   PUBLISH_COMMENT  1 = create/update the sticky comment           (default 0)
@@ -159,7 +159,24 @@ cat <<'JQ'
       (flat | if length > 160 then .[0:160] + "…" else . end)
       | if test("[`\\\\]") then md_escape else "`" + gsub("\\|"; "\\|") + "`" end;
 
-    def tier_rank: {"R0":0,"R1":1,"R2":2,"R3":3}[.] // 3;
+    def canonical_tier:
+      if type != "string" then .
+      else {"R0":"low","R1":"medium","R2":"high","R3":"xhigh"}[.] // . end;
+    def canonical_axis:
+      if type != "object" then .
+      else (if has("tier") then .tier |= canonical_tier else . end)
+        | (if has("residual_tier") then .residual_tier |= canonical_tier else . end)
+        | (if (.files | type) == "array"
+           then .files |= map(if type == "object" and has("tier") then .tier |= canonical_tier else . end)
+           else . end)
+      end;
+    def canonical_risk:
+      if type != "object" then .
+      else (if has("tier") then .tier |= canonical_tier else . end)
+        | (if (.axes | type) == "object" then .axes |= map_values(canonical_axis) else . end)
+      end;
+    def tier_rank:
+      canonical_tier | if type == "string" then {"low":0,"medium":1,"high":2,"xhigh":3}[.] // 3 else 3 end;
     # Does an axis TIE the headline? One definition, called once per axis, so the tie
     # classification, the attribution tail and the reducibility gate can never disagree about
     # which axes tied. Takes the headline as a parameter rather than closing over `$tier`
@@ -168,20 +185,21 @@ cat <<'JQ'
     # a boolean or a number raises "Cannot index object with boolean" — a hard jq error that its
     # own `// 3` fallback cannot catch, aborting the whole render rather than degrading. The old
     # per-axis `($A2.tier // null)` normalization this replaced covered the `false` case only; a
-    # type test covers every non-tier shape, and is identical on the R0–R3 strings the grader emits.
+    # type test covers every non-tier shape, and is identical on the low–xhigh strings the grader emits.
     def ties($t; $headline):
       (($t | type) == "string") and (($headline | type) == "string")
       and (($t | tier_rank) == ($headline | tier_rank));
     def pct($p; $w): if $w <= 0 then 0 else (100 * $p / $w) | round end;
 
     . as $r
-    | ($r.risk // null) as $R
+    # Historical records remain renderable, but every surface uses canonical tier names.
+    | (($r.risk // null) | canonical_risk) as $R
     | (($R.status // "unknown") == "ok" and ($R.tier // null) != null) as $graded
     | ($R.tier // null) as $tier
     | ($R.axes.path_floor // null) as $A1
     | ($R.axes.provenance // null) as $A2
     | ($R.axes.reversibility // null) as $A3
-    | ($A1.tier // "R0") as $floor
+    | ($A1.tier // "low") as $floor
     | ([$A1.files[]? | . + {lines: ((.additions // 0) + (.deletions // 0))}]) as $files
     | ([$files[] | .lines] | add // 0) as $total
     | ([$files[] | select((.tier | tier_rank) >= ($floor | tier_rank))]) as $topf
@@ -197,7 +215,7 @@ cat <<'JQ'
     # follows the remainder); a reversibility tie is a property of specific FILES, which may be
     # exactly the files the clause proposes peeling off. Bound separately here so the gate can
     # treat them differently; `$drivers` keeps the combined list because the attribution tail's
-    # wording ("the provenance and reversibility axis proposes R3") is about which axes tied, and
+    # wording ("the provenance and reversibility axis proposes xhigh") is about which axes tied, and
     # is correct either way. Order is provenance-then-reversibility because `$drivers[0].r` is the
     # reason both the tail and the headline print.
     | ties($A2.tier; $tier) as $prov_tie
@@ -210,20 +228,20 @@ cat <<'JQ'
     # the clause peels — the remainder provably carries neither the path floor nor the reversibility
     # reason, so suppressing the clause would be a false negative rather than caution.
     #
-    # `null` (an older record, or the R2/R1 rungs, where "no green rollup" is a property of the
+    # `null` (an older record, or the high/medium rungs, where "no green rollup" is a property of the
     # HEAD COMMIT and "no test touched" of the whole change set) reads as NOT removable — the
     # fail-safe back to the unconditional suppression this replaces.
     #
     # THE SUBSET TEST IS LOAD-BEARING, not a formality: a consumer map override can put an
-    # irreversible-class file BELOW the path floor (remap `migrations` to R1 while leaving it in
+    # irreversible-class file BELOW the path floor (remap `migrations` to medium while leaving it in
     # `irreversible_classes`), and there peeling `$topf` leaves the reversibility reason exactly
     # where it was. `[]` is a subset of every set, so it is rejected by the non-empty test rather
     # than reading as "yes, removable" — the same direction the grader's own `null` fallback points.
     #
     # AND THE SUBSET TEST IS NOT ENOUGH ON ITS OWN. It proves the reason CURRENTLY ATTRIBUTED goes
     # with the peel; it does not prove the axis lands lower, because the rungs the remainder falls
-    # to are map-configurable and a consumer may have raised one (`no_green_checks_tier: "R3"` puts
-    # the remainder straight back on R3, and the head commit's rollup is not something a peel can
+    # to are map-configurable and a consumer may have raised one (`no_green_checks_tier: "xhigh"` puts
+    # the remainder straight back on xhigh, and the head commit's rollup is not something a peel can
     # change). `axes.reversibility.residual_tier` is the grader's own map-aware bound on where the
     # axis lands after the peel; requiring it to rank BELOW the headline is what turns "this reason
     # is removable" into "this tie is removable". Missing (a record graded before the field existed)
@@ -245,7 +263,7 @@ cat <<'JQ'
               | all($rf[]; (type == "string") and ($keep[.] == true)))) as $rev_removable
     # THE PATH AXIS DECIDED: it is graded, the headline IS the floor, and no tie survives the peel.
     # A provenance tie deliberately still reads as "not decided by path" — if provenance also
-    # proposes R3, peeling the R3 files out changes nothing, and promising a reduction there would
+    # proposes xhigh, peeling the xhigh files out changes nothing, and promising a reduction there would
     # be the one wrong answer. A reversibility tie reads the same way UNLESS its own attributed
     # files are all inside `$topf` AND the axis provably lands lower once they go, in which case the
     # split removes both reasons at once. This is the SPLIT-ELIGIBILITY half; `$pitches_split` below
@@ -264,14 +282,14 @@ cat <<'JQ'
     # number that separates "peel 2 files and the rest rubber-stamps" from "peel 2 files and the
     # rest is still a normal review" is not otherwise recoverable without re-grading by hand.
     | ([$files[] | select((.tier | tier_rank) < ($floor | tier_rank))]) as $below
-    # The printed label is the RECORD's own tier string, never `"R\(rank)"` re-rendered from the
-    # number: `tier_rank` deliberately collapses anything outside R0–R3 to 3, so re-rendering would
-    # print an unrecognized tier as a confident `R3`. `max_by` applies the same worst-of rule while
+    # The printed label is the RECORD's own tier string, never reconstructed from the
+    # number: `tier_rank` deliberately collapses anything outside low–xhigh to 3, so re-rendering would
+    # print an unrecognized tier as a confident `xhigh`. `max_by` applies the same worst-of rule while
     # keeping the label tied to the data rather than to the enum's present shape.
     | (if ($below | length) > 0 then ($below | max_by(.tier | tier_rank) | .tier) else null end) as $comp_tier
     # The below-floor share, bound once because the clause and the sentence it hangs off have to
     # agree about it. A remainder that ROUNDS TO 0% of the diff gets no split pitch, or the sentence
-    # reads "**0%** of this diff is R0/R1/R2 … peeled into their own PR, the remaining 1 file(s)" —
+    # reads "**0%** of this diff is low/medium/high … peeled into their own PR, the remaining 1 file(s)" —
     # offering to relocate a line it has just called nothing. The gate is the sentence's OWN printed
     # number rather than a threshold picked here, so the two can never disagree.
     | (pct($total - $toplines; $total)) as $below_pct
@@ -297,7 +315,7 @@ cat <<'JQ'
        elif ($floor | tier_rank) == 0 or ($total - $toplines) <= 0
        then "All \($total) changed lines sit at \($floor) on the path axis."
        else "**\($below_pct)% of this diff is "
-            + ([range(0; ($floor | tier_rank))] | map("R\(.)") | join("/"))
+            + (["low","medium","high","xhigh"][0:($floor | tier_rank)] | join("/"))
             + "**; the \(pct($toplines; $total))% that puts the path floor at \($floor) is "
             + "\($topf | length) file(s), \($toplines) lines"
             # A FLOOR WITH ITS ASSUMPTIONS NAMED, never a promised grade. The OTHER TWO AXES are
@@ -341,7 +359,7 @@ cat <<'JQ'
            "",
            ($R.reason // "the graded record was empty or unreadable — nothing was graded" | md_text(1000)),
            "",
-           "An ungradable PR is reported as `unknown`, never defaulted to `R0`: a PR whose inputs we could not read is exactly the PR that might touch auth. Push again or re-run the check to retry.",
+           "An ungradable PR is reported as `unknown`, never defaulted to `low`: a PR whose inputs we could not read is exactly the PR that might touch auth. Push again or re-run the check to retry.",
            "",
            "This check is advisory: its conclusion is always `neutral`, so it never fails and never blocks a merge." ]
          | join("\n"))
@@ -364,7 +382,7 @@ cat <<'JQ'
          "<sub>Advisory · never fails a check or blocks a merge · re-grades on every push, updated in place.</sub>" ]) as $tail
 
     # WHICH AXIS TO NAME IN THE HEADLINE, and its human reason. `$R.reason` is deliberately NOT
-    # used here: it is the machine trace ("worst of path_floor=R1, provenance=R2, ..."), which
+    # used here: it is the machine trace ("worst of path_floor=medium, provenance=high, ..."), which
     # restates the tier instead of explaining it. The formula and that trace both still appear
     # inside the <details>, so nothing is lost by leading with the axis that actually decided.
     # BOTH AXES, when a removable reversibility tie let the clause speak. This branch is checked
@@ -395,14 +413,14 @@ cat <<'JQ'
        then {n: "path", r: ($A1.reason // ""), path: true}
        else {n: null, r: "", path: false} end) as $driver
     # The concentration clause, cut to a headline-sized fragment — and shown ONLY when the path
-    # axis is what drove the tier. Quoting "14% of lines set the path floor at R1" under an R2
+    # axis is what drove the tier. Quoting "14% of lines set the path floor at medium" under a high
     # headline that provenance produced points the reader at the wrong number.
     # IT COUNTS PATH-FLOOR FILES, so it says so. Under the combined `path and reversibility`
     # headline, `axes.reversibility.files` may be a strict SUBSET of $topf (the migration supplied
     # the reversibility reason; the CI file beside it only met the path floor) — so "N file(s)
     # carry it", with "it" reading back to a headline naming both axes, would credit more files
     # with the reversibility reason than actually supplied it. The path-floor count is the honest
-    # one for both spellings, and it matches the long form's "the X% that puts the path floor at R3
+    # one for both spellings, and it matches the long form's "the X% that puts the path floor at xhigh
     # is N file(s)" word for word.
     | (if $driver.path
           and ($files | length) > 0 and $total > 0
@@ -429,7 +447,7 @@ cat <<'JQ'
               "| file | +/- | path tier | matched classes |", "|---|---|---|---|" ])
        else
          [ $marker, "",
-           "**Risk `unknown`** · advisory — this pull request could not be graded: \($R.reason // "the graded record was empty or unreadable" | md_text(240)). An ungradable PR is never defaulted to `R0`; push again or re-run to retry." ]
+           "**Risk `unknown`** · advisory — this pull request could not be graded: \($R.reason // "the graded record was empty or unreadable" | md_text(240)). An ungradable PR is never defaulted to `low`; push again or re-run to retry." ]
        end) as $head
     | ([ $files[] ] | sort_by([ -(.tier | tier_rank), -(.lines) ])) as $shown
     | ([ $shown[0:50][]
