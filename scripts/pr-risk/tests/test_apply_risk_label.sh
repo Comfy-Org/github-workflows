@@ -23,24 +23,36 @@ run() { # <tier> [label_map] -> stdout (the target label); rc in $?
 }
 
 echo "— default map —"
-eq "R0 maps to risk:R0" "risk:R0" "$(run R0)"
-eq "R3 maps to risk:R3" "risk:R3" "$(run R3)"
+eq "low maps to risk:low" "risk:low" "$(run low)"
+eq "xhigh maps to risk:xhigh" "risk:xhigh" "$(run xhigh)"
 eq "unknown maps to risk:ungraded" "risk:ungraded" "$(run unknown)"
 eq "empty tier reads as unknown" "risk:ungraded" "$(run '')"
 eq "literal null reads as unknown" "risk:ungraded" "$(run null)"
 
-echo "— caller remap (a 1-indexed R1..R4 scheme is one input) —"
-MAP='R0=risk:R1,R1=risk:R2,R2=risk:R3,R3=risk:R4,unknown=risk:ungraded'
-eq "R0 remaps to risk:R1" "risk:R1" "$(run R0 "$MAP")"
-eq "R3 remaps to risk:R4" "risk:R4" "$(run R3 "$MAP")"
+echo "— caller remap —"
+MAP='low=risk:1,medium=risk:2,high=risk:3,xhigh=risk:4,unknown=risk:ungraded'
+eq "low remaps to risk:1" "risk:1" "$(run low "$MAP")"
+eq "xhigh remaps to risk:4" "risk:4" "$(run xhigh "$MAP")"
+
+echo "— deprecated aliases remain compatible —"
+LEGACY_MAP='R0=risk:low,R1=risk:medium,R2=risk:high,R3=risk:xhigh,unknown=risk:ungraded'
+eq "legacy tier input normalizes to the canonical label" "risk:low" "$(run R0)"
+eq "legacy LABEL_MAP keys still resolve" "risk:xhigh" "$(run xhigh "$LEGACY_MAP")"
+REPO=test/repo PR_NUMBER=7 TIER=R3 LABEL_MAP="$LEGACY_MAP" DRY_RUN=1 \
+  bash "$SCRIPT" >/dev/null 2>"$SANDBOX/legacy.err"
+if grep -F 'deprecated' "$SANDBOX/legacy.err" >/dev/null; then
+  ok "legacy tier and label-map use emit deprecation warnings"
+else
+  bad "legacy tier and label-map use emit deprecation warnings" "$(cat "$SANDBOX/legacy.err")"
+fi
 
 echo "— validation refuses bad input before any write —"
 run R7 >/dev/null 2>&1;                              eq "bad tier exits 2" 2 "$?"
-run R2 'R0=a,R1=b,R2=c,R3=d' >/dev/null 2>&1;        eq "map missing unknown exits 2" 2 "$?"
-run R2 'R0=,R1=b,R2=c,R3=d,unknown=e' >/dev/null 2>&1; eq "empty label exits 2" 2 "$?"
-REPO='bad repo' PR_NUMBER=7 TIER=R1 DRY_RUN=1 bash "$SCRIPT" >/dev/null 2>&1
+run high 'low=a,medium=b,high=c,xhigh=d' >/dev/null 2>&1;        eq "map missing unknown exits 2" 2 "$?"
+run high 'low=,medium=b,high=c,xhigh=d,unknown=e' >/dev/null 2>&1; eq "empty label exits 2" 2 "$?"
+REPO='bad repo' PR_NUMBER=7 TIER=medium DRY_RUN=1 bash "$SCRIPT" >/dev/null 2>&1
 eq "bad repo exits 2" 2 "$?"
-REPO=test/repo PR_NUMBER=x TIER=R1 DRY_RUN=1 bash "$SCRIPT" >/dev/null 2>&1
+REPO=test/repo PR_NUMBER=x TIER=medium DRY_RUN=1 bash "$SCRIPT" >/dev/null 2>&1
 eq "bad pr number exits 2" 2 "$?"
 
 echo "— the write path: ONE atomic PUT of the whole label set —"
@@ -52,7 +64,7 @@ echo "— the write path: ONE atomic PUT of the whole label set —"
 # can assert on the requests actually built.
 mkdir -p "$SANDBOX/bin"
 export GH_LOG="$SANDBOX/gh.log" CURRENT_LABELS="$SANDBOX/current.txt"
-printf 'risk:R0\nkeep-me\n' > "$CURRENT_LABELS"
+printf 'risk:low\nkeep-me\n' > "$CURRENT_LABELS"
 cat > "$SANDBOX/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 # The real `gh api --paginate ... --jq '[.[].name]'` answers with a JSON ARRAY per page, and the
@@ -83,10 +95,10 @@ STUB
 chmod +x "$SANDBOX/bin/gh"
 
 # Label names are still a PATH SEGMENT in the repo-label probe, and GitHub label names legally
-# contain spaces, `/`, `#`, `?` and `%` — so a caller remap like `R3=risk high/urgent` must still be
+# contain spaces, `/`, `#`, `?` and `%` — so a caller remap like `xhigh=risk high/urgent` must still be
 # encoded there, while the PUT carries the raw names as form fields.
-MAP2='R0=risk:R0,R1=risk:R1,R2=risk:R2,R3=risk high/urgent,unknown=risk:ungraded'
-out="$(PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 TIER=R3 LABEL_MAP="$MAP2" \
+MAP2='low=risk:low,medium=risk:medium,high=risk:high,xhigh=risk high/urgent,unknown=risk:ungraded'
+out="$(PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 TIER=xhigh LABEL_MAP="$MAP2" \
         bash "$SCRIPT" 2>/dev/null)"
 eq "the raw name is what gets returned/logged" "risk high/urgent" "$out"
 if grep -q 'risk%20high%2Furgent' "$GH_LOG"; then
@@ -105,7 +117,7 @@ case "$put" in
   *) bad "and the FORM FIELD carries the raw name, not the encoding" "$put" ;;
 esac
 case "$put" in
-  *'risk:R0'*) bad "the stale owned label is absent from the PUT" "$put" ;;
+  *'risk:low'*) bad "the stale owned label is absent from the PUT" "$put" ;;
   *) ok "the stale owned label is absent from the PUT (it is dropped BY the replace)" ;;
 esac
 # The delete/add pair is precisely what the race exploited; neither may survive anywhere.
@@ -123,12 +135,12 @@ echo "— the race shape: an EMPTY current set still syncs with a PUT, never a P
 # This is the assertion that pins the race closed. With no owned label present the tempting
 # "optimization" is an additive POST (nothing to remove, so why replace?). That reintroduces the
 # exact interleaving: run A and run B both read {}, both see nothing stale, both POST — and the PR
-# ends up carrying risk:R1 AND risk:R2 at once. A PUT cannot do that: whichever writer lands second
+# ends up carrying risk:medium AND risk:high at once. A PUT cannot do that: whichever writer lands second
 # replaces the set, so the PR always ends with exactly one owned label.
 : > "$GH_LOG"; : > "$CURRENT_LABELS"
-outrace="$(PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 TIER=R1 bash "$SCRIPT" 2>/dev/null)"
-eq "an empty current set still returns the target" "risk:R1" "$outrace"
-if grep -q -- '-X PUT repos/test/repo/issues/7/labels -f labels\[\]=risk:R1' "$GH_LOG"; then
+outrace="$(PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 TIER=medium bash "$SCRIPT" 2>/dev/null)"
+eq "an empty current set still returns the target" "risk:medium" "$outrace"
+if grep -q -- '-X PUT repos/test/repo/issues/7/labels -f labels\[\]=risk:medium' "$GH_LOG"; then
   ok "with nothing stale the write is STILL a PUT of the full set"
 else bad "with nothing stale the write is STILL a PUT of the full set" "$(tr '\n' '|' < "$GH_LOG")"; fi
 if grep -q -- '-X POST repos/test/repo/issues/7/labels' "$GH_LOG"; then
@@ -136,11 +148,11 @@ if grep -q -- '-X POST repos/test/repo/issues/7/labels' "$GH_LOG"; then
 else ok "and never an additive POST (that is the interleaving)"; fi
 
 echo "— unowned labels are preserved verbatim, disputes included —"
-: > "$GH_LOG"; printf 'risk:R1\nrisk-dispute\nbug\n' > "$CURRENT_LABELS"
-PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 TIER=R3 bash "$SCRIPT" >/dev/null 2>&1
+: > "$GH_LOG"; printf 'risk:medium\nrisk-dispute\nbug\n' > "$CURRENT_LABELS"
+PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 TIER=xhigh bash "$SCRIPT" >/dev/null 2>&1
 put3="$(grep -- '-X PUT repos/test/repo/issues/7/labels ' "$GH_LOG")"
 eq "the PUT carries exactly the unowned labels plus the new target" \
-   "api -X PUT repos/test/repo/issues/7/labels -f labels[]=risk-dispute -f labels[]=bug -f labels[]=risk:R3" \
+   "api -X PUT repos/test/repo/issues/7/labels -f labels[]=risk-dispute -f labels[]=bug -f labels[]=risk:xhigh" \
    "$put3"
 
 echo "— first use: the label is pre-created before the sync —"
@@ -180,8 +192,8 @@ done
 exit 0
 STUB
 chmod +x "$SANDBOX/bin404label/gh"
-: > "$GH_LOG"; printf 'risk:R0\n' > "$CURRENT_LABELS"
-PATH="$SANDBOX/bin404label:$PATH" REPO=test/repo PR_NUMBER=7 TIER=R2 bash "$SCRIPT" >/dev/null 2>&1
+: > "$GH_LOG"; printf 'risk:low\n' > "$CURRENT_LABELS"
+PATH="$SANDBOX/bin404label:$PATH" REPO=test/repo PR_NUMBER=7 TIER=high bash "$SCRIPT" >/dev/null 2>&1
 create_line="$(grep -n -- '-X POST repos/test/repo/labels ' "$GH_LOG" | head -1 | cut -d: -f1)"
 put_line="$(grep -n -- '-X PUT repos/test/repo/issues/7/labels ' "$GH_LOG" | head -1 | cut -d: -f1)"
 if [ -n "$create_line" ] && [ -n "$put_line" ] && [ "$create_line" -lt "$put_line" ]; then
@@ -196,37 +208,45 @@ echo "— a PR the OLD race already double-labeled is HEALED, not read as in-syn
 # be, twice over: PRs graded before the atomic PUT landed can still be carrying two `risk:*` labels
 # right now, and a human can hand-add a second one at any time. A bare `has "$TARGET"` check calls
 # both of those states in-sync and writes nothing, so the contradiction never gets repaired.
-: > "$GH_LOG"; printf 'risk:R0\nrisk:R2\nkeep-me\n' > "$CURRENT_LABELS"
-PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 TIER=R2 bash "$SCRIPT" >/dev/null 2>&1
+: > "$GH_LOG"; printf 'risk:low\nrisk:high\nkeep-me\n' > "$CURRENT_LABELS"
+PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 TIER=high bash "$SCRIPT" >/dev/null 2>&1
 putheal="$(grep -- '-X PUT repos/test/repo/issues/7/labels ' "$GH_LOG")"
 eq "the extra owned label is squashed down to the one target" \
-   "api -X PUT repos/test/repo/issues/7/labels -f labels[]=keep-me -f labels[]=risk:R2" \
+   "api -X PUT repos/test/repo/issues/7/labels -f labels[]=keep-me -f labels[]=risk:high" \
    "$putheal"
 
-# Already-correct label: no write at all beyond the read.
+echo "— deprecated default labels are retired during the first canonical re-grade —"
 : > "$GH_LOG"; printf 'risk:R2\nkeep-me\n' > "$CURRENT_LABELS"
-outsync="$(PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 TIER=R2 bash "$SCRIPT" 2>/dev/null)"
+PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 TIER=high bash "$SCRIPT" >/dev/null 2>&1
+putlegacy="$(grep -- '-X PUT repos/test/repo/issues/7/labels ' "$GH_LOG")"
+eq "the old default label is replaced by its canonical label" \
+   "api -X PUT repos/test/repo/issues/7/labels -f labels[]=keep-me -f labels[]=risk:high" \
+   "$putlegacy"
+
+# Already-correct label: no write at all beyond the read.
+: > "$GH_LOG"; printf 'risk:high\nkeep-me\n' > "$CURRENT_LABELS"
+outsync="$(PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 TIER=high bash "$SCRIPT" 2>/dev/null)"
 rcsync=$?
 eq "an in-sync label writes nothing" 1 "$(wc -l < "$GH_LOG" | tr -d ' ')"
 eq "an in-sync run exits 0" 0 "$rcsync"
-eq "an in-sync run still prints the target" "risk:R2" "$outsync"
+eq "an in-sync run still prints the target" "risk:high" "$outsync"
 
 echo "— label identity is CASE-INSENSITIVE on GitHub, so the ownership match must be too —"
-# GitHub will not let a repo hold both `risk:R2` and `Risk:R2` — they are the same label. A
+# GitHub will not let a repo hold both `risk:high` and `Risk:high` — they are the same label. A
 # case-sensitive match therefore misreads a variant spelling (an older LABEL_MAP, or a
 # hand-created label) as "not the target AND not owned", which breaks the contract twice: the
 # in-sync short-circuit never fires so EVERY run issues the destructive PUT, and the variant is
 # carried through that PUT next to the new target — two `risk:*` labels, the exact state this
 # shape exists to make impossible.
-: > "$GH_LOG"; printf 'Risk:R2\nkeep-me\n' > "$CURRENT_LABELS"
-outci="$(PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 TIER=R2 bash "$SCRIPT" 2>/dev/null)"
+: > "$GH_LOG"; printf 'Risk:high\nkeep-me\n' > "$CURRENT_LABELS"
+outci="$(PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 TIER=high bash "$SCRIPT" 2>/dev/null)"
 eq "a case-variant of the TARGET reads as in-sync (no write)" 1 "$(wc -l < "$GH_LOG" | tr -d ' ')"
-eq "and the run still prints the canonical target" "risk:R2" "$outci"
-: > "$GH_LOG"; printf 'Risk:R0\nkeep-me\n' > "$CURRENT_LABELS"
-PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 TIER=R2 bash "$SCRIPT" >/dev/null 2>&1
+eq "and the run still prints the canonical target" "risk:high" "$outci"
+: > "$GH_LOG"; printf 'Risk:low\nkeep-me\n' > "$CURRENT_LABELS"
+PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 TIER=high bash "$SCRIPT" >/dev/null 2>&1
 putci="$(grep -- '-X PUT repos/test/repo/issues/7/labels ' "$GH_LOG")"
 eq "a case-variant of a STALE owned label is dropped, not carried through beside the target" \
-   "api -X PUT repos/test/repo/issues/7/labels -f labels[]=keep-me -f labels[]=risk:R2" \
+   "api -X PUT repos/test/repo/issues/7/labels -f labels[]=keep-me -f labels[]=risk:high" \
    "$putci"
 
 echo "— a broken jq must fail the run, never degrade the PUT to target-only —"
@@ -244,9 +264,9 @@ for a in "$@"; do [ "$a" = --argjson ] && { echo 'jq: error: synthetic failure' 
 exec "$REAL_JQ" "$@"
 STUB
 chmod +x "$SANDBOX/binjqfail/jq"
-: > "$GH_LOG"; printf 'risk:R0\nrisk-dispute\nkeep-me\n' > "$CURRENT_LABELS"
+: > "$GH_LOG"; printf 'risk:low\nrisk-dispute\nkeep-me\n' > "$CURRENT_LABELS"
 REAL_JQ="$(command -v jq)" PATH="$SANDBOX/binjqfail:$PATH" \
-  REPO=test/repo PR_NUMBER=7 TIER=R2 bash "$SCRIPT" >/dev/null 2>&1
+  REPO=test/repo PR_NUMBER=7 TIER=high bash "$SCRIPT" >/dev/null 2>&1
 eq "a failing carry-through filter exits 4" 4 "$?"
 if grep -q -- '-X PUT' "$GH_LOG"; then
   bad "and no PUT is issued at all" "$(grep -- '-X PUT' "$GH_LOG" | tr '\n' '|')"
@@ -264,7 +284,7 @@ printf '%s\n' "$*" >> "$GH_LOG"
 for a in "$@"; do
   case "$a" in
     *issues/*/labels*) [ "${1:-}" = api ] && [[ " $* " != *" -X POST "* && " $* " != *" -X PUT "* ]] \
-                         && printf '["keep\\nme","risk:R0"]\n'
+                         && printf '["keep\\nme","risk:low"]\n'
                        exit 0 ;;
   esac
 done
@@ -272,7 +292,7 @@ exit 0
 STUB
 chmod +x "$SANDBOX/binnl/gh"
 : > "$GH_LOG"
-PATH="$SANDBOX/binnl:$PATH" REPO=test/repo PR_NUMBER=7 TIER=R2 bash "$SCRIPT" >/dev/null 2>&1
+PATH="$SANDBOX/binnl:$PATH" REPO=test/repo PR_NUMBER=7 TIER=high bash "$SCRIPT" >/dev/null 2>&1
 eq "the two-line name stays ONE label (a split would make three)" 2 \
    "$(grep -o -- '-f labels\[\]=' "$GH_LOG" | wc -l | tr -d ' ')"
 if grep -q -- '-f labels\[\]=me' "$GH_LOG"; then
@@ -293,9 +313,9 @@ for a in "$@"; do [ "$a" = -e ] && { echo 'jq: error: synthetic failure' >&2; ex
 exec "$REAL_JQ" "$@"
 STUB
 chmod +x "$SANDBOX/binjqerr/jq"
-: > "$GH_LOG"; printf 'risk:R2\nrisk:R0\nkeep-me\n' > "$CURRENT_LABELS"
+: > "$GH_LOG"; printf 'risk:high\nrisk:low\nkeep-me\n' > "$CURRENT_LABELS"
 REAL_JQ="$(command -v jq)" PATH="$SANDBOX/binjqerr:$PATH" \
-  REPO=test/repo PR_NUMBER=7 TIER=R2 bash "$SCRIPT" >/dev/null 2>&1
+  REPO=test/repo PR_NUMBER=7 TIER=high bash "$SCRIPT" >/dev/null 2>&1
 eq "a failing membership check exits 4, never a silent in-sync 0" 4 "$?"
 if grep -q -- '-X PUT' "$GH_LOG"; then
   bad "and issues no PUT off an unanswered check" "$(grep -- '-X PUT' "$GH_LOG" | tr '\n' '|')"
@@ -335,8 +355,8 @@ done
 exit 0
 STUB
 chmod +x "$SANDBOX/bin403probe/gh"
-: > "$GH_LOG"; printf 'risk:R0\nkeep-me\n' > "$CURRENT_LABELS"
-probeerr="$(PATH="$SANDBOX/bin403probe:$PATH" REPO=test/repo PR_NUMBER=7 TIER=R2 \
+: > "$GH_LOG"; printf 'risk:low\nkeep-me\n' > "$CURRENT_LABELS"
+probeerr="$(PATH="$SANDBOX/bin403probe:$PATH" REPO=test/repo PR_NUMBER=7 TIER=high \
               bash "$SCRIPT" 2>&1 >/dev/null)"
 case "$probeerr" in
   *"NON-404"*"Resource not accessible by integration"*)
@@ -386,7 +406,7 @@ done
 exit 0
 STUB
 chmod +x "$SANDBOX/bin403/gh"
-err="$(PATH="$SANDBOX/bin403:$PATH" REPO=test/repo PR_NUMBER=7 TIER=R1 bash "$SCRIPT" 2>&1 >/dev/null)"
+err="$(PATH="$SANDBOX/bin403:$PATH" REPO=test/repo PR_NUMBER=7 TIER=medium bash "$SCRIPT" 2>&1 >/dev/null)"
 rc=$?
 eq "a 403 on the label sync exits 4" 4 "$rc"
 case "$err" in

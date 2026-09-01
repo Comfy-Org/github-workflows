@@ -2,8 +2,9 @@
 # apply-risk-label.sh — sync a PR's risk label to the computed tier. The one write the
 # reusable pr-risk.yml workflow performs.
 #
-# OWNERSHIP CONTRACT: this script owns EXACTLY the label names in LABEL_MAP's values, and a PR it
-# has written to carries EXACTLY ONE of them. That holds under concurrency BY CONSTRUCTION, not by
+# OWNERSHIP CONTRACT: this script owns the label names in LABEL_MAP's values plus the four retired
+# default labels (`risk:R0`..`risk:R3`) during their deprecation window, and a PR it has written to
+# carries EXACTLY ONE current mapped label. That holds under concurrency BY CONSTRUCTION, not by
 # luck: the sync is a single atomic `PUT .../labels`, which replaces the PR's whole label set in one
 # request, so there is no delete-then-add window for a second run to interleave into. Two runs
 # racing (a `pr_numbers` batch and a `pull_request` event run sit in different concurrency groups,
@@ -36,11 +37,9 @@
 # before-snapshot and the after-read, so the diff that would have to catch it is empty by
 # construction.
 #
-# ONE MORE LIMIT, on a different axis: ownership is defined by the CURRENT LABEL_MAP. Change a
-# caller's `label_map` and labels applied under the old map are, by definition, no longer owned —
-# they are carried through every future PUT beside the new target, and nothing here will clean them
-# up. Remapping is a one-time repo-side cleanup (delete the retired label names), not something a
-# re-grade heals.
+# ONE MORE LIMIT, on a different axis: ownership is defined by the CURRENT LABEL_MAP plus the four
+# known former defaults. Those defaults are removed by the first canonical re-grade; custom values
+# from an older map are unknowable and still need one-time repo-side cleanup.
 #
 # The label is applied with the plain GITHUB_TOKEN on purpose: GITHUB_TOKEN-applied labels do
 # not fire `labeled` workflow triggers, which makes the shadow check incapable of starting a
@@ -50,11 +49,11 @@
 # Inputs (env):
 #   REPO        owner/name of the repo holding the PR                        (required)
 #   PR_NUMBER   the PR number                                                (required)
-#   TIER        R0 | R1 | R2 | R3 | unknown ('' and 'null' read as unknown)  (required)
+#   TIER        low | medium | high | xhigh | unknown ('' and 'null' read as unknown)  (required)
+#               R0 | R1 | R2 | R3 remain accepted as deprecated aliases.
 #   LABEL_MAP   tier=label pairs, comma-separated                            (optional)
-#               default: R0=risk:R0,R1=risk:R1,R2=risk:R2,R3=risk:R3,unknown=risk:ungraded
-#               Relabeling (e.g. a 1-indexed R1..R4 scheme) is a caller-side remap of the
-#               VALUES only; tier keys are fixed R0..R3 + unknown everywhere else.
+#               default: low=risk:low,medium=risk:medium,high=risk:high,xhigh=risk:xhigh,unknown=risk:ungraded
+#               Legacy R0..R3 keys remain accepted as deprecated aliases.
 #   DRY_RUN     1 = print the plan, write nothing
 #   GH_TOKEN    token for gh (in CI: the job's GITHUB_TOKEN; needs pull-requests: write for
 #               the label add/remove on the PR — the labels endpoint is dual-mapped and
@@ -78,7 +77,7 @@ PR_NUMBER="${PR_NUMBER:-}"
 TIER="${TIER:-}"
 LABEL_MAP="${LABEL_MAP:-}"
 DRY_RUN="${DRY_RUN:-0}"
-DEFAULT_MAP="R0=risk:R0,R1=risk:R1,R2=risk:R2,R3=risk:R3,unknown=risk:ungraded"
+DEFAULT_MAP="low=risk:low,medium=risk:medium,high=risk:high,xhigh=risk:xhigh,unknown=risk:ungraded"
 
 log()  { printf '[apply-risk-label] %s\n' "$*" >&2; }
 die()  { printf '[apply-risk-label] ERROR %s\n' "$*" >&2; exit 2; }
@@ -90,29 +89,61 @@ fail() { printf '[apply-risk-label] FAIL %s\n' "$*" >&2; exit 4; }
 command -v jq >/dev/null 2>&1 || die "jq not found on PATH"
 [ "$DRY_RUN" = 1 ] || command -v gh >/dev/null 2>&1 || die "gh not found on PATH"
 
+canonical_tier() {
+  case "$1" in
+    R0) echo low ;; R1) echo medium ;; R2) echo high ;; R3) echo xhigh ;; *) echo "$1" ;;
+  esac
+}
+legacy_tier() {
+  case "$1" in
+    low) echo R0 ;; medium) echo R1 ;; high) echo R2 ;; xhigh) echo R3 ;; *) echo "$1" ;;
+  esac
+}
+
 # '' and 'null' arrive when the grader refused a confident tier — both are the unknown lane.
 case "$TIER" in ""|null) TIER="unknown" ;; esac
-case "$TIER" in R0|R1|R2|R3|unknown) ;; *) die "bad TIER '$TIER' (want R0..R3 or unknown)" ;; esac
+case "$TIER" in
+  R0|R1|R2|R3)
+    log "WARN tier '$TIER' is deprecated; use '$(canonical_tier "$TIER")'"
+    TIER="$(canonical_tier "$TIER")" ;;
+  low|medium|high|xhigh|unknown) ;;
+  *) die "bad TIER '$TIER' (want low..xhigh or unknown)" ;;
+esac
 
 [ -n "$LABEL_MAP" ] || LABEL_MAP="$DEFAULT_MAP"
+if printf '%s' "$LABEL_MAP" | tr ',' '\n' | awk -F= '$1 ~ /^R[0-3]$/ { found=1 } END { exit !found }'; then
+  log "WARN LABEL_MAP keys R0..R3 are deprecated; use low, medium, high, xhigh"
+fi
 
 # Parse "tier=label,tier=label" without eval. All five tiers must resolve: a map that forgets
 # `unknown` would leave ungradeable PRs silently unlabeled, which reads as "grader never ran".
 label_for() { # <tier> -> label on stdout, rc 1 when unmapped
-  printf '%s' "$LABEL_MAP" | tr ',' '\n' | awk -F= -v t="$1" '$1 == t { print $2; found=1 } END { exit !found }'
+  local legacy
+  legacy="$(legacy_tier "$1")"
+  printf '%s' "$LABEL_MAP" | tr ',' '\n' | awk -F= -v t="$1" -v legacy="$legacy" '
+    $1 == t { exact=$2; exact_found=1 }
+    $1 == legacy { alias=$2; alias_found=1 }
+    END {
+      if (exact_found) print exact
+      else if (alias_found) print alias
+      else exit 1
+    }'
 }
 OWNED=()
-for t in R0 R1 R2 R3 unknown; do
+for t in low medium high xhigh unknown; do
   l="$(label_for "$t")" || die "LABEL_MAP is missing a label for tier '$t' (got '$LABEL_MAP')"
   [ -n "$l" ] || die "LABEL_MAP maps tier '$t' to an empty label"
   OWNED+=("$l")
 done
+# Known former defaults are safe to retire automatically; custom historical label-map values are
+# unknowable and still need the one-time cleanup documented in the README.
+OWNED+=("risk:R0" "risk:R1" "risk:R2" "risk:R3")
 TARGET="$(label_for "$TIER")"
 
 # Colors keyed by TIER (not label text, which callers may remap): green .. red, gray unknown.
 color_for() {
   case "$1" in
-    R0) echo "0e8a16" ;; R1) echo "fbca04" ;; R2) echo "d93f0b" ;; R3) echo "b60205" ;;
+    low) echo "0e8a16" ;; medium) echo "fbca04" ;; high) echo "d93f0b" ;; xhigh) echo "b60205" ;;
     *)  echo "cfd3d7" ;;
   esac
 }
@@ -124,7 +155,7 @@ if [ "$DRY_RUN" = 1 ]; then
 fi
 
 # A label name is a PATH SEGMENT in the repo-label probe below, and GitHub label names legally
-# contain spaces, `/`, `#`, `?` and `%`. A caller who remaps `R3=risk high` would otherwise build a
+# contain spaces, `/`, `#`, `?` and `%`. A caller who remaps `xhigh=risk high` would otherwise build a
 # malformed or misrouted URL: the probe misses, and a rename paints the check red or spams
 # pre-creates. Encoded for the path only — the raw name is what we log, compare and send as a form
 # field. (The label sync itself needs no encoding: its path carries only the PR number, and the
@@ -155,7 +186,7 @@ current="$(ghq api --paginate "repos/$REPO/issues/$PR_NUMBER/labels?per_page=100
            | jq -sc 'add // []')" \
   || fail "could not read labels on $REPO#$PR_NUMBER: $(gherr)"
 
-# GitHub label identity is CASE-INSENSITIVE (you cannot hold both `risk:R2` and `Risk:R2`), so every
+# GitHub label identity is CASE-INSENSITIVE (you cannot hold both `risk:high` and `Risk:high`), so every
 # comparison against the snapshot has to be too. A case variant — an older LABEL_MAP spelling, or a
 # hand-created label — otherwise reads as "not the target AND not owned": the in-sync short-circuit
 # never fires, so every run issues the PUT (widening the residual window the header confines to
