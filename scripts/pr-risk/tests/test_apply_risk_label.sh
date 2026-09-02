@@ -33,6 +33,8 @@ echo "— caller remap (a 1-indexed R1..R4 scheme is one input) —"
 MAP='R0=risk:R1,R1=risk:R2,R2=risk:R3,R3=risk:R4,unknown=risk:ungraded'
 eq "R0 remaps to risk:R1" "risk:R1" "$(run R0 "$MAP")"
 eq "R3 remaps to risk:R4" "risk:R4" "$(run R3 "$MAP")"
+NAMED_MAP='R0=risk:low,R1=risk:medium,R2=risk:high,R3=risk:xhigh,unknown=risk:unknown'
+eq "unknown remaps to risk:unknown" "risk:unknown" "$(run unknown "$NAMED_MAP")"
 
 echo "— validation refuses bad input before any write —"
 run R7 >/dev/null 2>&1;                              eq "bad tier exits 2" 2 "$?"
@@ -205,8 +207,7 @@ eq "the extra owned label is squashed down to the one target" \
 
 echo "— a remap retires the default grade label instead of keeping both —"
 : > "$GH_LOG"; printf 'risk:R2\nkeep-me\n' > "$CURRENT_LABELS"
-SEVERITY_MAP='R0=risk:low,R1=risk:medium,R2=risk:high,R3=risk:xhigh,unknown=risk:ungraded'
-PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 TIER=R2 LABEL_MAP="$SEVERITY_MAP" \
+PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 TIER=R2 LABEL_MAP="$NAMED_MAP" \
   bash "$SCRIPT" >/dev/null 2>&1
 putremap="$(grep -- '-X PUT repos/test/repo/issues/7/labels ' "$GH_LOG")"
 eq "the old default is replaced by the mapped label" \

@@ -123,7 +123,7 @@ fail the caller's next run at startup.
 | `repo_runbooks_path` | `.github/risk-runbooks.json` | Consumer runbook-registry override, read from the PR **base ref**. |
 
 For `risk:low` through `risk:xhigh`, set `RISK_LABEL_MAP` to
-`R0=risk:low,R1=risk:medium,R2=risk:high,R3=risk:xhigh,unknown=risk:ungraded`.
+`R0=risk:low,R1=risk:medium,R2=risk:high,R3=risk:xhigh,unknown=risk:unknown`.
 The next grade removes a default `risk:R0`..`risk:R3` label and leaves only the
 mapped label. Custom names from an older map still need one-time cleanup.
 
