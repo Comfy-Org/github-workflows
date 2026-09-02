@@ -78,6 +78,19 @@ Anything unreadable grades `unknown` (labeled `risk:ungraded`), never a
 confident tier, and never "the axes that did resolve" — a PR whose file list we
 could not read is exactly the PR that might touch auth.
 
+## Migrating legacy label assignments
+
+Preview the fixed R0–R3 to named-label migration, then apply it:
+
+```bash
+bash scripts/pr-risk/migrate-risk-labels.sh OWNER/REPO
+bash scripts/pr-risk/migrate-risk-labels.sh OWNER/REPO --apply
+```
+
+The CLI paginates all PRs, adds and verifies each named label before removing
+its legacy label, preserves unrelated labels, and fails if any assignment could
+not be migrated or remains afterward.
+
 Two CI-specific mechanics worth knowing:
 
 - **The grading run excludes itself from the check rollup it reads** (its own

@@ -48,7 +48,7 @@ jobs:
           persist-credentials: false
 
       - name: shellcheck
-        run: shellcheck -x grade-pr-risk.sh apply-risk-label.sh grade-targets.sh resolve-enabled.sh tests/test_grade_pr_risk.sh tests/test_apply_risk_label.sh tests/test_grade_targets.sh tests/test_resolve_enabled.sh tests/test_pin_contract.sh publish-risk-surfaces.sh tests/test_publish_risk_surfaces.sh
+        run: shellcheck -x grade-pr-risk.sh apply-risk-label.sh migrate-risk-labels.sh grade-targets.sh resolve-enabled.sh tests/test_grade_pr_risk.sh tests/test_apply_risk_label.sh tests/test_migrate_risk_labels.sh tests/test_grade_targets.sh tests/test_resolve_enabled.sh tests/test_pin_contract.sh publish-risk-surfaces.sh tests/test_publish_risk_surfaces.sh
 
       - name: default map + registry parse and validate
         # The shipped defaults must pass the grader's own structural validation:
@@ -62,6 +62,9 @@ jobs:
 
       - name: label suite
         run: bash tests/test_apply_risk_label.sh
+
+      - name: label migration suite
+        run: bash tests/test_migrate_risk_labels.sh
 
       - name: targets suite
         # The orchestration layer behind pr-risk.yml: base-ref resolution, the per-repo override
