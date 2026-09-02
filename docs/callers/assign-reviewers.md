@@ -11,6 +11,10 @@ Matches a PR's changed paths against a **caller-repo** `.github/reviewers.yml`
 `vars.REVIEWER_GROWTH_POOL` member for new-folk randomization, and assigns the top
 `num_reviewers`.
 
+Routing runs for every eligible author by default. Set
+`vars.REVIEWER_AUTHOR_ALLOWLIST` to scope it to an opt-in set of PR authors
+instead — the middle ground between "on for everyone" and off.
+
 > **Despite the name, it writes the ASSIGNEE field, not reviewer requests.**
 > Comfy-Org routes and alerts people via assignees, so an entry under
 > `reviewers:` means "gets assigned".
@@ -29,6 +33,7 @@ buy fork support** — see the fork gotcha below.
 | `vars.REVIEWER_GROWTH_POOL` | Optional. Logins for new-folk randomization. |
 | `vars.REVIEWER_LOAD_CAP` | Optional. Max open reviews before steering off. |
 | `vars.REVIEWER_EXCLUDE` | Optional. Logins to hard-exclude. |
+| `vars.REVIEWER_AUTHOR_ALLOWLIST` | Optional. Whitespace-separated logins. When non-empty, only these **authors'** PRs are routed; everyone else's is skipped. Unset ⇒ every eligible author is routed. |
 
 ## Caller
 
@@ -118,6 +123,16 @@ this workflow reads `.github/reviewers.yml` from the head SHA — that combinati
 turns the expertise map into a real escalation path, so it is not offered.
 [`ci-assign-reviewers.yml`](../../.github/workflows/ci-assign-reviewers.yml) in
 this repo is the worked example.
+
+**`REVIEWER_AUTHOR_ALLOWLIST` fails closed — a typo silently switches routing
+off.** Every login that is not in the list is skipped, so a misspelled entry (or a
+list that names nobody who actually opens PRs here) looks exactly like the
+automation being disabled: green checks, no assignees, no error. Entries are
+matched case-insensitively and a leading `@` is tolerated, but nothing else is
+guessed at. After setting it, confirm on a real PR that the run logs
+`is in REVIEWER_AUTHOR_ALLOWLIST — routing`. To turn scoping back off, clear the
+variable rather than emptying it to whitespace — both work, but an unset variable
+is the unambiguous "no scoping" state.
 
 **A matched bucket does not fall back to `default_pool`.** `default_pool` is
 consulted only when *no* rule matched the changed paths. The author is dropped
