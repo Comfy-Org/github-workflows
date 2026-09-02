@@ -32,6 +32,12 @@ name: Assign Reviewers (reusable)
 # read from the PR head SHA via the contents API, so a PR's own edits to the
 # config take effect on that PR.
 #
+# AUTHOR SCOPING: vars.REVIEWER_AUTHOR_ALLOWLIST, when set, restricts routing to
+# that list of PR authors and skips everyone else. It is the opt-in alternative to
+# switching the automation off for the whole repo when only some people want their
+# PRs routed (BE-11575). Unset/empty keeps the historical run-for-every-author
+# behavior, so adding it breaks no existing caller.
+#
 # SELECTION: changed paths -> union of matching experts (else default_pool) ->
 # drop the author + vars.REVIEWER_EXCLUDE -> rank ascending by each candidate's
 # open assignee load (steering off anyone at/over vars.REVIEWER_LOAD_CAP) ->
@@ -55,10 +61,12 @@ name: Assign Reviewers (reusable)
 #         CLOUD_CODE_BOT_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
 #
 # Caller-side configuration:
-#   vars.APP_ID                 - CLOUD_CODE_BOT app id (same as cursor-review-auto-label)
-#   vars.REVIEWER_GROWTH_POOL   - whitespace-separated logins for new-folk randomization
-#   vars.REVIEWER_LOAD_CAP      - max open reviews before a candidate is steered off (optional)
-#   vars.REVIEWER_EXCLUDE       - whitespace-separated logins to hard-exclude (optional)
+#   vars.APP_ID                    - CLOUD_CODE_BOT app id (same as cursor-review-auto-label)
+#   vars.REVIEWER_GROWTH_POOL      - whitespace-separated logins for new-folk randomization
+#   vars.REVIEWER_LOAD_CAP         - max open reviews before a candidate is steered off (optional)
+#   vars.REVIEWER_EXCLUDE          - whitespace-separated logins to hard-exclude (optional)
+#   vars.REVIEWER_AUTHOR_ALLOWLIST - whitespace-separated logins; when non-empty, ONLY
+#                                    these authors' PRs are routed at all (optional)
 
 on:
   workflow_call:
@@ -114,6 +122,7 @@ jobs:
           GROWTH_POOL: ${{ vars.REVIEWER_GROWTH_POOL }}
           LOAD_CAP: ${{ vars.REVIEWER_LOAD_CAP }}
           EXCLUDE: ${{ vars.REVIEWER_EXCLUDE }}
+          AUTHOR_ALLOWLIST: ${{ vars.REVIEWER_AUTHOR_ALLOWLIST }}
         with:
           # Authenticate the octokit with the APP token so assignment works on
           # fork PRs (read-only GITHUB_TOKEN would 403).
@@ -127,6 +136,26 @@ jobs:
             // --- 1. Early exits (never fail the PR) ---
             if (pr.draft) { core.info('PR is a draft — skipping.'); return; }
             if (pr.user && pr.user.type === 'Bot') { core.info('Author is a bot — skipping.'); return; }
+            const authorLogin = pr.user && pr.user.login;
+            // Opt-in author scoping (BE-11575). UNSET/empty => route every
+            // eligible author, exactly as before, so no existing caller changes
+            // behavior until it sets the var. NON-EMPTY => route ONLY these
+            // authors and skip every other PR with an informational log, never a
+            // failing check. This is the knob that lets a repo keep the routing
+            // on for the people who want it instead of turning it off for all.
+            // Logins are matched case-insensitively and tolerate a leading `@`
+            // because this gate fails CLOSED: one typo'd entry would otherwise
+            // silently disable routing repo-wide with no error to notice.
+            const normalizeLogin = (s) => s.replace(/^@/, '').toLowerCase();
+            const authorAllowlist = (process.env.AUTHOR_ALLOWLIST || '')
+              .split(/\s+/).filter(Boolean).map(normalizeLogin);
+            if (authorAllowlist.length > 0) {
+              if (!authorLogin || !authorAllowlist.includes(normalizeLogin(authorLogin))) {
+                core.info(`Author ${authorLogin || '(unknown)'} is not in REVIEWER_AUTHOR_ALLOWLIST — skipping.`);
+                return;
+              }
+              core.info(`Author ${authorLogin} is in REVIEWER_AUTHOR_ALLOWLIST — routing.`);
+            }
             const skipLabel = process.env.SKIP_LABEL;
             const labels = (pr.labels || []).map((l) => l.name);
             if (skipLabel && labels.includes(skipLabel)) {
@@ -143,7 +172,6 @@ jobs:
             // onto an already-assigned PR. Author-only (or no) assignees fall
             // through to the normal blame-based pick; multiple bot picks are
             // intentional (load-spread) and are NOT capped here.
-            const authorLogin = pr.user && pr.user.login;
             // Live read of the non-author assignees. Returns `null` when the API
             // read fails: callers treat "can't confirm" as "skip", never as
             // "fall back to the payload" — the payload is exactly the value that
