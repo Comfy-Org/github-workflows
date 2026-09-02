@@ -1,11 +1,10 @@
 name: PR Risk Grade (reusable)
 
 # Reusable ADVISORY PR risk grader — the shadow-check rung of the PR risk-grading ladder.
-# Grades every PR event into a tier R0 (safest) .. R3 (riskiest) and syncs ONE label
-# (`risk:R0` .. `risk:R3`, or `risk:ungraded` when an input was unreadable). That label is
-# the entire product: nothing is gated, nothing is blocked, nothing merges, no comment is
-# posted. Humans look at the label and agree or disagree; disagreement is recorded by adding
-# the `risk-dispute` label (which this workflow never touches) plus a comment saying why.
+# Grades every PR event into a tier R0 (safest) .. R3 (riskiest) and syncs ONE visible label
+# (`risk:R0` .. `risk:R3`, or `risk:ungraded` when an input was unreadable). A human can override
+# that visible label with `risk-dispute:low` .. `risk-dispute:xhigh`; the computed tier remains in
+# the grade record. Nothing is gated, blocked, routed, commented, or merged.
 #
 # grade = worst(path_floor, provenance, reversibility) — three deterministic axes; the worst
 # tier wins, so no axis can move a PR into a safer lane than another axis put it. No LLM, no
@@ -67,8 +66,8 @@ name: PR Risk Grade (reusable)
 #
 # ON-DEMAND GRADING (`pr_number` / `pr_numbers`): supply a PR number and that PR is graded with
 # no `pull_request` event involved — which is how a repo enrolling mid-stream grades the open
-# queue it already has, and how a PR is re-graded after a `.github/risk.json` change or a
-# `risk-dispute`. Absent, the workflow reads the event exactly as before. Three things differ on
+# queue it already has, and how a PR is re-graded after a `.github/risk.json` change. Absent, the
+# workflow reads the event exactly as before. Three things differ on
 # the by-number path, all of them deliberate:
 #   * FORK PRs ARE GRADED. The `head.repo.full_name == github.repository` clause callers put in
 #     their `if:` is a TOKEN guard, not a policy one: a fork's `pull_request` run gets a
@@ -117,7 +116,7 @@ name: PR Risk Grade (reusable)
 # labels on a PR under one `label_map`; remapping `label_map` orphans the old names, which is a
 # one-time repo-side cleanup. What the shape does cost is a narrower residual: the PUT is built from
 # a snapshot read, so a NON-owned label added by someone else in the read→PUT window is dropped
-# (`risk-dispute` included) and one removed in it is resurrected. That window opens only on a run
+# (`risk-dispute:*` included) and one removed in it is resurrected. That window opens only on a run
 # that actually changes the grade and is roughly one API round-trip — about three on the first
 # grade in a repo, where the label pre-create sits inside it. The drop is recorded on the PR
 # timeline as an `unlabeled` event, so re-add a dispute that happens to land in that instant.
@@ -147,7 +146,7 @@ name: PR Risk Grade (reusable)
 #   name: CI - PR Risk Grade
 #   on:
 #     pull_request:
-#       types: [opened, synchronize, reopened, ready_for_review]
+#       types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
 #     workflow_dispatch:
 #       inputs:
 #         pr_number:
@@ -213,7 +212,9 @@ name: PR Risk Grade (reusable)
 #       # can hand a Dependabot-triggered run an Actions secret.
 #       if: >-
 #         github.event_name != 'pull_request' ||
-#         github.event.pull_request.head.repo.full_name == github.repository
+#         (((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+#           startsWith(github.event.label.name, 'risk-dispute:')) &&
+#          github.event.pull_request.head.repo.full_name == github.repository)
 #       permissions:
 #         contents: read
 #         issues: write         # create the risk:* labels repo-side on first use
@@ -284,8 +285,8 @@ on:
           `pull_request` run: with no number supplied the target, the base ref and every emitted
           label are exactly what they were before this input existed. Supplying it is what makes
           grading possible without a `pull_request` event — the enrollment backfill of an
-          already-open queue, and the manual re-grade after a risk-map change or a
-          `risk-dispute`. Bot-authored and fork PRs ARE graded on this path (see the header).
+          already-open queue, and the manual re-grade after a risk-map change.
+          Bot-authored and fork PRs ARE graded on this path (see the header).
           Typed `string` rather than `number` because `workflow_dispatch` inputs arrive as
           strings, and because an empty string is what lets the fall-through to the event's own
           number stay a single expression.
@@ -378,10 +379,9 @@ on:
 
           Ticking the checkbox applies `risk-grade-disputed` on the next grade, and a re-grade
           preserves the tick rather than resetting it. That label is DISTINCT from the
-          human-owned `risk-dispute` convention, which the grader still never touches: one is a
-          machine-maintained mirror of a checkbox, rewritten on every grade; the other is a
-          human's own label. Needs no permission beyond the `pull-requests: write` the grade job
-          already holds for the label.
+          human-owned `risk-dispute:*` override labels: one is a machine-maintained mirror of a
+          checkbox, while the others select the visible risk tier. Needs no permission beyond the
+          `pull-requests: write` the grade job already holds for the label.
         type: boolean
         required: false
         default: false
@@ -1104,7 +1104,7 @@ jobs:
               jq -r '"| #\(.pr) | \(.tier // "—") | \(.label // "—") | `\(.base_ref // "—")` | \(.waited)s | \(.note // "") |"' "$RESULTS"
             fi
             echo
-            echo "This label routes nothing and gates nothing. Disagree with the grade? Add the \`risk-dispute\` label and say why in a comment — the grader never touches that label."
+            echo "This label routes nothing and gates nothing. Override it with \`risk-dispute:low\`…\`risk-dispute:xhigh\`; remove the override to restore the computed label."
           } >> "$GITHUB_STEP_SUMMARY"
 
   # THE ONE JOB THAT HOLDS `checks: write`, and it reads NOTHING from a pull request. Its whole
