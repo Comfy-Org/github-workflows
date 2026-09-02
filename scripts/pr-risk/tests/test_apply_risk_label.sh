@@ -143,6 +143,27 @@ eq "the PUT carries exactly the unowned labels plus the new target" \
    "api -X PUT repos/test/repo/issues/7/labels -f labels[]=risk-dispute -f labels[]=bug -f labels[]=risk:R3" \
    "$put3"
 
+echo "— a named dispute overrides the visible risk label until removed —"
+NAMED_MAP='R0=risk:low,R1=risk:medium,R2=risk:high,R3=risk:xhigh,unknown=risk:unknown'
+: > "$GH_LOG"; printf 'risk:high\nrisk-dispute:medium\nbug\n' > "$CURRENT_LABELS"
+outdispute="$(PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 TIER=R2 \
+  LABEL_MAP="$NAMED_MAP" bash "$SCRIPT" 2>/dev/null)"
+eq "risk-dispute:medium overrides computed R2" "risk:medium" "$outdispute"
+putdispute="$(grep -- '-X PUT repos/test/repo/issues/7/labels ' "$GH_LOG")"
+eq "the PUT preserves the dispute and replaces the visible risk label" \
+  "api -X PUT repos/test/repo/issues/7/labels -f labels[]=risk-dispute:medium -f labels[]=bug -f labels[]=risk:medium" \
+  "$putdispute"
+
+: > "$GH_LOG"; printf 'risk:medium\nbug\n' > "$CURRENT_LABELS"
+outrestored="$(PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 TIER=R2 \
+  LABEL_MAP="$NAMED_MAP" bash "$SCRIPT" 2>/dev/null)"
+eq "removing the dispute restores computed R2" "risk:high" "$outrestored"
+
+: > "$GH_LOG"; printf 'risk:low\nrisk-dispute:low\nrisk-dispute:xhigh\n' > "$CURRENT_LABELS"
+outmultiple="$(PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 TIER=R0 \
+  LABEL_MAP="$NAMED_MAP" bash "$SCRIPT" 2>/dev/null)"
+eq "the highest of multiple disputes wins" "risk:xhigh" "$outmultiple"
+
 echo "— first use: the label is pre-created before the sync —"
 # A PUT creates the ASSOCIATION but never the label's color or description, so enrollment still
 # needs the explicit repo-side create on first use — and it must land BEFORE the sync.
