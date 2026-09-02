@@ -114,8 +114,10 @@ name: PR Risk Grade (reusable)
 # last-writer-wins with still EXACTLY ONE `risk:*` label — possibly the staler tier, which gates
 # nothing meanwhile and which the next grade re-syncs (on the LAST push there is no next grade, so
 # re-dispatch on `pr_number` if a final grade looks wrong). It can no longer leave two contradictory
-# labels on a PR under one `label_map`; remapping `label_map` orphans the old names, which is a
-# one-time repo-side cleanup. What the shape does cost is a narrower residual: the PUT is built from
+# labels on a PR under one `label_map`. A caller can switch maps without a PR via
+# `vars.RISK_LABEL_MAP`; the first remapped grade retires the default `risk:R0`..`risk:R3` labels.
+# Custom names from an older map still need one-time repo-side cleanup. What the shape does cost is
+# a narrower residual: the PUT is built from
 # a snapshot read, so a NON-owned label added by someone else in the read→PUT window is dropped
 # (`risk-dispute` included) and one removed in it is resurrected. That window opens only on a run
 # that actually changes the grade and is roughly one API round-trip — about three on the first
@@ -330,7 +332,8 @@ on:
           (comma-separated). Default:
           `R0=risk:R0,R1=risk:R1,R2=risk:R2,R3=risk:R3,unknown=risk:ungraded`.
           Tier KEYS are fixed; only the label text is yours. Missing labels are
-          created on first use, color-coded green through red.
+          created on first use, color-coded green through red. The caller repo's
+          `RISK_LABEL_MAP` variable overrides this input without a caller PR.
         type: string
         required: false
         default: ''
@@ -988,7 +991,7 @@ jobs:
           RB_PATH: ${{ inputs.repo_runbooks_path }}
           FLEET_LOGINS: ${{ inputs.fleet_logins }}
           BOT_LOGINS: ${{ inputs.bot_logins }}
-          LABEL_MAP: ${{ inputs.label_map }}
+          LABEL_MAP: ${{ vars.RISK_LABEL_MAP || inputs.label_map }}
           SELF_CONTEXT: ${{ github.workflow }}
           SELF_RUN_ID: ${{ github.run_id }}
           WAIT_MINUTES: ${{ inputs.wait_for_checks_minutes }}

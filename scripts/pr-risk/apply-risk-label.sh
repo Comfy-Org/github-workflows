@@ -36,11 +36,9 @@
 # before-snapshot and the after-read, so the diff that would have to catch it is empty by
 # construction.
 #
-# ONE MORE LIMIT, on a different axis: ownership is defined by the CURRENT LABEL_MAP. Change a
-# caller's `label_map` and labels applied under the old map are, by definition, no longer owned —
-# they are carried through every future PUT beside the new target, and nothing here will clean them
-# up. Remapping is a one-time repo-side cleanup (delete the retired label names), not something a
-# re-grade heals.
+# ONE MORE LIMIT, on a different axis: ownership is defined by the CURRENT LABEL_MAP plus the four
+# default grade labels. A remap retires those defaults on the first re-grade. Custom names from an
+# older map are unknowable and still need one-time repo-side cleanup.
 #
 # The label is applied with the plain GITHUB_TOKEN on purpose: GITHUB_TOKEN-applied labels do
 # not fire `labeled` workflow triggers, which makes the shadow check incapable of starting a
@@ -107,6 +105,7 @@ for t in R0 R1 R2 R3 unknown; do
   [ -n "$l" ] || die "LABEL_MAP maps tier '$t' to an empty label"
   OWNED+=("$l")
 done
+OWNED+=("risk:R0" "risk:R1" "risk:R2" "risk:R3")
 TARGET="$(label_for "$TIER")"
 
 # Colors keyed by TIER (not label text, which callers may remap): green .. red, gray unknown.
