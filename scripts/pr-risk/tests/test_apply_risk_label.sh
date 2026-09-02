@@ -206,11 +206,11 @@ eq "the extra owned label is squashed down to the one target" \
    "$putheal"
 
 echo "— a remap retires the default grade label instead of keeping both —"
-: > "$GH_LOG"; printf 'risk:R2\nkeep-me\n' > "$CURRENT_LABELS"
+: > "$GH_LOG"; printf 'risk:R2\nrisk:ungraded\nkeep-me\n' > "$CURRENT_LABELS"
 PATH="$SANDBOX/bin:$PATH" REPO=test/repo PR_NUMBER=7 TIER=R2 LABEL_MAP="$NAMED_MAP" \
   bash "$SCRIPT" >/dev/null 2>&1
 putremap="$(grep -- '-X PUT repos/test/repo/issues/7/labels ' "$GH_LOG")"
-eq "the old default is replaced by the mapped label" \
+eq "the old defaults are replaced by the mapped label" \
    "api -X PUT repos/test/repo/issues/7/labels -f labels[]=keep-me -f labels[]=risk:high" \
    "$putremap"
 

@@ -36,8 +36,8 @@
 # before-snapshot and the after-read, so the diff that would have to catch it is empty by
 # construction.
 #
-# ONE MORE LIMIT, on a different axis: ownership is defined by the CURRENT LABEL_MAP plus the four
-# default grade labels. A remap retires those defaults on the first re-grade. Custom names from an
+# ONE MORE LIMIT, on a different axis: ownership is defined by the CURRENT LABEL_MAP plus the five
+# default labels. A remap retires those defaults on the first re-grade. Custom names from an
 # older map are unknowable and still need one-time repo-side cleanup.
 #
 # The label is applied with the plain GITHUB_TOKEN on purpose: GITHUB_TOKEN-applied labels do
@@ -105,7 +105,7 @@ for t in R0 R1 R2 R3 unknown; do
   [ -n "$l" ] || die "LABEL_MAP maps tier '$t' to an empty label"
   OWNED+=("$l")
 done
-OWNED+=("risk:R0" "risk:R1" "risk:R2" "risk:R3")
+OWNED+=("risk:R0" "risk:R1" "risk:R2" "risk:R3" "risk:ungraded")
 TARGET="$(label_for "$TIER")"
 
 # Colors keyed by TIER (not label text, which callers may remap): green .. red, gray unknown.

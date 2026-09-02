@@ -198,9 +198,9 @@ Operational caveats for a backfill:
   invisible: GitHub records it on the PR timeline as an `unlabeled` event by the
   grader token. Dispatch when the queue is quiet, and use `pr_number` when you
   want the per-PR group to serialize a re-grade against event runs.
-- **Remapping retires the default `risk:R0`..`risk:R3` labels.** The first
-  re-grade removes the old default and leaves one mapped label. Custom names
-  from an older map are unknowable and still need one-time repo-side cleanup.
+- **Remapping retires the default `risk:R0`..`risk:R3` and `risk:ungraded`
+  labels.** The first re-grade removes the old default and leaves one mapped
+  label. Custom names from an older map still need one-time repo-side cleanup.
 - **The pre-grader reads retry.** Rate limits are global, not per-PR, so the
   base-ref and override reads — the first hop for every target — retry a
   transient failure with backoff, as the grader already does. Without it one
