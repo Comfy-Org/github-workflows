@@ -15,14 +15,22 @@ class FakeGitHub:
     def __init__(self, protected):
         self.protected = protected
         self.current_base = "release/next"
+        self.pr_state = "open"
         self.statuses = []
         self.deleted_comments = []
 
     def get(self, path, *, paginate=False):
+        if path.endswith("/commits/abc123/pulls"):
+            return [{
+                "number": 17,
+                "state": self.pr_state,
+                "head": {"sha": "abc123"},
+                "base": {"repo": {"full_name": self.repo}},
+            }]
         if path.endswith("/pulls/17"):
             return {
                 "number": 17,
-                "state": "open",
+                "state": self.pr_state,
                 "html_url": "https://github.com/Comfy-Org/example/pull/17",
                 "head": {"sha": "abc123", "ref": "feature/be-123"},
                 "base": {"ref": "release/next"},
@@ -96,6 +104,18 @@ class ProtectedBaseBranch(unittest.TestCase):
 
         self.assertEqual(validator.run(event()), 1)
         self.assertEqual(github.statuses, [])
+
+    def test_signal_that_finishes_after_pr_merge_is_a_noop(self):
+        github = FakeGitHub(protected=True)
+        github.pr_state = "closed"
+        validator = self.validator(github)
+        validator._query_attachments = lambda _url: self.fail("Linear must not be queried")
+        stale_event = event()
+        stale_event["workflow_run"]["pull_requests"] = []
+
+        self.assertEqual(validator.run(stale_event), 0)
+        self.assertEqual(github.statuses, [])
+        self.assertEqual(github.deleted_comments, [])
 
     def test_retargeted_pr_does_not_publish_stale_terminal_status(self):
         github = FakeGitHub(protected=False)
