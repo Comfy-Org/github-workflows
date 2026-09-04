@@ -16,23 +16,31 @@ class FakeGitHub:
         self.protected = protected
         self.current_base = "release/next"
         self.pr_state = "open"
+        self.pr_merged = False
+        self.pr_head = "abc123"
+        self.association_paginated = None
+        self.fail_pull_numbers = set()
         self.statuses = []
         self.deleted_comments = []
 
     def get(self, path, *, paginate=False):
         if path.endswith("/commits/abc123/pulls"):
+            self.association_paginated = paginate
             return [{
                 "number": 17,
                 "state": self.pr_state,
-                "head": {"sha": "abc123"},
+                "head": {"sha": self.pr_head},
                 "base": {"repo": {"full_name": self.repo}},
             }]
         if path.endswith("/pulls/17"):
+            if 17 in self.fail_pull_numbers:
+                return None
             return {
                 "number": 17,
                 "state": self.pr_state,
+                "merged": self.pr_merged,
                 "html_url": "https://github.com/Comfy-Org/example/pull/17",
-                "head": {"sha": "abc123", "ref": "feature/be-123"},
+                "head": {"sha": self.pr_head, "ref": "feature/be-123"},
                 "base": {"ref": "release/next"},
                 "title": "Change something",
                 "body": "",
@@ -108,6 +116,7 @@ class ProtectedBaseBranch(unittest.TestCase):
     def test_signal_that_finishes_after_pr_merge_is_a_noop(self):
         github = FakeGitHub(protected=True)
         github.pr_state = "closed"
+        github.pr_merged = True
         validator = self.validator(github)
         validator._query_attachments = lambda _url: self.fail("Linear must not be queried")
         stale_event = event()
@@ -116,6 +125,48 @@ class ProtectedBaseBranch(unittest.TestCase):
         self.assertEqual(validator.run(stale_event), 0)
         self.assertEqual(github.statuses, [])
         self.assertEqual(github.deleted_comments, [])
+
+    def test_closed_unmerged_pr_fails_closed(self):
+        github = FakeGitHub(protected=True)
+        github.pr_state = "closed"
+        validator = self.validator(github)
+        stale_event = event()
+        stale_event["workflow_run"]["pull_requests"] = []
+
+        self.assertEqual(validator.run(stale_event), 1)
+        self.assertEqual(github.statuses, [])
+
+    def test_merged_pr_with_a_newer_head_is_a_noop(self):
+        github = FakeGitHub(protected=True)
+        github.pr_state = "closed"
+        github.pr_merged = True
+        github.pr_head = "newer-head"
+        validator = self.validator(github)
+        validator._query_attachments = lambda _url: self.fail("Linear must not be queried")
+        stale_event = event()
+        stale_event["workflow_run"]["pull_requests"] = []
+
+        self.assertEqual(validator.run(stale_event), 0)
+        self.assertEqual(github.statuses, [])
+
+    def test_pr_fetch_failure_does_not_become_a_completed_noop(self):
+        github = FakeGitHub(protected=True)
+        github.fail_pull_numbers.add(17)
+        validator = self.validator(github)
+        stale_event = event()
+        stale_event["workflow_run"]["pull_requests"] = []
+
+        self.assertEqual(validator.run(stale_event), 1)
+        self.assertEqual(github.statuses, [])
+
+    def test_commit_associations_are_paginated(self):
+        github = FakeGitHub(protected=True)
+        validator = self.validator(github)
+        stale_event = event()
+        stale_event["workflow_run"]["pull_requests"] = []
+
+        self.assertEqual(validator._resolve_pr(stale_event, "abc123"), (17, False))
+        self.assertTrue(github.association_paginated)
 
     def test_retargeted_pr_does_not_publish_stale_terminal_status(self):
         github = FakeGitHub(protected=False)

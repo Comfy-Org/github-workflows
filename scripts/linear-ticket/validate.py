@@ -374,7 +374,7 @@ class Validator:
 
         self.pr_number, completed = self._resolve_pr(event, head_sha)
         if completed:
-            log(f"The PR at {head_sha} closed before its signal run completed — nothing to "
+            log(f"The PR at {head_sha} merged before its signal run completed — nothing to "
                 "validate.")
             return 0
         if self.pr_number is None:
@@ -448,30 +448,44 @@ class Validator:
         wr = event.get("workflow_run") or {}
         candidates = [pr.get("number") for pr in (wr.get("pull_requests") or []) if pr.get("number")]
         if not candidates:
-            assoc = self.gh.get(f"/repos/{self.gh.repo}/commits/{head_sha}/pulls") or []
+            assoc = self.gh.get(
+                f"/repos/{self.gh.repo}/commits/{head_sha}/pulls", paginate=True)
+            if assoc is None:
+                error(f"Could not fetch PRs associated with {head_sha}; failing closed.")
+                return None, False
             candidates = [
                 pr.get("number") for pr in assoc
-                if (pr.get("base") or {}).get("repo", {}).get("full_name") == self.gh.repo
+                if ((pr.get("base") or {}).get("repo") or {}).get("full_name") == self.gh.repo
             ]
 
         open_prs: list[int] = []
         completed_prs: list[int] = []
+        other_prs: list[int] = []
+        unreadable_prs: list[int] = []
         for number in dict.fromkeys(candidates):  # de-dup, preserve order
             data = self.gh.get(f"/repos/{self.gh.repo}/pulls/{number}")
-            if data and data.get("state") == "open":
+            if data is None:
+                unreadable_prs.append(number)
+            elif data.get("state") == "open":
                 open_prs.append(number)
-            elif data and (data.get("head") or {}).get("sha") == head_sha:
+            elif data.get("merged") is True or data.get("merged_at"):
                 completed_prs.append(number)
+            else:
+                other_prs.append(number)
+
+        if unreadable_prs:
+            error(f"Could not fetch associated PR(s) {unreadable_prs}; failing closed.")
+            return None, False
 
         if len(open_prs) == 1:
             return open_prs[0], False
-        if not open_prs and len(completed_prs) == 1:
+        if not open_prs and len(completed_prs) == 1 and not other_prs:
             return None, True
 
-        if len(open_prs) != 1:
-            error(f"Expected exactly one open PR associated with {head_sha}, found "
-                  f"{len(open_prs)} (and {len(completed_prs)} completed exact-head PRs; "
-                  f"event={wr.get('event')}). Refusing to publish an ambiguous result.")
+        error(f"Expected exactly one open PR associated with {head_sha}, found "
+              f"{len(open_prs)} (and {len(completed_prs)} merged, "
+              f"{len(other_prs)} non-merged closed/unknown; event={wr.get('event')}). "
+              "Refusing to publish an ambiguous result.")
         return None, False
 
     def _query_attachments(self, html_url: str):
