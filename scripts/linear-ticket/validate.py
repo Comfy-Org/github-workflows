@@ -372,7 +372,11 @@ class Validator:
                   "signal workflow must run on pull_request; refusing to validate.")
             return 1
 
-        self.pr_number = self._resolve_pr(event, head_sha)
+        self.pr_number, completed = self._resolve_pr(event, head_sha)
+        if completed:
+            log(f"The PR at {head_sha} merged before its signal run completed — nothing to "
+                "validate.")
+            return 0
         if self.pr_number is None:
             return 1  # error already reported
 
@@ -433,31 +437,56 @@ class Validator:
 
         return self._diagnose_and_fail(nodes, infra_error, branch, title, body)
 
-    def _resolve_pr(self, event: dict, head_sha: str) -> int | None:
-        """Exactly one open PR. Same-repo runs carry workflow_run.pull_requests; fork runs do
-        not, so fall back to the commit->PR association (GitHub-owned data either way)."""
+    def _resolve_pr(self, event: dict, head_sha: str) -> tuple[int | None, bool]:
+        """Resolve one open PR, or identify a signal whose exact-head PR already closed.
+
+        Same-repo runs normally carry ``workflow_run.pull_requests``. GitHub can empty that
+        list when a fast merge or close beats the signal run, and fork runs omit it, so fall
+        back to the commit->PR association (GitHub-owned data either way). The boolean return
+        is true only for an unambiguous completed exact-head PR; callers may safely no-op it.
+        """
         wr = event.get("workflow_run") or {}
         candidates = [pr.get("number") for pr in (wr.get("pull_requests") or []) if pr.get("number")]
         if not candidates:
-            assoc = self.gh.get(f"/repos/{self.gh.repo}/commits/{head_sha}/pulls") or []
+            assoc = self.gh.get(
+                f"/repos/{self.gh.repo}/commits/{head_sha}/pulls", paginate=True)
+            if assoc is None:
+                error(f"Could not fetch PRs associated with {head_sha}; failing closed.")
+                return None, False
             candidates = [
                 pr.get("number") for pr in assoc
-                if pr.get("state") == "open"
-                and (pr.get("base") or {}).get("repo", {}).get("full_name") == self.gh.repo
+                if ((pr.get("base") or {}).get("repo") or {}).get("full_name") == self.gh.repo
             ]
 
         open_prs: list[int] = []
+        completed_prs: list[int] = []
+        other_prs: list[int] = []
+        unreadable_prs: list[int] = []
         for number in dict.fromkeys(candidates):  # de-dup, preserve order
             data = self.gh.get(f"/repos/{self.gh.repo}/pulls/{number}")
-            if data and data.get("state") == "open":
+            if data is None:
+                unreadable_prs.append(number)
+            elif data.get("state") == "open":
                 open_prs.append(number)
+            elif data.get("merged") is True or data.get("merged_at"):
+                completed_prs.append(number)
+            else:
+                other_prs.append(number)
 
-        if len(open_prs) != 1:
-            error(f"Expected exactly one open PR associated with {head_sha}, found "
-                  f"{len(open_prs)} (event={wr.get('event')}). Refusing to publish an "
-                  "ambiguous result.")
-            return None
-        return open_prs[0]
+        if unreadable_prs:
+            error(f"Could not fetch associated PR(s) {unreadable_prs}; failing closed.")
+            return None, False
+
+        if len(open_prs) == 1:
+            return open_prs[0], False
+        if not open_prs and len(completed_prs) == 1 and not other_prs:
+            return None, True
+
+        error(f"Expected exactly one open PR associated with {head_sha}, found "
+              f"{len(open_prs)} (and {len(completed_prs)} merged, "
+              f"{len(other_prs)} non-merged closed/unknown; event={wr.get('event')}). "
+              "Refusing to publish an ambiguous result.")
+        return None, False
 
     def _query_attachments(self, html_url: str):
         """attachmentsForURL(this PR) with bounded retry for the async-link race (design §5
