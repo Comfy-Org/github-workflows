@@ -1380,8 +1380,12 @@ jobs:
           # auto-discovery (and hooks/plugins/keychain); auth stays on the
           # ANTHROPIC_API_KEY set above, the only credential this step has (--bare
           # never reads OAuth/keychain, so a missing key fails loudly, not silently).
-          # --max-turns 150: the whole-repo finder brief needs ~82 turns in a healthy
-          # environment (validated); the old 40 could not finish the brief at all.
+          # Two independent ceilings bound a runaway finder: 100 turns and $8.
+          # A healthy whole-repo run historically needed ~82 turns; the brief now
+          # reserves its final 40-turn margin for producing the result rather than
+          # treating repository coverage or a six-finding minimum as completion.
+          # The dollar ceiling is intentionally separate: turn cost varies with
+          # context size, so a turn cap alone allowed one failed run to spend $11.25.
           # `git grep` is deliberately NOT allowlisted: `--open-files-in-pager=<cmd>`
           # executes an arbitrary command. The Grep tool covers content search.
           # `Edit(//<abs path>)` instead of a bare `Write` is the STRUCTURAL close of
@@ -1423,7 +1427,8 @@ jobs:
             GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*' \
           claude -p "$PROMPT" \
             --model "$MODEL" \
-            --max-turns 150 \
+            --max-turns 100 \
+            --max-budget-usd 8 \
             --allowedTools "Read,Glob,Grep,Edit(//${FINDER_OUT#/}),Bash(git log:*),Bash(git show:*),Bash(grep:*),Bash(cat:*),Bash(ls:*),Bash(head:*),Bash(tail:*),Bash(wc:*)" \
             --bare \
             --setting-sources "" \
