@@ -1381,11 +1381,10 @@ jobs:
           # ANTHROPIC_API_KEY set above, the only credential this step has (--bare
           # never reads OAuth/keychain, so a missing key fails loudly, not silently).
           # Two independent ceilings bound a runaway finder: 100 turns and $8.
-          # A healthy whole-repo run historically needed ~82 turns; the brief now
-          # reserves its final 40-turn margin for producing the result rather than
-          # treating repository coverage or a six-finding minimum as completion.
+          # The brief reserves both turn and dollar margin for producing the result
+          # rather than treating broad coverage or a finding minimum as completion.
           # The dollar ceiling is intentionally separate: turn cost varies with
-          # context size, so a turn cap alone allowed one failed run to spend $11.25.
+          # context size, so a turn cap alone is not a reliable spend boundary.
           # `git grep` is deliberately NOT allowlisted: `--open-files-in-pager=<cmd>`
           # executes an arbitrary command. The Grep tool covers content search.
           # `Edit(//<abs path>)` instead of a bare `Write` is the STRUCTURAL close of
