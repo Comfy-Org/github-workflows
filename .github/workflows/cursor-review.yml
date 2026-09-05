@@ -2154,10 +2154,20 @@ jobs:
     # those leaves the gate's thread query empty. So the script states it
     # instead; see its emit_delivery for the contract. Unset (the script died
     # before deciding) reads as false at the gate — fail-closed by default.
+    #
+    # `posted` is the DM's weaker sibling (BE-10017), not a duplicate of
+    # `delivered`: it says only that SOME review body reached the PR. The two
+    # disagree in both directions of interest — the error review and the
+    # all-cells-failed review post but do not deliver, and the read-only-403
+    # degradation neither posts nor delivers while still exiting 0. The gate
+    # wants `delivered`; `notify-complete`'s "one consolidated review is on the
+    # PR" wants `posted`, or it congratulates the author over a PR with no
+    # review on it.
     outputs:
       delivered: ${{ steps.post.outputs.delivered }}
       gated_findings: ${{ steps.post.outputs.gated_findings }}
       ungated_findings: ${{ steps.post.outputs.ungated_findings }}
+      posted: ${{ steps.post.outputs.posted }}
     steps:
       - name: Require a pinned workflows_ref
         # workflows_ref has no default on purpose. GitHub does NOT enforce
@@ -2769,6 +2779,14 @@ jobs:
           PR_URL: ${{ github.event.pull_request.html_url }}
           CONSOLIDATE_RESULT: ${{ needs.consolidate.result }}
           POST_REVIEW_RESULT: ${{ needs.post-review.result }}
+          # Not redundant with the result above (BE-10017): post-review.py exits
+          # 0 — so the job is green — after a read-only-token 403, having written
+          # the review to the run's job summary instead of the PR. Deliberate (a
+          # caller that forgot `pull-requests: write` still gets its review
+          # somewhere), but it made the success DM claim a review that is not
+          # there. Unset reads as not-'true', which is the fail-closed direction:
+          # the worst case is a degraded DM on a review that did post.
+          REVIEW_POSTED: ${{ needs.post-review.outputs.posted }}
         run: |
           chmod +x "$CURSOR_REVIEW_ASSETS/slack-notify.sh"
           # Keyed on the POST job, not on consolidate: since the credential
@@ -2776,10 +2794,17 @@ jobs:
           # consolidate alone no longer justifies "one consolidated review is on
           # the PR". The two failures are distinguished so the DM says which
           # half broke.
-          if [ "$POST_REVIEW_RESULT" = "success" ]; then
+          if [ "$POST_REVIEW_RESULT" = "success" ] && [ "$REVIEW_POSTED" = "true" ]; then
             STATUS="success"
             TITLE="Cursor review complete"
             DETAIL="One consolidated review is on the PR."
+          elif [ "$POST_REVIEW_RESULT" = "success" ]; then
+            # Green job, nothing on the PR: the read-only-token degradation. Say
+            # where the review actually went and name the cause, because the fix
+            # is in the CALLER's permissions block, not in this run.
+            STATUS="warning"
+            TITLE="Cursor review degraded"
+            DETAIL="The review was rendered to the run's job summary but could not be posted on the PR — the workflow token lacks pull-requests: write (check the caller's permissions block)."
           elif [ "$CONSOLIDATE_RESULT" != "success" ]; then
             STATUS="warning"
             TITLE="Cursor review failed to post"
