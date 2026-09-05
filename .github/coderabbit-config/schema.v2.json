@@ -819,7 +819,7 @@
 					"type": "object",
 					"properties": {
 						"ast-grep": {
-							"description": "Enable ast-grep | ast-grep is a code analysis tool that helps you to find patterns in your codebase using abstract syntax trees patterns. | v0.45.1",
+							"description": "Enable ast-grep | ast-grep is a code analysis tool that helps you to find patterns in your codebase using abstract syntax trees patterns. | v0.45.2",
 							"default": {},
 							"type": "object",
 							"properties": {
@@ -873,7 +873,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Ruff | Ruff is a Python linter and code formatter. |  Enable Ruff integration. | v0.16.1",
+									"description": "Enable Ruff | Ruff is a Python linter and code formatter. |  Enable Ruff integration. | v0.16.2",
 									"type": "boolean"
 								}
 							}
@@ -964,7 +964,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Biome | Biome is a fast formatter, linter, and analyzer for web projects. | Enable Biome integration. | v2.5.6",
+									"description": "Enable Biome | Biome is a fast formatter, linter, and analyzer for web projects. | Enable Biome integration. | v2.5.7",
 									"type": "boolean"
 								}
 							}
@@ -1004,7 +1004,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable PHPStan | PHPStan requires [config file](https://phpstan.org/config-reference#config-file) in your repository root. Please ensure that this file contains the `paths:` parameter. | v2.2.7",
+									"description": "Enable PHPStan | PHPStan requires [config file](https://phpstan.org/config-reference#config-file) in your repository root. Please ensure that this file contains the `paths:` parameter. | v2.2.8",
 									"type": "boolean"
 								},
 								"level": {
@@ -1165,7 +1165,7 @@
 									"properties": {
 										"enabled": {
 											"default": true,
-											"description": "Enable @e18e/eslint-plugin | Detects dependencies with modern replacements, flags unmaintained packages, and suggests native API alternatives or lighter replacements | v0.6.0",
+											"description": "Enable @e18e/eslint-plugin | Detects dependencies with modern replacements, flags unmaintained packages, and suggests native API alternatives or lighter replacements | v0.8.0",
 											"type": "boolean"
 										}
 									}
@@ -1220,7 +1220,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable RuboCop | RuboCop is a Ruby static code analyzer (a.k.a. linter ) and code formatter. | v1.88.2",
+									"description": "Enable RuboCop | RuboCop is a Ruby static code analyzer (a.k.a. linter ) and code formatter. | v1.89.0",
 									"type": "boolean"
 								}
 							}
@@ -1313,6 +1313,18 @@
 								}
 							}
 						},
+						"vale": {
+							"description": "Vale lints prose using the repository's checked-in style rules.",
+							"default": {},
+							"type": "object",
+							"properties": {
+								"enabled": {
+									"default": true,
+									"description": "Enable Vale | Vale checks prose against repository-defined editorial style rules. It runs only when a supported root Vale configuration is present. | v3.17.1",
+									"type": "boolean"
+								}
+							}
+						},
 						"verilator": {
 							"description": "Verilator statically analyzes Verilog and SystemVerilog source files.",
 							"default": {},
@@ -1360,7 +1372,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable CircleCI | CircleCI tool is a static checker for CircleCI config files. | v0.1.38646",
+									"description": "Enable CircleCI | CircleCI tool is a static checker for CircleCI config files. | v1.0.47471",
 									"type": "boolean"
 								}
 							}
@@ -1384,7 +1396,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable SQLFluff | SQLFluff is an open source, dialect-flexible and configurable SQL linter. | v4.2.2",
+									"description": "Enable SQLFluff | SQLFluff is an open source, dialect-flexible and configurable SQL linter. | v4.3.0",
 									"type": "boolean"
 								},
 								"config_file": {
@@ -1400,7 +1412,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Squawk for Postgres migration linting | Detects unsafe schema changes that can cause downtime or blocking locks | v2.61.0",
+									"description": "Enable Squawk for Postgres migration linting | Detects unsafe schema changes that can cause downtime or blocking locks | v2.62.0",
 									"type": "boolean"
 								}
 							}
@@ -1436,7 +1448,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Pylint | Pylint is a Python static code analysis tool. | v4.0.6",
+									"description": "Enable Pylint | Pylint is a Python static code analysis tool. | v4.0.7",
 									"type": "boolean"
 								}
 							}
@@ -1460,7 +1472,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Shopify Theme Check | A linter for Shopify themes that helps you follow Shopify theme & Liquid best practices | cli 4.6.0 | theme 3.58.2",
+									"description": "Enable Shopify Theme Check | A linter for Shopify themes that helps you follow Shopify theme & Liquid best practices | cli 4.6.1 | theme 3.58.2",
 									"type": "boolean"
 								}
 							}
@@ -1546,7 +1558,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable OSV Scanner | OSV Scanner is a tool for vulnerability package scanning | v2.4.0",
+									"description": "Enable OSV Scanner | OSV Scanner is a tool for vulnerability package scanning | v2.5.0",
 									"type": "boolean"
 								}
 							}
@@ -1558,7 +1570,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable oasdiff | oasdiff detects breaking changes between OpenAPI specifications. | v1.27.0",
+									"description": "Enable oasdiff | oasdiff detects breaking changes between OpenAPI specifications. | v1.28.0",
 									"type": "boolean"
 								}
 							}
@@ -1570,7 +1582,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable React Doctor | React Doctor scans React codebases for security, performance, correctness, and accessibility issues. | v0.9.6",
+									"description": "Enable React Doctor | React Doctor scans React codebases for security, performance, correctness, and accessibility issues. | v0.9.11",
 									"type": "boolean"
 								}
 							}
@@ -1630,7 +1642,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable SkillSpector | SkillSpector is a security scanner for AI agent skills. It detects vulnerabilities, malicious patterns, and security risks in SKILL.md manifests and MCP configurations. | v2.5.1",
+									"description": "Enable SkillSpector | SkillSpector is a security scanner for AI agent skills. It detects vulnerabilities, malicious patterns, and security risks in SKILL.md manifests and MCP configurations. | v2.8.2",
 									"type": "boolean"
 								}
 							}
