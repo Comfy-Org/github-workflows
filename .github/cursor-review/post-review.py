@@ -105,23 +105,46 @@ BODY_ONLY_SENTINEL_PREFIX = "cursor-review:body-only-findings v1"
 #                     reviewed diff, or the whole inline payload 422'd). Real
 #                     findings with nowhere to reply — no thread resolution can ever
 #                     clear them, so the gate must not read their absence as clean.
+#   posted            true when SOME review body reached the PR, whatever it said.
+#                     Strictly weaker than `delivered` and deliberately so: it is
+#                     what `notify-complete`'s DM needs, and the DM asks a different
+#                     question than the gate. The gate asks "did an adjudicated
+#                     review land"; the DM claims "one consolidated review is on the
+#                     PR", which is true of the error review and the all-cells-failed
+#                     review (both `delivered=false`) and false of the read-only-403
+#                     degradation, where the review reached only the job summary and
+#                     the script still exits 0. Keying the DM on the job result alone
+#                     made that last case a silent green — a success DM pointing at a
+#                     PR carrying no review. `delivered` implies `posted`; the
+#                     converse does not hold.
 #
 # Emitted exactly once (first call wins): the paths below can fall through each
-# other, and duplicate keys in $GITHUB_OUTPUT are ambiguous. Nothing is written when
-# the script dies before deciding, which leaves the gate reading an empty
-# `delivered` — false, i.e. fail-closed by default.
+# other, and duplicate keys in $GITHUB_OUTPUT are ambiguous. That once-guard is also
+# why `posted` rides along here rather than in an emitter of its own — it is decided
+# by the same branches, so a second emitter would need a second guard kept in sync
+# with this one across every path below. Nothing is written when the script dies
+# before deciding, which leaves the gate reading an empty `delivered` and the DM an
+# empty `posted` — false, i.e. fail-closed by default on both.
 _DELIVERY_EMITTED = False
 
 
-def emit_delivery(delivered: bool, gated: int = 0, ungated: int = 0) -> None:
+def emit_delivery(
+    delivered: bool, gated: int = 0, ungated: int = 0, posted: bool = False
+) -> None:
     """Write the blocking gate's delivery signal to $GITHUB_OUTPUT."""
     global _DELIVERY_EMITTED
     if _DELIVERY_EMITTED:
         return
     _DELIVERY_EMITTED = True
+    # `delivered` without `posted` would be incoherent — an adjudicated review that
+    # never reached the PR — and would green the gate while the DM reported a
+    # degradation. No call site should produce it; assert the invariant rather than
+    # trusting every future one to remember.
+    posted = posted or delivered
     print(
         f"delivery: delivered={'true' if delivered else 'false'} "
-        f"gated_findings={gated} ungated_findings={ungated}",
+        f"gated_findings={gated} ungated_findings={ungated} "
+        f"posted={'true' if posted else 'false'}",
         file=sys.stderr,
     )
     path = os.environ.get("GITHUB_OUTPUT")
@@ -131,6 +154,7 @@ def emit_delivery(delivered: bool, gated: int = 0, ungated: int = 0) -> None:
         f.write(f"delivered={'true' if delivered else 'false'}\n")
         f.write(f"gated_findings={gated}\n")
         f.write(f"ungated_findings={ungated}\n")
+        f.write(f"posted={'true' if posted else 'false'}\n")
 # Mirrors build-ledger.py's MAX_BODY_CHARS: the ledger truncates to that anyway, so
 # encoding more only spends review-body budget that the clamp would take back. The
 # marker mirrors its TRUNCATION_MARKER for the same reason — cutting to exactly the
@@ -345,7 +369,11 @@ def post_or_degrade(
     """
     result = gh_post_review(repo, pr_number, payload)
     if result.returncode == 0:
-        emit_delivery(delivers, gated, ungated)
+        # `posted` regardless of `delivers`: a body that reports a failure still
+        # reached the PR, and the DM's claim is about the PR, not about adjudication.
+        # A clamped-but-posted review is posted too — hence before the `truncated`
+        # handling, not after it.
+        emit_delivery(delivers, gated, ungated, posted=True)
         if truncated:
             print(
                 f"{context}: body hit GitHub's size limit — full text written to "
@@ -1392,7 +1420,9 @@ def main():
         # human can resolve; `body_only_items` reached the body and can never be
         # resolved. A round where the second is non-empty and the first is empty is
         # a review whose every finding is invisible to a thread query.
-        emit_delivery(True, gated=len(comments), ungated=len(body_only_items))
+        emit_delivery(
+            True, gated=len(comments), ungated=len(body_only_items), posted=True
+        )
         if posted_body != review_body:
             # The clamp note tells the reader the full text is in the job summary.
             # Nothing else on this path writes one, so write it here or the note lies
