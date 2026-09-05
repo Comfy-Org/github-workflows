@@ -189,6 +189,8 @@ re-point that pins callers to the verified tip instead of a stale `github.sha`.
 | `WATCHED_EXEC` | optional — newline-separated repo-relative **files** a pinned caller actually executes. When set, each is probed for deletion at the tip and — unless the run was re-pointed, which makes that tip the pin target — locally too, in addition to `WATCHED`/`WATCHED_ASSETS`. **Only `pr-risk` and `pr-derisk` need this today** |
 | `NEW_SHA` | the candidate SHA, normally `github.sha` |
 | `GITHUB_SHA`, `GITHUB_OUTPUT` | provided by Actions |
+| `GITHUB_EVENT_NAME`, `GITHUB_EVENT_PATH`, `GITHUB_REPOSITORY`, `GITHUB_WORKFLOW_REF` | also provided by Actions to every step, no wiring needed — read only by the `Skip-caller-bump` gate and the owed-bump check below. Absent or unparseable is never an error; both fail open toward bumping |
+| `GH_TOKEN` | the ambient, read-only `${{ github.token }}`, wired into the preflight step's `env:` alongside an `actions: read` permission. The **only** credential this script uses, and it is minted long before the org-wide write token the bump step needs. Read only by the owed-bump check; unset means that check reads "cannot determine" and bumps |
 
 `WATCHED`, `WATCHED_ASSETS` and every `WATCHED_EXEC` entry are **literal,
 repo-relative paths, not the globs from the `paths:` filter** —
@@ -619,14 +621,49 @@ to widen it — but logs a **distinct** line first saying the hand-off is
 *unverified*, so a fleet that quietly stopped bumping leaves a trace of which of
 the two happened.
 
-**Known limit.** A bump run is also the *catch-up* for an earlier watched change
-whose own run never bumped — one that failed at the token mint or inside
+**The owed-bump check.** A bump run is also the *catch-up* for an earlier watched
+change whose own run never bumped — one that failed at the token mint or inside
 `bump-callers.sh`, was cancelled, or never started because a `paths:` filter is
-evaluated against only the first 300 changed files of a push. Declining here
-declines that catch-up too, and nothing in the push payload can see it; the
-hand-off guard covers only the concurrent-run case, which is the one the
-preflight *can* observe. Until that is closed, keep trailered pushes small and
-reach for `workflow_dispatch` if a fleet looks behind.
+evaluated against only the first 300 changed files of a push. Declining on a
+trailer used to decline that catch-up too, and nothing in the push *payload* can
+see it (the hand-off guard covers only the concurrent-run case). So before the
+trailer is honored, `fleet_owes_bump` looks somewhere the payload cannot: this
+fleet's own **Actions run history** — the same `actions: read`, no-new-secret,
+fail-open pattern `.github/groom/interval.py` uses for its cadence gate.
+
+1. **Find the left endpoint.** From `GITHUB_WORKFLOW_REF` and
+   `GITHUB_REPOSITORY`, list this workflow's successful runs on `main`, newest
+   first, one bounded page, and take the first whose job carries a step named
+   exactly **`Bump SHA in caller repos`** with conclusion `success`. That step is
+   `skipped` on a declined run and `success` on a real bump, which is the entire
+   discriminator; every entrypoint spells it identically and
+   `test_paths_contract.sh` fails the build if one stops. `push` and
+   `workflow_dispatch` runs both count — a dispatch recovery bump is as much of a
+   catch-up as a push one. The endpoint is that run's `head_sha`, not the SHA it
+   pinned: a re-pointed run had already proved its surface unchanged up to its
+   pin target, so the difference can only *add* commits to the range below.
+2. **Walk that range to `HEAD`**, restricted to the watched surface (the same
+   pathspecs the staleness comparison uses, so an excluding fleet keeps its
+   exclusions), and check each commit's message with the one shared trailer
+   definition. **Per commit, not as a content diff** — that is what lets an
+   earlier, legitimately-skipped trailered push keep being excused by its own
+   trailer instead of poisoning every later skip.
+3. **Any untrailered watched commit refuses the skip**, with a `::notice::`
+   naming the oldest one: *catch-up owed for `<sha>`, whose own run never
+   bumped.*
+
+The check can only ever **narrow** a skip. Every indeterminate answer — no `gh`
+or `jq`, an Actions API error, no qualifying run inside the scan bound, a failed
+deepening fetch, a left endpoint that is not an ancestor of `HEAD`, a range past
+the sanity bound — bumps, and none of them fails the run.
+
+**Residual, deliberately.** The scan reads one bounded page of recent runs, so a
+fleet whose last real bump has aged out of that page — or out of the Actions
+run-retention window entirely — reads as "cannot determine" and bumps. That is
+status-quo churn (the behavior before the trailer existed), never pin drift. The
+same is true of a fleet whose preflight step loses `actions: read` or its
+`GH_TOKEN`: the trailer quietly stops being honored, which is why the contract
+test asserts all three.
 
 ## How the pin rewrite is scoped (and why it asserts afterwards)
 
