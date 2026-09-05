@@ -1410,5 +1410,105 @@ class TestBodyOnlyFindings(unittest.TestCase):
         )
 
 
+class TestLostToFallbackEntries(unittest.TestCase):
+    """The wholesale-fallback half of the body-only channel (BE-10002).
+
+    When the review POST fails, post-review.py re-posts every finding as prose — the
+    ones that anchored fine included. They reach the ledger through the same sentinel
+    as a demoted finding and get the same disposition (no thread, no discussion_url,
+    answered_count 0, cap-exempt), because all of that is factually true of them. What
+    is NOT true of them is the steering that asks the panel to prefer not re-raising an
+    unanchorable finding: these anchored, and will anchor again. Hence one flag, and a
+    render that says which of the two happened.
+    """
+
+    def _section(self, findings, lost_lines=()):
+        """The demoted-findings section, as post-review.py renders it, with the named
+        lines tagged the way the fallback branch tags them."""
+        items = pr.normalize_comments(findings)
+        tagged = [
+            {**item, "lost_to_fallback": True}
+            if item["comment"]["line"] in lost_lines
+            else item
+            for item in items
+        ]
+        return pr.render_body_only_findings(tagged)
+
+    def _ledger(self, findings, lost_lines=()):
+        section = self._section(findings, lost_lines)
+        return bl.build_ledger(
+            [review_with_demoted(101, 1, findings, section=section)], [], []
+        )
+
+    def test_the_flag_survives_the_round_trip_through_the_real_writer(self):
+        ledger = self._ledger([demoted("app.py", 11), demoted("far.py", 900)], lost_lines=(11,))
+        by_line = {e["line"]: e for e in ledger["entries"]}
+        self.assertTrue(by_line[11]["lost_to_fallback"])
+        self.assertNotIn("lost_to_fallback", by_line[900])
+        # Everything mechanical is the SAME for both — the flag is presentation only.
+        for entry in ledger["entries"]:
+            self.assertFalse(entry["anchored"])
+            self.assertEqual(entry["discussion_url"], "")
+            self.assertEqual(entry["thread"]["answered_count"], 0)
+        self.assertEqual(ledger["unanchorable_count"], 2)
+        self.assertEqual(ledger["unanswered_count"], 0, "nobody could have answered either")
+
+    def test_it_renders_post_failed_and_says_the_finding_did_anchor(self):
+        rendered = bl.render_ledger_markdown(
+            self._ledger([demoted("app.py", 11, severity="low")], lost_lines=(11,)), "judge"
+        )
+        self.assertIn("* app.py:11 [low] [post-failed]", rendered)
+        self.assertNotIn("* app.py:11 [low] [unanchorable]", rendered)
+        self.assertIn(
+            "(review POST failed — this finding anchored to the diff but its review was "
+            "delivered body-only, so no thread exists and nobody could answer it; "
+            "re-raising it needs no repeat_of and it should anchor normally next round)",
+            rendered,
+        )
+        # The unanchorable note is the OTHER branch — an entry gets one, never both.
+        self.assertNotIn("demoted to the review body, no thread exists", rendered)
+        self.assertNotIn("discussion_url:", rendered, "still no thread to point at")
+
+    def test_both_audiences_are_told_what_post_failed_means(self):
+        ledger = self._ledger([demoted("app.py", 11)], lost_lines=(11,))
+        for audience in ("panel", "judge"):
+            with self.subTest(audience=audience):
+                steering = bl.render_ledger_markdown(ledger, audience).split(
+                    "--- ROUND 1", 1
+                )[0]
+                self.assertIn("[post-failed]", steering)
+                self.assertIn("anchored", steering)
+                self.assertIn("raise it freely", steering.lower())
+
+    def test_a_v1_payload_without_the_flag_renders_exactly_as_before(self):
+        """Forward compatibility in the direction that actually happens: consumers stay
+        pinned to older SHAs, so bodies written without the key keep arriving."""
+        findings = [demoted("far.py", 900, severity="low")]
+        plain = bl.render_ledger_markdown(self._ledger(findings), "judge")
+        self.assertIn("* far.py:900 [low] [unanchorable]", plain)
+        self.assertNotIn("[post-failed]", plain.split("--- ROUND 1", 1)[1])
+        self.assertIn("cannot be answered or resolved; re-raising needs no repeat_of", plain)
+
+    def test_only_a_real_true_sets_the_flag(self):
+        """The payload is model-adjacent text travelling through a public review body,
+        so a near-miss value must not read as the flag being set."""
+        for value in ("true", "false", 1, 0, None, [], {"a": 1}):
+            with self.subTest(value=value):
+                section = replace_payload(
+                    body_only_section([demoted("far.py", 900)]),
+                    json.dumps(
+                        [{"path": "far.py", "line": 900, "severity": "low",
+                          "body": "x", "lost_to_fallback": value}]
+                    ).replace("-", "\\u002d"),
+                )
+                ledger = bl.build_ledger(
+                    [review(101, 1, body=f"{MARKER}\n\nFound **1** finding(s).\n\n---\n\n{section}")],
+                    [], [],
+                )
+                self.assertEqual(ledger["entry_count"], 1, "the entry is still recovered")
+                self.assertNotIn("lost_to_fallback", ledger["entries"][0])
+                self.assertIn("[unanchorable]", bl.render_ledger_markdown(ledger, "judge"))
+
+
 if __name__ == "__main__":
     unittest.main()
