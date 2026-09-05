@@ -29,6 +29,13 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 WORKFLOWS="${REPO_ROOT}/.github/workflows"
+PREFLIGHT="${SCRIPT_DIR}/../preflight.sh"
+
+# The bump step's name, read OUT OF preflight.sh rather than restated here — it is
+# the discriminator the owed-bump probe (BE-10008) keys on to tell a run that
+# really bumped from one that declined, and two copies of it would be free to
+# drift in exactly the direction nothing else can see.
+OWED_STEP_NAME="$(sed -n "s/^OWED_BUMP_STEP_NAME='\(.*\)'$/\1/p" "$PREFLIGHT")"
 
 PASS=0
 FAIL=0
@@ -369,6 +376,46 @@ ${pathspec_diag}"
   else
     ok "${file}: token is minted only after, and only if, preflight says proceed"
   fi
+
+  # --- the owed-bump probe's three silent dependencies (BE-10008) ---
+  # Before honoring a `Skip-caller-bump: true` trailer, preflight.sh asks whether
+  # this fleet still owes a catch-up bump, by reading its own Actions run history
+  # and keying on a step named EXACTLY $OWED_STEP_NAME — that step is `skipped` on
+  # a declined run and `success` on a real one, which is the entire signal.
+  #
+  # All three of these fail SILENTLY GREEN, which is why they are asserted here
+  # rather than left to convention. Rename the step, drop `actions: read`, or drop
+  # the ambient `GH_TOKEN`, and the probe reads "cannot determine" forever: every
+  # trailered skip on this fleet degrades into a bump. That is the SAFE direction
+  # — status-quo churn, never pin drift — so no run turns red and no caller
+  # breaks. Nothing else in this repo would ever notice the trailer had quietly
+  # stopped working.
+  if [[ -z "$OWED_STEP_NAME" ]]; then
+    bad "${file}: could not read OWED_BUMP_STEP_NAME out of preflight.sh — the step-name contract cannot be checked"
+  elif grep -qxF "      - name: ${OWED_STEP_NAME}" "$path"; then
+    ok "${file}: names its bump step exactly '${OWED_STEP_NAME}'"
+  else
+    bad "${file}: has no step named exactly '${OWED_STEP_NAME}' — preflight.sh's owed-bump probe keys the whole \"did that run really bump?\" question on that name, so renaming it silently degrades every trailered skip on this fleet into a bump"
+  fi
+
+  # Workflow-level `permissions:` only. A job-level block REPLACES it wholesale,
+  # so one that omitted `actions: read` would leave the probe unable to read the
+  # history while this check passed on the top-level grant — assert there is no
+  # second block rather than trying to reconcile two.
+  if grep -q '^    permissions:' "$path"; then
+    bad "${file}: declares a JOB-level permissions: block, which REPLACES the workflow-level one — this check reads only the workflow-level grant, so \`actions: read\` may be silently absent from the job that runs the preflight"
+  elif awk '/^permissions:/{inp=1;next} inp && /^[^ ]/{inp=0} inp && /^  actions: read[ \t]*$/{found=1} END{exit !found}' "$path"; then
+    ok "${file}: grants actions: read for the owed-bump probe"
+  else
+    bad "${file}: does not grant \`actions: read\` — the owed-bump probe cannot list this fleet's runs, so it reads every trailered push as indeterminate and bumps anyway"
+  fi
+
+  gh_token="$(parse_preflight_env "$path" GH_TOKEN)"
+  if [[ "$gh_token" == *'github.token'* ]]; then
+    ok "${file}: wires the ambient github.token into the Preflight step"
+  else
+    bad "${file}: the Preflight step has no \`GH_TOKEN: \${{ github.token }}\` env (parsed '${gh_token}') — the owed-bump probe's \`gh api\` calls would be unauthenticated, so it can never rule out an owed catch-up"
+  fi
 done
 
 # --- parser self-test --------------------------------------------------------
@@ -376,6 +423,14 @@ done
 # parser's REJECTIONS are unexercised there — and a parser that reads a shape
 # differently from preflight.sh is exactly how this test would certify a config
 # the runtime misparses. These fixtures pin the divergences that matter.
+echo
+echo "== owed-bump step-name constant =="
+if [[ -n "$OWED_STEP_NAME" ]]; then
+  ok "preflight.sh defines OWED_BUMP_STEP_NAME ('${OWED_STEP_NAME}')"
+else
+  bad "preflight.sh no longer defines a single-quoted OWED_BUMP_STEP_NAME — the per-fleet step-name contract above degraded to a no-op"
+fi
+
 echo
 echo "== parser self-test =="
 

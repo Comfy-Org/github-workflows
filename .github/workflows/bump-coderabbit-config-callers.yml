@@ -63,6 +63,11 @@ on:
 
 permissions:
   contents: read
+  # Read-only, and read by the PREFLIGHT step alone (BE-10008): before it
+  # honors a `Skip-caller-bump: true` trailer, the guard reads this fleet's own
+  # Actions run history to check no earlier watched change is still owed a bump.
+  # It stays well ahead of the org-wide write token minted further down.
+  actions: read
 
 # Serialize runs of this fleet. The bumper pushes to a STABLE branch
 # (ci/bump-coderabbit-config-validate) shared across runs, so two overlapping runs
@@ -111,6 +116,11 @@ jobs:
           NEW_SHA: ${{ github.sha }}
           WATCHED: .github/workflows/coderabbit-config-validate.yml
           WATCHED_ASSETS: .github/coderabbit-config
+          # Read-only ambient token, for the owed-bump probe's `actions: read`
+          # history lookup only (BE-10008). Never a write credential: the
+          # Cloud Code Bot token is minted after — and only if — this step says
+          # proceed. Absent, the probe reads as "cannot determine" and bumps.
+          GH_TOKEN: ${{ github.token }}
         run: bash .github/bump-callers/preflight.sh
 
       - name: Generate Cloud Code Bot token
