@@ -144,6 +144,17 @@ BODY_ONLY_SENTINEL_BODY_CHARS = 600
 # round demoted nothing", so it is a constant here rather than a literal in the render.
 BODY_ONLY_PROSE_MARKER = "could not be anchored to a line the reviewed diff carries"
 BODY_ONLY_TRUNCATION_MARKER = " …[truncated]"
+# What render_findings_markdown puts between the head and the first finding. A
+# constant because the wholesale fallback's size guard has to measure everything that
+# precedes finding one, and a guard that re-spelled this separator would drift from it.
+FINDINGS_SEPARATOR = "\n\n---\n\n"
+# What clamp_review_body appends in place of what it cut. Also a constant because the
+# same size guard has to RESERVE it: the clamp cuts at `limit - len(note)`, so a head
+# that merely fits under the limit can still have its tail — the sentinel — taken.
+CLAMP_TRUNCATION_NOTE = (
+    "\n\n_…truncated here: the review body reached GitHub's size limit. As much "
+    "of it as fits is in the job summary of this run._"
+)
 
 
 def normalize_severity(value) -> str:
@@ -801,10 +812,7 @@ def clamp_review_body(body: str, limit: int = MAX_REVIEW_BODY_CHARS) -> str:
     body = encodable(body)
     if len(body) <= limit:
         return body
-    note = (
-        "\n\n_…truncated here: the review body reached GitHub's size limit. As much "
-        "of it as fits is in the job summary of this run._"
-    )
+    note = CLAMP_TRUNCATION_NOTE
     if limit <= len(note):
         # Degenerate limit (tests, a future tightening): the cut still has to hold.
         return body[:limit]
@@ -953,9 +961,17 @@ def render_body_only_sentinel(items: list) -> str:
     That blanket replace is safe because the only JSON tokens outside string literals
     here are `[`, `]`, `{`, `}`, `,`, `:` and the digits of `line` — normalize_comments
     guarantees `line` is a POSITIVE int, so no `-` can appear as a number's sign.
+
+    `lost_to_fallback` (BE-10002) is emitted ONLY for an item that carries it, so a
+    success-path payload stays byte-identical to what this rendered before the key
+    existed. It marks a finding that anchored fine and lost its thread to the failed
+    POST rather than to the diff — presentation only on the reading side, since the
+    mechanical consequences of `anchored: false` are correct for it either way. The
+    key name carries no `-`, so the escape above already covers it.
     """
-    payload = [
-        {
+    payload = []
+    for item in items:
+        entry = {
             # neutralize_mentions, like render_code_ref does for the prose half. The
             # body was already neutralized in normalize_comments, but `path` is raw
             # model output until it is rendered — and this render is still a POSTed
@@ -971,8 +987,9 @@ def render_body_only_sentinel(items: list) -> str:
                 )
             ),
         }
-        for item in items
-    ]
+        if item.get("lost_to_fallback"):
+            entry["lost_to_fallback"] = True
+        payload.append(entry)
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     escaped = encoded.replace("-", "\\u002d")
     return f"<!-- {BODY_ONLY_SENTINEL_PREFIX} {escaped} -->"
@@ -1013,7 +1030,7 @@ def render_findings_markdown(review_body: str, comments: list[dict]) -> str:
     """
     md = review_body
     if comments:
-        md += "\n\n---\n\n"
+        md += FINDINGS_SEPARATOR
         for c in comments:
             md += render_finding_entry(c) + "\n\n"
     return md
@@ -1366,11 +1383,10 @@ def main():
         # build-ledger.py parses back out of this body, so a fully-demoted round can no
         # longer read as a review that found nothing. Those entries are permanently
         # UNANSWERED, hence cap-exempt, which is the same rule an unanswered thread
-        # already gets. What is still open: the WHOLESALE fallback body (the 422 path
-        # below) carries no sentinel, because it is not rendered through
-        # render_body_only_findings — so its findings do not reach the ledger. It does
-        # carry the prose marker, so that round degrades loudly rather than silently.
-        review_body += f"\n\n---\n\n{body_only_md}"
+        # already gets. Since BE-10002 the WHOLESALE fallback body (the 422 path below)
+        # carries a sentinel of its own too, so a round whose findings were lost to a
+        # failed POST reaches the ledger as well.
+        review_body += f"{FINDINGS_SEPARATOR}{body_only_md}"
 
     # Every finding, most → least urgent, for any render that has no inline half.
     prose_body = render_findings_markdown(review_head, [i["comment"] for i in enriched])
@@ -1437,13 +1453,11 @@ def main():
     # Fallback: same findings without inline anchors. Typical cause is line
     # numbers that fall outside the diff context — often the model picked
     # a line near the change but not on the change.
-    # The note carries BODY_ONLY_PROSE_MARKER deliberately. This body has no sentinel —
-    # it is not rendered through render_body_only_findings, and adding one is the wrong
-    # move on a request that just 422'd for being unacceptable (see the PR's Residual).
-    # But without the marker, next round's build_ledger saw neither entries NOR a
-    # degradation for a round on which EVERY finding is body-only, so a fallback-posted
-    # round read as a review that found nothing and the round after it looked like a
-    # first round. The marker alone costs a sentence and keeps the disclosure honest.
+    # The note carries BODY_ONLY_PROSE_MARKER deliberately. Without it, next round's
+    # build_ledger saw neither entries NOR a degradation for a round on which EVERY
+    # finding is body-only, so a fallback-posted round read as a review that found
+    # nothing and the round after it looked like a first round. The marker alone costs a
+    # sentence and keeps the disclosure honest.
     #
     # It goes in the HEAD, for exactly the reason the section marker had to move above
     # the sentinel: clamp_review_body cuts the TAIL. Appended after the findings the
@@ -1459,8 +1473,55 @@ def main():
         "below instead. None of them has a review thread, so there is nowhere to "
         "reply to one or resolve it.)_"
     )
+    # …and the sentinel goes DIRECTLY under that note (BE-10002), in the same
+    # marker → sentinel → prose order render_body_only_findings uses and for the same
+    # two reasons: build-ledger.py accepts a sentinel only when the marker line sits
+    # immediately above it, and a tail clamp then eats the least-urgent PROSE rather
+    # than the JSON. Until this, the fallback posted the marker alone, so the ledger
+    # disclosed the degradation loudly and recovered ZERO entries — including for the
+    # findings that anchored perfectly well and lost their thread only to the failed
+    # POST. Every finding of the round is in it: the ones from `inline_items` tagged
+    # `lost_to_fallback`, the ones already unanchorable left untagged, since the POST
+    # outcome changed nothing for them.
+    #
+    # Tagged by identity, not by value: `inline_items` and `body_only_items` hold the
+    # very objects `enriched` does, and two findings can be equal without being the
+    # same one. Iterating `enriched` is what keeps the sentinel in the same most →
+    # least urgent order as the prose below it.
+    lost_ids = {id(item) for item in inline_items}
+    sentinel_items = [
+        {**item, "lost_to_fallback": True} if id(item) in lost_ids else item
+        for item in enriched
+    ]
+    fallback_head_with_sentinel = (
+        f"{fallback_head}\n\n{render_body_only_sentinel(sentinel_items)}"
+    )
+    # Size guard: the sentinel is a best-effort addition, never a reason for the clamp
+    # to reach the note above it. If it would not fit ahead of the first finding — so
+    # many findings that their JSON overruns the limit by itself, or a huge panel
+    # summary — drop it and post exactly what this path posted before, which the ledger
+    # still reads as a disclosed truncation rather than a silent round.
+    #
+    # The clamp's own note is RESERVED here, not merely the limit tested. The clamp
+    # cuts at `limit - len(note)`, so a head+sentinel that fits the limit by less than
+    # that can still be cut mid-JSON — and drop_unterminated_comment then removes the
+    # sentinel back to its opener, taking every finding after it with it. That is a
+    # ~120-char window (measured: 89 findings, one long path) in which the review
+    # collapsed from 60,000 characters of findings to a 494-character header. Reserving
+    # the note closes it: the sentinel is either posted whole or not posted at all.
+    if (
+        len(fallback_head_with_sentinel) + len(FINDINGS_SEPARATOR)
+        > MAX_REVIEW_BODY_CHARS - len(CLAMP_TRUNCATION_NOTE)
+    ):
+        print(
+            "Review: the fallback's body-only sentinel does not fit under the size "
+            "limit — posting the marker alone, so next round's ledger discloses the "
+            "loss instead of recovering the findings.",
+            file=sys.stderr,
+        )
+        fallback_head_with_sentinel = fallback_head
     fallback_body = render_findings_markdown(
-        fallback_head, [i["comment"] for i in enriched]
+        fallback_head_with_sentinel, [i["comment"] for i in enriched]
     )
     clamped_fallback = clamp_review_body(fallback_body)
     fallback_payload = json.dumps(
