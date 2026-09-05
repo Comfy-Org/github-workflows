@@ -66,7 +66,7 @@ jobs:
       # head sha and does every write with the CLOUD_CODE_BOT App token, so no
       # pull-requests/issues GITHUB_TOKEN scope is needed here.
       contents: read
-    uses: Comfy-Org/github-workflows/.github/workflows/assign-reviewers.yml@29a81cab43766adc52a6f2adadcab63f0db7f6c5 # main @ 29a81ca — assign-reviewers.yml not on the v1 tag
+    uses: Comfy-Org/github-workflows/.github/workflows/assign-reviewers.yml@d94e03209cc91e271d1b38e1d3b355c4eb46e6a5 # main @ d94e032 — assign-reviewers.yml not on the v1 tag
     with:
       # ONE assignee per PR, matching how this repo's PRs are actually tracked
       # (a single named owner, not a pair). Raise to 2 if single-owner PRs start
