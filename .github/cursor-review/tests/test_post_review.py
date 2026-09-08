@@ -668,6 +668,154 @@ class BodyBudgetTest(unittest.TestCase):
                 # …and the round still reaches the ledger, partially rather than not.
                 self.assertGreater(ledger_from_posted_body(body)["entry_count"], 20)
 
+    def test_the_success_path_s_sentinel_never_displaces_the_findings_a_reader_can_see(self):
+        """The same prose floor, on the path that posts SUCCESSFULLY (BE-12535).
+
+        The 422 fallback got this guard first; the success path's demoted-findings
+        section kept the all-or-nothing rule and inherited the identical cliff.
+        Measured before this fix, with one anchorable finding plus n demoted ones of
+        ~700 chars: n=60 posted 60,000 characters carrying 45 ledger entries but only
+        27 visible findings, n=90 posted the same 60,000 characters with ONE visible
+        finding, and at n=91 the sentinel finally overran the whole body — the clamp cut
+        inside its JSON, `drop_unterminated_comment` rewound to the opener and took
+        every finding with it, and the round posted a 420-character header with zero
+        ledger entries and zero visible findings. The rounds with the most to report
+        showed the least, and the largest of them showed nothing at all.
+
+        Reachable only through the judge-failed raw-panel branch of cursor-review.yml,
+        which unions every cell's findings with no count cap; the judge-ok branch caps
+        at 10. That makes it the branch that runs when the review is already degraded.
+        """
+        for n in (60, 90, 91, 100, 130):
+            with self.subTest(findings=n):
+                findings = [finding("app.py", 11, body="anchorable " + "z" * 700)]
+                findings += [
+                    finding("app.py", 900 + i, body=f"demoted {i} " + "z" * 700)
+                    for i in range(n)
+                ]
+                # The success path posts once: `posted[0]`, not the fallback's `[1]`.
+                body = EndToEndPostTest().run_main(findings)[0]["body"]
+                self.assertIn(PROSE_MARKER, body)
+                self.assertLessEqual(len(body), PR.MAX_REVIEW_BODY_CHARS)
+                # The half the sentinel may never take.
+                self.assertGreaterEqual(
+                    len(visible(body)),
+                    PR.MAX_REVIEW_BODY_CHARS // 2 - len(PR.CLAMP_TRUNCATION_NOTE),
+                    "the prose floor holds",
+                )
+                self.assertGreater(
+                    visible(body).count("demoted "), 20, "and a reader sees findings"
+                )
+                self.assertGreater(
+                    ledger_from_posted_body(body)["entry_count"], 20,
+                    "…while the round still reaches next round's ledger",
+                )
+
+    def test_the_success_path_s_sentinel_is_never_posted_where_the_clamp_would_cut_it(self):
+        """The reserve half of the guard, on the success path (BE-12535).
+
+        `main()` subtracts CLAMP_TRUNCATION_NOTE, the measured head and the separator
+        before handing `render_body_only_findings` a budget, so the sentinel's closing
+        `-->` always sits ahead of the cut point. Without that reserve there is a window
+        `len(CLAMP_TRUNCATION_NOTE)` wide in which the sentinel fits the raw limit but
+        not the clamp's cut — posted, cut mid-JSON, rewound to its opener, taking the
+        prose below it. Swept across the boundary with a padded `path` (model output,
+        length-checked nowhere) rather than pinned to one fixture that lands in it.
+        """
+        for pad in range(0, 400, 80):
+            with self.subTest(path_padding=pad):
+                findings = [finding("app.py", 11, body="anchorable " + "z" * 700)]
+                findings += [
+                    finding("app.py", 900 + i, body=f"demoted {i} " + "z" * 700)
+                    for i in range(88)
+                ]
+                findings += [finding("p" * (pad + 1) + ".py", 8000, body="z" * 700)]
+                body = EndToEndPostTest().run_main(findings)[0]["body"]
+                self.assertIn(PROSE_MARKER, body, "the disclosure is never optional")
+                # Measured on the VISIBLE body: `len(body)` counts tens of thousands of
+                # characters of HTML comment that render as nothing, so it stays large
+                # on exactly the body that shows a reader no findings.
+                self.assertGreater(
+                    visible(body).count("demoted "), 20,
+                    "the review never collapses to a bare header — findings still render",
+                )
+                ledger = ledger_from_posted_body(body)
+                if PR.BODY_ONLY_SENTINEL_PREFIX in body:
+                    self.assertGreater(ledger["entry_count"], 0, "a posted sentinel parses")
+                else:
+                    self.assertEqual(ledger["unrecovered_rounds"], 1, "…or it degrades loudly")
+
+    def test_the_success_path_sentinel_keeps_the_most_urgent_prefix(self):
+        """A prefix, not a sample — the success path's half of
+        test_the_sentinel_keeps_the_most_urgent_findings_when_it_cannot_keep_all.
+
+        `enriched` is severity-sorted and `partition_by_anchor` preserves that order, so
+        the demoted findings the budget keeps are the ones next round most needs back,
+        in the same order as the prose below them. The critical is cited LAST in the
+        input so the assertion tests the severity sort rather than the input order.
+        """
+        findings = [
+            finding("app.py", 900 + i, severity="low", body=f"low {i} " + "z" * 700)
+            for i in range(99)
+        ]
+        findings += [finding("app.py", 999, severity="critical", body="C " + "z" * 700)]
+        body = EndToEndPostTest().run_main(findings)[0]["body"]
+        # Read the PAYLOAD, not the ledger: build_ledger re-sorts its entries, so the
+        # order the sentinel was WRITTEN in — the thing under test — only survives here.
+        sentinel = [
+            ln for ln in body.splitlines()
+            if ln.startswith(f"<!-- {PR.BODY_ONLY_SENTINEL_PREFIX} ")
+        ]
+        self.assertEqual(len(sentinel), 1, "exactly one sentinel line")
+        payload = json.loads(
+            sentinel[0][len("<!-- ") + len(PR.BODY_ONLY_SENTINEL_PREFIX) : -len(" -->")]
+        )
+        self.assertGreater(len(payload), 0)
+        self.assertLess(len(payload), 100, "not all of them fit")
+        self.assertEqual(payload[0]["severity"], "critical", "the most urgent is kept")
+        # The kept set is the leading run of the severity-sorted order, not a scatter
+        # through it: the critical, then the lows in the order they were cited.
+        self.assertEqual(
+            [e["line"] for e in payload],
+            [999] + [900 + i for i in range(len(payload) - 1)],
+        )
+
+    def test_render_body_only_findings_without_a_budget_is_unchanged(self):
+        """`budget=None` is today's behaviour, byte-identical. Every non-`main()` reader
+        of this function gets what it always got, and the round-trip tests above keep
+        pinning the unbudgeted render."""
+        items = PR.normalize_comments(
+            [finding("app.py", 900 + i, body=f"demoted {i}") for i in range(12)]
+        )
+        self.assertEqual(
+            PR.render_body_only_findings(items),
+            PR.render_body_only_findings(items, budget=None),
+        )
+        rendered = PR.render_body_only_findings(items)
+        self.assertIn(
+            PR.render_body_only_sentinel(items), rendered,
+            "the unbudgeted sentinel carries every item",
+        )
+
+    def test_a_budget_nothing_fits_posts_the_marker_alone_on_the_success_path(self):
+        """The floor, on the success path: when not even the first finding's JSON fits,
+        the sentinel is dropped whole and the section carries what it carried before the
+        sentinel existed — the marker, which next round reads as a disclosed truncation
+        rather than as a round that found nothing. The PROSE is never what gets dropped.
+        """
+        marker = (
+            f"_The finding(s) below {PROSE_MARKER}, so they are reported here "
+            "instead of inline:_\n\n"
+        )
+        items = PR.normalize_comments(
+            [finding("app.py", 900 + i, body=f"demoted {i}") for i in range(12)]
+        )
+        rendered = PR.render_body_only_findings(items, budget=len(marker) + 10)
+        self.assertIn(PROSE_MARKER, rendered, "the disclosure survives")
+        self.assertNotIn(PR.BODY_ONLY_SENTINEL_PREFIX, rendered, "the sentinel does not")
+        for i in range(12):
+            self.assertIn(f"demoted {i}", rendered, "and every finding is still shown")
+
     def test_the_sentinel_keeps_the_most_urgent_findings_when_it_cannot_keep_all(self):
         """A prefix, not a sample: `enriched` is severity-sorted, so the findings the
         budget keeps are the ones next round most needs back — and they stay in the same
@@ -870,7 +1018,7 @@ class FitSentinelItemsTest(unittest.TestCase):
     def test_the_budget_reserves_the_clamp_note_when_the_head_dominates(self):
         """The other half of the size guard, and the half the prose floor hides.
 
-        `sentinel_budget` is `min(FALLBACK_SENTINEL_MAX_CHARS, limit - note - head - …)`.
+        `sentinel_budget` is `min(SENTINEL_MAX_CHARS, limit - note - head - …)`.
         On an ordinary round the first term wins and the reserve never binds, so it is
         pinned here on the input where the SECOND term wins: a panel summary — the one
         finding-independent part of the head a caller controls — large enough to make
