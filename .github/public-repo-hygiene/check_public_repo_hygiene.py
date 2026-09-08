@@ -97,17 +97,27 @@ import unicodedata
 #   * The class is ASCII-only, so a non-ASCII letter is a boundary. `\b` treats
 #     one as a word character, which made `<any-cyrillic-char>BE-1234` a way to
 #     carry a ticket id past the check.
-TICKET_RE = re.compile(r"(?<![A-Za-z0-9])[A-Z]{2,6}-\d{2,6}(?![A-Za-z0-9])")
+# The digits are `[0-9]`, not `\d`, for the same reason the class is ASCII-only:
+# `\d` also matches Unicode decimal digits, so `BE-` followed by seven
+# Arabic-Indic digits took six into the body and then found the seventh OUTSIDE
+# `[A-Za-z0-9]` -- a boundary -- and matched, while the ASCII `BE-1234567` does
+# not. The 2-6 digit bound this file documents has to be one bound, not one per
+# script.
+TICKET_RE = re.compile(r"(?<![A-Za-z0-9])[A-Z]{2,6}-[0-9]{2,6}(?![A-Za-z0-9])")
 # Only entries that TICKET_RE can actually MATCH belong here: 2-6 letters AND
 # 2-6 digits. `UTF-8`, `OAUTH-2`, `IPV-4`, `IPV-6` and `X-25519` were carried
 # for years and could never fire (too few digits, or too few letters); the
 # tests enforce that every entry is matchable so the dead-entry trap cannot
 # reopen. An acronym whose NAMESPACE is public (`UTF-16`, `RFC-1123`,
 # `ISO-27001`, every `CVE-####`) belongs in TICKET_ALLOWED_PREFIXES below
-# instead -- do not re-list those here.
+# instead -- do not re-list those here. `ISO-8601`, `RFC-2119`, `RFC-7231` and
+# `RFC-3339` were exactly that second flavour of dead entry: matchable, but
+# already cleared by the `ISO`/`RFC` prefixes, so deleting them changes no
+# outcome. Both flavours are pinned by tests -- an entry must be matchable AND
+# not already prefix-cleared -- because "it reads as coverage" is what let the
+# first five sit here for months.
 TICKET_ALLOWLIST = frozenset(
     {
-        "ISO-8601",
         "SHA-224",
         "SHA-256",
         "SHA-384",
@@ -115,9 +125,6 @@ TICKET_ALLOWLIST = frozenset(
         "AES-128",
         "AES-192",
         "AES-256",
-        "RFC-2119",
-        "RFC-7231",
-        "RFC-3339",
         "WIN-32",
         "WIN-64",
     }
@@ -127,8 +134,9 @@ TICKET_ALLOWLIST = frozenset(
 # boundary holds against the following hyphen -- so a SECURITY.md, a dependency
 # changelog or a patch note trips what adopters wire in as a REQUIRED check.
 # Clearing that token-by-token would cost one entry per year prefix and break
-# again each January; `CWE-89`, `PEP-484` and any `RFC-####`/`ISO-####` outside
-# the three hard-coded RFCs above are the same shape -- as is `UTF-16`/`UTF-32`,
+# again each January; `CWE-89`, `PEP-484` and every `RFC-####`/`ISO-####` --
+# `RFC-3339` and `ISO-8601` included -- are the same shape, as is
+# `UTF-16`/`UTF-32`,
 # the only ticket-SHAPED members of a namespace the exact list once represented
 # with the unmatchable `UTF-8`. None of these is a plausible internal team key,
 # so the namespace is the right granularity. (BE-8654 review.)

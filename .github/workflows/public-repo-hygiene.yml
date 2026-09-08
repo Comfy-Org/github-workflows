@@ -64,7 +64,7 @@ name: Public Repo Hygiene (reusable)
 #   ticket_allowlist   Newline- or comma-separated acronyms that LOOK like
 #                      ticket IDs but are not (`GPU-100`, a product SKU, a spec
 #                      number). ADDITIVE on top of the built-in list
-#                      (SHA-256, AES-192, RFC-3339, …) — a caller can extend
+#                      (SHA-256, AES-192, WIN-64, …) — a caller can extend
 #                      it, never shrink it. Matched case-insensitively.
 #                      Default empty.
 #   exclude_paths      Newline- or comma-separated tracked paths to skip.

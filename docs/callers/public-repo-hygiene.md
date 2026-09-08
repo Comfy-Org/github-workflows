@@ -9,7 +9,7 @@ CI if it finds any:
 
 1. **Ticket-style identifiers** — `TEAM-1234`-shaped tokens. A generic shape, never a list of
    real internal team keys, so the check itself discloses nothing. Common tech acronyms
-   (`SHA-256`, `AES-192`, `RFC-3339`, …) are allowlisted, as are the public identifier namespaces
+   (`SHA-256`, `AES-192`, `WIN-64`, …) are allowlisted, as are the public identifier namespaces
    `CVE-`, `CWE-`, `PEP-`, `RFC-`, `ISO-` and `UTF-` **by prefix** (so a SECURITY.md citing
    `CVE-2021-44228` is clean, and stays clean next January); add your own with
    `ticket_allowlist:`.

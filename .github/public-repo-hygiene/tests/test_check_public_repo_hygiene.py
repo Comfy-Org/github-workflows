@@ -87,8 +87,15 @@ class TicketIdCategoryTest(CheckerTestCase):
         self.assertTrue(findings[0].startswith("README.md:1:"), findings[0])
 
     def test_builtin_acronyms_are_not_flagged(self):
-        self.repo.write("docs.md", "Encoded UTF-8, hashed SHA-256, dated ISO-8601.\n")
-        self.assertEqual(self.findings(), [])
+        # Driven off TICKET_ALLOWLIST rather than a hand-written sentence: the
+        # sentence used to read `UTF-8` (unmatchable) and `ISO-8601` (cleared
+        # by its namespace prefix, not by its entry), so it passed without
+        # exercising a single exact-list lookup. Every entry is now asserted,
+        # and adding one cannot leave it uncovered.
+        for entry in sorted(checker.TICKET_ALLOWLIST):
+            with self.subTest(entry=entry):
+                self.repo.write("docs.md", f"Documented {entry} here.\n")
+                self.assertEqual(self.findings(), [])
 
     def test_every_allowlist_entry_can_actually_match(self):
         # Anti-vacuity. TICKET_RE needs 2-6 letters AND 2-6 digits, so an
@@ -102,6 +109,22 @@ class TicketIdCategoryTest(CheckerTestCase):
                     checker.TICKET_RE.fullmatch(entry),
                     f"{entry!r} can never match TICKET_RE, so allowlisting "
                     "it does nothing",
+                )
+
+    def test_no_allowlist_entry_is_already_cleared_by_a_prefix(self):
+        # The second flavour of dead entry, and the one the matchability
+        # assertion above cannot see: `ISO-8601` and `RFC-3339` were both
+        # matchable, yet `ISO` and `RFC` are in TICKET_ALLOWED_PREFIXES, so
+        # `_line_findings` never reached the exact list for them. Re-listing a
+        # namespace member here is what the module docstring forbids; this is
+        # what makes the ban hold.
+        for entry in sorted(checker.TICKET_ALLOWLIST):
+            with self.subTest(entry=entry):
+                self.assertNotIn(
+                    entry.split("-", 1)[0],
+                    checker.TICKET_ALLOWED_PREFIXES,
+                    f"{entry!r} is already cleared by its namespace prefix, so "
+                    "the exact entry is dead -- drop it",
                 )
 
     def test_matchable_near_neighbours_are_cleared(self):
@@ -128,6 +151,16 @@ class TicketIdCategoryTest(CheckerTestCase):
         )
         flagged = sorted(f.split(": ")[-1] for f in self.findings())
         self.assertEqual(flagged, ["'ABCDEF-123456'", "'BE-12'"])
+
+    def test_the_digit_body_is_ascii_only(self):
+        # `\d` matches Unicode decimal digits, but the boundaries only exclude
+        # ASCII `[A-Za-z0-9]`. Under `\d`, `BE-` plus seven Arabic-Indic digits
+        # took six into the body and found the seventh outside the class -- a
+        # boundary -- and matched, while the ASCII `BE-1234567` (pinned in
+        # `test_shape_boundaries`) does not. `[0-9]` makes the 2-6 digit bound
+        # mean one thing.
+        self.repo.write("edge.md", "BE-\u0661\u0662\u0663\u0664\u0665\u0666\u0667\n")
+        self.assertEqual(self.findings(), [])
 
     def test_an_underscore_is_not_a_boundary(self):
         # `_` is a word character, so the original `\b`-anchored pattern
@@ -159,8 +192,11 @@ class TicketIdCategoryTest(CheckerTestCase):
     def test_a_glued_alphanumeric_is_still_not_a_match(self):
         # The boundaries loosened for `_` only. A letter or a digit welded to
         # either end is a different token and stays unmatched, exactly as
-        # under `\b`. (A digit welded to the RIGHT is absent on purpose: it is
-        # simply a longer ticket number, which `\d{2,6}` already admits.)
+        # under `\b`. (A digit welded to the RIGHT is out of scope rather than
+        # covered: the shape caps at six digits, so a 7+ digit id such as
+        # `BE-1234567` matches NOTHING -- every backtrack lands on another
+        # digit and the right lookahead rejects it. That known miss is pinned
+        # by `test_shape_boundaries`, not by this test.)
         self.repo.write("edge.md", "xBE-1234 BE-1234x 9BE-1234\n")
         self.assertEqual(self.findings(), [])
 
