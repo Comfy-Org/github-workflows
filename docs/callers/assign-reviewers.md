@@ -27,7 +27,8 @@ buy fork support** — see the fork gotcha below.
 |---|---|
 | `vars.APP_ID` | **Required.** CLOUD_CODE_BOT app id. |
 | `secrets.CLOUD_CODE_BOT_PRIVATE_KEY` | **Required.** |
-| `.github/reviewers.yml` in **your** repo | **Required.** The expertise map. |
+| `.github/reviewers.yml` in **your** repo | **Required for assignment.** The expertise map. |
+| App permission `Actions: read` | Required for cached-history downloads; otherwise assignment uses live history. |
 | `vars.REVIEWER_GROWTH_POOL` | Deprecated and ignored. No random assignments. |
 | `vars.REVIEWER_LOAD_CAP` | Optional. Prefer below-cap owners among equally relevant candidates. |
 | `vars.REVIEWER_EXCLUDE` | Optional. Logins to hard-exclude. |
@@ -43,6 +44,9 @@ name: Assign Reviewers
 on:
   pull_request:
     types: [opened, ready_for_review]
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch: {}
 
 jobs:
   assign:
@@ -51,16 +55,34 @@ jobs:
     # arrives empty, so the App-token step hard-fails and the PR carries a red X
     # for a routing decision that could never have been made. See the gotcha.
     if: >-
-      github.event.pull_request.head.repo.full_name == github.repository
+      github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
       && github.actor != 'dependabot[bot]'
     permissions:
       contents: read
     uses: Comfy-Org/github-workflows/.github/workflows/assign-reviewers.yml@<full-commit-sha>
     with:
       num_reviewers: 2
+      history_workflow: assign-reviewers.yml
+    secrets:
+      CLOUD_CODE_BOT_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+
+  refresh-history:
+    if: >-
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+      && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    permissions:
+      contents: read
+    uses: Comfy-Org/github-workflows/.github/workflows/assign-reviewers.yml@<full-commit-sha>
+    with:
+      generate_history: true
     secrets:
       CLOUD_CODE_BOT_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
 ```
+
+Pin both jobs to the same reviewed SHA. The shared caller bumper updates both
+references in this file. To keep live-only routing, omit `history_workflow`, the
+refresh job, and the schedule/manual triggers.
 
 Then ask a maintainer to add your repo to the `ASSIGN_REVIEWERS_CALLERS` roster secret.
 
@@ -76,9 +98,50 @@ The assignee write goes through the App token.
 
 | Input | Default | Notes |
 |---|---|---|
+| `generate_history` | `false` | Generate a manifest instead of assigning; only schedule/manual dispatch on the default branch is accepted. |
+| `history_workflow` | `''` | Caller workflow filename that publishes the manifest, e.g. `assign-reviewers.yml`. Empty uses live history. |
 | `reviewer_config_path` | `.github/reviewers.yml` | Where your expertise map lives. |
 | `num_reviewers` | `2` | Maximum owners (clamped to 1–10). Extra owners must add file coverage. |
 | `skip_label` | `skip-auto-assign` | Present on a PR ⇒ skip routing. |
+
+## Shared history manifest
+
+Generation is a second **job calling this same reusable workflow**, not a second
+implementation. It uses the same collector as live routing, independent of the PR
+author, author allowlist, exclusions, or reviewer map. It gathers up to 50 recent
+merged PRs on the default branch and publishes `reviewer-history-v1`, a ZIP with
+one `manifest.json` member. The JSON contains schema version, repository, base
+branch, producing run ID, refresh timestamp, and records of PR number, changed
+paths and final human approvers. Review bodies and credentials are never stored.
+
+On a cache hit, the PR job reads the manifest instead of repeating the history
+search and review/file lookups. Current changed files, ownership config, author
+and exclusions, workload, assignability, and manual assignments are still live.
+History can be up to **12 hours old**; cached evidence can include an approval
+withdrawn since refresh. This is advisory owner routing, not approval enforcement.
+The six-hour schedule tolerates a missed refresh. Artifacts expire after two days,
+so four runs daily retain about eight small snapshots, with a 2 MiB payload limit.
+
+Only successful, completed **schedule or workflow_dispatch** runs of the configured
+caller on the same repository's default branch can supply a snapshot. PR and
+workflow_run artifacts are never accepted. The reader checks repository, base,
+run identity, schema, record structure and freshness, and reads exactly one bounded
+JSON member in memory, without extracting or executing archive contents. Historical
+file lists stop at three pages; 300+ file sweeps provide no routing evidence.
+
+Absent, expired, malformed, incompatible, or inaccessible snapshots fall back to
+the live collector. Failed refreshes publish nothing; partial history is never
+saved. The run log reports cache hit/run ID/age or why live lookup was needed.
+Non-default-base PRs use live history because the shared snapshot covers only the
+default branch. Change the schema version when changing the evidence contract.
+
+After merging the caller, open its Actions page and choose **Run workflow** on the
+default branch to seed the snapshot immediately. Subsequent refreshes run on the
+schedule. Check the `Refresh reviewer history` job for the record/byte count and
+its `reviewer-history-v1` artifact, then verify that a qualifying PR reports
+`History cache hit`. Before the first refresh, assignments still work via live
+lookup. The App needs Actions read permission to download artifacts; the caller's
+ambient token remains `contents: read` and is not widened.
 
 ## Your `reviewers.yml`
 

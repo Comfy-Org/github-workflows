@@ -43,6 +43,14 @@ name: Assign Reviewers (reusable)
 # No random substitutions. A second owner must cover previously uncovered code.
 # Decisions and supporting historical PR numbers appear in the run summary.
 #
+# CACHING: a scheduled/manual caller uses generate_history: true to publish a
+# neutral history manifest from the default branch. The PR job opts in with
+# history_workflow: <caller-filename.yml>. Only successful default-branch
+# scheduled/manual runs supply snapshots, valid for 12 hours; all live routing
+# policy still applies. Missing/unusable snapshots fall back to the same live
+# collector. App Actions: read is needed for artifact lookup/download. See the
+# caller guide for the complete two-job schedule + PR wiring.
+#
 # Example caller (consumer repo):
 #
 #   name: CI - Assign Reviewers
@@ -70,6 +78,16 @@ name: Assign Reviewers (reusable)
 on:
   workflow_call:
     inputs:
+      generate_history:
+        description: Generate a shared history artifact on schedule or manual dispatch from the default branch.
+        type: boolean
+        required: false
+        default: false
+      history_workflow:
+        description: Caller workflow filename that generates the artifact; empty disables cached history.
+        type: string
+        required: false
+        default: ''
       reviewer_config_path:
         description: >-
           Path in the caller repo to the expertise/path-glob reviewer config.
@@ -100,11 +118,11 @@ permissions:
 
 jobs:
   assign-reviewers:
-    name: Assign expertise-aware owners
+    name: ${{ inputs.generate_history && 'Refresh reviewer history' || 'Assign expertise-aware owners' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency:
-      group: intelligent-assignment-${{ github.repository }}-${{ github.event.pull_request.number || github.run_id }}
+      group: intelligent-assignment-${{ github.repository }}-${{ inputs.generate_history && 'history' || github.event.pull_request.number || github.run_id }}
       cancel-in-progress: false
     permissions:
       contents: read
@@ -116,9 +134,12 @@ jobs:
           app-id: ${{ vars.APP_ID }}
           private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
 
-      - name: Select and assign owners
+      - name: Collect history or select owners
+        id: selection
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
+          GENERATE_HISTORY: ${{ inputs.generate_history }}
+          HISTORY_WORKFLOW: ${{ inputs.history_workflow }}
           REVIEWER_CONFIG_PATH: ${{ inputs.reviewer_config_path }}
           NUM_REVIEWERS: ${{ inputs.num_reviewers }}
           SKIP_LABEL: ${{ inputs.skip_label }}
@@ -130,9 +151,136 @@ jobs:
           # fork PRs (read-only GITHUB_TOKEN would 403).
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
+            const { owner, repo } = context.repo;
+            const normalizeLogin = (s) => s.replace(/^@/, '').toLowerCase();
+            const validLogin = (s) => typeof s === 'string' && /^[a-z\d](?:[a-z\d-]{0,38})$/i.test(s);
+            const MAX_BYTES = 2 * 1024 * 1024;
+            const MAX_AGE = 12 * 60 * 60 * 1000;
+            const artifactName = 'reviewer-history-v1';
+            const sameRepo = (value) => typeof value === 'string' && value.toLowerCase() === `${owner}/${repo}`.toLowerCase();
+
+            // Collect author-neutral evidence. Both live selection and scheduled refresh
+            // use this exact collector; current author/exclusion/load policy applies later.
+            const collectHistory = async (base) => {
+              const since = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
+              const search = await github.rest.search.issuesAndPullRequests({
+                q: `repo:${owner}/${repo} is:pr is:merged base:"${base}" merged:>=${since}`,
+                sort: 'updated', order: 'desc', per_page: 50,
+              });
+              if (search.data.incomplete_results) throw new Error('incomplete history search');
+              const records = [];
+              for (const item of search.data.items) {
+                const reviews = await github.paginate(github.rest.pulls.listReviews, {owner, repo, pull_number: item.number, per_page: 100});
+                const final = new Map();
+                for (const review of reviews) {
+                  if (!review.user || review.user.type !== 'User' ||
+                      !['MEMBER', 'OWNER', 'COLLABORATOR'].includes(review.author_association)) continue;
+                  if (['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'].includes(review.state)) final.set(normalizeLogin(review.user.login), review.state);
+                }
+                const approvers = [...final].filter(([login, state]) => state === 'APPROVED' && validLogin(login)).map(([login]) => login);
+                if (!approvers.length) continue;
+                // Fetch at most three pages: sweeps of 300+ files are intentionally ignored.
+                const files = [];
+                for (let page = 1; page <= 3; page++) {
+                  const response = await github.rest.pulls.listFiles({owner, repo, pull_number: item.number, per_page: 100, page});
+                  files.push(...response.data);
+                  if (response.data.length < 100) break;
+                }
+                if (files.length >= 300) continue;
+                records.push({number: item.number, approvers, files: files.map(({filename, previous_filename}) => ({filename, ...(previous_filename ? {previous_filename} : {})}))});
+              }
+              return records;
+            };
+
+            if (process.env.GENERATE_HISTORY === 'true') {
+              const repository = (await github.rest.repos.get({owner, repo})).data;
+              if (!['schedule', 'workflow_dispatch'].includes(context.eventName) ||
+                  context.ref !== `refs/heads/${repository.default_branch}`) {
+                core.setFailed('History generation requires schedule or manual dispatch on the default branch.');
+                return;
+              }
+              // Any API failure aborts this refresh. Never publish a partial snapshot.
+              const records = await collectHistory(repository.default_branch);
+              const manifest = {
+                version: 1, repository: `${owner}/${repo}`, base: repository.default_branch,
+                generated_at: new Date().toISOString(),
+                run_id: String(context.runId), records,
+              };
+              const payload = JSON.stringify(manifest);
+              if (Buffer.byteLength(payload) > MAX_BYTES) throw new Error('History manifest exceeds the 2 MiB limit');
+              const fs = require('node:fs');
+              const path = require('node:path');
+              const directory = path.join(process.env.RUNNER_TEMP, 'reviewer-history');
+              fs.mkdirSync(directory, {recursive: true});
+              fs.writeFileSync(path.join(directory, 'manifest.json'), payload);
+              core.setOutput('manifest_ready', 'true');
+              core.info(`Generated ${records.length} history records (${Buffer.byteLength(payload)} bytes).`);
+              return;
+            }
+
+            const readHistory = async (base) => {
+              const workflow = process.env.HISTORY_WORKFLOW || '';
+              if (!workflow) return null;
+              try {
+                if (!/^[a-zA-Z0-9_.-]+\.ya?ml$/.test(workflow)) throw new Error('invalid workflow identity');
+                const repository = (await github.rest.repos.get({owner, repo})).data;
+                if (base !== repository.default_branch) throw new Error('snapshot targets a different base');
+                // Bound lookups and never accept PR/workflow_run artifacts, even if named
+                // identically. Listing by workflow ID alone does not establish provenance.
+                const runs = (await Promise.all(['schedule', 'workflow_dispatch'].map(async (event) =>
+                  (await github.rest.actions.listWorkflowRuns({
+                    owner, repo, workflow_id: workflow, branch: base, status: 'success', event,
+                    created: `>=${new Date(Date.now() - MAX_AGE).toISOString()}`, per_page: 1,
+                  })).data.workflow_runs
+                ))).flat().sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+                const run = runs.find((r) => r.status === 'completed' && r.conclusion === 'success' &&
+                  ['schedule', 'workflow_dispatch'].includes(r.event) && r.head_branch === base &&
+                  r.path === `.github/workflows/${workflow}` && sameRepo(r.head_repository?.full_name) &&
+                  Date.now() - Date.parse(r.created_at) >= 0 && Date.now() - Date.parse(r.created_at) <= MAX_AGE);
+                if (!run) throw new Error('no recent trusted generator run');
+                const artifacts = (await github.rest.actions.listWorkflowRunArtifacts({owner, repo, run_id: run.id, per_page: 100})).data.artifacts;
+                const artifact = artifacts.find((a) => a.name === artifactName && !a.expired);
+                if (!artifact || artifact.size_in_bytes > MAX_BYTES) throw new Error('missing, expired or oversized artifact');
+                const download = await github.rest.actions.downloadArtifact({owner, repo, artifact_id: artifact.id, archive_format: 'zip'});
+                const archive = Buffer.from(download.data);
+                if (archive.length > MAX_BYTES) throw new Error('oversized archive');
+                // Parse one JSON member in memory, never extract paths or execute content.
+                // Python is preinstalled on ubuntu-latest; only its stdlib is used.
+                const payload = require('node:child_process').execFileSync('python3', ['-c', [
+                  'import io, sys, zipfile',
+                  'z = zipfile.ZipFile(io.BytesIO(sys.stdin.buffer.read()))',
+                  'assert len(z.infolist()) == 1',
+                  'entry = z.infolist()[0]',
+                  'assert entry.filename == "manifest.json" and entry.file_size <= 2 * 1024 * 1024',
+                  'sys.stdout.buffer.write(z.read(entry))',
+                ].join('\n')], {input: archive, maxBuffer: MAX_BYTES, timeout: 5000, stdio: ['pipe', 'pipe', 'pipe']});
+                const manifest = JSON.parse(payload.toString('utf8'));
+                const age = Date.now() - Date.parse(manifest.generated_at);
+                if (manifest.version !== 1 || !sameRepo(manifest.repository) || manifest.base !== base ||
+                    manifest.run_id !== String(run.id) ||
+                    !Number.isFinite(age) || age < 0 || age > MAX_AGE ||
+                    Date.parse(manifest.generated_at) < Date.parse(run.created_at) ||
+                    !Array.isArray(manifest.records) || manifest.records.length > 50) throw new Error('invalid or stale manifest');
+                const seen = new Set();
+                const validPath = (p) => typeof p === 'string' && p.length > 0 && p.length <= 4096 && !/[\x00-\x1f]/.test(p);
+                for (const record of manifest.records) {
+                  if (!Number.isSafeInteger(record.number) || record.number <= 0 || seen.has(record.number) ||
+                      !Array.isArray(record.approvers) || record.approvers.length > 1000 || !record.approvers.every(validLogin) ||
+                      new Set(record.approvers.map(normalizeLogin)).size !== record.approvers.length ||
+                      !Array.isArray(record.files) || record.files.length >= 300 ||
+                      !record.files.every((f) => f && validPath(f.filename) && (f.previous_filename === undefined || validPath(f.previous_filename)))) throw new Error('invalid history record');
+                  seen.add(record.number);
+                }
+                core.info(`History cache hit: run ${run.id}, ${Math.round(age / 60000)} minutes old, ${manifest.records.length} records.`);
+                return manifest.records;
+              } catch (error) {
+                core.info(`History cache unavailable (${error.message}); fetching live history.`);
+                return null;
+              }
+            };
+
             let pr = context.payload.pull_request;
             if (!pr) { core.info('Not a pull_request event — nothing to do.'); return; }
-            const { owner, repo } = context.repo;
             const pull_number = pr.number;
 
             // --- 1. Early exits (never fail the PR) ---
@@ -148,7 +296,6 @@ jobs:
             // Logins are matched case-insensitively and tolerate a leading `@`
             // because this gate fails CLOSED: one typo'd entry would otherwise
             // silently disable routing repo-wide with no error to notice.
-            const normalizeLogin = (s) => s.replace(/^@/, '').toLowerCase();
             const authorAllowlist = (process.env.AUTHOR_ALLOWLIST || '')
               .split(/\s+/).filter(Boolean).map(normalizeLogin);
             if (authorAllowlist.length > 0) {
@@ -382,41 +529,25 @@ jobs:
               });
             }
 
-            // Bound discovery to 50 recently updated merged PRs within 90 days on
-            // this base branch. Only final, non-dismissed human approvals are evidence;
-            // bot authorship, assignees and mere comments never imply expertise.
-            const since = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
             let historyComplete = true;
+            let historySource = 'live';
             try {
-              const search = await github.rest.search.issuesAndPullRequests({
-                q: `repo:${owner}/${repo} is:pr is:merged base:"${pr.base.ref}" merged:>=${since}`,
-                sort: 'updated', order: 'desc', per_page: 50,
-              });
-              if (search.data.incomplete_results) throw new Error('incomplete history search');
-              for (const item of search.data.items) {
-                if (item.number === pull_number) continue;
-                const reviews = await github.paginate(github.rest.pulls.listReviews, {owner, repo, pull_number: item.number, per_page: 100});
-                const final = new Map();
-                for (const review of reviews) {
-                  if (!review.user || review.user.type !== 'User' ||
-                      !['MEMBER', 'OWNER', 'COLLABORATOR'].includes(review.author_association)) continue;
-                  if (['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'].includes(review.state)) final.set(normalizeLogin(review.user.login), review.state);
-                }
-                const approved = [...final].filter(([login, state]) => state === 'APPROVED' && eligible(login));
-                if (!approved.length) continue;
-                const oldFiles = await github.paginate(github.rest.pulls.listFiles, {owner, repo, pull_number: item.number, per_page: 100});
-                // Huge historical sweeps are poor ownership evidence and may be truncated.
-                if (oldFiles.length >= 300) continue;
+              const cached = await readHistory(pr.base.ref);
+              const history = cached ?? await collectHistory(pr.base.ref);
+              historySource = cached === null ? 'live' : 'cached';
+              for (const record of history) {
+                if (record.number === pull_number) continue;
+                const oldFiles = record.files;
                 files.forEach((file, index) => {
                   const affinity = Math.max(0, ...oldFiles.flatMap((old) => paths(file).flatMap((a) => paths(old).map((b) => sameArea(a, b)))));
                   if (!affinity) return;
-                  for (const [login] of approved) {
+                  for (const login of record.approvers.map(normalizeLogin).filter(eligible)) {
                     // A maintained rule defines eligibility for its area. History refines
                     // that roster; it only discovers new owners for unmapped files.
                     const person = candidate(login);
                     if (matched.has(index) && !person.configured.has(index)) continue;
                     if (!person.history.has(index)) person.history.set(index, []);
-                    person.history.get(index).push({number: item.number, affinity});
+                    person.history.get(index).push({number: record.number, affinity});
                   }
                 });
               }
@@ -490,7 +621,7 @@ jobs:
             const explanation = [
               `PR #${pull_number}: ${files.length} changed files; ${covered.size} covered by expertise.`,
               ...decisions,
-              `History: ${historyComplete ? 'up to 50 recently updated merged PRs, last 90 days' : 'unavailable; configured expertise only'}.`,
+              `History: ${historyComplete ? `${historySource}; up to 50 recently updated merged PRs, last 90 days` : 'unavailable; configured expertise only'}.`,
             ];
             explanation.forEach((line) => core.info(line));
             // Escape all external text. Summary only, no comments or extra notifications.
@@ -537,3 +668,13 @@ jobs:
             } catch (e) {
               core.warning(`addAssignees failed (${e.message}) — leaving PR unassigned.`);
             }
+
+      - name: Publish reviewer history manifest
+        if: inputs.generate_history && steps.selection.outputs.manifest_ready == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: reviewer-history-v1
+          path: ${{ runner.temp }}/reviewer-history/manifest.json
+          archive: true
+          retention-days: 2
+          if-no-files-found: error
