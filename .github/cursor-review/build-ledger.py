@@ -186,6 +186,20 @@ _BODY_ONLY_SENTINEL_RE = re.compile(
     re.DOTALL | re.MULTILINE,
 )
 
+# post-review.py's companion to the line above, emitted only when a size budget cut the
+# payload down to a PREFIX of the round's demoted findings. Pinned to the same
+# single-spaced OPENER, and for the same reason: the writer defangs exactly this literal
+# in text it quotes, so a reader more tolerant than the defang is a reader the defang
+# does not cover. What follows the opener is NOT pinned, because nothing here reads it:
+# the presence of the line is the whole claim ("findings were dropped"), and pinning
+# `kept=N total=N` would let a shape this reader did not expect turn a DISCLOSED loss
+# back into a silent one — the failure the companion exists to remove. The counts are
+# for a human reading the raw body.
+BODY_ONLY_TRUNCATED_OPENER = "<!-- cursor-review:body-only-truncated v1 "
+_BODY_ONLY_TRUNCATED_RE = re.compile(
+    re.escape(BODY_ONLY_TRUNCATED_OPENER) + r"[^\n]*?-->"
+)
+
 # post_error_review's shape, as its own f-string renders it. See _body_only_entries:
 # this is the one consolidated body whose imported text sits at column 0, and the
 # writer-side defang that protects it only exists in bodies written by THIS version.
@@ -433,8 +447,11 @@ def _body_only_text(value) -> str:
 def _body_only_entries(review: dict, meta: dict, max_body: int):
     """(entries, degraded) for one consolidated review's demoted findings.
 
-    ``degraded`` is True when the review says it demoted findings but the sentinel
-    could not be read — the caller discloses that as a truncation note.
+    ``degraded`` is True when the review says it demoted findings that are not in the
+    returned entries — because the sentinel could not be read at all, or because the
+    writer's size budget cut it to a prefix and said so. The caller discloses either as
+    a truncation note. Entries and ``degraded`` are INDEPENDENT: a prefix payload
+    returns both real entries and True.
 
     An ERROR review is refused outright, before either half is looked at. It is the one
     consolidated body that renders unbounded judge/CLI text in a FENCE rather than a
@@ -457,6 +474,15 @@ def _body_only_entries(review: dict, meta: dict, max_body: int):
     parsed = _parse_body_only_sentinel(review.get("body") or "")
     if parsed is None:
         return [], BODY_ONLY_PROSE_MARKER in (review.get("body") or "")
+    # A sentinel the writer's size budget cut down to a PREFIX parses perfectly — it is
+    # valid JSON, just not all of it — so the entries recovered below are real AND the
+    # round is degraded at the same time. Without this the omitted findings vanish with
+    # no `unrecovered_rounds` entry and no note, which is strictly worse than the
+    # all-or-nothing rule the budget replaced: THAT one degraded loudly, because a
+    # dropped sentinel does not parse. Absent on a body an older writer posted, which
+    # reads as "not truncated" — the same answer that writer's all-or-nothing payload
+    # actually warranted.
+    truncated = bool(_BODY_ONLY_TRUNCATED_RE.search(review.get("body") or ""))
     entries = []
     for item in parsed:
         entry = {
@@ -493,7 +519,7 @@ def _body_only_entries(review: dict, meta: dict, max_body: int):
         if item.get("lost_to_fallback") is True:
             entry["lost_to_fallback"] = True
         entries.append(entry)
-    return entries, False
+    return entries, truncated
 
 
 def _resolve_root_id(comment: dict, by_id: dict):
