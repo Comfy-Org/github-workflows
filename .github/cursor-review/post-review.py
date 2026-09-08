@@ -179,6 +179,29 @@ BODY_ONLY_SENTINEL_BODY_CHARS = 600
 # round demoted nothing", so it is a constant here rather than a literal in the render.
 BODY_ONLY_PROSE_MARKER = "could not be anchored to a line the reviewed diff carries"
 BODY_ONLY_TRUNCATION_MARKER = " …[truncated]"
+# What render_findings_markdown puts between the head and the first finding. A
+# constant because the wholesale fallback's size guard has to measure everything that
+# precedes finding one, and a guard that re-spelled this separator would drift from it.
+FINDINGS_SEPARATOR = "\n\n---\n\n"
+# What clamp_review_body appends in place of what it cut. Also a constant because the
+# same size guard has to RESERVE it: the clamp cuts at `limit - len(note)`, so a head
+# that merely fits under the limit can still have its tail — the sentinel — taken.
+CLAMP_TRUNCATION_NOTE = (
+    "\n\n_…truncated here: the review body reached GitHub's size limit. As much "
+    "of it as fits is in the job summary of this run._"
+)
+# The share of the fallback body the sentinel may take. It has TWO readers and the
+# HUMAN comes first: the prose findings are the review a person actually reads on the
+# PR, and the sentinel is a best-effort machine-readable copy for next round's ledger.
+# Uncapped, the sentinel wins that contest — its per-finding JSON is nearly as long as
+# the prose entry it duplicates, so it can consume the whole budget ahead of finding
+# one and leave the clamp nothing but the head to keep. Measured before this cap: 89
+# findings of ~700 chars posted 58,720 characters of JSON and rendered ZERO findings,
+# while the same round at 90 findings — one over the all-or-nothing guard, so the
+# sentinel was dropped whole — rendered 79 of them. The cliff ran the wrong way.
+# Half the budget is the prose FLOOR; the sentinel takes the most-urgent prefix of the
+# findings that fits the other half (see fit_sentinel_items).
+FALLBACK_SENTINEL_MAX_CHARS = MAX_REVIEW_BODY_CHARS // 2
 
 
 def normalize_severity(value) -> str:
@@ -840,10 +863,7 @@ def clamp_review_body(body: str, limit: int = MAX_REVIEW_BODY_CHARS) -> str:
     body = encodable(body)
     if len(body) <= limit:
         return body
-    note = (
-        "\n\n_…truncated here: the review body reached GitHub's size limit. As much "
-        "of it as fits is in the job summary of this run._"
-    )
+    note = CLAMP_TRUNCATION_NOTE
     if limit <= len(note):
         # Degenerate limit (tests, a future tightening): the cut still has to hold.
         return body[:limit]
@@ -992,9 +1012,17 @@ def render_body_only_sentinel(items: list) -> str:
     That blanket replace is safe because the only JSON tokens outside string literals
     here are `[`, `]`, `{`, `}`, `,`, `:` and the digits of `line` — normalize_comments
     guarantees `line` is a POSITIVE int, so no `-` can appear as a number's sign.
+
+    `lost_to_fallback` (BE-10002) is emitted ONLY for an item that carries it, so a
+    success-path payload stays byte-identical to what this rendered before the key
+    existed. It marks a finding that anchored fine and lost its thread to the failed
+    POST rather than to the diff — presentation only on the reading side, since the
+    mechanical consequences of `anchored: false` are correct for it either way. The
+    key name carries no `-`, so the escape above already covers it.
     """
-    payload = [
-        {
+    payload = []
+    for item in items:
+        entry = {
             # neutralize_mentions, like render_code_ref does for the prose half. The
             # body was already neutralized in normalize_comments, but `path` is raw
             # model output until it is rendered — and this render is still a POSTed
@@ -1010,11 +1038,50 @@ def render_body_only_sentinel(items: list) -> str:
                 )
             ),
         }
-        for item in items
-    ]
+        # `is True`, matching build-ledger.py's reader exactly. It reads the key that
+        # way so a stray `"lost_to_fallback": "no"` in a relayed payload cannot count
+        # as set; emitting on mere truthiness here would normalize such a value to
+        # JSON `true` and defeat that guard from the writing side.
+        if item.get("lost_to_fallback") is True:
+            entry["lost_to_fallback"] = True
+        payload.append(entry)
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     escaped = encoded.replace("-", "\\u002d")
     return f"<!-- {BODY_ONLY_SENTINEL_PREFIX} {escaped} -->"
+
+
+def fit_sentinel_items(items: list, budget: int) -> list:
+    """The longest leading run of `items` whose rendered sentinel fits `budget` chars.
+
+    A PREFIX rather than a subset, because `items` arrives most → least urgent: the
+    findings kept are the ones next round most needs back, and they stay in the same
+    order as the prose below them. `[]` means "nothing fits" — the caller drops the
+    sentinel and posts the prose marker alone, which is what this path did before the
+    sentinel existed and which the ledger still reads as a disclosed truncation.
+
+    Recovering SOME findings is strictly better than the all-or-nothing rule it
+    replaces: that rule made the sentinel free to eat the whole body budget as long as
+    it fit at all, so the round with the most findings to report was the one that
+    rendered none of them. A partial sentinel is not a partial truth on the reading
+    side either — the findings it leaves out are simply absent from the ledger, exactly
+    as all of them were when the whole sentinel was dropped.
+
+    Binary search: the render grows monotonically with the prefix length, so the
+    boundary is well defined and found in ~log2(n) renders rather than n.
+    """
+    if budget <= 0 or not items:
+        return []
+    if len(render_body_only_sentinel(items)) <= budget:
+        return items
+    # Invariant: `lo` fits (or is 0, the drop case the caller handles), `hi` does not.
+    lo, hi = 0, len(items)
+    while lo < hi - 1:
+        mid = (lo + hi) // 2
+        if len(render_body_only_sentinel(items[:mid])) <= budget:
+            lo = mid
+        else:
+            hi = mid
+    return items[:lo]
 
 
 def render_body_only_findings(items: list) -> str:
@@ -1052,7 +1119,7 @@ def render_findings_markdown(review_body: str, comments: list[dict]) -> str:
     """
     md = review_body
     if comments:
-        md += "\n\n---\n\n"
+        md += FINDINGS_SEPARATOR
         for c in comments:
             md += render_finding_entry(c) + "\n\n"
     return md
@@ -1374,7 +1441,11 @@ def main():
     # Anchor-aware split. The COUNT below stays the total across both halves — a finding
     # that lands in the body is still a finding, and a headline that shrank because an
     # anchor missed would misreport the review.
-    inline_items, body_only_items = partition_by_anchor(enriched, load_anchors(args.diff))
+    # `anchors` is kept, not just consumed: None means the diff could not be read and
+    # partition_by_anchor failed OPEN without testing a single finding, which the
+    # wholesale fallback below has to know before it can claim anything anchored.
+    anchors = load_anchors(args.diff)
+    inline_items, body_only_items = partition_by_anchor(enriched, anchors)
     comments = [item["comment"] for item in inline_items]
 
     # The head is every finding-independent part of the review. Kept separate from the
@@ -1405,11 +1476,10 @@ def main():
         # build-ledger.py parses back out of this body, so a fully-demoted round can no
         # longer read as a review that found nothing. Those entries are permanently
         # UNANSWERED, hence cap-exempt, which is the same rule an unanswered thread
-        # already gets. What is still open: the WHOLESALE fallback body (the 422 path
-        # below) carries no sentinel, because it is not rendered through
-        # render_body_only_findings — so its findings do not reach the ledger. It does
-        # carry the prose marker, so that round degrades loudly rather than silently.
-        review_body += f"\n\n---\n\n{body_only_md}"
+        # already gets. Since BE-10002 the WHOLESALE fallback body (the 422 path below)
+        # carries a sentinel of its own too, so a round whose findings were lost to a
+        # failed POST reaches the ledger as well.
+        review_body += f"{FINDINGS_SEPARATOR}{body_only_md}"
 
     # Every finding, most → least urgent, for any render that has no inline half.
     prose_body = render_findings_markdown(review_head, [i["comment"] for i in enriched])
@@ -1478,13 +1548,11 @@ def main():
     # Fallback: same findings without inline anchors. Typical cause is line
     # numbers that fall outside the diff context — often the model picked
     # a line near the change but not on the change.
-    # The note carries BODY_ONLY_PROSE_MARKER deliberately. This body has no sentinel —
-    # it is not rendered through render_body_only_findings, and adding one is the wrong
-    # move on a request that just 422'd for being unacceptable (see the PR's Residual).
-    # But without the marker, next round's build_ledger saw neither entries NOR a
-    # degradation for a round on which EVERY finding is body-only, so a fallback-posted
-    # round read as a review that found nothing and the round after it looked like a
-    # first round. The marker alone costs a sentence and keeps the disclosure honest.
+    # The note carries BODY_ONLY_PROSE_MARKER deliberately. Without it, next round's
+    # build_ledger saw neither entries NOR a degradation for a round on which EVERY
+    # finding is body-only, so a fallback-posted round read as a review that found
+    # nothing and the round after it looked like a first round. The marker alone costs a
+    # sentence and keeps the disclosure honest.
     #
     # It goes in the HEAD, for exactly the reason the section marker had to move above
     # the sentinel: clamp_review_body cuts the TAIL. Appended after the findings the
@@ -1500,8 +1568,94 @@ def main():
         "below instead. None of them has a review thread, so there is nowhere to "
         "reply to one or resolve it.)_"
     )
+    # …and the sentinel goes DIRECTLY under that note (BE-10002), in the same
+    # marker → sentinel → prose order render_body_only_findings uses and for the same
+    # two reasons: build-ledger.py accepts a sentinel only when the marker line sits
+    # immediately above it, and a tail clamp then eats the least-urgent PROSE rather
+    # than the JSON. Until this, the fallback posted the marker alone, so the ledger
+    # disclosed the degradation loudly and recovered ZERO entries — including for the
+    # findings that anchored perfectly well and lost their thread only to the failed
+    # POST. Every finding of the round is OFFERED to it — the ones from `inline_items`
+    # tagged `lost_to_fallback`, the ones already unanchorable left untagged, since the
+    # POST outcome changed nothing for them — and the size guard below decides how many
+    # of them the body can actually afford to carry.
+    #
+    # Residual (BE-10002): a nonzero `gh` result is not PROOF the review was not
+    # committed server-side — the `not comments` branch above declines the fallback for
+    # exactly that reason. If the first POST did land, its findings have real threads
+    # and also land in this sentinel, so next round's ledger carries each of them
+    # twice: once with its thread and any reply on it, once as a cap-exempt
+    # [post-failed] entry saying nobody could have answered it. Keying the tag on a
+    # confirmed-absent thread would need a read of the PR's reviews this script does
+    # not do, so it is written down here rather than fixed.
+    #
+    # Tagged by identity, not by value: `inline_items` and `body_only_items` hold the
+    # very objects `enriched` does, and two findings can be equal without being the
+    # same one. Iterating `enriched` is what keeps the sentinel in the same most →
+    # least urgent order as the prose below it.
+    #
+    # And tagged only where the anchors were actually CHECKED. With `anchors is None`
+    # partition_by_anchor put every finding inline without testing one, so
+    # `inline_items` is not evidence of anything — least of all on a 422, whose typical
+    # cause IS an anchor GitHub would not take. Untagged, those findings render as
+    # [unanchorable]: the conservative reading, and the one this path gave them before
+    # BE-10002. The claim the flag makes is "this passed the diff-anchor check", and
+    # that is a claim only a real check can make.
+    lost_ids = {id(item) for item in inline_items} if anchors is not None else set()
+    sentinel_items = [
+        {**item, "lost_to_fallback": True} if id(item) in lost_ids else item
+        for item in enriched
+    ]
+    # Size guard, in two parts.
+    #
+    # A PROSE FLOOR first. The sentinel duplicates the findings in JSON at nearly the
+    # length of the prose entries below it, so left to take whatever fits it displaces
+    # the review a human reads: measured at 89 findings it posted 58,720 characters of
+    # comment and rendered no findings at all, where the same round one finding larger
+    # dropped the sentinel and rendered 79. The sentinel gets at most half the body;
+    # fit_sentinel_items then keeps the most-urgent prefix that fits, so a round too big
+    # for a whole sentinel recovers part of one instead of none of it.
+    #
+    # The clamp's own note is RESERVED in that budget, not merely the limit tested. The
+    # clamp cuts at `limit - len(note)`, so a head+sentinel that fits the limit by less
+    # than that can still be cut mid-JSON — and drop_unterminated_comment then removes
+    # the sentinel back to its opener, taking every finding after it with it. That was a
+    # ~120-char window (measured: 89 findings, one long path) in which the review
+    # collapsed from 60,000 characters of findings to a 494-character header. The
+    # sentinel is posted whole or not at all; it is never posted where the clamp cuts.
+    sentinel_budget = min(
+        FALLBACK_SENTINEL_MAX_CHARS,
+        MAX_REVIEW_BODY_CHARS
+        - len(CLAMP_TRUNCATION_NOTE)
+        - len(fallback_head)
+        - len("\n\n")
+        - len(FINDINGS_SEPARATOR),
+    )
+    kept = fit_sentinel_items(sentinel_items, sentinel_budget)
+    if kept:
+        fallback_head_with_sentinel = (
+            f"{fallback_head}\n\n{render_body_only_sentinel(kept)}"
+        )
+        if len(kept) < len(sentinel_items):
+            print(
+                f"Review: the fallback's body-only sentinel carries the "
+                f"{len(kept)} most urgent of {len(sentinel_items)} finding(s) — the "
+                "rest would have displaced the findings a reader can see.",
+                file=sys.stderr,
+            )
+    else:
+        # Nothing fits: post exactly what this path posted before the sentinel existed.
+        # The prose marker is still in the head, so next round's ledger reads a
+        # disclosed truncation rather than a round that found nothing.
+        print(
+            "Review: no part of the fallback's body-only sentinel fits under the size "
+            "limit — posting the marker alone, so next round's ledger discloses the "
+            "loss instead of recovering the findings.",
+            file=sys.stderr,
+        )
+        fallback_head_with_sentinel = fallback_head
     fallback_body = render_findings_markdown(
-        fallback_head, [i["comment"] for i in enriched]
+        fallback_head_with_sentinel, [i["comment"] for i in enriched]
     )
     clamped_fallback = clamp_review_body(fallback_body)
     fallback_payload = json.dumps(

@@ -459,32 +459,40 @@ def _body_only_entries(review: dict, meta: dict, max_body: int):
         return [], BODY_ONLY_PROSE_MARKER in (review.get("body") or "")
     entries = []
     for item in parsed:
-        entries.append(
-            {
-                "round": meta["round"],
-                "commit": meta["commit"],
-                "posted_at": meta["posted_at"],
-                "path": _body_only_text(item.get("path")),
-                "line": _body_only_line(item.get("line")),
-                "severity": _body_only_text(item.get("severity")),
-                "finding": _truncate(item.get("body") or "", max_body),
-                # Permanently unanswered, by construction: there is no thread to
-                # reply on. answered_count=0 is what makes these cap-EXEMPT, matching
-                # the existing rule that only an ANSWERED finding costs a repeat slot.
-                "thread": {
-                    "resolved": False,
-                    "outdated": False,
-                    "reply_count": 0,
-                    "answered_count": 0,
-                },
-                "replies": [],
-                "dropped_replies": 0,
-                # No thread means no permalink. Rendered as an omitted line rather
-                # than an empty one, so the judge can never emit it as a `repeat_of`.
-                "discussion_url": "",
-                "anchored": False,
-            }
-        )
+        entry = {
+            "round": meta["round"],
+            "commit": meta["commit"],
+            "posted_at": meta["posted_at"],
+            "path": _body_only_text(item.get("path")),
+            "line": _body_only_line(item.get("line")),
+            "severity": _body_only_text(item.get("severity")),
+            "finding": _truncate(item.get("body") or "", max_body),
+            # Permanently unanswered, by construction: there is no thread to
+            # reply on. answered_count=0 is what makes these cap-EXEMPT, matching
+            # the existing rule that only an ANSWERED finding costs a repeat slot.
+            "thread": {
+                "resolved": False,
+                "outdated": False,
+                "reply_count": 0,
+                "answered_count": 0,
+            },
+            "replies": [],
+            "dropped_replies": 0,
+            # No thread means no permalink. Rendered as an omitted line rather
+            # than an empty one, so the judge can never emit it as a `repeat_of`.
+            "discussion_url": "",
+            "anchored": False,
+        }
+        # BE-10002: the writer marks a finding that anchored to the diff and lost its
+        # thread to a failed review POST, not to the diff. Everything mechanical above
+        # is still correct for it — there is no thread, so no discussion_url and no
+        # answer — and the flag changes only how the render explains it. Matched with
+        # `is True` rather than truthiness because the payload is model-adjacent text
+        # travelling through a public review body: a stray `"lost_to_fallback": "no"`
+        # must not read as the flag being set.
+        if item.get("lost_to_fallback") is True:
+            entry["lost_to_fallback"] = True
+        entries.append(entry)
     return entries, False
 
 
@@ -739,7 +747,21 @@ def build_ledger(
         for e in entries
         if e.get("anchored", True) and e["thread"]["answered_count"] == 0
     )
-    unanchorable = sum(1 for e in entries if not e.get("anchored", True))
+    # Counted apart from `post_failed` for the same reason `unanswered` is counted
+    # apart from both: the block header is the first thing the model reads, and
+    # "N unanchorable, so never answerable at all" said of a finding whose own entry
+    # line two rows below reports that it DID anchor is the aggregate contradicting
+    # the detail. On a wholesale-fallback round that would be every finding of it.
+    unanchorable = sum(
+        1
+        for e in entries
+        if not e.get("anchored", True) and e.get("lost_to_fallback") is not True
+    )
+    post_failed = sum(
+        1
+        for e in entries
+        if not e.get("anchored", True) and e.get("lost_to_fallback") is True
+    )
 
     return {
         "status": "ok",
@@ -750,6 +772,7 @@ def build_ledger(
         "entry_count": len(entries),
         "unanswered_count": unanswered,
         "unanchorable_count": unanchorable,
+        "post_failed_count": post_failed,
         "notes": notes,
         # How many rounds demoted findings we could not read back, and how many notes
         # a SIZE cap produced. Both kept structurally rather than sniffed out of
@@ -778,6 +801,7 @@ def unknown_ledger(call: str, reason: str) -> dict:
         "entry_count": 0,
         "unanswered_count": 0,
         "unanchorable_count": 0,
+        "post_failed_count": 0,
         "notes": [],
         "failed_call": call,
         "reason": reason,
@@ -796,6 +820,7 @@ def disabled_ledger() -> dict:
         "entry_count": 0,
         "unanswered_count": 0,
         "unanchorable_count": 0,
+        "post_failed_count": 0,
         "notes": [],
     }
 
@@ -833,6 +858,11 @@ _PANEL_STEERING = (
     "  thread, so nobody COULD have answered it and the first bullet above does\n"
     "  not apply to it. Re-raising it is legitimate; prefer not to unless its\n"
     "  severity warrants, and say in the body that it repeats unanchored.\n"
+    "- An entry marked [post-failed] is like [unanchorable] for repeat purposes —\n"
+    "  no thread exists, so nobody could have answered it — but UNLIKE it, the\n"
+    "  finding passed the diff-anchor check and lost its thread to an API failure\n"
+    "  that delivered the whole review as prose. Re-raise it if it still applies;\n"
+    "  the \"prefer not to\" above is about unanchorable findings and not about it.\n"
 )
 
 _JUDGE_STEERING = (
@@ -858,6 +888,11 @@ _JUDGE_STEERING = (
     "  could have answered it. If the same unanchorable finding appears in several\n"
     "  recent rounds, prefer NOT re-raising it unless its severity warrants; if you\n"
     "  do re-raise it, say in the body that it repeats unanchored.\n"
+    "- An entry marked [post-failed] has NO discussion_url and never takes repeat_of\n"
+    "  either, and costs no repeat slot. But unlike [unanchorable] it DID pass the\n"
+    "  diff-anchor check — its review was lost to an API failure and delivered as\n"
+    "  prose — so the preference above does not apply to it:\n"
+    "  re-raise it if it still holds.\n"
 )
 
 
@@ -882,9 +917,16 @@ def render_ledger_markdown(ledger: dict, audience: str = "panel") -> str:
     # their own clause, because saying "N never answered" of a finding nobody could
     # answer contradicts the per-entry line right below it.
     unanchorable = ledger.get('unanchorable_count') or 0
+    post_failed = ledger.get('post_failed_count') or 0
     counts = f"{ledger['unanswered_count']} never answered"
     if unanchorable:
         counts += f"; {unanchorable} unanchorable, so never answerable at all"
+    if post_failed:
+        # Its own clause, not folded into `unanchorable`: these findings DID pass the
+        # diff-anchor check, and the entry lines below say so.
+        counts += (
+            f"; {post_failed} lost to a failed review POST, so never answerable either"
+        )
     lines.append(
         f"Ledger: {ledger['entry_count']} prior finding(s) across "
         f"{ledger['rounds']} round(s) of {ledger['total_rounds']} total on this PR "
@@ -906,6 +948,11 @@ def render_ledger_markdown(ledger: dict, audience: str = "panel") -> str:
         # Pre-BE-9565 entries (and every thread-derived one) are anchored; only a
         # finding recovered from a review body is not, so default to True.
         anchored = entry.get("anchored", True)
+        # Same disposition as any other thread-less entry; only the explanation
+        # differs. A forward-compatibility property too: a v1 payload written before
+        # BE-10002 (or by a consumer still pinned to an older SHA) carries no flag and
+        # renders exactly as it always did.
+        lost_to_fallback = entry.get("lost_to_fallback") is True
         # path/severity are defanged like the prose below. For a thread-derived entry
         # they came from GitHub, but a body-only entry relays them from model output
         # through the sentinel, and both land on the HEADER line. `_body_only_text`
@@ -918,7 +965,7 @@ def render_ledger_markdown(ledger: dict, audience: str = "panel") -> str:
         if entry["severity"]:
             header += f" [{_defang_fences(entry['severity'])}]"
         if not anchored:
-            header += " [unanchorable]"
+            header += " [post-failed]" if lost_to_fallback else " [unanchorable]"
         # entry['path'], entry['severity'], entry['finding'] and reply['text'] are all
         # imported prose — the untrusted fields in this block. Defanged so none can
         # forge the fence that makes the block DATA. See _defang_fences.
@@ -950,7 +997,19 @@ def render_ledger_markdown(ledger: dict, audience: str = "panel") -> str:
                 # judge must not treat it as one.
                 tag = " (third party — NOT an answer)"
             lines.append(f"  reply from {who}{tag}: {_defang_fences(reply['text'])}\n")
-        if not anchored:
+        if not anchored and lost_to_fallback:
+            # Same "nobody could have answered it" as below, but the reason matters:
+            # this finding passed the diff-anchor check, so the steering that asks the
+            # panel to prefer not re-raising an unanchorable one would be wrong about
+            # it. Stated as the check it passed rather than as a promise about next
+            # round: the writer tags this from ITS parse of the diff, and the POST that
+            # failed may well have failed because GitHub refused an anchor anyway.
+            lines.append(
+                "  (review POST failed — this finding matched a line in the reviewed "
+                "diff but its review was delivered body-only, so no thread exists and "
+                "nobody could answer it; re-raising it needs no repeat_of)\n"
+            )
+        elif not anchored:
             # Stronger than "never answered": nobody COULD have answered it. Said
             # explicitly so the judge does not read a bare answered_count=0 as an
             # author who ignored the finding.
@@ -1007,9 +1066,12 @@ def ledger_note(ledger: dict) -> str:
     # "3 prior finding(s) … (0 never answered)" — i.e. as though the author had answered
     # every one of them, when not one of them had a thread to answer.
     unanchorable = ledger.get('unanchorable_count') or 0
+    post_failed = ledger.get('post_failed_count') or 0
     counts = f"{ledger['unanswered_count']} never answered"
     if unanchorable:
         counts += f"; {unanchorable} unanchorable"
+    if post_failed:
+        counts += f"; {post_failed} lost to a failed review POST"
     return (
         f"Round {ledger['total_rounds'] + 1} — ledger: {ledger['entry_count']} prior "
         f"finding(s) across {ledger['rounds']} round(s) "

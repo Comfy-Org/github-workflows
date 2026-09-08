@@ -46,10 +46,46 @@ SPEC.loader.exec_module(PR)
 
 # The sentence build-ledger.py keys on to tell "this round demoted findings and the
 # sentinel is unreadable" apart from "this round demoted nothing". Duplicated as a
-# literal on purpose: test_build_ledger.py pins it against PROSE_MARKER,
-# so a reword that breaks the contract fails there, and this file stays free of a
-# build-ledger import it otherwise has no use for.
+# literal on purpose: test_build_ledger.py pins it against PROSE_MARKER, so a reword
+# that breaks the contract fails there rather than being quietly carried along here.
 PROSE_MARKER = "could not be anchored to a line the reviewed diff carries"
+
+# build-ledger.py, for the fallback round-trips below (BE-10002). What the wholesale
+# fallback body is FOR, once it carries a sentinel, is what the next round's ledger can
+# read back out of it — so those tests drive the real parser rather than a copy of it
+# living here, which would pin only itself.
+_BL_SPEC = importlib.util.spec_from_file_location(
+    "build_ledger", os.path.join(os.path.dirname(__file__), "..", "build-ledger.py")
+)
+BL = importlib.util.module_from_spec(_BL_SPEC)
+_BL_SPEC.loader.exec_module(BL)
+
+
+def ledger_from_posted_body(body):
+    """Build the ledger a NEXT round would see from one posted review body."""
+    review = {
+        "id": 101,
+        "state": "COMMENTED",
+        "commit_id": "abc1234567",
+        "submitted_at": "2026-07-01T00:00:00Z",
+        "body": body,
+        "user": {"login": "github-actions[bot]", "type": "Bot"},
+    }
+    return BL.build_ledger([review], [], [])
+
+
+def visible(body):
+    """`body` with the sentinel comment line removed.
+
+    The sentinel renders as NOTHING on the PR, so any assertion about what a reader
+    sees has to drop it first — `len(body)` counts tens of thousands of characters of
+    HTML comment and stays large on exactly the body that shows no findings at all.
+    """
+    return "\n".join(
+        ln
+        for ln in body.splitlines()
+        if not ln.startswith(f"<!-- {PR.BODY_ONLY_SENTINEL_PREFIX} ")
+    )
 
 # Two files, so a per-file anchor set has something to be wrong about. `app.py` has two
 # hunks; `util.py` has one. Line numbers are the NEW side, exactly what a finding cites.
@@ -168,8 +204,11 @@ class LoadAnchorsFailsOpenTest(unittest.TestCase):
 class EndToEndPostTest(unittest.TestCase):
     """Drive main() with a stubbed `gh` and read the payload it would have sent."""
 
-    def run_main(self, findings, with_diff=True, post_returncode=0, stderr="", summaries=None):
-        """Return the POSTed payloads. Pass `summaries` (a list) to collect step-summary writes."""
+    def run_main(self, findings, with_diff=True, post_returncode=0, stderr="", summaries=None,
+                 panel=None):
+        """Return the POSTed payloads. Pass `summaries` (a list) to collect step-summary
+        writes, or `panel` to control the panel summary — the one finding-INDEPENDENT
+        part of the review head that a caller can make large."""
         posted = []
 
         def fake_post(repo, pr_number, payload):
@@ -185,7 +224,12 @@ class EndToEndPostTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             fpath = os.path.join(d, "consolidated.json")
             with open(fpath, "w", encoding="utf-8") as f:
-                json.dump({"findings": findings, "panel": [{"model": "m", "review_type": "adversarial", "status": "ok"}]}, f)
+                json.dump({
+                    "findings": findings,
+                    "panel": panel or [
+                        {"model": "m", "review_type": "adversarial", "status": "ok"}
+                    ],
+                }, f)
             argv = [
                 "post-review.py",
                 "--findings", fpath,
@@ -487,10 +531,15 @@ class BodyBudgetTest(unittest.TestCase):
         # The fallback body used to be review_body (ending with the DEMOTED half) plus
         # the inline half appended after it, so clamping from the end dropped the
         # findings that had just lost their anchors while a demoted nit survived.
-        findings = [finding("app.py", 11, severity="critical", body="C" * 19000)]
-        findings += [finding("elsewhere.py", 7, severity="low", body="L" * 19000)]
-        findings += [finding("app.py", 12, severity="high", body="H" * 19000)]
-        findings += [finding("elsewhere.py", 8, severity="medium", body="M" * 19000)]
+        #
+        # Bodies are sized to fill the budget with the SENTINEL in place (BE-10002),
+        # which takes up to BODY_ONLY_SENTINEL_BODY_CHARS per finding out of it. The
+        # property pinned is the ordering, not the exact capacity: what the clamp takes
+        # is still the least urgent finding, and never the head above them.
+        findings = [finding("app.py", 11, severity="critical", body="C" * 18000)]
+        findings += [finding("elsewhere.py", 7, severity="low", body="L" * 18000)]
+        findings += [finding("app.py", 12, severity="high", body="H" * 18000)]
+        findings += [finding("elsewhere.py", 8, severity="medium", body="M" * 18000)]
         posted = EndToEndPostTest().run_main(
             findings, post_returncode=1, stderr="gh: Unprocessable Entity (HTTP 422)"
         )
@@ -499,22 +548,30 @@ class BodyBudgetTest(unittest.TestCase):
         # Severity order now holds across BOTH halves, so the cut lands on the low.
         # Before, the demoted half came first and the inline half was appended after
         # it, so the high (inline) was dropped whole while the low (demoted) survived.
-        self.assertIn("C" * 19000, body, "the critical survives")
-        self.assertIn("H" * 19000, body, "so does the high")
-        self.assertIn("M" * 19000, body, "and the medium")
-        self.assertNotIn("L" * 19000, body, "the low is what gets cut")
+        self.assertIn("C" * 18000, body, "the critical survives")
+        self.assertIn("H" * 18000, body, "so does the high")
+        self.assertIn("M" * 18000, body, "and the medium")
+        self.assertNotIn("L" * 18000, body, "the low is what gets cut")
+        # …and the low is still recoverable from the sentinel above the cut, which is
+        # the ONLY copy of it that survives on this path.
+        ledger = ledger_from_posted_body(body)
+        self.assertEqual(ledger["entry_count"], 4)
+        self.assertTrue(
+            any(e["finding"].startswith("L" * 100) for e in ledger["entries"]),
+            "the cut finding is still recoverable from the sentinel above the cut",
+        )
 
-    def test_the_fallback_round_degrades_loudly_in_the_next_round_s_ledger(self):
-        """The fallback body carries no sentinel — it is not rendered through
-        render_body_only_findings, and adding bytes to a request that just 422'd is the
-        wrong move. But on this path EVERY finding is body-only, so without the prose
-        marker next round's build_ledger saw neither entries nor a degradation: the
-        round read as a review that found nothing, and the round after it looked like a
-        first round. The marker costs one sentence and keeps the disclosure honest.
+    def test_the_fallback_round_carries_its_findings_into_the_next_round_s_ledger(self):
+        """The fallback body used to carry the prose marker and NO sentinel, so the
+        next round's ledger disclosed the loss loudly and recovered zero entries — for
+        every finding of the round, including the ones that anchored perfectly well and
+        lost their thread only to the failed POST. Since BE-10002 it carries a sentinel
+        too, and a lost-to-the-POST finding is marked so the render can say which of the
+        two things happened to it.
 
         PROSE_MARKER is pinned to build-ledger.py's BODY_ONLY_PROSE_MARKER by
         test_build_ledger.py, which also pins that a marker with no readable sentinel
-        degrades loudly — so those two plus this one are the whole chain.
+        still degrades loudly — the floor this sits on top of.
         """
         # One anchorable finding, so there IS an inline half to drop and the wholesale
         # fallback actually runs; one off-diff, so the round has a demoted half too.
@@ -526,7 +583,200 @@ class BodyBudgetTest(unittest.TestCase):
         fallback = posted[1]
         self.assertNotIn("comments", fallback, "this is the wholesale fallback")
         self.assertIn(PROSE_MARKER, fallback["body"])
-        self.assertNotIn(PR.BODY_ONLY_SENTINEL_PREFIX, fallback["body"], "no sentinel here")
+        self.assertIn(PR.BODY_ONLY_SENTINEL_PREFIX, fallback["body"], "and now a sentinel")
+
+        ledger = ledger_from_posted_body(fallback["body"])
+        self.assertEqual(ledger["entry_count"], 2, "both findings reach the ledger")
+        by_line = {e["line"]: e for e in ledger["entries"]}
+        # The one that anchored: its thread died with the POST, not with the diff.
+        self.assertTrue(by_line[11]["lost_to_fallback"])
+        self.assertFalse(by_line[11]["anchored"], "it still has no thread")
+        self.assertEqual(by_line[11]["discussion_url"], "")
+        self.assertEqual(by_line[11]["thread"]["answered_count"], 0, "so it is cap-exempt")
+        # The one that never could have anchored is unchanged — the POST outcome
+        # told us nothing about it.
+        self.assertNotIn("lost_to_fallback", by_line[999])
+
+        rendered = BL.render_ledger_markdown(ledger, "judge")
+        self.assertIn("* app.py:11 [medium] [post-failed]", rendered)
+        self.assertIn("* app.py:999 [medium] [unanchorable]", rendered)
+        self.assertIn("this finding matched a line in the reviewed diff", rendered)
+
+    def test_a_fallback_too_large_for_any_sentinel_still_degrades_loudly(self):
+        """The size guard's floor. When not even the FIRST finding's JSON fits the
+        sentinel's budget, the sentinel is dropped entirely and this path posts exactly
+        what it posted before BE-10002 — the marker alone, which the next round reads as
+        a disclosed truncation rather than as a silent round.
+
+        Reached here through a single pathological `path`: finding bodies are capped at
+        BODY_ONLY_SENTINEL_BODY_CHARS, but `path` is model output and is length-checked
+        nowhere, so one entry can exceed the whole budget on its own. Sorted first by
+        severity, so there is no shorter prefix to fall back to.
+        """
+        findings = [
+            finding("p" * 31000 + ".py", 900, severity="critical", body="demoted")
+        ]
+        findings += [finding("app.py", 11, severity="low", body="anchorable")]
+        posted = EndToEndPostTest().run_main(
+            findings, post_returncode=1, stderr="gh: Unprocessable Entity (HTTP 422)"
+        )
+        fallback = posted[1]["body"]
+        self.assertNotIn(
+            PR.BODY_ONLY_SENTINEL_PREFIX, fallback, "no sentinel fits, so none is posted"
+        )
+        self.assertIn(PROSE_MARKER, fallback, "but the disclosure still is")
+        self.assertLessEqual(len(fallback), PR.MAX_REVIEW_BODY_CHARS)
+
+        ledger = ledger_from_posted_body(fallback)
+        self.assertEqual(ledger["entry_count"], 0, "today's behaviour, preserved as the floor")
+        self.assertEqual(ledger["unrecovered_rounds"], 1)
+        self.assertIn("could not recover the finding(s)", BL.ledger_note(ledger))
+
+    def test_the_sentinel_never_displaces_the_findings_a_reader_can_see(self):
+        """The prose floor. The sentinel duplicates every finding as JSON at close to
+        the length of the prose entry below it, so a guard that only asked "does it fit
+        at all" let it take the entire body: measured at 89 findings it posted 58,720
+        characters of comment and rendered ZERO findings, while the same round one
+        finding LARGER dropped the sentinel whole and rendered 79 of them — the cliff
+        ran backwards, and the rounds with the most to report showed the least.
+
+        Now the sentinel gets at most half the budget and the prose keeps the rest, so
+        both readers are served at every size: a human sees findings, and the ledger
+        recovers the most urgent prefix rather than all-or-nothing.
+        """
+        for n in (60, 89, 90, 130):
+            with self.subTest(findings=n):
+                findings = [finding("app.py", 11, body="anchorable " + "z" * 700)]
+                findings += [
+                    finding("app.py", 900 + i, body=f"demoted {i} " + "z" * 700)
+                    for i in range(n)
+                ]
+                body = EndToEndPostTest().run_main(
+                    findings, post_returncode=1, stderr="gh: Unprocessable Entity (HTTP 422)"
+                )[1]["body"]
+                self.assertIn(PROSE_MARKER, body)
+                self.assertLessEqual(len(body), PR.MAX_REVIEW_BODY_CHARS)
+                # The half the sentinel may never take.
+                self.assertGreaterEqual(
+                    len(visible(body)),
+                    PR.MAX_REVIEW_BODY_CHARS // 2 - len(PR.CLAMP_TRUNCATION_NOTE),
+                    "the prose floor holds",
+                )
+                self.assertGreater(
+                    visible(body).count("demoted "), 20, "and a reader sees findings"
+                )
+                # …and the round still reaches the ledger, partially rather than not.
+                self.assertGreater(ledger_from_posted_body(body)["entry_count"], 20)
+
+    def test_the_sentinel_keeps_the_most_urgent_findings_when_it_cannot_keep_all(self):
+        """A prefix, not a sample: `enriched` is severity-sorted, so the findings the
+        budget keeps are the ones next round most needs back — and they stay in the same
+        order as the prose below them."""
+        findings = [finding("app.py", 11, severity="critical", body="C " + "z" * 700)]
+        findings += [
+            finding("app.py", 900 + i, severity="low", body=f"low {i} " + "z" * 700)
+            for i in range(120)
+        ]
+        body = EndToEndPostTest().run_main(
+            findings, post_returncode=1, stderr="gh: Unprocessable Entity (HTTP 422)"
+        )[1]["body"]
+        entries = ledger_from_posted_body(body)["entries"]
+        self.assertGreater(len(entries), 0)
+        self.assertLess(len(entries), 121, "not all of them fit")
+        self.assertEqual(entries[0]["severity"], "critical", "the most urgent is kept")
+        # The kept set is the leading run of the prose order, not a scatter through it.
+        self.assertEqual(
+            [e["line"] for e in entries],
+            [11] + [900 + i for i in range(len(entries) - 1)],
+        )
+
+    def test_no_finding_is_called_post_failed_when_the_anchors_were_never_checked(self):
+        """`lost_to_fallback` claims the finding passed the diff-anchor check. With no
+        `--diff`, partition_by_anchor fails OPEN and calls every finding inline without
+        testing one, so there is no such check to have passed — and on a 422, whose
+        typical cause is an anchor GitHub refused, asserting it would be the wrong way
+        round. Those findings stay [unanchorable]: the conservative reading."""
+        posted = EndToEndPostTest().run_main(
+            [finding("app.py", 11), finding("app.py", 12)],
+            with_diff=False,
+            post_returncode=1,
+            stderr="gh: Unprocessable Entity (HTTP 422)",
+        )
+        fallback = posted[1]["body"]
+        self.assertIn(PR.BODY_ONLY_SENTINEL_PREFIX, fallback, "the findings still reach it")
+        ledger = ledger_from_posted_body(fallback)
+        self.assertEqual(ledger["entry_count"], 2)
+        for entry in ledger["entries"]:
+            self.assertNotIn("lost_to_fallback", entry)
+        self.assertEqual(ledger["post_failed_count"], 0)
+        self.assertEqual(ledger["unanchorable_count"], 2)
+
+
+    def test_the_sentinel_is_never_posted_where_the_clamp_would_cut_it(self):
+        """The size guard reserves the clamp's own note, not just the limit.
+
+        The clamp cuts at `limit - len(note)`, so a head+sentinel that fits the limit
+        by less than that gets cut mid-JSON — and drop_unterminated_comment then takes
+        the sentinel back to its opener AND every finding after it. Measured before the
+        reserve: a ~120-character window in which this path posted a 494-character
+        header instead of 60,000 characters of findings. Swept across the boundary
+        rather than pinned to the one fixture that lands in it.
+        """
+        for pad in range(0, 400, 80):
+            with self.subTest(path_padding=pad):
+                findings = [finding("app.py", 11, body="anchorable " + "z" * 700)]
+                findings += [
+                    finding("app.py", 900 + i, body=f"demoted {i} " + "z" * 700)
+                    for i in range(88)
+                ]
+                findings += [finding("p" * (pad + 1) + ".py", 8000, body="z" * 700)]
+                body = EndToEndPostTest().run_main(
+                    findings, post_returncode=1, stderr="gh: Unprocessable Entity (HTTP 422)"
+                )[1]["body"]
+                self.assertIn(PROSE_MARKER, body, "the disclosure is never optional")
+                # Measured on the VISIBLE body. `len(body)` counts the sentinel's tens
+                # of thousands of characters of HTML comment, which render as nothing,
+                # so it stays large on precisely the body that shows a reader no
+                # findings — the case this assertion exists to catch.
+                self.assertGreater(
+                    visible(body).count("demoted "), 20,
+                    "the review never collapses to a bare header — findings still render",
+                )
+                ledger = ledger_from_posted_body(body)
+                if PR.BODY_ONLY_SENTINEL_PREFIX in body:
+                    self.assertGreater(ledger["entry_count"], 0, "a posted sentinel parses")
+                else:
+                    self.assertEqual(ledger["unrecovered_rounds"], 1, "…or it degrades loudly")
+
+    def test_the_fallback_s_sentinel_survives_the_clamp_that_cuts_the_findings(self):
+        """Head-first ordering, the same property render_body_only_findings has: the
+        sentinel sits directly under the note, ahead of every finding, so a clamp big
+        enough to cut prose still leaves the machine-readable copy whole. Without it the
+        round that most needs the ledger — every finding lost, and the body too long to
+        show them all — is the one the ledger cannot read."""
+        big = "x" * 19000
+        findings = [finding("app.py", 11, body="anchorable " + big)]
+        findings += [finding("app.py", 900 + n, body=f"demoted {n} " + big) for n in range(5)]
+        posted = EndToEndPostTest().run_main(
+            findings, post_returncode=1, stderr="gh: Unprocessable Entity (HTTP 422)"
+        )
+        fallback = posted[1]["body"]
+        self.assertEqual(len(fallback), PR.MAX_REVIEW_BODY_CHARS, "the clamp really fired")
+        self.assertIn("truncated here", fallback)
+        self.assertLess(
+            fallback.index(f"<!-- {PR.BODY_ONLY_SENTINEL_PREFIX} "), 3000,
+            "the sentinel sits in the finding-independent head, not after the findings",
+        )
+        # Every finding of the round is recoverable, including the ones whose prose the
+        # cut took — which is the whole point of putting the JSON above them.
+        ledger = ledger_from_posted_body(fallback)
+        self.assertEqual(ledger["entry_count"], 6)
+        self.assertEqual(
+            sorted(e["line"] for e in ledger["entries"]), [11, 900, 901, 902, 903, 904]
+        )
+        self.assertEqual(
+            [e for e in ledger["entries"] if e.get("lost_to_fallback")][0]["line"], 11
+        )
 
     def test_the_fallback_s_marker_survives_the_clamp_that_cuts_the_findings(self):
         """The round-1 fix put the marker at the TAIL of the fallback body, and
@@ -571,9 +821,107 @@ class BodyBudgetTest(unittest.TestCase):
             post_returncode=1,
             stderr="gh: Unprocessable Entity (HTTP 422)",
         )
-        body = posted[1]["body"]
+        # The sentinel carries a machine-readable copy of every finding, exactly as the
+        # demoted-findings section does on the success path. It renders as nothing, so
+        # the property this pins is about the VISIBLE half: drop the comment line and
+        # each finding must still appear once.
+        body = visible(posted[1]["body"])
         self.assertEqual(body.count("anchored one"), 1)
         self.assertEqual(body.count("demoted one"), 1)
+
+
+class FitSentinelItemsTest(unittest.TestCase):
+    """The budget search behind the prose floor."""
+
+    def items(self, n):
+        return PR.normalize_comments(
+            [finding(f"f{i}.py", i + 1, body=f"body {i}") for i in range(n)]
+        )
+
+    def test_everything_fits_under_a_generous_budget(self):
+        items = self.items(5)
+        self.assertEqual(PR.fit_sentinel_items(items, 100000), items)
+
+    def test_it_returns_the_longest_prefix_that_fits(self):
+        items = self.items(20)
+        for budget in range(0, 3000, 97):
+            with self.subTest(budget=budget):
+                kept = PR.fit_sentinel_items(items, budget)
+                self.assertEqual(kept, items[: len(kept)], "a prefix, in order")
+                if kept:
+                    self.assertLessEqual(
+                        len(PR.render_body_only_sentinel(kept)), budget, "and it fits"
+                    )
+                if len(kept) < len(items):
+                    self.assertGreater(
+                        len(PR.render_body_only_sentinel(items[: len(kept) + 1])),
+                        budget,
+                        "one more would not — so it really is the LONGEST prefix",
+                    )
+
+    def test_a_budget_nothing_fits_drops_the_sentinel_entirely(self):
+        self.assertEqual(PR.fit_sentinel_items(self.items(3), 0), [])
+        self.assertEqual(PR.fit_sentinel_items(self.items(3), -100), [])
+        self.assertEqual(PR.fit_sentinel_items(self.items(3), 10), [])
+
+    def test_no_items_is_no_sentinel(self):
+        self.assertEqual(PR.fit_sentinel_items([], 100000), [])
+
+    def test_the_budget_reserves_the_clamp_note_when_the_head_dominates(self):
+        """The other half of the size guard, and the half the prose floor hides.
+
+        `sentinel_budget` is `min(FALLBACK_SENTINEL_MAX_CHARS, limit - note - head - …)`.
+        On an ordinary round the first term wins and the reserve never binds, so it is
+        pinned here on the input where the SECOND term wins: a panel summary — the one
+        finding-independent part of the head a caller controls — large enough to make
+        the head most of the body.
+
+        Dropping the reserve opens a window `len(CLAMP_TRUNCATION_NOTE)` wide in which
+        the sentinel fits the raw limit but not the clamp's cut point: it is posted,
+        cut mid-JSON, and `drop_unterminated_comment` then rewinds to its opener and
+        takes every finding below it. The loss is the PROSE, not the sentinel — both
+        settings end with no readable sentinel in that window, but only the unreserved
+        one also throws the findings away. So that is what this asserts.
+        """
+        body300 = "z" * 300
+        sentinel_len = len(
+            PR.render_body_only_sentinel(PR.normalize_comments([finding("app.py", 11, body=body300)]))
+        )
+        # Head lengths at which the sentinel fits `limit` but not `limit - note`.
+        # `9` is the "\n\n" under the head plus FINDINGS_SEPARATOR above finding one.
+        hi = PR.MAX_REVIEW_BODY_CHARS - 9 - sentinel_len
+        lo = hi - len(PR.CLAMP_TRUNCATION_NOTE)
+        # `panel` is padded to hit those head lengths; the offset between the two is a
+        # property of the fixture, so it is measured rather than assumed.
+        probe = EndToEndPostTest().run_main(
+            [finding("app.py", 11, body=body300)], post_returncode=1, stderr="422",
+            panel=[{"model": "m" * 1000, "review_type": "adversarial", "status": "error"}],
+        )[1]["body"]
+        offset = len(probe.split(f"<!-- {PR.BODY_ONLY_SENTINEL_PREFIX}")[0].rstrip("\n")) - 1000
+
+        # Swept across the window rather than pinned to its midpoint, so the test keeps
+        # straddling it if the note or the sentinel's shape changes size.
+        for head_len in range(lo - 40, hi + 41, 35):
+            with self.subTest(head_len=head_len):
+                body = EndToEndPostTest().run_main(
+                    [finding("app.py", 11, body=body300)],
+                    post_returncode=1,
+                    stderr="gh: Unprocessable Entity (HTTP 422)",
+                    panel=[{
+                        "model": "m" * (head_len - offset),
+                        "review_type": "adversarial",
+                        "status": "error",
+                    }],
+                )[1]["body"]
+                self.assertLessEqual(len(body), PR.MAX_REVIEW_BODY_CHARS)
+                self.assertIn(PROSE_MARKER, body, "the disclosure is never optional")
+                self.assertIn(
+                    body300, body,
+                    "the finding is never traded away for a sentinel the clamp then cuts",
+                )
+                # And a sentinel that IS posted is always whole and readable.
+                if f"<!-- {PR.BODY_ONLY_SENTINEL_PREFIX} " in body:
+                    self.assertEqual(ledger_from_posted_body(body)["entry_count"], 1)
 
 
 class DanglingCommentClampTest(unittest.TestCase):
@@ -1674,6 +2022,24 @@ class BodyOnlySentinelTest(unittest.TestCase):
         self.assertEqual(len(at_column_zero), 1, "only the real sentinel is unindented")
         self.assertIn("evil.py", md, "the forgery is still reported — just quoted")
         self.assertIn(f"> {forged[:20]}", md, "and it is inside the blockquote")
+
+    def test_the_lost_to_fallback_key_is_emitted_only_for_a_tagged_item(self):
+        """The success path's payload must stay byte-identical to what it was before
+        the key existed — an old consumer reads this JSON, and a new optional key it
+        ignores is only free if it is absent when it does not apply."""
+        items = PR.normalize_comments([finding("a/b.py", 42, body="plain")])
+        self.assertNotIn("lost_to_fallback", PR.render_body_only_sentinel(items))
+
+        tagged = [{**items[0], "lost_to_fallback": True}]
+        payload = json.loads(
+            PR.render_body_only_sentinel(tagged)[
+                len("<!-- ") + len(PR.BODY_ONLY_SENTINEL_PREFIX) : -len(" -->")
+            ].replace("\\u002d", "-")
+        )
+        self.assertIs(payload[0]["lost_to_fallback"], True)
+        # …and the key itself carries no `-`, so the dash escape still leaves the
+        # comment unclosable.
+        self.assertNotIn("--", PR.render_body_only_sentinel(tagged)[len("<!-- ") : -len(" -->")])
 
     def test_no_sentinel_when_nothing_was_demoted(self):
         posted = EndToEndPostTest().run_main([finding("app.py", 11)])[0]["body"]
