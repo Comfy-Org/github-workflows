@@ -114,6 +114,13 @@ name: Groom (reusable)
 #       with:
 #         # Post/act issues as cloud-code-bot instead of github-actions[bot].
 #         bot_app_id: ${{ vars.APP_ID }}
+#         # OPTIONAL: bind a GitHub environment on the three credentialed jobs
+#         # (build_select / file / build_pr) so the bot App key can live as an
+#         # ENVIRONMENT secret with a deployment-branch policy instead of a
+#         # repository secret. The environment must hold a secret named exactly
+#         # BOT_APP_PRIVATE_KEY. It is an ordinary `with:` string input — pass
+#         # the name (or a `vars.` expression), never a secret.
+#         # environment: bot-main
 #         # No workflows_ref: the briefs + ledger auto-load from the same commit
 #         # this `uses:` pin resolves to (job.workflow_sha — the runner v2.334.0+
 #         # accessor, not the empty `github.job_workflow_sha`). Set it only to
@@ -390,6 +397,23 @@ on:
           are opened and acted under that App's identity (e.g. cloud-code-bot)
           instead of github-actions[bot], so groom's issues are a distinct,
           queryable actor. App IDs aren't secret, so this is an input.
+        type: string
+        required: false
+        default: ''
+      environment:
+        description: >-
+          GitHub environment (in the CALLER repo) that the three credentialed
+          jobs (build_select, file, build_pr) bind. Lets a caller keep
+          BOT_APP_PRIVATE_KEY as an ENVIRONMENT secret with a main-only
+          deployment-branch policy instead of a repository secret readable by
+          every branch. Empty (the default) binds no environment — existing
+          callers are unaffected. Because the caller's `secrets:` mapping is
+          evaluated in the CALLER job (which cannot itself carry
+          `environment:`), the environment must hold a secret named exactly
+          BOT_APP_PRIVATE_KEY; GitHub substitutes it for the passed value when
+          this job binds the environment. Never applied to the agent jobs —
+          they read untrusted repo content and must not sit inside a
+          credentialed environment.
         type: string
         required: false
         default: ''
@@ -1975,6 +1999,11 @@ jobs:
     needs: [gate, audit_verify]
     if: needs.gate.outputs.should_run == 'true' && needs.audit_verify.outputs.have_findings == 'true'
     runs-on: ubuntu-latest
+    # Optional caller-side gate on the bot App key: '' (the default) binds no
+    # environment, so existing callers are unaffected. Bound ONLY by the jobs
+    # that mint the bot token — never by the agent jobs, which run a model over
+    # untrusted repo content and must stay outside a credentialed environment.
+    environment: ${{ inputs.environment }}
     timeout-minutes: 15
     permissions:
       contents: read
@@ -2195,6 +2224,11 @@ jobs:
     needs: [gate, build_select]
     if: needs.gate.outputs.should_run == 'true' && needs.build_select.outputs.have_file == 'true'
     runs-on: ubuntu-latest
+    # Optional caller-side gate on the bot App key: '' (the default) binds no
+    # environment, so existing callers are unaffected. Bound ONLY by the jobs
+    # that mint the bot token — never by the agent jobs, which run a model over
+    # untrusted repo content and must stay outside a credentialed environment.
+    environment: ${{ inputs.environment }}
     timeout-minutes: 15
     permissions:
       contents: read
@@ -2936,6 +2970,11 @@ jobs:
     # never uploaded its result simply fails its own build_pr cell (fail-fast off).
     if: ${{ !cancelled() && needs.gate.outputs.should_run == 'true' && needs.build_select.outputs.have_build == 'true' }}
     runs-on: ubuntu-latest
+    # Optional caller-side gate on the bot App key: '' (the default) binds no
+    # environment, so existing callers are unaffected. Bound ONLY by the jobs
+    # that mint the bot token — never by the agent jobs, which run a model over
+    # untrusted repo content and must stay outside a credentialed environment.
+    environment: ${{ inputs.environment }}
     # 15 -> 20. Headroom only, and deliberately the LAST line of defence rather
     # than the fix: the 2026-08-04 cancellation was a hung fetch that produced
     # zero bytes, so a bigger budget alone would just have bought a longer hang.

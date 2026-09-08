@@ -116,9 +116,19 @@ The ones that matter:
 | `scope_label` / `scope_desc` | `whole-repo` | Cosmetic labels for the scope in issue bodies. |
 | `workflows_ref` | `''` | **Leaving it unset is safe.** Alone among these workflows groom does not *require* it — it defaults to `''` and each asset checkout falls back to `${{ job.workflow_sha }}`, the commit your `uses:` pin resolved to, so the briefs, `ledger.py` and `interval.py` always match the logic running them with nothing to keep in sync. Set it only to test briefs from a branch. Before BE-8077 that fallback was spelled `github.job_workflow_sha` and silently loaded the assets from this repo's default branch — see the footgun below. |
 | `bot_app_id` | `''` | File as your App rather than `github-actions[bot]`. |
+| `environment` | `''` | Bind a GitHub environment (in YOUR repo) on the three jobs that mint the bot App token — `build_select`, `file`, `build_pr` — so `BOT_APP_PRIVATE_KEY` can be an environment secret behind a deployment-branch policy instead of a repository secret every branch can read. Empty (the default) binds nothing. See "Scoping the bot key to an environment" below. |
 | `builder` | `false` | Opt into PR-writing — see below. |
 | `max_prs` | `'5'` | Only with `builder: true`. Typed **string**, deliberately. |
 | `pr_size_limit` | `400` | Only with `builder: true`. Caps a built PR's diff. |
+
+## Scoping the bot key to an environment
+
+By default `BOT_APP_PRIVATE_KEY` is a **repository** secret, which any workflow on any branch of your repo can read. Set `environment: bot-main` (any environment name) and the three credentialed jobs — `build_select`, `file` and `build_pr`, the only ones that mint the bot App token — bind that environment, so you can hold the key as an **environment** secret with a `main`-only deployment-branch policy instead. The agent jobs (`audit_find`, `audit_verify`, `build`) deliberately never bind it: they run a model over untrusted repo content and must stay outside any credentialed environment.
+
+Two things to get right:
+
+- **The environment must hold a secret named exactly `BOT_APP_PRIVATE_KEY`.** Your caller's `secrets:` mapping is evaluated in the *caller* job, which cannot itself carry `environment:`, so the value you pass through is whatever the caller could see. GitHub substitutes the environment's same-named secret for it once the nested job binds the environment — that name match is the whole mechanism, so a differently-named environment secret silently leaves the passed (or empty) value in place.
+- **Pass the environment as a plain string** under `with:`, e.g. `environment: bot-main`. It is an ordinary `type: string` input (a `${{ vars.* }}` expression works too) — it is *not* a secret and must not be routed through `secrets:`. Leaving it unset is the existing behavior, unchanged.
 
 ## Opt-in auto-builder
 
