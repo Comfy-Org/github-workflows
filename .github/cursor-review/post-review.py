@@ -302,11 +302,18 @@ def gh_http_status(result: subprocess.CompletedProcess):
 # The no-read short-circuit rests on a 4xx meaning "GitHub validated this and refused
 # it", which holds for the rejections it was built for (422 over an inline position,
 # and the 4xx family of malformed/unauthorized/absent) but NOT for these: a timeout,
-# a rate limit or an early-hint refusal can come from an edge or a proxy in front of
-# GitHub, about a request the API went on to serve. Treating one of those as "absent
-# by construction" would repost the fallback and tag every anchored finding
+# a secondary rate limit or an early-hint refusal can come from an edge or a proxy in
+# front of GitHub, about a request the API went on to serve. Treating one of those as
+# "absent by construction" would repost the fallback and tag every anchored finding
 # `lost_to_fallback` on an assumption that does not apply, so they take the read like
 # a 5xx does.
+#
+# 403 is NOT in this set, and not because a throttled 403 is impossible — GitHub does
+# signal throttling that way. It is because `is_read_only_token_error` matches any
+# stderr carrying "HTTP 403" and returns from `main()` before this decision is
+# reached, so listing 403 here would be dead code that reads as coverage. Narrowing
+# that guard to its specific message is a change to the read-only degradation path,
+# not to this one; tracked separately rather than made in passing.
 RETRYABLE_4XX_STATUSES = frozenset({408, 425, 429})
 
 
@@ -424,6 +431,15 @@ def review_already_posted(
     """
     result = gh_list_reviews(repo, pr_number)
     if result.returncode != 0:
+        # The UNKNOWN branch withholds `lost_to_fallback` and reposts the fallback
+        # without saying why, so the reason has to be logged HERE or it exists nowhere:
+        # a 60s timeout, an auth failure and an older `gh` without `--slurp` are
+        # indistinguishable to an operator otherwise.
+        print(
+            f"Review: could not list reviews for {repo}#{pr_number} "
+            f"(exit {result.returncode}): {(result.stderr or '').strip()[:300]}",
+            file=sys.stderr,
+        )
         return None
     # An exit-0 read with nothing in it INSPECTED nothing; defaulting it to `[]` would
     # launder that into "this PR has no reviews" and tag every finding lost on the
@@ -436,11 +452,21 @@ def review_already_posted(
         pages = json.loads(raw)
     except ValueError:
         return None
-    # `--slurp` promises a list OF PAGES, each itself a list. Anything else — a flat
-    # array of reviews, a single object, a bare scalar — is a payload shape this does
-    # not know how to read, so it is UNKNOWN rather than empty. Silently dropping the
-    # pages that fail the check would turn an unrecognized shape into "no reviews".
-    if not isinstance(pages, list) or not all(isinstance(page, list) for page in pages):
+    # `--slurp` promises a NON-EMPTY list OF PAGES, each itself a list. Anything else —
+    # a flat array of reviews, a single object, a bare scalar — is a payload shape this
+    # does not know how to read, so it is UNKNOWN rather than empty. Silently dropping
+    # the pages that fail the check would turn an unrecognized shape into "no reviews".
+    #
+    # `[]` is in that set, and deliberately: `all()` is vacuously true over it, so it
+    # would otherwise fall through to `reviews = []` and answer "confirmed absent" —
+    # the same laundering the empty-stdout guard above rejects, on a read that
+    # inspected no page at all. `[[]]` is what --slurp really returns for a PR with no
+    # reviews, and that is the genuine absence.
+    if (
+        not isinstance(pages, list)
+        or not pages
+        or not all(isinstance(page, list) for page in pages)
+    ):
         return None
     reviews = [r for page in pages for r in page]
     for review in reviews:
@@ -448,17 +474,29 @@ def review_already_posted(
             continue
         if review.get("state") not in SUBMITTED_REVIEW_STATES:
             continue
-        if ((review.get("user") or {}).get("type") or "") != "Bot":
+        # Types are trusted no further than shapes were: this runs on a payload the
+        # process cannot re-fetch, and an AttributeError here escapes `main()` and
+        # kills it ahead of BOTH the fallback POST and write_step_summary — the same
+        # both-channel loss the timeout above exists to prevent.
+        user = review.get("user")
+        if not isinstance(user, dict) or user.get("type") != "Bot":
             continue
         if review.get("commit_id") != commit_sha:
             continue
-        # Cheap prefix reject before the normalization work; the equality below is
-        # what actually decides. Every body this script posts opens with the marker,
-        # so this can only skip reviews the identity check would reject anyway.
-        body = review.get("body") or ""
-        if not body.startswith(CONSOLIDATED_MARKER):
+        # Cheap prefix reject before the equality; every body this script posts opens
+        # with the marker, so it can only skip reviews the identity check would reject
+        # anyway. Applied to the NORMALIZED body, not the raw one, or it would be
+        # STRICTER than the check it guards: `_normalize_review_body` strips leading
+        # whitespace, so a stored body differing only by a leading newline would pass
+        # the equality yet never reach it — answering "absent" for the run's own landed
+        # review, which is precisely this path's worst outcome.
+        body = review.get("body")
+        if not isinstance(body, str):
             continue
-        if _normalize_review_body(body) == _normalize_review_body(posted_body):
+        normalized = _normalize_review_body(body)
+        if not normalized.startswith(CONSOLIDATED_MARKER):
+            continue
+        if normalized == _normalize_review_body(posted_body):
             return True
     return False
 

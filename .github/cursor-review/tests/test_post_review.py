@@ -1164,7 +1164,63 @@ class FirstReviewConfirmationTest(unittest.TestCase):
         """The degenerate-shape guard must not swallow the real answer: `[[]]` is what
         `--slurp` returns for a PR with no reviews, and that IS "confirmed absent"."""
         self.assertIs(self.confirm(json.dumps([[]])), False)
-        self.assertIs(self.confirm(json.dumps([])), False, "no pages at all")
+        self.assertIs(
+            self.confirm(json.dumps([[], []])), False, "several empty pages"
+        )
+
+    def test_a_zero_page_payload_is_unknown_not_absent(self):
+        """`[]` is not `[[]]`. `all()` is vacuously true over it, so without an
+        explicit non-empty check it falls through to "no reviews" and tags every
+        anchored finding lost on a read that inspected no PAGE at all — the same
+        laundering the empty-stdout guard rejects."""
+        self.assertIsNone(self.confirm(json.dumps([])))
+
+    def test_a_review_with_hostile_field_types_does_not_kill_the_process(self):
+        """Types are trusted no further than shapes. An AttributeError here escapes
+        main() and kills it ahead of BOTH the fallback POST and the summary write."""
+        for label, review in (
+            ("user is a string", self.landed_review(user="ghost")),
+            ("user is null", self.landed_review(user=None)),
+            ("body is a number", self.landed_review(body=7)),
+            ("body is null", self.landed_review(body=None)),
+        ):
+            with self.subTest(review=label):
+                self.assertIs(self.confirm(json.dumps([[review]])), False)
+
+    def test_the_prefix_reject_is_never_stricter_than_the_equality(self):
+        """The cheap reject runs on the NORMALIZED body, so it cannot skip a review the
+        identity check would have accepted. A raw `startswith` could: normalization
+        strips leading whitespace, so a stored body differing only by a leading newline
+        would pass the equality and never reach it — answering "absent" for the run's
+        own landed review, this path's worst outcome."""
+        body = f"{PR.CONSOLIDATED_MARKER}\n\nFound **2** finding(s)."
+        for label, stored in (
+            ("a leading newline", "\n" + body),
+            ("leading spaces", "   " + body),
+            ("both ends", "\n  " + body + "  \n"),
+        ):
+            with self.subTest(stored=label):
+                self.assertIs(
+                    self.confirm(
+                        json.dumps([[self.landed_review(body=stored)]]),
+                        posted_body=body,
+                    ),
+                    True,
+                )
+
+    def test_a_failed_review_list_read_logs_why(self):
+        """UNKNOWN reposts the fallback and withholds the tag without saying why, so
+        the reason has to be logged here or it exists in no channel at all."""
+        result = subprocess.CompletedProcess(
+            args=["gh"], returncode=124, stdout="",
+            stderr="gh api timed out after 60s listing reviews for o/r#1",
+        )
+        err = io.StringIO()
+        with mock.patch.object(PR, "gh_list_reviews", return_value=result), \
+             contextlib.redirect_stderr(err):
+            self.assertIsNone(PR.review_already_posted("o/r", "1", "deadbeef", "b"))
+        self.assertIn("timed out after 60s", err.getvalue())
+        self.assertIn("exit 124", err.getvalue())
 
     def test_the_review_list_read_is_bounded_and_a_timeout_reads_as_unknown(self):
         """It sits ahead of the fallback POST and the summary write, so an unbounded
