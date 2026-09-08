@@ -205,10 +205,24 @@ class EndToEndPostTest(unittest.TestCase):
     """Drive main() with a stubbed `gh` and read the payload it would have sent."""
 
     def run_main(self, findings, with_diff=True, post_returncode=0, stderr="", summaries=None,
-                 panel=None):
+                 panel=None, existing_reviews=None, list_returncode=0, list_calls=None,
+                 outputs=None, notes=None):
         """Return the POSTed payloads. Pass `summaries` (a list) to collect step-summary
         writes, or `panel` to control the panel summary — the one finding-INDEPENDENT
-        part of the review head that a caller can make large."""
+        part of the review head that a caller can make large.
+
+        The review-list read (BE-12528) is ALWAYS stubbed, never merely when a case
+        cares about it: this harness drives main() end to end, so an unpatched
+        `gh_list_reviews` would shell out to a real `gh` from the unit suite the moment
+        a failure path stopped being a 4xx. The default answer is an empty page, i.e.
+        "confirmed absent", which is what every pre-existing case here already assumed.
+
+        `existing_reviews` is the flat list of review objects the PR carries; it is
+        wrapped in one `--slurp` page, the shape the real command returns.
+        `list_calls`, `outputs` and `notes` are optional out-parameters: the calls the
+        list read received, the parsed $GITHUB_OUTPUT, and the `note=` each
+        write_step_summary got.
+        """
         posted = []
 
         def fake_post(repo, pr_number, payload):
@@ -217,10 +231,26 @@ class EndToEndPostTest(unittest.TestCase):
                 args=["gh"], returncode=post_returncode, stdout="", stderr=stderr
             )
 
+        def fake_list(repo, pr_number):
+            if list_calls is not None:
+                list_calls.append((repo, pr_number))
+            return subprocess.CompletedProcess(
+                args=["gh"],
+                returncode=list_returncode,
+                stdout=json.dumps([existing_reviews or []]),
+                stderr="",
+            )
+
         def fake_summary(markdown, note=None):
             if summaries is not None:
                 summaries.append(markdown)
+            if notes is not None:
+                notes.append(note)
 
+        # Once-per-process by design (the paths fall through each other and duplicate
+        # keys in $GITHUB_OUTPUT are ambiguous), so it has to be reset per case or the
+        # second run_main in a process emits nothing at all.
+        PR._DELIVERY_EMITTED = False
         with tempfile.TemporaryDirectory() as d:
             fpath = os.path.join(d, "consolidated.json")
             with open(fpath, "w", encoding="utf-8") as f:
@@ -230,6 +260,7 @@ class EndToEndPostTest(unittest.TestCase):
                         {"model": "m", "review_type": "adversarial", "status": "ok"}
                     ],
                 }, f)
+            outpath = os.path.join(d, "github_output")
             argv = [
                 "post-review.py",
                 "--findings", fpath,
@@ -243,12 +274,21 @@ class EndToEndPostTest(unittest.TestCase):
                     f.write(DIFF)
                 argv += ["--diff", dpath]
             with mock.patch.object(PR, "gh_post_review", side_effect=fake_post), \
+                 mock.patch.object(PR, "gh_list_reviews", side_effect=fake_list), \
                  mock.patch.object(PR.sys, "argv", argv), \
+                 mock.patch.dict(os.environ, {"GITHUB_OUTPUT": outpath}, clear=False), \
                  mock.patch.object(PR, "write_step_summary", side_effect=fake_summary):
                 try:
                     PR.main()
-                except SystemExit:
-                    pass
+                    self.exit_code = None
+                except SystemExit as exc:
+                    self.exit_code = exc.code
+            if outputs is not None and os.path.exists(outpath):
+                with open(outpath, encoding="utf-8") as f:
+                    for raw in f.read().splitlines():
+                        if "=" in raw:
+                            key, _, value = raw.partition("=")
+                            outputs[key] = value
         return posted
 
     def test_the_field_regression_nine_anchor_one_lands_in_the_body(self):
@@ -828,6 +868,183 @@ class BodyBudgetTest(unittest.TestCase):
         body = visible(posted[1]["body"])
         self.assertEqual(body.count("anchored one"), 1)
         self.assertEqual(body.count("demoted one"), 1)
+
+
+class FirstReviewConfirmationTest(unittest.TestCase):
+    """Before tagging findings `lost_to_fallback`, confirm the first review is ABSENT.
+
+    BE-10002 wrote the tag on the strength of a nonzero `gh` exit alone, and recorded
+    the hole it left as a residual: a nonzero exit is not PROOF the review was not
+    committed server-side. When it WAS, the fallback posted a second review and the
+    next round's ledger carried every anchored finding twice — once with the real
+    thread and any reply on it, once as a cap-exempt `[post-failed]` entry claiming
+    nobody could have answered it.
+
+    So the failure path now asks, cheapest sufficient evidence first: a 4xx is GitHub
+    rejecting the request before writing (the observed firing is always a 422 over an
+    inline position), so no read is needed; anything else — a 5xx, or a transport error
+    with no status at all — takes one paginated read of the PR's reviews. Three
+    outcomes, and the third is the one an over-simplified version loses: PRESENT,
+    ABSENT, and UNKNOWN (BE-4785 — a guard that cannot read its input must not answer
+    a zero).
+    """
+
+    ANCHORED = [finding("app.py", 11), finding("app.py", 12)]
+
+    def landed_review(self, **overrides):
+        review = {
+            "state": "COMMENTED",
+            "commit_id": "deadbeef",
+            "user": {"type": "Bot"},
+            "body": f"{PR.CONSOLIDATED_MARKER}\n\nFound **2** finding(s).",
+        }
+        review.update(overrides)
+        return review
+
+    def test_a_4xx_rejection_tags_post_failed_without_reading_the_reviews(self):
+        """The 422 path, byte-for-byte as before — and it spends no extra API call.
+
+        GitHub validated and refused this request before writing anything, so the
+        review is absent by construction; asking the PR could only agree, at the cost
+        of a round trip on the most common failure this script sees.
+        """
+        calls = []
+        posted = EndToEndPostTest().run_main(
+            self.ANCHORED,
+            post_returncode=1,
+            stderr="gh: Unprocessable Entity (HTTP 422)",
+            list_calls=calls,
+        )
+        self.assertEqual(calls, [], "a 4xx needs no read")
+        self.assertEqual(len(posted), 2, "inline attempt, then the body-only fallback")
+        ledger = ledger_from_posted_body(posted[1]["body"])
+        self.assertEqual(ledger["post_failed_count"], len(self.ANCHORED))
+
+    def test_a_5xx_with_the_review_confirmed_absent_tags_post_failed(self):
+        """A 5xx says nothing about whether the write landed, so this one asks — and
+        an empty review list is the confirmation the tag needs."""
+        calls = []
+        posted = EndToEndPostTest().run_main(
+            self.ANCHORED,
+            post_returncode=1,
+            stderr="gh: Bad Gateway (HTTP 502)",
+            existing_reviews=[],
+            list_calls=calls,
+        )
+        self.assertEqual(calls, [("o/r", "1")], "asked the PR exactly once")
+        self.assertEqual(len(posted), 2)
+        ledger = ledger_from_posted_body(posted[1]["body"])
+        self.assertEqual(ledger["post_failed_count"], len(self.ANCHORED))
+
+    def test_a_5xx_with_the_review_present_skips_the_fallback(self):
+        """The residual, closed: the write DID land, so there is nothing to repost and
+        nothing was lost. One review on the PR, `delivered=true`, exit 0."""
+        outputs, summaries, notes, calls = {}, [], [], []
+        driver = EndToEndPostTest()
+        posted = driver.run_main(
+            self.ANCHORED,
+            post_returncode=1,
+            stderr="gh: Bad Gateway (HTTP 502)",
+            existing_reviews=[self.landed_review()],
+            list_calls=calls,
+            outputs=outputs,
+            summaries=summaries,
+            notes=notes,
+        )
+        self.assertEqual(calls, [("o/r", "1")])
+        self.assertEqual(len(posted), 1, "no duplicate review is posted")
+        self.assertNotIn(
+            PR.POST_FAILED_SUMMARY_NOTE, notes,
+            "nothing failed to reach the PR, so nothing degrades to the summary",
+        )
+        self.assertEqual(outputs["delivered"], "true")
+        self.assertEqual(outputs["gated_findings"], "2", "both findings kept a thread")
+        self.assertEqual(outputs["posted"], "true")
+        self.assertIsNone(driver.exit_code, "the step is green: the review is on the PR")
+
+    def test_a_present_review_by_a_human_or_on_another_commit_does_not_count(self):
+        """The same four-part discriminator the gate and the workflow's dup-check use.
+
+        A human's review, a review of a different head SHA, and a DISMISSED one are all
+        reviews on the PR that are NOT this run's — reading any of them as "it landed"
+        would suppress a fallback the round genuinely needs and lose every finding.
+        """
+        for label, review in (
+            ("a human author", self.landed_review(user={"type": "User"})),
+            ("another commit", self.landed_review(commit_id="cafebabe")),
+            ("dismissed", self.landed_review(state="DISMISSED")),
+        ):
+            with self.subTest(review=label):
+                posted = EndToEndPostTest().run_main(
+                    self.ANCHORED,
+                    post_returncode=1,
+                    stderr="gh: Bad Gateway (HTTP 502)",
+                    existing_reviews=[review],
+                )
+                self.assertEqual(len(posted), 2, "the fallback still posts")
+                ledger = ledger_from_posted_body(posted[1]["body"])
+                self.assertEqual(ledger["post_failed_count"], len(self.ANCHORED))
+
+    def test_an_unreadable_review_list_posts_the_fallback_untagged(self):
+        """UNKNOWN is neither of the other two. The findings still reach the ledger —
+        losing them is never the answer — but as `[unanchorable]`, the conservative
+        reading, because `lost_to_fallback` is a claim and nothing here supports it."""
+        stderr_buf = io.StringIO()
+        with contextlib.redirect_stderr(stderr_buf):
+            posted = EndToEndPostTest().run_main(
+                self.ANCHORED,
+                post_returncode=1,
+                stderr="gh: Bad Gateway (HTTP 502)",
+                list_returncode=1,
+            )
+        self.assertEqual(len(posted), 2, "the fallback still posts")
+        fallback = posted[1]["body"]
+        self.assertIn(PR.BODY_ONLY_SENTINEL_PREFIX, fallback, "the findings still reach it")
+        ledger = ledger_from_posted_body(fallback)
+        self.assertEqual(ledger["entry_count"], len(self.ANCHORED))
+        for entry in ledger["entries"]:
+            self.assertNotIn("lost_to_fallback", entry)
+        self.assertEqual(ledger["post_failed_count"], 0)
+        self.assertEqual(ledger["unanchorable_count"], len(self.ANCHORED))
+        self.assertIn("could not confirm whether the first POST landed", stderr_buf.getvalue())
+
+    def test_a_transport_error_with_no_http_status_goes_through_the_read(self):
+        """No status at all is UNDECIDED, not "not a 4xx we recognize" — a connection
+        that dropped after the request left may well have been served."""
+        calls = []
+        EndToEndPostTest().run_main(
+            self.ANCHORED,
+            post_returncode=1,
+            stderr="error connecting to api.github.com",
+            existing_reviews=[],
+            list_calls=calls,
+        )
+        self.assertEqual(calls, [("o/r", "1")])
+
+    def test_the_consolidated_marker_matches_gate_unresolved(self):
+        """One discriminator, three readers (the gate, the ledger, and now this) — so
+        a reword that moved only one of them would make this path stop recognizing the
+        review it just posted. Copied rather than imported (neither module imports the
+        other), pinned here exactly as test_build_ledger.py pins the ledger's copy."""
+        spec = importlib.util.spec_from_file_location(
+            "gate_unresolved",
+            os.path.join(os.path.dirname(__file__), "..", "gate-unresolved.py"),
+        )
+        gate_unresolved = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gate_unresolved)
+        self.assertEqual(PR.CONSOLIDATED_MARKER, gate_unresolved.CONSOLIDATED_MARKER)
+
+    def test_gh_http_status_parses_gh_stderr(self):
+        def status(text):
+            return PR.gh_http_status(
+                subprocess.CompletedProcess(args=["gh"], returncode=1, stderr=text)
+            )
+
+        self.assertEqual(status("gh: Unprocessable Entity (HTTP 422)"), 422)
+        self.assertEqual(status("gh: Bad Gateway (HTTP 502)"), 502)
+        self.assertIsNone(status("error connecting to api.github.com"))
+        self.assertIsNone(status(""))
+        self.assertIsNone(status(None), "a CompletedProcess can carry no stderr at all")
 
 
 class FitSentinelItemsTest(unittest.TestCase):

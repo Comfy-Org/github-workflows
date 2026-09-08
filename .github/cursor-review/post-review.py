@@ -278,6 +278,93 @@ def is_read_only_token_error(result: subprocess.CompletedProcess) -> bool:
     return "Resource not accessible by integration" in blob or "HTTP 403" in blob
 
 
+# The discriminator for "a review of THIS panel is already on the PR". Mirrors
+# gate-unresolved.py's constant of the same name (and the inline jq the workflow's
+# dup-check uses) — duplicated as a literal rather than imported because neither module
+# imports the other, and pinned equal to the gate's by test_post_review.py, exactly the
+# way build-ledger.py pins its own copy.
+CONSOLIDATED_MARKER = "## 🔍 Cursor Review — Consolidated panel"
+
+# `gh api` reports the HTTP status in its stderr, e.g.
+# `gh: Unprocessable Entity (HTTP 422)`. A transport failure (DNS, TLS, a dropped
+# connection) carries no status at all, which is why the caller treats "no match" as
+# unknown rather than as a server error.
+_GH_HTTP_STATUS_RE = re.compile(r"\(HTTP (\d{3})\)")
+
+
+def gh_http_status(result: subprocess.CompletedProcess):
+    """The HTTP status `gh` reported on stderr, or None when it reported none."""
+    match = _GH_HTTP_STATUS_RE.search(result.stderr or "")
+    return int(match.group(1)) if match else None
+
+
+def gh_list_reviews(repo: str, pr_number: str) -> subprocess.CompletedProcess:
+    """Every review on the PR, oldest first, ALL pages.
+
+    Paginated deliberately: the review this asks about is the newest one, so on a PR
+    with more than a page of reviews it sits on the LAST page. The workflow's own
+    dup-check (`cursor-review.yml`, the `already_reviewed` step) is the same
+    discriminator without pagination — it can afford that, because it only has to
+    notice a review that already exists before spending the panel, while a wrong
+    answer here decides whether findings are labelled lost.
+
+    `--slurp` wraps each page in an outer array (gh >= 2.43; the runner uses a current
+    gh), so the caller flattens one level.
+    """
+    return subprocess.run(
+        [
+            "gh",
+            "api",
+            "--paginate",
+            "--slurp",
+            f"/repos/{repo}/pulls/{pr_number}/reviews",
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+
+def review_already_posted(
+    repo: str, pr_number: str, commit_sha: str, posted_body: str
+):
+    """Did the review this run tried to post actually land on the PR?
+
+    Three-valued on purpose, because two of the three drive different behaviour and
+    the third must never be mistaken for either: ``True`` a review from this run is on
+    the PR, ``False`` confirmed absent, ``None`` could not tell (the list read failed
+    or came back unparseable). A read that failed is not a zero — see BE-4785 — so the
+    caller degrades rather than claiming the review is missing.
+
+    The same four-part discriminator the gate and the workflow use: not DISMISSED, a
+    Bot author (the poster is caller-configurable, so the TYPE is the only thing this
+    can know), the run's own head SHA, and the panel marker. Matched on the marker
+    rather than only on byte-equality with `posted_body` because GitHub may normalize
+    what it stored (line endings, trailing whitespace); byte-equality is still tried
+    first since it is the strongest evidence available.
+    """
+    result = gh_list_reviews(repo, pr_number)
+    if result.returncode != 0:
+        return None
+    try:
+        pages = json.loads(result.stdout or "[]")
+    except ValueError:
+        return None
+    if not isinstance(pages, list):
+        return None
+    reviews = [r for page in pages for r in (page if isinstance(page, list) else [])]
+    for review in reviews:
+        if not isinstance(review, dict) or review.get("state") == "DISMISSED":
+            continue
+        if ((review.get("user") or {}).get("type") or "") != "Bot":
+            continue
+        if review.get("commit_id") != commit_sha:
+            continue
+        body = review.get("body") or ""
+        if body == posted_body or body.startswith(CONSOLIDATED_MARKER):
+            return True
+    return False
+
+
 READ_ONLY_SUMMARY_NOTE = (
     "> ℹ️ This review could not be posted on the PR because the run's "
     "`GITHUB_TOKEN` is read-only (e.g. read-only default workflow "
@@ -1494,9 +1581,14 @@ def main():
         }
     )
 
-    result = gh_post_review(args.repo, args.pr_number, payload)
+    def finish_posted_review():
+        """Report the inline review as delivered, and write the clamp's job summary.
 
-    if result.returncode == 0:
+        Shared by the two paths on which THIS body is on the PR: the `gh` POST
+        returned 0, and the POST errored but the review turned out to have landed
+        anyway (below). Those two outcomes are the same fact about the PR, so they
+        report it through one implementation rather than two that can drift.
+        """
         # The split the gate needs: `comments` are the findings that got a thread a
         # human can resolve; `body_only_items` reached the body and can never be
         # resolved. A round where the second is non-empty and the first is empty is
@@ -1514,6 +1606,11 @@ def main():
                 file=sys.stderr,
             )
             write_step_summary(prose_body, note=TRUNCATED_SUMMARY_NOTE)
+
+    result = gh_post_review(args.repo, args.pr_number, payload)
+
+    if result.returncode == 0:
+        finish_posted_review()
         return
 
     # A read-only token rejects any write, so the inline-less fallback below
@@ -1544,6 +1641,46 @@ def main():
         emit_delivery(False)
         write_step_summary(prose_body, note=POST_FAILED_SUMMARY_NOTE)
         raise SystemExit(1)
+
+    # Did that POST really fail to land? A nonzero `gh` is not proof it did not —
+    # the `not comments` branch above already declines to repost for exactly that
+    # reason — and the answer decides two things below: whether to post the fallback
+    # at all, and whether the findings that anchored may be labelled lost.
+    #
+    # Cheapest sufficient evidence first. A 4xx is GitHub VALIDATING and rejecting the
+    # request before writing anything (every firing observed in the field is a 422 over
+    # an inline position), so the review is absent by construction and no read is worth
+    # the call. Anything else — a 5xx, or a transport error that carries no status at
+    # all — leaves the write genuinely undecided, so ask the PR. Three outcomes follow:
+    # PRESENT (the review landed: report it delivered, post nothing more), ABSENT
+    # (behave exactly as this path always has), and UNKNOWN (post the fallback, but tag
+    # nothing `lost_to_fallback` — the flag is a claim, and an unreadable list supports
+    # none). UNKNOWN is why the read failing is not answered as a `False`: that would
+    # be indistinguishable from a confirmed-absent review and would relabel findings on
+    # the strength of a transient blip.
+    status = gh_http_status(result)
+    if status is not None and 400 <= status < 500:
+        landed = False
+    else:
+        landed = review_already_posted(
+            args.repo, args.pr_number, args.commit_sha, posted_body
+        )
+
+    if landed is True:
+        print(
+            f"Review: the POST errored ({(result.stderr or '').strip()[:200]}) but a "
+            f"review for {args.commit_sha[:7]} is on the PR — not reposting; treating "
+            "as delivered.",
+            file=sys.stderr,
+        )
+        finish_posted_review()
+        return
+    if landed is None:
+        print(
+            "Review: could not confirm whether the first POST landed (review list "
+            "unreadable) — posting the fallback with no finding tagged [post-failed].",
+            file=sys.stderr,
+        )
 
     # Fallback: same findings without inline anchors. Typical cause is line
     # numbers that fall outside the diff context — often the model picked
@@ -1576,18 +1713,16 @@ def main():
     # disclosed the degradation loudly and recovered ZERO entries — including for the
     # findings that anchored perfectly well and lost their thread only to the failed
     # POST. Every finding of the round is OFFERED to it — the ones from `inline_items`
-    # tagged `lost_to_fallback`, the ones already unanchorable left untagged, since the
-    # POST outcome changed nothing for them — and the size guard below decides how many
-    # of them the body can actually afford to carry.
+    # tagged `lost_to_fallback` only when the first review is confirmed ABSENT, the
+    # ones already unanchorable left untagged, since the POST outcome changed nothing
+    # for them — and the size guard below decides how many of them the body can
+    # actually afford to carry.
     #
-    # Residual (BE-10002): a nonzero `gh` result is not PROOF the review was not
-    # committed server-side — the `not comments` branch above declines the fallback for
-    # exactly that reason. If the first POST did land, its findings have real threads
-    # and also land in this sentinel, so next round's ledger carries each of them
-    # twice: once with its thread and any reply on it, once as a cap-exempt
-    # [post-failed] entry saying nobody could have answered it. Keying the tag on a
-    # confirmed-absent thread would need a read of the PR's reviews this script does
-    # not do, so it is written down here rather than fixed.
+    # That confirmation is the check above, and it has three outcomes: PRESENT returns
+    # before reaching here (nothing is reposted and nothing is relabelled), ABSENT is
+    # this path with the tag applied, and UNKNOWN is this path with the tag withheld —
+    # the fallback still carries every finding, each reading as [unanchorable], which
+    # is what an unread review list can honestly support.
     #
     # Tagged by identity, not by value: `inline_items` and `body_only_items` hold the
     # very objects `enriched` does, and two findings can be equal without being the
@@ -1601,7 +1736,17 @@ def main():
     # [unanchorable]: the conservative reading, and the one this path gave them before
     # BE-10002. The claim the flag makes is "this passed the diff-anchor check", and
     # that is a claim only a real check can make.
-    lost_ids = {id(item) for item in inline_items} if anchors is not None else set()
+    #
+    # Both conditions are required, and for the same reason: `lost_to_fallback` says
+    # "this finding anchored, and the failed POST is what cost it its thread". The
+    # anchor half needs a real diff check (`anchors is not None`); the lost half needs
+    # the first review to be confirmed ABSENT (`landed is False`), since a review that
+    # landed — or one nobody could look for — leaves that second claim unsupported.
+    lost_ids = (
+        {id(item) for item in inline_items}
+        if (anchors is not None and landed is False)
+        else set()
+    )
     sentinel_items = [
         {**item, "lost_to_fallback": True} if id(item) in lost_ids else item
         for item in enriched
