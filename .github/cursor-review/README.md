@@ -71,6 +71,12 @@ a fresh runner with a fresh pinned checkout there is nothing tampered left for t
 minted token to meet. `tests/test_workflow_job_isolation.py` pins the property, and
 [`pr-size.yml`](../workflows/pr-size.yml) uses the identical split for its comment job.
 
+### The prior-review ledger and the repeat policy
+
+With `ledger_prior_review` on (the default), [`build-ledger.py`](build-ledger.py) rebuilds what earlier rounds raised on this PR — each finding, its thread, and the author's replies — and splices it into the panel and judge prompts as untrusted DATA. The rule it enforces is that only an **answered** finding costs a repeat slot: a finding the author or a maintainer replied to may be raised again only if the judge emits `repeat_of` (that thread's permalink) and `repeat_round`, and at most `REPEAT_CAP` such re-raises survive per review, so a round can never be all re-litigation. A finding nobody answered is free to raise again.
+
+A finding that could not be anchored to a line the reviewed diff carries is **demoted** to the review body, and one that lost its whole review to a failed POST is delivered as prose — neither gets a thread, so neither can be answered and neither costs a slot. But a demoted finding may itself have been a *re-raise*, and that lineage used to disappear with the trailer that was stripped out of its recovered body: the next round saw a fresh, thread-less, cap-exempt finding, so one demoted hop made every later re-raise of the same finding free. The sentinel now carries the ancestor's URL and round as fields, and the ledger resolves them back to the real thread — the id must name a **root** comment of one of *our* consolidated reviews on this PR, so a hallucinated or foreign link resolves to nothing. When it does resolve, the entry renders a `re_raise_of: <url> (round N; answers_from_author_or_maintainer=<k>)` line and the repeat rule is applied to that **ancestor's** answer state: with `k >= 1` a further re-raise must carry `repeat_of` and costs a slot, and with `k == 0` nothing changes. Resolution runs over every consolidated review before the round cap, so the ancestor is still found after its own round has aged out of the ledger.
+
 ### The panel
 
 | Lab | Model (Cursor catalog) |
