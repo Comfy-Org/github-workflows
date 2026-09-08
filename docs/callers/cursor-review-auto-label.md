@@ -18,15 +18,22 @@ roster is baked into the workflow.
 | | |
 |---|---|
 | `vars.APP_ID` | **Required unless `bot_app_id` is set.** The CLOUD_CODE_BOT app id. |
-| `secrets.CLOUD_CODE_BOT_PRIVATE_KEY` | **Required unless `bot_app_id` is set.** |
+| `secrets.CLOUD_CODE_BOT_PRIVATE_KEY` | **Required unless `bot_app_id` is set** — and must NOT be passed when it is. |
 | `bot_app_id` (input) | Optional. App id to mint the label token from instead of `vars.APP_ID` — for a caller that would rather not hand this workflow the write-broad app's key. |
-| `secrets.BOT_APP_PRIVATE_KEY` | Required **when** `bot_app_id` is set; ignored otherwise. |
+| `secrets.BOT_APP_PRIVATE_KEY` | Required **when** `bot_app_id` is set — and must NOT be passed when it isn't. |
 | `vars.CURSOR_REVIEW_OPTED_IN_LOGINS` | The opt-in roster. Empty means nobody gets auto-labeled. |
 
-Exactly one of the two pairs must be complete. A half-configured pair — a
-`bot_app_id` with no `BOT_APP_PRIVATE_KEY`, or neither key — fails the run at a
-preflight step with an explicit `::error::`, rather than silently minting from
-the other app.
+Supply **exactly one complete pair**. A preflight step ahead of the mint fails
+the run with an explicit `::error::` — never a silent fall back to the other
+app — on every other shape:
+
+| What you passed | Why it fails |
+|---|---|
+| `bot_app_id`, no `BOT_APP_PRIVATE_KEY` | Half a pair. |
+| `BOT_APP_PRIVATE_KEY`, no `bot_app_id` | Half a pair — and usually a `bot_app_id:` expression that resolved empty (variable unset or misspelled). Falling back here would mint from the write-broad app you were trying to avoid, on a green run. |
+| `bot_app_id` **and** `CLOUD_CODE_BOT_PRIVATE_KEY` | A mix. Migrating means *replacing* the `CLOUD_CODE_BOT_PRIVATE_KEY:` mapping, not adding beside it, so the write-broad key never enters the run. `secrets: inherit` trips this too — map the one secret explicitly. |
+| Neither key | Nothing to mint with. |
+| No `bot_app_id` and an empty `vars.APP_ID` | The default pair needs the app id too, not just the key. |
 
 ## Caller
 
@@ -56,7 +63,8 @@ jobs:
       CLOUD_CODE_BOT_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
 ```
 
-To mint from a narrower App instead (same caller, swap the last four lines):
+To mint from a narrower App instead, replace that caller's `uses:`/`secrets:`
+block (its last three lines) with:
 
 ```yaml
     uses: Comfy-Org/github-workflows/.github/workflows/cursor-review-auto-label.yml@<full-commit-sha>
@@ -66,10 +74,14 @@ To mint from a narrower App instead (same caller, swap the last four lines):
       BOT_APP_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PR_PRIVATE_KEY }}
 ```
 
+Note the `CLOUD_CODE_BOT_PRIVATE_KEY:` line is *gone*, not kept alongside — a
+caller that passes both is rejected at the preflight rather than quietly
+carrying the write-broad key into the run.
+
 That App still needs `pull-requests: write` on the installation — it is what
-applies the label — and it must be a real GitHub App, for the same
-GITHUB_TOKEN reason below. Pass `bot_app_id` **or** the CLOUD_CODE_BOT key, not
-a mix: with `bot_app_id` set, `CLOUD_CODE_BOT_PRIVATE_KEY` is never read.
+applies the label, and it is the only permission the minted token requests
+(`permission-pull-requests: write`, on both credential paths) — and it must be a
+real GitHub App, for the same GITHUB_TOKEN reason below.
 
 Then ask a maintainer to add your repo to the `AUTO_LABEL_CALLERS` roster secret on `Comfy-Org/github-workflows`
 — that roster is what keeps your pin current
@@ -90,7 +102,7 @@ Only that. The label write goes through the App token, not `GITHUB_TOKEN`.
 | `review_label` | `cursor-review` | Must match `cursor-review.yml`'s `review_label`. |
 | `skip_label` | `skip-cursor-review` | Present on a PR ⇒ never auto-label it. |
 | `runs_on` | `'"ubuntu-latest"'` | JSON. Set for self-hosted runners. |
-| `bot_app_id` | `''` (empty) | App id to mint the label token from. Empty ⇒ `vars.APP_ID`. Pair it with `secrets.BOT_APP_PRIVATE_KEY`. |
+| `bot_app_id` | `''` (empty) | App id to mint the label token from. Empty ⇒ `vars.APP_ID` + `secrets.CLOUD_CODE_BOT_PRIVATE_KEY`. Set ⇒ pair it with `secrets.BOT_APP_PRIVATE_KEY` and drop the CLOUD_CODE_BOT mapping. |
 
 ## Why the App token is mandatory
 
