@@ -1941,9 +1941,10 @@ class BodyOnlySentinelTest(unittest.TestCase):
         self.assertEqual(payload[0]["body"], "still broken")
         self.assertNotIn("discussion_r99", payload[0]["body"])
         self.assertNotIn("re-raise of", payload[0]["body"])
-        # …and it is carried structurally instead.
+        # …and it is carried structurally instead. The URL alone: build-ledger.py takes
+        # the round off the review the resolved ancestor belongs to.
         self.assertEqual(payload[0]["repeat_of"], url)
-        self.assertEqual(payload[0]["repeat_round"], 2)
+        self.assertNotIn("repeat_round", payload[0])
         # The human-readable half is untouched — the reader still sees the re-raise.
         self.assertIn("re-raise of", PR.render_body_only_findings(items))
 
@@ -1984,50 +1985,50 @@ class BodyOnlySentinelTest(unittest.TestCase):
                     PR.render_body_only_findings(PR.normalize_comments([raw]))
                 )
                 self.assertNotIn("repeat_of", payload[0])
-                # The round is its own field and stays valid on its own — only the URL
-                # was malformed. The reader drops the whole lineage without a URL to
-                # resolve, so this is the writer being narrow, not the policy leaking.
-                self.assertEqual(payload[0].get("repeat_round"), 2)
+                # No lineage key of ANY kind survives a malformed URL. The round used
+                # to be emitted here on its own, which left the sentinel claiming a
+                # lineage round with no lineage to belong to; the reader takes the
+                # round off the resolved ancestor's review, so the payload never
+                # carries one.
+                self.assertNotIn("repeat_round", payload[0])
 
-    def test_a_malformed_repeat_round_is_not_emitted(self):
-        """`bool` is an int subclass, so `repeat_round: true` would otherwise be emitted
-        as JSON `true` — the exact value the reader's own coercion rejects."""
+    def test_the_round_never_travels_in_the_sentinel(self):
+        """The URL is the ONLY lineage key. build-ledger.py recovers the round from the
+        review the resolved ancestor belongs to — truthful by construction, and
+        available whenever the URL resolves at all — so a `repeat_round` field here
+        would be payload nothing reads, in a body under a hard size cap that can drop a
+        real finding to make room for it. The prose trailer still shows the round."""
         url = "https://github.com/o/r/pull/1#discussion_r99"
-        for bad in (True, False, 0, -1, "x", "", None, 1.5, [2]):
-            with self.subTest(repeat_round=bad):
+        for round_no in (2, " 3 ", True, 0, -1, "x", None, 1.5, [2]):
+            with self.subTest(repeat_round=round_no):
                 raw = finding("a/b.py", 42, body="still broken")
                 raw["repeat_of"] = url
-                raw["repeat_round"] = bad
+                raw["repeat_round"] = round_no
                 payload = self._payload(
                     PR.render_body_only_findings(PR.normalize_comments([raw]))
                 )
                 self.assertNotIn("repeat_round", payload[0])
                 self.assertEqual(payload[0]["repeat_of"], url, "the URL still travels")
 
-    def test_a_repeat_round_given_as_a_decimal_string_is_emitted_as_an_int(self):
-        """Same coercion the prose trailer uses (`coerce_repeat_round`), so the two can
-        never disagree about which values are a round."""
+    def test_a_repeat_round_given_as_a_decimal_string_still_renders_in_the_trailer(self):
+        """The coercion the prose trailer uses (`coerce_repeat_round`) is unchanged by
+        the sentinel no longer carrying the round."""
         raw = finding("a/b.py", 42, body="still broken")
         raw["repeat_of"] = "https://github.com/o/r/pull/1#discussion_r99"
         raw["repeat_round"] = " 3 "
         items = PR.normalize_comments([raw])
         self.assertIn("(round 3)", items[0]["comment"]["body"])
-        self.assertEqual(
-            self._payload(PR.render_body_only_findings(items))[0]["repeat_round"], 3
-        )
 
     def test_a_digit_like_repeat_round_that_int_rejects_degrades_instead_of_raising(self):
         """`str.isdigit()` is True for characters `int()` rejects ('²' → ValueError), so
         the pre-existing `isdigit()`-then-`int()` pair raised out of normalize_comments
-        — killing the whole review post over one relayed field. Sharing the coercion
-        with the sentinel made the guard mandatory (this parser must degrade, never
-        raise, exactly like build-ledger.py's `_body_only_line`), so it is pinned here.
+        — killing the whole review post over one relayed field. This parser must
+        degrade, never raise, exactly like build-ledger.py's `_body_only_line`.
         """
         raw = finding("a/b.py", 42, body="still broken")
         raw["repeat_of"] = "https://github.com/o/r/pull/1#discussion_r99"
         raw["repeat_round"] = "²"
         items = PR.normalize_comments([raw])
-        self.assertEqual(items[0]["repeat_round"], None)
         self.assertNotIn("(round", items[0]["comment"]["body"])
         self.assertIn("re-raise of", items[0]["comment"]["body"], "the URL still renders")
         self.assertNotIn(
