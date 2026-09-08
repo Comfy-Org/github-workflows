@@ -201,12 +201,22 @@ class LoadAnchorsFailsOpenTest(unittest.TestCase):
             self.assertEqual(PR.load_anchors(p)["util.py"], {5, 6})
 
 
+# Stands in, inside an `existing_reviews` fixture, for "the body this run actually
+# POSTed" — which a case cannot write out, since main() assembles it from the findings.
+# Compared by IDENTITY in the harness, so it can never collide with a real body.
+ECHO_POSTED_BODY = "<the body this run posted>"
+
+# Distinguishes "the case said nothing about stdout" from "the case asked for empty
+# stdout", which is itself one of the behaviours under test.
+_UNSET = object()
+
+
 class EndToEndPostTest(unittest.TestCase):
     """Drive main() with a stubbed `gh` and read the payload it would have sent."""
 
     def run_main(self, findings, with_diff=True, post_returncode=0, stderr="", summaries=None,
                  panel=None, existing_reviews=None, list_returncode=0, list_calls=None,
-                 outputs=None, notes=None):
+                 outputs=None, notes=None, raw_stdout=_UNSET, extra_argv=()):
         """Return the POSTed payloads. Pass `summaries` (a list) to collect step-summary
         writes, or `panel` to control the panel summary — the one finding-INDEPENDENT
         part of the review head that a caller can make large.
@@ -218,7 +228,14 @@ class EndToEndPostTest(unittest.TestCase):
         "confirmed absent", which is what every pre-existing case here already assumed.
 
         `existing_reviews` is the flat list of review objects the PR carries; it is
-        wrapped in one `--slurp` page, the shape the real command returns.
+        wrapped in one `--slurp` page, the shape the real command returns. A review
+        whose `body` is `ECHO_POSTED_BODY` gets the body this run actually POSTed,
+        which is the only body the identity check accepts. `raw_stdout` replaces that
+        whole payload with a literal string, for the cases that test a MALFORMED one.
+
+        `extra_argv` appends to the command line, for the head-shaping options
+        (`--notice`, `--triggered-by`, `--ledger-note`) a case needs to vary.
+
         `list_calls`, `outputs` and `notes` are optional out-parameters: the calls the
         list read received, the parsed $GITHUB_OUTPUT, and the `note=` each
         write_step_summary got.
@@ -234,10 +251,20 @@ class EndToEndPostTest(unittest.TestCase):
         def fake_list(repo, pr_number):
             if list_calls is not None:
                 list_calls.append((repo, pr_number))
+            # A review only counts as THIS run's when its body IS the body this run
+            # posted (BE-12528), which the case cannot spell out ahead of time — it is
+            # assembled by main() from the findings. ECHO_POSTED_BODY stands in for it
+            # and is resolved here, after the POST, from the payload actually sent.
+            reviews = []
+            for review in existing_reviews or []:
+                if review.get("body") is ECHO_POSTED_BODY:
+                    review = {**review, "body": posted[0]["body"]}
+                reviews.append(review)
+            stdout = json.dumps([reviews]) if raw_stdout is _UNSET else raw_stdout
             return subprocess.CompletedProcess(
                 args=["gh"],
                 returncode=list_returncode,
-                stdout=json.dumps([existing_reviews or []]),
+                stdout=stdout,
                 stderr="",
             )
 
@@ -273,6 +300,7 @@ class EndToEndPostTest(unittest.TestCase):
                 with open(dpath, "w", encoding="utf-8") as f:
                     f.write(DIFF)
                 argv += ["--diff", dpath]
+            argv += list(extra_argv)
             with mock.patch.object(PR, "gh_post_review", side_effect=fake_post), \
                  mock.patch.object(PR, "gh_list_reviews", side_effect=fake_list), \
                  mock.patch.object(PR.sys, "argv", argv), \
@@ -892,11 +920,18 @@ class FirstReviewConfirmationTest(unittest.TestCase):
     ANCHORED = [finding("app.py", 11), finding("app.py", 12)]
 
     def landed_review(self, **overrides):
+        """The review this run posted, as the PR would carry it back.
+
+        The body is ECHO_POSTED_BODY, not a hand-written body that merely opens with
+        the marker: since the identity check the marker-prefix match was replaced by,
+        only the body this run actually POSTed answers True, and a fixture that
+        asserted otherwise would be asserting against the old behaviour.
+        """
         review = {
             "state": "COMMENTED",
             "commit_id": "deadbeef",
             "user": {"type": "Bot"},
-            "body": f"{PR.CONSOLIDATED_MARKER}\n\nFound **2** finding(s).",
+            "body": ECHO_POSTED_BODY,
         }
         review.update(overrides)
         return review
@@ -968,11 +1003,35 @@ class FirstReviewConfirmationTest(unittest.TestCase):
         A human's review, a review of a different head SHA, and a DISMISSED one are all
         reviews on the PR that are NOT this run's — reading any of them as "it landed"
         would suppress a fallback the round genuinely needs and lose every finding.
+
+        So are the four the marker-prefix match used to accept. A PENDING review is the
+        sharpest: `GET /pulls/{n}/reviews` returns the authenticated identity's own
+        unsubmitted reviews, and that identity is this same bot, so the half-committed
+        write this path exists to detect is precisely what could show up as PENDING —
+        invisible to everyone else, publishing no resolvable thread. And a previous
+        round's fallback body or a `post_error_review` body both OPEN with the marker,
+        are Bot-authored, and carry this same `commit_id`; accepting either would report
+        `delivered=true` over another round's threads while this round's findings
+        reached nowhere at all.
         """
         for label, review in (
             ("a human author", self.landed_review(user={"type": "User"})),
             ("another commit", self.landed_review(commit_id="cafebabe")),
             ("dismissed", self.landed_review(state="DISMISSED")),
+            ("pending", self.landed_review(state="PENDING")),
+            ("a state this does not recognize", self.landed_review(state="")),
+            (
+                "another round's fallback body at the same SHA",
+                self.landed_review(
+                    body=f"{PR.CONSOLIDATED_MARKER}\n\nFound **9** finding(s)."
+                ),
+            ),
+            (
+                "an error review at the same SHA",
+                self.landed_review(
+                    body=f"{PR.CONSOLIDATED_MARKER}\n\nThe review could not run."
+                ),
+            ),
         ):
             with self.subTest(review=label):
                 posted = EndToEndPostTest().run_main(
@@ -1033,6 +1092,137 @@ class FirstReviewConfirmationTest(unittest.TestCase):
         gate_unresolved = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(gate_unresolved)
         self.assertEqual(PR.CONSOLIDATED_MARKER, gate_unresolved.CONSOLIDATED_MARKER)
+
+    def test_a_body_github_normalized_still_counts_as_this_runs_review(self):
+        """The identity check tolerates what GitHub rewrites, and only that.
+
+        CRLF line endings and trailing whitespace are storage artefacts, not a
+        different review — if they defeated the match, the very case this path exists
+        for (the write DID land) would repost the duplicate anyway.
+        """
+        body = f"{PR.CONSOLIDATED_MARKER}\n\nFound **2** finding(s).\n"
+        stored = self.landed_review(body=body.replace("\n", "\r\n") + "  \r\n")
+        self.assertIs(
+            self.confirm(json.dumps([[stored]]), posted_body=body), True,
+            "CRLF and trailing whitespace are storage artefacts, not another review",
+        )
+        # …and only that. A body differing by anything a reader would SEE is a
+        # different review, which is the whole point of matching on the body at all.
+        for label, other in (
+            ("one more finding", body.replace("**2**", "**3**")),
+            ("an extra paragraph", body + "\nAlso: something else.\n"),
+        ):
+            with self.subTest(differs_by=label):
+                self.assertIs(
+                    self.confirm(
+                        json.dumps([[self.landed_review(body=other)]]), posted_body=body
+                    ),
+                    False,
+                )
+
+    def test_a_retryable_4xx_is_not_treated_as_a_pre_write_rejection(self):
+        """408/429 can come from an edge or a proxy about a request GitHub SERVED.
+
+        The no-read short-circuit is sound only for a status that means "validated and
+        refused before writing", so these take the read like a 5xx — and when it says
+        the review landed, no duplicate is posted and nothing is tagged lost.
+        """
+        for status, label in ((408, "Request Timeout"), (429, "Too Many Requests")):
+            with self.subTest(status=status):
+                calls = []
+                posted = EndToEndPostTest().run_main(
+                    self.ANCHORED,
+                    post_returncode=1,
+                    stderr=f"gh: {label} (HTTP {status})",
+                    existing_reviews=[self.landed_review()],
+                    list_calls=calls,
+                )
+                self.assertEqual(calls, [("o/r", "1")], "this status must be read, not assumed")
+                self.assertEqual(len(posted), 1, "the review landed — no duplicate")
+
+    def test_a_degenerate_review_list_payload_is_unknown_not_empty(self):
+        """A read that inspected NOTHING must not answer "confirmed absent".
+
+        Exit 0 with empty stdout, a flat array, a bare object and a scalar are all
+        payloads this cannot read; defaulting any of them to `[]` would apply
+        `lost_to_fallback` to every anchored finding on the strength of a read that
+        established nothing (BE-4785).
+        """
+        for label, raw in (
+            ("empty stdout", ""),
+            ("whitespace only", "   \n"),
+            ("a flat array of reviews", json.dumps([self.landed_review(body="x")])),
+            ("a single object", json.dumps({"state": "COMMENTED"})),
+            ("a bare scalar", json.dumps(7)),
+        ):
+            with self.subTest(payload=label):
+                self.assertIsNone(
+                    self.confirm(raw), f"{label} must read as UNKNOWN"
+                )
+
+    def test_a_well_formed_empty_page_is_still_a_confirmed_absence(self):
+        """The degenerate-shape guard must not swallow the real answer: `[[]]` is what
+        `--slurp` returns for a PR with no reviews, and that IS "confirmed absent"."""
+        self.assertIs(self.confirm(json.dumps([[]])), False)
+        self.assertIs(self.confirm(json.dumps([])), False, "no pages at all")
+
+    def test_the_review_list_read_is_bounded_and_a_timeout_reads_as_unknown(self):
+        """It sits ahead of the fallback POST and the summary write, so an unbounded
+        hang would take the round out of both channels when the job timer fires. The
+        timeout comes back as a nonzero result, i.e. through the UNKNOWN branch."""
+        self.assertLess(
+            PR.GH_LIST_REVIEWS_TIMEOUT_SECONDS, 10 * 60,
+            "must be well under the job's timeout-minutes: 10",
+        )
+        with mock.patch.object(
+            PR.subprocess, "run",
+            side_effect=subprocess.TimeoutExpired(cmd=["gh"], timeout=PR.GH_LIST_REVIEWS_TIMEOUT_SECONDS),
+        ) as run:
+            result = PR.gh_list_reviews("o/r", "1")
+        self.assertEqual(
+            run.call_args.kwargs.get("timeout"), PR.GH_LIST_REVIEWS_TIMEOUT_SECONDS
+        )
+        self.assertNotEqual(result.returncode, 0, "a timeout is not a successful read")
+        with mock.patch.object(PR, "gh_list_reviews", return_value=result):
+            self.assertIsNone(PR.review_already_posted("o/r", "1", "deadbeef", "body"))
+
+    def test_every_head_variant_still_opens_with_the_marker(self):
+        """The cheap prefix reject ahead of the identity check assumes it.
+
+        `--notice` and `--ledger-note` APPEND to the header rather than prepend, and
+        the trigger attribution follows the title — so every body this script posts
+        opens with CONSOLIDATED_MARKER. If one ever stopped doing so, the prefix reject
+        would skip the run's OWN review and answer "absent" for a review that landed,
+        which is the bug this whole path exists to fix. Pinned rather than assumed.
+        """
+        driver = EndToEndPostTest()
+        posted = driver.run_main(
+            self.ANCHORED,
+            existing_reviews=[],
+            extra_argv=[
+                "--triggered-by", "someone",
+                "--notice", "The judge failed; these are raw panel findings.",
+                "--ledger-note", "Round 2 — ledger: 3 prior findings.",
+            ],
+        )
+        self.assertTrue(posted[0]["body"].startswith(PR.CONSOLIDATED_MARKER))
+        # …and end to end: that same decorated body is recognized as this run's.
+        self.assertIs(
+            self.confirm(
+                json.dumps([[self.landed_review(body=posted[0]["body"])]]),
+                posted_body=posted[0]["body"],
+            ),
+            True,
+        )
+
+    def confirm(self, raw_stdout, posted_body="body"):
+        """`review_already_posted` over a literal `gh` stdout, so the answer is the
+        payload's doing and nothing else's."""
+        result = subprocess.CompletedProcess(
+            args=["gh"], returncode=0, stdout=raw_stdout, stderr=""
+        )
+        with mock.patch.object(PR, "gh_list_reviews", return_value=result):
+            return PR.review_already_posted("o/r", "1", "deadbeef", posted_body)
 
     def test_gh_http_status_parses_gh_stderr(self):
         def status(text):

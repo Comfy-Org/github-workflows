@@ -298,6 +298,28 @@ def gh_http_status(result: subprocess.CompletedProcess):
     return int(match.group(1)) if match else None
 
 
+# 4xx statuses that are NOT evidence the request was rejected before it was written.
+# The no-read short-circuit rests on a 4xx meaning "GitHub validated this and refused
+# it", which holds for the rejections it was built for (422 over an inline position,
+# and the 4xx family of malformed/unauthorized/absent) but NOT for these: a timeout,
+# a rate limit or an early-hint refusal can come from an edge or a proxy in front of
+# GitHub, about a request the API went on to serve. Treating one of those as "absent
+# by construction" would repost the fallback and tag every anchored finding
+# `lost_to_fallback` on an assumption that does not apply, so they take the read like
+# a 5xx does.
+RETRYABLE_4XX_STATUSES = frozenset({408, 425, 429})
+
+
+# This read sits on the RECOVERY path: the fallback POST and write_step_summary both
+# come after it, so a call that hangs takes the round out of BOTH channels — the job's
+# `timeout-minutes: 10` kills the process before either runs, where the pre-BE-12528
+# code posted the fallback immediately. Bounded well under that budget so a slow or
+# wedged read degrades to the UNKNOWN branch (fallback posted, nothing tagged) instead
+# of costing the round entirely. Generous enough that ordinary pagination over a busy
+# PR finishes inside it.
+GH_LIST_REVIEWS_TIMEOUT_SECONDS = 60
+
+
 def gh_list_reviews(repo: str, pr_number: str) -> subprocess.CompletedProcess:
     """Every review on the PR, oldest first, ALL pages.
 
@@ -306,22 +328,60 @@ def gh_list_reviews(repo: str, pr_number: str) -> subprocess.CompletedProcess:
     dup-check (`cursor-review.yml`, the `already_reviewed` step) is the same
     discriminator without pagination — it can afford that, because it only has to
     notice a review that already exists before spending the panel, while a wrong
-    answer here decides whether findings are labelled lost.
+    answer here decides whether findings are labelled lost. Pagination means this is
+    one *command* but not necessarily one HTTP request.
 
     `--slurp` wraps each page in an outer array (gh >= 2.43; the runner uses a current
     gh), so the caller flattens one level.
+
+    A timeout is reported as a nonzero CompletedProcess rather than raised, so the
+    caller reads it through the same "could not tell" branch as any other failed read.
     """
-    return subprocess.run(
-        [
-            "gh",
-            "api",
-            "--paginate",
-            "--slurp",
-            f"/repos/{repo}/pulls/{pr_number}/reviews",
-        ],
-        text=True,
-        capture_output=True,
-    )
+    argv = [
+        "gh",
+        "api",
+        "--paginate",
+        "--slurp",
+        f"/repos/{repo}/pulls/{pr_number}/reviews",
+    ]
+    try:
+        return subprocess.run(
+            argv,
+            text=True,
+            capture_output=True,
+            timeout=GH_LIST_REVIEWS_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=124,
+            stdout="",
+            stderr=(
+                f"gh api timed out after {GH_LIST_REVIEWS_TIMEOUT_SECONDS}s listing "
+                f"reviews for {repo}#{pr_number}"
+            ),
+        )
+
+
+# The states GitHub uses for a review that has actually been SUBMITTED. Matched as an
+# allowlist rather than by excluding DISMISSED, because `GET /pulls/{n}/reviews`
+# also returns the authenticated identity's own PENDING (unsubmitted) reviews — and
+# that identity is the very bot whose POST just errored, so a half-committed write is
+# exactly what could appear here as PENDING. A pending review is invisible to everyone
+# else and publishes no resolvable thread, so reading one as "landed" would suppress
+# the fallback and report `delivered=true` over findings no thread query can find.
+SUBMITTED_REVIEW_STATES = frozenset({"COMMENTED", "APPROVED", "CHANGES_REQUESTED"})
+
+
+def _normalize_review_body(text) -> str:
+    """`text` with the differences GitHub is known to introduce when it stores a body.
+
+    Line endings (it rewrites CRLF) and trailing whitespace only. Deliberately NOT a
+    loose normalization: the comparison this feeds is the identity check, so anything
+    that makes two DIFFERENT review bodies compare equal defeats it.
+    """
+    lines = (text or "").replace("\r\n", "\n").split("\n")
+    return "\n".join(line.rstrip() for line in lines).strip()
 
 
 def review_already_posted(
@@ -335,32 +395,70 @@ def review_already_posted(
     or came back unparseable). A read that failed is not a zero — see BE-4785 — so the
     caller degrades rather than claiming the review is missing.
 
-    The same four-part discriminator the gate and the workflow use: not DISMISSED, a
-    Bot author (the poster is caller-configurable, so the TYPE is the only thing this
-    can know), the run's own head SHA, and the panel marker. Matched on the marker
-    rather than only on byte-equality with `posted_body` because GitHub may normalize
-    what it stored (line endings, trailing whitespace); byte-equality is still tried
-    first since it is the strongest evidence available.
+    The gate's and the workflow's three-part filter first — a SUBMITTED state, a Bot
+    author (the poster is caller-configurable, so the TYPE is the only thing this can
+    know), and the run's own head SHA — and then, unlike them, an identity check on
+    the BODY: it must be `posted_body`, up to the normalization GitHub applies when it
+    stores one.
+
+    That last part is what this cannot borrow from the gate. `CONSOLIDATED_MARKER` is
+    a fine discriminator for the question THEY ask ("does a panel review already exist
+    at this SHA, so should we spend the panel at all?"), but it is the wrong one here.
+    A previous round's body-only fallback, and any `post_error_review` body, both open
+    with the marker, are Bot-authored and carry this same `commit_id` — so accepting a
+    prefix match would answer "yes, your review landed" on the strength of some OTHER
+    review entirely. That answer is not a harmless duplicate: the caller returns
+    without posting the fallback and reports `delivered=true` with
+    `gated_findings=len(comments)`, so THIS round's findings reach neither the PR nor
+    the job summary while the blocking gate goes green over threads that belong to a
+    different round. The pre-change behaviour in that same scenario was a duplicate
+    review — noisy, but with the findings still visible — so a loose match here would
+    trade a duplicate for a silent loss. It is reachable, too: the workflow's
+    `already_reviewed` dup-check fails OPEN on an API error, and two runs can both pass
+    it before either posts.
+
+    Requiring the body means the residual is now the strictly narrower "a previous
+    round posted a byte-identical body at the same head SHA", which is the same
+    findings, in the same order, with the same anchors — a review whose threads do
+    carry this round's findings.
     """
     result = gh_list_reviews(repo, pr_number)
     if result.returncode != 0:
         return None
+    # An exit-0 read with nothing in it INSPECTED nothing; defaulting it to `[]` would
+    # launder that into "this PR has no reviews" and tag every finding lost on the
+    # strength of it. Same rule as the unparseable and wrong-shape cases below
+    # (BE-4785): only a list this actually read can answer False.
+    raw = (result.stdout or "").strip()
+    if not raw:
+        return None
     try:
-        pages = json.loads(result.stdout or "[]")
+        pages = json.loads(raw)
     except ValueError:
         return None
-    if not isinstance(pages, list):
+    # `--slurp` promises a list OF PAGES, each itself a list. Anything else — a flat
+    # array of reviews, a single object, a bare scalar — is a payload shape this does
+    # not know how to read, so it is UNKNOWN rather than empty. Silently dropping the
+    # pages that fail the check would turn an unrecognized shape into "no reviews".
+    if not isinstance(pages, list) or not all(isinstance(page, list) for page in pages):
         return None
-    reviews = [r for page in pages for r in (page if isinstance(page, list) else [])]
+    reviews = [r for page in pages for r in page]
     for review in reviews:
-        if not isinstance(review, dict) or review.get("state") == "DISMISSED":
+        if not isinstance(review, dict):
+            continue
+        if review.get("state") not in SUBMITTED_REVIEW_STATES:
             continue
         if ((review.get("user") or {}).get("type") or "") != "Bot":
             continue
         if review.get("commit_id") != commit_sha:
             continue
+        # Cheap prefix reject before the normalization work; the equality below is
+        # what actually decides. Every body this script posts opens with the marker,
+        # so this can only skip reviews the identity check would reject anyway.
         body = review.get("body") or ""
-        if body == posted_body or body.startswith(CONSOLIDATED_MARKER):
+        if not body.startswith(CONSOLIDATED_MARKER):
+            continue
+        if _normalize_review_body(body) == _normalize_review_body(posted_body):
             return True
     return False
 
@@ -1650,8 +1748,11 @@ def main():
     # Cheapest sufficient evidence first. A 4xx is GitHub VALIDATING and rejecting the
     # request before writing anything (every firing observed in the field is a 422 over
     # an inline position), so the review is absent by construction and no read is worth
-    # the call. Anything else — a 5xx, or a transport error that carries no status at
-    # all — leaves the write genuinely undecided, so ask the PR. Three outcomes follow:
+    # the call — with the exception carved out by RETRYABLE_4XX_STATUSES, which are 4xx
+    # only in the sense that an edge or a proxy said so and may well have said it about
+    # a request GitHub went on to serve. Anything else — a 5xx, or a transport error
+    # that carries no status at all — leaves the write genuinely undecided, so ask the
+    # PR. Three outcomes follow:
     # PRESENT (the review landed: report it delivered, post nothing more), ABSENT
     # (behave exactly as this path always has), and UNKNOWN (post the fallback, but tag
     # nothing `lost_to_fallback` — the flag is a claim, and an unreadable list supports
@@ -1659,7 +1760,12 @@ def main():
     # be indistinguishable from a confirmed-absent review and would relabel findings on
     # the strength of a transient blip.
     status = gh_http_status(result)
-    if status is not None and 400 <= status < 500:
+    pre_write_rejection = (
+        status is not None
+        and 400 <= status < 500
+        and status not in RETRYABLE_4XX_STATUSES
+    )
+    if pre_write_rejection:
         landed = False
     else:
         landed = review_already_posted(
