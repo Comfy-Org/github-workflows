@@ -359,12 +359,28 @@ class PostedSignalTest(MainDriverMixin, unittest.TestCase):
         self.assertEqual(self.exit_code, 1)
         self.assertNotEqual(delivery.get("posted"), "true")
 
-    def test_a_review_that_could_not_even_be_attempted_exits_one(self):
-        # The no-inline-comments branch: the fallback would repost the same body,
-        # so it is skipped entirely and the step goes red with nothing on the PR.
+    def test_a_failed_no_findings_review_exits_one(self):
+        # Zero findings takes the NO-FINDINGS branch (a clean "✅ No high-signal
+        # findings." review), which returns long before the anchor split — so this
+        # pins that branch's own POST failure, not the no-inline-comments one below.
         _, delivery = self.run_main(
             [], post_returncode=1, stderr="gh: Server Error (HTTP 500)"
         )
+        self.assertEqual(self.exit_code, 1)
+        self.assertEqual(delivery["posted"], "false")
+
+    def test_the_no_inline_comments_branch_never_claims_posted(self):
+        # The branch the case above was mislabelled as. Reaching it needs findings
+        # that all MISS the diff (line 900 is outside DIFF's hunk), so the anchor
+        # split leaves `comments` empty: the fallback would repost the same body and
+        # is skipped, the step goes red, and nothing reached the PR.
+        posted, delivery = self.run_main(
+            [finding("app.py", 900)],
+            post_returncode=1,
+            stderr="gh: Server Error (HTTP 500)",
+        )
+        self.assertEqual(len(posted), 1, "no inline half to drop — no fallback retry")
+        self.assertEqual(posted[0].get("comments", []), [], "the anchor missed the diff")
         self.assertEqual(self.exit_code, 1)
         self.assertEqual(delivery["posted"], "false")
 
@@ -497,30 +513,77 @@ class NotifyCompleteGateTest(unittest.TestCase):
     def test_the_post_job_surfaces_posted_as_an_output(self):
         self.assertIn("posted: ${{ steps.post.outputs.posted }}", self.text)
 
-    def test_the_dm_reads_the_post_jobs_posted_output(self):
+    def test_the_dm_reads_both_of_the_post_jobs_delivery_outputs(self):
         self.assertIn("REVIEW_POSTED: ${{ needs.post-review.outputs.posted }}", self.text)
-
-    def test_the_success_dm_requires_both_the_job_result_and_the_signal(self):
-        # The regression this file exists to stop coming back: a success branch
-        # keyed on the job result ALONE goes green over the read-only 403.
-        success_guard = (
-            'if [ "$POST_REVIEW_RESULT" = "success" ] && [ "$REVIEW_POSTED" = "true" ]; then'
+        self.assertIn(
+            "REVIEW_DELIVERED: ${{ needs.post-review.outputs.delivered }}", self.text
         )
-        self.assertIn(success_guard, self.text)
-        claim = "One consolidated review is on the PR."
-        self.assertEqual(self.text.count(claim), 1, "one success claim, one guard")
-        # The claim must sit AFTER the compound guard and BEFORE the next branch,
-        # i.e. inside it.
-        guard_at = self.text.index(success_guard)
-        claim_at = self.text.index(claim)
-        next_branch = self.text.index('elif [ "$POST_REVIEW_RESULT" = "success" ]; then')
-        self.assertLess(guard_at, claim_at)
-        self.assertLess(claim_at, next_branch)
 
-    def test_the_degraded_branch_names_the_cause_and_warns(self):
-        self.assertIn('TITLE="Cursor review degraded"', self.text)
-        self.assertIn("could not be posted on the PR", self.text)
-        self.assertIn("pull-requests: write", self.text)
+    #: The three green-job branches, in source order. Each entry is
+    #: (opening guard, the phrase that must sit inside that branch).
+    SUCCESS_GUARD = (
+        'if [ "$POST_REVIEW_RESULT" = "success" ]'
+        ' && [ "$REVIEW_POSTED" = "true" ]'
+        ' && [ "$REVIEW_DELIVERED" = "true" ]; then'
+    )
+    POSTED_ONLY_GUARD = (
+        'elif [ "$POST_REVIEW_RESULT" = "success" ]'
+        ' && [ "$REVIEW_POSTED" = "true" ]; then'
+    )
+    NOT_POSTED_GUARD = 'elif [ "$POST_REVIEW_RESULT" = "success" ]; then'
+
+    def assert_inside_branch(self, guard, phrase):
+        """Pin `phrase` to the branch `guard` opens, not merely to the file.
+
+        A bare assertIn cannot fail independently of the branch it means to
+        describe once the same words appear elsewhere in the workflow — the
+        failure mode that let an earlier version of this test pass on a message
+        with its cause deleted.
+        """
+        self.assertIn(guard, self.text, "the branch itself is gone")
+        self.assertEqual(self.text.count(phrase), 1, f"{phrase!r} must be unique")
+        guard_at = self.text.index(guard)
+        phrase_at = self.text.index(phrase)
+        self.assertLess(guard_at, phrase_at, f"{phrase!r} precedes its guard")
+        # ... and before whatever branch comes next, so it is inside this one.
+        next_at = self.text.find("\n          elif ", guard_at + len(guard))
+        self.assertNotEqual(next_at, -1, "no following branch — the chain changed")
+        self.assertLess(phrase_at, next_at, f"{phrase!r} fell out of its branch")
+
+    def test_the_success_dm_requires_the_job_result_and_both_signals(self):
+        # The regression this file exists to stop coming back: a success branch
+        # keyed on the job result ALONE goes green over the read-only 403 — and one
+        # keyed on `posted` alone still calls a crashed judge's error review
+        # "complete", the round the blocking gate refuses to pass.
+        self.assert_inside_branch(
+            self.SUCCESS_GUARD, "One consolidated review is on the PR."
+        )
+
+    def test_the_posted_but_not_adjudicated_branch_warns_without_claiming_complete(self):
+        self.assert_inside_branch(
+            self.POSTED_ONLY_GUARD, 'TITLE="Cursor review incomplete"'
+        )
+        self.assert_inside_branch(
+            self.POSTED_ONLY_GUARD, "but it adjudicated nothing"
+        )
+
+    def test_the_degraded_branch_states_the_observation_and_warns(self):
+        self.assert_inside_branch(
+            self.NOT_POSTED_GUARD, 'TITLE="Cursor review degraded"'
+        )
+        # The observation is the part that is always true; the cause is hedged,
+        # because this branch is reached by any green run that did not post.
+        self.assert_inside_branch(
+            self.NOT_POSTED_GUARD, "No review was posted on the PR"
+        )
+        self.assert_inside_branch(
+            self.NOT_POSTED_GUARD, "Most often the run's token lacks pull-requests: write"
+        )
+
+    def test_no_green_branch_asserts_a_single_cause_as_fact(self):
+        # The DETAIL must not tell an author to fix a `permissions:` block that may
+        # already be correct — every other 403 and a stale pin land in that branch.
+        self.assertNotIn("the workflow token lacks pull-requests: write", self.text)
 
 
 if __name__ == "__main__":

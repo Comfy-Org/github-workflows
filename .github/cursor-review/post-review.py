@@ -138,8 +138,19 @@ def emit_delivery(
     _DELIVERY_EMITTED = True
     # `delivered` without `posted` would be incoherent — an adjudicated review that
     # never reached the PR — and would green the gate while the DM reported a
-    # degradation. No call site should produce it; assert the invariant rather than
-    # trusting every future one to remember.
+    # degradation. No call site produces it today (both `delivered=True` sites post
+    # first and pass `posted=True`); this NORMALIZES rather than asserts, so a future
+    # one that forgets the kwarg cannot emit the incoherent pair. Not a raise on
+    # purpose: this runs immediately AFTER a review was successfully posted, so
+    # raising would turn a kwarg slip into a red check and a "did not succeed" DM on
+    # a PR that has its review — strictly worse than the coherent output.
+    #
+    # The opposite direction — a body that DID post whose site forgets `posted=True`
+    # — is not repairable here (nothing in this function can see the POST), so it
+    # stays each call site's job and the parameter defaults to the fail-closed
+    # `False`. Its blast radius is a spurious "degraded" DM, never a false success.
+    # The stderr line below prints both keys so a run log shows which pair was
+    # emitted without re-reading $GITHUB_OUTPUT.
     posted = posted or delivered
     print(
         f"delivery: delivered={'true' if delivered else 'false'} "

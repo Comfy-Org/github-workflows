@@ -2787,6 +2787,13 @@ jobs:
           # there. Unset reads as not-'true', which is the fail-closed direction:
           # the worst case is a degraded DM on a review that did post.
           REVIEW_POSTED: ${{ needs.post-review.outputs.posted }}
+          # `posted` and `delivered` disagree in BOTH directions, so the DM needs
+          # both: the "Review failed" error review and the all-cells-failed review
+          # DO reach the PR (posted) while adjudicating nothing (not delivered).
+          # Claiming "review complete" over those is the same class of lie this
+          # ticket fixes, one branch further in — the blocking gate refuses that
+          # exact round. Unset reads as not-'true', i.e. fail-closed here too.
+          REVIEW_DELIVERED: ${{ needs.post-review.outputs.delivered }}
         run: |
           chmod +x "$CURSOR_REVIEW_ASSETS/slack-notify.sh"
           # Keyed on the POST job, not on consolidate: since the credential
@@ -2794,17 +2801,31 @@ jobs:
           # consolidate alone no longer justifies "one consolidated review is on
           # the PR". The two failures are distinguished so the DM says which
           # half broke.
-          if [ "$POST_REVIEW_RESULT" = "success" ] && [ "$REVIEW_POSTED" = "true" ]; then
+          if [ "$POST_REVIEW_RESULT" = "success" ] && [ "$REVIEW_POSTED" = "true" ] && [ "$REVIEW_DELIVERED" = "true" ]; then
             STATUS="success"
             TITLE="Cursor review complete"
             DETAIL="One consolidated review is on the PR."
+          elif [ "$POST_REVIEW_RESULT" = "success" ] && [ "$REVIEW_POSTED" = "true" ]; then
+            # A body reached the PR but adjudicated nothing: the "Review failed"
+            # error review, or the review a round posts when every panel cell
+            # errored. Pointing at the PR is right — there IS something to read
+            # there — but calling it complete is not.
+            STATUS="warning"
+            TITLE="Cursor review incomplete"
+            DETAIL="A review was posted on the PR, but it adjudicated nothing — the judge failed, or every reviewer in the panel errored. See the run for the underlying cause."
           elif [ "$POST_REVIEW_RESULT" = "success" ]; then
-            # Green job, nothing on the PR: the read-only-token degradation. Say
-            # where the review actually went and name the cause, because the fix
-            # is in the CALLER's permissions block, not in this run.
+            # Green job, nothing on the PR. The designed-for case is the
+            # read-only-token degradation, but this branch is reached by every
+            # green run that did not post, so state the OBSERVATION as fact and
+            # the cause as likelihood: is_read_only_token_error treats any HTTP
+            # 403 as read-only, so an SSO/IP-allowlist, secondary-rate-limit or
+            # archived-repo rejection lands here too, as does an App
+            # installation without pull-request write (where the caller's
+            # permissions block is not the knob) and a workflows_ref resolving
+            # to a post-review.py too old to emit `posted` at all.
             STATUS="warning"
             TITLE="Cursor review degraded"
-            DETAIL="The review was rendered to the run's job summary but could not be posted on the PR — the workflow token lacks pull-requests: write (check the caller's permissions block)."
+            DETAIL="No review was posted on the PR — the full text is in the run's job summary. Most often the run's token lacks pull-requests: write (check the caller's permissions block); another 403 (SSO/IP allowlist, rate limit, archived repo) or a stale workflows_ref pin reaches this too."
           elif [ "$CONSOLIDATE_RESULT" != "success" ]; then
             STATUS="warning"
             TITLE="Cursor review failed to post"
