@@ -204,8 +204,11 @@ class LoadAnchorsFailsOpenTest(unittest.TestCase):
 class EndToEndPostTest(unittest.TestCase):
     """Drive main() with a stubbed `gh` and read the payload it would have sent."""
 
-    def run_main(self, findings, with_diff=True, post_returncode=0, stderr="", summaries=None):
-        """Return the POSTed payloads. Pass `summaries` (a list) to collect step-summary writes."""
+    def run_main(self, findings, with_diff=True, post_returncode=0, stderr="", summaries=None,
+                 panel=None):
+        """Return the POSTed payloads. Pass `summaries` (a list) to collect step-summary
+        writes, or `panel` to control the panel summary — the one finding-INDEPENDENT
+        part of the review head that a caller can make large."""
         posted = []
 
         def fake_post(repo, pr_number, payload):
@@ -221,7 +224,12 @@ class EndToEndPostTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             fpath = os.path.join(d, "consolidated.json")
             with open(fpath, "w", encoding="utf-8") as f:
-                json.dump({"findings": findings, "panel": [{"model": "m", "review_type": "adversarial", "status": "ok"}]}, f)
+                json.dump({
+                    "findings": findings,
+                    "panel": panel or [
+                        {"model": "m", "review_type": "adversarial", "status": "ok"}
+                    ],
+                }, f)
             argv = [
                 "post-review.py",
                 "--findings", fpath,
@@ -704,43 +712,6 @@ class BodyBudgetTest(unittest.TestCase):
         self.assertEqual(ledger["unanchorable_count"], 2)
 
 
-class FitSentinelItemsTest(unittest.TestCase):
-    """The budget search behind the prose floor."""
-
-    def items(self, n):
-        return PR.normalize_comments(
-            [finding(f"f{i}.py", i + 1, body=f"body {i}") for i in range(n)]
-        )
-
-    def test_everything_fits_under_a_generous_budget(self):
-        items = self.items(5)
-        self.assertEqual(PR.fit_sentinel_items(items, 100000), items)
-
-    def test_it_returns_the_longest_prefix_that_fits(self):
-        items = self.items(20)
-        for budget in range(0, 3000, 97):
-            with self.subTest(budget=budget):
-                kept = PR.fit_sentinel_items(items, budget)
-                self.assertEqual(kept, items[: len(kept)], "a prefix, in order")
-                if kept:
-                    self.assertLessEqual(
-                        len(PR.render_body_only_sentinel(kept)), budget, "and it fits"
-                    )
-                if len(kept) < len(items):
-                    self.assertGreater(
-                        len(PR.render_body_only_sentinel(items[: len(kept) + 1])),
-                        budget,
-                        "one more would not — so it really is the LONGEST prefix",
-                    )
-
-    def test_a_budget_nothing_fits_drops_the_sentinel_entirely(self):
-        self.assertEqual(PR.fit_sentinel_items(self.items(3), 0), [])
-        self.assertEqual(PR.fit_sentinel_items(self.items(3), -100), [])
-        self.assertEqual(PR.fit_sentinel_items(self.items(3), 10), [])
-
-    def test_no_items_is_no_sentinel(self):
-        self.assertEqual(PR.fit_sentinel_items([], 100000), [])
-
     def test_the_sentinel_is_never_posted_where_the_clamp_would_cut_it(self):
         """The size guard reserves the clamp's own note, not just the limit.
 
@@ -857,6 +828,100 @@ class FitSentinelItemsTest(unittest.TestCase):
         body = visible(posted[1]["body"])
         self.assertEqual(body.count("anchored one"), 1)
         self.assertEqual(body.count("demoted one"), 1)
+
+
+class FitSentinelItemsTest(unittest.TestCase):
+    """The budget search behind the prose floor."""
+
+    def items(self, n):
+        return PR.normalize_comments(
+            [finding(f"f{i}.py", i + 1, body=f"body {i}") for i in range(n)]
+        )
+
+    def test_everything_fits_under_a_generous_budget(self):
+        items = self.items(5)
+        self.assertEqual(PR.fit_sentinel_items(items, 100000), items)
+
+    def test_it_returns_the_longest_prefix_that_fits(self):
+        items = self.items(20)
+        for budget in range(0, 3000, 97):
+            with self.subTest(budget=budget):
+                kept = PR.fit_sentinel_items(items, budget)
+                self.assertEqual(kept, items[: len(kept)], "a prefix, in order")
+                if kept:
+                    self.assertLessEqual(
+                        len(PR.render_body_only_sentinel(kept)), budget, "and it fits"
+                    )
+                if len(kept) < len(items):
+                    self.assertGreater(
+                        len(PR.render_body_only_sentinel(items[: len(kept) + 1])),
+                        budget,
+                        "one more would not — so it really is the LONGEST prefix",
+                    )
+
+    def test_a_budget_nothing_fits_drops_the_sentinel_entirely(self):
+        self.assertEqual(PR.fit_sentinel_items(self.items(3), 0), [])
+        self.assertEqual(PR.fit_sentinel_items(self.items(3), -100), [])
+        self.assertEqual(PR.fit_sentinel_items(self.items(3), 10), [])
+
+    def test_no_items_is_no_sentinel(self):
+        self.assertEqual(PR.fit_sentinel_items([], 100000), [])
+
+    def test_the_budget_reserves_the_clamp_note_when_the_head_dominates(self):
+        """The other half of the size guard, and the half the prose floor hides.
+
+        `sentinel_budget` is `min(FALLBACK_SENTINEL_MAX_CHARS, limit - note - head - …)`.
+        On an ordinary round the first term wins and the reserve never binds, so it is
+        pinned here on the input where the SECOND term wins: a panel summary — the one
+        finding-independent part of the head a caller controls — large enough to make
+        the head most of the body.
+
+        Dropping the reserve opens a window `len(CLAMP_TRUNCATION_NOTE)` wide in which
+        the sentinel fits the raw limit but not the clamp's cut point: it is posted,
+        cut mid-JSON, and `drop_unterminated_comment` then rewinds to its opener and
+        takes every finding below it. The loss is the PROSE, not the sentinel — both
+        settings end with no readable sentinel in that window, but only the unreserved
+        one also throws the findings away. So that is what this asserts.
+        """
+        body300 = "z" * 300
+        sentinel_len = len(
+            PR.render_body_only_sentinel(PR.normalize_comments([finding("app.py", 11, body=body300)]))
+        )
+        # Head lengths at which the sentinel fits `limit` but not `limit - note`.
+        # `9` is the "\n\n" under the head plus FINDINGS_SEPARATOR above finding one.
+        hi = PR.MAX_REVIEW_BODY_CHARS - 9 - sentinel_len
+        lo = hi - len(PR.CLAMP_TRUNCATION_NOTE)
+        # `panel` is padded to hit those head lengths; the offset between the two is a
+        # property of the fixture, so it is measured rather than assumed.
+        probe = EndToEndPostTest().run_main(
+            [finding("app.py", 11, body=body300)], post_returncode=1, stderr="422",
+            panel=[{"model": "m" * 1000, "review_type": "adversarial", "status": "error"}],
+        )[1]["body"]
+        offset = len(probe.split(f"<!-- {PR.BODY_ONLY_SENTINEL_PREFIX}")[0].rstrip("\n")) - 1000
+
+        # Swept across the window rather than pinned to its midpoint, so the test keeps
+        # straddling it if the note or the sentinel's shape changes size.
+        for head_len in range(lo - 40, hi + 41, 35):
+            with self.subTest(head_len=head_len):
+                body = EndToEndPostTest().run_main(
+                    [finding("app.py", 11, body=body300)],
+                    post_returncode=1,
+                    stderr="gh: Unprocessable Entity (HTTP 422)",
+                    panel=[{
+                        "model": "m" * (head_len - offset),
+                        "review_type": "adversarial",
+                        "status": "error",
+                    }],
+                )[1]["body"]
+                self.assertLessEqual(len(body), PR.MAX_REVIEW_BODY_CHARS)
+                self.assertIn(PROSE_MARKER, body, "the disclosure is never optional")
+                self.assertIn(
+                    body300, body,
+                    "the finding is never traded away for a sentinel the clamp then cuts",
+                )
+                # And a sentinel that IS posted is always whole and readable.
+                if f"<!-- {PR.BODY_ONLY_SENTINEL_PREFIX} " in body:
+                    self.assertEqual(ledger_from_posted_body(body)["entry_count"], 1)
 
 
 class DanglingCommentClampTest(unittest.TestCase):
