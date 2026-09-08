@@ -34,6 +34,12 @@ The reusable workflow (`.github/workflows/public-repo-hygiene.yml`) loads this
 file from a pinned ref of THIS repo, never from the caller's checkout, so a PR
 in the caller repo cannot reach the checker or the allowlist below.
 
+Category 1 clears a well-known PUBLIC identifier namespace by PATTERN, not by
+list: `CVE-2021-44228` and every future `CVE-YYYY-NNNNN` clear because `CVE` is
+in `TICKET_ALLOWED_PREFIXES`, so no adopter has to re-file the carve-out each
+January. Only acronyms with no public namespace behind them (`SHA-256`,
+`WIN-64`) are enumerated in `TICKET_ALLOWLIST`.
+
 Per-repo tuning is a workflow INPUT, never a fork, and every knob is ADDITIVE:
 `--ticket-allow` adds acronyms to the built-in ticket allowlist and
 `--exclude` drops paths from the scan. Neither can remove a built-in entry, and
@@ -76,37 +82,56 @@ import unicodedata
 # never have to encode (and thus disclose) an internal naming scheme here.
 # Common tech acronyms that fit the shape are carved out below -- extend the
 # allowlist, not the regex, when a legitimate term trips it.
-TICKET_RE = re.compile(r"\b[A-Z]{2,6}-\d{2,6}\b")
+#
+# The boundaries are explicit lookarounds rather than `\b`, because `_` is a
+# word character: `\b` refuses to fire next to one, so `BE-1234_design`,
+# `feature/BE-1234_fix` and `FOO_BE-1234` -- ordinary branch, directory and
+# fixture names -- were all silently unmatched. Three things about the excluded
+# class are load-bearing, and each of them is a way this "tidy-up" gets undone:
+#   * `_` is deliberately ABSENT from it. Adding it back (`[A-Za-z0-9_]`) makes
+#     the assertion fail next to an underscore again, which is exactly `\b` --
+#     the shape that fixes nothing.
+#   * `-` is deliberately ABSENT too. Adding it would stop `AES-128` matching
+#     inside `AES-128-CBC` and inside `CVE-2021-44228`, and the whole
+#     TICKET_ALLOWED_PREFIXES carve-out below is built on those matching.
+#   * The class is ASCII-only, so a non-ASCII letter is a boundary. `\b` treats
+#     one as a word character, which made `<any-cyrillic-char>BE-1234` a way to
+#     carry a ticket id past the check.
+TICKET_RE = re.compile(r"(?<![A-Za-z0-9])[A-Z]{2,6}-\d{2,6}(?![A-Za-z0-9])")
+# Only entries that TICKET_RE can actually MATCH belong here: 2-6 letters AND
+# 2-6 digits. `UTF-8`, `OAUTH-2`, `IPV-4`, `IPV-6` and `X-25519` were carried
+# for years and could never fire (too few digits, or too few letters); the
+# tests enforce that every entry is matchable so the dead-entry trap cannot
+# reopen. An acronym whose NAMESPACE is public (`UTF-16`, `RFC-1123`,
+# `ISO-27001`, every `CVE-####`) belongs in TICKET_ALLOWED_PREFIXES below
+# instead -- do not re-list those here.
 TICKET_ALLOWLIST = frozenset(
     {
-        "UTF-8",
         "ISO-8601",
+        "SHA-224",
         "SHA-256",
         "SHA-384",
         "SHA-512",
         "AES-128",
+        "AES-192",
         "AES-256",
         "RFC-2119",
         "RFC-7231",
         "RFC-3339",
-        "OAUTH-2",
-        "IPV-4",
-        "IPV-6",
-        "X-25519",
         "WIN-32",
         "WIN-64",
     }
 )
 # Well-known PUBLIC identifier namespaces, allowlisted by PREFIX rather than as
-# exact tokens. `\b[A-Z]{2,6}-\d{2,6}\b` matches `CVE-2021` inside
-# `CVE-2021-44228` -- the `\b` holds against the following hyphen -- so a
-# SECURITY.md, a dependency changelog or a patch note trips what adopters wire in
-# as a REQUIRED check. Clearing that token-by-token would cost one entry per year
-# prefix and break again each January; `CWE-89`, `PEP-484` and any
-# `RFC-####`/`ISO-####` outside the three hard-coded RFCs above are the same
-# shape -- as is `UTF-16`/`UTF-32`, which the exact list above carried only for
-# `UTF-8`. None of these is a plausible internal team key, so the namespace is
-# the right granularity. (BE-8654 review.)
+# exact tokens. TICKET_RE matches `CVE-2021` inside `CVE-2021-44228` -- the
+# boundary holds against the following hyphen -- so a SECURITY.md, a dependency
+# changelog or a patch note trips what adopters wire in as a REQUIRED check.
+# Clearing that token-by-token would cost one entry per year prefix and break
+# again each January; `CWE-89`, `PEP-484` and any `RFC-####`/`ISO-####` outside
+# the three hard-coded RFCs above are the same shape -- as is `UTF-16`/`UTF-32`,
+# the only ticket-SHAPED members of a namespace the exact list once represented
+# with the unmatchable `UTF-8`. None of these is a plausible internal team key,
+# so the namespace is the right granularity. (BE-8654 review.)
 TICKET_ALLOWED_PREFIXES = frozenset(
     {"CVE", "CWE", "PEP", "RFC", "ISO", "UTF"}
 )
@@ -636,9 +661,9 @@ _LFS_OID_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 # UTF-16-LE BOM, so the shorter marker would swallow it. A UTF-8 BOM is
 # deliberately NOT listed: those bytes already decode as UTF-8 down the ordinary
 # path, which carries a recovery for a read cap landing mid-codepoint that this
-# table has no equivalent of, and a leading U+FEFF hides nothing (it is not a
-# word character, so neither `TICKET_RE`'s `\b` nor the repo pattern's left
-# boundary is affected by it). (BE-8654 review.)
+# table has no equivalent of, and a leading U+FEFF hides nothing (it is neither
+# an ASCII letter nor a digit, so neither `TICKET_RE`'s left lookbehind nor the
+# repo pattern's left boundary is affected by it). (BE-8654 review.)
 _BOM_CODECS = (
     (codecs.BOM_UTF32_LE, "utf-32", 4),
     (codecs.BOM_UTF32_BE, "utf-32", 4),

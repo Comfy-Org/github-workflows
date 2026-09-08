@@ -90,6 +90,33 @@ class TicketIdCategoryTest(CheckerTestCase):
         self.repo.write("docs.md", "Encoded UTF-8, hashed SHA-256, dated ISO-8601.\n")
         self.assertEqual(self.findings(), [])
 
+    def test_every_allowlist_entry_can_actually_match(self):
+        # Anti-vacuity. TICKET_RE needs 2-6 letters AND 2-6 digits, so an
+        # entry like `UTF-8`, `IPV-4` or `X-25519` is a no-op that reads as
+        # coverage -- five of them sat in the list for months. Pinning the
+        # invariant is what stops the dead-entry trap reopening the next time
+        # someone adds an acronym.
+        for entry in sorted(checker.TICKET_ALLOWLIST):
+            with self.subTest(entry=entry):
+                self.assertIsNotNone(
+                    checker.TICKET_RE.fullmatch(entry),
+                    f"{entry!r} can never match TICKET_RE, so allowlisting "
+                    "it does nothing",
+                )
+
+    def test_matchable_near_neighbours_are_cleared(self):
+        # The real-world tokens that FIT the ticket shape and would otherwise
+        # redden an ordinary public repo. Two routes clear them and the test
+        # deliberately does not care which: `AES-192`/`SHA-224` are exact
+        # TICKET_ALLOWLIST entries, while `UTF-16`, `RFC-1123`, `ISO-8859` and
+        # `ISO-27001` clear through their namespace prefix.
+        self.repo.write(
+            "crypto.md",
+            "AES-192 and SHA-224 alongside UTF-16, UTF-32 and RFC-1123;\n"
+            "ISO-8859 charsets, audited to ISO-27001.\n",
+        )
+        self.assertEqual(self.findings(), [])
+
     def test_shape_boundaries(self):
         # One letter and seven letters are both outside [A-Z]{2,6}; one digit
         # and seven digits are both outside \d{2,6}. Keeping these pinned is
@@ -102,9 +129,44 @@ class TicketIdCategoryTest(CheckerTestCase):
         flagged = sorted(f.split(": ")[-1] for f in self.findings())
         self.assertEqual(flagged, ["'ABCDEF-123456'", "'BE-12'"])
 
+    def test_an_underscore_is_not_a_boundary(self):
+        # `_` is a word character, so the original `\b`-anchored pattern
+        # refused to fire next to one and missed the most ordinary shapes a
+        # ticket id is written in: a branch name, a directory, a fixture file.
+        # The excluded class is `[A-Za-z0-9]` precisely so `_` does NOT block
+        # a match -- putting `_` back into it restores `\b` and this test.
+        for text in (
+            "BE-1234_design",
+            "feature/BE-1234_fix",
+            "_BE-1234_",
+            "FOO_BE-1234",
+        ):
+            with self.subTest(text=text):
+                self.repo.write("edge.md", text + "\n")
+                findings = self.findings()
+                self.assertEqual(len(findings), 1, findings)
+                self.assertIn("BE-1234", findings[0])
+
+    def test_a_hyphen_is_still_a_boundary(self):
+        # The counterweight to the test above: `-` stays OUT of the excluded
+        # class, so a compound token still matches its allowlisted head.
+        # Adding `-` there would redden `AES-128-CBC` -- and would break the
+        # whole CVE carve-out, which depends on `CVE-2021-44228` presenting
+        # here as `CVE-2021`.
+        self.repo.write("crypto.md", "Ciphered with AES-128-CBC.\n")
+        self.assertEqual(self.findings(), [])
+
+    def test_a_glued_alphanumeric_is_still_not_a_match(self):
+        # The boundaries loosened for `_` only. A letter or a digit welded to
+        # either end is a different token and stays unmatched, exactly as
+        # under `\b`. (A digit welded to the RIGHT is absent on purpose: it is
+        # simply a longer ticket number, which `\d{2,6}` already admits.)
+        self.repo.write("edge.md", "xBE-1234 BE-1234x 9BE-1234\n")
+        self.assertEqual(self.findings(), [])
+
     def test_public_identifier_namespaces_clear_by_prefix(self):
-        # `\b[A-Z]{2,6}-\d{2,6}\b` matches `CVE-2021` INSIDE `CVE-2021-44228`
-        # (the `\b` holds against the following hyphen), so a SECURITY.md or a
+        # `TICKET_RE` matches `CVE-2021` INSIDE `CVE-2021-44228` (the boundary
+        # holds against the following hyphen), so a SECURITY.md or a
         # dependency changelog reddened what adopters wire in as a REQUIRED
         # check. An exact-token carve-out would cost one entry per year prefix
         # and break again each January, so the namespace is allowlisted instead.
@@ -122,6 +184,24 @@ class TicketIdCategoryTest(CheckerTestCase):
         self.repo.write("README.md", "See CVEX-1234 and ISOP-99 for context.\n")
         findings = self.findings()
         self.assertEqual(len(findings), 2, findings)
+
+    def test_a_cve_never_expires_and_never_shadows_a_real_id(self):
+        # The year in a CVE advances, so the carve-out is a PATTERN (the `CVE`
+        # namespace prefix) rather than an enumerated `CVE-2024` entry that
+        # would rot every January -- `CVE-2199` is as clean as `CVE-2024`.
+        self.repo.write(
+            "SECURITY.md", "Fixed CVE-2024-12345; reserved CVE-2199.\n"
+        )
+        self.assertEqual(self.findings(), [])
+        # ...and the carve-out is scoped to the CVE token itself: a real
+        # ticket id sharing the line is still reported.
+        self.repo.write(
+            "SECURITY.md",
+            "Fixed CVE-2024-12345; tracked internally as BE-1234.\n",
+        )
+        findings = self.findings()
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("BE-1234", findings[0])
 
     def test_extra_ticket_allow_is_additive(self):
         self.repo.write("README.md", "GPU-100 and SHA-256 and BE-1234.\n")
@@ -1773,21 +1853,27 @@ class TrackedPathSurfaceTest(CheckerTestCase):
         self.assertEqual(self.findings(), [])
 
     def test_a_ticket_shaped_path_component_is_a_finding(self):
-        # `TICKET_RE`'s `\b` fires at `/` and at `-`, so a directory component
-        # and a filename prefix both match -- the same token rules the content
-        # scan uses, no path-specific boundary.
+        # `TICKET_RE`'s boundaries hold at `/`, at `-` and at `_`, so a
+        # directory component, a filename prefix and an underscore-joined
+        # filename all match -- the same token rules the content scan uses, no
+        # path-specific boundary.
         self.repo.write("notes/BE-1234/plan.md", "clean\n")
         self.repo.write("BE-5678-notes.md", "clean\n")
+        self.repo.write("notes/BE-9012_design.md", "clean\n")
         findings = sorted(self.findings())
-        self.assertEqual(len(findings), 2, findings)
+        self.assertEqual(len(findings), 3, findings)
+        self.assertIn("BE-9012", findings[2])
         self.assertTrue(all("(tracked path)" in f for f in findings), findings)
         self.assertIn("BE-5678", findings[0])
         self.assertIn("BE-1234", findings[1])
 
     def test_allowlisted_acronyms_in_a_path_are_clean(self):
         # Built-in allowlist and the caller-side `--ticket-allow` both reach
-        # the path surface, because there is only one matcher to reach.
-        self.repo.write("src/UTF-8/decode.py", "clean\n")
+        # the path surface, because there is only one matcher to reach. The
+        # built-in has to be a MATCHABLE entry to prove anything -- the old
+        # `UTF-8` here was shape-proof, so it passed via the regex rather than
+        # via the allowlist it was standing in for.
+        self.repo.write("src/SHA-256/decode.py", "clean\n")
         self.repo.write("src/GPU-100/kernel.py", "clean\n")
         self.assertEqual(
             self.findings(extra_ticket_allow=["GPU-100"]), []
