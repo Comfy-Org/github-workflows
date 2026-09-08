@@ -22,10 +22,19 @@ name: Cursor Review Auto-Label (reusable)
 # IMPORTANT: the label MUST be applied with a GitHub App token, not the default
 # GITHUB_TOKEN. Label events triggered by GITHUB_TOKEN do not create new
 # workflow runs, so a GITHUB_TOKEN-applied label would silently fail to fire the
-# review. The caller therefore sets `vars.APP_ID` (the CLOUD_CODE_BOT app id) and
-# passes `secrets.CLOUD_CODE_BOT_PRIVATE_KEY`.
+# review. So the caller must hand this workflow an App to mint from, in one of
+# two ways:
+#   - DEFAULT (unchanged): pass `secrets.CLOUD_CODE_BOT_PRIVATE_KEY` and leave
+#     `bot_app_id` unset — the token is minted from the caller's `vars.APP_ID`
+#     (the CLOUD_CODE_BOT app id), exactly as before.
+#   - NARROW APP: set the `bot_app_id` input and pass the matching
+#     `BOT_APP_PRIVATE_KEY` secret — useful on a `pull_request` caller that
+#     would rather not expose the write-broad app's key. App IDs aren't secret,
+#     so the id is an input and only the key is a secret.
+# Exactly one of the two pairs must be complete; a half-configured pair (an id
+# with no key, or neither key) fails the run loudly rather than falling back.
 #
-# Example caller (consumer repo):
+# Example caller (consumer repo) — default CLOUD_CODE_BOT mint:
 #
 #   name: CI - Cursor Review Auto-Label
 #   on:
@@ -38,6 +47,13 @@ name: Cursor Review Auto-Label (reusable)
 #       uses: Comfy-Org/github-workflows/.github/workflows/cursor-review-auto-label.yml@<sha>
 #       secrets:
 #         CLOUD_CODE_BOT_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+#
+# Example caller — mint from a narrower App instead:
+#
+#       with:
+#         bot_app_id: ${{ vars.APP_ID_PR }}
+#       secrets:
+#         BOT_APP_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PR_PRIVATE_KEY }}
 
 on:
   workflow_call:
@@ -69,13 +85,31 @@ on:
         type: string
         required: false
         default: '"ubuntu-latest"'
+      bot_app_id:
+        description: >-
+          GitHub App ID to mint the labelling token from. Optional — when
+          empty the workflow keeps its original behaviour and uses the
+          caller's `vars.APP_ID` (the CLOUD_CODE_BOT app). Set it (with the
+          BOT_APP_PRIVATE_KEY secret) so a `pull_request` caller can mint from
+          a narrower App instead of the write-broad one. App IDs aren't
+          secret, so this is an input, not a secret.
+        type: string
+        required: false
+        default: ''
     secrets:
       CLOUD_CODE_BOT_PRIVATE_KEY:
         description: >-
-          Private key for the CLOUD_CODE_BOT GitHub App (app id = vars.APP_ID).
-          Required: the label must be applied by a GitHub App so it triggers the
-          downstream review run (GITHUB_TOKEN-applied labels do not).
-        required: true
+          Private key for the CLOUD_CODE_BOT app (`vars.APP_ID`). Required when
+          `bot_app_id` is NOT set — the label must be applied by a GitHub App so
+          it triggers the downstream review run (GITHUB_TOKEN-applied labels do
+          not). Declared optional so a caller can supply BOT_APP_PRIVATE_KEY
+          instead; the preflight below fails a run that supplies neither.
+        required: false
+      BOT_APP_PRIVATE_KEY:
+        description: >-
+          PEM private key matching the bot_app_id input. Required when
+          bot_app_id is set; ignored otherwise.
+        required: false
 
 permissions:
   contents: read
@@ -87,12 +121,35 @@ jobs:
     permissions:
       contents: read
     steps:
+      # Both keys are optional at the `secrets:` declaration so either pairing
+      # can be used, which means neither is enforced at startup any more. Catch
+      # a half-configured pair here instead — and deliberately WITHOUT an `||`
+      # fallback on the key side of the mint below: silently minting from
+      # CLOUD_CODE_BOT when a caller asked for a narrower App (and happens to
+      # pass both keys) is fail-open, and the whole point of bot_app_id is to
+      # NOT use the write-broad app.
+      - name: Refuse a half-configured App pair
+        env:
+          BOT_APP_ID: ${{ inputs.bot_app_id }}
+          HAS_BOT_KEY: ${{ secrets.BOT_APP_PRIVATE_KEY != '' }}
+          HAS_LEGACY_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY != '' }}
+        run: |
+          if [ -n "$BOT_APP_ID" ] && [ "$HAS_BOT_KEY" != "true" ]; then
+            echo "::error::bot_app_id is set but BOT_APP_PRIVATE_KEY is empty — pass the key paired with that App id." ; exit 1
+          fi
+          if [ -z "$BOT_APP_ID" ] && [ "$HAS_LEGACY_KEY" != "true" ]; then
+            echo "::error::bot_app_id is unset and CLOUD_CODE_BOT_PRIVATE_KEY is empty — nothing to mint with." ; exit 1
+          fi
+
       - name: Generate GitHub App token
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.APP_ID }}
-          private-key: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+          # `vars` resolves in the CALLER's context, so an unset bot_app_id
+          # reads the caller's vars.APP_ID here — byte-for-byte the expression
+          # this step carried before bot_app_id existed.
+          app-id: ${{ inputs.bot_app_id || vars.APP_ID }}
+          private-key: ${{ inputs.bot_app_id != '' && secrets.BOT_APP_PRIVATE_KEY || secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
 
       - name: Apply label when an opted-in person opens / readies / is assigned
         env:

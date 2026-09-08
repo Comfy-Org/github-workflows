@@ -17,9 +17,16 @@ roster is baked into the workflow.
 
 | | |
 |---|---|
-| `vars.APP_ID` | **Required.** The CLOUD_CODE_BOT app id. |
-| `secrets.CLOUD_CODE_BOT_PRIVATE_KEY` | **Required.** |
+| `vars.APP_ID` | **Required unless `bot_app_id` is set.** The CLOUD_CODE_BOT app id. |
+| `secrets.CLOUD_CODE_BOT_PRIVATE_KEY` | **Required unless `bot_app_id` is set.** |
+| `bot_app_id` (input) | Optional. App id to mint the label token from instead of `vars.APP_ID` — for a caller that would rather not hand this workflow the write-broad app's key. |
+| `secrets.BOT_APP_PRIVATE_KEY` | Required **when** `bot_app_id` is set; ignored otherwise. |
 | `vars.CURSOR_REVIEW_OPTED_IN_LOGINS` | The opt-in roster. Empty means nobody gets auto-labeled. |
+
+Exactly one of the two pairs must be complete. A half-configured pair — a
+`bot_app_id` with no `BOT_APP_PRIVATE_KEY`, or neither key — fails the run at a
+preflight step with an explicit `::error::`, rather than silently minting from
+the other app.
 
 ## Caller
 
@@ -49,6 +56,21 @@ jobs:
       CLOUD_CODE_BOT_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
 ```
 
+To mint from a narrower App instead (same caller, swap the last four lines):
+
+```yaml
+    uses: Comfy-Org/github-workflows/.github/workflows/cursor-review-auto-label.yml@<full-commit-sha>
+    with:
+      bot_app_id: ${{ vars.APP_ID_PR }}
+    secrets:
+      BOT_APP_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PR_PRIVATE_KEY }}
+```
+
+That App still needs `pull-requests: write` on the installation — it is what
+applies the label — and it must be a real GitHub App, for the same
+GITHUB_TOKEN reason below. Pass `bot_app_id` **or** the CLOUD_CODE_BOT key, not
+a mix: with `bot_app_id` set, `CLOUD_CODE_BOT_PRIVATE_KEY` is never read.
+
 Then ask a maintainer to add your repo to the `AUTO_LABEL_CALLERS` roster secret on `Comfy-Org/github-workflows`
 — that roster is what keeps your pin current
 (see [Staying current](README.md#staying-current)).
@@ -68,14 +90,16 @@ Only that. The label write goes through the App token, not `GITHUB_TOKEN`.
 | `review_label` | `cursor-review` | Must match `cursor-review.yml`'s `review_label`. |
 | `skip_label` | `skip-cursor-review` | Present on a PR ⇒ never auto-label it. |
 | `runs_on` | `'"ubuntu-latest"'` | JSON. Set for self-hosted runners. |
+| `bot_app_id` | `''` (empty) | App id to mint the label token from. Empty ⇒ `vars.APP_ID`. Pair it with `secrets.BOT_APP_PRIVATE_KEY`. |
 
 ## Why the App token is mandatory
 
 A label applied with the default `GITHUB_TOKEN` **does not trigger workflow
 runs** — GitHub suppresses events raised by that token to prevent recursion. The
 label would appear on the PR and no review would start, with nothing in any log
-to explain it. Hence `vars.APP_ID` and the App private key are required rather
-than optional here.
+to explain it. Hence an App mint is required rather than optional here — what is
+optional is only *which* App: `vars.APP_ID` + `CLOUD_CODE_BOT_PRIVATE_KEY` by
+default, or `bot_app_id` + `BOT_APP_PRIVATE_KEY`.
 
 ## Gotchas
 
