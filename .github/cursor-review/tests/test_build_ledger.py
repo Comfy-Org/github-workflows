@@ -1450,8 +1450,33 @@ class TestLostToFallbackEntries(unittest.TestCase):
             self.assertFalse(entry["anchored"])
             self.assertEqual(entry["discussion_url"], "")
             self.assertEqual(entry["thread"]["answered_count"], 0)
-        self.assertEqual(ledger["unanchorable_count"], 2)
+        # Counted apart, never merged: the block header reports each in its own
+        # clause, so it can never say "unanchorable, so never answerable at all" of
+        # the finding whose entry line below reports that it matched the diff.
+        self.assertEqual(ledger["unanchorable_count"], 1)
+        self.assertEqual(ledger["post_failed_count"], 1)
         self.assertEqual(ledger["unanswered_count"], 0, "nobody could have answered either")
+
+    def test_the_two_thread_less_totals_are_reported_separately(self):
+        ledger = self._ledger(
+            [demoted("app.py", 11), demoted("far.py", 900)], lost_lines=(11,)
+        )
+        header = bl.render_ledger_markdown(ledger, "judge").split("--- ROUND 1", 1)[0]
+        self.assertIn("1 unanchorable, so never answerable at all", header)
+        self.assertIn("1 lost to a failed review POST, so never answerable either", header)
+        self.assertNotIn("2 unanchorable", header)
+        note = bl.ledger_note(ledger)
+        self.assertIn("1 unanchorable", note)
+        self.assertIn("1 lost to a failed review POST", note)
+
+    def test_a_round_with_no_post_failed_entry_reads_exactly_as_before(self):
+        """The new clause is added, never substituted: an ordinary demoted round's
+        header and note keep the wording they had."""
+        ledger = self._ledger([demoted("far.py", 900)])
+        header = bl.render_ledger_markdown(ledger, "judge").split("--- ROUND 1", 1)[0]
+        self.assertIn("1 unanchorable, so never answerable at all", header)
+        self.assertNotIn("failed review POST", header)
+        self.assertNotIn("failed review POST", bl.ledger_note(ledger))
 
     def test_it_renders_post_failed_and_says_the_finding_did_anchor(self):
         rendered = bl.render_ledger_markdown(
@@ -1459,12 +1484,16 @@ class TestLostToFallbackEntries(unittest.TestCase):
         )
         self.assertIn("* app.py:11 [low] [post-failed]", rendered)
         self.assertNotIn("* app.py:11 [low] [unanchorable]", rendered)
+        # Worded as the check the finding PASSED, not as a promise about next round:
+        # the writer tags this from its own parse of the diff, and the POST that failed
+        # may have failed because GitHub refused an anchor anyway.
         self.assertIn(
-            "(review POST failed — this finding anchored to the diff but its review was "
-            "delivered body-only, so no thread exists and nobody could answer it; "
-            "re-raising it needs no repeat_of and it should anchor normally next round)",
+            "(review POST failed — this finding matched a line in the reviewed diff "
+            "but its review was delivered body-only, so no thread exists and nobody "
+            "could answer it; re-raising it needs no repeat_of)",
             rendered,
         )
+        self.assertNotIn("should anchor normally", rendered)
         # The unanchorable note is the OTHER branch — an entry gets one, never both.
         self.assertNotIn("demoted to the review body, no thread exists", rendered)
         self.assertNotIn("discussion_url:", rendered, "still no thread to point at")
@@ -1477,8 +1506,12 @@ class TestLostToFallbackEntries(unittest.TestCase):
                     "--- ROUND 1", 1
                 )[0]
                 self.assertIn("[post-failed]", steering)
-                self.assertIn("anchored", steering)
-                self.assertIn("raise it freely", steering.lower())
+                self.assertIn("diff-anchor check", steering)
+                self.assertIn("re-raise it if it still", steering.lower())
+                # Not "freely": a [post-failed] entry carries no repeat lineage, so
+                # steering that waves the panel through amplifies the one bypass the
+                # repeat cap cannot see.
+                self.assertNotIn("freely", steering.lower())
 
     def test_a_v1_payload_without_the_flag_renders_exactly_as_before(self):
         """Forward compatibility in the direction that actually happens: consumers stay

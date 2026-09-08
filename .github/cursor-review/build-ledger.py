@@ -747,7 +747,21 @@ def build_ledger(
         for e in entries
         if e.get("anchored", True) and e["thread"]["answered_count"] == 0
     )
-    unanchorable = sum(1 for e in entries if not e.get("anchored", True))
+    # Counted apart from `post_failed` for the same reason `unanswered` is counted
+    # apart from both: the block header is the first thing the model reads, and
+    # "N unanchorable, so never answerable at all" said of a finding whose own entry
+    # line two rows below reports that it DID anchor is the aggregate contradicting
+    # the detail. On a wholesale-fallback round that would be every finding of it.
+    unanchorable = sum(
+        1
+        for e in entries
+        if not e.get("anchored", True) and e.get("lost_to_fallback") is not True
+    )
+    post_failed = sum(
+        1
+        for e in entries
+        if not e.get("anchored", True) and e.get("lost_to_fallback") is True
+    )
 
     return {
         "status": "ok",
@@ -758,6 +772,7 @@ def build_ledger(
         "entry_count": len(entries),
         "unanswered_count": unanswered,
         "unanchorable_count": unanchorable,
+        "post_failed_count": post_failed,
         "notes": notes,
         # How many rounds demoted findings we could not read back, and how many notes
         # a SIZE cap produced. Both kept structurally rather than sniffed out of
@@ -786,6 +801,7 @@ def unknown_ledger(call: str, reason: str) -> dict:
         "entry_count": 0,
         "unanswered_count": 0,
         "unanchorable_count": 0,
+        "post_failed_count": 0,
         "notes": [],
         "failed_call": call,
         "reason": reason,
@@ -804,6 +820,7 @@ def disabled_ledger() -> dict:
         "entry_count": 0,
         "unanswered_count": 0,
         "unanchorable_count": 0,
+        "post_failed_count": 0,
         "notes": [],
     }
 
@@ -843,8 +860,9 @@ _PANEL_STEERING = (
     "  severity warrants, and say in the body that it repeats unanchored.\n"
     "- An entry marked [post-failed] is like [unanchorable] for repeat purposes —\n"
     "  no thread exists, so nobody could have answered it — but UNLIKE it, the\n"
-    "  finding anchored to the diff correctly and was lost to an API failure that\n"
-    "  delivered the whole review as prose. Re-raise it freely if it still applies.\n"
+    "  finding passed the diff-anchor check and lost its thread to an API failure\n"
+    "  that delivered the whole review as prose. Re-raise it if it still applies;\n"
+    "  the \"prefer not to\" above is about unanchorable findings and not about it.\n"
 )
 
 _JUDGE_STEERING = (
@@ -871,10 +889,10 @@ _JUDGE_STEERING = (
     "  recent rounds, prefer NOT re-raising it unless its severity warrants; if you\n"
     "  do re-raise it, say in the body that it repeats unanchored.\n"
     "- An entry marked [post-failed] has NO discussion_url and never takes repeat_of\n"
-    "  either, and costs no repeat slot. But unlike [unanchorable] it DID anchor to\n"
-    "  the diff — its review was lost to an API failure and delivered as prose — so\n"
-    "  the preference above does not apply: re-raise it freely if it still holds,\n"
-    "  and it should anchor normally this round.\n"
+    "  either, and costs no repeat slot. But unlike [unanchorable] it DID pass the\n"
+    "  diff-anchor check — its review was lost to an API failure and delivered as\n"
+    "  prose — so the preference above does not apply to it:\n"
+    "  re-raise it if it still holds.\n"
 )
 
 
@@ -899,9 +917,16 @@ def render_ledger_markdown(ledger: dict, audience: str = "panel") -> str:
     # their own clause, because saying "N never answered" of a finding nobody could
     # answer contradicts the per-entry line right below it.
     unanchorable = ledger.get('unanchorable_count') or 0
+    post_failed = ledger.get('post_failed_count') or 0
     counts = f"{ledger['unanswered_count']} never answered"
     if unanchorable:
         counts += f"; {unanchorable} unanchorable, so never answerable at all"
+    if post_failed:
+        # Its own clause, not folded into `unanchorable`: these findings DID pass the
+        # diff-anchor check, and the entry lines below say so.
+        counts += (
+            f"; {post_failed} lost to a failed review POST, so never answerable either"
+        )
     lines.append(
         f"Ledger: {ledger['entry_count']} prior finding(s) across "
         f"{ledger['rounds']} round(s) of {ledger['total_rounds']} total on this PR "
@@ -974,13 +999,15 @@ def render_ledger_markdown(ledger: dict, audience: str = "panel") -> str:
             lines.append(f"  reply from {who}{tag}: {_defang_fences(reply['text'])}\n")
         if not anchored and lost_to_fallback:
             # Same "nobody could have answered it" as below, but the reason matters:
-            # this finding DID anchor, so the steering that asks the panel to prefer
-            # not re-raising an unanchorable one would be wrong about it.
+            # this finding passed the diff-anchor check, so the steering that asks the
+            # panel to prefer not re-raising an unanchorable one would be wrong about
+            # it. Stated as the check it passed rather than as a promise about next
+            # round: the writer tags this from ITS parse of the diff, and the POST that
+            # failed may well have failed because GitHub refused an anchor anyway.
             lines.append(
-                "  (review POST failed — this finding anchored to the diff but its "
-                "review was delivered body-only, so no thread exists and nobody could "
-                "answer it; re-raising it needs no repeat_of and it should anchor "
-                "normally next round)\n"
+                "  (review POST failed — this finding matched a line in the reviewed "
+                "diff but its review was delivered body-only, so no thread exists and "
+                "nobody could answer it; re-raising it needs no repeat_of)\n"
             )
         elif not anchored:
             # Stronger than "never answered": nobody COULD have answered it. Said
@@ -1039,9 +1066,12 @@ def ledger_note(ledger: dict) -> str:
     # "3 prior finding(s) … (0 never answered)" — i.e. as though the author had answered
     # every one of them, when not one of them had a thread to answer.
     unanchorable = ledger.get('unanchorable_count') or 0
+    post_failed = ledger.get('post_failed_count') or 0
     counts = f"{ledger['unanswered_count']} never answered"
     if unanchorable:
         counts += f"; {unanchorable} unanchorable"
+    if post_failed:
+        counts += f"; {post_failed} lost to a failed review POST"
     return (
         f"Round {ledger['total_rounds'] + 1} — ledger: {ledger['entry_count']} prior "
         f"finding(s) across {ledger['rounds']} round(s) "
