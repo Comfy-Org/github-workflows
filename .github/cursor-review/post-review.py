@@ -78,6 +78,25 @@ MAX_FENCE_CHARS = 64
 # what the judge prompt block quotes.
 REPEAT_CAP = 2
 
+# The shape a `repeat_of` may have when it travels STRUCTURALLY through the body-only
+# sentinel (BE-12534). A demoted re-raise loses its lineage otherwise: the trailer is
+# stripped out of the sentinel's prose (see strip_repeat_line) and, with no field to
+# carry it, build-ledger.py rebuilt the entry as a fresh unanchorable finding — so the
+# next round's re-raise of the SAME finding needed no repeat_of and cost no repeat slot.
+# One demoted hop made every later hop of that chain cap-free.
+#
+# This is a SHAPE guard, not the integrity check: it bounds what can be written into a
+# public review body and re-read from it, so the payload can never carry a link to an
+# arbitrary host, a whitespace/line-break run, or an unbounded string. What actually
+# decides whether the lineage is real is on the reader — build-ledger.py resolves the
+# id to a ROOT comment of one of OUR consolidated reviews, so a judge-hallucinated or
+# foreign URL of exactly this shape still resolves to nothing. Kept as a literal
+# pattern rather than a compiled-only object because build-ledger.py duplicates it
+# (neither module imports the other) and test_build_ledger.py pins the two together.
+REPEAT_URL_PATTERN = r"^https://github\.com/[^/\s]+/[^/\s]+/pull/\d+#discussion_r\d+$"
+REPEAT_URL_RE = re.compile(REPEAT_URL_PATTERN)
+REPEAT_URL_MAX_CHARS = 512
+
 # Machine-readable handoff for findings demoted to the review body (BE-9565).
 # build-ledger.py derives its entries from review-COMMENT thread roots, and a demoted
 # finding has no comment — so without this it never reaches the next round's ledger and
@@ -1199,6 +1218,14 @@ def strip_repeat_line(repeat_line: str, body: str) -> str:
     re-matched with a regex, for the same reason strip_severity_badge is: if the format
     changes this stops matching and the sentinel carries a visible trailer — cosmetic —
     instead of silently eating the tail of a finding.
+
+    Since BE-12534 stripping the trailer no longer LOSES the lineage: the URL travels
+    structurally instead, as the sentinel's optional `repeat_of` key
+    (render_body_only_sentinel), which build-ledger.py resolves back to the ancestor
+    thread — recovering its round from that thread rather than from the payload. Before that they were carried in no field at all, so a re-raise
+    demoted to the body was rebuilt next round as a fresh unanchorable finding and
+    every later hop of that chain became cap-free. The prose half is unchanged — the
+    trailer still shows the re-raise to whoever reads the review.
     """
     if repeat_line and body.endswith(repeat_line):
         return body[: -len(repeat_line)].rstrip()
@@ -1242,6 +1269,16 @@ def render_body_only_sentinel(items: list) -> str:
     POST rather than to the diff — presentation only on the reading side, since the
     mechanical consequences of `anchored: false` are correct for it either way. The
     key name carries no `-`, so the escape above already covers it.
+
+    `repeat_of` (BE-12534) follows the same optional-key discipline and carries the
+    re-raise lineage strip_repeat_line just removed from `body`. Unlike
+    `lost_to_fallback` it is NOT presentation-only: the reader resolves the URL to the
+    ancestor thread and reads that thread's real answer state, which is what makes a
+    demoted re-raise of an ANSWERED finding cost a repeat slot next round instead of
+    being cap-exempt. The URL is the ONLY lineage key emitted — the ancestor's round is
+    not carried, because the reader derives it from the resolved comment's own review
+    rather than from the payload, and a field nobody reads would still be paid for out
+    of the two size guards' budget.
     """
     payload = []
     for item in items:
@@ -1267,6 +1304,38 @@ def render_body_only_sentinel(items: list) -> str:
         # JSON `true` and defeat that guard from the writing side.
         if item.get("lost_to_fallback") is True:
             entry["lost_to_fallback"] = True
+        # BE-12534: the re-raise lineage, carried STRUCTURALLY because
+        # strip_repeat_line just took it out of `body`. Same optional-key discipline as
+        # `lost_to_fallback` — emitted only for an item that has it, so a payload with
+        # no re-raise in it stays byte-identical to what this rendered before the key
+        # existed (which is also what keeps the two size guards' measurements honest).
+        #
+        # The URL alone. The ancestor's ROUND is deliberately not carried: the reader
+        # takes it from the review the resolved comment belongs to, which is truthful
+        # by construction and available whenever the URL resolves at all, so a
+        # `repeat_round` field here would be payload nothing reads — and this body is
+        # under a hard size cap that can drop a real finding to make room for it.
+        #
+        # Validated HERE rather than trusted to the reader, even though the reader
+        # re-validates: this string is judge output landing in a review body on a
+        # public PR, so what gets WRITTEN is bounded too. The URL is one anchored
+        # GitHub discussion permalink and nothing else — no other host, no whitespace
+        # or line break (which would ride through JSON losslessly and land on the
+        # ledger's own `re_raise_of:` line), and no unbounded string. The `-` → `-`
+        # escape below already covers it: it is applied post-encode to the whole
+        # payload, so the URL's own dashes cannot close the HTML comment early.
+        repeat_url = item.get("repeat_url") or ""
+        if (
+            isinstance(repeat_url, str)
+            and len(repeat_url) <= REPEAT_URL_MAX_CHARS
+            # fullmatch, not match: `$` also matches just BEFORE a trailing
+            # newline, and JSON round-trips that losslessly — it would arrive on
+            # the ledger's own `re_raise_of:` line as a real line break, at column
+            # 0 of the prompt. repeat_url_of already stripped, so this is the
+            # second of the two halves rather than the only one.
+            and REPEAT_URL_RE.fullmatch(repeat_url)
+        ):
+            entry["repeat_of"] = repeat_url
         payload.append(entry)
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     escaped = encoded.replace("-", "\\u002d")
@@ -1399,6 +1468,17 @@ def normalize_comments(findings: list[dict]) -> list[dict]:
                 # Truthy only for a re-raise of an already-answered finding —
                 # what enforce_repeat_cap counts against REPEAT_CAP.
                 "repeat_of": repeat_line,
+                # The same lineage, unrendered (BE-12534). `repeat_of` above is the
+                # TRAILER — the prose the reader sees — and strip_repeat_line takes it
+                # back out of a demoted finding's sentinel body, because a live thread
+                # URL must never travel inside the prose the judge reads. This field is
+                # how it travels instead: structurally, as a sentinel key
+                # render_body_only_sentinel validates on the way out and
+                # build-ledger.py resolves against the PR's real comments on the way
+                # in. Kept beside `repeat_of` rather than replacing it so
+                # enforce_repeat_cap's count and strip_repeat_line's reconstruction are
+                # both untouched.
+                "repeat_url": repeat_url_of(finding),
                 "comment": {
                     "path": path,
                     "line": line_int,
@@ -1427,10 +1507,52 @@ def render_repeat_of(finding: dict) -> str:
     record, linked to the thread that already answered it, so the author can see
     at a glance that this is round N of the same conversation.
     """
+    url = repeat_url_of(finding)
+    if not url:
+        return ""
+    return f"\n\n↩︎ re-raise of {url}{render_repeat_round(finding)}"
+
+
+def repeat_url_of(finding: dict) -> str:
+    """The judge's `repeat_of` URL, neutralized and stripped — or `""`.
+
+    Split out of render_repeat_of (BE-12534) so the RENDERED trailer and the RAW url
+    are two separate things. normalize_comments keeps storing the trailer in
+    `item["repeat_of"]` — that is what enforce_repeat_cap counts and what
+    strip_repeat_line reconstructs — and stores this alongside it as
+    `item["repeat_url"]`, which is what render_body_only_sentinel emits as a field.
+    The ROUND has no such twin: it stays in the trailer only, because the ledger reads
+    a resolved ancestor's round off that ancestor's own review rather than off the
+    payload, so carrying it structurally would cost sentinel bytes nothing reads.
+    """
     url = finding.get("repeat_of")
     if not isinstance(url, str) or not url.strip():
         return ""
-    return f"\n\n↩︎ re-raise of {neutralize_mentions(url.strip())}{render_repeat_round(finding)}"
+    return neutralize_mentions(url.strip())
+
+
+def coerce_repeat_round(finding: dict):
+    """The judge's `repeat_round` as a POSITIVE int, or None.
+
+    The type IS the control (see render_repeat_round): a positive integer cannot carry
+    an `@handle` or markup at all. `bool` is rejected explicitly because it is a
+    subclass of `int`, so `repeat_round: true` would otherwise render "(round True)"
+    and be emitted into the sentinel as JSON `true`.
+    """
+    round_no = finding.get("repeat_round")
+    if isinstance(round_no, bool):
+        return None
+    if isinstance(round_no, str):
+        round_no = round_no.strip()
+        if not round_no.isdigit():
+            return None
+        try:
+            round_no = int(round_no)
+        except ValueError:
+            return None
+    if not isinstance(round_no, int) or round_no <= 0:
+        return None
+    return round_no
 
 
 def render_repeat_round(finding: dict) -> str:
@@ -1444,16 +1566,14 @@ def render_repeat_round(finding: dict) -> str:
     subclass of `int`, so `repeat_round: true` rendered as "(round True)".)
     neutralize_mentions stays on the render as defense in depth for whoever
     loosens the type next.
+
+    The coercion itself lives in coerce_repeat_round (BE-12534): it is the guard that
+    keeps a non-decimal digit (`str.isdigit()` is true for characters `int()` rejects)
+    from raising straight out of normalize_comments and taking down the whole review
+    post.
     """
-    round_no = finding.get("repeat_round")
-    if isinstance(round_no, bool):
-        return ""
-    if isinstance(round_no, str):
-        round_no = round_no.strip()
-        if not round_no.isdigit():
-            return ""
-        round_no = int(round_no)
-    if not isinstance(round_no, int) or round_no <= 0:
+    round_no = coerce_repeat_round(finding)
+    if round_no is None:
         return ""
     return f" (round {neutralize_mentions(str(round_no))})"
 
@@ -1702,6 +1822,15 @@ def main():
         # already gets. Since BE-10002 the WHOLESALE fallback body (the 422 path below)
         # carries a sentinel of its own too, so a round whose findings were lost to a
         # failed POST reaches the ledger as well.
+        #
+        # Cap-exempt is about the entry ITSELF, not about its lineage. Since BE-12534 a
+        # demoted finding that was a RE-RAISE carries the ancestor thread's URL
+        # structurally, in the sentinel's `repeat_of` key — never in the prose, which
+        # strip_repeat_line still clears. build-ledger.py resolves that URL against the
+        # PR's real comments and reads the ANCESTOR's answer state (and round), so
+        # re-raising an answered finding keeps costing a repeat slot even after one hop
+        # of the chain was demoted. Without the field the chain went cap-free from that
+        # hop on.
         review_body += f"{FINDINGS_SEPARATOR}{body_only_md}"
 
     # Every finding, most → least urgent, for any render that has no inline half.
