@@ -1,7 +1,7 @@
 name: Assign Reviewers (reusable)
 
-# Auto-assigns expertise-aware, load-balanced PR owners, with optional
-# "new-folk" randomization so people outside the matched experts get reps.
+# Assigns owners using configured expertise and recent human approvals on
+# the changed code. Workload breaks ties; extra owners must add coverage.
 # NOTE: this org routes/alerts people via the ASSIGNEE field, so this workflow
 # writes assignees (github.rest.issues.addAssignees) — NOT reviewer requests.
 # Models its structure on cursor-review-auto-label.yml: a workflow_call
@@ -29,8 +29,8 @@ name: Assign Reviewers (reusable)
 #         - carol
 #
 # Both flow (`[a, b]`) and block (`- a`) sequences are accepted. The config is
-# read from the PR head SHA via the contents API, so a PR's own edits to the
-# config take effect on that PR.
+# read from the PR base SHA, so proposed routing edits cannot select their
+# own owners before the edits have been reviewed.
 #
 # AUTHOR SCOPING: vars.REVIEWER_AUTHOR_ALLOWLIST, when set, restricts routing to
 # that list of PR authors and skips everyone else. It is the opt-in alternative to
@@ -38,11 +38,10 @@ name: Assign Reviewers (reusable)
 # PRs routed (BE-11575). Unset/empty keeps the historical run-for-every-author
 # behavior, so adding it breaks no existing caller.
 #
-# SELECTION: changed paths -> union of matching experts (else default_pool) ->
-# drop the author + vars.REVIEWER_EXCLUDE -> rank ascending by each candidate's
-# open assignee load (steering off anyone at/over vars.REVIEWER_LOAD_CAP) ->
-# deterministically (per PR number) maybe swap the last slot for a
-# vars.REVIEWER_GROWTH_POOL member -> assign the top `num_reviewers`.
+# SELECTION: configured path expertise plus recent approvals on the same files
+# or directories, then greedy coverage of the diff. Load breaks expertise ties.
+# No random substitutions. A second owner must cover previously uncovered code.
+# Decisions and supporting historical PR numbers appear in the run summary.
 #
 # Example caller (consumer repo):
 #
@@ -62,7 +61,7 @@ name: Assign Reviewers (reusable)
 #
 # Caller-side configuration:
 #   vars.APP_ID                    - CLOUD_CODE_BOT app id (same as cursor-review-auto-label)
-#   vars.REVIEWER_GROWTH_POOL      - whitespace-separated logins for new-folk randomization
+#   vars.REVIEWER_GROWTH_POOL      - deprecated, ignored (no random assignments)
 #   vars.REVIEWER_LOAD_CAP         - max open reviews before a candidate is steered off (optional)
 #   vars.REVIEWER_EXCLUDE          - whitespace-separated logins to hard-exclude (optional)
 #   vars.REVIEWER_AUTHOR_ALLOWLIST - whitespace-separated logins; when non-empty, ONLY
@@ -78,7 +77,7 @@ on:
         required: false
         default: .github/reviewers.yml
       num_reviewers:
-        description: How many reviewers to request.
+        description: Maximum owners to assign (1-10); extra owners must add coverage.
         type: number
         required: false
         default: 2
@@ -103,6 +102,10 @@ jobs:
   assign-reviewers:
     name: Assign expertise-aware owners
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: intelligent-assignment-${{ github.repository }}-${{ github.event.pull_request.number || github.run_id }}
+      cancel-in-progress: false
     permissions:
       contents: read
     steps:
@@ -119,7 +122,6 @@ jobs:
           REVIEWER_CONFIG_PATH: ${{ inputs.reviewer_config_path }}
           NUM_REVIEWERS: ${{ inputs.num_reviewers }}
           SKIP_LABEL: ${{ inputs.skip_label }}
-          GROWTH_POOL: ${{ vars.REVIEWER_GROWTH_POOL }}
           LOAD_CAP: ${{ vars.REVIEWER_LOAD_CAP }}
           EXCLUDE: ${{ vars.REVIEWER_EXCLUDE }}
           AUTHOR_ALLOWLIST: ${{ vars.REVIEWER_AUTHOR_ALLOWLIST }}
@@ -128,7 +130,7 @@ jobs:
           # fork PRs (read-only GITHUB_TOKEN would 403).
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
-            const pr = context.payload.pull_request;
+            let pr = context.payload.pull_request;
             if (!pr) { core.info('Not a pull_request event — nothing to do.'); return; }
             const { owner, repo } = context.repo;
             const pull_number = pr.number;
@@ -170,8 +172,7 @@ jobs:
             // the trigger payload — a creation-time assignee is missed by the
             // payload (github-workflows BE-4008), which is what let the bot stack
             // onto an already-assigned PR. Author-only (or no) assignees fall
-            // through to the normal blame-based pick; multiple bot picks are
-            // intentional (load-spread) and are NOT capped here.
+            // through to expertise selection; extra owners must add coverage.
             // Live read of the non-author assignees. Returns `null` when the API
             // read fails: callers treat "can't confirm" as "skip", never as
             // "fall back to the payload" — the payload is exactly the value that
@@ -185,9 +186,16 @@ jobs:
                 core.info(`Could not read live assignees (${e.message}).`);
                 return null;
               }
+              if (live.data.state !== 'open' || live.data.draft ||
+                  (live.data.labels || []).some((label) => label.name === skipLabel) ||
+                  (live.data.requested_reviewers || []).length ||
+                  (live.data.requested_teams || []).length) return null;
+              if (live.data.head.sha !== pr.head.sha ||
+                  live.data.base.sha !== pr.base.sha || live.data.base.ref !== pr.base.ref) return null;
+              pr = live.data;
               return (live.data.assignees || [])
                 .map((a) => a && a.login)
-                .filter((login) => login && login !== authorLogin);
+                .filter((login) => login && normalizeLogin(login) !== normalizeLogin(authorLogin || ''));
             };
             const nonAuthorAssignees = await readNonAuthorAssignees();
             if (nonAuthorAssignees === null) {
@@ -319,15 +327,19 @@ jobs:
             const files = await github.paginate(github.rest.pulls.listFiles, {
               owner, repo, pull_number, per_page: 100,
             });
+            if (files.length !== pr.changed_files) {
+              core.warning('Changed-file list is incomplete; skipping routing.');
+              return;
+            }
             const changed = files.map((f) => f.filename);
             core.info(`PR #${pull_number}: ${changed.length} changed file(s).`);
 
-            // --- 3. Read + parse the caller's reviewer config from the head SHA ---
+            // --- 3. Read + parse the caller's reviewer config from the reviewed base SHA ---
             const configPath = process.env.REVIEWER_CONFIG_PATH;
             let config;
             try {
               const res = await github.rest.repos.getContent({
-                owner, repo, path: configPath, ref: pr.head.sha,
+                owner, repo, path: configPath, ref: pr.base.sha,
               });
               if (Array.isArray(res.data) || !res.data.content) {
                 core.info(`${configPath} is not a file — nothing to do.`);
@@ -336,76 +348,158 @@ jobs:
               const text = Buffer.from(res.data.content, 'base64').toString('utf8');
               config = parseReviewerConfig(text);
             } catch (e) {
-              core.info(`Could not read ${configPath}@${pr.head.sha} (${e.message}) — nothing to do.`);
+              core.info(`Could not read ${configPath}@${pr.base.sha} (${e.message}) — nothing to do.`);
               return;
             }
 
-            // Match changed paths -> union of expert reviewers; else default_pool.
-            const candidates = new Set();
+            // Each file contributes one unit, so generated line counts cannot swamp
+            // a smaller source change. Known mechanical artifacts contribute less.
+            const weight = (path) => /(^|\/)(vendor|generated|dist)\/|(?:\.gen\.|\.generated\.|(?:^|\/)go\.sum$|(?:^|\/)(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?|Cargo\.lock|poetry\.lock|uv\.lock|Pipfile\.lock|composer\.lock|Gemfile\.lock|packages\.lock\.json)$)/.test(path) ? 0.1 : 1;
+            const paths = (file) => [file.filename, file.previous_filename].filter(Boolean);
+            const sameArea = (a, b) => {
+              if (a === b) return 1;
+              const parent = (p) => p.slice(0, p.lastIndexOf('/'));
+              // Never infer expertise just from the repository root or a top-level
+              // directory such as services/. Sibling files need a shared deeper folder.
+              return a.includes('/') && b.includes('/') && parent(a).includes('/') && parent(a) === parent(b) ? 0.5 : 0;
+            };
+            const exclude = new Set((process.env.EXCLUDE || '').split(/\s+/).filter(Boolean).map(normalizeLogin));
+            exclude.add(normalizeLogin(authorLogin || ''));
+            const eligible = (login) => /^[a-z\d](?:[a-z\d-]{0,38})$/i.test(login) && !exclude.has(login);
+            const candidates = new Map();
+            const candidate = (raw) => {
+              const login = normalizeLogin(raw);
+              if (!eligible(login)) return null;
+              if (!candidates.has(login)) candidates.set(login, {login, configured: new Set(), history: new Map(), load: null});
+              return candidates.get(login);
+            };
+            const matched = new Set();
             for (const rule of config.rules) {
-              const globs = rule.paths || [];
-              if (globs.length && changed.some((p) => matchesAny(p, globs))) {
-                for (const r of (rule.reviewers || [])) candidates.add(r);
-              }
-            }
-            if (candidates.size === 0) {
-              for (const r of (config.default_pool || [])) candidates.add(r);
+              files.forEach((file, index) => {
+                if (!paths(file).some((path) => matchesAny(path, rule.paths || []))) return;
+                matched.add(index);
+                for (const login of rule.reviewers || []) candidate(login)?.configured.add(index);
+              });
             }
 
-            // --- 4. Remove the author and hard-excluded logins ---
-            const exclude = new Set(
-              (process.env.EXCLUDE || '').split(/\s+/).filter(Boolean)
-            );
-            if (pr.user && pr.user.login) exclude.add(pr.user.login);
-            let pool = [...candidates].filter((c) => !exclude.has(c));
-            if (pool.length === 0) {
-              core.info('No eligible candidates after exclusions — nothing to assign.');
+            // Bound discovery to 50 recently updated merged PRs within 90 days on
+            // this base branch. Only final, non-dismissed human approvals are evidence;
+            // bot authorship, assignees and mere comments never imply expertise.
+            const since = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
+            let historyComplete = true;
+            try {
+              const search = await github.rest.search.issuesAndPullRequests({
+                q: `repo:${owner}/${repo} is:pr is:merged base:"${pr.base.ref}" merged:>=${since}`,
+                sort: 'updated', order: 'desc', per_page: 50,
+              });
+              if (search.data.incomplete_results) throw new Error('incomplete history search');
+              for (const item of search.data.items) {
+                if (item.number === pull_number) continue;
+                const reviews = await github.paginate(github.rest.pulls.listReviews, {owner, repo, pull_number: item.number, per_page: 100});
+                const final = new Map();
+                for (const review of reviews) {
+                  if (!review.user || review.user.type !== 'User' ||
+                      !['MEMBER', 'OWNER', 'COLLABORATOR'].includes(review.author_association)) continue;
+                  if (['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'].includes(review.state)) final.set(normalizeLogin(review.user.login), review.state);
+                }
+                const approved = [...final].filter(([login, state]) => state === 'APPROVED' && eligible(login));
+                if (!approved.length) continue;
+                const oldFiles = await github.paginate(github.rest.pulls.listFiles, {owner, repo, pull_number: item.number, per_page: 100});
+                // Huge historical sweeps are poor ownership evidence and may be truncated.
+                if (oldFiles.length >= 300) continue;
+                files.forEach((file, index) => {
+                  const affinity = Math.max(0, ...oldFiles.flatMap((old) => paths(file).flatMap((a) => paths(old).map((b) => sameArea(a, b)))));
+                  if (!affinity) return;
+                  for (const [login] of approved) {
+                    // A maintained rule defines eligibility for its area. History refines
+                    // that roster; it only discovers new owners for unmapped files.
+                    const person = candidate(login);
+                    if (matched.has(index) && !person.configured.has(index)) continue;
+                    if (!person.history.has(index)) person.history.set(index, []);
+                    person.history.get(index).push({number: item.number, affinity});
+                  }
+                });
+              }
+            } catch (error) {
+              historyComplete = false;
+              // Discard partial evidence: API order must not favor the people read first.
+              for (const person of candidates.values()) person.history.clear();
+              core.warning(`Review history unavailable (${error.message}); using configured expertise only.`);
+            }
+
+            // Exact-file approval is sufficient; directory-only inference needs two
+            // separate merged PRs. The configured fallback is used only if NO rule or
+            // credible historical evidence covers ANY changed file. It adds one owner.
+            const coverage = (person) => new Set([
+              ...person.configured,
+              ...[...person.history].filter(([, evidence]) => evidence.some((e) => e.affinity === 1) || evidence.length >= 2).map(([index]) => index),
+            ]);
+            for (const [login, person] of candidates) if (!coverage(person).size) candidates.delete(login);
+            const fallback = !matched.size && !candidates.size;
+            if (fallback) for (const login of config.default_pool || []) candidate(login);
+            if (!candidates.size) {
+              core.info('No eligible owner with evidence; leaving PR unassigned.');
               return;
             }
 
-            // --- 5. Load-balance: rank ascending by open assignee load ---
-            const cap = parseInt(process.env.LOAD_CAP || '', 10); // NaN when unset
-            const withLoad = [];
-            for (const login of pool) {
-              let load = 0;
+            // Unknown load never means zero. Use repository-local load because the app
+            // token is scoped to this repository and cannot report org-wide load reliably.
+            for (const person of candidates.values()) {
               try {
-                const r = await github.rest.search.issuesAndPullRequests({
-                  q: `is:open is:pr assignee:${login} org:${owner}`,
+                const response = await github.rest.search.issuesAndPullRequests({
+                  q: `repo:${owner}/${repo} is:open is:pr assignee:${person.login} -author:${person.login}`,
                 });
-                load = r.data.total_count;
-              } catch (e) {
-                core.info(`Load query failed for ${login} (${e.message}) — treating load as 0.`);
-              }
-              withLoad.push({ login, load });
-            }
-            let ranked = withLoad.slice().sort((a, b) => a.load - b.load);
-            if (!Number.isNaN(cap)) {
-              const under = ranked.filter((x) => x.load < cap);
-              // Only steer off over-cap candidates if some remain; otherwise a
-              // busy reviewer beats no reviewer.
-              if (under.length > 0) ranked = under;
-            }
-            let selected = ranked.map((x) => x.login);
-
-            // --- 6. New-folk randomization (deterministic per PR number) ---
-            const num = Math.max(1, parseInt(process.env.NUM_REVIEWERS || '2', 10) || 2);
-            const growth = (process.env.GROWTH_POOL || '').split(/\s+/).filter(Boolean);
-            selected = selected.slice(0, num);
-            // Deterministic pseudo-random in [0,1) from the PR number — stable
-            // across re-runs of the same PR, so behavior is not flaky.
-            const rand = ((pull_number * 2654435761) >>> 0) / 4294967296;
-            if (growth.length && selected.length >= 1 && rand < 0.5) {
-              const eligible = growth.filter((g) => !selected.includes(g) && !exclude.has(g));
-              if (eligible.length) {
-                const pick = eligible[pull_number % eligible.length];
-                if (selected.length >= 2) {
-                  selected[selected.length - 1] = pick; // swap last expert slot
-                } else {
-                  selected.push(pick); // single expert: add a newcomer instead of dropping coverage
-                }
+                if (!response.data.incomplete_results && Number.isFinite(response.data.total_count)) person.load = response.data.total_count;
+              } catch (error) {
+                core.warning(`Load unavailable for ${person.login}; treating as unknown.`);
               }
             }
-            selected = selected.slice(0, num);
+            const num = Math.min(10, Math.max(1, Math.floor(Number(process.env.NUM_REVIEWERS) || 2)));
+            const parsedCap = Number(process.env.LOAD_CAP);
+            const cap = process.env.LOAD_CAP && Number.isFinite(parsedCap) && parsedCap >= 0 ? parsedCap : Infinity;
+            const covered = new Set();
+            const selected = [];
+            const decisions = [];
+            const unavailable = new Set();
+            while (selected.length < (fallback ? 1 : num)) {
+              const ranked = [...candidates.values()].filter((p) => !selected.includes(p.login) && !unavailable.has(p.login)).map((person) => {
+                const fresh = [...coverage(person)].filter((index) => !covered.has(index));
+                const gain = fresh.reduce((sum, index) => sum + weight(files[index].filename), 0);
+                const evidence = fresh.reduce((sum, index) => sum + Math.min(3, (person.history.get(index) || []).reduce((n, e) => n + e.affinity, 0)) * weight(files[index].filename), 0);
+                return {...person, fresh, gain, evidence};
+              }).filter((p) => fallback || p.gain > 0);
+              if (!ranked.length) break;
+              // Expertise is primary; cap/load steer only among candidates with equal
+              // added coverage. A busy expert still beats someone unrelated to the diff.
+              ranked.sort((a, b) => b.gain - a.gain ||
+                Number(a.load === null || a.load >= cap) - Number(b.load === null || b.load >= cap) ||
+                b.evidence - a.evidence || (a.load ?? Infinity) - (b.load ?? Infinity) || a.login.localeCompare(b.login));
+              const pick = ranked[0];
+              try {
+                await github.rest.issues.checkUserCanBeAssigned({owner, repo, assignee: pick.login});
+              } catch (error) {
+                unavailable.add(pick.login);
+                core.warning(`Cannot confirm ${pick.login} is assignable; trying the next qualified owner.`);
+                continue;
+              }
+              selected.push(pick.login);
+              pick.fresh.forEach((index) => covered.add(index));
+              const supporting = [...new Set(pick.fresh.flatMap((index) => (pick.history.get(index) || []).map((e) => `#${e.number}`)))];
+              decisions.push(`${pick.login}: ${fallback ? 'configured default pool (low confidence; no path evidence)' : `${pick.fresh.length} additional file(s), ${pick.fresh.filter((i) => pick.configured.has(i)).length} from path rules; approval evidence ${supporting.slice(0, 8).join(', ') + (supporting.length > 8 ? ` (+${supporting.length - 8} more)` : '') || 'none'}`} [open review load: ${pick.load ?? 'unknown'}]`);
+            }
+            const explanation = [
+              `PR #${pull_number}: ${files.length} changed files; ${covered.size} covered by expertise.`,
+              ...decisions,
+              `History: ${historyComplete ? 'up to 50 recently updated merged PRs, last 90 days' : 'unavailable; configured expertise only'}.`,
+            ];
+            explanation.forEach((line) => core.info(line));
+            // Escape all external text. Summary only, no comments or extra notifications.
+            const escape = (value) => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+            try {
+              await core.summary.addHeading('Proposed owner selection').addRaw(`<pre>${escape(explanation.join('\n'))}</pre>`).write();
+            } catch (error) {
+              core.warning('Could not write the summary; decision evidence is in the run log.');
+            }
 
             // --- 7. Assign the selected users (never fail the PR) ---
             // This org routes/alerts people via the ASSIGNEE field, not the
@@ -417,7 +511,7 @@ jobs:
             }
             // TOCTOU guard: the early skip check ran before the async config
             // read + candidate selection above. A human (or a concurrent run —
-            // this workflow defines no `concurrency:` group) may have assigned
+            // another workflow may not share our `concurrency:` group) may have assigned
             // someone in that window, and GitHub assignment is additive, so
             // re-read the live state immediately before mutating and bail if a
             // non-author assignee now exists. Unreadable state → skip, same as
@@ -432,10 +526,14 @@ jobs:
               return;
             }
             try {
-              await github.rest.issues.addAssignees({
+              const assigned = await github.rest.issues.addAssignees({
                 owner, repo, issue_number: pull_number, assignees: selected,
               });
-              core.info(`Assigned: ${selected.join(', ')}`);
+              const actual = new Set((assigned.data.assignees || []).map((a) => normalizeLogin(a.login)));
+              const confirmed = selected.filter((login) => actual.has(login));
+              const missing = selected.filter((login) => !actual.has(login));
+              core.info(`Assigned: ${confirmed.join(', ') || 'none'}`);
+              if (missing.length) core.warning(`GitHub did not assign: ${missing.join(', ')}.`);
             } catch (e) {
               core.warning(`addAssignees failed (${e.message}) — leaving PR unassigned.`);
             }

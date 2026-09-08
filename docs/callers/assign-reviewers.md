@@ -4,16 +4,14 @@ Read [the shared caller contract](README.md) first.
 
 ## What it does
 
-Matches a PR's changed paths against a **caller-repo** `.github/reviewers.yml`
-(path-glob → reviewers, plus a `default_pool`), drops the author and anyone in
-`vars.REVIEWER_EXCLUDE`, ranks the remaining candidates by current open load
-(steering off anyone at or over `vars.REVIEWER_LOAD_CAP`), may swap one slot for a
-`vars.REVIEWER_GROWTH_POOL` member for new-folk randomization, and assigns the top
-`num_reviewers`.
+Routes a PR using configured path expertise and recent human approvals on the
+same code. Each chosen owner must add coverage of the changed files. Workload
+breaks relevance ties; a one-subsystem PR normally gets one owner even with the
+default maximum of two. There are no random substitutions.
 
-Routing runs for every eligible author by default. Set
-`vars.REVIEWER_AUTHOR_ALLOWLIST` to scope it to an opt-in set of PR authors
-instead — the middle ground between "on for everyone" and off.
+Each run logs its evidence and writes an Actions summary: additional files
+covered, configured rules, supporting historical PR numbers, and known/unknown
+open review load. It does not post a PR comment.
 
 > **Despite the name, it writes the ASSIGNEE field, not reviewer requests.**
 > Comfy-Org routes and alerts people via assignees, so an entry under
@@ -30,8 +28,8 @@ buy fork support** — see the fork gotcha below.
 | `vars.APP_ID` | **Required.** CLOUD_CODE_BOT app id. |
 | `secrets.CLOUD_CODE_BOT_PRIVATE_KEY` | **Required.** |
 | `.github/reviewers.yml` in **your** repo | **Required.** The expertise map. |
-| `vars.REVIEWER_GROWTH_POOL` | Optional. Logins for new-folk randomization. |
-| `vars.REVIEWER_LOAD_CAP` | Optional. Max open reviews before steering off. |
+| `vars.REVIEWER_GROWTH_POOL` | Deprecated and ignored. No random assignments. |
+| `vars.REVIEWER_LOAD_CAP` | Optional. Prefer below-cap owners among equally relevant candidates. |
 | `vars.REVIEWER_EXCLUDE` | Optional. Logins to hard-exclude. |
 | `vars.REVIEWER_AUTHOR_ALLOWLIST` | Optional. Whitespace-separated logins. When non-empty, only these **authors'** PRs are routed; everyone else's is skipped. Unset ⇒ every eligible author is routed. |
 
@@ -79,7 +77,7 @@ The assignee write goes through the App token.
 | Input | Default | Notes |
 |---|---|---|
 | `reviewer_config_path` | `.github/reviewers.yml` | Where your expertise map lives. |
-| `num_reviewers` | `2` | How many people to assign. |
+| `num_reviewers` | `2` | Maximum owners (clamped to 1–10). Extra owners must add file coverage. |
 | `skip_label` | `skip-auto-assign` | Present on a PR ⇒ skip routing. |
 
 ## Your `reviewers.yml`
@@ -117,10 +115,8 @@ Hence `&& github.actor != 'dependabot[bot]'` in the guard above.
 `pull_request` event withholds repository secrets from fork-originated runs, so
 `CLOUD_CODE_BOT_PRIVATE_KEY` arrives empty and the App-token mint hard-fails — a
 red check and no routing either way. Hence the `if:` guard in the caller above; a
-skipped job reports as neutral instead. Routing forks would mean
-`pull_request_target`, which runs privileged against untrusted head code while
-this workflow reads `.github/reviewers.yml` from the head SHA — that combination
-turns the expertise map into a real escalation path, so it is not offered.
+skipped job reports as neutral instead. The base-SHA configuration read does not
+change this caller contract; fork routing through `pull_request_target` is not offered.
 [`ci-assign-reviewers.yml`](../../.github/workflows/ci-assign-reviewers.yml) in
 this repo is the worked example.
 
@@ -134,17 +130,50 @@ guessed at. After setting it, confirm on a real PR that the run logs
 variable rather than emptying it to whitespace — both work, but an unset variable
 is the unambiguous "no scoping" state.
 
-**A matched bucket does not fall back to `default_pool`.** `default_pool` is
-consulted only when *no* rule matched the changed paths. The author is dropped
-**after** that choice, so a rule whose reviewer list is just the PR author matches,
-yields a one-person candidate set, loses that person to the author-drop, and ends
-at `No eligible candidates after exclusions — nothing to assign`. It never reaches
-`default_pool`. Write each bucket with at least one member who is not the usual
-author of changes in those paths.
+## How selection works
 
-**`default_pool` must never be one person** — and must not be whoever opens most
-PRs in the repo. When it *is* used (no rule matched), the same author-drop applies,
-so a single-member pool that happens to be the author assigns nobody.
+1. Read the expertise map at the PR's **base SHA**. Routing changes in a PR apply
+   only after merge. Match current paths and original paths of renamed files.
+   A matching rule defines the eligible roster for that file.
+2. Look at up to **50 recently updated merged PRs in the last 90 days**, targeting
+   the same base branch. Only human approvals from members, owners, or
+   collaborators count. The last decisive review state must be APPROVED;
+   dismissed approvals and later change requests do not count. One approval of
+   the exact file is evidence; directory-only inference needs two separate PRs
+   and a shared directory at least two levels deep. History refines the roster
+   for mapped files and discovers eligible owners for unmapped files.
+3. Rank by newly covered files. Each file has equal weight except recognizable
+   generated files, vendored/build output, and lockfiles, which count one tenth.
+   Among equal coverage, prefer owners below the optional load cap, then stronger
+   approval evidence, then lower load, then login for a stable tie. Load counts
+   open PRs assigned to the person in **this repository**, excluding their own
+   PRs. The repository-scoped app cannot reliably measure the whole organization.
+4. Confirm the chosen user can be assigned, then repeat only for uncovered files
+   up to `num_reviewers`. A second person must cover something new.
+
+If no rule and no credible historical evidence match, assign **one** member of
+`default_pool`, clearly identified as a low-confidence fallback. A matched rule
+whose entire roster is excluded does **not** fall back to unrelated people.
+Keep at least two people in each rule and fallback pool so authorship/exclusions
+leave an eligible owner. The PR author and `REVIEWER_EXCLUDE` are always removed,
+case-insensitively, tolerating a leading `@`.
+
+History is a bounded sample, not a complete ownership database. Huge historical
+PRs (300+ files) are ignored as weak routing evidence. Directory proximity is a
+heuristic, not proof of semantic expertise; maintain explicit rules for areas
+where that distinction matters. Older or less frequently reviewed areas may
+still use the configured fallback. Use the summary to improve those rules.
+
+If history fails, discard partial history and use the configured map. Failed or
+incomplete load queries remain **unknown**, never zero. An incomplete current
+file list skips routing. An unavailable assignability check skips that candidate.
+
+Existing non-author assignees or requested reviewers/teams suppress routing.
+The reusable serializes assignment per PR and rechecks live assignments, draft,
+closed/skip-label state, head SHA and base target immediately before writing. Manual changes
+made during the analysis are respected; a push during analysis skips the stale
+selection. There is still a small race with unrelated external writers after the
+last read because GitHub's assignment API has no conditional-write operation.
 
 **Globs are the durable part; names are not.** People change teams. Write bucket
 globs deliberately and expect the roster inside them to churn.
