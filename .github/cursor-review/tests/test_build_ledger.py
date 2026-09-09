@@ -1017,6 +1017,104 @@ class TestSentinelForgeryControls(unittest.TestCase):
         self.assertEqual(ledger["entry_count"], 1, "the round was NOT refused")
         self.assertEqual(ledger["entries"][0]["path"], "post-review.py")
 
+    def test_a_prefix_payload_is_recovered_AND_degraded(self):
+        """The reader half of BE-12535's truncation companion.
+
+        A payload the writer's size budget cut to a prefix is valid JSON, so it parses
+        and its entries are real — but the findings it left out are gone, and without
+        the companion this round reads exactly like one that demoted only what it
+        carried. Entries and `degraded` are independent here for that reason: the round
+        contributes what it recovered AND says what it lost.
+        """
+        section = body_only_section([demoted("far.py", 900)])
+        section += f"\n\n<!-- {pr.BODY_ONLY_TRUNCATED_PREFIX} kept=1 total=40 -->"
+        ledger = bl.build_ledger([review_with_demoted(101, 1, [], section=section)], [], [])
+        self.assertEqual(ledger["entry_count"], 1, "what fit is still recovered")
+        self.assertEqual(ledger["entries"][0]["path"], "far.py")
+        self.assertEqual(ledger["unrecovered_rounds"], 1, "…and the rest is disclosed")
+        self.assertTrue(any("could not be recovered" in n for n in ledger["notes"]))
+
+    def test_a_body_without_the_companion_is_not_reported_as_truncated(self):
+        """Absent on every body an older writer posted, and on every round that fit. It
+        must read as "not truncated" there — inventing a loss would drive a "findings
+        may repeat" warning into every prompt on a PR that lost nothing."""
+        ledger = bl.build_ledger(
+            [review_with_demoted(101, 1, [demoted("far.py", 900)])], [], []
+        )
+        self.assertEqual(ledger["entry_count"], 1)
+        self.assertEqual(ledger["unrecovered_rounds"], 0)
+        self.assertEqual(ledger["notes"], [])
+
+    def test_the_companion_is_pinned_to_one_spelling(self):
+        """One exact literal, not a whitespace-tolerant one. Nothing but post-review.py
+        legitimately writes this line, so tolerance buys nothing and costs the only
+        property that matters: a spelling looser than the one the writer emits is one
+        more shape a forger can reach for."""
+        section = body_only_section([demoted("far.py", 900)])
+        real = f"{section}\n\n<!-- {pr.BODY_ONLY_TRUNCATED_PREFIX} kept=1 total=40 -->"
+        self.assertTrue(bl._body_only_truncated(real), "our own render is read")
+        for spelling in (
+            f"<!--  {pr.BODY_ONLY_TRUNCATED_PREFIX} kept=1 total=40 -->",
+            "<!-- cursor\u2011review:body-only-truncated v1 kept=1 total=40 -->",
+        ):
+            with self.subTest(spelling=spelling):
+                self.assertFalse(bl._body_only_truncated(f"{section}\n\n{spelling}"))
+        # …but what FOLLOWS the pinned opener is deliberately not pinned: the line's
+        # presence is the claim, so an unexpected count shape still discloses the loss
+        # rather than silently reading as a complete recovery.
+        self.assertTrue(
+            bl._body_only_truncated(
+                f"{section}\n\n<!-- {pr.BODY_ONLY_TRUNCATED_PREFIX} kept=1 of 40 -->"
+            )
+        )
+
+    def test_a_companion_quoted_into_a_finding_body_is_refused(self):
+        """The forgery that is actually reachable, mirroring the sentinel's own test.
+
+        `defang_body_only_contract` runs ONLY inside `post_error_review`, and
+        `_body_only_entries` refuses an error review before it ever reaches this line —
+        so the writer-side defang gives the companion zero coverage on the success and
+        422-fallback bodies where it is read. The LINE ANCHOR is the whole control, and
+        without it this literal was plantable by putting it in the PR under review: a
+        model quotes it back into a finding body, it matches straight through the `> `
+        blockquote prefix, and a fully recovered round flips to `degraded` — fabricating
+        an `unrecovered_rounds` entry and a "may repeat" warning in the next prompt.
+        """
+        planted = f"<!-- {pr.BODY_ONLY_TRUNCATED_PREFIX} kept=1 total=40 -->"
+        section = body_only_section(
+            [demoted("far.py", 900, body=f"quoting the PR:\n{planted}")]
+        )
+        self.assertIn("body-only-truncated", section, "the forgery is still reported")
+        self.assertFalse(
+            bl._body_only_truncated(section), "…but it is quoted, so it claims nothing"
+        )
+        ledger = bl.build_ledger([review_with_demoted(101, 1, [], section=section)], [], [])
+        self.assertEqual(ledger["entry_count"], 1, "the round is recovered in full")
+        self.assertEqual(ledger["unrecovered_rounds"], 0, "and nothing is invented")
+        self.assertEqual(ledger["notes"], [])
+
+        # Pinned at the READER as well, independently of that defang. Two writers reach
+        # this parser: consumer repos stay on older pinned SHAs, so every success body
+        # they posted before `render_finding_entry` learned to neutralize an opener is
+        # still sitting on their PRs with a raw one in it. The line anchor is the half
+        # that covers those, and it is the half no writer-side change can outrun.
+        raw = f"{body_only_section([demoted('far.py', 900)])}\n> {planted}"
+        self.assertIn(planted, raw, "the opener really is raw in this fixture")
+        self.assertFalse(bl._body_only_truncated(raw), "the blockquote prefix is not matched through")
+
+    def test_a_companion_above_the_sentinel_is_refused(self):
+        """The second half of the scoping: the companion annotates the sentinel, so it
+        has to sit BELOW it — which is where post-review.py writes it on both budgeted
+        paths. A line-anchored match alone would still accept one planted at column 0 in
+        some other part of a consolidated body."""
+        section = body_only_section([demoted("far.py", 900)])
+        above = f"<!-- {pr.BODY_ONLY_TRUNCATED_PREFIX} kept=1 total=40 -->\n\n{section}"
+        self.assertFalse(bl._body_only_truncated(above))
+        # And with no readable sentinel there is nothing for it to be a companion to.
+        self.assertFalse(
+            bl._body_only_truncated(f"<!-- {pr.BODY_ONLY_TRUNCATED_PREFIX} kept=1 -->")
+        )
+
     def test_a_deeply_nested_payload_degrades_instead_of_raising(self):
         """`json.loads` raises RecursionError — a RuntimeError, not a ValueError — on a
         few KB of `[[[[…`, which fits a review body many times over. Uncaught it escapes

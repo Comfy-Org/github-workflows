@@ -191,6 +191,32 @@ _BODY_ONLY_SENTINEL_RE = re.compile(
     re.DOTALL | re.MULTILINE,
 )
 
+# post-review.py's companion to the line above, emitted only when a size budget cut the
+# payload down to a PREFIX of the round's demoted findings. Pinned to the same
+# single-spaced OPENER, so a spelling the writer's defang lets through cannot satisfy
+# this reader either. What follows the opener is NOT pinned, because nothing here reads
+# it: the presence of the line is the whole claim ("findings were dropped"), and pinning
+# `kept=N total=N` would let a shape this reader did not expect turn a DISCLOSED loss
+# back into a silent one — the failure the companion exists to remove. The counts are
+# for a human reading the raw body.
+#
+# Anchored to a LINE START for the same reason the sentinel is, and it is the sentinel's
+# containment argument — not the writer-side defang — that carries the weight here.
+# `defang_body_only_contract` runs only inside `post_error_review`, and `_body_only_entries`
+# refuses an error review before it ever reaches this pattern, so the defang gives this
+# line ZERO coverage on the success and 422-fallback bodies where the companion is
+# actually read. The line anchor is what does: a demoted finding's prose renders as a
+# blockquote, so a `<!-- cursor-review:body-only-truncated v1 ... -->` quoted into a
+# finding body sits behind a `> ` and can never be the match. Unanchored — with a bare
+# `search` over the whole body — that literal was plantable from the PR under review and
+# flipped a FULLY RECOVERED round to `degraded`, fabricating an `unrecovered_rounds`
+# entry and a "could not be recovered" note in the next round's prompt.
+BODY_ONLY_TRUNCATED_OPENER = "<!-- cursor-review:body-only-truncated v1 "
+_BODY_ONLY_TRUNCATED_RE = re.compile(
+    r"(?:\A|(?<=" + _LINE_SEP_CLASS + r"))"
+    + re.escape(BODY_ONLY_TRUNCATED_OPENER) + _NOT_LINE_SEP_CLASS + r"*?-->"
+)
+
 # post_error_review's shape, as its own f-string renders it. See _body_only_entries:
 # this is the one consolidated body whose imported text sits at column 0, and the
 # writer-side defang that protects it only exists in bodies written by THIS version.
@@ -452,6 +478,31 @@ def _body_only_text(value) -> str:
     return _FIELD_LINE_BREAK_RE.sub(" ", str(value or ""))
 
 
+def _body_only_truncated(body: str) -> bool:
+    """Whether the round's sentinel says it carries only a PREFIX of its findings.
+
+    Scoped the two ways the sentinel itself is scoped, because a false POSITIVE here is
+    not cosmetic: it fabricates an `unrecovered_rounds` entry and a "could not be
+    recovered — they may repeat" note in the next round's prompt off a round that lost
+    nothing.
+
+    1. The companion must begin its LINE (see `_BODY_ONLY_TRUNCATED_RE`), which is what
+       keeps a blockquoted copy quoted out of a finding body from matching.
+    2. It must sit BELOW the sentinel it annotates. That is where post-review.py writes
+       it on BOTH budgeted paths — the success section and the 422 fallback — and it
+       narrows the line anchor further: a body with no readable sentinel has nothing for
+       this line to be a companion TO, and such a round is already degraded by the
+       missing sentinel rather than by this.
+
+    Searching from `sentinel.end()` rather than slicing, so the pattern's line-start
+    lookbehind still sees the `\n` that precedes the companion.
+    """
+    sentinel = _BODY_ONLY_SENTINEL_RE.search(body or "")
+    if sentinel is None:
+        return False
+    return bool(_BODY_ONLY_TRUNCATED_RE.search(body or "", sentinel.end()))
+
+
 def _resolve_lineage(url, by_id: dict, replies_by_root: dict, round_by_review: dict,
                      pr_author=None):
     """Resolve a sentinel `repeat_of` to the ANCESTOR thread it names, or None.
@@ -561,8 +612,11 @@ def _resolve_lineage(url, by_id: dict, replies_by_root: dict, round_by_review: d
 def _body_only_entries(review: dict, meta: dict, max_body: int, resolve_lineage=None):
     """(entries, degraded) for one consolidated review's demoted findings.
 
-    ``degraded`` is True when the review says it demoted findings but the sentinel
-    could not be read — the caller discloses that as a truncation note.
+    ``degraded`` is True when the review says it demoted findings that are not in the
+    returned entries — because the sentinel could not be read at all, or because the
+    writer's size budget cut it to a prefix and said so. The caller discloses either as
+    a truncation note. Entries and ``degraded`` are INDEPENDENT: a prefix payload
+    returns both real entries and True.
 
     An ERROR review is refused outright, before either half is looked at. It is the one
     consolidated body that renders unbounded judge/CLI text in a FENCE rather than a
@@ -585,6 +639,15 @@ def _body_only_entries(review: dict, meta: dict, max_body: int, resolve_lineage=
     parsed = _parse_body_only_sentinel(review.get("body") or "")
     if parsed is None:
         return [], BODY_ONLY_PROSE_MARKER in (review.get("body") or "")
+    # A sentinel the writer's size budget cut down to a PREFIX parses perfectly — it is
+    # valid JSON, just not all of it — so the entries recovered below are real AND the
+    # round is degraded at the same time. Without this the omitted findings vanish with
+    # no `unrecovered_rounds` entry and no note, which is strictly worse than the
+    # all-or-nothing rule the budget replaced: THAT one degraded loudly, because a
+    # dropped sentinel does not parse. Absent on a body an older writer posted, which
+    # reads as "not truncated" — the same answer that writer's all-or-nothing payload
+    # actually warranted.
+    truncated = _body_only_truncated(review.get("body") or "")
     entries = []
     for item in parsed:
         entry = {
@@ -648,7 +711,7 @@ def _body_only_entries(review: dict, meta: dict, max_body: int, resolve_lineage=
             # asserting it would let a forged, unresolvable URL spend a repeat slot.
             entry["repeat_unresolved"] = True
         entries.append(entry)
-    return entries, False
+    return entries, truncated
 
 
 def _resolve_root_id(comment: dict, by_id: dict):

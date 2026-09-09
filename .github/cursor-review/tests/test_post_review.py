@@ -74,6 +74,22 @@ def ledger_from_posted_body(body):
     return BL.build_ledger([review], [], [])
 
 
+def sentinel_payload(body):
+    """The findings the body's body-only sentinel actually carries.
+
+    Read off the POSTed line rather than through build_ledger, which re-sorts its
+    entries: the prefix the writer chose only survives here.
+    """
+    lines = [
+        ln for ln in body.splitlines()
+        if ln.startswith(f"<!-- {PR.BODY_ONLY_SENTINEL_PREFIX} ")
+    ]
+    assert len(lines) == 1, f"expected exactly one sentinel line, got {len(lines)}"
+    return json.loads(
+        lines[0][len("<!-- ") + len(PR.BODY_ONLY_SENTINEL_PREFIX) : -len(" -->")]
+    )
+
+
 def visible(body):
     """`body` with the sentinel comment line removed.
 
@@ -85,6 +101,7 @@ def visible(body):
         ln
         for ln in body.splitlines()
         if not ln.startswith(f"<!-- {PR.BODY_ONLY_SENTINEL_PREFIX} ")
+        and not ln.startswith(f"<!-- {PR.BODY_ONLY_TRUNCATED_PREFIX} ")
     )
 
 # Two files, so a per-file anchor set has something to be wrong about. `app.py` has two
@@ -736,6 +753,284 @@ class BodyBudgetTest(unittest.TestCase):
                 # …and the round still reaches the ledger, partially rather than not.
                 self.assertGreater(ledger_from_posted_body(body)["entry_count"], 20)
 
+    def test_the_success_path_s_sentinel_never_displaces_the_findings_a_reader_can_see(self):
+        """The same prose floor, on the path that posts SUCCESSFULLY (BE-12535).
+
+        The 422 fallback got this guard first; the success path's demoted-findings
+        section kept the all-or-nothing rule and inherited the identical cliff.
+        Measured before this fix, with one anchorable finding plus n demoted ones of
+        ~700 chars: n=60 posted 60,000 characters carrying 45 ledger entries but only
+        27 visible findings, n=90 posted the same 60,000 characters with ONE visible
+        finding, and at n=91 the sentinel finally overran the whole body — the clamp cut
+        inside its JSON, `drop_unterminated_comment` rewound to the opener and took
+        every finding with it, and the round posted a 420-character header with zero
+        ledger entries and zero visible findings. The rounds with the most to report
+        showed the least, and the largest of them showed nothing at all.
+
+        Reachable only through the judge-failed raw-panel branch of cursor-review.yml,
+        which unions every cell's findings with no count cap; the judge-ok branch caps
+        at 10. That makes it the branch that runs when the review is already degraded.
+        """
+        for n in (60, 90, 91, 100, 130):
+            with self.subTest(findings=n):
+                findings = [finding("app.py", 11, body="anchorable " + "z" * 700)]
+                findings += [
+                    finding("app.py", 900 + i, body=f"demoted {i} " + "z" * 700)
+                    for i in range(n)
+                ]
+                # The success path posts once: `posted[0]`, not the fallback's `[1]`.
+                body = EndToEndPostTest().run_main(findings)[0]["body"]
+                self.assertIn(PROSE_MARKER, body)
+                self.assertLessEqual(len(body), PR.MAX_REVIEW_BODY_CHARS)
+                # The half the sentinel may never take.
+                self.assertGreaterEqual(
+                    len(visible(body)),
+                    PR.MAX_REVIEW_BODY_CHARS // 2 - len(PR.CLAMP_TRUNCATION_NOTE),
+                    "the prose floor holds",
+                )
+                self.assertGreater(
+                    visible(body).count("demoted "), 20, "and a reader sees findings"
+                )
+                self.assertGreater(
+                    ledger_from_posted_body(body)["entry_count"], 20,
+                    "…while the round still reaches next round's ledger",
+                )
+
+    def test_the_success_path_s_sentinel_is_never_posted_where_the_clamp_would_cut_it(self):
+        """The reserve half of the guard, on the success path (BE-12535).
+
+        `main()` subtracts CLAMP_TRUNCATION_NOTE, the measured head and the separator
+        before handing `render_body_only_findings` a budget, so the sentinel's closing
+        `-->` always sits ahead of the cut point. Without that reserve there is a window
+        `len(CLAMP_TRUNCATION_NOTE)` wide in which the sentinel fits the raw limit but
+        not the clamp's cut — posted, cut mid-JSON, rewound to its opener, taking the
+        prose below it. Swept across the boundary with a padded `path` (model output,
+        length-checked nowhere) rather than pinned to one fixture that lands in it.
+        """
+        for pad in range(0, 400, 80):
+            with self.subTest(path_padding=pad):
+                findings = [finding("app.py", 11, body="anchorable " + "z" * 700)]
+                findings += [
+                    finding("app.py", 900 + i, body=f"demoted {i} " + "z" * 700)
+                    for i in range(88)
+                ]
+                findings += [finding("p" * (pad + 1) + ".py", 8000, body="z" * 700)]
+                body = EndToEndPostTest().run_main(findings)[0]["body"]
+                self.assertIn(PROSE_MARKER, body, "the disclosure is never optional")
+                # Measured on the VISIBLE body: `len(body)` counts tens of thousands of
+                # characters of HTML comment that render as nothing, so it stays large
+                # on exactly the body that shows a reader no findings.
+                self.assertGreater(
+                    visible(body).count("demoted "), 20,
+                    "the review never collapses to a bare header — findings still render",
+                )
+                ledger = ledger_from_posted_body(body)
+                if PR.BODY_ONLY_SENTINEL_PREFIX in body:
+                    self.assertGreater(ledger["entry_count"], 0, "a posted sentinel parses")
+                else:
+                    self.assertEqual(ledger["unrecovered_rounds"], 1, "…or it degrades loudly")
+
+    def test_the_success_path_sentinel_keeps_the_most_urgent_prefix(self):
+        """A prefix, not a sample — the success path's half of
+        test_the_sentinel_keeps_the_most_urgent_findings_when_it_cannot_keep_all.
+
+        `enriched` is severity-sorted and `partition_by_anchor` preserves that order, so
+        the demoted findings the budget keeps are the ones next round most needs back,
+        in the same order as the prose below them. The critical is cited LAST in the
+        input so the assertion tests the severity sort rather than the input order.
+        """
+        findings = [
+            finding("app.py", 900 + i, severity="low", body=f"low {i} " + "z" * 700)
+            for i in range(99)
+        ]
+        findings += [finding("app.py", 999, severity="critical", body="C " + "z" * 700)]
+        body = EndToEndPostTest().run_main(findings)[0]["body"]
+        # Read the PAYLOAD, not the ledger: build_ledger re-sorts its entries, so the
+        # order the sentinel was WRITTEN in — the thing under test — only survives here.
+        payload = sentinel_payload(body)
+        self.assertGreater(len(payload), 0)
+        self.assertLess(len(payload), 100, "not all of them fit")
+        self.assertEqual(payload[0]["severity"], "critical", "the most urgent is kept")
+        # The kept set is the leading run of the severity-sorted order, not a scatter
+        # through it: the critical, then the lows in the order they were cited.
+        self.assertEqual(
+            [e["line"] for e in payload],
+            [999] + [900 + i for i in range(len(payload) - 1)],
+        )
+
+    def test_render_body_only_findings_without_a_budget_is_unchanged(self):
+        """`budget=None` is today's behaviour, byte-identical. Every non-`main()` reader
+        of this function gets what it always got, and the round-trip tests above keep
+        pinning the unbudgeted render."""
+        items = PR.normalize_comments(
+            [finding("app.py", 900 + i, body=f"demoted {i}") for i in range(12)]
+        )
+        self.assertEqual(
+            PR.render_body_only_findings(items),
+            PR.render_body_only_findings(items, budget=None),
+        )
+        rendered = PR.render_body_only_findings(items)
+        self.assertIn(
+            PR.render_body_only_sentinel(items), rendered,
+            "the unbudgeted sentinel carries every item",
+        )
+
+    def test_a_budget_nothing_fits_posts_the_marker_alone_on_the_success_path(self):
+        """The floor, on the success path: when not even the first finding's JSON fits,
+        the sentinel is dropped whole and the section carries what it carried before the
+        sentinel existed — the marker, which next round reads as a disclosed truncation
+        rather than as a round that found nothing. The PROSE is never what gets dropped.
+        """
+        marker = (
+            f"_The finding(s) below {PROSE_MARKER}, so they are reported here "
+            "instead of inline:_\n\n"
+        )
+        items = PR.normalize_comments(
+            [finding("app.py", 900 + i, body=f"demoted {i}") for i in range(12)]
+        )
+        rendered = PR.render_body_only_findings(items, budget=len(marker) + 10)
+        self.assertIn(PROSE_MARKER, rendered, "the disclosure survives")
+        self.assertNotIn(PR.BODY_ONLY_SENTINEL_PREFIX, rendered, "the sentinel does not")
+        for i in range(12):
+            self.assertIn(f"demoted {i}", rendered, "and every finding is still shown")
+
+    def test_a_truncated_sentinel_discloses_the_loss_to_the_next_round_s_ledger(self):
+        """A PREFIX payload is still valid JSON, so it must say it is a prefix (BE-12535).
+
+        The all-or-nothing rule this budget replaced was self-disclosing by accident:
+        a dropped sentinel does not parse, `_parse_body_only_sentinel` returns None, and
+        the round degraded LOUDLY as an `unrecovered_rounds` entry the next prompt calls
+        out. A budget-cut payload parses perfectly, so left unannotated it reads to the
+        next round as a COMPLETE recovery — the omitted findings vanish with no note at
+        all, and the only record is a line in a public run log. That is strictly worse
+        than what it replaced, on exactly the rounds with the most to report.
+        """
+        findings = [finding("app.py", 11, body="anchorable " + "z" * 700)]
+        findings += [
+            finding("app.py", 900 + i, body=f"demoted {i} " + "z" * 700)
+            for i in range(120)
+        ]
+        body = EndToEndPostTest().run_main(findings)[0]["body"]
+        payload = sentinel_payload(body)
+        self.assertLess(len(payload), 120, "the budget did cut the payload")
+        self.assertIn(
+            f"<!-- {PR.BODY_ONLY_TRUNCATED_PREFIX} kept={len(payload)} total=120 -->",
+            body,
+            "…and the cut is serialized, not left to the run log",
+        )
+        ledger = ledger_from_posted_body(body)
+        self.assertEqual(len(payload), ledger["entry_count"], "what fit is recovered")
+        self.assertEqual(
+            ledger["unrecovered_rounds"], 1, "…and what did not is disclosed"
+        )
+        self.assertTrue(
+            any("could not be recovered" in n for n in ledger["notes"]),
+            "the next round's prompt is told, in words",
+        )
+
+    def test_a_truncated_fallback_sentinel_discloses_the_loss_too(self):
+        """The same companion on the 422 path, where partial payloads came first.
+
+        The two paths share one reader: a disclosure the success path emits and the
+        fallback does not would make `unrecovered_rounds` mean different things
+        depending on which body a round happened to post.
+        """
+        findings = [
+            finding("app.py", 11 + (i % 3), body=f"lost {i} " + "z" * 700)
+            for i in range(120)
+        ]
+        body = EndToEndPostTest().run_main(
+            findings, post_returncode=1, stderr="gh: Unprocessable Entity (HTTP 422)"
+        )[1]["body"]
+        payload = sentinel_payload(body)
+        self.assertLess(len(payload), 120)
+        self.assertIn(
+            f"<!-- {PR.BODY_ONLY_TRUNCATED_PREFIX} kept={len(payload)} total=120 -->",
+            body,
+        )
+        self.assertEqual(ledger_from_posted_body(body)["unrecovered_rounds"], 1)
+
+    def test_a_whole_sentinel_never_claims_a_truncation(self):
+        """The companion is emitted ONLY on a real cut, so the note it drives into the
+        next round's prompt is never a false alarm — and a round that recovered
+        everything is never reported as one that lost findings."""
+        findings = [finding("app.py", 11)]
+        findings += [finding("app.py", 900 + i, body=f"demoted {i}") for i in range(6)]
+        body = EndToEndPostTest().run_main(findings)[0]["body"]
+        self.assertEqual(len(sentinel_payload(body)), 6, "all six fit")
+        self.assertNotIn(PR.BODY_ONLY_TRUNCATED_PREFIX, body)
+        ledger = ledger_from_posted_body(body)
+        self.assertEqual(ledger["entry_count"], 6)
+        self.assertEqual(ledger["unrecovered_rounds"], 0)
+
+    def test_the_prose_floor_holds_when_the_head_eats_the_ceiling(self):
+        """SENTINEL_MAX_CHARS alone is not the floor it reads as (BE-12535).
+
+        `min(SENTINEL_MAX_CHARS, available)` buys the half-the-body ceiling only while
+        the FIRST term wins. Once the review head grows past roughly half the limit —
+        and the head is built from caller-supplied `--notice`, `--ledger-note` and the
+        panel summary, so a consumer repo can reach that size without touching this
+        file — `available` is itself under the ceiling, the `min` stops binding, and the
+        sentinel is free to take every character left before the cut. That reproduces
+        the zero-visible-findings collapse the ceiling exists to prevent, on the rounds
+        where the head is already crowding the findings out.
+
+        Swept across the head size at which the second term takes over rather than
+        pinned to one point past it.
+        """
+        for head_share in (0.3, 0.5, 0.6, 0.75, 0.9):
+            with self.subTest(head_share=head_share):
+                pad = int(PR.MAX_REVIEW_BODY_CHARS * head_share)
+                findings = [finding("app.py", 11, body="anchorable " + "z" * 700)]
+                findings += [
+                    finding("app.py", 900 + i, body=f"demoted {i} " + "z" * 700)
+                    for i in range(60)
+                ]
+                body = EndToEndPostTest().run_main(
+                    findings,
+                    panel=[{"model": "m" * pad, "review_type": "adversarial",
+                            "status": "error"}],
+                )[0]["body"]
+                self.assertLessEqual(len(body), PR.MAX_REVIEW_BODY_CHARS)
+                self.assertIn(PROSE_MARKER, body, "the disclosure is never optional")
+                # The sentinel never takes more than half of what the head left.
+                sentinel = [
+                    ln for ln in body.splitlines()
+                    if ln.startswith(f"<!-- {PR.BODY_ONLY_SENTINEL_PREFIX} ")
+                ]
+                if sentinel:
+                    self.assertLess(
+                        len(sentinel[0]), len(visible(body)),
+                        "the machine copy never outweighs the review a human reads",
+                    )
+                self.assertGreater(
+                    visible(body).count("demoted "), 1,
+                    "and a reader always sees findings, never a bare header",
+                )
+
+    def test_a_section_that_fits_is_never_charged_the_ceiling(self):
+        """No clamp, no budget — the ceiling is size PRESSURE, not a quota (BE-12535).
+
+        `render_body_only_sentinel` escapes every `-` to six characters where the prose
+        below spends one, so a round on hyphen-rich paths can push the sentinel past
+        SENTINEL_MAX_CHARS while sentinel-plus-prose stays comfortably under the limit.
+        Charging the ceiling there drops findings out of the next round's ledger to make
+        room nobody needed. Driven through the function directly with a budget larger
+        than the whole section, which is what `main()` hands it on such a round.
+        """
+        items = PR.normalize_comments(
+            [finding("a-b-c-d-e-f-g-h.py", 900 + i, body="x") for i in range(400)]
+        )
+        whole = PR.render_body_only_sentinel(items)
+        self.assertGreater(
+            len(whole), PR.SENTINEL_MAX_CHARS,
+            "fixture check: the escaping alone pushes this past the ceiling",
+        )
+        rendered = PR.render_body_only_findings(items, budget=len(whole) * 4)
+        self.assertIn(whole, rendered, "every item is still recovered")
+        self.assertNotIn(PR.BODY_ONLY_TRUNCATED_PREFIX, rendered, "nothing was lost")
+
+
     def test_the_sentinel_keeps_the_most_urgent_findings_when_it_cannot_keep_all(self):
         """A prefix, not a sample: `enriched` is severity-sorted, so the findings the
         budget keeps are the ones next round most needs back — and they stay in the same
@@ -896,6 +1191,65 @@ class BodyBudgetTest(unittest.TestCase):
         body = visible(posted[1]["body"])
         self.assertEqual(body.count("anchored one"), 1)
         self.assertEqual(body.count("demoted one"), 1)
+
+
+    def test_a_section_inside_the_clamp_note_window_is_not_truncated(self):
+        """`budget` is the CUT POINT, not the limit (BE-12535).
+
+        The caller subtracts CLAMP_TRUNCATION_NOTE out of `budget` because that is where
+        clamp_review_body starts trimming ONCE IT HAS DECIDED TO TRIM. But it leaves any
+        body up to MAX_REVIEW_BODY_CHARS untouched and never reaches for its note at
+        all, so a section sitting in the ~140-char window between the two was truncated
+        and its round flagged degraded with no clamp behind it to justify the loss. The
+        422 fallback's own guard compares against the raw limit; so does this one now.
+        """
+        items = PR.normalize_comments(
+            [finding(f"p{n}.py", n, body="z" * 200) for n in range(20)]
+        )
+        whole = PR.render_body_only_findings(items)
+        budget = len(whole) - 1
+        self.assertLessEqual(
+            len(whole), budget + len(PR.CLAMP_TRUNCATION_NOTE),
+            "the section really is inside the window the clamp will not cut",
+        )
+        out = PR.render_body_only_findings(items, budget=budget)
+        self.assertEqual(out, whole, "so it is posted whole")
+        self.assertNotIn(
+            PR.BODY_ONLY_TRUNCATED_PREFIX, out, "and nothing is disclosed as lost"
+        )
+        # One character further in and the clamp DOES fire, so the budget binds again.
+        cut = PR.render_body_only_findings(
+            items, budget=len(whole) - len(PR.CLAMP_TRUNCATION_NOTE) - 1
+        )
+        self.assertNotEqual(cut, whole, "past the window the budget still applies")
+
+    def test_the_ceiling_is_not_charged_where_the_prose_wants_no_room(self):
+        """SENTINEL_MAX_CHARS bounds the FLOOR, not the leftover (BE-12535).
+
+        Capping the whole `max` charged the ceiling on rounds with no size pressure
+        behind it: a 44,000-char sentinel beside 17,000 chars of prose in ~59,000 of
+        space was handed 30,000 instead of the ~42,000 that fit — roughly a hundred
+        ledger entries dropped to reserve room the prose had no use for. The prose keeps
+        its guarantee from the `available // 2` floor alone.
+        """
+        self.assertEqual(
+            PR.sentinel_share(59_000, 17_000), 42_000, "it gets what the prose leaves"
+        )
+        self.assertEqual(
+            PR.sentinel_share(59_000, 66_000), 29_500, "…floored at half when it does not"
+        )
+        for share in (0.1, 0.3, 0.5, 0.75, 0.9):
+            avail = int(PR.MAX_REVIEW_BODY_CHARS * share)
+            for prose in (0, avail // 4, avail, avail * 3):
+                with self.subTest(share=share, prose=prose):
+                    got = PR.sentinel_share(avail, prose)
+                    self.assertGreaterEqual(
+                        avail - got, min(prose, avail // 2),
+                        "the prose gets what it wants, up to half, at every head size",
+                    )
+                    self.assertLessEqual(
+                        avail - got, prose, "and never more room than it asked for"
+                    )
 
 
 class FirstReviewConfirmationTest(unittest.TestCase):
@@ -1333,7 +1687,7 @@ class FitSentinelItemsTest(unittest.TestCase):
     def test_the_budget_reserves_the_clamp_note_when_the_head_dominates(self):
         """The other half of the size guard, and the half the prose floor hides.
 
-        `sentinel_budget` is `min(FALLBACK_SENTINEL_MAX_CHARS, limit - note - head - …)`.
+        `sentinel_budget` is `min(SENTINEL_MAX_CHARS, limit - note - head - …)`.
         On an ordinary round the first term wins and the reserve never binds, so it is
         pinned here on the input where the SECOND term wins: a panel summary — the one
         finding-independent part of the head a caller controls — large enough to make
@@ -1436,6 +1790,103 @@ class DanglingCommentClampTest(unittest.TestCase):
         clamped = PR.clamp_review_body(body, limit=len(body) // 3)
         self.assertNotIn(PR.BODY_ONLY_SENTINEL_PREFIX, clamped, "the sentinel is gone")
         self.assertIn(PROSE_MARKER, clamped, "but the disclosure is not")
+
+    def test_a_planted_comment_opener_is_neutralized_at_the_writer(self):
+        """A `<!--` in a finding body must never reach the posted review (BE-12535).
+
+        Round 1 of this change assumed the blockquote contained it — that `> ` indents
+        the opener out of CommonMark's HTML-block start condition. It does not:
+        cmark-gfm strips the `> ` marker BEFORE parsing the blockquote's contents, so
+        `> <!--` opens a type-2 HTML block exactly as a column-0 opener would, and the
+        raw `<!--` is passed straight through into the HTML. Ending the blockquote never
+        synthesizes a `-->`. Checked against GitHub's own /markdown render: one finding
+        carrying `<!--` at the start of a line erased every finding below it AND the
+        clamp's truncation note. Writing a `-->` back at column 0 does not undo it
+        either — that one is escaped to `--&gt;` and closes nothing.
+
+        So it dies at the writer, and the clamp's rewind never has to reason about it.
+        It is plantable exactly as you would expect: `<!--` on its own line in the PR
+        under review, quoted back into a finding body by a model doing its job.
+        """
+        hostile = PR.render_finding_entry(
+            {"path": "a.py", "line": 1, "body": "quoting the file:\n<!-- a comment"}
+        )
+        self.assertNotIn(PR.HTML_COMMENT_OPENER, hostile, "no opener survives the render")
+        self.assertIn(f"> {PR.DEFANGED_COMMENT_OPENER} a comment", hostile,
+                      "and what was quoted still reads as it arrived")
+
+        keep = [
+            PR.render_finding_entry({"path": "b.py", "line": n, "body": "z" * 200})
+            for n in range(8)
+        ]
+        body = "HEADER\n\n" + hostile + "\n\n" + "\n\n".join(keep)
+        clamped = PR.clamp_review_body(body, limit=len(body) - 50)
+        for n in range(7):
+            self.assertIn(f"b.py:{n}", clamped, "the findings below it survive the clamp")
+        self.assertIn("job summary", clamped, "and the clamp's own note still renders")
+
+    def test_an_opener_inside_a_fence_is_not_a_rewind_point(self):
+        """CommonMark renders a fenced block's contents literally, so a column-0 `<!--`
+        in there swallows nothing — confirmed against GitHub's render, where the prose
+        after the fence and the clamp note both come back intact. Treating it as an
+        opener is the same over-deletion, one container over: post_error_review puts
+        unbounded judge/CLI text in a column-0 fence, so the last such line in a long
+        error would have taken the whole tail of that text with it (BE-12535).
+        """
+        cut = "HEADER\n\n```\njudge said:\n<!-- not an opener in here\nmore output\n```\n\ntail prose"
+        self.assertEqual(PR.drop_unterminated_comment(cut), cut, "nothing is dropped")
+        # Still true when the cut left the fence itself open — everything after an
+        # unterminated fence renders as code, so the opener is inert there too.
+        open_fence = "HEADER\n\n```\njudge said:\n<!-- still inert"
+        self.assertEqual(PR.drop_unterminated_comment(open_fence), open_fence)
+        # …and a genuinely dangling opener OUTSIDE any fence is still removed.
+        real = "HEADER\n\n```\nfenced\n```\n\n<!-- cursor-review:body-only-findings v1 [{"
+        self.assertEqual(PR.drop_unterminated_comment(real), "HEADER\n\n```\nfenced\n```")
+
+    def test_a_tilde_fence_closes_only_on_its_own_marker(self):
+        """A ``` line inside a ~~~ fence is content, not a close. Reading it as one
+        would put the scanner back "outside" a fence it is still in, and hand the rewind
+        an inert opener as its target."""
+        cut = "~~~\n```\n<!-- inert\n~~~\n\ntail"
+        self.assertEqual(PR.drop_unterminated_comment(cut), cut)
+
+    def test_the_rewind_goes_to_the_first_dangling_opener_not_the_last(self):
+        """An HTML block runs from its opener to the FIRST `-->`, so once one is left
+        dangling every byte after it — including any later `<!--` — is already inside
+        that comment. Rewinding to the last one therefore deleted a little text and left
+        the earlier, real opener standing and swallowing the tail, which is the failure
+        this function exists to prevent (BE-12535)."""
+        cut = "HEADER\n\n<!-- cursor-review:body-only-findings v1 [{\n\n<!-- a later one"
+        self.assertEqual(PR.drop_unterminated_comment(cut), "HEADER")
+        # A TERMINATED opener above a dangling one is not the rewind point, though.
+        mixed = "HEADER\n\n<!-- closed -->\n\n<!-- cursor-review:body-only-findings v1 [{"
+        self.assertEqual(
+            PR.drop_unterminated_comment(mixed), "HEADER\n\n<!-- closed -->"
+        )
+
+    def test_a_blockquoted_opener_below_a_dangling_one_does_not_misdirect_the_rewind(self):
+        """The other half of the scoping, as a contract test on the function.
+
+        An unscoped `rfind` took the LAST `<!--` anywhere in the cut, so ANY later
+        non-opening `<!--` sent the rewind to the wrong place: it deleted a little prose
+        and left standing the opener that actually swallows the rest of the body — the
+        one failure this function exists to prevent. Today's writers never emit that
+        order (the sentinel is the last block-level comment in every body they build),
+        which is why this drives `drop_unterminated_comment` directly rather than a
+        posted body: the contract has to hold for the next path that adds a comment too.
+
+        The decoy is written at column 0 rather than taken from render_finding_entry,
+        which now defangs the opener out of model prose before it can be one.
+        """
+        quoted = "> **`a.py:1`** — quoting:\n> <!-- harmless"
+        cut = "HEADER\n\n<!-- cursor-review:body-only-findings v1 [{\n\n" + quoted
+        kept = PR.drop_unterminated_comment(cut)
+        self.assertNotIn(
+            "cursor-review:body-only-findings", kept, "the dangling opener is gone"
+        )
+        self.assertNotIn("<!-- harmless", kept, "…and it was the rewind point, not this")
+        self.assertEqual(kept, "HEADER")
+
 
 
 class FallbackSuffixTest(unittest.TestCase):
@@ -2592,7 +3043,14 @@ class BodyOnlySentinelTest(unittest.TestCase):
         ]
         self.assertEqual(len(at_column_zero), 1, "only the real sentinel is unindented")
         self.assertIn("evil.py", md, "the forgery is still reported — just quoted")
-        self.assertIn(f"> {forged[:20]}", md, "and it is inside the blockquote")
+        # Blockquoted AND opener-defanged. The blockquote is what stops the forgery
+        # satisfying build-ledger.py's line-anchored match; the defang is what stops the
+        # same line opening an HTML block that swallows the findings below it, which the
+        # `> ` prefix does NOT prevent (see HTML_COMMENT_OPENER).
+        quoted = forged.replace(PR.HTML_COMMENT_OPENER, PR.DEFANGED_COMMENT_OPENER)
+        self.assertIn(f"> {quoted}", md, "and it is inside the blockquote, defanged")
+        self.assertNotIn(PR.HTML_COMMENT_OPENER, md.split("\n\n", 2)[2],
+                         "no raw opener survives into the prose at all")
 
     def test_the_lost_to_fallback_key_is_emitted_only_for_a_tagged_item(self):
         """The success path's payload must stay byte-identical to what it was before

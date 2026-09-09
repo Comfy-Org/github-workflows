@@ -105,6 +105,19 @@ REPEAT_URL_MAX_CHARS = 512
 # lets the reader reject a payload it does not understand instead of guessing.
 BODY_ONLY_SENTINEL_PREFIX = "cursor-review:body-only-findings v1"
 
+# The sentinel's companion, emitted ONLY when a size budget cut the payload down to a
+# PREFIX of the round's demoted findings. A truncated payload is still VALID JSON, so
+# without this line build-ledger.py reads 12-of-89 as a complete recovery: the other 77
+# vanish with no `unrecovered_rounds` entry and no note, and the only record is a line
+# in a public run log nobody reads. The all-or-nothing rule this budget replaced was
+# self-disclosing by accident — a dropped sentinel does not parse, so the round degraded
+# LOUDLY — and a partial one has to say so on purpose. Deliberately a SECOND comment
+# rather than a key inside the payload: the reader pins the sentinel to a single-spaced
+# opener immediately below the prose marker (see build-ledger.py), so anything inserted
+# between them breaks the recovery it is meant to annotate, and a reader pinned to an
+# older SHA ignores an unknown trailing comment instead of failing to parse the findings.
+BODY_ONLY_TRUNCATED_PREFIX = "cursor-review:body-only-truncated v1"
+
 # --- the blocking gate's delivery signal (BE-4691) -------------------------
 # `needs.post-review.result == 'success'` cannot stand in for "a review carrying
 # resolvable finding threads landed on the PR": this script exits 0 after a
@@ -209,18 +222,20 @@ CLAMP_TRUNCATION_NOTE = (
     "\n\n_…truncated here: the review body reached GitHub's size limit. As much "
     "of it as fits is in the job summary of this run._"
 )
-# The share of the fallback body the sentinel may take. It has TWO readers and the
-# HUMAN comes first: the prose findings are the review a person actually reads on the
-# PR, and the sentinel is a best-effort machine-readable copy for next round's ledger.
-# Uncapped, the sentinel wins that contest — its per-finding JSON is nearly as long as
-# the prose entry it duplicates, so it can consume the whole budget ahead of finding
-# one and leave the clamp nothing but the head to keep. Measured before this cap: 89
-# findings of ~700 chars posted 58,720 characters of JSON and rendered ZERO findings,
-# while the same round at 90 findings — one over the all-or-nothing guard, so the
-# sentinel was dropped whole — rendered 79 of them. The cliff ran the wrong way.
-# Half the budget is the prose FLOOR; the sentinel takes the most-urgent prefix of the
-# findings that fits the other half (see fit_sentinel_items).
-FALLBACK_SENTINEL_MAX_CHARS = MAX_REVIEW_BODY_CHARS // 2
+# The share of a finding-carrying body the sentinel may take, on BOTH such paths — the
+# success path's demoted-findings section (render_body_only_findings) and the wholesale
+# 422 fallback. It has TWO readers and the HUMAN comes first: the prose findings are the
+# review a person actually reads on the PR, and the sentinel is a best-effort
+# machine-readable copy for next round's ledger. Uncapped, the sentinel wins that
+# contest — its per-finding JSON is nearly as long as the prose entry it duplicates, so
+# it can consume the whole budget ahead of finding one and leave the clamp nothing but
+# the head to keep. Measured before this cap: 89 findings of ~700 chars posted 58,720
+# characters of JSON and rendered ZERO findings, while the same round at 90 findings —
+# one over the all-or-nothing guard, so the sentinel was dropped whole — rendered 79 of
+# them. The cliff ran the wrong way. Half the budget is the prose FLOOR; the sentinel
+# takes the most-urgent prefix of the findings that fits the other half (see
+# fit_sentinel_items).
+SENTINEL_MAX_CHARS = MAX_REVIEW_BODY_CHARS // 2
 
 
 def normalize_severity(value) -> str:
@@ -1069,6 +1084,65 @@ def load_anchors(diff_path):
     return anchors
 
 
+# CommonMark's start condition for an HTML block opened by `<!--`: the opener begins
+# the line, after at most three spaces of indentation. `\r` alone is a line ending to
+# cmark-gfm, so it counts here too — `re.MULTILINE`'s `^` would not.
+BLOCK_COMMENT_OPENER_RE = re.compile(r"\A {0,3}(<!--)")
+# A fenced code block's opening and closing lines. The opener may carry an info string;
+# the closer may not, and must be at least as long a run of the SAME character.
+FENCE_OPEN_RE = re.compile(r"\A {0,3}(`{3,}|~{3,})")
+FENCE_CLOSE_RE = re.compile(r"\A {0,3}(`{3,}|~{3,})[ \t]*\Z")
+
+
+def md_lines(text: str):
+    """`(offset, line)` for every CommonMark line in `text`, terminators excluded.
+
+    Split on MD_LINE_BREAK_RE rather than `str.splitlines()` — cmark-gfm's line endings
+    are exactly `\r\n`, `\r` and `\n`, while `splitlines()` also breaks on `\v`, `\f`
+    and `U+2028`, which would report a start-of-line where the renderer sees none.
+    Offsets are carried explicitly because `\r\n` and `\n` are different lengths.
+    """
+    start = 0
+    for m in MD_LINE_BREAK_RE.finditer(text):
+        yield start, text[start:m.start()]
+        start = m.end()
+    yield start, text[start:]
+
+
+def html_block_openers(text: str) -> list:
+    """Offsets of every `<!--` in `text` that can open an HTML block, outermost first.
+
+    An opener that sits inside a FENCED CODE BLOCK is skipped: CommonMark renders the
+    fence's contents literally, so a column-0 `<!--` in there swallows nothing (verified
+    against GitHub's own render — prose after the fence, and the clamp's note, come back
+    intact). That exclusion is load-bearing on the ERROR-review path, the one body that
+    renders unbounded judge/CLI text at column 0 inside a fence: without it the last
+    such line reads as a dangling opener and drop_unterminated_comment deletes the whole
+    tail of the error text to contain damage that never existed.
+
+    A fence the cut itself left OPEN is not closed here. Closing it would mean appending
+    characters, and clamp_review_body has already spent its slack reserving
+    CLAMP_TRUNCATION_NOTE — anything added past that cut point pushes the body back over
+    GitHub's limit and buys a 422. The note still RENDERS in that case, as a last line of
+    code rather than as prose: ugly, but visible, which is the property this file defends.
+    """
+    openers, fence = [], None
+    for start, line in md_lines(text):
+        if fence is None:
+            opening = FENCE_OPEN_RE.match(line)
+            if opening:
+                fence = opening.group(1)
+                continue
+            comment = BLOCK_COMMENT_OPENER_RE.match(line)
+            if comment:
+                openers.append(start + comment.start(1))
+            continue
+        closing = FENCE_CLOSE_RE.match(line)
+        if closing and closing.group(1)[0] == fence[0] and len(closing.group(1)) >= len(fence):
+            fence = None
+    return openers
+
+
 def drop_unterminated_comment(cut: str) -> str:
     """Remove a trailing `<!--` the size clamp left with no `-->` to close it.
 
@@ -1078,21 +1152,40 @@ def drop_unterminated_comment(cut: str) -> str:
     clamp_review_body's own "as much of it as fits is in the job summary" note. The
     review then renders as a header with no visible findings and no explanation of why.
 
-    Fixed HERE rather than by giving the sentinel a byte budget at render time, because
-    a budget cannot actually promise this: whether the sentinel survives depends on how
-    much body precedes it, which render_body_only_findings does not know. The clamp is
-    the one place that knows where the cut lands, and closing it here covers every HTML
-    comment in every posted body rather than the one we happen to be thinking about.
+    The BUDGET is the primary guard, and both finding-carrying paths now compute one in
+    main() from the head they just measured — the success path's demoted-findings
+    section and the wholesale 422 fallback alike — so on either of them the sentinel is
+    posted whole, or as its most-urgent prefix, or not at all, and never where the cut
+    lands. This function is the BACKSTOP behind that arithmetic: it is the one place
+    that knows where the cut actually landed, so it covers any HTML comment in any
+    posted body — a head measured wrong, a comment some future path adds — rather than
+    the one we happen to be thinking about.
 
     Dropping the fragment is safe on its own terms: the section's prose marker sits
     ABOVE the sentinel, so a cut deep enough to reach it still leaves build-ledger.py
     the evidence that findings WERE demoted, and that round degrades loudly instead of
     reading as a round that found nothing.
+
+    Two things keep the rewind from costing more than the fragment. Model-supplied prose
+    can no longer carry an opener at all: render_finding_entry neutralizes `<!--` at the
+    writer (see DEFANGED_COMMENT_OPENER), which removes the plantable
+    `<!--`-on-its-own-line in the PR under review — both as a swallow and as bait for a
+    rewind that would delete every finding between it and the cut. And openers inside a
+    fence are excluded by html_block_openers, which covers the error path's imported
+    text. What is left is the sentinel, its truncation companion, and whatever future
+    path emits a column-0 comment of its own.
+
+    The rewind goes to the FIRST unterminated opener, not the last. An HTML block runs
+    from its opener to the first `-->`, so once one is left dangling every byte after it
+    is already inside that comment — including any later `<!--`, which is then not an
+    opener at all. Rewinding to the LAST one left the earlier, real one standing and
+    swallowing the tail: the failure this function exists to prevent, reached by exactly
+    the misdirection the fence and blockquote scoping fix in their own containers.
     """
-    opener = cut.rfind("<!--")
-    if opener == -1 or "-->" in cut[opener:]:
-        return cut
-    return cut[:opener].rstrip()
+    for offset in html_block_openers(cut):
+        if cut.find("-->", offset) == -1:
+            return cut[:offset].rstrip()
+    return cut
 
 
 def clamp_review_body(body: str, limit: int = MAX_REVIEW_BODY_CHARS) -> str:
@@ -1139,6 +1232,23 @@ def render_code_ref(path, line) -> str:
     return f"{fence}{pad}{text}{pad}{fence}"
 
 
+# The one construct a blockquote does NOT contain. cmark-gfm strips the `> ` marker
+# before parsing a blockquote's contents, so `> <!--` opens a type-2 HTML block exactly
+# as a column-0 opener would, and the raw `<!--` is passed through verbatim into the
+# HTML — ending the blockquote never synthesizes a `-->`. Measured against GitHub's own
+# /markdown render: one finding carrying `<!--` at the start of a line erased every
+# finding below it AND clamp_review_body's truncation note. Writing a `-->` back at
+# column 0 does not undo it, because that one is markdown-escaped to `--&gt;` and closes
+# nothing — the opener has to die at the WRITER.
+#
+# A zero-width space defeats CommonMark's start condition while the text still reads
+# exactly as it arrived, the same trick and the same house style as
+# defang_body_only_contract. Applied to EVERY `<!--`, not just a line-leading one: which
+# column a substring lands in depends on the wrapping around it, and the escape is free.
+HTML_COMMENT_OPENER = "<!--"
+DEFANGED_COMMENT_OPENER = "<\u200b!--"
+
+
 def render_finding_entry(c: dict) -> str:
     """One finding, as a blockquote its own markdown cannot break out of.
 
@@ -1149,8 +1259,13 @@ def render_finding_entry(c: dict) -> str:
     that from a rare fallback render into a per-run one. Inside a blockquote the
     damage is confined: the block ends at the blank line before the next finding, so
     an unclosed fence closes with it.
+
+    An unterminated HTML COMMENT is the exception — the blockquote does not contain
+    that one, and it is plantable by putting `<!--` on its own line in the PR under
+    review. See HTML_COMMENT_OPENER; it is neutralized here rather than contained.
     """
     text = f"**{render_code_ref(c['path'], c['line'])}** — {c['body']}"
+    text = text.replace(HTML_COMMENT_OPENER, DEFANGED_COMMENT_OPENER)
     # MD_LINE_BREAK_RE, not split("\n"): CommonMark (and GitHub's cmark-gfm) ends a
     # line on a bare \r too, and nothing upstream strips control characters —
     # review-output-mcp.py's validate_finding checks only type/non-empty/length, and
@@ -1201,6 +1316,11 @@ def defang_body_only_contract(text: str) -> str:
     ).replace(
         BODY_ONLY_PROSE_MARKER,
         BODY_ONLY_PROSE_MARKER.replace(" ", "\u200b ", 1),
+    ).replace(
+        # The truncation companion, for the same reason: forged, it fabricates a
+        # "findings were lost" note in the next round's prompt off text we quoted.
+        BODY_ONLY_TRUNCATED_PREFIX,
+        BODY_ONLY_TRUNCATED_PREFIX.replace(":", ":\u200b", 1),
     )
 
 
@@ -1342,6 +1462,16 @@ def render_body_only_sentinel(items: list) -> str:
     return f"<!-- {BODY_ONLY_SENTINEL_PREFIX} {escaped} -->"
 
 
+def render_body_only_truncation(kept: int, total: int) -> str:
+    """Disclose, machine-readably, that the sentinel above carries only `kept` of `total`.
+
+    Counts rather than a bare flag, so the next round's prompt can say how much it lost
+    rather than only that it lost something. Both are plain integers from `len()`, so
+    nothing model-supplied reaches this line and it needs no escaping of its own.
+    """
+    return f"<!-- {BODY_ONLY_TRUNCATED_PREFIX} kept={kept} total={total} -->"
+
+
 def fit_sentinel_items(items: list, budget: int) -> list:
     """The longest leading run of `items` whose rendered sentinel fits `budget` chars.
 
@@ -1376,31 +1506,128 @@ def fit_sentinel_items(items: list, budget: int) -> list:
     return items[:lo]
 
 
-def render_body_only_findings(items: list) -> str:
-    """Render findings that could not be anchored, for inclusion in the review body."""
+def sentinel_share(available: int, prose_len: int) -> int:
+    """How much of `available` pre-cut space the sentinel may take, given its prose.
+
+    Two terms, and the SMALLER wins:
+
+    * `SENTINEL_MAX_CHARS`, half the whole body — the ceiling.
+    * what the prose does not need, floored at half of `available`.
+
+    That second term is what makes the ceiling hold at EVERY head size. Passing
+    `available` straight into `min(SENTINEL_MAX_CHARS, available)` buys the ceiling only
+    while the first term wins: once the head grows past roughly half the limit,
+    `available` is itself under the ceiling, the `min` stops binding, and the sentinel is
+    free to take all of the space that is left — reproducing on a big-head round the
+    zero-visible-findings collapse the ceiling exists to prevent. Both heads are
+    caller-shaped (`--notice`, `--ledger-note`, the panel summary), so that is a size a
+    consumer repo can reach without touching this file.
+
+    `available - prose_len` BEFORE the floor, so a round whose prose is small is not
+    charged a floor it does not need: the sentinel may use whatever the prose leaves,
+    and the split only becomes one-half-each when the prose wants more than half.
+
+    The ceiling bounds the FLOOR — the room the sentinel takes over the prose's
+    objection — and NOT the leftover the prose never wanted. Capping the whole `max`
+    charged the ceiling on rounds with no size pressure behind it: a 44,000-char
+    sentinel beside 17,000 chars of prose in ~59,000 of space was handed 30,000 instead
+    of the ~42,000 that fit, dropping roughly a hundred ledger entries to reserve space
+    the prose had no use for. The prose keeps its guarantee either way, because the
+    `available // 2` floor already delivers it: the prose gets
+    `min(prose_len, available // 2)` at every head size, which is "everything it wants,
+    up to half" — exactly what SENTINEL_MAX_CHARS was introduced to promise.
+    """
+    return max(available - prose_len, min(SENTINEL_MAX_CHARS, available // 2))
+
+
+def render_body_only_findings(items: list, budget: int | None = None) -> str:
+    """Render findings that could not be anchored, for inclusion in the review body.
+
+    `budget` is the number of characters this whole section may occupy before the
+    clamp's cut point — i.e. what is left of MAX_REVIEW_BODY_CHARS once the clamp's own
+    note, the review head above this section, and the separator between them are
+    subtracted. The caller computes it because the caller is the only one that has
+    measured the head; documenting it here keeps that arithmetic explained in one
+    place. `None` means "unbudgeted": the sentinel carries every item, which is what
+    every non-`main()` caller (and every round small enough for it not to matter) wants.
+
+    Order is load-bearing, and it is marker → sentinel → prose.
+
+    clamp_review_body cuts the TAIL, so the machine-readable copy sits as near the
+    head of the section as it can and stays recoverable for as long as any of the
+    section survives. But it cannot be first: a clamp landing INSIDE the JSON takes
+    the closing `-->` with it, and with the marker below that it took the evidence
+    too — build-ledger.py saw neither a parseable sentinel nor the marker, and a
+    fully-demoted round read as a review that found nothing. That is the one cut that
+    actually happens, and it was the silent one.
+
+    One short line above the sentinel costs ~140 chars of recoverability and makes
+    every such cut LOUD. It is also the sentinel's required predecessor on the read
+    side, which is what scopes build-ledger.py's search to this section.
+
+    The prose renders ALL `items` whatever the budget does to the sentinel: the budget
+    governs which findings the LEDGER recovers, never which ones a reader is shown.
+    Prose that overruns is handled by the tail clamp, as it always was.
+
+    A section that FITS pays no budget at all — the clamp will not cut it, so there is
+    no size pressure to justify dropping a ledger entry. That is not a theoretical case:
+    render_body_only_sentinel escapes every `-` to six characters where the prose below
+    spends one, so a round on hyphen-rich paths can push the sentinel past
+    SENTINEL_MAX_CHARS while sentinel-plus-prose stays well under the limit. Charging
+    the ceiling there would drop findings out of the ledger to make room nobody needed.
+
+    "Fits" is measured against the RAW limit, which is `budget` plus the clamp note the
+    caller subtracted out of it. `budget` is the cut POINT — where the clamp starts
+    trimming once it has decided to trim — but clamp_review_body leaves any body up to
+    MAX_REVIEW_BODY_CHARS untouched and never reaches for its note at all. Testing
+    `len(whole) <= budget` therefore truncated and degraded a section sitting in the
+    ~140-char window between the two, with no clamp behind it to justify the loss. The
+    422 fallback's own guard compares against MAX_REVIEW_BODY_CHARS for this reason;
+    this is the same comparison, expressed in what this function was handed.
+    """
     if not items:
         return ""
-    # Order is load-bearing, and it is marker → sentinel → prose.
-    #
-    # clamp_review_body cuts the TAIL, so the machine-readable copy sits as near the
-    # head of the section as it can and stays recoverable for as long as any of the
-    # section survives. But it cannot be first: a clamp landing INSIDE the JSON takes
-    # the closing `-->` with it, and with the marker below that it took the evidence
-    # too — build-ledger.py saw neither a parseable sentinel nor the marker, and a
-    # fully-demoted round read as a review that found nothing. That is the one cut that
-    # actually happens, and it was the silent one.
-    #
-    # One short line above the sentinel costs ~140 chars of recoverability and makes
-    # every such cut LOUD. It is also the sentinel's required predecessor on the read
-    # side, which is what scopes build-ledger.py's search to this section.
-    md = (
+    marker = (
         f"_The finding(s) below {BODY_ONLY_PROSE_MARKER}, so they are reported here "
         "instead of inline:_\n\n"
-        f"{render_body_only_sentinel(items)}\n\n"
     )
-    for item in items:
-        md += render_finding_entry(item["comment"]) + "\n\n"
-    return md.rstrip("\n")
+    prose = "".join(render_finding_entry(item["comment"]) + "\n\n" for item in items)
+    whole = f"{marker}{render_body_only_sentinel(items)}\n\n{prose}"
+    if budget is None or len(whole) <= budget + len(CLAMP_TRUNCATION_NOTE):
+        return whole.rstrip("\n")
+    # Room for the truncation companion, measured at its longest: `kept` is strictly
+    # less than `total` here, so it can never carry more digits than `total` does.
+    notice_reserve = (
+        len(render_body_only_truncation(len(items), len(items))) + len("\n\n")
+    )
+    available = budget - len(marker) - len("\n\n") - notice_reserve
+    kept = fit_sentinel_items(items, sentinel_share(available, len(prose)))
+    if kept:
+        md = f"{marker}{render_body_only_sentinel(kept)}\n\n"
+        if len(kept) < len(items):
+            # The loss, serialized. A prefix payload is still valid JSON, so without
+            # this line next round's ledger reads it as a complete recovery.
+            md += f"{render_body_only_truncation(len(kept), len(items))}\n\n"
+            print(
+                f"Review: the body-only sentinel carries the {len(kept)} most urgent of "
+                f"{len(items)} demoted finding(s) — the rest would have displaced the "
+                "findings a reader can see.",
+                file=sys.stderr,
+            )
+    else:
+        # Nothing fits: emit exactly what this section carried before the sentinel
+        # existed. The marker still discloses that findings WERE demoted, so next
+        # round's ledger reads a truncation rather than a round that found nothing —
+        # no companion needed, because a missing sentinel does not parse and is
+        # already the loud case.
+        print(
+            "Review: no part of the body-only sentinel fits under the size limit — "
+            "posting the marker alone, so next round's ledger discloses the loss "
+            "instead of recovering the findings.",
+            file=sys.stderr,
+        )
+        md = marker
+    return f"{md}{prose}".rstrip("\n")
 
 
 def render_findings_markdown(review_body: str, comments: list[dict]) -> str:
@@ -1811,7 +2038,21 @@ def main():
         review_head += "\n\n_(All findings had invalid file/line references and were dropped.)_"
 
     review_body = review_head
-    body_only_md = render_body_only_findings(body_only_items)
+    # The section's size guard, computed HERE because `review_head` is the only thing
+    # that decides where the clamp lands and this is the only place it has been
+    # measured. What the section may occupy before the cut point: the limit, less the
+    # clamp's own note (the clamp cuts at `limit - len(note)`), less the head above it,
+    # less the separator between them. `review_body` ends up as
+    # `review_head + FINDINGS_SEPARATOR + marker + sentinel + "\n\n" + prose`, so with
+    # this budget the sentinel's closing `-->` always sits before the cut: it is emitted
+    # whole, or as its most-urgent prefix, or not at all — never where the clamp cuts.
+    body_only_md = render_body_only_findings(
+        body_only_items,
+        budget=MAX_REVIEW_BODY_CHARS
+        - len(CLAMP_TRUNCATION_NOTE)
+        - len(review_head)
+        - len(FINDINGS_SEPARATOR),
+    )
     if body_only_md:
         # A demoted finding still carries no THREAD — there is no place to answer or
         # resolve it — but since BE-9565 it does reach the next round's ledger: the
@@ -2041,20 +2282,49 @@ def main():
     # ~120-char window (measured: 89 findings, one long path) in which the review
     # collapsed from 60,000 characters of findings to a 494-character header. The
     # sentinel is posted whole or not at all; it is never posted where the clamp cuts.
-    sentinel_budget = min(
-        FALLBACK_SENTINEL_MAX_CHARS,
-        MAX_REVIEW_BODY_CHARS
-        - len(CLAMP_TRUNCATION_NOTE)
-        - len(fallback_head)
-        - len("\n\n")
-        - len(FINDINGS_SEPARATOR),
+    #
+    # Both parts are skipped outright for a body that FITS: nothing will be cut, so
+    # there is no size pressure to justify dropping a ledger entry. Same rule, and the
+    # same `sentinel_share` split, as the success path's section above.
+    prose_only = render_findings_markdown("", [i["comment"] for i in enriched])
+    whole_fallback_len = (
+        len(fallback_head)
+        + len("\n\n")
+        + len(render_body_only_sentinel(sentinel_items))
+        + len(prose_only)
     )
-    kept = fit_sentinel_items(sentinel_items, sentinel_budget)
+    if whole_fallback_len <= MAX_REVIEW_BODY_CHARS:
+        kept = sentinel_items
+    else:
+        notice_reserve = (
+            len(render_body_only_truncation(len(sentinel_items), len(sentinel_items)))
+            + len("\n\n")
+        )
+        available = (
+            MAX_REVIEW_BODY_CHARS
+            - len(CLAMP_TRUNCATION_NOTE)
+            - len(fallback_head)
+            - len("\n\n")
+            - len(FINDINGS_SEPARATOR)
+            - notice_reserve
+        )
+        # `prose_only` opens with FINDINGS_SEPARATOR, which `available` already
+        # reserved; counting it twice would understate what the prose leaves over.
+        kept = fit_sentinel_items(
+            sentinel_items,
+            sentinel_share(available, max(0, len(prose_only) - len(FINDINGS_SEPARATOR))),
+        )
     if kept:
         fallback_head_with_sentinel = (
             f"{fallback_head}\n\n{render_body_only_sentinel(kept)}"
         )
         if len(kept) < len(sentinel_items):
+            # The loss, serialized — see render_body_only_truncation. A prefix payload
+            # is still valid JSON, so next round's ledger would otherwise read it as a
+            # complete recovery of a round that lost most of its findings.
+            fallback_head_with_sentinel += (
+                f"\n\n{render_body_only_truncation(len(kept), len(sentinel_items))}"
+            )
             print(
                 f"Review: the fallback's body-only sentinel carries the "
                 f"{len(kept)} most urgent of {len(sentinel_items)} finding(s) — the "
