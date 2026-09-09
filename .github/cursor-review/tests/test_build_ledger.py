@@ -477,7 +477,7 @@ class TestRepeatRendering(unittest.TestCase):
         self.assertIn(50, lines)
         self.assertNotIn(30, lines)
         self.assertNotIn(40, lines)
-        self.assertIn("2 re-raise(s) of already-answered findings were dropped", payload["body"])
+        self.assertIn("2 re-raise(s) the judge declared were dropped", payload["body"])
 
     def test_repeat_cap_helper(self):
         enriched = [

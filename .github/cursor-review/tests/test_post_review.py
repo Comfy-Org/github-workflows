@@ -2690,8 +2690,11 @@ class ShownRepeatUrlsTest(unittest.TestCase):
                             # A DEMOTED re-raise: no thread of its own, so no
                             # discussion_url — its lineage is the ancestor permalink
                             # build-ledger.py resolved, which is what the judge sees
-                            # on the entry's `re_raise_of:` line (BE-12534).
-                            {"discussion_url": "", "repeat_of": ancestor},
+                            # on the entry's `re_raise_of:` line (BE-12534). Carries
+                            # `anchored: False`, as _body_only_entries writes it: that
+                            # is the flag the renderer gates `re_raise_of:` on, so it
+                            # is the flag this must gate on too.
+                            {"discussion_url": "", "anchored": False, "repeat_of": ancestor},
                         ],
                     }
                 )
@@ -2705,6 +2708,9 @@ class ShownRepeatUrlsTest(unittest.TestCase):
             self._write(
                 json.dumps(
                     {
+                        # `status: ok` throughout: a ledger the renderer would not
+                        # display shows nothing at all, which the status test covers.
+                        "status": "ok",
                         "entries": [
                             "not a dict",
                             None,
@@ -2721,6 +2727,67 @@ class ShownRepeatUrlsTest(unittest.TestCase):
         # Stripped on the way in, so the comparison is against the same shape
         # repeat_url_of strips its candidate to.
         self.assertEqual(shown, frozenset({url.strip()}))
+
+
+    def test_a_non_ok_status_shows_nothing(self):
+        """build-ledger.py renders an EMPTY block for any non-ok status, so the judge
+        saw no thread whatever the file holds. Mirrored here rather than left to the
+        `entries: []` those statuses happen to hard-code, so the two cannot drift."""
+        url = "https://github.com/o/r/pull/1#discussion_r5"
+        for status in ('"unknown"', '"empty"', '"disabled"', "null"):
+            with self.subTest(status=status):
+                shown = self._load(
+                    self._write(
+                        '{"status": %s, "entries": [{"discussion_url": "%s"}]}'
+                        % (status, url)
+                    )
+                )
+                self.assertEqual(shown, frozenset(), "an empty set, not None")
+                self.assertIsNotNone(shown)
+
+    def test_an_anchored_entrys_repeat_of_is_never_shown(self):
+        """The renderer prints `re_raise_of:` only for a NOT-anchored entry (an
+        anchored one has a thread of its own and _body_only_entries is the only writer
+        of the lineage keys). Reading it regardless would put a URL in the shown set
+        that no line of the prompt displayed."""
+        own = "https://github.com/o/r/pull/1#discussion_r1"
+        lineage = "https://github.com/o/r/pull/1#discussion_r2"
+        shown = self._load(
+            self._write(
+                json.dumps(
+                    {
+                        "status": "ok",
+                        "entries": [
+                            {"discussion_url": own, "anchored": True, "repeat_of": lineage}
+                        ],
+                    }
+                )
+            )
+        )
+        self.assertEqual(shown, frozenset({own}))
+
+    def test_a_degraded_read_is_annotated_on_the_run(self):
+        """`ledger_download` is continue-on-error, so a transient artifact failure
+        turns the membership layer off with nothing but a stderr line — an unprotected
+        run indistinguishable from a protected one. A ::warning:: puts it on the run
+        summary. The two cases that are real degradations get it; "no --ledger given"
+        is a caller's choice, not a failure, and does not."""
+        for path in (self._write("not json"), self._write('{"entries": 3}')):
+            with self.subTest(path=path):
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    self.assertIsNone(PR.load_shown_repeat_urls(path))
+                self.assertTrue(
+                    out.getvalue().startswith("::warning::cursor-review:"),
+                    "the annotation must open the line to be parsed as one",
+                )
+                self.assertEqual(len(out.getvalue().strip().splitlines()), 1)
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            PR.load_shown_repeat_urls(None)
+            PR.load_shown_repeat_urls(self._write('{"status": "ok", "entries": []}'))
+        self.assertEqual(out.getvalue(), "", "a readable ledger annotates nothing")
 
 
 class RepeatMembershipTest(unittest.TestCase):
@@ -2751,10 +2818,13 @@ class RepeatMembershipTest(unittest.TestCase):
         self.assertEqual(items[0]["repeat_url"], "")
         self.assertNotIn("re-raise of", items[0]["comment"]["body"])
         self.assertNotIn("discussion_r99", items[0]["comment"]["body"])
-        # Not a repeat any more, so it cannot consume one of the REPEAT_CAP slots
-        # a legitimate re-raise needs.
+        # But the DECLARATION still costs a REPEAT_CAP slot. The judge said this was a
+        # re-raise and only its URL was refused; if the refusal also refunded the slot,
+        # citing a link we drop would be strictly cheaper than citing a real one and a
+        # round of five fabricated re-raises would be entirely uncapped.
+        self.assertIs(items[0]["repeat_dropped"], True)
         kept, dropped = PR.enforce_repeat_cap(items, cap=0)
-        self.assertEqual((len(kept), dropped), (1, 0))
+        self.assertEqual((len(kept), dropped), (0, 1))
         # …and the demoted copy carries no lineage key either.
         payload = json.loads(
             PR.render_body_only_sentinel(items)[
@@ -2772,24 +2842,74 @@ class RepeatMembershipTest(unittest.TestCase):
         self.assertEqual(with_set[0]["repeat_url"], self.URL)
 
     def test_none_reproduces_todays_shape_only_behaviour_exactly(self):
-        """The default every existing caller still gets. Run the same fixtures through
-        both signatures and demand equality — including a malformed `repeat_of`, which
-        the shape guard must still reject on its own."""
-        fixtures = [
-            self._repeat_finding(),
+        """The default every existing caller still gets: membership OFF, shape ON.
+
+        Asserting `normalize_comments([raw], None) == normalize_comments([raw])` alone
+        would be VACUOUS — None IS the default, so both sides take one path — and would
+        have passed just as happily with no shape guard at all. So each fixture states
+        the OUTCOME it must reach, and a shape guard that goes missing fails here.
+        """
+        good = self._repeat_finding()
+        bad = [
             self._repeat_finding(url="https://evil.example.com/o/r/pull/1#discussion_r99"),
             self._repeat_finding(url="not a url"),
-            finding("a/b.py", 7, body="no lineage at all"),
+            # INTERNAL whitespace, not trailing: repeat_url_of strips first, so a
+            # trailing newline is a well-shaped URL with slack around it, and the
+            # fullmatch is what stops one from surviving in the middle.
+            self._repeat_finding(url="https://github.com/o/r/pull/1#discussion\n_r9"),
+            self._repeat_finding(url="https://github.com/o/r/pull/1#discussion_r9 x"),
+            self._repeat_finding(
+                url="https://github.com/o/r/pull/1#discussion_r" + "9" * 600
+            ),
         ]
-        for raw in fixtures:
-            with self.subTest(repeat_of=raw.get("repeat_of")):
-                self.assertEqual(
-                    PR.normalize_comments([raw], None), PR.normalize_comments([raw])
-                )
-                self.assertEqual(
-                    PR.render_body_only_findings(PR.normalize_comments([raw], None)),
-                    PR.render_body_only_findings(PR.normalize_comments([raw])),
-                )
+
+        kept = self._normalize([good], None)
+        self.assertEqual(kept[0]["repeat_url"], self.URL, "a well-shaped URL survives")
+        self.assertIn("re-raise of", kept[0]["comment"]["body"])
+        self.assertIs(kept[0]["repeat_dropped"], False)
+
+        for raw in bad:
+            with self.subTest(repeat_of=raw["repeat_of"][:40]):
+                items = self._normalize([raw], None)
+                self.assertEqual(items[0]["repeat_of"], "", "no trailer")
+                self.assertEqual(items[0]["repeat_url"], "", "no sentinel field")
+                self.assertNotIn("re-raise of", items[0]["comment"]["body"])
+                # Still a declared re-raise, so still capped.
+                self.assertIs(items[0]["repeat_dropped"], True)
+                # …and identical to what the parameterless call produces, which is the
+                # compatibility half the original assertion was reaching for.
+                self.assertEqual(items, PR.normalize_comments([raw]))
+
+    def test_a_malformed_url_never_reaches_the_rendered_trailer(self):
+        """The shape pair used to live only in render_body_only_sentinel, so an
+        arbitrary judge string reached the PROSE — rendered after "re-raise of" in a
+        bot-authored comment, unbounded in length, and spending a REPEAT_CAP slot for
+        lineage the sentinel then refused to carry. Both halves are on repeat_url_of
+        now, so the trailer and the field agree by construction."""
+        raw = self._repeat_finding(url="javascript:alert(1) " + "A" * 900)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            items = PR.normalize_comments([raw], None)
+        body = items[0]["comment"]["body"]
+        self.assertNotIn("re-raise of", body)
+        self.assertNotIn("javascript:", body)
+        self.assertEqual(items[0]["repeat_url"], "")
+        self.assertIn("Dropping malformed repeat_of:", err.getvalue())
+        # Bounded and single-line for the same reason the membership drop is.
+        self.assertEqual(len(err.getvalue().strip().splitlines()), 1)
+        self.assertLess(len(err.getvalue()), 400)
+
+    def test_a_rejected_declaration_is_capped_exactly_like_an_honest_one(self):
+        """REPEAT_CAP counts DECLARED re-raises, however their URL fared. Otherwise the
+        cheapest way to re-litigate a whole round is to cite links the guard drops."""
+        honest = [self._repeat_finding(body=f"real {i}") for i in range(2)]
+        fabricated = [
+            self._repeat_finding(url=f"https://github.com/o/r/pull/1#discussion_r{i}")
+            for i in range(3)
+        ]
+        items = self._normalize(honest + fabricated, frozenset({self.URL}))
+        kept, dropped = PR.enforce_repeat_cap(items, cap=2)
+        self.assertEqual((len(kept), dropped), (2, 3))
 
     def test_an_empty_shown_set_drops_every_repeat_of(self):
         items = self._normalize(
@@ -2800,17 +2920,29 @@ class RepeatMembershipTest(unittest.TestCase):
         self.assertEqual([i["repeat_url"] for i in items], ["", ""])
 
     def test_the_drop_is_announced_on_stderr_without_starting_a_log_line(self):
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            PR.normalize_comments(
-                [self._repeat_finding(url=self.URL + "\n::add-mask::x")], frozenset()
-            )
-        printed = err.getvalue()
-        self.assertIn("Dropping repeat_of not in the ledger the judge was shown:", printed)
-        # One line. The URL is relayed model text reaching a step log GitHub parses
-        # for `::workflow-command::` at the start of a line, so it is repr'd.
-        self.assertEqual(len(printed.strip().splitlines()), 1)
-        self.assertNotIn("\n::add-mask::", printed)
+        """Both drops, because both print relayed model text. Which one fires depends
+        on the URL: shape runs first, so an injected newline never reaches the
+        membership branch — and the well-shaped non-member below is what does."""
+        cases = [
+            (self.URL + "\n::add-mask::x", "Dropping malformed repeat_of:"),
+            (
+                "https://github.com/o/r/pull/1#discussion_r1234",
+                "Dropping repeat_of not in the ledger the judge was shown:",
+            ),
+        ]
+        for url, expected in cases:
+            with self.subTest(url=url[:40]):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    PR.normalize_comments([self._repeat_finding(url=url)], frozenset())
+                printed = err.getvalue()
+                self.assertIn(expected, printed)
+                # One line. The URL is relayed model text reaching a step log GitHub
+                # parses for `::workflow-command::` at the start of a line, so it is
+                # repr'd — and this module now writes real annotations to stdout, so a
+                # value able to start a line could forge one.
+                self.assertEqual(len(printed.strip().splitlines()), 1)
+                self.assertNotIn("\n::add-mask::", printed)
 
     def test_a_demoted_re_raises_ancestor_url_is_accepted_from_the_ledger(self):
         """The BE-12534 chain, end to end: round N demotes a re-raise, its ancestor
@@ -2881,6 +3013,75 @@ class RepeatMembershipTest(unittest.TestCase):
         self.assertNotIn("discussion_r99", body)
 
 
+class JudgeLedgerMissingTest(unittest.TestCase):
+    """`--no-judge-ledger`: the JUDGE's download failed, so nothing was shown.
+
+    The judge's and the poster's ledger downloads fail independently and the workflow
+    already tracks them apart (`LEDGER_DOWNLOAD_JUDGE` vs `LEDGER_DOWNLOAD`). Only the
+    judge's says what the judge SAW: when it failed the judge prompt was spliced an
+    empty ledger block, so every repeat_of it emitted is unfounded — even if this job's
+    own copy of ledger.json arrived intact and is full of genuine thread URLs. Reading
+    that copy would make the guard vouch for links the judge never saw, on exactly the
+    degraded run the header banner already calls out.
+    """
+
+    URL = "https://github.com/o/r/pull/1#discussion_r99"
+
+    def _run(self, extra_argv):
+        raw = finding("a/b.py", 42, severity="high", body="still broken")
+        raw["repeat_of"] = self.URL
+        raw["repeat_round"] = 2
+        tmp = tempfile.mkdtemp()
+        ledger_path = os.path.join(tmp, "ledger.json")
+        with open(ledger_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {"status": "ok", "entries": [{"discussion_url": self.URL, "anchored": True}]},
+                f,
+            )
+        findings_path = os.path.join(tmp, "findings.json")
+        with open(findings_path, "w", encoding="utf-8") as f:
+            json.dump({"findings": [raw], "panel": []}, f)
+
+        seen = []
+        real = PR.load_shown_repeat_urls
+
+        def spy(path):
+            seen.append(path)
+            return real(path)
+
+        argv = [
+            "post-review.py",
+            "--findings", findings_path,
+            "--pr-number", "65",
+            "--repo", "o/r",
+            "--commit-sha", "deadbee",
+            "--ledger", ledger_path,
+        ] + extra_argv
+        ok = subprocess.CompletedProcess([], 0, stdout="{}", stderr="")
+        with mock.patch.object(PR, "load_shown_repeat_urls", spy), \
+                mock.patch.object(PR.sys, "argv", argv), \
+                mock.patch.object(PR, "gh_post_review", return_value=ok) as post, \
+                mock.patch.object(PR, "review_already_posted", return_value=False), \
+                contextlib.redirect_stderr(io.StringIO()), \
+                contextlib.redirect_stdout(io.StringIO()):
+            PR.main()
+        return seen, json.dumps(json.loads(post.call_args[0][2]))
+
+    def test_without_the_flag_the_shown_ledger_admits_the_re_raise(self):
+        """The control: same fixtures, same ledger — the only difference is the flag."""
+        seen, body = self._run([])
+        self.assertEqual(len(seen), 1, "--ledger was read")
+        self.assertIn("re-raise of", body)
+
+    def test_with_the_flag_the_ledger_is_not_read_and_the_re_raise_is_dropped(self):
+        seen, body = self._run(["--no-judge-ledger"])
+        self.assertEqual(seen, [], "the poster's copy is not what the judge saw")
+        self.assertNotIn("re-raise of", body)
+        self.assertNotIn("discussion_r99", body)
+        # Dropped, not deleted: the finding itself still reaches the PR.
+        self.assertIn("still broken", body)
+
+
 class LedgerFlagWiringTest(unittest.TestCase):
     """Every post-review.py invocation in cursor-review.yml passes --ledger.
 
@@ -2890,8 +3091,12 @@ class LedgerFlagWiringTest(unittest.TestCase):
     unfounded `repeat_of` is most likely; missing the flag there would leave the
     degraded path on the old shape-only behaviour with nothing to say so.
 
-    The step deliberately does NOT gate on the download's outcome: `ledger_download`
-    is continue-on-error, and load_shown_repeat_urls degrades on a missing file.
+    `--ledger` itself is deliberately NOT gated on the POSTER's download outcome:
+    `ledger_download` is continue-on-error and load_shown_repeat_urls degrades on a
+    missing file, so gating would only swap one graceful degradation for another. The
+    JUDGE's download is the separate question `--no-judge-ledger` answers — when that
+    one failed the judge prompt carried an EMPTY block, so nothing was shown and this
+    job's own (possibly intact) copy of ledger.json must not stand in for it.
     """
 
     WORKFLOW = os.path.join(
@@ -2916,12 +3121,35 @@ class LedgerFlagWiringTest(unittest.TestCase):
             out.append(cmd)
         return out
 
-    def test_all_three_invocations_carry_the_ledger_flag(self):
+    def test_all_three_invocations_carry_the_ledger_flags(self):
         cmds = self.commands()
         self.assertEqual(len(cmds), 3, "the branch count changed — re-check each one")
         for cmd in cmds:
             with self.subTest(cmd=cmd.splitlines()[1:3]):
-                self.assertIn("--ledger /tmp/ledger/ledger.json", cmd)
+                # Quoted and [@]-expanded, so an empty-vs-one-element array cannot
+                # collapse into a stray empty argv element.
+                self.assertIn('"${LEDGER_FLAGS[@]}"', cmd)
+                self.assertNotIn("--ledger /tmp/ledger/ledger.json", cmd)
+
+    def test_the_flag_array_is_built_once_and_always_carries_the_path(self):
+        self.assertIn("LEDGER_FLAGS=(--ledger /tmp/ledger/ledger.json)", self.text)
+        self.assertEqual(self.text.count("LEDGER_FLAGS=("), 1)
+
+    def test_the_judge_download_outcome_is_what_disables_membership(self):
+        """Not the poster's. `JUDGE_LEDGER_OK` is already computed for the header
+        banner and is the only variable that says what the JUDGE was shown; gating on
+        `LEDGER_DOWNLOAD` (this job's own fetch) would leave the membership check
+        vouching for URLs the judge never saw."""
+        self.assertIn(
+            'if [ "$JUDGE_LEDGER_OK" != "true" ]; then\n'
+            "            LEDGER_FLAGS+=(--no-judge-ledger)",
+            self.text,
+        )
+        # The array is assembled AFTER the variable it reads is set.
+        self.assertLess(
+            self.text.index("JUDGE_LEDGER_OK=true"),
+            self.text.index("LEDGER_FLAGS=("),
+        )
 
     def test_the_path_is_the_one_the_download_step_writes(self):
         # `ledger_download` unpacks the artifact to /tmp/ledger; no new download step
