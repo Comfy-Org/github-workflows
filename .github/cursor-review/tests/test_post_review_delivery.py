@@ -80,11 +80,20 @@ class MainDriverMixin:
         error_message=None,
         with_diff=True,
         fallback_ok=False,
+        existing_reviews=(),
     ):
         """Return (posted_payloads, delivery_dict). delivery is {} when nothing was written.
 
         `fallback_ok` models the real 422: the inline payload is what GitHub
         rejects, so the anchor-free retry that follows it succeeds.
+
+        The landed-review read (BE-12528) is ALWAYS stubbed, exactly as
+        test_post_review.py's driver stubs it and for the same reason: this drives
+        main() end to end, so an unstubbed `gh_list_reviews` shells out to a REAL `gh`
+        from the unit suite the moment a failure path stops short-circuiting on its
+        status — which is what a 403 now does (BE-12612). `existing_reviews` is the
+        flat list the PR carries, wrapped in the one `--slurp` page the real command
+        returns; the default empty page is "confirmed absent".
         """
         posted = []
 
@@ -95,6 +104,14 @@ class MainDriverMixin:
                 rc, err = 0, ""
             return subprocess.CompletedProcess(
                 args=["gh"], returncode=rc, stdout="", stderr=err
+            )
+
+        def fake_list(repo, pr_number):
+            return subprocess.CompletedProcess(
+                args=["gh"],
+                returncode=0,
+                stdout=json.dumps([list(existing_reviews)]),
+                stderr="",
             )
 
         if panel is None:
@@ -121,6 +138,7 @@ class MainDriverMixin:
                 argv += ["--error-message", error_message]
 
             with mock.patch.object(PR, "gh_post_review", side_effect=fake_post), \
+                 mock.patch.object(PR, "gh_list_reviews", side_effect=fake_list), \
                  mock.patch.object(PR.sys, "argv", argv), \
                  mock.patch.object(PR, "write_step_summary", lambda *a, **k: None), \
                  mock.patch.dict(os.environ, {"GITHUB_OUTPUT": outpath}, clear=False):
@@ -336,16 +354,21 @@ class PostedSignalTest(MainDriverMixin, unittest.TestCase):
         self.assertIsNone(self.exit_code, "the read-only degradation still exits 0")
         self.assertEqual(delivery["posted"], "false")
 
-    def test_a_bare_403_is_read_as_read_only_too(self):
-        # is_read_only_token_error matches any HTTP 403, not just the integration
-        # phrasing — pin that the weaker match reaches the same verdict.
+    def test_a_bare_403_is_no_longer_read_as_read_only(self):
+        # BE-12612 inverted this case. is_read_only_token_error used to match any
+        # stderr carrying "HTTP 403", so a throttle, an abuse-detection refusal or an
+        # org-policy block exited 0 claiming a read-only token — and returned before
+        # the landed-review check could ask whether the write had gone through. It now
+        # matches the PERMISSION MESSAGE only, so a 403 without that message takes the
+        # read; confirmed absent here, the fallback is thrown and fails the same way,
+        # which is a genuine POST failure and goes red. `posted` still never lies.
         _, delivery = self.run_main(
             [finding("app.py", 11)],
             post_returncode=1,
             stderr="gh: HTTP 403: Forbidden",
         )
-        self.assertIsNone(self.exit_code)
-        self.assertEqual(delivery["posted"], "false")
+        self.assertEqual(self.exit_code, 1)
+        self.assertNotEqual(delivery.get("posted"), "true")
 
     def test_a_genuine_post_failure_exits_one_and_never_claims_posted(self):
         # Both attempts fail for a non-403 reason. The job goes red, so the DM's

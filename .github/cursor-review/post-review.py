@@ -283,6 +283,15 @@ def gh_post_review(repo: str, pr_number: str, payload: str) -> subprocess.Comple
     )
 
 
+# The PERMISSION rejection's message, matched case-insensitively as a PREFIX of the
+# full phrase. Deliberately stops before the principal: both token arms in
+# cursor-review.yml (the `create-github-app-token` output and `secrets.GITHUB_TOKEN`)
+# are installation tokens and say `Resource not accessible by integration`, while a
+# fine-grained PAT says `... by personal access token` — the same refusal, a different
+# noun. Matching the shared prefix covers all of them without enumerating principals.
+READ_ONLY_TOKEN_MESSAGE = "resource not accessible by"
+
+
 def is_read_only_token_error(result: subprocess.CompletedProcess) -> bool:
     """True when the POST failed because the token can't write to the PR.
 
@@ -292,9 +301,18 @@ def is_read_only_token_error(result: subprocess.CompletedProcess) -> bool:
     HTTP 403 'Resource not accessible by integration'. That's an environment
     constraint, not a review failure, so callers degrade to the job summary
     rather than failing the check red.
+
+    Identified by its MESSAGE, never by its status. GitHub answers throttling —
+    primary and secondary rate limits, abuse detection — with 403 too, and so does an
+    org-policy refusal; none of those is a read-only token, and none of them proves
+    the write was rejected before it was committed. A status match swallowed all of
+    them here and returned from `main()` before the landed-review check below could
+    ask the PR what actually happened, reporting a throttle as a read-only token and
+    skipping the read. So the match is on the permission wording alone, and every
+    other 403 falls through to that check (see RETRYABLE_4XX_STATUSES).
     """
-    blob = result.stderr or ""
-    return "Resource not accessible by integration" in blob or "HTTP 403" in blob
+    blob = (result.stderr or "").lower()
+    return READ_ONLY_TOKEN_MESSAGE in blob
 
 
 # The discriminator for "a review of THIS panel is already on the PR". Mirrors
@@ -327,13 +345,14 @@ def gh_http_status(result: subprocess.CompletedProcess):
 # `lost_to_fallback` on an assumption that does not apply, so they take the read like
 # a 5xx does.
 #
-# 403 is NOT in this set, and not because a throttled 403 is impossible — GitHub does
-# signal throttling that way. It is because `is_read_only_token_error` matches any
-# stderr carrying "HTTP 403" and returns from `main()` before this decision is
-# reached, so listing 403 here would be dead code that reads as coverage. Narrowing
-# that guard to its specific message is a change to the read-only degradation path,
-# not to this one; tracked separately rather than made in passing.
-RETRYABLE_4XX_STATUSES = frozenset({408, 425, 429})
+# 403 is here because `is_read_only_token_error` is now message-specific: any 403 that
+# reaches THIS decision has already failed that match, so it is not the permission
+# case. What is left is a primary or secondary rate limit, an abuse-detection refusal
+# or an org-policy block — GitHub answers all of them 403 — and none of those proves
+# the write was rejected before it was committed. A throttle in particular can be
+# raised on a request the API went on to serve, exactly like the 429 beside it, so it
+# takes the read too.
+RETRYABLE_4XX_STATUSES = frozenset({403, 408, 425, 429})
 
 
 # This read sits on the RECOVERY path: the fallback POST and write_step_summary both
@@ -1915,11 +1934,11 @@ def main():
     # Cheapest sufficient evidence first. A 4xx is GitHub VALIDATING and rejecting the
     # request before writing anything (every firing observed in the field is a 422 over
     # an inline position), so the review is absent by construction and no read is worth
-    # the call — with the exception carved out by RETRYABLE_4XX_STATUSES, which are 4xx
-    # only in the sense that an edge or a proxy said so and may well have said it about
-    # a request GitHub went on to serve. Anything else — a 5xx, or a transport error
-    # that carries no status at all — leaves the write genuinely undecided, so ask the
-    # PR. Three outcomes follow:
+    # the call — with the exception carved out by RETRYABLE_4XX_STATUSES, whose members
+    # are 4xx without carrying that meaning: an edge or a proxy said so, or GitHub
+    # throttled a request it may well have gone on to serve. Anything else — a 5xx, or
+    # a transport error that carries no status at all — leaves the write genuinely
+    # undecided, so ask the PR. Three outcomes follow:
     # PRESENT (the review landed: report it delivered, post nothing more), ABSENT
     # (behave exactly as this path always has), and UNKNOWN (post the fallback, but tag
     # nothing `lost_to_fallback` — the flag is a claim, and an unreadable list supports
@@ -2098,8 +2117,9 @@ def main():
         gated=0,
         ungated=len(enriched),
     ):
-        # Both attempts failed for a non-403 reason (an API outage, a stale commit_id
-        # after a force-push, a body-level rejection dropping the anchors cannot fix).
+        # Both attempts failed for a non-permission reason (an API outage, a throttle,
+        # a stale commit_id after a force-push, a body-level rejection dropping the
+        # anchors cannot fix).
         # Without this the whole review is gone from the PR *and* the summary, which
         # contradicts the no-inline branch above — and this is the branch carrying
         # MORE content, since it has an inline half. post_or_degrade only writes a
