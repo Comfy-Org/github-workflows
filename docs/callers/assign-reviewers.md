@@ -33,6 +33,31 @@ buy fork support** — see the fork gotcha below.
 | `vars.REVIEWER_LOAD_CAP` | Optional. Prefer below-cap owners among equally relevant candidates. |
 | `vars.REVIEWER_EXCLUDE` | Optional. Logins to hard-exclude. |
 | `vars.REVIEWER_AUTHOR_ALLOWLIST` | Optional. Whitespace-separated logins. When non-empty, only these **authors'** PRs are routed; everyone else's is skipped. Unset ⇒ every eligible author is routed. |
+| `vars.REVIEWER_SKIP_BASE_BRANCHES` | Optional. Whitespace-separated globs. A PR whose **base** ref matches any of them is skipped. Unset ⇒ every base is routed. |
+
+### Turning routing off for a stacked-PR lane
+
+Set `REVIEWER_SKIP_BASE_BRANCHES` to `stack/**` and PRs that target a `stack/…`
+integration branch get no assignee, while PRs to the default branch route as
+before. This is for the lane where many small child PRs land on one long-lived
+branch and review is deferred to the single promotion PR at the end — assigning
+an owner to each child pages a human per commit for a review nobody intends to
+do there, and that noise is what gets the whole automation muted.
+
+Glob semantics match the path rules: `**` spans segments (`stack/**` covers
+`stack/a` and `stack/a/b`), `*` stays within one (`stack/*` covers `stack/a` but
+not `stack/a/b`), and a pattern with no wildcard is an **exact** match — so
+`release` skips `release` and leaves `release/1.2` and `releases` alone. Several
+patterns are whitespace-separated: `stack/** wip/**`.
+
+Two related knobs, so pick the right one. This var is **per-lane and automatic**.
+The `skip_label` input (default `skip-auto-assign`) is **per-PR and manual**. Use
+the label for a one-off; use this for a lane that should never route.
+
+Unlike `REVIEWER_AUTHOR_ALLOWLIST`, this gate fails **open**: a pattern that
+matches nothing simply routes as usual, so a typo costs you the exemption rather
+than silently disabling routing repo-wide. Confirm it took effect in the run log,
+which prints `Base branch <ref> matches REVIEWER_SKIP_BASE_BRANCHES — skipping.`
 
 ## Caller
 

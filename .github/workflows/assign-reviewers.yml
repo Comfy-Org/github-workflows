@@ -38,6 +38,16 @@ name: Assign Reviewers (reusable)
 # PRs routed (BE-11575). Unset/empty keeps the historical run-for-every-author
 # behavior, so adding it breaks no existing caller.
 #
+# BASE-BRANCH SCOPING: vars.REVIEWER_SKIP_BASE_BRANCHES, when set, skips any PR
+# whose BASE ref matches one of its whitespace-separated globs (same glob
+# semantics as the path rules, so `stack/**` covers `stack/anything`). Unset/empty
+# keeps routing on for every base, so adding it breaks no existing caller. The case
+# it exists for is a stacked-PR lane: many small child PRs land on one long-lived
+# integration branch and review is deferred to the single promotion PR, so routing
+# an owner onto each child pages a human per commit for a review nobody intends to
+# do there. Orthogonal to the skip_label input — that is per-PR and manual, this is
+# per-lane and automatic.
+#
 # SELECTION: configured path expertise plus recent approvals on the same files
 # or directories, then greedy coverage of the diff. Load breaks expertise ties.
 # No random substitutions. A second owner must cover previously uncovered code.
@@ -74,6 +84,8 @@ name: Assign Reviewers (reusable)
 #   vars.REVIEWER_EXCLUDE          - whitespace-separated logins to hard-exclude (optional)
 #   vars.REVIEWER_AUTHOR_ALLOWLIST - whitespace-separated logins; when non-empty, ONLY
 #                                    these authors' PRs are routed at all (optional)
+#   vars.REVIEWER_SKIP_BASE_BRANCHES - whitespace-separated globs; a PR whose BASE ref
+#                                    matches any of them is skipped (optional)
 
 on:
   workflow_call:
@@ -146,6 +158,7 @@ jobs:
           LOAD_CAP: ${{ vars.REVIEWER_LOAD_CAP }}
           EXCLUDE: ${{ vars.REVIEWER_EXCLUDE }}
           AUTHOR_ALLOWLIST: ${{ vars.REVIEWER_AUTHOR_ALLOWLIST }}
+          SKIP_BASE_BRANCHES: ${{ vars.REVIEWER_SKIP_BASE_BRANCHES }}
         with:
           # Authenticate the octokit with the APP token so assignment works on
           # fork PRs (read-only GITHUB_TOKEN would 403).
@@ -283,9 +296,58 @@ jobs:
             if (!pr) { core.info('Not a pull_request event — nothing to do.'); return; }
             const pull_number = pr.number;
 
+            // Dependency-free glob -> RegExp (`*` within a segment, `**` across
+            // segments, `?` single non-slash char). minimatch/picomatch are not
+            // reliably available inside github-script, so we roll our own. Defined
+            // here rather than with the other helpers below because the base-branch
+            // early exit needs it before any API call is made.
+            const globToRegExp = (glob) => {
+              let re = '';
+              for (let i = 0; i < glob.length; i++) {
+                const c = glob[i];
+                if (c === '*') {
+                  if (glob[i + 1] === '*') {
+                    if (glob[i + 2] === '/') { re += '(?:.*/)?'; i += 2; }
+                    else { re += '.*'; i += 1; }
+                  } else { re += '[^/]*'; }
+                } else if (c === '?') {
+                  re += '[^/]';
+                } else if ('.+^${}()|[]\\/'.includes(c)) {
+                  re += '\\' + c;
+                } else {
+                  re += c;
+                }
+              }
+              return new RegExp('^' + re + '$');
+            };
+            const matchesAny = (p, globs) => globs.some((g) => globToRegExp(g).test(p));
+
             // --- 1. Early exits (never fail the PR) ---
             if (pr.draft) { core.info('PR is a draft — skipping.'); return; }
             if (pr.user && pr.user.type === 'Bot') { core.info('Author is a bot — skipping.'); return; }
+            // Opt-in base-branch scoping. UNSET/empty => route PRs against every
+            // base, exactly as before, so no existing caller changes behavior until
+            // it sets the var. NON-EMPTY => skip any PR whose BASE ref matches one
+            // of these globs.
+            //
+            // The case this exists for: a stacked-PR lane, where many small child
+            // PRs land on one long-lived integration branch and review is deferred
+            // to the single promotion PR at the end. Routing an owner onto each
+            // child pages a human per commit for a review nobody intends to do
+            // there, and the noise is what makes people mute the automation
+            // wholesale. `stack/**` turns that off without touching the routing
+            // that runs on PRs to the default branch.
+            //
+            // Matched against the base ref with the same glob semantics as the
+            // path rules, so `stack/**` covers `stack/anything` and
+            // `stack/a/b`, while a bare `release` matches only `release`.
+            const skipBaseBranches = (process.env.SKIP_BASE_BRANCHES || '')
+              .split(/\s+/).filter(Boolean);
+            const baseRef = (pr.base && pr.base.ref) || '';
+            if (skipBaseBranches.length > 0 && baseRef && matchesAny(baseRef, skipBaseBranches)) {
+              core.info(`Base branch ${baseRef} matches REVIEWER_SKIP_BASE_BRANCHES — skipping.`);
+              return;
+            }
             const authorLogin = pr.user && pr.user.login;
             // Opt-in author scoping (BE-11575). UNSET/empty => route every
             // eligible author, exactly as before, so no existing caller changes
@@ -355,30 +417,6 @@ jobs:
             }
 
             // --- helpers ---
-            // Dependency-free glob -> RegExp (`*` within a segment, `**` across
-            // segments, `?` single non-slash char). minimatch/picomatch are not
-            // reliably available inside github-script, so we roll our own.
-            const globToRegExp = (glob) => {
-              let re = '';
-              for (let i = 0; i < glob.length; i++) {
-                const c = glob[i];
-                if (c === '*') {
-                  if (glob[i + 1] === '*') {
-                    if (glob[i + 2] === '/') { re += '(?:.*/)?'; i += 2; }
-                    else { re += '.*'; i += 1; }
-                  } else { re += '[^/]*'; }
-                } else if (c === '?') {
-                  re += '[^/]';
-                } else if ('.+^${}()|[]\\/'.includes(c)) {
-                  re += '\\' + c;
-                } else {
-                  re += c;
-                }
-              }
-              return new RegExp('^' + re + '$');
-            };
-            const matchesAny = (p, globs) => globs.some((g) => globToRegExp(g).test(p));
-
             // Minimal YAML parser scoped to the documented reviewers.yml schema
             // (default_pool + rules[{paths, reviewers}], flow or block seqs).
             // js-yaml is not bundled with github-script; the schema is small and
