@@ -1299,27 +1299,39 @@ class FirstReviewConfirmationTest(unittest.TestCase):
         self.assertIsNone(status(None), "a CompletedProcess can carry no stderr at all")
 
 
-class ReadOnlyGuardIsMessageSpecificTest(unittest.TestCase):
-    """A 403 is not by itself a read-only token, and must not short-circuit the read.
+class ReadOnlyGuardExcludesThrottlesTest(unittest.TestCase):
+    """A THROTTLED 403 is not a read-only token, and must not short-circuit the read.
 
     `is_read_only_token_error` used to match the bare `HTTP 403` substring, and
-    `main()` returns from that branch BEFORE the landed-review check — so every other
-    403 GitHub issues (a primary or secondary rate limit, abuse detection, an
-    org-policy or SSO refusal) was reported as a read-only token, written to the job
-    summary and exited 0, with the PR never asked whether the review had actually
-    landed. The guard now matches the PERMISSION MESSAGE only, and 403 joins
-    RETRYABLE_4XX_STATUSES so what falls through takes the read instead of being
+    `main()` returns from that branch BEFORE the landed-review check — so a primary or
+    secondary rate limit and an abuse-detection refusal were reported as a read-only
+    token, written to the job summary and exited 0, with the PR never asked whether
+    the review had actually landed. The guard now excludes those wordings, and 403
+    joins RETRYABLE_4XX_STATUSES so what falls through takes the read instead of being
     assumed absent. Both halves are needed: narrowing the guard alone would send a
     throttled 403 into `pre_write_rejection`, which treats a 4xx outside that set as
     absent by construction and skips the read just the same.
+
+    The narrowing is an ALLOWLIST of throttles, not a denylist of the permission
+    phrase, and `test_a_policy_403_still_degrades_to_the_summary` is why: every OTHER
+    403 — SSO, IP allowlist, archived repo, a reworded permission message — is a
+    standing refusal that no retry fixes and that wrote nothing. Routing those into
+    the read plus a doomed fallback would replace a green degrade with a permanently
+    red check in exactly the orgs least able to change it.
     """
 
     ANCHORED = [finding("app.py", 11), finding("app.py", 12)]
 
     # The real messages, verbatim. `gh api` renders GitHub's error as
     # `gh: <message> (HTTP 403)`, so the status is identical across all of them and
-    # the message is the ONLY discriminator this path has.
+    # the message is the only thing separating a throttle from a standing refusal.
     PERMISSION = "gh: Resource not accessible by integration (HTTP 403)"
+    # An org-policy refusal: the wording shares nothing with the permission phrase,
+    # which is precisely why the guard cannot be written as "not the permission phrase".
+    POLICY = (
+        "gh: Although you appear to have the correct authorization credentials, the "
+        "`acme` organization has enabled OAuth App access restrictions (HTTP 403)"
+    )
     THROTTLED = (
         "gh: You have exceeded a secondary rate limit. Please wait a few minutes "
         "before you try again. (HTTP 403)"
@@ -1333,13 +1345,17 @@ class ReadOnlyGuardIsMessageSpecificTest(unittest.TestCase):
 
         A read-only token rejects the fallback exactly as it rejected the first POST,
         and no read is worth the call because nothing was written — so this branch
-        still returns before either. The lower-case variant is here because the match
-        is case-insensitive by design: `gh` echoes GitHub's message and nothing
-        guarantees its capitalisation.
+        still returns before either. The lower-case variant is here because the
+        MESSAGE match is case-insensitive by design: `gh` echoes GitHub's message and
+        nothing guarantees its capitalisation. Only the message is lower-cased —
+        `(HTTP 403)` is `gh`'s own rendering, not GitHub's text, and it is fixed.
         """
         for label, stderr in (
             ("as GitHub sends it", self.PERMISSION),
-            ("lower-cased", self.PERMISSION.lower()),
+            ("message lower-cased", self.PERMISSION.replace(
+                "Resource not accessible by integration",
+                "resource not accessible by integration",
+            )),
         ):
             with self.subTest(message=label):
                 outputs, summaries, notes, calls = {}, [], [], []
@@ -1367,6 +1383,97 @@ class ReadOnlyGuardIsMessageSpecificTest(unittest.TestCase):
                     "and that default is the read-only banner",
                 )
                 self.assertIsNone(driver.exit_code, "an environment constraint is not red")
+
+    def test_a_policy_403_still_degrades_to_the_summary(self):
+        """The regression guard on the allowlist: a standing 403 stays green.
+
+        An SSO/OAuth-restriction block shares no wording with the permission refusal,
+        so a guard written as "the permission phrase, and nothing else" would send it
+        into the landed-review read (which the same block fails, yielding UNKNOWN) and
+        then a doomed fallback POST, ending in SystemExit(1) on EVERY run — a
+        permanently red check where the caller used to get its review in the job
+        summary and a green step. Nothing about a policy refusal is transient, and
+        nothing was written, so it degrades exactly as the permission case does.
+        """
+        outputs, summaries, notes, calls = {}, [], [], []
+        driver = EndToEndPostTest()
+        posted = driver.run_main(
+            self.ANCHORED,
+            post_returncode=1,
+            stderr=self.POLICY,
+            list_calls=calls,
+            outputs=outputs,
+            summaries=summaries,
+            notes=notes,
+        )
+        self.assertEqual(calls, [], "a refusal that wrote nothing has nothing to read")
+        self.assertEqual(len(posted), 1, "no fallback — it would fail the same way")
+        self.assertEqual(outputs["posted"], "false")
+        self.assertEqual(len(summaries), 1, "the review went to the job summary")
+        self.assertEqual(notes, [None], "under the read-only banner default")
+        self.assertIsNone(driver.exit_code, "an environment constraint is not red")
+
+    def test_the_guard_needs_the_status_as_well_as_the_message(self):
+        """Neither half alone: a 422 can carry the permission phrase, a 403 can not.
+
+        `gh` joins a 422's `errors[].message` entries into the same stderr blob, so
+        the permission wording can arrive under a status that PROVES the write was
+        validated and refused. Classifying that as a read-only token would return from
+        `main()` before the landed-review check — the same silent skip BE-12612 is
+        removing, reached from the other direction. And a transport failure carries no
+        status at all, so it is not a 403 either.
+        """
+        def guard(stderr):
+            return PR.is_read_only_token_error(
+                subprocess.CompletedProcess(args=["gh"], returncode=1, stderr=stderr)
+            )
+
+        self.assertTrue(guard(self.PERMISSION))
+        self.assertTrue(guard(self.POLICY))
+        self.assertTrue(
+            guard("gh: Repository was archived so is read-only. (HTTP 403)"),
+            "an archived repo refuses every write and no retry fixes it",
+        )
+        self.assertFalse(
+            guard("gh: Resource not accessible by integration (HTTP 422)"),
+            "the phrase under a 422 is a validated rejection, not a read-only token",
+        )
+        self.assertFalse(
+            guard("error connecting to api.github.com: Resource not accessible by x"),
+            "no status at all is not a 403",
+        )
+        self.assertFalse(guard(""))
+        self.assertFalse(guard(None), "a CompletedProcess can carry no stderr at all")
+
+    def test_every_throttle_wording_falls_through_the_guard(self):
+        """The allowlist, pinned to the wordings GitHub actually sends with a 403.
+
+        Each of these can be raised on a request the API went on to serve, so none may
+        short-circuit the landed-review read. Matched case-insensitively for the same
+        reason the permission phrase is.
+        """
+        for message in (
+            "API rate limit exceeded for installation ID 1234",
+            "You have exceeded a secondary rate limit. Please wait a few minutes "
+            "before you try again.",
+            "You have triggered an abuse detection mechanism.",
+            "You have been submitted too quickly. Please retry your request again "
+            "later.",
+        ):
+            for label, text in (
+                ("as sent", message),
+                ("lower-cased", message.lower()),
+            ):
+                with self.subTest(message=message[:40], case=label):
+                    result = subprocess.CompletedProcess(
+                        args=["gh"], returncode=1, stderr=f"gh: {text} (HTTP 403)"
+                    )
+                    self.assertTrue(PR.is_throttled_403(result))
+                    self.assertFalse(PR.is_read_only_token_error(result))
+                    self.assertIn(
+                        PR.gh_http_status(result), (403,),
+                        "and it keeps its status, so RETRYABLE_4XX_STATUSES takes it",
+                    )
 
     def test_a_throttled_403_with_the_review_present_skips_the_fallback(self):
         """A secondary rate limit can be raised on a request GitHub went on to serve.

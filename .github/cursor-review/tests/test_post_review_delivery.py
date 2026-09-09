@@ -354,21 +354,46 @@ class PostedSignalTest(MainDriverMixin, unittest.TestCase):
         self.assertIsNone(self.exit_code, "the read-only degradation still exits 0")
         self.assertEqual(delivery["posted"], "false")
 
-    def test_a_bare_403_is_no_longer_read_as_read_only(self):
+    def test_a_throttled_403_is_no_longer_read_as_read_only(self):
         # BE-12612 inverted this case. is_read_only_token_error used to match any
-        # stderr carrying "HTTP 403", so a throttle, an abuse-detection refusal or an
-        # org-policy block exited 0 claiming a read-only token — and returned before
-        # the landed-review check could ask whether the write had gone through. It now
-        # matches the PERMISSION MESSAGE only, so a 403 without that message takes the
-        # read; confirmed absent here, the fallback is thrown and fails the same way,
-        # which is a genuine POST failure and goes red. `posted` still never lies.
+        # stderr carrying "HTTP 403", so a secondary rate limit exited 0 claiming a
+        # read-only token — and returned before the landed-review check could ask
+        # whether the write had gone through. The throttle wordings are now excluded
+        # from the guard, so this takes the read; confirmed absent by the driver's
+        # default empty page, the fallback is thrown and fails the same way, which is
+        # a genuine POST failure and goes red. `posted` still never lies.
+        #
+        # The stderr is `gh`'s real shape — `gh: <message> (HTTP 403)` — because the
+        # guard now conjoins the status, and the status only parses out of those
+        # parentheses. Written any other way this case would reach the read through
+        # the "no status at all" branch and pass whether the fix were here or not.
         _, delivery = self.run_main(
             [finding("app.py", 11)],
             post_returncode=1,
-            stderr="gh: HTTP 403: Forbidden",
+            stderr=(
+                "gh: You have exceeded a secondary rate limit. Please wait a few "
+                "minutes before you try again. (HTTP 403)"
+            ),
         )
         self.assertEqual(self.exit_code, 1)
         self.assertNotEqual(delivery.get("posted"), "true")
+
+    def test_an_unworded_403_still_degrades_green(self):
+        # The other half of the same narrowing, and the one that keeps this from
+        # being a regression for anyone: a 403 that is NOT a throttle is a standing
+        # refusal — an SSO/IP-allowlist or org-policy block, an archived repo, a
+        # reworded permission message — which no retry fixes and which wrote nothing.
+        # Those keep the pre-BE-12612 behaviour exactly: one attempt, review in the
+        # job summary, exit 0. Matching "everything that is not the permission
+        # phrase" into the retry path would have turned every run in such an org red.
+        posted, delivery = self.run_main(
+            [finding("app.py", 11)],
+            post_returncode=1,
+            stderr="gh: Forbidden (HTTP 403)",
+        )
+        self.assertEqual(len(posted), 1, "no fallback — it would fail the same way")
+        self.assertIsNone(self.exit_code, "an environment constraint is not red")
+        self.assertEqual(delivery["posted"], "false")
 
     def test_a_genuine_post_failure_exits_one_and_never_claims_posted(self):
         # Both attempts fail for a non-403 reason. The job goes red, so the DM's

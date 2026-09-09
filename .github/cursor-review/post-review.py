@@ -283,17 +283,32 @@ def gh_post_review(repo: str, pr_number: str, payload: str) -> subprocess.Comple
     )
 
 
-# The PERMISSION rejection's message, matched case-insensitively as a PREFIX of the
-# full phrase. Deliberately stops before the principal: both token arms in
-# cursor-review.yml (the `create-github-app-token` output and `secrets.GITHUB_TOKEN`)
-# are installation tokens and say `Resource not accessible by integration`, while a
-# fine-grained PAT says `... by personal access token` — the same refusal, a different
-# noun. Matching the shared prefix covers all of them without enumerating principals.
-READ_ONLY_TOKEN_MESSAGE = "resource not accessible by"
+# The 403 wordings that mean "slow down", not "you may not write". GitHub answers a
+# primary rate limit, a secondary rate limit and abuse detection with 403 as readily
+# as with 429 — and, unlike every other 403, one of those can be raised on a request
+# the API went on to SERVE, so it is not evidence the write was rejected before it was
+# committed. Matched case-insensitively as substrings, which is how `gh` hands over
+# GitHub's `message`: echoed into stderr rather than parsed out of the JSON body.
+# Only ever consulted once the status is already known to be 403, so a finding body
+# quoting one of these phrases cannot reach it through a 422.
+THROTTLE_403_MESSAGES = (
+    # "API rate limit exceeded for ..." / "You have exceeded a secondary rate limit."
+    "rate limit",
+    # "You have triggered an abuse detection mechanism."
+    "abuse detection",
+    # the older wording of the same secondary-limit refusal
+    "submitted too quickly",
+)
+
+
+def is_throttled_403(result: subprocess.CompletedProcess) -> bool:
+    """True when a 403's message is GitHub asking us to slow down."""
+    blob = (result.stderr or "").lower()
+    return any(message in blob for message in THROTTLE_403_MESSAGES)
 
 
 def is_read_only_token_error(result: subprocess.CompletedProcess) -> bool:
-    """True when the POST failed because the token can't write to the PR.
+    """True when the POST failed because the ENVIRONMENT forbids writing to the PR.
 
     The gate skips fork PRs (which always hit this), but a read-only token can
     still occur on same-repo runs — org/repo default workflow permissions set
@@ -302,17 +317,34 @@ def is_read_only_token_error(result: subprocess.CompletedProcess) -> bool:
     constraint, not a review failure, so callers degrade to the job summary
     rather than failing the check red.
 
-    Identified by its MESSAGE, never by its status. GitHub answers throttling —
-    primary and secondary rate limits, abuse detection — with 403 too, and so does an
-    org-policy refusal; none of those is a read-only token, and none of them proves
-    the write was rejected before it was committed. A status match swallowed all of
-    them here and returned from `main()` before the landed-review check below could
-    ask the PR what actually happened, reporting a throttle as a read-only token and
-    skipping the read. So the match is on the permission wording alone, and every
-    other 403 falls through to that check (see RETRYABLE_4XX_STATUSES).
+    STATUS AND MESSAGE, not either alone (BE-12612).
+
+    The status must be 403. The permission wording also travels inside a 422's
+    `errors[].message` list, which `gh` joins into the same stderr blob, and reading
+    that as a read-only token would return from `main()` before the landed-review
+    check — the same silent skip this guard is being narrowed to remove, arrived at
+    from the other direction.
+
+    The message must then NOT be a throttle. A rate limit and an abuse-detection
+    refusal are neither an environment constraint nor proof that nothing was written,
+    so those alone fall through to the landed-review check (see
+    RETRYABLE_4XX_STATUSES). Everything else a 403 can carry — the permission refusal
+    above, whatever principal it names (`by integration` for both of
+    cursor-review.yml's token arms, `by personal access token` for a fine-grained
+    PAT), an SSO/IP-allowlist
+    or org-policy block, an archived repo, a future rewording of any of them — is a
+    STANDING refusal that no retry fixes and that wrote nothing, so it degrades to the
+    job summary. Matching the throttles rather than the permission phrase is what
+    keeps a SAML-blocked or IP-allowlisted org on that green degrade instead of the
+    permanently red check "everything but the permission phrase" would hand it.
+
+    The fall-through reaches the landed-review check on the INLINE path in `main()`
+    only. `main()`'s no-inline-comments branch and `post_or_degrade` have no such
+    read: there a throttled 403 is reported as the POST failure it is — red, review in
+    the job summary — rather than mislabelled a read-only token. Neither of those
+    posts a fallback, so neither can duplicate a write GitHub committed before erroring.
     """
-    blob = (result.stderr or "").lower()
-    return READ_ONLY_TOKEN_MESSAGE in blob
+    return gh_http_status(result) == 403 and not is_throttled_403(result)
 
 
 # The discriminator for "a review of THIS panel is already on the PR". Mirrors
@@ -345,13 +377,12 @@ def gh_http_status(result: subprocess.CompletedProcess):
 # `lost_to_fallback` on an assumption that does not apply, so they take the read like
 # a 5xx does.
 #
-# 403 is here because `is_read_only_token_error` is now message-specific: any 403 that
-# reaches THIS decision has already failed that match, so it is not the permission
-# case. What is left is a primary or secondary rate limit, an abuse-detection refusal
-# or an org-policy block — GitHub answers all of them 403 — and none of those proves
-# the write was rejected before it was committed. A throttle in particular can be
-# raised on a request the API went on to serve, exactly like the 429 beside it, so it
-# takes the read too.
+# 403 is here because `is_read_only_token_error` now excludes the throttle wordings:
+# a 403 that reaches THIS decision has already been classified as one of them, so it
+# is a rate limit or an abuse-detection refusal and nothing else — every standing
+# 403 (permission, SSO/IP allowlist, archived repo) returned from `main()` on the
+# degrade path well above. A throttle can be raised on a request the API went on to
+# serve, exactly like the 429 beside it, so it takes the read too.
 RETRYABLE_4XX_STATUSES = frozenset({403, 408, 425, 429})
 
 
@@ -2117,9 +2148,9 @@ def main():
         gated=0,
         ungated=len(enriched),
     ):
-        # Both attempts failed for a non-permission reason (an API outage, a throttle,
-        # a stale commit_id after a force-push, a body-level rejection dropping the
-        # anchors cannot fix).
+        # Both attempts failed for a reason the read-only degradation does not cover
+        # (an API outage, a throttle, a stale commit_id after a force-push, a
+        # body-level rejection dropping the anchors cannot fix).
         # Without this the whole review is gone from the PR *and* the summary, which
         # contradicts the no-inline branch above — and this is the branch carrying
         # MORE content, since it has an inline half. post_or_degrade only writes a
