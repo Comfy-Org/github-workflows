@@ -2393,6 +2393,7 @@ jobs:
               --commit-sha "$HEAD_SHA" \
               --triggered-by "$TRIGGERED_BY" \
               --diff /tmp/pr-diff.patch \
+              --ledger /tmp/ledger/ledger.json \
               --ledger-note "$LEDGER_NOTE"
           elif [ "${CONSOLIDATED_COUNT:-0}" != "0" ]; then
             # No JUDGE_ERROR is read here on purpose: this branch passes --notice with
@@ -2410,6 +2411,7 @@ jobs:
               --commit-sha "$HEAD_SHA" \
               --triggered-by "$TRIGGERED_BY" \
               --diff /tmp/pr-diff.patch \
+              --ledger /tmp/ledger/ledger.json \
               --ledger-note "$LEDGER_NOTE" \
               --notice "⚠️ The judge step did not submit a final review through its structured-output tool (status=${JUDGE_STATUS}). The findings below are the raw, un-adjudicated panel output — they may contain duplicates or false positives the judge would normally filter."
           else
@@ -2433,6 +2435,7 @@ jobs:
               --repo "$REPO" \
               --commit-sha "$HEAD_SHA" \
               --triggered-by "$TRIGGERED_BY" \
+              --ledger /tmp/ledger/ledger.json \
               --ledger-note "$LEDGER_NOTE" \
               --error-message "Judge call failed (status=${JUDGE_STATUS}): ${JUDGE_ERROR}"
           fi
