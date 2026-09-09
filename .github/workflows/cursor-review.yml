@@ -2146,9 +2146,21 @@ jobs:
     # error (`pull-requests: write` already implies that read, so no permission
     # changes here) — minutes of work at most. That read carries its own
     # GH_LIST_REVIEWS_TIMEOUT_SECONDS well under this budget, so a wedged list cannot
-    # eat the job's whole allowance and take the fallback POST down with it. Bounded
-    # like every other job here so a rate-limited or hung call cannot hold a runner
-    # for the 6-hour default.
+    # eat the job's whole allowance and take the fallback POST down with it.
+    #
+    # A THROTTLED write (429, or one of the 403 wordings that mean "slow down") adds a
+    # bounded WAIT in front of each of those reads, and one more before the body-only
+    # fallback — otherwise the read goes out on the token GitHub just throttled and
+    # comes back "could not tell", which is the answer that used to cost a duplicate
+    # review. Each wait is `Retry-After` (or the `X-RateLimit-Reset` window) clamped to
+    # THROTTLE_DELAY_MAX_SECONDS, so the worst case is three 90s waits plus two bounded
+    # reads — 6.5 minutes, inside this budget with the artifact downloads and the token
+    # mint alongside it. Nothing here retries an unconfirmed write: a throttle whose
+    # landed-review read is still unreadable after the wait declines the fallback and
+    # goes red with the review in the job summary.
+    #
+    # Bounded like every other job here so a rate-limited or hung call cannot hold a
+    # runner for the 6-hour default.
     timeout-minutes: 10
     permissions:
       contents: read

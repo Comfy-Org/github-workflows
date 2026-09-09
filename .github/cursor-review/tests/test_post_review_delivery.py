@@ -58,6 +58,22 @@ def finding(path, line, severity="high", body="msg"):
     return {"file": path, "line": line, "severity": severity, "body": body}
 
 
+# Stands in, inside an `existing_reviews` fixture, for "the body this run actually
+# POSTed" — which a case cannot write out, since main() assembles it from the findings.
+# Compared by IDENTITY in the harness, so it can never collide with a real body.
+ECHO_POSTED_BODY = "<the body this run posted>"
+
+
+def landed_review():
+    """The review this run posted, as the PR would carry it back."""
+    return {
+        "state": "COMMENTED",
+        "commit_id": "deadbeef",
+        "user": {"type": "Bot"},
+        "body": ECHO_POSTED_BODY,
+    }
+
+
 class MainDriverMixin:
     """Drive main() with a stubbed `gh` and read what it wrote to $GITHUB_OUTPUT."""
 
@@ -81,6 +97,10 @@ class MainDriverMixin:
         with_diff=True,
         fallback_ok=False,
         existing_reviews=(),
+        post_stdout="",
+        list_returncode=0,
+        list_calls=None,
+        sleeps=None,
     ):
         """Return (posted_payloads, delivery_dict). delivery is {} when nothing was written.
 
@@ -94,6 +114,13 @@ class MainDriverMixin:
         status — which is what a 403 now does (BE-12612). `existing_reviews` is the
         flat list the PR carries, wrapped in the one `--slurp` page the real command
         returns; the default empty page is "confirmed absent".
+
+        `time.sleep` is ALWAYS stubbed too (BE-12691): a throttled POST now backs off
+        before the landed-review read, so an unpatched clock would make the throttle
+        cases below wait real minutes. `post_stdout` is what `gh -i` wrote (status line
+        + response headers, which is where the backoff reads `Retry-After`), `sleeps`
+        collects the seconds each wait was asked for, and `list_returncode` /
+        `list_calls` model and count an UNREADABLE review list.
         """
         posted = []
 
@@ -103,16 +130,31 @@ class MainDriverMixin:
             if fallback_ok and len(posted) > 1:
                 rc, err = 0, ""
             return subprocess.CompletedProcess(
-                args=["gh"], returncode=rc, stdout="", stderr=err
+                args=["gh"], returncode=rc, stdout=post_stdout, stderr=err
             )
 
         def fake_list(repo, pr_number):
+            if list_calls is not None:
+                list_calls.append((repo, pr_number))
+            # A review counts as THIS run's only when its body IS the body this run
+            # POSTed, which a case cannot spell out ahead of time — main() assembles it
+            # from the findings. ECHO_POSTED_BODY stands in and is resolved here, after
+            # the POST, from the payload actually sent.
+            reviews = []
+            for review in existing_reviews:
+                if review.get("body") is ECHO_POSTED_BODY:
+                    review = {**review, "body": posted[0]["body"]}
+                reviews.append(review)
             return subprocess.CompletedProcess(
                 args=["gh"],
-                returncode=0,
-                stdout=json.dumps([list(existing_reviews)]),
+                returncode=list_returncode,
+                stdout=json.dumps([reviews]),
                 stderr="",
             )
+
+        def fake_sleep(seconds):
+            if sleeps is not None:
+                sleeps.append(seconds)
 
         if panel is None:
             panel = [{"model": "m", "review_type": "adversarial", "status": "ok"}]
@@ -139,6 +181,7 @@ class MainDriverMixin:
 
             with mock.patch.object(PR, "gh_post_review", side_effect=fake_post), \
                  mock.patch.object(PR, "gh_list_reviews", side_effect=fake_list), \
+                 mock.patch.object(PR.time, "sleep", side_effect=fake_sleep), \
                  mock.patch.object(PR.sys, "argv", argv), \
                  mock.patch.object(PR, "write_step_summary", lambda *a, **k: None), \
                  mock.patch.dict(os.environ, {"GITHUB_OUTPUT": outpath}, clear=False):
@@ -540,6 +583,140 @@ class PostedSignalTest(MainDriverMixin, unittest.TestCase):
                 with open(outpath, encoding="utf-8") as f:
                     written = f.read()
         self.assertNotIn("posted=true", written)
+
+
+class ThrottledDeliverySignalTest(MainDriverMixin, unittest.TestCase):
+    """What a THROTTLED write may claim about the PR (BE-12691).
+
+    `posted` is the DM's question — "is one consolidated review on the PR?" — and a
+    throttle is the one failure that can be raised on a request the API went on to
+    serve. BE-12612 made the script ask the PR instead of guessing; this pins what it
+    does when the ANSWER is also unavailable, because the read went out on the same
+    throttled token.
+
+    The rule: never claim, and never write again. `posted=false` on an unconfirmed
+    write keeps the fresh-review gate red (a false `true` would green it over nothing),
+    and the fallback is withheld (a second write would duplicate a review nobody can
+    un-post). The findings still reach the job summary either way.
+
+    THROTTLED_403 is written in `gh`'s real shape — `gh: <message> (HTTP 403)` — for
+    the reason BE-12612's cases are: the classification conjoins the status, and the
+    status only parses out of those parentheses.
+    """
+
+    THROTTLED_403 = (
+        "gh: You have exceeded a secondary rate limit. Please wait a few minutes "
+        "before you try again. (HTTP 403)"
+    )
+    # `gh -i`'s stdout for that response: status line, one header, blank line, body.
+    RESPONSE = (
+        "HTTP/2.0 403 Forbidden\r\n"
+        "Retry-After: 42\r\n"
+        "\r\n"
+        '{"message":"You have exceeded a secondary rate limit."}'
+    )
+
+    def test_the_no_inline_branch_waits_once_and_reports_the_landed_review(self):
+        """A demoted-only round has no inline half to drop, so it never reposts — but
+        it does ask, after waiting out the window GitHub named."""
+        calls, sleeps = [], []
+        posted, delivery = self.run_main(
+            [finding("app.py", 900)],
+            post_returncode=1,
+            stderr=self.THROTTLED_403,
+            post_stdout=self.RESPONSE,
+            existing_reviews=[landed_review()],
+            list_calls=calls,
+            sleeps=sleeps,
+        )
+        self.assertEqual(posted[0].get("comments", []), [], "nothing anchored")
+        self.assertEqual(len(posted), 1, "and nothing more was written")
+        self.assertEqual(sleeps, [42], "one wait, for the Retry-After GitHub sent")
+        self.assertEqual(calls, [("o/r", "1")], "one read, after it")
+        self.assertEqual(delivery["posted"], "true")
+        self.assertIsNone(self.exit_code, "a review that landed is not a red step")
+
+    def test_the_no_inline_branch_stays_red_when_nothing_landed(self):
+        calls, sleeps = [], []
+        posted, delivery = self.run_main(
+            [finding("app.py", 900)],
+            post_returncode=1,
+            stderr=self.THROTTLED_403,
+            post_stdout=self.RESPONSE,
+            list_calls=calls,
+            sleeps=sleeps,
+        )
+        self.assertEqual(len(posted), 1, "still no byte-identical repost")
+        self.assertEqual(sleeps, [42])
+        self.assertEqual(calls, [("o/r", "1")])
+        self.assertEqual(delivery["posted"], "false")
+        self.assertEqual(self.exit_code, 1)
+
+    def test_an_unreadable_read_withholds_the_fallback_and_claims_nothing(self):
+        """The inline path's fail-closed case: throttled POST, unreadable answer.
+
+        Before BE-12691 this posted the fallback — a duplicate whenever the first write
+        had been served — and reported `posted=false` for it either way.
+        """
+        calls, sleeps = [], []
+        posted, delivery = self.run_main(
+            [finding("app.py", 11), finding("app.py", 900)],
+            post_returncode=1,
+            stderr=self.THROTTLED_403,
+            post_stdout=self.RESPONSE,
+            list_returncode=1,
+            list_calls=calls,
+            sleeps=sleeps,
+        )
+        self.assertEqual(
+            len(posted[0]["comments"]), 1,
+            "one finding anchored, so this is the INLINE path, not the no-inline one",
+        )
+        self.assertEqual(len(posted), 1, "the unverified second write never goes out")
+        self.assertEqual(sleeps, [42], "it waited, then declined rather than retrying")
+        self.assertEqual(calls, [("o/r", "1")])
+        self.assertEqual(delivery["delivered"], "false")
+        self.assertEqual(delivery["posted"], "false")
+        self.assertEqual(self.exit_code, 1)
+
+    def test_post_or_degrade_waits_before_its_read_and_never_reposts(self):
+        """The no-findings review — the common round — goes through post_or_degrade,
+        which reads and, since BE-12612, reports a landed review as delivered."""
+        calls, sleeps = [], []
+        posted, delivery = self.run_main(
+            [],
+            post_returncode=1,
+            stderr=self.THROTTLED_403,
+            post_stdout=self.RESPONSE,
+            existing_reviews=[landed_review()],
+            list_calls=calls,
+            sleeps=sleeps,
+        )
+        self.assertIn("No high-signal findings", posted[0]["body"])
+        self.assertEqual(len(posted), 1, "post_or_degrade reads; it never reposts")
+        self.assertEqual(sleeps, [42])
+        self.assertEqual(calls, [("o/r", "1")])
+        self.assertEqual(delivery["posted"], "true")
+        self.assertEqual(delivery["delivered"], "true")
+        self.assertIsNone(self.exit_code)
+
+    def test_a_standing_403_still_costs_no_wall_clock(self):
+        """The regression guard on the wait: a permission refusal returns on the
+        read-only degradation above the backoff, so it neither sleeps nor reads."""
+        calls, sleeps = [], []
+        posted, delivery = self.run_main(
+            [finding("app.py", 11)],
+            post_returncode=1,
+            stderr="gh: Resource not accessible by integration (HTTP 403)",
+            post_stdout=self.RESPONSE,
+            list_calls=calls,
+            sleeps=sleeps,
+        )
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(sleeps, [], "nothing to wait for — no retry fixes this")
+        self.assertEqual(calls, [], "and nothing was written, so nothing to read")
+        self.assertEqual(delivery["posted"], "false")
+        self.assertIsNone(self.exit_code)
 
 
 class NotifyCompleteGateTest(unittest.TestCase):

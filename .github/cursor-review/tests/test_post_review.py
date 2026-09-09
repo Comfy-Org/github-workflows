@@ -217,10 +217,20 @@ class EndToEndPostTest(unittest.TestCase):
 
     def run_main(self, findings, with_diff=True, post_returncode=0, stderr="", summaries=None,
                  panel=None, existing_reviews=None, list_returncode=0, list_calls=None,
-                 outputs=None, notes=None, raw_stdout=_UNSET, extra_argv=()):
+                 outputs=None, notes=None, raw_stdout=_UNSET, extra_argv=(),
+                 post_stdout="", sleeps=None, trace=None):
         """Return the POSTed payloads. Pass `summaries` (a list) to collect step-summary
         writes, or `panel` to control the panel summary — the one finding-INDEPENDENT
         part of the review head that a caller can make large.
+
+        `time.sleep` is ALWAYS stubbed, for the same reason the list read always is: a
+        throttled POST now backs off before the landed-review read (BE-12691), so an
+        unpatched clock would make every throttle case in this file wait a real minute
+        or three. `post_stdout` is what `gh -i` wrote — the status line plus the
+        response headers the backoff reads. `sleeps` collects the seconds each sleep
+        was asked for; `trace` collects `("post"|"list"|"sleep", …)` across all three
+        stubs, which is the only way to assert the backoff happens BEFORE the read
+        rather than merely alongside it.
 
         The review-list read (BE-12528) is ALWAYS stubbed, never merely when a case
         cares about it: this harness drives main() end to end, so an unpatched
@@ -245,13 +255,23 @@ class EndToEndPostTest(unittest.TestCase):
 
         def fake_post(repo, pr_number, payload):
             posted.append(json.loads(payload))
+            if trace is not None:
+                trace.append(("post",))
             return subprocess.CompletedProcess(
-                args=["gh"], returncode=post_returncode, stdout="", stderr=stderr
+                args=["gh"], returncode=post_returncode, stdout=post_stdout, stderr=stderr
             )
+
+        def fake_sleep(seconds):
+            if sleeps is not None:
+                sleeps.append(seconds)
+            if trace is not None:
+                trace.append(("sleep", seconds))
 
         def fake_list(repo, pr_number):
             if list_calls is not None:
                 list_calls.append((repo, pr_number))
+            if trace is not None:
+                trace.append(("list", repo, pr_number))
             # A review only counts as THIS run's when its body IS the body this run
             # posted (BE-12528), which the case cannot spell out ahead of time — it is
             # assembled by main() from the findings. ECHO_POSTED_BODY stands in for it
@@ -304,6 +324,7 @@ class EndToEndPostTest(unittest.TestCase):
             argv += list(extra_argv)
             with mock.patch.object(PR, "gh_post_review", side_effect=fake_post), \
                  mock.patch.object(PR, "gh_list_reviews", side_effect=fake_list), \
+                 mock.patch.object(PR.time, "sleep", side_effect=fake_sleep), \
                  mock.patch.object(PR.sys, "argv", argv), \
                  mock.patch.dict(os.environ, {"GITHUB_OUTPUT": outpath}, clear=False), \
                  mock.patch.object(PR, "write_step_summary", side_effect=fake_summary):
@@ -1516,6 +1537,51 @@ class ReadOnlyGuardExcludesThrottlesTest(unittest.TestCase):
                         PR.gh_http_status(result), (403,),
                         "and it keeps its status, so RETRYABLE_4XX_STATUSES takes it",
                     )
+                    self.assertTrue(
+                        PR.is_throttle(result),
+                        "and it earns a backoff before the read (BE-12691)",
+                    )
+
+    def test_is_throttle_separates_a_wait_from_every_other_failure(self):
+        """Which failures buy something by WAITING — a strictly smaller set than the
+        ones that buy something by asking the PR (BE-12691).
+
+        `RETRYABLE_4XX_STATUSES` answers "could GitHub have served this anyway", and
+        408/425 are in it because an edge or a proxy can raise either on a request the
+        API went on to handle. Neither says a rate window is CLOSED, though, so a sleep
+        in front of their read would spend the job's ten-minute budget for nothing.
+
+        The 403 arm conjoins the status rather than trusting the wording alone. The
+        allowlist is a substring match over `gh`'s error line, and a validation message
+        is free to quote "rate limit" — so a 422 that did would otherwise be handed a
+        backoff on a request GitHub demonstrably validated and refused.
+        """
+        def throttle(stderr):
+            return PR.is_throttle(
+                subprocess.CompletedProcess(args=["gh"], returncode=1, stderr=stderr)
+            )
+
+        self.assertTrue(throttle("gh: Too Many Requests (HTTP 429)"))
+        self.assertTrue(
+            throttle("gh: anything at all (HTTP 429)"),
+            "429 needs no wording — the status IS the throttle",
+        )
+        self.assertTrue(throttle(self.THROTTLED))
+        self.assertFalse(throttle(self.PERMISSION))
+        self.assertFalse(throttle(self.POLICY))
+        for status in (408, 425, 422, 500):
+            self.assertFalse(
+                throttle(f"gh: something (HTTP {status})"),
+                f"{status} is not a throttle",
+            )
+        self.assertFalse(
+            throttle("gh: rate limit wording under a validation failure (HTTP 422)"),
+            "the wording alone is not enough — the status has to be 403",
+        )
+        self.assertFalse(
+            throttle("error connecting to api.github.com"),
+            "no status at all is not a throttle either",
+        )
 
     def test_a_throttled_403_with_the_review_present_skips_the_fallback(self):
         """A secondary rate limit can be raised on a request GitHub went on to serve.
@@ -1574,22 +1640,60 @@ class ReadOnlyGuardExcludesThrottlesTest(unittest.TestCase):
         self.assertNotIn(None, notes, "the read-only banner never applies here")
         self.assertEqual(driver.exit_code, 1, "the step goes red")
 
-    def test_a_throttled_403_with_an_unreadable_list_tags_nothing(self):
-        """UNKNOWN survives the new status too: post the fallback, claim nothing.
+    def test_a_throttled_403_with_an_unreadable_list_declines_the_fallback(self):
+        """UNKNOWN under a THROTTLE declines the second write entirely (BE-12691).
 
-        `lost_to_fallback` asserts the first review is absent, and a read that failed
-        supports no such claim (BE-4785).
+        Round 1 (BE-12612) routed the throttle into the read and left UNKNOWN posting
+        the fallback, which is a duplicate review whenever the throttled first POST was
+        one GitHub went on to serve — and a review cannot be un-posted. So the throttle
+        case now fails CLOSED: findings to the job summary under
+        POST_FAILED_SUMMARY_NOTE, `posted=false` so the fresh-review gate stays red
+        over a write nobody confirmed, and a red step.
+
+        UNKNOWN from any OTHER cause is untouched — see
+        `test_an_unknown_read_that_is_not_a_throttle_still_posts_the_fallback`.
         """
-        calls = []
-        posted = EndToEndPostTest().run_main(
+        calls, outputs, summaries, notes = [], {}, [], []
+        driver = EndToEndPostTest()
+        posted = driver.run_main(
             self.ANCHORED,
             post_returncode=1,
             stderr=self.THROTTLED,
             list_returncode=1,
             list_calls=calls,
+            outputs=outputs,
+            summaries=summaries,
+            notes=notes,
+        )
+        self.assertEqual(calls, [("o/r", "1")], "asked once; the answer was unreadable")
+        self.assertEqual(len(posted), 1, "and no second write went out on that token")
+        self.assertEqual(outputs["delivered"], "false")
+        self.assertEqual(outputs["posted"], "false")
+        self.assertEqual(len(summaries), 1, "the findings still reach the job summary")
+        self.assertIn(PR.POST_FAILED_SUMMARY_NOTE, notes)
+        self.assertEqual(driver.exit_code, 1, "an unverified write is not a green step")
+
+    def test_an_unknown_read_that_is_not_a_throttle_still_posts_the_fallback(self):
+        """The other side of the decline: only a THROTTLE withholds the fallback.
+
+        A 5xx, a dropped connection, a 408 or a 425 can also leave the write undecided,
+        but none of them says a rate window is closed and none of them is evidence the
+        first request was served — so the pre-BE-12691 behaviour stands: post the
+        fallback, and tag nothing `lost_to_fallback`, since that flag asserts the first
+        review is ABSENT and a read that failed supports no such claim (BE-4785).
+        """
+        calls, sleeps = [], []
+        posted = EndToEndPostTest().run_main(
+            self.ANCHORED,
+            post_returncode=1,
+            stderr="gh: Server Error (HTTP 500)",
+            list_returncode=1,
+            list_calls=calls,
+            sleeps=sleeps,
         )
         self.assertEqual(calls, [("o/r", "1"), ("o/r", "1")])
-        self.assertEqual(len(posted), 2, "undecided means post the fallback")
+        self.assertEqual(sleeps, [], "nothing here is a throttle, so nothing waits")
+        self.assertEqual(len(posted), 2, "undecided-but-unthrottled posts the fallback")
         ledger = ledger_from_posted_body(posted[1]["body"])
         for entry in ledger["entries"]:
             self.assertNotIn("lost_to_fallback", entry)
@@ -1757,6 +1861,461 @@ class ReadOnlyGuardExcludesThrottlesTest(unittest.TestCase):
         self.assertEqual(outputs["posted"], "false")
         self.assertEqual(notes, [None], "under the read-only banner default")
         self.assertIsNone(driver.exit_code)
+
+
+# What `gh api -i` really writes to stdout: the status line, CRLF-terminated headers
+# in Go's canonical casing, a blank line, then the body. Captured from gh 2.92.0
+# against a 404 probe (`gh api -i /repos/o/r/pulls/99999999`) and trimmed — the
+# CRLFs, the `X-Ratelimit-*` spelling and the JSON tail are all verbatim, because
+# each of them is something the parser has to get right.
+GH_INCLUDE_STDOUT = (
+    "HTTP/2.0 404 Not Found\r\n"
+    "Content-Type: application/json; charset=utf-8\r\n"
+    "Date: Wed, 09 Sep 2026 04:05:32 GMT\r\n"
+    "X-Ratelimit-Limit: 5000\r\n"
+    "X-Ratelimit-Remaining: 3887\r\n"
+    "X-Ratelimit-Reset: 1788927701\r\n"
+    "\r\n"
+    '{"message":"Not Found","status":"404"}'
+)
+
+
+def gh_result(stdout="", stderr="", returncode=1):
+    return subprocess.CompletedProcess(
+        args=["gh"], returncode=returncode, stdout=stdout, stderr=stderr
+    )
+
+
+def response(*header_lines, status="HTTP/2.0 429 Too Many Requests", body="{}"):
+    """A `gh -i` stdout carrying exactly `header_lines`."""
+    return "".join([f"{status}\r\n"] + [f"{h}\r\n" for h in header_lines] + ["\r\n", body])
+
+
+class ResponseHeaderParsingTest(unittest.TestCase):
+    """`gh -i`'s stdout, read back as headers (BE-12691).
+
+    `gh api` prints only the response BODY by default, and there is no knob that
+    surfaces a single header — so `Retry-After` and `X-RateLimit-Reset` are reachable
+    only by asking for the whole response. That makes stdout, previously ignored on
+    every path, something the process now reads, and this pins what it may conclude
+    from it.
+    """
+
+    def test_it_parses_the_shape_gh_actually_writes(self):
+        headers = PR.gh_response_headers(gh_result(stdout=GH_INCLUDE_STDOUT))
+        self.assertEqual(headers["x-ratelimit-remaining"], "3887")
+        self.assertEqual(headers["x-ratelimit-reset"], "1788927701")
+        self.assertEqual(
+            headers["content-type"], "application/json; charset=utf-8",
+            "the value keeps its own colons — only the FIRST one splits",
+        )
+        self.assertNotIn("message", headers, "the body is past the blank line")
+
+    def test_names_are_lower_cased(self):
+        """`gh` canonicalizes to `X-Ratelimit-Reset`; GitHub documents
+        `X-RateLimit-Reset`. Neither spelling may be the one a caller has to guess."""
+        headers = PR.gh_response_headers(gh_result(stdout=GH_INCLUDE_STDOUT))
+        self.assertIn("x-ratelimit-reset", headers)
+        self.assertNotIn("X-Ratelimit-Reset", headers)
+
+    def test_empty_or_unparseable_stdout_is_no_headers(self):
+        for label, stdout in (
+            ("empty", ""),
+            ("stubbed away", None),
+            # An older `gh`, or any caller that did not pass `-i`, writes the body
+            # alone. Reading its first line as a header would let a review body's own
+            # text dictate the backoff.
+            ("a bare JSON body", '{"id": 1, "Retry-After": "3600"}'),
+            ("headers with no status line", "Retry-After: 30\r\n\r\n{}"),
+        ):
+            with self.subTest(stdout=label):
+                self.assertEqual(PR.gh_response_headers(gh_result(stdout=stdout)), {})
+
+    def test_a_header_block_with_no_body_still_parses(self):
+        headers = PR.gh_response_headers(
+            gh_result(stdout="HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\n")
+        )
+        self.assertEqual(headers, {"retry-after": "60"})
+
+
+class ThrottleDelayTest(unittest.TestCase):
+    """How long a throttled write waits, and why it is never longer than that.
+
+    Precedence follows GitHub's rate-limit best-practices doc: `Retry-After` first
+    (secondary limits), then `X-RateLimit-Remaining: 0` + `X-RateLimit-Reset` (a
+    primary limit, which lifts at the reset epoch), then a one-minute default —
+    GitHub's own "wait for at least one minute" for a throttle that named no window.
+    """
+
+    NOW = 1_788_927_701
+
+    def delay(self, *header_lines, **kwargs):
+        return PR.throttle_delay_seconds(
+            gh_result(stdout=response(*header_lines)), **kwargs
+        )
+
+    def test_retry_after_wins(self):
+        self.assertEqual(self.delay("Retry-After: 30"), 30)
+
+    def test_retry_after_is_capped(self):
+        """GitHub sends an hour-long `Retry-After` on a primary limit. The `post` job
+        has ten minutes total and writes the job-summary fallback AFTER the wait, so an
+        uncapped sleep would lose the review from both channels rather than one."""
+        self.assertEqual(self.delay("retry-after: 300"), PR.THROTTLE_DELAY_MAX_SECONDS)
+        self.assertEqual(PR.THROTTLE_DELAY_MAX_SECONDS, 90)
+
+    def test_a_zero_retry_after_still_waits_the_floor(self):
+        """Zero is a wait GitHub asked for, not a missing header — but retrying with no
+        pause at all is the shape that earns the next throttle."""
+        self.assertEqual(self.delay("Retry-After: 0"), PR.THROTTLE_DELAY_MIN_SECONDS)
+        self.assertEqual(PR.THROTTLE_DELAY_MIN_SECONDS, 1)
+
+    def test_an_exhausted_primary_limit_waits_for_its_reset(self):
+        self.assertEqual(
+            self.delay(
+                "X-Ratelimit-Remaining: 0",
+                f"X-Ratelimit-Reset: {self.NOW + 45}",
+                now=self.NOW,
+            ),
+            45,
+        )
+
+    def test_a_primary_limit_with_budget_left_is_not_a_window(self):
+        """`remaining` above zero means the limit that fired was the SECONDARY one, so
+        its reset epoch says nothing about when this write may be retried."""
+        self.assertEqual(
+            self.delay(
+                "X-Ratelimit-Remaining: 7",
+                f"X-Ratelimit-Reset: {self.NOW + 45}",
+                now=self.NOW,
+            ),
+            PR.THROTTLE_DELAY_DEFAULT_SECONDS,
+        )
+
+    def test_a_reset_in_the_past_falls_through(self):
+        self.assertEqual(
+            self.delay(
+                "X-Ratelimit-Remaining: 0",
+                f"X-Ratelimit-Reset: {self.NOW - 45}",
+                now=self.NOW,
+            ),
+            PR.THROTTLE_DELAY_DEFAULT_SECONDS,
+        )
+
+    def test_no_headers_at_all_takes_the_default(self):
+        self.assertEqual(
+            PR.throttle_delay_seconds(gh_result(stdout="")),
+            PR.THROTTLE_DELAY_DEFAULT_SECONDS,
+        )
+        self.assertEqual(PR.THROTTLE_DELAY_DEFAULT_SECONDS, 60)
+
+    def test_unusable_values_fall_to_the_next_rule(self):
+        """Each header is untrusted text off the wire; a value that is not a
+        non-negative integer is not evidence, so it is skipped rather than guessed at."""
+        for label, lines in (
+            ("non-numeric retry-after", ("Retry-After: soon",)),
+            ("HTTP-date retry-after", ("Retry-After: Wed, 09 Sep 2026 04:06:32 GMT",)),
+            ("negative retry-after", ("Retry-After: -5",)),
+            ("empty retry-after", ("Retry-After:",)),
+            ("unparseable reset", ("X-Ratelimit-Remaining: 0", "X-Ratelimit-Reset: soon")),
+            ("remaining zero with no reset", ("X-Ratelimit-Remaining: 0",)),
+        ):
+            with self.subTest(case=label):
+                self.assertEqual(
+                    self.delay(*lines, now=self.NOW),
+                    PR.THROTTLE_DELAY_DEFAULT_SECONDS,
+                )
+
+    def test_every_answer_is_inside_the_clamp(self):
+        for lines in (
+            ("Retry-After: 999999",),
+            ("Retry-After: 0",),
+            ("X-Ratelimit-Remaining: 0", f"X-Ratelimit-Reset: {1_788_927_701 + 3600}"),
+            (),
+        ):
+            with self.subTest(headers=lines):
+                value = self.delay(*lines, now=self.NOW)
+                self.assertGreaterEqual(value, PR.THROTTLE_DELAY_MIN_SECONDS)
+                self.assertLessEqual(value, PR.THROTTLE_DELAY_MAX_SECONDS)
+
+
+class ThrottleBackoffTest(unittest.TestCase):
+    """The wait itself: before the landed-review read, and before the fallback POST.
+
+    THE FAILURE THIS PINS (BE-12691). BE-12612 stopped a throttled POST being misread
+    as a read-only token and routed it into the landed-review read — but that read goes
+    out on the SAME token GitHub just throttled, immediately, so it was liable to be
+    throttled in its turn. The answer that produced was UNKNOWN, and UNKNOWN on the
+    inline path posted the fallback: a DUPLICATE review whenever the throttled first
+    POST was one the API went on to serve, and a review cannot be un-posted.
+
+    Two halves, and both are needed. The backoff turns most of those UNKNOWNs into a
+    real answer by waiting out the window GitHub named. What is still UNKNOWN after it
+    declines the second write and fails closed instead — the findings reach the job
+    summary, `posted=false` keeps the fresh-review gate red rather than green over a
+    write nobody confirmed, and the step goes red.
+    """
+
+    ANCHORED = [finding("app.py", 11), finding("app.py", 12)]
+    THROTTLED_429 = "gh: You have exceeded a secondary rate limit. (HTTP 429)"
+    RESPONSE_429 = response("Retry-After: 30")
+
+    def landed_review(self, **overrides):
+        return FirstReviewConfirmationTest().landed_review(**overrides)
+
+    def test_the_backoff_happens_before_the_read_not_after_it(self):
+        """The whole point of the wait: the read must land on the far side of it.
+
+        Pinned on a shared call-order trace rather than on two independent counters,
+        because a sleep issued AFTER the read is indistinguishable from this one by
+        call count alone and buys nothing at all.
+        """
+        trace, sleeps = [], []
+        EndToEndPostTest().run_main(
+            self.ANCHORED,
+            post_returncode=1,
+            stderr=self.THROTTLED_429,
+            post_stdout=self.RESPONSE_429,
+            existing_reviews=[self.landed_review()],
+            trace=trace,
+            sleeps=sleeps,
+        )
+        self.assertEqual(
+            trace,
+            [("post",), ("sleep", 30), ("list", "o/r", "1")],
+            "POST, then the Retry-After wait, then the read",
+        )
+        self.assertEqual(sleeps, [30], "the wait is the one GitHub asked for")
+
+    def test_a_throttled_post_whose_review_landed_posts_nothing_more(self):
+        outputs, summaries, sleeps = {}, [], []
+        driver = EndToEndPostTest()
+        posted = driver.run_main(
+            self.ANCHORED,
+            post_returncode=1,
+            stderr=self.THROTTLED_429,
+            post_stdout=self.RESPONSE_429,
+            existing_reviews=[self.landed_review()],
+            outputs=outputs,
+            summaries=summaries,
+            sleeps=sleeps,
+        )
+        self.assertEqual(len(posted), 1, "PRESENT never reposts")
+        self.assertEqual(sleeps, [30], "and waits once, for the read only")
+        self.assertEqual(outputs["delivered"], "true")
+        self.assertEqual(outputs["posted"], "true")
+        self.assertEqual(summaries, [], "the review is on the PR")
+        self.assertIsNone(driver.exit_code)
+
+    def test_a_throttled_post_confirmed_absent_waits_again_then_falls_back(self):
+        """ABSENT is the one answer that authorizes the second write — and it goes out
+        on the same throttled token, so it waits the window out a second time."""
+        outputs, sleeps, trace = {}, [], []
+        driver = EndToEndPostTest()
+        posted = driver.run_main(
+            self.ANCHORED,
+            post_returncode=1,
+            stderr=self.THROTTLED_429,
+            post_stdout=self.RESPONSE_429,
+            existing_reviews=[],
+            outputs=outputs,
+            sleeps=sleeps,
+            trace=trace,
+        )
+        self.assertEqual(len(posted), 2, "inline attempt, then the body-only fallback")
+        self.assertEqual(
+            [step[0] for step in trace],
+            # The fallback is throttled too (the stub answers every POST the same way),
+            # so it takes the same wait-then-read treatment through post_or_degrade.
+            ["post", "sleep", "list", "sleep", "post", "sleep", "list"],
+        )
+        self.assertEqual(sleeps, [30, 30, 30])
+        self.assertEqual(outputs["delivered"], "false")
+        self.assertEqual(driver.exit_code, 1)
+
+    def test_an_unknown_answer_declines_the_fallback_and_fails_closed(self):
+        outputs, summaries, notes, sleeps = {}, [], [], []
+        driver = EndToEndPostTest()
+        posted = driver.run_main(
+            self.ANCHORED,
+            post_returncode=1,
+            stderr=self.THROTTLED_429,
+            post_stdout=self.RESPONSE_429,
+            list_returncode=1,
+            outputs=outputs,
+            summaries=summaries,
+            notes=notes,
+            sleeps=sleeps,
+        )
+        self.assertEqual(len(posted), 1, "no unverified second write")
+        self.assertEqual(sleeps, [30], "it waited once, then gave up rather than retry")
+        self.assertEqual(outputs["delivered"], "false")
+        self.assertEqual(outputs["posted"], "false")
+        self.assertEqual(len(summaries), 1)
+        self.assertIn(PR.POST_FAILED_SUMMARY_NOTE, notes)
+        self.assertEqual(driver.exit_code, 1)
+
+    def test_a_timeout_status_takes_the_read_immediately(self):
+        """408 and 425 are in RETRYABLE_4XX_STATUSES — an edge can raise either on a
+        request GitHub served — but neither says a rate window is closed, so neither
+        buys anything by waiting and both keep the immediate read."""
+        for status in (408, 425):
+            with self.subTest(status=status):
+                sleeps, calls = [], []
+                EndToEndPostTest().run_main(
+                    self.ANCHORED,
+                    post_returncode=1,
+                    stderr=f"gh: Request Timeout (HTTP {status})",
+                    post_stdout=response("Retry-After: 30", status=f"HTTP/2.0 {status} x"),
+                    existing_reviews=[self.landed_review()],
+                    sleeps=sleeps,
+                    list_calls=calls,
+                )
+                self.assertEqual(sleeps, [], "no wait")
+                self.assertEqual(calls, [("o/r", "1")], "but still the read")
+
+    def test_a_throttle_with_no_headers_waits_the_default(self):
+        """`gh -i` is what supplies the headers; a response that carried none — or a
+        `gh` too old to have been asked for them — still waits GitHub's stated
+        minimum rather than retrying straight away."""
+        sleeps = []
+        EndToEndPostTest().run_main(
+            self.ANCHORED,
+            post_returncode=1,
+            stderr=self.THROTTLED_429,
+            existing_reviews=[self.landed_review()],
+            sleeps=sleeps,
+        )
+        self.assertEqual(sleeps, [PR.THROTTLE_DELAY_DEFAULT_SECONDS])
+
+    def test_a_successful_post_never_waits(self):
+        sleeps = []
+        posted = EndToEndPostTest().run_main(
+            self.ANCHORED, post_stdout=GH_INCLUDE_STDOUT, sleeps=sleeps
+        )
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(sleeps, [], "the happy path reads no headers and waits not at all")
+
+    def test_the_no_inline_branch_waits_once_and_still_never_reposts(self):
+        """The branch with no inline half to drop asks the PR too — and its answer only
+        ever changes whether the round is reported delivered, never whether a second
+        body is written."""
+        for label, reviews, posted_flag, exit_code in (
+            ("landed", [self.landed_review()], "true", None),
+            ("absent", [], "false", 1),
+        ):
+            with self.subTest(answer=label):
+                outputs, sleeps, trace = {}, [], []
+                driver = EndToEndPostTest()
+                posted = driver.run_main(
+                    [finding("elsewhere.py", 7)],
+                    post_returncode=1,
+                    stderr=self.THROTTLED_429,
+                    post_stdout=self.RESPONSE_429,
+                    existing_reviews=reviews,
+                    outputs=outputs,
+                    sleeps=sleeps,
+                    trace=trace,
+                )
+                self.assertEqual(posted[0].get("comments", []), [])
+                self.assertEqual(len(posted), 1, "this branch never reposts")
+                self.assertEqual(sleeps, [30], "one wait, before the one read")
+                self.assertEqual(
+                    [step[0] for step in trace], ["post", "sleep", "list"]
+                )
+                self.assertEqual(outputs["posted"], posted_flag)
+                self.assertEqual(driver.exit_code, exit_code)
+
+    def test_post_or_degrade_waits_before_its_read_and_never_reposts(self):
+        """The third seam: the no-findings review, which post_or_degrade owns."""
+        for label, reviews, posted_flag, exit_code in (
+            ("landed", [self.landed_review()], "true", None),
+            ("absent", [], "false", 1),
+        ):
+            with self.subTest(answer=label):
+                outputs, sleeps, trace = {}, [], []
+                driver = EndToEndPostTest()
+                posted = driver.run_main(
+                    [],
+                    post_returncode=1,
+                    stderr=self.THROTTLED_429,
+                    post_stdout=self.RESPONSE_429,
+                    existing_reviews=reviews,
+                    outputs=outputs,
+                    sleeps=sleeps,
+                    trace=trace,
+                )
+                self.assertIn("No high-signal findings", posted[0]["body"])
+                self.assertEqual(len(posted), 1, "post_or_degrade reads, never reposts")
+                self.assertEqual(sleeps, [30])
+                self.assertEqual(
+                    [step[0] for step in trace], ["post", "sleep", "list"]
+                )
+                self.assertEqual(outputs["posted"], posted_flag)
+                self.assertEqual(driver.exit_code, exit_code)
+
+    def test_a_standing_403_never_waits(self):
+        """It returns on the read-only degradation well above the backoff, so a
+        permission or policy refusal costs no wall-clock at all."""
+        sleeps, calls = [], []
+        driver = EndToEndPostTest()
+        driver.run_main(
+            self.ANCHORED,
+            post_returncode=1,
+            stderr="gh: Resource not accessible by integration (HTTP 403)",
+            post_stdout=response("Retry-After: 30", status="HTTP/2.0 403 Forbidden"),
+            sleeps=sleeps,
+            list_calls=calls,
+        )
+        self.assertEqual(sleeps, [])
+        self.assertEqual(calls, [])
+        self.assertIsNone(driver.exit_code)
+
+
+class IncludeFlagTest(unittest.TestCase):
+    """`-i` is what makes the headers reachable, and it changes nothing else.
+
+    Verified against gh 2.92.0: the exit code is still nonzero on an error and stderr
+    is still `gh: <msg> (HTTP nnn)`, byte for byte. Every classifier in this module
+    reads stderr, so a rendering change there would have re-broken the read-only /
+    throttle split BE-12612 had just narrowed.
+    """
+
+    def test_the_post_asks_for_the_response_headers(self):
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured["argv"] = argv
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(PR.subprocess, "run", side_effect=fake_run):
+            PR.gh_post_review("o/r", "1", "{}")
+        self.assertIn("-i", captured["argv"])
+        self.assertEqual(captured["argv"][:3], ["gh", "api", "-i"])
+        self.assertIn("--method", captured["argv"])
+        self.assertIn("/repos/o/r/pulls/1/reviews", captured["argv"])
+
+    def test_the_stderr_classifiers_are_unchanged_by_it(self):
+        """The pin BE-12612 left behind: same stderr, same verdicts, with `-i` adding a
+        stdout that none of them reads."""
+        cases = (
+            ("gh: Unprocessable Entity (HTTP 422)", 422, False, False),
+            ("gh: Resource not accessible by integration (HTTP 403)", 403, True, False),
+            (
+                "gh: You have exceeded a secondary rate limit. (HTTP 403)",
+                403, False, True,
+            ),
+            ("gh: Too Many Requests (HTTP 429)", 429, False, True),
+            ("gh: Server Error (HTTP 500)", 500, False, False),
+        )
+        for stderr, status, read_only, throttle in cases:
+            for label, stdout in (("no -i", ""), ("with -i", GH_INCLUDE_STDOUT)):
+                with self.subTest(stderr=stderr[:40], stdout=label):
+                    result = gh_result(stdout=stdout, stderr=stderr)
+                    self.assertEqual(PR.gh_http_status(result), status)
+                    self.assertEqual(PR.gh_error_line(result), stderr)
+                    self.assertEqual(PR.is_read_only_token_error(result), read_only)
+                    self.assertEqual(PR.is_throttle(result), throttle)
 
 
 class FitSentinelItemsTest(unittest.TestCase):
