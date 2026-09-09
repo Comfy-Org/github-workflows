@@ -79,6 +79,11 @@ MAX_LEDGER_BYTES = 40 * 1024
 # under. The most RECENT replies are kept — they are the author's current
 # position — and dropping any is disclosed on the entry itself.
 MAX_REPLIES_PER_ENTRY = 8
+# The excerpt of the ANCESTOR's answering reply carried on a lineage line (BE-12534).
+# Deliberately tighter than MAX_BODY_CHARS: it is one line of context for a finding
+# whose own round has usually aged out, not the reply chain itself, and every demoted
+# re-raise on the PR pays for it out of MAX_LEDGER_BYTES.
+MAX_LINEAGE_ANSWER_CHARS = 300
 TRUNCATION_MARKER = " …[truncated]"
 
 # Max re-raises the judge may emit per review. Enforced deterministically in
@@ -240,6 +245,23 @@ BOT_USER_TYPE = "Bot"
 # thread to "answered" — that would let any passer-by spend the judge's repeat
 # budget and bury real findings. GitHub returns NONE/CONTRIBUTOR for outsiders.
 MAINTAINER_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
+
+# The shape a demoted finding's re-raise lineage may have in the sentinel (BE-12534).
+# Duplicated from post-review.py's REPEAT_URL_PATTERN / REPEAT_URL_MAX_CHARS rather
+# than imported (neither module imports the other) and pinned together by
+# test_build_ledger.py — a reader looser than the writer would accept payloads the
+# writer can never produce, and a reader stricter would silently drop lineage the
+# writer emitted.
+#
+# The regex is only the SHAPE gate. `_resolve_lineage` is the integrity check: the id
+# has to name a ROOT review comment on THIS PR belonging to one of OUR consolidated
+# reviews, so a judge-hallucinated or foreign URL of exactly this shape resolves to
+# nothing and the entry carries no lineage at all.
+REPEAT_URL_PATTERN = r"^https://github\.com/[^/\s]+/[^/\s]+/pull/\d+#discussion_r\d+$"
+REPEAT_URL_RE = re.compile(REPEAT_URL_PATTERN)
+REPEAT_URL_MAX_CHARS = 512
+# The comment id at the tail of a `repeat_of` that already passed REPEAT_URL_RE.
+_REPEAT_URL_ID_RE = re.compile(r"#discussion_r(\d+)$")
 
 
 class FetchError(Exception):
@@ -481,7 +503,113 @@ def _body_only_truncated(body: str) -> bool:
     return bool(_BODY_ONLY_TRUNCATED_RE.search(body or "", sentinel.end()))
 
 
-def _body_only_entries(review: dict, meta: dict, max_body: int):
+def _resolve_lineage(url, by_id: dict, replies_by_root: dict, round_by_review: dict,
+                     pr_author=None):
+    """Resolve a sentinel `repeat_of` to the ANCESTOR thread it names, or None.
+
+    The whole point of BE-12534. A demoted re-raise has no thread of its OWN, and the
+    existing rule — only an ANSWERED finding costs a repeat slot — was being applied to
+    that thread-less copy, which is unanswered by construction. So it is applied to the
+    ancestor instead, using the ancestor's REAL answer state. One demoted hop otherwise
+    made every later re-raise of the same finding cap-free.
+
+    Every step is a gate, and a failed gate returns None (no lineage) rather than a
+    partial answer:
+
+    * the value must be a string of the writer's exact shape and within its length
+      bound — `repeat_of` is judge output relayed through a public review body, so it
+      is never trusted as a URL just because it looks like one;
+    * the trailing `discussion_r<id>` must name a comment we actually fetched on this
+      PR (`cmd_build` fetches every review comment on it, so an ancestor whose round
+      has since aged past MAX_ROUNDS is still here — that is exactly the case this
+      exists for);
+    * that comment must be a thread ROOT (`in_reply_to_id` is None) belonging to one of
+      OUR consolidated reviews. This is the integrity check: it is what a hallucinated
+      id, a link to a human's review comment, and a link to a reply all fail.
+
+    Only the trailing id is READ from the URL — the owner/repo/PR-number half is SHAPE
+    ONLY and is never compared to anything. So a `repeat_of` naming a different repo or
+    PR number DOES resolve whenever its trailing id happens to match one of our roots;
+    what stops that from mattering is that `by_id` holds the comments of THIS PR alone
+    (so a resolved id is on this PR whatever slug the string claimed) and that the
+    result carries the ancestor's OWN `html_url`, never the relayed string. The relayed
+    URL is not a fallback: an ancestor with no `html_url` yields no lineage.
+
+    The round comes from `round_by_review`, which covers ALL consolidated reviews and is
+    built BEFORE the MAX_ROUNDS age filter — so the ancestor's round number is truthful
+    even when its own entries were dropped for size.
+
+    `answered_count` is the same computation the anchored branch does over the full
+    reply chain: an ANSWER is a reply from the PR author or a maintainer, never a
+    drive-by third party, because counting those would let any passer-by flip a live
+    finding to "answered" and spend the judge's repeat budget.
+    """
+    if not isinstance(url, str):
+        return None
+    url = url.strip()
+    # fullmatch, not match: `$` also matches just before a trailing newline, and a
+    # line break reaching the `re_raise_of:` render would sit at column 0 of the
+    # panel/judge prompt — the forged-fence shape `_FIELD_LINE_BREAK_RE` exists for.
+    # The length bound is tested FIRST so an absurd string is rejected without a
+    # scan. The strip above is the other half.
+    if len(url) > REPEAT_URL_MAX_CHARS or not REPEAT_URL_RE.fullmatch(url):
+        return None
+    match = _REPEAT_URL_ID_RE.search(url)
+    if not match:
+        return None
+    try:
+        comment_id = int(match.group(1))
+    except ValueError:
+        # `\d+` is unbounded, and int() past sys.get_int_max_str_digits() raises. This
+        # parser degrades rather than raising: one bad field must not escape into
+        # cmd_build's blanket except and cost the whole ledger.
+        return None
+    comment = by_id.get(comment_id)
+    if not isinstance(comment, dict):
+        return None
+    if comment.get("in_reply_to_id"):
+        return None
+    review_meta = round_by_review.get(comment.get("pull_request_review_id"))
+    if review_meta is None:
+        return None
+    # The ancestor's OWN permalink, from GitHub — the relayed string is NEVER a
+    # fallback. REPEAT_URL_RE shape-checks the owner/repo/PR-number half without
+    # comparing it to anything, and resolution reads the trailing id alone, so a
+    # `repeat_of` naming some OTHER repo resolves against a genuine root of ours.
+    # Relaying it would render that foreign link on the `re_raise_of:` line, which the
+    # steering then tells the judge to emit verbatim as `repeat_of` — publishing
+    # model-chosen text as a bot-authored link. No permalink means no lineage, the same
+    # way the anchored branch degrades to an empty `discussion_url` and an omitted line.
+    ancestor_url = comment.get("html_url") or ""
+    if not ancestor_url:
+        return None
+    answering = [
+        reply
+        for reply in replies_by_root.get(comment_id, [])
+        if (pr_author and ((reply.get("user") or {}).get("login") or "") == pr_author)
+        or (reply.get("author_association") or "") in MAINTAINER_ASSOCIATIONS
+    ]
+    # The most recent answer is the author's CURRENT position, the same rule
+    # MAX_REPLIES_PER_ENTRY keeps the tail of a hot thread for.
+    answering.sort(key=lambda c: (c.get("created_at") or "", c.get("id") or 0))
+    return {
+        "url": ancestor_url,
+        "round": review_meta["round"],
+        "answered_count": len(answering),
+        # The steering tells the model to ENGAGE the reason the ancestor's reply gave
+        # before re-raising. In the case this whole function exists for the ancestor's
+        # round has aged past MAX_ROUNDS, so its own entry — and its replies — are not
+        # in the ledger at all: without this the instruction names text the model
+        # cannot see, and it either drops a live finding or invents the engagement.
+        # Flattened AND truncated: it is a reply body, so it is the same untrusted
+        # prose every other imported field is, and it lands on a metadata line.
+        "answer": _body_only_text(
+            _truncate(answering[-1].get("body") or "", MAX_LINEAGE_ANSWER_CHARS)
+        ) if answering else "",
+    }
+
+
+def _body_only_entries(review: dict, meta: dict, max_body: int, resolve_lineage=None):
     """(entries, degraded) for one consolidated review's demoted findings.
 
     ``degraded`` is True when the review says it demoted findings that are not in the
@@ -555,6 +683,33 @@ def _body_only_entries(review: dict, meta: dict, max_body: int):
         # must not read as the flag being set.
         if item.get("lost_to_fallback") is True:
             entry["lost_to_fallback"] = True
+        # BE-12534: this demoted finding may itself have been a RE-RAISE. Its own
+        # thread state above stays exactly as it was — it has no thread, so
+        # answered_count 0 and an empty discussion_url are both still true of it — and
+        # the lineage is carried in separate keys so the render can say what the
+        # ANCESTOR's answer state was. Optional-key discipline, like lost_to_fallback:
+        # an ABSENT `repeat_of` sets none of them, so an entry that never claimed
+        # lineage is identical to what this built before the keys existed. A claim that
+        # fails to resolve is its own third state — see below.
+        claimed = item.get("repeat_of")
+        resolved = resolve_lineage(claimed) if resolve_lineage else None
+        if resolved:
+            entry["repeat_of"] = resolved["url"]
+            entry["repeat_round"] = resolved["round"]
+            entry["repeat_answered_count"] = resolved["answered_count"]
+            if resolved["answer"]:
+                entry["repeat_answer"] = resolved["answer"]
+        elif isinstance(claimed, str) and claimed.strip():
+            # A lineage CLAIM that did not resolve is not the same thing as no claim,
+            # and rendering them alike is how the cap-free chain reopens: dismissing a
+            # review (`_consolidated_reviews` drops DISMISSED ones, so `round_by_review`
+            # loses its roots) or deleting the ancestor comment are ordinary maintainer
+            # actions, and either one silently turned this entry back into a plain
+            # cap-EXEMPT demoted finding. Recorded so the render can withhold the
+            # exemption it can no longer justify. Deliberately NOT the converse claim —
+            # an unverified ancestor is not evidence the finding WAS answered, and
+            # asserting it would let a forged, unresolvable URL spend a repeat slot.
+            entry["repeat_unresolved"] = True
         entries.append(entry)
     return entries, truncated
 
@@ -679,11 +834,21 @@ def build_ledger(
     # Findings this round DEMOTED into its own body: no comment, so no thread root
     # above ever sees them. Read straight off the consolidated reviews, which the
     # Bot-author + marker + not-DISMISSED filter has already vouched for.
+    #
+    # Runs BELOW the `by_id` / `roots` / `replies_by_root` indexes on purpose: a demoted
+    # finding that was itself a RE-RAISE names its ancestor thread in the sentinel
+    # (BE-12534), and resolving that needs the whole PR's comments — including the
+    # ancestor's, whose own round may be about to be dropped by the MAX_ROUNDS filter
+    # below. `round_by_review` covers every consolidated review, so the resolution
+    # happens before any age filtering, which is the point.
+    def resolve_lineage(url):
+        return _resolve_lineage(url, by_id, replies_by_root, round_by_review, pr_author)
+
     entries = []
     degraded_rounds = []
     for review in consolidated:
         meta = round_by_review[review.get("id")]
-        recovered, degraded = _body_only_entries(review, meta, max_body)
+        recovered, degraded = _body_only_entries(review, meta, max_body, resolve_lineage)
         entries.extend(recovered)
         if degraded:
             degraded_rounds.append(meta["round"])
@@ -926,6 +1091,12 @@ _PANEL_STEERING = (
     "  finding passed the diff-anchor check and lost its thread to an API failure\n"
     "  that delivered the whole review as prose. Re-raise it if it still applies;\n"
     "  the \"prefer not to\" above is about unanchorable findings and not about it.\n"
+    "- An [unanchorable] or [post-failed] entry that carries a re_raise_of: line was\n"
+    "  ITSELF a re-raise, of the thread that line names. When that line reports\n"
+    "  ancestor_answers >= 1, the original WAS answered — so the first bullet above\n"
+    "  DOES apply to it: engage the reason quoted on its re_raise_answer: line, and\n"
+    "  name the round on the re_raise_of: line, before raising it again. With no\n"
+    "  re_raise_of: line, or with ancestor_answers=0 on it, nothing changes.\n"
 )
 
 _JUDGE_STEERING = (
@@ -947,15 +1118,29 @@ _JUDGE_STEERING = (
     "  A deferral (\"real, but deferred\") is not a refutation — but re-raising a\n"
     "  deferral costs one of your repeat slots, so spend it on severity.\n"
     "- An entry marked [unanchorable] has NO discussion_url and never takes\n"
-    "  repeat_of — it was demoted to a review body, so no thread exists and nobody\n"
-    "  could have answered it. If the same unanchorable finding appears in several\n"
-    "  recent rounds, prefer NOT re-raising it unless its severity warrants; if you\n"
-    "  do re-raise it, say in the body that it repeats unanchored.\n"
+    "  repeat_of for ITSELF — it was demoted to a review body, so no thread exists\n"
+    "  and nobody could have answered it. If the same unanchorable finding appears in\n"
+    "  several recent rounds, prefer NOT re-raising it unless its severity warrants;\n"
+    "  if you do re-raise it, say in the body that it repeats unanchored.\n"
     "- An entry marked [post-failed] has NO discussion_url and never takes repeat_of\n"
-    "  either, and costs no repeat slot. But unlike [unanchorable] it DID pass the\n"
-    "  diff-anchor check — its review was lost to an API failure and delivered as\n"
-    "  prose — so the preference above does not apply to it:\n"
-    "  re-raise it if it still holds.\n"
+    "  for ITSELF either, and on its own costs no repeat slot. But unlike\n"
+    "  [unanchorable] it DID pass the diff-anchor check — its review was lost to an\n"
+    "  API failure and delivered as prose — so the preference above does not apply to\n"
+    "  it: re-raise it if it still holds.\n"
+    "- LINEAGE, and it overrides both bullets above. An [unanchorable] or\n"
+    "  [post-failed] entry that carries a re_raise_of: line was ITSELF a re-raise, of\n"
+    "  the ancestor thread that line names. When that line reports ancestor_answers\n"
+    "  >= 1 the ancestor WAS answered, so a finding matching this entry may only be\n"
+    "  emitted if it carries \"repeat_of\": that re_raise_of URL and \"repeat_round\":\n"
+    "  that line's round number — and it costs a repeat slot like any other re-raise.\n"
+    "  Its body OPENS by engaging the reply quoted on the re_raise_answer: line.\n"
+    "  Use the re_raise_of URL, never the entry's own (it has none). With\n"
+    "  ancestor_answers=0 on that line, or with no re_raise_of: line at all, nothing\n"
+    "  changes: no repeat_of, no slot.\n"
+    "- An entry whose parenthetical says its re-raise claim is UNVERIFIED names an\n"
+    "  ancestor thread that is no longer on this PR, so nothing can be read off it.\n"
+    "  It takes no repeat_of (there is no URL to carry) and costs no slot, but do not\n"
+    "  treat it as a finding nobody ever answered either — judge it on its merits.\n"
 )
 
 
@@ -1016,6 +1201,21 @@ def render_ledger_markdown(ledger: dict, audience: str = "panel") -> str:
         # BE-10002 (or by a consumer still pinned to an older SHA) carries no flag and
         # renders exactly as it always did.
         lost_to_fallback = entry.get("lost_to_fallback") is True
+        # BE-12534. Set only on a thread-less entry whose sentinel named an ancestor
+        # thread that RESOLVED — so reaching here means the URL is one of our own
+        # review comments' permalinks, not relayed model text. `_defang_fences` is
+        # applied at the render anyway, like every other imported field.
+        #
+        # Gated on `not anchored` as well, which _body_only_entries already guarantees
+        # (only it writes these keys). Stated here rather than assumed so "anchored
+        # entries render exactly as before" is a property of THIS function and not an
+        # invariant a reader has to go and confirm somewhere else: an anchored entry
+        # has a discussion_url of its own, and a second link claiming to be its lineage
+        # is the one thing that could make the judge emit the wrong repeat_of.
+        re_raise_url = "" if anchored else (entry.get("repeat_of") or "")
+        re_raise_answered = 0 if anchored else (entry.get("repeat_answered_count") or 0)
+        re_raise_answer = "" if anchored else (entry.get("repeat_answer") or "")
+        re_raise_unresolved = False if anchored else bool(entry.get("repeat_unresolved"))
         # path/severity are defanged like the prose below. For a thread-derived entry
         # they came from GitHub, but a body-only entry relays them from model output
         # through the sentinel, and both land on the HEADER line. `_body_only_text`
@@ -1042,7 +1242,33 @@ def render_ledger_markdown(ledger: dict, audience: str = "panel") -> str:
             f"outdated={str(thread['outdated']).lower()} "
             f"replies={thread['reply_count']} "
             f"answers_from_author_or_maintainer={thread['answered_count']}\n"
-            f"  finding: {_defang_fences(entry['finding'])}\n"
+            # The lineage line (BE-12534). Sits under `thread:` so the two read
+            # together: this entry's own thread state (none) and the ANCESTOR's, which
+            # is the one the repeat policy is actually about.
+            #
+            # `ancestor_answers=`, NOT the `answers_from_author_or_maintainer=` token
+            # the `thread:` line above uses: the two describe different findings and
+            # hold different values on the same entry (0 here, >=1 there), and the
+            # judge's first REPEAT POLICY bullet keys on that token to demand a
+            # `repeat_of` equal to the entry's own discussion_url — which this entry
+            # does not have. A distinct name removes the collision outright instead of
+            # leaving the LINEAGE bullet's stated precedence to resolve it.
+            + (
+                f"  re_raise_of: {_defang_fences(re_raise_url)} "
+                f"(round {entry.get('repeat_round') or '?'}; "
+                f"ancestor_answers={re_raise_answered})\n"
+                if re_raise_url
+                else ""
+            )
+            # The ancestor's own answer, quoted, so "engage the reason that thread's
+            # reply gives" names text the model can actually see. Its round has usually
+            # aged out of the ledger, so this is the only place it appears.
+            + (
+                f"  re_raise_answer: {_defang_fences(re_raise_answer)}\n"
+                if re_raise_url and re_raise_answer
+                else ""
+            )
+            + f"  finding: {_defang_fences(entry['finding'])}\n"
         )
         if entry.get("dropped_replies"):
             lines.append(
@@ -1060,7 +1286,40 @@ def render_ledger_markdown(ledger: dict, audience: str = "panel") -> str:
                 # judge must not treat it as one.
                 tag = " (third party — NOT an answer)"
             lines.append(f"  reply from {who}{tag}: {_defang_fences(reply['text'])}\n")
-        if not anchored and lost_to_fallback:
+        if not anchored and re_raise_url and re_raise_answered >= 1:
+            # The one thread-less case that DOES cost a repeat slot (BE-12534). The
+            # entry has no thread of its own — everything above still says so — but it
+            # was a re-raise of a finding the author or a maintainer ANSWERED, and the
+            # existing rule (only an answered finding costs a slot) applies to that
+            # ancestor. Said instead of the "needs no repeat_of" lines below, not
+            # alongside them: an entry gets exactly one closing parenthetical, and two
+            # that contradict each other is the aggregate-vs-detail failure the counts
+            # above are split to avoid. The lead clause still names WHICH kind of
+            # thread-less entry this is, because that part has not changed.
+            lead = (
+                "review POST failed — this finding matched a line in the reviewed diff "
+                "but its review was delivered body-only, so it has no thread of its own"
+                if lost_to_fallback
+                else "unanchorable — demoted to the review body, no thread of its own"
+            )
+            lines.append(
+                f"  ({lead}; it re-raised an ANSWERED finding, so re-raising it again "
+                f"MUST carry repeat_of: {_defang_fences(re_raise_url)} and costs a "
+                "repeat slot)\n"
+            )
+        elif not anchored and re_raise_unresolved:
+            # A lineage CLAIM we could not verify (BE-12534). Withholds the cap
+            # exemption without asserting the opposite: the entry is not stated to have
+            # been answered — nothing here knows that — so a forged unresolvable URL
+            # cannot spend a repeat slot, and a real ancestor lost to a dismissal or a
+            # deleted comment no longer silently reads as a fresh, free finding.
+            lines.append(
+                "  (this finding says it re-raised an earlier thread, but that thread "
+                "could not be found on this PR — its review may have been dismissed or "
+                "its comment deleted. The claim is UNVERIFIED: treat the finding on "
+                "its merits and do not rely on it being cap-exempt.)\n"
+            )
+        elif not anchored and lost_to_fallback:
             # Same "nobody could have answered it" as below, but the reason matters:
             # this finding passed the diff-anchor check, so the steering that asks the
             # panel to prefer not re-raising an unanchorable one would be wrong about

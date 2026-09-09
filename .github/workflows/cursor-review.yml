@@ -2140,8 +2140,15 @@ jobs:
     runs-on: ubuntu-latest
     # Three artifact downloads, a token mint, and post-review.py's ONE
     # `gh api POST /pulls/N/reviews` carrying every inline comment in a single
-    # payload — minutes of work at most. Bounded like every other job here so a
-    # rate-limited or hung call cannot hold a runner for the 6-hour default.
+    # payload — plus, on a POST failure that is not a pre-write rejection, at most
+    # one paginated read of the PR's reviews (one `gh` command, but one request PER
+    # PAGE), to tell a review that never landed from one that landed despite the
+    # error (`pull-requests: write` already implies that read, so no permission
+    # changes here) — minutes of work at most. That read carries its own
+    # GH_LIST_REVIEWS_TIMEOUT_SECONDS well under this budget, so a wedged list cannot
+    # eat the job's whole allowance and take the fallback POST down with it. Bounded
+    # like every other job here so a rate-limited or hung call cannot hold a runner
+    # for the 6-hour default.
     timeout-minutes: 10
     permissions:
       contents: read
