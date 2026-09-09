@@ -119,6 +119,41 @@ test('allowlist stays author-scoped, not trigger-actor scoped', async () => {
   assert.deepEqual((await run({env: {AUTHOR_ALLOWLIST: 'someone-else'}})).selected, []);
   assert.deepEqual((await run({env: {AUTHOR_ALLOWLIST: '@AUTHOR'}})).selected, ['alice']);
 });
+// REVIEWER_SKIP_BASE_BRANCHES: the stacked-PR lane knob. The default-off case is
+// asserted first and hardest, because it is every existing caller.
+test('base-branch skip is off until the var is set', async () => {
+  assert.deepEqual((await run()).selected, ['alice']);
+  assert.deepEqual((await run({env: {SKIP_BASE_BRANCHES: ''}})).selected, ['alice']);
+  assert.deepEqual((await run({env: {SKIP_BASE_BRANCHES: '   '}})).selected, ['alice']);
+});
+test('a PR onto a skipped base is not routed, and one onto the default branch still is', async () => {
+  assert.deepEqual((await run({pr: {base: {sha: 'base', ref: 'stack/router-queue-poc'}}, env: {SKIP_BASE_BRANCHES: 'stack/**'}})).selected, []);
+  assert.deepEqual((await run({env: {SKIP_BASE_BRANCHES: 'stack/**'}})).selected, ['alice']);
+});
+test('base-branch globs use the same semantics as the path rules', async () => {
+  const skip = (ref, patterns) => run({pr: {base: {sha: 'base', ref}}, env: {SKIP_BASE_BRANCHES: patterns}}).then(r => r.selected.length === 0);
+  // `stack/**` spans segments, so a nested stack branch is covered too.
+  assert.equal(await skip('stack/a/b', 'stack/**'), true);
+  // A bare pattern is an exact match, never a prefix: `release` must not swallow
+  // `release/1.2` or `releases`. Getting this wrong silently disables routing on
+  // branches nobody meant to exempt.
+  assert.equal(await skip('release', 'release'), true);
+  assert.equal(await skip('release/1.2', 'release'), false);
+  assert.equal(await skip('releases', 'release'), false);
+  // `*` stays within a segment.
+  assert.equal(await skip('stack/one', 'stack/*'), true);
+  assert.equal(await skip('stack/one/two', 'stack/*'), false);
+  // Several patterns, whitespace-separated.
+  assert.equal(await skip('wip/thing', 'stack/** wip/**'), true);
+  // A non-matching pattern list leaves routing alone.
+  assert.equal(await skip('main', 'stack/**'), false);
+});
+test('base-branch skip happens before any API call', async () => {
+  // It is an early exit, so it must cost nothing: no file listing, no config read.
+  const result = await run({pr: {base: {sha: 'base', ref: 'stack/x'}}, env: {SKIP_BASE_BRANCHES: 'stack/**'}});
+  assert.deepEqual(result.calls, []);
+  assert.deepEqual(result.reads, []);
+});
 for (const [name, change] of Object.entries({manual: {assignees: [{login: 'manual'}]}, draft: {draft: true}, closed: {state: 'closed'}, skip: {labels: [{name: 'skip-auto-assign'}]}, reviewer: {requested_reviewers: [{login: 'manual'}]}, team: {requested_teams: [{slug: 'team'}]}, pushed: {head: {sha: 'new'}}, retargeted: {base: {sha: 'new-base', ref: 'release'}}})) {
   test(`live ${name} state before mutation prevents assignments`, async () => assert.deepEqual((await run({beforeWrite: change})).selected, []));
 }
