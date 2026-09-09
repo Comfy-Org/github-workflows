@@ -847,14 +847,7 @@ class BodyBudgetTest(unittest.TestCase):
         body = EndToEndPostTest().run_main(findings)[0]["body"]
         # Read the PAYLOAD, not the ledger: build_ledger re-sorts its entries, so the
         # order the sentinel was WRITTEN in — the thing under test — only survives here.
-        sentinel = [
-            ln for ln in body.splitlines()
-            if ln.startswith(f"<!-- {PR.BODY_ONLY_SENTINEL_PREFIX} ")
-        ]
-        self.assertEqual(len(sentinel), 1, "exactly one sentinel line")
-        payload = json.loads(
-            sentinel[0][len("<!-- ") + len(PR.BODY_ONLY_SENTINEL_PREFIX) : -len(" -->")]
-        )
+        payload = sentinel_payload(body)
         self.assertGreater(len(payload), 0)
         self.assertLess(len(payload), 100, "not all of them fit")
         self.assertEqual(payload[0]["severity"], "critical", "the most urgent is kept")

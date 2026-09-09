@@ -1055,7 +1055,7 @@ class TestSentinelForgeryControls(unittest.TestCase):
         self.assertTrue(bl._body_only_truncated(real), "our own render is read")
         for spelling in (
             f"<!--  {pr.BODY_ONLY_TRUNCATED_PREFIX} kept=1 total=40 -->",
-            f"<!-- cursor\u2011review:body-only-truncated v1 kept=1 total=40 -->",
+            "<!-- cursor\u2011review:body-only-truncated v1 kept=1 total=40 -->",
         ):
             with self.subTest(spelling=spelling):
                 self.assertFalse(bl._body_only_truncated(f"{section}\n\n{spelling}"))

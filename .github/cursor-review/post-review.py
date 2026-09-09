@@ -1246,7 +1246,7 @@ def render_code_ref(path, line) -> str:
 # defang_body_only_contract. Applied to EVERY `<!--`, not just a line-leading one: which
 # column a substring lands in depends on the wrapping around it, and the escape is free.
 HTML_COMMENT_OPENER = "<!--"
-DEFANGED_COMMENT_OPENER = "<​!--"
+DEFANGED_COMMENT_OPENER = "<\u200b!--"
 
 
 def render_finding_entry(c: dict) -> str:
