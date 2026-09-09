@@ -2144,20 +2144,30 @@ jobs:
     # one paginated read of the PR's reviews (one `gh` command, but one request PER
     # PAGE), to tell a review that never landed from one that landed despite the
     # error (`pull-requests: write` already implies that read, so no permission
-    # changes here) — minutes of work at most. That read carries its own
-    # GH_LIST_REVIEWS_TIMEOUT_SECONDS well under this budget, so a wedged list cannot
-    # eat the job's whole allowance and take the fallback POST down with it.
+    # changes here) — minutes of work at most. Every one of those calls is bounded:
+    # the reads by GH_LIST_REVIEWS_TIMEOUT_SECONDS and the POSTs by
+    # GH_POST_REVIEW_TIMEOUT_SECONDS, both well under this budget, so a wedged call
+    # cannot eat the job's whole allowance and take the fallback POST — or the job
+    # summary that is written after it — down with it.
     #
-    # A THROTTLED write (429, or one of the 403 wordings that mean "slow down") adds a
-    # bounded WAIT in front of each of those reads, and one more before the body-only
-    # fallback — otherwise the read goes out on the token GitHub just throttled and
-    # comes back "could not tell", which is the answer that used to cost a duplicate
-    # review. Each wait is `Retry-After` (or the `X-RateLimit-Reset` window) clamped to
-    # THROTTLE_DELAY_MAX_SECONDS, so the worst case is three 90s waits plus two bounded
-    # reads — 6.5 minutes, inside this budget with the artifact downloads and the token
-    # mint alongside it. Nothing here retries an unconfirmed write: a throttle whose
-    # landed-review read is still unreadable after the wait declines the fallback and
-    # goes red with the review in the job summary.
+    # A THROTTLED write (429, one of the 403 wordings that mean "slow down", or a 403
+    # carrying its own `Retry-After`) adds a bounded WAIT in front of the landed-review
+    # read — otherwise that read goes out on the token GitHub just throttled and comes
+    # back "could not tell", which is the answer that used to cost a duplicate review.
+    # The wait is `Retry-After` (or the `X-RateLimit-Reset` window) clamped to
+    # THROTTLE_DELAY_MAX_SECONDS, and it is ONE window per throttled POST: the inline
+    # path's read and its body-only fallback share a single deadline, so the fallback
+    # finishes the remainder rather than sitting out a second full wait. Worst case is
+    # therefore two 90s waits plus two bounded reads and two bounded POSTs — 7 minutes,
+    # inside this budget with the artifact downloads and the token mint alongside it.
+    #
+    # Nothing here retries an unconfirmed write: a throttle whose landed-review read is
+    # still unreadable after the wait declines the fallback and goes red with the review
+    # in the job summary. Nor does anything call the API inside a window GitHub closed —
+    # a declared embargo longer than THROTTLE_DELAY_MAX_SECONDS (a primary rate limit
+    # sends hour-long values) skips the wait, the read and the fallback outright and
+    # goes straight to the job summary, since retrying inside it escalates the limit for
+    # the whole App installation.
     #
     # Bounded like every other job here so a rate-limited or hung call cannot hold a
     # runner for the 6-hour default.
