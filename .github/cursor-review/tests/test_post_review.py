@@ -1312,9 +1312,10 @@ class ReadOnlyGuardExcludesThrottlesTest(unittest.TestCase):
     token, written to the job summary and exited 0, with the PR never asked whether
     the review had actually landed. The guard now excludes those wordings, and 403
     joins RETRYABLE_4XX_STATUSES so what falls through takes the read instead of being
-    assumed absent. Both halves are needed: narrowing the guard alone would send a
-    throttled 403 into `pre_write_rejection`, which treats a 4xx outside that set as
-    absent by construction and skips the read just the same.
+    assumed absent. Both halves are needed: narrowing the guard alone would leave
+    `post_may_have_landed` answering False for a throttled 403 — it reads a 4xx
+    outside that set as absent by construction — and the read would be skipped just
+    the same.
 
     The narrowing is an ALLOWLIST of throttles, not a denylist of the permission
     phrase, and `test_a_policy_403_still_degrades_to_the_summary` is why: every OTHER
@@ -1489,8 +1490,9 @@ class ReadOnlyGuardExcludesThrottlesTest(unittest.TestCase):
         """The allowlist, pinned to the wordings GitHub actually sends with a 403.
 
         Each of these can be raised on a request the API went on to serve, so none may
-        short-circuit the landed-review read. Matched case-insensitively for the same
-        reason the permission phrase is.
+        short-circuit the landed-review read. Matched case-insensitively because `gh`
+        echoes GitHub's message verbatim and nothing guarantees its capitalisation —
+        this allowlist is the only case-insensitive match left in the guard.
         """
         for message in (
             "API rate limit exceeded for installation ID 1234",
