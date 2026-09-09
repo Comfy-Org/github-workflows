@@ -131,17 +131,21 @@ Your caller's `secrets:` mapping is evaluated in the *caller* job, which cannot 
 
 > Environment secrets cannot be passed from the caller workflow as `on.workflow_call` does not support the `environment` keyword. If you include `environment` in the reusable workflow at the job level, the environment secret will be used, and not the secret passed from the caller workflow.
 
-That name match is the whole mechanism: **the environment must hold a secret named exactly `BOT_APP_PRIVATE_KEY`.** A differently-named environment secret does not error — it silently leaves the passed (or empty) value in place, and you get a green run that never used the environment copy.
+That name match is the whole mechanism: **the environment must hold a secret named exactly `BOT_APP_PRIVATE_KEY`.**
+
+What happens when it does *not* — because the name is misspelled, or because a typo'd `environment:` auto-created an empty one — is the one thing here we have **not** confirmed against a run. GitHub's precedence model is a merge in which the most specific level wins, which implies the caller-passed value simply stays in place: a green run that quietly never used the environment copy. The competing reading is that binding the environment leaves the job with no usable key and token minting fails outright. The documented sentence above settles which secret wins when *both* exist; it does not settle the absent case, and we have not tested it.
+
+Assume the silent one. It is the reading that costs you something — a loud mint failure tells you immediately, whereas a green run that still reads the repository key looks exactly like success. Step 4 below is what catches it either way, and it is why step 5 comes last.
 
 ### Migration sequence
 
 Do these in order. Steps 1–3 are additive and reversible; **step 5 is the one that actually removes the exposure**, and doing it before step 4 breaks groom.
 
-1. **Create the environment and its deployment-branch policy first.** Settings → Environments → New environment (`bot-main`), then restrict deployment branches to your default branch. Do not skip this: GitHub creates a referenced-but-missing environment **on demand, with no rules and no secrets**, so a typo'd or not-yet-created name fails *open* — the jobs still run, still receive the repository-level key, and the gate you think you have does not exist. There is no error to notice.
+1. **Create the environment and its deployment-branch policy first.** Settings → Environments → New environment (`bot-main`), then restrict deployment branches to your default branch. Do not skip this: GitHub creates a referenced-but-missing environment **on demand, with no rules and no secrets**, so a typo'd or not-yet-created name gives you a run with no gate on it at all — and, on the reading above, no error to notice either. Check the environment name against Settings → Environments rather than trusting a green run.
 2. **Add the App key to that environment** as an environment secret named exactly `BOT_APP_PRIVATE_KEY`.
 3. **Set the input** on your caller: `environment: bot-main` under `with:`. It is an ordinary `type: string` input (a `${{ vars.* }}` expression works too) — it is *not* a secret and must not be routed through `secrets:`.
-4. **Validate one real run.** Confirm the run shows a deployment to `bot-main` on `build_select` and `file`, and that issues were filed under the bot. Until this passes, keep the repository secret — it is still what the run reads if anything above is misconfigured.
-5. **Only then delete the repository-level secret** (`CLOUD_CODE_BOT_PRIVATE_KEY` in the Comfy setup). This is the step that ends the "readable from every branch" exposure. Until you do it, the key is exactly as reachable as before, no matter what the environment says.
+4. **Validate one real run.** Confirm the run shows a deployment to `bot-main` on `build_select` and `file`, and that issues were filed under the bot. Do not treat green alone as proof — a run that is still reading the repository key is also green. The deployment appearing on those two jobs is the signal that the binding took effect. Keep the repository secret until this passes.
+5. **Only then delete the repository-level secret** (`CLOUD_CODE_BOT_PRIVATE_KEY` in the Comfy setup). This is the step that ends the "readable from every branch" exposure — until you do it, the key is exactly as reachable as before, no matter what the environment says. Deleting it is also what makes step 4's check meaningful in retrospect: from here on, a working run *cannot* be one that fell back. Treat the repository secret as a **rollback path** rather than a safety net — if the environment-backed run misbehaves, re-adding it restores the previous state.
 
 **Your caller's `secrets:` mapping does not change**, and step 5 does not break it. The final form is still:
 
