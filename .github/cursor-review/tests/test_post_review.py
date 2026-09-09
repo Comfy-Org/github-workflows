@@ -31,6 +31,7 @@ Run: python3 -m unittest discover -s .github/cursor-review/tests -p 'test_*.py'
 
 import contextlib
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -1320,7 +1321,10 @@ class FirstReviewConfirmationTest(unittest.TestCase):
             existing_reviews=[],
             list_calls=calls,
         )
-        self.assertEqual(calls, [("o/r", "1")], "asked the PR exactly once")
+        # Twice, not once: the stub fails the FALLBACK the same way, and post_or_degrade
+        # asks the same question about that POST for the same reason (BE-12612). Both
+        # reads answer ABSENT here, so the behaviour below is unchanged.
+        self.assertEqual(calls, [("o/r", "1"), ("o/r", "1")])
         self.assertEqual(len(posted), 2)
         ledger = ledger_from_posted_body(posted[1]["body"])
         self.assertEqual(ledger["post_failed_count"], len(self.ANCHORED))
@@ -1432,7 +1436,8 @@ class FirstReviewConfirmationTest(unittest.TestCase):
             existing_reviews=[],
             list_calls=calls,
         )
-        self.assertEqual(calls, [("o/r", "1")])
+        # Once for the inline POST, once for the fallback the stub fails identically.
+        self.assertEqual(calls, [("o/r", "1"), ("o/r", "1")])
 
     def test_the_consolidated_marker_matches_gate_unresolved(self):
         """One discriminator, three readers (the gate, the ledger, and now this) — so
@@ -1642,9 +1647,470 @@ class FirstReviewConfirmationTest(unittest.TestCase):
 
         self.assertEqual(status("gh: Unprocessable Entity (HTTP 422)"), 422)
         self.assertEqual(status("gh: Bad Gateway (HTTP 502)"), 502)
+        self.assertEqual(
+            status("gh: You have exceeded a secondary rate limit (HTTP 403)"), 403,
+            "a throttled 403 carries a status like any other — it is not the "
+            "permission case and must reach the landed-review check",
+        )
         self.assertIsNone(status("error connecting to api.github.com"))
         self.assertIsNone(status(""))
         self.assertIsNone(status(None), "a CompletedProcess can carry no stderr at all")
+
+
+class ReadOnlyGuardExcludesThrottlesTest(unittest.TestCase):
+    """A THROTTLED 403 is not a read-only token, and must not short-circuit the read.
+
+    `is_read_only_token_error` used to match the bare `HTTP 403` substring, and
+    `main()` returns from that branch BEFORE the landed-review check — so a primary or
+    secondary rate limit and an abuse-detection refusal were reported as a read-only
+    token, written to the job summary and exited 0, with the PR never asked whether
+    the review had actually landed. The guard now excludes those wordings, and 403
+    joins RETRYABLE_4XX_STATUSES so what falls through takes the read instead of being
+    assumed absent. Both halves are needed: narrowing the guard alone would leave
+    `post_may_have_landed` answering False for a throttled 403 — it reads a 4xx
+    outside that set as absent by construction — and the read would be skipped just
+    the same.
+
+    The narrowing is an ALLOWLIST of throttles, not a denylist of the permission
+    phrase, and `test_a_policy_403_still_degrades_to_the_summary` is why: every OTHER
+    403 — SSO, IP allowlist, archived repo, a reworded permission message — is a
+    standing refusal that no retry fixes and that wrote nothing. Routing those into
+    the read plus a doomed fallback would replace a green degrade with a permanently
+    red check in exactly the orgs least able to change it.
+    """
+
+    ANCHORED = [finding("app.py", 11), finding("app.py", 12)]
+
+    # The real messages, verbatim. `gh api` renders GitHub's error as
+    # `gh: <message> (HTTP 403)`, so the status is identical across all of them and
+    # the message is the only thing separating a throttle from a standing refusal.
+    PERMISSION = "gh: Resource not accessible by integration (HTTP 403)"
+    # An org-policy refusal: the wording shares nothing with the permission phrase,
+    # which is precisely why the guard cannot be written as "not the permission phrase".
+    POLICY = (
+        "gh: Although you appear to have the correct authorization credentials, the "
+        "`acme` organization has enabled OAuth App access restrictions (HTTP 403)"
+    )
+    THROTTLED = (
+        "gh: You have exceeded a secondary rate limit. Please wait a few minutes "
+        "before you try again. (HTTP 403)"
+    )
+
+    def landed_review(self, **overrides):
+        return FirstReviewConfirmationTest().landed_review(**overrides)
+
+    def test_the_permission_403_still_degrades_to_the_summary(self):
+        """The case the guard is FOR, unchanged: no read, no fallback, green exit.
+
+        A read-only token rejects the fallback exactly as it rejected the first POST,
+        and no read is worth the call because nothing was written — so this branch
+        still returns before either.
+
+        Both of `gh`'s renderings, because the guard now conjoins the status and
+        `_GH_HTTP_STATUS_RE` has to find a 403 in either of them: the parenthesized
+        trailer `gh api` usually prints, and go-gh's leading `HTTP 403: <msg> (<url>)`.
+        Reading the second as "no status" would drop this case out of the degrade and
+        into a doomed read, a doomed fallback and a permanently red check. There is no
+        lower-cased variant any more: since BE-12612 the guard is `403 and not a
+        throttle` and never inspects the permission wording at all, so a case-folded
+        copy of it would exercise the identical path. The surviving case-insensitive
+        match is the throttle allowlist, pinned by
+        `test_every_throttle_wording_falls_through_the_guard`.
+        """
+        for label, stderr in (
+            ("as GitHub sends it", self.PERMISSION),
+            ("go-gh's leading-status rendering", (
+                "gh: HTTP 403: Resource not accessible by integration "
+                "(https://api.github.com/repos/o/r/pulls/1/reviews)"
+            )),
+        ):
+            with self.subTest(message=label):
+                outputs, summaries, notes, calls = {}, [], [], []
+                driver = EndToEndPostTest()
+                posted = driver.run_main(
+                    self.ANCHORED,
+                    post_returncode=1,
+                    stderr=stderr,
+                    list_calls=calls,
+                    outputs=outputs,
+                    summaries=summaries,
+                    notes=notes,
+                )
+                self.assertEqual(calls, [], "a read-only token wrote nothing to read")
+                self.assertEqual(len(posted), 1, "no fallback — it would fail the same way")
+                self.assertEqual(outputs["delivered"], "false")
+                self.assertEqual(outputs["posted"], "false")
+                self.assertEqual(len(summaries), 1, "the review went to the job summary")
+                # main() calls write_step_summary with no `note=`, so the stub records
+                # None; the banner it takes is the parameter's default.
+                self.assertEqual(notes, [None])
+                self.assertIs(
+                    inspect.signature(PR.write_step_summary).parameters["note"].default,
+                    PR.READ_ONLY_SUMMARY_NOTE,
+                    "and that default is the read-only banner",
+                )
+                self.assertIsNone(driver.exit_code, "an environment constraint is not red")
+
+    def test_a_policy_403_still_degrades_to_the_summary(self):
+        """The regression guard on the allowlist: a standing 403 stays green.
+
+        An SSO/OAuth-restriction block shares no wording with the permission refusal,
+        so a guard written as "the permission phrase, and nothing else" would send it
+        into the landed-review read (which the same block fails, yielding UNKNOWN) and
+        then a doomed fallback POST, ending in SystemExit(1) on EVERY run — a
+        permanently red check where the caller used to get its review in the job
+        summary and a green step. Nothing about a policy refusal is transient, and
+        nothing was written, so it degrades exactly as the permission case does.
+        """
+        outputs, summaries, notes, calls = {}, [], [], []
+        driver = EndToEndPostTest()
+        posted = driver.run_main(
+            self.ANCHORED,
+            post_returncode=1,
+            stderr=self.POLICY,
+            list_calls=calls,
+            outputs=outputs,
+            summaries=summaries,
+            notes=notes,
+        )
+        self.assertEqual(calls, [], "a refusal that wrote nothing has nothing to read")
+        self.assertEqual(len(posted), 1, "no fallback — it would fail the same way")
+        self.assertEqual(outputs["posted"], "false")
+        self.assertEqual(len(summaries), 1, "the review went to the job summary")
+        self.assertEqual(notes, [None], "under the read-only banner default")
+        self.assertIsNone(driver.exit_code, "an environment constraint is not red")
+
+    # The rendering go-gh reaches for when a 4xx body carries `errors[]` alongside
+    # `message`: the status LEADS, the first message line goes on that line, and the
+    # rest follows after a newline. Written out because it is the shape that actually
+    # carries the permission wording under a 422 — the single-message
+    # `gh: <msg> (HTTP 422)` form by definition cannot, since it has one message.
+    VALIDATION_422 = (
+        "gh: HTTP 422: Validation Failed "
+        "(https://api.github.com/repos/o/r/pulls/1/reviews)\n"
+        "Resource not accessible by integration"
+    )
+
+    def test_the_guard_needs_the_status_as_well_as_the_message(self):
+        """Neither half alone: a 422 can carry the permission phrase, a 403 can not.
+
+        `gh` renders a 422 whose body carries `errors[]` as `HTTP 422: <first line>
+        (<url>)\n<rest>`, so the permission wording can arrive under a status that
+        PROVES the write was validated and refused. Classifying that as a read-only
+        token would return from `main()` before the landed-review check — the same
+        silent skip BE-12612 is removing, reached from the other direction. That is
+        also why `_GH_HTTP_STATUS_RE` has to read the leading rendering: matching only
+        the parenthesized trailer would score this blob as "no status", and no-status
+        is not a 403 either, so the guard would answer the same False by accident
+        while a leading-status 403 answered False for real. And a transport failure
+        carries no status in any rendering, so it is not a 403 at all.
+        """
+        def guard(stderr):
+            return PR.is_read_only_token_error(
+                subprocess.CompletedProcess(args=["gh"], returncode=1, stderr=stderr)
+            )
+
+        def status(stderr):
+            return PR.gh_http_status(
+                subprocess.CompletedProcess(args=["gh"], returncode=1, stderr=stderr)
+            )
+
+        self.assertTrue(guard(self.PERMISSION))
+        self.assertTrue(guard(self.POLICY))
+        self.assertTrue(
+            guard("gh: Repository was archived so is read-only. (HTTP 403)"),
+            "an archived repo refuses every write and no retry fixes it",
+        )
+        self.assertEqual(
+            status(self.VALIDATION_422), 422,
+            "the joined rendering must parse, or this case proves nothing",
+        )
+        self.assertFalse(
+            guard(self.VALIDATION_422),
+            "the phrase under a 422 is a validated rejection, not a read-only token",
+        )
+        self.assertFalse(
+            guard("gh: Resource not accessible by integration (HTTP 422)"),
+            "and the single-message rendering of the same status likewise",
+        )
+        self.assertFalse(
+            guard("error connecting to api.github.com: Resource not accessible by x"),
+            "no status at all is not a 403",
+        )
+        self.assertFalse(guard(""))
+        self.assertFalse(guard(None), "a CompletedProcess can carry no stderr at all")
+
+    def test_every_throttle_wording_falls_through_the_guard(self):
+        """The allowlist, pinned to the wordings GitHub actually sends with a 403.
+
+        Each of these can be raised on a request the API went on to serve, so none may
+        short-circuit the landed-review read. Matched case-insensitively because `gh`
+        echoes GitHub's message verbatim and nothing guarantees its capitalisation —
+        this allowlist is the only case-insensitive match left in the guard.
+        """
+        for message in (
+            "API rate limit exceeded for installation ID 1234",
+            "You have exceeded a secondary rate limit. Please wait a few minutes "
+            "before you try again.",
+            "You have triggered an abuse detection mechanism.",
+            "You have been submitted too quickly. Please retry your request again "
+            "later.",
+        ):
+            for label, text in (
+                ("as sent", message),
+                ("lower-cased", message.lower()),
+            ):
+                with self.subTest(message=message[:40], case=label):
+                    result = subprocess.CompletedProcess(
+                        args=["gh"], returncode=1, stderr=f"gh: {text} (HTTP 403)"
+                    )
+                    self.assertTrue(PR.is_throttled_403(result))
+                    self.assertFalse(PR.is_read_only_token_error(result))
+                    self.assertIn(
+                        PR.gh_http_status(result), (403,),
+                        "and it keeps its status, so RETRYABLE_4XX_STATUSES takes it",
+                    )
+
+    def test_a_throttled_403_with_the_review_present_skips_the_fallback(self):
+        """A secondary rate limit can be raised on a request GitHub went on to serve.
+
+        Under the old guard this exited 0 having written the review to the job summary
+        and claimed a read-only token, while the review sat on the PR the whole time.
+        """
+        outputs, summaries, notes, calls = {}, [], [], []
+        driver = EndToEndPostTest()
+        posted = driver.run_main(
+            self.ANCHORED,
+            post_returncode=1,
+            stderr=self.THROTTLED,
+            existing_reviews=[self.landed_review()],
+            list_calls=calls,
+            outputs=outputs,
+            summaries=summaries,
+            notes=notes,
+        )
+        self.assertEqual(calls, [("o/r", "1")], "this 403 is read, not assumed")
+        self.assertEqual(len(posted), 1, "the review landed — no duplicate is posted")
+        self.assertEqual(outputs["delivered"], "true")
+        self.assertNotIn(
+            PR.READ_ONLY_SUMMARY_NOTE, notes,
+            "nothing here is a read-only token",
+        )
+        self.assertEqual(summaries, [], "the review is on the PR, not the summary")
+        self.assertIsNone(driver.exit_code)
+
+    def test_a_throttled_403_with_the_review_absent_fails_red(self):
+        """Throttled on both POSTs, and the read confirms nothing landed.
+
+        Nothing reached the PR and the cause is not an environment constraint, so this
+        is the POST-failed degradation — summary under POST_FAILED_SUMMARY_NOTE and a
+        red step — not the green read-only one the old guard produced.
+        """
+        outputs, summaries, notes, calls = {}, [], [], []
+        driver = EndToEndPostTest()
+        posted = driver.run_main(
+            self.ANCHORED,
+            post_returncode=1,
+            stderr=self.THROTTLED,
+            existing_reviews=[],
+            list_calls=calls,
+            outputs=outputs,
+            summaries=summaries,
+            notes=notes,
+        )
+        self.assertEqual(
+            calls, [("o/r", "1"), ("o/r", "1")],
+            "the fallback is throttled too, and it gets the same read",
+        )
+        self.assertEqual(len(posted), 2, "inline attempt, then the body-only fallback")
+        self.assertEqual(outputs["delivered"], "false")
+        self.assertIn(PR.POST_FAILED_SUMMARY_NOTE, notes)
+        self.assertNotIn(None, notes, "the read-only banner never applies here")
+        self.assertEqual(driver.exit_code, 1, "the step goes red")
+
+    def test_a_throttled_403_with_an_unreadable_list_tags_nothing(self):
+        """UNKNOWN survives the new status too: post the fallback, claim nothing.
+
+        `lost_to_fallback` asserts the first review is absent, and a read that failed
+        supports no such claim (BE-4785).
+        """
+        calls = []
+        posted = EndToEndPostTest().run_main(
+            self.ANCHORED,
+            post_returncode=1,
+            stderr=self.THROTTLED,
+            list_returncode=1,
+            list_calls=calls,
+        )
+        self.assertEqual(calls, [("o/r", "1"), ("o/r", "1")])
+        self.assertEqual(len(posted), 2, "undecided means post the fallback")
+        ledger = ledger_from_posted_body(posted[1]["body"])
+        for entry in ledger["entries"]:
+            self.assertNotIn("lost_to_fallback", entry)
+
+
+    def test_gh_status_is_read_out_of_every_rendering_gh_uses(self):
+        """One status parser, three renderings, and the LAST one wins.
+
+        `gh api` usually trails the status in parentheses, but go-gh leads with it
+        whenever it has a request URL and either no message or a message plus an
+        `errors[]` tail. Since BE-12612 made the read-only degradation depend on the
+        status, a rendering this could not parse would score as "no status" and take a
+        STANDING refusal into the retry path — so all three have to parse.
+
+        Last-match, because `GH_DEBUG=api` puts the request trace on the same stderr,
+        and the request being traced is the review body: a review discussing `HTTP
+        403` handling would otherwise supply the status for its own failure.
+        """
+        def status(stderr):
+            return PR.gh_http_status(
+                subprocess.CompletedProcess(args=["gh"], returncode=1, stderr=stderr)
+            )
+
+        self.assertEqual(status("gh: Unprocessable Entity (HTTP 422)"), 422)
+        self.assertEqual(
+            status("gh: HTTP 403 (https://api.github.com/repos/o/r/pulls/1/reviews)"),
+            403,
+            "no message at all — a proxy, a WAF or a GHES edge with no JSON body",
+        )
+        self.assertEqual(
+            status(
+                "gh: HTTP 422: Validation Failed (https://api.github.com/x)\n"
+                "Resource not accessible by integration"
+            ),
+            422,
+        )
+        self.assertEqual(
+            status(
+                "* Request at 2026-01-01\n"
+                "> POST /repos/o/r/pulls/1/reviews\n"
+                '> {"body": "the review body quotes HTTP 403 verbatim"}\n'
+                "< HTTP/2.0 500 Internal Server Error\n"
+                "gh: Server Error (HTTP 500)"
+            ),
+            500,
+            "gh's own error is written last, so it is the one that describes this run",
+        )
+        self.assertIsNone(status("error connecting to api.github.com"))
+        self.assertIsNone(status(None))
+
+    def test_a_debug_trace_quoting_a_throttle_does_not_make_one(self):
+        """The allowlist reads `gh`'s error LINE, not everything on stderr.
+
+        `GH_DEBUG=api` is a documented knob a caller workflow can set on the step, and
+        it echoes the POSTed review body — so a review that DISCUSSES rate limiting
+        would, under a whole-blob match, turn its own standing permission 403 into a
+        "throttle": doomed read, doomed fallback, red step, on a run that used to
+        degrade green and stay green.
+        """
+        traced = (
+            "* Request at 2026-01-01\n"
+            "> POST /repos/o/r/pulls/1/reviews\n"
+            '> {"body": "a rate limit is answered with 403, see abuse detection"}\n'
+            "gh: Resource not accessible by integration (HTTP 403)"
+        )
+        result = subprocess.CompletedProcess(args=["gh"], returncode=1, stderr=traced)
+        self.assertFalse(PR.is_throttled_403(result))
+        self.assertTrue(PR.is_read_only_token_error(result))
+        self.assertEqual(
+            PR.gh_error_line(result),
+            "gh: Resource not accessible by integration (HTTP 403)",
+        )
+
+    def test_a_throttled_403_with_no_inline_half_reports_the_landed_review(self):
+        """The no-inline branch asks the PR too, and answers PRESENT as delivered.
+
+        Round 1 narrowed WHICH 403s reach this branch; it did not change what happened
+        when one did. A throttle raised on a request GitHub went on to serve exited 1
+        with `posted=false` while the review sat on the PR — so the fresh-review gate
+        held the check red over a review that had landed, and the job summary
+        published a second copy of it. It reads now, and it still never reposts.
+        """
+        outputs, summaries, notes, calls = {}, [], [], []
+        driver = EndToEndPostTest()
+        posted = driver.run_main(
+            [finding("elsewhere.py", 7)],
+            post_returncode=1,
+            stderr=self.THROTTLED,
+            existing_reviews=[self.landed_review()],
+            list_calls=calls,
+            outputs=outputs,
+            summaries=summaries,
+            notes=notes,
+        )
+        self.assertEqual(posted[0].get("comments", []), [], "no inline half to drop")
+        self.assertEqual(calls, [("o/r", "1")], "asked the PR once")
+        self.assertEqual(len(posted), 1, "and still posted nothing more")
+        self.assertEqual(outputs["posted"], "true")
+        self.assertEqual(outputs["delivered"], "true")
+        self.assertEqual(summaries, [], "the review is on the PR, not the summary")
+        self.assertIsNone(driver.exit_code, "a review that landed is not a red step")
+
+    def test_a_throttled_403_with_no_inline_half_and_nothing_landed_stays_red(self):
+        """Only PRESENT changes this branch. ABSENT behaves exactly as it always has."""
+        outputs, summaries, notes, calls = {}, [], [], []
+        driver = EndToEndPostTest()
+        posted = driver.run_main(
+            [finding("elsewhere.py", 7)],
+            post_returncode=1,
+            stderr=self.THROTTLED,
+            existing_reviews=[],
+            list_calls=calls,
+            outputs=outputs,
+            summaries=summaries,
+            notes=notes,
+        )
+        self.assertEqual(calls, [("o/r", "1")])
+        self.assertEqual(len(posted), 1, "still no byte-identical repost")
+        self.assertEqual(outputs["posted"], "false")
+        self.assertEqual(len(summaries), 1, "the review goes to the job summary")
+        self.assertIn(PR.POST_FAILED_SUMMARY_NOTE, notes)
+        self.assertEqual(driver.exit_code, 1)
+
+    def test_a_throttled_403_on_the_no_findings_review_reports_the_landed_review(self):
+        """post_or_degrade asks too — and the no-findings review is the common round.
+
+        Nothing to demote and no fallback to post, so before BE-12612 this was a flat
+        `posted=false` plus SystemExit(1) even when the throttled POST had been served.
+        """
+        outputs, summaries, notes, calls = {}, [], [], []
+        driver = EndToEndPostTest()
+        posted = driver.run_main(
+            [],
+            post_returncode=1,
+            stderr=self.THROTTLED,
+            existing_reviews=[self.landed_review()],
+            list_calls=calls,
+            outputs=outputs,
+            summaries=summaries,
+            notes=notes,
+        )
+        self.assertIn("No high-signal findings", posted[0]["body"])
+        self.assertEqual(calls, [("o/r", "1")])
+        self.assertEqual(len(posted), 1, "post_or_degrade reads, it never reposts")
+        self.assertEqual(outputs["posted"], "true")
+        self.assertEqual(outputs["delivered"], "true")
+        self.assertEqual(summaries, [])
+        self.assertIsNone(driver.exit_code)
+
+    def test_a_standing_403_on_the_no_findings_review_never_reaches_the_read(self):
+        """The other side of it: a permission refusal still degrades green, unread."""
+        outputs, summaries, notes, calls = {}, [], [], []
+        driver = EndToEndPostTest()
+        posted = driver.run_main(
+            [],
+            post_returncode=1,
+            stderr=self.PERMISSION,
+            list_calls=calls,
+            outputs=outputs,
+            summaries=summaries,
+            notes=notes,
+        )
+        self.assertEqual(calls, [], "a read-only token wrote nothing to read")
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(outputs["posted"], "false")
+        self.assertEqual(notes, [None], "under the read-only banner default")
+        self.assertIsNone(driver.exit_code)
 
 
 class FitSentinelItemsTest(unittest.TestCase):

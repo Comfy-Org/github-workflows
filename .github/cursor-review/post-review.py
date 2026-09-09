@@ -298,8 +298,42 @@ def gh_post_review(repo: str, pr_number: str, payload: str) -> subprocess.Comple
     )
 
 
+# The 403 wordings that mean "slow down", not "you may not write". GitHub answers a
+# primary rate limit, a secondary rate limit and abuse detection with 403 as readily
+# as with 429 — and, unlike every other 403, one of those can be raised on a request
+# the API went on to SERVE, so it is not evidence the write was rejected before it was
+# committed. Matched case-insensitively as substrings, which is how `gh` hands over
+# GitHub's `message`: echoed into stderr rather than parsed out of the JSON body.
+# Only ever consulted once the status is already known to be 403, so a finding body
+# quoting one of these phrases cannot reach it through a 422 — and matched against
+# `gh`'s own error LINE rather than the whole blob, so it cannot reach it through the
+# same PR's review body either (see gh_error_line).
+THROTTLE_403_MESSAGES = (
+    # "API rate limit exceeded for ..." / "You have exceeded a secondary rate limit."
+    "rate limit",
+    # "You have triggered an abuse detection mechanism."
+    "abuse detection",
+    # the older wording of the same secondary-limit refusal
+    "submitted too quickly",
+)
+
+
+def is_throttled_403(result: subprocess.CompletedProcess) -> bool:
+    """True when a 403's message is GitHub asking us to slow down.
+
+    Read out of `gh`'s error line, not out of all of stderr. With `GH_DEBUG=api` set
+    on the step — a documented `gh` knob a caller workflow can add — stderr also
+    carries the request trace, which echoes the review body being POSTed; a review
+    that DISCUSSES rate-limit handling would otherwise turn a standing permission 403
+    into a "throttle", costing it a doomed read, a doomed fallback and a red step
+    where it used to degrade green.
+    """
+    line = gh_error_line(result).lower()
+    return any(message in line for message in THROTTLE_403_MESSAGES)
+
+
 def is_read_only_token_error(result: subprocess.CompletedProcess) -> bool:
-    """True when the POST failed because the token can't write to the PR.
+    """True when the POST failed because the ENVIRONMENT forbids writing to the PR.
 
     The gate skips fork PRs (which always hit this), but a read-only token can
     still occur on same-repo runs — org/repo default workflow permissions set
@@ -307,9 +341,43 @@ def is_read_only_token_error(result: subprocess.CompletedProcess) -> bool:
     HTTP 403 'Resource not accessible by integration'. That's an environment
     constraint, not a review failure, so callers degrade to the job summary
     rather than failing the check red.
+
+    STATUS AND MESSAGE, not either alone (BE-12612).
+
+    The status must be 403. The permission wording also travels inside a 422's
+    `errors[].message` list, which `gh` joins into the same stderr blob, and reading
+    that as a read-only token would return from `main()` before the landed-review
+    check — the same silent skip this guard is being narrowed to remove, arrived at
+    from the other direction.
+
+    The message must then NOT be a throttle. A rate limit and an abuse-detection
+    refusal are neither an environment constraint nor proof that nothing was written,
+    so those alone fall through to the landed-review check (see
+    RETRYABLE_4XX_STATUSES). Everything else a 403 can carry — the permission refusal
+    above, whatever principal it names (`by integration` for both of
+    cursor-review.yml's token arms, `by personal access token` for a fine-grained
+    PAT), an SSO/IP-allowlist
+    or org-policy block, an archived repo, a future rewording of any of them — is a
+    STANDING refusal that no retry fixes and that wrote nothing, so it degrades to the
+    job summary. Matching the throttles rather than the permission phrase is what
+    keeps a SAML-blocked or IP-allowlisted org on that green degrade instead of the
+    permanently red check "everything but the permission phrase" would hand it.
+
+    The fall-through reaches the landed-review check on ALL THREE failure paths —
+    `main()`'s inline branch, its no-inline-comments branch, and `post_or_degrade` —
+    because `post_may_have_landed` gates each of them the same way. A throttle raised
+    on a request GitHub went on to serve is therefore reported as delivered wherever
+    it happens, rather than red with `posted=false` over a review sitting on the PR.
+    Only the inline path REPOSTS on the other two answers; the other two read and,
+    unless the answer is PRESENT, behave exactly as they always have.
+
+    One residual, named rather than implied: the read runs on the same token GitHub
+    just throttled, so it can be throttled too. That yields UNKNOWN, and on the inline
+    path UNKNOWN posts the fallback — which duplicates a first write that did land.
+    Closing that needs `Retry-After`/backoff, which `gh api` does not surface on the
+    default path; it is tracked separately (BE-12679) rather than half-done here.
     """
-    blob = result.stderr or ""
-    return "Resource not accessible by integration" in blob or "HTTP 403" in blob
+    return gh_http_status(result) == 403 and not is_throttled_403(result)
 
 
 # The discriminator for "a review of THIS panel is already on the PR". Mirrors
@@ -319,17 +387,62 @@ def is_read_only_token_error(result: subprocess.CompletedProcess) -> bool:
 # way build-ledger.py pins its own copy.
 CONSOLIDATED_MARKER = "## 🔍 Cursor Review — Consolidated panel"
 
-# `gh api` reports the HTTP status in its stderr, e.g.
-# `gh: Unprocessable Entity (HTTP 422)`. A transport failure (DNS, TLS, a dropped
-# connection) carries no status at all, which is why the caller treats "no match" as
-# unknown rather than as a server error.
-_GH_HTTP_STATUS_RE = re.compile(r"\(HTTP (\d{3})\)")
+# `gh` reports an API error's HTTP status in its stderr, but not in ONE shape. The
+# common `gh api` rendering trails it in parentheses (`gh: Unprocessable Entity
+# (HTTP 422)`), but go-gh's HTTPError leads with it whenever it has a request URL to
+# report and either no message at all — `HTTP 403 (https://api.github.com/...)`, what
+# a proxy, a WAF or a GHES edge that sent no JSON body produces — or a message plus an
+# `errors[]` tail, `HTTP 422: Validation Failed (https://...)\n<rest>`. Both
+# alternatives are matched.
+#
+# Matching only the parenthesized trailer was a REGRESSION risk once
+# `is_read_only_token_error` began conjoining the status (BE-12612): the leading
+# shapes would have read as "no status at all", so a STANDING permission or SSO 403
+# rendered that way would leave the green degrade for a doomed read, a doomed fallback
+# and SystemExit(1) on every run — which the bare `"HTTP 403" in blob` it replaced did
+# not do.
+#
+# A transport failure (DNS, TLS, a dropped connection) carries no status in either
+# shape, which is why the caller treats "no match" as unknown rather than as a server
+# error.
+_GH_HTTP_STATUS_RE = re.compile(r"\(HTTP (\d{3})\)|\bHTTP (\d{3})\b")
+
+
+def _gh_status_match(result: subprocess.CompletedProcess):
+    """The LAST status rendering on stderr, as a match, or None if there is none.
+
+    Last, not first: with `GH_DEBUG=api` stderr also carries the request/response
+    trace, and the request it echoes is the review body being POSTed — which can quote
+    anything, `HTTP 403` included. `gh` writes its own error AFTER that trace, so the
+    final match is the one describing the response rather than something quoting one.
+    """
+    matches = list(_GH_HTTP_STATUS_RE.finditer(result.stderr or ""))
+    return matches[-1] if matches else None
 
 
 def gh_http_status(result: subprocess.CompletedProcess):
     """The HTTP status `gh` reported on stderr, or None when it reported none."""
-    match = _GH_HTTP_STATUS_RE.search(result.stderr or "")
-    return int(match.group(1)) if match else None
+    match = _gh_status_match(result)
+    if match is None:
+        return None
+    return int(match.group(1) or match.group(2))
+
+
+def gh_error_line(result: subprocess.CompletedProcess) -> str:
+    """The one stderr line carrying that status — `gh`'s own error line, or "".
+
+    The scope for anything that reads the WORDING of a failure. Both of `gh`'s
+    renderings put GitHub's `message` on the same line as the status, so this is all
+    of what GitHub said and none of what an `errors[]` continuation, a `GH_DEBUG=api`
+    trace or a quoted review body put around it.
+    """
+    match = _gh_status_match(result)
+    if match is None:
+        return ""
+    blob = result.stderr or ""
+    start = blob.rfind("\n", 0, match.start()) + 1
+    end = blob.find("\n", match.end())
+    return blob[start:] if end == -1 else blob[start:end]
 
 
 # 4xx statuses that are NOT evidence the request was rejected before it was written.
@@ -342,13 +455,34 @@ def gh_http_status(result: subprocess.CompletedProcess):
 # `lost_to_fallback` on an assumption that does not apply, so they take the read like
 # a 5xx does.
 #
-# 403 is NOT in this set, and not because a throttled 403 is impossible — GitHub does
-# signal throttling that way. It is because `is_read_only_token_error` matches any
-# stderr carrying "HTTP 403" and returns from `main()` before this decision is
-# reached, so listing 403 here would be dead code that reads as coverage. Narrowing
-# that guard to its specific message is a change to the read-only degradation path,
-# not to this one; tracked separately rather than made in passing.
-RETRYABLE_4XX_STATUSES = frozenset({408, 425, 429})
+# 403 is here because `is_read_only_token_error` now excludes the throttle wordings:
+# a 403 that reaches THIS decision has already been classified as one of them, so it
+# is a rate limit or an abuse-detection refusal and nothing else — every standing
+# 403 (permission, SSO/IP allowlist, archived repo) returned from `main()` on the
+# degrade path well above. A throttle can be raised on a request the API went on to
+# serve, exactly like the 429 beside it, so it takes the read too.
+RETRYABLE_4XX_STATUSES = frozenset({403, 408, 425, 429})
+
+
+def post_may_have_landed(result: subprocess.CompletedProcess) -> bool:
+    """Could GitHub have committed this write despite erroring on the request?
+
+    False only for the 4xx that mean "GitHub VALIDATED this and refused it before
+    writing anything" — every 4xx outside RETRYABLE_4XX_STATUSES, whose members are
+    4xx without carrying that meaning. A 5xx, and a transport error with no status at
+    all, leave the write genuinely undecided.
+
+    True is not "the review landed"; it is "the PR is worth asking". Shared by all
+    three failure paths so the question is answered the same way on each — the
+    no-inline branch and post_or_degrade used to skip it entirely, which reported
+    `posted=false` for a review that was on the PR the whole time (BE-12612).
+    """
+    status = gh_http_status(result)
+    return not (
+        status is not None
+        and 400 <= status < 500
+        and status not in RETRYABLE_4XX_STATUSES
+    )
 
 
 # This read sits on the RECOVERY path: the fallback POST and write_step_summary both
@@ -658,8 +792,9 @@ def post_or_degrade(
     read-only branch returns True as well and is never a delivery: the review
     reached a job summary, not the PR, so no thread exists to hold the merge on.
     """
-    result = gh_post_review(repo, pr_number, payload)
-    if result.returncode == 0:
+
+    def report_posted():
+        """This body is on the PR. Shared by the two ways of finding that out."""
         # `posted` regardless of `delivers`: a body that reports a failure still
         # reached the PR, and the DM's claim is about the PR, not about adjudication.
         # A clamped-but-posted review is posted too — hence before the `truncated`
@@ -672,6 +807,10 @@ def post_or_degrade(
                 file=sys.stderr,
             )
             write_step_summary(summary_markdown, note=TRUNCATED_SUMMARY_NOTE)
+
+    result = gh_post_review(repo, pr_number, payload)
+    if result.returncode == 0:
+        report_posted()
         return True
     if is_read_only_token_error(result):
         print(
@@ -683,6 +822,31 @@ def post_or_degrade(
         write_step_summary(summary_markdown)
         return True
     print(f"{context} POST failed: {result.stderr}", file=sys.stderr)
+    # A nonzero `gh` is not proof the write was refused. Once the throttle wordings
+    # stopped being read as a read-only token (BE-12612), the 403 GitHub raises on a
+    # request it went on to SERVE reaches here — and every caller answers a False by
+    # writing the same text to the job summary and exiting 1. That publishes a second
+    # copy of a review already on the PR and reports `posted=false` for it, which the
+    # fresh-review gate then holds the check red over. So ask the PR, on exactly the
+    # statuses the inline path asks on. This is a READ, never a repost: on ABSENT and
+    # on UNKNOWN this returns False and the caller behaves as it always has.
+    if post_may_have_landed(result):
+        # Read the commit and the body back out of the REQUEST rather than taking them
+        # as parameters: `review_already_posted` answers True only for a byte-identical
+        # body at the same head SHA, so the two have to be the ones this call actually
+        # sent. `payload` is that request, and every caller builds it with json.dumps.
+        request = json.loads(payload)
+        landed = review_already_posted(
+            repo, pr_number, request.get("commit_id") or "", request.get("body") or ""
+        )
+        if landed is True:
+            print(
+                f"{context}: the POST errored but this exact review is on the PR — "
+                "treating it as delivered rather than reporting it lost.",
+                file=sys.stderr,
+            )
+            report_posted()
+            return True
     return False
 
 
@@ -2139,6 +2303,24 @@ def main():
         # if GitHub committed the write before erroring it publishes a DUPLICATE
         # review no one can un-post. That duplicate risk, not byte-identity, is the
         # reason to skip it. Deliver the text to the summary and let the step go red.
+        # "No fallback to post" is not "no question to ask", though. A throttled 403
+        # (or a 5xx, or a dropped connection) can be raised on a request GitHub went
+        # on to SERVE, and reporting THAT as `posted=false` leaves the review on the
+        # PR while the fresh-review gate holds the check red for a review that landed
+        # and the job summary publishes a second copy of it. Same read as the inline
+        # path below, on the same statuses, and still no repost: only a PRESENT answer
+        # changes anything here.
+        if post_may_have_landed(result) and review_already_posted(
+            args.repo, args.pr_number, args.commit_sha, posted_body
+        ) is True:
+            print(
+                f"Review: the POST errored ({(result.stderr or '').strip()[:200]}) but "
+                f"a review for {args.commit_sha[:7]} is on the PR — treating as "
+                "delivered.",
+                file=sys.stderr,
+            )
+            finish_posted_review()
+            return
         print(
             "Review: no inline comments to drop — the fallback would repost the same "
             "body, so writing it to the job summary instead.",
@@ -2149,16 +2331,18 @@ def main():
         raise SystemExit(1)
 
     # Did that POST really fail to land? A nonzero `gh` is not proof it did not —
-    # the `not comments` branch above already declines to repost for exactly that
-    # reason — and the answer decides two things below: whether to post the fallback
-    # at all, and whether the findings that anchored may be labelled lost.
+    # the `not comments` branch above asks the same question for the same reason, and
+    # declines to repost whatever the answer — and here the answer decides two things
+    # below: whether to post the fallback at all, and whether the findings that
+    # anchored may be labelled lost.
     #
-    # Cheapest sufficient evidence first. A 4xx is GitHub VALIDATING and rejecting the
-    # request before writing anything (every firing observed in the field is a 422 over
-    # an inline position), so the review is absent by construction and no read is worth
-    # the call — with the exception carved out by RETRYABLE_4XX_STATUSES, which are 4xx
-    # only in the sense that an edge or a proxy said so and may well have said it about
-    # a request GitHub went on to serve. Anything else — a 5xx, or a transport error
+    # Cheapest sufficient evidence first, which is what `post_may_have_landed` weighs:
+    # a 4xx is GitHub VALIDATING and rejecting the request before writing anything
+    # (every firing observed in the field is a 422 over an inline position), so the
+    # review is absent by construction and no read is worth the call — with the
+    # exception carved out by RETRYABLE_4XX_STATUSES, whose members are 4xx without
+    # carrying that meaning: an edge or a proxy said so, or GitHub throttled a request
+    # it may well have gone on to serve. Anything else — a 5xx, or a transport error
     # that carries no status at all — leaves the write genuinely undecided, so ask the
     # PR. Three outcomes follow:
     # PRESENT (the review landed: report it delivered, post nothing more), ABSENT
@@ -2167,18 +2351,12 @@ def main():
     # none). UNKNOWN is why the read failing is not answered as a `False`: that would
     # be indistinguishable from a confirmed-absent review and would relabel findings on
     # the strength of a transient blip.
-    status = gh_http_status(result)
-    pre_write_rejection = (
-        status is not None
-        and 400 <= status < 500
-        and status not in RETRYABLE_4XX_STATUSES
-    )
-    if pre_write_rejection:
-        landed = False
-    else:
+    if post_may_have_landed(result):
         landed = review_already_posted(
             args.repo, args.pr_number, args.commit_sha, posted_body
         )
+    else:
+        landed = False
 
     if landed is True:
         print(
@@ -2368,8 +2546,9 @@ def main():
         gated=0,
         ungated=len(enriched),
     ):
-        # Both attempts failed for a non-403 reason (an API outage, a stale commit_id
-        # after a force-push, a body-level rejection dropping the anchors cannot fix).
+        # Both attempts failed for a reason the read-only degradation does not cover
+        # (an API outage, a throttle, a stale commit_id after a force-push, a
+        # body-level rejection dropping the anchors cannot fix).
         # Without this the whole review is gone from the PR *and* the summary, which
         # contradicts the no-inline branch above — and this is the branch carrying
         # MORE content, since it has an inline half. post_or_degrade only writes a
