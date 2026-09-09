@@ -1093,6 +1093,15 @@ class TestSentinelForgeryControls(unittest.TestCase):
         self.assertEqual(ledger["unrecovered_rounds"], 0, "and nothing is invented")
         self.assertEqual(ledger["notes"], [])
 
+        # Pinned at the READER as well, independently of that defang. Two writers reach
+        # this parser: consumer repos stay on older pinned SHAs, so every success body
+        # they posted before `render_finding_entry` learned to neutralize an opener is
+        # still sitting on their PRs with a raw one in it. The line anchor is the half
+        # that covers those, and it is the half no writer-side change can outrun.
+        raw = f"{body_only_section([demoted('far.py', 900)])}\n> {planted}"
+        self.assertIn(planted, raw, "the opener really is raw in this fixture")
+        self.assertFalse(bl._body_only_truncated(raw), "the blockquote prefix is not matched through")
+
     def test_a_companion_above_the_sentinel_is_refused(self):
         """The second half of the scoping: the companion annotates the sentinel, so it
         has to sit BELOW it — which is where post-review.py writes it on both budgeted
