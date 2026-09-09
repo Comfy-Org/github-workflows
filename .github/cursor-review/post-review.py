@@ -845,7 +845,60 @@ def load_anchors(diff_path):
 # CommonMark's start condition for an HTML block opened by `<!--`: the opener begins
 # the line, after at most three spaces of indentation. `\r` alone is a line ending to
 # cmark-gfm, so it counts here too — `re.MULTILINE`'s `^` would not.
-BLOCK_COMMENT_OPENER_RE = re.compile(r"(?:\A|(?<=\n)|(?<=\r)) {0,3}<!--")
+BLOCK_COMMENT_OPENER_RE = re.compile(r"\A {0,3}(<!--)")
+# A fenced code block's opening and closing lines. The opener may carry an info string;
+# the closer may not, and must be at least as long a run of the SAME character.
+FENCE_OPEN_RE = re.compile(r"\A {0,3}(`{3,}|~{3,})")
+FENCE_CLOSE_RE = re.compile(r"\A {0,3}(`{3,}|~{3,})[ \t]*\Z")
+
+
+def md_lines(text: str):
+    """`(offset, line)` for every CommonMark line in `text`, terminators excluded.
+
+    Split on MD_LINE_BREAK_RE rather than `str.splitlines()` — cmark-gfm's line endings
+    are exactly `\r\n`, `\r` and `\n`, while `splitlines()` also breaks on `\v`, `\f`
+    and `U+2028`, which would report a start-of-line where the renderer sees none.
+    Offsets are carried explicitly because `\r\n` and `\n` are different lengths.
+    """
+    start = 0
+    for m in MD_LINE_BREAK_RE.finditer(text):
+        yield start, text[start:m.start()]
+        start = m.end()
+    yield start, text[start:]
+
+
+def html_block_openers(text: str) -> list:
+    """Offsets of every `<!--` in `text` that can open an HTML block, outermost first.
+
+    An opener that sits inside a FENCED CODE BLOCK is skipped: CommonMark renders the
+    fence's contents literally, so a column-0 `<!--` in there swallows nothing (verified
+    against GitHub's own render — prose after the fence, and the clamp's note, come back
+    intact). That exclusion is load-bearing on the ERROR-review path, the one body that
+    renders unbounded judge/CLI text at column 0 inside a fence: without it the last
+    such line reads as a dangling opener and drop_unterminated_comment deletes the whole
+    tail of the error text to contain damage that never existed.
+
+    A fence the cut itself left OPEN is not closed here. Closing it would mean appending
+    characters, and clamp_review_body has already spent its slack reserving
+    CLAMP_TRUNCATION_NOTE — anything added past that cut point pushes the body back over
+    GitHub's limit and buys a 422. The note still RENDERS in that case, as a last line of
+    code rather than as prose: ugly, but visible, which is the property this file defends.
+    """
+    openers, fence = [], None
+    for start, line in md_lines(text):
+        if fence is None:
+            opening = FENCE_OPEN_RE.match(line)
+            if opening:
+                fence = opening.group(1)
+                continue
+            comment = BLOCK_COMMENT_OPENER_RE.match(line)
+            if comment:
+                openers.append(start + comment.start(1))
+            continue
+        closing = FENCE_CLOSE_RE.match(line)
+        if closing and closing.group(1)[0] == fence[0] and len(closing.group(1)) >= len(fence):
+            fence = None
+    return openers
 
 
 def drop_unterminated_comment(cut: str) -> str:
@@ -871,22 +924,26 @@ def drop_unterminated_comment(cut: str) -> str:
     the evidence that findings WERE demoted, and that round degrades loudly instead of
     reading as a round that found nothing.
 
-    Scoped to an opener that BEGINS ITS LINE, which is CommonMark's start condition for
-    an HTML block and therefore the only `<!--` that can swallow what follows it. A
-    `<!--` inside a finding's blockquote cannot: render_finding_entry prefixes every
-    line with `> `, so the opener is indented out of the start condition, and even as a
-    block it would end with the blockquote at the blank line before the next finding.
-    Rewinding to one of THOSE deletes every finding between it and the cut — tens of
-    thousands of characters of prose that GitHub would have rendered perfectly — to
-    contain damage that was already contained. It is plantable, too: a `<!--` on its own
-    line in the PR under review, quoted back inside a finding body. The scoping also
-    fixes the case where a blockquoted `<!--` sits BELOW a genuinely dangling one, where
-    an unscoped `rfind` rewound to the harmless one and left the harmful one standing.
+    Two things keep the rewind from costing more than the fragment. Model-supplied prose
+    can no longer carry an opener at all: render_finding_entry neutralizes `<!--` at the
+    writer (see DEFANGED_COMMENT_OPENER), which removes the plantable
+    `<!--`-on-its-own-line in the PR under review — both as a swallow and as bait for a
+    rewind that would delete every finding between it and the cut. And openers inside a
+    fence are excluded by html_block_openers, which covers the error path's imported
+    text. What is left is the sentinel, its truncation companion, and whatever future
+    path emits a column-0 comment of its own.
+
+    The rewind goes to the FIRST unterminated opener, not the last. An HTML block runs
+    from its opener to the first `-->`, so once one is left dangling every byte after it
+    is already inside that comment — including any later `<!--`, which is then not an
+    opener at all. Rewinding to the LAST one left the earlier, real one standing and
+    swallowing the tail: the failure this function exists to prevent, reached by exactly
+    the misdirection the fence and blockquote scoping fix in their own containers.
     """
-    openers = list(BLOCK_COMMENT_OPENER_RE.finditer(cut))
-    if not openers or "-->" in cut[openers[-1].start():]:
-        return cut
-    return cut[: openers[-1].start()].rstrip()
+    for offset in html_block_openers(cut):
+        if cut.find("-->", offset) == -1:
+            return cut[:offset].rstrip()
+    return cut
 
 
 def clamp_review_body(body: str, limit: int = MAX_REVIEW_BODY_CHARS) -> str:
@@ -933,6 +990,23 @@ def render_code_ref(path, line) -> str:
     return f"{fence}{pad}{text}{pad}{fence}"
 
 
+# The one construct a blockquote does NOT contain. cmark-gfm strips the `> ` marker
+# before parsing a blockquote's contents, so `> <!--` opens a type-2 HTML block exactly
+# as a column-0 opener would, and the raw `<!--` is passed through verbatim into the
+# HTML — ending the blockquote never synthesizes a `-->`. Measured against GitHub's own
+# /markdown render: one finding carrying `<!--` at the start of a line erased every
+# finding below it AND clamp_review_body's truncation note. Writing a `-->` back at
+# column 0 does not undo it, because that one is markdown-escaped to `--&gt;` and closes
+# nothing — the opener has to die at the WRITER.
+#
+# A zero-width space defeats CommonMark's start condition while the text still reads
+# exactly as it arrived, the same trick and the same house style as
+# defang_body_only_contract. Applied to EVERY `<!--`, not just a line-leading one: which
+# column a substring lands in depends on the wrapping around it, and the escape is free.
+HTML_COMMENT_OPENER = "<!--"
+DEFANGED_COMMENT_OPENER = "<​!--"
+
+
 def render_finding_entry(c: dict) -> str:
     """One finding, as a blockquote its own markdown cannot break out of.
 
@@ -943,8 +1017,13 @@ def render_finding_entry(c: dict) -> str:
     that from a rare fallback render into a per-run one. Inside a blockquote the
     damage is confined: the block ends at the blank line before the next finding, so
     an unclosed fence closes with it.
+
+    An unterminated HTML COMMENT is the exception — the blockquote does not contain
+    that one, and it is plantable by putting `<!--` on its own line in the PR under
+    review. See HTML_COMMENT_OPENER; it is neutralized here rather than contained.
     """
     text = f"**{render_code_ref(c['path'], c['line'])}** — {c['body']}"
+    text = text.replace(HTML_COMMENT_OPENER, DEFANGED_COMMENT_OPENER)
     # MD_LINE_BREAK_RE, not split("\n"): CommonMark (and GitHub's cmark-gfm) ends a
     # line on a bare \r too, and nothing upstream strips control characters —
     # review-output-mcp.py's validate_finding checks only type/non-empty/length, and
@@ -1155,8 +1234,18 @@ def sentinel_share(available: int, prose_len: int) -> int:
     `available - prose_len` BEFORE the floor, so a round whose prose is small is not
     charged a floor it does not need: the sentinel may use whatever the prose leaves,
     and the split only becomes one-half-each when the prose wants more than half.
+
+    The ceiling bounds the FLOOR — the room the sentinel takes over the prose's
+    objection — and NOT the leftover the prose never wanted. Capping the whole `max`
+    charged the ceiling on rounds with no size pressure behind it: a 44,000-char
+    sentinel beside 17,000 chars of prose in ~59,000 of space was handed 30,000 instead
+    of the ~42,000 that fit, dropping roughly a hundred ledger entries to reserve space
+    the prose had no use for. The prose keeps its guarantee either way, because the
+    `available // 2` floor already delivers it: the prose gets
+    `min(prose_len, available // 2)` at every head size, which is "everything it wants,
+    up to half" — exactly what SENTINEL_MAX_CHARS was introduced to promise.
     """
-    return min(SENTINEL_MAX_CHARS, max(available - prose_len, available // 2))
+    return max(available - prose_len, min(SENTINEL_MAX_CHARS, available // 2))
 
 
 def render_body_only_findings(items: list, budget: int | None = None) -> str:
@@ -1188,13 +1277,21 @@ def render_body_only_findings(items: list, budget: int | None = None) -> str:
     governs which findings the LEDGER recovers, never which ones a reader is shown.
     Prose that overruns is handled by the tail clamp, as it always was.
 
-    A section that FITS its budget pays no budget at all — the clamp will not cut it, so
-    there is no size pressure to justify dropping a ledger entry. That is not a
-    theoretical case: render_body_only_sentinel escapes every `-` to six characters
-    where the prose below spends one, so a round on hyphen-rich paths can push the
-    sentinel past SENTINEL_MAX_CHARS while sentinel-plus-prose stays well under the
-    limit. Charging the ceiling there would drop findings out of the ledger to make room
-    nobody needed.
+    A section that FITS pays no budget at all — the clamp will not cut it, so there is
+    no size pressure to justify dropping a ledger entry. That is not a theoretical case:
+    render_body_only_sentinel escapes every `-` to six characters where the prose below
+    spends one, so a round on hyphen-rich paths can push the sentinel past
+    SENTINEL_MAX_CHARS while sentinel-plus-prose stays well under the limit. Charging
+    the ceiling there would drop findings out of the ledger to make room nobody needed.
+
+    "Fits" is measured against the RAW limit, which is `budget` plus the clamp note the
+    caller subtracted out of it. `budget` is the cut POINT — where the clamp starts
+    trimming once it has decided to trim — but clamp_review_body leaves any body up to
+    MAX_REVIEW_BODY_CHARS untouched and never reaches for its note at all. Testing
+    `len(whole) <= budget` therefore truncated and degraded a section sitting in the
+    ~140-char window between the two, with no clamp behind it to justify the loss. The
+    422 fallback's own guard compares against MAX_REVIEW_BODY_CHARS for this reason;
+    this is the same comparison, expressed in what this function was handed.
     """
     if not items:
         return ""
@@ -1204,7 +1301,7 @@ def render_body_only_findings(items: list, budget: int | None = None) -> str:
     )
     prose = "".join(render_finding_entry(item["comment"]) + "\n\n" for item in items)
     whole = f"{marker}{render_body_only_sentinel(items)}\n\n{prose}"
-    if budget is None or len(whole) <= budget:
+    if budget is None or len(whole) <= budget + len(CLAMP_TRUNCATION_NOTE):
         return whole.rstrip("\n")
     # Room for the truncation companion, measured at its longest: `kept` is strictly
     # less than `total` here, so it can never carry more digits than `total` does.

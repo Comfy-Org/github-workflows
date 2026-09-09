@@ -188,16 +188,28 @@ _BODY_ONLY_SENTINEL_RE = re.compile(
 
 # post-review.py's companion to the line above, emitted only when a size budget cut the
 # payload down to a PREFIX of the round's demoted findings. Pinned to the same
-# single-spaced OPENER, and for the same reason: the writer defangs exactly this literal
-# in text it quotes, so a reader more tolerant than the defang is a reader the defang
-# does not cover. What follows the opener is NOT pinned, because nothing here reads it:
-# the presence of the line is the whole claim ("findings were dropped"), and pinning
+# single-spaced OPENER, so a spelling the writer's defang lets through cannot satisfy
+# this reader either. What follows the opener is NOT pinned, because nothing here reads
+# it: the presence of the line is the whole claim ("findings were dropped"), and pinning
 # `kept=N total=N` would let a shape this reader did not expect turn a DISCLOSED loss
 # back into a silent one — the failure the companion exists to remove. The counts are
 # for a human reading the raw body.
+#
+# Anchored to a LINE START for the same reason the sentinel is, and it is the sentinel's
+# containment argument — not the writer-side defang — that carries the weight here.
+# `defang_body_only_contract` runs only inside `post_error_review`, and `_body_only_entries`
+# refuses an error review before it ever reaches this pattern, so the defang gives this
+# line ZERO coverage on the success and 422-fallback bodies where the companion is
+# actually read. The line anchor is what does: a demoted finding's prose renders as a
+# blockquote, so a `<!-- cursor-review:body-only-truncated v1 ... -->` quoted into a
+# finding body sits behind a `> ` and can never be the match. Unanchored — with a bare
+# `search` over the whole body — that literal was plantable from the PR under review and
+# flipped a FULLY RECOVERED round to `degraded`, fabricating an `unrecovered_rounds`
+# entry and a "could not be recovered" note in the next round's prompt.
 BODY_ONLY_TRUNCATED_OPENER = "<!-- cursor-review:body-only-truncated v1 "
 _BODY_ONLY_TRUNCATED_RE = re.compile(
-    re.escape(BODY_ONLY_TRUNCATED_OPENER) + r"[^\n]*?-->"
+    r"(?:\A|(?<=" + _LINE_SEP_CLASS + r"))"
+    + re.escape(BODY_ONLY_TRUNCATED_OPENER) + _NOT_LINE_SEP_CLASS + r"*?-->"
 )
 
 # post_error_review's shape, as its own f-string renders it. See _body_only_entries:
@@ -444,6 +456,31 @@ def _body_only_text(value) -> str:
     return _FIELD_LINE_BREAK_RE.sub(" ", str(value or ""))
 
 
+def _body_only_truncated(body: str) -> bool:
+    """Whether the round's sentinel says it carries only a PREFIX of its findings.
+
+    Scoped the two ways the sentinel itself is scoped, because a false POSITIVE here is
+    not cosmetic: it fabricates an `unrecovered_rounds` entry and a "could not be
+    recovered — they may repeat" note in the next round's prompt off a round that lost
+    nothing.
+
+    1. The companion must begin its LINE (see `_BODY_ONLY_TRUNCATED_RE`), which is what
+       keeps a blockquoted copy quoted out of a finding body from matching.
+    2. It must sit BELOW the sentinel it annotates. That is where post-review.py writes
+       it on BOTH budgeted paths — the success section and the 422 fallback — and it
+       narrows the line anchor further: a body with no readable sentinel has nothing for
+       this line to be a companion TO, and such a round is already degraded by the
+       missing sentinel rather than by this.
+
+    Searching from `sentinel.end()` rather than slicing, so the pattern's line-start
+    lookbehind still sees the `\n` that precedes the companion.
+    """
+    sentinel = _BODY_ONLY_SENTINEL_RE.search(body or "")
+    if sentinel is None:
+        return False
+    return bool(_BODY_ONLY_TRUNCATED_RE.search(body or "", sentinel.end()))
+
+
 def _body_only_entries(review: dict, meta: dict, max_body: int):
     """(entries, degraded) for one consolidated review's demoted findings.
 
@@ -482,7 +519,7 @@ def _body_only_entries(review: dict, meta: dict, max_body: int):
     # dropped sentinel does not parse. Absent on a body an older writer posted, which
     # reads as "not truncated" — the same answer that writer's all-or-nothing payload
     # actually warranted.
-    truncated = bool(_BODY_ONLY_TRUNCATED_RE.search(review.get("body") or ""))
+    truncated = _body_only_truncated(review.get("body") or "")
     entries = []
     for item in parsed:
         entry = {

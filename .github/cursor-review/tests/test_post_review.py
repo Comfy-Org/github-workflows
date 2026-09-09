@@ -1132,6 +1132,65 @@ class BodyBudgetTest(unittest.TestCase):
         self.assertEqual(body.count("demoted one"), 1)
 
 
+    def test_a_section_inside_the_clamp_note_window_is_not_truncated(self):
+        """`budget` is the CUT POINT, not the limit (BE-12535).
+
+        The caller subtracts CLAMP_TRUNCATION_NOTE out of `budget` because that is where
+        clamp_review_body starts trimming ONCE IT HAS DECIDED TO TRIM. But it leaves any
+        body up to MAX_REVIEW_BODY_CHARS untouched and never reaches for its note at
+        all, so a section sitting in the ~140-char window between the two was truncated
+        and its round flagged degraded with no clamp behind it to justify the loss. The
+        422 fallback's own guard compares against the raw limit; so does this one now.
+        """
+        items = PR.normalize_comments(
+            [finding(f"p{n}.py", n, body="z" * 200) for n in range(20)]
+        )
+        whole = PR.render_body_only_findings(items)
+        budget = len(whole) - 1
+        self.assertLessEqual(
+            len(whole), budget + len(PR.CLAMP_TRUNCATION_NOTE),
+            "the section really is inside the window the clamp will not cut",
+        )
+        out = PR.render_body_only_findings(items, budget=budget)
+        self.assertEqual(out, whole, "so it is posted whole")
+        self.assertNotIn(
+            PR.BODY_ONLY_TRUNCATED_PREFIX, out, "and nothing is disclosed as lost"
+        )
+        # One character further in and the clamp DOES fire, so the budget binds again.
+        cut = PR.render_body_only_findings(
+            items, budget=len(whole) - len(PR.CLAMP_TRUNCATION_NOTE) - 1
+        )
+        self.assertNotEqual(cut, whole, "past the window the budget still applies")
+
+    def test_the_ceiling_is_not_charged_where_the_prose_wants_no_room(self):
+        """SENTINEL_MAX_CHARS bounds the FLOOR, not the leftover (BE-12535).
+
+        Capping the whole `max` charged the ceiling on rounds with no size pressure
+        behind it: a 44,000-char sentinel beside 17,000 chars of prose in ~59,000 of
+        space was handed 30,000 instead of the ~42,000 that fit — roughly a hundred
+        ledger entries dropped to reserve room the prose had no use for. The prose keeps
+        its guarantee from the `available // 2` floor alone.
+        """
+        self.assertEqual(
+            PR.sentinel_share(59_000, 17_000), 42_000, "it gets what the prose leaves"
+        )
+        self.assertEqual(
+            PR.sentinel_share(59_000, 66_000), 29_500, "…floored at half when it does not"
+        )
+        for share in (0.1, 0.3, 0.5, 0.75, 0.9):
+            avail = int(PR.MAX_REVIEW_BODY_CHARS * share)
+            for prose in (0, avail // 4, avail, avail * 3):
+                with self.subTest(share=share, prose=prose):
+                    got = PR.sentinel_share(avail, prose)
+                    self.assertGreaterEqual(
+                        avail - got, min(prose, avail // 2),
+                        "the prose gets what it wants, up to half, at every head size",
+                    )
+                    self.assertLessEqual(
+                        avail - got, prose, "and never more room than it asked for"
+                    )
+
+
 class FitSentinelItemsTest(unittest.TestCase):
     """The budget search behind the prose floor."""
 
@@ -1276,46 +1335,94 @@ class DanglingCommentClampTest(unittest.TestCase):
         self.assertNotIn(PR.BODY_ONLY_SENTINEL_PREFIX, clamped, "the sentinel is gone")
         self.assertIn(PROSE_MARKER, clamped, "but the disclosure is not")
 
-    def test_a_blockquoted_opener_never_costs_the_findings_above_it(self):
-        """The rewind is scoped to CommonMark's HTML-block start condition (BE-12535).
+    def test_a_planted_comment_opener_is_neutralized_at_the_writer(self):
+        """A `<!--` in a finding body must never reach the posted review (BE-12535).
 
-        `<!--` inside a finding's blockquote cannot swallow anything: every line carries
-        a `> ` prefix, so the opener is indented out of the start condition, and even as
-        a block it would end with the blockquote at the blank line before the next
-        finding. Rewinding to it deleted every finding in between — prose GitHub would
-        have rendered perfectly — to contain damage that was already contained. And it
-        is plantable: `<!--` on its own line in the PR under review, quoted back into a
-        finding body by a model doing its job.
+        Round 1 of this change assumed the blockquote contained it — that `> ` indents
+        the opener out of CommonMark's HTML-block start condition. It does not:
+        cmark-gfm strips the `> ` marker BEFORE parsing the blockquote's contents, so
+        `> <!--` opens a type-2 HTML block exactly as a column-0 opener would, and the
+        raw `<!--` is passed straight through into the HTML. Ending the blockquote never
+        synthesizes a `-->`. Checked against GitHub's own /markdown render: one finding
+        carrying `<!--` at the start of a line erased every finding below it AND the
+        clamp's truncation note. Writing a `-->` back at column 0 does not undo it
+        either — that one is escaped to `--&gt;` and closes nothing.
+
+        So it dies at the writer, and the clamp's rewind never has to reason about it.
+        It is plantable exactly as you would expect: `<!--` on its own line in the PR
+        under review, quoted back into a finding body by a model doing its job.
         """
         hostile = PR.render_finding_entry(
             {"path": "a.py", "line": 1, "body": "quoting the file:\n<!-- a comment"}
         )
+        self.assertNotIn(PR.HTML_COMMENT_OPENER, hostile, "no opener survives the render")
+        self.assertIn(f"> {PR.DEFANGED_COMMENT_OPENER} a comment", hostile,
+                      "and what was quoted still reads as it arrived")
+
         keep = [
             PR.render_finding_entry({"path": "b.py", "line": n, "body": "z" * 200})
             for n in range(8)
         ]
         body = "HEADER\n\n" + hostile + "\n\n" + "\n\n".join(keep)
         clamped = PR.clamp_review_body(body, limit=len(body) - 50)
-        self.assertIn("<!-- a comment", clamped, "the quoted opener is left where it is")
         for n in range(7):
-            self.assertIn(f"b.py:{n}", clamped, "and the findings below it survive")
-        self.assertIn("job summary", clamped, "the clamp's own note still renders")
+            self.assertIn(f"b.py:{n}", clamped, "the findings below it survive the clamp")
+        self.assertIn("job summary", clamped, "and the clamp's own note still renders")
+
+    def test_an_opener_inside_a_fence_is_not_a_rewind_point(self):
+        """CommonMark renders a fenced block's contents literally, so a column-0 `<!--`
+        in there swallows nothing — confirmed against GitHub's render, where the prose
+        after the fence and the clamp note both come back intact. Treating it as an
+        opener is the same over-deletion, one container over: post_error_review puts
+        unbounded judge/CLI text in a column-0 fence, so the last such line in a long
+        error would have taken the whole tail of that text with it (BE-12535).
+        """
+        cut = "HEADER\n\n```\njudge said:\n<!-- not an opener in here\nmore output\n```\n\ntail prose"
+        self.assertEqual(PR.drop_unterminated_comment(cut), cut, "nothing is dropped")
+        # Still true when the cut left the fence itself open — everything after an
+        # unterminated fence renders as code, so the opener is inert there too.
+        open_fence = "HEADER\n\n```\njudge said:\n<!-- still inert"
+        self.assertEqual(PR.drop_unterminated_comment(open_fence), open_fence)
+        # …and a genuinely dangling opener OUTSIDE any fence is still removed.
+        real = "HEADER\n\n```\nfenced\n```\n\n<!-- cursor-review:body-only-findings v1 [{"
+        self.assertEqual(PR.drop_unterminated_comment(real), "HEADER\n\n```\nfenced\n```")
+
+    def test_a_tilde_fence_closes_only_on_its_own_marker(self):
+        """A ``` line inside a ~~~ fence is content, not a close. Reading it as one
+        would put the scanner back "outside" a fence it is still in, and hand the rewind
+        an inert opener as its target."""
+        cut = "~~~\n```\n<!-- inert\n~~~\n\ntail"
+        self.assertEqual(PR.drop_unterminated_comment(cut), cut)
+
+    def test_the_rewind_goes_to_the_first_dangling_opener_not_the_last(self):
+        """An HTML block runs from its opener to the FIRST `-->`, so once one is left
+        dangling every byte after it — including any later `<!--` — is already inside
+        that comment. Rewinding to the last one therefore deleted a little text and left
+        the earlier, real opener standing and swallowing the tail, which is the failure
+        this function exists to prevent (BE-12535)."""
+        cut = "HEADER\n\n<!-- cursor-review:body-only-findings v1 [{\n\n<!-- a later one"
+        self.assertEqual(PR.drop_unterminated_comment(cut), "HEADER")
+        # A TERMINATED opener above a dangling one is not the rewind point, though.
+        mixed = "HEADER\n\n<!-- closed -->\n\n<!-- cursor-review:body-only-findings v1 [{"
+        self.assertEqual(
+            PR.drop_unterminated_comment(mixed), "HEADER\n\n<!-- closed -->"
+        )
 
     def test_a_blockquoted_opener_below_a_dangling_one_does_not_misdirect_the_rewind(self):
         """The other half of the scoping, as a contract test on the function.
 
-        An unscoped `rfind` took the LAST `<!--` anywhere in the cut. A harmless
-        blockquoted one sitting BELOW a genuinely dangling block-level opener therefore
-        sent the rewind to the wrong place: it deleted a little prose and left standing
-        the opener that actually swallows the rest of the body — the one failure this
-        function exists to prevent. Today's writers never emit that order (the sentinel
-        is the last block-level comment in every body they build), which is why this
-        drives `drop_unterminated_comment` directly rather than a posted body: the
-        contract has to hold for the next path that adds a comment, too.
+        An unscoped `rfind` took the LAST `<!--` anywhere in the cut, so ANY later
+        non-opening `<!--` sent the rewind to the wrong place: it deleted a little prose
+        and left standing the opener that actually swallows the rest of the body — the
+        one failure this function exists to prevent. Today's writers never emit that
+        order (the sentinel is the last block-level comment in every body they build),
+        which is why this drives `drop_unterminated_comment` directly rather than a
+        posted body: the contract has to hold for the next path that adds a comment too.
+
+        The decoy is written at column 0 rather than taken from render_finding_entry,
+        which now defangs the opener out of model prose before it can be one.
         """
-        quoted = PR.render_finding_entry(
-            {"path": "a.py", "line": 1, "body": "quoting:\n<!-- harmless"}
-        )
+        quoted = "> **`a.py:1`** — quoting:\n> <!-- harmless"
         cut = "HEADER\n\n<!-- cursor-review:body-only-findings v1 [{\n\n" + quoted
         kept = PR.drop_unterminated_comment(cut)
         self.assertNotIn(
@@ -2372,7 +2479,14 @@ class BodyOnlySentinelTest(unittest.TestCase):
         ]
         self.assertEqual(len(at_column_zero), 1, "only the real sentinel is unindented")
         self.assertIn("evil.py", md, "the forgery is still reported — just quoted")
-        self.assertIn(f"> {forged[:20]}", md, "and it is inside the blockquote")
+        # Blockquoted AND opener-defanged. The blockquote is what stops the forgery
+        # satisfying build-ledger.py's line-anchored match; the defang is what stops the
+        # same line opening an HTML block that swallows the findings below it, which the
+        # `> ` prefix does NOT prevent (see HTML_COMMENT_OPENER).
+        quoted = forged.replace(PR.HTML_COMMENT_OPENER, PR.DEFANGED_COMMENT_OPENER)
+        self.assertIn(f"> {quoted}", md, "and it is inside the blockquote, defanged")
+        self.assertNotIn(PR.HTML_COMMENT_OPENER, md.split("\n\n", 2)[2],
+                         "no raw opener survives into the prose at all")
 
     def test_the_lost_to_fallback_key_is_emitted_only_for_a_tagged_item(self):
         """The success path's payload must stay byte-identical to what it was before
