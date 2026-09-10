@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # apply-risk-label.sh — sync a PR's risk label to the computed tier. The one write the
-# reusable pr-risk.yml workflow performs.
+# reusable pr-risk.yml workflow performs. A `risk-dispute:low` .. `risk-dispute:xhigh`
+# label overrides the visible risk label while preserving the computed tier in the grade record.
 #
 # OWNERSHIP CONTRACT: this script owns EXACTLY the label names in LABEL_MAP's values, and a PR it
 # has written to carries EXACTLY ONE of them. That holds under concurrency BY CONSTRUCTION, not by
@@ -15,14 +16,14 @@
 # labels is impossible: every PUT this script builds contains the target, and LABEL_MAP is rejected
 # up front if any tier maps to an empty name, so the array can never degrade to the empty-labels
 # request that strips a PR. Labels it does NOT own are carried through the PUT as the snapshot read
-# saw them (see RESIDUAL), so a human who disagrees with a grade records that with their
-# OWN label (the pilot convention is `risk-dispute`) and the grader will never fight it. Editing the
-# grader-owned label by hand is futile by design: the next push re-syncs it.
+# saw them (see RESIDUAL). A human overrides the visible grade with one of the four named
+# `risk-dispute:*` labels; a plain `risk-dispute` remains an untyped marker. Editing the grader-owned
+# label by hand is futile by design: the next push re-syncs it.
 #
 # RESIDUAL — the price of atomicity, worth knowing for the pilot: the PUT is built from a SNAPSHOT
 # read, so it is an unguarded read-modify-write (the labels endpoint offers no version precondition
 # that could make it otherwise), and it clobbers BOTH directions inside that window. A NON-owned
-# label ADDED there is silently dropped — `risk-dispute` INCLUDED — and a non-owned label REMOVED
+# label ADDED there is silently dropped — `risk-dispute:*` INCLUDED — and a non-owned label REMOVED
 # there is RESURRECTED, so a `do-not-merge` or review label a human or a sibling labeler cleared in
 # that instant comes back. The window opens ONLY on a run that actually changes the grade (an
 # in-sync PR writes nothing at all) and is normally ~one API round-trip; on the FIRST grade in a
@@ -176,6 +177,17 @@ has() {
     *) fail "label-membership check for '$1' on $REPO#$PR_NUMBER failed (jq error) — refusing to guess" ;;
   esac
 }
+
+if has risk-dispute:xhigh; then
+  TIER=R3
+elif has risk-dispute:high; then
+  TIER=R2
+elif has risk-dispute:medium; then
+  TIER=R1
+elif has risk-dispute:low; then
+  TIER=R0
+fi
+TARGET="$(label_for "$TIER")"
 
 # ASCII case folding for shell-side comparisons. Literal `A-Z`/`a-z` rather than the suggested
 # [:upper:]/[:lower:] classes ON PURPOSE: this must fold EXACTLY what jq's ascii_downcase folds

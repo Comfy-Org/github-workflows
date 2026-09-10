@@ -94,8 +94,13 @@ TODAY = datetime.date(2026, 7, 27)
 # below a 25-row head truncation — so the rendering fix is asserted against it
 # rather than against a hand-built approximation of it.
 REAL_CATALOG_PATH = os.path.join(os.path.dirname(__file__), "fixtures", "catalog-2026-08-10.txt")
-REAL_PANEL = ["gpt-5.6-sol-max", "claude-opus-5-thinking-max", "gemini-3.1-pro", "kimi-k3-max"]
-REAL_JUDGE = "claude-opus-5-thinking-max"
+REAL_PANEL = ["gpt-5.6-sol-max", "claude-opus-5-thinking-max", "kimi-k3-high"]
+REAL_JUDGE = "claude-opus-5-thinking-xhigh"
+# The pins that 2026-08-10 run actually reported against (Gemini was still on the
+# panel, Kimi and the judge were at `-max`). The acceptance case below is a
+# regression test for THAT report's rendering, so it keeps the historical pins.
+PANEL_2026_08_10 = ["gpt-5.6-sol-max", "claude-opus-5-thinking-max", "gemini-3.1-pro", "kimi-k3-max"]
+JUDGE_2026_08_10 = "claude-opus-5-thinking-max"
 
 
 def real_catalog():
@@ -1146,7 +1151,7 @@ class TierCollapseTest(unittest.TestCase):
         # The acceptance case, against the catalog captured verbatim in #144.
         catalog = real_catalog()
         report = cd.analyze(
-            REAL_PANEL, REAL_JUDGE, catalog, datetime.date(2026, 7, 28), datetime.date(2026, 8, 10), 30
+            PANEL_2026_08_10, JUDGE_2026_08_10, catalog, datetime.date(2026, 7, 28), datetime.date(2026, 8, 10), 30
         )
         # The finding itself is unchanged — 178 unpinned same-lab ids, still not
         # urgent (no pin delisted, none marked NO-ZDR). Only the rendering moved.

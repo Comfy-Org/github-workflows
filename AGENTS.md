@@ -110,11 +110,16 @@ a second catalog drifts, and this one already had. Three facts it cannot tell yo
   of THIS repo — never from the caller's checkout. That is what makes the
   reviewer/checker tamper-proof: a PR cannot rewrite the logic judging it. The
   self-enrollment callers (`ci-cursor-review.yml`, `ci-assign-reviewers.yml`,
-  `ci-groom.yml`) pin a merged-main SHA rather than a local `./` path for the same
-  reason — do not "simplify" them to a path.
+  `ci-groom.yml`, `ci-agents-md-integrity.yml`) pin a merged-main SHA rather than
+  a local `./` path for the same reason — do not "simplify" them to a path.
 - **One bumper, not several.** `bump-callers.sh` backs every fleet; the thin
   `bump-*-callers.yml` wrappers stay separate only so one reusable's change does not
   bump another fleet. Never fork it — forking is how other shared org machinery drifted.
+- **Comment/docs-only edit inside a watched surface? Add `Skip-caller-bump: true`**
+  as the LAST commit's trailer — only the squashed message's trailing trailer
+  block counts, and it declares the WHOLE PR bump-irrelevant for EVERY fleet.
+  Reviewers must reject it on any PR with behavioral changes; when in doubt,
+  leave it off and let the fleet bump. `workflow_dispatch` overrides a mistake.
 - **Enrolling a caller is TWO steps.** Merge the caller, *and* add the repo to its
   `*_CALLERS` roster secret. Skipping the second is the most repeated mistake here
   — the pin never moves, and it fails at startup much later with no obvious cause.
@@ -128,15 +133,15 @@ a second catalog drifts, and this one already had. Three facts it cannot tell yo
   so a phantom input in the docs is a broken caller for whoever copies it. Check
   `on.workflow_call.inputs` first. **Deleting an input is a docs change too** —
   grep the repo for its name in the same commit. (`cursor-review`'s `blocking:` is
-  the worked example: deleted in #31, its docs outlived it in three places.)
+  the worked example: deleted in #31, docs outlived it in three places; restored by BE-4691.)
 - **Versioning:** semver-style major tags (`v1`, `v2`). Breaking changes bump the
   major; compatible changes move the tag in place — `git tag -f v1 <sha> && git
   push -f origin v1`. Without the push the public tag never moves. That force-move
   is the one sanctioned force-push — NOT license to force-push branches.
-- **This AGENTS.md must satisfy the standard `agents-md-integrity.yml` enforces** —
-  under 200 lines (aim ≤150), `CLAUDE.md` a bare `@AGENTS.md` shim, no
-  `.cursorrules` — but this repo is NOT self-enrolled in that reusable, so no PR
-  check catches a regression. Run `check_agents_md.py --root .` yourself.
+- **This AGENTS.md is itself gated** by the standard `agents-md-integrity.yml`
+  enforces — under 200 lines (aim ≤150), `CLAUDE.md` a bare `@AGENTS.md` shim, no
+  `.cursorrules` — via `ci-agents-md-integrity.yml`, so every PR and push to main
+  runs the check. Locally: `check_agents_md.py --root .`.
 
 ## Deeper docs
 

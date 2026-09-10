@@ -78,6 +78,25 @@ MAX_FENCE_CHARS = 64
 # what the judge prompt block quotes.
 REPEAT_CAP = 2
 
+# The shape a `repeat_of` may have when it travels STRUCTURALLY through the body-only
+# sentinel (BE-12534). A demoted re-raise loses its lineage otherwise: the trailer is
+# stripped out of the sentinel's prose (see strip_repeat_line) and, with no field to
+# carry it, build-ledger.py rebuilt the entry as a fresh unanchorable finding — so the
+# next round's re-raise of the SAME finding needed no repeat_of and cost no repeat slot.
+# One demoted hop made every later hop of that chain cap-free.
+#
+# This is a SHAPE guard, not the integrity check: it bounds what can be written into a
+# public review body and re-read from it, so the payload can never carry a link to an
+# arbitrary host, a whitespace/line-break run, or an unbounded string. What actually
+# decides whether the lineage is real is on the reader — build-ledger.py resolves the
+# id to a ROOT comment of one of OUR consolidated reviews, so a judge-hallucinated or
+# foreign URL of exactly this shape still resolves to nothing. Kept as a literal
+# pattern rather than a compiled-only object because build-ledger.py duplicates it
+# (neither module imports the other) and test_build_ledger.py pins the two together.
+REPEAT_URL_PATTERN = r"^https://github\.com/[^/\s]+/[^/\s]+/pull/\d+#discussion_r\d+$"
+REPEAT_URL_RE = re.compile(REPEAT_URL_PATTERN)
+REPEAT_URL_MAX_CHARS = 512
+
 # Machine-readable handoff for findings demoted to the review body (BE-9565).
 # build-ledger.py derives its entries from review-COMMENT thread roots, and a demoted
 # finding has no comment — so without this it never reaches the next round's ledger and
@@ -85,6 +104,100 @@ REPEAT_CAP = 2
 # sentinel is what humans read; THIS is the contract, and the version suffix is what
 # lets the reader reject a payload it does not understand instead of guessing.
 BODY_ONLY_SENTINEL_PREFIX = "cursor-review:body-only-findings v1"
+
+# The sentinel's companion, emitted ONLY when a size budget cut the payload down to a
+# PREFIX of the round's demoted findings. A truncated payload is still VALID JSON, so
+# without this line build-ledger.py reads 12-of-89 as a complete recovery: the other 77
+# vanish with no `unrecovered_rounds` entry and no note, and the only record is a line
+# in a public run log nobody reads. The all-or-nothing rule this budget replaced was
+# self-disclosing by accident — a dropped sentinel does not parse, so the round degraded
+# LOUDLY — and a partial one has to say so on purpose. Deliberately a SECOND comment
+# rather than a key inside the payload: the reader pins the sentinel to a single-spaced
+# opener immediately below the prose marker (see build-ledger.py), so anything inserted
+# between them breaks the recovery it is meant to annotate, and a reader pinned to an
+# older SHA ignores an unknown trailing comment instead of failing to parse the findings.
+BODY_ONLY_TRUNCATED_PREFIX = "cursor-review:body-only-truncated v1"
+
+# --- the blocking gate's delivery signal (BE-4691) -------------------------
+# `needs.post-review.result == 'success'` cannot stand in for "a review carrying
+# resolvable finding threads landed on the PR": this script exits 0 after a
+# read-only-token 403 (the review went to the job summary, not the PR), after the
+# body-only "Review failed" error review, after the no-findings review a run posts
+# when every panel cell errored, and after the 422 inline-anchor fallback. Each of
+# those satisfies a zero-exit guard while the gate's thread query legitimately finds
+# nothing — a green required check over a round that never reviewed anything, which
+# is the fail-OPEN the gate exists to prevent. So say it POSITIVELY instead, and let
+# the gate require the statement rather than infer it from an exit code.
+#
+#   delivered         true only when a real review — one whose findings were actually
+#                     adjudicated — reached the PR itself.
+#   gated_findings    findings that carry an inline thread, i.e. that a human can
+#                     resolve and that the gate can therefore hold the merge on.
+#   ungated_findings  findings that reached the review BODY only (anchor missed the
+#                     reviewed diff, or the whole inline payload 422'd). Real
+#                     findings with nowhere to reply — no thread resolution can ever
+#                     clear them, so the gate must not read their absence as clean.
+#   posted            true when SOME review body reached the PR, whatever it said.
+#                     Strictly weaker than `delivered` and deliberately so: it is
+#                     what `notify-complete`'s DM needs, and the DM asks a different
+#                     question than the gate. The gate asks "did an adjudicated
+#                     review land"; the DM claims "one consolidated review is on the
+#                     PR", which is true of the error review and the all-cells-failed
+#                     review (both `delivered=false`) and false of the read-only-403
+#                     degradation, where the review reached only the job summary and
+#                     the script still exits 0. Keying the DM on the job result alone
+#                     made that last case a silent green — a success DM pointing at a
+#                     PR carrying no review. `delivered` implies `posted`; the
+#                     converse does not hold.
+#
+# Emitted exactly once (first call wins): the paths below can fall through each
+# other, and duplicate keys in $GITHUB_OUTPUT are ambiguous. That once-guard is also
+# why `posted` rides along here rather than in an emitter of its own — it is decided
+# by the same branches, so a second emitter would need a second guard kept in sync
+# with this one across every path below. Nothing is written when the script dies
+# before deciding, which leaves the gate reading an empty `delivered` and the DM an
+# empty `posted` — false, i.e. fail-closed by default on both.
+_DELIVERY_EMITTED = False
+
+
+def emit_delivery(
+    delivered: bool, gated: int = 0, ungated: int = 0, posted: bool = False
+) -> None:
+    """Write the blocking gate's delivery signal to $GITHUB_OUTPUT."""
+    global _DELIVERY_EMITTED
+    if _DELIVERY_EMITTED:
+        return
+    _DELIVERY_EMITTED = True
+    # `delivered` without `posted` would be incoherent — an adjudicated review that
+    # never reached the PR — and would green the gate while the DM reported a
+    # degradation. No call site produces it today (both `delivered=True` sites post
+    # first and pass `posted=True`); this NORMALIZES rather than asserts, so a future
+    # one that forgets the kwarg cannot emit the incoherent pair. Not a raise on
+    # purpose: this runs immediately AFTER a review was successfully posted, so
+    # raising would turn a kwarg slip into a red check and a "did not succeed" DM on
+    # a PR that has its review — strictly worse than the coherent output.
+    #
+    # The opposite direction — a body that DID post whose site forgets `posted=True`
+    # — is not repairable here (nothing in this function can see the POST), so it
+    # stays each call site's job and the parameter defaults to the fail-closed
+    # `False`. Its blast radius is a spurious "degraded" DM, never a false success.
+    # The stderr line below prints both keys so a run log shows which pair was
+    # emitted without re-reading $GITHUB_OUTPUT.
+    posted = posted or delivered
+    print(
+        f"delivery: delivered={'true' if delivered else 'false'} "
+        f"gated_findings={gated} ungated_findings={ungated} "
+        f"posted={'true' if posted else 'false'}",
+        file=sys.stderr,
+    )
+    path = os.environ.get("GITHUB_OUTPUT")
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"delivered={'true' if delivered else 'false'}\n")
+        f.write(f"gated_findings={gated}\n")
+        f.write(f"ungated_findings={ungated}\n")
+        f.write(f"posted={'true' if posted else 'false'}\n")
 # Mirrors build-ledger.py's MAX_BODY_CHARS: the ledger truncates to that anyway, so
 # encoding more only spends review-body budget that the clamp would take back. The
 # marker mirrors its TRUNCATION_MARKER for the same reason — cutting to exactly the
@@ -98,6 +211,31 @@ BODY_ONLY_SENTINEL_BODY_CHARS = 600
 # round demoted nothing", so it is a constant here rather than a literal in the render.
 BODY_ONLY_PROSE_MARKER = "could not be anchored to a line the reviewed diff carries"
 BODY_ONLY_TRUNCATION_MARKER = " …[truncated]"
+# What render_findings_markdown puts between the head and the first finding. A
+# constant because the wholesale fallback's size guard has to measure everything that
+# precedes finding one, and a guard that re-spelled this separator would drift from it.
+FINDINGS_SEPARATOR = "\n\n---\n\n"
+# What clamp_review_body appends in place of what it cut. Also a constant because the
+# same size guard has to RESERVE it: the clamp cuts at `limit - len(note)`, so a head
+# that merely fits under the limit can still have its tail — the sentinel — taken.
+CLAMP_TRUNCATION_NOTE = (
+    "\n\n_…truncated here: the review body reached GitHub's size limit. As much "
+    "of it as fits is in the job summary of this run._"
+)
+# The share of a finding-carrying body the sentinel may take, on BOTH such paths — the
+# success path's demoted-findings section (render_body_only_findings) and the wholesale
+# 422 fallback. It has TWO readers and the HUMAN comes first: the prose findings are the
+# review a person actually reads on the PR, and the sentinel is a best-effort
+# machine-readable copy for next round's ledger. Uncapped, the sentinel wins that
+# contest — its per-finding JSON is nearly as long as the prose entry it duplicates, so
+# it can consume the whole budget ahead of finding one and leave the clamp nothing but
+# the head to keep. Measured before this cap: 89 findings of ~700 chars posted 58,720
+# characters of JSON and rendered ZERO findings, while the same round at 90 findings —
+# one over the all-or-nothing guard, so the sentinel was dropped whole — rendered 79 of
+# them. The cliff ran the wrong way. Half the budget is the prose FLOOR; the sentinel
+# takes the most-urgent prefix of the findings that fits the other half (see
+# fit_sentinel_items).
+SENTINEL_MAX_CHARS = MAX_REVIEW_BODY_CHARS // 2
 
 
 def normalize_severity(value) -> str:
@@ -160,8 +298,42 @@ def gh_post_review(repo: str, pr_number: str, payload: str) -> subprocess.Comple
     )
 
 
+# The 403 wordings that mean "slow down", not "you may not write". GitHub answers a
+# primary rate limit, a secondary rate limit and abuse detection with 403 as readily
+# as with 429 — and, unlike every other 403, one of those can be raised on a request
+# the API went on to SERVE, so it is not evidence the write was rejected before it was
+# committed. Matched case-insensitively as substrings, which is how `gh` hands over
+# GitHub's `message`: echoed into stderr rather than parsed out of the JSON body.
+# Only ever consulted once the status is already known to be 403, so a finding body
+# quoting one of these phrases cannot reach it through a 422 — and matched against
+# `gh`'s own error LINE rather than the whole blob, so it cannot reach it through the
+# same PR's review body either (see gh_error_line).
+THROTTLE_403_MESSAGES = (
+    # "API rate limit exceeded for ..." / "You have exceeded a secondary rate limit."
+    "rate limit",
+    # "You have triggered an abuse detection mechanism."
+    "abuse detection",
+    # the older wording of the same secondary-limit refusal
+    "submitted too quickly",
+)
+
+
+def is_throttled_403(result: subprocess.CompletedProcess) -> bool:
+    """True when a 403's message is GitHub asking us to slow down.
+
+    Read out of `gh`'s error line, not out of all of stderr. With `GH_DEBUG=api` set
+    on the step — a documented `gh` knob a caller workflow can add — stderr also
+    carries the request trace, which echoes the review body being POSTed; a review
+    that DISCUSSES rate-limit handling would otherwise turn a standing permission 403
+    into a "throttle", costing it a doomed read, a doomed fallback and a red step
+    where it used to degrade green.
+    """
+    line = gh_error_line(result).lower()
+    return any(message in line for message in THROTTLE_403_MESSAGES)
+
+
 def is_read_only_token_error(result: subprocess.CompletedProcess) -> bool:
-    """True when the POST failed because the token can't write to the PR.
+    """True when the POST failed because the ENVIRONMENT forbids writing to the PR.
 
     The gate skips fork PRs (which always hit this), but a read-only token can
     still occur on same-repo runs — org/repo default workflow permissions set
@@ -169,9 +341,332 @@ def is_read_only_token_error(result: subprocess.CompletedProcess) -> bool:
     HTTP 403 'Resource not accessible by integration'. That's an environment
     constraint, not a review failure, so callers degrade to the job summary
     rather than failing the check red.
+
+    STATUS AND MESSAGE, not either alone (BE-12612).
+
+    The status must be 403. The permission wording also travels inside a 422's
+    `errors[].message` list, which `gh` joins into the same stderr blob, and reading
+    that as a read-only token would return from `main()` before the landed-review
+    check — the same silent skip this guard is being narrowed to remove, arrived at
+    from the other direction.
+
+    The message must then NOT be a throttle. A rate limit and an abuse-detection
+    refusal are neither an environment constraint nor proof that nothing was written,
+    so those alone fall through to the landed-review check (see
+    RETRYABLE_4XX_STATUSES). Everything else a 403 can carry — the permission refusal
+    above, whatever principal it names (`by integration` for both of
+    cursor-review.yml's token arms, `by personal access token` for a fine-grained
+    PAT), an SSO/IP-allowlist
+    or org-policy block, an archived repo, a future rewording of any of them — is a
+    STANDING refusal that no retry fixes and that wrote nothing, so it degrades to the
+    job summary. Matching the throttles rather than the permission phrase is what
+    keeps a SAML-blocked or IP-allowlisted org on that green degrade instead of the
+    permanently red check "everything but the permission phrase" would hand it.
+
+    The fall-through reaches the landed-review check on ALL THREE failure paths —
+    `main()`'s inline branch, its no-inline-comments branch, and `post_or_degrade` —
+    because `post_may_have_landed` gates each of them the same way. A throttle raised
+    on a request GitHub went on to serve is therefore reported as delivered wherever
+    it happens, rather than red with `posted=false` over a review sitting on the PR.
+    Only the inline path REPOSTS on the other two answers; the other two read and,
+    unless the answer is PRESENT, behave exactly as they always have.
+
+    One residual, named rather than implied: the read runs on the same token GitHub
+    just throttled, so it can be throttled too. That yields UNKNOWN, and on the inline
+    path UNKNOWN posts the fallback — which duplicates a first write that did land.
+    Closing that needs `Retry-After`/backoff, which `gh api` does not surface on the
+    default path; it is tracked separately (BE-12679) rather than half-done here.
     """
+    return gh_http_status(result) == 403 and not is_throttled_403(result)
+
+
+# The discriminator for "a review of THIS panel is already on the PR". Mirrors
+# gate-unresolved.py's constant of the same name (and the inline jq the workflow's
+# dup-check uses) — duplicated as a literal rather than imported because neither module
+# imports the other, and pinned equal to the gate's by test_post_review.py, exactly the
+# way build-ledger.py pins its own copy.
+CONSOLIDATED_MARKER = "## 🔍 Cursor Review — Consolidated panel"
+
+# `gh` reports an API error's HTTP status in its stderr, but not in ONE shape. The
+# common `gh api` rendering trails it in parentheses (`gh: Unprocessable Entity
+# (HTTP 422)`), but go-gh's HTTPError leads with it whenever it has a request URL to
+# report and either no message at all — `HTTP 403 (https://api.github.com/...)`, what
+# a proxy, a WAF or a GHES edge that sent no JSON body produces — or a message plus an
+# `errors[]` tail, `HTTP 422: Validation Failed (https://...)\n<rest>`. Both
+# alternatives are matched.
+#
+# Matching only the parenthesized trailer was a REGRESSION risk once
+# `is_read_only_token_error` began conjoining the status (BE-12612): the leading
+# shapes would have read as "no status at all", so a STANDING permission or SSO 403
+# rendered that way would leave the green degrade for a doomed read, a doomed fallback
+# and SystemExit(1) on every run — which the bare `"HTTP 403" in blob` it replaced did
+# not do.
+#
+# A transport failure (DNS, TLS, a dropped connection) carries no status in either
+# shape, which is why the caller treats "no match" as unknown rather than as a server
+# error.
+_GH_HTTP_STATUS_RE = re.compile(r"\(HTTP (\d{3})\)|\bHTTP (\d{3})\b")
+
+
+def _gh_status_match(result: subprocess.CompletedProcess):
+    """The LAST status rendering on stderr, as a match, or None if there is none.
+
+    Last, not first: with `GH_DEBUG=api` stderr also carries the request/response
+    trace, and the request it echoes is the review body being POSTed — which can quote
+    anything, `HTTP 403` included. `gh` writes its own error AFTER that trace, so the
+    final match is the one describing the response rather than something quoting one.
+    """
+    matches = list(_GH_HTTP_STATUS_RE.finditer(result.stderr or ""))
+    return matches[-1] if matches else None
+
+
+def gh_http_status(result: subprocess.CompletedProcess):
+    """The HTTP status `gh` reported on stderr, or None when it reported none."""
+    match = _gh_status_match(result)
+    if match is None:
+        return None
+    return int(match.group(1) or match.group(2))
+
+
+def gh_error_line(result: subprocess.CompletedProcess) -> str:
+    """The one stderr line carrying that status — `gh`'s own error line, or "".
+
+    The scope for anything that reads the WORDING of a failure. Both of `gh`'s
+    renderings put GitHub's `message` on the same line as the status, so this is all
+    of what GitHub said and none of what an `errors[]` continuation, a `GH_DEBUG=api`
+    trace or a quoted review body put around it.
+    """
+    match = _gh_status_match(result)
+    if match is None:
+        return ""
     blob = result.stderr or ""
-    return "Resource not accessible by integration" in blob or "HTTP 403" in blob
+    start = blob.rfind("\n", 0, match.start()) + 1
+    end = blob.find("\n", match.end())
+    return blob[start:] if end == -1 else blob[start:end]
+
+
+# 4xx statuses that are NOT evidence the request was rejected before it was written.
+# The no-read short-circuit rests on a 4xx meaning "GitHub validated this and refused
+# it", which holds for the rejections it was built for (422 over an inline position,
+# and the 4xx family of malformed/unauthorized/absent) but NOT for these: a timeout,
+# a secondary rate limit or an early-hint refusal can come from an edge or a proxy in
+# front of GitHub, about a request the API went on to serve. Treating one of those as
+# "absent by construction" would repost the fallback and tag every anchored finding
+# `lost_to_fallback` on an assumption that does not apply, so they take the read like
+# a 5xx does.
+#
+# 403 is here because `is_read_only_token_error` now excludes the throttle wordings:
+# a 403 that reaches THIS decision has already been classified as one of them, so it
+# is a rate limit or an abuse-detection refusal and nothing else — every standing
+# 403 (permission, SSO/IP allowlist, archived repo) returned from `main()` on the
+# degrade path well above. A throttle can be raised on a request the API went on to
+# serve, exactly like the 429 beside it, so it takes the read too.
+RETRYABLE_4XX_STATUSES = frozenset({403, 408, 425, 429})
+
+
+def post_may_have_landed(result: subprocess.CompletedProcess) -> bool:
+    """Could GitHub have committed this write despite erroring on the request?
+
+    False only for the 4xx that mean "GitHub VALIDATED this and refused it before
+    writing anything" — every 4xx outside RETRYABLE_4XX_STATUSES, whose members are
+    4xx without carrying that meaning. A 5xx, and a transport error with no status at
+    all, leave the write genuinely undecided.
+
+    True is not "the review landed"; it is "the PR is worth asking". Shared by all
+    three failure paths so the question is answered the same way on each — the
+    no-inline branch and post_or_degrade used to skip it entirely, which reported
+    `posted=false` for a review that was on the PR the whole time (BE-12612).
+    """
+    status = gh_http_status(result)
+    return not (
+        status is not None
+        and 400 <= status < 500
+        and status not in RETRYABLE_4XX_STATUSES
+    )
+
+
+# This read sits on the RECOVERY path: the fallback POST and write_step_summary both
+# come after it, so a call that hangs takes the round out of BOTH channels — the job's
+# `timeout-minutes: 10` kills the process before either runs, where the pre-BE-12528
+# code posted the fallback immediately. Bounded well under that budget so a slow or
+# wedged read degrades to the UNKNOWN branch (fallback posted, nothing tagged) instead
+# of costing the round entirely. Generous enough that ordinary pagination over a busy
+# PR finishes inside it.
+GH_LIST_REVIEWS_TIMEOUT_SECONDS = 60
+
+
+def gh_list_reviews(repo: str, pr_number: str) -> subprocess.CompletedProcess:
+    """Every review on the PR, oldest first, ALL pages.
+
+    Paginated deliberately: the review this asks about is the newest one, so on a PR
+    with more than a page of reviews it sits on the LAST page. The workflow's own
+    dup-check (`cursor-review.yml`, the `already_reviewed` step) is the same
+    discriminator without pagination — it can afford that, because it only has to
+    notice a review that already exists before spending the panel, while a wrong
+    answer here decides whether findings are labelled lost. Pagination means this is
+    one *command* but not necessarily one HTTP request.
+
+    `--slurp` wraps each page in an outer array (gh >= 2.43; the runner uses a current
+    gh), so the caller flattens one level.
+
+    A timeout is reported as a nonzero CompletedProcess rather than raised, so the
+    caller reads it through the same "could not tell" branch as any other failed read.
+    """
+    argv = [
+        "gh",
+        "api",
+        "--paginate",
+        "--slurp",
+        f"/repos/{repo}/pulls/{pr_number}/reviews",
+    ]
+    try:
+        return subprocess.run(
+            argv,
+            text=True,
+            capture_output=True,
+            timeout=GH_LIST_REVIEWS_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=124,
+            stdout="",
+            stderr=(
+                f"gh api timed out after {GH_LIST_REVIEWS_TIMEOUT_SECONDS}s listing "
+                f"reviews for {repo}#{pr_number}"
+            ),
+        )
+
+
+# The states GitHub uses for a review that has actually been SUBMITTED. Matched as an
+# allowlist rather than by excluding DISMISSED, because `GET /pulls/{n}/reviews`
+# also returns the authenticated identity's own PENDING (unsubmitted) reviews — and
+# that identity is the very bot whose POST just errored, so a half-committed write is
+# exactly what could appear here as PENDING. A pending review is invisible to everyone
+# else and publishes no resolvable thread, so reading one as "landed" would suppress
+# the fallback and report `delivered=true` over findings no thread query can find.
+SUBMITTED_REVIEW_STATES = frozenset({"COMMENTED", "APPROVED", "CHANGES_REQUESTED"})
+
+
+def _normalize_review_body(text) -> str:
+    """`text` with the differences GitHub is known to introduce when it stores a body.
+
+    Line endings (it rewrites CRLF) and trailing whitespace only. Deliberately NOT a
+    loose normalization: the comparison this feeds is the identity check, so anything
+    that makes two DIFFERENT review bodies compare equal defeats it.
+    """
+    lines = (text or "").replace("\r\n", "\n").split("\n")
+    return "\n".join(line.rstrip() for line in lines).strip()
+
+
+def review_already_posted(
+    repo: str, pr_number: str, commit_sha: str, posted_body: str
+):
+    """Did the review this run tried to post actually land on the PR?
+
+    Three-valued on purpose, because two of the three drive different behaviour and
+    the third must never be mistaken for either: ``True`` a review from this run is on
+    the PR, ``False`` confirmed absent, ``None`` could not tell (the list read failed
+    or came back unparseable). A read that failed is not a zero — see BE-4785 — so the
+    caller degrades rather than claiming the review is missing.
+
+    The gate's and the workflow's three-part filter first — a SUBMITTED state, a Bot
+    author (the poster is caller-configurable, so the TYPE is the only thing this can
+    know), and the run's own head SHA — and then, unlike them, an identity check on
+    the BODY: it must be `posted_body`, up to the normalization GitHub applies when it
+    stores one.
+
+    That last part is what this cannot borrow from the gate. `CONSOLIDATED_MARKER` is
+    a fine discriminator for the question THEY ask ("does a panel review already exist
+    at this SHA, so should we spend the panel at all?"), but it is the wrong one here.
+    A previous round's body-only fallback, and any `post_error_review` body, both open
+    with the marker, are Bot-authored and carry this same `commit_id` — so accepting a
+    prefix match would answer "yes, your review landed" on the strength of some OTHER
+    review entirely. That answer is not a harmless duplicate: the caller returns
+    without posting the fallback and reports `delivered=true` with
+    `gated_findings=len(comments)`, so THIS round's findings reach neither the PR nor
+    the job summary while the blocking gate goes green over threads that belong to a
+    different round. The pre-change behaviour in that same scenario was a duplicate
+    review — noisy, but with the findings still visible — so a loose match here would
+    trade a duplicate for a silent loss. It is reachable, too: the workflow's
+    `already_reviewed` dup-check fails OPEN on an API error, and two runs can both pass
+    it before either posts.
+
+    Requiring the body means the residual is now the strictly narrower "a previous
+    round posted a byte-identical body at the same head SHA", which is the same
+    findings, in the same order, with the same anchors — a review whose threads do
+    carry this round's findings.
+    """
+    result = gh_list_reviews(repo, pr_number)
+    if result.returncode != 0:
+        # The UNKNOWN branch withholds `lost_to_fallback` and reposts the fallback
+        # without saying why, so the reason has to be logged HERE or it exists nowhere:
+        # a 60s timeout, an auth failure and an older `gh` without `--slurp` are
+        # indistinguishable to an operator otherwise.
+        print(
+            f"Review: could not list reviews for {repo}#{pr_number} "
+            f"(exit {result.returncode}): {(result.stderr or '').strip()[:300]}",
+            file=sys.stderr,
+        )
+        return None
+    # An exit-0 read with nothing in it INSPECTED nothing; defaulting it to `[]` would
+    # launder that into "this PR has no reviews" and tag every finding lost on the
+    # strength of it. Same rule as the unparseable and wrong-shape cases below
+    # (BE-4785): only a list this actually read can answer False.
+    raw = (result.stdout or "").strip()
+    if not raw:
+        return None
+    try:
+        pages = json.loads(raw)
+    except ValueError:
+        return None
+    # `--slurp` promises a NON-EMPTY list OF PAGES, each itself a list. Anything else —
+    # a flat array of reviews, a single object, a bare scalar — is a payload shape this
+    # does not know how to read, so it is UNKNOWN rather than empty. Silently dropping
+    # the pages that fail the check would turn an unrecognized shape into "no reviews".
+    #
+    # `[]` is in that set, and deliberately: `all()` is vacuously true over it, so it
+    # would otherwise fall through to `reviews = []` and answer "confirmed absent" —
+    # the same laundering the empty-stdout guard above rejects, on a read that
+    # inspected no page at all. `[[]]` is what --slurp really returns for a PR with no
+    # reviews, and that is the genuine absence.
+    if (
+        not isinstance(pages, list)
+        or not pages
+        or not all(isinstance(page, list) for page in pages)
+    ):
+        return None
+    reviews = [r for page in pages for r in page]
+    for review in reviews:
+        if not isinstance(review, dict):
+            continue
+        if review.get("state") not in SUBMITTED_REVIEW_STATES:
+            continue
+        # Types are trusted no further than shapes were: this runs on a payload the
+        # process cannot re-fetch, and an AttributeError here escapes `main()` and
+        # kills it ahead of BOTH the fallback POST and write_step_summary — the same
+        # both-channel loss the timeout above exists to prevent.
+        user = review.get("user")
+        if not isinstance(user, dict) or user.get("type") != "Bot":
+            continue
+        if review.get("commit_id") != commit_sha:
+            continue
+        # Cheap prefix reject before the equality; every body this script posts opens
+        # with the marker, so it can only skip reviews the identity check would reject
+        # anyway. Applied to the NORMALIZED body, not the raw one, or it would be
+        # STRICTER than the check it guards: `_normalize_review_body` strips leading
+        # whitespace, so a stored body differing only by a leading newline would pass
+        # the equality yet never reach it — answering "absent" for the run's own landed
+        # review, which is precisely this path's worst outcome.
+        body = review.get("body")
+        if not isinstance(body, str):
+            continue
+        normalized = _normalize_review_body(body)
+        if not normalized.startswith(CONSOLIDATED_MARKER):
+            continue
+        if normalized == _normalize_review_body(posted_body):
+            return True
+    return False
 
 
 READ_ONLY_SUMMARY_NOTE = (
@@ -267,7 +762,17 @@ def write_step_summary(markdown: str, note: str = READ_ONLY_SUMMARY_NOTE) -> Non
         f.write(payload + "\n")
 
 
-def post_or_degrade(repo, pr_number, payload, summary_markdown, context, truncated=False) -> bool:
+def post_or_degrade(
+    repo,
+    pr_number,
+    payload,
+    summary_markdown,
+    context,
+    truncated=False,
+    delivers=True,
+    gated=0,
+    ungated=0,
+) -> bool:
     """POST a review; degrade to the step summary on a read-only token.
 
     Returns True when the review was delivered — either posted on the PR, or
@@ -278,9 +783,23 @@ def post_or_degrade(repo, pr_number, payload, summary_markdown, context, truncat
     `truncated` says the posted body was clamped, so the whole of it goes to the
     summary even on success — otherwise the clamp note points at a summary that
     was never written.
+
+    `delivers` says whether a SUCCESSFUL post of this particular body counts as a
+    review for the blocking gate. It does not for the two bodies that report a
+    failure rather than a review — the "Review failed" error review and the
+    all-cells-failed no-findings review — which is the whole reason the gate
+    cannot read this function's `True` as "a review happened". Note that the
+    read-only branch returns True as well and is never a delivery: the review
+    reached a job summary, not the PR, so no thread exists to hold the merge on.
     """
-    result = gh_post_review(repo, pr_number, payload)
-    if result.returncode == 0:
+
+    def report_posted():
+        """This body is on the PR. Shared by the two ways of finding that out."""
+        # `posted` regardless of `delivers`: a body that reports a failure still
+        # reached the PR, and the DM's claim is about the PR, not about adjudication.
+        # A clamped-but-posted review is posted too — hence before the `truncated`
+        # handling, not after it.
+        emit_delivery(delivers, gated, ungated, posted=True)
         if truncated:
             print(
                 f"{context}: body hit GitHub's size limit — full text written to "
@@ -288,6 +807,10 @@ def post_or_degrade(repo, pr_number, payload, summary_markdown, context, truncat
                 file=sys.stderr,
             )
             write_step_summary(summary_markdown, note=TRUNCATED_SUMMARY_NOTE)
+
+    result = gh_post_review(repo, pr_number, payload)
+    if result.returncode == 0:
+        report_posted()
         return True
     if is_read_only_token_error(result):
         print(
@@ -295,9 +818,35 @@ def post_or_degrade(repo, pr_number, payload, summary_markdown, context, truncat
             "summary instead of the PR.",
             file=sys.stderr,
         )
+        emit_delivery(False)
         write_step_summary(summary_markdown)
         return True
     print(f"{context} POST failed: {result.stderr}", file=sys.stderr)
+    # A nonzero `gh` is not proof the write was refused. Once the throttle wordings
+    # stopped being read as a read-only token (BE-12612), the 403 GitHub raises on a
+    # request it went on to SERVE reaches here — and every caller answers a False by
+    # writing the same text to the job summary and exiting 1. That publishes a second
+    # copy of a review already on the PR and reports `posted=false` for it, which the
+    # fresh-review gate then holds the check red over. So ask the PR, on exactly the
+    # statuses the inline path asks on. This is a READ, never a repost: on ABSENT and
+    # on UNKNOWN this returns False and the caller behaves as it always has.
+    if post_may_have_landed(result):
+        # Read the commit and the body back out of the REQUEST rather than taking them
+        # as parameters: `review_already_posted` answers True only for a byte-identical
+        # body at the same head SHA, so the two have to be the ones this call actually
+        # sent. `payload` is that request, and every caller builds it with json.dumps.
+        request = json.loads(payload)
+        landed = review_already_posted(
+            repo, pr_number, request.get("commit_id") or "", request.get("body") or ""
+        )
+        if landed is True:
+            print(
+                f"{context}: the POST errored but this exact review is on the PR — "
+                "treating it as delivered rather than reporting it lost.",
+                file=sys.stderr,
+            )
+            report_posted()
+            return True
     return False
 
 
@@ -699,6 +1248,65 @@ def load_anchors(diff_path):
     return anchors
 
 
+# CommonMark's start condition for an HTML block opened by `<!--`: the opener begins
+# the line, after at most three spaces of indentation. `\r` alone is a line ending to
+# cmark-gfm, so it counts here too — `re.MULTILINE`'s `^` would not.
+BLOCK_COMMENT_OPENER_RE = re.compile(r"\A {0,3}(<!--)")
+# A fenced code block's opening and closing lines. The opener may carry an info string;
+# the closer may not, and must be at least as long a run of the SAME character.
+FENCE_OPEN_RE = re.compile(r"\A {0,3}(`{3,}|~{3,})")
+FENCE_CLOSE_RE = re.compile(r"\A {0,3}(`{3,}|~{3,})[ \t]*\Z")
+
+
+def md_lines(text: str):
+    """`(offset, line)` for every CommonMark line in `text`, terminators excluded.
+
+    Split on MD_LINE_BREAK_RE rather than `str.splitlines()` — cmark-gfm's line endings
+    are exactly `\r\n`, `\r` and `\n`, while `splitlines()` also breaks on `\v`, `\f`
+    and `U+2028`, which would report a start-of-line where the renderer sees none.
+    Offsets are carried explicitly because `\r\n` and `\n` are different lengths.
+    """
+    start = 0
+    for m in MD_LINE_BREAK_RE.finditer(text):
+        yield start, text[start:m.start()]
+        start = m.end()
+    yield start, text[start:]
+
+
+def html_block_openers(text: str) -> list:
+    """Offsets of every `<!--` in `text` that can open an HTML block, outermost first.
+
+    An opener that sits inside a FENCED CODE BLOCK is skipped: CommonMark renders the
+    fence's contents literally, so a column-0 `<!--` in there swallows nothing (verified
+    against GitHub's own render — prose after the fence, and the clamp's note, come back
+    intact). That exclusion is load-bearing on the ERROR-review path, the one body that
+    renders unbounded judge/CLI text at column 0 inside a fence: without it the last
+    such line reads as a dangling opener and drop_unterminated_comment deletes the whole
+    tail of the error text to contain damage that never existed.
+
+    A fence the cut itself left OPEN is not closed here. Closing it would mean appending
+    characters, and clamp_review_body has already spent its slack reserving
+    CLAMP_TRUNCATION_NOTE — anything added past that cut point pushes the body back over
+    GitHub's limit and buys a 422. The note still RENDERS in that case, as a last line of
+    code rather than as prose: ugly, but visible, which is the property this file defends.
+    """
+    openers, fence = [], None
+    for start, line in md_lines(text):
+        if fence is None:
+            opening = FENCE_OPEN_RE.match(line)
+            if opening:
+                fence = opening.group(1)
+                continue
+            comment = BLOCK_COMMENT_OPENER_RE.match(line)
+            if comment:
+                openers.append(start + comment.start(1))
+            continue
+        closing = FENCE_CLOSE_RE.match(line)
+        if closing and closing.group(1)[0] == fence[0] and len(closing.group(1)) >= len(fence):
+            fence = None
+    return openers
+
+
 def drop_unterminated_comment(cut: str) -> str:
     """Remove a trailing `<!--` the size clamp left with no `-->` to close it.
 
@@ -708,21 +1316,40 @@ def drop_unterminated_comment(cut: str) -> str:
     clamp_review_body's own "as much of it as fits is in the job summary" note. The
     review then renders as a header with no visible findings and no explanation of why.
 
-    Fixed HERE rather than by giving the sentinel a byte budget at render time, because
-    a budget cannot actually promise this: whether the sentinel survives depends on how
-    much body precedes it, which render_body_only_findings does not know. The clamp is
-    the one place that knows where the cut lands, and closing it here covers every HTML
-    comment in every posted body rather than the one we happen to be thinking about.
+    The BUDGET is the primary guard, and both finding-carrying paths now compute one in
+    main() from the head they just measured — the success path's demoted-findings
+    section and the wholesale 422 fallback alike — so on either of them the sentinel is
+    posted whole, or as its most-urgent prefix, or not at all, and never where the cut
+    lands. This function is the BACKSTOP behind that arithmetic: it is the one place
+    that knows where the cut actually landed, so it covers any HTML comment in any
+    posted body — a head measured wrong, a comment some future path adds — rather than
+    the one we happen to be thinking about.
 
     Dropping the fragment is safe on its own terms: the section's prose marker sits
     ABOVE the sentinel, so a cut deep enough to reach it still leaves build-ledger.py
     the evidence that findings WERE demoted, and that round degrades loudly instead of
     reading as a round that found nothing.
+
+    Two things keep the rewind from costing more than the fragment. Model-supplied prose
+    can no longer carry an opener at all: render_finding_entry neutralizes `<!--` at the
+    writer (see DEFANGED_COMMENT_OPENER), which removes the plantable
+    `<!--`-on-its-own-line in the PR under review — both as a swallow and as bait for a
+    rewind that would delete every finding between it and the cut. And openers inside a
+    fence are excluded by html_block_openers, which covers the error path's imported
+    text. What is left is the sentinel, its truncation companion, and whatever future
+    path emits a column-0 comment of its own.
+
+    The rewind goes to the FIRST unterminated opener, not the last. An HTML block runs
+    from its opener to the first `-->`, so once one is left dangling every byte after it
+    is already inside that comment — including any later `<!--`, which is then not an
+    opener at all. Rewinding to the LAST one left the earlier, real one standing and
+    swallowing the tail: the failure this function exists to prevent, reached by exactly
+    the misdirection the fence and blockquote scoping fix in their own containers.
     """
-    opener = cut.rfind("<!--")
-    if opener == -1 or "-->" in cut[opener:]:
-        return cut
-    return cut[:opener].rstrip()
+    for offset in html_block_openers(cut):
+        if cut.find("-->", offset) == -1:
+            return cut[:offset].rstrip()
+    return cut
 
 
 def clamp_review_body(body: str, limit: int = MAX_REVIEW_BODY_CHARS) -> str:
@@ -735,10 +1362,7 @@ def clamp_review_body(body: str, limit: int = MAX_REVIEW_BODY_CHARS) -> str:
     body = encodable(body)
     if len(body) <= limit:
         return body
-    note = (
-        "\n\n_…truncated here: the review body reached GitHub's size limit. As much "
-        "of it as fits is in the job summary of this run._"
-    )
+    note = CLAMP_TRUNCATION_NOTE
     if limit <= len(note):
         # Degenerate limit (tests, a future tightening): the cut still has to hold.
         return body[:limit]
@@ -772,6 +1396,23 @@ def render_code_ref(path, line) -> str:
     return f"{fence}{pad}{text}{pad}{fence}"
 
 
+# The one construct a blockquote does NOT contain. cmark-gfm strips the `> ` marker
+# before parsing a blockquote's contents, so `> <!--` opens a type-2 HTML block exactly
+# as a column-0 opener would, and the raw `<!--` is passed through verbatim into the
+# HTML — ending the blockquote never synthesizes a `-->`. Measured against GitHub's own
+# /markdown render: one finding carrying `<!--` at the start of a line erased every
+# finding below it AND clamp_review_body's truncation note. Writing a `-->` back at
+# column 0 does not undo it, because that one is markdown-escaped to `--&gt;` and closes
+# nothing — the opener has to die at the WRITER.
+#
+# A zero-width space defeats CommonMark's start condition while the text still reads
+# exactly as it arrived, the same trick and the same house style as
+# defang_body_only_contract. Applied to EVERY `<!--`, not just a line-leading one: which
+# column a substring lands in depends on the wrapping around it, and the escape is free.
+HTML_COMMENT_OPENER = "<!--"
+DEFANGED_COMMENT_OPENER = "<\u200b!--"
+
+
 def render_finding_entry(c: dict) -> str:
     """One finding, as a blockquote its own markdown cannot break out of.
 
@@ -782,8 +1423,13 @@ def render_finding_entry(c: dict) -> str:
     that from a rare fallback render into a per-run one. Inside a blockquote the
     damage is confined: the block ends at the blank line before the next finding, so
     an unclosed fence closes with it.
+
+    An unterminated HTML COMMENT is the exception — the blockquote does not contain
+    that one, and it is plantable by putting `<!--` on its own line in the PR under
+    review. See HTML_COMMENT_OPENER; it is neutralized here rather than contained.
     """
     text = f"**{render_code_ref(c['path'], c['line'])}** — {c['body']}"
+    text = text.replace(HTML_COMMENT_OPENER, DEFANGED_COMMENT_OPENER)
     # MD_LINE_BREAK_RE, not split("\n"): CommonMark (and GitHub's cmark-gfm) ends a
     # line on a bare \r too, and nothing upstream strips control characters —
     # review-output-mcp.py's validate_finding checks only type/non-empty/length, and
@@ -834,6 +1480,11 @@ def defang_body_only_contract(text: str) -> str:
     ).replace(
         BODY_ONLY_PROSE_MARKER,
         BODY_ONLY_PROSE_MARKER.replace(" ", "\u200b ", 1),
+    ).replace(
+        # The truncation companion, for the same reason: forged, it fabricates a
+        # "findings were lost" note in the next round's prompt off text we quoted.
+        BODY_ONLY_TRUNCATED_PREFIX,
+        BODY_ONLY_TRUNCATED_PREFIX.replace(":", ":\u200b", 1),
     )
 
 
@@ -851,6 +1502,14 @@ def strip_repeat_line(repeat_line: str, body: str) -> str:
     re-matched with a regex, for the same reason strip_severity_badge is: if the format
     changes this stops matching and the sentinel carries a visible trailer — cosmetic —
     instead of silently eating the tail of a finding.
+
+    Since BE-12534 stripping the trailer no longer LOSES the lineage: the URL travels
+    structurally instead, as the sentinel's optional `repeat_of` key
+    (render_body_only_sentinel), which build-ledger.py resolves back to the ancestor
+    thread — recovering its round from that thread rather than from the payload. Before that they were carried in no field at all, so a re-raise
+    demoted to the body was rebuilt next round as a fresh unanchorable finding and
+    every later hop of that chain became cap-free. The prose half is unchanged — the
+    trailer still shows the re-raise to whoever reads the review.
     """
     if repeat_line and body.endswith(repeat_line):
         return body[: -len(repeat_line)].rstrip()
@@ -887,9 +1546,27 @@ def render_body_only_sentinel(items: list) -> str:
     That blanket replace is safe because the only JSON tokens outside string literals
     here are `[`, `]`, `{`, `}`, `,`, `:` and the digits of `line` — normalize_comments
     guarantees `line` is a POSITIVE int, so no `-` can appear as a number's sign.
+
+    `lost_to_fallback` (BE-10002) is emitted ONLY for an item that carries it, so a
+    success-path payload stays byte-identical to what this rendered before the key
+    existed. It marks a finding that anchored fine and lost its thread to the failed
+    POST rather than to the diff — presentation only on the reading side, since the
+    mechanical consequences of `anchored: false` are correct for it either way. The
+    key name carries no `-`, so the escape above already covers it.
+
+    `repeat_of` (BE-12534) follows the same optional-key discipline and carries the
+    re-raise lineage strip_repeat_line just removed from `body`. Unlike
+    `lost_to_fallback` it is NOT presentation-only: the reader resolves the URL to the
+    ancestor thread and reads that thread's real answer state, which is what makes a
+    demoted re-raise of an ANSWERED finding cost a repeat slot next round instead of
+    being cap-exempt. The URL is the ONLY lineage key emitted — the ancestor's round is
+    not carried, because the reader derives it from the resolved comment's own review
+    rather than from the payload, and a field nobody reads would still be paid for out
+    of the two size guards' budget.
     """
-    payload = [
-        {
+    payload = []
+    for item in items:
+        entry = {
             # neutralize_mentions, like render_code_ref does for the prose half. The
             # body was already neutralized in normalize_comments, but `path` is raw
             # model output until it is rendered — and this render is still a POSTed
@@ -905,38 +1582,216 @@ def render_body_only_sentinel(items: list) -> str:
                 )
             ),
         }
-        for item in items
-    ]
+        # `is True`, matching build-ledger.py's reader exactly. It reads the key that
+        # way so a stray `"lost_to_fallback": "no"` in a relayed payload cannot count
+        # as set; emitting on mere truthiness here would normalize such a value to
+        # JSON `true` and defeat that guard from the writing side.
+        if item.get("lost_to_fallback") is True:
+            entry["lost_to_fallback"] = True
+        # BE-12534: the re-raise lineage, carried STRUCTURALLY because
+        # strip_repeat_line just took it out of `body`. Same optional-key discipline as
+        # `lost_to_fallback` — emitted only for an item that has it, so a payload with
+        # no re-raise in it stays byte-identical to what this rendered before the key
+        # existed (which is also what keeps the two size guards' measurements honest).
+        #
+        # The URL alone. The ancestor's ROUND is deliberately not carried: the reader
+        # takes it from the review the resolved comment belongs to, which is truthful
+        # by construction and available whenever the URL resolves at all, so a
+        # `repeat_round` field here would be payload nothing reads — and this body is
+        # under a hard size cap that can drop a real finding to make room for it.
+        #
+        # Validated HERE rather than trusted to the reader, even though the reader
+        # re-validates: this string is judge output landing in a review body on a
+        # public PR, so what gets WRITTEN is bounded too. The URL is one anchored
+        # GitHub discussion permalink and nothing else — no other host, no whitespace
+        # or line break (which would ride through JSON losslessly and land on the
+        # ledger's own `re_raise_of:` line), and no unbounded string. The `-` → `-`
+        # escape below already covers it: it is applied post-encode to the whole
+        # payload, so the URL's own dashes cannot close the HTML comment early.
+        repeat_url = item.get("repeat_url") or ""
+        if (
+            isinstance(repeat_url, str)
+            and len(repeat_url) <= REPEAT_URL_MAX_CHARS
+            # fullmatch, not match: `$` also matches just BEFORE a trailing
+            # newline, and JSON round-trips that losslessly — it would arrive on
+            # the ledger's own `re_raise_of:` line as a real line break, at column
+            # 0 of the prompt. repeat_url_of already stripped, so this is the
+            # second of the two halves rather than the only one.
+            and REPEAT_URL_RE.fullmatch(repeat_url)
+        ):
+            entry["repeat_of"] = repeat_url
+        payload.append(entry)
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     escaped = encoded.replace("-", "\\u002d")
     return f"<!-- {BODY_ONLY_SENTINEL_PREFIX} {escaped} -->"
 
 
-def render_body_only_findings(items: list) -> str:
-    """Render findings that could not be anchored, for inclusion in the review body."""
+def render_body_only_truncation(kept: int, total: int) -> str:
+    """Disclose, machine-readably, that the sentinel above carries only `kept` of `total`.
+
+    Counts rather than a bare flag, so the next round's prompt can say how much it lost
+    rather than only that it lost something. Both are plain integers from `len()`, so
+    nothing model-supplied reaches this line and it needs no escaping of its own.
+    """
+    return f"<!-- {BODY_ONLY_TRUNCATED_PREFIX} kept={kept} total={total} -->"
+
+
+def fit_sentinel_items(items: list, budget: int) -> list:
+    """The longest leading run of `items` whose rendered sentinel fits `budget` chars.
+
+    A PREFIX rather than a subset, because `items` arrives most → least urgent: the
+    findings kept are the ones next round most needs back, and they stay in the same
+    order as the prose below them. `[]` means "nothing fits" — the caller drops the
+    sentinel and posts the prose marker alone, which is what this path did before the
+    sentinel existed and which the ledger still reads as a disclosed truncation.
+
+    Recovering SOME findings is strictly better than the all-or-nothing rule it
+    replaces: that rule made the sentinel free to eat the whole body budget as long as
+    it fit at all, so the round with the most findings to report was the one that
+    rendered none of them. A partial sentinel is not a partial truth on the reading
+    side either — the findings it leaves out are simply absent from the ledger, exactly
+    as all of them were when the whole sentinel was dropped.
+
+    Binary search: the render grows monotonically with the prefix length, so the
+    boundary is well defined and found in ~log2(n) renders rather than n.
+    """
+    if budget <= 0 or not items:
+        return []
+    if len(render_body_only_sentinel(items)) <= budget:
+        return items
+    # Invariant: `lo` fits (or is 0, the drop case the caller handles), `hi` does not.
+    lo, hi = 0, len(items)
+    while lo < hi - 1:
+        mid = (lo + hi) // 2
+        if len(render_body_only_sentinel(items[:mid])) <= budget:
+            lo = mid
+        else:
+            hi = mid
+    return items[:lo]
+
+
+def sentinel_share(available: int, prose_len: int) -> int:
+    """How much of `available` pre-cut space the sentinel may take, given its prose.
+
+    Two terms, and the SMALLER wins:
+
+    * `SENTINEL_MAX_CHARS`, half the whole body — the ceiling.
+    * what the prose does not need, floored at half of `available`.
+
+    That second term is what makes the ceiling hold at EVERY head size. Passing
+    `available` straight into `min(SENTINEL_MAX_CHARS, available)` buys the ceiling only
+    while the first term wins: once the head grows past roughly half the limit,
+    `available` is itself under the ceiling, the `min` stops binding, and the sentinel is
+    free to take all of the space that is left — reproducing on a big-head round the
+    zero-visible-findings collapse the ceiling exists to prevent. Both heads are
+    caller-shaped (`--notice`, `--ledger-note`, the panel summary), so that is a size a
+    consumer repo can reach without touching this file.
+
+    `available - prose_len` BEFORE the floor, so a round whose prose is small is not
+    charged a floor it does not need: the sentinel may use whatever the prose leaves,
+    and the split only becomes one-half-each when the prose wants more than half.
+
+    The ceiling bounds the FLOOR — the room the sentinel takes over the prose's
+    objection — and NOT the leftover the prose never wanted. Capping the whole `max`
+    charged the ceiling on rounds with no size pressure behind it: a 44,000-char
+    sentinel beside 17,000 chars of prose in ~59,000 of space was handed 30,000 instead
+    of the ~42,000 that fit, dropping roughly a hundred ledger entries to reserve space
+    the prose had no use for. The prose keeps its guarantee either way, because the
+    `available // 2` floor already delivers it: the prose gets
+    `min(prose_len, available // 2)` at every head size, which is "everything it wants,
+    up to half" — exactly what SENTINEL_MAX_CHARS was introduced to promise.
+    """
+    return max(available - prose_len, min(SENTINEL_MAX_CHARS, available // 2))
+
+
+def render_body_only_findings(items: list, budget: int | None = None) -> str:
+    """Render findings that could not be anchored, for inclusion in the review body.
+
+    `budget` is the number of characters this whole section may occupy before the
+    clamp's cut point — i.e. what is left of MAX_REVIEW_BODY_CHARS once the clamp's own
+    note, the review head above this section, and the separator between them are
+    subtracted. The caller computes it because the caller is the only one that has
+    measured the head; documenting it here keeps that arithmetic explained in one
+    place. `None` means "unbudgeted": the sentinel carries every item, which is what
+    every non-`main()` caller (and every round small enough for it not to matter) wants.
+
+    Order is load-bearing, and it is marker → sentinel → prose.
+
+    clamp_review_body cuts the TAIL, so the machine-readable copy sits as near the
+    head of the section as it can and stays recoverable for as long as any of the
+    section survives. But it cannot be first: a clamp landing INSIDE the JSON takes
+    the closing `-->` with it, and with the marker below that it took the evidence
+    too — build-ledger.py saw neither a parseable sentinel nor the marker, and a
+    fully-demoted round read as a review that found nothing. That is the one cut that
+    actually happens, and it was the silent one.
+
+    One short line above the sentinel costs ~140 chars of recoverability and makes
+    every such cut LOUD. It is also the sentinel's required predecessor on the read
+    side, which is what scopes build-ledger.py's search to this section.
+
+    The prose renders ALL `items` whatever the budget does to the sentinel: the budget
+    governs which findings the LEDGER recovers, never which ones a reader is shown.
+    Prose that overruns is handled by the tail clamp, as it always was.
+
+    A section that FITS pays no budget at all — the clamp will not cut it, so there is
+    no size pressure to justify dropping a ledger entry. That is not a theoretical case:
+    render_body_only_sentinel escapes every `-` to six characters where the prose below
+    spends one, so a round on hyphen-rich paths can push the sentinel past
+    SENTINEL_MAX_CHARS while sentinel-plus-prose stays well under the limit. Charging
+    the ceiling there would drop findings out of the ledger to make room nobody needed.
+
+    "Fits" is measured against the RAW limit, which is `budget` plus the clamp note the
+    caller subtracted out of it. `budget` is the cut POINT — where the clamp starts
+    trimming once it has decided to trim — but clamp_review_body leaves any body up to
+    MAX_REVIEW_BODY_CHARS untouched and never reaches for its note at all. Testing
+    `len(whole) <= budget` therefore truncated and degraded a section sitting in the
+    ~140-char window between the two, with no clamp behind it to justify the loss. The
+    422 fallback's own guard compares against MAX_REVIEW_BODY_CHARS for this reason;
+    this is the same comparison, expressed in what this function was handed.
+    """
     if not items:
         return ""
-    # Order is load-bearing, and it is marker → sentinel → prose.
-    #
-    # clamp_review_body cuts the TAIL, so the machine-readable copy sits as near the
-    # head of the section as it can and stays recoverable for as long as any of the
-    # section survives. But it cannot be first: a clamp landing INSIDE the JSON takes
-    # the closing `-->` with it, and with the marker below that it took the evidence
-    # too — build-ledger.py saw neither a parseable sentinel nor the marker, and a
-    # fully-demoted round read as a review that found nothing. That is the one cut that
-    # actually happens, and it was the silent one.
-    #
-    # One short line above the sentinel costs ~140 chars of recoverability and makes
-    # every such cut LOUD. It is also the sentinel's required predecessor on the read
-    # side, which is what scopes build-ledger.py's search to this section.
-    md = (
+    marker = (
         f"_The finding(s) below {BODY_ONLY_PROSE_MARKER}, so they are reported here "
         "instead of inline:_\n\n"
-        f"{render_body_only_sentinel(items)}\n\n"
     )
-    for item in items:
-        md += render_finding_entry(item["comment"]) + "\n\n"
-    return md.rstrip("\n")
+    prose = "".join(render_finding_entry(item["comment"]) + "\n\n" for item in items)
+    whole = f"{marker}{render_body_only_sentinel(items)}\n\n{prose}"
+    if budget is None or len(whole) <= budget + len(CLAMP_TRUNCATION_NOTE):
+        return whole.rstrip("\n")
+    # Room for the truncation companion, measured at its longest: `kept` is strictly
+    # less than `total` here, so it can never carry more digits than `total` does.
+    notice_reserve = (
+        len(render_body_only_truncation(len(items), len(items))) + len("\n\n")
+    )
+    available = budget - len(marker) - len("\n\n") - notice_reserve
+    kept = fit_sentinel_items(items, sentinel_share(available, len(prose)))
+    if kept:
+        md = f"{marker}{render_body_only_sentinel(kept)}\n\n"
+        if len(kept) < len(items):
+            # The loss, serialized. A prefix payload is still valid JSON, so without
+            # this line next round's ledger reads it as a complete recovery.
+            md += f"{render_body_only_truncation(len(kept), len(items))}\n\n"
+            print(
+                f"Review: the body-only sentinel carries the {len(kept)} most urgent of "
+                f"{len(items)} demoted finding(s) — the rest would have displaced the "
+                "findings a reader can see.",
+                file=sys.stderr,
+            )
+    else:
+        # Nothing fits: emit exactly what this section carried before the sentinel
+        # existed. The marker still discloses that findings WERE demoted, so next
+        # round's ledger reads a truncation rather than a round that found nothing —
+        # no companion needed, because a missing sentinel does not parse and is
+        # already the loud case.
+        print(
+            "Review: no part of the body-only sentinel fits under the size limit — "
+            "posting the marker alone, so next round's ledger discloses the loss "
+            "instead of recovering the findings.",
+            file=sys.stderr,
+        )
+        md = marker
+    return f"{md}{prose}".rstrip("\n")
 
 
 def render_findings_markdown(review_body: str, comments: list[dict]) -> str:
@@ -947,7 +1802,7 @@ def render_findings_markdown(review_body: str, comments: list[dict]) -> str:
     """
     md = review_body
     if comments:
-        md += "\n\n---\n\n"
+        md += FINDINGS_SEPARATOR
         for c in comments:
             md += render_finding_entry(c) + "\n\n"
     return md
@@ -1004,6 +1859,17 @@ def normalize_comments(findings: list[dict]) -> list[dict]:
                 # Truthy only for a re-raise of an already-answered finding —
                 # what enforce_repeat_cap counts against REPEAT_CAP.
                 "repeat_of": repeat_line,
+                # The same lineage, unrendered (BE-12534). `repeat_of` above is the
+                # TRAILER — the prose the reader sees — and strip_repeat_line takes it
+                # back out of a demoted finding's sentinel body, because a live thread
+                # URL must never travel inside the prose the judge reads. This field is
+                # how it travels instead: structurally, as a sentinel key
+                # render_body_only_sentinel validates on the way out and
+                # build-ledger.py resolves against the PR's real comments on the way
+                # in. Kept beside `repeat_of` rather than replacing it so
+                # enforce_repeat_cap's count and strip_repeat_line's reconstruction are
+                # both untouched.
+                "repeat_url": repeat_url_of(finding),
                 "comment": {
                     "path": path,
                     "line": line_int,
@@ -1032,10 +1898,52 @@ def render_repeat_of(finding: dict) -> str:
     record, linked to the thread that already answered it, so the author can see
     at a glance that this is round N of the same conversation.
     """
+    url = repeat_url_of(finding)
+    if not url:
+        return ""
+    return f"\n\n↩︎ re-raise of {url}{render_repeat_round(finding)}"
+
+
+def repeat_url_of(finding: dict) -> str:
+    """The judge's `repeat_of` URL, neutralized and stripped — or `""`.
+
+    Split out of render_repeat_of (BE-12534) so the RENDERED trailer and the RAW url
+    are two separate things. normalize_comments keeps storing the trailer in
+    `item["repeat_of"]` — that is what enforce_repeat_cap counts and what
+    strip_repeat_line reconstructs — and stores this alongside it as
+    `item["repeat_url"]`, which is what render_body_only_sentinel emits as a field.
+    The ROUND has no such twin: it stays in the trailer only, because the ledger reads
+    a resolved ancestor's round off that ancestor's own review rather than off the
+    payload, so carrying it structurally would cost sentinel bytes nothing reads.
+    """
     url = finding.get("repeat_of")
     if not isinstance(url, str) or not url.strip():
         return ""
-    return f"\n\n↩︎ re-raise of {neutralize_mentions(url.strip())}{render_repeat_round(finding)}"
+    return neutralize_mentions(url.strip())
+
+
+def coerce_repeat_round(finding: dict):
+    """The judge's `repeat_round` as a POSITIVE int, or None.
+
+    The type IS the control (see render_repeat_round): a positive integer cannot carry
+    an `@handle` or markup at all. `bool` is rejected explicitly because it is a
+    subclass of `int`, so `repeat_round: true` would otherwise render "(round True)"
+    and be emitted into the sentinel as JSON `true`.
+    """
+    round_no = finding.get("repeat_round")
+    if isinstance(round_no, bool):
+        return None
+    if isinstance(round_no, str):
+        round_no = round_no.strip()
+        if not round_no.isdigit():
+            return None
+        try:
+            round_no = int(round_no)
+        except ValueError:
+            return None
+    if not isinstance(round_no, int) or round_no <= 0:
+        return None
+    return round_no
 
 
 def render_repeat_round(finding: dict) -> str:
@@ -1049,16 +1957,14 @@ def render_repeat_round(finding: dict) -> str:
     subclass of `int`, so `repeat_round: true` rendered as "(round True)".)
     neutralize_mentions stays on the render as defense in depth for whoever
     loosens the type next.
+
+    The coercion itself lives in coerce_repeat_round (BE-12534): it is the guard that
+    keeps a non-decimal digit (`str.isdigit()` is true for characters `int()` rejects)
+    from raising straight out of normalize_comments and taking down the whole review
+    post.
     """
-    round_no = finding.get("repeat_round")
-    if isinstance(round_no, bool):
-        return ""
-    if isinstance(round_no, str):
-        round_no = round_no.strip()
-        if not round_no.isdigit():
-            return ""
-        round_no = int(round_no)
-    if not isinstance(round_no, int) or round_no <= 0:
+    round_no = coerce_repeat_round(finding)
+    if round_no is None:
         return ""
     return f" (round {neutralize_mentions(str(round_no))})"
 
@@ -1146,10 +2052,14 @@ def post_error_review(repo, pr_number, commit_sha, header, error_message):
         unclamped,
         "Error review",
         truncated=body_text != unclamped,
+        # This body REPORTS a failure; it adjudicates nothing and anchors no
+        # thread. Posting it must never green the blocking gate.
+        delivers=False,
     ):
         # Same contract as the review paths: a genuine POST failure still delivers the
         # text somewhere. post_or_degrade writes the summary itself on the paths that
         # return True, so this cannot double-write.
+        emit_delivery(False)
         write_step_summary(unclamped, note=POST_FAILED_SUMMARY_NOTE)
         raise SystemExit(1)
 
@@ -1241,12 +2151,21 @@ def main():
             {"body": body_text, "event": "COMMENT", "commit_id": args.commit_sha}
         )
         if not post_or_degrade(
-            args.repo, args.pr_number, payload, body_text, "No-findings review"
+            args.repo,
+            args.pr_number,
+            payload,
+            body_text,
+            "No-findings review",
+            # `all_failed` is "every reviewer errored", not "the reviewers found
+            # nothing" — zero threads there means nothing was reviewed, so it is
+            # exactly the round the gate must refuse to pass.
+            delivers=not all_failed,
         ):
             # Same contract as the other three exit paths: a genuine POST failure still
             # delivers the text somewhere. On the all-failed branch that text is the one
             # artifact explaining why no review happened — the panel summary naming
             # which cells errored — so losing it is exactly when it is needed most.
+            emit_delivery(False)
             write_step_summary(body_text, note=POST_FAILED_SUMMARY_NOTE)
             raise SystemExit(1)
         return
@@ -1256,7 +2175,11 @@ def main():
     # Anchor-aware split. The COUNT below stays the total across both halves — a finding
     # that lands in the body is still a finding, and a headline that shrank because an
     # anchor missed would misreport the review.
-    inline_items, body_only_items = partition_by_anchor(enriched, load_anchors(args.diff))
+    # `anchors` is kept, not just consumed: None means the diff could not be read and
+    # partition_by_anchor failed OPEN without testing a single finding, which the
+    # wholesale fallback below has to know before it can claim anything anchored.
+    anchors = load_anchors(args.diff)
+    inline_items, body_only_items = partition_by_anchor(enriched, anchors)
     comments = [item["comment"] for item in inline_items]
 
     # The head is every finding-independent part of the review. Kept separate from the
@@ -1279,7 +2202,21 @@ def main():
         review_head += "\n\n_(All findings had invalid file/line references and were dropped.)_"
 
     review_body = review_head
-    body_only_md = render_body_only_findings(body_only_items)
+    # The section's size guard, computed HERE because `review_head` is the only thing
+    # that decides where the clamp lands and this is the only place it has been
+    # measured. What the section may occupy before the cut point: the limit, less the
+    # clamp's own note (the clamp cuts at `limit - len(note)`), less the head above it,
+    # less the separator between them. `review_body` ends up as
+    # `review_head + FINDINGS_SEPARATOR + marker + sentinel + "\n\n" + prose`, so with
+    # this budget the sentinel's closing `-->` always sits before the cut: it is emitted
+    # whole, or as its most-urgent prefix, or not at all — never where the clamp cuts.
+    body_only_md = render_body_only_findings(
+        body_only_items,
+        budget=MAX_REVIEW_BODY_CHARS
+        - len(CLAMP_TRUNCATION_NOTE)
+        - len(review_head)
+        - len(FINDINGS_SEPARATOR),
+    )
     if body_only_md:
         # A demoted finding still carries no THREAD — there is no place to answer or
         # resolve it — but since BE-9565 it does reach the next round's ledger: the
@@ -1287,11 +2224,19 @@ def main():
         # build-ledger.py parses back out of this body, so a fully-demoted round can no
         # longer read as a review that found nothing. Those entries are permanently
         # UNANSWERED, hence cap-exempt, which is the same rule an unanswered thread
-        # already gets. What is still open: the WHOLESALE fallback body (the 422 path
-        # below) carries no sentinel, because it is not rendered through
-        # render_body_only_findings — so its findings do not reach the ledger. It does
-        # carry the prose marker, so that round degrades loudly rather than silently.
-        review_body += f"\n\n---\n\n{body_only_md}"
+        # already gets. Since BE-10002 the WHOLESALE fallback body (the 422 path below)
+        # carries a sentinel of its own too, so a round whose findings were lost to a
+        # failed POST reaches the ledger as well.
+        #
+        # Cap-exempt is about the entry ITSELF, not about its lineage. Since BE-12534 a
+        # demoted finding that was a RE-RAISE carries the ancestor thread's URL
+        # structurally, in the sentinel's `repeat_of` key — never in the prose, which
+        # strip_repeat_line still clears. build-ledger.py resolves that URL against the
+        # PR's real comments and reads the ANCESTOR's answer state (and round), so
+        # re-raising an answered finding keeps costing a repeat slot even after one hop
+        # of the chain was demoted. Without the field the chain went cap-free from that
+        # hop on.
+        review_body += f"{FINDINGS_SEPARATOR}{body_only_md}"
 
     # Every finding, most → least urgent, for any render that has no inline half.
     prose_body = render_findings_markdown(review_head, [i["comment"] for i in enriched])
@@ -1306,9 +2251,21 @@ def main():
         }
     )
 
-    result = gh_post_review(args.repo, args.pr_number, payload)
+    def finish_posted_review():
+        """Report the inline review as delivered, and write the clamp's job summary.
 
-    if result.returncode == 0:
+        Shared by the two paths on which THIS body is on the PR: the `gh` POST
+        returned 0, and the POST errored but the review turned out to have landed
+        anyway (below). Those two outcomes are the same fact about the PR, so they
+        report it through one implementation rather than two that can drift.
+        """
+        # The split the gate needs: `comments` are the findings that got a thread a
+        # human can resolve; `body_only_items` reached the body and can never be
+        # resolved. A round where the second is non-empty and the first is empty is
+        # a review whose every finding is invisible to a thread query.
+        emit_delivery(
+            True, gated=len(comments), ungated=len(body_only_items), posted=True
+        )
         if posted_body != review_body:
             # The clamp note tells the reader the full text is in the job summary.
             # Nothing else on this path writes one, so write it here or the note lies
@@ -1319,6 +2276,11 @@ def main():
                 file=sys.stderr,
             )
             write_step_summary(prose_body, note=TRUNCATED_SUMMARY_NOTE)
+
+    result = gh_post_review(args.repo, args.pr_number, payload)
+
+    if result.returncode == 0:
+        finish_posted_review()
         return
 
     # A read-only token rejects any write, so the inline-less fallback below
@@ -1329,6 +2291,7 @@ def main():
             "summary instead of the PR.",
             file=sys.stderr,
         )
+        emit_delivery(False)
         write_step_summary(prose_body)
         return
 
@@ -1340,24 +2303,85 @@ def main():
         # if GitHub committed the write before erroring it publishes a DUPLICATE
         # review no one can un-post. That duplicate risk, not byte-identity, is the
         # reason to skip it. Deliver the text to the summary and let the step go red.
+        # "No fallback to post" is not "no question to ask", though. A throttled 403
+        # (or a 5xx, or a dropped connection) can be raised on a request GitHub went
+        # on to SERVE, and reporting THAT as `posted=false` leaves the review on the
+        # PR while the fresh-review gate holds the check red for a review that landed
+        # and the job summary publishes a second copy of it. Same read as the inline
+        # path below, on the same statuses, and still no repost: only a PRESENT answer
+        # changes anything here.
+        if post_may_have_landed(result) and review_already_posted(
+            args.repo, args.pr_number, args.commit_sha, posted_body
+        ) is True:
+            print(
+                f"Review: the POST errored ({(result.stderr or '').strip()[:200]}) but "
+                f"a review for {args.commit_sha[:7]} is on the PR — treating as "
+                "delivered.",
+                file=sys.stderr,
+            )
+            finish_posted_review()
+            return
         print(
             "Review: no inline comments to drop — the fallback would repost the same "
             "body, so writing it to the job summary instead.",
             file=sys.stderr,
         )
+        emit_delivery(False)
         write_step_summary(prose_body, note=POST_FAILED_SUMMARY_NOTE)
         raise SystemExit(1)
+
+    # Did that POST really fail to land? A nonzero `gh` is not proof it did not —
+    # the `not comments` branch above asks the same question for the same reason, and
+    # declines to repost whatever the answer — and here the answer decides two things
+    # below: whether to post the fallback at all, and whether the findings that
+    # anchored may be labelled lost.
+    #
+    # Cheapest sufficient evidence first, which is what `post_may_have_landed` weighs:
+    # a 4xx is GitHub VALIDATING and rejecting the request before writing anything
+    # (every firing observed in the field is a 422 over an inline position), so the
+    # review is absent by construction and no read is worth the call — with the
+    # exception carved out by RETRYABLE_4XX_STATUSES, whose members are 4xx without
+    # carrying that meaning: an edge or a proxy said so, or GitHub throttled a request
+    # it may well have gone on to serve. Anything else — a 5xx, or a transport error
+    # that carries no status at all — leaves the write genuinely undecided, so ask the
+    # PR. Three outcomes follow:
+    # PRESENT (the review landed: report it delivered, post nothing more), ABSENT
+    # (behave exactly as this path always has), and UNKNOWN (post the fallback, but tag
+    # nothing `lost_to_fallback` — the flag is a claim, and an unreadable list supports
+    # none). UNKNOWN is why the read failing is not answered as a `False`: that would
+    # be indistinguishable from a confirmed-absent review and would relabel findings on
+    # the strength of a transient blip.
+    if post_may_have_landed(result):
+        landed = review_already_posted(
+            args.repo, args.pr_number, args.commit_sha, posted_body
+        )
+    else:
+        landed = False
+
+    if landed is True:
+        print(
+            f"Review: the POST errored ({(result.stderr or '').strip()[:200]}) but a "
+            f"review for {args.commit_sha[:7]} is on the PR — not reposting; treating "
+            "as delivered.",
+            file=sys.stderr,
+        )
+        finish_posted_review()
+        return
+    if landed is None:
+        print(
+            "Review: could not confirm whether the first POST landed (review list "
+            "unreadable) — posting the fallback with no finding tagged [post-failed].",
+            file=sys.stderr,
+        )
 
     # Fallback: same findings without inline anchors. Typical cause is line
     # numbers that fall outside the diff context — often the model picked
     # a line near the change but not on the change.
-    # The note carries BODY_ONLY_PROSE_MARKER deliberately. This body has no sentinel —
-    # it is not rendered through render_body_only_findings, and adding one is the wrong
-    # move on a request that just 422'd for being unacceptable (see the PR's Residual).
-    # But without the marker, next round's build_ledger saw neither entries NOR a
-    # degradation for a round on which EVERY finding is body-only, so a fallback-posted
-    # round read as a review that found nothing and the round after it looked like a
-    # first round. The marker alone costs a sentence and keeps the disclosure honest.
+    # The note carries BODY_ONLY_PROSE_MARKER deliberately. Without it, next round's
+    # build_ledger saw neither entries NOR a degradation for a round on which EVERY
+    # finding is body-only, so a fallback-posted round read as a review that found
+    # nothing and the round after it looked like a first round. The marker alone costs a
+    # sentence and keeps the disclosure honest.
     #
     # It goes in the HEAD, for exactly the reason the section marker had to move above
     # the sentinel: clamp_review_body cuts the TAIL. Appended after the findings the
@@ -1373,8 +2397,131 @@ def main():
         "below instead. None of them has a review thread, so there is nowhere to "
         "reply to one or resolve it.)_"
     )
+    # …and the sentinel goes DIRECTLY under that note (BE-10002), in the same
+    # marker → sentinel → prose order render_body_only_findings uses and for the same
+    # two reasons: build-ledger.py accepts a sentinel only when the marker line sits
+    # immediately above it, and a tail clamp then eats the least-urgent PROSE rather
+    # than the JSON. Until this, the fallback posted the marker alone, so the ledger
+    # disclosed the degradation loudly and recovered ZERO entries — including for the
+    # findings that anchored perfectly well and lost their thread only to the failed
+    # POST. Every finding of the round is OFFERED to it — the ones from `inline_items`
+    # tagged `lost_to_fallback` only when the first review is confirmed ABSENT, the
+    # ones already unanchorable left untagged, since the POST outcome changed nothing
+    # for them — and the size guard below decides how many of them the body can
+    # actually afford to carry.
+    #
+    # That confirmation is the check above, and it has three outcomes: PRESENT returns
+    # before reaching here (nothing is reposted and nothing is relabelled), ABSENT is
+    # this path with the tag applied, and UNKNOWN is this path with the tag withheld —
+    # the fallback still carries every finding, each reading as [unanchorable], which
+    # is what an unread review list can honestly support.
+    #
+    # Tagged by identity, not by value: `inline_items` and `body_only_items` hold the
+    # very objects `enriched` does, and two findings can be equal without being the
+    # same one. Iterating `enriched` is what keeps the sentinel in the same most →
+    # least urgent order as the prose below it.
+    #
+    # And tagged only where the anchors were actually CHECKED. With `anchors is None`
+    # partition_by_anchor put every finding inline without testing one, so
+    # `inline_items` is not evidence of anything — least of all on a 422, whose typical
+    # cause IS an anchor GitHub would not take. Untagged, those findings render as
+    # [unanchorable]: the conservative reading, and the one this path gave them before
+    # BE-10002. The claim the flag makes is "this passed the diff-anchor check", and
+    # that is a claim only a real check can make.
+    #
+    # Both conditions are required, and for the same reason: `lost_to_fallback` says
+    # "this finding anchored, and the failed POST is what cost it its thread". The
+    # anchor half needs a real diff check (`anchors is not None`); the lost half needs
+    # the first review to be confirmed ABSENT (`landed is False`), since a review that
+    # landed — or one nobody could look for — leaves that second claim unsupported.
+    lost_ids = (
+        {id(item) for item in inline_items}
+        if (anchors is not None and landed is False)
+        else set()
+    )
+    sentinel_items = [
+        {**item, "lost_to_fallback": True} if id(item) in lost_ids else item
+        for item in enriched
+    ]
+    # Size guard, in two parts.
+    #
+    # A PROSE FLOOR first. The sentinel duplicates the findings in JSON at nearly the
+    # length of the prose entries below it, so left to take whatever fits it displaces
+    # the review a human reads: measured at 89 findings it posted 58,720 characters of
+    # comment and rendered no findings at all, where the same round one finding larger
+    # dropped the sentinel and rendered 79. The sentinel gets at most half the body;
+    # fit_sentinel_items then keeps the most-urgent prefix that fits, so a round too big
+    # for a whole sentinel recovers part of one instead of none of it.
+    #
+    # The clamp's own note is RESERVED in that budget, not merely the limit tested. The
+    # clamp cuts at `limit - len(note)`, so a head+sentinel that fits the limit by less
+    # than that can still be cut mid-JSON — and drop_unterminated_comment then removes
+    # the sentinel back to its opener, taking every finding after it with it. That was a
+    # ~120-char window (measured: 89 findings, one long path) in which the review
+    # collapsed from 60,000 characters of findings to a 494-character header. The
+    # sentinel is posted whole or not at all; it is never posted where the clamp cuts.
+    #
+    # Both parts are skipped outright for a body that FITS: nothing will be cut, so
+    # there is no size pressure to justify dropping a ledger entry. Same rule, and the
+    # same `sentinel_share` split, as the success path's section above.
+    prose_only = render_findings_markdown("", [i["comment"] for i in enriched])
+    whole_fallback_len = (
+        len(fallback_head)
+        + len("\n\n")
+        + len(render_body_only_sentinel(sentinel_items))
+        + len(prose_only)
+    )
+    if whole_fallback_len <= MAX_REVIEW_BODY_CHARS:
+        kept = sentinel_items
+    else:
+        notice_reserve = (
+            len(render_body_only_truncation(len(sentinel_items), len(sentinel_items)))
+            + len("\n\n")
+        )
+        available = (
+            MAX_REVIEW_BODY_CHARS
+            - len(CLAMP_TRUNCATION_NOTE)
+            - len(fallback_head)
+            - len("\n\n")
+            - len(FINDINGS_SEPARATOR)
+            - notice_reserve
+        )
+        # `prose_only` opens with FINDINGS_SEPARATOR, which `available` already
+        # reserved; counting it twice would understate what the prose leaves over.
+        kept = fit_sentinel_items(
+            sentinel_items,
+            sentinel_share(available, max(0, len(prose_only) - len(FINDINGS_SEPARATOR))),
+        )
+    if kept:
+        fallback_head_with_sentinel = (
+            f"{fallback_head}\n\n{render_body_only_sentinel(kept)}"
+        )
+        if len(kept) < len(sentinel_items):
+            # The loss, serialized — see render_body_only_truncation. A prefix payload
+            # is still valid JSON, so next round's ledger would otherwise read it as a
+            # complete recovery of a round that lost most of its findings.
+            fallback_head_with_sentinel += (
+                f"\n\n{render_body_only_truncation(len(kept), len(sentinel_items))}"
+            )
+            print(
+                f"Review: the fallback's body-only sentinel carries the "
+                f"{len(kept)} most urgent of {len(sentinel_items)} finding(s) — the "
+                "rest would have displaced the findings a reader can see.",
+                file=sys.stderr,
+            )
+    else:
+        # Nothing fits: post exactly what this path posted before the sentinel existed.
+        # The prose marker is still in the head, so next round's ledger reads a
+        # disclosed truncation rather than a round that found nothing.
+        print(
+            "Review: no part of the fallback's body-only sentinel fits under the size "
+            "limit — posting the marker alone, so next round's ledger discloses the "
+            "loss instead of recovering the findings.",
+            file=sys.stderr,
+        )
+        fallback_head_with_sentinel = fallback_head
     fallback_body = render_findings_markdown(
-        fallback_head, [i["comment"] for i in enriched]
+        fallback_head_with_sentinel, [i["comment"] for i in enriched]
     )
     clamped_fallback = clamp_review_body(fallback_body)
     fallback_payload = json.dumps(
@@ -1392,13 +2539,21 @@ def main():
         fallback_body,
         "Fallback review",
         truncated=clamped_fallback != fallback_body,
+        # This body reached the PR, so it IS a delivery — but the inline half is
+        # exactly what was dropped to make it postable, so none of its findings
+        # carries a thread. Reported as ungated so the gate refuses to read the
+        # empty thread query as "nothing was found".
+        gated=0,
+        ungated=len(enriched),
     ):
-        # Both attempts failed for a non-403 reason (an API outage, a stale commit_id
-        # after a force-push, a body-level rejection dropping the anchors cannot fix).
+        # Both attempts failed for a reason the read-only degradation does not cover
+        # (an API outage, a throttle, a stale commit_id after a force-push, a
+        # body-level rejection dropping the anchors cannot fix).
         # Without this the whole review is gone from the PR *and* the summary, which
         # contradicts the no-inline branch above — and this is the branch carrying
         # MORE content, since it has an inline half. post_or_degrade only writes a
         # summary on the paths that return True, so there is no double write here.
+        emit_delivery(False)
         write_step_summary(fallback_body, note=POST_FAILED_SUMMARY_NOTE)
         raise SystemExit(1)
 

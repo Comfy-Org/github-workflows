@@ -1,7 +1,8 @@
 name: Cursor Review (reusable)
 
-# Reusable, label-triggered multi-model code review. A 4-lab × 2-review-type
-# panel (8 cursor-agent cells) runs adversarial + edge-case passes, then a
+# Reusable, label-triggered multi-model code review. A multi-lab × 2-review-type
+# panel (one cursor-agent cell per model × pass; 6 by default) runs adversarial +
+# edge-case passes, then a
 # judge model consolidates the findings into ONE review posted on the PR,
 # with per-finding severity badges (critical/high/medium/low/nit).
 #
@@ -10,17 +11,45 @@ name: Cursor Review (reusable)
 # thin caller — they don't carry copies of the review logic, so there's no
 # drift to keep in sync.
 #
+# Credential isolation (same two-job split pr-size.yml uses). The invariant:
+# NO job both checks out PR code and holds a write-scoped credential. The jobs
+# that check out PR code and run cursor-agent over it — `review` and
+# `consolidate` — hold `contents: read` and nothing else; the consolidated
+# review is posted from a separate `post-review` job that checks out NO PR code
+# and receives its payload as an artifact. The two jobs that DO carry
+# `pull-requests: write` and the BOT_APP_PRIVATE_KEY mint — `post-review` and
+# `over-cap-comment` — check out nothing but this repo's pinned assets. The
+# panel and the judge run `cursor-agent --print --trust` without `--sandbox`,
+# and print mode can use write and shell tools, so a prompt-injected model could
+# rewrite the assets checkout or a downloaded action inside its own job; on a
+# fresh runner with a fresh pinned checkout there is nothing tampered for the
+# minted token to meet. `.github/cursor-review/tests/test_workflow_job_isolation.py`
+# pins this.
+#
 # Caller pattern (place in source repo at .github/workflows/ci-cursor-review.yml):
 #
 #   name: CI - Cursor Review
 #   on:
+#     # The BLOCKING caller shape, because this example sets `blocking: true`
+#     # below. A required check must report on the head SHA, and a label-only
+#     # `types: [labeled, unlabeled]` delivers no event on push — the check
+#     # would sit at "Expected" and brick the PR until someone toggled the
+#     # label. `pull_request_review_thread` is what flips the gate green the
+#     # moment the last finding thread is resolved. Advisory callers
+#     # (`blocking` unset) can keep the narrower label-only pair; see
+#     # docs/callers/cursor-review.md for both shapes.
 #     pull_request:
-#       types: [labeled, unlabeled]
+#       types: [opened, reopened, ready_for_review, synchronize, labeled, unlabeled]
+#     pull_request_review_thread:
+#       types: [resolved, unresolved]
 #   permissions:
 #     contents: read
 #     pull-requests: write
 #   concurrency:
-#     group: cursor-review-pr-${{ github.event.pull_request.number }}-${{ github.event.label.name }}
+#     # PR number ONLY. `github.event.label.name` is empty on every widened
+#     # event, so keying on it splits one PR across groups that cannot cancel
+#     # each other.
+#     group: cursor-review-pr-${{ github.event.pull_request.number }}
 #     cancel-in-progress: true
 #   jobs:
 #     cursor-review:
@@ -54,6 +83,13 @@ name: Cursor Review (reusable)
 #         # a distinct, queryable identity instead of github-actions[bot]. Supply
 #         # your App's id + private key (App IDs aren't secret, so id is an input).
 #         bot_app_id: ${{ vars.REVIEW_BOT_APP_ID }}
+#         # Optional: make the review blocking. true → the "Blocking gate" check
+#         # goes red while any cursor-review finding thread is unresolved. To
+#         # actually block merge you must ALSO mark "Blocking gate" as a required
+#         # status check in this repo's branch-protection / ruleset settings —
+#         # see docs/callers/cursor-review.md for the full flow, including the
+#         # pull_request_review_thread trigger that re-checks on thread resolution.
+#         blocking: true
 #       secrets:
 #         CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
 #         SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
@@ -66,11 +102,13 @@ on:
       judge_model:
         description: >-
           Single judge model that adjudicates panel findings into one
-          consolidated review. Picked to match the highest reasoning tier in
-          the panel.
+          consolidated review. Same model family as the panel's Anthropic cell,
+          one reasoning tier below `max`: the judge adjudicates a bounded text
+          payload with no tools, and ran at xhigh until 2026-07-18 with no
+          recorded quality gap, while `max` cost ~10% of every run's spend.
         type: string
         required: false
-        default: claude-opus-5-thinking-max
+        default: claude-opus-5-thinking-xhigh
       diff_size_cap:
         description: >-
           Max counted changed lines. PRs over the cap are skipped — too large
@@ -212,6 +250,52 @@ on:
         type: boolean
         required: false
         default: false
+      panel_models:
+        description: >-
+          Optional JSON array of Cursor catalog model ids that REPLACES the
+          default panel list (see the preflight "Define panel models" step for
+          the current defaults). Each id still runs both review types and is
+          validated against the live catalog by preflight, so a typo or a
+          delisted id fails loud before any cell spends. Intended for
+          per-repo experiments — e.g. an A/B of `-xhigh` vs `-max` reasoning
+          tiers — without forking the workflow. Empty (default) = built-in list.
+        type: string
+        required: false
+        default: ''
+      skip_bot_branch_prefixes:
+        description: >-
+          Space-separated head-branch prefixes that skip the review when the PR
+          AUTHOR is a GitHub App / Bot account. Targets machine-generated pin
+          bumps and catalog refreshes (`ci/bump-…`, `chore/refresh-…`,
+          `auto/refresh-…`) that otherwise pay for a full panel with nothing a
+          reviewer can judge. Matched only for `user.type == Bot` authors, so a
+          human pushing to a `ci/bump-…` branch is still reviewed. Set to '' to
+          review every bot PR. Skips are logged in the gate step, and the
+          `skip-cursor-review` label remains the per-PR override in both
+          directions.
+        type: string
+        required: false
+        default: ci/bump- chore/refresh- auto/refresh-
+      blocking:
+        description: >-
+          Opt-in merge gate (restored by BE-4691 after #31 dropped it). false
+          (default) → the review is advisory, exactly as before: it posts
+          findings but never fails a check on them, so no caller's behavior
+          changes until it opts in. true → a final "Blocking gate" job fails
+          (red check) while the PR has unresolved, non-outdated cursor-review
+          finding threads, and passes once they are all resolved — idempotent
+          on re-run, and fail-closed: a fresh panel that was supposed to post
+          its review and didn't refuses to pass. NOTE: this workflow cannot set
+          branch protection. To actually block the merge you must ALSO mark the
+          "Blocking gate" check as a required status check in the caller repo's
+          branch-protection / ruleset settings — until you do, the red check is
+          visible but non-blocking. Require THIS check and no other: a skipped
+          required check counts as passing, and "Consolidate panel" /
+          "Post review" skip exactly when no review ran. See
+          docs/callers/cursor-review.md for the resolve→re-check flow.
+        type: boolean
+        required: false
+        default: false
     secrets:
       CURSOR_API_KEY:
         description: Cursor API key for cursor-agent (the panel + judge models bill through it).
@@ -241,10 +325,10 @@ env:
   # Cursor release never breaks this; the pin moves only via a reviewed PR.
   # Consumed by .github/cursor-review/install-cursor-cli.sh, the ONE installer
   # all three CLI-using jobs run (preflight, review matrix, consolidate).
-  CURSOR_CLI_VERSION: 2026.08.11-e8db854
+  CURSOR_CLI_VERSION: 2026.09.02-c22c1a3
   # sha256 of the linux/x64 agent-cli-package.tar.gz (all jobs run ubuntu-latest).
   # Cross-checked against nixpkgs pkgs/by-name/cu/cursor-cli at pin time.
-  CURSOR_CLI_SHA256: bfff4bf6f4e9dd30c1d0ef0a70b6077b074015dd2948e4c50685d53afdcfce5a
+  CURSOR_CLI_SHA256: b73b59854762535c0fc20d7ccc51c3b5a356a851491088d60a362be48750f53c
 
 jobs:
   gate:
@@ -266,6 +350,10 @@ jobs:
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           BASE_REPO: ${{ github.repository }}
           RUN_WITHOUT_LABEL: ${{ inputs.run_without_label }}
+          PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          SKIP_BOT_PREFIXES: ${{ inputs.skip_bot_branch_prefixes }}
         run: |
           # PRs from forks can't run this review. The pull_request event grants
           # fork PRs no access to secrets — so CURSOR_API_KEY is empty and every
@@ -285,6 +373,24 @@ jobs:
             echo "skip-cursor-review label present — skipping."
             echo "should_run=false" >> "$GITHUB_OUTPUT"
             exit 0
+          fi
+
+          # Machine-generated PRs (bot author AND a configured branch prefix)
+          # skip the panel: a pinned-SHA bump or a catalog refresh has nothing a
+          # reviewer can judge, and each one otherwise costs a full matrix run.
+          # Author TYPE is checked, not just the branch, so a human pushing a
+          # `ci/bump-…` branch is still reviewed. Configurable per caller via
+          # skip_bot_branch_prefixes ('' disables).
+          if [ "$PR_AUTHOR_TYPE" = "Bot" ]; then
+            for prefix in $SKIP_BOT_PREFIXES; do
+              case "$HEAD_REF" in
+                "$prefix"*)
+                  echo "Bot-authored PR ($PR_AUTHOR) on '$HEAD_REF' matches skip prefix '$prefix' — skipping the panel."
+                  echo "should_run=false" >> "$GITHUB_OUTPUT"
+                  exit 0
+                  ;;
+              esac
+            done
           fi
 
           # Label-free mode (run_without_label input): callers in repos with no
@@ -343,8 +449,30 @@ jobs:
           #
           # API failure falls through to running, not skipping — better to
           # double-review than silently no-op.
+          #
+          # The `user.type == "Bot"` term is a permission check, not a tidiness
+          # one (BE-4691). The consolidated marker is PUBLIC text in a public
+          # repo, and anyone who can open a PR can submit a review on it — so
+          # matching the body alone let any user post a body-only review
+          # carrying the marker and have this step declare the SHA already
+          # reviewed. That skips the panel, the judge and the post, and under
+          # `blocking: true` it also waives the gate's fresh-review guard and
+          # greens a required check over a PR nothing ever looked at. It also
+          # made the documented remedy for a genuine error review (re-trigger on
+          # the same SHA) a silent no-op, since that review carries the marker
+          # too.
+          #
+          # Matched on the TYPE rather than a login because the poster is
+          # caller-configurable: `github-actions[bot]` by default, or whatever
+          # bot the caller's `bot_app_id` App resolves to — a login this job
+          # cannot know without minting that token, which is the credential
+          # split's whole point. `Bot` narrows the set from "every GitHub user"
+          # to "Apps a repo admin installed here", which is the boundary that
+          # matters. Residual, accepted: another installed App could post a
+          # marked review. Closing THAT needs the identity check to move into
+          # the posting job, where the token exists.
           EXISTING=$(gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" 2>/dev/null \
-            | jq --arg sha "$HEAD_SHA" '[.[] | select(.commit_id == $sha and .state != "DISMISSED" and (.body | startswith("## 🔍 Cursor Review — Consolidated panel")))] | length' \
+            | jq --arg sha "$HEAD_SHA" '[.[] | select(.commit_id == $sha and .state != "DISMISSED" and (.user.type == "Bot") and (.body | startswith("## 🔍 Cursor Review — Consolidated panel")))] | length' \
             2>/dev/null || echo 0)
 
           if [ "$EXISTING" -gt 0 ]; then
@@ -657,7 +785,7 @@ jobs:
           #     back to the RAW changed-line count with no exclusions —
           #     strictly >= the classified count, so a degraded run still
           #     reviews a small PR but can never feed an unbounded diff to the
-          #     eight panel jobs. The next step rebuilds the diff with
+          #     panel jobs. The next step rebuilds the diff with
           #     diff_excludes only (the pre-classifier behavior).
           rc=0
           "${RUNNER_TEMP}/check-pr-size" \
@@ -783,12 +911,12 @@ jobs:
   # ::warning:: annotation and step summary), and this path may never redden the
   # run — hence continue-on-error on both the mint and the upsert.
   #
-  # Non-blocking on purpose. cursor-review is advisory — it posts a review, it
-  # does not gate (no cursor-review job is a required status check on the
-  # largest consumer's default branch, checked live via the rulesets API), so
-  # failing the run over an over-cap PR would gate nothing while breaking the
-  # reusable's contract for every caller. The fix here is VISIBILITY, not
-  # enforcement.
+  # Non-blocking on purpose. cursor-review is advisory by default — it posts a
+  # review, it does not gate (gating is the opt-in `blocking` input's separate
+  # Blocking gate job, and even for a blocking caller an over-cap skip is a
+  # documented pass-through there, not a failure) — so failing the run over an
+  # over-cap PR would gate nothing while breaking the reusable's contract for
+  # every caller. The fix here is VISIBILITY, not enforcement.
   #
   # Isolation: this job checks out NO code at all — it only reads job outputs
   # and calls the comments API — so its write-scoped token is never present in
@@ -818,7 +946,7 @@ jobs:
     permissions:
       contents: read
       # For the GITHUB_TOKEN fallback below. Not a new demand on callers:
-      # `consolidate` already requires this exact scope to post the review, so
+      # `post-review` already requires this exact scope to post the review, so
       # every caller that can run this workflow at all already grants it.
       pull-requests: write
     env:
@@ -1085,29 +1213,46 @@ jobs:
         # validates every entry — so a bump only ever touches this one list.
         # Keep in sync with the README model table.
         #
-        # Pinned to each lab's newest highest-reasoning tier in Cursor's
-        # catalog (last checked 2026-07-28). OpenAI: GPT-5.6 Sol is the
+        # Three labs (last checked 2026-08-27). OpenAI: GPT-5.6 Sol is the
         # 5.6-family coding flagship (Luna is the cost tier, Terra mid; the
         # Codex line stops at 5.3). Anthropic: Fable 5 tops the catalog but
         # all Fable entries are marked NO ZDR in Cursor, and this panel
         # reviews private-repo diffs, so it is excluded; Opus 5 thinking at
         # its max tier is ZDR-eligible (confirmed against the live catalog —
         # no NO-ZDR marker, see PR BE-4818 for the run link) and replaces
-        # Opus 4.8 at identical per-token pricing. Gemini: 3.1 Pro is still
-        # the only Pro-line entry (3.5/3.6 are Flash tier). Moonshot: Kimi K3
-        # (max tier) supersedes K2.7 Code; no NO-ZDR marker in the catalog
-        # (same evidentiary bar as every other pin), ~3.2x/3.75x the
-        # per-token cost of K2.7 on this lab's two panel cells (~+10-15%
-        # total panel cost per PR).
+        # Opus 4.8 at identical per-token pricing. Moonshot: Kimi K3 at the
+        # `high` tier — same model as the former `kimi-k3-max` pin, one
+        # reasoning notch lower; no NO-ZDR marker in the catalog.
+        #
+        # Gemini 3.1 Pro was removed 2026-08-27. Over 1,450 judge-kept
+        # findings (172 PRs), its two cells were the sole raiser of 2.5% of
+        # kept findings and 3 of 213 critical/high ones, while costing ~9% of
+        # every run; every other Gemini finding was also raised by the OpenAI
+        # or Anthropic cell. The Kimi tier drop and the judge's move to
+        # `-xhigh` come from the same spend review. The `panel_models` input
+        # overrides this list per caller for A/B experiments.
+        env:
+          PANEL_MODELS_OVERRIDE: ${{ inputs.panel_models }}
         run: |
           cat > /tmp/models.json <<'JSON'
           [
             "gpt-5.6-sol-max",
             "claude-opus-5-thinking-max",
-            "gemini-3.1-pro",
-            "kimi-k3-max"
+            "kimi-k3-high"
           ]
           JSON
+          if [ -n "$(printf '%s' "$PANEL_MODELS_OVERRIDE" | tr -d '[:space:]')" ]; then
+            # Caller override. Must be a non-empty JSON array of catalog-shaped
+            # ids; the shape check here and the live-catalog check below both
+            # fail loud, so a bad override costs zero cells.
+            if ! printf '%s' "$PANEL_MODELS_OVERRIDE" | jq -e \
+                 'type == "array" and length > 0 and all(.[]; type == "string" and test("^[a-z0-9][a-z0-9._-]*$"))' > /dev/null; then
+              echo "::error::panel_models must be a non-empty JSON array of Cursor model ids (e.g. [\"gpt-5.6-sol-xhigh\", \"claude-opus-5-thinking-xhigh\"]); got: $PANEL_MODELS_OVERRIDE"
+              exit 1
+            fi
+            printf '%s' "$PANEL_MODELS_OVERRIDE" | jq -c 'unique' > /tmp/models.json
+            echo "panel_models override in effect: $(cat /tmp/models.json)"
+          fi
           echo "models=$(jq -c . /tmp/models.json)" >> "$GITHUB_OUTPUT"
 
       - name: Require a pinned workflows_ref
@@ -1224,12 +1369,12 @@ jobs:
     if: needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true'
     runs-on: ubuntu-latest
     # COUPLED to `consolidate` below — bump this and you must bump those too.
-    # The judge reads all 8 of this panel's artifacts at the same reasoning
+    # The judge reads all of this panel's artifacts at the same reasoning
     # tier, so it needs at least a cell's budget: its `Run judge` step cap
     # tracks THIS number, and its job cap sits above the step so a hung judge
     # trips the step (degraded fallback still posts) rather than the job (all
-    # 8 cells discarded). Letting this cap outgrow them recreates exactly the
-    # silent skew that fix was for.
+    # panel cells discarded). Letting this cap outgrow them recreates exactly
+    # the silent skew that fix was for.
     timeout-minutes: 30
     permissions:
       contents: read
@@ -1455,6 +1600,17 @@ jobs:
           echo "Prompt size: $(wc -c < /tmp/prompt.txt) bytes"
 
       - name: Run cursor review
+        # Step cap, absorbed by continue-on-error (same idiom as the judge
+        # step): healthy cells finish in 3-7 min and every cell's p90 is under
+        # 12 min, but a stalled agent — almost always one that never reaches
+        # its MCP submission — used to run to the 30-min JOB timeout, which
+        # GitHub reports as a cancelled job and a cancelled run, and stretched
+        # the whole review to 35+ min. Killing the step instead leaves the
+        # pre-seeded status=error artifact for the judge to count as a
+        # non-contributing cell, exactly what the job timeout produced, but
+        # 15 minutes sooner and green.
+        continue-on-error: true
+        timeout-minutes: 15
         env:
           CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
           MODEL: ${{ matrix.model }}
@@ -1501,17 +1657,22 @@ jobs:
           retention-days: 7
 
   consolidate:
-    # Adjudicates the 8 cell artifacts into one consolidated review.
+    # Adjudicates the panel cell artifacts into one consolidated review.
     # Calls cursor-agent one more time as the judge, with prompt-judge.md.
+    #
+    # Holds no write credential: the payload is handed to the `post-review` job
+    # below as an artifact, and that job does the mint + post. See the header's
+    # "Credential isolation" note for why the judge must not share a job with
+    # a write-scoped token.
     name: Consolidate panel
     needs: [gate, diff-size, preflight, review, ledger]
     if: always() && needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true' && needs.review.result != 'skipped'
     runs-on: ubuntu-latest
-    # ABOVE the `review` cap, never under it. The judge reads all 8 cell
-    # artifacts with the same top reasoning tier one cell uses, so it is the
+    # ABOVE the `review` cap, never under it. The judge reads every cell's
+    # artifact with the same top reasoning tier one cell uses, so it is the
     # strictly harder call — yet at 15m it was capped at HALF the panel it
     # adjudicates. A diff slow enough to stretch the panel stretches the judge
-    # with it, so the failure mode was the expensive one: all 8 cells run green
+    # with it, so the failure mode was the expensive one: every cell runs green
     # for ~25m, then the judge is killed at the last step and every cell's work
     # is discarded with nothing posted to the PR. GitHub reports a
     # timeout-minutes kill as `cancelled`, not `failed`, so it reads on the run
@@ -1520,18 +1681,20 @@ jobs:
     #
     # Deliberately longer than the `Run judge` step cap below, same idiom as
     # the `ledger` job: raising the JOB cap alone would only move the cliff,
-    # since a job-level kill takes `Build consolidated findings file` and
-    # `Post review` with it and is the one failure mode that can never reach
+    # since a job-level kill takes `Build consolidated findings file` and the
+    # payload upload with it and is the one failure mode that can never reach
     # the degraded panel-union fallback. The step trips first and is absorbed,
     # so a hung judge costs the adjudication, not the panel. The slack over
     # the step (10m) covers this job's own overhead — a `fetch-depth: 0`
-    # checkout, the CLI install, three artifact downloads and the post — which
-    # a panel cell does not all pay, so the judge's effective MODEL budget is
-    # the step cap, not this one.
+    # checkout, the CLI install, three artifact downloads and the upload —
+    # which a panel cell does not all pay, so the judge's effective MODEL
+    # budget is the step cap, not this one.
     timeout-minutes: 40
+    # contents: read ONLY. This job checks out PR-authored code and runs the
+    # judge agent over it, so it must carry nothing write-scoped — `post-review`
+    # below holds pull-requests: write and the bot credentials instead.
     permissions:
       contents: read
-      pull-requests: write
     steps:
       - name: Checkout PR repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1752,7 +1915,7 @@ jobs:
         # Time-boxed BELOW the job cap and absorbed, so a hung judge loses only
         # the adjudication: the steps below then read the `--init` seed left by
         # `Configure structured final review` (status=error), take the degraded
-        # panel-union path and still post what the 8 cells found. Equal to the
+        # panel-union path and still post what the cells found. Equal to the
         # `review` panel cap so the judge is never given less model time than
         # one of the cells it reads. `continue-on-error` is what makes the
         # timeout absorbable — without it the step failure fails the job and
@@ -1880,6 +2043,268 @@ jobs:
             echo "triggered_by=$GH_ACTOR" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Bundle consolidate outputs
+        # Hand the review payload to the isolated `post-review` job below.
+        # The step outputs ride in a small JSON file rather than as job outputs
+        # so a single artifact download reconstitutes everything that job needs.
+        # `ledger_download` travels with them because the ledger banner asks two
+        # separate questions — did the JUDGE get prior-round context (this job's
+        # download), and can the poster READ the note (its own download).
+        # `degraded` is diagnostic: the review's own degradation banner keys on
+        # `judge_status`, so this only ever reaches the run log.
+        env:
+          JUDGE_STATUS: ${{ steps.consolidated.outputs.judge_status }}
+          CONSOLIDATED_COUNT: ${{ steps.consolidated.outputs.consolidated_count }}
+          DEGRADED: ${{ steps.consolidated.outputs.degraded }}
+          TRIGGERED_BY: ${{ steps.triggerer.outputs.triggered_by }}
+          LEDGER_DOWNLOAD: ${{ steps.ledger_download.outcome }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+
+          # Collapse newlines: every value below is written back out as one
+          # `key=value` GITHUB_OUTPUT line in the post job, and triggered_by is
+          # derived from PR data, so a smuggled newline must not become a second
+          # line there.
+          def one_line(value):
+              return " ".join(value.splitlines()).strip()
+
+          meta = {
+              key.lower(): one_line(os.environ.get(key, ""))
+              for key in (
+                  "JUDGE_STATUS",
+                  "CONSOLIDATED_COUNT",
+                  "DEGRADED",
+                  "TRIGGERED_BY",
+                  "LEDGER_DOWNLOAD",
+              )
+          }
+          with open("/tmp/consolidated-meta.json", "w", encoding="utf-8") as f:
+              json.dump(meta, f)
+          print(json.dumps(meta, indent=2))
+          PY
+
+      - name: Upload consolidated review payload
+        # An artifact, not job outputs: the job holding the bot write-token must
+        # never run in the same context as the PR checkout and the judge agent.
+        # Deliberately NOT `if: always()` — a consolidate that died before this
+        # step produced no review to post, and a half-built payload must not be
+        # posted. `post-review` is gated on this job SUCCEEDING, so it simply
+        # does not run; the failure stays visible as this job's own red status
+        # and `notify-complete` names which half broke.
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: cursor-review-consolidated
+          path: |
+            /tmp/consolidated.json
+            /tmp/judge-findings.json
+            /tmp/consolidated-meta.json
+          if-no-files-found: error
+          retention-days: 7
+
+  post-review:
+    # Posts the ONE consolidated review on the PR, under the bot identity when
+    # the caller configured one.
+    #
+    # This is the write half of the credential split described in the header.
+    # It checks out NO PR code — just this repo's assets at the pinned
+    # `workflows_ref`, plus artifacts. Both untrusted inputs it renders (the consolidated
+    # findings, the reviewed diff) are downloaded, not re-derived from a
+    # checkout, and the diff comes from the `pr-diff` artifact `diff-size`
+    # published rather than from the copy the judge job had shell access to.
+    name: Post review
+    needs: [consolidate, ledger]
+    # `!cancelled()` rather than `always()`, for the same reason
+    # `over-cap-comment` documents at its own `if:`: the documented caller sets
+    # `cancel-in-progress: true`, and `always()` runs a job even when the RUN is
+    # cancelled. In the common supersede ordering `consolidate` has already
+    # finished and uploaded before the new push cancels the run, so its result
+    # is still `success` and a `needs.consolidate.result != 'cancelled'` test
+    # sails right past — this job would then post a review pinned to the
+    # superseded head SHA, alongside the new run's. Splitting the post into its
+    # own job WIDENED that window (cancellation used to kill the post step
+    # mid-job), so the run-level test is the one that has to be here.
+    #
+    # `== 'success'` rather than "ran at all": this job's whole input is a
+    # downloaded artifact, and artifact names are run-global. A prompt-injected
+    # panel cell (the header concedes those have shell access) can claim
+    # `cursor-review-consolidated` first; v4+ artifacts are immutable without
+    # `overwrite`, so the REAL upload then fails, `consolidate` goes red — and a
+    # gate that accepted a failed consolidate would download the spoofed payload
+    # and post it under the bot's write token. A failed `consolidate` is already
+    # visible as its own red job and is reported by `notify-complete`; there is
+    # nothing here worth posting on that path. A judge that never submitted is
+    # NOT this case: its step is `continue-on-error`, so `consolidate` still
+    # succeeds and the degraded review still posts.
+    if: ${{ !cancelled() && needs.consolidate.result == 'success' }}
+    runs-on: ubuntu-latest
+    # Three artifact downloads, a token mint, and post-review.py's ONE
+    # `gh api POST /pulls/N/reviews` carrying every inline comment in a single
+    # payload — plus, on a POST failure that is not a pre-write rejection, at most
+    # one paginated read of the PR's reviews (one `gh` command, but one request PER
+    # PAGE), to tell a review that never landed from one that landed despite the
+    # error (`pull-requests: write` already implies that read, so no permission
+    # changes here) — minutes of work at most. That read carries its own
+    # GH_LIST_REVIEWS_TIMEOUT_SECONDS well under this budget, so a wedged list cannot
+    # eat the job's whole allowance and take the fallback POST down with it. Bounded
+    # like every other job here so a rate-limited or hung call cannot hold a runner
+    # for the 6-hour default.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    # The blocking gate's POSITIVE delivery signal (BE-4691). This job's
+    # `result` cannot answer "did a review carrying resolvable finding threads
+    # land on the PR" — post-review.py exits 0 after a read-only-token 403, after
+    # the body-only "Review failed" review, after the all-cells-failed
+    # no-findings review and after the 422 inline fallback, and every one of
+    # those leaves the gate's thread query empty. So the script states it
+    # instead; see its emit_delivery for the contract. Unset (the script died
+    # before deciding) reads as false at the gate — fail-closed by default.
+    #
+    # `posted` is the DM's weaker sibling (BE-10017), not a duplicate of
+    # `delivered`: it says only that SOME review body reached the PR. The two
+    # disagree in both directions of interest — the error review and the
+    # all-cells-failed review post but do not deliver, and the read-only-403
+    # degradation neither posts nor delivers while still exiting 0. The gate
+    # wants `delivered`; `notify-complete`'s "one consolidated review is on the
+    # PR" wants `posted`, or it congratulates the author over a PR with no
+    # review on it.
+    outputs:
+      delivered: ${{ steps.post.outputs.delivered }}
+      gated_findings: ${{ steps.post.outputs.gated_findings }}
+      ungated_findings: ${{ steps.post.outputs.ungated_findings }}
+      posted: ${{ steps.post.outputs.posted }}
+    steps:
+      - name: Require a pinned workflows_ref
+        # workflows_ref has no default on purpose. GitHub does NOT enforce
+        # `required: true` for workflow_call inputs, so an omitted input arrives
+        # as '' and actions/checkout would silently fall back to this repo's
+        # default branch — running MUTABLE scripts under a pin that claims
+        # otherwise. Fail fast instead. (BE-5546)
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+        run: |
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form, and echo only that: dropping
+          # newlines also stops a multi-line value from smuggling a ::workflow
+          # command:: into the log, and from satisfying the line-oriented grep
+          # below on one 40-hex line among many.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
+            exit 1
+          fi
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
+          fi
+
+      - name: Load cursor-review assets
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _cursor_review_assets
+          persist-credentials: false
+
+      - name: Download consolidated review payload
+        id: payload
+        # Tolerated here so the guard below can name the real cause; a bare
+        # download failure reads as "artifact plumbing broke" when what actually
+        # happened is upstream.
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: cursor-review-consolidated
+          path: /tmp/consolidated
+
+      - name: Require the consolidated payload
+        env:
+          PAYLOAD_OUTCOME: ${{ steps.payload.outcome }}
+        run: |
+          if [ "$PAYLOAD_OUTCOME" != "success" ]; then
+            echo "::error::The consolidate job did not publish cursor-review-consolidated, so there is no review to post — see that job for the failure."
+            exit 1
+          fi
+
+          # A successful download is not a complete bundle. `if-no-files-found:
+          # error` on the upload fires only when ZERO of its three paths match,
+          # so a partial artifact uploads cleanly. Name the missing file here:
+          # the alternative is an unhandled FileNotFoundError inside `Read
+          # consolidate outputs` or inside the JUDGE_ERROR one-liner, which
+          # reads as "the poster is broken" when what happened is upstream —
+          # and which kills the run on exactly the degraded path the panel-union
+          # fallback exists to survive.
+          MISSING=""
+          for f in consolidated.json consolidated-meta.json judge-findings.json; do
+            [ -f "/tmp/consolidated/$f" ] || MISSING="$MISSING $f"
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::cursor-review-consolidated downloaded but is missing:${MISSING} — the consolidate job uploaded a partial payload, see that job."
+            exit 1
+          fi
+
+      - name: Download reviewed diff
+        # The same generated-file-excluded diff the panel and the judge read,
+        # taken from `diff-size`'s artifact — post-review.py anchors its inline
+        # comments against it, so this job needs no PR checkout.
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: pr-diff
+          path: /tmp
+
+      - name: Download prior-review ledger
+        id: ledger_download
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: cursor-review-ledger
+          path: /tmp/ledger
+
+      - name: Read consolidate outputs
+        id: meta
+        run: |
+          python3 - <<'PY'
+          import json, os, re
+
+          # `triggered_by` is the one header field post-review.py interpolates
+          # RAW — `_Triggered by @{value}._`, not routed through
+          # neutralize_mentions. That was safe while the value was `github.actor`
+          # read in the posting job itself; since the split it arrives out of a
+          # meta file assembled inside the job this workflow declares
+          # prompt-injectable, so it now crosses the trust boundary the split
+          # draws. Pin it to the shape of a GitHub login (39 chars max,
+          # alphanumerics and hyphens, plus the `[bot]` suffix `Resolve
+          # triggerer` can legitimately emit) and drop anything else: an
+          # `@org/team` mass-mention, a `[text](url)` phishing link or arbitrary
+          # markdown must not reach a review posted under the bot's write-scoped
+          # identity. post-review.py omits the attribution line entirely for an
+          # empty value, so dropping degrades to "no attribution", not to a lie.
+          LOGIN = re.compile(r"^[A-Za-z0-9-]{1,39}(\[bot\])?$")
+
+          with open("/tmp/consolidated/consolidated-meta.json", encoding="utf-8") as f:
+              meta = json.load(f)
+          print(json.dumps(meta, indent=2))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as g:
+              # `degraded` is deliberately absent: it is diagnostic, printed
+              # above with the rest of the payload, and no step below reads it.
+              for key in (
+                  "judge_status",
+                  "consolidated_count",
+                  "triggered_by",
+                  "ledger_download",
+              ):
+                  value = " ".join(str(meta.get(key, "")).splitlines()).strip()
+                  if key == "triggered_by" and value and not LOGIN.match(value):
+                      print(
+                          f"::warning::meta triggered_by is not a GitHub login shape "
+                          f"({len(value)} chars) — dropping the attribution line."
+                      )
+                      value = ""
+                  g.write(f"{key}={value}\n")
+          PY
+
       - name: Mint bot-identity token (optional)
         id: bot_token
         if: ${{ inputs.bot_app_id != '' }}
@@ -1889,17 +2314,21 @@ jobs:
           private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
 
       - name: Post review
+        id: post
         env:
           # Dedicated bot identity when configured (bot_app_id), else github-actions[bot].
           GH_TOKEN: ${{ steps.bot_token.outputs.token || secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          TRIGGERED_BY: ${{ steps.triggerer.outputs.triggered_by }}
-          JUDGE_STATUS: ${{ steps.consolidated.outputs.judge_status }}
-          CONSOLIDATED_COUNT: ${{ steps.consolidated.outputs.consolidated_count }}
+          TRIGGERED_BY: ${{ steps.meta.outputs.triggered_by }}
+          JUDGE_STATUS: ${{ steps.meta.outputs.judge_status }}
+          CONSOLIDATED_COUNT: ${{ steps.meta.outputs.consolidated_count }}
           LEDGER_STATUS: ${{ needs.ledger.outputs.status }}
+          # This job's own download (can the poster READ the note) …
           LEDGER_DOWNLOAD: ${{ steps.ledger_download.outcome }}
+          # … and the consolidate job's (did the JUDGE get prior-round context).
+          LEDGER_DOWNLOAD_JUDGE: ${{ steps.meta.outputs.ledger_download }}
         run: |
           # Prior-review ledger line for the review header: either the
           # round/ledger summary, or the "context unavailable" banner naming the
@@ -1908,17 +2337,37 @@ jobs:
           # first-round review.
           #
           # The DELIVERY of the ledger is checked separately from its CONTENT.
-          # Both downloads are continue-on-error, so an upload or download that
-          # failed leaves no ledger-note.txt while the ledger job still reports
-          # status=ok — and the panel prompts were spliced with an EMPTY block.
-          # Reading only LEDGER_STATUS there would emit no banner and the
+          # Every ledger download is continue-on-error, so an upload or download
+          # that failed leaves no ledger-note.txt while the ledger job still
+          # reports status=ok — and the panel prompts were spliced with an EMPTY
+          # block. Reading only LEDGER_STATUS there would emit no banner and the
           # context-free re-review would render as a genuine first round, the
           # exact partial failure the banner exists to catch. So: file ABSENT
           # (delivery failed) is a banner; file PRESENT but empty is a real
           # "nothing to say" (first round / kill switch / no prior findings).
+          #
+          # The two halves are reported SEPARATELY because they mean different
+          # things to the author. If the JUDGE's download failed, the panel
+          # genuinely reviewed without prior-round context and findings may
+          # repeat earlier rounds. If only the POSTER's download failed — a case
+          # that exists only because this job now fetches the note itself — the
+          # panel and judge DID have the context and only this header could not
+          # be rendered; telling the author "findings may repeat" there would be
+          # false.
           LEDGER_NOTE=""
+          JUDGE_LEDGER_OK=true
+          if [ "${LEDGER_DOWNLOAD_JUDGE:-failure}" != "success" ]; then
+            JUDGE_LEDGER_OK=false
+          fi
+          POST_LEDGER_OK=true
           if [ "${LEDGER_DOWNLOAD:-failure}" != "success" ] || [ ! -f /tmp/ledger/ledger-note.txt ]; then
-            LEDGER_NOTE="⚠️ prior-review context unavailable (ledger artifact did not reach the consolidate job: download=${LEDGER_DOWNLOAD:-missing}) — the panel ran without prior-round context, so findings may repeat earlier rounds."
+            POST_LEDGER_OK=false
+          fi
+
+          if [ "$JUDGE_LEDGER_OK" != "true" ]; then
+            LEDGER_NOTE="⚠️ prior-review context unavailable (the ledger artifact did not reach the review jobs: judge=${LEDGER_DOWNLOAD_JUDGE:-missing}, post=${LEDGER_DOWNLOAD:-missing}) — the panel ran without prior-round context, so findings may repeat earlier rounds."
+          elif [ "$POST_LEDGER_OK" != "true" ]; then
+            LEDGER_NOTE="⚠️ prior-review summary unavailable (the ledger note did not reach the posting job: post=${LEDGER_DOWNLOAD:-missing}). The panel and judge DID read prior-round context, so findings are not repeats for want of it — only this header could not be rendered."
           else
             LEDGER_NOTE="$(cat /tmp/ledger/ledger-note.txt)"
             if [ -z "$LEDGER_NOTE" ]; then
@@ -1938,7 +2387,7 @@ jobs:
           # 3. Judge failed, no findings       → honest error review.
           if [ "$JUDGE_STATUS" = "ok" ]; then
             python3 "$CURSOR_REVIEW_ASSETS/post-review.py" \
-              --findings /tmp/consolidated.json \
+              --findings /tmp/consolidated/consolidated.json \
               --pr-number "$PR_NUMBER" \
               --repo "$REPO" \
               --commit-sha "$HEAD_SHA" \
@@ -1955,7 +2404,7 @@ jobs:
             # un-adjudicated panel review is posted. That review is the whole point of
             # this branch.
             python3 "$CURSOR_REVIEW_ASSETS/post-review.py" \
-              --findings /tmp/consolidated.json \
+              --findings /tmp/consolidated/consolidated.json \
               --pr-number "$PR_NUMBER" \
               --repo "$REPO" \
               --commit-sha "$HEAD_SHA" \
@@ -1977,9 +2426,9 @@ jobs:
             # MAX_ARG_STRLEN, so say it HERE instead — the marker is appended only when
             # the cut actually fired. (Command substitution also strips trailing
             # newlines and cannot carry NUL; neither changes what the reader is told.)
-            JUDGE_ERROR=$(python3 -c "import json; e = str(json.load(open('/tmp/judge-findings.json')).get('error', '(no error message)')).encode('utf-8', 'replace'); cut = e[:100000]; print(cut.decode('utf-8', 'ignore') + ('' if len(cut) == len(e) else ' …(truncated: the error message exceeded the 100 KB argument budget)'))")
+            JUDGE_ERROR=$(python3 -c "import json; e = str(json.load(open('/tmp/consolidated/judge-findings.json')).get('error', '(no error message)')).encode('utf-8', 'replace'); cut = e[:100000]; print(cut.decode('utf-8', 'ignore') + ('' if len(cut) == len(e) else ' …(truncated: the error message exceeded the 100 KB argument budget)'))")
             python3 "$CURSOR_REVIEW_ASSETS/post-review.py" \
-              --findings /tmp/consolidated.json \
+              --findings /tmp/consolidated/consolidated.json \
               --pr-number "$PR_NUMBER" \
               --repo "$REPO" \
               --commit-sha "$HEAD_SHA" \
@@ -1987,6 +2436,206 @@ jobs:
               --ledger-note "$LEDGER_NOTE" \
               --error-message "Judge call failed (status=${JUDGE_STATUS}): ${JUDGE_ERROR}"
           fi
+
+  blocking-gate:
+    # Opt-in merge gate (inputs.blocking), restored by BE-4691 after #31
+    # dropped it unintentionally. Fails this check while the PR has unresolved,
+    # non-outdated cursor-review finding threads, so a caller that marks
+    # "Blocking gate" a required status check blocks merge until every finding
+    # thread is addressed. With blocking:false (default) this job is skipped
+    # entirely — the review stays advisory and no enrolled caller's behavior
+    # changes.
+    #
+    # With blocking on, this job runs on EVERY delivered event — deliberately
+    # NOT conditioned on `should_run`, unlike the original #16 job. A skipped
+    # required check counts as PASSING, so any run where the trigger step says
+    # "don't review" (an unrelated label toggled, skip-cursor-review present,
+    # the trigger label removed) would otherwise mint a green "Blocking gate"
+    # over open finding threads. Running unconditionally makes the verdict
+    # event-independent: are there live unresolved cursor-review threads on
+    # this PR right now. That is also what makes a pull_request_review_thread
+    # trigger in the caller's `on:` block a pure re-check — the trigger step
+    # leaves should_run=false, so the panel, comments and DMs all stay skipped
+    # while this gate re-queries thread state and flips green on the last
+    # resolve. The same holds for plain PR events under a label-gated caller,
+    # so a blocking caller that widens its `types:` gets a gate verdict on
+    # every push instead of a required check stuck at "Expected".
+    # (Fork PRs never gate red: their runs can post no review, so they have no
+    # finding threads to be unresolved.)
+    #
+    # `needs: post-review` orders it after the review's threads exist on a
+    # fresh run; `always()` (not `!cancelled()`) is what keeps it reporting.
+    # post-review uses `!cancelled()` because it WRITES and must not race the
+    # run that superseded it — this job writes nothing, it re-reads live thread
+    # state, so a superseded run and its replacement can only agree. What
+    # `!cancelled()` would cost is the whole point of the job: a cancelled run
+    # skips it, GitHub counts a skipped required check as PASSING, and the
+    # documented caller makes cancellation easy to reach (`cancel-in-progress`
+    # puts thread-resolve events in the same group as panel runs, and an author
+    # can cancel by hand). Green-on-cancel is the exact fail-OPEN this job
+    # exists to close, so it runs on cancellation too — and if the teardown
+    # takes its steps down with it, the check goes RED, which is the safe side.
+    name: Blocking gate
+    needs: [gate, diff-size, post-review]
+    if: ${{ always() && inputs.blocking }}
+    runs-on: ubuntu-latest
+    # One paged GraphQL query through gh — minutes at most; bounded like every
+    # other job here so a hung API call cannot hold a runner for the 6-hour
+    # default.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Fail if the trigger decision itself failed
+        # FIRST fail-closed guard, and it has to come first because every guard
+        # below is phrased in terms of `needs.gate.outputs.*`. Those outputs are
+        # EMPTY when the gate job failed — its dup-check API call and its label
+        # `jq` can both error — so `should_run == 'true'` is false, every
+        # downstream guard skips, and the run falls through to a thread query
+        # that finds nothing on a PR nobody ever decided to review. That is a
+        # green required check produced by a red job, on exactly the path these
+        # guards exist to close. An undecided run is not a clean run.
+        if: ${{ needs.gate.result != 'success' }}
+        env:
+          GATE_RESULT: ${{ needs.gate.result }}
+        run: |
+          echo "::error::The cursor-review trigger job did not succeed (gate: $GATE_RESULT), so whether this PR should have been reviewed is unknown — refusing to pass the blocking gate. Re-run the failed job."
+          exit 1
+
+      - name: Fail if the fresh review did not land
+        # SECOND fail-closed guard. A gate that passed while the review it gates
+        # on never landed would be fail-OPEN: no threads exist, the query below
+        # finds nothing, green check. So on the fresh path — the trigger step
+        # said a panel should run and no dedupe hit — refuse to pass unless the
+        # pipeline actually delivered a review.
+        #
+        # Two things are checked, and BOTH are needed:
+        #
+        # * `needs.post-review.result == 'success'`. post-review, not
+        #   consolidate, is the terminal write since the credential split: a
+        #   consolidate that succeeded into a failed post still posted nothing.
+        # * `needs.post-review.outputs.delivered == 'true'`. The job result is
+        #   NOT sufficient on its own — post-review.py exits 0 after a
+        #   read-only-token 403 (review written to the job summary, never to the
+        #   PR), after the body-only "Review failed" error review, after the
+        #   no-findings review a run posts when every panel cell errored, and
+        #   after the 422 inline-anchor fallback. Each of those is a zero exit
+        #   over a round that adjudicated nothing, and each leaves the thread
+        #   query below empty. The script therefore emits the claim positively
+        #   (see its emit_delivery); an unset value — the script died before
+        #   deciding — is not `'true'`, so the default is closed.
+        #
+        # Over the cap is NOT exempt any more. It used to fall through to the
+        # thread query as a "documented, announced skip", but diff size is fully
+        # author-controlled: padding a PR past `diff_size_cap` skipped the panel
+        # AND outdated every thread an earlier under-cap round had posted, so one
+        # commit both cleared the existing findings and greened the gate. "Too
+        # big to review" is not evidence a PR is clean. For a blocking caller the
+        # over-cap path now holds the check red (post-review is skipped, so this
+        # guard fires) until the diff comes under the cap or the caller raises
+        # `diff_size_cap`. Only the genuinely review-free paths stay exempt —
+        # should_run=false events and the already_reviewed re-trigger — and those
+        # fall through to the live thread query, which is the whole verdict there.
+        if: ${{ needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && (needs.diff-size.result != 'success' || needs.post-review.result != 'success' || needs.post-review.outputs.delivered != 'true') }}
+        env:
+          DIFF_SIZE_RESULT: ${{ needs.diff-size.result }}
+          WITHIN_CAP: ${{ needs.diff-size.outputs.within_cap }}
+          POST_REVIEW_RESULT: ${{ needs.post-review.result }}
+          DELIVERED: ${{ needs.post-review.outputs.delivered }}
+        run: |
+          if [ "$DIFF_SIZE_RESULT" = "success" ] && [ "$WITHIN_CAP" != "true" ]; then
+            echo "::error::This PR's counted diff exceeds diff_size_cap, so no review ran — and an unreviewed PR cannot pass a blocking gate. Split the PR under the cap and re-trigger the review, or raise diff_size_cap on the caller."
+            exit 1
+          fi
+          echo "::error::A fresh review was triggered but did not land on this PR (diff-size: $DIFF_SIZE_RESULT, post-review: $POST_REVIEW_RESULT, delivered: ${DELIVERED:-<unset>}) — refusing to pass the blocking gate. Re-run the failed jobs or re-trigger the review."
+          exit 1
+
+      - name: Fail if the review landed with no resolvable threads
+        # THIRD fail-closed guard, for the one delivery that is real and still
+        # invisible to the query below. post-review.py demotes a finding whose
+        # anchor misses the reviewed diff into the review BODY, and falls back to
+        # a wholly body-only review when GitHub 422s the inline payload. Neither
+        # creates a thread. A round in which EVERY finding was demoted posts N
+        # real findings and leaves zero threads — indistinguishable, to a thread
+        # query, from a clean PR — so the gate would report green over findings
+        # nobody can even reply to, which is precisely the "every finding was
+        # explicitly looked at and closed out" claim falsified.
+        #
+        # Scoped to the fully-degraded round (threads == 0 while body-only
+        # findings exist) on purpose. A PARTIALLY demoted round keeps its inline
+        # half, so the gate already holds red on those threads; failing on the
+        # demoted half too would be a check no thread resolution could ever clear
+        # — a bricked PR rather than a gate. That residual is documented in the
+        # setup guide's blocking-gate gotchas rather than papered over here.
+        if: ${{ needs.post-review.outputs.delivered == 'true' && needs.post-review.outputs.gated_findings == '0' && needs.post-review.outputs.ungated_findings != '0' && needs.post-review.outputs.ungated_findings != '' }}
+        env:
+          UNGATED: ${{ needs.post-review.outputs.ungated_findings }}
+        run: |
+          echo "::error::The review landed but every one of its $UNGATED finding(s) was posted in the review body with no inline thread (the anchors missed the reviewed diff, or GitHub rejected the inline payload), so there is nothing for this gate to watch resolve. Read the findings in the review body, push a fix, and re-trigger the review."
+          exit 1
+
+      - name: Require a pull-request event
+        # gate-unresolved.py's --pr-number is argparse `type=int`, and this job
+        # runs on EVERY delivered event by design. On any payload without a pull
+        # request — `merge_group` (which a merge queue runs required checks on),
+        # `workflow_dispatch`, `push`, `issue_comment` — the expression below is
+        # empty and argparse exits 2, leaving a required check permanently red
+        # whose only explanation is a traceback and which no thread resolution
+        # can clear. Say what is wrong instead. Still a FAILURE, not a skip: a
+        # skipped required check counts as passing, and this gate cannot judge a
+        # PR it was not handed. The fix is the caller's `on:` block — see the
+        # blocking caller shape in docs/callers/cursor-review.md.
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ -z "$PR_NUMBER" ]; then
+            echo "::error::The blocking gate was triggered by '$EVENT_NAME', which carries no pull_request payload, so it cannot read this PR's review threads. Trigger cursor-review from pull_request / pull_request_review_thread events (see the blocking caller shape in docs/callers/cursor-review.md)."
+            exit 1
+          fi
+
+      - name: Require a pinned workflows_ref
+        # workflows_ref has no default on purpose. GitHub does NOT enforce
+        # `required: true` for workflow_call inputs, so an omitted input arrives
+        # as '' and actions/checkout would silently fall back to this repo's
+        # default branch — running MUTABLE scripts under a pin that claims
+        # otherwise. Fail fast instead. (BE-5546)
+        env:
+          WORKFLOWS_REF: ${{ inputs.workflows_ref }}
+        run: |
+          # actions/checkout reads `ref` through core.getInput, which TRIMS, so a
+          # whitespace-only value is an empty ref to IT while sailing past a bare
+          # -z test here. Compare the stripped form, and echo only that: dropping
+          # newlines also stops a multi-line value from smuggling a ::workflow
+          # command:: into the log, and from satisfying the line-oriented grep
+          # below on one 40-hex line among many.
+          REF="$(printf '%s' "$WORKFLOWS_REF" | tr -d '[:space:]')"
+          if [ -z "$REF" ]; then
+            echo "::error::workflows_ref is required; pin it to the same commit SHA as the uses: line (see header example)"
+            exit 1
+          fi
+          if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
+          fi
+
+      - name: Load cursor-review assets
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Comfy-Org/github-workflows
+          ref: ${{ inputs.workflows_ref }}
+          path: _cursor_review_assets
+          persist-credentials: false
+
+      - name: Fail on unresolved cursor-review threads
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 "$CURSOR_REVIEW_ASSETS/gate-unresolved.py" \
+            --repo "$REPO" \
+            --pr-number "$PR_NUMBER"
 
   notify-start:
     name: Notify start
@@ -2068,7 +2717,7 @@ jobs:
 
   notify-complete:
     name: Notify complete
-    needs: [gate, diff-size, review, consolidate]
+    needs: [gate, diff-size, review, consolidate, post-review]
     if: always() && needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true' && needs.review.result != 'skipped'
     runs-on: ubuntu-latest
     permissions:
@@ -2136,16 +2785,68 @@ jobs:
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_URL: ${{ github.event.pull_request.html_url }}
           CONSOLIDATE_RESULT: ${{ needs.consolidate.result }}
+          POST_REVIEW_RESULT: ${{ needs.post-review.result }}
+          # Not redundant with the result above (BE-10017): post-review.py exits
+          # 0 — so the job is green — after a read-only-token 403, having written
+          # the review to the run's job summary instead of the PR. Deliberate (a
+          # caller that forgot `pull-requests: write` still gets its review
+          # somewhere), but it made the success DM claim a review that is not
+          # there. Unset reads as not-'true', which is the fail-closed direction:
+          # the worst case is a degraded DM on a review that did post.
+          REVIEW_POSTED: ${{ needs.post-review.outputs.posted }}
+          # `posted` and `delivered` disagree in BOTH directions, so the DM needs
+          # both: the "Review failed" error review and the all-cells-failed review
+          # DO reach the PR (posted) while adjudicating nothing (not delivered).
+          # Claiming "review complete" over those is the same class of lie this
+          # ticket fixes, one branch further in — the blocking gate refuses that
+          # exact round. Unset reads as not-'true', i.e. fail-closed here too.
+          REVIEW_DELIVERED: ${{ needs.post-review.outputs.delivered }}
         run: |
           chmod +x "$CURSOR_REVIEW_ASSETS/slack-notify.sh"
-          if [ "$CONSOLIDATE_RESULT" = "success" ]; then
+          # Keyed on the POST job, not on consolidate: since the credential
+          # split it is `post-review` that puts the review on the PR, so a green
+          # consolidate alone no longer justifies "one consolidated review is on
+          # the PR". The two failures are distinguished so the DM says which
+          # half broke.
+          if [ "$POST_REVIEW_RESULT" = "success" ] && [ "$REVIEW_POSTED" = "true" ] && [ "$REVIEW_DELIVERED" = "true" ]; then
             STATUS="success"
             TITLE="Cursor review complete"
             DETAIL="One consolidated review is on the PR."
-          else
+          elif [ "$POST_REVIEW_RESULT" = "success" ] && [ "$REVIEW_POSTED" = "true" ]; then
+            # A body reached the PR but adjudicated nothing: the "Review failed"
+            # error review, or the review a round posts when every panel cell
+            # errored. Pointing at the PR is right — there IS something to read
+            # there — but calling it complete is not.
+            STATUS="warning"
+            TITLE="Cursor review incomplete"
+            DETAIL="A review was posted on the PR, but it adjudicated nothing — the judge failed, or every reviewer in the panel errored. See the run for the underlying cause."
+          elif [ "$POST_REVIEW_RESULT" = "success" ]; then
+            # Green job, nothing on the PR. The designed-for case is the
+            # read-only-token degradation, but this branch is reached by every
+            # green run that did not post, so state the OBSERVATION as fact and
+            # the cause as likelihood: is_read_only_token_error treats every 403
+            # EXCEPT a throttle as read-only (BE-12612), so an SSO/IP-allowlist
+            # or archived-repo rejection lands here too, as does an App
+            # installation without pull-request write (where the caller's
+            # permissions block is not the knob) and a workflows_ref resolving
+            # to a post-review.py too old to emit `posted` at all. A throttle
+            # GitHub WORDS as one no longer arrives here: it takes the
+            # landed-review check instead and fails red if nothing landed, which
+            # the failure branch below already covers. An unworded 403 — what an
+            # edge, a WAF or a GHES proxy returns with no JSON body — carries
+            # nothing to tell those apart by, so it is read as standing and does
+            # still land here; hence "most often", not "always".
+            STATUS="warning"
+            TITLE="Cursor review degraded"
+            DETAIL="No review was posted on the PR — the full text is in the run's job summary. Most often the run's token lacks pull-requests: write (check the caller's permissions block); another standing 403 (SSO/IP allowlist, archived repo) or a stale workflows_ref pin reaches this too. A 403 GitHub worded as a rate limit does not reach this — it takes the landed-review check and fails the job red if nothing landed — but a 403 carrying no message at all (an edge or proxy) is indistinguishable from a standing refusal and does, so check the run log for the actual error before ruling a throttle out."
+          elif [ "$CONSOLIDATE_RESULT" != "success" ]; then
             STATUS="warning"
             TITLE="Cursor review failed to post"
             DETAIL="Consolidate step did not succeed — see the run for details."
+          else
+            STATUS="warning"
+            TITLE="Cursor review failed to post"
+            DETAIL="The panel consolidated, but the post-review job did not succeed — see the run for details."
           fi
           MSG="*${PR_TITLE}*"$'\n'"${PR_URL}"$'\n'"${DETAIL}"
           "$CURSOR_REVIEW_ASSETS/slack-notify.sh" \
