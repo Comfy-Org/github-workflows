@@ -116,9 +116,58 @@ The ones that matter:
 | `scope_label` / `scope_desc` | `whole-repo` | Cosmetic labels for the scope in issue bodies. |
 | `workflows_ref` | `''` | **Leaving it unset is safe.** Alone among these workflows groom does not *require* it — it defaults to `''` and each asset checkout falls back to `${{ job.workflow_sha }}`, the commit your `uses:` pin resolved to, so the briefs, `ledger.py` and `interval.py` always match the logic running them with nothing to keep in sync. Set it only to test briefs from a branch. Before BE-8077 that fallback was spelled `github.job_workflow_sha` and silently loaded the assets from this repo's default branch — see the footgun below. |
 | `bot_app_id` | `''` | File as your App rather than `github-actions[bot]`. |
+| `environment` | `''` | Bind a GitHub environment (in YOUR repo) on the three jobs that mint the bot App token — `build_select`, `file`, `build_pr` — so `BOT_APP_PRIVATE_KEY` can be an environment secret behind a deployment-branch policy instead of a repository secret every branch can read. Empty (the default) binds nothing, and so does any value while `bot_app_id` is unset. Deployment-branch policies only, and the environment must exist before you set this. See "Scoping the bot key to an environment" below. |
 | `builder` | `false` | Opt into PR-writing — see below. |
 | `max_prs` | `'5'` | Only with `builder: true`. Typed **string**, deliberately. |
 | `pr_size_limit` | `400` | Only with `builder: true`. Caps a built PR's diff. |
+
+## Scoping the bot key to an environment
+
+By default `BOT_APP_PRIVATE_KEY` is a **repository** secret, which any workflow on any branch of your repo can read. Set `environment: bot-main` and the three credentialed jobs — `build_select`, `file` and `build_pr`, the only ones that mint the bot App token — bind that environment, so you can hold the key as an **environment** secret with a `main`-only deployment-branch policy instead. The agent jobs (`audit_find`, `audit_verify`, `build`) deliberately never bind it: they run a model over untrusted repo content and must stay outside any credentialed environment. Nothing binds while `bot_app_id` is unset either — with no App there is no token for an environment to guard.
+
+### Why the environment's secret wins
+
+Your caller's `secrets:` mapping is evaluated in the *caller* job, which cannot itself carry `environment:`, so what you pass through is whatever the caller could see. The substitution happens on the other side, and it is documented behaviour rather than an inference — GitHub's [Reuse workflows](https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows#using-inputs-and-secrets-in-a-reusable-workflow) guide warns:
+
+> Environment secrets cannot be passed from the caller workflow as `on.workflow_call` does not support the `environment` keyword. If you include `environment` in the reusable workflow at the job level, the environment secret will be used, and not the secret passed from the caller workflow.
+
+That name match is the whole mechanism: **the environment must hold a secret named exactly `BOT_APP_PRIVATE_KEY`.**
+
+What happens when it does *not* — because the name is misspelled, or because a typo'd `environment:` auto-created an empty one — is the one thing here we have **not** confirmed against a run. GitHub's precedence model is a merge in which the most specific level wins, which implies the caller-passed value simply stays in place: a green run that quietly never used the environment copy. The competing reading is that binding the environment leaves the job with no usable key and token minting fails outright. The documented sentence above settles which secret wins when *both* exist; it does not settle the absent case, and we have not tested it.
+
+Assume the silent one. It is the reading that costs you something — a loud mint failure tells you immediately, whereas a green run that still reads the repository key looks exactly like success. Step 4 below is what catches it either way, and it is why step 5 comes last.
+
+### Migration sequence
+
+Do these in order. Steps 1–3 are additive and reversible; **step 5 is the one that actually removes the exposure**, and doing it before step 4 breaks groom.
+
+1. **Create the environment and its deployment-branch policy first.** Settings → Environments → New environment (`bot-main`), then restrict deployment branches to your default branch. Do not skip this: GitHub creates a referenced-but-missing environment **on demand, with no rules and no secrets**, so a typo'd or not-yet-created name gives you a run with no gate on it at all — and, on the reading above, no error to notice either. Check the environment name against Settings → Environments rather than trusting a green run.
+2. **Add the App key to that environment** as an environment secret named exactly `BOT_APP_PRIVATE_KEY`.
+3. **Set the input** on your caller: `environment: bot-main` under `with:`. It is an ordinary `type: string` input (a `${{ vars.* }}` expression works too) — it is *not* a secret and must not be routed through `secrets:`.
+4. **Validate one real run.** Confirm the run shows a deployment to `bot-main` on `build_select` and `file`, and that issues were filed under the bot. Do not treat green alone as proof — a run that is still reading the repository key is also green. The deployment appearing on those two jobs is the signal that the binding took effect. Keep the repository secret until this passes.
+5. **Only then delete the repository-level secret** (`CLOUD_CODE_BOT_PRIVATE_KEY` in the Comfy setup). This is the step that ends the "readable from every branch" exposure — until you do it, the key is exactly as reachable as before, no matter what the environment says. Deleting it is also what makes step 4's check meaningful in retrospect: from here on, a working run *cannot* be one that fell back. Treat the repository secret as a **rollback path** rather than a safety net — if the environment-backed run misbehaves, re-adding it restores the previous state.
+
+**Your caller's `secrets:` mapping does not change**, and step 5 does not break it. The final form is still:
+
+```yaml
+    with:
+      bot_app_id: ${{ vars.APP_ID }}
+      environment: bot-main
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      # After step 5 this resolves to '' — the repository secret is gone. That
+      # is fine and expected: the three credentialed jobs bind `bot-main` and
+      # use ITS `BOT_APP_PRIVATE_KEY` instead of the value passed here. Keep the
+      # line: the input is declared `required: false`, but dropping it makes the
+      # pre-migration and mid-migration states fail instead of degrading.
+      BOT_APP_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
+```
+
+### What to point it at
+
+- **Use a DEDICATED environment holding only this key.** Binding is all-or-nothing: *every* secret and variable in the environment is injected into these three jobs — including `build_pr`, which applies a model-authored patch and pushes it as the bot. Pointing this at a pre-existing environment that also holds, say, deploy credentials silently widens what those jobs can reach.
+- **Deployment-branch policies only — no required reviewers, no wait timer.** A *pausing* rule suspends `build_select`, which both `file` and `build_pr` depend on. This workflow runs under `concurrency: groom-<repo>` with `cancel-in-progress: false`, so a run parked awaiting approval (up to 30 days) holds the group and every later daily tick queues behind it and is cancelled — groom stops for that repo with no failure and no log. `build_pr` makes it worse: it is a `max-parallel: 1` matrix over up to `max_prs` findings, so it raises one deployment **per finding**, not one per run — up to five sequential approvals, and a cell denied after earlier cells have pushed leaves a half-filed run.
+- **Make the branch policy cover every branch groom actually runs from.** A denied deployment is not free: the finder and verifier have already been billed by then, their findings are lost, and the run still counts as the last real one for the `interval_days` cadence gate (which anchors on the finder having spent, not on the run having filed anything), so the next `interval_days` of scheduled ticks no-op. If you `workflow_dispatch` groom from feature branches, a default-branch-only policy will silently eat those runs.
 
 ## Opt-in auto-builder
 
