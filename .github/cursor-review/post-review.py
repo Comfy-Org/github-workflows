@@ -47,10 +47,12 @@ empty — this job's copy of ledger.json is not what the judge saw.
 
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
 import sys
+import time
 
 # Severity scale, ordered most → least urgent. Drives sort order, the inline
 # comment prefix, and the summary table. The judge tool accepts one
@@ -300,21 +302,107 @@ def neutralize_mentions(text: str) -> str:
     return str(text).replace("@", "@\u200B")
 
 
+# The write half of the same reasoning as GH_LIST_REVIEWS_TIMEOUT_SECONDS below. Both
+# POSTs on the recovery path (the first review and the body-only fallback) precede
+# `write_step_summary`, so a wedged one takes the round out of BOTH channels when the
+# job's `timeout-minutes` kills the process — and with bounded WAITS now sitting in
+# front of the reads, an unbounded POST was the last unbounded term in the budget the
+# workflow's `post` job comment states. A timeout is reported as a nonzero
+# CompletedProcess carrying NO HTTP status, which `post_may_have_landed` reads as
+# genuinely undecided: the request may have been served, so the caller asks the PR
+# rather than assuming either answer.
+GH_POST_REVIEW_TIMEOUT_SECONDS = 60
+
+
 def gh_post_review(repo: str, pr_number: str, payload: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        [
-            "gh",
-            "api",
-            "--method",
-            "POST",
-            f"/repos/{repo}/pulls/{pr_number}/reviews",
-            "--input",
-            "-",
-        ],
-        input=payload,
-        text=True,
-        capture_output=True,
-    )
+    """POST the review, keeping the RESPONSE HEADERS (BE-12691).
+
+    `-i` is what makes `Retry-After` / `X-RateLimit-Reset` reachable: `gh api` prints
+    only the body by default, and there is no other knob that surfaces a response
+    header. Everything else about the call is unchanged — verified on gh 2.92.0, the
+    exit code is still nonzero on an error, stderr is still byte-identical
+    (`gh: <msg> (HTTP nnn)`), and the status line + headers + body all go to STDOUT,
+    which nothing but `gh_response_headers` reads. So `gh_http_status`,
+    `gh_error_line`, `is_throttled_403` and `is_read_only_token_error` — every one of
+    which reads stderr — are unaffected.
+
+    Bounded by GH_POST_REVIEW_TIMEOUT_SECONDS. The timeout message deliberately carries
+    neither an `HTTP nnn` rendering nor any of THROTTLE_403_MESSAGES, so it reads as a
+    transport failure — status None, not a throttle, not a read-only token — and takes
+    the undecided path.
+    """
+    argv = [
+        "gh",
+        "api",
+        "-i",
+        "--method",
+        "POST",
+        f"/repos/{repo}/pulls/{pr_number}/reviews",
+        "--input",
+        "-",
+    ]
+    try:
+        return subprocess.run(
+            argv,
+            input=payload,
+            text=True,
+            capture_output=True,
+            timeout=GH_POST_REVIEW_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=124,
+            # Whatever `gh` had written before the kill. Headers are only readable once
+            # the status line has arrived, and `gh_response_headers` returns {} short
+            # of that, so a partial capture degrades to "no headers" rather than to a
+            # wrong `Retry-After`.
+            stdout=exc.stdout or "",
+            stderr=(
+                f"gh api timed out after {GH_POST_REVIEW_TIMEOUT_SECONDS}s posting the "
+                f"review to {repo}#{pr_number} — whether the write was served is "
+                "unknown"
+            ),
+        )
+
+
+# The first line `gh -i` writes: `HTTP/2.0 403 Forbidden`, `HTTP/1.1 429 Too Many
+# Requests`. Required before anything is read as a header, so a stdout carrying only a
+# JSON body — what an older `gh`, or any caller that stubs the POST, produces — is
+# UNPARSEABLE rather than a header block whose first field happens to look like one.
+_GH_STATUS_LINE_RE = re.compile(r"^HTTP/\S+\s+\d{3}\b")
+
+
+def gh_response_headers(result: subprocess.CompletedProcess) -> dict[str, str]:
+    """The response headers `gh -i` wrote to stdout, lower-cased, or `{}`.
+
+    Read from stdout on purpose: stderr carries `gh`'s error line and, under
+    `GH_DEBUG=api`, an echo of the POSTed review body — so a finding that QUOTES a
+    `Retry-After:` line could dictate how long this process sleeps if the headers were
+    scraped from there. stdout is `gh`'s own rendering of the response and nothing
+    else.
+
+    Names are lower-cased because `gh` hands back Go's canonical form
+    (`X-Ratelimit-Reset`, not the `X-RateLimit-Reset` GitHub documents), and callers
+    must not have to guess which spelling arrived. A repeated header keeps its LAST
+    value, which is what an HTTP client would use.
+    """
+    blob = result.stdout or ""
+    lines = blob.split("\n")
+    if not _GH_STATUS_LINE_RE.match(lines[0].rstrip("\r")):
+        return {}
+    headers: dict[str, str] = {}
+    for raw in lines[1:]:
+        line = raw.rstrip("\r")
+        # The blank line ends the header block; everything after it is the body, which
+        # is attacker-influenced JSON and must never be read as a header.
+        if not line.strip():
+            break
+        name, sep, value = line.partition(":")
+        if not sep:
+            continue
+        headers[name.strip().lower()] = value.strip()
+    return headers
 
 
 # The 403 wordings that mean "slow down", not "you may not write". GitHub answers a
@@ -337,6 +425,35 @@ THROTTLE_403_MESSAGES = (
 )
 
 
+# What is left of `gh`'s error line once the status rendering, the request URL it may
+# carry and `gh`'s own prefix are taken out. Empty means GitHub (or whatever answered
+# for it) sent no `message` — an edge, a WAF or a GHES proxy with no JSON body.
+_GH_ERROR_URL_RE = re.compile(r"\(\s*https?://\S*?\s*\)")
+_GH_ERROR_PREFIX_RE = re.compile(r"^gh:\s*")
+
+
+def gh_error_is_messageless(result: subprocess.CompletedProcess) -> bool:
+    """Did the failure arrive with a status but no message of any kind?
+
+    The discriminator for "there is no wording here to weigh" — which is when
+    `is_throttle` lets a `Retry-After` header speak for a 403 instead. Read off the
+    same one line `is_throttled_403` reads, so a `GH_DEBUG=api` trace or a quoted
+    review body cannot make a messageful error look messageless or the reverse.
+
+    Anything it cannot fully strip — a request URL carrying its own parentheses, say —
+    leaves a remainder and so reads as MESSAGEFUL. That is the safe direction: the
+    caller then keeps the standing-refusal classification it has always had, rather
+    than promoting an unrecognized rendering to a throttle on a guess.
+    """
+    line = gh_error_line(result)
+    if not line:
+        return False
+    remainder = _GH_HTTP_STATUS_RE.sub("", line)
+    remainder = _GH_ERROR_URL_RE.sub("", remainder)
+    remainder = _GH_ERROR_PREFIX_RE.sub("", remainder.strip())
+    return not remainder.strip(" :\t").strip()
+
+
 def is_throttled_403(result: subprocess.CompletedProcess) -> bool:
     """True when a 403's message is GitHub asking us to slow down.
 
@@ -349,6 +466,203 @@ def is_throttled_403(result: subprocess.CompletedProcess) -> bool:
     """
     line = gh_error_line(result).lower()
     return any(message in line for message in THROTTLE_403_MESSAGES)
+
+
+def is_throttle(result: subprocess.CompletedProcess) -> bool:
+    """Is this failure GitHub asking us to slow down, on either status it uses?
+
+    429 by status alone; 403 only with one of the throttle wordings, OR with a
+    parseable `Retry-After` of its own — since every other 403 is a standing refusal
+    (see `is_read_only_token_error`). The 403 arm conjoins the status rather than
+    trusting the wording alone, which is the precondition `is_throttled_403`
+    documents: its allowlist is a substring match over `gh`'s error LINE, so a 422
+    whose validation message happened to quote "rate limit" would otherwise be treated
+    as a throttle and earn a sleep it cannot benefit from.
+
+    THE HEADER ARM is the gap `-i` closes, and it is deliberately narrow: it applies
+    only to a 403 that carried NO MESSAGE at all. A rate-limiting edge, a WAF or a
+    GHES proxy in front of GitHub can refuse a request with a bare status and no JSON
+    body while still sending the `Retry-After` that says what the refusal is —
+    `gh` renders that as `HTTP 403 (https://…)`, the shape `_GH_HTTP_STATUS_RE`'s own
+    comment names. Read by wording alone it is indistinguishable from a standing
+    refusal, so `is_read_only_token_error` claims it, the run degrades GREEN with no
+    read, and a write GitHub may have gone on to serve is reported `posted=false` —
+    which is the outcome `cursor-review.yml`'s own degrade message warns is
+    indistinguishable from a permission problem. A response that names its own retry
+    window and says nothing else is a throttle.
+
+    Narrow because the header must NOT override a message that says otherwise. A 403
+    reading "Resource not accessible by integration" is a standing refusal no wait
+    fixes; treating it as a throttle because some proxy attached a `Retry-After` would
+    trade its green degrade for a doomed wait, a doomed read and a permanently red
+    check — the exact regression BE-12612 narrowed this family to avoid. Affirmative
+    wording wins; the header only speaks where there is no wording to weigh.
+
+    Safe to trust at all because `gh_response_headers` reads STDOUT and stops at the
+    blank line, so nothing a review BODY says can reach it — the same property that
+    lets `throttle_delay_seconds` act on the value.
+
+    408 and 425 are deliberately NOT throttles. They are in RETRYABLE_4XX_STATUSES
+    because an edge or a proxy can raise them on a request GitHub went on to serve —
+    so they still take the landed-review read — but neither says a rate window is
+    open, so neither buys anything by waiting. They keep the immediate read.
+    """
+    status = gh_http_status(result)
+    if status == 429:
+        return True
+    if status != 403:
+        return False
+    if is_throttled_403(result):
+        return True
+    return gh_error_is_messageless(result) and (
+        _non_negative_int(gh_response_headers(result).get("retry-after")) is not None
+    )
+
+
+# GitHub's own guidance for a secondary rate limit with no `Retry-After`: "wait for at
+# least one minute before retrying". The MAX is this repo's, not GitHub's — see the
+# budget note in `throttle_delay_seconds` — and the MIN keeps a `Retry-After: 0` from
+# turning the wait into no wait at all, which is the shape that earns a second
+# throttle.
+THROTTLE_DELAY_DEFAULT_SECONDS = 60
+THROTTLE_DELAY_MAX_SECONDS = 90
+THROTTLE_DELAY_MIN_SECONDS = 1
+
+
+def _non_negative_int(value):
+    """`value` as a non-negative int, or None when it is missing or not one."""
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def declared_throttle_delay_seconds(result: subprocess.CompletedProcess, now=None):
+    """The wait the RESPONSE ITSELF asked for, UNCLAMPED — None when it named none.
+
+    GitHub's rate-limit best-practices order, each rule falling through to the next
+    when its header is missing, unparseable or negative:
+
+    1. `Retry-After` — the seconds GitHub itself asked for (secondary limits).
+    2. `X-RateLimit-Remaining: 0` plus a parseable `X-RateLimit-Reset` — a PRIMARY
+       limit, which lifts at the reset epoch and not before. A reset already in the
+       past says the window reopened, so it is not evidence of anything and falls
+       through rather than yielding a zero wait.
+    3. None — the response named no window; the caller substitutes its default.
+
+    Unclamped on purpose: `throttle_delay_seconds` clamps for the SLEEP, while
+    `throttle_exceeds_budget` needs the number GitHub actually sent to tell an
+    embargo this job can wait out from one it cannot. Squashing the two together is
+    what made a one-hour `Retry-After` look like a 90-second one.
+
+    ALL-INTEGER arithmetic. `_non_negative_int` accepts an arbitrarily large epoch,
+    and `reset - time.time()` would coerce that to float — an absurd (~309-digit)
+    `X-RateLimit-Reset` then raises OverflowError, killing the poster before
+    `write_step_summary` and losing the review from both channels. `math.floor(now)`
+    keeps the subtraction in int, where there is no such range. Flooring `now` (rather
+    than ceiling the difference) is the same rounding: for an integer `reset`,
+    `ceil(reset - now) == reset - floor(now)`, i.e. still rounded UP, so the wait never
+    ends a fraction of a second BEFORE the window GitHub named reopens.
+    """
+    headers = gh_response_headers(result)
+    delay = _non_negative_int(headers.get("retry-after"))
+    if delay is None and headers.get("x-ratelimit-remaining") == "0":
+        reset = _non_negative_int(headers.get("x-ratelimit-reset"))
+        if reset is not None:
+            remaining = reset - math.floor(time.time() if now is None else now)
+            # `> 0`, not `>= 0`: `time.time()` is fractional, so a window that expired
+            # within the last second floors to a remaining of 0 — and a zero wait on a
+            # response that just throttled us is not a wait. Fall through to the
+            # default instead, exactly as a reset further in the past does.
+            delay = remaining if remaining > 0 else None
+    return delay
+
+
+def throttle_delay_seconds(result: subprocess.CompletedProcess, now=None) -> int:
+    """How long to wait before touching the API again after a throttled write.
+
+    `declared_throttle_delay_seconds`, else `THROTTLE_DELAY_DEFAULT_SECONDS`, clamped
+    to [MIN, MAX] whichever rule produced it — so a header cannot dictate an unbounded
+    sleep inside a job with a wall-clock budget.
+
+    The clamp is only ever reached for an embargo this job CAN sit out:
+    `throttle_exceeds_budget` diverts a longer one to the job summary before any wait
+    happens, so MAX truncates nothing that would then be retried early.
+
+    BUDGET. The `post` job runs on `timeout-minutes: 10`. A worst case that throttles
+    at every turn spends two of these sleeps — one per throttled POST, since the
+    inline path's read and its fallback share ONE deadline (see
+    `throttle_backoff_deadline`) — plus at most two reads bounded by
+    GH_LIST_REVIEWS_TIMEOUT_SECONDS and two POSTs bounded by
+    GH_POST_REVIEW_TIMEOUT_SECONDS. That is 2 x 90 + 2 x 60 + 2 x 60 = 420s, inside
+    the budget with the three artifact downloads and the token mint alongside it.
+    """
+    delay = declared_throttle_delay_seconds(result, now)
+    if delay is None:
+        delay = THROTTLE_DELAY_DEFAULT_SECONDS
+    return max(THROTTLE_DELAY_MIN_SECONDS, min(THROTTLE_DELAY_MAX_SECONDS, delay))
+
+
+def throttle_exceeds_budget(result: subprocess.CompletedProcess, now=None) -> bool:
+    """Did the response declare an embargo longer than this job can honour?
+
+    A request issued INSIDE a server-declared embargo is what escalates a secondary
+    rate limit — the penalty lands on the whole App installation, not just this run —
+    so an hour-long `Retry-After` (which is what GitHub sends on a primary limit) must
+    not be truncated to MAX and then retried anyway. There is no wait that both
+    respects it and fits `timeout-minutes: 10`, so the run stops touching the API
+    entirely: no backoff, no landed-review read, no fallback POST. The findings go to
+    the job summary and the check goes red, which is the correct outcome for a run
+    that cannot deliver — and it is reached in seconds rather than after 90s of sleep
+    that bought nothing.
+
+    Only a DECLARED window counts. When the response named no wait at all, the 60s
+    default is this repo's own guess, not an embargo, so it is not a reason to give up.
+    """
+    delay = declared_throttle_delay_seconds(result, now)
+    return delay is not None and delay > THROTTLE_DELAY_MAX_SECONDS
+
+
+def throttle_backoff_deadline(result: subprocess.CompletedProcess, now=None) -> float:
+    """The monotonic instant a throttled response's window is treated as reopened.
+
+    An absolute DEADLINE rather than a duration, because one throttled POST governs
+    two waits on the inline path — the one before the landed-review read and the one
+    before the body-only fallback — and they are the SAME window, not two of them.
+    Sleeping the full delay twice waited a `Retry-After` out twice over; worse, on the
+    `X-RateLimit-Reset` rule the recomputed second delay had usually gone negative
+    (the window it names demonstrably reopened during the first sleep and the read),
+    fell through to `THROTTLE_DELAY_DEFAULT_SECONDS`, and spent a flat 60s of the
+    job's budget ahead of `write_step_summary` for nothing.
+
+    Against `time.monotonic`, not `time.time`: a clock step (NTP on a fresh runner)
+    must not turn the remaining wait into hours or into nothing.
+
+    A second, LATER throttle gets its own deadline — it is a new window, and the
+    response that declared it is the current one.
+    """
+    base = time.monotonic() if now is None else now
+    return base + throttle_delay_seconds(result)
+
+
+def wait_for_backoff(deadline: float, reason: str, now=None) -> int:
+    """Sleep until `deadline`; return the whole seconds actually slept.
+
+    Zero, without sleeping, once the deadline has passed — which is the normal case
+    for the second consumer of a shared deadline, and the point of sharing one.
+
+    Rounded UP to a whole second for the same reason `declared_throttle_delay_seconds`
+    rounds up: the clock is fractional, and a wait that ends a fraction of a second
+    early is a retry into the window rather than a wait.
+    """
+    remaining = deadline - (time.monotonic() if now is None else now)
+    if remaining <= 0:
+        return 0
+    seconds = math.ceil(remaining)
+    print(f"Review: {reason} — waiting {seconds}s.", file=sys.stderr)
+    time.sleep(seconds)
+    return seconds
 
 
 def is_read_only_token_error(result: subprocess.CompletedProcess) -> bool:
@@ -390,13 +704,19 @@ def is_read_only_token_error(result: subprocess.CompletedProcess) -> bool:
     Only the inline path REPOSTS on the other two answers; the other two read and,
     unless the answer is PRESENT, behave exactly as they always have.
 
-    One residual, named rather than implied: the read runs on the same token GitHub
-    just throttled, so it can be throttled too. That yields UNKNOWN, and on the inline
-    path UNKNOWN posts the fallback — which duplicates a first write that did land.
-    Closing that needs `Retry-After`/backoff, which `gh api` does not surface on the
-    default path; it is tracked separately (BE-12679) rather than half-done here.
+    The residual this left — the read runs on the same token GitHub just throttled, so
+    it can be throttled too, and the resulting UNKNOWN used to post a fallback that
+    duplicated a first write that did land — is closed by BE-12691: `confirm_landed`
+    backs off per `Retry-After` before the read, and an UNKNOWN under a throttle
+    declines the fallback rather than risking the duplicate.
+    "Not a throttle" is `is_throttle`, not `is_throttled_403` — so a 403 that carries a
+    `Retry-After` but none of the wordings (a rate-limiting edge, a WAF, a GHES proxy)
+    is excluded here too, and takes the backoff and the landed-review read rather than
+    the green degrade that would report `posted=false` over a write GitHub may have
+    served. On a 403 the two agree except for that header arm, which is strictly a
+    narrowing of what this claims.
     """
-    return gh_http_status(result) == 403 and not is_throttled_403(result)
+    return gh_http_status(result) == 403 and not is_throttle(result)
 
 
 # The discriminator for "a review of THIS panel is already on the PR". Mirrors
@@ -688,6 +1008,61 @@ def review_already_posted(
     return False
 
 
+def confirm_landed(
+    result,
+    repo: str,
+    pr_number: str,
+    commit_sha: str,
+    posted_body: str,
+    deadline=None,
+):
+    """`review_already_posted`, with a throttle backoff in front of it (BE-12691).
+
+    The ONE seam every failure path reads the PR through, so the backoff cannot be
+    added to two of the three and forgotten on the last. Three-valued exactly as
+    `review_already_posted` is, and it changes nothing about PRESENT or ABSENT.
+
+    What it changes is UNKNOWN. The read runs on the SAME token GitHub just throttled,
+    so issuing it immediately is close to asking for a second throttle — and the
+    answer that produces is "could not tell", which is the one answer that used to
+    cost a duplicate review. Waiting out the window GitHub named is what turns most of
+    those UNKNOWNs into a real PRESENT or ABSENT.
+
+    Only a throttle waits. A 5xx, a dropped connection, a 408 or a 425 all still take
+    the read immediately: none of them says a rate window is closed, so a sleep would
+    buy nothing and spend the job's budget.
+
+    An embargo longer than the job's budget (`throttle_exceeds_budget`) answers UNKNOWN
+    without touching the API at all. Truncating it to MAX and reading anyway would
+    issue a request inside a window GitHub explicitly closed, which is what escalates a
+    secondary limit for the whole installation — and the caller's response to UNKNOWN
+    under a throttle is already the right one: job summary, `posted=false`, red.
+
+    `deadline` lets a caller that will wait TWICE on one throttled response share a
+    single window between both waits; the default computes a fresh one. See
+    `throttle_backoff_deadline`.
+    """
+    if is_throttle(result):
+        if throttle_exceeds_budget(result):
+            print(
+                f"Review: GitHub throttled the POST (HTTP {gh_http_status(result)}) "
+                f"and asked for {declared_throttle_delay_seconds(result)}s, longer "
+                f"than this job can wait — not reading the PR back, since a request "
+                "inside a declared embargo escalates the limit. Treating the write as "
+                "unconfirmed.",
+                file=sys.stderr,
+            )
+            return None
+        if deadline is None:
+            deadline = throttle_backoff_deadline(result)
+        wait_for_backoff(
+            deadline,
+            f"GitHub throttled the POST (HTTP {gh_http_status(result)}) — backing off "
+            "before checking whether it landed",
+        )
+    return review_already_posted(repo, pr_number, commit_sha, posted_body)
+
+
 READ_ONLY_SUMMARY_NOTE = (
     "> ℹ️ This review could not be posted on the PR because the run's "
     "`GITHUB_TOKEN` is read-only (e.g. read-only default workflow "
@@ -697,6 +1072,20 @@ READ_ONLY_SUMMARY_NOTE = (
 POST_FAILED_SUMMARY_NOTE = (
     "> ⚠️ This review could not be posted on the PR (the API rejected the "
     "request). Posting it here instead — see the run log for the error.\n\n"
+)
+
+# The note above asserts the write was REJECTED. On the one path this branch exists to
+# create, that assertion is exactly what cannot be made: a throttle can be raised on a
+# request GitHub went on to serve, and the read that would have settled it was itself
+# throttled. A maintainer told "rejected" re-triggers the label and creates the
+# duplicate the branch just declined to create — so this note says undecided, and says
+# what to check before re-triggering.
+POST_UNCONFIRMED_SUMMARY_NOTE = (
+    "> ⚠️ GitHub throttled this review's POST, and the follow-up read could not "
+    "confirm whether it landed — so it was **not** re-posted, to avoid publishing a "
+    "duplicate review that cannot be deleted. It **may already be on the PR**: check "
+    "the PR's reviews before re-triggering. Posting the findings here so they are not "
+    "lost.\n\n"
 )
 
 # "as much as fits", not "the full text": write_step_summary budgets against
@@ -791,6 +1180,7 @@ def post_or_degrade(
     delivers=True,
     gated=0,
     ungated=0,
+    outcome=None,
 ) -> bool:
     """POST a review; degrade to the step summary on a read-only token.
 
@@ -798,6 +1188,13 @@ def post_or_degrade(
     (when the token is read-only) written to the job step summary. Returns
     False only on a genuine POST failure the caller should handle itself
     (e.g. retry without inline anchors).
+
+    `outcome`, when a dict is passed, collects what a False could not say: it gets
+    `unconfirmed=True` when the POST was THROTTLED and the landed-review read still
+    could not tell whether it landed. The caller needs that to pick a summary note,
+    because "the API rejected the request" is exactly the claim that path cannot make
+    — and a maintainer who reads it re-triggers the label and creates the duplicate
+    review the whole check exists to avoid.
 
     `truncated` says the posted body was clamped, so the whole of it goes to the
     summary even on success — otherwise the clamp note points at a summary that
@@ -855,8 +1252,12 @@ def post_or_degrade(
         # body at the same head SHA, so the two have to be the ones this call actually
         # sent. `payload` is that request, and every caller builds it with json.dumps.
         request = json.loads(payload)
-        landed = review_already_posted(
-            repo, pr_number, request.get("commit_id") or "", request.get("body") or ""
+        landed = confirm_landed(
+            result,
+            repo,
+            pr_number,
+            request.get("commit_id") or "",
+            request.get("body") or "",
         )
         if landed is True:
             print(
@@ -866,6 +1267,8 @@ def post_or_degrade(
             )
             report_posted()
             return True
+        if landed is None and is_throttle(result) and outcome is not None:
+            outcome["unconfirmed"] = True
     return False
 
 
@@ -2540,9 +2943,14 @@ def main():
         # and the job summary publishes a second copy of it. Same read as the inline
         # path below, on the same statuses, and still no repost: only a PRESENT answer
         # changes anything here.
-        if post_may_have_landed(result) and review_already_posted(
-            args.repo, args.pr_number, args.commit_sha, posted_body
-        ) is True:
+        landed_no_inline = (
+            confirm_landed(
+                result, args.repo, args.pr_number, args.commit_sha, posted_body
+            )
+            if post_may_have_landed(result)
+            else False
+        )
+        if landed_no_inline is True:
             print(
                 f"Review: the POST errored ({(result.stderr or '').strip()[:200]}) but "
                 f"a review for {args.commit_sha[:7]} is on the PR — treating as "
@@ -2557,7 +2965,17 @@ def main():
             file=sys.stderr,
         )
         emit_delivery(False)
-        write_step_summary(prose_body, note=POST_FAILED_SUMMARY_NOTE)
+        # Same note choice as the inline path's fail-closed branch: under a throttle an
+        # UNKNOWN read means the write MAY have been served, so the summary must not
+        # tell a maintainer it was rejected and send them off to re-trigger.
+        write_step_summary(
+            prose_body,
+            note=(
+                POST_UNCONFIRMED_SUMMARY_NOTE
+                if landed_no_inline is None and is_throttle(result)
+                else POST_FAILED_SUMMARY_NOTE
+            ),
+        )
         raise SystemExit(1)
 
     # Did that POST really fail to land? A nonzero `gh` is not proof it did not —
@@ -2581,9 +2999,23 @@ def main():
     # none). UNKNOWN is why the read failing is not answered as a `False`: that would
     # be indistinguishable from a confirmed-absent review and would relabel findings on
     # the strength of a transient blip.
+    #
+    # ONE deadline for BOTH waits this response can cost — this read's, and the
+    # fallback POST's below. They are the same rate-limit window, so waiting the full
+    # delay a second time waited it out twice (see `throttle_backoff_deadline`).
+    throttle_deadline = (
+        throttle_backoff_deadline(result)
+        if is_throttle(result) and not throttle_exceeds_budget(result)
+        else None
+    )
     if post_may_have_landed(result):
-        landed = review_already_posted(
-            args.repo, args.pr_number, args.commit_sha, posted_body
+        landed = confirm_landed(
+            result,
+            args.repo,
+            args.pr_number,
+            args.commit_sha,
+            posted_body,
+            deadline=throttle_deadline,
         )
     else:
         landed = False
@@ -2597,7 +3029,11 @@ def main():
         )
         finish_posted_review()
         return
-    if landed is None:
+    # UNDER A THROTTLE, an UNKNOWN does not reach the fallback at all (BE-12691) — the
+    # branch below declines it — so this line would misreport what happens next. It
+    # stays for every other undecided cause (a 5xx, a dropped connection, a 408/425),
+    # where the fallback still goes out with nothing tagged.
+    if landed is None and not is_throttle(result):
         print(
             "Review: could not confirm whether the first POST landed (review list "
             "unreadable) — posting the fallback with no finding tagged [post-failed].",
@@ -2754,6 +3190,45 @@ def main():
         fallback_head_with_sentinel, [i["comment"] for i in enriched]
     )
     clamped_fallback = clamp_review_body(fallback_body)
+
+    # The fallback is a SECOND WRITE on the token GitHub just throttled, and the two
+    # answers still on the table need opposite treatment (BE-12691). `landed is True`
+    # returned above, so this is UNKNOWN or confirmed-ABSENT.
+    if is_throttle(result):
+        if landed is None:
+            # Fail closed. A throttle can be raised on a request the API went on to
+            # SERVE, the read that would have told us was itself throttled, and a
+            # review posted twice cannot be un-posted — so the unverified write is the
+            # one thing not to do. The findings still reach the job summary, and
+            # `posted=false` keeps the fresh-review gate RED rather than green over a
+            # write nobody confirmed. Same fail-closed shape as the `not comments`
+            # branch above, which declines its (byte-identical) repost on every answer.
+            print(
+                "Review: the POST was throttled and the landed-review read could not "
+                "confirm it is absent — not reposting (a second write on a throttled "
+                "token risks a duplicate); writing to the job summary instead.",
+                file=sys.stderr,
+            )
+            emit_delivery(False)
+            write_step_summary(fallback_body, note=POST_UNCONFIRMED_SUMMARY_NOTE)
+            raise SystemExit(1)
+        # Confirmed ABSENT: nothing landed, so the fallback is the only copy of this
+        # round that can reach the PR and it does go out — but on the same token, so
+        # finish waiting out the window first or it earns the same throttle the first
+        # write did. FINISH, not restart: `throttle_deadline` is the same window
+        # `confirm_landed` already slept against, so this is the REMAINDER and is
+        # usually zero — the read that returned ABSENT is itself evidence the window
+        # reopened. Keeping the wait short is also what keeps the ABSENT answer fresh:
+        # the longer the gap between the read and this POST, the more room a first
+        # write that was in fact served has to become visible in it.
+        if throttle_deadline is not None:
+            wait_for_backoff(
+                throttle_deadline,
+                f"the first POST was throttled (HTTP {gh_http_status(result)}) and the "
+                "review is confirmed absent — finishing the backoff before posting the "
+                "fallback",
+            )
+
     fallback_payload = json.dumps(
         {
             # Clamped for the API; the step-summary copy stays whole.
@@ -2762,6 +3237,7 @@ def main():
             "commit_id": args.commit_sha,
         }
     )
+    fallback_outcome = {}
     if not post_or_degrade(
         args.repo,
         args.pr_number,
@@ -2769,6 +3245,7 @@ def main():
         fallback_body,
         "Fallback review",
         truncated=clamped_fallback != fallback_body,
+        outcome=fallback_outcome,
         # This body reached the PR, so it IS a delivery — but the inline half is
         # exactly what was dropped to make it postable, so none of its findings
         # carries a thread. Reported as ungated so the gate refuses to read the
@@ -2784,7 +3261,17 @@ def main():
         # MORE content, since it has an inline half. post_or_degrade only writes a
         # summary on the paths that return True, so there is no double write here.
         emit_delivery(False)
-        write_step_summary(fallback_body, note=POST_FAILED_SUMMARY_NOTE)
+        # The fallback can fail the same undecided way the inline POST can — throttled,
+        # with its own landed-review read unreadable — and the summary must not tell a
+        # maintainer it was rejected when it may be on the PR.
+        write_step_summary(
+            fallback_body,
+            note=(
+                POST_UNCONFIRMED_SUMMARY_NOTE
+                if fallback_outcome.get("unconfirmed")
+                else POST_FAILED_SUMMARY_NOTE
+            ),
+        )
         raise SystemExit(1)
 
 
