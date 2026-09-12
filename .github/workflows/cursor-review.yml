@@ -2846,15 +2846,21 @@ jobs:
             # Green job, nothing on the PR. The designed-for case is the
             # read-only-token degradation, but this branch is reached by every
             # green run that did not post, so state the OBSERVATION as fact and
-            # the cause as likelihood: is_read_only_token_error treats any HTTP
-            # 403 as read-only, so an SSO/IP-allowlist, secondary-rate-limit or
-            # archived-repo rejection lands here too, as does an App
+            # the cause as likelihood: is_read_only_token_error treats every 403
+            # EXCEPT a throttle as read-only (BE-12612), so an SSO/IP-allowlist
+            # or archived-repo rejection lands here too, as does an App
             # installation without pull-request write (where the caller's
             # permissions block is not the knob) and a workflows_ref resolving
-            # to a post-review.py too old to emit `posted` at all.
+            # to a post-review.py too old to emit `posted` at all. A throttle
+            # GitHub WORDS as one no longer arrives here: it takes the
+            # landed-review check instead and fails red if nothing landed, which
+            # the failure branch below already covers. An unworded 403 — what an
+            # edge, a WAF or a GHES proxy returns with no JSON body — carries
+            # nothing to tell those apart by, so it is read as standing and does
+            # still land here; hence "most often", not "always".
             STATUS="warning"
             TITLE="Cursor review degraded"
-            DETAIL="No review was posted on the PR — the full text is in the run's job summary. Most often the run's token lacks pull-requests: write (check the caller's permissions block); another 403 (SSO/IP allowlist, rate limit, archived repo) or a stale workflows_ref pin reaches this too."
+            DETAIL="No review was posted on the PR — the full text is in the run's job summary. Most often the run's token lacks pull-requests: write (check the caller's permissions block); another standing 403 (SSO/IP allowlist, archived repo) or a stale workflows_ref pin reaches this too. A 403 GitHub worded as a rate limit does not reach this — it takes the landed-review check and fails the job red if nothing landed — but a 403 carrying no message at all (an edge or proxy) is indistinguishable from a standing refusal and does, so check the run log for the actual error before ruling a throttle out."
           elif [ "$CONSOLIDATE_RESULT" != "success" ]; then
             STATUS="warning"
             TITLE="Cursor review failed to post"
