@@ -1,0 +1,225 @@
+# Allowlist for check-org-repo-literals.sh — the ONLY org-prefixed repo names
+# that may appear as literals in this public repo's tracked tree.
+#
+# One entry per line, each with a trailing `#` comment saying WHY it is safe.
+# Entries are LITERAL names, compared case-insensitively (GitHub resolves
+# owner/repo names case-insensitively). A trailing `.git` suffix and trailing
+# periods are stripped from the literal before it is compared; a trailing `-`
+# or `_` is NOT, because both are legal at the end of a real slug and
+# stripping them would let `<allowlisted>-` clear on `<allowlisted>`.
+#
+# An entry written with a leading `@` is a TEAM/scope entry: it clears only an
+# `@`-prefixed literal (a CODEOWNERS team handle, or an npm / GitHub Packages
+# scope). A plain entry clears either spelling. Keeping team slugs out of the
+# repo namespace is why a CODEOWNERS fixture's team name does not also clear a
+# literal reference to a private REPO of that name.
+#
+# THREE SHAPES ARE REFUSED as configuration errors (exit 2). Each reads as an
+# ordinary allowlist edit while doing something other than what its author meant.
+#
+#   NO GLOBS — an entry containing `*`, `?`, `[` or `]`. Note what this is
+#   today: entries are compared with EXACT EQUALITY, so a `[a-z]*` entry clears
+#   nothing but a literal `[a-z]*`; no entry reaches the comparison as a
+#   pattern. The rejection is DEFENCE-IN-DEPTH should that comparison ever go
+#   back to a `case` glob — do not read it as evidence that entries already
+#   match as patterns, and do not "simplify" the `=` into one. (It is also why
+#   no fixed set of probe names is used instead: no two probes can decide
+#   breadth in general.) Every name here is spelled out; a family of test
+#   fixtures is enumerated, not globbed.
+#
+#   NO `/` — entries are bare repo NAMES, compared against the name alone, so
+#   `<org>/foo` can never match anything. That is the spelling the tool invites,
+#   since a finding quotes the whole literal; write just `foo`.
+#
+#   NO NAME ENDING IN THE ORG NAME — that is the shape of a MERGED literal, not
+#   of a repo. `<org>/public.<org>/private` scans as ONE match named
+#   `public.<org>`, and allowlisting the token such a finding quotes would clear
+#   the second, never-examined name with the run green.
+#
+# Adding a line here is the ratification step: it is what makes "this name is
+# safe to publish" a reviewed decision instead of an assumption. Never add a
+# name you have not confirmed is publishable — for a real repo that means
+# confirming it is PUBLIC.
+#
+# The org-wide known-public repo list lives in
+# .github/public-repo-hygiene/check_public_repo_hygiene.py and is the source of
+# truth for other repos; this file is repo-local because this repo additionally
+# carries that checker's own fake-private test fixtures.
+#
+# This file is scanned like every other tracked file — the comments above and
+# below are NOT exempt, so a rationale that quotes ANOTHER, unlisted name is a
+# finding. The one place the scan structurally cannot look is an entry's own
+# line, because the entry clears it: state the DECISION there ("published by
+# decision — see <doc>"), never a confidentiality attribute of the name, since
+# "X is private" is itself the private detail AGENTS.md keeps out of this tree.
+
+# ── Real repos in this org, verified public ──
+github-workflows            # this repo, public
+.github                     # org meta repo, public
+comfy-cli                   # public (also on the org-wide PUBLIC_COMFY_ORG_REPOS list)
+comfy-desktop               # public (org-wide list: Comfy-Desktop)
+comfy-typescript-sdk        # public (org-wide list)
+comfyui                     # public (org-wide list: ComfyUI)
+comfyui_frontend            # public (org-wide list: ComfyUI_frontend)
+
+# ── Documented exceptions ──
+unreviewed-merges           # published by decision as the SOC-2 tracker destination — see README and docs/callers/detect-unreviewed-merge.md
+
+# ── CODEOWNERS team handles / package scopes (`@`-prefixed literals only) ──
+# Team handles are inherently public on a public repo: GitHub renders CODEOWNERS
+# owners to anyone who can see the repo. Mirrors PUBLIC_COMFY_ORG_TEAMS. These
+# are `@`-scoped so none of them also clears a bare repo reference.
+@core-engine-team           # team handle, org-wide PUBLIC_COMFY_ORG_TEAMS
+@backend                    # team handle in the agents-md-integrity suite's CODEOWNERS fixture — a team slug, not a repo
+@not-a-public-team          # fixture team handle in the public-repo-hygiene suite
+@core-engine                # ASCII prefix of the public-repo-hygiene suite's `core-engine<U+2010>team` fixture handle (see limitation 2)
+
+# ── Team handles that ALSO appear bare, as fixtures ──
+# The public-repo-hygiene suite writes these without the `@` on purpose, to
+# prove the bare path is checked against the repo LIST. The bare spelling is the
+# one that has to clear, so unlike the block above these two stay in the REPO
+# namespace — a KNOWN CROSSING of the `@`-split, named here so that split does
+# not read as complete. Residual: a private repo named exactly `comfy-cloud-team`
+# or `some-team` would clear on these lines. Neither name is a repository in
+# this org.
+#
+# They are safe to publish for different reasons, so they are not "both
+# invented": `comfy-cloud-team` is a REAL org team, already on the org-wide
+# PUBLIC_COMFY_ORG_TEAMS list (a team handle is inherently public on a public
+# repo — GitHub renders CODEOWNERS owners to anyone who can see it), while
+# `some-team` is an invented fixture slug.
+comfy-cloud-team            # REAL org team, on the org-wide PUBLIC_COMFY_ORG_TEAMS list; also written bare in a public-repo-hygiene fixture
+some-team                   # INVENTED fixture team handle, also written bare in a public-repo-hygiene HF-route fixture
+
+# ── Documentation examples — no such repo exists ──
+github-workflows-tools      # doc example in the bump-callers docs
+github-workflows-actions    # doc example in the bump-callers docs
+example                     # generic doc/test placeholder
+foo                         # generic doc/test placeholder
+legit                       # bump-callers doc/test placeholder
+x                           # single-letter placeholder in the public-repo-hygiene docs
+notes                       # path-shaped example (`docs/v1.2/<org>/notes`) in the public-repo-hygiene docs
+ComfyUI.md                  # doc example: extension over-flag limitation (public-repo-hygiene README/docs/tests)
+ComfyUI.internal            # doc example: extension over-flag limitation (public-repo-hygiene README/docs/tests)
+
+# ── Hugging Face model/dataset namespaces, not GitHub repos ──
+# This org publishes weights under a Hugging Face namespace of the same name, so
+# these names have no GitHub existence at all. They are product content, not
+# references.
+#
+# Allowlist membership is GLOBAL, not per-host: these lines clear a
+# `github.com/<org>/<name>` reference just as they clear the model-host one that
+# justifies them. A KNOWN CROSSING, named here the way the team block above
+# names its own, so the host-specific rationale does not read as a host-specific
+# exception. Residual: if a private GitHub repo ever took one of these names,
+# the reference would ship without its own ratification step. None of them is a
+# repository in this org today. The doc-example and fixture blocks below carry
+# the same crossing for the same reason.
+qwen-image-edit_comfyui     # public HF model, quoted in the public-repo-hygiene docs/tests
+qwen-image_comfyui          # public HF model, quoted in the public-repo-hygiene tests
+ace_step_1.5_comfyui_files  # public HF model, quoted in the public-repo-hygiene tests
+stable-diffusion-v1-5-archive  # public HF model, quoted in the public-repo-hygiene tests
+a-model                     # HF-route fixture in the public-repo-hygiene tests
+a-dataset                   # HF-route fixture in the public-repo-hygiene tests
+some-model                  # HF-route fixture in the public-repo-hygiene tests
+some-demo                   # HF-route fixture in the public-repo-hygiene tests
+some-eval-set               # HF-route fixture in the public-repo-hygiene tests
+some-set-abc123             # HF-route fixture in the public-repo-hygiene tests
+
+# ── Test fixtures — invented names, no such repo ──
+# These are the fake "private" names the bump-callers and public-repo-hygiene
+# suites use to prove masking and default-deny. Enumerated rather than globbed
+# — and a `secret-*` line is now REJECTED outright, because pre-approving an
+# unbounded family on a default-deny list would let a real private repo whose
+# name began `secret-` ship without tripping the lint. A NEW fixture name needs
+# a line here, on purpose: that edit is where a reviewer confirms it is
+# invented.
+comfyui2                    # public-repo-hygiene fixture: invented near-miss of a real public name
+a.b.c                       # bump-callers fixture (dotted name shape)
+not-a-public-repo           # public-repo-hygiene fixture
+private                     # public-repo-hygiene fixture
+private-thing               # public-repo-hygiene fixture
+super-secret-repo           # public-repo-hygiene fixture
+some-internal-thing         # public-repo-hygiene fixture
+something-else              # public-repo-hygiene fixture
+definitely-not-public       # public-repo-hygiene fixture
+nope                        # public-repo-hygiene fixture
+nope-private                # public-repo-hygiene fixture
+whatever                    # public-repo-hygiene fixture
+some-private-repo           # public-repo-hygiene fixture
+other-private-repo          # public-repo-hygiene fixture
+github-workflows-ops        # public-repo-hygiene fixture
+bare-host-at-line-start     # public-repo-hygiene model-host anchor fixture
+host-case-and-port          # public-repo-hygiene model-host anchor fixture
+in-a-markdown-link          # public-repo-hygiene model-host anchor fixture
+in-angle-brackets           # public-repo-hygiene model-host anchor fixture
+in-double-quotes            # public-repo-hygiene model-host anchor fixture
+plain-http                  # public-repo-hygiene model-host anchor fixture
+protocol-relative           # public-repo-hygiene model-host anchor fixture
+title-case-route            # public-repo-hygiene model-host route fixture
+upper-case-route            # public-repo-hygiene model-host route fixture
+secret-a                    # fixture: bump-callers / public-repo-hygiene
+secret-alpha                # fixture: bump-callers / public-repo-hygiene
+secret-anchor               # fixture: bump-callers / public-repo-hygiene
+secret-b                    # fixture: bump-callers / public-repo-hygiene
+secret-bad                  # fixture: bump-callers / public-repo-hygiene
+secret-beta                 # fixture: bump-callers / public-repo-hygiene
+secret-both                 # fixture: bump-callers / public-repo-hygiene
+secret-branch               # fixture: bump-callers / public-repo-hygiene
+secret-c                    # fixture: bump-callers / public-repo-hygiene
+secret-case                 # fixture: bump-callers / public-repo-hygiene
+secret-coloc                # fixture: bump-callers / public-repo-hygiene
+secret-conv                 # fixture: bump-callers / public-repo-hygiene
+secret-converged            # fixture: bump-callers / public-repo-hygiene
+secret-converted            # fixture: bump-callers / public-repo-hygiene
+secret-deriskonly           # fixture: bump-callers / public-repo-hygiene
+secret-dup                  # fixture: bump-callers / public-repo-hygiene
+secret-dupnopin             # fixture: bump-callers / public-repo-hygiene
+secret-emptyref             # fixture: bump-callers / public-repo-hygiene
+secret-expr                 # fixture: bump-callers / public-repo-hygiene
+secret-floating             # fixture: bump-callers / public-repo-hygiene
+secret-flow                 # fixture: bump-callers / public-repo-hygiene
+secret-gamma                # fixture: bump-callers / public-repo-hygiene
+secret-good                 # fixture: bump-callers / public-repo-hygiene
+secret-groomed              # fixture: bump-callers / public-repo-hygiene
+secret-half                 # fixture: bump-callers / public-repo-hygiene
+secret-hashref              # fixture: bump-callers / public-repo-hygiene
+secret-lbl                  # fixture: bump-callers / public-repo-hygiene
+secret-legacy               # fixture: bump-callers / public-repo-hygiene
+secret-longkey              # fixture: bump-callers / public-repo-hygiene
+secret-lowercase            # fixture: bump-callers / public-repo-hygiene
+secret-mention              # fixture: bump-callers / public-repo-hygiene
+secret-mono                 # fixture: bump-callers / public-repo-hygiene
+secret-multi                # fixture: bump-callers / public-repo-hygiene
+secret-nopin                # fixture: bump-callers / public-repo-hygiene
+secret-nopin-two            # fixture: bump-callers / public-repo-hygiene
+secret-noscript             # fixture: bump-callers / public-repo-hygiene
+secret-notuses              # fixture: bump-callers / public-repo-hygiene
+secret-ok                   # fixture: bump-callers / public-repo-hygiene
+secret-one                  # fixture: bump-callers / public-repo-hygiene
+secret-pinned               # fixture: bump-callers / public-repo-hygiene
+secret-pkg                  # fixture: bump-callers / public-repo-hygiene
+secret-prose                # fixture: bump-callers / public-repo-hygiene
+secret-quoted               # fixture: bump-callers / public-repo-hygiene
+secret-riskonly             # fixture: bump-callers / public-repo-hygiene
+secret-shortref             # fixture: bump-callers / public-repo-hygiene
+secret-sibling              # fixture: bump-callers / public-repo-hygiene
+secret-sibref               # fixture: bump-callers / public-repo-hygiene
+secret-squad                # fixture: bump-callers / public-repo-hygiene
+secret-tagref               # fixture: bump-callers / public-repo-hygiene
+secret-three                # fixture: bump-callers / public-repo-hygiene
+secret-two                  # fixture: bump-callers / public-repo-hygiene
+secret-unwired              # fixture: bump-callers / public-repo-hygiene
+secret-wdup                 # fixture: bump-callers / public-repo-hygiene
+secret-wired                # fixture: bump-callers / public-repo-hygiene
+secret-wref                 # fixture: bump-callers / public-repo-hygiene
+secret-wrongfleet           # fixture: bump-callers / public-repo-hygiene
+secret_a.b-c                # fixture: bump-callers / public-repo-hygiene
+
+# ── ASCII prefixes of the public-repo-hygiene suite's homoglyph fixtures ──
+# That suite deliberately commits names whose tail is non-ASCII, to prove its
+# own homoglyph handling. This lint's name class is ASCII (limitation 2 in
+# check-org-repo-literals.sh), so it reads only the prefix. Each of these is
+# the prefix of an INVENTED fixture name, not of a real repo.
+comfy-type                  # prefix of the `comfy-type<U+017F>cript-sdk` fixture
+mod                         # prefix of the `mod<U+2010>el` HF-route fixture
