@@ -35,7 +35,10 @@ class TestBuilderBounds(unittest.TestCase):
         self.assertIn('.status == "bail"', builder_step)
         self.assertIn('test -z "$(git status --short)"', builder_step)
         self.assertIn("preserving the clean bail-out for issue filing", builder_step)
-        self.assertIn("STATUS=0", builder_step)
+        self.assertRegex(
+            builder_step,
+            r'(?s)preserving the clean bail-out for issue filing\."\n\s+STATUS=0\n\s+else',
+        )
 
 
 if __name__ == "__main__":
