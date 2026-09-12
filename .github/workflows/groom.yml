@@ -2686,7 +2686,21 @@ jobs:
           # bank a half-finished (or empty) patch as a legitimate result.
           # `fail-fast: false` keeps the other findings building.
           if [ "$STATUS" -ne 0 ]; then
-            echo "::error::claude exited $STATUS — see the groom-builder-exec-$IDX artifact."
+            # A ceiling can land just after the builder completed a clean bail-out.
+            # Preserve that bounded handoff so build_pr can file the verified finding
+            # as an issue. Never preserve `patched` here: a non-zero exit can leave a
+            # half-written patch, and the normal successful path must validate it.
+            if [ -s "$BUILDER_OUT" ] && jq -e '
+              type == "object"
+              and .status == "bail"
+              and (.summary | type == "string" and length > 0)
+            ' "$BUILDER_OUT" >/dev/null 2>&1 \
+              && test -z "$(git status --short)"; then
+              echo "::warning::claude exited $STATUS after producing a complete control file; preserving the clean bail-out for issue filing."
+              STATUS=0
+            else
+              echo "::error::claude exited $STATUS — see the groom-builder-exec-$IDX artifact."
+            fi
           fi
           exit "$STATUS"
 
