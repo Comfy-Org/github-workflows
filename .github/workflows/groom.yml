@@ -1380,9 +1380,10 @@ jobs:
           # auto-discovery (and hooks/plugins/keychain); auth stays on the
           # ANTHROPIC_API_KEY set above, the only credential this step has (--bare
           # never reads OAuth/keychain, so a missing key fails loudly, not silently).
-          # Two independent ceilings bound a runaway finder: 100 turns and $8.
-          # The brief reserves both turn and dollar margin for producing the result
-          # rather than treating broad coverage or a finding minimum as completion.
+          # Two independent ceilings bound a runaway finder: 150 turns and $8.
+          # Healthy whole-repo finder runs have measured about 82 turns, so 150
+          # retains enough headroom for denied calls and synthesis while the brief's
+          # separately countable 60-inspection-call limit drives early completion.
           # The dollar ceiling is intentionally separate: turn cost varies with
           # context size, so a turn cap alone is not a reliable spend boundary.
           # `git grep` is deliberately NOT allowlisted: `--open-files-in-pager=<cmd>`
@@ -1426,7 +1427,7 @@ jobs:
             GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*' \
           claude -p "$PROMPT" \
             --model "$MODEL" \
-            --max-turns 100 \
+            --max-turns 150 \
             --max-budget-usd 8 \
             --allowedTools "Read,Glob,Grep,Edit(//${FINDER_OUT#/}),Bash(git log:*),Bash(git show:*),Bash(grep:*),Bash(cat:*),Bash(ls:*),Bash(head:*),Bash(tail:*),Bash(wc:*)" \
             --bare \
@@ -1445,12 +1446,22 @@ jobs:
             echo "::error::finder output contains ANTHROPIC_API_KEY — refusing to publish (possible prompt-injection exfil)."
             rm -f "$FINDER_OUT"; STATUS=1
           fi
-          # Do NOT swallow a non-zero exit: a rate-limit/network/turn-exhaustion
-          # failure must fail the job loudly. Swallowing it made the run green and
-          # silently discarded the finder's real candidates. The diagnostics upload
-          # below is `if: always()` so it still survives this failure.
+          # Preserve a complete handoff even if the CLI exits non-zero after writing
+          # it (for example, if a ceiling lands after the final Edit). The independent
+          # verifier still checks every candidate. A missing/incomplete handoff keeps
+          # the CLI failure loud, and the diagnostics upload below survives either
+          # path via `if: always()`.
           if [ "$STATUS" -ne 0 ]; then
-            echo "::error::claude exited $STATUS — see the groom-finder-exec artifact for subtype/num_turns."
+            if [ -s "$FINDER_OUT" ] && jq -e '
+              type == "object"
+              and (.findings | type == "array")
+              and (.stop_reason | IN("inspection-complete", "inspection-call-limit"))
+            ' "$FINDER_OUT" >/dev/null 2>&1; then
+              echo "::warning::claude exited $STATUS after producing a complete finder handoff; preserving it for independent verification."
+              STATUS=0
+            else
+              echo "::error::claude exited $STATUS without a complete finder handoff — see the groom-finder-exec artifact for subtype/num_turns."
+            fi
           fi
           exit "$STATUS"
 
@@ -1545,6 +1556,14 @@ jobs:
             echo "::error::Finder did not produce valid JSON at $FINDER_OUT."
             exit 1
           fi
+          if ! jq -e '
+            type == "object"
+            and (.findings | type == "array")
+            and (.stop_reason | IN("inspection-complete", "inspection-call-limit"))
+          ' "$FINDER_OUT" >/dev/null; then
+            echo "::error::Finder output is missing a valid findings array or stop_reason."
+            exit 1
+          fi
           # ENFORCE the path scope (BE-4757). The brief ASKS the finder to stay in
           # the directory; this is what makes it true. Runs on the finder output
           # because that is where the evidence `sites` live, and filtering here
@@ -1562,6 +1581,9 @@ jobs:
           fi
           COUNT=$(jq '.findings | length' "$FINDER_OUT")
           echo "Finder candidates: $COUNT"
+          if [ "$COUNT" -eq 0 ] && [ "$(jq -r '.stop_reason' "$FINDER_OUT")" = "inspection-call-limit" ]; then
+            echo "::warning::Finder reached its inspection-call limit with zero findings; this was a bounded run, not a clean-repository claim."
+          fi
           if [ "$COUNT" -gt 0 ]; then
             echo "have_candidates=true" >> "$GITHUB_OUTPUT"
           else
