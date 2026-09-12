@@ -24,6 +24,25 @@ read) every finding is sent inline, as before.
 Falls back to a body-only review (no inline anchors) if GitHub rejects the
 inline payload anyway — the API is all-or-nothing, so one bad position costs
 every anchor in the request.
+
+A judge `repeat_of` is checked on TWO independent layers, and neither is the
+other's backstop. Here — the WRITER — it must have the right SHAPE (one anchored
+GitHub discussion permalink under `REPEAT_URL_MAX_CHARS`, nothing else) and, given
+`--ledger`, it must also be a MEMBER of the set of thread URLs carried by the very
+ledger the judge prompt was rendered from: `discussion_url` on an anchored entry,
+plus the `repeat_of` lineage of a demoted re-raise entry (what its `re_raise_of:`
+line shows). A URL failing either check is dropped WHOLE — it travels neither as
+the rendered trailer nor as the body-only sentinel field — but the judge's
+DECLARATION that the finding is a re-raise still costs its `REPEAT_CAP` slot, so a
+rejected link cannot be a cheaper way to re-litigate than an honest one. On the
+READER, build-ledger.py's `_resolve_lineage` separately resolves the trailing
+comment id against this PR's own consolidated-review roots. Membership deliberately
+catches only what resolution cannot: an id that is resolvable but was never SHOWN
+(aged past the round cap, dropped by the byte cap, or never rendered). Without
+`--ledger`, or with one that cannot be read, this degrades to shape-only and the
+reader's half still holds. `--no-judge-ledger` is the third state: the JUDGE's own
+download failed, so its prompt carried an EMPTY ledger block and the shown set is
+empty — this job's copy of ledger.json is not what the judge saw.
 """
 
 import argparse
@@ -1823,7 +1842,9 @@ def build_panel_summary(panel: list[dict]) -> str:
     return "\n\n".join(parts)
 
 
-def normalize_comments(findings: list[dict]) -> list[dict]:
+def normalize_comments(
+    findings: list[dict], shown_repeat_urls: frozenset[str] | None = None
+) -> list[dict]:
     """Build sorted, severity-tagged inline comments from raw judge findings.
 
     Returns a list of {"severity": str, "comment": dict} entries sorted most
@@ -1831,6 +1852,9 @@ def normalize_comments(findings: list[dict]) -> list[dict]:
     (path/line/side/body) with the severity badge prefixed into the body;
     severity is kept alongside (not inside) so the summary table can count it
     without leaking an unknown key into the GitHub API request.
+
+    `shown_repeat_urls` is threaded straight to repeat_url_of; None (the default,
+    which keeps every existing caller unchanged) means shape-only.
     """
     enriched = []
     for finding in findings:
@@ -1852,10 +1876,23 @@ def normalize_comments(findings: list[dict]) -> list[dict]:
             continue
         severity = normalize_severity(finding.get("severity"))
         badge = f"{SEVERITY_EMOJI[severity]} **{SEVERITY_LABEL[severity]}** — "
-        repeat_line = render_repeat_of(finding)
+        # ONE repeat_url_of call decides both lineage fields below, so a URL the
+        # ledger never showed the judge produces neither the trailer nor the
+        # sentinel key — and therefore consumes no REPEAT_CAP slot either.
+        claimed = finding.get("repeat_of")
+        declared_repeat = isinstance(claimed, str) and bool(claimed.strip())
+        repeat_url = repeat_url_of(finding, shown_repeat_urls)
+        repeat_line = render_repeat_trailer(finding, repeat_url)
         enriched.append(
             {
                 "severity": severity,
+                # The judge DECLARED a re-raise and only its URL was refused — wrong
+                # shape, or naming no entry the ledger showed it. The declaration still
+                # costs a REPEAT_CAP slot (see enforce_repeat_cap): counting only the
+                # rendered trailer would make a URL we reject strictly CHEAPER than an
+                # honest one, so a judge could turn a whole round into uncapped
+                # re-litigation just by citing links the guard drops.
+                "repeat_dropped": declared_repeat and not repeat_url,
                 # Truthy only for a re-raise of an already-answered finding —
                 # what enforce_repeat_cap counts against REPEAT_CAP.
                 "repeat_of": repeat_line,
@@ -1869,7 +1906,7 @@ def normalize_comments(findings: list[dict]) -> list[dict]:
                 # in. Kept beside `repeat_of` rather than replacing it so
                 # enforce_repeat_cap's count and strip_repeat_line's reconstruction are
                 # both untouched.
-                "repeat_url": repeat_url_of(finding),
+                "repeat_url": repeat_url,
                 "comment": {
                     "path": path,
                     "line": line_int,
@@ -1890,21 +1927,127 @@ def normalize_comments(findings: list[dict]) -> list[dict]:
     return enriched
 
 
-def render_repeat_of(finding: dict) -> str:
-    """Render the re-raise line for a finding the judge marked as a repeat.
+def render_repeat_trailer(finding: dict, url: str) -> str:
+    """The trailer for an ALREADY-resolved url, so one call decides both fields.
 
-    `repeat_of` is the prior round's `discussion_url` from the ledger. Showing
-    it inline is the whole point of the repeat policy: a re-raise happens on the
-    record, linked to the thread that already answered it, so the author can see
-    at a glance that this is round N of the same conversation.
+    The SINGLE entry point for rendering the re-raise line. A `render_repeat_of` that
+    took the finding and resolved the URL itself lived here until BE-12630 removed it:
+    it had no callers left, and reintroducing one would restore exactly the two-call
+    shape this signature exists to forbid — a second repeat_url_of over the same
+    finding, logging the membership drop twice and free to disagree with the
+    `repeat_url` normalize_comments stored beside the trailer.
+
+    normalize_comments stores the rendered trailer and the raw URL side by side and
+    they must never disagree — a trailer whose URL was dropped would spend a
+    REPEAT_CAP slot on lineage the sentinel does not carry, and would put a live
+    thread URL back into the prose. Calling repeat_url_of twice would also log the
+    membership drop twice.
     """
-    url = repeat_url_of(finding)
     if not url:
         return ""
     return f"\n\n↩︎ re-raise of {url}{render_repeat_round(finding)}"
 
 
-def repeat_url_of(finding: dict) -> str:
+def warn_membership_guard_off() -> None:
+    """Annotate the run when the membership layer turns itself OFF.
+
+    Every ledger download is continue-on-error, so a transient artifact failure
+    silently degrades this guard to shape-only and an UNPROTECTED run is otherwise
+    indistinguishable from a protected one — a stderr line nobody opens the log for.
+    A `::warning::` puts it on the run summary next to the checks.
+
+    The text is a fixed literal: no path, no exception string, nothing relayed. This
+    line is parsed as a workflow command when it starts one, so nothing that could
+    carry a newline may be interpolated into it. The detail stays on stderr.
+    """
+    print(
+        "::warning::cursor-review: the prior-review ledger could not be read on the "
+        "posting side, so a judge repeat_of is shape-checked only for this run "
+        "(membership against the ledger the judge was shown is OFF).",
+        flush=True,
+    )
+
+
+def load_shown_repeat_urls(path) -> frozenset[str] | None:
+    """Every thread URL the ledger at `path` showed the judge — or None.
+
+    None means "do not check membership": no path given, or the file is missing,
+    unreadable, not JSON, not an object, or carries no `entries` list. That is a
+    DEGRADATION to the shape-only behaviour this had before, and it is the only
+    correct answer — a guard that cannot read its input must not report an empty
+    set, which here would drop every `repeat_of` in the run.
+
+    An EMPTY frozenset is a real answer and is NOT that case. `empty` / `disabled`
+    / `unknown` ledgers all carry `entries: []`, and prompt-judge.md permits
+    `repeat_of` only when a PRIOR REVIEW LEDGER block appears ("Emit those two
+    fields on no other finding"), so on such a run the judge was shown no thread
+    at all and every `repeat_of` it emits is unfounded.
+
+    One key per entry, chosen by the SAME gates build-ledger.py renders behind, so
+    the set is what was displayed rather than what the file holds. An anchored entry
+    renders its own `discussion_url:` and never carries lineage of its own. A DEMOTED
+    re-raise has no thread and renders `re_raise_of: <ancestor>` instead, out of the
+    entry's `repeat_of` key (BE-12534) — a resolved ancestor permalink the judge is
+    told to carry forward, so it is legitimately shown even though no entry calls it
+    a `discussion_url`. A ledger whose `status` is not `ok` renders an EMPTY block, so
+    it shows nothing at all.
+
+    Never raises: it runs on the posting path, where an exception would cost the
+    whole review over a file this deliberately treats as optional.
+    """
+    if not path:
+        print(
+            "No --ledger path given: judge repeat_of URLs are shape-checked only.",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    # JSONDecodeError and UnicodeDecodeError are both ValueError; RecursionError is
+    # the one non-ValueError json.load raises on input it cannot parse (deep nesting)
+    # and is caught by name rather than by a bare `except`, which would also swallow
+    # a KeyboardInterrupt or a genuine bug in this module.
+    except (OSError, ValueError, RecursionError) as e:
+        print(
+            f"Could not read the ledger at {path} ({e}): judge repeat_of URLs are "
+            "shape-checked only.",
+            file=sys.stderr,
+        )
+        warn_membership_guard_off()
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
+        print(
+            f"Ledger at {path} has no `entries` list: judge repeat_of URLs are "
+            "shape-checked only.",
+            file=sys.stderr,
+        )
+        warn_membership_guard_off()
+        return None
+    # build-ledger.py renders an EMPTY block for any non-ok status, so the judge was
+    # shown no thread at all and every repeat_of on such a run is unfounded. Latent
+    # while `unknown` / `empty` / `disabled` all hard-code `entries: []`, but mirrored
+    # explicitly so the shown set stays equal to what was RENDERED rather than to what
+    # the file happens to hold, which is what this function's contract claims.
+    if data.get("status") != "ok":
+        return frozenset()
+    shown = set()
+    for entry in data["entries"]:
+        if not isinstance(entry, dict):
+            continue
+        # The same gate the renderer applies (build-ledger.py: `discussion_url:` only
+        # when anchored, `re_raise_of:` only when not). An anchored entry has a thread
+        # of its own and never carries a `repeat_of` key; reading one anyway would put
+        # a URL in the shown set that no line of the prompt ever displayed.
+        keys = ("discussion_url",) if entry.get("anchored", True) else ("repeat_of",)
+        for key in keys:
+            url = entry.get(key)
+            if isinstance(url, str) and url.strip():
+                shown.add(url.strip())
+    return frozenset(shown)
+
+
+def repeat_url_of(finding: dict, shown_repeat_urls: frozenset[str] | None = None) -> str:
     """The judge's `repeat_of` URL, neutralized and stripped — or `""`.
 
     Split out of render_repeat_of (BE-12534) so the RENDERED trailer and the RAW url
@@ -1915,11 +2058,54 @@ def repeat_url_of(finding: dict) -> str:
     The ROUND has no such twin: it stays in the trailer only, because the ledger reads
     a resolved ancestor's round off that ancestor's own review rather than off the
     payload, so carrying it structurally would cost sentinel bytes nothing reads.
+
+    Two checks, in order. SHAPE first (BE-12630): REPEAT_URL_RE plus
+    REPEAT_URL_MAX_CHARS, the same pair render_body_only_sentinel applies to the
+    structural field — applied here so the rendered TRAILER is bounded too, rather
+    than only the field, which is what let an arbitrary judge string reach a public
+    review body. Then MEMBERSHIP: `shown_repeat_urls` is the set of thread URLs the
+    ledger the judge was shown actually carried, or None to skip that half.
+    See load_shown_repeat_urls and the module docstring.
     """
     url = finding.get("repeat_of")
     if not isinstance(url, str) or not url.strip():
         return ""
-    return neutralize_mentions(url.strip())
+    url = url.strip()
+    # SHAPE, and on THIS path — not only in render_body_only_sentinel (BE-12630).
+    # Applying it there alone left the TRAILER, the prose a human reads, carrying
+    # whatever the judge wrote: an arbitrary string rendered after "re-raise of", of
+    # unbounded length (a long enough one 422s the entire inline payload), spending a
+    # REPEAT_CAP slot for lineage the sentinel then refused to carry — the exact
+    # trailer/sentinel disagreement render_repeat_trailer exists to prevent. Both
+    # halves now live here, so the module docstring's "degrades to shape-only" is
+    # true of the trailer as well as of the sentinel field.
+    #
+    # fullmatch for the same reason the sentinel uses it: `$` also matches just BEFORE
+    # a trailing newline, and that newline would land at column 0 of the next round's
+    # prompt.
+    if len(url) > REPEAT_URL_MAX_CHARS or not REPEAT_URL_RE.fullmatch(url):
+        # Truncated and !r for the same reason as the membership drop below.
+        print(f"Dropping malformed repeat_of: {url[:200]!r}", file=sys.stderr)
+        return ""
+    # Membership in the ledger the judge was actually shown (see the module
+    # docstring). `shown_repeat_urls is None` — not falsy — is what distinguishes
+    # "not checked" from an EMPTY shown set, which legitimately drops everything.
+    #
+    # Compared BEFORE neutralize_mentions: the set holds raw GitHub permalinks as
+    # build-ledger.py wrote them, and while neutralize_mentions cannot alter a URL
+    # of the allowed shape (it has no `@`), comparing the pre-neutralize string
+    # makes that independence a property of this function rather than of the
+    # regex someone loosens next.
+    if shown_repeat_urls is not None and url not in shown_repeat_urls:
+        # !r, not the bare string: this is relayed model text going to a step log
+        # that GitHub parses for `::workflow-command::` lines and that is world-
+        # readable on a public repo, so a newline in it must not start a line.
+        print(
+            f"Dropping repeat_of not in the ledger the judge was shown: {url!r}",
+            file=sys.stderr,
+        )
+        return ""
+    return neutralize_mentions(url)
 
 
 def coerce_repeat_round(finding: dict):
@@ -1980,7 +2166,12 @@ def enforce_repeat_cap(enriched: list[dict], cap: int = REPEAT_CAP) -> tuple[lis
     kept, dropped = [], 0
     repeats = 0
     for item in enriched:
-        if item.get("repeat_of"):
+        # `repeat_dropped` counts too: the judge declared a re-raise and only the URL
+        # was refused (malformed, or naming no entry it was shown), so the declaration
+        # spends the budget exactly as an honest one does. Counting the rendered
+        # trailer alone would leave a round of five fabricated-lineage re-raises
+        # entirely uncapped — cheaper than five real ones.
+        if item.get("repeat_of") or item.get("repeat_dropped"):
             if repeats >= cap:
                 dropped += 1
                 continue
@@ -2087,6 +2278,24 @@ def main():
         help="Banner prepended to the review body (e.g. a judge-failed degradation note).",
     )
     parser.add_argument(
+        "--ledger",
+        default=None,
+        help=(
+            "Path to the ledger job's ledger.json — the post-cap entry list the judge "
+            "prompt was rendered from. Used to drop a judge `repeat_of` naming a thread "
+            "the judge was not shown. Missing or unreadable degrades to shape-only."
+        ),
+    )
+    parser.add_argument(
+        "--no-judge-ledger",
+        action="store_true",
+        help=(
+            "The JUDGE's ledger download failed, so its prompt was spliced an empty "
+            "ledger block. The shown set is then empty regardless of --ledger: this "
+            "job's own copy of ledger.json is not what the judge saw."
+        ),
+    )
+    parser.add_argument(
         "--ledger-note",
         default=None,
         help=(
@@ -2170,7 +2379,24 @@ def main():
             raise SystemExit(1)
         return
 
-    enriched = normalize_comments(findings)
+    # Read once, here rather than at the top of main(): the error-review and
+    # no-findings paths return before this and adjudicate no repeat_of at all.
+    if args.no_judge_ledger:
+        # The two downloads fail independently, and only the JUDGE's decides what the
+        # judge was shown. When the judge's failed its prompt carried an EMPTY ledger
+        # block, so the shown set is empty — NOT None, and not this job's own copy of
+        # ledger.json, whose contents the judge never saw. Reading that copy here would
+        # make "the very ledger the judge prompt was rendered from" false on exactly
+        # the degraded run the header already banners.
+        print(
+            "The judge's ledger download failed: its prompt carried an empty ledger "
+            "block, so every judge repeat_of is unfounded and is dropped.",
+            file=sys.stderr,
+        )
+        shown_repeat_urls = frozenset()
+    else:
+        shown_repeat_urls = load_shown_repeat_urls(args.ledger)
+    enriched = normalize_comments(findings, shown_repeat_urls)
     enriched, repeats_dropped = enforce_repeat_cap(enriched)
     # Anchor-aware split. The COUNT below stays the total across both halves — a finding
     # that lands in the body is still a finding, and a headline that shrank because an
@@ -2190,8 +2416,12 @@ def main():
     review_head = f"{header}\n\nFound **{len(enriched)}** finding(s)."
     if repeats_dropped:
         review_head += (
-            f"\n\n_{repeats_dropped} re-raise(s) of already-answered findings were dropped "
-            f"(cap: {REPEAT_CAP} per review). They are still open on their original threads._"
+            # "the judge declared", not "of already-answered findings": the cap now
+            # also counts a declaration whose URL was refused, and such a finding has no
+            # original thread to still be open on.
+            f"\n\n_{repeats_dropped} re-raise(s) the judge declared were dropped "
+            f"(cap: {REPEAT_CAP} per review). Any earlier thread they repeat is "
+            f"still open._"
         )
     severity_summary = build_severity_summary(enriched)
     if severity_summary:
