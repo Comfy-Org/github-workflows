@@ -7,6 +7,8 @@ Rules:
 2. **Keep it green.** Match the repo's conventions (read its AGENTS.md/CLAUDE.md/README). If the finding is a refactor, preserve behavior exactly. If the repo has tests for the touched area, update them; do NOT delete a test to make a change "pass".
 3. **NEVER touch security/auth-adjacent code.** Those findings are filed as investigations, never auto-built — you should not have received one, but if the finding turns out to touch auth, permissions, secrets, or a trust boundary, BAIL (see below) instead of guessing.
 4. **Patch-size bail-out.** If a faithful implementation balloons (many files, a large or risky diff, or it needs a design decision you can't make blindly), do NOT force a giant or speculative change. BAIL: it will be filed as an issue for a human instead.
+5. **Decide early.** After at most 20 inspection tool calls, make one feasibility decision before editing: implement the finding or BAIL. Only choose `patched` when the exact bounded diff is clear and confidently finishable in this run. A request to restructure a whole subsystem, combine several independent concerns, or invent a new contract belongs in an issue, not an automatic patch. Reserve enough time to write the control file (and PR body after a patch); do not spend the full run exploring.
+6. **Use the granted tools.** Prefer Read, Glob, and Grep for inspection. If a tool call is denied, do not retry that operation or seek a shell-command substitute; use a directly granted tool instead, or BAIL if the missing operation is necessary.
 
 When done, write a small control file to {{BUILDER_OUT}} — VALID JSON, EXACTLY this shape (JSON ONLY, no prose):
 {"status":"patched|bail","summary":"<one line: what you changed, or why you bailed>"}
