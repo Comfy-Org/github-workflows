@@ -313,6 +313,40 @@ class ChangedFilesLookup(unittest.TestCase):
         with self.assertRaises(validate.ChangedFilesUnavailable):
             gh.changed_files(17)
 
+    def test_short_list_against_the_declared_count_raises(self):
+        # THE dangerous direction: the dropped entry is exactly the non-exempt path, so every
+        # survivor matches and a partial read would publish a waiver.
+        gh = self.github([{"filename": "c/a.yaml"}, {"filename": "c/b.yaml"}])
+        with self.assertRaises(validate.ChangedFilesUnavailable):
+            gh.changed_files(17, declared_count=3)
+
+    def test_surplus_list_against_the_declared_count_raises(self):
+        gh = self.github([{"filename": "c/a.yaml"}, {"filename": "c/b.yaml"}])
+        with self.assertRaises(validate.ChangedFilesUnavailable):
+            gh.changed_files(17, declared_count=1)
+
+    def test_matching_declared_count_is_accepted(self):
+        # A rename yields two paths from one entry, so the count is compared against ENTRIES,
+        # never against the expanded path list.
+        gh = self.github([{"filename": "c/a.yaml", "previous_filename": "old/a.yaml"}])
+        self.assertEqual(gh.changed_files(17, declared_count=1), ["c/a.yaml", "old/a.yaml"])
+
+    def test_non_object_entry_raises_rather_than_attributeerror(self):
+        gh = self.github([{"filename": "c/a.yaml"}, "c/b.yaml"])
+        with self.assertRaises(validate.ChangedFilesUnavailable):
+            gh.changed_files(17)
+
+    def test_non_string_filename_raises_before_it_reaches_the_matcher(self):
+        # lib.path_matches_any calls re.fullmatch(), which raises TypeError on a non-string.
+        gh = self.github([{"filename": 17}])
+        with self.assertRaises(validate.ChangedFilesUnavailable):
+            gh.changed_files(17)
+
+    def test_non_string_previous_filename_raises(self):
+        gh = self.github([{"filename": "c/a.yaml", "previous_filename": ["old/a.yaml"]}])
+        with self.assertRaises(validate.ChangedFilesUnavailable):
+            gh.changed_files(17)
+
 
 class MalformedExemptPathsInput(unittest.TestCase):
     """A malformed `exempt-paths` fails the RUN, the way a malformed `team-keys` does."""
@@ -320,8 +354,12 @@ class MalformedExemptPathsInput(unittest.TestCase):
     def test_main_rejects_a_malformed_list_before_touching_the_event(self):
         with tempfile.TemporaryDirectory() as tmp:
             event_path = os.path.join(tmp, "event.json")
+            # DELIBERATELY unparseable: this test's claim is that `exempt-paths` is validated
+            # BEFORE the event is read, and a well-formed fixture cannot tell the two orders
+            # apart. If main() ever parses the event first, json.load raises here and the test
+            # fails loudly instead of passing on a coincidence.
             with open(event_path, "w", encoding="utf-8") as handle:
-                json.dump({"workflow_run": {}}, handle)
+                handle.write("{ this is not json")
             env = {
                 "GH_REPO": "Comfy-Org/example",
                 "GITHUB_EVENT_PATH": event_path,

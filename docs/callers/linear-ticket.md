@@ -185,9 +185,11 @@ Three more properties worth knowing before you set it:
 
 - **It short-circuits before Linear is queried.** An exempt PR spends no Linear API budget and
   passes even while Linear is unreachable — same as `exempt-label` and `exempt-actors`.
-- **It costs one extra GitHub API call**, `GET /repos/{owner}/{repo}/pulls/{number}/files`,
-  paginated at 100 per page. That is GitHub-owned metadata, not PR content — nothing is checked
-  out, and the filenames it returns are treated as untrusted data and only pattern-matched. The
+- **It costs one extra GitHub API lookup**, `GET /repos/{owner}/{repo}/pulls/{number}/files` —
+  paginated at 100 files per page, so it is *one request per page*, not one request for the
+  whole list (a 250-file PR costs 3 requests; an accepted PR just under the 3000-file cap costs
+  30). That is GitHub-owned metadata, not PR content — nothing is checked out, and the
+  filenames it returns are treated as untrusted data and only pattern-matched. The
   `pull-requests: write` you already grant covers it; no new permission is needed.
 - **It fails closed when the file list cannot be trusted.** That endpoint caps at **3000 files**
   and truncates *silently*, so a PR at or past the cap — or any failed/malformed read — reports

@@ -206,9 +206,13 @@ class GitHub:
         ever reach ``lib.all_paths_exempt`` and a log line.
 
         Paginated at 100/page. Raises ChangedFilesUnavailable — never returns a partial list —
-        when the request fails, when an entry carries no filename, or when the list is at or
-        past ``CHANGED_FILES_CAP``. ``declared_count`` is the PR payload's own ``changed_files``
-        field, checked FIRST because it is the only authoritative count of a truncated read.
+        when the request fails, when the list is at or past ``CHANGED_FILES_CAP``, when its
+        length disagrees with ``declared_count``, or when any entry is not an object carrying a
+        non-empty string ``filename`` (and a string ``previous_filename`` if present).
+        ``declared_count`` is the PR payload's own ``changed_files`` field, checked FIRST
+        because it is the only authoritative count of a truncated read — and checked AGAIN
+        against the returned length, because a list that is merely short is indistinguishable
+        from a complete one once the non-exempt path is the entry that went missing.
 
         A rename contributes BOTH its new ``filename`` and its ``previous_filename``: renaming
         a Go file into an exempt config directory is still a change to that Go file, and the
@@ -231,14 +235,39 @@ class GitHub:
             raise ChangedFilesUnavailable(
                 f"the changed-files API returned {len(data)} entries, at or past its "
                 f"{CHANGED_FILES_CAP}-file ceiling, so the list may be truncated")
+        # The two counts must agree exactly. A SHORT list is the dangerous direction: drop the
+        # one non-exempt path and every survivor can match, turning a partial read into a
+        # published waiver. A SURPLUS list means the payload is not the thing we asked for, so
+        # it is refused too rather than pattern-matched. Disagreement is only expected when the
+        # head moved between the two reads, and `_guard_supersession` already suppresses a
+        # superseded run's terminal write — so failing closed here costs a re-run, never a gate.
+        if isinstance(declared_count, int) and len(data) != declared_count:
+            raise ChangedFilesUnavailable(
+                f"the PR reports {declared_count} changed files but the changed-files API "
+                f"returned {len(data)} entries; the list does not match the PR")
         paths: list[str] = []
         for entry in data:
-            filename = (entry or {}).get("filename")
+            # Not `(entry or {})`: a truthy non-dict entry would raise AttributeError straight
+            # out of this privileged job, escaping the ChangedFilesUnavailable contract that
+            # `_check_path_exemption` fails closed on. Same reason the paths are type-checked —
+            # a non-string reaches `lib.path_matches_any`'s `.fullmatch()` and raises TypeError.
+            if not isinstance(entry, dict):
+                raise ChangedFilesUnavailable(
+                    "a changed-file entry was not an object; the response is malformed")
+            filename = entry.get("filename")
             if not filename:
                 raise ChangedFilesUnavailable(
                     "a changed-file entry carried no filename; the response is malformed")
+            if not isinstance(filename, str):
+                raise ChangedFilesUnavailable(
+                    "a changed-file entry carried a non-string filename; the response is "
+                    "malformed")
             paths.append(filename)
-            previous = (entry or {}).get("previous_filename")
+            previous = entry.get("previous_filename")
+            if previous and not isinstance(previous, str):
+                raise ChangedFilesUnavailable(
+                    "a changed-file entry carried a non-string previous_filename; the "
+                    "response is malformed")
             if previous:
                 paths.append(previous)
         return paths

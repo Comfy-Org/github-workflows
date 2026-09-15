@@ -55,7 +55,10 @@ pending forever.
   buy the exemption.
 - That endpoint caps at **3000 files and truncates silently**, so a read at or past the cap —
   or a failed/malformed one — raises `ChangedFilesUnavailable` and fails the check closed as
-  `changed_files_unavailable`, never as a partial list declared fully matched.
+  `changed_files_unavailable`, never as a partial list declared fully matched. "Malformed"
+  includes a length that **disagrees with the PR payload's own `changed_files` count** (a list
+  that is merely short reads exactly like a complete one once the dropped entry is the
+  non-exempt path) and any entry that is not an object carrying string paths.
 
 ## Security & failure model
 
