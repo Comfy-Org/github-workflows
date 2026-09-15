@@ -18,6 +18,9 @@ Contract (all via env, set by linear-ticket.yml):
     GITHUB_EVENT_PATH  workflow_run event payload
     TEAM_KEYS          raw ``team-keys`` input (comma-separated; empty = any team)
     EXEMPT_LABEL       exemption label name; empty disables exemption
+    EXEMPT_ACTORS      comma-separated exempt PR-author logins; empty disables exemption
+    EXEMPT_PATHS       comma-separated path patterns; a PR whose changed files ALL match is
+                       exempt. Empty (the default) disables the path exemption entirely
     REQUIRE_OPEN_ISSUE "true"/"false"
     ENFORCE            "true" (fail closed) / "false" (warn-only: a failing VERDICT never
                        exits nonzero; a broken run still can — see finish_fail and run())
@@ -48,6 +51,23 @@ import lib
 
 LINEAR_API_URL = os.environ.get("LINEAR_API_URL") or "https://api.linear.app/graphql"
 BACKOFF_SECONDS = (2, 4, 8, 16)  # between five attempts
+
+# GitHub's documented ceiling on GET /repos/{owner}/{repo}/pulls/{number}/files: the endpoint
+# returns at most 3000 files and TRUNCATES SILENTLY — no error, no flag on the response. That
+# silence is the hazard the path exemption has to defend against, because a truncated list can
+# consist entirely of matching config files while the 3001st changed file is Go.
+CHANGED_FILES_CAP = 3000
+
+
+class ChangedFilesUnavailable(Exception):
+    """The PR's changed-file list could not be read, or could not be trusted to be complete.
+
+    Raised only when a path exemption is configured, since that is the only time the list is
+    consulted. Always fails the check closed (``changed_files_unavailable``) rather than
+    falling through to the Linear query: the run cannot tell an exempt PR from a non-exempt
+    one, and guessing either way publishes a verdict it did not reach.
+    """
+
 
 ATTACHMENTS_QUERY = """query PullRequestAttachments($url: String!) {
   attachmentsForURL(url: $url, first: 20) {
@@ -177,6 +197,81 @@ class GitHub:
         if result.returncode != 0:
             warning(f"Failed to delete marker comment {existing}: {result.stderr.strip()}")
 
+    def changed_files(self, pr: int, declared_count: int | None = None) -> list[str]:
+        """Every changed path in the PR, as untrusted DATA to be MATCHED, never interpolated.
+
+        Paths are GitHub-owned metadata (they come from this endpoint, not from the PR branch),
+        so reading them is compatible with the fork-safety constraints in linear-ticket.yml's
+        header — but the filenames themselves are still author-controlled strings, so they only
+        ever reach ``lib.all_paths_exempt`` and a log line.
+
+        Paginated at 100/page. Raises ChangedFilesUnavailable — never returns a partial list —
+        when the request fails, when the list is at or past ``CHANGED_FILES_CAP``, when its
+        length disagrees with ``declared_count``, or when any entry is not an object carrying a
+        non-empty string ``filename`` (and a string ``previous_filename`` if present).
+        ``declared_count`` is the PR payload's own ``changed_files`` field, checked FIRST
+        because it is the only authoritative count of a truncated read — and checked AGAIN
+        against the returned length, because a list that is merely short is indistinguishable
+        from a complete one once the non-exempt path is the entry that went missing.
+
+        A rename contributes BOTH its new ``filename`` and its ``previous_filename``: renaming
+        a Go file into an exempt config directory is still a change to that Go file, and the
+        exemption must not be reachable by moving code across the pattern boundary.
+        """
+        # `>=`, not `>`: GitHub documents the 3000-file maximum but NOT what it does past it,
+        # so a PR sitting exactly at the ceiling is indistinguishable from a truncated one and
+        # is refused too. `isinstance` so a malformed payload degrades to the list-length guard
+        # below instead of raising TypeError out of a privileged job.
+        if isinstance(declared_count, int) and declared_count >= CHANGED_FILES_CAP:
+            raise ChangedFilesUnavailable(
+                f"the PR reports {declared_count} changed files, at or past GitHub's "
+                f"{CHANGED_FILES_CAP}-file ceiling for the changed-files API, which truncates "
+                "silently")
+        data = self.get(f"/repos/{self.repo}/pulls/{pr}/files?per_page=100", paginate=True)
+        if not isinstance(data, list):
+            raise ChangedFilesUnavailable(
+                "the changed-files API request failed or returned a non-list body")
+        if len(data) >= CHANGED_FILES_CAP:
+            raise ChangedFilesUnavailable(
+                f"the changed-files API returned {len(data)} entries, at or past its "
+                f"{CHANGED_FILES_CAP}-file ceiling, so the list may be truncated")
+        # The two counts must agree exactly. A SHORT list is the dangerous direction: drop the
+        # one non-exempt path and every survivor can match, turning a partial read into a
+        # published waiver. A SURPLUS list means the payload is not the thing we asked for, so
+        # it is refused too rather than pattern-matched. Disagreement is only expected when the
+        # head moved between the two reads, and `_guard_supersession` already suppresses a
+        # superseded run's terminal write — so failing closed here costs a re-run, never a gate.
+        if isinstance(declared_count, int) and len(data) != declared_count:
+            raise ChangedFilesUnavailable(
+                f"the PR reports {declared_count} changed files but the changed-files API "
+                f"returned {len(data)} entries; the list does not match the PR")
+        paths: list[str] = []
+        for entry in data:
+            # Not `(entry or {})`: a truthy non-dict entry would raise AttributeError straight
+            # out of this privileged job, escaping the ChangedFilesUnavailable contract that
+            # `_check_path_exemption` fails closed on. Same reason the paths are type-checked —
+            # a non-string reaches `lib.path_matches_any`'s `.fullmatch()` and raises TypeError.
+            if not isinstance(entry, dict):
+                raise ChangedFilesUnavailable(
+                    "a changed-file entry was not an object; the response is malformed")
+            filename = entry.get("filename")
+            if not filename:
+                raise ChangedFilesUnavailable(
+                    "a changed-file entry carried no filename; the response is malformed")
+            if not isinstance(filename, str):
+                raise ChangedFilesUnavailable(
+                    "a changed-file entry carried a non-string filename; the response is "
+                    "malformed")
+            paths.append(filename)
+            previous = entry.get("previous_filename")
+            if previous and not isinstance(previous, str):
+                raise ChangedFilesUnavailable(
+                    "a changed-file entry carried a non-string previous_filename; the "
+                    "response is malformed")
+            if previous:
+                paths.append(previous)
+        return paths
+
     def current_pr_target(self, pr: int) -> tuple[str | None, str | None]:
         data = self.get(f"/repos/{self.repo}/pulls/{pr}")
         return (
@@ -249,7 +344,7 @@ def _log_rate_limit(headers) -> None:
 # ── orchestration ───────────────────────────────────────────────────────────────────────
 class Validator:
     def __init__(self, gh: GitHub, token: str, team_keys, require_open, enforce, soft_fail,
-                 run_url):
+                 run_url, exempt_paths=None):
         self.gh = gh
         self.token = token
         self.team_keys = team_keys
@@ -259,6 +354,9 @@ class Validator:
         self.run_url = run_url
         self.exempt_label = os.environ.get("EXEMPT_LABEL", "")
         self.exempt_actors = lib.parse_actor_list(os.environ.get("EXEMPT_ACTORS", ""))
+        # Parsed in main(), not here: a malformed value must fail the RUN with a readable
+        # message (as team-keys does), not raise out of a constructor.
+        self.exempt_paths = exempt_paths or []
         self.pr_number: int | None = None
         self.validated_sha: str | None = None
         self.validated_base_branch: str | None = None
@@ -421,6 +519,14 @@ class Validator:
                 f"PR author `@{author}` is in `exempt-actors` — the Linear-ticket requirement "
                 "is waived for this bot/automation account.",
                 f"Exempt via exempt-actors (@{author})")
+        # The path exemption is checked LAST of the three because it is the only one that
+        # costs GitHub API calls (the label and actor lists are already in the PR payload).
+        # It still short-circuits before the Linear query, so an exempt config-only PR spends
+        # no Linear token budget and does not depend on Linear being reachable.
+        if self.exempt_paths:
+            exempt_outcome = self._check_path_exemption(pr)
+            if exempt_outcome is not None:
+                return exempt_outcome
 
         nodes, infra_error = self._query_attachments(html_url)
 
@@ -432,6 +538,36 @@ class Validator:
                 return self.finish_pass(joined)
 
         return self._diagnose_and_fail(nodes, infra_error, branch, title, body)
+
+    def _check_path_exemption(self, pr: dict) -> int | None:
+        """Exit code if the run terminates here (exempt, or the list was unreadable); else None.
+
+        None means "not exempt, carry on to Linear" — the ordinary outcome for a PR that
+        touches anything outside `exempt-paths`.
+        """
+        try:
+            paths = self.gh.changed_files(self.pr_number, pr.get("changed_files"))
+        except ChangedFilesUnavailable as exc:
+            error(f"Could not read the changed-file list for PR #{self.pr_number}: {exc}. "
+                  "`exempt-paths` is configured, so the exemption cannot be decided; failing "
+                  "closed.")
+            return self.finish_fail("changed_files_unavailable",
+                                    f"Changed-file lookup: {exc}.")
+        if lib.all_paths_exempt(paths, self.exempt_paths):
+            log(f"All {len(paths)} changed path(s) match exempt-paths — exempt.")
+            return self.finish_exempt(
+                f"Every changed path in this PR ({len(paths)}) matches the repository's "
+                "`exempt-paths` patterns — the Linear-ticket requirement is waived for this "
+                "PR because it changes nothing outside the exempted paths.",
+                f"Exempt via exempt-paths (all {len(paths)} changed paths match)")
+        # Logged, not commented: a non-exempt PR is the normal case, and the reason it is not
+        # exempt belongs in the run log rather than on every PR in the repo. Only the COUNT is
+        # logged, never the names: a git path may legally contain a NEWLINE, so echoing an
+        # author-controlled filename from this privileged job would let a branch forge
+        # `::error::`/`::set-output::` workflow commands in the run log.
+        log(f"{len(paths)} changed path(s); at least one is outside exempt-paths — the "
+            "Linear-ticket requirement applies.")
+        return None
 
     def _resolve_pr(self, event: dict, head_sha: str) -> int | None:
         """Exactly one open PR. Same-repo runs carry workflow_run.pull_requests; fork runs do
@@ -559,6 +695,14 @@ def main() -> int:
               "keys, unique, comma-separated.")
         return 1
 
+    try:
+        exempt_paths = lib.parse_path_list(os.environ.get("EXEMPT_PATHS", ""))
+    except ValueError as exc:
+        error(f"Invalid exempt-paths input: {exc}. Entries must be non-empty, unique, "
+              "repo-relative path patterns, comma-separated (e.g. "
+              "`infrastructure/dynamicconfig/**`).")
+        return 1
+
     with open(event_path, encoding="utf-8") as handle:
         event = json.load(handle)
 
@@ -571,7 +715,7 @@ def main() -> int:
     run_url = os.environ.get("RUN_URL", "")
 
     validator = Validator(GitHub(repo), token, team_keys, require_open, enforce, soft_fail,
-                          run_url)
+                          run_url, exempt_paths)
     return validator.run(event)
 
 
