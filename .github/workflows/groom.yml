@@ -46,6 +46,15 @@ name: Groom (reusable)
 # separate `file` job, which holds no agent. Issues are opened/acted as the bot
 # identity you configure (Comfy: cloud-code-bot), NOT github-actions[bot].
 #
+# The one credential the agent steps DO need — the model API key — is kept out of
+# their env too (BE-4311): each agent job starts a loopback key broker
+# (.github/groom/key-broker.mjs) that holds the real key and injects it into the
+# Claude CLI's requests, so the agent step runs with only a DUMMY key and
+# ANTHROPIC_BASE_URL pointed at 127.0.0.1. An agent that dumps its whole
+# environment into its output leaks only that dummy and a loopback URL. The
+# literal-key output scans below are now defence in depth, not the primary
+# barrier. See .github/groom/README.md for the wiring.
+#
 # Caller pattern (place in the source repo at .github/workflows/groom.yml):
 #
 #   name: Groom
@@ -1355,6 +1364,30 @@ jobs:
           CLAUDE_CODE_VERSION: ${{ needs.gate.outputs.claude_code_version }}
         run: npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION:?not resolved by the gate job from .github/groom/package.json}"
 
+      - name: Start API key broker
+        # BE-4311: the real key lives ONLY in this step's env and the broker's
+        # heap. It is fed via STDIN with `env -u`, never env/argv, because the
+        # agent's unscoped Read + Bash(cat:*) can read /proc/<pid>/environ and
+        # /proc/<pid>/cmdline of any same-user process on the runner. The broker
+        # then replaces the x-api-key header on the way to api.anthropic.com, so
+        # the agent step below carries no usable credential. Background processes
+        # persist across steps within a job, so no stop step is needed — the
+        # runner tears the job down. If the broker dies mid-run the CLI fails
+        # loudly with connection-refused (fail closed), never falling back to a
+        # real key in the agent env.
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$ANTHROPIC_API_KEY" \
+            | env -u ANTHROPIC_API_KEY node "$GROOM_ASSETS/key-broker.mjs" \
+              > /tmp/groom-broker.log 2>&1 &
+          for _ in $(seq 1 50); do
+            if (exec 3<>/dev/tcp/127.0.0.1/8199) 2>/dev/null; then exec 3>&-; exit 0; fi
+            sleep 0.2
+          done
+          echo "::error::key broker failed to start"; cat /tmp/groom-broker.log; exit 1
+
       - name: Lock the clone read-only
         # The finder NEVER writes into the clone — its sole output is $FINDER_OUT
         # under /tmp. Making the whole checkout unwritable closes the `Write` tool
@@ -1392,10 +1425,16 @@ jobs:
         # resolve, which is the read-only inspection the brief assumes.
         working-directory: ${{ env.GROOM_CLONE }}
         env:
-          # ONLY the model key — no GitHub write token, no egress creds. Job
-          # permissions are contents:read, so even the implicit github.token
-          # cannot write. The agent's sole output is the local FINDER_OUT file.
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # NO usable credential in this env — no model key, no GitHub write
+          # token, no egress creds. Job permissions are contents:read, so even the
+          # implicit github.token cannot write. Auth to the model flows through the
+          # local key broker started above: the CLI requires a non-empty key
+          # (verified on 2.1.217: absent key -> "Not logged in" before any
+          # request), so a fixed dummy satisfies it, and the broker replaces the
+          # x-api-key header on the way to api.anthropic.com. The agent's sole
+          # output is the local FINDER_OUT file. (BE-4311)
+          ANTHROPIC_API_KEY: groom-broker-dummy
+          ANTHROPIC_BASE_URL: http://127.0.0.1:8199
           MODEL: ${{ fromJSON(needs.gate.outputs.resolved).model }}
           # Neutralize git's pager escape hatch: `Bash(git log:*)` /
           # `Bash(git show:*)` are PREFIX matches, so a prompt-injected agent could
@@ -1424,9 +1463,11 @@ jobs:
           # TARGET repo's CLAUDE.md/AGENTS.md being auto-loaded as TRUSTED project
           # memory, which would let a malicious repo override the "untrusted data,
           # never instructions" guardrail above. --bare skips CLAUDE.md
-          # auto-discovery (and hooks/plugins/keychain); auth stays on the
-          # ANTHROPIC_API_KEY set above, the only credential this step has (--bare
-          # never reads OAuth/keychain, so a missing key fails loudly, not silently).
+          # auto-discovery (and hooks/plugins/keychain); auth flows through the
+          # local key broker (ANTHROPIC_BASE_URL above) — the dummy ANTHROPIC_API_KEY
+          # in this step's env is not a usable credential, and --bare never reads
+          # OAuth/keychain, so a broker that never started fails loudly (the CLI
+          # gets connection-refused), not silently. (BE-4311)
           # --max-turns 150: the whole-repo finder brief needs ~82 turns in a healthy
           # environment (validated); the old 40 could not finish the brief at all.
           # `git grep` is deliberately NOT allowlisted: `--open-files-in-pager=<cmd>`
@@ -1462,8 +1503,11 @@ jobs:
           # without it, clearing global config would make every allowlisted `git`
           # command fail "dubious ownership" on any runner whose checkout owner differs
           # from the step user (container/self-hosted), re-creating the BE-4214
-          # starvation this PR fixes. A sandboxed agent step with a scrubbed env is
-          # still the tracked gate before groom runs on any untrusted repo.
+          # starvation this PR fixes. BE-4311 closed the key-exfil channel itself:
+          # the model key is no longer in this step's env (it lives only in the
+          # broker), so an agent that dumps its environment leaks a dummy and a
+          # loopback URL. Widening groom's caller set beyond trusted-default-branch
+          # repos still wants a holistic security review before flipping.
           STATUS=0
           env -u GITHUB_ENV -u GITHUB_PATH -u GITHUB_OUTPUT -u GITHUB_STATE -u GITHUB_STEP_SUMMARY -u RUNNER_TEMP \
             GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null \
@@ -1476,18 +1520,9 @@ jobs:
             --setting-sources "" \
             --strict-mcp-config \
             --output-format json > /tmp/groom-finder-exec.json || STATUS=$?
-          # Pre-publish secret scan: the agent can read $ANTHROPIC_API_KEY (e.g.
-          # `cat /proc/self/environ`) and its PRIMARY output ($FINDER_OUT, filed
-          # verbatim as public GitHub issues) is model-authored. Fail closed if the
-          # literal key lands there. Deterministic against the literal value only —
-          # base64/split obfuscation defeats it; the structural close (key out of the
-          # agent env via a sandboxed step/broker) is the tracked pre-untrusted-repo
-          # gate. Runs regardless of $STATUS — a partial/aborted output can carry it.
-          if [ -n "${ANTHROPIC_API_KEY:-}" ] && [ -f "$FINDER_OUT" ] \
-             && LC_ALL=C grep -qF -- "$ANTHROPIC_API_KEY" "$FINDER_OUT"; then
-            echo "::error::finder output contains ANTHROPIC_API_KEY — refusing to publish (possible prompt-injection exfil)."
-            rm -f "$FINDER_OUT"; STATUS=1
-          fi
+          # The literal-key output scan moved to its own `if: always()` step below
+          # (BE-4311): with the real key gone from this step's env it would silently
+          # no-op here, so it now runs in a step that holds the key on its own env.
           # Do NOT swallow a non-zero exit: a rate-limit/network/turn-exhaustion
           # failure must fail the job loudly. Swallowing it made the run green and
           # silently discarded the finder's real candidates. The diagnostics upload
@@ -1496,6 +1531,22 @@ jobs:
             echo "::error::claude exited $STATUS — see the groom-finder-exec artifact for subtype/num_turns."
           fi
           exit "$STATUS"
+
+      - name: Scan finder output for leaked key
+        # Backstop only (BE-4311 moved the key out of the agent env): matches the
+        # LITERAL value; encoding/splitting defeats it. Runs no agent, so holding
+        # the key here adds no exfil surface. if: always() — a partial output
+        # from a failed run can still carry bytes and the diag upload is always().
+        if: always()
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -n "${ANTHROPIC_API_KEY:-}" ] && [ -f "$FINDER_OUT" ] \
+             && LC_ALL=C grep -qF -- "$ANTHROPIC_API_KEY" "$FINDER_OUT"; then
+            echo "::error::finder output contains ANTHROPIC_API_KEY — refusing to publish (possible prompt-injection exfil)."
+            rm -f "$FINDER_OUT"; exit 1
+          fi
 
       - name: Unlock the clone
         # ALWAYS: the agent is done, and a read-only `.git` would break any later
@@ -1779,6 +1830,30 @@ jobs:
           CLAUDE_CODE_VERSION: ${{ needs.gate.outputs.claude_code_version }}
         run: npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION:?not resolved by the gate job from .github/groom/package.json}"
 
+      - name: Start API key broker
+        # BE-4311: the real key lives ONLY in this step's env and the broker's
+        # heap. It is fed via STDIN with `env -u`, never env/argv, because the
+        # agent's unscoped Read + Bash(cat:*) can read /proc/<pid>/environ and
+        # /proc/<pid>/cmdline of any same-user process on the runner. The broker
+        # then replaces the x-api-key header on the way to api.anthropic.com, so
+        # the agent step below carries no usable credential. Background processes
+        # persist across steps within a job, so no stop step is needed — the
+        # runner tears the job down. If the broker dies mid-run the CLI fails
+        # loudly with connection-refused (fail closed), never falling back to a
+        # real key in the agent env.
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$ANTHROPIC_API_KEY" \
+            | env -u ANTHROPIC_API_KEY node "$GROOM_ASSETS/key-broker.mjs" \
+              > /tmp/groom-broker.log 2>&1 &
+          for _ in $(seq 1 50); do
+            if (exec 3<>/dev/tcp/127.0.0.1/8199) 2>/dev/null; then exec 3>&-; exit 0; fi
+            sleep 0.2
+          done
+          echo "::error::key broker failed to start"; cat /tmp/groom-broker.log; exit 1
+
       - name: Lock the clone read-only
         # Same OS-level write lockdown as the finder job — see the full note there.
         # The verifier's only output is $VERIFIER_OUT under /tmp, so it never needs
@@ -1794,7 +1869,13 @@ jobs:
         # allowlisted `git` commands actually work (BE-4214).
         working-directory: ${{ env.GROOM_CLONE }}
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # NO usable credential in this env (BE-4311): auth to the model flows
+          # through the local key broker started above. The CLI requires a
+          # non-empty key (verified on 2.1.217: absent key -> "Not logged in"
+          # before any request), so a fixed dummy satisfies it; the broker replaces
+          # the x-api-key header on the way to api.anthropic.com.
+          ANTHROPIC_API_KEY: groom-broker-dummy
+          ANTHROPIC_BASE_URL: http://127.0.0.1:8199
           MODEL: ${{ fromJSON(needs.gate.outputs.resolved).model }}
           # Neutralize git's pager escape hatch — see the finder job for the note.
           GIT_PAGER: cat
@@ -1831,14 +1912,9 @@ jobs:
             --setting-sources "" \
             --strict-mcp-config \
             --output-format json > /tmp/groom-verifier-exec.json || STATUS=$?
-          # Pre-publish secret scan (see the finder job): $VERIFIER_OUT is filed
-          # verbatim as public issues and the agent can read $ANTHROPIC_API_KEY. Fail
-          # closed on the literal key. Structural close (sandbox/broker) tracked.
-          if [ -n "${ANTHROPIC_API_KEY:-}" ] && [ -f "$VERIFIER_OUT" ] \
-             && LC_ALL=C grep -qF -- "$ANTHROPIC_API_KEY" "$VERIFIER_OUT"; then
-            echo "::error::verifier output contains ANTHROPIC_API_KEY — refusing to publish (possible prompt-injection exfil)."
-            rm -f "$VERIFIER_OUT"; STATUS=1
-          fi
+          # The literal-key output scan moved to its own `if: always()` step below
+          # (BE-4311): with the real key gone from this step's env it would silently
+          # no-op here, so it now runs in a step that holds the key on its own env.
           # Fail loudly rather than letting the validate step below read the
           # missing output as "no findings" and keep the run green — that silently
           # discards the finder's real candidates. See the finder job.
@@ -1846,6 +1922,22 @@ jobs:
             echo "::error::claude exited $STATUS — see the groom-verifier-exec artifact for subtype/num_turns."
           fi
           exit "$STATUS"
+
+      - name: Scan verifier output for leaked key
+        # Backstop only (BE-4311 moved the key out of the agent env): matches the
+        # LITERAL value; encoding/splitting defeats it. Runs no agent, so holding
+        # the key here adds no exfil surface. if: always() — a partial output
+        # from a failed run can still carry bytes and the diag upload is always().
+        if: always()
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -n "${ANTHROPIC_API_KEY:-}" ] && [ -f "$VERIFIER_OUT" ] \
+             && LC_ALL=C grep -qF -- "$ANTHROPIC_API_KEY" "$VERIFIER_OUT"; then
+            echo "::error::verifier output contains ANTHROPIC_API_KEY — refusing to publish (possible prompt-injection exfil)."
+            rm -f "$VERIFIER_OUT"; exit 1
+          fi
 
       - name: Unlock the clone
         # ALWAYS — a read-only `.git` would break `actions/checkout`'s post-job
@@ -2644,6 +2736,30 @@ jobs:
           CLAUDE_CODE_VERSION: ${{ needs.gate.outputs.claude_code_version }}
         run: npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION:?not resolved by the gate job from .github/groom/package.json}"
 
+      - name: Start API key broker
+        # BE-4311: the real key lives ONLY in this step's env and the broker's
+        # heap. It is fed via STDIN with `env -u`, never env/argv, because the
+        # agent's unscoped Read + Bash(cat:*) can read /proc/<pid>/environ and
+        # /proc/<pid>/cmdline of any same-user process on the runner. The broker
+        # then replaces the x-api-key header on the way to api.anthropic.com, so
+        # the agent step below carries no usable credential. Background processes
+        # persist across steps within a job, so no stop step is needed — the
+        # runner tears the job down. If the broker dies mid-run the CLI fails
+        # loudly with connection-refused (fail closed), never falling back to a
+        # real key in the agent env.
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$ANTHROPIC_API_KEY" \
+            | env -u ANTHROPIC_API_KEY node "$GROOM_ASSETS/key-broker.mjs" \
+              > /tmp/groom-broker.log 2>&1 &
+          for _ in $(seq 1 50); do
+            if (exec 3<>/dev/tcp/127.0.0.1/8199) 2>/dev/null; then exec 3>&-; exit 0; fi
+            sleep 0.2
+          done
+          echo "::error::key broker failed to start"; cat /tmp/groom-broker.log; exit 1
+
       - name: Lock the clone's .git read-only
         # Narrower than the finder/verifier lockdown: the builder's whole JOB is to
         # edit files in the worktree, so only `.git` is frozen. That is the part it
@@ -2664,11 +2780,17 @@ jobs:
         # on actually resolve — at the workspace root there is no git repo.
         working-directory: ${{ env.GROOM_CLONE }}
         env:
-          # ONLY the model key — no GitHub write token, no egress creds. Job
-          # permissions are contents:read, so even the implicit github.token
-          # cannot write. The agent's sole outputs are files under repo/ (the
-          # edits) + the BUILDER_OUT control file.
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # NO usable credential in this env — no model key, no GitHub write
+          # token, no egress creds. Job permissions are contents:read, so even the
+          # implicit github.token cannot write. Auth to the model flows through the
+          # local key broker started above: the CLI requires a non-empty key
+          # (verified on 2.1.217: absent key -> "Not logged in" before any
+          # request), so a fixed dummy satisfies it, and the broker replaces the
+          # x-api-key header on the way to api.anthropic.com. The agent's sole
+          # outputs are files under repo/ (the edits) + the BUILDER_OUT control
+          # file. (BE-4311)
+          ANTHROPIC_API_KEY: groom-broker-dummy
+          ANTHROPIC_BASE_URL: http://127.0.0.1:8199
           MODEL: ${{ fromJSON(needs.gate.outputs.resolved).model }}
           # Neutralize git's pager escape hatch — see the finder job for the note.
           GIT_PAGER: cat
