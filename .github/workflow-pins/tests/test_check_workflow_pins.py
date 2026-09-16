@@ -5171,6 +5171,31 @@ class DocsCrossCheckTests(unittest.TestCase):
         self.assertEqual(checked, ["pr-foo.yml"])
         self.assertEqual(errors, [], errors)
 
+    def test_a_reusable_is_cross_checked_via_its_own_name_page(self):
+        # The derivation is the workflow's OWN basename, so a reusable whose
+        # name shares no prefix with any other guide is still cross-checked
+        # against its same-named page — a page claiming a `main` default fails.
+        # (This is the coverage refresh-reviewers.yml gained once it got its own
+        # docs/callers/refresh-reviewers.md page instead of being skipped.)
+        self._write_wf("refresh-foo.yml", _reusable(PINNED))
+        self._write_doc("refresh-foo.md", _docs_page("main"))
+        errors, checked, _, _ = self._check()
+        self.assertEqual(checked, ["refresh-foo.yml"])
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("refresh-foo.md", errors[0])
+        self.assertIn("line=%d" % _DOCS_ROW_LINE, errors[0])
+        self.assertIn("refresh-foo.yml", errors[0])  # names the declaration
+        self.assertIn("BE-6508", errors[0])
+
+    def test_a_required_marker_row_on_its_own_name_page_is_clean(self):
+        # Companion to the above: the compliant `— (**required**)` marker on a
+        # reusable's own-name page passes.
+        self._write_wf("refresh-foo.yml", _reusable(PINNED))
+        self._write_doc("refresh-foo.md", _docs_page("— (**required**)"))
+        errors, checked, _, _ = self._check()
+        self.assertEqual(checked, ["refresh-foo.yml"])
+        self.assertEqual(errors, [], errors)
+
     def test_a_page_missing_the_row_is_a_hard_error(self):
         self._write_wf("pr-foo.yml", _reusable(PINNED))
         # Present page, real inputs table, but no `workflows_ref` row.
@@ -5200,7 +5225,7 @@ class DocsCrossCheckTests(unittest.TestCase):
         self.assertIn("no `workflows_ref` row", errors[0])
 
     def test_a_missing_page_is_skipped_not_an_error(self):
-        # refresh-reviewers.yml is documented under assign-reviewers.md, so a
+        # An internal bump-*/ci-*/test-* workflow has no docs/callers guide, so a
         # page absent under the workflow's own name is "not applicable".
         self._write_wf("pr-foo.yml", _reusable(PINNED))
         errors, checked, _, _ = self._check()

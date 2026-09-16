@@ -17,6 +17,7 @@ per-workflow pages give you a complete, copy-pasteable caller:
 | `public-repo-hygiene.yml` | [public-repo-hygiene.md](public-repo-hygiene.md) | nothing |
 | `coderabbit-config-validate.yml` | [coderabbit-config-validate.md](coderabbit-config-validate.md) | nothing |
 | `assign-reviewers.yml` | [assign-reviewers.md](assign-reviewers.md) | `vars.APP_ID` + App key + `.github/reviewers.yml` |
+| `refresh-reviewers.yml` | [refresh-reviewers.md](refresh-reviewers.md) | `vars.APP_ID` + App key + `.github/reviewers.yml` |
 | `assign-prs-to-author.yml` | [assign-prs-to-author.md](assign-prs-to-author.md) | nothing |
 | `stale.yml` | [stale.md](stale.md) | `SLACK_BOT_TOKEN` (optional) |
 | `detect-unreviewed-merge.yml` | [detect-unreviewed-merge.md](detect-unreviewed-merge.md) | `UNREVIEWED_MERGES_TOKEN` |

@@ -3607,9 +3607,10 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT, docs_dir=None):
             base = name.rsplit(".", 1)[0]
             docs_path = os.path.join(docs_dir, base + ".md")
             # No page under this name = not documented as its own caller guide
-            # (e.g. refresh-reviewers.yml is covered by assign-reviewers.md), so
-            # there is nothing to cross-check. A page that EXISTS but lacks the
-            # row is the case that must not pass silently, below.
+            # (e.g. an internal bump-*/ci-*/test-* workflow, which legitimately
+            # have no docs/callers guide), so there is nothing to cross-check. A
+            # page that EXISTS but lacks the row is the case that must not pass
+            # silently, below.
             if os.path.isfile(docs_path):
                 ann_docs_path = _ann_prop(docs_path)
                 with open(docs_path, "r", encoding="utf-8", errors="replace") as f:
