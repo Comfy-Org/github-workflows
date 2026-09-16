@@ -1379,11 +1379,20 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           set -euo pipefail
+          : > /tmp/groom-broker.log
           printf '%s\n' "$ANTHROPIC_API_KEY" \
             | env -u ANTHROPIC_API_KEY node "$GROOM_ASSETS/key-broker.mjs" \
               > /tmp/groom-broker.log 2>&1 &
+          BROKER_PID=$!
+          # Readiness = OUR broker printed its own bind line, not merely "something
+          # is listening on 8199". A bare TCP probe accepts a pre-existing rogue
+          # listener when key-broker.mjs die()s on EADDRINUSE, and the agent would
+          # then ship its prompt + repo data to that listener via ANTHROPIC_BASE_URL.
           for _ in $(seq 1 50); do
-            if (exec 3<>/dev/tcp/127.0.0.1/8199) 2>/dev/null; then exec 3>&-; exit 0; fi
+            if grep -qxF 'groom-key-broker listening on 127.0.0.1:8199' /tmp/groom-broker.log; then
+              exit 0
+            fi
+            kill -0 "$BROKER_PID" 2>/dev/null || break
             sleep 0.2
           done
           echo "::error::key broker failed to start"; cat /tmp/groom-broker.log; exit 1
@@ -1845,11 +1854,20 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           set -euo pipefail
+          : > /tmp/groom-broker.log
           printf '%s\n' "$ANTHROPIC_API_KEY" \
             | env -u ANTHROPIC_API_KEY node "$GROOM_ASSETS/key-broker.mjs" \
               > /tmp/groom-broker.log 2>&1 &
+          BROKER_PID=$!
+          # Readiness = OUR broker printed its own bind line, not merely "something
+          # is listening on 8199". A bare TCP probe accepts a pre-existing rogue
+          # listener when key-broker.mjs die()s on EADDRINUSE, and the agent would
+          # then ship its prompt + repo data to that listener via ANTHROPIC_BASE_URL.
           for _ in $(seq 1 50); do
-            if (exec 3<>/dev/tcp/127.0.0.1/8199) 2>/dev/null; then exec 3>&-; exit 0; fi
+            if grep -qxF 'groom-key-broker listening on 127.0.0.1:8199' /tmp/groom-broker.log; then
+              exit 0
+            fi
+            kill -0 "$BROKER_PID" 2>/dev/null || break
             sleep 0.2
           done
           echo "::error::key broker failed to start"; cat /tmp/groom-broker.log; exit 1
@@ -2751,11 +2769,20 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           set -euo pipefail
+          : > /tmp/groom-broker.log
           printf '%s\n' "$ANTHROPIC_API_KEY" \
             | env -u ANTHROPIC_API_KEY node "$GROOM_ASSETS/key-broker.mjs" \
               > /tmp/groom-broker.log 2>&1 &
+          BROKER_PID=$!
+          # Readiness = OUR broker printed its own bind line, not merely "something
+          # is listening on 8199". A bare TCP probe accepts a pre-existing rogue
+          # listener when key-broker.mjs die()s on EADDRINUSE, and the agent would
+          # then ship its prompt + repo data to that listener via ANTHROPIC_BASE_URL.
           for _ in $(seq 1 50); do
-            if (exec 3<>/dev/tcp/127.0.0.1/8199) 2>/dev/null; then exec 3>&-; exit 0; fi
+            if grep -qxF 'groom-key-broker listening on 127.0.0.1:8199' /tmp/groom-broker.log; then
+              exit 0
+            fi
+            kill -0 "$BROKER_PID" 2>/dev/null || break
             sleep 0.2
           done
           echo "::error::key broker failed to start"; cat /tmp/groom-broker.log; exit 1
