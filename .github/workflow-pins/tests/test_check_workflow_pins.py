@@ -4986,5 +4986,263 @@ class CheckDirTests(unittest.TestCase):
             self.assertIsInstance(idx, int)
 
 
+# A docs page whose inputs table's `workflows_ref` default cell varies. The
+# prose line and the fenced caller example both MENTION the input and must never
+# be read as the table row (BE-6508 plan item 4d).
+def _docs_page(default_cell):
+    return (
+        "# pr-foo caller\n"
+        "\n"
+        "The scripts load from your pinned `workflows_ref` at run time.\n"
+        "\n"
+        "```yaml\n"
+        "    with:\n"
+        "      workflows_ref: main   # <- a caller example, not the table\n"
+        "```\n"
+        "\n"
+        "## Inputs\n"
+        "\n"
+        "| Input | Default | Notes |\n"
+        "|---|---|---|\n"
+        "| `workflows_ref` | %s | Pin to the `uses:` SHA. |\n"
+        "| `other` | `false` | Something else. |\n"
+    ) % default_cell
+
+
+# The `workflows_ref` table row sits on the 14th line of the page above (1-based).
+_DOCS_ROW_LINE = 14
+
+
+class DocsDefaultLiteralRefTests(unittest.TestCase):
+    def test_a_bare_branch_name_is_a_literal_ref(self):
+        self.assertTrue(cwp.docs_default_is_literal_ref(" main "))
+
+    def test_a_sha_in_a_code_span_is_a_literal_ref(self):
+        self.assertTrue(cwp.docs_default_is_literal_ref(" `1a2b3c4d` "))
+
+    def test_the_em_dash_required_marker_is_clean(self):
+        self.assertFalse(cwp.docs_default_is_literal_ref(" — (**required**) "))
+
+    def test_a_bare_required_marker_is_clean(self):
+        self.assertFalse(cwp.docs_default_is_literal_ref(" *(required)* "))
+
+    def test_a_lone_em_dash_is_clean(self):
+        self.assertFalse(cwp.docs_default_is_literal_ref(" — "))
+
+    def test_a_lone_hyphen_is_clean(self):
+        self.assertFalse(cwp.docs_default_is_literal_ref(" - "))
+
+    def test_the_groom_empty_string_default_is_clean(self):
+        self.assertFalse(cwp.docs_default_is_literal_ref(" `''` "))
+
+    def test_an_empty_cell_is_not_a_literal_ref(self):
+        self.assertFalse(cwp.docs_default_is_literal_ref("   "))
+
+    def test_a_ref_that_merely_contains_the_word_required_is_a_literal_ref(self):
+        # The keyword must not wave through a cell that documents a real default
+        # — matching is whole-cell, not a substring scan.
+        self.assertTrue(cwp.docs_default_is_literal_ref(" `main` (**required**) "))
+        self.assertTrue(cwp.docs_default_is_literal_ref(" main — required until BE-1 "))
+
+    def test_common_no_default_wordings_are_clean(self):
+        for marker in ("n/a", "none", "(none)", "no default", "unset", "NA"):
+            self.assertFalse(
+                cwp.docs_default_is_literal_ref(marker),
+                "%r should read as no-default" % marker,
+            )
+
+    def test_a_u2212_minus_sign_marker_is_clean(self):
+        # U+2212 MINUS SIGN sits outside the U+2010–U+2015 dash range.
+        self.assertFalse(cwp.docs_default_is_literal_ref(" − "))
+        self.assertFalse(cwp.docs_default_is_literal_ref(" − (**required**) "))
+
+
+class FindDocsRowTests(unittest.TestCase):
+    def _find(self, text):
+        return cwp.find_docs_workflows_ref_row(text.split("\n"))
+
+    def test_the_table_row_is_found_with_its_line_number(self):
+        found = self._find(_docs_page("main"))
+        self.assertIsNotNone(found)
+        lineno, cell = found
+        self.assertEqual(lineno, _DOCS_ROW_LINE)
+        self.assertEqual(cell.strip(), "main")
+
+    def test_prose_and_a_fenced_example_are_not_the_row(self):
+        # The page mentions `workflows_ref` in prose and inside a ```yaml block,
+        # but has NO table row — that is None, not a false positive on either.
+        text = (
+            "# Page\n"
+            "\n"
+            "Set `workflows_ref` to your `uses:` SHA.\n"
+            "\n"
+            "```yaml\n"
+            "      workflows_ref: main\n"
+            "```\n"
+        )
+        self.assertIsNone(self._find(text))
+
+    def test_a_fenced_row_shaped_line_is_not_the_row(self):
+        # Even a line that looks exactly like the table row is ignored inside a
+        # fence — a doc could show a sample table in a ``` block.
+        text = (
+            "# Page\n"
+            "```\n"
+            "| `workflows_ref` | main | example |\n"
+            "```\n"
+        )
+        self.assertIsNone(self._find(text))
+
+    def test_a_real_row_after_a_closed_fence_is_still_found(self):
+        text = (
+            "# Page\n"
+            "```yaml\n"
+            "      workflows_ref: main\n"
+            "```\n"
+            "| `workflows_ref` | — (**required**) | note |\n"
+        )
+        found = self._find(text)
+        self.assertIsNotNone(found)
+        self.assertEqual(found[0], 5)
+
+    def test_a_shorter_inner_fence_does_not_close_a_longer_block(self):
+        # A four-backtick block containing a bare ``` line must NOT close early
+        # and invert the state: the row-shaped line stays inside the fence and
+        # is ignored, and the real row after the four-backtick closer is found.
+        text = (
+            "# Page\n"
+            "````\n"
+            "```\n"
+            "| `workflows_ref` | main | fenced sample, not the row |\n"
+            "````\n"
+            "| `workflows_ref` | — (**required**) | the real row |\n"
+        )
+        found = self._find(text)
+        self.assertIsNotNone(found)
+        self.assertEqual(found[0], 6)
+        self.assertEqual(found[1].strip(), "— (**required**)")
+
+    def test_a_closer_carrying_an_info_string_does_not_close(self):
+        # Only a bare fence closes; `​```yaml` inside a block is content, so the
+        # row-shaped line after it stays fenced and is not read as the row.
+        text = (
+            "# Page\n"
+            "```\n"
+            "```yaml\n"
+            "| `workflows_ref` | main | still fenced |\n"
+            "```\n"
+        )
+        self.assertIsNone(self._find(text))
+
+
+class DocsCrossCheckTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.docs = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.addCleanup(shutil.rmtree, self.docs, True)
+
+    def _write_wf(self, name, text):
+        with open(os.path.join(self.dir, name), "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def _write_doc(self, name, text):
+        with open(os.path.join(self.docs, name), "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def _check(self):
+        return cwp.check_dir(self.dir, exempt=frozenset(), docs_dir=self.docs)
+
+    def test_a_docs_row_claiming_main_fails_with_the_right_line(self):
+        self._write_wf("pr-foo.yml", _reusable(PINNED))
+        self._write_doc("pr-foo.md", _docs_page("main"))
+        errors, checked, _, _ = self._check()
+        self.assertEqual(checked, ["pr-foo.yml"])
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("pr-foo.md", errors[0])
+        self.assertIn("line=%d" % _DOCS_ROW_LINE, errors[0])
+        self.assertIn("pr-foo.yml", errors[0])  # names the contradicted declaration
+        self.assertIn("BE-6508", errors[0])
+
+    def test_a_required_marker_row_is_clean(self):
+        self._write_wf("pr-foo.yml", _reusable(PINNED))
+        self._write_doc("pr-foo.md", _docs_page("— (**required**)"))
+        errors, checked, _, _ = self._check()
+        self.assertEqual(checked, ["pr-foo.yml"])
+        self.assertEqual(errors, [], errors)
+
+    def test_a_page_missing_the_row_is_a_hard_error(self):
+        self._write_wf("pr-foo.yml", _reusable(PINNED))
+        # Present page, real inputs table, but no `workflows_ref` row.
+        self._write_doc(
+            "pr-foo.md",
+            "# pr-foo\n\n## Inputs\n\n| Input | Default | Notes |\n|---|---|---|\n"
+            "| `other` | `false` | Something. |\n",
+        )
+        errors, checked, _, _ = self._check()
+        self.assertEqual(checked, ["pr-foo.yml"])
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("pr-foo.md", errors[0])
+        self.assertIn("no `workflows_ref` row", errors[0])
+        self.assertIn("BE-6508", errors[0])
+
+    def test_a_page_with_only_prose_and_a_fenced_example_is_a_hard_error(self):
+        # The row-absence case must not be defeated by a `workflows_ref` that
+        # appears only in prose or a fenced caller example (plan item 4d).
+        self._write_wf("pr-foo.yml", _reusable(PINNED))
+        self._write_doc(
+            "pr-foo.md",
+            "# pr-foo\n\nPin `workflows_ref` to your SHA.\n\n```yaml\n"
+            "      workflows_ref: main\n```\n",
+        )
+        errors, _, _, _ = self._check()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("no `workflows_ref` row", errors[0])
+
+    def test_a_missing_page_is_skipped_not_an_error(self):
+        # refresh-reviewers.yml is documented under assign-reviewers.md, so a
+        # page absent under the workflow's own name is "not applicable".
+        self._write_wf("pr-foo.yml", _reusable(PINNED))
+        errors, checked, _, _ = self._check()
+        self.assertEqual(checked, ["pr-foo.yml"])
+        self.assertEqual(errors, [], errors)
+
+    def test_an_optional_default_workflow_is_not_cross_checked(self):
+        # A groom-style `default: ''` self-pin is the optional/auto-derive
+        # direction — its docs may legitimately document a default, so the check
+        # must NOT fire even when the docs row names a literal ref.
+        groom_like = (
+            "name: Fixture\n"
+            "on:\n"
+            "  workflow_call:\n"
+            "    inputs:\n"
+            "      workflows_ref:\n"
+            "        type: string\n"
+            "        required: false\n"
+            "        default: ''\n"
+            "jobs:\n"
+            "  check:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - name: Require a resolvable workflows_ref\n"
+            "        env:\n"
+            "          WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}\n"
+            "        run: |\n"
+            '          if [ -z "$WORKFLOWS_REF" ]; then\n'
+            '            echo "::error::empty"\n'
+            "            exit 1\n"
+            "          fi\n"
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ inputs.workflows_ref || job.workflow_sha }}\n"
+        )
+        self._write_wf("groomy.yml", groom_like)
+        self._write_doc("groomy.md", _docs_page("main"))
+        errors, checked, _, _ = self._check()
+        self.assertEqual(checked, ["groomy.yml"])
+        self.assertEqual(errors, [], errors)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
