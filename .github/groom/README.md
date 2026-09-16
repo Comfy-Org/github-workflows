@@ -660,10 +660,31 @@ python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
 
 ## The agent sandbox — `agent-sandbox.sh` + `broker.mjs` (BE-4302)
 
-The auto-builder (phase 3) runs an untrusted agent that writes code. These two
-trusted assets confine that agent so a prompt-injected or misbehaving run cannot
-read the runner's secrets, touch anything outside its clone, or exfiltrate the
-API key — while still letting it edit its worktree and reach Anthropic.
+Every groom phase that runs a model on untrusted repo content — the **finder**,
+the **verifier**, and each **builder** matrix cell — runs ONLY inside these
+trusted assets (wired into `groom.yml` by BE-4303; before that the three agent
+steps used a hand-rolled `chmod`/`env -u` scrub with the real key in the step
+env). They confine the agent so a prompt-injected or misbehaving run cannot read
+the runner's secrets, touch anything outside its clone, or exfiltrate the API key
+— while still letting the builder edit its worktree and letting all three reach
+Anthropic. **This jail is the gate that had been blocking groom on
+untrusted-contributor repos:** with the real key structurally out of the agent's
+reach and the filesystem/network confined, an outside contributor's PR content is
+just untrusted data the agent analyzes, never a path to the runner's credentials.
+
+How `groom.yml` composes them per agent job: a **broker step** (the only step
+holding `secrets.ANTHROPIC_API_KEY`) starts `broker.mjs` on the host socket
+`$BROKER_SOCK` and waits for its `/healthz`; the **agent step** — carrying NO real
+key — runs `agent-sandbox.sh --uds "$BROKER_SOCK"` with the brief (and, for the
+builder, the finding JSON) passed `--ro-file`, every output under the one rw
+`--out-dir` (`$GROOM_OUT_DIR`), and a `bash -c` wrapper that brings up the in-jail
+`jail-shim.mjs` before `exec`ing the pinned `claude` CLI with a DUMMY key and
+`ANTHROPIC_BASE_URL` pointed at the shim; a **scan step** (finder/verifier) or the
+**capture step** (builder) re-checks the model-authored output for the literal key
+as a regression tripwire; and an `always()` **cleanup step** kills the broker. The
+finder/verifier bind the clone `ro`; the builder binds it `rw-git-ro` so its
+worktree edits land on the host for the patch-capture step while `.git` stays
+read-only.
 
 - **[`agent-sandbox.sh`](agent-sandbox.sh)** — a [bubblewrap](https://github.com/containers/bubblewrap)
   (`bwrap`) wrapper that runs an arbitrary command inside an unprivileged jail:
