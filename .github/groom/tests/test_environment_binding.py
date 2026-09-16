@@ -152,5 +152,125 @@ class EnvironmentInputTest(unittest.TestCase):
         )
 
 
+# The real model key, however the expression is spaced.
+MODEL_KEY_RE = re.compile(r"secrets\s*\.\s*ANTHROPIC_API_KEY")
+# The agent step in each agent job — the one that runs the model over untrusted
+# repo content. It must NEVER hold the real key (BE-4303); it reaches Anthropic
+# through the broker with a dummy key.
+AGENT_STEPS = {
+    "audit_find": "Run finder",
+    "audit_verify": "Run verifier",
+    "build": "Run builder",
+}
+BROKER_STEP = "Start the key broker"
+# The ONLY steps in each agent JOB allowed to hold the real key: the broker that
+# injects it, and the no-agent pre-publish scan/capture steps that run after the
+# jail is gone. The key appearing ANYWHERE ELSE in the job — most dangerously a
+# job-level (or workflow-level) `env:`, which lands in the sandboxed agent step's
+# environment while that step's OWN block stays clean — is the aliasing regression
+# the step-scoped test below cannot see.
+KEY_HOLDING_STEPS = {
+    "audit_find": ("Start the key broker", "Scan finder output for the model key"),
+    "audit_verify": ("Start the key broker", "Scan verifier output for the model key"),
+    "build": ("Start the key broker", "Capture patch (enforce the size bail-out)"),
+}
+
+
+def _step_block(job_block, step_name):
+    """The body of one `- name: <step_name>` step, up to the next step or EOF."""
+    m = re.search(
+        r"(?ms)^      - name: " + re.escape(step_name) + r"\n(.*?)(?=^      - name: |\Z)",
+        job_block,
+    )
+    return m.group(1) if m else None
+
+
+class AgentStepModelKeyBoundaryTest(unittest.TestCase):
+    """BE-4303: the real `ANTHROPIC_API_KEY` lives ONLY in the broker step (and the
+    no-agent scan/capture steps) — never in the `Run finder/verifier/builder` step
+    that runs the model over untrusted repo content. The agent runs inside
+    `agent-sandbox.sh` with a DUMMY key and reaches Anthropic through the broker.
+    Re-adding `ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}` to an agent
+    step is one green line in a diff; this pins the boundary. Text/shape-based for
+    the same stdlib-only reason as the matchers above."""
+
+    def setUp(self):
+        self.jobs = _job_blocks(_workflow_text())
+
+    def test_no_agent_step_holds_the_real_model_key(self):
+        for job, step in AGENT_STEPS.items():
+            with self.subTest(job=job):
+                block = _step_block(self.jobs[job], step)
+                self.assertIsNotNone(block, f"agent step '{step}' missing from {job}")
+                self.assertIsNone(
+                    MODEL_KEY_RE.search(block),
+                    f"the agent step '{step}' must NOT hold secrets.ANTHROPIC_API_KEY "
+                    "— the sandbox + broker keep the real key out of the agent's reach",
+                )
+
+    def test_each_agent_job_has_a_broker_step_that_holds_the_key(self):
+        # Positive control: a restructure that dropped the broker (and with it the
+        # key injection) would otherwise satisfy the negative test above vacuously.
+        for job in AGENT_STEPS:
+            with self.subTest(job=job):
+                block = _step_block(self.jobs[job], BROKER_STEP)
+                self.assertIsNotNone(block, f"'{BROKER_STEP}' step missing from {job}")
+                self.assertIsNotNone(
+                    MODEL_KEY_RE.search(block),
+                    f"the broker step in {job} must hold secrets.ANTHROPIC_API_KEY",
+                )
+
+    def test_the_real_key_appears_only_in_the_allowed_no_agent_steps(self):
+        # Scope the search to the WHOLE agent job, not just the agent step: aliasing
+        # the key through a job-level `env:` would put it in the sandboxed agent
+        # step's environment while `Run finder`'s own block stays clean — the exact
+        # one-green-line regression the step-scoped negative test above cannot catch.
+        # Assert the key lives in NO MORE than the expected no-agent step set.
+        for job, allowed in KEY_HOLDING_STEPS.items():
+            with self.subTest(job=job):
+                remainder = self.jobs[job]
+                for step in allowed:
+                    sb = _step_block(remainder, step)
+                    self.assertIsNotNone(
+                        sb, f"expected key-holding step '{step}' missing from {job}"
+                    )
+                    remainder = remainder.replace(sb, "")
+                self.assertIsNone(
+                    MODEL_KEY_RE.search(remainder),
+                    f"secrets.ANTHROPIC_API_KEY appears in job '{job}' OUTSIDE the "
+                    f"allowed no-agent steps {allowed} — a job-level env: alias would "
+                    "leak the real key into the sandboxed agent step",
+                )
+
+    def test_the_workflow_level_env_never_holds_the_real_key(self):
+        # The top-level `env:` (before `jobs:`) is inherited by every step in every
+        # job, the agent step included, so the real key must never live there. Scope
+        # to that block alone: the file's header comment carries a caller EXAMPLE that
+        # legitimately shows `secrets.ANTHROPIC_API_KEY`, so a whole-preamble search
+        # would false-positive.
+        m = re.search(r"(?ms)^env:\n(.*?)(?=^\S)", _workflow_text())
+        self.assertIsNotNone(m, "no workflow-level env: block in groom.yml")
+        self.assertIsNone(
+            MODEL_KEY_RE.search(m.group(1)),
+            "secrets.ANTHROPIC_API_KEY appears in the workflow-level env: block — it "
+            "would be inherited by every agent step",
+        )
+
+    def test_each_agent_step_runs_inside_the_sandbox_with_a_dummy_key(self):
+        # The other half of the boundary: the model runs ONLY inside agent-sandbox.sh,
+        # and the key it carries into the jail is the dummy the broker strips.
+        for job, step in AGENT_STEPS.items():
+            with self.subTest(job=job):
+                block = _step_block(self.jobs[job], step)
+                self.assertIn(
+                    "agent-sandbox.sh", block,
+                    f"the agent step '{step}' must invoke agent-sandbox.sh",
+                )
+                self.assertIn(
+                    "ANTHROPIC_API_KEY=groom-sandbox-placeholder", block,
+                    f"the agent step '{step}' must pass the DUMMY key into the jail",
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
