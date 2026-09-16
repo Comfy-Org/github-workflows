@@ -748,12 +748,19 @@ request-handling contract is identical on both transports.
 with only loopback up, so the broker — reached over the unix socket bind-mounted
 at `/run/broker.sock` via the in-jail `jail-shim.mjs` TCP→UDS forwarder — is the
 *only* thing the agent can talk to. Host network, host loopback services, and
-cloud metadata (`169.254.169.254` / `168.63.129.16`) are all unreachable. Two
-consequences for callers: set `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` in the
-agent env so the agent doesn't stall on telemetry endpoints that can never be
-reached; and because there is no egress, in-jail `git fetch` / `npm install`
-cannot work — anything the agent needs must already be in the clone before it is
-sandboxed.
+cloud metadata (`169.254.169.254` / `168.63.129.16`) are all unreachable. So is
+**name resolution**, and twice over: the netns has no route to any nameserver (the
+runner's stub resolver at `127.0.0.53` sits on the *host's* loopback, not the
+jail's), and on a systemd-resolved runner `/etc/resolv.conf` is a symlink into
+`/run` — which the jail mounts `/etc` but deliberately not — so the resolver has
+no nameserver configured either way. A hostname the read-only `/etc/hosts` does
+not already answer cannot be resolved at all.
+
+Two consequences for callers: set `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
+in the agent env so the agent doesn't stall on telemetry endpoints that can
+never be reached; and because there is no egress, in-jail `git fetch` / `npm
+install` cannot work — anything the agent needs must already be in the clone
+before it is sandboxed.
 
 ### The loud-preflight guarantee
 
@@ -777,8 +784,17 @@ broker at a local fake upstream ([`tests/fake-upstream.mjs`](tests/fake-upstream
 *over the bind-mounted unix socket + in-jail `jail-shim.mjs`* to prove key
 injection/stripping, the `/healthz` + non-`/v1` behavior, and SSE pass-through. It
 also proves the BE-4369 egress isolation: host loopback, cloud metadata, and an
-arbitrary external IP are all unreachable from the jail. No `claude`, no API key,
-no spend.
+arbitrary external IP are all unreachable from the jail, and name resolution is
+dead. Every one of those reads a *failure* as the proof, so each is guarded
+against false-passing on a missing tool — the IP-literal checks by asserting
+`curl` is on the jail `PATH` first, the resolution check by asserting exact,
+cause-specific exit codes (`getent` 2 = key not found, `curl` 6 =
+could-not-resolve), which a missing binary's 127 cannot satisfy. The resolution
+check also carries a second assertion on top — a no-route connect to a hardcoded
+nameserver address, `curl` 7 — because a resolution failure ALONE would still
+pass under a *shared* network namespace (the dangling `/etc/resolv.conf` above
+breaks resolution regardless of routing), and a proof that cannot go red is not a
+proof. No `claude`, no API key, no spend.
 
 ```bash
 shellcheck -x .github/groom/agent-sandbox.sh .github/groom/tests/sandbox-tests.sh

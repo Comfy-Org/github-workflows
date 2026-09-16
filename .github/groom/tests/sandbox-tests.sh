@@ -291,7 +291,56 @@ if ! "$SANDBOX" --clone "$clone" --clone-mode ro --out-dir "$outdir" -- bash -c 
 '; then fail "arbitrary external IP reachable from jail"; fi
 pass "arbitrary external IP unreachable from jail"
 
-# 7d. --uds fail-loud: a nonexistent socket path must exit non-zero BEFORE the cmd.
+# 7d. Name resolution is dead inside the jail, and no nameserver is routable.
+#
+# 7a/7b/7c all use IP literals ON PURPOSE, so not one of them ever touches the
+# resolver — routing is proven while name resolution is left untested. This section
+# covers it, in TWO parts, because the obvious one-liner is a trap.
+#
+# (i) Resolution fails. Asserted on resolver-SPECIFIC exit codes rather than a bare
+#     non-zero, which is what stops the same false-pass the 7a/7b/7c tool-presence
+#     check exists to block: `getent` 2 is "key not found" specifically (a missing
+#     binary is 127) and `curl` 6 is CURLE_COULDNT_RESOLVE_HOST specifically (a
+#     connect-stage failure is 7, a timeout 28, a missing binary 127). The name is a
+#     real, permanently-resolvable one, so neither branch can pass merely because the
+#     hostname was bogus — and the host-side control below says so out loud.
+#
+# (ii) THE NETNS PROOF — do NOT collapse this into (i). Part (i) on its own is
+#     VACUOUS as evidence of network isolation: it passes under a SHARED netns too
+#     (measured, not theorized). On a systemd-resolved host /etc/resolv.conf is a
+#     symlink into /run, and the jail mounts /etc but deliberately NOT /run (mounting
+#     it would be a confinement regression in its own right), so the resolver has no
+#     nameserver configured whatever the netns looks like — meaning a future change
+#     that put the jail back on a shared network would NOT turn part (i) red. What
+#     only an isolated netns can produce is an immediate no-route to a hardcoded
+#     nameserver address, so assert that as well, again on the exact code: `curl` 7
+#     is CURLE_COULDNT_CONNECT, which a shared netns cannot return here — it reaches
+#     the host stack and comes back 52/56 when 1.1.1.1:53 answers, or 28 when egress
+#     to it is filtered, never 7.
+if getent hosts api.anthropic.com >/dev/null 2>&1; then
+	echo "note: this host resolves api.anthropic.com — the in-jail failure below is the sandbox, not a dead name"
+else
+	echo "note: this host cannot resolve api.anthropic.com either (offline?) — the in-jail assertions are still enforced"
+fi
+if ! "$SANDBOX" --clone "$clone" --clone-mode ro --out-dir "$outdir" -- bash -c '
+	# (i) name resolution fails
+	rc=0; getent hosts api.anthropic.com >/dev/null 2>&1 || rc=$?
+	if [ "$rc" = 0 ]; then echo "api.anthropic.com RESOLVED in jail — name resolution is not closed off (an /etc/hosts entry on the host would do this, served through the read-only /etc bind)"; exit 1; fi
+	[ "$rc" = 2 ] || { echo "getent exit $rc, want 2 (key not found) — getent missing from the jail PATH?"; exit 1; }
+	# --max-time is generous so a resolver that retried before giving up still reports
+	# 6 (could-not-resolve) rather than being clipped into an ambiguous 28 (timeout).
+	rc=0; curl -s --max-time 10 http://api.anthropic.com/ >/dev/null 2>&1 || rc=$?
+	if [ "$rc" = 0 ]; then echo "curl reached api.anthropic.com from jail — egress is NOT closed"; exit 1; fi
+	[ "$rc" = 6 ] || { echo "curl exit $rc, want 6 (CURLE_COULDNT_RESOLVE_HOST) — failed past the resolver stage instead of at it"; exit 1; }
+	# (ii) and no nameserver is routable either — the half a shared netns would fail
+	rc=0; curl -s --max-time 10 http://1.1.1.1:53/ >/dev/null 2>&1 || rc=$?
+	if [ "$rc" = 0 ]; then echo "nameserver 1.1.1.1:53 answered from jail — netns is not isolated"; exit 1; fi
+	[ "$rc" = 7 ] || { echo "curl exit $rc to 1.1.1.1:53, want 7 (CURLE_COULDNT_CONNECT/no route) — a reachable netns returns 52/56/28 here, so this jail still has one"; exit 1; }
+	exit 0
+'; then fail "jail name resolution / nameserver routing is not closed off"; fi
+pass "name resolution dead in jail (getent 2, curl 6) and no nameserver routable (curl 7 to 1.1.1.1:53)"
+
+# 7e. --uds fail-loud: a nonexistent socket path must exit non-zero BEFORE the cmd.
 if "$SANDBOX" --clone "$clone" --clone-mode ro --out-dir "$outdir" \
 	--uds /nonexistent.sock -- true 2>/dev/null; then
 	fail "--uds /nonexistent.sock was accepted (must fail loud before running the command)"
