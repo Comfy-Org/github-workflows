@@ -11,8 +11,11 @@ Run: python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
 """
 
 import importlib.util
+import io
 import os
+import re
 import unittest
+from unittest import mock
 
 _MODULE_PATH = os.path.join(os.path.dirname(__file__), "..", "patch_policy.py")
 _spec = importlib.util.spec_from_file_location("groom_patch_policy", _MODULE_PATH)
@@ -450,6 +453,153 @@ class RawByteRegressionTest(unittest.TestCase):
         self.assertEqual(policy.parse_raw_z(b""), [])
         self.assertEqual(policy.denied_paths([]), [])
         self.assertEqual(policy.denied_entries([]), [])
+
+
+def _run_main(raw_stdin=b"", *, env_extra=None):
+    """Drive `policy.main()` with the given raw `--raw -z` stdin and, optionally, an
+    `EXTRA_DENIED_PATHS` env value. Returns (rc, stdout_bytes, stderr_text)."""
+    stdin = io.BytesIO(raw_stdin)
+    stdout_buf = io.BytesIO()
+    stderr_buf = io.StringIO()
+
+    class _Stdin:
+        buffer = stdin
+
+    class _Stdout:
+        buffer = stdout_buf
+
+    env = {} if env_extra is None else {"EXTRA_DENIED_PATHS": env_extra}
+    orig_in, orig_out, orig_err = policy.sys.stdin, policy.sys.stdout, policy.sys.stderr
+    try:
+        policy.sys.stdin, policy.sys.stdout, policy.sys.stderr = _Stdin(), _Stdout(), stderr_buf
+        with mock.patch.dict(os.environ, env, clear=False):
+            # Ensure the var is truly absent when env_extra is None.
+            if env_extra is None:
+                os.environ.pop("EXTRA_DENIED_PATHS", None)
+            rc = policy.main()
+    finally:
+        policy.sys.stdin, policy.sys.stdout, policy.sys.stderr = orig_in, orig_out, orig_err
+    return rc, stdout_buf.getvalue(), stderr_buf.getvalue()
+
+
+def _raw(*paths):
+    """Wrap raw path bytes as regular-file `--raw -z` records."""
+    return b"".join(b":100644 100644 0000000 1111111 M\x00" + p + b"\x00" for p in paths)
+
+
+class ExtraDeniedPathsTest(unittest.TestCase):
+    """Caller-supplied `extra_denied_paths` (BE-4405): additive-only deny patterns
+    that extend the policy without editing the reusable workflow."""
+
+    def test_extra_pattern_matches(self):
+        # A repo-specific CI entrypoint the built-in list does NOT cover.
+        extra = (re.compile(r"^scripts/ci/", re.IGNORECASE),)
+        self.assertTrue(policy._is_denied("scripts/ci/deploy.sh", extra))
+        self.assertEqual(
+            policy.denied_paths(["scripts/ci/deploy.sh", "src/app.py"], extra),
+            ["scripts/ci/deploy.sh"],
+        )
+
+    def test_extra_pattern_does_not_affect_builtins(self):
+        # Built-ins still deny with an extra list present…
+        extra = (re.compile(r"^scripts/ci/"),)
+        self.assertTrue(policy._is_denied("package.json", extra))
+        # …and an UNMATCHED extra pattern denies nothing built-ins wouldn't.
+        self.assertEqual(policy.denied_paths(["src/app.py", "README.md"], extra), [])
+        # A path only the extra pattern covers is NOT denied without it (proves the
+        # extra list is the sole reason it matches — not a latent built-in).
+        self.assertFalse(policy._is_denied("scripts/ci/deploy.sh"))
+        self.assertEqual(policy.denied_paths(["scripts/ci/deploy.sh"]), [])
+
+    def test_extra_patterns_are_additive_only(self):
+        # There is no way for an extra pattern to UN-deny a built-in: the built-in
+        # OR fires first, so even an (impossible) "negation" cannot narrow the list.
+        extra = (re.compile(r".*"),)  # matches everything — only ever widens
+        self.assertEqual(policy.denied_paths(["a.py"], extra), ["a.py"])
+        # Empty extras leave the built-in verdict byte-identical.
+        self.assertEqual(policy.denied_paths(["a.py", "package.json"], ()), ["package.json"])
+
+    def test_extra_pattern_flows_through_denied_entries_and_modes(self):
+        extra = (re.compile(r"^scripts/ci/"),)
+        entries = policy.parse_raw_z(
+            _raw(b"scripts/ci/run.sh", b"src/ok.py", b"package.json")
+        )
+        self.assertEqual(
+            policy.denied_entries(entries, extra),
+            ["scripts/ci/run.sh", "package.json"],
+        )
+        # The symlink-in-suites mode deny is orthogonal and still fires with extras.
+        sym = policy.parse_raw_z(
+            b":000000 120000 0000000 1111111 M\x00suites/link\x00"
+        )
+        self.assertEqual(policy.denied_entries(sym, extra), ["suites/link"])
+
+    def test_compile_case_insensitive_like_builtins(self):
+        # A case-insensitive CI runner resolves SCRIPTS/CI/x to the real file, so
+        # the extra pattern must match it too (mirrors _PATTERN's IGNORECASE).
+        patterns = policy.compile_extra_patterns("^scripts/ci/")
+        self.assertEqual(len(patterns), 1)
+        self.assertTrue(policy._is_denied("SCRIPTS/CI/DEPLOY.SH", patterns))
+
+    def test_compile_strips_and_skips_blanks(self):
+        # Leading/trailing whitespace and blank lines are noise from a YAML block
+        # scalar: blanks skipped, non-blank lines stripped before compiling.
+        patterns = policy.compile_extra_patterns("\n  ^scripts/ci/  \n\n\t\n^custom-runner$\n")
+        self.assertEqual(len(patterns), 2)
+        self.assertTrue(policy._is_denied("scripts/ci/x", patterns))
+        self.assertTrue(policy._is_denied("custom-runner", patterns))
+
+    def test_empty_and_whitespace_input_is_a_noop(self):
+        for raw in ("", "   ", "\n\n", "\t \n  \n"):
+            self.assertEqual(policy.compile_extra_patterns(raw), [], repr(raw))
+
+    def test_invalid_pattern_raises_naming_the_bad_pattern(self):
+        with self.assertRaises(policy.InvalidExtraPattern) as ctx:
+            policy.compile_extra_patterns("^scripts/ci/\n^unbalanced[")
+        # The offending pattern (stripped) is carried for the ::error:: message.
+        self.assertEqual(ctx.exception.pattern, "^unbalanced[")
+        self.assertIn("^unbalanced[", str(ctx.exception))
+
+
+class MainExtraDeniedPathsTest(unittest.TestCase):
+    """`main()` reads EXTRA_DENIED_PATHS from the env and fails CLOSED on a typo."""
+
+    def test_env_extra_pattern_denies_via_main(self):
+        rc, out, err = _run_main(
+            _raw(b"scripts/ci/deploy.sh", b"src/app.py"),
+            env_extra="^scripts/ci/",
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, b"scripts/ci/deploy.sh\n")
+        self.assertEqual(err, "")
+
+    def test_unset_env_is_byte_identical_to_prior_behavior(self):
+        # No EXTRA_DENIED_PATHS var at all → built-in policy only, unchanged.
+        rc, out, err = _run_main(_raw(b"package.json", b"src/app.py"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, b"package.json\n")
+        self.assertEqual(err, "")
+
+    def test_empty_env_is_byte_identical(self):
+        rc, out, _ = _run_main(_raw(b"package.json", b"scripts/ci/x"), env_extra="\n  \n")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, b"package.json\n")  # scripts/ci/x NOT denied — empty extras
+
+    def test_invalid_pattern_fails_closed_with_error_annotation(self):
+        rc, out, err = _run_main(
+            _raw(b"src/app.py"),  # nothing else denied — the config error alone must fail closed
+            env_extra="^ok/\n^bad[",
+        )
+        self.assertEqual(rc, 2, "an uncompilable pattern must exit nonzero (fail closed)")
+        self.assertEqual(out, b"", "no denied-path output on the fail-closed path")
+        self.assertIn("::error::", err)
+        self.assertIn("^bad[", err, "the ::error:: must name the bad pattern")
+
+    def test_valid_env_with_no_denied_paths_exits_zero_empty(self):
+        rc, out, err = _run_main(_raw(b"src/app.py", b"README.md"), env_extra="^scripts/ci/")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, "")
 
 
 if __name__ == "__main__":

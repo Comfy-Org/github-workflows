@@ -119,7 +119,8 @@ The ones that matter:
 | `environment` | `''` | Bind a GitHub environment (in YOUR repo) on the three jobs that mint the bot App token — `build_select`, `file`, `build_pr` — so `BOT_APP_PRIVATE_KEY` can be an environment secret behind a deployment-branch policy instead of a repository secret every branch can read. Empty (the default) binds nothing, and so does any value while `bot_app_id` is unset. Deployment-branch policies only, and the environment must exist before you set this. See "Scoping the bot key to an environment" below. |
 | `builder` | `false` | Opt into PR-writing — see below. |
 | `max_prs` | `'5'` | Only with `builder: true`. Typed **string**, deliberately. |
-| `pr_size_limit` | `400` | Only with `builder: true`. Caps a built PR's diff. |
+| `pr_size_limit` | `600` | Only with `builder: true`. Caps a built PR's diff. |
+| `extra_denied_paths` | `''` | Only with `builder: true`. Newline-separated Python-`re` patterns adding this repo's OWN CI-privileged paths (a `scripts/ci/` entrypoint, a custom runner) to the built-in patch deny-list, so a matching builder patch is filed as an issue rather than opened as a PR. **Additive-only** — a caller widens the deny-list, never narrows it. A pattern that will not compile fails the run **closed** (a security-control typo must not silently widen the allow side). Propose broadly-applicable paths upstream in `patch_policy.py`; keep only repo-specific ones here. See below. |
 
 ## Scoping the bot key to an environment
 
@@ -201,6 +202,22 @@ Parsing and clamping happen once inside the reusable: empty → default,
 non-numeric → 0 PRs plus a warning. Never a failed run.
 
 Start at `max_prs: 1`. The current large-repo builder pilot runs at exactly that.
+
+### Extending the patch deny-list for your repo (`extra_denied_paths`)
+
+A builder patch that touches a path your CI **executes before a human reviews the merge** — a workflow/action def, a dependency lockfile, a build/test config — is downgraded from an auto-PR to a filed issue: on a same-repo branch push that code runs with your repository secrets and a writable token before review. The shared deny-list lives in the tested [`patch_policy.py`](../../.github/groom/patch_policy.py) and covers the common cross-ecosystem cases, but it cannot know YOUR repo's bespoke privileged surface — a checked-in `scripts/ci/` entrypoint, a custom build runner.
+
+`extra_denied_paths` closes that gap without editing the reusable workflow. Pass newline-separated Python-`re` patterns; each is matched (case-insensitively, same semantics as the built-ins) against every changed path, and any match files the patch as an issue for a human to author:
+
+```yaml
+    with:
+      builder: true
+      extra_denied_paths: |
+        ^scripts/ci/
+        ^deploy/run\.sh$
+```
+
+Two properties matter. It is **additive-only** — patterns are OR-ed onto the built-in list, so you can widen the deny-list but never narrow it (there is no way to un-deny a built-in path). And it **fails closed on a typo**: a pattern that will not compile prints an `::error::` naming it and fails the run, so the builder opens no PRs until you fix it — a broken deny-list must never silently let the path it was meant to guard sail through to an auto-PR. Erring wide is safe (a false positive only files an issue instead of opening a PR; nothing is dropped), so when in doubt, add the pattern. If a path is privileged for *most* repos, propose it upstream in `patch_policy.py` so every caller benefits, and keep only the genuinely repo-specific ones here.
 
 ## Footguns
 
