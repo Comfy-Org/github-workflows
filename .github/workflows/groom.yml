@@ -849,6 +849,36 @@ jobs:
           # a plain key=value line is safe — no heredoc delimiter needed.
           echo "resolved=$RESOLVED" >> "$GITHUB_OUTPUT"
 
+      - name: Validate extra_denied_paths (fail closed before agent spend)
+        # Compile the caller's additive deny patterns HERE — in the cheap,
+        # pre-agent gate — so a typo becomes an immediate red run instead of one
+        # that first bills the full finder+verifier+builder budget for every
+        # selected finding and only then aborts in the build job's `Capture
+        # patch` step (:3010, the pipe into patch_policy.py under `set -euo
+        # pipefail`). Reuses patch_policy.py's EXACT compile + ::error:: + exit-2
+        # contract with zero duplication: main() compiles EXTRA_DENIED_PATHS
+        # BEFORE reading stdin, so an empty stdin (empty diff) exercises only the
+        # pattern compile — exit 0 on a good/empty value, exit 2 with the
+        # identical ::error:: on a bad one. Same operator-facing message, same
+        # fail-closed shape as today, just ~10 min and zero agent spend earlier;
+        # a gate failure fails every downstream job (they all `needs: gate`).
+        # $GROOM_ASSETS is already populated by `Load groom assets` above, so no
+        # second checkout is needed. Builder-gated: extra_denied_paths is ignored
+        # unless builder is true, so a non-builder caller's typo stays harmless
+        # exactly as it is today.
+        if: ${{ inputs.builder }}
+        env:
+          # Via env, NOT inline `${{ }}` into `run:` — matches the `Capture patch`
+          # step and this file's SINK/CADENCE convention, keeping caller text off
+          # the shell command line.
+          EXTRA_DENIED_PATHS: ${{ inputs.extra_denied_paths }}
+        run: |
+          set -euo pipefail
+          # Empty stdin = empty diff: main() only reaches the pattern compile,
+          # printing nothing on success and the ::error:: + exit 2 on a bad
+          # pattern. pipefail propagates that nonzero exit so the gate fails closed.
+          printf '' | python3 "$GROOM_ASSETS/patch_policy.py" >/dev/null
+
       - name: Validate sink
         env:
           SINK: ${{ inputs.sink }}
