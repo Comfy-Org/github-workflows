@@ -26,11 +26,15 @@ name: Groom (reusable)
 # dataset-of-record paths (BE-9609): graded eval case files (`.yml`/`.yaml`) under
 # a `suites/**/cases/` tree, whose merge publishes immutable versions reserved for
 # the dataset owner. The deny-list is the tested `.github/groom/
-# patch_policy.py`. STRUCTURAL LIMIT: the deny-list guards privileged-CONFIG
-# surfaces, but ANY patch's source still executes when the caller's CI runs its
-# tests — a review-gated PR is still untrusted code running before merge. Callers
-# enabling `builder: true` should avoid exposing secrets to test steps and
-# consider `npm ci --ignore-scripts` (or equivalents) where viable.
+# patch_policy.py`. A caller extends it for its OWN privileged surface via the
+# `extra_denied_paths` input (BE-4405) — additive-only newline-separated regexes,
+# so a repo can widen the deny-list without editing this workflow (propose
+# broadly-applicable paths upstream in patch_policy.py). STRUCTURAL LIMIT: the
+# deny-list guards privileged-CONFIG surfaces, but ANY patch's source still
+# executes when the caller's CI runs its tests — a review-gated PR is still
+# untrusted code running before merge. Callers enabling `builder: true` should
+# avoid exposing secrets to test steps and consider `npm ci --ignore-scripts` (or
+# equivalents) where viable.
 #
 # Topology mirrors cursor-review.yml (this repo is the single source of truth —
 # the finder/verifier BRIEFS + the dedup ledger live under .github/groom/, so a
@@ -174,6 +178,16 @@ name: Groom (reusable)
 #         # ledger recording the bail, so a deterministic bail re-spends a
 #         # `max_prs` slot every run. Settable live via vars.GROOM_CONFIG.
 #         # bail_sink: none
+#         # OPTIONAL, builder callers only: extend the CI-privileged patch
+#         # deny-list with this repo's OWN privileged paths (BE-4405). Newline-
+#         # separated Python-re patterns; any match downgrades a builder patch to
+#         # a filed issue. Additive-only (a caller can widen, never narrow), and a
+#         # pattern that will not compile fails the run CLOSED. Propose broadly-
+#         # applicable paths upstream in patch_policy.py; keep only repo-specific
+#         # ones here.
+#         # extra_denied_paths: |
+#         #   ^scripts/ci/
+#         #   ^deploy/run\.sh$
 #       secrets:
 #         ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 #         BOT_APP_PRIVATE_KEY: ${{ secrets.CLOUD_CODE_BOT_PRIVATE_KEY }}
@@ -599,6 +613,42 @@ on:
         type: string
         required: false
         default: issue
+      extra_denied_paths:
+        description: >-
+          Repo-specific ADDITIONS to the builder patch-path deny-list (BE-4405).
+          Newline-separated Python-`re` patterns, matched against every changed
+          path in a builder patch (raw bytes, SAME semantics as the built-in
+          policy — `.search()` over the whole path and each newline-split line,
+          case-insensitive); any match downgrades that patch from an auto-PR to a
+          filed issue, exactly like a built-in deny. Use it to cover a repo's OWN
+          CI-privileged surface the shared default cannot know — a checked-in
+          `scripts/ci/` entrypoint, a custom build runner — WITHOUT editing the
+          reusable workflow.
+
+
+          ADDITIVE-ONLY by construction: patterns are OR-ed onto the built-in
+          list, so a caller can only WIDEN the deny-list, never narrow it — there
+          is no way to un-deny a built-in path. Erring wide is the safe direction
+          (a false positive only files an issue instead of opening a PR; nothing
+          is dropped). Propose broadly-applicable paths UPSTREAM in
+          `.github/groom/patch_policy.py` so every caller benefits; keep only the
+          genuinely repo-specific ones here.
+
+
+          FAIL-CLOSED on a typo: a pattern that will not compile prints an
+          `::error::` naming it and FAILS the `Capture patch` step, so the builder
+          opens NO PRs that run until the pattern is fixed — a typo in a security
+          control must never silently widen the allow side by dropping the
+          uncompilable pattern. Ignored unless `builder` is true.
+
+
+          Example caller value (a YAML block scalar, one pattern per line):
+            extra_denied_paths: |
+              ^scripts/ci/
+              ^deploy/run\.sh$
+        type: string
+        required: false
+        default: ''
     secrets:
       ANTHROPIC_API_KEY:
         description: Anthropic API key the finder + verifier agents bill through.
@@ -2963,6 +3013,13 @@ jobs:
           GIT_CONFIG_COUNT: '1'
           GIT_CONFIG_KEY_0: safe.directory
           GIT_CONFIG_VALUE_0: '*'
+          # Caller's repo-specific deny-list additions (BE-4405). Passed via env,
+          # NOT inline `${{ }}` into `run:` — matches this file's SINK/CADENCE/etc.
+          # convention and keeps caller text off the shell command line.
+          # patch_policy.py reads it, compiles each pattern, and fails CLOSED
+          # (::error:: + nonzero exit → this step aborts, no PR) on an
+          # uncompilable pattern rather than silently dropping it.
+          EXTRA_DENIED_PATHS: ${{ inputs.extra_denied_paths }}
         run: |
           set -euo pipefail
           mkdir -p /tmp/out
@@ -3063,10 +3120,14 @@ jobs:
           # load-bearing notes survive here:
           #   (a) it is a conservative DEFAULT, not a proof of completeness — the
           #       precise list is target-repo-specific, so STILL read patch_policy.py
-          #       BEFORE setting `builder: true` on any caller (a repo whose CI runs
-          #       something else privileged must add it there). Erring wide is safe:
-          #       a false positive only downgrades a legit refactor from a PR to an
-          #       issue, and nothing is dropped either way.
+          #       BEFORE setting `builder: true` on any caller. A repo whose CI runs
+          #       something else privileged adds its OWN paths via the
+          #       `extra_denied_paths` input (BE-4405, threaded in below as
+          #       $EXTRA_DENIED_PATHS) — additive-only, so a caller can widen the
+          #       deny-list without editing this workflow; propose broadly-applicable
+          #       paths upstream in patch_policy.py. Erring wide is safe: a false
+          #       positive only downgrades a legit refactor from a PR to an issue,
+          #       and nothing is dropped either way.
           #   (b) NUL-delimited comparison is mandatory (`-z`): git C-quotes and
           #       double-quote-wraps any path with a quote/backslash/control byte in
           #       default output, slipping the path past a `^\.github/` anchor; `-z`
@@ -3083,12 +3144,15 @@ jobs:
           #       `suites/**/cases/*.yaml` importer resolves straight through it).
           # $GROOM_ASSETS already points into the _groom_assets checkout (workflow
           # env, same var the prompt-build steps use).
-          # NO `|| true`: patch_policy.py always exits 0 on success (a no-match is
+          # NO `|| true`: on the happy path patch_policy.py exits 0 (a no-match is
           # empty output, not a nonzero exit, unlike the old `grep`), so `|| true`
           # would only mask a REAL failure (missing $GROOM_ASSETS, wrong path, bad
-          # interpreter, uncaught exception). Under this step's `set -euo pipefail`,
-          # letting such a failure abort the step fails CLOSED — no PR is opened when
-          # the gate can't run — instead of fail-open (empty TOUCHED_CI => PR opened).
+          # interpreter, uncaught exception, OR an uncompilable $EXTRA_DENIED_PATHS
+          # pattern, which it reports with an ::error:: and a nonzero exit — a typo
+          # in a security deny-list must not silently widen the allow side). Under
+          # this step's `set -euo pipefail`, letting such a failure abort the step
+          # fails CLOSED — no PR is opened when the gate can't run — instead of
+          # fail-open (empty TOUCHED_CI => PR opened).
           TOUCHED_CI=$(git -C repo diff --cached --no-renames --raw -z | python3 "$GROOM_ASSETS/patch_policy.py")
 
           if [ "$STATUS" != "patched" ] || [ ! -s /tmp/out/patch.diff ]; then

@@ -35,7 +35,9 @@ PR to a filed issue: on a same-repo branch push that code executes in
 credentialed CI *before* a human reads the diff (review gates merge, not CI
 exec). The deny-list is the tested [`patch_policy.py`](patch_policy.py) (BE-4404)
 — a conservative default, not a proof of completeness, so read it before setting
-`builder: true` on a repo whose CI runs something else privileged. **Structural
+`builder: true` on a repo whose CI runs something else privileged; that repo adds
+its own privileged paths via the `extra_denied_paths` caller input (BE-4405)
+rather than editing the reusable. **Structural
 limit:** the policy guards privileged-*config* surfaces, but any patch's source
 code still executes when the caller's CI runs its *tests* — a review-gated PR is
 untrusted code running pre-merge. Callers enabling the builder should avoid
@@ -349,8 +351,17 @@ foreign process already holding the port would pass a bare connect check while
 the broker exits with `EADDRINUSE`, and the consumer would then stream prompts
 and repo data (plus the dummy key) to an unrelated listener.
 
-> **groom.yml wiring lands in the sibling ticket (BE-4311)** — this file adds the
-> broker script + its unit tests only; nothing in `groom.yml` calls it yet.
+> **groom.yml wiring:** the loopback-TCP wiring of this proxy (BE-4311: a `Start
+> API key broker` step + `ANTHROPIC_BASE_URL: http://127.0.0.1:8199`) was
+> **superseded by the agent sandbox** (BE-4303 — see "The agent sandbox" below).
+> All three agent jobs now run inside `agent-sandbox.sh` and reach Anthropic
+> through `broker.mjs` over a bind-mounted **unix socket**, bridged by the in-jail
+> `jail-shim.mjs`, with a dummy `ANTHROPIC_API_KEY` — so the real key still never
+> enters the agent step's env, and the jail additionally hides the runner FS and
+> cuts off egress. `key-broker.mjs` remains the standalone loopback proxy described
+> above. The literal-key output scans (`Scan finder output for the model key`, the
+> verifier equivalent, and the builder's `Capture patch` step) stay as defence-in-
+> depth backstops, each holding the real key in its OWN no-agent step env.
 
 ## `interval.py` — the runtime cadence gate (BE-4004)
 
@@ -793,17 +804,25 @@ ecosystems. Matching is **case-insensitive** — macOS/Windows CI runners resolv
   `denied_entries(entries)` wraps it for `(old_mode, new_mode, path)` raw-diff
   entries, adding the symlink-mode deny described below.
 - `main()` reads raw diff records from stdin (matching `git diff --cached
-  --no-renames --raw -z`) and prints the denied paths, **exit 0 always** — the
-  caller tests non-emptiness. Each producer flag is load-bearing. `-z`: git
-  C-quotes exotic paths in its default output, slipping them past the anchors,
-  while `-z` emits raw bytes. `--no-renames`: with rename detection on, a rename
-  reports only its DESTINATION pairing, so a patch MOVING a denied path out to
-  an undenied one would show the policy nothing. `--raw` (not `--name-only`):
-  the raw records carry file MODE bits, which is how `denied_entries` sees
-  symlinks — path shape alone cannot.
+  --no-renames --raw -z`), folds in the caller's `EXTRA_DENIED_PATHS` patterns
+  (below), and prints the denied paths. The happy path is **exit 0** (a no-match
+  is empty output, not a nonzero exit) — the caller tests non-emptiness. The one
+  nonzero exit is fail-closed: an `EXTRA_DENIED_PATHS` pattern that will not
+  compile prints an `::error::` and exits 2, aborting the `set -euo pipefail`
+  capture step so no PR opens until the typo is fixed. Each producer flag is
+  load-bearing. `-z`: git C-quotes exotic paths in its default output, slipping
+  them past the anchors, while `-z` emits raw bytes. `--no-renames`: with rename
+  detection on, a rename reports only its DESTINATION pairing, so a patch MOVING
+  a denied path out to an undenied one would show the policy nothing. `--raw`
+  (not `--name-only`): the raw records carry file MODE bits, which is how
+  `denied_entries` sees symlinks — path shape alone cannot.
 - The list is a conservative **default, not a proof of completeness** — over-block
   is safe (a false positive only downgrades a PR to an issue), under-block is the
-  hole. A repo whose CI runs something else privileged must add it here first.
+  hole. A repo whose CI runs something else privileged adds repo-specific paths
+  via the **`extra_denied_paths`** caller input (BE-4405) — additive-only
+  newline-separated regexes, folded into the deny test with the same semantics,
+  so a caller widens the list without editing this file; propose
+  broadly-applicable ones upstream here so every caller benefits.
 - It also denies **owner-gated dataset-of-record paths** (BE-9609) — `.yml`/`.yaml`
   files at any depth under a `suites/**/cases/` tree (`**` spanning zero or more
   segments, so a flat `suites/cases/` layout is inside the surface), plus any
@@ -825,6 +844,18 @@ ecosystems. Matching is **case-insensitive** — macOS/Windows CI runners resolv
   `max_prs` slot. Over-block is still the safe direction here (the finding is
   filed as an issue, never dropped) — but if a second consumer needs its own path
   family, make the class a caller input instead of extending this tuple.
+- **`extra_denied_paths` — the caller-input escape hatch (BE-4405).** groom.yml's
+  `extra_denied_paths` input is threaded to `main()` as the `EXTRA_DENIED_PATHS`
+  env var; `compile_extra_patterns` splits it on newlines (blank/whitespace lines
+  skipped, each surviving line `.strip()`-ed and compiled `re.IGNORECASE`, mirroring
+  `_PATTERN`) and `denied_paths`/`denied_entries` OR the results onto the built-in
+  test. It is **additive-only** — a caller widens the deny-list for its own
+  privileged surface (a `scripts/ci/` entrypoint, a custom runner) and cannot narrow
+  it. A pattern that will not compile raises `InvalidExtraPattern`, which `main()`
+  turns into the fail-closed `::error::`+exit-2 above rather than silently dropping
+  it: a typo in a security deny-list must never widen the ALLOW side. This is the
+  CI-privileged half of the "make the class a caller input" note above; the
+  dataset-of-record tuple stays hardcoded for now.
 
 ```bash
 python3 -m unittest discover -s .github/groom/tests -p test_patch_policy.py -v
