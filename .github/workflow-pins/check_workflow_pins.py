@@ -1813,6 +1813,74 @@ def find_workflows_ref_defaults(lines):
     return hits
 
 
+# --- docs/callers cross-check (BE-6508) -------------------------------------
+#
+# A `docs/callers/<name>.md` page whose inputs-table row for `workflows_ref`
+# claims a default (`| workflows_ref | main | … |`) contradicts a workflow that
+# declares the input `required: true` with NO default, and used to rot silently
+# — the sibling docs-sync fix corrected the drift once, this catches it coming
+# back. Text-level like the rest of this file (no PyYAML); it only needs to find
+# ONE markdown table row and read its second cell.
+
+# A fenced code block: ``` or ~~~ (info string allowed). Its lines are skipped
+# so a ```yaml caller example carrying `workflows_ref: <sha>` is never mistaken
+# for the table row.
+_DOCS_FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
+
+# The inputs-table row itself: a markdown table line whose FIRST cell is exactly
+# the code-spanned input name. Anchored at `|` so prose merely mentioning
+# `workflows_ref` never matches — only a real table row does.
+_DOCS_ROW_RE = re.compile(r"^\s*\|\s*`workflows_ref`\s*\|(.*)$")
+
+
+def find_docs_workflows_ref_row(lines):
+    """`(line_number, default_cell)` for the docs inputs-table row documenting
+    `workflows_ref`, or None when the page has no such row.
+
+    `line_number` is 1-based; `default_cell` is the raw text of the row's second
+    (default) column. Lines inside a fenced code block are skipped so a caller
+    example is never read as the table.
+    """
+    fence = None
+    for i, line in enumerate(lines):
+        m = _DOCS_FENCE_RE.match(line)
+        if m:
+            marker = m.group(1)
+            if fence is None:
+                fence = marker[0]  # the fence char: ` or ~
+            elif marker[0] == fence:
+                fence = None
+            continue
+        if fence is not None:
+            continue
+        row = _DOCS_ROW_RE.match(line)
+        if row:
+            # The default column runs up to the next cell separator. Table cells
+            # cannot contain a literal `|` unescaped, so a plain split is safe.
+            return i + 1, row.group(1).split("|", 1)[0]
+    return None
+
+
+def docs_default_is_literal_ref(cell):
+    """True when a docs default cell names a literal ref (`main`, a SHA, …)
+    rather than a required / no-default marker (`—`, `required`, `''`).
+
+    Only the required-no-default direction is asserted, so every marker a
+    compliant page legitimately uses reads as clean; anything left over is a
+    concrete ref value the page should not be claiming.
+    """
+    stripped = re.sub(r"[`*_()]", "", cell).strip()
+    if not stripped:
+        return False
+    if "required" in stripped.lower():
+        return False
+    if re.fullmatch(r"[-‐-―]+", stripped):  # -, –, —, and kin
+        return False
+    if stripped in ("''", '""'):
+        return False
+    return True
+
+
 _STEPS_KEY_RE = re.compile(r"""^\s*(['"]?)steps\1\s*:[^\S\n]*(?:#.*)?$""")
 
 
@@ -3233,7 +3301,7 @@ def _escaped_steps_warning(path, name, lines, job_start, job_indent, count):
     )
 
 
-def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
+def check_dir(workflows_dir, exempt=KNOWN_EXEMPT, docs_dir=None):
     """Returns (errors, checked, exempt_ok, notices) — errors and notices are annotation-ready strings; only errors fail the run.
 
     `notices` carries the BE-9045 observability channel: one `::warning` per
@@ -3242,7 +3310,16 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
     and still returns 0 — because the drop it reports is a deliberate
     fail-open (a fail-CLOSED escape manufactures false CI failures out of a
     pre-scan that could not run); what was wrong was that the drop was silent.
+
+    `docs_dir` is where the BE-6508 docs cross-check looks for a workflow's
+    `<name>.md` caller guide. Defaults (when None) to `docs/callers` alongside
+    the repo the `workflows_dir` lives in, so the real CI run needs no argument
+    and a fixture dir points it at its own docs; a page that does not exist is
+    "not documented under that name" and skipped, not an error.
     """
+    if docs_dir is None:
+        repo_root = os.path.dirname(os.path.dirname(os.path.normpath(workflows_dir)))
+        docs_dir = os.path.join(repo_root, "docs", "callers")
     errors = []
     checked = []
     exempt_ok = []
@@ -3494,6 +3571,58 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT):
                 "arrives as '' and checkout silently takes the default branch. "
                 "See BE-5546." % (ann_path, lineno, ann_name, INPUT_NAME)
             )
+
+        # BE-6508: the docs must not claim a default the declaration forbids.
+        # Only the required-no-default direction is asserted — `defaults` is the
+        # empty list here (declares the input, no `default:`), which is exactly
+        # the state the no-default lint above parses. A workflow that DOES carry
+        # a default (the groom-style `default: ''` self-pin) has a non-empty
+        # `defaults` and is deliberately left out, so the check can never block
+        # legitimate docs wording for an optional/auto-derived input.
+        if not defaults:
+            base = name.rsplit(".", 1)[0]
+            docs_path = os.path.join(docs_dir, base + ".md")
+            # No page under this name = not documented as its own caller guide
+            # (e.g. refresh-reviewers.yml is covered by assign-reviewers.md), so
+            # there is nothing to cross-check. A page that EXISTS but lacks the
+            # row is the case that must not pass silently, below.
+            if os.path.isfile(docs_path):
+                ann_docs_path = _ann_prop(docs_path)
+                with open(docs_path, "r", encoding="utf-8", errors="replace") as f:
+                    doc_lines = f.read().split("\n")
+                row = find_docs_workflows_ref_row(doc_lines)
+                if row is None:
+                    # Same discipline as the "consumes the input but I can't find
+                    # the declaration" hard error above: absence of the row and
+                    # "not applicable" must not look the same.
+                    errors.append(
+                        "::error file=%s::documents the `%s` reusable workflow, "
+                        "which declares `%s` as `required: true` with no "
+                        "`default:`, but its inputs table has no `%s` row. Add a "
+                        "`| `%s` | — (**required**) | … |` row so the "
+                        "docs cannot drift from the declaration silently. "
+                        "See BE-6508." % (ann_docs_path, ann_name, INPUT_NAME, INPUT_NAME, INPUT_NAME)
+                    )
+                else:
+                    doc_lineno, default_cell = row
+                    if docs_default_is_literal_ref(default_cell):
+                        errors.append(
+                            "::error file=%s,line=%d::the `%s` inputs-table row "
+                            "documents a default of `%s`, but %s declares `%s` as "
+                            "`required: true` with no `default:`. A caller copying "
+                            "this row would SHA-pin `uses:` yet load scripts from a "
+                            "mutable ref. Set the default column to a "
+                            "required/no-default marker (e.g. `— "
+                            "(**required**)`). See BE-6508."
+                            % (
+                                ann_docs_path,
+                                doc_lineno,
+                                INPUT_NAME,
+                                _ann_msg(default_cell.strip()),
+                                ann_name,
+                                INPUT_NAME,
+                            )
+                        )
 
     # A KNOWN_EXEMPT entry naming a workflow that no longer declares the input
     # at all — renamed, deleted, or fixed. Left alone it would silently

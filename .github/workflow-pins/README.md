@@ -13,6 +13,17 @@ repo's own workflow files.
   from the *mutable-default* half only — it still has to carry a guard (see
   below). Text-level parsing (this repo is stdlib-only — no
   PyYAML), the same constraint `bump-callers.sh` works under.
+  It also (3) cross-checks the docs: when a workflow declares
+  `workflows_ref` `required: true` with no default, its
+  `docs/callers/<name>.md` page must not document a default for it — a row like
+  `| workflows_ref | main | … |` contradicts the declaration and would teach a
+  caller to load scripts from a mutable ref, so it fails naming the file, line,
+  and the workflow it contradicts. A page that exists but carries no
+  `workflows_ref` row is a hard error too (absence must not read as "not
+  applicable"); a page absent under the workflow's own name is skipped (some
+  reusables are documented on a differently-named page). Only the
+  required-no-default direction is asserted, so an optional/auto-derived input
+  like `groom.yml`'s `default: ''` is left alone.
 - **`tests/`** — `unittest` suite, run by
   [`test-workflow-pins.yml`](../workflows/test-workflow-pins.yml) along with a
   CLI smoke test that a reintroduced default really exits non-zero.
