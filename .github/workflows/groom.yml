@@ -1471,6 +1471,25 @@ jobs:
           fi
           echo "key broker ready on $BROKER_SOCK"
 
+      - name: Preflight the sandbox
+        # BE-14756: bring the bubblewrap sandbox up in its OWN step, BEFORE the
+        # billed "Run finder" step below. `--preflight-only` runs ONLY the mutating
+        # bring-up (install bubblewrap, the AppArmor profile, the sysctl fallback)
+        # and exits non-zero if a working jail cannot be established — burning NO
+        # agent budget. Splitting it out is why a no-spend setup failure never
+        # lands on the "Run finder" name: when this step fails the job fails but
+        # "Run finder" is never reached, so the runs-jobs API reports it
+        # queued/skipped and interval.py's `agent_step_started` reads it as
+        # unstarted -> the cadence clock is NOT advanced (mirrors the "Start the
+        # key broker" split, done for the same reason). The name is deliberately
+        # DISTINCT from "Run finder" so interval.py's EXACT-name match never
+        # mistakes this bring-up for the billed agent step. preflight() is
+        # idempotent, so "Run finder"'s own preflight then hits its fast path
+        # (already usable -> instant return, no side effects).
+        run: |
+          set -uo pipefail
+          bash "$GROOM_ASSETS/agent-sandbox.sh" --preflight-only
+
       # NAME IS LOAD-BEARING — `interval.py` matches this step name EXACTLY
       # (`_AGENT_STEP_NAME`) against the runs-jobs API's `steps[]` to decide
       # whether a FAILED finder job actually spent its (billed) audit and may
@@ -1479,7 +1498,10 @@ jobs:
       # "agent never started", i.e. the cadence stops throttling failures — so
       # `test_interval.py` pins both halves. Same for adding an `if:` to this
       # step: a conditionally-skipped agent inside a SUCCEEDING job would still
-      # count, because a success is trusted on the job conclusion alone.
+      # count, because a success is trusted on the job conclusion alone. The
+      # sandbox bring-up is deliberately in the separate "Preflight the sandbox"
+      # step ABOVE (BE-14756), NOT here, so a no-spend bring-up failure fails that
+      # distinctly-named step instead of this billed one.
       - name: Run finder
         # BE-4303: the agent runs ONLY inside `agent-sandbox.sh` (the bubblewrap
         # jail). What the old `chmod`/`env -u` dance did by hand the jail now does
@@ -1910,6 +1932,19 @@ jobs:
             exit 1
           fi
           echo "key broker ready on $BROKER_SOCK"
+
+      - name: Preflight the sandbox
+        # BE-14756: bring the bubblewrap sandbox up in its OWN step before the
+        # "Run verifier" step (see the finder job's "Preflight the sandbox" step
+        # for the full rationale). `--preflight-only` runs ONLY the mutating
+        # bring-up and burns no agent budget; "Run verifier"'s own preflight then
+        # hits its idempotent fast path. Only the finder job is cadence-gated, so
+        # this split does not affect interval.py's clock here — it mirrors the
+        # finder for consistency (and the "Start the key broker" precedent), and
+        # keeps a no-spend bring-up failure off the agent step in either case.
+        run: |
+          set -uo pipefail
+          bash "$GROOM_ASSETS/agent-sandbox.sh" --preflight-only
 
       - name: Run verifier
         # A FRESH agent session on a FRESH checkout — it sees only the finder's JSON
@@ -2825,6 +2860,19 @@ jobs:
             exit 1
           fi
           echo "key broker ready on $BROKER_SOCK"
+
+      - name: Preflight the sandbox
+        # BE-14756: bring the bubblewrap sandbox up in its OWN step before the
+        # "Run builder" step (see the finder job's "Preflight the sandbox" step
+        # for the full rationale). `--preflight-only` runs ONLY the mutating
+        # bring-up and burns no agent budget; "Run builder"'s own preflight then
+        # hits its idempotent fast path. Only the finder job is cadence-gated, so
+        # this split does not affect interval.py's clock here — it mirrors the
+        # finder for consistency (and the "Start the key broker" precedent), and
+        # keeps a no-spend bring-up failure off the agent step in either case.
+        run: |
+          set -uo pipefail
+          bash "$GROOM_ASSETS/agent-sandbox.sh" --preflight-only
 
       - name: Run builder
         # Runs ONLY inside `agent-sandbox.sh` (BE-4303), in `rw-git-ro` mode: the
