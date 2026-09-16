@@ -749,12 +749,19 @@ with only loopback up, so the broker — reached over the unix socket bind-mount
 at `/run/broker.sock` via the in-jail `jail-shim.mjs` TCP→UDS forwarder — is the
 *only* thing the agent can talk to. Host network, host loopback services, and
 cloud metadata (`169.254.169.254` / `168.63.129.16`) are all unreachable. So is
-**name resolution**, and twice over: the netns has no route to any nameserver (the
-runner's stub resolver at `127.0.0.53` sits on the *host's* loopback, not the
-jail's), and on a systemd-resolved runner `/etc/resolv.conf` is a symlink into
-`/run` — which the jail mounts `/etc` but deliberately not — so the resolver has
-no nameserver configured either way. A hostname the read-only `/etc/hosts` does
-not already answer cannot be resolved at all.
+**name resolution**, and twice over. First, the netns has no route off-box at all
+— one interface (`lo`), no default route — so the runner's stub resolver at
+`127.0.0.53`, which sits on the *host's* loopback and not the jail's, cannot be
+reached. Second, on a systemd-resolved runner `/etc/resolv.conf` is a symlink into
+`/run` — which the jail mounts `/etc` but deliberately not — so no `nameserver`
+line is readable and glibc falls back to the local machine (`127.0.0.1`, per
+resolv.conf(5)). That fallback *is* configured and routable: the jail's own `lo`
+carries all of `127.0.0.0/8`. Lookups fail because nothing is listening on the
+jail's `127.0.0.1:53` — which is worth knowing concretely, because the jail
+already runs in-jail loopback listeners (`jail-shim.mjs` on `127.0.0.1:8790`), so
+a future in-jail bind to `:53` would silently become the agent's resolver. Either
+way, a hostname the read-only `/etc/hosts` does not already answer cannot be
+resolved.
 
 Two consequences for callers: set `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
 in the agent env so the agent doesn't stall on telemetry endpoints that can
@@ -790,11 +797,14 @@ against false-passing on a missing tool — the IP-literal checks by asserting
 `curl` is on the jail `PATH` first, the resolution check by asserting exact,
 cause-specific exit codes (`getent` 2 = key not found, `curl` 6 =
 could-not-resolve), which a missing binary's 127 cannot satisfy. The resolution
-check also carries a second assertion on top — a no-route connect to a hardcoded
-nameserver address, `curl` 7 — because a resolution failure ALONE would still
-pass under a *shared* network namespace (the dangling `/etc/resolv.conf` above
-breaks resolution regardless of routing), and a proof that cannot go red is not a
-proof. No `claude`, no API key, no spend.
+check also carries a second assertion on top, because a resolution failure ALONE
+would still pass under a *shared* network namespace (the dangling
+`/etc/resolv.conf` above breaks resolution regardless of routing), and a proof
+that cannot go red is not a proof. That second assertion reads the jail's own
+netns out of its fresh `/proc` — `/proc/net/dev` must list `lo` and nothing else,
+`/proc/net/route` must carry no default route — rather than keying on a connect
+exit code, which could not tell an isolated netns from a shared one behind a
+firewall REJECT or on an offline host. No `claude`, no API key, no spend.
 
 ```bash
 shellcheck -x .github/groom/agent-sandbox.sh .github/groom/tests/sandbox-tests.sh
