@@ -5225,8 +5225,9 @@ class DocsCrossCheckTests(unittest.TestCase):
         self.assertIn("no `workflows_ref` row", errors[0])
 
     def test_a_missing_page_is_skipped_not_an_error(self):
-        # An internal bump-*/ci-*/test-* workflow has no docs/callers guide, so a
-        # page absent under the workflow's own name is "not applicable".
+        # A reusable that declares workflows_ref-no-default but ships no own-name
+        # docs/callers guide: a page absent under the workflow's own name is "not
+        # applicable" and skipped (the lint's blind spot — nothing to cross-check).
         self._write_wf("pr-foo.yml", _reusable(PINNED))
         errors, checked, _, _ = self._check()
         self.assertEqual(checked, ["pr-foo.yml"])
