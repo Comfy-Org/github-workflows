@@ -1365,16 +1365,19 @@ jobs:
         run: npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION:?not resolved by the gate job from .github/groom/package.json}"
 
       - name: Start API key broker
-        # BE-4311: the real key lives ONLY in this step's env and the broker's
-        # heap. It is fed via STDIN with `env -u`, never env/argv, because the
-        # agent's unscoped Read + Bash(cat:*) can read /proc/<pid>/environ and
+        # BE-4311: the real key is kept out of the AGENT step's env entirely — it
+        # lives in the broker's heap and in the env of NON-agent steps only (this
+        # launcher, and the `if: always()` leak-scan / capture-patch steps, which
+        # run no untrusted code and each carry the key for a literal-value scan).
+        # It is fed via STDIN with `env -u`, never env/argv, because the agent's
+        # unscoped Read + Bash(cat:*) can read /proc/<pid>/environ and
         # /proc/<pid>/cmdline of any same-user process on the runner. The broker
         # then replaces the x-api-key header on the way to api.anthropic.com, so
         # the agent step below carries no usable credential. Background processes
         # persist across steps within a job, so no stop step is needed — the
-        # runner tears the job down. If the broker dies mid-run the CLI fails
-        # loudly with connection-refused (fail closed), never falling back to a
-        # real key in the agent env.
+        # ubuntu-latest runner is ephemeral and torn down at job end. If the broker
+        # dies mid-run the CLI fails loudly with connection-refused (fail closed),
+        # never falling back to a real key in the agent env.
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
@@ -1840,16 +1843,19 @@ jobs:
         run: npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION:?not resolved by the gate job from .github/groom/package.json}"
 
       - name: Start API key broker
-        # BE-4311: the real key lives ONLY in this step's env and the broker's
-        # heap. It is fed via STDIN with `env -u`, never env/argv, because the
-        # agent's unscoped Read + Bash(cat:*) can read /proc/<pid>/environ and
+        # BE-4311: the real key is kept out of the AGENT step's env entirely — it
+        # lives in the broker's heap and in the env of NON-agent steps only (this
+        # launcher, and the `if: always()` leak-scan / capture-patch steps, which
+        # run no untrusted code and each carry the key for a literal-value scan).
+        # It is fed via STDIN with `env -u`, never env/argv, because the agent's
+        # unscoped Read + Bash(cat:*) can read /proc/<pid>/environ and
         # /proc/<pid>/cmdline of any same-user process on the runner. The broker
         # then replaces the x-api-key header on the way to api.anthropic.com, so
         # the agent step below carries no usable credential. Background processes
         # persist across steps within a job, so no stop step is needed — the
-        # runner tears the job down. If the broker dies mid-run the CLI fails
-        # loudly with connection-refused (fail closed), never falling back to a
-        # real key in the agent env.
+        # ubuntu-latest runner is ephemeral and torn down at job end. If the broker
+        # dies mid-run the CLI fails loudly with connection-refused (fail closed),
+        # never falling back to a real key in the agent env.
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
@@ -2755,16 +2761,19 @@ jobs:
         run: npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION:?not resolved by the gate job from .github/groom/package.json}"
 
       - name: Start API key broker
-        # BE-4311: the real key lives ONLY in this step's env and the broker's
-        # heap. It is fed via STDIN with `env -u`, never env/argv, because the
-        # agent's unscoped Read + Bash(cat:*) can read /proc/<pid>/environ and
+        # BE-4311: the real key is kept out of the AGENT step's env entirely — it
+        # lives in the broker's heap and in the env of NON-agent steps only (this
+        # launcher, and the `if: always()` leak-scan / capture-patch steps, which
+        # run no untrusted code and each carry the key for a literal-value scan).
+        # It is fed via STDIN with `env -u`, never env/argv, because the agent's
+        # unscoped Read + Bash(cat:*) can read /proc/<pid>/environ and
         # /proc/<pid>/cmdline of any same-user process on the runner. The broker
         # then replaces the x-api-key header on the way to api.anthropic.com, so
         # the agent step below carries no usable credential. Background processes
         # persist across steps within a job, so no stop step is needed — the
-        # runner tears the job down. If the broker dies mid-run the CLI fails
-        # loudly with connection-refused (fail closed), never falling back to a
-        # real key in the agent env.
+        # ubuntu-latest runner is ephemeral and torn down at job end. If the broker
+        # dies mid-run the CLI fails loudly with connection-refused (fail closed),
+        # never falling back to a real key in the agent env.
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
