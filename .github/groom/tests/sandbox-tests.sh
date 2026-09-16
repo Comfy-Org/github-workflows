@@ -58,8 +58,10 @@ pass() {
 	echo "PASS: $*"
 }
 
+skips=0
 skip() {
 	echo "SKIP: $*"
+	skips=$(( skips + 1 ))
 }
 
 # --- fixtures ----------------------------------------------------------------
@@ -295,7 +297,7 @@ if ! "$SANDBOX" --clone "$clone" --clone-mode ro --out-dir "$outdir" -- bash -c 
 '; then fail "arbitrary external IP reachable from jail"; fi
 pass "arbitrary external IP unreachable from jail"
 
-# 7d. Name resolution is dead inside the jail, and nothing off-box is routable.
+# 7d. Name resolution is dead inside the jail, and the jail is in its own netns.
 #
 # 7a/7b/7c all use IP literals ON PURPOSE, so not one of them ever touches the
 # resolver — routing is proven while name resolution is left untested. This section
@@ -304,12 +306,12 @@ pass "arbitrary external IP unreachable from jail"
 # (i) Resolution fails. Asserted on resolver-SPECIFIC exit codes rather than a bare
 #     non-zero, which is what stops the same false-pass the 7a/7b/7c tool-presence
 #     check exists to block: `getent` 2 is "key not found" specifically (a missing
-#     binary is 127) and `curl` 6 is CURLE_COULDNT_RESOLVE_HOST specifically (a
-#     connect-stage failure is 7, a timeout 28, a missing binary 127). Part (i) is
-#     only EVIDENCE about the sandbox if the name is live off-jail, so the host-side
-#     control below gates it: when this host cannot resolve the name either, the
-#     assertions still run and still have to hold, but part (i) is reported SKIPPED
-#     rather than counted as proof.
+#     binary is 127, a clipped lookup 124) and `curl` 6 is CURLE_COULDNT_RESOLVE_HOST
+#     specifically (a connect-stage failure is 7, a timeout 28, a missing binary 127).
+#     Part (i) is only EVIDENCE about the sandbox if the name is live off-jail, so the
+#     host-side control below gates it: when this host cannot resolve the name either,
+#     the assertions still run and still have to hold, but part (i) is reported
+#     SKIPPED rather than counted as proof.
 #
 # (ii) THE NETNS PROOF — do NOT collapse this into (i). Part (i) on its own is
 #     VACUOUS as evidence of network isolation: it passes under a SHARED netns too
@@ -321,76 +323,110 @@ pass "arbitrary external IP unreachable from jail"
 #     resolver is both configured AND routable in there; lookups fail only because
 #     nothing is listening on the jail's 127.0.0.1:53. That holds whatever the netns
 #     looks like, so part (i) would NOT turn red if the jail went back on a shared
-#     network. (It also means a future in-jail bind to :53 would silently become the
-#     agent's resolver — the jail already runs in-jail loopback listeners, e.g.
-#     jail-shim.mjs on 127.0.0.1:8790.)
+#     network. (It also means a future in-jail bind to 127.0.0.1:53 — or to
+#     127.0.0.53:53, systemd-resolved's own address, which is in that same /8 —
+#     would silently become the agent's resolver. The jail already runs in-jail
+#     loopback listeners, e.g. jail-shim.mjs on 127.0.0.1:8790.)
 #
-#     So key (ii) on the netns ITSELF, read out of the jail's own /proc: the wrapper
-#     passes `--proc /proc`, a fresh procfs mount inside the new netns, so
-#     /proc/net/dev and /proc/net/route describe the JAIL's network and not the
-#     host's. An isolated netns has exactly one interface (`lo`) and an empty route
-#     table; a shared one shows the host's NICs and its default route.
+#     So key (ii) on the netns ITSELF, and key it FIRST on netns IDENTITY: compare
+#     `readlink /proc/self/ns/net` inside the jail against the host's. That is the one
+#     fact that discriminates on EVERY host — the interface/route facts below are
+#     identical for a shared and an unshared netns when the HOST itself has only `lo`
+#     and no default route (a developer running this suite inside a `--network=none`
+#     container), so on such a host they would pass a wrapper that had stopped
+#     unsharing the netns. The identity check cannot.
 #
-#     Do NOT key this on a connect exit code instead. `curl` 7 is
+#     The interface and route tables are then asserted as the substantive claim —
+#     the jail's network is EMPTY, not merely separate. `/proc/net` is a magic link
+#     to `/proc/self/net`, which the kernel resolves against the READING TASK's
+#     netns, so these describe the jail's network however /proc got mounted (this is
+#     NOT a property of the wrapper's `--proc /proc`; section 4 is what covers that).
+#
+#     Do NOT key any of this on a connect exit code. `curl` 7 is
 #     CURLE_COULDNT_CONNECT, which equally covers ECONNREFUSED, ENETUNREACH and a
 #     firewall REJECT (--reject-with, ICMP admin-prohibited, or simply no default
-#     route), so a FULLY SHARED netns on a filtered or offline host returns 7 here
-#     too — an exact-7 assertion goes green on precisely the confinement regression
-#     it exists to catch. The /proc facts cannot be faked by host network state, need
-#     no egress of any kind, and cover a UDP/53 path as well as TCP: no route is no
-#     route, for any protocol.
+#     route), so a FULLY SHARED netns on a filtered or offline host returns 7 too —
+#     an exact-7 assertion goes green on precisely the confinement regression it
+#     exists to catch. The /proc facts need no egress of any kind, and cover a UDP/53
+#     path as well as TCP: no route is no route, for any protocol.
 host_resolves=""
 if timeout 5 getent hosts api.anthropic.com >/dev/null 2>&1; then
 	host_resolves=1
 	echo "note: this host resolves api.anthropic.com — the in-jail failure below is the sandbox, not a dead name"
 fi
-if ! "$SANDBOX" --clone "$clone" --clone-mode ro --out-dir "$outdir" -- bash -c '
-	# (i) name resolution fails
-	rc=0; getent hosts api.anthropic.com >/dev/null 2>&1 || rc=$?
+host_netns="$(readlink /proc/self/ns/net || true)"
+[[ -n "$host_netns" ]] || fail "cannot read the host's own netns id (/proc/self/ns/net) — 7d part (ii) needs it as the control"
+if ! "$SANDBOX" --clone "$clone" --clone-mode ro --out-dir "$outdir" \
+	--env "HOST_NETNS=$host_netns" -- bash -c '
+	# (i) name resolution fails. `timeout 5` bounds the lookup: on exactly the
+	# regression this section exists to catch (jail back on a shared netns behind a
+	# blackholed resolver) glibc would otherwise burn timeout x attempts x
+	# nameservers here, and the sandbox-tests job sets no timeout-minutes. A clipped
+	# lookup exits 124 and reds the `= 2` assertion loudly — safe direction.
+	# --noproxy "*" keeps an exported http_proxy/HTTPS_PROXY/ALL_PROXY on the runner
+	# from retargeting curl at the proxy, which would exit 5/7 and red a correctly
+	# isolated jail.
+	rc=0; timeout 5 getent hosts api.anthropic.com >/dev/null 2>&1 || rc=$?
 	if [ "$rc" = 0 ]; then echo "api.anthropic.com RESOLVED in jail — name resolution is not closed off (an /etc/hosts entry on the host would do this, served through the read-only /etc bind)"; exit 1; fi
-	[ "$rc" = 2 ] || { echo "getent exit $rc, want 2 (key not found) — getent missing from the jail PATH?"; exit 1; }
-	# --max-time here is a BACKSTOP, not margin: with the dangling resolv.conf
-	# described above glibc falls back to 127.0.0.1 and the jail lo refuses the send
-	# instantly, so this returns in milliseconds. It is deliberately NOT sized to
-	# outlast a retrying resolver (glibc defaults timeout:5 attempts:2 burn 10s on a
-	# single blackholing nameserver); a clipped lookup exits 28 and fails loud on the
-	# next line with the code printed, rather than passing silently.
-	rc=0; curl -s --max-time 10 http://api.anthropic.com/ >/dev/null 2>&1 || rc=$?
+	[ "$rc" = 2 ] || { echo "getent exit $rc, want 2 (key not found) — 124 is a clipped lookup, 127 getent missing from the jail PATH"; exit 1; }
+	# --max-time is a BACKSTOP, not margin: with the dangling resolv.conf described
+	# above glibc falls back to 127.0.0.1 and the jail lo refuses the send instantly,
+	# so this returns in milliseconds. It is deliberately NOT sized to outlast a
+	# retrying resolver (glibc defaults timeout:5 attempts:2 burn 10s on a single
+	# blackholing nameserver); a clipped lookup exits 28 and fails loud on the next
+	# line with the code printed, rather than passing silently.
+	rc=0; curl -s --noproxy "*" --max-time 10 http://api.anthropic.com/ >/dev/null 2>&1 || rc=$?
 	if [ "$rc" = 0 ]; then echo "curl reached api.anthropic.com from jail — egress is NOT closed"; exit 1; fi
 	[ "$rc" = 6 ] || { echo "curl exit $rc, want 6 (CURLE_COULDNT_RESOLVE_HOST) — failed past the resolver stage instead of at it"; exit 1; }
 
-	# (ii) the netns is EMPTY — the half a shared netns cannot fake, whatever the
-	# host network is doing. Read straight from the jail-local procfs; no tool
-	# beyond bash, so this cannot false-pass on a missing binary either.
-	[ -r /proc/net/dev ] || { echo "/proc/net/dev unreadable in jail — cannot verify the netns"; exit 1; }
-	[ -r /proc/net/route ] || { echo "/proc/net/route unreadable in jail — cannot verify the netns"; exit 1; }
-	extra_ifaces=""
+	# (ii-a) NETNS IDENTITY — the discriminator that works on every host.
+	jail_netns="$(readlink /proc/self/ns/net || true)"
+	[ -n "$jail_netns" ] || { echo "cannot read the jail netns id (/proc/self/ns/net) — cannot verify isolation"; exit 1; }
+	[ -n "${HOST_NETNS:-}" ] || { echo "HOST_NETNS was not passed into the jail — the netns-identity control is missing"; exit 1; }
+	if [ "$jail_netns" = "$HOST_NETNS" ]; then
+		echo "jail netns id $jail_netns is the HOST net namespace — the wrapper is not unsharing the netns at all"; exit 1
+	fi
+
+	# (ii-b) and that netns is EMPTY. Both loops must OBSERVE the table, not merely
+	# find no offending row: an unreadable-but-present or reformatted file would
+	# otherwise leave the collector empty and pass having seen nothing.
+	saw_lo=""; extra_ifaces=""
 	while IFS= read -r line; do
 		case "$line" in *:*) ;; *) continue ;; esac   # skip the two header rows
 		name="${line%%:*}"
 		name="${name// /}"
-		[ -n "$name" ] && [ "$name" != lo ] && extra_ifaces="$extra_ifaces $name"
+		[ -z "$name" ] && continue
+		if [ "$name" = lo ]; then saw_lo=1; else extra_ifaces="$extra_ifaces $name"; fi
 	done < /proc/net/dev
+	[ -n "$saw_lo" ] || { echo "/proc/net/dev listed no lo interface in the jail — read nothing, so it proves nothing"; exit 1; }
 	if [ -n "$extra_ifaces" ]; then
-		echo "jail netns has non-loopback interface(s):$extra_ifaces — the netns is SHARED with the host, so nothing here proves isolation"; exit 1
+		echo "jail netns has non-loopback interface(s):$extra_ifaces — the netns is not empty"; exit 1
 	fi
-	default_routes=""
+	# Default routes, v4 (/proc/net/route) AND v6 (/proc/net/ipv6_route) — the v4 FIB
+	# alone cannot see an IPv6 default, and "no route for any protocol" is the claim.
+	saw_v4_hdr=""; default_routes=""
 	while read -r iface dest _; do
-		[ "$iface" = Iface ] && continue
-		[ "$dest" = 00000000 ] && default_routes="$default_routes $iface"
+		if [ "$iface" = Iface ]; then saw_v4_hdr=1; continue; fi
+		[ "$dest" = 00000000 ] && default_routes="$default_routes v4:$iface"
 	done < /proc/net/route
-	if [ -n "$default_routes" ]; then
-		echo "jail netns has a default route via:$default_routes — a nameserver (and everything else off-box) is routable"; exit 1
+	[ -n "$saw_v4_hdr" ] || { echo "/proc/net/route had no header row in the jail — format changed, so this check proves nothing"; exit 1; }
+	# The v6 default rows present in EVERY netns are installed by the kernel as
+	# `unreachable` (flags RTF_REJECT, device lo) — count a v6 default only if it exits
+	# via a real device, which is what a shared netns would show.
+	if [ -r /proc/net/ipv6_route ]; then
+		while read -r dst dstlen _ _ _ _ _ _ _ dev _; do
+			[ "$dst" = 00000000000000000000000000000000 ] || continue
+			[ "$dstlen" = 00 ] || continue
+			[ "$dev" = lo ] && continue
+			default_routes="$default_routes v6:$dev"
+		done < /proc/net/ipv6_route
 	fi
-
-	# Behavioral confirmation on top of those facts: nothing answers on a nameserver
-	# address. Asserted as "did not succeed" ONLY — the exact failure code is not
-	# load-bearing here, by design; see (ii).
-	rc=0; curl -s --max-time 5 http://1.1.1.1:53/ >/dev/null 2>&1 || rc=$?
-	if [ "$rc" = 0 ]; then echo "nameserver 1.1.1.1:53 answered from jail — netns is not isolated"; exit 1; fi
+	if [ -n "$default_routes" ]; then
+		echo "jail netns has a default route ($default_routes) — a nameserver (and everything else off-box) is routable"; exit 1
+	fi
 	exit 0
 '; then fail "jail name resolution / netns isolation is not closed off"; fi
-pass "jail netns is empty (lo only, no default route) and no nameserver answers — resolution cannot work, and the netns is why"
+pass "jail is in its OWN netns (id != host) and that netns is empty (lo only, no v4/v6 default route) — resolution cannot work, and the netns is why"
 if [[ -n "$host_resolves" ]]; then
 	pass "name resolution dead in jail (getent 2, curl 6) against a name this host CAN resolve"
 else
@@ -404,4 +440,8 @@ if "$SANDBOX" --clone "$clone" --clone-mode ro --out-dir "$outdir" \
 fi
 pass "--uds fail-loud on a nonexistent socket path"
 
-echo "ALL SANDBOX TESTS PASSED"
+if [[ "$skips" -gt 0 ]]; then
+	echo "ALL SANDBOX TESTS PASSED ($skips skipped)"
+else
+	echo "ALL SANDBOX TESTS PASSED"
+fi
