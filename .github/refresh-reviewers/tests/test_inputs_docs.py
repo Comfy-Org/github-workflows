@@ -50,12 +50,15 @@ SETUP_GUIDE = os.path.normpath(
 INPUT_KEY = re.compile(r"^      ([A-Za-z0-9_-]+):\s*$")
 # A table row's first cell: `| `name` | ...`.
 TABLE_KEY = re.compile(r"^\|\s*`([A-Za-z0-9_-]+)`\s*\|")
-HEADING = re.compile(r"^#{2,3}\s")
+HEADING = re.compile(r"^#{2,}\s")
 
 
 def read_lines(path):
+    # Tolerate CRLF: split on \n and drop a trailing \r so indent-anchored
+    # matches (dedent break, INPUT_KEY) and `lines.index("jobs:")` are not
+    # thrown off by a stray carriage return.
     with open(path, encoding="utf-8") as f:
-        return f.read().split("\n")
+        return [line.rstrip("\r") for line in f.read().split("\n")]
 
 
 def workflow_inputs():
@@ -63,11 +66,21 @@ def workflow_inputs():
     lines = read_lines(WORKFLOW)
     # Constrain to the pre-`jobs:` header so a 6-space key inside some job's
     # step mapping can never register as an input.
+    if "jobs:" not in lines:
+        raise AssertionError(
+            f"no top-level `jobs:` line in {WORKFLOW} — file moved or its "
+            "structure changed; the input scan cannot be bounded"
+        )
     head = lines[: lines.index("jobs:")]
     names, in_inputs = set(), False
     for line in head:
         if line == "    inputs:":
             in_inputs = True
+            continue
+        if in_inputs and (not line.strip() or line.lstrip().startswith("#")):
+            # Blank or comment lines carry no indentation signal: a 4-space
+            # comment is legal YAML inside `inputs:` and must not trip the
+            # dedent break and silently truncate the scan.
             continue
         if in_inputs and re.match(r"^    \S", line):  # dedent: secrets:, etc.
             break
