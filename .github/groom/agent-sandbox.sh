@@ -60,13 +60,19 @@ selftest() {
 # the unprivileged user namespaces bwrap needs unless an unconfined AppArmor
 # profile is installed for /usr/bin/bwrap.
 preflight() {
+	# Everything here goes to STDERR, never stdout: the caller captures this
+	# script's stdout as the agent's exec JSON (see the exec comment below), and
+	# `apt-get`/`apparmor_parser`/`sysctl`/`::error::` chatter on stdout would be
+	# prepended to that JSON, breaking the downstream `jq -e .` guard so the
+	# diagnostics artifact is silently never written. Workflow `::` commands are
+	# honoured on stderr too, so the fail-loud annotation still surfaces.
 	# Fast path: already usable, do nothing (keeps repeated invocations quiet).
 	if command -v bwrap >/dev/null 2>&1 && selftest; then
 		return 0
 	fi
 
 	if ! command -v bwrap >/dev/null 2>&1; then
-		sudo apt-get install -y bubblewrap
+		sudo apt-get install -y bubblewrap >&2
 	fi
 
 	local restrict=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
@@ -79,7 +85,7 @@ profile bwrap /usr/bin/bwrap flags=(unconfined) {
   include if exists <local/bwrap>
 }
 PROFILE
-		sudo apparmor_parser -r -W /etc/apparmor.d/bwrap || true
+		sudo apparmor_parser -r -W /etc/apparmor.d/bwrap >&2 || true
 	fi
 
 	if selftest; then
@@ -87,12 +93,12 @@ PROFILE
 	fi
 
 	# Last resort: drop the unprivileged-userns restriction outright and retest.
-	sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+	sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 >&2 || true
 	if selftest; then
 		return 0
 	fi
 
-	echo "::error::bwrap sandbox unavailable on this runner image — refusing to run the agent unsandboxed"
+	echo "::error::bwrap sandbox unavailable on this runner image — refusing to run the agent unsandboxed" >&2
 	exit 1
 }
 

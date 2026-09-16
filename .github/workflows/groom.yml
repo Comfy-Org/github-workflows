@@ -634,6 +634,12 @@ env:
   # Per-job (each agent job runs on its own runner), so the fixed path never collides.
   BROKER_SOCK: /tmp/groom-broker.sock
   FINDER_OUT: /tmp/groom-out/groom-finder.json
+  # The verifier's INPUT: the finder's candidates, downloaded for the verifier job
+  # to a bare /tmp path OUTSIDE GROOM_OUT_DIR (BE-4303) and handed in `--ro-file`.
+  # It must NOT land under the rw out-dir, or a prompt-injected verifier could
+  # rewrite the very candidates it is supposed to independently adjudicate — the
+  # read-only-input invariant stated above, and the way the builder handles FINDING_IN.
+  FINDER_IN: /tmp/groom-finder-in/groom-finder.json
   VERIFIER_OUT: /tmp/groom-out/groom-verified.json
   # Auto-builder (BE-4003) intermediate files. DECISION_OUT / FINDING_IN are
   # host-side control files the agent never writes; FINDING_IN is handed to the
@@ -1404,7 +1410,13 @@ jobs:
             sleep 0.2
           done
           if [ -z "$ok" ]; then
-            echo "::error::key broker did not come up on $BROKER_SOCK within ~10s — see /tmp/groom-broker.log."
+            echo "::error::key broker did not come up on $BROKER_SOCK within ~10s — startup log follows."
+            # Surface the broker's OWN startup log on this failure path: it records
+            # method+path+status only (never headers/body/key), and a startup failure
+            # holds the node error (bad key, EADDRINUSE, a runtime fault) — the one
+            # diagnostic this branch names, otherwise unobtainable since the log is
+            # deliberately kept off the agent and out of the request-time run log.
+            cat /tmp/groom-broker.log >&2 2>/dev/null || true
             exit 1
           fi
           echo "key broker ready on $BROKER_SOCK"
@@ -1483,10 +1495,18 @@ jobs:
               # dials it; it dies with the jail (--die-with-parent). Its stderr banner
               # and the readiness curls go nowhere near the captured stdout.
               node "$GROOM_SHIM" "$SHIM_PORT" /run/broker.sock &
+              shim_ready=
               for _ in $(seq 1 50); do
-                curl -fsS "http://127.0.0.1:$SHIM_PORT/healthz" >/dev/null 2>&1 && break
+                curl -fsS "http://127.0.0.1:$SHIM_PORT/healthz" >/dev/null 2>&1 && { shim_ready=1; break; }
                 sleep 0.2
               done
+              # Fail loud (to STDERR, off the captured stdout) rather than exec the CLI
+              # against a dead ANTHROPIC_BASE_URL: that would burn the turn budget on
+              # unreachable-API retries and surface as a confusing auth/error_max_turns
+              # failure, contradicting the broker step promise that the agent never
+              # starts against a dead broker. Mirrors sandbox-tests.sh §5 (shim_ready
+              # flag + guard).
+              [ -n "$shim_ready" ] || { echo "jail-shim did not come up on 127.0.0.1:$SHIM_PORT" >&2; exit 1; }
               exec claude -p "$PROMPT" \
                 --model "$MODEL" \
                 --max-turns 150 \
@@ -1743,15 +1763,16 @@ jobs:
           persist-credentials: false
 
       - name: Download finder candidates
-        # Lands at $FINDER_OUT (/tmp/groom-out/groom-finder.json) — the only thing
+        # Lands at $FINDER_IN (/tmp/groom-finder-in/groom-finder.json) — the only thing
         # that crosses from the finder to the verifier is this JSON, treated as
-        # untrusted data. Downloaded INTO $GROOM_OUT_DIR (BE-4303) so the verifier's
-        # single rw `--out-dir` bind makes it readable inside the jail without a
-        # separate `--ro-file`.
+        # untrusted data. Downloaded to a bare /tmp dir OUTSIDE $GROOM_OUT_DIR (BE-4303)
+        # and handed to the agent step `--ro-file`, so the verifier reads it but — unlike
+        # if it sat under the single rw `--out-dir` bind — cannot rewrite the candidates
+        # it is meant to independently adjudicate. Mirrors the builder's $FINDING_IN.
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: groom-finder
-          path: ${{ env.GROOM_OUT_DIR }}
+          path: /tmp/groom-finder-in
 
       - name: Build verifier prompt
         env:
@@ -1784,7 +1805,10 @@ jobs:
               "{{SCOPE_DESC}}": os.environ["SCOPE_DESC"],
               "{{SCOPE_LABEL}}": os.environ["SCOPE_LABEL"],
               "{{SIG_SCOPE}}": os.environ["SIG_SCOPE"],
-              "{{FINDER_OUT}}": os.environ["FINDER_OUT"],
+              # The brief's {{FINDER_OUT}} placeholder is the path the verifier READS
+              # the finder's candidates from — the read-only $FINDER_IN it is handed
+              # `--ro-file`, NOT the finder job's rw out-dir path (BE-4303).
+              "{{FINDER_OUT}}": os.environ["FINDER_IN"],
               "{{VERIFIER_OUT}}": os.environ["VERIFIER_OUT"],
           }
           with open(os.path.join(os.environ["GROOM_ASSETS"], "verifier.md"), encoding="utf-8") as f:
@@ -1826,7 +1850,13 @@ jobs:
             sleep 0.2
           done
           if [ -z "$ok" ]; then
-            echo "::error::key broker did not come up on $BROKER_SOCK within ~10s — see /tmp/groom-broker.log."
+            echo "::error::key broker did not come up on $BROKER_SOCK within ~10s — startup log follows."
+            # Surface the broker's OWN startup log on this failure path: it records
+            # method+path+status only (never headers/body/key), and a startup failure
+            # holds the node error (bad key, EADDRINUSE, a runtime fault) — the one
+            # diagnostic this branch names, otherwise unobtainable since the log is
+            # deliberately kept off the agent and out of the request-time run log.
+            cat /tmp/groom-broker.log >&2 2>/dev/null || true
             exit 1
           fi
           echo "key broker ready on $BROKER_SOCK"
@@ -1835,8 +1865,10 @@ jobs:
         # A FRESH agent session on a FRESH checkout — it sees only the finder's JSON
         # + the code, never the finder's reasoning. That independence is the whole
         # point. Runs ONLY inside `agent-sandbox.sh` (BE-4303) — the clone is bound
-        # READ-ONLY, the finder's JSON is readable via the rw `--out-dir` bind it was
-        # downloaded into, and $VERIFIER_OUT is the sole write. See the finder job's
+        # READ-ONLY, the finder's JSON is handed in READ-ONLY via `--ro-file "$FINDER_IN"`
+        # (a bare /tmp path, NOT the rw out-dir, so a prompt-injected verifier cannot
+        # rewrite the candidates it adjudicates), and $VERIFIER_OUT is the sole write.
+        # See the finder job's
         # agent step for the full contract (mount allow-list, cleared env, no egress,
         # the broker/shim wiring, why `Edit(//<abs>)`/`--bare`/`--setting-sources ""`
         # still matter inside the jail).
@@ -1857,6 +1889,7 @@ jobs:
             --uds "$BROKER_SOCK" \
             --ro-file "$GROOM_ASSETS/jail-shim.mjs" \
             --ro-file /tmp/groom-verifier-prompt.md \
+            --ro-file "$FINDER_IN" \
             --env ANTHROPIC_BASE_URL="http://127.0.0.1:$SHIM_PORT" \
             --env ANTHROPIC_API_KEY=groom-sandbox-placeholder \
             --env CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
@@ -1870,10 +1903,18 @@ jobs:
             --env VERIFIER_OUT="$VERIFIER_OUT" \
             -- bash -c '
               node "$GROOM_SHIM" "$SHIM_PORT" /run/broker.sock &
+              shim_ready=
               for _ in $(seq 1 50); do
-                curl -fsS "http://127.0.0.1:$SHIM_PORT/healthz" >/dev/null 2>&1 && break
+                curl -fsS "http://127.0.0.1:$SHIM_PORT/healthz" >/dev/null 2>&1 && { shim_ready=1; break; }
                 sleep 0.2
               done
+              # Fail loud (to STDERR, off the captured stdout) rather than exec the CLI
+              # against a dead ANTHROPIC_BASE_URL: that would burn the turn budget on
+              # unreachable-API retries and surface as a confusing auth/error_max_turns
+              # failure, contradicting the broker step promise that the agent never
+              # starts against a dead broker. Mirrors sandbox-tests.sh §5 (shim_ready
+              # flag + guard).
+              [ -n "$shim_ready" ] || { echo "jail-shim did not come up on 127.0.0.1:$SHIM_PORT" >&2; exit 1; }
               exec claude -p "$PROMPT" \
                 --model "$MODEL" \
                 --max-turns 150 \
@@ -2724,7 +2765,13 @@ jobs:
             sleep 0.2
           done
           if [ -z "$ok" ]; then
-            echo "::error::key broker did not come up on $BROKER_SOCK within ~10s — see /tmp/groom-broker.log."
+            echo "::error::key broker did not come up on $BROKER_SOCK within ~10s — startup log follows."
+            # Surface the broker's OWN startup log on this failure path: it records
+            # method+path+status only (never headers/body/key), and a startup failure
+            # holds the node error (bad key, EADDRINUSE, a runtime fault) — the one
+            # diagnostic this branch names, otherwise unobtainable since the log is
+            # deliberately kept off the agent and out of the request-time run log.
+            cat /tmp/groom-broker.log >&2 2>/dev/null || true
             exit 1
           fi
           echo "key broker ready on $BROKER_SOCK"
@@ -2777,10 +2824,18 @@ jobs:
             --env PR_BODY_OUT="$PR_BODY_OUT" \
             -- bash -c '
               node "$GROOM_SHIM" "$SHIM_PORT" /run/broker.sock &
+              shim_ready=
               for _ in $(seq 1 50); do
-                curl -fsS "http://127.0.0.1:$SHIM_PORT/healthz" >/dev/null 2>&1 && break
+                curl -fsS "http://127.0.0.1:$SHIM_PORT/healthz" >/dev/null 2>&1 && { shim_ready=1; break; }
                 sleep 0.2
               done
+              # Fail loud (to STDERR, off the captured stdout) rather than exec the CLI
+              # against a dead ANTHROPIC_BASE_URL: that would burn the turn budget on
+              # unreachable-API retries and surface as a confusing auth/error_max_turns
+              # failure, contradicting the broker step promise that the agent never
+              # starts against a dead broker. Mirrors sandbox-tests.sh §5 (shim_ready
+              # flag + guard).
+              [ -n "$shim_ready" ] || { echo "jail-shim did not come up on 127.0.0.1:$SHIM_PORT" >&2; exit 1; }
               exec claude -p "$PROMPT" \
                 --model "$MODEL" \
                 --max-turns 100 \
@@ -2890,8 +2945,10 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           # The agent ran just before this step and its writes reach the worktree, so
           # the `git` invocations below must not read attacker-plantable config. The
-          # agent's jail bound `.git` read-only (BE-4303, rw-git-ro) and its worktree
-          # was invisible to the host, but THIS step runs git over that worktree on the
+          # agent's jail bound `.git` read-only (BE-4303, rw-git-ro) and the host's
+          # ~/.gitconfig was invisible to the agent — the worktree itself is bound rw at
+          # its real path precisely so this step can read the edits back — but THIS step
+          # runs git over that worktree on the
           # host where ~/.gitconfig is untouched — and a `[filter "x"] clean = <cmd>` /
           # `[diff] external = <cmd>` there,
           # referenced from a worktree `.gitattributes` the agent CAN write, would
@@ -2909,6 +2966,20 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p /tmp/out
+          # Defense-in-depth on the one host-writable surface (BE-4303): $GROOM_OUT_DIR
+          # is bound rw into the jail at its REAL host path, so a symlink planted at a
+          # fixed output name would be dereferenced HERE on the host — where files the
+          # jail could never see are readable — and its target published as the patch,
+          # summary or PR body. The builder's allowedTools grant no symlink-creating tool
+          # today (Read/Glob/Grep/Edit + read-only git/cat/ls/…), so this is belt-and-
+          # suspenders should that ever widen; fail CLOSED (bail, don't dereference).
+          if [ -L "$BUILDER_OUT" ] || [ -L "$PR_BODY_OUT" ]; then
+            echo "::error::Build $IDX: an agent output path under \$GROOM_OUT_DIR is a symlink — refusing to dereference a host path (possible exfil); filing a redacted issue instead."
+            printf '{"status":"bail","reason":"builder output path was a symlink; refusing to publish a dereferenced host file","withheld":true}\n' > /tmp/out/result.json
+            : > /tmp/out/patch.diff
+            rm -f /tmp/out/pr_body.md
+            exit 0
+          fi
           # Empty means the resolved knob set somehow carried no pr_size_limit —
           # only reachable if the CALLER's own reviewed `with:` value was itself
           # rejected by config.py (e.g. a negative literal), since the variable
