@@ -21,7 +21,7 @@
 #       [--ro-file <path> ...] [--env KEY=VALUE ...] [--uds <host-socket-path>] \
 #       -- <command...>
 #
-#   agent-sandbox.sh --preflight-only        # (alias: --selftest)
+#   agent-sandbox.sh --preflight-only
 #
 #   --uds bind-mounts a host-side listening unix socket (the broker) to the fixed
 #   in-jail path /run/broker.sock (read-only: connect(2) to a socket works under a
@@ -127,18 +127,27 @@ main() {
 			--ro-file) [[ $# -ge 2 ]] || die "--ro-file needs a value"; ro_files+=("$2"); shift 2 ;;
 			--env) [[ $# -ge 2 ]] || die "--env needs a value"; envs+=("$2"); shift 2 ;;
 			--uds) [[ $# -ge 2 ]] || die "--uds needs a value"; [[ -n "$2" ]] || die "--uds needs a non-empty value"; [[ -z "$uds" ]] || die "--uds may be given at most once"; uds="$2"; shift 2 ;;
-			--preflight-only | --selftest) preflight_only=1; shift ;;
+			--preflight-only) preflight_only=1; shift ;;
 			--) shift; cmd=("$@"); break ;;
 			*) die "unknown argument: $1" ;;
 		esac
 	done
 
 	# --preflight-only: run ONLY the (mutating) sandbox bring-up and report whether
-	# a working jail is now available (BE-14756). It takes no clone/out-dir/command,
-	# so skip every requirement check below and short-circuit here. preflight()
-	# exits non-zero itself when the sandbox cannot be established.
+	# a working jail is now available (BE-14756). It takes NO clone/clone-mode/
+	# out-dir/uds/ro-file/env and NO `-- <command>`; combining it with any of those
+	# is a copy-paste mistake — a stray `--preflight-only` on a real agent step
+	# would otherwise silently discard the clone/out-dir/command and exit 0 having
+	# run no agent, the opposite of this mode's contract. Every other bad flag
+	# combination here dies loudly, so die here too instead of short-circuiting
+	# past every validation. preflight() fails loud itself when the sandbox cannot
+	# be established; `|| exit $?` keeps that structural even if preflight() is ever
+	# refactored to RETURN non-zero rather than terminate the process.
 	if [[ -n "$preflight_only" ]]; then
-		preflight
+		[[ -z "$clone" && -z "$clone_mode" && -z "$out_dir" && -z "$uds" \
+			&& ${#ro_files[@]} -eq 0 && ${#envs[@]} -eq 0 && ${#cmd[@]} -eq 0 ]] \
+			|| die "--preflight-only takes no --clone/--clone-mode/--out-dir/--uds/--ro-file/--env and no -- <command>"
+		preflight || exit $?
 		exit 0
 	fi
 

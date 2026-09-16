@@ -1476,12 +1476,18 @@ jobs:
         # billed "Run finder" step below. `--preflight-only` runs ONLY the mutating
         # bring-up (install bubblewrap, the AppArmor profile, the sysctl fallback)
         # and exits non-zero if a working jail cannot be established — burning NO
-        # agent budget. Splitting it out is why a no-spend setup failure never
-        # lands on the "Run finder" name: when this step fails the job fails but
-        # "Run finder" is never reached, so the runs-jobs API reports it
+        # agent budget. Splitting it out is why a no-spend sandbox BRING-UP failure
+        # never lands on the "Run finder" name: when this step fails the job fails
+        # but "Run finder" is never reached, so the runs-jobs API reports it
         # queued/skipped and interval.py's `agent_step_started` reads it as
         # unstarted -> the cadence clock is NOT advanced (mirrors the "Start the
-        # key broker" split, done for the same reason). The name is deliberately
+        # key broker" split, done for the same reason). NOTE this covers the
+        # bring-up ONLY: agent-sandbox.sh still runs no-spend, fail-loud guards
+        # (argument validation, the --uds live-broker healthz probe, the clone/
+        # out-dir path + overlap checks) INSIDE "Run finder" before it execs the
+        # agent, and any of those dying still stamps "Run finder" failed with no
+        # spend -> counted as a spent audit. Hoisting that validation ahead of the
+        # billed step (a validate-only mode) is tracked separately. The name is deliberately
         # DISTINCT from "Run finder" so interval.py's EXACT-name match never
         # mistakes this bring-up for the billed agent step. preflight() is
         # idempotent, so "Run finder"'s own preflight then hits its fast path

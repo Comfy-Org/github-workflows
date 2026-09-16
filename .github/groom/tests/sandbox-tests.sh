@@ -306,14 +306,26 @@ pass "--uds fail-loud on a nonexistent socket path"
 
 # 8a. With a working bwrap (proven by sections 1-7 above), --preflight-only hits
 # preflight()'s idempotent fast path and exits 0 — no clone, no out-dir, no
-# `-- command`. The --selftest alias must behave identically.
+# `-- command`.
 if ! "$SANDBOX" --preflight-only >/dev/null 2>&1; then
 	fail "--preflight-only exited non-zero on a host with a working bwrap sandbox"
 fi
-if ! "$SANDBOX" --selftest >/dev/null 2>&1; then
-	fail "--selftest (alias of --preflight-only) exited non-zero on a working sandbox"
+pass "--preflight-only exits 0 when the sandbox is already usable (no clone/out-dir/command)"
+
+# 8a'. --preflight-only takes NO execution-mode args: combining it with a clone,
+# out-dir, uds, ro-file, env, or a `-- command` must DIE, not silently discard
+# them and exit 0 (a stray --preflight-only on a real agent step would otherwise
+# be a green no-op that runs no agent). Each bad combination must fail loud.
+if "$SANDBOX" --preflight-only --clone "$work" --out-dir "$work/out" -- true >/dev/null 2>&1; then
+	fail "--preflight-only with --clone/--out-dir/-- command exited 0 (must die, not run a green no-op)"
 fi
-pass "--preflight-only / --selftest exit 0 when the sandbox is already usable (no clone/out-dir/command)"
+if "$SANDBOX" --preflight-only --uds /tmp/nope.sock >/dev/null 2>&1; then
+	fail "--preflight-only with --uds exited 0 (must die)"
+fi
+if "$SANDBOX" --preflight-only -- true >/dev/null 2>&1; then
+	fail "--preflight-only with a -- command exited 0 (must die)"
+fi
+pass "--preflight-only dies loud when combined with any execution-mode argument"
 
 # 8b. --preflight-only must still FAIL LOUD when a working sandbox cannot be
 # established. Stub bwrap to always fail (so the self-test never passes) and sudo
