@@ -351,8 +351,15 @@ foreign process already holding the port would pass a bare connect check while
 the broker exits with `EADDRINUSE`, and the consumer would then stream prompts
 and repo data (plus the dummy key) to an unrelated listener.
 
-> **groom.yml wiring lands in the sibling ticket (BE-4311)** — this file adds the
-> broker script + its unit tests only; nothing in `groom.yml` calls it yet.
+> **groom.yml wiring (BE-4311):** all three agent jobs (`audit_find`,
+> `audit_verify`, `build`) start this broker in a `Start API key broker` step
+> right after `Install Claude Code`, then run the Claude CLI with only the dummy
+> `ANTHROPIC_API_KEY: groom-broker-dummy` and `ANTHROPIC_BASE_URL:
+> http://127.0.0.1:8199` — so the agent steps carry no real credential. The
+> literal-key output scans (`Scan finder output for leaked key`, the verifier
+> equivalent, and the builder's `Capture patch` step) are now defence in depth
+> rather than the primary barrier, and each holds the real key in its OWN step
+> env because it runs no agent.
 
 ## `interval.py` — the runtime cadence gate (BE-4004)
 
