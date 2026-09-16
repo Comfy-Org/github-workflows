@@ -14,11 +14,17 @@ on:
     paths:
       - '.github/workflows/**'
       - '.github/workflow-pins/**'
+      # The lint also cross-checks each reusable's caller guide (BE-6508), so a
+      # docs-only edit that reintroduces `| workflows_ref | main | … |` must
+      # trigger it too — otherwise the guard never runs on the drift it exists
+      # to catch.
+      - 'docs/callers/**'
   push:
     branches: [main]
     paths:
       - '.github/workflows/**'
       - '.github/workflow-pins/**'
+      - 'docs/callers/**'
 
 permissions:
   contents: read
