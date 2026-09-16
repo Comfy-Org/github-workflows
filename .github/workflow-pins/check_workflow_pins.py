@@ -1817,15 +1817,21 @@ def find_workflows_ref_defaults(lines):
 #
 # A `docs/callers/<name>.md` page whose inputs-table row for `workflows_ref`
 # claims a default (`| workflows_ref | main | … |`) contradicts a workflow that
-# declares the input `required: true` with NO default, and used to rot silently
-# — the sibling docs-sync fix corrected the drift once, this catches it coming
+# declares the input with NO `default:` (the required-no-default shape this repo
+# mandates — the checker gates on the absent default, which is what it actually
+# parses, not on `required:` which it does not read), and used to rot silently —
+# the sibling docs-sync fix corrected the drift once, this catches it coming
 # back. Text-level like the rest of this file (no PyYAML); it only needs to find
 # ONE markdown table row and read its second cell.
 
-# A fenced code block: ``` or ~~~ (info string allowed). Its lines are skipped
-# so a ```yaml caller example carrying `workflows_ref: <sha>` is never mistaken
-# for the table row.
-_DOCS_FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
+# A fenced code block line: 3+ backticks or tildes, capturing the run itself and
+# whatever trails it. Its lines are skipped so a ```yaml caller example carrying
+# `workflows_ref: <sha>` is never mistaken for the table row. The captured run
+# LENGTH and trailing text matter (CommonMark §4.5): a closer must repeat the
+# opener's char, be at least as long, and carry no info string — so a four-tick
+# block containing a bare ``` does not close early and invert the state for the
+# rest of the page.
+_DOCS_FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})([^\n]*)$")
 
 # The inputs-table row itself: a markdown table line whose FIRST cell is exactly
 # the code-spanned input name. Anchored at `|` so prose merely mentioning
@@ -1841,14 +1847,21 @@ def find_docs_workflows_ref_row(lines):
     (default) column. Lines inside a fenced code block are skipped so a caller
     example is never read as the table.
     """
-    fence = None
+    fence = None  # (char, length) of the OPEN fence, or None
     for i, line in enumerate(lines):
         m = _DOCS_FENCE_RE.match(line)
         if m:
-            marker = m.group(1)
+            run, rest = m.group(1), m.group(2)
+            char, length = run[0], len(run)
             if fence is None:
-                fence = marker[0]  # the fence char: ` or ~
-            elif marker[0] == fence:
+                # Opener; an info string is allowed, except a backtick fence's
+                # info string may not itself contain a backtick (CommonMark),
+                # which also keeps an inline ``code`` span off this path.
+                if not (char == "`" and "`" in rest):
+                    fence = (char, length)
+            elif char == fence[0] and length >= fence[1] and not rest.strip():
+                # Closer: same char, at least as long, no info string. Anything
+                # else here is ordinary content inside the block.
                 fence = None
             continue
         if fence is not None:
@@ -1861,24 +1874,35 @@ def find_docs_workflows_ref_row(lines):
     return None
 
 
+# Cells that mean "no default / required", not a concrete ref value. Compared
+# against the WHOLE normalized cell (markdown emphasis and dash glyphs stripped,
+# whitespace collapsed), NOT scanned for a keyword: a real ref documented as
+# `main (**required until BE-x**)` must NOT be waved through by the word
+# `required` sitting inside it.
+_DOCS_NO_DEFAULT_MARKERS = frozenset(
+    ("", "required", "none", "no default", "n/a", "na", "unset", "''", '""')
+)
+
+
 def docs_default_is_literal_ref(cell):
     """True when a docs default cell names a literal ref (`main`, a SHA, …)
-    rather than a required / no-default marker (`—`, `required`, `''`).
+    rather than a required / no-default marker (`—`, `required`, `n/a`, `''`).
 
     Only the required-no-default direction is asserted, so every marker a
     compliant page legitimately uses reads as clean; anything left over is a
-    concrete ref value the page should not be claiming.
+    concrete ref value the page should not be claiming. The stripped cell is
+    matched as a WHOLE against the marker set — `main (**required**)` documents a
+    mutable default and must not read clean just because it contains `required`.
     """
     stripped = re.sub(r"[`*_()]", "", cell).strip()
     if not stripped:
         return False
-    if "required" in stripped.lower():
-        return False
-    if re.fullmatch(r"[-‐-―]+", stripped):  # -, –, —, and kin
-        return False
-    if stripped in ("''", '""'):
-        return False
-    return True
+    # Drop dash-like glyphs — hyphen-minus, the U+2010–U+2015 range, and the
+    # U+2212 MINUS SIGN that sits OUTSIDE it — and collapse whitespace, so
+    # `— (**required**)` normalizes to `required` and a lone `—` to ``.
+    core = re.sub(r"[-‐-―−]+", " ", stripped)
+    core = " ".join(core.split()).lower()
+    return core not in _DOCS_NO_DEFAULT_MARKERS
 
 
 _STEPS_KEY_RE = re.compile(r"""^\s*(['"]?)steps\1\s*:[^\S\n]*(?:#.*)?$""")
@@ -3597,8 +3621,9 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT, docs_dir=None):
                     # "not applicable" must not look the same.
                     errors.append(
                         "::error file=%s::documents the `%s` reusable workflow, "
-                        "which declares `%s` as `required: true` with no "
-                        "`default:`, but its inputs table has no `%s` row. Add a "
+                        "which declares `%s` with no `default:` (the "
+                        "required-no-default shape this repo mandates), but its "
+                        "inputs table has no `%s` row. Add a "
                         "`| `%s` | — (**required**) | … |` row so the "
                         "docs cannot drift from the declaration silently. "
                         "See BE-6508." % (ann_docs_path, ann_name, INPUT_NAME, INPUT_NAME, INPUT_NAME)
@@ -3608,8 +3633,8 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT, docs_dir=None):
                     if docs_default_is_literal_ref(default_cell):
                         errors.append(
                             "::error file=%s,line=%d::the `%s` inputs-table row "
-                            "documents a default of `%s`, but %s declares `%s` as "
-                            "`required: true` with no `default:`. A caller copying "
+                            "documents a default of `%s`, but %s declares `%s` "
+                            "with no `default:`. A caller copying "
                             "this row would SHA-pin `uses:` yet load scripts from a "
                             "mutable ref. Set the default column to a "
                             "required/no-default marker (e.g. `— "

@@ -16,7 +16,8 @@ repo's own workflow files.
   It also (3) cross-checks the docs: when a workflow declares
   `workflows_ref` `required: true` with no default, its
   `docs/callers/<name>.md` page must not document a default for it — a row like
-  `| workflows_ref | main | … |` contradicts the declaration and would teach a
+  `` | `workflows_ref` | main | … | `` (the name in a code span, as every guide
+  writes it) contradicts the declaration and would teach a
   caller to load scripts from a mutable ref, so it fails naming the file, line,
   and the workflow it contradicts. A page that exists but carries no
   `workflows_ref` row is a hard error too (absence must not read as "not

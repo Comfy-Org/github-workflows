@@ -5038,6 +5038,24 @@ class DocsDefaultLiteralRefTests(unittest.TestCase):
     def test_an_empty_cell_is_not_a_literal_ref(self):
         self.assertFalse(cwp.docs_default_is_literal_ref("   "))
 
+    def test_a_ref_that_merely_contains_the_word_required_is_a_literal_ref(self):
+        # The keyword must not wave through a cell that documents a real default
+        # — matching is whole-cell, not a substring scan.
+        self.assertTrue(cwp.docs_default_is_literal_ref(" `main` (**required**) "))
+        self.assertTrue(cwp.docs_default_is_literal_ref(" main — required until BE-1 "))
+
+    def test_common_no_default_wordings_are_clean(self):
+        for marker in ("n/a", "none", "(none)", "no default", "unset", "NA"):
+            self.assertFalse(
+                cwp.docs_default_is_literal_ref(marker),
+                "%r should read as no-default" % marker,
+            )
+
+    def test_a_u2212_minus_sign_marker_is_clean(self):
+        # U+2212 MINUS SIGN sits outside the U+2010–U+2015 dash range.
+        self.assertFalse(cwp.docs_default_is_literal_ref(" − "))
+        self.assertFalse(cwp.docs_default_is_literal_ref(" − (**required**) "))
+
 
 class FindDocsRowTests(unittest.TestCase):
     def _find(self, text):
@@ -5086,6 +5104,35 @@ class FindDocsRowTests(unittest.TestCase):
         found = self._find(text)
         self.assertIsNotNone(found)
         self.assertEqual(found[0], 5)
+
+    def test_a_shorter_inner_fence_does_not_close_a_longer_block(self):
+        # A four-backtick block containing a bare ``` line must NOT close early
+        # and invert the state: the row-shaped line stays inside the fence and
+        # is ignored, and the real row after the four-backtick closer is found.
+        text = (
+            "# Page\n"
+            "````\n"
+            "```\n"
+            "| `workflows_ref` | main | fenced sample, not the row |\n"
+            "````\n"
+            "| `workflows_ref` | — (**required**) | the real row |\n"
+        )
+        found = self._find(text)
+        self.assertIsNotNone(found)
+        self.assertEqual(found[0], 6)
+        self.assertEqual(found[1].strip(), "— (**required**)")
+
+    def test_a_closer_carrying_an_info_string_does_not_close(self):
+        # Only a bare fence closes; `​```yaml` inside a block is content, so the
+        # row-shaped line after it stays fenced and is not read as the row.
+        text = (
+            "# Page\n"
+            "```\n"
+            "```yaml\n"
+            "| `workflows_ref` | main | still fenced |\n"
+            "```\n"
+        )
+        self.assertIsNone(self._find(text))
 
 
 class DocsCrossCheckTests(unittest.TestCase):
