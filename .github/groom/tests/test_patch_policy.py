@@ -519,6 +519,34 @@ class ExtraDeniedPathsTest(unittest.TestCase):
         # Empty extras leave the built-in verdict byte-identical.
         self.assertEqual(policy.denied_paths(["a.py", "package.json"], ()), ["package.json"])
 
+    def test_one_shot_iterator_is_not_exhausted_across_paths(self):
+        # A generator of patterns is a one-shot iterator: `_is_denied` re-iterates
+        # the extras per path, so without materializing them once, the FIRST path
+        # would exhaust the generator and every later path would see zero extras —
+        # a silent under-block. Both entry points must materialize.
+        def gen():
+            yield re.compile(r"^scripts/ci/")
+
+        # Second and third paths (checked after the generator would be exhausted)
+        # must still be denied.
+        self.assertEqual(
+            policy.denied_paths(["src/a.py", "scripts/ci/x", "scripts/ci/y"], gen()),
+            ["scripts/ci/x", "scripts/ci/y"],
+        )
+        entries = policy.parse_raw_z(_raw(b"src/a.py", b"scripts/ci/x", b"scripts/ci/y"))
+        self.assertEqual(
+            policy.denied_entries(entries, gen()),
+            ["scripts/ci/x", "scripts/ci/y"],
+        )
+
+    def test_compile_wraps_non_re_error_compile_failures(self):
+        # re.compile raises more than re.error for caller-caused failures: an
+        # oversized repeat bound surfaces OverflowError. It must be wrapped in
+        # InvalidExtraPattern (naming the line), not escape as a raw traceback.
+        with self.assertRaises(policy.InvalidExtraPattern) as ctx:
+            policy.compile_extra_patterns("a{4294967296}")
+        self.assertEqual(ctx.exception.pattern, "a{4294967296}")
+
     def test_extra_pattern_flows_through_denied_entries_and_modes(self):
         extra = (re.compile(r"^scripts/ci/"),)
         entries = policy.parse_raw_z(
@@ -571,7 +599,11 @@ class MainExtraDeniedPathsTest(unittest.TestCase):
         )
         self.assertEqual(rc, 0)
         self.assertEqual(out, b"scripts/ci/deploy.sh\n")
-        self.assertEqual(err, "")
+        # A present deny-list leaves a ::notice:: evidence trail (count + patterns),
+        # never touching captured stdout.
+        self.assertIn("::notice::", err)
+        self.assertIn("compiled 1", err)
+        self.assertIn("^scripts/ci/", err)
 
     def test_unset_env_is_byte_identical_to_prior_behavior(self):
         # No EXTRA_DENIED_PATHS var at all → built-in policy only, unchanged.
@@ -599,7 +631,37 @@ class MainExtraDeniedPathsTest(unittest.TestCase):
         rc, out, err = _run_main(_raw(b"src/app.py", b"README.md"), env_extra="^scripts/ci/")
         self.assertEqual(rc, 0)
         self.assertEqual(out, b"")
-        self.assertEqual(err, "")
+        # No denied path, but the deny-list was active — the evidence notice still fires.
+        self.assertIn("::notice::", err)
+        self.assertIn("compiled 1", err)
+
+    def test_no_notice_when_no_extra_patterns(self):
+        # A caller not using the feature (unset or blank) gets no annotation noise.
+        _, _, err_unset = _run_main(_raw(b"src/app.py"))
+        self.assertNotIn("::notice::", err_unset)
+        _, _, err_blank = _run_main(_raw(b"src/app.py"), env_extra="\n  \n")
+        self.assertNotIn("::notice::", err_blank)
+
+    def test_folded_scalar_is_visible_in_the_notice(self):
+        # A `>-` folded block collapses two patterns into one inert line; the notice
+        # renders it AS COMPILED so the operator can see the fold (one pattern, an
+        # interior space) rather than the two they intended.
+        rc, out, err = _run_main(
+            _raw(b"scripts/ci/x"), env_extra="^scripts/ci/ ^deploy/run\\.sh$"
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, b"", "the folded pattern matches no real path — nothing denied")
+        self.assertIn("compiled 1", err)
+        self.assertIn("^scripts/ci/ ^deploy/run", err)
+
+    def test_overflow_repeat_bound_fails_closed_naming_the_pattern(self):
+        # An oversized repeat bound raises OverflowError inside re.compile, not
+        # re.error; it must still reach the fail-closed ::error:: naming the line.
+        rc, out, err = _run_main(_raw(b"src/app.py"), env_extra="a{4294967296}")
+        self.assertEqual(rc, 2)
+        self.assertEqual(out, b"")
+        self.assertIn("::error::", err)
+        self.assertIn("a{4294967296}", err)
 
 
 if __name__ == "__main__":

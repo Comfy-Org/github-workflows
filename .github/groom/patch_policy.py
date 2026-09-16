@@ -30,6 +30,10 @@ is fail-closed: an `EXTRA_DENIED_PATHS` pattern that will not compile prints an
 no `|| true`) aborts and NO PR opens for any finding until the typo is fixed —
 because silently dropping an uncompilable deny pattern would widen the ALLOW
 side, the one direction a security control must never fail toward (see main()).
+When extra patterns ARE present, `main()` also emits a `::notice::` echoing the
+compiled count and values, so a caller who accidentally folds them onto one inert
+line (a `>-` block scalar) leaves evidence on the run record instead of a silently
+empty deny-list.
 
 Two load-bearing invariants (see also the trimmed comment in groom.yml):
 
@@ -280,6 +284,12 @@ def denied_paths(paths: Iterable[str], extra_patterns: Iterable[re.Pattern] = ()
     # a string would iterate its characters and silently under-block. Fail loud.
     if isinstance(paths, (str, bytes)):
         raise TypeError("denied_paths expects an iterable of paths, not a single str/bytes")
+    # Materialize the extras ONCE: `_is_denied` re-iterates them per path, so a
+    # one-shot iterator (a generator, `map(re.compile, …)`) would be exhausted by
+    # the first path and every later path checked against ZERO extras — a silent
+    # under-block, the one direction this deny-list must never fail toward. `main()`
+    # already passes a list, so this only hardens the public annotation. (BE-4405.)
+    extra_patterns = tuple(extra_patterns)
     return [p for p in paths if _is_denied(p, extra_patterns)]
 
 
@@ -356,6 +366,10 @@ def denied_entries(
     territory: the deny-list is a conservative default, and a caller whose
     dataset surface extends beyond literal `suites/` paths must extend it.
     """
+    # Materialize the extras ONCE (see `denied_paths`): `_is_denied` re-iterates
+    # them per entry, so a one-shot iterator would exhaust after the first entry
+    # and silently under-block the rest. (BE-4405.)
+    extra_patterns = tuple(extra_patterns)
     return [
         path
         for old_mode, new_mode, path in entries
@@ -379,9 +393,17 @@ class InvalidExtraPattern(ValueError):
     diff input, whose fail-closed contract is separate.
     """
 
-    def __init__(self, pattern: str, error: "re.error"):
+    def __init__(self, pattern: str, error: BaseException):
         self.pattern = pattern
         super().__init__(f"{pattern!r} did not compile: {error}")
+
+
+# `re.compile` rejects a caller pattern with more than `re.error`: an oversized
+# repeat bound (`a{4294967296}`) surfaces `OverflowError`, and deep nesting can
+# surface `RecursionError`. All are caller-caused compile failures and must reach
+# the SAME fail-closed `::error::` (naming the pattern), not an unlabeled traceback
+# that leaves the operator guessing which line broke. (BE-4405.)
+_COMPILE_ERRORS = (re.error, OverflowError, RecursionError)
 
 
 def compile_extra_patterns(raw: str) -> list[re.Pattern]:
@@ -401,7 +423,10 @@ def compile_extra_patterns(raw: str) -> list[re.Pattern]:
 
     A line that will not compile raises `InvalidExtraPattern` rather than being
     dropped: `main()` turns that into a fail-closed `::error::` + nonzero exit. A
-    typo in a security deny-list must never silently widen the allow side.
+    typo in a security deny-list must never silently widen the allow side. Every
+    caller-caused compile failure — not just `re.error` but `OverflowError`
+    (oversized repeat bound) and `RecursionError` (deep nesting) — is wrapped, so
+    the operator always gets the named `::error::`, never a raw traceback.
     """
     patterns: list[re.Pattern] = []
     for line in raw.split("\n"):
@@ -410,7 +435,7 @@ def compile_extra_patterns(raw: str) -> list[re.Pattern]:
             continue
         try:
             patterns.append(re.compile(stripped, re.IGNORECASE))
-        except re.error as exc:
+        except _COMPILE_ERRORS as exc:
             raise InvalidExtraPattern(stripped, exc) from exc
     return patterns
 
@@ -446,6 +471,26 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+
+    # Leave EVIDENCE of the active extra deny-list on the run record (BE-4405): a
+    # caller who writes the block scalar as `>-` instead of `|` has YAML FOLD the
+    # patterns onto one line (`^scripts/ci/ ^deploy/run\.sh$`), which compiles
+    # cleanly, matches no real path, and silently denies NOTHING while the operator
+    # believes the surface is guarded. A `::notice::` echoing the compiled count and
+    # the patterns AS COMPILED makes that fold visible — one line where two were
+    # meant — instead of an inert deny-list failing invisibly toward ALLOW. Emitted
+    # only when patterns are present, so a caller not using the feature sees no
+    # annotation. Same STDERR rationale as the ::error:: above (stdout is captured
+    # into $TOUCHED_CI; the runner scans stderr for annotations).
+    if extra_patterns:
+        rendered = " ".join(repr(p.pattern) for p in extra_patterns)
+        print(
+            f"::notice::extra_denied_paths: compiled {len(extra_patterns)} "
+            f"additive deny pattern(s): {rendered}. If you expected more, check the "
+            "caller's block scalar is `|` (literal, one pattern per line), not `>-` "
+            "(folded — collapses every line into one inert pattern).",
+            file=sys.stderr,
+        )
 
     # Write raw bytes, not text: the parsers decode with `surrogateescape`, so a
     # denied path carrying non-UTF-8 bytes holds lone surrogates that the default

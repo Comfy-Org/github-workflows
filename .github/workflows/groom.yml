@@ -173,8 +173,10 @@ name: Groom (reusable)
 #         # pattern that will not compile fails the run CLOSED. Propose broadly-
 #         # applicable paths upstream in patch_policy.py; keep only repo-specific
 #         # ones here.
+#         # To deny a whole subtree, anchor with `(?:/|$)` not a bare trailing
+#         # `/` — `^scripts/ci/` misses a symlink/gitlink at `scripts/ci` itself.
 #         # extra_denied_paths: |
-#         #   ^scripts/ci/
+#         #   ^scripts/ci(?:/|$)
 #         #   ^deploy/run\.sh$
 #       secrets:
 #         ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -630,9 +632,19 @@ on:
           uncompilable pattern. Ignored unless `builder` is true.
 
 
+          To deny a whole SUBTREE, anchor with `(?:/|$)` rather than a bare
+          trailing slash: `^scripts/ci/` misses a symlink or gitlink AT
+          `scripts/ci` itself (the very indirection the deny is meant to catch),
+          whereas `^scripts/ci(?:/|$)` denies both the directory and that entry.
+          Patterns run through Python `re` with no match timeout, so avoid
+          catastrophic backtracking (nested unbounded quantifiers like `(a+)+`):
+          a pathological pattern only ever STALLS the builder to its job timeout
+          (fail-closed, no PR), never opens one, but it wastes the run.
+
+
           Example caller value (a YAML block scalar, one pattern per line):
             extra_denied_paths: |
-              ^scripts/ci/
+              ^scripts/ci(?:/|$)
               ^deploy/run\.sh$
         type: string
         required: false

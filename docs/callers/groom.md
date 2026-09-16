@@ -213,9 +213,11 @@ A builder patch that touches a path your CI **executes before a human reviews th
     with:
       builder: true
       extra_denied_paths: |
-        ^scripts/ci/
+        ^scripts/ci(?:/|$)
         ^deploy/run\.sh$
 ```
+
+To deny a whole **subtree**, anchor it with `(?:/|$)` rather than a bare trailing slash. `^scripts/ci/` denies files *under* the directory but misses a symlink or gitlink at `scripts/ci` **itself** — the exact indirection the deny is meant to catch (a symlink there redirects everything below it to an undenied tree). `^scripts/ci(?:/|$)` denies both. The patterns run through Python `re` with no match timeout, so avoid catastrophic backtracking (nested unbounded quantifiers such as `(a+)+`): a pathological pattern only stalls the builder to its job timeout — fail-closed, no PR — but it wastes the run.
 
 Two properties matter. It is **additive-only** — patterns are OR-ed onto the built-in list, so you can widen the deny-list but never narrow it (there is no way to un-deny a built-in path). And it **fails closed on a typo**: a pattern that will not compile prints an `::error::` naming it and fails the run, so the builder opens no PRs until you fix it — a broken deny-list must never silently let the path it was meant to guard sail through to an auto-PR. Erring wide is safe (a false positive only files an issue instead of opening a PR; nothing is dropped), so when in doubt, add the pattern. If a path is privileged for *most* repos, propose it upstream in `patch_policy.py` so every caller benefits, and keep only the genuinely repo-specific ones here.
 

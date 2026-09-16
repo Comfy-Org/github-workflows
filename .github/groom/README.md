@@ -821,9 +821,14 @@ ecosystems. Matching is **case-insensitive** — macOS/Windows CI runners resolv
   `_PATTERN`) and `denied_paths`/`denied_entries` OR the results onto the built-in
   test. It is **additive-only** — a caller widens the deny-list for its own
   privileged surface (a `scripts/ci/` entrypoint, a custom runner) and cannot narrow
-  it. A pattern that will not compile raises `InvalidExtraPattern`, which `main()`
-  turns into the fail-closed `::error::`+exit-2 above rather than silently dropping
-  it: a typo in a security deny-list must never widen the ALLOW side. This is the
+  it. A pattern that will not compile — `re.error`, or the `OverflowError`/
+  `RecursionError` an oversized-bound or deeply-nested pattern surfaces — raises
+  `InvalidExtraPattern`, which `main()` turns into the fail-closed
+  `::error::`+exit-2 above rather than silently dropping it: a typo in a security
+  deny-list must never widen the ALLOW side. When patterns ARE present, `main()`
+  also emits a `::notice::` echoing the compiled count and values, so a caller who
+  folds them onto one line with a `>-` block scalar (an inert deny-list that
+  matches nothing) leaves visible evidence on the run record. This is the
   CI-privileged half of the "make the class a caller input" note above; the
   dataset-of-record tuple stays hardcoded for now.
 
