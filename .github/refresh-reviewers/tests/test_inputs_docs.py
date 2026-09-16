@@ -15,12 +15,13 @@ So this test pins set equality between:
 * `on.workflow_call.inputs` in `.github/workflows/refresh-reviewers.yml`, and
 * the "Inputs" table in `docs/callers/refresh-reviewers.md`.
 
-This is deliberately a TWO-set check. `.github/refresh-reviewers/README.md`'s
-"Knob defaults (and why)" table is intentionally partial (it omits
-`reviewer_config_path`, `map_exclude`, `extra_exclude_paths` and `workflows_ref`)
-and uses combined-cell rows (`| `top_k` / `floor` |`), so the bare-name table
-regex neither captures nor should capture it — including it would make this test
-permanently red or vacuous.
+The guide's Inputs table is checked for full set-equality in BOTH directions.
+`.github/refresh-reviewers/README.md`'s "Knob defaults (and why)" table is
+intentionally partial (it omits `reviewer_config_path`, `map_exclude`,
+`extra_exclude_paths` and `workflows_ref`), so it is checked ONE way only — no
+phantom knob — but its combined-cell rows (`| `top_k` / `floor` |`) ARE parsed,
+so every knob it names is still policed. Set-equality there would be permanently
+red, since the table omits many inputs by design.
 
 Deliberately parsed WITHOUT PyYAML, like the cursor-review model
 (test_workflow_inputs_docs.py): this repo is stdlib-only and CI installs no
@@ -71,6 +72,32 @@ def read_lines(path):
         return [line.rstrip("\r") for line in f.read().split("\n")]
 
 
+def section_lines(lines, heading):
+    """Lines strictly under `heading` (a `## …` line), up to the next heading at
+    the same or a higher level. Lets a scan be scoped to one section instead of
+    the whole file, so an unrelated block elsewhere can't stand in for it."""
+    out, in_section = [], False
+    for line in lines:
+        if line.strip() == heading:
+            in_section = True
+            continue
+        if in_section and HEADING.match(line):
+            break
+        if in_section:
+            out.append(line)
+    return out
+
+
+def split_cells(line):
+    """Split a markdown table row into trimmed cells, honoring GFM's escaped
+    `\\|` (a literal pipe inside a cell) so a Default value that contains a pipe
+    — plausible for a regex-valued input — doesn't shift every later column and
+    make the Default comparison run against the wrong cell."""
+    body = line.strip().strip("|")
+    cells = re.split(r"(?<!\\)\|", body)
+    return [cell.strip().replace("\\|", "|") for cell in cells]
+
+
 def workflow_inputs():
     """Input names declared under on.workflow_call.inputs."""
     lines = read_lines(WORKFLOW)
@@ -114,6 +141,33 @@ def documented_inputs(path, heading):
             match = TABLE_KEY.match(line)
             if match:
                 names.add(match.group(1))
+    return names
+
+
+def documented_knob_names(path, heading):
+    """Every backticked knob named in the FIRST cell of each table row under
+    `heading`, INCLUDING combined-cell rows like `| `top_k` / `floor` |` that
+    the lone-name `TABLE_KEY` regex skips. A cell counts only when every
+    `/`-separated part is itself a lone backticked name, so the header, the
+    `---` separator, and prose rows contribute nothing. Used for the README
+    phantom-knob direction, where combined cells would otherwise let
+    `top_k`/`floor`/`min_touches`/`min_score` drift unnoticed."""
+    names, in_section = set(), False
+    for line in read_lines(path):
+        if line.strip() == heading:
+            in_section = True
+            continue
+        if in_section and HEADING.match(line):
+            break
+        if not in_section or not line.lstrip().startswith("|"):
+            continue
+        cells = split_cells(line)
+        if not cells or not cells[0]:
+            continue
+        parts = [part.strip() for part in cells[0].split("/")]
+        matched = [re.fullmatch(r"`([A-Za-z0-9_-]+)`", part) for part in parts]
+        if all(matched):
+            names.update(match.group(1) for match in matched)
     return names
 
 
@@ -184,17 +238,38 @@ def with_keys(lines):
 def example_with_keys():
     """`with:` keys from the two example callers this repo ships: the fenced
     YAML under the guide's ## Caller heading, and the `# `-prefixed example in
-    the workflow header comment. Returns {source_label: set_of_keys}."""
-    guide_lines = []
-    for block in fenced_blocks(read_lines(SETUP_GUIDE)):
-        guide_lines.extend(block)
+    the workflow header comment. Returns {source_label: set_of_keys}.
+
+    Both sources are scoped the way their label claims, and each fenced block is
+    scanned on its own:
+
+    * Guide side — ONLY the fences under `## Caller`, not every fence in the
+      file, so the anti-vacuity `workflows_ref` guard can't be satisfied by some
+      unrelated snippet while the real Caller example silently loses its `with:`,
+      and so a stray step-level `with:` in another section (e.g. an
+      `actions/checkout`) can't register here as a phantom input.
+    * Workflow side — ONLY the header comment above `jobs:`, bounded exactly the
+      way `workflow_inputs` bounds its scan, not every column-0 `#` line in the
+      file.
+
+    Scanning per block (rather than one flattened list) keeps a `with:` that
+    ends one block from absorbing the next block's more-indented lines.
+    """
+    guide_keys = set()
+    for block in fenced_blocks(section_lines(read_lines(SETUP_GUIDE), "## Caller")):
+        guide_keys |= with_keys(block)
+
+    workflow_lines = read_lines(WORKFLOW)
+    head = (
+        workflow_lines[: workflow_lines.index("jobs:")]
+        if "jobs:" in workflow_lines
+        else workflow_lines
+    )
     header_comment = [
-        strip_comment_prefix(line)
-        for line in read_lines(WORKFLOW)
-        if line.startswith("#")
+        strip_comment_prefix(line) for line in head if line.startswith("#")
     ]
     return {
-        "docs/callers/refresh-reviewers.md ## Caller": with_keys(guide_lines),
+        "docs/callers/refresh-reviewers.md ## Caller": guide_keys,
         "refresh-reviewers.yml header comment": with_keys(header_comment),
     }
 
@@ -246,12 +321,23 @@ def documented_input_defaults(path, heading):
         if in_section and HEADING.match(line):
             break
         if in_section and line.lstrip().startswith("|"):
-            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+            cells = split_cells(line)
             if len(cells) < 2:
                 continue
             key = re.fullmatch(r"`([A-Za-z0-9_-]+)`", cells[0])
             if key:
-                result[key.group(1)] = cells[1]
+                name = key.group(1)
+                # A second row for the same input would silently overwrite the
+                # first, so two contradictory Default cells would pass as long as
+                # the last one is right. Surface it — that's exactly the drift
+                # this file exists to catch.
+                if name in result:
+                    raise AssertionError(
+                        f"`{name}` appears twice in the `{heading}` table of "
+                        f"{path} — a duplicate row hides a contradictory Default "
+                        "cell from this comparison"
+                    )
+                result[name] = cells[1]
     return result
 
 
@@ -261,19 +347,45 @@ def documented_input_defaults(path, heading):
 _REQUIRED = "\x00required-no-default"
 
 
+def _clean_workflow_default(raw):
+    """Canonicalize a raw `default:` value so cosmetic YAML — a trailing inline
+    comment, surrounding quotes — doesn't turn this suite red against correct
+    docs. Backticks are stripped from the guide side, so the two sides would
+    otherwise compare a value against its raw YAML source."""
+    text = raw.strip()
+    # Surrounding matching quotes are cosmetic — EXCEPT the empty string, which
+    # both the guide and this file spell `''`, so leave that spelling intact.
+    if len(text) > 2 and text[0] in "\"'" and text[-1] == text[0]:
+        return text[1:-1]
+    # An unquoted inline comment (` # …`) is not part of the value.
+    hash_at = text.find(" #")
+    if hash_at != -1:
+        text = text[:hash_at].rstrip()
+    return text
+
+
 def canonical_guide_default(cell):
     text = cell.strip()
-    if "**required**" in text:
+    # Anchor on the required-cell SHAPE (`— (**required**)`), not a loose
+    # `**required**` substring: a cell like `` `main` (**required**) `` advertises
+    # a default the workflow deliberately lacks and must NOT canonicalize to
+    # _REQUIRED (that drift is the whole point of this check), while a real
+    # default annotated in prose must not false-match either.
+    if text.startswith("—") and "**required**" in text:
         return _REQUIRED
     return text.strip("`").strip()
 
 
 def canonical_workflow_default(name, defaults, required):
     if name in defaults:
-        return defaults[name].strip()
+        return _clean_workflow_default(defaults[name])
     if name in required:
         return _REQUIRED
-    return None
+    # Optional with no `default:` — a legal `workflow_call` shape that arrives at
+    # runtime as `''`. Canonicalize to the empty string it actually delivers
+    # rather than to None (which the guide side can never produce, permanently
+    # reddening the subTest).
+    return ""
 
 
 class RefreshReviewersInputsDocsTest(unittest.TestCase):
@@ -338,17 +450,18 @@ class RefreshReviewersInputsDocsTest(unittest.TestCase):
 
     def test_readme_knob_table_has_no_phantom_knob(self):
         # `.github/refresh-reviewers/README.md`'s "Knob defaults (and why)"
-        # table is intentionally partial and uses combined-cell rows
-        # (`| `top_k` / `floor` |`) the TABLE_KEY regex correctly does NOT
-        # capture, so assert ONLY the phantom direction — a knob named there but
-        # not declared. Set-equality would be permanently red (the table omits
-        # many inputs by design).
-        documented = documented_inputs(README, "## Knob defaults (and why)")
+        # table is intentionally partial, so assert ONLY the phantom direction —
+        # a knob named there but not declared. Set-equality would be permanently
+        # red (the table omits many inputs by design). Combined-cell rows
+        # (`| `top_k` / `floor` |`) ARE parsed here: skipping them would leave
+        # top_k/floor/min_touches/min_score free to drift to a stale name with
+        # this test still green.
+        documented = documented_knob_names(README, "## Knob defaults (and why)")
         # Guard: a heading rename would empty this and make the check vacuous.
         self.assertTrue(
             documented,
-            "the README `## Knob defaults (and why)` scanner found no bare-name "
-            "knob rows — the heading was renamed or the table reshaped",
+            "the README `## Knob defaults (and why)` scanner found no knob rows "
+            "— the heading was renamed or the table reshaped",
         )
         phantom = documented - self.declared
         self.assertFalse(
@@ -391,16 +504,17 @@ class RefreshReviewersInputsDocsTest(unittest.TestCase):
                 )
                 want = canonical_workflow_default(name, defaults, required)
                 got = canonical_guide_default(guide[name])
+                if name in required:
+                    have = "required: true (no default)"
+                elif name in defaults:
+                    have = f"default: {defaults[name]!r}"
+                else:
+                    have = "no default and not required (arrives as '')"
                 self.assertEqual(
                     got,
                     want,
                     f"guide Default column for `{name}` is {guide[name]!r} but "
-                    "refresh-reviewers.yml has "
-                    + (
-                        "required: true (no default)"
-                        if name in required
-                        else f"default: {defaults.get(name)!r}"
-                    ),
+                    f"refresh-reviewers.yml has {have}",
                 )
 
 
