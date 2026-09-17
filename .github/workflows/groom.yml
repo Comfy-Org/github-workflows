@@ -636,10 +636,14 @@ on:
 
 
           FAIL-CLOSED on a typo: a pattern that will not compile prints an
-          `::error::` naming it and FAILS the `Capture patch` step, so the builder
-          opens NO PRs that run until the pattern is fixed — a typo in a security
-          control must never silently widen the allow side by dropping the
-          uncompilable pattern. Ignored unless `builder` is true.
+          `::error::` naming it and FAILS the run at the `gate` job, BEFORE any
+          agent spend. Because every downstream job `needs: gate`, this blocks
+          the WHOLE audit — both the PR builder and the issue `file` sink — until
+          the pattern is fixed; a typo in a security control must never silently
+          widen the allow side by dropping the uncompilable pattern, and a loud,
+          cheap red is preferred over billing the full finder+verifier+builder
+          budget and only then aborting the PR path. Ignored unless `builder` is
+          true, and only evaluated on a tick the interval + volume gates let run.
 
 
           Example caller value (a YAML block scalar, one pattern per line):
@@ -1053,6 +1057,48 @@ jobs:
           else
             echo "should_run=false" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Validate extra_denied_paths (fail closed before agent spend)
+        # Compile the caller's additive deny patterns HERE — in the cheap,
+        # pre-agent gate — so a typo becomes an immediate red run instead of one
+        # that first bills the full finder+verifier+builder budget for every
+        # selected finding and only then aborts in the build job's `Capture
+        # patch` step (the pipe into patch_policy.py under `set -euo pipefail`).
+        # Reuses patch_policy.py's EXACT compile + ::error:: + exit-2 contract
+        # with zero duplication: main() compiles EXTRA_DENIED_PATHS BEFORE
+        # reading stdin, so an empty stdin (empty diff) exercises only the
+        # pattern compile — exit 0 on a good/empty value, exit 2 with the
+        # identical ::error:: on a bad one. $GROOM_ASSETS is already populated by
+        # `Load groom assets` above, so no second checkout is needed.
+        #
+        # Placed AFTER `Decide should_run` and gated on should_run — like the two
+        # CLI-pin steps below and for the same reason: a skipped tick (interval
+        # or volume gate) spends nothing on agents, so it must not redden on a
+        # standing typo either. On the ticks that WOULD spend, this fails ~10 min
+        # and zero agent spend earlier than `Capture patch` does today.
+        #
+        # SCOPE, stated honestly: failing the `gate` job is BROADER than today's
+        # `Capture patch` abort. Today a bad pattern aborts only the `build`
+        # matrix, and the sibling `file` job still files non-built findings as
+        # issues; here every downstream job is `needs: gate`, so the `file` sink
+        # is suppressed too until the pattern is fixed. That is deliberate: an
+        # uncompilable additive deny-pattern is a broken security control, and a
+        # loud, immediate, cheap red at the gate is the right response — the
+        # operator fixes the one-line typo and BOTH sinks (issues and PRs) resume
+        # on the next run, rather than the audit quietly running for ~10 min and
+        # billing the full agent budget before aborting only the PR path.
+        if: steps.check.outputs.should_run == 'true' && inputs.builder == true
+        env:
+          # Via env, NOT inline `${{ }}` into `run:` — matches the `Capture patch`
+          # step and this file's SINK/CADENCE convention, keeping caller text off
+          # the shell command line.
+          EXTRA_DENIED_PATHS: ${{ inputs.extra_denied_paths }}
+        run: |
+          set -euo pipefail
+          # Empty stdin = empty diff: main() only reaches the pattern compile,
+          # printing nothing on success and the ::error:: + exit 2 on a bad
+          # pattern. pipefail propagates that nonzero exit so the gate fails closed.
+          printf '' | python3 "$GROOM_ASSETS/patch_policy.py" >/dev/null
 
       - name: Load the agent CLI pin
         # Deliberately NOT from `$GROOM_ASSETS` (which tracks `inputs.workflows_ref`,
@@ -1471,6 +1517,31 @@ jobs:
           fi
           echo "key broker ready on $BROKER_SOCK"
 
+      - name: Preflight the sandbox
+        # BE-14756: bring the bubblewrap sandbox up in its OWN step, BEFORE the
+        # billed "Run finder" step below. `--preflight-only` runs ONLY the mutating
+        # bring-up (install bubblewrap, the AppArmor profile, the sysctl fallback)
+        # and exits non-zero if a working jail cannot be established — burning NO
+        # agent budget. Splitting it out is why a no-spend sandbox BRING-UP failure
+        # never lands on the "Run finder" name: when this step fails the job fails
+        # but "Run finder" is never reached, so the runs-jobs API reports it
+        # queued/skipped and interval.py's `agent_step_started` reads it as
+        # unstarted -> the cadence clock is NOT advanced (mirrors the "Start the
+        # key broker" split, done for the same reason). NOTE this covers the
+        # bring-up ONLY: agent-sandbox.sh still runs no-spend, fail-loud guards
+        # (argument validation, the --uds live-broker healthz probe, the clone/
+        # out-dir path + overlap checks) INSIDE "Run finder" before it execs the
+        # agent, and any of those dying still stamps "Run finder" failed with no
+        # spend -> counted as a spent audit. Hoisting that validation ahead of the
+        # billed step (a validate-only mode) is tracked separately. The name is deliberately
+        # DISTINCT from "Run finder" so interval.py's EXACT-name match never
+        # mistakes this bring-up for the billed agent step. preflight() is
+        # idempotent, so "Run finder"'s own preflight then hits its fast path
+        # (already usable -> instant return, no side effects).
+        run: |
+          set -uo pipefail
+          bash "$GROOM_ASSETS/agent-sandbox.sh" --preflight-only
+
       # NAME IS LOAD-BEARING — `interval.py` matches this step name EXACTLY
       # (`_AGENT_STEP_NAME`) against the runs-jobs API's `steps[]` to decide
       # whether a FAILED finder job actually spent its (billed) audit and may
@@ -1479,7 +1550,10 @@ jobs:
       # "agent never started", i.e. the cadence stops throttling failures — so
       # `test_interval.py` pins both halves. Same for adding an `if:` to this
       # step: a conditionally-skipped agent inside a SUCCEEDING job would still
-      # count, because a success is trusted on the job conclusion alone.
+      # count, because a success is trusted on the job conclusion alone. The
+      # sandbox bring-up is deliberately in the separate "Preflight the sandbox"
+      # step ABOVE (BE-14756), NOT here, so a no-spend bring-up failure fails that
+      # distinctly-named step instead of this billed one.
       - name: Run finder
         # BE-4303: the agent runs ONLY inside `agent-sandbox.sh` (the bubblewrap
         # jail). What the old `chmod`/`env -u` dance did by hand the jail now does
@@ -1910,6 +1984,19 @@ jobs:
             exit 1
           fi
           echo "key broker ready on $BROKER_SOCK"
+
+      - name: Preflight the sandbox
+        # BE-14756: bring the bubblewrap sandbox up in its OWN step before the
+        # "Run verifier" step (see the finder job's "Preflight the sandbox" step
+        # for the full rationale). `--preflight-only` runs ONLY the mutating
+        # bring-up and burns no agent budget; "Run verifier"'s own preflight then
+        # hits its idempotent fast path. Only the finder job is cadence-gated, so
+        # this split does not affect interval.py's clock here — it mirrors the
+        # finder for consistency (and the "Start the key broker" precedent), and
+        # keeps a no-spend bring-up failure off the agent step in either case.
+        run: |
+          set -uo pipefail
+          bash "$GROOM_ASSETS/agent-sandbox.sh" --preflight-only
 
       - name: Run verifier
         # A FRESH agent session on a FRESH checkout — it sees only the finder's JSON
@@ -2825,6 +2912,19 @@ jobs:
             exit 1
           fi
           echo "key broker ready on $BROKER_SOCK"
+
+      - name: Preflight the sandbox
+        # BE-14756: bring the bubblewrap sandbox up in its OWN step before the
+        # "Run builder" step (see the finder job's "Preflight the sandbox" step
+        # for the full rationale). `--preflight-only` runs ONLY the mutating
+        # bring-up and burns no agent budget; "Run builder"'s own preflight then
+        # hits its idempotent fast path. Only the finder job is cadence-gated, so
+        # this split does not affect interval.py's clock here — it mirrors the
+        # finder for consistency (and the "Start the key broker" precedent), and
+        # keeps a no-spend bring-up failure off the agent step in either case.
+        run: |
+          set -uo pipefail
+          bash "$GROOM_ASSETS/agent-sandbox.sh" --preflight-only
 
       - name: Run builder
         # Runs ONLY inside `agent-sandbox.sh` (BE-4303), in `rw-git-ro` mode: the

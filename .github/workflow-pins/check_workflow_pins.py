@@ -3606,10 +3606,15 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT, docs_dir=None):
         if not defaults:
             base = name.rsplit(".", 1)[0]
             docs_path = os.path.join(docs_dir, base + ".md")
-            # No page under this name = not documented as its own caller guide
-            # (e.g. refresh-reviewers.yml is covered by assign-reviewers.md), so
-            # there is nothing to cross-check. A page that EXISTS but lacks the
-            # row is the case that must not pass silently, below.
+            # We only reach here for a reusable that DECLARES workflows_ref with
+            # no default (`not defaults`); bump-*/ci-*/test-* files don't declare
+            # the input at all and were skipped far above. So no page under this
+            # name means this reusable ships no own-name caller guide, and there
+            # is no row to cross-check — the lint's one blind spot (a declared-
+            # no-default reusable with no guide is not covered). That gap is
+            # exactly why refresh-reviewers.yml needed its own docs/callers page
+            # instead of being skipped here. A page that EXISTS but lacks the row
+            # is the case that must not pass silently, below.
             if os.path.isfile(docs_path):
                 ann_docs_path = _ann_prop(docs_path)
                 with open(docs_path, "r", encoding="utf-8", errors="replace") as f:
