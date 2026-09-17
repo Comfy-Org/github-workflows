@@ -1502,10 +1502,12 @@ jobs:
         # "Run finder" stays open. A broker that dies AFTER the healthz probe below
         # still kills "Run finder" no-spend, and that failure is still counted as a
         # spent audit — the same residual the bring-up split carries. Nor can this
-        # reach a failure bwrap itself raises at exec (a `--ro-file` that does not
-        # exist, a mount that fails), since validating without running the jail is
-        # the whole point. Proving the finder actually BILLED is tracked separately
-        # (BE-4850).
+        # reach a failure `bwrap` itself raises at exec — a mount that fails on a
+        # source that exists — since validating without running the jail is the
+        # whole point. (A `--ro-file` source that is simply MISSING is NOT in that
+        # class: it needs no jail to detect, so `--validate-only` checks it
+        # host-side, `-e`, alongside the `-d` on --clone and the `-S` on --uds.)
+        # Proving the finder actually BILLED is tracked separately (BE-4850).
         # The name is deliberately DISTINCT from "Run finder" so interval.py's
         # EXACT-name match never mistakes either phase for the billed agent step.
         # preflight() is idempotent, so "Run finder"'s own preflight then hits its

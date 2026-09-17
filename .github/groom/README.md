@@ -781,14 +781,23 @@ Everything `agent-sandbox.sh` does *before* `exec bwrap` is no-spend: the sandbo
 bring-up above, and then a wall of fail-loud guards (required/absolute-path
 argument validation, the `--uds` `-S` check plus a live-broker `/healthz` probe,
 clone and out-dir existence, the out-dir↔clone overlap check, and the `--env
-KEY=VALUE` / `rw-git-ro` `.git` / `--ro-file` checks inside the mount assembly).
+KEY=VALUE` / `rw-git-ro` `.git` / `--ro-file` absolute-path-and-existence checks
+inside the mount assembly). Every one of them is answerable host-side, with no
+jail — `--ro-file` included: `--ro-bind` (unlike `--ro-bind-try`) aborts on a
+missing source, so an absent brief or jail-shim would otherwise sail through
+validation and kill the billed step, which is the whole miscount in miniature.
 Run from inside the billed `Run <agent>` step, any of them failing leaves that
 step `failure` having billed nothing — and
 [`interval.py`](interval.py)'s exact-name match then reads the agent as *started*,
 so `run_audited` counts a spent audit and advances the `GROOM_INTERVAL_DAYS`
 cadence clock for a run that spent nothing (BE-4814). The most plausible live
 trigger: the broker dies between its step and the agent step, leaving a stale
-socket that passes `-S` and fails `/healthz`.
+socket that passes `-S` and fails `/healthz`. That probe runs over `curl`, falling
+back to `python3` — under `--validate-only` a host with neither is a hard failure
+rather than a skipped probe, because a validation that silently cannot validate
+is the green no-op this mode exists to prevent. (A real run keeps the older
+best-effort skip: it is about to run the agent regardless, and a spurious failure
+*there* is the expensive one.)
 
 So both halves run in their own `Preflight the sandbox` step, whose name is
 deliberately DISTINCT from the billed step:
@@ -802,15 +811,26 @@ deliberately DISTINCT from the billed step:
 re-implementing the checks — a parallel copy would drift, and a guard it missed
 would still kill the billed step no-spend. Both modes reject nonsensical
 combinations loudly (each other, or a `-- command`), so a stray flag on a real
-agent step dies instead of becoming a green no-op that runs no agent. `preflight()`
-is idempotent and the validation's only side effect is the `mkdir -p` on the
-out-dir that the real run performs anyway, so the agent step's own copies of both
-are then no-ops.
+agent step dies instead of becoming a green no-op that runs no agent.
+
+`--validate-only` walks the *whole* pre-exec path, `preflight()` included — so
+**it is only side-effect-free once the bring-up has already succeeded.** In the
+`Preflight the sandbox` step that is guaranteed (`--preflight-only` ran first, so
+`preflight()` takes its idempotent fast path), and the sole remaining side effect
+is the `mkdir -p` on the out-dir that the real run performs anyway; the agent
+step's own copies of both are then no-ops. Run standalone on a host where the
+sandbox is *not* yet usable, the same call will `sudo apt-get install bubblewrap`,
+write `/etc/apparmor.d/bwrap`, and as a last resort `sudo sysctl -w
+kernel.apparmor_restrict_unprivileged_userns=0` — the bring-up's host-wide
+mutations, from a mode named for validation. Pair it with `--preflight-only`, as
+groom.yml does, or expect the bring-up.
 
 **What this does NOT close:** the window between that step and the agent step. A
-broker that dies *after* the `/healthz` probe still fails the billed step with no
-spend, and that failure is still counted as an audit. Proving the agent actually
-BILLED is tracked separately (BE-4850).
+broker that dies *after* the `/healthz` probe — or an input deleted after it is
+checked — still fails the billed step with no spend, and that failure is still
+counted as an audit. Nor can validation reach a mount that `bwrap` itself rejects
+at exec for a source that *does* exist. Proving the agent actually BILLED is
+tracked separately (BE-4850).
 
 ### Tests — deterministic, no API spend
 
@@ -826,8 +846,10 @@ arbitrary external IP are all unreachable from the jail. Sections 8 and 9 cover
 the no-spend split: `--preflight-only` exits 0 on a usable host and fails loud on a
 broken `bwrap`, and `--validate-only` exits 0 on a real run's arguments *without
 exec'ing the jail* (a stubbed `bwrap` records every invocation, so "did it exec?"
-is asserted, not assumed) while failing loud on a bad argument and on a
-`-S`-passing socket with no live broker. No `claude`, no API key, no spend.
+is asserted, not assumed) while failing loud on a bad argument — including a
+`--ro-file` that does not exist — and on a `-S`-passing socket with no live
+broker, over curl and over the python3 fallback alike. No `claude`, no API key,
+no spend.
 
 ```bash
 shellcheck -x .github/groom/agent-sandbox.sh .github/groom/tests/sandbox-tests.sh

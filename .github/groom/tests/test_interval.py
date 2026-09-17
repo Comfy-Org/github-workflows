@@ -488,68 +488,14 @@ class PreAgentFailureTest(unittest.TestCase):
         step = step.split("\n      - name:", 1)[0]
         self.assertNotRegex(step, r"(?m)^\s+if:\s", "the pinned agent step must not be conditional")
 
-        # BE-14756: the sandbox bring-up is a SEPARATE step that PRECEDES the billed
-        # agent step, so a no-spend setup failure fails that step and never reaches
-        # "Run finder" (the runs-jobs API then reports it queued/skipped and
-        # `agent_step_started` reads it as unstarted). Pin the structure: exactly one
-        # such step exists in audit_find, it comes BEFORE "Run finder", and its name
-        # is DISTINCT from the billed step so the exact-name matcher can't confuse
-        # the two.
-        preflight_name = "Preflight the sandbox"
-        self.assertNotEqual(preflight_name, interval.agent_step_name())
-        self.assertEqual(finder_block[0].count(f"- name: {preflight_name}\n"), 1)
-        self.assertLess(
-            finder_block[0].index(f"- name: {preflight_name}\n"),
-            finder_block[0].index(f"- name: {interval.agent_step_name()}\n"),
-            "the sandbox preflight step must come BEFORE the billed agent step",
-        )
-
-        # BE-14771: that same step now hoists the PRE-EXEC VALIDATION too, not just
-        # the bring-up. agent-sandbox.sh's no-spend, fail-loud guards (argument and
-        # absolute-path validation, the `--uds` live-broker healthz probe, the
-        # clone/out-dir existence + overlap checks, and the guards inside the
-        # bwrap_args assembly) used to run INSIDE "Run finder": any of them dying
-        # left the billed step `completed`/`failure` having spent nothing, which
-        # `agent_step_started` correctly reads as started and `run_audited` then
-        # counts as a spent audit. `--validate-only` runs that identical guard path
-        # off the billed step's name. Nothing in this module changes (the exact-name
-        # match is what keeps the preflight step uncounted) — pin the invocation so
-        # dropping it silently returns those failures to the billed step.
-        preflight_step = finder_block[0].split(f"- name: {preflight_name}\n", 1)[1]
-        preflight_step = preflight_step.split("\n      - name:", 1)[0]
-        # Match the INVOCATION, not the flag name: both flags are discussed in the
-        # step's own comments, so a bare substring check would pass on the prose
-        # alone and keep passing after the command itself was deleted.
-        self.assertIn('agent-sandbox.sh" --preflight-only', preflight_step)
-        self.assertIn('agent-sandbox.sh" --validate-only', preflight_step)
-        # And the validation must NOT run inside the billed step: the whole point
-        # is that it fails somewhere interval.py does not count.
-        self.assertNotIn('agent-sandbox.sh" --validate-only', step)
-
-        # The hoist is only worth anything if it validates the invocation the agent
-        # step actually makes: a `--ro-file` added to "Run finder" but not here would
-        # leave that path unchecked until the billed step dies on it. Compare the
-        # mount-shaping arguments of the two invocations token for token. `--env` and
-        # the `-- <command>` are deliberately excluded — validate-only refuses a
-        # command, and every --env key in this file is a literal, so the KEY=VALUE
-        # guard cannot fire from this caller.
-        mount_args = r"--(?:clone|clone-mode|out-dir|uds|ro-file)\s+\S+"
-
-        def invocation(block, start):
-            # One `bash ... agent-sandbox.sh ...` call: continuation lines until the
-            # first line that does not end in a backslash.
-            lines = []
-            for line in block[start:].split("\n"):
-                lines.append(line)
-                if not line.rstrip().endswith("\\"):
-                    break
-            return re.findall(mount_args, "\n".join(lines))
-
-        self.assertEqual(
-            invocation(preflight_step, preflight_step.index('agent-sandbox.sh" --validate-only')),
-            invocation(step, step.index('agent-sandbox.sh"')),
-            "the --validate-only arguments must mirror the billed agent step's",
-        )
+        # BE-14756 + BE-14771: the sandbox bring-up (`--preflight-only`) and the
+        # pre-exec guard wall (`--validate-only`) are both no-spend, and both run in
+        # a SEPARATE, distinctly-named step that PRECEDES this one — so a failure in
+        # either never stamps "Run finder" failed, and `agent_step_started` reads it
+        # as unstarted rather than as a spent audit. Nothing in THIS module changes
+        # (the exact-name match is what keeps that step uncounted), and the structure
+        # is not audit_find-specific, so it is pinned once for all three agent jobs
+        # in SandboxPreflightHoistTest below rather than a second time here.
 
     def test_the_gate_job_is_time_bounded(self):
         # The gate walks run history (and, for re-run entries, per-attempt job
@@ -946,6 +892,127 @@ class FetchValidationTest(unittest.TestCase):
     def test_bad_workflow_file_rejected(self):
         with self.assertRaises(ValueError):
             interval.fetch_workflow_runs("o/r", "ci-groom", run=make_gh_stub([], {}))
+
+
+
+# Every groom job that runs an agent inside the jail: (job key, billed step name).
+# `audit_find`'s is the one `interval.py` matches by name; the other two are
+# structurally identical and hoist the same guards for the same reason.
+_AGENT_JOBS = (
+    ("audit_find", "Run finder"),
+    ("audit_verify", "Run verifier"),
+    ("build", "Run builder"),
+)
+
+_PREFLIGHT_STEP = "Preflight the sandbox"
+
+# The mount-shaping arguments of an `agent-sandbox.sh` invocation. `--env` and the
+# `-- <command>` are deliberately excluded — validate-only refuses a command, and
+# every --env key in groom.yml is a literal, so the KEY=VALUE guard cannot fire
+# from this caller.
+_MOUNT_ARGS = r"--(?:clone|clone-mode|out-dir|uds|ro-file)\s+\S+"
+
+
+def _job_block(text, job):
+    """The `job:` block of groom.yml, as text.
+
+    Matched as text rather than parsed — PyYAML is not stdlib and this repo is
+    stdlib-only, so a parse would add a CI dependency for a structural pin.
+    """
+    blocks = re.split(r"(?m)^  (?=[A-Za-z_][A-Za-z0-9_-]*:\s*$)", text)
+    blocks = [b for b in blocks if b.startswith(f"{job}:")]
+    assert len(blocks) == 1, f"could not isolate the {job} job in groom.yml"
+    return blocks[0]
+
+
+def _step_body(block, name):
+    """The body of the `- name: <name>` step inside a job block."""
+    body = block.split(f"- name: {name}\n", 1)[1]
+    return body.split("\n      - name:", 1)[0]
+
+
+def _invocation(block, start):
+    """The mount arguments of ONE `bash ... agent-sandbox.sh ...` call at `start`.
+
+    Continuation lines until the first that does not end in a backslash.
+    """
+    lines = []
+    for line in block[start:].split("\n"):
+        lines.append(line)
+        if not line.rstrip().endswith("\\"):
+            break
+    return re.findall(_MOUNT_ARGS, "\n".join(lines))
+
+
+class SandboxPreflightHoistTest(unittest.TestCase):
+    """BE-14756 + BE-14771, pinned for EVERY agent job, not just the billed one.
+
+    `agent-sandbox.sh`'s pre-exec work — the mutating bring-up (`--preflight-only`)
+    and the wall of fail-loud guards (`--validate-only`) — is no-spend. Run from
+    inside a billed `Run <agent>` step, a failure there stamps that step failed
+    having billed nothing, which `interval.py` reads as a STARTED (spent) audit.
+    Both phases therefore live in a separate, distinctly-named step that precedes
+    it. `interval.py` only matches `audit_find`'s step by name, but the verifier
+    and builder hoist the same guards for the same reason and are equally able to
+    drift — and they carry the longer `--ro-file` lists and the only
+    `--clone-mode rw-git-ro`, whose `.git`-pointer guard is the one most likely
+    to kill those jobs no-spend.
+    """
+
+    def setUp(self):
+        wf = os.path.join(os.path.dirname(__file__), "..", "..", "workflows", "groom.yml")
+        with open(wf, encoding="utf-8") as f:
+            self.text = f.read()
+
+    def test_the_preflight_step_precedes_every_billed_agent_step(self):
+        self.assertNotEqual(_PREFLIGHT_STEP, interval.agent_step_name())
+        for job, agent_step in _AGENT_JOBS:
+            with self.subTest(job=job):
+                block = _job_block(self.text, job)
+                self.assertEqual(block.count(f"- name: {agent_step}\n"), 1)
+                self.assertEqual(block.count(f"- name: {_PREFLIGHT_STEP}\n"), 1)
+                self.assertLess(
+                    block.index(f"- name: {_PREFLIGHT_STEP}\n"),
+                    block.index(f"- name: {agent_step}\n"),
+                    f"{job}: the sandbox preflight step must come BEFORE the billed agent step",
+                )
+
+    def test_both_no_spend_phases_run_off_the_billed_step(self):
+        for job, agent_step in _AGENT_JOBS:
+            with self.subTest(job=job):
+                block = _job_block(self.text, job)
+                preflight = _step_body(block, _PREFLIGHT_STEP)
+                billed = _step_body(block, agent_step)
+                # Match the INVOCATION, not the flag name: both flags are discussed
+                # in the steps' own comments, so a bare substring check would pass
+                # on the prose alone and keep passing after the command was deleted.
+                self.assertIn('agent-sandbox.sh" --preflight-only', preflight, job)
+                self.assertIn('agent-sandbox.sh" --validate-only', preflight, job)
+                # And neither phase may run inside the billed step: the whole point
+                # is that they fail somewhere interval.py does not count.
+                self.assertNotIn('agent-sandbox.sh" --validate-only', billed, job)
+                self.assertNotIn('agent-sandbox.sh" --preflight-only', billed, job)
+
+    def test_validate_only_mirrors_the_invocation_its_job_actually_runs(self):
+        # A `--ro-file` (or a `--clone-mode`) added to `Run <agent>` but not to the
+        # preflight call leaves that path unvalidated until the BILLED step dies on
+        # it — precisely the miscount the hoist exists to prevent. The step comments
+        # say "KEEP THE TWO LISTS IN SYNC"; a comment is not a guard.
+        for job, agent_step in _AGENT_JOBS:
+            with self.subTest(job=job):
+                block = _job_block(self.text, job)
+                preflight = _step_body(block, _PREFLIGHT_STEP)
+                billed = _step_body(block, agent_step)
+                validated = _invocation(
+                    preflight, preflight.index('agent-sandbox.sh" --validate-only')
+                )
+                executed = _invocation(billed, billed.index('agent-sandbox.sh"'))
+                self.assertTrue(validated, f"{job}: no mount arguments found on the --validate-only call")
+                self.assertEqual(
+                    validated,
+                    executed,
+                    f"{job}: the --validate-only arguments must mirror the billed agent step's",
+                )
 
 
 if __name__ == "__main__":
