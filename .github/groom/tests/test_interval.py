@@ -357,6 +357,22 @@ class PreAgentFailureTest(unittest.TestCase):
         self.assertFalse(interval.run_audited([finder_job("failure")]))
         self.assertFalse(interval.run_audited([finder_job("failure", [])]))
 
+    def test_failed_sandbox_preflight_before_the_agent_is_not_a_spent_audit(self):
+        # BE-14756: the sandbox bring-up is its OWN step ("Preflight the sandbox"),
+        # placed BEFORE "Run finder". A no-agent-budget bring-up failure fails that
+        # step, so "Run finder" is never reached and the API reports it
+        # queued/skipped — which must NOT count as a spent audit. The preflight
+        # step is named DISTINCTLY from the billed step, so the exact-name matcher
+        # ignores it and only the (unstarted) agent step decides the verdict.
+        preflight_failed = {"name": "Preflight the sandbox", "status": "completed",
+                            "conclusion": "failure"}
+        queued = finder_job("failure", [pre_agent_step(conclusion="success"), preflight_failed,
+                                        agent_step(status="queued", conclusion=None)])
+        self.assertFalse(interval.run_audited([queued]))
+        skipped = finder_job("failure", [pre_agent_step(conclusion="success"), preflight_failed,
+                                         agent_step(conclusion="skipped")])
+        self.assertFalse(interval.run_audited([skipped]))
+
     def test_failure_after_the_agent_step_completed_IS_a_spent_audit(self):
         # The half that must NOT regress: a run that paid for the agent and then
         # died at a later step (the JSON assert, the artifact upload) still counts,
@@ -471,6 +487,22 @@ class PreAgentFailureTest(unittest.TestCase):
         step = finder_block[0].split(f"- name: {interval.agent_step_name()}\n", 1)[1]
         step = step.split("\n      - name:", 1)[0]
         self.assertNotRegex(step, r"(?m)^\s+if:\s", "the pinned agent step must not be conditional")
+
+        # BE-14756: the sandbox bring-up is a SEPARATE step that PRECEDES the billed
+        # agent step, so a no-spend setup failure fails that step and never reaches
+        # "Run finder" (the runs-jobs API then reports it queued/skipped and
+        # `agent_step_started` reads it as unstarted). Pin the structure: exactly one
+        # such step exists in audit_find, it comes BEFORE "Run finder", and its name
+        # is DISTINCT from the billed step so the exact-name matcher can't confuse
+        # the two.
+        preflight_name = "Preflight the sandbox"
+        self.assertNotEqual(preflight_name, interval.agent_step_name())
+        self.assertEqual(finder_block[0].count(f"- name: {preflight_name}\n"), 1)
+        self.assertLess(
+            finder_block[0].index(f"- name: {preflight_name}\n"),
+            finder_block[0].index(f"- name: {interval.agent_step_name()}\n"),
+            "the sandbox preflight step must come BEFORE the billed agent step",
+        )
 
     def test_the_gate_job_is_time_bounded(self):
         # The gate walks run history (and, for re-run entries, per-attempt job

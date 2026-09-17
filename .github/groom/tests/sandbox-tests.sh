@@ -298,4 +298,47 @@ if "$SANDBOX" --clone "$clone" --clone-mode ro --out-dir "$outdir" \
 fi
 pass "--uds fail-loud on a nonexistent socket path"
 
+# --- 8. --preflight-only: bring-up-only mode (BE-14756) ----------------------
+# The groom jobs run this in a step SEPARATE from "Run <agent>" so a no-spend
+# sandbox bring-up failure fails its own step and never reaches the billed agent
+# step. It takes NO --clone/--out-dir and NO `-- <command>`; it only reports
+# (exit code) whether a working jail is now usable.
+
+# 8a. With a working bwrap (proven by sections 1-7 above), --preflight-only hits
+# preflight()'s idempotent fast path and exits 0 — no clone, no out-dir, no
+# `-- command`.
+if ! "$SANDBOX" --preflight-only >/dev/null 2>&1; then
+	fail "--preflight-only exited non-zero on a host with a working bwrap sandbox"
+fi
+pass "--preflight-only exits 0 when the sandbox is already usable (no clone/out-dir/command)"
+
+# 8a'. --preflight-only takes NO execution-mode args: combining it with a clone,
+# out-dir, uds, ro-file, env, or a `-- command` must DIE, not silently discard
+# them and exit 0 (a stray --preflight-only on a real agent step would otherwise
+# be a green no-op that runs no agent). Each bad combination must fail loud.
+if "$SANDBOX" --preflight-only --clone "$work" --out-dir "$work/out" -- true >/dev/null 2>&1; then
+	fail "--preflight-only with --clone/--out-dir/-- command exited 0 (must die, not run a green no-op)"
+fi
+if "$SANDBOX" --preflight-only --uds /tmp/nope.sock >/dev/null 2>&1; then
+	fail "--preflight-only with --uds exited 0 (must die)"
+fi
+if "$SANDBOX" --preflight-only -- true >/dev/null 2>&1; then
+	fail "--preflight-only with a -- command exited 0 (must die)"
+fi
+pass "--preflight-only dies loud when combined with any execution-mode argument"
+
+# 8b. --preflight-only must still FAIL LOUD when a working sandbox cannot be
+# established. Stub bwrap to always fail (so the self-test never passes) and sudo
+# to a no-op (so the bring-up's apt/apparmor/sysctl steps mutate nothing on the
+# host); the final self-test still fails, so preflight must exit non-zero.
+failbin="$work/failbin"
+mkdir -p "$failbin"
+printf '#!/bin/sh\nexit 1\n' > "$failbin/bwrap"
+printf '#!/bin/sh\nexit 0\n' > "$failbin/sudo"
+chmod +x "$failbin/bwrap" "$failbin/sudo"
+if PATH="$failbin:$PATH" "$SANDBOX" --preflight-only >/dev/null 2>&1; then
+	fail "--preflight-only exited 0 with a broken bwrap (must fail loud when no jail can be established)"
+fi
+pass "--preflight-only fails loud when the sandbox self-test cannot pass"
+
 echo "ALL SANDBOX TESTS PASSED"

@@ -602,5 +602,37 @@ class MainExtraDeniedPathsTest(unittest.TestCase):
         self.assertEqual(err, "")
 
 
+class GatePreAgentValidationTest(unittest.TestCase):
+    """The groom.yml `gate` job validates EXTRA_DENIED_PATHS before any agent
+    spend by piping an EMPTY diff into main() (`printf '' | patch_policy.py`).
+    main() compiles the patterns BEFORE reading stdin, so an empty stdin
+    exercises ONLY the compile: rc 2 + ::error:: on a bad pattern, rc 0 (empty
+    output) on a good or empty one — the exact contract the gate step relies on.
+    These pin that empty-stdin invocation directly (the tests above all feed a
+    non-empty diff)."""
+
+    def test_empty_stdin_bad_pattern_fails_closed(self):
+        # `printf '' | patch_policy.py` with an uncompilable pattern → rc 2.
+        rc, out, err = _run_main(b"", env_extra="^ok/\n^bad[")
+        self.assertEqual(rc, 2, "empty diff + bad pattern must still fail closed (rc 2)")
+        self.assertEqual(out, b"", "no output on the fail-closed path")
+        self.assertIn("::error::", err)
+        self.assertIn("^bad[", err, "the ::error:: must name the bad pattern")
+
+    def test_empty_stdin_good_pattern_exits_zero(self):
+        # A compilable pattern over an empty diff validates clean → rc 0, no output.
+        rc, out, err = _run_main(b"", env_extra="^scripts/ci/")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, "")
+
+    def test_empty_stdin_empty_env_exits_zero(self):
+        # Unset/empty extra_denied_paths (the default caller value) → rc 0, no output.
+        rc, out, err = _run_main(b"", env_extra="")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, "")
+
+
 if __name__ == "__main__":
     unittest.main()
