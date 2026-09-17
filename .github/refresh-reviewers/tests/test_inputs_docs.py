@@ -353,10 +353,24 @@ def _clean_workflow_default(raw):
     docs. Backticks are stripped from the guide side, so the two sides would
     otherwise compare a value against its raw YAML source."""
     text = raw.strip()
-    # Surrounding matching quotes are cosmetic — EXCEPT the empty string, which
-    # both the guide and this file spell `''`, so leave that spelling intact.
-    if len(text) > 2 and text[0] in "\"'" and text[-1] == text[0]:
-        return text[1:-1]
+    # A quoted scalar ends at its closing quote; anything after that (including
+    # a ` #` that would otherwise look like a comment marker) is a trailing
+    # inline comment, not part of the value. Keep the `''` spelling both the
+    # guide and this file use for the empty string.
+    if text[:1] in "\"'":
+        quote = text[0]
+        end = 1
+        while end < len(text):
+            if quote == '"' and text[end] == "\\":
+                end += 2
+                continue
+            if quote == "'" and text[end : end + 2] == "''":
+                end += 2
+                continue
+            if text[end] == quote:
+                inner = text[1:end]
+                return inner if inner else quote * 2
+            end += 1
     # An unquoted inline comment (` # …`) is not part of the value.
     hash_at = text.find(" #")
     if hash_at != -1:
