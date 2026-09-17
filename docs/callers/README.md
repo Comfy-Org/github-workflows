@@ -17,6 +17,7 @@ per-workflow pages give you a complete, copy-pasteable caller:
 | `public-repo-hygiene.yml` | [public-repo-hygiene.md](public-repo-hygiene.md) | nothing |
 | `coderabbit-config-validate.yml` | [coderabbit-config-validate.md](coderabbit-config-validate.md) | nothing |
 | `assign-reviewers.yml` | [assign-reviewers.md](assign-reviewers.md) | `vars.APP_ID` + App key + `.github/reviewers.yml` |
+| `refresh-reviewers.yml` | [refresh-reviewers.md](refresh-reviewers.md) | `vars.APP_ID` + App key + `.github/reviewers.yml` |
 | `assign-prs-to-author.yml` | [assign-prs-to-author.md](assign-prs-to-author.md) | nothing |
 | `stale.yml` | [stale.md](stale.md) | `SLACK_BOT_TOKEN` (optional) |
 | `detect-unreviewed-merge.yml` | [detect-unreviewed-merge.md](detect-unreviewed-merge.md) | `UNREVIEWED_MERGES_TOKEN` |
@@ -198,8 +199,9 @@ with:
 
 ## Concurrency
 
-Check whether the reusable already declares a `concurrency` group. Today only
-`groom.yml` does (`groom-${{ github.repository }}`).
+Check whether the reusable already declares a `concurrency` group. Today
+`groom.yml` (`groom-${{ github.repository }}`) and `refresh-reviewers.yml`
+(`refresh-reviewers-${{ github.repository }}`, `cancel-in-progress: false`) do.
 
 **If it does, do not declare the same group in your caller.** The caller holds
 the group while waiting for its `uses:` job, which is waiting to acquire the same
@@ -265,8 +267,8 @@ gh workflow list --repo <your-org>/<your-repo>
 gh run list --repo <your-org>/<your-repo> --workflow <caller>.yml --limit 1
 ```
 
-**Scheduled / dispatchable callers** — `groom`, `stale`, `assign-prs-to-author`.
-These declare `workflow_dispatch`, so you can fire them by hand:
+**Scheduled / dispatchable callers** — `groom`, `stale`, `assign-prs-to-author`,
+`refresh-reviewers`. These declare `workflow_dispatch`, so you can fire them by hand:
 
 ```bash
 gh workflow run <caller>.yml --repo <your-org>/<your-repo>
