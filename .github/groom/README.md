@@ -748,12 +748,29 @@ request-handling contract is identical on both transports.
 with only loopback up, so the broker — reached over the unix socket bind-mounted
 at `/run/broker.sock` via the in-jail `jail-shim.mjs` TCP→UDS forwarder — is the
 *only* thing the agent can talk to. Host network, host loopback services, and
-cloud metadata (`169.254.169.254` / `168.63.129.16`) are all unreachable. Two
-consequences for callers: set `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` in the
-agent env so the agent doesn't stall on telemetry endpoints that can never be
-reached; and because there is no egress, in-jail `git fetch` / `npm install`
-cannot work — anything the agent needs must already be in the clone before it is
-sandboxed.
+cloud metadata (`169.254.169.254` / `168.63.129.16`) are all unreachable. So is
+**name resolution**, and twice over. First, the jail is in its own network
+namespace with no route off-box at all — one interface (`lo`), no IPv4 or IPv6
+default route — so nothing outside the jail is reachable, including any
+nameserver on another host. Second, on a systemd-resolved runner `/etc/resolv.conf` is a symlink into
+`/run` — which the jail mounts `/etc` but deliberately not — so no `nameserver`
+line is readable and glibc falls back to the local machine (`127.0.0.1`, per
+resolv.conf(5)). That fallback *is* configured and routable: the jail's own `lo`
+carries all of `127.0.0.0/8`. Lookups fail because nothing is listening on the
+jail's `127.0.0.1:53`. Note that the runner's stub resolver address
+`127.0.0.53` is inside that same `127.0.0.0/8` the jail's `lo` carries, so it too
+is *routable* inside the jail and fails only for want of a listener — which is
+worth knowing concretely, because the jail already runs in-jail loopback
+listeners (`jail-shim.mjs` on `127.0.0.1:8790`), so a future in-jail bind to
+`127.0.0.1:53` or `127.0.0.53:53` would silently become the agent's resolver.
+Either way, a hostname the read-only `/etc/hosts` does not already answer cannot
+be resolved.
+
+Two consequences for callers: set `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
+in the agent env so the agent doesn't stall on telemetry endpoints that can
+never be reached; and because there is no egress, in-jail `git fetch` / `npm
+install` cannot work — anything the agent needs must already be in the clone
+before it is sandboxed.
 
 ### The loud-preflight guarantee
 
@@ -777,8 +794,23 @@ broker at a local fake upstream ([`tests/fake-upstream.mjs`](tests/fake-upstream
 *over the bind-mounted unix socket + in-jail `jail-shim.mjs`* to prove key
 injection/stripping, the `/healthz` + non-`/v1` behavior, and SSE pass-through. It
 also proves the BE-4369 egress isolation: host loopback, cloud metadata, and an
-arbitrary external IP are all unreachable from the jail. No `claude`, no API key,
-no spend.
+arbitrary external IP are all unreachable from the jail, and name resolution is
+dead. Every one of those reads a *failure* as the proof, so each is guarded
+against false-passing on a missing tool — the IP-literal checks by asserting
+`curl` is on the jail `PATH` first, the resolution check by asserting exact,
+cause-specific exit codes (`getent` 2 = key not found, `curl` 6 =
+could-not-resolve), which a missing binary's 127 cannot satisfy. The resolution
+check also carries a second assertion on top, because a resolution failure ALONE
+would still pass under a *shared* network namespace (the dangling
+`/etc/resolv.conf` above breaks resolution regardless of routing), and a proof
+that cannot go red is not a proof. That second assertion reads the jail's own
+netns out of `/proc`: first its *identity* (`readlink /proc/self/ns/net` must
+differ from the host's — the one fact that discriminates even on a host whose own
+netns is empty), then its contents (`/proc/net/dev` must list `lo` and nothing
+else, and neither `/proc/net/route` nor `/proc/net/ipv6_route` may carry a default
+route). It deliberately does *not* key on a connect exit code, which could not
+tell an isolated netns from a shared one behind a firewall REJECT or on an offline
+host. No `claude`, no API key, no spend.
 
 ```bash
 shellcheck -x .github/groom/agent-sandbox.sh .github/groom/tests/sandbox-tests.sh
