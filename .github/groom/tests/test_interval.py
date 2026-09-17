@@ -504,6 +504,53 @@ class PreAgentFailureTest(unittest.TestCase):
             "the sandbox preflight step must come BEFORE the billed agent step",
         )
 
+        # BE-14771: that same step now hoists the PRE-EXEC VALIDATION too, not just
+        # the bring-up. agent-sandbox.sh's no-spend, fail-loud guards (argument and
+        # absolute-path validation, the `--uds` live-broker healthz probe, the
+        # clone/out-dir existence + overlap checks, and the guards inside the
+        # bwrap_args assembly) used to run INSIDE "Run finder": any of them dying
+        # left the billed step `completed`/`failure` having spent nothing, which
+        # `agent_step_started` correctly reads as started and `run_audited` then
+        # counts as a spent audit. `--validate-only` runs that identical guard path
+        # off the billed step's name. Nothing in this module changes (the exact-name
+        # match is what keeps the preflight step uncounted) — pin the invocation so
+        # dropping it silently returns those failures to the billed step.
+        preflight_step = finder_block[0].split(f"- name: {preflight_name}\n", 1)[1]
+        preflight_step = preflight_step.split("\n      - name:", 1)[0]
+        # Match the INVOCATION, not the flag name: both flags are discussed in the
+        # step's own comments, so a bare substring check would pass on the prose
+        # alone and keep passing after the command itself was deleted.
+        self.assertIn('agent-sandbox.sh" --preflight-only', preflight_step)
+        self.assertIn('agent-sandbox.sh" --validate-only', preflight_step)
+        # And the validation must NOT run inside the billed step: the whole point
+        # is that it fails somewhere interval.py does not count.
+        self.assertNotIn('agent-sandbox.sh" --validate-only', step)
+
+        # The hoist is only worth anything if it validates the invocation the agent
+        # step actually makes: a `--ro-file` added to "Run finder" but not here would
+        # leave that path unchecked until the billed step dies on it. Compare the
+        # mount-shaping arguments of the two invocations token for token. `--env` and
+        # the `-- <command>` are deliberately excluded — validate-only refuses a
+        # command, and every --env key in this file is a literal, so the KEY=VALUE
+        # guard cannot fire from this caller.
+        mount_args = r"--(?:clone|clone-mode|out-dir|uds|ro-file)\s+\S+"
+
+        def invocation(block, start):
+            # One `bash ... agent-sandbox.sh ...` call: continuation lines until the
+            # first line that does not end in a backslash.
+            lines = []
+            for line in block[start:].split("\n"):
+                lines.append(line)
+                if not line.rstrip().endswith("\\"):
+                    break
+            return re.findall(mount_args, "\n".join(lines))
+
+        self.assertEqual(
+            invocation(preflight_step, preflight_step.index('agent-sandbox.sh" --validate-only')),
+            invocation(step, step.index('agent-sandbox.sh"')),
+            "the --validate-only arguments must mirror the billed agent step's",
+        )
+
     def test_the_gate_job_is_time_bounded(self):
         # The gate walks run history (and, for re-run entries, per-attempt job
         # payloads) at a 30s per-call timeout, so its cost is data-dependent. It

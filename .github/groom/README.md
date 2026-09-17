@@ -685,8 +685,9 @@ just untrusted data the agent analyzes, never a path to the runner's credentials
 
 How `groom.yml` composes them per agent job: a **broker step** (the only step
 holding `secrets.ANTHROPIC_API_KEY`) starts `broker.mjs` on the host socket
-`$BROKER_SOCK` and waits for its `/healthz`; the **agent step** — carrying NO real
-key — runs `agent-sandbox.sh --uds "$BROKER_SOCK"` with the brief (and, for the
+`$BROKER_SOCK` and waits for its `/healthz`; a **"Preflight the sandbox" step**
+does the whole no-spend setup half (`--preflight-only` then `--validate-only`, see
+below); the **agent step** — carrying NO real key — runs `agent-sandbox.sh --uds "$BROKER_SOCK"` with the brief (and, for the
 builder, the finding JSON) passed `--ro-file`, every output under the one rw
 `--out-dir` (`$GROOM_OUT_DIR`), and a `bash -c` wrapper that brings up the in-jail
 `jail-shim.mjs` before `exec`ing the pinned `claude` CLI with a DUMMY key and
@@ -704,7 +705,14 @@ read-only.
   agent-sandbox.sh --clone <path> --clone-mode ro|rw-git-ro --out-dir <path> \
       [--ro-file <path> ...] [--env KEY=VALUE ...] [--uds <host-socket-path>] \
       -- <command...>
+
+  agent-sandbox.sh --preflight-only          # bring-up only, no command
+  agent-sandbox.sh --validate-only <same args as a real run, minus the command>
   ```
+
+  The two extra modes are the *pre-agent-step split* described under
+  [the no-spend pre-agent split](#the-no-spend-pre-agent-split) below;
+  both take no `-- <command>` and neither ever starts the agent.
 
 - **[`broker.mjs`](broker.mjs)** — a ~50-line node-stdlib reverse proxy
   (`node broker.mjs <port|socket-path>`) that holds the real key on the host and
@@ -767,6 +775,43 @@ it drops the userns restriction and retests; if it *still* fails it emits
 `::error::bwrap sandbox unavailable …` and exits non-zero. A broken sandbox stops
 the run — it never silently degrades to no sandbox.
 
+### The no-spend pre-agent split
+
+Everything `agent-sandbox.sh` does *before* `exec bwrap` is no-spend: the sandbox
+bring-up above, and then a wall of fail-loud guards (required/absolute-path
+argument validation, the `--uds` `-S` check plus a live-broker `/healthz` probe,
+clone and out-dir existence, the out-dir↔clone overlap check, and the `--env
+KEY=VALUE` / `rw-git-ro` `.git` / `--ro-file` checks inside the mount assembly).
+Run from inside the billed `Run <agent>` step, any of them failing leaves that
+step `failure` having billed nothing — and
+[`interval.py`](interval.py)'s exact-name match then reads the agent as *started*,
+so `run_audited` counts a spent audit and advances the `GROOM_INTERVAL_DAYS`
+cadence clock for a run that spent nothing (BE-4814). The most plausible live
+trigger: the broker dies between its step and the agent step, leaving a stale
+socket that passes `-S` and fails `/healthz`.
+
+So both halves run in their own `Preflight the sandbox` step, whose name is
+deliberately DISTINCT from the billed step:
+
+| Mode | Runs | Takes |
+|---|---|---|
+| `--preflight-only` (BE-14756) | ONLY the mutating bring-up | no clone/out-dir/uds/ro-file/env, no `-- command` |
+| `--validate-only` (BE-14771) | the SAME guard path a real run walks, stopping at the single `exec` point | the same arguments as the agent step; no `-- command` |
+
+`--validate-only` deliberately routes through the real code rather than
+re-implementing the checks — a parallel copy would drift, and a guard it missed
+would still kill the billed step no-spend. Both modes reject nonsensical
+combinations loudly (each other, or a `-- command`), so a stray flag on a real
+agent step dies instead of becoming a green no-op that runs no agent. `preflight()`
+is idempotent and the validation's only side effect is the `mkdir -p` on the
+out-dir that the real run performs anyway, so the agent step's own copies of both
+are then no-ops.
+
+**What this does NOT close:** the window between that step and the agent step. A
+broker that dies *after* the `/healthz` probe still fails the billed step with no
+spend, and that failure is still counted as an audit. Proving the agent actually
+BILLED is tracked separately (BE-4850).
+
 ### Tests — deterministic, no API spend
 
 [`tests/sandbox-tests.sh`](tests/sandbox-tests.sh) (run by the `sandbox-tests` job
@@ -777,8 +822,12 @@ broker at a local fake upstream ([`tests/fake-upstream.mjs`](tests/fake-upstream
 *over the bind-mounted unix socket + in-jail `jail-shim.mjs`* to prove key
 injection/stripping, the `/healthz` + non-`/v1` behavior, and SSE pass-through. It
 also proves the BE-4369 egress isolation: host loopback, cloud metadata, and an
-arbitrary external IP are all unreachable from the jail. No `claude`, no API key,
-no spend.
+arbitrary external IP are all unreachable from the jail. Sections 8 and 9 cover
+the no-spend split: `--preflight-only` exits 0 on a usable host and fails loud on a
+broken `bwrap`, and `--validate-only` exits 0 on a real run's arguments *without
+exec'ing the jail* (a stubbed `bwrap` records every invocation, so "did it exec?"
+is asserted, not assumed) while failing loud on a bad argument and on a
+`-S`-passing socket with no live broker. No `claude`, no API key, no spend.
 
 ```bash
 shellcheck -x .github/groom/agent-sandbox.sh .github/groom/tests/sandbox-tests.sh
