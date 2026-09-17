@@ -88,6 +88,7 @@ the filenames literally) and `cursor-review` does not.
 |---|---|---|
 | `stale.yml` | 0 | Nothing to bump. Add a fleet when the first caller lands. |
 | `assign-prs-to-author.yml` | 0 | Same. |
+| `refresh-reviewers.yml` | 0 | Ships a consumer caller guide but no external caller has enrolled yet. Add a fleet + `REFRESH_REVIEWERS_CALLERS` roster once the first one lands; until then a consumer's `uses:`/`workflows_ref` pin is bumped by hand. |
 
 A reusable that has callers but no fleet is the trap this whole directory exists
 to prevent: the pins simply never move, so consumers drift behind indefinitely

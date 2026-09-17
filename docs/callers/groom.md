@@ -120,7 +120,7 @@ The ones that matter:
 | `builder` | `false` | Opt into PR-writing — see below. |
 | `max_prs` | `'5'` | Only with `builder: true`. Typed **string**, deliberately. |
 | `pr_size_limit` | `600` | Only with `builder: true`. Caps a built PR's diff. |
-| `extra_denied_paths` | `''` | Only with `builder: true`. Newline-separated Python-`re` patterns adding this repo's OWN CI-privileged paths (a `scripts/ci/` entrypoint, a custom runner) to the built-in patch deny-list, so a matching builder patch is filed as an issue rather than opened as a PR. **Additive-only** — a caller widens the deny-list, never narrows it. A pattern that will not compile fails the run **closed** (a security-control typo must not silently widen the allow side). Propose broadly-applicable paths upstream in `patch_policy.py`; keep only repo-specific ones here. See below. |
+| `extra_denied_paths` | `''` | Only with `builder: true`. Newline-separated Python-`re` patterns adding this repo's OWN CI-privileged paths (a `scripts/ci/` entrypoint, a custom runner) to the built-in patch deny-list, so a matching builder patch is filed as an issue rather than opened as a PR. **Additive-only** — a caller widens the deny-list, never narrows it. A pattern that will not compile fails the run **closed** at the `gate` job before any agent spend, blocking the whole audit (both sinks) until fixed — a security-control typo must not silently widen the allow side. Propose broadly-applicable paths upstream in `patch_policy.py`; keep only repo-specific ones here. See below. |
 
 ## Scoping the bot key to an environment
 
@@ -217,7 +217,7 @@ A builder patch that touches a path your CI **executes before a human reviews th
         ^deploy/run\.sh$
 ```
 
-Two properties matter. It is **additive-only** — patterns are OR-ed onto the built-in list, so you can widen the deny-list but never narrow it (there is no way to un-deny a built-in path). And it **fails closed on a typo**: a pattern that will not compile prints an `::error::` naming it and fails the run, so the builder opens no PRs until you fix it — a broken deny-list must never silently let the path it was meant to guard sail through to an auto-PR. Erring wide is safe (a false positive only files an issue instead of opening a PR; nothing is dropped), so when in doubt, add the pattern. If a path is privileged for *most* repos, propose it upstream in `patch_policy.py` so every caller benefits, and keep only the genuinely repo-specific ones here.
+Two properties matter. It is **additive-only** — patterns are OR-ed onto the built-in list, so you can widen the deny-list but never narrow it (there is no way to un-deny a built-in path). And it **fails closed on a typo**: a pattern that will not compile prints an `::error::` naming it and fails the run at the `gate` job, before any agent spend. Because every downstream job needs that gate, this blocks the whole audit — both the PR builder and the issue-filing sink — until you fix it (a loud, cheap red instead of billing the full agent budget and only then aborting the PR path); a broken deny-list must never silently let the path it was meant to guard sail through to an auto-PR. Erring wide is safe (a false positive only files an issue instead of opening a PR; nothing is dropped), so when in doubt, add the pattern. If a path is privileged for *most* repos, propose it upstream in `patch_policy.py` so every caller benefits, and keep only the genuinely repo-specific ones here.
 
 ## Footguns
 
