@@ -21,10 +21,23 @@
 #       [--ro-file <path> ...] [--env KEY=VALUE ...] [--uds <host-socket-path>] \
 #       -- <command...>
 #
+#   agent-sandbox.sh --preflight-only
+#
 #   --uds bind-mounts a host-side listening unix socket (the broker) to the fixed
 #   in-jail path /run/broker.sock (read-only: connect(2) to a socket works under a
 #   read-only bind, but the jail can't chmod/replace the shared inode).
 #   Omit it for a fully offline jail.
+#
+#   --preflight-only runs ONLY preflight() — the (mutating) sandbox bring-up
+#   (install bubblewrap, the AppArmor profile, the sysctl fallback) — then exits:
+#   0 if a working bwrap sandbox is now usable, non-zero if it cannot be
+#   established. It takes NO --clone/--out-dir/-- <command>. It exists so the groom
+#   jobs can do the bring-up in a step SEPARATE from `Run <agent>` (BE-14756): a
+#   bring-up failure then fails that preflight step and NEVER reaches the billed
+#   agent step, so interval.py does not miscount a no-spend setup failure as a
+#   spent audit. preflight() is idempotent (fast path returns instantly when the
+#   sandbox is already usable), so the real `Run <agent>` step's own preflight is
+#   then a no-op.
 #
 # The preflight FAILS LOUD: if a working bwrap sandbox cannot be established on
 # this runner image, the script exits non-zero and the command is NEVER run. It
@@ -103,7 +116,7 @@ PROFILE
 }
 
 main() {
-	local clone="" clone_mode="" out_dir="" uds=""
+	local clone="" clone_mode="" out_dir="" uds="" preflight_only=""
 	local ro_files=() envs=() cmd=()
 
 	while [[ $# -gt 0 ]]; do
@@ -114,10 +127,29 @@ main() {
 			--ro-file) [[ $# -ge 2 ]] || die "--ro-file needs a value"; ro_files+=("$2"); shift 2 ;;
 			--env) [[ $# -ge 2 ]] || die "--env needs a value"; envs+=("$2"); shift 2 ;;
 			--uds) [[ $# -ge 2 ]] || die "--uds needs a value"; [[ -n "$2" ]] || die "--uds needs a non-empty value"; [[ -z "$uds" ]] || die "--uds may be given at most once"; uds="$2"; shift 2 ;;
+			--preflight-only) preflight_only=1; shift ;;
 			--) shift; cmd=("$@"); break ;;
 			*) die "unknown argument: $1" ;;
 		esac
 	done
+
+	# --preflight-only: run ONLY the (mutating) sandbox bring-up and report whether
+	# a working jail is now available (BE-14756). It takes NO clone/clone-mode/
+	# out-dir/uds/ro-file/env and NO `-- <command>`; combining it with any of those
+	# is a copy-paste mistake — a stray `--preflight-only` on a real agent step
+	# would otherwise silently discard the clone/out-dir/command and exit 0 having
+	# run no agent, the opposite of this mode's contract. Every other bad flag
+	# combination here dies loudly, so die here too instead of short-circuiting
+	# past every validation. preflight() fails loud itself when the sandbox cannot
+	# be established; `|| exit $?` keeps that structural even if preflight() is ever
+	# refactored to RETURN non-zero rather than terminate the process.
+	if [[ -n "$preflight_only" ]]; then
+		[[ -z "$clone" && -z "$clone_mode" && -z "$out_dir" && -z "$uds" \
+			&& ${#ro_files[@]} -eq 0 && ${#envs[@]} -eq 0 && ${#cmd[@]} -eq 0 ]] \
+			|| die "--preflight-only takes no --clone/--clone-mode/--out-dir/--uds/--ro-file/--env and no -- <command>"
+		preflight || exit $?
+		exit 0
+	fi
 
 	[[ -n "$clone" ]] || die "--clone is required"
 	[[ -n "$out_dir" ]] || die "--out-dir is required"
