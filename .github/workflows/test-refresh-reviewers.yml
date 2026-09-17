@@ -10,12 +10,16 @@ on:
   pull_request:
     paths:
       - '.github/refresh-reviewers/**'
+      - '.github/workflows/refresh-reviewers.yml'
       - '.github/workflows/test-refresh-reviewers.yml'
+      - 'docs/callers/refresh-reviewers.md'
   push:
     branches: [main]
     paths:
       - '.github/refresh-reviewers/**'
+      - '.github/workflows/refresh-reviewers.yml'
       - '.github/workflows/test-refresh-reviewers.yml'
+      - 'docs/callers/refresh-reviewers.md'
 
 permissions:
   contents: read
