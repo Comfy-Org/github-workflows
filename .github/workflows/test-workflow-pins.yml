@@ -24,6 +24,13 @@ on:
       # drift harness.
       - '.github/cursor-review/README.md'
       - '.github/refresh-reviewers/README.md'
+      # The public catalog, scanned by SharedDocExampleCallersTest for
+      # `uses:`-anchored `with:` fences. It matches none of the globs above, so
+      # without this entry a catalog-only edit that adds a phantom `with:` key
+      # to the most-copied caller example in the repo runs no job and lands
+      # green — the #31 failure. (`docs/callers/README.md`, the other doc that
+      # test scans, is already covered by `docs/callers/**`.)
+      - 'README.md'
   push:
     branches: [main]
     paths:
@@ -34,6 +41,8 @@ on:
       # knob row must run the drift harness.
       - '.github/cursor-review/README.md'
       - '.github/refresh-reviewers/README.md'
+      # Same public catalog as above.
+      - 'README.md'
 
 permissions:
   contents: read

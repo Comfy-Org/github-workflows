@@ -16,14 +16,17 @@ the repo: one `ROWS` table, one set of parsers (ported from the refresh-reviewer
 copy, CRLF handling and blank/comment tolerance included), one generated
 `TestCase` per reusable so `-v` names the workflow that drifted. The two
 originals are deleted; everything they asserted is carried by their rows'
-`dir_readme` / `readme_mode` / `check_defaults` columns. It does NOT fix any
-docs drift.
+`dir_readme` / `readme_mode` / `check_defaults` /
+`expect_sentinel_in_examples` columns. It does NOT fix any docs drift.
 
-Because the two directory READMEs it now reads live outside `docs/callers/**`,
-`test-workflow-pins.yml` lists `.github/cursor-review/README.md` and
-`.github/refresh-reviewers/README.md` as explicit `paths:` entries — a
-README-only edit that deletes a knob row has to run this harness, which is the
-#31 scenario exactly.
+Some files it reads live outside the `paths:` globs `test-workflow-pins.yml`
+already covers (`.github/workflows/**`, `.github/workflow-pins/**`,
+`docs/callers/**`): the two directory READMEs, and the repo-root `README.md`
+scanned by `SharedDocExampleCallersTest`. Each is listed there as its own
+explicit `paths:` entry, so an edit to it has to run this harness — the #31
+scenario exactly. `test_files_read_outside_the_globs_are_in_this_suites_ci_path_filters`
+derives that set from this file and checks `pull_request` and `push`
+separately, so the pairing cannot rot.
 
 Direction-by-direction, what is asserted and why the strictness differs:
 
@@ -143,6 +146,12 @@ Row = collections.namedtuple(
         "readme_heading",
         "readme_mode",  # "one-way" (phantom only) | "two-way" (set equality)
         "check_defaults",  # compare the guide's Default column to the workflow
+        # Require `sentinel` in EVERY example `with:` block, not merely a
+        # non-empty one. OFF by default: most examples legitimately show only
+        # the knobs they need (groom's header example passes no ref at all,
+        # `stale`'s passes only `dry_run`), so demanding it everywhere would be
+        # permanently red.
+        "expect_sentinel_in_examples",
     ),
     defaults=(
         None,  # guide
@@ -153,6 +162,7 @@ Row = collections.namedtuple(
         None,  # readme_heading
         "one-way",  # readme_mode
         False,  # check_defaults
+        False,  # expect_sentinel_in_examples
     ),
 )
 
@@ -231,6 +241,12 @@ ROWS = (
         readme_heading="## Knob defaults (and why)",
         readme_mode="one-way",
         check_defaults=True,
+        # Restores the deleted suite's `assertIn("workflows_ref", keys)` on both
+        # shipped example callers. The generalized harness only requires a
+        # non-empty `with:`, under which a later edit dropping `workflows_ref:`
+        # from either copy-paste caller would land green — and whoever copied it
+        # would run with `workflows_ref` as `''`, the BE-5546 hole.
+        expect_sentinel_in_examples=True,
     ),
     Row(workflow="stale", sentinel="slack_channel"),
 )
@@ -799,6 +815,87 @@ def canonical_workflow_default(name, defaults, required):
     return ""
 
 
+# The `paths:`-filter globs in test-workflow-pins.yml that already cover whole
+# trees. A file this suite READS which falls outside all of them needs its own
+# literal entry, or an edit to it runs no job at all.
+CI_PATH_GLOB_PREFIXES = (
+    ".github/workflows/",
+    ".github/workflow-pins/",
+    "docs/callers/",
+)
+# Events whose `paths:` list must carry every such file. Both, so adding an
+# entry to `pull_request` while forgetting `push` — or vice versa — still fails.
+CI_FILTER_EVENTS = ("pull_request", "push")
+
+
+def files_needing_their_own_ci_path_entry():
+    """Repo-relative files this suite reads from outside CI_PATH_GLOB_PREFIXES.
+
+    Derived from the suite itself — the rows' `dir_readme`s plus the shared
+    catalogs `SharedDocExampleCallersTest` scans — rather than hard-coded, so
+    adding a row that reads a new README extends the guard automatically instead
+    of leaving it pinned to yesterday's list.
+    """
+    read = {row.dir_readme for row in ROWS if row.dir_readme}
+    read |= {doc.replace(os.sep, "/") for doc in SharedDocExampleCallersTest.DOCS}
+    return sorted(
+        path
+        for path in read
+        if not path.startswith(CI_PATH_GLOB_PREFIXES)
+    )
+
+
+def event_paths_entries(path, event):
+    """The literal `paths:` list entries under `on.<event>` in a workflow file.
+
+    Indent-anchored rather than YAML-parsed (stdlib-only repo). The event's
+    block is every line indented deeper than its own `  <event>:` key, and
+    within it `paths:` owns the `- ` items indented deeper than itself — so a
+    sibling key's list (`branches:`, or another event's `paths:`) is never
+    counted as this event's. A trailing ` # comment` is stripped, and the
+    surrounding quotes normalised away, so a correctly-configured filter whose
+    entry carries an inline note still matches.
+    """
+    lines = read_lines(path)
+    key = "  %s:" % event
+    try:
+        start = lines.index(key)
+    except ValueError:
+        return None
+    entries, in_paths, paths_indent = [], False, None
+    for line in lines[start + 1:]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent <= 2:
+            break  # left the event's block
+        stripped = line.strip()
+        if in_paths:
+            if indent <= paths_indent:
+                in_paths = False
+            elif stripped.startswith("- "):
+                entries.append(_unquote_filter_entry(stripped[2:]))
+                continue
+        if stripped == "paths:":
+            in_paths, paths_indent = True, indent
+    return entries
+
+
+def _unquote_filter_entry(value):
+    """A `paths:` item's bare glob: inline comment stripped, quotes removed."""
+    value = value.strip()
+    if value[:1] in ("'", '"'):
+        closing = value.find(value[0], 1)
+        if closing != -1:
+            return value[1:closing]
+        return value[1:]
+    # Unquoted: YAML ends the scalar at ` #`.
+    comment = value.find(" #")
+    if comment != -1:
+        value = value[:comment]
+    return value.strip()
+
+
 def reusable_workflow_names():
     """Basenames of every workflow file that is itself reusable.
 
@@ -954,6 +1051,27 @@ def _make_case(row):
                                 "check vacuous"
                                 % (position, len(blocks), label),
                             )
+                            if row.expect_sentinel_in_examples:
+                                # Stronger than non-empty, for the rows whose
+                                # deleted hand-rolled suite pinned the sentinel
+                                # itself: a shipped caller that quietly loses
+                                # `workflows_ref:` is a consumer running off a
+                                # mutable ref, not just a thinner example.
+                                self.assertIn(
+                                    row.sentinel,
+                                    keys,
+                                    "`with:` block #%d of %d in %s does not "
+                                    "pass `%s` — this example is pinned to show "
+                                    "it, and a caller copied without it runs "
+                                    "with `%s` as `''`"
+                                    % (
+                                        position,
+                                        len(blocks),
+                                        label,
+                                        row.sentinel,
+                                        row.sentinel,
+                                    ),
+                                )
                     undeclared = set().union(*blocks) - self.declared
                     self.assertFalse(
                         undeclared,
@@ -1022,7 +1140,13 @@ def _make_case(row):
                 "shape changed; this check is now vacuous"
                 % (row.inputs_heading, rel(self.guide), row.sentinel),
             )
-            for name in sorted(self.declared):
+            # KNOWN_UNDOCUMENTED subtracted for the same reason
+            # test_every_declared_input_is_documented_or_allowlisted subtracts
+            # it: without that, the two directions of this file disagree — an
+            # input added to the allowlist would pass the documented-or-
+            # allowlisted test and still redden here, on a guide that is
+            # correct by this file's own definition.
+            for name in sorted(self.declared - self.allowed):
                 with self.subTest(input=name):
                     self.assertIn(
                         name,
@@ -1107,6 +1231,18 @@ class RowsCoverTheReusablesTest(unittest.TestCase):
                         "so the README knob check skips and that heading is "
                         "never read" % (row.workflow, row.readme_heading),
                     )
+                    # Same half-filled config, one column over: a row carrying
+                    # readme_mode="two-way" with no dir_readme reads as a
+                    # set-equality pin while test_directory_readme_knob_table
+                    # skips outright, so the strictest-looking column in the
+                    # table checks nothing at all.
+                    self.assertEqual(
+                        row.readme_mode,
+                        Row._field_defaults["readme_mode"],
+                        "ROWS gives %s readme_mode=%r but no dir_readme, so the "
+                        "README knob check skips and that mode is never applied"
+                        % (row.workflow, row.readme_mode),
+                    )
                 else:
                     self.assertTrue(
                         row.readme_heading
@@ -1117,43 +1253,84 @@ class RowsCoverTheReusablesTest(unittest.TestCase):
                         % (row.workflow, row.dir_readme, row.readme_heading),
                     )
 
-    def test_dir_readmes_are_in_this_suites_ci_path_filters(self):
-        """Every `dir_readme` must appear in BOTH of test-workflow-pins.yml's
-        `paths:` lists.
+    def test_files_read_outside_the_globs_are_in_this_suites_ci_path_filters(self):
+        """Every file this suite reads from outside the `paths:` globs must
+        appear in BOTH of test-workflow-pins.yml's `paths:` lists.
 
-        These two READMEs are the only files this suite reads from outside
-        `.github/workflows/**`, `.github/workflow-pins/**` and `docs/callers/**`
-        — the three globs that filter already covers. Drop an entry and a
-        README-only PR that deletes a knob row matches no filter, runs no job,
-        and lands green: the #31 scenario, on the very file this row was added
-        to police. Nothing else in the repo checks a `paths:` filter, so the
-        pairing is asserted here, next to the rows that depend on it.
+        That is the two rows' directory READMEs plus the repo-root `README.md`
+        — the public catalog `SharedDocExampleCallersTest` scans for
+        `uses:`-anchored `with:` fences. None of them matches
+        `.github/workflows/**`, `.github/workflow-pins/**` or `docs/callers/**`,
+        the three globs the filter already covers. Drop an entry and an edit to
+        that file matches no filter, runs no job, and lands green: the #31
+        scenario, on files this suite is the only checker of. Nothing else in
+        the repo checks a `paths:` filter, so the pairing is asserted here, next
+        to the rows that depend on it.
 
-        Counted as literal list entries rather than parsed as YAML (stdlib-only
-        repo), and required TWICE so adding it to `pull_request` while
-        forgetting `push` — or vice versa — still fails.
+        Each event's own `paths:` block is scanned SEPARATELY and required to
+        carry the entry, so two copies in one list cannot stand in for the
+        other event's missing one — exactly the mispairing this test exists to
+        catch. The needed-files set is derived from the suite, so a row that
+        starts reading a new README extends this guard on its own.
         """
         filters = os.path.join(WORKFLOWS_DIR, "test-workflow-pins.yml")
-        entries = [
-            line.strip()
-            for line in read_lines(filters)
-            if line.lstrip().startswith("- ")
-        ]
+        needed = files_needing_their_own_ci_path_entry()
         self.assertTrue(
-            entries, "no `- ` list entries in %s — the file moved or was "
-            "reshaped; this check is now vacuous" % rel(filters)
+            needed,
+            "no file outside %s is read by this suite — the rows or "
+            "SharedDocExampleCallersTest.DOCS were reshaped; this check is now "
+            "vacuous" % (CI_PATH_GLOB_PREFIXES,),
         )
-        for readme in sorted({row.dir_readme for row in ROWS if row.dir_readme}):
-            with self.subTest(dir_readme=readme):
-                spellings = ("- '%s'" % readme, '- "%s"' % readme, "- %s" % readme)
-                found = sum(entry in spellings for entry in entries)
-                self.assertGreaterEqual(
-                    found,
-                    2,
-                    "%s is read by a ROWS row but appears in %d of the two "
-                    "`paths:` lists in %s (need both pull_request and push) — "
-                    "a README-only edit that deletes a knob row would run no "
-                    "job at all" % (readme, found, rel(filters)),
+        by_event = {}
+        for event in CI_FILTER_EVENTS:
+            entries = event_paths_entries(filters, event)
+            self.assertIsNotNone(
+                entries,
+                "no `on.%s:` key in %s — the file moved or was reshaped; this "
+                "check is now vacuous" % (event, rel(filters)),
+            )
+            self.assertTrue(
+                entries,
+                "`on.%s:` in %s has no `paths:` entries — the filter was "
+                "removed or reshaped; this check is now vacuous"
+                % (event, rel(filters)),
+            )
+            by_event[event] = entries
+        for path in needed:
+            for event in CI_FILTER_EVENTS:
+                with self.subTest(path=path, event=event):
+                    self.assertIn(
+                        path,
+                        by_event[event],
+                        "%s is read by this suite but is missing from the "
+                        "`on.%s.paths:` list in %s — an edit to it would run "
+                        "no job at all"
+                        % (path, event, rel(filters)),
+                    )
+
+    def test_sentinel_pin_has_an_example_to_pin(self):
+        """`expect_sentinel_in_examples` needs both examples actually scanned.
+
+        It is enforced inside the `expect_*_with` branch, so a row that turns it
+        on while turning either example off gets no sentinel check on that side
+        — no error, no coverage: the quietly-vacuous half-filled config this
+        file exists to prevent, on the column added to close exactly that gap.
+        """
+        for row in ROWS:
+            if not row.expect_sentinel_in_examples:
+                continue
+            with self.subTest(workflow=row.workflow):
+                self.assertTrue(
+                    row.expect_guide_with and row.expect_header_with,
+                    "ROWS gives %s expect_sentinel_in_examples=True but "
+                    "expect_guide_with=%r / expect_header_with=%r; the sentinel "
+                    "is only asserted where a `with:` block is expected, so it "
+                    "would silently skip that example"
+                    % (
+                        row.workflow,
+                        row.expect_guide_with,
+                        row.expect_header_with,
+                    ),
                 )
 
     def test_rows_have_no_duplicate_workflows(self):
