@@ -591,9 +591,10 @@ nothing" hole the checks above close, with a third party holding the pen.
 So every `uses:` under `.github/workflows/` must name a full 40-hex commit SHA.
 One form names no ref of its own and is skipped rather than failed: a local
 path (`./.github/actions/x`), which resolves inside the caller's own
-already-pinned checkout. The skip is **reported** (`not pinnable <file>:<line>:
-… — <reason>`) and counted in the summary, so swapping a pinned ref for a local
-path cannot quietly shrink the coverage number with nothing else to say why.
+already-pinned checkout. The skip is **reported** — a
+`not pinnable <file>:<line>: <value> — <reason>` line, plus its own term in the
+summary — so swapping a pinned ref for a local path cannot quietly shrink the
+coverage number with nothing else to say why.
 
 A container image is **not** skipped. `docker://…` is immutable by registry
 digest rather than by git ref, but `docker://alpine:3.20` is a mutable tag on
@@ -635,8 +636,8 @@ dependency this repo deliberately does not carry.
 
 `KNOWN_UNPINNED` is the debt list for this check, with the same self-draining
 contract as `KNOWN_EXEMPT`: an entry is a known debt, not a blessing, and a
-**stale** entry is an error. Entries are `(workflow filename, full `uses:`
-value)` pairs — the file alone would pre-exempt every other action in it, and
+**stale** entry is an error. Entries are ``(workflow filename, full `uses:`
+value)`` pairs — the file alone would pre-exempt every other action in it, and
 the ref alone would pre-exempt the same floating ref wherever a later workflow
 copied it. Pinning the ref is not the only way an entry goes stale: Dependabot
 moving `@v6` to `@v7` retires the entry too, which is precisely how this debt
