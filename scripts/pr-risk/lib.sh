@@ -51,6 +51,12 @@ READ_RETRY_DELAY_SECONDS="${READ_RETRY_DELAY_SECONDS:-10}"
 # The job-wide deadline retry_read refuses to sleep past. 0 = no deadline, which is what a
 # single-target caller like collect-pr-inputs.sh runs with; grade-targets.sh's main() computes a
 # real one from the calling job's timeout before any target is attempted.
+# UNCONDITIONAL, unlike the knobs above — sourcing this file RESETS it to 0. A deadline is a value
+# only the sourcing script can compute (it needs that job's timeout), so it is set AFTER the source,
+# which is what main() does; a value computed BEFORE the source would be silently discarded here.
+# Deliberately not `${JOB_DEADLINE:-0}`: retry_read feeds this straight to `-eq`, so inheriting an
+# unvalidated string from the ambient environment would turn a typo into an arithmetic error inside
+# the retry loop rather than a clean default.
 JOB_DEADLINE=0
 
 # ---- scratch files -----------------------------------------------------------------------------
@@ -178,6 +184,21 @@ resolve_base_ref() { # <num> -> ref on stdout, rc 1 (reason already annotated on
 fetch_override() { # <path> <outfile> <base-ref> -> prints the outfile, or nothing when absent
   init_scratch
   local p="$1" out="$2" base="$3"
+  # THE PATH MUST STAY UNDER `contents/`. enc_path percent-encodes each segment, but jq's `@uri`
+  # leaves `.` alone by design, so a `..` segment survives encoding INTACT and the request becomes
+  # `repos/OWNER/NAME/contents/../../x?ref=…` — a different endpoint once the dot segments resolve,
+  # asked with the grading token. These paths arrive from the free-form `repo_map_path` /
+  # `repo_runbooks_path` inputs, which neither pr-risk.yml nor pr-derisk.yml validates, so the URL
+  # builder is the only place the SHAPE can be checked.
+  # REFUSED, NEVER SILENTLY REWRITTEN. Stripping the dot segments and fetching what is left would
+  # grade the PR against a file the repo did not ask for; falling through to the generic default
+  # would grade it against rules nobody read. Both are the failure the 404-only contract below
+  # exists to prevent, so an unusable path is an error on the target, exactly like a 5xx.
+  case "$p" in
+    "")                  echo "::error::the override path is empty — refusing to request the repository's contents root instead of a file." >&2; return 1 ;;
+    /*)                  echo "::error::the override path '${p}' is absolute — it must be relative to the repository root." >&2; return 1 ;;
+    ..|../*|*/..|*/../*) echo "::error::the override path '${p}' contains a '..' segment — refusing to build a contents URL that resolves outside the repository tree." >&2; return 1 ;;
+  esac
   if retry_read "$out" "repos/${REPO}/contents/$(enc_path "$p")?ref=$(enc "$base")" \
        -H "Accept: application/vnd.github.raw"; then
     echo "using ${p} from ${base}" >&2

@@ -22,7 +22,9 @@
 # Inputs (env):
 #   REPO             owner/name                                                     (required)
 #   PR_NUMBER        the PR number                                                  (required)
-#   TOOL_DIR         directory holding the pr-risk scripts  (default ../pr-risk beside us)
+#   TOOL_DIR         directory holding the pr-risk GRADER   (default ../pr-risk beside us).
+#                    The swappable tool only — `lib.sh` is sourced from beside this script,
+#                    not from here, so a stub grader directory need not carry the library.
 #   OUT_DIR          where to write record.json / diff.patch (default the cwd)
 #   MAX_DIFF_BYTES   diff budget                                                    (default 200000)
 #   MAP_PATH         consumer map override path        (default .github/risk.json)
@@ -74,17 +76,42 @@ mkdir -p "$OUT_DIR" || die "could not create OUT_DIR '$OUT_DIR'"
 
 # Sourced for `resolve_base_ref` / `fetch_override` / `retry_read`. It reads REPO from the
 # environment at source time, which is already set above, and it has no top-level side effects at
-# all — no trap, no scratch file, and no unprefixed function that could capture one of ours. That
-# is a property of the file rather than a guard inside it, which is what makes this safe rather
-# than merely convenient; see lib.sh's header.
-# Its own diagnostics (`gt_log`/`gt_die`) are prefixed so they cannot capture ours, but they still
-# report under OUR name — a retry line emitted while this step is collecting inputs must not read
-# `[grade-targets]`, naming a script that did not emit it, in a public run log. Set before the
-# source, because that is when lib.sh reads its default.
+# all — no command runs, no scratch file is created and no trap is installed. That is a property of
+# the file rather than a guard inside it, which is what makes this safe rather than merely
+# convenient; see lib.sh's header.
+#
+# FROM SELF_DIR, NOT TOOL_DIR, matching grade-targets.sh's own source line. TOOL_DIR names the
+# SWAPPABLE tools this script shells out to — the grader — and the suite overrides it with a stub
+# grader directory that holds no library. Anchoring the LIBRARY to a caller-overridable input too
+# would make that stubbing pattern hard-die at this source line instead of merely swapping the
+# grader. lib.sh is pr-risk's implementation of these resolvers, not one of the tools, so it
+# travels with the checkout rather than with the input.
+#
+# WHAT IT BRINGS IN, precisely: `gt_log`/`gt_die`, the unprefixed `init_scratch`/`gherr`/`enc`/
+# `enc_path`/`retryable_err`/`retry_read`, and the `ERRF`/`LABELF`/`OUTF`/`REPO`/`READ_RETRY_*`/
+# `JOB_DEADLINE` variables. None of those is a name THIS script defines, so nothing of ours is
+# captured — the pair that actually collided was `log`/`die`, which is why lib.sh's diagnostics
+# are the prefixed ones and why this file no longer defines its own twice.
+# Those diagnostics still report under OUR name — a retry line emitted while this step is
+# collecting inputs must not read `[grade-targets]`, naming a script that did not emit it, in a
+# public run log. Set before the source, because that is when lib.sh reads its default.
 GT_LOG_PREFIX=collect-pr-inputs
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=../pr-risk/lib.sh
-source "$TOOL_DIR/lib.sh" || die "could not source lib.sh from '$TOOL_DIR'"
+source "$SELF_DIR/../pr-risk/lib.sh" \
+  || die "could not source lib.sh from '$SELF_DIR/../pr-risk' — it ships beside the grader in this repo"
+
+# THE SCRATCH TRIO IS MINTED HERE, IN THE PARENT, and cleaned up by this script's own EXIT trap.
+# Both resolvers below run inside a command substitution (`base_ref="$(resolve_base_ref …)"`), so
+# leaving it to their lazy `init_scratch` mints the trio in the SUBSHELL: the ERRF/LABELF/OUTF
+# assignments never reach this scope, each of the three calls mints a FRESH set, and with no trap
+# here all nine files survive the run. publish-risk-surfaces.sh carries the same note over its own
+# `ghq` call sites — it is the same trap, found the same way.
+# ARMED BEFORE init_scratch, not after: the second or third mktemp can fail, and `gt_die` then
+# exits 2 with the file(s) already created and no trap in place. The three variables are
+# pre-initialised to "" in lib.sh and `rm -f` tolerates empty arguments, so arming it first is free.
+trap 'rm -f "$ERRF" "$LABELF" "$OUTF"' EXIT
+init_scratch
 
 emit() { # <key> <value>
   printf '%s=%s\n' "$1" "$2"
@@ -130,7 +157,7 @@ if ! gh api "repos/$REPO/pulls/$PR_NUMBER" -H "Accept: application/vnd.github.di
   oversized=true
 elif [ ! -s "$DIFF" ]; then
   # A ZERO-BYTE BODY IS NOT AN EMPTY DIFF. `gh` exited 0, so the branch above did not fire, but a
-  # followed redirect can return 200 with nothing in it (grade-targets.sh's `fetch_override`
+  # followed redirect can return 200 with nothing in it (`../pr-risk/lib.sh`'s `fetch_override`
   # documents the same trap on the contents API). Handing the planner a diff it never saw produces
   # a confident, evidence-free partition — the one output this rung must never emit.
   warn "the diff of ${REPO}#${PR_NUMBER} came back empty — taking the deterministic fallback rather than planning against a diff nobody read"

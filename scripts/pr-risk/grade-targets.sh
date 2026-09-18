@@ -377,13 +377,18 @@ process_target() { # <num> -> rc 0 = label in sync, rc 1 = failed
 
 # ---- main --------------------------------------------------------------------------------------
 main() {
-  init_scratch
   # UNCONDITIONAL, and inside main() rather than at file scope. At file scope this `trap` replaced
   # the EXIT trap of any shell that merely SOURCED this file — the bug that cost a `GT_DIRECT`
   # flag and a lazily-installed trap to work around. Nothing sources this file any more (the
   # helpers live in lib.sh), and main() runs only on a direct invocation, so the flag is gone and
   # the scratch files are cleaned up on every path out of a real run.
+  # ARMED BEFORE init_scratch, which is what makes that last claim true on EVERY path: init_scratch
+  # takes three mktemps, and a failure on the second or third exits 2 through `gt_die` — with the
+  # file(s) already created and, if the trap came after, nothing installed to remove them. The three
+  # variables are pre-initialised to "" in lib.sh and `rm -f` tolerates empty arguments, so arming
+  # it first costs nothing and closes that window.
   trap 'rm -f "$ERRF" "$LABELF" "$OUTF"' EXIT
+  init_scratch
   [ -n "$REPO" ] || die "REPO is required"
   [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "bad REPO '$REPO' (want owner/name)"
   [ -f "$GRADER" ]  || die "grader not found at $GRADER (set TOOL_DIR)"
