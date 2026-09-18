@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 try:
     import yaml
@@ -631,7 +632,7 @@ class TestCrlfByteFaithfulRewrite(unittest.TestCase):
                          CONFIG_CRLF)
 
     def test_mixed_endings_stay_mixed_per_line(self):
-        # Line-ending detection is per item line, so a file someone left half
+        # Endings are taken per POSITION, so a file someone left half
         # converted comes back exactly as half converted as it went in.
         mixed = ("rules:\r\n"
                  "  - paths: [\"x/**\"]\r\n"
@@ -640,9 +641,55 @@ class TestCrlfByteFaithfulRewrite(unittest.TestCase):
                  "      - old-e\r\n")
         config, locs = gen.parse_reviewer_config(mixed)
         out = gen.rewrite_config(mixed, locs, {0: ["n1", "n2"]}, None)
-        # the replaced items inherit the FIRST item line's ending (LF here)
-        self.assertIn("      - n1\n      - n2\n", out)
+        # item 0 displaces the LF line, item 1 the CRLF line
+        self.assertIn("      - n1\n      - n2\r\n", out)
         self.assertTrue(out.startswith("rules:\r\n"))
+
+    def test_longer_list_past_the_old_items_takes_the_block_ending(self):
+        # Sampling one ending for the whole insert cannot answer this: the
+        # new list outruns the old one, and the extra items must not arrive
+        # bare-LF in a CRLF block.
+        mixed = ("rules:\r\n"
+                 "  - paths: [\"x/**\"]\r\n"
+                 "    reviewers:\r\n"
+                 "      - old-d\n"
+                 "      - old-e\r\n"
+                 "      - old-f\r\n")
+        config, locs = gen.parse_reviewer_config(mixed)
+        out = gen.rewrite_config(mixed, locs, {0: ["n1", "n2", "n3", "n4"]}, None)
+        # positional for the first three, then the block's dominant ending
+        self.assertIn("      - n1\n      - n2\r\n      - n3\r\n      - n4\r\n",
+                      out)
+
+    def test_block_at_an_unterminated_final_line_stays_crlf(self):
+        # The final element of a `split("\n")` is the tail AFTER the last
+        # newline: it has no ending to lend. Sampling it handed every
+        # inserted item a bare LF inside a CRLF document.
+        crlf_eof = ("rules:\r\n"
+                    "  - paths: [\"x/**\"]\r\n"
+                    "    reviewers:\r\n"
+                    "      - old-d")          # no trailing newline
+        config, locs = gen.parse_reviewer_config(crlf_eof)
+        out = gen.rewrite_config(crlf_eof, locs, {0: ["n1", "n2"]}, None)
+        self.assertEqual(out, "rules:\r\n"
+                              "  - paths: [\"x/**\"]\r\n"
+                              "    reviewers:\r\n"
+                              "      - n1\r\n"
+                              "      - n2")
+        self.assertFalse(out.endswith("\r"), "stray CR left at EOF")
+
+    def test_shorter_list_at_an_unterminated_final_line_leaves_no_stray_cr(self):
+        crlf_eof = ("rules:\r\n"
+                    "  - paths: [\"x/**\"]\r\n"
+                    "    reviewers:\r\n"
+                    "      - old-d\r\n"
+                    "      - old-e")          # no trailing newline
+        config, locs = gen.parse_reviewer_config(crlf_eof)
+        out = gen.rewrite_config(crlf_eof, locs, {0: ["n1"]}, None)
+        self.assertEqual(out, "rules:\r\n"
+                              "  - paths: [\"x/**\"]\r\n"
+                              "    reviewers:\r\n"
+                              "      - n1")
 
 
 class TestUnterminatedFlowSequence(unittest.TestCase):
@@ -694,7 +741,7 @@ class TestUnterminatedFlowSequence(unittest.TestCase):
     def test_closing_bracket_in_a_trailing_comment_does_not_terminate(self):
         # `_flow_is_unterminated` sees the comment-STRIPPED value, so a `]`
         # inside the comment must not make a torn list look closed.
-        cfg = "default_pool: [alice,  # see [docs]\\n  bob]\\n"
+        cfg = "default_pool: [alice,  # see [docs]\n  bob]\n"
         _, locs = gen.parse_reviewer_config(cfg)
         self.assertEqual(locs["default_pool"][0], "unterminated")
 
@@ -716,6 +763,213 @@ class TestUnterminatedFlowSequence(unittest.TestCase):
     def test_pr_body_says_nothing_when_there_is_nothing_to_say(self):
         body = gen.build_pr_body(_pr_body_report())
         self.assertNotIn("left unchanged because", body)
+
+
+# A rule whose `paths:` is the torn list; its `reviewers:` is a perfectly
+# editable single line, which is precisely why it is dangerous.
+UNTERMINATED_PATHS = """\
+default_pool: [alice, bob]
+rules:
+  - paths: ["x/**",
+      "y/**"]
+    reviewers: [carol, dave]
+"""
+
+# A `]` inside a quoted scalar on a list that really is torn open.
+QUOTED_BRACKET_TORN = """\
+rules:
+  - paths: ["x/**"]
+    reviewers: ["a]b", carol,
+      dave]
+"""
+
+
+class TestUnterminatedPathsHoldsBackItsRule(unittest.TestCase):
+    """The reviewers half of the guard only covers a list with no line to
+    edit. A torn `paths:` is the other half: the reviewers line IS editable,
+    but the rule's globs were truncated at the break, so rewriting it would
+    write a list scored against the wrong bucket — silently wrong output
+    rather than the skipped output the guard exists to produce."""
+
+    def test_paths_is_tagged_and_named(self):
+        _, locs = gen.parse_reviewer_config(UNTERMINATED_PATHS)
+        self.assertEqual(locs["rule_paths"][0][0], "unterminated")
+        self.assertEqual(locs["rule_paths"][0][1], 2)
+        # the reviewers list itself is a normal, single-line flow
+        self.assertEqual(locs["rules"][0][0], "flow")
+        self.assertEqual(gen.unterminated_locations(locs),
+                         [("rules[0].paths", 2)])
+
+    def test_the_rule_is_not_rewritable_and_is_left_alone(self):
+        _, locs = gen.parse_reviewer_config(UNTERMINATED_PATHS)
+        self.assertFalse(gen.rule_is_rewritable(locs, 0))
+        out = gen.rewrite_config(UNTERMINATED_PATHS, locs, {0: ["z1"]}, None)
+        self.assertEqual(out, UNTERMINATED_PATHS)
+
+    def test_a_whole_rule_is_still_rewritable(self):
+        _, locs = gen.parse_reviewer_config(CONFIG)
+        self.assertTrue(gen.rule_is_rewritable(locs, 0))
+        self.assertIsNone(locs["rule_paths"][0])
+
+    def test_pr_body_explains_the_paths_entry(self):
+        report = _pr_body_report()
+        report["skipped_unterminated"] = [{"key": "rules[0].paths", "line": 3}]
+        body = gen.build_pr_body(report)
+        self.assertIn("scored against the wrong bucket", body)
+
+
+class TestQuotedBracketDoesNotCloseTheSequence(unittest.TestCase):
+    """`"]" not in s` is not quote-aware: a `]` inside a quoted scalar made a
+    torn list look closed, and the span rewrite then cut it at that quoted
+    bracket — leaving the continuation line behind as orphaned YAML, the
+    exact corruption the guard exists to prevent."""
+
+    def test_flow_is_unterminated_skips_quoted_brackets(self):
+        self.assertTrue(gen._flow_is_unterminated('["a]b", carol,'))
+        self.assertTrue(gen._flow_is_unterminated("['a]b', carol,"))
+        self.assertFalse(gen._flow_is_unterminated('["a]b", carol]'))
+
+    def test_find_unquoted_tracks_state_from_the_start(self):
+        self.assertEqual(gen._find_unquoted('["a]b"]', "]"), 6)
+        # `start` narrows the answer without losing the quote state before it
+        self.assertEqual(gen._find_unquoted('reviewers: ["a]b"]', "[", 9), 11)
+
+    def test_the_torn_list_is_left_exactly_as_committed(self):
+        _, locs = gen.parse_reviewer_config(QUOTED_BRACKET_TORN)
+        self.assertEqual(locs["rules"][0][0], "unterminated")
+        out = gen.rewrite_config(QUOTED_BRACKET_TORN, locs, {0: ["z1"]}, None)
+        self.assertEqual(out, QUOTED_BRACKET_TORN)
+        self.assertEqual(len(ORPHAN_RX.findall(out)),
+                         len(ORPHAN_RX.findall(QUOTED_BRACKET_TORN)))
+
+    def test_a_closed_list_carrying_a_quoted_bracket_is_rewritten_whole(self):
+        cfg = 'rules:\n  - paths: ["x/**"]\n    reviewers: ["a]b", carol]\n'
+        _, locs = gen.parse_reviewer_config(cfg)
+        out = gen.rewrite_config(cfg, locs, {0: ["z1", "z2"]}, None)
+        self.assertIn("reviewers: [z1, z2]\n", out)
+        self.assertNotIn("carol", out)
+        self.assertNotIn("a]b", out)
+
+
+class TestSkippedListsDoNotReachTheReport(unittest.TestCase):
+    """`rewrite_config` refusing a list is only half the job: the report, the
+    PR body and the default pool's anti-pile-on count all have to describe
+    the bytes that were actually written, or the drift PR advertises a change
+    `reviewers.new.yml` does not contain."""
+
+    KNOBS = {"top_k": 4, "floor": 2, "min_touches": 1, "min_score": 0.0,
+             "floor_min_touches": 1}
+
+    def _reports(self, text, score, touches):
+        config, locs = gen.parse_reviewer_config(text)
+        return config, locs, gen.build_rule_reports(
+            config, locs, score, touches, self.KNOBS)
+
+    def test_unterminated_rule_is_reported_unchanged_with_committed_before(self):
+        score = [{"zed": 9.0, "yan": 8.0}]
+        touches = [{"zed": 9, "yan": 8}]
+        _, _, (reports, replacements, final) = self._reports(
+            UNTERMINATED_RULE, score, touches)
+        self.assertEqual(replacements, {}, "a skipped list must not be written")
+        self.assertFalse(reports[0]["changed"])
+        self.assertTrue(reports[0]["skipped"])
+        # the parity parse truncates to ["carol"]; the report must show the
+        # list the file actually holds
+        self.assertEqual(reports[0]["before"], ["carol", "dave"])
+        self.assertEqual(reports[0]["after"], ["carol", "dave"])
+        # ... and the pool's anti-pile-on count must see dave as anchored
+        self.assertEqual(final, [["carol", "dave"]])
+
+    def test_unterminated_paths_is_reported_unchanged_too(self):
+        score = [{"zed": 9.0, "yan": 8.0}]
+        touches = [{"zed": 9, "yan": 8}]
+        _, _, (reports, replacements, final) = self._reports(
+            UNTERMINATED_PATHS, score, touches)
+        self.assertEqual(replacements, {})
+        self.assertTrue(reports[0]["skipped"])
+        self.assertEqual(reports[0]["after"], ["carol", "dave"])
+        self.assertEqual(final, [["carol", "dave"]])
+
+    def test_a_rewritable_rule_still_reports_its_change(self):
+        score = [{"zed": 9.0, "yan": 8.0}]
+        touches = [{"zed": 9, "yan": 8}]
+        _, _, (reports, replacements, final) = self._reports(
+            UNTERMINATED_POOL, score, touches)      # rule 0 here is fine
+        self.assertEqual(replacements, {0: ["zed", "yan"]})
+        self.assertTrue(reports[0]["changed"])
+        self.assertFalse(reports[0]["skipped"])
+        self.assertEqual(final, [["zed", "yan"]])
+
+    def test_committed_reviewers_reads_the_full_multi_line_list(self):
+        _, locs = gen.parse_reviewer_config(UNTERMINATED_POOL)
+        self.assertEqual(
+            gen.committed_reviewers(locs["default_pool"], ["alice"]),
+            ["alice", "bob"])
+        _, locs = gen.parse_reviewer_config(CONFIG)
+        self.assertEqual(
+            gen.committed_reviewers(locs["default_pool"], ["alice"]), ["alice"])
+
+    def test_a_never_closed_sequence_does_not_swallow_the_next_rule(self):
+        # No `]` anywhere: the continuation scan must give up at the next
+        # node rather than reading the following rule into `before`.
+        cfg = ("rules:\n"
+               "  - paths: [\"x/**\"]\n"
+               "    reviewers: [carol,\n"
+               "  - paths: [\"y/**\"]\n"
+               "    reviewers: [dave]\n")
+        _, locs = gen.parse_reviewer_config(cfg)
+        self.assertEqual(locs["rules"][0][0], "unterminated")
+        self.assertIsNone(locs["rules"][0][2])
+        self.assertEqual(gen.committed_reviewers(locs["rules"][0], ["carol"]),
+                         ["carol"])
+        self.assertEqual(gen.rewrite_config(cfg, locs, {0: ["z"]}, None), cfg)
+
+    def test_a_never_closed_sequence_reports_the_parity_parse(self):
+        # nothing closes it, so there is no fuller truth to report
+        cfg = "default_pool: [alice,\n  bob\nrules: []\n"
+        _, locs = gen.parse_reviewer_config(cfg)
+        self.assertEqual(locs["default_pool"][0], "unterminated")
+        self.assertIsNone(locs["default_pool"][2])
+        self.assertEqual(
+            gen.committed_reviewers(locs["default_pool"], ["alice"]), ["alice"])
+
+    def test_pr_body_renders_the_skipped_row_instead_of_a_proposal(self):
+        report = _pr_body_report()
+        report["rules"][0]["skipped"] = True
+        body = gen.build_pr_body(report)
+        self.assertIn("no single-line list here for the rewrite", body)
+
+
+class TestCrOnlyConfigIsANoOp(unittest.TestCase):
+    """Dropping `text=True` is what keeps a CRLF config byte-faithful, but it
+    also drops universal-newline handling of a lone `\r`. Parser and rewrite
+    both split on `"\n"` alone, so a CR-only file arrives as ONE line: no key
+    past the first is seen at indent 0, leaving zero rule buckets and a
+    `default_pool` the run would still happily propose a replacement for."""
+
+    CR_ONLY = "default_pool: [alice, bob]\rrules:\r  - paths: [\"x/**\"]\r"
+
+    def test_the_parse_really_does_collapse(self):
+        config, _ = gen.parse_reviewer_config(self.CR_ONLY)
+        self.assertEqual(config["rules"], [])
+        self.assertEqual(config["default_pool"], ["alice", "bob"])
+
+    def test_main_declines_instead_of_scoring_it(self):
+        env = {"GITHUB_REPOSITORY": "o/r", "GH_TOKEN": "t",
+               "DEFAULT_BRANCH": "main"}
+        with tempfile.TemporaryDirectory() as td:
+            env["RESULTS_DIR"] = td
+            env["GITHUB_OUTPUT"] = os.path.join(td, "out")
+            with mock.patch.dict(os.environ, env, clear=False), \
+                 mock.patch.object(gen, "read_committed_config",
+                                   return_value=self.CR_ONLY), \
+                 mock.patch.object(gen, "subprocess") as sp:
+                self.assertEqual(gen.main(), 0)
+            # refused before any git log / API call was attempted
+            sp.run.assert_not_called()
+            with open(env["GITHUB_OUTPUT"], encoding="utf-8") as f:
+                self.assertIn("changed=false", f.read())
+            self.assertFalse(os.path.exists(os.path.join(td, "report.json")))
 
 
 class TestRewriteRoundTrip(unittest.TestCase):

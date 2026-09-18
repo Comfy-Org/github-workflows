@@ -27,7 +27,14 @@ is on a later line) is parsed but never rewritten — the rewrite only edits
 single-line lists, so touching the opening line would orphan the continuation
 lines — so such a list is left exactly as committed, with a `::warning::`
 naming its line and a note in the drift PR's body; put it on one line to let
-the refresher manage it.
+the refresher manage it. A torn `paths:` list holds its whole rule back the
+same way, because the rule's globs stop at the line break and every reviewer
+score behind that rule would be computed from the wrong bucket. Skipped lists
+are reported as unchanged rather than as proposals, so the PR body never
+advertises an edit the file did not receive. A config with **CR-only** line
+breaks is declined outright (a clean no-op with a warning): the reader that
+keeps CRLF files byte-faithful does not split on a lone `\r`, so such a file
+cannot be parsed correctly at all.
 
 Runs are idempotent: each re-run force-resets the same `pr_branch` from the
 default branch and edits the one open drift PR in place, so duplicate PRs never
