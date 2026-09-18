@@ -217,6 +217,36 @@ _BODY_ONLY_TRUNCATED_RE = re.compile(
     + re.escape(BODY_ONLY_TRUNCATED_OPENER) + _NOT_LINE_SEP_CLASS + r"*?-->"
 )
 
+# The round sentinel (BE-15598): what the round that posted this review DIFFED AGAINST.
+# Emitted by post-review.py directly under the review header, on every success body and
+# on none of the error ones.
+#
+# Pinned to the SINGLE-SPACED opener, the exact byte-for-byte string post-review.py's
+# f-string emits, for the same reason the body-only sentinel is: the writer's defang
+# replaces one exact literal, and a reader more tolerant than that defang is a reader
+# the defang does not fully cover. `v1` is part of the literal, so a future `v2` payload
+# does not match at all — which is the intended "reject what you do not understand".
+#
+# Anchored to a LINE START, which is what stops a finding from forging one. Every line
+# of a rendered finding sits behind a `> ` blockquote marker (and post-review.py
+# neutralizes a bare `<!--` in model prose besides), so a round sentinel quoted out of
+# the PR under review can never be at column 0 and can never be this match. The
+# WRITER-side defang covers the error review's fenced text, where imported lines do sit
+# at column 0; `build_ledger` additionally requires the payload's `head` to equal the
+# review's own `commit_id`, which no text a PR can plant knows how to satisfy for a
+# review it did not write.
+ROUND_SENTINEL_OPENER = "<!-- cursor-review:round v1 "
+_ROUND_SENTINEL_RE = re.compile(
+    r"(?:\A|(?<=" + _LINE_SEP_CLASS + r"))"
+    + re.escape(ROUND_SENTINEL_OPENER) + r"(" + _NOT_LINE_SEP_CLASS + r"*?)-->"
+)
+
+# The shape every SHA in that payload must have before anything here believes it. Kept
+# strict (lowercase full hex) so it agrees exactly with post-review.py's writer-side
+# validation: a value this rejects reaches the workflow as "", which fails closed to
+# "no incremental block" rather than to a `git diff` against an attacker-chosen ref.
+_FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
 # post_error_review's shape, as its own f-string renders it. See _body_only_entries:
 # this is the one consolidated body whose imported text sits at column 0, and the
 # writer-side defang that protects it only exists in bodies written by THIS version.
@@ -459,6 +489,38 @@ def _parse_body_only_sentinel(body: str):
         # the exact silent round this function exists to prevent.
         return None
     return items
+
+
+def _parse_round_sentinel(body: str):
+    """Recover the round sentinel post-review.py wrote into a review body (BE-15598).
+
+    Returns the payload dict, or ``None`` when there is nothing to trust — no sentinel,
+    a version this reader does not know (the opener pins `v1`, so `v2` simply does not
+    match), a payload the tail clamp cut mid-JSON, or a shape that is not an object with
+    string `head` and `merge_base`. Never raises: the caller's fallback is "" for both
+    recorded SHAs, which fails closed to "no incremental block next round".
+
+    `base` is deliberately NOT required. Nothing builds a diff from it — it is recorded
+    for a human reading the raw body, and for whoever has to reconstruct what a round
+    was looking at — so a payload missing it is still perfectly usable for the one thing
+    this record exists to do.
+    """
+    match = _ROUND_SENTINEL_RE.search(body or "")
+    if not match:
+        return None
+    try:
+        payload = json.loads(match.group(1).strip())
+    except (ValueError, TypeError, RecursionError):
+        # RecursionError for the same reason _parse_body_only_sentinel catches it: it is
+        # a RuntimeError, not a ValueError, so a few KB of `[[[[…` would otherwise escape
+        # into cmd_build's blanket except and cost the ENTIRE ledger where this promises
+        # one unreadable sentinel degrades to "no recorded merge base".
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if not all(isinstance(payload.get(key), str) for key in ("head", "merge_base")):
+        return None
+    return payload
 
 
 def _body_only_line(value):
@@ -832,6 +894,8 @@ def build_ledger(
             "rounds": 0,
             "total_rounds": 0,
             "last_reviewed_sha": "",
+            "last_reviewed_merge_base": "",
+            "last_reviewed_base_sha": "",
             "entries": [],
             "entry_count": 0,
             "unanswered_count": 0,
@@ -847,6 +911,38 @@ def build_ledger(
         }
     total_rounds = len(consolidated)
     last_reviewed_sha = consolidated[-1].get("commit_id") or ""
+
+    # What the LAST round diffed against (BE-15598). Read from that round's own review
+    # body rather than recomputed, because the answer is not derivable after the fact:
+    # a retarget or a base-branch rewrite moves merge-base(base, last_reviewed), and the
+    # next round's incremental block would then treat hunks the panel never saw as
+    # already reviewed and drop them — a silent loss the subset fail-safe cannot catch,
+    # since a smaller block is still a subset.
+    #
+    # Three gates, all of which must hold, and all of which fail to "" rather than to a
+    # guess. Only the LAST round is read (it is the only one the next block diffs
+    # against). `head` must equal that review's own `commit_id`, so a sentinel copied
+    # from another round or another PR is refused, and so is one left behind by a body
+    # whose review was re-posted against a different commit. And `merge_base` must be a
+    # full lowercase hex SHA before it is allowed anywhere near a `git diff` argument.
+    last_reviewed_merge_base = ""
+    last_reviewed_base_sha = ""
+    round_sentinel = _parse_round_sentinel(consolidated[-1].get("body") or "")
+    if (
+        round_sentinel is not None
+        and last_reviewed_sha
+        and round_sentinel.get("head") == last_reviewed_sha
+        and _FULL_SHA_RE.match(round_sentinel.get("merge_base") or "")
+    ):
+        last_reviewed_merge_base = round_sentinel["merge_base"]
+        # `base` is diagnostic, but it is held to the SAME shape as the merge base, and
+        # not because anything diffs against it: `_write_outputs` appends it to
+        # $GITHUB_OUTPUT, where a value carrying a newline is an output-injection
+        # vector. The writer only ever emits hex-or-empty, so this costs nothing real
+        # and keeps a single control on the whole payload.
+        recorded_base = round_sentinel.get("base", "")
+        if isinstance(recorded_base, str) and _FULL_SHA_RE.match(recorded_base):
+            last_reviewed_base_sha = recorded_base
 
     comments = [c for c in (comments or []) if isinstance(c, dict)]
     by_id = {c.get("id"): c for c in comments}
@@ -1048,6 +1144,8 @@ def build_ledger(
         "rounds": len(rounds_present),
         "total_rounds": total_rounds,
         "last_reviewed_sha": last_reviewed_sha,
+        "last_reviewed_merge_base": last_reviewed_merge_base,
+        "last_reviewed_base_sha": last_reviewed_base_sha,
         "entries": entries,
         "entry_count": len(entries),
         "unanswered_count": unanswered,
@@ -1077,6 +1175,8 @@ def unknown_ledger(call: str, reason: str) -> dict:
         "rounds": 0,
         "total_rounds": 0,
         "last_reviewed_sha": "",
+        "last_reviewed_merge_base": "",
+        "last_reviewed_base_sha": "",
         "entries": [],
         "entry_count": 0,
         "unanswered_count": 0,
@@ -1096,6 +1196,8 @@ def disabled_ledger() -> dict:
         "rounds": 0,
         "total_rounds": 0,
         "last_reviewed_sha": "",
+        "last_reviewed_merge_base": "",
+        "last_reviewed_base_sha": "",
         "entries": [],
         "entry_count": 0,
         "unanswered_count": 0,
@@ -1510,6 +1612,14 @@ def _write_outputs(ledger: dict) -> None:
         f.write(f"status={ledger.get('status', 'unknown')}\n")
         f.write(f"rounds={ledger.get('total_rounds', 0)}\n")
         f.write(f"last_reviewed_sha={ledger.get('last_reviewed_sha', '')}\n")
+        # Consumed by the `incremental` step in the diff-size job (BE-15598): the OLD
+        # side of the incremental block is `git diff <merge base> <last reviewed>`, and
+        # an EMPTY value here is what makes that step skip the block outright instead of
+        # falling back to the current base, which is the bug this record exists to fix.
+        f.write(f"last_reviewed_merge_base={ledger.get('last_reviewed_merge_base', '')}\n")
+        # Diagnostic only — nothing builds a diff from it. It is what makes a shrunken
+        # block explicable after the fact ("the base moved between these two rounds").
+        f.write(f"last_reviewed_base_sha={ledger.get('last_reviewed_base_sha', '')}\n")
         f.write(f"entry_count={ledger.get('entry_count', 0)}\n")
 
 
