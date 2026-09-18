@@ -396,7 +396,10 @@ Put a `*_test.go` in a *subdirectory* and they stop: the trigger fires on it,
 the staleness diff has already excluded it, and the run re-points having compared
 nothing that moved — the pure-churn bump BE-7084 removed, one directory down.
 `test_paths_contract.sh` measures the tree for exactly this and fails the build
-the day it becomes true, so it cannot happen quietly.
+the day it becomes true, so it cannot happen quietly. It applies to **file-glob
+exclusions only** — a `/**` *directory* exclusion (`!scripts/pr-risk/tests/**`)
+selects the whole subtree in both syntaxes at every depth, so it cannot diverge
+this way and is deliberately not measured, subdirectories and all.
 
 **An excluding fleet passes `WATCHED_PATHSPECS`; a per-file fleet passes
 `WATCHED_EXEC`.** `pr-size` and `cursor-review` need the first (BE-7084): each
