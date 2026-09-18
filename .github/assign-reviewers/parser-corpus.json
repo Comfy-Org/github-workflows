@@ -360,7 +360,7 @@
     },
     {
       "name": "a U+00A0-only line at column 0 ends a default_pool block on both ports",
-      "why": "narrowing the blank-line test to s-white means a line whose only content is non-s-white whitespace is no longer blank, and `_indent_of`/`indentOf` count SPACES only, so it reads as column 0 and terminates the block. Both ports moved together, so this is a behaviour change rather than a parity break — pinned because nothing else covers a whitespace-only line and the truncation is otherwise silent",
+      "why": "narrowing the blank-line test to s-white means a line whose only content is non-s-white whitespace is no longer blank, and `_indent_of`/`indentOf` count SPACES only, so it reads as column 0 and terminates the block. Both ports moved together, so this is a behaviour change rather than a parity break — pinned because nothing else covers a whitespace-only line. Both ports now also WARN on the terminating line, naming its number and rendering the character codepoint-escaped, so the truncation is no longer silent; the warning text is asserted per-suite (each port has its own channel), never here",
       "text": "default_pool:\n  - alice\n\u00a0\n  - bob\n",
       "expected": {
         "default_pool": ["alice"],
@@ -369,7 +369,7 @@
     },
     {
       "name": "a U+00A0-only line at column 0 drops every later rule on both ports",
-      "why": "same mechanism as the default_pool case, but inside the `rules:` loop the `break` discards every rule AFTER the stray line, not just the tail of one list. Pinned so the blast radius of one invisible character is executable on both ports rather than discovered in a consumer repo",
+      "why": "same mechanism as the default_pool case, but inside the `rules:` loop the `break` discards every rule AFTER the stray line, not just the tail of one list. Pinned so the blast radius of one invisible character is executable on both ports rather than discovered in a consumer repo. Both ports now also WARN on the terminating line — one warning for the line, not one per discarded rule — asserted per-suite rather than here",
       "text": "rules:\n  - paths: ['a/**']\n    reviewers: [alice]\n\u00a0\n  - paths: ['b/**']\n    reviewers: [bob]\n",
       "expected": {
         "default_pool": [],
@@ -380,10 +380,19 @@
     },
     {
       "name": "an INDENTED U+00A0-only line does not end the block",
-      "why": "the negative control for the two cases above: `_indent_of`/`indentOf` count the leading spaces, so a padded blank line that is INDENTED reads as column 2, never reaches the column-0 `break`, and is simply not a `- ` item. Bounds the truncation to a stray character at column 0 specifically",
+      "why": "the negative control for the two cases above: `_indent_of`/`indentOf` count the leading spaces, so a padded blank line that is INDENTED reads as column 2, never reaches the column-0 `break`, and is simply not a `- ` item. Bounds the truncation to a stray character at column 0 specifically — and, since the unrecognised-key warning fires only at column 0, it is equally the negative control for that: both ports stay SILENT here, which is what keeps the orphaned `- bob` tail below a real truncation from burying the one warning that matters",
       "text": "default_pool:\n  - alice\n  \u00a0\n  - bob\n",
       "expected": {
         "default_pool": ["alice", "bob"],
+        "rules": []
+      }
+    },
+    {
+      "name": "an unknown top-level key at column 0 ends the block",
+      "why": "the key-SHAPED variant of the U+00A0 cases above, and the reason the warning is phrased around top-level keys rather than invisible characters: a plain misspelling or an unsupported key truncates the block exactly the same way, because only `default_pool:` and `rules:` are matched and everything else falls through to the same column-0 terminator. Pinned so a future port that starts skipping unknown keys instead of ending the block cannot land green",
+      "text": "default_pool:\n  - alice\nowners:\n  - bob\n",
+      "expected": {
+        "default_pool": ["alice"],
         "rules": []
       }
     }

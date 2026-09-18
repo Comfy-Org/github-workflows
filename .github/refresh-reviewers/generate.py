@@ -196,7 +196,23 @@ def _indent_of(line):
     return len(line) - len(line.lstrip(" "))
 
 
-def parse_reviewer_config(text):
+def _show_invisible(s):
+    r"""Render a token so a non-printing character in it is findable in a log.
+
+    The JS port's `showInvisible` (assign-reviewers.yml, inside the
+    `PARITY-HARNESS:config-parser` region) character for character: everything
+    outside printable ASCII becomes a lower-case `\uXXXX` escape. Both ports
+    render the same escape for the same token so a reader comparing a
+    `::warning::` annotation from the drift generator against a `core.warning`
+    from the runtime sees one string, not two spellings of it. The two diverge
+    only ABOVE the BMP, where JS escapes each UTF-16 surrogate and this escapes
+    the code point — irrelevant here, since an astral character is visible and
+    the ones this exists for (U+00A0, U+FEFF, U+0085, U+2028) are all BMP.
+    """
+    return "".join(c if " " <= c <= "~" else "\\u%04x" % ord(c) for c in s)
+
+
+def parse_reviewer_config(text, source_path=None):
     """Return (config, locations).
 
     config    = {"default_pool": [...], "rules": [{"paths": [...],
@@ -222,6 +238,12 @@ def parse_reviewer_config(text):
     # data; that would have traded the old divergence for a new one. Splitting on
     # the two-character break produces the same number of lines as `split("\n")`
     # on a CRLF document, so every line index is left alone.
+    # `source_path` only ever NAMES the file in a diagnostic, and is optional for
+    # the same reason the JS port's is: the unit tests (and the shared corpus) hand
+    # the parser text with no path, and a missing one must drop the prefix rather
+    # than print a literal `None:` or hardcode a `reviewers.yml` the caller may
+    # have configured away via `reviewer_config_path`.
+    where = f"{source_path}: " if source_path else ""
     raw_lines = re.split(r"\r?\n", text.removeprefix("\ufeff"))
     lines = [_strip_comment(l) for l in raw_lines]
     config = {"default_pool": [], "rules": []}
@@ -244,7 +266,7 @@ def parse_reviewer_config(text):
             # further work here; each arm also REPOINTS `locs["default_pool"]`,
             # so the rewrite can never target an occurrence the parse discarded.
             if seen_default_pool:
-                print("::warning::duplicate top-level default_pool: key — last one wins")
+                print(f"::warning::{where}duplicate top-level default_pool: key — last one wins")
             seen_default_pool = True
             rest = _trim(line[len("default_pool:"):])
             flow = _parse_flow(rest)
@@ -352,6 +374,29 @@ def parse_reviewer_config(text):
                     set_key(t, i)
                 i += 1
             continue
+        # Fallthrough: a non-empty line that is neither `default_pool:` nor `rules:`.
+        # At column 0 it is a BLOCK TERMINATOR — the `default_pool:`/`rules:` loops
+        # above `break` on `_indent_of(r) == 0`, so everything below it is dropped —
+        # and the reason this warns is that the line need not look like a key at all:
+        # since both ports narrowed to trimming s-white, a line whose only content is
+        # ONE non-s-white whitespace character (U+00A0, U+0085, U+000B, U+000C,
+        # U+001C-U+001F, U+FEFF, U+2028, U+2029, U+200B) is no longer blank, and
+        # `_indent_of` counts SPACES, so it reads as column 0 and truncates the block
+        # invisibly. Real YAML rejects most such documents outright (PyYAML raises on
+        # NBSP and FF), so widening the blank test would have diverged from YAML;
+        # making the truncation visible does not change what parses. Warn, never
+        # reject — the drift generator must not hard-fail on a malformed map, the
+        # same posture as the duplicate-key warning above.
+        #
+        # INDENTED fallthrough lines stay silent deliberately: they are the orphaned
+        # tail of an already-reported truncation (`  - bob` after the stray line),
+        # and one warning per column-0 terminator is the signal — one per orphaned
+        # item would bury it.
+        if _indent_of(raw) == 0:
+            print(f"::warning::{where}line {i + 1} is not a recognised top-level key "
+                  f"({_show_invisible(line)}) — it ends the block above it, and only "
+                  "`default_pool:` and `rules:` are read; if this is invisible padding "
+                  "at column 0 (e.g. U+00A0), every list item or rule after it is dropped")
         i += 1
     # locs["rules"] holds dicts internally; expose just the reviewers loc.
     locs["rules"] = [r["reviewers"] for r in locs["rules"]]
@@ -835,7 +880,7 @@ def main():
     if show.returncode != 0:
         return _noop_exit(f"could not read {config_path} on origin/{branch}")
     committed_text = show.stdout.decode("utf-8", errors="replace")
-    config, locs = parse_reviewer_config(committed_text)
+    config, locs = parse_reviewer_config(committed_text, config_path)
     if not config["rules"] and not config["default_pool"]:
         return _noop_exit(f"{config_path} has no rules or default_pool")
     rule_globs = [[glob_to_regexp(g) for g in r.get("paths", [])]

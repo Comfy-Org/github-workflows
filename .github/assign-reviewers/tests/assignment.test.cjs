@@ -384,9 +384,32 @@ test('the shared corpus is loaded and non-empty', () => {
   assert(corpus.globs.length > 0, 'parser-corpus.json has no glob cases');
   assert(corpus.globs.every(entry => entry.cases.length > 0), 'a corpus glob entry has no path cases');
 });
+// Every corpus case that emits a warning, with its count — the same table test_generate.py
+// carries for the Python channel, so a diagnostic that fires on one port and not the other is
+// caught by the suites even though the warning TEXT cannot live in the shared fixture.
+// The point of an EXHAUSTIVE table rather than per-case assertions is the silence: a regression
+// that made the unrecognised-key warning fire on ordinary blank lines, comment lines or indented
+// list items would warn on nearly every case here and nothing else would notice. Three entries
+// were not obvious before the sweep and are all correct: a stray `version:`/`notes:` key
+// truncates exactly like invisible padding does, and the second-BOM and leading-NEL cases are
+// documents whose FIRST line is an unrecognised key precisely because the stray character is not
+// indentation — which is the failure those two cases exist to pin, now with an annotation on it.
+const CORPUS_WARNINGS = {
+  'indented decoys and unknown top-level keys are ignored': 2,
+  'duplicate default_pool, flow then block': 1,
+  'duplicate default_pool, block then flow': 1,
+  'duplicate default_pool, second one empty': 1,
+  'two leading BOMs: only one is stripped': 1,
+  'U+0085 before a top-level key is not indentation': 1,
+  'a U+00A0-only line at column 0 ends a default_pool block on both ports': 1,
+  'a U+00A0-only line at column 0 drops every later rule on both ports': 1,
+  'an unknown top-level key at column 0 ends the block': 1,
+};
 for (const {name, text, expected} of corpus.configs) {
   test(`corpus config — ${name}`, () => {
+    helperWarnings.length = 0;
     assert.deepEqual(helpers.parseReviewerConfig(text), expected);
+    assert.equal(helperWarnings.length, CORPUS_WARNINGS[name] ?? 0, `warnings for ${JSON.stringify(name)}: ${JSON.stringify(helperWarnings)}`);
   });
 }
 // The corpus compares parsed CONFIGS, which is deliberately silent about the duplicate-key warning
@@ -422,6 +445,77 @@ test('an empty first default_pool: still warns on the duplicate', () => {
   assert.deepEqual(helpers.parseReviewerConfig('default_pool: []\ndefault_pool: [bob]\n').default_pool, ['bob']);
   assert.equal(helperWarnings.length, 1);
 });
+// A column-0 line that is neither key ENDS the block above it, and since both ports narrowed to
+// trimming s-white it need not look like a key: one U+00A0 is enough. The truncation is otherwise
+// completely silent, so the parser names the line and renders the character codepoint-escaped.
+// Parsed results stay corpus-pinned (three `U+00A0-only line` cases); the warning text cannot be,
+// because each port emits on its own channel, so each suite asserts its own — as with duplicates.
+test('a U+00A0-only line ending a default_pool block warns once, naming the line and the character', () => {
+  helperWarnings.length = 0;
+  assert.deepEqual(helpers.parseReviewerConfig('default_pool:\n  - alice\n\u00a0\n  - bob\n').default_pool, ['alice']);
+  assert.equal(helperWarnings.length, 1);
+  assert.match(helperWarnings[0], /^line 3 is not a recognised top-level key \(\\u00a0\)/);
+  // The literal `U+00A0` in the message's own prose is what makes the character searchable for a
+  // reader who does not think in `\u` escapes; both are asserted so neither can quietly drop.
+  assert.match(helperWarnings[0], /U\+00A0/);
+});
+
+test('a U+00A0-only line dropping every later rule warns once, naming its line', () => {
+  helperWarnings.length = 0;
+  const out = helpers.parseReviewerConfig("rules:\n  - paths: ['a/**']\n    reviewers: [alice]\n\u00a0\n  - paths: ['b/**']\n    reviewers: [bob]\n");
+  assert.equal(out.rules.length, 1);
+  assert.equal(helperWarnings.length, 1);
+  assert.match(helperWarnings[0], /^line 4 is not a recognised top-level key \(\\u00a0\)/);
+});
+
+test('an INDENTED U+00A0-only line is silent — it truncates nothing', () => {
+  // The negative control, and the one that keeps the warning useful: the orphaned `- bob` tail
+  // below a real truncation also falls through, and warning per orphan would bury the terminator.
+  helperWarnings.length = 0;
+  assert.deepEqual(helpers.parseReviewerConfig('default_pool:\n  - alice\n  \u00a0\n  - bob\n').default_pool, ['alice', 'bob']);
+  assert.deepEqual(helperWarnings, []);
+});
+
+test('an unknown top-level key at column 0 warns the same way, verbatim', () => {
+  // The key-shaped variant of the same truncation: nothing invisible, still silent before this.
+  helperWarnings.length = 0;
+  assert.deepEqual(helpers.parseReviewerConfig('default_pool:\n  - alice\nowners:\n  - bob\n').default_pool, ['alice']);
+  assert.equal(helperWarnings.length, 1);
+  assert.match(helperWarnings[0], /^line 3 is not a recognised top-level key \(owners:\)/);
+});
+
+test('the unrecognised-key warning carries the configured path when one is given', () => {
+  helperWarnings.length = 0;
+  helpers.parseReviewerConfig('default_pool:\n  - alice\nowners:\n', '.github/owners.yml');
+  assert.equal(helperWarnings.length, 1);
+  assert.match(helperWarnings[0], /^\.github\/owners\.yml: line 3 is not a recognised/);
+});
+
+// The two tests above run the EXTRACTED region, where `core` is the `helperCore` stub. These two
+// run the WHOLE shipped script instead, which is the only thing that proves `showInvisible` resolves
+// at BOTH of its call sites: it is a `const`, so it is in the temporal dead zone until its own line
+// executes, and the parser is CALLED further up the script than the invalid-login warning that used
+// to declare it. Declared at the wrong point, one of these two paths throws ReferenceError at run
+// time while every region-scoped test above stays green.
+test('the full shipped script emits the unrecognised-key warning, naming the configured path', async () => {
+  // The stray key lands INSIDE the `rules:` block, which is where the truncation actually bites:
+  // the rule below it is orphaned, so nothing matches `src/api/**` and routing falls back to the
+  // pool. (A stray key BETWEEN two top-level blocks truncates only its own orphaned tail — the
+  // outer loop keeps scanning and still finds a later `rules:`.)
+  const result = await run({config: 'default_pool: [generalist]\nrules:\nowners:\n  - paths: ["src/api/**"]\n    reviewers: [alice]\n'});
+  assert.equal(result.logs.filter(m => /is not a recognised top-level key/.test(m)).length, 1);
+  assert.match(result.logs.find(m => /is not a recognised top-level key/.test(m)), /^\.github\/reviewers\.yml: line 3 .*\(owners:\)/);
+  assert.deepEqual(result.selected, ['generalist']);
+});
+
+test('the full shipped script still warns about an invalid configured login', async () => {
+  // Same helper, its OTHER caller. Pinned here because nothing else executed this path.
+  const result = await run({config: 'rules:\n  - paths: ["src/api/**"]\n    reviewers: ["\u00a0alice"]\n'});
+  const warning = result.logs.find(m => /is not a valid GitHub login/.test(m));
+  assert(warning, `no invalid-login warning in ${JSON.stringify(result.logs)}`);
+  assert.match(warning, /configured reviewer "\\u00a0alice"/);
+});
+
 test('a single default_pool: is silent, however it is written', () => {
   helperWarnings.length = 0;
   for (const text of ['default_pool: [alice]\n', 'default_pool:\n  - alice\n', 'rules:\n  - reviewers: [a]\n', '  default_pool: [indented]\ndefault_pool: [alice]\n']) {

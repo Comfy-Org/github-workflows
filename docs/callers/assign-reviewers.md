@@ -212,10 +212,19 @@ since that is normal and would otherwise fire on nearly every run.
 
 One consequence of trimming spaces and tabs only: a line whose sole content is some
 *other* invisible character is no longer a blank line, and indentation counts spaces, so
-at column 0 it ends the block above it — inside `rules:` that silently discards every
-rule after it. Both ports behave identically here and the corpus pins it, but a stray
-non-breaking space at the start of a line is worth ruling out if owners stop being
-assigned. Indented, such a line is harmless.
+at column 0 it ends the block above it — inside `rules:` that discards every rule after
+it. Both ports behave identically here and the corpus pins it. The run no longer leaves
+you to guess, though: it **warns** once for the terminating line, naming the file and the
+line number and rendering the line's content codepoint-escaped so the character is
+findable —
+
+```
+::warning::reviewers.yml: line 3 is not a recognised top-level key (\u00a0) — it ends the block above it, and only `default_pool:` and `rules:` are read; if this is invisible padding at column 0 (e.g. U+00A0), every list item or rule after it is dropped
+```
+
+— and the same warning covers a misspelled or unsupported top-level key, which truncates
+the block identically. The orphaned items *below* the stray line do not each warn; one
+annotation per terminating line is the signal. Indented, such a line is harmless.
 
 ## Gotchas
 

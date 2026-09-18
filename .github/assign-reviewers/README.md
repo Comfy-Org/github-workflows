@@ -75,7 +75,11 @@ padding that now survives is invisible and the token would otherwise just never 
 assigned (keyed on the shape test only — being excluded as the PR author is normal and
 must not warn); a line whose only content is non-s-white whitespace is **no longer
 blank**, and since indentation counts spaces it reads as column 0 and terminates the
-block above it, which inside `rules:` drops every later rule; and the `setKey` regex
+block above it, which inside `rules:` drops every later rule — so any unrecognised
+column-0 line is now **reported by a warning** on both ports, naming its line number
+and rendering its content codepoint-escaped (`line 3 is not a recognised top-level key
+(\u00a0)`), since nothing about that truncation is visible in an editor and a
+misspelled key truncates identically; and the `setKey` regex
 spells its class out as `[^\n]*` rather than `.`, because Python's `.` excludes only LF
 while JS's also excludes CR, U+2028 and U+2029 — with `.` the Python port matched a rule
 line ending in a bare CR and the JS port did not, so the runtime dropped the key while

@@ -435,6 +435,16 @@ jobs:
             // js-yaml is not bundled with github-script; the schema is small and
             // fixed, so a focused parser is safer than an unavailable dependency.
             // PARITY-HARNESS:config-parser:begin
+            // Render a token so a non-printing character in it is findable in a log: everything
+            // outside printable ASCII becomes a lower-case `\uXXXX` escape. Two callers — the
+            // unrecognised-top-level-key warning below, and the invalid-configured-login warning
+            // further down the script — so it is declared ONCE, and it lives INSIDE this region
+            // because the parity harness executes the region on its own: a helper the parser calls
+            // but the extracted span does not contain is a ReferenceError in the tests, and a
+            // `const` declared BELOW the parser's own call site is one in the shipped script.
+            // `_show_invisible` in refresh-reviewers/generate.py is the port, so both sides render
+            // the same character the same way on their own warning channel.
+            const showInvisible = (s) => s.replace(/[^\x20-\x7e]/g, (c) => '\\u' + c.codePointAt(0).toString(16).padStart(4, '0'));
             // `sourcePath` is only ever used to NAME the file in a diagnostic, and is
             // optional because the parity harness extracts this region on its own and
             // has no path to hand it — an omitted one just drops the prefix rather than
@@ -566,6 +576,19 @@ jobs:
                   }
                   continue;
                 }
+                // Fallthrough: a non-empty line that is neither `default_pool:` nor `rules:`.
+                // At column 0 it is a BLOCK TERMINATOR — both loops above `break` on
+                // `indentOf(r) === 0`, so everything below it is dropped — and it need not look
+                // like a key at all: since both ports narrowed to trimming s-white, a line whose
+                // only content is ONE non-s-white whitespace character (U+00A0, U+0085, U+000B,
+                // U+000C, U+001C-U+001F, U+FEFF, U+2028, U+2029, U+200B) is no longer blank, and
+                // `indentOf` counts SPACES, so it reads as column 0 and truncates the block
+                // invisibly. Real YAML rejects most such documents outright, so widening the
+                // blank test would have diverged from YAML; warning changes what is VISIBLE, not
+                // what parses. Warn, never reject — same posture as the duplicate-key warning.
+                // INDENTED fallthrough lines stay silent deliberately: they are the orphaned tail
+                // of an already-reported truncation, and one warning per terminator is the signal.
+                if (indentOf(raw) === 0) core.warning(`${where}line ${i + 1} is not a recognised top-level key (${showInvisible(line)}) — it ends the block above it, and only \`default_pool:\` and \`rules:\` are read; if this is invisible padding at column 0 (e.g. U+00A0), every list item or rule after it is dropped`);
                 i++;
               }
               return out;
@@ -632,11 +655,12 @@ jobs:
             // set legitimately holds the PR author and `EXCLUDE`, and warning about a
             // correctly-configured owner who happens to have opened the PR would fire on
             // essentially every run and train people to ignore it. The token is rendered
-            // codepoint-escaped because the whole point is that it looks fine verbatim;
-            // note this is NOT the `escape` declared further down (that one is an HTML
-            // escaper for the job summary, and `const` — referencing it from here would
-            // hit the temporal dead zone and throw).
-            const showInvisible = (s) => s.replace(/[^\x20-\x7e]/g, (c) => '\\u' + c.codePointAt(0).toString(16).padStart(4, '0'));
+            // codepoint-escaped by `showInvisible`, because the whole point is that it looks fine
+            // verbatim. That helper is declared UP in the config-parser region, which warns about
+            // an unrecognised top-level key and needs it too: a `const` sits in the temporal dead
+            // zone until its own line runs, and the parser is CALLED above here, so declaring it at
+            // this point would throw the moment the parser reached for it — the same trap that puts
+            // the `escape` further down (an HTML escaper for the job summary) out of reach here.
             const warnedLogins = new Set();
             const configuredCandidate = (raw) => {
               const login = normalizeLogin(raw);
