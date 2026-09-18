@@ -228,9 +228,10 @@ step up in spend. Start label-gated.
 `<caller job id> / Panel integrity` (with the caller above, `review / Panel
 integrity`) is the context that answers **"was the panel that reviewed this PR a
 whole panel?"** — it is the one an automated merge gate should read for that
-question, and it runs on every review, with no input to turn on. Read the two
-bullets at the end of this section before you require it: it is red when the
-review ran and came up short *and* when the decision that selects a review
+question, and it runs on every review, with no input to turn on. Read the
+**"red, not skipped, when the decision itself failed"** and **"still skips when
+no review was warranted"** bullets below before you require it: it is red when
+the review ran and came up short *and* when the decision that selects a review
 failed, but it is **skipped — and therefore green — on the runs that
 deliberately review nothing**.
 
@@ -275,7 +276,7 @@ whole workflow** (which re-runs `Gate`, whose dup-check sees the review that
 already landed) or re-triggering by label. Use re-run-failed-jobs when you
 actually want a second, fuller review on the same commit.
 
-Three more shapes to expect before you require it:
+The remaining shapes to expect before you require it:
 
 * **A cancelled run reports red.** GitHub counts a *skipped* required check as
   passing, so this job runs on cancellation rather than handing a superseded run
