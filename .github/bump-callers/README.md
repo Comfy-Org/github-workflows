@@ -396,7 +396,12 @@ Put a `*_test.go` in a *subdirectory* and they stop: the trigger fires on it,
 the staleness diff has already excluded it, and the run re-points having compared
 nothing that moved — the pure-churn bump BE-7084 removed, one directory down.
 `test_paths_contract.sh` measures the tree for exactly this and fails the build
-the day it becomes true, so it cannot happen quietly.
+the day it becomes true, so it cannot happen quietly. What makes that the day is
+the trigger: `test-bump-callers.yml` runs on any change under `.github/**` or
+`scripts/**` (#302), so the measurement fails the PR that CREATES the divergence
+rather than some unrelated later one — and the contract test asserts that filter
+covers every fleet's positive `paths:` entry, so a fleet that ever watches a tree
+outside those two fails there instead of quietly losing its trigger.
 
 **An excluding fleet passes `WATCHED_PATHSPECS`; a per-file fleet passes
 `WATCHED_EXEC`.** `pr-size` and `cursor-review` need the first (BE-7084): each

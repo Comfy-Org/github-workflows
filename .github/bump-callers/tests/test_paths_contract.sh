@@ -42,6 +42,12 @@ FAIL=0
 # Every WATCHED_EXEC entry seen across every fleet, for the trigger-coverage
 # check after the loop.
 ALL_EXEC_ENTRIES=()
+# ...and every POSITIVE `paths:` entry (already `normalize_glob`ed), for the
+# second pass of that same check. The two are different questions: WATCHED_EXEC
+# names individual FILES whose disappearance freezes a fleet, while a positive
+# names the whole watched SURFACE — the tree a deep file can be added to, which
+# is what the glob-flatness measurement walks.
+ALL_POSITIVES=()
 ok()  { PASS=$((PASS+1)); echo "  ok: $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
 
@@ -247,6 +253,36 @@ compare_pathspecs() { # $1 = pathspecs, $2.. = positives then negatives
   return 1
 }
 
+# Which of $2… does a `paths:` filter select NONE of? Prints the uncovered
+# entries, one per line and in the order given; returns 0 when every entry is
+# covered, 1 otherwise.
+#
+# Extracted from the trigger-coverage block at the bottom for the same reason
+# compare_pathspecs is: the real filter covers the real entries BY CONSTRUCTION,
+# so nothing in this file would otherwise exercise a single rejection — a filter
+# narrowed back to the entrypoints would have to reach main before anything
+# noticed the check could still fail. One copy also keeps the two passes below
+# (WATCHED_EXEC files, and the fleets' `paths:` positives) matching by the same
+# rule rather than by two hand-copied loops free to drift apart.
+uncovered_against_filter() { # $1 = filter entries (newline-separated), $2… = paths
+  local patterns="$1"; shift
+  local e pat hit rc=0 pats=()
+  while IFS= read -r pat; do [[ -n "$pat" ]] && pats+=("$pat"); done <<<"$patterns"
+  for e in "$@"; do
+    hit=""
+    for pat in ${pats[@]+"${pats[@]}"}; do
+      # Unquoted RHS so the filter entry is used as a GLOB. An Actions filter's
+      # `*` does not cross `/` while bash's does, which makes this check
+      # slightly PERMISSIVE — acceptable in this direction, since every entry it
+      # passes on a `**` prefix (the only shape used here) is genuinely covered.
+      # shellcheck disable=SC2053
+      if [[ "$e" == $pat ]]; then hit=1; break; fi
+    done
+    [[ -n "$hit" ]] || { printf '%s\n' "$e"; rc=1; }
+  done
+  return $rc
+}
+
 # --- the contract ------------------------------------------------------------
 
 shopt -s nullglob
@@ -300,6 +336,15 @@ for path in "${FILES[@]}"; do
   for p in "${filter[@]}"; do
     if [[ "$p" == '!'* ]]; then negatives+=("$p"); else positives+=("$(normalize_glob "$p")"); fi
   done
+
+  # Accumulated HERE, before any of the per-fleet checks below can `continue` out
+  # of this iteration: a fleet whose preflight inputs are mid-edit is still a
+  # fleet whose watched surface this suite's own trigger has to cover, and
+  # dropping it would silently shrink the coverage check exactly when the file is
+  # being changed. Same empty-array guard as everywhere else in this file —
+  # `positives` cannot be empty today, but an all-negative filter would abort the
+  # whole run on bash 3.2 under `set -u` rather than fail one case.
+  ALL_POSITIVES+=(${positives[@]+"${positives[@]}"})
 
   if (( ${#negatives[@]} > 0 )) && [[ -z "$pathspecs" ]]; then
     bad "${file}: runs preflight.sh and its \`paths:\` filter carries a \`!\` exclusion, but it sets no WATCHED_PATHSPECS — WATCHED/WATCHED_ASSETS compare tree OIDs, which cannot express an exclusion, so every commit touching an excluded path would freeze this fleet as a permanent stale re-run. Mirror the filter into WATCHED_PATHSPECS"
@@ -851,6 +896,82 @@ exec_case 'blank lines are not entries' \
 exec_case 'an absent value yields no entries' '' ''
 
 
+# --- trigger-coverage self-test ----------------------------------------------
+# Same reasoning as the two self-tests above: the real filter covers the real
+# fleets by construction, so the block that follows only ever walks its CLEAN
+# path. These fixtures drive BOTH directions through uncovered_against_filter,
+# and through parse_push_paths — the same parser that reads the real files — so a
+# `paths:` shape the parser stops understanding fails here too rather than
+# quietly covering nothing.
+echo
+echo "== trigger-coverage self-test =="
+
+# $1 = case name, $2 = expected verdict (covered|uncovered), $3 = the workflow
+# whose `push:` `paths:` list is the FILTER, $4… = the fleet entrypoints whose
+# positive entries must be covered by it.
+cover_case() {
+  local name="$1" want="$2" filter_file="$3"; shift 3
+  local f p patterns out got=covered
+  local positives=()
+  patterns="$(parse_push_paths "$filter_file")"
+  for f in "$@"; do
+    while IFS= read -r p; do
+      [[ -n "$p" && "$p" != '!'* ]] && positives+=("$(normalize_glob "$p")")
+    done < <(parse_push_paths "$f")
+  done
+  # A fixture that parsed nothing asserts nothing — and would report `covered`,
+  # the passing verdict, which is the one failure mode a coverage check must
+  # never have.
+  if (( ${#positives[@]} == 0 )); then
+    bad "coverage: ${name} — parsed NO positives out of the fleet fixture(s), so this case asserts nothing"
+    return
+  fi
+  out="$(uncovered_against_filter "$patterns" "${positives[@]}")" || got=uncovered
+  if [[ "$got" == "$want" ]]; then
+    ok "coverage: ${name}"
+  else
+    # A narrowed filter leaves every entry uncovered at once, so name a sample
+    # rather than reprinting the whole roster into the failure — the same reason
+    # the live check below caps its own list.
+    local shown=()
+    while IFS= read -r p; do [[ -n "$p" ]] && shown+=("$p"); done <<<"$out"
+    bad "coverage: ${name} — got ${got}, want ${want}$( (( ${#shown[@]} > 0 )) && printf ' (%d uncovered, e.g. %s)' "${#shown[@]}" "$(printf '%s ' "${shown[@]:0:4}")" )"
+  fi
+}
+
+COVER_DIR="${FIXTURE_DIR}/cover"
+mkdir -p "$COVER_DIR"
+# The filter narrowed back to the entrypoint-only shape it carried before it was
+# widened to the two whole trees, against a fleet watching a tool tree under
+# `scripts/`. This is exactly the shape that lets the PR CREATING the
+# `!`/`:(exclude)` divergence merge without ever running the measurement, and it
+# is what the check below exists to refuse.
+cat > "${COVER_DIR}/test-bump-callers.yml" <<'YAML'
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/bump-callers/**'
+YAML
+cat > "${COVER_DIR}/bump-x-callers.yml" <<'YAML'
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/x/**'
+      - '!scripts/x/tests/**'
+YAML
+cover_case 'a filter narrowed to .github/bump-callers misses a scripts/ fleet' \
+  uncovered "${COVER_DIR}/test-bump-callers.yml" "${COVER_DIR}/bump-x-callers.yml"
+
+# ...and the REAL pair, driven through the same helper so the fixture above is
+# non-vacuous in both directions: it fails on an implementation that reports
+# everything uncovered just as surely as the fixture fails one that reports
+# everything covered.
+cover_case 'the real filter covers every real fleet entrypoint' \
+  covered "${WORKFLOWS}/test-bump-callers.yml" "${FILES[@]}"
+
+
 # --- this suite's OWN trigger must cover the tree it reads --------------------
 # The WATCHED_EXEC check above asserts a property of the REPO TREE, not just of
 # the entrypoints — so it is only worth anything if it runs on the PR that breaks
@@ -880,19 +1001,11 @@ else
   while IFS= read -r e; do
     [[ -n "$e" ]] && exec_uniq+=("$e")
   done < <(printf '%s\n' ${ALL_EXEC_ENTRIES[@]+"${ALL_EXEC_ENTRIES[@]}"} | LC_ALL=C sort -u)
+  self_patterns="$(printf '%s\n' "${self_filter[@]}")"
   uncovered=()
-  for e in ${exec_uniq[@]+"${exec_uniq[@]}"}; do
-    hit=""
-    for pat in "${self_filter[@]}"; do
-      # Unquoted RHS so the filter entry is used as a GLOB. An Actions filter's
-      # `*` does not cross `/` while bash's does, which makes this check
-      # slightly PERMISSIVE — acceptable in this direction, since every entry it
-      # passes on a `**` prefix (the only shape used here) is genuinely covered.
-      # shellcheck disable=SC2053
-      if [[ "$e" == $pat ]]; then hit=1; break; fi
-    done
-    [[ -n "$hit" ]] || uncovered+=("$e")
-  done
+  while IFS= read -r e; do
+    [[ -n "$e" ]] && uncovered+=("$e")
+  done < <(uncovered_against_filter "$self_patterns" ${exec_uniq[@]+"${exec_uniq[@]}"})
   if (( ${#uncovered[@]} > 0 )); then
     # A narrowed filter leaves whole trees uncovered at once, so report a sample
     # plus the count rather than fifty paths.
@@ -901,9 +1014,43 @@ else
     ok "test-bump-callers.yml triggers on all ${#exec_uniq[@]} distinct WATCHED_EXEC paths"
   fi
 
+  # --- and the same question again, over every fleet's watched SURFACE --------
+  # The pass above covers the files WATCHED_EXEC names. This one covers the
+  # `paths:` positives themselves, because the other tree-reading assertion in
+  # this suite — the glob-flatness measurement, which walks a `!` exclusion's
+  # directory for a match one level down — is an assertion about those surfaces
+  # and about nothing else. If a fleet ever watches a tree outside `.github/**`
+  # and `scripts/**`, the PR that adds the deep file INTO that tree starts no run
+  # of this suite, the measurement first speaks on some unrelated later PR, and
+  # the `!`/`:(exclude)` divergence lands green in between. The fix is always the
+  # same — widen the filter to the whole new tree, never enumerate the surfaces,
+  # since an enumeration is the roster this directory exists to not keep.
+  pos_uniq=()
+  while IFS= read -r e; do
+    [[ -n "$e" ]] && pos_uniq+=("$e")
+  done < <(printf '%s\n' ${ALL_POSITIVES[@]+"${ALL_POSITIVES[@]}"} | LC_ALL=C sort -u)
+  # Unlike WATCHED_EXEC, where zero entries across the fleet is a legitimate
+  # answer, zero positives means every entrypoint above failed to parse — so it
+  # is a vacuous pass, not a clean one, and says so.
+  if (( ${#pos_uniq[@]} == 0 )); then
+    bad "no fleet \`paths:\` positives were collected at all — every entrypoint failed to parse above, so this coverage check would pass vacuously"
+  else
+    uncovered=()
+    while IFS= read -r e; do
+      [[ -n "$e" ]] && uncovered+=("$e")
+    done < <(uncovered_against_filter "$self_patterns" ${pos_uniq[@]+"${pos_uniq[@]}"})
+    if (( ${#uncovered[@]} > 0 )); then
+      bad "test-bump-callers.yml's \`paths:\` filter selects none of ${#uncovered[@]} fleet \`paths:\` positives, e.g. $(printf '%s ' "${uncovered[@]:0:4}")— a PR that adds a deep file under one of those surfaces creates the \`!\`/\`:(exclude)\` divergence without ever running the glob-flatness measurement; add the tree to BOTH \`paths:\` lists in that workflow"
+    else
+      ok "test-bump-callers.yml triggers on all ${#pos_uniq[@]} distinct fleet \`paths:\` positives"
+    fi
+  fi
+
   # The file's own header says the two lists are duplicated on purpose and must
-  # stay identical — only the `pull_request` one is parsed above, so the `push`
-  # one could drift out from under this check unnoticed.
+  # stay identical — and both coverage passes above read the `push` one only
+  # (parse_push_paths is anchored to `^  push:` precisely so a `pull_request:`
+  # block can never answer for it), so the `pull_request` list could otherwise
+  # drift out from under them unnoticed.
   pr_block="$(awk '/^  pull_request:/{p=1;next} p&&/^  [a-z_]+:/{exit} p&&/^      - /{sub(/^[ \t]+/,"");print}' "${WORKFLOWS}/test-bump-callers.yml")"
   push_block="$(awk '/^  push:/{p=1;next} p&&/^  [a-z_]+:/{exit} p&&/^      - /{sub(/^[ \t]+/,"");print}' "${WORKFLOWS}/test-bump-callers.yml")"
   if [[ -n "$pr_block" && "$pr_block" == "$push_block" ]]; then
