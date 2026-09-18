@@ -113,6 +113,11 @@ rules:
       - .github/agents-md-integrity/**
       - .github/workflows/agents-md-integrity.yml
       - .github/workflows/test-agents-md-integrity.yml
+      # The `ci-` prefixed self-enrollment caller is tamper-sensitive (it is the
+      # gate on this repo's own AGENTS.md) and matches no glob above, so it needs
+      # naming outright — otherwise a PR touching only it, including the bump
+      # fleet's SHA-bump PRs once enrolled, falls through to default_pool.
+      - .github/workflows/ci-agents-md-integrity.yml
       - .github/public-repo-hygiene/**
       - .github/workflows/public-repo-hygiene.yml
       - .github/workflows/test-public-repo-hygiene.yml

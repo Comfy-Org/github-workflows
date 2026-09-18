@@ -13,9 +13,45 @@ repo's own workflow files.
   from the *mutable-default* half only — it still has to carry a guard (see
   below). Text-level parsing (this repo is stdlib-only — no
   PyYAML), the same constraint `bump-callers.sh` works under.
+  It also (3) cross-checks the docs: when a workflow declares
+  `workflows_ref` `required: true` with no default, its
+  `docs/callers/<name>.md` page must not document a default for it — a row like
+  `` | `workflows_ref` | main | … | `` (the name in a code span, as every guide
+  writes it) contradicts the declaration and would teach a
+  caller to load scripts from a mutable ref, so it fails naming the file, line,
+  and the workflow it contradicts. A page that exists but carries no
+  `workflows_ref` row is a hard error too (absence must not read as "not
+  applicable"); a page absent under the workflow's own name is skipped (some
+  reusables are documented on a differently-named page). Only the
+  required-no-default direction is asserted, so an optional/auto-derived input
+  like `groom.yml`'s `default: ''` is left alone.
+  Finally it (4) fails any `uses:` in `.github/workflows/` whose ref is not
+  immutable — a full 40-hex commit SHA for an action, a `sha256:` digest for a
+  `docker://` image — see [The `uses:` pin (BE-15255)](#the-uses-pin-be-15255)
+  below. Unlike (1)–(3) that half covers **every** workflow file, not just the
+  reusables: the `ci-*`, `bump-*` and `test-*` callers declare no
+  `workflows_ref` at all, and that is exactly where the floating refs were.
 - **`tests/`** — `unittest` suite, run by
-  [`test-workflow-pins.yml`](../workflows/test-workflow-pins.yml) along with a
-  CLI smoke test that a reintroduced default really exits non-zero.
+  [`test-workflow-pins.yml`](../workflows/test-workflow-pins.yml) along with CLI
+  smoke tests that a reintroduced default, an unguarded checkout and a
+  tag-pinned `uses:` really exit non-zero.
+- **`tests/test_inputs_docs_drift.py`** — a SEPARATE concern that lives here
+  because this is the directory whose CI already watches both
+  `.github/workflows/**` and `docs/callers/**`. It does not touch
+  `check_workflow_pins.py`: it is a table-driven declared-vs-documented input
+  drift check over all 16 reusables, one generated `TestCase` each. A
+  documented-but-undeclared input fails hard and always (BE-4691 — GitHub
+  rejects an unknown `workflow_call` input at startup with a zero-job
+  `startup_failure` and no logs, so a phantom row is a broken caller for whoever
+  copies it); the quieter reverse, a declared input no guide names, is pinned in
+  a self-draining `KNOWN_UNDOCUMENTED` allowlist modelled on `KNOWN_EXEMPT`
+  above — a stale entry FAILS, so documenting one is "add the row, delete the
+  name". The same phantom check runs one level in, over the `with:` keys of
+  every copy-pasteable caller the repo ships: each guide's fences, each
+  workflow's header comment, and the two shared catalogs (`README.md`,
+  `docs/callers/README.md`). Which `with:` belongs to which reusable is decided
+  by the `uses:` governing it, so a step's `actions/checkout` knobs are never
+  mistaken for a workflow input.
 
 ```bash
 python3 .github/workflow-pins/check_workflow_pins.py
@@ -167,7 +203,12 @@ input on neither physical line and on both together; `ref: "${{
 steps.r.outputs.ref` / `}}"` is the step-output checkout its one-line
 spelling is; and a leading operand that never reaches the input (`ref: ${{
 'main' ||` / `inputs.workflows_ref }}`) gets the same verdict split as it does
-on one line. Only the ref value's *own* quote opens a quoted window — one a
+on one line. A site is *recognized* from the lines seen so far — a mention
+anywhere in the fold is one — but *judging* its fallback strength also reads
+FORWARD, because the window records at the first mentioning line and the
+fallback may finish below it: `ref: >-` / `${{ inputs.workflows_ref ||` /
+`job.workflow_sha }}` mentions the input on the middle line and completes on
+the last. Only the ref value's *own* quote opens a quoted window — one a
 trailing comment leaves open (`ref: "main"  # see: "x`) is nobody's
 continuation. The `env:` alias scan follows the same split spellings, so a
 `WORKFLOWS_REF: "${{` / `inputs.workflows_ref }}"` binds the alias exactly as
@@ -392,7 +433,11 @@ Three things make that enforceable, and each was a hole on its own:
   carries the fallback. A comment merely *naming* the expression buys nothing
   either. Three matchers do this, mirroring the `_REF_USE_*` trio: block, flow
   (bounded at the entry boundary, exactly as `_REF_USE_FLOW_RE` bounds its own
-  value), and a continuation line that *is* the expression.
+  value), and a continuation line that *is* the expression — asked of the
+  **fold**, not of one physical line, so `ref: >-` / `${{ inputs.workflows_ref
+  ||` / `job.workflow_sha }}` is the self-pin its one-line spelling is. The
+  single-line reading is tried first and the fold only ever *adds* the
+  fallback, so no spelling that already scored one can lose it.
 - **The `default: ''` carve-out is scoped to actual ref checkouts**, and it asks
   the *parser* rather than re-reading each line. Asking "does any line
   self-pin?" of the whole file granted it to any file that merely mentions the
@@ -547,3 +592,72 @@ all (renamed or deleted), the latter being
 the case that would otherwise silently pre-exempt whatever later reuses the
 filename. The list is only applied to this repo's own `.github/workflows`: run
 against an ad-hoc `--workflows-dir` every entry would look stale.
+
+## The `uses:` pin (BE-15255)
+
+AGENTS.md has always said "**Pin everything by full commit SHA**, with a
+trailing `# v1` comment — both the `uses:` in callers and every third-party
+action here. Bare `@v1` fails the pin-validation (`pinact`, `zizmor`) that
+consumer CI runs." Nothing enforced it, so two `actions/*` refs in
+`test-refresh-reviewers.yml` sat on major tags for months — and **drifted
+twice** while they did (`@v6` → `@v7` → `@v7.0.0`), because Dependabot only
+ever narrows a tag to another tag and never converts one to a SHA. A tag moves
+at the discretion of whoever owns the action, which is the same "the pin proves
+nothing" hole the checks above close, with a third party holding the pen.
+
+So every `uses:` under `.github/workflows/` must name a full 40-hex commit SHA.
+One form names no ref of its own and is skipped rather than failed: a local
+path (`./.github/actions/x`), which resolves inside the caller's own
+already-pinned checkout. The skip is **reported** — a
+`not pinnable <file>:<line>: <value> — <reason>` line, plus its own term in the
+summary — so swapping a pinned ref for a local path cannot quietly shrink the
+coverage number with nothing else to say why.
+
+A container image is **not** skipped. `docker://…` is immutable by registry
+digest rather than by git ref, but `docker://alpine:3.20` is a mutable tag on
+exactly the terms `@v7` is, with a third party holding the pen — so it is held
+to the digest instead: `docker://image@sha256:<64-hex>`, checked whole, so a
+truncated digest (or a 40-hex commit SHA, which is not a digest at all) fails
+like any other floating ref. Exempting the whole `docker://` prefix would have
+carved out a category of the drift this check exists to ban.
+
+The version comment is convention, not lint — it is what makes a SHA readable,
+and the review that lands a bump is where it is kept honest.
+
+The walk reads both the block spelling (`- uses: owner/action@ref`) and the
+flow one (`steps: [{uses: owner/action@ref, …}]`, including YAML's implicit
+single-pair form `steps: [uses: …]`), and skips anything inside a `|`/`>`
+**block scalar**. That last part is the whole reason this is not a `grep`:
+`test-workflow-pins.yml` writes its own fixture workflows out of a `run: |`
+heredoc, and reading that literal text as workflow structure would make the
+lint fail on its own test harness. Those fixtures are nonetheless SHA-pinned
+themselves, so that each smoke test fails for the one reason it tests rather
+than passing on a pin error it never meant to raise.
+
+**What the walk cannot see.** It reads raw text, not a parsed document, so the
+flow scan strips a trailing comment, skips any match inside a quoted scalar,
+and skips a SINGLE-LINE `run:` outright — its value is shell, and the
+block-scalar mask only covers `run: |` bodies. Otherwise
+`# was {uses: a/b@v7}` and `run: echo '{"uses": "a/b@v1"}'` would each
+red-line a valid workflow, naming a step that does not exist. The quote scan
+takes the **strict** reading the other structural readers take, so a stray
+apostrophe in an unquoted scalar (`[{name: Don't, uses: a/b@v7}]`) cannot wedge
+a scalar open and drop a real floating ref out of coverage: a false alarm is
+loud, a silent miss is not. Two gaps remain, both out of reach of a stdlib-only walk. A key spelled through a
+double-quoted YAML **escape** — `"u\u0073es": owner/action@v1`, which parses
+as `uses` — is not matched (the plain quoted `'uses'` / `"uses"` spellings ARE).
+And a mapping key literally named `uses` at some other depth — an action input
+called `uses` — would be matched though it is not a step directive. Neither
+occurs here; a YAML parser is the fix if one ever does, and that is a
+dependency this repo deliberately does not carry.
+
+`KNOWN_UNPINNED` is the debt list for this check, with the same self-draining
+contract as `KNOWN_EXEMPT`: an entry is a known debt, not a blessing, and a
+**stale** entry is an error. Entries are ``(workflow filename, full `uses:`
+value)`` pairs — the file alone would pre-exempt every other action in it, and
+the ref alone would pre-exempt the same floating ref wherever a later workflow
+copied it. Pinning the ref is not the only way an entry goes stale: Dependabot
+moving `@v6` to `@v7` retires the entry too, which is precisely how this debt
+stayed invisible. It is **empty today** — both refs it was written for were
+pinned in the change that added the check — and, like `KNOWN_EXEMPT`, it is
+only applied to this repo's own `.github/workflows`.

@@ -11,8 +11,11 @@ Run: python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
 """
 
 import importlib.util
+import io
 import os
+import re
 import unittest
+from unittest import mock
 
 _MODULE_PATH = os.path.join(os.path.dirname(__file__), "..", "patch_policy.py")
 _spec = importlib.util.spec_from_file_location("groom_patch_policy", _MODULE_PATH)
@@ -191,6 +194,145 @@ class PanelHardeningTest(unittest.TestCase):
             self.assertTrue(denied(p), p)
 
 
+class DatasetOfRecordTest(unittest.TestCase):
+    """Owner-gated dataset-of-record paths (BE-9609): graded eval case files under
+    a `suites/**/cases/` tree, whose merge publishes immutable versions — denied so
+    a human authors the change, not the builder. Fixtures are deliberately generic
+    (`s1`, `s2`): this is a PUBLIC repo, so no caller's real suite names appear."""
+
+    def test_dataset_of_record_cases(self):
+        for p in (
+            "suites/s1/cases/foo.yaml",
+            "suites/s2/cases/x.yml",
+            "suites/s1/cases/deep/y.yaml",         # any depth under cases/
+            "sub/suites/s1/cases/b.yaml",          # segment-anchored, nested tree
+            "suites/cases/foo.yaml",               # flat layout — `**` spans ZERO
+            #                                        segments, so the advertised
+            #                                        suites/**/cases/ surface holds
+            "SUITES/S1/CASES/z.YAML",              # case-insensitive
+        ):
+            self.assertTrue(denied(p), p)
+        for p in (
+            "suites/s1/driver.yaml",               # suite config, not a case
+            "suites/s1/README.md",
+            "suites/s1/cases/README.md",           # not YAML
+            "cases/foo.yaml",                      # missing suites/ segment
+            "packages/x/suites/s1/cases.yaml",     # cases.yaml file, not cases/ dir
+        ):
+            self.assertFalse(denied(p), p)
+
+    def test_dataset_of_record_no_shape_bypass(self):
+        """The tail and the mid-segments must not be a bypass: erring WIDE is the
+        contract (invariant 1), so grouped/versioned layouts, an empty stem and a
+        newline-bearing name are all denied."""
+        for p in (
+            "suites/group/s1/cases/x.yaml",        # extra segment ABOVE cases/
+            "suites/s1/v2/deep/cases/x.yml",       # several segments above cases/
+            "suites/s1/cases/.yaml",               # empty stem — `.+` missed this
+            "suites/s1/cases/a\nb.yaml",           # match STRADDLES a raw newline:
+            #                                        the line-split alone misses it,
+            #                                        a `*.yaml` importer glob does not
+        ):
+            self.assertTrue(denied(p), p)
+
+    def test_dataset_of_record_cases_symlink_shape(self):
+        """git tracks no directories, so a change AT `suites/<x>/cases` is a file or
+        a symlink — the indirection that would point the importer's glob at an
+        undenied tree. Denied; a real `cases/`-as-directory never has this shape."""
+        for p in (
+            "suites/s1/cases",
+            "sub/suites/s1/group/cases",
+            "suites/cases",                        # flat layout — zero mid segments
+            "SUITES/S1/CASES",
+        ):
+            self.assertTrue(denied(p), p)
+        for p in (
+            "cases",                               # no suites/ segment
+            "suites/s1/testcases",                 # segment-anchored, not a suffix
+        ):
+            self.assertFalse(denied(p), p)
+
+
+class RawDiffModeTest(unittest.TestCase):
+    """`--raw -z` parsing plus the MODE-visible deny (BE-9612): a symlink-typed
+    change in a `suites` tree is the indirection path shape cannot express — a
+    link at `suites/<x>` has no `cases` segment and no YAML tail, yet a
+    `suites/**/cases/*.yaml` importer resolves straight through it."""
+
+    @staticmethod
+    def raw(*entries):
+        """Encode (old_mode, new_mode, path) byte triples as `--raw -z` output."""
+        return b"".join(
+            b":" + old + b" " + new + b" 0000000 1111111 M\x00" + path + b"\x00"
+            for old, new, path in entries
+        )
+
+    def test_parse_raw_z_extracts_modes_and_paths(self):
+        data = self.raw(
+            (b"100644", b"100644", b"src/foo.py"),
+            (b"000000", b"120000", b"suites/link"),
+        )
+        self.assertEqual(
+            policy.parse_raw_z(data),
+            [("100644", "100644", "src/foo.py"), ("000000", "120000", "suites/link")],
+        )
+
+    def test_parse_raw_z_empty_and_malformed(self):
+        self.assertEqual(policy.parse_raw_z(b""), [])
+        # A field where a meta record must sit but doesn't parse fails LOUD (the
+        # gate runs under `set -euo pipefail`, so a raise fails closed, not open):
+        # name-only-shaped input (the old producer) and an unpaired field both die.
+        with self.assertRaises(ValueError):
+            policy.parse_raw_z(b"package.json\x00")
+        with self.assertRaises(ValueError):
+            policy.parse_raw_z(b":100644 100644 0000000 1111111 M\x00")
+
+    def test_parse_raw_z_rejects_rename_records(self):
+        # Pins the module invariant-2 / `parse_raw_z` docstring claim that a
+        # two-path R/C record fails CLOSED. Reachable only if a future editor
+        # drops `--no-renames` from groom.yml's producer — the one edit that
+        # would hide a rename's SOURCE (the denied side) from the policy and
+        # rename this gate out of existence. Both arities must raise:
+        rename = (
+            b":100644 100644 0000000 1111111 R100\x00"
+            b"suites/s1/cases/c1.yaml\x00suites/s1/retired.yaml\x00"
+        )
+        # one record -> 3 fields, caught by the odd-parity check;
+        with self.assertRaises(ValueError):
+            policy.parse_raw_z(rename)
+        # two -> 6 fields, EVEN (parity check passes), caught only because the
+        # misaligned meta slot holds a path that `_RAW_META` refuses.
+        with self.assertRaises(ValueError):
+            policy.parse_raw_z(rename * 2)
+
+    def test_symlink_in_suites_tree_denied_by_mode(self):
+        for path in (
+            b"suites/newthing",        # a suite-dir-shaped link: no cases, no YAML
+            b"suites",                 # the glob's root component itself
+            b"sub/suites",             # nested tree's root component
+            b"suites/s1/cases/link",   # inside cases/ with no YAML tail
+            b"SUITES/lnk",             # case-insensitive runners (see _PATTERN)
+        ):
+            entries = policy.parse_raw_z(self.raw((b"000000", b"120000", path)))
+            self.assertEqual(policy.denied_entries(entries), [path.decode()], path)
+
+    def test_symlink_replaced_by_file_still_denied(self):
+        # old mode 120000 → new 100644: retiring the link changes resolution too;
+        # either side being a symlink denies (over-block is the safe direction).
+        entries = policy.parse_raw_z(self.raw((b"120000", b"100644", b"suites/s1")))
+        self.assertEqual(policy.denied_entries(entries), ["suites/s1"])
+
+    def test_regular_files_fall_through_to_path_policy(self):
+        entries = policy.parse_raw_z(
+            self.raw(
+                (b"100644", b"100644", b"suites/s1/harness.py"),  # suites, not a link
+                (b"100644", b"100644", b"package.json"),          # path-denied as ever
+                (b"000000", b"120000", b"docs/latest"),           # link OUTSIDE suites
+            )
+        )
+        self.assertEqual(policy.denied_entries(entries), ["package.json"])
+
+
 class ApiGuardTest(unittest.TestCase):
     """`denied_paths` must reject a bare str/bytes (a silent character-iteration footgun)."""
 
@@ -214,8 +356,11 @@ class MainStdoutTest(unittest.TestCase):
 
         # A denied path (package.json) whose DIRECTORY segment carries a raw non-UTF-8
         # byte (0xff) — the basename still anchors, so it is denied. git -z emits it
-        # verbatim; parse_nul_delimited holds the byte as a lone surrogate.
-        raw = b"p\xffkg/package.json\x00package.json\x00"
+        # verbatim; parse_raw_z holds the byte as a lone surrogate.
+        raw = (
+            b":100644 100644 0000000 1111111 M\x00p\xffkg/package.json\x00"
+            b":100644 100644 0000000 1111111 M\x00package.json\x00"
+        )
         stdin = io.BytesIO(raw)
         stdout_buf = io.BytesIO()
 
@@ -270,28 +415,34 @@ class NegativeCasesTest(unittest.TestCase):
 class RawByteRegressionTest(unittest.TestCase):
     """git C-quotes exotic paths in DEFAULT output; the policy reads raw `-z` bytes."""
 
+    @staticmethod
+    def _paths(raw_paths):
+        """Wrap raw path bytes in `--raw -z` records and parse them back out."""
+        data = b"".join(
+            b":100644 100644 0000000 1111111 M\x00" + p + b"\x00" for p in raw_paths
+        )
+        return [path for _old, _new, path in policy.parse_raw_z(data)]
+
     def test_embedded_quote_caught_from_raw_bytes(self):
         # `.github/workflows/ev"il.yml` — default git output would quote-wrap this,
         # slipping the leading quote past a `^\.github/` anchor. Raw -z bytes don't.
-        raw = b'.github/workflows/ev"il.yml'
-        paths = policy.parse_nul_delimited(raw)
+        paths = self._paths([b'.github/workflows/ev"il.yml'])
         self.assertEqual(policy.denied_paths(paths), ['.github/workflows/ev"il.yml'])
 
     def test_embedded_newline_split_both_lines_tested(self):
         # A single path carrying a raw newline arrives (via -z) as one field; the
         # policy splits it and tests BOTH lines. Match on either => denied.
         # (a) match on the first line
-        paths = policy.parse_nul_delimited(b".github/workflows/x.yml\nsecond-line")
+        paths = self._paths([b".github/workflows/x.yml\nsecond-line"])
         self.assertEqual(len(paths), 1)
         self.assertEqual(policy.denied_paths(paths), paths)
         # (b) match on the SECOND line — proves both are tested, not just the first
-        paths = policy.parse_nul_delimited(b"innocent-first\npackage.json")
+        paths = self._paths([b"innocent-first\npackage.json"])
         self.assertEqual(len(paths), 1)
         self.assertEqual(policy.denied_paths(paths), paths)
 
-    def test_nul_delimited_multiple_paths_partition(self):
-        raw = b".github/workflows/ci.yml\x00README.md\x00package-lock.json\x00"
-        paths = policy.parse_nul_delimited(raw)
+    def test_multiple_records_partition(self):
+        paths = self._paths([b".github/workflows/ci.yml", b"README.md", b"package-lock.json"])
         self.assertEqual(paths, [".github/workflows/ci.yml", "README.md", "package-lock.json"])
         self.assertEqual(
             policy.denied_paths(paths),
@@ -299,8 +450,188 @@ class RawByteRegressionTest(unittest.TestCase):
         )
 
     def test_empty_input_denies_nothing(self):
-        self.assertEqual(policy.parse_nul_delimited(b""), [])
+        self.assertEqual(policy.parse_raw_z(b""), [])
         self.assertEqual(policy.denied_paths([]), [])
+        self.assertEqual(policy.denied_entries([]), [])
+
+
+def _run_main(raw_stdin=b"", *, env_extra=None):
+    """Drive `policy.main()` with the given raw `--raw -z` stdin and, optionally, an
+    `EXTRA_DENIED_PATHS` env value. Returns (rc, stdout_bytes, stderr_text)."""
+    stdin = io.BytesIO(raw_stdin)
+    stdout_buf = io.BytesIO()
+    stderr_buf = io.StringIO()
+
+    class _Stdin:
+        buffer = stdin
+
+    class _Stdout:
+        buffer = stdout_buf
+
+    env = {} if env_extra is None else {"EXTRA_DENIED_PATHS": env_extra}
+    orig_in, orig_out, orig_err = policy.sys.stdin, policy.sys.stdout, policy.sys.stderr
+    try:
+        policy.sys.stdin, policy.sys.stdout, policy.sys.stderr = _Stdin(), _Stdout(), stderr_buf
+        with mock.patch.dict(os.environ, env, clear=False):
+            # Ensure the var is truly absent when env_extra is None.
+            if env_extra is None:
+                os.environ.pop("EXTRA_DENIED_PATHS", None)
+            rc = policy.main()
+    finally:
+        policy.sys.stdin, policy.sys.stdout, policy.sys.stderr = orig_in, orig_out, orig_err
+    return rc, stdout_buf.getvalue(), stderr_buf.getvalue()
+
+
+def _raw(*paths):
+    """Wrap raw path bytes as regular-file `--raw -z` records."""
+    return b"".join(b":100644 100644 0000000 1111111 M\x00" + p + b"\x00" for p in paths)
+
+
+class ExtraDeniedPathsTest(unittest.TestCase):
+    """Caller-supplied `extra_denied_paths` (BE-4405): additive-only deny patterns
+    that extend the policy without editing the reusable workflow."""
+
+    def test_extra_pattern_matches(self):
+        # A repo-specific CI entrypoint the built-in list does NOT cover.
+        extra = (re.compile(r"^scripts/ci/", re.IGNORECASE),)
+        self.assertTrue(policy._is_denied("scripts/ci/deploy.sh", extra))
+        self.assertEqual(
+            policy.denied_paths(["scripts/ci/deploy.sh", "src/app.py"], extra),
+            ["scripts/ci/deploy.sh"],
+        )
+
+    def test_extra_pattern_does_not_affect_builtins(self):
+        # Built-ins still deny with an extra list present…
+        extra = (re.compile(r"^scripts/ci/"),)
+        self.assertTrue(policy._is_denied("package.json", extra))
+        # …and an UNMATCHED extra pattern denies nothing built-ins wouldn't.
+        self.assertEqual(policy.denied_paths(["src/app.py", "README.md"], extra), [])
+        # A path only the extra pattern covers is NOT denied without it (proves the
+        # extra list is the sole reason it matches — not a latent built-in).
+        self.assertFalse(policy._is_denied("scripts/ci/deploy.sh"))
+        self.assertEqual(policy.denied_paths(["scripts/ci/deploy.sh"]), [])
+
+    def test_extra_patterns_are_additive_only(self):
+        # There is no way for an extra pattern to UN-deny a built-in: the built-in
+        # OR fires first, so even an (impossible) "negation" cannot narrow the list.
+        extra = (re.compile(r".*"),)  # matches everything — only ever widens
+        self.assertEqual(policy.denied_paths(["a.py"], extra), ["a.py"])
+        # Empty extras leave the built-in verdict byte-identical.
+        self.assertEqual(policy.denied_paths(["a.py", "package.json"], ()), ["package.json"])
+
+    def test_extra_pattern_flows_through_denied_entries_and_modes(self):
+        extra = (re.compile(r"^scripts/ci/"),)
+        entries = policy.parse_raw_z(
+            _raw(b"scripts/ci/run.sh", b"src/ok.py", b"package.json")
+        )
+        self.assertEqual(
+            policy.denied_entries(entries, extra),
+            ["scripts/ci/run.sh", "package.json"],
+        )
+        # The symlink-in-suites mode deny is orthogonal and still fires with extras.
+        sym = policy.parse_raw_z(
+            b":000000 120000 0000000 1111111 M\x00suites/link\x00"
+        )
+        self.assertEqual(policy.denied_entries(sym, extra), ["suites/link"])
+
+    def test_compile_case_insensitive_like_builtins(self):
+        # A case-insensitive CI runner resolves SCRIPTS/CI/x to the real file, so
+        # the extra pattern must match it too (mirrors _PATTERN's IGNORECASE).
+        patterns = policy.compile_extra_patterns("^scripts/ci/")
+        self.assertEqual(len(patterns), 1)
+        self.assertTrue(policy._is_denied("SCRIPTS/CI/DEPLOY.SH", patterns))
+
+    def test_compile_strips_and_skips_blanks(self):
+        # Leading/trailing whitespace and blank lines are noise from a YAML block
+        # scalar: blanks skipped, non-blank lines stripped before compiling.
+        patterns = policy.compile_extra_patterns("\n  ^scripts/ci/  \n\n\t\n^custom-runner$\n")
+        self.assertEqual(len(patterns), 2)
+        self.assertTrue(policy._is_denied("scripts/ci/x", patterns))
+        self.assertTrue(policy._is_denied("custom-runner", patterns))
+
+    def test_empty_and_whitespace_input_is_a_noop(self):
+        for raw in ("", "   ", "\n\n", "\t \n  \n"):
+            self.assertEqual(policy.compile_extra_patterns(raw), [], repr(raw))
+
+    def test_invalid_pattern_raises_naming_the_bad_pattern(self):
+        with self.assertRaises(policy.InvalidExtraPattern) as ctx:
+            policy.compile_extra_patterns("^scripts/ci/\n^unbalanced[")
+        # The offending pattern (stripped) is carried for the ::error:: message.
+        self.assertEqual(ctx.exception.pattern, "^unbalanced[")
+        self.assertIn("^unbalanced[", str(ctx.exception))
+
+
+class MainExtraDeniedPathsTest(unittest.TestCase):
+    """`main()` reads EXTRA_DENIED_PATHS from the env and fails CLOSED on a typo."""
+
+    def test_env_extra_pattern_denies_via_main(self):
+        rc, out, err = _run_main(
+            _raw(b"scripts/ci/deploy.sh", b"src/app.py"),
+            env_extra="^scripts/ci/",
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, b"scripts/ci/deploy.sh\n")
+        self.assertEqual(err, "")
+
+    def test_unset_env_is_byte_identical_to_prior_behavior(self):
+        # No EXTRA_DENIED_PATHS var at all → built-in policy only, unchanged.
+        rc, out, err = _run_main(_raw(b"package.json", b"src/app.py"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, b"package.json\n")
+        self.assertEqual(err, "")
+
+    def test_empty_env_is_byte_identical(self):
+        rc, out, _ = _run_main(_raw(b"package.json", b"scripts/ci/x"), env_extra="\n  \n")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, b"package.json\n")  # scripts/ci/x NOT denied — empty extras
+
+    def test_invalid_pattern_fails_closed_with_error_annotation(self):
+        rc, out, err = _run_main(
+            _raw(b"src/app.py"),  # nothing else denied — the config error alone must fail closed
+            env_extra="^ok/\n^bad[",
+        )
+        self.assertEqual(rc, 2, "an uncompilable pattern must exit nonzero (fail closed)")
+        self.assertEqual(out, b"", "no denied-path output on the fail-closed path")
+        self.assertIn("::error::", err)
+        self.assertIn("^bad[", err, "the ::error:: must name the bad pattern")
+
+    def test_valid_env_with_no_denied_paths_exits_zero_empty(self):
+        rc, out, err = _run_main(_raw(b"src/app.py", b"README.md"), env_extra="^scripts/ci/")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, "")
+
+
+class GatePreAgentValidationTest(unittest.TestCase):
+    """The groom.yml `gate` job validates EXTRA_DENIED_PATHS before any agent
+    spend by piping an EMPTY diff into main() (`printf '' | patch_policy.py`).
+    main() compiles the patterns BEFORE reading stdin, so an empty stdin
+    exercises ONLY the compile: rc 2 + ::error:: on a bad pattern, rc 0 (empty
+    output) on a good or empty one — the exact contract the gate step relies on.
+    These pin that empty-stdin invocation directly (the tests above all feed a
+    non-empty diff)."""
+
+    def test_empty_stdin_bad_pattern_fails_closed(self):
+        # `printf '' | patch_policy.py` with an uncompilable pattern → rc 2.
+        rc, out, err = _run_main(b"", env_extra="^ok/\n^bad[")
+        self.assertEqual(rc, 2, "empty diff + bad pattern must still fail closed (rc 2)")
+        self.assertEqual(out, b"", "no output on the fail-closed path")
+        self.assertIn("::error::", err)
+        self.assertIn("^bad[", err, "the ::error:: must name the bad pattern")
+
+    def test_empty_stdin_good_pattern_exits_zero(self):
+        # A compilable pattern over an empty diff validates clean → rc 0, no output.
+        rc, out, err = _run_main(b"", env_extra="^scripts/ci/")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, "")
+
+    def test_empty_stdin_empty_env_exits_zero(self):
+        # Unset/empty extra_denied_paths (the default caller value) → rc 0, no output.
+        rc, out, err = _run_main(b"", env_extra="")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, b"")
+        self.assertEqual(err, "")
 
 
 if __name__ == "__main__":

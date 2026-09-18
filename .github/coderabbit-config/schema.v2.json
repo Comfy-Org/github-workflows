@@ -488,13 +488,18 @@
 					"type": "boolean"
 				},
 				"slop_detection": {
-					"description": "Anti-Slop | Settings for detecting and managing spam or low-quality PRs on GitHub. Available for public repositories on all plans and private repositories on the Pro plan and above.",
+					"description": "Anti-Slop | Settings for detecting and managing spam or low-quality PRs on GitHub. Available for public repositories on all plans and private repositories on the Essentials plan and above.",
 					"default": {},
 					"type": "object",
 					"properties": {
 						"enabled": {
 							"default": true,
 							"description": "Enable or disable slop and low-quality PR detection.",
+							"type": "boolean"
+						},
+						"include_all_authors": {
+							"default": false,
+							"description": "Run slop detection for all PR authors, including collaborators, contributors, organization members, and repository owners.",
 							"type": "boolean"
 						},
 						"label": {
@@ -628,7 +633,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Fix Failing CI | Enable the fix-ci finishing touch on GitHub and Azure DevOps; requires a Pro Plus plan. When CI failures are attributed to the current pull request, Finishing Touches offers the delivery modes supported by the repository. Where both modes are available, it offers mutually exclusive stacked-pull-request and direct-commit options; where stacked-pull-request delivery is unavailable but direct commits are supported, it offers direct commit only. The `@coderabbitai fix-ci` command requests a stacked pull request by default, but commits in place on a CodeRabbit-authored pull request to avoid creating another stacked pull request. Use `@coderabbitai fix-ci commit` to request a direct commit. When disabled, both commands are removed from help and CodeRabbit declines fix-ci requests.",
+									"description": "Fix Failing CI | Enable the fix-ci finishing touch on GitHub and Azure DevOps; requires a Team plan. When CI failures are attributed to the current pull request, Finishing Touches offers the delivery modes supported by the repository. Where both modes are available, it offers mutually exclusive stacked-pull-request and direct-commit options; where stacked-pull-request delivery is unavailable but direct commits are supported, it offers direct commit only. The `@coderabbitai fix-ci` command requests a stacked pull request by default, but commits in place on a CodeRabbit-authored pull request to avoid creating another stacked pull request. Use `@coderabbitai fix-ci commit` to request a direct commit. When disabled, both commands are removed from help and CodeRabbit declines fix-ci requests.",
 									"type": "boolean"
 								}
 							}
@@ -640,15 +645,15 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Resolve Merge Conflicts | Enable the merge-conflict resolver (trigger via `@coderabbitai resolve merge conflict`). CodeRabbit analyzes the intent behind both sides of a conflict and commits a resolution to your branch. When disabled, the command is removed from help and CodeRabbit declines resolution requests. Available on GitHub and GitLab; requires a Pro Plus plan.",
+									"description": "Resolve Merge Conflicts | Enable the merge-conflict resolver (trigger via `@coderabbitai resolve merge conflict`). CodeRabbit analyzes the intent behind both sides of a conflict and commits a resolution to your branch. When disabled, the command is removed from help and CodeRabbit declines resolution requests. Available on GitHub and GitLab; requires a Team plan.",
 									"type": "boolean"
 								}
 							}
 						},
 						"custom": {
 							"default": [],
-							"description": "Custom Recipes | Define up to 5 custom finishing touch recipes. Trigger a recipe with `@coderabbitai run <recipe name>`.",
-							"maxItems": 5,
+							"description": "Custom Recipes | Define custom finishing touch recipes up to your plan limit. Trigger a recipe with `@coderabbitai run <recipe name>`.",
+							"maxItems": 20,
 							"type": "array",
 							"items": {
 								"type": "object",
@@ -819,7 +824,7 @@
 					"type": "object",
 					"properties": {
 						"ast-grep": {
-							"description": "Enable ast-grep | ast-grep is a code analysis tool that helps you to find patterns in your codebase using abstract syntax trees patterns. | v0.45.1",
+							"description": "Enable ast-grep | ast-grep is a code analysis tool that helps you to find patterns in your codebase using abstract syntax trees patterns. | v0.45.2",
 							"default": {},
 							"type": "object",
 							"properties": {
@@ -873,7 +878,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Ruff | Ruff is a Python linter and code formatter. |  Enable Ruff integration. | v0.16.1",
+									"description": "Enable Ruff | Ruff is a Python linter and code formatter. |  Enable Ruff integration. | v0.16.3",
 									"type": "boolean"
 								}
 							}
@@ -964,7 +969,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Biome | Biome is a fast formatter, linter, and analyzer for web projects. | Enable Biome integration. | v2.5.6",
+									"description": "Enable Biome | Biome is a fast formatter, linter, and analyzer for web projects. | Enable Biome integration. | v2.5.8",
 									"type": "boolean"
 								}
 							}
@@ -1004,7 +1009,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable PHPStan | PHPStan requires [config file](https://phpstan.org/config-reference#config-file) in your repository root. Please ensure that this file contains the `paths:` parameter. | v2.2.7",
+									"description": "Enable PHPStan | PHPStan requires [config file](https://phpstan.org/config-reference#config-file) in your repository root. Please ensure that this file contains the `paths:` parameter. | v2.2.8",
 									"type": "boolean"
 								},
 								"level": {
@@ -1059,7 +1064,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable golangci-lint | golangci-lint is a fast linters runner for Go. | Enable golangci-lint integration. | v2.12.2",
+									"description": "Enable golangci-lint | golangci-lint is a fast linters runner for Go. | Enable golangci-lint integration. | v2.13.2",
 									"type": "boolean"
 								},
 								"config_file": {
@@ -1087,7 +1092,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Betterleaks | Betterleaks is a secret scanner (an improved version of Gitleaks). | Enable Betterleaks integration. | v1.7.3",
+									"description": "Enable Betterleaks | Betterleaks is a secret scanner (an improved version of Gitleaks). | Enable Betterleaks integration. | v1.8.1",
 									"type": "boolean"
 								}
 							}
@@ -1111,7 +1116,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Checkov | Checkov is a static code analysis tool for infrastructure-as-code files. | v3.3.10",
+									"description": "Enable Checkov | Checkov is a static code analysis tool for infrastructure-as-code files. | v3.3.11",
 									"type": "boolean"
 								}
 							}
@@ -1165,7 +1170,7 @@
 									"properties": {
 										"enabled": {
 											"default": true,
-											"description": "Enable @e18e/eslint-plugin | Detects dependencies with modern replacements, flags unmaintained packages, and suggests native API alternatives or lighter replacements | v0.6.0",
+											"description": "Enable @e18e/eslint-plugin | Detects dependencies with modern replacements, flags unmaintained packages, and suggests native API alternatives or lighter replacements | v0.8.0",
 											"type": "boolean"
 										}
 									}
@@ -1220,7 +1225,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable RuboCop | RuboCop is a Ruby static code analyzer (a.k.a. linter ) and code formatter. | v1.88.2",
+									"description": "Enable RuboCop | RuboCop is a Ruby static code analyzer (a.k.a. linter ) and code formatter. | v1.89.0",
 									"type": "boolean"
 								}
 							}
@@ -1313,6 +1318,18 @@
 								}
 							}
 						},
+						"vale": {
+							"description": "Vale lints prose using the repository's checked-in style rules.",
+							"default": {},
+							"type": "object",
+							"properties": {
+								"enabled": {
+									"default": true,
+									"description": "Enable Vale | Vale checks prose against repository-defined editorial style rules. It runs only when a supported root Vale configuration is present. | v3.17.1",
+									"type": "boolean"
+								}
+							}
+						},
 						"verilator": {
 							"description": "Verilator statically analyzes Verilog and SystemVerilog source files.",
 							"default": {},
@@ -1332,7 +1349,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable OpenGrep | OpenGrep is a high-performance static code analysis engine for finding security vulnerabilities and bugs across 17+ languages. | v1.26.0",
+									"description": "Enable OpenGrep | OpenGrep is a high-performance static code analysis engine for finding security vulnerabilities and bugs across 17+ languages. | v1.27.1",
 									"type": "boolean"
 								}
 							}
@@ -1344,7 +1361,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Semgrep | Semgrep is a static analysis tool designed to scan code for security vulnerabilities and code quality issues. | Enable Semgrep integration. | v1.170.0",
+									"description": "Enable Semgrep | Semgrep is a static analysis tool designed to scan code for security vulnerabilities and code quality issues. | Enable Semgrep integration. | v1.173.0",
 									"type": "boolean"
 								},
 								"config_file": {
@@ -1360,7 +1377,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable CircleCI | CircleCI tool is a static checker for CircleCI config files. | v0.1.38646",
+									"description": "Enable CircleCI | CircleCI tool is a static checker for CircleCI config files. | v1.0.48254",
 									"type": "boolean"
 								}
 							}
@@ -1384,7 +1401,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable SQLFluff | SQLFluff is an open source, dialect-flexible and configurable SQL linter. | v4.2.2",
+									"description": "Enable SQLFluff | SQLFluff is an open source, dialect-flexible and configurable SQL linter. | v4.3.0",
 									"type": "boolean"
 								},
 								"config_file": {
@@ -1400,7 +1417,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Squawk for Postgres migration linting | Detects unsafe schema changes that can cause downtime or blocking locks | v2.61.0",
+									"description": "Enable Squawk for Postgres migration linting | Detects unsafe schema changes that can cause downtime or blocking locks | v2.62.0",
 									"type": "boolean"
 								}
 							}
@@ -1412,7 +1429,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Trivy for security scanning of IaC files (Terraform, Kubernetes, Docker, etc.) | v0.73.0",
+									"description": "Enable Trivy for security scanning of IaC files (Terraform, Kubernetes, Docker, etc.) | v0.74.0",
 									"type": "boolean"
 								}
 							}
@@ -1436,7 +1453,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Pylint | Pylint is a Python static code analysis tool. | v4.0.6",
+									"description": "Enable Pylint | Pylint is a Python static code analysis tool. | v4.0.7",
 									"type": "boolean"
 								}
 							}
@@ -1448,7 +1465,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Oxlint | Oxlint is a JavaScript/TypeScript linter for OXC written in Rust. | v1.77.0",
+									"description": "Enable Oxlint | Oxlint is a JavaScript/TypeScript linter for OXC written in Rust. | v1.78.0",
 									"type": "boolean"
 								}
 							}
@@ -1460,7 +1477,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Shopify Theme Check | A linter for Shopify themes that helps you follow Shopify theme & Liquid best practices | cli 4.6.0 | theme 3.58.2",
+									"description": "Enable Shopify Theme Check | A linter for Shopify themes that helps you follow Shopify theme & Liquid best practices | cli 4.6.1 | theme 3.58.2",
 									"type": "boolean"
 								}
 							}
@@ -1478,13 +1495,13 @@
 							}
 						},
 						"brakeman": {
-							"description": "Brakeman is a static analysis security vulnerability scanner for Ruby on Rails applications. | v8.0.5",
+							"description": "Brakeman is a static analysis security vulnerability scanner for Ruby on Rails applications. | v8.0.6",
 							"default": {},
 							"type": "object",
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Brakeman | Brakeman is a static analysis security vulnerability scanner for Ruby on Rails applications. | v8.0.5",
+									"description": "Enable Brakeman | Brakeman is a static analysis security vulnerability scanner for Ruby on Rails applications. | v8.0.6",
 									"type": "boolean"
 								}
 							}
@@ -1546,7 +1563,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable OSV Scanner | OSV Scanner is a tool for vulnerability package scanning | v2.4.0",
+									"description": "Enable OSV Scanner | OSV Scanner is a tool for vulnerability package scanning | v2.5.0",
 									"type": "boolean"
 								}
 							}
@@ -1558,7 +1575,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable oasdiff | oasdiff detects breaking changes between OpenAPI specifications. | v1.27.0",
+									"description": "Enable oasdiff | oasdiff detects breaking changes between OpenAPI specifications. | v1.29.1",
 									"type": "boolean"
 								}
 							}
@@ -1570,7 +1587,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable React Doctor | React Doctor scans React codebases for security, performance, correctness, and accessibility issues. | v0.9.6",
+									"description": "Enable React Doctor | React Doctor scans React codebases for security, performance, correctness, and accessibility issues. | v0.9.12",
 									"type": "boolean"
 								}
 							}
@@ -1594,7 +1611,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Blinter | Blinter is a linter for Windows batch files that provides comprehensive static analysis to identify syntax errors, security vulnerabilities, performance issues, and style problems. | v1.1.7",
+									"description": "Enable Blinter | Blinter is a linter for Windows batch files that provides comprehensive static analysis to identify syntax errors, security vulnerabilities, performance issues, and style problems. | v1.1.17",
 									"type": "boolean"
 								}
 							}
@@ -1630,7 +1647,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable SkillSpector | SkillSpector is a security scanner for AI agent skills. It detects vulnerabilities, malicious patterns, and security risks in SKILL.md manifests and MCP configurations. | v2.5.1",
+									"description": "Enable SkillSpector | SkillSpector is a security scanner for AI agent skills. It detects vulnerabilities, malicious patterns, and security risks in SKILL.md manifests and MCP configurations. | v2.9.5",
 									"type": "boolean"
 								}
 							}
@@ -1871,9 +1888,16 @@
 					},
 					"additionalProperties": false
 				},
+				"automatic_linking_mode": {
+					"default": "disabled",
+					"description": "Automatic Linking Mode | For Auto, private repositories may automatically link to public or private repositories, while public repositories may automatically link only to public repositories. Enabled uses context from any eligible repository in the organization, whether public or private. Disabled creates no automatic repository links. Manual repository links configured below are unaffected.",
+					"type": "string",
+					"enum": ["auto", "enabled", "disabled"]
+				},
 				"automatic_repository_linking": {
 					"default": false,
-					"description": "Automatic Repository Linking | When enabled, CodeRabbit automatically detects and links related repositories in your organization to identify breaking changes and downstream impact during PR reviews.",
+					"description": "Automatic Repository Linking | Deprecated. This setting has no effect. Use knowledge_base.automatic_linking_mode instead.",
+					"deprecated": true,
 					"type": "boolean"
 				},
 				"linked_repositories": {
@@ -1907,10 +1931,10 @@
 			"type": "object",
 			"properties": {
 				"docstrings": {
+					"description": "Docstring Generation | Settings for generating docstrings.",
 					"default": {
 						"path_instructions": []
 					},
-					"description": "Docstring Generation | Settings for generating docstrings.",
 					"type": "object",
 					"properties": {
 						"language": {

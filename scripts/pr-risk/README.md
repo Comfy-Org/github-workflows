@@ -12,9 +12,10 @@ event is graded into a tier and gets ONE label:
 | — | `risk:ungraded` | an input could not be read; deliberately NOT a tier | human review |
 
 **The label is the entire product.** Nothing is gated, blocked, routed, commented
-on, or merged. Humans glance at the label and either agree or disagree.
-Disagree by adding the `risk-dispute` label (never touched by the grader) plus a
-comment saying why — disputes are the pilot's calibration data.
+on, or merged. `risk-dispute:low` through `risk-dispute:xhigh` override the
+visible risk label while leaving the computed tier in the grade record. Removing
+the dispute restores the computed label; if multiple overrides exist, the highest
+risk wins.
 
 ## How a grade is computed
 
@@ -106,9 +107,9 @@ Two CI-specific mechanics worth knowing:
 
 Every grade above is triggered by a `pull_request` event. Two things need a grade
 with no event: a repo that **enrolls mid-stream** and wants the open queue it
-already has labeled, and a **manual re-grade** after a `.github/risk.json` change
-or on a PR carrying `risk-dispute`. Both are a `workflow_dispatch` on the
-consumer's caller, forwarding a number:
+already has labeled, and a **manual re-grade** after a `.github/risk.json`
+change. Both are a `workflow_dispatch` on the consumer's caller, forwarding a
+number:
 
 ```yaml
 on:
@@ -191,9 +192,9 @@ Operational caveats for a backfill:
   re-dispatch on `pr_number` if a final grade looks wrong. The residual it costs
   instead is narrower, but it cuts both ways: the PUT is built from a snapshot
   read, so a **non-owned** label added in the read→PUT window is dropped
-  (`risk-dispute` included — re-add a dispute that lands in that instant) and one
-  **removed** in that window is resurrected. The window opens only on a run that
-  actually changes the grade, and is about one API round-trip — three on the
+  (`risk-dispute:*` included — re-add an override that lands in that instant)
+  and one **removed** in that window is resurrected. The window opens only on a
+  run that actually changes the grade, and is about one API round-trip — three on the
   first grade in a repo, where the label pre-create sits inside it. A drop is not
   invisible: GitHub records it on the PR timeline as an `unlabeled` event by the
   grader token. Dispatch when the queue is quiet, and use `pr_number` when you
@@ -322,6 +323,19 @@ Labels are created on first use, color-coded green → red (gray for ungraded).
   no failure in it can redden a PR. `RENDER_ONLY=1` emits the surfaces and writes nothing, which
   is how the Check Run is rendered in the grading job and POSTed from the job that holds
   `checks: write`.
+- `lib.sh` — the sourceable core: the scratch files, the retrying `gh` reads built on them, and
+  the two resolvers that decide WHICH branch's rules judge a PR (`resolve_base_ref` /
+  `fetch_override`). No top-level side effects — no command runs, no scratch file is created and
+  no EXIT trap is installed by sourcing it, which is what lets `grade-targets.sh` here and
+  pr-derisk's `collect-pr-inputs.sh` share one implementation of "which `.github/risk.json`
+  applies" instead of two. Its diagnostics are `gt_log` / `gt_die`, prefixed so they cannot
+  capture a sourcing script's own, and they report under `GT_LOG_PREFIX` so a line still names
+  the script that emitted it. It is sourced from **beside the sourcing script**, never through a
+  `TOOL_DIR`-style input: `TOOL_DIR` names the swappable tools (the suite overrides it with a stub
+  grader directory), and anchoring the library to it would make that stubbing hard-die at the
+  source line. `fetch_override` also checks the SHAPE of the override path before building a URL
+  from it — `..` and a leading `/` are refused, because `@uri` leaves `.` untouched and
+  `contents/../../x` addresses a different endpoint once the dot segments resolve.
 - `grade-targets.sh` — the orchestration layer, extracted from `pr-risk.yml`'s
   inline job body so the event path and the by-number path cannot drift into two
   copies of it. Per target: resolve the base ref, fetch that ref's override

@@ -88,6 +88,7 @@ the filenames literally) and `cursor-review` does not.
 |---|---|---|
 | `stale.yml` | 0 | Nothing to bump. Add a fleet when the first caller lands. |
 | `assign-prs-to-author.yml` | 0 | Same. |
+| `refresh-reviewers.yml` | 0 | Ships a consumer caller guide but no external caller has enrolled yet. Add a fleet + `REFRESH_REVIEWERS_CALLERS` roster once the first one lands; until then a consumer's `uses:`/`workflows_ref` pin is bumped by hand. |
 
 A reusable that has callers but no fleet is the trap this whole directory exists
 to prevent: the pins simply never move, so consumers drift behind indefinitely
@@ -186,9 +187,11 @@ re-point that pins callers to the verified tip instead of a stale `github.sha`.
 | `WATCHED` | **required** — repo-relative path of the watched reusable workflow (e.g. `.github/workflows/groom.yml`) |
 | `WATCHED_ASSETS` | optional — the watched assets, a **newline-separated list** of literal paths, one per line (blank lines and surrounding whitespace ignored). A single-line value is just a one-element list, so `WATCHED_ASSETS: .github/groom` keeps working unchanged; a fleet watching more than one spells it as a YAML **literal** block scalar — `\|`, never the folded `>`, which joins the lines into one space-separated string (see below). Empty/unset means the fleet watches nothing beyond `WATCHED` |
 | `WATCHED_PATHSPECS` | optional — newline-separated git **pathspecs** (`:(exclude)` entries allowed) covering what the fleet's `paths:` filter watches. When set, they replace the `WATCHED`/`WATCHED_ASSETS` object comparison as the staleness test. Every positive entry must select a tracked path, and the list must select `WATCHED` **and something under every `WATCHED_ASSETS` entry**. Used by `pr-risk`, `pr-derisk`, `pr-size` and `cursor-review` |
-| `WATCHED_EXEC` | optional — newline-separated repo-relative **files** a pinned caller actually executes. When set, each is probed for deletion at the tip and — unless the run was re-pointed, which makes that tip the pin target — locally too, in addition to `WATCHED`/`WATCHED_ASSETS`. **Only `pr-risk` and `pr-derisk` need this today** |
+| `WATCHED_EXEC` | optional — newline-separated repo-relative **files** a pinned caller actually executes. When set, each is probed for deletion at the tip and — unless the run was re-pointed, which makes that tip the pin target — locally too, in addition to `WATCHED`/`WATCHED_ASSETS`. **Every fleet whose `WATCHED_ASSETS` entry is a DIRECTORY needs it** — that is all ten of the asset-watching fleets today; only the three that watch nothing beyond `WATCHED` (`assign-reviewers`, `auto-label`, `detect-unreviewed-merge`) leave it unset |
 | `NEW_SHA` | the candidate SHA, normally `github.sha` |
 | `GITHUB_SHA`, `GITHUB_OUTPUT` | provided by Actions |
+| `GITHUB_EVENT_NAME`, `GITHUB_EVENT_PATH`, `GITHUB_REPOSITORY`, `GITHUB_WORKFLOW_REF` | also provided by Actions to every step, no wiring needed — read only by the `Skip-caller-bump` gate and the owed-bump check below. Absent or unparseable is never an error; both fail open toward bumping |
+| `GH_TOKEN` | the ambient, read-only `${{ github.token }}`, wired into the preflight step's `env:` alongside an `actions: read` permission. The **only** credential this script uses, and it is minted long before the org-wide write token the bump step needs. Read only by the owed-bump check; unset means that check reads "cannot determine" and bumps |
 
 `WATCHED`, `WATCHED_ASSETS` and every `WATCHED_EXEC` entry are **literal,
 repo-relative paths, not the globs from the `paths:` filter** —
@@ -399,8 +402,13 @@ the day it becomes true, so it cannot happen quietly.
 `WATCHED_EXEC`.** `pr-size` and `cursor-review` need the first (BE-7084): each
 excludes `scripts/check-pr-size/*_test.go`, since a pinned caller builds and runs
 that tool and never runs `go test`, so a test-only commit would otherwise mint a
-token and fan a pure-churn bump PR to every consumer. `pr-risk` needs both — and
-they are what let it move onto this script instead of keeping its own guard:
+token and fan a pure-churn bump PR to every consumer. The second is **not** a
+pr-risk speciality: *every* fleet whose `WATCHED_ASSETS` entry is a directory
+needs it, because a directory outlives the files inside it — all ten of the
+asset-watching fleets set it today, and only the three that watch nothing beyond
+`WATCHED` (`assign-reviewers`, `auto-label`, `detect-unreviewed-merge`) leave it
+unset. `pr-risk` needs both — and they are what let it move onto this script
+instead of keeping its own guard:
 
 - Its `paths:` filter negates `scripts/pr-risk/tests/**` and the tool README, and
   no object comparison can express a negation. `WATCHED_PATHSPECS` is handed
@@ -411,17 +419,52 @@ they are what let it move onto this script instead of keeping its own guard:
   nothing, or that never reaches `WATCHED` — is enforced rather than trusted (see
   the input rules above). It compares two trees and walks no history, so it
   composes with the deepening but does not need it.
-- Its decommission surface is the three grader scripts a caller executes, not the
-  directory holding them: a commit deleting the graders while leaving `tests/` and
-  the README behind satisfies a `-d scripts/pr-risk` probe and would bump every
-  caller onto a SHA where the tools are gone. `WATCHED_EXEC` names those files, and
-  they are probed at the tip (before the staleness test, so a deletion warns rather
-  than reading as "a newer commit has its own run") and again in this run's tree —
-  the latter only when the run was *not* re-pointed, since a re-point makes that
-  same tip the SHA callers are pinned to and this checkout no longer the thing
-  worth probing.
+- Its decommission surface is the grader scripts and data files a caller executes,
+  not the directory holding them: a commit deleting the graders while leaving
+  `tests/` and the README behind satisfies a `-d scripts/pr-risk` probe and would
+  bump every caller onto a SHA where the tools are gone. `WATCHED_EXEC` names those
+  files, and they are probed at the tip (before the staleness test, so a deletion
+  warns rather than reading as "a newer commit has its own run") and again in this
+  run's tree — the latter only when the run was *not* re-pointed, since a re-point
+  makes that same tip the SHA callers are pinned to and this checkout no longer the
+  thing worth probing.
 
-Every other fleet leaves both unset and behaves exactly as before.
+That second half generalises, and every asset-watching fleet now applies it. The
+survivors differ per tree but the hole is identical: `.github/groom`,
+`.github/cursor-review`, `.github/agents-md-integrity`, `.github/coderabbit-config`
+and `.github/public-repo-hygiene` are each kept alive by `tests/` and `README.md`,
+while `scripts/check-pr-size` has neither and is kept alive by the very
+`*_test.go` files the `pr-size` / `cursor-review` filters exclude. Three rules
+when you write one of these lists:
+
+- **The test is "absence breaks a pinned caller at run time", not "is it an
+  executable".** A prompt or brief a consumer loads from the pinned ref qualifies
+  (`prompt-judge.md`, `finder.md`), and so does a data file resolved beside the
+  script (`risk-map.v0.json`, `schema.v2.json`) or a manifest a step fails closed
+  on (`.github/groom/package.json`). A `README.md` and anything under `tests/` does
+  not.
+- **Do not list a file no pinned caller loads**, even one that lives in the watched
+  directory and is genuinely executed *here* — `catalog-drift.py`,
+  `schema_drift.py` and `wire-bot-identity.py` all run out of this repo's own
+  checkout. Listing one turns its retirement into a `::warning::` that freezes the
+  whole fleet: a false decommission, the mirror of the false-healthy bump the input
+  exists to stop. `bump-pr-derisk-callers.yml` records the same call for
+  `apply-risk-label.sh`.
+- **A path that stops resolving is a silent freeze, so it is machine-checked.**
+  These are ~50 hand-written literal paths and preflight.sh probes each one for
+  deletion, so a typo — or a rename applied to the tree but not to this list, or
+  to only one of the two byte-identical `scripts/check-pr-size` blocks — makes the
+  fleet take the decommission branch on every future run: one `::warning::`,
+  `proceed=false`, a green run, and no caller bumped again. `test_paths_contract.sh`
+  asserts every entry is a tracked file at that commit, sits under a watched
+  surface, and that no fleet watching a DIRECTORY leaves the input unset — so all
+  three now fail the PR instead of the fleet. Rename or retire a listed file in the
+  SAME commit as the list edit, and the check will tell you when you have not.
+
+The three fleets that watch nothing beyond `WATCHED` leave both unset and behave
+exactly as before — `test_paths_contract.sh` grants them exactly that exemption,
+since preflight.sh probes `WATCHED` unconditionally and a `.yml` file is its own
+probe.
 
 Consumption is two steps — the guard, then the bump gated on its output:
 
@@ -508,6 +551,160 @@ way, and `test_paths_contract.sh` enforces it.
 >   rev-list back — and since BE-6676 it can express that filter directly, with
 >   `WATCHED_PATHSPECS` + `WATCHED_EXEC`, instead of narrowing anything away. The
 >   staleness test there is still a two-tree comparison, not a history walk.
+
+### Suppressing a churn bump (`Skip-caller-bump: true`)
+
+A commit that only rewords comments or docs *inside* a watched surface still
+matches the fleet's `paths:` filter, so it fans a pure-churn SHA-bump PR — a
+review round in every caller repo — for a change no caller can observe. A
+reviewed commit on `main` can declare itself bump-irrelevant with a
+commit-message trailer:
+
+```text
+docs(groom): reword the finder brief's intro comment
+
+Skip-caller-bump: true
+```
+
+The preflight then skips (`proceed=false`, `new_sha` still emitted, exit 0) —
+but ONLY when all of these hold; on any other condition, **including any
+read/parse failure of the event payload, the gate falls through to bumping**.
+It fails open on purpose: its worst bug must be status-quo churn (a bump that
+could have been skipped), never pin drift (a skip that suppressed a real bump).
+
+- the run is a `push` event. A `workflow_dispatch` run always bumps — dispatch
+  is the fleets' documented recovery path, and doubles as the manual override
+  if a trailer turns out to have been a mistake;
+- the push payload's `.commits` array has 1–2047 entries. GitHub documents the
+  push **webhook** payload — which is what `$GITHUB_EVENT_PATH` holds — as
+  carrying "a maximum of 2048 commits"; the far lower 20-entry cap belongs to
+  the Events API's `PushEvent`, a different representation, and the webhook
+  payload carries no `.size` to compare a length against, so the count is the
+  only truncation signal there is. At 2048 the array may be incomplete, and
+  skipping on an incompletely-checked push could suppress a behavioral bump —
+  the gate refuses to skip instead;
+- **every** commit in the push carries a line matching
+  `^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$` **in its trailing
+  trailer block** — the maximal suffix of *body* lines (the title paragraph is
+  never scanned, so a message with no blank line at all is untrailered) that are
+  blank or `Token: value` shaped, *and* which starts a paragraph (a blank line
+  precedes it, or it opens the body right after the title), i.e.
+  `git interpret-trailers --parse` semantics rather than a body-wide search. A
+  body-wide search reads the token
+  as a *declaration* when it is only being *quoted*: a `git cherry-pick -x` copy
+  (whose appended `(cherry picked from commit …)` line is not trailer-shaped, so
+  it correctly ends the block), a reapply carrying the original body, or a
+  commit whose prose documents this feature at column 0. The paragraph-start
+  half covers the quote that is the paragraph's *last* line —
+
+  ```text
+  docs: explain the gate
+
+  A churn commit ends with:
+  Skip-caller-bump: true
+  ```
+
+  — which the suffix rule alone accepts, because the scan stops on the prose
+  above having already taken the token. Blank lines are allowed *inside* the
+  block, so GitHub's appended `Co-authored-by:` paragraph does not push a valid
+  trailer out of it (nor does it launder a quote like the one above, since the
+  scan walks back through it to the same prose).
+
+All commits, not just those touching watched paths — on a **direct push to
+`main`** that is what stops a mixed push (one behavioral commit, one trailered
+docs commit) from skipping. It is not what guards the shape changes actually
+arrive in here. This repo squash-merges with
+`squash_merge_commit_message: COMMIT_MESSAGES`, so a whole PR lands as **one**
+commit and the all-commits rule is then trivially the head-commit rule. What
+guards that path is the trailer-block requirement plus review: GitHub's squashed
+body concatenates the branch commits in order, so only a trailer in the **last**
+commit's message survives into the squashed message's trailer block — which is
+also the text the squash-merge UI shows the person pressing the button. A
+trailer that reaches `main` therefore claims the **whole PR** is
+bump-irrelevant, for **every** fleet, and reviewers reject it on a PR carrying
+behavioral changes exactly as they would any other reviewed line. Legitimate
+only for comment/docs-only edits to watched surfaces; when in doubt, leave it
+off and let the fleet bump.
+
+The gate runs **last**, immediately before the final `proceed=true`, so every
+loud validation, staleness and decommission verdict above keeps precedence — a
+trailer can never mask an error or relabel a stale/decommission verdict. On the
+re-point path the run has already logged "pinning callers to … and proceeding";
+the skip `::notice::` names that line and says it overrides it, so the log never
+ends on two contradictory statements.
+
+**The hand-off guard.** The staleness skip earlier in the preflight is sound
+only because of what its own message claims — the newer commit "has its own
+run, which will pin the newer content". Once a run can *decline* on a trailer,
+that hand-off breaks: behavioral commit A lands on a watched surface, trailered
+churn commit B rewords a comment in the same surface moments later, A's run
+defers to B's run, B's run skips, and A reaches no caller until some later
+behavioral commit happens along. So before deferring, the staleness branch asks
+whether **every** commit `main` gained since this one **that touches the watched
+surface** is trailered; if so it does *not* defer — it pins the verified tip and
+proceeds, because it is the last run that will pin this content.
+
+Restricted to the watched surface because the question is "will any newer run
+pin this content?", and only a commit matching the fleet's `paths:` filter
+*starts* a run at all: an unwatched commit can neither decline nor pin, so
+counting it would defer this run to a run that was never triggered. The
+pathspecs handed to the guard are whichever shape the staleness comparison
+itself used (`WATCHED_PATHSPECS`, or `WATCHED` + `WATCHED_ASSETS`), so the two
+mean the same thing by construction. Its commit bound is the same 2047 as the
+gate's `.commits` bound, so no range the gate would skip commit-by-commit is one
+the guard declines to evaluate — the two disagreeing (50 vs 2047) was itself a
+pin-drift window.
+
+A range it cannot read (no `jq`, a failed history walk, no watched commit
+selected, a range past that bound) leaves the pre-existing stale verdict
+standing — the guard narrows that skip, and an inability to check is not grounds
+to widen it — but logs a **distinct** line first saying the hand-off is
+*unverified*, so a fleet that quietly stopped bumping leaves a trace of which of
+the two happened.
+
+**The owed-bump check.** A bump run is also the *catch-up* for an earlier watched
+change whose own run never bumped — one that failed at the token mint or inside
+`bump-callers.sh`, was cancelled, or never started because a `paths:` filter is
+evaluated against only the first 300 changed files of a push. Declining on a
+trailer used to decline that catch-up too, and nothing in the push *payload* can
+see it (the hand-off guard covers only the concurrent-run case). So before the
+trailer is honored, `fleet_owes_bump` looks somewhere the payload cannot: this
+fleet's own **Actions run history** — the same `actions: read`, no-new-secret,
+fail-open pattern `.github/groom/interval.py` uses for its cadence gate.
+
+1. **Find the left endpoint.** From `GITHUB_WORKFLOW_REF` and
+   `GITHUB_REPOSITORY`, list this workflow's successful runs on `main`, newest
+   first, one bounded page, and take the first whose job carries a step named
+   exactly **`Bump SHA in caller repos`** with conclusion `success`. That step is
+   `skipped` on a declined run and `success` on a real bump, which is the entire
+   discriminator; every entrypoint spells it identically and
+   `test_paths_contract.sh` fails the build if one stops. `push` and
+   `workflow_dispatch` runs both count — a dispatch recovery bump is as much of a
+   catch-up as a push one. The endpoint is that run's `head_sha`, not the SHA it
+   pinned: a re-pointed run had already proved its surface unchanged up to its
+   pin target, so the difference can only *add* commits to the range below.
+2. **Walk that range to `HEAD`**, restricted to the watched surface (the same
+   pathspecs the staleness comparison uses, so an excluding fleet keeps its
+   exclusions), and check each commit's message with the one shared trailer
+   definition. **Per commit, not as a content diff** — that is what lets an
+   earlier, legitimately-skipped trailered push keep being excused by its own
+   trailer instead of poisoning every later skip.
+3. **Any untrailered watched commit refuses the skip**, with a `::notice::`
+   naming the oldest one: *catch-up owed for `<sha>`, whose own run never
+   bumped.*
+
+The check can only ever **narrow** a skip. Every indeterminate answer — no `gh`
+or `jq`, an Actions API error, no qualifying run inside the scan bound, a failed
+deepening fetch, a left endpoint that is not an ancestor of `HEAD`, a range past
+the sanity bound — bumps, and none of them fails the run.
+
+**Residual, deliberately.** The scan reads one bounded page of recent runs, so a
+fleet whose last real bump has aged out of that page — or out of the Actions
+run-retention window entirely — reads as "cannot determine" and bumps. That is
+status-quo churn (the behavior before the trailer existed), never pin drift. The
+same is true of a fleet whose preflight step loses `actions: read` or its
+`GH_TOKEN`: the trailer quietly stops being honored, which is why the contract
+test asserts all three.
 
 ## How the pin rewrite is scoped (and why it asserts afterwards)
 

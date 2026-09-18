@@ -29,9 +29,19 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 WORKFLOWS="${REPO_ROOT}/.github/workflows"
+PREFLIGHT="${SCRIPT_DIR}/../preflight.sh"
+
+# The bump step's name, read OUT OF preflight.sh rather than restated here — it is
+# the discriminator the owed-bump probe (BE-10008) keys on to tell a run that
+# really bumped from one that declined, and two copies of it would be free to
+# drift in exactly the direction nothing else can see.
+OWED_STEP_NAME="$(sed -n "s/^OWED_BUMP_STEP_NAME='\(.*\)'$/\1/p" "$PREFLIGHT")"
 
 PASS=0
 FAIL=0
+# Every WATCHED_EXEC entry seen across every fleet, for the trigger-coverage
+# check after the loop.
+ALL_EXEC_ENTRIES=()
 ok()  { PASS=$((PASS+1)); echo "  ok: $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
 
@@ -138,6 +148,29 @@ parse_preflight_env() { # $1 = workflow file, $2 = key
 }
 
 has_preflight() { grep -q '^      - name: Preflight' "$1"; }
+
+# WATCHED_EXEC as its RUNTIME reads it. preflight.sh's split_lines drops blank
+# lines and whole-line `#` comments from WATCHED_EXEC — the same allowance
+# WATCHED_PATHSPECS gets, so a fleet can paste its `paths:` filter in with the
+# comments intact — while parse_preflight_env above hands block content through
+# verbatim. It has to: WATCHED_ASSETS *rejects* a `#` line, so stripping one
+# there would certify a path that resolves to nothing. Reading WATCHED_EXEC by
+# that stricter rule would go wrong in the other direction, failing a commented
+# list preflight.sh accepts. One function, so the difference is deliberate and
+# pinned by a fixture rather than repeated inline.
+parse_exec_list() { # $1 = the parsed WATCHED_EXEC value (newline-separated)
+  local e
+  while IFS= read -r e; do
+    # Trim BEFORE the comment test, exactly as split_lines does — otherwise an
+    # indented `#` line reads as a path here and as a comment at run time.
+    e="${e#"${e%%[![:space:]]*}"}"
+    e="${e%"${e##*[![:space:]]}"}"
+    [[ -n "$e" ]] || continue
+    case "$e" in '#'*) continue ;; esac
+    printf '%s\n' "$e"
+  done <<<"$1"
+}
+
 
 # `.github/groom/**` → `.github/groom`; a bare file path is returned unchanged.
 # This is the same literal-path shape preflight.sh's validate_path enforces.
@@ -354,6 +387,92 @@ ${pathspec_diag}"
         watched: $(echo "$act_sorted" | tr '\n' ' ')"
   fi
 
+  # --- WATCHED_EXEC: every named file must actually RESOLVE ------------------
+  # These are hand-written literal paths — ~50 of them across ten fleets — and
+  # nothing else in CI reads them. They are also the one input whose failure mode
+  # is a SILENT FREEZE rather than a red run: preflight.sh probes each entry for
+  # deletion, so a typo, or a rename applied to the repo but not to this list,
+  # makes it take the decommission branch on every future run (one `::warning::`,
+  # `proceed=false`) while the run itself stays green. The fleet quietly stops
+  # bumping and consumer pins drift — the mirror of the false-healthy bump the
+  # input exists to stop. Every OTHER preflight input is machine-enforced; this
+  # closes the last hole.
+  #
+  # `git ls-files` and an EXACT match, not `[[ -f ]]`: preflight.sh resolves each
+  # entry as a BLOB at the fetched tip (resolve_blob) as well as on disk, so a
+  # path that exists locally but is untracked, or is ignored, is absent as far as
+  # the probe is concerned. Exactness is what also rejects a DIRECTORY here —
+  # `ls-files -- x` on a directory succeeds, listing what is under it — which is
+  # the shape preflight.sh errors on at run time.
+  #
+  # This is also what keeps the two byte-identical `scripts/check-pr-size` blocks
+  # (bump-pr-size-callers.yml and bump-cursor-review-callers.yml, asserted in
+  # prose alone) in step: a rename applied to one list leaves the OTHER naming a
+  # path that no longer resolves, and that fleet fails here.
+  exec_entries=()
+  while IFS= read -r e; do
+    exec_entries+=("$e")
+  done < <(parse_exec_list "$(parse_preflight_env "$path" WATCHED_EXEC)")
+
+  # The rule this input now carries (BE-15253): a DIRECTORY cannot be its own
+  # decommission probe, because it OUTLIVES the files inside it — `tests/` and a
+  # `README.md` keep it resolving after every asset a pinned caller loads has
+  # been deleted, so the probe reports the surface healthy and bumps every caller
+  # onto a SHA where the scripts are gone. So any fleet watching a directory owes
+  # a WATCHED_EXEC. The fleets that watch nothing beyond WATCHED are exempt:
+  # preflight.sh probes WATCHED itself unconditionally, and a `.yml` file is its
+  # own probe.
+  watched_dirs=()
+  while IFS= read -r a; do
+    [[ -n "$a" ]] || continue
+    [[ -d "${REPO_ROOT}/${a}" ]] && watched_dirs+=("$a")
+  done <<<"$assets"
+
+  if (( ${#exec_entries[@]} == 0 )); then
+    if (( ${#watched_dirs[@]} > 0 )); then
+      bad "${file}: watches the DIRECTORY $(printf '%s ' "${watched_dirs[@]}")but sets no WATCHED_EXEC — a directory outlives the files inside it (\`tests/\` and \`README.md\` keep it resolving), so the decommission probe would report the surface healthy and bump every caller onto a SHA where the scripts it loads are gone. Name the files whose absence breaks a pinned caller at run time"
+    else
+      ok "${file}: watches nothing beyond WATCHED, so no WATCHED_EXEC is owed"
+    fi
+  else
+    exec_bad=""
+    for e in "${exec_entries[@]}"; do
+      if [[ "$(git -C "$REPO_ROOT" ls-files -z -- "$e" | tr -d '\0')" != "$e" ]]; then
+        exec_bad="${exec_bad}${exec_bad:+ }${e}"
+      fi
+    done
+    ALL_EXEC_ENTRIES+=("${exec_entries[@]}")
+    if [[ -n "$exec_bad" ]]; then
+      bad "${file}: WATCHED_EXEC names ${exec_bad} — not a tracked file at this commit. preflight.sh probes each entry for deletion, so this fleet takes the decommission branch on EVERY run: one \`::warning::\`, \`proceed=false\`, a green run, and no caller ever bumped again. Fix the path, or drop the entry if the file was genuinely retired"
+    else
+      ok "${file}: all ${#exec_entries[@]} WATCHED_EXEC entries resolve to tracked files"
+    fi
+
+    # Every entry must also sit UNDER a watched surface. One that does not is
+    # never compared by the staleness test and never triggers this fleet's
+    # `paths:` filter, so it can only ever contribute a freeze — a file outside
+    # the filter can be deleted by a commit that starts no run of this fleet at
+    # all, and the next unrelated run reads that deletion as a decommission.
+    # WATCHED plus every WATCHED_ASSETS entry, whether that entry is a directory
+    # or (hypothetically) a single file — an entry is covered by an exact match or
+    # by sitting under one.
+    surfaces=("$watched")
+    while IFS= read -r a; do [[ -n "$a" ]] && surfaces+=("$a"); done <<<"$assets"
+    stray=""
+    for e in "${exec_entries[@]}"; do
+      covered=""
+      for a in "${surfaces[@]}"; do
+        if [[ "$e" == "$a" || "$e" == "${a}/"* ]]; then covered=1; break; fi
+      done
+      [[ -n "$covered" ]] || stray="${stray}${stray:+ }${e}"
+    done
+    if [[ -n "$stray" ]]; then
+      bad "${file}: WATCHED_EXEC names ${stray}, which is outside WATCHED and every WATCHED_ASSETS entry — nothing compares or triggers on it, so its eventual deletion lands via a commit that starts no run of this fleet and freezes it behind a \`::warning::\` on the next unrelated push. Watch the path, or drop the entry"
+    else
+      ok "${file}: every WATCHED_EXEC entry sits under a watched surface"
+    fi
+  fi
+
   # --- credential ordering ---
   # preflight.sh must decide BEFORE the Cloud Code Bot token is minted, and the
   # token step must be gated on its verdict — otherwise a run that bumps nothing
@@ -369,6 +488,46 @@ ${pathspec_diag}"
   else
     ok "${file}: token is minted only after, and only if, preflight says proceed"
   fi
+
+  # --- the owed-bump probe's three silent dependencies (BE-10008) ---
+  # Before honoring a `Skip-caller-bump: true` trailer, preflight.sh asks whether
+  # this fleet still owes a catch-up bump, by reading its own Actions run history
+  # and keying on a step named EXACTLY $OWED_STEP_NAME — that step is `skipped` on
+  # a declined run and `success` on a real one, which is the entire signal.
+  #
+  # All three of these fail SILENTLY GREEN, which is why they are asserted here
+  # rather than left to convention. Rename the step, drop `actions: read`, or drop
+  # the ambient `GH_TOKEN`, and the probe reads "cannot determine" forever: every
+  # trailered skip on this fleet degrades into a bump. That is the SAFE direction
+  # — status-quo churn, never pin drift — so no run turns red and no caller
+  # breaks. Nothing else in this repo would ever notice the trailer had quietly
+  # stopped working.
+  if [[ -z "$OWED_STEP_NAME" ]]; then
+    bad "${file}: could not read OWED_BUMP_STEP_NAME out of preflight.sh — the step-name contract cannot be checked"
+  elif grep -qxF "      - name: ${OWED_STEP_NAME}" "$path"; then
+    ok "${file}: names its bump step exactly '${OWED_STEP_NAME}'"
+  else
+    bad "${file}: has no step named exactly '${OWED_STEP_NAME}' — preflight.sh's owed-bump probe keys the whole \"did that run really bump?\" question on that name, so renaming it silently degrades every trailered skip on this fleet into a bump"
+  fi
+
+  # Workflow-level `permissions:` only. A job-level block REPLACES it wholesale,
+  # so one that omitted `actions: read` would leave the probe unable to read the
+  # history while this check passed on the top-level grant — assert there is no
+  # second block rather than trying to reconcile two.
+  if grep -q '^    permissions:' "$path"; then
+    bad "${file}: declares a JOB-level permissions: block, which REPLACES the workflow-level one — this check reads only the workflow-level grant, so \`actions: read\` may be silently absent from the job that runs the preflight"
+  elif awk '/^permissions:/{inp=1;next} inp && /^[^ ]/{inp=0} inp && /^  actions: read[ \t]*$/{found=1} END{exit !found}' "$path"; then
+    ok "${file}: grants actions: read for the owed-bump probe"
+  else
+    bad "${file}: does not grant \`actions: read\` — the owed-bump probe cannot list this fleet's runs, so it reads every trailered push as indeterminate and bumps anyway"
+  fi
+
+  gh_token="$(parse_preflight_env "$path" GH_TOKEN)"
+  if [[ "$gh_token" == *'github.token'* ]]; then
+    ok "${file}: wires the ambient github.token into the Preflight step"
+  else
+    bad "${file}: the Preflight step has no \`GH_TOKEN: \${{ github.token }}\` env (parsed '${gh_token}') — the owed-bump probe's \`gh api\` calls would be unauthenticated, so it can never rule out an owed catch-up"
+  fi
 done
 
 # --- parser self-test --------------------------------------------------------
@@ -376,6 +535,14 @@ done
 # parser's REJECTIONS are unexercised there — and a parser that reads a shape
 # differently from preflight.sh is exactly how this test would certify a config
 # the runtime misparses. These fixtures pin the divergences that matter.
+echo
+echo "== owed-bump step-name constant =="
+if [[ -n "$OWED_STEP_NAME" ]]; then
+  ok "preflight.sh defines OWED_BUMP_STEP_NAME ('${OWED_STEP_NAME}')"
+else
+  bad "preflight.sh no longer defines a single-quoted OWED_BUMP_STEP_NAME — the per-fleet step-name contract above degraded to a no-op"
+fi
+
 echo
 echo "== parser self-test =="
 
@@ -621,6 +788,133 @@ if [[ -z "$got_empty" ]]; then
 else
   bad "pathspecs: an absent WATCHED_PATHSPECS parsed as '${got_empty}' — the \`!\`-without-pathspecs freeze guard would never fire"
 fi
+
+# --- WATCHED_EXEC list self-test ---------------------------------------------
+# Every real entrypoint writes a comment-free block, so the loop above only ever
+# walks parse_exec_list' pass-through path. What these fixtures pin is the ONE
+# place it must diverge from the WATCHED_ASSETS parser sitting next to it — and
+# the divergence is not symmetric, so getting it backwards fails in a different
+# direction on each input.
+echo
+echo "== WATCHED_EXEC list self-test =="
+
+exec_case() { # $1 = case name, $2 = raw value, $3 = expected entries
+  local got
+  got="$(parse_exec_list "$2")"
+  if [[ "$got" == "$3" ]]; then
+    ok "exec: $1"
+  else
+    bad "exec: $1 — got '$(echo "$got" | tr '\n' ' ')', want '$(echo "$3" | tr '\n' ' ')'"
+  fi
+}
+
+# The shape every fleet actually uses.
+exec_case 'a plain list passes through' \
+'.github/workflows/groom.yml
+.github/groom/ledger.py' \
+'.github/workflows/groom.yml
+.github/groom/ledger.py'
+
+# THE divergence. preflight.sh drops a whole-line `#` from WATCHED_EXEC, so a
+# commented list is a config the runtime accepts — reading it the strict
+# WATCHED_ASSETS way would fail this test on a correct fleet, and the annotation
+# would point at a "path" that is really a comment.
+exec_case 'a whole-line # comment is dropped, as split_lines drops it' \
+'# the briefs, loaded from the pinned ref
+.github/groom/finder.md
+  # indented, still a comment
+.github/groom/verifier.md' \
+'.github/groom/finder.md
+.github/groom/verifier.md'
+
+# ...and only a WHOLE-LINE one. `#` is a legal filename character, and
+# split_lines leaves a trailing one alone, so an entry carrying one is a real
+# path that still has to resolve. Dropping the tail here would hide a genuinely
+# unresolvable entry behind a green run — the freeze this check exists to catch.
+exec_case 'a trailing # is part of the path, not a comment' \
+'.github/groom/ledger.py # not a comment' \
+'.github/groom/ledger.py # not a comment'
+
+# Blank lines are noise in a block scalar, never an entry: an empty string would
+# resolve to nothing and read as a permanent decommission.
+exec_case 'blank lines are not entries' \
+'.github/groom/ledger.py
+
+.github/groom/scope.py' \
+'.github/groom/ledger.py
+.github/groom/scope.py'
+
+# An absent WATCHED_EXEC must parse as NO entries — that is what routes the three
+# WATCHED-only fleets to the "no WATCHED_EXEC is owed" branch instead of failing
+# them, and what makes the owed-WATCHED_EXEC check above fire for a directory
+# fleet that sets none.
+exec_case 'an absent value yields no entries' '' ''
+
+
+# --- this suite's OWN trigger must cover the tree it reads --------------------
+# The WATCHED_EXEC check above asserts a property of the REPO TREE, not just of
+# the entrypoints — so it is only worth anything if it runs on the PR that breaks
+# it. A `paths:` filter listing only `bump-*-callers.yml` would leave the commit
+# that renames `.github/groom/scope.py` (and forgets the list) untested: the
+# guard would first speak on some unrelated later PR, long after the fleet had
+# frozen. test-bump-callers.yml therefore watches `.github/**` and `scripts/**`
+# rather than the watched surfaces one by one, because an enumeration of those is
+# a roster and a roster copied into a filter drifts. That breadth is an
+# ASSUMPTION about where this repo keeps its assets, and this is the check that
+# stops it going stale: a fleet that ever watches a path outside those trees
+# fails here rather than quietly losing its trigger.
+echo
+echo "== this suite's trigger covers the paths it reads =="
+
+self_filter=()
+while IFS= read -r line; do
+  [[ -n "$line" ]] && self_filter+=("$line")
+done < <(parse_push_paths "${WORKFLOWS}/test-bump-callers.yml")
+if (( ${#self_filter[@]} == 0 )); then
+  bad "test-bump-callers.yml: parsed NO push paths: entries — this check would pass vacuously"
+else
+  # Two fleets legitimately list the same file (pr-risk and pr-derisk both run
+  # the graders), so de-duplicate — otherwise both the count and any failure
+  # message repeat it.
+  exec_uniq=()
+  while IFS= read -r e; do
+    [[ -n "$e" ]] && exec_uniq+=("$e")
+  done < <(printf '%s\n' ${ALL_EXEC_ENTRIES[@]+"${ALL_EXEC_ENTRIES[@]}"} | LC_ALL=C sort -u)
+  uncovered=()
+  for e in ${exec_uniq[@]+"${exec_uniq[@]}"}; do
+    hit=""
+    for pat in "${self_filter[@]}"; do
+      # Unquoted RHS so the filter entry is used as a GLOB. An Actions filter's
+      # `*` does not cross `/` while bash's does, which makes this check
+      # slightly PERMISSIVE — acceptable in this direction, since every entry it
+      # passes on a `**` prefix (the only shape used here) is genuinely covered.
+      # shellcheck disable=SC2053
+      if [[ "$e" == $pat ]]; then hit=1; break; fi
+    done
+    [[ -n "$hit" ]] || uncovered+=("$e")
+  done
+  if (( ${#uncovered[@]} > 0 )); then
+    # A narrowed filter leaves whole trees uncovered at once, so report a sample
+    # plus the count rather than fifty paths.
+    bad "test-bump-callers.yml's \`paths:\` filter selects none of ${#uncovered[@]} WATCHED_EXEC paths, e.g. $(printf '%s ' "${uncovered[@]:0:4}")— a commit renaming or retiring one of those starts no run of this suite, so the WATCHED_EXEC check above cannot catch the list going stale and the fleet freezes silently. Add the tree to BOTH \`paths:\` lists in that workflow"
+  else
+    ok "test-bump-callers.yml triggers on all ${#exec_uniq[@]} distinct WATCHED_EXEC paths"
+  fi
+
+  # The file's own header says the two lists are duplicated on purpose and must
+  # stay identical — only the `pull_request` one is parsed above, so the `push`
+  # one could drift out from under this check unnoticed.
+  pr_block="$(awk '/^  pull_request:/{p=1;next} p&&/^  [a-z_]+:/{exit} p&&/^      - /{sub(/^[ \t]+/,"");print}' "${WORKFLOWS}/test-bump-callers.yml")"
+  push_block="$(awk '/^  push:/{p=1;next} p&&/^  [a-z_]+:/{exit} p&&/^      - /{sub(/^[ \t]+/,"");print}' "${WORKFLOWS}/test-bump-callers.yml")"
+  if [[ -n "$pr_block" && "$pr_block" == "$push_block" ]]; then
+    ok "test-bump-callers.yml's pull_request and push paths: lists are identical"
+  else
+    bad "test-bump-callers.yml's pull_request and push \`paths:\` lists differ — its header requires them identical, and the coverage check above reads only the push one, so the other could silently stop firing
+        pull_request: $(echo "$pr_block" | tr '\n' ' ')
+        push:         $(echo "$push_block" | tr '\n' ' ')"
+  fi
+fi
+
 
 echo
 echo "== ${PASS} passed, ${FAIL} failed =="

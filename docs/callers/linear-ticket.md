@@ -117,6 +117,8 @@ jobs:
       #                              # team scoping — a restricted list fails cross-team PRs
       # exempt-label: linear-exempt  # optional; empty disables exemption
       # exempt-actors: dependabot[bot],renovate[bot]  # optional; bot PRs skip the check
+      # exempt-paths: infrastructure/dynamicconfig/**  # optional; a PR whose changed files
+      #                              # ALL match is exempt. Empty disables it.
       # require-open-issue: true     # default
       enforce: false                 # WARN-ONLY during rollout; flip to true when ready
       # soft-fail: true              # default; warn-only still shows a RED (non-blocking)
@@ -154,9 +156,80 @@ job-level detail.
 | `team-keys` | `''` | Comma-separated allow-list matched against the resolved issue's API `team.key`, never an identifier prefix. **Leave empty (recommended)** unless a repo genuinely wants team scoping — a restricted list fails a cross-team PR on first contact. Malformed or duplicate entries fail the run. |
 | `exempt-label` | `''` | Single label that waives the requirement (recommended `linear-exempt`). Empty disables exemption. |
 | `exempt-actors` | `''` | Comma-separated PR-author logins whose PRs skip the check without a label (e.g. `dependabot[bot],renovate[bot]`) — the non-manual hatch for bot PRs that never carry a ticket. Opt-in; empty means no bypass. Listing an actor means **all** of its PRs merge without a Linear ticket, so keep it to trusted automation accounts. |
+| `exempt-paths` | `''` | Comma-separated path patterns. A PR is exempt when **every** changed file matches at least one pattern — one config file plus one code file is **not** exempt. The hatch for config-only chores (dynamic-config flips, version syncs) that arrive from many different authors, where `exempt-label` is manual per-PR and `exempt-actors` would waive the gate on all of that account's real work too. Empty (the default) disables it. Only `*` (does not cross `/`) and `**` (crosses `/`) are wildcards; everything else is literal. `!` negation and empty, duplicate, absolute or `..` entries fail the run. See [Why `exempt-paths` is an in-validator exemption](#why-exempt-paths-is-an-in-validator-exemption-and-not-a-paths-ignore-filter). |
 | `require-open-issue` | `true` | Reject a linked issue whose Linear `state.type` is `completed`/`canceled`. `backlog`/`unstarted`/`started`/`triage` pass. |
 | `enforce` | `true` | `false` is warn-only: a failing **verdict** never exits the job nonzero. `soft-fail` decides how loudly it is reported; the diagnosis is identical either way. Warn-only is not a promise the job always exits `0` — a broken *run* still does (a failed terminal status write, a missing token/repo, malformed `team-keys`, a non-`pull_request` trigger). |
 | `soft-fail` | `true` | Warn-only only (ignored when `enforce: true`). `true` publishes a **red `failure`** status, so the PR's check list shows the check failing — loud, but non-blocking for as long as `Linear ticket` is not a required status in your ruleset. `false` restores the silent variant (warn-only publishes `success`; only the summary and comment carry the verdict). **Do not** require the `Linear ticket` context while `enforce: false` — required + soft-fail would block merges. |
+
+## Why `exempt-paths` is an in-validator exemption and not a `paths-ignore` filter
+
+The obvious way to stop a check running on config-only PRs is a `paths-ignore:` on the caller's
+**signal** workflow. **Do not do that.** It is the same required-check trap the Gotchas section
+below describes from the other direction.
+
+`Linear ticket` is a commit *status*, and the whole point of the rollout is that your ruleset
+eventually **requires** that context. A `paths-ignore:` stops the signal workflow firing, so the
+validator never runs, so no `Linear ticket` status is ever published for that PR — and a required
+status context that is never published does not "pass by omission". GitHub leaves it **pending
+forever**, which blocks the merge exactly as a failure would, for precisely the PRs you were
+trying to let through. The same reasoning is why an unprotected base branch is the *only* case
+this workflow declines to publish a status at all: those PRs are outside the gate entirely, and
+their base branch is not one your ruleset protects.
+
+So the exemption is decided *inside* the validator, and an exempt PR takes the same
+`finish_exempt()` exit the label and actor hatches take: a **green** `Linear ticket` status, a
+job summary naming the reason, and no marker comment. The status is published, the required
+context is satisfied, and the audit trail says why.
+
+Three more properties worth knowing before you set it:
+
+- **It short-circuits before Linear is queried.** An exempt PR spends no Linear API budget and
+  passes even while Linear is unreachable — same as `exempt-label` and `exempt-actors`.
+- **It costs one extra GitHub API lookup**, `GET /repos/{owner}/{repo}/pulls/{number}/files` —
+  paginated at 100 files per page, so it is *one request per page*, not one request for the
+  whole list (a 250-file PR costs 3 requests; an accepted PR just under the 3000-file cap costs
+  30). That is GitHub-owned metadata, not PR content — nothing is checked out, and the
+  filenames it returns are treated as untrusted data and only pattern-matched. The
+  `pull-requests: write` you already grant covers it; no new permission is needed.
+- **It fails closed when the file list cannot be trusted.** That endpoint caps at **3000 files**
+  and truncates *silently*, so a PR at or past the cap — or any failed/malformed read — reports
+  a red `Could not verify — the PR's changed-file list is unreadable`, rather than declaring a
+  partial list fully matched. In practice this means a >3000-file PR in a repo that sets
+  `exempt-paths` fails the check as an infrastructure error even if it carries a perfectly good
+  linked ticket; that is deliberate (a run must not publish a verdict it did not reach), and it
+  is one more reason not to set `exempt-paths` in a repo that does not need it.
+
+### Pattern grammar
+
+A deliberate **subset** of GitHub's filter-pattern grammar, small enough to read at a glance:
+
+| | |
+|---|---|
+| `**` | zero or more of any character, **including** `/` |
+| `*` | zero or more characters, **excluding** `/` |
+| everything else | literal — `?`, `[]`, `+` and `.` match themselves |
+
+GitHub's own `paths:` grammar additionally reads `?` and `+` as postfix *quantifiers* on the
+preceding character, which is the opposite of what shell-glob habits expect. A half-remembered
+quantifier inside a merge-gate waiver is how a pattern quietly matches more than its author
+meant, so those are literal here instead. Every limitation of this grammar under-matches, and
+under-matching leaves the ticket requirement **in force** — the safe direction.
+
+Two consequences:
+
+- `**` is translated positionally, so `a/**/b.yaml` requires both slashes literally and does
+  **not** match `a/b.yaml`. For a directory exemption write `a/**`, which is what you want.
+- `infrastructure/dynamicconfig/**` does not match `infrastructure/dynamicconfig-backup/x.yaml`
+  (the `/` before `**` is literal) and does not match the bare directory path either.
+
+A **rename** contributes both its new path and its `previous_filename`, so moving a code file
+into an exempted directory does not buy the exemption. A PR with **zero** changed files is never
+exempt — "every file matches" must not be vacuously true on an empty or fully-reverted branch.
+
+> [!WARNING]
+> Nothing stops you writing `exempt-paths: **`, and nothing will tell you afterwards: it matches
+> every path, so **every** PR reports green and the gate is off while still looking configured.
+> Scope patterns to the directory the ticket-less chores actually live in.
 
 ## Upgrading an existing `enforce: false` caller
 
@@ -214,7 +287,11 @@ skewed apart, so an older `linear-ticket.yml` is running newer scripts — is tr
    `repository_dispatch` driven by a Linear webhook — not a larger retry budget — and is a
    deliberate v2 follow-up, out of scope here.
 4. Decide bot-PR handling: set `exempt-actors` (e.g. `dependabot[bot],renovate[bot]`) so
-   dependency PRs pass without hand-labelling each one.
+   dependency PRs pass without hand-labelling each one. If the warn-only week also surfaces a
+   recurring stream of ticket-less **config-only** chores from *many different authors* — the
+   case `exempt-actors` cannot express without waiving the gate on all of those accounts' real
+   work — set `exempt-paths` for the directory those chores live in, and confirm one such PR
+   shows a green `Linear ticket` naming the exemption before you move on.
 5. Flip `enforce: true`. Leave the check non-required for a short window — the PR-visible
    result is unchanged from the soft-fail pilot; what changes is that the validator's own run
    now goes red too, so a systemic breakage is visible in the Actions tab.

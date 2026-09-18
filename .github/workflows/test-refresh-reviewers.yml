@@ -5,17 +5,29 @@ name: Test refresh-reviewers generator
 # generator proposes every consumer repo's reviewer map, so a scoring or
 # rewrite regression silently corrupts routing everywhere — cheap to guard
 # with a unit run on change.
+#
+# The filters below deliberately reach OUTSIDE this directory for
+# .github/assign-reviewers/parser-corpus.json, the fixture both parser ports
+# are driven from. test-assign-reviewers.yml watches it via
+# `.github/assign-reviewers/**`, so editing the corpus runs BOTH suites and a
+# case retuned to satisfy one port alone cannot land green.
 
 on:
   pull_request:
     paths:
       - '.github/refresh-reviewers/**'
+      - '.github/workflows/refresh-reviewers.yml'
       - '.github/workflows/test-refresh-reviewers.yml'
+      - '.github/assign-reviewers/parser-corpus.json'
+      - 'docs/callers/refresh-reviewers.md'
   push:
     branches: [main]
     paths:
       - '.github/refresh-reviewers/**'
+      - '.github/workflows/refresh-reviewers.yml'
       - '.github/workflows/test-refresh-reviewers.yml'
+      - '.github/assign-reviewers/parser-corpus.json'
+      - 'docs/callers/refresh-reviewers.md'
 
 permissions:
   contents: read
@@ -26,12 +38,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v7.0.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
 

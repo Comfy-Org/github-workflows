@@ -21,10 +21,45 @@
 #       [--ro-file <path> ...] [--env KEY=VALUE ...] [--uds <host-socket-path>] \
 #       -- <command...>
 #
+#   agent-sandbox.sh --preflight-only
+#
+#   agent-sandbox.sh --validate-only --clone <path> --clone-mode ro|rw-git-ro \
+#       --out-dir <path> [--ro-file <path> ...] [--env KEY=VALUE ...] \
+#       [--uds <host-socket-path>]
+#
 #   --uds bind-mounts a host-side listening unix socket (the broker) to the fixed
 #   in-jail path /run/broker.sock (read-only: connect(2) to a socket works under a
 #   read-only bind, but the jail can't chmod/replace the shared inode).
 #   Omit it for a fully offline jail.
+#
+#   --preflight-only runs ONLY preflight() — the (mutating) sandbox bring-up
+#   (install bubblewrap, the AppArmor profile, the sysctl fallback) — then exits:
+#   0 if a working bwrap sandbox is now usable, non-zero if it cannot be
+#   established. It takes NO --clone/--out-dir/-- <command>. It exists so the groom
+#   jobs can do the bring-up in a step SEPARATE from `Run <agent>` (BE-14756): a
+#   bring-up failure then fails that preflight step and NEVER reaches the billed
+#   agent step, so interval.py does not miscount a no-spend setup failure as a
+#   spent audit. preflight() is idempotent (fast path returns instantly when the
+#   sandbox is already usable), so the real `Run <agent>` step's own preflight is
+#   then a no-op.
+#
+#   --validate-only is the second half of that split (BE-14771). It takes the SAME
+#   arguments a real run does and walks the SAME code path — argument validation,
+#   the absolute-path checks, the --uds `-S` + live-broker healthz probe, the
+#   clone/out-dir existence + overlap check, preflight(), and the whole bwrap_args
+#   assembly with its embedded `--env KEY=VALUE`, `rw-git-ro` `.git`-pointer and
+#   `--ro-file` absolute-path + existence guards — then stops at the single exec
+#   point instead of exec'ing bwrap, printing `validate-only: all pre-exec guards passed` and
+#   exiting 0. Every one of those guards is no-spend and fail-loud, but on a real
+#   run they die INSIDE the billed `Run <agent>` step, which interval.py then reads
+#   as a started (spent) audit and advances the cadence clock for a run that billed
+#   nothing (BE-4814). Hoisting them into the same separate step as the bring-up
+#   moves that failure off the billed step's name. It takes NO `-- <command>`:
+#   nothing is ever executed, and rejecting one keeps a stray `--validate-only` on
+#   a real agent step from becoming a green no-op that runs no agent. Walking the
+#   REAL path (rather than a re-implementation of the checks) is the point — a
+#   parallel copy would drift, and a guard it missed would still kill `Run <agent>`
+#   no-spend.
 #
 # The preflight FAILS LOUD: if a working bwrap sandbox cannot be established on
 # this runner image, the script exits non-zero and the command is NEVER run. It
@@ -53,6 +88,42 @@ selftest() {
 		true 2>/dev/null
 }
 
+# Probe the broker's /healthz over the host-side unix socket at $1, proving a
+# process is actually LISTENING (a socket left behind by a crashed broker passes
+# `-S` but gets ECONNREFUSED here). Returns 0 = live, 1 = probe failed, 2 = no
+# probe tool on this host. curl is preferred; python3 is the fallback so a
+# curl-less host still gets the real check instead of a silent skip (both are
+# present on the runner images, and the test suite already requires python3).
+# Writes nothing to stdout — this script's stdout is the agent's exec JSON.
+broker_healthz() {
+	local sock="$1"
+	if command -v curl >/dev/null 2>&1; then
+		if curl -fsS --max-time 5 --unix-socket "$sock" http://broker/healthz >/dev/null 2>&1; then
+			return 0
+		fi
+		return 1
+	fi
+	if command -v python3 >/dev/null 2>&1; then
+		# Same question curl -f answers: does a listener accept the connection and
+		# answer /healthz with a non-error status (< 400)?
+		if python3 - "$sock" >/dev/null 2>&1 <<-'PY'
+			import socket, sys
+
+			s = socket.socket(socket.AF_UNIX)
+			s.settimeout(5)
+			s.connect(sys.argv[1])
+			s.sendall(b"GET /healthz HTTP/1.0\r\nHost: broker\r\nConnection: close\r\n\r\n")
+			parts = s.recv(256).split(b"\r\n", 1)[0].split()
+			sys.exit(0 if len(parts) >= 2 and parts[0].startswith(b"HTTP/1.") and parts[1].isdigit() and int(parts[1]) < 400 else 1)
+		PY
+		then
+			return 0
+		fi
+		return 1
+	fi
+	return 2
+}
+
 # Establish a working unprivileged-userns bwrap sandbox or exit non-zero. Mirrors
 # the runner image's own podman AppArmor workaround
 # (actions/runner-images: images/ubuntu/scripts/build/install-container-tools.sh):
@@ -60,13 +131,19 @@ selftest() {
 # the unprivileged user namespaces bwrap needs unless an unconfined AppArmor
 # profile is installed for /usr/bin/bwrap.
 preflight() {
+	# Everything here goes to STDERR, never stdout: the caller captures this
+	# script's stdout as the agent's exec JSON (see the exec comment below), and
+	# `apt-get`/`apparmor_parser`/`sysctl`/`::error::` chatter on stdout would be
+	# prepended to that JSON, breaking the downstream `jq -e .` guard so the
+	# diagnostics artifact is silently never written. Workflow `::` commands are
+	# honoured on stderr too, so the fail-loud annotation still surfaces.
 	# Fast path: already usable, do nothing (keeps repeated invocations quiet).
 	if command -v bwrap >/dev/null 2>&1 && selftest; then
 		return 0
 	fi
 
 	if ! command -v bwrap >/dev/null 2>&1; then
-		sudo apt-get install -y bubblewrap
+		sudo apt-get install -y bubblewrap >&2
 	fi
 
 	local restrict=/proc/sys/kernel/apparmor_restrict_unprivileged_userns
@@ -79,7 +156,7 @@ profile bwrap /usr/bin/bwrap flags=(unconfined) {
   include if exists <local/bwrap>
 }
 PROFILE
-		sudo apparmor_parser -r -W /etc/apparmor.d/bwrap || true
+		sudo apparmor_parser -r -W /etc/apparmor.d/bwrap >&2 || true
 	fi
 
 	if selftest; then
@@ -87,17 +164,17 @@ PROFILE
 	fi
 
 	# Last resort: drop the unprivileged-userns restriction outright and retest.
-	sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+	sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 >&2 || true
 	if selftest; then
 		return 0
 	fi
 
-	echo "::error::bwrap sandbox unavailable on this runner image — refusing to run the agent unsandboxed"
+	echo "::error::bwrap sandbox unavailable on this runner image — refusing to run the agent unsandboxed" >&2
 	exit 1
 }
 
 main() {
-	local clone="" clone_mode="" out_dir="" uds=""
+	local clone="" clone_mode="" out_dir="" uds="" preflight_only="" validate_only=""
 	local ro_files=() envs=() cmd=()
 
 	while [[ $# -gt 0 ]]; do
@@ -108,14 +185,53 @@ main() {
 			--ro-file) [[ $# -ge 2 ]] || die "--ro-file needs a value"; ro_files+=("$2"); shift 2 ;;
 			--env) [[ $# -ge 2 ]] || die "--env needs a value"; envs+=("$2"); shift 2 ;;
 			--uds) [[ $# -ge 2 ]] || die "--uds needs a value"; [[ -n "$2" ]] || die "--uds needs a non-empty value"; [[ -z "$uds" ]] || die "--uds may be given at most once"; uds="$2"; shift 2 ;;
+			--preflight-only) preflight_only=1; shift ;;
+			--validate-only) validate_only=1; shift ;;
 			--) shift; cmd=("$@"); break ;;
 			*) die "unknown argument: $1" ;;
 		esac
 	done
 
+	# The two pre-agent-step modes are mutually exclusive: --preflight-only takes NO
+	# execution-mode arguments and --validate-only requires the full set, so the
+	# combination cannot mean anything. Reject it instead of letting the
+	# --preflight-only branch below win and silently skip the validation the caller
+	# asked for — a green no-op where a caller expected a check is exactly the
+	# failure mode both of these modes exist to prevent.
+	[[ -z "$preflight_only" || -z "$validate_only" ]] \
+		|| die "--preflight-only and --validate-only are mutually exclusive"
+
+	# --preflight-only: run ONLY the (mutating) sandbox bring-up and report whether
+	# a working jail is now available (BE-14756). It takes NO clone/clone-mode/
+	# out-dir/uds/ro-file/env and NO `-- <command>`; combining it with any of those
+	# is a copy-paste mistake — a stray `--preflight-only` on a real agent step
+	# would otherwise silently discard the clone/out-dir/command and exit 0 having
+	# run no agent, the opposite of this mode's contract. Every other bad flag
+	# combination here dies loudly, so die here too instead of short-circuiting
+	# past every validation. preflight() fails loud itself when the sandbox cannot
+	# be established; `|| exit $?` keeps that structural even if preflight() is ever
+	# refactored to RETURN non-zero rather than terminate the process.
+	if [[ -n "$preflight_only" ]]; then
+		[[ -z "$clone" && -z "$clone_mode" && -z "$out_dir" && -z "$uds" \
+			&& ${#ro_files[@]} -eq 0 && ${#envs[@]} -eq 0 && ${#cmd[@]} -eq 0 ]] \
+			|| die "--preflight-only takes no --clone/--clone-mode/--out-dir/--uds/--ro-file/--env and no -- <command>"
+		preflight || exit $?
+		exit 0
+	fi
+
 	[[ -n "$clone" ]] || die "--clone is required"
 	[[ -n "$out_dir" ]] || die "--out-dir is required"
-	[[ ${#cmd[@]} -gt 0 ]] || die "a -- <command...> is required"
+	if [[ -n "$validate_only" ]]; then
+		# Nothing is ever executed under --validate-only, so a `-- <command>` here
+		# is meaningless. Rejecting it (rather than accepting and ignoring it) is
+		# what keeps a stray --validate-only on a real agent step LOUD: it dies
+		# instead of exiting 0 having silently discarded the agent invocation.
+		# Same misuse-guard posture as --preflight-only above.
+		[[ ${#cmd[@]} -eq 0 ]] \
+			|| die "--validate-only takes no -- <command...>: nothing is executed, so drop the command"
+	else
+		[[ ${#cmd[@]} -gt 0 ]] || die "a -- <command...> is required"
+	fi
 	# bwrap binds each of these at its REAL path; a relative value would resolve
 	# against an unexpected CWD instead of failing loud, so require absolute paths.
 	[[ "$clone" = /* ]] || die "--clone must be an absolute path (got '$clone')"
@@ -135,11 +251,25 @@ main() {
 		# listening — a stale socket from a crashed broker would pass -S yet the
 		# in-jail connect() then fails at runtime, breaking the fail-loud-before-
 		# running guarantee. Probe /healthz over the socket to confirm a live
-		# listener (best-effort: only when curl is present, matching the tests).
-		if command -v curl >/dev/null 2>&1; then
-			curl -fsS --max-time 5 --unix-socket "$uds" http://broker/healthz >/dev/null 2>&1 \
-				|| die "--uds socket has no live broker listening (healthz probe failed): $uds"
-		fi
+		# listener.
+		local probe_rc=0
+		broker_healthz "$uds" || probe_rc=$?
+		case "$probe_rc" in
+			0) ;;
+			1) die "--uds socket has no live broker listening (healthz probe failed): $uds" ;;
+			# No probe tool on this host. Under --validate-only that silently
+			# downgrades the mode's whole promise — the crashed-broker case is the
+			# most plausible live trigger for hoisting these guards off the billed
+			# step, and skipping the probe hands that failure straight back to it.
+			# A validation that cannot validate must say so rather than exit 0. On a
+			# real run, keep the historical best-effort skip: the agent step is about
+			# to run anyway and a spurious die there is the expensive failure.
+			*)
+				[[ -z "$validate_only" ]] \
+					|| die "--validate-only cannot probe the broker: neither curl nor python3 is on PATH (install one, or drop --uds)"
+				echo "agent-sandbox: warning: neither curl nor python3 on PATH; skipping the --uds liveness probe" >&2
+				;;
+		esac
 	fi
 
 	# out-dir must exist on the host before it can be bound rw into the jail; create
@@ -213,6 +343,14 @@ main() {
 	if [[ ${#ro_files[@]} -gt 0 ]]; then
 		for f in "${ro_files[@]}"; do
 			[[ "$f" = /* ]] || die "--ro-file must be an absolute path (got '$f')"
+			# bwrap's --ro-bind (unlike --ro-bind-try) aborts when the SOURCE does
+			# not exist, so a missing brief or jail-shim kills the run either way.
+			# Check it HOST-side — no jail needed, exactly like the `-d` on --clone
+			# and the `-S` on --uds — so --validate-only catches it too. Otherwise
+			# validation passes and the failure lands on the billed `Run <agent>`
+			# step having spent nothing, which is the BE-4814 miscount this whole
+			# split exists to move off that step name.
+			[[ -e "$f" ]] || die "--ro-file does not exist on the host: $f"
 			bwrap_args+=(--ro-bind "$f" "$f")
 		done
 	fi
@@ -231,6 +369,16 @@ main() {
 	fi
 
 	bwrap_args+=(--bind "$out_dir" "$out_dir" --chdir "$clone")
+
+	# THE single exec point, and therefore the single place --validate-only can
+	# branch (BE-14771) and still be sure every pre-exec guard above ran — including
+	# the ones embedded in the bwrap_args assembly just above (`--env KEY=VALUE`,
+	# the rw-git-ro `.git`-pointer check, `--ro-file` absolute paths + existence),
+	# which a validation re-implemented elsewhere would silently skip.
+	if [[ -n "$validate_only" ]]; then
+		echo "validate-only: all pre-exec guards passed"
+		exit 0
+	fi
 
 	# stdout/stderr pass through to the host shell; the caller redirects stdout
 	# on the HOST side to capture any exec JSON out of the agent's reach.

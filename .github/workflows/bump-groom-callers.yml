@@ -66,6 +66,11 @@ on:
 
 permissions:
   contents: read
+  # Read-only, and read by the PREFLIGHT step alone (BE-10008): before it
+  # honors a `Skip-caller-bump: true` trailer, the guard reads this fleet's own
+  # Actions run history to check no earlier watched change is still owed a bump.
+  # It stays well ahead of the org-wide write token minted further down.
+  actions: read
 
 # Serialize runs of this fleet. The bumper pushes to a STABLE branch
 # (ci/bump-groom) shared across runs, so two overlapping runs (a rapid second
@@ -115,6 +120,45 @@ jobs:
           NEW_SHA: ${{ github.sha }}
           WATCHED: .github/workflows/groom.yml
           WATCHED_ASSETS: .github/groom
+          # Every file whose ABSENCE breaks a pinned caller at run time — not just
+          # the entry points. The directory above can never be the decommission
+          # probe on its own: it OUTLIVES the files inside it, since `tests/` and
+          # `README.md` keep it resolving after every asset a groom tick loads has
+          # been deleted.
+          # The three BRIEFS are listed because the test for inclusion is "absence
+          # breaks a pinned caller at run time", NOT "is it an executable" — the
+          # finder, verifier and builder jobs each `open()` their brief out of
+          # $GROOM_ASSETS, i.e. the pinned ref, and a missing one takes the job down
+          # before any agent starts. scope.py is both exec'd and imported as a module
+          # (the brief-substitution step puts $GROOM_ASSETS on sys.path).
+          # package.json is here because the "Load the agent CLI pin" step fails
+          # CLOSED with an `::error::` on a missing manifest. It reads the manifest
+          # from `job.workflow_sha` rather than `workflows_ref` — deliberately, see
+          # groom.yml — but for a SHA-pinned caller that is this same commit, which is
+          # exactly the SHA this fleet is about to pin.
+          # DELIBERATELY ABSENT: key-broker.mjs. broker.mjs is what every agent job
+          # actually starts; no step here loads key-broker.mjs, so listing it would
+          # let its eventual cleanup freeze this fleet behind a `::warning::` — the
+          # false-decommission failure mode.
+          WATCHED_EXEC: |
+            .github/workflows/groom.yml
+            .github/groom/agent-sandbox.sh
+            .github/groom/broker.mjs
+            .github/groom/builder.md
+            .github/groom/config.py
+            .github/groom/finder.md
+            .github/groom/interval.py
+            .github/groom/jail-shim.mjs
+            .github/groom/ledger.py
+            .github/groom/package.json
+            .github/groom/patch_policy.py
+            .github/groom/scope.py
+            .github/groom/verifier.md
+          # Read-only ambient token, for the owed-bump probe's `actions: read`
+          # history lookup only (BE-10008). Never a write credential: the
+          # Cloud Code Bot token is minted after — and only if — this step says
+          # proceed. Absent, the probe reads as "cannot determine" and bumps.
+          GH_TOKEN: ${{ github.token }}
         run: bash .github/bump-callers/preflight.sh
 
       - name: Generate Cloud Code Bot token

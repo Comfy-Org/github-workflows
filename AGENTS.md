@@ -33,7 +33,7 @@ for t in <dir>/tests/*.sh; do bash "$t" || { echo "FAILED: $t"; break; }; done
 (cd scripts/check-pr-size && [ -z "$(gofmt -l .)" ] && go vet ./... && go test ./...)
 
 # Repo-wide lints that take a target rather than a suite:
-python3 .github/workflow-pins/check_workflow_pins.py   # no reusable may default `workflows_ref`
+python3 .github/workflow-pins/check_workflow_pins.py   # `workflows_ref` + every `uses:` SHA
 python3 .github/agents-md-integrity/check_agents_md.py --root .
 # org repo literal allowlist lint (whole tree, not path-filtered) + its shellcheck
 shellcheck -x .github/lint/check-org-repo-literals.sh && bash .github/lint/check-org-repo-literals.sh
@@ -50,8 +50,8 @@ anything there; `.github/workflows/` and `scripts/check-pr-size/` are the except
   multi-model panel + judge). `catalog-drift.py` reads the model pins *out of*
   `cursor-review.yml` — never duplicate that model list.
 - `.github/agents-md-integrity/` + `.github/workflow-pins/` — the two self-checks:
-  this AGENTS.md standard, and the lint forbidding a `default:` on
-  `workflows_ref` / requiring the empty-ref guard at every checkout.
+  this AGENTS.md standard, and the lint forbidding a `default:` on `workflows_ref`,
+  requiring the empty-ref guard at every checkout, and SHA-pinning every `uses:`.
 - `.github/public-repo-hygiene/` — the leak checker + the org-wide known-public
   allowlist it default-denies against. Never make that allowlist a workflow input:
   one a caller can pass is one a PR in that repo can widen.
@@ -103,9 +103,10 @@ a second catalog drifts, and this one already had. Three facts it cannot tell yo
   repo literal whose name is not on `.github/lint/org-repo-allowlist.txt`, so
   publishing a name is an allowlist edit review sees; BARE names stay with review
   (a denylist would leak).
-- **Pin everything by full commit SHA**, with a trailing `# v1` comment — both the
-  `uses:` in callers and every third-party action here. Bare `@v1` fails the
-  pin-validation (`pinact`, `zizmor`) that consumer CI runs.
+- **Pin everything by full commit SHA**, with a trailing `# v1` comment — callers'
+  `uses:` and every third-party action here. Bare `@v1` fails the pin-validation
+  (`pinact`, `zizmor`) consumers run and `check_workflow_pins.py` here (BE-15255);
+  Dependabot only ever narrows a tag to a tag, so it never fixes one for you.
 - **`workflows_ref` is REQUIRED, never given a `default:`** (BE-5546) — a default
   lets a caller SHA-pin `uses:` yet load mutable scripts, and `required:` is
   unenforced for `workflow_call` (omitted → `''` → checkout takes the default
@@ -120,11 +121,16 @@ a second catalog drifts, and this one already had. Three facts it cannot tell yo
   of THIS repo — never from the caller's checkout. That is what makes the
   reviewer/checker tamper-proof: a PR cannot rewrite the logic judging it. The
   self-enrollment callers (`ci-cursor-review.yml`, `ci-assign-reviewers.yml`,
-  `ci-groom.yml`) pin a merged-main SHA rather than a local `./` path for the same
-  reason — do not "simplify" them to a path.
+  `ci-groom.yml`, `ci-agents-md-integrity.yml`) pin a merged-main SHA rather than
+  a local `./` path for the same reason — do not "simplify" them to a path.
 - **One bumper, not several.** `bump-callers.sh` backs every fleet; the thin
   `bump-*-callers.yml` wrappers stay separate only so one reusable's change does not
   bump another fleet. Never fork it — forking is how other shared org machinery drifted.
+- **Comment/docs-only edit inside a watched surface? Add `Skip-caller-bump: true`**
+  as the LAST commit's trailer — only the squashed message's trailing trailer
+  block counts, and it declares the WHOLE PR bump-irrelevant for EVERY fleet.
+  Reviewers must reject it on any PR with behavioral changes; when in doubt,
+  leave it off and let the fleet bump. `workflow_dispatch` overrides a mistake.
 - **Enrolling a caller is TWO steps.** Merge the caller, *and* add the repo to its
   `*_CALLERS` roster secret. Skipping the second is the most repeated mistake here
   — the pin never moves, and it fails at startup much later with no obvious cause.
@@ -138,15 +144,15 @@ a second catalog drifts, and this one already had. Three facts it cannot tell yo
   so a phantom input in the docs is a broken caller for whoever copies it. Check
   `on.workflow_call.inputs` first. **Deleting an input is a docs change too** —
   grep the repo for its name in the same commit. (`cursor-review`'s `blocking:` is
-  the worked example: deleted in #31, its docs outlived it in three places.)
+  the worked example: deleted in #31, docs outlived it in three places; restored by BE-4691.)
 - **Versioning:** semver-style major tags (`v1`, `v2`). Breaking changes bump the
   major; compatible changes move the tag in place — `git tag -f v1 <sha> && git
   push -f origin v1`. Without the push the public tag never moves. That force-move
   is the one sanctioned force-push — NOT license to force-push branches.
-- **This AGENTS.md must satisfy the standard `agents-md-integrity.yml` enforces** —
-  under 200 lines (aim ≤150), `CLAUDE.md` a bare `@AGENTS.md` shim, no
-  `.cursorrules` — but this repo is NOT self-enrolled in that reusable, so no PR
-  check catches a regression. Run `check_agents_md.py --root .` yourself.
+- **This AGENTS.md is itself gated** by the standard `agents-md-integrity.yml`
+  enforces — under 200 lines (aim ≤150), `CLAUDE.md` a bare `@AGENTS.md` shim, no
+  `.cursorrules` — via `ci-agents-md-integrity.yml`, so every PR and push to main
+  runs the check. Locally: `check_agents_md.py --root .`.
 
 ## Deeper docs
 

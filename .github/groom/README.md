@@ -35,7 +35,9 @@ PR to a filed issue: on a same-repo branch push that code executes in
 credentialed CI *before* a human reads the diff (review gates merge, not CI
 exec). The deny-list is the tested [`patch_policy.py`](patch_policy.py) (BE-4404)
 — a conservative default, not a proof of completeness, so read it before setting
-`builder: true` on a repo whose CI runs something else privileged. **Structural
+`builder: true` on a repo whose CI runs something else privileged; that repo adds
+its own privileged paths via the `extra_denied_paths` caller input (BE-4405)
+rather than editing the reusable. **Structural
 limit:** the policy guards privileged-*config* surfaces, but any patch's source
 code still executes when the caller's CI runs its *tests* — a review-gated PR is
 untrusted code running pre-merge. Callers enabling the builder should avoid
@@ -349,8 +351,17 @@ foreign process already holding the port would pass a bare connect check while
 the broker exits with `EADDRINUSE`, and the consumer would then stream prompts
 and repo data (plus the dummy key) to an unrelated listener.
 
-> **groom.yml wiring lands in the sibling ticket (BE-4311)** — this file adds the
-> broker script + its unit tests only; nothing in `groom.yml` calls it yet.
+> **groom.yml wiring:** the loopback-TCP wiring of this proxy (BE-4311: a `Start
+> API key broker` step + `ANTHROPIC_BASE_URL: http://127.0.0.1:8199`) was
+> **superseded by the agent sandbox** (BE-4303 — see "The agent sandbox" below).
+> All three agent jobs now run inside `agent-sandbox.sh` and reach Anthropic
+> through `broker.mjs` over a bind-mounted **unix socket**, bridged by the in-jail
+> `jail-shim.mjs`, with a dummy `ANTHROPIC_API_KEY` — so the real key still never
+> enters the agent step's env, and the jail additionally hides the runner FS and
+> cuts off egress. `key-broker.mjs` remains the standalone loopback proxy described
+> above. The literal-key output scans (`Scan finder output for the model key`, the
+> verifier equivalent, and the builder's `Capture patch` step) stay as defence-in-
+> depth backstops, each holding the real key in its OWN no-agent step env.
 
 ## `interval.py` — the runtime cadence gate (BE-4004)
 
@@ -660,10 +671,32 @@ python3 -m unittest discover -s .github/groom/tests -p 'test_*.py' -v
 
 ## The agent sandbox — `agent-sandbox.sh` + `broker.mjs` (BE-4302)
 
-The auto-builder (phase 3) runs an untrusted agent that writes code. These two
-trusted assets confine that agent so a prompt-injected or misbehaving run cannot
-read the runner's secrets, touch anything outside its clone, or exfiltrate the
-API key — while still letting it edit its worktree and reach Anthropic.
+Every groom phase that runs a model on untrusted repo content — the **finder**,
+the **verifier**, and each **builder** matrix cell — runs ONLY inside these
+trusted assets (wired into `groom.yml` by BE-4303; before that the three agent
+steps used a hand-rolled `chmod`/`env -u` scrub with the real key in the step
+env). They confine the agent so a prompt-injected or misbehaving run cannot read
+the runner's secrets, touch anything outside its clone, or exfiltrate the API key
+— while still letting the builder edit its worktree and letting all three reach
+Anthropic. **This jail is the gate that had been blocking groom on
+untrusted-contributor repos:** with the real key structurally out of the agent's
+reach and the filesystem/network confined, an outside contributor's PR content is
+just untrusted data the agent analyzes, never a path to the runner's credentials.
+
+How `groom.yml` composes them per agent job: a **broker step** (the only step
+holding `secrets.ANTHROPIC_API_KEY`) starts `broker.mjs` on the host socket
+`$BROKER_SOCK` and waits for its `/healthz`; a **"Preflight the sandbox" step**
+does the whole no-spend setup half (`--preflight-only` then `--validate-only`, see
+below); the **agent step** — carrying NO real key — runs `agent-sandbox.sh --uds "$BROKER_SOCK"` with the brief (and, for the
+builder, the finding JSON) passed `--ro-file`, every output under the one rw
+`--out-dir` (`$GROOM_OUT_DIR`), and a `bash -c` wrapper that brings up the in-jail
+`jail-shim.mjs` before `exec`ing the pinned `claude` CLI with a DUMMY key and
+`ANTHROPIC_BASE_URL` pointed at the shim; a **scan step** (finder/verifier) or the
+**capture step** (builder) re-checks the model-authored output for the literal key
+as a regression tripwire; and an `always()` **cleanup step** kills the broker. The
+finder/verifier bind the clone `ro`; the builder binds it `rw-git-ro` so its
+worktree edits land on the host for the patch-capture step while `.git` stays
+read-only.
 
 - **[`agent-sandbox.sh`](agent-sandbox.sh)** — a [bubblewrap](https://github.com/containers/bubblewrap)
   (`bwrap`) wrapper that runs an arbitrary command inside an unprivileged jail:
@@ -672,7 +705,14 @@ API key — while still letting it edit its worktree and reach Anthropic.
   agent-sandbox.sh --clone <path> --clone-mode ro|rw-git-ro --out-dir <path> \
       [--ro-file <path> ...] [--env KEY=VALUE ...] [--uds <host-socket-path>] \
       -- <command...>
+
+  agent-sandbox.sh --preflight-only          # bring-up only, no command
+  agent-sandbox.sh --validate-only <same args as a real run, minus the command>
   ```
+
+  The two extra modes are the *pre-agent-step split* described under
+  [the no-spend pre-agent split](#the-no-spend-pre-agent-split) below;
+  both take no `-- <command>` and neither ever starts the agent.
 
 - **[`broker.mjs`](broker.mjs)** — a ~50-line node-stdlib reverse proxy
   (`node broker.mjs <port|socket-path>`) that holds the real key on the host and
@@ -716,12 +756,29 @@ request-handling contract is identical on both transports.
 with only loopback up, so the broker — reached over the unix socket bind-mounted
 at `/run/broker.sock` via the in-jail `jail-shim.mjs` TCP→UDS forwarder — is the
 *only* thing the agent can talk to. Host network, host loopback services, and
-cloud metadata (`169.254.169.254` / `168.63.129.16`) are all unreachable. Two
-consequences for callers: set `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` in the
-agent env so the agent doesn't stall on telemetry endpoints that can never be
-reached; and because there is no egress, in-jail `git fetch` / `npm install`
-cannot work — anything the agent needs must already be in the clone before it is
-sandboxed.
+cloud metadata (`169.254.169.254` / `168.63.129.16`) are all unreachable. So is
+**name resolution**, and twice over. First, the jail is in its own network
+namespace with no route off-box at all — one interface (`lo`), no IPv4 or IPv6
+default route — so nothing outside the jail is reachable, including any
+nameserver on another host. Second, on a systemd-resolved runner `/etc/resolv.conf` is a symlink into
+`/run` — which the jail mounts `/etc` but deliberately not — so no `nameserver`
+line is readable and glibc falls back to the local machine (`127.0.0.1`, per
+resolv.conf(5)). That fallback *is* configured and routable: the jail's own `lo`
+carries all of `127.0.0.0/8`. Lookups fail because nothing is listening on the
+jail's `127.0.0.1:53`. Note that the runner's stub resolver address
+`127.0.0.53` is inside that same `127.0.0.0/8` the jail's `lo` carries, so it too
+is *routable* inside the jail and fails only for want of a listener — which is
+worth knowing concretely, because the jail already runs in-jail loopback
+listeners (`jail-shim.mjs` on `127.0.0.1:8790`), so a future in-jail bind to
+`127.0.0.1:53` or `127.0.0.53:53` would silently become the agent's resolver.
+Either way, a hostname the read-only `/etc/hosts` does not already answer cannot
+be resolved.
+
+Two consequences for callers: set `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
+in the agent env so the agent doesn't stall on telemetry endpoints that can
+never be reached; and because there is no egress, in-jail `git fetch` / `npm
+install` cannot work — anything the agent needs must already be in the clone
+before it is sandboxed.
 
 ### The loud-preflight guarantee
 
@@ -735,6 +792,63 @@ it drops the userns restriction and retests; if it *still* fails it emits
 `::error::bwrap sandbox unavailable …` and exits non-zero. A broken sandbox stops
 the run — it never silently degrades to no sandbox.
 
+### The no-spend pre-agent split
+
+Everything `agent-sandbox.sh` does *before* `exec bwrap` is no-spend: the sandbox
+bring-up above, and then a wall of fail-loud guards (required/absolute-path
+argument validation, the `--uds` `-S` check plus a live-broker `/healthz` probe,
+clone and out-dir existence, the out-dir↔clone overlap check, and the `--env
+KEY=VALUE` / `rw-git-ro` `.git` / `--ro-file` absolute-path-and-existence checks
+inside the mount assembly). Every one of them is answerable host-side, with no
+jail — `--ro-file` included: `--ro-bind` (unlike `--ro-bind-try`) aborts on a
+missing source, so an absent brief or jail-shim would otherwise sail through
+validation and kill the billed step, which is the whole miscount in miniature.
+Run from inside the billed `Run <agent>` step, any of them failing leaves that
+step `failure` having billed nothing — and
+[`interval.py`](interval.py)'s exact-name match then reads the agent as *started*,
+so `run_audited` counts a spent audit and advances the `GROOM_INTERVAL_DAYS`
+cadence clock for a run that spent nothing (BE-4814). The most plausible live
+trigger: the broker dies between its step and the agent step, leaving a stale
+socket that passes `-S` and fails `/healthz`. That probe runs over `curl`, falling
+back to `python3` — under `--validate-only` a host with neither is a hard failure
+rather than a skipped probe, because a validation that silently cannot validate
+is the green no-op this mode exists to prevent. (A real run keeps the older
+best-effort skip: it is about to run the agent regardless, and a spurious failure
+*there* is the expensive one.)
+
+So both halves run in their own `Preflight the sandbox` step, whose name is
+deliberately DISTINCT from the billed step:
+
+| Mode | Runs | Takes |
+|---|---|---|
+| `--preflight-only` (BE-14756) | ONLY the mutating bring-up | no clone/out-dir/uds/ro-file/env, no `-- command` |
+| `--validate-only` (BE-14771) | the SAME guard path a real run walks, stopping at the single `exec` point | the same arguments as the agent step; no `-- command` |
+
+`--validate-only` deliberately routes through the real code rather than
+re-implementing the checks — a parallel copy would drift, and a guard it missed
+would still kill the billed step no-spend. Both modes reject nonsensical
+combinations loudly (each other, or a `-- command`), so a stray flag on a real
+agent step dies instead of becoming a green no-op that runs no agent.
+
+`--validate-only` walks the *whole* pre-exec path, `preflight()` included — so
+**it is only side-effect-free once the bring-up has already succeeded.** In the
+`Preflight the sandbox` step that is guaranteed (`--preflight-only` ran first, so
+`preflight()` takes its idempotent fast path), and the sole remaining side effect
+is the `mkdir -p` on the out-dir that the real run performs anyway; the agent
+step's own copies of both are then no-ops. Run standalone on a host where the
+sandbox is *not* yet usable, the same call will `sudo apt-get install bubblewrap`,
+write `/etc/apparmor.d/bwrap`, and as a last resort `sudo sysctl -w
+kernel.apparmor_restrict_unprivileged_userns=0` — the bring-up's host-wide
+mutations, from a mode named for validation. Pair it with `--preflight-only`, as
+groom.yml does, or expect the bring-up.
+
+**What this does NOT close:** the window between that step and the agent step. A
+broker that dies *after* the `/healthz` probe — or an input deleted after it is
+checked — still fails the billed step with no spend, and that failure is still
+counted as an audit. Nor can validation reach a mount that `bwrap` itself rejects
+at exec for a source that *does* exist. Proving the agent actually BILLED is
+tracked separately (BE-4850).
+
 ### Tests — deterministic, no API spend
 
 [`tests/sandbox-tests.sh`](tests/sandbox-tests.sh) (run by the `sandbox-tests` job
@@ -745,8 +859,29 @@ broker at a local fake upstream ([`tests/fake-upstream.mjs`](tests/fake-upstream
 *over the bind-mounted unix socket + in-jail `jail-shim.mjs`* to prove key
 injection/stripping, the `/healthz` + non-`/v1` behavior, and SSE pass-through. It
 also proves the BE-4369 egress isolation: host loopback, cloud metadata, and an
-arbitrary external IP are all unreachable from the jail. No `claude`, no API key,
-no spend.
+arbitrary external IP are all unreachable from the jail, and name resolution is
+dead. Every one of those reads a *failure* as the proof, so each is guarded
+against false-passing on a missing tool — the IP-literal checks by asserting
+`curl` is on the jail `PATH` first, the resolution check by asserting exact,
+cause-specific exit codes (`getent` 2 = key not found, `curl` 6 =
+could-not-resolve), which a missing binary's 127 cannot satisfy. The resolution
+check also carries a second assertion on top, because a resolution failure ALONE
+would still pass under a *shared* network namespace (the dangling
+`/etc/resolv.conf` above breaks resolution regardless of routing), and a proof
+that cannot go red is not a proof. That second assertion reads the jail's own
+netns out of `/proc`: first its *identity* (`readlink /proc/self/ns/net` must
+differ from the host's — the one fact that discriminates even on a host whose own
+netns is empty), then its contents (`/proc/net/dev` must list `lo` and nothing
+else, and neither `/proc/net/route` nor `/proc/net/ipv6_route` may carry a default
+route). It deliberately does *not* key on a connect exit code, which could not
+tell an isolated netns from a shared one behind a firewall REJECT or on an offline
+host. Sections 8 and 9 cover the no-spend split: `--preflight-only` exits 0 on a
+usable host and fails loud on a broken `bwrap`, and `--validate-only` exits 0 on
+a real run's arguments *without exec'ing the jail* (a stubbed `bwrap` records
+every invocation, so "did it exec?" is asserted, not assumed) while failing loud
+on a bad argument — including a `--ro-file` that does not exist — and on a
+`-S`-passing socket with no live broker, over curl and over the python3 fallback
+alike. No `claude`, no API key, no spend.
 
 ```bash
 shellcheck -x .github/groom/agent-sandbox.sh .github/groom/tests/sandbox-tests.sh
@@ -766,14 +901,64 @@ common build files across the JS/Python/Rust/Ruby/Swift/Go/Gradle/Bazel/CMake
 ecosystems. Matching is **case-insensitive** — macOS/Windows CI runners resolve
 `PACKAGE.JSON` to the real file, so the Linux checker must too.
 
-- `denied_paths(paths)` returns the CI-privileged subset of the changed paths.
-- `main()` reads NUL-delimited paths from stdin (matching `git diff --cached
-  --name-only -z`) and prints the matches, **exit 0 always** — the caller tests
-  non-emptiness. NUL delimiting is mandatory: git C-quotes exotic paths in its
-  default output, slipping them past the anchors; `-z` emits raw bytes.
+- `denied_paths(paths)` returns the subset of changed paths a human must author
+  — CI-privileged **and** dataset-of-record, undifferentiated (the gate only
+  tests non-emptiness). Do not read membership as "executes in pre-review CI".
+  `denied_entries(entries)` wraps it for `(old_mode, new_mode, path)` raw-diff
+  entries, adding the symlink-mode deny described below.
+- `main()` reads raw diff records from stdin (matching `git diff --cached
+  --no-renames --raw -z`), folds in the caller's `EXTRA_DENIED_PATHS` patterns
+  (below), and prints the denied paths. The happy path is **exit 0** (a no-match
+  is empty output, not a nonzero exit) — the caller tests non-emptiness. The one
+  nonzero exit is fail-closed: an `EXTRA_DENIED_PATHS` pattern that will not
+  compile prints an `::error::` and exits 2, aborting the `set -euo pipefail`
+  capture step so no PR opens until the typo is fixed. Each producer flag is
+  load-bearing. `-z`: git C-quotes exotic paths in its default output, slipping
+  them past the anchors, while `-z` emits raw bytes. `--no-renames`: with rename
+  detection on, a rename reports only its DESTINATION pairing, so a patch MOVING
+  a denied path out to an undenied one would show the policy nothing. `--raw`
+  (not `--name-only`): the raw records carry file MODE bits, which is how
+  `denied_entries` sees symlinks — path shape alone cannot.
 - The list is a conservative **default, not a proof of completeness** — over-block
   is safe (a false positive only downgrades a PR to an issue), under-block is the
-  hole. A repo whose CI runs something else privileged must add it here first.
+  hole. A repo whose CI runs something else privileged adds repo-specific paths
+  via the **`extra_denied_paths`** caller input (BE-4405) — additive-only
+  newline-separated regexes, folded into the deny test with the same semantics,
+  so a caller widens the list without editing this file; propose
+  broadly-applicable ones upstream here so every caller benefits.
+- It also denies **owner-gated dataset-of-record paths** (BE-9609) — `.yml`/`.yaml`
+  files at any depth under a `suites/**/cases/` tree (`**` spanning zero or more
+  segments, so a flat `suites/cases/` layout is inside the surface), plus any
+  change whose final path segment is `cases` under a suite (git tracks no
+  directories, so that shape is a file or a symlink), plus — by MODE, via the
+  `--raw` producer — any symlink-typed change carrying a `suites` segment: a
+  link at any other component the importer's glob traverses (`suites` itself, a
+  suite dir, a non-YAML name inside `cases/`) would silently redirect resolution
+  to an undenied tree. One residual stays open by construction: the policy sees
+  only the builder's diff, so a **pre-existing, human-authored** symlink into an
+  outside tree already extends the importable surface, and a builder file added
+  under that target tree matches nothing — a caller whose dataset surface
+  extends beyond literal `suites/` paths must extend the list (the conservative
+  default rule below). Their merge publishes immutable case versions reserved for the
+  dataset owner. This is the one entry with **no CI-execution justification**, and
+  it is currently hardcoded rather than caller-gated: a caller with an unrelated
+  `…/suites/<x>/cases/*.yaml` fixture tree inherits the deny with no opt-out, and
+  because a path bail is deterministic it recurs every run and re-spends a
+  `max_prs` slot. Over-block is still the safe direction here (the finding is
+  filed as an issue, never dropped) — but if a second consumer needs its own path
+  family, make the class a caller input instead of extending this tuple.
+- **`extra_denied_paths` — the caller-input escape hatch (BE-4405).** groom.yml's
+  `extra_denied_paths` input is threaded to `main()` as the `EXTRA_DENIED_PATHS`
+  env var; `compile_extra_patterns` splits it on newlines (blank/whitespace lines
+  skipped, each surviving line `.strip()`-ed and compiled `re.IGNORECASE`, mirroring
+  `_PATTERN`) and `denied_paths`/`denied_entries` OR the results onto the built-in
+  test. It is **additive-only** — a caller widens the deny-list for its own
+  privileged surface (a `scripts/ci/` entrypoint, a custom runner) and cannot narrow
+  it. A pattern that will not compile raises `InvalidExtraPattern`, which `main()`
+  turns into the fail-closed `::error::`+exit-2 above rather than silently dropping
+  it: a typo in a security deny-list must never widen the ALLOW side. This is the
+  CI-privileged half of the "make the class a caller input" note above; the
+  dataset-of-record tuple stays hardcoded for now.
 
 ```bash
 python3 -m unittest discover -s .github/groom/tests -p test_patch_policy.py -v

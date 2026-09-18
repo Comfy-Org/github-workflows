@@ -5,10 +5,9 @@ Read [the shared caller contract](README.md) first.
 ## What it does
 
 Grades every PR into a tier `R0` (safest) .. `R3` (riskiest) and syncs **one**
-label (`risk:R0`..`risk:R3`, or `risk:ungraded` when an input was unreadable).
-The label is the entire product: nothing is gated, routed, commented, or
-merged — a human looks at the label and agrees or disagrees (recorded with a
-`risk-dispute` label this workflow never touches).
+visible label (`risk:R0`..`risk:R3`, or `risk:ungraded` when an input was
+unreadable). A human can override it with `risk-dispute:low` through
+`risk-dispute:xhigh`; the computed tier remains in the grade record.
 
 Deterministic, no LLM: `grade = worst(path_floor, provenance, reversibility)` —
 a path-glob map, what process produced the diff (registered runbooks, forks
@@ -37,7 +36,7 @@ on:
   # a fork run under plain `pull_request` cannot write the label. See the
   # fork gotcha below before you swap it.
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
 
 concurrency:
   group: pr-risk-${{ github.event.pull_request.number }}
@@ -48,6 +47,10 @@ permissions:
 
 jobs:
   pr-risk:
+    if: >-
+      github.event_name != 'pull_request' ||
+      ((github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
+       startsWith(github.event.label.name, 'risk-dispute:'))
     permissions:
       contents: read
       issues: write          # create the risk:* labels repo-side on first use
@@ -119,7 +122,7 @@ fail the caller's next run at startup.
 | `bot_logins` | `github-actions,dependabot,renovate,coderabbitai,cursor,comfy-pr-bot,web-flow` | Extra logins treated as bots. Needed only for **machine USER accounts** — a real GitHub App is recognized from GitHub's own actor type, no list entry required. A bot with no runbook entry still grades as human — identity alone buys no trust. **This list is load-bearing, not a hint:** a listed login skips the first-time-contributor test, so it moves a non-fork `NONE`/`FIRST_TIME_CONTRIBUTOR` PR from `external` (R3) to `human` (R1). Nothing validates that a listed login is really a machine account, so add one only for an account you control, and remove it when it is retired. |
 | `label_map` | `''` | Rename the five grader-owned labels as `tier=label` pairs. Tier keys are fixed; only the label text is yours. |
 | `wait_for_checks_minutes` | `10` | How long to wait for the rest of the check rollup to settle before labeling (clamped to 25 — what a 30-minute job can spend waiting). `0` labels immediately, expect R2 floors from still-pending checks. |
-| `repo_map_path` | `.github/risk.json` | Consumer risk-map override, read from the PR **base ref**. |
+| `repo_map_path` | `.github/risk.json` | Consumer risk-map override, read from the PR **base ref**. Repo-relative — a leading `/` or a `..` segment is refused, not resolved. |
 | `repo_runbooks_path` | `.github/risk-runbooks.json` | Consumer runbook-registry override, read from the PR **base ref**. |
 
 ## Gotchas
@@ -133,17 +136,18 @@ your own steps (or jobs) that check out or run PR head code under it reopens
 the classic pwn-request hole. Same-repo-only callers (private org repos that
 take no fork PRs) should stay on plain `pull_request`.
 
-That is why the caller block above carries **no `if:` at all**, and why the two
-paragraphs below talk about a clause it does not show. Neither shape this page
-recommends needs one: under `pull_request_target` the token is writable for fork
-PRs too, and a same-repo-only repo has no fork PRs to guard against. The third
-shape — a public repo staying on plain `pull_request` and accepting that its fork
-PRs go **ungraded** rather than red — is the one that needs
-`github.event.pull_request.head.repo.full_name == github.repository`, scoped
-behind an event test so `workflow_dispatch` still works. Copy that variant from
-the caller pattern in
-[`pr-risk.yml`'s header](../../.github/workflows/pr-risk.yml) rather than writing
-it yourself; an unscoped clause makes the dispatch button a silent no-op.
+The caller's `if:` limits label events to `risk-dispute:*`; other labels do not
+need a re-grade. A public repo staying on plain `pull_request` also needs the
+fork guard from [`pr-risk.yml`'s header](../../.github/workflows/pr-risk.yml).
+Keep it behind the event test so `workflow_dispatch` still works.
+
+## Risk overrides
+
+`risk-dispute:low`, `risk-dispute:medium`, `risk-dispute:high`, and
+`risk-dispute:xhigh` override the visible risk label. For example,
+`risk-dispute:medium` changes a computed `risk:high` label to `risk:medium`.
+Removing the dispute restores the computed label. If multiple override labels
+are present, the highest risk wins.
 
 **Bot PRs are graded — do not add a `github.actor != 'dependabot[bot]'` skip.**
 Dependabot's `pull_request` runs do start from a read-only `GITHUB_TOKEN`, but

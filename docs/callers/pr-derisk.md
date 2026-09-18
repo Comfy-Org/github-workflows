@@ -74,13 +74,14 @@ literally. `bump-pr-derisk-callers.yml` moves both together; never hand-bump one
 
 | input | default | why you would change it |
 |---|---|---|
+| `workflows_ref` | — (**required**) | Pin to the SAME full commit SHA as `uses:` — never a tag or a floating branch. No default on purpose: a floating default would let a caller SHA-pin `uses:` and still load the planner, the renderer and the pr-risk grader from HEAD of main. Bumped by `bump-pr-derisk-callers.yml` alongside `uses:`; never hand-move one alone. |
 | `enabled` | `false` | Ship the caller off, switch it on later. `vars.DERISK_CONFIG` = `{"enabled": true}` does the same with no PR, and `{"enabled": false}` is a kill switch that outranks this input. |
 | `allowed_associations` | `OWNER,MEMBER,COLLABORATOR` | **Narrow it, never widen it.** `CONTRIBUTOR` and `NONE` are anyone with a GitHub account, and this command spends money. **Comma-separated, NO SPACES** — each entry is matched with the commas around it (so `FIRST_TIME_CONTRIBUTOR` cannot admit plain `CONTRIBUTOR`), and a space makes an entry unmatchable. The gate job fails loudly on a list containing whitespace. |
 | `command` | `/derisk` | Matched with `startsWith`, so `/derisk please` works and a mid-sentence mention does not. Must not be empty — `startsWith(body, '')` is every comment ever posted, so the gate rejects it. |
 | `model` | `claude-opus-5` | The partition is a judgement about a whole diff and the call happens once, on demand. |
 | `max_steps` | `5` | A chain nobody will actually open is not a plan. |
 | `max_diff_bytes` | `200000` | Over budget takes the deterministic fallback rather than planning off half a diff. |
-| `repo_map_path` / `repo_runbooks_path` | `.github/risk.json` / `.github/risk-runbooks.json` | Same overrides pr-risk reads, from the same base ref. |
+| `repo_map_path` / `repo_runbooks_path` | `.github/risk.json` / `.github/risk-runbooks.json` | Same overrides pr-risk reads, from the same base ref. Repo-relative — a leading `/` or a `..` segment is refused, not resolved. |
 
 ## Gotchas
 

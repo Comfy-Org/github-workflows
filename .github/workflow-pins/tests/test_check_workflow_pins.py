@@ -658,6 +658,141 @@ class GuardCoverageTests(unittest.TestCase):
         )
         self.assertEqual(self._jobs(self.GUARD_WITH_FALLBACK + checkout), [])
 
+    # Every folded spelling below puts the `ref:` key on line 19 of `_wrap`'s
+    # output, which is the line the continuation window reports — so the whole
+    # family shares one expected site.
+    FOLDED_SITE = [(19, True, True, False)]
+
+    # The one-line fallback checkout the folded spellings must agree with.
+    FALLBACK_CHECKOUT = (
+        "      - name: Load assets\n"
+        "        uses: actions/checkout@abc\n"
+        "        with:\n"
+        "          ref: ${{ inputs.workflows_ref || job.workflow_sha }}\n"
+    )
+
+    @staticmethod
+    def _folded(*value_lines):
+        """The fallback checkout with its ref written as a `>-` block scalar."""
+        return (
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: >-\n"
+        ) + "".join("            %s\n" % v for v in value_lines)
+
+    def _sites(self, *jobs):
+        return cwp.ref_checkouts(self._wrap(*jobs).split("\n"))
+
+    def test_a_folded_job_workflow_sha_fallback_agrees_with_the_one_line_spelling(self):
+        # A block scalar folds to ONE value at runtime, so every split of the
+        # BE-4169 fallback is the same expression as the one-line spelling and
+        # must earn the same verdict. `_FALLBACK_RES`' continuation form needs
+        # the WHOLE expression in the text it is handed, and the continuation
+        # arm records at the FIRST line mentioning the input — which spelling
+        # (a) leaves mid-expression. Judged one physical line at a time, that
+        # site recorded `uses_fallback=False`, so the fallback guard above it
+        # no longer covered it and the checkout was reported UNGUARDED with
+        # the wrong (bare-input) remedy (BE-9648).
+        spellings = (
+            # (a) trailing split — the mention lands one line ABOVE the close,
+            # which is why folding only over the lines already seen is not
+            # enough and the fold has to read forward.
+            self._folded("${{ inputs.workflows_ref ||", "job.workflow_sha }}"),
+            # (b) leading split — `${{` alone, then the whole expression.
+            self._folded("${{", "inputs.workflows_ref || job.workflow_sha }}"),
+            # (c) split at both — three physical lines, no two of which are
+            # the expression.
+            self._folded("${{", "inputs.workflows_ref ||", "job.workflow_sha }}"),
+        )
+        one_line = self._sites(self.GUARD_WITH_FALLBACK + self.FALLBACK_CHECKOUT)
+        self.assertEqual(one_line, self.FOLDED_SITE)
+        for i, checkout in enumerate(spellings):
+            with self.subTest(spelling="abc"[i]):
+                self.assertEqual(
+                    self._sites(self.GUARD_WITH_FALLBACK + checkout), self.FOLDED_SITE
+                )
+                self.assertEqual(self._jobs(self.GUARD_WITH_FALLBACK + checkout), [])
+
+    def test_a_folded_fallback_as_the_files_last_line_is_still_judged(self):
+        # The forward fold reads lines BELOW the site, so the shape to prove is
+        # the one with nothing below it: the checkout as the last field of the
+        # last step, `rstrip`ped so the scalar's final line is the file's. A
+        # deferred flush would be the fragile design here — this arm records at
+        # its own site, so the walk ending has nothing left to drop.
+        text = self._wrap(
+            self.GUARD_WITH_FALLBACK
+            + self._folded("${{ inputs.workflows_ref ||", "job.workflow_sha }}")
+        ).rstrip()
+        self.assertTrue(text.endswith("job.workflow_sha }}"), text[-40:])
+        self.assertEqual(cwp.ref_checkouts(text.split("\n")), self.FOLDED_SITE)
+
+    def test_a_folded_bare_input_is_not_a_folded_fallback(self):
+        # The negative control the fold must not swallow. `${{
+        # inputs.workflows_ref` / `}}` folds to the BARE input, which a
+        # fallback-strength guard does not cover (see
+        # `test_a_fallback_guard_does_not_cover_a_bare_input_checkout`) — so
+        # the site stays a non-fallback and stays unguarded.
+        checkout = self._folded("${{ inputs.workflows_ref", "}}")
+        self.assertEqual(
+            self._sites(self.GUARD_WITH_FALLBACK + checkout), [(19, False, False, False)]
+        )
+        self.assertEqual(self._jobs(self.GUARD_WITH_FALLBACK + checkout), [19])
+
+    def test_a_folded_weak_fallback_is_not_a_folded_fallback(self):
+        # The other negative control: `|| 'main'` is not `|| job.workflow_sha`.
+        # Folding must judge WHICH expression closed the interpolation, not
+        # merely that one did — this one resolves to a MUTABLE branch whenever
+        # the input is omitted, the exact hole the fallback exists to avoid.
+        checkout = self._folded("${{ inputs.workflows_ref ||", "'main' }}")
+        self.assertEqual(
+            self._sites(self.GUARD_WITH_FALLBACK + checkout), [(19, False, False, False)]
+        )
+        self.assertEqual(self._jobs(self.GUARD_WITH_FALLBACK + checkout), [19])
+
+    def test_a_folded_third_operand_defeats_the_fallback_exemption(self):
+        # `test_a_third_operand_defeats_the_fallback_exemption`'s folded twin,
+        # and the reason the fold is handed to the SAME anchored matcher
+        # rather than to a "contains the fallback" test. Splitting the
+        # expression must not become the way to smuggle a third operand past
+        # an anchor the one-line spelling is held to — this one resolves to
+        # `main` in exactly the pre-v2.334.0 case the fallback exists for.
+        checkout = self._folded(
+            "${{ inputs.workflows_ref ||", "job.workflow_sha || 'main' }}"
+        )
+        self.assertEqual(
+            self._sites(self.GUARD_WITH_FALLBACK + checkout), [(19, False, False, False)]
+        )
+        self.assertEqual(self._jobs(self.GUARD_WITH_FALLBACK + checkout), [19])
+
+    def test_a_blank_line_inside_the_scalar_does_not_end_the_fold(self):
+        # A blank line neither opens nor closes a YAML block, and the runtime
+        # folds right across it — so the fold skips it exactly as the walk
+        # that feeds it does. Reading it as the end of the scalar would strand
+        # the fallback one line short and put the site back where it started.
+        checkout = self._folded("${{ inputs.workflows_ref ||") + (
+            "\n" "            job.workflow_sha }}\n"
+        )
+        self.assertEqual(
+            self._sites(self.GUARD_WITH_FALLBACK + checkout), self.FOLDED_SITE
+        )
+
+    def test_the_forward_fold_stops_at_the_end_of_the_scalar(self):
+        # The fold is bounded by the `ref:` key's own column, exactly as the
+        # continuation window is. An interpolation left open at the end of the
+        # scalar must not reach into the NEXT step to find its close — that
+        # would let an unrelated `job.workflow_sha }}` elsewhere in the job
+        # score this checkout a self-pin it does not have.
+        checkout = self._folded("${{ inputs.workflows_ref ||") + (
+            "      - name: Unrelated\n"
+            "        env:\n"
+            "          NOTE: job.workflow_sha }}\n"
+            "        run: 'true'\n"
+        )
+        self.assertEqual(
+            self._sites(self.GUARD_WITH_FALLBACK + checkout), [(19, False, False, False)]
+        )
+
     def test_a_fallback_guard_does_not_cover_a_bare_input_checkout(self):
         # The strength rule, and the reason `_GUARD_BINDING_RE` records WHICH
         # expression each guard validated. This guard proves only that
@@ -3369,7 +3504,7 @@ class GuardCoverageTests(unittest.TestCase):
             self.assertEqual(cwp.find_unguarded_ref_checkouts(lines), [], name)
         self.assertEqual(
             seen,
-            16,
+            18,
             "expected the 12 guarded sites BE-5546 fixed + pr-size.yml's (BE-5858) "
             "+ cursor-review.yml's preflight (hard guard) site picked up merging "
             "main + cursor-review.yml's diff-size job's check-pr-size-tool "
@@ -3382,7 +3517,13 @@ class GuardCoverageTests(unittest.TestCase):
             "groom.yml's 7 sites name the input directly, via the "
             "`|| job.workflow_sha` fallback — and are clean because each one "
             "carries its guard, which BE-8077 made load-bearing rather than "
-            "exempt.",
+            "exempt. The 17th is cursor-review.yml's `post-review` job: the "
+            "credential split gave the review post its own checkout-free job, "
+            "which loads the assets from `workflows_ref` itself and therefore "
+            "carries its own copy of the guard. The 18th is cursor-review.yml's "
+            "`blocking-gate` job (BE-4691 restored the gate #31 dropped): it "
+            "loads gate-unresolved.py from `workflows_ref` in its own job and "
+            "therefore carries its own copy of the guard too.",
         )
 
     WORKFLOWS_DIR = os.path.normpath(
@@ -4256,6 +4397,46 @@ class CheckDirTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(checked, ["folded.yml"])
 
+    def test_a_fallback_split_ACROSS_lines_keeps_the_default_carve_out(self):
+        # The test above puts the whole expression on ONE continuation line.
+        # Split it once more and neither physical line is the expression, so
+        # the carve-out scan saw no self-pin anywhere in the file and the two
+        # contradictory errors came back together: BE-5546's "delete the
+        # `default:`" on line 8 plus BE-8077's unguarded-checkout error, on a
+        # file that self-pins and guards correctly (BE-9648). The fold the
+        # runtime performs is the value both halves have to be asked about.
+        text = (
+            "name: Fixture\n"
+            "on:\n"
+            "  workflow_call:\n"
+            "    inputs:\n"
+            "      workflows_ref:\n"
+            "        type: string\n"
+            "        required: false\n"
+            "        default: ''\n"
+            "jobs:\n"
+            "  check:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - name: Require a resolvable workflows_ref\n"
+            "        env:\n"
+            "          WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}\n"
+            "        run: |\n"
+            '          if [ -z "$WORKFLOWS_REF" ]; then\n'
+            "            exit 1\n"
+            "          fi\n"
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: >-\n"
+            "            ${{ inputs.workflows_ref ||\n"
+            "            job.workflow_sha }}\n"
+        )
+        self._write("split-folded.yml", text)
+        errors, checked, _, _ = cwp.check_dir(self.dir, exempt=frozenset())
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(checked, ["split-folded.yml"])
+
 
     def test_the_github_job_workflow_sha_default_is_no_longer_tolerated(self):
         # BE-8077: the same fixture spelled the OLD way is the `default: main`
@@ -4676,8 +4857,17 @@ class CheckDirTests(unittest.TestCase):
         # The CLI half, end to end: the warning reaches stdout (so it lands in
         # the PR annotations) and the process still exits 0. Asserting it on
         # `check_dir` alone would leave `main` free to reintroduce the failure.
+        #
+        # The shared fixture's throwaway `@abc` is swapped for a SHA-shaped ref
+        # here and only here: `main` also runs the BE-15255 pin check, which
+        # would fail this dir over a ref that has nothing to do with the
+        # fail-open behaviour under test — and an exit-0 assertion cannot
+        # tolerate an unrelated error. Every other user of FLOW_STEPS_JOB goes
+        # through `check_dir`, which the pin check does not touch.
         self._write(
-            "escaped.yml", self._ESCAPED_HEAD + GuardCoverageTests.FLOW_STEPS_JOB
+            "escaped.yml",
+            self._ESCAPED_HEAD
+            + GuardCoverageTests.FLOW_STEPS_JOB.replace("@abc", "@" + "a" * 40),
         )
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -4803,6 +4993,879 @@ class CheckDirTests(unittest.TestCase):
             self.assertIsInstance(job_start, int)
             self.assertIsInstance(job_indent, int)
             self.assertIsInstance(idx, int)
+
+
+# A docs page whose inputs table's `workflows_ref` default cell varies. The
+# prose line and the fenced caller example both MENTION the input and must never
+# be read as the table row (BE-6508 plan item 4d).
+def _docs_page(default_cell):
+    return (
+        "# pr-foo caller\n"
+        "\n"
+        "The scripts load from your pinned `workflows_ref` at run time.\n"
+        "\n"
+        "```yaml\n"
+        "    with:\n"
+        "      workflows_ref: main   # <- a caller example, not the table\n"
+        "```\n"
+        "\n"
+        "## Inputs\n"
+        "\n"
+        "| Input | Default | Notes |\n"
+        "|---|---|---|\n"
+        "| `workflows_ref` | %s | Pin to the `uses:` SHA. |\n"
+        "| `other` | `false` | Something else. |\n"
+    ) % default_cell
+
+
+# The `workflows_ref` table row sits on the 14th line of the page above (1-based).
+_DOCS_ROW_LINE = 14
+
+
+class DocsDefaultLiteralRefTests(unittest.TestCase):
+    def test_a_bare_branch_name_is_a_literal_ref(self):
+        self.assertTrue(cwp.docs_default_is_literal_ref(" main "))
+
+    def test_a_sha_in_a_code_span_is_a_literal_ref(self):
+        self.assertTrue(cwp.docs_default_is_literal_ref(" `1a2b3c4d` "))
+
+    def test_the_em_dash_required_marker_is_clean(self):
+        self.assertFalse(cwp.docs_default_is_literal_ref(" — (**required**) "))
+
+    def test_a_bare_required_marker_is_clean(self):
+        self.assertFalse(cwp.docs_default_is_literal_ref(" *(required)* "))
+
+    def test_a_lone_em_dash_is_clean(self):
+        self.assertFalse(cwp.docs_default_is_literal_ref(" — "))
+
+    def test_a_lone_hyphen_is_clean(self):
+        self.assertFalse(cwp.docs_default_is_literal_ref(" - "))
+
+    def test_the_groom_empty_string_default_is_clean(self):
+        self.assertFalse(cwp.docs_default_is_literal_ref(" `''` "))
+
+    def test_an_empty_cell_is_not_a_literal_ref(self):
+        self.assertFalse(cwp.docs_default_is_literal_ref("   "))
+
+    def test_a_ref_that_merely_contains_the_word_required_is_a_literal_ref(self):
+        # The keyword must not wave through a cell that documents a real default
+        # — matching is whole-cell, not a substring scan.
+        self.assertTrue(cwp.docs_default_is_literal_ref(" `main` (**required**) "))
+        self.assertTrue(cwp.docs_default_is_literal_ref(" main — required until BE-1 "))
+
+    def test_common_no_default_wordings_are_clean(self):
+        for marker in ("n/a", "none", "(none)", "no default", "unset", "NA"):
+            self.assertFalse(
+                cwp.docs_default_is_literal_ref(marker),
+                "%r should read as no-default" % marker,
+            )
+
+    def test_a_u2212_minus_sign_marker_is_clean(self):
+        # U+2212 MINUS SIGN sits outside the U+2010–U+2015 dash range.
+        self.assertFalse(cwp.docs_default_is_literal_ref(" − "))
+        self.assertFalse(cwp.docs_default_is_literal_ref(" − (**required**) "))
+
+
+class FindDocsRowTests(unittest.TestCase):
+    def _find(self, text):
+        return cwp.find_docs_workflows_ref_row(text.split("\n"))
+
+    def test_the_table_row_is_found_with_its_line_number(self):
+        found = self._find(_docs_page("main"))
+        self.assertIsNotNone(found)
+        lineno, cell = found
+        self.assertEqual(lineno, _DOCS_ROW_LINE)
+        self.assertEqual(cell.strip(), "main")
+
+    def test_prose_and_a_fenced_example_are_not_the_row(self):
+        # The page mentions `workflows_ref` in prose and inside a ```yaml block,
+        # but has NO table row — that is None, not a false positive on either.
+        text = (
+            "# Page\n"
+            "\n"
+            "Set `workflows_ref` to your `uses:` SHA.\n"
+            "\n"
+            "```yaml\n"
+            "      workflows_ref: main\n"
+            "```\n"
+        )
+        self.assertIsNone(self._find(text))
+
+    def test_a_fenced_row_shaped_line_is_not_the_row(self):
+        # Even a line that looks exactly like the table row is ignored inside a
+        # fence — a doc could show a sample table in a ``` block.
+        text = (
+            "# Page\n"
+            "```\n"
+            "| `workflows_ref` | main | example |\n"
+            "```\n"
+        )
+        self.assertIsNone(self._find(text))
+
+    def test_a_real_row_after_a_closed_fence_is_still_found(self):
+        text = (
+            "# Page\n"
+            "```yaml\n"
+            "      workflows_ref: main\n"
+            "```\n"
+            "| `workflows_ref` | — (**required**) | note |\n"
+        )
+        found = self._find(text)
+        self.assertIsNotNone(found)
+        self.assertEqual(found[0], 5)
+
+    def test_a_shorter_inner_fence_does_not_close_a_longer_block(self):
+        # A four-backtick block containing a bare ``` line must NOT close early
+        # and invert the state: the row-shaped line stays inside the fence and
+        # is ignored, and the real row after the four-backtick closer is found.
+        text = (
+            "# Page\n"
+            "````\n"
+            "```\n"
+            "| `workflows_ref` | main | fenced sample, not the row |\n"
+            "````\n"
+            "| `workflows_ref` | — (**required**) | the real row |\n"
+        )
+        found = self._find(text)
+        self.assertIsNotNone(found)
+        self.assertEqual(found[0], 6)
+        self.assertEqual(found[1].strip(), "— (**required**)")
+
+    def test_a_closer_carrying_an_info_string_does_not_close(self):
+        # Only a bare fence closes; `​```yaml` inside a block is content, so the
+        # row-shaped line after it stays fenced and is not read as the row.
+        text = (
+            "# Page\n"
+            "```\n"
+            "```yaml\n"
+            "| `workflows_ref` | main | still fenced |\n"
+            "```\n"
+        )
+        self.assertIsNone(self._find(text))
+
+
+class DocsCrossCheckTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.docs = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.addCleanup(shutil.rmtree, self.docs, True)
+
+    def _write_wf(self, name, text):
+        with open(os.path.join(self.dir, name), "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def _write_doc(self, name, text):
+        with open(os.path.join(self.docs, name), "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def _check(self):
+        return cwp.check_dir(self.dir, exempt=frozenset(), docs_dir=self.docs)
+
+    def test_a_docs_row_claiming_main_fails_with_the_right_line(self):
+        self._write_wf("pr-foo.yml", _reusable(PINNED))
+        self._write_doc("pr-foo.md", _docs_page("main"))
+        errors, checked, _, _ = self._check()
+        self.assertEqual(checked, ["pr-foo.yml"])
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("pr-foo.md", errors[0])
+        self.assertIn("line=%d" % _DOCS_ROW_LINE, errors[0])
+        self.assertIn("pr-foo.yml", errors[0])  # names the contradicted declaration
+        self.assertIn("BE-6508", errors[0])
+
+    def test_a_required_marker_row_is_clean(self):
+        self._write_wf("pr-foo.yml", _reusable(PINNED))
+        self._write_doc("pr-foo.md", _docs_page("— (**required**)"))
+        errors, checked, _, _ = self._check()
+        self.assertEqual(checked, ["pr-foo.yml"])
+        self.assertEqual(errors, [], errors)
+
+    def test_a_reusable_is_cross_checked_via_its_own_name_page(self):
+        # The derivation is the workflow's OWN basename, so a reusable whose
+        # name shares no prefix with any other guide is still cross-checked
+        # against its same-named page — a page claiming a `main` default fails.
+        # (This is the coverage refresh-reviewers.yml gained once it got its own
+        # docs/callers/refresh-reviewers.md page instead of being skipped.)
+        self._write_wf("refresh-foo.yml", _reusable(PINNED))
+        self._write_doc("refresh-foo.md", _docs_page("main"))
+        errors, checked, _, _ = self._check()
+        self.assertEqual(checked, ["refresh-foo.yml"])
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("refresh-foo.md", errors[0])
+        self.assertIn("line=%d" % _DOCS_ROW_LINE, errors[0])
+        self.assertIn("refresh-foo.yml", errors[0])  # names the declaration
+        self.assertIn("BE-6508", errors[0])
+
+    def test_a_required_marker_row_on_its_own_name_page_is_clean(self):
+        # Companion to the above: the compliant `— (**required**)` marker on a
+        # reusable's own-name page passes.
+        self._write_wf("refresh-foo.yml", _reusable(PINNED))
+        self._write_doc("refresh-foo.md", _docs_page("— (**required**)"))
+        errors, checked, _, _ = self._check()
+        self.assertEqual(checked, ["refresh-foo.yml"])
+        self.assertEqual(errors, [], errors)
+
+    def test_a_page_missing_the_row_is_a_hard_error(self):
+        self._write_wf("pr-foo.yml", _reusable(PINNED))
+        # Present page, real inputs table, but no `workflows_ref` row.
+        self._write_doc(
+            "pr-foo.md",
+            "# pr-foo\n\n## Inputs\n\n| Input | Default | Notes |\n|---|---|---|\n"
+            "| `other` | `false` | Something. |\n",
+        )
+        errors, checked, _, _ = self._check()
+        self.assertEqual(checked, ["pr-foo.yml"])
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("pr-foo.md", errors[0])
+        self.assertIn("no `workflows_ref` row", errors[0])
+        self.assertIn("BE-6508", errors[0])
+
+    def test_a_page_with_only_prose_and_a_fenced_example_is_a_hard_error(self):
+        # The row-absence case must not be defeated by a `workflows_ref` that
+        # appears only in prose or a fenced caller example (plan item 4d).
+        self._write_wf("pr-foo.yml", _reusable(PINNED))
+        self._write_doc(
+            "pr-foo.md",
+            "# pr-foo\n\nPin `workflows_ref` to your SHA.\n\n```yaml\n"
+            "      workflows_ref: main\n```\n",
+        )
+        errors, _, _, _ = self._check()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("no `workflows_ref` row", errors[0])
+
+    def test_a_missing_page_is_skipped_not_an_error(self):
+        # A reusable that declares workflows_ref-no-default but ships no own-name
+        # docs/callers guide: a page absent under the workflow's own name is "not
+        # applicable" and skipped (the lint's blind spot — nothing to cross-check).
+        self._write_wf("pr-foo.yml", _reusable(PINNED))
+        errors, checked, _, _ = self._check()
+        self.assertEqual(checked, ["pr-foo.yml"])
+        self.assertEqual(errors, [], errors)
+
+    def test_an_optional_default_workflow_is_not_cross_checked(self):
+        # A groom-style `default: ''` self-pin is the optional/auto-derive
+        # direction — its docs may legitimately document a default, so the check
+        # must NOT fire even when the docs row names a literal ref.
+        groom_like = (
+            "name: Fixture\n"
+            "on:\n"
+            "  workflow_call:\n"
+            "    inputs:\n"
+            "      workflows_ref:\n"
+            "        type: string\n"
+            "        required: false\n"
+            "        default: ''\n"
+            "jobs:\n"
+            "  check:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - name: Require a resolvable workflows_ref\n"
+            "        env:\n"
+            "          WORKFLOWS_REF: ${{ inputs.workflows_ref || job.workflow_sha }}\n"
+            "        run: |\n"
+            '          if [ -z "$WORKFLOWS_REF" ]; then\n'
+            '            echo "::error::empty"\n'
+            "            exit 1\n"
+            "          fi\n"
+            "      - name: Load assets\n"
+            "        uses: actions/checkout@abc\n"
+            "        with:\n"
+            "          ref: ${{ inputs.workflows_ref || job.workflow_sha }}\n"
+        )
+        self._write_wf("groomy.yml", groom_like)
+        self._write_doc("groomy.md", _docs_page("main"))
+        errors, checked, _, _ = self._check()
+        self.assertEqual(checked, ["groomy.yml"])
+        self.assertEqual(errors, [], errors)
+
+
+_SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
+
+
+def _plain_workflow(steps):
+    """A workflow that declares NO `workflows_ref` — the pin check's real surface.
+
+    Every `ci-*`, `bump-*` and `test-*` file here has this shape, `check_dir`
+    skips all of them, and that is where BE-15255's two floating refs lived.
+    """
+    return (
+        "name: Plain\n"
+        "on: [push]\n"
+        "jobs:\n"
+        "  run:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n" + steps
+    )
+
+
+@contextlib.contextmanager
+def _patched(module, name, value):
+    """`module.name = value` for the duration of the block."""
+    old = getattr(module, name)
+    setattr(module, name, value)
+    try:
+        yield
+    finally:
+        setattr(module, name, old)
+
+
+class BlockScalarMaskTests(unittest.TestCase):
+    """`_block_scalar_mask` is the one scan `_in_block_scalar` now answers from."""
+
+    LINES = (
+        "jobs:\n"
+        "  run:\n"
+        "    steps:\n"
+        "      - name: Smoke\n"
+        "        run: |\n"
+        "          cat > f.yml <<'YAML'\n"
+        "          steps:\n"
+        "\n"
+        "            - uses: actions/checkout@abc\n"
+        "          YAML\n"
+        "      - uses: actions/setup-python@abc\n"
+    ).split("\n")
+
+    # The answer the per-index scan gave BEFORE `_in_block_scalar` became one
+    # line over the mask, pinned as a literal. Comparing the mask to
+    # `_in_block_scalar` would compare it with itself and could never fail,
+    # while this mask decides which lines BOTH the pin and the ref-guard lints
+    # treat as YAML — so the equivalence has to be asserted against something
+    # the rewrite cannot move.
+    EXPECTED = [
+        False,  # 0  jobs:
+        False,  # 1    run:
+        False,  # 2      steps:
+        False,  # 3        - name: Smoke
+        False,  # 4          run: |          <- opens, is not inside
+        True,  # 5            cat > f.yml <<'YAML'
+        True,  # 6            steps:
+        False,  # 7          (blank — indented past nothing; must not CLOSE)
+        True,  # 8              - uses: actions/checkout@abc
+        True,  # 9            YAML
+        False,  # 10        - uses: actions/setup-python@abc  <- closes it
+        False,  # 11       (trailing empty element of the split)
+    ]
+
+    def test_the_mask_matches_the_per_index_answer_it_replaced(self):
+        self.assertEqual(len(self.LINES), len(self.EXPECTED))
+        self.assertEqual(cwp._block_scalar_mask(self.LINES), self.EXPECTED)
+
+    def test_the_per_index_form_still_answers_from_that_mask(self):
+        # The one-line-thick wrapper is the contract: every caller of either
+        # form sees the same decision about which lines are YAML.
+        self.assertEqual(
+            [cwp._in_block_scalar(self.LINES, i) for i in range(len(self.LINES))],
+            self.EXPECTED,
+        )
+
+    def test_the_key_line_opens_a_scalar_rather_than_sitting_in_one(self):
+        mask = cwp._block_scalar_mask(self.LINES)
+        self.assertFalse(mask[4], "`run: |` itself is YAML, not scalar text")
+        self.assertTrue(mask[5], "the heredoc body is text")
+        # A blank line reads False on its indent alone — the long-standing
+        # `_in_block_scalar` answer, preserved. It carries no directive either
+        # way, and it must NOT close the scalar, which is the half that matters:
+        self.assertFalse(mask[7], "a blank line is indented past nothing")
+        self.assertTrue(mask[8], "the fixture `uses:` is text, not a directive")
+        self.assertFalse(mask[10], "the next real step closes the scalar")
+
+
+class ActionPinTests(unittest.TestCase):
+    """BE-15255: every `uses:` under `.github/workflows/` names a full commit SHA."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def _write(self, name, text):
+        with open(os.path.join(self.dir, name), "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def _check(self, exempt=frozenset()):
+        # The not-pinnable list is stashed rather than returned, so the tests
+        # that do not care about it keep the three-tuple they read best as.
+        errors, pinned, exempt_ok, skipped = cwp.check_action_pins(self.dir, exempt=exempt)
+        self.skipped = skipped
+        return errors, pinned, exempt_ok
+
+    # --- the two directions the acceptance criteria name -------------------
+
+    def test_a_sha_pinned_ref_passes(self):
+        self._write("ok.yml", _plain_workflow("      - uses: actions/checkout@%s # v7.0.1\n" % _SHA))
+        errors, pinned, exempt_ok = self._check()
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(pinned, 1)
+        self.assertEqual(exempt_ok, [])
+
+    def test_a_tag_pinned_ref_fails_with_an_annotation(self):
+        self._write("bad.yml", _plain_workflow("      - uses: actions/checkout@v7\n"))
+        errors, pinned, _ = self._check()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertTrue(errors[0].startswith("::error file="), errors[0])
+        self.assertIn("bad.yml,line=7", errors[0])
+        self.assertIn("actions/checkout@v7", errors[0])
+        self.assertIn("BE-15255", errors[0])
+        self.assertEqual(pinned, 0)
+
+    def test_the_narrowed_tag_dependabot_produces_still_fails(self):
+        # The precise drift this exists for: `@v6` -> `@v7` -> `@v7.0.0`, tag in
+        # and tag out every time. A narrower tag is still a tag.
+        self._write("bad.yml", _plain_workflow("      - uses: actions/setup-python@v7.0.0\n"))
+        errors, _, _ = self._check()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("actions/setup-python@v7.0.0", errors[0])
+
+    def test_a_short_sha_is_not_a_pin(self):
+        self._write("bad.yml", _plain_workflow("      - uses: actions/checkout@%s\n" % _SHA[:7]))
+        errors, pinned, _ = self._check()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertEqual(pinned, 0)
+
+    def test_a_ref_with_no_at_sign_fails(self):
+        self._write("bad.yml", _plain_workflow("      - uses: actions/checkout\n"))
+        errors, _, _ = self._check()
+        self.assertEqual(len(errors), 1, errors)
+
+    def test_a_ref_with_no_at_sign_is_not_described_as_tag_pinned(self):
+        # The remedy differs — ADD a ref rather than convert one — and a
+        # message reading "pins `actions/checkout` by tag" names a tag that is
+        # not there. The site resolves at the action's default branch.
+        self._write("bad.yml", _plain_workflow("      - uses: actions/checkout\n"))
+        errors, _, _ = self._check()
+        self.assertIn("NO ref at all", errors[0])
+        self.assertIn("default branch", errors[0])
+        self.assertNotIn("by tag", errors[0])
+
+    # --- the self-draining exemption list ----------------------------------
+
+    def test_an_exempt_entry_suppresses_its_own_site_only(self):
+        self._write(
+            "bad.yml",
+            _plain_workflow(
+                "      - uses: actions/checkout@v7\n"
+                "      - uses: actions/setup-python@v7.0.0\n"
+            ),
+        )
+        errors, _, exempt_ok = self._check(
+            exempt=frozenset({("bad.yml", "actions/checkout@v7")})
+        )
+        self.assertEqual(exempt_ok, [("bad.yml", "actions/checkout@v7")])
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("actions/setup-python@v7.0.0", errors[0])
+
+    def test_one_debt_entry_is_reported_once_however_many_sites_it_covers(self):
+        # `seen_exempt` is a set and `exempt_ok` was appended per SITE, so the
+        # same value twice in one file printed the `(KNOWN_UNPINNED)` line
+        # twice and over-counted one entry in the `(%d exempt)` summary.
+        # `check_dir` reports first-sight-only; this now matches it.
+        self._write(
+            "bad.yml",
+            _plain_workflow(
+                "      - uses: actions/checkout@v7\n"
+                "      - uses: actions/checkout@v7\n"
+            ),
+        )
+        errors, _, exempt_ok = self._check(
+            exempt=frozenset({("bad.yml", "actions/checkout@v7")})
+        )
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(exempt_ok, [("bad.yml", "actions/checkout@v7")])
+
+    def test_an_exempt_entry_is_keyed_on_the_file_too(self):
+        # The FILE alone would pre-exempt every other action in it; the REF
+        # alone would pre-exempt the same floating ref wherever it is copied.
+        self._write("bad.yml", _plain_workflow("      - uses: actions/checkout@v7\n"))
+        errors, _, exempt_ok = self._check(
+            exempt=frozenset({("other.yml", "actions/checkout@v7")})
+        )
+        self.assertEqual(exempt_ok, [])
+        self.assertEqual(len(errors), 2, errors)
+        self.assertTrue(any("bad.yml,line=" in e for e in errors), errors)
+        self.assertTrue(any("delete that entry" in e for e in errors), errors)
+
+    def test_a_stale_exempt_entry_errors_once_the_ref_is_pinned(self):
+        self._write("was-bad.yml", _plain_workflow("      - uses: actions/checkout@%s\n" % _SHA))
+        errors, _, exempt_ok = self._check(
+            exempt=frozenset({("was-bad.yml", "actions/checkout@v7")})
+        )
+        self.assertEqual(exempt_ok, [])
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("KNOWN_UNPINNED", errors[0])
+        self.assertIn("was-bad.yml", errors[0])
+        self.assertIn("actions/checkout@v7", errors[0])
+
+    def test_a_stale_exempt_entry_errors_when_dependabot_moves_the_tag(self):
+        # How this debt hid in the first place: an entry frozen at `@v6` stops
+        # covering its line the day Dependabot writes `@v7`. The entry must go
+        # LOUD rather than quietly protecting nothing.
+        self._write("bad.yml", _plain_workflow("      - uses: actions/checkout@v7\n"))
+        errors, _, _ = self._check(
+            exempt=frozenset({("bad.yml", "actions/checkout@v6")})
+        )
+        self.assertEqual(len(errors), 2, errors)
+        self.assertTrue(any("actions/checkout@v7" in e for e in errors), errors)
+        self.assertTrue(any("actions/checkout@v6" in e for e in errors), errors)
+
+    def test_the_shipped_exemption_list_is_empty(self):
+        # BE-15255 landed with both of its refs pinned, so the list starts
+        # drained. A future entry is a deliberate act, never a leftover.
+        self.assertEqual(cwp.KNOWN_UNPINNED, frozenset())
+
+    # --- the fixtures and shapes it must NOT trip on -----------------------
+
+    def test_a_uses_inside_a_run_heredoc_is_not_a_directive(self):
+        # test-workflow-pins.yml writes fixture workflows out of a `run: |`
+        # heredoc. That literal text is not this workflow's structure, and
+        # reading it as such would fail the lint on its own test harness.
+        self._write(
+            "harness.yml",
+            _plain_workflow(
+                "      - name: Smoke\n"
+                "        run: |\n"
+                "          cat > f.yml <<'YAML'\n"
+                "          jobs:\n"
+                "            run:\n"
+                "              steps:\n"
+                "                - uses: actions/checkout@abc\n"
+                "          YAML\n"
+            ),
+        )
+        errors, pinned, _ = self._check()
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(pinned, 0)
+
+    def test_a_commented_out_caller_example_is_not_a_directive(self):
+        # Every reusable's header block carries one. They are comments.
+        self._write(
+            "doc.yml",
+            "# Example caller:\n"
+            "#     steps:\n"
+            "#       - uses: Comfy-Org/github-workflows/.github/workflows/x.yml@v1\n"
+            + _plain_workflow("      - uses: actions/checkout@%s # v7.0.1\n" % _SHA),
+        )
+        errors, pinned, _ = self._check()
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(pinned, 1)
+
+    def test_an_unreadable_uses_spelling_is_refused_not_skipped(self):
+        # "Not applicable" and "I could not read this" must never look the
+        # same — the module's own rule. Both spellings that hide the ref from
+        # this walk fail loudly instead of passing unchecked.
+        for steps in (
+            "      - uses: >-\n          actions/checkout@v7\n",
+            "      - uses:\n          actions/checkout@v7\n",
+        ):
+            self._write("odd.yml", _plain_workflow(steps))
+            errors, pinned, _ = self._check()
+            self.assertEqual(len(errors), 1, (steps, errors))
+            self.assertIn("cannot read on its own line", errors[0])
+            self.assertIn("odd.yml,line=7", errors[0])
+            self.assertEqual(pinned, 0)
+
+    def test_an_unreadable_uses_cannot_be_exempted(self):
+        # There is no value to key an entry on, and the remedy is a one-line
+        # rewrite — so the debt list must not be able to silence it.
+        self._write("odd.yml", _plain_workflow("      - uses: >-\n          actions/checkout@v7\n"))
+        errors, _, _ = self._check(exempt=frozenset({("odd.yml", "actions/checkout@v7")}))
+        self.assertEqual(len(errors), 2, errors)
+        self.assertTrue(any("cannot read on its own line" in e for e in errors), errors)
+        self.assertTrue(any("delete that entry" in e for e in errors), errors)
+
+    def test_a_local_path_is_skipped_and_the_skip_is_reported(self):
+        # `./…` names no ref of its own: it resolves inside the caller's
+        # already-pinned checkout. Skipped, but REPORTED — "not applicable"
+        # must not read as "checked and fine".
+        self._write("local.yml", _plain_workflow("      - uses: ./.github/actions/setup\n"))
+        errors, pinned, _ = self._check()
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(pinned, 0)
+        self.assertEqual(len(self.skipped), 1, self.skipped)
+        name, lineno, value, reason = self.skipped[0]
+        self.assertEqual((name, value), ("local.yml", "./.github/actions/setup"))
+        self.assertIn("local path", reason)
+
+    def test_a_container_image_on_a_tag_fails_like_any_other_floating_ref(self):
+        # `docker://alpine:3.20` is a MUTABLE registry tag on exactly the terms
+        # `@v7` is. Exempting every `docker://` value on the grounds that
+        # images are "pinned by digest" would carve a hole for a whole category
+        # of the floating refs this check exists to ban.
+        self._write("img.yml", _plain_workflow("      - uses: docker://alpine:3.20\n"))
+        errors, pinned, _ = self._check()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("img.yml,line=", errors[0])
+        self.assertIn("MUTABLE tag", errors[0])
+        self.assertIn("sha256:", errors[0])
+        self.assertEqual(pinned, 0)
+        self.assertEqual(self.skipped, [])
+
+    def test_a_container_image_at_a_digest_counts_as_pinned(self):
+        digest = "sha256:" + "0" * 64
+        self._write("img.yml", _plain_workflow("      - uses: docker://alpine@%s\n" % digest))
+        errors, pinned, _ = self._check()
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(pinned, 1)
+
+    def test_a_container_image_digest_must_be_the_full_64_hex(self):
+        # The short-digest hand edit, refused for the same reason the 7-char
+        # short SHA is: a truncated digest is not the one the registry checks.
+        self._write("img.yml", _plain_workflow("      - uses: docker://alpine@sha256:0000\n"))
+        errors, _, _ = self._check()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("MUTABLE tag", errors[0])
+
+    def test_a_40_hex_ref_does_not_pin_a_container_image(self):
+        # A commit SHA is not a registry digest; the walker must not accept one
+        # spelling's pin shape for the other's ref.
+        self._write("img.yml", _plain_workflow("      - uses: docker://alpine@%s\n" % _SHA))
+        errors, _, _ = self._check()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("MUTABLE tag", errors[0])
+
+    # --- spellings the walker must still read ------------------------------
+
+    def test_a_flow_mapping_step_is_read(self):
+        self._write(
+            "flow.yml",
+            "name: Flow\n"
+            "on: [push]\n"
+            "jobs:\n"
+            "  run:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps: [{id: a, run: echo hi}, {uses: actions/checkout@v7}]\n",
+        )
+        errors, _, _ = self._check()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("flow.yml,line=6", errors[0])
+        self.assertIn("actions/checkout@v7", errors[0])
+
+    def test_an_implicit_single_pair_flow_step_is_read(self):
+        # YAML's one-step shorthand: `[uses: …]` is a valid flow sequence
+        # holding a single-pair mapping. It carries neither `{` nor `,`, so a
+        # boundary class of `[{,]` alone lets it through UNCHECKED — the one
+        # direction this lint must never fail in.
+        self._write(
+            "flow.yml",
+            "name: Flow\n"
+            "on: [push]\n"
+            "jobs:\n"
+            "  run:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps: [uses: actions/checkout@v7]\n",
+        )
+        errors, _, _ = self._check()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("actions/checkout@v7", errors[0])
+
+    def test_a_flow_mapping_split_across_lines_keeps_its_ref_intact(self):
+        # The continuation line starts with the key, so `_USES_BLOCK_RE` claims
+        # it and its value group runs to end of line — carrying `}]` into the
+        # ref and red-lining a correctly pinned action.
+        self._write(
+            "flow.yml",
+            "name: Flow\n"
+            "on: [push]\n"
+            "jobs:\n"
+            "  run:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps: [{name: Checkout,\n"
+            "      uses: actions/checkout@%s}]\n" % _SHA,
+        )
+        errors, pinned, _ = self._check()
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(pinned, 1)
+
+    def test_a_trailing_comment_naming_a_flow_step_is_not_a_directive(self):
+        # `# was {uses: actions/checkout@v7}` is prose. Reading it as structure
+        # fails closed — a red CI run on a valid workflow, with a message
+        # naming a step that does not exist.
+        self._write(
+            "note.yml",
+            _plain_workflow(
+                "      - uses: actions/checkout@%s  # was {uses: actions/checkout@v7}\n" % _SHA
+            ),
+        )
+        errors, pinned, _ = self._check()
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(pinned, 1)
+
+    def test_a_flow_mapping_inside_a_run_one_liner_is_not_a_directive(self):
+        # A single-line `run:` is shell, not YAML, and has no block-scalar body
+        # for the mask to cover — so the key itself is what takes it out of the
+        # flow scan.
+        self._write(
+            "echo.yml",
+            _plain_workflow("      - run: echo '{\"uses\": \"actions/checkout@v7\"}'\n"),
+        )
+        errors, pinned, _ = self._check()
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(pinned, 0)
+
+    def test_a_run_key_does_not_excuse_the_flow_step_beside_it(self):
+        # The skip is anchored on the LINE's own key. A `steps:` line that
+        # merely carries a `run:` entry is still structure, and the `uses:`
+        # next to it is still a directive — the exact shape of this repo's own
+        # `test-workflow-pins.yml` fixtures.
+        self._write(
+            "flow.yml",
+            "name: Flow\n"
+            "on: [push]\n"
+            "jobs:\n"
+            "  run:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps: [{id: a, run: echo hi}, {uses: actions/checkout@v7}]\n",
+        )
+        errors, _, _ = self._check()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("actions/checkout@v7", errors[0])
+
+    def test_a_stray_apostrophe_does_not_mask_a_real_floating_ref(self):
+        # The quote scan takes the STRICT reading: a `'` that follows a plain
+        # word opens no YAML node. Under the weak reading `Don't` would wedge a
+        # scalar open for the rest of the line and drop the floating ref that
+        # follows out of coverage entirely — a silent miss, the one direction
+        # this lint must not fail in.
+        self._write(
+            "flow.yml",
+            "name: Flow\n"
+            "on: [push]\n"
+            "jobs:\n"
+            "  run:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps: [{name: Don't skip, uses: actions/checkout@v7}]\n",
+        )
+        errors, _, _ = self._check()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("actions/checkout@v7", errors[0])
+
+    def test_a_real_flow_step_with_a_quoted_sibling_value_is_still_read(self):
+        # The quote guard must not blind the walk to a genuine flow step that
+        # merely has a quoted value earlier on its line: the `,` boundary sits
+        # OUTSIDE those quotes.
+        self._write(
+            "flow.yml",
+            "name: Flow\n"
+            "on: [push]\n"
+            "jobs:\n"
+            "  run:\n"
+            "    runs-on: ubuntu-latest\n"
+            '    steps: [{name: "Check it out", uses: actions/checkout@v7}]\n',
+        )
+        errors, _, _ = self._check()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("actions/checkout@v7", errors[0])
+
+    def test_a_quoted_flow_key_is_still_read(self):
+        self._write(
+            "flow.yml",
+            "name: Flow\n"
+            "on: [push]\n"
+            "jobs:\n"
+            "  run:\n"
+            "    runs-on: ubuntu-latest\n"
+            '    steps: [{"uses": "actions/checkout@v7"}]\n',
+        )
+        errors, _, _ = self._check()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("actions/checkout@v7", errors[0])
+
+    def test_a_quoted_value_is_unwrapped_before_it_is_judged(self):
+        self._write("q.yml", _plain_workflow("      - uses: 'actions/checkout@v7'\n"))
+        errors, _, _ = self._check()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("actions/checkout@v7", errors[0])
+        self._write("q.yml", _plain_workflow('      - uses: "actions/checkout@%s"\n' % _SHA))
+        errors, pinned, _ = self._check()
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(pinned, 1)
+
+    def test_a_reusable_workflow_call_is_held_to_the_same_rule(self):
+        # The `uses:` this repo's own self-enrolment callers carry.
+        wf = "Comfy-Org/github-workflows/.github/workflows/groom.yml"
+        self._write(
+            "ci.yml",
+            "name: CI\non: [push]\njobs:\n  call:\n    uses: %s@v1\n" % wf,
+        )
+        errors, _, _ = self._check()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn(wf + "@v1", errors[0])
+
+    def test_an_annotation_escapes_an_untrusted_filename(self):
+        # Same discipline as `check_dir`: names come from a directory listing.
+        self._write("od,d.yml", _plain_workflow("      - uses: actions/checkout@v7\n"))
+        errors, _, _ = self._check()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("od%2Cd.yml,line=", errors[0])
+
+    # --- the CLI, end to end ------------------------------------------------
+
+    def test_main_fails_on_a_file_that_declares_no_workflows_ref(self):
+        # The regression in one test: `check_dir` returns early for this file,
+        # so only a check outside it can see the floating ref.
+        self._write("plain.yml", _plain_workflow("      - uses: actions/checkout@v7\n"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = cwp.main(["--workflows-dir", self.dir])
+        self.assertEqual(status, 1, out.getvalue())
+        self.assertIn("no reusable workflow declares", out.getvalue())
+        self.assertIn("BE-15255", out.getvalue())
+
+    def test_main_reports_the_pin_count_on_a_clean_dir(self):
+        self._write("plain.yml", _plain_workflow("      - uses: actions/checkout@%s # v7.0.1\n" % _SHA))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = cwp.main(["--workflows-dir", self.dir])
+        self.assertEqual(status, 0, out.getvalue())
+        self.assertIn("1 `uses:` ref(s) SHA-pinned (0 exempt, 0 not pinnable).", out.getvalue())
+
+    def test_main_names_a_not_pinnable_site_rather_than_dropping_it(self):
+        # The count alone would fall silently when a pinned ref is swapped for
+        # a local path; the line says which site and why.
+        self._write(
+            "plain.yml",
+            _plain_workflow(
+                "      - uses: actions/checkout@%s # v7.0.1\n" % _SHA
+                + "      - uses: ./.github/actions/setup\n"
+            ),
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = cwp.main(["--workflows-dir", self.dir])
+        self.assertEqual(status, 0, out.getvalue())
+        self.assertIn("1 `uses:` ref(s) SHA-pinned (0 exempt, 1 not pinnable).", out.getvalue())
+        self.assertIn("not pinnable plain.yml:8: ./.github/actions/setup", out.getvalue())
+
+    def test_main_scopes_the_debt_list_to_this_repos_own_dir(self):
+        # Same reason KNOWN_EXEMPT is scoped: against an ad-hoc --workflows-dir
+        # every entry would read as stale. The CHECK still runs there.
+        self._write("plain.yml", _plain_workflow("      - uses: actions/checkout@%s\n" % _SHA))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), _patched(cwp, "KNOWN_UNPINNED",
+                                                       frozenset({("nope.yml", "a/b@v1")})):
+            status = cwp.main(["--workflows-dir", self.dir])
+        self.assertEqual(status, 0, out.getvalue())
+
+
+class ThisRepoIsPinnedTests(unittest.TestCase):
+    """The lint, pointed at the real `.github/workflows/` it ships to police."""
+
+    def test_every_uses_in_this_repo_is_sha_pinned(self):
+        # The acceptance criterion itself, asserted where a reader can see it
+        # rather than only in CI's exit status: after BE-15255 the repo has no
+        # floating `uses:` left, and the exemption list is empty, so this is a
+        # true zero rather than a suppressed one.
+        root = os.path.dirname(  # …/github-workflows
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        )
+        workflows = os.path.join(root, ".github", "workflows")
+        if not os.path.isdir(workflows):
+            self.skipTest("not running from a checkout of this repo")
+        errors, pinned, exempt_ok, _ = cwp.check_action_pins(
+            workflows, exempt=cwp.KNOWN_UNPINNED
+        )
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(exempt_ok, [])
+        self.assertGreater(pinned, 100, "the walker stopped finding this repo's `uses:` refs")
 
 
 if __name__ == "__main__":

@@ -136,6 +136,24 @@
 #                  scripts inside it. Plain repo-relative FILE paths only —
 #                  pathspec magic belongs in WATCHED_PATHSPECS, and a directory
 #                  is rejected (WATCHED_ASSETS is the input for one).
+#   GITHUB_EVENT_NAME / GITHUB_EVENT_PATH
+#                  Provided by Actions to every step (no entrypoint wiring
+#                  needed); read ONLY by the Skip-caller-bump trailer gate at
+#                  the bottom of this file. Absent, unreadable or malformed is
+#                  never an error — that gate fails open toward bumping.
+#   GITHUB_REPOSITORY / GITHUB_WORKFLOW_REF
+#                  Also provided by Actions to every step; read ONLY by the
+#                  owed-bump probe that guards that gate (BE-10008), to find this
+#                  fleet's own Actions run history. Absent or unparseable reads
+#                  as "cannot determine", which bumps.
+#   GH_TOKEN       The ambient, read-only `${{ github.token }}`, wired into the
+#                  preflight step's `env:` by every entrypoint alongside an
+#                  `actions: read` permission — the ONLY credential this script
+#                  uses, and it is minted long before the org-wide write token
+#                  the bump step needs. Read by the same owed-bump probe (it is
+#                  what `gh api` authenticates with). Unset means the probe's
+#                  reads fail, which reads as "cannot determine" and bumps —
+#                  never an error.
 #
 # All three list inputs are newline-separated so an entrypoint can write them as
 # a YAML block scalar directly beneath the `paths:` filter they mirror. They do
@@ -161,9 +179,43 @@
 #
 # Outputs (written to $GITHUB_OUTPUT on every exit-0 path):
 #   proceed  "true"  → the caller should run bump-callers.sh
-#            "false" → stale or decommissioned; the caller should do nothing
+#            "false" → stale, decommissioned, or a trailer-declared churn push
+#                      (below); the caller should do nothing
 #   new_sha  the SHA to pin callers to — NEW_SHA, or the verified main tip when
 #            this run was re-pointed forward (see the re-point block below)
+#
+# One more skip verdict runs ahead of the final proceed=true, AFTER every check
+# above (BE-9561's follow-up): a push whose EVERY commit message carries the
+# anchored, case-insensitive-key line
+#   ^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$
+# — the `Skip-caller-bump: true` trailer — IN ITS TRAILING TRAILER BLOCK
+# declares itself bump-irrelevant (comment/docs-only churn inside a watched
+# surface) and skips with proceed=false. The block requirement is not a detail:
+# a body-wide line search would read the token as a DECLARATION when it is only
+# being QUOTED, so a behavioral commit that merely describes this feature would
+# suppress its own bump. Push events only: a workflow_dispatch run always bumps,
+# which is both the fleets' documented recovery path and the manual override
+# after a mistaken trailer. ALL commits in the push must carry the trailer (a
+# mixed push still bumps), and the payload's `.commits` must have 1..2047
+# entries — GitHub documents the push WEBHOOK payload (what GITHUB_EVENT_PATH
+# holds) as carrying at most 2048 commits, so 2048 may be TRUNCATED and an
+# incompletely-checked push must not skip. The far lower 20-entry cap belongs to
+# the Events API's `PushEvent`, which this is not. Any read/parse failure falls
+# through to bumping: the gate FAILS OPEN, so its worst bug is status-quo churn,
+# never pin drift. Full contract at the gate itself, at the bottom of this file.
+#
+# That gate is itself guarded (BE-10008). A bump run is also the CATCH-UP for an
+# earlier watched change whose own run never bumped — one that failed at the
+# token mint or inside bump-callers.sh, was cancelled, or never started at all
+# because a `paths:` filter only sees the first 300 changed files of a push — and
+# nothing in the push payload can see that. So before a trailer is honored,
+# `fleet_owes_bump` reads this fleet's own Actions run history (the
+# .github/groom/interval.py pattern: `actions: read` on the ambient token, no new
+# secret), finds the newest run whose `Bump SHA in caller repos` step actually
+# succeeded, and refuses the skip if ANY commit on the watched surface since that
+# run's head carries no trailer of its own. It can only ever NARROW a skip, and
+# every indeterminate answer — no gh/jq, an API error, no such run in the scan
+# bound, an unwalkable range — bumps.
 #
 # Exits non-zero ONLY for an input we cannot trust (malformed SHA, a glob-shaped,
 # slash-terminated or non-repo-relative watched path, a set-but-blank or
@@ -481,6 +533,167 @@ match_paths() { # $1 = tree-ish, $2.. = pathspecs; result in $MATCHED
 emit() {
   printf 'proceed=%s\n' "$1" >> "$GITHUB_OUTPUT"
   printf 'new_sha=%s\n' "$2" >> "$GITHUB_OUTPUT"
+}
+
+# --- Skip-caller-bump trailer recognition (shared) ----------------------------
+# ONE definition of what "this commit declares itself bump-irrelevant" means,
+# read by BOTH consumers of that declaration: the hand-off guard in the
+# staleness branch below (which reads messages out of git) and the trailer gate
+# at the foot of this file (which reads them out of the push event payload). A
+# second copy of this regex is precisely the drift this directory exists to
+# prevent.
+#
+# A trailer counts only inside the message's TRAILING TRAILER BLOCK — the
+# maximal suffix of BODY lines that are blank or `Token: value` shaped, AND
+# which starts at a PARAGRAPH BOUNDARY (a blank line precedes it, or it opens
+# the body right after the title) — rather than anywhere in the message. That
+# is `git interpret-trailers --parse` semantics, and it is what stops the token
+# being read as a DECLARATION when it is only being QUOTED: a
+# `git cherry-pick -x` copy of a trailered commit (whose appended
+# "(cherry picked from commit ...)" line is not trailer-shaped, so it correctly
+# ends the block), a commit whose prose documents this very feature at column 0,
+# or a reapply carrying the original body along.
+#
+# The scan never reaches the TITLE: everything through the first blank line is
+# dropped before it, because git reads no trailers out of the title paragraph —
+# a message with no blank line at all is one paragraph of title and
+# unconditionally untrailered, even when a conventional-commit subject
+# (`docs: …`) is itself `Token: value` shaped and would otherwise be swallowed
+# into the suffix. (A last paragraph made ENTIRELY of token-shaped lines is a
+# trailer block even when a lead-in like `Example:` reads as prose to a human —
+# that too is exactly how git parses it, and the reviewer gate below is the
+# guard for a trailer quoted onto a behavioral PR.)
+#
+# The paragraph-boundary half is what covers the quote that is the paragraph's
+# LAST line, which the maximal-suffix rule alone does not:
+#   docs: explain the gate
+#
+#   A churn commit ends with:
+#   Skip-caller-bump: true
+# The suffix scan accumulates the token line and stops on the prose above it —
+# but that prose is not a blank line, so the block does not begin a paragraph
+# and the message reads as untrailered, exactly as git reads it. A trailing
+# `Co-authored-by:` paragraph does not rescue such a quote either, because the
+# scan walking back through it still lands on non-blank prose.
+#
+# Blank lines are allowed INSIDE the block, which is what keeps GitHub's
+# appended `Co-authored-by:` paragraph from pushing an otherwise valid trailer
+# out of it — and the leading blank the scan swallows on its way out of the
+# block IS the paragraph boundary being asserted.
+#
+# The value match is exact and anchored:
+#   ^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$
+# each word's first letter case-insensitive, whitespace around the value free —
+# `false`, an all-caps key, and an indented line all read as untrailered, i.e.
+# as "bump". Lines are right-trimmed first, and the regex is applied PER LINE
+# rather than with a multiline flag, so `[[:space:]]*` can never swallow a
+# newline and match a value on the following line.
+# shellcheck disable=SC2016  # a jq PROGRAM: $line is jq's variable, not the shell's
+SKIP_TRAILER_JQ='
+  def skip_trailer:
+    (. // "")
+    | split("\n")
+    | map(sub("[[:space:]]+$"; ""))
+    | (index("") // -1) as $title_end
+    | ($title_end >= 0) and (
+        .[($title_end + 1):] as $body
+        | (reduce ($body | reverse | .[]) as $line ([true, []];
+             if .[0] and (($line == "") or ($line | test("^[A-Za-z][A-Za-z0-9-]*:")))
+             then [true, (.[1] + [$line])]
+             else [false, .[1]]
+             end) | .[1] | reverse) as $block
+        | ((($block | length) == ($body | length)) or (($block | first) == ""))
+          and ($block | any(test("^[Ss]kip-[Cc]aller-[Bb]ump:[[:space:]]*true[[:space:]]*$")))
+      );
+'
+
+# Asks whether every commit the range <from>..<to> gained ON THE WATCHED SURFACE
+# carries the trailer. Callers are in the staleness branch, which has already
+# deepened the clone and proved <to> descends from <from>, so the range is well
+# defined and present locally. The watched surface is passed as pathspecs in
+# $3.. — the SAME ones the surface comparison above used, so the two agree by
+# construction.
+#
+# Restricted to that surface deliberately, because the question this actually
+# answers is "will any newer run pin this content?" and only a commit matching
+# the fleet's `paths:` filter STARTS a run at all. An unwatched commit can
+# neither decline nor pin, so reading it as "untrailered, so defer" defers to a
+# run that was never triggered: behavioral commit A, trailered watched commit B
+# and an untrailered README-only commit U landing in one window would leave A
+# reaching no caller — B's run declines on the trailer and U's run does not
+# exist. Only a watched, untrailered commit is a real hand-off.
+#
+# Three exit codes, not a boolean, because "found an untrailered commit" and
+# "could not evaluate the range" must not print the same line: with one verdict
+# for both, a log could not tell a genuinely safe hand-off from a guard that
+# declined to run, on exactly the manual re-run the bound exists for.
+#   0  every watched commit in the range is trailered — this run must NOT defer
+#   1  at least one watched commit is untrailered — deferring is correct
+#   2  could not evaluate (no jq, a failed walk, no watched commit selected, or
+#      a range past the bound). The caller keeps the pre-existing stale verdict
+#      — an inability to check is not grounds to widen a skip — but says so
+#      distinctly, so the trace shows the pin-drift window may be open.
+#
+# The bound MATCHES the gate's own `.commits` bound at the foot of this file, so
+# no range the gate would skip commit-by-commit is one this guard declines to
+# evaluate. The two used to disagree (50 here, 2047 there), which left an
+# all-trailered 51..2047-commit range answering "defer" here while every newer
+# push in it declined there — nobody pinning, which is the drift this guard was
+# added to close. It is enforced by `-n` on the walk itself rather than by
+# collecting the whole range and then discarding it, so nothing unbounded is
+# ever materialized — which is what makes the bound affordable at the gate's
+# number rather than a number picked to keep the old per-commit shell-outs cheap.
+SKIP_TRAILER_RANGE_MAX=2047
+range_all_skip_trailered() {
+  command -v jq >/dev/null 2>&1 || return 2
+  local from="$1" to="$2"
+  shift 2
+  local raw verdict
+  # One `git log` and one jq pass, not a shell-out per commit: the walk costs
+  # the same whether the range is one commit or the whole bound, which is what
+  # makes the bound affordable at the gate's number. \x1e (ASCII record
+  # separator) delimits the messages — NUL would be dropped by the command
+  # substitution, and every printable byte can legitimately appear in a message.
+  raw=$(git log -n "$((SKIP_TRAILER_RANGE_MAX + 1))" --format=$'\x1e%B' "$from..$to" -- "$@") || return 2
+  [[ -n "$raw" ]] || return 2
+  verdict=$(printf '%s' "$raw" | jq -Rrs "$SKIP_TRAILER_JQ"'
+    split("\u001e")
+    | .[1:]
+    | if length == 0 or length > '"$SKIP_TRAILER_RANGE_MAX"' then "unknown"
+      elif all(.[]; skip_trailer) then "all"
+      else "some"
+      end' 2>/dev/null) || return 2
+  case "$verdict" in
+    all) return 0 ;;
+    some) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+# The watched surface expressed as PATHSPECS — whichever shape the staleness
+# comparison itself uses, so every reader of "the watched surface" means the same
+# thing by construction. Two read it: the hand-off guard in the staleness branch
+# above, and the owed-bump probe at the foot of this file. A second hand-rolled
+# copy of this three-line choice is exactly the drift this directory exists to
+# prevent, and here it would be worse than cosmetic: the two readers would
+# disagree about which commits count, on the one input (an excluding fleet's
+# WATCHED_PATHSPECS) where that changes the verdict.
+#
+# The result is never empty — WATCHED is always in it — so callers may expand it
+# unguarded. Building it takes two steps because `"${asset_dirs[@]}"` on an EMPTY
+# array is an unbound-variable error under `set -u` on bash 3.2 (macOS), which
+# this suite runs on.
+SURFACE_PATHSPECS=()
+surface_pathspecs() {
+  SURFACE_PATHSPECS=()
+  if (( ${#watched_pathspecs[@]} > 0 )); then
+    SURFACE_PATHSPECS=("${watched_pathspecs[@]}")
+    return 0
+  fi
+  SURFACE_PATHSPECS=("$WATCHED")
+  if (( ${#asset_dirs[@]} > 0 )); then
+    SURFACE_PATHSPECS+=("${asset_dirs[@]}")
+  fi
 }
 
 # The main-only ref guard in the entrypoints cannot catch a manual RE-RUN of an
@@ -845,15 +1058,61 @@ if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
     [[ "$tip_blob" == "$here_blob" ]] || changed_surface="$WATCHED"
   fi
   if [[ -n "$surface_changed" ]]; then
-    echo "github.sha $GITHUB_SHA is behind main ($main_tip) and the watched surface changed since ($changed_surface) — stale run/re-run; the newer commit has its own run. Nothing to bump"
-    emit false "$NEW_SHA"
-    exit 0
+    # HAND-OFF GUARD (BE-9571). Deferring here is sound only because of what the
+    # message says: the newer commit "has its own run, which will pin the newer
+    # content". Since the Skip-caller-bump gate at the foot of this file exists,
+    # that run can DECLINE — and then nobody pins anything. Sequence: behavioral
+    # commit A lands on a watched surface; trailered churn commit B rewords a
+    # comment in the same surface moments later; A's run reads the surface as
+    # changed and defers to B's run; B's run skips on the trailer; A reaches no
+    # caller until some later behavioral commit happens along. That is exactly
+    # the pin drift the gate's header promises cannot happen.
+    #
+    # So ask whether the newer commits are the kind that will decline. If EVERY
+    # commit main gained since this one ON THE WATCHED SURFACE is trailered
+    # churn, this run is the last one that will pin this content, and it must
+    # not defer. Pin the verified TIP: every watched commit between here and it
+    # is author-declared bump-irrelevant and every other one started no run at
+    # all, so the tip is this run's change plus nothing a caller can observe, at
+    # a commit that is actually current — the same argument the re-point below
+    # makes from byte-identity, made instead from the author's declaration.
+    #
+    # A range this cannot READ — no jq, a failed walk, a range longer than the
+    # sanity bound (a manual re-run of an ancient commit) — leaves the
+    # pre-existing stale verdict standing. This guard NARROWS the stale skip; an
+    # inability to check is not grounds to widen it. It says so on its own line
+    # first, though: the stale message claims a newer run will pin this content,
+    # and when the guard could not check, nothing verified that claim.
+    #
+    # The pathspecs handed over are whichever shape the comparison above used,
+    # so "the watched surface" means the same thing to both.
+    surface_pathspecs
+    handoff_rc=0
+    range_all_skip_trailered "$head_sha" "$fetched_tip" "${SURFACE_PATHSPECS[@]}" || handoff_rc=$?
+    if (( handoff_rc == 0 )); then
+      echo "::notice::main moved to $main_tip since $GITHUB_SHA and the watched surface changed since ($changed_surface), but EVERY commit in between that touches a watched path carries a 'Skip-caller-bump: true' trailer — those runs will decline to bump, so this run must not defer to them. Pinning callers to $main_tip and proceeding"
+      # Falls through to the shared re-point below, which sets NEW_SHA/repointed
+      # for both entry paths.
+    else
+      if (( handoff_rc != 1 )); then
+        echo "Could not evaluate whether the commits main gained since $GITHUB_SHA are all trailered churn (no jq, a failed history walk, or a range past ${SKIP_TRAILER_RANGE_MAX} commits) — keeping the stale verdict below unchanged, but it is UNVERIFIED: if every newer run declines on a 'Skip-caller-bump: true' trailer, this content reaches no caller until the next behavioral bump. A workflow_dispatch run of this fleet forces one."
+      fi
+      echo "github.sha $GITHUB_SHA is behind main ($main_tip) and the watched surface changed since ($changed_surface) — stale run/re-run; the newer commit has its own run. Nothing to bump"
+      emit false "$NEW_SHA"
+      exit 0
+    fi
   fi
-  # Pin callers to the VERIFIED TIP, not to this run's stale github.sha. We have
-  # just proved every watched object is byte-identical at both, so the tip is the
-  # same reusable content at a commit that is actually current — pinning the
-  # older SHA would hand every caller a non-tip commit (and, on a
-  # land-then-revert, re-pin them backwards).
+  # Pin callers to the VERIFIED TIP, not to this run's stale github.sha. Two
+  # entry paths reach here and each carries its own proof that the tip is safe
+  # to pin: the common one has just proved every watched object is
+  # byte-identical at both, and the hand-off guard above has just proved every
+  # watched commit in between declares itself bump-irrelevant. Either way the
+  # tip is the same observable content at a commit that is actually current —
+  # pinning the older SHA would hand every caller a non-tip commit (and, on a
+  # land-then-revert, re-pin them backwards). The line printed below therefore
+  # belongs to the byte-identity path ONLY: the guard has already printed its
+  # own ::notice::, and repeating "the watched surface is unchanged" after it
+  # would contradict the verdict two lines up.
   #
   # COUPLED TO THE PATH FILTER — this is only sound because every entry in the
   # fleet's `paths:` trigger is covered by the comparison above. A single-path
@@ -898,7 +1157,9 @@ if [[ "$main_tip" != "$GITHUB_SHA" ]]; then
   # cannot arise. There WATCHED_ASSETS buys only the COVERAGE ASSERTION above —
   # that the pathspec list still reaches under it — which is the one guard that
   # catches the list silently losing its positive `scripts/pr-risk` entry.
-  echo "main moved to $main_tip since $GITHUB_SHA, but the watched surface is unchanged — this run is still the only one for that change; pinning callers to $main_tip and proceeding"
+  if [[ -z "$surface_changed" ]]; then
+    echo "main moved to $main_tip since $GITHUB_SHA, but the watched surface is unchanged — this run is still the only one for that change; pinning callers to $main_tip and proceeding"
+  fi
   NEW_SHA="$main_tip"
   repointed=1
 fi
@@ -954,6 +1215,336 @@ if [[ -z "$repointed" ]] && (( ${#watched_exec[@]} > 0 )); then
       exit 0
     fi
   done
+fi
+
+# --- Skip-caller-bump trailer gate (last, deliberately) -----------------------
+# A commit that only rewords comments/docs inside a watched surface still
+# matches the fleet's `paths:` filter and fans a pure-churn SHA-bump PR — a
+# review round in every caller repo — for a change no caller can observe. A
+# reviewed commit on main can declare itself bump-irrelevant with a
+# `Skip-caller-bump: true` commit-message trailer; this gate honors it. It runs
+# immediately before the final `emit true`, on both the normal and the
+# re-pointed path, so every loud validation / staleness / decommission verdict
+# above keeps precedence — the trailer can never mask an error or convert a
+# stale/decommission verdict into a quiet skip.
+#
+# Skip (proceed=false, new_sha as computed, exit 0) ONLY when ALL of:
+#   * GITHUB_EVENT_NAME is exactly `push`. A workflow_dispatch run must always
+#     bump: dispatch is the fleets' documented recovery path, and doubles as
+#     the manual override after a mistaken trailer.
+#   * GITHUB_EVENT_PATH names a readable file that jq parses.
+#   * The payload's `.commits` array has >= 1 and <= 2047 entries. GitHub
+#     documents the push WEBHOOK payload — which is what $GITHUB_EVENT_PATH
+#     holds — as carrying "a maximum of 2048 commits"; the far lower 20-entry
+#     cap belongs to the Events API's `PushEvent` representation, which this is
+#     not, and the webhook payload carries no `.size` to compare a length
+#     against, so the count IS the only truncation signal available. At 2048 the
+#     array may therefore be incomplete — an unchecked 2049th commit could be
+#     behavioral — and skipping on an incompletely-checked push could suppress a
+#     behavioral bump. Refuse to skip instead.
+#   * EVERY entry's `.message` carries the trailer in its TRAILING TRAILER
+#     BLOCK, per the one shared `skip_trailer` definition above.
+#
+#     ALL commits, not just those touching watched paths. On a DIRECT push to
+#     main that is what stops a mixed push — one behavioral commit, one
+#     trailered docs commit — from skipping. It is NOT what guards the shape
+#     changes actually arrive in here: this repo squash-merges, so a whole PR
+#     lands as ONE commit and the all-commits rule is then trivially the
+#     head-commit rule. What does the guarding there is the trailer-BLOCK
+#     requirement plus review: GitHub's squashed body concatenates the branch
+#     commits in order, so only a trailer in the LAST commit's message survives
+#     into the squashed message's trailer block — which is also the text the
+#     squash-merge UI shows the person pressing the button. A trailer that
+#     reaches main therefore claims the WHOLE PR is bump-irrelevant, for EVERY
+#     fleet, and reviewers reject it on a PR carrying behavioral changes exactly
+#     as they would any other reviewed line.
+#
+# On ANY other condition — a missing/unreadable payload, malformed JSON, no jq
+# on PATH, an empty or absent `.commits` — fall through to `emit true`: the
+# gate FAILS OPEN toward bumping. It is optional sugar, so its worst bug must
+# be status-quo churn (a bump that could have been skipped), never pin drift (a
+# skip that suppressed a real bump) — and never a hard failure, which is why
+# every probe is `||`-guarded under this file's `set -euo pipefail` (an abort
+# would fail the run loudly, the one thing worse than either verdict here).
+#
+# A bump run is also the CATCH-UP for an earlier watched change whose own run
+# never bumped — one that failed at the token mint or inside bump-callers.sh, was
+# cancelled, or never started because a `paths:` filter is evaluated against only
+# the first 300 changed files of a push. Declining here used to decline that
+# catch-up too (the KNOWN LIMIT this comment used to carry), and nothing in the
+# push PAYLOAD can see it — the hand-off guard above covers only the
+# concurrent-run case. `fleet_owes_bump` below closes it by looking somewhere the
+# payload cannot: this fleet's own Actions run history. It runs BEFORE the skip
+# is honored and can only ever REFUSE one.
+#
+# Residual, and it is deliberate: the scan reads a bounded page of recent runs,
+# so a fleet whose last real bump has aged out of that page — or out of the
+# Actions run-retention window entirely — reads as "cannot determine" and bumps.
+# That is status-quo churn (the behavior before the trailer existed), never pin
+# drift, which is the only direction this file lets an optional check fail in.
+#
+# Messages are read from the EVENT PAYLOAD (`.commits[].message`), never
+# `git log`: the default checkout is fetch-depth 1, so the push range's parent
+# commits are not present locally, and fetching them for this would be
+# avoidable cost and failure surface. (The hand-off guard above is the one
+# reader that does use git — it runs only in the branch that has already
+# deepened the clone for its ancestry checks.)
+
+# --- owed-bump probe: does this fleet still owe a CATCH-UP bump? (BE-10008) ---
+# The gate above answers "is this push bump-irrelevant?" from the push payload
+# alone. That is not the whole question, because a bump run is also the catch-up
+# for an EARLIER watched change whose own run never bumped: it failed at the
+# token mint or inside bump-callers.sh, it was cancelled, or it never started at
+# all (GitHub evaluates a `paths:` filter against only the first 300 changed
+# files of a push — see bump-pr-risk-callers.yml's header). Honoring a trailer
+# on today's docs push then declines that catch-up as well, and every caller
+# stays on a stale SHA with nothing red anywhere.
+#
+# So before honoring the trailer, ask a question the payload cannot answer:
+# since the last run of THIS fleet that actually bumped, is there any watched
+# commit that did NOT declare itself bump-irrelevant? If there is, this run is
+# the catch-up for it and must not decline.
+#
+# The last-run state comes from Actions run history — the
+# `.github/groom/interval.py` pattern: derivable with only `actions: read` (which
+# the entrypoints now grant) on the ambient GITHUB_TOKEN, so it needs no new
+# secret and no writable store, and it is fail-open by construction.
+#
+#   1. LEFT ENDPOINT L. This run's own workflow file comes from
+#      GITHUB_WORKFLOW_REF, the repo from GITHUB_REPOSITORY. List that workflow's
+#      successful runs on main, newest first, ONE bounded page, and take the
+#      first whose job carries a step named exactly `Bump SHA in caller repos`
+#      with conclusion `success`. That step name is the discriminator the whole
+#      probe rests on: the step is `skipped` on a declined run and `success` on a
+#      real bump, and every entrypoint spells it identically —
+#      test_paths_contract.sh fails the build if one ever stops doing so.
+#      L is that run's `head_sha`. `push` AND `workflow_dispatch` runs both
+#      count: a dispatch recovery bump is exactly as much of a catch-up as a
+#      push one.
+#
+#      head_sha rather than the SHA that run PINNED is deliberate and safe: a
+#      re-pointed run proved its watched surface byte-identical (or every
+#      intervening watched commit trailered) up to its pin target, so the
+#      difference can only add commits to the range below — i.e. it errs toward
+#      bumping.
+#
+#   2. WALK L..HEAD, restricted to the watched surface, and check each commit's
+#      message with the ONE shared trailer definition above. Per COMMIT, not a
+#      content diff: that is what lets an earlier, legitimately-skipped trailered
+#      push keep being excused by its own trailer instead of poisoning every
+#      later skip. Any untrailered watched commit in that range is an owed
+#      catch-up.
+#
+#   3. FAIL TOWARD BUMPING, always. No gh, no jq, an API error, no qualifying run
+#      inside the scan bound (including a retention-expired history), unreadable
+#      jobs, a failed deepening fetch, an L that is not an ancestor of HEAD, a
+#      range past the sanity bound — every one of them reads as "cannot
+#      determine" and bumps. This check may only NARROW the skip, never widen it,
+#      and (like the gate it guards) it must never hard-fail the run, hence the
+#      `||` guards under this file's `set -euo pipefail`.
+OWED_BUMP_STEP_NAME='Bump SHA in caller repos'
+# One page of run history. Runs come back newest-first, and the newest successful
+# run of a healthy fleet IS a bumping one, so the common case costs two API
+# calls. The bound is what keeps a fleet whose recent history is all declines
+# from walking backwards forever; falling off the end reads as "cannot
+# determine".
+OWED_RUN_SCAN_MAX=30
+
+# The two `gh api` reads, each in its own function with NO `--jq`, so the tests
+# can put a `gh` stub on PATH that only has to echo canned JSON. All filtering
+# happens in this script, with the same jq the rest of the file uses.
+owed_api() { gh api "$1"; }
+
+# This run's workflow FILE, from GITHUB_WORKFLOW_REF
+# (`owner/repo/.github/workflows/<file>@<ref>`). The runs API takes that basename
+# as its `workflow_id`. The `@<ref>` suffix is stripped with the SHORTEST match
+# so a path containing an `@` cannot eat the filename with it.
+owed_workflow_file() {
+  local ref="${GITHUB_WORKFLOW_REF-}"
+  [[ -n "$ref" ]] || return 1
+  ref="${ref%@*}"
+  ref="${ref##*/}"
+  # Shape-checked before it is interpolated into an API path, the same guard
+  # .github/groom/interval.py puts on its own --workflow-file: a value that is
+  # not a plain `*.yml` basename is a context this script does not understand,
+  # and reading it as one would spend a doomed round-trip at best.
+  [[ "$ref" =~ ^[A-Za-z0-9._-]+\.(yml|yaml)$ ]] || return 1
+  printf '%s' "$ref"
+}
+
+# L, per step 1 above. Prints nothing; the answer lands in $OWED_LEFT_ENDPOINT.
+# Returns 1 for every "cannot determine" shape, which the caller reads as bump.
+OWED_LEFT_ENDPOINT=""
+owed_left_endpoint() {
+  OWED_LEFT_ENDPOINT=""
+  command -v gh >/dev/null 2>&1 || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  local repo="${GITHUB_REPOSITORY-}" wf runs jobs bumped id sha
+  [[ "$repo" == */* ]] || return 1
+  wf=$(owed_workflow_file) || return 1
+  runs=$(owed_api "repos/${repo}/actions/workflows/${wf}/runs?branch=main&status=success&per_page=${OWED_RUN_SCAN_MAX}") || return 1
+  # `status=success` already excludes the runs that failed or were cancelled
+  # before they could bump; the event filter keeps out anything that is not one
+  # of the two triggers a real bump can come from.
+  runs=$(printf '%s' "$runs" | jq -r '
+    (.workflow_runs // [])
+    | map(select((.event == "push") or (.event == "workflow_dispatch")))
+    | .[] | "\(.id)\t\(.head_sha)"' 2>/dev/null) || return 1
+  [[ -n "$runs" ]] || return 1
+  while IFS=$'\t' read -r id sha; do
+    [[ "$id" =~ ^[0-9]+$ ]] || continue
+    [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || continue
+    jobs=$(owed_api "repos/${repo}/actions/runs/${id}/jobs?per_page=100") || continue
+    bumped=$(printf '%s' "$jobs" | jq -r --arg step "$OWED_BUMP_STEP_NAME" '
+      [ (.jobs // [])[] | (.steps // [])[]
+        | select(.name == $step and .conclusion == "success") ] | length > 0' 2>/dev/null) || continue
+    if [[ "$bumped" == "true" ]]; then
+      OWED_LEFT_ENDPOINT="$sha"
+      return 0
+    fi
+  done <<<"$runs"
+  return 1
+}
+
+# Make sure $1 is present locally WITH REAL HISTORY. The gate sits on the normal
+# path, where the fetch-depth-1 checkout the entrypoints do was never deepened —
+# and `git merge-base --is-ancestor` cannot answer against a `--depth=1` graft
+# (the same finding that shaped the staleness branch's fetch above). Reuse that
+# branch's shape: probe with `--is-shallow-repository` (correct inside a linked
+# worktree, where the `shallow` marker lives in the COMMON git dir) and deepen
+# only when it says so — `--unshallow` is an error on an already-complete clone,
+# and on the re-pointed path the deepening has already happened.
+owed_have_history() { # $1 = commit that must be present
+  local want="$1" shallow
+  shallow=$(git rev-parse --is-shallow-repository 2>/dev/null) || shallow=""
+  if [[ "$shallow" == "true" ]]; then
+    git fetch --unshallow origin refs/heads/main >/dev/null 2>&1 || return 1
+  elif ! git cat-file -e "${want}^{commit}" 2>/dev/null; then
+    git fetch origin refs/heads/main >/dev/null 2>&1 || return 1
+  fi
+  git cat-file -e "${want}^{commit}" 2>/dev/null || return 1
+}
+
+# Step 2: the OLDEST commit in <from>..<to> that touches the watched surface and
+# does NOT carry the trailer — i.e. the one this fleet has owed a bump for
+# longest, which is the useful one to name in the log.
+#
+# Three exit codes, for the same reason range_all_skip_trailered has three:
+# "there is an owed commit" and "I could not look" must not print the same line.
+#   0  found one — its sha is in $OWED_UNTRAILERED_SHA
+#   1  every watched commit in the range is trailered, or the range selects none
+#      (nothing has landed on the watched surface since the last bump)
+#   2  could not evaluate (no jq, a failed walk, a range past the bound)
+#
+# It shares $SKIP_TRAILER_JQ — the single definition of what the declaration
+# MEANS — with the gate and the hand-off guard, so only the walk differs: this
+# one carries each commit's sha alongside its message so the answer can name it.
+# Bounded by the same SKIP_TRAILER_RANGE_MAX, enforced on the walk itself, so no
+# range the gate would skip commit-by-commit is one this declines to read.
+OWED_UNTRAILERED_SHA=""
+owed_untrailered_commit() { # $1 = from, $2 = to, $3.. = pathspecs
+  OWED_UNTRAILERED_SHA=""
+  command -v jq >/dev/null 2>&1 || return 2
+  local from="$1" to="$2"
+  shift 2
+  local raw verdict
+  # \x1e (ASCII record separator) delimits commits, and the first newline inside
+  # a record splits its sha from its message — NUL would be dropped by the
+  # command substitution, and every printable byte can appear in a message.
+  raw=$(git log -n "$((SKIP_TRAILER_RANGE_MAX + 1))" --format=$'\x1e%H%n%B' "$from..$to" -- "$@") || return 2
+  [[ -n "$raw" ]] || return 1
+  verdict=$(printf '%s' "$raw" | jq -Rrs "$SKIP_TRAILER_JQ"'
+    split("\u001e")
+    | .[1:]
+    | if length > '"$SKIP_TRAILER_RANGE_MAX"' then "unknown"
+      else
+        [ .[]
+          | split("\n") as $rec
+          | {sha: ($rec[0] // ""), msg: ($rec[1:] | join("\n"))}
+          | select((.msg | skip_trailer) | not) ]
+        | if length == 0 then "clean" else "owed \(last | .sha)" end
+      end' 2>/dev/null) || return 2
+  case "$verdict" in
+    clean) return 1 ;;
+    'owed '*)
+      OWED_UNTRAILERED_SHA="${verdict#owed }"
+      [[ "$OWED_UNTRAILERED_SHA" =~ ^[0-9a-f]{40}$ ]] || return 2
+      return 0
+      ;;
+    *) return 2 ;;
+  esac
+}
+
+# The probe itself. 0 = this fleet OWES a bump, so the trailer must not be
+# honored (and every indeterminate answer lands here); 1 = it owes nothing and
+# the skip is safe. Every branch that returns 0 says why on the run summary,
+# because "the trailer did not take" is otherwise indistinguishable from the
+# gate never having fired at all.
+fleet_owes_bump() {
+  local rc=0
+  if ! owed_left_endpoint; then
+    echo "::notice::Not honoring the 'Skip-caller-bump: true' trailer on ${GITHUB_SHA}: could not identify the last run of this fleet whose '${OWED_BUMP_STEP_NAME}' step actually succeeded (no gh/jq, an Actions API error, or no such run inside the last ${OWED_RUN_SCAN_MAX} successful runs on main — history older than the Actions retention window reads the same way). A bump run is also the catch-up for an earlier change whose own run never bumped, and that cannot be ruled out here, so this run bumps."
+    return 0
+  fi
+  if ! owed_have_history "$OWED_LEFT_ENDPOINT"; then
+    echo "::notice::Not honoring the 'Skip-caller-bump: true' trailer on ${GITHUB_SHA}: the last bumping run's commit ${OWED_LEFT_ENDPOINT} could not be made available locally (the deepening fetch failed, or that commit is no longer on main). An owed catch-up cannot be ruled out, so this run bumps."
+    return 0
+  fi
+  if ! git merge-base --is-ancestor "$OWED_LEFT_ENDPOINT" "$head_sha" 2>/dev/null; then
+    echo "::notice::Not honoring the 'Skip-caller-bump: true' trailer on ${GITHUB_SHA}: the last bumping run's commit ${OWED_LEFT_ENDPOINT} is not an ancestor of this run's commit (main was rewritten, or the ancestry could not be checked), so the range that would prove nothing is owed cannot be walked. This run bumps."
+    return 0
+  fi
+  surface_pathspecs
+  owed_untrailered_commit "$OWED_LEFT_ENDPOINT" "$head_sha" "${SURFACE_PATHSPECS[@]}" || rc=$?
+  case "$rc" in
+    0)
+      echo "::notice::Not honoring the 'Skip-caller-bump: true' trailer on ${GITHUB_SHA}: catch-up owed for ${OWED_UNTRAILERED_SHA}, whose own run never bumped. It touches the watched surface, carries no trailer, and landed after ${OWED_LEFT_ENDPOINT} — the last commit this fleet actually pinned callers to — so this run is the catch-up for it and bumps."
+      return 0
+      ;;
+    1) return 1 ;;
+    *)
+      echo "::notice::Not honoring the 'Skip-caller-bump: true' trailer on ${GITHUB_SHA}: could not read the commits between the last bumping run (${OWED_LEFT_ENDPOINT}) and this one (no jq, a failed history walk, or a range past ${SKIP_TRAILER_RANGE_MAX} commits), so an owed catch-up cannot be ruled out. This run bumps."
+      return 0
+      ;;
+  esac
+}
+
+SKIP_BUMP_COMMITS=""
+skip_caller_bump_requested() {
+  [[ "${GITHUB_EVENT_NAME-}" == "push" ]] || return 1
+  [[ -n "${GITHUB_EVENT_PATH-}" ]] || return 1
+  [[ -f "$GITHUB_EVENT_PATH" && -r "$GITHUB_EVENT_PATH" ]] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  # One jq pass answers both halves (count in range, every message trailered).
+  # Any evaluation error — malformed JSON, a non-object commit entry, a
+  # non-string message — fails the whole program, and reads as "bump".
+  local verdict
+  verdict=$(jq -r "$SKIP_TRAILER_JQ"'
+    if (.commits | type) == "array"
+       and (.commits | length) >= 1
+       and (.commits | length) <= 2047
+       and all(.commits[]; .message | skip_trailer)
+    then "skip \(.commits | length)"
+    else "bump"
+    end' "$GITHUB_EVENT_PATH" 2>/dev/null) || return 1
+  case "$verdict" in
+    'skip '*) SKIP_BUMP_COMMITS="${verdict#skip }" ;;
+    *) return 1 ;;
+  esac
+}
+if skip_caller_bump_requested && ! fleet_owes_bump; then
+  # ::notice::, not a bare echo — a fleet that "mysteriously" did not bump
+  # needs this to surface on the run summary, with both recovery paths named.
+  # On the re-pointed path the run has ALREADY logged "pinning callers to <tip>
+  # and proceeding"; name that line and say this one overrides it, rather than
+  # ending the log on two contradictory statements with nothing saying which won.
+  skip_override=""
+  if [[ -n "$repointed" ]]; then
+    skip_override=" This OVERRIDES the \"pinning callers to $NEW_SHA and proceeding\" line above: nothing is bumped, and new_sha is emitted only for a later manual consumer of these outputs."
+  fi
+  echo "::notice::Skipping this bump: every one of the ${SKIP_BUMP_COMMITS} commit(s) in push ${GITHUB_SHA} carries a 'Skip-caller-bump: true' trailer.${skip_override} Callers stay where they are until the next behavioral bump re-points them to the then-current tip; a run racing this one is covered by the hand-off guard above; and if the trailer was a mistake, a workflow_dispatch run of this fleet forces a bump immediately."
+  emit false "$NEW_SHA"
+  exit 0
 fi
 
 emit true "$NEW_SHA"
