@@ -185,8 +185,20 @@ jobs:
               steps:
                 - uses: actions/checkout@v7
           YAML
-          if python3 .github/workflow-pins/check_workflow_pins.py --workflows-dir "$dir"; then
+          grep -q 'actions/checkout@v7' "$dir/floating.yml"  # fixture intact
+          status=0
+          python3 .github/workflow-pins/check_workflow_pins.py --workflows-dir "$dir" > "$dir/out.txt" 2>&1 || status=$?
+          cat "$dir/out.txt"
+          if [ "$status" -eq 0 ]; then
             echo "::error::lint passed a uses: ref pinned to a tag — expected a non-zero exit"
+            exit 1
+          fi
+          # A non-zero exit alone is not the assertion: a traceback, or any
+          # unrelated future failure, satisfies it just as well, so the step
+          # would stay green with the pin check no longer firing at all. Tie
+          # it to the error this test exists for.
+          if ! grep -q 'by tag, not by commit SHA' "$dir/out.txt"; then
+            echo "::error::lint exited non-zero but never reported the tag-pinned uses: — see the output above"
             exit 1
           fi
           echo "lint correctly rejected the tag-pinned uses:"

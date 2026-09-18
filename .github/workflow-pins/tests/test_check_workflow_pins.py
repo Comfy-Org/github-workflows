@@ -5326,10 +5326,37 @@ class BlockScalarMaskTests(unittest.TestCase):
         "      - uses: actions/setup-python@abc\n"
     ).split("\n")
 
-    def test_the_mask_agrees_with_the_per_index_form_everywhere(self):
-        mask = cwp._block_scalar_mask(self.LINES)
+    # The answer the per-index scan gave BEFORE `_in_block_scalar` became one
+    # line over the mask, pinned as a literal. Comparing the mask to
+    # `_in_block_scalar` would compare it with itself and could never fail,
+    # while this mask decides which lines BOTH the pin and the ref-guard lints
+    # treat as YAML — so the equivalence has to be asserted against something
+    # the rewrite cannot move.
+    EXPECTED = [
+        False,  # 0  jobs:
+        False,  # 1    run:
+        False,  # 2      steps:
+        False,  # 3        - name: Smoke
+        False,  # 4          run: |          <- opens, is not inside
+        True,  # 5            cat > f.yml <<'YAML'
+        True,  # 6            steps:
+        False,  # 7          (blank — indented past nothing; must not CLOSE)
+        True,  # 8              - uses: actions/checkout@abc
+        True,  # 9            YAML
+        False,  # 10        - uses: actions/setup-python@abc  <- closes it
+        False,  # 11       (trailing empty element of the split)
+    ]
+
+    def test_the_mask_matches_the_per_index_answer_it_replaced(self):
+        self.assertEqual(len(self.LINES), len(self.EXPECTED))
+        self.assertEqual(cwp._block_scalar_mask(self.LINES), self.EXPECTED)
+
+    def test_the_per_index_form_still_answers_from_that_mask(self):
+        # The one-line-thick wrapper is the contract: every caller of either
+        # form sees the same decision about which lines are YAML.
         self.assertEqual(
-            mask, [cwp._in_block_scalar(self.LINES, i) for i in range(len(self.LINES))]
+            [cwp._in_block_scalar(self.LINES, i) for i in range(len(self.LINES))],
+            self.EXPECTED,
         )
 
     def test_the_key_line_opens_a_scalar_rather_than_sitting_in_one(self):
@@ -5356,7 +5383,11 @@ class ActionPinTests(unittest.TestCase):
             f.write(text)
 
     def _check(self, exempt=frozenset()):
-        return cwp.check_action_pins(self.dir, exempt=exempt)
+        # The not-pinnable list is stashed rather than returned, so the tests
+        # that do not care about it keep the three-tuple they read best as.
+        errors, pinned, exempt_ok, skipped = cwp.check_action_pins(self.dir, exempt=exempt)
+        self.skipped = skipped
+        return errors, pinned, exempt_ok
 
     # --- the two directions the acceptance criteria name -------------------
 
@@ -5396,6 +5427,16 @@ class ActionPinTests(unittest.TestCase):
         errors, _, _ = self._check()
         self.assertEqual(len(errors), 1, errors)
 
+    def test_a_ref_with_no_at_sign_is_not_described_as_tag_pinned(self):
+        # The remedy differs — ADD a ref rather than convert one — and a
+        # message reading "pins `actions/checkout` by tag" names a tag that is
+        # not there. The site resolves at the action's default branch.
+        self._write("bad.yml", _plain_workflow("      - uses: actions/checkout\n"))
+        errors, _, _ = self._check()
+        self.assertIn("NO ref at all", errors[0])
+        self.assertIn("default branch", errors[0])
+        self.assertNotIn("by tag", errors[0])
+
     # --- the self-draining exemption list ----------------------------------
 
     def test_an_exempt_entry_suppresses_its_own_site_only(self):
@@ -5412,6 +5453,24 @@ class ActionPinTests(unittest.TestCase):
         self.assertEqual(exempt_ok, [("bad.yml", "actions/checkout@v7")])
         self.assertEqual(len(errors), 1, errors)
         self.assertIn("actions/setup-python@v7.0.0", errors[0])
+
+    def test_one_debt_entry_is_reported_once_however_many_sites_it_covers(self):
+        # `seen_exempt` is a set and `exempt_ok` was appended per SITE, so the
+        # same value twice in one file printed the `(KNOWN_UNPINNED)` line
+        # twice and over-counted one entry in the `(%d exempt)` summary.
+        # `check_dir` reports first-sight-only; this now matches it.
+        self._write(
+            "bad.yml",
+            _plain_workflow(
+                "      - uses: actions/checkout@v7\n"
+                "      - uses: actions/checkout@v7\n"
+            ),
+        )
+        errors, _, exempt_ok = self._check(
+            exempt=frozenset({("bad.yml", "actions/checkout@v7")})
+        )
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(exempt_ok, [("bad.yml", "actions/checkout@v7")])
 
     def test_an_exempt_entry_is_keyed_on_the_file_too(self):
         # The FILE alone would pre-exempt every other action in it; the REF
@@ -5513,19 +5572,55 @@ class ActionPinTests(unittest.TestCase):
         self.assertTrue(any("cannot read on its own line" in e for e in errors), errors)
         self.assertTrue(any("delete that entry" in e for e in errors), errors)
 
-    def test_a_local_path_and_a_container_image_are_skipped(self):
-        # Neither names a commit: `./…` resolves inside the caller's own
-        # already-pinned checkout, and a docker image is pinned by digest.
-        self._write(
-            "local.yml",
-            _plain_workflow(
-                "      - uses: ./.github/actions/setup\n"
-                "      - uses: docker://alpine:3.20\n"
-            ),
-        )
+    def test_a_local_path_is_skipped_and_the_skip_is_reported(self):
+        # `./…` names no ref of its own: it resolves inside the caller's
+        # already-pinned checkout. Skipped, but REPORTED — "not applicable"
+        # must not read as "checked and fine".
+        self._write("local.yml", _plain_workflow("      - uses: ./.github/actions/setup\n"))
         errors, pinned, _ = self._check()
         self.assertEqual(errors, [], errors)
         self.assertEqual(pinned, 0)
+        self.assertEqual(len(self.skipped), 1, self.skipped)
+        name, lineno, value, reason = self.skipped[0]
+        self.assertEqual((name, value), ("local.yml", "./.github/actions/setup"))
+        self.assertIn("local path", reason)
+
+    def test_a_container_image_on_a_tag_fails_like_any_other_floating_ref(self):
+        # `docker://alpine:3.20` is a MUTABLE registry tag on exactly the terms
+        # `@v7` is. Exempting every `docker://` value on the grounds that
+        # images are "pinned by digest" would carve a hole for a whole category
+        # of the floating refs this check exists to ban.
+        self._write("img.yml", _plain_workflow("      - uses: docker://alpine:3.20\n"))
+        errors, pinned, _ = self._check()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("img.yml,line=", errors[0])
+        self.assertIn("MUTABLE tag", errors[0])
+        self.assertIn("sha256:", errors[0])
+        self.assertEqual(pinned, 0)
+        self.assertEqual(self.skipped, [])
+
+    def test_a_container_image_at_a_digest_counts_as_pinned(self):
+        digest = "sha256:" + "0" * 64
+        self._write("img.yml", _plain_workflow("      - uses: docker://alpine@%s\n" % digest))
+        errors, pinned, _ = self._check()
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(pinned, 1)
+
+    def test_a_container_image_digest_must_be_the_full_64_hex(self):
+        # The short-digest hand edit, refused for the same reason the 7-char
+        # short SHA is: a truncated digest is not the one the registry checks.
+        self._write("img.yml", _plain_workflow("      - uses: docker://alpine@sha256:0000\n"))
+        errors, _, _ = self._check()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("MUTABLE tag", errors[0])
+
+    def test_a_40_hex_ref_does_not_pin_a_container_image(self):
+        # A commit SHA is not a registry digest; the walker must not accept one
+        # spelling's pin shape for the other's ref.
+        self._write("img.yml", _plain_workflow("      - uses: docker://alpine@%s\n" % _SHA))
+        errors, _, _ = self._check()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("MUTABLE tag", errors[0])
 
     # --- spellings the walker must still read ------------------------------
 
@@ -5542,6 +5637,136 @@ class ActionPinTests(unittest.TestCase):
         errors, _, _ = self._check()
         self.assertEqual(len(errors), 1, errors)
         self.assertIn("flow.yml,line=6", errors[0])
+        self.assertIn("actions/checkout@v7", errors[0])
+
+    def test_an_implicit_single_pair_flow_step_is_read(self):
+        # YAML's one-step shorthand: `[uses: …]` is a valid flow sequence
+        # holding a single-pair mapping. It carries neither `{` nor `,`, so a
+        # boundary class of `[{,]` alone lets it through UNCHECKED — the one
+        # direction this lint must never fail in.
+        self._write(
+            "flow.yml",
+            "name: Flow\n"
+            "on: [push]\n"
+            "jobs:\n"
+            "  run:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps: [uses: actions/checkout@v7]\n",
+        )
+        errors, _, _ = self._check()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("actions/checkout@v7", errors[0])
+
+    def test_a_flow_mapping_split_across_lines_keeps_its_ref_intact(self):
+        # The continuation line starts with the key, so `_USES_BLOCK_RE` claims
+        # it and its value group runs to end of line — carrying `}]` into the
+        # ref and red-lining a correctly pinned action.
+        self._write(
+            "flow.yml",
+            "name: Flow\n"
+            "on: [push]\n"
+            "jobs:\n"
+            "  run:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps: [{name: Checkout,\n"
+            "      uses: actions/checkout@%s}]\n" % _SHA,
+        )
+        errors, pinned, _ = self._check()
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(pinned, 1)
+
+    def test_a_trailing_comment_naming_a_flow_step_is_not_a_directive(self):
+        # `# was {uses: actions/checkout@v7}` is prose. Reading it as structure
+        # fails closed — a red CI run on a valid workflow, with a message
+        # naming a step that does not exist.
+        self._write(
+            "note.yml",
+            _plain_workflow(
+                "      - uses: actions/checkout@%s  # was {uses: actions/checkout@v7}\n" % _SHA
+            ),
+        )
+        errors, pinned, _ = self._check()
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(pinned, 1)
+
+    def test_a_flow_mapping_inside_a_run_one_liner_is_not_a_directive(self):
+        # A single-line `run:` is shell, not YAML, and has no block-scalar body
+        # for the mask to cover — so the key itself is what takes it out of the
+        # flow scan.
+        self._write(
+            "echo.yml",
+            _plain_workflow("      - run: echo '{\"uses\": \"actions/checkout@v7\"}'\n"),
+        )
+        errors, pinned, _ = self._check()
+        self.assertEqual(errors, [], errors)
+        self.assertEqual(pinned, 0)
+
+    def test_a_run_key_does_not_excuse_the_flow_step_beside_it(self):
+        # The skip is anchored on the LINE's own key. A `steps:` line that
+        # merely carries a `run:` entry is still structure, and the `uses:`
+        # next to it is still a directive — the exact shape of this repo's own
+        # `test-workflow-pins.yml` fixtures.
+        self._write(
+            "flow.yml",
+            "name: Flow\n"
+            "on: [push]\n"
+            "jobs:\n"
+            "  run:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps: [{id: a, run: echo hi}, {uses: actions/checkout@v7}]\n",
+        )
+        errors, _, _ = self._check()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("actions/checkout@v7", errors[0])
+
+    def test_a_stray_apostrophe_does_not_mask_a_real_floating_ref(self):
+        # The quote scan takes the STRICT reading: a `'` that follows a plain
+        # word opens no YAML node. Under the weak reading `Don't` would wedge a
+        # scalar open for the rest of the line and drop the floating ref that
+        # follows out of coverage entirely — a silent miss, the one direction
+        # this lint must not fail in.
+        self._write(
+            "flow.yml",
+            "name: Flow\n"
+            "on: [push]\n"
+            "jobs:\n"
+            "  run:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps: [{name: Don't skip, uses: actions/checkout@v7}]\n",
+        )
+        errors, _, _ = self._check()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("actions/checkout@v7", errors[0])
+
+    def test_a_real_flow_step_with_a_quoted_sibling_value_is_still_read(self):
+        # The quote guard must not blind the walk to a genuine flow step that
+        # merely has a quoted value earlier on its line: the `,` boundary sits
+        # OUTSIDE those quotes.
+        self._write(
+            "flow.yml",
+            "name: Flow\n"
+            "on: [push]\n"
+            "jobs:\n"
+            "  run:\n"
+            "    runs-on: ubuntu-latest\n"
+            '    steps: [{name: "Check it out", uses: actions/checkout@v7}]\n',
+        )
+        errors, _, _ = self._check()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("actions/checkout@v7", errors[0])
+
+    def test_a_quoted_flow_key_is_still_read(self):
+        self._write(
+            "flow.yml",
+            "name: Flow\n"
+            "on: [push]\n"
+            "jobs:\n"
+            "  run:\n"
+            "    runs-on: ubuntu-latest\n"
+            '    steps: [{"uses": "actions/checkout@v7"}]\n',
+        )
+        errors, _, _ = self._check()
+        self.assertEqual(len(errors), 1, errors)
         self.assertIn("actions/checkout@v7", errors[0])
 
     def test_a_quoted_value_is_unwrapped_before_it_is_judged(self):
@@ -5591,7 +5816,24 @@ class ActionPinTests(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             status = cwp.main(["--workflows-dir", self.dir])
         self.assertEqual(status, 0, out.getvalue())
-        self.assertIn("1 `uses:` ref(s) SHA-pinned (0 exempt).", out.getvalue())
+        self.assertIn("1 `uses:` ref(s) SHA-pinned (0 exempt, 0 not pinnable).", out.getvalue())
+
+    def test_main_names_a_not_pinnable_site_rather_than_dropping_it(self):
+        # The count alone would fall silently when a pinned ref is swapped for
+        # a local path; the line says which site and why.
+        self._write(
+            "plain.yml",
+            _plain_workflow(
+                "      - uses: actions/checkout@%s # v7.0.1\n" % _SHA
+                + "      - uses: ./.github/actions/setup\n"
+            ),
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = cwp.main(["--workflows-dir", self.dir])
+        self.assertEqual(status, 0, out.getvalue())
+        self.assertIn("1 `uses:` ref(s) SHA-pinned (0 exempt, 1 not pinnable).", out.getvalue())
+        self.assertIn("not pinnable plain.yml:8: ./.github/actions/setup", out.getvalue())
 
     def test_main_scopes_the_debt_list_to_this_repos_own_dir(self):
         # Same reason KNOWN_EXEMPT is scoped: against an ad-hoc --workflows-dir
@@ -5618,7 +5860,9 @@ class ThisRepoIsPinnedTests(unittest.TestCase):
         workflows = os.path.join(root, ".github", "workflows")
         if not os.path.isdir(workflows):
             self.skipTest("not running from a checkout of this repo")
-        errors, pinned, exempt_ok = cwp.check_action_pins(workflows, exempt=cwp.KNOWN_UNPINNED)
+        errors, pinned, exempt_ok, _ = cwp.check_action_pins(
+            workflows, exempt=cwp.KNOWN_UNPINNED
+        )
         self.assertEqual(errors, [], errors)
         self.assertEqual(exempt_ok, [])
         self.assertGreater(pinned, 100, "the walker stopped finding this repo's `uses:` refs")

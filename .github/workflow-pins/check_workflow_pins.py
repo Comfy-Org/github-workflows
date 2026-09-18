@@ -3731,41 +3731,73 @@ _USES_BLOCK_RE = re.compile(r"""^\s*(?:-\s+)?(['"]?)uses\1\s*:(?P<value>.*)$""")
 # Same shape as `_REF_USE_FLOW_RE`: an entry runs to the next `,` or `}`. No
 # real workflow here is written this way, but the lint's own fixtures are, and
 # a spelling the guard cannot see is a spelling drift walks back in through.
-_USES_FLOW_RE = re.compile(r"""[{,]\s*(['"]?)uses\1\s*:(?P<value>[^,}]*)""")
+# `[` is in the boundary class for YAML's implicit single-pair flow form —
+# `steps: [uses: actions/checkout@v7]`, a valid one-step mapping that carries
+# neither a `{` nor a `,` and would otherwise pass the check unread.
+_USES_FLOW_RE = re.compile(r"""[\[{,]\s*(['"]?)uses\1\s*:(?P<value>[^,}\]]*)""")
+
+# A `run:` written on ONE line, whose value is shell rather than YAML. The
+# block-scalar mask already covers `run: |` bodies; this is the spelling that
+# has no body to mask. Anchored on the key, so a flow step that merely CARRIES
+# a `run:` entry (`steps: [{id: a, run: echo hi}, {uses: …}]` — the key there
+# is `steps`) is untouched.
+_INLINE_RUN_RE = re.compile(r"""^\s*(?:-\s+)?(['"]?)run\1\s*:\s*\S""")
+
+# A container image digest — `docker://image@sha256:<64-hex>`. The registry's
+# equivalent of a commit SHA, and the ONLY form of a `docker://` value that is
+# actually immutable; see `_unpinnable`.
+_PIN_DIGEST_RE = re.compile(r"""^sha256:[0-9a-fA-F]{64}$""")
 
 
 def _uses_value(raw):
-    """A `uses:` value with its comment and surrounding quotes removed."""
+    """A `uses:` value with its comment, surrounding quotes and flow closers removed.
+
+    The trailing `[,}\\]]` trim is for a flow mapping split across physical
+    lines — `steps: [{name: Checkout,` / `uses: owner/action@<40-hex>}]`. The
+    continuation line starts with the key, so `_USES_BLOCK_RE` claims it and
+    its value group runs to end of line, carrying the `}]` into the ref and
+    reporting a correctly pinned action as tag-pinned. No real `uses:` value
+    ends in flow punctuation, so trimming it cannot swallow a ref.
+    """
     value = _strip_comment(raw).strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
         value = value[1:-1].strip()
-    return value
+    return value.rstrip("],}").strip()
 
 
 def _unpinnable(value):
-    """Why `value` carries no pinnable commit SHA, or None when it must carry one.
+    """Why `value` carries no pinnable ref at all, or None when it must carry one.
 
-    Two `uses:` forms name no commit and so can never be SHA-pinned: a LOCAL
-    path (`./.github/actions/x`), which resolves inside the caller's own
-    already-pinned checkout, and a container image (`docker://…`), whose
-    immutability is a registry digest rather than a git ref. Returning a reason
-    rather than a bare False keeps the skip visible at the call site — the
-    "not applicable" / "I couldn't read this" distinction the module docstring
-    insists on, applied to the pin check.
+    ONE `uses:` form names nothing pinnable: a LOCAL path
+    (`./.github/actions/x`), which resolves inside the caller's own
+    already-pinned checkout and so has no ref of its own to move. Returning a
+    reason rather than a bare False keeps the skip visible at the call site —
+    the "not applicable" / "I couldn't read this" distinction the module
+    docstring insists on, applied to the pin check; `check_action_pins`
+    collects those reasons and `main` prints them.
+
+    A container image (`docker://…`) is deliberately NOT here. Its immutability
+    is a registry digest rather than a git ref, but `docker://alpine:3.20` is a
+    mutable tag on exactly the terms `@v7` is, with a third party holding the
+    pen — so it is checked against `_PIN_DIGEST_RE` instead of exempted.
     """
     if value.startswith("./") or value.startswith("../"):
         return "a local path, resolved from the caller's own checkout"
-    if value.startswith("docker://"):
-        return "a container image, immutable by registry digest rather than git ref"
     return None
 
 
 def action_pin_sites(lines):
-    """`(lineno, uses_value, sha)` for every `uses:` in `lines` that must be pinned.
+    """`(lineno, uses_value, sha, skip)` for every `uses:` in `lines`.
 
-    `sha` is the 40-hex ref when the site IS pinned and None when it is not, so
-    a caller can count coverage as well as failures. 1-based line numbers, to
-    match every other reporter here.
+    `sha` is the immutable ref when the site IS pinned — a 40-hex commit for an
+    action, a `sha256:` digest for a `docker://` image — and None when it is
+    not, so a caller can count coverage as well as failures. 1-based line
+    numbers, to match every other reporter here.
+
+    `skip` is `_unpinnable`'s reason for a site that names nothing pinnable,
+    and None otherwise. Yielded rather than dropped so the skip is REPORTED:
+    swapping `uses: owner/action@<sha>` for `uses: ./.github/actions/x` must
+    not quietly shrink the coverage count with an unchanged summary.
 
     An EMPTY `value` is the third state: a `uses:` whose value this walk cannot
     read on its line, because it is written as a block scalar (`uses: >-`) or
@@ -3790,24 +3822,90 @@ def action_pin_sites(lines):
             if _BLOCK_SCALAR_OPEN_RE.match(_dedash(line)):
                 # `uses: >-` with the ref below it. The mask says this KEY line
                 # is not inside a scalar (it opens one), so it lands here.
-                yield idx + 1, "", None
+                yield idx + 1, "", None, None
                 continue
             raws = [m.group("value")]
+        elif _INLINE_RUN_RE.match(_dedash(line)):
+            # A SINGLE-LINE `run:` is shell, not YAML: its value cannot contain
+            # a step directive, only text that looks like one
+            # (`run: echo '{"uses": "a/b@v1"}'`). The block-scalar mask covers
+            # `run: |` bodies but not this spelling, and the flow pattern
+            # matches mid-line — so without this the lint red-lines CI on a
+            # valid workflow, naming a step that does not exist.
+            continue
         else:
-            raws = [f.group("value") for f in _USES_FLOW_RE.finditer(line)]
+            # Comment-stripped and quote-masked BEFORE the scan, unlike the
+            # block branch (where `_uses_value` does both on the value alone),
+            # because this pattern matches mid-line: a trailing
+            # `# was {uses: actions/checkout@v7}` is prose and a `{uses: …}`
+            # inside a quoted scalar is string content, and reading either as
+            # structure fails a compliant workflow. Strict `_quote_mask`
+            # reading, like every other structural reader here — the weak one
+            # would let a stray apostrophe in an unquoted scalar
+            # (`[{name: Don't, uses: a/b@v7}]`) mask a REAL floating ref out of
+            # coverage, and a silent miss is the one direction a pin lint must
+            # not fail in.
+            code = _strip_comment(line)
+            outside = _quote_mask(code)
+            raws = [
+                f.group("value") for f in _USES_FLOW_RE.finditer(code) if outside[f.start()]
+            ]
         for raw in raws:
             value = _uses_value(raw)
             if not value:
-                yield idx + 1, "", None
+                yield idx + 1, "", None, None
                 continue
-            if _unpinnable(value):
+            skip = _unpinnable(value)
+            if skip:
+                yield idx + 1, value, None, skip
                 continue
             ref = value.rsplit("@", 1)[1] if "@" in value else ""
-            yield idx + 1, value, ref if _PIN_SHA_RE.match(ref) else None
+            pin_re = _PIN_DIGEST_RE if value.startswith("docker://") else _PIN_SHA_RE
+            yield idx + 1, value, ref if pin_re.match(ref) else None, None
+
+
+def _unpinned_error(ann_path, lineno, ann_name, value):
+    """The error for one `uses:` site that names no immutable ref.
+
+    Three defects, three remedies, so three messages — a site with no `@` at
+    all is not "pinned by tag", and a `docker://` image is pinned by registry
+    digest rather than by commit SHA. Reporting all three as tag-pinning
+    misnames the construct and points at the wrong fix.
+    """
+    ann_value = _ann_msg(value)
+    if value.startswith("docker://"):
+        return (
+            "::error file=%s,line=%d::%s runs the container image `%s` at a "
+            "MUTABLE tag. A registry tag moves at the discretion of whoever "
+            "owns the image, exactly as a git tag does, so the pin proves "
+            "nothing. Name the digest instead: "
+            "`uses: docker://image@sha256:<64-hex> # 3.20`. See BE-15255."
+            % (ann_path, lineno, ann_name, ann_value)
+        )
+    if "@" not in value:
+        return (
+            "::error file=%s,line=%d::%s writes `uses: %s` with NO ref at all, "
+            "so the action resolves at its default branch — the most mutable "
+            "ref there is. Add the full 40-hex commit SHA and keep the version "
+            "as a trailing comment (`uses: owner/action@<40-hex> # v1`). "
+            "See AGENTS.md and BE-15255."
+            % (ann_path, lineno, ann_name, ann_value)
+        )
+    return (
+        "::error file=%s,line=%d::%s pins `%s` by tag, not by commit "
+        "SHA. A tag is mutable by whoever owns the action, so the pin "
+        "proves nothing — and Dependabot only ever narrows a tag to "
+        "another tag, so this never converges on its own. Replace the "
+        "ref with the full 40-hex commit SHA and keep the version as a "
+        "trailing comment (`uses: owner/action@<40-hex> # v1`), the "
+        "spelling `pinact` and `zizmor` accept in consumer CI. See "
+        "AGENTS.md and BE-15255."
+        % (ann_path, lineno, ann_name, ann_value)
+    )
 
 
 def check_action_pins(workflows_dir, exempt=KNOWN_UNPINNED):
-    """Returns (errors, pinned, exempt_ok) for the `uses:` SHA-pin check (BE-15255).
+    """Returns (errors, pinned, exempt_ok, skipped) for the `uses:` pin check (BE-15255).
 
     Deliberately its OWN walk rather than a fourth branch of `check_dir`:
     `check_dir` returns early for any file that does not declare a
@@ -3818,11 +3916,17 @@ def check_action_pins(workflows_dir, exempt=KNOWN_UNPINNED):
 
     `exempt` is the `KNOWN_UNPINNED` debt list; `exempt_ok` names the entries
     that matched a real floating site this run, and an entry that matched
-    nothing is an error, so the list drains itself.
+    nothing is an error, so the list drains itself. An entry is keyed on
+    `(filename, uses value)`, so it covers every site in that file writing that
+    exact value — one debt, reported once, however many times it is spelled.
+
+    `skipped` is `(name, lineno, value, reason)` for each site that names
+    nothing pinnable (`_unpinnable`) — reported, never silently dropped.
     """
     errors = []
     pinned = 0
     exempt_ok = []
+    skipped = []
     seen_exempt = set()
 
     names = sorted(
@@ -3839,7 +3943,10 @@ def check_action_pins(workflows_dir, exempt=KNOWN_UNPINNED):
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             lines = f.read().split("\n")
 
-        for lineno, value, sha in action_pin_sites(lines):
+        for lineno, value, sha, skip in action_pin_sites(lines):
+            if skip:
+                skipped.append((name, lineno, value, skip))
+                continue
             if sha:
                 pinned += 1
                 continue
@@ -3859,20 +3966,14 @@ def check_action_pins(workflows_dir, exempt=KNOWN_UNPINNED):
                 continue
             entry = (name, value)
             if entry in exempt:
+                # First sight only, matching `check_dir`: `seen_exempt` is a
+                # set, so appending per SITE would print the `(KNOWN_UNPINNED)`
+                # line twice and over-count one debt entry in the summary.
+                if entry not in seen_exempt:
+                    exempt_ok.append(entry)
                 seen_exempt.add(entry)
-                exempt_ok.append(entry)
                 continue
-            errors.append(
-                "::error file=%s,line=%d::%s pins `%s` by tag, not by commit "
-                "SHA. A tag is mutable by whoever owns the action, so the pin "
-                "proves nothing — and Dependabot only ever narrows a tag to "
-                "another tag, so this never converges on its own. Replace the "
-                "ref with the full 40-hex commit SHA and keep the version as a "
-                "trailing comment (`uses: owner/action@<40-hex> # v1`), the "
-                "spelling `pinact` and `zizmor` accept in consumer CI. See "
-                "AGENTS.md and BE-15255."
-                % (ann_path, lineno, ann_name, _ann_msg(value))
-            )
+            errors.append(_unpinned_error(ann_path, lineno, ann_name, value))
 
     # An entry naming a site that is no longer floating — pinned, renamed,
     # deleted, or (the one this check was written around) bumped to a different
@@ -3887,7 +3988,7 @@ def check_action_pins(workflows_dir, exempt=KNOWN_UNPINNED):
             % (_ann_msg(name), _ann_msg(value))
         )
 
-    return errors, pinned, exempt_ok
+    return errors, pinned, exempt_ok, skipped
 
 
 def main(argv=None):
@@ -3915,7 +4016,9 @@ def main(argv=None):
     # would read as stale. The CHECK itself still runs there — a floating `uses:`
     # is a floating `uses:` in any directory — only the debt list is scoped.
     pin_exempt = KNOWN_UNPINNED if args.workflows_dir == DEFAULT_WORKFLOWS_DIR else frozenset()
-    pin_errors, pinned, pin_exempt_ok = check_action_pins(args.workflows_dir, exempt=pin_exempt)
+    pin_errors, pinned, pin_exempt_ok, pin_skipped = check_action_pins(
+        args.workflows_dir, exempt=pin_exempt
+    )
     errors = errors + pin_errors
 
     for name in checked:
@@ -3925,6 +4028,12 @@ def main(argv=None):
         print("no reusable workflow declares a `%s` input" % INPUT_NAME)
     for name, value in sorted(pin_exempt_ok):
         print("unpinned %s: %s (KNOWN_UNPINNED — tracked separately)" % (name, value))
+    # "Not applicable" must not look like "checked and fine": a site swapped
+    # from a pinned ref to a local path leaves the pinned count one lower with
+    # nothing else to say why, which is the reading `_unpinnable` exists to
+    # prevent. Not an error — these name nothing that COULD be pinned.
+    for name, lineno, value, reason in sorted(pin_skipped):
+        print("not pinnable %s:%d: %s — %s" % (name, lineno, value, reason))
 
     # Ahead of the errors and OUTSIDE the exit-status logic (BE-9045): a
     # warning names coverage this run did not have, never a problem with the
@@ -3947,7 +4056,11 @@ def main(argv=None):
     # into the lines below: it counts `uses:` SITES across EVERY workflow file,
     # while those count the WORKFLOWS that declare `workflows_ref` — two
     # different denominators, and running them together reads as one number.
-    pin_note = "\n%d `uses:` ref(s) SHA-pinned (%d exempt)." % (pinned, len(pin_exempt_ok))
+    pin_note = "\n%d `uses:` ref(s) SHA-pinned (%d exempt, %d not pinnable)." % (
+        pinned,
+        len(pin_exempt_ok),
+        len(pin_skipped),
+    )
 
     if notices:
         # Do NOT claim full coverage over a run that skipped jobs: the

@@ -25,8 +25,9 @@ repo's own workflow files.
   reusables are documented on a differently-named page). Only the
   required-no-default direction is asserted, so an optional/auto-derived input
   like `groom.yml`'s `default: ''` is left alone.
-  Finally it (4) fails any `uses:` in `.github/workflows/` whose ref is not a
-  full 40-hex commit SHA — see [The `uses:` pin (BE-15255)](#the-uses-pin-be-15255)
+  Finally it (4) fails any `uses:` in `.github/workflows/` whose ref is not
+  immutable — a full 40-hex commit SHA for an action, a `sha256:` digest for a
+  `docker://` image — see [The `uses:` pin (BE-15255)](#the-uses-pin-be-15255)
   below. Unlike (1)–(3) that half covers **every** workflow file, not just the
   reusables: the `ci-*`, `bump-*` and `test-*` callers declare no
   `workflows_ref` at all, and that is exactly where the floating refs were.
@@ -588,20 +589,49 @@ at the discretion of whoever owns the action, which is the same "the pin proves
 nothing" hole the checks above close, with a third party holding the pen.
 
 So every `uses:` under `.github/workflows/` must name a full 40-hex commit SHA.
-Two forms name no commit and are skipped rather than failed: a local path
-(`./.github/actions/x`, resolved inside the caller's own already-pinned
-checkout) and a container image (`docker://…`, pinned by registry digest). The
-version comment is convention, not lint — it is what makes a SHA readable, and
-the review that lands a bump is where it is kept honest.
+One form names no ref of its own and is skipped rather than failed: a local
+path (`./.github/actions/x`), which resolves inside the caller's own
+already-pinned checkout. The skip is **reported** (`not pinnable <file>:<line>:
+… — <reason>`) and counted in the summary, so swapping a pinned ref for a local
+path cannot quietly shrink the coverage number with nothing else to say why.
+
+A container image is **not** skipped. `docker://…` is immutable by registry
+digest rather than by git ref, but `docker://alpine:3.20` is a mutable tag on
+exactly the terms `@v7` is, with a third party holding the pen — so it is held
+to the digest instead: `docker://image@sha256:<64-hex>`, checked whole, so a
+truncated digest (or a 40-hex commit SHA, which is not a digest at all) fails
+like any other floating ref. Exempting the whole `docker://` prefix would have
+carved out a category of the drift this check exists to ban.
+
+The version comment is convention, not lint — it is what makes a SHA readable,
+and the review that lands a bump is where it is kept honest.
 
 The walk reads both the block spelling (`- uses: owner/action@ref`) and the
-flow one (`steps: [{uses: owner/action@ref, …}]`), and skips anything inside a
-`|`/`>` **block scalar**. That last part is the whole reason this is not a
-`grep`: `test-workflow-pins.yml` writes its own fixture workflows out of a
-`run: |` heredoc, and reading that literal text as workflow structure would
-make the lint fail on its own test harness. Those fixtures are nonetheless
-SHA-pinned themselves, so that each smoke test fails for the one reason it
-tests rather than passing on a pin error it never meant to raise.
+flow one (`steps: [{uses: owner/action@ref, …}]`, including YAML's implicit
+single-pair form `steps: [uses: …]`), and skips anything inside a `|`/`>`
+**block scalar**. That last part is the whole reason this is not a `grep`:
+`test-workflow-pins.yml` writes its own fixture workflows out of a `run: |`
+heredoc, and reading that literal text as workflow structure would make the
+lint fail on its own test harness. Those fixtures are nonetheless SHA-pinned
+themselves, so that each smoke test fails for the one reason it tests rather
+than passing on a pin error it never meant to raise.
+
+**What the walk cannot see.** It reads raw text, not a parsed document, so the
+flow scan strips a trailing comment, skips any match inside a quoted scalar,
+and skips a SINGLE-LINE `run:` outright — its value is shell, and the
+block-scalar mask only covers `run: |` bodies. Otherwise
+`# was {uses: a/b@v7}` and `run: echo '{"uses": "a/b@v1"}'` would each
+red-line a valid workflow, naming a step that does not exist. The quote scan
+takes the **strict** reading the other structural readers take, so a stray
+apostrophe in an unquoted scalar (`[{name: Don't, uses: a/b@v7}]`) cannot wedge
+a scalar open and drop a real floating ref out of coverage: a false alarm is
+loud, a silent miss is not. Two gaps remain, both out of reach of a stdlib-only walk. A key spelled through a
+double-quoted YAML **escape** — `"u\u0073es": owner/action@v1`, which parses
+as `uses` — is not matched (the plain quoted `'uses'` / `"uses"` spellings ARE).
+And a mapping key literally named `uses` at some other depth — an action input
+called `uses` — would be matched though it is not a step directive. Neither
+occurs here; a YAML parser is the fix if one ever does, and that is a
+dependency this repo deliberately does not carry.
 
 `KNOWN_UNPINNED` is the debt list for this check, with the same self-draining
 contract as `KNOWN_EXEMPT`: an entry is a known debt, not a blessing, and a
