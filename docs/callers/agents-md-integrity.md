@@ -63,7 +63,7 @@ contents: read
 | `warn_lines` | `150` | Warns without failing. |
 | `forbid_cursorrules` | `true` | Fail on a legacy `.cursorrules`. |
 | `check_nested` | `true` | Also check nested monorepo `AGENTS.md` files. |
-| `exclude_paths` | `''` | Newline- or comma-separated path globs carved out of the **nested** scan (e.g. `plugins/**`, for a repo that ships agent instructions as distributable payload). Excluded subtrees are never scanned, and every exclusion is reported in the run log. A glob that would match the root agents file or `CLAUDE.md`, or that is made only of wildcards, is rejected — the root pair is never excludable. |
+| `exclude_paths` | `''` | Newline- or comma-separated path globs carved out of the **nested** scan (e.g. `plugins/**`, for a repo that ships agent instructions as distributable payload). Excluded subtrees are never scanned, and every exclusion is reported in the run log. A glob that would match the root agents file or `CLAUDE.md`, or whose every segment is exactly `*` or `**`, is rejected — the root pair is never excludable. That second check is literal, not semantic: a wildcard-equivalent spelling like `?*/?*` is not caught by it, and would silently exclude every nested path while leaving `check_nested: true` green. Name the subtree (`plugins/**`); do not get clever. |
 | `require_shim` | `true` | A root `CLAUDE.md` shim must **exist** (and import `@AGENTS.md`). `false` still rejects a divergent `CLAUDE.md`, but tolerates its absence. |
 | `require_codeowners` | `false` | Require a CODEOWNERS DRI for `AGENTS.md`. |
 | `agents_file` | `AGENTS.md` | Override the filename. |
