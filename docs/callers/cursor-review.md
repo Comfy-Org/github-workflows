@@ -290,12 +290,16 @@ Three more shapes to expect before you require it:
   is gated on the same four conditions the panel is. Three of them read `Gate`'s
   and `Diff size check`'s job *outputs*, which are empty when those jobs
   **failed**; the fourth reads the review matrix's *result*, which is `skipped`
-  when `Preflight — validate model catalog` failed, because the matrix `needs:`
-  it. Gating on those alone would skip this check exactly when a dup-check API
-  call errored, the diff could not be built, or a delisted model stopped the
-  panel before a single cell started — and GitHub counts a skipped required
-  check as **passing**. So a failed `Gate`, `Diff size check` **or `Preflight`**
-  runs this job and fails it: an undecided run is not a clean run.
+  whenever **any** job the matrix `needs:` did not succeed — `Preflight —
+  validate model catalog` or `Prior-review ledger`. Gating on those alone would
+  skip this check exactly when a dup-check API call errored, the diff could not
+  be built, or a delisted model stopped the panel before a single cell started —
+  and GitHub counts a skipped required check as **passing**. So a failed `Gate`,
+  `Diff size check`, `Preflight` **or `Prior-review ledger`** runs this job and
+  fails it: an undecided run is not a clean run. (`Prior-review ledger` is built
+  never to fail — every step in it is `continue-on-error` — but a job timeout,
+  a cancellation or a lost runner is not a step outcome, and "rare" is the wrong
+  bar for something that would otherwise hand you a green merge gate.)
 * **It still skips when no review was warranted, and a skip is green.** The
   deliberate no-panel branches — no trigger label, an already-reviewed commit, a
   PR over the diff-size cap, a fork the panel cannot run on — are the ones where

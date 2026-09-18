@@ -68,16 +68,28 @@ GATE_CONDITIONS = (
 # pass) and turning the check into a permanent green.
 UNTRUSTED_VALUES = ("OK_COUNT", "TOTAL", "JUDGE_STATUS", "DELIVERED", "UNGATED", "GATED")
 
-# The three jobs whose non-success means "nobody decided whether to review this
-# PR". `preflight` is the subtle one: the review matrix `needs:` it, so a failed
-# preflight leaves `needs.review.result == 'skipped'` — byte-identical to the
-# deliberate no-panel branches — and gating on that alone minted a GREEN
-# required check on a run where not one cell ever started.
+# The jobs whose non-success means "nobody decided whether to review this PR".
+# `preflight` and `ledger` are the subtle ones: the review matrix `needs:` BOTH,
+# so a non-success in either leaves `needs.review.result == 'skipped'` —
+# byte-identical to the deliberate no-panel branches — and gating on that alone
+# minted a GREEN required check on a run where not one cell ever started.
+#
+# `ledger` reads like it cannot fail (every step in it is `continue-on-error`,
+# for exactly this reason) — but `Ensure ledger artifact exists` carries none,
+# its job cap sits above the sum of its step caps, and cancellation is neither.
+# Rare is the wrong bar for a guard that hands out a green required check.
 DECISION_RESULTS = (
     "needs.gate.result != 'success'",
     "needs.diff-size.result != 'success'",
     "needs.preflight.result != 'success'",
+    "needs.ledger.result != 'success'",
 )
+
+# The job whose `needs:` list DEFINES which jobs are decision jobs. Pinned as a
+# relationship rather than a name list, because the way this fail-open was
+# re-opened twice was a job being added to the matrix's `needs:` and nobody
+# adding it here.
+MATRIX_JOB = "review"
 
 # Causes that read a producing job's RESULT rather than its outputs. An output
 # is the empty string when its job failed/was skipped/was cancelled, and every
@@ -411,6 +423,11 @@ class UndecidedRunFailsClosedTest(unittest.TestCase):
         self.panel = self.jobs[PANEL_JOB]
         self.condition = job_scalar(self.panel, "if")
         self.assertIsNotNone(self.condition)
+        self.declared_needs = {
+            part.strip()
+            for part in (job_scalar(self.panel, "needs") or "").strip("[]").split(",")
+            if part.strip()
+        }
 
     def test_the_job_runs_when_an_upstream_decision_job_failed(self):
         # Without EVERY disjunct the job is skipped on that failing path and the
@@ -460,17 +477,57 @@ class UndecidedRunFailsClosedTest(unittest.TestCase):
         )
         self.assertIn("::error::", joined)
 
-    def test_it_needs_preflight_so_it_can_read_its_result(self):
-        # `needs.preflight.result` evaluates to the empty string unless the job
-        # is declared in `needs:` — and '' != 'success' is TRUE, so dropping it
+    def test_it_needs_the_decision_jobs_so_it_can_read_their_results(self):
+        # `needs.<job>.result` evaluates to the empty string unless the job is
+        # declared in `needs:` — and '' != 'success' is TRUE, so dropping one
         # from the list would make this check red on EVERY run rather than
-        # failing open. Loud, but still wrong, and pinned so it stays declared.
-        declared = {
+        # failing open. Loud, but still wrong, and pinned so they stay declared.
+        for job in ("preflight", "ledger"):
+            self.assertIn(job, self.declared_needs)
+
+    def test_every_job_the_matrix_needs_is_guarded_here(self):
+        # THE invariant, and the one both regressions broke. The review matrix
+        # skips when ANY job it `needs:` does not succeed, and a skipped matrix
+        # is indistinguishable from the deliberate no-panel branches — so every
+        # job in the matrix's `needs:` has to be a decision job here, in this
+        # job's `needs:` AND in the guard's condition. Asserting the RELATIONSHIP
+        # rather than today's four names is what makes the next job added to the
+        # matrix fail this suite instead of silently re-opening the fail-open.
+        matrix_needs = {
             part.strip()
-            for part in (job_scalar(self.panel, "needs") or "").strip("[]").split(",")
+            for part in (job_scalar(self.jobs[MATRIX_JOB], "needs") or "")
+            .strip("[]")
+            .split(",")
             if part.strip()
         }
-        self.assertIn("preflight", declared)
+        self.assertTrue(
+            matrix_needs,
+            f"could not read `{MATRIX_JOB}`'s `needs:` — the invariant below is "
+            "asserting over nothing",
+        )
+        guard = "\n".join(code_lines(step_named(self.panel, UNDECIDED_STEP)))
+        for job in sorted(matrix_needs):
+            self.assertIn(
+                job,
+                self.declared_needs,
+                f"`{MATRIX_JOB}` needs `{job}` but `{PANEL_JOB}` does not: a "
+                f"non-success `{job}` skips the matrix, leaving "
+                "`needs.review.result == 'skipped'` and a GREEN required check "
+                "over a run where not one cell reviewed",
+            )
+            self.assertIn(
+                "needs.%s.result != 'success'" % job,
+                guard,
+                f"`{UNDECIDED_STEP}` does not fail closed on a non-success "
+                f"`{job}`, which skips the review matrix",
+            )
+            self.assertIn(
+                "needs.%s.result != 'success'" % job,
+                self.condition,
+                f"`{PANEL_JOB}`'s `if:` does not run on a non-success `{job}`, "
+                "so the check SKIPS — and GitHub counts a skipped required "
+                "check as passing",
+            )
 
     def test_the_causes_read_the_producing_jobs_results_not_only_outputs(self):
         # `ok_count`/`total` are BOTH empty when `consolidate` died, and
