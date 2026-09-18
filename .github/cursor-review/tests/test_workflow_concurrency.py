@@ -100,6 +100,52 @@ def trigger_disjunction(group):
     return None
 
 
+def top_level_or_operands(disjunction):
+    """`disjunction` split on its TOP-LEVEL `||`, each operand unwrapped once.
+
+    Substring containment over the whole disjunction is not enough to pin the
+    slot rule: moving the veto comparison INTO the nested
+    `(inputs.run_without_label && …)` arm, or swapping the `||` between the two
+    label comparisons for an `&&`, keeps every substring present while the veto
+    label stops reaching `trigger` on a label-gated caller. Both mutations
+    change the top-level operand LIST, so that is what the tests below assert
+    on. Depth tracking is what makes it a top-level split — the
+    run_without_label arm carries `||`s of its own, nested one level deeper.
+    """
+    operands, depth, start = [], 0, 0
+    i = 0
+    while i < len(disjunction):
+        char = disjunction[i]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == "|" and depth == 0 and disjunction[i:i + 2] == "||":
+            operands.append(disjunction[start:i])
+            i += 2
+            start = i
+            continue
+        i += 1
+    operands.append(disjunction[start:])
+    return [unwrap(o) for o in operands]
+
+
+def unwrap(operand):
+    """`operand` stripped, with ONE redundant enclosing paren pair removed."""
+    operand = operand.strip()
+    if operand.startswith("(") and operand.endswith(")"):
+        depth = 0
+        for i, char in enumerate(operand):
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0 and i != len(operand) - 1:
+                    return operand  # the parens are not a single outer pair
+        return operand[1:-1].strip()
+    return operand
+
+
 class WorkflowConcurrencyTest(unittest.TestCase):
     def setUp(self):
         self.block = top_level_block(read_workflow(), "concurrency")
@@ -133,26 +179,72 @@ class WorkflowConcurrencyTest(unittest.TestCase):
         self.assertIn("github.event.pull_request.number", self.group)
 
     def test_trigger_label_and_veto_label_share_one_slot(self):
-        # The assertion this suite exists for. Both labels must sit in the SAME
-        # `&& 'trigger'` disjunction — one of them moved into its own slot (the
-        # shape draft PR #58 used) silently restores the bug.
+        # The assertion this suite exists for. Both labels must be TOP-LEVEL
+        # alternatives of the same `&& 'trigger'` disjunction — one of them
+        # moved into its own slot (the shape draft PR #58 used), or demoted
+        # into the nested run_without_label arm, or `||`-to-`&&`'d, silently
+        # restores the bug while leaving both substrings in the expression.
         disjunction = trigger_disjunction(self.group)
         self.assertIsNotNone(
             disjunction,
             "no `(...) && 'trigger'` disjunction in the group expression: %r"
             % self.group,
         )
-        self.assertIn(
-            "inputs.review_label",
-            disjunction,
-            "the trigger label is not in the `trigger` slot's disjunction",
+        operands = top_level_or_operands(disjunction)
+
+        trigger_arms = [o for o in operands if "inputs.review_label" in o]
+        self.assertEqual(
+            len(trigger_arms),
+            1,
+            "expected exactly ONE top-level `||` operand comparing against "
+            "inputs.review_label; got %r from %r" % (operands, disjunction),
         )
         self.assertIn(
-            "'skip-cursor-review'",
-            disjunction,
-            "the skip-cursor-review veto label is not in the SAME disjunction "
-            "as the trigger label — applying it mid-flight would land in a "
-            "different slot and cancel nothing",
+            "github.event.label.name == inputs.review_label",
+            trigger_arms[0],
+            "the trigger label's operand does not compare label.name to "
+            "inputs.review_label: %r" % trigger_arms[0],
+        )
+
+        veto_arms = [o for o in operands if "'skip-cursor-review'" in o]
+        self.assertEqual(
+            len(veto_arms),
+            1,
+            "the skip-cursor-review veto label must be its OWN top-level `||` "
+            "operand of the `trigger` disjunction — nested inside another arm "
+            "(or joined with `&&`) it no longer reaches `trigger` on a "
+            "label-gated caller, and applying it mid-flight cancels nothing; "
+            "got %r from %r" % (operands, disjunction),
+        )
+        self.assertEqual(
+            veto_arms[0],
+            "github.event.label.name == 'skip-cursor-review'",
+            "the veto operand must be an unconditional label comparison, not "
+            "%r — any extra conjunct is a condition under which the veto "
+            "silently stops cancelling the panel" % veto_arms[0],
+        )
+        self.assertIsNot(
+            veto_arms[0],
+            trigger_arms[0],
+            "the trigger and veto comparisons collapsed into one operand",
+        )
+
+    def test_trigger_label_disjunct_is_guarded_against_an_empty_review_label(self):
+        # `review_label` is `required: false`, so a caller can pass ''. GitHub
+        # coerces a MISSING `github.event.label` and '' alike in a mixed
+        # comparison, so an unguarded `label.name == inputs.review_label` is
+        # TRUE on every non-label event — `pull_request_review_thread` included
+        # — dragging them into `trigger`, where resolving a thread cancels a
+        # running panel.
+        disjunction = trigger_disjunction(self.group)
+        trigger_arms = [
+            o for o in top_level_or_operands(disjunction)
+            if "inputs.review_label" in o
+        ]
+        self.assertTrue(
+            trigger_arms and "inputs.review_label != \'\'" in trigger_arms[0],
+            "the trigger-label operand must be guarded by "
+            "`inputs.review_label != \'\'`; got %r" % (trigger_arms or None,),
         )
 
     def test_every_other_label_gets_its_own_namespaced_slot(self):
@@ -171,7 +263,12 @@ class WorkflowConcurrencyTest(unittest.TestCase):
         # own ci-cursor-review.yml caller — declaring the same group would hold
         # it while its `uses:` job waits to acquire it, hanging until timeout.
         offenders = []
-        for path in sorted(glob.glob(os.path.join(WORKFLOWS_DIR, "*.yml"))):
+        # BOTH extensions: GitHub loads `.yaml` workflows too, so a caller
+        # added here as `.yaml` would otherwise pass this guard and still
+        # deadlock its own run.
+        paths = glob.glob(os.path.join(WORKFLOWS_DIR, "*.yml"))
+        paths += glob.glob(os.path.join(WORKFLOWS_DIR, "*.yaml"))
+        for path in sorted(paths):
             if os.path.abspath(path) == os.path.abspath(WORKFLOW):
                 continue
             with open(path, encoding="utf-8") as f:
