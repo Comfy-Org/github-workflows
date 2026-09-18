@@ -52,7 +52,7 @@ jobs:
 
       - name: shellcheck
         working-directory: scripts/pr-derisk
-        run: shellcheck -x plan-derisk.sh publish-derisk-comment.sh collect-pr-inputs.sh resolve-enabled.sh tests/test_plan_derisk.sh
+        run: shellcheck -x plan-derisk.sh publish-derisk-comment.sh collect-pr-inputs.sh resolve-enabled.sh tests/test_plan_derisk.sh tests/test_collect_pr_inputs.sh
 
       - name: planner + renderer suite
         # Hermetic: the model is stubbed, the renderer runs under DRY_RUN, and the split floors
@@ -62,3 +62,13 @@ jobs:
         # crafted filename cannot forge markdown, and the `workflows_ref` guard has not drifted
         # from pr-risk.yml's.
         run: bash scripts/pr-derisk/tests/test_plan_derisk.sh
+
+      - name: collect-pr-inputs suite
+        # The step that re-grades the `/derisk` target before anything is planned. Hermetic — `gh`
+        # is stubbed and every call it receives is logged. The properties worth pinning are the
+        # ones that fail SILENTLY: that the shared library travels with this script rather than
+        # with the swappable TOOL_DIR, that the scratch trio is minted ONCE in the parent and
+        # cleaned up (both resolvers run inside a command substitution, where a lazy init leaks a
+        # fresh trio per call), and that an unusable override path stops the step instead of
+        # planning a split against the generic default map.
+        run: bash scripts/pr-derisk/tests/test_collect_pr_inputs.sh

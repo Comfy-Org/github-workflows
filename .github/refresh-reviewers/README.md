@@ -89,7 +89,14 @@ review expertise, and without the exclusion they would anchor every bucket.
   ref of this repo, never from the caller's checkout.
 - `tests/test_generate.py` — pure-python tests: glob parity, decay math,
   threshold/floor/backfill selection, bot/path/rename filtering, noreply
-  decoding, byte-preserving rewrite. Run:
+  decoding, byte-preserving rewrite. Its `TestSharedParserCorpus` drives
+  [`../assign-reviewers/parser-corpus.json`](../assign-reviewers/parser-corpus.json)
+  — the same fixture `../assign-reviewers/tests/assignment.test.cjs` runs
+  through the JS originals — so parser/glob parity is executable rather than a
+  comment. Only the `config` half of `parse_reviewer_config`'s `(config,
+  locations)` return is compared there; `locations` is Python-only and stays
+  covered by the rewrite tests. Add parser cases to the corpus, never as an
+  inline literal. Run:
 
 ```bash
 python3 -m unittest discover -s .github/refresh-reviewers/tests -p 'test_*.py' -v

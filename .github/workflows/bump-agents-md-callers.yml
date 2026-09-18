@@ -104,6 +104,16 @@ jobs:
           NEW_SHA: ${{ github.sha }}
           WATCHED: .github/workflows/agents-md-integrity.yml
           WATCHED_ASSETS: .github/agents-md-integrity
+          # Every file whose ABSENCE breaks a pinned caller at run time. The
+          # directory above can never be the decommission probe on its own — it
+          # OUTLIVES the script inside it, since `tests/` and `README.md` keep it
+          # resolving after the checker is deleted, so the probe would report the
+          # surface healthy and bump every caller onto a SHA where the checker is
+          # gone. Name the file instead: `check_agents_md.py` is the whole job
+          # body and imports nothing outside the stdlib.
+          WATCHED_EXEC: |
+            .github/workflows/agents-md-integrity.yml
+            .github/agents-md-integrity/check_agents_md.py
           # Read-only ambient token, for the owed-bump probe's `actions: read`
           # history lookup only (BE-10008). Never a write credential: the
           # Cloud Code Bot token is minted after — and only if — this step says

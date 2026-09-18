@@ -94,9 +94,16 @@ which is then rejected unless it covers the changed-file set exactly.
 ## Files
 
 - `collect-pr-inputs.sh` — re-grades the PR with the pr-risk grader and fetches the capped diff.
-  It **sources** `grade-targets.sh` for `resolve_base_ref` / `fetch_override` rather than
-  reimplementing them, so the rules that judge a split are resolved by the one implementation that
-  resolved the rules that judged the PR.
+  It **sources** [`../pr-risk/lib.sh`](../pr-risk/lib.sh) for `resolve_base_ref` / `fetch_override`
+  rather than reimplementing them, so the rules that judge a split are resolved by the one
+  implementation that resolved the rules that judged the PR. That library is the sourceable half of
+  the pr-risk tooling and has no top-level side effects — it used to be the whole of
+  `grade-targets.sh`, entrypoint included, which cost this file a lazily-installed EXIT trap on one
+  side and two copies of its own `log`/`warn`/`die` on the other. The library is sourced from
+  **beside this script**, not from `TOOL_DIR` — `TOOL_DIR` names the swappable grader, and a stub
+  grader directory carries no library. The scratch trio the library lends is minted here in the
+  parent under this script's own EXIT trap: both resolvers run inside a command substitution, so
+  leaving it to their lazy init mints a fresh trio per call in the subshell and leaks all nine.
 - `plan-derisk.sh` — the single model call, the partition validation + one retry, and the
   grader-computed floors. Emits one plan JSON object. `MODEL_RESPONSE_FILE` is the hermetic test
   surface: it reads the reply off disk (one line per attempt) and makes no network call.
@@ -105,10 +112,14 @@ which is then rejected unless it covers the changed-file set exactly.
   uses). `DRY_RUN=1` renders to stdout and writes nothing.
 - `resolve-enabled.sh` — the `enabled` input / `vars.DERISK_CONFIG` switch, degrading toward the
   reviewed value and never toward off.
-- `tests/` — one hermetic suite, run by
-  [`test-pr-derisk.yml`](../../.github/workflows/test-pr-derisk.yml). It also pins the
-  `workflows_ref` guard in `pr-derisk.yml` byte-identical to `pr-risk.yml`'s, which is what
-  extends that guard's own 40-odd assertions to this workflow without forking them.
+- `tests/` — two hermetic suites, run by
+  [`test-pr-derisk.yml`](../../.github/workflows/test-pr-derisk.yml).
+  `test_plan_derisk.sh` covers the planner and the renderer, and also pins the `workflows_ref`
+  guard in `pr-derisk.yml` byte-identical to `pr-risk.yml`'s — which is what extends that guard's
+  own 40-odd assertions to this workflow without forking them.
+  `test_collect_pr_inputs.sh` covers the re-grade step with `gh` stubbed: where the shared library
+  is sourced from, that the scratch trio is minted once in the parent and cleaned up, and that an
+  unusable override path stops the step instead of planning against the generic default map.
 
 ## What is deliberately NOT here
 

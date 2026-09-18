@@ -7,10 +7,16 @@ selection (including the under-floor leave-unchanged case), bot/generated-path/
 rename-syntax filtering, noreply-email decoding, and the surgical rewrite
 preserving every byte outside the edited lists. No network, no git.
 
+TestSharedParserCorpus drives ../../assign-reviewers/parser-corpus.json — the
+one fixture file .github/assign-reviewers/tests/assignment.test.cjs runs
+through the JS originals — so parser parity between the two hand-ported
+implementations is asserted by an executable corpus rather than by a comment.
+
 Run: python3 -m unittest discover -s .github/refresh-reviewers/tests -p 'test_*.py' -v
 """
 
 import importlib.util
+import json
 import os
 import re
 import unittest
@@ -485,6 +491,53 @@ class TestPrBody(unittest.TestCase):
         self.assertIn("docs/site", body)               # gap report
         self.assertIn("window_months=12", body)        # knob values
         self.assertIn("map_exclude=op-login", body)
+
+
+class TestSharedParserCorpus(unittest.TestCase):
+    """Drive the SHARED corpus through the Python port.
+
+    `.github/assign-reviewers/parser-corpus.json` is the single fixture file
+    that .github/assign-reviewers/tests/assignment.test.cjs runs through the
+    JS originals (parseReviewerConfig / globToRegExp, inline in
+    assign-reviewers.yml). refresh-reviewers WRITES the reviewers.yml that
+    assign-reviewers READS, so the two hand-ported parsers agreeing is a
+    correctness requirement — this class is what makes "parity" executable
+    instead of a comment. Only the config half of parse_reviewer_config's
+    (config, locations) return is compared; `locations` has no JS counterpart
+    and stays covered by TestSurgicalRewrite above.
+
+    Add a case to the corpus file, never as an inline literal here.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        path = os.path.join(os.path.dirname(__file__), "..", "..",
+                            "assign-reviewers", "parser-corpus.json")
+        with open(path, encoding="utf-8") as fh:
+            cls.corpus = json.load(fh)
+
+    def test_corpus_is_non_empty(self):
+        self.assertTrue(self.corpus["configs"], "corpus has no config cases")
+        self.assertTrue(self.corpus["globs"], "corpus has no glob cases")
+        for entry in self.corpus["globs"]:
+            self.assertTrue(entry["cases"], entry["glob"])
+
+    def test_config_cases(self):
+        for case in self.corpus["configs"]:
+            with self.subTest(case["name"]):
+                config, _locations = gen.parse_reviewer_config(case["text"])
+                self.assertEqual(config, case["expected"])
+
+    def test_glob_cases(self):
+        for entry in self.corpus["globs"]:
+            compiled = gen.glob_to_regexp(entry["glob"])
+            for case in entry["cases"]:
+                with self.subTest(glob=entry["glob"], path=case["path"]):
+                    self.assertEqual(bool(compiled.match(case["path"])),
+                                     case["matches"])
+                    self.assertEqual(
+                        gen.matches_any(case["path"], [compiled]),
+                        case["matches"])
 
 
 if __name__ == "__main__":

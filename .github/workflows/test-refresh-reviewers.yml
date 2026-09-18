@@ -5,6 +5,12 @@ name: Test refresh-reviewers generator
 # generator proposes every consumer repo's reviewer map, so a scoring or
 # rewrite regression silently corrupts routing everywhere — cheap to guard
 # with a unit run on change.
+#
+# The filters below deliberately reach OUTSIDE this directory for
+# .github/assign-reviewers/parser-corpus.json, the fixture both parser ports
+# are driven from. test-assign-reviewers.yml watches it via
+# `.github/assign-reviewers/**`, so editing the corpus runs BOTH suites and a
+# case retuned to satisfy one port alone cannot land green.
 
 on:
   pull_request:
@@ -12,6 +18,7 @@ on:
       - '.github/refresh-reviewers/**'
       - '.github/workflows/refresh-reviewers.yml'
       - '.github/workflows/test-refresh-reviewers.yml'
+      - '.github/assign-reviewers/parser-corpus.json'
       - 'docs/callers/refresh-reviewers.md'
   push:
     branches: [main]
@@ -19,6 +26,7 @@ on:
       - '.github/refresh-reviewers/**'
       - '.github/workflows/refresh-reviewers.yml'
       - '.github/workflows/test-refresh-reviewers.yml'
+      - '.github/assign-reviewers/parser-corpus.json'
       - 'docs/callers/refresh-reviewers.md'
 
 permissions:

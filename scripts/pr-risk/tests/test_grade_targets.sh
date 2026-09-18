@@ -455,6 +455,54 @@ eq "nothing is published for it"         0 "$(jq -s length "$WORK/pr-risk-surfac
 has_text "and the failure is annotated"  "the Check Run could not be rendered (rc=3)" "$OUT"
 has_text "…carrying the renderer's own stderr" "render blew up" "$OUT"
 
+echo "— phase 25: an override path that leaves the contents tree is REFUSED, not fetched —"
+# `enc_path` percent-encodes each segment, but jq's `@uri` leaves `.` alone, so a `..` survives
+# encoding intact and `contents/../../x?ref=…` addresses a different endpoint once the dot segments
+# resolve. MAP_PATH/RB_PATH come straight from the free-form `repo_map_path`/`repo_runbooks_path`
+# inputs, which the workflow does not validate — this builder is the only place the shape is seen.
+run_targets PR_NUMBERS=42 BASE_REF=main MAP_PATH='../../../etc/passwd'
+eq "the target fails rather than grading"  1 "$RC"
+has_text "and says why"  "contains a '..' segment" "$OUT"
+no_text "no contents request was ever made with it" "/etc/passwd" "$(calls)"
+# NOT a fall-through to the shipped defaults: that would grade the PR against rules nobody asked
+# for, which is the same failure the 404-only contract exists to prevent.
+no_text "…and it is not treated as an absent override" "using the generic default" "$OUT"
+
+run_targets PR_NUMBERS=42 BASE_REF=main RB_PATH='/etc/passwd'
+eq "an ABSOLUTE override path fails too"   1 "$RC"
+has_text "and says why"  "is absolute" "$OUT"
+
+# The legitimate shape still goes through untouched — the guard must not reject a normal path, or
+# every consumer with an override stops being graded against it.
+run_targets PR_NUMBERS=42 BASE_REF=main MAP_PATH='.github/risk.json'
+eq "a normal override path is unaffected"  0 "$RC"
+eq "…and the target still grades"          graded "$(res '.status')"
+
+echo "— phase 26: a mid-way mktemp failure leaves no scratch file behind —"
+# init_scratch takes THREE mktemps and `gt_die`s on any of them. With the EXIT trap armed after
+# init_scratch returned, a failure on the second or third exited 2 with the file(s) already created
+# and nothing installed to remove them. The trap is armed first; these variables are pre-initialised
+# to "" in lib.sh and `rm -f` tolerates empty arguments, so arming it early is free.
+MKTMP_PROBE="$SANDBOX/mktempprobe"; mkdir -p "$MKTMP_PROBE" "$SANDBOX/failbin"
+# `mktemp` that succeeds once, then fails — the second call in init_scratch.
+cat > "$SANDBOX/failbin/mktemp" <<'MKSTUB'
+#!/usr/bin/env bash
+n=0
+[ -f "$MKTEMP_COUNT" ] && n="$(cat "$MKTEMP_COUNT")"
+printf '%s' "$(( n + 1 ))" > "$MKTEMP_COUNT"
+[ "$n" -ge 1 ] && { echo "mktemp: refusing" >&2; exit 1; }
+exec /usr/bin/mktemp "$@"
+MKSTUB
+chmod +x "$SANDBOX/failbin/mktemp"
+mk_out="$( cd "$MKTMP_PROBE" && PATH="$SANDBOX/failbin:$SANDBOX/bin:$PATH" \
+    env REPO=test/repo TOOL_DIR="$TOOLDIR" DRY_RUN=1 PR_NUMBERS=42 BASE_REF=main \
+        JOB_TIMEOUT_MINUTES=30 WAIT_MINUTES=0 TMPDIR="$MKTMP_PROBE" \
+        MKTEMP_COUNT="$SANDBOX/mktemp-count" STUB_LOG="$STUB_LOG" STUB_DIR="$STUB_DIR" \
+        bash "$TARGETS" 2>&1 )"; mk_rc=$?
+eq "the run dies on the failed mktemp"     2 "$mk_rc"
+has_text "and says so"  "mktemp failed" "$mk_out"
+eq "…leaving no scratch file behind"       0 "$(find "$MKTMP_PROBE" -name 'grade-targets-*' -type f | wc -l | tr -d ' ')"
+
 echo
 echo "passed $PASS, failed $FAIL"
 [ "$FAIL" -eq 0 ]
