@@ -94,9 +94,12 @@ which is then rejected unless it covers the changed-file set exactly.
 ## Files
 
 - `collect-pr-inputs.sh` — re-grades the PR with the pr-risk grader and fetches the capped diff.
-  It **sources** `grade-targets.sh` for `resolve_base_ref` / `fetch_override` rather than
-  reimplementing them, so the rules that judge a split are resolved by the one implementation that
-  resolved the rules that judged the PR.
+  It **sources** [`../pr-risk/lib.sh`](../pr-risk/lib.sh) for `resolve_base_ref` / `fetch_override`
+  rather than reimplementing them, so the rules that judge a split are resolved by the one
+  implementation that resolved the rules that judged the PR. That library is the sourceable half of
+  the pr-risk tooling and has no top-level side effects — it used to be the whole of
+  `grade-targets.sh`, entrypoint included, which cost this file a lazily-installed EXIT trap on one
+  side and two copies of its own `log`/`warn`/`die` on the other.
 - `plan-derisk.sh` — the single model call, the partition validation + one retry, and the
   grader-computed floors. Emits one plan JSON object. `MODEL_RESPONSE_FILE` is the hermetic test
   surface: it reads the reply off disk (one line per attempt) and makes no network call.

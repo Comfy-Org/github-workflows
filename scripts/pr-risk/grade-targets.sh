@@ -58,7 +58,16 @@ GRADER="$TOOL_DIR/grade-pr-risk.sh"
 LABELER="$TOOL_DIR/apply-risk-label.sh"
 PUBLISHER="$TOOL_DIR/publish-risk-surfaces.sh"
 
-REPO="${REPO:-}"
+# The sourceable half of this tool — REPO, the scratch files, the retrying `gh` reads and the two
+# resolvers that decide which branch's rules judge a PR. Kept beside this file rather than inside
+# it so pr-derisk's collect-pr-inputs.sh can reuse those resolvers without also sourcing main()
+# and the per-target orchestration; see lib.sh's header for what that boundary bought.
+# From SELF_DIR, NOT TOOL_DIR: lib.sh is this script's own implementation, not one of the
+# swappable tools TOOL_DIR points at (the suite overrides TOOL_DIR with a stub grader directory).
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=lib.sh
+. "$SELF_DIR/lib.sh" || { printf '[grade-targets] ERROR could not source lib.sh from %s\n' "$SELF_DIR" >&2; exit 2; }
+
 PR_NUMBERS="${PR_NUMBERS:-}"
 BASE_REF="${BASE_REF:-}"
 MAP_PATH="${MAP_PATH:-.github/risk.json}"
@@ -93,103 +102,23 @@ SURFACES_BYTES=0
 SURFACES_DROPPED=0
 DRY_RUN="${DRY_RUN:-0}"
 # The retry/backoff constants are env-overridable ONLY so the suite can exercise the
-# unreadable-PR, read-retry and settle-repeat branches without sleeping through the production
-# backoff. CI passes none of them, so the values below are what runs in production.
+# unreadable-PR and settle-repeat branches without sleeping through the production backoff. CI
+# passes none of them, so the values below are what runs in production. (READ_RETRY_TRIES and
+# READ_RETRY_DELAY_SECONDS are the same kind of knob and live in lib.sh, beside the retry_read
+# that reads them.)
 MAX_UNREADABLE_TRIES="${MAX_UNREADABLE_TRIES:-4}"
 READ_RETRY_BUDGET_SECONDS="${READ_RETRY_BUDGET_SECONDS:-150}"
 POLL_DELAY_SECONDS="${POLL_DELAY_SECONDS:-15}"
-READ_RETRY_TRIES="${READ_RETRY_TRIES:-3}"
-READ_RETRY_DELAY_SECONDS="${READ_RETRY_DELAY_SECONDS:-10}"
 
-# Set by the per-target helpers, read by their callers.
+# Set by the per-target helpers, read by their callers. (JOB_DEADLINE is the sixth of these and
+# is declared in lib.sh, which is where retry_read reads it; main() computes it below.)
 G_TIER=""
 G_WAITED=0
 TARGET_COUNT=1
 OVERALL_DEADLINE=0
-JOB_DEADLINE=0
 
 log()  { printf '[grade-targets] %s\n' "$*" >&2; }
 die()  { printf '[grade-targets] ERROR %s\n' "$*" >&2; exit 2; }
-
-# SCRATCH FILES AND THE EXIT TRAP ARE CREATED LAZILY, on first use, and the trap is installed only
-# by a DIRECT invocation. At file scope they were side effects of merely SOURCING this file, and
-# the `trap ... EXIT` replaced the sourcing shell's own EXIT trap — so a suite that sources these
-# helpers to drive them directly silently lost its `rm -rf "$SANDBOX"` cleanup and leaked both the
-# sandbox and these temp files. The footer's "sourceable without side effects" claim is only true
-# with this deferred.
-GT_DIRECT=0
-[ "${BASH_SOURCE[0]}" = "${0}" ] && GT_DIRECT=1
-ERRF=""
-LABELF=""
-OUTF=""
-init_scratch() {
-  [ -z "$ERRF" ] || return 0
-  ERRF="$(mktemp "${TMPDIR:-/tmp}/grade-targets-err.XXXXXX")"     || die "mktemp failed"
-  LABELF="$(mktemp "${TMPDIR:-/tmp}/grade-targets-label.XXXXXX")" || die "mktemp failed"
-  OUTF="$(mktemp "${TMPDIR:-/tmp}/grade-targets-out.XXXXXX")"     || die "mktemp failed"
-  [ "$GT_DIRECT" = 1 ] && trap 'rm -f "$ERRF" "$LABELF" "$OUTF"' EXIT
-  return 0
-}
-gherr() {
-  [ -n "$ERRF" ] && [ -f "$ERRF" ] || return 0
-  tr '\n' ' ' < "$ERRF" | sed 's/[[:space:]]*$//'
-}
-
-# ---- URL building ------------------------------------------------------------------------------
-# EVERY INTERPOLATED VALUE BELOW IS A URL COMPONENT, so it is percent-encoded like one. Git branch
-# names legally contain `#`, `&`, `+` and `%`, and consumer-supplied override paths can too: raw,
-# a PR based on `fix/#123-thing` had its request truncated at the `#`, which arrives at the
-# contents endpoint as an EMPTY `?ref=` — and an empty ref is not an error there, it silently
-# resolves to the repository DEFAULT branch. That is precisely the "graded against rules nobody
-# read" failure resolve_base_ref exists to prevent, reached by a different door (`&` splits off a
-# bogus query param; `+` decodes to a space and 404s into the generic-default fallback). This is
-# the same reason apply-risk-label.sh encodes label names before putting them in a path.
-enc()      { jq -rn --arg s "$1" '$s | @uri'; }
-# A path keeps its separators — `/` is structural here, not data — but each SEGMENT is encoded.
-enc_path() { jq -rn --arg s "$1" '$s | split("/") | map(@uri) | join("/")'; }
-
-# ---- transient failures on the pre-grader reads ------------------------------------------------
-# WHY THESE READS RETRY. Each target's base-ref read and its two override reads happen BEFORE the
-# grader, which already retries this same failure class (rate limit, secondary rate limit,
-# transient 5xx) four times with backoff, precisely so a blip does not become a durable verdict.
-# Rate limits are GLOBAL rather than per-PR, so on a 50-PR backfill one secondary-rate-limit burst
-# hit every remaining target at its very first hop and failed them wholesale — the inverse of the
-# "one unreadable PR never abandons the rest" guarantee this file's header promises. Retrying here
-# is what stops the batch's most-repeated read from being its least resilient one.
-#
-# A DEFINITIVE ANSWER IS NOT RETRIED. 404 (the path is absent, or no such PR), 401, 410 and 422 do
-# not change on a second ask, and fetch_override needs the 404 verdict PROMPTLY to fall back to the
-# shipped defaults. 403 is ambiguous — GitHub returns it both for a missing scope and for a
-# secondary rate limit — so it is retried only when the message reads like a rate limit.
-retryable_err() { # gh's stderr in $ERRF -> rc 0 when another attempt could plausibly differ
-  local msg; msg="$(gherr)"
-  case "$msg" in
-    *"rate limit"*|*"Rate limit"*|*"secondary rate"*|*"abuse detection"*) return 0 ;;
-    *"(HTTP 5"*|*"(HTTP 429)"*) return 0 ;;   # server side / explicit throttle
-    *"(HTTP "*)                 return 1 ;;   # any other status is an answer, not a blip
-    *)                          return 0 ;;   # no status at all: DNS, TLS, timeout, gh itself
-  esac
-}
-
-retry_read() { # <outfile> <gh api args...> -> rc 0, else gh's rc with its stderr left in $ERRF
-  init_scratch
-  local out="$1"; shift
-  local tries="$READ_RETRY_TRIES" attempt=1 delay="$READ_RETRY_DELAY_SECONDS" rc
-  while :; do
-    rc=0
-    gh api "$@" > "$out" 2>"$ERRF" || rc=$?
-    [ "$rc" -eq 0 ] && return 0
-    retryable_err || return "$rc"
-    [ "$attempt" -lt "$tries" ] || return "$rc"
-    # A retry may never spend the time a LATER target needs: past the job's own deadline the
-    # remaining targets are better reported un-attempted by number than started and cut off.
-    [ "$JOB_DEADLINE" -eq 0 ] || [ "$(( $(date +%s) + delay ))" -lt "$JOB_DEADLINE" ] || return "$rc"
-    log "read failed (attempt ${attempt}/${tries}) — retrying in ${delay}s: $(gherr)"
-    sleep "$delay"
-    attempt=$(( attempt + 1 ))
-    delay=$(( delay * 2 )); [ "$delay" -le 60 ] || delay=60
-  done
-}
 
 # ---- targets ---------------------------------------------------------------------------------
 # A PR number is a positive integer with NO leading zeros. `007` is rejected rather than
@@ -212,68 +141,6 @@ parse_targets() { # <raw> -> one validated, de-duplicated number per line
   [ "${#nums[@]}" -le "$MAX_TARGETS" ] \
     || die "${#nums[@]} targets exceeds MAX_TARGETS=$MAX_TARGETS — split the backfill into batches. A list this long cannot finish inside the job's timeout, and a run cancelled mid-batch leaves an arbitrary prefix labeled with no record of where it stopped."
   printf '%s\n' "${nums[@]}"
-}
-
-# ---- the base ref ----------------------------------------------------------------------------
-# WHY AN UNRESOLVED REF IS FATAL RATHER THAN DEFAULTED. The ref is interpolated into the override
-# read below as `contents/${p}?ref=${base}`, and an EMPTY ref is not an error to that endpoint —
-# GitHub resolves it to the repository's DEFAULT branch. So a base ref we failed to read would
-# silently fetch some other branch's .github/risk.json (or fall back to the generic default when
-# the PR's real base carries an override the default branch does not) and grade the PR against
-# rules nobody read. That is the same failure the non-404 guard in fetch_override exists to
-# prevent, arriving by a different door. Stacked PRs make it concrete: base refs on live PRs in
-# the pilot repo include feature branches, not just `main`.
-resolve_base_ref() { # <num> -> ref on stdout, rc 1 (reason already annotated on stderr)
-  init_scratch
-  local num="$1" ref
-  if ! retry_read "$OUTF" "repos/${REPO}/pulls/${num}" --jq '.base.ref'; then
-    echo "::error::could not read the base ref of ${REPO}#${num}: $(gherr). NOT grading it against the default branch's rules." >&2
-    return 1
-  fi
-  ref="$(tr -d '\n' < "$OUTF")"
-  case "$ref" in
-    ""|null)
-      echo "::error::the base ref of ${REPO}#${num} read back empty — refusing to fall through to the repository default branch, which would grade this PR against another branch's rules." >&2
-      return 1 ;;
-  esac
-  printf '%s' "$ref"
-}
-
-# ---- the per-repo overrides -------------------------------------------------------------------
-# Read from the target's BASE ref, so the PR being graded cannot edit the rules that judge it.
-# Absent (a genuine 404) falls back to the shipped defaults; present-but-invalid is left for the
-# grader's structural validation to reject loudly — a repo that commits a corrupt map must see
-# red, not silent generic grading.
-#
-# ONLY A 404 MEANS ABSENT. Treating any non-zero exit as "no override" meant a 403 rate-limit, a
-# 5xx or a network blip silently graded the PR against the generic default map instead of the
-# repo's sharpened one — a LOWER tier computed from an input nobody read, which is the
-# confident-answer-from-an-unread-source failure the unknown contract forbids everywhere else. So
-# the status code is captured and anything that is not 200-or-404 fails the target.
-#
-# A 404 FROM THIS ENDPOINT IS TWO DIFFERENT ANSWERS. "the path is not in that tree" is the benign
-# one this fallback is for; "no commit found for the ref" is NOT — it means the base branch was
-# deleted or renamed (reachable on a by-number re-grade of an old PR), and treating it as "no
-# override" grades the PR confidently against rules nobody read, the same failure the non-404 guard
-# was written to stop. GitHub distinguishes them in the message body, so this does too.
-fetch_override() { # <path> <outfile> <base-ref> -> prints the outfile, or nothing when absent
-  init_scratch
-  local p="$1" out="$2" base="$3"
-  if retry_read "$out" "repos/${REPO}/contents/$(enc_path "$p")?ref=$(enc "$base")" \
-       -H "Accept: application/vnd.github.raw"; then
-    echo "using ${p} from ${base}" >&2
-    printf '%s' "$out"
-  elif grep -qi 'no commit found for the ref' "$ERRF"; then
-    rm -f "$out"
-    echo "::error::the ref '${base}' does not resolve in ${REPO} (${p} was requested from it): $(gherr). NOT falling back to the generic default: a 404 for the REF is not a 404 for the FILE, and grading against the default branch's rules is exactly what re-reading the base ref exists to prevent." >&2
-    return 1
-  elif grep -q '(HTTP 404)' "$ERRF"; then
-    rm -f "$out"   # the redirect already created it empty; nothing must read it
-    echo "no ${p} on ${base} — using the generic default" >&2
-  else
-    echo "::error::could not read ${p} from ${base}: $(gherr). NOT falling back to the generic default: that would grade this PR against rules nobody read." >&2
-    return 1
-  fi
 }
 
 # ---- grade one target, waiting for the rest of the rollup to settle ---------------------------
@@ -511,6 +378,12 @@ process_target() { # <num> -> rc 0 = label in sync, rc 1 = failed
 # ---- main --------------------------------------------------------------------------------------
 main() {
   init_scratch
+  # UNCONDITIONAL, and inside main() rather than at file scope. At file scope this `trap` replaced
+  # the EXIT trap of any shell that merely SOURCED this file — the bug that cost a `GT_DIRECT`
+  # flag and a lazily-installed trap to work around. Nothing sources this file any more (the
+  # helpers live in lib.sh), and main() runs only on a direct invocation, so the flag is gone and
+  # the scratch files are cleaned up on every path out of a real run.
+  trap 'rm -f "$ERRF" "$LABELF" "$OUTF"' EXIT
   [ -n "$REPO" ] || die "REPO is required"
   [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "bad REPO '$REPO' (want owner/name)"
   [ -f "$GRADER" ]  || die "grader not found at $GRADER (set TOOL_DIR)"
@@ -611,9 +484,11 @@ main() {
   [ "$(( failed + skipped ))" -eq 0 ]
 }
 
-# Sourceable without side effects — no temp file is created and no EXIT trap installed until a
-# helper actually needs one (see init_scratch), so a suite that sources this file to exercise the
-# helpers keeps its own EXIT cleanup. Only a direct invocation runs main.
+# Sourceable without side effects — everything above is a function or a plain assignment, and the
+# scratch files and the EXIT trap are main()'s, so a shell that sources this file keeps its own
+# EXIT cleanup and creates nothing (tests/test_grade_targets.sh phase 21 asserts both). Only a
+# direct invocation runs main. Nothing in this repo sources this file for its helpers — those are
+# in lib.sh, which is what pr-derisk's collect-pr-inputs.sh sources.
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   main "$@"
 fi
