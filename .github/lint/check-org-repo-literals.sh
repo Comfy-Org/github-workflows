@@ -103,6 +103,15 @@
 #      rather than capped: this tree's largest tracked file is under 600 lines,
 #      and capping the scan would trade an unreachable timeout for a truncated
 #      count, which is the one number a red run's summary turns on.
+#  12. The non-numeric-line-field and record-shape refusals below (fallback
+#      `grep -r` path only) are BEST-EFFORT, not a closed class: a tracked
+#      path whose embedded newline is followed by digits+colon, or by an
+#      `@${ORG}/...`/`${ORG}/...` fragment at column 0, fabricates a record
+#      that passes every content test here and is reported against a path
+#      that does not exist. No test on a record's content can distinguish a
+#      fabricated fragment from a real one. The GIT scan path does not have
+#      this hole (`git grep` C-quotes newline/tab/`\`/`"` in a path), so it is
+#      reachable only when `--root` is NOT inside a git work tree.
 #
 # TAMPER BOUNDARY: unlike the reusable checkers this repo publishes, this lint
 # runs from the PR's own checkout, so a PR here can edit both the script and the
@@ -158,16 +167,25 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
 # environment unconditionally, so `GIT_CONFIG_PARAMETERS="'core.attributesFile=…'"`
 # delivers the same fail-open with `GIT_CONFIG_COUNT` already gone (measured).
 #
+# `GIT_ATTR_SOURCE` (git >= 2.40) is a FIFTH channel to the same fail-open, and
+# a direct one rather than a config injection: it redirects every
+# `.gitattributes` read to a named tree-ish, so a tree carrying `*.md binary`
+# has `git grep -I` skip those files with no `GIT_CONFIG_*` variable involved.
+#
 # What this does NOT do: unsetting `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`
 # restores git's DEFAULT search (`$HOME`/XDG, `/etc/gitconfig`) rather than
-# disabling config, so a runner-level `core.attributesFile` still applies.
+# disabling config, so a runner-level `core.attributesFile` still applies --
+# and `HOME`/`XDG_CONFIG_HOME` reach the same `binary` fail-open with no
+# `GIT_CONFIG_*` variable at all, since git's per-user attributes default to
+# `$XDG_CONFIG_HOME/git/attributes` then `$HOME/.config/git/attributes`.
 # Pointing both at `/dev/null` plus `GIT_CONFIG_NOSYSTEM=1` would close that,
 # and is deliberately not done: it would also drop a runner's legitimate
 # `safe.directory`, which makes `rev-parse` fail and silently takes the
 # `grep -r` fallback -- trading a hazard nobody can reach from a PR for a
-# scope change on every run. The env is hardened; the runner's own config is
+# scope change on every run. The five unsets below close the injection
+# channels reachable from a PR; the runner's own config and `$HOME` are
 # trusted, the same way the TAMPER BOUNDARY block below trusts the checkout.
-unset GIT_CONFIG_COUNT GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_PARAMETERS
+unset GIT_CONFIG_COUNT GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_PARAMETERS GIT_ATTR_SOURCE
 
 ORG='Comfy-Org'
 # Deliberately assembled rather than written whole: a literal org-prefixed name
@@ -285,9 +303,10 @@ script_repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" || {
 # root `$root/$allowlist_rel` is not where the scanned repo keeps its allowlist
 # -- its top level is. Without this step `--root /somewhere/repo/docs` validated
 # that repo's literals against THIS repo's list, which is not what the comment
-# above promises. `|| true` because a non-repo root is the normal fallback case,
-# not an error, and `-d` because `--show-toplevel` prints nothing useful when it
-# fails.
+# above promises. `|| true` because a non-repo root is the normal fallback
+# case, not an error: `$root_repo_top` then stays empty, which the `-n` test
+# below catches, and the `elif`'s own `-f` test catches a toplevel that lacks
+# the allowlist file.
 root_repo_top=''
 if [ "$(git -C "$root" rev-parse --is-inside-work-tree 2>/dev/null)" = true ]; then
   root_repo_top="$(git -C "$root" rev-parse --show-toplevel 2>/dev/null || true)"
@@ -299,7 +318,11 @@ elif [ -n "$root_repo_top" ] && [ -f "$root_repo_top/$allowlist_rel" ]; then
 elif [ -f "$script_repo_root/$allowlist_rel" ]; then
   allowlist="$script_repo_root/$allowlist_rel"
 else
-  echo "error: allowlist '$allowlist_rel' not found under '$root' or '$script_repo_root'" >&2
+  if [ -n "$root_repo_top" ]; then
+    echo "error: allowlist '$allowlist_rel' not found under '$root', '$root_repo_top' or '$script_repo_root'" >&2
+  else
+    echo "error: allowlist '$allowlist_rel' not found under '$root' or '$script_repo_root'" >&2
+  fi
   exit 2
 fi
 # A regular but UNREADABLE allowlist clears the `-f` tests above, and the
@@ -355,6 +378,33 @@ fi
 # `@`-prefixed literal. A plain entry clears either spelling, because
 # `@<org>/<name>` is also how npm and GitHub Packages write a package scope for
 # a repo of that name — the same asymmetry `public-repo-hygiene` documents.
+# Trailing sentence punctuation the name class swallowed, then a `.git` suffix
+# (`Foo.git` still references the repo `Foo`), then punctuation again --
+# `<org>/foo.git.` needs both passes, and stripping `.git` first leaves the
+# suffix stuck behind the period.
+#
+# ONLY `.` is stripped. A GitHub slug may not END in a period, so dropping one
+# can only narrow the name. `-` and `_` are different: both are LEGAL as a
+# slug's last character, so stripping them would WIDEN the match — a literal for
+# a private repo named `<allowlisted>-` or `<allowlisted>_` would normalize onto
+# the allowlisted entry and clear this default-deny check.
+#
+# The peel is quadratic in the length of the run, so it is only safe because
+# MAX_NAME below bounds its input first. There is no cheap pure-bash
+# alternative: `${value%%"${value##*[!.]}"}`, the obvious two-expansion
+# rewrite, is quadratic in bash as well (measured: on a 200 KB run of periods
+# both forms run past two minutes).
+trim_trailing_dots() {
+  local value="$1"
+  while [ -n "$value" ]; do
+    case "$value" in
+      *.) value="${value%?}" ;;
+      *) break ;;
+    esac
+  done
+  printf '%s' "$value"
+}
+
 entries=()
 entry_count=0
 team_entries=()
@@ -370,7 +420,16 @@ while IFS= read -r line || [ -n "$line" ]; do
   case "$entry" in
     @*) is_team=1; entry="${entry#@}" ;;
   esac
-  [ -n "$entry" ] || { echo "error: allowlist '$allowlist' has an entry that is a bare '@'" >&2; exit 2; }
+  # Normalized the SAME way a scanned literal is (trailing periods, then at
+  # most one `.git`, then trailing periods again), so an entry copied out of a
+  # finding — which quotes the normalized name — is not silently inert. Without
+  # this, an entry written as `foo.git` (the spelling GitHub itself shows in a
+  # clone URL) can never match the `foo` a finding reports, and a rerun still
+  # insists the name is missing from a file that visibly contains it.
+  entry="$(trim_trailing_dots "$entry")"
+  entry="${entry%.git}"
+  entry="$(trim_trailing_dots "$entry")"
+  [ -n "$entry" ] || { echo "error: allowlist '$allowlist' entry '$line' names nothing once a leading '@' and trailing periods/'.git' are stripped" >&2; exit 2; }
   case "$entry" in
     *[][*?]*)
       echo "error: allowlist '$allowlist' entry '$line' contains a glob metacharacter ([, ], * or ?); entries are literal names, and a glob can allow every name" >&2
@@ -521,32 +580,6 @@ if [ "$scan_status" -gt 1 ]; then
   exit 2
 fi
 
-# Trailing sentence punctuation the name class swallowed, then a `.git` suffix
-# (`Foo.git` still references the repo `Foo`), then punctuation again --
-# `<org>/foo.git.` needs both passes, and stripping `.git` first leaves the
-# suffix stuck behind the period.
-#
-# ONLY `.` is stripped. A GitHub slug may not END in a period, so dropping one
-# can only narrow the name. `-` and `_` are different: both are LEGAL as a
-# slug's last character, so stripping them would WIDEN the match — a literal for
-# a private repo named `<allowlisted>-` or `<allowlisted>_` would normalize onto
-# the allowlisted entry and clear this default-deny check.
-#
-# The peel is quadratic in the length of the run, so it is only safe because
-# MAX_NAME below bounds its input first. There is no cheap pure-bash
-# alternative: `${value%%"${value##*[!.]}"}`, the obvious two-expansion
-# rewrite, is quadratic in bash as well (measured: on a 200 KB run of periods
-# both forms run past two minutes).
-trim_trailing_dots() {
-  local value="$1"
-  while [ -n "$value" ]; do
-    case "$value" in
-      *.) value="${value%?}" ;;
-      *) break ;;
-    esac
-  done
-  printf '%s' "$value"
-}
 
 # GitHub workflow-command escaping. A tracked PATH is untrusted input to the
 # runner -- it reaches both output lines below -- and `,`/`:` in it would
@@ -643,6 +676,9 @@ while IFS= read -r hit; do
   # fabricated finding, and skipping would drop a record on a parse this script
   # has already lost confidence in. Exit 2 is the same "refusing to report"
   # verdict every other unusable-scan branch here returns.
+  #
+  # This test and the shape test below it (after the boundary drop) are
+  # BEST-EFFORT, not a closed class -- see KNOWN LIMITATIONS 12.
   case "$lineno" in
     ''|*[!0-9]*)
       echo "error: could not parse the scan output — expected 'file:line:match', got a non-numeric line field. A tracked path containing a newline splits one record in two; rename it, or narrow --root past it." >&2
@@ -782,7 +818,7 @@ while IFS= read -r hit; do
       if [ "$oversize" -eq 1 ]; then
         why="is longer than GitHub's ${MAX_NAME}-character repo-name limit, so it cannot be allowlisted"
       else
-        why="is not on $allowlist_rel"
+        why="is not on $allowlist"
       fi
       echo "unapproved: $file:$lineno: $shown $why"
       echo "::error file=$(escape_property "$file"),line=$lineno::unapproved ${ORG} repo literal: $(escape_data "$shown") $(escape_data "$why")"
@@ -800,10 +836,10 @@ if [ "$findings" -gt 0 ]; then
 $findings unapproved ${ORG} repo literal(s) found.
 
 If the name is a PUBLIC repo, a documentation example or a test fixture, add it
-to $allowlist_rel with a trailing '#' comment saying why it is safe. If it is a
+to $allowlist with a trailing '#' comment saying why it is safe. If it is a
 private repo, remove the reference — this repo is public.
 MSG
   exit 1
 fi
 
-echo "OK: every ${ORG} repo literal in $scope is on $allowlist_rel"
+echo "OK: every ${ORG} repo literal in $scope is on $allowlist"

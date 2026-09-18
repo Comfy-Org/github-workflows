@@ -21,13 +21,17 @@ escaped: a line number is always digits, so a non-numeric field means the
 `file:line:match` record did not parse and the run refuses it (exit `2`). The
 record's **shape** is checked too — after the boundary drop the match must still
 begin with the org prefix — because a numeric line field does not prove the split
-landed where it appears to. The way both fire is a tracked path containing a
-newline on the `grep -r` **fallback** path, which prints paths raw: one hit
-arrives as two records, and the leading fragment would otherwise be reported as a
-literal cut out of a filename against a path that does not exist. The **git**
-path has no split — `git grep` C-quotes newline, tab, `\` and `"` in a path
-whatever `core.quotePath` says (that governs only bytes ≥ 0x80) — so there such a
-file is one record, a real finding with a C-quoted location.
+landed where it appears to. Both fire on a tracked path containing a newline on
+the `grep -r` **fallback** path, which prints paths raw: one hit can arrive as
+two records, and the leading fragment would otherwise be reported as a literal
+cut out of a filename against a path that does not exist. This is **best-effort,
+not a closed class** (limitation 12): a fabricated fragment that happens to look
+like a well-formed record — digits+colon, or an `@<org>/...`/`<org>/...`
+fragment at column 0 — passes both tests undetected, and no test on a record's
+content can tell it from a real one. The **git** path has no split — `git grep`
+C-quotes newline, tab, `\` and `"` in a path whatever `core.quotePath` says (that
+governs only bytes ≥ 0x80) — so there such a file is one record, a real finding
+with a C-quoted location.
 
 The org segment has to **start a token**, so `Not<org>/whatever` — a different
 owner whose name happens to end in ours — is not a reference to this org and is
@@ -48,7 +52,7 @@ only, and publishing a new one is an allowlist edit that shows up in review.
 Add one line, lowest-friction spelling first, with a trailing `#` comment saying
 why it is safe:
 
-```
+```text
 comfy-cli                   # public (also on the org-wide PUBLIC_COMFY_ORG_REPOS list)
 ```
 
@@ -180,6 +184,14 @@ in the same order, except limitation 5 (*this lint is one category of
   Documented rather than capped — this tree's largest tracked file is under 600
   lines, and capping the scan would trade an unreachable timeout for a truncated
   count, the one number a red run's summary turns on.
+- **The newline-in-a-path refusals are best-effort**, on the `grep -r`
+  **fallback** path only (a git work tree does not have this hole). A
+  fabricated record that happens to look well-formed — digits+colon, or an
+  `@<org>/...`/`<org>/...` fragment at column 0 — passes every content test
+  and is reported against a path that does not exist. No test on a record's
+  content can tell it from a real one; closing it needs the fallback path to
+  stop putting an untrusted path into the same stream it parses records out
+  of (enumerate files NUL-delimited and scan each one separately).
 
 ## Running it
 
@@ -209,23 +221,30 @@ public run log nor the annotation list.
 `--root` is resolved robustly rather than trustingly: `CDPATH`, `GIT_DIR`,
 `GIT_WORK_TREE` and `GIT_INDEX_FILE` are unset (each can silently move the scan
 off the directory the run then reports as its scope), and so are
-`GIT_CONFIG_COUNT`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM` and
-`GIT_CONFIG_PARAMETERS` — those inject arbitrary config, and
-`core.attributesFile` pointing at one `*.md binary` line marks a subset of the
-tree binary, which `git grep -I` then silently skips. That one fails *open*: the
-scannability probe still clears, the scan reads less than the tree, and the OK
-line still claims the whole scope. (`GIT_CONFIG_KEY_n`/`_VALUE_n` are inert once
-the count is gone. `GIT_CONFIG_PARAMETERS` is the non-obvious one: it is how `-c`
-propagates to child git processes and is read unconditionally, so it delivers the
-same fail-open with the count already unset.)
+`GIT_CONFIG_COUNT`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`,
+`GIT_CONFIG_PARAMETERS` and `GIT_ATTR_SOURCE` — the first four inject arbitrary
+config, and `core.attributesFile` pointing at one `*.md binary` line marks a
+subset of the tree binary, which `git grep -I` then silently skips;
+`GIT_ATTR_SOURCE` (git >= 2.40) reaches the same `binary` fail-open directly,
+redirecting every `.gitattributes` read to a named tree-ish with no config
+variable involved. That fails *open*: the scannability probe still clears, the
+scan reads less than the tree, and the OK line still claims the whole scope.
+(`GIT_CONFIG_KEY_n`/`_VALUE_n` are inert once the count is gone.
+`GIT_CONFIG_PARAMETERS` is the non-obvious one: it is how `-c` propagates to
+child git processes and is read unconditionally, so it delivers the same
+fail-open with the count already unset.)
 
 What that does *not* do: unsetting `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`
 restores git's **default** config search rather than disabling it, so a
 runner-level `core.attributesFile` still applies. Pointing both at `/dev/null`
 plus `GIT_CONFIG_NOSYSTEM=1` would close that and is deliberately not done — it
 would also drop a runner's legitimate `safe.directory`, which makes `rev-parse`
-fail and silently takes the `grep -r` fallback. The environment is hardened; the
-runner's own config is trusted, the same way the tamper boundary trusts the
+fail and silently takes the `grep -r` fallback. `HOME`/`XDG_CONFIG_HOME` reach
+the same `binary` fail-open too, with no `GIT_CONFIG_*` or `GIT_ATTR_SOURCE`
+variable involved at all — git's per-user attributes default to
+`$XDG_CONFIG_HOME/git/attributes`, then `$HOME/.config/git/attributes`. The five
+unsets above close the injection channels reachable from a PR; the runner's own
+config and `$HOME` are trusted, the same way the tamper boundary trusts the
 checkout.
 
 The git/`grep -r` branch is chosen from `rev-parse --is-inside-work-tree`'s

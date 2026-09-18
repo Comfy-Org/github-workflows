@@ -99,10 +99,11 @@ a second catalog drifts, and this one already had. Three facts it cannot tell yo
   not variables (BE-6472): a variable passed via a step's `env:` prints unmasked in
   the env dump Actions emits *before* the step, too early for the bumper's masking.
   Keep private repo paths and detail out of workflow files, commits, and PR text.
-  **CI-enforced (BE-8192)**: `test-org-repo-literals.yml` fails any org-prefixed
-  repo literal whose name is not on `.github/lint/org-repo-allowlist.txt`, so
-  publishing a name is an allowlist edit review sees; BARE names stay with review
-  (a denylist would leak).
+  **CI-enforced (BE-8192) for tracked file contents only**:
+  `test-org-repo-literals.yml` fails any org-prefixed repo literal in the tracked
+  tree whose name is not on `.github/lint/org-repo-allowlist.txt`, so publishing
+  a name is an allowlist edit review sees. Commit messages, PR text and BARE
+  names stay with review (a denylist would leak).
 - **Pin everything by full commit SHA**, with a trailing `# v1` comment — callers'
   `uses:` and every third-party action here. Bare `@v1` fails the pin-validation
   (`pinact`, `zizmor`) consumers run and `check_workflow_pins.py` here (BE-15255);

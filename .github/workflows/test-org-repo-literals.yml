@@ -47,6 +47,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # Without this, an LFS-tracked text file checks out as a pointer
+          # stub and `git grep` scans the stub instead of the object, so a
+          # literal living in it would pass this gate green.
+          lfs: true
 
       - name: ShellCheck the lint script
         run: shellcheck -x .github/lint/check-org-repo-literals.sh
@@ -659,6 +663,11 @@ jobs:
           expect 0 'a .git suffix on a 98-character allowlisted name' "$n98" 'see %s/%s.git here\n' 'Comfy-Org' "$n98"
           expect 0 'a sentence period after a 100-character allowlisted name' "$n100" 'see %s/%s.\n' 'Comfy-Org' "$n100"
           expect 0 'a .git suffix on a short allowlisted name' 'foo' 'see %s/%s.git\n' 'Comfy-Org' 'foo'
+          # The ALLOWLIST ENTRY gets the same normalization as a scanned
+          # literal. Without it, an entry copied verbatim out of a clone URL
+          # (`foo.git`, the spelling GitHub itself shows) can never equal the
+          # `foo` a finding reports -- it clears nothing.
+          expect 0 'a .git suffix on the allowlist ENTRY still clears the bare name' 'foo.git' 'see %s/%s\n' 'Comfy-Org' 'foo'
           # Both bounds still fail CLOSED: a name that is over the limit once
           # normalized, and a period run past the 8-byte strip headroom, are
           # reported rather than cleared. Widening the bound must not have
@@ -840,6 +849,32 @@ jobs:
             fail=1
           else
             echo 'ok (1): GIT_CONFIG_PARAMETERS cannot shrink the scanned scope either'
+          fi
+
+          # `GIT_ATTR_SOURCE` (git >= 2.40) is a direct channel to the same
+          # fail-open, not a config injection: it redirects every
+          # `.gitattributes` read to a named tree-ish, so `*.md binary` on
+          # that tree hides every tracked markdown file from `git grep -I`
+          # with no `GIT_CONFIG_*` variable involved. Needs a real commit --
+          # unlike the config-injection fixtures above, this one is read
+          # from the object store, not the worktree.
+          gas_dir="$(mktemp -d)"
+          git -C "$gas_dir" init -q
+          printf 'see %s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$gas_dir/fixture.md"
+          printf 'nothing to see\n' > "$gas_dir/other.txt"
+          mkdir -p "$gas_dir/attrsrc"
+          printf '*.md binary\n' > "$gas_dir/attrsrc/.gitattributes"
+          git -C "$gas_dir" add -A
+          git -C "$gas_dir" -c user.email=t@example.com -c user.name=t commit -q -m fixture
+          status=0
+          output="$(GIT_ATTR_SOURCE="HEAD:attrsrc" \
+            bash .github/lint/check-org-repo-literals.sh --root "$gas_dir" 2>&1)" || status=$?
+          if [ "$status" -ne 1 ]; then
+            echo "::error::GIT_ATTR_SOURCE hid the tree from the scan (exited $status, expected 1)"
+            printf '%s\n' "$output"
+            fail=1
+          else
+            echo 'ok (1): GIT_ATTR_SOURCE cannot shrink the scanned scope either'
           fi
 
           exit "$fail"
