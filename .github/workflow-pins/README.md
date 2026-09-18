@@ -28,6 +28,18 @@ repo's own workflow files.
 - **`tests/`** — `unittest` suite, run by
   [`test-workflow-pins.yml`](../workflows/test-workflow-pins.yml) along with a
   CLI smoke test that a reintroduced default really exits non-zero.
+- **`tests/test_inputs_docs_drift.py`** — a SEPARATE concern that lives here
+  because this is the directory whose CI already watches both
+  `.github/workflows/**` and `docs/callers/**`. It does not touch
+  `check_workflow_pins.py`: it is a table-driven declared-vs-documented input
+  drift check over all 16 reusables, one generated `TestCase` each. A
+  documented-but-undeclared input fails hard and always (BE-4691 — GitHub
+  rejects an unknown `workflow_call` input at startup with a zero-job
+  `startup_failure` and no logs, so a phantom row is a broken caller for whoever
+  copies it); the quieter reverse, a declared input no guide names, is pinned in
+  a self-draining `KNOWN_UNDOCUMENTED` allowlist modelled on `KNOWN_EXEMPT`
+  above — a stale entry FAILS, so documenting one is "add the row, delete the
+  name".
 
 ```bash
 python3 .github/workflow-pins/check_workflow_pins.py
