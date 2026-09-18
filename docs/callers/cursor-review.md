@@ -38,6 +38,12 @@ failure cases besides. The Blocking gate does not have this hole: with
 `blocking: true` it runs on every event the caller delivers, so its verdict is
 always a live query of the PR's thread state, never a skip.
 
+**Panel integrity is its own check, and it is always on.** A reviewer cell that
+never submits no longer exits green, and a run whose panel came up short, whose
+findings could not be anchored, or whose review never landed publishes a red
+`Panel integrity` context. It needs no input and blocks nothing by itself — see
+[Panel integrity](#panel-integrity).
+
 Prompts and scripts live in [`.github/cursor-review/`](../../.github/cursor-review)
 — the single source of truth, so your repo carries only a thin caller.
 
@@ -216,6 +222,60 @@ What it does **not** do is make your own group redundant. Keep the caller group 
 
 **`run_without_label: true` reviews every PR.** On a busy repo that is a large
 step up in spend. Start label-gated.
+
+## Panel integrity
+
+`<caller job id> / Panel integrity` (with the caller above, `review / Panel
+integrity`) is the context that answers **"was this PR actually reviewed by a
+whole panel?"** — it is the one an automated merge gate should read, and it runs
+on every review, with no input to turn on.
+
+It is **advisory**: red here fails no other job, and the consolidated review
+still posts. Marking it a required status check in your branch-protection /
+ruleset settings is what makes red block a merge — the same two-switch shape as
+the Blocking gate, and independent of it. The two answer different questions:
+Panel integrity asks whether the review was *complete*, the Blocking gate asks
+whether its findings were *addressed*.
+
+Red means at least one of these, each named on its own `::error::` annotation in
+the job log:
+
+| Cause | What it means |
+|---|---|
+| Panel incomplete | Fewer cells submitted findings than ran. The consolidated review was adjudicated over a short panel. The individual leg checks (`adversarial (<model>)` / `edge-case (<model>)`) are red for exactly the cells that did not submit — almost always the 15-minute agent cap. |
+| Unanchored findings | Findings the review could not anchor to a line of the reviewed diff, so they were demoted to the review **body** and have no thread. The Blocking gate cannot see them; read the body. |
+| Nothing delivered | No review carrying resolvable finding threads reached the PR — a read-only token, a rejected inline payload, or a post that could not be confirmed. The findings are in the `Post review` job summary. |
+| Judge degraded | The judge model never adjudicated; the review is the raw union of the cells' findings, so duplicates and false positives were not filtered out. |
+
+**Your caller job goes red with a failing leg, and that is the point.** A
+reusable workflow's caller job takes the aggregate conclusion of the jobs inside
+it, so a cell that did not submit now turns `review` red as well as its own leg
+— on a measured ~40% of runs, because a stalled `cursor-agent` is common. That
+red is the signal: it is what makes an incomplete panel visible to anything
+reading `statusCheckRollup`, which is exactly what used to be impossible. Read
+it as "this review is partial", not as "the review failed": the consolidated
+review still posts, the Blocking gate is unaffected, and re-running the failed
+legs or re-triggering the review is what clears it. If you want a *merge* gate,
+require `Panel integrity` — do **not** require the caller job itself, which is
+red for every unrelated infrastructure failure too.
+
+Three more shapes to expect before you require it:
+
+* **A cancelled run reports red.** GitHub counts a *skipped* required check as
+  passing, so this job runs on cancellation rather than handing a superseded run
+  a free green — the same reasoning the Blocking gate documents. Under the
+  `cancel-in-progress` caller above that red lands on the head SHA that was
+  superseded, not on the new one.
+* **Do not require a leg check instead.** A panel cell's context name carries
+  the model id (`edge-case (kimi-k3-high)`), so it changes whenever the panel
+  list does — and a required check whose name no longer exists blocks every PR
+  in the repo. `Panel integrity` is stable by design.
+* **A failed `Gate` job skips this check rather than failing it.** Panel
+  integrity is gated on the same four conditions the panel is, and all four read
+  `Gate`'s outputs — which are empty when that job failed. There is no panel to
+  report on in that case, and the `Gate` context is itself red, so the rollup
+  still carries the signal; the fail-closed guard for a *required* check lives on
+  the Blocking gate.
 
 ## Blocking-gate gotchas
 
