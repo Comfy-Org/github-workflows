@@ -346,6 +346,46 @@
         "default_pool": ["alice\r"],
         "rules": []
       }
+    },
+    {
+      "name": "a bare CR ending a rule key line is data, and BOTH ports keep the key",
+      "why": "the two languages' `.` differ: Python's omits only LF, JS's also omits CR, U+2028 and U+2029. With `(.*)$` the Python setKey regex matched this line and the JS one did NOT, so the runtime dropped `reviewers:` entirely and routed nobody while the drift generator modelled alice as routing. Both ports now spell the class out as `[^\\n]*`, keep the CR as part of the value, and agree it cannot be a login",
+      "text": "rules:\n  - paths: ['a/**']\n    reviewers: alice\r",
+      "expected": {
+        "default_pool": [],
+        "rules": [
+          {"paths": ["a/**"], "reviewers": ["alice\r"]}
+        ]
+      }
+    },
+    {
+      "name": "a U+00A0-only line at column 0 ends a default_pool block on both ports",
+      "why": "narrowing the blank-line test to s-white means a line whose only content is non-s-white whitespace is no longer blank, and `_indent_of`/`indentOf` count SPACES only, so it reads as column 0 and terminates the block. Both ports moved together, so this is a behaviour change rather than a parity break — pinned because nothing else covers a whitespace-only line and the truncation is otherwise silent",
+      "text": "default_pool:\n  - alice\n\u00a0\n  - bob\n",
+      "expected": {
+        "default_pool": ["alice"],
+        "rules": []
+      }
+    },
+    {
+      "name": "a U+00A0-only line at column 0 drops every later rule on both ports",
+      "why": "same mechanism as the default_pool case, but inside the `rules:` loop the `break` discards every rule AFTER the stray line, not just the tail of one list. Pinned so the blast radius of one invisible character is executable on both ports rather than discovered in a consumer repo",
+      "text": "rules:\n  - paths: ['a/**']\n    reviewers: [alice]\n\u00a0\n  - paths: ['b/**']\n    reviewers: [bob]\n",
+      "expected": {
+        "default_pool": [],
+        "rules": [
+          {"paths": ["a/**"], "reviewers": ["alice"]}
+        ]
+      }
+    },
+    {
+      "name": "an INDENTED U+00A0-only line does not end the block",
+      "why": "the negative control for the two cases above: `_indent_of`/`indentOf` count the leading spaces, so a padded blank line that is INDENTED reads as column 2, never reaches the column-0 `break`, and is simply not a `- ` item. Bounds the truncation to a stray character at column 0 specifically",
+      "text": "default_pool:\n  - alice\n  \u00a0\n  - bob\n",
+      "expected": {
+        "default_pool": ["alice", "bob"],
+        "rules": []
+      }
     }
   ],
   "globs": [

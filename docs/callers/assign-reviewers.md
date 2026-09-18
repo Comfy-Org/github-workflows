@@ -203,6 +203,20 @@ byte-order mark — is taken literally as part of the login by both the runtime 
 drift generator, matches no collaborator, and will not route. Strip those characters from
 the file rather than expecting either side to absorb them.
 
+Because that padding is invisible, the run **warns** (`configured reviewer "\u00a0alice"
+is not a valid GitHub login and will never be assigned`) whenever a login configured in
+`reviewers.yml` cannot be a GitHub login at all, rendering the offending token
+codepoint-escaped so the character is findable. It is deliberately silent about a
+configured owner who is merely excluded — the PR author, or `vars.REVIEWER_EXCLUDE` —
+since that is normal and would otherwise fire on nearly every run.
+
+One consequence of trimming spaces and tabs only: a line whose sole content is some
+*other* invisible character is no longer a blank line, and indentation counts spaces, so
+at column 0 it ends the block above it — inside `rules:` that silently discards every
+rule after it. Both ports behave identically here and the corpus pins it, but a stray
+non-breaking space at the start of a line is worth ruling out if owners stop being
+assigned. Indented, such a line is harmless.
+
 ## Gotchas
 
 **Dependabot PRs need the same skip as forks, for a different reason.** They are

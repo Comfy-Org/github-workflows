@@ -524,7 +524,17 @@ jobs:
                   i++;
                   let current = null, listKey = null, ruleIndent = -1;
                   const setKey = (seg) => {
-                    const m = seg.match(/^(paths|reviewers):(.*)$/);
+                    // `[^\n]*`, not `.*`: the two languages disagree about what `.`
+                    // excludes. Python's `.` omits only LF, JS's omits LF, CR, U+2028
+                    // and U+2029 — so on a rule line ending in a bare CR (the last line
+                    // of a document with no final newline, which the split above now
+                    // preserves as data) the Python port matched and this one did NOT,
+                    // silently dropping the key and leaving the rule with no reviewers
+                    // while the drift generator modelled those reviewers as routing.
+                    // Spelled out on both ports, both now keep the CR as part of the
+                    // value — where `eligible()` rejects it, the same answer the corpus
+                    // already pins for the `default_pool:` block arm.
+                    const m = seg.match(/^(paths|reviewers):([^\n]*)$/);
                     if (!m) return;
                     const key = m[1];
                     const val = trimSWhite(m[2]);
@@ -612,12 +622,36 @@ jobs:
               if (!candidates.has(login)) candidates.set(login, {login, configured: new Set(), history: new Map(), load: null});
               return candidates.get(login);
             };
+            // A CONFIGURED login that cannot be a GitHub login at all is config rot, and
+            // it is otherwise completely silent: it just never gets assigned. That became
+            // reachable when both ports narrowed to trimming s-white, since a login padded
+            // with U+00A0/U+FEFF/U+0085/U+001C or a trailing bare CR now survives parsing
+            // verbatim and fails the shape gate — and every one of those characters is
+            // invisible in an editor. Warn once per bad token so the rot is findable.
+            // Deliberately keyed on the SHAPE test only, not on `eligible()`: the exclude
+            // set legitimately holds the PR author and `EXCLUDE`, and warning about a
+            // correctly-configured owner who happens to have opened the PR would fire on
+            // essentially every run and train people to ignore it. The token is rendered
+            // codepoint-escaped because the whole point is that it looks fine verbatim;
+            // note this is NOT the `escape` declared further down (that one is an HTML
+            // escaper for the job summary, and `const` — referencing it from here would
+            // hit the temporal dead zone and throw).
+            const showInvisible = (s) => s.replace(/[^\x20-\x7e]/g, (c) => '\\u' + c.codePointAt(0).toString(16).padStart(4, '0'));
+            const warnedLogins = new Set();
+            const configuredCandidate = (raw) => {
+              const login = normalizeLogin(raw);
+              if (!/^[a-z\d](?:[a-z\d-]{0,38})$/i.test(login) && !warnedLogins.has(login)) {
+                warnedLogins.add(login);
+                core.warning(`${configPath ? `${configPath}: ` : ''}configured reviewer "${showInvisible(raw)}" is not a valid GitHub login and will never be assigned — check for invisible padding such as U+00A0 or a trailing CR.`);
+              }
+              return candidate(raw);
+            };
             const matched = new Set();
             for (const rule of config.rules) {
               files.forEach((file, index) => {
                 if (!paths(file).some((path) => matchesAny(path, rule.paths || []))) return;
                 matched.add(index);
-                for (const login of rule.reviewers || []) candidate(login)?.configured.add(index);
+                for (const login of rule.reviewers || []) configuredCandidate(login)?.configured.add(index);
               });
             }
 
@@ -659,7 +693,7 @@ jobs:
             ]);
             for (const [login, person] of candidates) if (!coverage(person).size) candidates.delete(login);
             const fallback = !matched.size && !candidates.size;
-            if (fallback) for (const login of config.default_pool || []) candidate(login);
+            if (fallback) for (const login of config.default_pool || []) configuredCandidate(login);
             if (!candidates.size) {
               core.info('No eligible owner with evidence; leaving PR unassigned.');
               return;

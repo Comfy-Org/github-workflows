@@ -69,6 +69,24 @@ runtime and in the drift generator instead of routing in one and not the other.
 The warning text is the one part not corpus-pinned — the channels differ
 (`core.warning` vs a `::warning::` line) — so each suite asserts its own.
 
+Three consequences of that narrowing, each pinned rather than left to be rediscovered:
+the runtime **warns** when a *configured* login fails the login-shape gate, because the
+padding that now survives is invisible and the token would otherwise just never be
+assigned (keyed on the shape test only — being excluded as the PR author is normal and
+must not warn); a line whose only content is non-s-white whitespace is **no longer
+blank**, and since indentation counts spaces it reads as column 0 and terminates the
+block above it, which inside `rules:` drops every later rule; and the `setKey` regex
+spells its class out as `[^\n]*` rather than `.`, because Python's `.` excludes only LF
+while JS's also excludes CR, U+2028 and U+2029 — with `.` the Python port matched a rule
+line ending in a bare CR and the JS port did not, so the runtime dropped the key while
+the generator modelled those reviewers as routing.
+
+The generator reads the committed config as **bytes**, never with `text=True`: universal-
+newline translation rewrites CRLF and a bare CR to LF before the parser sees them, which
+would hand the parser different bytes than the runtime reads from the base64 blob — the
+same divergence class, one layer above the parser and invisible to a test that feeds the
+parser text directly.
+
 The [caller guide](../../docs/callers/assign-reviewers.md) documents the ranking,
 evidence limits, failure handling, and configuration. Keep behavior there rather
 than maintaining another algorithm description here.

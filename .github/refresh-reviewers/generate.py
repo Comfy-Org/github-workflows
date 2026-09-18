@@ -289,7 +289,17 @@ def parse_reviewer_config(text):
 
             def set_key(seg, line_idx):
                 nonlocal list_key
-                m = re.match(r"^(paths|reviewers):(.*)$", seg)
+                # `[^\n]*`, not `.*`: the two languages disagree about what `.`
+                # excludes. Python's `.` omits only LF, JS's omits LF, CR, U+2028
+                # and U+2029 — so on a rule line ending in a bare CR (the last line
+                # of a document with no final newline, which the split above now
+                # preserves as data) Python matched and JS did NOT, silently
+                # dropping the key and leaving the rule with no reviewers while
+                # this generator modelled those reviewers as routing. Spelled out
+                # on both ports, both now keep the CR as part of the value — where
+                # `eligible()` rejects it, the same answer the corpus already pins
+                # for the `default_pool:` block arm.
+                m = re.match(r"^(paths|reviewers):([^\n]*)$", seg)
                 if not m:
                     return
                 key, val = m.group(1), _trim(m.group(2))
@@ -368,15 +378,23 @@ def _rewrite_flow_line(line, key, logins):
     # real value `alice` in place. Anchoring here keeps the two in step.
     value_pos = key_pos + len(key)
     rest = stripped[value_pos:]
-    lead = len(rest) - len(rest.lstrip())
+    # s-white, not bare lstrip()/rstrip(): the rewriter has to agree with
+    # `_parse_flow` about where the VALUE starts and ends, and `_parse_flow` now
+    # trims s-white only. A bare `lstrip()` still absorbs U+00A0 and U+001C, so
+    # `reviewers:<NBSP>[alice]` — a bare SCALAR to the parser — took the bracket
+    # branch here and emitted `reviewers:<NBSP>[new-a, new-b]`, which re-parses as
+    # ONE ineligible scalar login: the refreshed rule routed nobody. The trailing
+    # `rstrip()` was the mirror image, leaving value bytes outside the span it
+    # replaced. Both ends now spell out the same two characters the parser does.
+    lead = len(rest) - len(rest.lstrip(S_WHITE))
     open_idx = value_pos + lead if rest[lead:lead + 1] == "[" else -1
     if open_idx != -1:
         close_idx = stripped.find("]", open_idx)
-        end = close_idx + 1 if close_idx != -1 else len(stripped.rstrip())
+        end = close_idx + 1 if close_idx != -1 else len(stripped.rstrip(S_WHITE))
         return line[:open_idx] + new_list + line[end:]
     # scalar form: `reviewers: alice  # note` -> replace the value span only
     key_end = key_pos + len(key)
-    return line[:key_end] + " " + new_list + line[len(stripped.rstrip()):]
+    return line[:key_end] + " " + new_list + line[len(stripped.rstrip(S_WHITE)):]
 
 
 def rewrite_config(text, locs, rule_replacements, default_pool_replacement):
@@ -403,7 +421,14 @@ def rewrite_config(text, locs, rule_replacements, default_pool_replacement):
         else:
             _, item_lines, indent = loc
             drop.update(item_lines)
-            insert_at[item_lines[0]] = [" " * indent + "- " + l for l in logins]
+            # Carry the replaced line's CR, if it had one. `lines` comes from a
+            # `split("\n")`, so on a CRLF document every line still ends in `\r`;
+            # now that the read path no longer translates newlines away, emitting
+            # a bare-LF item into a CRLF file would leave it with MIXED endings.
+            # The flow arm needs no equivalent — it rebuilds the line around the
+            # `[...]` span and keeps the tail, CR included.
+            eol = "\r" if lines[item_lines[0]].endswith("\r") else ""
+            insert_at[item_lines[0]] = [" " * indent + "- " + l + eol for l in logins]
 
     out = []
     for i, line in enumerate(lines):
@@ -793,12 +818,23 @@ def main():
             print(f"::warning::skipping invalid EXTRA_EXCLUDE_PATHS regex {rx!r}: {e}")
 
     # --- committed config (from the default branch, not the checkout ref) ---
+    # Read the config as BYTES and decode here, deliberately: `text=True` turns on
+    # universal-newline translation, which rewrites `\r\n` AND a bare `\r` to `\n`
+    # before the parser ever sees them. The runtime port reads the blob untranslated
+    # (`Buffer.from(res.data.content, 'base64').toString('utf8')`), so with `text=True`
+    # this generator parsed `alice` exactly where the runtime parsed `alice\r` and
+    # refused to route it — the very divergence class `parse_reviewer_config`'s
+    # `re.split(r"\r?\n", ...)` exists to close, reintroduced one layer up and
+    # invisible to a unit test that feeds the parser text directly. It also kept
+    # `rewrite_config` from being byte-faithful on a CRLF config: every scheduled
+    # run would have rewritten the whole file to LF. `errors="replace"` matches the
+    # `git log` read below — a drift generator must not hard-fail on odd bytes.
     show = subprocess.run(
         ["git", "show", f"refs/remotes/origin/{branch}:{config_path}"],
-        capture_output=True, text=True)
+        capture_output=True)
     if show.returncode != 0:
         return _noop_exit(f"could not read {config_path} on origin/{branch}")
-    committed_text = show.stdout
+    committed_text = show.stdout.decode("utf-8", errors="replace")
     config, locs = parse_reviewer_config(committed_text)
     if not config["rules"] and not config["default_pool"]:
         return _noop_exit(f"{config_path} has no rules or default_pool")
@@ -955,7 +991,11 @@ def main():
     new_config_path = os.path.join(results_dir, "reviewers.new.yml")
     report_path = os.path.join(results_dir, "report.json")
     pr_body_path = os.path.join(results_dir, "pr-body.md")
-    with open(new_config_path, "w", encoding="utf-8") as f:
+    # `newline=""` for the same reason the read above drops `text=True`: now that a
+    # CR can survive parsing as data, the write must not translate it back. (A no-op
+    # on the Linux runners, where `os.linesep` is already `\n` — explicit so the
+    # round-trip stays byte-faithful rather than platform-dependent.)
+    with open(new_config_path, "w", encoding="utf-8", newline="") as f:
         f.write(new_text)
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
