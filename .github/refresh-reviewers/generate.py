@@ -136,6 +136,15 @@ def matches_any(path, compiled_globs):
 # those bytes. Location shapes:
 #   ("flow", line_idx)              — `reviewers: [a, b]` (also bare scalar)
 #   ("block", [line_idx, ...], indent) — `- a` item lines
+#   ("unterminated", line_idx)      — `reviewers: [a,` whose `]` lives on a
+#                                     LATER line; parsed, never rewritten
+#
+# The rewrite only ever edits bytes on the ONE line a location names (flow) or
+# the item lines it lists (block), so a flow sequence spread across several
+# lines has no location shape it can safely take: replacing the first line's
+# `[...]` span would leave the continuation lines behind as orphaned YAML.
+# Those lists are tagged "unterminated", skipped by the rewrite, and surfaced
+# to the caller via unterminated_locations() so the shape can be fixed by hand.
 
 def _strip_comment(s):
     in_s = in_d = False
@@ -163,6 +172,18 @@ def _parse_flow(s):
     end = s.find("]")
     inner = s[1:end] if end != -1 else s[1:]
     return [x for x in (_unquote(p) for p in inner.split(",")) if x]
+
+
+def _flow_is_unterminated(s):
+    """True when `s` opens a flow sequence that does not close on this line.
+
+    `_parse_flow` deliberately still parses such a value (it mirrors the JS
+    port's `s[1:]` fallback, and the shared parser corpus pins that), so this
+    is a SEPARATE question asked only by the rewrite side: can the list be
+    edited in place on one line? `s` is already comment-stripped by the
+    caller, so a `]` inside a trailing comment cannot make it look closed."""
+    s = s.strip()
+    return s.startswith("[") and "]" not in s
 
 
 def _indent_of(line):
@@ -195,7 +216,9 @@ def parse_reviewer_config(text):
             flow = _parse_flow(rest)
             if flow is not None:
                 config["default_pool"] = flow
-                locs["default_pool"] = ("flow", i)
+                locs["default_pool"] = (
+                    ("unterminated", i) if _flow_is_unterminated(rest)
+                    else ("flow", i))
                 i += 1
                 continue
             i += 1
@@ -237,7 +260,10 @@ def parse_reviewer_config(text):
                     if current is not None:
                         current[key] = flow
                         if key == "reviewers":
-                            cur_loc["reviewers"] = ("flow", line_idx)
+                            cur_loc["reviewers"] = (
+                                ("unterminated", line_idx)
+                                if _flow_is_unterminated(val)
+                                else ("flow", line_idx))
                     list_key = None
                 elif val == "":
                     list_key = key
@@ -287,6 +313,22 @@ def parse_reviewer_config(text):
     return config, locs
 
 
+def unterminated_locations(locs):
+    """[(key, line_idx), ...] for every list the rewrite must leave alone.
+
+    key is "default_pool" or "rules[<n>].reviewers"; line_idx is 0-based (the
+    caller renders it 1-based). Public so the workflow can warn about a config
+    shape the refresher silently cannot manage."""
+    out = []
+    dp = locs.get("default_pool")
+    if dp is not None and dp[0] == "unterminated":
+        out.append(("default_pool", dp[1]))
+    for n, loc in enumerate(locs.get("rules") or []):
+        if loc is not None and loc[0] == "unterminated":
+            out.append((f"rules[{n}].reviewers", loc[1]))
+    return out
+
+
 # --- surgical rewrite --------------------------------------------------------
 
 def _rewrite_flow_line(line, key, logins):
@@ -314,14 +356,27 @@ def rewrite_config(text, locs, rule_replacements, default_pool_replacement):
     rule_replacements: {rule_index: [logins]} — rules absent from the map keep
     their bytes untouched. default_pool_replacement: [logins] or None.
     Everything outside the replaced flow spans / block item lines — comments
-    included — is preserved byte-for-byte."""
+    included — is preserved byte-for-byte. A list whose location is None (no
+    line to edit) or "unterminated" (a flow sequence continued on later lines,
+    which no single-line edit can rewrite without orphaning the remainder) is
+    left exactly as committed.
+
+    Splitting on "\\n" leaves the "\\r" of a CRLF document on the end of every
+    line, so the flow/scalar rewrites — which edit a span WITHIN a line — stay
+    byte-faithful for free. Inserted block items have no line to inherit from,
+    so they copy the ending of the item line they replace, per line, which
+    keeps a deliberately mixed-ending file mixed exactly as it was."""
     lines = text.split("\n")
+
+    def _rewritable(loc):
+        return loc is not None and loc[0] != "unterminated"
+
     # (loc, key, logins) for every list being replaced
     jobs = []
-    if default_pool_replacement is not None and locs["default_pool"] is not None:
+    if default_pool_replacement is not None and _rewritable(locs["default_pool"]):
         jobs.append((locs["default_pool"], "default_pool:", default_pool_replacement))
     for idx, logins in rule_replacements.items():
-        if idx < len(locs["rules"]) and locs["rules"][idx] is not None:
+        if idx < len(locs["rules"]) and _rewritable(locs["rules"][idx]):
             jobs.append((locs["rules"][idx], "reviewers:", logins))
 
     drop = set()          # block item lines to remove
@@ -332,7 +387,9 @@ def rewrite_config(text, locs, rule_replacements, default_pool_replacement):
         else:
             _, item_lines, indent = loc
             drop.update(item_lines)
-            insert_at[item_lines[0]] = [" " * indent + "- " + l for l in logins]
+            eol = "\r" if lines[item_lines[0]].endswith("\r") else ""
+            insert_at[item_lines[0]] = [
+                " " * indent + "- " + l + eol for l in logins]
 
     out = []
     for i, line in enumerate(lines):
@@ -613,6 +670,16 @@ def build_pr_body(report):
         f"{report['bot_commits_excluded']}",
         "",
     ]
+    skipped = report.get("skipped_unterminated") or []
+    if skipped:
+        where = ", ".join(f"{md_code(e['key'])} (line {e['line']})" for e in skipped)
+        lines += [
+            f"**{len(skipped)} list(s) left unchanged because they are "
+            f"multi-line flow sequences** — {where}. The rewrite only edits "
+            "single-line lists, so put each list on one line to let the "
+            "refresher manage it.",
+            "",
+        ]
     if report["gaps"]:
         lines += [
             "### Taxonomy gaps (report-only)",
@@ -677,6 +744,31 @@ def write_outputs(outputs):
             f.write(f"{key}={val}\n")
 
 
+def read_committed_config(branch, config_path):
+    """Read `config_path` from `refs/remotes/origin/<branch>` as TEXT, without
+    newline translation. None when the blob is unreadable or not UTF-8.
+
+    `git show` is run in BYTES mode and decoded explicitly on purpose: with
+    `text=True`, Python's universal-newline translation rewrites a CRLF
+    config's `\\r\\n` to `\\n` before the surgical rewrite ever sees the file, so
+    every line of the proposed config differs from the committed bytes — the
+    opposite of the byte-faithful guarantee the rewrite exists to give. The
+    decode is strict for the same reason: a config we cannot reproduce
+    byte-for-byte must produce the documented clean no-op, never a lossy
+    `replace`-decoded rewrite of somebody's committed file."""
+    show = subprocess.run(
+        ["git", "show", f"refs/remotes/origin/{branch}:{config_path}"],
+        capture_output=True)
+    if show.returncode != 0:
+        return None
+    try:
+        return show.stdout.decode("utf-8")
+    except UnicodeDecodeError as e:
+        print(f"::warning::{config_path} on origin/{branch} is not valid "
+              f"UTF-8: {e}")
+        return None
+
+
 def _noop_exit(reason):
     print(f"::warning::{reason} — nothing to refresh.")
     write_outputs({"changed": "false"})
@@ -722,13 +814,18 @@ def main():
             print(f"::warning::skipping invalid EXTRA_EXCLUDE_PATHS regex {rx!r}: {e}")
 
     # --- committed config (from the default branch, not the checkout ref) ---
-    show = subprocess.run(
-        ["git", "show", f"refs/remotes/origin/{branch}:{config_path}"],
-        capture_output=True, text=True)
-    if show.returncode != 0:
-        return _noop_exit(f"could not read {config_path} on origin/{branch}")
-    committed_text = show.stdout
+    committed_text = read_committed_config(branch, config_path)
+    if committed_text is None:
+        return _noop_exit(
+            f"could not read {config_path} on origin/{branch} "
+            "(missing, or not valid UTF-8)")
     config, locs = parse_reviewer_config(committed_text)
+    skipped_unterminated = [{"key": key, "line": idx + 1}
+                            for key, idx in unterminated_locations(locs)]
+    for entry in skipped_unterminated:
+        print(f"::warning::{config_path}:{entry['line']}: {entry['key']} is a "
+              "multi-line flow sequence; the generator only rewrites "
+              "single-line lists, so this list is left unchanged")
     if not config["rules"] and not config["default_pool"]:
         return _noop_exit(f"{config_path} has no rules or default_pool")
     rule_globs = [[glob_to_regexp(g) for g in r.get("paths", [])]
@@ -879,12 +976,15 @@ def main():
             "scores": {l: round(overall.get(l, 0.0), 2) for l in dp_after},
         },
         "gaps": gaps,
+        "skipped_unterminated": skipped_unterminated,
     }
 
     new_config_path = os.path.join(results_dir, "reviewers.new.yml")
     report_path = os.path.join(results_dir, "report.json")
     pr_body_path = os.path.join(results_dir, "pr-body.md")
-    with open(new_config_path, "w", encoding="utf-8") as f:
+    # newline="" — the rewrite already carries the document's own line
+    # endings, so the runner OS must not translate them a second time.
+    with open(new_config_path, "w", encoding="utf-8", newline="") as f:
         f.write(new_text)
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)

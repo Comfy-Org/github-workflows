@@ -17,11 +17,17 @@ half_life_days)` and `touches += 1`. Line counts are intentionally unused. Bot
 authors, generated/churn paths, and non-collaborators are excluded (collaborators
 rather than org members, because `addAssignees` silently drops non-collaborators).
 The rewrite is surgical — only the `reviewers: [...]` / `default_pool: [...]`
-lists change and everything else is kept byte-for-byte — and a rule that cannot
-reach its floor of qualifiers is left unchanged. (One caveat: an inline trailing
-comment on a *block-form list item* being rewritten — `- alice # rationale` —
-is not carried over when that list's membership changes; keep per-reviewer
-rationales as their own comment lines, not inline.)
+lists change and everything else, the file's own line endings included, is kept
+byte-for-byte — and a rule that cannot reach its floor of qualifiers is left
+unchanged. Two caveats. An inline trailing comment on a *block-form list item*
+being rewritten — `- alice # rationale` — is not carried over when that list's
+membership changes; keep per-reviewer rationales as their own comment lines,
+not inline. And a **multi-line flow sequence** (`reviewers: [alice,` whose `]`
+is on a later line) is parsed but never rewritten — the rewrite only edits
+single-line lists, so touching the opening line would orphan the continuation
+lines — so such a list is left exactly as committed, with a `::warning::`
+naming its line and a note in the drift PR's body; put it on one line to let
+the refresher manage it.
 
 Runs are idempotent: each re-run force-resets the same `pr_branch` from the
 default branch and edits the one open drift PR in place, so duplicate PRs never
