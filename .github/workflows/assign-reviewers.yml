@@ -445,11 +445,16 @@ jobs:
               };
               const unquote = (s) => {
                 s = s.trim();
-                // `s.length >= 2` is load-bearing: a lone `"` both starts and ends with
-                // a quote, so without it `slice(1, -1)` turns that one character into
-                // the empty string. Nothing downstream filters an empty reviewer out of
-                // a BLOCK sequence, and the Python port already guards the length, so
-                // dropping the guard here is also a parity break.
+                // `s.length >= 2` is load-bearing for PARITY — the reason that survives
+                // being checked. A lone `"` both starts and ends with a quote, so without
+                // the guard `slice(1, -1)` collapses that one character to the empty
+                // string, while the Python port (guarded since #63) keeps it as `"`.
+                // Two things this guard is NOT: it does not stop an empty reviewer
+                // reaching the list (`- ""` is two characters and unquotes to `''`), and
+                // it is not the thing keeping `''` out of routing — `eligible()` below
+                // rejects `''` and `"` alike, so no assignment outcome changes either
+                // way. Drop it and you reopen exactly the divergence
+                // ../assign-reviewers/parser-corpus.json exists to pin, nothing more.
                 if (s.length >= 2 && ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'")))) return s.slice(1, -1);
                 return s;
               };

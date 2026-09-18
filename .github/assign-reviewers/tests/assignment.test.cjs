@@ -7,30 +7,63 @@ const workflow = readFileSync(resolve(__dirname, '../../workflows/assign-reviewe
 // `// PARITY-HARNESS:<name>:{begin,end}` sentinels emitted inside the script itself: the previous
 // split on a 10-space-indented `script: |` plus the name of an unrelated downstream step captured
 // the WRONG span, silently and still green, the moment either drifted. Every failure mode here
-// throws with the sentinel that is missing, duplicated or out of order.
-const region = (text, name) => {
+// throws with the sentinel that is missing, duplicated, out of order or out-dented.
+//
+// `origin` is the REPORTING FRAME, not just a label: `{file, offset}` where `offset` is the
+// 0-based line of `text`'s first line within `file`. The nested `glob-matcher` / `config-parser`
+// regions are extracted from the already-de-indented script, so without an offset their failures
+// would quote a line number into that intermediate string as if it were a workflow-file line.
+const WORKFLOW_ORIGIN = {file: 'assign-reviewers.yml', offset: 0};
+const regionSpan = (text, name, origin = WORKFLOW_ORIGIN) => {
   const lines = text.split('\n');
+  const at = (index) => origin.offset + index + 1;
   const only = (suffix) => {
     const marker = `// PARITY-HARNESS:${name}:${suffix}`;
-    const hits = lines.flatMap((line, at) => line.trim() === marker ? [at] : []);
-    if (hits.length !== 1) throw Error(`expected exactly one \`${marker}\` line in assign-reviewers.yml, found ${hits.length}. The parity harness extracts by sentinel; restore the marker rather than reintroducing an indentation-based split.`);
+    const hits = lines.flatMap((line, index) => line.trim() === marker ? [index] : []);
+    if (hits.length !== 1) throw Error(`expected exactly one \`${marker}\` line in ${origin.file}, found ${hits.length}. The parity harness extracts by sentinel; restore the marker rather than reintroducing an indentation-based split.`);
     return hits[0];
   };
   const begin = only('begin'), end = only('end');
-  if (end < begin) throw Error(`\`// PARITY-HARNESS:${name}\` sentinels are inverted in assign-reviewers.yml: begin on line ${begin + 1}, end on line ${end + 1}.`);
+  if (end < begin) throw Error(`\`// PARITY-HARNESS:${name}\` sentinels are inverted in ${origin.file}: begin on line ${at(begin)}, end on line ${at(end)}.`);
   const indent = lines[begin].length - lines[begin].trimStart().length;
-  return lines.slice(begin + 1, end).map((line, offset) => {
-    if (line.trim() && !line.startsWith(' '.repeat(indent))) throw Error(`line ${begin + 2 + offset} of assign-reviewers.yml is indented less than its \`// PARITY-HARNESS:${name}:begin\` sentinel; the extracted span would not be valid JavaScript.`);
-    return line.slice(indent);
-  }).join('\n');
+  // `<= end` deliberately includes the `:end` marker line: out-denting it out of the block
+  // scalar changes the shipped YAML's shape while leaving a body-only check green.
+  for (let index = begin + 1; index <= end; index++) {
+    if (lines[index].trim() && !lines[index].startsWith(' '.repeat(indent))) throw Error(`line ${at(index)} of ${origin.file} is indented less than its \`// PARITY-HARNESS:${name}:begin\` sentinel; the extracted span would not be valid JavaScript.`);
+  }
+  return {text: lines.slice(begin + 1, end).map((line) => line.slice(indent)).join('\n'), lines, begin, end, indent};
 };
-const script = region(workflow, 'script');
+const region = (text, name, origin) => regionSpan(text, name, origin).text;
+// Ordering the sentinels correctly is not enough: they must bracket the WHOLE `script: |`
+// scalar. JavaScript placed ABOVE `:begin` or BELOW `:end` still ships to production while
+// being excluded from the bytes `runScript` and `helpers` execute — the same silent
+// wrong-span failure this harness exists to eliminate, pointing the other way.
+const assertBracketsBlockScalar = (span, name, origin = WORKFLOW_ORIGIN) => {
+  const {lines, begin, end, indent} = span;
+  const at = (index) => origin.offset + index + 1;
+  let above = begin - 1;
+  while (above >= 0 && !lines[above].trim()) above--;
+  if (above < 0 || !/^\s*script:\s*\|[0-9+-]*\s*$/.test(lines[above])) {
+    throw Error(`\`// PARITY-HARNESS:${name}:begin\` (line ${at(begin)} of ${origin.file}) must be the FIRST line of the \`script: |\` scalar, but line ${at(above)} is \`${(lines[above] ?? '').trim()}\`; JavaScript above the sentinel ships untested.`);
+  }
+  let below = end + 1;
+  while (below < lines.length && !lines[below].trim()) below++;
+  if (below < lines.length && lines[below].startsWith(' '.repeat(indent))) {
+    throw Error(`\`// PARITY-HARNESS:${name}:end\` (line ${at(end)} of ${origin.file}) must be the LAST line of the \`script: |\` scalar, but line ${at(below)} (\`${lines[below].trim()}\`) is still inside it; JavaScript below the sentinel ships untested.`);
+  }
+  return span;
+};
+const scriptSpan = assertBracketsBlockScalar(regionSpan(workflow, 'script'), 'script');
+const script = scriptSpan.text;
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 const runScript = new AsyncFunction('github', 'context', 'core', 'process', 'require', script);
 // The two parity-critical helpers, evaluated straight out of the shipped script so the corpus
 // below drives the same bytes the runtime does. Their Python ports in refresh-reviewers/generate.py
-// are driven from that same corpus file by test_generate.py.
-const helpers = new Function(`${region(script, 'glob-matcher')}\n${region(script, 'config-parser')}\nreturn {globToRegExp, matchesAny, parseReviewerConfig};`)();
+// are driven from that same corpus file by test_generate.py. These are sub-spans of the script by
+// design, so they take the sentinel and indent checks but not the whole-scalar bracket check;
+// their origin offset keeps reported line numbers absolute in assign-reviewers.yml.
+const SCRIPT_ORIGIN = {file: 'assign-reviewers.yml', offset: scriptSpan.begin + 1};
+const helpers = new Function(`${region(script, 'glob-matcher', SCRIPT_ORIGIN)}\n${region(script, 'config-parser', SCRIPT_ORIGIN)}\nreturn {globToRegExp, matchesAny, parseReviewerConfig};`)();
 const corpus = JSON.parse(readFileSync(resolve(__dirname, '../parser-corpus.json'), 'utf8'));
 const file = (filename) => ({filename, changes: 10});
 const approval = (login, state = 'APPROVED', type = 'User') => ({user: {login, type}, state, author_association: 'MEMBER'});
@@ -370,4 +403,43 @@ test('sentinel extraction fails loudly when the span out-dents past its begin ma
 });
 test('sentinel extraction de-indents to the begin marker and keeps blank lines', () => {
   assert.equal(region('  // PARITY-HARNESS:demo:begin\n  const x = 1;\n\n    const y = 2;\n  // PARITY-HARNESS:demo:end\n', 'demo'), 'const x = 1;\n\n  const y = 2;');
+});
+test('sentinel extraction fails loudly when the END marker itself is out-dented', () => {
+  // The body-only check used to stop at `end - 1`, so out-denting `:end` clean out of the
+  // block scalar changed the shipped YAML's shape while the suite stayed green.
+  assert.throws(() => region('  // PARITY-HARNESS:demo:begin\n  const x = 1;\n// PARITY-HARNESS:demo:end\n', 'demo'), /indented less than/);
+});
+test('nested region failures report line numbers absolute in the workflow file', () => {
+  const nested = 'x\n  // PARITY-HARNESS:demo:begin\nconst bad = 1;\n  // PARITY-HARNESS:demo:end\n';
+  // Framed at a nested position, the offending line is reported in workflow coordinates...
+  assert.throws(() => region(nested, 'demo', {file: 'assign-reviewers.yml', offset: 99}), /line 102 of assign-reviewers\.yml/);
+  // ...and without the frame it would name line 3 of an intermediate string, which is the
+  // misreport this origin threading exists to prevent. Both directions are asserted so the
+  // offset cannot be dropped and stay green.
+  assert.throws(() => region(nested, 'demo'), /line 3 of assign-reviewers\.yml/);
+});
+test('the nested-region frame matches where the script really starts in the workflow', () => {
+  const workflowLines = workflow.split('\n');
+  assert.equal(workflowLines[SCRIPT_ORIGIN.offset - 1].trim(), '// PARITY-HARNESS:script:begin');
+  assert.equal(workflowLines[SCRIPT_ORIGIN.offset].trim(), script.split('\n')[0].trim());
+});
+test('the script sentinels must bracket the whole `script: |` scalar', () => {
+  const scalar = (body) => `      - name: run\n        with:\n          script: |\n${body}\n      - name: next\n`;
+  const good = scalar('            // PARITY-HARNESS:demo:begin\n            const x = 1;\n            // PARITY-HARNESS:demo:end');
+  assert.doesNotThrow(() => assertBracketsBlockScalar(regionSpan(good, 'demo'), 'demo'));
+  // JavaScript ABOVE the begin sentinel ships but is never executed by this suite.
+  const above = scalar('            const stray = 1;\n            // PARITY-HARNESS:demo:begin\n            const x = 1;\n            // PARITY-HARNESS:demo:end');
+  assert.throws(() => assertBracketsBlockScalar(regionSpan(above, 'demo'), 'demo'), /must be the FIRST line/);
+  // ...and BELOW the end sentinel, likewise.
+  const below = scalar('            // PARITY-HARNESS:demo:begin\n            const x = 1;\n            // PARITY-HARNESS:demo:end\n            const stray = 2;');
+  assert.throws(() => assertBracketsBlockScalar(regionSpan(below, 'demo'), 'demo'), /must be the LAST line/);
+});
+test('the shipped script region really does span its whole block scalar', () => {
+  // Non-vacuous guard on the assertion above: it runs at import time against the real file,
+  // so this pins that the real file is the shape it accepts, not merely that it did not throw.
+  const workflowLines = workflow.split('\n');
+  assert.match(workflowLines[scriptSpan.begin - 1], /^\s*script:\s*\|\s*$/);
+  const after = workflowLines.slice(scriptSpan.end + 1).find((line) => line.trim());
+  assert.ok(after, '`script:end` is the last non-blank line of the file; expected the next workflow step');
+  assert.ok(!after.startsWith(' '.repeat(scriptSpan.indent)), 'a line after `script:end` is still inside the scalar');
 });

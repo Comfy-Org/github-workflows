@@ -21,8 +21,20 @@ regions `glob-matcher` and `config-parser`. It used to split on a 10-space
 `script: |` plus the *name of an unrelated downstream step*, which captured the
 wrong span — silently, still green — the moment a second `script: |` appeared,
 a step was renamed, or the indentation changed. Every sentinel must occur
-exactly once, in order; missing, duplicated, inverted or out-dented markers all
-throw naming the marker. Moving or renaming one is never a cosmetic edit.
+exactly once, in order; missing, duplicated, inverted or out-dented markers —
+including an out-dented `:end` — all throw naming the marker. Moving or
+renaming one is never a cosmetic edit.
+
+Order alone is not enough for the outer `script` pair, which must also
+**bracket the whole `script: |` scalar**: `:begin` directly after the block
+header and `:end` as its last line. JavaScript placed above `:begin` or below
+`:end` would still ship while being excluded from the bytes the suite runs —
+the same silently-wrong span the sentinels replaced, pointing the other way —
+so the harness asserts both boundaries at import time. The nested
+`glob-matcher` / `config-parser` pairs are sub-spans by design and are exempt
+from that check; they instead carry the script's own offset into the workflow
+file, so a failure inside them reports a real `assign-reviewers.yml` line
+rather than a line number into the extracted string.
 
 ## Shared parser corpus
 

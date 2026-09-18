@@ -96,7 +96,13 @@ BUILTIN_EXCLUDE_PATHS = [
 def glob_to_regexp(glob):
     """Port of assign-reviewers.yml's globToRegExp: `*` within a segment,
     `**` across segments (`**/` -> optional leading dirs), `?` one non-slash
-    char. Full-string anchored. Must stay byte-for-byte semantics-equal to the
+    char. Anchored `^...$` and matched with `re.match`, which is full-string
+    EXCEPT for one known, deliberately-unfixed divergence: Python's `$` also
+    matches just before a single trailing newline, where the JS `RegExp` (no
+    `m` flag) does not, so a path containing a literal newline can score here
+    and not route there. Do not restate that as parity; changing the anchor to
+    `re.fullmatch`/`\\Z` is a scoring-behaviour change tracked separately.
+    Otherwise this must stay byte-for-byte semantics-equal to the
     JS original — the map is only correct if it is scored with the same
     matcher the runtime assigns with. That parity is EXECUTABLE, not a promise
     made here: ../assign-reviewers/parser-corpus.json is driven through both

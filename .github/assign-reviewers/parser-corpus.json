@@ -63,6 +63,17 @@
       }
     },
     {
+      "name": "multi-line flow sequence stops at the opening line",
+      "why": "no `]` on the line, so both ports fall back to s[1:] and the outer loop drops the continuation as an unrecognized indented key \u2014 they agree, and the corpus pins that they keep agreeing",
+      "text": "default_pool: [alice,\n  bob]\nrules:\n  - paths: [\"src/**\",\n      \"docs/**\"]\n    reviewers: [carol]\n",
+      "expected": {
+        "default_pool": ["alice"],
+        "rules": [
+          {"paths": ["src/**"], "reviewers": ["carol"]}
+        ]
+      }
+    },
+    {
       "name": "one-character quote is not a quoted empty string",
       "why": "without the length>=2 guard a lone quote unquotes to '' — the divergence this corpus pins",
       "text": "default_pool: [\", alice]\nrules:\n  - reviewers:\n      - \"\n      - bob\n",
