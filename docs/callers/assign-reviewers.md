@@ -47,8 +47,10 @@ do there, and that noise is what gets the whole automation muted.
 Glob semantics match the path rules: `**` spans segments (`stack/**` covers
 `stack/a` and `stack/a/b`), `*` stays within one (`stack/*` covers `stack/a` but
 not `stack/a/b`), and a pattern with no wildcard is an **exact** match — so
-`release` skips `release` and leaves `release/1.2` and `releases` alone. Several
-patterns are whitespace-separated: `stack/** wip/**`.
+`release` skips `release` and leaves `release/1.2` and `releases` alone. `?` is
+one Unicode character other than `/` — one code point, so an emoji or an accented
+letter counts as a single `?` rather than as the bytes or UTF-16 units it is
+stored as. Several patterns are whitespace-separated: `stack/** wip/**`.
 
 Two related knobs, so pick the right one. This var is **per-lane and automatic**.
 The `skip_label` input (default `skip-auto-assign`) is **per-PR and manual**. Use
