@@ -1117,6 +1117,45 @@ class RowsCoverTheReusablesTest(unittest.TestCase):
                         % (row.workflow, row.dir_readme, row.readme_heading),
                     )
 
+    def test_dir_readmes_are_in_this_suites_ci_path_filters(self):
+        """Every `dir_readme` must appear in BOTH of test-workflow-pins.yml's
+        `paths:` lists.
+
+        These two READMEs are the only files this suite reads from outside
+        `.github/workflows/**`, `.github/workflow-pins/**` and `docs/callers/**`
+        — the three globs that filter already covers. Drop an entry and a
+        README-only PR that deletes a knob row matches no filter, runs no job,
+        and lands green: the #31 scenario, on the very file this row was added
+        to police. Nothing else in the repo checks a `paths:` filter, so the
+        pairing is asserted here, next to the rows that depend on it.
+
+        Counted as literal list entries rather than parsed as YAML (stdlib-only
+        repo), and required TWICE so adding it to `pull_request` while
+        forgetting `push` — or vice versa — still fails.
+        """
+        filters = os.path.join(WORKFLOWS_DIR, "test-workflow-pins.yml")
+        entries = [
+            line.strip()
+            for line in read_lines(filters)
+            if line.lstrip().startswith("- ")
+        ]
+        self.assertTrue(
+            entries, "no `- ` list entries in %s — the file moved or was "
+            "reshaped; this check is now vacuous" % rel(filters)
+        )
+        for readme in sorted({row.dir_readme for row in ROWS if row.dir_readme}):
+            with self.subTest(dir_readme=readme):
+                spellings = ("- '%s'" % readme, '- "%s"' % readme, "- %s" % readme)
+                found = sum(entry in spellings for entry in entries)
+                self.assertGreaterEqual(
+                    found,
+                    2,
+                    "%s is read by a ROWS row but appears in %d of the two "
+                    "`paths:` lists in %s (need both pull_request and push) — "
+                    "a README-only edit that deletes a knob row would run no "
+                    "job at all" % (readme, found, rel(filters)),
+                )
+
     def test_rows_have_no_duplicate_workflows(self):
         names = [row.workflow for row in ROWS]
         dupes = sorted({name for name in names if names.count(name) > 1})
