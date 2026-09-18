@@ -44,7 +44,15 @@ repo's own workflow files.
   workflow's header comment, and the two shared catalogs (`README.md`,
   `docs/callers/README.md`). Which `with:` belongs to which reusable is decided
   by the `uses:` governing it, so a step's `actions/checkout` knobs are never
-  mistaken for a workflow input.
+  mistaken for a workflow input. Two rows also police a **directory** README's
+  knob table — `.github/cursor-review/README.md`'s `## Configuration knobs`
+  (two-way, full set equality) and `.github/refresh-reviewers/README.md`'s
+  deliberately partial `## Knob defaults (and why)` (phantom direction only,
+  plus that guide's Default column). Those pins came from two hand-rolled
+  per-workflow suites that this file replaced and that are now deleted. Both
+  READMEs sit outside `docs/callers/**`, so `test-workflow-pins.yml` lists each
+  one explicitly in its `paths:` filters; dropping either entry would let a
+  README-only edit delete a knob row without ever running this suite.
 
 ```bash
 python3 .github/workflow-pins/check_workflow_pins.py

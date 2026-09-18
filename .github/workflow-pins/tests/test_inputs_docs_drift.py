@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Table-driven declared-vs-documented input drift check, for ALL 16 reusables.
 
-Two hand-rolled copies of this check already exist — one for `cursor-review`
+Two hand-rolled copies of this check used to exist — one for `cursor-review`
 (`.github/cursor-review/tests/test_workflow_inputs_docs.py`) and one for
 `refresh-reviewers` (`.github/refresh-reviewers/tests/test_inputs_docs.py`).
 Both were written for the same failure, BE-4691: `cursor-review.yml`'s
@@ -11,12 +11,19 @@ with a zero-job `startup_failure` and no logs. So a phantom input in a caller
 guide is a broken caller for whoever copies it. The other 14 reusables had no
 such pin at all; a third hand-rolled copy per workflow is not the answer.
 
-This file is the generalisation: one `ROWS` table, one set of parsers (ported
-from the refresh-reviewers copy, CRLF handling and blank/comment tolerance
-included), one generated `TestCase` per reusable so `-v` names the workflow that
-drifted. It deliberately does NOT delete the two originals (that is a separate
-fold-in, which also flips the `dir_readme` / `check_defaults` columns on for the
-two rows that have those extra pins today) and it does NOT fix any docs drift.
+This file is the generalisation, and now the ONLY parser for this assertion in
+the repo: one `ROWS` table, one set of parsers (ported from the refresh-reviewers
+copy, CRLF handling and blank/comment tolerance included), one generated
+`TestCase` per reusable so `-v` names the workflow that drifted. The two
+originals are deleted; everything they asserted is carried by their rows'
+`dir_readme` / `readme_mode` / `check_defaults` columns. It does NOT fix any
+docs drift.
+
+Because the two directory READMEs it now reads live outside `docs/callers/**`,
+`test-workflow-pins.yml` lists `.github/cursor-review/README.md` and
+`.github/refresh-reviewers/README.md` as explicit `paths:` entries — a
+README-only edit that deletes a knob row has to run this harness, which is the
+#31 scenario exactly.
 
 Direction-by-direction, what is asserted and why the strictness differs:
 
@@ -156,10 +163,10 @@ Row = collections.namedtuple(
 # their own.
 #
 # `dir_readme` / `readme_heading` / `readme_mode` / `check_defaults` are OFF on
-# every row here by design: the two hand-rolled originals still own those extra
-# pins (cursor-review's `## Configuration knobs` README table, refresh-reviewers'
-# `## Knob defaults (and why)` table and its Default-column comparison), and
-# turning them on here is the fold-in ticket's job, not this one's.
+# every row but two: only `cursor-review` and `refresh-reviewers` ship a
+# directory README with a knob table, and theirs are the pins the two deleted
+# hand-rolled suites used to own. The two rows are NOT symmetric, and each
+# asymmetry is load-bearing — see the comments on them below.
 ROWS = (
     Row(workflow="agents-md-integrity", sentinel="workflows_ref"),
     # The only reusable here that declares no `workflows_ref` (it loads no
@@ -175,7 +182,20 @@ ROWS = (
     Row(workflow="assign-reviewers", sentinel="reviewer_config_path"),
     Row(workflow="coderabbit-config-validate", sentinel="workflows_ref"),
     Row(workflow="cursor-review-auto-label", sentinel="review_label"),
-    Row(workflow="cursor-review", sentinel="workflows_ref"),
+    # `## Configuration knobs` in the panel README is checked TWO-WAY, which is
+    # what the deleted hand-rolled suite asserted: set equality across all three
+    # sources (workflow, guide, panel README). `check_defaults` stays OFF —
+    # `extra_generated_globs`' default is a folded `>-` scalar
+    # (cursor-review.yml) rendered with `<br>` in the guide's Default cell, and
+    # the canonicaliser does not equate the two; turning it on would redden a
+    # correct doc.
+    Row(
+        workflow="cursor-review",
+        sentinel="workflows_ref",
+        dir_readme=".github/cursor-review/README.md",
+        readme_heading="## Configuration knobs",
+        readme_mode="two-way",
+    ),
     Row(workflow="detect-unreviewed-merge", sentinel="approval-mode"),
     Row(workflow="groom", sentinel="workflows_ref"),
     # linear-ticket's header comment carries no `with:` example — it documents
@@ -198,7 +218,20 @@ ROWS = (
     Row(workflow="pr-risk", sentinel="workflows_ref"),
     Row(workflow="pr-size", sentinel="workflows_ref"),
     Row(workflow="public-repo-hygiene", sentinel="workflows_ref"),
-    Row(workflow="refresh-reviewers", sentinel="workflows_ref"),
+    # Mirror image of the cursor-review row. `## Knob defaults (and why)` is
+    # intentionally PARTIAL — it omits `reviewer_config_path`, `map_exclude`,
+    # `extra_exclude_paths` and `workflows_ref` — so it is one-way (phantom
+    # only); set equality there would be permanently red. `check_defaults` is ON:
+    # this guide's Default column is the only one that currently matches the
+    # workflow under the canonicaliser, and the deleted suite pinned it.
+    Row(
+        workflow="refresh-reviewers",
+        sentinel="workflows_ref",
+        dir_readme=".github/refresh-reviewers/README.md",
+        readme_heading="## Knob defaults (and why)",
+        readme_mode="one-way",
+        check_defaults=True,
+    ),
     Row(workflow="stale", sentinel="slack_channel"),
 )
 
@@ -1037,6 +1070,52 @@ class RowsCoverTheReusablesTest(unittest.TestCase):
                     "ROWS points %s at %s, which does not exist"
                     % (row.workflow, rel(guide_path(row))),
                 )
+                if row.dir_readme:
+                    readme = os.path.join(REPO_ROOT, row.dir_readme)
+                    self.assertTrue(
+                        os.path.isfile(readme),
+                        "ROWS points %s's dir_readme at %s, which does not "
+                        "exist — a moved README would otherwise surface as a "
+                        "FileNotFoundError traceback rather than as drift, and "
+                        "its path also has to stay in test-workflow-pins.yml's "
+                        "`paths:` filters" % (row.workflow, row.dir_readme),
+                    )
+
+    def test_readme_columns_are_internally_consistent(self):
+        """A half-filled README column is a check that silently does nothing.
+
+        `test_directory_readme_knob_table` keys entirely off `dir_readme`, so a
+        row carrying `readme_heading`/`readme_mode` WITHOUT it skips — no error,
+        no coverage. And `readme_mode` is compared by string equality against
+        `"two-way"`, so a typo (`"twoway"`, `"two way"`) silently downgrades a
+        set-equality pin to the phantom direction alone: the exact
+        quietly-vacuous failure every guard in this file exists to prevent.
+        """
+        for row in ROWS:
+            with self.subTest(workflow=row.workflow):
+                self.assertIn(
+                    row.readme_mode,
+                    ("one-way", "two-way"),
+                    "ROWS gives %s readme_mode=%r; only 'one-way' and 'two-way' "
+                    "are understood, and anything else reads as 'one-way'"
+                    % (row.workflow, row.readme_mode),
+                )
+                if not row.dir_readme:
+                    self.assertIsNone(
+                        row.readme_heading,
+                        "ROWS gives %s a readme_heading (%r) but no dir_readme, "
+                        "so the README knob check skips and that heading is "
+                        "never read" % (row.workflow, row.readme_heading),
+                    )
+                else:
+                    self.assertTrue(
+                        row.readme_heading
+                        and HEADING.match(row.readme_heading),
+                        "ROWS gives %s dir_readme=%s but readme_heading=%r; "
+                        "section_lines matches a literal `## ` line, so a "
+                        "missing or wrongly-levelled heading finds no rows"
+                        % (row.workflow, row.dir_readme, row.readme_heading),
+                    )
 
     def test_rows_have_no_duplicate_workflows(self):
         names = [row.workflow for row in ROWS]

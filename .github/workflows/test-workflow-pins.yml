@@ -19,12 +19,21 @@ on:
       # trigger it too — otherwise the guard never runs on the drift it exists
       # to catch.
       - 'docs/callers/**'
+      # The two directory READMEs with knob tables, which sit outside
+      # docs/callers/**: a README-only edit that deletes a knob row must run the
+      # drift harness.
+      - '.github/cursor-review/README.md'
+      - '.github/refresh-reviewers/README.md'
   push:
     branches: [main]
     paths:
       - '.github/workflows/**'
       - '.github/workflow-pins/**'
       - 'docs/callers/**'
+      # Same two directory READMEs as above: a README-only edit that deletes a
+      # knob row must run the drift harness.
+      - '.github/cursor-review/README.md'
+      - '.github/refresh-reviewers/README.md'
 
 permissions:
   contents: read
