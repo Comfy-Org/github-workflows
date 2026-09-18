@@ -483,6 +483,207 @@ if PATH="$failbin:$PATH" "$SANDBOX" --preflight-only >/dev/null 2>&1; then
 fi
 pass "--preflight-only fails loud when the sandbox self-test cannot pass"
 
+# --- 9. --validate-only: the pre-exec guards, off the billed step (BE-14771) --
+# The groom jobs run this in the SAME separate "Preflight the sandbox" step as
+# --preflight-only. Everything the wrapper checks before `exec bwrap` is no-spend
+# and fail-loud, but run from inside the billed "Run <agent>" step a failure there
+# stamps that step failed having billed nothing — which interval.py reads as a
+# STARTED (spent) audit and counts against the cadence clock. --validate-only runs
+# the SAME arguments through the SAME code path and stops at the single exec
+# point, so those failures land on the preflight step's name instead.
+#
+# `bwrap` is stubbed for this whole section so "did it exec the jail?" is
+# observable: the stub logs its argv and always succeeds, so preflight() takes its
+# idempotent fast path (bwrap present + selftest green) and mutates nothing, and
+# the only remaining invocation would be the real exec — identifiable by
+# --clearenv, which preflight()'s selftest probe never passes.
+
+stubbin="$work/stubbin"
+mkdir -p "$stubbin"
+cat > "$stubbin/bwrap" <<'STUB'
+#!/bin/sh
+echo "$@" >> "$BWRAP_LOG"
+exit 0
+STUB
+chmod +x "$stubbin/bwrap"
+export BWRAP_LOG="$work/bwrap-argv.log"
+
+# 9d exercises the probe's PREFERRED implementation (curl). The python3 fallback
+# and the no-probe-tool case get their own coverage in 9f, so this assertion is
+# about knowing WHICH path 9d took, not about the probe existing at all.
+command -v curl >/dev/null 2>&1 || fail "curl missing on the host — 9d would exercise the python3 fallback instead of the curl path (9f covers that separately)"
+
+validate_only() {
+	PATH="$stubbin:$PATH" "$SANDBOX" --validate-only "$@"
+}
+
+assert_no_jail() {
+	if grep -q -- '--clearenv' "$BWRAP_LOG"; then
+		fail "$1: bwrap was exec'd — a real run would have started the agent (and spent budget) here"
+	fi
+}
+
+# 9a. The exact shape a groom "Preflight the sandbox" step uses — the same
+# clone/clone-mode/out-dir/uds/ro-file arguments as the agent step, against the
+# LIVE broker socket from section 5 — exits 0, says so, and never execs the jail.
+: > "$BWRAP_LOG"
+vo_out="$(validate_only --clone "$clone" --clone-mode ro --out-dir "$outdir" \
+	--uds "$work/broker.sock" --ro-file "$SHIM" --env FOO=bar 2>/dev/null)" \
+	|| fail "--validate-only exited non-zero on the arguments a real run accepts"
+echo "$vo_out" | grep -q "all pre-exec guards passed" \
+	|| fail "--validate-only did not report success on stdout (got: $vo_out)"
+assert_no_jail "good args"
+pass "--validate-only exits 0 on a real run's arguments without exec'ing the jail"
+
+# 9b. Control for 9a: the SAME arguments WITHOUT --validate-only do reach the exec.
+# Without this, a broken stub or an un-stubbed PATH would make every "no jail"
+# assertion in this section pass for the wrong reason.
+: > "$BWRAP_LOG"
+PATH="$stubbin:$PATH" "$SANDBOX" --clone "$clone" --clone-mode ro --out-dir "$outdir" \
+	--uds "$work/broker.sock" --ro-file "$SHIM" --env FOO=bar -- true >/dev/null 2>&1 \
+	|| fail "control run (no --validate-only) failed under the bwrap stub"
+grep -q -- '--clearenv' "$BWRAP_LOG" \
+	|| fail "the bwrap stub never recorded a real exec — section 9's no-jail assertions would false-pass"
+pass "bwrap stub observes the real exec (so the 9a/9c/9d/9e no-jail assertions mean something)"
+
+# 9c. A bad argument must fail validation, with no jail and no spend. Each case
+# below targets a DIFFERENT guard, and the last three live inside the bwrap_args
+# assembly — the ones a re-implemented validator would silently skip, letting
+# validate-only pass while "Run <agent>" still dies no-spend on them.
+ptr_clone="$work/ptr-clone"
+mkdir -p "$ptr_clone"
+echo "gitdir: /nowhere/else" > "$ptr_clone/.git"
+: > "$BWRAP_LOG"
+if validate_only --clone-mode ro --out-dir "$outdir" >/dev/null 2>&1; then
+	fail "--validate-only accepted a missing --clone"
+fi
+if validate_only --clone "$clone" --clone-mode ro --out-dir relative/out >/dev/null 2>&1; then
+	fail "--validate-only accepted a relative --out-dir"
+fi
+if validate_only --clone "$clone" --clone-mode banana --out-dir "$outdir" >/dev/null 2>&1; then
+	fail "--validate-only accepted an unknown --clone-mode"
+fi
+if validate_only --clone "$clone" --clone-mode ro --out-dir "$clone/nested/out" >/dev/null 2>&1; then
+	fail "--validate-only accepted an out-dir nested in the clone (section 3b's overlap guard)"
+fi
+if validate_only --clone "$clone" --clone-mode ro --out-dir "$outdir" --env NOEQUALSIGN >/dev/null 2>&1; then
+	fail "--validate-only accepted --env without '=' (that guard lives in the bwrap_args loop — validate-only must route through it)"
+fi
+if validate_only --clone "$clone" --clone-mode ro --out-dir "$outdir" --ro-file relative.txt >/dev/null 2>&1; then
+	fail "--validate-only accepted a relative --ro-file (bwrap_args-loop guard)"
+fi
+# Absolute but ABSENT. `--ro-bind` (not `--ro-bind-try`) aborts on a missing
+# source, so before the host-side `-e` this passed validation and then killed the
+# billed agent step no-spend — the exact miscount the hoist exists to prevent.
+if validate_only --clone "$clone" --clone-mode ro --out-dir "$outdir" --ro-file "$work/no-such-brief.md" >/dev/null 2>&1; then
+	fail "--validate-only accepted a --ro-file that does not exist (bwrap would abort at exec, killing the billed step no-spend)"
+fi
+if validate_only --clone "$ptr_clone" --clone-mode rw-git-ro --out-dir "$outdir" >/dev/null 2>&1; then
+	fail "--validate-only accepted rw-git-ro over a gitdir-pointer .git (bwrap_args-loop guard)"
+fi
+assert_no_jail "bad args"
+pass "--validate-only fails loud on every bad argument, including the bwrap_args-loop guards, without exec'ing the jail"
+
+# 9d. The failure this hoisting was written for: a broker that died leaving its
+# socket behind. `-S` still passes (the inode is a socket), so only the healthz
+# probe catches it — and before BE-14771 that `die` landed inside the billed agent
+# step, where it was counted as a spent audit having spent nothing.
+dead_sock="$work/dead-broker.sock"
+# bind + listen, then exit WITHOUT close(): the filesystem node survives (an
+# AF_UNIX bind is not unlinked on exit), so -S passes while connect() gets
+# ECONNREFUSED — exactly the shape a crashed broker leaves behind.
+python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(1)' "$dead_sock"
+[[ -S "$dead_sock" ]] || fail "fixture: $dead_sock is not a socket — the -S half of the probe would not be exercised"
+: > "$BWRAP_LOG"
+if validate_only --clone "$clone" --clone-mode ro --out-dir "$outdir" \
+	--uds "$dead_sock" >/dev/null 2>&1; then
+	fail "--validate-only accepted a stale socket with no live broker (-S alone passes it; only the healthz probe catches it)"
+fi
+assert_no_jail "dead broker socket"
+pass "--validate-only fails loud on a -S-passing socket with no live broker, without exec'ing the jail"
+
+# 9e. Misuse guards, mirroring --preflight-only's (section 8a'): the two pre-agent
+# modes are mutually exclusive, and --validate-only refuses a `-- command` so a
+# stray --validate-only on a real agent step DIES instead of exiting 0 having
+# silently run no agent.
+: > "$BWRAP_LOG"
+if validate_only --preflight-only >/dev/null 2>&1; then
+	fail "--validate-only --preflight-only exited 0 (mutually exclusive modes must die)"
+fi
+if PATH="$stubbin:$PATH" "$SANDBOX" --preflight-only --validate-only >/dev/null 2>&1; then
+	fail "--preflight-only --validate-only exited 0 (mutually exclusive modes must die, in either order)"
+fi
+if validate_only --clone "$clone" --clone-mode ro --out-dir "$outdir" -- true >/dev/null 2>&1; then
+	fail "--validate-only with a -- command exited 0 (must die, not silently discard the command)"
+fi
+assert_no_jail "misuse combinations"
+pass "--validate-only dies loud when combined with --preflight-only or a -- command"
+
+# 9f. The liveness probe must be STRUCTURAL under --validate-only, not conditional
+# on curl. A curl-less host used to skip the probe entirely and exit 0 on a stale
+# socket — handing the crashed-broker failure (9d, the case this whole split was
+# written for) straight back to the billed step. Build minimal PATHs that omit
+# curl (and then python3 too) and pin both halves of the contract.
+minpath() {
+	# $1 = dir to build, rest = basenames to expose. `bash` is needed for the
+	# script's `#!/usr/bin/env bash` lookup; the rest are what the pre-exec path
+	# actually shells out to (preflight() takes its fast path against the stub).
+	local dir="$1"; shift
+	mkdir -p "$dir"
+	local b src
+	for b in "$@"; do
+		src="$(command -v "$b")" || fail "9f fixture: $b not found on the host"
+		ln -sf "$src" "$dir/$b"
+	done
+	ln -sf "$stubbin/bwrap" "$dir/bwrap"
+}
+
+nocurl="$work/pathnocurl"
+minpath "$nocurl" bash mkdir realpath python3
+noprobe="$work/pathnoprobe"
+minpath "$noprobe" bash mkdir realpath
+
+command -v python3 >/dev/null 2>&1 || fail "9f fixture: python3 missing — the fallback half cannot be exercised"
+[[ ! -x "$nocurl/curl" ]] || fail "9f fixture: curl leaked into the no-curl PATH"
+
+# The fallback still PASSES a live broker (section 5's socket) — the point is to
+# keep the check working without curl, not to fail closed on every curl-less host.
+: > "$BWRAP_LOG"
+PATH="$nocurl" "$SANDBOX" --validate-only --clone "$clone" --clone-mode ro \
+	--out-dir "$outdir" --uds "$work/broker.sock" --ro-file "$SHIM" >/dev/null 2>&1 \
+	|| fail "--validate-only failed against a LIVE broker with only the python3 probe available"
+assert_no_jail "python3 probe, live broker"
+
+# ...and still CATCHES the stale socket from 9d, which is the whole point.
+: > "$BWRAP_LOG"
+if PATH="$nocurl" "$SANDBOX" --validate-only --clone "$clone" --clone-mode ro \
+	--out-dir "$outdir" --uds "$dead_sock" >/dev/null 2>&1; then
+	fail "--validate-only accepted a stale socket on a curl-less host (the python3 fallback did not run)"
+fi
+assert_no_jail "python3 probe, dead broker"
+pass "--validate-only probes broker liveness via python3 when curl is absent (live passes, stale socket still dies)"
+
+# With NEITHER tool the probe cannot run at all. --validate-only must say so
+# rather than exit 0 on an unverified socket: a validation that cannot validate
+# is the green no-op this mode exists to prevent.
+: > "$BWRAP_LOG"
+if PATH="$noprobe" "$SANDBOX" --validate-only --clone "$clone" --clone-mode ro \
+	--out-dir "$outdir" --uds "$work/broker.sock" >/dev/null 2>&1; then
+	fail "--validate-only exited 0 with no probe tool available (the liveness guarantee was silently skipped)"
+fi
+assert_no_jail "no probe tool"
+
+# But the REAL run keeps the historical best-effort skip: the agent step is about
+# to run regardless, and a spurious die there is the expensive failure. This is
+# the control proving 9f denies nothing that worked before.
+: > "$BWRAP_LOG"
+PATH="$noprobe" "$SANDBOX" --clone "$clone" --clone-mode ro --out-dir "$outdir" \
+	--uds "$work/broker.sock" -- true >/dev/null 2>&1 \
+	|| fail "a REAL run was refused on a host with no probe tool — the probe must stay best-effort off --validate-only"
+grep -q -- '--clearenv' "$BWRAP_LOG" \
+	|| fail "the real run with no probe tool never reached the exec"
+pass "no probe tool: --validate-only fails loud, a real run still proceeds (best-effort, as before)"
+
 if [[ "$skips" -gt 0 ]]; then
 	echo "ALL SANDBOX TESTS PASSED ($skips skipped)"
 else
