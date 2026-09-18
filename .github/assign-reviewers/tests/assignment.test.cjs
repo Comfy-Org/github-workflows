@@ -389,13 +389,16 @@ test('the shared corpus is loaded and non-empty', () => {
 // caught by the suites even though the warning TEXT cannot live in the shared fixture.
 // The point of an EXHAUSTIVE table rather than per-case assertions is the silence: a regression
 // that made the unrecognised-key warning fire on ordinary blank lines, comment lines or indented
-// list items would warn on nearly every case here and nothing else would notice. Three entries
-// were not obvious before the sweep and are all correct: a stray `version:`/`notes:` key
-// truncates exactly like invisible padding does, and the second-BOM and leading-NEL cases are
-// documents whose FIRST line is an unrecognised key precisely because the stray character is not
-// indentation — which is the failure those two cases exist to pin, now with an annotation on it.
+// list items would warn on nearly every case here and nothing else would notice.
+// Read it in both directions. The entries that are PRESENT and non-obvious are the second-BOM and
+// leading-NEL cases: each is a document whose FIRST line is an unrecognised key precisely because
+// the stray character is not indentation, which is the failure those two cases exist to pin, now
+// with an annotation on it (they reach the near-miss arm, not the terminator arm — no block is
+// open on line 1). The entries that are ABSENT matter just as much: `indented decoys and unknown
+// top-level keys are ignored` is silent because a `version:`/`notes:` key before the first block
+// ends nothing and drops nothing, and `YAML document markers are not unrecognised keys` is silent
+// because `---`/`...` are syntax. Both used to warn, on documents whose expected parse is complete.
 const CORPUS_WARNINGS = {
-  'indented decoys and unknown top-level keys are ignored': 2,
   'duplicate default_pool, flow then block': 1,
   'duplicate default_pool, block then flow': 1,
   'duplicate default_pool, second one empty': 1,
@@ -404,6 +407,8 @@ const CORPUS_WARNINGS = {
   'a U+00A0-only line at column 0 ends a default_pool block on both ports': 1,
   'a U+00A0-only line at column 0 drops every later rule on both ports': 1,
   'an unknown top-level key at column 0 ends the block': 1,
+  'a key sharing a prefix with `rules:` is not the `rules:` key': 1,
+  'no space after the colon is a plain scalar, not a key': 1,
 };
 for (const {name, text, expected} of corpus.configs) {
   test(`corpus config — ${name}`, () => {
@@ -412,6 +417,15 @@ for (const {name, text, expected} of corpus.configs) {
     assert.equal(helperWarnings.length, CORPUS_WARNINGS[name] ?? 0, `warnings for ${JSON.stringify(name)}: ${JSON.stringify(helperWarnings)}`);
   });
 }
+// `CORPUS_WARNINGS[name] ?? 0` above only checks corpus case -> table, so a table entry whose
+// corpus case was renamed or deleted would silently go dead and that case's count would stop being
+// asserted while the suite stayed green. The Python side compares both directions in one
+// `assertEqual(counts, self.CORPUS_WARNINGS)`; this is that other direction, so the two copies of
+// the "same table" cannot drift apart through a rename.
+test('every CORPUS_WARNINGS key names a corpus case that still exists', () => {
+  const names = new Set(corpus.configs.map(c => c.name));
+  assert.deepEqual(Object.keys(CORPUS_WARNINGS).filter(n => !names.has(n)), []);
+});
 // The corpus compares parsed CONFIGS, which is deliberately silent about the duplicate-key warning
 // — the Python port prints its own `::warning::` line instead, so the text cannot live in the shared
 // fixture. Each side therefore asserts its own channel; last-wins itself stays corpus-pinned above.
@@ -482,6 +496,94 @@ test('an unknown top-level key at column 0 warns the same way, verbatim', () => 
   assert.deepEqual(helpers.parseReviewerConfig('default_pool:\n  - alice\nowners:\n  - bob\n').default_pool, ['alice']);
   assert.equal(helperWarnings.length, 1);
   assert.match(helperWarnings[0], /^line 3 is not a recognised top-level key \(owners:\)/);
+});
+
+// --- what the warning deliberately stays SILENT about -------------------------------------
+// Warning on EVERY column-0 fallthrough both overclaimed and flooded, so these are the negative
+// half of the diagnostic and each one is a shape a real config has. Mirrored in test_generate.py.
+
+test('YAML document markers are silent', () => {
+  // yamllint's default `document-start` rule REQUIRES the leading `---`, so a conformant
+  // reviewers.yml has one; `...` even TERMINATES the `rules:` block, so without the carve-out a
+  // well-formed config warns on every run.
+  helperWarnings.length = 0;
+  const out = helpers.parseReviewerConfig("---\ndefault_pool:\n  - alice\nrules:\n  - paths: ['a/**']\n    reviewers: [bob]\n...\n");
+  assert.deepEqual(out.default_pool, ['alice']);
+  assert.equal(out.rules.length, 1);
+  assert.deepEqual(helperWarnings, []);
+});
+
+test('a metadata key before any block is silent', () => {
+  // No block is open yet, so nothing is ended and nothing is dropped — the old message asserted
+  // both. The nested `default_pool:` decoy is still ignored.
+  helperWarnings.length = 0;
+  assert.deepEqual(helpers.parseReviewerConfig('version: 1\nnotes:\n  default_pool: [mallory]\ndefault_pool: [alice]\n').default_pool, ['alice']);
+  assert.deepEqual(helperWarnings, []);
+});
+
+test('a zero-indented block sequence warns once, not once per item', () => {
+  // `default_pool:` followed by a COLUMN-0 sequence is valid YAML and common, and every item used
+  // to draw its own annotation — five here, ten in a real pool, against GitHub's ~10-per-step
+  // budget. Only the first ends the block; the rest end nothing, so the one warning that explains
+  // the empty pool is not buried.
+  helperWarnings.length = 0;
+  assert.deepEqual(helpers.parseReviewerConfig('default_pool:\n- alice\n- bob\n- carol\n- dave\n- eve\n').default_pool, []);
+  assert.equal(helperWarnings.length, 1);
+  assert.match(helperWarnings[0], /^line 2 is not a recognised top-level key \(- alice\)/);
+});
+
+test('a non-YAML file is silent', () => {
+  // A `reviewer_config_path` aimed at prose opens no block, so it warns not at all rather than
+  // once per line. The empty parse is the diagnostic there.
+  helperWarnings.length = 0;
+  assert.deepEqual(helpers.parseReviewerConfig('Some prose here.\nAnother line.\nAnd another.\n'), {default_pool: [], rules: []});
+  assert.deepEqual(helperWarnings, []);
+});
+
+// --- near misses: a line that NAMES a supported key without opening it ----------------------
+
+test('an invisible prefix before a key warns as a near miss', () => {
+  // U+0085, not U+FEFF: a SINGLE leading BOM is legal YAML and the parser strips it, so a one-BOM
+  // document parses fine and must stay silent. The stray character is not indentation, so the key
+  // reads as column 0, falls through, and its whole block is never read — while the line looks
+  // perfect in an editor. No block was open, so the terminator arm would have stayed silent here.
+  helperWarnings.length = 0;
+  assert.deepEqual(helpers.parseReviewerConfig('\u0085default_pool: [alice]\nrules:\n').default_pool, []);
+  assert.equal(helperWarnings.length, 1);
+  assert.match(helperWarnings[0], /^line 1 is not a recognised top-level key \(\\u0085default_pool: \[alice\]\) — it is not the supported `default_pool:` key/);
+  helperWarnings.length = 0;
+  assert.deepEqual(helpers.parseReviewerConfig('\ufeffdefault_pool: [alice]\n').default_pool, ['alice']);
+  assert.deepEqual(helperWarnings, []);
+});
+
+test('a key sharing a prefix with a supported one is not honoured, and warns', () => {
+  // `yaml.safe_load("rules:v2:\\n  - paths: [a]")` is `{"rules:v2": [...]}` — a key NAMED
+  // `rules:v2`, not `rules`. The old `startsWith` claimed it and parsed its children as live
+  // routing rules, so an unsupported key was silently HONOURED.
+  helperWarnings.length = 0;
+  assert.deepEqual(helpers.parseReviewerConfig("rules:v2:\n  - paths: ['a/**']\n    reviewers: [alice]\n").rules, []);
+  assert.equal(helperWarnings.length, 1);
+  assert.match(helperWarnings[0], /it is not the supported `rules:` key/);
+});
+
+test('no space after the colon is a plain scalar, not a key', () => {
+  // `yaml.safe_load("default_pool:[alice]")` is the STRING `default_pool:[alice]`: YAML reads
+  // `key:` as a mapping only with s-white or a line end after the colon.
+  helperWarnings.length = 0;
+  assert.deepEqual(helpers.parseReviewerConfig('default_pool:[alice]\n').default_pool, []);
+  assert.equal(helperWarnings.length, 1);
+  assert.match(helperWarnings[0], /it is not the supported `default_pool:` key/);
+});
+
+test('showInvisible escapes an astral character as a UTF-16 surrogate pair', () => {
+  // The regex has no `u` flag, so it walks code units — which is the REFERENCE the Python port's
+  // `_show_invisible` was corrected to match (a plain `"\\u%04x" % ord(c)` emitted `\u1f600`
+  // there, five digits and not a valid escape). Asserted so a later `u` flag here cannot silently
+  // reopen the divergence on the other side.
+  helperWarnings.length = 0;
+  helpers.parseReviewerConfig('default_pool:\n  - alice\n\u{1f600}x\n  - bob\n');
+  assert.equal(helperWarnings.length, 1);
+  assert.match(helperWarnings[0], /\(\\ud83d\\ude00x\)/);
 });
 
 test('the unrecognised-key warning carries the configured path when one is given', () => {

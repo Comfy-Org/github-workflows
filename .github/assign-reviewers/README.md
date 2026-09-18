@@ -75,11 +75,21 @@ padding that now survives is invisible and the token would otherwise just never 
 assigned (keyed on the shape test only — being excluded as the PR author is normal and
 must not warn); a line whose only content is non-s-white whitespace is **no longer
 blank**, and since indentation counts spaces it reads as column 0 and terminates the
-block above it, which inside `rules:` drops every later rule — so any unrecognised
-column-0 line is now **reported by a warning** on both ports, naming its line number
-and rendering its content codepoint-escaped (`line 3 is not a recognised top-level key
-(\u00a0)`), since nothing about that truncation is visible in an editor and a
-misspelled key truncates identically; and the `setKey` regex
+block above it, which inside `rules:` drops every later rule — so a column-0 line that
+**actually breaks something** is now reported by a warning on both ports, naming its line
+number and rendering its content codepoint-escaped (`line 3 is not a recognised top-level
+key (\u00a0)`), since nothing about that truncation is visible in an editor and a
+misspelled key truncates identically. Two arms, and the *silence* between them is as
+pinned as the text: a line that ENDED an open `default_pool:`/`rules:` block, and a
+near miss that names a supported key without opening it (`\u0085rules:`, whose stray
+character is not indentation; `rules:v2:`, a key YAML reads as `rules:v2`; and
+`default_pool:[alice]`, which YAML reads as a plain scalar — the last two used to be
+silently HONOURED as the supported key, which is why both ports now require s-white or
+a line end after a key's colon). A `---`/`...` document marker, a `version:` key before
+the first block and a stray key between two complete blocks break nothing and stay
+silent, as does every INDENTED fallthrough line — one annotation per thing actually
+broken, so a tab-indented or zero-indented config cannot flood GitHub's ~10-annotation
+budget and bury the one that matters. Finally, the `setKey` regex
 spells its class out as `[^\n]*` rather than `.`, because Python's `.` excludes only LF
 while JS's also excludes CR, U+2028 and U+2029 — with `.` the Python port matched a rule
 line ending in a bare CR and the JS port did not, so the runtime dropped the key while

@@ -214,17 +214,35 @@ One consequence of trimming spaces and tabs only: a line whose sole content is s
 *other* invisible character is no longer a blank line, and indentation counts spaces, so
 at column 0 it ends the block above it — inside `rules:` that discards every rule after
 it. Both ports behave identically here and the corpus pins it. The run no longer leaves
-you to guess, though: it **warns** once for the terminating line, naming the file and the
-line number and rendering the line's content codepoint-escaped so the character is
-findable —
+you to guess, though: it **warns**, naming the file and the line number and rendering the
+line's content codepoint-escaped so the character is findable —
 
 ```
-::warning::reviewers.yml: line 3 is not a recognised top-level key (\u00a0) — it ends the block above it, and only `default_pool:` and `rules:` are read; if this is invisible padding at column 0 (e.g. U+00A0), every list item or rule after it is dropped
+::warning::reviewers.yml: line 3 is not a recognised top-level key (\u00a0) — it ends the `default_pool:` block above it, and every list item or rule indented below it is dropped; only `default_pool:` and `rules:` are read, and at column 0 one invisible character (e.g. U+00A0) ends a block exactly like a misspelled key does
 ```
 
-— and the same warning covers a misspelled or unsupported top-level key, which truncates
-the block identically. The orphaned items *below* the stray line do not each warn; one
-annotation per terminating line is the signal. Indented, such a line is harmless.
+A misspelled or unsupported top-level key truncates the block identically and gets the
+same warning. A **near miss** — a line that names a supported key without opening one —
+gets its own:
+
+```
+::warning::reviewers.yml: line 1 is not a recognised top-level key (\u0085default_pool: [alice]) — it is not the supported `default_pool:` key, so the whole block it opens is ignored; that key is read only at column 0 with nothing but spaces before it and a space, a tab or the end of the line after its colon
+```
+
+That covers a stray character before the key (which is not indentation, so the key reads
+as column 0 and falls through) as well as `rules:v2:` — valid YAML for a key *named*
+`rules:v2` — and `default_pool:[alice]`, which YAML reads as a plain scalar rather than a
+mapping. Both of the latter used to be silently accepted **as** the supported key.
+
+What does *not* warn is as deliberate. A column-0 line that breaks nothing is silent: a
+`---` or `...` document marker (yamllint's default `document-start` rule requires the
+former, so a conformant config has one), a `version:`-style key before the first block,
+and a stray key between two complete blocks all leave every later `default_pool:`/`rules:`
+parsing. So are the orphaned items *below* a stray line, and every indented fallthrough
+line. One annotation per thing actually broken is the signal — otherwise a tab-indented
+config (indentation counts spaces, so every item reads as column 0) or a zero-indented
+block sequence would spend GitHub's ~10-annotation-per-step budget on the symptoms and
+bury the cause.
 
 ## Gotchas
 

@@ -395,6 +395,35 @@
         "default_pool": ["alice"],
         "rules": []
       }
+    },
+    {
+      "name": "a key sharing a prefix with `rules:` is not the `rules:` key",
+      "why": "`rules:v2:` is valid YAML for a key NAMED `rules:v2` — `yaml.safe_load` returns `{'rules:v2': [...]}`, not a `rules` mapping — but a bare `startsWith('rules:')`/`startswith(\"rules:\")` claimed it and parsed its children as live routing rules, silently HONOURING an unsupported key. Both ports now require s-white or the end of the line after a supported key's colon, so this falls through to the unrecognised-key warning instead. Pinned on both ports because the prefix test was written twice",
+      "text": "rules:v2:\n  - paths: ['a/**']\n    reviewers: [alice]\n",
+      "expected": {
+        "default_pool": [],
+        "rules": []
+      }
+    },
+    {
+      "name": "no space after the colon is a plain scalar, not a key",
+      "why": "the other half of the same tightening, and the reason it is YAML-correct rather than merely convenient: `yaml.safe_load(\"default_pool:[alice]\")` returns the STRING `default_pool:[alice]`, because YAML reads `key:` as a mapping only with s-white or a line end after the colon. Both ports used to accept it as a flow pool; both now fall it through, and the warning names the exact rule so a caller who wrote it is not left guessing why the pool went empty",
+      "text": "default_pool:[alice]\n",
+      "expected": {
+        "default_pool": [],
+        "rules": []
+      }
+    },
+    {
+      "name": "YAML document markers are not unrecognised keys",
+      "why": "`---` and `...` fall through both ports (and `...` after a `rules:` block even terminates it), but nothing is lost — the outer loop keeps scanning and every block still parses. yamllint's default `document-start` rule REQUIRES the leading `---`, so a perfectly conformant reviewers.yml has one; warning about it would fire on every scheduled drift run of a well-formed config and train people to ignore the annotation. Pinned for the PARSE, with the silence asserted per-suite",
+      "text": "---\ndefault_pool:\n  - alice\nrules:\n  - paths: ['a/**']\n    reviewers: [bob]\n...\n",
+      "expected": {
+        "default_pool": ["alice"],
+        "rules": [
+          {"paths": ["a/**"], "reviewers": ["bob"]}
+        ]
+      }
     }
   ],
   "globs": [

@@ -495,6 +495,33 @@ jobs:
                 return inner.split(',').map((x) => unquote(x)).filter((x) => x.length > 0);
               };
               const indentOf = (l) => l.match(/^ */)[0].length;
+              // A bare `startsWith` also claims a DIFFERENT key that merely shares the prefix:
+              // `rules:v2:` is valid YAML for a key named `rules:v2`, and the prefix test parsed
+              // its children as live routing rules — silently HONOURING an unsupported key
+              // instead of falling through to the warning below. YAML reads `key:` as a mapping
+              // only when s-white or the end of the line follows the colon, so require that;
+              // `default_pool:[alice]` is a plain scalar to YAML and is a fallthrough here too.
+              // `_is_key` in refresh-reviewers/generate.py is the port.
+              const isKey = (l, key) => l.startsWith(key) && (l.length === key.length || l[key.length] === ' ' || l[key.length] === '\t');
+              // The supported key a FALLTHROUGH line names but does not open. Two shapes reach
+              // this, both silent breakage worth an annotation: `\ufeffdefault_pool:`/`\u0085rules:`,
+              // where the stray character is not indentation (neither `trimSWhite` nor `indentOf`
+              // sees it) so the line reads as column 0 and the block it meant to open is never
+              // read; and `rules:v2:`/`default_pool:[alice]`, which `isKey` rightly declines.
+              // Only called where `isKey` is already known false, so a bare prefix match on the
+              // padding-stripped head always means one of the two. Ported as `_near_miss_key`.
+              const nearMissKey = (l) => {
+                const head = l.replace(/^[^\x21-\x7e]+/, '');
+                for (const key of ['default_pool:', 'rules:']) if (head.startsWith(key)) return key;
+                return null;
+              };
+              // A YAML document marker is syntax, not a key. yamllint's default `document-start`
+              // rule REQUIRES a leading `---`, so a perfectly conformant reviewers.yml opens with
+              // one (and may close with `...`); both fall through here, and `...` after a `rules:`
+              // block even terminates it — but nothing is lost, so warning would fire on every run
+              // of a well-formed config and train people to ignore the annotation. A SECOND
+              // document in the file is a separate pre-existing limitation, untouched by this.
+              const isDocMarker = (l) => l === '---' || l === '...' || l.startsWith('--- ') || l.startsWith('---\t');
               // A single leading U+FEFF is legal YAML and must not become part of the first
               // key. `trim()` used to absorb it here incidentally and the Python port's
               // `strip()` did not; now that both sides trim s-white only, NEITHER absorbs it
@@ -503,11 +530,19 @@ jobs:
               const lines = text.replace(/^\uFEFF/, '').split(/\r?\n/).map(stripComment);
               let i = 0;
               let seenDefaultPool = false;
+              // The block a column-0 line has just TERMINATED, or null. Both scans below skip
+              // blank lines and `break` only on a non-blank column-0 line WITHOUT advancing `i`,
+              // so the very next iteration of this loop is guaranteed to be the terminating line
+              // itself — which is what makes a one-iteration handoff sound rather than a flag that
+              // could go stale. Every branch consumes it. Ported as `ended_block`.
+              let endedBlock = null;
               while (i < lines.length) {
                 const raw = lines[i];
                 if (!trimSWhite(raw)) { i++; continue; }
                 const line = trimSWhite(raw);
-                if (indentOf(raw) === 0 && line.startsWith('default_pool:')) {
+                const terminated = endedBlock;
+                endedBlock = null;
+                if (indentOf(raw) === 0 && isKey(line, 'default_pool:')) {
                   // YAML requires unique keys; PyYAML's de-facto last-wins is the reference.
                   // Warn, never reject — routing must not hard-fail on a malformed map — and
                   // reset rather than accumulate, so the block form replaces like the flow
@@ -523,14 +558,14 @@ jobs:
                   while (i < lines.length) {
                     const r = lines[i];
                     if (!trimSWhite(r)) { i++; continue; }
-                    if (indentOf(r) === 0) break;
+                    if (indentOf(r) === 0) { endedBlock = 'default_pool:'; break; }
                     const t = trimSWhite(r);
                     if (t.startsWith('- ')) out.default_pool.push(unquote(t.slice(2)));
                     i++;
                   }
                   continue;
                 }
-                if (indentOf(raw) === 0 && line.startsWith('rules:')) {
+                if (indentOf(raw) === 0 && isKey(line, 'rules:')) {
                   i++;
                   let current = null, listKey = null, ruleIndent = -1;
                   const setKey = (seg) => {
@@ -556,7 +591,7 @@ jobs:
                   while (i < lines.length) {
                     const r = lines[i];
                     if (!trimSWhite(r)) { i++; continue; }
-                    if (indentOf(r) === 0) break;
+                    if (indentOf(r) === 0) { endedBlock = 'rules:'; break; }
                     const ind = indentOf(r);
                     const t = trimSWhite(r);
                     const isDash = t === '-' || t.startsWith('- ');
@@ -577,18 +612,44 @@ jobs:
                   continue;
                 }
                 // Fallthrough: a non-empty line that is neither `default_pool:` nor `rules:`.
-                // At column 0 it is a BLOCK TERMINATOR — both loops above `break` on
-                // `indentOf(r) === 0`, so everything below it is dropped — and it need not look
-                // like a key at all: since both ports narrowed to trimming s-white, a line whose
-                // only content is ONE non-s-white whitespace character (U+00A0, U+0085, U+000B,
-                // U+000C, U+001C-U+001F, U+FEFF, U+2028, U+2029, U+200B) is no longer blank, and
-                // `indentOf` counts SPACES, so it reads as column 0 and truncates the block
-                // invisibly. Real YAML rejects most such documents outright, so widening the
-                // blank test would have diverged from YAML; warning changes what is VISIBLE, not
-                // what parses. Warn, never reject — same posture as the duplicate-key warning.
-                // INDENTED fallthrough lines stay silent deliberately: they are the orphaned tail
-                // of an already-reported truncation, and one warning per terminator is the signal.
-                if (indentOf(raw) === 0) core.warning(`${where}line ${i + 1} is not a recognised top-level key (${showInvisible(line)}) — it ends the block above it, and only \`default_pool:\` and \`rules:\` are read; if this is invisible padding at column 0 (e.g. U+00A0), every list item or rule after it is dropped`);
+                // At column 0 such a line can do real, INVISIBLE damage, and the two shapes it
+                // takes are the two arms below. It need not look like a key at all: since both
+                // ports narrowed to trimming s-white, a line whose only content is ONE non-s-white
+                // whitespace character (U+00A0, U+0085, U+000B, U+000C, U+001C-U+001F, U+FEFF,
+                // U+2028, U+2029, U+200B) is no longer blank, and `indentOf` counts SPACES, so it
+                // reads as column 0. Real YAML rejects most such documents outright, so widening
+                // the blank test would have diverged from YAML; making the damage visible does not
+                // change what parses. Warn, never reject — routing must not hard-fail on a
+                // malformed map, the same posture as the duplicate-key warning above.
+                //
+                // What this deliberately does NOT warn about is an unrecognised column-0 line that
+                // broke nothing, because warning on EVERY fallthrough both overclaimed and flooded:
+                // a `---`/`...` document marker, a `version:`/`notes:` metadata key before the
+                // first block, and a stray key between two complete blocks all leave the outer loop
+                // scanning and every later `default_pool:`/`rules:` parsing — yet each drew an
+                // annotation asserting the block above was ended and the rules below were dropped,
+                // on a document whose parse is complete. Silence there is also what caps the
+                // volume: a zero-indented block sequence, a tab-indented config (`indentOf` counts
+                // spaces, so EVERY item reads as column 0) and a `reviewer_config_path` aimed at a
+                // non-YAML file each used to warn once per line and bury the annotation that
+                // mattered inside GitHub's ~10-per-step budget; now they warn once per block
+                // actually truncated, or not at all.
+                //
+                // INDENTED fallthrough lines stay silent for the same reason: they are the orphaned
+                // tail of an already-reported truncation, and one warning per terminator is the
+                // signal — one per orphaned item would bury it.
+                if (indentOf(raw) === 0 && !isDocMarker(line)) {
+                  const near = nearMissKey(line);
+                  if (near) {
+                    // Checked BEFORE the terminator arm because it names the actual cause and the
+                    // larger blast radius: `\ufeffrules:` may also end a (complete) `default_pool:`
+                    // above it, but what the reader needs to know is that every rule below is gone
+                    // because of one character they cannot see.
+                    core.warning(`${where}line ${i + 1} is not a recognised top-level key (${showInvisible(line)}) — it is not the supported \`${near}\` key, so the whole block it opens is ignored; that key is read only at column 0 with nothing but spaces before it and a space, a tab or the end of the line after its colon`);
+                  } else if (terminated) {
+                    core.warning(`${where}line ${i + 1} is not a recognised top-level key (${showInvisible(line)}) — it ends the \`${terminated}\` block above it, and every list item or rule indented below it is dropped; only \`default_pool:\` and \`rules:\` are read, and at column 0 one invisible character (e.g. U+00A0) ends a block exactly like a misspelled key does`);
+                  }
+                }
                 i++;
               }
               return out;

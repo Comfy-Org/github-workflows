@@ -33,13 +33,16 @@ A no-drift run closes a stale still-bot-authored drift PR so an obsolete proposa
 cannot linger mergeable.
 
 The generator reads `.github/reviewers.yml` with the same parser
-[`assign-reviewers.yml`](assign-reviewers.md) uses, so it emits the same warning about an
+[`assign-reviewers.yml`](assign-reviewers.md) uses, so it emits the same warnings about an
 unrecognised **top-level key** — a misspelled key, or a line whose only content is one
-invisible character such as U+00A0 at column 0, both of which end the block above them.
-That matters more here than at PR time: the generator rewrites the *truncated* list it
-parsed and leaves the orphaned items below the stray line where they are, so a drift PR
-that seems to drop reviewers for no reason is worth reading alongside the run's
-annotations.
+invisible character such as U+00A0 at column 0, both of which end the block above them;
+and a near miss such as `\u0085rules:` or `rules:v2:`, which names a supported key without
+opening one. That matters more here than at PR time: the generator rewrites the
+*truncated* list it parsed and leaves the orphaned items below the stray line where they
+are, so a drift PR that seems to drop reviewers for no reason is worth reading alongside
+the run's annotations. A column-0 line that breaks nothing — a `---`/`...` document
+marker, a metadata key before the first block — is silent, so the annotations that do
+appear all point at something real.
 
 ## Prerequisites
 
