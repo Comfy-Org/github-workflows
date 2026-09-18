@@ -164,6 +164,13 @@ jobs:
           # fork PRs (read-only GITHUB_TOKEN would 403).
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
+            // PARITY-HARNESS:script:begin
+            // ^ Extraction anchor for .github/assign-reviewers/tests/assignment.test.cjs, which
+            // executes the bytes shipped here — never a copy — and drives the two
+            // sentinel-delimited helper regions below from the shared parser corpus at
+            // .github/assign-reviewers/parser-corpus.json, the same corpus the Python port in
+            // .github/refresh-reviewers/generate.py is driven from. Renaming, moving or
+            // deleting a PARITY-HARNESS marker fails that suite loudly; it is never cosmetic.
             const { owner, repo } = context.repo;
             const normalizeLogin = (s) => s.replace(/^@/, '').toLowerCase();
             const validLogin = (s) => typeof s === 'string' && /^[a-z\d](?:[a-z\d-]{0,38})$/i.test(s);
@@ -301,6 +308,7 @@ jobs:
             // reliably available inside github-script, so we roll our own. Defined
             // here rather than with the other helpers below because the base-branch
             // early exit needs it before any API call is made.
+            // PARITY-HARNESS:glob-matcher:begin
             const globToRegExp = (glob) => {
               let re = '';
               for (let i = 0; i < glob.length; i++) {
@@ -321,6 +329,7 @@ jobs:
               return new RegExp('^' + re + '$');
             };
             const matchesAny = (p, globs) => globs.some((g) => globToRegExp(g).test(p));
+            // PARITY-HARNESS:glob-matcher:end
 
             // --- 1. Early exits (never fail the PR) ---
             if (pr.draft) { core.info('PR is a draft — skipping.'); return; }
@@ -421,6 +430,7 @@ jobs:
             // (default_pool + rules[{paths, reviewers}], flow or block seqs).
             // js-yaml is not bundled with github-script; the schema is small and
             // fixed, so a focused parser is safer than an unavailable dependency.
+            // PARITY-HARNESS:config-parser:begin
             const parseReviewerConfig = (text) => {
               const out = { default_pool: [], rules: [] };
               const stripComment = (s) => {
@@ -435,7 +445,17 @@ jobs:
               };
               const unquote = (s) => {
                 s = s.trim();
-                if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) return s.slice(1, -1);
+                // `s.length >= 2` is load-bearing for PARITY — the reason that survives
+                // being checked. A lone `"` both starts and ends with a quote, so without
+                // the guard `slice(1, -1)` collapses that one character to the empty
+                // string, while the Python port (guarded since #63) keeps it as `"`.
+                // Two things this guard is NOT: it does not stop an empty reviewer
+                // reaching the list (`- ""` is two characters and unquotes to `''`), and
+                // it is not the thing keeping `''` out of routing — `eligible()` below
+                // rejects `''` and `"` alike, so no assignment outcome changes either
+                // way. Drop it and you reopen exactly the divergence
+                // ../assign-reviewers/parser-corpus.json exists to pin, nothing more.
+                if (s.length >= 2 && ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'")))) return s.slice(1, -1);
                 return s;
               };
               const parseFlow = (s) => {
@@ -507,6 +527,7 @@ jobs:
               }
               return out;
             };
+            // PARITY-HARNESS:config-parser:end
 
             // --- 2. Changed paths ---
             const files = await github.paginate(github.rest.pulls.listFiles, {
@@ -706,6 +727,7 @@ jobs:
             } catch (e) {
               core.warning(`addAssignees failed (${e.message}) — leaving PR unassigned.`);
             }
+            // PARITY-HARNESS:script:end
 
       - name: Publish reviewer history manifest
         if: inputs.generate_history && steps.selection.outputs.manifest_ready == 'true'
