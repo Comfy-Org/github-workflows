@@ -1009,13 +1009,26 @@ jobs:
           # able to rewrite the logic that decides what the panel is shown.
           INCREMENTAL_PY="_pr_size_tool/.github/cursor-review/incremental-diff.py"
           : > "$NEW_PATCH"
+          # An OLD patch larger than this is declined rather than parsed. NEW is
+          # bounded by diff_size_cap; OLD is NOT — `git diff BASE...LAST` keeps
+          # the generated-file sections the classifier strips out of the
+          # reviewed diff, and those cost nothing against that cap — so a PR
+          # comfortably under the review cap can still hand this step a patch
+          # big enough to burn the runner's memory on. Declining fails closed to
+          # "no block", the same as every other case below.
+          OLD_PATCH_MAX_BYTES=33554432   # 32 MiB
           # Wrapped in a function so the shellcheck directive sits in front of a
           # complete command — it is rejected in front of an `elif` branch.
           build_old_patch() {
+            # core.quotePath=false to match check-pr-size's `writeReviewedDiff`,
+            # which builds the NEW side. Under the default (quoting ON) a
+            # non-ASCII path arrives C-quoted here and PLAIN there, so the two
+            # sides key differently and every such file is re-emitted in full on
+            # every round — including a pure rebase.
             # $DIFF_EXCLUDES is intentionally unquoted so bash word-splits it
             # into pathspec args.
             # shellcheck disable=SC2086
-            git diff "${BASE_SHA}...${LAST_REVIEWED_SHA}" -- . $DIFF_EXCLUDES > "$OLD_PATCH"
+            git -c core.quotePath=false diff "${BASE_SHA}...${LAST_REVIEWED_SHA}" -- . $DIFF_EXCLUDES > "$OLD_PATCH"
           }
           # Default the output to the honest "nothing was discarded" value, and
           # let the fail-safe below append 'false' over it — same last-value-wins
@@ -1031,11 +1044,20 @@ jobs:
             echo "Last-reviewed SHA ${LAST_REVIEWED_SHA} is unreachable (force-push or base-branch rewrite) — skipping the incremental diff block."
           elif [ ! -s "$FULL_PATCH" ]; then
             echo "The reviewed diff is empty — skipping the incremental diff block."
-          elif ! build_old_patch; then
-            # Fail CLOSED to "no block". Falling through with an empty OLD would
-            # make every file read as new and emit the whole reviewed diff a
-            # second time — a doubled prompt that prioritizes nothing.
-            echo "Could not build the last-reviewed patch (${LAST_REVIEWED_SHA}) — skipping the incremental diff block."
+          elif ! build_old_patch || [ ! -s "$OLD_PATCH" ]; then
+            # Fail CLOSED to "no block" — for a FAILED build and an EMPTY one
+            # alike. Falling through with an empty OLD would make every file
+            # read as new and emit the whole reviewed diff a second time: a
+            # doubled prompt that prioritizes nothing, which the fail-safe
+            # below cannot catch either (nothing is foreign, and new_lines
+            # EQUALS full_lines rather than exceeding it). An empty OLD is not
+            # an error git reports — it is simply what `BASE...LAST` yields
+            # whenever merge-base(BASE, LAST) is LAST itself (the base advanced
+            # past the last-reviewed commit, e.g. after a retarget), or
+            # whenever $DIFF_EXCLUDES filters every file out.
+            echo "Could not build a non-empty last-reviewed patch (${LAST_REVIEWED_SHA}) — skipping the incremental diff block."
+          elif [ "$(wc -c < "$OLD_PATCH")" -gt "$OLD_PATCH_MAX_BYTES" ]; then
+            echo "The last-reviewed patch is larger than ${OLD_PATCH_MAX_BYTES} bytes — skipping the incremental diff block rather than parsing it."
           elif ! python3 "$INCREMENTAL_PY" build \
                  --old "$OLD_PATCH" --new "$FULL_PATCH" --out "$NEW_PATCH"; then
             echo "::warning::Could not build the incremental diff block — the panel will run on the full reviewed diff alone."

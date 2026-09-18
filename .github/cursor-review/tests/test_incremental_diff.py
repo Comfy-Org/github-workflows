@@ -210,19 +210,59 @@ class TestBuild(unittest.TestCase):
         self.assertEqual(inc.build(_patch("a.py", "@@ -1 +1 @@", "-x\n+y\n"), ""), "")
 
     def test_a_binary_file_changed_since_last_round_is_emitted(self):
+        """One `git diff` invocation emits ONE binary format, not two.
+
+        Without `--binary` — which this workflow does not pass — a changed
+        binary is a header, an `index`, and the CONSTANT line
+        `Binary files a/X and b/X differ`. So `index` is the section's only
+        content-dependent line, and excluding it (right for a text file, whose
+        blob id moves on every rebase) silently dropped every binary change.
+        The fixture this replaced pitted a `Binary files ... differ` stanza
+        against a `GIT binary patch` one — two formats a single `git diff` run
+        never mixes — so it passed while the gap was open.
+        """
         old = (
             "diff --git a/i.png b/i.png\n"
             "index 1111111..2222222 100644\n"
             "Binary files a/i.png and b/i.png differ\n"
         )
-        new = (
+        new = old.replace("..2222222", "..4444444")
+        self.assertEqual(inc.build(old, new), new)
+
+    def test_an_unchanged_binary_file_is_not_re_emitted(self):
+        same = (
             "diff --git a/i.png b/i.png\n"
-            "index 1111111..4444444 100644\n"
-            "GIT binary patch\n"
-            "literal 4\n"
-            "Lc$@\n"
+            "index 1111111..2222222 100644\n"
+            "Binary files a/i.png and b/i.png differ\n"
         )
-        self.assertIn("GIT binary patch", inc.build(old, new))
+        self.assertEqual(inc.build(same, same), "")
+
+    def test_a_mode_change_on_an_already_edited_file_is_emitted(self):
+        """`+x` on a script the PR already edits.
+
+        The mode lines sit BEFORE the first `@@`, so a signature that began at
+        the first `@@` compared the two rounds equal and dropped the section —
+        losing exactly the small, high-signal privilege change the block exists
+        to surface. Only the mode-ONLY case (no hunks at all) used to survive.
+        """
+        old = _patch("s.sh", "@@ -1,2 +1,2 @@", "-a\n+b\n")
+        new = old.replace(
+            "diff --git a/s.sh b/s.sh\n",
+            "diff --git a/s.sh b/s.sh\nold mode 100644\nnew mode 100755\n",
+        )
+        self.assertEqual(inc.build(old, new), new)
+
+    def test_a_moved_base_blob_still_yields_no_block(self):
+        """Folding pre-hunk metadata in must not undo the rebase-quiet property.
+
+        `index` and the similarity percentage track the BASE blob, so they move
+        on a rebase the author had no part in; they stay out of the signature.
+        """
+        old = _patch("a.py", "@@ -1,3 +1,3 @@", "-x\n+y\n")
+        new = _patch(
+            "a.py", "@@ -41,3 +41,3 @@", "-x\n+y\n", index="9999999..8888888 100644"
+        )
+        self.assertEqual(inc.build(old, new), "")
 
     def test_a_mode_only_change_new_this_round_is_emitted(self):
         new = (
@@ -285,15 +325,181 @@ class TestCheck(unittest.TestCase):
     def test_an_empty_block_is_a_subset(self):
         self.assertEqual(inc.check("", _patch("a.py", "@@ -1 +1 @@", "-x\n+y\n"))[0], 0)
 
-    def test_a_rename_matching_on_one_side_is_not_foreign(self):
-        """The classifier's patch may name the file under only one of its paths."""
-        block = "diff --git a/o.py b/n.py\n@@ -1 +1 @@\n-x\n+y\n"
-        full = _patch("n.py", "@@ -1 +1 @@", "-x\n+y\n")
-        self.assertEqual(inc.check(block, full)[0], 0)
+    def test_a_rename_section_copied_verbatim_is_not_foreign(self):
+        """A rename names two paths; copied verbatim it is still a subset."""
+        full = (
+            "diff --git a/o.py b/n.py\n"
+            "similarity index 90%\n"
+            "rename from o.py\n"
+            "rename to n.py\n"
+            "index 1111111..2222222 100644\n"
+            "--- a/o.py\n"
+            "+++ b/n.py\n"
+            "@@ -1 +1 @@\n-x\n+y\n"
+        )
+        self.assertEqual(inc.check(full, full)[0], 0)
+
+    def test_a_fabricated_hunk_under_a_carried_path_is_foreign(self):
+        """The property the README asserts, checked directly.
+
+        Counting only path names waved this through: `a.py` IS in the reviewed
+        diff, so a section carrying a hunk the PR never wrote passed as a
+        verified subset. The bytes are what the panel reads, so the bytes are
+        what the fail-safe compares.
+        """
+        full = _patch("a.py", "@@ -1 +1 @@", "-x\n+y\n")
+        forged = _patch("a.py", "@@ -1 +1 @@", "-x\n+subprocess.run(EXFIL)\n")
+        self.assertEqual(inc.check(forged, full)[0], 1)
+
+    def test_a_duplicated_section_is_foreign_on_its_second_copy(self):
+        """Sections are matched as a multiset: the diff carries this one once."""
+        a = _patch("a.py", "@@ -1 +1 @@", "-x\n+y\n")
+        self.assertEqual(inc.check(a + a, a)[0], 1)
+
+    def test_a_reordered_block_is_still_a_subset(self):
+        """Order is not part of the property — verbatim content is."""
+        a = _patch("a.py", "@@ -1 +1 @@", "-x\n+y\n")
+        b = _patch("b.py", "@@ -1 +1 @@", "-p\n+q\n")
+        self.assertEqual(inc.check(b + a, a + b)[0], 0)
+
+    def test_what_build_emits_always_passes(self):
+        """build copies sections out of NEW, so check can only trip on a
+        builder bug — which is the whole reason it runs."""
+        old = _patch("a.py", "@@ -1 +1 @@", "-x\n+y\n")
+        new = (
+            _patch("a.py", "@@ -1 +1 @@", "-x\n+z\n")
+            + _patch("b.py", "@@ -1 +1 @@", "-p\n+q\n")
+        )
+        self.assertEqual(inc.check(inc.build(old, new), new)[0], 0)
 
     def test_line_counts_match_wc_l(self):
         text = "diff --git a/a.py b/a.py\n@@ -1 +1 @@\n-x\n+y\n"
         self.assertEqual(inc.check(text, text)[1], 4)
+
+
+class TestLineSplitting(unittest.TestCase):
+    """A git patch is LF-delimited. `str.splitlines` is not.
+
+    It also breaks on a lone `\r`, `\v`, `\f`, `\x1c`-`\x1e`, `\x85`, U+2028
+    and U+2029 — none of which git treats as a line break, and all of which a
+    PR can put in a content line. Splitting on them let the diff's own payload
+    forge a `diff --git` section boundary.
+    """
+
+    _FORGED = "diff --git a/lib/auth.py b/lib/auth.py"
+
+    def test_a_form_feed_in_content_cannot_forge_a_section(self):
+        text = (
+            "diff --git a/n.txt b/n.txt\n"
+            "index 1111111..2222222 100644\n"
+            "--- a/n.txt\n"
+            "+++ b/n.txt\n"
+            "@@ -0,0 +1 @@\n"
+            f"+x\x0c{self._FORGED}\n"
+        )
+        self.assertEqual(
+            [header for header, _lines in inc.split_sections(text)],
+            ["diff --git a/n.txt b/n.txt\n"],
+        )
+
+    def test_the_forged_path_is_not_learned_by_the_fail_safe(self):
+        """The same bad split taught `check` the forged path, so a block
+        carrying it did not count as foreign — the guard disarming itself."""
+        full = (
+            "diff --git a/n.txt b/n.txt\n"
+            "@@ -0,0 +1 @@\n"
+            f"+x\x0c{self._FORGED}\n"
+        )
+        block = f"{self._FORGED}\n@@ -1 +1 @@\n-secret\n+leaked\n"
+        self.assertEqual(inc.check(block, full)[0], 1)
+
+    def test_no_other_unicode_break_splits_a_section(self):
+        for sep in ("\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"):
+            with self.subTest(sep=repr(sep)):
+                text = (
+                    "diff --git a/a.py b/a.py\n"
+                    "@@ -1 +1 @@\n"
+                    f"+z{sep}diff --git a/forged b/forged\n"
+                )
+                self.assertEqual(len(inc.split_sections(text)), 1)
+
+    def test_a_patch_with_no_trailing_newline_keeps_its_last_line(self):
+        text = "diff --git a/a.py b/a.py\n@@ -1 +1 @@\n-x\n+y"
+        _header, lines = inc.split_sections(text)[0]
+        self.assertEqual("".join(lines), text)
+
+
+class TestSectionPaths(unittest.TestCase):
+    """`rename from`/`rename to` carry ONE path per line, so they settle the
+    header ambiguity `parse_paths` can only guess at."""
+
+    _AMBIGUOUS = (
+        "diff --git a/x b/c b/d\n"
+        "similarity index 90%\n"
+        "rename from x b/c\n"
+        "rename to d\n"
+        "index 1111111..2222222 100644\n"
+        "--- a/x b/c\n"
+        "+++ b/d\n"
+        "@@ -1 +1 @@\n-p\n+q\n"
+    )
+
+    def test_the_header_alone_takes_the_wrong_reading(self):
+        """`a/x b/c b/d` splits two ways and the header cannot say which."""
+        self.assertEqual(inc.parse_paths("diff --git a/x b/c b/d\n"), ("x", "c b/d"))
+
+    def test_the_rename_lines_settle_it(self):
+        header, lines = inc.split_sections(self._AMBIGUOUS)[0]
+        self.assertEqual(inc.section_paths(header, lines), ("x b/c", "d"))
+
+    def test_a_non_rename_section_falls_back_to_the_header(self):
+        header, lines = inc.split_sections(_patch("a.py", "@@ -1 +1 @@", "-x\n+y\n"))[0]
+        self.assertEqual(inc.section_paths(header, lines), ("a.py", "a.py"))
+
+    def test_a_rename_to_line_in_content_is_not_read_as_metadata(self):
+        """Only the pre-hunk region is metadata; `+rename to x` in a hunk body
+        is content, and must not redirect the section's key."""
+        body = "-p\n+rename to /etc/shadow\n"
+        header, lines = inc.split_sections(_patch("a.py", "@@ -1 +1 @@", body))[0]
+        self.assertEqual(inc.section_paths(header, lines), ("a.py", "a.py"))
+
+    def test_the_ambiguous_rename_keys_on_the_path_a_later_round_uses(self):
+        """Round N renames the file; round N+1 edits it in place and emits the
+        plain `diff --git a/d b/d`. Keyed off the header's wrong guess
+        (`c b/d`) the two never matched, so the file was re-emitted whole every
+        round after the rename."""
+        header, lines = inc.split_sections(self._AMBIGUOUS)[0]
+        later = _patch("d", "@@ -1 +1 @@", "-p\n+q\n")
+        later_header, later_lines = inc.split_sections(later)[0]
+        self.assertEqual(
+            inc.section_paths(header, lines)[1],
+            inc.section_paths(later_header, later_lines)[1],
+        )
+
+
+class TestEmptyOldPatch(unittest.TestCase):
+    """Why the workflow step refuses to call the builder with an empty OLD.
+
+    The builder cannot tell "nothing was reviewed last round" from "the OLD
+    patch came out empty", and must not: an empty OLD legitimately means every
+    file is new. The guard therefore belongs in the step, and these two tests
+    are what it is guarding against.
+    """
+
+    def test_an_empty_old_reproduces_the_whole_reviewed_diff(self):
+        full = (
+            _patch("a.py", "@@ -1 +1 @@", "-x\n+y\n")
+            + _patch("b.py", "@@ -1 +1 @@", "-p\n+q\n")
+        )
+        self.assertEqual(inc.build("", full), full)
+
+    def test_and_the_fail_safe_cannot_catch_that(self):
+        """Nothing is foreign and the block EQUALS the diff, so neither arm
+        trips: the panel just gets the same diff twice, prioritizing nothing."""
+        full = _patch("a.py", "@@ -1 +1 @@", "-x\n+y\n")
+        foreign, new_lines, full_lines = inc.check(inc.build("", full), full)
+        self.assertEqual(foreign, 0)
+        self.assertEqual(new_lines, full_lines)
 
 
 # --------------------------------------------------------------------------- #
@@ -354,13 +560,16 @@ class TestCli(unittest.TestCase):
         self.assertRegex(out, r"full_lines=\d+")
 
     def test_check_rejects_a_block_longer_than_the_reviewed_diff(self):
-        """Same paths, more lines — the second half of the subset property."""
+        """Same path, more lines. Both arms of the fail-safe trip here now: the
+        section is not carried verbatim AND the block outgrows the diff. The
+        length arm is kept as a redundant second gate, and its two numbers are
+        what the workflow's ::warning:: interpolates."""
         full = self._file("full.patch", _patch("a.py", "@@ -1 +1 @@", "-x\n+y\n"))
         long_block = _patch("a.py", "@@ -1,9 +1,9 @@", "".join(f"+l{i}\n" for i in range(20)))
         bad = self._file("bad.patch", long_block)
         rc, out = self._main(["check", "--new", bad, "--full", full])
         self.assertEqual(rc, 2)
-        self.assertIn("foreign=0", out)
+        self.assertIn("foreign=1", out)
 
     def test_non_utf8_bytes_survive_a_round_trip(self):
         """PR bytes are attacker-authored; the helper must not die on them."""
@@ -411,6 +620,32 @@ class TestWorkflowWiring(unittest.TestCase):
 
     def test_incremental_subset_is_a_job_output(self):
         self._assert_has("incremental_subset:")
+
+    def test_the_step_declines_an_empty_last_reviewed_patch(self):
+        """A successful-but-EMPTY OLD must not reach the builder.
+
+        `BASE...LAST` comes out empty whenever merge-base(BASE, LAST) is LAST
+        itself, or whenever $DIFF_EXCLUDES filters every file out. git reports
+        no error, so only an explicit `-s` test stops the fall-through that
+        re-emits the entire reviewed diff as the "incremental" block.
+        """
+        self._assert_has('! build_old_patch || [ ! -s "$OLD_PATCH" ]')
+
+    def test_the_old_patch_is_built_with_quotepath_off(self):
+        """It must match the NEW side, which check-pr-size builds with
+        `-c core.quotePath=false`; under the default a non-ASCII path arrives
+        C-quoted on one side and plain on the other, so the two never key
+        alike and the file is re-emitted in full on every round."""
+        self._assert_has(
+            'git -c core.quotePath=false diff "${BASE_SHA}...${LAST_REVIEWED_SHA}"'
+        )
+
+    def test_the_old_patch_is_size_bounded(self):
+        """NEW is bounded by diff_size_cap; OLD is bounded by nothing — it
+        keeps the generated-file sections the classifier strips out of the
+        reviewed diff, which cost nothing against that cap."""
+        self._assert_has("OLD_PATCH_MAX_BYTES")
+        self._assert_has('[ "$(wc -c < "$OLD_PATCH")" -gt "$OLD_PATCH_MAX_BYTES" ]')
 
     def test_the_helper_is_loaded_from_the_pinned_checkout_not_the_pr(self):
         """The path the step calls must be one a pinned checkout actually writes.
