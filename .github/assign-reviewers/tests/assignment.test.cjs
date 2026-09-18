@@ -3,10 +3,35 @@ const {resolve} = require('node:path');
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
 const workflow = readFileSync(resolve(__dirname, '../../workflows/assign-reviewers.yml'), 'utf8');
-// Execute the shipped inline script, never a copied implementation.
-const script = workflow.split('          script: |\n')[1].split('\n      - name: Publish reviewer history manifest')[0].split('\n').map(line => line.replace(/^            /, '')).join('\n');
+// Execute the shipped inline script, never a copied implementation. Extraction anchors on the
+// `// PARITY-HARNESS:<name>:{begin,end}` sentinels emitted inside the script itself: the previous
+// split on a 10-space-indented `script: |` plus the name of an unrelated downstream step captured
+// the WRONG span, silently and still green, the moment either drifted. Every failure mode here
+// throws with the sentinel that is missing, duplicated or out of order.
+const region = (text, name) => {
+  const lines = text.split('\n');
+  const only = (suffix) => {
+    const marker = `// PARITY-HARNESS:${name}:${suffix}`;
+    const hits = lines.flatMap((line, at) => line.trim() === marker ? [at] : []);
+    if (hits.length !== 1) throw Error(`expected exactly one \`${marker}\` line in assign-reviewers.yml, found ${hits.length}. The parity harness extracts by sentinel; restore the marker rather than reintroducing an indentation-based split.`);
+    return hits[0];
+  };
+  const begin = only('begin'), end = only('end');
+  if (end < begin) throw Error(`\`// PARITY-HARNESS:${name}\` sentinels are inverted in assign-reviewers.yml: begin on line ${begin + 1}, end on line ${end + 1}.`);
+  const indent = lines[begin].length - lines[begin].trimStart().length;
+  return lines.slice(begin + 1, end).map((line, offset) => {
+    if (line.trim() && !line.startsWith(' '.repeat(indent))) throw Error(`line ${begin + 2 + offset} of assign-reviewers.yml is indented less than its \`// PARITY-HARNESS:${name}:begin\` sentinel; the extracted span would not be valid JavaScript.`);
+    return line.slice(indent);
+  }).join('\n');
+};
+const script = region(workflow, 'script');
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 const runScript = new AsyncFunction('github', 'context', 'core', 'process', 'require', script);
+// The two parity-critical helpers, evaluated straight out of the shipped script so the corpus
+// below drives the same bytes the runtime does. Their Python ports in refresh-reviewers/generate.py
+// are driven from that same corpus file by test_generate.py.
+const helpers = new Function(`${region(script, 'glob-matcher')}\n${region(script, 'config-parser')}\nreturn {globToRegExp, matchesAny, parseReviewerConfig};`)();
+const corpus = JSON.parse(readFileSync(resolve(__dirname, '../parser-corpus.json'), 'utf8'));
 const file = (filename) => ({filename, changes: 10});
 const approval = (login, state = 'APPROVED', type = 'User') => ({user: {login, type}, state, author_association: 'MEMBER'});
 const ruleConfig = 'default_pool: [generalist]\nrules:\n  - paths: ["src/api/**"]\n    reviewers: [alice, bob]\n  - paths: ["src/ui/**"]\n    reviewers: [carol]\n';
@@ -307,4 +332,42 @@ test('historical sweeps stop after three pages and add no ownership evidence', a
   const result = await run({history});
   assert.equal(result.calls.filter(c => c.startsWith('files:90:')).length, 3);
   assert.deepEqual(result.selected, ['alice']);
+});
+
+// --- shared reviewers.yml parser corpus -------------------------------------
+// One fixture file, two hand-ported implementations. Anything asserted below is asserted against
+// the Python port by .github/refresh-reviewers/tests/test_generate.py from the SAME file, so a
+// case added here lands on both sides at once. Never restate a corpus case as an inline literal.
+test('the shared corpus is loaded and non-empty', () => {
+  assert(corpus.configs.length > 0, 'parser-corpus.json has no config cases');
+  assert(corpus.globs.length > 0, 'parser-corpus.json has no glob cases');
+  assert(corpus.globs.every(entry => entry.cases.length > 0), 'a corpus glob entry has no path cases');
+});
+for (const {name, text, expected} of corpus.configs) {
+  test(`corpus config — ${name}`, () => {
+    assert.deepEqual(helpers.parseReviewerConfig(text), expected);
+  });
+}
+for (const {glob, cases} of corpus.globs) {
+  test(`corpus glob — ${glob}`, () => {
+    for (const {path, matches} of cases) {
+      assert.equal(helpers.globToRegExp(glob).test(path), matches, `globToRegExp(${JSON.stringify(glob)}).test(${JSON.stringify(path)})`);
+      assert.equal(helpers.matchesAny(path, [glob]), matches, `matchesAny(${JSON.stringify(path)}, [${JSON.stringify(glob)}])`);
+    }
+  });
+}
+test('sentinel extraction fails loudly when a marker is missing', () => {
+  assert.throws(() => region(workflow.replace('// PARITY-HARNESS:config-parser:begin', '// removed'), 'config-parser'), /found 0/);
+});
+test('sentinel extraction fails loudly when a marker is duplicated', () => {
+  assert.throws(() => region(workflow.replace('// PARITY-HARNESS:script:end', '// PARITY-HARNESS:script:end\n            // PARITY-HARNESS:script:end'), 'script'), /found 2/);
+});
+test('sentinel extraction fails loudly when the markers are inverted', () => {
+  assert.throws(() => region('  // PARITY-HARNESS:demo:end\n  const x = 1;\n  // PARITY-HARNESS:demo:begin\n', 'demo'), /inverted/);
+});
+test('sentinel extraction fails loudly when the span out-dents past its begin marker', () => {
+  assert.throws(() => region('  // PARITY-HARNESS:demo:begin\nconst x = 1;\n  // PARITY-HARNESS:demo:end\n', 'demo'), /indented less than/);
+});
+test('sentinel extraction de-indents to the begin marker and keeps blank lines', () => {
+  assert.equal(region('  // PARITY-HARNESS:demo:begin\n  const x = 1;\n\n    const y = 2;\n  // PARITY-HARNESS:demo:end\n', 'demo'), 'const x = 1;\n\n  const y = 2;');
 });

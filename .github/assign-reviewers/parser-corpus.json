@@ -1,0 +1,228 @@
+{
+  "$note": [
+    "Shared reviewers.yml parser corpus. Driven from BOTH hand-ported implementations of the",
+    "same schema so their parity is executable rather than asserted by a comment:",
+    "  * JS  — parseReviewerConfig / globToRegExp, inline in .github/workflows/assign-reviewers.yml,",
+    "          executed by .github/assign-reviewers/tests/assignment.test.cjs.",
+    "  * Py  — parse_reviewer_config / glob_to_regexp in .github/refresh-reviewers/generate.py,",
+    "          executed by .github/refresh-reviewers/tests/test_generate.py.",
+    "refresh-reviewers WRITES the file assign-reviewers READS, so a divergence means the drift",
+    "generator rewrites lists the runtime reads differently. Add a case here, never to one suite.",
+    "",
+    "Contract: `configs[].text` is the literal document (newlines already embedded; the CRLF case",
+    "carries \\r\\n). `configs[].expected` is the parsed config — the Python side returns",
+    "(config, locations) and only the config half is compared here, because `locations` has no JS",
+    "counterpart and stays covered by test_generate.py's own rewrite tests.",
+    "`globs[].cases[]` are path/verdict pairs for the glob->RegExp translator.",
+    "",
+    "Both path filters (test-assign-reviewers.yml, test-refresh-reviewers.yml) watch this file, so",
+    "editing it runs both suites — a corpus tweak that only satisfies one port cannot land green."
+  ],
+  "configs": [
+    {
+      "name": "flow sequences",
+      "why": "the shape refresh-reviewers emits by default",
+      "text": "default_pool: [generalist, alice]\nrules:\n  - paths: [\"src/api/**\"]\n    reviewers: [alice, bob]\n  - paths: [\"src/ui/**\"]\n    reviewers: [carol]\n",
+      "expected": {
+        "default_pool": ["generalist", "alice"],
+        "rules": [
+          {"paths": ["src/api/**"], "reviewers": ["alice", "bob"]},
+          {"paths": ["src/ui/**"], "reviewers": ["carol"]}
+        ]
+      }
+    },
+    {
+      "name": "block sequences",
+      "why": "hand-written configs indent their lists instead",
+      "text": "default_pool:\n  - generalist\n  - alice\nrules:\n  - paths:\n      - \"**/api/**\"\n      - docs/*.md\n    reviewers:\n      - bob\n",
+      "expected": {
+        "default_pool": ["generalist", "alice"],
+        "rules": [
+          {"paths": ["**/api/**", "docs/*.md"], "reviewers": ["bob"]}
+        ]
+      }
+    },
+    {
+      "name": "comment stripping respects quotes",
+      "why": "a '#' inside a quoted scalar is data; one after whitespace starts a comment",
+      "text": "# routing for the example repo\ndefault_pool: ['alice', \"bob\"]  # trailing comment\nrules:\n  # which paths alice owns\n  - paths: [\"src/#hash/**\"]   # the # above is data\n    reviewers: [\"ca#rol\", 'dave']\n",
+      "expected": {
+        "default_pool": ["alice", "bob"],
+        "rules": [
+          {"paths": ["src/#hash/**"], "reviewers": ["ca#rol", "dave"]}
+        ]
+      }
+    },
+    {
+      "name": "unterminated quote swallows the comment marker",
+      "why": "the in-quote state machine never re-closes, so nothing on the line is stripped",
+      "text": "default_pool: [\"alice  # not a comment\n",
+      "expected": {
+        "default_pool": ["\"alice  # not a comment"],
+        "rules": []
+      }
+    },
+    {
+      "name": "one-character quote is not a quoted empty string",
+      "why": "without the length>=2 guard a lone quote unquotes to '' — the divergence this corpus pins",
+      "text": "default_pool: [\", alice]\nrules:\n  - reviewers:\n      - \"\n      - bob\n",
+      "expected": {
+        "default_pool": ["\"", "alice"],
+        "rules": [
+          {"paths": [], "reviewers": ["\"", "bob"]}
+        ]
+      }
+    },
+    {
+      "name": "CRLF line endings",
+      "why": "the JS splits on /\\r?\\n/ and the Python on a bare \\n; both must still agree",
+      "text": "default_pool: [generalist, alice]\r\nrules:\r\n  - paths: [\"src/api/**\"]\r\n    reviewers: [alice, bob]\r\n",
+      "expected": {
+        "default_pool": ["generalist", "alice"],
+        "rules": [
+          {"paths": ["src/api/**"], "reviewers": ["alice", "bob"]}
+        ]
+      }
+    },
+    {
+      "name": "bare scalar values",
+      "why": "a scalar reviewers/paths value becomes a one-item list; a scalar default_pool does not",
+      "text": "default_pool: generalist\nrules:\n  - paths: src/**\n    reviewers: alice\n",
+      "expected": {
+        "default_pool": [],
+        "rules": [
+          {"paths": ["src/**"], "reviewers": ["alice"]}
+        ]
+      }
+    },
+    {
+      "name": "empty flow sequences and blank lines",
+      "why": "an empty [] is a parsed empty list, not an unparsed scalar",
+      "text": "default_pool: []\n\nrules:\n\n  - paths: []\n    reviewers: []\n",
+      "expected": {
+        "default_pool": [],
+        "rules": [
+          {"paths": [], "reviewers": []}
+        ]
+      }
+    },
+    {
+      "name": "indented decoys and unknown top-level keys are ignored",
+      "why": "only column-0 default_pool:/rules: open a section",
+      "text": "version: 1\nnotes:\n  default_pool: [mallory]\ndefault_pool: [alice]\nrules:\n  - paths: [\"a/**\"]\n    reviewers: [bob]\n",
+      "expected": {
+        "default_pool": ["alice"],
+        "rules": [
+          {"paths": ["a/**"], "reviewers": ["bob"]}
+        ]
+      }
+    },
+    {
+      "name": "rules terminated by a later top-level key",
+      "why": "section order is free; a column-0 key closes the rules block",
+      "text": "rules:\n  - paths: [\"a/**\"]\n    reviewers: [bob]\ndefault_pool: [alice]\n",
+      "expected": {
+        "default_pool": ["alice"],
+        "rules": [
+          {"paths": ["a/**"], "reviewers": ["bob"]}
+        ]
+      }
+    }
+  ],
+  "globs": [
+    {
+      "glob": "src/api/**",
+      "why": "trailing ** crosses segments but still requires the parent directory",
+      "cases": [
+        {"path": "src/api/main.js", "matches": true},
+        {"path": "src/api/deep/nested/main.js", "matches": true},
+        {"path": "src/api/", "matches": true},
+        {"path": "src/api", "matches": false},
+        {"path": "src/apix/main.js", "matches": false}
+      ]
+    },
+    {
+      "glob": "**/api/**",
+      "why": "leading **/ is optional leading directories, not a required one",
+      "cases": [
+        {"path": "api/main.js", "matches": true},
+        {"path": "a/b/api/main.js", "matches": true},
+        {"path": "xapi/main.js", "matches": false}
+      ]
+    },
+    {
+      "glob": "**/foo",
+      "why": "**/ collapses to nothing at depth zero",
+      "cases": [
+        {"path": "foo", "matches": true},
+        {"path": "a/foo", "matches": true},
+        {"path": "a/b/foo", "matches": true},
+        {"path": "afoo", "matches": false}
+      ]
+    },
+    {
+      "glob": "a**b",
+      "why": "a ** not followed by / is a bare .* and still crosses separators",
+      "cases": [
+        {"path": "axyzb", "matches": true},
+        {"path": "a/b", "matches": true},
+        {"path": "ab", "matches": true},
+        {"path": "xab", "matches": false}
+      ]
+    },
+    {
+      "glob": "**",
+      "why": "the catch-all rule",
+      "cases": [
+        {"path": "a", "matches": true},
+        {"path": "a/b/c.txt", "matches": true}
+      ]
+    },
+    {
+      "glob": "src/*.js",
+      "why": "a single * stays inside one segment",
+      "cases": [
+        {"path": "src/main.js", "matches": true},
+        {"path": "src/.js", "matches": true},
+        {"path": "src/deep/main.js", "matches": false},
+        {"path": "src/main.jsx", "matches": false}
+      ]
+    },
+    {
+      "glob": "**/*.md",
+      "why": "the common docs rule — optional dirs plus an in-segment star",
+      "cases": [
+        {"path": "README.md", "matches": true},
+        {"path": "docs/callers/groom.md", "matches": true},
+        {"path": "docs/groom.mdx", "matches": false}
+      ]
+    },
+    {
+      "glob": "docs/?.md",
+      "why": "? is exactly one non-slash character",
+      "cases": [
+        {"path": "docs/a.md", "matches": true},
+        {"path": "docs/ab.md", "matches": false},
+        {"path": "docs/.md", "matches": false},
+        {"path": "docs//.md", "matches": false}
+      ]
+    },
+    {
+      "glob": "src/a+b(c).ts",
+      "why": "regex metacharacters in a glob are literals",
+      "cases": [
+        {"path": "src/a+b(c).ts", "matches": true},
+        {"path": "src/abbbb(c).ts", "matches": false},
+        {"path": "src/aXbXcXXts", "matches": false}
+      ]
+    },
+    {
+      "glob": "src/[x].ts",
+      "why": "brackets are escaped, never a character class",
+      "cases": [
+        {"path": "src/[x].ts", "matches": true},
+        {"path": "src/x.ts", "matches": false}
+      ]
+    }
+  ]
+}

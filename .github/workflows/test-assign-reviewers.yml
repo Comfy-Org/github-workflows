@@ -1,5 +1,11 @@
 name: Test owner assignment
 
+# `.github/assign-reviewers/**` below covers parser-corpus.json, the fixture the
+# Python port in .github/refresh-reviewers/generate.py is ALSO driven from
+# (test-refresh-reviewers.yml names that file explicitly in its own filters).
+# Keep the glob: an edit to the corpus has to run both suites, or a case retuned
+# to satisfy one of the two hand-ported parsers lands green against the other.
+
 on:
   pull_request:
     paths:

@@ -98,7 +98,11 @@ def glob_to_regexp(glob):
     `**` across segments (`**/` -> optional leading dirs), `?` one non-slash
     char. Full-string anchored. Must stay byte-for-byte semantics-equal to the
     JS original — the map is only correct if it is scored with the same
-    matcher the runtime assigns with."""
+    matcher the runtime assigns with. That parity is EXECUTABLE, not a promise
+    made here: ../assign-reviewers/parser-corpus.json is driven through both
+    ports (tests/test_generate.py and ../assign-reviewers/tests/
+    assignment.test.cjs), and both CI path filters watch it. Change this
+    function and you change the corpus, which reds the other suite."""
     out = ""
     i = 0
     n = len(glob)
@@ -133,7 +137,10 @@ def matches_any(path, compiled_globs):
 # Mirrors assign-reviewers.yml's minimal parser (default_pool + rules[{paths,
 # reviewers}], flow or block sequences, comment stripping) but ALSO records
 # where each reviewers/default_pool list lives so the rewrite can touch only
-# those bytes. Location shapes:
+# those bytes. The mirroring half is pinned by the shared corpus at
+# ../assign-reviewers/parser-corpus.json, which both suites read; the locations
+# half is Python-only and is covered by tests/test_generate.py alone.
+# Location shapes:
 #   ("flow", line_idx)              — `reviewers: [a, b]` (also bare scalar)
 #   ("block", [line_idx, ...], indent) — `- a` item lines
 
