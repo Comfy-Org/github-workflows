@@ -14,13 +14,21 @@ Removing the default is a one-line edit to undo, hence this lint: it is the
 regression guard that keeps the hole from coming back, and it deliberately
 covers workflows added *later* rather than an allow-list of today's three.
 
-Two checks, because the default is only half the hole:
+Three checks, because the default is only half the hole and the `uses:` pin is
+the other side of the same promise:
 
 1. no `default:` on the `workflows_ref` input, and
 2. every job that checks out at `ref: ${{ inputs.workflows_ref }}` runs the
    fail-fast empty-ref guard first. Without (2) a *new* job — or a whole new
    reusable workflow — reintroduces the `ref: ''` default-branch fallback with
    the lint still green, since it never declared a default to begin with.
+3. every `uses:` in this directory names a full 40-hex commit SHA (BE-15255).
+   AGENTS.md has always said so — "Pin everything by full commit SHA, with a
+   trailing `# v1` comment" — but nothing enforced it, so two `actions/*` refs
+   sat on major tags for months and DRIFTED twice (`@v6` → `@v7` → `@v7.0.0`)
+   because Dependabot narrows a tag to a narrower tag and never converts one to
+   a SHA. A tag is mutable by whoever owns the action, which is the same
+   "the pin proves nothing" hole as (1) with a third party holding the pen.
 
 Check (2) follows the ref through an earlier step, too (BE-8130): a job that
 must never fail cannot run a fail-closed guard, so it resolves the ref in a
@@ -61,6 +69,24 @@ DEFAULT_WORKFLOWS_DIR = ".github/workflows"
 # Empty as of BE-5858: the list drained itself exactly as designed, and every
 # reusable workflow here is now held to both checks with no carve-out.
 KNOWN_EXEMPT = frozenset()
+
+# `uses:` refs still floating on a tag, tracked for the same fix under their own
+# ticket (BE-15255). Same contract as KNOWN_EXEMPT and for the same reason: an
+# entry is a KNOWN debt, not a blessing, and `check_action_pins` fails on a
+# STALE entry so the list drains itself — whether the ref got pinned (fixed) or
+# the workflow stopped using it under that spelling (renamed, deleted, or
+# bumped to another tag, which Dependabot does on its own and which is exactly
+# how this debt hid: an entry frozen at `@v6` would have silently stopped
+# covering the line the day it became `@v7`).
+#
+# Each entry is a `(workflow filename, full `uses:` value)` pair — the FILE
+# alone would pre-exempt every other action in it, and the REF alone would
+# pre-exempt the same floating ref wherever a later workflow copied it.
+#
+# Empty as of BE-15255: both refs this list was written for were pinned in the
+# same change, so it starts drained and every `uses:` here is held to the check
+# with no carve-out.
+KNOWN_UNPINNED = frozenset()
 
 # A bracket-index accessor for an alternation of names — `[ 'NAME' ]`,
 # `[ "NAME" ]`, or `[ ''NAME'' ]` — shared by every "does this NAME the input
@@ -2420,12 +2446,31 @@ def _in_block_scalar(lines, idx):
     itself is never consulted as an opener — the `ref: >-` continuation
     spelling is reported at its own KEY line, which OPENS a scalar rather than
     sitting inside one.
+
+    One line thick over `_block_scalar_mask` so there is exactly ONE scan: a
+    caller asking about every line of a file (the BE-15255 pin walk does) wants
+    the whole mask, and a second copy of this state machine is a copy that can
+    disagree with this one about which lines are YAML.
     """
+    return _block_scalar_mask(lines)[idx]
+
+
+def _block_scalar_mask(lines):
+    """`_in_block_scalar(lines, i)` for every `i`, in one pass.
+
+    Each entry is decided from the state the lines STRICTLY ABOVE it left, so
+    a block-scalar key line reads False (it opens one, it is not inside one)
+    exactly as the per-index form specifies. Skippable lines neither open nor
+    close a scalar but can still sit inside one, so they are answered before
+    they are skipped.
+    """
+    mask = [False] * len(lines)
     open_indent = None
-    for j in range(idx):
-        if _is_skippable(lines[j]):
+    for i, raw in enumerate(lines):
+        mask[i] = open_indent is not None and _indent(raw) > open_indent
+        if _is_skippable(raw):
             continue
-        line = _dedash(lines[j])
+        line = _dedash(raw)
         ind = _indent(line)
         if open_indent is not None:
             if ind > open_indent:
@@ -2433,7 +2478,7 @@ def _in_block_scalar(lines, idx):
             open_indent = None
         if _BLOCK_SCALAR_OPEN_RE.match(line):
             open_indent = ind
-    return open_indent is not None and _indent(lines[idx]) > open_indent
+    return mask
 
 
 def _is_ref_input(lines, idx):
@@ -3669,6 +3714,182 @@ def check_dir(workflows_dir, exempt=KNOWN_EXEMPT, docs_dir=None):
     return errors, checked, exempt_ok, notices
 
 
+# A full git commit SHA — the only `uses:` ref this repo accepts (AGENTS.md).
+# Anchored whole: `@v7.0.0` and the 7-char short SHA a hand edit reaches for are
+# both rejected, and so is a 40-hex string with anything appended. Case is
+# tolerated because a SHA is a SHA; every pin here is lowercase, as `pinact`
+# writes them.
+_PIN_SHA_RE = re.compile(r"""^[0-9a-fA-F]{40}$""")
+
+# `uses:` as a block key — `uses: owner/repo@ref`, with or without the step's
+# `- ` marker, quoted or not. A whole-line comment (the commented-out caller
+# examples in every reusable's header block) never reaches this, because the
+# `#` sits where the pattern demands `uses`.
+_USES_BLOCK_RE = re.compile(r"""^\s*(?:-\s+)?(['"]?)uses\1\s*:(?P<value>.*)$""")
+
+# `uses:` inside a FLOW mapping — `steps: [{uses: owner/repo@ref, with: {…}}]`.
+# Same shape as `_REF_USE_FLOW_RE`: an entry runs to the next `,` or `}`. No
+# real workflow here is written this way, but the lint's own fixtures are, and
+# a spelling the guard cannot see is a spelling drift walks back in through.
+_USES_FLOW_RE = re.compile(r"""[{,]\s*(['"]?)uses\1\s*:(?P<value>[^,}]*)""")
+
+
+def _uses_value(raw):
+    """A `uses:` value with its comment and surrounding quotes removed."""
+    value = _strip_comment(raw).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        value = value[1:-1].strip()
+    return value
+
+
+def _unpinnable(value):
+    """Why `value` carries no pinnable commit SHA, or None when it must carry one.
+
+    Two `uses:` forms name no commit and so can never be SHA-pinned: a LOCAL
+    path (`./.github/actions/x`), which resolves inside the caller's own
+    already-pinned checkout, and a container image (`docker://…`), whose
+    immutability is a registry digest rather than a git ref. Returning a reason
+    rather than a bare False keeps the skip visible at the call site — the
+    "not applicable" / "I couldn't read this" distinction the module docstring
+    insists on, applied to the pin check.
+    """
+    if value.startswith("./") or value.startswith("../"):
+        return "a local path, resolved from the caller's own checkout"
+    if value.startswith("docker://"):
+        return "a container image, immutable by registry digest rather than git ref"
+    return None
+
+
+def action_pin_sites(lines):
+    """`(lineno, uses_value, sha)` for every `uses:` in `lines` that must be pinned.
+
+    `sha` is the 40-hex ref when the site IS pinned and None when it is not, so
+    a caller can count coverage as well as failures. 1-based line numbers, to
+    match every other reporter here.
+
+    An EMPTY `value` is the third state: a `uses:` whose value this walk cannot
+    read on its line, because it is written as a block scalar (`uses: >-`) or
+    carried on the line below. Reported rather than skipped, on the same rule
+    the module docstring sets for the parser above — "not applicable" and "I
+    could not read this" must never look the same, or a spelling nobody
+    anticipated drops out of coverage with CI still green.
+
+    Lines inside a `|`/`>` block scalar are skipped, which is the whole reason
+    this is not a `grep`. `test-workflow-pins.yml` writes fixture workflows out
+    of a `run: |` heredoc — deliberately unpinned, because their point is to be
+    rejected by the OTHER checks — and reading that literal text as workflow
+    structure would make this lint fail on its own test harness. `run:` bodies
+    across the repo print `uses:` lines for the same kind of reason.
+    """
+    in_scalar = _block_scalar_mask(lines)
+    for idx, line in enumerate(lines):
+        if _is_skippable(line) or in_scalar[idx]:
+            continue
+        m = _USES_BLOCK_RE.match(line)
+        if m:
+            if _BLOCK_SCALAR_OPEN_RE.match(_dedash(line)):
+                # `uses: >-` with the ref below it. The mask says this KEY line
+                # is not inside a scalar (it opens one), so it lands here.
+                yield idx + 1, "", None
+                continue
+            raws = [m.group("value")]
+        else:
+            raws = [f.group("value") for f in _USES_FLOW_RE.finditer(line)]
+        for raw in raws:
+            value = _uses_value(raw)
+            if not value:
+                yield idx + 1, "", None
+                continue
+            if _unpinnable(value):
+                continue
+            ref = value.rsplit("@", 1)[1] if "@" in value else ""
+            yield idx + 1, value, ref if _PIN_SHA_RE.match(ref) else None
+
+
+def check_action_pins(workflows_dir, exempt=KNOWN_UNPINNED):
+    """Returns (errors, pinned, exempt_ok) for the `uses:` SHA-pin check (BE-15255).
+
+    Deliberately its OWN walk rather than a fourth branch of `check_dir`:
+    `check_dir` returns early for any file that does not declare a
+    `workflows_ref` input, which is most of this directory — every `ci-*`,
+    `bump-*` and `test-*` caller, including the two files whose floating refs
+    prompted this check. A pin rule that only covered reusables would have
+    missed the exact drift it exists to catch.
+
+    `exempt` is the `KNOWN_UNPINNED` debt list; `exempt_ok` names the entries
+    that matched a real floating site this run, and an entry that matched
+    nothing is an error, so the list drains itself.
+    """
+    errors = []
+    pinned = 0
+    exempt_ok = []
+    seen_exempt = set()
+
+    names = sorted(
+        n
+        for n in os.listdir(workflows_dir)
+        if n.endswith((".yml", ".yaml")) and os.path.isfile(os.path.join(workflows_dir, n))
+    )
+    for name in names:
+        path = os.path.join(workflows_dir, name)
+        # Same untrusted-text handling as `check_dir`: these come from a
+        # directory listing and from file CONTENT, neither of which is ours.
+        ann_path = _ann_prop(path)
+        ann_name = _ann_msg(name)
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().split("\n")
+
+        for lineno, value, sha in action_pin_sites(lines):
+            if sha:
+                pinned += 1
+                continue
+            if not value:
+                # The walk found a `uses:` it could not read a ref out of. No
+                # exemption applies — there is no value to key one on, and the
+                # remedy is a one-line rewrite, not a carve-out.
+                errors.append(
+                    "::error file=%s,line=%d::%s writes a `uses:` whose value "
+                    "this lint cannot read on its own line — a block scalar "
+                    "(`uses: >-`) or a value carried on the line below. That "
+                    "spelling would leave the ref unchecked, so it is refused "
+                    "rather than skipped. Write the action inline: "
+                    "`uses: owner/action@<40-hex> # v1`. See BE-15255."
+                    % (ann_path, lineno, ann_name)
+                )
+                continue
+            entry = (name, value)
+            if entry in exempt:
+                seen_exempt.add(entry)
+                exempt_ok.append(entry)
+                continue
+            errors.append(
+                "::error file=%s,line=%d::%s pins `%s` by tag, not by commit "
+                "SHA. A tag is mutable by whoever owns the action, so the pin "
+                "proves nothing — and Dependabot only ever narrows a tag to "
+                "another tag, so this never converges on its own. Replace the "
+                "ref with the full 40-hex commit SHA and keep the version as a "
+                "trailing comment (`uses: owner/action@<40-hex> # v1`), the "
+                "spelling `pinact` and `zizmor` accept in consumer CI. See "
+                "AGENTS.md and BE-15255."
+                % (ann_path, lineno, ann_name, _ann_msg(value))
+            )
+
+    # An entry naming a site that is no longer floating — pinned, renamed,
+    # deleted, or (the one this check was written around) bumped to a different
+    # tag by Dependabot. Left alone it would silently pre-exempt whatever ref
+    # next takes that spelling.
+    for name, value in sorted(set(exempt) - seen_exempt):
+        errors.append(
+            "::error::%s no longer carries an unpinned `uses: %s` (pinned, "
+            "renamed, deleted, or bumped to another tag) — delete that entry "
+            "from KNOWN_UNPINNED in "
+            ".github/workflow-pins/check_workflow_pins.py"
+            % (_ann_msg(name), _ann_msg(value))
+        )
+
+    return errors, pinned, exempt_ok
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -3689,11 +3910,21 @@ def main(argv=None):
     exempt = KNOWN_EXEMPT if args.workflows_dir == DEFAULT_WORKFLOWS_DIR else frozenset()
     errors, checked, exempt_ok, notices = check_dir(args.workflows_dir, exempt=exempt)
 
+    # Same scoping, same reason (BE-15255): KNOWN_UNPINNED names sites in THIS
+    # repo's workflows dir, so against an ad-hoc --workflows-dir every entry
+    # would read as stale. The CHECK itself still runs there — a floating `uses:`
+    # is a floating `uses:` in any directory — only the debt list is scoped.
+    pin_exempt = KNOWN_UNPINNED if args.workflows_dir == DEFAULT_WORKFLOWS_DIR else frozenset()
+    pin_errors, pinned, pin_exempt_ok = check_action_pins(args.workflows_dir, exempt=pin_exempt)
+    errors = errors + pin_errors
+
     for name in checked:
         note = " (KNOWN_EXEMPT — tracked separately)" if name in exempt_ok else ""
         print("checked %s%s" % (name, note))
     if not checked:
         print("no reusable workflow declares a `%s` input" % INPUT_NAME)
+    for name, value in sorted(pin_exempt_ok):
+        print("unpinned %s: %s (KNOWN_UNPINNED — tracked separately)" % (name, value))
 
     # Ahead of the errors and OUTSIDE the exit-status logic (BE-9045): a
     # warning names coverage this run did not have, never a problem with the
@@ -3706,10 +3937,17 @@ def main(argv=None):
     if errors:
         print(
             "\n%d problem(s): a reusable workflow's `%s` input must have NO "
-            "default, and every job checking out at it must guard against an "
-            "empty value first." % (len(errors), INPUT_NAME)
+            "default, every job checking out at it must guard against an empty "
+            "value first, and every `uses:` must name a full commit SHA."
+            % (len(errors), INPUT_NAME)
         )
         return 1
+
+    # The pin half of the summary. Kept a separate sentence rather than folded
+    # into the lines below: it counts `uses:` SITES across EVERY workflow file,
+    # while those count the WORKFLOWS that declare `workflows_ref` — two
+    # different denominators, and running them together reads as one number.
+    pin_note = "\n%d `uses:` ref(s) SHA-pinned (%d exempt)." % (pinned, len(pin_exempt_ok))
 
     if notices:
         # Do NOT claim full coverage over a run that skipped jobs: the
@@ -3718,15 +3956,15 @@ def main(argv=None):
         print(
             "\nOK — %d workflow(s) declare `%s`, none with a default, every "
             "JUDGED ref checkout guarded (%d exempt); %d job(s) skipped the "
-            "dangling-ref check — see the warning(s) above."
-            % (len(checked), INPUT_NAME, len(exempt_ok), len(notices))
+            "dangling-ref check — see the warning(s) above.%s"
+            % (len(checked), INPUT_NAME, len(exempt_ok), len(notices), pin_note)
         )
         return 0
 
     print(
         "\nOK — %d workflow(s) declare `%s`, none with a default, every ref "
-        "checkout guarded (%d exempt)."
-        % (len(checked), INPUT_NAME, len(exempt_ok))
+        "checkout guarded (%d exempt).%s"
+        % (len(checked), INPUT_NAME, len(exempt_ok), pin_note)
     )
     return 0
 

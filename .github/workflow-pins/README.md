@@ -25,9 +25,15 @@ repo's own workflow files.
   reusables are documented on a differently-named page). Only the
   required-no-default direction is asserted, so an optional/auto-derived input
   like `groom.yml`'s `default: ''` is left alone.
+  Finally it (4) fails any `uses:` in `.github/workflows/` whose ref is not a
+  full 40-hex commit SHA — see [The `uses:` pin (BE-15255)](#the-uses-pin-be-15255)
+  below. Unlike (1)–(3) that half covers **every** workflow file, not just the
+  reusables: the `ci-*`, `bump-*` and `test-*` callers declare no
+  `workflows_ref` at all, and that is exactly where the floating refs were.
 - **`tests/`** — `unittest` suite, run by
-  [`test-workflow-pins.yml`](../workflows/test-workflow-pins.yml) along with a
-  CLI smoke test that a reintroduced default really exits non-zero.
+  [`test-workflow-pins.yml`](../workflows/test-workflow-pins.yml) along with CLI
+  smoke tests that a reintroduced default, an unguarded checkout and a
+  tag-pinned `uses:` really exit non-zero.
 
 ```bash
 python3 .github/workflow-pins/check_workflow_pins.py
@@ -568,3 +574,42 @@ all (renamed or deleted), the latter being
 the case that would otherwise silently pre-exempt whatever later reuses the
 filename. The list is only applied to this repo's own `.github/workflows`: run
 against an ad-hoc `--workflows-dir` every entry would look stale.
+
+## The `uses:` pin (BE-15255)
+
+AGENTS.md has always said "**Pin everything by full commit SHA**, with a
+trailing `# v1` comment — both the `uses:` in callers and every third-party
+action here. Bare `@v1` fails the pin-validation (`pinact`, `zizmor`) that
+consumer CI runs." Nothing enforced it, so two `actions/*` refs in
+`test-refresh-reviewers.yml` sat on major tags for months — and **drifted
+twice** while they did (`@v6` → `@v7` → `@v7.0.0`), because Dependabot only
+ever narrows a tag to another tag and never converts one to a SHA. A tag moves
+at the discretion of whoever owns the action, which is the same "the pin proves
+nothing" hole the checks above close, with a third party holding the pen.
+
+So every `uses:` under `.github/workflows/` must name a full 40-hex commit SHA.
+Two forms name no commit and are skipped rather than failed: a local path
+(`./.github/actions/x`, resolved inside the caller's own already-pinned
+checkout) and a container image (`docker://…`, pinned by registry digest). The
+version comment is convention, not lint — it is what makes a SHA readable, and
+the review that lands a bump is where it is kept honest.
+
+The walk reads both the block spelling (`- uses: owner/action@ref`) and the
+flow one (`steps: [{uses: owner/action@ref, …}]`), and skips anything inside a
+`|`/`>` **block scalar**. That last part is the whole reason this is not a
+`grep`: `test-workflow-pins.yml` writes its own fixture workflows out of a
+`run: |` heredoc, and reading that literal text as workflow structure would
+make the lint fail on its own test harness. Those fixtures are nonetheless
+SHA-pinned themselves, so that each smoke test fails for the one reason it
+tests rather than passing on a pin error it never meant to raise.
+
+`KNOWN_UNPINNED` is the debt list for this check, with the same self-draining
+contract as `KNOWN_EXEMPT`: an entry is a known debt, not a blessing, and a
+**stale** entry is an error. Entries are `(workflow filename, full `uses:`
+value)` pairs — the file alone would pre-exempt every other action in it, and
+the ref alone would pre-exempt the same floating ref wherever a later workflow
+copied it. Pinning the ref is not the only way an entry goes stale: Dependabot
+moving `@v6` to `@v7` retires the entry too, which is precisely how this debt
+stayed invisible. It is **empty today** — both refs it was written for were
+pinned in the change that added the check — and, like `KNOWN_EXEMPT`, it is
+only applied to this repo's own `.github/workflows`.
