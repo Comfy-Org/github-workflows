@@ -135,6 +135,25 @@ jobs:
             .github/workflows/pr-size.yml
             scripts/check-pr-size
             :(exclude)scripts/check-pr-size/*_test.go
+          # Every file whose ABSENCE breaks a pinned caller at run time. The
+          # directory above can never be the decommission probe on its own, and this
+          # tree survives differently from the rest of the fleet's: it holds no
+          # README.md and no `tests/`, so what keeps it resolving after main.go,
+          # size.go and go.mod are deleted is precisely the `*_test.go` pair the
+          # filter above deliberately excludes. Name the Go build inputs the
+          # "Build check-pr-size" step compiles instead — `go build .` needs every
+          # non-test source in the package, and go.mod is read twice (setup-go's
+          # go-version-file, then the build). The tests are NOT listed: no pinned
+          # caller ever runs `go test`, which is the whole reason for the exclusion
+          # above, and listing them would re-import the churn that exclusion removed.
+          # The scripts/check-pr-size lines are byte-identical to the ones in
+          # bump-cursor-review-callers.yml, which builds the same tool from the same
+          # pin — keep the two in step.
+          WATCHED_EXEC: |
+            .github/workflows/pr-size.yml
+            scripts/check-pr-size/go.mod
+            scripts/check-pr-size/main.go
+            scripts/check-pr-size/size.go
           # Read-only ambient token, for the owed-bump probe's `actions: read`
           # history lookup only (BE-10008). Never a write credential: the
           # Cloud Code Bot token is minted after — and only if — this step says

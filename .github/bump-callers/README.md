@@ -187,7 +187,7 @@ re-point that pins callers to the verified tip instead of a stale `github.sha`.
 | `WATCHED` | **required** — repo-relative path of the watched reusable workflow (e.g. `.github/workflows/groom.yml`) |
 | `WATCHED_ASSETS` | optional — the watched assets, a **newline-separated list** of literal paths, one per line (blank lines and surrounding whitespace ignored). A single-line value is just a one-element list, so `WATCHED_ASSETS: .github/groom` keeps working unchanged; a fleet watching more than one spells it as a YAML **literal** block scalar — `\|`, never the folded `>`, which joins the lines into one space-separated string (see below). Empty/unset means the fleet watches nothing beyond `WATCHED` |
 | `WATCHED_PATHSPECS` | optional — newline-separated git **pathspecs** (`:(exclude)` entries allowed) covering what the fleet's `paths:` filter watches. When set, they replace the `WATCHED`/`WATCHED_ASSETS` object comparison as the staleness test. Every positive entry must select a tracked path, and the list must select `WATCHED` **and something under every `WATCHED_ASSETS` entry**. Used by `pr-risk`, `pr-derisk`, `pr-size` and `cursor-review` |
-| `WATCHED_EXEC` | optional — newline-separated repo-relative **files** a pinned caller actually executes. When set, each is probed for deletion at the tip and — unless the run was re-pointed, which makes that tip the pin target — locally too, in addition to `WATCHED`/`WATCHED_ASSETS`. **Only `pr-risk` and `pr-derisk` need this today** |
+| `WATCHED_EXEC` | optional — newline-separated repo-relative **files** a pinned caller actually executes. When set, each is probed for deletion at the tip and — unless the run was re-pointed, which makes that tip the pin target — locally too, in addition to `WATCHED`/`WATCHED_ASSETS`. **Every fleet whose `WATCHED_ASSETS` entry is a DIRECTORY needs it** — that is all ten of the asset-watching fleets today; only the three that watch nothing beyond `WATCHED` (`assign-reviewers`, `auto-label`, `detect-unreviewed-merge`) leave it unset |
 | `NEW_SHA` | the candidate SHA, normally `github.sha` |
 | `GITHUB_SHA`, `GITHUB_OUTPUT` | provided by Actions |
 | `GITHUB_EVENT_NAME`, `GITHUB_EVENT_PATH`, `GITHUB_REPOSITORY`, `GITHUB_WORKFLOW_REF` | also provided by Actions to every step, no wiring needed — read only by the `Skip-caller-bump` gate and the owed-bump check below. Absent or unparseable is never an error; both fail open toward bumping |
@@ -402,8 +402,13 @@ the day it becomes true, so it cannot happen quietly.
 `WATCHED_EXEC`.** `pr-size` and `cursor-review` need the first (BE-7084): each
 excludes `scripts/check-pr-size/*_test.go`, since a pinned caller builds and runs
 that tool and never runs `go test`, so a test-only commit would otherwise mint a
-token and fan a pure-churn bump PR to every consumer. `pr-risk` needs both — and
-they are what let it move onto this script instead of keeping its own guard:
+token and fan a pure-churn bump PR to every consumer. The second is **not** a
+pr-risk speciality: *every* fleet whose `WATCHED_ASSETS` entry is a directory
+needs it, because a directory outlives the files inside it — all ten of the
+asset-watching fleets set it today, and only the three that watch nothing beyond
+`WATCHED` (`assign-reviewers`, `auto-label`, `detect-unreviewed-merge`) leave it
+unset. `pr-risk` needs both — and they are what let it move onto this script
+instead of keeping its own guard:
 
 - Its `paths:` filter negates `scripts/pr-risk/tests/**` and the tool README, and
   no object comparison can express a negation. `WATCHED_PATHSPECS` is handed
@@ -414,17 +419,40 @@ they are what let it move onto this script instead of keeping its own guard:
   nothing, or that never reaches `WATCHED` — is enforced rather than trusted (see
   the input rules above). It compares two trees and walks no history, so it
   composes with the deepening but does not need it.
-- Its decommission surface is the three grader scripts a caller executes, not the
-  directory holding them: a commit deleting the graders while leaving `tests/` and
-  the README behind satisfies a `-d scripts/pr-risk` probe and would bump every
-  caller onto a SHA where the tools are gone. `WATCHED_EXEC` names those files, and
-  they are probed at the tip (before the staleness test, so a deletion warns rather
-  than reading as "a newer commit has its own run") and again in this run's tree —
-  the latter only when the run was *not* re-pointed, since a re-point makes that
-  same tip the SHA callers are pinned to and this checkout no longer the thing
-  worth probing.
+- Its decommission surface is the grader scripts and data files a caller executes,
+  not the directory holding them: a commit deleting the graders while leaving
+  `tests/` and the README behind satisfies a `-d scripts/pr-risk` probe and would
+  bump every caller onto a SHA where the tools are gone. `WATCHED_EXEC` names those
+  files, and they are probed at the tip (before the staleness test, so a deletion
+  warns rather than reading as "a newer commit has its own run") and again in this
+  run's tree — the latter only when the run was *not* re-pointed, since a re-point
+  makes that same tip the SHA callers are pinned to and this checkout no longer the
+  thing worth probing.
 
-Every other fleet leaves both unset and behaves exactly as before.
+That second half generalises, and every asset-watching fleet now applies it. The
+survivors differ per tree but the hole is identical: `.github/groom`,
+`.github/cursor-review`, `.github/agents-md-integrity`, `.github/coderabbit-config`
+and `.github/public-repo-hygiene` are each kept alive by `tests/` and `README.md`,
+while `scripts/check-pr-size` has neither and is kept alive by the very
+`*_test.go` files the `pr-size` / `cursor-review` filters exclude. Two rules when
+you write one of these lists:
+
+- **The test is "absence breaks a pinned caller at run time", not "is it an
+  executable".** A prompt or brief a consumer loads from the pinned ref qualifies
+  (`prompt-judge.md`, `finder.md`), and so does a data file resolved beside the
+  script (`risk-map.v0.json`, `schema.v2.json`) or a manifest a step fails closed
+  on (`.github/groom/package.json`). A `README.md` and anything under `tests/` does
+  not.
+- **Do not list a file no pinned caller loads**, even one that lives in the watched
+  directory and is genuinely executed *here* — `catalog-drift.py`,
+  `schema_drift.py` and `wire-bot-identity.py` all run out of this repo's own
+  checkout. Listing one turns its retirement into a `::warning::` that freezes the
+  whole fleet: a false decommission, the mirror of the false-healthy bump the input
+  exists to stop. `bump-pr-derisk-callers.yml` records the same call for
+  `apply-risk-label.sh`.
+
+The three fleets that watch nothing beyond `WATCHED` leave both unset and behave
+exactly as before.
 
 Consumption is two steps — the guard, then the bump gated on its output:
 

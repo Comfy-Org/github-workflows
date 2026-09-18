@@ -158,6 +158,49 @@ jobs:
             .github/cursor-review
             scripts/check-pr-size
             :(exclude)scripts/check-pr-size/*_test.go
+          # Every file whose ABSENCE breaks a pinned caller at run time — not just
+          # the entry points, and NOT confined to one directory: a review run loads
+          # BOTH watched trees from the pinned ref. Neither directory can be the
+          # decommission probe on its own, and they survive differently:
+          # `.github/cursor-review` is kept alive by `tests/` and `README.md`, while
+          # `scripts/check-pr-size` holds no README and no `tests/` — there the
+          # survivors are the `*_test.go` files the filter above deliberately
+          # excludes, so deleting main.go/size.go/go.mod still leaves the directory
+          # resolving.
+          # The three prompts are listed because the test for inclusion is "absence
+          # breaks a pinned caller at run time", NOT "is it an executable": the panel
+          # splices prompt-adversarial.md / prompt-edge-case.md (the review_type
+          # matrix) and the judge splices prompt-judge.md, each read from
+          # $CURSOR_REVIEW_ASSETS. gate-unresolved.py is required even by a
+          # non-blocking caller — build-ledger.py imports it BY PATH at module load
+          # for CONSOLIDATED_MARKER — and slack-notify.sh is a caller-enabled path,
+          # listed for the same reason pr-risk lists apply-risk-label.sh. `go build .`
+          # compiles every non-test source in scripts/check-pr-size, and go.mod is
+          # read twice (setup-go's go-version-file, then the build).
+          # DELIBERATELY ABSENT: catalog-drift.py and wire-bot-identity.py. Neither is
+          # ever loaded from `workflows_ref` — catalog-drift.py belongs to this repo's
+          # weekly cursor-review-catalog-drift.yml, and wire-bot-identity.py is run by
+          # the BUMPER step below out of `github.workspace`. Listing either would let a
+          # file no review run touches freeze this fleet behind a `::warning::`, the
+          # false-decommission failure mode.
+          # The scripts/check-pr-size lines are byte-identical to the ones in
+          # bump-pr-size-callers.yml, which builds the same tool from the same pin —
+          # keep the two in step.
+          WATCHED_EXEC: |
+            .github/workflows/cursor-review.yml
+            .github/cursor-review/build-ledger.py
+            .github/cursor-review/fence-diff.py
+            .github/cursor-review/gate-unresolved.py
+            .github/cursor-review/install-cursor-cli.sh
+            .github/cursor-review/post-review.py
+            .github/cursor-review/review-output-mcp.py
+            .github/cursor-review/slack-notify.sh
+            .github/cursor-review/prompt-adversarial.md
+            .github/cursor-review/prompt-edge-case.md
+            .github/cursor-review/prompt-judge.md
+            scripts/check-pr-size/go.mod
+            scripts/check-pr-size/main.go
+            scripts/check-pr-size/size.go
           # Read-only ambient token, for the owed-bump probe's `actions: read`
           # history lookup only (BE-10008). Never a write credential: the
           # Cloud Code Bot token is minted after — and only if — this step says
