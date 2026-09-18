@@ -33,7 +33,7 @@ for t in <dir>/tests/*.sh; do bash "$t" || { echo "FAILED: $t"; break; }; done
 (cd scripts/check-pr-size && [ -z "$(gofmt -l .)" ] && go vet ./... && go test ./...)
 
 # Repo-wide lints that take a target rather than a suite:
-python3 .github/workflow-pins/check_workflow_pins.py   # no reusable may default `workflows_ref`
+python3 .github/workflow-pins/check_workflow_pins.py   # `workflows_ref` + every `uses:` SHA
 python3 .github/agents-md-integrity/check_agents_md.py --root .
 ```
 
@@ -48,8 +48,8 @@ anything there; `.github/workflows/` and `scripts/check-pr-size/` are the except
   multi-model panel + judge). `catalog-drift.py` reads the model pins *out of*
   `cursor-review.yml` — never duplicate that model list.
 - `.github/agents-md-integrity/` + `.github/workflow-pins/` — the two self-checks:
-  this AGENTS.md standard, and the lint forbidding a `default:` on
-  `workflows_ref` / requiring the empty-ref guard at every checkout.
+  this AGENTS.md standard, and the lint forbidding a `default:` on `workflows_ref`,
+  requiring the empty-ref guard at every checkout, and SHA-pinning every `uses:`.
 - `.github/public-repo-hygiene/` — the leak checker + the org-wide known-public
   allowlist it default-denies against. Never make that allowlist a workflow input:
   one a caller can pass is one a PR in that repo can widen.
@@ -93,9 +93,10 @@ a second catalog drifts, and this one already had. Three facts it cannot tell yo
   not variables (BE-6472): a variable passed via a step's `env:` prints unmasked in
   the env dump Actions emits *before* the step, too early for the bumper's masking.
   Keep private repo paths and detail out of workflow files, commits, and PR text.
-- **Pin everything by full commit SHA**, with a trailing `# v1` comment — both the
-  `uses:` in callers and every third-party action here. Bare `@v1` fails the
-  pin-validation (`pinact`, `zizmor`) that consumer CI runs.
+- **Pin everything by full commit SHA**, with a trailing `# v1` comment — callers'
+  `uses:` and every third-party action here. Bare `@v1` fails the pin-validation
+  (`pinact`, `zizmor`) consumers run and `check_workflow_pins.py` here (BE-15255);
+  Dependabot only ever narrows a tag to a tag, so it never fixes one for you.
 - **`workflows_ref` is REQUIRED, never given a `default:`** (BE-5546) — a default
   lets a caller SHA-pin `uses:` yet load mutable scripts, and `required:` is
   unenforced for `workflow_call` (omitted → `''` → checkout takes the default
