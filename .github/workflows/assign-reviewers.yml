@@ -28,9 +28,11 @@ name: Assign Reviewers (reusable)
 #       reviewers:
 #         - carol
 #
-# Both flow (`[a, b]`) and block (`- a`) sequences are accepted. The config is
-# read from the PR base SHA, so proposed routing edits cannot select their
-# own owners before the edits have been reviewed.
+# Both flow (`[a, b]`) and block (`- a`) sequences are accepted. A duplicate
+# top-level key is last-wins with a warning, a `#` opens a comment only at the
+# start of a line or after a space or a tab, and one leading BOM is tolerated.
+# The config is read from the PR base SHA, so proposed routing edits cannot
+# select their own owners before the edits have been reviewed.
 #
 # AUTHOR SCOPING: vars.REVIEWER_AUTHOR_ALLOWLIST, when set, restricts routing to
 # that list of PR authors and skips everyone else. It is the opt-in alternative to
@@ -439,7 +441,11 @@ jobs:
                   const ch = s[i];
                   if (ch === "'" && !inD) inS = !inS;
                   else if (ch === '"' && !inS) inD = !inD;
-                  else if (ch === '#' && !inS && !inD && (i === 0 || /\s/.test(s[i - 1]))) return s.slice(0, i);
+                  // YAML starts a comment at `#` only at column 0 or after s-white — a SPACE
+                  // or a TAB, nothing else. `/\s/` was wider on the JS side and `isspace()`
+                  // wider (differently) on the Python side, so the two ports disagreed on
+                  // U+0085, U+001C and U+FEFF; both now spell out the two characters.
+                  else if (ch === '#' && !inS && !inD && (i === 0 || s[i - 1] === ' ' || s[i - 1] === '\t')) return s.slice(0, i);
                 }
                 return s;
               };
@@ -466,16 +472,29 @@ jobs:
                 return inner.split(',').map((x) => unquote(x)).filter((x) => x.length > 0);
               };
               const indentOf = (l) => l.match(/^ */)[0].length;
-              const lines = text.split(/\r?\n/).map(stripComment);
+              // A single leading U+FEFF is legal YAML and must not become part of the first
+              // key. `trim()` below already tolerated it here; the Python port's `strip()`
+              // did not, so the strip is spelled out on both sides rather than left to a
+              // whitespace definition the two languages disagree about.
+              const lines = text.replace(/^\uFEFF/, '').split(/\r?\n/).map(stripComment);
               let i = 0;
+              let seenDefaultPool = false;
               while (i < lines.length) {
                 const raw = lines[i];
                 if (!raw.trim()) { i++; continue; }
                 const line = raw.trim();
                 if (indentOf(raw) === 0 && line.startsWith('default_pool:')) {
+                  // YAML requires unique keys; PyYAML's de-facto last-wins is the reference.
+                  // Warn, never reject — routing must not hard-fail on a malformed map — and
+                  // reset rather than accumulate, so the block form replaces like the flow
+                  // form already did. The flag (not `out.default_pool.length`) is what keeps
+                  // the warning firing for an empty first list, matching the Python port.
+                  if (seenDefaultPool) core.warning('reviewers.yml: duplicate top-level `default_pool:` key — last one wins');
+                  seenDefaultPool = true;
                   const rest = line.slice('default_pool:'.length).trim();
                   const flow = parseFlow(rest);
                   if (flow) { out.default_pool = flow; i++; continue; }
+                  out.default_pool = [];
                   i++;
                   while (i < lines.length) {
                     const r = lines[i];

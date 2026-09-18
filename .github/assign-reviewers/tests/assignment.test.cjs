@@ -63,7 +63,15 @@ const runScript = new AsyncFunction('github', 'context', 'core', 'process', 'req
 // design, so they take the sentinel and indent checks but not the whole-scalar bracket check;
 // their origin offset keeps reported line numbers absolute in assign-reviewers.yml.
 const SCRIPT_ORIGIN = {file: 'assign-reviewers.yml', offset: scriptSpan.begin + 1};
-const helpers = new Function(`${region(script, 'glob-matcher', SCRIPT_ORIGIN)}\n${region(script, 'config-parser', SCRIPT_ORIGIN)}\nreturn {globToRegExp, matchesAny, parseReviewerConfig};`)();
+// `core` is ambient inside a github-script step but NOT inside this `new Function` scope, so the
+// extracted region has to be handed one. It is a real capture, not a silencer: `parseReviewerConfig`
+// calls `core.warning` on a duplicate top-level `default_pool:`, and `helperWarnings` is what lets a
+// test assert that warning fires. Leave it out and the region throws ReferenceError on that path —
+// which is a REAL failure mode of the shipped script too, so extend the stub rather than the sentinels
+// whenever the parser reaches for another `core` method.
+const helperWarnings = [];
+const helperCore = {warning: (message) => helperWarnings.push(message), info: () => {}};
+const helpers = new Function('core', `${region(script, 'glob-matcher', SCRIPT_ORIGIN)}\n${region(script, 'config-parser', SCRIPT_ORIGIN)}\nreturn {globToRegExp, matchesAny, parseReviewerConfig};`)(helperCore);
 const corpus = JSON.parse(readFileSync(resolve(__dirname, '../parser-corpus.json'), 'utf8'));
 const file = (filename) => ({filename, changes: 10});
 const approval = (login, state = 'APPROVED', type = 'User') => ({user: {login, type}, state, author_association: 'MEMBER'});
@@ -381,6 +389,29 @@ for (const {name, text, expected} of corpus.configs) {
     assert.deepEqual(helpers.parseReviewerConfig(text), expected);
   });
 }
+// The corpus compares parsed CONFIGS, which is deliberately silent about the duplicate-key warning
+// — the Python port prints its own `::warning::` line instead, so the text cannot live in the shared
+// fixture. Each side therefore asserts its own channel; last-wins itself stays corpus-pinned above.
+test('a duplicate top-level default_pool: warns once, naming the key', () => {
+  helperWarnings.length = 0;
+  assert.deepEqual(helpers.parseReviewerConfig('default_pool: [alice]\ndefault_pool:\n  - bob\n').default_pool, ['bob']);
+  assert.equal(helperWarnings.length, 1);
+  assert.match(helperWarnings[0], /duplicate top-level `default_pool:` key/);
+});
+test('an empty first default_pool: still warns on the duplicate', () => {
+  // Keyed on "the key was seen", not on "the list is non-empty" — an emptiness test would make the
+  // JS warn where the Python port (which keys on its own seen-flag) does not.
+  helperWarnings.length = 0;
+  assert.deepEqual(helpers.parseReviewerConfig('default_pool: []\ndefault_pool: [bob]\n').default_pool, ['bob']);
+  assert.equal(helperWarnings.length, 1);
+});
+test('a single default_pool: is silent, however it is written', () => {
+  helperWarnings.length = 0;
+  for (const text of ['default_pool: [alice]\n', 'default_pool:\n  - alice\n', 'rules:\n  - reviewers: [a]\n', '  default_pool: [indented]\ndefault_pool: [alice]\n']) {
+    helpers.parseReviewerConfig(text);
+  }
+  assert.deepEqual(helperWarnings, []);
+});
 for (const {glob, cases} of corpus.globs) {
   test(`corpus glob — ${glob}`, () => {
     for (const {path, matches} of cases) {

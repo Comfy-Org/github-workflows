@@ -51,6 +51,17 @@ Add parser cases **to the corpus**, not as an inline literal in either suite —
 a case only one implementation ever sees proves nothing about the other, which
 is how the two live divergences reached `main`.
 
+Three dialect rules the corpus now pins on both sides, because each was a place
+the ports read the same bytes differently: a **duplicate top-level key is
+last-wins** (the second `default_pool:` replaces the first — the block arm used
+to *append* on the JS side — and each port warns rather than rejecting); a **`#`
+opens a comment only at column 0 or after a space or a tab**, the two characters
+spelled out rather than delegated to `/\s/` and `isspace()`, which disagree about
+U+0085, U+001C and U+FEFF; and a **single leading U+FEFF is stripped from the
+document**, which `trim()` did for free and `strip()` did not. The warning text
+is the one part not corpus-pinned — the channels differ (`core.warning` vs a
+`::warning::` line) — so each suite asserts its own.
+
 The [caller guide](../../docs/callers/assign-reviewers.md) documents the ranking,
 evidence limits, failure handling, and configuration. Keep behavior there rather
 than maintaining another algorithm description here.

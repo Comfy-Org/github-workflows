@@ -15,7 +15,9 @@ implementations is asserted by an executable corpus rather than by a comment.
 Run: python3 -m unittest discover -s .github/refresh-reviewers/tests -p 'test_*.py' -v
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -401,6 +403,63 @@ class TestSurgicalRewrite(unittest.TestCase):
         pool = gen.select_default_pool({"DrJKL": 9.0, "b": 5.0}, [], {"drjkl"})
         self.assertEqual(pool, ["b"])
 
+    def test_bom_flow_default_pool_rewrite_keeps_the_bom(self):
+        # `parse_reviewer_config` strips a leading U+FEFF so the first key is
+        # recognised; `rewrite_config` deliberately does NOT, because its
+        # contract is byte-faithfulness. Dropping one character off the head of
+        # line 0 changes no line INDEX, and `_rewrite_flow_line` locates the
+        # bracket span WITHIN the line, so the BOM survives the rewrite in
+        # place — this pins that the two halves stay compatible.
+        cfg = "﻿default_pool: [old-a]  # keep small\nrules:\n  - paths: [\"x/**\"]\n    reviewers: [r1]\n"
+        config, locs = gen.parse_reviewer_config(cfg)
+        self.assertEqual(config["default_pool"], ["old-a"])
+        out = gen.rewrite_config(cfg, locs, {}, ["new-a", "new-b"])
+        self.assertTrue(out.startswith("﻿"), "the rewrite dropped the BOM")
+        self.assertIn("﻿default_pool: [new-a, new-b]  # keep small\n", out)
+        self.assertEqual(out.split("\n")[1:], cfg.split("\n")[1:])
+
+
+class TestDuplicateDefaultPool(unittest.TestCase):
+    """Last-wins plus a warning, never a rejection.
+
+    The parsed result is pinned language-neutrally by the shared corpus; the
+    warning cannot be, because each port emits on its own channel (`::warning::`
+    here, `core.warning` in the JS step), so each side asserts its own.
+    """
+
+    def parse(self, text):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            config, locs = gen.parse_reviewer_config(text)
+        return config, locs, buf.getvalue()
+
+    def test_duplicate_warns_once_and_last_wins(self):
+        config, _locs, out = self.parse("default_pool: [alice]\ndefault_pool:\n  - bob\n")
+        self.assertEqual(config["default_pool"], ["bob"])
+        self.assertEqual(out.count("::warning::"), 1)
+        self.assertIn("duplicate top-level default_pool: key", out)
+
+    def test_empty_first_list_still_warns(self):
+        # Keyed on "the key was seen", not on "the list is non-empty" — an
+        # emptiness test would make this port silent where the JS one warns.
+        _config, _locs, out = self.parse("default_pool: []\ndefault_pool: [bob]\n")
+        self.assertEqual(out.count("::warning::"), 1)
+
+    def test_single_or_indented_default_pool_is_silent(self):
+        for text in ("default_pool: [alice]\n",
+                     "default_pool:\n  - alice\n",
+                     "rules:\n  - reviewers: [a]\n",
+                     "  default_pool: [indented]\ndefault_pool: [alice]\n"):
+            with self.subTest(text=text):
+                self.assertNotIn("::warning::", self.parse(text)[2])
+
+    def test_locs_still_point_at_a_rewritable_list(self):
+        # last-wins is a PARSE rule; the rewrite must stay coherent with it.
+        cfg = "default_pool: [alice]\ndefault_pool:\n  - bob\n"
+        _config, locs, _out = self.parse(cfg)
+        out = gen.rewrite_config(cfg, locs, {}, ["carol"])
+        self.assertEqual(out, "default_pool: [alice]\ndefault_pool:\n  - carol\n")
+
 
 class TestEnvKnobs(unittest.TestCase):
     def _with_env(self, value, default=90):
@@ -525,7 +584,11 @@ class TestSharedParserCorpus(unittest.TestCase):
     def test_config_cases(self):
         for case in self.corpus["configs"]:
             with self.subTest(case["name"]):
-                config, _locations = gen.parse_reviewer_config(case["text"])
+                # stdout is swallowed only so the duplicate-key cases do not
+                # emit `::warning::` annotations from a passing test job; the
+                # warning itself is asserted by TestDuplicateDefaultPool.
+                with contextlib.redirect_stdout(io.StringIO()):
+                    config, _locations = gen.parse_reviewer_config(case["text"])
                 self.assertEqual(config, case["expected"])
 
     def test_glob_cases(self):

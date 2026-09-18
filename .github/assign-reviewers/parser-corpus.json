@@ -14,6 +14,8 @@
     "(config, locations) and only the config half is compared here, because `locations` has no JS",
     "counterpart and stays covered by test_generate.py's own rewrite tests.",
     "`globs[].cases[]` are path/verdict pairs for the glob->RegExp translator.",
+    "Characters that would be invisible or ambiguous in this file (U+FEFF, U+0085, U+001C) are",
+    "written as JSON \\u escapes on purpose — keep them escaped rather than pasting the literal.",
     "",
     "Both path filters (test-assign-reviewers.yml, test-refresh-reviewers.yml) watch this file, so",
     "editing it runs both suites — a corpus tweak that only satisfies one port cannot land green."
@@ -137,6 +139,100 @@
         "rules": [
           {"paths": ["a/**"], "reviewers": ["bob"]}
         ]
+      }
+    },
+    {
+      "name": "duplicate default_pool, flow then block",
+      "why": "YAML requires unique keys and both ports take PyYAML's de-facto last-wins, so the block form must REPLACE the flow list instead of appending to it",
+      "text": "default_pool: [alice]\ndefault_pool:\n  - bob\n",
+      "expected": {
+        "default_pool": ["bob"],
+        "rules": []
+      }
+    },
+    {
+      "name": "duplicate default_pool, block then flow",
+      "why": "last-wins in the other order; the flow arm always replaced, and this pins that it keeps doing so",
+      "text": "default_pool:\n  - alice\ndefault_pool: [bob]\n",
+      "expected": {
+        "default_pool": ["bob"],
+        "rules": []
+      }
+    },
+    {
+      "name": "duplicate default_pool, second one empty",
+      "why": "last-wins means an empty second key EMPTIES the pool, and the `rules:` after it still parses",
+      "text": "default_pool: [alice]\ndefault_pool:\nrules:\n  - paths: [a]\n    reviewers: [b]\n",
+      "expected": {
+        "default_pool": [],
+        "rules": [
+          {"paths": ["a"], "reviewers": ["b"]}
+        ]
+      }
+    },
+    {
+      "name": "leading BOM before the first key",
+      "why": "a leading U+FEFF is legal YAML; JS trim() tolerated it and Python strip() did not, so the BOM is now stripped from the document on both sides",
+      "text": "\ufeffdefault_pool: [alice]\nrules:\n  - paths: [\"src/**\"]\n    reviewers: [bob]\n",
+      "expected": {
+        "default_pool": ["alice"],
+        "rules": [
+          {"paths": ["src/**"], "reviewers": ["bob"]}
+        ]
+      }
+    },
+    {
+      "name": "leading BOM before a comment line",
+      "why": "the BOM strip and the space-or-tab comment rule must agree on the commonest BOM document of all, one that opens with a header comment",
+      "text": "\ufeff# hdr\ndefault_pool: [alice]\n",
+      "expected": {
+        "default_pool": ["alice"],
+        "rules": []
+      }
+    },
+    {
+      "name": "U+0085 before # is not a comment",
+      "why": "NEL is isspace() in Python but not /\\s/ in JS, so the ports disagreed until both required a space or a tab",
+      "text": "default_pool: [x\u0085#c, y]\n",
+      "expected": {
+        "default_pool": ["x\u0085#c", "y"],
+        "rules": []
+      }
+    },
+    {
+      "name": "U+FEFF before # is not a comment",
+      "why": "the mirror image: U+FEFF is /\\s/ in JS but not isspace() in Python; only a MID-document BOM reaches this test, the leading one is stripped first",
+      "text": "default_pool: [x\ufeff#c, y]\n",
+      "expected": {
+        "default_pool": ["x\ufeff#c", "y"],
+        "rules": []
+      }
+    },
+    {
+      "name": "U+001C before # is not a comment",
+      "why": "FILE SEPARATOR is isspace() in Python but not /\\s/ in JS, the same disagreement as U+0085 from a different character class",
+      "text": "default_pool: [x\u001c#c, y]\n",
+      "expected": {
+        "default_pool": ["x\u001c#c", "y"],
+        "rules": []
+      }
+    },
+    {
+      "name": "tab before # starts a comment",
+      "why": "s-white is space OR tab, so narrowing the rule must not drop the tab half",
+      "text": "default_pool: [x\t#c, y]\n",
+      "expected": {
+        "default_pool": ["x"],
+        "rules": []
+      }
+    },
+    {
+      "name": "space before # starts a comment",
+      "why": "the other half of s-white, pinned beside the tab so neither can be narrowed away",
+      "text": "default_pool: [x #c, y]\n",
+      "expected": {
+        "default_pool": ["x"],
+        "rules": []
       }
     }
   ],

@@ -157,7 +157,11 @@ def _strip_comment(s):
             in_s = not in_s
         elif ch == '"' and not in_s:
             in_d = not in_d
-        elif ch == "#" and not in_s and not in_d and (i == 0 or s[i - 1].isspace()):
+        # YAML starts a comment at `#` only at column 0 or after s-white — a SPACE
+        # or a TAB, nothing else. `isspace()` was wider here and `/\s/` wider
+        # (differently) in the JS port, so the two disagreed on U+0085, U+001C and
+        # U+FEFF; both now spell out the two characters. Pinned by the corpus.
+        elif ch == "#" and not in_s and not in_d and (i == 0 or s[i - 1] in " \t"):
             return s[:i]
     return s
 
@@ -190,11 +194,19 @@ def parse_reviewer_config(text):
     locations = {"default_pool": loc-or-None,
                  "rules": [loc-or-None, ...]}        (reviewers-list positions)
     """
-    raw_lines = text.split("\n")
+    # A single leading U+FEFF is legal YAML and must not become part of the first
+    # key; `strip()` does not treat it as whitespace, so the first `default_pool:`
+    # of a BOM-prefixed document used to be skipped here while the JS port (whose
+    # `trim()` does strip it) parsed the same bytes fine. Dropping one character
+    # from the head of line 0 leaves every line INDEX untouched, so `locs` — and
+    # the byte-faithful `rewrite_config`, which keeps the BOM by splitting `text`
+    # itself — are unaffected.
+    raw_lines = text.removeprefix("\ufeff").split("\n")
     lines = [_strip_comment(l) for l in raw_lines]
     config = {"default_pool": [], "rules": []}
     locs = {"default_pool": None, "rules": []}
 
+    seen_default_pool = False
     i = 0
     n = len(lines)
     while i < n:
@@ -204,6 +216,15 @@ def parse_reviewer_config(text):
             i += 1
             continue
         if _indent_of(raw) == 0 and line.startswith("default_pool:"):
+            # YAML requires unique keys; PyYAML's de-facto last-wins is the
+            # reference. Warn, never reject — the drift generator must not
+            # hard-fail on a malformed map. Both the flow and the block arm below
+            # already REPLACE `config["default_pool"]`, so last-wins needs no
+            # further work here; `locs` likewise keeps tracking the last
+            # occurrence that carried items.
+            if seen_default_pool:
+                print("::warning::duplicate top-level default_pool: key — last one wins")
+            seen_default_pool = True
             rest = line[len("default_pool:"):].strip()
             flow = _parse_flow(rest)
             if flow is not None:
