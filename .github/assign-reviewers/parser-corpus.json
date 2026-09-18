@@ -210,14 +210,15 @@
     },
     {
       "glob": "docs/?.md",
-      "why": "? is exactly one non-slash Unicode character — a code POINT, not a UTF-16 code unit",
+      "why": "? is exactly one non-slash Unicode character — a code POINT, not a UTF-16 code unit. The non-ASCII paths stay \\u-escaped for the same reason U+2028/U+2029 are below: a `path` is semantics, and a literal here would silently depend on this file staying NFC — an editor or tool that normalizes to NFD rewrites the precomposed case into two code points and flips its expectation in both ports. The surrogate-pair escape decodes to ONE code point under both json.loads and JSON.parse, which is the `u` flag's whole point: it is two UTF-16 code units. The decomposed case pins that `?` counts CODE POINTS, not grapheme clusters — `e` + U+0301 is two, so it takes two `?`.",
       "cases": [
         {"path": "docs/a.md", "matches": true},
         {"path": "docs/ab.md", "matches": false},
         {"path": "docs/.md", "matches": false},
         {"path": "docs//.md", "matches": false},
-        {"path": "docs/😀.md", "matches": true},
-        {"path": "docs/é.md", "matches": true}
+        {"path": "docs/\ud83d\ude00.md", "matches": true},
+        {"path": "docs/\u00e9.md", "matches": true},
+        {"path": "docs/e\u0301.md", "matches": false}
       ]
     },
     {
@@ -268,7 +269,7 @@
       "glob": "**/x?",
       "why": "? is one code point (the `u` flag), and it matches a line terminator like any other character",
       "cases": [
-        {"path": "a/b/x😀", "matches": true},
+        {"path": "a/b/x\ud83d\ude00", "matches": true},
         {"path": "x\n", "matches": true}
       ]
     }

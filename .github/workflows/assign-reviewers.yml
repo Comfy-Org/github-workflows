@@ -311,11 +311,20 @@ jobs:
             //
             // Flags (`su`) and the `^...$` anchors are the semantics, not polish,
             // and .github/refresh-reviewers/generate.py's glob_to_regexp carries
-            // the same three:
+            // the same three — but SPELLS two of them differently, so port the
+            // INTENT, never the characters:
             //   * FULL-STRING anchored — no `m`, so `^`/`$` are the ends of the
-            //     path, never the ends of a line inside it.
+            //     path, never the ends of a line inside it. That reasoning is
+            //     JS-ONLY: Python's `$` matches just before a single trailing
+            //     newline even WITHOUT re.MULTILINE, so the port anchors with
+            //     `\Z` instead. Writing `$` on the Python side compiles, reads
+            //     as parity, and silently reintroduces the exact divergence
+            //     this pairing removes (the corpus's `src/a.js` case pins it).
             //   * `s` — `**` (and the `.` it compiles to) spans EVERY character,
-            //     line terminators included (`\n`, `\r`, U+2028, U+2029).
+            //     line terminators included (`\n`, `\r`, U+2028, U+2029). The
+            //     port spells this one re.DOTALL, and it is NOT a no-op there:
+            //     U+2028/U+2029 are line terminators to a JS RegExp but ordinary
+            //     characters to Python's `.`, so the flags converge them.
             //   * `u` — `?` is one Unicode CODE POINT, so an astral path
             //     character (an emoji) counts once rather than as its two UTF-16
             //     surrogate halves. Every escape this emits (`.+^${}()|[]\/`) is
