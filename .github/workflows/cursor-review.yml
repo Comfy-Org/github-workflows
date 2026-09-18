@@ -592,6 +592,13 @@ jobs:
       status: ${{ steps.build.outputs.status || steps.fallback.outputs.status }}
       rounds: ${{ steps.build.outputs.rounds || steps.fallback.outputs.rounds }}
       last_reviewed_sha: ${{ steps.build.outputs.last_reviewed_sha }}
+      # The merge base the LAST round recorded in its own review (BE-15598), read back
+      # out of the round sentinel. The `incremental` step in `diff-size` builds its OLD
+      # patch against exactly this commit, and skips the block outright when it is empty
+      # — there is no fallback to the current base, which is what made a retargeted PR
+      # drop hunks the panel had never seen. Like `last_reviewed_sha` this has no
+      # fallback-step reading: a degraded ledger legitimately records nothing.
+      last_reviewed_merge_base: ${{ steps.build.outputs.last_reviewed_merge_base }}
     steps:
       - name: Resolve the asset ref
         # This job must never fail (see the job comment), so the fail-closed
@@ -764,6 +771,14 @@ jobs:
       # should report. Written with `!= 'false'` rather than read straight
       # through so the skipped-step empty string reads as `true`, not `''`.
       incremental_subset: ${{ steps.incremental.outputs.incremental_subset != 'false' }}
+      # The merge base THIS round's reviewed diff was taken against — the exact left
+      # tree `check-pr-size` resolves `BASE_SHA...HEAD_SHA` to. Consumed by `post-review`
+      # (BE-15598), which writes it into the consolidated review's round sentinel so the
+      # NEXT round can rebuild "what the panel already saw" against this tree rather than
+      # recomputing a merge base from a base that may have moved since (a retarget, a
+      # base-branch rewrite). Empty when git could not resolve it, which the next round
+      # reads as "no recorded merge base" and fails closed to no incremental block.
+      merge_base_sha: ${{ steps.merge_base.outputs.merge_base_sha }}
     steps:
       - name: Checkout PR head
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -798,6 +813,39 @@ jobs:
           if ! printf '%s' "$REF" | grep -Eq '^[0-9a-f]{40}$'; then
             echo "::warning::workflows_ref '$REF' is not a full 40-hex commit SHA — branch and tag refs are mutable and can skew between jobs mid-run"
           fi
+
+      - name: Resolve this round's merge base
+        # Recorded in the consolidated review by `post-review`, and read back by the
+        # NEXT round to pin the OLD side of its incremental block (BE-15598). Plain
+        # shell rather than a check-pr-size output on purpose: the tool does resolve
+        # the same commit internally, but it is skipped entirely on the degraded
+        # raw-numstat fallback path, and a round that records no merge base costs the
+        # NEXT round its whole incremental block. This step runs on both paths.
+        #
+        # Best-effort by construction — it must never fail the job. `git merge-base`
+        # exits non-zero when the two commits share no history (an unrelated-histories
+        # base, a base ref the fetch-depth:0 checkout still cannot see), and there is
+        # nothing to do about that except record nothing and say so.
+        id: merge_base
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        #
+        # No line-break guard on the value, unlike `resolveMergeBase` in
+        # scripts/check-pr-size/main.go, which rejects a result containing \r or \n. The
+        # divergence is deliberate, not an oversight: `git merge-base` with two commits
+        # and no --all prints exactly ONE line, and `$( )` strips every trailing newline
+        # off it, so there is no value this step can emit that the Go check would refuse.
+        # post-review.py's `field()` re-validates the shape before it reaches the
+        # sentinel besides, and build-ledger.py's `_FULL_SHA_RE` again on the way back.
+        run: |
+          MERGE_BASE="$(git merge-base "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || true)"
+          if [ -n "$MERGE_BASE" ]; then
+            echo "Round merge base: ${MERGE_BASE}"
+          else
+            echo "::warning::Could not resolve the merge base of ${BASE_SHA} and ${HEAD_SHA} — this round records none, so the next round will skip its incremental diff block rather than diff against the wrong tree."
+          fi
+          echo "merge_base_sha=${MERGE_BASE}" >> "$GITHUB_OUTPUT"
 
       - name: Load check-pr-size tool
         # The SAME classifier the PR-size cap uses — the single source of truth
@@ -985,20 +1033,41 @@ jobs:
         # file the classifier stripped from the reviewed diff can never reappear
         # in the block (which would trip the fail-safe and discard the lot).
         #
-        # The two patches can resolve to DIFFERENT merge bases — OLD to
-        # merge-base(BASE, LAST), NEW to merge-base(BASE, HEAD) — when the round
-        # merged or rebased the base branch in. A file the base branch AND the
-        # branch both touched then reads as changed even if the author's own
-        # edit did not move. That is over-inclusion strictly WITHIN the PR's own
-        # files, which costs a little prompt budget and never breaks the subset
-        # property; the alternative (pinning both to one merge base) would hide
-        # a hunk whose surrounding code really did change under it.
+        # Each patch is pinned to the merge base ITS OWN round used: OLD to the one
+        # round N recorded in its review's round sentinel, NEW (via check-pr-size) to
+        # merge-base(BASE, HEAD) for this round. Recomputing OLD's from the CURRENT
+        # base is the bug BE-15598 fixes — after a retarget or a base-branch rewrite
+        # `BASE...LAST_REVIEWED` diffs against a merge base round N never used, so
+        # hunks the panel has never seen read as "already reviewed" and are dropped
+        # from the block. The subset fail-safe cannot catch that: a block that is too
+        # SMALL is still a subset. With no recorded merge base there is no honest
+        # answer, so the step emits no block at all rather than guessing one.
+        #
+        # KNOWN, and not fixed here: on the retarget path this pin exists FOR, the two
+        # merge bases can be nearly disjoint, so almost nothing in NEW is in OLD and the
+        # block comes out close to the full reviewed diff — which the prompt then carries
+        # twice. `check` cannot catch it (`foreign == 0` and `new_lines <= full_lines`
+        # both hold), because the block really is a faithful subset; it is just a useless
+        # one. The cost is prompt budget on an uncommon path, never coverage, and the
+        # alternative — declining a block whose length approaches `full_lines` — needs a
+        # threshold nothing here has grounds to pick yet. Left as a known waste rather
+        # than guessed at.
+        #
+        # The two merge bases still differ whenever the base branch was merged in
+        # between rounds. A file the base branch AND the branch both touched then reads
+        # as changed even if the author's own edit did not move. That is over-inclusion
+        # strictly WITHIN the PR's own files, which costs a little prompt budget and
+        # never breaks the subset property; it is the accepted direction, because the
+        # alternative hides a hunk whose surrounding code really did change under it.
         id: incremental
         if: steps.check.outputs.over_cap != 'true'
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           LAST_REVIEWED_SHA: ${{ needs.ledger.outputs.last_reviewed_sha }}
+          # The merge base round N recorded, NOT this round's — see above. Empty for
+          # every round reviewed before the round sentinel existed, and for one whose
+          # sentinel did not parse or did not name the reviewed commit.
+          LAST_REVIEWED_MERGE_BASE: ${{ needs.ledger.outputs.last_reviewed_merge_base }}
           LEDGER_ROUNDS: ${{ needs.ledger.outputs.rounds }}
         run: |
           NEW_PATCH="${RUNNER_TEMP}/pr-diff-new.patch"
@@ -1010,7 +1079,7 @@ jobs:
           INCREMENTAL_PY="_pr_size_tool/.github/cursor-review/incremental-diff.py"
           : > "$NEW_PATCH"
           # An OLD patch larger than this is declined rather than parsed. NEW is
-          # bounded by diff_size_cap; OLD is NOT — `git diff BASE...LAST` keeps
+          # bounded by diff_size_cap; OLD is NOT — the last-reviewed patch keeps
           # the generated-file sections the classifier strips out of the
           # reviewed diff, and those cost nothing against that cap — so a PR
           # comfortably under the review cap can still hand this step a patch
@@ -1025,10 +1094,15 @@ jobs:
             # non-ASCII path arrives C-quoted here and PLAIN there, so the two
             # sides key differently and every such file is re-emitted in full on
             # every round — including a pure rebase.
+            # TWO-DOT, against the RECORDED merge base: that commit is the exact left
+            # tree round N diffed, so this is the same two-tree diff its own
+            # `mergeBase...head` resolved to — and check-pr-size builds NEW the same
+            # way. Three dots here would re-resolve a merge base from a ref that has
+            # already moved, which is precisely the bug (BE-15598).
             # $DIFF_EXCLUDES is intentionally unquoted so bash word-splits it
             # into pathspec args.
             # shellcheck disable=SC2086
-            git -c core.quotePath=false diff "${BASE_SHA}...${LAST_REVIEWED_SHA}" -- . $DIFF_EXCLUDES > "$OLD_PATCH"
+            git -c core.quotePath=false diff "${LAST_REVIEWED_MERGE_BASE}" "${LAST_REVIEWED_SHA}" -- . $DIFF_EXCLUDES > "$OLD_PATCH"
           }
           # Default the output to the honest "nothing was discarded" value, and
           # let the fail-safe below append 'false' over it — same last-value-wins
@@ -1042,6 +1116,22 @@ jobs:
             echo "No usable last-reviewed SHA — skipping the incremental diff block."
           elif ! git cat-file -e "${LAST_REVIEWED_SHA}^{commit}" 2>/dev/null; then
             echo "Last-reviewed SHA ${LAST_REVIEWED_SHA} is unreachable (force-push or base-branch rewrite) — skipping the incremental diff block."
+          elif [ -z "$LAST_REVIEWED_MERGE_BASE" ]; then
+            # Fail CLOSED, and do NOT fall back to ${BASE_SHA}: that fallback IS the bug
+            # (BE-15598). Every live PR sees this once after rollout — the round it is
+            # comparing against was posted before the sentinel existed — and then the
+            # block comes back on the round after, which is the first one with a
+            # recorded merge base to pin to.
+            echo "No recorded merge base for round ${LEDGER_ROUNDS:-?} (reviewed before the round sentinel existed, or the sentinel did not parse) — skipping the incremental diff block."
+          elif ! git cat-file -e "${LAST_REVIEWED_MERGE_BASE}^{commit}" 2>/dev/null \
+               || ! git merge-base --is-ancestor "$LAST_REVIEWED_MERGE_BASE" "$LAST_REVIEWED_SHA" 2>/dev/null; then
+            # The recorded commit has to be reachable in THIS checkout and has to still
+            # be an ancestor of the commit it was the merge base of. A base-branch
+            # rewrite can drop the commit entirely, and a rewritten PR branch can leave
+            # it reachable but no longer in the last-reviewed commit's history — in
+            # which case `git diff <merge base> <last reviewed>` succeeds and returns
+            # something that is not "what round N saw" at all.
+            echo "Recorded merge base ${LAST_REVIEWED_MERGE_BASE} is unreachable or not an ancestor of the last-reviewed commit ${LAST_REVIEWED_SHA} — skipping the incremental diff block."
           elif [ ! -s "$FULL_PATCH" ]; then
             echo "The reviewed diff is empty — skipping the incremental diff block."
           elif ! build_old_patch || [ ! -s "$OLD_PATCH" ]; then
@@ -1051,9 +1141,9 @@ jobs:
             # doubled prompt that prioritizes nothing, which the fail-safe
             # below cannot catch either (nothing is foreign, and new_lines
             # EQUALS full_lines rather than exceeding it). An empty OLD is not
-            # an error git reports — it is simply what `BASE...LAST` yields
-            # whenever merge-base(BASE, LAST) is LAST itself (the base advanced
-            # past the last-reviewed commit, e.g. after a retarget), or
+            # an error git reports — it is simply what the recorded merge base
+            # against the last-reviewed commit yields whenever round N's own
+            # patch was empty (the recorded merge base IS that commit), or
             # whenever $DIFF_EXCLUDES filters every file out.
             echo "Could not build a non-empty last-reviewed patch (${LAST_REVIEWED_SHA}) — skipping the incremental diff block."
           elif [ "$(wc -c < "$OLD_PATCH")" -gt "$OLD_PATCH_MAX_BYTES" ]; then
@@ -2310,7 +2400,11 @@ jobs:
     # checkout, and the diff comes from the `pr-diff` artifact `diff-size`
     # published rather than from the copy the judge job had shell access to.
     name: Post review
-    needs: [consolidate, ledger]
+    # `diff-size` for its `merge_base_sha` alone (BE-15598) — the round sentinel this
+    # job writes has to record the merge base THIS round's reviewed diff was taken
+    # against. Already a transitive dependency (consolidate → review → diff-size), so
+    # this adds no ordering, only the outputs.
+    needs: [consolidate, ledger, diff-size]
     # `!cancelled()` rather than `always()`, for the same reason
     # `over-cap-comment` documents at its own `if:`: the documented caller sets
     # `cancel-in-progress: true`, and `always()` runs a job even when the RUN is
@@ -2540,6 +2634,12 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # The two halves of the round sentinel post-review.py writes under the review
+          # header (BE-15598). BASE_SHA is diagnostic; MERGE_BASE_SHA is the one the
+          # NEXT round pins its "already reviewed" patch to, and an empty value is
+          # recorded as empty so that round skips its block rather than guessing.
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          MERGE_BASE_SHA: ${{ needs.diff-size.outputs.merge_base_sha }}
           TRIGGERED_BY: ${{ steps.meta.outputs.triggered_by }}
           JUDGE_STATUS: ${{ steps.meta.outputs.judge_status }}
           CONSOLIDATED_COUNT: ${{ steps.meta.outputs.consolidated_count }}
@@ -2629,6 +2729,8 @@ jobs:
               --pr-number "$PR_NUMBER" \
               --repo "$REPO" \
               --commit-sha "$HEAD_SHA" \
+              --base-sha "$BASE_SHA" \
+              --merge-base-sha "$MERGE_BASE_SHA" \
               --triggered-by "$TRIGGERED_BY" \
               --diff /tmp/pr-diff.patch \
               "${LEDGER_FLAGS[@]}" \
@@ -2647,6 +2749,8 @@ jobs:
               --pr-number "$PR_NUMBER" \
               --repo "$REPO" \
               --commit-sha "$HEAD_SHA" \
+              --base-sha "$BASE_SHA" \
+              --merge-base-sha "$MERGE_BASE_SHA" \
               --triggered-by "$TRIGGERED_BY" \
               --diff /tmp/pr-diff.patch \
               "${LEDGER_FLAGS[@]}" \
@@ -2672,6 +2776,8 @@ jobs:
               --pr-number "$PR_NUMBER" \
               --repo "$REPO" \
               --commit-sha "$HEAD_SHA" \
+              --base-sha "$BASE_SHA" \
+              --merge-base-sha "$MERGE_BASE_SHA" \
               --triggered-by "$TRIGGERED_BY" \
               "${LEDGER_FLAGS[@]}" \
               --ledger-note "$LEDGER_NOTE" \

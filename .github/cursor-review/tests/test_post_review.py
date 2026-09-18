@@ -103,6 +103,7 @@ def visible(body):
         for ln in body.splitlines()
         if not ln.startswith(f"<!-- {PR.BODY_ONLY_SENTINEL_PREFIX} ")
         and not ln.startswith(f"<!-- {PR.BODY_ONLY_TRUNCATED_PREFIX} ")
+        and not ln.startswith(f"<!-- {PR.ROUND_SENTINEL_PREFIX} ")
     )
 
 # Two files, so a per-file anchor set has something to be wrong about. `app.py` has two
@@ -235,7 +236,7 @@ class EndToEndPostTest(unittest.TestCase):
     def run_main(self, findings, with_diff=True, post_returncode=0, stderr="", summaries=None,
                  panel=None, existing_reviews=None, list_returncode=0, list_calls=None,
                  outputs=None, notes=None, raw_stdout=_UNSET, extra_argv=(),
-                 post_stdout="", sleeps=None, trace=None):
+                 post_stdout="", sleeps=None, trace=None, commit_sha="deadbeef"):
         """Return the POSTed payloads. Pass `summaries` (a list) to collect step-summary
         writes, or `panel` to control the panel summary — the one finding-INDEPENDENT
         part of the review head that a caller can make large.
@@ -263,6 +264,10 @@ class EndToEndPostTest(unittest.TestCase):
 
         `extra_argv` appends to the command line, for the head-shaping options
         (`--notice`, `--triggered-by`, `--ledger-note`) a case needs to vary.
+
+        `commit_sha` is the reviewed head. It defaults to the short, non-hex `deadbeef`
+        every pre-existing case here assumed; the round-sentinel cases (BE-15598) pass a
+        real 40-hex SHA, because the writer records anything else as the empty string.
 
         `list_calls`, `outputs` and `notes` are optional out-parameters: the calls the
         list read received, the parsed $GITHUB_OUTPUT, and the `note=` each
@@ -342,7 +347,7 @@ class EndToEndPostTest(unittest.TestCase):
                 "--findings", fpath,
                 "--pr-number", "1",
                 "--repo", "o/r",
-                "--commit-sha", "deadbeef",
+                "--commit-sha", commit_sha,
             ]
             if with_diff:
                 dpath = os.path.join(d, "pr-diff.patch")
@@ -5126,3 +5131,264 @@ class LedgerFlagWiringTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+HEAD_40 = "a" * 40
+BASE_40 = "b" * 40
+MERGE_BASE_40 = "c" * 40
+
+
+class RoundSentinelTest(EndToEndPostTest):
+    """The round sentinel: what this round reviewed, and what it diffed against (BE-15598).
+
+    The ledger already records WHICH commit the last round reviewed. Without what it
+    diffed that commit AGAINST, the next round rebuilds the "already reviewed" side from
+    the CURRENT base — and after a retarget or a base-branch rewrite that is a different
+    merge base, so hunks the panel never saw read as already reviewed and are dropped
+    from the incremental block. The subset fail-safe cannot catch a block that is merely
+    too small, so the record has to be written down at the time.
+
+    Subclasses EndToEndPostTest for its stubbed-`gh` harness; the cases below are the
+    only ones that pass a real 40-hex `commit_sha`.
+    """
+
+    ARGV = ["--base-sha", BASE_40, "--merge-base-sha", MERGE_BASE_40]
+
+    def _sentinel_line(self, body):
+        lines = [
+            ln for ln in body.splitlines()
+            if ln.startswith(f"<!-- {PR.ROUND_SENTINEL_PREFIX} ")
+        ]
+        self.assertEqual(len(lines), 1, f"exactly one round sentinel, got {len(lines)}")
+        return lines[0]
+
+    def _payload(self, body):
+        line = self._sentinel_line(body)
+        return json.loads(line[len("<!-- ") + len(PR.ROUND_SENTINEL_PREFIX) : -len(" -->")])
+
+    def _assert_directly_under_the_header(self, body):
+        lines = body.splitlines()
+        self.assertTrue(
+            lines[0].startswith("## 🔍 Cursor Review — Consolidated panel"),
+            f"the header is still the first line: {lines[0]!r}",
+        )
+        self.assertEqual(
+            lines[1], self._sentinel_line(body),
+            "the sentinel is the SECOND line — the clamp cuts the tail, so this height "
+            "is what makes it survive every cut that leaves a body at all",
+        )
+
+    # -- the three success bodies ------------------------------------------- #
+
+    def test_the_findings_body_carries_it_directly_under_the_header(self):
+        payload = self.run_main(
+            [finding("app.py", 11)], commit_sha=HEAD_40, extra_argv=self.ARGV
+        )[0]
+        self._assert_directly_under_the_header(payload["body"])
+        self.assertEqual(
+            self._payload(payload["body"]),
+            {"base": BASE_40, "head": HEAD_40, "merge_base": MERGE_BASE_40},
+        )
+
+    def test_the_no_findings_body_carries_it(self):
+        payload = self.run_main([], commit_sha=HEAD_40, extra_argv=self.ARGV)[0]
+        self.assertIn("✅ No high-signal findings.", payload["body"])
+        self._assert_directly_under_the_header(payload["body"])
+
+    def test_the_wholesale_fallback_body_carries_it_too(self):
+        posted = self.run_main(
+            [finding("app.py", 11), finding("app.py", 999)],
+            commit_sha=HEAD_40,
+            extra_argv=self.ARGV,
+            post_returncode=1,
+            stderr="gh: Unprocessable Entity (HTTP 422)",
+        )
+        self.assertEqual(len(posted), 2)
+        self._assert_directly_under_the_header(posted[1]["body"])
+
+    # -- and the two bodies that must NOT ----------------------------------- #
+
+    def test_the_error_review_body_carries_no_sentinel(self):
+        """A round that failed reviewed nothing, so it has nothing to record about
+        what it diffed. build-ledger.py refuses the error-review shape outright, so a
+        sentinel there could only ever mislead a human reading the raw body."""
+        posted = self.run_main(
+            [],
+            commit_sha=HEAD_40,
+            extra_argv=self.ARGV + ["--error-message", "judge exploded"],
+        )
+        self.assertEqual(len(posted), 1)
+        self.assertIn("⚠️ **Review failed**", posted[0]["body"])
+        self.assertNotIn(PR.ROUND_SENTINEL_PREFIX, posted[0]["body"])
+
+    def test_the_all_panel_cells_failed_body_carries_no_sentinel_either(self):
+        """Same rule, and the case the error review does NOT cover: every reviewer
+        errored, so this round judged nothing — but the body carries no "Review failed"
+        heading, so build-ledger.py's reader-side refusal does not reach it. Withholding
+        the sentinel at the WRITER is therefore the only control, and without it the next
+        round would rebuild its "already reviewed" side from a panel that never ran and
+        subtract hunks nobody looked at. It is posted with `delivers=False` for the very
+        same reason."""
+        posted = self.run_main(
+            [],
+            commit_sha=HEAD_40,
+            extra_argv=self.ARGV,
+            panel=[{"model": "m", "review_type": "adversarial", "status": "error"}],
+        )
+        self.assertEqual(len(posted), 1)
+        self.assertIn("Panel did not produce any findings", posted[0]["body"])
+        self.assertNotIn(PR.ROUND_SENTINEL_PREFIX, posted[0]["body"])
+        self.assertNotIn(BL.ERROR_REVIEW_MARKER, posted[0]["body"],
+                         "and the reader-side refusal genuinely does not cover it")
+        # Driven through the REAL parser, not a copy: it is still a round, so
+        # `last_reviewed_sha` advances — and it records no merge base, so the next
+        # round fails closed to "no incremental block" rather than to a bad one.
+        ledger = BL.build_ledger(
+            [{"id": 101, "state": "COMMENTED", "commit_id": HEAD_40,
+              "submitted_at": "2026-07-01T00:00:00Z", "body": posted[0]["body"],
+              "user": {"login": "github-actions[bot]", "type": "Bot"}}],
+            [], [],
+        )
+        self.assertEqual(ledger["last_reviewed_sha"], HEAD_40)
+        self.assertEqual(ledger["last_reviewed_merge_base"], "")
+
+    # -- the banners still render, and still render BELOW it ---------------- #
+
+    def test_the_notice_and_ledger_banners_still_follow_it(self):
+        payload = self.run_main(
+            [finding("app.py", 11)],
+            commit_sha=HEAD_40,
+            extra_argv=self.ARGV + [
+                "--triggered-by", "someone",
+                "--notice", "judge degraded",
+                "--ledger-note", "Round 2 — ledger: 1 entry",
+            ],
+        )[0]
+        body = payload["body"]
+        self.assertIn("_Triggered by @someone._", body)
+        self.assertLess(
+            body.index("_Triggered by @someone._"),
+            body.index(PR.ROUND_SENTINEL_PREFIX),
+            "attribution is part of the header line block, so it precedes the sentinel",
+        )
+        for banner in ("judge degraded", "Round 2 — ledger: 1 entry"):
+            self.assertGreater(
+                body.index(banner), body.index(PR.ROUND_SENTINEL_PREFIX),
+                f"{banner!r} renders below the sentinel, as the header comment says",
+            )
+
+    # -- SHA validation ------------------------------------------------------ #
+
+    def test_every_field_must_be_a_full_lowercase_hex_sha(self):
+        for bad in ("deadbeef", "A" * 40, "x" * 40, "a" * 39, "a" * 41, "", None,
+                    "  " + "a" * 40 + "  "):
+            with self.subTest(bad=bad):
+                rendered = PR.render_round_sentinel(bad, bad, bad)
+                payload = json.loads(
+                    rendered[len("<!-- ") + len(PR.ROUND_SENTINEL_PREFIX) : -len(" -->")]
+                )
+                expected = "a" * 40 if bad and bad.strip() == "a" * 40 else ""
+                self.assertEqual(
+                    payload, {"base": expected, "head": expected, "merge_base": expected}
+                )
+
+    def test_an_unresolvable_merge_base_is_recorded_as_empty_not_dropped(self):
+        """Fail closed, and be legible about it: a sentinel that PARSES and carries no
+        merge base is what makes the next round skip its block. A missing KEY would be
+        indistinguishable from a body this writer never wrote."""
+        payload = self.run_main(
+            [finding("app.py", 11)],
+            commit_sha=HEAD_40,
+            extra_argv=["--base-sha", BASE_40, "--merge-base-sha", ""],
+        )[0]
+        self.assertEqual(
+            self._payload(payload["body"]),
+            {"base": BASE_40, "head": HEAD_40, "merge_base": ""},
+        )
+
+    def test_the_payload_is_one_line_with_sorted_keys(self):
+        rendered = PR.render_round_sentinel(HEAD_40, BASE_40, MERGE_BASE_40)
+        self.assertNotIn("\n", rendered)
+        self.assertEqual(
+            rendered,
+            '<!-- cursor-review:round v1 '
+            f'{{"base":"{BASE_40}","head":"{HEAD_40}","merge_base":"{MERGE_BASE_40}"}} -->',
+        )
+
+    # -- containment --------------------------------------------------------- #
+
+    def test_the_defang_breaks_a_round_sentinel_in_imported_text(self):
+        forged = PR.render_round_sentinel(HEAD_40, BASE_40, MERGE_BASE_40)
+        defanged = PR.defang_body_only_contract(forged)
+        self.assertNotIn(PR.ROUND_SENTINEL_PREFIX, defanged)
+        self.assertIn("cursor-review:​round v1", defanged)
+        self.assertIsNone(BL._parse_round_sentinel(defanged))
+
+    def test_an_error_message_cannot_smuggle_a_parseable_round_sentinel(self):
+        """The error review is the one consolidated body whose imported text sits at
+        column 0 — it renders inside a FENCE, not a blockquote — so the writer-side
+        defang is what covers it."""
+        forged = PR.render_round_sentinel(HEAD_40, BASE_40, MERGE_BASE_40)
+        posted = self.run_main(
+            [],
+            commit_sha=HEAD_40,
+            extra_argv=self.ARGV + ["--error-message", f"boom\n{forged}\nmore"],
+        )
+        self.assertNotIn(PR.ROUND_SENTINEL_PREFIX, posted[0]["body"])
+        self.assertIn(MERGE_BASE_40, posted[0]["body"], "the text is reported, not deleted")
+        self.assertIsNone(BL._parse_round_sentinel(posted[0]["body"]))
+
+    def test_a_finding_body_quoting_one_cannot_forge_it(self):
+        forged = PR.render_round_sentinel(HEAD_40, "d" * 40, "e" * 40)
+        payload = self.run_main(
+            [finding("app.py", 11, body=f"the PR contains\n{forged}\nliterally")],
+            commit_sha=HEAD_40,
+            extra_argv=self.ARGV,
+        )[0]
+        # Exactly one sentinel — ours — and it still names OUR merge base.
+        self.assertEqual(
+            self._payload(payload["body"])["merge_base"],
+            MERGE_BASE_40,
+            "the quoted copy did not become the sentinel",
+        )
+        parsed = BL._parse_round_sentinel(payload["body"])
+        self.assertEqual(parsed["merge_base"], MERGE_BASE_40)
+
+    # -- the clamp ----------------------------------------------------------- #
+
+    def test_the_sentinel_survives_the_size_clamp(self):
+        """`clamp_review_body` cuts the TAIL and the sentinel sits on line two, so it
+        is never what a cut takes — which is the whole reason for that placement."""
+        # Unanchorable on purpose: they are demoted into the BODY, which is the only
+        # way one round's prose reaches the size limit at all.
+        findings = [
+            finding("elsewhere.py", 100 + i, body="x" * 900) for i in range(200)
+        ]
+        payload = self.run_main(findings, commit_sha=HEAD_40, extra_argv=self.ARGV)[0]
+        body = payload["body"]
+        self.assertIn("truncated here", body, "the clamp really did fire")
+        self.assertEqual(len(body), PR.MAX_REVIEW_BODY_CHARS)
+        self._assert_directly_under_the_header(body)
+        self.assertEqual(
+            BL._parse_round_sentinel(body),
+            {"base": BASE_40, "head": HEAD_40, "merge_base": MERGE_BASE_40},
+        )
+
+    def test_a_clamped_body_still_hands_the_next_round_its_merge_base(self):
+        """End to end through the real reader, not just the regex."""
+        payload = self.run_main(
+            [finding("elsewhere.py", 100 + i, body="y" * 900) for i in range(200)],
+            commit_sha=HEAD_40,
+            extra_argv=self.ARGV,
+        )[0]
+        review = {
+            "id": 7,
+            "state": "COMMENTED",
+            "commit_id": HEAD_40,
+            "submitted_at": "2026-09-01T00:00:00Z",
+            "body": payload["body"],
+            "user": {"login": "github-actions[bot]", "type": "Bot"},
+        }
+        ledger = BL.build_ledger([review], [], [])
+        self.assertEqual(ledger["last_reviewed_merge_base"], MERGE_BASE_40)
+        self.assertEqual(ledger["last_reviewed_base_sha"], BASE_40)

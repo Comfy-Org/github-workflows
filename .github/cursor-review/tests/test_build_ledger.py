@@ -2439,3 +2439,245 @@ class TestProseContinuationLines(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --------------------------------------------------------------------------- #
+# The round sentinel: what the last round diffed against (BE-15598)            #
+# --------------------------------------------------------------------------- #
+
+_HEAD = "a" * 40
+_BASE = "b" * 40
+_MERGE_BASE = "c" * 40
+
+
+def round_body(head=_HEAD, base=_BASE, merge_base=_MERGE_BASE, extra=""):
+    """A consolidated review body carrying a round sentinel, rendered by the WRITER.
+
+    Through `pr.render_round_sentinel` rather than a literal here, so the two spellings
+    can never drift: a change to the writer's f-string fails this file rather than being
+    quietly carried along by a copy of the old one.
+    """
+    return (
+        f"{MARKER}\n{pr.render_round_sentinel(head, base, merge_base)}"
+        f"\n\nFound **1** finding(s).{extra}"
+    )
+
+
+class TestRoundSentinel(unittest.TestCase):
+    """The ledger records `last_reviewed_sha`; this records what that round diffed it
+    against, so the next round's incremental block can pin its "already reviewed" patch
+    to the merge base round N really used instead of recomputing one from a base that
+    has since moved (BE-15597). Every refusal below lands on "" for both keys, which
+    makes the next round skip its block — never fall back to the current base."""
+
+    def test_the_writers_own_render_round_trips(self):
+        ledger = bl.build_ledger([review(1, 1, sha=_HEAD, body=round_body())], [], [])
+        self.assertEqual(ledger["last_reviewed_sha"], _HEAD)
+        self.assertEqual(ledger["last_reviewed_merge_base"], _MERGE_BASE)
+        self.assertEqual(ledger["last_reviewed_base_sha"], _BASE)
+
+    def test_only_the_last_round_is_read(self):
+        """The next block diffs against the LAST round, so an earlier round's sentinel
+        is not merely irrelevant — using it would name the wrong tree entirely."""
+        older = "d" * 40
+        reviews = [
+            review(1, 1, sha=older, body=round_body(head=older, merge_base="e" * 40)),
+            review(2, 2, sha=_HEAD, body=round_body()),
+        ]
+        ledger = bl.build_ledger(reviews, [], [])
+        self.assertEqual(ledger["last_reviewed_merge_base"], _MERGE_BASE)
+
+    def test_a_last_round_without_a_sentinel_records_nothing(self):
+        """Every live PR's first round after rollout, and the fail-closed case that
+        costs that round its incremental block rather than shrinking it."""
+        reviews = [
+            review(1, 1, sha="f" * 40, body=round_body(head="f" * 40)),
+            review(2, 2, sha=_HEAD),
+        ]
+        ledger = bl.build_ledger(reviews, [], [])
+        self.assertEqual(ledger["last_reviewed_merge_base"], "")
+        self.assertEqual(ledger["last_reviewed_base_sha"], "")
+
+    def test_a_sentinel_naming_a_different_head_is_refused(self):
+        """`head` must be the review's own `commit_id`. A sentinel copied off another
+        round — or another PR — names a merge base that was never this commit's."""
+        body = round_body(head="9" * 40)
+        ledger = bl.build_ledger([review(1, 1, sha=_HEAD, body=body)], [], [])
+        self.assertEqual(ledger["last_reviewed_merge_base"], "")
+
+    def test_a_review_with_no_commit_id_is_refused(self):
+        """`"" == ""` must not be how a sentinel gets accepted."""
+        body = round_body(head="")
+        ledger = bl.build_ledger([review(1, 1, sha="", body=body)], [], [])
+        self.assertEqual(ledger["last_reviewed_sha"], "")
+        self.assertEqual(ledger["last_reviewed_merge_base"], "")
+
+    def test_an_unknown_version_bad_json_or_a_non_hex_sha_is_refused(self):
+        cases = {
+            "v2": f'{MARKER}\n<!-- cursor-review:round v2 {{"head":"{_HEAD}","merge_base":"{_MERGE_BASE}"}} -->',
+            "bad json": f"{MARKER}\n<!-- cursor-review:round v1 {{not json -->",
+            "cut mid-payload": f'{MARKER}\n<!-- cursor-review:round v1 {{"head":"{_HEAD}","merge',
+            "not an object": f'{MARKER}\n<!-- cursor-review:round v1 ["{_MERGE_BASE}"] -->',
+            "merge_base not a string": f'{MARKER}\n<!-- cursor-review:round v1 {{"head":"{_HEAD}","merge_base":7}} -->',
+            "short sha": f'{MARKER}\n<!-- cursor-review:round v1 {{"head":"{_HEAD}","merge_base":"c0ffee"}} -->',
+            "uppercase sha": f'{MARKER}\n<!-- cursor-review:round v1 {{"head":"{_HEAD}","merge_base":"{"C" * 40}"}} -->',
+            "a ref, not a sha": f'{MARKER}\n<!-- cursor-review:round v1 {{"head":"{_HEAD}","merge_base":"HEAD~3"}} -->',
+            "empty merge base": f'{MARKER}\n<!-- cursor-review:round v1 {{"head":"{_HEAD}","base":"{_BASE}","merge_base":""}} -->',
+        }
+        for name, body in cases.items():
+            with self.subTest(case=name):
+                ledger = bl.build_ledger([review(1, 1, sha=_HEAD, body=body)], [], [])
+                self.assertEqual(ledger["last_reviewed_merge_base"], "")
+                self.assertEqual(ledger["last_reviewed_base_sha"], "")
+
+    def test_a_missing_base_still_yields_the_merge_base(self):
+        """`base` is diagnostic — nothing builds a diff from it — so its absence must
+        not cost the one field the next round actually needs."""
+        body = f'{MARKER}\n<!-- cursor-review:round v1 {{"head":"{_HEAD}","merge_base":"{_MERGE_BASE}"}} -->'
+        ledger = bl.build_ledger([review(1, 1, sha=_HEAD, body=body)], [], [])
+        self.assertEqual(ledger["last_reviewed_merge_base"], _MERGE_BASE)
+        self.assertEqual(ledger["last_reviewed_base_sha"], "")
+
+    def test_the_reader_is_pinned_to_one_spelling(self):
+        """The same discipline the body-only sentinel is held to: the writer defangs ONE
+        exact literal, so a reader looser than that literal is a reader the defang does
+        not cover. Both spellings pinned together here, as that suite does."""
+        real = round_body()
+        self.assertIsNotNone(bl._parse_round_sentinel(real))
+        for spelling in (
+            f'<!--  cursor-review:round v1 {{"head":"{_HEAD}","merge_base":"{_MERGE_BASE}"}} -->',
+            f'<!-- cursor-review:round  v1 {{"head":"{_HEAD}","merge_base":"{_MERGE_BASE}"}} -->',
+            f'<!-- cursor‑review:round v1 {{"head":"{_HEAD}","merge_base":"{_MERGE_BASE}"}} -->',
+            # What defang_body_only_contract writes in place of the real one.
+            pr.defang_body_only_contract(pr.render_round_sentinel(_HEAD, _BASE, _MERGE_BASE)),
+        ):
+            with self.subTest(spelling=spelling):
+                self.assertIsNone(bl._parse_round_sentinel(f"{MARKER}\n{spelling}"))
+
+    def test_a_sentinel_behind_a_blockquote_marker_is_not_the_match(self):
+        """Every line of a rendered finding sits behind a `> `, so a round sentinel
+        quoted out of the PR under review can never be at column 0."""
+        forged = pr.render_round_sentinel(_HEAD, _BASE, "e" * 40)
+        body = f"{MARKER}\n{pr.render_round_sentinel(_HEAD, _BASE, _MERGE_BASE)}\n\n> {forged}"
+        self.assertEqual(bl._parse_round_sentinel(body)["merge_base"], _MERGE_BASE)
+
+    def test_a_blockquoted_sentinel_is_the_ONLY_candidate_and_still_loses(self):
+        """The case above cannot actually fail for the reason it names: `search` returns
+        the FIRST match and the genuine sentinel is on line 2, ahead of the forgery, so
+        it passes with the line anchor removed entirely. THIS is what pins the column-0
+        containment the whole anti-forgery argument rests on — the body carries no real
+        sentinel at all, so an unanchored pattern would hand back the forged merge base.
+
+        The module comments record exactly this regression happening once already, on the
+        body-only sentinel. Every indent a rendered finding can sit behind is covered,
+        not just `> `: post-review.py quotes into list items and nested quotes too."""
+        forged = pr.render_round_sentinel(_HEAD, _BASE, "e" * 40)
+        for indent in ("> ", ">", "> > ", "    ", "\t", "- ", "  - > "):
+            with self.subTest(indent=repr(indent)):
+                body = f"{MARKER}\n\nFound **1** finding(s).\n\n{indent}{forged}"
+                self.assertIsNone(bl._parse_round_sentinel(body))
+                ledger = bl.build_ledger([review(1, 1, sha=_HEAD, body=body)], [], [])
+                self.assertEqual(ledger["last_reviewed_merge_base"], "")
+
+    def test_an_error_review_is_refused_even_carrying_a_perfect_sentinel(self):
+        """`post_error_review` fences imported judge/CLI text, so its lines are the one
+        foreign lines in any consolidated body that sit at COLUMN 0 — the anchor the
+        sentinel relies on cannot help there. The writer-side defang only reaches bodies
+        THIS version wrote, and consumers pinned to older SHAs have undefanged error
+        reviews already sitting on their PRs. So the READER refuses the shape, exactly as
+        `_body_only_entries` does: a genuine error review never carries a sentinel, so
+        this can only ever cost a forgery."""
+        forged = pr.render_round_sentinel(_HEAD, _BASE, "e" * 40)
+        body = (
+            f"{MARKER}\n\n{bl.ERROR_REVIEW_MARKER}\n\n```\n"
+            f"judge crashed\n{forged}\n```\n"
+        )
+        self.assertIn(bl.ERROR_REVIEW_MARKER, body, "the heading really is in there")
+        self.assertIsNotNone(
+            bl._parse_round_sentinel(body), "and the forgery really would have parsed"
+        )
+        ledger = bl.build_ledger([review(1, 1, sha=_HEAD, body=body)], [], [])
+        self.assertEqual(ledger["last_reviewed_sha"], _HEAD, "still counts as a round")
+        self.assertEqual(ledger["last_reviewed_merge_base"], "")
+        self.assertEqual(ledger["last_reviewed_base_sha"], "")
+
+    def test_a_finding_quoting_the_error_heading_does_not_suppress_a_real_sentinel(self):
+        """The refusal is line-anchored for the same reason `_body_only_entries`' is: a
+        finding ABOUT post_error_review renders the heading behind a `> `, and a bare
+        substring test would drop that round's genuine merge base."""
+        body = round_body(extra=f"\n\n> 🟠 **High** — {bl.ERROR_REVIEW_MARKER} is unfenced")
+        ledger = bl.build_ledger([review(1, 1, sha=_HEAD, body=body)], [], [])
+        self.assertEqual(ledger["last_reviewed_merge_base"], _MERGE_BASE)
+
+    def test_a_trailing_newline_does_not_pass_the_sha_gate(self):
+        """`^[0-9a-f]{40}$` accepts `"a" * 40 + "\n"` — Python's `$` matches before a
+        final newline — and this gate is the single control keeping a line break out of
+        the `key=value` `_write_outputs` appends to $GITHUB_OUTPUT. `\Z` is what makes
+        the regex provide the invariant the surrounding code claims from it."""
+        for field in ("merge_base", "base", "head"):
+            with self.subTest(field=field):
+                self.assertIsNone(bl._FULL_SHA_RE.match("a" * 40 + "\n"))
+        # End to end: a hand-rolled payload (the writer can no longer emit one) whose
+        # merge base carries the newline must reach the ledger as "".
+        payload = (
+            '{"base":"%s","head":"%s","merge_base":"%s\\n"}' % (_BASE, _HEAD, _MERGE_BASE)
+        )
+        body = f"{MARKER}\n<!-- {pr.ROUND_SENTINEL_PREFIX} {payload} -->\n\nFound **1** finding(s)."
+        ledger = bl.build_ledger([review(1, 1, sha=_HEAD, body=body)], [], [])
+        self.assertEqual(ledger["last_reviewed_merge_base"], "")
+
+    def test_the_parser_never_raises(self):
+        for body in (None, "", MARKER, "<!-- cursor-review:round v1 " + "[" * 4000 + " -->"):
+            with self.subTest(body=str(body)[:40]):
+                self.assertIsNone(bl._parse_round_sentinel(body))
+
+    def test_both_keys_are_present_on_every_degraded_ledger(self):
+        """A consumer reads `ledger["last_reviewed_merge_base"]` unconditionally; a
+        KeyError on the degraded shapes would take down the whole ledger job."""
+        for name, ledger in (
+            ("empty", bl.build_ledger([], [], [])),
+            ("unknown", bl.unknown_ledger("GET reviews", "HTTP 502")),
+            ("disabled", bl.disabled_ledger()),
+            ("ok", bl.build_ledger([review(1, 1, sha=_HEAD, body=round_body())], [], [])),
+        ):
+            with self.subTest(status=name):
+                self.assertIn("last_reviewed_merge_base", ledger)
+                self.assertIn("last_reviewed_base_sha", ledger)
+
+    def test_both_keys_reach_github_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out")
+            ledger = bl.build_ledger([review(1, 1, sha=_HEAD, body=round_body())], [], [])
+            with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": path}, clear=False):
+                bl._write_outputs(ledger)
+            with open(path, encoding="utf-8") as f:
+                written = dict(
+                    line.split("=", 1) for line in f.read().splitlines() if "=" in line
+                )
+        self.assertEqual(written["last_reviewed_merge_base"], _MERGE_BASE)
+        self.assertEqual(written["last_reviewed_base_sha"], _BASE)
+        self.assertEqual(written["last_reviewed_sha"], _HEAD)
+
+    def test_a_degraded_ledger_writes_both_keys_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "out")
+            with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": path}, clear=False):
+                bl._write_outputs(bl.unknown_ledger("GET reviews", "HTTP 502"))
+            with open(path, encoding="utf-8") as f:
+                written = dict(
+                    line.split("=", 1) for line in f.read().splitlines() if "=" in line
+                )
+        self.assertEqual(written["last_reviewed_merge_base"], "")
+        self.assertEqual(written["last_reviewed_base_sha"], "")
+
+    def test_a_non_hex_base_is_dropped_rather_than_written_through(self):
+        """`base` is diagnostic, but `_write_outputs` appends it to $GITHUB_OUTPUT —
+        where a value carrying a newline is an output-injection vector. One shape check
+        over the whole payload, not two."""
+        body = (
+            f'{MARKER}\n<!-- cursor-review:round v1 '
+            f'{{"base":"main\\nfoo=bar","head":"{_HEAD}","merge_base":"{_MERGE_BASE}"}} -->'
+        )
+        ledger = bl.build_ledger([review(1, 1, sha=_HEAD, body=body)], [], [])
+        self.assertEqual(ledger["last_reviewed_merge_base"], _MERGE_BASE)
+        self.assertEqual(ledger["last_reviewed_base_sha"], "")
