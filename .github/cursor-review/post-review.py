@@ -784,6 +784,64 @@ def gh_error_line(result: subprocess.CompletedProcess) -> str:
     return blob[start:] if end == -1 else blob[start:end]
 
 
+def gh_status_line(result: subprocess.CompletedProcess) -> str:
+    """The `HTTP/x.y nnn Reason` line `gh -i` wrote to STDOUT, or "".
+
+    The one artifact that says whether the request reached GitHub at all: `gh -i`
+    renders the response's status line first thing on stdout, so its PRESENCE means a
+    response arrived (however GitHub then answered) and its ABSENCE means the write
+    never got a reply — a transport error, a timeout, a stub. Empty for anything that
+    is not a status line, gated by the same `_GH_STATUS_LINE_RE` the header parser
+    uses, so a bare JSON body's first line is never mistaken for one.
+    """
+    first = (result.stdout or "").split("\n", 1)[0].rstrip("\r")
+    return first if _GH_STATUS_LINE_RE.match(first) else ""
+
+
+# The response headers worth surfacing beside a POST failure: they say whether the
+# failure was a throttle and how long a retry must wait. Lower-cased to match
+# `gh_response_headers`, which canonicalizes to Go's casing.
+_POST_FAILURE_HEADERS = ("retry-after", "x-ratelimit-remaining", "x-ratelimit-reset")
+
+
+def format_post_failure(
+    context: str, result: subprocess.CompletedProcess, payload: str | None = None
+) -> str:
+    """The `<context> POST failed:` diagnostic, keeping what `gh -i` put on STDOUT
+    (BE-15634).
+
+    stderr carries only `gh`'s error line; the status line and the response headers
+    that say whether GitHub was even reached — and, on a throttle, how long to wait —
+    go to stdout, and reporting stderr alone threw them away at the one moment they
+    are needed. `unexpected end of JSON input` is the case that motivated this: on
+    stderr alone it cannot be told apart from a request GitHub never received, but the
+    stdout status line settles it. When `payload` is given, a `json.loads` self-check
+    settles the OTHER half — whether the body we sent was well-formed JSON — so the
+    same error can be attributed to the response decode rather than our request.
+
+    Reads headers through `gh_response_headers`, which stops at the blank line, so a
+    finding body that quotes a `Retry-After:` header can never reach this diagnostic.
+    """
+    parts = [f"{context} POST failed: {result.stderr}"]
+    status_line = gh_status_line(result)
+    parts.append(
+        f"  response status: {status_line}"
+        if status_line
+        else "  response status: none captured on stdout (no reply reached gh)"
+    )
+    headers = gh_response_headers(result)
+    surfaced = [f"{name}: {headers[name]}" for name in _POST_FAILURE_HEADERS if name in headers]
+    if surfaced:
+        parts.append("  response headers: " + "; ".join(surfaced))
+    if payload is not None:
+        try:
+            json.loads(payload)
+            parts.append("  request body: valid JSON — the decode error is response-side")
+        except (ValueError, TypeError) as exc:
+            parts.append(f"  request body: INVALID JSON ({exc}) — the decode error is request-side")
+    return "\n".join(parts)
+
+
 # 4xx statuses that are NOT evidence the request was rejected before it was written.
 # The no-read short-circuit rests on a 4xx meaning "GitHub validated this and refused
 # it", which holds for the rejections it was built for (422 over an inline position,
@@ -1237,7 +1295,7 @@ def post_or_degrade(
         emit_delivery(False)
         write_step_summary(summary_markdown)
         return True
-    print(f"{context} POST failed: {result.stderr}", file=sys.stderr)
+    print(format_post_failure(context, result, payload), file=sys.stderr)
     # A nonzero `gh` is not proof the write was refused. Once the throttle wordings
     # stopped being read as a read-only token (BE-12612), the 403 GitHub raises on a
     # request it went on to SERVE reaches here — and every caller answers a False by
@@ -2928,7 +2986,7 @@ def main():
         write_step_summary(prose_body)
         return
 
-    print(f"Review POST failed: {result.stderr}", file=sys.stderr)
+    print(format_post_failure("Review", result, payload), file=sys.stderr)
     if not comments:
         # There is no inline half to drop, so a fallback POST would carry the same
         # findings as the request that just failed (only the demotion intro and the

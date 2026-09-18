@@ -1472,6 +1472,30 @@ class FirstReviewConfirmationTest(unittest.TestCase):
         # Once for the inline POST, once for the fallback the stub fails identically.
         self.assertEqual(calls, [("o/r", "1"), ("o/r", "1")])
 
+    def test_a_status_less_failure_still_lands_the_findings_in_the_summary(self):
+        """The BE-15634 scenario: both POSTs fail with a status-less transport error
+        (`gh: unexpected end of JSON input`), the read confirms the review is absent,
+        and the run must NOT drop the findings. They reach the job summary — the run
+        artifact is no longer their only surviving copy — under the POST-failed note,
+        and the step goes red."""
+        outputs, summaries, notes, calls = {}, [], [], []
+        driver = EndToEndPostTest()
+        driver.run_main(
+            self.ANCHORED,
+            post_returncode=1,
+            stderr="gh: unexpected end of JSON input",
+            existing_reviews=[],
+            list_calls=calls,
+            outputs=outputs,
+            summaries=summaries,
+            notes=notes,
+        )
+        self.assertEqual(outputs["delivered"], "false")
+        self.assertEqual(len(summaries), 1, "the findings reached the job summary")
+        self.assertIn("finding on app.py:11", summaries[0], "and the findings are in it")
+        self.assertIn(PR.POST_FAILED_SUMMARY_NOTE, notes)
+        self.assertEqual(driver.exit_code, 1, "the step goes red")
+
     def test_the_consolidated_marker_matches_gate_unresolved(self):
         """One discriminator, three readers (the gate, the ledger, and now this) — so
         a reword that moved only one of them would make this path stop recognizing the
@@ -2310,6 +2334,85 @@ class ResponseHeaderParsingTest(unittest.TestCase):
             gh_result(stdout="HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\n")
         )
         self.assertEqual(headers, {"retry-after": "60"})
+
+
+class PostFailureDiagnosticTest(unittest.TestCase):
+    """What a `<context> POST failed:` line carries (BE-15634).
+
+    The failure that motivated this reported stderr alone — `gh: unexpected end of
+    JSON input` — and discarded the stdout `-i` captured, which is the one place the
+    status line and rate-limit headers live. Two identical failures 1.4s apart could
+    not then be told apart from a request GitHub never received. These pin that the
+    status line, the throttle headers, and the request-body self-check all reach the
+    log.
+    """
+
+    # `gh` fails an empty error body exactly this way, and it is the case where the
+    # status line on stdout is the only thing that says a reply arrived at all.
+    EMPTY_JSON_STDERR = "gh: unexpected end of JSON input"
+
+    def test_the_stdout_status_line_is_surfaced(self):
+        line = PR.format_post_failure(
+            "Review",
+            gh_result(stdout=GH_INCLUDE_STDOUT, stderr=self.EMPTY_JSON_STDERR),
+        )
+        self.assertIn(self.EMPTY_JSON_STDERR, line)
+        self.assertIn("response status: HTTP/2.0 404 Not Found", line)
+
+    def test_rate_limit_headers_are_surfaced_when_present(self):
+        throttled_stdout = response(
+            "Retry-After: 42",
+            "X-Ratelimit-Remaining: 0",
+            status="HTTP/2.0 403 Forbidden",
+        )
+        line = PR.format_post_failure(
+            "Fallback review",
+            gh_result(
+                stdout=throttled_stdout,
+                stderr="gh: You have exceeded a secondary rate limit. (HTTP 403)",
+            ),
+        )
+        self.assertIn("retry-after: 42", line)
+        self.assertIn("x-ratelimit-remaining: 0", line)
+
+    def test_no_reply_reached_gh_is_stated_not_left_blank(self):
+        """A transport error / timeout writes no status line to stdout. Saying so
+        explicitly is the point — it distinguishes 'GitHub rejected us' from 'the
+        write never got a reply', which is exactly what the old stderr-only line
+        could not do."""
+        line = PR.format_post_failure(
+            "Review", gh_result(stdout="", stderr="gh: dial tcp: i/o timeout")
+        )
+        self.assertIn("no reply reached gh", line)
+
+    def test_a_well_formed_payload_points_the_finger_at_the_response(self):
+        line = PR.format_post_failure(
+            "Review",
+            gh_result(stderr=self.EMPTY_JSON_STDERR),
+            payload=json.dumps({"body": "x", "event": "COMMENT"}),
+        )
+        self.assertIn("request body: valid JSON", line)
+        self.assertIn("response-side", line)
+
+    def test_a_malformed_payload_points_the_finger_at_the_request(self):
+        line = PR.format_post_failure(
+            "Review", gh_result(stderr=self.EMPTY_JSON_STDERR), payload="{not json"
+        )
+        self.assertIn("request body: INVALID JSON", line)
+        self.assertIn("request-side", line)
+
+    def test_a_finding_that_quotes_a_retry_after_cannot_forge_a_header(self):
+        """The response body is past the blank line, so `gh_response_headers` never
+        reads it — a finding body echoed into the JSON response cannot dictate what
+        this diagnostic reports as a throttle window."""
+        spoof = response(
+            "Retry-After: 1",
+            status="HTTP/2.0 422 Unprocessable Entity",
+            body='{"message":"Retry-After: 3600 X-Ratelimit-Remaining: 0"}',
+        )
+        line = PR.format_post_failure("Review", gh_result(stdout=spoof))
+        self.assertIn("retry-after: 1", line)
+        self.assertNotIn("3600", line)
 
 
 class ThrottleDelayTest(unittest.TestCase):
