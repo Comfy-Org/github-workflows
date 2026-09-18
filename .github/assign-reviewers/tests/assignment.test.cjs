@@ -398,6 +398,23 @@ test('a duplicate top-level default_pool: warns once, naming the key', () => {
   assert.equal(helperWarnings.length, 1);
   assert.match(helperWarnings[0], /duplicate top-level `default_pool:` key/);
 });
+
+test('the duplicate warning names the configured path, and omits the prefix without one', () => {
+  // `reviewer_config_path` is a caller input, so the warning must not hardcode
+  // `reviewers.yml` — a caller that configured another name would be told to go
+  // look at a file its repo does not have.
+  helperWarnings.length = 0;
+  helpers.parseReviewerConfig('default_pool: [alice]\ndefault_pool: [bob]\n', '.github/owners.yml');
+  assert.equal(helperWarnings.length, 1);
+  assert.match(helperWarnings[0], /^\.github\/owners\.yml: duplicate top-level/);
+  // Omitted (as the harness calls it): a bare message, never a literal `undefined:`.
+  helperWarnings.length = 0;
+  helpers.parseReviewerConfig('default_pool: [alice]\ndefault_pool: [bob]\n');
+  assert.equal(helperWarnings.length, 1);
+  assert.doesNotMatch(helperWarnings[0], /undefined/);
+  assert.match(helperWarnings[0], /^duplicate top-level/);
+});
+
 test('an empty first default_pool: still warns on the duplicate', () => {
   // Keyed on "the key was seen", not on "the list is non-empty" — an emptiness test would make the
   // JS warn where the Python port (which keys on its own seen-flag) does not.

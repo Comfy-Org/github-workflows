@@ -52,9 +52,10 @@ a case only one implementation ever sees proves nothing about the other, which
 is how the two live divergences reached `main`.
 
 Three dialect rules the corpus now pins on both sides, because each was a place
-the ports read the same bytes differently: a **duplicate top-level key is
-last-wins** (the second `default_pool:` replaces the first — the block arm used
-to *append* on the JS side — and each port warns rather than rejecting); a **`#`
+the ports read the same bytes differently: a **duplicate top-level
+`default_pool:` is last-wins** (the second replaces the first — the block arm
+used to *append* on the JS side — and each port warns rather than rejecting;
+a repeated `rules:` is *not* covered, it still appends on both sides); a **`#`
 opens a comment only at column 0 or after a space or a tab**, the two characters
 spelled out rather than delegated to `/\s/` and `isspace()`, which disagree about
 U+0085, U+001C and U+FEFF; and a **single leading U+FEFF is stripped from the

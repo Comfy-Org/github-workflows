@@ -29,8 +29,10 @@ name: Assign Reviewers (reusable)
 #         - carol
 #
 # Both flow (`[a, b]`) and block (`- a`) sequences are accepted. A duplicate
-# top-level key is last-wins with a warning, a `#` opens a comment only at the
-# start of a line or after a space or a tab, and one leading BOM is tolerated.
+# top-level `default_pool:` is last-wins with a warning (a repeated `rules:`
+# still APPENDS, silently — do not rely on it to replace an earlier block), a
+# `#` opens a comment only at the start of a line or after a space or a tab,
+# and one leading BOM is tolerated.
 # The config is read from the PR base SHA, so proposed routing edits cannot
 # select their own owners before the edits have been reviewed.
 #
@@ -433,7 +435,13 @@ jobs:
             // js-yaml is not bundled with github-script; the schema is small and
             // fixed, so a focused parser is safer than an unavailable dependency.
             // PARITY-HARNESS:config-parser:begin
-            const parseReviewerConfig = (text) => {
+            // `sourcePath` is only ever used to NAME the file in a diagnostic, and is
+            // optional because the parity harness extracts this region on its own and
+            // has no path to hand it — an omitted one just drops the prefix rather than
+            // printing `undefined:` or hardcoding a `reviewers.yml` the caller may have
+            // configured away (`reviewer_config_path`).
+            const parseReviewerConfig = (text, sourcePath) => {
+              const where = sourcePath ? `${sourcePath}: ` : '';
               const out = { default_pool: [], rules: [] };
               const stripComment = (s) => {
                 let inS = false, inD = false;
@@ -489,7 +497,7 @@ jobs:
                   // reset rather than accumulate, so the block form replaces like the flow
                   // form already did. The flag (not `out.default_pool.length`) is what keeps
                   // the warning firing for an empty first list, matching the Python port.
-                  if (seenDefaultPool) core.warning('reviewers.yml: duplicate top-level `default_pool:` key — last one wins');
+                  if (seenDefaultPool) core.warning(`${where}duplicate top-level \`default_pool:\` key — last one wins`);
                   seenDefaultPool = true;
                   const rest = line.slice('default_pool:'.length).trim();
                   const flow = parseFlow(rest);
@@ -571,7 +579,7 @@ jobs:
                 return;
               }
               const text = Buffer.from(res.data.content, 'base64').toString('utf8');
-              config = parseReviewerConfig(text);
+              config = parseReviewerConfig(text, configPath);
             } catch (e) {
               core.info(`Could not read ${configPath}@${pr.base.sha} (${e.message}) — nothing to do.`);
               return;

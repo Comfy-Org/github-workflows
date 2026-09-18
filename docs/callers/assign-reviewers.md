@@ -190,9 +190,11 @@ rules:
 with commentary on how the buckets were seeded.
 
 Three dialect rules the focused parser follows, shared with the `refresh-reviewers`
-generator that writes this file: a **duplicate top-level key is last-wins** — a second
-`default_pool:` replaces the first rather than adding to it, and the run logs a warning
-rather than failing; a **`#` starts a comment only at the start of a line or after a
+generator that writes this file: a **duplicate top-level `default_pool:` is last-wins**
+— a second one replaces the first rather than adding to it, and the run logs a warning
+rather than failing (a repeated `rules:` block is *not* covered: it still appends to the
+earlier one, with no warning, so replace a rules block in place rather than restating it);
+a **`#` starts a comment only at the start of a line or after a
 space or a tab**, so `[x#c]` is the literal login `x#c` and only `[x #c]` is a trailing
 comment; and a **single leading byte-order mark is tolerated**, so a `reviewers.yml`
 saved as UTF-8-with-BOM still routes.

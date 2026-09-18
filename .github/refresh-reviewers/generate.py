@@ -220,8 +220,8 @@ def parse_reviewer_config(text):
             # reference. Warn, never reject — the drift generator must not
             # hard-fail on a malformed map. Both the flow and the block arm below
             # already REPLACE `config["default_pool"]`, so last-wins needs no
-            # further work here; `locs` likewise keeps tracking the last
-            # occurrence that carried items.
+            # further work here; each arm also REPOINTS `locs["default_pool"]`,
+            # so the rewrite can never target an occurrence the parse discarded.
             if seen_default_pool:
                 print("::warning::duplicate top-level default_pool: key — last one wins")
             seen_default_pool = True
@@ -250,8 +250,14 @@ def parse_reviewer_config(text):
                     indent = _indent_of(r)
                 i += 1
             config["default_pool"] = items
-            if item_lines:
-                locs["default_pool"] = ("block", item_lines, indent)
+            # Last-wins has to move `locs` too, including when the winning
+            # occurrence carries NO item lines. Leaving it on a shadowed earlier
+            # occurrence would point `rewrite_config` at a line the very next
+            # parse throws away: the emitted file would carry the refreshed pool
+            # on the dead key, still re-read as the empty winner, and every
+            # scheduled run would regenerate the same no-op diff forever. `None`
+            # means "no rewritable list here", which `rewrite_config` skips.
+            locs["default_pool"] = ("block", item_lines, indent) if item_lines else None
             continue
         if _indent_of(raw) == 0 and line.startswith("rules:"):
             i += 1
@@ -332,7 +338,17 @@ def _rewrite_flow_line(line, key, logins):
     new_list = "[" + ", ".join(logins) + "]"
     stripped = _strip_comment(line)
     key_pos = stripped.find(key)
-    open_idx = stripped.find("[", key_pos)
+    # The flow span counts only when the VALUE ITSELF opens with `[`, exactly as
+    # `_parse_flow` requires before it returns a flow list. Searching for any `[`
+    # after the key also matches one sitting INSIDE a plain scalar, which the
+    # s-white comment rule makes reachable: in `reviewers: alice # see [bob]`
+    # the `#` no longer opens a comment, so the whole tail is the value — and the
+    # old search rewrote the bracket in that comment-shaped tail while leaving the
+    # real value `alice` in place. Anchoring here keeps the two in step.
+    value_pos = key_pos + len(key)
+    rest = stripped[value_pos:]
+    lead = len(rest) - len(rest.lstrip())
+    open_idx = value_pos + lead if rest[lead:lead + 1] == "[" else -1
     if open_idx != -1:
         close_idx = stripped.find("]", open_idx)
         end = close_idx + 1 if close_idx != -1 else len(stripped.rstrip())

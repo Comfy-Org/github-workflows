@@ -338,6 +338,26 @@ class TestSurgicalRewrite(unittest.TestCase):
         self.assertIn("reviewers: [old-f]  # keep: cold-start", out)
         self.assertIn("# Reviewer expertise map — hand-tuned", out)
 
+    def test_flow_span_is_anchored_to_the_value_not_to_any_later_bracket(self):
+        # Fallout of narrowing `_strip_comment` to s-white: after a character
+        # that is NOT a space or a tab, `#` no longer opens a comment, so the
+        # whole tail is the plain scalar VALUE. `_rewrite_flow_line` must not
+        # treat a `[` inside that tail as the flow span — doing so rewrote the
+        # comment-shaped text and left the real value `alice` routing.
+        line = "    reviewers: alice\u00a0# see [bob]"   # NBSP, escaped on purpose
+        self.assertEqual(
+            gen._rewrite_flow_line(line, "reviewers:", ["new1", "new2"]),
+            "    reviewers: [new1, new2]")
+        # A real trailing comment (space before `#`) still keeps its bytes, and a
+        # genuine flow value is still rewritten in place — the anchoring only
+        # rejects brackets that are not the value itself.
+        self.assertEqual(
+            gen._rewrite_flow_line("    reviewers: alice # see [bob]", "reviewers:", ["new1"]),
+            "    reviewers: [new1] # see [bob]")
+        self.assertEqual(
+            gen._rewrite_flow_line("    reviewers: [a, b]  # note [x]", "reviewers:", ["new1"]),
+            "    reviewers: [new1]  # note [x]")
+
     def test_block_rewrite_replaces_items_at_same_indent(self):
         config, locs = gen.parse_reviewer_config(CONFIG)
         out = gen.rewrite_config(CONFIG, locs, {1: ["new-p", "new-q", "new-r"]}, None)
@@ -410,12 +430,16 @@ class TestSurgicalRewrite(unittest.TestCase):
         # line 0 changes no line INDEX, and `_rewrite_flow_line` locates the
         # bracket span WITHIN the line, so the BOM survives the rewrite in
         # place — this pins that the two halves stay compatible.
-        cfg = "﻿default_pool: [old-a]  # keep small\nrules:\n  - paths: [\"x/**\"]\n    reviewers: [r1]\n"
+        # U+FEFF stays ESCAPED here, as in parser-corpus.json: a literal would be
+        # invisible in review and would go silently VACUOUS if an editor or lint
+        # normalised it away — `startswith("")` is always true, so the BOM
+        # assertions below would keep passing while testing nothing.
+        cfg = "\ufeffdefault_pool: [old-a]  # keep small\nrules:\n  - paths: [\"x/**\"]\n    reviewers: [r1]\n"
         config, locs = gen.parse_reviewer_config(cfg)
         self.assertEqual(config["default_pool"], ["old-a"])
         out = gen.rewrite_config(cfg, locs, {}, ["new-a", "new-b"])
-        self.assertTrue(out.startswith("﻿"), "the rewrite dropped the BOM")
-        self.assertIn("﻿default_pool: [new-a, new-b]  # keep small\n", out)
+        self.assertTrue(out.startswith("\ufeff"), "the rewrite dropped the BOM")
+        self.assertIn("\ufeffdefault_pool: [new-a, new-b]  # keep small\n", out)
         self.assertEqual(out.split("\n")[1:], cfg.split("\n")[1:])
 
 
@@ -459,6 +483,20 @@ class TestDuplicateDefaultPool(unittest.TestCase):
         _config, locs, _out = self.parse(cfg)
         out = gen.rewrite_config(cfg, locs, {}, ["carol"])
         self.assertEqual(out, "default_pool: [alice]\ndefault_pool:\n  - carol\n")
+
+    def test_locs_drop_a_shadowed_key_when_the_winner_has_no_items(self):
+        # The other half of last-wins-for-`locs`, and the dangerous one: the
+        # winning occurrence carries no item lines, so there is nothing to
+        # rewrite. `locs` must NOT fall back to the shadowed first occurrence —
+        # rewriting there emits a file whose refreshed pool sits on a dead key,
+        # re-reads as the empty winner, and regenerates the same diff forever.
+        cfg = "default_pool: [alice]\ndefault_pool:\nrules:\n  - paths: [\"x/**\"]\n    reviewers: [r1]\n"
+        config, locs, _out = self.parse(cfg)
+        self.assertEqual(config["default_pool"], [])
+        self.assertIsNone(locs["default_pool"])
+        # With no rewritable location the document is returned untouched, rather
+        # than rewritten into the occurrence the parse discarded.
+        self.assertEqual(gen.rewrite_config(cfg, locs, {}, ["carol"]), cfg)
 
 
 class TestEnvKnobs(unittest.TestCase):
