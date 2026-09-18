@@ -183,9 +183,15 @@ jobs:
           # the BUMPER step below out of `github.workspace`. Listing either would let a
           # file no review run touches freeze this fleet behind a `::warning::`, the
           # false-decommission failure mode.
+          # NOTE these are literal paths: a rename that is not mirrored here reads as
+          # a decommission and no-ops the fleet behind a `::warning::`, so rename them
+          # in this list in the same commit. test_paths_contract.sh asserts every
+          # entry is a tracked file, so forgetting turns that silent freeze into a red
+          # PR.
           # The scripts/check-pr-size lines are byte-identical to the ones in
           # bump-pr-size-callers.yml, which builds the same tool from the same pin —
-          # keep the two in step.
+          # keep the two in step; that test is also what catches a rename applied to
+          # only one of them.
           WATCHED_EXEC: |
             .github/workflows/cursor-review.yml
             .github/cursor-review/build-ledger.py

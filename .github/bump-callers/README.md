@@ -434,8 +434,8 @@ survivors differ per tree but the hole is identical: `.github/groom`,
 `.github/cursor-review`, `.github/agents-md-integrity`, `.github/coderabbit-config`
 and `.github/public-repo-hygiene` are each kept alive by `tests/` and `README.md`,
 while `scripts/check-pr-size` has neither and is kept alive by the very
-`*_test.go` files the `pr-size` / `cursor-review` filters exclude. Two rules when
-you write one of these lists:
+`*_test.go` files the `pr-size` / `cursor-review` filters exclude. Three rules
+when you write one of these lists:
 
 - **The test is "absence breaks a pinned caller at run time", not "is it an
   executable".** A prompt or brief a consumer loads from the pinned ref qualifies
@@ -450,9 +450,21 @@ you write one of these lists:
   whole fleet: a false decommission, the mirror of the false-healthy bump the input
   exists to stop. `bump-pr-derisk-callers.yml` records the same call for
   `apply-risk-label.sh`.
+- **A path that stops resolving is a silent freeze, so it is machine-checked.**
+  These are ~50 hand-written literal paths and preflight.sh probes each one for
+  deletion, so a typo — or a rename applied to the tree but not to this list, or
+  to only one of the two byte-identical `scripts/check-pr-size` blocks — makes the
+  fleet take the decommission branch on every future run: one `::warning::`,
+  `proceed=false`, a green run, and no caller bumped again. `test_paths_contract.sh`
+  asserts every entry is a tracked file at that commit, sits under a watched
+  surface, and that no fleet watching a DIRECTORY leaves the input unset — so all
+  three now fail the PR instead of the fleet. Rename or retire a listed file in the
+  SAME commit as the list edit, and the check will tell you when you have not.
 
 The three fleets that watch nothing beyond `WATCHED` leave both unset and behave
-exactly as before.
+exactly as before — `test_paths_contract.sh` grants them exactly that exemption,
+since preflight.sh probes `WATCHED` unconditionally and a `.yml` file is its own
+probe.
 
 Consumption is two steps — the guard, then the bump gated on its output:
 

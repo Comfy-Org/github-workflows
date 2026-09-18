@@ -143,10 +143,23 @@ jobs:
           # filter above deliberately excludes. Name the Go build inputs the
           # "Build check-pr-size" step compiles instead — `go build .` needs every
           # non-test source in the package, and go.mod is read twice (setup-go's
-          # go-version-file, then the build). The tests are NOT listed: no pinned
-          # caller ever runs `go test`, which is the whole reason for the exclusion
-          # above, and listing them would re-import the churn that exclusion removed.
-          # The scripts/check-pr-size lines are byte-identical to the ones in
+          # go-version-file, then the build). The tests are NOT listed, and the
+          # reason is the FIRST rule, not the exclusion above: no pinned caller ever
+          # runs `go test`, so a missing `*_test.go` breaks nothing at run time.
+          # Listing one would not re-import that churn — WATCHED_EXEC is a
+          # presence-only decommission probe and takes no part in the staleness
+          # comparison (that is WATCHED_PATHSPECS), so an entry here can only ever
+          # read as `tip_gone`, never turn a skip into a bump. What it WOULD buy is
+          # a false-decommission freeze the day a test is deleted. Do not prune the
+          # `:(exclude)` line above on the belief this input covers churn: it does
+          # not.
+          # NOTE these are literal paths: a rename that is not mirrored here reads as
+          # a decommission and no-ops the fleet behind a `::warning::`, so rename them
+          # in this list in the same commit. test_paths_contract.sh asserts every
+          # entry is a tracked file, so forgetting turns that silent freeze into a red
+          # PR — including the case where only ONE of the two byte-identical
+          # scripts/check-pr-size blocks is updated.
+          # Those lines are byte-identical to the ones in
           # bump-cursor-review-callers.yml, which builds the same tool from the same
           # pin — keep the two in step.
           WATCHED_EXEC: |
