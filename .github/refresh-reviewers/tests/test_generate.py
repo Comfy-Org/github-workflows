@@ -358,6 +358,54 @@ class TestSurgicalRewrite(unittest.TestCase):
             gen._rewrite_flow_line("    reviewers: [a, b]  # note [x]", "reviewers:", ["new1"]),
             "    reviewers: [new1]  # note [x]")
 
+    def test_rewriter_and_parser_agree_on_the_value_span_for_non_s_white(self):
+        # The rewriter located the value with a BARE `lstrip()`/`rstrip()`, which
+        # still absorb U+00A0 and U+001C, while `_parse_flow` trims s-white only.
+        # So `reviewers:<NBSP>[alice]` is a bare SCALAR to the parser but took the
+        # BRACKET branch here, emitting a line that re-parses as ONE ineligible
+        # scalar login: the refreshed rule routed NOBODY. Assert the round trip,
+        # not just the bytes — that is the property that was broken.
+        for value in ("\u00a0[alice]", "\u001c[alice]"):   # escaped on purpose
+            with self.subTest(value=value):
+                doc = "rules:\n  - paths: ['a/**']\n    reviewers:%s\n" % value
+                _config, locs = gen.parse_reviewer_config(doc)
+                out = gen.rewrite_config(doc, locs, {0: ["new1", "new2"]}, None)
+                reparsed, _ = gen.parse_reviewer_config(out)
+                self.assertEqual(reparsed["rules"][0]["reviewers"],
+                                 ["new1", "new2"])
+        # The mirror image at the other end: a trailing non-s-white byte is part
+        # of the VALUE to the parser, so the replaced span must swallow it rather
+        # than leave it stranded after the new list.
+        self.assertEqual(
+            gen._rewrite_flow_line("    reviewers: alice\u00a0", "reviewers:", ["new1"]),
+            "    reviewers: [new1]")
+        self.assertEqual(
+            gen._rewrite_flow_line("    reviewers: alice\u00a0  # note", "reviewers:", ["new1"]),
+            "    reviewers: [new1]  # note")
+
+    def test_crlf_document_round_trips_without_mixing_line_endings(self):
+        # `main()` reads the config as BYTES now (universal-newline translation
+        # would hide a CR from the parser that the runtime port plainly sees), so
+        # a CRLF document reaches `rewrite_config` with its CRs intact for the
+        # first time. Emitting bare-LF item lines into it would leave the file
+        # with MIXED endings — a diff on every untouched line for the reviewer of
+        # the drift PR.
+        doc = "default_pool:\r\n  - alice\r\n  - bob\r\n"
+        _config, locs = gen.parse_reviewer_config(doc)
+        out = gen.rewrite_config(doc, locs, {}, ["carol", "dave"])
+        self.assertEqual(out, "default_pool:\r\n  - carol\r\n  - dave\r\n")
+        self.assertNotIn("\n", out.replace("\r\n", ""))
+        # An LF document must not acquire CRs by the same code path.
+        lf = "default_pool:\n  - alice\n  - bob\n"
+        _config, lf_locs = gen.parse_reviewer_config(lf)
+        self.assertEqual(gen.rewrite_config(lf, lf_locs, {}, ["carol"]),
+                         "default_pool:\n  - carol\n")
+        # The flow arm keeps the tail (CR included) on its own.
+        flow = "default_pool: [alice]\r\n"
+        _config, flow_locs = gen.parse_reviewer_config(flow)
+        self.assertEqual(gen.rewrite_config(flow, flow_locs, {}, ["carol"]),
+                         "default_pool: [carol]\r\n")
+
     def test_block_rewrite_replaces_items_at_same_indent(self):
         config, locs = gen.parse_reviewer_config(CONFIG)
         out = gen.rewrite_config(CONFIG, locs, {1: ["new-p", "new-q", "new-r"]}, None)

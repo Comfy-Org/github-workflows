@@ -14,8 +14,8 @@
     "(config, locations) and only the config half is compared here, because `locations` has no JS",
     "counterpart and stays covered by test_generate.py's own rewrite tests.",
     "`globs[].cases[]` are path/verdict pairs for the glob->RegExp translator.",
-    "Characters that would be invisible or ambiguous in this file (U+FEFF, U+0085, U+001C) are",
-    "written as JSON \\u escapes on purpose — keep them escaped rather than pasting the literal.",
+    "Characters that would be invisible or ambiguous in this file (U+FEFF, U+0085, U+001C, U+00A0)",
+    "are written as JSON \\u escapes on purpose — keep them escaped rather than pasting the literal.",
     "",
     "Both path filters (test-assign-reviewers.yml, test-refresh-reviewers.yml) watch this file, so",
     "editing it runs both suites — a corpus tweak that only satisfies one port cannot land green."
@@ -232,6 +232,158 @@
       "text": "default_pool: [x #c, y]\n",
       "expected": {
         "default_pool": ["x"],
+        "rules": []
+      }
+    },
+    {
+      "name": "U+FEFF at the start of a flow token is kept",
+      "why": "JS trim() strips U+FEFF and Python strip() does not, so this token used to arrive with the BOM on one port and without it on the other; s-white trims neither",
+      "text": "default_pool: [\ufeffalice]\n",
+      "expected": {
+        "default_pool": ["\ufeffalice"],
+        "rules": []
+      }
+    },
+    {
+      "name": "U+0085 at the end of a flow token is kept",
+      "why": "the mirror image: Python strip() strips NEL and JS trim() does not; s-white trims neither",
+      "text": "default_pool: [x\u0085, y]\n",
+      "expected": {
+        "default_pool": ["x\u0085", "y"],
+        "rules": []
+      }
+    },
+    {
+      "name": "U+001C at the end of a flow token is kept",
+      "why": "Python strip() strips FILE SEPARATOR and JS trim() does not, the same disagreement as U+0085 from a different character class",
+      "text": "default_pool: [x\u001c, y]\n",
+      "expected": {
+        "default_pool": ["x\u001c", "y"],
+        "rules": []
+      }
+    },
+    {
+      "name": "U+00A0 padding around a flow token is kept",
+      "why": "the one character both ports agreed on and both got wrong — strip() and trim() BOTH drop NBSP, so a login padded with it used to look routable; s-white keeps it literal, so the runtime and the drift generator now agree it does not route",
+      "text": "default_pool: [\u00a0x\u00a0, y]\n",
+      "expected": {
+        "default_pool": ["\u00a0x\u00a0", "y"],
+        "rules": []
+      }
+    },
+    {
+      "name": "U+FEFF at the start of a block item is kept",
+      "why": "the block arm trims separately from the flow arm, so the JS-strips-BOM divergence has to be pinned on both; only a MID-document BOM reaches here, the leading one is stripped first",
+      "text": "default_pool:\n  - \ufeffalice\n",
+      "expected": {
+        "default_pool": ["\ufeffalice"],
+        "rules": []
+      }
+    },
+    {
+      "name": "U+0085 at the end of a block item is kept",
+      "why": "Python strip() used to drop the trailing NEL from a block item while JS trim() kept it",
+      "text": "default_pool:\n  - alice\u0085\n",
+      "expected": {
+        "default_pool": ["alice\u0085"],
+        "rules": []
+      }
+    },
+    {
+      "name": "U+FEFF inside a rule's flow reviewers is kept",
+      "why": "a rule's reviewers list trims through its own path (setKey / set_key, then unquote), so the JS-strips-BOM divergence is pinned there too",
+      "text": "rules:\n  - paths: [src/**]\n    reviewers: [\ufeffbob]\n",
+      "expected": {
+        "default_pool": [],
+        "rules": [
+          {"paths": ["src/**"], "reviewers": ["\ufeffbob"]}
+        ]
+      }
+    },
+    {
+      "name": "U+001C at the end of a block reviewer is kept",
+      "why": "the last trim path left: a block reviewer under a rule, where Python strip() used to drop the trailing FILE SEPARATOR and JS trim() kept it",
+      "text": "rules:\n  - paths:\n      - src/**\n    reviewers:\n      - bob\u001c\n",
+      "expected": {
+        "default_pool": [],
+        "rules": [
+          {"paths": ["src/**"], "reviewers": ["bob\u001c"]}
+        ]
+      }
+    },
+    {
+      "name": "two leading BOMs: only one is stripped",
+      "why": "the explicit single-BOM strip is now the ONLY thing removing a BOM on either port; JS trim() used to absorb the second one and parse the key, Python strip() never did",
+      "text": "\ufeff\ufeffdefault_pool: [alice]\n",
+      "expected": {
+        "default_pool": [],
+        "rules": []
+      }
+    },
+    {
+      "name": "U+0085 before a top-level key is not indentation",
+      "why": "Python strip() used to remove the leading NEL so the line still matched `default_pool:`, while JS trim() left it and skipped the line; s-white leaves it on both, and indentOf/_indent_of count spaces only, so the line is column 0 either way",
+      "text": "\u0085default_pool: [alice]\n",
+      "expected": {
+        "default_pool": [],
+        "rules": []
+      }
+    },
+    {
+      "name": "tab padding around a flow token is trimmed",
+      "why": "narrowing the trim to s-white must not drop the tab half of it — this is the case that reds if either port is retuned to trim spaces only",
+      "text": "default_pool: [\tx\t, y]\n",
+      "expected": {
+        "default_pool": ["x", "y"],
+        "rules": []
+      }
+    },
+    {
+      "name": "a bare CR ending the last line is data, not a line break",
+      "why": "a CR is a line break only when a newline FOLLOWS it — JS splits on /\\r?\\n/ and keeps this one, and the Python port must split the same way rather than stripping a trailing CR off each piece of a split(\"\\n\"), which would eat it. The runtime is the reference: the drift generator has to model what routes, and neither side trims CR as s-white any more",
+      "text": "default_pool:\n  - alice\r",
+      "expected": {
+        "default_pool": ["alice\r"],
+        "rules": []
+      }
+    },
+    {
+      "name": "a bare CR ending a rule key line is data, and BOTH ports keep the key",
+      "why": "the two languages' `.` differ: Python's omits only LF, JS's also omits CR, U+2028 and U+2029. With `(.*)$` the Python setKey regex matched this line and the JS one did NOT, so the runtime dropped `reviewers:` entirely and routed nobody while the drift generator modelled alice as routing. Both ports now spell the class out as `[^\\n]*`, keep the CR as part of the value, and agree it cannot be a login",
+      "text": "rules:\n  - paths: ['a/**']\n    reviewers: alice\r",
+      "expected": {
+        "default_pool": [],
+        "rules": [
+          {"paths": ["a/**"], "reviewers": ["alice\r"]}
+        ]
+      }
+    },
+    {
+      "name": "a U+00A0-only line at column 0 ends a default_pool block on both ports",
+      "why": "narrowing the blank-line test to s-white means a line whose only content is non-s-white whitespace is no longer blank, and `_indent_of`/`indentOf` count SPACES only, so it reads as column 0 and terminates the block. Both ports moved together, so this is a behaviour change rather than a parity break — pinned because nothing else covers a whitespace-only line and the truncation is otherwise silent",
+      "text": "default_pool:\n  - alice\n\u00a0\n  - bob\n",
+      "expected": {
+        "default_pool": ["alice"],
+        "rules": []
+      }
+    },
+    {
+      "name": "a U+00A0-only line at column 0 drops every later rule on both ports",
+      "why": "same mechanism as the default_pool case, but inside the `rules:` loop the `break` discards every rule AFTER the stray line, not just the tail of one list. Pinned so the blast radius of one invisible character is executable on both ports rather than discovered in a consumer repo",
+      "text": "rules:\n  - paths: ['a/**']\n    reviewers: [alice]\n\u00a0\n  - paths: ['b/**']\n    reviewers: [bob]\n",
+      "expected": {
+        "default_pool": [],
+        "rules": [
+          {"paths": ["a/**"], "reviewers": ["alice"]}
+        ]
+      }
+    },
+    {
+      "name": "an INDENTED U+00A0-only line does not end the block",
+      "why": "the negative control for the two cases above: `_indent_of`/`indentOf` count the leading spaces, so a padded blank line that is INDENTED reads as column 2, never reaches the column-0 `break`, and is simply not a `- ` item. Bounds the truncation to a stray character at column 0 specifically",
+      "text": "default_pool:\n  - alice\n  \u00a0\n  - bob\n",
+      "expected": {
+        "default_pool": ["alice", "bob"],
         "rules": []
       }
     }

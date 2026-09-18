@@ -166,15 +166,25 @@ def _strip_comment(s):
     return s
 
 
+# YAML s-white: the ONLY characters trimmed around a token. Spelled out (not
+# str.strip()) because strip() and JS trim() disagree about U+FEFF, U+0085 and
+# U+001C-U+001F; the JS port's `trimSWhite` is the same two characters. Corpus-pinned.
+S_WHITE = " \t"
+
+
+def _trim(s):
+    return s.strip(S_WHITE)
+
+
 def _unquote(s):
-    s = s.strip()
+    s = _trim(s)
     if len(s) >= 2 and ((s[0] == '"' and s[-1] == '"') or (s[0] == "'" and s[-1] == "'")):
         return s[1:-1]
     return s
 
 
 def _parse_flow(s):
-    s = s.strip()
+    s = _trim(s)
     if not s.startswith("["):
         return None
     end = s.find("]")
@@ -195,13 +205,24 @@ def parse_reviewer_config(text):
                  "rules": [loc-or-None, ...]}        (reviewers-list positions)
     """
     # A single leading U+FEFF is legal YAML and must not become part of the first
-    # key; `strip()` does not treat it as whitespace, so the first `default_pool:`
-    # of a BOM-prefixed document used to be skipped here while the JS port (whose
-    # `trim()` does strip it) parsed the same bytes fine. Dropping one character
-    # from the head of line 0 leaves every line INDEX untouched, so `locs` — and
-    # the byte-faithful `rewrite_config`, which keeps the BOM by splitting `text`
-    # itself — are unaffected.
-    raw_lines = text.removeprefix("\ufeff").split("\n")
+    # key; neither `strip()` nor `_trim` treats it as whitespace, so the first
+    # `default_pool:` of a BOM-prefixed document used to be skipped here while the
+    # JS port (whose `trim()` does strip it) parsed the same bytes fine. Dropping
+    # one character from the head of line 0 leaves every line INDEX untouched, so
+    # `locs` — and the byte-faithful `rewrite_config`, which keeps the BOM by
+    # splitting `text` itself — are unaffected.
+    #
+    # The CR of a CRLF document used to come off incidentally, via the `strip()`
+    # calls that `_trim` replaced; s-white excludes CR, so consume it HERE instead,
+    # as part of the line break. `re.split(r"\r?\n", ...)` is the JS port's
+    # `split(/\r?\n/)` character for character, which is the point: a CR is only
+    # a line break when a newline FOLLOWS it. Stripping a trailing CR off each
+    # `split("\n")` piece instead — the obvious shortcut — also eats a BARE CR
+    # ending the last line of a document with no final newline, which JS keeps as
+    # data; that would have traded the old divergence for a new one. Splitting on
+    # the two-character break produces the same number of lines as `split("\n")`
+    # on a CRLF document, so every line index is left alone.
+    raw_lines = re.split(r"\r?\n", text.removeprefix("\ufeff"))
     lines = [_strip_comment(l) for l in raw_lines]
     config = {"default_pool": [], "rules": []}
     locs = {"default_pool": None, "rules": []}
@@ -211,7 +232,7 @@ def parse_reviewer_config(text):
     n = len(lines)
     while i < n:
         raw = lines[i]
-        line = raw.strip()
+        line = _trim(raw)
         if not line:
             i += 1
             continue
@@ -225,7 +246,7 @@ def parse_reviewer_config(text):
             if seen_default_pool:
                 print("::warning::duplicate top-level default_pool: key — last one wins")
             seen_default_pool = True
-            rest = line[len("default_pool:"):].strip()
+            rest = _trim(line[len("default_pool:"):])
             flow = _parse_flow(rest)
             if flow is not None:
                 config["default_pool"] = flow
@@ -238,12 +259,12 @@ def parse_reviewer_config(text):
             indent = 2
             while i < n:
                 r = lines[i]
-                if not r.strip():
+                if not _trim(r):
                     i += 1
                     continue
                 if _indent_of(r) == 0:
                     break
-                t = r.strip()
+                t = _trim(r)
                 if t.startswith("- "):
                     items.append(_unquote(t[2:]))
                     item_lines.append(i)
@@ -268,10 +289,20 @@ def parse_reviewer_config(text):
 
             def set_key(seg, line_idx):
                 nonlocal list_key
-                m = re.match(r"^(paths|reviewers):(.*)$", seg)
+                # `[^\n]*`, not `.*`: the two languages disagree about what `.`
+                # excludes. Python's `.` omits only LF, JS's omits LF, CR, U+2028
+                # and U+2029 — so on a rule line ending in a bare CR (the last line
+                # of a document with no final newline, which the split above now
+                # preserves as data) Python matched and JS did NOT, silently
+                # dropping the key and leaving the rule with no reviewers while
+                # this generator modelled those reviewers as routing. Spelled out
+                # on both ports, both now keep the CR as part of the value — where
+                # `eligible()` rejects it, the same answer the corpus already pins
+                # for the `default_pool:` block arm.
+                m = re.match(r"^(paths|reviewers):([^\n]*)$", seg)
                 if not m:
                     return
-                key, val = m.group(1), m.group(2).strip()
+                key, val = m.group(1), _trim(m.group(2))
                 flow = _parse_flow(val)
                 if flow is not None:
                     if current is not None:
@@ -291,13 +322,13 @@ def parse_reviewer_config(text):
 
             while i < n:
                 r = lines[i]
-                if not r.strip():
+                if not _trim(r):
                     i += 1
                     continue
                 if _indent_of(r) == 0:
                     break
                 ind = _indent_of(r)
-                t = r.strip()
+                t = _trim(r)
                 is_dash = t == "-" or t.startswith("- ")
                 if is_dash and (rule_indent == -1 or ind == rule_indent):
                     if rule_indent == -1:
@@ -307,11 +338,11 @@ def parse_reviewer_config(text):
                     config["rules"].append(current)
                     locs["rules"].append(cur_loc)
                     list_key = None
-                    after_dash = t[1:].strip()
+                    after_dash = _trim(t[1:])
                     if after_dash:
                         set_key(after_dash, i)
                 elif is_dash and list_key and current is not None:
-                    current[list_key].append(_unquote(t[1:].strip()))
+                    current[list_key].append(_unquote(_trim(t[1:])))
                     if list_key == "reviewers":
                         if cur_loc["reviewers"] is None:
                             cur_loc["reviewers"] = ("block", [], ind)
@@ -347,15 +378,23 @@ def _rewrite_flow_line(line, key, logins):
     # real value `alice` in place. Anchoring here keeps the two in step.
     value_pos = key_pos + len(key)
     rest = stripped[value_pos:]
-    lead = len(rest) - len(rest.lstrip())
+    # s-white, not bare lstrip()/rstrip(): the rewriter has to agree with
+    # `_parse_flow` about where the VALUE starts and ends, and `_parse_flow` now
+    # trims s-white only. A bare `lstrip()` still absorbs U+00A0 and U+001C, so
+    # `reviewers:<NBSP>[alice]` — a bare SCALAR to the parser — took the bracket
+    # branch here and emitted `reviewers:<NBSP>[new-a, new-b]`, which re-parses as
+    # ONE ineligible scalar login: the refreshed rule routed nobody. The trailing
+    # `rstrip()` was the mirror image, leaving value bytes outside the span it
+    # replaced. Both ends now spell out the same two characters the parser does.
+    lead = len(rest) - len(rest.lstrip(S_WHITE))
     open_idx = value_pos + lead if rest[lead:lead + 1] == "[" else -1
     if open_idx != -1:
         close_idx = stripped.find("]", open_idx)
-        end = close_idx + 1 if close_idx != -1 else len(stripped.rstrip())
+        end = close_idx + 1 if close_idx != -1 else len(stripped.rstrip(S_WHITE))
         return line[:open_idx] + new_list + line[end:]
     # scalar form: `reviewers: alice  # note` -> replace the value span only
     key_end = key_pos + len(key)
-    return line[:key_end] + " " + new_list + line[len(stripped.rstrip()):]
+    return line[:key_end] + " " + new_list + line[len(stripped.rstrip(S_WHITE)):]
 
 
 def rewrite_config(text, locs, rule_replacements, default_pool_replacement):
@@ -382,7 +421,14 @@ def rewrite_config(text, locs, rule_replacements, default_pool_replacement):
         else:
             _, item_lines, indent = loc
             drop.update(item_lines)
-            insert_at[item_lines[0]] = [" " * indent + "- " + l for l in logins]
+            # Carry the replaced line's CR, if it had one. `lines` comes from a
+            # `split("\n")`, so on a CRLF document every line still ends in `\r`;
+            # now that the read path no longer translates newlines away, emitting
+            # a bare-LF item into a CRLF file would leave it with MIXED endings.
+            # The flow arm needs no equivalent — it rebuilds the line around the
+            # `[...]` span and keeps the tail, CR included.
+            eol = "\r" if lines[item_lines[0]].endswith("\r") else ""
+            insert_at[item_lines[0]] = [" " * indent + "- " + l + eol for l in logins]
 
     out = []
     for i, line in enumerate(lines):
@@ -772,12 +818,23 @@ def main():
             print(f"::warning::skipping invalid EXTRA_EXCLUDE_PATHS regex {rx!r}: {e}")
 
     # --- committed config (from the default branch, not the checkout ref) ---
+    # Read the config as BYTES and decode here, deliberately: `text=True` turns on
+    # universal-newline translation, which rewrites `\r\n` AND a bare `\r` to `\n`
+    # before the parser ever sees them. The runtime port reads the blob untranslated
+    # (`Buffer.from(res.data.content, 'base64').toString('utf8')`), so with `text=True`
+    # this generator parsed `alice` exactly where the runtime parsed `alice\r` and
+    # refused to route it — the very divergence class `parse_reviewer_config`'s
+    # `re.split(r"\r?\n", ...)` exists to close, reintroduced one layer up and
+    # invisible to a unit test that feeds the parser text directly. It also kept
+    # `rewrite_config` from being byte-faithful on a CRLF config: every scheduled
+    # run would have rewritten the whole file to LF. `errors="replace"` matches the
+    # `git log` read below — a drift generator must not hard-fail on odd bytes.
     show = subprocess.run(
         ["git", "show", f"refs/remotes/origin/{branch}:{config_path}"],
-        capture_output=True, text=True)
+        capture_output=True)
     if show.returncode != 0:
         return _noop_exit(f"could not read {config_path} on origin/{branch}")
-    committed_text = show.stdout
+    committed_text = show.stdout.decode("utf-8", errors="replace")
     config, locs = parse_reviewer_config(committed_text)
     if not config["rules"] and not config["default_pool"]:
         return _noop_exit(f"{config_path} has no rules or default_pool")
@@ -934,7 +991,11 @@ def main():
     new_config_path = os.path.join(results_dir, "reviewers.new.yml")
     report_path = os.path.join(results_dir, "report.json")
     pr_body_path = os.path.join(results_dir, "pr-body.md")
-    with open(new_config_path, "w", encoding="utf-8") as f:
+    # `newline=""` for the same reason the read above drops `text=True`: now that a
+    # CR can survive parsing as data, the write must not translate it back. (A no-op
+    # on the Linux runners, where `os.linesep` is already `\n` — explicit so the
+    # round-trip stays byte-faithful rather than platform-dependent.)
+    with open(new_config_path, "w", encoding="utf-8", newline="") as f:
         f.write(new_text)
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
