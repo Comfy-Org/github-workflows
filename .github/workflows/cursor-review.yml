@@ -46,9 +46,14 @@ name: Cursor Review (reusable)
 #     contents: read
 #     pull-requests: write
 #   concurrency:
-#     # PR number ONLY. `github.event.label.name` is empty on every widened
-#     # event, so keying on it splits one PR across groups that cannot cancel
-#     # each other.
+#     # OPTIONAL belt-and-braces once you are pinned past the commit that gave
+#     # this reusable its OWN workflow-level `concurrency:` block — that group
+#     # already collapses per-PR runs, and it is what makes skip-cursor-review
+#     # cancel a panel that is already running. Keep or drop this; just never
+#     # name a caller group `cursor-review-reusable-*` (a caller sharing the
+#     # reusable's group deadlocks its own run). PR number ONLY:
+#     # `github.event.label.name` is empty on every widened event, so keying on
+#     # it splits one PR across groups that cannot cancel each other.
 #     group: cursor-review-pr-${{ github.event.pull_request.number }}
 #     cancel-in-progress: true
 #   jobs:
@@ -307,6 +312,38 @@ on:
         description: PEM private key matching the bot_app_id input. Required only when bot_app_id is set.
         required: false
 
+concurrency:
+  # Owned by the REUSABLE so every caller gets it at its next pin bump — the
+  # same shape pr-size.yml and pr-area-label.yml use here. The `-reusable-`
+  # infix keeps the name off what a caller would naturally pick: a caller that
+  # declares the SAME group DEADLOCKS its own run, holding the group while its
+  # `uses:` job waits to acquire it (see the note in ci-groom.yml and
+  # docs/callers/pr-size.md).
+  #
+  # Slot rule: the trigger label AND the `skip-cursor-review` veto label share
+  # one `trigger` slot, so applying skip-cursor-review mid-flight CANCELS the
+  # running panel — the Gate's "skip-cursor-review wins" precedence, made true
+  # for in-flight runs too — and removing it cancels nothing that matters
+  # before starting a fresh one. Every OTHER label gets its own namespaced
+  # `label-<name>` slot, so an unrelated label add never kills a running
+  # review. `format('label-{0}', …)` is what stops a label literally named
+  # `trigger` (or `Trigger`; group names are case-insensitive) from reaching
+  # the shared slot.
+  #
+  # Non-label events carry an EMPTY `github.event.label.name`, so they fall to
+  # `label-` and share one slot among themselves. That is deliberate for
+  # `pull_request_review_thread` on a blocking caller: resolving a thread must
+  # never cancel a panel. But a `run_without_label` caller STARTS panels from
+  # plain PR events, so those four actions — and only those four, mirroring the
+  # Gate's own case list — join `trigger` as well; otherwise a
+  # synchronize-triggered panel would sit in a slot the veto label cannot
+  # reach, which is the case this block exists for.
+  #
+  # `inputs` is an allowed context in a called workflow's workflow-level
+  # `concurrency:`, same as the `env:` block below.
+  group: cursor-review-reusable-${{ github.event.pull_request.number || github.ref }}-${{ (github.event.label.name == inputs.review_label || github.event.label.name == 'skip-cursor-review' || (inputs.run_without_label && github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || github.event.action == 'synchronize'))) && 'trigger' || format('label-{0}', github.event.label.name) }}
+  cancel-in-progress: true
+
 # DIFF_SIZE_CAP / REVIEW_LABEL / JUDGE_MODEL / DIFF_EXCLUDES are mapped from
 # `inputs` here so the run steps below read them verbatim from the original
 # (private-repo) workflow without per-step plumbing. `inputs` is available to
@@ -407,8 +444,16 @@ jobs:
             esac
           fi
 
-          # Only adding the trigger label fires the matrix. Removing it cancels
-          # any in-progress run via the concurrency group and then no-ops here.
+          # Only adding the trigger label fires the matrix. Adding or removing
+          # the trigger label, and ADDING skip-cursor-review, all resolve to the
+          # reusable's shared `trigger` concurrency slot (see the workflow-level
+          # `concurrency:` block), so any in-flight run for this PR is already
+          # cancelled before this step gets to decide — which is what makes the
+          # skip-cursor-review veto above true for a panel that is still
+          # running, not just for one that has yet to start. A caller pinned
+          # BELOW that commit has only its own label-scoped group, which covers
+          # the trigger label alone: there, applying skip-cursor-review does not
+          # stop a running panel.
           if [ "$LABEL_NAME" = "$REVIEW_LABEL" ] && [ "$GH_EVENT_ACTION" = "labeled" ]; then
             echo "$REVIEW_LABEL label added — running."
             echo "should_run=true" >> "$GITHUB_OUTPUT"
@@ -417,6 +462,9 @@ jobs:
 
           # Removing skip-cursor-review while the trigger label is present
           # unblocks a previously skipped review — treat it as a fresh trigger.
+          # This event shares the `trigger` concurrency slot too, so anything
+          # in flight for this PR has already been cancelled; the dup check
+          # below still covers the case where a review COMPLETED at this SHA.
           if [ "$LABEL_NAME" = "skip-cursor-review" ] && [ "$GH_EVENT_ACTION" = "unlabeled" ]; then
             if echo "$PR_LABELS" | jq -e --arg l "$REVIEW_LABEL" 'index($l)' > /dev/null; then
               echo "skip-cursor-review removed while $REVIEW_LABEL is present — running."
