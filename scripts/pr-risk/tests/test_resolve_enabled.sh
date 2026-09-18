@@ -104,6 +104,14 @@ case "$SUMMARY" in
   *"This MANUAL run grades anyway"*) ok "it says the manual run will grade" ;;
   *) bad "it says the manual run will grade" "$SUMMARY" ;;
 esac
+# ...and that the OPT-IN surfaces ride along with it. `publish-check` follows the grade job rather
+# than `enabled` (see its `if:` in pr-risk.yml) and the sticky comment is posted from inside grade
+# itself, so a disabled dispatch on an opted-in caller leaves a comment and a Check Run too. A
+# summary naming only the label would understate what the run is about to write to the PR.
+case "$SUMMARY" in
+  *"post the sticky comment and the Check Run"*) ok "and that the opted-in surfaces ride along" ;;
+  *) bad "and that the opted-in surfaces ride along" "$SUMMARY" ;;
+esac
 # And it must warn that the label it leaves goes stale, since pushes will not re-grade it.
 case "$SUMMARY" in
   *"every later commit will go ungraded"*) ok "and that the label will not stay current" ;;

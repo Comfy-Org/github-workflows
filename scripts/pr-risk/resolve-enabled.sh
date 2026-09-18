@@ -70,8 +70,9 @@ if [ "$enabled" != true ] && [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     {
       echo "## Automatic PR risk grading is OFF for this repository"
       echo
-      echo "This MANUAL run grades anyway and will sync a \`risk:*\` label — \`enabled\` governs"
-      echo "the \`pull_request\` stream, not a dispatch anyone with write access chose to run."
+      echo "This MANUAL run grades anyway and will sync a \`risk:*\` label and, where the caller"
+      echo "opted in, post the sticky comment and the Check Run — \`enabled\` governs the"
+      echo "\`pull_request\` stream, not a dispatch anyone with write access chose to run."
       echo
       echo "So the label this run leaves will NOT be kept up to date by pushes: until grading is"
       echo "switched on, it reflects this moment only and every later commit will go ungraded."
