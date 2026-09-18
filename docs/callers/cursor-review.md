@@ -250,6 +250,8 @@ the job log:
 | Unanchored findings | Findings the review could not anchor to a line of the reviewed diff, so they were demoted to the review **body** and have no thread. The Blocking gate cannot see them; read the body. |
 | Nothing delivered | No review carrying resolvable finding threads reached the PR — a read-only token, a rejected inline payload, or a post that could not be confirmed. The findings are in the `Post review` job summary. |
 | Judge degraded | The judge model never adjudicated; the review is the raw union of the cells' findings, so duplicates and false positives were not filtered out. |
+| Panel never adjudicated / Post review failed | `Consolidate panel` or `Post review` did not succeed, so the values the causes above are read from are absent. Reported as its own cause rather than inferred from the empty outputs, because an absent output is not a clean one — and because `delivered=true` is written the moment the POST returns, so it can survive a `Post review` job that dies in a later step. |
+| Cell counts missing | `ok_count`/`total` came back empty. Counted as an incomplete panel: unset-vs-unset compares equal, so without this the check would print "whole panel" having counted nothing. |
 
 **Your caller job goes red with a failing leg, and that is the point.** A
 reusable workflow's caller job takes the aggregate conclusion of the jobs inside
@@ -263,6 +265,16 @@ legs or re-triggering the review is what clears it. If you want a *merge* gate,
 require `Panel integrity` — do **not** require the caller job itself, which is
 red for every unrelated infrastructure failure too.
 
+**"Re-run failed jobs" posts a second review.** GitHub's re-run-failed-jobs
+re-runs every job that *depends* on a failed one, so re-running a red leg also
+re-runs `Consolidate panel` and `Post review` — while the green `Gate` is not
+re-run and its cached `already_reviewed=false` is reused. `post-review.py`'s
+landed-review check only fires when the POST itself *errors*, so a clean re-run
+POSTs, and the PR ends up with two consolidated reviews. Prefer **re-running the
+whole workflow** (which re-runs `Gate`, whose dup-check sees the review that
+already landed) or re-triggering by label. Use re-run-failed-jobs when you
+actually want a second, fuller review on the same commit.
+
 Three more shapes to expect before you require it:
 
 * **A cancelled run reports red.** GitHub counts a *skipped* required check as
@@ -275,12 +287,15 @@ Three more shapes to expect before you require it:
   list does — and a required check whose name no longer exists blocks every PR
   in the repo. `Panel integrity` is stable by design.
 * **It is red, not skipped, when the decision itself failed.** Panel integrity
-  is gated on the same four conditions the panel is, and all four read `Gate`'s
-  and `Diff size check`'s job *outputs* — which are empty when those jobs
-  **failed**. Gating on them alone would skip this check exactly when a dup-check
-  API call errored or the diff could not be built, and GitHub counts a skipped
-  required check as **passing**. So a failed `Gate` or `Diff size check` runs
-  this job and fails it: an undecided run is not a clean run.
+  is gated on the same four conditions the panel is. Three of them read `Gate`'s
+  and `Diff size check`'s job *outputs*, which are empty when those jobs
+  **failed**; the fourth reads the review matrix's *result*, which is `skipped`
+  when `Preflight — validate model catalog` failed, because the matrix `needs:`
+  it. Gating on those alone would skip this check exactly when a dup-check API
+  call errored, the diff could not be built, or a delisted model stopped the
+  panel before a single cell started — and GitHub counts a skipped required
+  check as **passing**. So a failed `Gate`, `Diff size check` **or `Preflight`**
+  runs this job and fails it: an undecided run is not a clean run.
 * **It still skips when no review was warranted, and a skip is green.** The
   deliberate no-panel branches — no trigger label, an already-reviewed commit, a
   PR over the diff-size cap, a fork the panel cannot run on — are the ones where
@@ -291,6 +306,25 @@ Three more shapes to expect before you require it:
   relevantly, if you do not want an over-cap PR merging unreviewed — require the
   Blocking gate, which fails closed on over-cap fresh reviews, and keep your own
   label policy. Do not read a skipped Panel integrity as "the panel was fine".
+* **It detects a cell that went missing, not a cell that lied.** "Did this cell
+  submit" is the `status` field of the artifact the cell itself wrote, and that
+  cell's agent runs `--trust` with shell access over attacker-authored diff
+  text. A prompt-injected cell can write `{"status": "ok"}` with zero findings
+  and green both its own leg and the panel count. That is a real limit, not a
+  quibble: this check is an availability signal — it catches the stalls, crashes
+  and caps that make up essentially all of the observed failures — and is **not**
+  an attestation that six independent reviews happened. Making the count
+  forgery-resistant needs the submission recorded outside the cell's own
+  writable job; until then, do not treat a green `Panel integrity` as proof
+  against an adversarial PR.
+* **One listed cause is wired but inert.** The job also reads
+  `diff-size`'s `incremental_subset` — "were the cells prioritized onto hunks
+  that were actually in the reviewed diff?" — and fails on a literal `false`.
+  `Diff size check` does not publish that output yet (it arrives with the
+  incremental-diff fix), so today the expression is the empty string, which
+  counts as "not measured", i.e. a pass. Nothing in the rollup changes when it
+  starts being published; it is documented here so the cause table is not read
+  as a scope check that is already running.
 
 ## Blocking-gate gotchas
 

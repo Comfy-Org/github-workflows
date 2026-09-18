@@ -1761,6 +1761,15 @@ jobs:
         # consolidated review still posts — the only thing that changes is that
         # the gap is now visible. `Panel integrity` further down aggregates the
         # same fact into one panel-level context.
+        #
+        # SCOPE, because the check reads stronger than it is: the verdict is the
+        # `status` this cell's OWN agent wrote, and that agent runs `--trust`
+        # with shell access over attacker-authored diff text, so a prompt-injected
+        # cell can write status=ok with no findings and green both this leg and
+        # the panel count. This is an AVAILABILITY signal — it catches the stalls,
+        # crashes and step caps that are what every observed failure has been —
+        # not an attestation that a review happened. A forgery-resistant count
+        # needs the submission recorded outside the cell's own writable job.
         if: always()
         env:
           MODEL: ${{ matrix.model }}
@@ -1773,13 +1782,21 @@ jobs:
           # ::workflow command:: line. The substitution REPLACES a disallowed
           # character rather than dropping it — deleting would let a crafted
           # "o k" collapse into the one value that passes.
+          #
+          # `ValueError`, not `json.JSONDecodeError`: the file is opened as
+          # utf-8, so invalid UTF-8 — reachable precisely BECAUSE these bytes
+          # are agent-written — raises `UnicodeDecodeError`, which is NOT a
+          # JSONDecodeError. Under `set -e` that traceback would kill the step
+          # and lose the `::error::` naming which cell failed, turning the one
+          # case this step exists to report into an unlabelled crash. Both
+          # exception types subclass `ValueError`, so one clause covers the pair.
           status=$(python3 - <<'PY'
           import json, re
 
           try:
               with open("/tmp/findings-out/findings.json", encoding="utf-8") as f:
                   cell = json.load(f)
-          except (OSError, json.JSONDecodeError):
+          except (OSError, ValueError):
               cell = None
           value = cell.get("status") if isinstance(cell, dict) else None
           if not isinstance(value, str):
@@ -2677,20 +2694,25 @@ jobs:
     # superseded head SHA, not the new one.
     #
     # That same "skipped counts as passing" rule is why those four conditions
-    # cannot be read STRAIGHT off `gate` and `diff-size`. Every one of them is a
-    # job OUTPUT, and a job that FAILED has empty outputs — so a gate whose
-    # dup-check API call errored, or a diff-size that could not build the diff at
-    # all, would make all four false, skip this job, and mint a GREEN required
-    # check on a run where whether the PR was reviewed is unknown. An undecided
-    # run is not a clean run. So the condition below runs this job whenever an
-    # upstream DECISION job did not succeed, and `Fail if the panel decision
-    # itself did not complete` turns that into red — the same fail-closed shape,
-    # and the same reasoning, as `Blocking gate`'s first two guards. The
-    # deliberate skips are unchanged: they are the branches where `gate` and
-    # `diff-size` both SUCCEEDED and said no panel was warranted.
+    # cannot be read STRAIGHT off `gate`, `diff-size` and the matrix. Three of
+    # them are job OUTPUTS, and a job that FAILED has empty outputs — so a gate
+    # whose dup-check API call errored, or a diff-size that could not build the
+    # diff at all, would make all four false, skip this job, and mint a GREEN
+    # required check on a run where whether the PR was reviewed is unknown. The
+    # fourth, `needs.review.result != 'skipped'`, has the same hole from the
+    # other end: `review` needs `preflight`, so a FAILED preflight skips the
+    # whole matrix and leaves a 'skipped' result that reads exactly like the
+    # deliberate no-panel branches — a green check over a run where not one cell
+    # ever started. An undecided run is not a clean run. So the condition below
+    # runs this job whenever an upstream DECISION job (`gate`, `diff-size`,
+    # `preflight`) did not succeed, and `Fail if the panel decision itself did
+    # not complete` turns that into red — the same fail-closed shape, and the
+    # same reasoning, as `Blocking gate`'s first two guards. The deliberate
+    # skips are unchanged: they are the branches where `gate` and `diff-size`
+    # both SUCCEEDED and said no panel was warranted.
     name: Panel integrity
-    needs: [gate, diff-size, review, consolidate, post-review]
-    if: ${{ always() && (needs.gate.result != 'success' || (needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && (needs.diff-size.result != 'success' || (needs.diff-size.outputs.within_cap == 'true' && needs.review.result != 'skipped')))) }}
+    needs: [gate, diff-size, preflight, review, consolidate, post-review]
+    if: ${{ always() && (needs.gate.result != 'success' || (needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && (needs.diff-size.result != 'success' || (needs.diff-size.outputs.within_cap == 'true' && (needs.preflight.result != 'success' || needs.review.result != 'skipped'))))) }}
     runs-on: ubuntu-latest
     # Reads job outputs and prints. No API call, no checkout, no network.
     timeout-minutes: 5
@@ -2709,17 +2731,28 @@ jobs:
         # even decided on, which is a true statement about the wrong question.
         #
         # This condition is exact GIVEN the job `if:` above, which admits only
-        # two ways to arrive here with an upstream decision job unfinished:
-        # `gate` did not succeed, or `gate` selected a fresh in-scope review and
-        # `diff-size` did not succeed. Both are read back verbatim. (`within_cap`
-        # can only be the string 'true' when `diff-size` succeeded, so the
-        # deliberate over-cap skip never reaches this step.)
-        if: ${{ needs.gate.result != 'success' || needs.diff-size.result != 'success' }}
+        # three ways to arrive here with an upstream decision job unfinished:
+        # `gate` did not succeed; `gate` selected a fresh in-scope review and
+        # `diff-size` did not succeed; or both succeeded and said review, and
+        # `preflight` did not succeed. All three are read back verbatim.
+        # (`within_cap` can only be the string 'true' when `diff-size`
+        # succeeded, so the deliberate over-cap skip never reaches this step.)
+        #
+        # `preflight` is here because it is the THIRD decision job, and the one
+        # whose failure is invisible from the outputs: `review` needs it, so a
+        # red `preflight` SKIPS the whole matrix, `needs.review.result` is then
+        # 'skipped' — indistinguishable from the deliberate no-panel branches —
+        # and gating on that alone skipped this job and minted a GREEN required
+        # check on a run where NOTHING was reviewed. The job `if:` therefore
+        # admits a non-success `preflight` under a within-cap fresh review, and
+        # this step turns it red. A panel that never started is not a whole one.
+        if: ${{ needs.gate.result != 'success' || needs.diff-size.result != 'success' || needs.preflight.result != 'success' }}
         env:
           GATE_RESULT: ${{ needs.gate.result }}
           DIFF_SIZE_RESULT: ${{ needs.diff-size.result }}
+          PREFLIGHT_RESULT: ${{ needs.preflight.result }}
         run: |
-          echo "::error::Panel integrity cannot be judged: the jobs that decide whether a panel should run did not succeed (gate: ${GATE_RESULT}, diff size: ${DIFF_SIZE_RESULT}). Whether this PR was reviewed at all is unknown — re-run the failed job."
+          echo "::error::Panel integrity cannot be judged: the jobs that decide whether a panel should run did not succeed (gate: ${GATE_RESULT}, diff size: ${DIFF_SIZE_RESULT}, preflight: ${PREFLIGHT_RESULT}). Whether this PR was reviewed at all is unknown — re-run the failed job."
           exit 1
 
       - name: Report panel integrity
@@ -2731,6 +2764,20 @@ jobs:
           DELIVERED: ${{ needs.post-review.outputs.delivered }}
           GATED: ${{ needs.post-review.outputs.gated_findings }}
           UNGATED: ${{ needs.post-review.outputs.ungated_findings }}
+          # The RESULTS of the two jobs every value above comes out of. Each
+          # cause below is phrased against an OUTPUT, and an output is the empty
+          # string when the job producing it failed, was skipped or was
+          # cancelled — a state every one of those causes would otherwise read
+          # as a pass. `OK_COUNT != TOTAL` is the sharpest case: both are empty
+          # on a dead `consolidate`, so the comparison is unset-vs-unset and
+          # says "whole panel". That is caught today only because `DELIVERED`
+          # happens to be empty on those same runs, which is coincidence, not a
+          # guard — `post-review.py` writes `delivered=true` the moment the POST
+          # returns and keeps working, so a `post-review` that dies in a LATER
+          # step leaves delivered=true behind a red job. Read both signals, the
+          # way `Blocking gate`'s second guard does.
+          CONSOLIDATE_RESULT: ${{ needs.consolidate.result }}
+          POST_REVIEW_RESULT: ${{ needs.post-review.result }}
           # Declared by `diff-size` only once the incremental-diff fix lands;
           # until then this expression is the empty string and the check below
           # is inert BY DESIGN. Empty is "not measured", which is a pass — the
@@ -2747,7 +2794,26 @@ jobs:
 
           causes=0
 
-          if [ "$OK_COUNT" != "$TOTAL" ]; then
+          # Job-result causes FIRST, so a dead producer is named as itself
+          # rather than inferred from the empty outputs it left behind.
+          if [ "$CONSOLIDATE_RESULT" != "success" ]; then
+            echo "::error::The panel was never adjudicated: the Consolidate panel job did not succeed (result=$(flatten "${CONSOLIDATE_RESULT:-<unset>}")). Its cell counts and judge status are unavailable, so panel completeness is unknown rather than clean."
+            causes=$((causes + 1))
+          fi
+
+          if [ "$POST_REVIEW_RESULT" != "success" ]; then
+            echo "::error::The Post review job did not succeed (result=$(flatten "${POST_REVIEW_RESULT:-<unset>}")), so whether a review with resolvable threads reached this PR is unknown — delivered=true is written the moment the POST returns, before the rest of that job runs."
+            causes=$((causes + 1))
+          fi
+
+          # An EMPTY count is not a matching count. Guarded separately from the
+          # comparison below because unset-vs-unset compares EQUAL in `test`,
+          # which is the one way this check could print "whole panel" having
+          # counted nothing at all.
+          if [ -z "$OK_COUNT" ] || [ -z "$TOTAL" ]; then
+            echo "::error::Panel cell counts are missing (ok_count=$(flatten "${OK_COUNT:-<unset>}"), total=$(flatten "${TOTAL:-<unset>}")), so how many reviewer cells submitted cannot be established. Treat this as an incomplete panel, not a whole one."
+            causes=$((causes + 1))
+          elif [ "$OK_COUNT" != "$TOTAL" ]; then
             echo "::error::Panel incomplete: $(flatten "$OK_COUNT") of $(flatten "$TOTAL") reviewer cells submitted a review. The consolidated review was adjudicated over a short panel — see the red leg checks for which cells did not submit."
             causes=$((causes + 1))
           fi

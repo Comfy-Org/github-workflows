@@ -74,7 +74,7 @@ The jobs, in the order they report:
 | `<review type> (<model>)` — one per cell | reviewing | **That cell did not submit a review.** Its artifact is still uploaded and the panel still consolidates; the leg is red so the gap reaches `statusCheckRollup`. Never require one of these: the context name carries the model id and changes whenever the panel list does. |
 | `Consolidate panel` | reviewing | The judge job failed outright (a hung judge is absorbed and falls back to the panel union instead). |
 | `Post review` | Consolidate panel succeeded | The POST failed, or succeeded without the run being able to confirm it. The findings are written to the job summary in that case — see [Delivery, the body-only fallback, and a throttled POST](#delivery-the-body-only-fallback-and-a-throttled-post). |
-| `Panel integrity` | reviewing, **or** the decision to review failed | The panel was short, findings went unanchored, nothing was delivered, the judge never adjudicated — or `Gate`/`Diff size check` failed, leaving whether the PR was reviewed unknown. Skipped, not green-by-verdict, when no review was warranted. Advisory unless a caller marks it required. |
+| `Panel integrity` | reviewing, **or** the decision to review failed | The panel was short, findings went unanchored, nothing was delivered, the judge never adjudicated — or `Gate`/`Diff size check`/`Preflight` failed, leaving whether the PR was reviewed unknown. Skipped, not green-by-verdict, when no review was warranted. Advisory unless a caller marks it required. |
 | `Blocking gate` | `blocking: true` | Unresolved, non-outdated finding threads — or a round that should have produced them and did not. Opt-in. |
 
 **Post review is its own job, and that is a security boundary.** No job both
@@ -110,11 +110,20 @@ the artifact upload so the panel keeps consolidating and the review still posts.
 And one `Panel integrity` job reads the panel-level facts back off
 `consolidate`'s and `post-review`'s job outputs and goes red on any of: fewer
 cells submitted than ran; findings demoted to the review body with no thread;
-no review delivered; the judge never adjudicated. It also goes red — rather than
-skipping — when `gate` or `diff-size` *failed*, because every one of those
-conditions reads a job output, an output is empty when the job producing it
-failed, and a skipped required check passes: the same fail-closed guard the
-Blocking gate carries. Otherwise it prints one
+no review delivered; the judge never adjudicated; `consolidate` or `post-review`
+did not succeed at all. It also goes red — rather than skipping — when `gate`,
+`diff-size` or `preflight` *failed*, because three of those gate conditions read
+a job output (empty when the job producing it failed) and the fourth reads the
+matrix result (`skipped` when `preflight` failed, since the matrix `needs:` it),
+while a skipped required check passes: the same fail-closed guard the Blocking
+gate carries.
+
+What it is **not** is an attestation that six independent reviews happened. A
+leg's "did it submit" verdict is the `status` its own `--trust` agent wrote into
+`findings.json`, so a prompt-injected cell can green itself; this is an
+availability signal against stalls, crashes and step caps — which is what every
+observed failure has been — and a forgery-resistant count would need the
+submission recorded outside the cell's own writable job. Otherwise it prints one
 `::notice::Panel integrity: <ok>/<total> cells, <n> anchored finding(s), 0
 unanchored.` It gates no other job — a short panel must not also cost the PR the
 findings it did produce — so blocking on it is the caller's call, exactly like

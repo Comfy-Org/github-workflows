@@ -68,6 +68,25 @@ GATE_CONDITIONS = (
 # pass) and turning the check into a permanent green.
 UNTRUSTED_VALUES = ("OK_COUNT", "TOTAL", "JUDGE_STATUS", "DELIVERED", "UNGATED", "GATED")
 
+# The three jobs whose non-success means "nobody decided whether to review this
+# PR". `preflight` is the subtle one: the review matrix `needs:` it, so a failed
+# preflight leaves `needs.review.result == 'skipped'` — byte-identical to the
+# deliberate no-panel branches — and gating on that alone minted a GREEN
+# required check on a run where not one cell ever started.
+DECISION_RESULTS = (
+    "needs.gate.result != 'success'",
+    "needs.diff-size.result != 'success'",
+    "needs.preflight.result != 'success'",
+)
+
+# Causes that read a producing job's RESULT rather than its outputs. An output
+# is the empty string when its job failed/was skipped/was cancelled, and every
+# output-shaped cause treats empty as a pass.
+RESULT_CAUSES = (
+    "needs.consolidate.result",
+    "needs.post-review.result",
+)
+
 CAUSE_READS = (
     "needs.consolidate.outputs.ok_count",
     "needs.consolidate.outputs.total",
@@ -322,20 +341,40 @@ class PanelIntegrityJobTest(unittest.TestCase):
         # `cursor-agent --trust` over PR code. A newline reaching a
         # ::workflow command:: line forges a second command, so every one of
         # these must be interpolated through `flatten` and nowhere else.
+        #
+        # Two things this had to get right, and originally did not:
+        #
+        # 1. The pattern matches the BARE `$VAR` / `${VAR`, with no leading
+        #    quote. Requiring a `"` immediately before the `$` only ever matched
+        #    the already-safe `$(flatten "$VAR")` form — so the unsafe form this
+        #    test exists to catch (`status=$JUDGE_STATUS`, a non-quote character
+        #    before the `$`) never matched at all, while `hits` stayed non-zero
+        #    from the safe occurrences and the assertion passed VACUOUSLY over a
+        #    real workflow-command injection.
+        # 2. Every line that ECHOES is checked, not only lines containing `::`.
+        #    The runner parses workflow commands on every stdout line, so an
+        #    untrusted value echoed on a plain log line is the same hole. Lines
+        #    that merely TEST a value (`if [ "$OK_COUNT" != "$TOTAL" ]`) reach no
+        #    stdout and are correctly left alone.
         self.assertIn("flatten()", self.body)
         for var in UNTRUSTED_VALUES:
-            pattern = re.compile(r'"\$\{?%s\b' % var)
+            pattern = re.compile(r"\$\{?%s\b" % var)
             hits = 0
             for line in self.body.split("\n"):
-                if "::" not in line:  # only the annotation lines interpolate
+                if "echo " not in line:  # only echoed lines reach the log
                     continue
                 for match in pattern.finditer(line):
                     hits += 1
+                    # `$(flatten "$VAR"` and `$(flatten "${VAR:-…}"` both leave
+                    # `…$(flatten "` before the match; the bare `$(flatten $VAR`
+                    # form leaves `…$(flatten `. Strip the optional quote, then
+                    # require the call.
+                    prefix = line[: match.start()].rstrip('"')
                     self.assertTrue(
-                        line[: match.start()].endswith("flatten "),
-                        f"`{PANEL_JOB}` interpolates ${var} into an annotation "
-                        "without flatten(): a newline in it forges a workflow "
-                        f"command\n    {line.strip()}",
+                        prefix.endswith("flatten "),
+                        f"`{PANEL_JOB}` echoes ${var} without flatten(): a "
+                        "newline in it forges a second workflow command"
+                        f"\n    {line.strip()}",
                     )
             self.assertTrue(hits, f"`{PANEL_JOB}` no longer reports ${var}")
 
@@ -374,9 +413,9 @@ class UndecidedRunFailsClosedTest(unittest.TestCase):
         self.assertIsNotNone(self.condition)
 
     def test_the_job_runs_when_an_upstream_decision_job_failed(self):
-        # Without BOTH disjuncts the job is skipped on the failing path and the
+        # Without EVERY disjunct the job is skipped on that failing path and the
         # guard step below can never fire, however it is written.
-        for result in ("needs.gate.result != 'success'", "needs.diff-size.result != 'success'"):
+        for result in DECISION_RESULTS:
             self.assertIn(
                 result,
                 self.condition,
@@ -402,10 +441,10 @@ class UndecidedRunFailsClosedTest(unittest.TestCase):
             "the wrong question on a run that was never decided",
         )
 
-    def test_the_guard_step_fires_on_either_failure_and_exits_nonzero(self):
+    def test_the_guard_step_fires_on_every_failure_and_exits_nonzero(self):
         body = code_lines(step_named(self.panel, UNDECIDED_STEP))
         joined = "\n".join(body)
-        for result in ("needs.gate.result != 'success'", "needs.diff-size.result != 'success'"):
+        for result in DECISION_RESULTS:
             self.assertIn(
                 result,
                 joined,
@@ -420,6 +459,38 @@ class UndecidedRunFailsClosedTest(unittest.TestCase):
             f"`{UNDECIDED_STEP}` no longer exits non-zero",
         )
         self.assertIn("::error::", joined)
+
+    def test_it_needs_preflight_so_it_can_read_its_result(self):
+        # `needs.preflight.result` evaluates to the empty string unless the job
+        # is declared in `needs:` — and '' != 'success' is TRUE, so dropping it
+        # from the list would make this check red on EVERY run rather than
+        # failing open. Loud, but still wrong, and pinned so it stays declared.
+        declared = {
+            part.strip()
+            for part in (job_scalar(self.panel, "needs") or "").strip("[]").split(",")
+            if part.strip()
+        }
+        self.assertIn("preflight", declared)
+
+    def test_the_causes_read_the_producing_jobs_results_not_only_outputs(self):
+        # `ok_count`/`total` are BOTH empty when `consolidate` died, and
+        # unset-vs-unset compares equal, so the completeness comparison alone
+        # reports a whole panel over a job that never ran. Pair every cause with
+        # its producer's result, and reject an empty count explicitly.
+        report = "\n".join(code_lines(step_named(self.panel, REPORT_STEP)))
+        for cause in RESULT_CAUSES:
+            self.assertIn(
+                "${{ %s }}" % cause,
+                report,
+                f"`{REPORT_STEP}` no longer reads `{cause}` — an empty output "
+                "from a dead producer then reads as a pass",
+            )
+        self.assertIn(
+            '[ -z "$OK_COUNT" ] || [ -z "$TOTAL" ]',
+            report,
+            f"`{REPORT_STEP}` no longer rejects empty cell counts: unset-vs-unset "
+            'compares EQUAL, so it would print "whole panel" having counted nothing',
+        )
 
     def test_the_deliberate_skips_are_still_skips(self):
         # The fail-closed disjunct must not swallow the intentional no-panel
