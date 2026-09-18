@@ -117,6 +117,15 @@ case "$SUMMARY" in
   *"every later commit will go ungraded"*) ok "and that the label will not stay current" ;;
   *) bad "and that the label will not stay current" "$SUMMARY" ;;
 esac
+# The STICKY COMMENT goes stale the same way and must be named in that warning too. It is only
+# refreshed by a later re-grade, which a disabled repo never performs, so it keeps displaying this
+# moment's tier while every subsequent commit goes ungraded underneath it. A warning naming only
+# the label reads as though the comment were still live. (The Check Run needs no such caveat: it
+# is pinned to the commit it graded, so it never becomes untrue of that commit.)
+case "$SUMMARY" in
+  *"and the sticky comment"*) ok "and that the sticky comment goes stale with it" ;;
+  *) bad "and that the sticky comment goes stale with it" "$SUMMARY" ;;
+esac
 # The non-dispatch summary keeps its own claim, and points at the dispatch escape hatch.
 run false "" pull_request
 case "$SUMMARY" in
