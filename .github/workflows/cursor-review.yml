@@ -46,9 +46,16 @@ name: Cursor Review (reusable)
 #     contents: read
 #     pull-requests: write
 #   concurrency:
-#     # PR number ONLY. `github.event.label.name` is empty on every widened
-#     # event, so keying on it splits one PR across groups that cannot cancel
-#     # each other.
+#     # KEEP THIS. The reusable owns a workflow-level `concurrency:` block of
+#     # its own — that is what makes skip-cursor-review cancel a panel already
+#     # running — but it REFINES this group rather than replacing it: under the
+#     # default `run_without_label: false` it does not cancel on push. Never
+#     # name a caller group `cursor-review-reusable-*` (a caller sharing the
+#     # reusable's group deadlocks its own run), and call this from a dedicated
+#     # workflow file, not one job of a larger ci.yml — cancellation is
+#     # run-scoped. PR number ONLY: `github.event.label.name` is empty on every
+#     # widened event, so keying on it splits one PR across groups that cannot
+#     # cancel each other.
 #     group: cursor-review-pr-${{ github.event.pull_request.number }}
 #     cancel-in-progress: true
 #   jobs:
@@ -307,6 +314,60 @@ on:
         description: PEM private key matching the bot_app_id input. Required only when bot_app_id is set.
         required: false
 
+concurrency:
+  # Owned by the REUSABLE so every caller gets it at its next pin bump — the
+  # same shape pr-size.yml and pr-area-label.yml use here. The `-reusable-`
+  # infix keeps the name off what a caller would naturally pick: a caller that
+  # declares the SAME group DEADLOCKS its own run, holding the group while its
+  # `uses:` job waits to acquire it (see the note in ci-groom.yml and
+  # docs/callers/pr-size.md).
+  #
+  # Slot rule: the trigger label AND the `skip-cursor-review` veto label share
+  # one `trigger` slot, so applying skip-cursor-review mid-flight CANCELS the
+  # running panel — the Gate's "skip-cursor-review wins" precedence, made true
+  # for in-flight runs too — and removing it cancels nothing that matters
+  # before starting a fresh one. Every OTHER label gets its own namespaced
+  # `label-<name>` slot, so an unrelated label add never kills a running
+  # review. `format('label-{0}', …)` is what stops a label literally named
+  # `trigger` (or `Trigger`; group names are case-insensitive) from reaching
+  # the shared slot.
+  #
+  # Non-label events carry an EMPTY `github.event.label.name`, so they fall to
+  # `label-` and share one slot among themselves. That is deliberate for
+  # `pull_request_review_thread` on a blocking caller: resolving a thread must
+  # never cancel a panel. But a `run_without_label` caller STARTS panels from
+  # plain PR events, so those four actions — and only those four, mirroring the
+  # Gate's own case list — join `trigger` as well; otherwise a
+  # synchronize-triggered panel would sit in a slot the veto label cannot
+  # reach, which is the case this block exists for.
+  #
+  # `inputs.review_label != ''` guards the first disjunct because the input is
+  # `required: false` and a caller CAN pass an empty string. GitHub coerces a
+  # missing `github.event.label` and `''` alike in a mixed comparison, so
+  # without the guard every non-label event — `pull_request_review_thread`
+  # included — would compare EQUAL and join `trigger`, making a thread resolve
+  # cancel a running panel: the exact case the paragraph above calls impossible.
+  #
+  # KNOWN GAP, case. `==` here is case-INSENSITIVE (GitHub expression
+  # semantics) while the Gate's own test is a case-SENSITIVE shell `=` and its
+  # veto check a case-sensitive `jq index(...)`. A label that differs from
+  # `review_label` only in case therefore reaches `trigger` and cancels the
+  # panel, then no-ops in the Gate — a review destroyed with nothing replacing
+  # it. Unfixable in an expression (there is no `lower()`, and `contains()` is
+  # case-insensitive too); it needs a case-matched `review_label`, which is the
+  # caller's to get right. Reachable only via that misconfiguration.
+  #
+  # Cancellation is ASYNCHRONOUS and SLOT-SCOPED, not ordered and total: a
+  # superseded run keeps unwinding after the new one starts, and only same-slot
+  # runs are cancelled at all. Anything reasoning about the state a cancelled
+  # run leaves behind has to allow for both — see the blocking-gate gotchas in
+  # docs/callers/cursor-review.md for the one place it is observable.
+  #
+  # `inputs` is an allowed context in a called workflow's workflow-level
+  # `concurrency:`, same as the `env:` block below.
+  group: cursor-review-reusable-${{ github.event.pull_request.number || github.ref }}-${{ ((inputs.review_label != '' && github.event.label.name == inputs.review_label) || github.event.label.name == 'skip-cursor-review' || (inputs.run_without_label && github.event_name == 'pull_request' && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || github.event.action == 'synchronize'))) && 'trigger' || format('label-{0}', github.event.label.name) }}
+  cancel-in-progress: true
+
 # DIFF_SIZE_CAP / REVIEW_LABEL / JUDGE_MODEL / DIFF_EXCLUDES are mapped from
 # `inputs` here so the run steps below read them verbatim from the original
 # (private-repo) workflow without per-step plumbing. `inputs` is available to
@@ -407,8 +468,21 @@ jobs:
             esac
           fi
 
-          # Only adding the trigger label fires the matrix. Removing it cancels
-          # any in-progress run via the concurrency group and then no-ops here.
+          # Only adding the trigger label fires the matrix. Adding or removing
+          # the trigger label, and ADDING skip-cursor-review, all resolve to the
+          # reusable's shared `trigger` concurrency slot (see the workflow-level
+          # `concurrency:` block), so GitHub has REQUESTED cancellation of any
+          # in-flight same-slot run for this PR by the time this step decides —
+          # which is what makes the skip-cursor-review veto above true for a
+          # panel that is still running, not just for one that has yet to
+          # start. Requested, not completed: cancellation is asynchronous, so
+          # the superseded run is still unwinding alongside this one, and it is
+          # slot-scoped, so a run sitting in a `label-<name>` slot is not
+          # cancelled at all. Do not add a panel starter outside `trigger` on
+          # the assumption that this step runs after the field is clear. A
+          # caller pinned BELOW that commit has only its own label-scoped group,
+          # which covers the trigger label alone: there, applying
+          # skip-cursor-review does not stop a running panel.
           if [ "$LABEL_NAME" = "$REVIEW_LABEL" ] && [ "$GH_EVENT_ACTION" = "labeled" ]; then
             echo "$REVIEW_LABEL label added — running."
             echo "should_run=true" >> "$GITHUB_OUTPUT"
@@ -417,6 +491,10 @@ jobs:
 
           # Removing skip-cursor-review while the trigger label is present
           # unblocks a previously skipped review — treat it as a fresh trigger.
+          # This event shares the `trigger` concurrency slot too, so a same-slot
+          # run in flight for this PR has been asked to cancel (asynchronously
+          # — it may still be unwinding here); the dup check below still covers
+          # the case where a review COMPLETED at this SHA.
           if [ "$LABEL_NAME" = "skip-cursor-review" ] && [ "$GH_EVENT_ACTION" = "unlabeled" ]; then
             if echo "$PR_LABELS" | jq -e --arg l "$REVIEW_LABEL" 'index($l)' > /dev/null; then
               echo "skip-cursor-review removed while $REVIEW_LABEL is present — running."
@@ -1666,7 +1744,16 @@ jobs:
     # a write-scoped token.
     name: Consolidate panel
     needs: [gate, diff-size, preflight, review, ledger]
-    if: always() && needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true' && needs.review.result != 'skipped'
+    # `!cancelled()`, not `always()`: the judge is the most expensive call in
+    # the workflow, and the only job that does anything with its payload,
+    # `post-review`, is itself `!cancelled()`. On a cancelled run — now an
+    # advertised escape hatch, since applying `skip-cursor-review` mid-panel
+    # cancels the run — `always()` spent up to 30 minutes adjudicating partial
+    # cell output that nothing could ever post. Individual cell FAILURES are a
+    # different thing and are still judged: `cancelled()` asks whether the RUN
+    # was cancelled, so a red or cancelled matrix cell still reaches the judge,
+    # which is what `always()` was here for.
+    if: ${{ !cancelled() && needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true' && needs.review.result != 'skipped' }}
     runs-on: ubuntu-latest
     # ABOVE the `review` cap, never under it. The judge reads every cell's
     # artifact with the same top reasoning tier one cell uses, so it is the
@@ -2762,7 +2849,16 @@ jobs:
   notify-complete:
     name: Notify complete
     needs: [gate, diff-size, review, consolidate, post-review]
-    if: always() && needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true' && needs.review.result != 'skipped'
+    # `!cancelled()` for the same reason `consolidate` above uses it, plus one
+    # of its own: this job reads a skipped/cancelled `post-review` as a posting
+    # failure and DMs the triggerer "Cursor review failed to post". On a
+    # cancelled run that message is simply false — the veto label, or a newer
+    # push, stopped the panel on purpose — so a run someone deliberately
+    # stopped should not page anyone. Genuine failures are untouched: a failed
+    # cell, judge or post is not a cancelled RUN and still notifies. (It also
+    # keeps this job's `needs: consolidate` honest now that `consolidate` is
+    # itself `!cancelled()` and no longer runs on a cancelled run.)
+    if: ${{ !cancelled() && needs.gate.outputs.should_run == 'true' && needs.gate.outputs.already_reviewed != 'true' && needs.diff-size.outputs.within_cap == 'true' && needs.review.result != 'skipped' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

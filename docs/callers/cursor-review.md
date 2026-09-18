@@ -65,8 +65,9 @@ on:
     types: [labeled, unlabeled]
 
 concurrency:
-  # cursor-review declares no group of its own, so a caller-level group is safe
-  # and worth having — it stops label-toggling from stacking panels.
+  # KEEP THIS. The reusable owns a group of its own (see "The reusable owns a
+  # group of its own" below), but it refines yours rather than replacing it.
+  # Never name a caller group `cursor-review-reusable-*`.
   # NOTE: label.name is part of the key only because this caller is label-only.
   # Drop it if you widen `types:` — see the run_without_label gotcha.
   group: cursor-review-pr-${{ github.event.pull_request.number }}-${{ github.event.label.name }}
@@ -175,7 +176,9 @@ on:
     types: [opened, reopened, ready_for_review, synchronize, labeled, unlabeled]
 
 concurrency:
-  # Drop `label.name` from the key — see below.
+  # KEEP THIS — it is what supersedes a running panel on push; the reusable's
+  # own group only does that under `run_without_label: true` (see below). Drop
+  # `label.name` from the key, and never name it `cursor-review-reusable-*`.
   group: cursor-review-pr-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 # ...
@@ -195,12 +198,44 @@ Keep `labeled`/`unlabeled` in the list even in label-free mode: the label path
 stays live alongside it, which is how you force a re-review on an unchanged commit
 (dismiss the existing review, then apply the label — see the dedupe gotcha below).
 
+**The reusable owns a group of its own — it ADDS to your caller group, it does not replace it.** `cursor-review.yml` declares a workflow-level `concurrency: cursor-review-reusable-<pr>-<slot>` with `cancel-in-progress: true`, which reaches you at your next pin bump with no caller edit and no permission change. Its slot rule: the trigger label and `skip-cursor-review` share one `trigger` slot, so **applying `skip-cursor-review` mid-panel cancels the running panel**; every other label gets its own `label-<name>` slot, so an unrelated label add never kills a running review; `pull_request_review_thread` events stay out of `trigger`, so resolving a finding thread on a blocking caller cannot cancel a panel; and under `run_without_label: true` the four plain PR actions the gate accepts (`opened` / `reopened` / `ready_for_review` / `synchronize`) join `trigger` as well, so a push supersedes a running panel and the veto label can still reach it.
+
+What it does **not** do is make your own group redundant. Keep the caller group in every shape above, and know what each side costs:
+
+- **Under the default `run_without_label: false`, the reusable's group does not supersede on push.** That arm of the `trigger` slot is gated on the input, so a `synchronize` event lands in `label-` while the label-triggered panel sits in `trigger`, and the push cancels nothing. `post-review`'s `!cancelled()` guard exists to stop a review pinned to a superseded head SHA and depends on that cancellation — so a widened or blocking caller that drops its PR-number-only group posts reviews against stale diffs, and under `blocking: true` gates red on threads for code that no longer exists.
+- **A PR-number-only caller group is coarser than the reusable's, and that is the price of the line above.** It puts *every* event for the PR in one slot, so an unrelated label add — or, on the blocking caller, a `pull_request_review_thread: resolved` — cancels the caller run, and with it the `uses:` panel job, before the reusable's per-slot group can isolate anything. The reusable's slots only refine what your own group has not already cancelled.
+
+**Two hard rules, both of them the ones [`pr-size`](pr-size.md) carries:**
+
+- **Never name a caller group `cursor-review-reusable-*`.** A caller that declares the reusable's own group deadlocks its own run — the caller holds the group while its `uses:` job waits to acquire it.
+- **Call cursor-review from a dedicated workflow file, not as one job of a larger `ci.yml`.** Cancellation is run-scoped, so the reusable's group cancels the whole caller *run* — including builds, tests and deploys that have nothing to do with the review. Unlike the deadlock rule this one arrives silently at your next pin bump, with no caller edit to warn you, so check it before you bump.
+
+**`review_label` must match your label's case exactly.** The slot expression compares it with a GitHub expression `==`, which is case-**in**sensitive, while the gate's own decision is a case-**sensitive** shell comparison. A label differing from `review_label` only in case therefore reaches the shared `trigger` slot and cancels a running panel, then no-ops in the gate — a review destroyed with nothing replacing it. GitHub expressions have no case-sensitive string compare, so the caller has to get this right.
+
+**Veto mid-flight: on a pin BELOW that change, `skip-cursor-review` does not stop a running panel.** With only a caller-level group, `labeled: skip-cursor-review` and `labeled: cursor-review` land in *different* groups (the group key carries `label.name`), so the veto starts a run that no-ops in the gate while the panel it was meant to stop keeps going — and still posts its review. Do not try to fix it caller-side by collapsing to a PR-number-only group: that does cancel on the veto, but it also puts *every* label event in one group, so adding an unrelated label kills a running review. Bump your pin past the reusable's own group instead — there is nothing to change in the caller.
+
 **`run_without_label: true` reviews every PR.** On a busy repo that is a large
 step up in spend. Start label-gated.
 
 ## Blocking-gate gotchas
 
 Everything in this section applies only once you pass `blocking: true`.
+
+**A mid-panel veto leaves the check's verdict racy.** Applying `skip-cursor-review`
+while a panel is running cancels that run and starts a second one, both on the
+same head SHA, and both publish a `Blocking gate` check. The cancelled run trips
+the "a fresh review was triggered but did not land" guard (`post-review` is
+`cancelled`) and reports **red**; the veto run has `should_run=false`, skips that
+guard, falls through to the live thread query and reports **green** unless an
+earlier round left unresolved threads. Which one sticks is whichever job finishes
+last, and nothing orders them. Treat a red gate straight after a veto as "re-run
+it", not as a finding: re-applying the trigger label, resolving the threads, or
+re-running the gate job settles it. The `always()` on that job is deliberate and
+is not the bug — a cancelled run that *skipped* the gate would mint a green
+required check, which is the exact fail-open BE-4691 added the job to close. Which
+verdict a vetoed PR *should* get is a policy question and is tracked separately;
+until it is settled, do not require the check on a repo where mid-panel vetoes are
+routine.
 
 **Widen your triggers before you require the check, or pushes brick the PR.**
 A required check that never *reports* on the head SHA blocks merge as
@@ -216,8 +251,12 @@ on:
     types: [resolved, unresolved]
 
 concurrency:
-  # PR number only — label.name is empty on the widened events, and split
-  # groups can't cancel each other (see the run_without_label gotcha).
+  # KEEP THIS — with `run_without_label: false` the reusable's own group does
+  # not cancel a panel on push, and this gate reports on the head SHA (see
+  # "The reusable owns a group of its own"); never name it
+  # `cursor-review-reusable-*`. PR number only — label.name is empty on the
+  # widened events, and split groups can't cancel each other (see the
+  # run_without_label gotcha).
   group: cursor-review-pr-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 ```
@@ -238,7 +277,7 @@ are the same story: they can't run the panel (see above), so they never gate
 red.
 
 **Neither the skip label nor removing the trigger label waives the gate.**
-`skip-cursor-review` stops new panels from running; it does not resolve the
+`skip-cursor-review` stops new panels from running and cancels a running one; it does not resolve the
 threads an earlier panel already posted, and neither does taking the trigger
 label off. Once findings exist, the ways out are resolving each thread, pushing
 a fix that outdates them, or a ruleset bypass. Dismissing the review does not

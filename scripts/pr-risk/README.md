@@ -323,6 +323,19 @@ Labels are created on first use, color-coded green → red (gray for ungraded).
   no failure in it can redden a PR. `RENDER_ONLY=1` emits the surfaces and writes nothing, which
   is how the Check Run is rendered in the grading job and POSTed from the job that holds
   `checks: write`.
+- `lib.sh` — the sourceable core: the scratch files, the retrying `gh` reads built on them, and
+  the two resolvers that decide WHICH branch's rules judge a PR (`resolve_base_ref` /
+  `fetch_override`). No top-level side effects — no command runs, no scratch file is created and
+  no EXIT trap is installed by sourcing it, which is what lets `grade-targets.sh` here and
+  pr-derisk's `collect-pr-inputs.sh` share one implementation of "which `.github/risk.json`
+  applies" instead of two. Its diagnostics are `gt_log` / `gt_die`, prefixed so they cannot
+  capture a sourcing script's own, and they report under `GT_LOG_PREFIX` so a line still names
+  the script that emitted it. It is sourced from **beside the sourcing script**, never through a
+  `TOOL_DIR`-style input: `TOOL_DIR` names the swappable tools (the suite overrides it with a stub
+  grader directory), and anchoring the library to it would make that stubbing hard-die at the
+  source line. `fetch_override` also checks the SHAPE of the override path before building a URL
+  from it — `..` and a leading `/` are refused, because `@uri` leaves `.` untouched and
+  `contents/../../x` addresses a different endpoint once the dot segments resolve.
 - `grade-targets.sh` — the orchestration layer, extracted from `pr-risk.yml`'s
   inline job body so the event path and the by-number path cannot drift into two
   copies of it. Per target: resolve the base ref, fetch that ref's override

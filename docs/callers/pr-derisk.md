@@ -81,7 +81,7 @@ literally. `bump-pr-derisk-callers.yml` moves both together; never hand-bump one
 | `model` | `claude-opus-5` | The partition is a judgement about a whole diff and the call happens once, on demand. |
 | `max_steps` | `5` | A chain nobody will actually open is not a plan. |
 | `max_diff_bytes` | `200000` | Over budget takes the deterministic fallback rather than planning off half a diff. |
-| `repo_map_path` / `repo_runbooks_path` | `.github/risk.json` / `.github/risk-runbooks.json` | Same overrides pr-risk reads, from the same base ref. |
+| `repo_map_path` / `repo_runbooks_path` | `.github/risk.json` / `.github/risk-runbooks.json` | Same overrides pr-risk reads, from the same base ref. Repo-relative — a leading `/` or a `..` segment is refused, not resolved. |
 
 ## Gotchas
 
