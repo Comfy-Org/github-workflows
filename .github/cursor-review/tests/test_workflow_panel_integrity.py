@@ -48,9 +48,13 @@ LEG_STEP = "Fail the leg when the cell did not submit"
 UPLOAD_STEP = "Upload findings artifact"
 PANEL_JOB = "panel-integrity"
 PANEL_CONTEXT = "Panel integrity"
+UNDECIDED_STEP = "Fail if the panel decision itself did not complete"
+REPORT_STEP = "Report panel integrity"
 
 # Every condition `consolidate` gates on must also gate `panel-integrity`, or it
-# reports on runs where no panel was ever supposed to happen.
+# reports on runs where no panel was ever supposed to happen. They are NESTED
+# inside the upstream-failure disjunct rather than ANDed at the top level (see
+# `UndecidedRunFailsClosedTest`), so these are substring assertions on purpose.
 GATE_CONDITIONS = (
     "needs.gate.outputs.should_run == 'true'",
     "needs.gate.outputs.already_reviewed != 'true'",
@@ -258,10 +262,16 @@ class PanelIntegrityJobTest(unittest.TestCase):
     def test_it_needs_every_job_it_reads(self):
         needs = job_scalar(self.panel, "needs")
         self.assertIsNotNone(needs, f"`{PANEL_JOB}` declares no `needs:`")
+        # Compare PARSED names, not the raw scalar: `review` is a substring of
+        # `post-review`, so a plain `in` check would stay green with `review`
+        # dropped from the list — the one entry whose loss this test most needs
+        # to catch, since `needs.review.result` is what keeps the job from
+        # reporting on a fork.
+        declared = {part.strip() for part in needs.strip("[]").split(",") if part.strip()}
         for job in ("gate", "diff-size", "review", "consolidate", "post-review"):
             self.assertIn(
                 job,
-                needs,
+                declared,
                 f"`{PANEL_JOB}` dropped `{job}` from needs — its outputs then "
                 "evaluate to the empty string, which every cause treats as a pass",
             )
@@ -342,6 +352,82 @@ class PanelIntegrityJobTest(unittest.TestCase):
                 f"job `{name}` needs `{PANEL_JOB}` — the check is advisory and "
                 "must gate no other job",
             )
+
+
+class UndecidedRunFailsClosedTest(unittest.TestCase):
+    """The job must go RED, not skipped, when the decision jobs did not finish.
+
+    Every gate condition on `panel-integrity` reads a job OUTPUT, and a job that
+    FAILED has empty outputs. Gating the job on those outputs alone therefore
+    SKIPS it exactly when `gate`'s dup-check API call errors or `diff-size`
+    cannot build the diff — and GitHub counts a skipped required check as
+    PASSING, so a caller that took this PR's advice and required `Panel
+    integrity` would get a green merge gate over a run that never decided
+    whether to review the PR at all. `Blocking gate` closes the same hole with
+    the same two guards; this suite pins that they stay closed here too.
+    """
+
+    def setUp(self):
+        self.jobs = split_jobs(read_workflow())
+        self.panel = self.jobs[PANEL_JOB]
+        self.condition = job_scalar(self.panel, "if")
+        self.assertIsNotNone(self.condition)
+
+    def test_the_job_runs_when_an_upstream_decision_job_failed(self):
+        # Without BOTH disjuncts the job is skipped on the failing path and the
+        # guard step below can never fire, however it is written.
+        for result in ("needs.gate.result != 'success'", "needs.diff-size.result != 'success'"):
+            self.assertIn(
+                result,
+                self.condition,
+                f"`{PANEL_JOB}`'s `if:` no longer runs the job on `{result}` — an "
+                "undecided run skips this check, and a skipped required check is "
+                "a GREEN merge gate",
+            )
+
+    def test_the_guard_step_exists_and_is_first(self):
+        order = step_order(self.panel)
+        self.assertIn(
+            UNDECIDED_STEP,
+            order,
+            f"`{PANEL_JOB}` lost its `{UNDECIDED_STEP}` guard — the job now runs "
+            "on undecided runs and reports causes read from empty outputs",
+        )
+        self.assertIn(REPORT_STEP, order)
+        self.assertLess(
+            order.index(UNDECIDED_STEP),
+            order.index(REPORT_STEP),
+            f"`{UNDECIDED_STEP}` must come BEFORE `{REPORT_STEP}`: every cause "
+            "there treats an empty output as a pass, so the report would answer "
+            "the wrong question on a run that was never decided",
+        )
+
+    def test_the_guard_step_fires_on_either_failure_and_exits_nonzero(self):
+        body = code_lines(step_named(self.panel, UNDECIDED_STEP))
+        joined = "\n".join(body)
+        for result in ("needs.gate.result != 'success'", "needs.diff-size.result != 'success'"):
+            self.assertIn(
+                result,
+                joined,
+                f"`{UNDECIDED_STEP}` no longer fires on `{result}`",
+            )
+        self.assertFalse(
+            any("continue-on-error" in line for line in body),
+            f"`{UNDECIDED_STEP}` carries continue-on-error and can no longer fail the check",
+        )
+        self.assertTrue(
+            any(line.strip() == "exit 1" for line in body),
+            f"`{UNDECIDED_STEP}` no longer exits non-zero",
+        )
+        self.assertIn("::error::", joined)
+
+    def test_the_deliberate_skips_are_still_skips(self):
+        # The fail-closed disjunct must not swallow the intentional no-panel
+        # branches: those are the ones where `gate` and `diff-size` both
+        # SUCCEEDED and said no review was warranted, and being red on every
+        # unlabelled PR is what would get this check un-required again.
+        for gate in GATE_CONDITIONS:
+            self.assertIn(gate, self.condition, f"`{PANEL_JOB}` lost gate `{gate}`")
 
 
 if __name__ == "__main__":

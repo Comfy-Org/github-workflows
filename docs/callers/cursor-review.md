@@ -226,9 +226,13 @@ step up in spend. Start label-gated.
 ## Panel integrity
 
 `<caller job id> / Panel integrity` (with the caller above, `review / Panel
-integrity`) is the context that answers **"was this PR actually reviewed by a
-whole panel?"** — it is the one an automated merge gate should read, and it runs
-on every review, with no input to turn on.
+integrity`) is the context that answers **"was the panel that reviewed this PR a
+whole panel?"** — it is the one an automated merge gate should read for that
+question, and it runs on every review, with no input to turn on. Read the two
+bullets at the end of this section before you require it: it is red when the
+review ran and came up short *and* when the decision that selects a review
+failed, but it is **skipped — and therefore green — on the runs that
+deliberately review nothing**.
 
 It is **advisory**: red here fails no other job, and the consolidated review
 still posts. Marking it a required status check in your branch-protection /
@@ -270,12 +274,23 @@ Three more shapes to expect before you require it:
   the model id (`edge-case (kimi-k3-high)`), so it changes whenever the panel
   list does — and a required check whose name no longer exists blocks every PR
   in the repo. `Panel integrity` is stable by design.
-* **A failed `Gate` job skips this check rather than failing it.** Panel
-  integrity is gated on the same four conditions the panel is, and all four read
-  `Gate`'s outputs — which are empty when that job failed. There is no panel to
-  report on in that case, and the `Gate` context is itself red, so the rollup
-  still carries the signal; the fail-closed guard for a *required* check lives on
-  the Blocking gate.
+* **It is red, not skipped, when the decision itself failed.** Panel integrity
+  is gated on the same four conditions the panel is, and all four read `Gate`'s
+  and `Diff size check`'s job *outputs* — which are empty when those jobs
+  **failed**. Gating on them alone would skip this check exactly when a dup-check
+  API call errored or the diff could not be built, and GitHub counts a skipped
+  required check as **passing**. So a failed `Gate` or `Diff size check` runs
+  this job and fails it: an undecided run is not a clean run.
+* **It still skips when no review was warranted, and a skip is green.** The
+  deliberate no-panel branches — no trigger label, an already-reviewed commit, a
+  PR over the diff-size cap, a fork the panel cannot run on — are the ones where
+  `Gate` and `Diff size check` both *succeeded* and said no panel should run.
+  This check stays skipped there, and a required skipped check passes. That is
+  the intended shape: it answers **"was the panel that ran whole?"**, not "was
+  this PR reviewed at all?" If you need the second question gated too — most
+  relevantly, if you do not want an over-cap PR merging unreviewed — require the
+  Blocking gate, which fails closed on over-cap fresh reviews, and keep your own
+  label policy. Do not read a skipped Panel integrity as "the panel was fine".
 
 ## Blocking-gate gotchas
 
