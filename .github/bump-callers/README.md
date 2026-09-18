@@ -395,11 +395,31 @@ textual, and there is one case where equal text selects *different* sets: a
 Put a `*_test.go` in a *subdirectory* and they stop: the trigger fires on it,
 the staleness diff has already excluded it, and the run re-points having compared
 nothing that moved — the pure-churn bump BE-7084 removed, one directory down.
-`test_paths_contract.sh` measures the tree for exactly this and fails the build
-the day it becomes true, so it cannot happen quietly. It applies to **file-glob
-exclusions only** — a `/**` *directory* exclusion (`!scripts/pr-risk/tests/**`)
-selects the whole subtree in both syntaxes at every depth, so it cannot diverge
-this way and is deliberately not measured, subdirectories and all.
+`test_paths_contract.sh` measures the tree for exactly this, and fails rather
+than warns, so it cannot happen quietly. Three things to know about the scope of
+that measurement:
+
+* It applies to **glob exclusions only.** A `/**` *directory* exclusion
+  (`!scripts/pr-risk/tests/**`) selects the whole subtree in both syntaxes at
+  every depth, so it cannot diverge this way and is deliberately not measured,
+  subdirectories and all. `?` and `[…]` **are** globs on both sides and are
+  measured like `*` — git's `?` crosses `/` too.
+* It measures the whole **path**, not the basename, because that is what git
+  does: `:(exclude)x/test_*.sh` drops `x/test_dir/b.sh` (its `*` spans `dir/b`)
+  and keeps `x/sub/test_a.sh` (no literal `x/test_` prefix). So a prefix-anchored
+  exclusion is held to git's rule, not to a basename's.
+* A shape it cannot decide is reported **unmeasured**, not clean — a glob in the
+  directory half (`!x/*/tests/**` genuinely can diverge), a directory absent from
+  the tree, or a literal *directory* (`!x/tests` matches only a file named that,
+  while `:(exclude)x/tests` drops the subtree — write `!x/tests/**`). A failed
+  walk is a hard failure, never a pass.
+
+One caveat on "the day it becomes true": the measurement runs when
+`test-bump-callers.yml` runs, and that workflow is path-filtered to
+`.github/bump-callers/**` plus the `bump-*-callers.yml` entrypoints. A PR that
+adds only a deep test file under a *watched tool* directory — the very PR that
+creates this divergence — does not run it, and the guard first fires on the next
+PR that does touch this directory.
 
 **An excluding fleet passes `WATCHED_PATHSPECS`; a per-file fleet passes
 `WATCHED_EXEC`.** `pr-size` and `cursor-review` need the first (BE-7084): each
