@@ -245,7 +245,13 @@ _ROUND_SENTINEL_RE = re.compile(
 # strict (lowercase full hex) so it agrees exactly with post-review.py's writer-side
 # validation: a value this rejects reaches the workflow as "", which fails closed to
 # "no incremental block" rather than to a `git diff` against an attacker-chosen ref.
-_FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+#
+# Terminated with `\Z`, NOT `$`: Python's `$` also matches just before a FINAL newline,
+# so `^[0-9a-f]{40}$` accepts a 41-character value ending in one. `_write_outputs`
+# appends the accepted value to $GITHUB_OUTPUT as `key=value`, and this gate is the
+# single control keeping a line break out of it — an invariant `$` does not provide.
+# post-review.py's `_ROUND_SHA_RE` is the writer-side twin and is anchored the same way.
+_FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}\Z")
 
 # post_error_review's shape, as its own f-string renders it. See _body_only_entries:
 # this is the one consolidated body whose imported text sits at column 0, and the
@@ -919,15 +925,36 @@ def build_ledger(
     # already reviewed and drop them — a silent loss the subset fail-safe cannot catch,
     # since a smaller block is still a subset.
     #
-    # Three gates, all of which must hold, and all of which fail to "" rather than to a
-    # guess. Only the LAST round is read (it is the only one the next block diffs
+    # Four gates, all of which must hold, and all of which fail to "" rather than to a
+    # guess. The ERROR-REVIEW shape is refused outright first, exactly as
+    # `_body_only_entries` refuses it and for the identical reason: `post_error_review`
+    # renders imported judge/CLI text inside a FENCE, so it is the one consolidated body
+    # whose foreign lines sit at column 0 and can therefore satisfy the line anchor the
+    # sentinel's containment argument rests on. post-review.py's writer-side defang
+    # covers that text, but only in bodies THIS version wrote — consumers stay pinned to
+    # older SHAs, and every error review they have already posted is sitting on their PRs
+    # undefanged, a body no writer-side change can reach. Nor does the `head` gate below
+    # close it: the reviewed head SHA is public to the PR author, so a forged payload can
+    # name it, and the merge base it then claims would pass the workflow's `cat-file -e`
+    # and `merge-base --is-ancestor` checks (those prove ANCESTRY, not that the commit is
+    # the merge base round N actually used). Refusing the shape here is the half that
+    # cannot be outrun by a slow fleet, and it costs nothing real: `post_error_review`
+    # deliberately writes no sentinel, so a genuine error review never had one to lose.
+    #
+    # It also makes the workflow's "No recorded merge base" log honest for the case its
+    # message omits — the last round was an error review, which carries no sentinel at all.
+    #
+    # Then: only the LAST round is read (it is the only one the next block diffs
     # against). `head` must equal that review's own `commit_id`, so a sentinel copied
     # from another round or another PR is refused, and so is one left behind by a body
     # whose review was re-posted against a different commit. And `merge_base` must be a
     # full lowercase hex SHA before it is allowed anywhere near a `git diff` argument.
     last_reviewed_merge_base = ""
     last_reviewed_base_sha = ""
-    round_sentinel = _parse_round_sentinel(consolidated[-1].get("body") or "")
+    last_body = consolidated[-1].get("body") or ""
+    round_sentinel = (
+        None if _ERROR_REVIEW_RE.search(last_body) else _parse_round_sentinel(last_body)
+    )
     if (
         round_sentinel is not None
         and last_reviewed_sha

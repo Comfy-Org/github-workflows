@@ -157,7 +157,12 @@ ROUND_SENTINEL_PREFIX = "cursor-review:round v1"
 # "no incremental block", where a MISSING key would be indistinguishable from a sentinel
 # this writer never wrote. It also keeps the payload free of `-->`, `"` and newlines by
 # construction, so the comment cannot be broken out of by whatever produced the value.
-_ROUND_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+#
+# `\Z`, not `$`, and for that last clause specifically: Python's `$` matches before a
+# FINAL newline too, so `$` here would let a 41-character value whose last byte is `\n`
+# through and put a line break inside the HTML comment. build-ledger.py's `_FULL_SHA_RE`
+# is the reader-side twin and carries the same anchor.
+_ROUND_SHA_RE = re.compile(r"^[0-9a-f]{40}\Z")
 
 # --- the blocking gate's delivery signal (BE-4691) -------------------------
 # `needs.post-review.result == 'success'` cannot stand in for "a review carrying
@@ -2787,10 +2792,13 @@ def main():
     # the top of its section: `clamp_review_body` cuts the TAIL, so a record this short
     # at this height survives every cut that leaves a body at all.
     #
-    # Two headers, deliberately. `post_error_review` gets the plain one: a round that
-    # failed reviewed nothing, so recording what it "diffed against" would be a claim
-    # about a panel that never ran — and build-ledger.py refuses the error-review shape
-    # outright anyway, so a sentinel there could only ever be misleading.
+    # Two headers, deliberately, and the plain one goes to every body whose round
+    # reviewed NOTHING: `post_error_review`, and the all-panel-cells-failed branch
+    # below. Recording what such a round "diffed against" would be a claim about a panel
+    # that never ran, and the next round would build its "already reviewed" side from it
+    # — subtracting hunks nobody looked at. build-ledger.py refuses the error-review
+    # shape outright besides, so a sentinel there could only ever be misleading; the
+    # all-failed body carries no such shape, which is why withholding it is the control.
     review_header = "{}\n{}".format(
         header, render_round_sentinel(args.commit_sha, args.base_sha, args.merge_base_sha)
     )
@@ -2836,8 +2844,18 @@ def main():
         # misleading on (2), so check the panel metadata explicitly.
         all_failed = bool(panel) and all(c.get("status") != "ok" for c in panel)
         if all_failed:
+            # The PLAIN header, no round sentinel — same rule as post_error_review, and
+            # the same reason (BE-15598). Every reviewer errored, so this round diffed
+            # nothing and judged nothing; recording what it "diffed against" would let
+            # the NEXT round build its "already reviewed" side out of it and subtract
+            # hunks no panel ever saw. build-ledger.py still counts this body as a round
+            # for `last_reviewed_sha` — it IS a review of that commit — but with no
+            # sentinel it records no merge base, so the next round fails closed to "no
+            # incremental block" and the panel sees the full diff. That is the correct
+            # trade: the block is a prioritization hint, and losing it costs prompt
+            # budget where trusting this round costs coverage.
             body_text = (
-                f"{review_header}\n\n⚠️ **Panel did not produce any findings.**\n\n"
+                f"{header}\n\n⚠️ **Panel did not produce any findings.**\n\n"
                 "Every reviewer in the matrix failed to contribute — see the "
                 "panel summary for which cells errored, and the run logs for "
                 "the underlying cause."

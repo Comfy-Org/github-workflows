@@ -5195,16 +5195,6 @@ class RoundSentinelTest(EndToEndPostTest):
         self.assertIn("✅ No high-signal findings.", payload["body"])
         self._assert_directly_under_the_header(payload["body"])
 
-    def test_the_panel_produced_nothing_body_carries_it(self):
-        payload = self.run_main(
-            [],
-            commit_sha=HEAD_40,
-            extra_argv=self.ARGV,
-            panel=[{"model": "m", "review_type": "adversarial", "status": "error"}],
-        )[0]
-        self.assertIn("Panel did not produce any findings", payload["body"])
-        self._assert_directly_under_the_header(payload["body"])
-
     def test_the_wholesale_fallback_body_carries_it_too(self):
         posted = self.run_main(
             [finding("app.py", 11), finding("app.py", 999)],
@@ -5216,7 +5206,7 @@ class RoundSentinelTest(EndToEndPostTest):
         self.assertEqual(len(posted), 2)
         self._assert_directly_under_the_header(posted[1]["body"])
 
-    # -- and the one body that must NOT ------------------------------------- #
+    # -- and the two bodies that must NOT ----------------------------------- #
 
     def test_the_error_review_body_carries_no_sentinel(self):
         """A round that failed reviewed nothing, so it has nothing to record about
@@ -5230,6 +5220,37 @@ class RoundSentinelTest(EndToEndPostTest):
         self.assertEqual(len(posted), 1)
         self.assertIn("⚠️ **Review failed**", posted[0]["body"])
         self.assertNotIn(PR.ROUND_SENTINEL_PREFIX, posted[0]["body"])
+
+    def test_the_all_panel_cells_failed_body_carries_no_sentinel_either(self):
+        """Same rule, and the case the error review does NOT cover: every reviewer
+        errored, so this round judged nothing — but the body carries no "Review failed"
+        heading, so build-ledger.py's reader-side refusal does not reach it. Withholding
+        the sentinel at the WRITER is therefore the only control, and without it the next
+        round would rebuild its "already reviewed" side from a panel that never ran and
+        subtract hunks nobody looked at. It is posted with `delivers=False` for the very
+        same reason."""
+        posted = self.run_main(
+            [],
+            commit_sha=HEAD_40,
+            extra_argv=self.ARGV,
+            panel=[{"model": "m", "review_type": "adversarial", "status": "error"}],
+        )
+        self.assertEqual(len(posted), 1)
+        self.assertIn("Panel did not produce any findings", posted[0]["body"])
+        self.assertNotIn(PR.ROUND_SENTINEL_PREFIX, posted[0]["body"])
+        self.assertNotIn(BL.ERROR_REVIEW_MARKER, posted[0]["body"],
+                         "and the reader-side refusal genuinely does not cover it")
+        # Driven through the REAL parser, not a copy: it is still a round, so
+        # `last_reviewed_sha` advances — and it records no merge base, so the next
+        # round fails closed to "no incremental block" rather than to a bad one.
+        ledger = BL.build_ledger(
+            [{"id": 101, "state": "COMMENTED", "commit_id": HEAD_40,
+              "submitted_at": "2026-07-01T00:00:00Z", "body": posted[0]["body"],
+              "user": {"login": "github-actions[bot]", "type": "Bot"}}],
+            [], [],
+        )
+        self.assertEqual(ledger["last_reviewed_sha"], HEAD_40)
+        self.assertEqual(ledger["last_reviewed_merge_base"], "")
 
     # -- the banners still render, and still render BELOW it ---------------- #
 

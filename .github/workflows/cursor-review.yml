@@ -830,6 +830,14 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        #
+        # No line-break guard on the value, unlike `resolveMergeBase` in
+        # scripts/check-pr-size/main.go, which rejects a result containing \r or \n. The
+        # divergence is deliberate, not an oversight: `git merge-base` with two commits
+        # and no --all prints exactly ONE line, and `$( )` strips every trailing newline
+        # off it, so there is no value this step can emit that the Go check would refuse.
+        # post-review.py's `field()` re-validates the shape before it reaches the
+        # sentinel besides, and build-ledger.py's `_FULL_SHA_RE` again on the way back.
         run: |
           MERGE_BASE="$(git merge-base "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || true)"
           if [ -n "$MERGE_BASE" ]; then
@@ -1034,6 +1042,16 @@ jobs:
         # from the block. The subset fail-safe cannot catch that: a block that is too
         # SMALL is still a subset. With no recorded merge base there is no honest
         # answer, so the step emits no block at all rather than guessing one.
+        #
+        # KNOWN, and not fixed here: on the retarget path this pin exists FOR, the two
+        # merge bases can be nearly disjoint, so almost nothing in NEW is in OLD and the
+        # block comes out close to the full reviewed diff — which the prompt then carries
+        # twice. `check` cannot catch it (`foreign == 0` and `new_lines <= full_lines`
+        # both hold), because the block really is a faithful subset; it is just a useless
+        # one. The cost is prompt budget on an uncommon path, never coverage, and the
+        # alternative — declining a block whose length approaches `full_lines` — needs a
+        # threshold nothing here has grounds to pick yet. Left as a known waste rather
+        # than guessed at.
         #
         # The two merge bases still differ whenever the base branch was merged in
         # between rounds. A file the base branch AND the branch both touched then reads
