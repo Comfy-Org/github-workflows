@@ -27,9 +27,12 @@ Direction-by-direction, what is asserted and why the strictness differs:
   `KNOWN_UNDOCUMENTED` below, modelled on `KNOWN_EXEMPT` in
   `check_workflow_pins.py`: an entry is a KNOWN debt, not a blessing, and a
   STALE entry FAILS, so the list drains itself as the guides get filled in.
-* **Example `with:` keys** — the same phantom failure one level in, in the two
-  copy-paste callers this repo ships (the guide's caller fence and the workflow
-  header comment). Subset, not equality: an example legitimately shows only a
+* **Example `with:` keys** — the same phantom failure one level in, in the
+  copy-paste callers this repo ships: every fence in the guide, the workflow's
+  header comment, and the two shared catalogs (`README.md`,
+  `docs/callers/README.md`) that belong to no single reusable. Which `with:`
+  counts for which reusable is decided by the `uses:` governing it, not by the
+  heading above it. Subset, not equality: an example legitimately shows only a
   few inputs.
 
 Parsed WITHOUT PyYAML on purpose: this repo is stdlib-only (`AGENTS.md`) and
@@ -38,8 +41,10 @@ Parsed WITHOUT PyYAML on purpose: this repo is stdlib-only (`AGENTS.md`) and
 these scanners need. Every scanner is also guarded against going quiet and
 passing vacuously, since each assertion compares two scanner outputs and {} vs
 {} is a pass: the two NAME scanners must both find the row's `sentinel` input,
-and each example `with:` scanner must find at least one key (non-empty rather
-than sentinel-bearing — an example caller shows only the knobs it needs).
+and each example `with:` scanner must find at least one BLOCK with at least one
+key in it (non-empty rather than sentinel-bearing — an example caller shows only
+the knobs it needs; per block rather than over their union, because a union goes
+non-empty as soon as any one block carries keys).
 
 Run: python3 -m unittest discover -s .github/workflow-pins/tests -p 'test_*.py' -v
 """
@@ -56,28 +61,41 @@ WORKFLOWS_DIR = os.path.join(REPO_ROOT, ".github", "workflows")
 GUIDES_DIR = os.path.join(REPO_ROOT, "docs", "callers")
 
 # The line that makes a workflow file REUSABLE: `workflow_call:` as a top-level
-# key of `on:`, at exactly 2-space indent and alone on its line. Matched
-# exactly, not by substring, so the files that merely MENTION `workflow_call`
-# — in prose, in a heredoc fixture, in a comment — are not mistaken for
-# reusables and do not demand a ROWS entry.
+# key of `on:`, at exactly 2-space indent. ANCHORED, not a substring match, so
+# the files that merely MENTION `workflow_call` — in prose, in a heredoc
+# fixture, in a comment — are not mistaken for reusables and do not demand a
+# ROWS entry.
+#
+# Tolerant of three spellings that all still declare the trigger, because a
+# workflow this regex misses is absent from BOTH `on_disk` and ROWS and so
+# ships with no drift coverage at all while
+# `test_rows_match_the_reusable_workflows_on_disk` stays green: an empty flow
+# mapping (`workflow_call: {}`), trailing whitespace, and a trailing comment.
 WORKFLOW_CALL_LINE = "  workflow_call:"
+WORKFLOW_CALL_RE = re.compile(r"^  workflow_call:[ \t]*(\{[ \t]*\})?[ \t]*(#.*)?$")
 
 # An input declaration: the key alone on its 6-space line, directly under
 # `    inputs:`. Sub-keys of an input (description/type/default) are 8-space,
 # and folded description text deeper still, so none of them match.
 INPUT_KEY = re.compile(r"^      ([A-Za-z0-9_-]+):\s*$")
-# Section bounds: `## ` ONLY, never `### `. `linear-ticket.md` puts the two
-# caller fences under `### 1.` / `### 2.` sub-headings inside
-# `## Caller — two files`, so a `^#{2,}` bound (what the refresh-reviewers copy
-# uses, correctly, for a guide with no sub-headings) would end that section
-# before either fence and make the `with:` scan vacuous.
+# `on:`'s trigger keys sit at 2 spaces, `workflow_call:`'s own keys (`inputs:`,
+# `secrets:`, `outputs:`) at 4, an input key at 6 and its sub-keys at 8. Every
+# block bound below is expressed against these rather than as "exactly four
+# spaces" — see workflow_call_input_lines for why that distinction is
+# load-bearing.
+TRIGGER_INDENT = 2
+INPUTS_LINE = "    inputs:"
+INPUT_KEY_INDENT = 6
+INPUT_SUBKEY_INDENT = 8
+# Section bounds for the Inputs/knob TABLES: `## ` ONLY, never `### `, so a
+# `###` sub-section is scanned as part of its parent and a table under one
+# contributes names too. Exactly one exists today — `### Choosing
+# \`approval-mode\`` under `docs/callers/detect-unreviewed-merge.md`'s
+# `## Inputs`. Widening toward MORE documented names can only ever add a
+# phantom failure, never hide one, so it fails safe.
 #
-# The trade-off is real and deliberate: a `###` sub-section is now scanned as
-# part of its parent, so a table under one contributes names too. Exactly one
-# exists today — `### Choosing \`approval-mode\`` under
-# `docs/callers/detect-unreviewed-merge.md`'s `## Inputs` — and it yields no
-# phantom. Widening toward MORE documented names can only ever add a phantom
-# failure, never hide one, so it fails safe.
+# The example `with:` scan is NOT section-bounded at all — it anchors on
+# `uses:` and reads every fence in the doc; see USES_ANY / reusable_with_blocks.
 HEADING = re.compile(r"^#{2}\s")
 # An input's `default:` / `required:` sub-keys — 8-space, one level under the
 # 6-space input key — used by the opt-in Default-column comparison.
@@ -88,6 +106,21 @@ INPUT_REQUIRED = re.compile(r"^        required:\s*(\S+)\s*$")
 # starts a line, so MAPPING_KEY never mistakes one for an input.
 WITH_LINE = re.compile(r"^(\s*)with:\s*$")
 MAPPING_KEY = re.compile(r"^\s*([A-Za-z0-9_-]+):")
+# The `uses:` that GOVERNS a `with:` — the two are siblings in the same mapping.
+# Both the reusable-job form (`      uses: …`) and the step form
+# (`      - uses: …`) are matched, and group(1)'s length is the effective key
+# indent in each, so a step's `with:` is attributed to the step's action rather
+# than to the job's reusable.
+USES_ANY = re.compile(r"^(\s*(?:-\s+)?)uses:\s*(\S+)")
+# ... and the subset of those values that name a reusable OF THIS REPO.
+REUSABLE_USES = re.compile(
+    r"^Comfy-Org/github-workflows/\.github/workflows/([A-Za-z0-9_-]+)\.yml(?:@|$)"
+)
+# A `default:` whose value is a block scalar: the VALUE is the indented lines
+# that follow, not this indicator.
+BLOCK_SCALAR_INDICATOR = re.compile(r"^[|>][+-]?$")
+# Markdown link wrapping around a table cell's input name.
+CELL_LINK = re.compile(r"^\[(.*)\]\([^)]*\)$")
 
 
 Row = collections.namedtuple(
@@ -97,8 +130,7 @@ Row = collections.namedtuple(
         "sentinel",  # input that MUST appear on both sides (anti-vacuity guard)
         "guide",  # None -> docs/callers/<workflow>.md
         "inputs_heading",  # the guide heading whose table lists the inputs
-        "caller_heading",  # the guide heading whose fences hold the example
-        "expect_guide_with",  # a `with:` block is expected in the guide fence
+        "expect_guide_with",  # a `with:` block is expected in the guide's fences
         "expect_header_with",  # ... and in the workflow's header comment
         "dir_readme",  # None -> no directory-README knob table to police
         "readme_heading",
@@ -108,7 +140,6 @@ Row = collections.namedtuple(
     defaults=(
         None,  # guide
         "## Inputs",  # inputs_heading
-        "## Caller",  # caller_heading
         True,  # expect_guide_with
         True,  # expect_header_with
         None,  # dir_readme
@@ -146,18 +177,12 @@ ROWS = (
     Row(workflow="cursor-review-auto-label", sentinel="review_label"),
     Row(workflow="cursor-review", sentinel="workflows_ref"),
     Row(workflow="detect-unreviewed-merge", sentinel="approval-mode"),
-    # groom's guide leads with the finds-only caller rather than a `## Caller`.
-    Row(
-        workflow="groom",
-        sentinel="workflows_ref",
-        caller_heading="## Minimal caller — finds-only",
-    ),
-    # linear-ticket ships TWO caller files; only the second one calls this
-    # reusable, and the header comment carries no `with:` example.
+    Row(workflow="groom", sentinel="workflows_ref"),
+    # linear-ticket's header comment carries no `with:` example — it documents
+    # the two caller FILES in prose and leaves the fences to the guide.
     Row(
         workflow="linear-ticket",
         sentinel="workflows_ref",
-        caller_heading="## Caller — two files",
         expect_header_with=False,
     ),
     Row(
@@ -255,7 +280,7 @@ def section_lines(lines, heading):
 
     Fence-aware: a `## …` line INSIDE a ``` block is example content, not a
     heading, so it must not end the section. No guide writes one today, but the
-    caller fences are full of YAML `#` comments and one gaining a second `#`
+    example fences are full of YAML `#` comments and one gaining a second `#`
     would otherwise truncate the section silently — turning a real check into a
     vacuous one rather than into a failure. The fence delimiters are kept in the
     output, so `fenced_blocks` still sees every block.
@@ -284,40 +309,124 @@ def split_cells(line):
     return [cell.strip().replace("\\|", "|") for cell in cells]
 
 
-def workflow_inputs(path):
-    """Input names declared under on.workflow_call.inputs."""
-    names, in_inputs = set(), False
+def workflow_call_input_lines(path):
+    """Lines of the `on.workflow_call.inputs` mapping, in file order.
+
+    Two bounds, both expressed as "indented less than X" rather than as "exactly
+    X spaces":
+
+    * `workflow_call:` scoping. A reusable may ALSO declare
+      `workflow_dispatch:` — a sibling trigger at the same 2-space indent, with
+      an `inputs:` mapping of its own at the same 4-space indent. Keying off a
+      bare `    inputs:` line would merge that second trigger's 6-space keys
+      into the declared set, inflating exactly the set the STRICT phantom check
+      subtracts and masking the BE-4691 drift this file targets. Whichever
+      trigger is declared first, only `workflow_call:`'s keys are collected.
+    * The `inputs:` bound. An input key sits at 6 spaces and its sub-keys
+      deeper, so ANY content line shallower than that closes the mapping.
+      Matching `^    \\S` (exactly four spaces) — the obvious spelling, and what
+      this scanner used to do — catches only the 4-space siblings (`secrets:`,
+      `outputs:`) and lets a 2-space `  workflow_dispatch:` or a column-0
+      `permissions:` through with the scan still latched open.
+
+    Blank and comment lines are KEPT rather than filtered: a `#` line indented
+    inside a folded `default:` is literal text, not a comment, and only
+    workflow_input_defaults has the context to tell those apart. Neither ever
+    ends a block here — neither carries a meaningful indentation signal.
+    """
+    out, in_call, in_inputs = [], False, False
     for line in workflow_head(path):
-        if line == "    inputs:":
+        if not line.strip() or line.lstrip().startswith("#"):
+            if in_inputs:
+                out.append(line)
+            continue
+        indent = len(line) - len(line.lstrip())
+        if line == WORKFLOW_CALL_LINE or WORKFLOW_CALL_RE.match(line):
+            in_call, in_inputs = True, False
+            continue
+        if in_call and indent <= TRIGGER_INDENT:
+            # A sibling trigger (`  workflow_dispatch:`) or a top-level key
+            # (`permissions:`). Not a `break`: `workflow_call:` may be declared
+            # AFTER the trigger we are leaving.
+            in_call = in_inputs = False
+            continue
+        if not in_call:
+            continue
+        if line == INPUTS_LINE:
             in_inputs = True
             continue
-        if in_inputs and (not line.strip() or line.lstrip().startswith("#")):
-            # Blank or comment lines carry no indentation signal: a 4-space
-            # comment is legal YAML inside `inputs:` and must not trip the
-            # dedent break and silently truncate the scan.
+        if in_inputs and indent < INPUT_KEY_INDENT:  # secrets:, outputs:, ...
+            in_inputs = False
             continue
-        if in_inputs and re.match(r"^    \S", line):  # dedent: secrets:, etc.
-            break
         if in_inputs:
-            match = INPUT_KEY.match(line)
-            if match:
-                names.add(match.group(1))
+            out.append(line)
+    return out
+
+
+def workflow_inputs(path):
+    """Input names declared under on.workflow_call.inputs."""
+    names = set()
+    for line in workflow_call_input_lines(path):
+        match = INPUT_KEY.match(line)
+        if match:
+            names.add(match.group(1))
     return names
 
 
-def documented_knob_names(path, heading):
-    """Every backticked name in the FIRST cell of each table row under
-    `heading`, INCLUDING combined-cell rows like `| `scope_label` / `scope_desc` |`
-    that a lone-name regex would skip. A cell counts only when every
-    `/`-separated part is itself a lone backticked name, so the header row, the
-    `---` separator, and prose rows contribute nothing.
+def strip_cell_markup(fragment):
+    """Drop markdown emphasis and link wrapping from a table-cell fragment.
 
-    Combined cells are NOT a README-only shape, which is why this — not the
-    lone-name scanner — is what the Inputs tables are read with: groom's guide
-    documents `scope_label`/`scope_desc` on one row and pr-derisk's documents
-    `repo_map_path`/`repo_runbooks_path` on one row. Reading those with a
-    lone-name regex would report four real, documented inputs as undocumented.
+    A cell written ``**`foo`**``, ``__`foo`__`` or ``[`foo`](#foo)`` documents a
+    copyable input every bit as plainly as ``` `foo` ```, but a bare backtick
+    fullmatch sees none of them — the BE-4691 `blocking:` row would have escaped
+    the direction this file calls STRICT simply by being bold. Unwrapping first
+    still keeps PROSE cells out: `**Note**` unwraps to `Note`, which carries no
+    backticks and so still contributes no name.
     """
+    text = fragment.strip()
+    for _ in range(4):  # `**[`foo`](#x)**` — emphasis wrapped around a link
+        before = text
+        link = CELL_LINK.match(text)
+        if link:
+            text = link.group(1).strip()
+        for marker in ("**", "__", "*", "_"):
+            if len(text) > 2 * len(marker) and text.startswith(marker) and text.endswith(marker):
+                text = text[len(marker) : -len(marker)].strip()
+                break
+        if text == before:
+            break
+    return text
+
+
+def cell_input_names(cell):
+    """The input names a table row's FIRST cell documents, or None for a cell
+    that documents none (the header row, the `---` separator, a prose row).
+
+    A cell counts only when EVERY `/`-separated fragment is a lone backticked
+    name once emphasis/link markup is stripped. Combined cells like
+    `` `scope_label` / `scope_desc` `` are NOT a README-only shape — groom's
+    guide documents `scope_label`/`scope_desc` on one row and pr-derisk's
+    documents `repo_map_path`/`repo_runbooks_path` on one row — so both names
+    are yielded and a lone-name regex would report four real, documented inputs
+    as undocumented.
+
+    Shared by BOTH table scanners on purpose. Reading one table with two
+    different cell parsers made them disagree about what it documents: the
+    Default scanner used a lone-name regex, so those same four names counted as
+    documented yet contributed no Default entry and would be reported as
+    missing the moment `check_defaults` is turned on.
+    """
+    parts = [strip_cell_markup(part) for part in cell.split("/")]
+    if not parts or not all(parts):
+        return None
+    matched = [re.fullmatch(r"`([A-Za-z0-9_-]+)`", part) for part in parts]
+    if not all(matched):
+        return None
+    return [match.group(1) for match in matched]
+
+
+def documented_knob_names(path, heading):
+    """Every input name documented by a table row under `heading`."""
     names = set()
     for line in section_lines(read_lines(path), heading):
         if not line.lstrip().startswith("|"):
@@ -325,10 +434,9 @@ def documented_knob_names(path, heading):
         cells = split_cells(line)
         if not cells or not cells[0]:
             continue
-        parts = [part.strip() for part in cells[0].split("/")]
-        matched = [re.fullmatch(r"`([A-Za-z0-9_-]+)`", part) for part in parts]
-        if all(matched):
-            names.update(match.group(1) for match in matched)
+        found = cell_input_names(cells[0])
+        if found:
+            names.update(found)
     return names
 
 
@@ -358,98 +466,186 @@ def fenced_blocks(lines):
     return blocks
 
 
-def with_keys(lines):
-    """Mapping keys directly under each `with:` in `lines`.
+def keys_under_with(lines, index):
+    """Mapping keys directly under the `with:` at `lines[index]`.
 
-    Relative-indentation only, no YAML parser: the first non-blank line after a
-    `with:` fixes the child indent, and keys at exactly that indent are
+    Relative-indentation only, no YAML parser: the first non-blank line after
+    the `with:` fixes the child indent, and keys at exactly that indent are
     collected until the block dedents back to (or past) the `with:` line. So
     `uses:` / `secrets:`, which sit at the `with:` indent, end the block rather
     than count as inputs.
     """
-    keys = set()
-    i, n = 0, len(lines)
-    while i < n:
-        opener = WITH_LINE.match(lines[i])
-        if not opener:
-            i += 1
+    base = len(WITH_LINE.match(lines[index]).group(1))
+    keys, child = set(), None
+    for line in lines[index + 1 :]:
+        if not line.strip() or line.lstrip().startswith("#"):
             continue
-        base = len(opener.group(1))
-        child = None
-        j = i + 1
-        while j < n:
-            line = lines[j]
-            if not line.strip() or line.lstrip().startswith("#"):
-                j += 1
-                continue
-            indent = len(line) - len(line.lstrip())
-            if indent <= base:  # dedent to a sibling (secrets:, next job key)
-                break
-            if child is None:
-                child = indent
-            if indent == child:
-                key = MAPPING_KEY.match(line)
-                if key:
-                    keys.add(key.group(1))
-            j += 1
-        i = j
+        indent = len(line) - len(line.lstrip())
+        if indent <= base:  # dedent to a sibling (secrets:, next job key)
+            break
+        if child is None:
+            child = indent
+        if indent == child:
+            key = MAPPING_KEY.match(line)
+            if key:
+                keys.add(key.group(1))
     return keys
 
 
-def example_with_keys(row):
-    """`with:` keys from the two example callers this repo ships, as
-    {source_label: (set_of_keys, expected_non_empty)}.
+def governing_uses(lines, index):
+    """The `uses:` value that owns the `with:` at `lines[index]`, or None.
 
-    Both sources are scoped the way their label claims, and each fenced block is
-    scanned on its own:
-
-    * Guide side — ONLY the fences under the row's caller heading, not every
-      fence in the file, so the anti-vacuity guard can't be satisfied by an
-      unrelated snippet while the real caller example silently loses its
-      `with:`, and so a stray step-level `with:` elsewhere (an
-      `actions/checkout`) can't register here as a phantom input.
-    * Workflow side — ONLY the header comment above `jobs:`, bounded exactly the
-      way the input scan is bounded, not every column-0 `#` line in the file.
-
-    Scanning per block (rather than one flattened list) keeps a `with:` that
-    ends one block from absorbing the next block's more-indented lines.
+    Walks BACKWARDS over the mapping the `with:` belongs to — its siblings at
+    the same indent and their deeper values — and stops at the first line
+    shallower than that indent, which is where the mapping began. None means
+    the snippet shows a bare `with:` with no `uses:` above it.
     """
-    guide = guide_path(row)
-    guide_keys = set()
-    for block in fenced_blocks(section_lines(read_lines(guide), row.caller_heading)):
-        guide_keys |= with_keys(block)
+    base = len(WITH_LINE.match(lines[index]).group(1))
+    for line in reversed(lines[:index]):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        owner = USES_ANY.match(line)
+        if owner and len(owner.group(1)) == base:
+            return owner.group(2)
+        # Tested AFTER the `uses:` match, not before: in the step form
+        # (`  - uses: actions/checkout@…`) the dash is part of the key's
+        # indentation, so the line MEASURES two columns shallower than the
+        # `with:` it governs. Breaking on the raw measurement first would call
+        # every step-level `with:` an unowned fragment — and an unowned fragment
+        # is attributed to the reusable, which is exactly the misattribution
+        # this function exists to prevent.
+        if len(line) - len(line.lstrip()) < base:
+            return None
+    return None
 
-    header_comment = [
-        strip_comment_prefix(line)
-        for line in workflow_head(workflow_path(row))
-        if line.startswith("#")
-    ]
+
+def reusable_with_blocks(lines, workflow, allow_orphan=True):
+    """Key sets of the `with:` blocks that pass `workflow`'s inputs, one set per
+    block, in file order.
+
+    A `with:` counts when the `uses:` governing it names THIS repo's
+    `workflow`. A `with:` governed by some OTHER `uses:` — an
+    `actions/checkout`'s `ref:`/`fetch-depth:`, a sibling reusable's knobs in a
+    multi-workflow doc — never counts: reading it here would register those keys
+    as phantom inputs AND would satisfy the anti-vacuity guard while this
+    reusable's own example silently lost its `with:`.
+
+    `allow_orphan` covers a `with:` with no `uses:` above it at all. These docs
+    really do ship such fragments — `cursor-review-auto-label.yml`'s header
+    shows a bare `with:`/`secrets:` pair under "mint from a narrower App
+    instead", and it is unambiguously that reusable's — so it is True when the
+    lines come from a SINGLE-subject document (a row's own guide, a workflow's
+    own header comment) and False for a shared doc, where an unattributable
+    fragment would otherwise be charged against every reusable at once.
+
+    Anchoring on `uses:` rather than on a `## Caller` heading is what lets this
+    read EVERY fence in a doc. Heading-scoping missed every other
+    copy-pasteable snippet a guide ships — `public-repo-hygiene.md`'s
+    `## Tuning example`, groom's environment/builder/deny-list examples — and a
+    phantom key in one of those is the same zero-job `startup_failure` as one in
+    the `## Caller` fence.
+    """
+    blocks = []
+    for index, line in enumerate(lines):
+        if not WITH_LINE.match(line):
+            continue
+        owner = governing_uses(lines, index)
+        if owner is None:
+            if not allow_orphan:
+                continue
+        else:
+            reusable = REUSABLE_USES.match(owner)
+            if not reusable or reusable.group(1) != workflow:
+                continue
+        blocks.append(keys_under_with(lines, index))
+    return blocks
+
+
+def header_comment_lines(path):
+    """The workflow's CONTIGUOUS leading `#` block, comment markers stripped.
+
+    Bounded at the first non-comment line rather than filtered for `#` across
+    the whole head. `cursor-review.yml`, `groom.yml` and `pr-size.yml` each
+    carry a SECOND column-0 comment block further down (the preamble to `env:`
+    or `concurrency:`), and collecting every `#` line splices those onto the
+    header example with the YAML between them discarded — so a `with:` still
+    open at the end of the header would absorb the spliced block's
+    more-indented lines and report them as phantom inputs.
+    """
+    head = workflow_head(path)
+    start = next((i for i, line in enumerate(head) if line.startswith("#")), None)
+    if start is None:
+        return []
+    end = start
+    while end < len(head) and head[end].startswith("#"):
+        end += 1
+    return [strip_comment_prefix(line) for line in head[start:end]]
+
+
+def example_with_keys(row):
+    """`with:` key sets from the two example callers a ROW owns, as
+    {source_label: (list_of_per_block_key_sets, expected_non_empty)}.
+
+    * Guide side — EVERY fenced block in the row's guide, anchored on `uses:`.
+    * Workflow side — ONLY the contiguous header comment above `jobs:`.
+
+    Each fenced block is scanned on its own, so a `with:` that ends one block
+    cannot absorb the next block's more-indented lines. The per-BLOCK key sets
+    are returned rather than their union so the anti-vacuity guard can be
+    applied per block: a union goes non-empty as soon as ANY block carries keys,
+    which is how a guard meant for the real caller example ends up satisfied by
+    a different fence entirely.
+    """
+    guide_blocks = []
+    for block in fenced_blocks(read_lines(guide_path(row))):
+        guide_blocks.extend(reusable_with_blocks(block, row.workflow))
     return {
-        "%s %s" % (rel(guide), row.caller_heading): (
-            guide_keys,
+        "%s example callers" % rel(guide_path(row)): (
+            guide_blocks,
             row.expect_guide_with,
         ),
         "%s header comment" % rel(workflow_path(row)): (
-            with_keys(header_comment),
+            reusable_with_blocks(
+                header_comment_lines(workflow_path(row)), row.workflow
+            ),
             row.expect_header_with,
         ),
     }
 
 
+def _block_scalar_value(lines, start, indicator):
+    """(folded value, index after the block) for the block scalar whose
+    indicator sits on the preceding `default:` line.
+
+    The body is every line indented deeper than the `default:` key; blank lines
+    inside it belong to the scalar, and a `#` line inside it is literal text,
+    not a comment. `>` folds to spaces, `|` keeps newlines; the chomping
+    indicator only affects trailing newlines, which the caller strips anyway.
+    """
+    body, index = [], start
+    while index < len(lines):
+        line = lines[index]
+        if line.strip() and len(line) - len(line.lstrip()) <= INPUT_SUBKEY_INDENT:
+            break
+        body.append(line.strip())
+        index += 1
+    while body and not body[-1]:
+        body.pop()
+    joiner = " " if indicator.startswith(">") else "\n"
+    return joiner.join(body).strip(), index
+
+
 def workflow_input_defaults(path):
     """(`{name: raw default:}`, `{names marked required: true}`) from the
     workflow. Required inputs carry no default (`workflows_ref`)."""
-    defaults, required, current, in_inputs = {}, set(), None, False
-    for line in workflow_head(path):
-        if line == "    inputs:":
-            in_inputs = True
-            continue
-        if not in_inputs:
-            continue
+    lines = workflow_call_input_lines(path)
+    defaults, required, current = {}, set(), None
+    index, total = 0, len(lines)
+    while index < total:
+        line = lines[index]
+        index += 1
         if not line.strip() or line.lstrip().startswith("#"):
             continue
-        if re.match(r"^    \S", line):  # dedent out of inputs: (secrets:, etc.)
-            break
         key = INPUT_KEY.match(line)
         if key:
             current = key.group(1)
@@ -458,7 +654,17 @@ def workflow_input_defaults(path):
             continue
         default = INPUT_DEFAULT.match(line)
         if default:
-            defaults[current] = default.group(1)
+            raw = default.group(1)
+            if BLOCK_SCALAR_INDICATOR.match(raw):
+                # The VALUE of a folded/literal default is the indented lines
+                # BELOW it, not the `>-` on this line. Recording the indicator
+                # would pit `'>-'` against the guide's correct prose the moment
+                # check_defaults is turned on — and `groom.yml`'s `themes`,
+                # `cursor-review.yml`'s `diff_excludes` and both of
+                # `stale.yml`'s messages all use this shape.
+                defaults[current], index = _block_scalar_value(lines, index, raw)
+            else:
+                defaults[current] = raw
             continue
         req = INPUT_REQUIRED.match(line)
         if req and req.group(1) == "true":
@@ -467,7 +673,12 @@ def workflow_input_defaults(path):
 
 
 def documented_input_defaults(path, heading):
-    """`{input key: raw Default-column cell}` from the table under `heading`."""
+    """`{input name: raw Default-column cell}` from the table under `heading`.
+
+    Reads cells with `cell_input_names`, the SAME parser the name scanner uses,
+    so the two cannot disagree about what one table documents; a combined cell
+    maps every name it carries to that row's one Default cell.
+    """
     result = {}
     for line in section_lines(read_lines(path), heading):
         if not line.lstrip().startswith("|"):
@@ -475,9 +686,7 @@ def documented_input_defaults(path, heading):
         cells = split_cells(line)
         if len(cells) < 2:
             continue
-        key = re.fullmatch(r"`([A-Za-z0-9_-]+)`", cells[0])
-        if key:
-            name = key.group(1)
+        for name in cell_input_names(cells[0]) or ():
             # A second row for the same input would silently overwrite the
             # first, so two contradictory Default cells would pass as long as
             # the last one is right. Surface it — that's exactly the drift this
@@ -508,7 +717,11 @@ def _clean_workflow_default(raw):
     # a ` #` that would otherwise look like a comment marker) is a trailing
     # inline comment, not part of the value. Keep the `''` spelling both the
     # guide and this file use for the empty string.
-    if text[:1] in "\"'":
+    if text[:1] in ("'", '"'):
+        # Tuple membership, NOT `text[:1] in "\"'"`: that is a SUBSTRING test and
+        # `""` is a substring of every string, so a bare `default:` (legal YAML
+        # null, captured as `''`) would enter this branch and `text[0]` would
+        # raise IndexError instead of failing an assertion.
         quote = text[0]
         end = 1
         while end < len(text):
@@ -554,16 +767,22 @@ def canonical_workflow_default(name, defaults, required):
 
 
 def reusable_workflow_names():
-    """Basenames of every `.github/workflows/*.yml` that is itself reusable.
+    """Basenames of every workflow file that is itself reusable.
 
-    `*.yml` only, matching the repo's uniform extension — there is no `.yaml`
-    workflow here and `test_rows_match_the_reusable_workflows_on_disk` would not
-    notice one. Actions accepts both, so widen this glob if that ever changes.
+    Both extensions Actions accepts, and `WORKFLOW_CALL_RE` rather than exact
+    membership of `WORKFLOW_CALL_LINE`: a workflow this scan misses is absent
+    from BOTH `on_disk` and ROWS, so it ships with no drift coverage at all
+    while `test_rows_match_the_reusable_workflows_on_disk` stays green — the
+    `assertTrue(on_disk)` guard there proves some file matched, never that none
+    were missed. Every reusable here is `.yml` today, and a `.yaml` one would
+    fail `test_files_exist_for_every_row` (which resolves rows through
+    `workflow_path`, `.yml`-only) with a clear message rather than go unnoticed.
     """
     names = set()
-    for path in glob.glob(os.path.join(WORKFLOWS_DIR, "*.yml")):
-        if WORKFLOW_CALL_LINE in read_lines(path):
-            names.add(os.path.basename(path)[: -len(".yml")])
+    for pattern in ("*.yml", "*.yaml"):
+        for path in glob.glob(os.path.join(WORKFLOWS_DIR, pattern)):
+            if any(WORKFLOW_CALL_RE.match(line) for line in read_lines(path)):
+                names.add(os.path.splitext(os.path.basename(path))[0])
     return names
 
 
@@ -669,27 +888,40 @@ def _make_case(row):
             # there is a zero-job startup_failure for whoever copies it — the
             # #31 failure, one level in from the Inputs table. Subset, not
             # equality: an example legitimately shows only a few inputs.
-            for label, (keys, expect_non_empty) in sorted(
+            for label, (blocks, expect_non_empty) in sorted(
                 example_with_keys(row).items()
             ):
                 with self.subTest(example=label):
                     if expect_non_empty:
                         # Guard: this example really does pass inputs, so a
                         # scanner gone quiet fails loudly instead of asserting
-                        # {} ⊆ declared. NON-EMPTY, not "names the sentinel":
-                        # an example caller shows only the knobs it needs, and
-                        # several here legitimately omit theirs — groom's
+                        # {} ⊆ declared. Applied PER BLOCK, not to the union:
+                        # a union goes non-empty as soon as any one block
+                        # carries keys, so the guard would be satisfied by some
+                        # other snippet while the real caller example silently
+                        # lost its `with:`. NON-EMPTY, not "names the
+                        # sentinel": an example shows only the knobs it needs,
+                        # and several here legitimately omit theirs — groom's
                         # header example leans on `workflows_ref`'s `default:
                         # ''` carve-out and passes no ref at all, `stale`'s
                         # passes only `dry_run`. Where the row says no `with:`
                         # is expected at all, demanding one is permanently red.
                         self.assertTrue(
-                            keys,
-                            "the %s `with:` scanner found no keys at all — the "
-                            "example block moved or the parser broke; this "
-                            "subset check is now vacuous" % label,
+                            blocks,
+                            "the %s scan found no `with:` block for `%s` at all "
+                            "— the example moved, lost its `with:`, or the "
+                            "`uses:` anchoring it was renamed; this subset "
+                            "check is now vacuous" % (label, row.workflow),
                         )
-                    undeclared = keys - self.declared
+                        for position, keys in enumerate(blocks, start=1):
+                            self.assertTrue(
+                                keys,
+                                "`with:` block #%d of %d in %s carries no keys "
+                                "— an empty example block makes this subset "
+                                "check vacuous"
+                                % (position, len(blocks), label),
+                            )
+                    undeclared = set().union(*blocks) - self.declared
                     self.assertFalse(
                         undeclared,
                         "the %s example passes `with:` inputs %s does not "
@@ -845,6 +1077,64 @@ class RowsCoverTheReusablesTest(unittest.TestCase):
         )
 
 
+class SharedDocExampleCallersTest(unittest.TestCase):
+    """The copy-pasteable callers that live outside any row's guide.
+
+    `README.md` (the public catalog) and `docs/callers/README.md` both ship
+    `with:` fences that a new caller copies, and neither has — or wants — a ROWS
+    entry of its own, so nothing above looks at them. A phantom key there is the
+    same zero-job `startup_failure` as one in a guide, so they are scanned the
+    same way: every `with:` anchored to a `uses:` of one of THIS repo's
+    reusables, checked against that reusable's declared inputs.
+
+    Orphan `with:` fragments are SKIPPED here (unlike in a single-subject
+    guide): these docs cover many reusables, so an unattributable block would be
+    charged against every one of them at once.
+    """
+
+    maxDiff = None
+
+    DOCS = ("README.md", os.path.join("docs", "callers", "README.md"))
+
+    def test_every_example_with_key_is_a_declared_input(self):
+        rowed = {guide_path(row) for row in ROWS}
+        scanned = 0
+        for relative in self.DOCS:
+            path = os.path.join(REPO_ROOT, relative)
+            self.assertTrue(os.path.isfile(path), "%s does not exist" % relative)
+            self.assertNotIn(
+                path,
+                rowed,
+                "%s is a row's guide and is already scanned per-row" % relative,
+            )
+            blocks = fenced_blocks(read_lines(path))
+            for workflow in sorted(reusable_workflow_names()):
+                declared = workflow_inputs(
+                    os.path.join(WORKFLOWS_DIR, workflow + ".yml")
+                )
+                for block in blocks:
+                    for keys in reusable_with_blocks(
+                        block, workflow, allow_orphan=False
+                    ):
+                        scanned += 1
+                        with self.subTest(doc=relative, workflow=workflow):
+                            undeclared = keys - declared
+                            self.assertFalse(
+                                undeclared,
+                                "the %s example for %s passes `with:` inputs it "
+                                "does not declare: %s — a phantom input there "
+                                "is a zero-job startup_failure for whoever "
+                                "copies it"
+                                % (relative, workflow, sorted(undeclared)),
+                            )
+        self.assertTrue(
+            scanned,
+            "no `uses:`-anchored `with:` block found in any of %s — the fences "
+            "moved or the anchoring broke; this check is now vacuous"
+            % (sorted(self.DOCS),),
+        )
+
+
 def _install_cases():
     """Publish one generated TestCase per row under its own module-level name.
 
@@ -854,8 +1144,21 @@ def _install_cases():
     so the last row's class stayed reachable under a second name and that one
     workflow was silently checked twice — 17 runs of each method across 16 rows.
     """
+    seen = {}
     for row in ROWS:
         case = _make_case(row)
+        # `-` -> `_` is not injective: rows for `foo-bar` and `foo_bar` both
+        # derive `InputsDocsDrift_foo_bar`, and the second assignment would
+        # silently drop the first workflow's ENTIRE case while
+        # test_rows_have_no_duplicate_workflows and the on-disk coverage check
+        # both stayed green.
+        if case.__name__ in seen:
+            raise AssertionError(
+                "ROWS entries %r and %r both derive the TestCase name %s — one "
+                "would silently replace the other, dropping a whole workflow's "
+                "coverage" % (seen[case.__name__], row.workflow, case.__name__)
+            )
+        seen[case.__name__] = row.workflow
         globals()[case.__name__] = case
 
 

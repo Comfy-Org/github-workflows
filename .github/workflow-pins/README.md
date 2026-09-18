@@ -39,7 +39,12 @@ repo's own workflow files.
   copies it); the quieter reverse, a declared input no guide names, is pinned in
   a self-draining `KNOWN_UNDOCUMENTED` allowlist modelled on `KNOWN_EXEMPT`
   above — a stale entry FAILS, so documenting one is "add the row, delete the
-  name".
+  name". The same phantom check runs one level in, over the `with:` keys of
+  every copy-pasteable caller the repo ships: each guide's fences, each
+  workflow's header comment, and the two shared catalogs (`README.md`,
+  `docs/callers/README.md`). Which `with:` belongs to which reusable is decided
+  by the `uses:` governing it, so a step's `actions/checkout` knobs are never
+  mistaken for a workflow input.
 
 ```bash
 python3 .github/workflow-pins/check_workflow_pins.py
