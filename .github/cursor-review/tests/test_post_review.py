@@ -2375,15 +2375,50 @@ class PostFailureDiagnosticTest(unittest.TestCase):
         self.assertIn("retry-after: 42", line)
         self.assertIn("x-ratelimit-remaining: 0", line)
 
-    def test_no_reply_reached_gh_is_stated_not_left_blank(self):
-        """A transport error / timeout writes no status line to stdout. Saying so
-        explicitly is the point — it distinguishes 'GitHub rejected us' from 'the
-        write never got a reply', which is exactly what the old stderr-only line
-        could not do."""
+    def test_a_missing_status_line_is_reported_as_not_captured_not_as_no_reply(self):
+        """Saying the status line is absent is the point — it distinguishes 'GitHub
+        rejected us' from 'we cannot tell', which the old stderr-only line could not
+        do. But absence is NOT proof nothing was served: a `gh` without `-i` and a
+        timeout that killed `gh` after GitHub served the write both land here, so the
+        outcome is reported as UNKNOWN rather than asserted to be a non-delivery a
+        maintainer would answer by re-triggering into a duplicate review."""
         line = PR.format_post_failure(
             "Review", gh_result(stdout="", stderr="gh: dial tcp: i/o timeout")
         )
-        self.assertIn("no reply reached gh", line)
+        self.assertIn("no status line captured on stdout", line)
+        self.assertIn("UNKNOWN", line)
+        self.assertNotIn(
+            "no reply reached gh", line, "absence of a status line proves no such thing"
+        )
+
+    def test_a_stderr_status_is_cross_checked_when_stdout_carried_no_status_line(self):
+        """`gh` invoked without `-i` — or any stub — writes a bare body, so stdout has
+        no status line while stderr's `(HTTP nnn)` says plainly that GitHub answered.
+        Reporting the stdout half alone would call that a non-delivery."""
+        line = PR.format_post_failure(
+            "Review",
+            gh_result(
+                stdout='{"message":"Unprocessable Entity"}',
+                stderr="gh: Unprocessable Entity (HTTP 422)",
+            ),
+        )
+        self.assertIn("no status line captured on stdout", line)
+        self.assertIn("HTTP 422", line)
+        self.assertIn("a reply DID arrive", line)
+        self.assertNotIn("UNKNOWN", line)
+
+    def test_a_failure_with_no_decode_error_claims_no_decode_attribution(self):
+        """A 403 throttle, a 422 rejection and a 500 involve no JSON decode at all.
+        Both call sites always hand over a `json.dumps` result, so an unconditional
+        "the decode error is response-side" would fire on EVERY failure and announce a
+        decode error that never happened — misdirecting the triage this exists for."""
+        line = PR.format_post_failure(
+            "Review",
+            gh_result(stderr="gh: You have exceeded a secondary rate limit. (HTTP 403)"),
+            payload=json.dumps({"body": "x", "event": "COMMENT"}),
+        )
+        self.assertIn("request body: valid JSON", line)
+        self.assertNotIn("decode error", line)
 
     def test_a_well_formed_payload_points_the_finger_at_the_response(self):
         line = PR.format_post_failure(
@@ -2392,7 +2427,10 @@ class PostFailureDiagnosticTest(unittest.TestCase):
             payload=json.dumps({"body": "x", "event": "COMMENT"}),
         )
         self.assertIn("request body: valid JSON", line)
-        self.assertIn("response-side", line)
+        self.assertIn(
+            "response-side", line,
+            "gh DID report a decode failure here, so the attribution is earned",
+        )
 
     def test_a_malformed_payload_points_the_finger_at_the_request(self):
         line = PR.format_post_failure(
@@ -2903,6 +2941,41 @@ class PostTimeoutTest(unittest.TestCase):
         self.assertIsInstance(result, subprocess.CompletedProcess)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("timed out", result.stderr)
+
+    def test_a_timeout_that_captured_output_decodes_it_instead_of_carrying_bytes(self):
+        """`TimeoutExpired.stdout` is the RAW BYTES the pipe had buffered even under
+        `text=True` — CPython decodes only when the child exits normally. Carrying that
+        through would hand a bytes-bearing `CompletedProcess` to str readers, and since
+        `format_post_failure` now runs on EVERY POST failure, the resulting `TypeError`
+        would skip the landed-review read, the fallback POST and the job-summary write
+        — losing the findings on the very path built to preserve them.
+        """
+        partial = b"HTTP/2.0 403 Forbidden\r\nRetry-After: 60\r\n\r\n"
+        with mock.patch.object(
+            PR.subprocess, "run",
+            side_effect=subprocess.TimeoutExpired(cmd=["gh"], timeout=60, output=partial),
+        ):
+            result = PR.gh_post_review("o/r", "1", "{}")
+        self.assertIsInstance(result.stdout, str, "decoded at the source, once")
+        self.assertEqual(PR.gh_status_line(result), "HTTP/2.0 403 Forbidden")
+        self.assertEqual(PR.gh_response_headers(result).get("retry-after"), "60")
+        # The whole point: the diagnostic renders rather than raising.
+        line = PR.format_post_failure("Review", result, payload="{}")
+        self.assertIn("HTTP/2.0 403 Forbidden", line)
+        self.assertIn("retry-after: 60", line)
+
+    def test_a_severed_multibyte_capture_degrades_rather_than_raising(self):
+        """A kill can land mid-character. A diagnostic must never be the thing that
+        raises, so the decode replaces rather than strict-errors."""
+        with mock.patch.object(
+            PR.subprocess, "run",
+            side_effect=subprocess.TimeoutExpired(
+                cmd=["gh"], timeout=60, output=b"HTTP/2.0 502 Bad Gateway\r\n\r\n\xe2\x82",
+            ),
+        ):
+            result = PR.gh_post_review("o/r", "1", "{}")
+        self.assertIsInstance(result.stdout, str)
+        self.assertIn("502", PR.format_post_failure("Review", result))
 
     def test_a_timed_out_post_takes_the_undecided_path(self):
         """It carries no HTTP status, so it is neither a throttle nor a read-only

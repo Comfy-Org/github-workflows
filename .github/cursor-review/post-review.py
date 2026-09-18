@@ -314,6 +314,22 @@ def neutralize_mentions(text: str) -> str:
 GH_POST_REVIEW_TIMEOUT_SECONDS = 60
 
 
+def _as_text(captured) -> str:
+    """A captured stdout/stderr as `str`, whatever `subprocess` handed back.
+
+    `subprocess.run(..., text=True)` decodes only on the NORMAL-completion path: when
+    the child is killed on a timeout, `TimeoutExpired.stdout` is the raw BYTES read off
+    the pipe before the kill. A `CompletedProcess` built from one therefore carries
+    bytes where every reader here expects str, and `"".split` on it raises `TypeError`
+    — which, on a path whose whole job is to report a failure, would replace the
+    diagnostic with a traceback and lose the findings it was protecting. So the decode
+    happens once, here, and the str readers go through it too.
+    """
+    if isinstance(captured, (bytes, bytearray)):
+        return bytes(captured).decode("utf-8", errors="replace")
+    return captured or ""
+
+
 def gh_post_review(repo: str, pr_number: str, payload: str) -> subprocess.CompletedProcess:
     """POST the review, keeping the RESPONSE HEADERS (BE-12691).
 
@@ -353,11 +369,15 @@ def gh_post_review(repo: str, pr_number: str, payload: str) -> subprocess.Comple
         return subprocess.CompletedProcess(
             args=argv,
             returncode=124,
-            # Whatever `gh` had written before the kill. Headers are only readable once
-            # the status line has arrived, and `gh_response_headers` returns {} short
-            # of that, so a partial capture degrades to "no headers" rather than to a
-            # wrong `Retry-After`.
-            stdout=exc.stdout or "",
+            # Whatever `gh` had written before the kill, DECODED: `TimeoutExpired`
+            # carries the raw BYTES the pipe had buffered even under `text=True` —
+            # CPython decodes only on the normal-completion path — so handing
+            # `exc.stdout` straight through would make every str reader of this result
+            # (`gh_status_line`, `gh_response_headers`) raise `TypeError` the moment a
+            # timeout killed `gh` after it wrote anything. `errors="replace"` because a
+            # kill can sever a multi-byte character mid-sequence, and a diagnostic must
+            # never be the thing that raises.
+            stdout=_as_text(exc.stdout),
             stderr=(
                 f"gh api timed out after {GH_POST_REVIEW_TIMEOUT_SECONDS}s posting the "
                 f"review to {repo}#{pr_number} — whether the write was served is "
@@ -387,7 +407,7 @@ def gh_response_headers(result: subprocess.CompletedProcess) -> dict[str, str]:
     must not have to guess which spelling arrived. A repeated header keeps its LAST
     value, which is what an HTTP client would use.
     """
-    blob = result.stdout or ""
+    blob = _as_text(result.stdout)
     lines = blob.split("\n")
     if not _GH_STATUS_LINE_RE.match(lines[0].rstrip("\r")):
         return {}
@@ -787,14 +807,18 @@ def gh_error_line(result: subprocess.CompletedProcess) -> str:
 def gh_status_line(result: subprocess.CompletedProcess) -> str:
     """The `HTTP/x.y nnn Reason` line `gh -i` wrote to STDOUT, or "".
 
-    The one artifact that says whether the request reached GitHub at all: `gh -i`
-    renders the response's status line first thing on stdout, so its PRESENCE means a
-    response arrived (however GitHub then answered) and its ABSENCE means the write
-    never got a reply — a transport error, a timeout, a stub. Empty for anything that
-    is not a status line, gated by the same `_GH_STATUS_LINE_RE` the header parser
-    uses, so a bare JSON body's first line is never mistaken for one.
+    `gh -i` renders the response's status line first thing on stdout, so its PRESENCE
+    is proof a response arrived, however GitHub then answered. Its ABSENCE proves only
+    that none was CAPTURED, and is not evidence the write went unserved: a `gh`
+    predating `-i` or invoked without it writes a bare JSON body, a stub writes
+    whatever it likes, and a timeout can kill `gh` after GitHub already served the
+    write. Read it one way only — asserting "no reply reached GitHub" from an empty
+    return would invite the duplicate review the landed-review read exists to avoid.
+    Empty for anything that is not a status line, gated by the same
+    `_GH_STATUS_LINE_RE` the header parser uses, so a bare JSON body's first line is
+    never mistaken for one.
     """
-    first = (result.stdout or "").split("\n", 1)[0].rstrip("\r")
+    first = _as_text(result.stdout).split("\n", 1)[0].rstrip("\r")
     return first if _GH_STATUS_LINE_RE.match(first) else ""
 
 
@@ -802,6 +826,23 @@ def gh_status_line(result: subprocess.CompletedProcess) -> str:
 # failure was a throttle and how long a retry must wait. Lower-cased to match
 # `gh_response_headers`, which canonicalizes to Go's casing.
 _POST_FAILURE_HEADERS = ("retry-after", "x-ratelimit-remaining", "x-ratelimit-reset")
+
+
+# Go's `encoding/json` wordings `gh` surfaces when it cannot parse a JSON document —
+# the ONLY failures for which "request-side or response-side?" is even a question. A
+# 403 throttle, a 422 anchor rejection and a 500 involve no decode at all, so on those
+# the request-body self-check may report what it checked and nothing more.
+_JSON_DECODE_WORDINGS = (
+    "unexpected end of json input",
+    "invalid character",
+    "cannot unmarshal",
+)
+
+
+def _looks_like_json_decode_failure(result: subprocess.CompletedProcess) -> bool:
+    """Whether `gh` failed DECODING JSON, rather than merely reporting an HTTP error."""
+    blob = (result.stderr or "").lower()
+    return any(wording in blob for wording in _JSON_DECODE_WORDINGS)
 
 
 def format_post_failure(
@@ -819,26 +860,57 @@ def format_post_failure(
     settles the OTHER half — whether the body we sent was well-formed JSON — so the
     same error can be attributed to the response decode rather than our request.
 
+    Every claim here is bounded by what was actually observed: a missing status line is
+    reported as "not captured" and cross-checked against the stderr status rather than
+    asserted to mean nothing was served, and the request-body check attributes a decode
+    error only when `gh` reported one.
+
     Reads headers through `gh_response_headers`, which stops at the blank line, so a
     finding body that quotes a `Retry-After:` header can never reach this diagnostic.
     """
     parts = [f"{context} POST failed: {result.stderr}"]
     status_line = gh_status_line(result)
-    parts.append(
-        f"  response status: {status_line}"
-        if status_line
-        else "  response status: none captured on stdout (no reply reached gh)"
-    )
+    if status_line:
+        parts.append(f"  response status: {status_line}")
+    else:
+        # An absent status line is NOT proof nothing was served — see `gh_status_line`.
+        # `gh_http_status` reads the `(HTTP nnn)` gh renders on stderr, and a status
+        # there settles it from the other side, so the two are reported together
+        # rather than the stdout half alone being read as a verdict.
+        reported = gh_http_status(result)
+        parts.append(
+            f"  response status: no status line captured on stdout, but gh reported "
+            f"HTTP {reported} on stderr — a reply DID arrive"
+            if reported is not None
+            else "  response status: no status line captured on stdout and no HTTP "
+            "status on stderr — whether the write was served is UNKNOWN; ask the PR, "
+            "do not re-trigger blind"
+        )
     headers = gh_response_headers(result)
     surfaced = [f"{name}: {headers[name]}" for name in _POST_FAILURE_HEADERS if name in headers]
     if surfaced:
         parts.append("  response headers: " + "; ".join(surfaced))
     if payload is not None:
+        # Attribution is claimed ONLY when `gh` actually failed to decode JSON. Both
+        # call sites hand over a `json.dumps` result, so the valid branch always wins;
+        # printing "the decode error is response-side" unconditionally would announce a
+        # decode error on every 403, 422 and 500 — misdirecting the triage this exists
+        # to serve. Absent a decode failure it reports what it checked, and stops.
+        decode_failure = _looks_like_json_decode_failure(result)
         try:
             json.loads(payload)
-            parts.append("  request body: valid JSON — the decode error is response-side")
         except (ValueError, TypeError) as exc:
-            parts.append(f"  request body: INVALID JSON ({exc}) — the decode error is request-side")
+            parts.append(
+                f"  request body: INVALID JSON ({exc}) — the decode error is request-side"
+                if decode_failure
+                else f"  request body: INVALID JSON ({exc})"
+            )
+        else:
+            parts.append(
+                "  request body: valid JSON — so the decode error is response-side"
+                if decode_failure
+                else "  request body: valid JSON"
+            )
     return "\n".join(parts)
 
 
