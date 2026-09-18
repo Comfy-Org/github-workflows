@@ -51,17 +51,23 @@ Add parser cases **to the corpus**, not as an inline literal in either suite —
 a case only one implementation ever sees proves nothing about the other, which
 is how the two live divergences reached `main`.
 
-Three dialect rules the corpus now pins on both sides, because each was a place
+Four dialect rules the corpus now pins on both sides, because each was a place
 the ports read the same bytes differently: a **duplicate top-level
 `default_pool:` is last-wins** (the second replaces the first — the block arm
 used to *append* on the JS side — and each port warns rather than rejecting;
 a repeated `rules:` is *not* covered, it still appends on both sides); a **`#`
 opens a comment only at column 0 or after a space or a tab**, the two characters
 spelled out rather than delegated to `/\s/` and `isspace()`, which disagree about
-U+0085, U+001C and U+FEFF; and a **single leading U+FEFF is stripped from the
-document**, which `trim()` did for free and `strip()` did not. The warning text
-is the one part not corpus-pinned — the channels differ (`core.warning` vs a
-`::warning::` line) — so each suite asserts its own.
+U+0085, U+001C and U+FEFF; a **single leading U+FEFF is stripped from the
+document**, which `trim()` did for free and `strip()` did not; and **a token is
+trimmed of a space or a tab and nothing else** — YAML s-white, spelled out as
+`_trim` in the Python port and `trimSWhite` in the JS one, because `str.strip()`
+also drops U+0085 and U+001C-U+001F, `String.prototype.trim()` also drops U+FEFF,
+and *both* drop U+00A0. Every other invisible character now survives into the
+login verbatim on both sides, so a padded login fails to route identically in the
+runtime and in the drift generator instead of routing in one and not the other.
+The warning text is the one part not corpus-pinned — the channels differ
+(`core.warning` vs a `::warning::` line) — so each suite asserts its own.
 
 The [caller guide](../../docs/callers/assign-reviewers.md) documents the ranking,
 evidence limits, failure handling, and configuration. Keep behavior there rather

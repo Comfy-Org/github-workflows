@@ -166,15 +166,25 @@ def _strip_comment(s):
     return s
 
 
+# YAML s-white: the ONLY characters trimmed around a token. Spelled out (not
+# str.strip()) because strip() and JS trim() disagree about U+FEFF, U+0085 and
+# U+001C-U+001F; the JS port's `trimSWhite` is the same two characters. Corpus-pinned.
+S_WHITE = " \t"
+
+
+def _trim(s):
+    return s.strip(S_WHITE)
+
+
 def _unquote(s):
-    s = s.strip()
+    s = _trim(s)
     if len(s) >= 2 and ((s[0] == '"' and s[-1] == '"') or (s[0] == "'" and s[-1] == "'")):
         return s[1:-1]
     return s
 
 
 def _parse_flow(s):
-    s = s.strip()
+    s = _trim(s)
     if not s.startswith("["):
         return None
     end = s.find("]")
@@ -195,13 +205,24 @@ def parse_reviewer_config(text):
                  "rules": [loc-or-None, ...]}        (reviewers-list positions)
     """
     # A single leading U+FEFF is legal YAML and must not become part of the first
-    # key; `strip()` does not treat it as whitespace, so the first `default_pool:`
-    # of a BOM-prefixed document used to be skipped here while the JS port (whose
-    # `trim()` does strip it) parsed the same bytes fine. Dropping one character
-    # from the head of line 0 leaves every line INDEX untouched, so `locs` — and
-    # the byte-faithful `rewrite_config`, which keeps the BOM by splitting `text`
-    # itself — are unaffected.
-    raw_lines = text.removeprefix("\ufeff").split("\n")
+    # key; neither `strip()` nor `_trim` treats it as whitespace, so the first
+    # `default_pool:` of a BOM-prefixed document used to be skipped here while the
+    # JS port (whose `trim()` does strip it) parsed the same bytes fine. Dropping
+    # one character from the head of line 0 leaves every line INDEX untouched, so
+    # `locs` — and the byte-faithful `rewrite_config`, which keeps the BOM by
+    # splitting `text` itself — are unaffected.
+    #
+    # The CR of a CRLF document used to come off incidentally, via the `strip()`
+    # calls that `_trim` replaced; s-white excludes CR, so consume it HERE instead,
+    # as part of the line break. `re.split(r"\r?\n", ...)` is the JS port's
+    # `split(/\r?\n/)` character for character, which is the point: a CR is only
+    # a line break when a newline FOLLOWS it. Stripping a trailing CR off each
+    # `split("\n")` piece instead — the obvious shortcut — also eats a BARE CR
+    # ending the last line of a document with no final newline, which JS keeps as
+    # data; that would have traded the old divergence for a new one. Splitting on
+    # the two-character break produces the same number of lines as `split("\n")`
+    # on a CRLF document, so every line index is left alone.
+    raw_lines = re.split(r"\r?\n", text.removeprefix("\ufeff"))
     lines = [_strip_comment(l) for l in raw_lines]
     config = {"default_pool": [], "rules": []}
     locs = {"default_pool": None, "rules": []}
@@ -211,7 +232,7 @@ def parse_reviewer_config(text):
     n = len(lines)
     while i < n:
         raw = lines[i]
-        line = raw.strip()
+        line = _trim(raw)
         if not line:
             i += 1
             continue
@@ -225,7 +246,7 @@ def parse_reviewer_config(text):
             if seen_default_pool:
                 print("::warning::duplicate top-level default_pool: key — last one wins")
             seen_default_pool = True
-            rest = line[len("default_pool:"):].strip()
+            rest = _trim(line[len("default_pool:"):])
             flow = _parse_flow(rest)
             if flow is not None:
                 config["default_pool"] = flow
@@ -238,12 +259,12 @@ def parse_reviewer_config(text):
             indent = 2
             while i < n:
                 r = lines[i]
-                if not r.strip():
+                if not _trim(r):
                     i += 1
                     continue
                 if _indent_of(r) == 0:
                     break
-                t = r.strip()
+                t = _trim(r)
                 if t.startswith("- "):
                     items.append(_unquote(t[2:]))
                     item_lines.append(i)
@@ -271,7 +292,7 @@ def parse_reviewer_config(text):
                 m = re.match(r"^(paths|reviewers):(.*)$", seg)
                 if not m:
                     return
-                key, val = m.group(1), m.group(2).strip()
+                key, val = m.group(1), _trim(m.group(2))
                 flow = _parse_flow(val)
                 if flow is not None:
                     if current is not None:
@@ -291,13 +312,13 @@ def parse_reviewer_config(text):
 
             while i < n:
                 r = lines[i]
-                if not r.strip():
+                if not _trim(r):
                     i += 1
                     continue
                 if _indent_of(r) == 0:
                     break
                 ind = _indent_of(r)
-                t = r.strip()
+                t = _trim(r)
                 is_dash = t == "-" or t.startswith("- ")
                 if is_dash and (rule_indent == -1 or ind == rule_indent):
                     if rule_indent == -1:
@@ -307,11 +328,11 @@ def parse_reviewer_config(text):
                     config["rules"].append(current)
                     locs["rules"].append(cur_loc)
                     list_key = None
-                    after_dash = t[1:].strip()
+                    after_dash = _trim(t[1:])
                     if after_dash:
                         set_key(after_dash, i)
                 elif is_dash and list_key and current is not None:
-                    current[list_key].append(_unquote(t[1:].strip()))
+                    current[list_key].append(_unquote(_trim(t[1:])))
                     if list_key == "reviewers":
                         if cur_loc["reviewers"] is None:
                             cur_loc["reviewers"] = ("block", [], ind)
