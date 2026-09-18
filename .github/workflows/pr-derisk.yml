@@ -200,12 +200,17 @@ on:
         required: false
         default: 200000
       repo_map_path:
-        description: Path to the consumer's risk-map override, read from the PR's BASE ref.
+        description: >-
+          Path to the consumer's risk-map override, read from the PR's BASE ref.
+          Repo-relative: a leading `/` or a `..` segment is refused rather than
+          resolved, since it would address an endpoint outside the repo's contents.
         type: string
         required: false
         default: '.github/risk.json'
       repo_runbooks_path:
-        description: Path to the consumer's runbook-registry override, read from the PR's BASE ref.
+        description: >-
+          Path to the consumer's runbook-registry override, read from the PR's BASE
+          ref. Repo-relative, on the same terms as `repo_map_path`.
         type: string
         required: false
         default: '.github/risk-runbooks.json'

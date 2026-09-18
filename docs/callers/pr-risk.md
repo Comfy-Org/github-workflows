@@ -122,7 +122,7 @@ fail the caller's next run at startup.
 | `bot_logins` | `github-actions,dependabot,renovate,coderabbitai,cursor,comfy-pr-bot,web-flow` | Extra logins treated as bots. Needed only for **machine USER accounts** — a real GitHub App is recognized from GitHub's own actor type, no list entry required. A bot with no runbook entry still grades as human — identity alone buys no trust. **This list is load-bearing, not a hint:** a listed login skips the first-time-contributor test, so it moves a non-fork `NONE`/`FIRST_TIME_CONTRIBUTOR` PR from `external` (R3) to `human` (R1). Nothing validates that a listed login is really a machine account, so add one only for an account you control, and remove it when it is retired. |
 | `label_map` | `''` | Rename the five grader-owned labels as `tier=label` pairs. Tier keys are fixed; only the label text is yours. |
 | `wait_for_checks_minutes` | `10` | How long to wait for the rest of the check rollup to settle before labeling (clamped to 25 — what a 30-minute job can spend waiting). `0` labels immediately, expect R2 floors from still-pending checks. |
-| `repo_map_path` | `.github/risk.json` | Consumer risk-map override, read from the PR **base ref**. |
+| `repo_map_path` | `.github/risk.json` | Consumer risk-map override, read from the PR **base ref**. Repo-relative — a leading `/` or a `..` segment is refused, not resolved. |
 | `repo_runbooks_path` | `.github/risk-runbooks.json` | Consumer runbook-registry override, read from the PR **base ref**. |
 
 ## Gotchas
