@@ -1518,29 +1518,60 @@ jobs:
           echo "key broker ready on $BROKER_SOCK"
 
       - name: Preflight the sandbox
-        # BE-14756: bring the bubblewrap sandbox up in its OWN step, BEFORE the
-        # billed "Run finder" step below. `--preflight-only` runs ONLY the mutating
-        # bring-up (install bubblewrap, the AppArmor profile, the sysctl fallback)
-        # and exits non-zero if a working jail cannot be established — burning NO
-        # agent budget. Splitting it out is why a no-spend sandbox BRING-UP failure
-        # never lands on the "Run finder" name: when this step fails the job fails
-        # but "Run finder" is never reached, so the runs-jobs API reports it
-        # queued/skipped and interval.py's `agent_step_started` reads it as
-        # unstarted -> the cadence clock is NOT advanced (mirrors the "Start the
-        # key broker" split, done for the same reason). NOTE this covers the
-        # bring-up ONLY: agent-sandbox.sh still runs no-spend, fail-loud guards
-        # (argument validation, the --uds live-broker healthz probe, the clone/
-        # out-dir path + overlap checks) INSIDE "Run finder" before it execs the
-        # agent, and any of those dying still stamps "Run finder" failed with no
-        # spend -> counted as a spent audit. Hoisting that validation ahead of the
-        # billed step (a validate-only mode) is tracked separately. The name is deliberately
-        # DISTINCT from "Run finder" so interval.py's EXACT-name match never
-        # mistakes this bring-up for the billed agent step. preflight() is
-        # idempotent, so "Run finder"'s own preflight then hits its fast path
-        # (already usable -> instant return, no side effects).
+        # BE-14756 + BE-14771: run BOTH no-spend pre-agent phases here, under THIS
+        # step's name, BEFORE the billed "Run finder" step below.
+        #   1. `--preflight-only` (BE-14756) runs ONLY the mutating sandbox bring-up
+        #      (install bubblewrap, the AppArmor profile, the sysctl fallback) and
+        #      exits non-zero if a working jail cannot be established.
+        #   2. `--validate-only` (BE-14771) then walks the SAME pre-exec guard path a
+        #      real invocation does — required/absolute-path argument validation, the
+        #      `--uds` `-S` + live-broker `/healthz` probe, clone and out-dir
+        #      existence, the out-dir<->clone overlap check, and the guards embedded
+        #      in the bwrap_args assembly — and stops at the exec point instead of
+        #      exec'ing bwrap. It is handed the SAME arguments as "Run finder" below,
+        #      so KEEP THE TWO LISTS IN SYNC or this validates an invocation the
+        #      agent step does not make. Two deliberate omissions: the `-- <command>`
+        #      (refused: nothing is executed) and the `--env`s (their keys are
+        #      literals in this file, so the `KEY=VALUE` guard cannot fire from this
+        #      caller; the `--ro-file`/`--clone-mode` guards in that same loop ARE
+        #      exercised).
+        # Neither phase burns agent budget, and hoisting both is why a no-spend
+        # failure in either never lands on the "Run finder" name: when this step
+        # fails the job fails but "Run finder" is never reached, so the runs-jobs API
+        # reports it queued/skipped and interval.py's `agent_step_started` reads it
+        # as unstarted -> the cadence clock is NOT advanced for a run that billed
+        # nothing (BE-4814; mirrors the "Start the key broker" split, done for the
+        # same reason). Before BE-14771 phase 2's guards ran inside "Run finder", so
+        # e.g. a broker that died leaving a stale socket (passes `-S`, fails healthz)
+        # failed the billed step having spent nothing and was counted as an audit.
+        # RESIDUAL, deliberately NOT closed here: the window between this step and
+        # "Run finder" stays open. A broker that dies AFTER the healthz probe below
+        # still kills "Run finder" no-spend, and that failure is still counted as a
+        # spent audit — the same residual the bring-up split carries. Nor can this
+        # reach a failure `bwrap` itself raises at exec — a mount that fails on a
+        # source that exists — since validating without running the jail is the
+        # whole point. (A `--ro-file` source that is simply MISSING is NOT in that
+        # class: it needs no jail to detect, so `--validate-only` checks it
+        # host-side, `-e`, alongside the `-d` on --clone and the `-S` on --uds.)
+        # Proving the finder actually BILLED is tracked separately (BE-4850).
+        # The name is deliberately DISTINCT from "Run finder" so interval.py's
+        # EXACT-name match never mistakes either phase for the billed agent step.
+        # preflight() is idempotent, so "Run finder"'s own preflight then hits its
+        # fast path (already usable -> instant return, no side effects) and re-runs
+        # the same validation as a cheap no-op.
+        # `-e` is spelled out (the sibling steps write `set -uo pipefail` and inherit
+        # it from the runner's default `bash -e`) because this step now runs TWO
+        # commands: a bring-up failure must fail the step, not be masked by the
+        # validation's exit status.
         run: |
-          set -uo pipefail
+          set -euo pipefail
           bash "$GROOM_ASSETS/agent-sandbox.sh" --preflight-only
+          bash "$GROOM_ASSETS/agent-sandbox.sh" --validate-only \
+            --clone "$GROOM_CLONE" --clone-mode ro \
+            --out-dir "$GROOM_OUT_DIR" \
+            --uds "$BROKER_SOCK" \
+            --ro-file "$GROOM_ASSETS/jail-shim.mjs" \
+            --ro-file /tmp/groom-finder-prompt.md
 
       # NAME IS LOAD-BEARING — `interval.py` matches this step name EXACTLY
       # (`_AGENT_STEP_NAME`) against the runs-jobs API's `steps[]` to decide
@@ -1551,9 +1582,10 @@ jobs:
       # `test_interval.py` pins both halves. Same for adding an `if:` to this
       # step: a conditionally-skipped agent inside a SUCCEEDING job would still
       # count, because a success is trusted on the job conclusion alone. The
-      # sandbox bring-up is deliberately in the separate "Preflight the sandbox"
-      # step ABOVE (BE-14756), NOT here, so a no-spend bring-up failure fails that
-      # distinctly-named step instead of this billed one.
+      # sandbox bring-up AND its pre-exec argument/path validation are deliberately
+      # in the separate "Preflight the sandbox" step ABOVE (BE-14756, BE-14771), NOT
+      # here, so a no-spend setup or validation failure fails that distinctly-named
+      # step instead of this billed one.
       - name: Run finder
         # BE-4303: the agent runs ONLY inside `agent-sandbox.sh` (the bubblewrap
         # jail). What the old `chmod`/`env -u` dance did by hand the jail now does
@@ -1986,17 +2018,29 @@ jobs:
           echo "key broker ready on $BROKER_SOCK"
 
       - name: Preflight the sandbox
-        # BE-14756: bring the bubblewrap sandbox up in its OWN step before the
-        # "Run verifier" step (see the finder job's "Preflight the sandbox" step
-        # for the full rationale). `--preflight-only` runs ONLY the mutating
-        # bring-up and burns no agent budget; "Run verifier"'s own preflight then
-        # hits its idempotent fast path. Only the finder job is cadence-gated, so
-        # this split does not affect interval.py's clock here — it mirrors the
+        # BE-14756 + BE-14771: do the bubblewrap bring-up AND the pre-exec argument/
+        # path validation in this OWN step before the "Run verifier" step (see the
+        # finder job's "Preflight the sandbox" step for the full rationale, the
+        # keep-the-arg-lists-in-sync warning, and the residual this does NOT close).
+        # `--preflight-only` runs ONLY the mutating bring-up; `--validate-only` then
+        # walks the same guard path a real invocation does (including the `--uds`
+        # live-broker healthz probe) and stops at the exec point. Neither burns agent
+        # budget; "Run verifier"'s own preflight then hits its idempotent fast path
+        # and its validation re-runs as a no-op. Only the finder job is cadence-gated,
+        # so this split does not affect interval.py's clock here — it mirrors the
         # finder for consistency (and the "Start the key broker" precedent), and
-        # keeps a no-spend bring-up failure off the agent step in either case.
+        # keeps a no-spend bring-up or validation failure off the agent step in
+        # either case.
         run: |
-          set -uo pipefail
+          set -euo pipefail
           bash "$GROOM_ASSETS/agent-sandbox.sh" --preflight-only
+          bash "$GROOM_ASSETS/agent-sandbox.sh" --validate-only \
+            --clone "$GROOM_CLONE" --clone-mode ro \
+            --out-dir "$GROOM_OUT_DIR" \
+            --uds "$BROKER_SOCK" \
+            --ro-file "$GROOM_ASSETS/jail-shim.mjs" \
+            --ro-file /tmp/groom-verifier-prompt.md \
+            --ro-file "$FINDER_IN"
 
       - name: Run verifier
         # A FRESH agent session on a FRESH checkout — it sees only the finder's JSON
@@ -2914,17 +2958,32 @@ jobs:
           echo "key broker ready on $BROKER_SOCK"
 
       - name: Preflight the sandbox
-        # BE-14756: bring the bubblewrap sandbox up in its OWN step before the
-        # "Run builder" step (see the finder job's "Preflight the sandbox" step
-        # for the full rationale). `--preflight-only` runs ONLY the mutating
-        # bring-up and burns no agent budget; "Run builder"'s own preflight then
-        # hits its idempotent fast path. Only the finder job is cadence-gated, so
-        # this split does not affect interval.py's clock here — it mirrors the
-        # finder for consistency (and the "Start the key broker" precedent), and
-        # keeps a no-spend bring-up failure off the agent step in either case.
+        # BE-14756 + BE-14771: do the bubblewrap bring-up AND the pre-exec argument/
+        # path validation in this OWN step before the "Run builder" step (see the
+        # finder job's "Preflight the sandbox" step for the full rationale, the
+        # keep-the-arg-lists-in-sync warning, and the residual this does NOT close).
+        # `--preflight-only` runs ONLY the mutating bring-up; `--validate-only` then
+        # walks the same guard path a real invocation does and stops at the exec
+        # point. `--clone-mode rw-git-ro` is passed because that is what "Run builder"
+        # uses, and it is load-bearing here: rw-git-ro is the one mode with an extra
+        # pre-exec guard (the clone's `.git` must be a real directory, not a git-
+        # worktree `gitdir:` pointer file), so validating in `ro` would silently skip
+        # the check most likely to kill this job no-spend. Neither phase burns agent
+        # budget; "Run builder"'s own preflight then hits its idempotent fast path and
+        # its validation re-runs as a no-op. Only the finder job is cadence-gated, so
+        # this split does not affect interval.py's clock here — it mirrors the finder
+        # for consistency (and the "Start the key broker" precedent), and keeps a
+        # no-spend bring-up or validation failure off the agent step in either case.
         run: |
-          set -uo pipefail
+          set -euo pipefail
           bash "$GROOM_ASSETS/agent-sandbox.sh" --preflight-only
+          bash "$GROOM_ASSETS/agent-sandbox.sh" --validate-only \
+            --clone "$GROOM_CLONE" --clone-mode rw-git-ro \
+            --out-dir "$GROOM_OUT_DIR" \
+            --uds "$BROKER_SOCK" \
+            --ro-file "$GROOM_ASSETS/jail-shim.mjs" \
+            --ro-file /tmp/groom-builder-prompt.md \
+            --ro-file "$FINDING_IN"
 
       - name: Run builder
         # Runs ONLY inside `agent-sandbox.sh` (BE-4303), in `rw-git-ro` mode: the

@@ -33,12 +33,32 @@ on:
       # match this pattern and is not meant to.)
       - '.github/workflows/bump-*-callers.yml'
       - '.github/workflows/test-bump-callers.yml'
+      # The contract test also reads the TREE, not just the entrypoints: since
+      # BE-15253 it asserts every `WATCHED_EXEC` entry is a tracked file. Those
+      # are ~50 hand-written literal paths, and the failure they guard is a
+      # SILENT FREEZE — rename or retire a listed file without editing the list
+      # and preflight.sh reads it as a decommission on every future run
+      # (`::warning::`, `proceed=false`, a green run, no caller bumped again).
+      # A filter listing only the entrypoints would not fire on the PR doing the
+      # renaming, so the guard would first speak on some unrelated later PR,
+      # long after the fleet froze.
+      #
+      # Deliberately the two whole trees rather than an enumeration of the
+      # watched surfaces: that enumeration is a roster, and a roster duplicated
+      # into a `paths:` filter is exactly the drift this directory exists to
+      # prevent. The contract test asserts this filter covers every surface it
+      # reads, so a fleet that ever watches a path outside these two fails here
+      # rather than quietly losing its trigger.
+      - '.github/**'
+      - 'scripts/**'
   push:
     branches: [main]
     paths:
       - '.github/bump-callers/**'
       - '.github/workflows/bump-*-callers.yml'
       - '.github/workflows/test-bump-callers.yml'
+      - '.github/**'
+      - 'scripts/**'
 
 permissions:
   contents: read

@@ -153,6 +153,15 @@ permissions:
   contents: read
   pull-requests: write
 concurrency:
+  # KEEP THIS. The reusable owns a `cursor-review-reusable-<pr>-<slot>` group
+  # of its own — that is what lets `skip-cursor-review` cancel a panel already
+  # running — but it REFINES this one rather than replacing it: under the
+  # default `run_without_label: false` it does not cancel on push. Two rules:
+  # never name a caller group `cursor-review-reusable-*` (same group as the
+  # reusable = the caller deadlocks its own run), and call the reusable from a
+  # dedicated workflow file — its cancellation is run-scoped, so a label event
+  # would take the rest of a shared `ci.yml` down with it. Details in
+  # docs/callers/cursor-review.md.
   # Re-labeling cancels an in-flight run for the same PR + label.
   group: cursor-review-pr-${{ github.event.pull_request.number }}-${{ github.event.label.name }}
   cancel-in-progress: true
@@ -295,7 +304,13 @@ and upsert are both `continue-on-error`: the size verdict lives in the
 ### Escape hatches
 
 - **Skip a PR**: add the `skip-cursor-review` label. It wins even if the trigger
-  label is present. Removing it (while the trigger label is on) starts a run.
+  label is present, and — on a caller pinned past the reusable's own
+  `cursor-review-reusable-*` concurrency group — it also **cancels a panel that
+  is already running**, since the veto label and the trigger label share one
+  concurrency slot. Cancellation is asynchronous, so the vetoed run keeps
+  unwinding for a moment; under `blocking: true` that leaves the gate's verdict
+  racy for a beat (see the blocking-gate gotchas in the caller guide). Removing
+  it (while the trigger label is on) starts a run.
 - **Re-review after changes**: push commits. The new HEAD SHA bypasses the
   idempotency check and a re-applied label runs a fresh panel.
 - **Re-review unchanged content**: dismiss the existing review, then re-apply

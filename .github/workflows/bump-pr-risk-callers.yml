@@ -167,6 +167,9 @@ jobs:
           # were what the inline copy this step replaces listed, and that list
           # was already short of what a caller runs (a carried-over gap, fixed
           # here rather than ported):
+          #   * grade-targets.sh sources lib.sh — the base-ref and override
+          #     resolvers plus the retrying reads under them — and exits 2 if it
+          #     is not beside it, before any target is attempted;
           #   * grade-targets.sh hard-`die`s without apply-risk-label.sh, and
           #     again without publish-risk-surfaces.sh once `check_run:` or
           #     `sticky_comment:` is enabled;
@@ -184,6 +187,7 @@ jobs:
             .github/workflows/pr-risk.yml
             scripts/pr-risk/grade-pr-risk.sh
             scripts/pr-risk/grade-targets.sh
+            scripts/pr-risk/lib.sh
             scripts/pr-risk/resolve-enabled.sh
             scripts/pr-risk/apply-risk-label.sh
             scripts/pr-risk/publish-risk-surfaces.sh
