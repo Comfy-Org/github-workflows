@@ -9,7 +9,8 @@ Two jobs, one taxonomy that lives in **your** repo (`.github/area-labels.yml` by
 - **`sync-labels`** — on push to your default branch that touches the taxonomy (or a manual
   full-sync), create-or-updates every `area:*` label from the YAML. Edit the YAML, never the
   GitHub UI. No secret.
-- **`label-pr`** — classifies each PR into exactly one `area:*` label. An LLM does the
+- **`label-pr`** — classifies each PR into exactly one `area:*` label, plus any
+  [path sub-labels](#path-sub-labels) the PR's changed files matched. An LLM does the
   judgement (the domain-vs-path call a static `paths:` map can't make), but it gets **no
   tools and no token**: PR metadata is passed as data inside `<pr_data>` tags, the reply is
   enum-constrained by a JSON schema to your taxonomy's own names, and a deterministic step
@@ -108,7 +109,38 @@ labels:
     description: "GCP infrastructure"       # what GitHub stores (≤100 chars)
     guidance: "terraform/gcp; GKE cluster infra lives here."   # optional; classifier reads
                                                                # this, falling back to description
+
+sub_labels:                # optional — see "Path sub-labels" below
+  - name: "area:router"    # same shape as above; must NOT also appear in labels[]
+    color: "7057ff"
+    description: "Router: the model-routing layer inside the API service"
+    paths:
+      - "services/api/router*/**"
+      - "**/*router*"
 ```
+
+## Path sub-labels
+
+Use these when a subsystem lives **inside** another area's service and you still want to
+filter for it — the classic case being a component that is genuinely a subset of one area, so
+promoting it to its own area would just hide those PRs from the parent area's filter.
+
+`labels[]` answers *"which area owns this PR?"* — a judgement call, so a model makes it and
+exactly one wins. `sub_labels[]` answers *"does this PR touch X?"* — a path question, so the
+model never sees it: the globs are matched against the PR's changed files and the result
+rides **alongside** the classified area.
+
+A PR touching `services/api/routerqueue/queue.go` ends up with **`area:api` +
+`area:router`**. Matched sub-labels are exempt from the one-area cleanup; a sub-label that
+stops matching (the PR dropped those files) is retired by that same cleanup on the next run.
+Glob semantics match a workflow `paths:` filter's, so you can copy a glob between the two:
+`*` and `?` stay within one path segment, `**` crosses segments, and a leading `**/` matches
+zero or more directories (`**/*router*` also matches a root-level file).
+
+Sub-label names must be canonical `area:*` slugs and **disjoint** from `labels[]` — a name in
+both would be ambiguous during cleanup, and the run is skipped with a warning rather than
+guessing. Adding a `sub_labels:` block needs no caller change; `sync-labels` creates the
+labels when it lands on your default branch. Repos that omit the key are unaffected.
 
 ## Gotchas
 
@@ -121,6 +153,15 @@ inside the reusable — the caller stays a bare `uses:`.
 the base ref; the PR that first introduces `.github/area-labels.yml` reads a base ref where
 it doesn't exist yet and skips cleanly. After that PR merges, `sync-labels` creates the
 labels and the next PR gets classified.
+
+**A sub-label is only as good as its globs.** They are matched against the PR's changed
+file paths and nothing else — no content, no judgement. A file that *is* the subsystem's work
+but doesn't live under a matching path won't be tagged, and a rename that moves files out
+from under a glob silently stops matching. Keep the globs broad (a `**/*name*` catch-all next
+to the directory patterns costs nothing) and treat the label as a filter, not an audit. The
+changed-file list also comes from `gh pr view --json files`, which returns the first 100
+files, so a sub-label can be missed on a PR larger than that — the same list the classifier
+itself has always been shown.
 
 **The label is applied with the plain `GITHUB_TOKEN`.** That means it cannot fire `labeled`
 triggers — this classifier is structurally unable to start a workflow cascade. Don't

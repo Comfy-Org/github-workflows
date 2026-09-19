@@ -8,7 +8,9 @@
 
 name: Test area-label scripts
 
-# Runs shellcheck + the hermetic lib suite for the area-label classifier. The classifier
+# Runs shellcheck + the hermetic suites for the area-label classifier (`tests/test_lib.sh`
+# over the pure core, `tests/test_apply.sh` over the label-writing orchestration with `gh`
+# and `curl` stubbed). The classifier
 # stamps an area label on every consuming repo's PRs, so a regression in taxonomy validation
 # or request-building silently mislabels PRs — cheap to guard with a unit run on change.
 
@@ -43,6 +45,11 @@ jobs:
         with:
           persist-credentials: false
       - name: shellcheck
-        run: shellcheck -x lib.sh sync-labels.sh classify-and-apply.sh tests/test_lib.sh
-      - name: lib suite
-        run: bash tests/test_lib.sh
+        run: shellcheck -x ./*.sh tests/*.sh
+      - name: suites
+        # LOOP, don't list: `bash a.sh b.sh` would run only a.sh and silently skip the rest.
+        run: |
+          for t in tests/*.sh; do
+            echo "== $t"
+            bash "$t" || exit 1
+          done
