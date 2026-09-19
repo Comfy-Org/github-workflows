@@ -429,6 +429,58 @@ test('a single default_pool: is silent, however it is written', () => {
   }
   assert.deepEqual(helperWarnings, []);
 });
+
+// The invalid-configured-login warning. Unlike the duplicate-key warning above this one lives in
+// the routing script rather than the shared parser region, so it is driven through `run()` and read
+// off `logs` — and it only exists because both ports narrowed to trimming s-white, which left a
+// login padded with U+00A0/U+FEFF/U+0085 surviving the parse verbatim and then failing the shape
+// gate, invisibly. `\u00a0` is written escaped on purpose: a literal here would go vacuous the
+// moment an editor normalised it away, with every assertion below still passing.
+const NBSP = '\u00a0';
+test('a padded login in a MATCHED rule warns, codepoint-escaped, and does not route', async () => {
+  const result = await run({config: `rules:\n  - paths: ["src/**"]\n    reviewers: ["${NBSP}alice", bob]\n`});
+  assert.deepEqual(result.selected, ['bob']);
+  const warnings = result.logs.filter((line) => /is not a valid GitHub login/.test(line));
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /configured reviewer "\\u00a0alice"/);
+  assert.match(warnings[0], /^\.github\/reviewers\.yml: /);
+});
+test('a padded login warns even when its rule matches NOTHING in this PR', async () => {
+  // The regression CodeRabbit caught: warning only from `configuredCandidate` reached a rule's
+  // reviewers only once that rule's paths matched a changed file, so rot in any other area of the
+  // config stayed silent on every run that did not happen to touch it. The rot is a property of
+  // the FILE, not of this diff.
+  const result = await run({
+    files: [file('src/api/main.js')],
+    config: `rules:\n  - paths: ["src/api/**"]\n    reviewers: [alice]\n  - paths: ["docs/**"]\n    reviewers: ["${NBSP}carol"]\n`,
+  });
+  assert.deepEqual(result.selected, ['alice']);
+  // Warned about, but emphatically NOT routed: an unmatched rule's owners stay out of `candidates`.
+  assert.equal(result.logs.filter((line) => /configured reviewer "\\u00a0carol"/.test(line)).length, 1);
+  assert.ok(!result.selected.includes('carol'));
+});
+test('a padded default_pool entry warns on a run that never reaches the fallback', async () => {
+  // `default_pool` was only ever swept when NO rule and no history covered any file. A rotted
+  // entry in it could therefore go unreported indefinitely while some rule kept matching — and
+  // the fallback is exactly the path you need it to work on when it finally fires.
+  const result = await run({config: `default_pool: ["bob${NBSP}"]\nrules:\n  - paths: ["src/**"]\n    reviewers: [alice]\n`});
+  assert.deepEqual(result.selected, ['alice']);
+  assert.equal(result.logs.filter((line) => /configured reviewer "bob\\u00a0"/.test(line)).length, 1);
+});
+test('each bad token warns once, however many rules repeat it', async () => {
+  const result = await run({
+    config: `default_pool: ["${NBSP}dana"]\nrules:\n  - paths: ["src/api/**"]\n    reviewers: ["${NBSP}dana", alice]\n  - paths: ["docs/**"]\n    reviewers: ["${NBSP}dana"]\n`,
+  });
+  assert.equal(result.logs.filter((line) => /configured reviewer "\\u00a0dana"/.test(line)).length, 1);
+});
+test('a well-formed login is never warned about, excluded or not', async () => {
+  // Keyed on the SHAPE test only, never on `eligible()`: the exclude set legitimately holds the PR
+  // author and `EXCLUDE`, so warning there would fire on essentially every run and train people to
+  // ignore the message. `author` and `alice` below are both shape-valid and both excluded.
+  const result = await run({config: 'rules:\n  - paths: ["src/**"]\n    reviewers: [Author, Alice, bob]\n', env: {EXCLUDE: '@ALICE'}});
+  assert.deepEqual(result.selected, ['bob']);
+  assert.deepEqual(result.logs.filter((line) => /is not a valid GitHub login/.test(line)), []);
+});
 for (const {glob, cases} of corpus.globs) {
   test(`corpus glob — ${glob}`, () => {
     for (const {path, matches} of cases) {

@@ -73,7 +73,10 @@ Three consequences of that narrowing, each pinned rather than left to be redisco
 the runtime **warns** when a *configured* login fails the login-shape gate, because the
 padding that now survives is invisible and the token would otherwise just never be
 assigned (keyed on the shape test only — being excluded as the PR author is normal and
-must not warn); a line whose only content is non-s-white whitespace is **no longer
+must not warn), sweeping **every** rule's reviewers and the whole `default_pool` up
+front rather than only the ones a given run routes through, since the rot belongs to the
+file and not to the diff — the sweep warns, it does not enqueue, so an unmatched rule's
+owners are still never candidates; a line whose only content is non-s-white whitespace is **no longer
 blank**, and since indentation counts spaces it reads as column 0 and terminates the
 block above it, which inside `rules:` drops every later rule; and the `setKey` regex
 spells its class out as `[^\n]*` rather than `.`, because Python's `.` excludes only LF

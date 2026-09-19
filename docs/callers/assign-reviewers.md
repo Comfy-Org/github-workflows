@@ -206,7 +206,11 @@ the file rather than expecting either side to absorb them.
 Because that padding is invisible, the run **warns** (`configured reviewer "\u00a0alice"
 is not a valid GitHub login and will never be assigned`) whenever a login configured in
 `reviewers.yml` cannot be a GitHub login at all, rendering the offending token
-codepoint-escaped so the character is findable. It is deliberately silent about a
+codepoint-escaped so the character is findable. Every rule's reviewers and the whole
+`default_pool` are checked on every run, including rules whose paths this PR did not
+touch — the warning reports the state of the *file*, so a rotted owner does not stay
+hidden until some later PR happens to change that area. Being warned about is not being
+routed to: an unmatched rule's owners are still never assigned. It is deliberately silent about a
 configured owner who is merely excluded — the PR author, or `vars.REVIEWER_EXCLUDE` —
 since that is normal and would otherwise fire on nearly every run.
 

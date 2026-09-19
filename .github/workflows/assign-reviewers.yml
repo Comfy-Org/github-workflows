@@ -638,20 +638,31 @@ jobs:
             // hit the temporal dead zone and throw).
             const showInvisible = (s) => s.replace(/[^\x20-\x7e]/g, (c) => '\\u' + c.codePointAt(0).toString(16).padStart(4, '0'));
             const warnedLogins = new Set();
-            const configuredCandidate = (raw) => {
+            const warnConfiguredLogin = (raw) => {
               const login = normalizeLogin(raw);
               if (!/^[a-z\d](?:[a-z\d-]{0,38})$/i.test(login) && !warnedLogins.has(login)) {
                 warnedLogins.add(login);
                 core.warning(`${configPath ? `${configPath}: ` : ''}configured reviewer "${showInvisible(raw)}" is not a valid GitHub login and will never be assigned — check for invisible padding such as U+00A0 or a trailing CR.`);
               }
-              return candidate(raw);
             };
+            // WARN BROADLY, ROUTE NARROWLY. The rot is a property of the FILE, not of this
+            // diff, so the sweep is a lint over every configured token, run once up front and
+            // deliberately separate from routing. Warning from inside the candidate helper
+            // instead reached a rule's reviewers only once that rule's paths matched a changed
+            // file, and `default_pool` only on a run that fell all the way through to the
+            // fallback — so a rotted owner stayed silent on exactly the runs that did not touch
+            // its area, and a padded `default_pool` entry could go unreported for as long as any
+            // rule kept matching, right up until the fallback fired and needed it. This pass
+            // creates NO candidates: insertion below stays conditional on the routing checks, so
+            // an unmatched rule's owners are warned about without ever entering `candidates`.
+            for (const rule of config.rules) for (const login of rule.reviewers || []) warnConfiguredLogin(login);
+            for (const login of config.default_pool || []) warnConfiguredLogin(login);
             const matched = new Set();
             for (const rule of config.rules) {
               files.forEach((file, index) => {
                 if (!paths(file).some((path) => matchesAny(path, rule.paths || []))) return;
                 matched.add(index);
-                for (const login of rule.reviewers || []) configuredCandidate(login)?.configured.add(index);
+                for (const login of rule.reviewers || []) candidate(login)?.configured.add(index);
               });
             }
 
@@ -693,7 +704,7 @@ jobs:
             ]);
             for (const [login, person] of candidates) if (!coverage(person).size) candidates.delete(login);
             const fallback = !matched.size && !candidates.size;
-            if (fallback) for (const login of config.default_pool || []) configuredCandidate(login);
+            if (fallback) for (const login of config.default_pool || []) candidate(login);
             if (!candidates.size) {
               core.info('No eligible owner with evidence; leaving PR unassigned.');
               return;
