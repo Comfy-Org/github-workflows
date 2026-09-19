@@ -27,9 +27,9 @@ forward automatically instead of silently drifting commits behind.
 
 | Entrypoint | Triggers on a change to | Caller secret | Seeded |
 |---|---|---|---|
-| [`bump-cursor-review-callers.yml`](../workflows/bump-cursor-review-callers.yml) | `cursor-review.yml`, `cursor-review/**` (minus its `tests/` and `README.md`) or `scripts/check-pr-size/**` (minus its `*_test.go`) — none of which a caller executes | `CURSOR_REVIEW_CALLERS` | non-empty (hard-fails if empty) |
+| [`bump-cursor-review-callers.yml`](../workflows/bump-cursor-review-callers.yml) | `cursor-review.yml`, `cursor-review/**` (minus its `tests/`, `README.md` and `catalog-drift.py`) or `scripts/check-pr-size/**` (minus its `*_test.go`) — none of which a caller executes | `CURSOR_REVIEW_CALLERS` | non-empty (hard-fails if empty) |
 | [`bump-agents-md-callers.yml`](../workflows/bump-agents-md-callers.yml) | `agents-md-integrity.yml` or `agents-md-integrity/**` (minus its `tests/` and `README.md`, which no caller executes) | `AGENTS_MD_CALLERS` | empty `[]` (grows as callers land) |
-| [`bump-coderabbit-config-callers.yml`](../workflows/bump-coderabbit-config-callers.yml) | `coderabbit-config-validate.yml` or `coderabbit-config/**` (minus its `tests/` and `README.md`, which no caller executes) | `CODERABBIT_CONFIG_CALLERS` | empty `[]` (grows as callers land) |
+| [`bump-coderabbit-config-callers.yml`](../workflows/bump-coderabbit-config-callers.yml) | `coderabbit-config-validate.yml` or `coderabbit-config/**` (minus its `tests/`, `README.md` and `schema_drift.py`, which no caller executes) | `CODERABBIT_CONFIG_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-pr-size-callers.yml`](../workflows/bump-pr-size-callers.yml) | `pr-size.yml` or `scripts/check-pr-size/**` (minus its `*_test.go`, which no caller executes) | `PR_SIZE_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-pr-risk-callers.yml`](../workflows/bump-pr-risk-callers.yml) | `pr-risk.yml` or `scripts/pr-risk/**` (minus its `tests/` and `README.md`, which no caller executes) | `PR_RISK_CALLERS` | non-empty (hard-fails if empty) |
 | [`bump-pr-derisk-callers.yml`](../workflows/bump-pr-derisk-callers.yml) | `pr-derisk.yml`, `scripts/pr-derisk/**` **or `scripts/pr-risk/**`** (minus both `tests/` and `README.md`) — a `/derisk` run executes the pr-risk grader as well as the planner, so a grader change is consumer-visible on this fleet too | `PR_RISK_CALLERS` **(shared — filtered to `ci-pr-derisk.yml`)** | **may select nothing** (no callers enrolled yet — flip `ALLOW_EMPTY` to `false` with the first enrolment) |
@@ -474,7 +474,12 @@ when you write one of these lists:
   checkout. Listing one turns its retirement into a `::warning::` that freezes the
   whole fleet: a false decommission, the mirror of the false-healthy bump the input
   exists to stop. `bump-pr-derisk-callers.yml` records the same call for
-  `apply-risk-label.sh`.
+  `apply-risk-label.sh`. `catalog-drift.py` and `schema_drift.py` are now also
+  negated out of their fleets' `paths:` filters (and mirrored into
+  `WATCHED_PATHSPECS`), so a commit touching only one of them does not fan a
+  no-op bump either, while `wire-bot-identity.py` stays *watched* — the bumper
+  itself executes it and rewrites `wire_bot`-flagged callers with its output, so
+  a wiring-logic change really does change caller files.
 - **A path that stops resolving is a silent freeze, so it is machine-checked.**
   These are ~50 hand-written literal paths and preflight.sh probes each one for
   deletion, so a typo — or a rename applied to the tree but not to this list, or
