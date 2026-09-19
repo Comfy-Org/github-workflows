@@ -28,9 +28,13 @@ name: Assign Reviewers (reusable)
 #       reviewers:
 #         - carol
 #
-# Both flow (`[a, b]`) and block (`- a`) sequences are accepted. The config is
-# read from the PR base SHA, so proposed routing edits cannot select their
-# own owners before the edits have been reviewed.
+# Both flow (`[a, b]`) and block (`- a`) sequences are accepted. A duplicate
+# top-level `default_pool:` is last-wins with a warning (a repeated `rules:`
+# still APPENDS, silently — do not rely on it to replace an earlier block), a
+# `#` opens a comment only at the start of a line or after a space or a tab,
+# and one leading BOM is tolerated.
+# The config is read from the PR base SHA, so proposed routing edits cannot
+# select their own owners before the edits have been reviewed.
 #
 # AUTHOR SCOPING: vars.REVIEWER_AUTHOR_ALLOWLIST, when set, restricts routing to
 # that list of PR authors and skips everyone else. It is the opt-in alternative to
@@ -304,10 +308,32 @@ jobs:
             const pull_number = pr.number;
 
             // Dependency-free glob -> RegExp (`*` within a segment, `**` across
-            // segments, `?` single non-slash char). minimatch/picomatch are not
-            // reliably available inside github-script, so we roll our own. Defined
-            // here rather than with the other helpers below because the base-branch
-            // early exit needs it before any API call is made.
+            // segments, `?` a single non-slash character). minimatch/picomatch are
+            // not reliably available inside github-script, so we roll our own.
+            // Defined here rather than with the other helpers below because the
+            // base-branch early exit needs it before any API call is made.
+            //
+            // Flags (`su`) and the `^...$` anchors are the semantics, not polish,
+            // and .github/refresh-reviewers/generate.py's glob_to_regexp carries
+            // the same three — but SPELLS two of them differently, so port the
+            // INTENT, never the characters:
+            //   * FULL-STRING anchored — no `m`, so `^`/`$` are the ends of the
+            //     path, never the ends of a line inside it. That reasoning is
+            //     JS-ONLY: Python's `$` matches just before a single trailing
+            //     newline even WITHOUT re.MULTILINE, so the port anchors with
+            //     `\Z` instead. Writing `$` on the Python side compiles, reads
+            //     as parity, and silently reintroduces the exact divergence
+            //     this pairing removes (the corpus's `src/a.js` case pins it).
+            //   * `s` — `**` (and the `.` it compiles to) spans EVERY character,
+            //     line terminators included (`\n`, `\r`, U+2028, U+2029). The
+            //     port spells this one re.DOTALL, and it is NOT a no-op there:
+            //     U+2028/U+2029 are line terminators to a JS RegExp but ordinary
+            //     characters to Python's `.`, so the flags converge them.
+            //   * `u` — `?` is one Unicode CODE POINT, so an astral path
+            //     character (an emoji) counts once rather than as its two UTF-16
+            //     surrogate halves. Every escape this emits (`.+^${}()|[]\/`) is
+            //     a legal identity escape under `u`, and a lone surrogate in a
+            //     glob still compiles and self-matches.
             // PARITY-HARNESS:glob-matcher:begin
             const globToRegExp = (glob) => {
               let re = '';
@@ -326,7 +352,7 @@ jobs:
                   re += c;
                 }
               }
-              return new RegExp('^' + re + '$');
+              return new RegExp('^' + re + '$', 'su');
             };
             const matchesAny = (p, globs) => globs.some((g) => globToRegExp(g).test(p));
             // PARITY-HARNESS:glob-matcher:end
@@ -431,7 +457,23 @@ jobs:
             // js-yaml is not bundled with github-script; the schema is small and
             // fixed, so a focused parser is safer than an unavailable dependency.
             // PARITY-HARNESS:config-parser:begin
-            const parseReviewerConfig = (text) => {
+            // Render a token so a non-printing character in it is findable in a log: everything
+            // outside printable ASCII becomes a lower-case `\uXXXX` escape. Two callers — the
+            // unrecognised-top-level-key warning below, and the invalid-configured-login warning
+            // further down the script — so it is declared ONCE, and it lives INSIDE this region
+            // because the parity harness executes the region on its own: a helper the parser calls
+            // but the extracted span does not contain is a ReferenceError in the tests, and a
+            // `const` declared BELOW the parser's own call site is one in the shipped script.
+            // `_show_invisible` in refresh-reviewers/generate.py is the port, so both sides render
+            // the same character the same way on their own warning channel.
+            const showInvisible = (s) => s.replace(/[^\x20-\x7e]/g, (c) => '\\u' + c.codePointAt(0).toString(16).padStart(4, '0'));
+            // `sourcePath` is only ever used to NAME the file in a diagnostic, and is
+            // optional because the parity harness extracts this region on its own and
+            // has no path to hand it — an omitted one just drops the prefix rather than
+            // printing `undefined:` or hardcoding a `reviewers.yml` the caller may have
+            // configured away (`reviewer_config_path`).
+            const parseReviewerConfig = (text, sourcePath) => {
+              const where = sourcePath ? `${sourcePath}: ` : '';
               const out = { default_pool: [], rules: [] };
               const stripComment = (s) => {
                 let inS = false, inD = false;
@@ -439,12 +481,21 @@ jobs:
                   const ch = s[i];
                   if (ch === "'" && !inD) inS = !inS;
                   else if (ch === '"' && !inS) inD = !inD;
-                  else if (ch === '#' && !inS && !inD && (i === 0 || /\s/.test(s[i - 1]))) return s.slice(0, i);
+                  // YAML starts a comment at `#` only at column 0 or after s-white — a SPACE
+                  // or a TAB, nothing else. `/\s/` was wider on the JS side and `isspace()`
+                  // wider (differently) on the Python side, so the two ports disagreed on
+                  // U+0085, U+001C and U+FEFF; both now spell out the two characters.
+                  else if (ch === '#' && !inS && !inD && (i === 0 || s[i - 1] === ' ' || s[i - 1] === '\t')) return s.slice(0, i);
                 }
                 return s;
               };
+              // YAML s-white: the ONLY characters trimmed around a token. Spelled out (not
+              // String.prototype.trim()) because trim() and Python strip() disagree about
+              // U+FEFF, U+0085 and U+001C-U+001F; the Python port's `_trim` is the same two
+              // characters. Corpus-pinned.
+              const trimSWhite = (s) => s.replace(/^[ \t]+|[ \t]+$/g, '');
               const unquote = (s) => {
-                s = s.trim();
+                s = trimSWhite(s);
                 // `s.length >= 2` is load-bearing for PARITY — the reason that survives
                 // being checked. A lone `"` both starts and ends with a quote, so without
                 // the guard `slice(1, -1)` collapses that one character to the empty
@@ -459,42 +510,101 @@ jobs:
                 return s;
               };
               const parseFlow = (s) => {
-                s = s.trim();
+                s = trimSWhite(s);
                 if (!s.startsWith('[')) return null;
                 const end = s.indexOf(']');
                 const inner = s.slice(1, end === -1 ? s.length : end);
                 return inner.split(',').map((x) => unquote(x)).filter((x) => x.length > 0);
               };
               const indentOf = (l) => l.match(/^ */)[0].length;
-              const lines = text.split(/\r?\n/).map(stripComment);
+              // A bare `startsWith` also claims a DIFFERENT key that merely shares the prefix:
+              // `rules:v2:` is valid YAML for a key named `rules:v2`, and the prefix test parsed
+              // its children as live routing rules — silently HONOURING an unsupported key
+              // instead of falling through to the warning below. YAML reads `key:` as a mapping
+              // only when s-white or the end of the line follows the colon, so require that;
+              // `default_pool:[alice]` is a plain scalar to YAML and is a fallthrough here too.
+              // `_is_key` in refresh-reviewers/generate.py is the port.
+              const isKey = (l, key) => l.startsWith(key) && (l.length === key.length || l[key.length] === ' ' || l[key.length] === '\t');
+              // The supported key a FALLTHROUGH line names but does not open. Two shapes reach
+              // this, both silent breakage worth an annotation: `\ufeffdefault_pool:`/`\u0085rules:`,
+              // where the stray character is not indentation (neither `trimSWhite` nor `indentOf`
+              // sees it) so the line reads as column 0 and the block it meant to open is never
+              // read; and `rules:v2:`/`default_pool:[alice]`, which `isKey` rightly declines.
+              // Only called where `isKey` is already known false, so a bare prefix match on the
+              // padding-stripped head always means one of the two. Ported as `_near_miss_key`.
+              const nearMissKey = (l) => {
+                const head = l.replace(/^[^\x21-\x7e]+/, '');
+                for (const key of ['default_pool:', 'rules:']) if (head.startsWith(key)) return key;
+                return null;
+              };
+              // A YAML document marker is syntax, not a key. yamllint's default `document-start`
+              // rule REQUIRES a leading `---`, so a perfectly conformant reviewers.yml opens with
+              // one (and may close with `...`); both fall through here, and `...` after a `rules:`
+              // block even terminates it — but nothing is lost, so warning would fire on every run
+              // of a well-formed config and train people to ignore the annotation. A SECOND
+              // document in the file is a separate pre-existing limitation, untouched by this.
+              const isDocMarker = (l) => l === '---' || l === '...' || l.startsWith('--- ') || l.startsWith('---\t');
+              // A single leading U+FEFF is legal YAML and must not become part of the first
+              // key. `trim()` used to absorb it here incidentally and the Python port's
+              // `strip()` did not; now that both sides trim s-white only, NEITHER absorbs it
+              // and this explicit single-BOM strip is the only thing removing it, on both
+              // sides. A SECOND BOM is data and stays — see the corpus.
+              const lines = text.replace(/^\uFEFF/, '').split(/\r?\n/).map(stripComment);
               let i = 0;
+              let seenDefaultPool = false;
+              // The block a column-0 line has just TERMINATED, or null. Both scans below skip
+              // blank lines and `break` only on a non-blank column-0 line WITHOUT advancing `i`,
+              // so the very next iteration of this loop is guaranteed to be the terminating line
+              // itself — which is what makes a one-iteration handoff sound rather than a flag that
+              // could go stale. Every branch consumes it. Ported as `ended_block`.
+              let endedBlock = null;
               while (i < lines.length) {
                 const raw = lines[i];
-                if (!raw.trim()) { i++; continue; }
-                const line = raw.trim();
-                if (indentOf(raw) === 0 && line.startsWith('default_pool:')) {
-                  const rest = line.slice('default_pool:'.length).trim();
+                if (!trimSWhite(raw)) { i++; continue; }
+                const line = trimSWhite(raw);
+                const terminated = endedBlock;
+                endedBlock = null;
+                if (indentOf(raw) === 0 && isKey(line, 'default_pool:')) {
+                  // YAML requires unique keys; PyYAML's de-facto last-wins is the reference.
+                  // Warn, never reject — routing must not hard-fail on a malformed map — and
+                  // reset rather than accumulate, so the block form replaces like the flow
+                  // form already did. The flag (not `out.default_pool.length`) is what keeps
+                  // the warning firing for an empty first list, matching the Python port.
+                  if (seenDefaultPool) core.warning(`${where}duplicate top-level \`default_pool:\` key — last one wins`);
+                  seenDefaultPool = true;
+                  const rest = trimSWhite(line.slice('default_pool:'.length));
                   const flow = parseFlow(rest);
                   if (flow) { out.default_pool = flow; i++; continue; }
+                  out.default_pool = [];
                   i++;
                   while (i < lines.length) {
                     const r = lines[i];
-                    if (!r.trim()) { i++; continue; }
-                    if (indentOf(r) === 0) break;
-                    const t = r.trim();
+                    if (!trimSWhite(r)) { i++; continue; }
+                    if (indentOf(r) === 0) { endedBlock = 'default_pool:'; break; }
+                    const t = trimSWhite(r);
                     if (t.startsWith('- ')) out.default_pool.push(unquote(t.slice(2)));
                     i++;
                   }
                   continue;
                 }
-                if (indentOf(raw) === 0 && line.startsWith('rules:')) {
+                if (indentOf(raw) === 0 && isKey(line, 'rules:')) {
                   i++;
                   let current = null, listKey = null, ruleIndent = -1;
                   const setKey = (seg) => {
-                    const m = seg.match(/^(paths|reviewers):(.*)$/);
+                    // `[^\n]*`, not `.*`: the two languages disagree about what `.`
+                    // excludes. Python's `.` omits only LF, JS's omits LF, CR, U+2028
+                    // and U+2029 — so on a rule line ending in a bare CR (the last line
+                    // of a document with no final newline, which the split above now
+                    // preserves as data) the Python port matched and this one did NOT,
+                    // silently dropping the key and leaving the rule with no reviewers
+                    // while the drift generator modelled those reviewers as routing.
+                    // Spelled out on both ports, both now keep the CR as part of the
+                    // value — where `eligible()` rejects it, the same answer the corpus
+                    // already pins for the `default_pool:` block arm.
+                    const m = seg.match(/^(paths|reviewers):([^\n]*)$/);
                     if (!m) return;
                     const key = m[1];
-                    const val = m[2].trim();
+                    const val = trimSWhite(m[2]);
                     const flow = parseFlow(val);
                     if (flow) { if (current) current[key] = flow; listKey = null; }
                     else if (val === '') { listKey = key; }
@@ -502,26 +612,65 @@ jobs:
                   };
                   while (i < lines.length) {
                     const r = lines[i];
-                    if (!r.trim()) { i++; continue; }
-                    if (indentOf(r) === 0) break;
+                    if (!trimSWhite(r)) { i++; continue; }
+                    if (indentOf(r) === 0) { endedBlock = 'rules:'; break; }
                     const ind = indentOf(r);
-                    const t = r.trim();
+                    const t = trimSWhite(r);
                     const isDash = t === '-' || t.startsWith('- ');
                     if (isDash && (ruleIndent === -1 || ind === ruleIndent)) {
                       if (ruleIndent === -1) ruleIndent = ind;
                       current = { paths: [], reviewers: [] };
                       out.rules.push(current);
                       listKey = null;
-                      const afterDash = t.slice(1).trim();
+                      const afterDash = trimSWhite(t.slice(1));
                       if (afterDash) setKey(afterDash);
                     } else if (isDash && listKey && current) {
-                      current[listKey].push(unquote(t.slice(1).trim()));
+                      current[listKey].push(unquote(trimSWhite(t.slice(1))));
                     } else {
                       setKey(t);
                     }
                     i++;
                   }
                   continue;
+                }
+                // Fallthrough: a non-empty line that is neither `default_pool:` nor `rules:`.
+                // At column 0 such a line can do real, INVISIBLE damage, and the two shapes it
+                // takes are the two arms below. It need not look like a key at all: since both
+                // ports narrowed to trimming s-white, a line whose only content is ONE non-s-white
+                // whitespace character (U+00A0, U+0085, U+000B, U+000C, U+001C-U+001F, U+FEFF,
+                // U+2028, U+2029, U+200B) is no longer blank, and `indentOf` counts SPACES, so it
+                // reads as column 0. Real YAML rejects most such documents outright, so widening
+                // the blank test would have diverged from YAML; making the damage visible does not
+                // change what parses. Warn, never reject — routing must not hard-fail on a
+                // malformed map, the same posture as the duplicate-key warning above.
+                //
+                // What this deliberately does NOT warn about is an unrecognised column-0 line that
+                // broke nothing, because warning on EVERY fallthrough both overclaimed and flooded:
+                // a `---`/`...` document marker, a `version:`/`notes:` metadata key before the
+                // first block, and a stray key between two complete blocks all leave the outer loop
+                // scanning and every later `default_pool:`/`rules:` parsing — yet each drew an
+                // annotation asserting the block above was ended and the rules below were dropped,
+                // on a document whose parse is complete. Silence there is also what caps the
+                // volume: a zero-indented block sequence, a tab-indented config (`indentOf` counts
+                // spaces, so EVERY item reads as column 0) and a `reviewer_config_path` aimed at a
+                // non-YAML file each used to warn once per line and bury the annotation that
+                // mattered inside GitHub's ~10-per-step budget; now they warn once per block
+                // actually truncated, or not at all.
+                //
+                // INDENTED fallthrough lines stay silent for the same reason: they are the orphaned
+                // tail of an already-reported truncation, and one warning per terminator is the
+                // signal — one per orphaned item would bury it.
+                if (indentOf(raw) === 0 && !isDocMarker(line)) {
+                  const near = nearMissKey(line);
+                  if (near) {
+                    // Checked BEFORE the terminator arm because it names the actual cause and the
+                    // larger blast radius: `\ufeffrules:` may also end a (complete) `default_pool:`
+                    // above it, but what the reader needs to know is that every rule below is gone
+                    // because of one character they cannot see.
+                    core.warning(`${where}line ${i + 1} is not a recognised top-level key (${showInvisible(line)}) — it is not the supported \`${near}\` key, so the whole block it opens is ignored; that key is read only at column 0 with nothing but spaces before it and a space, a tab or the end of the line after its colon`);
+                  } else if (terminated) {
+                    core.warning(`${where}line ${i + 1} is not a recognised top-level key (${showInvisible(line)}) — it ends the \`${terminated}\` block above it, and every list item or rule indented below it is dropped; only \`default_pool:\` and \`rules:\` are read, and at column 0 one invisible character (e.g. U+00A0) ends a block exactly like a misspelled key does`);
+                  }
                 }
                 i++;
               }
@@ -552,7 +701,7 @@ jobs:
                 return;
               }
               const text = Buffer.from(res.data.content, 'base64').toString('utf8');
-              config = parseReviewerConfig(text);
+              config = parseReviewerConfig(text, configPath);
             } catch (e) {
               core.info(`Could not read ${configPath}@${pr.base.sha} (${e.message}) — nothing to do.`);
               return;
@@ -579,6 +728,42 @@ jobs:
               if (!candidates.has(login)) candidates.set(login, {login, configured: new Set(), history: new Map(), load: null});
               return candidates.get(login);
             };
+            // A CONFIGURED login that cannot be a GitHub login at all is config rot, and
+            // it is otherwise completely silent: it just never gets assigned. That became
+            // reachable when both ports narrowed to trimming s-white, since a login padded
+            // with U+00A0/U+FEFF/U+0085/U+001C or a trailing bare CR now survives parsing
+            // verbatim and fails the shape gate — and every one of those characters is
+            // invisible in an editor. Warn once per bad token so the rot is findable.
+            // Deliberately keyed on the SHAPE test only, not on `eligible()`: the exclude
+            // set legitimately holds the PR author and `EXCLUDE`, and warning about a
+            // correctly-configured owner who happens to have opened the PR would fire on
+            // essentially every run and train people to ignore it. The token is rendered
+            // codepoint-escaped by `showInvisible`, declared UP in the config-parser region,
+            // which warns about an unrecognised top-level key and needs it too: a `const` sits
+            // in the temporal dead zone until its own line runs, and the parser is CALLED above
+            // here, so declaring it at this point would throw the moment the parser reached for
+            // it — the same trap that puts the `escape` further down (an HTML escaper for the
+            // job summary) out of reach here.
+            const warnedLogins = new Set();
+            const warnConfiguredLogin = (raw) => {
+              const login = normalizeLogin(raw);
+              if (!/^[a-z\d](?:[a-z\d-]{0,38})$/i.test(login) && !warnedLogins.has(login)) {
+                warnedLogins.add(login);
+                core.warning(`${configPath ? `${configPath}: ` : ''}configured reviewer "${showInvisible(raw)}" is not a valid GitHub login and will never be assigned — check for invisible padding such as U+00A0 or a trailing CR.`);
+              }
+            };
+            // WARN BROADLY, ROUTE NARROWLY. The rot is a property of the FILE, not of this
+            // diff, so the sweep is a lint over every configured token, run once up front and
+            // deliberately separate from routing. Warning from inside the candidate helper
+            // instead reached a rule's reviewers only once that rule's paths matched a changed
+            // file, and `default_pool` only on a run that fell all the way through to the
+            // fallback — so a rotted owner stayed silent on exactly the runs that did not touch
+            // its area, and a padded `default_pool` entry could go unreported for as long as any
+            // rule kept matching, right up until the fallback fired and needed it. This pass
+            // creates NO candidates: insertion below stays conditional on the routing checks, so
+            // an unmatched rule's owners are warned about without ever entering `candidates`.
+            for (const rule of config.rules) for (const login of rule.reviewers || []) warnConfiguredLogin(login);
+            for (const login of config.default_pool || []) warnConfiguredLogin(login);
             const matched = new Set();
             for (const rule of config.rules) {
               files.forEach((file, index) => {

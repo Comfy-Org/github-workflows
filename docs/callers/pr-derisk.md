@@ -82,6 +82,8 @@ literally. `bump-pr-derisk-callers.yml` moves both together; never hand-bump one
 | `max_steps` | `5` | A chain nobody will actually open is not a plan. |
 | `max_diff_bytes` | `200000` | Over budget takes the deterministic fallback rather than planning off half a diff. |
 | `repo_map_path` / `repo_runbooks_path` | `.github/risk.json` / `.github/risk-runbooks.json` | Same overrides pr-risk reads, from the same base ref. Repo-relative — a leading `/` or a `..` segment is refused, not resolved. |
+| `fleet_logins` | `''` | Forwarded to the grader — logins whose PRs grade provenance `agent-supervised`. Same meaning as [pr-risk's `fleet_logins`](pr-risk.md#inputs); empty here leaves the grader on its own default. |
+| `bot_logins` | `''` | Forwarded to the grader — extra logins treated as bots. Same meaning as [pr-risk's `bot_logins`](pr-risk.md#inputs), load-bearing for the same reason; empty here leaves the grader on its own default. |
 
 ## Gotchas
 

@@ -6,8 +6,9 @@ name: PR Area Label (reusable)
 #   sync-labels — keeps the consumer's `area:*` labels standardized. Runs on push to the
 #                 consumer's default branch (the caller filters to the taxonomy path) or a
 #                 manual full-sync, and create-or-updates every label from the YAML with
-#                 `gh label create --force`. Edit the YAML, never the GitHub UI — the UI
-#                 drifts, this heals. Needs no secret.
+#                 `gh label create --force` — both the classified `labels[]` and the optional
+#                 `sub_labels[]`. Edit the YAML, never the GitHub UI — the UI drifts, this
+#                 heals. Needs no secret.
 #
 #   label-pr    — classifies each PR into exactly one `area:*` label. An LLM does the
 #                 classification, but it is given NO tools and NO token: PR metadata is
@@ -18,6 +19,14 @@ name: PR Area Label (reusable)
 #                 privileged tool call — the worst a malicious PR earns itself is a (valid)
 #                 area label. The taxonomy is read from the PR's BASE ref, never its head, so
 #                 a PR cannot rewrite the rules that classify it.
+#
+#                 The taxonomy's optional `sub_labels[]` ride ALONGSIDE that one area: `area:*`
+#                 names carrying `paths:` globs, matched against the PR's changed files. No
+#                 model sees them — a subsystem inside another area's service is a path
+#                 question, not a judgement call — and matches are exempt from the one-area
+#                 cleanup, which retires them again once a PR stops matching. Their names are
+#                 held to the same `area:*` shape and must be disjoint from `labels[]`, so
+#                 every write this workflow makes stays inside the `area:*` namespace.
 #
 # The classifier logic and scripts load from THIS repo at the pinned `workflows_ref` — never
 # from the classified PR's checkout (no PR code is checked out at all). See scripts/area-label/.

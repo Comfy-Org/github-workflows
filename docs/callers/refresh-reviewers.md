@@ -17,11 +17,24 @@ half_life_days)` and `touches += 1`. Line counts are intentionally unused. Bot
 authors, generated/churn paths, and non-collaborators are excluded (collaborators
 rather than org members, because `addAssignees` silently drops non-collaborators).
 The rewrite is surgical — only the `reviewers: [...]` / `default_pool: [...]`
-lists change and everything else is kept byte-for-byte — and a rule that cannot
-reach its floor of qualifiers is left unchanged. (One caveat: an inline trailing
-comment on a *block-form list item* being rewritten — `- alice # rationale` —
-is not carried over when that list's membership changes; keep per-reviewer
-rationales as their own comment lines, not inline.)
+lists change and everything else, the file's own line endings included, is kept
+byte-for-byte — and a rule that cannot reach its floor of qualifiers is left
+unchanged. Two caveats. An inline trailing comment on a *block-form list item*
+being rewritten — `- alice # rationale` — is not carried over when that list's
+membership changes; keep per-reviewer rationales as their own comment lines,
+not inline. And a **multi-line flow sequence** (`reviewers: [alice,` whose `]`
+is on a later line) is parsed but never rewritten — the rewrite only edits
+single-line lists, so touching the opening line would orphan the continuation
+lines — so such a list is left exactly as committed, with a `::warning::`
+naming its line and a note in the drift PR's body; put it on one line to let
+the refresher manage it. A torn `paths:` list holds its whole rule back the
+same way, because the rule's globs stop at the line break and every reviewer
+score behind that rule would be computed from the wrong bucket. Skipped lists
+are reported as unchanged rather than as proposals, so the PR body never
+advertises an edit the file did not receive. A config with **CR-only** line
+breaks is declined outright (a clean no-op with a warning): the reader that
+keeps CRLF files byte-faithful does not split on a lone `\r`, so such a file
+cannot be parsed correctly at all.
 
 Runs are idempotent: each re-run force-resets the same `pr_branch` from the
 default branch and edits the one open drift PR in place, so duplicate PRs never
@@ -31,6 +44,18 @@ PR is closed, merged or retargeted, or the branch pre-dates any PR, the next run
 resets it from the default branch, so only push to it while its bot PR is open.
 A no-drift run closes a stale still-bot-authored drift PR so an obsolete proposal
 cannot linger mergeable.
+
+The generator reads `.github/reviewers.yml` with the same parser
+[`assign-reviewers.yml`](assign-reviewers.md) uses, so it emits the same warnings about an
+unrecognised **top-level key** — a misspelled key, or a line whose only content is one
+invisible character such as U+00A0 at column 0, both of which end the block above them;
+and a near miss such as `\u0085rules:` or `rules:v2:`, which names a supported key without
+opening one. That matters more here than at PR time: the generator rewrites the
+*truncated* list it parsed and leaves the orphaned items below the stray line where they
+are, so a drift PR that seems to drop reviewers for no reason is worth reading alongside
+the run's annotations. A column-0 line that breaks nothing — a `---`/`...` document
+marker, a metadata key before the first block — is silent, so the annotations that do
+appear all point at something real.
 
 ## Prerequisites
 

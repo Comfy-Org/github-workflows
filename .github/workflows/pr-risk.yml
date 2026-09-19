@@ -406,6 +406,10 @@ on:
           same PR or its next run fails before a step executes. The separate job still earns its
           keep: it is the only place `checks: write` is ever HELD, and it reads nothing from a
           pull request, so no PR-controlled text is ever rendered under the elevated token.
+
+
+          Published whenever `grade` ran — including a manual `workflow_dispatch` on a repo whose
+          `enabled` resolves false — so the staged-rollout preview shows the Check Run too.
         type: boolean
         required: false
         default: false
@@ -520,7 +524,8 @@ on:
           leaves whatever the last enabled one left, it does not clean up).
 
 
-          A MANUAL `workflow_dispatch` GRADES REGARDLESS. Dispatching requires
+          A MANUAL `workflow_dispatch` GRADES REGARDLESS (and, when opted in,
+          posts the sticky comment and the Check Run). Dispatching requires
           write access and is an explicit, attributed act, so there is no
           unattended behaviour left for this switch to govern — and without that
           exemption the staged rollout this input exists for cannot happen: a
@@ -1125,9 +1130,23 @@ jobs:
   #
   # Keeping it in its OWN job is still what limits the blast radius: `checks: write` is held here
   # and nowhere else, and the grade job — the one that reads pull requests — keeps `checks: read`.
+  #
+  # IT FOLLOWS `grade`, NOT `enabled`: whenever the grade job ran this job publishes, including on
+  # a manual `workflow_dispatch` in a repo whose `enabled` resolves false.
   publish-check:
     needs: [gate, grade]
-    if: needs.gate.outputs.enabled == 'true' && inputs.check_run && !cancelled()
+    # Gated on GRADE having run, not on `enabled`: `enabled` governs the automatic `pull_request`
+    # stream only (see the `grade` job), and a manual dispatch that grades, labels and comments must
+    # also publish the one commit-attached artifact the staged-rollout preview exists to show. NOT
+    # `inputs.check_run && !cancelled()` alone: `!cancelled()` is a non-success() status function,
+    # so with no result test the job would RUN on every disabled `pull_request` run (its needs were
+    # merely skipped) and boot a runner to publish nothing — the cost the `gate` job exists to avoid.
+    # `!= 'skipped'` rather than `== 'success'` keeps publishing the targets that DID render when
+    # grade fails partway, which the step below already tolerates.
+    if: >-
+      needs.grade.result != 'skipped' &&
+      inputs.check_run &&
+      !cancelled()
     name: Publish the risk Check Run
     runs-on: ubuntu-latest
     timeout-minutes: 10
