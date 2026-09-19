@@ -80,6 +80,15 @@ on:
       # the paths they match: a commit touching size.go AND its test still
       # matches the positive pattern and still bumps.
       - '!scripts/check-pr-size/*_test.go'
+      # Same reasoning for the review dir's own tests and README: a review run
+      # loads prompts/scripts from the pinned ref, never the tests or README, so a
+      # test-only or docs-only commit under .github/cursor-review is pure churn to
+      # every consumer. Exclude them so a bump PR keeps meaning "consumer-visible
+      # behavior changed". Negations only strip the paths they match: a commit
+      # touching post-review.py AND its test still matches the positive pattern
+      # and still bumps.
+      - '!.github/cursor-review/tests/**'
+      - '!.github/cursor-review/README.md'
 
 permissions:
   contents: read
@@ -141,10 +150,11 @@ jobs:
           # pins callers to a tip whose other content was never verified.
           # Kept alongside WATCHED_PATHSPECS deliberately. The pathspec list
           # SUPERSEDES this input's tree-OID staleness comparison (it has to —
-          # an OID cannot express the `*_test.go` exclusion below, so a
-          # test-only commit would move the scripts/check-pr-size tree and
-          # freeze the fleet as a permanent stale re-run). What it does NOT
-          # supersede is the decommission probe: these entries are still what
+          # an OID cannot express the exclusions below, so a test-only or
+          # docs-only commit — under .github/cursor-review/tests, its README.md,
+          # or the scripts/check-pr-size `*_test.go` tests — would move a watched
+          # tree and freeze the fleet as a permanent stale re-run). What it does
+          # NOT supersede is the decommission probe: these entries are still what
           # notices either directory disappearing, and preflight cross-checks
           # that the pathspecs reach EVERY one of them.
           WATCHED_ASSETS: |
@@ -157,6 +167,8 @@ jobs:
             .github/workflows/cursor-review.yml
             .github/cursor-review
             scripts/check-pr-size
+            :(exclude).github/cursor-review/tests
+            :(exclude).github/cursor-review/README.md
             :(exclude)scripts/check-pr-size/*_test.go
           # Every file whose ABSENCE breaks a pinned caller at run time — not just
           # the entry points, and NOT confined to one directory: a review run loads
