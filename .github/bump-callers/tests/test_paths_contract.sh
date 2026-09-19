@@ -44,6 +44,11 @@ FAIL=0
 ALL_EXEC_ENTRIES=()
 ok()  { PASS=$((PASS+1)); echo "  ok: $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  FAIL: $1"; }
+# A skip counts as NEITHER. It is printed because an unmeasured exclusion that
+# leaves no line behind is indistinguishable from one that measured clean, and
+# counting it as a pass would let a widening skip rule inflate the pass total
+# while asserting less and less.
+skip() { echo "  skip: $1"; }
 
 # --- parsers -----------------------------------------------------------------
 
@@ -247,6 +252,116 @@ compare_pathspecs() { # $1 = pathspecs, $2.. = positives then negatives
   return 1
 }
 
+# The one way a `!` filter entry and its `:(exclude)` mirror can be textually
+# equal yet select DIFFERENT sets, measured against the real tree.
+#
+# A `paths:` filter's `*` does NOT cross `/`; a bare git pathspec's does (git
+# matches without FNM_PATHNAME unless `:(glob)` is asked for, and preflight.sh
+# rejects that magic outright). So `!x/*_test.go` and `:(exclude)x/*_test.go` —
+# which compare_pathspecs pronounces equal, and which ARE equal while `x` is flat
+# — diverge the moment a matching file appears in a SUBDIRECTORY of `x`: the
+# filter still fires the trigger on it, while the pathspec staleness diff already
+# excluded it, so the run reads "unchanged", re-points and fans a bump nothing
+# asked for. That is the very churn the exclusion exists to stop, leaking back in
+# one directory down. Nothing textual can catch it, so measure the tree instead.
+#
+# The measurement mirrors GIT, not `find -name`: git applies the pattern to the
+# whole relative PATH with `*` crossing `/`, so each walked path is matched, in
+# full and relative to the exclusion's directory half, by `case` — bash's `case`
+# is fnmatch WITHOUT FNM_PATHNAME, the same matcher semantics git uses. Testing
+# the BASENAME instead would be wrong in BOTH directions for any glob that is not
+# suffix-anchored: for `!x/test_*.sh` (this repo's own shell-test convention) it
+# would MISS `x/test_dir/b.sh` — which git excludes and the filter does not, a
+# real divergence — and INVENT one for `x/sub/test_a.sh`, where the pathspec needs
+# a literal `x/test_` prefix and the two syntaxes therefore agree.
+#
+# FOUR verdicts, because a refusal to measure must never read as a measurement:
+#
+#   0  MEASURED   — stdout carries the deep matches, one per line, `LC_ALL=C`
+#                   sorted and capped at 3. EMPTY stdout is the positive
+#                   assertion that the two spellings still select the same set.
+#   1  EQUIVALENT — the shape provably cannot diverge this way, so there is
+#                   nothing to measure:
+#                     * `**` anywhere in the basename — it crosses `/` on BOTH
+#                       sides, at every depth;
+#                     * a literal FILE name (or a name absent from the tree) —
+#                       no glob, so nothing can cross `/`.
+#   2  UNMEASURED — a shape this walk cannot decide. It asserts nothing either
+#                   way and SAYS so, rather than certifying a pair it never
+#                   compared:
+#                     * a glob in the DIRECTORY half — no single tree to walk,
+#                       and git's `*` there spans levels the filter's cannot;
+#                     * a directory that is not in the tree — nothing to walk;
+#                     * a literal DIRECTORY — `!x/tests` matches only a file
+#                       named exactly that while `:(exclude)x/tests` drops the
+#                       whole subtree, and the filter half of that cannot be
+#                       executed here. Spell it `!x/tests/**` and it is
+#                       EQUIVALENT by the `**` rule above.
+#   3  ERROR      — the walk itself failed. Never mistake it for a clean result.
+glob_exclusion_deep_matches() { # $1 = repo root, $2 = negation without the leading `!`
+  # `matches` is a newline-joined STRING, not an array: this suite is run locally
+  # with bash 3.2, where an empty array under `set -u` is the fatal this file
+  # already works around twice below, and the caller wants a string anyway.
+  local root="$1" neg="$2" negbase negdir out p rc=0 matches="" n=0
+  negbase="${neg##*/}"
+  # A bare entry with no `/` is anchored at the repo ROOT, which is a tree like
+  # any other rather than a special case: `!*_test.go` there has exactly the
+  # divergence measured below, since the filter's `*` holds it to the root while
+  # git's reaches every depth.
+  if [[ "$neg" == */* ]]; then negdir="${neg%/*}"; else negdir="."; fi
+
+  # Both UNMEASURED checks run BEFORE the basename rules, and that order is
+  # load-bearing. The `**` rule below holds only for a FIXED, PRESENT directory:
+  # `!x/*/tests/**` does diverge (git's `*` in the directory half spans several
+  # levels, the filter's one), and a `/**` exclusion over a directory that is not
+  # there at all proves nothing about the one that used to be.
+  case "$negdir" in *'*'*|*'?'*|*'['*) return 2 ;; esac
+  [[ -d "${root}/${negdir}" ]] || return 2
+
+  case "$negbase" in
+    # `**` ANYWHERE in the basename, not just as the whole of it: `!x/tests/**`
+    # and `!x/**_test.go` alike cross `/` on both sides and select the same set at
+    # every depth. It has to be spelled out, because `**` also satisfies the glob
+    # test below — and it used to fall through it, so any `/**` exclusion over a
+    # directory that merely HAD a subdirectory failed with a message about a file
+    # glob it does not have (BE-15254).
+    *'**'*) return 1 ;;
+    # `?` and `[` are globs in both syntaxes too, and git's `?` crosses `/` just
+    # as its `*` does (`!x/foo?bar.go` excludes `x/foo/bar.go` on the pathspec
+    # side alone), so they are MEASURED rather than waved through as literals.
+    *'*'*|*'?'*|*'['*) ;;
+    # A literal name. A file cannot diverge; a DIRECTORY can, and is unmeasured.
+    *) [[ -d "${root}/${neg}" ]] && return 2
+       return 1 ;;
+  esac
+
+  # No `head` in this pipeline, so there is no SIGPIPE status to launder into a
+  # verdict: the walk either succeeds whole or reports ERROR, and its stderr is
+  # left VISIBLE so a failure says why. `-type f` keeps a directory whose own name
+  # matches the glob out of the result — it can never make a `paths:` trigger and
+  # a `git diff` pathspec disagree. `sort` makes the reported matches
+  # deterministic; the cap is applied after matching, below.
+  out="$(cd "${root}/${negdir}" && find . -mindepth 2 -type f -print | LC_ALL=C sort)" || rc=$?
+  (( rc != 0 )) && return 3
+  while IFS= read -r p; do
+    p="${p#./}"
+    [[ -n "$p" ]] || continue
+    # `.git` is in no tree either side can see — a `paths:` filter never matches
+    # inside it and `git diff` never reports it — so a match there would be a pure
+    # false divergence. Only a bare root-anchored exclusion can reach it, since
+    # that is the one shape whose walk starts at the repo root.
+    [[ "$p" == .git/* ]] && continue
+    # `$negbase` is UNQUOTED on purpose: it is the glob being applied, matched
+    # against the whole relative path exactly as git would.
+    # shellcheck disable=SC2254
+    case "$p" in
+      $negbase) matches="${matches}${p}"$'\n'; n=$((n+1)); (( n >= 3 )) && break ;;
+    esac
+  done <<<"$out"
+  [[ -n "$matches" ]] && printf '%s' "$matches"
+  return 0
+}
+
 # --- the contract ------------------------------------------------------------
 
 shopt -s nullglob
@@ -327,32 +442,39 @@ ${pathspec_diag}"
 
     # --- and the one way the two spellings can be textually equal yet select
     # DIFFERENT sets ---------------------------------------------------------
-    # A `paths:` filter's `*` does NOT cross `/`; a bare git pathspec's does
-    # (git matches without FNM_PATHNAME unless `:(glob)` is asked for, and
-    # preflight.sh rejects that magic outright). So `!x/*_test.go` and
-    # `:(exclude)x/*_test.go` — which the comparison above pronounces equal, and
-    # which ARE equal while `x` is flat — diverge the moment a matching file
-    # appears in a SUBDIRECTORY of `x`: the filter still fires the trigger on it,
-    # while the pathspec staleness diff already excluded it, so the run reads
-    # "unchanged", re-points and fans a bump nothing asked for. That is the very
-    # churn this exclusion exists to stop, leaking back in one directory down.
-    # Nothing textual can catch it, so measure the tree instead: the day the
-    # precondition stops holding, this fails loudly rather than the fleet
-    # silently going wrong.
+    # glob_exclusion_deep_matches (above) carries the reasoning and the skip
+    # rules; the day its precondition stops holding, this fails loudly rather
+    # than the fleet silently going wrong.
     for neg in ${negatives[@]+"${negatives[@]}"}; do
       neg="${neg#!}"
-      negbase="${neg##*/}" negdir="${neg%/*}"
-      # File globs only. A `/**` directory exclusion means "everything under
-      # here" in both syntaxes at every depth, so it cannot diverge this way.
-      case "$negbase" in *'*'*) ;; *) continue ;; esac
-      case "$negdir" in *'*'*) continue ;; esac
-      [[ "$negdir" != "$neg" && -d "${REPO_ROOT}/${negdir}" ]] || continue
-      deep="$(cd "${REPO_ROOT}/${negdir}" && find . -mindepth 2 -name "$negbase" -print 2>/dev/null | head -3)"
-      if [[ -z "$deep" ]]; then
-        ok "${file}: no '${negbase}' below the top level of ${negdir} — its \`!\`/\`:(exclude)\` pair still select the same set"
-      else
-        bad "${file}: '${negdir}' now holds '${negbase}' in a SUBDIRECTORY ($(echo "$deep" | tr '\n' ' ')), where the filter's \`!${neg}\` and the pathspec's \`:(exclude)${neg}\` stop agreeing — the filter's \`*\` does not cross \`/\` but git's does, so the trigger fires on that file while the staleness diff excludes it, and the run re-points having compared nothing that moved. Narrow the exclusion to the top level, or move those tests back up"
-      fi
+      # Split again here only to NAME the parts in the messages below; the
+      # function does its own splitting and the verdict is entirely its call.
+      negbase="${neg##*/}"
+      if [[ "$neg" == */* ]]; then negdir="${neg%/*}"; else negdir="."; fi
+      # All four verdicts are reported. A skip is NOT silence: the one thing this
+      # block must never do is leave a reader unable to tell an exclusion it
+      # CLEARED from one it never looked at, so an unmeasured shape and a failed
+      # walk each say so in their own words.
+      glob_rc=0
+      deep="$(glob_exclusion_deep_matches "$REPO_ROOT" "$neg")" || glob_rc=$?
+      case "$glob_rc" in
+        0)
+          if [[ -z "$deep" ]]; then
+            ok "${file}: no path matching '${negbase}' below the top level of ${negdir} — its \`!\`/\`:(exclude)\` pair still select the same set"
+          else
+            bad "${file}: '${negdir}' now holds a path matching '${negbase}' in a SUBDIRECTORY ($(echo "$deep" | tr '\n' ' ')), where the filter's \`!${neg}\` and the pathspec's \`:(exclude)${neg}\` stop agreeing — the filter's \`*\` does not cross \`/\` but git's does, so the trigger fires on that file while the staleness diff excludes it, and the run re-points having compared nothing that moved. Narrow the exclusion to the top level, or move those tests back up"
+          fi
+          ;;
+        1)
+          skip "${file}: '!${neg}' and \`:(exclude)${neg}\` cannot diverge this way — they select the same set at every depth, so there is nothing to measure"
+          ;;
+        2)
+          skip "${file}: '!${neg}' is UNMEASURED — this walk cannot decide whether it and \`:(exclude)${neg}\` select the same set, so nothing here asserts that they do"
+          ;;
+        *)
+          bad "${file}: the glob-flatness measurement for '!${neg}' FAILED (status ${glob_rc}) — it neither cleared the exclusion nor reported a divergence. A failed measurement must never read as a clean one, so this is a hard failure rather than a skip"
+          ;;
+      esac
     done
   fi
 
@@ -755,6 +877,183 @@ pathspec_case 'widening a directory exclusion to its parent is caught' mismatch 
 scripts/pr-risk
 :(exclude)scripts/pr-risk' \
   '.github/workflows/pr-risk.yml' 'scripts/pr-risk' '!scripts/pr-risk/tests/**'
+
+# --- the glob-flatness guard -------------------------------------------------
+# Same reasoning again, for glob_exclusion_deep_matches: the real entrypoints are
+# all flat by construction, so the loop above only ever walks its CLEAN path and
+# its skip paths — nothing in this file would otherwise exercise a rejection, and
+# nothing would notice the guard silently classifying an exclusion wrong. These
+# fixtures drive all FOUR verdicts against trees built for the purpose, and every
+# one of them is non-vacuous: each fails on the implementation it replaced.
+echo
+
+GUARD_ROOT="${FIXTURE_DIR}/guard"
+# `deep`: a `/**`-excluded directory that HAS a subdirectory (the BE-15254 shape
+# the old guard mis-reported), plus a `*_test.go` one directory down (the real
+# divergence) and a literal README to stand in for a non-glob exclusion.
+# `flat`: the same exclusion with nothing below the top level.
+# `prefix`: the two halves of the basename-vs-path bug — `test_dir/b.sh`, which
+# git's `:(exclude)x/test_*.sh` DOES exclude while the filter does not (a real
+# divergence a basename test misses), and `sub/test_a.sh`, which neither excludes
+# (a false divergence a basename test invents).
+# `qmark`: `?` crossing `/`, the way git's fnmatch lets it.
+# `many`: FOUR deep matches, so the cap on the reported list is exercised.
+mkdir -p "${GUARD_ROOT}/deep/x/tests/fixtures" "${GUARD_ROOT}/deep/x/sub" \
+         "${GUARD_ROOT}/flat/x" "${GUARD_ROOT}/prefix/x/test_dir" \
+         "${GUARD_ROOT}/prefix/x/sub" "${GUARD_ROOT}/qmark/x/foo" \
+         "${GUARD_ROOT}/many/x/sub"
+# …and a `.git` holding a file that matches the glob the bare-root fixture below
+# uses, which is the only shape whose walk starts high enough to see it.
+mkdir -p "${GUARD_ROOT}/deep/.git"
+touch "${GUARD_ROOT}/deep/.git/z_test.go"
+touch "${GUARD_ROOT}/deep/x/tests/fixtures/a.txt" \
+      "${GUARD_ROOT}/deep/x/tests/README.md" \
+      "${GUARD_ROOT}/deep/x/sub/b_test.go" \
+      "${GUARD_ROOT}/flat/x/b_test.go" \
+      "${GUARD_ROOT}/prefix/x/test_dir/b.sh" \
+      "${GUARD_ROOT}/prefix/x/sub/test_a.sh" \
+      "${GUARD_ROOT}/qmark/x/foo/bar.go" \
+      "${GUARD_ROOT}/many/x/sub/a_test.go" \
+      "${GUARD_ROOT}/many/x/sub/b_test.go" \
+      "${GUARD_ROOT}/many/x/sub/c_test.go" \
+      "${GUARD_ROOT}/many/x/sub/d_test.go"
+# `dironly`: a DIRECTORY whose own name matches the glob, BELOW the top level (at
+# the top level `-mindepth 2` would skip it anyway, and the fixture would prove
+# nothing). It can never make a `paths:` trigger and a `git diff` pathspec
+# disagree — only files are ever compared — so it must not be reported.
+mkdir -p "${GUARD_ROOT}/dironly/x/sub/sub_test.go"
+touch "${GUARD_ROOT}/dironly/x/sub/keep.txt"
+
+# $1 = case name, $2 = expected verdict
+# (clean|caught|equivalent|unmeasured|error), $3 = fixture root, $4 = the negation
+# with its leading `!` already stripped, $5 = for `caught`, the exact match list
+# expected on stdout.
+guard_case() {
+  local name="$1" want="$2" root="$3" neg="$4" want_out="${5-}" out rc=0 got
+  out="$(glob_exclusion_deep_matches "$root" "$neg")" || rc=$?
+  # Every status is named, and an UNPLANNED one is named too — as `status-N`,
+  # which no fixture ever asks for and which therefore FAILS. Folding unknown
+  # statuses into `skip` is how the skip fixtures below (the BE-15254 regression
+  # among them) would keep passing if this function were renamed or deleted (127),
+  # or aborted under `set -u` — only the clean and caught cases would notice.
+  case "$rc" in
+    0) if [[ -z "$out" ]]; then got=clean; else got=caught; fi ;;
+    1) got=equivalent ;;
+    2) got=unmeasured ;;
+    3) got=error ;;
+    *) got="status-${rc}" ;;
+  esac
+  if [[ "$got" != "$want" ]]; then
+    bad "glob guard: ${name} — got ${got}, want ${want}$( [[ -n "$out" ]] && printf ' (matched: %s)' "$(echo "$out" | tr '\n' ' ')" )"
+  elif [[ "$want" == caught && "$out" != "$want_out" ]]; then
+    bad "glob guard: ${name} — caught, but reported '$(echo "$out" | tr '\n' ' ')' rather than '$(echo "$want_out" | tr '\n' ' ')'"
+  else
+    ok "glob guard: ${name}"
+  fi
+}
+
+# THE regression (BE-15254). `**` matched the guard's file-glob test and
+# `find -name '**'` matches every ordinary filename, so before the explicit rule
+# this returned `./fixtures/a.txt` and the fleet failed its own contract test on a
+# correct config, told to "narrow the exclusion to the top level" over a file glob
+# it does not have. A `/**` exclusion selects the whole subtree in BOTH syntaxes.
+guard_case 'a /** directory exclusion cannot diverge, subdirectories and all' \
+  equivalent "${GUARD_ROOT}/deep" 'x/tests/**'
+
+# …and `**` need not be the WHOLE basename to cross `/`. `!x/**_test.go` matches
+# `sub/b_test.go` on both sides, so it is equally equivalent — while a basename
+# test for exactly `**` let it fall through and fail the same false red.
+guard_case 'a basename merely CONTAINING ** cannot diverge either' \
+  equivalent "${GUARD_ROOT}/deep" 'x/**_test.go'
+
+# The divergence the guard exists to catch: a `*_test.go` one directory down,
+# where the filter's `*` stops and git's does not.
+guard_case 'a file glob matching below the top level is caught' \
+  caught "${GUARD_ROOT}/deep" 'x/*_test.go' 'sub/b_test.go'
+
+# The same exclusion over a FLAT directory is the assertion the real entrypoints
+# make on every run — clean, and distinguishable from a skip.
+guard_case 'a file glob over a flat directory measures clean' \
+  clean "${GUARD_ROOT}/flat" 'x/*_test.go'
+
+# Clean as well one directory DOWN, when the only thing matching the glob there is
+# a directory: that is why the walk is `-type f`. Matched as a path, `sub/sub_test.go`
+# would be reported as a divergence, and no directory can make a `paths:` trigger
+# and a `git diff` pathspec disagree.
+guard_case 'a matching DIRECTORY below the top level is not a divergence' \
+  clean "${GUARD_ROOT}/dironly" 'x/*_test.go'
+
+# The pattern is matched against the PATH, not the basename — both halves of that
+# bug in one fixture. `test_dir/b.sh` is the real divergence a basename test
+# MISSES (`b.sh` never matches `test_*.sh`, yet git's `*` spans `dir/b` and
+# excludes it); `sub/test_a.sh` is the false one it INVENTS (its basename matches,
+# but the pathspec needs a literal `x/test_` prefix, so both syntaxes agree). Only
+# the first may be reported.
+guard_case 'a prefix-anchored glob is measured against the path, not the basename' \
+  caught "${GUARD_ROOT}/prefix" 'x/test_*.sh' 'test_dir/b.sh'
+
+# `?` is a glob in both syntaxes and crosses `/` in git's, so an exclusion
+# carrying one is a measurement, not a literal filename to wave through.
+guard_case 'a ? glob crosses / in git and is measured, not treated as a literal' \
+  caught "${GUARD_ROOT}/qmark" 'x/foo?bar.go' 'foo/bar.go'
+
+# The reported list is capped at 3 and sorted, so a tree with four divergences
+# still names three of them deterministically rather than flooding the failure.
+guard_case 'more than three deep matches are capped, in sorted order' \
+  caught "${GUARD_ROOT}/many" 'x/*_test.go' 'sub/a_test.go
+sub/b_test.go
+sub/c_test.go'
+
+# A literal FILE name carries no glob, so nothing can cross `/` and the two
+# syntaxes cannot disagree about it.
+guard_case 'a literal filename exclusion cannot diverge' \
+  equivalent "${GUARD_ROOT}/deep" 'x/tests/README.md'
+
+# A literal DIRECTORY is the opposite: `!x/tests` matches only a file named
+# exactly that while `:(exclude)x/tests` drops the whole subtree, so it is NOT
+# equivalent — and the filter half of that cannot be executed here, so the honest
+# verdict is UNMEASURED rather than a certificate. (`!x/tests/**` is the spelling
+# that IS equivalent, and the README documents that one.)
+guard_case 'a literal directory exclusion is unmeasured, not certified equal' \
+  unmeasured "${GUARD_ROOT}/deep" 'x/tests'
+
+# A glob in the DIRECTORY half is unmeasured too — there is no single tree to
+# walk, and git's `*` there spans levels the filter's cannot, so the `**` rule
+# must NOT reach this shape: `!x/*/tests/**` genuinely can diverge.
+guard_case 'a glob in the directory half is unmeasured, ** basename or not' \
+  unmeasured "${GUARD_ROOT}/deep" 'x/*/tests/**'
+
+# An absent directory is unmeasured, checked BEFORE the `**` rule — otherwise the
+# regression fixture above would go on passing after its tree disappeared, having
+# stopped exercising the `**` rule at all.
+guard_case 'an absent directory is unmeasured, not a vacuous ** skip' \
+  unmeasured "${GUARD_ROOT}/deep" 'x/gone/**'
+
+# A bare entry with no `/` is anchored at the tree ROOT and measured there — the
+# filter holds its `*` to the root while git's reaches every depth, which is the
+# same divergence one level up. It is also the only shape that walks over `.git`,
+# and `.git/z_test.go` must NOT be among the matches: nothing in there is visible
+# to a `paths:` filter or to `git diff`, so reporting it would be a false red.
+guard_case 'a bare root-level glob is measured against the tree root, .git aside' \
+  caught "${GUARD_ROOT}/deep" '*_test.go' 'x/sub/b_test.go'
+
+# A walk that FAILS must never read as a clean measurement: an unreadable subtree
+# is the ERROR verdict, which the fleet loop turns into a hard failure rather than
+# a skip. The `cd: … Permission denied` this prints on stderr is the other half of
+# the point — the walk's diagnostic is no longer swallowed by a `2>/dev/null` that
+# left an empty result looking like a clean one. Skipped as root, for whom the mode
+# bits are advisory.
+if [[ "$(id -u)" != 0 ]]; then
+  mkdir -p "${GUARD_ROOT}/unreadable/x/sub"
+  touch "${GUARD_ROOT}/unreadable/x/sub/e_test.go"
+  chmod 000 "${GUARD_ROOT}/unreadable/x"
+  guard_case 'a walk that cannot run reports ERROR, never clean' \
+    error "${GUARD_ROOT}/unreadable" 'x/*_test.go'
+  # Restore the mode so the EXIT trap's `rm -rf` can take the tree back out.
+  chmod 755 "${GUARD_ROOT}/unreadable/x"
+else
+  skip "glob guard: the ERROR verdict is not exercised as root (mode bits advisory)"
+fi
 
 # --- comments inside the pathspec block ---
 # preflight.sh's split_lines drops whole-line `#` comments from
