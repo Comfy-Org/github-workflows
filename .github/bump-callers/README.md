@@ -395,9 +395,15 @@ textual, and there is one case where equal text selects *different* sets: a
 Put a `*_test.go` in a *subdirectory* and they stop: the trigger fires on it,
 the staleness diff has already excluded it, and the run re-points having compared
 nothing that moved — the pure-churn bump BE-7084 removed, one directory down.
-`test_paths_contract.sh` measures the tree for exactly this, and fails rather
-than warns, so it cannot happen quietly. Three things to know about the scope of
-that measurement:
+`test_paths_contract.sh` measures the tree for exactly this and fails the build
+the day it becomes true, so it cannot happen quietly. What makes that the day is
+the trigger: `test-bump-callers.yml` runs on any change under `.github/**` or
+`scripts/**` (#302), so the measurement fails the PR that CREATES the divergence
+rather than some unrelated later one — and the contract test asserts that filter
+covers every fleet's positive `paths:` entry, so a fleet that ever watches a tree
+outside those two fails there instead of quietly losing its trigger.
+
+Three things to know about the scope of the glob-flatness measurement itself:
 
 * It applies to **glob exclusions only.** A `/**` *directory* exclusion
   (`!scripts/pr-risk/tests/**`) selects the whole subtree in both syntaxes at
@@ -413,13 +419,6 @@ that measurement:
   the tree, or a literal *directory* (`!x/tests` matches only a file named that,
   while `:(exclude)x/tests` drops the subtree — write `!x/tests/**`). A failed
   walk is a hard failure, never a pass.
-
-One caveat on "the day it becomes true": the measurement runs when
-`test-bump-callers.yml` runs, and that workflow is path-filtered to
-`.github/bump-callers/**` plus the `bump-*-callers.yml` entrypoints. A PR that
-adds only a deep test file under a *watched tool* directory — the very PR that
-creates this divergence — does not run it, and the guard first fires on the next
-PR that does touch this directory.
 
 **An excluding fleet passes `WATCHED_PATHSPECS`; a per-file fleet passes
 `WATCHED_EXEC`.** `pr-size` and `cursor-review` need the first (BE-7084): each
