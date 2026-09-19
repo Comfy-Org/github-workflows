@@ -21,7 +21,7 @@ touches[rule][login] += 1
 - **Buckets are the committed rules.** Each `rules:` entry's path globs are the
   bucket definition, matched with the *same* glob semantics as
   assign-reviewers.yml's `globToRegExp` (`*` within a segment, `**` across,
-  `?` one non-slash char) — the map is only correct if it is scored with the
+  `?` one non-slash code POINT) — the map is only correct if it is scored with the
   matcher the runtime assigns with.
 - **Line counts are intentionally unused.** Recency-decayed commit *touches*
   are the signal; numstat is read only for the changed-file list.

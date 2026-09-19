@@ -308,10 +308,32 @@ jobs:
             const pull_number = pr.number;
 
             // Dependency-free glob -> RegExp (`*` within a segment, `**` across
-            // segments, `?` single non-slash char). minimatch/picomatch are not
-            // reliably available inside github-script, so we roll our own. Defined
-            // here rather than with the other helpers below because the base-branch
-            // early exit needs it before any API call is made.
+            // segments, `?` a single non-slash character). minimatch/picomatch are
+            // not reliably available inside github-script, so we roll our own.
+            // Defined here rather than with the other helpers below because the
+            // base-branch early exit needs it before any API call is made.
+            //
+            // Flags (`su`) and the `^...$` anchors are the semantics, not polish,
+            // and .github/refresh-reviewers/generate.py's glob_to_regexp carries
+            // the same three — but SPELLS two of them differently, so port the
+            // INTENT, never the characters:
+            //   * FULL-STRING anchored — no `m`, so `^`/`$` are the ends of the
+            //     path, never the ends of a line inside it. That reasoning is
+            //     JS-ONLY: Python's `$` matches just before a single trailing
+            //     newline even WITHOUT re.MULTILINE, so the port anchors with
+            //     `\Z` instead. Writing `$` on the Python side compiles, reads
+            //     as parity, and silently reintroduces the exact divergence
+            //     this pairing removes (the corpus's `src/a.js` case pins it).
+            //   * `s` — `**` (and the `.` it compiles to) spans EVERY character,
+            //     line terminators included (`\n`, `\r`, U+2028, U+2029). The
+            //     port spells this one re.DOTALL, and it is NOT a no-op there:
+            //     U+2028/U+2029 are line terminators to a JS RegExp but ordinary
+            //     characters to Python's `.`, so the flags converge them.
+            //   * `u` — `?` is one Unicode CODE POINT, so an astral path
+            //     character (an emoji) counts once rather than as its two UTF-16
+            //     surrogate halves. Every escape this emits (`.+^${}()|[]\/`) is
+            //     a legal identity escape under `u`, and a lone surrogate in a
+            //     glob still compiles and self-matches.
             // PARITY-HARNESS:glob-matcher:begin
             const globToRegExp = (glob) => {
               let re = '';
@@ -330,7 +352,7 @@ jobs:
                   re += c;
                 }
               }
-              return new RegExp('^' + re + '$');
+              return new RegExp('^' + re + '$', 'su');
             };
             const matchesAny = (p, globs) => globs.some((g) => globToRegExp(g).test(p));
             // PARITY-HARNESS:glob-matcher:end
@@ -716,27 +738,38 @@ jobs:
             // set legitimately holds the PR author and `EXCLUDE`, and warning about a
             // correctly-configured owner who happens to have opened the PR would fire on
             // essentially every run and train people to ignore it. The token is rendered
-            // codepoint-escaped by `showInvisible`, because the whole point is that it looks fine
-            // verbatim. That helper is declared UP in the config-parser region, which warns about
-            // an unrecognised top-level key and needs it too: a `const` sits in the temporal dead
-            // zone until its own line runs, and the parser is CALLED above here, so declaring it at
-            // this point would throw the moment the parser reached for it — the same trap that puts
-            // the `escape` further down (an HTML escaper for the job summary) out of reach here.
+            // codepoint-escaped by `showInvisible`, declared UP in the config-parser region,
+            // which warns about an unrecognised top-level key and needs it too: a `const` sits
+            // in the temporal dead zone until its own line runs, and the parser is CALLED above
+            // here, so declaring it at this point would throw the moment the parser reached for
+            // it — the same trap that puts the `escape` further down (an HTML escaper for the
+            // job summary) out of reach here.
             const warnedLogins = new Set();
-            const configuredCandidate = (raw) => {
+            const warnConfiguredLogin = (raw) => {
               const login = normalizeLogin(raw);
               if (!/^[a-z\d](?:[a-z\d-]{0,38})$/i.test(login) && !warnedLogins.has(login)) {
                 warnedLogins.add(login);
                 core.warning(`${configPath ? `${configPath}: ` : ''}configured reviewer "${showInvisible(raw)}" is not a valid GitHub login and will never be assigned — check for invisible padding such as U+00A0 or a trailing CR.`);
               }
-              return candidate(raw);
             };
+            // WARN BROADLY, ROUTE NARROWLY. The rot is a property of the FILE, not of this
+            // diff, so the sweep is a lint over every configured token, run once up front and
+            // deliberately separate from routing. Warning from inside the candidate helper
+            // instead reached a rule's reviewers only once that rule's paths matched a changed
+            // file, and `default_pool` only on a run that fell all the way through to the
+            // fallback — so a rotted owner stayed silent on exactly the runs that did not touch
+            // its area, and a padded `default_pool` entry could go unreported for as long as any
+            // rule kept matching, right up until the fallback fired and needed it. This pass
+            // creates NO candidates: insertion below stays conditional on the routing checks, so
+            // an unmatched rule's owners are warned about without ever entering `candidates`.
+            for (const rule of config.rules) for (const login of rule.reviewers || []) warnConfiguredLogin(login);
+            for (const login of config.default_pool || []) warnConfiguredLogin(login);
             const matched = new Set();
             for (const rule of config.rules) {
               files.forEach((file, index) => {
                 if (!paths(file).some((path) => matchesAny(path, rule.paths || []))) return;
                 matched.add(index);
-                for (const login of rule.reviewers || []) configuredCandidate(login)?.configured.add(index);
+                for (const login of rule.reviewers || []) candidate(login)?.configured.add(index);
               });
             }
 
@@ -778,7 +811,7 @@ jobs:
             ]);
             for (const [login, person] of candidates) if (!coverage(person).size) candidates.delete(login);
             const fallback = !matched.size && !candidates.size;
-            if (fallback) for (const login of config.default_pool || []) configuredCandidate(login);
+            if (fallback) for (const login of config.default_pool || []) candidate(login);
             if (!candidates.size) {
               core.info('No eligible owner with evidence; leaving PR unassigned.');
               return;

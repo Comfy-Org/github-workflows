@@ -47,8 +47,13 @@ do there, and that noise is what gets the whole automation muted.
 Glob semantics match the path rules: `**` spans segments (`stack/**` covers
 `stack/a` and `stack/a/b`), `*` stays within one (`stack/*` covers `stack/a` but
 not `stack/a/b`), and a pattern with no wildcard is an **exact** match — so
-`release` skips `release` and leaves `release/1.2` and `releases` alone. Several
-patterns are whitespace-separated: `stack/** wip/**`.
+`release` skips `release` and leaves `release/1.2` and `releases` alone. `?` is
+one Unicode character other than `/` — one code POINT, so an emoji counts as a
+single `?` rather than as the bytes or UTF-16 units it is stored as. An accented
+letter counts once only when **precomposed** (NFC): a decomposed `é` (`e` +
+U+0301, and NFD is the normal form paths originating on macOS arrive in) is two
+code points and needs two `?`. `*` spans either form, so prefer it over `?` when
+a segment may carry combining marks. Several patterns are whitespace-separated: `stack/** wip/**`.
 
 Two related knobs, so pick the right one. This var is **per-lane and automatic**.
 The `skip_label` input (default `skip-auto-assign`) is **per-PR and manual**. Use
@@ -206,7 +211,11 @@ the file rather than expecting either side to absorb them.
 Because that padding is invisible, the run **warns** (`configured reviewer "\u00a0alice"
 is not a valid GitHub login and will never be assigned`) whenever a login configured in
 `reviewers.yml` cannot be a GitHub login at all, rendering the offending token
-codepoint-escaped so the character is findable. It is deliberately silent about a
+codepoint-escaped so the character is findable. Every rule's reviewers and the whole
+`default_pool` are checked on every run, including rules whose paths this PR did not
+touch — the warning reports the state of the *file*, so a rotted owner does not stay
+hidden until some later PR happens to change that area. Being warned about is not being
+routed to: an unmatched rule's owners are still never assigned. It is deliberately silent about a
 configured owner who is merely excluded — the PR author, or `vars.REVIEWER_EXCLUDE` —
 since that is normal and would otherwise fire on nearly every run.
 
