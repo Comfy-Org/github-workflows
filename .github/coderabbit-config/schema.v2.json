@@ -824,7 +824,7 @@
 					"type": "object",
 					"properties": {
 						"ast-grep": {
-							"description": "Enable ast-grep | ast-grep is a code analysis tool that helps you to find patterns in your codebase using abstract syntax trees patterns. | v0.45.2",
+							"description": "Enable ast-grep | ast-grep is a code analysis tool that helps you to find patterns in your codebase using abstract syntax trees patterns. | v0.45.3",
 							"default": {},
 							"type": "object",
 							"properties": {
@@ -878,8 +878,12 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Ruff | Ruff is a Python linter and code formatter. |  Enable Ruff integration. | v0.16.3",
+									"description": "Enable Ruff | Ruff is a Python linter and code formatter. |  Enable Ruff integration. | v0.16.4",
 									"type": "boolean"
+								},
+								"config_file": {
+									"description": "Optional path to a Ruff configuration file relative to the repository. When set, this configuration is used for every reviewed file instead of Ruff's closest-config discovery.",
+									"type": "string"
 								}
 							}
 						},
@@ -969,7 +973,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Biome | Biome is a fast formatter, linter, and analyzer for web projects. | Enable Biome integration. | v2.5.8",
+									"description": "Enable Biome | Biome is a fast formatter, linter, and analyzer for web projects. | Enable Biome integration. | v2.5.10",
 									"type": "boolean"
 								}
 							}
@@ -993,7 +997,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable SwiftLint | SwiftLint is a Swift linter. | Enable SwiftLint integration. | v0.65.0",
+									"description": "Enable SwiftLint | SwiftLint is a Swift linter. | Enable SwiftLint integration. | v0.65.1",
 									"type": "boolean"
 								},
 								"config_file": {
@@ -1009,7 +1013,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable PHPStan | PHPStan requires [config file](https://phpstan.org/config-reference#config-file) in your repository root. Please ensure that this file contains the `paths:` parameter. | v2.2.8",
+									"description": "Enable PHPStan | PHPStan requires [config file](https://phpstan.org/config-reference#config-file) in your repository root. Please ensure that this file contains the `paths:` parameter. | v2.2.9",
 									"type": "boolean"
 								},
 								"level": {
@@ -1116,7 +1120,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Checkov | Checkov is a static code analysis tool for infrastructure-as-code files. | v3.3.11",
+									"description": "Enable Checkov | Checkov is a static code analysis tool for infrastructure-as-code files. | v3.3.13",
 									"type": "boolean"
 								}
 							}
@@ -1225,7 +1229,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable RuboCop | RuboCop is a Ruby static code analyzer (a.k.a. linter ) and code formatter. | v1.89.0",
+									"description": "Enable RuboCop | RuboCop is a Ruby static code analyzer (a.k.a. linter ) and code formatter. | v1.90.0",
 									"type": "boolean"
 								}
 							}
@@ -1325,7 +1329,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Vale | Vale checks prose against repository-defined editorial style rules. It runs only when a supported root Vale configuration is present. | v3.17.1",
+									"description": "Enable Vale | Vale checks prose against repository-defined editorial style rules. It runs only when a supported root Vale configuration is present. | v3.18.0",
 									"type": "boolean"
 								}
 							}
@@ -1349,7 +1353,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable OpenGrep | OpenGrep is a high-performance static code analysis engine for finding security vulnerabilities and bugs across 17+ languages. | v1.27.1",
+									"description": "Enable OpenGrep | OpenGrep is a high-performance static code analysis engine for finding security vulnerabilities and bugs across 17+ languages. | v1.28.0",
 									"type": "boolean"
 								}
 							}
@@ -1361,7 +1365,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Semgrep | Semgrep is a static analysis tool designed to scan code for security vulnerabilities and code quality issues. | Enable Semgrep integration. | v1.173.0",
+									"description": "Enable Semgrep | Semgrep is a static analysis tool designed to scan code for security vulnerabilities and code quality issues. | Enable Semgrep integration. | v1.174.0",
 									"type": "boolean"
 								},
 								"config_file": {
@@ -1377,7 +1381,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable CircleCI | CircleCI tool is a static checker for CircleCI config files. | v1.0.48254",
+									"description": "Enable CircleCI | CircleCI tool is a static checker for CircleCI config files. | v1.0.48692",
 									"type": "boolean"
 								}
 							}
@@ -1417,7 +1421,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Squawk for Postgres migration linting | Detects unsafe schema changes that can cause downtime or blocking locks | v2.62.0",
+									"description": "Enable Squawk for Postgres migration linting | Detects unsafe schema changes that can cause downtime or blocking locks | v2.63.0",
 									"type": "boolean"
 								}
 							}
@@ -1465,7 +1469,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Oxlint | Oxlint is a JavaScript/TypeScript linter for OXC written in Rust. | v1.78.0",
+									"description": "Enable Oxlint | Oxlint is a JavaScript/TypeScript linter for OXC written in Rust. | v1.80.0",
 									"type": "boolean"
 								}
 							}
@@ -1477,7 +1481,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable Shopify Theme Check | A linter for Shopify themes that helps you follow Shopify theme & Liquid best practices | cli 4.6.1 | theme 3.58.2",
+									"description": "Enable Shopify Theme Check | A linter for Shopify themes that helps you follow Shopify theme & Liquid best practices | cli 4.7.0 | theme 3.58.2",
 									"type": "boolean"
 								}
 							}
@@ -1563,7 +1567,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable OSV Scanner | OSV Scanner is a tool for vulnerability package scanning | v2.5.0",
+									"description": "Enable OSV Scanner | OSV Scanner is a tool for vulnerability package scanning | v2.5.1",
 									"type": "boolean"
 								}
 							}
@@ -1647,7 +1651,7 @@
 							"properties": {
 								"enabled": {
 									"default": true,
-									"description": "Enable SkillSpector | SkillSpector is a security scanner for AI agent skills. It detects vulnerabilities, malicious patterns, and security risks in SKILL.md manifests and MCP configurations. | v2.9.5",
+									"description": "Enable SkillSpector | SkillSpector is a security scanner for AI agent skills. It detects vulnerabilities, malicious patterns, and security risks in SKILL.md manifests and MCP configurations. | v2.9.6",
 									"type": "boolean"
 								}
 							}
@@ -1700,6 +1704,12 @@
 									"description": "Jira | Allow creating Jira issues from chat. 'auto' disables the integration for public repositories.",
 									"type": "string",
 									"enum": ["auto", "enabled", "disabled"]
+								},
+								"issue_template": {
+									"default": "",
+									"description": "Jira Issue Template | Structure to use for the description of Jira issues created from chat. Provide the headings your team expects, one per line, for example '## Goal', '## Description', '## Acceptance Criteria'. Leave empty to let CodeRabbit choose the structure.",
+									"type": "string",
+									"maxLength": 3000
 								}
 							}
 						},
