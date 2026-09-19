@@ -51,7 +51,21 @@ repo's own workflow files.
   workflow's header comment, and the two shared catalogs (`README.md`,
   `docs/callers/README.md`). Which `with:` belongs to which reusable is decided
   by the `uses:` governing it, so a step's `actions/checkout` knobs are never
-  mistaken for a workflow input.
+  mistaken for a workflow input. Two rows also police a **directory** README's
+  knob table — `.github/cursor-review/README.md`'s `## Configuration knobs`
+  (two-way, full set equality) and `.github/refresh-reviewers/README.md`'s
+  deliberately partial `## Knob defaults (and why)` (phantom direction only).
+  For that second row the Default column of the **caller guide**
+  `docs/callers/refresh-reviewers.md` is pinned too — the directory README has
+  no Default column — as is `workflows_ref` in both of its shipped example
+  callers. Those pins came from two hand-rolled per-workflow suites that this
+  file replaced and that are now deleted. Both READMEs sit outside
+  `docs/callers/**`, as does the repo-root `README.md` the shared-catalog check
+  scans, so `test-workflow-pins.yml` lists all three explicitly in its `paths:`
+  filters; dropping an entry would let an edit to that file land without ever
+  running this suite. `test_files_read_outside_the_globs_are_in_this_suites_ci_path_filters`
+  derives the required set from the suite and checks each event's list
+  separately, so neither a new row nor a one-sided entry can slip through.
 
 ```bash
 python3 .github/workflow-pins/check_workflow_pins.py

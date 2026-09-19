@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Table-driven declared-vs-documented input drift check, for ALL 16 reusables.
 
-Two hand-rolled copies of this check already exist — one for `cursor-review`
+Two hand-rolled copies of this check used to exist — one for `cursor-review`
 (`.github/cursor-review/tests/test_workflow_inputs_docs.py`) and one for
 `refresh-reviewers` (`.github/refresh-reviewers/tests/test_inputs_docs.py`).
 Both were written for the same failure, BE-4691: `cursor-review.yml`'s
@@ -11,12 +11,22 @@ with a zero-job `startup_failure` and no logs. So a phantom input in a caller
 guide is a broken caller for whoever copies it. The other 14 reusables had no
 such pin at all; a third hand-rolled copy per workflow is not the answer.
 
-This file is the generalisation: one `ROWS` table, one set of parsers (ported
-from the refresh-reviewers copy, CRLF handling and blank/comment tolerance
-included), one generated `TestCase` per reusable so `-v` names the workflow that
-drifted. It deliberately does NOT delete the two originals (that is a separate
-fold-in, which also flips the `dir_readme` / `check_defaults` columns on for the
-two rows that have those extra pins today) and it does NOT fix any docs drift.
+This file is the generalisation, and now the ONLY parser for this assertion in
+the repo: one `ROWS` table, one set of parsers (ported from the refresh-reviewers
+copy, CRLF handling and blank/comment tolerance included), one generated
+`TestCase` per reusable so `-v` names the workflow that drifted. The two
+originals are deleted; everything they asserted is carried by their rows'
+`dir_readme` / `readme_mode` / `check_defaults` /
+`expect_sentinel_in_examples` columns. It does NOT fix any docs drift.
+
+Some files it reads live outside the `paths:` globs `test-workflow-pins.yml`
+already covers (`.github/workflows/**`, `.github/workflow-pins/**`,
+`docs/callers/**`): the two directory READMEs, and the repo-root `README.md`
+scanned by `SharedDocExampleCallersTest`. Each is listed there as its own
+explicit `paths:` entry, so an edit to it has to run this harness — the #31
+scenario exactly. `test_files_read_outside_the_globs_are_in_this_suites_ci_path_filters`
+derives that set from this file and checks `pull_request` and `push`
+separately, so the pairing cannot rot.
 
 Direction-by-direction, what is asserted and why the strictness differs:
 
@@ -136,6 +146,12 @@ Row = collections.namedtuple(
         "readme_heading",
         "readme_mode",  # "one-way" (phantom only) | "two-way" (set equality)
         "check_defaults",  # compare the guide's Default column to the workflow
+        # Require `sentinel` in EVERY example `with:` block, not merely a
+        # non-empty one. OFF by default: most examples legitimately show only
+        # the knobs they need (groom's header example passes no ref at all,
+        # `stale`'s passes only `dry_run`), so demanding it everywhere would be
+        # permanently red.
+        "expect_sentinel_in_examples",
     ),
     defaults=(
         None,  # guide
@@ -146,6 +162,7 @@ Row = collections.namedtuple(
         None,  # readme_heading
         "one-way",  # readme_mode
         False,  # check_defaults
+        False,  # expect_sentinel_in_examples
     ),
 )
 
@@ -156,10 +173,10 @@ Row = collections.namedtuple(
 # their own.
 #
 # `dir_readme` / `readme_heading` / `readme_mode` / `check_defaults` are OFF on
-# every row here by design: the two hand-rolled originals still own those extra
-# pins (cursor-review's `## Configuration knobs` README table, refresh-reviewers'
-# `## Knob defaults (and why)` table and its Default-column comparison), and
-# turning them on here is the fold-in ticket's job, not this one's.
+# every row but two: only `cursor-review` and `refresh-reviewers` ship a
+# directory README with a knob table, and theirs are the pins the two deleted
+# hand-rolled suites used to own. The two rows are NOT symmetric, and each
+# asymmetry is load-bearing — see the comments on them below.
 ROWS = (
     Row(workflow="agents-md-integrity", sentinel="workflows_ref"),
     # The only reusable here that declares no `workflows_ref` (it loads no
@@ -175,7 +192,20 @@ ROWS = (
     Row(workflow="assign-reviewers", sentinel="reviewer_config_path"),
     Row(workflow="coderabbit-config-validate", sentinel="workflows_ref"),
     Row(workflow="cursor-review-auto-label", sentinel="review_label"),
-    Row(workflow="cursor-review", sentinel="workflows_ref"),
+    # `## Configuration knobs` in the panel README is checked TWO-WAY, which is
+    # what the deleted hand-rolled suite asserted: set equality across all three
+    # sources (workflow, guide, panel README). `check_defaults` stays OFF —
+    # `extra_generated_globs`' default is a folded `>-` scalar
+    # (cursor-review.yml) rendered with `<br>` in the guide's Default cell, and
+    # the canonicaliser does not equate the two; turning it on would redden a
+    # correct doc.
+    Row(
+        workflow="cursor-review",
+        sentinel="workflows_ref",
+        dir_readme=".github/cursor-review/README.md",
+        readme_heading="## Configuration knobs",
+        readme_mode="two-way",
+    ),
     Row(workflow="detect-unreviewed-merge", sentinel="approval-mode"),
     Row(workflow="groom", sentinel="workflows_ref"),
     # linear-ticket's header comment carries no `with:` example — it documents
@@ -198,7 +228,26 @@ ROWS = (
     Row(workflow="pr-risk", sentinel="workflows_ref"),
     Row(workflow="pr-size", sentinel="workflows_ref"),
     Row(workflow="public-repo-hygiene", sentinel="workflows_ref"),
-    Row(workflow="refresh-reviewers", sentinel="workflows_ref"),
+    # Mirror image of the cursor-review row. `## Knob defaults (and why)` is
+    # intentionally PARTIAL — it omits `reviewer_config_path`, `map_exclude`,
+    # `extra_exclude_paths` and `workflows_ref` — so it is one-way (phantom
+    # only); set equality there would be permanently red. `check_defaults` is ON:
+    # this guide's Default column is the only one that currently matches the
+    # workflow under the canonicaliser, and the deleted suite pinned it.
+    Row(
+        workflow="refresh-reviewers",
+        sentinel="workflows_ref",
+        dir_readme=".github/refresh-reviewers/README.md",
+        readme_heading="## Knob defaults (and why)",
+        readme_mode="one-way",
+        check_defaults=True,
+        # Restores the deleted suite's `assertIn("workflows_ref", keys)` on both
+        # shipped example callers. The generalized harness only requires a
+        # non-empty `with:`, under which a later edit dropping `workflows_ref:`
+        # from either copy-paste caller would land green — and whoever copied it
+        # would run with `workflows_ref` as `''`, the BE-5546 hole.
+        expect_sentinel_in_examples=True,
+    ),
     Row(workflow="stale", sentinel="slack_channel"),
 )
 
@@ -766,6 +815,87 @@ def canonical_workflow_default(name, defaults, required):
     return ""
 
 
+# The `paths:`-filter globs in test-workflow-pins.yml that already cover whole
+# trees. A file this suite READS which falls outside all of them needs its own
+# literal entry, or an edit to it runs no job at all.
+CI_PATH_GLOB_PREFIXES = (
+    ".github/workflows/",
+    ".github/workflow-pins/",
+    "docs/callers/",
+)
+# Events whose `paths:` list must carry every such file. Both, so adding an
+# entry to `pull_request` while forgetting `push` — or vice versa — still fails.
+CI_FILTER_EVENTS = ("pull_request", "push")
+
+
+def files_needing_their_own_ci_path_entry():
+    """Repo-relative files this suite reads from outside CI_PATH_GLOB_PREFIXES.
+
+    Derived from the suite itself — the rows' `dir_readme`s plus the shared
+    catalogs `SharedDocExampleCallersTest` scans — rather than hard-coded, so
+    adding a row that reads a new README extends the guard automatically instead
+    of leaving it pinned to yesterday's list.
+    """
+    read = {row.dir_readme for row in ROWS if row.dir_readme}
+    read |= {doc.replace(os.sep, "/") for doc in SharedDocExampleCallersTest.DOCS}
+    return sorted(
+        path
+        for path in read
+        if not path.startswith(CI_PATH_GLOB_PREFIXES)
+    )
+
+
+def event_paths_entries(path, event):
+    """The literal `paths:` list entries under `on.<event>` in a workflow file.
+
+    Indent-anchored rather than YAML-parsed (stdlib-only repo). The event's
+    block is every line indented deeper than its own `  <event>:` key, and
+    within it `paths:` owns the `- ` items indented deeper than itself — so a
+    sibling key's list (`branches:`, or another event's `paths:`) is never
+    counted as this event's. A trailing ` # comment` is stripped, and the
+    surrounding quotes normalised away, so a correctly-configured filter whose
+    entry carries an inline note still matches.
+    """
+    lines = read_lines(path)
+    key = "  %s:" % event
+    try:
+        start = lines.index(key)
+    except ValueError:
+        return None
+    entries, in_paths, paths_indent = [], False, None
+    for line in lines[start + 1:]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent <= 2:
+            break  # left the event's block
+        stripped = line.strip()
+        if in_paths:
+            if indent <= paths_indent:
+                in_paths = False
+            elif stripped.startswith("- "):
+                entries.append(_unquote_filter_entry(stripped[2:]))
+                continue
+        if stripped == "paths:":
+            in_paths, paths_indent = True, indent
+    return entries
+
+
+def _unquote_filter_entry(value):
+    """A `paths:` item's bare glob: inline comment stripped, quotes removed."""
+    value = value.strip()
+    if value[:1] in ("'", '"'):
+        closing = value.find(value[0], 1)
+        if closing != -1:
+            return value[1:closing]
+        return value[1:]
+    # Unquoted: YAML ends the scalar at ` #`.
+    comment = value.find(" #")
+    if comment != -1:
+        value = value[:comment]
+    return value.strip()
+
+
 def reusable_workflow_names():
     """Basenames of every workflow file that is itself reusable.
 
@@ -921,6 +1051,27 @@ def _make_case(row):
                                 "check vacuous"
                                 % (position, len(blocks), label),
                             )
+                            if row.expect_sentinel_in_examples:
+                                # Stronger than non-empty, for the rows whose
+                                # deleted hand-rolled suite pinned the sentinel
+                                # itself: a shipped caller that quietly loses
+                                # `workflows_ref:` is a consumer running off a
+                                # mutable ref, not just a thinner example.
+                                self.assertIn(
+                                    row.sentinel,
+                                    keys,
+                                    "`with:` block #%d of %d in %s does not "
+                                    "pass `%s` — this example is pinned to show "
+                                    "it, and a caller copied without it runs "
+                                    "with `%s` as `''`"
+                                    % (
+                                        position,
+                                        len(blocks),
+                                        label,
+                                        row.sentinel,
+                                        row.sentinel,
+                                    ),
+                                )
                     undeclared = set().union(*blocks) - self.declared
                     self.assertFalse(
                         undeclared,
@@ -989,7 +1140,13 @@ def _make_case(row):
                 "shape changed; this check is now vacuous"
                 % (row.inputs_heading, rel(self.guide), row.sentinel),
             )
-            for name in sorted(self.declared):
+            # KNOWN_UNDOCUMENTED subtracted for the same reason
+            # test_every_declared_input_is_documented_or_allowlisted subtracts
+            # it: without that, the two directions of this file disagree — an
+            # input added to the allowlist would pass the documented-or-
+            # allowlisted test and still redden here, on a guide that is
+            # correct by this file's own definition.
+            for name in sorted(self.declared - self.allowed):
                 with self.subTest(input=name):
                     self.assertIn(
                         name,
@@ -1036,6 +1193,144 @@ class RowsCoverTheReusablesTest(unittest.TestCase):
                     os.path.isfile(guide_path(row)),
                     "ROWS points %s at %s, which does not exist"
                     % (row.workflow, rel(guide_path(row))),
+                )
+                if row.dir_readme:
+                    readme = os.path.join(REPO_ROOT, row.dir_readme)
+                    self.assertTrue(
+                        os.path.isfile(readme),
+                        "ROWS points %s's dir_readme at %s, which does not "
+                        "exist — a moved README would otherwise surface as a "
+                        "FileNotFoundError traceback rather than as drift, and "
+                        "its path also has to stay in test-workflow-pins.yml's "
+                        "`paths:` filters" % (row.workflow, row.dir_readme),
+                    )
+
+    def test_readme_columns_are_internally_consistent(self):
+        """A half-filled README column is a check that silently does nothing.
+
+        `test_directory_readme_knob_table` keys entirely off `dir_readme`, so a
+        row carrying `readme_heading`/`readme_mode` WITHOUT it skips — no error,
+        no coverage. And `readme_mode` is compared by string equality against
+        `"two-way"`, so a typo (`"twoway"`, `"two way"`) silently downgrades a
+        set-equality pin to the phantom direction alone: the exact
+        quietly-vacuous failure every guard in this file exists to prevent.
+        """
+        for row in ROWS:
+            with self.subTest(workflow=row.workflow):
+                self.assertIn(
+                    row.readme_mode,
+                    ("one-way", "two-way"),
+                    "ROWS gives %s readme_mode=%r; only 'one-way' and 'two-way' "
+                    "are understood, and anything else reads as 'one-way'"
+                    % (row.workflow, row.readme_mode),
+                )
+                if not row.dir_readme:
+                    self.assertIsNone(
+                        row.readme_heading,
+                        "ROWS gives %s a readme_heading (%r) but no dir_readme, "
+                        "so the README knob check skips and that heading is "
+                        "never read" % (row.workflow, row.readme_heading),
+                    )
+                    # Same half-filled config, one column over: a row carrying
+                    # readme_mode="two-way" with no dir_readme reads as a
+                    # set-equality pin while test_directory_readme_knob_table
+                    # skips outright, so the strictest-looking column in the
+                    # table checks nothing at all.
+                    self.assertEqual(
+                        row.readme_mode,
+                        Row._field_defaults["readme_mode"],
+                        "ROWS gives %s readme_mode=%r but no dir_readme, so the "
+                        "README knob check skips and that mode is never applied"
+                        % (row.workflow, row.readme_mode),
+                    )
+                else:
+                    self.assertTrue(
+                        row.readme_heading
+                        and HEADING.match(row.readme_heading),
+                        "ROWS gives %s dir_readme=%s but readme_heading=%r; "
+                        "section_lines matches a literal `## ` line, so a "
+                        "missing or wrongly-levelled heading finds no rows"
+                        % (row.workflow, row.dir_readme, row.readme_heading),
+                    )
+
+    def test_files_read_outside_the_globs_are_in_this_suites_ci_path_filters(self):
+        """Every file this suite reads from outside the `paths:` globs must
+        appear in BOTH of test-workflow-pins.yml's `paths:` lists.
+
+        That is the two rows' directory READMEs plus the repo-root `README.md`
+        — the public catalog `SharedDocExampleCallersTest` scans for
+        `uses:`-anchored `with:` fences. None of them matches
+        `.github/workflows/**`, `.github/workflow-pins/**` or `docs/callers/**`,
+        the three globs the filter already covers. Drop an entry and an edit to
+        that file matches no filter, runs no job, and lands green: the #31
+        scenario, on files this suite is the only checker of. Nothing else in
+        the repo checks a `paths:` filter, so the pairing is asserted here, next
+        to the rows that depend on it.
+
+        Each event's own `paths:` block is scanned SEPARATELY and required to
+        carry the entry, so two copies in one list cannot stand in for the
+        other event's missing one — exactly the mispairing this test exists to
+        catch. The needed-files set is derived from the suite, so a row that
+        starts reading a new README extends this guard on its own.
+        """
+        filters = os.path.join(WORKFLOWS_DIR, "test-workflow-pins.yml")
+        needed = files_needing_their_own_ci_path_entry()
+        self.assertTrue(
+            needed,
+            "no file outside %s is read by this suite — the rows or "
+            "SharedDocExampleCallersTest.DOCS were reshaped; this check is now "
+            "vacuous" % (CI_PATH_GLOB_PREFIXES,),
+        )
+        by_event = {}
+        for event in CI_FILTER_EVENTS:
+            entries = event_paths_entries(filters, event)
+            self.assertIsNotNone(
+                entries,
+                "no `on.%s:` key in %s — the file moved or was reshaped; this "
+                "check is now vacuous" % (event, rel(filters)),
+            )
+            self.assertTrue(
+                entries,
+                "`on.%s:` in %s has no `paths:` entries — the filter was "
+                "removed or reshaped; this check is now vacuous"
+                % (event, rel(filters)),
+            )
+            by_event[event] = entries
+        for path in needed:
+            for event in CI_FILTER_EVENTS:
+                with self.subTest(path=path, event=event):
+                    self.assertIn(
+                        path,
+                        by_event[event],
+                        "%s is read by this suite but is missing from the "
+                        "`on.%s.paths:` list in %s — an edit to it would run "
+                        "no job at all"
+                        % (path, event, rel(filters)),
+                    )
+
+    def test_sentinel_pin_has_an_example_to_pin(self):
+        """`expect_sentinel_in_examples` needs both examples actually scanned.
+
+        It is enforced inside the `expect_*_with` branch, so a row that turns it
+        on while turning either example off gets no sentinel check on that side
+        — no error, no coverage: the quietly-vacuous half-filled config this
+        file exists to prevent, on the column added to close exactly that gap.
+        """
+        for row in ROWS:
+            if not row.expect_sentinel_in_examples:
+                continue
+            with self.subTest(workflow=row.workflow):
+                self.assertTrue(
+                    row.expect_guide_with and row.expect_header_with,
+                    "ROWS gives %s expect_sentinel_in_examples=True but "
+                    "expect_guide_with=%r / expect_header_with=%r; the sentinel "
+                    "is only asserted where a `with:` block is expected, so it "
+                    "would silently skip that example"
+                    % (
+                        row.workflow,
+                        row.expect_guide_with,
+                        row.expect_header_with,
+                    ),
                 )
 
     def test_rows_have_no_duplicate_workflows(self):
