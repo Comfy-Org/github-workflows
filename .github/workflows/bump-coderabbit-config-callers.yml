@@ -60,6 +60,16 @@ on:
     paths:
       - .github/workflows/coderabbit-config-validate.yml
       - .github/coderabbit-config/**
+      # …but the tests and the README under that dir are NOT part of what a
+      # pinned caller executes, so a test-only or docs-only commit would mint the
+      # org-wide bot token, force-reset the stable ci/bump-coderabbit-config
+      # branch and fan a pure-churn SHA-bump PR (identical consumer behavior, a
+      # review round in every caller repo) across the whole fleet. Exclude them so
+      # a bump PR keeps meaning "consumer-visible behavior changed". Negations only
+      # strip the paths they match: a commit touching check_coderabbit_config.py
+      # AND its test still matches the positive pattern and still bumps.
+      - '!.github/coderabbit-config/tests/**'
+      - '!.github/coderabbit-config/README.md'
 
 permissions:
   contents: read
@@ -116,6 +126,14 @@ jobs:
           NEW_SHA: ${{ github.sha }}
           WATCHED: .github/workflows/coderabbit-config-validate.yml
           WATCHED_ASSETS: .github/coderabbit-config
+          # MIRRORS the `paths:` filter above, exclusions included — that is the
+          # coupling, not a coincidence. Widen one and you widen the other in the
+          # same change; test_paths_contract.sh fails the build otherwise.
+          WATCHED_PATHSPECS: |
+            .github/workflows/coderabbit-config-validate.yml
+            .github/coderabbit-config
+            :(exclude).github/coderabbit-config/tests
+            :(exclude).github/coderabbit-config/README.md
           # Every file whose ABSENCE breaks a pinned caller at run time. The
           # directory above can never be the decommission probe on its own — it
           # OUTLIVES the files inside it, since `tests/` and `README.md` keep it
