@@ -445,8 +445,44 @@ ${pathspec_diag}"
     # glob_exclusion_deep_matches (above) carries the reasoning and the skip
     # rules; the day its precondition stops holding, this fails loudly rather
     # than the fleet silently going wrong.
+    # --- and the way EITHER spelling goes dead without a word --------------
+    # An exclusion is the one class of hand-written path here that nothing
+    # probed for deletion. git silently ignores a `:(exclude)` that matches
+    # nothing — no error, no warning, the comparison just widens back out —
+    # preflight.sh's own resolution loop walks `pathspec_positives` ONLY, and
+    # the mirror assertion above compares the two lists against each OTHER, so
+    # a rename applied to the tree but to neither list leaves both carrying the
+    # same stale path and agreeing perfectly about it. The renamed file falls
+    # back into the watched surface and the fleet quietly resumes the pure-churn
+    # bumps the exclusion was added to stop: no freeze, no failure, just the
+    # regression re-landing in silence. So resolve every exclusion against the
+    # real tree, the way WATCHED_EXEC literals already are below.
+    #
+    # Checked HERE and not in preflight.sh deliberately. A dead exclusion only
+    # ever over-watches — it compares MORE than the filter negates, never less —
+    # so it can never produce an unsafe bump, and erroring on it at run time
+    # would trade a churn regression for a full fleet outage. This list is a
+    # static, hand-written, repo-local artifact; the commit that renames the
+    # script is the one that should fail, and that commit is a PR in this repo.
+    #
+    # `git ls-files` is the LOOSER matcher of the two spellings (git's `*`
+    # crosses `/`, the `paths:` filter's does not), so "≥1 tracked path" is a
+    # claim about the `:(exclude)` half — exactly the half preflight.sh consumes
+    # unprobed. The filter half rides on the mirror assertion above plus the
+    # deep-match walk below, which is what catches the two diverging.
+    neg_dead=""
+    neg_unreadable=""
     for neg in ${negatives[@]+"${negatives[@]}"}; do
       neg="${neg#!}"
+      ls_rc=0
+      neg_hits="$(git -C "$REPO_ROOT" ls-files -- "$neg")" || ls_rc=$?
+      if (( ls_rc != 0 )); then
+        # A lookup that FAILED is not a measurement. Never let it read as either
+        # verdict, the same not-evidence rule preflight.sh applies to resolve_oid.
+        neg_unreadable="${neg_unreadable}${neg_unreadable:+ }${neg}(status ${ls_rc})"
+      elif [[ -z "$neg_hits" ]]; then
+        neg_dead="${neg_dead}${neg_dead:+ }${neg}"
+      fi
       # Split again here only to NAME the parts in the messages below; the
       # function does its own splitting and the verdict is entirely its call.
       negbase="${neg##*/}"
@@ -476,6 +512,18 @@ ${pathspec_diag}"
           ;;
       esac
     done
+    if [[ -n "$neg_unreadable" ]]; then
+      bad "${file}: could not list what the exclusion ${neg_unreadable} selects — a failed lookup must never read as a resolved path, so this is a hard failure rather than a pass"
+    elif [[ -n "$neg_dead" ]]; then
+      bad "${file}: the exclusion ${neg_dead} selects no tracked path at this commit — git ignores a \`:(exclude)\` that matches nothing, so the staleness diff silently widens back out to the path it was meant to drop and this fleet resumes fanning no-op bumps to every consumer on a commit touching only it. Fix the path, or drop both the \`!\` filter entry and its \`:(exclude)\` mirror if the file was genuinely retired"
+    elif (( ${#negatives[@]} > 0 )); then
+      ok "${file}: all ${#negatives[@]} \`paths:\` exclusions still select a tracked path"
+    else
+      # The no-`!` fleet that sets WATCHED_PATHSPECS anyway. Said rather than
+      # left silent, so "no exclusion to resolve" can never be mistaken for
+      # "every exclusion resolved" in the log.
+      skip "${file}: sets WATCHED_PATHSPECS but its \`paths:\` filter has no exclusion, so there is none to resolve"
+    fi
   fi
 
   expected=("${positives[@]}")

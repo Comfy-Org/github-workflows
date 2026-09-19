@@ -89,6 +89,17 @@ on:
       # and still bumps.
       - '!.github/cursor-review/tests/**'
       - '!.github/cursor-review/README.md'
+      # catalog-drift.py backs this repo's own weekly cursor-review-catalog-drift.yml
+      # and is run out of THAT checkout — never from a caller's `workflows_ref`
+      # (see the DELIBERATELY ABSENT note on WATCHED_EXEC below). A commit touching
+      # only it is pure churn to every consumer, so it must not bump.
+      - '!.github/cursor-review/catalog-drift.py'
+      # wire-bot-identity.py is deliberately NOT excluded even though no caller
+      # loads it from `workflows_ref`: the bump step below runs it out of
+      # github.workspace (WIRE_BOT_SCRIPT) and writes its output INTO each
+      # wire_bot-flagged caller, so a wiring-logic change is a real caller-file
+      # change that must fan out (bump-callers.sh's "wiring-only change on an
+      # already-SHA-current caller still stages the file" design).
 
 permissions:
   contents: read
@@ -150,13 +161,13 @@ jobs:
           # pins callers to a tip whose other content was never verified.
           # Kept alongside WATCHED_PATHSPECS deliberately. The pathspec list
           # SUPERSEDES this input's tree-OID staleness comparison (it has to —
-          # an OID cannot express the exclusions below, so a test-only or
-          # docs-only commit — under .github/cursor-review/tests, its README.md,
-          # or the scripts/check-pr-size `*_test.go` tests — would move a watched
-          # tree and freeze the fleet as a permanent stale re-run). What it does
-          # NOT supersede is the decommission probe: these entries are still what
-          # notices either directory disappearing, and preflight cross-checks
-          # that the pathspecs reach EVERY one of them.
+          # an OID cannot express the exclusions below, so a commit touching only
+          # a path the filter negates — .github/cursor-review/tests, its
+          # README.md, catalog-drift.py, or the scripts/check-pr-size `*_test.go`
+          # tests — would move a watched tree and freeze the fleet as a permanent
+          # stale re-run). What it does NOT supersede is the decommission probe:
+          # these entries are still what notices either directory disappearing,
+          # and preflight cross-checks that the pathspecs reach EVERY one of them.
           WATCHED_ASSETS: |
             .github/cursor-review
             scripts/check-pr-size
@@ -169,6 +180,7 @@ jobs:
             scripts/check-pr-size
             :(exclude).github/cursor-review/tests
             :(exclude).github/cursor-review/README.md
+            :(exclude).github/cursor-review/catalog-drift.py
             :(exclude)scripts/check-pr-size/*_test.go
           # Every file whose ABSENCE breaks a pinned caller at run time — not just
           # the entry points, and NOT confined to one directory: a review run loads

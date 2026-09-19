@@ -72,6 +72,11 @@ on:
       # matches the positive pattern and still bumps.
       - '!.github/coderabbit-config/tests/**'
       - '!.github/coderabbit-config/README.md'
+      # schema_drift.py belongs to this repo's own weekly refresh-coderabbit-schema.yml
+      # and runs out of THAT checkout (ref: main) — no pinned caller ever loads it
+      # (see the DELIBERATELY ABSENT note on WATCHED_EXEC below), so a commit
+      # touching only it must not bump.
+      - '!.github/coderabbit-config/schema_drift.py'
 
 permissions:
   contents: read
@@ -136,6 +141,7 @@ jobs:
             .github/coderabbit-config
             :(exclude).github/coderabbit-config/tests
             :(exclude).github/coderabbit-config/README.md
+            :(exclude).github/coderabbit-config/schema_drift.py
           # Every file whose ABSENCE breaks a pinned caller at run time. The
           # directory above can never be the decommission probe on its own — it
           # OUTLIVES the files inside it, since `tests/` and `README.md` keep it
