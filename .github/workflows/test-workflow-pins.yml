@@ -6,6 +6,12 @@ name: Test workflow pins
 # write permissions — the pin then proves nothing. Removing that default is a
 # one-line edit to undo, so it is guarded by CI rather than by convention.
 #
+# It also lints the OTHER pin this repo depends on (BE-15255): every `uses:`
+# under `.github/workflows/` must name a full 40-hex commit SHA, not a tag.
+# That half covers every workflow file, `ci-*` and `test-*` callers included —
+# they declare no `workflows_ref` and so are skipped by the checks above, which
+# is precisely where two `actions/*` refs sat floating on major tags for months.
+#
 # Runs on every workflow-file change (not just the three fixed ones) so a
 # workflow added later is covered the day it lands.
 
@@ -89,6 +95,12 @@ jobs:
           # the fixture would silently lose the very line under test; and the
           # lint's own "this file uses the input, so it must declare it" check
           # would then read this workflow as a consumer it failed to parse.
+          #
+          # The fixture's `uses:` is SHA-pinned for a THIRD reason (BE-15255):
+          # the lint now also rejects a tag-pinned `uses:`, so a fixture left on
+          # `@abc` would fail this step for a reason it does not test — and the
+          # step, which only asserts a non-zero exit, would then pass even if the
+          # unguarded-checkout check it exists for stopped firing entirely.
           D='$'
           sed "s|__REF__|${D}{{ inputs.workflows_ref }}|" > "$dir/unguarded.yml" <<'YAML'
           name: Unguarded
@@ -102,7 +114,7 @@ jobs:
             run:
               runs-on: ubuntu-latest
               steps:
-                - uses: actions/checkout@abc
+                - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
                   with:
                     ref: __REF__
           YAML
@@ -122,7 +134,12 @@ jobs:
           # warning that started failing the run, or a drop that went quiet
           # again.
           dir="$(mktemp -d)"
-          # Same placeholder trick as the step above, for the same two reasons.
+          # Same placeholder trick as the step above, for the same two reasons,
+          # and the fixture's `uses:` is SHA-pinned for the same third one —
+          # sharper here, because this step asserts exit 0. A tag-pinned fixture
+          # ref would fail the pin check (BE-15255), and this step would then go
+          # red over a ref that is not what it is testing. The flow-mapping
+          # spelling is deliberate and the pin check reads it too.
           D='$'
           sed "s|__REF__|${D}{{ steps.typo.outputs.ref }}|" > "$dir/escaped.yml" <<'YAML'
           name: Escaped
@@ -135,7 +152,7 @@ jobs:
           jobs:
             run:
               runs-on: ubuntu-latest
-              steps: [{id: resolve, run: echo hi}, {uses: actions/checkout@abc, with: {ref: "__REF__"}}]
+              steps: [{id: resolve, run: echo hi}, {uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1, with: {ref: "__REF__"}}]
           YAML
           grep -q 'steps.typo.outputs.ref' "$dir/escaped.yml"  # fixture intact
           status=0
@@ -150,3 +167,38 @@ jobs:
             exit 1
           fi
           echo "lint warned about the unjudged job without failing the run"
+
+      - name: Smoke test — a tag-pinned `uses:` fails the lint
+        run: |
+          # BE-15255: the pin half, wired to FAIL at the CLI like the two above.
+          # The fixture declares no `workflows_ref` at all, so nothing but the
+          # pin check can account for a non-zero exit here — a tag-pinned ref
+          # must fail even in a file the other two checks skip entirely, which
+          # is the case that let two `actions/*` refs float for months.
+          dir="$(mktemp -d)"
+          cat > "$dir/floating.yml" <<'YAML'
+          name: Floating
+          on: [push]
+          jobs:
+            run:
+              runs-on: ubuntu-latest
+              steps:
+                - uses: actions/checkout@v7
+          YAML
+          grep -q 'actions/checkout@v7' "$dir/floating.yml"  # fixture intact
+          status=0
+          python3 .github/workflow-pins/check_workflow_pins.py --workflows-dir "$dir" > "$dir/out.txt" 2>&1 || status=$?
+          cat "$dir/out.txt"
+          if [ "$status" -eq 0 ]; then
+            echo "::error::lint passed a uses: ref pinned to a tag — expected a non-zero exit"
+            exit 1
+          fi
+          # A non-zero exit alone is not the assertion: a traceback, or any
+          # unrelated future failure, satisfies it just as well, so the step
+          # would stay green with the pin check no longer firing at all. Tie
+          # it to the error this test exists for.
+          if ! grep -q 'by tag, not by commit SHA' "$dir/out.txt"; then
+            echo "::error::lint exited non-zero but never reported the tag-pinned uses: — see the output above"
+            exit 1
+          fi
+          echo "lint correctly rejected the tag-pinned uses:"

@@ -55,8 +55,40 @@ rationale from ComfyUI_frontend#5448) minus `map_exclude`.
 
 The rewrite is **surgical**: only the `reviewers: [...]` / `default_pool:
 [...]` sequences (flow or block) are replaced; every comment and all other
-bytes are preserved. The config's comments are its documentation — a
-YAML-dump rewrite would be a regression.
+bytes — the document's own line endings included — are preserved. The config's
+comments are its documentation — a YAML-dump rewrite would be a regression.
+The committed blob is read as bytes and decoded explicitly (never with
+`text=True`, whose universal-newline translation would silently rewrite a
+CRLF config to LF), inserted block items copy — per position — the line
+ending of the item they displace, and the proposal is written with
+`newline=""` so the runner OS cannot translate anything on the way out. A
+config that is not valid UTF-8, or one written with CR-only line breaks
+(which the byte-faithful reader does not split on, so it would arrive as a
+single line), takes the documented clean no-op rather than a lossy or
+half-read rewrite.
+
+Two shapes the rewrite deliberately **cannot** manage, both left exactly as
+committed rather than edited:
+
+- an inline trailing comment on a *block-form list item* (`- alice # why`) is
+  not carried over when that list's membership changes — keep per-reviewer
+  rationales on their own comment lines;
+- a **multi-line flow sequence** (`reviewers: [alice,` closing on a later
+  line). Every edit the rewrite makes is confined to the one line a location
+  names, so rewriting the opening line would leave the continuation lines
+  behind as orphaned YAML. Those lists are parsed but never rewritten; each
+  one emits a `::warning::` naming its file and line and is listed in the
+  drift PR's body. Put the list on one line to let the refresher manage it.
+  A torn **`paths:`** holds back its rule's `reviewers:` for a different
+  reason: that list *is* editable, but the rule's globs were truncated at
+  the line break, so anything selected from them would be scored against the
+  wrong bucket — a wrong write rather than a skipped one.
+
+A list the rewrite skips is reported as skipped everywhere, not just in the
+bytes: `report.json` marks it `skipped` and never `changed`, its before/after
+row shows the committed list (read across the continuation lines, so the
+`before` column is the real one and not the parser's truncated view), and it
+still counts toward the default pool's anti-pile-on tally.
 
 The PR body carries the per-rule before/after table with scores/touches, the
 unresolved-email count, the knob values, and a report-only **taxonomy gap**
