@@ -28,9 +28,13 @@ name: Assign Reviewers (reusable)
 #       reviewers:
 #         - carol
 #
-# Both flow (`[a, b]`) and block (`- a`) sequences are accepted. The config is
-# read from the PR base SHA, so proposed routing edits cannot select their
-# own owners before the edits have been reviewed.
+# Both flow (`[a, b]`) and block (`- a`) sequences are accepted. A duplicate
+# top-level `default_pool:` is last-wins with a warning (a repeated `rules:`
+# still APPENDS, silently — do not rely on it to replace an earlier block), a
+# `#` opens a comment only at the start of a line or after a space or a tab,
+# and one leading BOM is tolerated.
+# The config is read from the PR base SHA, so proposed routing edits cannot
+# select their own owners before the edits have been reviewed.
 #
 # AUTHOR SCOPING: vars.REVIEWER_AUTHOR_ALLOWLIST, when set, restricts routing to
 # that list of PR authors and skips everyone else. It is the opt-in alternative to
@@ -304,10 +308,32 @@ jobs:
             const pull_number = pr.number;
 
             // Dependency-free glob -> RegExp (`*` within a segment, `**` across
-            // segments, `?` single non-slash char). minimatch/picomatch are not
-            // reliably available inside github-script, so we roll our own. Defined
-            // here rather than with the other helpers below because the base-branch
-            // early exit needs it before any API call is made.
+            // segments, `?` a single non-slash character). minimatch/picomatch are
+            // not reliably available inside github-script, so we roll our own.
+            // Defined here rather than with the other helpers below because the
+            // base-branch early exit needs it before any API call is made.
+            //
+            // Flags (`su`) and the `^...$` anchors are the semantics, not polish,
+            // and .github/refresh-reviewers/generate.py's glob_to_regexp carries
+            // the same three — but SPELLS two of them differently, so port the
+            // INTENT, never the characters:
+            //   * FULL-STRING anchored — no `m`, so `^`/`$` are the ends of the
+            //     path, never the ends of a line inside it. That reasoning is
+            //     JS-ONLY: Python's `$` matches just before a single trailing
+            //     newline even WITHOUT re.MULTILINE, so the port anchors with
+            //     `\Z` instead. Writing `$` on the Python side compiles, reads
+            //     as parity, and silently reintroduces the exact divergence
+            //     this pairing removes (the corpus's `src/a.js` case pins it).
+            //   * `s` — `**` (and the `.` it compiles to) spans EVERY character,
+            //     line terminators included (`\n`, `\r`, U+2028, U+2029). The
+            //     port spells this one re.DOTALL, and it is NOT a no-op there:
+            //     U+2028/U+2029 are line terminators to a JS RegExp but ordinary
+            //     characters to Python's `.`, so the flags converge them.
+            //   * `u` — `?` is one Unicode CODE POINT, so an astral path
+            //     character (an emoji) counts once rather than as its two UTF-16
+            //     surrogate halves. Every escape this emits (`.+^${}()|[]\/`) is
+            //     a legal identity escape under `u`, and a lone surrogate in a
+            //     glob still compiles and self-matches.
             // PARITY-HARNESS:glob-matcher:begin
             const globToRegExp = (glob) => {
               let re = '';
@@ -326,7 +352,7 @@ jobs:
                   re += c;
                 }
               }
-              return new RegExp('^' + re + '$');
+              return new RegExp('^' + re + '$', 'su');
             };
             const matchesAny = (p, globs) => globs.some((g) => globToRegExp(g).test(p));
             // PARITY-HARNESS:glob-matcher:end
@@ -431,7 +457,13 @@ jobs:
             // js-yaml is not bundled with github-script; the schema is small and
             // fixed, so a focused parser is safer than an unavailable dependency.
             // PARITY-HARNESS:config-parser:begin
-            const parseReviewerConfig = (text) => {
+            // `sourcePath` is only ever used to NAME the file in a diagnostic, and is
+            // optional because the parity harness extracts this region on its own and
+            // has no path to hand it — an omitted one just drops the prefix rather than
+            // printing `undefined:` or hardcoding a `reviewers.yml` the caller may have
+            // configured away (`reviewer_config_path`).
+            const parseReviewerConfig = (text, sourcePath) => {
+              const where = sourcePath ? `${sourcePath}: ` : '';
               const out = { default_pool: [], rules: [] };
               const stripComment = (s) => {
                 let inS = false, inD = false;
@@ -439,12 +471,21 @@ jobs:
                   const ch = s[i];
                   if (ch === "'" && !inD) inS = !inS;
                   else if (ch === '"' && !inS) inD = !inD;
-                  else if (ch === '#' && !inS && !inD && (i === 0 || /\s/.test(s[i - 1]))) return s.slice(0, i);
+                  // YAML starts a comment at `#` only at column 0 or after s-white — a SPACE
+                  // or a TAB, nothing else. `/\s/` was wider on the JS side and `isspace()`
+                  // wider (differently) on the Python side, so the two ports disagreed on
+                  // U+0085, U+001C and U+FEFF; both now spell out the two characters.
+                  else if (ch === '#' && !inS && !inD && (i === 0 || s[i - 1] === ' ' || s[i - 1] === '\t')) return s.slice(0, i);
                 }
                 return s;
               };
+              // YAML s-white: the ONLY characters trimmed around a token. Spelled out (not
+              // String.prototype.trim()) because trim() and Python strip() disagree about
+              // U+FEFF, U+0085 and U+001C-U+001F; the Python port's `_trim` is the same two
+              // characters. Corpus-pinned.
+              const trimSWhite = (s) => s.replace(/^[ \t]+|[ \t]+$/g, '');
               const unquote = (s) => {
-                s = s.trim();
+                s = trimSWhite(s);
                 // `s.length >= 2` is load-bearing for PARITY — the reason that survives
                 // being checked. A lone `"` both starts and ends with a quote, so without
                 // the guard `slice(1, -1)` collapses that one character to the empty
@@ -459,29 +500,43 @@ jobs:
                 return s;
               };
               const parseFlow = (s) => {
-                s = s.trim();
+                s = trimSWhite(s);
                 if (!s.startsWith('[')) return null;
                 const end = s.indexOf(']');
                 const inner = s.slice(1, end === -1 ? s.length : end);
                 return inner.split(',').map((x) => unquote(x)).filter((x) => x.length > 0);
               };
               const indentOf = (l) => l.match(/^ */)[0].length;
-              const lines = text.split(/\r?\n/).map(stripComment);
+              // A single leading U+FEFF is legal YAML and must not become part of the first
+              // key. `trim()` used to absorb it here incidentally and the Python port's
+              // `strip()` did not; now that both sides trim s-white only, NEITHER absorbs it
+              // and this explicit single-BOM strip is the only thing removing it, on both
+              // sides. A SECOND BOM is data and stays — see the corpus.
+              const lines = text.replace(/^\uFEFF/, '').split(/\r?\n/).map(stripComment);
               let i = 0;
+              let seenDefaultPool = false;
               while (i < lines.length) {
                 const raw = lines[i];
-                if (!raw.trim()) { i++; continue; }
-                const line = raw.trim();
+                if (!trimSWhite(raw)) { i++; continue; }
+                const line = trimSWhite(raw);
                 if (indentOf(raw) === 0 && line.startsWith('default_pool:')) {
-                  const rest = line.slice('default_pool:'.length).trim();
+                  // YAML requires unique keys; PyYAML's de-facto last-wins is the reference.
+                  // Warn, never reject — routing must not hard-fail on a malformed map — and
+                  // reset rather than accumulate, so the block form replaces like the flow
+                  // form already did. The flag (not `out.default_pool.length`) is what keeps
+                  // the warning firing for an empty first list, matching the Python port.
+                  if (seenDefaultPool) core.warning(`${where}duplicate top-level \`default_pool:\` key — last one wins`);
+                  seenDefaultPool = true;
+                  const rest = trimSWhite(line.slice('default_pool:'.length));
                   const flow = parseFlow(rest);
                   if (flow) { out.default_pool = flow; i++; continue; }
+                  out.default_pool = [];
                   i++;
                   while (i < lines.length) {
                     const r = lines[i];
-                    if (!r.trim()) { i++; continue; }
+                    if (!trimSWhite(r)) { i++; continue; }
                     if (indentOf(r) === 0) break;
-                    const t = r.trim();
+                    const t = trimSWhite(r);
                     if (t.startsWith('- ')) out.default_pool.push(unquote(t.slice(2)));
                     i++;
                   }
@@ -491,10 +546,20 @@ jobs:
                   i++;
                   let current = null, listKey = null, ruleIndent = -1;
                   const setKey = (seg) => {
-                    const m = seg.match(/^(paths|reviewers):(.*)$/);
+                    // `[^\n]*`, not `.*`: the two languages disagree about what `.`
+                    // excludes. Python's `.` omits only LF, JS's omits LF, CR, U+2028
+                    // and U+2029 — so on a rule line ending in a bare CR (the last line
+                    // of a document with no final newline, which the split above now
+                    // preserves as data) the Python port matched and this one did NOT,
+                    // silently dropping the key and leaving the rule with no reviewers
+                    // while the drift generator modelled those reviewers as routing.
+                    // Spelled out on both ports, both now keep the CR as part of the
+                    // value — where `eligible()` rejects it, the same answer the corpus
+                    // already pins for the `default_pool:` block arm.
+                    const m = seg.match(/^(paths|reviewers):([^\n]*)$/);
                     if (!m) return;
                     const key = m[1];
-                    const val = m[2].trim();
+                    const val = trimSWhite(m[2]);
                     const flow = parseFlow(val);
                     if (flow) { if (current) current[key] = flow; listKey = null; }
                     else if (val === '') { listKey = key; }
@@ -502,20 +567,20 @@ jobs:
                   };
                   while (i < lines.length) {
                     const r = lines[i];
-                    if (!r.trim()) { i++; continue; }
+                    if (!trimSWhite(r)) { i++; continue; }
                     if (indentOf(r) === 0) break;
                     const ind = indentOf(r);
-                    const t = r.trim();
+                    const t = trimSWhite(r);
                     const isDash = t === '-' || t.startsWith('- ');
                     if (isDash && (ruleIndent === -1 || ind === ruleIndent)) {
                       if (ruleIndent === -1) ruleIndent = ind;
                       current = { paths: [], reviewers: [] };
                       out.rules.push(current);
                       listKey = null;
-                      const afterDash = t.slice(1).trim();
+                      const afterDash = trimSWhite(t.slice(1));
                       if (afterDash) setKey(afterDash);
                     } else if (isDash && listKey && current) {
-                      current[listKey].push(unquote(t.slice(1).trim()));
+                      current[listKey].push(unquote(trimSWhite(t.slice(1))));
                     } else {
                       setKey(t);
                     }
@@ -552,7 +617,7 @@ jobs:
                 return;
               }
               const text = Buffer.from(res.data.content, 'base64').toString('utf8');
-              config = parseReviewerConfig(text);
+              config = parseReviewerConfig(text, configPath);
             } catch (e) {
               core.info(`Could not read ${configPath}@${pr.base.sha} (${e.message}) — nothing to do.`);
               return;
@@ -579,6 +644,41 @@ jobs:
               if (!candidates.has(login)) candidates.set(login, {login, configured: new Set(), history: new Map(), load: null});
               return candidates.get(login);
             };
+            // A CONFIGURED login that cannot be a GitHub login at all is config rot, and
+            // it is otherwise completely silent: it just never gets assigned. That became
+            // reachable when both ports narrowed to trimming s-white, since a login padded
+            // with U+00A0/U+FEFF/U+0085/U+001C or a trailing bare CR now survives parsing
+            // verbatim and fails the shape gate — and every one of those characters is
+            // invisible in an editor. Warn once per bad token so the rot is findable.
+            // Deliberately keyed on the SHAPE test only, not on `eligible()`: the exclude
+            // set legitimately holds the PR author and `EXCLUDE`, and warning about a
+            // correctly-configured owner who happens to have opened the PR would fire on
+            // essentially every run and train people to ignore it. The token is rendered
+            // codepoint-escaped because the whole point is that it looks fine verbatim;
+            // note this is NOT the `escape` declared further down (that one is an HTML
+            // escaper for the job summary, and `const` — referencing it from here would
+            // hit the temporal dead zone and throw).
+            const showInvisible = (s) => s.replace(/[^\x20-\x7e]/g, (c) => '\\u' + c.codePointAt(0).toString(16).padStart(4, '0'));
+            const warnedLogins = new Set();
+            const warnConfiguredLogin = (raw) => {
+              const login = normalizeLogin(raw);
+              if (!/^[a-z\d](?:[a-z\d-]{0,38})$/i.test(login) && !warnedLogins.has(login)) {
+                warnedLogins.add(login);
+                core.warning(`${configPath ? `${configPath}: ` : ''}configured reviewer "${showInvisible(raw)}" is not a valid GitHub login and will never be assigned — check for invisible padding such as U+00A0 or a trailing CR.`);
+              }
+            };
+            // WARN BROADLY, ROUTE NARROWLY. The rot is a property of the FILE, not of this
+            // diff, so the sweep is a lint over every configured token, run once up front and
+            // deliberately separate from routing. Warning from inside the candidate helper
+            // instead reached a rule's reviewers only once that rule's paths matched a changed
+            // file, and `default_pool` only on a run that fell all the way through to the
+            // fallback — so a rotted owner stayed silent on exactly the runs that did not touch
+            // its area, and a padded `default_pool` entry could go unreported for as long as any
+            // rule kept matching, right up until the fallback fired and needed it. This pass
+            // creates NO candidates: insertion below stays conditional on the routing checks, so
+            // an unmatched rule's owners are warned about without ever entering `candidates`.
+            for (const rule of config.rules) for (const login of rule.reviewers || []) warnConfiguredLogin(login);
+            for (const login of config.default_pool || []) warnConfiguredLogin(login);
             const matched = new Set();
             for (const rule of config.rules) {
               files.forEach((file, index) => {
