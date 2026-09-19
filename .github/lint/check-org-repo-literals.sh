@@ -103,15 +103,6 @@
 #      rather than capped: this tree's largest tracked file is under 600 lines,
 #      and capping the scan would trade an unreachable timeout for a truncated
 #      count, which is the one number a red run's summary turns on.
-#  12. The non-numeric-line-field and record-shape refusals below (fallback
-#      `grep -r` path only) are BEST-EFFORT, not a closed class: a tracked
-#      path whose embedded newline is followed by digits+colon, or by an
-#      `@${ORG}/...`/`${ORG}/...` fragment at column 0, fabricates a record
-#      that passes every content test here and is reported against a path
-#      that does not exist. No test on a record's content can distinguish a
-#      fabricated fragment from a real one. The GIT scan path does not have
-#      this hole (`git grep` C-quotes newline/tab/`\`/`"` in a path), so it is
-#      reachable only when `--root` is NOT inside a git work tree.
 #
 # TAMPER BOUNDARY: unlike the reusable checkers this repo publishes, this lint
 # runs from the PR's own checkout, so a PR here can edit both the script and the
@@ -525,7 +516,9 @@ if [ "$(git -C "$root" rev-parse --is-inside-work-tree 2>/dev/null)" = true ]; t
   # which corrupts the lowercased name so an allowlisted entry stops matching,
   # and `core.quotePath=true` (git's DEFAULT) emits a path holding a non-ASCII
   # byte quoted and octal-escaped, so the `::error file=` annotation would name
-  # a path that does not exist -- while the fallback `grep -r` prints it raw.
+  # a path that does not exist. Pinned `false`, git prints a byte >= 0x80 raw --
+  # and so does the fallback's per-file `grep`, so both scan paths print such a
+  # byte raw and agree on the location.
   #
   # `grep.fullName=TRUE` is the pinned value, not `false`. Of the two stable
   # settings only one keeps a subtree run's locations usable: with `false` git
@@ -569,7 +562,54 @@ else
     echo "error: no readable text file under '$root' — refusing to report a clean tree" >&2
     exit 2
   fi
-  hits="$(cd -- "$root" || exit 3; grep -rIoiEn --exclude-dir=.git -- "$PATTERN" .)" || scan_status=$?
+  # Enumerate the matching files NUL-delimited and scan each one on stdin, rather
+  # than letting one `grep -r` put the raw path and the match into the same line
+  # the per-hit loop splits as `file:line:match`. A path containing a newline
+  # otherwise splits one hit into two records, and the leading fragment is a
+  # genuine PATTERN substring, so the record-shape refusals in the per-hit loop
+  # cannot catch it (it is reported against a file that does not exist). The git
+  # path does not have this hole because `git grep` C-quotes such a path; this
+  # makes the fallback C-quote the SAME four bytes, so both scan paths now yield
+  # IDENTICAL locations for the same tree.
+  #
+  #   * The NUL list is PIPED STRAIGHT into the loop, never stored in a variable:
+  #     bash `$(...)` drops NUL bytes ("ignored null byte in input"), the loop
+  #     would then run zero times, `hits` would be empty with `scan_status` 0, and
+  #     every tree would read clean. That is a fail-OPEN -- exactly what a naive
+  #     first draft does -- so the file list must not touch a shell variable.
+  #   * Each file is scanned on STDIN with `-H --label="$label"` so grep never
+  #     prints a path of its own; the record's path comes from the trusted loop
+  #     variable `$label`, not from grep's view of an untrusted filename.
+  #   * `$label` is C-quoted the way `git grep` quotes a path (`\` -> `\\`,
+  #     `"` -> `\"`, LF -> `\n`, TAB -> `\t`, wrapped in double quotes) whenever it
+  #     holds a control character, backslash or double quote. The per-hit loop
+  #     already handles that shape from the git path, so both paths produce the
+  #     same record and the loop body needs no change. Backslash is escaped FIRST
+  #     so the escapes added for the other three are not doubled.
+  #   * `--null`, not `-Z`: `-Z` is `--decompress` on BSD grep. `--null` and
+  #     `--label` are accepted by GNU grep 3.x, BSD grep and ugrep.
+  #   * Exit status: `grep -l` exits 1 for "no matching file", which flows through
+  #     the `scan_status` logic below exactly as `grep -r`'s exit 1 did. Inside the
+  #     loop a per-file grep exit ABOVE 1 (e.g. an unreadable file) is propagated
+  #     with `exit "$s"` so the "scan failed (exit N)" refusal still fires; a
+  #     per-file exit 1 (a file matched at enumeration time but not on the re-scan)
+  #     is tolerated.
+  #   * Cost is one extra grep fork per MATCHING FILE, not per hit (measured
+  #     negligible on the spike host: 300 files x 5 hits 9.4s -> 9.6s; 1 file x
+  #     2000 hits 12.1s -> 12.2s). KNOWN LIMITATIONS 11's per-hit numbers hold.
+  hits="$(
+    cd -- "$root" || exit 3
+    grep -rIliE --null --exclude-dir=.git -- "$PATTERN" . | while IFS= read -r -d '' path; do
+      label="${path#./}"
+      case "$label" in
+        *[[:cntrl:]\\\"]*)
+          q="${label//\\/\\\\}"; q="${q//\"/\\\"}"; q="${q//$'\n'/\\n}"; q="${q//$'\t'/\\t}"
+          label="\"$q\""
+          ;;
+      esac
+      grep -oiEnH --label="$label" -e "$PATTERN" - < "$path" || { s=$?; [ "$s" -eq 1 ] || exit "$s"; }
+    done
+  )" || scan_status=$?
 fi
 # Both tools exit 1 for "no matches" and >1 for a real error. Swallowing the
 # latter with `|| true` would report a clean tree because the scan never ran --
@@ -657,31 +697,24 @@ while IFS= read -r hit; do
   lineno="${where##*:}"
 
   # A line number is always DIGITS, so anything else means this record is not a
-  # `file:line:match` triple and the split above produced three fabrications.
-  # The way that happens is a tracked path containing a NEWLINE on the `grep -r`
-  # FALLBACK path, which prints the path raw: one hit arrives as two records and
-  # the leading fragment yields a file that does not exist, a `line=` that is a
-  # path, and a "literal" cut out of the filename. Reporting it would also put
-  # the raw `:`/`,` of a path into the `file=`/`line=` properties that
-  # `escape_property` exists to protect.
+  # `file:line:match` triple. This is a cheap parse INVARIANT on the record shape
+  # both scan paths now guarantee, not a case a path can reach: `git grep`
+  # C-quotes newline, tab, `\` and `"` in a path whatever `core.quotePath` says
+  # (that setting governs only bytes >= 0x80), and the fallback loop above scans
+  # each file on stdin under a `--label` it C-quotes the same four bytes in -- so
+  # a path holding a newline arrives as ONE record with a numeric line field and
+  # a C-quoted pseudo-path on EITHER path, never two fabricated ones. That is a
+  # real finding with a quoted location, left as such (the annotation's `:`/`,`
+  # delimiters are still escaped).
   #
-  # The GIT path does not have the split: `git grep` C-quotes newline, tab, `\`
-  # and `"` in a path whatever `core.quotePath` says (that setting governs only
-  # bytes >= 0x80), so such a file arrives as ONE record with a numeric line
-  # field and a C-quoted pseudo-path. That is a real finding with a quoted
-  # location, not a fabrication, and it is left as such -- the annotation's
-  # delimiters (`:` and `,`) are still escaped.
-  #
-  # Refused rather than escaped or skipped: escaping would still publish the
-  # fabricated finding, and skipping would drop a record on a parse this script
-  # has already lost confidence in. Exit 2 is the same "refusing to report"
+  # So if this ever fires the scan output is corrupt in a way neither path is
+  # supposed to produce. Refused rather than escaped or skipped: escaping would
+  # publish a broken finding, and skipping would drop a record on a parse this
+  # script has lost confidence in. Exit 2 is the same "refusing to report"
   # verdict every other unusable-scan branch here returns.
-  #
-  # This test and the shape test below it (after the boundary drop) are
-  # BEST-EFFORT, not a closed class -- see KNOWN LIMITATIONS 12.
   case "$lineno" in
     ''|*[!0-9]*)
-      echo "error: could not parse the scan output — expected 'file:line:match', got a non-numeric line field. A tracked path containing a newline splits one record in two; rename it, or narrow --root past it." >&2
+      echo "error: could not parse the scan output — expected 'file:line:match', got a non-numeric line field." >&2
       exit 2
       ;;
   esac
@@ -715,10 +748,12 @@ while IFS= read -r hit; do
       match="${match#?}"
       # A numeric line field does NOT prove the record parsed, so the shape is
       # checked here too: after the boundary drop what remains must still begin
-      # with the org prefix, because that is all PATTERN can match. A tracked
-      # path named `a:1:foo<LF>x.md` splits into the fragment `./a:1:foo`, which
-      # passes the digit test above (file=`a`, line=`1`) and would otherwise be
-      # printed as the finding `oo` against a path that does not exist.
+      # with the org prefix, because that is all PATTERN can match. Like the digit
+      # test above, this is a cheap parse INVARIANT on the record shape both scan
+      # paths now guarantee -- each C-quotes a newline in a path rather than
+      # letting it split one record into two -- so it is not reachable by a path
+      # on either path; if it fires the scan output is corrupt and printing the
+      # fabricated location it implies is refused.
       # shellcheck disable=SC2254  # $org_glob is a GLOB by construction — its
       # `[Cc]` classes are the case-insensitive match, so quoting it would break
       # the test. (The two patterns above end in `*`, which is why ShellCheck
@@ -726,7 +761,7 @@ while IFS= read -r hit; do
       case "${match:0:$((${#ORG} + 1))}" in
         $org_glob/) ;;
         *)
-          echo "error: could not parse the scan output — a record's match text does not begin with the org prefix, so 'file:line:match' did not split where it appears to. A tracked path containing a newline splits one record in two; rename it, or narrow --root past it." >&2
+          echo "error: could not parse the scan output — a record's match text does not begin with the org prefix, so 'file:line:match' did not split where it appears to." >&2
           exit 2
           ;;
       esac
