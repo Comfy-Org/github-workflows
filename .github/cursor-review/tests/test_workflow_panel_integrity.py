@@ -252,6 +252,25 @@ class LegFailsWhenTheCellDidNotSubmitTest(unittest.TestCase):
         body = code_lines(step_named(self.review, "Run cursor review"))
         self.assertIn("        continue-on-error: true", body)
 
+    def test_a_red_leg_does_not_cancel_its_sibling_cells(self):
+        # The other half of "failing here costs the panel nothing", and the only
+        # half that is not local to the step. With `fail-fast` left at its
+        # DEFAULT of true, the first cell to exit non-zero CANCELS every sibling
+        # still running — so the leg check would destroy the panel it exists to
+        # measure, landing six cells as one red leg and five cancelled ones, and
+        # `Aggregate panel findings` would undercount a matrix that was merely
+        # short before. Nothing in this matrix ever failed deliberately until
+        # the leg check was added (a cell that did not submit exited GREEN), so
+        # this setting was inert to the panel until this change made it
+        # load-bearing. That is exactly why it is pinned rather than assumed.
+        self.assertIn(
+            "      fail-fast: false",
+            code_lines(self.review),
+            "the `review` matrix lost `fail-fast: false` — a cell that does not "
+            "submit now fails its leg deliberately and would CANCEL the sibling "
+            "cells, turning a short panel into no panel at all",
+        )
+
 
 class ConsolidateExposesPanelCountsTest(unittest.TestCase):
     def setUp(self):
