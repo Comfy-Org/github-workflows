@@ -131,7 +131,16 @@ submission recorded outside the cell's own writable job. Otherwise it prints one
 `::notice::Panel integrity: <ok>/<total> cells, <n> anchored finding(s), 0
 unanchored.` It gates no other job — a short panel must not also cost the PR the
 findings it did produce — so blocking on it is the caller's call, exactly like
-the Blocking gate. See [the setup
+the Blocking gate.
+
+Nor is a red verdict durable yet. The job is gated on a panel being warranted,
+so a later run on the **same head SHA** that takes a deliberate no-panel branch
+— a toggled label, or the already-reviewed re-trigger — skips it, and that
+newer skipped check run supersedes the red for branch protection, which counts
+a skip as a pass. Closing it means reading prior state from outside the run
+(the previous conclusion, or the landed review's cell count), which this job
+deliberately holds no credential for; tracked as BE-15604, and documented as a
+caveat in [the setup
 guide](../../docs/callers/cursor-review.md#panel-integrity).
 
 ### Delivery, the body-only fallback, and a throttled POST

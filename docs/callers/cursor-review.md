@@ -274,7 +274,9 @@ landed-review check only fires when the POST itself *errors*, so a clean re-run
 POSTs, and the PR ends up with two consolidated reviews. Prefer **re-running the
 whole workflow** (which re-runs `Gate`, whose dup-check sees the review that
 already landed) or re-triggering by label. Use re-run-failed-jobs when you
-actually want a second, fuller review on the same commit.
+actually want a second, fuller review on the same commit. Both of those
+alternatives, though, supersede a red `Panel integrity` with a skip — see the
+supersession shape below before you reach for either to clear one.
 
 The remaining shapes to expect before you require it:
 
@@ -311,6 +313,22 @@ The remaining shapes to expect before you require it:
   relevantly, if you do not want an over-cap PR merging unreviewed — require the
   Blocking gate, which fails closed on over-cap fresh reviews, and keep your own
   label policy. Do not read a skipped Panel integrity as "the panel was fine".
+* **A later no-panel run on the same commit supersedes a red with a skip.**
+  That is the previous bullet's sharp edge, and reaching it needs no failure at
+  all. Once `Panel integrity` is red on a head SHA, **any** subsequent run on
+  that same SHA which takes a deliberate no-panel branch publishes a *newer*
+  `Panel integrity` check run in the `skipped` state — and branch protection
+  reads the latest check run of a given name, counting a skipped one as
+  passing. An unrelated label toggled, `skip-cursor-review` applied, the trigger
+  label removed, or the already-reviewed re-trigger all do it — and so does
+  **re-running the whole workflow**, the remediation recommended above, whose
+  fresh `Gate` dup-check finds the review that already landed and reports
+  `already_reviewed=true`. The panel is still short, nothing was re-reviewed,
+  and the required check is green. Until this is closed (BE-15604), clear a red
+  `Panel integrity` by pushing a **new commit** — a fresh SHA gets its own
+  verdict — rather than by re-triggering on the reviewed one, and for a commit
+  whose review came up short read the check's *run history* rather than only its
+  latest conclusion.
 * **It detects a cell that went missing, not a cell that lied.** "Did this cell
   submit" is the `status` field of the artifact the cell itself wrote, and that
   cell's agent runs `--trust` with shell access over attacker-authored diff
