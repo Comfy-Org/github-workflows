@@ -490,6 +490,16 @@ when you write one of these lists:
   surface, and that no fleet watching a DIRECTORY leaves the input unset — so all
   three now fail the PR instead of the fleet. Rename or retire a listed file in the
   SAME commit as the list edit, and the check will tell you when you have not.
+- **An exclusion that stops resolving is the opposite failure, and is checked in
+  the same place.** git ignores a `:(exclude)` matching nothing without a word, so
+  a rename applied to the tree but to neither list leaves the `paths:` negation and
+  its `WATCHED_PATHSPECS` mirror carrying the same stale path and agreeing
+  perfectly about it — the renamed file falls back into the watched surface and the
+  fleet quietly resumes the no-op bumps the exclusion was added to stop. That one
+  over-watches rather than under-verifying, so it can never produce an *unsafe*
+  bump and preflight.sh does NOT error on it at run time (that would trade churn
+  for a full fleet outage); `test_paths_contract.sh` resolves every exclusion
+  against the tree instead, failing the PR that does the renaming.
 
 The three fleets that watch nothing beyond `WATCHED` leave both unset and behave
 exactly as before — `test_paths_contract.sh` grants them exactly that exemption,
