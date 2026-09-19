@@ -23,10 +23,13 @@ Direction-by-direction, what is asserted and why the strictness differs:
 * **Phantom** (documented but not declared) — STRICT, no allowlist, because
   every phantom is a copy-paste caller that fails at startup.
 * **Undocumented** (declared but not documented) — a knob nobody can discover.
-  Real, but quieter, and 13 of them already exist. They are pinned in
-  `KNOWN_UNDOCUMENTED` below, modelled on `KNOWN_EXEMPT` in
+  Real, but quieter. The 13 that existed at this file's first green run were
+  pinned in `KNOWN_UNDOCUMENTED` below, modelled on `KNOWN_EXEMPT` in
   `check_workflow_pins.py`: an entry is a KNOWN debt, not a blessing, and a
-  STALE entry FAILS, so the list drains itself as the guides get filled in.
+  STALE entry FAILS, so the list drains itself as the guides get filled in. It
+  has since drained to empty, which is the intended steady state — the debt is
+  paid, and the mechanism is still there for the next deliberately internal
+  input.
 * **Example `with:` keys** — the same phantom failure one level in, in the
   copy-paste callers this repo ships: every fence in the guide, the workflow's
   header comment, and the two shared catalogs (`README.md`,
@@ -202,30 +205,26 @@ ROWS = (
     Row(workflow="stale", sentinel="slack_channel"),
 )
 
-# Inputs a workflow declares that its caller guide's Inputs table does not name
-# — the 13 that exist as of this file's first green run. Modelled on
-# `KNOWN_EXEMPT` in `check_workflow_pins.py`: an entry is a KNOWN debt, not a
-# blessing. `test_known_undocumented_is_not_stale` FAILS on a stale entry — one
-# whose input the workflow no longer declares (renamed/deleted) or whose guide
-# now DOES document it (fixed) — so the list drains itself instead of rotting,
-# and a name left here after the fix would silently pre-exempt the next drift
-# under that name. Documenting one of these is a two-line change: add the table
-# row, delete the name here.
+# Inputs a workflow declares that its caller guide's Inputs table does not name.
+# Modelled on `KNOWN_EXEMPT` in `check_workflow_pins.py`: an entry is a KNOWN
+# debt, not a blessing. `test_known_undocumented_is_not_stale` FAILS on a stale
+# entry — one whose input the workflow no longer declares (renamed/deleted) or
+# whose guide now DOES document it (fixed) — so the list drains itself instead
+# of rotting, and a name left here after the fix would silently pre-exempt the
+# next drift under that name. Documenting one of these is a two-line change: add
+# the table row, delete the name here.
+#
+# EMPTY, and that is the intended steady state (BE-15249): the 13 entries this
+# file shipped with — `agents-md-integrity`'s `exclude_paths`, groom's
+# `bail_sink`/`config`/`path`/`sink`, pr-derisk's `bot_logins`/`fleet_logins`
+# and pr-risk's `check_name`/`check_run`/`enabled`/`pr_number`/`pr_numbers`/
+# `sticky_comment` — are now documented in their caller guides, so every one of
+# them was a stale entry and had to go. The mechanism stays for the day a
+# deliberately internal input appears: add `"<workflow>": {"<input>"}` here with
+# a comment saying WHY it is not for callers.
 #
 # There is deliberately NO allowlist for the phantom direction.
-KNOWN_UNDOCUMENTED = {
-    "agents-md-integrity": {"exclude_paths"},
-    "groom": {"bail_sink", "config", "path", "sink"},
-    "pr-derisk": {"bot_logins", "fleet_logins"},
-    "pr-risk": {
-        "check_name",
-        "check_run",
-        "enabled",
-        "pr_number",
-        "pr_numbers",
-        "sticky_comment",
-    },
-}
+KNOWN_UNDOCUMENTED = {}
 
 
 def workflow_path(row):
