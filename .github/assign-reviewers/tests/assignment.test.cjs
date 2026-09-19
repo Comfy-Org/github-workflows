@@ -63,7 +63,15 @@ const runScript = new AsyncFunction('github', 'context', 'core', 'process', 'req
 // design, so they take the sentinel and indent checks but not the whole-scalar bracket check;
 // their origin offset keeps reported line numbers absolute in assign-reviewers.yml.
 const SCRIPT_ORIGIN = {file: 'assign-reviewers.yml', offset: scriptSpan.begin + 1};
-const helpers = new Function(`${region(script, 'glob-matcher', SCRIPT_ORIGIN)}\n${region(script, 'config-parser', SCRIPT_ORIGIN)}\nreturn {globToRegExp, matchesAny, parseReviewerConfig};`)();
+// `core` is ambient inside a github-script step but NOT inside this `new Function` scope, so the
+// extracted region has to be handed one. It is a real capture, not a silencer: `parseReviewerConfig`
+// calls `core.warning` on a duplicate top-level `default_pool:`, and `helperWarnings` is what lets a
+// test assert that warning fires. Leave it out and the region throws ReferenceError on that path —
+// which is a REAL failure mode of the shipped script too, so extend the stub rather than the sentinels
+// whenever the parser reaches for another `core` method.
+const helperWarnings = [];
+const helperCore = {warning: (message) => helperWarnings.push(message), info: () => {}};
+const helpers = new Function('core', `${region(script, 'glob-matcher', SCRIPT_ORIGIN)}\n${region(script, 'config-parser', SCRIPT_ORIGIN)}\nreturn {globToRegExp, matchesAny, parseReviewerConfig};`)(helperCore);
 const corpus = JSON.parse(readFileSync(resolve(__dirname, '../parser-corpus.json'), 'utf8'));
 const file = (filename) => ({filename, changes: 10});
 const approval = (login, state = 'APPROVED', type = 'User') => ({user: {login, type}, state, author_association: 'MEMBER'});
@@ -381,6 +389,98 @@ for (const {name, text, expected} of corpus.configs) {
     assert.deepEqual(helpers.parseReviewerConfig(text), expected);
   });
 }
+// The corpus compares parsed CONFIGS, which is deliberately silent about the duplicate-key warning
+// — the Python port prints its own `::warning::` line instead, so the text cannot live in the shared
+// fixture. Each side therefore asserts its own channel; last-wins itself stays corpus-pinned above.
+test('a duplicate top-level default_pool: warns once, naming the key', () => {
+  helperWarnings.length = 0;
+  assert.deepEqual(helpers.parseReviewerConfig('default_pool: [alice]\ndefault_pool:\n  - bob\n').default_pool, ['bob']);
+  assert.equal(helperWarnings.length, 1);
+  assert.match(helperWarnings[0], /duplicate top-level `default_pool:` key/);
+});
+
+test('the duplicate warning names the configured path, and omits the prefix without one', () => {
+  // `reviewer_config_path` is a caller input, so the warning must not hardcode
+  // `reviewers.yml` — a caller that configured another name would be told to go
+  // look at a file its repo does not have.
+  helperWarnings.length = 0;
+  helpers.parseReviewerConfig('default_pool: [alice]\ndefault_pool: [bob]\n', '.github/owners.yml');
+  assert.equal(helperWarnings.length, 1);
+  assert.match(helperWarnings[0], /^\.github\/owners\.yml: duplicate top-level/);
+  // Omitted (as the harness calls it): a bare message, never a literal `undefined:`.
+  helperWarnings.length = 0;
+  helpers.parseReviewerConfig('default_pool: [alice]\ndefault_pool: [bob]\n');
+  assert.equal(helperWarnings.length, 1);
+  assert.doesNotMatch(helperWarnings[0], /undefined/);
+  assert.match(helperWarnings[0], /^duplicate top-level/);
+});
+
+test('an empty first default_pool: still warns on the duplicate', () => {
+  // Keyed on "the key was seen", not on "the list is non-empty" — an emptiness test would make the
+  // JS warn where the Python port (which keys on its own seen-flag) does not.
+  helperWarnings.length = 0;
+  assert.deepEqual(helpers.parseReviewerConfig('default_pool: []\ndefault_pool: [bob]\n').default_pool, ['bob']);
+  assert.equal(helperWarnings.length, 1);
+});
+test('a single default_pool: is silent, however it is written', () => {
+  helperWarnings.length = 0;
+  for (const text of ['default_pool: [alice]\n', 'default_pool:\n  - alice\n', 'rules:\n  - reviewers: [a]\n', '  default_pool: [indented]\ndefault_pool: [alice]\n']) {
+    helpers.parseReviewerConfig(text);
+  }
+  assert.deepEqual(helperWarnings, []);
+});
+
+// The invalid-configured-login warning. Unlike the duplicate-key warning above this one lives in
+// the routing script rather than the shared parser region, so it is driven through `run()` and read
+// off `logs` — and it only exists because both ports narrowed to trimming s-white, which left a
+// login padded with U+00A0/U+FEFF/U+0085 surviving the parse verbatim and then failing the shape
+// gate, invisibly. `\u00a0` is written escaped on purpose: a literal here would go vacuous the
+// moment an editor normalised it away, with every assertion below still passing.
+const NBSP = '\u00a0';
+test('a padded login in a MATCHED rule warns, codepoint-escaped, and does not route', async () => {
+  const result = await run({config: `rules:\n  - paths: ["src/**"]\n    reviewers: ["${NBSP}alice", bob]\n`});
+  assert.deepEqual(result.selected, ['bob']);
+  const warnings = result.logs.filter((line) => /is not a valid GitHub login/.test(line));
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /configured reviewer "\\u00a0alice"/);
+  assert.match(warnings[0], /^\.github\/reviewers\.yml: /);
+});
+test('a padded login warns even when its rule matches NOTHING in this PR', async () => {
+  // The regression CodeRabbit caught: warning only from `configuredCandidate` reached a rule's
+  // reviewers only once that rule's paths matched a changed file, so rot in any other area of the
+  // config stayed silent on every run that did not happen to touch it. The rot is a property of
+  // the FILE, not of this diff.
+  const result = await run({
+    files: [file('src/api/main.js')],
+    config: `rules:\n  - paths: ["src/api/**"]\n    reviewers: [alice]\n  - paths: ["docs/**"]\n    reviewers: ["${NBSP}carol"]\n`,
+  });
+  assert.deepEqual(result.selected, ['alice']);
+  // Warned about, but emphatically NOT routed: an unmatched rule's owners stay out of `candidates`.
+  assert.equal(result.logs.filter((line) => /configured reviewer "\\u00a0carol"/.test(line)).length, 1);
+  assert.ok(!result.selected.includes('carol'));
+});
+test('a padded default_pool entry warns on a run that never reaches the fallback', async () => {
+  // `default_pool` was only ever swept when NO rule and no history covered any file. A rotted
+  // entry in it could therefore go unreported indefinitely while some rule kept matching — and
+  // the fallback is exactly the path you need it to work on when it finally fires.
+  const result = await run({config: `default_pool: ["bob${NBSP}"]\nrules:\n  - paths: ["src/**"]\n    reviewers: [alice]\n`});
+  assert.deepEqual(result.selected, ['alice']);
+  assert.equal(result.logs.filter((line) => /configured reviewer "bob\\u00a0"/.test(line)).length, 1);
+});
+test('each bad token warns once, however many rules repeat it', async () => {
+  const result = await run({
+    config: `default_pool: ["${NBSP}dana"]\nrules:\n  - paths: ["src/api/**"]\n    reviewers: ["${NBSP}dana", alice]\n  - paths: ["docs/**"]\n    reviewers: ["${NBSP}dana"]\n`,
+  });
+  assert.equal(result.logs.filter((line) => /configured reviewer "\\u00a0dana"/.test(line)).length, 1);
+});
+test('a well-formed login is never warned about, excluded or not', async () => {
+  // Keyed on the SHAPE test only, never on `eligible()`: the exclude set legitimately holds the PR
+  // author and `EXCLUDE`, so warning there would fire on essentially every run and train people to
+  // ignore the message. `author` and `alice` below are both shape-valid and both excluded.
+  const result = await run({config: 'rules:\n  - paths: ["src/**"]\n    reviewers: [Author, Alice, bob]\n', env: {EXCLUDE: '@ALICE'}});
+  assert.deepEqual(result.selected, ['bob']);
+  assert.deepEqual(result.logs.filter((line) => /is not a valid GitHub login/.test(line)), []);
+});
 for (const {glob, cases} of corpus.globs) {
   test(`corpus glob — ${glob}`, () => {
     for (const {path, matches} of cases) {

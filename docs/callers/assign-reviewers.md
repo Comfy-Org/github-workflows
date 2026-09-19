@@ -194,6 +194,38 @@ rules:
 [This repo's own `reviewers.yml`](../../.github/reviewers.yml) is a worked example
 with commentary on how the buckets were seeded.
 
+Four dialect rules the focused parser follows, shared with the `refresh-reviewers`
+generator that writes this file: a **duplicate top-level `default_pool:` is last-wins**
+— a second one replaces the first rather than adding to it, and the run logs a warning
+rather than failing (a repeated `rules:` block is *not* covered: it still appends to the
+earlier one, with no warning, so replace a rules block in place rather than restating it);
+a **`#` starts a comment only at the start of a line or after a
+space or a tab**, so `[x#c]` is the literal login `x#c` and only `[x #c]` is a trailing
+comment; a **single leading byte-order mark is tolerated**, so a `reviewers.yml`
+saved as UTF-8-with-BOM still routes; and **a login is trimmed of spaces and tabs only**,
+so one padded by any other invisible character — a non-breaking space, a NEL, a *second*
+byte-order mark — is taken literally as part of the login by both the runtime and the
+drift generator, matches no collaborator, and will not route. Strip those characters from
+the file rather than expecting either side to absorb them.
+
+Because that padding is invisible, the run **warns** (`configured reviewer "\u00a0alice"
+is not a valid GitHub login and will never be assigned`) whenever a login configured in
+`reviewers.yml` cannot be a GitHub login at all, rendering the offending token
+codepoint-escaped so the character is findable. Every rule's reviewers and the whole
+`default_pool` are checked on every run, including rules whose paths this PR did not
+touch — the warning reports the state of the *file*, so a rotted owner does not stay
+hidden until some later PR happens to change that area. Being warned about is not being
+routed to: an unmatched rule's owners are still never assigned. It is deliberately silent about a
+configured owner who is merely excluded — the PR author, or `vars.REVIEWER_EXCLUDE` —
+since that is normal and would otherwise fire on nearly every run.
+
+One consequence of trimming spaces and tabs only: a line whose sole content is some
+*other* invisible character is no longer a blank line, and indentation counts spaces, so
+at column 0 it ends the block above it — inside `rules:` that silently discards every
+rule after it. Both ports behave identically here and the corpus pins it, but a stray
+non-breaking space at the start of a line is worth ruling out if owners stop being
+assigned. Indented, such a line is harmless.
+
 ## Gotchas
 
 **Dependabot PRs need the same skip as forks, for a different reason.** They are

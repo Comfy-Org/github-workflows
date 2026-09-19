@@ -166,9 +166,23 @@ def _strip_comment(s):
             in_s = not in_s
         elif ch == '"' and not in_s:
             in_d = not in_d
-        elif ch == "#" and not in_s and not in_d and (i == 0 or s[i - 1].isspace()):
+        # YAML starts a comment at `#` only at column 0 or after s-white — a SPACE
+        # or a TAB, nothing else. `isspace()` was wider here and `/\s/` wider
+        # (differently) in the JS port, so the two disagreed on U+0085, U+001C and
+        # U+FEFF; both now spell out the two characters. Pinned by the corpus.
+        elif ch == "#" and not in_s and not in_d and (i == 0 or s[i - 1] in " \t"):
             return s[:i]
     return s
+
+
+# YAML s-white: the ONLY characters trimmed around a token. Spelled out (not
+# str.strip()) because strip() and JS trim() disagree about U+FEFF, U+0085 and
+# U+001C-U+001F; the JS port's `trimSWhite` is the same two characters. Corpus-pinned.
+S_WHITE = " \t"
+
+
+def _trim(s):
+    return s.strip(S_WHITE)
 
 
 def _find_unquoted(s, ch, start=0):
@@ -194,14 +208,14 @@ def _find_unquoted(s, ch, start=0):
 
 
 def _unquote(s):
-    s = s.strip()
+    s = _trim(s)
     if len(s) >= 2 and ((s[0] == '"' and s[-1] == '"') or (s[0] == "'" and s[-1] == "'")):
         return s[1:-1]
     return s
 
 
 def _parse_flow(s):
-    s = s.strip()
+    s = _trim(s)
     if not s.startswith("["):
         return None
     end = s.find("]")
@@ -269,21 +283,49 @@ def parse_reviewer_config(text):
     locations = {"default_pool": loc-or-None,
                  "rules": [loc-or-None, ...]}        (reviewers-list positions)
     """
-    raw_lines = text.split("\n")
+    # A single leading U+FEFF is legal YAML and must not become part of the first
+    # key; neither `strip()` nor `_trim` treats it as whitespace, so the first
+    # `default_pool:` of a BOM-prefixed document used to be skipped here while the
+    # JS port (whose `trim()` does strip it) parsed the same bytes fine. Dropping
+    # one character from the head of line 0 leaves every line INDEX untouched, so
+    # `locs` — and the byte-faithful `rewrite_config`, which keeps the BOM by
+    # splitting `text` itself — are unaffected.
+    #
+    # The CR of a CRLF document used to come off incidentally, via the `strip()`
+    # calls that `_trim` replaced; s-white excludes CR, so consume it HERE instead,
+    # as part of the line break. `re.split(r"\r?\n", ...)` is the JS port's
+    # `split(/\r?\n/)` character for character, which is the point: a CR is only
+    # a line break when a newline FOLLOWS it. Stripping a trailing CR off each
+    # `split("\n")` piece instead — the obvious shortcut — also eats a BARE CR
+    # ending the last line of a document with no final newline, which JS keeps as
+    # data; that would have traded the old divergence for a new one. Splitting on
+    # the two-character break produces the same number of lines as `split("\n")`
+    # on a CRLF document, so every line index is left alone.
+    raw_lines = re.split(r"\r?\n", text.removeprefix("\ufeff"))
     lines = [_strip_comment(l) for l in raw_lines]
     config = {"default_pool": [], "rules": []}
     locs = {"default_pool": None, "rules": [], "rule_paths": []}
 
+    seen_default_pool = False
     i = 0
     n = len(lines)
     while i < n:
         raw = lines[i]
-        line = raw.strip()
+        line = _trim(raw)
         if not line:
             i += 1
             continue
         if _indent_of(raw) == 0 and line.startswith("default_pool:"):
-            rest = line[len("default_pool:"):].strip()
+            # YAML requires unique keys; PyYAML's de-facto last-wins is the
+            # reference. Warn, never reject — the drift generator must not
+            # hard-fail on a malformed map. Both the flow and the block arm below
+            # already REPLACE `config["default_pool"]`, so last-wins needs no
+            # further work here; each arm also REPOINTS `locs["default_pool"]`,
+            # so the rewrite can never target an occurrence the parse discarded.
+            if seen_default_pool:
+                print("::warning::duplicate top-level default_pool: key — last one wins")
+            seen_default_pool = True
+            rest = _trim(line[len("default_pool:"):])
             flow = _parse_flow(rest)
             if flow is not None:
                 config["default_pool"] = flow
@@ -299,20 +341,26 @@ def parse_reviewer_config(text):
             indent = 2
             while i < n:
                 r = lines[i]
-                if not r.strip():
+                if not _trim(r):
                     i += 1
                     continue
                 if _indent_of(r) == 0:
                     break
-                t = r.strip()
+                t = _trim(r)
                 if t.startswith("- "):
                     items.append(_unquote(t[2:]))
                     item_lines.append(i)
                     indent = _indent_of(r)
                 i += 1
             config["default_pool"] = items
-            if item_lines:
-                locs["default_pool"] = ("block", item_lines, indent)
+            # Last-wins has to move `locs` too, including when the winning
+            # occurrence carries NO item lines. Leaving it on a shadowed earlier
+            # occurrence would point `rewrite_config` at a line the very next
+            # parse throws away: the emitted file would carry the refreshed pool
+            # on the dead key, still re-read as the empty winner, and every
+            # scheduled run would regenerate the same no-op diff forever. `None`
+            # means "no rewritable list here", which `rewrite_config` skips.
+            locs["default_pool"] = ("block", item_lines, indent) if item_lines else None
             continue
         if _indent_of(raw) == 0 and line.startswith("rules:"):
             i += 1
@@ -323,10 +371,20 @@ def parse_reviewer_config(text):
 
             def set_key(seg, line_idx):
                 nonlocal list_key
-                m = re.match(r"^(paths|reviewers):(.*)$", seg)
+                # `[^\n]*`, not `.*`: the two languages disagree about what `.`
+                # excludes. Python's `.` omits only LF, JS's omits LF, CR, U+2028
+                # and U+2029 — so on a rule line ending in a bare CR (the last line
+                # of a document with no final newline, which the split above now
+                # preserves as data) Python matched and JS did NOT, silently
+                # dropping the key and leaving the rule with no reviewers while
+                # this generator modelled those reviewers as routing. Spelled out
+                # on both ports, both now keep the CR as part of the value — where
+                # `eligible()` rejects it, the same answer the corpus already pins
+                # for the `default_pool:` block arm.
+                m = re.match(r"^(paths|reviewers):([^\n]*)$", seg)
                 if not m:
                     return
-                key, val = m.group(1), m.group(2).strip()
+                key, val = m.group(1), _trim(m.group(2))
                 flow = _parse_flow(val)
                 if flow is not None:
                     if current is not None:
@@ -357,13 +415,13 @@ def parse_reviewer_config(text):
 
             while i < n:
                 r = lines[i]
-                if not r.strip():
+                if not _trim(r):
                     i += 1
                     continue
                 if _indent_of(r) == 0:
                     break
                 ind = _indent_of(r)
-                t = r.strip()
+                t = _trim(r)
                 is_dash = t == "-" or t.startswith("- ")
                 if is_dash and (rule_indent == -1 or ind == rule_indent):
                     if rule_indent == -1:
@@ -373,11 +431,11 @@ def parse_reviewer_config(text):
                     config["rules"].append(current)
                     locs["rules"].append(cur_loc)
                     list_key = None
-                    after_dash = t[1:].strip()
+                    after_dash = _trim(t[1:])
                     if after_dash:
                         set_key(after_dash, i)
                 elif is_dash and list_key and current is not None:
-                    current[list_key].append(_unquote(t[1:].strip()))
+                    current[list_key].append(_unquote(_trim(t[1:])))
                     if list_key == "reviewers":
                         if cur_loc["reviewers"] is None:
                             cur_loc["reviewers"] = ("block", [], ind)
@@ -465,14 +523,35 @@ def _rewrite_flow_line(line, key, logins):
     new_list = "[" + ", ".join(logins) + "]"
     stripped = _strip_comment(line)
     key_pos = stripped.find(key)
-    open_idx = _find_unquoted(stripped, "[", key_pos)
+    # The flow span counts only when the VALUE ITSELF opens with `[`, exactly as
+    # `_parse_flow` requires before it returns a flow list. Searching for any `[`
+    # after the key also matches one sitting INSIDE a plain scalar, which the
+    # s-white comment rule makes reachable: in `reviewers: alice # see [bob]`
+    # the `#` no longer opens a comment, so the whole tail is the value — and the
+    # old search rewrote the bracket in that comment-shaped tail while leaving the
+    # real value `alice` in place. Anchoring here keeps the two in step.
+    value_pos = key_pos + len(key)
+    rest = stripped[value_pos:]
+    # s-white, not bare lstrip()/rstrip(): the rewriter has to agree with
+    # `_parse_flow` about where the VALUE starts and ends, and `_parse_flow` now
+    # trims s-white only. A bare `lstrip()` still absorbs U+00A0 and U+001C, so
+    # `reviewers:<NBSP>[alice]` — a bare SCALAR to the parser — took the bracket
+    # branch here and emitted `reviewers:<NBSP>[new-a, new-b]`, which re-parses as
+    # ONE ineligible scalar login: the refreshed rule routed nobody. The trailing
+    # `rstrip()` was the mirror image, leaving value bytes outside the span it
+    # replaced. Both ends now spell out the same two characters the parser does.
+    # The close-bracket scan is quote-aware too (`_find_unquoted`, not `find`):
+    # `reviewers: ["a]b", carol,` must not treat the `]` inside the quoted
+    # scalar as the end of the sequence.
+    lead = len(rest) - len(rest.lstrip(S_WHITE))
+    open_idx = value_pos + lead if rest[lead:lead + 1] == "[" else -1
     if open_idx != -1:
         close_idx = _find_unquoted(stripped, "]", open_idx)
-        end = close_idx + 1 if close_idx != -1 else len(stripped.rstrip())
+        end = close_idx + 1 if close_idx != -1 else len(stripped.rstrip(S_WHITE))
         return line[:open_idx] + new_list + line[end:]
     # scalar form: `reviewers: alice  # note` -> replace the value span only
     key_end = key_pos + len(key)
-    return line[:key_end] + " " + new_list + line[len(stripped.rstrip()):]
+    return line[:key_end] + " " + new_list + line[len(stripped.rstrip(S_WHITE)):]
 
 
 def rewrite_config(text, locs, rule_replacements, default_pool_replacement):

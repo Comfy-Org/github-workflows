@@ -22,7 +22,9 @@ implementations is asserted by an executable corpus rather than by a comment.
 Run: python3 -m unittest discover -s .github/refresh-reviewers/tests -p 'test_*.py' -v
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -352,6 +354,74 @@ class TestSurgicalRewrite(unittest.TestCase):
         self.assertIn("reviewers: [old-f]  # keep: cold-start", out)
         self.assertIn("# Reviewer expertise map — hand-tuned", out)
 
+    def test_flow_span_is_anchored_to_the_value_not_to_any_later_bracket(self):
+        # Fallout of narrowing `_strip_comment` to s-white: after a character
+        # that is NOT a space or a tab, `#` no longer opens a comment, so the
+        # whole tail is the plain scalar VALUE. `_rewrite_flow_line` must not
+        # treat a `[` inside that tail as the flow span — doing so rewrote the
+        # comment-shaped text and left the real value `alice` routing.
+        line = "    reviewers: alice\u00a0# see [bob]"   # NBSP, escaped on purpose
+        self.assertEqual(
+            gen._rewrite_flow_line(line, "reviewers:", ["new1", "new2"]),
+            "    reviewers: [new1, new2]")
+        # A real trailing comment (space before `#`) still keeps its bytes, and a
+        # genuine flow value is still rewritten in place — the anchoring only
+        # rejects brackets that are not the value itself.
+        self.assertEqual(
+            gen._rewrite_flow_line("    reviewers: alice # see [bob]", "reviewers:", ["new1"]),
+            "    reviewers: [new1] # see [bob]")
+        self.assertEqual(
+            gen._rewrite_flow_line("    reviewers: [a, b]  # note [x]", "reviewers:", ["new1"]),
+            "    reviewers: [new1]  # note [x]")
+
+    def test_rewriter_and_parser_agree_on_the_value_span_for_non_s_white(self):
+        # The rewriter located the value with a BARE `lstrip()`/`rstrip()`, which
+        # still absorb U+00A0 and U+001C, while `_parse_flow` trims s-white only.
+        # So `reviewers:<NBSP>[alice]` is a bare SCALAR to the parser but took the
+        # BRACKET branch here, emitting a line that re-parses as ONE ineligible
+        # scalar login: the refreshed rule routed NOBODY. Assert the round trip,
+        # not just the bytes — that is the property that was broken.
+        for value in ("\u00a0[alice]", "\u001c[alice]"):   # escaped on purpose
+            with self.subTest(value=value):
+                doc = "rules:\n  - paths: ['a/**']\n    reviewers:%s\n" % value
+                _config, locs = gen.parse_reviewer_config(doc)
+                out = gen.rewrite_config(doc, locs, {0: ["new1", "new2"]}, None)
+                reparsed, _ = gen.parse_reviewer_config(out)
+                self.assertEqual(reparsed["rules"][0]["reviewers"],
+                                 ["new1", "new2"])
+        # The mirror image at the other end: a trailing non-s-white byte is part
+        # of the VALUE to the parser, so the replaced span must swallow it rather
+        # than leave it stranded after the new list.
+        self.assertEqual(
+            gen._rewrite_flow_line("    reviewers: alice\u00a0", "reviewers:", ["new1"]),
+            "    reviewers: [new1]")
+        self.assertEqual(
+            gen._rewrite_flow_line("    reviewers: alice\u00a0  # note", "reviewers:", ["new1"]),
+            "    reviewers: [new1]  # note")
+
+    def test_crlf_document_round_trips_without_mixing_line_endings(self):
+        # `main()` reads the config as BYTES now (universal-newline translation
+        # would hide a CR from the parser that the runtime port plainly sees), so
+        # a CRLF document reaches `rewrite_config` with its CRs intact for the
+        # first time. Emitting bare-LF item lines into it would leave the file
+        # with MIXED endings — a diff on every untouched line for the reviewer of
+        # the drift PR.
+        doc = "default_pool:\r\n  - alice\r\n  - bob\r\n"
+        _config, locs = gen.parse_reviewer_config(doc)
+        out = gen.rewrite_config(doc, locs, {}, ["carol", "dave"])
+        self.assertEqual(out, "default_pool:\r\n  - carol\r\n  - dave\r\n")
+        self.assertNotIn("\n", out.replace("\r\n", ""))
+        # An LF document must not acquire CRs by the same code path.
+        lf = "default_pool:\n  - alice\n  - bob\n"
+        _config, lf_locs = gen.parse_reviewer_config(lf)
+        self.assertEqual(gen.rewrite_config(lf, lf_locs, {}, ["carol"]),
+                         "default_pool:\n  - carol\n")
+        # The flow arm keeps the tail (CR included) on its own.
+        flow = "default_pool: [alice]\r\n"
+        _config, flow_locs = gen.parse_reviewer_config(flow)
+        self.assertEqual(gen.rewrite_config(flow, flow_locs, {}, ["carol"]),
+                         "default_pool: [carol]\r\n")
+
     def test_block_rewrite_replaces_items_at_same_indent(self):
         config, locs = gen.parse_reviewer_config(CONFIG)
         out = gen.rewrite_config(CONFIG, locs, {1: ["new-p", "new-q", "new-r"]}, None)
@@ -416,6 +486,81 @@ class TestSurgicalRewrite(unittest.TestCase):
     def test_default_pool_exclude_is_case_insensitive(self):
         pool = gen.select_default_pool({"DrJKL": 9.0, "b": 5.0}, [], {"drjkl"})
         self.assertEqual(pool, ["b"])
+
+    def test_bom_flow_default_pool_rewrite_keeps_the_bom(self):
+        # `parse_reviewer_config` strips a leading U+FEFF so the first key is
+        # recognised; `rewrite_config` deliberately does NOT, because its
+        # contract is byte-faithfulness. Dropping one character off the head of
+        # line 0 changes no line INDEX, and `_rewrite_flow_line` locates the
+        # bracket span WITHIN the line, so the BOM survives the rewrite in
+        # place — this pins that the two halves stay compatible.
+        # U+FEFF stays ESCAPED here, as in parser-corpus.json: a literal would be
+        # invisible in review and would go silently VACUOUS if an editor or lint
+        # normalised it away — `startswith("")` is always true, so the BOM
+        # assertions below would keep passing while testing nothing.
+        cfg = "\ufeffdefault_pool: [old-a]  # keep small\nrules:\n  - paths: [\"x/**\"]\n    reviewers: [r1]\n"
+        config, locs = gen.parse_reviewer_config(cfg)
+        self.assertEqual(config["default_pool"], ["old-a"])
+        out = gen.rewrite_config(cfg, locs, {}, ["new-a", "new-b"])
+        self.assertTrue(out.startswith("\ufeff"), "the rewrite dropped the BOM")
+        self.assertIn("\ufeffdefault_pool: [new-a, new-b]  # keep small\n", out)
+        self.assertEqual(out.split("\n")[1:], cfg.split("\n")[1:])
+
+
+class TestDuplicateDefaultPool(unittest.TestCase):
+    """Last-wins plus a warning, never a rejection.
+
+    The parsed result is pinned language-neutrally by the shared corpus; the
+    warning cannot be, because each port emits on its own channel (`::warning::`
+    here, `core.warning` in the JS step), so each side asserts its own.
+    """
+
+    def parse(self, text):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            config, locs = gen.parse_reviewer_config(text)
+        return config, locs, buf.getvalue()
+
+    def test_duplicate_warns_once_and_last_wins(self):
+        config, _locs, out = self.parse("default_pool: [alice]\ndefault_pool:\n  - bob\n")
+        self.assertEqual(config["default_pool"], ["bob"])
+        self.assertEqual(out.count("::warning::"), 1)
+        self.assertIn("duplicate top-level default_pool: key", out)
+
+    def test_empty_first_list_still_warns(self):
+        # Keyed on "the key was seen", not on "the list is non-empty" — an
+        # emptiness test would make this port silent where the JS one warns.
+        _config, _locs, out = self.parse("default_pool: []\ndefault_pool: [bob]\n")
+        self.assertEqual(out.count("::warning::"), 1)
+
+    def test_single_or_indented_default_pool_is_silent(self):
+        for text in ("default_pool: [alice]\n",
+                     "default_pool:\n  - alice\n",
+                     "rules:\n  - reviewers: [a]\n",
+                     "  default_pool: [indented]\ndefault_pool: [alice]\n"):
+            with self.subTest(text=text):
+                self.assertNotIn("::warning::", self.parse(text)[2])
+
+    def test_locs_still_point_at_a_rewritable_list(self):
+        # last-wins is a PARSE rule; the rewrite must stay coherent with it.
+        cfg = "default_pool: [alice]\ndefault_pool:\n  - bob\n"
+        _config, locs, _out = self.parse(cfg)
+        out = gen.rewrite_config(cfg, locs, {}, ["carol"])
+        self.assertEqual(out, "default_pool: [alice]\ndefault_pool:\n  - carol\n")
+
+    def test_locs_drop_a_shadowed_key_when_the_winner_has_no_items(self):
+        # The other half of last-wins-for-`locs`, and the dangerous one: the
+        # winning occurrence carries no item lines, so there is nothing to
+        # rewrite. `locs` must NOT fall back to the shadowed first occurrence —
+        # rewriting there emits a file whose refreshed pool sits on a dead key,
+        # re-reads as the empty winner, and regenerates the same diff forever.
+        cfg = "default_pool: [alice]\ndefault_pool:\nrules:\n  - paths: [\"x/**\"]\n    reviewers: [r1]\n"
+        config, locs, _out = self.parse(cfg)
+        self.assertEqual(config["default_pool"], [])
+        self.assertIsNone(locs["default_pool"])
+        # With no rewritable location the document is returned untouched, rather
+        # than rewritten into the occurrence the parse discarded.
+        self.assertEqual(gen.rewrite_config(cfg, locs, {}, ["carol"]), cfg)
 
 
 def _as_parser_shape(doc):
@@ -1191,7 +1336,11 @@ class TestSharedParserCorpus(unittest.TestCase):
     def test_config_cases(self):
         for case in self.corpus["configs"]:
             with self.subTest(case["name"]):
-                config, _locations = gen.parse_reviewer_config(case["text"])
+                # stdout is swallowed only so the duplicate-key cases do not
+                # emit `::warning::` annotations from a passing test job; the
+                # warning itself is asserted by TestDuplicateDefaultPool.
+                with contextlib.redirect_stdout(io.StringIO()):
+                    config, _locations = gen.parse_reviewer_config(case["text"])
                 self.assertEqual(config, case["expected"])
 
     def test_glob_cases(self):
