@@ -22,14 +22,17 @@ escaped: a line number is always digits, so a non-numeric field means the
 record's **shape** is checked too — after the boundary drop the match must still
 begin with the org prefix — because a numeric line field does not prove the split
 landed where it appears to. Both are cheap parse invariants on a record shape both
-scan paths guarantee, not a defence against a path: a newline, tab, `\` or `"` in a
+scan paths guarantee, not a defence against a path: a control byte, `\` or `"` in a
 tracked path is reported as **one** finding with a **C-quoted location** on both scan
-paths. `git grep` C-quotes those four bytes in a path whatever `core.quotePath` says
-(that governs only bytes ≥ 0x80), and the `grep -r` **fallback** now enumerates the
-matching files NUL-delimited and scans each on stdin under a `--label` it C-quotes the
-same four bytes in — so a path holding a newline arrives as one record on either path,
-never split into a fabricated fragment reported against a file that does not exist. The
-two paths give identical locations for the same tree.
+paths. `git grep` C-quotes those bytes in a path whatever `core.quotePath` says (that
+governs only bytes ≥ 0x80), and the `grep -r` **fallback** now enumerates the matching
+files NUL-delimited and scans each on stdin under a `--label` it C-quotes the same way
+— git's `quote_c_style` exactly, down to `\r` for the control bytes git names and
+three-digit octal (`\001`, `\177`) for the ones it does not. So a path holding a
+newline arrives as one record on either path, never split into a fabricated fragment
+reported against a file that does not exist, and no raw control byte from a tracked
+path reaches the public run log. The two paths give identical locations for the same
+tree.
 
 The org segment has to **start a token**, so `Not<org>/whatever` — a different
 owner whose name happens to end in ours — is not a reference to this org and is

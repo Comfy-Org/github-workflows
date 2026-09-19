@@ -569,8 +569,8 @@ else
   # genuine PATTERN substring, so the record-shape refusals in the per-hit loop
   # cannot catch it (it is reported against a file that does not exist). The git
   # path does not have this hole because `git grep` C-quotes such a path; this
-  # makes the fallback C-quote the SAME four bytes, so both scan paths now yield
-  # IDENTICAL locations for the same tree.
+  # makes the fallback C-quote a path exactly as `git grep` does, so both scan
+  # paths now yield IDENTICAL locations for the same tree.
   #
   #   * The NUL list is PIPED STRAIGHT into the loop, never stored in a variable:
   #     bash `$(...)` drops NUL bytes ("ignored null byte in input"), the loop
@@ -580,20 +580,56 @@ else
   #   * Each file is scanned on STDIN with `-H --label="$label"` so grep never
   #     prints a path of its own; the record's path comes from the trusted loop
   #     variable `$label`, not from grep's view of an untrusted filename.
-  #   * `$label` is C-quoted the way `git grep` quotes a path (`\` -> `\\`,
-  #     `"` -> `\"`, LF -> `\n`, TAB -> `\t`, wrapped in double quotes) whenever it
-  #     holds a control character, backslash or double quote. The per-hit loop
-  #     already handles that shape from the git path, so both paths produce the
-  #     same record and the loop body needs no change. Backslash is escaped FIRST
-  #     so the escapes added for the other three are not doubled.
+  #   * `$label` is C-quoted the way `git grep` quotes a path -- git's
+  #     `quote_c_style` exactly -- whenever it holds a control character,
+  #     backslash or double quote: `\` -> `\\`, `"` -> `\"`, the seven control
+  #     bytes git NAMES (`\a \b \t \n \v \f \r`), every OTHER control byte (ESC,
+  #     DEL, CR's neighbours) as a three-digit OCTAL escape, the whole wrapped in
+  #     double quotes. Bytes >= 0x80 are left raw, which is what `core.quotePath`
+  #     pinned `false` makes git do. Verified byte-for-byte against `git grep` on
+  #     the same names, so the two scan paths print the SAME location string.
+  #     Escaping only the four bytes the newline scenario itself needs would leave
+  #     CR/ESC/BEL/DEL raw INSIDE the quotes -- neither valid C-quoting nor what
+  #     git emits, so the "identical locations" invariant would not hold -- and a
+  #     raw CR reaches the `unapproved:` line, which is NOT percent-escaped the
+  #     way the `::error` annotation is; a bare CR is a line terminator to the
+  #     Actions runner, so a name like `x<CR>::stop-commands::tok.md` would put a
+  #     workflow command at column zero of a public run log.
+  #     Backslash is escaped FIRST so the escapes added after it are not doubled,
+  #     and the per-character octal pass runs only if a control byte SURVIVED the
+  #     named seven, so the ordinary path stays pure parameter expansion.
+  #   * `-I` on the per-file grep, the same flag the enumeration, the
+  #     `first_scannable` probe and the GIT path all pass -- so binary-ness is
+  #     decided by the same pass that prints records and KNOWN LIMITATIONS 3 stays
+  #     true. Without it the two passes can disagree: `grep -l` stops at the first
+  #     match, so a file whose NUL byte sits AFTER that match enumerates as text,
+  #     and the unflagged re-scan would then treat it as binary -- GNU grep >= 3.5
+  #     silently suppressing the remaining matches, older GNU and BSD grep putting
+  #     `Binary file <label> matches` into `$hits`, where it trips the
+  #     non-numeric-line-field refusal with exit 2.
   #   * `--null`, not `-Z`: `-Z` is `--decompress` on BSD grep. `--null` and
   #     `--label` are accepted by GNU grep 3.x, BSD grep and ugrep.
   #   * Exit status: `grep -l` exits 1 for "no matching file", which flows through
   #     the `scan_status` logic below exactly as `grep -r`'s exit 1 did. Inside the
-  #     loop a per-file grep exit ABOVE 1 (e.g. an unreadable file) is propagated
-  #     with `exit "$s"` so the "scan failed (exit N)" refusal still fires; a
-  #     per-file exit 1 (a file matched at enumeration time but not on the re-scan)
-  #     is tolerated.
+  #     loop a per-file grep exit ABOVE 1 is propagated with `exit "$s"` so the
+  #     "scan failed (exit N)" refusal still fires; a per-file exit 1 (a file
+  #     matched at enumeration time but not on the re-scan) is tolerated.
+  #   * A redirection that cannot OPEN the file -- deleted, chmod'd or replaced
+  #     between the two passes -- is NOT tolerable, but bash reports it as status
+  #     1 as well, indistinguishable from grep's tolerable 1. So the open is
+  #     judged SEPARATELY: the brace group swallows grep's 1 and returns 0, which
+  #     leaves a non-zero group status meaning "the redirection failed" and
+  #     nothing else. That is refused with exit 2 -- FAIL-CLOSED, the same verdict
+  #     the single `grep -r` this replaces gave (its own exit 2, which the
+  #     `scan_status > 1` guard turned into a refusal). Tolerating it would drop a
+  #     file positively enumerated as containing a literal while the run still
+  #     printed the clean-tree OK line and exited 0, a fail-OPEN in a lint where
+  #     every other unusable-scan condition exits 2.
+  #     Written `... < "$path" || { ...; exit 2; }` and deliberately NOT
+  #     `if ! { ... } < "$path"`: on a redirection it cannot open, bash abandons
+  #     the command and returns 1 WITHOUT applying the `!`, so the `if` branch
+  #     never fires and the hole would look closed while staying open (measured,
+  #     bash 5.2.21).
   #   * Cost is one extra grep fork per MATCHING FILE, not per hit (measured
   #     negligible on the spike host: 300 files x 5 hits 9.4s -> 9.6s; 1 file x
   #     2000 hits 12.1s -> 12.2s). KNOWN LIMITATIONS 11's per-hit numbers hold.
@@ -603,11 +639,31 @@ else
       label="${path#./}"
       case "$label" in
         *[[:cntrl:]\\\"]*)
-          q="${label//\\/\\\\}"; q="${q//\"/\\\"}"; q="${q//$'\n'/\\n}"; q="${q//$'\t'/\\t}"
+          q="${label//\\/\\\\}"; q="${q//\"/\\\"}"
+          q="${q//$'\a'/\\a}"; q="${q//$'\b'/\\b}"; q="${q//$'\t'/\\t}"
+          q="${q//$'\n'/\\n}"; q="${q//$'\v'/\\v}"; q="${q//$'\f'/\\f}"
+          q="${q//$'\r'/\\r}"
+          case "$q" in
+            *[[:cntrl:]]*)                # ESC, DEL, and the other unnamed ones
+              esc=''
+              for ((i = 0; i < ${#q}; i++)); do
+                c="${q:i:1}"
+                case "$c" in
+                  [[:cntrl:]]) printf -v c '\\%03o' "'$c" ;;
+                esac
+                esc="$esc$c"
+              done
+              q="$esc"
+              ;;
+          esac
           label="\"$q\""
           ;;
       esac
-      grep -oiEnH --label="$label" -e "$PATTERN" - < "$path" || { s=$?; [ "$s" -eq 1 ] || exit "$s"; }
+      { grep -IoiEnH --label="$label" -e "$PATTERN" - \
+          || { s=$?; [ "$s" -eq 1 ] || exit "$s"; }; } < "$path" || {
+        echo "error: could not open $label for the re-scan — refusing to report a clean tree" >&2
+        exit 2
+      }
     done
   )" || scan_status=$?
 fi
@@ -699,9 +755,10 @@ while IFS= read -r hit; do
   # A line number is always DIGITS, so anything else means this record is not a
   # `file:line:match` triple. This is a cheap parse INVARIANT on the record shape
   # both scan paths now guarantee, not a case a path can reach: `git grep`
-  # C-quotes newline, tab, `\` and `"` in a path whatever `core.quotePath` says
-  # (that setting governs only bytes >= 0x80), and the fallback loop above scans
-  # each file on stdin under a `--label` it C-quotes the same four bytes in -- so
+  # C-quotes `\`, `"` and every CONTROL byte (newline and tab among them) in a
+  # path whatever `core.quotePath` says (that setting governs only bytes >= 0x80),
+  # and the fallback loop above scans each file on stdin under a `--label` it
+  # C-quotes byte-for-byte the same way -- so
   # a path holding a newline arrives as ONE record with a numeric line field and
   # a C-quoted pseudo-path on EITHER path, never two fabricated ones. That is a
   # real finding with a quoted location, left as such (the annotation's `:`/`,`

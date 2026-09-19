@@ -770,7 +770,7 @@ jobs:
           printf 'see %s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$nl_dir/$nl_name"
           status=0
           output="$(bash .github/lint/check-org-repo-literals.sh --root "$nl_dir" 2>&1)" || status=$?
-          count="$(printf '%s\n' "$output" | grep -c '^unapproved: ')"
+          count="$(printf '%s\n' "$output" | grep -c '^unapproved: ' || true)"
           if [ "$status" -ne 1 ]; then
             echo "::error::a newline in a tracked path exited $status — expected 1 (one C-quoted finding)"
             printf '%s\n' "$output"
@@ -799,7 +799,7 @@ jobs:
           printf 'see %s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$num_dir/$num_name"
           status=0
           output="$(bash .github/lint/check-org-repo-literals.sh --root "$num_dir" 2>&1)" || status=$?
-          count="$(printf '%s\n' "$output" | grep -c '^unapproved: ')"
+          count="$(printf '%s\n' "$output" | grep -c '^unapproved: ' || true)"
           if [ "$status" -ne 1 ]; then
             echo "::error::a numeric-looking path fragment exited $status — expected 1 (one C-quoted finding)"
             printf '%s\n' "$output"
@@ -854,9 +854,9 @@ jobs:
           done
           status=0
           output="$(bash .github/lint/check-org-repo-literals.sh --root "$spike_dir" 2>&1)" || status=$?
-          count="$(printf '%s\n' "$output" | grep -c '^unapproved: ')"
-          quoted="$(printf '%s\n' "$output" | grep -c '^::error file="')"
-          errlines="$(printf '%s\n' "$output" | grep -c '^::error ')"
+          count="$(printf '%s\n' "$output" | grep -c '^unapproved: ' || true)"
+          quoted="$(printf '%s\n' "$output" | grep -c '^::error file="' || true)"
+          errlines="$(printf '%s\n' "$output" | grep -c '^::error ' || true)"
           if [ "$status" -ne 1 ]; then
             echo "::error::the spike fixtures exited $status — expected 1"
             printf '%s\n' "$output"
@@ -918,6 +918,40 @@ jobs:
             echo 'ok (1): tab, quote, backslash and a leading dash are C-quoted and handled'
           fi
 
+          # A name holding a CARRIAGE RETURN, a bare control byte (SOH) and DEL.
+          # The `case` guard that triggers quoting fires on ANY `[[:cntrl:]]` byte,
+          # so escaping only `\`, `"`, LF and TAB would wrap these three in double
+          # quotes with the RAW byte still inside — neither valid C-quoting nor
+          # what the git path emits, so the "both paths give identical locations"
+          # invariant would be false. Pins git's own `quote_c_style` spelling:
+          # `\r` for CR (one of the seven bytes git names) and three-digit OCTAL
+          # for the two it does not. Also pins that no raw control byte survives
+          # into the run log — the `unapproved:` line is not percent-escaped, and a
+          # bare CR is a line terminator to the runner, so a crafted name could
+          # otherwise put a workflow command at column zero of a PUBLIC log.
+          ctl_dir="$(mktemp -d)"
+          mkdir -p "$ctl_dir/.github/lint"
+          printf 'placeholder  # fixture\n' > "$ctl_dir/.github/lint/org-repo-allowlist.txt"
+          ctl_name="$(printf 'a\rb\001c\177d.md')"
+          printf 'see %s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$ctl_dir/$ctl_name"
+          status=0
+          output="$(bash .github/lint/check-org-repo-literals.sh --root "$ctl_dir" 2>&1)" || status=$?
+          if [ "$status" -ne 1 ]; then
+            echo "::error::a CR/control-byte path exited $status — expected 1"
+            printf '%s\n' "$output"
+            fail=1
+          elif ! printf '%s\n' "$output" | grep -qF '"a\rb\001c\177d.md"'; then
+            echo '::error::a CR/control-byte path was not C-quoted the way git quotes it'
+            printf '%s\n' "$output" | cat -v
+            fail=1
+          elif oneline="${output//$'\n'/}"; [ "$oneline" != "${oneline//[[:cntrl:]]/}" ]; then
+            echo '::error::a raw control byte from a tracked path reached the run log'
+            printf '%s\n' "$output" | cat -v
+            fail=1
+          else
+            echo 'ok (1): CR, SOH and DEL in a path are escaped exactly as git C-quotes them'
+          fi
+
           # NUL-SAFETY on the record: two matching files, one with a newline in
           # its name. Two findings, not zero — a regression that stores the NUL
           # file list in a shell variable drops every NUL byte, runs the loop zero
@@ -930,7 +964,7 @@ jobs:
           printf 'see %s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$nul_dir/$nul_name"
           status=0
           output="$(bash .github/lint/check-org-repo-literals.sh --root "$nul_dir" 2>&1)" || status=$?
-          count="$(printf '%s\n' "$output" | grep -c '^unapproved: ')"
+          count="$(printf '%s\n' "$output" | grep -c '^unapproved: ' || true)"
           if [ "$status" -ne 1 ]; then
             echo "::error::the NUL-safety fixture exited $status — expected 1"
             printf '%s\n' "$output"
