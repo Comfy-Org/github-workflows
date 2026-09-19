@@ -507,12 +507,38 @@ class TestSurgicalRewrite(unittest.TestCase):
         self.assertEqual(out.split("\n")[1:], cfg.split("\n")[1:])
 
 
-class TestDuplicateDefaultPool(unittest.TestCase):
-    """Last-wins plus a warning, never a rejection.
+class TestShowInvisible(unittest.TestCase):
+    """`_show_invisible` has to render a token the way the JS `showInvisible` does.
 
-    The parsed result is pinned language-neutrally by the shared corpus; the
-    warning cannot be, because each port emits on its own channel (`::warning::`
-    here, `core.warning` in the JS step), so each side asserts its own.
+    Both warning channels quote the offending token, and a reader comparing a
+    `::warning::` here against a `core.warning` there must see one string.
+    """
+
+    def test_bmp_characters_escape_to_four_lower_case_hex_digits(self):
+        self.assertEqual(gen._show_invisible("a\u00a0b\ufeff"), "a\\u00a0b\\ufeff")
+
+    def test_printable_ascii_is_left_alone(self):
+        self.assertEqual(gen._show_invisible(" !~%"), " !~%")
+
+    def test_astral_characters_escape_as_a_surrogate_pair(self):
+        # JS's regex has no `u` flag, so it walks UTF-16 code units and renders U+1F600
+        # as `\ud83d\ude00`. A plain `"\\u%04x" % ord(c)` renders `\u1f600` — five
+        # digits, which is not a valid `\u` escape at all and reads ambiguously as
+        # `\u1f60` followed by `0`. Emoji reach this via a stray line or a configured
+        # login, both of which the helper escapes whole.
+        self.assertEqual(gen._show_invisible("\U0001f600"), "\\ud83d\\ude00")
+        self.assertEqual(gen._show_invisible("\U0010ffff"), "\\udbff\\udfff")
+
+
+class TestParserWarnings(unittest.TestCase):
+    """Both parser diagnostics: a duplicate `default_pool:` (last-wins) and a
+    column-0 line that is neither key (it ends the block above it). Warnings,
+    never rejections — a drift generator must not hard-fail on a malformed map.
+
+    Every parsed result here is pinned language-neutrally by the shared corpus;
+    the warnings cannot be, because each port emits on its own channel
+    (`::warning::` here, `core.warning` in the JS step), so each side asserts
+    its own. assignment.test.cjs mirrors each case below.
     """
 
     def parse(self, text):
@@ -526,6 +552,168 @@ class TestDuplicateDefaultPool(unittest.TestCase):
         self.assertEqual(config["default_pool"], ["bob"])
         self.assertEqual(out.count("::warning::"), 1)
         self.assertIn("duplicate top-level default_pool: key", out)
+
+    def test_nbsp_line_ending_default_pool_warns_once(self):
+        # U+00A0 stays ESCAPED here, as everywhere in this repo: a literal would be
+        # invisible in review, and an editor or lint that normalised it away would
+        # make this test silently vacuous rather than red.
+        config, _locs, out = self.parse("default_pool:\n  - alice\n\u00a0\n  - bob\n")
+        self.assertEqual(config["default_pool"], ["alice"])
+        self.assertEqual(out.count("::warning::"), 1)
+        self.assertIn("line 3 is not a recognised top-level key (\\u00a0)", out)
+        # The literal `U+00A0` in the message's own prose is what makes the character
+        # searchable for a reader who does not think in `\u` escapes.
+        self.assertIn("U+00A0", out)
+
+    def test_nbsp_line_ending_rules_warns_once(self):
+        config, _locs, out = self.parse(
+            "rules:\n  - paths: ['a/**']\n    reviewers: [alice]\n"
+            "\u00a0\n  - paths: ['b/**']\n    reviewers: [bob]\n")
+        self.assertEqual(len(config["rules"]), 1)
+        self.assertEqual(out.count("::warning::"), 1)
+        self.assertIn("line 4 is not a recognised top-level key (\\u00a0)", out)
+
+    def test_indented_nbsp_line_is_silent(self):
+        # The negative control, and the one that keeps the warning useful: the orphaned
+        # `- bob` tail below a REAL truncation falls through the same way, and warning
+        # once per orphan would bury the single terminator that explains them all.
+        config, _locs, out = self.parse("default_pool:\n  - alice\n  \u00a0\n  - bob\n")
+        self.assertEqual(config["default_pool"], ["alice", "bob"])
+        self.assertNotIn("::warning::", out)
+
+    def test_unknown_top_level_key_warns_once(self):
+        # The key-SHAPED variant: nothing invisible, same silent truncation before this.
+        config, _locs, out = self.parse("default_pool:\n  - alice\nowners:\n  - bob\n")
+        self.assertEqual(config["default_pool"], ["alice"])
+        self.assertEqual(out.count("::warning::"), 1)
+        self.assertIn("line 3 is not a recognised top-level key (owners:)", out)
+
+    def test_warnings_name_the_configured_path_when_given(self):
+        # `reviewer_config_path` is a caller input, so neither warning may hardcode
+        # `reviewers.yml` — a caller that configured another name would be sent to look
+        # at a file its repo does not have. Without a path the prefix is simply absent,
+        # never a literal `None:`; the JS port asserts the same two shapes.
+        # The second `default_pool:` is the BLOCK form on purpose: `owners:` only warns
+        # because it terminates an open block, so the flow form would make this test
+        # assert one warning while claiming to assert two.
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            gen.parse_reviewer_config(
+                "default_pool: [alice]\ndefault_pool:\n  - bob\nowners:\n",
+                ".github/owners.yml")
+        lines = [l for l in buf.getvalue().splitlines() if l]
+        self.assertEqual(len(lines), 2)
+        for line in lines:
+            self.assertTrue(line.startswith("::warning::.github/owners.yml: "), line)
+        self.assertNotIn("None", self.parse("default_pool:\n  - alice\nowners:\n  - bob\n")[2])
+
+    # --- what the warning deliberately stays SILENT about -------------------------
+    # Warning on EVERY column-0 fallthrough both overclaimed and flooded, so these six
+    # are the negative half of the diagnostic and each one is a shape a real config has.
+
+    def test_document_markers_are_silent(self):
+        # yamllint's default `document-start` rule REQUIRES the leading `---`, so a
+        # conformant reviewers.yml has one; `...` even TERMINATES the `rules:` block, so
+        # without the carve-out a well-formed config warns on every scheduled run.
+        config, _locs, out = self.parse(
+            "---\ndefault_pool:\n  - alice\nrules:\n  - paths: ['a/**']\n"
+            "    reviewers: [bob]\n...\n")
+        self.assertEqual(config["default_pool"], ["alice"])
+        self.assertEqual(len(config["rules"]), 1)
+        self.assertNotIn("::warning::", out)
+
+    def test_metadata_key_before_any_block_is_silent(self):
+        # No block is open yet, so nothing is ended and nothing is dropped — the old
+        # message asserted both. The nested `default_pool:` decoy is still ignored.
+        config, _locs, out = self.parse(
+            "version: 1\nnotes:\n  default_pool: [mallory]\ndefault_pool: [alice]\n")
+        self.assertEqual(config["default_pool"], ["alice"])
+        self.assertNotIn("::warning::", out)
+
+    def test_zero_indented_block_sequence_warns_once_not_per_item(self):
+        # `default_pool:` followed by a COLUMN-0 sequence is valid YAML and common, and
+        # every item used to draw its own annotation — five here, ten in a real pool,
+        # against GitHub's ~10-per-step budget. Only the first ends the block; the rest
+        # end nothing, so they are silent and the one warning that explains the empty
+        # pool is not buried.
+        config, _locs, out = self.parse(
+            "default_pool:\n- alice\n- bob\n- carol\n- dave\n- eve\n")
+        self.assertEqual(config["default_pool"], [])
+        self.assertEqual(out.count("::warning::"), 1)
+        self.assertIn("line 2 is not a recognised top-level key (- alice)", out)
+
+    def test_non_yaml_file_is_silent(self):
+        # A `reviewer_config_path` aimed at prose opens no block, so it warns not at all
+        # rather than once per line. The empty parse is the diagnostic there.
+        config, _locs, out = self.parse(
+            "Some prose here.\nAnother line.\nAnd another.\nYet more.\n")
+        self.assertEqual(config, {"default_pool": [], "rules": []})
+        self.assertNotIn("::warning::", out)
+
+    # --- near misses: a line that NAMES a supported key without opening it ---------
+
+    def test_invisible_prefix_before_a_key_warns_as_a_near_miss(self):
+        # The stray character is not indentation, so the key reads as column 0, falls
+        # through, and its whole block is never read — while the line looks perfect in an
+        # editor. No block was open, so the terminator arm would have stayed silent here;
+        # this arm is what keeps the two BOM/NEL corpus cases annotated.
+        # U+0085, not U+FEFF: a SINGLE leading BOM is legal YAML and the parser strips
+        # it, so a one-BOM document parses fine and must stay silent. It takes a second
+        # BOM (the corpus case) or a character nothing strips to reach this arm.
+        config, _locs, out = self.parse("\u0085default_pool: [alice]\nrules:\n")
+        self.assertEqual(config["default_pool"], [])
+        self.assertEqual(out.count("::warning::"), 1)
+        self.assertIn(
+            "line 1 is not a recognised top-level key (\\u0085default_pool: [alice]) "
+            "— it is not the supported `default_pool:` key", out)
+        # The negative control the line above depends on.
+        self.assertNotIn("::warning::", self.parse("\ufeffdefault_pool: [alice]\n")[2])
+
+    def test_prefix_sharing_key_is_not_honoured_and_warns(self):
+        # `yaml.safe_load("rules:v2:\\n  - paths: [a]")` is `{"rules:v2": [...]}` — a key
+        # NAMED `rules:v2`, not `rules`. The old `startswith` claimed it and parsed its
+        # children as live routing rules, so an unsupported key was silently HONOURED.
+        config, _locs, out = self.parse("rules:v2:\n  - paths: ['a/**']\n    reviewers: [alice]\n")
+        self.assertEqual(config["rules"], [])
+        self.assertEqual(out.count("::warning::"), 1)
+        self.assertIn("it is not the supported `rules:` key", out)
+
+    def test_no_space_after_the_colon_is_not_a_key(self):
+        # `yaml.safe_load("default_pool:[alice]")` is the STRING `default_pool:[alice]`:
+        # YAML reads `key:` as a mapping only with s-white or a line end after the colon.
+        config, _locs, out = self.parse("default_pool:[alice]\n")
+        self.assertEqual(config["default_pool"], [])
+        self.assertEqual(out.count("::warning::"), 1)
+        self.assertIn("it is not the supported `default_pool:` key", out)
+
+    # --- the annotation has to survive the runner ---------------------------------
+
+    def test_workflow_command_characters_are_escaped(self):
+        # `::warning::` is built by hand here, and the runner DECODES `%25`/`%0D`/`%0A`
+        # out of the message: an unescaped `%` in a config token (printable ASCII, so
+        # `_show_invisible` leaves it) is decoded into a mangled multi-line annotation,
+        # and a newline in the caller-configured path can start a SECOND runner command.
+        # `core.warning` does exactly this for the JS port, so this is also the parity.
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            gen.parse_reviewer_config(
+                "default_pool:\n  - alice\n100%0Adone\n  - bob\n", "a\nb.yml")
+        out = buf.getvalue()
+        self.assertEqual(len(out.splitlines()), 1)
+        self.assertIn("a%0Ab.yml: ", out)
+        self.assertIn("(100%250Adone)", out)
+
+    def test_live_consumer_config_shape_is_silent(self):
+        # The acceptance shape every live consumer config has: only `default_pool:`,
+        # `rules:`, comments and blank lines at column 0. A warning here would fire on
+        # every scheduled drift run and train people to ignore the annotation.
+        _config, _locs, out = self.parse(
+            "# a leading comment\n\n"
+            "default_pool:\n  - alice\n  - bob\n\n"
+            "# a comment between blocks\n\n"
+            "rules:\n  - paths: ['a/**']\n    reviewers: [alice]\n\n"
+            "  # an indented comment\n  - paths: ['b/**']\n    reviewers: [bob]\n")
+        self.assertNotIn("::warning::", out)
 
     def test_empty_first_list_still_warns(self):
         # Keyed on "the key was seen", not on "the list is non-empty" — an
@@ -1338,10 +1526,50 @@ class TestSharedParserCorpus(unittest.TestCase):
             with self.subTest(case["name"]):
                 # stdout is swallowed only so the duplicate-key cases do not
                 # emit `::warning::` annotations from a passing test job; the
-                # warning itself is asserted by TestDuplicateDefaultPool.
+                # warning itself is asserted by TestParserWarnings.
                 with contextlib.redirect_stdout(io.StringIO()):
                     config, _locations = gen.parse_reviewer_config(case["text"])
                 self.assertEqual(config, case["expected"])
+
+    # Every corpus case that emits a `::warning::`, with its count. The point of an
+    # EXHAUSTIVE table rather than per-case assertions is the silence: a regression
+    # that made the unrecognised-key warning fire on ordinary blank lines, comment
+    # lines or indented list items would warn on nearly every case here and nothing
+    # else in either suite would notice. The JS port carries the same table.
+    #
+    # Read it in both directions. The entries that are PRESENT and non-obvious are the
+    # second-BOM and leading-NEL cases: each is a document whose FIRST line is an
+    # unrecognised key precisely because the stray character is not indentation, which
+    # is the failure those two cases exist to pin, now with an annotation on it (they
+    # reach the near-miss arm, not the terminator arm — no block is open on line 1).
+    # The entries that are ABSENT matter just as much: `indented decoys and unknown
+    # top-level keys are ignored` is silent because a `version:`/`notes:` key before
+    # the first block ends nothing and drops nothing, and `YAML document markers are
+    # not unrecognised keys` is silent because `---`/`...` are syntax. Both used to
+    # warn, on documents whose expected parse right here is complete.
+    CORPUS_WARNINGS = {
+        "duplicate default_pool, flow then block": 1,
+        "duplicate default_pool, block then flow": 1,
+        "duplicate default_pool, second one empty": 1,
+        "two leading BOMs: only one is stripped": 1,
+        "U+0085 before a top-level key is not indentation": 1,
+        "a U+00A0-only line at column 0 ends a default_pool block on both ports": 1,
+        "a U+00A0-only line at column 0 drops every later rule on both ports": 1,
+        "an unknown top-level key at column 0 ends the block": 1,
+        "a key sharing a prefix with `rules:` is not the `rules:` key": 1,
+        "no space after the colon is a plain scalar, not a key": 1,
+    }
+
+    def test_config_case_warnings_are_exactly_the_expected_set(self):
+        counts = {}
+        for case in self.corpus["configs"]:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                gen.parse_reviewer_config(case["text"])
+            n = buf.getvalue().count("::warning::")
+            if n:
+                counts[case["name"]] = n
+        self.assertEqual(counts, self.CORPUS_WARNINGS)
 
     def test_glob_cases(self):
         for entry in self.corpus["globs"]:
