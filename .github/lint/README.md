@@ -21,17 +21,18 @@ escaped: a line number is always digits, so a non-numeric field means the
 `file:line:match` record did not parse and the run refuses it (exit `2`). The
 record's **shape** is checked too — after the boundary drop the match must still
 begin with the org prefix — because a numeric line field does not prove the split
-landed where it appears to. Both fire on a tracked path containing a newline on
-the `grep -r` **fallback** path, which prints paths raw: one hit can arrive as
-two records, and the leading fragment would otherwise be reported as a literal
-cut out of a filename against a path that does not exist. This is **best-effort,
-not a closed class** (limitation 12): a fabricated fragment that happens to look
-like a well-formed record — digits+colon, or an `@<org>/...`/`<org>/...`
-fragment at column 0 — passes both tests undetected, and no test on a record's
-content can tell it from a real one. The **git** path has no split — `git grep`
-C-quotes newline, tab, `\` and `"` in a path whatever `core.quotePath` says (that
-governs only bytes ≥ 0x80) — so there such a file is one record, a real finding
-with a C-quoted location.
+landed where it appears to. Both are cheap parse invariants on a record shape both
+scan paths guarantee, not a defence against a path: a control byte, `\` or `"` in a
+tracked path is reported as **one** finding with a **C-quoted location** on both scan
+paths. `git grep` C-quotes those bytes in a path whatever `core.quotePath` says (that
+governs only bytes ≥ 0x80), and the `grep -r` **fallback** now enumerates the matching
+files NUL-delimited and scans each on stdin under a `--label` it C-quotes the same way
+— git's `quote_c_style` exactly, down to `\r` for the control bytes git names and
+three-digit octal (`\001`, `\177`) for the ones it does not. So a path holding a
+newline arrives as one record on either path, never split into a fabricated fragment
+reported against a file that does not exist, and no raw control byte from a tracked
+path reaches the public run log. The two paths give identical locations for the same
+tree.
 
 The org segment has to **start a token**, so `Not<org>/whatever` — a different
 owner whose name happens to end in ours — is not a reference to this org and is
@@ -184,14 +185,6 @@ in the same order, except limitation 5 (*this lint is one category of
   Documented rather than capped — this tree's largest tracked file is under 600
   lines, and capping the scan would trade an unreachable timeout for a truncated
   count, the one number a red run's summary turns on.
-- **The newline-in-a-path refusals are best-effort**, on the `grep -r`
-  **fallback** path only (a git work tree does not have this hole). A
-  fabricated record that happens to look well-formed — digits+colon, or an
-  `@<org>/...`/`<org>/...` fragment at column 0 — passes every content test
-  and is reported against a path that does not exist. No test on a record's
-  content can tell it from a real one; closing it needs the fallback path to
-  stop putting an untrusted path into the same stream it parses records out
-  of (enumerate files NUL-delimited and scan each one separately).
 
 ## Running it
 
