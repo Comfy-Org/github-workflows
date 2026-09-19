@@ -386,10 +386,10 @@ env:
   # Cursor release never breaks this; the pin moves only via a reviewed PR.
   # Consumed by .github/cursor-review/install-cursor-cli.sh, the ONE installer
   # all three CLI-using jobs run (preflight, review matrix, consolidate).
-  CURSOR_CLI_VERSION: 2026.09.02-c22c1a3
+  CURSOR_CLI_VERSION: 2026.09.10-fd3934a
   # sha256 of the linux/x64 agent-cli-package.tar.gz (all jobs run ubuntu-latest).
   # Cross-checked against nixpkgs pkgs/by-name/cu/cursor-cli at pin time.
-  CURSOR_CLI_SHA256: b73b59854762535c0fc20d7ccc51c3b5a356a851491088d60a362be48750f53c
+  CURSOR_CLI_SHA256: 27997c8391ad853a5a732b1845db8ef82a8ba6afb0f7829cc739464f8966e96e
 
 jobs:
   gate:
