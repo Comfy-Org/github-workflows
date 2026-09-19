@@ -754,6 +754,16 @@ jobs:
       # so calling it "after generated-file exclusion" would send an author
       # hunting for a lockfile that was, in fact, counted.
       degraded: ${{ steps.check.outputs.degraded }}
+      # Whether the incremental "hunks new since last round" block really was
+      # the subset of the reviewed diff the prompt calls it (BE-15558).
+      # `true` both when the block passed the fail-safe and when there is no
+      # block at all (round 1, an unresolvable last-reviewed SHA, an over-cap
+      # run where this step never ran) — in none of those cases was anything
+      # dropped. `false` ONLY when the fail-safe fired and discarded a block
+      # that had been built, which is the one case a panel-integrity signal
+      # should report. Written with `!= 'false'` rather than read straight
+      # through so the skipped-step empty string reads as `true`, not `''`.
+      incremental_subset: ${{ steps.incremental.outputs.incremental_subset != 'false' }}
     steps:
       - name: Checkout PR head
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -954,21 +964,121 @@ jobs:
         # ride the same shared artifact instead of every consumer re-deriving it.
         # Best-effort: an unresolvable SHA (force-push, base-branch rewrite)
         # simply produces no incremental block.
+        #
+        # It is built by DIFFING TWO PR PATCHES, never a commit range (BE-15558).
+        # `git diff LAST_REVIEWED...HEAD` looks like the obvious formulation and
+        # is wrong: when HEAD is a merge commit that pulled the base branch into
+        # the branch, LAST is an ancestor of HEAD, the merge base of the two IS
+        # LAST, and the range therefore contains every commit that merge brought
+        # in. Measured on a consumer repo, one round built a 9,800-line block
+        # against a 1,234-line reviewed diff (119 of its 133 files outside the
+        # PR) and two PRs built ~1.16M-line blocks; the prompt went from ~98 KB
+        # to ~826 KB, most legs timed out, and the legs that finished reviewed
+        # files from the base branch rather than the PR. Both patches here are
+        # three-dot diffs against the base, so each carries only the branch's
+        # own changes and neither can name a base-branch commit.
+        #
+        # NEW is `pr-diff.patch` ITSELF — the diff this round is actually
+        # reviewing — not a freshly-computed BASE...HEAD diff. Every emitted
+        # section is then a verbatim slice of the reviewed diff, so the subset
+        # property the prompt asserts holds by construction, and a generated
+        # file the classifier stripped from the reviewed diff can never reappear
+        # in the block (which would trip the fail-safe and discard the lot).
+        #
+        # The two patches can resolve to DIFFERENT merge bases — OLD to
+        # merge-base(BASE, LAST), NEW to merge-base(BASE, HEAD) — when the round
+        # merged or rebased the base branch in. A file the base branch AND the
+        # branch both touched then reads as changed even if the author's own
+        # edit did not move. That is over-inclusion strictly WITHIN the PR's own
+        # files, which costs a little prompt budget and never breaks the subset
+        # property; the alternative (pinning both to one merge base) would hide
+        # a hunk whose surrounding code really did change under it.
+        id: incremental
         if: steps.check.outputs.over_cap != 'true'
         env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           LAST_REVIEWED_SHA: ${{ needs.ledger.outputs.last_reviewed_sha }}
           LEDGER_ROUNDS: ${{ needs.ledger.outputs.rounds }}
         run: |
-          : > "${RUNNER_TEMP}/pr-diff-new.patch"
-          if [ -n "$LAST_REVIEWED_SHA" ] && [ "$LAST_REVIEWED_SHA" != "$HEAD_SHA" ] \
-             && git cat-file -e "${LAST_REVIEWED_SHA}^{commit}" 2>/dev/null; then
+          NEW_PATCH="${RUNNER_TEMP}/pr-diff-new.patch"
+          OLD_PATCH="${RUNNER_TEMP}/pr-diff-old.patch"
+          FULL_PATCH="${RUNNER_TEMP}/pr-diff.patch"
+          # The helper comes from the pinned checkout of THIS repo (same one the
+          # classifier was built from), never the PR checkout — a PR must not be
+          # able to rewrite the logic that decides what the panel is shown.
+          INCREMENTAL_PY="_pr_size_tool/.github/cursor-review/incremental-diff.py"
+          : > "$NEW_PATCH"
+          # An OLD patch larger than this is declined rather than parsed. NEW is
+          # bounded by diff_size_cap; OLD is NOT — `git diff BASE...LAST` keeps
+          # the generated-file sections the classifier strips out of the
+          # reviewed diff, and those cost nothing against that cap — so a PR
+          # comfortably under the review cap can still hand this step a patch
+          # big enough to burn the runner's memory on. Declining fails closed to
+          # "no block", the same as every other case below.
+          OLD_PATCH_MAX_BYTES=33554432   # 32 MiB
+          # Wrapped in a function so the shellcheck directive sits in front of a
+          # complete command — it is rejected in front of an `elif` branch.
+          build_old_patch() {
+            # core.quotePath=false to match check-pr-size's `writeReviewedDiff`,
+            # which builds the NEW side. Under the default (quoting ON) a
+            # non-ASCII path arrives C-quoted here and PLAIN there, so the two
+            # sides key differently and every such file is re-emitted in full on
+            # every round — including a pure rebase.
+            # $DIFF_EXCLUDES is intentionally unquoted so bash word-splits it
+            # into pathspec args.
             # shellcheck disable=SC2086
-            git diff "${LAST_REVIEWED_SHA}...${HEAD_SHA}" -- . $DIFF_EXCLUDES \
-              > "${RUNNER_TEMP}/pr-diff-new.patch" || : > "${RUNNER_TEMP}/pr-diff-new.patch"
-            echo "Incremental diff since round ${LEDGER_ROUNDS:-?} (${LAST_REVIEWED_SHA}): $(wc -l < "${RUNNER_TEMP}/pr-diff-new.patch") lines"
-          else
+            git -c core.quotePath=false diff "${BASE_SHA}...${LAST_REVIEWED_SHA}" -- . $DIFF_EXCLUDES > "$OLD_PATCH"
+          }
+          # Default the output to the honest "nothing was discarded" value, and
+          # let the fail-safe below append 'false' over it — same last-value-wins
+          # append the raw-count fallback above uses.
+          echo "incremental_subset=true" >> "$GITHUB_OUTPUT"
+          # Every "can't build one" case below leaves the block EMPTY and
+          # `incremental_subset` true: nothing was discarded, there was simply
+          # nothing to prioritize, and the panel reviews the full diff as it
+          # does on round 1. Only the fail-safe at the bottom writes `false`.
+          if [ -z "$LAST_REVIEWED_SHA" ] || [ "$LAST_REVIEWED_SHA" = "$HEAD_SHA" ]; then
             echo "No usable last-reviewed SHA — skipping the incremental diff block."
+          elif ! git cat-file -e "${LAST_REVIEWED_SHA}^{commit}" 2>/dev/null; then
+            echo "Last-reviewed SHA ${LAST_REVIEWED_SHA} is unreachable (force-push or base-branch rewrite) — skipping the incremental diff block."
+          elif [ ! -s "$FULL_PATCH" ]; then
+            echo "The reviewed diff is empty — skipping the incremental diff block."
+          elif ! build_old_patch || [ ! -s "$OLD_PATCH" ]; then
+            # Fail CLOSED to "no block" — for a FAILED build and an EMPTY one
+            # alike. Falling through with an empty OLD would make every file
+            # read as new and emit the whole reviewed diff a second time: a
+            # doubled prompt that prioritizes nothing, which the fail-safe
+            # below cannot catch either (nothing is foreign, and new_lines
+            # EQUALS full_lines rather than exceeding it). An empty OLD is not
+            # an error git reports — it is simply what `BASE...LAST` yields
+            # whenever merge-base(BASE, LAST) is LAST itself (the base advanced
+            # past the last-reviewed commit, e.g. after a retarget), or
+            # whenever $DIFF_EXCLUDES filters every file out.
+            echo "Could not build a non-empty last-reviewed patch (${LAST_REVIEWED_SHA}) — skipping the incremental diff block."
+          elif [ "$(wc -c < "$OLD_PATCH")" -gt "$OLD_PATCH_MAX_BYTES" ]; then
+            echo "The last-reviewed patch is larger than ${OLD_PATCH_MAX_BYTES} bytes — skipping the incremental diff block rather than parsing it."
+          elif ! python3 "$INCREMENTAL_PY" build \
+                 --old "$OLD_PATCH" --new "$FULL_PATCH" --out "$NEW_PATCH"; then
+            echo "::warning::Could not build the incremental diff block — the panel will run on the full reviewed diff alone."
+            : > "$NEW_PATCH"
+          else
+            echo "Incremental diff since round ${LEDGER_ROUNDS:-?} (${LAST_REVIEWED_SHA}): $(wc -l < "$NEW_PATCH") lines"
+            # Fail-safe. The prompt tells the panel this block "is the subset of
+            # the diff above", so VERIFY it rather than trusting the builder:
+            # any path the reviewed diff does not carry, or more lines than the
+            # reviewed diff, and the block is discarded whole. The panel then
+            # runs on the full diff alone, which is always correct.
+            if SUBSET_OUT="$(python3 "$INCREMENTAL_PY" check --new "$NEW_PATCH" --full "$FULL_PATCH")"; then
+              echo "Incremental block verified as a subset of the reviewed diff."
+            else
+              FOREIGN="$(printf '%s\n' "$SUBSET_OUT" | sed -n 's/^foreign=//p')"
+              NEW_LINES="$(printf '%s\n' "$SUBSET_OUT" | sed -n 's/^new_lines=//p')"
+              FULL_LINES="$(printf '%s\n' "$SUBSET_OUT" | sed -n 's/^full_lines=//p')"
+              : > "$NEW_PATCH"
+              echo "::warning::Incremental diff discarded: it was not a subset of the reviewed diff (${FOREIGN:-unknown} foreign file(s), ${NEW_LINES:-unknown} vs ${FULL_LINES:-unknown} lines)."
+              echo "incremental_subset=false" >> "$GITHUB_OUTPUT"
+            fi
           fi
 
       - name: Upload reviewed diff
