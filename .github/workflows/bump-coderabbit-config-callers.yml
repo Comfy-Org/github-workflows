@@ -62,12 +62,14 @@ on:
       - .github/coderabbit-config/**
       # …but the tests and the README under that dir are NOT part of what a
       # pinned caller executes, so a test-only or docs-only commit would mint the
-      # org-wide bot token, force-reset the stable ci/bump-coderabbit-config
-      # branch and fan a pure-churn SHA-bump PR (identical consumer behavior, a
-      # review round in every caller repo) across the whole fleet. Exclude them so
-      # a bump PR keeps meaning "consumer-visible behavior changed". Negations only
-      # strip the paths they match: a commit touching check_coderabbit_config.py
-      # AND its test still matches the positive pattern and still bumps.
+      # org-wide bot token, force-reset the stable branch
+      # ci/bump-coderabbit-config-validate (the TAG below is
+      # `coderabbit-config-validate`, not `coderabbit-config`) and fan a pure-churn
+      # SHA-bump PR (identical consumer behavior, a review round in every caller
+      # repo) across the whole fleet. Exclude them so a bump PR keeps meaning
+      # "consumer-visible behavior changed". Negations only strip the paths they
+      # match: a commit touching check_coderabbit_config.py AND its test still
+      # matches the positive pattern and still bumps.
       - '!.github/coderabbit-config/tests/**'
       - '!.github/coderabbit-config/README.md'
 

@@ -283,11 +283,11 @@ trigger is covered by the comparison — for `agents-md-integrity`
 (`.github/agents-md-integrity/**`), `cursor-review` (`.github/cursor-review/**`),
 `groom` (`.github/groom/**`) and `pr-size` (`scripts/check-pr-size/**`) that
 includes the asset directory the reusable loads its prompts/scripts/briefs from at
-run time. (Every fleet whose filter also carries `:(exclude)` entries —
-`pr-risk`, `pr-derisk`, `pr-size`, `cursor-review`, and since this change
-`agents-md-integrity`, `coderabbit-config` and `groom` — has a comparison that
-`WATCHED_ASSETS` cannot express, so its comparison is `WATCHED_PATHSPECS`; it
-still *sets* `WATCHED_ASSETS`, for a different reason; see the note below.)
+run time. (Every fleet whose `paths:` filter *also* carries a `!` exclusion — read
+the "Triggers on" column of the table above rather than a list here, which is what
+went stale last time — has a comparison that `WATCHED_ASSETS` cannot express, so
+its comparison is `WATCHED_PATHSPECS`; it still *sets* `WATCHED_ASSETS`, for a
+different reason; see the note below.)
 Compare `WATCHED` alone on one of those and a commit touching
 only the assets reads as "unchanged", so callers get pinned to a tip whose other
 relevant content was never verified. Read the entrypoint's
