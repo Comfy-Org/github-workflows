@@ -143,7 +143,26 @@ preflight() {
 	fi
 
 	if ! command -v bwrap >/dev/null 2>&1; then
-		sudo apt-get install -y bubblewrap >&2
+		# `apt-get update` FIRST, every time. The runner image ships an apt index
+		# frozen at image-build time, and noble-updates supersedes packages
+		# between image rebuilds: installing against the stale index asks the
+		# pool for a .deb version that has since been withdrawn, so EVERY mirror
+		# answers 404 and the install fails with a perfectly good package
+		# sitting there under a newer version. Observed 2026-09-19 — the same
+		# image (ubuntu-24.04 20260907.300.1) that installed
+		# bubblewrap 0.9.0-1ubuntu0.1 fine the day before 404'd on it across the
+		# azure, archive and security mirrors, failing the sweep at preflight.
+		#
+		# Both halves tolerate failure so the verdict stays with the selftest
+		# below rather than with apt's exit code: a transient index refresh
+		# failure must not skip an install the on-image cache can still satisfy,
+		# and a failed install must not abort the script before the AppArmor and
+		# sysctl fallbacks — preflight() is called bare (errexit live) on the
+		# agent path and as `preflight || exit $?` on the --preflight-only path,
+		# so without these an apt failure would exit 100 with no `::error::` on
+		# one path and reach the fail-loud on the other.
+		sudo apt-get update >&2 || true
+		sudo apt-get install -y bubblewrap >&2 || true
 	fi
 
 	local restrict=/proc/sys/kernel/apparmor_restrict_unprivileged_userns

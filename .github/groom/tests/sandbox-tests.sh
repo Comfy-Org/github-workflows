@@ -483,6 +483,47 @@ if PATH="$failbin:$PATH" "$SANDBOX" --preflight-only >/dev/null 2>&1; then
 fi
 pass "--preflight-only fails loud when the sandbox self-test cannot pass"
 
+# 8c. With bwrap MISSING, the bring-up must refresh the apt index BEFORE it
+# installs bubblewrap. The runner image carries an apt index frozen at image
+# build time while noble-updates keeps superseding packages, so an install
+# against that stale index asks the pool for a withdrawn .deb version, 404s on
+# every mirror, and kills the whole sweep at preflight with a working package one
+# `apt-get update` away (observed 2026-09-19 on ubuntu-24.04 20260907.300.1,
+# bubblewrap 0.9.0-1ubuntu0.1 — installed fine the day before).
+#
+# PATH is the stub dir ALONE, holding only a `sudo` that logs its argv and
+# succeeds plus symlinks to the two binaries the bring-up itself needs (`bash`,
+# which the `#!/usr/bin/env bash` shebang resolves through PATH, and `cat`). That
+# is what makes bwrap unfindable, so preflight takes the install branch; nothing
+# is really installed, so it still fails loud at the end.
+aptbin="$work/aptbin"
+mkdir -p "$aptbin"
+cat > "$aptbin/sudo" <<'STUB'
+#!/bin/sh
+echo "$@" >> "$SUDO_LOG"
+exit 0
+STUB
+chmod +x "$aptbin/sudo"
+ln -s "$(command -v bash)" "$aptbin/bash"
+ln -s "$(command -v cat)" "$aptbin/cat"
+export SUDO_LOG="$work/sudo-argv.log"
+: > "$SUDO_LOG"
+if PATH="$aptbin" "$SANDBOX" --preflight-only >/dev/null 2>&1; then
+	fail "--preflight-only exited 0 with no bwrap and a no-op sudo (nothing was installed, so it must fail loud)"
+fi
+apt_update_line="$(grep -n -m1 '^apt-get update' "$SUDO_LOG" | cut -d: -f1 || true)"
+apt_install_line="$(grep -n -m1 '^apt-get install' "$SUDO_LOG" | cut -d: -f1 || true)"
+if [[ -z "$apt_install_line" ]]; then
+	fail "preflight never attempted the bubblewrap install with bwrap absent from PATH"
+fi
+if [[ -z "$apt_update_line" ]]; then
+	fail "preflight installed bubblewrap without refreshing the apt index first — a stale runner index 404s the .deb"
+fi
+if (( apt_update_line >= apt_install_line )); then
+	fail "preflight ran \`apt-get update\` AFTER the install — the install still resolves against the stale index"
+fi
+pass "preflight refreshes the apt index before installing bubblewrap (and still fails loud when it cannot)"
+
 # --- 9. --validate-only: the pre-exec guards, off the billed step (BE-14771) --
 # The groom jobs run this in the SAME separate "Preflight the sandbox" step as
 # --preflight-only. Everything the wrapper checks before `exec bwrap` is no-spend

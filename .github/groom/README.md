@@ -836,8 +836,9 @@ agent step dies instead of becoming a green no-op that runs no agent.
 `preflight()` takes its idempotent fast path), and the sole remaining side effect
 is the `mkdir -p` on the out-dir that the real run performs anyway; the agent
 step's own copies of both are then no-ops. Run standalone on a host where the
-sandbox is *not* yet usable, the same call will `sudo apt-get install bubblewrap`,
-write `/etc/apparmor.d/bwrap`, and as a last resort `sudo sysctl -w
+sandbox is *not* yet usable, the same call will `sudo apt-get update` and then
+`sudo apt-get install bubblewrap`, write `/etc/apparmor.d/bwrap`, and as a last
+resort `sudo sysctl -w
 kernel.apparmor_restrict_unprivileged_userns=0` — the bring-up's host-wide
 mutations, from a mode named for validation. Pair it with `--preflight-only`, as
 groom.yml does, or expect the bring-up.
