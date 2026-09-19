@@ -143,6 +143,14 @@ preflight() {
 	fi
 
 	if ! command -v bwrap >/dev/null 2>&1; then
+		# Refresh the package index FIRST. The runner image ships a cached package
+		# list that the Ubuntu pool eventually outruns, and apt then 404s fetching
+		# the exact superseded version it still believes in — a failure that has
+		# nothing to do with whether this runner can sandbox, but which reaches the
+		# caller as the fail-loud "sandbox unavailable" verdict below. `|| true`
+		# because a flaky mirror during the refresh is survivable; the install is
+		# the step that must still fail loud.
+		sudo apt-get update >&2 || true
 		sudo apt-get install -y bubblewrap >&2
 	fi
 

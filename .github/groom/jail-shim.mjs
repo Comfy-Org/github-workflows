@@ -4,7 +4,7 @@
 //   node jail-shim.mjs <port> <socket-path>
 //
 // The sandbox (agent-sandbox.sh) runs the agent in an ISOLATED network namespace
-// with only loopback up and no egress; the key-broker (broker.mjs) is reachable
+// with only loopback up and no egress; the broker (broker.mjs) is reachable
 // only as a unix-domain socket bind-mounted into the jail at /run/broker.sock.
 // Agent tooling that speaks HTTP to a host:port (e.g. an Anthropic base URL) can't
 // dial a unix socket, so this shim listens on jail-local loopback and forwards
