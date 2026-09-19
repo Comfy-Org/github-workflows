@@ -28,6 +28,8 @@ Run: python3 .github/cursor-review/tests/test_workflow_panel_integrity.py
 
 import os
 import re
+import shutil
+import subprocess
 import unittest
 
 WORKFLOW = os.path.normpath(
@@ -575,6 +577,119 @@ class UndecidedRunFailsClosedTest(unittest.TestCase):
         # unlabelled PR is what would get this check un-required again.
         for gate in GATE_CONDITIONS:
             self.assertIn(gate, self.condition, f"`{PANEL_JOB}` lost gate `{gate}`")
+
+
+class FlattenEscapesWorkflowCommandsTest(unittest.TestCase):
+    """`flatten()` must defeat the runner's OWN unescaping, not just newlines.
+
+    The runner unescapes `%25`, `%0D` and `%0A` inside a workflow command's
+    message before rendering it. So deleting real newlines is only half the
+    defence: a value carrying the literal six characters `%0A` arrives here
+    perfectly single-line and the runner puts the newline back, forging the
+    second command `tr -d` was meant to prevent.
+
+    Only `JUDGE_STATUS` can actually carry one today — it is whatever string
+    the judge agent's tool wrote as `status`, unvalidated — but the function is
+    the shared chokepoint for every value the step echoes, so it is pinned
+    here rather than at the one call site that needs it. Every other checker in
+    this repo already escapes `%` before annotating (`check_agents_md.py`,
+    `check_workflow_pins.py`, `check-org-repo-literals.sh`); this is the same
+    escape, and the suite executes the real line rather than pattern-matching
+    it.
+    """
+
+    def setUp(self):
+        self.jobs = split_jobs(read_workflow())
+        self.assertIn(PANEL_JOB, self.jobs, "job splitter lost the panel job")
+        report = step_named(self.jobs[PANEL_JOB], REPORT_STEP)
+        self.assertIsNotNone(report, f"`{REPORT_STEP}` is gone")
+        definitions = [
+            line.strip()
+            for line in code_lines(report)
+            if line.strip().startswith("flatten()")
+        ]
+        self.assertEqual(
+            len(definitions),
+            1,
+            f"expected exactly one `flatten()` definition in `{REPORT_STEP}`, "
+            f"found {len(definitions)}",
+        )
+        self.definition = definitions[0]
+
+    def _flatten(self, value):
+        """Run the workflow's ACTUAL flatten() line against `value`."""
+        bash = shutil.which("bash")
+        self.assertIsNotNone(bash, "bash is required to execute flatten()")
+        script = self.definition + '\nflatten "$1"\n'
+        done = subprocess.run(
+            [bash, "-c", script, "flatten-test", value],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(
+            done.returncode, 0, f"flatten() failed: {done.stderr}"
+        )
+        return done.stdout
+
+    def test_it_escapes_percent_so_the_runner_cannot_re_expand_a_newline(self):
+        # The attack: no real newline anywhere in the input, so `tr -d` is a
+        # no-op, and the runner's unescaping supplies the line break.
+        out = self._flatten("error%0A::stop-commands::tok")
+        self.assertNotIn(
+            "%0A::",
+            out,
+            "flatten() passed a live `%0A` through: the runner unescapes it "
+            "into a real newline and the following `::stop-commands::` becomes "
+            "a genuine workflow command",
+        )
+        self.assertIn(
+            "%250A",
+            out,
+            "flatten() must escape `%` to `%25`, which renders the payload as "
+            "the inert literal text `%0A`",
+        )
+        # The escape must not silently eat the value it is protecting.
+        self.assertTrue(
+            out.startswith("error"), f"flatten() mangled the real status: {out!r}"
+        )
+
+    def test_it_still_strips_real_newlines(self):
+        # The original guarantee, kept: a genuine newline must be DELETED, not
+        # escaped back into one by the runner.
+        out = self._flatten("ok\n::error::forged\r\nmore")
+        self.assertNotIn("\n", out.rstrip("\n"))
+        self.assertNotIn("\r", out)
+        self.assertNotIn("%0A", out)
+        self.assertNotIn("%0D", out)
+
+    def test_it_still_clamps_long_values(self):
+        out = self._flatten("A" * 500).rstrip("\n")
+        self.assertLessEqual(
+            len(out), 64, "flatten() no longer clamps: an agent controls this string"
+        )
+
+    def test_the_clamp_cannot_split_an_escape_it_created(self):
+        # `cut` must run BEFORE the `%` escape. Were it after, a `%25` produced
+        # at the boundary could be truncated to a bare `%2`/`%` — and, worse,
+        # a clamp applied to already-escaped text makes the 64-char budget
+        # depend on attacker-chosen content.
+        out = self._flatten("%" * 100).rstrip("\n")
+        self.assertNotIn("%2\n", out)
+        self.assertEqual(
+            out,
+            "%25" * 64,
+            "each of the 64 clamped `%` must survive as a WHOLE `%25`",
+        )
+
+    def test_every_value_the_step_echoes_goes_through_it(self):
+        # Belt-and-braces against the fix being bypassed rather than reverted:
+        # a future cause that echoes a raw `$VAR` reintroduces the hole even
+        # with flatten() intact. `test_it_flattens_untrusted_values_before_
+        # annotating` pins the same property structurally; this asserts the
+        # definition it relies on is the escaping one.
+        self.assertIn("%25", self.definition, "flatten() no longer escapes `%`")
+        self.assertIn("tr -d", self.definition, "flatten() no longer strips newlines")
 
 
 if __name__ == "__main__":

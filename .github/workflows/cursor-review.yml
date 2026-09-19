@@ -1867,9 +1867,13 @@ jobs:
       ok_count: ${{ steps.aggregate.outputs.ok_count }}
       total: ${{ steps.aggregate.outputs.total }}
       degraded: ${{ steps.consolidated.outputs.degraded }}
-      # Untrusted: written by the judge agent's own tool output. Anything that
-      # consumes it must flatten it before it reaches a ::workflow command::
-      # line — `Panel integrity` does.
+      # Untrusted: this is whatever string the judge agent's own tool wrote as
+      # `status` in /tmp/judge-findings.json, in a job running `cursor-agent
+      # --trust` over PR-authored text. It is neither validated against an enum
+      # nor escaped on the way out. Anything that consumes it must flatten AND
+      # percent-escape it before it reaches a ::workflow command:: line —
+      # stripping newlines alone is not enough, because the runner unescapes
+      # `%0A` back into one. `Panel integrity` does both.
       judge_status: ${{ steps.consolidated.outputs.judge_status }}
     steps:
       - name: Checkout PR repo
@@ -2814,7 +2818,24 @@ jobs:
           # that run `--trust` over PR code. They land in ::workflow command::
           # lines here, where a newline would forge a second command, so flatten
           # and clamp before echoing.
-          flatten() { printf '%s' "$1" | tr -d '\r\n' | cut -c1-64; }
+          #
+          # Escaping `%` is the other half of that, and it is not optional: the
+          # runner UNESCAPES `%25`, `%0D` and `%0A` in a command's message, so
+          # deleting real newlines alone is not enough. A judge that writes its
+          # `status` as `error%0A::stop-commands::x` reaches this line carrying
+          # no newline at all — and the runner puts one back, forging the second
+          # command `tr` was supposed to prevent. `%` -> `%25` turns that into
+          # the inert literal text `%0A`. It is the same escape every checker in
+          # this repo already applies before annotating (`check_agents_md.py`,
+          # `check_workflow_pins.py`, `check-org-repo-literals.sh`), and only
+          # `JUDGE_STATUS` can actually carry a `%` today: the counts are
+          # python-formatted integers and the rest are job results.
+          #
+          # Order is load-bearing at both ends. AFTER `tr`, so a real newline is
+          # dropped rather than escaped back into one by the runner; and AFTER
+          # `cut`, so the clamp can never split a `%25` it just created (`cut`
+          # only ever removes characters, so it cannot forge one either).
+          flatten() { printf '%s' "$1" | tr -d '\r\n' | cut -c1-64 | sed 's/%/%25/g'; }
 
           causes=0
 
