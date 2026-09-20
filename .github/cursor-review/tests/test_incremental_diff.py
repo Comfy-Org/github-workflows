@@ -14,6 +14,13 @@ and a file dropped from the PR contributes nothing.
 with a real merge commit, so it fails against the old commit-range formulation
 rather than only against a hand-written fixture.
 
+`TestRetargetedBase` is the second real repro (BE-15598), for the half the rewrite
+left open: OLD was still `git diff BASE...LAST_REVIEWED`, which re-resolves its merge
+base from the CURRENT base, so a retarget made hunks the panel had never seen read as
+already reviewed and dropped them from the block — under a `check` that passes, since
+a block that is too small is still a subset. OLD is now pinned to the merge base the
+previous round recorded in its own review.
+
 Run: python3 -m unittest discover -s .github/cursor-review/tests -p 'test_*.py'
 """
 
@@ -154,6 +161,134 @@ class TestMergeCommitHead(unittest.TestCase):
         old = self._diff(self.base_sha, self.last_reviewed)
         new = self._diff(self.base_sha, merge_only)
         self.assertEqual(inc.build(old, new), "")
+
+
+# --------------------------------------------------------------------------- #
+# 1b. The second headline case: the PR is RETARGETED between rounds            #
+# --------------------------------------------------------------------------- #
+
+
+class TestRetargetedBase(unittest.TestCase):
+    """A real repo, a real retarget: the OLD side must be pinned, not recomputed.
+
+    `git diff BASE...LAST_REVIEWED` is right only while BASE resolves to the merge base
+    round N actually used. Retarget the PR (or rewrite its base branch) and it does not:
+    the three-dot form silently re-resolves to a DIFFERENT merge base, and everything
+    that entered the branch from the old base now shows up on both sides — so hunks the
+    panel has never seen are subtracted as "already reviewed" and dropped from the
+    block. Nothing downstream catches it: the block is smaller, and a smaller block is
+    still a subset, so `check` passes (BE-15597).
+
+    The repo below is the minimum that reproduces it.
+
+        ROOT ──────────────── release   (B2: the NEW base, after the retarget)
+          └── B1 (main edits lib.py)
+                └── L  (round 1's reviewed head: edits app.py)
+                      └── H  (round 2's head: edits app.py again)
+
+    Round 1 ran with base=B1, so it reviewed `B1...L` — app.py only; the panel has never
+    been shown lib.py. Round 2 retargets onto `release`, so its reviewed diff is
+    `ROOT...H`, which DOES carry lib.py (it came into the branch with the fork point).
+    Rebuilding OLD as `ROOT...L` puts that same lib.py section on both sides.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if shutil.which("git") is None:  # pragma: no cover - CI always has git
+            raise unittest.SkipTest("git not available")
+        cls.repo = tempfile.mkdtemp(prefix="inc-diff-retarget-")
+        repo = cls.repo
+        _git(repo, "init", "-q", "-b", "main")
+        _git(repo, "config", "user.email", "test@example.invalid")
+        _git(repo, "config", "user.name", "Test")
+        _write(repo, "app.py", "one\ntwo\nthree\n")
+        _write(repo, "lib.py", "lib one\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "root")
+        cls.root = _rev(repo, "HEAD")
+
+        # The branch the PR is retargeted ONTO, left at ROOT.
+        _git(repo, "branch", "release")
+
+        # main moves first: it edits lib.py. B1 is round 1's base.
+        _write(repo, "lib.py", "lib one\nlib two from main\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "main edits lib.py")
+        cls.base_round_1 = _rev(repo, "HEAD")
+
+        # The PR forks from B1 and edits app.py. Round 1 reviews exactly this.
+        _git(repo, "checkout", "-q", "-b", "pr")
+        _write(repo, "app.py", "one\nTWO\nthree\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "pr round 1")
+        cls.last_reviewed = _rev(repo, "HEAD")
+
+        # Round 2: the PR is retargeted onto `release` (still ROOT) and gains a commit.
+        _write(repo, "app.py", "one\nTWO\nTHREE\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "pr round 2")
+        cls.head = _rev(repo, "HEAD")
+        cls.base_round_2 = _rev(repo, "release")
+
+        # What round 1 recorded in its own review: merge-base(B1, L) — which is B1.
+        cls.recorded_merge_base = _git(
+            repo, "merge-base", cls.base_round_1, cls.last_reviewed
+        ).strip()
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.repo, ignore_errors=True)
+
+    def _three_dot(self, a, b):
+        return _git(self.repo, "-c", "core.quotePath=false", "diff", f"{a}...{b}", "--", ".")
+
+    def _two_dot(self, a, b):
+        return _git(self.repo, "-c", "core.quotePath=false", "diff", a, b, "--", ".")
+
+    def test_the_retarget_really_moved_the_merge_base(self):
+        """The precondition. Without it the rest of this class proves nothing."""
+        self.assertEqual(self.recorded_merge_base, self.base_round_1)
+        self.assertEqual(
+            _git(self.repo, "merge-base", self.base_round_2, self.head).strip(), self.root
+        )
+        self.assertNotEqual(self.recorded_merge_base, self.root)
+
+    def test_round_one_never_saw_lib_py(self):
+        """It is not in round 1's reviewed diff, so the panel has never been shown it."""
+        self.assertNotIn("lib.py", self._three_dot(self.base_round_1, self.last_reviewed))
+
+    def test_round_two_reviews_it(self):
+        self.assertIn("lib.py", self._three_dot(self.base_round_2, self.head))
+
+    def test_the_old_formulation_drops_a_hunk_the_panel_never_saw(self):
+        """The bug, pinned: OLD rebuilt against the CURRENT base hides lib.py."""
+        old = self._three_dot(self.base_round_2, self.last_reviewed)
+        new = self._three_dot(self.base_round_2, self.head)
+        self.assertNotIn("lib.py", inc.build(old, new))
+
+    def test_and_the_subset_fail_safe_cannot_catch_that(self):
+        """Which is why the fix has to be the pin, not another check: a block that is
+        too SMALL is still a subset of the reviewed diff."""
+        old = self._three_dot(self.base_round_2, self.last_reviewed)
+        new = self._three_dot(self.base_round_2, self.head)
+        foreign, new_lines, full_lines = inc.check(inc.build(old, new), new)
+        self.assertEqual(foreign, 0)
+        self.assertLessEqual(new_lines, full_lines)
+
+    def test_pinning_old_to_the_recorded_merge_base_keeps_it(self):
+        old = self._two_dot(self.recorded_merge_base, self.last_reviewed)
+        new = self._three_dot(self.base_round_2, self.head)
+        block = inc.build(old, new)
+        self.assertIn("lib.py", block)
+        self.assertIn("lib two from main", block)
+        self.assertIn("app.py", block, "this round's own edit is still prioritized")
+
+    def test_the_pinned_block_still_passes_the_fail_safe(self):
+        old = self._two_dot(self.recorded_merge_base, self.last_reviewed)
+        new = self._three_dot(self.base_round_2, self.head)
+        foreign, new_lines, full_lines = inc.check(inc.build(old, new), new)
+        self.assertEqual(foreign, 0)
+        self.assertLessEqual(new_lines, full_lines)
 
 
 # --------------------------------------------------------------------------- #
@@ -635,10 +770,47 @@ class TestWorkflowWiring(unittest.TestCase):
         """It must match the NEW side, which check-pr-size builds with
         `-c core.quotePath=false`; under the default a non-ASCII path arrives
         C-quoted on one side and plain on the other, so the two never key
-        alike and the file is re-emitted in full on every round."""
+        alike and the file is re-emitted in full on every round.
+
+        Two-dot against the RECORDED merge base since BE-15598 — the exact left tree
+        round N diffed — which is the same two-tree diff check-pr-size's own
+        `mergeBase...head` resolves to on the NEW side."""
         self._assert_has(
-            'git -c core.quotePath=false diff "${BASE_SHA}...${LAST_REVIEWED_SHA}"'
+            'git -c core.quotePath=false diff "${LAST_REVIEWED_MERGE_BASE}" "${LAST_REVIEWED_SHA}"'
         )
+
+    def test_the_step_never_diffs_old_against_the_current_base(self):
+        """The BE-15598 bug, pinned. After a retarget or a base-branch rewrite the
+        current base resolves to a merge base round N never used, so hunks the panel
+        has never seen read as already-reviewed and vanish from the block — and the
+        subset fail-safe cannot catch it, because a block that is too SMALL is still
+        a subset."""
+        needle = '"${BASE_SHA}...${LAST_REVIEWED_SHA}"'
+        self.assertFalse(needle in self.text, f"cursor-review.yml is back on {needle!r}")
+
+    def test_the_step_fails_closed_without_a_recorded_merge_base(self):
+        """No recorded merge base means no honest OLD patch, so there is no block —
+        never a fall back to ${BASE_SHA}, which is the bug above."""
+        self._assert_has('[ -z "$LAST_REVIEWED_MERGE_BASE" ]')
+        self._assert_has("No recorded merge base for round")
+        self._assert_has("LAST_REVIEWED_MERGE_BASE: ${{ needs.ledger.outputs.last_reviewed_merge_base }}")
+        self._assert_has("last_reviewed_merge_base: ${{ steps.build.outputs.last_reviewed_merge_base }}")
+
+    def test_the_recorded_merge_base_is_checked_before_it_is_diffed(self):
+        """Reachable in THIS checkout, and still an ancestor of the commit it was the
+        merge base OF — otherwise `git diff <merge base> <last reviewed>` succeeds and
+        returns something that is not what round N saw at all."""
+        self._assert_has('git cat-file -e "${LAST_REVIEWED_MERGE_BASE}^{commit}"')
+        self._assert_has('git merge-base --is-ancestor "$LAST_REVIEWED_MERGE_BASE" "$LAST_REVIEWED_SHA"')
+        self._assert_has("is unreachable or not an ancestor of the last-reviewed commit")
+
+    def test_the_round_merge_base_is_resolved_and_published(self):
+        """In SHELL, in the diff-size job — not out of check-pr-size, which is skipped
+        entirely on the degraded raw-numstat fallback path. A round that records no
+        merge base costs the NEXT round its whole block."""
+        self._assert_has('MERGE_BASE="$(git merge-base "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || true)"')
+        self._assert_has("merge_base_sha: ${{ steps.merge_base.outputs.merge_base_sha }}")
+        self._assert_has('--merge-base-sha "$MERGE_BASE_SHA"')
 
     def test_the_old_patch_is_size_bounded(self):
         """NEW is bounded by diff_size_cap; OLD is bounded by nothing — it
