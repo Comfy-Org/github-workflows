@@ -27,14 +27,14 @@ forward automatically instead of silently drifting commits behind.
 
 | Entrypoint | Triggers on a change to | Caller secret | Seeded |
 |---|---|---|---|
-| [`bump-cursor-review-callers.yml`](../workflows/bump-cursor-review-callers.yml) | `cursor-review.yml`, `cursor-review/**` or `scripts/check-pr-size/**` (minus its `*_test.go`, which no caller executes) | `CURSOR_REVIEW_CALLERS` | non-empty (hard-fails if empty) |
-| [`bump-agents-md-callers.yml`](../workflows/bump-agents-md-callers.yml) | `agents-md-integrity.yml` or `agents-md-integrity/**` | `AGENTS_MD_CALLERS` | empty `[]` (grows as callers land) |
-| [`bump-coderabbit-config-callers.yml`](../workflows/bump-coderabbit-config-callers.yml) | `coderabbit-config-validate.yml` or `coderabbit-config/**` | `CODERABBIT_CONFIG_CALLERS` | empty `[]` (grows as callers land) |
+| [`bump-cursor-review-callers.yml`](../workflows/bump-cursor-review-callers.yml) | `cursor-review.yml`, `cursor-review/**` (minus its `tests/`, `README.md` and `catalog-drift.py`) or `scripts/check-pr-size/**` (minus its `*_test.go`) — none of which a caller executes | `CURSOR_REVIEW_CALLERS` | non-empty (hard-fails if empty) |
+| [`bump-agents-md-callers.yml`](../workflows/bump-agents-md-callers.yml) | `agents-md-integrity.yml` or `agents-md-integrity/**` (minus its `tests/` and `README.md`, which no caller executes) | `AGENTS_MD_CALLERS` | empty `[]` (grows as callers land) |
+| [`bump-coderabbit-config-callers.yml`](../workflows/bump-coderabbit-config-callers.yml) | `coderabbit-config-validate.yml` or `coderabbit-config/**` (minus its `tests/`, `README.md` and `schema_drift.py`, which no caller executes) | `CODERABBIT_CONFIG_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-pr-size-callers.yml`](../workflows/bump-pr-size-callers.yml) | `pr-size.yml` or `scripts/check-pr-size/**` (minus its `*_test.go`, which no caller executes) | `PR_SIZE_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-pr-risk-callers.yml`](../workflows/bump-pr-risk-callers.yml) | `pr-risk.yml` or `scripts/pr-risk/**` (minus its `tests/` and `README.md`, which no caller executes) | `PR_RISK_CALLERS` | non-empty (hard-fails if empty) |
 | [`bump-pr-derisk-callers.yml`](../workflows/bump-pr-derisk-callers.yml) | `pr-derisk.yml`, `scripts/pr-derisk/**` **or `scripts/pr-risk/**`** (minus both `tests/` and `README.md`) — a `/derisk` run executes the pr-risk grader as well as the planner, so a grader change is consumer-visible on this fleet too | `PR_RISK_CALLERS` **(shared — filtered to `ci-pr-derisk.yml`)** | **may select nothing** (no callers enrolled yet — flip `ALLOW_EMPTY` to `false` with the first enrolment) |
 | [`bump-assign-reviewers-callers.yml`](../workflows/bump-assign-reviewers-callers.yml) | `assign-reviewers.yml` | `ASSIGN_REVIEWERS_CALLERS` | empty `[]` (grows as callers land) |
-| [`bump-groom-callers.yml`](../workflows/bump-groom-callers.yml) | `groom.yml` or `groom/**` | `GROOM_CALLERS` | empty `[]` (grows as callers land) |
+| [`bump-groom-callers.yml`](../workflows/bump-groom-callers.yml) | `groom.yml` or `groom/**` (minus its `tests/` and `README.md`, which no caller executes) | `GROOM_CALLERS` | empty `[]` (grows as callers land) |
 | [`bump-auto-label-callers.yml`](../workflows/bump-auto-label-callers.yml) | `cursor-review-auto-label.yml` | `AUTO_LABEL_CALLERS` | non-empty (hard-fails if empty) |
 | [`bump-detect-unreviewed-merge-callers.yml`](../workflows/bump-detect-unreviewed-merge-callers.yml) | `detect-unreviewed-merge.yml` | `DETECT_UNREVIEWED_MERGE_CALLERS` | non-empty (hard-fails if empty) |
 | [`bump-area-label-callers.yml`](../workflows/bump-area-label-callers.yml) | `pr-area-label.yml` or `scripts/area-label/**` (minus its `tests/` and `README.md`, which no caller executes) | `AREA_LABEL_CALLERS` | empty `[]` (grows as callers land) |
@@ -186,7 +186,7 @@ re-point that pins callers to the verified tip instead of a stale `github.sha`.
 |---|---|
 | `WATCHED` | **required** — repo-relative path of the watched reusable workflow (e.g. `.github/workflows/groom.yml`) |
 | `WATCHED_ASSETS` | optional — the watched assets, a **newline-separated list** of literal paths, one per line (blank lines and surrounding whitespace ignored). A single-line value is just a one-element list, so `WATCHED_ASSETS: .github/groom` keeps working unchanged; a fleet watching more than one spells it as a YAML **literal** block scalar — `\|`, never the folded `>`, which joins the lines into one space-separated string (see below). Empty/unset means the fleet watches nothing beyond `WATCHED` |
-| `WATCHED_PATHSPECS` | optional — newline-separated git **pathspecs** (`:(exclude)` entries allowed) covering what the fleet's `paths:` filter watches. When set, they replace the `WATCHED`/`WATCHED_ASSETS` object comparison as the staleness test. Every positive entry must select a tracked path, and the list must select `WATCHED` **and something under every `WATCHED_ASSETS` entry**. Used by `pr-risk`, `pr-derisk`, `pr-size` and `cursor-review` |
+| `WATCHED_PATHSPECS` | optional — newline-separated git **pathspecs** (`:(exclude)` entries allowed) covering what the fleet's `paths:` filter watches. When set, they replace the `WATCHED`/`WATCHED_ASSETS` object comparison as the staleness test. Every positive entry must select a tracked path, and the list must select `WATCHED` **and something under every `WATCHED_ASSETS` entry**. Used by every fleet whose `paths:` filter carries a `!` exclusion (see the table above) |
 | `WATCHED_EXEC` | optional — newline-separated repo-relative **files** a pinned caller actually executes. When set, each is probed for deletion at the tip and — unless the run was re-pointed, which makes that tip the pin target — locally too, in addition to `WATCHED`/`WATCHED_ASSETS`. **Every fleet whose `WATCHED_ASSETS` entry is a DIRECTORY needs it** — that is all ten of the asset-watching fleets today; only the three that watch nothing beyond `WATCHED` (`assign-reviewers`, `auto-label`, `detect-unreviewed-merge`) leave it unset |
 | `NEW_SHA` | the candidate SHA, normally `github.sha` |
 | `GITHUB_SHA`, `GITHUB_OUTPUT` | provided by Actions |
@@ -283,10 +283,12 @@ trigger is covered by the comparison — for `agents-md-integrity`
 (`.github/agents-md-integrity/**`), `cursor-review` (`.github/cursor-review/**`),
 `groom` (`.github/groom/**`) and `pr-size` (`scripts/check-pr-size/**`) that
 includes the asset directory the reusable loads its prompts/scripts/briefs from at
-run time. (`pr-risk` is multi-path too, but its filter also carries `:(exclude)`
-entries that `WATCHED_ASSETS` cannot express, so its comparison is
-`WATCHED_PATHSPECS` — it still *sets* `WATCHED_ASSETS`, for a different reason;
-see the note below.) Compare `WATCHED` alone on one of those and a commit touching
+run time. (Every fleet whose `paths:` filter *also* carries a `!` exclusion — read
+the "Triggers on" column of the table above rather than a list here, which is what
+went stale last time — has a comparison that `WATCHED_ASSETS` cannot express, so
+its comparison is `WATCHED_PATHSPECS`; it still *sets* `WATCHED_ASSETS`, for a
+different reason; see the note below.)
+Compare `WATCHED` alone on one of those and a commit touching
 only the assets reads as "unchanged", so callers get pinned to a tip whose other
 relevant content was never verified. Read the entrypoint's
 `paths:` rather than trusting this list, and if you widen a fleet's path filter,
@@ -471,7 +473,12 @@ when you write one of these lists:
   checkout. Listing one turns its retirement into a `::warning::` that freezes the
   whole fleet: a false decommission, the mirror of the false-healthy bump the input
   exists to stop. `bump-pr-derisk-callers.yml` records the same call for
-  `apply-risk-label.sh`.
+  `apply-risk-label.sh`. `catalog-drift.py` and `schema_drift.py` are now also
+  negated out of their fleets' `paths:` filters (and mirrored into
+  `WATCHED_PATHSPECS`), so a commit touching only one of them does not fan a
+  no-op bump either, while `wire-bot-identity.py` stays *watched* — the bumper
+  itself executes it and rewrites `wire_bot`-flagged callers with its output, so
+  a wiring-logic change really does change caller files.
 - **A path that stops resolving is a silent freeze, so it is machine-checked.**
   These are ~50 hand-written literal paths and preflight.sh probes each one for
   deletion, so a typo — or a rename applied to the tree but not to this list, or
@@ -482,6 +489,16 @@ when you write one of these lists:
   surface, and that no fleet watching a DIRECTORY leaves the input unset — so all
   three now fail the PR instead of the fleet. Rename or retire a listed file in the
   SAME commit as the list edit, and the check will tell you when you have not.
+- **An exclusion that stops resolving is the opposite failure, and is checked in
+  the same place.** git ignores a `:(exclude)` matching nothing without a word, so
+  a rename applied to the tree but to neither list leaves the `paths:` negation and
+  its `WATCHED_PATHSPECS` mirror carrying the same stale path and agreeing
+  perfectly about it — the renamed file falls back into the watched surface and the
+  fleet quietly resumes the no-op bumps the exclusion was added to stop. That one
+  over-watches rather than under-verifying, so it can never produce an *unsafe*
+  bump and preflight.sh does NOT error on it at run time (that would trade churn
+  for a full fleet outage); `test_paths_contract.sh` resolves every exclusion
+  against the tree instead, failing the PR that does the renaming.
 
 The three fleets that watch nothing beyond `WATCHED` leave both unset and behave
 exactly as before — `test_paths_contract.sh` grants them exactly that exemption,
