@@ -63,7 +63,15 @@ const runScript = new AsyncFunction('github', 'context', 'core', 'process', 'req
 // design, so they take the sentinel and indent checks but not the whole-scalar bracket check;
 // their origin offset keeps reported line numbers absolute in assign-reviewers.yml.
 const SCRIPT_ORIGIN = {file: 'assign-reviewers.yml', offset: scriptSpan.begin + 1};
-const helpers = new Function(`${region(script, 'glob-matcher', SCRIPT_ORIGIN)}\n${region(script, 'config-parser', SCRIPT_ORIGIN)}\nreturn {globToRegExp, matchesAny, parseReviewerConfig};`)();
+// `core` is ambient inside a github-script step but NOT inside this `new Function` scope, so the
+// extracted region has to be handed one. It is a real capture, not a silencer: `parseReviewerConfig`
+// calls `core.warning` on a duplicate top-level `default_pool:`, and `helperWarnings` is what lets a
+// test assert that warning fires. Leave it out and the region throws ReferenceError on that path —
+// which is a REAL failure mode of the shipped script too, so extend the stub rather than the sentinels
+// whenever the parser reaches for another `core` method.
+const helperWarnings = [];
+const helperCore = {warning: (message) => helperWarnings.push(message), info: () => {}};
+const helpers = new Function('core', `${region(script, 'glob-matcher', SCRIPT_ORIGIN)}\n${region(script, 'config-parser', SCRIPT_ORIGIN)}\nreturn {globToRegExp, matchesAny, parseReviewerConfig};`)(helperCore);
 const corpus = JSON.parse(readFileSync(resolve(__dirname, '../parser-corpus.json'), 'utf8'));
 const file = (filename) => ({filename, changes: 10});
 const approval = (login, state = 'APPROVED', type = 'User') => ({user: {login, type}, state, author_association: 'MEMBER'});
@@ -376,11 +384,299 @@ test('the shared corpus is loaded and non-empty', () => {
   assert(corpus.globs.length > 0, 'parser-corpus.json has no glob cases');
   assert(corpus.globs.every(entry => entry.cases.length > 0), 'a corpus glob entry has no path cases');
 });
+// Every corpus case that emits a warning, with its count — the same table test_generate.py
+// carries for the Python channel, so a diagnostic that fires on one port and not the other is
+// caught by the suites even though the warning TEXT cannot live in the shared fixture.
+// The point of an EXHAUSTIVE table rather than per-case assertions is the silence: a regression
+// that made the unrecognised-key warning fire on ordinary blank lines, comment lines or indented
+// list items would warn on nearly every case here and nothing else would notice.
+// Read it in both directions. The entries that are PRESENT and non-obvious are the second-BOM and
+// leading-NEL cases: each is a document whose FIRST line is an unrecognised key precisely because
+// the stray character is not indentation, which is the failure those two cases exist to pin, now
+// with an annotation on it (they reach the near-miss arm, not the terminator arm — no block is
+// open on line 1). The entries that are ABSENT matter just as much: `indented decoys and unknown
+// top-level keys are ignored` is silent because a `version:`/`notes:` key before the first block
+// ends nothing and drops nothing, and `YAML document markers are not unrecognised keys` is silent
+// because `---`/`...` are syntax. Both used to warn, on documents whose expected parse is complete.
+const CORPUS_WARNINGS = {
+  'duplicate default_pool, flow then block': 1,
+  'duplicate default_pool, block then flow': 1,
+  'duplicate default_pool, second one empty': 1,
+  'two leading BOMs: only one is stripped': 1,
+  'U+0085 before a top-level key is not indentation': 1,
+  'a U+00A0-only line at column 0 ends a default_pool block on both ports': 1,
+  'a U+00A0-only line at column 0 drops every later rule on both ports': 1,
+  'an unknown top-level key at column 0 ends the block': 1,
+  'a key sharing a prefix with `rules:` is not the `rules:` key': 1,
+  'no space after the colon is a plain scalar, not a key': 1,
+};
 for (const {name, text, expected} of corpus.configs) {
   test(`corpus config — ${name}`, () => {
+    helperWarnings.length = 0;
     assert.deepEqual(helpers.parseReviewerConfig(text), expected);
+    assert.equal(helperWarnings.length, CORPUS_WARNINGS[name] ?? 0, `warnings for ${JSON.stringify(name)}: ${JSON.stringify(helperWarnings)}`);
   });
 }
+// `CORPUS_WARNINGS[name] ?? 0` above only checks corpus case -> table, so a table entry whose
+// corpus case was renamed or deleted would silently go dead and that case's count would stop being
+// asserted while the suite stayed green. The Python side compares both directions in one
+// `assertEqual(counts, self.CORPUS_WARNINGS)`; this is that other direction, so the two copies of
+// the "same table" cannot drift apart through a rename.
+test('every CORPUS_WARNINGS key names a corpus case that still exists', () => {
+  const names = new Set(corpus.configs.map(c => c.name));
+  assert.deepEqual(Object.keys(CORPUS_WARNINGS).filter(n => !names.has(n)), []);
+});
+// The corpus compares parsed CONFIGS, which is deliberately silent about the duplicate-key warning
+// — the Python port prints its own `::warning::` line instead, so the text cannot live in the shared
+// fixture. Each side therefore asserts its own channel; last-wins itself stays corpus-pinned above.
+test('a duplicate top-level default_pool: warns once, naming the key', () => {
+  helperWarnings.length = 0;
+  assert.deepEqual(helpers.parseReviewerConfig('default_pool: [alice]\ndefault_pool:\n  - bob\n').default_pool, ['bob']);
+  assert.equal(helperWarnings.length, 1);
+  assert.match(helperWarnings[0], /duplicate top-level `default_pool:` key/);
+});
+
+test('the duplicate warning names the configured path, and omits the prefix without one', () => {
+  // `reviewer_config_path` is a caller input, so the warning must not hardcode
+  // `reviewers.yml` — a caller that configured another name would be told to go
+  // look at a file its repo does not have.
+  helperWarnings.length = 0;
+  helpers.parseReviewerConfig('default_pool: [alice]\ndefault_pool: [bob]\n', '.github/owners.yml');
+  assert.equal(helperWarnings.length, 1);
+  assert.match(helperWarnings[0], /^\.github\/owners\.yml: duplicate top-level/);
+  // Omitted (as the harness calls it): a bare message, never a literal `undefined:`.
+  helperWarnings.length = 0;
+  helpers.parseReviewerConfig('default_pool: [alice]\ndefault_pool: [bob]\n');
+  assert.equal(helperWarnings.length, 1);
+  assert.doesNotMatch(helperWarnings[0], /undefined/);
+  assert.match(helperWarnings[0], /^duplicate top-level/);
+});
+
+test('an empty first default_pool: still warns on the duplicate', () => {
+  // Keyed on "the key was seen", not on "the list is non-empty" — an emptiness test would make the
+  // JS warn where the Python port (which keys on its own seen-flag) does not.
+  helperWarnings.length = 0;
+  assert.deepEqual(helpers.parseReviewerConfig('default_pool: []\ndefault_pool: [bob]\n').default_pool, ['bob']);
+  assert.equal(helperWarnings.length, 1);
+});
+// A column-0 line that is neither key ENDS the block above it, and since both ports narrowed to
+// trimming s-white it need not look like a key: one U+00A0 is enough. The truncation is otherwise
+// completely silent, so the parser names the line and renders the character codepoint-escaped.
+// Parsed results stay corpus-pinned (three `U+00A0-only line` cases); the warning text cannot be,
+// because each port emits on its own channel, so each suite asserts its own — as with duplicates.
+test('a U+00A0-only line ending a default_pool block warns once, naming the line and the character', () => {
+  helperWarnings.length = 0;
+  assert.deepEqual(helpers.parseReviewerConfig('default_pool:\n  - alice\n\u00a0\n  - bob\n').default_pool, ['alice']);
+  assert.equal(helperWarnings.length, 1);
+  assert.match(helperWarnings[0], /^line 3 is not a recognised top-level key \(\\u00a0\)/);
+  // The literal `U+00A0` in the message's own prose is what makes the character searchable for a
+  // reader who does not think in `\u` escapes; both are asserted so neither can quietly drop.
+  assert.match(helperWarnings[0], /U\+00A0/);
+});
+
+test('a U+00A0-only line dropping every later rule warns once, naming its line', () => {
+  helperWarnings.length = 0;
+  const out = helpers.parseReviewerConfig("rules:\n  - paths: ['a/**']\n    reviewers: [alice]\n\u00a0\n  - paths: ['b/**']\n    reviewers: [bob]\n");
+  assert.equal(out.rules.length, 1);
+  assert.equal(helperWarnings.length, 1);
+  assert.match(helperWarnings[0], /^line 4 is not a recognised top-level key \(\\u00a0\)/);
+});
+
+test('an INDENTED U+00A0-only line is silent — it truncates nothing', () => {
+  // The negative control, and the one that keeps the warning useful: the orphaned `- bob` tail
+  // below a real truncation also falls through, and warning per orphan would bury the terminator.
+  helperWarnings.length = 0;
+  assert.deepEqual(helpers.parseReviewerConfig('default_pool:\n  - alice\n  \u00a0\n  - bob\n').default_pool, ['alice', 'bob']);
+  assert.deepEqual(helperWarnings, []);
+});
+
+test('an unknown top-level key at column 0 warns the same way, verbatim', () => {
+  // The key-shaped variant of the same truncation: nothing invisible, still silent before this.
+  helperWarnings.length = 0;
+  assert.deepEqual(helpers.parseReviewerConfig('default_pool:\n  - alice\nowners:\n  - bob\n').default_pool, ['alice']);
+  assert.equal(helperWarnings.length, 1);
+  assert.match(helperWarnings[0], /^line 3 is not a recognised top-level key \(owners:\)/);
+});
+
+// --- what the warning deliberately stays SILENT about -------------------------------------
+// Warning on EVERY column-0 fallthrough both overclaimed and flooded, so these are the negative
+// half of the diagnostic and each one is a shape a real config has. Mirrored in test_generate.py.
+
+test('YAML document markers are silent', () => {
+  // yamllint's default `document-start` rule REQUIRES the leading `---`, so a conformant
+  // reviewers.yml has one; `...` even TERMINATES the `rules:` block, so without the carve-out a
+  // well-formed config warns on every run.
+  helperWarnings.length = 0;
+  const out = helpers.parseReviewerConfig("---\ndefault_pool:\n  - alice\nrules:\n  - paths: ['a/**']\n    reviewers: [bob]\n...\n");
+  assert.deepEqual(out.default_pool, ['alice']);
+  assert.equal(out.rules.length, 1);
+  assert.deepEqual(helperWarnings, []);
+});
+
+test('a metadata key before any block is silent', () => {
+  // No block is open yet, so nothing is ended and nothing is dropped — the old message asserted
+  // both. The nested `default_pool:` decoy is still ignored.
+  helperWarnings.length = 0;
+  assert.deepEqual(helpers.parseReviewerConfig('version: 1\nnotes:\n  default_pool: [mallory]\ndefault_pool: [alice]\n').default_pool, ['alice']);
+  assert.deepEqual(helperWarnings, []);
+});
+
+test('a zero-indented block sequence warns once, not once per item', () => {
+  // `default_pool:` followed by a COLUMN-0 sequence is valid YAML and common, and every item used
+  // to draw its own annotation — five here, ten in a real pool, against GitHub's ~10-per-step
+  // budget. Only the first ends the block; the rest end nothing, so the one warning that explains
+  // the empty pool is not buried.
+  helperWarnings.length = 0;
+  assert.deepEqual(helpers.parseReviewerConfig('default_pool:\n- alice\n- bob\n- carol\n- dave\n- eve\n').default_pool, []);
+  assert.equal(helperWarnings.length, 1);
+  assert.match(helperWarnings[0], /^line 2 is not a recognised top-level key \(- alice\)/);
+});
+
+test('a non-YAML file is silent', () => {
+  // A `reviewer_config_path` aimed at prose opens no block, so it warns not at all rather than
+  // once per line. The empty parse is the diagnostic there.
+  helperWarnings.length = 0;
+  assert.deepEqual(helpers.parseReviewerConfig('Some prose here.\nAnother line.\nAnd another.\n'), {default_pool: [], rules: []});
+  assert.deepEqual(helperWarnings, []);
+});
+
+// --- near misses: a line that NAMES a supported key without opening it ----------------------
+
+test('an invisible prefix before a key warns as a near miss', () => {
+  // U+0085, not U+FEFF: a SINGLE leading BOM is legal YAML and the parser strips it, so a one-BOM
+  // document parses fine and must stay silent. The stray character is not indentation, so the key
+  // reads as column 0, falls through, and its whole block is never read — while the line looks
+  // perfect in an editor. No block was open, so the terminator arm would have stayed silent here.
+  helperWarnings.length = 0;
+  assert.deepEqual(helpers.parseReviewerConfig('\u0085default_pool: [alice]\nrules:\n').default_pool, []);
+  assert.equal(helperWarnings.length, 1);
+  assert.match(helperWarnings[0], /^line 1 is not a recognised top-level key \(\\u0085default_pool: \[alice\]\) — it is not the supported `default_pool:` key/);
+  helperWarnings.length = 0;
+  assert.deepEqual(helpers.parseReviewerConfig('\ufeffdefault_pool: [alice]\n').default_pool, ['alice']);
+  assert.deepEqual(helperWarnings, []);
+});
+
+test('a key sharing a prefix with a supported one is not honoured, and warns', () => {
+  // `yaml.safe_load("rules:v2:\\n  - paths: [a]")` is `{"rules:v2": [...]}` — a key NAMED
+  // `rules:v2`, not `rules`. The old `startsWith` claimed it and parsed its children as live
+  // routing rules, so an unsupported key was silently HONOURED.
+  helperWarnings.length = 0;
+  assert.deepEqual(helpers.parseReviewerConfig("rules:v2:\n  - paths: ['a/**']\n    reviewers: [alice]\n").rules, []);
+  assert.equal(helperWarnings.length, 1);
+  assert.match(helperWarnings[0], /it is not the supported `rules:` key/);
+});
+
+test('no space after the colon is a plain scalar, not a key', () => {
+  // `yaml.safe_load("default_pool:[alice]")` is the STRING `default_pool:[alice]`: YAML reads
+  // `key:` as a mapping only with s-white or a line end after the colon.
+  helperWarnings.length = 0;
+  assert.deepEqual(helpers.parseReviewerConfig('default_pool:[alice]\n').default_pool, []);
+  assert.equal(helperWarnings.length, 1);
+  assert.match(helperWarnings[0], /it is not the supported `default_pool:` key/);
+});
+
+test('showInvisible escapes an astral character as a UTF-16 surrogate pair', () => {
+  // The regex has no `u` flag, so it walks code units — which is the REFERENCE the Python port's
+  // `_show_invisible` was corrected to match (a plain `"\\u%04x" % ord(c)` emitted `\u1f600`
+  // there, five digits and not a valid escape). Asserted so a later `u` flag here cannot silently
+  // reopen the divergence on the other side.
+  helperWarnings.length = 0;
+  helpers.parseReviewerConfig('default_pool:\n  - alice\n\u{1f600}x\n  - bob\n');
+  assert.equal(helperWarnings.length, 1);
+  assert.match(helperWarnings[0], /\(\\ud83d\\ude00x\)/);
+});
+
+test('the unrecognised-key warning carries the configured path when one is given', () => {
+  helperWarnings.length = 0;
+  helpers.parseReviewerConfig('default_pool:\n  - alice\nowners:\n', '.github/owners.yml');
+  assert.equal(helperWarnings.length, 1);
+  assert.match(helperWarnings[0], /^\.github\/owners\.yml: line 3 is not a recognised/);
+});
+
+// The two tests above run the EXTRACTED region, where `core` is the `helperCore` stub. These two
+// run the WHOLE shipped script instead, which is the only thing that proves `showInvisible` resolves
+// at BOTH of its call sites: it is a `const`, so it is in the temporal dead zone until its own line
+// executes, and the parser is CALLED further up the script than the invalid-login warning that used
+// to declare it. Declared at the wrong point, one of these two paths throws ReferenceError at run
+// time while every region-scoped test above stays green.
+test('the full shipped script emits the unrecognised-key warning, naming the configured path', async () => {
+  // The stray key lands INSIDE the `rules:` block, which is where the truncation actually bites:
+  // the rule below it is orphaned, so nothing matches `src/api/**` and routing falls back to the
+  // pool. (A stray key BETWEEN two top-level blocks truncates only its own orphaned tail — the
+  // outer loop keeps scanning and still finds a later `rules:`.)
+  const result = await run({config: 'default_pool: [generalist]\nrules:\nowners:\n  - paths: ["src/api/**"]\n    reviewers: [alice]\n'});
+  assert.equal(result.logs.filter(m => /is not a recognised top-level key/.test(m)).length, 1);
+  assert.match(result.logs.find(m => /is not a recognised top-level key/.test(m)), /^\.github\/reviewers\.yml: line 3 .*\(owners:\)/);
+  assert.deepEqual(result.selected, ['generalist']);
+});
+
+test('the full shipped script still warns about an invalid configured login', async () => {
+  // Same helper, its OTHER caller. Pinned here because nothing else executed this path.
+  const result = await run({config: 'rules:\n  - paths: ["src/api/**"]\n    reviewers: ["\u00a0alice"]\n'});
+  const warning = result.logs.find(m => /is not a valid GitHub login/.test(m));
+  assert(warning, `no invalid-login warning in ${JSON.stringify(result.logs)}`);
+  assert.match(warning, /configured reviewer "\\u00a0alice"/);
+});
+
+test('a single default_pool: is silent, however it is written', () => {
+  helperWarnings.length = 0;
+  for (const text of ['default_pool: [alice]\n', 'default_pool:\n  - alice\n', 'rules:\n  - reviewers: [a]\n', '  default_pool: [indented]\ndefault_pool: [alice]\n']) {
+    helpers.parseReviewerConfig(text);
+  }
+  assert.deepEqual(helperWarnings, []);
+});
+
+// The invalid-configured-login warning. Unlike the duplicate-key warning above this one lives in
+// the routing script rather than the shared parser region, so it is driven through `run()` and read
+// off `logs` — and it only exists because both ports narrowed to trimming s-white, which left a
+// login padded with U+00A0/U+FEFF/U+0085 surviving the parse verbatim and then failing the shape
+// gate, invisibly. `\u00a0` is written escaped on purpose: a literal here would go vacuous the
+// moment an editor normalised it away, with every assertion below still passing.
+const NBSP = '\u00a0';
+test('a padded login in a MATCHED rule warns, codepoint-escaped, and does not route', async () => {
+  const result = await run({config: `rules:\n  - paths: ["src/**"]\n    reviewers: ["${NBSP}alice", bob]\n`});
+  assert.deepEqual(result.selected, ['bob']);
+  const warnings = result.logs.filter((line) => /is not a valid GitHub login/.test(line));
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /configured reviewer "\\u00a0alice"/);
+  assert.match(warnings[0], /^\.github\/reviewers\.yml: /);
+});
+test('a padded login warns even when its rule matches NOTHING in this PR', async () => {
+  // The regression CodeRabbit caught: warning only from `configuredCandidate` reached a rule's
+  // reviewers only once that rule's paths matched a changed file, so rot in any other area of the
+  // config stayed silent on every run that did not happen to touch it. The rot is a property of
+  // the FILE, not of this diff.
+  const result = await run({
+    files: [file('src/api/main.js')],
+    config: `rules:\n  - paths: ["src/api/**"]\n    reviewers: [alice]\n  - paths: ["docs/**"]\n    reviewers: ["${NBSP}carol"]\n`,
+  });
+  assert.deepEqual(result.selected, ['alice']);
+  // Warned about, but emphatically NOT routed: an unmatched rule's owners stay out of `candidates`.
+  assert.equal(result.logs.filter((line) => /configured reviewer "\\u00a0carol"/.test(line)).length, 1);
+  assert.ok(!result.selected.includes('carol'));
+});
+test('a padded default_pool entry warns on a run that never reaches the fallback', async () => {
+  // `default_pool` was only ever swept when NO rule and no history covered any file. A rotted
+  // entry in it could therefore go unreported indefinitely while some rule kept matching — and
+  // the fallback is exactly the path you need it to work on when it finally fires.
+  const result = await run({config: `default_pool: ["bob${NBSP}"]\nrules:\n  - paths: ["src/**"]\n    reviewers: [alice]\n`});
+  assert.deepEqual(result.selected, ['alice']);
+  assert.equal(result.logs.filter((line) => /configured reviewer "bob\\u00a0"/.test(line)).length, 1);
+});
+test('each bad token warns once, however many rules repeat it', async () => {
+  const result = await run({
+    config: `default_pool: ["${NBSP}dana"]\nrules:\n  - paths: ["src/api/**"]\n    reviewers: ["${NBSP}dana", alice]\n  - paths: ["docs/**"]\n    reviewers: ["${NBSP}dana"]\n`,
+  });
+  assert.equal(result.logs.filter((line) => /configured reviewer "\\u00a0dana"/.test(line)).length, 1);
+});
+test('a well-formed login is never warned about, excluded or not', async () => {
+  // Keyed on the SHAPE test only, never on `eligible()`: the exclude set legitimately holds the PR
+  // author and `EXCLUDE`, so warning there would fire on essentially every run and train people to
+  // ignore the message. `author` and `alice` below are both shape-valid and both excluded.
+  const result = await run({config: 'rules:\n  - paths: ["src/**"]\n    reviewers: [Author, Alice, bob]\n', env: {EXCLUDE: '@ALICE'}});
+  assert.deepEqual(result.selected, ['bob']);
+  assert.deepEqual(result.logs.filter((line) => /is not a valid GitHub login/.test(line)), []);
+});
 for (const {glob, cases} of corpus.globs) {
   test(`corpus glob — ${glob}`, () => {
     for (const {path, matches} of cases) {

@@ -47,8 +47,13 @@ do there, and that noise is what gets the whole automation muted.
 Glob semantics match the path rules: `**` spans segments (`stack/**` covers
 `stack/a` and `stack/a/b`), `*` stays within one (`stack/*` covers `stack/a` but
 not `stack/a/b`), and a pattern with no wildcard is an **exact** match — so
-`release` skips `release` and leaves `release/1.2` and `releases` alone. Several
-patterns are whitespace-separated: `stack/** wip/**`.
+`release` skips `release` and leaves `release/1.2` and `releases` alone. `?` is
+one Unicode character other than `/` — one code POINT, so an emoji counts as a
+single `?` rather than as the bytes or UTF-16 units it is stored as. An accented
+letter counts once only when **precomposed** (NFC): a decomposed `é` (`e` +
+U+0301, and NFD is the normal form paths originating on macOS arrive in) is two
+code points and needs two `?`. `*` spans either form, so prefer it over `?` when
+a segment may carry combining marks. Several patterns are whitespace-separated: `stack/** wip/**`.
 
 Two related knobs, so pick the right one. This var is **per-lane and automatic**.
 The `skip_label` input (default `skip-auto-assign`) is **per-PR and manual**. Use
@@ -188,6 +193,65 @@ rules:
 
 [This repo's own `reviewers.yml`](../../.github/reviewers.yml) is a worked example
 with commentary on how the buckets were seeded.
+
+Four dialect rules the focused parser follows, shared with the `refresh-reviewers`
+generator that writes this file: a **duplicate top-level `default_pool:` is last-wins**
+— a second one replaces the first rather than adding to it, and the run logs a warning
+rather than failing (a repeated `rules:` block is *not* covered: it still appends to the
+earlier one, with no warning, so replace a rules block in place rather than restating it);
+a **`#` starts a comment only at the start of a line or after a
+space or a tab**, so `[x#c]` is the literal login `x#c` and only `[x #c]` is a trailing
+comment; a **single leading byte-order mark is tolerated**, so a `reviewers.yml`
+saved as UTF-8-with-BOM still routes; and **a login is trimmed of spaces and tabs only**,
+so one padded by any other invisible character — a non-breaking space, a NEL, a *second*
+byte-order mark — is taken literally as part of the login by both the runtime and the
+drift generator, matches no collaborator, and will not route. Strip those characters from
+the file rather than expecting either side to absorb them.
+
+Because that padding is invisible, the run **warns** (`configured reviewer "\u00a0alice"
+is not a valid GitHub login and will never be assigned`) whenever a login configured in
+`reviewers.yml` cannot be a GitHub login at all, rendering the offending token
+codepoint-escaped so the character is findable. Every rule's reviewers and the whole
+`default_pool` are checked on every run, including rules whose paths this PR did not
+touch — the warning reports the state of the *file*, so a rotted owner does not stay
+hidden until some later PR happens to change that area. Being warned about is not being
+routed to: an unmatched rule's owners are still never assigned. It is deliberately silent about a
+configured owner who is merely excluded — the PR author, or `vars.REVIEWER_EXCLUDE` —
+since that is normal and would otherwise fire on nearly every run.
+
+One consequence of trimming spaces and tabs only: a line whose sole content is some
+*other* invisible character is no longer a blank line, and indentation counts spaces, so
+at column 0 it ends the block above it — inside `rules:` that discards every rule after
+it. Both ports behave identically here and the corpus pins it. The run no longer leaves
+you to guess, though: it **warns**, naming the file and the line number and rendering the
+line's content codepoint-escaped so the character is findable —
+
+```
+::warning::reviewers.yml: line 3 is not a recognised top-level key (\u00a0) — it ends the `default_pool:` block above it, and every list item or rule indented below it is dropped; only `default_pool:` and `rules:` are read, and at column 0 one invisible character (e.g. U+00A0) ends a block exactly like a misspelled key does
+```
+
+A misspelled or unsupported top-level key truncates the block identically and gets the
+same warning. A **near miss** — a line that names a supported key without opening one —
+gets its own:
+
+```
+::warning::reviewers.yml: line 1 is not a recognised top-level key (\u0085default_pool: [alice]) — it is not the supported `default_pool:` key, so the whole block it opens is ignored; that key is read only at column 0 with nothing but spaces before it and a space, a tab or the end of the line after its colon
+```
+
+That covers a stray character before the key (which is not indentation, so the key reads
+as column 0 and falls through) as well as `rules:v2:` — valid YAML for a key *named*
+`rules:v2` — and `default_pool:[alice]`, which YAML reads as a plain scalar rather than a
+mapping. Both of the latter used to be silently accepted **as** the supported key.
+
+What does *not* warn is as deliberate. A column-0 line that breaks nothing is silent: a
+`---` or `...` document marker (yamllint's default `document-start` rule requires the
+former, so a conformant config has one), a `version:`-style key before the first block,
+and a stray key between two complete blocks all leave every later `default_pool:`/`rules:`
+parsing. So are the orphaned items *below* a stray line, and every indented fallthrough
+line. One annotation per thing actually broken is the signal — otherwise a tab-indented
+config (indentation counts spaces, so every item reads as column 0) or a zero-indented
+block sequence would spend GitHub's ~10-annotation-per-step budget on the symptoms and
+bury the cause.
 
 ## Gotchas
 

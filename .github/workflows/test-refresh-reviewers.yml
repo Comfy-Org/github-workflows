@@ -11,6 +11,12 @@ name: Test refresh-reviewers generator
 # are driven from. test-assign-reviewers.yml watches it via
 # `.github/assign-reviewers/**`, so editing the corpus runs BOTH suites and a
 # case retuned to satisfy one port alone cannot land green.
+#
+# docs/callers/refresh-reviewers.md is deliberately NOT in the filters: the
+# declared-vs-documented input drift check that used to read it folded into
+# .github/workflow-pins/tests/test_inputs_docs_drift.py, and no suite this
+# workflow runs reads the guide. test-workflow-pins.yml watches both that guide
+# (via docs/callers/**) and .github/refresh-reviewers/README.md.
 
 on:
   pull_request:
@@ -19,7 +25,6 @@ on:
       - '.github/workflows/refresh-reviewers.yml'
       - '.github/workflows/test-refresh-reviewers.yml'
       - '.github/assign-reviewers/parser-corpus.json'
-      - 'docs/callers/refresh-reviewers.md'
   push:
     branches: [main]
     paths:
@@ -27,7 +32,6 @@ on:
       - '.github/workflows/refresh-reviewers.yml'
       - '.github/workflows/test-refresh-reviewers.yml'
       - '.github/assign-reviewers/parser-corpus.json'
-      - 'docs/callers/refresh-reviewers.md'
 
 permissions:
   contents: read

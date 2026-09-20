@@ -396,7 +396,29 @@ Put a `*_test.go` in a *subdirectory* and they stop: the trigger fires on it,
 the staleness diff has already excluded it, and the run re-points having compared
 nothing that moved — the pure-churn bump BE-7084 removed, one directory down.
 `test_paths_contract.sh` measures the tree for exactly this and fails the build
-the day it becomes true, so it cannot happen quietly.
+the day it becomes true, so it cannot happen quietly. What makes that the day is
+the trigger: `test-bump-callers.yml` runs on any change under `.github/**` or
+`scripts/**` (#302), so the measurement fails the PR that CREATES the divergence
+rather than some unrelated later one — and the contract test asserts that filter
+covers every fleet's positive `paths:` entry, so a fleet that ever watches a tree
+outside those two fails there instead of quietly losing its trigger.
+
+Three things to know about the scope of the glob-flatness measurement itself:
+
+* It applies to **glob exclusions only.** A `/**` *directory* exclusion
+  (`!scripts/pr-risk/tests/**`) selects the whole subtree in both syntaxes at
+  every depth, so it cannot diverge this way and is deliberately not measured,
+  subdirectories and all. `?` and `[…]` **are** globs on both sides and are
+  measured like `*` — git's `?` crosses `/` too.
+* It measures the whole **path**, not the basename, because that is what git
+  does: `:(exclude)x/test_*.sh` drops `x/test_dir/b.sh` (its `*` spans `dir/b`)
+  and keeps `x/sub/test_a.sh` (no literal `x/test_` prefix). So a prefix-anchored
+  exclusion is held to git's rule, not to a basename's.
+* A shape it cannot decide is reported **unmeasured**, not clean — a glob in the
+  directory half (`!x/*/tests/**` genuinely can diverge), a directory absent from
+  the tree, or a literal *directory* (`!x/tests` matches only a file named that,
+  while `:(exclude)x/tests` drops the subtree — write `!x/tests/**`). A failed
+  walk is a hard failure, never a pass.
 
 **An excluding fleet passes `WATCHED_PATHSPECS`; a per-file fleet passes
 `WATCHED_EXEC`.** `pr-size` and `cursor-review` need the first (BE-7084): each
