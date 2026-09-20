@@ -1083,9 +1083,9 @@ jobs:
         # against a 1,234-line reviewed diff (119 of its 133 files outside the
         # PR) and two PRs built ~1.16M-line blocks; the prompt went from ~98 KB
         # to ~826 KB, most legs timed out, and the legs that finished reviewed
-        # files from the base branch rather than the PR. Both patches here are
-        # three-dot diffs against the base, so each carries only the branch's
-        # own changes and neither can name a base-branch commit.
+        # files from the base branch rather than the PR. Each patch here is taken
+        # against a MERGE BASE instead, so each carries only the branch's own
+        # changes and neither can name a base-branch commit.
         #
         # NEW is `pr-diff.patch` ITSELF — the diff this round is actually
         # reviewing — not a freshly-computed BASE...HEAD diff. Every emitted

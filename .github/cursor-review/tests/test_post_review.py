@@ -230,8 +230,15 @@ ECHO_POSTED_BODY = "<the body this run posted>"
 _UNSET = object()
 
 
-class EndToEndPostTest(unittest.TestCase):
-    """Drive main() with a stubbed `gh` and read the payload it would have sent."""
+class PostHarness:
+    """The stubbed-`gh` harness both end-to-end suites drive main() through.
+
+    A plain object, NOT a `unittest.TestCase`: when this lived on
+    `EndToEndPostTest` and `RoundSentinelTest` subclassed that class to reach it,
+    discovery collected the parent's five `test_*` methods a second time under the
+    child and CI ran them twice. Carrying the shared helpers on a mixin with no
+    `test_*` methods of its own keeps every case collected exactly once.
+    """
 
     def run_main(self, findings, with_diff=True, post_returncode=0, stderr="", summaries=None,
                  panel=None, existing_reviews=None, list_returncode=0, list_calls=None,
@@ -374,6 +381,10 @@ class EndToEndPostTest(unittest.TestCase):
                             key, _, value = raw.partition("=")
                             outputs[key] = value
         return posted
+
+
+class EndToEndPostTest(PostHarness, unittest.TestCase):
+    """Drive main() with a stubbed `gh` and read the payload it would have sent."""
 
     def test_the_field_regression_nine_anchor_one_lands_in_the_body(self):
         # The observed shape: ten findings, one citing a line outside every hunk.
@@ -5314,7 +5325,7 @@ BASE_40 = "b" * 40
 MERGE_BASE_40 = "c" * 40
 
 
-class RoundSentinelTest(EndToEndPostTest):
+class RoundSentinelTest(PostHarness, unittest.TestCase):
     """The round sentinel: what this round reviewed, and what it diffed against (BE-15598).
 
     The ledger already records WHICH commit the last round reviewed. Without what it
@@ -5324,8 +5335,9 @@ class RoundSentinelTest(EndToEndPostTest):
     from the incremental block. The subset fail-safe cannot catch a block that is merely
     too small, so the record has to be written down at the time.
 
-    Subclasses EndToEndPostTest for its stubbed-`gh` harness; the cases below are the
-    only ones that pass a real 40-hex `commit_sha`.
+    Mixes in `PostHarness` for the stubbed-`gh` harness rather than subclassing
+    `EndToEndPostTest`, which would re-collect that class's own `test_*` methods here;
+    the cases below are the only ones that pass a real 40-hex `commit_sha`.
     """
 
     ARGV = ["--base-sha", BASE_40, "--merge-base-sha", MERGE_BASE_40]

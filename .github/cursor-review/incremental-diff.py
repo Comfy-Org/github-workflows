@@ -11,12 +11,20 @@ reviewed diff with 119 of its 133 files outside the PR, and two PRs built
 ~1.16M-line blocks; the prompt grew from ~98 KB to ~826 KB, most legs timed out,
 and the legs that finished reviewed files from the base branch instead of the PR.
 
-The fix is to stop diffing two commits and start diffing two PR *patches*. Both
-are three-dot diffs against the base, so each contains only the branch's own
-changes and neither can carry a base-branch commit:
+The fix is to stop diffing two commits and start diffing two PR *patches*. Each
+is taken against a MERGE BASE rather than along a commit range, so each contains
+only the branch's own changes and neither can carry a base-branch commit:
 
-* OLD — `git diff BASE...LAST_REVIEWED` — what the last round saw.
-* NEW — the reviewed diff this round is running on (`pr-diff.patch`).
+* OLD — `git diff <the merge base round N recorded> LAST_REVIEWED` — what the
+  last round saw. Two-dot, and pinned to the merge base that round itself
+  diffed against, read back from the round sentinel in its review rather than
+  recomputed from the CURRENT base (BE-15598): retarget the PR or rewrite its
+  base branch and a recomputed merge base moves, which puts everything the
+  branch inherited from the old base on both sides and silently subtracts, as
+  "already reviewed", hunks the panel has never seen. The caller supplies no
+  OLD patch at all when it has no recorded merge base to pin to.
+* NEW — the reviewed diff this round is running on (`pr-diff.patch`), which
+  `check-pr-size` builds as `mergeBase...head` for THIS round.
 
 `build` emits every NEW file section whose content differs from the same file's
 section in OLD, plus every NEW section for a file OLD does not have. A file OLD
