@@ -3101,10 +3101,26 @@ jobs:
           # way `Blocking gate`'s second guard does.
           CONSOLIDATE_RESULT: ${{ needs.consolidate.result }}
           POST_REVIEW_RESULT: ${{ needs.post-review.result }}
-          # Declared by `diff-size` only once the incremental-diff fix lands;
-          # until then this expression is the empty string and the check below
-          # is inert BY DESIGN. Empty is "not measured", which is a pass — the
-          # only failing value is a literal 'false', i.e. measured and wrong.
+          # LIVE since #321, which landed the incremental-diff fix this used to
+          # wait on: `diff-size` now declares the output on every run it
+          # completes, so this expression is the literal 'true' or 'false', and
+          # empty only when `diff-size` did NOT succeed — a path the guard step
+          # above has already exited 1 on.
+          #
+          # Read what 'false' MEANS, though, because it is not what the name
+          # suggests and it is why this is reported below as a ::warning:: that
+          # does NOT count toward `causes`. #321 made the subset check fail
+          # CLOSED: a block that does not verify is DISCARDED WHOLE and the
+          # panel runs on the full reviewed diff alone. So a 'false' run hands
+          # the cells byte-identical input to a run that never built a block at
+          # all — round 1, or any "could not build one" branch — and both of
+          # those report 'true'. The panel is provably just as whole; nothing
+          # was skipped and no finding was suppressed. `Panel integrity` is a
+          # check callers are told to mark REQUIRED, so reddening it over a run
+          # whose reviewed content is indistinguishable from a normal one is a
+          # merge-blocking false positive. The anomaly is still worth seeing —
+          # a 'false' means the BUILDER emitted a non-subset, a real defect —
+          # so it is annotated, just not as a panel-integrity failure.
           INCREMENTAL_SUBSET: ${{ needs.diff-size.outputs.incremental_subset }}
         run: |
           # Every value below is a job output, and two of them (`JUDGE_STATUS`
@@ -3176,9 +3192,13 @@ jobs:
             causes=$((causes + 1))
           fi
 
+          # Deliberately NOT a cause, and deliberately not phrased as one —
+          # see the INCREMENTAL_SUBSET comment above. The block was thrown
+          # away, so the cells read the full reviewed diff, exactly as they do
+          # on round 1. Surfaced because a non-subset block means the BUILDER
+          # misbehaved, never because this panel came up short.
           if [ "$INCREMENTAL_SUBSET" = "false" ]; then
-            echo "::error::The incremental \"new since the last reviewed round\" block was not a subset of the diff the panel reviewed, so the cells were prioritized onto hunks that were not in scope."
-            causes=$((causes + 1))
+            echo "::warning::The incremental \"new since the last reviewed round\" block failed its subset check and was discarded, so the panel reviewed the full diff without a prioritization hint. Nothing was skipped and no finding was suppressed — see the 'Incremental diff discarded' warning on the Diff size check job for the counts."
           fi
 
           if [ "$causes" -ne 0 ]; then

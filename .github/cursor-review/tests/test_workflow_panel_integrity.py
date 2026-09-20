@@ -363,6 +363,52 @@ class PanelIntegrityJobTest(unittest.TestCase):
                 f"`{PANEL_JOB}` no longer reads `{read}`",
             )
 
+    def test_a_discarded_incremental_block_is_not_a_failing_cause(self):
+        # `incremental_subset` is `false` only when the incremental block was
+        # built and then FAILED its byte-for-byte subset check — at which point
+        # `diff-size` discards the block whole and the panel reviews the full
+        # reviewed diff alone. That is byte-identical input to a run which never
+        # built a block at all (round 1, every "could not build one" branch),
+        # and those report `true`. So the panel is provably just as whole, and
+        # reddening a check callers are told to mark REQUIRED over input
+        # indistinguishable from a normal run is a merge-blocking false
+        # positive. It must annotate and NOT increment `causes`.
+        #
+        # Pinned because this job was written while that output was still
+        # unpublished, when a `false` was believed to mean the cells had been
+        # prioritized onto out-of-scope hunks. Publishing it inverted the
+        # meaning without touching a line of this job, so nothing but a test
+        # stops the next change from re-arming the false positive.
+        lines = self.body.split("\n")
+        starts = [
+            i
+            for i, line in enumerate(lines)
+            if 'if [ "$INCREMENTAL_SUBSET" = "false" ]' in line
+        ]
+        self.assertEqual(
+            len(starts),
+            1,
+            "expected exactly one INCREMENTAL_SUBSET branch in `%s`" % PANEL_JOB,
+        )
+
+        block = []
+        for line in lines[starts[0]:]:
+            block.append(line)
+            if line.strip() == "fi":
+                break
+        else:  # pragma: no cover - the branch always closes
+            self.fail("the INCREMENTAL_SUBSET branch is never closed by `fi`")
+        block = "\n".join(block)
+
+        self.assertNotIn(
+            "causes=$((causes + 1))",
+            block,
+            "a discarded incremental block must not fail `Panel integrity`: the "
+            "block is thrown away and the panel reads the full reviewed diff",
+        )
+        self.assertIn("::warning::", block)
+        self.assertNotIn("::error::", block)
+
     def test_it_fails_and_annotates(self):
         self.assertIn("exit 1", self.body)
         self.assertIn("::error::", self.body)

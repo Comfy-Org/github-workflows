@@ -344,14 +344,19 @@ The remaining shapes to expect before you require it:
   forgery-resistant needs the submission recorded outside the cell's own
   writable job; until then, do not treat a green `Panel integrity` as proof
   against an adversarial PR.
-* **One listed cause is wired but inert.** The job also reads
-  `diff-size`'s `incremental_subset` — "were the cells prioritized onto hunks
-  that were actually in the reviewed diff?" — and fails on a literal `false`.
-  `Diff size check` does not publish that output yet (it arrives with the
-  incremental-diff fix), so today the expression is the empty string, which
-  counts as "not measured", i.e. a pass. Nothing in the rollup changes when it
-  starts being published; it is documented here so the cause table is not read
-  as a scope check that is already running.
+* **A discarded incremental block warns, it does not fail the check.** The job
+  also reads `diff-size`'s `incremental_subset`, which is `false` when the
+  incremental "new since the last reviewed round" block was built and then
+  failed its byte-for-byte subset check against the reviewed diff. That reads
+  like a scope failure and is not one: the block is **discarded whole**, so the
+  panel reviews the **full reviewed diff alone** — the same input it gets on
+  round 1, and on every run where no block could be built at all. Nothing is
+  skipped and no finding is suppressed, so the panel is exactly as whole as any
+  other run's. `Panel integrity` therefore emits a `::warning::` here and stays
+  green on this signal alone; the counts are in the `Incremental diff
+  discarded` warning on the *Diff size check* job. It is called out because the
+  annotation is easy to misread as "the panel reviewed the wrong hunks" when it
+  means "the panel lost its budget hint".
 
 ## Blocking-gate gotchas
 
