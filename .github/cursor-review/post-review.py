@@ -139,6 +139,31 @@ BODY_ONLY_SENTINEL_PREFIX = "cursor-review:body-only-findings v1"
 # older SHA ignores an unknown trailing comment instead of failing to parse the findings.
 BODY_ONLY_TRUNCATED_PREFIX = "cursor-review:body-only-truncated v1"
 
+# The round sentinel (BE-15598). The ledger already records WHICH commit the last round
+# reviewed (`last_reviewed_sha`); this records what that round diffed it AGAINST. The
+# next round's incremental block rebuilds the OLD side as "what round N saw", and the
+# only way to do that faithfully is to diff the tree round N actually used — its merge
+# base. Recomputing it from the CURRENT base is what BE-15597 measured wrong: after a
+# retarget or a base-branch rewrite the merge base moves, hunks the panel never saw read
+# as already-reviewed, and they are dropped from the block. The block still passes the
+# subset fail-safe (it is a subset), so nothing downstream catches it — hence a written
+# record rather than a derivation. Same version-suffix discipline as the sentinels above:
+# a reader that does not understand the payload rejects it instead of guessing.
+ROUND_SENTINEL_PREFIX = "cursor-review:round v1"
+
+# Every SHA the round sentinel carries is validated against this before it is written.
+# A field that does not match is emitted as "" rather than dropped: the reader then sees
+# a sentinel that parses and is missing the one thing it needs, which fails closed to
+# "no incremental block", where a MISSING key would be indistinguishable from a sentinel
+# this writer never wrote. It also keeps the payload free of `-->`, `"` and newlines by
+# construction, so the comment cannot be broken out of by whatever produced the value.
+#
+# `\Z`, not `$`, and for that last clause specifically: Python's `$` matches before a
+# FINAL newline too, so `$` here would let a 41-character value whose last byte is `\n`
+# through and put a line break inside the HTML comment. build-ledger.py's `_FULL_SHA_RE`
+# is the reader-side twin and carries the same anchor.
+_ROUND_SHA_RE = re.compile(r"^[0-9a-f]{40}\Z")
+
 # --- the blocking gate's delivery signal (BE-4691) -------------------------
 # `needs.post-review.result == 'success'` cannot stand in for "a review carrying
 # resolvable finding threads landed on the PR": this script exits 0 after a
@@ -2004,6 +2029,30 @@ def strip_severity_badge(severity: str, body: str) -> str:
     return body[len(badge):] if body.startswith(badge) else body
 
 
+def render_round_sentinel(head: str, base: str, merge_base: str) -> str:
+    """The round sentinel: what THIS round reviewed, and what it diffed against.
+
+    Read back by build-ledger.py from the last consolidated review, and used by the
+    next round's incremental block to pin the OLD patch to the merge base this round
+    used rather than recomputing one from a base that may since have moved.
+
+    Every field is a 40-hex commit SHA or the empty string — see `_ROUND_SHA_RE`. The
+    JSON is sorted-key and separator-tight so the line is byte-stable across rounds,
+    which is what lets a reader pin the opener as one exact literal.
+    """
+
+    def field(value) -> str:
+        text = (value or "").strip()
+        return text if _ROUND_SHA_RE.match(text) else ""
+
+    payload = json.dumps(
+        {"base": field(base), "head": field(head), "merge_base": field(merge_base)},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"<!-- {ROUND_SENTINEL_PREFIX} {payload} -->"
+
+
 def defang_body_only_contract(text: str) -> str:
     """Break both halves of the body-only sentinel contract inside imported text.
 
@@ -2037,6 +2086,16 @@ def defang_body_only_contract(text: str) -> str:
         # "findings were lost" note in the next round's prompt off text we quoted.
         BODY_ONLY_TRUNCATED_PREFIX,
         BODY_ONLY_TRUNCATED_PREFIX.replace(":", ":\u200b", 1),
+    ).replace(
+        # The round sentinel (BE-15598), which is worth rather more than the other two:
+        # forged, it names a merge base of the attacker's choosing, and the next round
+        # builds its OLD patch — "what the panel already saw" — against that tree. A
+        # merge base equal to the last-reviewed commit makes OLD empty; the step fails
+        # closed there, but a merge base pointing at a LATER tree would suppress real
+        # hunks from the block. The reader is line-anchored and checks `head` against
+        # the review's own `commit_id`, so this is the third control, not the only one.
+        ROUND_SENTINEL_PREFIX,
+        ROUND_SENTINEL_PREFIX.replace(":", ":\u200b", 1),
     )
 
 
@@ -2803,6 +2862,24 @@ def main():
             "or unreadable means every finding is sent inline (pre-existing behaviour)."
         ),
     )
+    parser.add_argument(
+        "--base-sha",
+        default="",
+        help=(
+            "The PR's base-branch tip for this round, recorded in the round sentinel. "
+            "Diagnostic only — nothing reads it back to build a diff."
+        ),
+    )
+    parser.add_argument(
+        "--merge-base-sha",
+        default="",
+        help=(
+            "merge-base(base, head) for this round, recorded in the round sentinel so "
+            "the NEXT round can pin its 'already reviewed' patch to the tree this "
+            "round actually diffed against. Empty (unresolvable) is recorded as empty, "
+            "and the next round then skips its incremental block rather than guessing."
+        ),
+    )
     parser.add_argument("--triggered-by", default=None)
     parser.add_argument("--error-message", default=None, help="If set, post an error review with this message")
     parser.add_argument(
@@ -2840,15 +2917,33 @@ def main():
 
     attribution = f"\n\n_Triggered by @{args.triggered_by}._" if args.triggered_by else ""
     header = f"## 🔍 Cursor Review — Consolidated panel{attribution}"
+    # The round sentinel goes on its own line directly under the header and above
+    # everything else (BE-15598), for the same reason the body-only sentinel sits near
+    # the top of its section: `clamp_review_body` cuts the TAIL, so a record this short
+    # at this height survives every cut that leaves a body at all.
+    #
+    # Two headers, deliberately, and the plain one goes to every body whose round
+    # reviewed NOTHING: `post_error_review`, and the all-panel-cells-failed branch
+    # below. Recording what such a round "diffed against" would be a claim about a panel
+    # that never ran, and the next round would build its "already reviewed" side from it
+    # — subtracting hunks nobody looked at. build-ledger.py refuses the error-review
+    # shape outright besides, so a sentinel there could only ever be misleading; the
+    # all-failed body carries no such shape, which is why withholding it is the control.
+    review_header = "{}\n{}".format(
+        header, render_round_sentinel(args.commit_sha, args.base_sha, args.merge_base_sha)
+    )
+    banners = ""
     if args.notice:
         # Surface a degradation banner (judge failed → raw panel findings) right
         # under the title so every rendered body carries it.
-        header += f"\n\n{neutralize_mentions(args.notice)}"
+        banners += f"\n\n{neutralize_mentions(args.notice)}"
     if args.ledger_note and args.ledger_note.strip():
         # Either "Round N — ledger: …" or the ledger-unavailable banner. The
         # banner case matters most: a re-review that ran WITHOUT prior context
         # must never look identical to a genuine first-round review.
-        header += f"\n\n_{neutralize_mentions(args.ledger_note.strip())}_"
+        banners += f"\n\n_{neutralize_mentions(args.ledger_note.strip())}_"
+    header += banners
+    review_header += banners
 
     if args.error_message:
         post_error_review(args.repo, args.pr_number, args.commit_sha, header, args.error_message)
@@ -2879,6 +2974,16 @@ def main():
         # misleading on (2), so check the panel metadata explicitly.
         all_failed = bool(panel) and all(c.get("status") != "ok" for c in panel)
         if all_failed:
+            # The PLAIN header, no round sentinel — same rule as post_error_review, and
+            # the same reason (BE-15598). Every reviewer errored, so this round diffed
+            # nothing and judged nothing; recording what it "diffed against" would let
+            # the NEXT round build its "already reviewed" side out of it and subtract
+            # hunks no panel ever saw. build-ledger.py still counts this body as a round
+            # for `last_reviewed_sha` — it IS a review of that commit — but with no
+            # sentinel it records no merge base, so the next round fails closed to "no
+            # incremental block" and the panel sees the full diff. That is the correct
+            # trade: the block is a prioritization hint, and losing it costs prompt
+            # budget where trusting this round costs coverage.
             body_text = (
                 f"{header}\n\n⚠️ **Panel did not produce any findings.**\n\n"
                 "Every reviewer in the matrix failed to contribute — see the "
@@ -2886,7 +2991,7 @@ def main():
                 "the underlying cause."
             )
         else:
-            body_text = f"{header}\n\n✅ No high-signal findings."
+            body_text = f"{review_header}\n\n✅ No high-signal findings."
         if panel_summary:
             body_text += f"\n\n{panel_summary}"
         payload = json.dumps(
@@ -2946,7 +3051,7 @@ def main():
     # fallback) can list ALL findings once, in severity order, instead of appending the
     # inline half AFTER a block that already ends with the demoted half — which put a
     # demoted nit ahead of a lost critical and made the size clamp cut the wrong end.
-    review_head = f"{header}\n\nFound **{len(enriched)}** finding(s)."
+    review_head = f"{review_header}\n\nFound **{len(enriched)}** finding(s)."
     if repeats_dropped:
         review_head += (
             # "the judge declared", not "of already-answered findings": the cap now
