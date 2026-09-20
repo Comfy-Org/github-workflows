@@ -275,7 +275,108 @@ def _indent_of(line):
     return len(line) - len(line.lstrip(" "))
 
 
-def parse_reviewer_config(text):
+def _show_invisible(s):
+    r"""Render a token so a non-printing character in it is findable in a log.
+
+    The JS port's `showInvisible` (assign-reviewers.yml, inside the
+    `PARITY-HARNESS:config-parser` region) character for character: everything
+    outside printable ASCII becomes a lower-case `\uXXXX` escape. Both ports
+    render the same escape for the same token so a reader comparing a
+    `::warning::` annotation from the drift generator against a `core.warning`
+    from the runtime sees one string, not two spellings of it.
+
+    That includes ABOVE the BMP, which is why an astral code point is emitted as
+    a SURROGATE PAIR rather than as itself: JS's regex has no `u` flag, so it
+    walks UTF-16 code units and renders U+1F600 as `\ud83d\ude00`, while a plain
+    `"\\u%04x" % ord(c)` renders `\u1f600` — five digits, which is not a valid
+    `\u` escape at all and reads ambiguously as `\u1f60` followed by `0`. The
+    characters this exists for (U+00A0, U+FEFF, U+0085, U+2028) are all BMP, but
+    the helper escapes the WHOLE token, so an emoji anywhere in a stray line or a
+    configured login used to render differently on the two ports.
+    """
+    out = []
+    for c in s:
+        cp = ord(c)
+        if " " <= c <= "~":
+            out.append(c)
+        elif cp > 0xFFFF:
+            v = cp - 0x10000
+            out.append("\\u%04x\\u%04x" % (0xD800 + (v >> 10), 0xDC00 + (v & 0x3FF)))
+        else:
+            out.append("\\u%04x" % cp)
+    return "".join(out)
+
+
+def _wc_escape(s):
+    """Escape a message for a `::warning::` workflow command.
+
+    The runner decodes `%25`/`%0D`/`%0A` out of a workflow command's message and
+    treats a raw newline as the end of the command, so three things could mangle
+    an annotation here: a `%` in a config token (`_show_invisible` leaves it
+    alone — it is printable ASCII), and a CR or LF in `source_path`, which comes
+    from the caller-configurable `reviewer_config_path` and is interpolated raw.
+    A newline there splits the physical stdout line and can start a SECOND
+    runner command. `core.warning` escapes exactly these three for the JS port,
+    so doing it here is what keeps the two annotations one string rather than
+    two spellings of it. `%` first, or the escapes escape each other.
+    """
+    return s.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def _is_key(line, key):
+    """True when an s-white-trimmed `line` opens the top-level block `key`.
+
+    A bare `startswith` also claims a DIFFERENT key that merely shares the
+    prefix: `rules:v2:` is valid YAML for a key named `rules:v2`, and the prefix
+    test parsed its children as live routing rules — silently HONOURING an
+    unsupported key instead of falling through to the warning below. YAML reads
+    `key:` as a mapping only when s-white or the end of the line follows the
+    colon, so require that; `default_pool:[alice]` is a plain scalar to YAML and
+    is now a fallthrough here too. The JS port's `isKey` is the same test.
+    """
+    return line.startswith(key) and line[len(key):len(key) + 1] in ("", " ", "\t")
+
+
+def _near_miss_key(line):
+    """The supported key a fallthrough `line` names but does not open.
+
+    Two shapes reach this, and both are silent breakage worth an annotation:
+
+    * `\ufeffdefault_pool:`, `\u0085rules:` — the stray character is not
+      indentation (neither `_trim` nor `_indent_of` sees it), so the line reads
+      as column 0, falls through, and the block it meant to open is never read.
+      Stripping the leading non-printable-ASCII run recognises the intent.
+    * `rules:v2:`, `default_pool:[alice]` — a DIFFERENT key that merely shares
+      the prefix, or a colon YAML would not read as a mapping. `_is_key`
+      (rightly) declines these; without this they would fall through in
+      silence, which is how `rules:v2:` used to be honoured as live routing.
+
+    Only called from the fallthrough, where `_is_key(line, key)` is already
+    known false, so a bare prefix match here always means one of the two. The
+    JS port's `nearMissKey` is identical.
+    """
+    head = re.sub(r"^[^\x21-\x7e]+", "", line)
+    for key in ("default_pool:", "rules:"):
+        if head.startswith(key):
+            return key
+    return None
+
+
+def _is_doc_marker(line):
+    """True for a YAML document marker, which is syntax rather than a key.
+
+    yamllint's default `document-start` rule REQUIRES a leading `---`, so a
+    perfectly conformant reviewers.yml opens with one (and may close with
+    `...`). Both fall through this parser, and `...` after a `rules:` block even
+    terminates it — but nothing is lost, so warning about them would fire on
+    every scheduled run of a well-formed config and train people to ignore the
+    annotation. A SECOND document in the file is a separate, pre-existing
+    limitation (its keys merge into the first); this only silences the marker.
+    """
+    return line in ("---", "...") or line.startswith("--- ") or line.startswith("---\t")
+
+
+def parse_reviewer_config(text, source_path=None):
     """Return (config, locations).
 
     config    = {"default_pool": [...], "rules": [{"paths": [...],
@@ -301,12 +402,24 @@ def parse_reviewer_config(text):
     # data; that would have traded the old divergence for a new one. Splitting on
     # the two-character break produces the same number of lines as `split("\n")`
     # on a CRLF document, so every line index is left alone.
+    # `source_path` only ever NAMES the file in a diagnostic, and is optional for
+    # the same reason the JS port's is: the unit tests (and the shared corpus) hand
+    # the parser text with no path, and a missing one must drop the prefix rather
+    # than print a literal `None:` or hardcode a `reviewers.yml` the caller may
+    # have configured away via `reviewer_config_path`.
+    where = f"{source_path}: " if source_path else ""
     raw_lines = re.split(r"\r?\n", text.removeprefix("\ufeff"))
     lines = [_strip_comment(l) for l in raw_lines]
     config = {"default_pool": [], "rules": []}
     locs = {"default_pool": None, "rules": [], "rule_paths": []}
 
     seen_default_pool = False
+    # The block a column-0 line has just TERMINATED, or None. Both scans below
+    # skip blank lines and `break` only on a non-blank column-0 line WITHOUT
+    # advancing `i`, so the very next iteration of this loop is guaranteed to be
+    # the terminating line itself — which is what makes a one-iteration handoff
+    # sound rather than a flag that could go stale. Every branch consumes it.
+    ended_block = None
     i = 0
     n = len(lines)
     while i < n:
@@ -315,7 +428,8 @@ def parse_reviewer_config(text):
         if not line:
             i += 1
             continue
-        if _indent_of(raw) == 0 and line.startswith("default_pool:"):
+        terminated, ended_block = ended_block, None
+        if _indent_of(raw) == 0 and _is_key(line, "default_pool:"):
             # YAML requires unique keys; PyYAML's de-facto last-wins is the
             # reference. Warn, never reject — the drift generator must not
             # hard-fail on a malformed map. Both the flow and the block arm below
@@ -323,7 +437,8 @@ def parse_reviewer_config(text):
             # further work here; each arm also REPOINTS `locs["default_pool"]`,
             # so the rewrite can never target an occurrence the parse discarded.
             if seen_default_pool:
-                print("::warning::duplicate top-level default_pool: key — last one wins")
+                print("::warning::" + _wc_escape(
+                    f"{where}duplicate top-level default_pool: key — last one wins"))
             seen_default_pool = True
             rest = _trim(line[len("default_pool:"):])
             flow = _parse_flow(rest)
@@ -345,6 +460,7 @@ def parse_reviewer_config(text):
                     i += 1
                     continue
                 if _indent_of(r) == 0:
+                    ended_block = "default_pool:"
                     break
                 t = _trim(r)
                 if t.startswith("- "):
@@ -362,7 +478,7 @@ def parse_reviewer_config(text):
             # means "no rewritable list here", which `rewrite_config` skips.
             locs["default_pool"] = ("block", item_lines, indent) if item_lines else None
             continue
-        if _indent_of(raw) == 0 and line.startswith("rules:"):
+        if _indent_of(raw) == 0 and _is_key(line, "rules:"):
             i += 1
             current = None
             cur_loc = None
@@ -419,6 +535,7 @@ def parse_reviewer_config(text):
                     i += 1
                     continue
                 if _indent_of(r) == 0:
+                    ended_block = "rules:"
                     break
                 ind = _indent_of(r)
                 t = _trim(r)
@@ -445,6 +562,54 @@ def parse_reviewer_config(text):
                     set_key(t, i)
                 i += 1
             continue
+        # Fallthrough: a non-empty line that is neither `default_pool:` nor `rules:`.
+        # At column 0 such a line can do real, INVISIBLE damage, and the two shapes it
+        # takes are the two arms below. It need not look like a key at all: since both
+        # ports narrowed to trimming s-white, a line whose only content is ONE non-s-white
+        # whitespace character (U+00A0, U+0085, U+000B, U+000C, U+001C-U+001F, U+FEFF,
+        # U+2028, U+2029, U+200B) is no longer blank, and `_indent_of` counts SPACES, so it
+        # reads as column 0. Real YAML rejects most such documents outright (PyYAML raises
+        # on NBSP and FF), so widening the blank test would have diverged from YAML; making
+        # the damage visible does not change what parses. Warn, never reject — the drift
+        # generator must not hard-fail on a malformed map, the same posture as the
+        # duplicate-key warning above.
+        #
+        # What this deliberately does NOT warn about is an unrecognised column-0 line that
+        # broke nothing, because warning on EVERY fallthrough both overclaimed and flooded:
+        # a leading `---` or trailing `...` document marker (valid YAML, and what yamllint's
+        # default `document-start` rule REQUIRES), a `version:`/`notes:` metadata key before
+        # the first block, and a stray key between two complete blocks all leave the outer
+        # loop scanning and every later `default_pool:`/`rules:` parsing — yet each drew an
+        # annotation asserting the block above was ended and the rules below were dropped,
+        # on a document whose parse is complete. Silence there is also what caps the volume:
+        # a zero-indented block sequence, a tab-indented config (`_indent_of` counts spaces,
+        # so EVERY item reads as column 0) and a `reviewer_config_path` aimed at a non-YAML
+        # file each used to warn once per line and bury the annotation that mattered inside
+        # GitHub's ~10-per-step budget; now they warn once per block actually truncated.
+        #
+        # INDENTED fallthrough lines stay silent for the same reason: they are the orphaned
+        # tail of an already-reported truncation (`  - bob` after the stray line), and one
+        # warning per terminator is the signal — one per orphaned item would bury it.
+        if _indent_of(raw) == 0 and not _is_doc_marker(line):
+            near = _near_miss_key(line)
+            if near:
+                # Checked BEFORE the terminator arm because it names the actual cause and
+                # the larger blast radius: `\ufeffrules:` may also end a (complete)
+                # `default_pool:` above it, but what the reader needs to know is that every
+                # rule below is gone because of one character they cannot see.
+                print("::warning::" + _wc_escape(
+                    f"{where}line {i + 1} is not a recognised top-level key "
+                    f"({_show_invisible(line)}) — it is not the supported `{near}` key, so "
+                    "the whole block it opens is ignored; that key is read only at column 0 "
+                    "with nothing but spaces before it and a space, a tab or the end of the "
+                    "line after its colon"))
+            elif terminated:
+                print("::warning::" + _wc_escape(
+                    f"{where}line {i + 1} is not a recognised top-level key "
+                    f"({_show_invisible(line)}) — it ends the `{terminated}` block above "
+                    "it, and every list item or rule indented below it is dropped; only "
+                    "`default_pool:` and `rules:` are read, and at column 0 one invisible "
+                    "character (e.g. U+00A0) ends a block exactly like a misspelled key does"))
         i += 1
     # locs["rules"] holds dicts internally; expose the reviewers loc as
     # locs["rules"] and the (skip-only) paths loc alongside it.
@@ -1113,7 +1278,7 @@ def main():
         return _noop_exit(
             f"{config_path} on origin/{branch} uses CR-only line endings, "
             "which the byte-faithful reader does not split on")
-    config, locs = parse_reviewer_config(committed_text)
+    config, locs = parse_reviewer_config(committed_text, config_path)
     skipped_unterminated = [{"key": key, "line": idx + 1}
                             for key, idx in unterminated_locations(locs)]
     for entry in skipped_unterminated:

@@ -353,6 +353,14 @@ All optional except `workflows_ref` (required, no default) — pass them under
 | `run_without_label` | `false` | Run on plain PR events instead of requiring the trigger label. Also requires widening the caller's `types:` — see [the setup guide](../../docs/callers/cursor-review.md). |
 | `blocking` | `false` | Adds the fail-closed **Blocking gate** check: red while any cursor-review finding thread is unresolved and non-outdated, and red when the round that should have produced those threads did not land (including an over-cap skip). Blocking the merge additionally requires marking that check required in the caller's ruleset — see [the blocking section above](#optional-make-the-review-blocking). |
 
+### `workflows_ref` must equal the `uses:` pin
+
+The two pins are checked against each other at run time, not just documented. Every job that checks this directory out runs a `Require a pinned workflows_ref` step that rejects an empty value and then compares the ref to `job.workflow_sha` — the commit the caller's `uses:` line resolved to. That value is computed by the runner from the `uses:` line, so a caller cannot set it, which is what makes "the prompts come from the commit you pinned" a checked fact rather than a convention. A mismatch fails the job: otherwise a caller pinned to one commit would have its PR judged by another commit's prompts, scripts and model list.
+
+Two deliberate holes. A runner older than Actions v2.334.0 supplies no `job.workflow_sha`, so the comparison cannot be evaluated at all — that case **warns and continues** rather than failing, since a property that could not be measured is not evidence of a violation. (Every job here is `runs-on: ubuntu-latest`, which is always current, so only a runner group shadowing that label reaches it.) And the `Prior-review ledger` job is exempt from the guard entirely — it must never fail the run, because the review matrix `needs:` it — so it downgrades the same mismatch to a `::warning::` in its own log. That warning is the one signal a caller gets when the label gate skipped every guarded job.
+
+**Fixing a red run:** set `uses:` and `workflows_ref` to one and the same 40-hex SHA. They drift when only one of them gets bumped — the `bump-callers` fleet rewrites both together, but Dependabot rewrites only `uses:`, so a caller that lets Dependabot bump this reusable needs an `ignore` entry for `Comfy-Org/github-workflows` in its `dependabot.yml`.
+
 ### Over the diff-size cap
 
 A PR whose counted diff exceeds `diff_size_cap` gets **no review panel**, and

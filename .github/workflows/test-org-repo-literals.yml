@@ -755,13 +755,14 @@ jobs:
               ;;
           esac
 
-          # A tracked path containing a NEWLINE splits one grep record in two,
-          # and the leading fragment parsed into a file that does not exist, a
-          # `line=` holding a path, and a "literal" cut out of the filename —
-          # publishing raw `:`/`,` into the very properties `escape_property`
-          # exists to protect. A line number is always digits, so a non-numeric
-          # field is a parse failure and the run refuses it (exit 2) rather than
-          # reporting a fabrication.
+          # A tracked path containing a NEWLINE used to split one `grep -r` record
+          # into two on the fallback path, and the leading fragment was reported
+          # against a file that does not exist. The fallback now enumerates the
+          # matching files NUL-delimited and scans each on stdin under a C-quoted
+          # `--label`, so such a path is ONE finding with a C-quoted location — the
+          # same shape the git path has always produced. Exit 1, exactly one
+          # `unapproved:` line located at `"a:bc\nd.md":1:` (the `\n` there is two
+          # literal characters, backslash then n).
           nl_dir="$(mktemp -d)"
           mkdir -p "$nl_dir/.github/lint"
           printf 'placeholder  # fixture\n' > "$nl_dir/.github/lint/org-repo-allowlist.txt"
@@ -769,24 +770,28 @@ jobs:
           printf 'see %s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$nl_dir/$nl_name"
           status=0
           output="$(bash .github/lint/check-org-repo-literals.sh --root "$nl_dir" 2>&1)" || status=$?
-          if [ "$status" -ne 2 ]; then
-            echo "::error::a newline in a tracked path exited $status — expected 2 (unparseable scan output)"
+          count="$(printf '%s\n' "$output" | grep -c '^unapproved: ' || true)"
+          if [ "$status" -ne 1 ]; then
+            echo "::error::a newline in a tracked path exited $status — expected 1 (one C-quoted finding)"
             printf '%s\n' "$output"
             fail=1
-          elif printf '%s\n' "$output" | grep -q '^unapproved: '; then
-            echo '::error::a newline in a tracked path still produced a finding line'
+          elif [ "$count" -ne 1 ]; then
+            echo "::error::a newline in a tracked path produced $count finding(s) — expected exactly 1"
+            printf '%s\n' "$output"
+            fail=1
+          elif ! printf '%s\n' "$output" | grep -qF 'unapproved: "a:bc\nd.md":1: '; then
+            echo '::error::a newline path was not reported with its C-quoted location'
             printf '%s\n' "$output"
             fail=1
           else
-            echo 'ok (2): an unparseable scan record is refused, not reported'
+            echo 'ok (1): a newline in a tracked path is one finding with a C-quoted location'
           fi
 
-          # A NUMERIC line field does not prove the record parsed. A path named
-          # `a:1:foo<LF>x.md` splits into the fragment `./a:1:foo`, which clears
-          # the digit test (file=`a`, line=`1`) and was printed as the finding
-          # `oo` — the boundary drop eats its first byte — against a path that
-          # does not exist. The record SHAPE is what catches this one: after the
-          # boundary drop the match must still begin with the org prefix.
+          # A path named `a:1:foo<LF>x.md` used to split into the fragment
+          # `a:1:foo`, which cleared the digit test (file=`a`, line=`1`) and was
+          # printed as the bogus finding `oo` against a path that does not exist.
+          # Now it is ONE finding located at the whole C-quoted path — no `file=a`,
+          # no `x.md`.
           num_dir="$(mktemp -d)"
           mkdir -p "$num_dir/.github/lint"
           printf 'placeholder  # fixture\n' > "$num_dir/.github/lint/org-repo-allowlist.txt"
@@ -794,16 +799,25 @@ jobs:
           printf 'see %s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$num_dir/$num_name"
           status=0
           output="$(bash .github/lint/check-org-repo-literals.sh --root "$num_dir" 2>&1)" || status=$?
-          if [ "$status" -ne 2 ]; then
-            echo "::error::a numeric-looking path fragment exited $status — expected 2 (unparseable scan output)"
+          count="$(printf '%s\n' "$output" | grep -c '^unapproved: ' || true)"
+          if [ "$status" -ne 1 ]; then
+            echo "::error::a numeric-looking path fragment exited $status — expected 1 (one C-quoted finding)"
             printf '%s\n' "$output"
             fail=1
-          elif printf '%s\n' "$output" | grep -q '^unapproved: '; then
-            echo '::error::a numeric-looking path fragment still produced a finding line'
+          elif [ "$count" -ne 1 ]; then
+            echo "::error::a numeric-looking path produced $count finding(s) — expected exactly 1"
+            printf '%s\n' "$output"
+            fail=1
+          elif ! printf '%s\n' "$output" | grep -qF 'unapproved: "a:1:foo\nx.md":1: '; then
+            echo '::error::a numeric-looking path was not reported with its C-quoted location'
+            printf '%s\n' "$output"
+            fail=1
+          elif printf '%s\n' "$output" | grep -qE 'file=a,|:oo '; then
+            echo '::error::a numeric-looking path was reported as a fabricated fragment'
             printf '%s\n' "$output"
             fail=1
           else
-            echo 'ok (2): a numeric line field alone does not make a record parsed'
+            echo 'ok (1): a numeric line field in a path is one C-quoted finding, not a fabrication'
           fi
 
           # The GIT path has no split to refuse: `git grep` C-quotes newline,
@@ -826,6 +840,141 @@ jobs:
             fail=1
           else
             echo 'ok (1): the git path reports a newline-path literal rather than refusing it'
+          fi
+
+          # The three spike fixtures (BE-15437): directory+file pairs under ONE
+          # fallback root, each a matching file whose name embeds a newline. Every
+          # one is reported as a single C-quoted finding — none split into a
+          # fragment attributed to `file=a` or to the non-existent tail `y.md`.
+          spike_dir="$(mktemp -d)"
+          mkdir -p "$spike_dir/.github/lint"
+          printf 'placeholder  # fixture\n' > "$spike_dir/.github/lint/org-repo-allowlist.txt"
+          for spike_name in "$(printf 'x\ny.md')" "$(printf 'core-engine-team\ny.md')" "$(printf 'unlisted\ny.md')"; do
+            printf 'see %s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$spike_dir/$spike_name"
+          done
+          status=0
+          output="$(bash .github/lint/check-org-repo-literals.sh --root "$spike_dir" 2>&1)" || status=$?
+          count="$(printf '%s\n' "$output" | grep -c '^unapproved: ' || true)"
+          quoted="$(printf '%s\n' "$output" | grep -c '^::error file="' || true)"
+          errlines="$(printf '%s\n' "$output" | grep -c '^::error ' || true)"
+          if [ "$status" -ne 1 ]; then
+            echo "::error::the spike fixtures exited $status — expected 1"
+            printf '%s\n' "$output"
+            fail=1
+          elif [ "$count" -ne 3 ]; then
+            echo "::error::the spike fixtures produced $count finding line(s) — expected exactly 3"
+            printf '%s\n' "$output"
+            fail=1
+          elif [ "$quoted" -ne "$errlines" ]; then
+            echo '::error::not every spike ::error annotation used a quoted (C-quoted) location'
+            printf '%s\n' "$output"
+            fail=1
+          elif printf '%s\n' "$output" | grep -qE 'file=a,|file=y\.md'; then
+            echo '::error::a spike finding was attributed to a fabricated path (file=a or file=y.md)'
+            printf '%s\n' "$output"
+            fail=1
+          else
+            echo 'ok (1): three newline-named files are three C-quoted findings, no fabricated paths'
+          fi
+
+          # The same three paths, but each body is an ALLOWLISTED literal. Exit 0
+          # pins that the leading fragment is not being CLEARED against the
+          # allowlist — there is no fragment any more, so nothing to clear.
+          spike_ok_dir="$(mktemp -d)"
+          mkdir -p "$spike_ok_dir/.github/lint"
+          printf 'x  # allowlisted single-letter placeholder\n' > "$spike_ok_dir/.github/lint/org-repo-allowlist.txt"
+          for spike_name in "$(printf 'x\ny.md')" "$(printf 'core-engine-team\ny.md')" "$(printf 'unlisted\ny.md')"; do
+            printf 'see %s/%s\n' 'Comfy-Org' 'x' > "$spike_ok_dir/$spike_name"
+          done
+          status=0
+          output="$(bash .github/lint/check-org-repo-literals.sh --root "$spike_ok_dir" 2>&1)" || status=$?
+          if [ "$status" -ne 0 ]; then
+            echo "::error::an allowlisted literal in newline-named files exited $status — expected 0"
+            printf '%s\n' "$output"
+            fail=1
+          else
+            echo 'ok (0): an allowlisted literal clears even in newline-named files (no fragment survives)'
+          fi
+
+          # A name holding a TAB, a DOUBLE QUOTE and a BACKSLASH, and beginning
+          # with `-`. Pins the full C-quoting (`\t`, `\"`, `\\`) AND that the
+          # leading dash is handled by `--`/`< "$path"` rather than read as a flag.
+          meta_dir="$(mktemp -d)"
+          mkdir -p "$meta_dir/.github/lint"
+          printf 'placeholder  # fixture\n' > "$meta_dir/.github/lint/org-repo-allowlist.txt"
+          meta_name="$(printf -- '-t\tq"b\\.md')"
+          printf 'see %s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$meta_dir/$meta_name"
+          status=0
+          output="$(bash .github/lint/check-org-repo-literals.sh --root "$meta_dir" 2>&1)" || status=$?
+          if [ "$status" -ne 1 ]; then
+            echo "::error::a tab/quote/backslash path exited $status — expected 1"
+            printf '%s\n' "$output"
+            fail=1
+          elif ! printf '%s\n' "$output" | grep -qF '"-t\tq\"b\\.md"'; then
+            echo '::error::a tab/quote/backslash path was not C-quoted as expected'
+            printf '%s\n' "$output"
+            fail=1
+          else
+            echo 'ok (1): tab, quote, backslash and a leading dash are C-quoted and handled'
+          fi
+
+          # A name holding a CARRIAGE RETURN, a bare control byte (SOH) and DEL.
+          # The `case` guard that triggers quoting fires on ANY `[[:cntrl:]]` byte,
+          # so escaping only `\`, `"`, LF and TAB would wrap these three in double
+          # quotes with the RAW byte still inside — neither valid C-quoting nor
+          # what the git path emits, so the "both paths give identical locations"
+          # invariant would be false. Pins git's own `quote_c_style` spelling:
+          # `\r` for CR (one of the seven bytes git names) and three-digit OCTAL
+          # for the two it does not. Also pins that no raw control byte survives
+          # into the run log — the `unapproved:` line is not percent-escaped, and a
+          # bare CR is a line terminator to the runner, so a crafted name could
+          # otherwise put a workflow command at column zero of a PUBLIC log.
+          ctl_dir="$(mktemp -d)"
+          mkdir -p "$ctl_dir/.github/lint"
+          printf 'placeholder  # fixture\n' > "$ctl_dir/.github/lint/org-repo-allowlist.txt"
+          ctl_name="$(printf 'a\rb\001c\177d.md')"
+          printf 'see %s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$ctl_dir/$ctl_name"
+          status=0
+          output="$(bash .github/lint/check-org-repo-literals.sh --root "$ctl_dir" 2>&1)" || status=$?
+          if [ "$status" -ne 1 ]; then
+            echo "::error::a CR/control-byte path exited $status — expected 1"
+            printf '%s\n' "$output"
+            fail=1
+          elif ! printf '%s\n' "$output" | grep -qF '"a\rb\001c\177d.md"'; then
+            echo '::error::a CR/control-byte path was not C-quoted the way git quotes it'
+            printf '%s\n' "$output" | cat -v
+            fail=1
+          elif oneline="${output//$'\n'/}"; [ "$oneline" != "${oneline//[[:cntrl:]]/}" ]; then
+            echo '::error::a raw control byte from a tracked path reached the run log'
+            printf '%s\n' "$output" | cat -v
+            fail=1
+          else
+            echo 'ok (1): CR, SOH and DEL in a path are escaped exactly as git C-quotes them'
+          fi
+
+          # NUL-SAFETY on the record: two matching files, one with a newline in
+          # its name. Two findings, not zero — a regression that stores the NUL
+          # file list in a shell variable drops every NUL byte, runs the loop zero
+          # times, and reports a clean tree, which this catches.
+          nul_dir="$(mktemp -d)"
+          mkdir -p "$nul_dir/.github/lint"
+          printf 'placeholder  # fixture\n' > "$nul_dir/.github/lint/org-repo-allowlist.txt"
+          printf 'see %s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$nul_dir/plain.md"
+          nul_name="$(printf 'has\nnewline.md')"
+          printf 'see %s/%s\n' 'Comfy-Org' 'not-on-the-allowlist' > "$nul_dir/$nul_name"
+          status=0
+          output="$(bash .github/lint/check-org-repo-literals.sh --root "$nul_dir" 2>&1)" || status=$?
+          count="$(printf '%s\n' "$output" | grep -c '^unapproved: ' || true)"
+          if [ "$status" -ne 1 ]; then
+            echo "::error::the NUL-safety fixture exited $status — expected 1"
+            printf '%s\n' "$output"
+            fail=1
+          elif [ "$count" -ne 2 ]; then
+            echo "::error::the NUL-safety fixture produced $count finding(s) — expected 2 (a variable-stored file list would give 0)"
+            printf '%s\n' "$output"
+            fail=1
+          else
+            echo 'ok (1): the NUL-delimited file list is piped, not stored — two files, two findings'
           fi
 
           # `GIT_CONFIG_PARAMETERS` is the channel `-c` uses to reach child git
